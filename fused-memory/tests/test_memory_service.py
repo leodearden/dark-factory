@@ -2775,16 +2775,32 @@ class TestUpdateMemoryStormCounter:
 
         for i in range(5):
             await self._amend(service, agent_id=f'recon-stage-1-run-{i}')
-        assert len(service._mem0_update_storm_counters) == 5
+        assert len(service.mem0_update_storm_tracked_agents) == 5
 
         # Every one of those agents has now gone quiet for a full window.
         clock.advance(window + 1)
         await self._amend(service, agent_id='recon-stage-2')
 
-        assert set(service._mem0_update_storm_counters) == {'recon-stage-2'}, (
+        assert service.mem0_update_storm_tracked_agents == {'recon-stage-2'}, (
             'a counter whose window has emptied carries no state that could '
             'change a later decision, so it must not survive'
         )
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_storm_leaf_tracks_no_agent(self, stormy):
+        """A bad leaf disables the alarm; it must not also leak a key per agent.
+
+        The sweep never runs while the leaf is bad, so a counter minted per
+        agent BEFORE the config check would accumulate without bound for as
+        long as the leaf stays malformed.
+        """
+        service, _clock = stormy
+        service.config.mem0_update.storm_threshold = 'ten'
+
+        for i in range(3):
+            await self._amend(service, agent_id=f'recon-stage-1-run-{i}')
+
+        assert service.mem0_update_storm_tracked_agents == frozenset()
 
     @pytest.mark.asyncio
     async def test_eviction_does_not_disarm_a_live_burst(self, stormy):

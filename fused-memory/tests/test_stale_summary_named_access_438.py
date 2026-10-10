@@ -7,7 +7,7 @@ Locks in:
   (b) ``rebuild_entity_summaries`` uses named attribute access and routes the
       per-entity edge list correctly from the ``all_edges`` field.
 
-Structural field contract (all_edges, tuple unpacking) is covered in
+Structural field contract (all_edges, keyword-only construction) is covered in
 test_graphiti_rebuild_pipeline.py::TestStaleSummaryResult. This file focuses on
 integration behaviour of detect_stale_summaries and rebuild_entity_summaries.
 """
@@ -16,7 +16,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _fm_helpers import make_rebuild_detail
+from _fm_helpers import COMPLETE_READ, make_rebuild_detail
 
 from fused_memory.backends.graphiti_client import (
     EdgeDict,
@@ -47,6 +47,8 @@ class TestDetectStaleSummariesNamedAccess:
             stale=stale_list,
             all_edges={},
             total_count=3,
+            entities_completeness=COMPLETE_READ,
+            edges_completeness=COMPLETE_READ,
         )
         backend.detect_stale_with_edges = AsyncMock(return_value=detect_result)
 
@@ -64,7 +66,10 @@ class TestDetectStaleSummariesNamedAccess:
         valid and expected return value.
         """
         backend = make_backend(mock_config)
-        detect_result = StaleSummaryResult(stale=[], all_edges={}, total_count=0)
+        detect_result = StaleSummaryResult(
+            stale=[], all_edges={}, total_count=0,
+            entities_completeness=COMPLETE_READ, edges_completeness=COMPLETE_READ,
+        )
         backend.detect_stale_with_edges = AsyncMock(return_value=detect_result)
 
         returned = await backend.detect_stale_summaries(group_id='t')
@@ -117,6 +122,8 @@ class TestRebuildEntitySummariesNamedAccess:
             stale=stale_list,
             all_edges=all_edges,
             total_count=5,
+            entities_completeness=COMPLETE_READ,
+            edges_completeness=COMPLETE_READ,
         )
         svc.graphiti.detect_stale_with_edges = AsyncMock(return_value=detect_result)
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(

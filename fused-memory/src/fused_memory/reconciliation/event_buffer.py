@@ -1265,16 +1265,4 @@ class EventBuffer:
             self._access = None
 
     async def checkpoint(self) -> CheckpointResult:
-        """``PRAGMA wal_checkpoint(TRUNCATE)`` → ``(busy, log, checkpointed)``.
-
-        Still ``(-1, -1, -1)`` — never a raise — for a buffer that was never
-        initialized OR one already closed: server/main.py's checkpoint cycle
-        unpacks the result and logs exceptions separately.
-
-        This is the contract THIS store's callers already had; the journal and
-        ReconLedgerStore raise 'not initialized' in both those cases instead.
-        See ``ReconciliationJournal.checkpoint`` for why the split is deliberate.
-        """
-        if self._access is None:
-            return CheckpointResult(-1, -1, -1)
-        return await self._access.checkpoint()
+        return await AtomicConnection.checkpoint_or_unavailable(self._access)

@@ -19,11 +19,15 @@ from typing import Any
 
 import pytest
 from legibility import codebook as mod
-from legibility import coder
+from legibility import coder, invariants
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+# The vocabulary of a project declaring no invariant slugs, for every merge
+# test that is not about the slug screen.
+_NO_SLUGS: tuple[str, ...] = ()
 
 def _minimal_v2() -> dict:
     """A minimal well-formed v2 codebook: one entry, no candidates."""
@@ -466,7 +470,7 @@ def test_apply_coding_record_appends_one_sighting():
     codebook = _codebook_with_entry_a()
     record = _match_record()
 
-    result, stats = mod.apply_coding_record(codebook, record)
+    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
 
     entry = next(e for e in result["entries"] if e["id"] == "entry-a")
     assert entry["sightings"] == [
@@ -485,8 +489,8 @@ def test_apply_coding_record_match_is_idempotent_on_session_and_entry():
     codebook = _codebook_with_entry_a()
     record = _match_record()
 
-    once, _ = mod.apply_coding_record(codebook, record)
-    twice, _ = mod.apply_coding_record(once, record)
+    once, _ = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
+    twice, _ = mod.apply_coding_record(once, record, invariant_slugs=_NO_SLUGS)
 
     entry = next(e for e in twice["entries"] if e["id"] == "entry-a")
     assert len(entry["sightings"]) == 1
@@ -497,7 +501,7 @@ def test_apply_coding_record_unknown_entry_id_is_skipped_and_counted():
     codebook = _codebook_with_entry_a()
     record = _match_record(entry_id="entry-zzz")
 
-    result, stats = mod.apply_coding_record(codebook, record)
+    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
 
     assert len(result["entries"]) == 1  # no entry fabricated
     assert result["entries"][0]["sightings"] == []
@@ -510,7 +514,7 @@ def test_apply_coding_record_does_not_mutate_input():
     original = copy.deepcopy(codebook)
     record = _match_record()
 
-    mod.apply_coding_record(codebook, record)
+    mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
 
     assert codebook == original
 
@@ -542,7 +546,7 @@ def test_apply_coding_record_appends_one_candidate():
     codebook = _codebook_with_entry_a()
     record = _candidate_record()
 
-    result, stats = mod.apply_coding_record(codebook, record)
+    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
 
     assert len(result["candidates"]) == 1
     candidate = result["candidates"][0]
@@ -560,8 +564,8 @@ def test_apply_coding_record_candidate_is_idempotent_on_session_and_title():
     codebook = _codebook_with_entry_a()
     record = _candidate_record()
 
-    once, _ = mod.apply_coding_record(codebook, record)
-    twice, _ = mod.apply_coding_record(once, record)
+    once, _ = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
+    twice, _ = mod.apply_coding_record(once, record, invariant_slugs=_NO_SLUGS)
 
     assert len(twice["candidates"]) == 1
     assert len(twice["candidates"][0]["sightings"]) == 1
@@ -571,10 +575,10 @@ def test_apply_coding_record_candidate_is_idempotent_on_session_and_title():
 def test_apply_coding_record_different_candidate_same_day_increments_id():
     codebook = _codebook_with_entry_a()
     record_a = _candidate_record(title="novel shape")
-    once, _ = mod.apply_coding_record(codebook, record_a)
+    once, _ = mod.apply_coding_record(codebook, record_a, invariant_slugs=_NO_SLUGS)
 
     record_b = _candidate_record(title="a different shape")
-    twice, _ = mod.apply_coding_record(once, record_b)
+    twice, _ = mod.apply_coding_record(once, record_b, invariant_slugs=_NO_SLUGS)
 
     assert len(twice["candidates"]) == 2
     ids = {c["title"]: c["id"] for c in twice["candidates"]}
@@ -622,7 +626,7 @@ def test_apply_coding_record_does_not_resurrect_rejected_candidate():
     codebook = _codebook_with_adjudicated_candidate("rejected")
     record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
 
-    result, stats = mod.apply_coding_record(codebook, record)
+    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
 
     assert len(result["candidates"]) == 1  # NO pending twin fabricated
     candidate = result["candidates"][0]
@@ -645,7 +649,7 @@ def test_apply_coding_record_does_not_duplicate_promoted_candidate():
     codebook = _codebook_with_adjudicated_candidate("promoted")
     record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
 
-    result, stats = mod.apply_coding_record(codebook, record)
+    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
 
     assert len(result["candidates"]) == 1
     candidate = result["candidates"][0]
@@ -670,7 +674,7 @@ def test_apply_coding_record_routes_promoted_recurrence_to_its_entry():
     codebook["candidates"][0]["promoted_to"] = "entry-a"
     record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
 
-    result, stats = mod.apply_coding_record(codebook, record)
+    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
 
     entry = next(e for e in result["entries"] if e["id"] == "entry-a")
     assert [s["session"] for s in entry["sightings"]] == ["sess-new"]
@@ -697,7 +701,7 @@ def test_apply_coding_record_promoted_recurrence_dedupes_on_the_entry():
         {"entry_id": "entry-a", "origin_phase": "implement", "manifested_phase": "merge"}
     ]
 
-    result, stats = mod.apply_coding_record(codebook, record)
+    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
 
     entry = next(e for e in result["entries"] if e["id"] == "entry-a")
     assert [s["session"] for s in entry["sightings"]] == ["sess-new"]
@@ -716,7 +720,7 @@ def test_apply_coding_record_promoted_with_dangling_promoted_to_falls_back():
     codebook["candidates"][0]["promoted_to"] = "entry-that-was-never-created"
     record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
 
-    result, stats = mod.apply_coding_record(codebook, record)
+    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
 
     assert len(result["entries"]) == 1  # no entry fabricated
     assert result["entries"][0]["sightings"] == []
@@ -735,8 +739,8 @@ def test_apply_coding_record_adjudicated_conflict_is_idempotent():
     codebook = _codebook_with_adjudicated_candidate("rejected")
     record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
 
-    once, first_stats = mod.apply_coding_record(codebook, record)
-    twice, second_stats = mod.apply_coding_record(once, record)
+    once, first_stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
+    twice, second_stats = mod.apply_coding_record(once, record, invariant_slugs=_NO_SLUGS)
 
     assert len(twice["candidates"]) == 1
     assert len(twice["candidates"][0]["sightings"]) == 2  # unchanged by the 2nd apply
@@ -753,7 +757,7 @@ def test_apply_coding_record_still_creates_pending_for_a_genuinely_new_title():
         title="a different shape", session="sess-new", date="2026-07-24"
     )
 
-    result, stats = mod.apply_coding_record(codebook, record)
+    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
 
     assert len(result["candidates"]) == 2
     fresh = next(c for c in result["candidates"] if c["title"] == "a different shape")
@@ -785,6 +789,7 @@ _NO_CHANGES = {
     "corrections_applied": 0,
     "correction_skipped": 0,
     "record_invalid": False,
+    "invariant_slugs": mod.SlugTally(),
 }
 
 
@@ -819,7 +824,7 @@ def test_apply_coding_record_correction_rewrites_only_the_named_fields():
     record = _correction_record()
     correction = record["corrections"][0]
 
-    result, stats = mod.apply_coding_record(codebook, record)
+    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
 
     entry = next(e for e in result["entries"] if e["id"] == "entry-a")
     assert entry["title"] == correction["title"]
@@ -863,7 +868,7 @@ def test_apply_coding_record_correction_never_deletes_and_does_not_mutate_input(
     ]
     original = copy.deepcopy(codebook)
 
-    result, _ = mod.apply_coding_record(codebook, _correction_record())
+    result, _ = mod.apply_coding_record(codebook, _correction_record(), invariant_slugs=_NO_SLUGS)
 
     entry = next(e for e in result["entries"] if e["id"] == "entry-a")
     assert [s["session"] for s in entry["sightings"]] == [
@@ -882,8 +887,8 @@ def test_apply_coding_record_correction_re_apply_is_a_no_op(caplog):
     record = _correction_record()
 
     with caplog.at_level(logging.WARNING, logger="legibility.codebook"):
-        once, _ = mod.apply_coding_record(codebook, record)
-        twice, stats = mod.apply_coding_record(once, record)
+        once, _ = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
+        twice, stats = mod.apply_coding_record(once, record, invariant_slugs=_NO_SLUGS)
 
     assert stats == _NO_CHANGES
     assert twice == once
@@ -919,7 +924,7 @@ def test_apply_coding_record_correction_outranks_a_sibling_match_on_one_entry():
     record = _match_and_correction_record()
     correction = record["corrections"][0]
 
-    result, stats = mod.apply_coding_record(codebook, record)
+    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
 
     entry = next(e for e in result["entries"] if e["id"] == "entry-a")
     assert entry["title"] == correction["title"]
@@ -940,7 +945,7 @@ def test_apply_coding_record_colliding_correction_is_counted_and_logged(caplog):
     record["corrections"].append(loser)
 
     with caplog.at_level(logging.WARNING, logger="legibility.codebook"):
-        result, stats = mod.apply_coding_record(codebook, record)
+        result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
 
     entry = next(e for e in result["entries"] if e["id"] == "entry-a")
     assert entry["title"] == record["corrections"][0]["title"]
@@ -984,7 +989,7 @@ def test_apply_coding_record_correction_never_clears_a_field(field, spelling):
     else:
         del correction[field]
 
-    result, stats = mod.apply_coding_record(codebook, record)
+    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
 
     entry = next(e for e in result["entries"] if e["id"] == "entry-a")
     assert entry[field] == before[field]
@@ -1001,7 +1006,7 @@ def test_apply_coding_record_correction_unknown_entry_id_is_skipped_and_counted(
     codebook = _codebook_with_entry_a()
     record = _correction_record(entry_id="entry-zzz")
 
-    result, stats = mod.apply_coding_record(codebook, record)
+    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
 
     assert result["entries"] == _codebook_with_entry_a()["entries"]
     assert stats == {**_NO_CHANGES, "skipped_unknown_entry": 1}
@@ -1018,7 +1023,7 @@ def test_apply_coding_record_raises_on_correction_removal_action(action):
     record["corrections"][0]["action"] = action
 
     with pytest.raises(mod.NeverDeleteError):
-        mod.apply_coding_record(codebook, record)
+        mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
 
     assert codebook == original
 
@@ -1073,7 +1078,7 @@ def test_apply_coding_record_invalid_correction_is_skipped_whole(build_record):
 
     assert mod.validate_coding_record(record) != []
 
-    result, stats = mod.apply_coding_record(codebook, record)
+    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
 
     assert stats == {**_NO_CHANGES, "record_invalid": True}
     assert result == original
@@ -1091,7 +1096,7 @@ def test_apply_coding_record_raises_on_top_level_removal_directive(key):
     record[key] = ["entry-a"]
 
     with pytest.raises(mod.NeverDeleteError):
-        mod.apply_coding_record(codebook, record)
+        mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
 
     assert codebook == original  # input untouched
 
@@ -1103,7 +1108,7 @@ def test_apply_coding_record_raises_on_match_delete_action():
     record["matches"][0]["action"] = "delete"
 
     with pytest.raises(mod.NeverDeleteError):
-        mod.apply_coding_record(codebook, record)
+        mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
 
     assert codebook == original
 
@@ -1247,6 +1252,163 @@ def test_assert_no_deletion_allows_candidate_promotion_via_disposition_change():
 
 
 # ---------------------------------------------------------------------------
+# task 6400: invariant_violated is screened against the project's slugs on
+# write (plans/census-incremental-prd.md §4.8 row 15)
+# ---------------------------------------------------------------------------
+
+_KNOWN_SLUGS = ("known-slug", "other-slug")
+
+
+def _slugged_record() -> dict:
+    record = _match_record()
+    record["matches"][0]["invariant_violated"] = "known-slug"
+    record["candidates"] = [
+        {"title": "novel shape", "invariant_violated": "free text not a slug"}
+    ]
+    return record
+
+
+def _sighting_on(holder: dict, session: str) -> dict:
+    return next(s for s in holder["sightings"] if s["session"] == session)
+
+
+def test_a_known_slug_persists_and_an_unknown_one_is_stored_as_absent():
+    result, stats = mod.apply_coding_record(
+        _codebook_with_entry_a(), _slugged_record(), invariant_slugs=_KNOWN_SLUGS
+    )
+
+    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    assert _sighting_on(entry, "sess-1")["invariant_violated"] == "known-slug"
+    candidate = next(c for c in result["candidates"] if c["title"] == "novel shape")
+    assert "invariant_violated" not in _sighting_on(candidate, "sess-1")
+    assert stats["invariant_slugs"] == mod.SlugTally(
+        valid=1, rejected=("free text not a slug",)
+    )
+    assert mod.validate(result) == []
+
+
+def test_a_correction_with_an_unknown_slug_lands_without_it():
+    record = _correction_record()
+    record["corrections"][0]["invariant_violated"] = "not-a-declared-slug"
+
+    result, stats = mod.apply_coding_record(
+        _codebook_with_entry_a(), record, invariant_slugs=_KNOWN_SLUGS
+    )
+
+    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    assert entry["title"] == record["corrections"][0]["title"]
+    assert "invariant_violated" not in _sighting_on(entry, "sess-correction")
+    assert stats["corrections_applied"] == 1
+    assert stats["invariant_slugs"].rejected == ("not-a-declared-slug",)
+
+
+@pytest.mark.parametrize("value", [None, "", "<absent>"])
+def test_an_empty_slug_is_neither_valid_nor_rejected(value):
+    record = _match_record()
+    if value == "<absent>":
+        del record["matches"][0]["invariant_violated"]
+    else:
+        record["matches"][0]["invariant_violated"] = value
+
+    _, stats = mod.apply_coding_record(
+        _codebook_with_entry_a(), record, invariant_slugs=_KNOWN_SLUGS
+    )
+
+    assert stats["invariant_slugs"] == mod.SlugTally()
+
+
+def test_a_project_without_slugs_rejects_every_value():
+    result, stats = mod.apply_coding_record(
+        _codebook_with_entry_a(), _slugged_record(), invariant_slugs=()
+    )
+
+    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    assert "invariant_violated" not in _sighting_on(entry, "sess-1")
+    assert stats["invariant_slugs"] == mod.SlugTally(
+        valid=0, rejected=("known-slug", "free text not a slug")
+    )
+
+
+def test_the_slug_screen_does_not_mutate_the_record():
+    record = _slugged_record()
+    original = copy.deepcopy(record)
+
+    mod.apply_coding_record(_codebook_with_entry_a(), record, invariant_slugs=())
+
+    assert record == original
+
+
+def test_validate_still_accepts_a_legacy_free_text_slug():
+    codebook = _codebook_with_entry_a()
+    codebook["entries"][0]["sightings"] = [
+        {
+            "date": "2026-07-01",
+            "project": "dark_factory",
+            "session": "legacy",
+            "origin_phase": "unknown",
+            "manifested_phase": "unknown",
+            "invariant_violated": "some legacy free text",
+        }
+    ]
+
+    assert mod.validate(codebook) == []
+
+
+def test_slug_tallies_add_up():
+    total = mod.SlugTally(valid=1, rejected=("a",)).plus(
+        mod.SlugTally(valid=2, rejected=("b", "a"))
+    )
+
+    assert total == mod.SlugTally(valid=3, rejected=("a", "b", "a"))
+
+
+def test_unknown_slugs_are_warned_once_per_run(caplog):
+    caplog.set_level(logging.DEBUG, logger="legibility.codebook")
+
+    mod.warn_unknown_invariant_slugs(
+        mod.SlugTally(valid=2, rejected=("unknown-x", "unknown-y", "unknown-x")),
+        ("a",),
+        run="run-1",
+    )
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert warnings[0].name == "legibility.codebook"
+    message = warnings[0].getMessage()
+    assert "run-1" in message
+    assert "stored 3 " in message
+    assert "['unknown-x', 'unknown-y']" in message
+    assert message.count("unknown-x") == 1
+
+
+def test_the_unknown_slug_warning_stays_one_bounded_line(caplog):
+    """The values are LLM free text: a large run must not grow the line without
+    bound, while the count stays exact."""
+    caplog.set_level(logging.DEBUG, logger="legibility.codebook")
+    rejected = tuple(f"free-text-{n:03d}-" + "z" * 1000 for n in range(50))
+
+    mod.warn_unknown_invariant_slugs(
+        mod.SlugTally(rejected=rejected), ("a",), run="run-1"
+    )
+
+    [warning] = [r for r in caplog.records if r.levelno == logging.WARNING]
+    message = warning.getMessage()
+    assert "stored 50 " in message
+    assert "free-text-000-" in message
+    assert "free-text-049-" not in message
+    assert "more" in message
+    assert len(message) < 2000
+
+
+def test_no_unknown_slugs_means_no_warning(caplog):
+    caplog.set_level(logging.DEBUG, logger="legibility.codebook")
+
+    mod.warn_unknown_invariant_slugs(mod.SlugTally(valid=2), ("a",), run="r1")
+
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+# ---------------------------------------------------------------------------
 # amendment: migrate_v1_to_v2()/apply_coding_record() fail loudly with a
 # clear ValueError on a non-dict codebook (e.g. an empty or malformed YAML
 # file loads via yaml.safe_load as None), instead of an AttributeError deep
@@ -1270,7 +1432,7 @@ def test_migrate_v1_to_v2_raises_on_non_dict_codebook():
 
 def test_apply_coding_record_raises_on_non_dict_codebook():
     with pytest.raises(ValueError):
-        mod.apply_coding_record(_NOT_A_CODEBOOK, _match_record())
+        mod.apply_coding_record(_NOT_A_CODEBOOK, _match_record(), invariant_slugs=_NO_SLUGS)
 
 
 # ---------------------------------------------------------------------------
@@ -1347,7 +1509,7 @@ class TestMainCLI:
     def test_apply_applies_match_and_candidate_and_rewrites_file(self, tmp_path):
         codebook_path, records_path = self._write_apply_fixtures(tmp_path)
 
-        ret = mod.main(["apply", str(codebook_path), str(records_path)])
+        ret = mod.main(["apply", "--project-root", str(tmp_path), str(codebook_path), str(records_path)])
 
         assert ret == 0
         reloaded = mod.load(codebook_path)
@@ -1359,8 +1521,8 @@ class TestMainCLI:
     def test_apply_is_idempotent_at_file_level(self, tmp_path):
         codebook_path, records_path = self._write_apply_fixtures(tmp_path)
 
-        first = mod.main(["apply", str(codebook_path), str(records_path)])
-        second = mod.main(["apply", str(codebook_path), str(records_path)])
+        first = mod.main(["apply", "--project-root", str(tmp_path), str(codebook_path), str(records_path)])
+        second = mod.main(["apply", "--project-root", str(tmp_path), str(codebook_path), str(records_path)])
 
         assert first == 0
         assert second == 0
@@ -1380,7 +1542,7 @@ class TestMainCLI:
         good_line = records_path.read_text(encoding="utf-8")
         records_path.write_text("{not valid json\n" + good_line, encoding="utf-8")
 
-        ret = mod.main(["apply", str(codebook_path), str(records_path)])
+        ret = mod.main(["apply", "--project-root", str(tmp_path), str(codebook_path), str(records_path)])
         captured = capsys.readouterr()
 
         assert ret == 0
@@ -1417,7 +1579,7 @@ class TestMainCLI:
             encoding="utf-8",
         )
 
-        ret = mod.main(["apply", str(codebook_path), str(records_path)])
+        ret = mod.main(["apply", "--project-root", str(tmp_path), str(codebook_path), str(records_path)])
         captured = capsys.readouterr()
 
         assert ret == 0
@@ -1471,7 +1633,7 @@ class TestMainCLI:
             encoding="utf-8",
         )
 
-        ret = mod.main(["apply", str(codebook_path), str(records_path)])
+        ret = mod.main(["apply", "--project-root", str(tmp_path), str(codebook_path), str(records_path)])
         captured = capsys.readouterr()
 
         assert ret == 0
@@ -1498,7 +1660,7 @@ class TestMainCLI:
             json.dumps(_correction_record()) + "\n", encoding="utf-8"
         )
 
-        ret = mod.main(["apply", str(codebook_path), str(records_path)])
+        ret = mod.main(["apply", "--project-root", str(tmp_path), str(codebook_path), str(records_path)])
         captured = capsys.readouterr()
 
         assert ret == 0
@@ -1531,7 +1693,7 @@ class TestMainCLI:
         records_path = tmp_path / "records.jsonl"
         records_path.write_text(json.dumps(_match_record()) + "\n", encoding="utf-8")
 
-        ret = mod.main(["apply", str(path), str(records_path)])
+        ret = mod.main(["apply", "--project-root", str(tmp_path), str(path), str(records_path)])
         captured = capsys.readouterr()
 
         assert ret == 1
@@ -1555,6 +1717,32 @@ class TestMainCLI:
         assert ret == 1
         assert captured.err.strip() != ""
         assert path.read_bytes() == before
+
+    def test_apply_screens_slugs_against_the_project_doc(self, tmp_path, capsys, caplog):
+        caplog.set_level(logging.DEBUG)
+        root = tmp_path / "project"
+        doc = root / invariants.DOC_RELPATH
+        doc.parent.mkdir(parents=True)
+        doc.write_text("## INV-1 `known-slug`\n", encoding="utf-8")
+        codebook_path = tmp_path / "codebook.yaml"
+        mod.dump(_codebook_with_entry_a(), codebook_path)
+        records_path = tmp_path / "records.jsonl"
+        records_path.write_text(json.dumps(_slugged_record()) + "\n", encoding="utf-8")
+
+        ret = mod.main(
+            ["apply", "--project-root", str(root), str(codebook_path), str(records_path)]
+        )
+
+        assert ret == 0
+        reloaded = mod.load(codebook_path)
+        entry = next(e for e in reloaded["entries"] if e["id"] == "entry-a")
+        assert _sighting_on(entry, "sess-1")["invariant_violated"] == "known-slug"
+        candidate = next(c for c in reloaded["candidates"] if c["title"] == "novel shape")
+        assert "invariant_violated" not in _sighting_on(candidate, "sess-1")
+        out = capsys.readouterr().out
+        assert "invariant_slugs_valid=1" in out
+        assert "invariant_slugs_rejected=1" in out
+        assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1807,7 +1995,7 @@ def _assert_correction_absorbed(
     )
 
     # (5) NO-OP — the committed YAML is exactly what the sole writer produces.
-    _, stats = mod.apply_coding_record(codebook, record)
+    _, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
     assert stats == _NO_CHANGES, (
         f"re-applying session {session!r} changed something — the committed "
         f"codebook has not fully absorbed the record: {stats}"
@@ -1940,7 +2128,7 @@ def test_live_codebook_carries_the_task_4892_corrections():
     # (4) NO-OP — the record is already fully absorbed, so re-running the sole
     #     writer over it appends nothing.
     for record in records:
-        codebook, stats = mod.apply_coding_record(codebook, record)
+        codebook, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
         assert stats == _NO_CHANGES, (
             f"re-applying session {record.get('session')!r} appended something — "
             f"its sightings are not already absorbed by the live codebook: {stats}"

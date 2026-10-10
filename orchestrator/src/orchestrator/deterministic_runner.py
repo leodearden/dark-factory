@@ -367,6 +367,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from shared.before_done_paths import BeforeDonePaths, resolve_before_done_paths
 from shared.proc_group import unsafe_pgid_reason
 from shared.task_metadata import (
     HUMAN_CURATOR_ADJUDICATED_AT_KEY,
@@ -611,7 +612,7 @@ def _script_timeout_budget_line(exc: ScriptTimeout, subject: str) -> str:
     )
 
 
-def _survivor_processes_line(script: str) -> str:
+def _survivor_processes_line(script: Path) -> str:
     """The actionable sentence for a teardown that left the script's children
     alive — printed by BOTH deploy arms whenever the whole-group kill was not
     the signal dispatched (task 4252 reviewer finding).
@@ -631,7 +632,7 @@ def _survivor_processes_line(script: str) -> str:
     )
 
 
-def _script_timeout_fact_lines(exc: ScriptTimeout, *, script: str) -> list[str]:
+def _script_timeout_fact_lines(exc: ScriptTimeout, *, script: Path) -> list[str]:
     """The FACT sentences both DEPLOY arms print for a ``ScriptTimeout``.
 
     Shared so the two deploy branches cannot come to say different things
@@ -654,9 +655,10 @@ def _script_timeout_fact_lines(exc: ScriptTimeout, *, script: str) -> list[str]:
         exc: the timeout, carrying the three measured facts these sentences
             are built from — budget, the script's own exit code if it had
             one, and which signal the teardown dispatched.
-        script: ``before_done['script']``, the search key the survivor
-            sentence hands the operator when that teardown left the script's
-            children running.  Not on ``exc``: it is the deploy's own
+        script: the absolute path the runner executed
+            (``DeterministicRunner._before_done_paths``), the search key the
+            survivor sentence hands the operator when that teardown left the
+            script's children running.  Not on ``exc``: it is the deploy's own
             configuration, not something the timeout measured.
     """
     group_killed = exc.teardown is ProcessTeardown.GROUP_KILLED
@@ -840,24 +842,23 @@ RECURRENCE_KEY: str = 'recurrence'
 _PROJECT_ROOT_PLACEHOLDER: str = '<project_root>'
 
 
-def _snippet_project_root(scheduler) -> str:
-    """Return the configured project_root for the operator runbook snippet.
+def _configured_project_root(scheduler) -> Path | None:
+    """Return the scheduler's configured project_root, or None if unusable.
 
-    Falls back to a VISIBLE placeholder rather than raising or interpolating a
-    repr.  ``scheduler`` is duck-typed here — ``Harness._run_deterministic_slot``
-    builds the runner "with only the minimal dependencies needed" — and
-    ``_file_curator_adjudication_missing_and_block``'s contract is that a
-    durable on-disk safety escalation is filed no matter what.  The attribute
-    chain is read while formatting the detail string, i.e. BEFORE
-    ``escalation_queue.submit()``, so an ``AttributeError`` there does not just
-    skip the BLOCK — it loses the escalation entirely and propagates, exactly
-    what that method's docstring forbids.
+    ``scheduler`` is duck-typed here — ``Harness._run_deterministic_slot``
+    builds the runner "with only the minimal dependencies needed" — so the
+    attribute chain must never raise.  That matters most to
+    ``_file_curator_adjudication_missing_and_block``, whose contract is that a
+    durable on-disk safety escalation is filed no matter what: the chain is
+    read while formatting the detail string, i.e. BEFORE
+    ``escalation_queue.submit()``, so an ``AttributeError`` there would not
+    just skip the BLOCK — it would lose the escalation entirely and propagate.
 
     Accepts the value ONLY when it is a non-empty ``str``/``Path`` that is not
-    the literal ``'None'``, so a test double's Mock attribute cannot reach an
-    operator as ``<MagicMock id=...>``.  The ``'None'`` rejection mirrors the
-    scheduler's own project_root guard, which defends against a value that
-    bypassed pydantic validation.
+    the literal ``'None'``, so a test double's Mock attribute reaches neither
+    an operator (as ``<MagicMock id=...>``) nor a filesystem path.  The
+    ``'None'`` rejection mirrors the scheduler's own project_root guard, which defends
+    against a value that bypassed pydantic validation.
 
     Deliberately no broad ``except Exception``: the two ``getattr`` defaults
     plus the isinstance/non-empty check are the entire failure surface.
@@ -866,8 +867,14 @@ def _snippet_project_root(scheduler) -> str:
     if isinstance(root, (str, Path)):
         text = str(root).strip()
         if text and text != 'None':
-            return text
-    return _PROJECT_ROOT_PLACEHOLDER
+            return Path(text)
+    return None
+
+
+def _snippet_project_root(scheduler) -> str:
+    """The configured project_root for the runbook snippet, else a visible placeholder."""
+    root = _configured_project_root(scheduler)
+    return str(root) if root is not None else _PROJECT_ROOT_PLACEHOLDER
 
 # Length bound applied to the externally-supplied `human_curator_adjudicated_at`
 # value when it is interpolated into the curator-gate `done_provenance.note`.
@@ -1383,6 +1390,17 @@ class DeterministicRunner:
         """
         return os.environ.get('ORCH_UNIT', '')
 
+    def _before_done_paths(self, before_done: dict) -> BeforeDonePaths:
+        root = _configured_project_root(self.scheduler)
+        if root is None:
+            root = Path.cwd()
+            logger.warning(
+                'DeterministicRunner: scheduler carries no configured project_root — '
+                'resolving before_done paths against the process cwd %s',
+                root,
+            )
+        return resolve_before_done_paths(before_done, root.resolve())
+
     async def _default_schedule_detached_restart(
         self,
         before_done: dict,
@@ -1441,20 +1459,10 @@ class DeterministicRunner:
             fails (tail carries the error detail).
         """
         target_unit = before_done.get('target_unit', 'unknown')
-        script = before_done['script']
         args = before_done.get('args') or []
-
-        # The transient unit runs under the systemd --user manager, which does
-        # NOT inherit the orchestrator's own working directory — it defaults to
-        # $HOME.  A relative deploy `script` would therefore fail to be found
-        # (exit 127) once the unit fires.  Resolve an explicit cwd from
-        # before_done['cwd'] when the caller supplied one; otherwise fall back
-        # to this process's own os.getcwd(), which is project_root because the
-        # orchestrator's own systemd unit pins WorkingDirectory=project_root.
-        # RestartPlan.__post_init__ absolutizes a relative `script` against
-        # this `cwd` (RP-3), byte-identical to this method's prior inline
-        # absolutization.
-        cwd = before_done.get('cwd') or os.getcwd()
+        # docs/task-authoring.md §5: paths resolve against the configured
+        # project_root (shared/src/shared/before_done_paths.py).
+        paths = self._before_done_paths(before_done)
 
         esc_summary = summary or (
             f'Self-restart fire-time failure: {target_unit}'
@@ -1533,9 +1541,9 @@ class DeterministicRunner:
         )
 
         plan = RestartPlan(
-            script=Path(script),
+            script=paths.script,
             args=list(args),
-            cwd=Path(cwd),
+            cwd=paths.cwd,
             target_unit=transient_unit,
             own_unit=transient_unit,
             on_failure_escalation=escalation_spec,
@@ -1673,18 +1681,17 @@ class DeterministicRunner:
                 script's OWN exit code when the teardown found the direct child
                 already exited.
         """
-        script = before_done['script']
+        paths = self._before_done_paths(before_done)
         args = before_done.get('args') or []
         # Merge over os.environ so the child sees a full environment (PATH, HOME,
         # XDG_RUNTIME_DIR …).  An empty / absent env dict means full inherit.
         env = {**os.environ, **before_done['env']} if before_done.get('env') else None
-        cwd = before_done.get('cwd') or None
         timeout_secs = before_done.get('timeout_secs', 60)
 
         proc = await asyncio.create_subprocess_exec(
-            script, *args,
+            str(paths.script), *args,
             env=env,
-            cwd=cwd,
+            cwd=paths.cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
@@ -3264,7 +3271,9 @@ class DeterministicRunner:
             inner_timeout_detail = '\n'.join([
                 description,
                 note,
-                *_script_timeout_fact_lines(exc, script=before_done['script']),
+                *_script_timeout_fact_lines(
+                    exc, script=self._before_done_paths(before_done).script,
+                ),
                 'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
             ])
             return await self._file_infra_issue_and_block(
@@ -4347,10 +4356,11 @@ class DeterministicRunner:
                     baseline_main_pid=baseline.get('MainPID', 0),
                     inspect_timeout_secs=self._inspect_timeout_secs,
                 )
+                paths = self._before_done_paths(before_done)
                 plan = RestartPlan(
-                    script=Path(before_done['script']),
+                    script=paths.script,
                     args=list(before_done.get('args') or []),
-                    cwd=Path(before_done.get('cwd') or os.getcwd()).resolve(),
+                    cwd=paths.cwd,
                     target_unit=target_unit,
                     # own_unit must be truthy and provably non-self here (this
                     # branch is only reached when the runner's OWN self_target
@@ -4404,7 +4414,7 @@ class DeterministicRunner:
                     inner_timeout_detail = '\n'.join([
                         description,
                         f'Target unit: {target_unit}',
-                        *_script_timeout_fact_lines(exc, script=before_done['script']),
+                        *_script_timeout_fact_lines(exc, script=paths.script),
                         'The post-deploy fresh-PID verify never ran, so the unit state '
                         'after the timeout is unobserved — check it out-of-band (e.g. '
                         'systemctl --user status) before resolving.',

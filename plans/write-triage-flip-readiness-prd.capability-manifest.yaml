@@ -279,3 +279,64 @@ tasks:
     delivered_check:
       kind: manual
       reason: the gate runs the predicate; a second grep would duplicate it
+- label: pi2
+  task_id: 6530
+  title: Write-time slates — rerun the flip-decision judge arms (§12, eval-only)
+  capabilities:
+  - name: write-time-population-published
+    binding: capability→producer — π2 publishes a population artifact scored on slates
+      that existed when each write was made (verified on landing by the grep)
+    verdict: OPEN
+    delivered_check:
+      kind: grep
+      pattern: '"n_judge_band_write_time":'
+      paths:
+      - fused-memory/calibration/write_triage_population_write_time.json
+      expect: present
+- label: lambda2
+  task_id: 6531
+  title: Blind rating top-up of the write-time pairs (§12, operational)
+  capabilities:
+  - name: every-write-time-pair-rated
+    binding: capability→producer — λ2; same brief and protocol as λ; ι2 refuses on
+      an unrated pair so an incomplete top-up cannot pass Γ3
+    verdict: OPEN
+    delivered_check:
+      kind: manual
+      reason: operational leaf; completeness is asserted by ι2 at μ, not by a grep
+- label: iota2
+  task_id: 6532
+  title: Comparative flip instrument and μ rerun (§12, C2‴)
+  capabilities:
+  - name: comparative-block-published
+    binding: capability→producer — ι2 writes the comparative block Γ3's re-pointed
+      args read (verified on landing by the grep)
+    verdict: OPEN
+    delivered_check:
+      kind: grep
+      pattern: '"harm_delta_vs_status_quo":'
+      paths:
+      - fused-memory/calibration/write_triage_best_config.json
+      expect: present
+- label: contested-heal
+  task_id: 6533
+  title: Link-heal adjudicates judge-written contested links (§12 D21 follow-up)
+  capabilities:
+  - name: judge-contested-links-healable
+    binding: capability→producer — lifts link-heal H1 row 2 for triage-stamped children
+      only; not a flip dependency
+    verdict: OPEN
+    delivered_check:
+      kind: manual
+      reason: behaviour is asserted by the sweep's own report and tests
+- label: contested-render-full
+  task_id: 6534
+  title: Contesting child rendered in full on the parent-only path (§12 D21 follow-up)
+  capabilities:
+  - name: contesting-child-full-text-on-parent-only-hit
+    binding: capability→producer — χ's intent completed for the fallback path; not
+      a flip dependency
+    verdict: OPEN
+    delivered_check:
+      kind: manual
+      reason: asserted by the orchestrator fixture and tests

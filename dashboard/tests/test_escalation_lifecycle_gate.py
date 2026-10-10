@@ -318,10 +318,10 @@ async def _build_live_boundary_archive(queue: EscalationQueue, server: Any) -> _
 async def _build_every_class_archive(queue: EscalationQueue, server: Any) -> _LiveArchive:
     """The boundary archive, plus one record in each class it does not already hold.
 
-    Both go through α's production terminal-write paths: the L0 strand sweep
+    All go through α's production terminal-write paths: the L0 strand sweep
     (``dismiss_all_pending`` with a strand threshold, the reaper's path) stamps
     ``'stale-strand'``, and the server's ``resolve_issue`` stamps
-    ``'moot-terminal-subject'`` when the operator rules the subject moot.
+    ``'moot-terminal-subject'`` and every remaining class.
     """
     arch = await _build_live_boundary_archive(queue, server)
 
@@ -339,6 +339,17 @@ async def _build_every_class_archive(queue: EscalationQueue, server: Any) -> _Li
     arch.records.append(_RecordExpectation(
         ID_MOOT, SRC_MOOT, 1, 'resolved', 'moot-terminal-subject', 'stamped', resolved_by='interactive',
     ))
+
+    held = {r.cls for r in arch.records if r.cls is not None}
+    for n, cls in enumerate(sorted(RESOLUTION_CLASSES - held), start=1):
+        esc_id, source = f'esc-gx{n}-1', f'gate-src-{cls}'
+        _submit_pending(queue, esc_id, f'gx{n}', source, level=0, filed_at=_BASE + timedelta(hours=8 + n))
+        await _resolve_via_server(
+            server, esc_id, resolution=f'ruled {cls}', resolved_by='interactive', resolution_class=cls,
+        )
+        arch.records.append(_RecordExpectation(
+            esc_id, source, 0, 'resolved', cls, 'stamped', resolved_by='interactive',
+        ))
     return arch
 
 
@@ -712,6 +723,7 @@ class TestFrontendPayloadContract:
         workflow = entry['workflow']
         assert {
             'tier_weekly', 'action_mix', 'churn_daily', 'esc_per_done_daily', 'flow_daily',
+            'done_counts_read',
         } <= set(workflow)
         assert workflow['esc_per_done_daily']
         for row in workflow['esc_per_done_daily']:

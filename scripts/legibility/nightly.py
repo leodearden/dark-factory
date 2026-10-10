@@ -31,6 +31,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import NamedTuple
 
 # Self-bootstrap for standalone `python scripts/legibility/nightly.py` runs
 # (and the systemd ExecStart, which invokes this file directly) -- must run
@@ -46,8 +47,10 @@ from legibility import (  # noqa: E402
     codebook,
     coder,
     digest,
+    invariants,
     inventory,
     sampling,
+    session_ledger,
     session_runner,
     trickle_state,
     unlanded,
@@ -132,35 +135,16 @@ def resolve_config_path(
 def select_scored_records(
     cfg: LegibilityConfig, projects_root: Path | str, target_date: date,
 ) -> list[sampling.ScoredRecord]:
-    """Enumerate *target_date*'s sessions for *cfg* and assemble a
-    :class:`~legibility.sampling.ScoredRecord` per session.
-
-    Reuses ``inventory.enumerate_sessions`` plus sampling's own private
-    one-pass helpers (``_score_and_find_first_turn`` /
-    ``_first_user_turn_text``) -- the EXACT loop ``sampling.main`` uses --
-    rather than duplicating the score+first-turn pass or adding a new public
-    function to the already-landed β module.
-    """
+    """Enumerate *target_date*'s sessions for *cfg* and score each one with
+    :func:`legibility.sampling.score_session`, the loop ``sampling.main``
+    uses too."""
     sessions = inventory.enumerate_sessions(
         projects_root, cfg.cwd_prefixes, target_date,
         agent_transcript_roots=inventory.resolve_agent_transcript_roots(
             cfg.project_root, cfg.agent_transcript_roots
         ),
     )
-
-    scored: list[sampling.ScoredRecord] = []
-    for session in sessions:
-        counts, first_turn = sampling._score_and_find_first_turn(session.path)
-        stratum = sampling.classify_agent_class(first_turn, session.path)
-        scored.append(
-            sampling.ScoredRecord(
-                session=session,
-                stratum=stratum,
-                counts=counts,
-                first_turn_text=sampling._first_user_turn_text(first_turn),
-            )
-        )
-    return scored
+    return [sampling.score_session(session) for session in sessions]
 
 
 DEFAULT_MAX_DIGEST_BYTES = sampling.DEFAULT_DIGEST_MAX_BYTES
@@ -896,6 +880,84 @@ class NightlyResult:
     Set only on the commit-failure branch; a structured fact rather than the
     escalation prose that also carries it."""
 
+    ledger_rows_written: int = 0
+    """Coded sessions this run added to the session ledger."""
+
+    ledger_rows_failed: int = 0
+    """Coded sessions this run failed to ledger — counted, so a ledger fault
+    is a structured fact and not only a journal line (the next census
+    re-mines them)."""
+
+
+class _LedgerWrite(NamedTuple):
+    written: int
+    failed: int
+    error: str | None
+
+
+def _ledger_fault(
+    cfg: LegibilityConfig, target_date: date, *, failed: int, error: Exception,
+) -> _LedgerWrite:
+    outcome = _LedgerWrite(written=0, failed=failed, error=str(error))
+    logger.warning(
+        'legibility trickle ledger: project=%s date=%s rows_written=%d '
+        'rows_failed=%d error=%s',
+        cfg.project_id, target_date.isoformat(), outcome.written,
+        outcome.failed, outcome.error,
+    )
+    return outcome
+
+
+def _trickle_run_ref(cfg: LegibilityConfig, target_date: date) -> str:
+    return f'trickle-{cfg.project_id}-{target_date:%Y%m%d}'
+
+
+def _ledger_coded_sessions(
+    cfg: LegibilityConfig, records, target_date: date, now: datetime | None,
+) -> _LedgerWrite:
+    """Record every merged coding in the session ledger so the census skips
+    those sessions. A ledger fault -- rows that will not build (e.g. a naive
+    *now*) or a write that fails -- is logged and counted, never raised."""
+    records = list(records)
+    try:
+        rows = session_ledger.rows_for(
+            records,
+            coded_by=session_ledger.CodedBy.TRICKLE,
+            run_ref=_trickle_run_ref(cfg, target_date),
+            instrument_version=digest.DIGEST_INSTRUMENT_VERSION,
+            coded_at=now if now is not None else datetime.now(UTC),
+        )
+    except ValueError as exc:
+        return _ledger_fault(cfg, target_date, failed=len(records), error=exc)
+    try:
+        written = session_ledger.record_codings(
+            session_ledger.ledger_path(cfg.project_id), rows,
+        )
+    except session_ledger.LedgerError as exc:
+        return _ledger_fault(cfg, target_date, failed=len(rows), error=exc)
+    logger.info(
+        'legibility trickle ledger: project=%s date=%s rows_written=%d rows_failed=%d',
+        cfg.project_id, target_date.isoformat(), written, 0,
+    )
+    return _LedgerWrite(written=written, failed=0, error=None)
+
+
+def _report_invariant_slugs(
+    cfg: LegibilityConfig,
+    target_date: date,
+    tally: codebook.SlugTally,
+    invariant_slugs: Sequence[str],
+) -> None:
+    """Journal what the merger kept and dropped of the night's
+    ``invariant_violated`` values, and warn once naming the dropped ones."""
+    logger.info(
+        'legibility trickle: project=%s date=%s invariant slugs: %d valid, %d rejected',
+        cfg.project_id, target_date.isoformat(), tally.valid, len(tally.rejected),
+    )
+    codebook.warn_unknown_invariant_slugs(
+        tally, invariant_slugs, run=_trickle_run_ref(cfg, target_date),
+    )
+
 
 def _report_sample_outcome(
     cfg: LegibilityConfig,
@@ -1420,9 +1482,11 @@ def run_nightly(
                 codebook_path,
             )
             cb = {'version': 2, 'entries': [], 'candidates': []}
+        invariant_slugs = invariants.read_slugs(cfg.project_root)
 
         run = coder.code_digests(
-            digests, cb, project=cfg.project_id, model=cfg.models.trickle, invoke=invoke,
+            digests, cb, project=cfg.project_id, model=cfg.models.trickle,
+            invariant_slugs=invariant_slugs, invoke=invoke,
         )
 
         if coder.is_cap_deferral(run):
@@ -1478,10 +1542,14 @@ def run_nightly(
 
         applied = 0
         conflicts = 0
+        slug_tally = codebook.SlugTally()
         deletion_skipped: list[str] = []
+        merged_records = []
         for record in run.records:
             try:
-                cb, stats = codebook.apply_coding_record(cb, record)
+                cb, stats = codebook.apply_coding_record(
+                    cb, record, invariant_slugs=invariant_slugs,
+                )
             except codebook.NeverDeleteError as exc:
                 # One deletion-shaped coder record must not cost the whole
                 # night's merge: apply_coding_record raises before it deep-
@@ -1501,7 +1569,9 @@ def run_nightly(
                 )
                 deletion_skipped.append(detail)
                 continue
+            merged_records.append(record)
             conflicts += stats['candidate_disposition_conflicts']
+            slug_tally = slug_tally.plus(stats['invariant_slugs'])
             # A conflict-appended sighting IS a codebook mutation (a
             # recurrence appended to an already-adjudicated candidate), so it
             # must count toward the dump/commit gate below -- otherwise a
@@ -1519,6 +1589,7 @@ def run_nightly(
                 + stats['corrections_applied']
             )
 
+        _report_invariant_slugs(cfg, target_date, slug_tally, invariant_slugs)
         if conflicts:
             logger.info(
                 'legibility trickle: %d candidate sighting(s) appended to an '
@@ -1617,6 +1688,15 @@ def run_nightly(
                 'legibility trickle: no-change night: nothing committed (applied=%d)', applied,
             )
 
+        # Before the census step: it may launch the census synchronously, and
+        # that census must skip what this night coded.
+        ledger = _ledger_coded_sessions(cfg, merged_records, target_date, now)
+        ledger_reason = (
+            f'legibility trickle: {ledger.failed} coded session(s) not ledgered, '
+            f'the next census re-mines them ({ledger.error})'
+            if ledger.error is not None else None
+        )
+
         # Task 4148. The decision was computed and returned on NightlyResult
         # below, but never LOGGED -- so only the census's failure modes
         # (census_trigger's own WARNINGs, FIRE-WITHOUT-LAUNCH, 4085's
@@ -1652,7 +1732,9 @@ def run_nightly(
             # never-delete contract violation would survive only as a WARNING
             # line in the journal -- `escalated` False, `reason` empty, every
             # other field identical to a clean run.
-            reason=deletion_reason,
+            reason='; '.join(filter(None, (deletion_reason, ledger_reason))) or None,
+            ledger_rows_written=ledger.written,
+            ledger_rows_failed=ledger.failed,
         )
         return result
     finally:

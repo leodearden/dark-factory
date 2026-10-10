@@ -35,7 +35,7 @@ from escalation.models import Escalation
 from escalation.pins import PinRecord, _norm_id, classify_pins
 from escalation.queue import EscalationQueue
 from shared.deploy_state import DeployPhase
-from shared.task_claimant import compose_claimant_run_id
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, compose_claimant_run_id
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
@@ -501,6 +501,13 @@ def _plan_lock_artifacts(worktree: Path) -> TaskArtifacts:
     deliberately never consults.
     """
     return TaskArtifacts(worktree, TaskArtifacts.meta_root_for(worktree.parent, worktree.name))
+
+
+class TestDefaultHeartbeatTtl:
+    def test_default_is_the_shared_claimant_ttl(self):
+        """Identity, not equality: a local timedelta(minutes=10) copy compares
+        equal, so only ``is`` distinguishes it from the single definition."""
+        assert _make_ground_truth().heartbeat_ttl is DEFAULT_CLAIMANT_HEARTBEAT_TTL
 
 
 @pytest.mark.asyncio

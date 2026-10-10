@@ -284,7 +284,7 @@ def test_the_band_edges_are_exactly_where_the_design_puts_them() -> None:
         True,  # 150         -- measured, test_offline_lane_integration.py
         True,  # 180         -- measured, the most common in-band value (34 sites)
         True,  # 299         -- last inverting value
-        False,  # 300        -- WHOLE_TREE_SCAN / HEAVY_BARRIER / the CLI budget
+        False,  # 300        -- WHOLE_TREE_SCAN / the CLI budget
         False,  # 360        -- loosens under both
         False,  # 960        -- PYTEST_TIMEOUT (warm-lane bash bucket)
     ]

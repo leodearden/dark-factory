@@ -118,25 +118,26 @@ canonically by uuid (so the result does not depend on the order FalkorDB
 happens to return rows in, which is not guaranteed stable), permute under
 `Random(f'{seed}:{month}:{kind}')`, take the first `allocate()[cell]`.
 
-## N = 200 is provisional
+## N = 200 is final (ruled by ζ)
 
-200 is δ's choice: the midpoint of the PRD's 150–300 band, checked against the
-measured census so that all 16 non-empty cells receive at least one seat.
-**PRD Open Q4 defers the final corpus size to ζ**, to be settled from measured
-control variance and wall-clock.
+200 was δ's choice: the midpoint of the PRD's 150–300 band, checked against the
+measured census so that all 16 non-empty cells receive at least one seat. PRD
+Open Q4 deferred the final corpus size to ζ, and **ζ kept N = 200** after
+measuring control variance and wall-clock on this exact manifest. Every LLM
+gated margin derived from the two incumbent control replays is far inside the
+0.10 adequacy bound, and wall-clock does not constrain N. The ruling and its
+measured basis are in `plans/local-memory-models-eval-preregistration.md`
+§"Corpus N".
 
-Re-tuning is cheap by construction. Because each cell's take is a *prefix* of
-that cell's permutation, growing N only ever **appends** to a cell — so ζ can
-re-run the builder at a different N without invalidating replays ε has already
-completed at the smaller one. Note this is a **per-cell** guarantee, not a
-global one: largest-remainder allocation can move a single seat between cells
-as N changes, so a cell whose allocation *shrank* is the one case where an
-earlier pick is dropped.
+The controls, and every margin pre-registered from them, are bound to this
+manifest's `corpus_sha`. Re-running the builder at a different `--n` writes a
+different manifest with a different `corpus_sha`, which invalidates the
+controls. That would be a new pre-registration, not a re-tune.
 
-```bash
-# what ζ runs to re-tune
-uv run python fused-memory/scripts/local_memory_models_eval/build_corpus.py --n 300
-```
+The builder's prefix property still holds. Each cell's take is a prefix of that
+cell's seeded permutation, so growing N only ever **appends** to a cell. This
+is a **per-cell** guarantee, not a global one: largest-remainder allocation can
+move a single seat between cells as N changes.
 
 ## The binding hazard: no conditioning on the incumbent's outcome
 
@@ -239,7 +240,24 @@ Live endpoints come from `FusedMemoryConfig()` (honours `CONFIG_PATH`).
 | `integrity --reference G --candidate G` | ι | Re-embed integrity verdict over two scratch topologies (`topology.py`) |
 | `parity-check --run-a A --run-b B` | ζ | Client-class parity deltas (a − b) into `A/parity/<arm b>/metrics/` (`comparison.py`) |
 | `control-check --run A --run B [--run …] [--reference-outcomes F]` | ζ | Symmetry, one code sha, token/cost and reference checks (`checks.py`) |
+| `preregister --run-a A --run-b B --out F` | ζ | The incumbent control pair's margins, latency envelope and calls-per-episode profile, written to a fresh `F` (an existing `F` is refused, never overwritten); B must have run with `--reference-outcomes` A, and its graph-sameness is recomputed from both runs' outcomes (`preregistration.py`, `margins.py`) |
+| `screen --evidence-root R --arms-manifest Y --preregistration-inputs P --reference-outcomes O --out F` | η | Offline: loads each `arms.yaml` LLM arm's screening evidence under `R` and writes the survivor verdict to a fresh `F`. A zero-survivor verdict exits 0, and invalid evidence exits 2 (`screening.py`, `screening_evidence.py`) |
+| `incumbent-cost --telemetry T --until U --pricing-spec S --control-run A [--control-run …] --out-dir D` | θ | Offline: windows `telemetry_query.py`'s JSONL dump `T` from the first token-bearing graphiti LLM attempt up to `U` (ISO-8601 with an offset), prices it at `S`'s token rates, and adds each control run's replay unit cost. The dump must reach back past that first attempt and forward to `U`, or it is refused. Writes `D/production-telemetry.jsonl` and `D/incumbent-cost.json`, both or neither; an existing output is refused, never overwritten (`incumbent_cost.py`) |
+| `topology --graph G` | ζ, ι | A scratch graph's node and edge counts and topology hash: ζ freezes the reference graph, ι re-runs it to verify the graph is unchanged (`topology.py`) |
 | `teardown --arm-spec S [--collection]` | ι | Deletes the arm's scratch graph and, with `--collection`, its Qdrant replica (`teardown.py`) |
+| `mem0-snapshot --collection C --out F` | ι | A read-only scroll of Mem0 collection `C` into a fresh JSONL `F`, and its sha256 (`mem0_replica.py`) |
+| `probe-set --reference-json J --control-a-outcomes O --transcript-corpus T --mem0-snapshot F --registry R --out P` | ι | The embedding probe set, written to a fresh `P`. It reads the frozen reference through `ro_query` only and exits 3 if the reference's hash moved. δ's `corpus_sha` comes from the `run.json` beside `O`, and E1's registry and `content_key` are loaded from `memory_eval_retrieval_probe.py` (`probe_set.py`) |
+| `embed-specs --arms-manifest Y --probe-set P --code-sha C --preregistration-sha S --out-dir D` | ι | `D/<arm_id>.json` for the two incumbent controls, at the config's embedder, and for each `arms.yaml` embedding arm, all with `corpus_sha` = the sha of `P`. Writes all or none, and an existing spec is refused (`slate.py`) |
+| `embed-run --arm-spec S --probe-set P --mem0-snapshot F --out-root D [--repo-root R]` | ι | One embedding arm end to end: copy and re-embed the reference, probe both index configurations, build and probe the Mem0 replica, and time queries. A scratch graph or replica left by an earlier run is refused (exit 2) before anything is copied (`embedding_run.py`, `embedding_graph_phase.py`) |
+| `embed-preregister --run-a A --run-b B --out F` | ι | The embedding control pair's margins and query-latency envelope, written to a fresh `F`. A control with a failed latency query, or whose re-embed left a text unembedded, yields none (exit 2) (`embedding_preregistration.py`) |
+| `embed-compare --preregistration F --run R [--run …]` | ι | Offline: one markdown row per candidate and margin, then each candidate's envelope, reported rows and `non_inferior` verdict. A failed latency query keeps the envelope from admitting a candidate. A run whose re-embed left a text unembedded, or that ran at another code sha, corpus sha or search timeout than the pre-registration, is refused (exit 2) (`embedding_preregistration.py`) |
+
+`screen_slate.py`, beside `harness.py`, is η's sweep driver. It runs every LLM
+arm in turn: start, smoke, run, α's healthcheck, stop and teardown, all through
+the pinned harness. Each arm's traffic passes through the in-process usage tap
+(`usage_tap.py`), which records the server's own per-call `usage`. Its
+provenance and run record:
+`plans/local-memory-models-eval-screening/README.md`.
 
 `run` refuses before touching any store unless the spec's `code_sha` is the
 clean HEAD of `--repo-root`, a candidate's `preregistration_sha` carries the
@@ -253,8 +271,8 @@ population.
 |---|---|
 | 0 | ok |
 | 1 | the run could not complete (store unreachable, index build failed, the index probe could not remove its seeded node — the error names it — or a traceback) |
-| 2 | refused: invalid spec or input, a pre-run instrument check failed, a run dir is not fresh or not complete |
-| 3 | an instrument check failed (post-run, smoke, index-check, integrity, control-check) |
+| 2 | refused: invalid spec or input, a pre-run instrument check failed, a run dir is not fresh or not complete, an embedding arm's scratch graph or replica is stale, a control pair yields no valid pre-registration |
+| 3 | an instrument check failed (post-run, smoke, index-check, integrity, control-check, embed-run's mid-run checks, probe-set's frozen-reference check) |
 | 4 | INV-4 abort: consecutive episode failures stopped the run |
 | 5 | scratch guard: a non-`evalmem_` name reached a guarded checkpoint |
 | 6 | corpus integrity: `corpus_sha` mismatch, or δ's verdict is not ok |
@@ -276,6 +294,20 @@ artifacts.
 | `graph_sameness_details.json` | Present only with `--reference-outcomes` |
 | `journal/` | The run-local write journal; read it with `OPERATOR_TELEMETRY_QUERY` |
 
+### Embedding run directory
+
+`embed-run` uses the same `<out-root>/<arm_id>/<STAMP>/` layout.
+
+| Path | Content |
+|---|---|
+| `run.json` | The `EmbeddingRunManifest`, written last; a failed instrument check writes none |
+| `metrics/` | Six per-configuration records (known-item recall@5, recall@10 and MRR for each index configuration), plus the Mem0, query-latency and re-embed-throughput records |
+
+Each embedding arm uses one graph (= `scratch_group_id`), which passes through
+embedding-only and then with-indices, plus a same-named Qdrant replica. So
+`teardown --arm-spec S --collection` removes both. The rationale is in
+`plans/local-memory-models-eval-embedding-report.md`.
+
 ## Scratch names
 
 Every graph or collection the harness writes, indexes, reads for topology or
@@ -290,7 +322,8 @@ uv run pytest -m integration tests/arm_harness
 
 It replays two episodes onto `evalmem_test_` graphs on the FalkorDB at
 `FALKOR_HOST`/`FALKOR_PORT` against a local mock endpoint, and asserts that no
-protected graph or index changed.
+protected graph or index changed. `test_live_embedding_integration.py` does
+the same for an embedding arm's copy, re-embed and index transitions.
 
 ## Known limitations
 

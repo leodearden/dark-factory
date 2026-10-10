@@ -317,6 +317,8 @@ NON_TERMINAL_STATUS_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
+# Out-of-module importer: reconciliation/stale_gate_citation_guard.py
+# (retrospective cue after a gate-citation id list).
 TERMINAL_OUTCOME_RE: re.Pattern[str] = re.compile(
     r'\b(?:merged|landed|merge\s+commit|done|cancell?ed|completed|shipped)\b',
     re.IGNORECASE,

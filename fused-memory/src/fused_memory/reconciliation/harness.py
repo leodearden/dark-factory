@@ -124,6 +124,7 @@ try:
     from escalation.server import (  # type: ignore[import-untyped]
         create_server as create_escalation_server,
     )
+    from escalation.store_identity import StoreIdentity  # type: ignore[import-untyped]
     HAS_ESCALATION = True
 except ImportError:
     HAS_ESCALATION = False
@@ -2808,7 +2809,15 @@ class ReconciliationHarness:
             queue_dir = Path(self.config.explore_codebase_root) / queue_dir
         self._escalation_queue = EscalationQueue(queue_dir)  # type: ignore[possibly-undefined]
 
-        mcp_server = create_escalation_server(self._escalation_queue)  # type: ignore[possibly-undefined]
+        mcp_server = create_escalation_server(  # type: ignore[possibly-undefined]
+            self._escalation_queue,
+            store_identity=StoreIdentity(  # type: ignore[possibly-undefined]
+                kind='reconciliation',
+                queue_dir=self._escalation_queue.queue_dir,
+                project_id=None,
+                project_root=None,
+            ),
+        )
         host = self.config.escalation_host
         port = self.config.escalation_port
 
@@ -5604,7 +5613,7 @@ class ReconciliationHarness:
             # Task 2964: `_tasks_snapshot_at` is the instant the per-task snapshot
             # below (task_by_id, and therefore every heartbeat_at it carries) was
             # read. It is threaded into corroboration_for_task ONLY to age-check
-            # that snapshot's own heartbeat_at against DEFAULT_HEARTBEAT_TTL, so it
+            # that snapshot's own heartbeat_at against DEFAULT_CLAIMANT_HEARTBEAT_TTL, so it
             # must be the snapshot's clock, not the clock at the moment the gate
             # runs: the gate fires AFTER the focused S1→S2→S3 stages, i.e. after
             # minutes of LLM work, and the TTL is 10 minutes — comparable to a

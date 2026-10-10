@@ -22,6 +22,22 @@ from shared.cli_invoke import (
 )
 
 
+@pytest.fixture
+def pinned_claude(monkeypatch, tmp_path: Path) -> str:
+    """Pin CLAUDE_BINARY at a real executable and yield its absolute path.
+
+    build_claude_argv now resolves argv[0] to an absolute path rather than
+    emitting the bare name 'claude' (task 4448), so these argv assertions need
+    a deterministic value that does not depend on whether the CLI happens to
+    be on the CI PATH.
+    """
+    exec_file = tmp_path / 'claude'
+    exec_file.write_text('#!/bin/sh\nexit 0\n')
+    exec_file.chmod(0o755)
+    monkeypatch.setenv('CLAUDE_BINARY', str(exec_file))
+    return str(exec_file)
+
+
 def _make_subprocess_result(**overrides: Any) -> _SubprocessResult:
     """Build a minimal _SubprocessResult that _parse_claude_output can parse."""
     stdout = json.dumps({
@@ -45,11 +61,11 @@ def _make_subprocess_result(**overrides: Any) -> _SubprocessResult:
 
 
 @pytest.mark.asyncio
-async def test_sandbox_wrap_applied_to_argv(tmp_path: Path) -> None:
+async def test_sandbox_wrap_applied_to_argv(tmp_path: Path, pinned_claude: str) -> None:
     """When sandbox_wrap is set, _invoke_claude applies it to cmd before spawning.
 
     The wrapped argv should start with the wrap token ('WRAP') but still
-    contain 'claude' as the wrapped command.  Confirms the hook fires between
+    contain the resolved claude binary as the wrapped command.  Confirms the hook fires between
     temp-file creation and _run_subprocess, as designed.
     """
     captured: list[list[str]] = []
@@ -69,15 +85,18 @@ async def test_sandbox_wrap_applied_to_argv(tmp_path: Path) -> None:
     assert len(captured) == 1, 'Expected exactly one subprocess invocation'
     argv = captured[0]
     assert argv[0] == 'WRAP', f'Expected wrapped argv to start with WRAP; got {argv[:3]}'
-    assert 'claude' in argv, f'Expected wrapped argv to contain claude; got {argv[:5]}'
+    assert pinned_claude in argv, f'Expected wrapped argv to contain claude; got {argv[:5]}'
 
 
 @pytest.mark.asyncio
-async def test_sandbox_wrap_none_leaves_argv_unchanged(tmp_path: Path) -> None:
+async def test_sandbox_wrap_none_leaves_argv_unchanged(
+    tmp_path: Path, pinned_claude: str,
+) -> None:
     """When sandbox_wrap is None (default), cmd is passed to _run_subprocess unchanged.
 
-    The first token in the captured argv must be 'claude', confirming no
-    accidental transformation.
+    The first token in the captured argv must be the resolved claude binary,
+    confirming no accidental transformation — in particular that NO sandbox
+    wrapper was prepended.
     """
     captured: list[list[str]] = []
 
@@ -95,7 +114,9 @@ async def test_sandbox_wrap_none_leaves_argv_unchanged(tmp_path: Path) -> None:
 
     assert len(captured) == 1
     argv = captured[0]
-    assert argv[0] == 'claude', f'Expected unchanged argv to start with claude; got {argv[:3]}'
+    assert argv[0] == pinned_claude, (
+        f'Expected unchanged argv to start with the claude binary; got {argv[:3]}'
+    )
 
 
 # ── invoke_with_cap_retry forwarding tests ────────────────────────────────────

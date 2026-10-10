@@ -373,3 +373,140 @@ class TestEdgeSimilarityLeg:
         assert [edge.uuid for edge in edges] == ranking[:limit]
         assert returned_endpoints(edges) == seeded.seeded_endpoints(edges)
         assert seeded.off_label_edge.uuid not in {edge.uuid for edge in edges}
+
+
+# --- BFS leg ------------------------------------------------------------------
+
+BFS_DEPTH = 3
+BFS_ENTITY_ORIGIN = 1
+BFS_MENTIONED = 10
+BFS_EPISODE_UUID = 'episode-bfs-origin'
+
+SEED_EPISODE_CYPHER = (
+    'MATCH (n:Entity {uuid: $mentioned}) '
+    'CREATE (:Episodic {uuid: $episode, name: $episode, group_id: $group_id, created_at: $created_at})'
+    '-[:MENTIONS {uuid: $mention, group_id: $group_id, created_at: $created_at}]->(n)'
+)
+
+# Fact edges into and out of a non-Entity node, on a path from the Entity
+# origin to its ring successor: reached by the BFS, but not Entity-to-Entity.
+BFS_DETOUR_EDGES = ('detour-in', 'detour-out')
+
+SEED_DETOUR_CYPHER = (
+    'MATCH (a:Entity {uuid: $origin}), (b:Entity {uuid: $successor}) '
+    'CREATE (a)-[:RELATES_TO {uuid: $into, group_id: $group_id, name: $into, fact: $into, '
+    "episodes: ['ep'], created_at: $created_at}]->"
+    '(:CanaryEndpoint {uuid: $detour, name: $detour, group_id: $group_id})'
+    '-[:RELATES_TO {uuid: $out_of, group_id: $group_id, name: $out_of, fact: $out_of, '
+    "episodes: ['ep'], created_at: $created_at}]->(b)"
+)
+
+
+def ring_reachable(start: int, hops: int, count: int) -> set[str]:
+    """The ring edge uuids on directed paths of 1..*hops* edges from node *start*."""
+    return {f'edge-{(start - 1 + h) % count + 1}' for h in range(hops)}
+
+
+def bfs_expected(count: int) -> set[str]:
+    """Fact edges reached from both BFS origins; the MENTIONS hop spends one of the episode's hops."""
+    return ring_reachable(BFS_ENTITY_ORIGIN, BFS_DEPTH, count) | ring_reachable(
+        BFS_MENTIONED, BFS_DEPTH - 1, count
+    )
+
+
+def bfs_leg(group_id: str, limit: int) -> SearchLeg:
+    return lambda driver: search_utils.edge_bfs_search(
+        driver,
+        [f'node-{BFS_ENTITY_ORIGIN}', BFS_EPISODE_UUID],
+        BFS_DEPTH,
+        SearchFilters(),
+        [group_id],
+        limit,
+    )
+
+
+@pytest_asyncio.fixture
+async def seed_bfs(seed_ring) -> Callable[[int], Awaitable[SeededGraph]]:
+    """``seed(count)``: ``seed_ring`` plus an Episodic BFS origin that MENTIONS ring node
+    BFS_MENTIONED, and the BFS_DETOUR_EDGES."""
+
+    async def seed(count: int) -> SeededGraph:
+        seeded = await seed_ring(count)
+        await seeded.graph.query(
+            SEED_EPISODE_CYPHER,
+            {
+                'mentioned': f'node-{BFS_MENTIONED}',
+                'episode': BFS_EPISODE_UUID,
+                'mention': 'mention-bfs-origin',
+                'group_id': seeded.name,
+                'created_at': SEEDED_AT,
+            },
+        )
+        into, out_of = BFS_DETOUR_EDGES
+        await seeded.graph.query(
+            SEED_DETOUR_CYPHER,
+            {
+                'origin': f'node-{BFS_ENTITY_ORIGIN}',
+                'successor': f'node-{BFS_ENTITY_ORIGIN + 1}',
+                'into': into,
+                'out_of': out_of,
+                'detour': 'detour-node',
+                'group_id': seeded.name,
+                'created_at': SEEDED_AT,
+            },
+        )
+        return seeded
+
+    return seed
+
+
+class TestEdgeBfsLeg:
+    @pytest.mark.asyncio
+    async def test_issued_cypher_plans_without_a_per_row_scan(self, seed_bfs):
+        """The discriminating gate for this leg; no wall-clock budget is asserted.
+
+        Stock measured 134 ms on the 800-edge ring, inside the server TIMEOUT,
+        so a budget cannot tell it from the rewrite at test scale.  The plan
+        shape differs at any size.
+        """
+        seeded = await seed_bfs(EDGE_COUNT)
+
+        query = await issued_by_hardened_driver(seeded, bfs_leg(seeded.name, 20))
+        plan = await explain(seeded.graph, query)
+
+        assert non_leaf_scans(plan) == [], str(plan)
+
+    @pytest.mark.asyncio
+    async def test_stock_cypher_plans_a_per_row_scan(self, seed_bfs):
+        """Negative control: without it the plan assertion above could pass vacuously."""
+        seeded = await seed_bfs(EDGE_COUNT)
+
+        query = await issued_by_stock_graphiti(bfs_leg(seeded.name, 20))
+        plan = await explain(seeded.graph, query)
+
+        assert non_leaf_scans(plan) != [], str(plan)
+
+    @pytest.mark.asyncio
+    async def test_returns_the_edge_set_of_graphiti_builtin_cypher(self, seed_bfs):
+        """Each reached Entity-to-Entity fact edge once, oriented as stored.
+
+        The MENTIONS hop and the detour through a non-Entity node are traversed, not returned.
+        """
+        seeded = await seed_bfs(50)
+        leg = bfs_leg(seeded.name, 1000)
+        # Copy before spying, or the copy would carry the hardened driver's spy.
+        builtin_driver = without_search_interface(seeded.driver)
+        issued_by_builtin = spy_on_queries(builtin_driver)
+        issued_by_hardened = spy_on_queries(seeded.driver)
+
+        edges = await leg(seeded.driver)
+        builtin = {edge.uuid for edge in await leg(builtin_driver)}
+
+        (hardened_query,) = issued_by_hardened
+        (oracle_query,) = issued_by_builtin
+        assert hardened_query.cypher != oracle_query.cypher, 'the oracle must run the built-in Cypher'
+        rewritten = {edge.uuid for edge in edges}
+        assert rewritten.isdisjoint(BFS_DETOUR_EDGES)
+        assert rewritten == builtin == bfs_expected(50)
+        assert len(edges) == len(rewritten)
+        assert returned_endpoints(edges) == seeded.seeded_endpoints(edges)

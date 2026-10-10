@@ -103,6 +103,13 @@ non-obvious and easy to diverge on:
 One builder plus one interpreter per kind makes divergence structurally
 impossible.
 
+THE SECOND AXIS: SCOPE LIVENESS. Orthogonal to polarity, an
+``expect=present`` check whose ``paths`` name a ``sys.modules`` alias shim or
+a path the mainline deleted or moved away can never go green either (task
+5036's ``merge_queue.py`` shim). That classification and its policy live in
+``shared.delivered_check_scope``; the lint reports them as ``shim_path`` and
+``removed_path`` rejects alongside any polarity finding.
+
 NEVER RAISES. :func:`lint_delivered_checks` returns findings for any
 iterable of entries — malformed check entries, values no argv can carry
 (a NUL byte, a lone surrogate), a non-repo root, a missing ``git``. Both wire points depend on that
@@ -134,6 +141,18 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
+from shared.delivered_check_scope import (
+    GIT_PROBE_FAILURES,
+    GIT_TIMEOUT_SECS,
+    STALE_PATH_CODES,
+    STALE_PATH_REASONS,
+    PathState,
+    ScopePath,
+    classify_scope_paths,
+    resolve_commit,
+    stale_scope_paths,
+)
+
 __all__ = [
     'GATE_REF',
     'CheckFinding',
@@ -151,27 +170,12 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-#: Wall-clock ceiling for ONE authoring-time git probe (``grep``,
-#: ``ls-tree``, ``ls-files``). Generous relative to a real probe
-#: (milliseconds on this repo) because exceeding it is not a verdict — it
-#: degrades to ``ERRORED``, which is REPORTED rather than blocking, so a
-#: slow disk delays a commit_planning call instead of rejecting a healthy
-#: batch.
-GIT_TIMEOUT_SECS: float = 30.0
-
 #: The ref every delivered_check is judged against: the runtime gate's
 #: (``orchestrator/src/orchestrator/scheduler.py::Scheduler._resolve_main_sha``
 #: rev-parses it, and ``orchestrator.delivered_checks.run_delivered_check``
 #: defaults to it). The authoring-time wire points evaluate against the same
 #: name so the two gates judge one tree.
 GATE_REF: str = 'main'
-
-#: Everything ``subprocess.run`` can raise for one git probe, all of which mean
-#: "unevaluable", never a verdict: ``OSError`` (no ``git``, exec failure),
-#: ``SubprocessError`` (chiefly a timeout) and ``ValueError`` — an argv
-#: element carrying a NUL byte, or a lone surrogate that cannot be encoded
-#: (``UnicodeEncodeError`` is a ``ValueError``), both refused before git runs.
-_GIT_PROBE_FAILURES = (OSError, subprocess.SubprocessError, ValueError)
 
 
 class CheckOutcome(Enum):
@@ -302,10 +306,11 @@ class CheckFinding:
     ranking of confidence — they are three different contracts:
 
     ``'reject'``
-        A measured defect. The check is green at the authoring tree, so
-        landing its producer cannot change its verdict and it gates
-        nothing. ``commit_planning`` refuses the batch; the stamper
-        refuses to copy the check.
+        A measured defect. Either the check is green at the authoring tree,
+        so landing its producer cannot change its verdict and it gates
+        nothing, or its scope is stale, so it can never go green.
+        ``commit_planning`` refuses the batch; the stamper refuses to copy
+        the check.
     ``'warn'``
         Reported, never blocking. Reserved for classes that are genuinely
         undecidable at authoring time (an over-broad ``expect='absent'``
@@ -371,7 +376,7 @@ def evaluate_grep_at_tree(
         completed = subprocess.run(
             argv, capture_output=True, text=True, timeout=timeout_secs
         )
-    except _GIT_PROBE_FAILURES:
+    except GIT_PROBE_FAILURES:
         return CheckOutcome.ERRORED
     return interpret_grep_rc(completed.returncode, expect)
 
@@ -399,7 +404,7 @@ def evaluate_path_at_tree(
             completed = subprocess.run(
                 argv, capture_output=True, text=True, timeout=timeout_secs
             )
-        except _GIT_PROBE_FAILURES:
+        except GIT_PROBE_FAILURES:
             return CheckOutcome.ERRORED
         outcome = interpret_path_listing(completed.returncode, completed.stdout, expect)
         if outcome is not CheckOutcome.PASS:
@@ -468,10 +473,11 @@ def lint_delivered_checks(
 ) -> list[CheckFinding]:
     """Lint a whole ``metadata.delivered_checks`` list against the authoring tree.
 
-    Returns one :class:`CheckFinding` per offending check (at most one per
-    check) and an empty list for a clean batch. *files* is the task's
-    declared ``metadata.files``, used by the refinements to tell a match
-    inside the task's own scope from one outside it.
+    Returns at most one polarity finding per check, plus at most one per
+    stale-path code (the scope axis, see the module docstring), and an empty
+    list for a clean batch. *files* is the task's declared
+    ``metadata.files``, used by the refinements to tell a match inside the
+    task's own scope from one outside it.
 
     The 2x2 is a statement about POLARITY, so it evaluates the kinds that
     carry an ``expect`` — ``grep`` and ``path``. A script check has none to
@@ -484,7 +490,7 @@ def lint_delivered_checks(
     unresolved, a name like ``main`` with no such branch would be read as a
     PATHSPEC and answered from the working tree.
     """
-    tree = functools.cache(lambda: _resolve_commit(repo_root, ref))
+    tree = functools.cache(lambda: resolve_commit(repo_root, ref))
     findings: list[CheckFinding] = []
     for check in checks:
         finding = _lint_one_check(
@@ -492,22 +498,10 @@ def lint_delivered_checks(
         )
         if finding is not None:
             findings.append(finding)
-    return findings
-
-
-def _resolve_commit(
-    repo_root: str | Path, ref: str, timeout_secs: float = GIT_TIMEOUT_SECS
-) -> str | None:
-    """The commit *ref* names in *repo_root*, or ``None`` if it names none."""
-    argv = ['git', '-C', str(repo_root), 'rev-parse', '--verify', '--quiet', f'{ref}^{{commit}}']
-    try:
-        completed = subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout_secs
+        findings.extend(
+            _stale_scope_findings(check, repo_root=repo_root, ref=ref, tree=tree)
         )
-    except _GIT_PROBE_FAILURES:
-        return None
-    sha = completed.stdout.strip()
-    return sha if completed.returncode == 0 and sha else None
+    return findings
 
 
 def _unevaluable_finding(name: str, ref: str, repo_root: str | Path) -> CheckFinding:
@@ -517,6 +511,14 @@ def _unevaluable_finding(name: str, ref: str, repo_root: str | Path) -> CheckFin
         code='unevaluable',
         message=_unevaluable_message(name, ref, repo_root),
     )
+
+
+def _check_name(check: object) -> str | None:
+    """The usable name a finding about *check* is addressed to, if any."""
+    if not isinstance(check, dict):
+        return None
+    name = check.get('name')
+    return name if isinstance(name, str) and name else None
 
 
 def _lint_one_check(
@@ -545,10 +547,8 @@ def _lint_one_check(
       ``expect`` to invert; a script-only batch must cost nothing), or a
       kind the schema does not know at all.
     """
-    if not isinstance(check, dict):
-        return None
-    name = check.get('name')
-    if not isinstance(name, str) or not name:
+    name = _check_name(check)
+    if name is None:
         return None
     kind = check.get('kind')
     linter = _POLARITY_LINTERS.get(kind) if isinstance(kind, str) else None
@@ -726,6 +726,86 @@ _POLARITY_LINTERS: dict[str, Callable[..., CheckFinding | None]] = {
 
 
 # ---------------------------------------------------------------------------
+# The scope axis
+# ---------------------------------------------------------------------------
+
+def _shim_path_message(name: str, entries: Sequence[ScopePath], ref: str) -> str:
+    paths = [entry.path for entry in entries]
+    return (
+        f'delivered_check {name!r} (expect=present) is scoped to {paths!r} at '
+        f'{ref}: {STALE_PATH_REASONS["shim_path"]}'
+    )
+
+
+def _removed_path_message(name: str, entries: Sequence[ScopePath], ref: str) -> str:
+    sites = ', '.join(
+        f'{entry.path} (removed in {entry.removed_in or "mainline history"})'
+        for entry in entries
+    )
+    return (
+        f'delivered_check {name!r} (expect=present) names {sites}, absent at '
+        f'{ref}: {STALE_PATH_REASONS["removed_path"]} If this task genuinely '
+        f're-creates the file, scope a grep check to its parent directory instead.'
+    )
+
+
+_STALE_PATH_MESSAGES: dict[PathState, Callable[[str, Sequence[ScopePath], str], str]] = {
+    PathState.SYS_MODULES_SHIM: _shim_path_message,
+    PathState.REMOVED: _removed_path_message,
+}
+
+
+def _stale_scope_findings(
+    check: Any,
+    *,
+    repo_root: str | Path,
+    ref: str,
+    tree: Callable[[], str | None],
+) -> list[CheckFinding]:
+    """One reject per stale-path code for *check*, each listing its paths.
+
+    Skipped before any git call unless *check* is a named ``expect=present``
+    check of a polarity kind with usable ``paths``. Fails open: an
+    unresolvable tree is already reported by the polarity axis, and a
+    classification failure loses only this diagnosis.
+    """
+    name = _check_name(check)
+    if name is None:
+        return []
+    kind = check.get('kind')
+    expect = check.get('expect')
+    paths = list(dict.fromkeys(_strings_only(check.get('paths'))))
+    if not (isinstance(kind, str) and kind in _POLARITY_LINTERS):
+        return []
+    if expect != 'present' or not paths:
+        return []
+    sha = tree()
+    if sha is None:
+        return []
+    census = classify_scope_paths(paths, repo_root=repo_root, ref=sha)
+    if census is None:
+        logger.warning(
+            'delivered_check scope: could not classify the paths of check %r '
+            '(ref=%s, repo_root=%s); no scope finding emitted',
+            name, ref, repo_root,
+        )
+        return []
+    by_state: dict[PathState, list[ScopePath]] = {}
+    for entry in stale_scope_paths(kind, expect, [census[p] for p in paths if p in census]):
+        by_state.setdefault(entry.state, []).append(entry)
+    return [
+        CheckFinding(
+            check_name=name,
+            severity='reject',
+            code=STALE_PATH_CODES[state],
+            message=_STALE_PATH_MESSAGES[state](name, entries, ref),
+            detail=tuple(entry.path for entry in entries),
+        )
+        for state, entries in by_state.items()
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Diagnostic refinements, and the two rules the 2x2 cannot see
 # ---------------------------------------------------------------------------
 
@@ -780,7 +860,7 @@ def _grep_matches(
         completed = subprocess.run(
             argv, capture_output=True, text=True, timeout=timeout_secs
         )
-    except _GIT_PROBE_FAILURES:
+    except GIT_PROBE_FAILURES:
         return None
     if completed.returncode >= 2:
         return None
@@ -818,7 +898,7 @@ def _tracked_paths(
         completed = subprocess.run(
             argv, capture_output=True, text=True, timeout=timeout_secs
         )
-    except _GIT_PROBE_FAILURES:
+    except GIT_PROBE_FAILURES:
         return None
     if completed.returncode != 0:
         return None
@@ -1233,7 +1313,9 @@ _POLARITY_HINT = (
     'is written can never signal anything — it gates nothing, and its dependent '
     'is dispatched as if unguarded. A check that can NEVER go green is worse: '
     'it blocks its dependent forever, and at runtime that is indistinguishable '
-    'from a genuinely undelivered capability.'
+    'from a genuinely undelivered capability. A check scoped to a sys.modules '
+    'shim, or to a path the mainline removed, is that kind: repath `paths` to '
+    'where the code lives now.'
 )
 
 
@@ -1257,11 +1339,12 @@ def polarity_error(
     prevent. Those findings are still REPORTED by the caller, just not here.
     """
     rejects = [f for f in findings if f.severity == 'reject']
+    rejected_checks = len({f.check_name for f in rejects})
     task_clause = f' (task {task_id})' if task_id else ''
     check_list = ', '.join(f'{f.check_name!r} [{f.code}]' for f in rejects)
     return {
         'error': (
-            f'metadata.delivered_checks contains {len(rejects)} check(s) that are '
+            f'metadata.delivered_checks contains {rejected_checks} check(s) that are '
             f'already satisfied at the authoring tree, or can never be satisfied'
             f'{task_clause}: {check_list}. Such a check gates nothing (or gates '
             f'forever), and at runtime a mis-authored check is indistinguishable '

@@ -1396,56 +1396,15 @@ def test_memory_returns_memory_status(client):
     body = resp.json()
     assert 'MEMORY_STATUS' in body
     ms = body['MEMORY_STATUS']
-    for key in ('graphiti', 'mem0', 'taskmaster', 'queue'):
+    for key in ('graphiti', 'mem0', 'queue'):
         assert key in ms
+    assert 'taskmaster' not in ms
     # get_status offline, get_queue_stats online: the queue renders its own
     # measured state, not the offline branch's zeros.
     stats = ms['queue']['stats']
     assert stats['state'] == 'fresh'
     assert stats['value']['pending'] == 2
     assert 'served_at' in body
-
-
-_MEMORY_OPS_KEYS = {'labels', 'reads', 'writes', 'other', 'total', 'totals', 'by_operation'}
-
-
-def test_memory_graphs_serves_one_reconciling_memory_ops_block(client):
-    from dashboard.data.write_journal import MemoryOps
-
-    ops = MemoryOps(
-        labels=('11:00', '12:00'),
-        reads=(3, 7),
-        writes=(1, 2),
-        other=(0, 2),
-        by_operation=(('search', 10), ('add_memory', 3), ('compact', 2)),
-    )
-    with patch('dashboard.app.get_memory_ops', new=AsyncMock(return_value=ops)):
-        resp = client.get('/api/v2/dashboard/memory-graphs')
-    assert resp.status_code == 200
-    body = resp.json()
-    assert 'MEMORY_TIMESERIES' not in body
-    assert 'MEMORY_OPS_BREAKDOWN' not in body
-    block = body['MEMORY_OPS']
-    assert set(block) == _MEMORY_OPS_KEYS
-    totals = block['totals']
-    assert totals['total'] == totals['reads'] + totals['writes'] + totals['other'] == 15
-    assert totals['total'] == sum(row['value'] for row in block['by_operation'])
-    assert totals['total'] == sum(block['total'])
-
-
-def test_memory_graphs_degrades_to_the_zeroed_window_not_a_500(client):
-    """A non-DB failure serves the same 24 zeroed hours a failed DB read does."""
-    with patch(
-        'dashboard.app.get_memory_ops', new=AsyncMock(side_effect=RuntimeError('boom')),
-    ):
-        resp = client.get('/api/v2/dashboard/memory-graphs')
-    assert resp.status_code == 200
-    block = resp.json()['MEMORY_OPS']
-    assert set(block) == _MEMORY_OPS_KEYS
-    assert len(block['labels']) == 24
-    assert block['total'] == [0] * 24
-    assert block['by_operation'] == []
-    assert block['totals']['total'] == 0
 
 
 def test_recon_returns_recon_state_and_agents(client):
@@ -1603,6 +1562,56 @@ def test_costs_route_includes_by_model_role(client):
     assert by_model_role['turn_cap_saturation'] == fake_rollup['turn_cap_saturation']
 
 
+@pytest.fixture()
+def curator_ledger_row(client):
+    """One ``task_curator`` invocation in the running app's curator ledger.
+
+    The ledger sits under the session-scoped project root every ``client``
+    shares, so the db file (and its directory, if this fixture made it) is
+    deleted afterwards.
+    """
+    import asyncio
+    from datetime import UTC
+
+    from shared.cost_store import CostStore
+
+    ledger = client.app.state.config.curator_events_db
+    assert not ledger.exists(), f'{ledger} already exists; refusing to delete it afterwards'
+    made_dir = not ledger.parent.exists()
+    now = datetime.now(UTC).isoformat()
+
+    async def _write() -> None:
+        store = CostStore(ledger)
+        await store.open()
+        try:
+            await store.save_invocation(
+                run_id='fused-memory-x', task_id=None, project_id='dark_factory',
+                account_name='a', model='opus', role='task_curator', cost_usd=0.02,
+                input_tokens=None, output_tokens=None, cache_read_tokens=None,
+                cache_create_tokens=None, duration_ms=1234, capped=False,
+                started_at=now, completed_at=now,
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(_write())
+    yield
+    for suffix in ('', '-wal', '-shm'):
+        ledger.with_name(ledger.name + suffix).unlink(missing_ok=True)
+    if made_dir:
+        ledger.parent.rmdir()
+
+
+def test_costs_by_role_includes_curator_ledger(client, curator_ledger_row):
+    """The cost view reads the fused-memory curator's ledger as well as each
+    project's runs.db, labelling the curator's spend by its role."""
+    resp = client.get('/api/v2/dashboard/costs?window=7d')
+
+    assert resp.status_code == 200
+    roles = [entry['role'] for entry in resp.json()['COSTS']['by_role']]
+    assert 'task_curator' in roles, roles
+
+
 def test_shape_costs_places_model_role_rollup_under_by_model_role():
     """shape_costs(..., by_model_role=<aggregate_model_role_rollup output>)
     places rows+turn_cap_saturation under COSTS.by_model_role without
@@ -1643,14 +1652,17 @@ def test_performance_returns_performance(client):
     body = resp.json()
     assert 'PERFORMANCE' in body
     assert isinstance(body['PERFORMANCE'], dict)
+    assert 'PERFORMANCE_LISTING' in body
 
 
 def test_performance_route_threads_one_now_and_the_window_to_both_aggregates(client):
     """api_performance must hand the cards and the sparkline history the SAME
     `now` and the chip's `days`, so both count one window; and it serves that
     instant as served_at (mirrors test_costs_route_threads_shared_now_to_all_aggregates)."""
+    from dashboard.data.performance import unread_listing
+
     mocks = {
-        'aggregate_performance_cards': AsyncMock(return_value={}),
+        'aggregate_performance_cards': AsyncMock(return_value=unread_listing('fixture', days=30)),
         'aggregate_performance_history': AsyncMock(return_value={}),
     }
     with (
@@ -1672,6 +1684,22 @@ def test_performance_route_threads_one_now_and_the_window_to_both_aggregates(cli
         nows.append(now)
     assert nows[0] == nows[1]
     assert resp.json()['served_at'] == nows[0].isoformat()
+
+
+def test_performance_route_serves_an_unknown_listing_when_cards_raise(client):
+    """A cards read that raises is an unread listing naming the failure, never a silently empty one."""
+    with (
+        patch('dashboard.app.aggregate_performance_cards',
+              new=AsyncMock(side_effect=RuntimeError('boom'))),
+        patch('dashboard.app.aggregate_performance_history', new=AsyncMock(return_value={})),
+    ):
+        resp = client.get('/api/v2/dashboard/performance')
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body['PERFORMANCE'] == {}
+    assert body['PERFORMANCE_LISTING']['state'] == 'unknown'
+    assert 'RuntimeError: boom' in body['PERFORMANCE_LISTING']['reason']
 
 
 def test_burndown_returns_aggregate_and_per_project(client):
@@ -2224,14 +2252,27 @@ _LIVE_ENTRY_RETRY = {
 
 
 def _proj_raw(*roots: str) -> dict:
-    """A minimal build_per_project_merge_queue output for each root."""
+    """A minimal build_per_project_merge_queue output for each root.
+
+    Its runs.db readings are stamped just before the request, so they are
+    served fresh, as a readable runs.db's are.
+    """
+    from datetime import UTC
+
+    from dashboard.data.datum import Datum, DatumState
+
+    read_at = datetime.now(UTC)
     return {
         root: {
             'depth_timeseries': {'labels': [], 'values': []},
             'outcomes': {'labels': [], 'values': []},
             'latency': {},
             'recent': [],
-            'speculative': {},
+            'recent_total': Datum(0, read_at, DatumState.FRESH, None, 30),
+            'speculative': Datum(
+                {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': None},
+                read_at, DatumState.FRESH, None, 30,
+            ),
             'train_events': [],
         }
         for root in roots or (_PROJ_ROOT,)

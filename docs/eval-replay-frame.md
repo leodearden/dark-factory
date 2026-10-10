@@ -128,16 +128,29 @@ justified it.
 
 ## 6. Demonstration
 
-No live framed cell has been recorded yet. A live cell must run from an
-unsandboxed session, because `create_eval_worktree` registers a worktree in the
-shared `.git` directory. Until one runs, these hermetic tests show that the
-architect's briefing carries the frame and that every cell is stamped:
+One live framed cell is recorded. It ran from an unsandboxed session, because
+`create_eval_worktree` registers a worktree in the shared `.git` directory
+(task 6361; Leo approved it at milestone gate esc-6361-1).
+
+- date: 2026-10-07
+- commit: 465d8723fc (main when the run started)
+- fixture: `df_task_2260`, config `architect-sonnet-replay-demo`
+  (claude / sonnet / high, role architect, `max_budget_usd=3.0`, `timeout_override=30`)
+- run_id: `05e2ecb7`
+- `replay_frame`: `'honest-frame-v1'`
+- `terminal_kind`: `'planned'`
+- `plan_steps`: 7
+- `plan_quality`: 0.82
+- `cost_usd`: 2.5042058 (architect only; the judge's 1.2203746 is reported separately)
+- `invocation_error`: `None`
+
+The architect planned against a base that is the first parent of the task's
+own landing merge, `97059b1dd8`. §1 names this fixture as tranche 1's decline
+case. This run used 39 turns, `cap_tainted` was False, and the runner removed
+the eval worktree afterwards. It is one cell, not a rate.
+
+The hermetic tests remain the deterministic coverage:
 
 - `orchestrator/tests/test_eval_architect.py::TestArchitectCellCarriesReplayFrame`
 - `orchestrator/tests/test_eval_driver.py::TestEndToEndCarriesReplayFrame`
 - `orchestrator/tests/test_eval_replay_frame.py::TestPlanOnlyCliBriefsInReplayFrame`
-
-When a live cell runs, record here: date, commit, fixture, run id, and the
-`replay_frame`, `terminal_kind`, `plan_steps`, `plan_quality`, `cost_usd` and
-`invocation_error` values, verbatim. A decline is an acceptable result if it is
-grounded in in-frame evidence.

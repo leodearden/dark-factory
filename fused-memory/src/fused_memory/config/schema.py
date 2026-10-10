@@ -500,6 +500,26 @@ class WriteJournalConfig(BaseModel):
         return self
 
 
+class WriteJournalGrowthAlarmConfig(BaseModel):
+    """Ceilings for ``services/journal_growth_alarm.py``.
+
+    Restart-only, in the same posture as ``WriteJournalConfig``: absent from
+    ``config/reload.py::RELOADABLE_FIELDS``. The measured basis of both ceilings
+    lives in the ``write_journal_growth_alarm`` block of
+    ``fused-memory/config/config.yaml``. Task 5405 must re-anchor both values
+    after its rollup lands.
+    """
+
+    #: On-disk bytes of ``write_journal.db`` plus its ``-wal`` / ``-shm`` sidecars.
+    max_file_bytes: int = Field(default=19_327_352_832, gt=0)
+    #: ``write_ops`` rows inserted in the trailing 24 h.
+    max_rows_inserted_per_day: int = Field(default=1_500_000, gt=0)
+    #: Minimum seconds between two checks. Checks ride the checkpoint loop's tick
+    #: (``server/main.py::_CHECKPOINT_INTERVAL``), so the effective interval is
+    #: this value rounded UP to a whole number of ticks: below one tick, every tick.
+    check_interval_seconds: float = Field(default=3600.0, gt=0)
+
+
 # --- Taskmaster ---
 
 class TaskmasterConfig(BaseModel):
@@ -1511,7 +1531,14 @@ class ReconciliationConfig(BaseModel):
     agent_llm_provider: str = Field(default='claude_cli')
     agent_llm_model: str = Field(default='sonnet')
     agent_max_tokens: int = Field(default=8192)
-    agent_max_steps: int = Field(default=50)
+    agent_max_steps: int = Field(
+        default=50,
+        description=(
+            'Outer tool-dispatch steps for the in-process agent providers '
+            '(anthropic/openai). The claude_cli provider runs its loop inside one '
+            'CLI invocation capped by agent_loop.py::_AGENT_CLI_MAX_TURNS instead.'
+        ),
+    )
 
     # Judge settings
     judge_enabled: bool = Field(default=True)
@@ -1631,7 +1658,8 @@ class ReconciliationConfig(BaseModel):
         default=180,
         gt=0,
         description=(
-            'Wall-clock budget for a single agent_loop._call_claude_cli invocation. '
+            'Wall-clock budget for a single agent_loop._call_claude_cli invocation, '
+            'which carries the whole verification (task 4344). '
             'Distinct from stage_timeout_seconds (outer stage guard). '
             'Restores the pre-881 hard-coded 180s ceiling.'
         ),
@@ -2112,6 +2140,20 @@ class ReconciliationConfig(BaseModel):
         ),
     )
 
+class DedupOutageDetectorConfig(BaseModel):
+    """Detects a window of curated tickets with no combine at all, resolved
+    faster than any real curator LLM call can complete.
+
+    The back-test behind these defaults is in
+    ``plans/curator-dedup-outage-2026-08-15-rca.md``.
+    """
+
+    enabled: bool = Field(default=True)
+    window_seconds: float = Field(default=21600.0, gt=0)
+    min_samples: int = Field(default=10, ge=1)
+    max_median_resolve_seconds: float = Field(default=15.0, gt=0)
+
+
 class TicketJanitorConfig(BaseModel):
     """Background sweep that surfaces failed tickets to the orchestrator.
 
@@ -2126,6 +2168,7 @@ class TicketJanitorConfig(BaseModel):
     interval_seconds: float = Field(default=60.0)
     cooldown_seconds: float = Field(default=3600.0)
     batch_limit: int = Field(default=100)
+    dedup_outage: DedupOutageDetectorConfig = Field(default_factory=DedupOutageDetectorConfig)
 
 
 class SummaryRebuildConfig(BaseModel):
@@ -2350,6 +2393,13 @@ class CuratorConfig(BaseModel):
     zot_duplicate_sweep_enabled: bool = Field(default=True)
     zot_duplicate_score_threshold: float = Field(default=0.65, ge=0.0, le=1.0)
     zot_duplicate_search_limit: int = Field(default=5, ge=1)
+
+    # Degraded-streak alarm (task 4448): escalate once when one project's run
+    # of CONSECUTIVE degraded curations, of any cause, reaches this length.
+    # Counted per project_id, so another project's healthy curations neither
+    # reset nor mask it. Distinct from zero_output_breaker_threshold above,
+    # which counts only hung calls and short-circuits them; this only reports.
+    degraded_streak_threshold: int = Field(default=5, ge=1)
 
     # Cancelled-premise blocklist: path (absolute, or relative to server cwd)
     # of a YAML file listing premises proven wrong by revert. Matching
@@ -3227,12 +3277,14 @@ class ConsolidationAutoConfig(BaseModel):
 
 
 class LinkHealConfig(BaseModel):
-    """Caps and storm escapes for the link-heal executor (task 6181).
+    """Caps, storm escapes and adjudicator knobs for link healing (tasks 6181, 6184).
 
     Contract: ``plans/write-triage-link-healing-prd.md`` H1, "Caps and storm
-    escapes". The only consumer is ``fused-memory/scripts/link_heal.py``, which
-    loads config afresh at each run start; the server holds no copy, so every
-    leaf is green-tier.
+    escapes", and H2, the link adjudicator. The consumers are
+    ``fused-memory/scripts/link_heal.py`` and
+    ``fused-memory/scripts/eval_link_adjudicator.py``, both of which load config
+    afresh at each run start; the server holds no copy, so every leaf is
+    green-tier.
     """
 
     max_actions_per_run: int = Field(
@@ -3260,6 +3312,53 @@ class LinkHealConfig(BaseModel):
             'and escalate under link-heal-write-failure. PRD H1.'
         ),
     )
+    adjudicator_model: str = Field(
+        default='opus',
+        min_length=1,
+        description=(
+            'Claude CLI model alias for the link adjudicator; the δm/Γ_A '
+            'selection re-bases it. PRD H2.'
+        ),
+    )
+    shard_size: int = Field(
+        default=40,
+        ge=1,
+        description='Pairs per adjudicator CLI call. PRD H2.',
+    )
+    field_chars: int = Field(
+        default=4000,
+        ge=1,
+        description=(
+            "Cap per text, with the rater brief's truncation marker; the cap "
+            'the 359 hand-link ratings used. PRD H2.'
+        ),
+    )
+    misfile_share_ceiling: float = Field(
+        default=0.25,
+        ge=0,
+        le=1,
+        description=(
+            'A run whose adjudicated misfile share exceeds this writes nothing '
+            'and escalates under link-heal-misfile-share. PRD H2.'
+        ),
+    )
+    corrects_share_ceiling: float = Field(
+        default=0.60,
+        ge=0,
+        le=1,
+        description=(
+            'A run whose adjudicated CORRECTS share exceeds this writes nothing '
+            'and escalates under link-heal-corrects-share. PRD H2.'
+        ),
+    )
+    shard_failure_streak: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            'Consecutive failed adjudicator shards that escalate under '
+            'link-heal-adjudicator and stop adjudicating. PRD H2.'
+        ),
+    )
 
 
 class FusedMemoryConfig(BaseSettings):
@@ -3278,6 +3377,9 @@ class FusedMemoryConfig(BaseSettings):
     # startup-only prune. Nullability would bucket the whole section as one
     # atomic leaf instead.
     write_journal: WriteJournalConfig = Field(default_factory=WriteJournalConfig)
+    write_journal_growth_alarm: WriteJournalGrowthAlarmConfig = Field(
+        default_factory=WriteJournalGrowthAlarmConfig
+    )
     taskmaster: TaskmasterConfig | None = Field(default=None)
     task_metadata: TaskMetadataConfig = Field(default_factory=TaskMetadataConfig)
     memory_metadata: MemoryMetadataConfig = Field(default_factory=MemoryMetadataConfig)

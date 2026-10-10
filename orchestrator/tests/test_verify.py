@@ -3,12 +3,14 @@
 import asyncio
 import contextlib
 import logging
-from dataclasses import asdict, replace
+import shlex
+from dataclasses import asdict, fields, replace
 from pathlib import Path
 from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from _serial_recovery_helpers import ORCH_SHAPED_PYPROJECT, ROOT_SHAPED_PYPROJECT, addopts_values
 from _xdist_crash_fixtures import (
     XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT,
     XDIST_CRASH_ATTRIBUTED_FAILED_LINE,
@@ -816,41 +818,49 @@ class TestRunVerificationColdFirstUse:
         )
 
 
-def test_apply_cargo_scope_preserves_verify_cold_command_timeout_secs(tmp_path: Path):
-    """_apply_cargo_scope propagates verify_cold_command_timeout_secs to the rebuilt ModuleConfig.
-
-    Constructs a ModuleConfig with both warm and cold timeout values, forces the
-    cargo-scope rewrite path via mocked workspace discovery, and asserts the
-    returned ModuleConfig carries both timeout fields unchanged.
-    """
-    from unittest.mock import patch
-
-    from orchestrator.config import ModuleConfig
-    from orchestrator.verify import _apply_cargo_scope
+def test_apply_cargo_scope_preserves_every_non_command_field(tmp_path: Path):
+    """Cargo scoping rewrites only the three commands; every other ModuleConfig field survives."""
+    (tmp_path / 'Cargo.toml').write_text('[workspace]\nmembers = ["crates/*"]\n')
+    crate_dir = tmp_path / 'crates' / 'foo'
+    crate_dir.mkdir(parents=True)
+    (crate_dir / 'Cargo.toml').write_text('[package]\nname = "foo"\nversion = "0.1.0"\n')
 
     mc = ModuleConfig(
         prefix='crates',
         test_command='cargo test --workspace',
         lint_command='cargo clippy --workspace',
-        type_check_command=None,
+        type_check_command='cargo check --workspace',
+        lock_depth=3,
+        max_per_module=2,
+        module_overrides={'crates/foo': 1},
         verify_command_timeout_secs=2000.0,
         verify_cold_command_timeout_secs=6000.0,
+        concurrent_verify=False,
+        sequential_lint_first=True,
+        verify_env={'K': 'V'},
+        scope_cargo=True,
+    )
+    left_default = [f.name for f in fields(ModuleConfig) if getattr(mc, f.name) == f.default]
+    assert left_default == [], (
+        f'Every ModuleConfig field must be set to a non-default value here so a dropped '
+        f'field is observable; still at default: {left_default}'
     )
 
-    # Force the rewrite path: workspace has one crate, and the .rs file maps to it.
-    with (
-        patch('orchestrator.verify.discover_workspace_crates', return_value={'crates/foo': 'foo'}),
-        patch('orchestrator.verify.files_to_crates', return_value=['foo']),
-    ):
-        result = _apply_cargo_scope(
-            mc,
-            task_files=['crates/foo/src/lib.rs'],
-            project_root=tmp_path,
-            scope_cargo_enabled=True,
-        )
+    result = _apply_cargo_scope(
+        mc,
+        task_files=['crates/foo/src/lib.rs'],
+        project_root=tmp_path,
+        scope_cargo_enabled=True,
+    )
 
-    assert result.verify_command_timeout_secs == 2000.0
-    assert result.verify_cold_command_timeout_secs == 6000.0
+    assert result is not mc
+    assert result.test_command == 'cargo test -p foo'
+    command_fields = {'test_command', 'lint_command', 'type_check_command'}
+    differing = [
+        f.name for f in fields(ModuleConfig)
+        if f.name not in command_fields and getattr(result, f.name) != getattr(mc, f.name)
+    ]
+    assert differing == [], f'Non-command fields changed by cargo scoping: {differing}'
 
 
 class TestIsTestFile:
@@ -8035,6 +8045,68 @@ class TestRunFullVerificationRole:
         )
 
 
+class TestRunFullVerificationMaxRetries:
+    """run_full_verification threads `max_retries` to every run_verification call.
+
+    Task 5812: the main-tip sweep passes max_retries=0 so a timeout reaches its
+    verdict without re-running; omitting it keeps config.verify_timeout_retries
+    in force for every other caller (e.g. review-checkpoint).
+    """
+
+    _PASSING = VerifyResult(
+        passed=True, test_output='', lint_output='', type_output='', summary='ok',
+    )
+
+    @pytest.mark.asyncio
+    async def test_threads_max_retries_to_each_subproject(self, tmp_path: Path):
+        config = OrchestratorConfig(project_root=tmp_path)
+        config._module_configs = {
+            'dashboard': ModuleConfig(prefix='dashboard', test_command='echo dash'),
+            'api': ModuleConfig(prefix='api', test_command='echo api'),
+        }
+
+        mock_run_verification = AsyncMock(return_value=self._PASSING)
+        with patch('orchestrator.verify.run_verification', new=mock_run_verification):
+            await run_full_verification(
+                tmp_path, config, role='background', max_retries=0,
+            )
+
+        assert mock_run_verification.call_count == 2
+        for one_call in mock_run_verification.call_args_list:
+            assert one_call.kwargs['max_retries'] == 0, one_call.kwargs
+
+    @pytest.mark.asyncio
+    async def test_threads_max_retries_to_the_global_fallback(self, tmp_path: Path):
+        config = OrchestratorConfig(project_root=tmp_path)
+        config._module_configs = {}  # discovered-empty → global fallback branch
+
+        mock_run_verification = AsyncMock(return_value=self._PASSING)
+        with patch('orchestrator.verify.run_verification', new=mock_run_verification):
+            await run_full_verification(tmp_path, config, max_retries=0)
+
+        assert mock_run_verification.call_count == 1
+        assert mock_run_verification.call_args_list[0].kwargs['max_retries'] == 0
+
+    @pytest.mark.asyncio
+    async def test_omitted_max_retries_leaves_config_default_in_force(
+        self, tmp_path: Path,
+    ):
+        """None reaches run_verification, which then uses config.verify_timeout_retries."""
+        config = OrchestratorConfig(project_root=tmp_path)
+        config._module_configs = {
+            'dashboard': ModuleConfig(prefix='dashboard', test_command='echo dash'),
+            'api': ModuleConfig(prefix='api', test_command='echo api'),
+        }
+
+        mock_run_verification = AsyncMock(return_value=self._PASSING)
+        with patch('orchestrator.verify.run_verification', new=mock_run_verification):
+            await run_full_verification(tmp_path, config)
+
+        assert mock_run_verification.call_count == 2
+        for one_call in mock_run_verification.call_args_list:
+            assert one_call.kwargs.get('max_retries') is None, one_call.kwargs
+
+
 class TestRunScopedVerificationForceWorkspace:
     """run_scoped_verification: force_workspace=True bypasses all scoping.
 
@@ -10635,7 +10707,7 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
         from orchestrator.verify import _serial_pytest_str
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
-            result = _serial_pytest_str(self._REFUSED)
+            result = _serial_pytest_str(self._REFUSED, invocation_dir=None)
 
         assert result is self._REFUSED, "the no-op must return the caller's own string"
         records = [r for r in caplog.records if r.name == 'orchestrator.verify']
@@ -10669,7 +10741,7 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
 
         cmd = 'echo "pytest" && true'
         with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
-            assert _serial_pytest_str(cmd) is cmd
+            assert _serial_pytest_str(cmd, invocation_dir=None) is cmd
 
         records = [r for r in caplog.records if r.name == 'orchestrator.verify']
         assert len(records) == 1
@@ -10741,7 +10813,7 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
         from orchestrator.verify import _serial_pytest_str
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
-            _serial_pytest_str(cmd)
+            _serial_pytest_str(cmd, invocation_dir=None)
 
         assert [r.message for r in caplog.records if r.name == 'orchestrator.verify'] == []
 
@@ -10757,10 +10829,88 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
 
         from orchestrator.verify import _serial_pytest_str
 
-        result = _serial_pytest_str(ROOT_TEST_COMMAND)
+        result = _serial_pytest_str(ROOT_TEST_COMMAND, invocation_dir=None)
         assert result is not None
         assert result is not ROOT_TEST_COMMAND
         assert 'no:xdist' in result
+
+
+def _write_serial_recovery_tree(root: Path) -> Path:
+    """A real tree: a root-shaped root config and an orchestrator-shaped ``sub``."""
+    (root / 'pyproject.toml').write_text(ROOT_SHAPED_PYPROJECT, encoding='utf-8')
+    (root / 'sub' / 'tests').mkdir(parents=True)
+    (root / 'sub' / 'pyproject.toml').write_text(ORCH_SHAPED_PYPROJECT, encoding='utf-8')
+    (root / 'sub' / 'tests' / 'test_x.py').write_text('def test_t():\n    pass\n', encoding='utf-8')
+    return root
+
+
+class TestSerialPytestStrReSuppliesGoverningAddopts:
+    """``_serial_pytest_str(cmd, invocation_dir)`` re-supplies the governing addopts.
+
+    The config is resolved by pytest's own walk from the directory the command
+    runs in, so scoped and unscoped shapes of one module agree; every xdist
+    option is removed. ``invocation_dir=None`` is the historical blank.
+    """
+
+    def test_a_module_directory_command_carries_its_own_config(self, tmp_path):
+        from orchestrator.verify import _serial_pytest_str
+
+        tree = _write_serial_recovery_tree(tmp_path)
+        rendered = _serial_pytest_str('uv run --directory sub pytest tests/', invocation_dir=tree)
+        assert rendered is not None
+        assert addopts_values(shlex.split(rendered)) == ["-m 'not warm_lane_bash'"]
+        assert not any(
+            token in rendered for token in ('-n auto', '--dist', '--max-worker-restart')
+        ), rendered
+
+    def test_the_scoped_cwd_stripped_shape_carries_the_same_config(self, tmp_path):
+        from orchestrator.verify import _serial_pytest_str
+
+        tree = _write_serial_recovery_tree(tmp_path)
+        rendered = _serial_pytest_str(
+            'uv run --project sub pytest sub/tests/test_x.py::T::t', invocation_dir=tree,
+        )
+        assert rendered is not None
+        assert addopts_values(shlex.split(rendered)) == ["-m 'not warm_lane_bash'"]
+
+    def test_a_root_targeted_command_carries_the_root_config(self, tmp_path):
+        from orchestrator.verify import _serial_pytest_str
+
+        tree = _write_serial_recovery_tree(tmp_path)
+        rendered = _serial_pytest_str('uv run pytest tests/', invocation_dir=tree)
+        assert rendered is not None
+        assert addopts_values(shlex.split(rendered)) == [
+            "--import-mode=importlib -m 'not smoke and not integration and not warm_lane_bash'",
+        ]
+
+    def test_no_invocation_dir_is_the_historical_blank(self, tmp_path):
+        from orchestrator.verify import _serial_pytest_str
+
+        assert _serial_pytest_str('uv run --directory sub pytest tests/', invocation_dir=None) == (
+            'cd sub && uv run pytest -p no:xdist -o addopts= tests/'
+        )
+
+    def test_none_and_non_pytest_commands_pass_through(self, tmp_path):
+        from orchestrator.verify import _serial_pytest_str
+
+        tree = _write_serial_recovery_tree(tmp_path)
+        assert _serial_pytest_str(None, invocation_dir=tree) is None
+        cmd = 'cargo test --workspace'
+        assert _serial_pytest_str(cmd, invocation_dir=tree) is cmd
+
+    def test_a_refused_rewrite_still_logs_once_with_an_invocation_dir(
+        self, tmp_path, caplog: pytest.LogCaptureFixture,
+    ):
+        from orchestrator.verify import _serial_pytest_str
+
+        tree = _write_serial_recovery_tree(tmp_path)
+        refused = "pytest -k 'a && b' tests/ && true"
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            assert _serial_pytest_str(refused, invocation_dir=tree) is refused
+        records = [r for r in caplog.records if r.name == 'orchestrator.verify']
+        assert len(records) == 1
+        assert refused in records[0].getMessage()
+        assert "pytest -k 'a " in records[0].getMessage()
 
 
 # ---------------------------------------------------------------------------

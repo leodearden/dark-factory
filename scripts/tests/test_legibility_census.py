@@ -20,7 +20,7 @@ import functools
 import json
 import logging
 import subprocess
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from typing import Any
 
 import census as mod
@@ -28,9 +28,21 @@ import codebook
 import coder
 import digest as digest_mod
 import filing_policy
-import inventory
 import pytest
-from legibility import account_pool, census_trigger, session_runner, unlanded
+import yaml
+from legibility import (
+    account_pool,
+    census_trigger,
+    census_window,
+    check_census_report,
+    invariants,
+    session_ledger,
+    session_runner,
+    trickle_state,
+    unlanded,
+    verdict,
+)
+from quality_doc_texts import code_quality
 from shared.cap_markers import (
     BLOCKING_BANNER_MARKERS,
     REAL_CLI_CAP_HIT_MESSAGES,
@@ -38,6 +50,14 @@ from shared.cap_markers import (
 )
 
 import config as config_mod
+
+
+@pytest.fixture(autouse=True)
+def _isolate_legibility_state(tmp_path, monkeypatch):
+    """Keep every ledger and quarantine this module's census runs write
+    under tmp_path, never the operator's real legibility state root."""
+    monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path / "legibility-state"))
+
 
 # ---------------------------------------------------------------------------
 # Shared fixture helpers — synthetic transcript -> real digest text, mirrors
@@ -209,6 +229,11 @@ class _TrackingBatchSource:
             yield batch
 
 
+def _no_selection():
+    """The ``selection_of`` seam of a batch source with no mining window."""
+    return None
+
+
 def _poison(name):
     """A seam fake that raises if ever called -- used to prove a code path
     (e.g. run_census's DEFER branch) never reaches a given seam."""
@@ -289,7 +314,7 @@ def test_mine_to_saturation_stops_after_two_consecutive_saturated_batches():
 
     result = mod.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
-        config=saturation, invoke=fake_invoke,
+        config=saturation, invoke=fake_invoke, invariant_slugs=(),
     )
 
     assert result.stop_reason == "saturated"
@@ -319,7 +344,7 @@ def test_mine_to_saturation_exhausts_source_that_never_saturates():
 
     result = mod.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
-        config=saturation, invoke=fake_invoke,
+        config=saturation, invoke=fake_invoke, invariant_slugs=(),
     )
 
     assert result.stop_reason == "exhausted"
@@ -378,7 +403,7 @@ def test_mine_to_saturation_storm_batch_never_counts_as_saturated():
 
     result = mod.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
-        config=saturation, invoke=fake_invoke,
+        config=saturation, invoke=fake_invoke, invariant_slugs=(),
     )
 
     assert result.stop_reason == "saturated"
@@ -430,7 +455,7 @@ def test_mine_to_saturation_stops_at_operator_batch_cap():
 
     result = mod.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
-        config=saturation, invoke=fake_invoke, max_batches=2,
+        config=saturation, invoke=fake_invoke, max_batches=2, invariant_slugs=(),
     )
 
     assert result.stop_reason == "capped", "the cap must be distinguishable from exhaustion"
@@ -451,7 +476,7 @@ def test_mine_to_saturation_cap_not_reached_leaves_stop_reason_unchanged():
 
     result = mod.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
-        config=saturation, invoke=fake_invoke, max_batches=99,
+        config=saturation, invoke=fake_invoke, max_batches=99, invariant_slugs=(),
     )
 
     assert result.stop_reason == "exhausted", "a cap never reached must not relabel the stop"
@@ -474,7 +499,7 @@ def test_mine_to_saturation_saturation_at_the_cap_reports_saturated_not_capped()
 
     result = mod.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
-        config=saturation, invoke=fake_invoke, max_batches=2,
+        config=saturation, invoke=fake_invoke, max_batches=2, invariant_slugs=(),
     )
 
     assert result.stop_reason == "saturated", (
@@ -492,14 +517,14 @@ def test_mine_to_saturation_records_max_batches_on_result():
     capped = mod.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
         config=saturation, invoke=_make_fake_invoke(_mining_response_fn(novel_sessions)),
-        max_batches=2,
+        max_batches=2, invariant_slugs=(),
     )
     assert capped.max_batches == 2, "the cap must travel on the result for the report"
 
     source2, novel_sessions2 = _never_saturating_source(3)
     flagless = mod.mine_to_saturation(
         source2, live_codebook, project="dark_factory", model="sonnet",
-        config=saturation, invoke=_make_fake_invoke(_mining_response_fn(novel_sessions2)),
+        config=saturation, invoke=_make_fake_invoke(_mining_response_fn(novel_sessions2)), invariant_slugs=(),
     )
     assert flagless.max_batches is None, "no cap passed -> nothing to report"
     assert flagless.stop_reason == "exhausted"
@@ -519,7 +544,7 @@ def test_mine_to_saturation_rejects_a_nonpositive_batch_cap(bad_cap):
     with pytest.raises(ValueError, match="max_batches"):
         mod.mine_to_saturation(
             source, live_codebook, project="dark_factory", model="sonnet",
-            config=saturation, invoke=_poison("invoke"), max_batches=bad_cap,
+            config=saturation, invoke=_poison("invoke"), max_batches=bad_cap, invariant_slugs=(),
         )
 
     assert source.pulled == [], "the guard must fire before any batch is consumed"
@@ -1078,23 +1103,46 @@ def test_retire_entry_sets_status_retained():
 
 
 # ---------------------------------------------------------------------------
-# step-13: RED — advance_census_state() (zeta/2579 MUST-persist contract)
+# advance_census_state() -- the six-key census-state (zeta/2579 MUST-persist
+# contract for last_census_done_count; PRD census-incremental §4.2)
 # ---------------------------------------------------------------------------
 
-def test_advance_census_state_writes_all_three_fields(tmp_path):
-    path = tmp_path / "census-state.json"
+_STATE_KEYS = [
+    "last_census_at",
+    "last_census_run_id",
+    "last_census_report",
+    "last_census_as_of_sha",
+    "session_watermark",
+    "last_census_done_count",
+]
 
-    mod.advance_census_state(
-        path,
-        now_iso="2026-07-14T12:00:00+00:00",
+
+def _advance(path, **overrides):
+    kwargs: dict[str, Any] = dict(
+        census_at="2026-07-14",
+        run_id="census-dark_factory-20260714",
         report_path="plans/confusion-census-2026-07-14.md",
+        as_of_sha="a" * 40,
+        session_watermark="2026-07-14T00:00:00+00:00",
         done_count=42,
     )
+    kwargs.update(overrides)
+    mod.advance_census_state(path, **kwargs)
+
+
+def test_advance_census_state_writes_exactly_the_six_keys_in_order(tmp_path):
+    path = tmp_path / "census-state.json"
+
+    _advance(path)
 
     data = json.loads(path.read_text(encoding="utf-8"))
+    assert list(data) == _STATE_KEYS
     assert data == {
-        "last_census_at": "2026-07-14T12:00:00+00:00",
+        "last_census_at": "2026-07-14",
+        "last_census_run_id": "census-dark_factory-20260714",
         "last_census_report": "plans/confusion-census-2026-07-14.md",
+        "last_census_as_of_sha": "a" * 40,
+        "session_watermark": "2026-07-14T00:00:00+00:00",
         "last_census_done_count": 42,
     }
 
@@ -1102,9 +1150,7 @@ def test_advance_census_state_writes_all_three_fields(tmp_path):
 def test_advance_census_state_done_count_zero_is_written_as_integer_zero(tmp_path):
     path = tmp_path / "census-state.json"
 
-    mod.advance_census_state(
-        path, now_iso="2026-07-14T12:00:00+00:00", report_path="plans/x.md", done_count=0,
-    )
+    _advance(path, done_count=0)
 
     data = json.loads(path.read_text(encoding="utf-8"))
     assert "last_census_done_count" in data, "must never be dropped as falsy"
@@ -1121,14 +1167,24 @@ def test_advance_census_state_writes_none_done_count_as_json_null(tmp_path):
     present -- while being truthful about the state being unknown."""
     path = tmp_path / "census-state.json"
 
-    mod.advance_census_state(
-        path, now_iso="2026-07-31T12:00:00+00:00", report_path="plans/x.md", done_count=None,
-    )
+    _advance(path, done_count=None)
 
     data = json.loads(path.read_text(encoding="utf-8"))
     assert "last_census_done_count" in data, "MUST-persist contract: key is never dropped"
     assert data["last_census_done_count"] is None
     assert '"last_census_done_count": null' in path.read_text(encoding="utf-8")
+
+
+def test_advance_census_state_writes_none_session_watermark_as_json_null(tmp_path):
+    """A run with no mining window (an injected batch source) has no
+    watermark; the key is still written, as null."""
+    path = tmp_path / "census-state.json"
+
+    _advance(path, session_watermark=None)
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert list(data) == _STATE_KEYS
+    assert data["session_watermark"] is None
 
 
 def test_null_done_count_baseline_makes_condition_b_fail_safe(tmp_path, caplog):
@@ -1140,9 +1196,7 @@ def test_null_done_count_baseline_makes_condition_b_fail_safe(tmp_path, caplog):
     `null` baseline instead routes into the existing absent-baseline branch:
     one WARNING, `None`, no fire."""
     path = tmp_path / "census-state.json"
-    mod.advance_census_state(
-        path, now_iso="2026-07-31T12:00:00+00:00", report_path="plans/x.md", done_count=None,
-    )
+    _advance(path, census_at="2026-07-31", done_count=None)
 
     # A null baseline is UNKNOWN, not malformed -- the state file still loads.
     status, data = census_trigger.load_census_state(path)
@@ -1172,7 +1226,10 @@ def test_null_done_count_baseline_makes_condition_b_fail_safe(tmp_path, caplog):
     decision = census_trigger.evaluate(
         now=now,
         last_census_at=now - timedelta(days=config.tasks_landed_min_days + 1),
-        never_censused=False,
+        floor_anchor=census_trigger.FloorAnchor(
+            census_trigger.FloorAnchorKind.SESSION_WATERMARK,
+            now - timedelta(days=config.tasks_landed_min_days + 1),
+        ),
         tasks_landed=None,
         candidate_first_seens=[],
         config=config,
@@ -1181,21 +1238,20 @@ def test_null_done_count_baseline_makes_condition_b_fail_safe(tmp_path, caplog):
     assert decision.fire is False
 
 
-def test_advance_census_state_round_trips_through_census_trigger_load(tmp_path):
+@pytest.mark.parametrize("watermark", ["2026-07-14T00:00:00+00:00", None])
+def test_advance_census_state_round_trips_through_census_trigger_load(tmp_path, watermark):
     path = tmp_path / "census-state.json"
 
-    mod.advance_census_state(
-        path,
-        now_iso="2026-07-14T12:00:00+00:00",
-        report_path="plans/confusion-census-2026-07-14.md",
-        done_count=7,
-    )
+    _advance(path, done_count=7, session_watermark=watermark)
 
     status, data = census_trigger.load_census_state(path)
     assert status == "ok"
     assert data is not None  # tuple[str, dict | None]; None only for missing/malformed
-    assert data["last_census_at"] == "2026-07-14T12:00:00+00:00"
+    assert data["last_census_at"] == "2026-07-14"
+    assert data["last_census_run_id"] == "census-dark_factory-20260714"
     assert data["last_census_report"] == "plans/confusion-census-2026-07-14.md"
+    assert data["last_census_as_of_sha"] == "a" * 40
+    assert data["session_watermark"] == watermark
     assert data["last_census_done_count"] == 7
 
 
@@ -1203,9 +1259,7 @@ def test_advance_census_state_atomic_replace_no_partial_left_behind(tmp_path):
     path = tmp_path / "census-state.json"
     path.write_text(json.dumps({"stale": "data"}), encoding="utf-8")
 
-    mod.advance_census_state(
-        path, now_iso="2026-07-14T12:00:00+00:00", report_path="plans/x.md", done_count=3,
-    )
+    _advance(path, done_count=3)
 
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["last_census_done_count"] == 3
@@ -1243,6 +1297,7 @@ def test_render_report_carries_each_piece_in_its_own_section():
     # spell `"--force" not in report`.
     assert [section.key for section in sections] == [
         mod.SECTION_HEADER,
+        mod.SECTION_METHOD,
         mod.SECTION_SATURATION,
         mod.SECTION_MATRIX,
         mod.SECTION_SYNTHESIS,
@@ -1276,23 +1331,83 @@ def test_render_report_carries_each_piece_in_its_own_section():
 
 
 def test_render_report_is_deterministic_no_clock():
-    kwargs: dict[str, Any] = dict(
-        date="2026-07-14",
-        project_id="dark_factory",
-        force=False,
-        matrix_md="matrix",
-        mining_result=_sample_mining_result(),
-        synthesis_md="prose",
-        filed_ticket_ids=["tkt_1"],
-        cost_note="cost",
-    )
-    assert mod.render_report(**kwargs) == mod.render_report(**kwargs)
+    assert mod.render_report(_census_record()) == mod.render_report(_census_record())
+
+
+_SAMPLE_METHOD: dict[str, Any] = {
+    "run_id": "census-dark_factory-20260714",
+    "as_of_sha": "a" * 40,
+    "since": "none",
+    "evidence": {
+        "window": ["2026-06-14T00:00:00+00:00", "2026-07-14T00:00:00+00:00"],
+        "sessions_enumerated": 25,
+        "skipped_coded": 3,
+        "skipped_zero_signal": 2,
+        "mined": 20,
+        "ledger_rows": 3,
+    },
+    "verification": {"confirmed": 0, "weakened": 0, "refuted": 0, "unverified": 0},
+    "cost": {
+        "miner_calls": 20,
+        "verify_calls": 0,
+        "synthesis_calls": 1,
+        "probe_calls": 1,
+        "embedding_calls": 0,
+        "wall_clock_secs": 12.5,
+    },
+    "inputs_consumed": [],
+    "extra": {
+        "inputs_consumed_note": "no other instrument's report is read yet",
+        "ledger_created_this_run": False,
+        "ledger_state": "ok",
+        "ledger_pruned": 0,
+        "ledger_error": None,
+    },
+}
+"""A fixed ``## Method`` block, as ``build_method`` shapes it, so the report
+fixtures do not depend on a clock or a ledger."""
 
 
 _GOLDEN_FLAGLESS_REPORT = """\
 # confusion census 2026-07-14
 
 Project: dark_factory
+
+## Method
+
+```yaml
+run_id: census-dark_factory-20260714
+as_of_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+since: none
+evidence:
+  window:
+  - '2026-06-14T00:00:00+00:00'
+  - '2026-07-14T00:00:00+00:00'
+  sessions_enumerated: 25
+  skipped_coded: 3
+  skipped_zero_signal: 2
+  mined: 20
+  ledger_rows: 3
+verification:
+  confirmed: 0
+  weakened: 0
+  refuted: 0
+  unverified: 0
+cost:
+  miner_calls: 20
+  verify_calls: 0
+  synthesis_calls: 1
+  probe_calls: 1
+  embedding_calls: 0
+  wall_clock_secs: 12.5
+inputs_consumed: []
+extra:
+  inputs_consumed_note: no other instrument's report is read yet
+  ledger_created_this_run: false
+  ledger_state: ok
+  ledger_pruned: 0
+  ledger_error: null
+```
 
 ## Saturation
 
@@ -1447,6 +1562,7 @@ def _render_kwargs(**overrides) -> dict[str, Any]:
     dict whose inferred value union would otherwise be re-reported once per
     union member per render_report parameter."""
     kwargs: dict[str, Any] = dict(
+        method=_SAMPLE_METHOD,
         date="2026-07-14",
         project_id="dark_factory",
         force=False,
@@ -1460,12 +1576,16 @@ def _render_kwargs(**overrides) -> dict[str, Any]:
     return kwargs
 
 
+def _census_record(**overrides):
+    return mod.build_census_record(**_render_kwargs(**overrides))
+
+
 def _render(**overrides):
-    return mod.render_report(**_render_kwargs(**overrides))
+    return mod.render_report(_census_record(**overrides))
 
 
 def _sections(**overrides):
-    return mod.census_report_sections(**_render_kwargs(**overrides))
+    return mod.census_report_sections(_census_record(**overrides))
 
 
 def test_render_report_capped_run_names_cap_and_partial_coverage():
@@ -1484,7 +1604,7 @@ def test_render_report_capped_run_names_cap_and_partial_coverage():
     assert "operator batch cap = 2 batch(es)" in coverage_line
     # The partial-coverage disclosure is its own line, and a capped run is the
     # only run that carries it (see ..._no_cap_renders_no_coverage_line).
-    assert len(_saturation_lines(sections, "- NOT PICKED UP LATER:")) == 1
+    assert len(_saturation_lines(sections, "- RESUMED NEXT RUN:")) == 1
 
 
 def test_render_report_capped_coverage_states_coded_digests_not_drawn_digests():
@@ -1513,8 +1633,8 @@ def test_render_report_capped_coverage_states_coded_digests_not_drawn_digests():
 def test_render_report_capped_coverage_names_the_uncoded_digests_when_coding_fell_short():
     # The storm's shortfall must be LOUD on the coverage line itself, not
     # merely inferable by subtracting the per-batch bullets rendered below
-    # it -- an operator deciding whether to roll last_census_at back reads
-    # THIS line, and it is the one line whose job is the coverage claim.
+    # it -- an operator judging what this run covered reads THIS line, and it
+    # is the one line whose job is the coverage claim.
     coverage_line = _coverage_line(_sections(mining_result=_storm_capped_mining_result()))
     # The shortfall COUNT attached to the claim it qualifies, not a bare "6":
     # the line legitimately carries 14 and 20, each of which a bare digit check
@@ -1543,35 +1663,29 @@ def test_render_report_capped_coverage_omits_the_shortfall_clause_when_every_dig
     )
 
 
-def test_render_report_capped_run_says_the_skipped_sessions_are_not_re_mined():
-    # PARTIAL coverage must not read as "the rest gets picked up next time".
-    # run_census always advances last_census_at and _census_window_dates
-    # anchors the NEXT window there, so the capped-away sessions fall outside
-    # every future window -- the same dead-recovery-path hazard the dry-run
-    # WARNING is written to avoid.
+def test_render_report_capped_run_says_the_skipped_sessions_resume_next_run():
+    # The capped-away sessions were never ledgered as coded, so the next
+    # census mines them while they remain inside its retention window. The
+    # old disclosure told the operator to roll last_census_at back; with the
+    # ledger that advice is wrong, and it must not survive.
     sections = _sections(
         mining_result=_capped_mining_result(stop_reason="capped", max_batches=2),
     )
 
-    disclosure = _saturation_lines(sections, "- NOT PICKED UP LATER:")
+    disclosure = _saturation_lines(sections, "- RESUMED NEXT RUN:")
     assert len(disclosure) == 1, "the disclosure is one line of its own"
-    # The two IDENTIFIERS an operator needs to act: the field that re-anchors
-    # the window, and the file holding it. Asserted because they are machine
-    # names a reader can look up, not because of the prose around them.
-    assert "last_census_at" in disclosure[0], "the re-anchoring mechanism must be named"
-    assert "docs/legibility/census-state.json" in disclosure[0], (
-        "the one real recovery lever is named, so a plain re-run is not read as it"
-    )
+    assert "last_census_at" not in disclosure[0], "no rollback advice"
+    assert _saturation_lines(sections, "- NOT PICKED UP LATER:") == []
 
 
-def test_render_report_cap_not_reached_makes_no_re_anchor_claim():
-    # The re-anchor disclosure belongs to the CAPPED branch only: a cap that
-    # was set but never reached mined exactly what an uncapped run would.
+def test_render_report_cap_not_reached_makes_no_resume_claim():
+    # The resume disclosure belongs to the CAPPED branch only: a cap that was
+    # set but never reached mined exactly what an uncapped run would.
     sections = _sections(
         mining_result=_capped_mining_result(stop_reason="saturated", max_batches=99),
     )
 
-    assert _saturation_lines(sections, "- NOT PICKED UP LATER:") == []
+    assert _saturation_lines(sections, "- RESUMED NEXT RUN:") == []
     assert _saturation_lines(sections, "- coverage:") == []
 
 
@@ -1588,7 +1702,7 @@ def test_render_report_cap_set_but_not_reached_is_reported_distinctly():
     assert "not reached -- mining stopped by: saturated" in not_reached[0]
     # No partial-coverage claim: the run stopped on its own terms.
     assert _saturation_lines(sections, "- coverage:") == []
-    assert _saturation_lines(sections, "- NOT PICKED UP LATER:") == []
+    assert _saturation_lines(sections, "- RESUMED NEXT RUN:") == []
 
 
 def test_render_report_no_cap_renders_no_coverage_line():
@@ -1601,7 +1715,7 @@ def test_render_report_no_cap_renders_no_coverage_line():
     # plus the per-batch bullets, so no cap text can appear anywhere in it.
     assert _saturation_lines(sections, "- coverage:") == []
     assert _saturation_lines(sections, "- operator batch cap:") == []
-    assert _saturation_lines(sections, "- NOT PICKED UP LATER:") == []
+    assert _saturation_lines(sections, "- RESUMED NEXT RUN:") == []
     assert _section(sections, mod.SECTION_SATURATION).lines == (
         "",
         "## Saturation",
@@ -1644,6 +1758,11 @@ def test_render_report_verify_cap_states_verified_of_novel_and_deferred():
     assert "662 deferred" in bullets[0], (
         "the deferred remainder must be STATED, not left to the reader's arithmetic"
     )
+    # The caveat follows the ledger: the deferred clusters' sessions were
+    # coded, so they are ledgered and not re-mined; last_census_at no longer
+    # anchors anything.
+    assert "last_census_at" not in bullets[1]
+    assert "ledger" in bullets[1]
     # Placement is asserted structurally by
     # test_census_report_sections_verification_is_gated_and_positioned.
 
@@ -1802,7 +1921,7 @@ _REPORT_FLAG_CASES: dict[str, dict[str, Any]] = {
 
 
 def test_census_report_sections_returns_keyed_sections_of_lines():
-    sections = mod.census_report_sections(**_render_kwargs())
+    sections = _sections()
 
     assert isinstance(sections, tuple)
     assert sections, "a report always carries at least a header"
@@ -1822,16 +1941,195 @@ def test_render_report_is_the_pure_join_of_its_sections(case):
 
     Asserted across every gated flag combination -- a branch that rendered
     outside the structure would pass on the flagless case alone."""
-    kwargs = _render_kwargs(**_REPORT_FLAG_CASES[case])
+    record = _census_record(**_REPORT_FLAG_CASES[case])
 
-    assert mod.render_report(**kwargs) == mod.join_report_sections(
-        mod.census_report_sections(**kwargs)
+    assert mod.render_report(record) == mod.join_report_sections(
+        mod.census_report_sections(record)
     )
+
+
+@pytest.mark.parametrize("case", sorted(_REPORT_FLAG_CASES))
+def test_render_report_renders_from_the_json_record_alone(case):
+    """The record is the source (contract §5): it survives a JSON round trip
+    and renders the same report from the parsed copy."""
+    record = _census_record(**_REPORT_FLAG_CASES[case])
+
+    parsed = json.loads(json.dumps(record))
+
+    assert mod.render_report(parsed) == mod.render_report(record)
+
+
+def test_build_census_record_carries_identity_and_method():
+    record = _census_record()
+
+    assert record["record_version"] == 1
+    assert record["run_id"] == _SAMPLE_METHOD["run_id"]
+    assert record["method"] == _SAMPLE_METHOD
+
+
+_METHOD_WINDOW = census_window.MiningWindow(
+    start=datetime(2026, 6, 14, tzinfo=UTC), end=datetime(2026, 7, 14, tzinfo=UTC),
+)
+
+
+def _selection(tmp_path, state, *, rows=None, pruned=None, error=None):
+    snapshot = session_ledger.LedgerSnapshot(
+        path=tmp_path / "coded-sessions.sqlite",
+        state=state,
+        rows_by_coded_by=rows or {},
+        pruned=pruned,
+        error=error,
+    )
+    return census_window.SessionSelection(
+        window=_METHOD_WINDOW,
+        ledger=snapshot,
+        sessions_enumerated=25,
+        skipped_coded=3,
+        skipped_zero_signal=2,
+    )
+
+
+def _method(**overrides):
+    kwargs: dict[str, Any] = dict(
+        run_id="census-dark_factory-20260714",
+        as_of_sha="a" * 40,
+        since=None,
+        selection=None,
+        mined=20,
+        confirmed=2,
+        refuted=1,
+        unverified=4,
+        miner_calls=20,
+        verify_calls=3,
+        synthesis_calls=1,
+        probe_calls=2,
+        wall_clock_secs=12.5,
+        verify_normalisations=verdict.count_normalisations([]),
+    )
+    kwargs.update(overrides)
+    return mod.build_method(**kwargs)
+
+
+_ORACLE_REPORT = check_census_report.Report(
+    date="2026-07-14", suffix=None, record=None, rendering=None,
+)
+"""The report identity the independent checker matches ``run_id`` against."""
+
+
+@pytest.mark.parametrize(
+    "state", [None, session_ledger.LedgerState.OK, session_ledger.LedgerState.UNREADABLE],
+)
+def test_build_method_conforms_to_the_independent_report_checker(tmp_path, state):
+    """``check_census_report`` imports nothing from census.py, so it holds
+    the contract §5 key set independently of ``build_method``."""
+    selection = None if state is None else _selection(tmp_path, state)
+    record = json.loads(json.dumps(_census_record(method=_method(selection=selection))))
+
+    assert check_census_report.check_record_method(record, _ORACLE_REPORT) == []
+    assert check_census_report.check_rendered_method(
+        mod.render_report(record), _ORACLE_REPORT,
+    ) == []
+    assert record["method"]["run_id"] == "census-dark_factory-20260714"
+    assert record["method"]["as_of_sha"] == "a" * 40
+
+
+def test_build_method_records_a_copy_of_every_verify_normalisation_count():
+    counts = {**verdict.count_normalisations([]), "tag_dropped": 2}
+    recorded = dict(counts)
+
+    method = _method(verify_normalisations=counts)
+    counts["tag_dropped"] = 99
+
+    assert method["extra"]["verify_normalisations"] == recorded
+
+
+def test_build_method_since_is_none_text_without_a_prior_census():
+    assert _method(since=None)["since"] == "none"
+    assert _method(since="b" * 40)["since"] == "b" * 40
+
+
+def test_build_method_verification_cost_and_inputs_consumed():
+    method = _method()
+
+    assert method["verification"] == {
+        "confirmed": 2, "weakened": 0, "refuted": 1, "unverified": 4,
+    }
+    assert method["cost"] == {
+        "miner_calls": 20,
+        "verify_calls": 3,
+        "synthesis_calls": 1,
+        "probe_calls": 2,
+        "embedding_calls": 0,
+        "wall_clock_secs": 12.5,
+    }
+    assert method["inputs_consumed"] == []
+    assert method["extra"]["inputs_consumed_note"]
+
+
+def test_build_method_evidence_comes_from_the_selection(tmp_path):
+    selection = _selection(
+        tmp_path, session_ledger.LedgerState.OK,
+        rows={session_ledger.CodedBy.TRICKLE: 3}, pruned=4,
+    )
+
+    method = _method(selection=selection)
+
+    assert method["evidence"] == {
+        "window": _METHOD_WINDOW.to_record(),
+        "sessions_enumerated": 25,
+        "skipped_coded": 3,
+        "skipped_zero_signal": 2,
+        "mined": 20,
+        "ledger_rows": 3,
+    }
+    assert method["extra"]["ledger_created_this_run"] is False
+    assert method["extra"]["ledger_state"] == "ok"
+    assert method["extra"]["ledger_pruned"] == 4
+
+
+def test_build_method_names_a_ledger_created_this_run(tmp_path):
+    method = _method(selection=_selection(tmp_path, session_ledger.LedgerState.CREATED))
+
+    assert method["extra"]["ledger_created_this_run"] is True
+    assert method["evidence"]["ledger_rows"] == 0
+
+
+def test_build_method_unreadable_ledger_counts_null_never_zero(tmp_path):
+    path = tmp_path / "coded-sessions.sqlite"
+    selection = _selection(
+        tmp_path, session_ledger.LedgerState.UNREADABLE,
+        error=f"{path}: file is not a database",
+    )
+
+    method = _method(selection=selection)
+
+    assert method["evidence"]["ledger_rows"] is None
+    assert method["extra"]["ledger_pruned"] is None
+    assert method["extra"]["ledger_state"] == "unreadable"
+    assert str(path) in method["extra"]["ledger_error"]
+    assert method["extra"]["ledger_created_this_run"] is False
+
+
+def test_build_method_without_a_selection_reports_null_evidence():
+    method = _method(selection=None)
+
+    assert method["evidence"] == {
+        "window": None,
+        "sessions_enumerated": None,
+        "skipped_coded": None,
+        "skipped_zero_signal": None,
+        "mined": 20,
+        "ledger_rows": None,
+    }
+    assert method["extra"]["ledger_created_this_run"] is None
+    assert method["extra"]["ledger_state"] is None
+    assert method["extra"]["ledger_pruned"] is None
 
 
 def test_census_report_sections_flagless_key_set_and_order():
     assert _section_keys() == [
         mod.SECTION_HEADER,
+        mod.SECTION_METHOD,
         mod.SECTION_SATURATION,
         mod.SECTION_MATRIX,
         mod.SECTION_SYNTHESIS,
@@ -1847,6 +2145,17 @@ def test_census_report_sections_force_marker_is_gated_and_positioned():
 
     forced = _section_keys(force=True)
     assert forced.index(mod.SECTION_FORCE_MARKER) == forced.index(mod.SECTION_HEADER) + 1
+    assert forced.index(mod.SECTION_METHOD) == forced.index(mod.SECTION_FORCE_MARKER) + 1
+
+
+def test_census_report_method_section_is_a_yaml_fence_of_the_record_method():
+    record = _census_record()
+
+    lines = _section(mod.census_report_sections(record), mod.SECTION_METHOD).lines
+
+    assert lines[:4] == ("", "## Method", "", "```yaml")
+    assert lines[-1] == "```"
+    assert yaml.safe_load("\n".join(lines[4:-1])) == record["method"]
 
 
 def test_census_report_sections_verification_is_gated_and_positioned():
@@ -1906,7 +2215,7 @@ def test_section_text_names_the_key_and_the_keys_present_when_absent():
     """The helper's own failure mode is part of what this workstream buys: an
     absent section fails naming what was looked for AND what was there,
     instead of raising a bare IndexError from a string split."""
-    sections = mod.census_report_sections(**_render_kwargs())
+    sections = _sections()
 
     with pytest.raises(AssertionError) as excinfo:
         _section_text(sections, mod.SECTION_VERIFICATION)
@@ -1921,13 +2230,12 @@ def test_census_report_sections_joined_are_byte_identical_to_the_golden():
     views cannot drift: whatever
     test_render_report_flagless_output_is_byte_identical_golden pins for the
     prose, this pins for the partition."""
-    assert mod.join_report_sections(
-        mod.census_report_sections(**_render_kwargs())
-    ) == _GOLDEN_FLAGLESS_REPORT
+    assert mod.join_report_sections(_sections()) == _GOLDEN_FLAGLESS_REPORT
 
 
 def test_render_report_flagless_output_is_byte_identical_golden():
-    report = mod.render_report(
+    report = mod.render_report(mod.build_census_record(
+        method=_SAMPLE_METHOD,
         date="2026-07-14",
         project_id="dark_factory",
         force=False,
@@ -1936,7 +2244,7 @@ def test_render_report_flagless_output_is_byte_identical_golden():
         synthesis_md="prose",
         filed_ticket_ids=["tkt_1"],
         cost_note="cost",
-    )
+    ))
     assert report == _GOLDEN_FLAGLESS_REPORT
 
 
@@ -1954,6 +2262,7 @@ def _run_census_kwargs(tmp_path, **overrides) -> dict[str, Any]:
     # single annotation cleared 337 of the 350 errors this file carried.
     kwargs: dict[str, Any] = dict(
         batch_source=None,
+        selection_of=_no_selection,
         invoke=_make_fake_invoke(default="pong"),
         verify_fn=_poison("verify_fn"),
         synthesize_fn=_poison("synthesize_fn"),
@@ -1975,6 +2284,9 @@ def _run_census_kwargs(tmp_path, **overrides) -> dict[str, Any]:
         census_state_path=tmp_path / "census-state.json",
         report_path=tmp_path / "confusion-census-2026-07-14.md",
         date="2026-07-14",
+        run_id="census-dark_factory-20260714",
+        as_of_sha="a" * 40,
+        since=None,
         force=False,
     )
     kwargs.update(overrides)
@@ -2098,6 +2410,24 @@ def test_run_census_defers_at_verify_boundary_when_cap_arrives_after_preflight(
 _IN_TREE_REMEDIATION = {"path": "docs/fixture.md", "change": "fixture remediation"}
 
 
+def _fake_verdict(remediation):
+    """The verdict.Verdict the real verifier attaches to a verified cluster,
+    as a fake verifier states it: no normalisation, severity medium."""
+    found = None if remediation is None else verdict.Remediation(
+        remediation["path"], remediation["change"],
+    )
+    return verdict.Verdict(
+        verified=True,
+        reason="fake verifier",
+        anchor="slug:fake-verdict" if found is None else found.path,
+        tags=("h13", verdict.KIND_TAG),
+        severity=verdict.DEFAULT_SEVERITY,
+        severity_reason="fake verifier",
+        route=verdict.Route.STRUCTURAL if found is None else verdict.Route.MECHANICAL,
+        remediation=found,
+    )
+
+
 def _make_fake_verify_fn(
     *, verified_titles=(), rejected_titles=(), fixed_entry_ids=(),
     remediation=_IN_TREE_REMEDIATION,
@@ -2108,15 +2438,20 @@ def _make_fake_verify_fn(
     retire_entry path independently of any particular cluster. Records
     every call's (clusters, model, result) in `.calls`.
 
-    Each VERIFIED cluster comes back as a new dict carrying *remediation*,
-    as the real verifier's in-tree proposal would: run_census files a
-    single-sighting cluster only when it has one (filing_policy.is_fileable),
-    so without it every "was it filed" assertion here would be vacuous.
-    Pass remediation=None to model an unremediated verdict."""
+    Each VERIFIED cluster comes back as a new dict carrying its Verdict and
+    *remediation*, as the real verifier's in-tree proposal would: run_census
+    files a single-sighting cluster only when it has one
+    (filing_policy.is_fileable), so without it every "was it filed" assertion
+    here would be vacuous. Pass remediation=None to model an unremediated
+    verdict."""
     calls = []
 
     def fake_verify_fn(clusters, *, model):
-        verified = [c for c in clusters if c.get("title") in verified_titles]
+        verified = [
+            {**c, "verdict": _fake_verdict(remediation)}
+            for c in clusters
+            if c.get("title") in verified_titles
+        ]
         if remediation is not None:
             verified = [{**c, "remediation": remediation} for c in verified]
         result = {
@@ -2275,6 +2610,109 @@ def test_run_census_happy_path_full_seam_wiring(tmp_path):
     assert outcome.stop_reason == "exhausted"
 
 
+def test_run_census_persists_run_identity_and_repo_relative_report(tmp_path):
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[[_hand_digest("dup-1", "nothing new here")]],
+        verify_fn=_make_fake_verify_fn(),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        status_fetcher=_make_fake_status_fetcher(5),
+        commit=_make_fake_commit(),
+        run_id="census-dark_factory-20260714-2",
+        as_of_sha="c" * 40,
+        since="d" * 40,
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    state = json.loads(kwargs["census_state_path"].read_text(encoding="utf-8"))
+    assert state == {
+        "last_census_at": "2026-07-14",
+        "last_census_run_id": "census-dark_factory-20260714-2",
+        "last_census_report": "confusion-census-2026-07-14.md",
+        "last_census_as_of_sha": "c" * 40,
+        "session_watermark": None,
+        "last_census_done_count": 5,
+    }
+
+
+def _declared_and_free_text_slug_response(prompt, model):
+    """A mining reply matching entry-a: the `digest-alpha` session names the
+    declared slug, every other session a free-text value."""
+    if prompt == mod._HEADROOM_PROBE_PROMPT:
+        return "pong"
+    slug = "known-slug" if "digest-alpha" in prompt else "free-text-one"
+    return json.dumps(
+        {"matches": [{"entry_id": "entry-a", "invariant_violated": slug}], "candidates": []}
+    )
+
+
+def _invariant_slugs_block(prompt):
+    return prompt.split("=== INVARIANT SLUGS ===\n", 1)[1].split("\n=== ", 1)[0]
+
+
+def test_run_census_screens_mined_slugs_and_warns_once(tmp_path, caplog):
+    """plans/census-incremental-prd.md §4.8 row 15 on the census path."""
+    doc = tmp_path / invariants.DOC_RELPATH
+    doc.parent.mkdir(parents=True)
+    doc.write_text("## INV-1 `known-slug`\n", encoding="utf-8")
+    fake_invoke = _make_fake_invoke(_declared_and_free_text_slug_response)
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=fake_invoke,
+        batch_source=[[
+            _hand_digest("digest-alpha", "one confusion"),
+            _hand_digest("digest-beta", "another confusion"),
+        ]],
+        verify_fn=_make_fake_verify_fn(),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        status_fetcher=_make_fake_status_fetcher(5),
+        commit=_make_fake_commit(),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    mining_prompts = [
+        c["prompt"] for c in fake_invoke.calls if c["prompt"] != mod._HEADROOM_PROBE_PROMPT
+    ]
+    assert len(mining_prompts) == 2
+    for prompt in mining_prompts:
+        assert "- known-slug" in _invariant_slugs_block(prompt).splitlines()
+    persisted = codebook.load(kwargs["codebook_path"])
+    [entry] = [e for e in persisted["entries"] if e["id"] == "entry-a"]
+    by_session = {s["session"]: s for s in entry["sightings"]}
+    assert by_session["digest-alpha"]["invariant_violated"] == "known-slug"
+    assert "invariant_violated" not in by_session["digest-beta"]
+    naming_it = [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING and "free-text-one" in r.getMessage()
+    ]
+    assert len(naming_it) == 1, naming_it
+
+
+def test_run_census_rejects_a_report_path_outside_project_root_before_any_spend(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "elsewhere" / "confusion-census-2026-07-14.md"
+    kwargs = _run_census_kwargs(
+        root,
+        invoke=_poison("invoke"),
+        batch_source=_poison("batch_source"),
+        report_path=outside,
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        mod.run_census(**kwargs)
+
+    assert str(outside) in str(excinfo.value)
+    assert str(root) in str(excinfo.value)
+    assert not outside.parent.exists()
+
+
 # ---------------------------------------------------------------------------
 # task 5780: a census whose commit does not land (e.g. refused by the target
 # repo's pre-commit hook) rolls every written path back to HEAD, quarantines
@@ -2395,8 +2833,11 @@ def test_run_census_never_advances_census_state_when_the_commit_does_not_land(tm
     census_state_path = legibility_dir / "census-state.json"
     mod.advance_census_state(
         census_state_path,
-        now_iso="2026-06-01",
+        census_at="2026-06-01",
+        run_id="census-dark_factory-20260601",
         report_path="plans/confusion-census-2026-06-01.md",
+        as_of_sha="b" * 40,
+        session_watermark=None,
         done_count=0,
     )
     _git(repo, "add", ".")
@@ -3147,7 +3588,7 @@ def test_main_done_line_names_unresolved_verdicts_only_when_non_zero(
     """The CLI clause appears exactly when it carries information, so a normal
     run's summary line stays BYTE-unchanged -- same gating reasoning as
     render_report's coverage-shortfall clause."""
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
 
     def _run_main(unresolved):
@@ -3412,32 +3853,37 @@ def test_run_census_submit_fn_error_shape_is_not_counted_as_filed(tmp_path, capl
     assert "None" not in filed_section, "an unfilable result must never render as a '- None' bullet"
 
 
-def test_run_census_promote_clamps_out_of_enum_severity_to_medium(tmp_path):
-    """A custom verify_fn may enrich a cluster with a severity outside
-    codebook.py's {high, medium, low} entry enum (e.g. an escalation-style
-    'critical', valid elsewhere in this codebase but not in the codebook's
-    own schema). That must be clamped, not persisted verbatim into a
-    codebook.dump() that would otherwise raise deep into the pipeline
-    (reviewer_comprehensive finding #3)."""
-    batch = [
+_PROMOTED_TITLE = "Silent no-op subagent contract"
+
+
+def _novel_verified_batch():
+    return [
         _hand_digest("dup-1", "nothing new here"),
         _hand_digest("novel-verified", "a genuinely new confusion shape"),
     ]
-    fake_invoke = _make_fake_invoke(_happy_invoke_response)
 
-    def bad_severity_verify_fn(clusters, *, model):
-        verified = [
-            {**c, "severity": "critical"}
-            for c in clusters
-            if c.get("title") == "Silent no-op subagent contract"
-        ]
-        return {"verified": verified, "rejected": [], "fixed": []}
 
-    kwargs = _run_census_kwargs(
+def _persisted_promoted_entry(kwargs):
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert codebook.validate(persisted) == []
+    return next(e for e in persisted["entries"] if e["title"] == _PROMOTED_TITLE)
+
+
+def _recorded_normalisations(kwargs):
+    record = json.loads(kwargs["report_path"].with_suffix(".json").read_text(encoding="utf-8"))
+    return record["method"]["extra"]["verify_normalisations"]
+
+
+def _normalisation_counts(**nonzero):
+    return {**verdict.count_normalisations([]), **nonzero}
+
+
+def _promotion_kwargs(tmp_path, *, verify_fn, invoke=None):
+    return _run_census_kwargs(
         tmp_path,
-        invoke=fake_invoke,
-        batch_source=[batch],
-        verify_fn=bad_severity_verify_fn,
+        invoke=invoke or _make_fake_invoke(_happy_invoke_response),
+        batch_source=[_novel_verified_batch()],
+        verify_fn=verify_fn,
         synthesize_fn=_make_fake_synthesize_fn(),
         submit_fn=_make_fake_submit_fn(),
         escalate_fn=_poison("escalate_fn"),
@@ -3445,15 +3891,176 @@ def test_run_census_promote_clamps_out_of_enum_severity_to_medium(tmp_path):
         commit=_make_fake_commit(),
     )
 
+
+def test_run_census_promotes_with_the_verdicts_severity_and_reason(tmp_path):
+    def verdict_verify_fn(clusters, *, model):
+        verified = [
+            {
+                **c,
+                "verdict": verdict.parse_verdict(
+                    {
+                        "verified": True,
+                        "reason": "r",
+                        "tags": ["h13"],
+                        "severity": "high",
+                        "severity_reason": "r-high",
+                        "route": "structural",
+                    },
+                    title=c["title"],
+                    project_root=tmp_path,
+                ),
+            }
+            for c in clusters
+            if c.get("title") == _PROMOTED_TITLE
+        ]
+        return {"verified": verified, "rejected": [], "fixed": []}
+
+    kwargs = _promotion_kwargs(tmp_path, verify_fn=verdict_verify_fn)
+
     outcome = mod.run_census(**kwargs)
 
-    assert outcome.status == "done", "an out-of-enum severity from verify_fn must not crash the census"
-    persisted = codebook.load(kwargs["codebook_path"])
-    assert codebook.validate(persisted) == []
-    promoted_entry = next(
-        e for e in persisted["entries"] if e["title"] == "Silent no-op subagent contract"
+    assert outcome.status == "done"
+    entry = _persisted_promoted_entry(kwargs)
+    assert entry["severity"] == "high"
+    assert entry["severity_reason"] == "r-high"
+
+
+def test_run_census_promotes_a_verdictless_cluster_through_the_parsers_defaults(
+    tmp_path, caplog,
+):
+    """A custom verify_fn may return a verified cluster with no Verdict, even
+    one carrying its own out-of-enum severity ('critical'). The cluster-level
+    severity is ignored: the cluster is parsed as an empty verdict, so its
+    defaults are normalised and counted like any other verdict's."""
+    def bad_severity_verify_fn(clusters, *, model):
+        verified = [
+            {**c, "severity": "critical"}
+            for c in clusters
+            if c.get("title") == _PROMOTED_TITLE
+        ]
+        return {"verified": verified, "rejected": [], "fixed": []}
+
+    kwargs = _promotion_kwargs(tmp_path, verify_fn=bad_severity_verify_fn)
+
+    with caplog.at_level(logging.WARNING, logger="legibility.census"):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    entry = _persisted_promoted_entry(kwargs)
+    assert entry["severity"] == "medium"
+    assert "medium" in entry["severity_reason"]
+    assert any(
+        _PROMOTED_TITLE in record.getMessage()
+        and "without a verdict" in record.getMessage().lower()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
     )
-    assert promoted_entry["severity"] == "medium", "an out-of-enum severity is clamped, never persisted verbatim"
+    assert "critical" not in entry["severity_reason"]
+    assert _recorded_normalisations(kwargs) == _normalisation_counts(
+        anchor_from_title=1, severity_missing=1, route_defaulted=1, reason_missing=1,
+    )
+
+
+def _verdictless_verify_fn(remediation):
+    def verify_fn(clusters, *, model):
+        verified = [
+            {**c, "remediation": remediation}
+            for c in clusters
+            if c.get("title") == _PROMOTED_TITLE
+        ]
+        return {"verified": verified, "rejected": [], "fixed": []}
+
+    return verify_fn
+
+
+def test_run_census_reads_a_verdictless_clusters_in_tree_remediation_into_its_verdict(
+    tmp_path,
+):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "fixture.md").write_text("fixture\n", encoding="utf-8")
+    synthesize_fn = _make_fake_synthesize_fn()
+    kwargs = _promotion_kwargs(tmp_path, verify_fn=_verdictless_verify_fn(_IN_TREE_REMEDIATION))
+    kwargs["synthesize_fn"] = synthesize_fn
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    [cluster] = synthesize_fn.calls[0]["verified"]
+    assert cluster["verdict"].remediation == verdict.Remediation(**_IN_TREE_REMEDIATION)
+    assert cluster["verdict"].route is verdict.Route.MECHANICAL
+    assert cluster["remediation"] == _IN_TREE_REMEDIATION
+    [filed] = kwargs["submit_fn"].calls
+    assert _IN_TREE_REMEDIATION["path"] in filed["description"]
+    assert _recorded_normalisations(kwargs) == _normalisation_counts(
+        anchor_from_remediation=1, severity_missing=1, route_defaulted=1, reason_missing=1,
+    )
+
+
+def test_run_census_drops_a_verdictless_clusters_out_of_tree_remediation(tmp_path):
+    synthesize_fn = _make_fake_synthesize_fn()
+    kwargs = _promotion_kwargs(
+        tmp_path,
+        verify_fn=_verdictless_verify_fn({"path": "docs/missing.md", "change": "Document X"}),
+    )
+    kwargs["synthesize_fn"] = synthesize_fn
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    [cluster] = synthesize_fn.calls[0]["verified"]
+    assert cluster["verdict"].remediation is None
+    assert "remediation" not in cluster
+    assert all("docs/missing.md" not in call["description"] for call in kwargs["submit_fn"].calls)
+    assert _recorded_normalisations(kwargs) == _normalisation_counts(
+        anchor_from_title=1, severity_missing=1, route_defaulted=1, reason_missing=1,
+        remediation_rejected=1,
+    )
+
+
+def test_run_census_normalises_and_counts_a_malformed_verdict_from_the_real_verifier(
+    tmp_path,
+):
+    """PRD §4.8 row 6, end to end: unknown tag, missing anchor path and
+    severity 'critical' are each normalised and counted, and the run completes."""
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "fixture.md").write_text("fixture\n", encoding="utf-8")
+    malformed = json.dumps(
+        {
+            "verified": True,
+            "reason": "r",
+            "anchor": "docs/missing.py::f",
+            "tags": ["h13", "bogus"],
+            "severity": "critical",
+            "severity_reason": "s",
+            "remediation": _IN_TREE_REMEDIATION,
+        }
+    )
+
+    def respond(prompt, model):
+        if prompt.startswith("You are the periodic-census verifier"):
+            return malformed
+        return _happy_invoke_response(prompt, model)
+
+    fake_invoke = _make_fake_invoke(respond)
+    kwargs = _promotion_kwargs(
+        tmp_path,
+        invoke=fake_invoke,
+        verify_fn=mod._build_default_verify_fn(str(tmp_path), fake_invoke),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    entry = _persisted_promoted_entry(kwargs)
+    assert entry["severity"] == "medium"
+    assert "critical" in entry["severity_reason"]
+    expected = _normalisation_counts(
+        anchor_from_remediation=1, tag_dropped=1, severity_substituted=1, route_defaulted=1,
+    )
+    assert _recorded_normalisations(kwargs) == expected
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    method_yaml = report_text.split("## Method", 1)[1].split("```yaml\n", 1)[1].split("```", 1)[0]
+    assert yaml.safe_load(method_yaml)["extra"]["verify_normalisations"] == expected
 
 
 def test_run_census_storm_batch_is_logged_and_noted_in_report(tmp_path, caplog):
@@ -3629,13 +4236,11 @@ def test_run_census_max_batches_caps_mining_and_reports_it(tmp_path):
     assert "operator batch cap = 1" in lowered
     assert "partial" in lowered, "a capped run must never read as full coverage"
     assert "not mined" in lowered
-    # ...and PARTIAL must not read as "the remainder comes next run": this
-    # very run advanced census-state, so the next window starts here.
-    assert "last_census_at" in lowered
-    assert "never re-enumerated" in lowered
-    assert kwargs["census_state_path"].exists(), (
-        "the report's re-anchor claim is only honest because state really advanced"
-    )
+    # ...and the unmined remainder is resumed by the next run: it was never
+    # ledgered as coded.
+    assert "resumed next run" in lowered
+    assert "never re-enumerated" not in lowered
+    assert kwargs["census_state_path"].exists()
 
     # The rest of the pipeline still ran to completion on the mined batch.
     assert outcome.status == "done"
@@ -3996,10 +4601,10 @@ def test_run_census_dry_run_filing_writes_payloads_and_files_nothing(tmp_path, c
 # codebook merge, the promotions, codebook.dump and advance_census_state all
 # really happened, so re-running the census files NOTHING (the same confusions
 # now code as `matches` against the advanced codebook, `_novel_clusters` comes
-# back empty, build_task_payloads returns [], and _census_window_dates has
-# re-anchored at this run's last_census_at so the earlier window is never
-# enumerated again). Advertising a re-run as the recovery path sends the
-# operator down a road that silently drops the remediation work.
+# back empty, build_task_payloads returns [], and the mined sessions are
+# ledgered as coded, so no later census mines them again). Advertising a re-run
+# as the recovery path sends the operator down a road that silently drops the
+# remediation work.
 # ---------------------------------------------------------------------------
 
 def test_run_census_dry_run_warning_states_advanced_state_and_no_rerun_recovery(
@@ -4044,6 +4649,11 @@ def test_run_census_dry_run_warning_states_advanced_state_and_no_rerun_recovery(
 
     # (c) names hand-filing the payload file as the remaining path
     assert "hand" in msg
+
+    # (c2) names the ledger as why the sessions are not mined again; the
+    # retired window re-anchoring is not offered as the reason
+    assert "ledger" in msg
+    assert "re-anchor" not in msg
 
     # (d) THE FINDING: never advertise a re-run as recovery. A second census
     # cannot re-file these payloads, so pointing the operator at one loses
@@ -4227,7 +4837,7 @@ def test_run_census_all_three_cost_control_flags_interact_end_to_end(tmp_path, c
 
     # (b) the capped coverage line reports the CODED count for the one mined
     # batch (steps 2/4 above, now observed through the real pipeline rather
-    # than a hand-built MiningResult), and the PARTIAL / never-re-enumerated
+    # than a hand-built MiningResult), and the PARTIAL / resumed-next-run
     # disclosures still fire. _happy_batch's 3 digests all code successfully
     # (none configured to fail to parse), so coded == drawn == 3 here -- no
     # shortfall clause is expected from THIS combination; step-5's extension
@@ -4237,7 +4847,7 @@ def test_run_census_all_three_cost_control_flags_interact_end_to_end(tmp_path, c
     assert "operator batch cap = 1" in coverage_line
     assert "failed to code" not in coverage_line.lower()
     assert "partial" in lowered
-    assert "never re-enumerated" in lowered
+    assert "resumed next run" in lowered
 
     # (c) the verify cap bit only on the clusters capped mining actually
     # produced. A single _happy_batch always yields exactly two novel
@@ -4268,8 +4878,7 @@ def test_run_census_all_three_cost_control_flags_interact_end_to_end(tmp_path, c
     assert len(payloads) == 1
     assert "Silent no-op subagent contract" in payloads[0]["title"]
 
-    # (e) census-state still advanced under three caps at once, so the
-    # report's re-anchor claim ("NOT PICKED UP LATER") stays honest.
+    # (e) census-state still advanced under three caps at once.
     assert kwargs["census_state_path"].exists()
     assert outcome.status == "done"
 
@@ -4311,6 +4920,25 @@ def _write_legibility_yaml(project_root, *, config_path=None, project_id="dark_f
         lines.append("agent_transcript_roots:")
         lines += [f"  - {r}" for r in agent_transcript_roots]
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return config_path
+
+
+def _commit_all(repo):
+    """Commit everything under *repo*, initialising it as a git repo first
+    if it is not one yet."""
+    if not (repo / ".git").exists():
+        _git(repo, "init", "-q", "-b", "main")
+        _git(repo, "config", "user.email", "test@example.com")
+        _git(repo, "config", "user.name", "Test")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "fixture")
+
+
+def _census_project(project_root, **yaml_kwargs):
+    """A project main() can census: its legibility.yaml committed in a real
+    git repo, since main() resolves as_of_sha from the project's HEAD."""
+    config_path = _write_legibility_yaml(project_root, **yaml_kwargs)
+    _commit_all(project_root)
     return config_path
 
 
@@ -4379,7 +5007,7 @@ def _make_fake_main_run_census(outcome=None):
 
 
 def test_main_force_bypasses_gate_and_calls_run_census(tmp_path, monkeypatch):
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
     # proves --force never even reaches the gate
@@ -4395,7 +5023,7 @@ def test_main_force_bypasses_gate_and_calls_run_census(tmp_path, monkeypatch):
 def test_main_without_force_no_fire_noops_with_exit_zero(
     tmp_path, monkeypatch, capsys, opened_runners,
 ):
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
 
@@ -4417,7 +5045,7 @@ def test_main_without_force_no_fire_noops_with_exit_zero(
 def test_main_exits_nonzero_and_names_the_quarantine_when_the_census_did_not_land(
     tmp_path, monkeypatch, capsys,
 ):
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     quarantine_dir = tmp_path / "q" / "census-2026-07-14-x"
     fake_run_census = _make_fake_main_run_census(outcome=mod.CensusOutcome(
         status="unlanded",
@@ -4432,6 +5060,33 @@ def test_main_exits_nonzero_and_names_the_quarantine_when_the_census_did_not_lan
 
     assert exit_code == 1
     assert str(quarantine_dir) in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("ledger_error", [None, "/state/coded-sessions.sqlite: disk I/O error"])
+def test_main_done_line_names_a_ledger_write_failure_only_when_there_was_one(
+    tmp_path, monkeypatch, capsys, ledger_error,
+):
+    _census_project(tmp_path)
+    monkeypatch.setattr(mod, "run_census", _make_fake_main_run_census(outcome=mod.CensusOutcome(
+        status="done", report_path="plans/confusion-census-2026-01-02.md",
+        filed_ticket_ids=["tkt_1234"], stop_reason="exhausted",
+        ledger_write_error=ledger_error,
+    )))
+
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+
+    assert exit_code == 0
+    [done_line] = [
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("census: done")
+    ]
+    if ledger_error is None:
+        assert done_line == (
+            "census: done -- report=plans/confusion-census-2026-01-02.md "
+            "filed_tickets=1 stop_reason=exhausted"
+        )
+    else:
+        assert "ledger_write_failed" in done_line
+        assert ledger_error in done_line
 
 
 def test_main_wires_a_roll_back_bound_to_the_censused_project(tmp_path, monkeypatch):
@@ -4513,7 +5168,7 @@ def test_main_configures_logging_so_info_lines_reach_the_journal(tmp_path, monke
     # debugging the trickle (or a host whose unit env is sourced) exporting
     # LEGIBILITY_LOG_LEVEL=WARNING would otherwise turn a working fix red.
     monkeypatch.delenv("LEGIBILITY_LOG_LEVEL", raising=False)
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
 
@@ -4539,7 +5194,7 @@ def test_main_configures_logging_so_info_lines_reach_the_journal(tmp_path, monke
 
 
 def test_main_without_force_fire_decision_runs_pipeline(tmp_path, monkeypatch):
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
 
@@ -4558,7 +5213,7 @@ def test_main_without_force_fire_decision_runs_pipeline(tmp_path, monkeypatch):
 def test_main_config_flag_overrides_default_path_and_date_flag_threads_through(tmp_path, monkeypatch):
     # deliberately NOT at the default <project-root>/docs/legibility/legibility.yaml
     # location, so this only passes if --config is actually honored.
-    alt_config = _write_legibility_yaml(tmp_path, config_path=tmp_path / "alt-legibility.yaml")
+    alt_config = _census_project(tmp_path, config_path=tmp_path / "alt-legibility.yaml")
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
@@ -4578,7 +5233,7 @@ def test_main_config_flag_overrides_default_path_and_date_flag_threads_through(t
 
 
 def test_main_cost_control_flags_thread_into_run_census(tmp_path, monkeypatch):
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
@@ -4668,7 +5323,7 @@ def test_main_accepts_a_project_root_that_matches_the_config_via_a_relative_spel
     ``--project-root`` is not mistaken for a mixed-project run."""
     project = tmp_path / "project_a"
     project.mkdir()
-    _write_legibility_yaml(project)
+    _census_project(project)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
@@ -4684,7 +5339,7 @@ def test_main_without_cost_control_flags_passes_defaults(tmp_path, monkeypatch):
     # The flagless shape -- an operator run with no flags, or a trickle launch
     # whose census.trickle_caps are null -- must stay behaviorally
     # byte-identical.
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
@@ -4713,7 +5368,7 @@ def test_main_rejects_a_nonpositive_cost_cap_at_the_cli_boundary(
     # A nonsense cap on a flag whose entire purpose is to be an explicit,
     # legible bound must exit non-zero with a message, not degenerate into a
     # half-applied cap. argparse raises SystemExit(2) for a type= rejection.
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     monkeypatch.setattr(mod, "run_census", _poison("run_census"))
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
 
@@ -4728,7 +5383,7 @@ def test_main_rejects_a_nonpositive_cost_cap_at_the_cli_boundary(
 
 def test_main_accepts_a_cap_of_one(tmp_path, monkeypatch):
     # The boundary itself is valid: 1 is the smallest cap that can be honored.
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
@@ -4744,7 +5399,7 @@ def test_main_accepts_a_cap_of_one(tmp_path, monkeypatch):
 
 
 def test_main_dry_run_summary_line_names_payload_file(tmp_path, monkeypatch, capsys):
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     payloads_path = "/p/plans/confusion-census-2026-07-30-payloads.json"
     fake_run_census = _make_fake_main_run_census(
         outcome=mod.CensusOutcome(
@@ -4780,7 +5435,7 @@ def test_main_done_summary_line_counts_filed_tickets_not_tasks(tmp_path, monkeyp
     # The operator reads this line to learn what the run produced. Filing
     # yields tickets, not tasks (census.py::_ticket_id_from_submit_result),
     # so "filed_tasks=N" would overclaim N tasks that may not exist.
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     fake_run_census = _make_fake_main_run_census(
         outcome=mod.CensusOutcome(
             status="done",
@@ -4815,7 +5470,7 @@ def test_main_missing_config_returns_nonzero(tmp_path, monkeypatch):
 
 
 def test_main_returns_nonzero_on_fail_loud_error(tmp_path, monkeypatch):
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
 
     def raising_run_census(**kwargs):
         raise RuntimeError("codebook merge produced an invalid codebook")
@@ -4837,7 +5492,7 @@ def test_main_failure_files_escalation(tmp_path, monkeypatch):
     escalate_fn closure (PRD decision 8: degradation never silent) -- a hard
     census failure exits non-zero AND leaves an operator signal, rather than
     dying with only a stderr line (the silent-census incident this fixes)."""
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
 
     def raising_run_census(**kwargs):
         raise RuntimeError("codebook merge produced an invalid codebook")
@@ -4869,7 +5524,7 @@ def test_main_failure_escalation_is_best_effort_when_poster_raises(tmp_path, mon
     """The failure escalation is best-effort: if the escalation POST itself
     raises, the closure swallows it (logging a WARNING) and main() STILL
     returns 1 -- the escalation never masks the authoritative exit code."""
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
 
     def raising_run_census(**kwargs):
         raise RuntimeError("codebook merge produced an invalid codebook")
@@ -4892,55 +5547,119 @@ def test_main_failure_escalation_is_best_effort_when_poster_raises(tmp_path, mon
 
 
 # ---------------------------------------------------------------------------
-# default_batch_source — the whole census window is enumerated in ONE walk via
-# enumerate_sessions_in_range (O(files), not O(window_days × files)), and the
-# shipped agent_transcript_roots is threaded into that single call with NO
-# operator flip (resolved against cfg.project_root). Patches
-# inventory.enumerate_sessions_in_range (the module object census.py itself
-# references via `import inventory`) to capture its window + kwargs.
+# main() mines through a census_window.WindowBatchSource over the project's
+# ledger; selection itself is covered in test_census_window.py.
 # ---------------------------------------------------------------------------
 
-def test_default_batch_source_passes_resolved_archive_roots_to_enumerate(tmp_path, monkeypatch):
-    config_path = _write_legibility_yaml(
-        tmp_path, agent_transcript_roots=["data/orchestrator/agent-transcripts"],
+def _write_census_state(root, state):
+    path = root / "docs" / "legibility" / "census-state.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+
+def _main_with_fake_census(tmp_path, monkeypatch, *extra_args):
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+    exit_code = mod.main([
+        "--project-root", str(tmp_path), "--force", "--date", "2026-10-06", *extra_args,
+    ])
+    assert exit_code == 0
+    [call] = fake_run_census.calls
+    return call
+
+
+def test_main_allocates_the_next_identity_and_threads_sha_and_since(tmp_path, monkeypatch):
+    _write_legibility_yaml(tmp_path)
+    plans = tmp_path / "plans"
+    plans.mkdir()
+    (plans / "confusion-census-2026-10-06.md").write_text("earlier\n", encoding="utf-8")
+    _write_census_state(tmp_path, {
+        "last_census_at": "2026-10-06",
+        "last_census_run_id": "census-dark_factory-20261006",
+        "last_census_report": "plans/confusion-census-2026-10-06.md",
+        "last_census_as_of_sha": "b" * 40,
+        "session_watermark": "2026-10-06T00:00:00+00:00",
+        "last_census_done_count": 3,
+    })
+    _commit_all(tmp_path)
+
+    call = _main_with_fake_census(tmp_path, monkeypatch)
+
+    assert call["report_path"] == plans / "confusion-census-2026-10-06-2.md"
+    assert call["run_id"] == "census-dark_factory-20261006-2"
+    assert call["as_of_sha"] == _git(tmp_path, "rev-parse", "HEAD").decode().strip()
+    assert call["since"] == "b" * 40
+
+
+def test_main_passes_no_since_for_a_legacy_state(tmp_path, monkeypatch):
+    _write_legibility_yaml(tmp_path)
+    _write_census_state(tmp_path, {"last_census_at": "2026-10-01"})
+    _commit_all(tmp_path)
+
+    call = _main_with_fake_census(tmp_path, monkeypatch)
+
+    assert call["since"] is None
+    assert call["run_id"] == "census-dark_factory-20261006"
+    assert call["report_path"] == tmp_path / "plans" / "confusion-census-2026-10-06.md"
+
+
+def test_main_names_the_dry_run_payloads_after_the_allocated_basename(tmp_path, monkeypatch):
+    _write_legibility_yaml(tmp_path)
+    (tmp_path / "plans").mkdir()
+    (tmp_path / "plans" / "confusion-census-2026-10-06.json").write_text("{}", encoding="utf-8")
+    _commit_all(tmp_path)
+
+    call = _main_with_fake_census(tmp_path, monkeypatch, "--dry-run-filing")
+
+    assert call["dry_run_payloads_path"] == (
+        tmp_path / "plans" / "confusion-census-2026-10-06-2-payloads.json"
     )
-    cfg = config_mod.load_config(config_path)
 
-    captured = []
 
-    def fake_enumerate_sessions_in_range(
-        projects_root, cwd_prefixes, start_date, end_date, **kwargs
-    ):
-        captured.append((start_date, end_date, kwargs))
-        return []
+def test_main_fails_loud_before_any_spend_on_a_root_that_is_no_repo(
+    tmp_path, monkeypatch, capsys, opened_runners,
+):
+    _write_legibility_yaml(tmp_path)
+    monkeypatch.setattr(mod, "run_census", _poison("run_census"))
 
-    monkeypatch.setattr(
-        inventory, "enumerate_sessions_in_range", fake_enumerate_sessions_in_range
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "as_of_sha" in err
+    assert str(tmp_path) in err
+    assert opened_runners == []
+
+
+def test_main_hands_run_census_a_window_source_over_the_project_ledger(tmp_path, monkeypatch):
+    _census_project(tmp_path)
+    last_census = datetime.now(UTC).date() - timedelta(days=3)
+    (tmp_path / "docs" / "legibility" / "census-state.json").write_text(
+        json.dumps({"last_census_at": last_census.isoformat()}), encoding="utf-8",
     )
+    monkeypatch.setattr(mod, "DEFAULT_PROJECTS_ROOT", tmp_path / "no-projects")
+    sources = []
 
-    now = datetime(2026, 7, 13, 12, 0, tzinfo=UTC)
-    # Consume the generator: nothing enumerates until it is iterated.
-    list(mod.default_batch_source(cfg, projects_root=tmp_path / "projects", now=now))
+    def fake_run_census(**kwargs):
+        source = kwargs["batch_source"]
+        list(source)
+        sources.append((source, kwargs["selection_of"]()))
+        return mod.CensusOutcome(
+            status="done", report_path="plans/r.md", filed_ticket_ids=[],
+            stop_reason="exhausted",
+        )
 
-    # With no census-state.json under cfg.project_root the window is the
-    # multi-date default lookback (>1 date) — the old per-date loop would have
-    # called the enumerator once per date.
-    window = mod._census_window_dates(cfg.project_root, now=now)
-    assert len(window) > 1, "sanity: this test needs a genuinely multi-date window"
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
 
-    # (1) ONE range-enumerate call regardless of window length — the
-    # O(files)-not-O(window_days × files) census-level signal.
-    assert len(captured) == 1, "enumerate_sessions_in_range must be called exactly once"
+    assert mod.main(["--project-root", str(tmp_path), "--force"]) == 0
 
-    start_date, end_date, kwargs = captured[0]
-    # (2) resolved archive roots threaded with no operator flip.
-    expected_roots = inventory.resolve_agent_transcript_roots(
-        cfg.project_root, cfg.agent_transcript_roots
-    )
-    assert expected_roots == [tmp_path / "data" / "orchestrator" / "agent-transcripts"]
-    assert kwargs["agent_transcript_roots"] == expected_roots
-    # (3) the [start, end] window equals _census_window_dates' first/last.
-    assert (start_date, end_date) == (window[0], window[-1])
+    ((source, selected),) = sources
+    assert isinstance(source, census_window.WindowBatchSource)
+    assert source.selection is not None
+    assert selected is source.selection
+    assert source.selection.window.start == datetime.combine(last_census, time(), UTC)
+    assert source.selection.ledger.path == session_ledger.ledger_path("dark_factory")
+    assert source.selection.ledger.state is session_ledger.LedgerState.CREATED
 
 
 # ---------------------------------------------------------------------------
@@ -5067,7 +5786,7 @@ def test_main_hard_failure_under_pytest_reaches_no_real_mcp_endpoint(tmp_path, m
 
     The exit contract is asserted alongside: refusing the POST must not
     change `main()`'s authoritative signal (tasks 2951/2952/3644)."""
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
 
     def raising_run_census(**kwargs):
         raise RuntimeError("codebook merge produced an invalid codebook")
@@ -5218,7 +5937,7 @@ def test_main_hands_run_census_one_runners_invokers_for_the_census_stages(
     one 120s invoke to EVERY stage, so every verify and synthesis call died
     at 120s. DEFAULT config (no timeouts block), the shape of a pre-existing
     legibility.yaml."""
-    config_path = _write_legibility_yaml(tmp_path)
+    config_path = _census_project(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
@@ -5246,7 +5965,7 @@ def test_main_hands_run_census_one_runners_invokers_for_the_census_stages(
 def test_main_closes_its_one_runner_on_the_done_and_the_failed_exit(
     tmp_path, monkeypatch, opened_runners, run_fails,
 ):
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     if run_fails:
         def raising_run_census(**kwargs):
             raise RuntimeError("codebook merge produced an invalid codebook")
@@ -6134,15 +6853,7 @@ def test_main_deferred_output_names_the_stage_and_the_unverified_count(tmp_path,
     distinguishable by field -- printing neither hides it from the one person
     watching the run.
     """
-    (tmp_path / "docs" / "legibility").mkdir(parents=True)
-    (tmp_path / "docs" / "legibility" / "legibility.yaml").write_text(
-        "project_id: dark_factory\n"
-        f"project_root: {tmp_path}\n"
-        "escalation_port: 8103\n"
-        "cwd_prefixes:\n"
-        f"  - {tmp_path}\n",
-        encoding="utf-8",
-    )
+    _census_project(tmp_path)
 
     def fake_run_census(**kwargs):
         return mod.CensusOutcome(
@@ -6263,7 +6974,7 @@ def test_mine_to_saturation_emits_one_aggregated_warning_per_failing_batch(caplo
     with caplog.at_level(logging.WARNING):
         result = mod.mine_to_saturation(
             source, live_codebook, project="dark_factory", model="sonnet",
-            config=saturation, invoke=fake_invoke,
+            config=saturation, invoke=fake_invoke, invariant_slugs=(),
         )
 
     assert [s.failed for s in result.batch_stats] == [0, 6], "fixture sanity"
@@ -6325,7 +7036,7 @@ def test_mine_to_saturation_bounds_the_coder_per_digest_flood_without_silencing_
     with caplog.at_level(logging.WARNING):
         result = mod.mine_to_saturation(
             source, live_codebook, project="dark_factory", model="sonnet",
-            config=saturation, invoke=fake_invoke,
+            config=saturation, invoke=fake_invoke, invariant_slugs=(),
         )
 
     assert [s.failed for s in result.batch_stats] == [0, 6], "fixture sanity"
@@ -6370,13 +7081,13 @@ def test_mine_to_saturation_bound_leaves_a_later_direct_code_digests_call_untouc
     with caplog.at_level(logging.WARNING):
         mod.mine_to_saturation(
             source, live_codebook, project="dark_factory", model="sonnet",
-            config=saturation, invoke=fake_invoke,
+            config=saturation, invoke=fake_invoke, invariant_slugs=(),
         )
         caplog.clear()
         # The same failing fixture, called directly — as nightly.run_nightly does.
         direct = coder.code_digests(
             _batch_digests(10, "f1"), live_codebook,
-            project="dark_factory", model="sonnet", invoke=fake_invoke,
+            project="dark_factory", model="sonnet", invoke=fake_invoke, invariant_slugs=(),
         )
 
     assert direct.failed == 6, "fixture sanity"
@@ -6399,7 +7110,7 @@ def test_mine_to_saturation_bound_is_removed_when_the_batch_loop_unwinds(caplog)
     with pytest.raises(RuntimeError, match="blew up mid-iteration"):
         mod.mine_to_saturation(
             _RaisingBatchSource(), live_codebook, project="dark_factory",
-            model="sonnet", config=saturation, invoke=fake_invoke,
+            model="sonnet", config=saturation, invoke=fake_invoke, invariant_slugs=(),
         )
 
     assert logging.getLogger("legibility.coder").filters == [], (
@@ -6430,7 +7141,7 @@ def test_mine_to_saturation_bound_is_spent_only_on_warnings_not_on_chatter(caplo
     with caplog.at_level(logging.DEBUG):
         mod.mine_to_saturation(
             source, live_codebook, project="dark_factory", model="sonnet",
-            config=saturation, invoke=chatty_invoke,
+            config=saturation, invoke=chatty_invoke, invariant_slugs=(),
         )
 
     assert chatter == 20, "fixture sanity: two batches of ten digests each"
@@ -6725,17 +7436,7 @@ def test_render_report_flagless_golden_is_untouched_by_the_new_parameter():
     """`mass_rejection=None` must leave the module's byte-identical-flagless
     invariant exactly as it was — that property is deliberate and documented,
     and must not be spent to buy an anomaly signal."""
-    report = mod.render_report(
-        date="2026-07-14",
-        project_id="dark_factory",
-        force=False,
-        matrix_md="matrix",
-        mining_result=_sample_mining_result(),
-        synthesis_md="prose",
-        filed_ticket_ids=["tkt_1"],
-        cost_note="cost",
-        mass_rejection=None,
-    )
+    report = mod.render_report(_census_record(mass_rejection=None))
     assert report == _GOLDEN_FLAGLESS_REPORT
 
 
@@ -6958,7 +7659,7 @@ def test_run_census_clean_run_emits_no_run_summary_line(tmp_path, caplog):
 def test_main_done_line_names_unresolved_verdicts_when_nonzero(
     tmp_path, monkeypatch, capsys,
 ):
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
 
     def _run_main(unresolved):
@@ -7105,6 +7806,154 @@ def test_verify_prompt_requests_the_remediation_key(tmp_path):
     fake_invoke = _make_fake_invoke(default=_verdict())
     mod._build_default_verify_fn(str(tmp_path), fake_invoke)(_clusters(1), model="sonnet")
     assert '"remediation"' in fake_invoke.calls[0]["prompt"]
+
+
+# ---------------------------------------------------------------------------
+# task 6401 step-7: RED — the default verifier parses every reply into a
+# typed verdict.Verdict (plans/census-incremental-prd.md §4.4 C4) and logs
+# each normalisation it needed.
+# ---------------------------------------------------------------------------
+
+_GUIDE_REMEDIATION = {"path": "docs/guide.md", "change": "Document X"}
+
+
+def _c4_reply(**overrides):
+    reply = {
+        "verified": True,
+        "reason": "r",
+        "anchor": "docs/guide.md",
+        "tags": ["h11"],
+        "severity": "high",
+        "severity_reason": "the next edit to the guide repeats it",
+        "route": "mechanical",
+        "remediation": _GUIDE_REMEDIATION,
+    }
+    reply.update(overrides)
+    return json.dumps(reply)
+
+
+def test_default_verify_fn_attaches_the_parsed_verdict_to_a_verified_cluster(tmp_path):
+    [cluster] = _verify_one(_tree_with_guide(tmp_path), _c4_reply())["verified"]
+
+    v = cluster["verdict"]
+    assert isinstance(v, verdict.Verdict)
+    assert v.severity == "high"
+    assert v.tags == ("h11", "kind:confusion")
+    assert v.anchor == "docs/guide.md"
+    assert v.remediation is not None
+    assert cluster["remediation"] == v.remediation.to_record()
+
+
+def test_default_verify_fn_attaches_the_parsed_verdict_to_a_refuted_cluster(tmp_path):
+    result = _verify_one(_tree_with_guide(tmp_path), _c4_reply(verified=False))
+
+    assert result["verified"] == []
+    [cluster] = result["rejected"]
+    assert isinstance(cluster["verdict"], verdict.Verdict)
+    assert cluster["verdict"].verified is False
+    assert "remediation" not in cluster
+
+
+def test_default_verify_fn_rejects_a_parsed_reply_that_is_no_verdict_without_a_probe(
+    tmp_path, caplog,
+):
+    reply = json.dumps({"verified": "yes", "reason": REAL_CLI_CAP_MESSAGES[0]})
+    probe = _make_recording_probe(mod.HeadroomResult(ok=False, reason="must never be consulted"))
+    verify_fn = mod._build_default_verify_fn(
+        str(_tree_with_guide(tmp_path)), lambda prompt, model: reply, headroom_probe=probe,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="legibility.census"):
+        result = verify_fn([{"title": _REMEDIATED_TITLE}], model="sonnet")
+
+    assert result["verified"] == []
+    assert result["rejected"] == [{"title": _REMEDIATED_TITLE}]
+    assert probe.calls == []
+    assert any(
+        _REMEDIATED_TITLE in record.getMessage() and "verified" in record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    )
+
+
+def test_default_verify_fn_logs_one_warning_per_verdict_normalisation(tmp_path, caplog):
+    reply = _c4_reply(severity="critical", tags=["h11", "bogus"])
+
+    with caplog.at_level(logging.WARNING, logger="legibility.census"):
+        _verify_one(_tree_with_guide(tmp_path), reply)
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING and record.name == "legibility.census"
+    ]
+    for kind, offered in (("tag_dropped", "'bogus'"), ("severity_substituted", "'critical'")):
+        naming = [m for m in messages if _REMEDIATED_TITLE in m and kind in m and offered in m]
+        assert len(naming) == 1, (kind, messages)
+
+
+# ---------------------------------------------------------------------------
+# task 6401 step-9: RED — both census prompts embed the quality definition
+# rendered by code_quality.guidance() (docs/quality-findings-contract.md §10),
+# computed here at test time, never pasted.
+# ---------------------------------------------------------------------------
+
+_QUALITY_MARKER = "=== QUALITY DEFINITION ===\n"
+
+
+def _quality_block_of(prompt):
+    assert prompt.count(_QUALITY_MARKER) == 1
+    return prompt.split(_QUALITY_MARKER, 1)[1].split("\n=== ", 1)[0]
+
+
+_C4_KEYS = (
+    "verified", "reason", "anchor", "tags", "severity", "severity_reason", "route",
+    "remediation",
+)
+
+
+def test_verify_prompt_embeds_the_quality_definition_and_asks_for_the_c4_verdict(tmp_path):
+    fake_invoke = _make_fake_invoke(default=_verdict())
+    mod._build_default_verify_fn(str(tmp_path), fake_invoke)(_clusters(1), model="sonnet")
+    prompt = fake_invoke.calls[0]["prompt"]
+
+    assert _quality_block_of(prompt) == code_quality.guidance()
+    assert prompt.startswith("You are the periodic-census verifier")
+    for key in _C4_KEYS:
+        assert f'"{key}"' in prompt, key
+    for severity in verdict.SEVERITIES:
+        assert f'"{severity}"' in prompt, severity
+    for route in verdict.Route:
+        assert f'"{route.value}"' in prompt, route
+    assert verdict.KIND_TAG not in prompt
+    assert str(tmp_path) in prompt
+
+
+def test_synthesis_prompt_embeds_the_quality_definition_and_the_verdicts(tmp_path):
+    root = _tree_with_guide(tmp_path)
+    found = verdict.parse_verdict(
+        {
+            "verified": True,
+            "reason": "r",
+            "anchor": "docs/guide.md",
+            "tags": ["h2"],
+            "severity": "low",
+            "severity_reason": "contained",
+            "route": "structural",
+        },
+        title=_REMEDIATED_TITLE,
+        project_root=root,
+    )
+    fake_invoke = _make_fake_invoke(default="Synthesis prose.")
+
+    mod._build_default_synthesize_fn(fake_invoke)(
+        [{"title": _REMEDIATED_TITLE, "verdict": found}], model="fable",
+    )
+    prompt = fake_invoke.calls[0]["prompt"]
+
+    assert _quality_block_of(prompt) == code_quality.guidance()
+    assert '"anchor": "docs/guide.md"' in prompt
+    assert '"severity": "low"' in prompt
 
 
 # ---------------------------------------------------------------------------

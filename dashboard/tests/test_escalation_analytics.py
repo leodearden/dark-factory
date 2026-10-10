@@ -207,12 +207,26 @@ class TestDoneByDay:
 
         assert result == {'2026-07-10': 2, '2026-07-11': 1}
 
-    def test_missing_db_returns_empty_dict(self, tmp_path):
+    def test_missing_db_is_unreadable(self, tmp_path):
+        """No runs.db is no reading — never {}, which would claim no task completed."""
         from dashboard.data.escalation_analytics import _done_by_day
 
         missing = tmp_path / 'does-not-exist' / 'runs.db'
 
-        assert _done_by_day(missing) == {}
+        assert _done_by_day(missing) is None
+
+    def test_a_failing_query_is_unreadable(self, tmp_path):
+        from dashboard.data.escalation_analytics import _done_by_day
+
+        tableless = tmp_path / 'runs.db'
+        sqlite3.connect(str(tableless)).close()
+
+        assert _done_by_day(tableless) is None
+
+    def test_a_readable_empty_db_is_a_measured_empty_dict(self, tmp_path):
+        from dashboard.data.escalation_analytics import _done_by_day
+
+        assert _done_by_day(_make_runs_db(tmp_path, [])) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -699,6 +713,7 @@ class TestAggregateProjectWorkflow:
         assert by_date[done_only_day]['filings'] == 0
         assert by_date[done_only_day]['done'] == 1
         assert by_date[done_only_day]['ratio'] == 0.0
+        assert workflow['done_counts_read'] is True
 
         # flow_daily: sparse cube over the 5 terminal-with-valid-times
         # records, keyed by (date(resolved_at), source, level, tier, class).
@@ -726,6 +741,24 @@ class TestAggregateProjectWorkflow:
         }
         assert all(row['n'] == 1 for row in workflow['flow_daily'])
         assert sum(row['n'] for row in workflow['flow_daily']) == len(entry['lifespan']['samples'])
+
+    def test_unreadable_runs_db_serves_unmeasured_done_counts(self, tmp_path):
+        """An unread runs.db is not 'no tasks completed': done and ratio are unmeasured."""
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        archive = build_golden_archive(esc_dir, now)
+        expected_filings_by_date: dict[str, int] = {}
+        for esc in archive.values():
+            d = datetime.fromisoformat(esc['timestamp']).date().isoformat()
+            expected_filings_by_date[d] = expected_filings_by_date.get(d, 0) + 1
+
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'absent' / 'runs.db', now=now)
+        workflow = entry['workflow']
+
+        assert workflow['done_counts_read'] is False
+        rows = workflow['esc_per_done_daily']
+        assert {row['date']: row['filings'] for row in rows} == expected_filings_by_date
+        assert all(row['done'] is None and row['ratio'] is None for row in rows)
 
 
 # ---------------------------------------------------------------------------
@@ -1635,11 +1668,17 @@ def _terminal(esc_id: str, *, now: datetime, status: str, resolution_class: str 
     }
 
 
+_INFERRED_CLASSES = frozenset({'benign', 'actionable'})
+
+
 def _one_terminal_per_class(esc_dir: Path, now: datetime) -> None:
-    """Stamped moot-terminal-subject and stale-strand, unstamped dismissed and resolved."""
+    """Unstamped dismissed and resolved, plus one stamp per other RESOLUTION_CLASSES member."""
+    stamped = [
+        _terminal(f'esc-{100 + n}-1', now=now, status='dismissed', resolution_class=cls)
+        for n, cls in enumerate(sorted(RESOLUTION_CLASSES - _INFERRED_CLASSES))
+    ]
     for record in (
-        _terminal('esc-1-1', now=now, status='dismissed', resolution_class='moot-terminal-subject'),
-        _terminal('esc-2-1', now=now, status='dismissed', resolution_class='stale-strand'),
+        *stamped,
         _terminal('esc-3-1', now=now, status='dismissed'),
         _terminal('esc-4-1', now=now, status='resolved', action='restart'),
     ):
@@ -1660,7 +1699,7 @@ class TestCompleteResolutionClasses:
         assert set(source['classes']) == set(RESOLUTION_CLASSES)
         for cls in RESOLUTION_CLASSES:
             assert source['classes'][cls] == 1
-        assert source['classified'] == sum(source['classes'].values()) == 4
+        assert source['classified'] == sum(source['classes'].values()) == len(RESOLUTION_CLASSES)
         assert source['benign_rate'] == source['classes']['benign'] / source['classified']
         assert 'benign' not in source and 'actionable' not in source
 
@@ -1690,7 +1729,7 @@ class TestCompleteResolutionClasses:
         (source,) = entry['origin']['sources']
 
         assert source['classes']['not-a-class'] == 1
-        assert source['classified'] == sum(source['classes'].values()) == 5
+        assert source['classified'] == sum(source['classes'].values()) == len(RESOLUTION_CLASSES) + 1
 
 
 class TestOneTerminalPopulation:
@@ -1710,8 +1749,8 @@ class TestOneTerminalPopulation:
         classified = sum(sum(s['classes'].values()) for s in entry['origin']['sources'])
         action_mix = entry['workflow']['action_mix']
 
-        assert entry['terminal'] == classified == sum(action_mix.values()) == 5
-        assert action_mix == {'restart': 1, 'unspecified': 4}
+        assert entry['terminal'] == classified == sum(action_mix.values()) == len(RESOLUTION_CLASSES) + 1
+        assert action_mix == {'restart': 1, 'unspecified': len(RESOLUTION_CLASSES)}
 
 
 def _write_pending(esc_dir: Path, esc_id: str, *, now: datetime, archived: bool) -> None:
@@ -1769,11 +1808,14 @@ class TestCorpusViewsAndProvenance:
 
         payload = _analytics(projects, now=now)
 
+        read = {entry['project']: entry['workflow']['done_counts_read'] for entry in payload['per_project']}
+        assert read == {'alpha': True, 'beta': True, 'gamma': False}
         done = {
             entry['project']: sum(day['done'] for day in entry['workflow']['esc_per_done_daily'])
             for entry in payload['per_project']
+            if entry['workflow']['done_counts_read']
         }
-        assert done == {'alpha': 1, 'beta': 2, 'gamma': 0}
+        assert done == {'alpha': 1, 'beta': 2}
 
     def test_generated_at_is_the_corpus_instant(self, tmp_path):
         now = golden_now()

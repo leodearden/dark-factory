@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 import pytest
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 from shared.task_statuses import ACTIVE, TaskStatus
 
@@ -2349,12 +2350,11 @@ class TestTheReturnedUnitsCarryTheShapedRows:
         Both go through ``task_is_stranded`` at ``rows.as_of``, the instant the
         rows were measured. Judging the badge at the render instant instead
         would, once the substrate has been unreachable longer than
-        ``STRANDED_HEARTBEAT_TTL``, badge every claim as abandoned while the
+        ``DEFAULT_CLAIMANT_HEARTBEAT_TTL``, badge every claim as abandoned while the
         split (judged at ``as_of``) reports none — the same rows disagreeing
         with themselves on one wire payload.
         """
         import dashboard.data.task_snapshot as snapshot_mod
-        from dashboard.data.tasks import STRANDED_HEARTBEAT_TTL
 
         (root,) = self._roots(tmp_path, 'df')
         claimed = _raw_row(1, 'in-progress')
@@ -2375,7 +2375,7 @@ class TestTheReturnedUnitsCarryTheShapedRows:
 
         monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', _rows_read_fails)
         monkeypatch.setattr(snapshot_mod, 'SNAPSHOT_TTL_SECONDS', 0.0)
-        much_later = _STUB_AS_OF + STRANDED_HEARTBEAT_TTL + timedelta(minutes=1)
+        much_later = _STUB_AS_OF + DEFAULT_CLAIMANT_HEARTBEAT_TTL + timedelta(minutes=1)
         active, snapshots = await collect_tasks_with_counts(dummy_client, config, now=much_later)
 
         unit = snapshots['df']

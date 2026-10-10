@@ -33,7 +33,7 @@ from pathlib import Path
 import pytest
 
 from escalation.models import BORN_AT_L2_SEVERITIES, KNOWN_SEVERITIES, Escalation
-from escalation.pins import PinClass, PinRecord, PinReport, classify_pins
+from escalation.pins import PinClass, PinRecord, PinReport, classify_pins, is_queue_handoff
 
 # ---------------------------------------------------------------------------
 # step-3 — pure type-surface contract
@@ -113,7 +113,9 @@ class TestPinsModuleExports:
         that each name exists and is importable."""
         import escalation.pins as pins_mod
 
-        assert {'PinClass', 'PinRecord', 'PinReport', 'classify_pins'} <= set(pins_mod.__all__)
+        assert {
+            'PinClass', 'PinRecord', 'PinReport', 'classify_pins', 'is_queue_handoff',
+        } <= set(pins_mod.__all__)
 
 
 # ---------------------------------------------------------------------------
@@ -903,3 +905,49 @@ class TestPinnedOnlyByHumanParked:
         report = classify_pins('42', [_rec(id='esc-42-1', level=2)], live_claimant=False)
 
         assert pinned_only_by_human_parked(report, [_rec(id='esc-42-2', level=2)]) is False
+
+
+# ---------------------------------------------------------------------------
+# is_queue_handoff — the one-record gating answer (task 5221)
+# ---------------------------------------------------------------------------
+
+#: (record, expected is_queue_handoff) over the severity x level table.
+_HANDOFF_TABLE: list[tuple[Escalation, bool]] = [
+    # Link 1: info never gates, at any level, whatever its spelling.
+    (_esc(id='esc-42-1', severity='info', level=0), False),
+    (_esc(id='esc-42-2', severity='info', level=1), False),
+    (_esc(id='esc-42-3', severity='info', level=2), False),
+    (_esc(id='esc-42-4', severity=' INFO ', level=0), False),
+    # Link 3: queue-backed L1/L2 handoffs gate.
+    (_esc(id='esc-42-5', severity='blocking', level=1), True),
+    (_esc(id='esc-42-6', severity='blocking', level=2), True),
+    # Link 4: with no live id to compare, an L0 fails safe to a handoff.
+    (_esc(id='esc-42-7', severity='blocking', level=0), True),
+    (_esc(id='esc-42-8', severity='blocking', level=0, filing_claimant_run_id=LIVE_ID), True),
+    # Link 3b: born-at-L2 severities gate at either level.
+    (_esc(id='esc-42-9', severity='critical', level=2), True),
+    (_esc(id='esc-42-10', severity='critical', level=0), True),
+    # Link 2: an unknown severity fails safe to a handoff.
+    (_esc(id='esc-42-11', severity='', level=2), True),
+    (_esc(id='esc-42-12', severity='weird', level=2), True),
+]
+
+
+class TestIsQueueHandoff:
+    """``is_queue_handoff`` answers "does this ONE open record gate a live run?"
+    by delegating to the shared chain, never by a second predicate (INV-5)."""
+
+    @pytest.mark.parametrize(('record', 'expected'), _HANDOFF_TABLE, ids=lambda v: getattr(v, 'id', None))
+    def test_answer_over_the_severity_level_table(self, record: Escalation, expected: bool) -> None:
+        assert is_queue_handoff(record) is expected
+
+    @pytest.mark.parametrize(('record', 'expected'), _HANDOFF_TABLE, ids=lambda v: getattr(v, 'id', None))
+    def test_parity_with_the_shared_chain(self, record: Escalation, expected: bool) -> None:
+        report = classify_pins(record.task_id, [record], live_claimant=True)
+        assert is_queue_handoff(record) == (record.id in report.queue_handoff)
+
+    @pytest.mark.parametrize(('record', 'expected'), _HANDOFF_TABLE, ids=lambda v: getattr(v, 'id', None))
+    def test_is_pure(self, record: Escalation, expected: bool) -> None:
+        before = record.to_dict()
+        is_queue_handoff(record)
+        assert record.to_dict() == before

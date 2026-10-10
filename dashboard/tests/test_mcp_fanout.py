@@ -604,7 +604,7 @@ class TestFanoutFailureThrottling:
         )
 
     async def test_log_failures_false_suppresses_the_fanout_report(self, caplog):
-        """The two app.py proxies log their own detailed WARNING at the call site."""
+        """app.py's MCP-write proxy logs its own detailed WARNING at the call site."""
         async def call(_url):
             raise httpx.ConnectError('refused')
 

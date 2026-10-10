@@ -1400,7 +1400,7 @@ class TestUnrepairableResidueIsPreserved:
 # ---------------------------------------------------------------------------
 #
 # The middleware routes storm records through the SAME injected sink as residue
-# records (``_file_storm_escalation`` hands it ``{'error_type':
+# records (its ``BoundaryStormEscape`` hands it ``{'error_type':
 # 'mcp_markup_storm', ...}``), so without a branch the sink would file a
 # residue-shaped record — one claiming to hold a caller payload it does not
 # have — for a burst.
@@ -1428,18 +1428,17 @@ class _Clock:
 def tune_storm(rig: ResidueRig, *, threshold: int, clock: _Clock) -> MarkupGuardMiddleware:
     """Point the REGISTERED guard's burst detector at a fake clock.
 
-    Not a reach-around: ``StormCounter``'s reload-safety contract has the
-    middleware pass ``threshold`` and ``window_seconds`` PER record() call
-    precisely so a consumer can read them live, and the counters themselves are
-    created lazily on the first event — so tuning them on the constructed guard
-    before any call is exactly as supported as reading them from a config leaf.
-    The alternative is sleeping through the real 3600s window.
+    Through the guard's public ``storm_escape``, whose ``threshold`` and
+    ``time_provider`` are documented live-read tuning: both are read at every
+    record, so setting them before the first call is exactly as supported as
+    reading them from a config leaf. The alternative is sleeping through the
+    real 3600s window.
     """
     guard = next(
         m for m in rig.harness.server.middleware if isinstance(m, MarkupGuardMiddleware)
     )
-    guard._storm_threshold = threshold
-    guard._storm_time_provider = clock
+    guard.storm_escape.threshold = threshold
+    guard.storm_escape.time_provider = clock
     return guard
 
 

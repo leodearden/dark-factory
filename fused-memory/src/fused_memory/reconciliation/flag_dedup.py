@@ -355,6 +355,13 @@ from typing import Any, Literal, NamedTuple, NotRequired, TypedDict
 from shared.task_statuses import TaskStatus
 
 from fused_memory.models.memory import AddMemoryResponse
+from fused_memory.reconciliation.flag_record_contract import (
+    STAGE1_FLAG_MARKER_KIND,
+    STAGE1_FLAG_SUPPRESSION_KIND,
+    canonical_flag_types,
+    normalize_flag_record_metadata,
+)
+from fused_memory.reconciliation.flag_task_ids import task_id_components
 from fused_memory.reconciliation.internal_writers import is_internal_writer
 from fused_memory.reconciliation.recon_ledger import (
     ReconLedgerRecord,
@@ -407,9 +414,10 @@ class _SuppressionMetadata(TypedDict):
 class SuppressionPayload(TypedDict):
     """Canonical Mem0 payload shape for a ``stage1_flag_suppression`` record.
 
-    Enforces the schema documented in the ``## Flag Suppression Check`` section
-    of ``STAGE1_SYSTEM_PROMPT`` at the type level so that mis-typed callers are
-    caught by mypy rather than silently accepted.
+    Enforces the write contract of ``flag_record_contract.py`` (the
+    ``stage1_flag_suppression`` row of ``FLAG_RECORD_SHAPES``) at the type level
+    so that mis-typed callers are caught by the type checker rather than
+    silently accepted.
     """
 
     content: str
@@ -1739,14 +1747,13 @@ async def dedup_flags(
         # already-``done`` cross-project fix task (task 4381 amendment).
         prior_done_suppressions: int = 0
 
-        payload: dict[str, Any] = {
-            'source': 'stage1_flag_marker',
-            'kind': 'stage1_flag_marker',
+        payload = normalize_flag_record_metadata({
+            'kind': STAGE1_FLAG_MARKER_KIND,
             'task_id': tid,
             'flag_type': ftype,
             'run_id': run_id,
             'last_seen_run_id': run_id,
-        }
+        })
         if deduped_against:
             payload['deduped_against'] = list(deduped_against)
 
@@ -1766,7 +1773,9 @@ async def dedup_flags(
         ledger_read_ok = False
         if ledger is not None:
             try:
-                prior = await ledger.get_by_identity(project_id, 'stage1_flag_marker', tid, ftype, '')
+                prior = await ledger.get_by_identity(
+                    project_id, STAGE1_FLAG_MARKER_KIND, tid, ftype, ''
+                )
                 if prior is not None:
                     prior_payload = json.loads(prior.payload_json)
                     persisted_from_run = prior_payload.get('run_id') or 'unknown'
@@ -1883,7 +1892,7 @@ async def dedup_flags(
                 now = datetime.now(UTC)
                 await ledger.upsert(ReconLedgerRecord(
                     project_id=project_id,
-                    record_kind='stage1_flag_marker',
+                    record_kind=STAGE1_FLAG_MARKER_KIND,
                     payload_json=json.dumps(payload),
                     state='active',
                     created_at=now.isoformat(),
@@ -2005,8 +2014,8 @@ def build_suppression_payload(
     """Build the canonical ``stage1_flag_suppression`` Mem0 payload for *task_id*.
 
     Returns a :class:`SuppressionPayload` with ``content``, ``category``, and
-    ``metadata`` fields matching the canonical schema documented in the
-    ``## Flag Suppression Check`` section of ``STAGE1_SYSTEM_PROMPT``.
+    ``metadata`` fields matching the canonical shape defined by the write
+    contract in ``flag_record_contract.py``.
     ``task_id`` accepts either a single numeric id (``int`` or numeric
     ``str``) OR a comma-joined composite of numeric ids (e.g.
     ``'2405,540,544'``, mixing ids across projects) — both are canonicalized
@@ -2045,11 +2054,11 @@ def build_suppression_payload(
     """
     tid = _canonicalize_suppression_task_id(task_id)
     metadata: _SuppressionMetadata = {
-        'kind': 'stage1_flag_suppression',
+        'kind': STAGE1_FLAG_SUPPRESSION_KIND,
         'task_id': tid,
     }
     if flag_types:
-        metadata['flag_types'] = sorted({str(ft) for ft in flag_types})
+        metadata['flag_types'] = canonical_flag_types(flag_types)
     return {
         'content': f'STAGE 1 FLAG SUPPRESSION task_id={tid}',
         'category': 'observations_and_summaries',
@@ -2299,7 +2308,7 @@ async def write_suppression_record(
         for ft in to_write:
             await ledger.upsert(ReconLedgerRecord(
                 project_id=project_id,
-                record_kind='stage1_flag_suppression',
+                record_kind=STAGE1_FLAG_SUPPRESSION_KIND,
                 payload_json=payload_json,
                 state='active',
                 created_at=now_iso,
@@ -2314,7 +2323,7 @@ async def write_suppression_record(
             **write_payload,
             project_id=project_id,
             causation_id=causation_id,
-            _source='stage1_flag_suppression',
+            _source=STAGE1_FLAG_SUPPRESSION_KIND,
         )
     except Exception:
         logger.debug(
@@ -5075,13 +5084,13 @@ async def acknowledge_flag_marker(
         )
         return 0
 
-    probe = await ledger.get_by_identity(project_id, 'stage1_flag_marker', tid, ftype, '')
+    probe = await ledger.get_by_identity(project_id, STAGE1_FLAG_MARKER_KIND, tid, ftype, '')
     if probe is None:
         return 0
 
     await ledger.mark_addressed(
         project_id,
-        'stage1_flag_marker',
+        STAGE1_FLAG_MARKER_KIND,
         tid,
         ftype,
         '',
@@ -5692,47 +5701,30 @@ def _accounting_unconfirmable_reason(
 def _flag_candidate_task_ids(flag: dict[str, Any]) -> list[str]:
     """Return every task id *flag* points at, in resolution order (task 3476).
 
-    Two channels, top-level first:
+    Two channels, top-level first, each value decomposed by
+    :func:`~fused_memory.reconciliation.flag_task_ids.task_id_components`:
 
-    1. ``flag['task_id']`` -- coerced to ``str`` (an int ``3417`` yields
-       ``'3417'``) and split on ``','`` to handle the composite shape
-       (``'3417,3468'``), each component stripped.
-    2. ``flag['cited_tasks'][].task_id`` -- coerced to ``str``, blanks and
-       non-dict entries skipped.  ``project_id`` is deliberately NOT filtered
-       on; see :func:`filter_accounted_cluster_growth_flags`' docstring.
+    1. ``flag['task_id']``.
+    2. ``flag['cited_tasks'][].task_id``, non-dict entries skipped.
+       ``project_id`` is deliberately NOT filtered on; see
+       :func:`filter_accounted_cluster_growth_flags`' docstring.
 
     NOT :func:`_decompose_suppression_task_id`: that helper's contract reserves
     comma-decomposition for suppression LEDGER rows and states that a flag's
-    own task_id is never split by it.  This is the separate, task-3476-owned
+    own task_id is never split by it.  ``task_id_components`` is the separate
     splitter for a flag's own task_id.
 
-    Total over malformed LLM-authored input.  Results are deduped, keeping
-    first position; returns ``[]`` when nothing resolvable is present.
+    Total over malformed LLM-authored input.  Results are deduped ACROSS both
+    channels, keeping first position; returns ``[]`` when nothing resolvable
+    is present.
 
     Pure, sync, no I/O.
     """
-    seen: set[str] = set()
-    ids: list[str] = []
-
-    def _add(raw: Any) -> None:
-        if raw is None or isinstance(raw, bool):
-            return
-        if not isinstance(raw, (str, int)):
-            return
-        for part in str(raw).split(','):
-            part = part.strip()
-            if not part or part in seen:
-                continue
-            seen.add(part)
-            ids.append(part)
-
-    _add(flag.get('task_id'))
+    raws = [flag.get('task_id')]
     cited_tasks = flag.get('cited_tasks')
     if isinstance(cited_tasks, list):
-        for entry in cited_tasks:
-            if isinstance(entry, dict):
-                _add(entry.get('task_id'))
-    return ids
+        raws.extend(entry.get('task_id') for entry in cited_tasks if isinstance(entry, dict))
+    return list(dict.fromkeys(tid for raw in raws for tid in task_id_components(raw)))
 
 
 @dataclass(frozen=True)

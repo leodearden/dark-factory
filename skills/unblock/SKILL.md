@@ -215,6 +215,8 @@ This is where you determine the nature and severity of each issue. The goal is t
 - Blocker: can't safely merge or continue without resolving this
 - Nice-for-later: real issue, but safe to defer to the backlog
 
+**Is the premise contested?** A check in this session, or in an Explore agent's session, that does not reproduce an issue's premise is a non-reproduction, not a refutation, unless it ran in the premise's execution context. Say which context each check ran in. Single normative statement of the rule: `orchestrator/src/orchestrator/agents/premise_refutation_guidance.py::PREMISE_REFUTATION_GUIDANCE`.
+
 ---
 
 ## Step 3: Present findings
@@ -518,7 +520,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
                                    # not more polling).
 
      loop:
-         sleep(poll_interval)
+         sleep(poll_interval)  # realise per skills/merge-queue/SKILL.md#waiting-between-polls -- a bare sleep 60 is blocked by the harness
          poll = mcp__escalation__merge_status(**poll_kwargs)
          if poll["state"] in terminal and accept_terminal(poll):
              break

@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
-"""Heal hand-linked mem0 records from a verdict corpus.
+"""Heal hand-linked mem0 records from a verdict corpus or the link adjudicator.
 
-The contract is plans/write-triage-link-healing-prd.md H1.
+The contract is plans/write-triage-link-healing-prd.md H1 and H2.
 
 Usage:
     python fused-memory/scripts/link_heal.py [--config PATH] [--server-url URL] COMMAND
 
-    plan --from-corpus PATH [--out PATH]
+    plan (--from-corpus PATH | --from-adjudicator [--project P ...]) [--out PATH]
         Decide every live link, ledger the heals, and write the plan document.
-        Writes nothing to the store.
-    apply [--approved-plan-sha SHA256]
-        Heal the pending plan, oldest first. With the sha of the pending plan
-        document, every pending heal is applied and the per-run cap is lifted.
+        Writes nothing to the store. --from-adjudicator asks the link
+        adjudicator about the links of each --project (default: the server's
+        own project) that no deterministic row decides and that it has not
+        judged at their current texts, and ledgers its verdicts.
+    apply [--from-adjudicator] [--approved-plan-sha SHA256]
+        Heal the pending plan of the corpus (default) or of the adjudicator,
+        oldest first. With the sha of the pending plan document, every pending
+        heal is applied and the per-run cap is lifted. When the adjudications
+        behind the pending heals pass a share ceiling, nothing is written.
     undo --run RUN_ID
         Take back every heal one apply run applied. RUN_ID may be its first 8 characters.
     status [--limit N]
         List recent runs from the ledger. Never creates the ledger.
 
 Exit codes: 0 when the run is complete, or partial only by the cap or stale
-skips; 1 when a heal or read failed or the run stopped; 2 when the command was
-refused before any run started.
+skips; 1 when a heal, read or adjudication failed or the run stopped; 2 when
+the command was refused before any run started.
 """
 
 from __future__ import annotations
@@ -36,17 +41,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from shared.mcp_post import open_mcp_client
-
 from fused_memory.backends.mem0_client import Mem0Backend
 from fused_memory.config.schema import FusedMemoryConfig, TaskmasterConfig
 from fused_memory.maintenance._utils import override_config_path
+from fused_memory.maintenance.link_adjudicator import LinkAdjudicator, configured_adjudicator
 from fused_memory.maintenance.link_heal import CorpusFormatError, LinkBasis, load_corpus_bases
 from fused_memory.maintenance.link_heal_executor import (
     ApprovalMismatch,
     FoldedEscapeFiler,
     RunLimits,
     RunReport,
+    run_adjudicator_plan,
     run_apply,
     run_plan,
     run_undo,
@@ -70,7 +75,7 @@ from fused_memory.maintenance.link_heal_store import (
     QdrantLinkCensus,
     StoreUnreachable,
     ToolCaller,
-    mcp_tool_caller,
+    server_tool_caller,
 )
 from fused_memory.models.scope import resolve_project_id
 
@@ -99,18 +104,16 @@ def home_project_root(config: FusedMemoryConfig) -> str:
 
 
 @contextlib.asynccontextmanager
-async def server_tool_caller(server_url: str) -> AsyncIterator[ToolCaller]:
-    async with open_mcp_client() as client:
-        yield mcp_tool_caller(client, server_url)
-
-
-@contextlib.asynccontextmanager
 async def qdrant_census(config: FusedMemoryConfig) -> AsyncIterator[LinkCensus]:
     backend = Mem0Backend(config)
     try:
         yield QdrantLinkCensus(backend, config.mem0.collection_prefix)
     finally:
         await backend.close()
+
+
+def config_adjudicator(config: FusedMemoryConfig) -> LinkAdjudicator:
+    return configured_adjudicator(config.link_heal)
 
 
 @dataclass(frozen=True)
@@ -130,6 +133,7 @@ class LinkHealEnv:
     )
     ledger_dir_for: Callable[[FusedMemoryConfig], Path] = config_ledger_dir
     home_root_for: Callable[[FusedMemoryConfig], str] = home_project_root
+    adjudicator_for: Callable[[FusedMemoryConfig], LinkAdjudicator] = config_adjudicator
 
 
 class Refused(Exception):
@@ -144,17 +148,28 @@ REFUSALS = (
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog='link_heal.py', description='Heal hand-linked mem0 records (PRD H1).',
+        prog='link_heal.py', description='Heal hand-linked mem0 records (PRD H1, H2).',
     )
     parser.add_argument('--config', help='fused-memory config YAML (default: $CONFIG_PATH)')
     parser.add_argument(
         '--server-url', help='fused-memory server (default: http://127.0.0.1:<server.port>)',
     )
     commands = parser.add_subparsers(dest='command', required=True)
-    plan = commands.add_parser('plan', help='ledger the heals a corpus supports; no writes')
-    plan.add_argument('--from-corpus', type=Path, required=True, metavar='PATH')
+    plan = commands.add_parser(
+        'plan', help='ledger the heals a corpus or the adjudicator supports; no writes',
+    )
+    source = plan.add_mutually_exclusive_group(required=True)
+    source.add_argument('--from-corpus', type=Path, metavar='PATH')
+    source.add_argument('--from-adjudicator', action='store_true')
+    plan.add_argument(
+        '--project', action='append', dest='projects', metavar='PROJECT',
+        help='with --from-adjudicator: a project to plan (repeatable; default: the home project)',
+    )
     plan.add_argument('--out', type=Path, metavar='PATH', help='where to write the plan')
     apply = commands.add_parser('apply', help='heal the pending plan')
+    apply.add_argument(
+        '--from-adjudicator', action='store_true', help="heal the adjudicator's pending plan",
+    )
     apply.add_argument('--approved-plan-sha', metavar='SHA256')
     undo = commands.add_parser('undo', help="take back an apply run's heals")
     undo.add_argument('--run', required=True, metavar='RUN_ID')
@@ -166,7 +181,13 @@ def build_parser() -> argparse.ArgumentParser:
 def exit_code(report: RunReport) -> int:
     """0 when complete or partial only by the cap or stale skips; 1 otherwise."""
     counts = report.counts
-    failed = (counts.failed, counts.read_failed, counts.not_attempted, counts.stopped_by)
+    failed = (
+        counts.failed,
+        counts.read_failed,
+        counts.not_attempted,
+        counts.adjudication_failed,
+        counts.stopped_by,
+    )
     return EXIT_FAILED if any(failed) else EXIT_OK
 
 
@@ -254,6 +275,30 @@ def _plan_path_for(out: Path | None, ledger_dir: Path) -> Callable[[str], Path]:
 
 
 async def _plan(args: argparse.Namespace, session: _Session) -> RunReport:
+    if args.from_adjudicator:
+        return await _plan_from_adjudicator(args, session)
+    if args.projects:
+        raise Refused('--project applies only to --from-adjudicator')
+    return await _plan_from_corpus(args, session)
+
+
+async def _plan_from_adjudicator(args: argparse.Namespace, session: _Session) -> RunReport:
+    plan_path_for = _plan_path_for(args.out, session.ledger_dir)
+    projects = list(dict.fromkeys(args.projects or [resolve_project_id(session.home_root)]))
+    await session.probe(projects[0])
+    async with session.env.census_for(session.config) as census:
+        return await run_adjudicator_plan(
+            adjudicate=session.env.adjudicator_for(session.config),
+            store=session.store,
+            census=census,
+            ledger=session.ledger,
+            limits=session.limits,
+            projects=projects,
+            plan_path_for=plan_path_for,
+        )
+
+
+async def _plan_from_corpus(args: argparse.Namespace, session: _Session) -> RunReport:
     bases = _load_corpus(args.from_corpus)
     plan_path_for = _plan_path_for(args.out, session.ledger_dir)
     projects = list(dict.fromkeys(basis.project_id for basis in bases))
@@ -273,13 +318,14 @@ async def _plan(args: argparse.Namespace, session: _Session) -> RunReport:
 
 
 async def _apply(args: argparse.Namespace, session: _Session) -> RunReport:
-    await session.probe(_first_project(session.ledger.pending_actions(RunSource.CORPUS)))
+    source = RunSource.ADJUDICATOR if args.from_adjudicator else RunSource.CORPUS
+    await session.probe(_first_project(session.ledger.pending_actions(source)))
     return await run_apply(
         store=session.store,
         ledger=session.ledger,
         limits=session.limits,
         filer=FoldedEscapeFiler(session.home_root),
-        source=RunSource.CORPUS,
+        source=source,
         approved_plan_sha256=args.approved_plan_sha,
     )
 

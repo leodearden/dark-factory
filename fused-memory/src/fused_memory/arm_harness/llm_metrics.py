@@ -9,6 +9,7 @@ import math
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from types import MappingProxyType
+from typing import TypeVar
 
 from shared.memory_eval_metrics import Metric
 
@@ -29,7 +30,7 @@ LATENCY_PERCENTILES: Mapping[LlmMetricId, float] = MappingProxyType({
     LlmMetricId.EPISODE_LATENCY_P50: 0.50,
     LlmMetricId.EPISODE_LATENCY_P95: 0.95,
 })
-_USD_PER_MTOK_DIVISOR = 1_000_000
+_Ranked = TypeVar('_Ranked')
 
 
 class TokenAccountingError(RuntimeError):
@@ -62,7 +63,7 @@ def episode_failure_rate_metric(result: ArmRunResult) -> Metric | None:
     )
 
 
-def _nearest_rank(sorted_values: Sequence[float], p: float) -> float:
+def nearest_rank(sorted_values: Sequence[_Ranked], p: float) -> _Ranked:
     """The value at 1-based rank ceil(p·n): an observed value, deterministic for small n."""
     return sorted_values[max(1, math.ceil(p * len(sorted_values))) - 1]
 
@@ -79,12 +80,12 @@ def latency_metric(metric_id: LlmMetricId, outcomes: Sequence[EpisodeOutcome]) -
     return Metric(
         metric_id=metric_id,
         kind='scalar',
-        value=_nearest_rank(durations, LATENCY_PERCENTILES[metric_id]),
+        value=nearest_rank(durations, LATENCY_PERCENTILES[metric_id]),
         n=len(durations),
     )
 
 
-def _ok_token_usages(outcomes: Sequence[EpisodeOutcome]) -> list[LlmTokenUsage]:
+def ok_token_usages(outcomes: Sequence[EpisodeOutcome]) -> list[LlmTokenUsage]:
     ok = _ok(outcomes)
     unaccounted = tuple(outcome.episode_id for outcome in ok if outcome.tokens is None)
     if unaccounted:
@@ -93,7 +94,7 @@ def _ok_token_usages(outcomes: Sequence[EpisodeOutcome]) -> list[LlmTokenUsage]:
 
 
 def tokens_per_episode_metric(outcomes: Sequence[EpisodeOutcome]) -> Metric | None:
-    usages = _ok_token_usages(outcomes)
+    usages = ok_token_usages(outcomes)
     if not usages:
         return None
     return Metric(
@@ -107,16 +108,13 @@ def tokens_per_episode_metric(outcomes: Sequence[EpisodeOutcome]) -> Metric | No
 def _usd(usage: LlmTokenUsage, pricing: TokenPricing | None) -> float:
     if pricing is None:
         return 0.0
-    return (
-        usage.input_tokens * pricing.usd_per_mtok_input
-        + usage.output_tokens * pricing.usd_per_mtok_output
-    ) / _USD_PER_MTOK_DIVISOR
+    return pricing.usd_for(usage.input_tokens, usage.output_tokens)
 
 
 def usd_per_episode_metric(
     spec: LlmArmSpec, outcomes: Sequence[EpisodeOutcome]
 ) -> Metric | None:
-    usages = _ok_token_usages(outcomes)
+    usages = ok_token_usages(outcomes)
     if not usages:
         return None
     return Metric(

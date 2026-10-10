@@ -10,6 +10,7 @@ Unifies the twice-fixed scope decision between ``scope_module_config`` and
 from __future__ import annotations
 
 import logging
+import posixpath
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
@@ -17,7 +18,11 @@ from enum import Enum, StrEnum
 from typing import Literal
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.pytest_markers import deselecting_expression_for_targets
+from orchestrator.pytest_markers import (
+    addopts_tokens,
+    deselecting_expression_for_targets,
+    locate_pytest_config,
+)
 from orchestrator.verify_cmd import (
     ToolKind,
     VerifyCmd,
@@ -453,6 +458,111 @@ def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> Verify
     return VerifyCmd(tool=scoped.tool, raw=f'{render(scoped)} {tail}')
 
 
+def _names_a_config_file(flag: str) -> bool:
+    """True for an explicit ``-c``/``--config-file`` in any spelling, which overrides pytest's walk."""
+    if flag == '--config-file' or flag.startswith('--config-file='):
+        return True
+    return flag.startswith('-c') and not flag.startswith('--')
+
+
+def _escapes_reader_root(path: str) -> bool:
+    return posixpath.isabs(path) or path == '..' or path.startswith('../')
+
+
+def pytest_config_path_for_command(
+    cmd: VerifyCmd,
+    worktree_reader: Callable[[str], str | None],
+) -> str | None:
+    """The worktree-relative config file pytest reads for *cmd*, else None.
+
+    THE one answer to "where is the ini file", shared by the marker-deselection
+    probe (:func:`deselecting_expression_for_command`) and the serial-recovery
+    addopts derivation (:func:`governing_addopts`): were two consumers to
+    answer differently, one would describe a config the command never applies.
+
+    WHERE: pytest's own walk (``_pytest/config/findpaths.py::determine_setup``),
+    started at the common ancestor of the command's positional targets — each
+    stripped of its ``::`` node id and resolved against the command's effective
+    cwd (a leading ``cd X &&``, or ``uv run --directory X``) — or at that cwd
+    when it names no target. A target *worktree_reader* can read is a file and
+    stands for its parent directory, as in pytest's ``get_dirs_from_args``; any
+    other is walked as a directory. That is exact for a directory, a dotted
+    one (``tests/v1.2/``) included, and harmless for a missing target: it holds
+    no config, and pytest refuses a run that names one. NOT any module prefix,
+    and NOT the cwd alone. The ``scripts`` and ``tests/scripts``
+    modules run ``uv run --project shared pytest tests/scripts/ scripts/tests/``
+    from the REPO ROOT (``--project`` does not shift cwd), and those targets'
+    common ancestor is the root, so the root config applies. A scoped,
+    cwd-stripped ``uv run --project orchestrator pytest
+    orchestrator/tests/test_x.py::T::t`` starts at ``orchestrator/tests`` and
+    finds ``orchestrator/pyproject.toml``, where the cwd alone would have named
+    the root's.
+
+    BOUNDED at the reader's root: the walk never looks above it, so any config
+    it finds is the same one pytest finds first, and finding none refuses —
+    correct-or-None (``pytest_markers.py::locate_pytest_config``).
+
+    REFUSES rather than guesses, each fail-safe for every consumer:
+
+    1. a *cmd* that is not PYTEST at all (``npm test``, a shell script): a
+       pyproject's ``addopts`` describe a suite this command never invokes;
+    2. a raw-retained command (``cmd.raw is not None`` — OPAQUE, or an ``&&``
+       chain): neither the effective cwd nor which invocation is meant is
+       recoverable from it. ``_scope_prefix_to_keyword`` truncates a chained
+       ``test_command`` to its FIRST ``pytest`` clause, and each ``cd X &&``
+       clause reads its own config;
+    3. an explicit ``-c``/``--config-file``, which replaces the walk;
+    4. a target or cwd that is absolute or escapes the reader's root.
+    """
+    if cmd.tool is not ToolKind.PYTEST or cmd.raw is not None:
+        return None
+    if any(_names_a_config_file(flag) for flag in cmd.base_flags):
+        return None
+    cwd = posixpath.normpath(cmd.cwd_rel or '.')
+    paths = [posixpath.normpath(posixpath.join(cwd, target.split('::')[0])) for target in cmd.targets]
+    if _escapes_reader_root(cwd) or any(_escapes_reader_root(path) for path in paths):
+        return None
+    start_dirs = [
+        posixpath.dirname(path) if worktree_reader(path) is not None else path
+        for path in paths
+    ]
+    start = posixpath.commonpath(start_dirs) if start_dirs else cwd
+    return locate_pytest_config(start, worktree_reader)
+
+
+def _governing_pyproject(
+    cmd: VerifyCmd,
+    worktree_reader: Callable[[str], str | None],
+) -> str | None:
+    """The config path pytest reads for *cmd* when it is a ``pyproject.toml``.
+
+    Only a pyproject's addopts are readable here; a ``pytest.ini`` /
+    ``tox.ini`` / ``setup.cfg`` / ``pytest.toml`` governing config is a
+    deliberate refusal — an under-fire, never an over-fire.
+    """
+    path = pytest_config_path_for_command(cmd, worktree_reader)
+    if path is None or posixpath.basename(path) != 'pyproject.toml':
+        return None
+    return path
+
+
+def governing_addopts(
+    cmd: VerifyCmd,
+    worktree_reader: Callable[[str], str | None],
+) -> tuple[str, ...]:
+    """The RAW ``addopts`` tokens pytest will apply for *cmd*, else ``()``.
+
+    xdist tokens included; ``verify_cmd.py::serial_pytest`` strips them.
+    ``()`` covers no resolvable ``pyproject.toml`` (see
+    :func:`pytest_config_path_for_command`), no ``addopts`` key, and a native
+    ``[tool.pytest]`` (toml mode) table.
+    """
+    path = _governing_pyproject(cmd, worktree_reader)
+    if path is None:
+        return ()
+    return tuple(addopts_tokens(worktree_reader(path)) or ())
+
+
 def deselecting_expression_for_command(
     test_command: str | None,
     targets: Sequence[str],
@@ -485,45 +595,20 @@ def deselecting_expression_for_command(
     have created exactly the divergence this shared probe exists to prevent.
 
     *targets* are worktree-ROOT-relative (the frame *worktree_reader* reads in),
-    while the command's own targets may be cwd-relative — only the CONFIG path
-    below follows the command's ``cwd_rel``. A caller holding cwd-relative
-    targets must resolve them first.
+    while the command's own targets may be cwd-relative. A caller holding
+    cwd-relative targets must resolve them first.
 
-    WHERE the ini file is looked for: pytest reads ``addopts`` from its
-    ROOTDIR, which follows the command's effective cwd — NOT from any module
-    prefix. The two come apart in this very repo: the ``scripts`` and
-    ``tests/scripts`` modules both run ``uv run --project shared pytest
-    tests/scripts/ ...`` from the REPO ROOT (no ``--directory``), so a
-    ``scripts/pyproject.toml`` would never be the config pytest actually
-    applies. The effective cwd is therefore taken from the parsed command's
-    ``cwd_rel`` (a leading ``cd X &&``, or ``uv run --directory X``), falling
-    back to the repo root when the command carries neither.
-
-    Three guards REFUSE rather than guess. Each is fail-safe — no widening,
-    i.e. exactly the pre-3494 FILE_SCOPED behaviour:
-
-    1. a *test_command* that does not parse as PYTEST at all (``npm test``,
-       a shell script): a pyproject's ``addopts`` describe a suite this command
-       never invokes, so consulting them would widen on a false premise;
-    2. a raw-retained command (``cmd.raw is not None`` — OPAQUE, or an ``&&``
-       chain): neither the effective cwd nor which invocation gets scoped is
-       recoverable from it. ``_scope_prefix_to_keyword`` truncates a chained
-       ``test_command`` to its FIRST ``pytest`` clause, so a probe that read a
-       later clause's config would describe a different invocation than the
-       one that runs;
-    3. only ``pyproject.toml`` is consulted. ``pytest.ini`` / ``setup.cfg`` /
-       ``tox.ini`` addopts are invisible here, so a module configured that way
-       simply never widens. A deliberate UNDER-fire, never an over-fire.
+    WHERE the ini file is looked for, and which commands are refused outright:
+    :func:`pytest_config_path_for_command`, shared with the serial-recovery
+    addopts derivation. Only a governing ``pyproject.toml`` is consulted, so a
+    module configured through ``pytest.ini`` / ``setup.cfg`` / ``tox.ini``
+    simply never widens — a deliberate UNDER-fire, never an over-fire.
     """
     if not test_command:
         return None
-    parsed = parse_config_command(test_command)
-    if parsed.tool is not ToolKind.PYTEST or parsed.raw is not None:
+    config_path = _governing_pyproject(parse_config_command(test_command), worktree_reader)
+    if config_path is None:
         return None
-    cwd_rel = parsed.cwd_rel
-    config_path = (
-        'pyproject.toml' if not cwd_rel or cwd_rel == '.' else f'{cwd_rel}/pyproject.toml'
-    )
     return deselecting_expression_for_targets(
         targets,
         worktree_reader(config_path),

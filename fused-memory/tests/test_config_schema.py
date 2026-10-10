@@ -1617,6 +1617,27 @@ class TestPathScopeAdjudicatorConfigBudget:
         )
 
 
+class TestCuratorDegradedStreakThreshold:
+    """The knob behind the class-agnostic degraded-streak alarm (task 4448).
+
+    Distinct from ``zero_output_breaker_threshold``, which counts only ZOT
+    failures and exists to stop burning 180s per hung call. This one counts
+    degraded DECISIONS of any cause and exists to make the outage visible.
+    """
+
+    def test_default_is_five(self):
+        assert CuratorConfig().degraded_streak_threshold == 5, (
+            'N=5 is chosen against the 2026-08-13 to 08-18 outage: 08-15 alone '
+            'saw 38 consecutive degradations, so N=5 would have escalated '
+            'within minutes of that day starting instead of on day five.'
+        )
+
+    def test_rejects_below_one(self):
+        """N=0 would fire on a healthy curator's first non-LLM decision."""
+        with pytest.raises(ValidationError):
+            CuratorConfig(degraded_streak_threshold=0)
+
+
 class TestCuratorEntryCharCaps:
     """The per-entry char caps, pinned with the measurement that set them.
 
@@ -4173,3 +4194,93 @@ class TestWriteJournalConfig:
         # Unmentioned leaves keep their defaults rather than being clobbered.
         assert section.write_retention_days == 730.0
         assert section.prune_batch_size == 5000
+
+
+class TestWriteJournalGrowthAlarmConfig:
+    """Task 3311: the write_journal growth alarm's ceilings are operator-tunable.
+
+    The measured basis of the defaults lives in the
+    ``write_journal_growth_alarm`` block of ``fused-memory/config/config.yaml``.
+    """
+
+    def test_section_is_a_bare_submodel_with_defaults(self):
+        from fused_memory.config.schema import WriteJournalGrowthAlarmConfig
+
+        section = FusedMemoryConfig().write_journal_growth_alarm
+        assert isinstance(section, WriteJournalGrowthAlarmConfig), (
+            'RED: write_journal_growth_alarm must be a BARE (non-Optional) '
+            'submodel — reload.py descends only into required submodels'
+        )
+        assert section.max_file_bytes == 19_327_352_832
+        assert section.max_rows_inserted_per_day == 1_500_000
+        assert section.check_interval_seconds == 3600.0
+
+    def test_values_load_from_yaml(self, tmp_path, monkeypatch):
+        config_data = {
+            'write_journal_growth_alarm': {
+                'max_file_bytes': 1024,
+                'check_interval_seconds': 60.0,
+            },
+        }
+        config_file = tmp_path / 'config.yaml'
+        config_file.write_text(yaml.dump(config_data))
+        monkeypatch.setenv('CONFIG_PATH', str(config_file))
+
+        section = FusedMemoryConfig().write_journal_growth_alarm
+
+        assert section.max_file_bytes == 1024, 'RED: the section must be tunable'
+        assert section.check_interval_seconds == 60.0
+        assert section.max_rows_inserted_per_day == 1_500_000
+
+    @pytest.mark.parametrize(
+        'field',
+        ['max_file_bytes', 'max_rows_inserted_per_day', 'check_interval_seconds'],
+    )
+    def test_non_positive_values_are_rejected(self, field):
+        from fused_memory.config.schema import WriteJournalGrowthAlarmConfig
+
+        with pytest.raises(ValidationError) as excinfo:
+            WriteJournalGrowthAlarmConfig.model_validate({field: 0})
+        assert field in str(excinfo.value), (
+            'RED: a ceiling of 0 fires permanently; the rejection must name the field'
+        )
+
+
+class TestDedupOutageDetectorConfig:
+    """Task 4718: the TicketJanitor's dedup-outage detector is configured under
+    ``curator.janitor.dedup_outage``. The defaults are back-tested in
+    ``plans/curator-dedup-outage-2026-08-15-rca.md``.
+    """
+
+    def test_nested_under_the_ticket_janitor_config(self):
+        from fused_memory.config.schema import DedupOutageDetectorConfig, TicketJanitorConfig
+
+        assert isinstance(TicketJanitorConfig().dedup_outage, DedupOutageDetectorConfig)
+
+    def test_defaults(self):
+        from fused_memory.config.schema import DedupOutageDetectorConfig
+
+        cfg = DedupOutageDetectorConfig()
+
+        assert cfg.enabled is True
+        assert cfg.window_seconds == 21600.0
+        assert cfg.min_samples == 10
+        assert cfg.max_median_resolve_seconds == 15.0
+
+    @pytest.mark.parametrize(
+        'field',
+        ['window_seconds', 'max_median_resolve_seconds', 'min_samples'],
+    )
+    def test_non_positive_bounds_are_rejected(self, field):
+        from fused_memory.config.schema import DedupOutageDetectorConfig
+
+        with pytest.raises(ValidationError) as excinfo:
+            DedupOutageDetectorConfig.model_validate({field: 0})
+        assert field in str(excinfo.value)
+
+    def test_reachable_from_the_top_level_config(self):
+        from fused_memory.config.schema import DedupOutageDetectorConfig
+
+        section = FusedMemoryConfig().curator.janitor.dedup_outage
+
+        assert isinstance(section, DedupOutageDetectorConfig)

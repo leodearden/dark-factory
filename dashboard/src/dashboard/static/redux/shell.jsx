@@ -9,6 +9,9 @@ const PIP_BADGE_STYLE = Object.freeze({ fontSize: 9 });
 // The Datum render decision. Module scope, no fallback, bound under datum.js's
 // own name — see the CANONICAL note in datum.js's header.
 const { datumView } = window.DF_DATUM;
+// A queued row's enqueue instant. Module scope, no fallback; merge_queue.js
+// declares it a top-level `function`, which this .jsx `var` cannot collide with.
+const { queuedSince } = window.DF_MERGE_QUEUE;
 const SHELL_PROJECTS = window.DF_DATA.PROJECTS;
 const SHELL_AGENTS = window.DF_DATA.AGENTS;
 
@@ -137,7 +140,7 @@ function StatStrip({ live, lastUpdate, summary }) {
       </span>
       <span className="stat-pill">
         <span className="lbl">spend 24h</span>
-        <span className="val">${summary.spend24h.toFixed(2)}</span>
+        <span className="val">{summary.spend24h}</span>
       </span>
     </div>
   );
@@ -266,7 +269,8 @@ function Toolbar({
 //
 // Builds a unified stream from real events already present in DF_DATA:
 //   - reconciliation runs (RECON_STATE.runs) — id, status, project, events
-//   - merge queue activity (MERGE_QUEUE[pid].recent + .active) — task, outcome
+//   - merge queue activity (MERGE_QUEUE[pid].recent + .active) — task, outcome;
+//     a queued (.active) row is dated by its enqueue instant (queuedSince)
 //   - cost / account events (COSTS.events) — account, event_type, detail
 // Each source is normalised to {ts, src, msg, key}, sorted by timestamp,
 // trimmed to the most recent 60.
@@ -296,10 +300,11 @@ function buildFeedEntries(D) {
       });
     }
     for (const a of (mq.active || [])) {
-      if (!a.timestamp) continue;
+      const iso = queuedSince(mq, a);
+      if (!iso) continue;
       rows.push({
-        key: `mq-active:${pid}:${a.task_id}:${a.timestamp}`,
-        iso: a.timestamp,
+        key: `mq-active:${pid}:${a.task_id}`,
+        iso,
         src: 'queue',
         msg: `${pid} · ${a.task_id} ${a.state} · ${a.branch || ''}`.trim(),
       });

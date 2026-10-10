@@ -83,6 +83,12 @@ from fused_memory.middleware.path_scope_guard import (
 )
 from fused_memory.middleware.pre_done_hook import run_hook as _run_hook
 from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
+from fused_memory.middleware.recurrence_mint import (
+    RECURRENCE_MINT_SOURCE,
+    MintOutcomeKind,
+    mint_successor,
+    mints_successor,
+)
 from fused_memory.middleware.scope_violation_escalator import ScopeViolationEscalator
 from fused_memory.middleware.soft_scope_signals import (
     SoftScopeFinding,
@@ -95,6 +101,7 @@ from fused_memory.middleware.task_curator import (
     CuratorFailureError,
     PreparedCandidate,
     TaskCurator,
+    exception_summary,
     flatten_task_tree,
     is_combine_eligible_status,
     normalize_title,
@@ -105,6 +112,12 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
 )
 from fused_memory.models.scope import resolve_project_id
+from fused_memory.reconciliation.audit_trail_rotation import (
+    AuditTrailArchive,
+    RotationOutcome,
+    bound_audit_trail,
+    task_fingerprint,
+)
 from fused_memory.reconciliation.consolidation_gate import (
     GATE_METADATA_KEY,
     declared_gate_topic,
@@ -113,8 +126,12 @@ from fused_memory.reconciliation.consolidation_gate import (
     resolve_unstamped_live_ids,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
+from fused_memory.reconciliation.stale_gate_citation_guard import (
+    stale_gate_citation_error,
+)
 
 if TYPE_CHECKING:
+    from shared.cost_store import CostStore
     from shared.usage_gate import UsageGate
 
     from fused_memory.config.schema import FusedMemoryConfig
@@ -258,6 +275,42 @@ def _maybe_kwargs(sentinel: object, **pairs: object) -> dict:
     return {k: v for k, v in pairs.items() if v is not sentinel}
 
 
+def _status_write_claimant_kwargs(
+    status: str, claimant_run_id: object, heartbeat_at: object,
+) -> dict[str, Any]:
+    """Claimant kwargs a status write forwards to the backend writer.
+
+    docs/prds/claimant-invariant-enforcement.md C4-E2: a terminal target whose
+    caller supplied no claimant (unsupplied or explicit None) clears BOTH
+    columns, so a heartbeat never outlives its claimant on a terminal row. A
+    supplied non-NULL claimant is honoured verbatim. C4-E3: every non-terminal
+    write keeps the plain tri-state forwarding.
+    """
+    if status in TERMINAL_STATUSES and (claimant_run_id is _UNSET or claimant_run_id is None):
+        return dict(claimant_run_id=None, heartbeat_at=None)
+    return _maybe_kwargs(_UNSET, claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at)
+
+
+def _claimant_exception_entry(
+    status: str, claimant_run_id: object, *, agent_id: str | None, tag: str | None,
+) -> dict[str, Any] | None:
+    """Ledger entry for a terminal write that honours an explicit non-NULL claimant.
+
+    docs/prds/claimant-invariant-detection.md D-5/E-2: the sanctioned C4-E2
+    exception leaves its name in ``metadata.claimant_exception``. Every other
+    write (non-terminal, unsupplied or explicit-NULL claimant) gets None.
+    """
+    if status not in TERMINAL_STATUSES or claimant_run_id is _UNSET or claimant_run_id is None:
+        return None
+    return {
+        'claimant_run_id': claimant_run_id,
+        'target_status': status,
+        'agent_id': agent_id,
+        'tag': tag,
+        'stamped_at': datetime.now(UTC).isoformat(),
+    }
+
+
 def _is_ticket_id(value: object) -> bool:
     """Return True when *value* looks like a two-phase ticket id (``tkt_…``)."""
     return isinstance(value, str) and value.startswith('tkt_')
@@ -378,7 +431,41 @@ def _create_after_curator_failure(exc: CuratorFailureError) -> CuratorDecision:
     Keeps the ZOT marker, so the no-orchestrator path still gets swept and
     stamped even though no escalation could be filed for it.
     """
-    return CuratorDecision(action='create', degraded_by_zot=exc.zero_output_timeout)
+    return CuratorDecision(
+        action='create',
+        justification=f'curator-failed: {exception_summary(exc)}',
+        degraded_by_zot=exc.zero_output_timeout,
+    )
+
+
+# The label a non-create decision carries when its ticket still ends in a
+# create: a combine or drop that could not be executed fell through, and
+# route_deterministic creates by design.
+_CREATE_FALLTHROUGH_LABELS: dict[str, str] = {
+    'combine': 'combine-failed',
+    'drop': 'drop-failed',
+    'route_deterministic': 'route_deterministic',
+}
+
+
+def _create_reason(
+    decision: CuratorDecision | None, *, curator_unavailable: str | None = None,
+) -> str:
+    """The ``tickets.reason`` a ``created`` ticket persists: why it was created.
+
+    *curator_unavailable* is given only when no curator existed to decide; a
+    curator that existed but produced no decision is ``no-curator-decision``.
+    """
+    if decision is None:
+        if curator_unavailable is None:
+            return 'create: no-curator-decision'
+        return f'create: curator-unavailable: {curator_unavailable}'
+    parts = ['create']
+    if decision.action in _CREATE_FALLTHROUGH_LABELS:
+        parts.append(_CREATE_FALLTHROUGH_LABELS[decision.action])
+    if decision.justification:
+        parts.append(decision.justification)
+    return ': '.join(parts)
 
 
 class TaskInterceptor:
@@ -402,6 +489,7 @@ class TaskInterceptor:
         event_queue: 'EventQueue | None' = None,
         backlog_policy: 'BacklogPolicy | None' = None,
         usage_gate: 'UsageGate | None' = None,
+        cost_store: 'CostStore | None' = None,
         ticket_store: 'TicketStore | None' = None,
         bulk_reset_guard: 'BulkResetGuard | None' = None,
         prefix_registry: ProjectPrefixRegistry | None = None,
@@ -433,11 +521,16 @@ class TaskInterceptor:
         # _get_curator() because it pulls in a Qdrant client + embedder.
         self._config = config
         self._curator: TaskCurator | None = None
+        # exception_summary() of the last failed TaskCurator construction.
+        self._curator_construction_error: str | None = None
         self._escalator = escalator
         # Forwarded to ``TaskCurator`` for cap-aware LLM invocation across the
         # shared account pool. ``None`` falls back to the legacy single-shot
         # path with no cap retry — preserved for tests.
         self._usage_gate = usage_gate
+        # BORROWED from main.py, which owns its close; forwarded to TaskCurator
+        # so every curator CLI call lands a row in its invocations ledger.
+        self._cost_store = cost_store
         # Split per-project locks (2026-04-20; updated 2026-04-22 for ticket queue):
         #
         # ``_write_locks`` (short, high-frequency) serialises tasks.json
@@ -535,6 +628,9 @@ class TaskInterceptor:
         # unexpected status/claimant_run_id divergence. None (default) ->
         # exact current behavior (the pre-existing inline write).
         self._lifecycle_reset_filer: FileFindingFn | None = None
+        # Task 5771: where recon-stage writes archive rotated-out audit trail.
+        # None (default) -> no rotation; see set_audit_trail_archive.
+        self._audit_trail_archive: AuditTrailArchive | None = None
         # Task 3112: the consolidation-gate closure scroll. Optional and
         # DORMANT when unwired — the interceptor holds no MemoryService, and
         # self.reconciler is None at server/main.py's reconciliation-disabled
@@ -611,6 +707,13 @@ class TaskInterceptor:
         behavior change.
         """
         self._lifecycle_reset_filer = filer
+
+    def set_audit_trail_archive(self, archive: AuditTrailArchive) -> None:
+        """Wire the audit-trail rotation archive (task 5771).
+
+        Until called, recon-stage ``update_task`` writes are never rotated.
+        """
+        self._audit_trail_archive = archive
 
     def set_consolidation_scroll(
         self, scroll: Any, count: Any = None, exists: Any = None
@@ -1601,12 +1704,16 @@ class TaskInterceptor:
 
             # 3. Execute status change. Convert the typed DTO to a plain
             # dict so callers can tack on the reconciliation key below.
-            # claimant_kwargs carries claimant_run_id/heartbeat_at only when
-            # explicitly supplied (task 2182) — _UNSET params are omitted so
-            # the default call stays byte-identical to every existing caller.
-            claimant_kwargs: dict[str, Any] = _maybe_kwargs(
-                _UNSET, claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at,
+            # Sits after the same-status no-op (C4-E5) and feeds both writers:
+            # a terminal target clears an unsupplied claimant (task 4866).
+            claimant_kwargs: dict[str, Any] = _status_write_claimant_kwargs(
+                status, claimant_run_id, heartbeat_at,
             )
+            claimant_exception = _claimant_exception_entry(
+                status, claimant_run_id, agent_id=agent_id, tag=tag,
+            )
+            if claimant_exception is not None:
+                audit_fields['claimant_exception'] = claimant_exception
             # Same tri-state forwarding shape, one more kwarg: omitted unless
             # a batch clock was supplied, so the single-id call stays
             # byte-identical to a pre-3816 one (task 3816).
@@ -1655,8 +1762,8 @@ class TaskInterceptor:
                         tag=tag,
                         before_task=before,
                         requested_status=status,
-                        requested_claimant_write=claimant_run_id is not _UNSET,
-                        requested_heartbeat_write=heartbeat_at is not _UNSET,
+                        requested_claimant_write='claimant_run_id' in claimant_kwargs,
+                        requested_heartbeat_write='heartbeat_at' in claimant_kwargs,
                     )
                 )
             else:
@@ -1678,6 +1785,18 @@ class TaskInterceptor:
         if result.get('success') is False and result.get('error') == 'status_write_not_persisted':
             return result
 
+        if (persisted_exception := audit_fields.get('claimant_exception')) is not None:
+            logger.warning(
+                'claimant_exception: terminal write honoured an explicit claimant — '
+                'task_id=%s target_status=%s claimant_run_id=%s agent_id=%s tag=%s stamped_at=%s',
+                task_id,
+                persisted_exception['target_status'],
+                persisted_exception['claimant_run_id'],
+                persisted_exception['agent_id'],
+                persisted_exception['tag'],
+                persisted_exception['stamped_at'],
+            )
+
         # 5. Emit event
         payload: dict[str, Any] = {
             'task_id': task_id,
@@ -1695,6 +1814,18 @@ class TaskInterceptor:
             payload,
         )
         await self._journal(event)
+
+        # 5b. A recurrence carrier completed done mints its successor inline,
+        # so the caller's next read sees it (task 4866 r2). The mint takes the
+        # project write lock itself, so it stays outside the transition's
+        # (non-reentrant) lock.
+        if mints_successor(status, before):
+            await self._mint_recurrence_successor(
+                task_id=task_id,
+                project_root=project_root,
+                tag=tag,
+                project_id=project_id,
+            )
 
         # 6. Targeted reconciliation for trigger statuses (fire-and-forget)
         if status in self.STATUS_TRIGGERS and self.reconciler:
@@ -1719,6 +1850,50 @@ class TaskInterceptor:
             result['reconciliation'] = {'status': 'async', 'task_id': task_id}
 
         return result
+
+    async def _mint_recurrence_successor(
+        self, *, task_id: str, project_root: str, tag: str | None, project_id: str,
+    ) -> None:
+        """Mint a completed carrier's successor link, surviving the request's cancellation.
+
+        The status write has already committed, so the mint runs as a tracked
+        background task behind ``asyncio.shield``: a cancelled request leaves
+        it running to completion, and ``drain()`` awaits it at close, instead
+        of silently leaving the link done with no successor.
+        """
+        mint = asyncio.create_task(
+            self._mint_and_journal(
+                task_id=task_id, project_root=project_root, tag=tag, project_id=project_id,
+            ),
+            name=f'recurrence-mint-{task_id}',
+        )
+        self._background_tasks.add(mint)
+        mint.add_done_callback(self._background_tasks.discard)
+        await asyncio.shield(mint)
+
+    async def _mint_and_journal(
+        self, *, task_id: str, project_root: str, tag: str | None, project_id: str,
+    ) -> None:
+        tm = await self._ensure_taskmaster()
+        outcome = await mint_successor(
+            tm,
+            write_lock=self._write_lock(project_id),
+            predecessor_id=task_id,
+            project_root=project_root,
+            tag=tag,
+        )
+        if outcome.kind is MintOutcomeKind.MINTED:
+            event = self._make_event(
+                EventType.task_created,
+                project_root,
+                {
+                    'operation': 'add_task',
+                    'task_id': outcome.successor_id,
+                    'source': RECURRENCE_MINT_SOURCE,
+                    'minted_from': task_id,
+                },
+            )
+            await self._journal(event)
 
     # ── Claimant-only writes (no status-FSM gate) ───────────────────────
 
@@ -1786,7 +1961,9 @@ class TaskInterceptor:
                 cwd=cwd,
                 escalator=self._escalator,
                 usage_gate=self._usage_gate,
+                cost_store=self._cost_store,
             )
+            self._curator_construction_error = None
             # Trigger the one-shot backfill check as a background task so the
             # caller is not delayed by the Qdrant count() round-trip.
             if project_root is not None:
@@ -1796,10 +1973,36 @@ class TaskInterceptor:
                 )
                 self._background_tasks.add(bg)
                 bg.add_done_callback(lambda t: self._background_tasks.discard(t))
+                # Ask once whether the curator's backend binary resolves at all
+                # (task 4448). Backgrounded for the same reason as the backfill
+                # check: a PATH lookup must not delay task creation. The check
+                # reports and returns a verdict rather than raising — a curator
+                # with a missing binary still degrades to action='create', which
+                # is strictly better than the `except Exception` below turning a
+                # refusal into a silently absent curator.
+                check = asyncio.create_task(
+                    self._curator.startup_self_check(
+                        resolve_project_id(project_root), project_root,
+                    ),
+                    name='curator-startup-self-check',
+                )
+                self._background_tasks.add(check)
+                check.add_done_callback(lambda t: self._background_tasks.discard(t))
             return self._curator
-        except Exception:
+        except Exception as exc:
             logger.warning('Failed to create TaskCurator', exc_info=True)
+            self._curator_construction_error = exception_summary(exc)
             return None
+
+    def _curator_unavailable_reason(self) -> str:
+        """Why ``_get_curator()`` has no curator to hand out right now."""
+        if self._closed:
+            return 'closed'
+        if self._config is None or not self._config.curator.enabled:
+            return 'disabled'
+        if self._curator_construction_error is not None:
+            return f'construction-failed: {self._curator_construction_error}'
+        return 'unknown'
 
     async def _maybe_backfill_corpus(self, curator: TaskCurator, project_root: str) -> None:
         """Trigger a one-shot background backfill if the collection is empty.
@@ -4462,6 +4665,12 @@ class TaskInterceptor:
             # strand the task and cause duplicate-on-retry.
             task_id = task_id_str
             status = 'created'
+            reason = _create_reason(
+                decision,
+                curator_unavailable=(
+                    self._curator_unavailable_reason() if curator is None else None
+                ),
+            )
             result_dict = dict(result)
             if curator_degrade_reason is not None:
                 result_dict = {**result_dict, 'curator_degrade_reason': curator_degrade_reason}
@@ -5372,9 +5581,12 @@ class TaskInterceptor:
             # `before` before the lock, which let the live task status drift
             # between the check and the write). snapshot_token is extracted
             # from the incoming metadata payload so gate 3 (stale-snapshot)
-            # can fire on this path. This same `before` read is reused below
-            # (task 2624) as the lifecycle-reset guard's before-snapshot, so
-            # a recon-stage write never issues two before-reads.
+            # can fire on this path. This same `before` read is reused by
+            # TWO other consumers, so a recon-stage write never issues two
+            # before-reads: the lifecycle-reset guard's before-snapshot
+            # (task 2624) below, and the stale-gate-citation guard's live
+            # `dependencies` array (task 4919) immediately after the verdict
+            # check.
             if is_recon_stage_write:
                 # is_recon_stage_write already guarantees this (it's defined
                 # as `isinstance(agent_id, str) and ...`); re-asserted here
@@ -5419,6 +5631,36 @@ class TaskInterceptor:
                 )
                 if verdict.is_rejection:
                     return verdict.to_error_dict()
+
+                # Task 4919: reject a relay that cites a pending external gate
+                # absent from the task's live `dependencies`. Incident: task
+                # 3708's relay prose kept naming 3660 as a live blocker for
+                # three cycles after 3660 was coalesced into 4856, because each
+                # relay copied the gate list forward from the previous relay's
+                # prose instead of re-deriving it.
+                #
+                # The prose is judged against the array the write LEAVES
+                # BEHIND. A non-None `dependencies` kwarg is that array, so it
+                # takes precedence over `before`. `None` means the write leaves
+                # the array untouched — the backend's own contract
+                # (backends/sqlite_task_backend.py::TaskBackend.update_task) —
+                # and server/tools.py::update_task always forwards the key, so
+                # a presence test would never fall back to `before`. `[]`
+                # clears the array and is enforced as such. `before` is reused
+                # rather than re-read (see the comment block above).
+                incoming_dependencies = kwargs.get('dependencies')
+                if err := stale_gate_citation_error(
+                    kwargs.get('details'),
+                    agent_id,
+                    live_dependencies=(
+                        incoming_dependencies if incoming_dependencies is not None
+                        else (before or {}).get('dependencies')
+                    ),
+                    metadata_payloads=(
+                        (before or {}).get('metadata'), kwargs.get('metadata'),
+                    ),
+                ):
+                    return err
 
             async def _do_update_task_write() -> Any:
                 return await self._journal_around(
@@ -5467,6 +5709,11 @@ class TaskInterceptor:
                 # raise — holds for both tools.py (which delegates here) and
                 # direct interceptor callers (task C2).
                 return e.to_error_dict()
+        rotation: RotationOutcome | None = None
+        if is_recon_stage_write and interceptor_write_succeeded(result):
+            result, rotation = await self._with_bounded_audit_trail(
+                result, task_id, project_root, project_id,
+            )
         event = self._make_event(
             EventType.task_modified,
             project_root,
@@ -5479,6 +5726,7 @@ class TaskInterceptor:
         # exactly what changed without re-fetching. Re-embed unconditionally when
         # the caller passed any of these hints.
         should_reembed = any(k in kwargs for k in ('prompt', 'title', 'description', 'details'))
+        should_reembed = should_reembed or (rotation is not None and rotation.description_rewritten)
         if should_reembed:
             curator = await self._get_curator()
             if curator is not None:
@@ -5513,6 +5761,66 @@ class TaskInterceptor:
                     )
         await self._idempotency_record(client_op_id, 'update_task', result)
         return result
+
+    async def _with_bounded_audit_trail(
+        self, result: dict[str, Any], task_id: str, project_root: str, project_id: str,
+    ) -> tuple[dict[str, Any], RotationOutcome | None]:
+        """The landed recon write's response, plus its audit-trail rotation outcome (task 5771).
+
+        The recon write has already committed, so a rotation failure is
+        reported in the response and logged, never turned into an error reply.
+        """
+        if self._audit_trail_archive is None:
+            return result, None
+        try:
+            outcome = await self._bound_audit_trail(
+                self._audit_trail_archive, task_id, project_root, project_id,
+            )
+        except Exception as e:
+            logger.warning(
+                'audit_trail_rotation: rotating task %s failed after the recon write landed',
+                task_id, exc_info=True,
+            )
+            outcome = RotationOutcome.failed(task_id, e)
+        if outcome is None:
+            return result, None
+        bounded = {**result, 'audit_trail_rotation': outcome.as_dict()}
+        if outcome.committed_task is not None:
+            bounded['updated_task'] = dict(outcome.committed_task)
+        return bounded, outcome
+
+    async def _bound_audit_trail(
+        self, archive: AuditTrailArchive, task_id: str, project_root: str, project_id: str,
+    ) -> RotationOutcome | None:
+        tm = await self._ensure_taskmaster()
+
+        async def commit(
+            *, expected_fingerprint: str, description: str | None, metadata: dict[str, Any],
+        ) -> dict[str, Any] | None:
+            async with self._write_lock(project_id):
+                if task_fingerprint(await tm.get_task(task_id, project_root)) != expected_fingerprint:
+                    return None
+                written = await self._journal_around(
+                    'rewrite_audit_trail',
+                    project_root,
+                    {
+                        'task_id': task_id,
+                        'description': _journal_param_clip(description),
+                        'metadata': _journal_param_clip(json.dumps(metadata)),
+                    },
+                    tm.rewrite_audit_trail(  # type: ignore[attr-defined]
+                        task_id, project_root, description=description, metadata=metadata,
+                    ),
+                )
+                return written['updated_task']
+
+        return await bound_audit_trail(
+            await tm.get_task(task_id, project_root),
+            project_id=project_id,
+            now=datetime.now(UTC),
+            archive=archive,
+            commit=commit,
+        )
 
     async def remove_tasks(self, ids: list[str], project_root: str, tag: str | None = None) -> dict:
         if err := await self._backlog_gate(project_root):

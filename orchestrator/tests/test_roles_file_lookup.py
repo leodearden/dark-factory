@@ -15,10 +15,12 @@ from __future__ import annotations
 from dataclasses import replace
 
 from _role_splice_contract import (
+    BASH_CAPABLE_UNPINNED_ROLES,
     MARKDOWN_HEADING,
     SpliceContract,
     assert_brace_free,
     assert_nonempty,
+    bash_capable_unpinned_contract,
 )
 
 from orchestrator.agents.file_lookup_guidance import FILE_LOOKUP_GUIDANCE
@@ -29,17 +31,11 @@ from orchestrator.agents.roles import (
     AgentRole,
 )
 
-#: Every role with a literal system_prompt. DERIVED rather than
-#: hand-maintained, as in the sibling census-block modules.
+#: Every role with a literal system_prompt, derived from ROLES.
 _UNPINNED_ROLES = frozenset(name for name, role in ROLES.items() if role.prompt_spec is None)
 
-#: The carriers of `_BASH_CAPABLE_ROLE_PREAMBLE`, whose tail this block joins.
-_BASH_PREAMBLE_ROLES = frozenset(
-    name for name in _UNPINNED_ROLES if 'Bash' in ROLES[name].allowed_tools
-)
-
 #: Roles building their own chain around the read-only Grep variant (`judge`).
-_READ_ONLY_ROLES = _UNPINNED_ROLES - _BASH_PREAMBLE_ROLES
+_READ_ONLY_ROLES = _UNPINNED_ROLES - BASH_CAPABLE_UNPINNED_ROLES
 
 
 def _can_run_every_prescribed_lookup(role: AgentRole) -> bool:
@@ -96,7 +92,7 @@ def test_guidance_opens_its_own_section():
     )
 
 
-def test_derived_role_sets_are_nonempty():
+def test_unpinned_role_set_is_nonempty():
     """No splice test below can pass vacuously over an emptied derivation.
 
     `_READ_ONLY_ROLES` is deliberately not required non-empty: it empties
@@ -106,11 +102,6 @@ def test_derived_role_sets_are_nonempty():
     assert _UNPINNED_ROLES, (
         'No role has a literal system_prompt, so every splice test here passes '
         'over an empty set. Check the `prompt_spec is None` derivation.'
-    )
-    assert _BASH_PREAMBLE_ROLES, (
-        'No literal-prompt role holds unqualified `Bash`, so the preamble-order '
-        "test passes over an empty set. Check the `'Bash' in allowed_tools` "
-        'derivation.'
     )
 
 
@@ -178,8 +169,8 @@ def test_guidance_lands_after_the_grep_block_in_bash_roles():
     `orchestrator/src/orchestrator/agents/roles.py::_BASH_CAPABLE_ROLE_PREAMBLE`
     holds that rationale.
     """
-    replace(
-        _CONTRACT, roles=_BASH_PREAMBLE_ROLES, role_set_name='_BASH_PREAMBLE_ROLES'
+    bash_capable_unpinned_contract(
+        'FILE_LOOKUP_GUIDANCE', FILE_LOOKUP_GUIDANCE
     ).assert_lands_after(
         follows=GREP_LOOKAROUND_GUIDANCE,
         follows_name='GREP_LOOKAROUND_GUIDANCE',

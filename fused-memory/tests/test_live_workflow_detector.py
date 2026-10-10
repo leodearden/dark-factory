@@ -15,10 +15,10 @@ import pytest
 
 # RED in step-1: module does not exist yet; import will fail until step-2.
 from _fm_helpers import as_async_run_git as _as_async_run_git
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
 
 import fused_memory.services.live_workflow_detector as detector_module
 from fused_memory.services.live_workflow_detector import (
-    DEFAULT_HEARTBEAT_TTL,
     DEFAULT_MAX_WORKTREE_AGE_HOURS,
     ClaimantLabel,
     WorkflowLiveness,
@@ -1809,8 +1809,31 @@ class TestCorroborationForTask:
 
     _STARTED = datetime(2026, 7, 23, 10, 0, 0, tzinfo=UTC)
 
-    def test_default_heartbeat_ttl_is_ten_minutes(self):
-        assert timedelta(minutes=10) == DEFAULT_HEARTBEAT_TTL
+    def _default_ttl_task(self, heartbeat_at: datetime) -> dict:
+        return {
+            'id': _CORROB_TASK_ID,
+            'status': 'in-progress',
+            'claimant_run_id': 'run-1/sess-1/pid=42',
+            'heartbeat_at': heartbeat_at.isoformat(),
+        }
+
+    def test_default_ttl_just_inside_is_corroborated(self):
+        task = self._default_ttl_task(
+            _CORROB_NOW - DEFAULT_CLAIMANT_HEARTBEAT_TTL + timedelta(seconds=1),
+        )
+        assert corroboration_for_task(
+            task, _CORROB_TASK_ID, now=_CORROB_NOW,
+            scheduler_state=None, orchestrator_started_at=None,
+        ) is True
+
+    def test_default_ttl_just_outside_is_not_corroborated(self):
+        task = self._default_ttl_task(
+            _CORROB_NOW - DEFAULT_CLAIMANT_HEARTBEAT_TTL - timedelta(seconds=1),
+        )
+        assert corroboration_for_task(
+            task, _CORROB_TASK_ID, now=_CORROB_NOW,
+            scheduler_state=None, orchestrator_started_at=None,
+        ) is False
 
     def test_fresh_heartbeat_true(self):
         task = {
@@ -1927,9 +1950,16 @@ class TestClaimantLabel:
     def test_default_ttl_is_the_corroboration_ttl(self):
         just_inside = {
             'claimant_run_id': self._RUN,
-            'heartbeat_at': (self._NOW - DEFAULT_HEARTBEAT_TTL + timedelta(seconds=1)).isoformat(),
+            'heartbeat_at': (self._NOW - DEFAULT_CLAIMANT_HEARTBEAT_TTL + timedelta(seconds=1)).isoformat(),
         }
         assert self._label(just_inside) is ClaimantLabel.LIVE
+
+    def test_default_ttl_just_outside_is_stale(self):
+        just_outside = {
+            'claimant_run_id': self._RUN,
+            'heartbeat_at': (self._NOW - DEFAULT_CLAIMANT_HEARTBEAT_TTL - timedelta(seconds=1)).isoformat(),
+        }
+        assert self._label(just_outside) is ClaimantLabel.STALE
 
 
 class TestCorroborationGate:

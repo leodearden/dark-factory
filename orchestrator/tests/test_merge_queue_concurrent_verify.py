@@ -58,6 +58,7 @@ from _orch_helpers import (
     PYPROJECT_DEFAULT_TIMEOUT,
     RESPONSIVE_WAIT_STRETCH,
     RESPONSIVE_WAIT_WALL_CAP,
+    UNDER_LOAD_HEADROOM_FACTOR,
     VERIFY_CLI_PER_TEST_TIMEOUT,
     wait_responsive,
 )
@@ -266,17 +267,26 @@ async def _stop_worker(
 
 
 # The shared per-test ceiling for every class whose waits outgrow the ambient
-# budget. Derived, not literal, so the marks that share it cannot drift apart:
-# task 3477 found two that had, one so tight it would itself os._exit() the
-# xdist worker (timeout_method = "thread", --max-worker-restart=0) before the
-# loud _await_outcome failure could report. Generalized from
-# CASCADE_TEST_TIMEOUT by task 3492.
+# budget. SHARED, not per-class, so the marks cannot drift apart (task 3477
+# found two that had; task 3492 generalized CASCADE_TEST_TIMEOUT into this).
 #
 # No class's budget is written here or beside its mark: TestTimeoutMarkCoverage
 # recomputes each one from source on every run (_worst_per_method_wait_budget)
 # and checks it against the class's mark, or against the ambient budget for an
 # unmarked class -- so leaving a class unmarked is a checked decision too.
-HEAVY_BARRIER_TEST_TIMEOUT = 5 * MERGE_RESULT_TIMEOUT + 75  # 300s
+#
+# A literal, pinned by TestHeavyBarrierTimeoutConstant against the measured
+# worst case below x UNDER_LOAD_HEADROOM_FACTOR and against
+# PYPROJECT_DEFAULT_TIMEOUT (never-narrow).  Derivation:
+# plans/pytest-per-test-timeout-measurement-2026-09-17.md.
+HEAVY_BARRIER_TEST_TIMEOUT = 540
+
+# Worst per-test wall clock -- setup+call+teardown, what a pytest-timeout mark
+# bounds -- of any HEAVY_BARRIER- or capstone-marked test: task 5572, 2026-10-08,
+# `-n auto` at loadavg 152 -> 101,
+# test_merge_speculation.py::TestSpecLaneAbortReleasesLane::test_operator_halt_releases_spec_lane.
+# Corpus: plans/pytest-per-test-timeout-measurement-2026-09-17.md.
+_HEAVY_BARRIER_MEASURED_UNDER_LOAD_WORST_CASE = 14.59
 
 
 # task 3492: known-name table for _worst_per_method_wait_budget below. These
@@ -6736,9 +6746,9 @@ class TestMergeResultTimeoutName:
             f'got {budgets!r}.'
         )
 
-    def test_heavy_barrier_test_timeout_name_resolves_to_300(self) -> None:
+    def test_heavy_barrier_test_timeout_name_resolves_to_its_value(self) -> None:
         """`timeout=HEAVY_BARRIER_TEST_TIMEOUT` resolves the name reference
-        to its known numeric value, 300.0.
+        to the constant's numeric value rather than billing it as unbounded.
         """
         source = '''
 class TestHeavyBarrierTimeoutName:
@@ -6747,9 +6757,14 @@ class TestHeavyBarrierTimeoutName:
 '''
         budgets = _worst_per_method_wait_budget(source)
 
-        assert budgets == {'TestHeavyBarrierTimeoutName': 300.0}, (
+        assert math.isfinite(budgets['TestHeavyBarrierTimeoutName']), (
+            f'Expected timeout=HEAVY_BARRIER_TEST_TIMEOUT to resolve to a '
+            f'finite budget, got {budgets!r}: the name was billed as unbounded.'
+        )
+        expected = float(HEAVY_BARRIER_TEST_TIMEOUT)
+        assert budgets == {'TestHeavyBarrierTimeoutName': expected}, (
             f'Expected timeout=HEAVY_BARRIER_TEST_TIMEOUT to resolve to '
-            f'300.0, got {budgets!r}.'
+            f'{expected}, got {budgets!r}.'
         )
 
     def test_wait_responsive_bare_bills_the_stretched_hidden_default(self) -> None:
@@ -7750,6 +7765,35 @@ class TestTimeoutMarkOffenders:
         assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
         assert '_Unbounded' in offenders[0]
         assert 'unbounded' in offenders[0]
+
+
+class TestHeavyBarrierTimeoutConstant:
+    """HEAVY_BARRIER_TEST_TIMEOUT is a literal held up by two floors.
+
+    The per-class WAIT floor is TestTimeoutMarkCoverage's job, not this one's.
+    """
+
+    def test_clears_the_measured_wall_clock_with_headroom(self) -> None:
+        """The constant keeps UNDER_LOAD_HEADROOM_FACTOR over the measured worst case."""
+        required = _HEAVY_BARRIER_MEASURED_UNDER_LOAD_WORST_CASE * UNDER_LOAD_HEADROOM_FACTOR
+        assert required <= HEAVY_BARRIER_TEST_TIMEOUT, (
+            f'HEAVY_BARRIER_TEST_TIMEOUT ({HEAVY_BARRIER_TEST_TIMEOUT}s) no longer '
+            f'clears {UNDER_LOAD_HEADROOM_FACTOR}x the measured-under-load worst '
+            f'case ({_HEAVY_BARRIER_MEASURED_UNDER_LOAD_WORST_CASE}s = {required}s). '
+            'Raise the constant (and re-record the measurement) rather than '
+            'relaxing this arithmetic.'
+        )
+
+    def test_never_narrows_the_ini_default(self) -> None:
+        """The constant never falls below PYPROJECT_DEFAULT_TIMEOUT."""
+        assert HEAVY_BARRIER_TEST_TIMEOUT >= PYPROJECT_DEFAULT_TIMEOUT, (
+            f'HEAVY_BARRIER_TEST_TIMEOUT ({HEAVY_BARRIER_TEST_TIMEOUT}s) is below '
+            f'the pyproject default ({PYPROJECT_DEFAULT_TIMEOUT}s). A timeout mark '
+            'REPLACES the ambient budget rather than flooring it (see '
+            '_orch_helpers.VERIFY_CLI_PER_TEST_TIMEOUT), so below the ini default '
+            'the merge-barrier classes carrying this mark run TIGHTER than every '
+            'unmarked test on a bare local or agent run. Raise the constant.'
+        )
 
 
 # ---------------------------------------------------------------------------

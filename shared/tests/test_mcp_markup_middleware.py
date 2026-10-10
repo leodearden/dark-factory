@@ -67,6 +67,7 @@ import toolcall_markup_corpus_extract as extract
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 
+from shared.boundary_storm_escape import BoundaryStormEscape
 from shared.mcp_markup_middleware import (
     _ATTRIBUTION_AXIS_MAXLEN,
     MarkupGuardMiddleware,
@@ -2688,15 +2689,15 @@ class TestB10StormEscape:
         clock = _Clock()
         h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
 
-        with caplog.at_level('ERROR', logger='shared.mcp_markup_middleware'):
+        # Logger-agnostic: the line is the contract, not which module emits it.
+        with caplog.at_level('ERROR'):
             for _ in range(3):
                 await self._repair(h)
                 clock.advance(60)
 
         storm_lines = [
             r.getMessage() for r in caplog.records
-            if r.name == 'shared.mcp_markup_middleware'
-            and r.levelname == 'ERROR'
+            if r.levelname == 'ERROR'
             and r.getMessage().startswith('markup_guard_storm')
         ]
         assert storm_lines, (
@@ -3027,6 +3028,26 @@ class TestTheStormNamesItsCrossingCaller:
 
     # -- (b) the identity axis, and the old keys are UNCHANGED --------------
 
+    async def test_the_error_line_names_the_crossing_call_in_the_record_vocabulary(
+        self, caplog
+    ):
+        """One vocabulary for the line and the record: an operator holding an
+        escalation record greps a key name off it and finds the line."""
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        with caplog.at_level('ERROR'):
+            for _ in range(3):
+                await self._typed_repair(h)
+                clock.advance(60)
+
+        [line] = [
+            r.getMessage() for r in caplog.records
+            if r.levelname == 'ERROR' and r.getMessage().startswith('markup_guard_storm')
+        ]
+        assert "crossing_subject_task_id='4805'" in line
+        assert "crossing_subject_agent_role='implementer-4805'" in line
+
     async def test_the_storm_names_the_crossing_call_agent_id(self):
         clock = _Clock()
         h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
@@ -3271,6 +3292,51 @@ class TestTheStormNamesItsCrossingCaller:
         assert storm['callers'] and all(blob not in c for c in storm['callers'])
         # The unbounded value reaches NOTHING on the record.
         assert blob not in repr(storm)
+
+
+class TestTheStormEscapeIsTheSharedCollaborator:
+    """INV-5: the guard counts bursts through the ONE shared storm escape.
+
+    ``storm_escape`` is also the supported seam for tuning a REGISTERED guard,
+    which its own registration site constructs out of a test's reach.
+    """
+
+    @staticmethod
+    def _guard(h) -> MarkupGuardMiddleware:
+        return next(m for m in h.mcp.middleware if isinstance(m, MarkupGuardMiddleware))
+
+    def test_the_guard_composes_the_shared_boundary_storm_escape(self):
+        guard = self._guard(build_harness(RepairPolicy.FORWARD_REPAIR))
+
+        assert isinstance(guard.storm_escape, BoundaryStormEscape)
+        assert guard.storm_escape.names_callers is True
+
+    def test_the_collaborator_cannot_be_rebound(self):
+        guard = self._guard(build_harness(RepairPolicy.FORWARD_REPAIR))
+
+        replacement = BoundaryStormEscape(owner='other', error_type='e', log_event='l')
+
+        with pytest.raises(AttributeError):
+            guard.storm_escape = replacement  # pyright: ignore[reportAttributeAccessIssue]
+
+    async def test_a_registered_guard_is_tuned_live_through_the_escape(self):
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+        clock = _Clock()
+        guard = self._guard(h)
+        guard.storm_escape.threshold = 2
+        guard.storm_escape.time_provider = clock
+
+        for _ in range(2):
+            await TestB10StormEscape()._repair(h)
+        storms = TestB10StormEscape._storms(h)
+        assert [storm['count'] for storm in storms] == [2]
+
+        clock.advance(7200)
+        for _ in range(2):
+            await TestB10StormEscape()._repair(h)
+        assert len(TestB10StormEscape._storms(h)) == 2, (
+            'the swapped clock drained the window and the rate limit'
+        )
 
 
 # ---------------------------------------------------------------------------

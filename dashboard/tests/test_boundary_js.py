@@ -252,7 +252,9 @@ def test_sketch_9_a_window_counts_its_own_merges_and_each_attempt_once(served_bo
     in_window = [attempt for attempt in MERGE_ATTEMPTS if attempt.age <= span]
 
     assert body['WINDOW']['served'] == window
-    assert block['recent_total'] == len(block['recent']) == len(in_window)
+    assert block['recent_total']['state'] == 'fresh', 'a readable runs.db window total is measured'
+    assert block['speculative']['state'] == 'fresh', 'a readable runs.db speculative count is measured'
+    assert block['recent_total']['value'] == len(block['recent']) == len(in_window)
     latency = block['latency']
     assert sum(block['outcomes']['values']) == latency['with_duration'] + latency['without_duration']
     assert latency['with_duration'] == sum(1 for attempt in in_window if attempt.duration_ms)
@@ -262,7 +264,7 @@ def test_sketch_9_a_window_counts_its_own_merges_and_each_attempt_once(served_bo
 def test_sketch_9_the_two_windows_hold_different_merges(served_bodies):
     week, day = (served_bodies[f'merge_{window}']['MERGE_QUEUE']['dark-factory'] for window in ('7d', '24h'))
 
-    assert week['recent_total'] != day['recent_total']
+    assert week['recent_total']['value'] != day['recent_total']['value']
     assert len(week['recent']) != len(day['recent'])
 
 
@@ -288,12 +290,24 @@ def test_sketch_10_each_ttl_generation_is_its_own_walk(served_bodies):
 
 
 def test_sketch_11_every_journal_row_is_counted_once_in_the_totals(served_bodies):
-    totals = served_bodies['memory_ops']['MEMORY_OPS']['totals']
+    served = served_bodies['memory_ops']['MEMORY_OPS']['totals']
+    assert served['state'] == 'fresh', served
+    totals = served['value']
     kinds = [kind for _operation, kind in MEMORY_OPS]
 
     assert totals['reads'] + totals['writes'] + totals['other'] == totals['total'] == len(MEMORY_OPS)
     assert (totals['reads'], totals['writes']) == (kinds.count('read'), kinds.count('write'))
     assert totals['other'] == 1, 'the kind outside read and write is counted, as other'
+
+
+def test_sketch_11_a_missing_journal_is_unknown_not_a_quiet_day(served_bodies):
+    ops = served_bodies['memory_ops_missing']['MEMORY_OPS']
+
+    for reading in ('totals', 'newest_hour_total'):
+        assert ops[reading]['state'] == 'unknown', ops[reading]
+        assert (ops[reading]['reason'] or '').strip(), f'an unknown {reading} must say why'
+    for series in ('labels', 'reads', 'writes', 'other', 'total', 'by_operation'):
+        assert ops[series] == [], f'a hole serves no {series} to draw as a flat zero line'
 
 
 def test_sketch_12_an_offline_scheduler_is_named_while_its_tasks_are_still_served(served_bodies):

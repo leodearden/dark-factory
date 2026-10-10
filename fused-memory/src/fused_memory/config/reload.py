@@ -257,13 +257,21 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # write_triage.t_high_by_category. Each therefore reloads all-or-nothing,
     # which is why a partially-applied ranking map can never gate a cycle.
     'consolidation_auto.category_weights',
-    # ---- Link-heal executor caps (task 6181, plans/write-triage-link-healing-prd.md H1) ----
-    # The consumer is fused-memory/scripts/link_heal.py, which loads config at
-    # each run start. The server holds no copy, so an edit must never report
+    # ---- Link-heal executor caps and adjudicator knobs (tasks 6181, 6184;
+    # plans/write-triage-link-healing-prd.md H1, H2) ----
+    # The consumers are fused-memory/scripts/link_heal.py and
+    # fused-memory/scripts/eval_link_adjudicator.py, which load config at each
+    # run start. The server holds no copy, so an edit must never report
     # restart_required.
     'link_heal.max_actions_per_run',
     'link_heal.backlog_multiplier',
     'link_heal.write_failure_streak',
+    'link_heal.adjudicator_model',
+    'link_heal.shard_size',
+    'link_heal.field_chars',
+    'link_heal.misfile_share_ceiling',
+    'link_heal.corrects_share_ceiling',
+    'link_heal.shard_failure_streak',
 })
 
 

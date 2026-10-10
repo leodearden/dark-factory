@@ -28,6 +28,8 @@ class InstrumentCheckId(StrEnum):
     ENDPOINT_CONFORMANCE = 'endpoint-conformance'
     VALIDATOR_NEGATIVE_CONTROL = 'validator-negative-control'
     INDEX_CONFIGURATION = 'index-configuration'
+    FROZEN_REFERENCE_UNCHANGED = 'frozen-reference-unchanged'
+    REEMBED_INTEGRITY = 'reembed-integrity'
 
 
 @dataclass(frozen=True)

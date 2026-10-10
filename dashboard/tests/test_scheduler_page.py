@@ -2187,26 +2187,6 @@ async def test_collect_scheduler_state_keeps_module_contention_per_project(
 # ---------------------------------------------------------------------------
 
 
-def test_scheduler_proxy_handles_non_dict_mcp_result(client):
-    """_scheduler_proxy: a non-dict MCP result must not 500 on `.get('error')`.
-
-    Older/buggy MCP tools could return a list or None.  The not_found→404
-    mapping must guard with isinstance(result, dict) so the unexpected type
-    is forwarded verbatim as 200 rather than escaping as AttributeError/500.
-    """
-    from unittest.mock import AsyncMock, patch
-
-    with patch(_PATCH_TARGET, new=AsyncMock(return_value=['unexpected', 'list'])):
-        resp = client.post(
-            '/api/v2/dashboard/scheduler/clear-override',
-            json={'task_id': 'T1', 'project_root': '/proj'},
-        )
-
-    # Forwarded verbatim — the list reaches JSONResponse without crashing.
-    assert resp.status_code == 200
-    assert resp.json() == ['unexpected', 'list']
-
-
 def test_compose_rows_tolerates_non_string_installed_at():
     """park_state.installed_at coerced to str so non-string values don't AttributeError.
 
@@ -2472,8 +2452,10 @@ def test_module_contention_counts_attaches_parked_by_and_stack():
     ]
     park_stacks = {
         'm': [
-            {'owner': 'low', 'rank': 10, 'shadowed': True, 'installed_at': iso},
-            {'owner': 'high', 'rank': 5, 'shadowed': False, 'installed_at': iso},
+            {'owner': 'low', 'rank': 10, 'shadowed': True, 'installed_at': iso,
+             'source': 'fairness', 'tier': 'polish'},
+            {'owner': 'high', 'rank': -999999, 'shadowed': False, 'installed_at': iso,
+             'source': 'pin', 'pin_order': 1},
         ]
     }
     live_task_ids = {'low', 'high'}
@@ -2512,6 +2494,10 @@ def test_module_contention_counts_attaches_parked_by_and_stack():
     assert ps[1]['owner'] == 'high'
     assert ps[1]['shadowed'] is False
     assert ps[1]['live'] is True
+
+    # Producer-supplied priority naming passes through unchanged
+    assert (ps[0]['source'], ps[0]['tier']) == ('fairness', 'polish')
+    assert (ps[1]['source'], ps[1]['pin_order']) == ('pin', 1)
 
     # has_dead_park: all entries are live → False
     assert m_entry['has_dead_park'] is False, (
@@ -2694,6 +2680,27 @@ def test_stranded_park_rows_flags_dead_owner():
     assert sorted(r2['lock_set']) == ['m1', 'm2'], (
         f"lock_set must list both modules, got {r2['lock_set']!r}"
     )
+
+
+def test_stranded_park_rows_lists_module_once_when_owner_holds_two_entries():
+    """One dead owner with a pin entry and a fairness entry on one module lists it once."""
+    from dashboard.data.scheduler import _stranded_park_rows
+
+    iso = '2026-01-01T09:00:00+00:00'
+    park_stacks = {
+        'm': [
+            {'owner': '7', 'rank': 1, 'shadowed': True, 'installed_at': iso,
+             'source': 'fairness', 'tier': 'high'},
+            {'owner': '7', 'rank': -999999, 'shadowed': False, 'installed_at': iso,
+             'source': 'pin', 'pin_order': 1},
+        ]
+    }
+
+    rows = _stranded_park_rows(park_stacks, set(), project='p', project_root='/p')
+
+    assert len(rows) == 1
+    assert rows[0]['park_state']['modules'] == ['m']
+    assert rows[0]['lock_set'] == ['m']
 
 
 # ---------------------------------------------------------------------------

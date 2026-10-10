@@ -18,11 +18,15 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
 
 from graphiti_core.nodes import EpisodeType
+from shared.storm_counter import KeyedStormCounters
 
 from fused_memory.backends.graphiti_client import (
     ActiveEdgesError,
     AmbiguousEntityError,
     GraphitiBackend,
+    ReadCompleteness,
+    read_all_valid_edges_checked,
+    read_entity_nodes_checked,
 )
 from fused_memory.backends.llm_token_usage import TokenMeasurement
 from fused_memory.backends.mem0_client import (
@@ -78,6 +82,9 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
 )
 from fused_memory.models.scope import Scope
+from fused_memory.reconciliation.flag_record_contract import (
+    enforce_flag_record_write_contract,
+)
 from fused_memory.reconciliation.recon_pool_map import (
     CYCLE_SUMMARY_KIND as _CYCLE_SUMMARY_KIND,
 )
@@ -96,7 +103,6 @@ from fused_memory.reconciliation.standing_decision_writer import (
 )
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
-from fused_memory.server.storm_counter import StormCounter
 from fused_memory.services.completion_claim_gate import UNVERIFIED_CLAIM_TAG
 from fused_memory.services.durable_queue import DeadLetterEvent, DurableWriteQueue
 from fused_memory.services.memory_metadata_census import (
@@ -2277,14 +2283,15 @@ class MemoryService:
         # service). An alarm bound to either would vanish in exactly the
         # degraded configuration where an unattended rewrite loop is least
         # likely to be noticed any other way.
-        self._mem0_update_storm_counters: dict[str, StormCounter] = {}
+        self._mem0_update_storm_counters: KeyedStormCounters[str] = KeyedStormCounters()
         self._mem0_update_storm_escalator = Mem0UpdateStormEscalator()
         # INV-4 storm escape for the ensure_entity_node MCP tool (task 4932),
-        # keyed per `agent_id` for the same attribution reason as the dict above.
+        # keyed per `agent_id` for the same attribution reason as the registry
+        # above.
         # No escalator OBJECT beside it: `middleware/entity_mint_storm_escalator`
         # is a module FUNCTION taking project_root explicitly, so there is no
         # queue cache to own and no set_known_projects lifecycle to keep in sync.
-        self._entity_mint_storm_counters: dict[str, StormCounter] = {}
+        self._entity_mint_storm_counters: KeyedStormCounters[str] = KeyedStormCounters()
         # Warn-ONCE latch for a corrupt/absent `entity_mint.storm_*` leaf. The
         # corrupt-leaf branch of `_record_entity_mint` is reached on EVERY mint
         # (unlike the `_known_projects` miss beside it, which only fires at a
@@ -2415,6 +2422,25 @@ class MemoryService:
         unwired, which callers treat as "skip journalling", never as an error.
         """
         return self._write_journal
+
+    @property
+    def mem0_update_storm_tracked_agents(self) -> frozenset[str]:
+        """The ``agent_id`` labels holding an ``update_memory`` storm window.
+
+        ``agent_id`` is caller-supplied and unbounded, so evicting dormant
+        agents is a real memory bound on a long-lived server and belongs in the
+        interface, as ``UnknownKeyStormDetector.tracked_writers`` argues.
+        """
+        return self._mem0_update_storm_counters.tracked_keys
+
+    @property
+    def entity_mint_storm_tracked_agents(self) -> frozenset[str]:
+        """The ``agent_id`` labels holding an ``ensure_entity_node`` storm window.
+
+        The same bound as :attr:`mem0_update_storm_tracked_agents`, for the
+        entity-mint burst alarm.
+        """
+        return self._entity_mint_storm_counters.tracked_keys
 
     def set_planned_registry(self, registry: PlannedEpisodeRegistry) -> None:
         """Wire the planned episode registry into the service."""
@@ -2820,26 +2846,38 @@ class MemoryService:
         session_id: str | None,
         category: str | None,
         metadata: dict | None,
-    ) -> str:
+    ) -> str | None:
         """sha256 over the canonical mem0 write payload — audit/idempotency key.
 
         Used to stamp the write-ahead ``mem0_intent`` (task 2710) so a
         dead-lettered intent carries a stable fingerprint of exactly what
         would have been written, for audit and manual replay.
+
+        Never raises, like ``WriteJournal.log_mem0_intent``: on failure it logs
+        at ERROR and returns None.
         """
-        canonical = json.dumps(
-            {
-                'content': content,
-                'project_id': project_id,
-                'agent_id': agent_id,
-                'session_id': session_id,
-                'category': category,
-                'metadata': metadata or {},
-            },
-            sort_keys=True,
-            ensure_ascii=False,
-        )
-        return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+        try:
+            canonical = json.dumps(
+                {
+                    'content': content,
+                    'project_id': project_id,
+                    'agent_id': agent_id,
+                    'session_id': session_id,
+                    'category': category,
+                    'metadata': metadata or {},
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+            return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+        except Exception as e:
+            logger.error(
+                'mem0 payload digest could not be computed (%s: %s); the '
+                'mem0_intent is journaled without a digest',
+                type(e).__name__,
+                e,
+            )
+            return None
 
     # ------------------------------------------------------------------
     # Durable queue: execute write dispatcher
@@ -6613,6 +6651,9 @@ class MemoryService:
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
         write_op_id = str(uuid_mod.uuid4())
 
+        # Stage-1 flag-record write contract: flag_record_contract.py.
+        meta = enforce_flag_record_write_contract(metadata, agent_id=agent_id)
+
         # Resolve category
         if category is None:
             classification = await self.classifier.classify(content)
@@ -6624,7 +6665,6 @@ class MemoryService:
 
         memory_ids: list[str] = []
         stores_written: list[SourceStore] = []
-        meta = dict(metadata or {})
         meta['category'] = resolved_category.value
         _stamp_unverified_claim(meta, unverified_claim)
 
@@ -6898,7 +6938,8 @@ class MemoryService:
         - only FAILED mem0 backend_op(s) → ``add()`` raised. In the common
           (clean, pre-persist) failure mem0 did not land, so re-issue is safe
           (0 prior writes + 1 = 1): rebuild ``Scope`` + metadata and call
-          ``mem0.add``; ``completed`` on success, ``dead`` on error.
+          ``mem0.add``; ``completed`` on success, ``dead`` on error. Crash
+          after re-issue: ``fused-memory/tests/test_mem0_intent_recovery.py::TestRecoverMem0Intents::test_crash_after_successful_reissue_is_reconciled_not_reissued_again``.
           RESIDUAL DUPLICATE RISK (accepted, documented): a failure raised
           AFTER mem0 committed but at/near the response (e.g. a read-timeout
           on an otherwise-successful add) ALSO records a FAILED backend_op
@@ -6960,10 +7001,16 @@ class MemoryService:
                         session_id=intent.get('session_id'),
                     )
                     metadata = json.loads(intent.get('metadata') or '{}')
-                    await self.mem0.add(
-                        content=intent.get('content') or '',
-                        scope=scope,
-                        metadata=metadata,
+                    content = intent.get('content') or ''
+                    await self._journaled_backend_call(
+                        write_op_id=write_op_id,
+                        causation_id=intent.get('causation_id'),
+                        backend='mem0',
+                        operation='add',
+                        payload={'content': content[:200]},
+                        coro=self.mem0.add(
+                            content=content, scope=scope, metadata=metadata
+                        ),
                     )
                     await self._write_journal.resolve_mem0_intent(
                         intent_id,
@@ -7046,9 +7093,11 @@ class MemoryService:
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
         write_op_id = str(uuid_mod.uuid4())
 
+        # Stage-1 flag-record write contract: flag_record_contract.py.
+        meta = enforce_flag_record_write_contract(metadata, agent_id=agent_id)
+
         resolved_category = MemoryCategory(category) if isinstance(category, str) else category
 
-        meta = dict(metadata or {})
         meta['category'] = resolved_category.value
         # No completion-claim gate runs on this path, so it never tags.
         _stamp_unverified_claim(meta, False)
@@ -9310,39 +9359,21 @@ class MemoryService:
         they would make both green-tier leaves restart-only in disguise.
         """
         label = agent_id or '<unattributed>'
-        counter = self._mem0_update_storm_counters.get(label)
-        if counter is None:
-            counter = StormCounter(time_provider=self._mem0_update_storm_time_provider)
-            self._mem0_update_storm_counters[label] = counter
-
         cfg = getattr(self.config, 'mem0_update', None)
         threshold = getattr(cfg, 'storm_threshold', None)
         window_seconds = getattr(cfg, 'storm_window_seconds', None)
         if not isinstance(threshold, int) or not isinstance(window_seconds, int | float):
             return
 
-        storm = counter.record(
+        # agent_id is caller-supplied and unbounded; KeyedStormCounters sweeps
+        # the dormant ones on every record.
+        storm = self._mem0_update_storm_counters.record(
+            label,
             threshold=threshold,
             window_seconds=float(window_seconds),
             label=label,
+            now=self._mem0_update_storm_time_provider(),
         )
-
-        # Evict counters whose window has gone empty. Each counter self-prunes
-        # its own deque, but nothing would drop the counter OBJECT, and
-        # ``agent_id`` is caller-supplied and unbounded in cardinality — the
-        # gate is a self-reported prefix match, so a widened prefix admits
-        # arbitrary suffixes (``recon-stage-1-run-<uuid>`` mints a fresh key
-        # every run). A server designed to run for weeks between restarts would
-        # otherwise accumulate one dead counter per agent it ever saw.
-        #
-        # Runs on EVERY amend, not just a breach: the leak is on the common
-        # path. It is O(live agents) because the sweep is itself what keeps
-        # that from becoming O(agents ever seen). See StormCounter.prune on why
-        # dropping an empty counter is behaviour-preserving.
-        for other, dormant in list(self._mem0_update_storm_counters.items()):
-            if other != label and dormant.prune(float(window_seconds)) == 0:
-                del self._mem0_update_storm_counters[other]
-
         if storm is None:
             return
 
@@ -10267,11 +10298,6 @@ class MemoryService:
         they would make both green-tier leaves restart-only in disguise.
         """
         label = agent_id or '<unattributed>'
-        counter = self._entity_mint_storm_counters.get(label)
-        if counter is None:
-            counter = StormCounter(time_provider=self._entity_mint_storm_time_provider)
-            self._entity_mint_storm_counters[label] = counter
-
         cfg = getattr(self.config, 'entity_mint', None)
         threshold = getattr(cfg, 'storm_threshold', None)
         window_seconds = getattr(cfg, 'storm_window_seconds', None)
@@ -10304,25 +10330,15 @@ class MemoryService:
             return
         self._entity_mint_storm_config_warned = False
 
-        storm = counter.record(
+        # agent_id is caller-supplied and unbounded; KeyedStormCounters sweeps
+        # the dormant ones on every record.
+        storm = self._entity_mint_storm_counters.record(
+            label,
             threshold=threshold,
             window_seconds=float(window_seconds),
             label=label,
+            now=self._entity_mint_storm_time_provider(),
         )
-
-        # Evict counters whose window has gone empty. Each counter self-prunes
-        # its own deque, but nothing would drop the counter OBJECT, and
-        # ``agent_id`` is caller-supplied and unbounded in cardinality — the
-        # gate is a self-reported prefix match, so a widened prefix admits
-        # arbitrary suffixes (``recon-stage-1-run-<uuid>`` mints a fresh key
-        # every run). A server designed to run for weeks between restarts would
-        # otherwise accumulate one dead counter per agent it ever saw. Mirrors
-        # ``_record_content_amend``'s sweep exactly; see StormCounter.prune on
-        # why dropping an empty counter is behaviour-preserving.
-        for other, dormant in list(self._entity_mint_storm_counters.items()):
-            if other != label and dormant.prune(float(window_seconds)) == 0:
-                del self._entity_mint_storm_counters[other]
-
         if storm is None:
             return
 
@@ -10792,8 +10808,8 @@ class MemoryService:
 
         Orchestrates the rebuild pipeline:
         1. Target selection — entity_uuids (targeted, bypasses detection) takes
-           precedence over detect_stale_with_edges (force=False) or
-           list_entity_nodes (force=True).
+           precedence over detect_stale_with_edges (force=False) or the
+           whole node read (force=True).
         2. Fan-out — asyncio.Semaphore(20) + gather_collect (fused_memory.utils.async_utils)
            calling graphiti.rebuild_entity_from_edges for each target.
         3. Error accumulation — two-tier: gather_collect's Pass 1 (cancellation
@@ -10815,7 +10831,15 @@ class MemoryService:
 
         Returns:
             Dict with keys: total_entities, stale_entities, rebuilt, skipped,
-            errors, details.
+            errors, details, and the tri-state read completeness
+            entities_complete / entities_incomplete_kind / edges_complete /
+            edges_incomplete_kind.  True: the read was proven complete.
+            False: it was observed incomplete; the rebuild proceeded on what
+            was fetched and the policy warned.  None: no verdict for that
+            read on this path, because the read was not issued or this is the
+            force=False dry_run probe (tkt_0RVHH0D37FVAWSMT1NVGSHDSZM).
+            Gate on ``is True``.  The raise/warn split is
+            fused-memory/src/fused_memory/backends/graphiti_client.py::apply_incompleteness_policy.
         """
         write_op_id = str(uuid_mod.uuid4())
         success = True
@@ -10827,10 +10851,14 @@ class MemoryService:
             all_edges: dict[str, list] = {}
             total_entities: int = 0
             not_found_details: list[dict] = []
+            entities_completeness: ReadCompleteness | None = None
+            edges_completeness: ReadCompleteness | None = None
 
             if entity_uuids is not None and len(entity_uuids) > 0:
                 requested = list(dict.fromkeys(entity_uuids))  # dedupe, preserve order
-                all_entities = await self.graphiti.list_entity_nodes(group_id=project_id)
+                all_entities, entities_completeness = await read_entity_nodes_checked(
+                    self.graphiti, group_id=project_id, log=logger
+                )
                 by_uuid = {e['uuid']: e for e in all_entities}
                 targets = [
                     {'uuid': u, 'name': by_uuid[u]['name'], 'old_summary': by_uuid[u]['summary']}
@@ -10844,19 +10872,25 @@ class MemoryService:
                 ]
                 total_entities = len(targets)
                 if not dry_run:
-                    all_edges = await self.graphiti.get_all_valid_edges(group_id=project_id)
+                    all_edges, edges_completeness = await read_all_valid_edges_checked(
+                        self.graphiti, group_id=project_id, log=logger
+                    )
             elif entity_uuids is not None:
                 # entity_uuids == [] — explicit zero-count no-op, no backend calls.
                 pass
             elif force:
-                all_entities = await self.graphiti.list_entity_nodes(group_id=project_id)
+                all_entities, entities_completeness = await read_entity_nodes_checked(
+                    self.graphiti, group_id=project_id, log=logger
+                )
                 targets = [
                     {'uuid': e['uuid'], 'name': e['name'], 'old_summary': e['summary']}
                     for e in all_entities
                 ]
                 total_entities = len(all_entities)
                 if not dry_run:
-                    all_edges = await self.graphiti.get_all_valid_edges(group_id=project_id)
+                    all_edges, edges_completeness = await read_all_valid_edges_checked(
+                        self.graphiti, group_id=project_id, log=logger
+                    )
             else:
                 if dry_run:
                     stale, total_entities = await self.graphiti.detect_stale_dry_run(
@@ -10864,11 +10898,13 @@ class MemoryService:
                     )
                 else:
                     detect_result = await self.graphiti.detect_stale_with_edges(
-                        group_id=project_id
+                        group_id=project_id, log=logger
                     )
                     stale = detect_result.stale
                     all_edges = detect_result.all_edges
                     total_entities = detect_result.total_count
+                    entities_completeness = detect_result.entities_completeness
+                    edges_completeness = detect_result.edges_completeness
                 targets = [
                     {'uuid': s['uuid'], 'name': s['name'], 'old_summary': s['summary']}
                     for s in stale
@@ -10948,11 +10984,17 @@ class MemoryService:
             # without affecting rebuilt/skipped/errors counts.
             details.extend(not_found_details)
 
+            completeness = {
+                **ReadCompleteness.result_keys('entities', entities_completeness),
+                **ReadCompleteness.result_keys('edges', edges_completeness),
+            }
             logger.info(
                 'rebuild_entity_summaries: group=%s total=%d stale=%d rebuilt=%d '
-                'skipped=%d errors=%d dry_run=%s force=%s',
+                'skipped=%d errors=%d dry_run=%s force=%s entities_complete=%s '
+                'edges_complete=%s',
                 project_id, total_entities, stale_entities, rebuilt, skipped, errors,
-                dry_run, force,
+                dry_run, force, completeness['entities_complete'],
+                completeness['edges_complete'],
             )
             result = {
                 'total_entities': total_entities,
@@ -10961,6 +11003,7 @@ class MemoryService:
                 'skipped': skipped,
                 'errors': errors,
                 'details': details,
+                **completeness,
             }
         except Exception as e:
             success = False

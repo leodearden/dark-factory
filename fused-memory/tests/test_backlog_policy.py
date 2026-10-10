@@ -84,6 +84,16 @@ async def _seed_buffered(event_buffer: EventBuffer, project_id: str, n: int) -> 
         await event_buffer.push(event)
 
 
+def _pending_records(esc_dir: Path) -> dict[str, dict]:
+    """Every pending record in ``esc_dir``, keyed by id."""
+    out = {}
+    for path in sorted(esc_dir.glob('esc-*.json')):
+        body = json.loads(path.read_text(encoding='utf-8'))
+        if body.get('status') == 'pending':
+            out[body['id']] = body
+    return out
+
+
 # ── BacklogPolicy.check ───────────────────────────────────────────────────
 
 
@@ -1300,16 +1310,6 @@ class TestFoldIsolation:
     ``_maybe_write_escalation``.
     """
 
-    @staticmethod
-    def _pending(esc_dir: Path) -> dict[str, dict]:
-        """Every pending record in ``esc_dir``, keyed by id."""
-        out = {}
-        for path in sorted(esc_dir.glob('esc-*.json')):
-            body = json.loads(path.read_text(encoding='utf-8'))
-            if body.get('status') == 'pending':
-                out[body['id']] = body
-        return out
-
     @pytest.mark.asyncio
     async def test_judge_halt_does_not_fold_into_a_pending_backlog_parent(
         self, event_buffer, tmp_path,
@@ -1343,7 +1343,7 @@ class TestFoldIsolation:
         assert halt_verdict.escalation_path != backlog_verdict.escalation_path
 
         esc_dir = project_root / 'data' / 'escalations'
-        pending = self._pending(esc_dir)
+        pending = _pending_records(esc_dir)
         assert len(pending) == 2, sorted(pending)
 
         backlog_ids = [i for i in pending if i.startswith('esc-reconciliation-backlog-')]
@@ -1387,16 +1387,8 @@ class TestFoldIsolation:
             rate_limit_seconds=900.0,
             time_provider=now,
         )
-        # The 1s offsets are LOAD-BEARING, not cosmetic. The escalation id is
-        # derived from ``kind`` and the clock alone (``_ESC_ID_PREFIXES`` +
-        # isoformat), with nothing project-scoped in it, so two projects
-        # escalating at the SAME clock reading mint the same id and the second
-        # submit overwrites the first at the same path. That id collision
-        # predates this fold mechanism (it is byte-identical at base
-        # 63a2984c65) and is unreachable in production, where ``time.time()``
-        # resolves to microseconds; a frozen test clock is what makes it
-        # certain. Offsetting keeps this test measuring FOLD isolation instead
-        # of that collision — see the follow-up filed for the id scheme.
+        # The 1s offsets keep this test measuring fold isolation alone; same-tick
+        # id scoping is pinned separately by ``TestEscalationIdScoping``.
         await policy.check('proj_a', project_root=str(shared_root))
         clock['now'] += 1.0
         await policy.check('proj_b', project_root=str(shared_root))
@@ -1407,7 +1399,7 @@ class TestFoldIsolation:
         assert v_a.escalation_path != v_b.escalation_path
 
         esc_dir = shared_root / 'data' / 'escalations'
-        pending = self._pending(esc_dir)
+        pending = _pending_records(esc_dir)
         assert len(pending) == 2, sorted(pending)
         by_project = {body['project_id']: body for body in pending.values()}
         assert set(by_project) == {'proj_a', 'proj_b'}
@@ -1469,7 +1461,7 @@ class TestFoldIsolation:
         assert verdict.escalation_path is not None
         assert Path(verdict.escalation_path).name != foreign_path.name
 
-        pending = self._pending(esc_dir)
+        pending = _pending_records(esc_dir)
         assert len(pending) == 2, sorted(pending)
         own = [i for i in pending if i.startswith('esc-reconciliation-backlog-')]
         assert len(own) == 1, sorted(pending)
@@ -1477,6 +1469,95 @@ class TestFoldIsolation:
         # The foreign record is not merely un-folded — it is untouched.
         assert foreign_path.read_text(encoding='utf-8') == before
         assert pending[foreign_id].get('dedupe_count', 0) == 0
+
+
+class TestEscalationIdScoping:
+    """Two projects sharing one escalation directory and escalating on the
+    same clock reading keep separate records, because the id is project-scoped.
+    """
+
+    @staticmethod
+    def _frozen_policy(event_buffer: EventBuffer, clock: dict) -> BacklogPolicy:
+        return BacklogPolicy(
+            event_buffer,
+            _StubQueue(),
+            lambda _: True,
+            hard_limit=10,
+            rate_limit_seconds=900.0,
+            time_provider=lambda: clock['now'],
+        )
+
+    @pytest.mark.asyncio
+    async def test_two_projects_on_one_frozen_tick_keep_separate_records(
+        self, event_buffer, tmp_path,
+    ):
+        await _seed_buffered(event_buffer, 'proj_a', n=12)
+        await _seed_buffered(event_buffer, 'proj_b', n=12)
+        shared_root = tmp_path / 'shared_root'
+        shared_root.mkdir()
+        clock = {'now': 1_000_000.0}
+        policy = self._frozen_policy(event_buffer, clock)
+
+        first_a = await policy.check('proj_a', project_root=str(shared_root))
+        first_b = await policy.check('proj_b', project_root=str(shared_root))
+        assert first_a.escalation_path is not None
+        assert first_b.escalation_path is not None
+        assert first_a.escalation_path != first_b.escalation_path
+
+        esc_dir = shared_root / 'data' / 'escalations'
+        pending = _pending_records(esc_dir)
+        assert len(pending) == 2, sorted(pending)
+        by_project = {body['project_id']: body for body in pending.values()}
+        assert set(by_project) == {'proj_a', 'proj_b'}
+        assert (
+            by_project['proj_a']['dedupe_fingerprint']
+            != by_project['proj_b']['dedupe_fingerprint']
+        )
+        for project_id, verdict in (('proj_a', first_a), ('proj_b', first_b)):
+            assert verdict.escalation_path is not None
+            record = by_project[project_id]
+            assert Path(verdict.escalation_path).stem == record['id']
+            assert record['dedupe_count'] == 0
+            assert project_id in record['id']
+
+        clock['now'] += 901.0
+        second_a = await policy.check('proj_a', project_root=str(shared_root))
+        second_b = await policy.check('proj_b', project_root=str(shared_root))
+
+        pending = _pending_records(esc_dir)
+        assert len(pending) == 2, sorted(pending)
+        by_project = {body['project_id']: body for body in pending.values()}
+        assert by_project['proj_a']['dedupe_count'] == 1
+        assert by_project['proj_b']['dedupe_count'] == 1
+        assert second_a.escalation_path == first_a.escalation_path
+        assert second_b.escalation_path == first_b.escalation_path
+
+    @pytest.mark.asyncio
+    async def test_project_ids_differing_only_in_path_unsafe_characters_never_collide(
+        self, event_buffer, tmp_path,
+    ):
+        await _seed_buffered(event_buffer, 'team/a', n=12)
+        await _seed_buffered(event_buffer, 'team_a', n=12)
+        shared_root = tmp_path / 'shared_root'
+        shared_root.mkdir()
+        clock = {'now': 1_000_000.0}
+        policy = self._frozen_policy(event_buffer, clock)
+
+        slashed = await policy.check('team/a', project_root=str(shared_root))
+        underscored = await policy.check('team_a', project_root=str(shared_root))
+        assert slashed.escalation_path is not None
+        assert underscored.escalation_path is not None
+        assert slashed.escalation_path != underscored.escalation_path
+
+        esc_dir = shared_root / 'data' / 'escalations'
+        assert Path(slashed.escalation_path).parent == esc_dir
+        assert Path(underscored.escalation_path).parent == esc_dir
+
+        pending = _pending_records(esc_dir)
+        assert len(pending) == 2, sorted(pending)
+        assert {body['project_id'] for body in pending.values()} == {
+            'team/a', 'team_a',
+        }
 
 
 class TestPolicyKeyCoupling:
@@ -1670,7 +1751,7 @@ class TestDegradedFilingPaths:
         assert second_id != first_id
 
         esc_dir = project_root / 'data' / 'escalations'
-        pending = TestFoldIsolation._pending(esc_dir)
+        pending = _pending_records(esc_dir)
         assert list(pending) == [second_id], sorted(pending)
         # A NEW incident, counted from zero — not a child of the closed one.
         assert pending[second_id]['dedupe_count'] == 0

@@ -119,24 +119,30 @@ _POLICY_ID_PATTERN = r'[a-z0-9]+(?:-[a-z0-9]+)*'
 _TICKET_ID_RE = re.compile(_TICKET_ID_PATTERN)
 _POLICY_ID_RE = re.compile(_POLICY_ID_PATTERN)
 
-# The keyword probe.  Case-sensitive on purpose: the grammar D6 publishes is
-# lower-case, so `# DEBT: task 5601` is not a marker at all and must return
-# None rather than raise — otherwise every comment beginning with the word
-# DEBT becomes an instrument failure.
 _MARKER_KEYWORD_RE = re.compile(r'#\s*(?:debt|ratified):')
+"""The keyword probe.
 
-# One anchored form per INLINE_MARKER_FORMS entry, matched against the comment
-# from the keyword onward.  The trailing `$` is what rejects extra prose after
-# a disposition: a comment reading `debt: task 5601 (see also 5602)` is a note,
-# not a marker, and honouring its prefix would silently disposition an entry by
-# half a sentence.  That example omits the leading `#` every published form
-# carries, deliberately rather than by typo: the keyword probe above scans a
-# whole comment token and cannot tell a quoted marker from a real one, so
-# spelling the example in full would make this very line a malformed
-# disposition.
+Case-sensitive on purpose: the grammar D6 publishes is lower-case, so
+``# DEBT: task 5601`` is not a marker at all and must return None rather than
+raise — otherwise every comment beginning with the word DEBT becomes an
+instrument failure.
+
+The probe scans a whole comment token and cannot tell a quoted marker from a
+real one, which is why every example marker in this module sits in a docstring.
+``scripts/inline_suppressions.py`` reads COMMENT tokens only, so a marker quoted
+in a ``#`` comment anywhere in the tree is a permanent gate violation that no
+disposition can cover, while the same text inside a string token is invisible
+to it."""
+
 _DEBT_TASK_RE = re.compile(rf'^#\s*debt:\s*task\s+({_TASK_ID_PATTERN})\s*$')
 _DEBT_TICKET_RE = re.compile(rf'^#\s*debt:\s*ticket\s+({_TICKET_ID_PATTERN})\s*$')
 _RATIFIED_RE = re.compile(rf'^#\s*ratified:\s*({_POLICY_ID_PATTERN})\s*$')
+"""One anchored form per :data:`INLINE_MARKER_FORMS` entry, matched against the
+comment from the keyword onward.
+
+The trailing ``$`` is what rejects extra prose after a disposition: a comment
+reading ``# debt: task 5601 (see also 5602)`` is a note, not a marker, and
+honouring its prefix would silently disposition an entry by half a sentence."""
 
 INLINE_MARKER_FORMS: tuple[str, ...] = (
     '# debt: task <task id>',

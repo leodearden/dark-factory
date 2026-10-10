@@ -29,7 +29,7 @@ THE TWO MEASURED AUTO-CREATES (task 4319, re-measured at base 56fb6fec97)
   ``"pending_before": 0``, and exits 0.
 * ``fused_memory/backends/sqlite_task_backend.py::SqliteTaskBackend.get_tasks``
   auto-creates ``.taskmaster/tasks/tasks.db`` (see
-  ``sqlite_task_backend.py::SqliteTaskBackend._get_connection``, which opens the
+  ``sqlite_task_backend.py::SqliteTaskBackend._get_write_access``, which opens the
   file "creating parent directories") and returns ``{"tasks": []}`` for ANY
   ``project_root``, never raising. ``.taskmaster/`` is neither present in nor
   tracked by a worktree, so ``--project-root <worktree>`` yields an empty task
@@ -49,9 +49,10 @@ here has a second substrate, so neither can tear:
 * ``sqlite_task_backend.py::SqliteTaskBackend``'s five mutating methods
   (``set_task_status``, ``set_status_and_stamp_audit``, ``update_task``,
   ``add_dependency``, ``remove_dependency``) all enter via
-  ``async with self._write_lock(...), self._txn(...)``, and
-  ``sqlite_task_backend.py::SqliteTaskBackend._txn`` is ONE explicit
-  BEGIN/COMMIT with rollback-and-re-raise. ``update_task``'s three statements
+  ``async with self._write_unit(...)``, and
+  ``sqlite_task_backend.py::SqliteTaskBackend._write_unit`` is ONE
+  transaction that commits on exit and rolls back and re-raises on any
+  exception, cancellation included. ``update_task``'s three statements
   live inside that single transaction;
   ``sqlite_task_backend.py::SqliteTaskBackend.set_status_and_stamp_audit``
   states the property in its own docstring — status and both audit trails

@@ -169,7 +169,7 @@ tasks:
       kind: grep
       pattern: TERMINAL_STATUSES
       paths:
-      - orchestrator/src/orchestrator/merge_queue.py
+      - orchestrator/src/orchestrator/merge_lane/worker.py
       expect: present
   - name: parked-disposition-label-distinct-from-pruned
     binding: capability→producer - the PRD signal requires the outcome label distinguish
@@ -181,7 +181,7 @@ tasks:
       kind: grep
       pattern: skipped_parked
       paths:
-      - orchestrator/src/orchestrator/merge_queue.py
+      - orchestrator/src/orchestrator/merge_lane/worker.py
       expect: present
   - name: tally-key-pre-registered-or-the-label-is-swallowed
     binding: rejection-mechanism (observed hazard) - reconcile_landed_outbox does
@@ -195,7 +195,7 @@ tasks:
       kind: grep
       pattern: '''skipped_parked'':[[:space:]]*0'
       paths:
-      - orchestrator/src/orchestrator/merge_queue.py
+      - orchestrator/src/orchestrator/merge_lane/worker.py
       expect: present
   - name: dispatch-gate-bool-mapping-defaults-correctly
     binding: 'capability→producer (wired) - reconcile_landed_task returns ''disposition
@@ -266,7 +266,7 @@ tasks:
       kind: grep
       pattern: async def branch_work_landed
       paths:
-      - orchestrator/src/orchestrator/landing_evidence.py
+      - orchestrator/src/orchestrator/merge_lane/landing_evidence.py
       expect: present
   - name: landing-verdict-dataclass-does-not-collide
     binding: 'capability→producer - LandingEvidenceVerdict (frozen; accepted/evidence_sha/reason/probe)
@@ -280,7 +280,7 @@ tasks:
       kind: grep
       pattern: class LandingVerdict
       paths:
-      - orchestrator/src/orchestrator/landing_evidence.py
+      - orchestrator/src/orchestrator/merge_lane/landing_evidence.py
       expect: present
   - name: degenerate-branch-check-already-implemented
     binding: 'capability→producer (wired) - boundary row B6 needs no new algorithm:
@@ -294,7 +294,7 @@ tasks:
       kind: grep
       pattern: degenerate_branch
       paths:
-      - orchestrator/src/orchestrator/landing_evidence.py
+      - orchestrator/src/orchestrator/merge_lane/landing_evidence.py
       expect: present
   - name: patch-id-containment-helper-exists-and-is-reusable
     binding: 'capability→producer (wired; D2 anchors CORRECTED) - merge_queue.patch_content_contained
@@ -310,7 +310,7 @@ tasks:
       kind: grep
       pattern: patch_content_contained
       paths:
-      - orchestrator/src/orchestrator/landing_evidence.py
+      - orchestrator/src/orchestrator/merge_lane/landing_evidence.py
       expect: present
   - name: no-op-rejection-reason-in-the-closed-vocabulary
     binding: capability→producer - Contract invariant 2 plus the normative ordering
@@ -323,7 +323,7 @@ tasks:
       kind: grep
       pattern: no_op_landing
       paths:
-      - orchestrator/src/orchestrator/landing_evidence.py
+      - orchestrator/src/orchestrator/merge_lane/landing_evidence.py
       expect: present
   - name: reason-codes-must-be-registered-in-reason-explanations
     binding: 'rejection-mechanism (observed hazard) - format_unattributed_landing_detail
@@ -338,7 +338,7 @@ tasks:
       kind: grep
       pattern: '''no_attribution'''
       paths:
-      - orchestrator/src/orchestrator/landing_evidence.py
+      - orchestrator/src/orchestrator/merge_lane/landing_evidence.py
       expect: present
   - name: closed-reason-and-method-vocabularies-are-machine-checked
     binding: 'G7 contracts-machine-checked - the Contract''s ''reason: str  # closed
@@ -436,7 +436,7 @@ tasks:
       kind: grep
       pattern: def branch_work_landed\(
       paths:
-      - orchestrator/src/orchestrator/landing_evidence.py
+      - orchestrator/src/orchestrator/merge_lane/landing_evidence.py
       expect: present
   - name: dispatch-gate-ancestry-arm-repointed
     binding: 'capability→producer (wired) - grep:orchestrator/src/orchestrator/harness.py:11671
@@ -666,7 +666,7 @@ tasks:
       kind: grep
       pattern: async def branch_work_landed
       paths:
-      - orchestrator/src/orchestrator/landing_evidence.py
+      - orchestrator/src/orchestrator/merge_lane/landing_evidence.py
       expect: present
   - name: git-authority-tier-importable-upstream
     binding: 'capability→producer - producer:task-ζ upstream (DAG ζ→η). The static
@@ -691,7 +691,7 @@ tasks:
       kind: grep
       pattern: skipped_parked
       paths:
-      - orchestrator/src/orchestrator/merge_queue.py
+      - orchestrator/src/orchestrator/merge_lane/worker.py
       expect: present
   - name: live-claimancy-fold-usable-for-parked-statuses
     binding: 'producer-extent-short, resolved by an OUT-OF-BATCH dependency on task
@@ -1020,7 +1020,7 @@ tasks:
       kind: grep
       pattern: skipped_parked
       paths:
-      - orchestrator/src/orchestrator/merge_queue.py
+      - orchestrator/src/orchestrator/merge_lane/worker.py
       expect: present
   - name: b4-b6-reason-vocabulary-is-assertable
     binding: 'capability→producer - producer:task-δ upstream (transitively through

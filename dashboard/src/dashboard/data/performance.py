@@ -23,7 +23,7 @@ import aiosqlite
 from escalation.queue import iter_all_escalation_paths
 from shared.timestamps import parse_timestamp_or_warn
 
-from dashboard.data.datum import Datum, DatumState
+from dashboard.data.datum import Datum, DatumState, unknown_datum
 from dashboard.data.db import with_db
 from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import resolve_now, safe_gather_result
@@ -77,13 +77,20 @@ def _cutoff(days: int, *, now: datetime | None = None) -> str:
     return (resolve_now(now) - timedelta(days=days)).isoformat()
 
 
+# A cancel ends an attempt from outside (shutdown drain, operator cancel, takeover); the resumed attempt
+# records its own row, so no reading counts one. Values of orchestrator/src/orchestrator/workflow_types.py::WorkflowOutcome.
+_NOT_A_CANCEL = "outcome NOT IN ('cancelled', 'soft-cancelled')"
+
+
 async def _latest_completions(db: aiosqlite.Connection) -> dict[str, str]:
     """Return ``{project_id: MAX(completed_at)}`` for every project with a
-    recorded completion — the projects a card family tallies by default."""
+    recorded completion, a cancel not counting (see ``_NOT_A_CANCEL``) —
+    the projects a card family tallies by default."""
     rows = await db.execute_fetchall(
         'SELECT project_id, MAX(completed_at) '
         '  FROM task_results '
         " WHERE completed_at IS NOT NULL AND completed_at != '' "
+        f'   AND {_NOT_A_CANCEL} '
         ' GROUP BY project_id',
     )
     return {row[0]: row[1] for row in rows}
@@ -128,7 +135,8 @@ async def get_completion_paths(
 
     Returns {project_id: [{path: str, count: int, pct: float}, ...]} for each
     of *projects* (default: every project with a recorded completion).
-    Paths: one-pass, multi-pass, via-steward, via-interactive, blocked.
+    Paths: one-pass, multi-pass, via-steward, via-interactive, blocked; a
+    cancel outcome is no path and is not counted (see ``_NOT_A_CANCEL``).
     """
     escalations = _load_escalations(escalations_dir)
 
@@ -147,7 +155,8 @@ async def get_completion_paths(
             'SELECT project_id, task_id, outcome, review_cycles, '
             '       steward_invocations '
             '  FROM task_results '
-            ' WHERE project_id IN (SELECT value FROM json_each(?)) AND completed_at >= ? ',
+            ' WHERE project_id IN (SELECT value FROM json_each(?)) AND completed_at >= ? '
+            f'  AND {_NOT_A_CANCEL} ',
             since,
             projects,
         )
@@ -563,7 +572,8 @@ async def get_escalation_rates(
             db,
             'SELECT project_id, task_id, steward_invocations '
             '  FROM task_results '
-            ' WHERE project_id IN (SELECT value FROM json_each(?)) AND completed_at >= ? ',
+            ' WHERE project_id IN (SELECT value FROM json_each(?)) AND completed_at >= ? '
+            f'  AND {_NOT_A_CANCEL} ',
             since,
             projects,
         )
@@ -728,7 +738,7 @@ async def get_time_centiles(
 # table.  /api/v2/dashboard/performance is hit every 3s, so the per-DB
 # query is wrapped in a tiny self-invalidating cache keyed by
 # (project_id, days, max(completed_at)) — bucketing only changes when a new
-# task_results row arrives, so the key is deterministic.
+# counted (non-cancel) task_results row arrives, so the key is deterministic.
 
 _HISTORY_CACHE: dict[tuple, dict] = {}
 _HISTORY_CACHE_MAX = 64
@@ -738,9 +748,10 @@ async def _project_max_completed(
     db: aiosqlite.Connection,
     project_id: str,
 ) -> str:
-    """Return the most recent completed_at for *project_id* (empty string if none)."""
+    """Return the most recent completed_at for *project_id* (empty string if none),
+    a cancel not counting (see ``_NOT_A_CANCEL``), as ``_hour_bucketed_history`` counts none."""
     async with db.execute(
-        "SELECT MAX(completed_at) FROM task_results WHERE project_id = ?",
+        f'SELECT MAX(completed_at) FROM task_results WHERE project_id = ? AND {_NOT_A_CANCEL}',
         (project_id,),
     ) as cur:
         row = await cur.fetchone()
@@ -778,7 +789,7 @@ async def _hour_bucketed_history(
     # strftime appears only in the SELECT/ORDER BY, not the WHERE clause, so
     # it does not defeat the index either.
     rows = await db.execute_fetchall(
-        """
+        f"""
         SELECT strftime('%Y-%m-%dT%H:00', completed_at) AS bucket,
                duration_ms,
                outcome,
@@ -789,6 +800,7 @@ async def _hour_bucketed_history(
            AND completed_at >= ?
            AND completed_at IS NOT NULL
            AND completed_at != ''
+           AND {_NOT_A_CANCEL}
          ORDER BY bucket
         """,
         (project_id, _cutoff(days, now=now)),
@@ -849,7 +861,7 @@ async def _per_db_history(
 ) -> dict[str, list]:
     """Cached wrapper for ``_hour_bucketed_history`` keyed by max(completed_at).
 
-    The bucket layout only changes when a new task_results row arrives, so
+    The bucket layout only changes when a new counted task_results row arrives, so
     the cache is deterministic and self-invalidating. LRU-trim at
     ``_HISTORY_CACHE_MAX`` keeps memory bounded across many projects.
 
@@ -951,7 +963,7 @@ async def aggregate_performance_history(
         try:
             rows = await db.execute_fetchall(
                 'SELECT DISTINCT project_id FROM task_results '
-                'WHERE completed_at >= ?',
+                f'WHERE completed_at >= ? AND {_NOT_A_CANCEL}',
                 (since,),
             )
             pid_sets.append({r[0] for r in rows if r[0]})
@@ -1143,35 +1155,79 @@ def _cards_datum(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class PerformanceListing:
+    """Every listed project's cards Datum, and how far the listing itself can be trusted.
+
+    ``listed`` counts the listed projects — FRESH when every runs.db was read;
+    LOWER_BOUND when some could not be, since their projects are missing;
+    UNKNOWN when none could be. Project ids come from ``task_results``, not
+    from a runs.db's path, so an unread runs.db cannot be keyed under the
+    project it would have listed: only the listing can say it is short.
+    """
+
+    cards: Mapping[str, Datum[PerformanceCards]]
+    listed: Datum[int]
+
+
+def unread_listing(reason: str, *, days: int) -> PerformanceListing:
+    """A listing nothing could be read for: no cards, and an UNKNOWN count saying why."""
+    return PerformanceListing(cards={}, listed=unknown_datum(reason, _window_bound_seconds(days)))
+
+
+def _listing_datum(
+    read_count: int, db_count: int, project_count: int, served_at: datetime, days: int,
+) -> Datum[int]:
+    """How many projects are listed, and whether every runs.db was read to list them."""
+    bound = _window_bound_seconds(days)
+    unread = db_count - read_count
+    if read_count == 0:
+        return unknown_datum(f'no runs.db could be read ({unread} of {db_count})', bound)
+    if unread:
+        return Datum(
+            project_count, served_at, DatumState.LOWER_BOUND,
+            f'{unread} of {db_count} runs.db could not be read; their projects are not listed',
+            bound,
+        )
+    return Datum(project_count, served_at, DatumState.FRESH, None, bound)
+
+
 async def aggregate_performance_cards(
     dbs: list[aiosqlite.Connection | None],
     escalations_dirs: list[Path],
     *,
     days: int = 7,
     now: datetime | None = None,
-) -> dict[str, Datum[PerformanceCards]]:
+) -> PerformanceListing:
     """Each project's card block for the window ``[now - days, now]``, as one Datum.
 
     The projects are discovered once per DB, and each DB tallies only the
-    projects it holds (a runs.db whose own discovery query fails lists none;
-    ``with_db`` logs the failure). A project is served a value only when
-    every DB holding it tallied every family; otherwise it is UNKNOWN, and
-    the reason names the families. The value is the project's window tally;
-    ``as_of`` is its newest contributing event, its latest completion. So
-    "fresh" means the last completion lies inside the window, and an idle
-    project (completions ever, none in the window) is stale by the
-    envelope's own bound.
+    projects it holds. A runs.db that is absent, or whose own discovery query
+    fails (``with_db`` logs the failure), lists none and makes the listing's
+    count a LOWER_BOUND — UNKNOWN when no runs.db was read — so an unread
+    fleet never reads as one that completed nothing. A project is served a
+    value only when every DB holding it tallied every family; otherwise it is
+    UNKNOWN, and the reason names the families. The value is the project's
+    window tally; ``as_of`` is its newest contributing event, its latest
+    completion. So "fresh" means the last completion lies inside the window,
+    and an idle project (completions ever, none in the window) is stale by
+    the envelope's own bound.
     """
     served_at = resolve_now(now)
-    per_db = await asyncio.gather(*(with_db(db, _latest_completions, {}) for db in dbs))
-    latest = _latest_instants(per_db)
+    per_db = await asyncio.gather(*(with_db(db, _latest_completions, None) for db in dbs))
+    read = [found for found in per_db if found is not None]
+    latest = _latest_instants(read)
+    listed = _listing_datum(len(read), len(dbs), len(latest), served_at, days)
     if not latest:
-        return {}
+        return PerformanceListing(cards={}, listed=listed)
     readings = await _read_card_families(
         dbs, escalations_dirs, days=days, now=served_at,
-        projects_by_db=[frozenset(found) for found in per_db],
+        projects_by_db=[frozenset(found or {}) for found in per_db],
     )
-    return {
-        project_id: _cards_datum(project_id, readings, latest[project_id], served_at, days)
-        for project_id in sorted(latest)
-    }
+    return PerformanceListing(
+        cards={
+            project_id: _cards_datum(project_id, readings, latest[project_id], served_at, days)
+            for project_id in sorted(latest)
+        },
+        listed=listed,
+    )

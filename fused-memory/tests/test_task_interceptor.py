@@ -14,13 +14,18 @@ import pytest
 import pytest_asyncio
 from _fm_helpers import _init_git_repo, make_8df8_scenario
 from _fm_helpers import submit_and_resolve as _submit_and_resolve
+from shared.async_sqlite_base import CheckpointResult
 from shared.cli_invoke import AgentResult
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.sqlite_task_backend import _merge_metadata, _resolve_metadata_mode
 from fused_memory.backends.task_backend_errors import TaskmasterError
-from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
+from fused_memory.config.schema import (
+    CuratorConfig,
+    FusedMemoryConfig,
+    TaskmasterConfig,
+)
 from fused_memory.middleware import scope_violation_escalator as sve_mod
 from fused_memory.middleware.curator_escalator import CuratorEscalator
 from fused_memory.middleware.curator_zot_duplicate_sweep import DuplicateFinding
@@ -3711,6 +3716,53 @@ async def test_reopen_atomic_contract_persists_against_real_backend(
         await backend.close()
 
 
+@pytest.mark.asyncio
+async def test_found_on_main_recovery_done_clears_leaked_claimant(tmp_path, event_buffer):
+    """The orchestrator restart/recovery-DONE shape whose coverage was contested (task 3996):
+    a found_on_main done written with no claimant must clear the still-fresh claimant
+    through the atomic set_status_and_stamp_audit writer.
+    """
+    from datetime import UTC, datetime
+
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import TaskmasterConfig
+
+    project_root = str(tmp_path)
+    sha = _init_git_repo(tmp_path)
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await backend.start()
+    try:
+        await backend.add_task(project_root=project_root, title='T')
+        interceptor = TaskInterceptor(backend, None, event_buffer)
+        claim = await interceptor.set_task_status(
+            '1', 'in-progress', project_root,
+            claimant_run_id='run-r/sess-1/pid=7',
+            heartbeat_at=datetime.now(UTC).isoformat(),
+        )
+        assert 'error' not in claim, claim
+
+        result = await interceptor.set_task_status(
+            '1', 'done', project_root,
+            done_provenance={
+                'kind': 'found_on_main',
+                'commit': sha,
+                'note': 'recovered after orchestrator restart',
+            },
+        )
+        assert 'error' not in result, result
+    finally:
+        await backend.close()
+
+    fresh = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await fresh.start()
+    try:
+        task = await fresh.get_task('1', project_root=project_root)
+    finally:
+        await fresh.close()
+    assert task['claimant_run_id'] is None, task
+    assert task['metadata']['done_provenance']['kind'] == 'found_on_main'
+
+
 # ── Tests for the reopen-freshness gate (task 2674, PRD task alpha) ────────
 #
 # Closes Face B (re-derivation clobber, task-1175 shape): a legitimate
@@ -6592,6 +6644,82 @@ async def test_update_task_accepts_manifest_file(taskmaster, reconciler, event_b
     taskmaster.update_task.assert_called_once()
 
 
+# ── Curator startup self-check wiring (task 4448) ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_curator_schedules_startup_self_check(
+    taskmaster, reconciler, event_buffer, tmp_path,
+):
+    """The self-check is only worth having if something actually runs it.
+
+    Scheduled as a background task, alongside the backfill check, so a curator
+    construction is never delayed by a PATH lookup — and so a self-check that
+    somehow misbehaves cannot take add_task down with it.
+    """
+    cfg = FusedMemoryConfig()
+    cfg.taskmaster = TaskmasterConfig(project_root=str(tmp_path))
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, config=cfg)
+
+    self_check = AsyncMock(return_value=True)
+    with patch.object(TaskCurator, 'startup_self_check', new=self_check), \
+         patch.object(
+             type(interceptor), '_maybe_backfill_corpus', new=AsyncMock(return_value=None),
+         ):
+        curator = await interceptor._get_curator()
+        assert curator is not None
+        while interceptor._background_tasks:
+            await asyncio.gather(*list(interceptor._background_tasks))
+
+    self_check.assert_awaited_once()
+    await_args = self_check.await_args
+    assert await_args is not None
+    assert (await_args.kwargs.get('project_root') or await_args.args[-1]) == str(tmp_path)
+
+
+# ── Curator invocations ledger wiring (task 4718) ──────────────────────────
+
+
+def _config_without_curator_startup_tasks() -> FusedMemoryConfig:
+    """No taskmaster project_root, so ``_get_curator`` schedules no backfill or self-check."""
+    config = FusedMemoryConfig()
+    config.taskmaster = None
+    return config
+
+
+@pytest.mark.asyncio
+async def test_get_curator_forwards_the_borrowed_cost_store(
+    taskmaster, reconciler, event_buffer,
+):
+    gate = MagicMock()
+    store = MagicMock()
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer,
+        config=_config_without_curator_startup_tasks(), usage_gate=gate, cost_store=store,
+    )
+
+    with patch('fused_memory.middleware.task_interceptor.TaskCurator') as curator_cls:
+        assert await interceptor._get_curator() is curator_cls.return_value
+
+    kwargs = curator_cls.call_args.kwargs
+    assert kwargs['cost_store'] is store
+    assert kwargs['usage_gate'] is gate
+
+
+@pytest.mark.asyncio
+async def test_get_curator_forwards_no_cost_store_by_default(
+    taskmaster, reconciler, event_buffer,
+):
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=_config_without_curator_startup_tasks(),
+    )
+
+    with patch('fused_memory.middleware.task_interceptor.TaskCurator') as curator_cls:
+        await interceptor._get_curator()
+
+    assert curator_cls.call_args.kwargs['cost_store'] is None
+
+
 # ── Tests for background task retention (step-3) ───────────────────────────
 
 
@@ -6959,7 +7087,7 @@ async def test_set_task_status_holds_lock_across_read_and_write(
         await asyncio.sleep(0)
         return {'id': task_id, 'status': state['status'], 'title': 'T'}
 
-    async def set_task_status(task_id, status, project_root, tag=None):
+    async def set_task_status(task_id, status, project_root, tag=None, **_claimant_kwargs):
         call_log.append(f'{task_id}:{state["status"]}->{status}')
         # Yield between the read above and committing the new state so
         # the race window is widened.
@@ -7293,7 +7421,7 @@ async def test_main_wires_ticket_store_into_interceptor(
 
     Asserts:
     1. _build_ticket_store returns a TicketStore backed by data_dir/tickets.db.
-    2. The returned store's _db is connected (not None) — initialize() was called.
+    2. The returned store is open — initialize() was called.
     3. A TaskInterceptor built with ticket_store=store exposes it as _ticket_store.
     """
     from fused_memory.server.main import _build_ticket_store  # noqa: PLC0415
@@ -7306,7 +7434,7 @@ async def test_main_wires_ticket_store_into_interceptor(
     assert store._db_path == tmp_path / 'tickets.db', (
         f'Expected db path {tmp_path / "tickets.db"}, got {store._db_path}'
     )
-    assert store._db is not None, 'TicketStore._db should be connected after _build_ticket_store'
+    assert await store.checkpoint() != CheckpointResult.unavailable(), 'TicketStore should be open after _build_ticket_store'
 
     # Verify TaskInterceptor accepts and stores the ticket_store kwarg correctly.
     ti = TaskInterceptor(taskmaster, reconciler, event_buffer, ticket_store=store)
@@ -7951,8 +8079,7 @@ class TestSubmitTaskGuardrail:
         ticket_id = result.get('ticket', '')
         assert ticket_id.startswith('tkt_'), f'Expected tkt_-prefixed ticket, got: {result}'
 
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute(
             'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
             (ticket_id,),
@@ -8072,12 +8199,11 @@ class TestSubmitTaskGuardrail:
             f'Expected tkt_-prefixed ticket, got: {result}'
         )
 
-        # Direct _db access is intentional: we're pinning the storage-layer
+        # Direct connection access is intentional: we're pinning the storage-layer
         # serialisation contract, which has no public query path.  This mirrors
         # the pattern used by sibling tests in this class (e.g.
         # test_submit_task_advises_dark_factory_paths_in_wrong_project).
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute(
             'SELECT project_id, candidate_json FROM tickets WHERE ticket_id = ?',
             (result['ticket'],),
@@ -8158,8 +8284,7 @@ class TestSubmitTaskGuardrail:
         )
         assert result.get('suggested_project') == 'dark_factory'
 
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute('SELECT COUNT(*) FROM tickets')
         row = await cursor.fetchone()
         assert row[0] == 0, f'Expected 0 tickets (rejected), found {row[0]}'
@@ -8194,8 +8319,7 @@ class TestSubmitTaskGuardrail:
         ticket_id = result.get('ticket', '')
         assert ticket_id.startswith('tkt_'), f'Expected tkt_-prefixed ticket, got: {result}'
 
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute(
             'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
             (ticket_id,),
@@ -8302,8 +8426,7 @@ class TestSubmitTaskGuardrail:
             f'Field {field!r}: expected tkt_-prefixed ticket, got: {result}'
         )
 
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute(
             'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
             (ticket_id,),
@@ -8356,8 +8479,7 @@ class TestSubmitTaskGuardrail:
         )
 
         # Verify the row was persisted for the submitting project
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute(
             'SELECT project_id, candidate_json FROM tickets WHERE ticket_id = ?',
             (ticket_id,),
@@ -8413,8 +8535,7 @@ class TestSubmitTaskGuardrail:
         ticket_id = result.get('ticket', '')
         assert ticket_id.startswith('tkt_'), f'Expected tkt_-prefixed ticket, got: {result}'
 
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute(
             'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
             (ticket_id,),
@@ -8614,8 +8735,7 @@ async def _persisted_candidate_metadata(ticket_store, result):
     ticket_id = result.get('ticket', '')
     assert ticket_id.startswith('tkt_'), f'Expected tkt_-prefixed ticket: {result}'
 
-    db = ticket_store._db
-    assert db is not None
+    db = ticket_store._require_access().connection
     cursor = await db.execute(
         'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
         (ticket_id,),
@@ -8714,8 +8834,7 @@ class TestSubmitTaskGuardrailMultiProject:
         )
         assert result.get('suggested_project') == 'dark_factory'
 
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute('SELECT COUNT(*) FROM tickets')
         row = await cursor.fetchone()
         assert row[0] == 0, f'Expected 0 tickets (rejected), found {row[0]}'
@@ -8769,8 +8888,7 @@ class TestSubmitTaskGuardrailMultiProject:
         )
         assert result.get('suggested_project') == 'dark_factory'
 
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute('SELECT COUNT(*) FROM tickets')
         row = await cursor.fetchone()
         assert row[0] == 0, f'Expected 0 tickets (rejected), found {row[0]}'
@@ -8839,8 +8957,7 @@ class TestSubmitTaskCrossRepoDeliverable:
         ticket_id = result.get('ticket', '')
         assert ticket_id.startswith('tkt_'), f'Expected tkt_ ticket, got: {result}'
 
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute(
             'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
             (ticket_id,),
@@ -8902,8 +9019,7 @@ class TestSubmitTaskCrossRepoDeliverable:
         ticket_id = result.get('ticket', '')
         assert ticket_id.startswith('tkt_'), f'Expected tkt_ ticket, got: {result}'
 
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute(
             'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
             (ticket_id,),
@@ -8945,8 +9061,7 @@ class TestSubmitTaskCrossRepoDeliverable:
         assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
             f'Expected DarkFactoryPathScopeViolation, got: {result}'
         )
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute('SELECT COUNT(*) FROM tickets')
         row = await cursor.fetchone()
         assert row[0] == 0, f'Expected 0 tickets (rejected), found {row[0]}'
@@ -8990,8 +9105,7 @@ class TestSubmitTaskCrossRepoDeliverable:
             f'Expected DarkFactoryPathScopeViolation for unregistered filer, '
             f'got: {result}'
         )
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute('SELECT COUNT(*) FROM tickets')
         row = await cursor.fetchone()
         assert row[0] == 0, f'Expected 0 tickets (rejected), found {row[0]}'
@@ -9102,8 +9216,7 @@ class TestProseRightBoundarySignal:
             f'Expected the ticket to still be created, got: {result}'
         )
 
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute(
             'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
             (ticket_id,),
@@ -9160,8 +9273,7 @@ class TestProseRightBoundarySignal:
         ticket_id = result.get('ticket', '')
         assert ticket_id.startswith('tkt_'), f'Expected tkt_-prefixed ticket, got: {result}'
 
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute(
             'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
             (ticket_id,),
@@ -10074,8 +10186,7 @@ class TestPathGuardFallbackMetadataFiles:
         assert result.get('suggested_project') == 'dark_factory'
 
         # Ticket store must have zero rows (guard fires before persist)
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute('SELECT COUNT(*) FROM tickets')
         row = await cursor.fetchone()
         assert row[0] == 0, f'meta_key={meta_key!r}: expected 0 tickets in store, found {row[0]}'
@@ -11749,8 +11860,7 @@ class TestRoutingOverrideEndToEndAudit:
         ticket_id = result.get('ticket', '')
         assert ticket_id.startswith('tkt_'), f'expected a ticket, got: {result}'
 
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute(
             'SELECT candidate_json FROM tickets WHERE ticket_id = ?', (ticket_id,),
         )
@@ -12501,15 +12611,14 @@ async def test_journaled_write_emits_write_op_and_backend_op(
         await interceptor.update_task('1', '/project', prompt='tweak')
 
         # Verify the rows.
-        assert journal._db is not None
-        async with journal._db.execute(
+        async with journal._require_access().connection.execute(
             "SELECT id, operation FROM write_ops WHERE operation = 'update_task'",
         ) as cur:
             wo_rows = list(await cur.fetchall())
         assert len(wo_rows) == 1, wo_rows
         write_op_id = wo_rows[0][0]
 
-        async with journal._db.execute(
+        async with journal._require_access().connection.execute(
             'SELECT backend, success FROM backend_ops '
             "WHERE write_op_id = ? AND operation = 'update_task'",
             (write_op_id,),
@@ -12552,15 +12661,14 @@ async def test_journaled_write_logs_failure_row(
         with pytest.raises(TaskmasterError):
             await interceptor.update_task('1', '/project', prompt='x')
 
-        assert journal._db is not None
-        async with journal._db.execute(
+        async with journal._require_access().connection.execute(
             "SELECT COUNT(*) FROM write_ops WHERE operation = 'update_task'",
         ) as cur:
             row = await cur.fetchone()
             assert row is not None
             wo_count = row[0]
         assert wo_count == 1
-        async with journal._db.execute(
+        async with journal._require_access().connection.execute(
             "SELECT success, error FROM backend_ops WHERE operation = 'update_task'",
         ) as cur:
             bo_rows = list(await cur.fetchall())
@@ -12771,7 +12879,7 @@ async def test_client_op_id_failure_result_not_pinned(
 # Every non-done row keeps the literal and carries no `done_provenance_kind`
 # key, so no existing consumer changes meaning.
 #
-# Rows are read back through the PUBLIC readers. The `journal._db` sqlite
+# Rows are read back through the PUBLIC readers. The raw-connection sqlite
 # reads elsewhere in this file are the pattern to improve on, not to copy:
 # reaching a module's internals from a test is an interface smell.
 

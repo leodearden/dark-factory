@@ -34,13 +34,17 @@ from shared.cli_invoke import (
     _to_token_count,
     build_failure_message,
     classify_agent_failure,
+    classify_cap_kill,
     count_transcript_turns,
+    detect_transcript_model_id,
     invoke_claude_agent,
     invoke_with_cap_retry,
     is_timed_out_with_progress,
     is_zero_output_timeout,
     read_transcript_records,
+    transcript_model_id_for_session,
 )
+from shared.cost_store import CapReason
 from shared.invocation_outcome import classify_invocation
 from shared.testing import make_gate_mock
 from shared.testing_stdin import (
@@ -3310,6 +3314,27 @@ class TestSchemaToolNotDisallowed:
         assert 'StructuredOutput' not in captured_cmd
         assert '--json-schema' in captured_cmd
 
+    async def test_available_tools_is_forwarded_as_the_registry_filter(self, tmp_path):
+        captured_cmd = []
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec',
+                   side_effect=_capture_cmd_exec(captured_cmd)):
+            await invoke_claude_agent(
+                prompt='hi', system_prompt='sys', cwd=tmp_path,
+                available_tools=['Read', 'Grep', 'Glob'], output_schema=self._SCHEMA,
+            )
+        assert captured_cmd[captured_cmd.index('--tools') + 1] == 'Read,Grep,Glob'
+        assert '--json-schema' in captured_cmd
+
+    async def test_setting_sources_is_forwarded(self, tmp_path):
+        captured_cmd = []
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec',
+                   side_effect=_capture_cmd_exec(captured_cmd)):
+            await invoke_claude_agent(
+                prompt='hi', system_prompt='sys', cwd=tmp_path,
+                available_tools=['Read'], output_schema=self._SCHEMA, setting_sources=[],
+            )
+        assert captured_cmd[captured_cmd.index('--setting-sources') + 1] == ''
+
     async def test_wildcard_without_schema_is_preserved(self, tmp_path):
         """judge.py case: ['*'] with no output_schema must keep blocking all tools."""
         captured_cmd = []
@@ -3893,6 +3918,55 @@ class TestCpuGovernPrefix:
         assert 'DF_AGENT_CPU_GOVERN' not in env
 
 
+class TestClaudeBinaryResolution:
+    """Unit tests for claude_binary_spec() / resolve_claude_binary() in cli_invoke.
+
+    These exist because of the 2026-08-13→08-18 outage: ``build_claude_argv``
+    emitted the bare PATH name ``claude`` as argv[0], the fused-memory systemd
+    unit pinned no ``Environment=PATH=``, and the inherited user-manager PATH
+    lacked ``~/.local/bin`` — so every curator LLM call raised
+    ``FileNotFoundError`` for 80+ hours with no diagnostic naming the binary.
+    """
+
+    def test_spec_defaults_to_bare_claude_when_env_unset(self, monkeypatch):
+        """CLAUDE_BINARY unset → the historical bare name 'claude'."""
+        from shared.cli_invoke import claude_binary_spec
+        monkeypatch.delenv('CLAUDE_BINARY', raising=False)
+        assert claude_binary_spec() == 'claude'
+
+    def test_spec_returns_env_override(self, monkeypatch):
+        """CLAUDE_BINARY set → that value verbatim (the operator escape hatch)."""
+        from shared.cli_invoke import claude_binary_spec
+        monkeypatch.setenv('CLAUDE_BINARY', '/opt/claude/bin/claude')
+        assert claude_binary_spec() == '/opt/claude/bin/claude'
+
+    def test_spec_ignores_empty_env_value(self, monkeypatch):
+        """CLAUDE_BINARY='' is treated as unset, not as an empty argv[0]."""
+        from shared.cli_invoke import claude_binary_spec
+        monkeypatch.setenv('CLAUDE_BINARY', '')
+        assert claude_binary_spec() == 'claude'
+
+    def test_resolve_returns_absolute_path_for_real_executable(self, monkeypatch, tmp_path):
+        """CLAUDE_BINARY pointing at an executable file → its absolute path."""
+        from shared.cli_invoke import resolve_claude_binary
+        exec_file = tmp_path / 'claude'
+        exec_file.write_text('#!/bin/sh\nexit 0\n')
+        exec_file.chmod(0o755)
+        monkeypatch.setenv('CLAUDE_BINARY', str(exec_file))
+        assert resolve_claude_binary() == str(exec_file)
+
+    def test_resolve_returns_none_for_missing_path_without_raising(self, monkeypatch, tmp_path):
+        """An unresolvable spec yields None — never an exception.
+
+        Every spawn path (and several test suites that never run the CLI)
+        reaches this helper, so raising here would break callers that only
+        wanted to assemble an argv.
+        """
+        from shared.cli_invoke import resolve_claude_binary
+        monkeypatch.setenv('CLAUDE_BINARY', str(tmp_path / 'no-such-claude'))
+        assert resolve_claude_binary() is None
+
+
 # ── Transcript readers ────────────────────────────────────────────────────────
 
 
@@ -4152,7 +4226,7 @@ class TestRunSubprocessWatchdog:
     async def test_working_regime_survives_grace_killed_at_ceiling(self, tmp_path):
         """B6 long-synchronous-tool survival: ≥1 turn seen → no fast kill at grace, only ceiling.
 
-        A proc that has made progress (count_transcript_turns=5) must NOT be killed
+        A proc that has made progress (5 assistant turns on disk) must NOT be killed
         at the startup_grace_secs bound.  Liveness is proven (seen_turn=True); the
         working regime applies and only the absolute ceiling triggers the kill.
         Wall-clock must be >= ~0.25s (past the 0.05s grace) and result.transcript_turns==5.
@@ -4161,7 +4235,7 @@ class TestRunSubprocessWatchdog:
 
         sid = str(uuid.uuid4())
         cfg_dir = tmp_path / 'cfg'
-        cfg_dir.mkdir()
+        _write_model_transcript(cfg_dir, sid, [{'type': 'assistant'}] * 5)
 
         proc, _ = self._make_hanging_proc()
         terminate_pg_mock = AsyncMock()
@@ -4172,7 +4246,6 @@ class TestRunSubprocessWatchdog:
         with (
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
             patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
-            patch('shared.cli_invoke.count_transcript_turns', return_value=5),
         ):
             t0 = _time.monotonic()
             result = await _run_subprocess(
@@ -5574,3 +5647,563 @@ class TestMaterializeStdin:
         assert any(
             'read-only fd' in r.message for r in caplog.records
         ), f'narrowing was skipped silently; records={[r.message for r in caplog.records]}'
+
+
+# ── Exact model id from the transcript (task 4826) ──────────────────────────
+
+class TestDetectTranscriptModelId:
+    """``detect_transcript_model_id(records)`` — the pure model-id detector.
+
+    Answers "which model actually served this run?" from already-parsed
+    transcript records, so it is unit-testable with no filesystem and can be
+    called from the normal-exit seam that has already read them.
+    """
+
+    def test_reads_the_nested_message_model(self):
+        """The real CLI shape nests it under ``record['message']['model']``."""
+        records = [
+            {'type': 'user', 'message': {'role': 'user'}},
+            {'type': 'assistant', 'message': {'model': 'claude-opus-5'}},
+        ]
+        assert detect_transcript_model_id(records) == 'claude-opus-5'
+
+    def test_reads_the_flat_model(self):
+        """A flat ``record['model']`` is accepted too, mirroring _content_blocks."""
+        records = [{'type': 'assistant', 'model': 'claude-sonnet-5'}]
+        assert detect_transcript_model_id(records) == 'claude-sonnet-5'
+
+    def test_nested_wins_over_flat(self):
+        records = [
+            {
+                'type': 'assistant',
+                'model': 'claude-sonnet-5',
+                'message': {'model': 'claude-opus-5'},
+            },
+        ]
+        assert detect_transcript_model_id(records) == 'claude-opus-5'
+
+    def test_returns_the_last_of_several_differing_ids(self):
+        """A run that fails over or is downgraded mid-flight ends on the model
+        that actually produced the final output — that is the one to attribute."""
+        records = [
+            {'type': 'assistant', 'message': {'model': 'claude-opus-5'}},
+            {'type': 'user', 'message': {'role': 'user'}},
+            {'type': 'assistant', 'message': {'model': 'claude-sonnet-5'}},
+        ]
+        assert detect_transcript_model_id(records) == 'claude-sonnet-5'
+
+    def test_skips_the_synthetic_sentinel(self):
+        """``<synthetic>`` is not a model — the nearest real id is returned."""
+        records = [
+            {'type': 'assistant', 'message': {'model': 'claude-opus-5'}},
+            {'type': 'assistant', 'message': {'model': '<synthetic>'}},
+        ]
+        assert detect_transcript_model_id(records) == 'claude-opus-5'
+
+    def test_synthetic_only_returns_none(self):
+        """The observed stub-transcript shape: no real id was ever served."""
+        records = [
+            {'type': 'assistant', 'message': {'model': '<synthetic>'}},
+            {'type': 'assistant', 'message': {'model': '<synthetic>'}},
+        ]
+        assert detect_transcript_model_id(records) is None
+
+    def test_empty_records_return_none(self):
+        assert detect_transcript_model_id([]) is None
+
+    def test_no_assistant_records_return_none(self):
+        records = [
+            {'type': 'user', 'message': {'model': 'claude-opus-5'}},
+            {'type': 'system', 'model': 'claude-opus-5'},
+        ]
+        assert detect_transcript_model_id(records) is None
+
+    def test_non_dict_record_is_skipped_not_raised(self):
+        records = [
+            'not a dict',
+            None,
+            42,
+            {'type': 'assistant', 'message': {'model': 'claude-opus-5'}},
+        ]
+        assert detect_transcript_model_id(records) == 'claude-opus-5'
+
+    def test_non_string_and_empty_values_are_skipped(self):
+        records = [
+            {'type': 'assistant', 'message': {'model': 'claude-opus-5'}},
+            {'type': 'assistant', 'message': {'model': ''}},
+            {'type': 'assistant', 'message': {'model': 123}},
+            {'type': 'assistant', 'message': {'model': None}},
+        ]
+        assert detect_transcript_model_id(records) == 'claude-opus-5'
+
+    def test_assistant_record_without_a_model_is_skipped(self):
+        records = [
+            {'type': 'assistant', 'message': {'model': 'claude-opus-5'}},
+            {'type': 'assistant', 'message': {'role': 'assistant'}},
+            {'type': 'assistant'},
+        ]
+        assert detect_transcript_model_id(records) == 'claude-opus-5'
+
+
+class TestTranscriptModelIdForSession:
+    """``transcript_model_id_for_session(config_dir, session_id)`` — the wrapper.
+
+    Mirrors ``ended_awaiting_background_for_session``: delegate to
+    ``read_transcript_records``, fail safe to None, never raise.
+    """
+
+    def _write_transcript(self, base: Path, session_id: str, lines: list[str]) -> Path:
+        slug_dir = base / 'projects' / 'myproject'
+        slug_dir.mkdir(parents=True, exist_ok=True)
+        transcript = slug_dir / f'{session_id}.jsonl'
+        transcript.write_text('\n'.join(lines) + '\n')
+        return transcript
+
+    def test_finds_the_id_on_disk(self, tmp_path):
+        sid = 'sess-model-001'
+        self._write_transcript(
+            tmp_path,
+            sid,
+            [
+                json.dumps({'type': 'system', 'content': 'init'}),
+                json.dumps({'type': 'assistant', 'message': {'model': 'claude-opus-5'}}),
+            ],
+        )
+        assert transcript_model_id_for_session(tmp_path, sid) == 'claude-opus-5'
+
+    def test_absent_transcript_returns_none(self, tmp_path):
+        (tmp_path / 'projects' / 'myproject').mkdir(parents=True, exist_ok=True)
+        assert transcript_model_id_for_session(tmp_path, 'sess-absent') is None
+
+    def test_truncated_trailing_line_is_tolerated(self, tmp_path):
+        """A SIGKILL-truncated final line must not lose the id already recorded."""
+        sid = 'sess-model-002'
+        self._write_transcript(
+            tmp_path,
+            sid,
+            [
+                json.dumps({'type': 'assistant', 'message': {'model': 'claude-sonnet-5'}}),
+                '{"type": "assistant", "message": {"model": "claude-op',  # truncated
+            ],
+        )
+        assert transcript_model_id_for_session(tmp_path, sid) == 'claude-sonnet-5'
+
+    def test_transcript_with_no_model_returns_none(self, tmp_path):
+        sid = 'sess-model-003'
+        self._write_transcript(
+            tmp_path,
+            sid,
+            [json.dumps({'type': 'user', 'content': 'hi'})],
+        )
+        assert transcript_model_id_for_session(tmp_path, sid) is None
+
+
+# ── model_id threaded from transcript onto AgentResult (task 4826) ──────────
+
+
+def _write_model_transcript(config_dir: Path, session_id: str, records: list[dict]) -> None:
+    slug_dir = config_dir / 'projects' / 'slug-model'
+    slug_dir.mkdir(parents=True, exist_ok=True)
+    (slug_dir / f'{session_id}.jsonl').write_text(
+        '\n'.join(json.dumps(r) for r in records) + '\n'
+    )
+
+
+def _normal_exit_proc(stdout: bytes = _CLAUDE_VALID_JSON_STDOUT.encode()) -> MagicMock:
+    proc = MagicMock()
+    proc.communicate = AsyncMock(return_value=(stdout, b''))
+    proc.terminate = MagicMock()
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock()
+    proc.returncode = 0
+    proc.pid = 12345
+    return proc
+
+
+def _sigkill_proc() -> MagicMock:
+    proc = MagicMock()
+    proc.communicate = AsyncMock(side_effect=TimeoutError)
+    proc.terminate = MagicMock()
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock()
+    proc.returncode = None
+    proc.pid = 12345
+    return proc
+
+
+# Two assistant turns served by a real model, the second of which launches a
+# background Bash command that is never reaped — so ONE transcript yields all
+# three normal-exit signals at once: transcript_turns == 2,
+# ended_awaiting_background is True, model_id == 'claude-opus-5'.
+_MODEL_AND_ABANDONED_LAUNCH_RECORDS = [
+    {'type': 'user', 'message': {'role': 'user', 'content': 'go'}},
+    {
+        'type': 'assistant',
+        'message': {
+            'model': 'claude-opus-5',
+            'role': 'assistant',
+            'content': [{'type': 'text', 'text': 'kick off the long build'}],
+        },
+    },
+    {
+        'type': 'assistant',
+        'message': {
+            'model': 'claude-opus-5',
+            'role': 'assistant',
+            'content': [{
+                'type': 'tool_use',
+                'name': 'Bash',
+                'input': {'command': './long-build.sh', 'run_in_background': True},
+            }],
+        },
+    },
+]
+
+
+class TestModelIdFieldDefaults:
+    def test_subprocess_result_defaults_model_id_none(self):
+        r = _SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=10)
+        assert r.model_id is None
+
+    def test_agent_result_defaults_model_id_none(self):
+        r = AgentResult(success=True, output='ok')
+        assert r.model_id is None
+
+
+class TestParseClaudeOutputPropagatesModelId:
+    """``model_id`` reaches AgentResult on EVERY ``_parse_claude_output`` branch.
+
+    The empty-output branch matters most: a cap-killed or timed-out run
+    frequently lands there, and that is exactly the run whose served model a
+    saturation analysis needs to attribute.
+    """
+
+    @pytest.mark.parametrize(
+        'stdout,returncode,timed_out',
+        [
+            ('', -15, True),
+            ('not valid json', 1, False),
+            (_CLAUDE_VALID_JSON_STDOUT, 0, False),
+        ],
+        ids=['empty_stdout', 'json_decode_error', 'normal_parse'],
+    )
+    def test_model_id_propagates(self, stdout, returncode, timed_out):
+        sub = _SubprocessResult(
+            stdout=stdout, stderr='', returncode=returncode, duration_ms=100,
+            timed_out=timed_out, model_id='claude-sonnet-5',
+        )
+        assert _parse_claude_output(sub).model_id == 'claude-sonnet-5'
+
+    @pytest.mark.parametrize(
+        'stdout,returncode',
+        [('', 1), ('not valid json', 1), (_CLAUDE_VALID_JSON_STDOUT, 0)],
+        ids=['empty_stdout', 'json_decode_error', 'normal_parse'],
+    )
+    def test_model_id_defaults_to_none(self, stdout, returncode):
+        sub = _SubprocessResult(stdout=stdout, stderr='', returncode=returncode, duration_ms=100)
+        assert _parse_claude_output(sub).model_id is None
+
+    def test_model_id_is_not_the_caller_alias(self):
+        """The exact served id is carried verbatim; it is never back-filled
+        from the caller-supplied lineage alias the envelope knows nothing of."""
+        sub = _SubprocessResult(
+            stdout=_CLAUDE_VALID_JSON_STDOUT, stderr='', returncode=0, duration_ms=100,
+            model_id='claude-opus-5',
+        )
+        agent = _parse_claude_output(sub)
+        assert agent.model_id == 'claude-opus-5'
+        assert agent.model_id != 'opus'
+
+
+@pytest.mark.asyncio
+class TestRunSubprocessStampsModelId:
+    """``_run_subprocess`` derives ``model_id`` from the on-disk transcript.
+
+    The normal-exit read count is NOT asserted here: the single-read property
+    for this seam is owned by
+    ``test_cli_invoke_transcript_offloop.py::TestNormalExitReadOffLoop``.
+    """
+
+    async def test_normal_exit_stamps_model_id_alongside_existing_signals(self, tmp_path):
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        _write_model_transcript(cfg_dir, sid, _MODEL_AND_ABANDONED_LAUNCH_RECORDS)
+
+        with patch(
+            'shared.cli_invoke.asyncio.create_subprocess_exec',
+            AsyncMock(return_value=_normal_exit_proc()),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=5.0,
+                session_id=sid, config_dir=cfg_dir,
+            )
+
+        assert result.timed_out is False
+        assert result.model_id == 'claude-opus-5'
+        assert result.transcript_turns == 2
+        assert result.ended_awaiting_background is True
+
+    async def test_normal_exit_model_id_none_without_config_dir(self, tmp_path):
+        with patch(
+            'shared.cli_invoke.asyncio.create_subprocess_exec',
+            AsyncMock(return_value=_normal_exit_proc()),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=5.0,
+                session_id=str(uuid.uuid4()), config_dir=None,
+            )
+
+        assert result.model_id is None
+        assert result.transcript_turns is None
+        assert result.ended_awaiting_background is False
+
+    async def test_normal_exit_model_id_none_without_session_id(self, tmp_path):
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+        with patch(
+            'shared.cli_invoke.asyncio.create_subprocess_exec',
+            AsyncMock(return_value=_normal_exit_proc()),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=5.0,
+                session_id=None, config_dir=cfg_dir,
+            )
+
+        assert result.model_id is None
+        assert result.transcript_turns is None
+        assert result.ended_awaiting_background is False
+
+    async def test_normal_exit_model_id_none_when_transcript_missing(self, tmp_path):
+        cfg_dir = tmp_path / 'cfg'
+        (cfg_dir / 'projects' / 'slug-model').mkdir(parents=True)
+        with patch(
+            'shared.cli_invoke.asyncio.create_subprocess_exec',
+            AsyncMock(return_value=_normal_exit_proc()),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=5.0,
+                session_id=str(uuid.uuid4()), config_dir=cfg_dir,
+            )
+
+        assert result.model_id is None
+        assert result.transcript_turns is None
+        assert result.ended_awaiting_background is False
+
+    async def test_normal_exit_model_id_none_when_transcript_has_no_model(self, tmp_path):
+        """A transcript with turns but no model field leaves model_id None
+        while transcript_turns is still counted."""
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        _write_model_transcript(
+            cfg_dir, sid,
+            [{'type': 'assistant', 'content': 'turn 1'}, {'type': 'assistant', 'content': 'turn 2'}],
+        )
+        with patch(
+            'shared.cli_invoke.asyncio.create_subprocess_exec',
+            AsyncMock(return_value=_normal_exit_proc()),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=5.0,
+                session_id=sid, config_dir=cfg_dir,
+            )
+
+        assert result.model_id is None
+        assert result.transcript_turns == 2
+        assert result.ended_awaiting_background is False
+
+    async def test_timeout_path_stamps_model_id_without_disturbing_turns(self, tmp_path):
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        _write_model_transcript(
+            cfg_dir, sid,
+            [
+                {'type': 'system', 'content': 'init'},
+                {'type': 'assistant', 'message': {'model': 'claude-sonnet-5'}},
+                {'type': 'user', 'content': 'reply'},
+                {'type': 'assistant', 'message': {'model': 'claude-sonnet-5'}},
+                {'type': 'assistant', 'message': {'model': '<synthetic>'}},
+            ],
+        )
+
+        with (
+            patch(
+                'shared.cli_invoke.asyncio.create_subprocess_exec',
+                AsyncMock(return_value=_sigkill_proc()),
+            ),
+            patch('shared.cli_invoke.terminate_process_group', new_callable=AsyncMock),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=0.1,
+                session_id=sid, config_dir=cfg_dir,
+            )
+
+        assert result.timed_out is True
+        assert result.model_id == 'claude-sonnet-5'
+        assert result.transcript_turns == 3
+
+    async def test_timeout_path_model_id_none_without_session_id(self, tmp_path):
+        with (
+            patch(
+                'shared.cli_invoke.asyncio.create_subprocess_exec',
+                AsyncMock(return_value=_sigkill_proc()),
+            ),
+            patch('shared.cli_invoke.terminate_process_group', new_callable=AsyncMock),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=0.1,
+                session_id=None, config_dir=tmp_path,
+            )
+
+        assert result.timed_out is True
+        assert result.model_id is None
+        assert result.transcript_turns is None
+
+    async def test_model_id_survives_parse_on_timeout_path(self, tmp_path):
+        """End-to-end: a SIGKILLed run lands on the empty-output parse branch
+        and still carries the served model id to AgentResult."""
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        _write_model_transcript(
+            cfg_dir, sid, [{'type': 'assistant', 'message': {'model': 'claude-opus-5'}}],
+        )
+
+        with (
+            patch(
+                'shared.cli_invoke.asyncio.create_subprocess_exec',
+                AsyncMock(return_value=_sigkill_proc()),
+            ),
+            patch('shared.cli_invoke.terminate_process_group', new_callable=AsyncMock),
+        ):
+            sub = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=0.1,
+                session_id=sid, config_dir=cfg_dir,
+            )
+
+        agent = _parse_claude_output(sub)
+        assert agent.subtype == 'error_timeout_killed_with_progress'
+        assert agent.model_id == 'claude-opus-5'
+
+
+# ── classify_cap_kill: was this run ended by a configured ceiling? (task 4826) ─
+
+
+def _cap_result(**overrides: Any) -> AgentResult:
+    fields: dict[str, Any] = {'success': False, 'output': ''}
+    fields.update(overrides)
+    return AgentResult(**fields)
+
+
+class TestClassifyCapKill:
+    """``classify_cap_kill(result, *, budget_usd, max_turns, backend)`` names
+    which configured ceiling ended a run — ``'budget'`` | ``'turns'`` — or None.
+
+    The CLI subtype is authoritative; the numeric comparison is only a
+    fallback for a FAILED claude run whose subtype is inconclusive.
+    """
+
+    @pytest.mark.parametrize(
+        'subtype,expected',
+        [('error_max_budget_usd', CapReason.BUDGET), ('error_max_turns', CapReason.TURNS)],
+    )
+    def test_returns_the_cap_reason_vocabulary(self, subtype, expected):
+        reason = classify_cap_kill(_cap_result(subtype=subtype), budget_usd=5.0, max_turns=50)
+        assert reason is expected
+
+    @pytest.mark.parametrize('backend', ['codex', 'gemini', 'pi'])
+    def test_non_claude_failed_run_past_both_ceilings_is_not_a_cap_kill(self, backend):
+        """codex/gemini/pi enforce neither ceiling, so no ceiling ended a run of
+        theirs however far its (estimated) cost or turn count went past one."""
+        result = _cap_result(subtype='', cost_usd=9.0, turns=80)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50, backend=backend) is None
+
+    def test_claude_is_the_default_backend(self):
+        result = _cap_result(subtype='', cost_usd=9.0, turns=3)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == CapReason.BUDGET
+
+    def test_budget_subtype_is_budget(self):
+        result = _cap_result(subtype='error_max_budget_usd', cost_usd=5.01)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=100) == 'budget'
+
+    def test_turns_subtype_is_turns(self):
+        result = _cap_result(subtype='error_max_turns', turns=100)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=100) == 'turns'
+
+    def test_budget_subtype_holds_with_no_ceilings_known(self):
+        result = _cap_result(subtype='error_max_budget_usd')
+        assert classify_cap_kill(result, budget_usd=None, max_turns=None) == 'budget'
+
+    def test_turns_subtype_holds_with_no_ceilings_known(self):
+        result = _cap_result(subtype='error_max_turns')
+        assert classify_cap_kill(result, budget_usd=None, max_turns=None) == 'turns'
+
+    def test_budget_subtype_outranks_contradicting_arithmetic(self):
+        """Cost far under the budget and turns AT the turn ceiling: the
+        subtype still says budget, and the subtype wins."""
+        result = _cap_result(subtype='error_max_budget_usd', cost_usd=0.10, turns=50)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == 'budget'
+
+    def test_turns_subtype_outranks_contradicting_arithmetic(self):
+        """Cost OVER the budget, which the fallback would call 'budget': the
+        subtype says turns, and the subtype wins."""
+        result = _cap_result(subtype='error_max_turns', cost_usd=9.0, turns=3)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == 'turns'
+
+    def test_turns_subtype_counts_even_when_schema_salvaged(self):
+        """A schema-salvaged run is reported success=True, but the CLI still
+        ended it at the turn ceiling — the subtype is not gated on success."""
+        result = _cap_result(
+            success=True, subtype='error_max_turns', schema_salvaged=True, turns=50,
+        )
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == 'turns'
+
+    def test_successful_run_at_both_ceilings_is_not_a_cap_kill(self):
+        """The false-positive guard: a healthy run that spends its full budget
+        and uses every turn finished on its own terms."""
+        result = _cap_result(success=True, subtype='success', cost_usd=5.0, turns=50)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) is None
+
+    def test_successful_run_over_both_ceilings_is_not_a_cap_kill(self):
+        result = _cap_result(success=True, subtype='success', cost_usd=7.5, turns=80)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) is None
+
+    def test_plain_failure_under_ceilings_is_not_a_cap_kill(self):
+        result = _cap_result(subtype='error_during_execution', cost_usd=0.4, turns=3)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) is None
+
+    def test_failed_run_over_budget_with_inconclusive_subtype_is_budget(self):
+        result = _cap_result(subtype='error_during_execution', cost_usd=5.2, turns=3)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == 'budget'
+
+    def test_failed_run_over_turns_with_inconclusive_subtype_is_turns(self):
+        result = _cap_result(subtype='', cost_usd=0.4, turns=51)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == 'turns'
+
+    def test_budget_wins_when_both_fallbacks_fire(self):
+        """Documented precedence: when a failed run is over BOTH ceilings with
+        an inconclusive subtype, the budget ceiling is reported."""
+        result = _cap_result(subtype='error_during_execution', cost_usd=6.0, turns=60)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == 'budget'
+
+    def test_exact_budget_equality_is_a_hit(self):
+        result = _cap_result(subtype='error_during_execution', cost_usd=5.0, turns=3)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == 'budget'
+
+    def test_exact_turns_equality_is_a_hit(self):
+        result = _cap_result(subtype='error_during_execution', cost_usd=0.4, turns=50)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == 'turns'
+
+    def test_none_budget_disables_the_budget_fallback(self):
+        result = _cap_result(subtype='error_during_execution', cost_usd=1_000.0, turns=3)
+        assert classify_cap_kill(result, budget_usd=None, max_turns=50) is None
+
+    def test_none_budget_falls_through_to_the_turns_fallback(self):
+        result = _cap_result(subtype='error_during_execution', cost_usd=1_000.0, turns=50)
+        assert classify_cap_kill(result, budget_usd=None, max_turns=50) == 'turns'
+
+    def test_none_max_turns_disables_the_turns_fallback(self):
+        result = _cap_result(subtype='error_during_execution', cost_usd=0.4, turns=10_000)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=None) is None
+
+    def test_both_ceilings_none_never_raises(self):
+        result = _cap_result(subtype='error_during_execution', cost_usd=1_000.0, turns=10_000)
+        assert classify_cap_kill(result, budget_usd=None, max_turns=None) is None

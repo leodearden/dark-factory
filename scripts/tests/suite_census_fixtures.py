@@ -113,6 +113,8 @@ def pytest_project(root: Path) -> Path:
 
     Modules (dirs holding orchestrator.yaml): orchestrator, fused-memory, tests/scripts.
     ``tests/test_a.py`` exists under BOTH orchestrator and fused-memory.
+    The root pyproject.toml declares those two as workspace members, so the
+    Part 2 census (``workspace_domain``) can enumerate the tree.
 
     - archived junit, run S1 (orchestrator): TestX::test_p[1]/[2] pass 2.0/3.0,
       test_q@grp failure 0.5, test_e error 0.2, test_s skipped, and
@@ -126,6 +128,7 @@ def pytest_project(root: Path) -> Path:
       and the deleted tests/test_deleted.py::test_x.
     """
     git_tree(root, {
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["orchestrator", "fused-memory"]\n',
         "orchestrator/orchestrator.yaml": "",
         "orchestrator/tests/test_a.py": "def test_q():\n    pass\n",
         "fused-memory/orchestrator.yaml": "",

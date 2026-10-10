@@ -695,11 +695,31 @@ Implements C1. Extracts the real specimens from the archived transcripts into a 
 > unreachable by construction (instrumented: 1 execution before, 0 after). It is
 > documented in place and kept, because deleting it removes a recursion bound 4502
 > landed deliberately. **Task 5640** (filed as `tkt_0RTT9N05CHRSHN2MSCHNXX4A8D`).
+> Closed by task 5638 (5640 was a duplicate filing of the same work); see below.
 > Named here so both stay greppable instead of being rediscovered as
 > inconsistencies — by TASK id, because a `tkt_…` is a transient submit_task
 > receipt: the first of these two resolved to status `combined` ("already pending in
 > the pool"), so following it alone lands a reader on a dropped duplicate rather
 > than on the open work.
+>
+> *Collapsed 2026-10-08 (task 5638) — the alternative-boundary condition is a local
+> item-boundary test, and the depth-1 probe is gone.* In 5620's numbering, (iii) now
+> reads: reading the inner closer as this item's terminator leaves the parser at an
+> **item boundary** — only whitespace follows, or an item opener does. The parser and
+> the rule share one opening step and nothing re-parses, so no recursion bound is
+> needed. Not blank-only, because residual (2)'s short-circuit was measured REACHABLE,
+> not unreachable by construction: a canonical opener head whose quoted name runs
+> across the item's own closer opens an item right after an inner closer, unseen by
+> the opener mirror, and with a closing tag in the spanned sibling's value the
+> short-circuit fired and the tail was recovered. A blank-only condition would also
+> have newly recovered the sibling specimen whose spanned parse completes, with every
+> suite green. Both are now refused, pinned by the two `alternative_boundary` controls
+> in `TestQuotedReportIsRepairable`. The old *start* parameter's no-slice contract now
+> lives on `_at_item_boundary`'s position argument, because the probe was its only
+> caller. *Blast radius, re-measured at 5638:* the corpus stays **444/60** with no
+> record changing outcome; both `esc-3514` specimen pins stay green (escalation markup
+> suites 74 passed), as do the shared markup suites (539 passed, 1 skipped), the sweep
+> suite and the plan-tools markup suites (244 passed).
 >
 > *The invariant that did NOT move.* `clean_value` stays envelope-free, stated against
 > `detect_for`. That is C1's post-condition on the value the repairer **rewrote**, and

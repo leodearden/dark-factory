@@ -402,7 +402,9 @@ value.\
 # rather than pasted: only Stage 2 holds the FIX D escalate_blocker path.
 #
 # The companion mechanism is DISALLOW_ESCALATION_READS in cli_stage_runner.py,
-# which denies the escalation READ tools in every stage. This paragraph is not
+# which denies the escalation READ tools in every stage, with its write-side
+# counterpart DISALLOW_ESCALATION_WRITES denying the filing tools to Stage 1 and
+# Stage 3 (the stages handed the no-action clause below). This paragraph is not
 # decorative: `--disallowed-tools` OMITS a denied tool from the agent's listing
 # rather than rejecting the call, so without it the agent gets no explanation
 # for the missing tool and can conclude the escalation surface does not exist.
@@ -617,14 +619,13 @@ def render_escalation_boundary_note(*, can_escalate: bool) -> str:
     Stage 3 have no FIX D path and no other sanctioned escalation write, so
     they get the no-action variant.
 
-    This matters beyond tidiness: ``escalate_blocker`` is deliberately NOT in
-    any disallow list (see DISALLOW_ESCALATION_READS in cli_stage_runner.py,
-    which denies only the READ tools), so the tool really is callable from every
-    stage. Naming it in a stage's prompt is therefore a live positive license,
-    not inert prose — and Stage 3 declares itself read-only two lines earlier.
-    Never tell a stage about an action it is not sanctioned to take
-    (loud-over-silent), and never license a durable write from a read-only
-    stage.
+    The mechanism agrees (task 3250): ``escalate_blocker`` is denied to Stage 1
+    and Stage 3 by ``cli_stage_runner.py::DISALLOW_ESCALATION_WRITES`` and is
+    callable only in Stage 2. Because ``--disallowed-tools`` OMITS a denied tool
+    rather than rejecting the call, the no-action clause is the only explanation
+    a Stage 1/3 agent gets for the missing tool. Never tell a stage about an
+    action it is not sanctioned to take (loud-over-silent), and never license a
+    durable write from a read-only stage.
 
     Args:
         can_escalate: True for Stage 2, which holds the FIX D escalate_blocker

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -38,7 +38,7 @@ from dashboard.data.datum import (
 from dashboard.data.escalation_corpus import EscalationView
 from dashboard.data.mcp_fanout import project_label
 from dashboard.data.outcome_colors import assign_outcome_colors
-from dashboard.data.performance import PerformanceCards
+from dashboard.data.performance import PerformanceListing
 from dashboard.data.reconciliation import AgentActivity
 from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import resolve_now
@@ -184,6 +184,9 @@ def shape_memory(
     series; ``delta_24h`` carries per-project ``{graphiti_nodes,
     mem0_memories}`` snapshots from ~24h ago for delta rendering.  All three
     are populated from metrics.db; absent / empty when history is sparse.
+
+    graphiti/mem0 ``connected`` is served as ``get_status`` measured it, and
+    null when unmeasured: an absent flag, or fused-memory itself unreachable.
     """
     spark_g = (sparks or {}).get('graphiti_nodes') or _EMPTY_SERIES
     spark_m = (sparks or {}).get('mem0_memories') or _EMPTY_SERIES
@@ -200,10 +203,9 @@ def shape_memory(
 
     if status.get('offline'):
         return {'MEMORY_STATUS': {
-            'graphiti': {'connected': False, 'node_count': 0, 'edge_count': 0, 'episode_count': 0,
+            'graphiti': {'connected': None, 'node_count': 0, 'edge_count': 0, 'episode_count': 0,
                          'spark': _empty_series_dict()},
-            'mem0': {'connected': False, 'memory_count': 0, 'spark': _empty_series_dict()},
-            'taskmaster': {'connected': False},
+            'mem0': {'connected': None, 'memory_count': 0, 'spark': _empty_series_dict()},
             'queue': queue_block,
             'projects': {},
             'wal': _shape_wal_status(wal),
@@ -214,7 +216,7 @@ def shape_memory(
         }, 'served_at': served_at.isoformat()}
 
     graphiti = dict(status.get('graphiti') or {})
-    graphiti.setdefault('connected', True)
+    graphiti['connected'] = graphiti.get('connected')
     for _key in ('node_count', 'edge_count', 'episode_count'):
         graphiti.setdefault(_key, 0)
     graphiti['spark'] = {
@@ -222,15 +224,12 @@ def shape_memory(
         'values': list(spark_g.get('values') or []),
     }
     mem0 = dict(status.get('mem0') or {})
-    mem0.setdefault('connected', True)
+    mem0['connected'] = mem0.get('connected')
     mem0.setdefault('memory_count', 0)
     mem0['spark'] = {
         'labels': list(spark_m.get('labels') or []),
         'values': list(spark_m.get('values') or []),
     }
-    taskmaster = dict(status.get('taskmaster') or {})
-    taskmaster.setdefault('connected', True)
-
     raw_projects = dict(status.get('projects') or {})
     enriched_projects = {pid: _project_block(pid, payload) for pid, payload in raw_projects.items()}
 
@@ -239,7 +238,6 @@ def shape_memory(
     return {'MEMORY_STATUS': {
         'graphiti': graphiti,
         'mem0': mem0,
-        'taskmaster': taskmaster,
         'queue': queue_block,
         'projects': enriched_projects,
         'wal': wal_block,
@@ -351,30 +349,51 @@ def _shape_wal_status(
 # ---------------------------------------------------------------------------
 
 
-def shape_memory_graphs(ops: MemoryOps) -> dict[str, Any]:
-    """Return ``{MEMORY_OPS}``: one window's operations, both views.
+_MEMORY_OPS_SERIES_KEYS = ('labels', 'reads', 'writes', 'other', 'total', 'by_operation')
 
-    The hourly ``total`` series and the window ``totals`` are derived here
-    and nowhere else, so the client never re-counts: the reads/writes/other
-    caption and the donut's centre read the same served numbers, and
-    ``totals.total`` equals the ``by_operation`` sum by MemoryOps' invariant.
+
+def _memory_ops_series(ops: MemoryOps | None) -> dict[str, list]:
+    """The block's chart series; every one empty for an unmeasured window."""
+    if ops is None:
+        return {key: [] for key in _MEMORY_OPS_SERIES_KEYS}
+    return {
+        'labels': list(ops.labels),
+        'reads': list(ops.reads),
+        'writes': list(ops.writes),
+        'other': list(ops.other),
+        'total': [r + w + o for r, w, o in zip(ops.reads, ops.writes, ops.other, strict=True)],
+        'by_operation': [{'label': label, 'value': count} for label, count in ops.by_operation],
+    }
+
+
+def shape_memory_graphs(ops: Datum[MemoryOps], *, served_at: datetime) -> dict[str, Any]:
+    """Return ``{MEMORY_OPS, served_at}``: one window's operations, both views.
+
+    The hourly ``total`` series and the two readings, the window ``totals``
+    and the ``newest_hour_total``, are derived here and nowhere else, so the
+    client never re-counts: the reads/writes/other caption, the donut's centre
+    and the ops/min tile read the same served numbers, and ``totals.total``
+    equals the ``by_operation`` sum by MemoryOps' invariant. Both readings
+    carry *ops*'s provenance. An unmeasured window serves them ``unknown``
+    with every series empty, so no chart draws a flat zero line over a hole.
     """
-    reads, writes, other = sum(ops.reads), sum(ops.writes), sum(ops.other)
+    series = _memory_ops_series(ops.value)
+    if ops.value is None:
+        totals = newest_hour_total = None
+    else:
+        reads, writes, other = sum(series['reads']), sum(series['writes']), sum(series['other'])
+        totals = {'reads': reads, 'writes': writes, 'other': other, 'total': reads + writes + other}
+        newest_hour_total = series['total'][-1]
+
     return {
         'MEMORY_OPS': {
-            'labels': list(ops.labels),
-            'reads': list(ops.reads),
-            'writes': list(ops.writes),
-            'other': list(ops.other),
-            'total': [r + w + o for r, w, o in zip(ops.reads, ops.writes, ops.other, strict=True)],
-            'totals': {
-                'reads': reads, 'writes': writes, 'other': other,
-                'total': reads + writes + other,
-            },
-            'by_operation': [
-                {'label': label, 'value': count} for label, count in ops.by_operation
-            ],
+            **series,
+            'totals': _wire_served(replace(ops, value=totals), 'MEMORY_OPS totals', served_at),
+            'newest_hour_total': _wire_served(
+                replace(ops, value=newest_hour_total), 'MEMORY_OPS newest_hour_total', served_at,
+            ),
         },
+        'served_at': served_at.isoformat(),
     }
 
 
@@ -506,13 +525,15 @@ def shape_merge_queue(
     ``speculative``, ``active`` (the live probe's entries), ``in_queue``,
     ``live_probe_configured`` (false keeps the project out of the client's
     multi-project in-queue totals), ``active_spark``, ``halt``,
-    ``train_events``. ``in_queue`` and ``live_probe_configured`` are required:
-    the route resolves both for every project.
+    ``train_events``. ``in_queue``, ``speculative``, ``recent_total`` and
+    ``live_probe_configured`` are required: the route resolves them for every
+    project.
 
-    ``in_queue`` and every ``recent``/``active`` row's ``title`` are Datums the
-    route resolved, each aged to *served_at*, validated against it and
-    rendered to the wire. A field that is not a Datum, or a Datum that breaks
-    its contract there, is a wiring or shaper bug, and the
+    ``in_queue``, ``speculative``, ``recent_total`` and every
+    ``recent``/``active`` row's ``title`` are Datums the route resolved, each
+    aged to *served_at*, validated against it and rendered to the wire. A
+    field that is not a Datum, or a Datum that breaks its contract there, is
+    a wiring or shaper bug, and the
     :class:`~dashboard.data.datum.DatumContractError` propagates.
 
     ``active_sparks`` (optional) is ``in_queue``'s sampled history, keyed by
@@ -543,8 +564,8 @@ def shape_merge_queue(
             'outcomes': _shape_outcomes(data.get('outcomes')),
             'latency': dict(data.get('latency') or {}),
             'recent': _titled(data.get('recent'), f'{label}.recent'),
-            'recent_total': int(data.get('recent_total') or 0),
-            'speculative': dict(data.get('speculative') or {}),
+            'recent_total': _served(data.get('recent_total'), f'{label}.recent_total'),
+            'speculative': _served(data.get('speculative'), f'{label}.speculative'),
             'active': _titled(data.get('active'), f'{label}.active'),
             'in_queue': _served(data.get('in_queue'), f'{label}.in_queue'),
             'live_probe_configured': bool(data['live_probe_configured']),
@@ -860,21 +881,24 @@ def shape_escalation_analytics(
 
 def shape_performance(
     *,
-    cards: Mapping[str, Datum[PerformanceCards]],
+    listing: PerformanceListing,
     history: Mapping[str, Mapping[str, Any]] | None = None,
     served_at: datetime,
 ) -> dict[str, Any]:
     """Each project's cards Datum beside its hour-bucketed histories, as served at *served_at*.
 
     Output: ``{PERFORMANCE: {project_label: {cards, time_centiles_history,
-    one_pass_history, escalation_history}}, served_at}``, where ``cards`` is
-    the project's wire Datum from
+    one_pass_history, escalation_history}}, PERFORMANCE_LISTING, served_at}``,
+    where ``cards`` is the project's wire Datum from
     :func:`dashboard.data.performance.aggregate_performance_cards` and
     ``served_at`` is the instant every Datum was validated against — the one
     the client ages each ``as_of`` from.
 
-    ``cards`` is the listing authority: a project appears exactly when it has
-    a cards Datum, measured or UNKNOWN. ``history`` (optional) is
+    ``listing.cards`` decides which projects appear: exactly those with a
+    cards Datum, measured or UNKNOWN. ``PERFORMANCE_LISTING`` is
+    ``listing.listed``, aged, validated and wired: the authority on whether an
+    empty ``PERFORMANCE`` means no project completed anything or no runs.db
+    could be read. ``history`` (optional) is
     :func:`dashboard.data.performance.aggregate_performance_history`'s
     output; a project absent from it gets empty history blocks. A Datum that
     breaks its contract at *served_at* is a shaper bug, and the
@@ -884,7 +908,7 @@ def shape_performance(
     empty_pair = {'labels': [], 'values': []}
     empty_centiles = {'labels': [], 'p50': [], 'p95': []}
     out: dict[str, dict] = {}
-    for pid, datum in cards.items():
+    for pid, datum in listing.cards.items():
         validate_datum(datum, served_at)
         h = history.get(pid) or {}
         out[project_label(pid)] = {
@@ -893,7 +917,11 @@ def shape_performance(
             'one_pass_history': dict(h.get('one_pass_history') or empty_pair),
             'escalation_history': dict(h.get('escalation_history') or empty_pair),
         }
-    return {'PERFORMANCE': out, 'served_at': served_at.isoformat()}
+    return {
+        'PERFORMANCE': out,
+        'PERFORMANCE_LISTING': _wire_served(listing.listed, 'PERFORMANCE_LISTING', served_at),
+        'served_at': served_at.isoformat(),
+    }
 
 
 # ---------------------------------------------------------------------------

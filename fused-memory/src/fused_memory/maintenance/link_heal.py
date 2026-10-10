@@ -7,8 +7,8 @@ one home, here: :func:`_deterministic_row` holds rows 1-5, and
 imported from ``server/grouped_read.py`` and never respelled.
 
 A verdict reaches the table only as a :class:`LinkBasis`. The committed
-hand-link corpus is one source of them (:func:`load_corpus_bases`); other
-sources plug in by producing the same rows.
+hand-link corpus is one source of them (:func:`load_corpus_bases`); the link
+adjudicator is the other, and plugs in by producing the same rows.
 """
 
 from __future__ import annotations
@@ -61,6 +61,7 @@ MISFILE_VERDICTS = frozenset({Verdict.RELATED, Verdict.UNRELATED})
 BELONGS_VERDICTS = frozenset(
     {Verdict.SAME, Verdict.EXTENDS, Verdict.SUBSUMED, Verdict.CORRECTS},
 )
+AGREEING_VERDICTS = BELONGS_VERDICTS - {Verdict.CORRECTS}
 
 
 class KindClass(StrEnum):
@@ -111,6 +112,7 @@ class Report(StrEnum):
 
 class BasisSource(StrEnum):
     CORPUS = 'corpus'
+    ADJUDICATOR = 'adjudicator'
     DETERMINISTIC = 'deterministic'
     UNDO = 'undo'
 
@@ -240,20 +242,42 @@ class CorpusFormatError(ValueError):
 _SHA256_HEX = re.compile(r'[0-9a-f]{64}')
 
 
-def load_corpus_bases(path: Path) -> tuple[LinkBasis, ...]:
+@dataclass(frozen=True)
+class CorpusRow:
+    """One hand-link corpus row: the basis it supports, and the kind its link showed when rated."""
+
+    basis: LinkBasis
+    kind_at_rating: str | None
+
+
+def load_corpus_rows(path: Path) -> tuple[CorpusRow, ...]:
     """Every row of the committed hand-link corpus, parsed strictly."""
-    bases: list[LinkBasis] = []
+    rows: list[CorpusRow] = []
     seen: set[tuple[str, str, str]] = set()
     for line_no, line in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
         if not line.strip():
             continue
-        basis = _corpus_basis(_corpus_row(line, line_no), line_no)
+        row = _corpus_entry(_corpus_row(line, line_no), line_no)
+        basis = row.basis
         link = (basis.project_id, basis.child_id, basis.parent_id)
         if link in seen:
             raise CorpusFormatError(f'{basis.key}: duplicate link {link}')
         seen.add(link)
-        bases.append(basis)
-    return tuple(bases)
+        rows.append(row)
+    return tuple(rows)
+
+
+def load_corpus_bases(path: Path) -> tuple[LinkBasis, ...]:
+    """The basis of every row of the committed hand-link corpus."""
+    return tuple(row.basis for row in load_corpus_rows(path))
+
+
+def _corpus_entry(row: dict[str, Any], line_no: int) -> CorpusRow:
+    basis = _corpus_basis(row, line_no)
+    kind = row.get('kind_at_rating')
+    if kind is not None and not isinstance(kind, str):
+        raise CorpusFormatError(f'{basis.key}: kind_at_rating is neither a string nor null')
+    return CorpusRow(basis=basis, kind_at_rating=kind)
 
 
 def _corpus_row(line: str, line_no: int) -> dict[str, Any]:
@@ -351,6 +375,11 @@ def decide(state: LinkState, basis: LinkBasis | None) -> Decision:
     return Decision(outcome, basis.source if isinstance(outcome, HealAction) else None)
 
 
+def needs_verdict(state: LinkState) -> bool:
+    """The link reaches the verdict rows: no deterministic row decides it."""
+    return decide(state, None).outcome is Report.UNEXAMINED
+
+
 def is_stale(state: LinkState, basis: LinkBasis) -> bool:
     """The verdict no longer judges the texts the link shows now."""
     if not basis.rated_text_matches_live:
@@ -378,7 +407,21 @@ def _verdict_row(state: LinkState, verdict: Verdict) -> HealAction | Report:
     kind = kind_class(state.link.kind)
     if kind is KindClass.HALF_LINK and state.has_children and verdict in BELONGS_VERDICTS:
         return Report.HAS_CHILDREN
+    return verdict_outcome(kind, verdict)
+
+
+def verdict_outcome(kind: KindClass, verdict: Verdict) -> HealAction | Report:
+    """The verdict rows' outcome for a childless link of class *kind*."""
     return _VERDICT_TABLE[(kind, verdict)]
+
+
+def healed_kind(kind: str | None, verdict: Verdict) -> str | None:
+    """The ``kind`` a childless link shows once the heal *verdict* earns has been written;
+    ``None`` is a link with no ``kind``, before or after."""
+    outcome = verdict_outcome(kind_class(kind), verdict)
+    if not isinstance(outcome, HealAction):
+        return kind
+    return post_image_for(outcome, LinkImage(parent_id=None, kind=kind)).kind
 
 
 def _every_kind(verdicts: Iterable[Verdict], outcome: HealAction | Report):
@@ -544,12 +587,17 @@ class RunCounts:
     ``examined`` counts the live links that were read and decided.
     ``adjudicated`` counts the examined links whose basis still judges the texts they show.
     ``unexamined`` counts the examined links that reached the verdict rows with no basis.
+    ``adjudications_reused`` counts the adjudicator verdicts already ledgered at the
+    texts a link shows; ``adjudication_failed`` the links the adjudicator was asked
+    about and gave no verdict.
     """
 
     links_total: int = 0
     examined: int = 0
     adjudicated: int = 0
     unexamined: int = 0
+    adjudications_reused: int = 0
+    adjudication_failed: int = 0
     planned: int = 0
     planned_by_action: Mapping[str, int] = field(default_factory=dict)
     already_pending: int = 0
@@ -587,7 +635,13 @@ class RunCounts:
 
     @property
     def complete(self) -> bool:
-        partial = (self.read_failed, self.failed, self.skipped_cap, self.not_attempted)
+        partial = (
+            self.read_failed,
+            self.failed,
+            self.skipped_cap,
+            self.not_attempted,
+            self.adjudication_failed,
+        )
         return not any(partial) and self.stopped_by is None
 
     def as_json(self) -> dict[str, Any]:
@@ -646,6 +700,42 @@ async def _presence_elsewhere(
     return ParentPresence.ABSENT
 
 
+@dataclass(frozen=True)
+class LinkReads:
+    """Every live link of some projects as read just now, and the ``(project, child)``
+    links whose read failed."""
+
+    states: tuple[LinkState, ...]
+    unread: tuple[tuple[str, str], ...]
+
+
+async def read_links(
+    store: LinkHealStore, census: LinkCensus, projects: Sequence[str],
+) -> LinkReads:
+    states: list[LinkState] = []
+    unread: list[tuple[str, str]] = []
+    for project_id in projects:
+        for child_id in await census.linked_ids(project_id):
+            try:
+                state = await read_link_state(store, project_id, child_id, projects)
+            except StoreReadFailed:
+                unread.append((project_id, child_id))
+                continue
+            if state is not None:
+                states.append(state)
+    return LinkReads(states=tuple(states), unread=tuple(unread))
+
+
+def plan_links(reads: LinkReads, bases: Iterable[LinkBasis]) -> Plan:
+    """Decide every link of *reads* against *bases*."""
+    tally = _PlanTally(bases)
+    for project_id, child_id in reads.unread:
+        tally.record_read_failure(project_id, child_id)
+    for state in reads.states:
+        tally.record(state)
+    return tally.plan()
+
+
 async def build_plan(
     bases: Iterable[LinkBasis],
     *,
@@ -654,17 +744,7 @@ async def build_plan(
     projects: Sequence[str],
 ) -> Plan:
     """Decide every live link of *projects* against *bases*. Writes nothing."""
-    tally = _PlanTally(bases)
-    for project_id in projects:
-        for child_id in await census.linked_ids(project_id):
-            try:
-                state = await read_link_state(store, project_id, child_id, projects)
-            except StoreReadFailed:
-                tally.record_read_failure(project_id, child_id)
-                continue
-            if state is not None:
-                tally.record(state)
-    return tally.plan()
+    return plan_links(await read_links(store, census, projects), bases)
 
 
 def _link_key(project_id: str, child_id: str, parent_id: str | None) -> tuple[str, str, str | None]:
@@ -672,7 +752,7 @@ def _link_key(project_id: str, child_id: str, parent_id: str | None) -> tuple[st
 
 
 class _PlanTally:
-    """What :func:`build_plan` has seen so far. Each :class:`Report` is
+    """What :func:`plan_links` has seen so far. Each :class:`Report` is
     disclosed by the :class:`RunCounts` counter its value names."""
 
     def __init__(self, bases: Iterable[LinkBasis]) -> None:

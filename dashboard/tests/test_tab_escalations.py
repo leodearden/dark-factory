@@ -638,14 +638,14 @@ def test_tab_escalations_renders_skipped_queue_files(tab_escalations_jsx_body: s
         'tab_escalations.jsx never reads `skipped_count` — add a global pill beside the '
         'existing `N pending · N L1 · N L2` summary pills.'
     )
-    # Anchored on the `byLevel[2]` identifier (the global pills; the subsection
-    # pips read `secByLevel[2]`, which does not match) and bounded at the next
-    # structural landmark — the subsection map — rather than by a character
-    # count.  The stated contract is "in the controls header, after the
-    # pending/L1/L2 pills and before the subsection groups", which survives a
-    # reformat or a label change; `'L1 · {byLevel[2]'` pinned exact whitespace
-    # and an interpunct.
-    pills_at = body.find('byLevel[2]')
+    # Anchored on the `levelCount(DF, 2)` call (the global L2 pill; the
+    # subsection pips read `secByLevel[2]`, which does not match) and bounded at
+    # the next structural landmark — the subsection map — rather than by a
+    # character count.  The stated contract is "in the controls header, after
+    # the pending/L1/L2 pills and before the subsection groups", which survives
+    # a reformat or a label change; pinning the pill's surrounding text would
+    # pin exact whitespace and an interpunct.
+    pills_at = body.find('levelCount(DF, 2)')
     assert pills_at != -1, 'could not locate the global summary-pill span'
     pills_end = body.find('subsections.map(', pills_at)
     pills_window = body[pills_at:pills_end if pills_end != -1 else len(body)]

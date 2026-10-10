@@ -434,21 +434,20 @@ directly, not just interactive agents.
   instead of halting the queue, and no operator rescue is needed for this
   case. If the grace still expires, that one merge is blocked per-task (see
   `park_lock_contended` in `OPERATIONS.md`) — the queue keeps running.
-- Do not direct-commit to main while a merge verify is **in flight**;
-  queued-only is fine (`depth` counts queued entries, not work). Moving main
-  under a solo merge forces a full re-verify however disjoint the files:
+- A direct-to-main commit may land while a merge verify is in flight; it
+  costs that merge one full re-verify, about what the same change would pay
+  going through the merge queue (INV-1 runs the full gate on a docs-only
+  merge). However disjoint the files, the re-verify is forced:
   `orchestrator/src/orchestrator/merge_lane/gates.py::_disjoint_skip_blockers`
   refuses the disjoint skip here on two counts — this project's
   `merge_verify_breadth: "full"` (a whole-tree gate), and drift the queue did
-  not itself land green (commit `fa95988c8e`). Under a train the price is the
-  same: the train re-verifies its rebased tip, then lands (task 5070). Commit when
-  `get_merge_queue` shows `verify_in_progress` null and
-  `occupancy.inflight_total` 0. It does not show a train's verify (task
-  5245), so also check `data/orchestrator/runs.db` for a `train_started` in the
-  last ~2h with no `train_merged`/`train_derailed` for that `train_id` (a
-  heuristic: restart-orphaned trains leave rows that never close). On a busy
-  lane, sending the docs change through the merge queue costs a verify slot
-  but interrupts nothing.
+  not itself land green (commit `fa95988c8e`). A train pays the same price:
+  it re-verifies its rebased tip, then lands (task 5070), so a moved main no
+  longer derails a train. Batch direct commits rather than landing a burst:
+  each one restarts the in-flight merge's re-verify, and more than
+  `MAX_CAS_RETRIES` (5) in one flight blocks that merge. What the lane must
+  never do is jam tasks in a hard-to-notice way; one extra verify is
+  acceptable.
 - **Never** run `git stash` in **any** dark-factory checkout — `project_root`
   or a `.worktrees/<id>` task worktree. `refs/stash` is a single ref in the
   shared `.git` dir and is *not* per-worktree, so every checkout pushes onto

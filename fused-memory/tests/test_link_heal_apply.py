@@ -424,7 +424,10 @@ class TestTheCapDrainsOldestFirst:
         assert report.counts.complete is True
 
 
-BACKLOG_LIMITS = RunLimits(max_actions_per_run=25, backlog_multiplier=1, write_failure_streak=3)
+BACKLOG_LIMITS = RunLimits(
+    max_actions_per_run=25, backlog_multiplier=1, write_failure_streak=3,
+    misfile_share_ceiling=0.25, corrects_share_ceiling=0.60,
+)
 
 
 class TestTheBacklogEscape:
@@ -472,7 +475,10 @@ class TestTheBacklogEscape:
         assert second.counts.escaped == ({'anchor': BACKLOG_ANCHOR, 'escalation_id': record.id},)
 
 
-STREAK_LIMITS = RunLimits(max_actions_per_run=25, backlog_multiplier=5, write_failure_streak=3)
+STREAK_LIMITS = RunLimits(
+    max_actions_per_run=25, backlog_multiplier=5, write_failure_streak=3,
+    misfile_share_ceiling=0.25, corrects_share_ceiling=0.60,
+)
 
 
 class TestTheWriteFailureStreak:
@@ -528,7 +534,10 @@ class TestTheWriteFailureStreak:
         return await plan_then_apply(
             harness, ledger, tmp_path, *seed_sightings(harness, len(pattern)),
             between=self._sabotage(harness, pattern),
-            limits=RunLimits(max_actions_per_run=25, backlog_multiplier=5, write_failure_streak=2),
+            limits=RunLimits(
+                max_actions_per_run=25, backlog_multiplier=5, write_failure_streak=2,
+                misfile_share_ceiling=0.25, corrects_share_ceiling=0.60,
+            ),
         )
 
     @pytest.mark.asyncio

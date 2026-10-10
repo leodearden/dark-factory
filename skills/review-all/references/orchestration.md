@@ -37,8 +37,8 @@ const ARGS_SCHEMA = {
       properties: {
         seat: { type: 'string', description: '<area>/<slice-slug>, or <area> when the area is one slice' },
         area: { type: 'string' },
-        read_fully: { type: 'array', items: { type: 'object', required: ['path', 'lines', 'prose_share', 'cognitive_max', 'cognitive_total', 'fan_in', 'fan_out', 'reach_back_imports', 'reexports', 'patch_targets'],
-          properties: { path: { type: 'string' }, lines: { type: 'integer' }, prose_share: { type: 'number' }, cognitive_max: { type: 'integer' }, cognitive_total: { type: 'integer' }, fan_in: { type: 'integer' }, fan_out: { type: 'integer' }, reach_back_imports: { type: 'integer' }, reexports: { type: 'integer' }, patch_targets: { type: 'integer' } } } },
+        read_fully: { type: 'array', description: "each entry's numbers come from the snapshot's file record for its path: prose_share = prose_ratio (0 where that is null, a 0-line file); fan_in = fan_in_src; reexports = len(reexport_names); patch_targets = the count of distinct private_patch_targets, across tests records, that continue this record's module; the rest are the record's own fields", items: { type: 'object', required: ['path', 'lines', 'prose_share', 'cognitive_max', 'cognitive_total', 'fan_in', 'fan_out', 'reach_back_imports', 'cycle_closing_imports', 'reexports', 'patch_targets'],
+          properties: { path: { type: 'string' }, lines: { type: 'integer' }, prose_share: { type: 'number' }, cognitive_max: { type: 'integer' }, cognitive_total: { type: 'integer' }, fan_in: { type: 'integer' }, fan_out: { type: 'integer' }, reach_back_imports: { type: 'integer' }, cycle_closing_imports: { type: 'integer' }, reexports: { type: 'integer' }, patch_targets: { type: 'integer' } } } },
         index_only: { type: 'array', items: { type: 'string' } },
         tests_reaching_internals: { type: 'array', items: { type: 'object', required: ['test_path', 'targets'], properties: { test_path: { type: 'string' }, targets: { type: 'array', items: { type: 'string' } } } } },
         size_alarms: { type: 'array', items: { type: 'string' }, description: 'files over ceilings.alarm_lines; heuristic-14 protocol is mandatory for each' },
@@ -50,15 +50,15 @@ const ARGS_SCHEMA = {
       } } },
     cross: { type: 'array', items: { type: 'object', required: ['lens', 'tag', 'title', 'question'],
       properties: { lens: { type: 'string' }, tag: { type: 'string' }, title: { type: 'string' }, question: { type: 'string' } } } },
-    metrics_summary: { type: 'string', description: 'whole-repo Phase 1 snapshot rendered as ≤4k chars of tables' },
+    metrics_summary: { type: 'string', description: '`scripts/quality_metrics_snapshot.py --summary` plus its `--diff` sections, ≤4k chars' },
     quality_guidance: { type: ['string', 'null'], description: "null when <root>/docs/code-quality.md exists (prompts say Read it); otherwise the render of orchestrator/src/orchestrator/agents/code_quality.py::guidance, embedded verbatim (contract §10)" },
-    import_graph_path: { type: 'string', description: 'JSON file under scratch: {edges:[[from,to]], reach_back:[...], deferred:[...], cycles:[[...]]}' },
+    import_graph_path: { type: 'string', description: "JSON file under scratch: the snapshot's import_graph section unchanged — {edges:[[from,to]], reach_back:[{from,to,names,line}], deferred:[{from,line,imports,closes_cycle}], cycles:[[module,...]], hidden_cycles:[[module,...]], typing_cycles:[[module,...]]}, nodes are module import names (a file record's `module`); cycles are over import-time edges, hidden_cycles add function-local imports, typing_cycles add `if TYPE_CHECKING:` ones, and closes_cycle marks a deferred import lying on a hidden cycle (plans/quality-metrics-snapshot-prd.md decision 10)" },
     prior: { type: 'object', required: ['open', 'standing'], properties: {
       open: { type: 'array', items: { type: 'object', required: ['canonical', 'key', 'area', 'statement', 'severity', 'source_run', 'disposition'] } },
       standing: { type: 'array', items: { type: 'object', required: ['canonical', 'key', 'area', 'statement', 'disposition'] } } } },
     routing: { type: 'object', required: ['area', 'skeptic', 'cross', 'synthesis', 'critic'],
       additionalProperties: { type: 'object', required: ['model', 'effort'], properties: { model: { type: 'string' }, effort: { type: 'string' } } } },
-    ceilings: { type: 'object', required: ['soft_lines', 'alarm_lines', 'max_findings_per_seat'],
+    ceilings: { type: 'object', required: ['soft_lines', 'alarm_lines', 'max_findings_per_seat'], description: "soft_lines and alarm_lines come from the snapshot's params (h14_soft_ceiling_lines, h14_alarm_lines)",
       properties: { soft_lines: { type: 'integer' }, alarm_lines: { type: 'integer' }, max_findings_per_seat: { type: 'integer' } } },
   },
 }
@@ -69,7 +69,7 @@ Default `cross` lenses (an overlay may add, never remove):
 | lens | tag | question |
 |---|---|---|
 | `spot` | `h11` | Which facts, definitions and policies live in more than one module with no derivation edge between the copies, so they can disagree? Map onto INV-5/INV-9 where one applies. |
-| `layering` | `h9` | Which modules import upward or sideways in cycles, which are shallow (interface ≈ implementation), and where is a stratum missing? Reach-back and deferred imports in the import graph are the leads. |
+| `layering` | `h9` | Which modules import upward or sideways in cycles, which are shallow (interface ≈ implementation), and where is a stratum missing? Reach-back imports and the deferred imports marked `closes_cycle` are the leads; `hidden_cycles` and `typing_cycles` name the cycles they close. |
 | `dimensions` | `h3` | Which independent axes of variability are handled by inline flag conjunctions, mode strings or kwargs threaded through several modules instead of one mechanism per axis? |
 | `stateless` | `h7` | Which cross-module interactions read another module's attributes, depend on the order of prior calls, or are reached by tests patching into another module's privates? |
 
@@ -259,7 +259,7 @@ function degenerateSeat(r, raw) {
 }
 
 function prettyFiles(list) {
-  return list.map(f => `- ${f.path} (${f.lines} lines, prose ${Math.round(f.prose_share * 100)}%, cognitive max ${f.cognitive_max} / total ${f.cognitive_total}, fan-in ${f.fan_in}, fan-out ${f.fan_out}, reach-back imports ${f.reach_back_imports}, re-exports ${f.reexports}, test patch targets ${f.patch_targets})`).join('\n')
+  return list.map(f => `- ${f.path} (${f.lines} lines, prose ${Math.round(f.prose_share * 100)}%, cognitive max ${f.cognitive_max} / total ${f.cognitive_total}, fan-in ${f.fan_in}, fan-out ${f.fan_out}, reach-back imports ${f.reach_back_imports}, cycle-closing deferred imports ${f.cycle_closing_imports}, re-exports ${f.reexports}, test patch targets ${f.patch_targets})`).join('\n')
 }
 
 function areaPrompt(s) {
@@ -398,7 +398,7 @@ ${QUALITY}your lens is the one heuristic no single-area reader can judge whole. 
 
 INPUTS
 - Whole-repo metrics snapshot:\n${A.metrics_summary}
-- Import graph: ${A.import_graph_path} (edges, reach-back imports, deferred imports, cycles). Read it with a small script, not by eye.
+- Import graph: ${A.import_graph_path} (edges, reach-back imports, deferred imports with closes_cycle, cycles, hidden_cycles, typing_cycles). Read it with a small script, not by eye.
 - Per-area verified findings (statements only) and each seat's seams_for_cross_area:\n${JSON.stringify(seats.map(r => ({ seat: r.seat, seams: r.seams_for_cross_area, findings: digestFindings(r.findings) })), null, 1)}
 - Existing canonical ids (area|anchor|primary_tag): ${JSON.stringify([...known.keys()])}
 

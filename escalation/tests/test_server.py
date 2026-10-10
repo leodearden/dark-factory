@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 from _escalation_seed import seed_escalation
+from _merge_tool_calls import call_merge_cancel, call_merge_request, call_merge_status
 
 from escalation import server as escalation_server
 from escalation.canonical import canonical_root_cause
@@ -38,7 +39,7 @@ from escalation.server import (
 )
 
 # ---------------------------------------------------------------------------
-# Cross-package orchestrator imports — used by TestMergeStatus.
+# Cross-package orchestrator imports — used by the merge-tool test classes.
 # Guarded so the rest of the file is still collected when the orchestrator
 # package is absent (e.g. in an escalation-only install).
 # ---------------------------------------------------------------------------
@@ -57,10 +58,10 @@ try:
     _ORCHESTRATOR_AVAILABLE = True
 except ImportError:
     _ORCHESTRATOR_AVAILABLE = False
-    # Satisfy pyright's definite-assignment check.  The TestMergeStatus class
-    # is guarded by @pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE) so these
-    # stubs are never exercised at runtime.  Annotating as Any lets pyright
-    # treat every subsequent use (calls, attribute access) as valid.
+    # Satisfy pyright's definite-assignment check.  Every merge-tool test
+    # class is guarded by @pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE) so
+    # these stubs are never exercised at runtime.  Annotating as Any lets
+    # pyright treat every subsequent use (calls, attribute access) as valid.
     OrchestratorConfig: Any = None
     EventStore: Any = None
     EventType: Any = None
@@ -1507,6 +1508,28 @@ class TestResolveIssueResolutionClass:
         assert record.resolution_class is None, (
             f"Record must remain unstamped; got {record.resolution_class!r}"
         )
+
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'cls', ['addressed', 'observation-consumed', 'converted', 'status-info'],
+    )
+    async def test_info_l0_disposition_class_round_trips(self, tmp_path: Path, cls: str):
+        """The info-L0 disposition classes (plans/info-l0-disposition-router-prd.md D14)
+        pass resolve_issue's validator and persist on the record."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='done', action='close_only',
+            resolution_class=cls,
+        )
+
+        assert 'error' not in result, f"Expected {cls!r} to be accepted; got: {result}"
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.resolution_class == cls
 
 
 class TestResolveIssueGrantedFiles:
@@ -3725,13 +3748,8 @@ class TestPromoteToL2SentinelIdentity:
 # ---------------------------------------------------------------------------
 
 
-async def _call_merge_request(server, **kwargs: Any) -> dict[str, Any]:
-    """Invoke the merge_request MCP tool directly."""
-    tool = await server.get_tool('merge_request')
-    return await tool.fn(**kwargs)
-
-
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
 class TestMergeRequestDedup:
     """Server-level de-dup tests for merge_request.
 
@@ -3740,11 +3758,6 @@ class TestMergeRequestDedup:
     InFlightMergeRegistry (new optional create_server param) so no real git
     repo or worker is needed.
     """
-
-    def _make_orch_config(self, tmp_path: Path):
-        """Create a minimal OrchestratorConfig without a git remote."""
-        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
-        return OrchestratorConfig(project_root=tmp_path)
 
     def _make_registry(self):
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
@@ -3764,7 +3777,7 @@ class TestMergeRequestDedup:
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         # Pre-seed the registry: acquire branch 'X' with a never-resolving future
@@ -3783,7 +3796,7 @@ class TestMergeRequestDedup:
         # Call merge_request for branch 'X' — should return in_flight immediately
         # (asyncio.wait_for with 2s proves it does NOT block on the future)
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='X',
                 branch='X',
@@ -3824,7 +3837,7 @@ class TestMergeRequestDedup:
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         # The disk-scan arm needs a real git repo + worktree to reach, so return
@@ -3846,7 +3859,7 @@ class TestMergeRequestDedup:
             merge_inflight_registry=registry,
         )
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server, task_id='X', branch='X',
                 worktree=str(tmp_path / 'wt'), description='',
             ),
@@ -3871,7 +3884,7 @@ class TestMergeRequestDedup:
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         never_future: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -3888,7 +3901,7 @@ class TestMergeRequestDedup:
         )
         try:
             result = await asyncio.wait_for(
-                _call_merge_request(
+                call_merge_request(
                     server, task_id='X', branch='X',
                     worktree=str(tmp_path / 'wt'), description='',
                 ),
@@ -3926,7 +3939,7 @@ class TestMergeRequestDedup:
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         never_future: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -3940,7 +3953,7 @@ class TestMergeRequestDedup:
         )
         try:
             result = await asyncio.wait_for(
-                _call_merge_request(
+                call_merge_request(
                     server, task_id='X', branch='X',
                     worktree=str(tmp_path / 'wt'), description='',
                 ),
@@ -3972,7 +3985,7 @@ class TestMergeRequestDedup:
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         server = create_server(
@@ -3982,7 +3995,7 @@ class TestMergeRequestDedup:
             merge_inflight_registry=registry,
         )
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server, task_id='D', branch='D',
                 worktree=str(tmp_path / 'wt'), description='',
             ),
@@ -4008,7 +4021,7 @@ class TestMergeRequestDedup:
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         server = create_server(
@@ -4029,7 +4042,7 @@ class TestMergeRequestDedup:
         worker_task = asyncio.create_task(_worker())
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='Y',
                 branch='Y',
@@ -4066,7 +4079,7 @@ class TestMergeRequestDedup:
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         server = create_server(
@@ -4088,7 +4101,7 @@ class TestMergeRequestDedup:
         worker_task = asyncio.create_task(_worker())
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='RFO',
                 branch='RFO',
@@ -4117,7 +4130,7 @@ class TestMergeRequestDedup:
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         server = create_server(
@@ -4139,7 +4152,7 @@ class TestMergeRequestDedup:
         worker_task = asyncio.create_task(_worker())
 
         await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='RFO2',
                 branch='RFO2',
@@ -4178,7 +4191,7 @@ class TestMergeRequestDedup:
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         # Simulate the workflow-path enqueue: build a MergeRequest inline
@@ -4209,7 +4222,7 @@ class TestMergeRequestDedup:
         )
 
         # MCP merge_request for the same branch 'B' must coalesce
-        result = await _call_merge_request(
+        result = await call_merge_request(
             server,
             task_id='mcp-caller',
             branch='B',
@@ -4264,7 +4277,7 @@ class TestMergeRequestDedup:
             git_ops=stub_git, _merge_worker=None, _terminal_retention=None
         )
         esc_queue = EscalationQueue(tmp_path / 'esc')
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
 
         server = create_server(
             esc_queue,
@@ -4273,14 +4286,14 @@ class TestMergeRequestDedup:
             merge_queue=asyncio.Queue(),
         )
 
-        bare_result = await _call_merge_request(
+        bare_result = await call_merge_request(
             server,
             task_id='123',
             branch='123',
             worktree=str(tmp_path / 'wt-bare'),
             description='',
         )
-        prefixed_result = await _call_merge_request(
+        prefixed_result = await call_merge_request(
             server,
             task_id='123',
             branch='task/123',
@@ -4315,20 +4328,10 @@ class TestMergeRequestDedup:
 # workflow.py:1724-1733 (task 2381 alpha / 2383 beta).
 
 
-async def _call_merge_cancel(server, **kwargs: Any) -> dict[str, Any]:
-    """Invoke the merge_cancel MCP tool directly."""
-    tool = await server.get_tool('merge_cancel')
-    return await tool.fn(**kwargs)
-
-
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
 class TestMergeRequestWorkflowVerifyEmission:
     """merge_request(verified_green=True) emits a workflow_verify row."""
-
-    def _make_orch_config(self, tmp_path: Path):
-        """Create a minimal OrchestratorConfig without a git remote."""
-        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
-        return OrchestratorConfig(project_root=tmp_path)
 
     async def test_verified_green_emits_workflow_verify(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -4376,7 +4379,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             git_ops=stub_git, _merge_worker=None, _terminal_retention=None,
         )
         esc_queue = EscalationQueue(tmp_path / 'esc')
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         event_store = EventStore(tmp_path / 'runs.db', 'run-wf-verify')
 
         server = create_server(
@@ -4387,7 +4390,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             merge_queue=asyncio.Queue(),
         )
 
-        result = await _call_merge_request(
+        result = await call_merge_request(
             server,
             task_id='777',
             branch='777',
@@ -4420,7 +4423,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             assert result.get('status') == 'queued', (
                 f'Expected status queued, got: {result}'
             )
-            await _call_merge_cancel(server, request_id=result['request_id'])
+            await call_merge_cancel(server, request_id=result['request_id'])
 
     async def test_default_verified_green_emits_nothing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -4459,7 +4462,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         stub_harness = types.SimpleNamespace(
             git_ops=stub_git, _merge_worker=None, _terminal_retention=None,
         )
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         event_store = EventStore(tmp_path / 'runs.db', 'run-wf-verify-default')
 
         server = create_server(
@@ -4470,7 +4473,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             merge_queue=asyncio.Queue(),
         )
 
-        result = await _call_merge_request(
+        result = await call_merge_request(
             server,
             task_id='778',
             branch='778',
@@ -4486,7 +4489,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             assert result.get('status') == 'queued', (
                 f'Expected status queued, got: {result}'
             )
-            await _call_merge_cancel(server, request_id=result['request_id'])
+            await call_merge_cancel(server, request_id=result['request_id'])
 
     async def test_verified_green_false_explicit_emits_nothing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -4524,7 +4527,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         stub_harness = types.SimpleNamespace(
             git_ops=stub_git, _merge_worker=None, _terminal_retention=None,
         )
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         event_store = EventStore(tmp_path / 'runs.db', 'run-wf-verify-explicit-false')
 
         server = create_server(
@@ -4535,7 +4538,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             merge_queue=asyncio.Queue(),
         )
 
-        result = await _call_merge_request(
+        result = await call_merge_request(
             server,
             task_id='779',
             branch='779',
@@ -4552,7 +4555,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             assert result.get('status') == 'queued', (
                 f'Expected status queued, got: {result}'
             )
-            await _call_merge_cancel(server, request_id=result['request_id'])
+            await call_merge_cancel(server, request_id=result['request_id'])
 
     async def test_verified_green_true_but_already_merged_emits_nothing(
         self, tmp_path: Path,
@@ -4575,7 +4578,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         stub_harness = types.SimpleNamespace(
             git_ops=stub_git, _merge_worker=None, _terminal_retention=None,
         )
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         event_store = EventStore(tmp_path / 'runs.db', 'run-wf-verify-already-merged')
 
         server = create_server(
@@ -4586,7 +4589,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             merge_queue=asyncio.Queue(),
         )
 
-        result = await _call_merge_request(
+        result = await call_merge_request(
             server,
             task_id='780',
             branch='780',
@@ -4651,7 +4654,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         stub_harness = types.SimpleNamespace(
             git_ops=stub_git, _merge_worker=None, _terminal_retention=None,
         )
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
 
         server = create_server(
             EscalationQueue(tmp_path / 'esc'),
@@ -4661,7 +4664,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             merge_queue=asyncio.Queue(),
         )
 
-        result = await _call_merge_request(
+        result = await call_merge_request(
             server,
             task_id='781',
             branch='781',
@@ -4677,7 +4680,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             )
         finally:
             if result.get('status') == 'queued':
-                await _call_merge_cancel(server, request_id=result['request_id'])
+                await call_merge_cancel(server, request_id=result['request_id'])
 
     async def test_verified_green_true_on_resubmit_attach_emits_second_row(
         self, tmp_path: Path,
@@ -4694,7 +4697,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         gracefully instead of the emission being skipped.
         """
         esc_queue = EscalationQueue(tmp_path / 'esc')
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         event_store = EventStore(tmp_path / 'runs.db', 'run-wf-verify-attach')
 
         server = create_server(
@@ -4708,7 +4711,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             merge_queue=asyncio.Queue(),
         )
 
-        first = await _call_merge_request(
+        first = await call_merge_request(
             server,
             task_id='790',
             branch='790',
@@ -4722,7 +4725,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         )
 
         try:
-            second = await _call_merge_request(
+            second = await call_merge_request(
                 server,
                 task_id='790',
                 branch='790',
@@ -4751,7 +4754,7 @@ class TestMergeRequestWorkflowVerifyEmission:
                     f"Expected data['branch']=='task/790', got: {row}"
                 )
         finally:
-            await _call_merge_cancel(server, request_id=first['request_id'])
+            await call_merge_cancel(server, request_id=first['request_id'])
 
 
 # ---------------------------------------------------------------------------
@@ -4766,12 +4769,9 @@ async def _call_get_merge_queue(server) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
 class TestGetMergeQueue:
     """Tests for the get_merge_queue escalation MCP tool."""
-
-    def _make_orch_config(self, tmp_path: Path):
-        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
-        return OrchestratorConfig(project_root=tmp_path)
 
     def _make_finalize_fixture(
         self,
@@ -4805,7 +4805,7 @@ class TestGetMergeQueue:
         )
 
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
 
         merge_wt = tmp_path / 'merge'
@@ -4885,7 +4885,7 @@ class TestGetMergeQueue:
         )
 
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
 
         req = MergeRequest(
             task_id='T1',
@@ -4943,7 +4943,7 @@ class TestGetMergeQueue:
         )
 
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
 
         git_ops_stub = types.SimpleNamespace()
@@ -4995,7 +4995,7 @@ class TestGetMergeQueue:
         )
 
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
 
         git_ops_stub = types.SimpleNamespace()
@@ -5055,7 +5055,7 @@ class TestGetMergeQueue:
         )
 
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
         git_ops_stub = types.SimpleNamespace()
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
@@ -5190,7 +5190,7 @@ class TestGetMergeQueue:
         )
 
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
 
         merge_wt = tmp_path / 'merge'
@@ -5321,7 +5321,7 @@ class TestGetMergeQueue:
         )
 
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
 
         merge_wt = tmp_path / 'merge'
@@ -5947,12 +5947,6 @@ class TestDowngradeDedupeCorrectness:
 # ---------------------------------------------------------------------------
 
 
-async def _call_merge_status(server, **kwargs) -> dict:
-    """Invoke the merge_status MCP tool (async tool)."""
-    tool = await server.get_tool('merge_status')
-    return await tool.fn(**kwargs)
-
-
 @pytest.mark.asyncio
 @pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
 class TestMergeStatus:
@@ -5965,7 +5959,7 @@ class TestMergeStatus:
         esc_queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(esc_queue)
 
-        result = await _call_merge_status(server)
+        result = await call_merge_status(server)
 
         assert isinstance(result, dict), f'Expected dict, got {type(result)}'
         assert 'error' in result, f'Expected error key, got: {result}'
@@ -5977,7 +5971,7 @@ class TestMergeStatus:
         esc_queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(esc_queue)  # standalone: no event_store, no harness
 
-        result = await _call_merge_status(server, request_id='mr-deadbeef')
+        result = await call_merge_status(server, request_id='mr-deadbeef')
 
         assert isinstance(result, dict), f'Expected dict, got {type(result)}'
         assert result.get('state') == 'unknown', f'Expected state=unknown, got: {result}'
@@ -6032,7 +6026,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, request_id='mr-statetest')
+        result = await call_merge_status(server, request_id='mr-statetest')
 
         assert result.get('state') == expected_coarse, (
             f'raw={raw_state!r}: expected coarse={expected_coarse!r}, got state={result.get("state")!r}'
@@ -6064,7 +6058,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, branch='feat-branch')
+        result = await call_merge_status(server, branch='feat-branch')
 
         assert result.get('state') == 'done', f'Expected done (most-recent), got: {result}'
         assert result.get('request_id') == 'mr-new', (
@@ -6087,7 +6081,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, task_id='T-tid')
+        result = await call_merge_status(server, task_id='T-tid')
 
         assert result.get('state') == 'done', f'Expected done (most-recent), got: {result}'
         assert result.get('request_id') == 'mr-later', (
@@ -6102,7 +6096,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, request_id='mr-nothere')
+        result = await call_merge_status(server, request_id='mr-nothere')
 
         assert result.get('state') == 'unknown', f'Expected unknown, got: {result}'
         assert 'hint' in result
@@ -6125,7 +6119,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
         server = create_server(esc_queue, harness=stub_harness)
 
-        result = await _call_merge_status(server, request_id='mr-aaaa1111')
+        result = await call_merge_status(server, request_id='mr-aaaa1111')
 
         assert result.get('state') == 'done', f'Expected done from ring, got: {result}'
         assert result.get('request_id') == 'mr-aaaa1111'
@@ -6158,7 +6152,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, request_id='mr-ringwin')
+        result = await call_merge_status(server, request_id='mr-ringwin')
 
         assert result.get('state') == 'blocked', (
             f'Expected ring value (blocked) to beat event store (done), got: {result}'
@@ -6181,7 +6175,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, request_id='mr-in-ev-only')
+        result = await call_merge_status(server, request_id='mr-in-ev-only')
 
         assert result.get('state') == 'conflict', (
             f'Expected conflict from event-store fallback, got: {result}'
@@ -6220,7 +6214,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
         server = create_server(esc_queue, harness=stub_harness)
 
-        result_ring = await _call_merge_status(server, request_id='mr-reason-ring')
+        result_ring = await call_merge_status(server, request_id='mr-reason-ring')
 
         assert result_ring.get('state') == 'blocked', (
             f'Expected state=blocked from ring, got: {result_ring}'
@@ -6253,7 +6247,7 @@ class TestMergeStatus:
             esc_queue2, harness=stub_harness2, event_store=event_store
         )
 
-        result_ev = await _call_merge_status(server2, request_id='mr-reason-ev')
+        result_ev = await call_merge_status(server2, request_id='mr-reason-ev')
 
         assert result_ev.get('state') == 'blocked', (
             f'Expected state=blocked from event store, got: {result_ev}'
@@ -6280,7 +6274,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
         server = create_server(esc_queue, harness=stub_harness)
 
-        result = await _call_merge_status(server, branch='branch-bylookup')
+        result = await call_merge_status(server, branch='branch-bylookup')
 
         assert result.get('state') == 'done', (
             f'Expected done from ring branch lookup, got: {result}'
@@ -6308,7 +6302,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
         server = create_server(esc_queue, harness=stub_harness)
 
-        result = await _call_merge_status(server, task_id='T-ltask')
+        result = await call_merge_status(server, task_id='T-ltask')
 
         assert result.get('state') == 'blocked', (
             f'Expected blocked from ring task_id lookup, got: {result}'
@@ -6339,7 +6333,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, branch='branch-ring-wins')
+        result = await call_merge_status(server, branch='branch-ring-wins')
 
         assert result.get('state') == 'blocked', (
             f'Expected ring value (blocked) to beat event store (done) on branch= poll, '
@@ -6362,7 +6356,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
         server = create_server(esc_queue, harness=stub_harness)
 
-        result = await _call_merge_status(server, request_id='mr-coalesced-alias')
+        result = await call_merge_status(server, request_id='mr-coalesced-alias')
 
         assert result.get('state') == 'done', (
             f'Expected done from coalesced-id alias resolution, got: {result}'
@@ -6395,7 +6389,7 @@ class TestMergeStatus:
 
         # Supply both request_id (ring-miss) and branch (ring-hit).
         # The ring tier must NOT resolve via branch because request_id is present.
-        result = await _call_merge_status(server, request_id='mr-miss', branch='prec-branch')
+        result = await call_merge_status(server, request_id='mr-miss', branch='prec-branch')
 
         # Should fall through to unknown (not 'done' from the ring's branch record)
         assert result.get('state') == 'unknown', (
@@ -6425,7 +6419,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, task_id='T-rtask')
+        result = await call_merge_status(server, task_id='T-rtask')
 
         assert result.get('state') == 'conflict', (
             f'Expected ring value (conflict) to beat event store (done) on task_id= poll, '
@@ -6437,13 +6431,10 @@ class TestMergeStatus:
 
     # ── step-11: live-snapshot tier ───────────────────────────────────────────
 
-    def _make_orch_config(self, tmp_path: Path):
-        return OrchestratorConfig(project_root=tmp_path)
-
     async def test_live_snapshot_state_mapping(self, tmp_path: Path) -> None:
         """Live snapshot states map to the public vocabulary."""
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
         git_ops_stub = types.SimpleNamespace()
         worker = SpeculativeMergeWorker(
@@ -6462,7 +6453,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=worker)
         server = create_server(esc_queue, harness=stub_harness)
 
-        result = await _call_merge_status(server, request_id=req.request_id)
+        result = await call_merge_status(server, request_id=req.request_id)
 
         assert result.get('state') == 'queued', f'Expected queued, got: {result}'
         assert result.get('request_id') == req.request_id
@@ -6476,7 +6467,7 @@ class TestMergeStatus:
     async def test_live_snapshot_lookup_by_branch(self, tmp_path: Path) -> None:
         """branch= lookup resolves to the live entry's request_id."""
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
         git_ops_stub = types.SimpleNamespace()
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore
@@ -6491,7 +6482,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=worker)
         server = create_server(esc_queue, harness=stub_harness)
 
-        result = await _call_merge_status(server, branch='branch-bylookup')
+        result = await call_merge_status(server, branch='branch-bylookup')
 
         assert result.get('state') == 'queued', f'Expected queued, got: {result}'
         assert result.get('request_id') == req.request_id, (
@@ -6501,7 +6492,7 @@ class TestMergeStatus:
     async def test_live_snapshot_lookup_by_task_id(self, tmp_path: Path) -> None:
         """task_id= lookup resolves to the live entry's request_id."""
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
         git_ops_stub = types.SimpleNamespace()
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore
@@ -6516,7 +6507,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=worker)
         server = create_server(esc_queue, harness=stub_harness)
 
-        result = await _call_merge_status(server, task_id='T-ltask')
+        result = await call_merge_status(server, task_id='T-ltask')
 
         assert result.get('state') == 'queued', f'Expected queued, got: {result}'
         assert result.get('request_id') == req.request_id, (
@@ -6526,7 +6517,7 @@ class TestMergeStatus:
     async def test_live_snapshot_beats_ring_and_event_store(self, tmp_path: Path) -> None:
         """Live snapshot tier wins over ring and event store for the same request_id."""
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
         git_ops_stub = types.SimpleNamespace()
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore
@@ -6558,7 +6549,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=worker, _terminal_retention=ring)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, request_id=req.request_id)
+        result = await call_merge_status(server, request_id=req.request_id)
 
         # Live snapshot is 'queued'; ring+event store have 'done'
         # Live must win
@@ -6580,7 +6571,7 @@ class TestMergeStatus:
     ) -> None:
         """Live snapshot state mapping covers all documented phase values."""
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
         git_ops_stub = types.SimpleNamespace()
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore
@@ -6648,7 +6639,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=worker)
         server = create_server(esc_queue, harness=stub_harness)
 
-        result = await _call_merge_status(server, request_id=req.request_id)
+        result = await call_merge_status(server, request_id=req.request_id)
 
         assert result.get('state') == expected, (
             f'verify_phase={verify_phase!r}: expected {expected!r}, got {result.get("state")!r}'
@@ -6685,7 +6676,7 @@ class TestMergeStatus:
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
         # Should NOT raise; should fall through to the event-store tier.
-        result = await _call_merge_status(server, request_id='mr-snapfail')
+        result = await call_merge_status(server, request_id='mr-snapfail')
 
         assert result.get('state') == 'done', (
             f'Expected durable-tier result after snapshot() failure, got: {result}'
@@ -6796,8 +6787,8 @@ async def _call_tool(server: Any, name: str, **kwargs: Any) -> Any:
 
     *server* is intentionally typed ``Any`` so pyright does not reach into
     FastMCP's ``Tool`` internals (``.fn``) — mirroring the ``_blocker`` /
-    ``_info`` / ``_call_merge_status`` helpers above, which the type-check gate
-    accepts for exactly this reason.
+    ``_info`` helpers above and ``_merge_tool_calls.py::call_merge_status``,
+    which the type-check gate accepts for exactly this reason.
     """
     tool = await server.get_tool(name)
     return await tool.fn(**kwargs)

@@ -360,6 +360,28 @@ promoted. `member_ids` is the projection of the record's `members` list; the raw
 stays dropped, as does `detail` — the unbounded free-text field compact mode exists to keep out
 of your context.
 
+**Match `root_cause` keys in canonical form, never as raw strings.** The server folds a promote
+into the pending L2 whose `root_cause` canonicalises the same under
+`escalation.canonical.canonical_root_cause`. Run that helper over the rebuilt keys and your
+candidate rather than reimplementing it; why the drain carries no canonical field is recorded at
+`escalation/src/escalation/server.py::_COMPACT_ESCALATION_FIELDS`.
+
+```bash
+uv run --directory "$DARK_FACTORY_ROOT/escalation" python -c '
+import json, sys
+from escalation.canonical import canonical_root_cause
+print(json.dumps({key: canonical_root_cause(key) for key in json.load(sys.stdin)}, indent=1))
+' <<'JSON'
+["<root_cause of each pending L2>", "<the root_cause you are about to promote under>"]
+JSON
+```
+
+Keys that map to the same canonical form are one cluster. A near-duplicate you miss is not free:
+the server still folds it (no duplicate L2), but the fold records the new spelling as an amendment
+and a `root_cause` variant and bumps `updated_at`. That makes the L2's triage-ack stale (see
+"Reading a triage-ack annotation") and counts toward the over-fold alarm (see "Reading preserved
+framing"). An unexpected `status: 'updated'` from `promote_to_l2` means your match missed.
+
 Triage from that; fetch the full record with `get_escalation(id)` **only** for
 the one item you're about to act on (and when you do, read its `amendments` —
 see "Reading preserved framing" below) — and prefer doing that full read inside the handling sub-agent
@@ -990,8 +1012,9 @@ Because no call can block >100 s, top-level submission is safe BY PROTOCOL.
         Mirrors shared/src/shared/merge_state.py::SUBMIT_NON_TERMINAL. Pinned by
         scripts/tests/test_merge_state_vocabulary_consistency.py — extend the enum
         and this list goes red until it matches. -->
-   A timeout yields a non-terminal queued shape: `{status: 'queued'|'attached', request_id,
-   snapshot_tip, generation, position, queue_depth, eta_seconds}`.
+   A timeout yields a non-terminal shape with `status: 'queued'|'attached'` and a
+   `request_id` to poll; its full key set is stated in `merge_request`'s own docstring
+   (`escalation/src/escalation/server.py::merge_request`), not restated here.
    <!-- merge-state-vocab:end -->
    Both are a **successful, durable submission** — the entry survives disconnect (PRD D2);
    intent persists even if the MCP session drops mid-bounded-wait.
@@ -1037,9 +1060,25 @@ switches on and off. Three behavioural shifts:
    days helps no one. Where the decision can be safely *postponed* without baking anything in:
    - Queue a follow-up task capturing the decision to be made (two-phase `submit_task` →
      `resolve_ticket`), and
-   - `resolve_issue(..., action='park')` so the blocking task lands `blocked`, held under an open L2
-     (no re-dispatch while the escalation is open; the stranded-blocked sweep skips a blocked task
-     that has an open escalation), and
+   - Hold the task, choosing by the record's **severity**:
+     - **Not `info`:** `resolve_issue(..., action='park')`. The task lands `blocked`, held under
+       the open L2, because a pinning escalation vetoes the stranded-blocked sweep.
+     - **`info`:** never park. An info record never pins
+       (`escalation/src/escalation/pins.py::classify_pins`; intended, Leo 2026-10-09). The sweep
+       re-pends a parked task within a tick, as with esc-5708-3, reify esc-7881-5 and
+       esc-4681-3 (16 s). Leave the escalation pending and **defer** the task:
+       1. `update_task(id, metadata={'x_deferral': {'escalation_id': '<esc-id>', 'until_condition':
+          'Leo rules <esc-id>', 'reason': '<one line>'}}, metadata_mode='merge')`;
+       2. `set_task_status(id, status='deferred')`;
+       3. confirm both with `get_task` about 30 s later.
+
+       A deferral keeps a not-yet-running task out of dispatch. It does not stop a live run, and
+       an info filer was told to keep driving, so leave an `in-progress` task alone (leave
+       pending + digest). When the ruling lands, carry it out, then re-pend the task with
+       `set_task_status(id, status='pending')` unless the ruling says otherwise, and set
+       `x_deferral` to null. Once the deferral-record gate is live (task 6525), the record goes
+       in `set_task_status(..., deferral=...)` instead. Task 6579 makes it the typed
+       `until_escalation` kind. And
    - File a DecisionRecord via `write-decision` (see "Filing Parked Decisions to the Cockpit
      Registry" below) — IN ADDITION to the follow-up task, so the parked decision surfaces in the
      cockpit decision queue.
@@ -1406,10 +1445,23 @@ esc-id-citing correction block in the cluster's task descriptions, or the subjec
 advancing while the task is blocked/parked (tip-advance on an `in-progress` subject is ordinary
 work, not a signal).
 
-`triaged_by` is server-attributed from the stamping connection's `X-Escalation-Identity` header and
-cannot be spoofed by the caller — the identical non-spoofable attribution contract this skill
-already documents for `resolved_by` (see "Recognizing the supervised auto-watcher's resolutions"
-below).
+`triaged_by` is server-enforced (`escalation/src/escalation/server.py::stamp_triage`) when the
+stamping connection sends `X-Escalation-Identity` (the auto-watcher does), the same attribution
+contract this skill documents for `resolved_by` (see "Recognizing the supervised auto-watcher's
+resolutions" below); for a header-less interactive session it is a convention, not a guarantee —
+see "Shadow-mode standing-policy rulings (measurement only)".
+
+### Refuting a premise: the claim's execution context, or it is not a refutation
+
+A check that does not reproduce an escalation's premise refutes it only if it ran in the premise's
+execution context; anywhere else it is a non-reproduction. The rule covers the probes you re-run and
+the resolution text you write. It also covers spawn briefs: never hand a spawned session a premise
+marked disproved, or marked "do not re-derive", unless the refuting check ran in that context, and
+state the context each cited check ran in. Specimen: on esc-legibility-trickle-reify-3 a brief
+refuted a boot-time timer's PATH premise from a post-login interactive shell. The premise was right,
+and the auto-watcher's triage note had said its probe did not verify the job's own PATH. Single
+normative statement of the rule:
+`orchestrator/src/orchestrator/agents/premise_refutation_guidance.py::PREMISE_REFUTATION_GUIDANCE`.
 
 ### Reading preserved framing (`amendments`)
 
@@ -2086,13 +2138,10 @@ them is reported as `gated_stamps` and excluded from every rate.
 
 ### Two facts about attribution and timing
 
-**Attribution here is a convention, not a guarantee.**
-`escalation/src/escalation/server.py::stamp_triage` overrides `triaged_by` from the
-`X-Escalation-Identity` header **only when that header is present**. The auto-watcher sends one, so
-for it the attribution is server-enforced; this session does not, so `triaged_by` is whatever you
-pass. This NARROWS the general statement in "Reading a triage-ack annotation" above for your own
-stamps. Therefore: **pass the same identity string you resolve with**, or `triaged_by` and
-`resolved_by` never compare and the `self_resolved` check silently never fires.
+**Attribution here is a convention, not a guarantee** (see "Reading a triage-ack annotation"
+above): this session sends no identity header, so `triaged_by` is whatever you pass. **Pass the
+same identity string you resolve with**, or `triaged_by` and `resolved_by` never compare and the
+`self_resolved` check silently never fires.
 
 **Stamp before the record is resolved.** `stamp_triage` refuses anything that is not `pending`, so a
 stamp written after the close is simply not written.
@@ -2211,14 +2260,14 @@ its values may be passed to `resolve_issue`.
 |---|---|---|---|---|
 | `resume` (default) | `resolved` | resumes; resolution text injected (L0 live path) | `blocked` → `pending` (any task-attached level ≥ 1, incl. memberless born-at-L2) | "Here's the answer — continue." |
 | `restart` | `resolved` | killed (soft-cancel → grace → hard) | → `pending` (from `in-progress` or `blocked`) | "This run is off-course — re-run fresh." |
-| `park` | kept open at L2 | killed | → `blocked` (from any non-terminal status) | "Stop; human decides later; held blocked under an open L2." |
+| `park` | kept open at L2 | killed | → `blocked` (from any non-terminal status) | "Stop; human decides later; held blocked under an open L2." **Never on an `info` record:** info never pins, so the sweep re-pends the task within a tick. Defer the task instead (AFK shift 1). `resolve_issue` will refuse it once task 6578 lands. |
 | `abandon` | `dismissed` | killed | → `cancelled` | "Never run again." |
 | `close_only` | `dismissed` | untouched | none | "Record is noise/duplicate — change nothing." |
 
 **C1 notes:**
 - Terminal task statuses (`done`, `cancelled`) are never overwritten by any action.
 - The removed `terminate` parameter now raises a hard error naming the five actions above.
-- **L2 cluster cascade**: the action applies uniformly to the L2 and every member task. `queue.resolve()` cascades members via `resolved_by='l2-cascade:<L2-id>'`; the harness member callback reads the parent action from the queue read API. For `action='park'`: `queue.park()` keeps the L2 and all member L1s open (status=`pending`); each member task ends `blocked`, covered by its still-open member L1 escalation — the stranded-blocked sweep skips each because Fix #1b finds the open L1.
+- **L2 cluster cascade**: the action applies uniformly to the L2 and every member task. `queue.resolve()` cascades members via `resolved_by='l2-cascade:<L2-id>'`; the harness member callback reads the parent action from the queue read API. For `action='park'`: `queue.park()` keeps the L2 and all member L1s open (status=`pending`); each member task ends `blocked`, covered by its still-open member L1 escalation — the stranded-blocked sweep skips each because Fix #1b finds the open L1. That cover holds only where the member L1 pins. An `info` member never pins by itself, so treat its task as unheld (see the `park` row).
 - Legacy in-process callers with `resolution_action=None`: `dismiss=True` maps to `close_only`; `dismiss=False` maps to `resume`.
 
 **Where the `resolution` text actually goes.** It reaches the working agent **only** in the L0

@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 from datetime import UTC, date, datetime, timedelta
@@ -24,12 +25,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 from legibility import (
     account_pool,
     census_trigger,
     codebook,
     digest,
+    invariants,
     nightly,
+    session_ledger,
     session_runner,
     trickle_state,
     unlanded,
@@ -38,6 +42,7 @@ from legibility import (
     config as config_mod,
 )
 from legibility.config import TrickleCensusCaps, load_config
+from quality_doc_texts import definition_body, heuristic_headlines
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
 
 # ---------------------------------------------------------------------------
@@ -2084,7 +2089,7 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
 
         result = coder_module.code_digest(
             _HAND_DIGEST_FOR_IDENTITY, {'entries': []}, project='dark_factory',
-            invoke=capped_invoke,
+            invoke=capped_invoke, invariant_slugs=(),
         )
 
         assert result.capped is True
@@ -3294,7 +3299,7 @@ def test_run_nightly_persists_a_corrections_only_night(tmp_path, monkeypatch):
 
     real_apply = codebook.apply_coding_record
 
-    def apply_with_correction(cb, record):
+    def apply_with_correction(cb, record, **kwargs):
         return real_apply(cb, {
             **record,
             'corrections': [{
@@ -3302,7 +3307,7 @@ def test_run_nightly_persists_a_corrections_only_night(tmp_path, monkeypatch):
                 'note': 'framing refuted',
                 'title': 'Corrected Cause',
             }],
-        })
+        }, **kwargs)
 
     monkeypatch.setattr(nightly.codebook, 'apply_coding_record', apply_with_correction)
 
@@ -3756,7 +3761,8 @@ _BRANCH_NEEDS_MONKEYPATCH = (
 def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
                      branch=None, recorder=None, budget_bytes=None,
                      invoke=_fake_invoke_known_cause, committer=None, poster=None,
-                     transcript=True):
+                     transcript=True, now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+                     invariants_doc: str | None = None):
     """Run ``run_nightly`` end to end on a real temp git repo + transcript and
     return ``(result, repo)``.
 
@@ -3781,13 +3787,20 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
 
     The other knobs shape a run that does NOT fail: *budget_bytes* rewrites
     the config with a digest byte budget small enough to suppress the whole
-    night, *transcript=False* makes it a genuinely quiet one, and
+    night, *transcript=False* makes it a genuinely quiet one, *invariants_doc*
+    is committed as the project's design-invariants doc, and
     *recorder* / *committer* / *poster* / *invoke* are the injected seams
     (*poster* defaults to a no-op, so a test that does not care about
     escalations never has to build one).
     """
     work_cwd = str(tmp_path / 'work')
     repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    if invariants_doc is not None:
+        doc_path = repo / invariants.DOC_RELPATH
+        doc_path.parent.mkdir(parents=True, exist_ok=True)
+        doc_path.write_text(invariants_doc, encoding='utf-8')
+        subprocess.run(['git', 'add', str(invariants.DOC_RELPATH)], cwd=repo, check=True)
+        subprocess.run(['git', 'commit', '-q', '-m', 'invariants'], cwd=repo, check=True)
     if budget_bytes is not None:
         _write_config(
             repo, project_id='testproj', escalation_port=8199,
@@ -3810,7 +3823,7 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
         config_path=config_path,
         projects_root=projects_root,
         target_date=date(2026, 7, 13),
-        now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+        now=now,
         invoke=invoke,
         status_fetcher=None,
         poster=poster if poster is not None else (lambda url, envelope: None),
@@ -5024,3 +5037,233 @@ def test_deletion_directive_aggregate_journals_once_at_warning(tmp_path, caplog)
         'no escalation on this path flips the exit code, so none of them '
         'belongs in `journalctl -p err`'
     )
+
+
+# ---------------------------------------------------------------------------
+# task 6397: the trickle ledgers every session it coded and merged, before
+# the census it may launch reads the ledger
+# ---------------------------------------------------------------------------
+
+def _ledger():
+    return session_ledger.read_ledger(session_ledger.ledger_path('testproj'))
+
+
+def _ledger_rows():
+    """Every stored row, read from the sqlite file the ledger owns."""
+    path = session_ledger.ledger_path('testproj')
+    if not path.exists():
+        return []
+    with contextlib.closing(sqlite3.connect(path)) as conn:
+        return conn.execute(
+            'SELECT session, instrument_version, coded_by, run_ref, outcome, coded_at '
+            'FROM coded_sessions',
+        ).fetchall()
+
+
+class TestRunNightlyLedgersCodedSessions:
+
+    def test_a_merged_coding_is_ledgered_as_trickle(self, tmp_path):
+        result, _repo = _run_e2e_nightly(tmp_path)
+
+        assert result.exit_code == 0
+        assert result.commit_made is True
+        coded = json.loads(_fake_invoke_known_cause('', ''))
+        assert _ledger_rows() == [(
+            'session-1',
+            digest.DIGEST_INSTRUMENT_VERSION,
+            'trickle',
+            'trickle-testproj-20260713',
+            session_ledger.outcome_of(coded).value,
+            '2026-07-14T03:00:00+00:00',
+        )]
+        assert result.ledger_rows_written == 1
+        assert result.ledger_rows_failed == 0
+
+    def test_the_row_is_ledgered_before_the_census_step_runs(self, tmp_path, monkeypatch):
+        seen_by_census_step = []
+
+        def _spy(cfg, **kwargs):
+            seen_by_census_step.append(_ledger().sessions)
+            return 'census: spy', False
+
+        monkeypatch.setattr(nightly, 'evaluate_census_step', _spy)
+        result, _repo = _run_e2e_nightly(tmp_path)
+
+        assert result.census_line == 'census: spy'
+        assert seen_by_census_step == [frozenset({'session-1'})]
+
+    @pytest.mark.parametrize(
+        'branch', ['extractor', 'storm', 'capped', 'validation', 'commit'],
+    )
+    def test_a_night_that_did_not_land_its_coding_ledgers_nothing(
+        self, tmp_path, monkeypatch, branch,
+    ):
+        result, _repo = _run_e2e_nightly(tmp_path, monkeypatch=monkeypatch, branch=branch)
+
+        assert result.commit_made is False
+        assert _ledger().sessions == frozenset()
+        assert result.ledger_rows_written == 0
+        assert result.ledger_rows_failed == 0
+
+    def test_a_quiet_night_ledgers_nothing_and_fails_nothing(self, tmp_path):
+        result, _repo = _run_e2e_nightly(tmp_path, transcript=False)
+
+        assert result.exit_code == 0
+        assert _ledger().sessions == frozenset()
+        assert result.ledger_rows_written == 0
+        assert result.ledger_rows_failed == 0
+
+    def test_a_deletion_directive_record_is_not_ledgered(self, tmp_path):
+        result, _repo = _run_e2e_nightly(tmp_path, invoke=_fake_invoke_deletion_directive)
+
+        assert result.exit_code == 0
+        assert _ledger().sessions == frozenset()
+        assert result.ledger_rows_written == 0
+
+    def test_an_unwritable_ledger_is_counted_and_never_fails_the_night(
+        self, tmp_path, caplog,
+    ):
+        path = session_ledger.ledger_path('testproj')
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b'not an sqlite database\n' * 8)
+
+        with caplog.at_level(logging.INFO, logger='legibility.nightly'):
+            result, _repo = _run_e2e_nightly(tmp_path)
+
+        assert result.exit_code == 0
+        assert result.commit_made is True
+        assert result.ledger_rows_written == 0
+        assert result.ledger_rows_failed == 1
+        assert result.reason is not None
+        assert 'ledger' in result.reason
+        assert str(path) in result.reason
+        naming_the_path = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and str(path) in r.getMessage()
+        ]
+        assert len(naming_the_path) == 1, [r.getMessage() for r in naming_the_path]
+
+    def test_rows_that_will_not_build_are_counted_and_never_fail_the_night(
+        self, tmp_path, caplog,
+    ):
+        naive_now = datetime(2026, 7, 14, 3, 0, 0)
+
+        with caplog.at_level(logging.WARNING, logger='legibility.nightly'):
+            result, _repo = _run_e2e_nightly(tmp_path, now=naive_now)
+
+        assert result.exit_code == 0
+        assert result.commit_made is True
+        assert result.census_line is not None
+        assert result.ledger_rows_written == 0
+        assert result.ledger_rows_failed == 1
+        assert result.reason is not None
+        assert 'coded_at' in result.reason
+        assert _ledger().sessions == frozenset()
+
+    def test_rerunning_the_night_ledgers_nothing_twice(self, tmp_path):
+        (tmp_path / 'first').mkdir()
+        (tmp_path / 'second').mkdir()
+        first, _repo = _run_e2e_nightly(tmp_path / 'first')
+        second, _repo2 = _run_e2e_nightly(tmp_path / 'second')
+
+        assert first.ledger_rows_written == 1
+        assert second.ledger_rows_written == 0
+        assert second.ledger_rows_failed == 0
+        assert [row[0] for row in _ledger_rows()] == ['session-1']
+
+
+# ---------------------------------------------------------------------------
+# task 6400: the trickle tells the coder the project's invariant slugs and
+# the quality Definition, and journals what the merger kept and dropped
+# (plans/census-incremental-prd.md §4.8 rows 15 and 17)
+# ---------------------------------------------------------------------------
+
+_REIFY_FORM_INVARIANTS_DOC = """\
+# Design invariants
+
+## INV-SF-1 `undef-has-provenance`
+
+## INV-AD-1 `angle-crossings-explicit`
+"""
+
+
+def _fake_invoke_known_and_unknown_slug(prompt: str, model: str) -> str:
+    return json.dumps({
+        'matches': [{
+            'entry_id': 'known-cause',
+            'origin_phase': 'implement',
+            'manifested_phase': 'implement',
+            'invariant_violated': 'undef-has-provenance',
+        }],
+        'candidates': [{'title': 'novel', 'invariant_violated': 'made-up-free-text'}],
+    })
+
+
+def _committed_codebook(repo: Path) -> dict:
+    shown = subprocess.run(
+        ['git', 'show', 'HEAD:docs/legibility/confusion-codebook.yaml'],
+        cwd=repo, check=True, capture_output=True, text=True,
+    )
+    return yaml.safe_load(shown.stdout)
+
+
+def _messages(caplog, level):
+    return [r.getMessage() for r in caplog.records if r.levelno == level]
+
+
+class TestRunNightlyInvariantSlugs:
+
+    def test_every_merging_night_journals_its_slug_tally(self, tmp_path, caplog):
+        caplog.set_level(logging.INFO)
+
+        result, _repo = _run_e2e_nightly(tmp_path)
+
+        assert result.exit_code == 0
+        assert any(
+            'invariant slugs: 0 valid, 0 rejected' in m
+            for m in _messages(caplog, logging.INFO)
+        )
+
+    def test_a_known_slug_persists_and_an_unknown_one_is_dropped_and_warned(
+        self, tmp_path, caplog,
+    ):
+        caplog.set_level(logging.INFO)
+
+        result, repo = _run_e2e_nightly(
+            tmp_path, invoke=_fake_invoke_known_and_unknown_slug,
+            invariants_doc=_REIFY_FORM_INVARIANTS_DOC,
+        )
+
+        assert result.commit_made is True
+        committed = _committed_codebook(repo)
+        [entry] = [e for e in committed['entries'] if e['id'] == 'known-cause']
+        assert [s.get('invariant_violated') for s in entry['sightings']] == [
+            'undef-has-provenance',
+        ]
+        [candidate] = [c for c in committed['candidates'] if c['title'] == 'novel']
+        assert ['invariant_violated' in s for s in candidate['sightings']] == [False]
+        assert any(
+            'invariant slugs: 1 valid, 1 rejected' in m
+            for m in _messages(caplog, logging.INFO)
+        )
+        naming_it = [m for m in _messages(caplog, logging.WARNING) if 'made-up-free-text' in m]
+        assert len(naming_it) == 1, naming_it
+
+    def test_the_coder_is_given_the_definition_and_an_empty_verdict_mints_nothing(
+        self, tmp_path,
+    ):
+        prompts = []
+
+        def recording_invoke(prompt: str, model: str) -> str:
+            prompts.append(prompt)
+            return json.dumps({'matches': [], 'candidates': []})
+
+        result, repo = _run_e2e_nightly(tmp_path, invoke=recording_invoke)
+
+        assert result.exit_code == 0
+        assert _committed_codebook(repo)['candidates'] == []
+        assert [row[4] for row in _ledger_rows()] == [session_ledger.Outcome.EMPTY.value]
+        [prompt] = prompts
+        assert definition_body() in prompt
+        for headline in heuristic_headlines():
+            assert headline not in prompt

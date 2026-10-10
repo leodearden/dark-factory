@@ -7,7 +7,9 @@ wording); each judge-band write of the snapshot that
 ``freeze_write_triage_population.py`` froze is judged once per arm, through
 the SHIPPED ``write_triage_judge._call_llm`` and parser. A row follows ι's
 per-case contract (``score_write_triage_pairs.py::JudgedCase``, C2''), so μ
-scores the arm files with ι unchanged.
+scores the arm files with ι unchanged. Task 6530 (π2, §12 D19) adds a
+write-time mode: the same sample, each slate cut to the records created
+before its write and its band re-decided.
 
 Usage
 -----
@@ -19,14 +21,25 @@ calls within an arm run concurrently.
       --snapshot <out-root>/write-triage-population-<date>/snapshot.json \\
       --max-writes N --budget-usd 40
 
-Rows land in ``arms/<arm>.jsonl`` beside the snapshot. A long run belongs
-detached (``setsid … > log 2>&1``), polled by reading the log. ``publish``
-then refuses anything partial and writes the two committed artifacts:
+Rows land in ``arms/<arm>.jsonl`` beside the snapshot. The write-time run
+(π2) judges the same sample with its own arm table into ``arms-write-time/``:
+
+  uv run python scripts/run_write_triage_population_arms.py run --slates write-time \\
+      --snapshot <snapshot.json> --max-writes 658 --budget-usd 15
+
+A long run belongs detached (``setsid … > log 2>&1``), polled by reading the
+log. ``publish`` then refuses anything partial and writes the two committed
+artifacts:
 
   uv run python scripts/run_write_triage_population_arms.py publish \\
       --snapshot <snapshot.json> \\
       --fixture-report shipped=<dir>/fixture-shipped.json \\
       --fixture-report pre-psi=<dir>/fixture-pre-psi.json
+
+and ``publish-write-time`` does the same for the write-time run:
+
+  uv run python scripts/run_write_triage_population_arms.py publish-write-time \\
+      --snapshot <snapshot.json> --max-writes 658 --budget-usd 15
 """
 from __future__ import annotations
 
@@ -39,11 +52,13 @@ import json
 import logging
 import math
 import os
+import statistics
 import sys
 import time
 import types
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +72,7 @@ from fused_memory.server.write_triage import (
     OUTCOME_STORED,
     TRIAGE_OUTCOMES,
     JudgeUsage,
+    decide_band,
 )
 
 # `_call_llm` is the one PRIVATE reach: an arm needs the raw text, the usage of
@@ -144,6 +160,26 @@ ARMS: tuple[Arm, ...] = (
 )
 
 
+class Slates(StrEnum):
+    """Which slate a write is judged on."""
+
+    #: The slate as frozen 2026-10-05, records created after the write included (π).
+    FROZEN = 'frozen'
+    #: Only records created strictly before the write, band re-decided (π2, PRD §12 D19).
+    WRITE_TIME = 'write-time'
+
+
+#: π2's arms (PRD §12.4): the flip-decision arms at width 5; sol:low@20 is over budget.
+WRITE_TIME_ARMS: tuple[Arm, ...] = tuple(
+    arm for arm in ARMS
+    if arm.name in {'gpt-4o-mini@5', 'gpt-5.6-terra:none@5', 'gpt-6.1-sol:low@5'}
+)
+#: Where each slate mode's arm files live, beside the snapshot.
+ARMS_DIR_NAME: dict[Slates, str] = {Slates.FROZEN: 'arms', Slates.WRITE_TIME: 'arms-write-time'}
+#: The arms each slate mode runs.
+ARMS_OF: dict[Slates, tuple[Arm, ...]] = {Slates.FROZEN: ARMS, Slates.WRITE_TIME: WRITE_TIME_ARMS}
+
+
 def _as_memory_result(candidate: Mapping[str, Any]) -> MemoryResult:
     """A frozen slate record as the row the shipped selector reads (``store_score`` included)."""
     return MemoryResult(
@@ -152,6 +188,38 @@ def _as_memory_result(candidate: Mapping[str, Any]) -> MemoryResult:
         source_store=SourceStore.mem0,
         metadata=dict(candidate.get('metadata') or {}),
     )
+
+
+def write_time_slate(
+    write: Mapping[str, Any], *, t_high: float, t_low: float,
+) -> dict[str, Any]:
+    """*write* as it was at write time: a new dict, *write* untouched.
+
+    A candidate is kept only when its ``created_at`` is an instant strictly
+    before the write's; one whose instant cannot be parsed cannot be shown
+    earlier, so it is dropped. The band, its winner and the similarity are
+    then re-decided by the shipped ``decide_band`` at *t_high* / *t_low*.
+    """
+    written = _freeze.parse_created_at(write['created_at'])
+    if written is None:
+        raise ValueError(
+            f'write {write["memory_id"]} has no aware created_at ({write["created_at"]!r}); '
+            'the freeze excludes undated writes',
+        )
+    kept = [
+        candidate for candidate in write['candidates']
+        if (instant := _freeze.parse_created_at(candidate.get('created_at'))) is not None
+        and instant < written
+    ]
+    decision = decide_band([_as_memory_result(c) for c in kept], t_high=t_high, t_low=t_low)
+    return {
+        **write,
+        'slates': Slates.WRITE_TIME,
+        'candidates': kept,
+        'band': decision.outcome,
+        'band_winner_id': decision.canonical_id,
+        'similarity': decision.similarity,
+    }
 
 
 def _usage_row(usage: JudgeUsage | None) -> dict[str, int | None] | None:
@@ -192,6 +260,7 @@ def _identity(
         'declares_attach_keys': write['declares_attach_keys'],
         'band': write['band'],
         'band_winner_id': write['band_winner_id'],
+        'slates': write['slates'],
         'attempts': 1,
         'transport_failures': [],
     }
@@ -323,6 +392,47 @@ def judge_band_order(
         return hashlib.sha256(f'{snapshot_sha256}:{write["memory_id"]}'.encode()).hexdigest()
 
     return sorted((w for w in snapshot['writes'] if w['band'] == OUTCOME_JUDGE), key=rank)
+
+
+@dataclass(frozen=True)
+class RunSet:
+    """The writes a run judges under its slates, and the drawn writes those slates moved out."""
+
+    slates: Slates
+    sample_size: int
+    writes: tuple[dict[str, Any], ...]
+    #: The drawn writes, viewed under *slates*, that the view moved out of the judge band.
+    leavers: tuple[dict[str, Any], ...]
+
+    @property
+    def left_judge_band(self) -> tuple[str, ...]:
+        return tuple(view['memory_id'] for view in self.leavers)
+
+
+def draw_run_set(
+    snapshot: Mapping[str, Any], snapshot_sha256: str, *,
+    max_writes: int | None, slates: Slates,
+) -> RunSet:
+    """The first *max_writes* of the frozen judge-band order, each viewed under *slates*.
+
+    A drawn write the view moves out of the judge band is listed, never
+    replaced by the next write of the order, so every mode judges π's sample.
+    """
+    sample = judge_band_order(snapshot, snapshot_sha256)[:max_writes]
+    match slates:
+        case Slates.FROZEN:
+            viewed = [{**write, 'slates': Slates.FROZEN} for write in sample]
+        case Slates.WRITE_TIME:
+            viewed = [
+                write_time_slate(write, t_high=snapshot['t_high'], t_low=snapshot['t_low'])
+                for write in sample
+            ]
+    return RunSet(
+        slates=slates,
+        sample_size=len(sample),
+        writes=tuple(view for view in viewed if view['band'] == OUTCOME_JUDGE),
+        leavers=tuple(view for view in viewed if view['band'] != OUTCOME_JUDGE),
+    )
 
 
 def arm_path(arms_dir: Path, arm_name: str) -> Path:
@@ -469,23 +579,30 @@ async def run_arms(
     budget_usd: float,
     sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
     max_attempts: int = 4,
+    slates: Slates = Slates.FROZEN,
 ) -> dict[str, Any]:
     """Run *arms* in order over the first *max_writes* of :func:`judge_band_order`.
 
+    Each write is judged on its *slates* view (:func:`draw_run_set`), and only
+    the arms of ``ARMS_OF[slates]`` may run.
     Resumable: a row already in ``arms_dir/<arm>.jsonl`` is never re-judged.
     Dispatch stops once the list-price spend of every arm file reaches
     *budget_usd*; calls in flight then still land, so the spend can pass it
     by up to *concurrency* calls (see :class:`_Budget`). Returns per-arm
-    coverage of the run set, whether the budget refused a dispatch, and the
-    spend.
+    coverage of the run set, whether the budget refused a dispatch, the
+    spend, the slates, the sample size and the drawn writes that left the band.
     """
+    off_table = [arm.name for arm in arms if arm not in ARMS_OF[slates]]
+    if off_table:
+        raise ValueError(f'arms {", ".join(off_table)} are not run on {slates} slates')
     too_wide = [arm.name for arm in arms if arm.width > snapshot['candidate_k']]
     if too_wide:
         raise ValueError(
             f'arms {", ".join(too_wide)} are wider than the frozen slates '
             f'(candidate_k={snapshot["candidate_k"]})',
         )
-    run_set = judge_band_order(snapshot, snapshot_sha256)[:max_writes]
+    drawn = draw_run_set(snapshot, snapshot_sha256, max_writes=max_writes, slates=slates)
+    run_set = drawn.writes
     arms_dir = Path(arms_dir)
     arms_dir.mkdir(parents=True, exist_ok=True)
     existing = {arm.name: _rows_of_this_snapshot(arms_dir, arm.name, snapshot_sha256) for arm in arms}
@@ -508,7 +625,11 @@ async def run_arms(
             'missing': len(run_set) - rows,
             'written_now': landed,
         }
-    return {'arms': coverage, 'budget_exhausted': budget.refused, 'spent_usd': budget.spent}
+    return {
+        'arms': coverage, 'budget_exhausted': budget.refused, 'spent_usd': budget.spent,
+        'slates': slates, 'sample_size': drawn.sample_size,
+        'left_judge_band': list(drawn.left_judge_band),
+    }
 
 
 # --- publish -------------------------------------------------------------------
@@ -524,6 +645,25 @@ _MATCHED_FIXTURE_PROVENANCE = ('field_chars', 'slate_mode', 'project_id', 'judge
 DEFAULT_POPULATION_OUT = _PACKAGE_ROOT / 'calibration' / 'write_triage_population.json'
 DEFAULT_PAIRS_OUT = _PACKAGE_ROOT / 'calibration' / 'write_triage_pairs_to_rate.jsonl'
 DEFAULT_ALREADY_RATED = _PACKAGE_ROOT / 'tests' / 'fixtures' / 'write_triage_pair_verdicts_seed.jsonl'
+DEFAULT_WRITE_TIME_POPULATION_OUT = (
+    _PACKAGE_ROOT / 'calibration' / 'write_triage_population_write_time.json'
+)
+DEFAULT_WRITE_TIME_PAIRS_OUT = (
+    _PACKAGE_ROOT / 'calibration' / 'write_triage_pairs_to_rate_write_time.jsonl'
+)
+#: The append-only verdict corpus the raters' answers land in.
+DEFAULT_VERDICT_CORPUS = _PACKAGE_ROOT / 'calibration' / 'write_triage_pair_verdicts.jsonl'
+
+#: How the write-time artifact's slates were cut, as the artifact states it.
+WRITE_TIME_RULE = (
+    "Each write is judged on the candidates of its frozen slate whose created_at is strictly "
+    "before the write's (an unparseable created_at cannot be shown earlier, so it is dropped); "
+    "band, band winner and similarity are re-decided by the shipped decide_band at the "
+    "snapshot's t_high and t_low. Where at least n candidates remain, the top n equal "
+    "production's write-time top n among records still live at the freeze. The sample is the "
+    "frozen judge-band prefix; a sampled write that leaves the judge band is listed, never "
+    "replaced."
+)
 
 
 def _sha256(data: bytes | str) -> str:
@@ -543,30 +683,87 @@ def _count(rows: Iterable[Mapping[str, Any]], key: str) -> dict[str, int]:
     return dict(sorted(collections.Counter(row[key] for row in rows).items()))
 
 
-def _validated_run_set(
-    snapshot: Mapping[str, Any], snapshot_sha256: str,
+#: The ``slates`` a published row may say under each mode. π's rows predate the
+#: field, so a frozen row may lack it; no row may say another mode's slates.
+_PUBLISHABLE_SLATES: dict[Slates, frozenset[Slates | None]] = {
+    Slates.FROZEN: frozenset({Slates.FROZEN, None}),
+    Slates.WRITE_TIME: frozenset({Slates.WRITE_TIME}),
+}
+
+
+def _refuse_partial_arms(
     arm_rows_by_name: Mapping[str, Sequence[Mapping[str, Any]]],
-) -> list[dict[str, Any]]:
-    """The run set every arm covers, refusing anything that would read as partial."""
-    for arm in ARMS:
+    snapshot_sha256: str,
+    expected_ids: Collection[str],
+    *,
+    slates: Slates,
+    expected_description: str,
+) -> None:
+    """Refuse, naming the arm, any arm of *slates* whose rows are not this run's.
+
+    Each arm of ``ARMS_OF[slates]`` must cover exactly *expected_ids*, once
+    each, with rows of this snapshot judged on *slates*.
+    *expected_description* names the expected writes in the refusal message.
+    """
+    arms = ARMS_OF[slates]
+    for arm in arms:
         if not arm_rows_by_name.get(arm.name):
             raise ValueError(f'arm {arm.name} has no rows to publish')
-    for arm in ARMS:
+    for arm in arms:
         rows = arm_rows_by_name[arm.name]
         foreign = sorted({str(row.get('snapshot_sha256')) for row in rows} - {snapshot_sha256})
         if foreign:
             raise ValueError(f'arm {arm.name} holds rows from another snapshot: {foreign}')
+        stray = sorted({
+            str(row.get('slates')) for row in rows
+            if row.get('slates') not in _PUBLISHABLE_SLATES[slates]
+        })
+        if stray:
+            raise ValueError(
+                f'arm {arm.name} holds rows judged on {", ".join(stray)} slates, not {slates}',
+            )
         if len({row['memory_id'] for row in rows}) != len(rows):
             raise ValueError(f'arm {arm.name} judged a write more than once')
-    prefix = judge_band_order(snapshot, snapshot_sha256)[:len(arm_rows_by_name[ARMS[0].name])]
-    expected = {write['memory_id'] for write in prefix}
-    for arm in ARMS:
-        if {row['memory_id'] for row in arm_rows_by_name[arm.name]} != expected:
-            raise ValueError(
-                f'arm {arm.name} does not cover the common prefix of the judge-band '
-                f'order, its first {len(prefix)} writes',
-            )
+    for arm in arms:
+        if {row['memory_id'] for row in arm_rows_by_name[arm.name]} != set(expected_ids):
+            raise ValueError(f'arm {arm.name} does not cover {expected_description}')
+
+
+def _validated_run_set(
+    snapshot: Mapping[str, Any], snapshot_sha256: str,
+    arm_rows_by_name: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> list[dict[str, Any]]:
+    """The run set every arm covers, refusing anything partial or on other slates."""
+    first_arm_rows = arm_rows_by_name.get(ARMS[0].name) or []
+    prefix = judge_band_order(snapshot, snapshot_sha256)[:len(first_arm_rows)]
+    _refuse_partial_arms(
+        arm_rows_by_name, snapshot_sha256, {write['memory_id'] for write in prefix},
+        slates=Slates.FROZEN,
+        expected_description=(
+            f'the common prefix of the judge-band order, its first {len(prefix)} writes'
+        ),
+    )
     return prefix
+
+
+def _validated_write_time_run_set(
+    snapshot: Mapping[str, Any], snapshot_sha256: str,
+    arm_rows_by_name: Mapping[str, Sequence[Mapping[str, Any]]],
+    sample_size: int,
+) -> RunSet:
+    """The write-time run set every arm covers, refusing anything partial or on other slates."""
+    run_set = draw_run_set(
+        snapshot, snapshot_sha256, max_writes=sample_size, slates=Slates.WRITE_TIME,
+    )
+    _refuse_partial_arms(
+        arm_rows_by_name, snapshot_sha256, {write['memory_id'] for write in run_set.writes},
+        slates=Slates.WRITE_TIME,
+        expected_description=(
+            f'the {len(run_set.writes)} of the first {run_set.sample_size} writes of the '
+            'judge-band order still in the judge band at write time'
+        ),
+    )
+    return run_set
 
 
 def _has_later_candidate(write: Mapping[str, Any]) -> bool:
@@ -600,6 +797,50 @@ def _population_block(
         'declares_attach_keys_writes': sum(1 for w in writes if w['declares_attach_keys']),
         **_freeze.exclusions(snapshot),
         'judge_band_with_later_candidates': sum(1 for w in run_set if _has_later_candidate(w)),
+    }
+
+
+def _write_time_population_block(
+    snapshot: Mapping[str, Any], snapshot_sha256: str, snapshot_path: Path, run_set: RunSet,
+) -> dict[str, Any]:
+    frozen = {write['memory_id']: write for write in snapshot['writes']}
+    n_judge_band_frozen = sum(1 for write in snapshot['writes'] if write['band'] == OUTCOME_JUDGE)
+    judged, leavers = run_set.writes, run_set.leavers
+    sizes = [len(write['candidates']) for write in judged]
+    return {
+        'slates': Slates.WRITE_TIME,
+        'slates_rule': WRITE_TIME_RULE,
+        'n_writes': len(snapshot['writes']),
+        'n_judge_band_frozen': n_judge_band_frozen,
+        'judge_band_sample': {
+            'order': _RUN_SET_ORDER, 'size': run_set.sample_size, 'of': n_judge_band_frozen,
+        },
+        'n_judge_band_write_time': len(judged),
+        'excluded_by_write_time_filter': {
+            'count': len(leavers),
+            'memory_ids': list(run_set.left_judge_band),
+            'by_band': _count(leavers, 'band'),
+        },
+        'band_winner_changed': sum(
+            1 for w in judged if w['band_winner_id'] != frozen[w['memory_id']]['band_winner_id']
+        ),
+        'writes_with_later_candidates': sum(
+            1 for w in (*judged, *leavers) if _has_later_candidate(frozen[w['memory_id']])
+        ),
+        'candidates_dropped': sum(
+            len(frozen[w['memory_id']]['candidates']) - len(w['candidates']) for w in judged
+        ),
+        'write_time_slate_size': {
+            'min': min(sizes), 'median': statistics.median(sizes), 'max': max(sizes),
+        },
+        'recon_marker_run_set': sum(1 for w in judged if w['recon_marker']),
+        'declares_attach_keys_run_set': sum(1 for w in judged if w['declares_attach_keys']),
+        'projects': list(snapshot['projects']),
+        'frozen_at': snapshot['frozen_at'],
+        'snapshot_sha256': snapshot_sha256,
+        'snapshot_path': repo_relative(snapshot_path),
+        't_high': snapshot['t_high'],
+        't_low': snapshot['t_low'],
     }
 
 
@@ -758,7 +999,7 @@ def build_population_artifact(
     are read from ``arms/`` beside *snapshot_path* for their path and digest.
     """
     run_set = _validated_run_set(snapshot, snapshot_sha256, arm_rows_by_name)
-    arms_dir = Path(snapshot_path).parent / 'arms'
+    arms_dir = Path(snapshot_path).parent / ARMS_DIR_NAME[Slates.FROZEN]
     arms = [
         _arm_row(arm, arm_rows_by_name[arm.name], arm_path(arms_dir, arm.name)) for arm in ARMS
     ]
@@ -771,6 +1012,41 @@ def build_population_artifact(
             'population': _wording_population(arm_rows_by_name),
             'fixture': _wording_fixture(fixture_reports),
         },
+    }
+
+
+def build_write_time_population_artifact(
+    snapshot: Mapping[str, Any],
+    snapshot_sha256: str,
+    snapshot_path: Path,
+    arm_rows_by_name: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    sample_size: int,
+    budget_usd: float,
+    pairs_to_rate: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The committed π2 artifact; refuses (``ValueError``) any partial or mixed arm.
+
+    Every arm of :data:`WRITE_TIME_ARMS` must cover, on write-time slates,
+    exactly the writes of the first *sample_size* of :func:`judge_band_order`
+    still in the judge band. Arm files are read from ``arms-write-time/``
+    beside *snapshot_path* for their path and digest.
+    """
+    run_set = _validated_write_time_run_set(
+        snapshot, snapshot_sha256, arm_rows_by_name, sample_size,
+    )
+    arms_dir = Path(snapshot_path).parent / ARMS_DIR_NAME[Slates.WRITE_TIME]
+    arms = [
+        _arm_row(arm, arm_rows_by_name[arm.name], arm_path(arms_dir, arm.name))
+        for arm in WRITE_TIME_ARMS
+    ]
+    return {
+        'population': _write_time_population_block(
+            snapshot, snapshot_sha256, snapshot_path, run_set,
+        ),
+        'arms': arms,
+        'spend': _spend_block(arms, budget_usd),
+        'pairs_to_rate': None if pairs_to_rate is None else dict(pairs_to_rate),
     }
 
 
@@ -802,6 +1078,28 @@ def build_pairs_to_rate(
     :func:`build_population_artifact` refuses.
     """
     _validated_run_set(snapshot, snapshot_sha256, arm_rows_by_name)
+    return _pair_rows(snapshot, snapshot_sha256, arm_rows_by_name, already_rated)
+
+
+def build_write_time_pairs_to_rate(
+    snapshot: Mapping[str, Any],
+    snapshot_sha256: str,
+    arm_rows_by_name: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    sample_size: int,
+    already_rated: Collection[tuple[str, str]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """:func:`build_pairs_to_rate` for the π2 run, refusing what its artifact refuses."""
+    _validated_write_time_run_set(snapshot, snapshot_sha256, arm_rows_by_name, sample_size)
+    return _pair_rows(snapshot, snapshot_sha256, arm_rows_by_name, already_rated)
+
+
+def _pair_rows(
+    snapshot: Mapping[str, Any],
+    snapshot_sha256: str,
+    arm_rows_by_name: Mapping[str, Sequence[Mapping[str, Any]]],
+    already_rated: Collection[tuple[str, str]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     writes = {write['memory_id']: write for write in snapshot['writes']}
     judged = {
         (row['memory_id'], row['judged_candidate_id'])
@@ -834,19 +1132,36 @@ def load_rated_pairs(paths: Iterable[Path]) -> set[tuple[str, str]]:
     }
 
 
+def read_rated_source(path: Path) -> tuple[frozenset[tuple[str, str]], dict[str, Any]]:
+    """The pairs a verdict file holds, and its ``{path, rows, sha256}`` record, from one read.
+
+    The record covers exactly the rows whose pairs are returned, so an
+    append-only file's later state keeps it as a prefix. A body whose last row
+    has no newline is refused: the next append would change that row.
+    """
+    body = Path(path).read_bytes()
+    if body and not body.endswith(b'\n'):
+        raise ValueError(f'{path} does not end in a newline; its last row may be a torn append')
+    lines = body.decode('utf-8').split('\n')[:-1]
+    pairs = frozenset(
+        (row['entry_id'], row['target_id']) for row in map(json.loads, filter(None, lines))
+    )
+    return pairs, {'path': repo_relative(path), 'rows': len(lines), 'sha256': _sha256(body)}
+
+
 # --- CLI -----------------------------------------------------------------------
 
 def _command_run(args: argparse.Namespace) -> int:
     from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
 
     snapshot, snapshot_sha256 = _freeze.load_snapshot(args.snapshot)
-    requested = set(args.arms or [arm.name for arm in ARMS])
+    requested = set(args.arms or [arm.name for arm in ARMS_OF[args.slates]])
     summary = asyncio.run(run_arms(
-        snapshot, snapshot_sha256, Path(args.snapshot).parent / 'arms',
+        snapshot, snapshot_sha256, Path(args.snapshot).parent / ARMS_DIR_NAME[args.slates],
         arms=[arm for arm in ARMS if arm.name in requested],
         service=types.SimpleNamespace(config=FusedMemoryConfig()),
         max_writes=args.max_writes, concurrency=args.concurrency,
-        budget_usd=args.budget_usd,
+        budget_usd=args.budget_usd, slates=args.slates,
     ))
     print(json.dumps(summary, indent=2))
     gaps = [f'{name} missing {c["missing"]}' for name, c in summary['arms'].items()
@@ -890,15 +1205,23 @@ def _write_staged(bodies: Mapping[Path, str]) -> None:
             temporary.unlink(missing_ok=True)
 
 
+def _jsonl_body(rows: Iterable[Mapping[str, Any]]) -> str:
+    return ''.join(json.dumps(row, sort_keys=True, ensure_ascii=False) + '\n' for row in rows)
+
+
+def _json_body(artifact: Mapping[str, Any]) -> str:
+    return json.dumps(artifact, indent=2, sort_keys=True, ensure_ascii=False) + '\n'
+
+
 def _command_publish(args: argparse.Namespace) -> int:
     snapshot, snapshot_sha256 = _freeze.load_snapshot(args.snapshot)
-    arms_dir = Path(args.snapshot).parent / 'arms'
+    arms_dir = Path(args.snapshot).parent / ARMS_DIR_NAME[Slates.FROZEN]
     arm_rows = {arm.name: read_rows(arm_path(arms_dir, arm.name)) for arm in ARMS}
     pairs, stats = build_pairs_to_rate(
         snapshot, snapshot_sha256, arm_rows,
         already_rated=load_rated_pairs(args.already_rated),
     )
-    pairs_body = ''.join(json.dumps(p, sort_keys=True, ensure_ascii=False) + '\n' for p in pairs)
+    pairs_body = _jsonl_body(pairs)
     artifact = build_population_artifact(
         snapshot, snapshot_sha256, args.snapshot, arm_rows,
         budget_usd=args.budget_usd,
@@ -907,14 +1230,39 @@ def _command_publish(args: argparse.Namespace) -> int:
             **stats, 'path': repo_relative(args.pairs_out), 'sha256': _sha256(pairs_body),
         },
     )
-    _write_staged({
-        args.pairs_out: pairs_body,
-        args.population_out: json.dumps(artifact, indent=2, sort_keys=True, ensure_ascii=False)
-        + '\n',
-    })
+    _write_staged({args.pairs_out: pairs_body, args.population_out: _json_body(artifact)})
     print(json.dumps({
         'population_out': str(args.population_out), 'pairs_out': str(args.pairs_out),
         'n_judge_band': artifact['population']['n_judge_band'],
+        'n_pairs': stats['n_pairs'], 'usd_total': artifact['spend']['usd_total'],
+    }, indent=2))
+    return 0
+
+
+def _command_publish_write_time(args: argparse.Namespace) -> int:
+    snapshot, snapshot_sha256 = _freeze.load_snapshot(args.snapshot)
+    arms_dir = Path(args.snapshot).parent / ARMS_DIR_NAME[Slates.WRITE_TIME]
+    arm_rows = {arm.name: read_rows(arm_path(arms_dir, arm.name)) for arm in WRITE_TIME_ARMS}
+    sources = [read_rated_source(path) for path in args.already_rated]
+    pairs, stats = build_write_time_pairs_to_rate(
+        snapshot, snapshot_sha256, arm_rows, sample_size=args.max_writes,
+        already_rated=frozenset().union(*(rated for rated, _ in sources)),
+    )
+    pairs_body = _jsonl_body(pairs)
+    artifact = build_write_time_population_artifact(
+        snapshot, snapshot_sha256, args.snapshot, arm_rows,
+        sample_size=args.max_writes, budget_usd=args.budget_usd,
+        pairs_to_rate={
+            **stats, 'path': repo_relative(args.pairs_out), 'sha256': _sha256(pairs_body),
+            'already_rated': [record for _, record in sources],
+        },
+    )
+    _write_staged({args.pairs_out: pairs_body, args.population_out: _json_body(artifact)})
+    population = artifact['population']
+    print(json.dumps({
+        'population_out': str(args.population_out), 'pairs_out': str(args.pairs_out),
+        'n_judge_band_write_time': population['n_judge_band_write_time'],
+        'excluded_by_write_time_filter': population['excluded_by_write_time_filter']['count'],
         'n_pairs': stats['n_pairs'], 'usd_total': artifact['spend']['usd_total'],
     }, indent=2))
     return 0
@@ -930,7 +1278,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     run.add_argument('--config', default=None,
                      help='path to a fused-memory config file (sets CONFIG_PATH)')
     run.add_argument('--snapshot', type=Path, required=True,
-                     help="a frozen snapshot.json; rows land in its directory's arms/")
+                     help="a frozen snapshot.json; rows land in its directory's arms/ "
+                          '(arms-write-time/ under --slates write-time)')
+    run.add_argument('--slates', type=Slates, choices=[s.value for s in Slates],
+                     default=Slates.FROZEN.value,
+                     help='judge each write on its frozen slate, or on the records created '
+                          'before it (default: frozen)')
     run.add_argument('--max-writes', dest='max_writes', type=int, default=None,
                      help='judge only this prefix of the judge-band order (default: all)')
     run.add_argument('--concurrency', type=int, default=8,
@@ -940,7 +1293,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                           'calls in flight still land, so spend can pass it by up to '
                           '--concurrency calls (default: 40.0)')
     run.add_argument('--arms', nargs='+', choices=[arm.name for arm in ARMS], default=None,
-                     help='arms to run, in ARMS order whatever the order given (default: all)')
+                     help='arms to run, in ARMS order whatever the order given '
+                          "(default: every arm of the --slates mode's table)")
     run.set_defaults(handler=_command_run)
     publish = commands.add_parser(
         'publish', help='refuse anything partial, then write the committed artifacts',
@@ -958,6 +1312,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                          help='a fixture eval report per wording; both or neither')
     publish.add_argument('--budget-usd', dest='budget_usd', type=float, default=40.0)
     publish.set_defaults(handler=_command_publish)
+    write_time = commands.add_parser(
+        'publish-write-time',
+        help='refuse anything partial, then write the π2 write-time artifacts',
+    )
+    write_time.add_argument('--snapshot', type=Path, required=True,
+                            help='the frozen snapshot.json whose arms-write-time/ to publish')
+    write_time.add_argument('--max-writes', dest='max_writes', type=int, required=True,
+                            help="the run's sample size, a prefix of the judge-band order "
+                                 "(π's is 658)")
+    write_time.add_argument('--population-out', dest='population_out', type=Path,
+                            default=DEFAULT_WRITE_TIME_POPULATION_OUT)
+    write_time.add_argument('--pairs-out', dest='pairs_out', type=Path,
+                            default=DEFAULT_WRITE_TIME_PAIRS_OUT)
+    write_time.add_argument('--already-rated', dest='already_rated', type=Path, nargs='+',
+                            default=[DEFAULT_VERDICT_CORPUS, DEFAULT_ALREADY_RATED],
+                            help='verdict files whose pairs are left out of the rater file '
+                                 '(default: the verdict corpus and the seed)')
+    write_time.add_argument('--budget-usd', dest='budget_usd', type=float, default=15.0)
+    write_time.set_defaults(handler=_command_publish_write_time)
     args = parser.parse_args(argv)
     if getattr(args, 'config', None):
         os.environ['CONFIG_PATH'] = str(args.config)

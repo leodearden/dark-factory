@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import httpx
 import pytest
@@ -14,6 +15,7 @@ from _dashboard_helpers import (
     mcp_tool_response,
 )
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
+from shared.testing_virtual_clock import virtual_clock_test
 
 
 class _PerPortHandler:
@@ -23,6 +25,11 @@ class _PerPortHandler:
     ``TaskRuntimeSnapshot(...).model_dump(mode='json')``) to return on
     tools/call. ``fail_ports`` raise httpx.ConnectError. ``slow_ports``
     sleep before responding (to drive the timeout path).
+    ``stall_ports`` BLOCK the loop thread (``time.sleep``) once per cold
+    probe, on its ``initialize`` leg — a starved xdist worker: host wall
+    clock moves while the loop cannot run.
+    Unlike ``slow_ports`` (an in-loop await), a stall cannot move a
+    shared/src/shared/testing_virtual_clock.py::virtual_clock_test loop clock.
     ``error_status_ports`` maps port -> HTTP status returned on the
     tools/call leg, which ``mcp_tool_call``'s ``raise_for_status()`` turns
     into an ``httpx.HTTPStatusError`` (the "orchestrator answered, but
@@ -38,27 +45,31 @@ class _PerPortHandler:
         *,
         fail_ports: set[int] | None = None,
         slow_ports: dict[int, float] | None = None,
+        stall_ports: dict[int, float] | None = None,
         error_status_ports: dict[int, int] | None = None,
         raise_ports: dict[int, BaseException] | None = None,
     ):
         self.responses = responses or {}
         self.fail_ports = fail_ports or set()
         self.slow_ports = slow_ports or {}
+        self.stall_ports = stall_ports or {}
         self.error_status_ports = error_status_ports or {}
         self.raise_ports = raise_ports or {}
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         port = request.url.port
         assert port is not None
+        body = json.loads(request.content)
+        method = body.get('method', '')
+        request_id = body.get('id', 1)
+        if port in self.stall_ports and method == 'initialize':
+            time.sleep(self.stall_ports[port])
         if port in self.raise_ports:
             raise self.raise_ports[port]
         if port in self.fail_ports:
             raise httpx.ConnectError('refused')
         if port in self.slow_ports:
             await asyncio.sleep(self.slow_ports[port])
-        body = json.loads(request.content)
-        method = body.get('method', '')
-        request_id = body.get('id', 1)
         if method == 'initialize':
             return mcp_init_response(request_id)
         if method.startswith('notifications/'):
@@ -95,6 +106,10 @@ def _clean_probe_log_state():
     reset_probe_log_state()
     yield
     reset_probe_log_state()
+
+
+_PROBE_DEADLINE_SECONDS = 0.05
+_HOST_STALL_SECONDS = 2 * _PROBE_DEADLINE_SECONDS
 
 
 def _urls(*ports: int) -> dict[str, str]:
@@ -173,16 +188,18 @@ class TestFetchTaskRuntime:
             offline=True, offline_reason='unreachable',
         )
 
+    @virtual_clock_test
     async def test_timeout_yields_offline_snapshot_for_slow_project_only(self):
         from dashboard.data.task_runtime import fetch_task_runtime
         handler = _PerPortHandler(
             {8100: TaskRuntimeSnapshot().model_dump(mode='json')},
             slow_ports={8105: 0.5},
+            stall_ports={8100: _HOST_STALL_SECONDS},
         )
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
             result = await fetch_task_runtime(
-                client, _urls(8100, 8105), per_call_timeout=0.05,
+                client, _urls(8100, 8105), per_call_timeout=_PROBE_DEADLINE_SECONDS,
             )
 
         assert result['proj8100'].offline is False
@@ -241,7 +258,7 @@ class TestProbeReasonDiscriminator:
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
             result = await fetch_task_runtime(
-                client, _urls(8105), per_call_timeout=0.05,
+                client, _urls(8105), per_call_timeout=_PROBE_DEADLINE_SECONDS,
             )
 
         assert result['proj8105'].offline is True
@@ -320,7 +337,7 @@ class TestProbeReasonDiscriminator:
         async with httpx.AsyncClient(transport=transport) as client:
             with caplog.at_level('WARNING'):
                 await fetch_task_runtime(
-                    client, _urls(8105), per_call_timeout=0.05,
+                    client, _urls(8105), per_call_timeout=_PROBE_DEADLINE_SECONDS,
                 )
 
         messages = [rec.getMessage() for rec in caplog.records]
@@ -356,7 +373,7 @@ class TestAllProjectsDeadlineWarning:
         async with httpx.AsyncClient(transport=transport) as client:
             with caplog.at_level('WARNING'):
                 result = await fetch_task_runtime(
-                    client, _urls(8105, 8106, 8107), per_call_timeout=0.05,
+                    client, _urls(8105, 8106, 8107), per_call_timeout=_PROBE_DEADLINE_SECONDS,
                 )
 
         aggregate = self._aggregate_records(caplog)
@@ -370,34 +387,41 @@ class TestAllProjectsDeadlineWarning:
         assert set(result) == {'proj8105', 'proj8106', 'proj8107'}
         assert all(s.offline_reason == 'deadline_exceeded' for s in result.values())
 
+    @virtual_clock_test
     async def test_one_of_two_timing_out_does_not_warn(self, caplog):
         """One project down while the other answers IS a per-project outage."""
         from dashboard.data.task_runtime import fetch_task_runtime
         handler = _PerPortHandler(
             {8100: TaskRuntimeSnapshot().model_dump(mode='json')},
             slow_ports={8105: 0.5},
+            stall_ports={8100: _HOST_STALL_SECONDS},
         )
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
             with caplog.at_level('WARNING'):
                 result = await fetch_task_runtime(
-                    client, _urls(8100, 8105), per_call_timeout=0.05,
+                    client, _urls(8100, 8105), per_call_timeout=_PROBE_DEADLINE_SECONDS,
                 )
 
         assert self._aggregate_records(caplog) == []
         assert result['proj8100'].offline is False
         assert result['proj8105'].offline_reason == 'deadline_exceeded'
 
+    @virtual_clock_test
     async def test_all_failing_with_mixed_reasons_does_not_warn(self, caplog):
         """Every project failing but for DIFFERENT reasons is not the
         starvation signature — one of them really is unreachable."""
         from dashboard.data.task_runtime import fetch_task_runtime
-        handler = _PerPortHandler(slow_ports={8105: 0.5}, fail_ports={8102})
+        handler = _PerPortHandler(
+            slow_ports={8105: 0.5},
+            fail_ports={8102},
+            stall_ports={8102: _HOST_STALL_SECONDS},
+        )
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
             with caplog.at_level('WARNING'):
                 result = await fetch_task_runtime(
-                    client, _urls(8102, 8105), per_call_timeout=0.05,
+                    client, _urls(8102, 8105), per_call_timeout=_PROBE_DEADLINE_SECONDS,
                 )
 
         assert self._aggregate_records(caplog) == []
@@ -414,7 +438,7 @@ class TestAllProjectsDeadlineWarning:
         async with httpx.AsyncClient(transport=transport) as client:
             with caplog.at_level('WARNING'):
                 result = await fetch_task_runtime(
-                    client, _urls(8105), per_call_timeout=0.05,
+                    client, _urls(8105), per_call_timeout=_PROBE_DEADLINE_SECONDS,
                 )
 
         assert self._aggregate_records(caplog) == []
@@ -534,7 +558,9 @@ class TestProbeWarningsAreTransitionLogged:
         slow = httpx.MockTransport(_PerPortHandler(slow_ports={8102: 0.5}))
         async with httpx.AsyncClient(transport=slow) as client:
             with caplog.at_level('DEBUG'):
-                await fetch_task_runtime(client, _urls(8102), per_call_timeout=0.05)
+                await fetch_task_runtime(
+                    client, _urls(8102), per_call_timeout=_PROBE_DEADLINE_SECONDS,
+                )
 
         warnings = self._for(caplog, 'WARNING', '8102')
         assert len(warnings) == 2, warnings
@@ -572,7 +598,7 @@ class TestProbeWarningsAreTransitionLogged:
             with caplog.at_level('DEBUG'):
                 for _ in range(3):
                     await fetch_task_runtime(
-                        client, _urls(8105, 8106), per_call_timeout=0.05,
+                        client, _urls(8105, 8106), per_call_timeout=_PROBE_DEADLINE_SECONDS,
                     )
 
         assert len(self._for(caplog, 'WARNING', 'probed projects')) == 1

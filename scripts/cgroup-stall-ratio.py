@@ -11,7 +11,8 @@ xdist workers 57%) and by the follow-up gate that checks per-role cgroup
 CPUWeight on verify scopes actually moves these numbers.
 
 Buckets: df (orchestrator-dark-factory.service), reify (orchestrator-reify.service),
-verify-scope:<project> (df-verify-<project>-* transient scopes), other.
+verify-scope:<slug> (df-verify-* transient scopes, labelled by the scope tag's
+basename slug: verify-scope:dark-factory, verify-scope:reify), other.
 Families: xdist worker, pytest master, claude-cli, rustc, cargo test binary, cargo,
 orch-main, git, other. The verify ROLE is inferred from nice (5 merge / 15 task /
 19 background, per shared/verify_admission.py::_NICE_TIERS), which holds both inside
@@ -31,6 +32,7 @@ import sys
 import time
 
 ROLE_BY_NICE = {5: 'merge', 15: 'task', 19: 'background'}
+SCOPE_SLUG = {'df': 'dark-factory', 'reify': 'reify'}
 
 
 def snap() -> dict[str, tuple[int, int, str, int, str]]:
@@ -59,7 +61,7 @@ def bucket(cg: str) -> str:
         return 'df'
     if 'orchestrator-reify.service' in cg:
         return 'reify'
-    m = re.search(r'df-verify-([A-Za-z0-9_]+)-', cg)
+    m = re.search(r'df-verify-([a-z0-9-]+)-[0-9a-f]{8}-[0-9a-f]{12}\.scope', cg)
     if m:
         return f'verify-scope:{m.group(1)}'
     return 'other'
@@ -83,6 +85,30 @@ def family(cl: str) -> str:
     if re.search(r'^git |/git |git-', cl):
         return 'git'
     return 'other'
+
+
+def _is_verify(bk: str, proj: str) -> bool:
+    return bk == proj or bk == f'verify-scope:{SCOPE_SLUG[proj]}'
+
+
+def headline(run: collections.Counter, wait: collections.Counter, dt: float, psi: str, runq: str) -> dict:
+    def cls(pred):
+        r = sum(run[k] for k in run if pred(k))
+        w = sum(wait[k] for k in wait if pred(k))
+        tot = r + w
+        return {'run_cores': round(r / 1e9 / dt, 2), 'wait_cores': round(w / 1e9 / dt, 2),
+                'stall_pct': round(100 * w / tot) if tot else None}
+
+    return {
+        'psi_cpu_some_avg10': psi, 'procs_running': runq, 'window_s': round(dt, 1),
+        'df_agents': cls(lambda k: k[0] == 'df' and k[1] == 'claude-cli'),
+        'df_merge_workers': cls(lambda k: _is_verify(k[0], 'df') and k[1] == 'xdist-worker' and k[2] == 5),
+        'df_task_workers': cls(lambda k: _is_verify(k[0], 'df') and k[1] == 'xdist-worker' and k[2] == 15),
+        'df_background_workers': cls(lambda k: _is_verify(k[0], 'df') and k[1] == 'xdist-worker' and k[2] == 19),
+        'reify_agents': cls(lambda k: k[0] == 'reify' and k[1] == 'claude-cli'),
+        'reify_merge_verify': cls(lambda k: _is_verify(k[0], 'reify') and k[1] in ('rustc', 'test-binary', 'cargo') and k[2] == 5),
+        'reify_task_verify': cls(lambda k: _is_verify(k[0], 'reify') and k[1] in ('rustc', 'test-binary', 'cargo') and k[2] == 15),
+    }
 
 
 def main() -> int:
@@ -130,27 +156,7 @@ def main() -> int:
               f'{run[k] / 1e9 / dt:7.2f} {wait[k] / 1e9 / dt:7.2f} {100 * wait[k] / tot if tot else 0:6.0f}%')
 
     if args.json:
-        def cls(pred):
-            r = sum(run[k] for k in run if pred(k))
-            w = sum(wait[k] for k in wait if pred(k))
-            tot = r + w
-            return {'run_cores': round(r / 1e9 / dt, 2), 'wait_cores': round(w / 1e9 / dt, 2),
-                    'stall_pct': round(100 * w / tot) if tot else None}
-
-        def is_verify(bk: str, proj: str) -> bool:
-            return bk == proj or bk == f'verify-scope:{proj if proj != "df" else "dark_factory"}'
-
-        headline = {
-            'psi_cpu_some_avg10': psi, 'procs_running': runq, 'window_s': round(dt, 1),
-            'df_agents': cls(lambda k: k[0] == 'df' and k[1] == 'claude-cli'),
-            'df_merge_workers': cls(lambda k: is_verify(k[0], 'df') and k[1] == 'xdist-worker' and k[2] == 5),
-            'df_task_workers': cls(lambda k: is_verify(k[0], 'df') and k[1] == 'xdist-worker' and k[2] == 15),
-            'df_background_workers': cls(lambda k: is_verify(k[0], 'df') and k[1] == 'xdist-worker' and k[2] == 19),
-            'reify_agents': cls(lambda k: k[0] == 'reify' and k[1] == 'claude-cli'),
-            'reify_merge_verify': cls(lambda k: is_verify(k[0], 'reify') and k[1] in ('rustc', 'test-binary', 'cargo') and k[2] == 5),
-            'reify_task_verify': cls(lambda k: is_verify(k[0], 'reify') and k[1] in ('rustc', 'test-binary', 'cargo') and k[2] == 15),
-        }
-        print(json.dumps(headline))
+        print(json.dumps(headline(run, wait, dt, psi, runq)))
     return 0
 
 

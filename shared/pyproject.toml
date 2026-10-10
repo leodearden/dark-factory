@@ -74,6 +74,10 @@ dev = [
 markers = ["integration: live CLI tests requiring OAuth accounts (deselect: -m 'not integration')"]
 addopts = "-m 'not integration'"
 asyncio_mode = "auto"
+filterwarnings = [
+    # Sync def under an @pytest.mark.asyncio mark: mark mismatch (same entry as orchestrator/pyproject.toml).
+    "error:The test .* is marked with '@pytest.mark.asyncio' but it is not an async function:pytest.PytestWarning",
+]
 # Default per-test timeout. THE CANONICAL RATIONALE for this setting across
 # the workspace — orchestrator/, fused-memory/, escalation/ and dashboard/
 # pyproject.toml cite this block rather than restating it.
@@ -106,9 +110,10 @@ asyncio_mode = "auto"
 # paragraph used to say nobody had done. The worst per-test wall clock of an
 # UNMARKED test, across every suite and both inifile-resolution modes under real
 # fleet load, measured 61.52s; times the 8x headroom factor whose rationale is
-# orchestrator/tests/test_whole_tree_scan_timeout_guard.py
-# ::_REQUIRED_HEADROOM_FACTOR, rounded up to a whole minute, floored at the
-# independently-measured 300. The full corpus, the run-to-run spread and the
+# orchestrator/tests/_orch_helpers.py::UNDER_LOAD_HEADROOM_FACTOR, rounded up
+# to a whole minute, floored at
+# orchestrator/tests/test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS.
+# The full corpus, the run-to-run spread and the
 # arithmetic are in
 # plans/pytest-per-test-timeout-measurement-2026-09-17.md — read that before
 # moving this number, and re-measure rather than re-judging it.

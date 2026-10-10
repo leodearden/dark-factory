@@ -218,6 +218,38 @@ write_journal:
   prune_max_rows_per_run: ${WRITE_JOURNAL_PRUNE_MAX_ROWS:500000}
   prune_max_seconds: ${WRITE_JOURNAL_PRUNE_MAX_SECONDS:30}
 
+# ─────────────────────────────────────────────────────────────────────────────
+# write_journal_growth_alarm — RED-TIER / restart-only (task 3311). Every
+# check_interval_seconds the checkpoint loop samples write_journal.db; a crossed
+# ceiling logs a WARNING naming the measured size and files an escalation. The
+# alarm DELETES NOTHING: rows are bounded by the write_journal prune above, and
+# the volume fix and reclaim are task 5405's. Task 5405 must re-anchor both
+# ceilings after it lands.
+#
+# MEASURED BASIS (2026-10-09, live journal, read-only):
+#   file      17,296,526,128 B including -wal/-shm, 366.8 MB of it on the freelist
+#   net file  +901.8 MB over ~29.5 days (~30.6 MB/day), despite the task-5247
+#             prune running throughout
+#   inserts   trailing-7d mean 931,647 rows/day; highest 24 h window 1,108,612;
+#             d-10..d-21 ran 412k-642k/day, so a ~1.9x step around 2026-09-30
+#
+# max_file_bytes = 18 GiB is ~2.03 GB above today's file. If the prune stopped
+# deleting, inserts (~439 MB/day = 931,647 rows x 471 B/row, the last exact
+# bytes/row measurement, 2026-09-10) would absorb the freelist and cross it in
+# ~5.5 days; at today's ~30.6 MB/day net creep it is crossed in ~66 days.
+# `auto_vacuum` is NONE, so the file never shrinks without an offline VACUUM: a
+# size breach stays breached until an operator VACUUMs or deliberately raises
+# this ceiling, recording the reason here.
+#
+# max_rows_inserted_per_day = 1.5M is 1.35x the highest 24 h window and 1.61x
+# the 7-day mean. A repeat of the late-September step would cross it within a
+# day. It clears by itself when the rate falls.
+# ─────────────────────────────────────────────────────────────────────────────
+write_journal_growth_alarm:
+  max_file_bytes: ${WRITE_JOURNAL_GROWTH_ALARM_MAX_FILE_BYTES:19327352832}
+  max_rows_inserted_per_day: ${WRITE_JOURNAL_GROWTH_ALARM_MAX_ROWS_PER_DAY:1500000}
+  check_interval_seconds: ${WRITE_JOURNAL_GROWTH_ALARM_CHECK_INTERVAL_SECONDS:3600}
+
 
 # task_metadata.enforce — RED-TIER / restart-only (task 2162, W3-β). warn-mode
 # (false) logs a task_metadata.schema_warning line per SchemaWarning and lets
@@ -467,10 +499,12 @@ mem0_update:
   # storm_threshold: 20
   # storm_window_seconds: 3600.0
 
-# Link-heal executor caps (task 6181, plans/write-triage-link-healing-prd.md
-# H1). Read by fused-memory/scripts/link_heal.py at each run start, so an edit
-# takes effect on the next run with no restart. Every value below is the shipped
-# default, shown so the knobs are discoverable. Uncomment to change one.
+# Link-heal executor caps and link adjudicator knobs (tasks 6181, 6184;
+# plans/write-triage-link-healing-prd.md H1, H2). Read by
+# fused-memory/scripts/link_heal.py and scripts/eval_link_adjudicator.py at each
+# run start, so an edit takes effect on the next run with no restart. Every
+# value below is the shipped default, shown so the knobs are discoverable.
+# Uncomment to change one.
 # link_heal:
 #   # Write attempts per unattended run, oldest-planned first; the rest stay
 #   # pending as skipped_cap. 0 applies nothing unattended.
@@ -479,6 +513,18 @@ mem0_update:
 #   backlog_multiplier: 5
 #   # Consecutive failed actions that stop a run (link-heal-write-failure).
 #   write_failure_streak: 3
+#   # Claude CLI model alias the link adjudicator asks.
+#   adjudicator_model: opus
+#   # Pairs per adjudicator CLI call.
+#   shard_size: 40
+#   # Cap per text, with the rater brief's truncation marker.
+#   field_chars: 4000
+#   # Apply writes nothing past this adjudicated misfile share (link-heal-misfile-share).
+#   misfile_share_ceiling: 0.25
+#   # Apply writes nothing past this adjudicated CORRECTS share (link-heal-corrects-share).
+#   corrects_share_ceiling: 0.60
+#   # Consecutive failed adjudicator shards that stop adjudicating (link-heal-adjudicator).
+#   shard_failure_streak: 3
 
 # Entity-node minting (task 4932) — the ensure_entity_node MCP tool, which
 # CREATES a Graphiti Entity node so a dangling referent has something to point

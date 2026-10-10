@@ -224,9 +224,9 @@ def _join_continuations(text: str) -> list[str]:
     """Return *text*'s lines with backslash continuations joined into one line.
 
     While a line ends in ``\\``, the backslash is dropped and the NEXT line's
-    stripped form is appended after a single space.  Mirrors ``_logical_exec_start``
-    in tests/scripts/test_dashboard_service_template.py, generalised from "the
-    ExecStart line" to "every line".
+    stripped form is appended after a single space.  Mirrors
+    tests/scripts/systemd_unit_invariants.py::logical_exec_start, generalised
+    from "the ExecStart line" to "every line".
 
     Joining happens BEFORE comment classification, which matches systemd's own
     behaviour: a comment line ending in ``\\`` continues, and its continuation

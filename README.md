@@ -140,9 +140,10 @@ graphiti/, mem0/     # git submodules (upstream Graphiti, Mem0)
   maintainer's project fleet on one machine — some scripts and unit files
   still carry hardcoded paths and project lists from that history.
   `SETUP.md` flags each one as a **Known gap** with what to change.
-- **Sandboxing is off by default.** Per-task agent sandboxing (`bwrap` /
-  Landlock) is implemented but disabled in the shipped defaults for task
-  agents — worktree isolation is git-level, not OS-level, today.
+- **Sandboxing is off by default.** The shipped defaults leave OS-level
+  agent sandboxing disabled. This fleet turns it on explicitly per project
+  with the Landlock backend (validated on x86_64 only); see
+  `docs/sandbox-fleet-status.md`.
 - **No auto-discovery, by design.** The orchestrator refuses to run without
   an explicit `--config` (or `ORCH_CONFIG_PATH`) — a past incident ran an
   orchestrator against the wrong project for 12 hours. This is a safety

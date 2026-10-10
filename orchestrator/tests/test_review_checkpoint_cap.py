@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _orch_helpers import pydantic_spec, stamp_stock_routing_config
 from _recording_event_store import _RecordingEventStore
-from shared.cli_invoke import AllAccountsCappedException
+from shared.cli_invoke import AgentResult, AllAccountsCappedException
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.review_checkpoint import ReviewCheckpoint, ReviewReport
@@ -278,3 +278,120 @@ class TestReviewCheckpointVerifyRole:
             "on run_full_verification's default, or an explicit role='task'); "
             f"got kwargs={call_kwargs!r}"
         )
+
+
+_REVIEW_PAYLOAD = {'findings': [], 'summary': 'all good'}
+
+
+@pytest.mark.asyncio
+class TestReviewCheckpointInvocationRecord:
+    """The deep_reviewer ``save_invocation`` row records the exact served
+    ``model_id`` and which configured ceiling, if any, ended the run (task 4826).
+
+    This path emits no ``invocation_end`` event, so its ``invocations`` row is
+    the ONLY durable record of a reviewer cap kill.
+    """
+
+    async def _drive(
+        self, monkeypatch, result: AgentResult, *, backend: str = 'claude',
+    ) -> tuple[dict, dict]:
+        """Run one focused review on *backend* returning *result*; give back
+        ``(save_invocation kwargs, invoke_with_cap_retry kwargs)``."""
+        checkpoint = _make_checkpoint()
+        checkpoint.config.backends.deep_reviewer = backend
+        cost_store = MagicMock()
+        cost_store.save_invocation = AsyncMock()
+        cost_store.model_cost_in_window = AsyncMock(return_value=0.0)
+        checkpoint.cost_store = cost_store
+        mock_invoke = AsyncMock(return_value=result)
+
+        monkeypatch.setattr('orchestrator.review_checkpoint.invoke_with_cap_retry', mock_invoke)
+        monkeypatch.setattr(
+            'orchestrator.review_checkpoint.run_full_verification',
+            AsyncMock(return_value=_PHASE1_RESULT),
+        )
+        monkeypatch.setattr(
+            'orchestrator.review_checkpoint.ReviewCheckpoint._save_report',
+            lambda *a, **kw: None,
+        )
+
+        await checkpoint.run_focused()
+
+        cost_store.save_invocation.assert_awaited_once()
+        return cost_store.save_invocation.call_args.kwargs, dict(mock_invoke.call_args.kwargs)
+
+    async def test_exact_model_id_is_recorded_beside_the_resolved_alias(self, monkeypatch):
+        save_kw, invoke_kw = await self._drive(
+            monkeypatch,
+            AgentResult(
+                success=True, output='', subtype='success',
+                structured_output=_REVIEW_PAYLOAD, model_id='claude-opus-5',
+            ),
+        )
+        assert save_kw['model'] == invoke_kw['model'], (
+            'model must stay the routing-resolved alias the reviewer was invoked with'
+        )
+        assert save_kw['model_id'] == 'claude-opus-5'
+        assert save_kw['model'] != save_kw['model_id']
+
+    async def test_budget_cap_kill_is_recorded(self, monkeypatch):
+        save_kw, invoke_kw = await self._drive(
+            monkeypatch,
+            AgentResult(
+                success=False, output='', subtype='error_max_budget_usd',
+                cost_usd=10.04, turns=22,
+            ),
+        )
+        assert invoke_kw['max_budget_usd'] == 10.0
+        assert save_kw['capped'] is True
+        assert save_kw['capped_reason'] == 'budget'
+
+    async def test_turn_cap_kill_is_recorded(self, monkeypatch):
+        save_kw, _ = await self._drive(
+            monkeypatch,
+            AgentResult(
+                success=False, output='', subtype='error_max_turns', cost_usd=2.1, turns=50,
+            ),
+        )
+        assert save_kw['capped'] is True
+        assert save_kw['capped_reason'] == 'turns'
+
+    async def test_resolved_budget_reaches_the_numeric_fallback(self, monkeypatch):
+        """A failed reviewer run AT the resolved budget with an inconclusive
+        subtype is attributed to the budget ceiling."""
+        save_kw, invoke_kw = await self._drive(
+            monkeypatch,
+            AgentResult(
+                success=False, output='', subtype='error_during_execution',
+                cost_usd=10.0, turns=3,
+            ),
+        )
+        assert invoke_kw['max_budget_usd'] == 10.0
+        assert save_kw['capped_reason'] == 'budget'
+
+    async def test_normal_review_is_not_capped(self, monkeypatch):
+        save_kw, _ = await self._drive(
+            monkeypatch,
+            AgentResult(
+                success=True, output='', subtype='success',
+                structured_output=_REVIEW_PAYLOAD, cost_usd=3.2, turns=18,
+            ),
+        )
+        assert save_kw['capped'] is False
+        assert save_kw['capped_reason'] is None
+        assert 'model_id' in save_kw
+        assert save_kw['model_id'] is None
+
+    async def test_non_claude_failed_review_past_the_budget_is_not_capped(self, monkeypatch):
+        """The deep_reviewer backend reaches the classifier as well as the
+        invoke: a backend that enforces no budget ceiling is never budget-capped."""
+        save_kw, invoke_kw = await self._drive(
+            monkeypatch,
+            AgentResult(
+                success=False, output='', subtype='', cost_usd=12.0, turns=3,
+            ),
+            backend='codex',
+        )
+        assert invoke_kw['backend'] == 'codex'
+        assert save_kw['capped'] is False
+        assert save_kw['capped_reason'] is None

@@ -1,5 +1,7 @@
 """System prompt for Stage 1: Memory Consolidator."""
 
+import json
+
 from fused_memory.memory_metadata import render_metadata_vocabulary_guidance
 from fused_memory.reconciliation.consolidation_gate import (
     render_consolidation_gate_section,
@@ -13,6 +15,9 @@ from fused_memory.reconciliation.internal_writers import (
 from fused_memory.reconciliation.live_workflow_section import (
     NOT_LIVE_TOKEN,
     render_live_workflow_authority_rules,
+)
+from fused_memory.reconciliation.preservation_specimen_guard import (
+    preservation_mem0_filters,
 )
 from fused_memory.reconciliation.prompts import (
     _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
@@ -63,6 +68,11 @@ EXECUTING_A_CLUSTER_FOLD_HEADING = f'## {EXECUTING_A_CLUSTER_FOLD_TITLE}'
 LIVE_STATE_FRESHNESS_TITLE = 'Live-State Freshness Before Re-Flagging'
 LIVE_STATE_FRESHNESS_HEADING = f'## {LIVE_STATE_FRESHNESS_TITLE}'
 
+#: The preserved-specimen section's heading (task 5465), exported for the same
+#: reason, for ``tests/reconciliation/test_stage1_preservation_specimen_prompt.py``.
+PRESERVED_SPECIMEN_CORROBORATION_TITLE = 'Preserved-Specimen Corroboration'
+PRESERVED_SPECIMEN_CORROBORATION_HEADING = f'## {PRESERVED_SPECIMEN_CORROBORATION_TITLE}'
+
 _CHILD_KIND_NAMES = ' or '.join(f'`{kind}`' for kind in sorted(CHILD_KINDS))
 
 #: The Authority-Model carve-out for child memories (task 6193), exported so
@@ -110,6 +120,11 @@ duplicate Mem0 cluster into one canonical entry, in place of a hand-rolled \
 - `mcp__fused-memory__get_memory_by_id` — read one Mem0 entry by id, returning its \
 RAW stored payload under `metadata` (including the `agent_id` that wrote it, which \
 search results do NOT carry)
+- `mcp__fused-memory__get_memories_by_metadata` — enumerate the Mem0 entries whose \
+metadata EQUALS every key in `filters`. A deterministic payload scroll, not a ranked \
+`search`, so a low-similarity match is never cut off; each row's `metadata` is the raw \
+stored payload, prose included. See the **{PRESERVED_SPECIMEN_CORROBORATION_TITLE}** \
+section below.
 - `mcp__fused-memory__update_edge` — update an existing edge's fact text directly (no LLM pipeline)
 {AMEND_AND_EPISODE_TOOLS_BLOCK}
 - `mcp__fused-memory__refresh_entity_summary` — regenerate an entity node's summary \
@@ -804,8 +819,7 @@ only ever as a report-only note per the audit rule above — never as a finding.
 **Tool error handling**: if `count_memories_by_metadata` returns an error (e.g. backend \
 unavailable), treat as inconclusive and do NOT reconstruct — the documented harm is \
 false-positive reconstruction (wasteful duplicate summaries), so bias toward skipping \
-reconstruction on uncertainty. Note the tool error in your cycle report instead. \
-This mirrors the Flag Suppression Check's conservative handling of search failures.
+reconstruction on uncertainty. Note the tool error in your cycle report instead.
 
 Rationale: back-to-back remediation passes otherwise trigger double-reconstruction of \
 the same Stage 2 summary, producing duplicate per-cycle entries a later cycle must clean \
@@ -824,14 +838,13 @@ search Mem0 for a completion summary written by TaskInterceptor / TargetedReconc
   project_id=..., categories=['observations_and_summaries'], stores=['mem0'], limit=20)
 
 Including `task_id=<task_id>` in the query biases the vector ranking toward the specific \
-task's entry (mirroring the Flag Suppression Check which uses \
-`query="stage1_flag_suppression task_id=<N>"`); without it a generic query risks ranking \
+task's entry; without it a generic query risks ranking \
 the relevant entry out of the top-20 when many tasks have completion summaries.
 
 Inspect each result: if any result satisfies BOTH of the following, do NOT emit the \
 missing-completion-summary finding for that task:
   1. `str(result.metadata.get('task_id')) == str(task_id)` (both sides coerced to str \
-to handle legacy int vs str task_id — consistent with the Flag Suppression Check)
+to handle legacy int vs str task_id)
   2. `result.metadata.get('source') == 'targeted_reconciliation'` \
 OR the result content contains "completed"
 
@@ -853,62 +866,19 @@ through can be cleaned up in a later consolidation cycle.
 ## Flag Suppression Check
 **The deterministic suppression gate is enforced in code** by \
 `flag_dedup.filter_suppressed`, which runs as the first step of the post-processor \
-before any flag reaches the signature-dedup loop.  You do not need to perform this \
-check yourself — suppressed flags are dropped automatically.
+before any flag reaches the signature-dedup loop and reads ONLY `recon_ledger` rows.  \
+You do not need to perform this check yourself — suppressed flags are dropped automatically.
 
-As an optimisation you *may* skip emitting a flag for a task that you know is \
-suppressed, but the code gate is the authoritative enforcement point; any flag you \
-emit for a suppressed task_id (and, for a scoped record, matching flag_type — see \
-below) will be dropped by the post-processor regardless.
+Do NOT withhold a flag because you believe it is suppressed: emit it. The code gate \
+is the only authority on what is suppressed, and it drops every flag matched by an \
+active suppression row (for a scoped row, only a matching flag_type — see below).
 
 {render_suppression_schema_section()}
-
-Producing a suppression record: operators and remediation hooks should call \
-`fused_memory.reconciliation.flag_dedup.write_suppression_record(memory_service, \
-project_id=..., task_id=N, flag_types=[...])` rather than constructing the \
-canonical schema by hand. The helper coerces `task_id` to a string (accepting a \
-single numeric id or a comma-joined composite signature), sorts/dedupes \
-`flag_types`, and pins the metadata.kind/content shape so future schema changes \
-touch one location. **Prefer a scoped record** (explicit `flag_types`) over the \
-legacy blanket form: scoping to the specific flag_type(s) you intend to suppress \
-means a newly-relevant flag_type for the same task is NOT silently blanket-blocked. \
-This is not hypothetical — an unscoped record once let an unrelated flag_type's \
-blanket suppression hide a genuinely recurring \
-`live_workflow_recurrence_counter_needed` flag for 6+ cycles with no tracking task. \
-Omit `flag_types` only when you deliberately want to silence every flag_type for \
-that task.
-
-If you do choose to check: call \
-`search(query="stage1_flag_suppression task_id=<N>", project_id=..., \
-categories=['observations_and_summaries'], stores=['mem0'], limit=50)`. \
-`task_id=<N>` in the query biases vector ranking; `limit=50` overrides the \
-default `limit=10` so a busy project doesn't drop the record; `limit=50` is \
-intentionally smaller than `filter_suppressed`'s bulk-sweep `limit=501` because \
-the `task_id=<N>` bias makes 50 sufficient for a single-task lookup. \
-Historical/legacy suppression records were written with `task_id` as either \
-`int` or `str`; new records are pinned to `int` by `build_suppression_payload`, \
-but readers MUST coerce both sides via `str(...)` to remain compatible with \
-legacy data: a result is a valid suppression record ONLY when BOTH \
-`metadata.kind == "stage1_flag_suppression"` AND \
-`str(result.metadata.get('task_id')) == str(target_task_id)`. When the matched \
-record also carries a non-empty `metadata.flag_types`, it is in effect for your \
-candidate flag ONLY if `str(candidate_flag_type)` also appears in that list \
-(str-coerced, same convention as task_id); an empty/absent `flag_types` means the \
-record is blanket and applies regardless of flag_type. Do NOT rely on \
-semantic/vector proximity alone — a result that fails either metadata field, or \
-an empty result set, means "no suppression in effect"; proceed normally.
-
-If the suppression search returns an error or times out, treat suppression as \
-not-in-effect and proceed with normal flag emission; record the search failure \
-in your cycle summary so operators can re-check. This mirrors the conservative \
-pass-through that the post-processor's `filter_suppressed` already performs in \
-code, keeping prompt-driven and code-driven outcomes aligned.
 
 Suppression is distinct from the post-processor dedup described in the next section. \
 Dedup collapses repeated emissions of the same (task_id, flag_type) pair across runs; \
 suppression authoritatively forbids flag emission for a task_id — either for every \
-flag_type (legacy blanket record) or for a scoped subset of flag_types (a record \
-carrying a non-empty `flag_types`). \
+flag_type (blanket rows) or for a scoped subset of flag_types (scoped rows). \
 The contamination cycle motivating this gate: Stage 1 writes a violating flag → Stage 3 \
 detects it → remediation deletes it → next cycle Stage 1 writes it again. \
 `flag_dedup.filter_suppressed` breaks this cycle deterministically in code.
@@ -974,6 +944,15 @@ Every `flag_for_stage2=true` Mem0 write MUST also include `metadata.run_id=<curr
 (use the `run_id` value from the `## Reconciliation Context` section appended to this prompt) \
 and `metadata.kind='{FLAG_FOR_STAGE2_MARKER_KIND}'`, which keeps the marker a standalone \
 record rather than one filed under a memory it resembles.
+
+Garbage collection of this marker keys on `metadata.task_id` and `metadata.kind`. When the \
+flag concerns a task, set `metadata.task_id` to that ONE task's id, never a comma-joined \
+list: the marker is collected once that task is done or cancelled AND the marker has aged \
+past the relay's minimum age, so a marker outliving its task's closure for a while is \
+normal and needs no action from you. A comma-joined or otherwise unresolvable `task_id` is \
+never collected. A marker with no `task_id` has no task to close, so it is collected only \
+after a much longer age ceiling and only if its `kind` is exactly \
+`'{FLAG_FOR_STAGE2_MARKER_KIND}'`; one declaring any other kind is never collected.
 
 Post-write confirmation (LLM-side variant of the findability discipline enforced in code by flag_dedup.confirm_marker_persisted — task-1400, post-task-1413): \
 `add_memory` returns a `memory_ids` list, but Mem0 may store the content under a DIFFERENT \
@@ -1060,7 +1039,7 @@ neither through a per-task signal nor through the project-wide lock — and none
 landing evidence; no live-workflow suppression applies, and stranded/blocked-escalation \
 flags may be emitted normally.
 
-## Preserved-Specimen Corroboration
+{PRESERVED_SPECIMEN_CORROBORATION_HEADING}
 Absence of a live-workflow signal is necessary for the stranded claim but it is NOT \
 sufficient. Some tasks are left `in-progress` with a null claimant and a null heartbeat \
 DELIBERATELY, because that state is itself the evidence something else is waiting on — \
@@ -1070,8 +1049,10 @@ signals alone, and a reset would destroy the very thing it is being kept for.
 **Before asserting that a no-claimant / dead-heartbeat `in-progress` task is stranded, \
 corroborate that its state is unintentional.** Two places already hold the answer:
 1. `get_entity('Task <id>')` — a preserved specimen usually has an edge saying so.
-2. the task's `investigation_outcome` memories — a prior cycle that adjudicated this \
-   exact question records its verdict there.
+2. `mcp__fused-memory__get_memories_by_metadata(project_id=..., \
+filters={json.dumps(preservation_mem0_filters('<id>'))})` — the prior cycles' recorded not-actionable \
+verdicts on this exact question; read each row's prose. Use this scroll rather than \
+`search`, whose top-N cutoff can drop the one row that matters.
 
 If either names the task as a preserved / validation specimen, do NOT recommend a status \
 reset, a redispatch, or an operator gate task. Emit the finding at `severity='info'` with \

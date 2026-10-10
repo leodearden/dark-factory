@@ -17,13 +17,14 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Any, TypeGuard
+from typing import IO, TYPE_CHECKING, Any, TypeGuard, TypeVar
+
+from shared.cost_store import CapReason
+from shared.proc_group import snapshot_process_group, terminate_process_group
 
 # VllmBridge depends on aiohttp, which is not installed in every consumer
 # environment (e.g. dashboard's venv).  Tolerate ImportError so that callers
 # that never set ANTHROPIC_BASE_URL can still import shared.cli_invoke.
-from shared.proc_group import snapshot_process_group, terminate_process_group
-
 try:
     from shared.vllm_bridge import VllmBridge as _VllmBridgeRuntime
 except ImportError:  # pragma: no cover - exercised only when aiohttp absent
@@ -228,6 +229,26 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 # ─────────────────────────────────────────────────────────────────────────────
 _DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
 _CAP_WAIT_LOG_INTERVAL_SECS = 600.0  # emit at most one cap_wait log per ~10 min
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Claude backend binary resolution.
+#
+# WHY THIS EXISTS: argv[0] used to be the hardcoded bare PATH name 'claude',
+# resolved by the kernel against whatever PATH the spawning process happened
+# to inherit. On 2026-08-13→08-18 the fused-memory systemd user unit pinned no
+# Environment=PATH=, its inherited user-manager PATH lacked ~/.local/bin, and
+# so every curator LLM call raised FileNotFoundError for 80+ hours — with no
+# log line naming the binary that could not be found.
+#
+# _CLAUDE_BINARY_ENV_VAR is the operator escape hatch: an absolute path here
+# removes PATH from the equation entirely, and is the remediation the
+# unresolvable-binary escalation recommends.
+# ─────────────────────────────────────────────────────────────────────────────
+_CLAUDE_BINARY_ENV_VAR = 'CLAUDE_BINARY'
+# The historical argv[0]. Kept as the fallback so an environment that never
+# sets _CLAUDE_BINARY_ENV_VAR and does have `claude` on PATH is byte-identical
+# to the pre-task-4448 behaviour.
+_DEFAULT_CLAUDE_BINARY = 'claude'
 CAP_HIT_RESUME_PROMPT = (
     'Your previous run was interrupted by a usage limit. '
     'Continue where you left off and complete your task.'
@@ -260,9 +281,12 @@ __all__ = [
     'TranscriptEvidence',
     'build_failure_message',
     'classify_agent_failure',
+    'classify_cap_kill',
+    'claude_binary_spec',
     'count_transcript_turns',
     'detect_ended_awaiting_background',
     'detect_resumable_progress',
+    'detect_transcript_model_id',
     'ended_awaiting_background_for_session',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
@@ -273,11 +297,48 @@ __all__ = [
     'note_unreadable_transcript',
     'read_transcript_records',
     'require_non_blank_prompt',
+    'resolve_claude_binary',
     'resumable_progress_for_session',
     'transcript_evidence',
     'transcript_evidence_for_session',
     'transcript_exists',
+    'transcript_model_id_for_session',
 ]
+
+
+def claude_binary_spec() -> str:
+    """Return the Claude CLI binary spec: the ``CLAUDE_BINARY`` override, else ``'claude'``.
+
+    An empty ``CLAUDE_BINARY`` is treated as unset rather than as an empty
+    argv[0], so ``CLAUDE_BINARY=`` in a systemd unit or a shell profile
+    degrades to the default instead of producing an unspawnable command.
+
+    The spec may be a bare name (resolved against PATH) or an absolute path.
+    Setting it to an absolute path is the remediation for the 2026-08-13→08-18
+    incident, in which the bare name ``claude`` failed to resolve off an
+    unpinned inherited systemd PATH and silently degraded every curator
+    decision for 80+ hours.
+
+    Never raises.
+    """
+    return os.environ.get(_CLAUDE_BINARY_ENV_VAR) or _DEFAULT_CLAUDE_BINARY
+
+
+def resolve_claude_binary() -> str | None:
+    """Resolve :func:`claude_binary_spec` to an absolute path, or ``None``.
+
+    ``None`` means the spec names nothing executable on the current PATH —
+    precisely the 2026-08-13→08-18 condition, where a bare ``claude`` resolved
+    off an unpinned inherited systemd PATH. Returning the resolution instead of
+    deferring it to ``exec`` is what lets callers report the failure by name
+    (see ``build_claude_argv``'s warning and
+    ``TaskCurator.startup_self_check``) rather than surfacing a bare
+    ``FileNotFoundError`` from deep inside a spawn.
+
+    Never raises: several callers only assemble an argv and never spawn, so a
+    raising resolver would break them on any host without the CLI installed.
+    """
+    return shutil.which(claude_binary_spec())
 
 
 class AllAccountsCappedException(Exception):
@@ -329,6 +390,9 @@ class AllAccountsCappedException(Exception):
 # shared/tests/test_wildcard_deny_live_inventory.py (``-m integration``).  If a
 # CLI change ever denies the schema tool itself, ``_parse_claude_output``
 # reports ``schema_tool_denied``.
+#
+# StructuredOutput survives a non-empty ``--tools`` list too, which is what a
+# caller's ``available_tools`` emits (measured CLI 2.1.287, task 4344).
 _SCHEMA_OUTPUT_TOOL = 'StructuredOutput'
 _SCHEMA_OUTPUT_ATTACHMENT = 'structured_output'
 
@@ -476,10 +540,16 @@ class AgentResult:
     stop_reason: str | None = None
     transcript_turns: int | None = None
     """Number of assistant turns found in the on-disk JSONL transcript, or None
-    when the transcript could not be read or located.  Stamped on the
-    SIGTERM/SIGKILL timeout path (via count_transcript_turns) AND on the
-    normal-exit path (task 2761 — derived from the same records read for the
-    ended_awaiting_background check, at no extra I/O)."""
+    when the transcript could not be read or located.  Stamped on both the
+    SIGTERM/SIGKILL timeout path and the normal-exit path, each time derived
+    from that path's single transcript read alongside its other signals."""
+    model_id: str | None = None
+    """The exact model id the CLI actually served (e.g. ``claude-opus-5``),
+    read from the on-disk transcript via ``detect_transcript_model_id``; None
+    when the transcript could not be read or carries no real id.  Deliberately
+    distinct from the caller-supplied lineage alias (``opus``/``sonnet``) that
+    callers record as ``model`` — that alias names the routing choice, this
+    names the version that answered."""
 
 
 def _resolve_transcript_path(config_dir: Path, session_id: str) -> Path | None:
@@ -574,6 +644,11 @@ def count_transcript_turns(
     records = read_transcript_records(config_dir, session_id)
     if records is None:
         return None
+    return _assistant_turn_count(records)
+
+
+def _assistant_turn_count(records: list[dict]) -> int:
+    """The number of assistant turns in parsed *records*."""
     return sum(1 for r in records if _is_assistant_turn(r))
 
 
@@ -763,30 +838,48 @@ _BG_LOG_PATH_RE = re.compile(r'Output is being written to:\s*(\S+?)\.?(?=\s|$)')
 _MIN_BG_TOKEN_LEN = 6
 
 
-def _content_blocks(record: object) -> list:
-    """Return *record*'s content blocks, tolerating both transcript nestings.
+_FieldT = TypeVar('_FieldT')
 
-    The real CLI shape nests blocks under ``record['message']['content']``;
-    a flat ``record['content']`` is also accepted (older records and the
-    ``nested=False`` half of the detector's parametrized fixtures).  Anything
-    else — a non-dict record, a missing key, a non-list content — yields an
-    empty list rather than raising.
 
-    SOLE expression of that tolerance rule: both ``_iter_result_texts`` and
-    ``detect_ended_awaiting_background`` route through here, so a future CLI
-    nesting change is a one-line fix in one place rather than two copies that
-    can drift (reviewer_comprehensive amendment, task 3639 — previously the
-    same cascade was inlined in each).
+def _record_field(
+    record: object,
+    key: str,
+    accepts: Callable[[object], TypeGuard[_FieldT]],
+) -> _FieldT | None:
+    """Return *record*'s *key* field, tolerating both transcript nestings.
+
+    The real CLI shape nests fields under ``record['message'][key]``; a flat
+    ``record[key]`` is also accepted (older records and the ``nested=False``
+    half of the detectors' parametrized fixtures).  The nested value wins when
+    *accepts* it, else the flat one; anything else — a non-dict record, a
+    missing key, a value *accepts* rejects — yields None rather than raising.
+
+    SOLE expression of that tolerance rule (task 3639): ``_content_blocks`` and
+    ``detect_transcript_model_id`` both route through here, so a future CLI
+    nesting change is a one-line fix in one place.
     """
     if not isinstance(record, dict):
-        return []
+        return None
     message = record.get('message')
-    if isinstance(message, dict) and isinstance(message.get('content'), list):
-        return message['content']
-    content = record.get('content')
-    if isinstance(content, list):
-        return content
-    return []
+    if isinstance(message, dict) and accepts(nested := message.get(key)):
+        return nested
+    flat = record.get(key)
+    return flat if accepts(flat) else None
+
+
+def _is_list(value: object) -> TypeGuard[list]:
+    return isinstance(value, list)
+
+
+def _is_non_empty_str(value: object) -> TypeGuard[str]:
+    return isinstance(value, str) and bool(value)
+
+
+def _content_blocks(record: object) -> list:
+    """Return *record*'s content blocks (via ``_record_field``), or an empty
+    list when it carries none.  Shared by ``_iter_result_texts`` and
+    ``detect_ended_awaiting_background``."""
+    return _record_field(record, 'content', _is_list) or []
 
 
 def _iter_result_texts(record: dict):
@@ -999,6 +1092,35 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
     return last_launch_idx != -1 and last_launch_idx > last_reap_idx
 
 
+# The CLI writes this in place of a model name on records it synthesised
+# itself rather than received from a model.
+_SYNTHETIC_MODEL_SENTINEL = '<synthetic>'
+
+
+def detect_transcript_model_id(records: list[dict]) -> str | None:
+    """Return the exact model id the CLI actually served, from *records*.
+
+    Reads the non-empty string ``model`` field (via ``_record_field``) of each
+    ``type == 'assistant'`` record, skipping malformed records rather than
+    raising, and discards :data:`_SYNTHETIC_MODEL_SENTINEL` as absent.
+
+    Returns the LAST surviving id, or None when no record carries one.  Last
+    over first because a run that fails over or is downgraded mid-flight ends
+    on the model that actually produced its final output.
+
+    Pure and total — operates on already-parsed records, so it costs no I/O at
+    a seam that has already read them.
+    """
+    found: str | None = None
+    for record in records:
+        if not isinstance(record, dict) or record.get('type') != 'assistant':
+            continue
+        model = _record_field(record, 'model', _is_non_empty_str)
+        if model is not None and model != _SYNTHETIC_MODEL_SENTINEL:
+            found = model
+    return found
+
+
 def detect_resumable_progress(records: list[dict] | None) -> bool:
     """Return True when the transcript *records* hold work worth CONTINUING.
 
@@ -1158,6 +1280,28 @@ def ended_awaiting_background_for_session(
     if records is None:
         return False
     return detect_ended_awaiting_background(records)
+
+
+def transcript_model_id_for_session(
+    config_dir: Path,
+    session_id: str,
+) -> str | None:
+    """Return the exact model id served for *session_id*, read from its transcript.
+
+    Mirrors ``ended_awaiting_background_for_session``' shape: delegate to
+    ``read_transcript_records``; if it returns None (transcript not located or
+    a catastrophic read error) return None; otherwise apply the pure
+    :func:`detect_transcript_model_id` detector.  Never raises — an
+    unattributable run records NULL, which reads correctly as "not recorded",
+    rather than failing the invocation over telemetry.
+
+    ``_run_subprocess`` does not call this: it already holds the parsed
+    records and applies the pure detector to them directly.
+    """
+    records = read_transcript_records(config_dir, session_id)
+    if records is None:
+        return None
+    return detect_transcript_model_id(records)
 
 
 @dataclass(frozen=True)
@@ -1443,7 +1587,7 @@ def require_non_blank_prompt(
     CLI" failure impossible to cause from OUR side.
 
     The claude backend is 100% stdin-dependent.  ``build_claude_argv`` emits
-    ``cmd = ['claude', '--print', '--output-format', 'json']`` and NEVER
+    ``cmd = [<resolved claude binary>, '--print', '--output-format', 'json']`` and NEVER
     appends a positional prompt or a ``-`` stdin marker (unlike the codex
     backend in ``orchestrator/agents/invoke.py``, which passes its own input
     argument).  The prompt is delivered solely on stdin — ``stdin_data =
@@ -1860,6 +2004,49 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
     )
 
 
+def classify_cap_kill(
+    result: AgentResult,
+    *,
+    budget_usd: float | None,
+    max_turns: int | None,
+    backend: str = 'claude',
+) -> CapReason | None:
+    """Return which configured ceiling ended *result* — ``CapReason.BUDGET``
+    or ``CapReason.TURNS`` — or None when no ceiling did.
+
+    Deliberately narrower than :func:`classify_agent_failure`'s "why did this
+    fail?" ladder, which has no budget kind at all.  ``CapReason.ACCOUNT`` is
+    not this function's business: an account usage cap is not a configured
+    ceiling.
+
+    The CLI subtype is authoritative and is checked first, ungated on
+    ``success`` (a schema-salvaged run is reported successful yet was still
+    ended at the turn ceiling).  The numeric comparison against *budget_usd* /
+    *max_turns* is only a fallback for a FAILED run whose subtype is
+    inconclusive: a healthy run that spends its whole budget or uses its last
+    turn finished on its own terms.  When both fallbacks fire, budget is
+    reported.  A None ceiling disables its fallback, and so does any
+    *backend* other than ``'claude'``: the others enforce neither ceiling
+    natively (see ``orchestrator/src/orchestrator/agents/invoke.py``), so no
+    ceiling can have ended their runs.  Total — never raises.
+
+    The subtype literals match ``shared/src/shared/usage_gate.py`` and
+    :func:`classify_agent_failure`; a third spelling of the budget one lives
+    at ``orchestrator/src/orchestrator/dry_run_unblock.py::_BUDGET_SUBTYPES``.
+    """
+    if result.subtype == 'error_max_budget_usd':
+        return CapReason.BUDGET
+    if result.subtype == 'error_max_turns':
+        return CapReason.TURNS
+    if result.success or backend != 'claude':
+        return None
+    if budget_usd is not None and result.cost_usd >= budget_usd:
+        return CapReason.BUDGET
+    if max_turns is not None and result.turns >= max_turns:
+        return CapReason.TURNS
+    return None
+
+
 def build_failure_message(label: str, result: AgentResult) -> str:
     """Format the canonical '{label} failed: {summary}\\n{diagnostic_detail}' message.
 
@@ -1920,6 +2107,11 @@ class _SubprocessResult:
     backgrounded Bash command; carried into AgentResult and used by
     _parse_claude_output to downgrade success→failure.  Never set on the
     timeout path (a timed-out run is already non-success)."""
+    model_id: str | None = None
+    """The exact CLI-served model id read from the transcript on BOTH the
+    normal-exit and timeout paths, or None when unavailable; carried verbatim
+    into ``AgentResult.model_id``.  Distinct from the caller's lineage alias
+    passed in as ``_run_subprocess``'s ``model``."""
 
 
 async def invoke_claude_agent(
@@ -1947,6 +2139,8 @@ async def invoke_claude_agent(
     working_idle_secs: float | None = None,
     absolute_cap_secs: float | None = None,
     strict_mcp_config: bool = False,
+    available_tools: list[str] | None = None,
+    setting_sources: list[str] | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI and return structured result.
 
@@ -1955,6 +2149,19 @@ async def invoke_claude_agent(
     servers, ignoring the ambient ``.mcp.json`` merge (task 2796, THREAD 2);
     forwarded verbatim to ``build_claude_argv``. Default ``False`` keeps every
     existing caller byte-identical.
+
+    *available_tools*, when not None, is the CLI's built-in tool REGISTRY
+    filter (``--tools``): which built-in tools exist at all.  That is a
+    different axis from *allowed_tools* (permission allow rules) and
+    *disallowed_tools* (deny rules).  Like ``--tools ''`` it does NOT filter
+    MCP, so a caller must also pass ``mcp_config=no_mcp_servers_config()``
+    with ``strict_mcp_config=True``.  Forwarded verbatim to
+    ``build_claude_argv``, which validates it.
+
+    *setting_sources*, when not None, names the settings files the CLI reads
+    (``--setting-sources``); ``[]`` reads none, so no ambient permission allow
+    rule reaches the call.  Forwarded verbatim to ``build_claude_argv``, which
+    validates it.
 
     *oauth_token*, when set, overrides the Claude CLI's default credentials
     via the ``CLAUDE_CODE_OAUTH_TOKEN`` env var (multi-account failover).
@@ -2028,6 +2235,8 @@ async def invoke_claude_agent(
         working_idle_secs=working_idle_secs,
         absolute_cap_secs=absolute_cap_secs,
         strict_mcp_config=strict_mcp_config,
+        available_tools=available_tools,
+        setting_sources=setting_sources,
     )
 
 
@@ -3011,6 +3220,18 @@ async def invoke_with_cap_retry(
     result.account_name = account_name
     result.resume_fallbacks = resume_fallbacks
     result.resume_fallback_session_ids = tuple(resume_fallback_session_ids)
+    # 'account' outranks a ceiling reason: an unattributed usage cap ends the
+    # run before any configured ceiling could have been reached.  `model` stays
+    # the caller's lineage alias so existing GROUP BY model consumers
+    # (dashboard/src/dashboard/data/model_role.py, orchestrator digest) are
+    # unaffected; the exact served version goes in `model_id` beside it.
+    ceiling_reason = classify_cap_kill(
+        result,
+        budget_usd=invoke_kwargs.get('max_budget_usd'),
+        max_turns=invoke_kwargs.get('max_turns'),
+        backend=backend,
+    )
+    capped_reason = CapReason.ACCOUNT if unattributed_cap else ceiling_reason
     if cost_store:
         try:
             await cost_store.save_invocation(
@@ -3026,7 +3247,9 @@ async def invoke_with_cap_retry(
                 cache_read_tokens=result.cache_read_tokens,
                 cache_create_tokens=result.cache_create_tokens,
                 duration_ms=result.duration_ms,
-                capped=unattributed_cap,
+                capped=capped_reason is not None,
+                capped_reason=capped_reason,
+                model_id=result.model_id,
                 started_at=started_at,
                 completed_at=completed_at,
             )
@@ -3050,6 +3273,8 @@ def build_claude_argv(
     resume_session_id: str | None,
     session_id: str | None,
     strict_mcp_config: bool = False,
+    available_tools: list[str] | None = None,
+    setting_sources: list[str] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Assemble the Claude CLI argv — the single source of truth shared by the
     non-sandbox (``_invoke_claude``) and sandbox (``_invoke_claude_with_sandbox``)
@@ -3072,6 +3297,25 @@ def build_claude_argv(
     ``--mcp-config``). The default ``False`` keeps every existing caller's argv
     byte-identical.
 
+    ``available_tools`` (default ``None``, which emits nothing): the CLI's
+    built-in tool REGISTRY filter, emitted as ``--tools <a,b,c>`` (``[]`` gives
+    ``--tools ''``).  It decides which built-in tools exist, a different axis
+    from ``allowed_tools`` (permission allow rules) and ``disallowed_tools``
+    (deny rules).  Entries must be bare tool names; a permission-rule spec such
+    as ``'Bash(git log:*)'`` belongs in ``allowed_tools``.  It cannot be
+    combined with a ``'*'`` deny, which also sets the registry and would win.
+    Like ``--tools ''``, it does NOT filter MCP, so a caller must also pass
+    ``mcp_config=no_mcp_servers_config()`` with ``strict_mcp_config=True``.
+    Both refusals raise ``ValueError`` before any temp file exists.
+
+    ``setting_sources`` (default ``None``, which emits nothing and leaves the
+    CLI reading every settings file): the settings files the CLI reads, emitted
+    as ``--setting-sources <a,b>`` from ``'user'``, ``'project'`` and
+    ``'local'``.  ``[]`` gives ``--setting-sources ''``, which reads none of
+    them, so no ambient permission allow rule reaches the call.  Managed
+    (policy) settings are not a source and still apply.  An unknown entry
+    raises ``ValueError`` before any temp file exists.
+
     Returns ``(cmd, temp_files)``: ``cmd`` is the assembled argv list;
     ``temp_files`` lists the temp file paths created.  It is never empty — the
     sysprompt path is always present, on the resume path too (task 3983) —
@@ -3083,7 +3327,30 @@ def build_claude_argv(
     already created during this call are unlinked before the exception
     propagates — callers never need to clean up after a raised call.
     """
-    cmd = ['claude', '--print', '--output-format', 'json']
+    _check_available_tools(available_tools, disallowed_tools)
+    _check_setting_sources(setting_sources)
+    # argv[0] is RESOLVED here rather than left for the kernel to look up
+    # against whatever PATH the spawning process inherited. This one site
+    # covers BOTH spawn paths — the sandbox and non-sandbox invocations here,
+    # and the orchestrator's, which reaches this same helper via
+    # orchestrator/src/orchestrator/agents/invoke.py::_invoke_claude_with_sandbox.
+    #
+    # Fail-open: an unresolvable spec falls back to itself, so a caller that
+    # only assembles an argv (several test suites, the startup probe) keeps
+    # working on a host with no CLI installed. The WARNING is the diagnostic
+    # that was missing on 2026-08-13→08-18, when a bare `claude` failed to
+    # resolve off an unpinned systemd PATH and the curator degraded silently
+    # for 80+ hours.
+    _spec = claude_binary_spec()
+    _resolved = resolve_claude_binary()
+    if _resolved is None:
+        logger.warning(
+            'claude binary %r does not resolve on PATH — spawning it will fail. '
+            'Set %s to an absolute path, or pin Environment=PATH= in the unit. '
+            'PATH=%s',
+            _spec, _CLAUDE_BINARY_ENV_VAR, os.environ.get('PATH'),
+        )
+    cmd = [_resolved or _spec, '--print', '--output-format', 'json']
 
     cmd.extend(['--model', model])
     cmd.extend(['--max-budget-usd', str(max_budget_usd)])
@@ -3144,6 +3411,8 @@ def build_claude_argv(
 
         cmd.extend(['--permission-mode', permission_mode])
         cmd.extend(['--max-turns', str(max_turns)])
+        if setting_sources is not None:
+            cmd.extend(['--setting-sources', ','.join(setting_sources)])
 
         if effort:
             cmd.extend(['--effort', effort])
@@ -3155,6 +3424,8 @@ def build_claude_argv(
             # registry filter keeps only that tool.  See _SCHEMA_OUTPUT_TOOL.
             cmd.extend(['--tools', ''])
             disallowed_tools = [t for t in disallowed_tools if t != '*']
+        if available_tools is not None:
+            cmd.extend(['--tools', ','.join(available_tools)])
         if disallowed_tools:
             cmd.extend(['--disallowed-tools', *disallowed_tools])
 
@@ -3179,6 +3450,37 @@ def build_claude_argv(
         raise
 
     return cmd, temp_files
+
+
+def _check_available_tools(
+    available_tools: list[str] | None, disallowed_tools: list[str] | None,
+) -> None:
+    """Refuse an ``available_tools`` registry the CLI would not honour as given."""
+    if available_tools is None:
+        return
+    if disallowed_tools and '*' in disallowed_tools:
+        raise ValueError(
+            "available_tools and disallowed_tools=['*'] both set the built-in "
+            "tool registry, and the '*' deny would win over the list; pass one"
+        )
+    for entry in available_tools:
+        if not entry.isidentifier():
+            raise ValueError(
+                f'available_tools entry {entry!r} is not a bare tool name; '
+                "permission-rule specs such as 'Bash(git log:*)' go in allowed_tools"
+            )
+
+
+_SETTING_SOURCES = frozenset({'user', 'project', 'local'})
+
+
+def _check_setting_sources(setting_sources: list[str] | None) -> None:
+    """Refuse a ``setting_sources`` entry that is not one of the CLI's file sources."""
+    for entry in setting_sources or ():
+        if entry not in _SETTING_SOURCES:
+            raise ValueError(
+                f'setting_sources entry {entry!r} is not one of {sorted(_SETTING_SOURCES)}'
+            )
 
 
 def apply_spawn_env(env: dict[str, str], spawn_env: dict[str, str] | None) -> None:
@@ -3237,6 +3539,8 @@ async def _invoke_claude(
     working_idle_secs: float | None = None,
     absolute_cap_secs: float | None = None,
     strict_mcp_config: bool = False,
+    available_tools: list[str] | None = None,
+    setting_sources: list[str] | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI."""
     # BEFORE build_claude_argv, which writes system-prompt / mcp-config temp
@@ -3257,6 +3561,8 @@ async def _invoke_claude(
         resume_session_id=resume_session_id,
         session_id=session_id,
         strict_mcp_config=strict_mcp_config,
+        available_tools=available_tools,
+        setting_sources=setting_sources,
     )
 
     # User prompt goes over stdin, never argv, to avoid ARG_MAX on large
@@ -3339,8 +3645,8 @@ async def _invoke_claude(
 def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     """Parse Claude Code JSON output into AgentResult.
 
-    timed_out and transcript_turns are propagated directly from result on every
-    return path.
+    timed_out, transcript_turns and model_id are propagated directly from
+    result on every return path.
     """
     if not result.stdout.strip():
         # Distinct subtype (task 2360 fix #3): a wall-clock timeout that DID
@@ -3376,6 +3682,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             proc_tree=result.proc_tree,
             transcript_turns=result.transcript_turns,
             ended_awaiting_background=result.ended_awaiting_background,
+            model_id=result.model_id,
         )
 
     try:
@@ -3390,6 +3697,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             proc_tree=result.proc_tree,
             transcript_turns=result.transcript_turns,
             ended_awaiting_background=result.ended_awaiting_background,
+            model_id=result.model_id,
         )
 
     cost = data.get('cost_usd', data.get('total_cost_usd', 0.0))
@@ -3482,6 +3790,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
         stop_reason=stop_reason,
         proc_tree=result.proc_tree,
         transcript_turns=result.transcript_turns,
+        model_id=result.model_id,
     )
 
 
@@ -4125,8 +4434,9 @@ async def _run_subprocess(
             # `except asyncio.CancelledError:` below, which cancels comm_task and
             # reaps the process group — the same treatment a cancel landing
             # anywhere else in the outer try receives.  No new leak path.
-            tt = (
-                await asyncio.to_thread(count_transcript_turns, config_dir, session_id)
+            # ONE read feeds both stamped signals, as on the normal-exit path.
+            killed_records = (
+                await asyncio.to_thread(read_transcript_records, config_dir, session_id)
                 if (config_dir and session_id)
                 else None
             )
@@ -4137,7 +4447,12 @@ async def _run_subprocess(
                 duration_ms=duration_ms,
                 timed_out=True,
                 proc_tree=proc_tree,
-                transcript_turns=tt,
+                transcript_turns=(
+                    None if killed_records is None else _assistant_turn_count(killed_records)
+                ),
+                model_id=(
+                    None if killed_records is None else detect_transcript_model_id(killed_records)
+                ),
             )
     except asyncio.CancelledError:
         # Orchestrator shutdown path: the awaiting task was cancelled. Kill the
@@ -4174,8 +4489,8 @@ async def _run_subprocess(
         )
 
     # Re-read the on-disk transcript ONCE on the normal-exit path and derive
-    # BOTH signals from the same parsed records — no double file I/O (task 2761
-    # amendment):
+    # ALL THREE signals from the same parsed records — no double file I/O (task
+    # 2761 amendment):
     #   • transcript_turns — the assistant-turn count surfaced in
     #     classify_agent_failure's diagnostic_detail.  Previously stamped only on
     #     the timeout path, so a normal-exit ENDED_AWAITING_BACKGROUND
@@ -4186,8 +4501,10 @@ async def _run_subprocess(
     #     silently abandoned the work.  Symmetric to the timeout path's
     #     transcript re-read above; _parse_claude_output owns the actual
     #     success→failure downgrade.
-    # Both fail safe when the transcript can't be located (records None →
-    # transcript_turns None, ended_awaiting_background False).
+    #   • model_id — the exact CLI-served model id, which the caller's alias
+    #     cannot tell apart across versions.
+    # All fail safe when the transcript can't be located (records None →
+    # transcript_turns None, ended_awaiting_background False, model_id None).
     # OFF-LOOP — see the task-3925 INVARIANT block above the poll loop.  This is
     # the largest of the four reads: it parses the FULL record list, and every
     # successful run pays it.
@@ -4197,8 +4514,8 @@ async def _run_subprocess(
     # That is safe and needs no asyncio.shield: comm_task has already completed
     # (proc.communicate() returned), so the child has exited and been reaped —
     # there is no process group left to orphan.  The only loss is the
-    # transcript_turns / ended_awaiting_background enrichment on a run that is
-    # being torn down anyway.
+    # transcript_turns / ended_awaiting_background / model_id enrichment on a
+    # run that is being torn down anyway.
     transcript_records = (
         await asyncio.to_thread(read_transcript_records, config_dir, session_id)
         if (config_dir and session_id)
@@ -4207,9 +4524,11 @@ async def _run_subprocess(
     if transcript_records is None:
         transcript_turns = None
         ended_awaiting_background = False
+        model_id = None
     else:
-        transcript_turns = sum(1 for r in transcript_records if _is_assistant_turn(r))
+        transcript_turns = _assistant_turn_count(transcript_records)
         ended_awaiting_background = detect_ended_awaiting_background(transcript_records)
+        model_id = detect_transcript_model_id(transcript_records)
 
     return _SubprocessResult(
         stdout=stdout.decode(),
@@ -4218,4 +4537,5 @@ async def _run_subprocess(
         duration_ms=duration_ms,
         transcript_turns=transcript_turns,
         ended_awaiting_background=ended_awaiting_background,
+        model_id=model_id,
     )

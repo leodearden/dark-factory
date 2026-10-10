@@ -157,18 +157,22 @@ Moved from the task-4340 comment block:
 > completeness signal itself is a first-class return value on the enumerate_*
 > methods, which never raise.
 
-### Consumers now act on it (task 4386)
+### Consumers now act on it (tasks 4386, 4914)
 
-Task 4386 discharged `tkt_0RSJP8CH1M9GAAJTABV8FZB4AH`. All three whole-graph consumers call the `enumerate_*` methods directly and each applies `apply_incompleteness_policy` at its OWN call site — the policy was SHARED, not migrated, so the raise/warn split stays one implementation (see that function's docstring for why). Each then reports what it read:
+Task 4386 discharged `tkt_0RSJP8CH1M9GAAJTABV8FZB4AH` for three whole-graph consumers, and task 4914 extended it to the summary write-back path. The policy was SHARED, not migrated, so the raise/warn split stays one implementation (see `apply_incompleteness_policy`'s docstring for why). The task-4386 consumers call the `enumerate_*` methods directly and apply it at their OWN call sites. The task-4914 consumers read through `read_entity_nodes_checked` / `read_all_valid_edges_checked` in `graphiti_client.py`, which wire each enumeration to the policy once and return its `ReadCompleteness`; the `list_entity_nodes` / `get_all_valid_edges` shims are those checked reads with the verdict dropped. Each consumer then reports what it read:
 
 - `stale_status_snapshot_edge_sweep` and `stale_priority_override_edge_sweep` project it into TRI-STATE per-cycle stats `enumeration_complete` / `enumeration_incomplete_kind`, which `MemoryConsolidator` surfaces on `report.stats` under the `stale_status_snapshot_edges_` and `stale_priority_override_edges_` prefixes. The two key sets are INDEPENDENT: a truncated corpus for one sweep never marks the other.
 - `scripts/cleanup_count_snapshots.py` reports it per project (four keys on each `report['projects'][pid]`) plus a `totals['incomplete_enumerations']` roll-up counting PROJECTS, and renders it as a Corpus column with a warning line on the operator-facing summary table.
+- `fused-memory/src/fused_memory/backends/graphiti_client.py::GraphitiBackend.detect_stale_with_edges` (task 4914) returns `StaleSummaryResult.entities_completeness` / `edges_completeness`, one `graphiti_client.ReadCompleteness` per read, because its two reads truncate independently.
+- `fused-memory/src/fused_memory/services/memory_service.py::MemoryService.rebuild_entity_summaries` (task 4914) reports the same four tri-state keys as the cleanup script (`entities_complete` / `entities_incomplete_kind` / `edges_complete` / `edges_incomplete_kind`) in its result dict, taken from its own reads or from `detect_stale_with_edges`.
 
-So "swept a complete corpus" and "swept what we could fetch" are now distinguishable at THOSE THREE consumers. The ONLY safe predicate is `is True`: `is not False` would admit the UNKNOWN case, letting a cycle that never looked pass as one that looked and found everything.
+So "swept a complete corpus" and "swept what we could fetch" are now distinguishable at every consumer listed here. The ONLY safe predicate is `is True`: `is not False` would admit the UNKNOWN case, letting a cycle that never looked pass as one that looked and found everything.
 
-STILL UNWIRED, and deliberately so — task 4386 scoped itself to the three consumers its ticket named. Two whole-graph consumers remain on the SHIMS and report no completeness at all: `MemoryService.rebuild_entity_summaries` (`services/memory_service.py`) and `detect_stale_with_edges`. Their fail-closed guard is intact (the shims still RAISE on a STRUCTURAL incompleteness), so the gap is the EMPIRICAL half — a census disagreement or short read WARNS and proceeds, and this is the summary WRITE-BACK path this audit keeps naming as the corrupting one, so rebuilt summaries can be missing facts with nothing in the returned result saying the corpus was partial. Closing that residual is `tkt_0RT0V3VJ6E64R9RZPTGADMP0BF` under TICKETS.
+STILL UNWIRED on the summary write-back path, both deliberately left out of task 4914:
+- `detect_stale_dry_run`, the `force=False, dry_run=True` probe, still reads through the `list_entity_nodes` shim. `rebuild_entity_summaries` therefore reports all four keys as None on that path. Its structural guard is intact through the shim, and it never writes. `tkt_0RVHH0D37FVAWSMT1NVGSHDSZM` under TICKETS.
+- `RebuildResult` (`maintenance/rebuild_summaries.py`), the periodic-cycle log (`server/main.py`) and the write-journal `result_summary` drop the four keys. `tkt_0RVHH0XMF1C2HZGJZ23CWX8ZY4` under TICKETS.
 
-### A third consumer, outside `graphiti_client.py`
+### Another consumer, outside `graphiti_client.py`
 
 `fused-memory/scripts/measure_plural_enum_guard_recall.py` (task 4576) pages through `_paged_ro_query` and composes both of its Cypher strings from `_ALL_VALID_EDGES_MATCH`. The read-only recall probe therefore measures the same population this module enumerates. It supplies its OWN projection and its own `count(DISTINCT e.uuid)` census, so it decides completeness in distinct EDGES rather than in rows, and it derives its own verdict instead of reading `paged.complete`. Nothing in `graphiti_client.py` changes on its account.
 
@@ -176,14 +180,16 @@ STILL UNWIRED, and deliberately so — task 4386 scoped itself to the three cons
 
 A materially-short `INCOMPLETE_SHORT_READ` still returns a partial collection. The `force=True` path of `fused-memory/src/fused_memory/services/memory_service.py::MemoryService.rebuild_entity_summaries` will write it back, blanking the summary of any entity whose edges fell in the missing remainder. That path never consults staleness, so it writes to every entity the node read returned.
 
-Do NOT close it by tightening the shims. Guard 4 fires on any shortfall at all, including a single concurrently-invalidated edge, so raising there would take down the live rebuild for exactly the transient that the warn-not-raise decision rejected. The fix belongs at the consumer: a policy on how short is too short, applied where the destructive write is decided. That is the same code the `tkt_0RT0V3VJ6E64R9RZPTGADMP0BF` residual below must touch.
+Do NOT close it by tightening the shims. Guard 4 fires on any shortfall at all, including a single concurrently-invalidated edge, so raising there would take down the live rebuild for exactly the transient that the warn-not-raise decision rejected. The fix belongs at the consumer: a policy on how short is too short, applied where the destructive write is decided. The signal such a policy would key off now reaches `rebuild_entity_summaries` (task 4914): it is the `ReadCompleteness` the checked reads return at the read site.
 
 ## TICKETS
 
 Every id below is a TICKET id, not a task id. The curator resolves tickets to tasks asynchronously.
 
 - `tkt_0RSJP8CH1M9GAAJTABV8FZB4AH`: wire the completeness signal (`PagedRead`) through to consumers. Status: RESOLVED by task 4386 — the policy was SHARED (promoted to public `apply_incompleteness_policy`) rather than moved; the REPORTING of the signal moved to the three consumers.
-- `tkt_0RT0V3VJ6E64R9RZPTGADMP0BF`: wire the completeness signal through the two remaining shim consumers, `MemoryService.rebuild_entity_summaries` and `detect_stale_with_edges` — the summary write-back path. Status: OPEN.
+- `tkt_0RT0V3VJ6E64R9RZPTGADMP0BF`: wire the completeness signal through the two remaining shim consumers, `MemoryService.rebuild_entity_summaries` and `detect_stale_with_edges` — the summary write-back path. Status: RESOLVED by task 4914.
+- `tkt_0RVHH0D37FVAWSMT1NVGSHDSZM`: move `detect_stale_dry_run` off the `list_entity_nodes` shim so the `force=False, dry_run=True` rebuild probe reports a node-read verdict. Status: OPEN.
+- `tkt_0RVHH0XMF1C2HZGJZ23CWX8ZY4`: carry the four completeness keys into `RebuildResult`, the periodic-cycle log and the write-journal `result_summary`. Status: OPEN.
 - `tkt_0RSJP92VQNATQB0FSR20YMXGW8`: re-measure the task-2613 stale-status miss rate against the now-complete corpus. It was computed against a truncated denominator. Status: OPEN.
 - `tkt_0RSJP82N82SNKT2BHRT3HWK3DA`: paginate the four reads the 2026-08-17 audit left AT RISK. Status: RESOLVED by task 4869.
 - `tkt_0RSKFG5RX196H9CJ0RXGJCZF4F`: move this audit out of source into a reference doc. Status: RESOLVED by task 4869 (this file).

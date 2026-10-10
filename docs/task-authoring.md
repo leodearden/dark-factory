@@ -570,7 +570,7 @@ unguarded. The opposite failure is worse — a check that can *never* go green
 blocks its dependent forever, and at runtime that is indistinguishable from a
 genuinely undelivered capability.
 
-**Reject codes** (all five block; the `_self_referential` and `_comment_only`
+**Reject codes** (all seven block; the `_self_referential` and `_comment_only`
 entries are diagnostic refinements of `vacuous_present` for grep, not separate
 gates):
 
@@ -581,6 +581,8 @@ gates):
 | `vacuous_present_comment_only` | the only matches are comments, not code | task **2792**'s `archive_task_transcripts`, matching one fossil comment in `git_ops.py` |
 | `vacuous_absent` | `expect: absent` check already passes at authoring (the pattern does not match, or no listed path exists) | the mirror cell: nothing to remove, so the check is green before any work starts |
 | `filename_shaped` | `kind: grep`, `expect: present` pattern has zero content matches and either names a tracked **filename**, or is exactly the basename or stem of a file the task declares in `metadata.files` inside the check's `paths` (the file need not exist yet) | task **3536**'s `test_workflow_merge_gating_strand` — authored before 3536 created that module, and a test module does not mention its own name, so `git grep` (which reads *contents*) could never see it. The rejection names the `kind: "path"` descriptor that says what was meant (see *Choosing a descriptor*) |
+| `shim_path` | a `kind: grep`, `expect: present` check whose `paths` names a `.py` file that rebinds `sys.modules[__name__]`: an alias shim, so the code it asserts lives elsewhere | task **5036** left `orchestrator/src/orchestrator/merge_queue.py`, `landing_evidence.py`, `merge_gates.py` and others as 12-line shims over `orchestrator/merge_lane/`, stranding checks of 2886, 2887, 4033, 4646–4648, 4651, 4652, 4830 and 5388 |
+| `removed_path` | an `expect: present` grep or path check naming a path a mainline (first-parent) commit deleted or moved away; the message names that commit | the move-shaped twin of `shim_path`: the path can never reappear unless someone re-creates it |
 
 **Warn code** (reported, never blocking):
 
@@ -595,6 +597,20 @@ files this task actually writes. That is the shape all three measured repairs
 took, and it is the only shape the gate can observe going green. When the
 capability IS a file's existence, use `kind: "path"` naming the file the task
 creates (or, with `expect: absent`, deletes).
+
+**Stale scope paths.** Every `paths` entry of an `expect: present` check must
+name live code at `main`. A path that never existed is the normal
+forward-looking state and is not flagged; only a `sys.modules` shim or a path
+the mainline removed is (`shared/src/shared/delivered_check_scope.py`). A path
+check on a shim is not stale, since the file exists. `expect: absent` checks are
+left to the 2x2 and the audit's `vacuous_live_gate`: a dead scope makes them
+pass, not wedge. Three enforcement points: the authoring lint (reject, also
+named in the runtime `AUTHORING DIAGNOSIS`); the audit's STALE PATHS section
+(below); and `scripts/tests/test_sidecar_delivered_check_scope.py`, a tripwire
+over every tracked sidecar at `HEAD` that fails the mover's own verify. The
+tripwire sees sidecars only; metadata-only descriptors are the audit's. Repair:
+repath BOTH halves (sidecar and task record), or drop the descriptor; a task
+that genuinely re-creates a removed file scopes a grep to its parent directory.
 
 **Two enforcement points, deliberately different contracts:**
 
@@ -636,10 +652,13 @@ evaluating a descriptor against main yields a *bit*, not a verdict —
 "`expect: present` and it matches" is the success state of a landed producer
 *and* a never-fires gate on a live one, and a status-blind rule flags 313 of
 548 descriptors (57%), overwhelmingly correctly delivered work. Exit 1 keys
-only on `broken` (a done producer whose capability is nowhere on main) and
-`vacuous_live_gate` (an open producer whose check already passes);
-`superseded` — a correct descriptor that later work legitimately undid — is
-reported and never actionable. A separate report-only section lists sidecar
+only on `broken` (a done producer whose capability is nowhere on main),
+`vacuous_live_gate` (an open producer whose check already passes),
+`unwired_live_gate` (an open producer never stamped with its sound sidecar
+check) and an actionable stale path (a live producer, or a done one with open
+dependents; the rest are listed report-only); `superseded` — a correct
+descriptor that later work legitimately undid — is reported and never
+actionable. A separate report-only section lists sidecar
 descriptors carrying a structural code (`vacuous_present_self_referential`,
 `vacuous_present_comment_only`, `filename_shaped`). Those codes are measured
 against today's tree, and a reworded comment or a later file flips them, so
@@ -823,6 +842,13 @@ dependency gate as every other task (§3).
   kind: "deploy",                   # "deploy" | "predicate"; default "deploy" — see §6 for "predicate"
 }
 ```
+
+A relative `script` (even when `cwd` is set) and a relative `cwd` resolve
+against the orchestrator's **configured** `project_root` — the `project_root` in its
+`dark-factory-orchestrator.yaml`, the same root `submit_task`'s guard
+validates the script under — never against the orchestrator process's
+working directory. See
+`shared/src/shared/before_done_paths.py::resolve_before_done_paths`.
 
 **`metadata.always_escalates`** (`bool`, default `false`) — file a
 born-at-L2 escalation after the action completes (or immediately if no
@@ -1142,9 +1168,11 @@ that flips `before_done.kind` to `deploy`, deletes `metadata.milestone`, or
 attaches `recurrence` to an existing normal task lands exactly the state
 this contract forbids, with no error raised. That is not specific to
 `recurrence`: it is the root cause task **3093** tracks, which `milestone`
-(§6) and `task_kind` are already symptoms of. Don't do it — and any consumer
-acting on a chain link (the mint above all) should re-verify the carrier
-rather than assume submit-time validation still holds.
+(§6) and `task_kind` are already symptoms of. Don't do it. The mint does
+re-verify the carrier of the link it renews, through
+`deterministic_task_error`, and fails soft when it no longer holds; any other
+consumer acting on a chain link should likewise re-verify rather than assume
+submit-time validation still holds.
 
 **Forbidden until ruled.** `recurrence` on a *deploy*-kind deterministic
 task — or on any non-predicate `before_done`, or on `task_kind='normal'` —
@@ -1180,10 +1208,27 @@ deterministic-recon sweep's Source B auto-closer keys on that category to
 resolve deploy-stranded escalations, so widening the carrier rule to deploys
 would make that population un-auto-closable.
 
-**Not fully live yet.** The mint-on-terminal step and the chain-state gauge
-are separate PRD tasks. Filing a carrier today therefore gets you a
-*validated, time-withheld one-shot link* whose failures are correctly
-categorised — not an auto-renewing chain.
+**Minting.** Completing a carrier link `done`, through any writer (the
+orchestrator, `resolve_issue`, an interactive `set_task_status`), mints
+exactly one `pending` successor at the fused-memory interceptor. It copies
+`description`, `details`, `priority`, `task_kind`, `before_done`, `files` and
+`recurrence.{key, interval_secs}`; it gets `recurrence.minted_from` = the
+predecessor's id, `metadata.source='recurrence-mint'`, and `milestone.at` =
+the predecessor's persisted terminal time (the `updatedAt` its `done` write
+stored) plus `interval_secs` (whole seconds, no catch-up). The title is the
+chain's base title plus a ` [due <at>]` run label, not a verbatim copy: the
+store's `candidate_key` UNIQUE index counts `done` rows, so a same-title,
+same-files successor would be refused as a duplicate of its own predecessor
+(`fused-memory/src/fused_memory/middleware/recurrence_mint.py::_successor_title`).
+`cancelled` ends the chain, and an existing non-terminal link with the same
+`key` suppresses the mint. A mint failure never fails the status write: it
+logs `recurrence_mint_failed:` and leaves the link `done` with no successor,
+the *broken* state the chain-state gauge (a separate PRD task, not yet live)
+will surface. A request cancelled after its `done` write committed does not
+abandon the mint, which runs on to completion; a mint that is itself cancelled
+logs that same line. A link completed inside the same wall-clock second as its
+predecessor would give its successor its own run label, so that mint fails
+the same way.
 
 ---
 
@@ -1296,7 +1341,8 @@ source_finding_id, stage1_finding_id, origin_finding_id,
 related_memory_ids, related_tasks, spawned_from, program, program_stream,
 stream, cross_repo, cross_repo_project, human_curator_gate,
 human_curator_adjudicated_at, last_blocked_at, recurrence,
-execution_class, merge_lane, pending_since, pending_since_backfilled
+execution_class, merge_lane, pending_since, pending_since_backfilled,
+claimant_exception, audit_trail_rotation
 ```
 <!-- /tier-a-blessed-keys-mirror -->
 
@@ -1317,6 +1363,15 @@ moved or made lazy, and it is what makes
 `fused-memory/scripts/migrate_task_metadata_to_x_namespace.py` refuse to
 `x_`-namespace it, which for a submodel-backed key with live readers is the
 correct refusal. Every other key in this list is unregistered.
+
+`claimant_exception` is the machine ledger entry
+`{claimant_run_id, target_status, agent_id, tag, stamped_at}`. The
+fused-memory interceptor writes it, atomically with the status, on a `done`
+or `cancelled` write that explicitly supplies a non-NULL claimant: the one
+case where a terminal row may legitimately keep a claimant. The metadata
+merge is shallow, so it is latest-wins. The alarm tier is a terminal row
+with a claimant and no matching `claimant_exception`
+(`docs/prds/claimant-invariant-detection.md` D-5, E-2).
 
 The finding-provenance family — the id trio (`source_finding_id`,
 `stage1_finding_id`, `origin_finding_id`) plus `related_memory_ids` — is the
@@ -1587,6 +1642,20 @@ metadata key — that just adds another `code=unknown_key` census line. Use
 the `x_`-prefixed forward-compat namespace instead (e.g.
 `x_reconciliation_note`) — silently allowed, no warning — or fold the
 value into a single `annotations` field.
+
+`x_inv12_finding` and `x_inv12_owns` are the Tier-C keys of the INV-12
+sweep (exceptions are owned or ratified; PRD
+`plans/inv12-exceptions-owned-or-ratified-prd.md`, D11).
+`x_inv12_finding` is the sweep's idempotence key, one per
+`(scope, dead owner)` where scope is a governed `list_id` or `inline`; the
+sweep skips filing while a live task or pending escalation carries it.
+`x_inv12_owns` is a note the sweep merges into a live owner task, saying
+which exception entries cite it. A sweep-filed task asks the implementer to
+re-dispose each entry whose owner is dead: fix the underlying type or code so
+the suppression can go, or cite a live follow-up ticket on the marker. The
+accepted marker and declaration spellings are
+`shared.governed_exceptions.INLINE_MARKER_FORMS` and `DECLARATION_FORMS`;
+read them there rather than from a copy here.
 
 ### `allow_mcp_markup`: a write-time flag, not a metadata key
 
@@ -1913,6 +1982,34 @@ were prose.
 **Rotation is not adjudication.** Rotating a parked gate touches its
 `description` and `metadata` only. Its status, its ruling in `details`,
 and its substantive question are out of scope.
+
+### Enforcement
+
+`fused-memory/src/fused_memory/reconciliation/audit_trail_rotation.py` is
+the harness side of this rule. It runs after every reconciliation-stage
+`update_task` lands, touches only `description` and `metadata`, and
+reports its outcome in the response's `audit_trail_rotation` field:
+
+- **On the pattern, at any size:** a family of dated `<stem>_YYYY_MM_DD`
+  metadata keys is folded verbatim into one newest-first `<stem>_history`
+  array. An array the harness owns (listed in the rollup's
+  `history_keys`, or made only of its own entries) is trimmed to
+  `HISTORY_KEEP` entries once it passes `HISTORY_MAX`. So is
+  `memory_hints.queries`: the queries the context assembler executes are
+  never shed, and of near-duplicate queries only the newest stays.
+- **On the size:** above `ROTATE_THRESHOLD_BYTES` it sheds toward
+  `ROTATE_TARGET_BYTES`. Description rotation keeps the first block and
+  the newest blocks, archives the middle verbatim, and leaves a pointer
+  block listing the first line of each block it moved.
+- Whatever leaves is archived and read back byte-identical first, and the
+  `audit_trail_rotation` rollup records where it went. An archive that
+  no committed rewrite points at is deleted again. A task whose bulk is
+  `details`, or an array the harness did not create, is reported
+  `unrotatable` rather than trimmed.
+
+It leaves two things to the Stage 2 prompt, because code cannot judge
+them: writing the description as a rolling summary, and the
+description-append pattern trigger.
 
 Worked precedents: `autopilot_video` 648 (mem0
 `971d0b38-426d-41f8-be8f-9515ec01cae5`) for the bounded-array trim;

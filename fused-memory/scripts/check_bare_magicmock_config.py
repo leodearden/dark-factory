@@ -4,7 +4,7 @@
 This script carries THREE INDEPENDENT RULES.  Rules A and B are mock-spec
 discipline and share the AST predicates ``_is_magicmock_call`` / ``_is_specced``;
 Rule C is a wait-deadline rule and shares none of them.  What ALL THREE share is
-only the exemption-comment contract (``_EXEMPT_TEMPLATE`` / ``_is_exempted``), the
+only the exemption-comment contract (``_lint_cli.py::is_exempted``), the
 single ``ast.walk`` and the output format.  The per-file debt-budget machinery
 (``_debt_budget`` / ``_apply_debt_budget``) is Rule C's alone: Rules A and B are
 hot for every scanned file.  They have separate detection pipelines,
@@ -215,8 +215,8 @@ sites and added a file-local guard), task 4246 (this shared, repo-wide guard).
 
 ---------------------------------------------------------------------------
 
-This script is intentionally stdlib-only (ast, argparse, collections.abc, pathlib, re,
-sys, typing) so
+This script is intentionally stdlib-only (ast, collections.abc, pathlib, sys, typing,
+plus its stdlib-only sibling _lint_cli.py) so
 hooks/project-checks can invoke it via plain python3 without uv env-resolution overhead.
 Adding a third-party dependency here would break that fast path.  This is why
 ``_DATACLASS_SHAPES`` hardcodes field names instead of importing the dataclasses it
@@ -227,22 +227,18 @@ fused-memory/tests/test_check_bare_magicmock_config.py::TestDataclassShapeRegist
 
 from __future__ import annotations
 
-import argparse
 import ast
-import re
 import sys
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
-
-class Violation(NamedTuple):
-    """A lint violation found by the checker."""
-
-    filename: str
-    lineno: int
-    col_offset: int
-    message: str
+# Sibling import that survives `python3 -I`: see _lint_cli.py's module docstring.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from _lint_cli import Violation, discover_files, is_exempted, run_cli
+finally:
+    del sys.path[0]
 
 
 # Names that the checker considers "config objects".
@@ -370,31 +366,13 @@ def _is_specced(call: ast.Call) -> bool:
     return False
 
 
-# Exemption comment regexes, one per rule code.
-# Matches: ``# noqa: <code> — <non-empty-reason>``
-# Accepts em-dash (—) or ASCII hyphen (-) as separator.
-# Requires at least one non-space character after the separator.
-#
-# Each rule gets its OWN code so a suppression written for one can never silently
-# exempt another: the remedies are unrelated (mock_orch_config/pydantic_spec vs
+# Each rule gets its OWN ``# noqa`` code, under _lint_cli.py's one pragma grammar: the
+# remedies are unrelated (mock_orch_config/pydantic_spec vs
 # _fake_verify_result/spec=VerifyResult vs wait_responsive/MERGE_RESULT_TIMEOUT), so a
-# pragma for one is not informed consent for another.  All three are built from the
-# same template, so the em-dash/ASCII-hyphen and mandatory-reason contract is
-# identical across rules and an author learns it once.
-_EXEMPT_TEMPLATE = r'#\s*noqa:\s*{code}\s*[—\-]+\s*\S.*'
-
+# pragma for one is not informed consent for another.
 _RULE_A_CODE = 'bare-magicmock'
 _RULE_B_CODE = 'bare-dataclass-double'
 _RULE_C_CODE = 'wall-clock-deadline'
-
-# Kept at its historical value so Rule A's behaviour is bit-identical.
-_EXEMPT_RE = re.compile(_EXEMPT_TEMPLATE.format(code=re.escape(_RULE_A_CODE)))
-
-_EXEMPT_RES: dict[str, re.Pattern[str]] = {
-    _RULE_A_CODE: _EXEMPT_RE,
-    _RULE_B_CODE: re.compile(_EXEMPT_TEMPLATE.format(code=re.escape(_RULE_B_CODE))),
-    _RULE_C_CODE: re.compile(_EXEMPT_TEMPLATE.format(code=re.escape(_RULE_C_CODE))),
-}
 
 _VIOLATION_MSG = (
     'bare MagicMock() assigned to a config variable with no spec/spec_set.'
@@ -483,8 +461,8 @@ def _apply_debt_budget(
     - Not a debt file (*budget* is None) → every violation is reported unchanged.
     - At or under budget → silence: this is the grandfathering the baseline exists for.
     - Over budget → report exactly ``found - budget`` violations, so the noise is
-      proportional to the overrun rather than dumping all 317 Rule C violations of
-      test_merge_queue.py on someone who added one.
+      proportional to the overrun rather than dumping every Rule C violation of a
+      large debt file on someone who added one.
 
     The reported sites are the last in source order.  That choice is deterministic
     rather than diagnostic — the checker cannot know which site is new — and the
@@ -569,7 +547,7 @@ def _dataclass_double_violation(
     shape, kwargs = match
     # Computed lazily — only after a shape match — so the upward line walk keeps
     # the cost profile it has under Rule A rather than running on every call node.
-    if _is_exempted(lines, call.lineno, _RULE_B_CODE):
+    if is_exempted(lines, call.lineno, _RULE_B_CODE):
         return None
     return Violation(
         filename=filename,
@@ -611,9 +589,9 @@ def _dataclass_double_violation(
 # The count is a BUDGET, not a comment.  A debt file is silent while it carries at
 # most its recorded number and reports the overrun the moment it carries more, so
 # "shrink-only" is enforced on the same hot path the rule itself runs on rather than
-# trusted.  This matters most for orchestrator/tests/test_merge_queue.py, an
-# actively-developed hub, where a wholesale grandfather would have made a brand-new
-# wall-clock wait added tomorrow invisible to the gate.
+# trusted.  This matters most for an actively-developed debt file, where a
+# wholesale grandfather would have made a brand-new wall-clock wait added tomorrow
+# invisible to the gate.
 #
 # DO NOT ADD ENTRIES, AND DO NOT RAISE A NUMBER.  Both may only shrink, as files are
 # migrated onto wait_responsive(...) with bounds derived from MERGE_RESULT_TIMEOUT.
@@ -633,7 +611,6 @@ def _dataclass_double_violation(
 # on trailing path COMPONENTS, so the package directory keeps them distinct.
 _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     # orchestrator/tests
-    'orchestrator/tests/test_merge_queue.py': 267,
     'orchestrator/tests/test_merge_queue_concurrent_verify.py': 85,
     'orchestrator/tests/test_concurrent_verify_boundary.py': 44,
     'orchestrator/tests/test_merge_queue_lifecycle_registry.py': 30,
@@ -868,7 +845,7 @@ def _wall_clock_deadline_violations(
       2. the func is ``asyncio.wait_for`` or ``wait_responsive``;
       3. ``_load_bearing_wait_target`` recognises ``args[0]``.
     Only then is the exemption line-walk run (see ``_wall_clock_deadline_violations``'s
-    call to ``_is_exempted``), so the upward walk keeps Rule B's cost profile rather
+    call to ``is_exempted``), so the upward walk keeps Rule B's cost profile rather
     than running on every ``ast.Call`` in the tree.
 
     Position-blind by construction: the caller hands this every ``ast.Call``, so a
@@ -910,7 +887,7 @@ def _wall_clock_deadline_violations(
     # both matched — so the upward line walk keeps Rule B's cost profile rather than
     # running on every ast.Call in the tree.  ONE check per SITE suppresses BOTH
     # offence kinds: a pragma is consent for the site, not for one half of it.
-    if _is_exempted(lines, call.lineno, _RULE_C_CODE):
+    if is_exempted(lines, call.lineno, _RULE_C_CODE):
         return []
 
     messages: list[str] = []
@@ -937,36 +914,6 @@ def _wall_clock_deadline_violations(
         )
         for message in messages
     ]
-
-def _is_exempted(lines: list[str], lineno: int, code: str) -> bool:
-    """Return True if the node at *lineno* (1-based) carries a valid ``code`` exemption.
-
-    Walks upward from ``lineno - 1`` over blank lines to the nearest non-blank line.
-    If that line matches ``code``'s exemption regex the node is exempt.
-    Any intervening non-blank, non-matching line breaks the exemption.
-
-    The *code* parameter keeps all three rules' suppressions strictly separate: a
-    ``# noqa: bare-magicmock`` pragma does not exempt a ``bare-dataclass-double`` or
-    ``wall-clock-deadline`` violation, in any direction.  Only the regex differs —
-    the walk, the blank-line tolerance and the mandatory-non-empty-reason contract
-    are shared verbatim.
-
-    Inline trailing exemption NOT honored: only the nearest *preceding* non-blank line
-    is inspected.  A ``# noqa: ...`` comment on the same line as the node (inline
-    trailing) is intentionally ignored.  This is by design — see module-level docstring.
-    """
-    exempt_re = _EXEMPT_RES[code]
-    # lineno is 1-based; convert to 0-based index of the line ABOVE the node.
-    idx = lineno - 2  # the line immediately above
-    while idx >= 0:
-        line = lines[idx]
-        stripped = line.strip()
-        if stripped == '':
-            idx -= 1
-            continue
-        # Nearest non-blank line found — must match the exemption regex.
-        return bool(exempt_re.match(stripped))
-    return False
 
 
 def find_violations(source: str, filename: str) -> list[Violation]:
@@ -1061,7 +1008,7 @@ def find_violations(source: str, filename: str) -> list[Violation]:
         if _is_specced(value):  # type: ignore[arg-type]
             continue
 
-        # _is_exempted is computed lazily — only on finding the first config-named
+        # is_exempted is computed lazily — only on finding the first config-named
         # ast.Name target — because the exemption check (an upward line walk + regex)
         # is not free, and most assignments have no config-named targets.
         exempted: bool | None = None
@@ -1071,7 +1018,7 @@ def find_violations(source: str, filename: str) -> list[Violation]:
             if not _is_config_name(target.id):
                 continue
             if exempted is None:
-                exempted = _is_exempted(lines, assignment_lineno, _RULE_A_CODE)
+                exempted = is_exempted(lines, assignment_lineno, _RULE_A_CODE)
             if exempted:
                 # All targets of this node share the same lineno and therefore
                 # the same exemption status — no need to check further targets.
@@ -1107,14 +1054,11 @@ _DISCOVERY_GLOBS: tuple[str, ...] = ('test_*.py', 'conftest.py', '_*.py')
 def discover_scan_targets(directory: Path) -> list[Path]:
     """Return every file under *directory* the checker scans, sorted.
 
-    The one home of directory discovery: ``main`` and the baseline-integrity census
-    in fused-memory/tests/test_check_bare_magicmock_config.py both call it, so the
-    gate and its census cannot scan different file sets.
+    The one directory expansion: ``main`` hands it to ``run_cli`` and the
+    baseline-integrity census in fused-memory/tests/test_check_bare_magicmock_config.py
+    calls it, so the gate and its census cannot scan different file sets.
     """
-    found: set[Path] = set()
-    for pattern in _DISCOVERY_GLOBS:
-        found.update(directory.rglob(pattern))
-    return sorted(found)
+    return discover_files(directory, _DISCOVERY_GLOBS)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1124,71 +1068,20 @@ def main(argv: list[str] | None = None) -> int:
     ``wall-clock-deadline`` — in a single AST pass per file.
 
     For directories, recursively scans test_*.py, conftest.py and _*.py helper
-    modules only (``discover_scan_targets``).
-    Prints violations to stdout in 'path:lineno:col: message' format (ruff-style).
-
-    Explicit file paths are validated up front; a missing explicit path fails
-    fast with exit code 2 before any scan work. Mid-scan OSErrors (e.g. a file
-    yanked between rglob discovery and read) are accumulated and reported on
-    stderr without discarding violations already collected.
-
-    Returns 0 if clean, 1 if only violations were found, 2 on any fatal error
-    (missing explicit path or transient read failure).
+    modules only (``discover_scan_targets``).  Output and the 0/1/2 exit ladder are
+    ``_lint_cli.run_cli``'s.
     """
-    parser = argparse.ArgumentParser(
+    return run_cli(
+        argv,
         description=(
             'Test-quality lint checks over test files: bare MagicMock() assigned to '
             'config-named variables (bare-magicmock), unspecced MagicMocks shaped like '
             'a registered dataclass (bare-dataclass-double), and load-bearing waits '
             'carrying a wall-clock deadline (wall-clock-deadline).'
-        )
+        ),
+        discover=discover_scan_targets,
+        find_violations=find_violations,
     )
-    parser.add_argument('paths', nargs='+', help='Files or directories to check')
-    args = parser.parse_args(argv)
-
-    # Phase 1: discovery + upfront validation of explicit paths.
-    # rglob results are guaranteed to exist at discovery time, so only
-    # non-directory (explicit) paths need the existence check.
-    files_to_scan: list[Path] = []
-    for path_str in args.paths:
-        p = Path(path_str)
-        if p.is_dir():
-            files_to_scan.extend(discover_scan_targets(p))
-        else:
-            if not p.exists():
-                print(f'error: {p}: No such file or directory', file=sys.stderr)
-                return 2
-            files_to_scan.append(p)
-
-    # Phase 2: scan. Accumulate per-file read errors without returning early,
-    # so a transient OSError on one file never discards violations already
-    # collected from earlier files.
-    all_violations: list[Violation] = []
-    read_errors: list[tuple[Path, Exception]] = []
-    for file_path in files_to_scan:
-        try:
-            source = file_path.read_text(encoding='utf-8')
-        except (OSError, UnicodeDecodeError) as exc:
-            # UnicodeDecodeError is a ValueError subclass, not an OSError,
-            # but a malformed file must be reported via the read_errors channel
-            # rather than crashing with an unhandled traceback.
-            read_errors.append((file_path, exc))
-            continue
-
-        violations = find_violations(source, str(file_path))
-        all_violations.extend(violations)
-
-    # Phase 3: reporting.
-    # Sort across files for deterministic ruff-style (filename, lineno, col_offset) output.
-    all_violations.sort(key=lambda v: (v.filename, v.lineno, v.col_offset))
-    for v in all_violations:
-        print(f'{v.filename}:{v.lineno}:{v.col_offset}: {v.message}')
-    for file_path, exc in read_errors:
-        print(f'error reading {file_path}: {exc}', file=sys.stderr)
-
-    if read_errors:
-        return 2
-    return 1 if all_violations else 0
 
 
 if __name__ == '__main__':

@@ -2,28 +2,28 @@
 
 Follows ``test_conftest_helpers.py``'s precedent of contract-testing test
 infrastructure. ``_role_splice_contract.py`` is not production code; it is the
-deduplicated body behind the per-role splice assertions in
-``test_roles_wait_pattern.py`` (task 3607, ``BACKGROUND_WAIT_GUIDANCE``) and
-``test_roles_tool_call_rejection.py`` (tasks 4273/4578,
-``TOOL_CALL_REJECTION_GUIDANCE``).
+deduplicated body behind the per-role splice assertions in the ``test_roles_*``
+anchor modules.
 
-WHY THE FIRING CASES MATTER, and why this file exists at all. Both consumer
-modules name the same motivating risk in their docstrings: a prompt refactor
-silently drops a mandated block and CI stays green. Once both files delegate
-their assertions to one helper, that hazard concentrates. An assertion helper
-that degrades into a no-op — an ``assert`` accidentally softened to a truthy
-expression, an offender loop that never appends, a message that swallows the
-call site's remedy — would leave all 24 consumer tests green while asserting
-nothing at all. So every assertion here is pinned TWICE: once that it PASSES
-on a conforming input, and once that it FIRES (raises ``AssertionError``, with
-the offenders named) on a violating one. A helper that only ever passes is
-indistinguishable from a helper that does nothing.
+WHY THE FIRING CASES MATTER, and why this file exists at all. The consumer
+modules name the same motivating risk: a prompt refactor silently drops a
+mandated block and CI stays green. Once they all delegate their assertions to
+one helper, that hazard concentrates. An assertion helper that degrades into a
+no-op — an ``assert`` accidentally softened to a truthy expression, an offender
+loop that never appends, a message that swallows the call site's remedy — would
+leave every consumer test green while asserting nothing at all. So every
+assertion here is pinned TWICE: once that it PASSES on a conforming input, and
+once that it FIRES (raises ``AssertionError``, with the offenders named) on a
+violating one. A helper that only ever passes is indistinguishable from a
+helper that does nothing.
 
 Everything under test here is driven by SYNTHETIC fixtures — string literals
 and synthetic ``AgentRole`` mappings — never by a real prompt constant from
-``roles.py``. This file tests the HELPER; whether the real prompts satisfy the
-contract is the two consumer files' job, and duplicating that here would
-recreate the very clone this task is closing.
+``roles.py``, except ``GREP_LOOKAROUND_GUIDANCE``, imported only as the opaque
+landmark the preamble-tail order check anchors on and never asserted on. This
+file tests the HELPER; whether the real prompts satisfy the contract is the
+consumer modules' job, and duplicating that here would recreate the very clone
+this task is closing.
 """
 
 from __future__ import annotations
@@ -33,13 +33,19 @@ from collections.abc import Mapping
 
 import pytest
 from _role_splice_contract import (
+    BASH_CAPABLE_UNPINNED_ROLES,
     MARKDOWN_HEADING,
+    PreambleTailBlock,
+    PreambleTailContractTests,
     SpliceContract,
     assert_brace_free,
     assert_nonempty,
+    bash_capable_unpinned,
+    bash_capable_unpinned_contract,
 )
+from shared.prompt_artifact import PromptSpec
 
-from orchestrator.agents.roles import ROLES, AgentRole
+from orchestrator.agents.roles import GREP_LOOKAROUND_GUIDANCE, ROLES, AgentRole
 
 # Synthetic remedy prose. The helper must render the caller's remedy into every
 # failure message: the consumers' remediation sentences ARE the diagnostic value
@@ -154,7 +160,7 @@ def test_all_roles_defaults_to_the_real_roles_mapping() -> None:
     """Omitting `all_roles` binds the real `ROLES`, so consumers stay one-liners.
 
     Identity check ONLY. Nothing about the real roles' prompt CONTENTS is
-    asserted here — that is the two consumer files' job, and duplicating it here
+    asserted here — that is the consumer modules' job, and duplicating it here
     would recreate the clone this task closes.
     """
     contract = SpliceContract(
@@ -240,6 +246,85 @@ def test_the_capability_predicate_is_genuinely_a_parameter() -> None:
     with pytest.raises(AssertionError) as excinfo:
         only_alpha.assert_role_set_matches_capability(remedy=_REMEDY)
     assert "gained=['beta']" in str(excinfo.value)
+
+
+_SYNTHETIC_PROMPT_SPEC = PromptSpec(prompt_id='p', contract='c', baseline_heuristics='h')
+
+
+@pytest.mark.parametrize(
+    ('role', 'expected'),
+    [
+        (AgentRole(name='alpha', system_prompt=_SPLICE, allowed_tools=['Bash']), True),
+        (AgentRole(name='alpha', system_prompt=_SPLICE, allowed_tools=['Bash(git:*)']), False),
+        (AgentRole(name='alpha', system_prompt=_SPLICE, allowed_tools=[]), False),
+        (
+            AgentRole(
+                name='alpha',
+                system_prompt=_SPLICE,
+                allowed_tools=['Bash'],
+                prompt_spec=_SYNTHETIC_PROMPT_SPEC,
+            ),
+            False,
+        ),
+    ],
+    ids=['literal-bash', 'git-only-bash', 'no-tools', 'prompt-spec-backed'],
+)
+def test_bash_capable_unpinned_predicate(role: AgentRole, expected: bool) -> None:
+    """Literal prompt AND the exact `'Bash'` grant; `'Bash(git:*)'` does not qualify."""
+    assert bash_capable_unpinned(role) is expected
+
+
+def _bash_capable_mapping(**extra: AgentRole) -> dict[str, AgentRole]:
+    """Every shared-set name as a literal Bash role, plus both excluded shapes.
+
+    `judge` (git-only `Bash`) and a PromptSpec-backed `Bash` holder are both
+    present so each exclusion arm of the predicate meets a role to exclude.
+    """
+    mapping = {
+        name: AgentRole(name=name, system_prompt=_SPLICE, allowed_tools=['Bash'])
+        for name in BASH_CAPABLE_UNPINNED_ROLES
+    }
+    mapping['judge'] = AgentRole(
+        name='judge', system_prompt=_SPLICE, allowed_tools=['Bash(git:*)']
+    )
+    mapping['reviewer_synthetic'] = AgentRole(
+        name='reviewer_synthetic',
+        system_prompt=_SPLICE,
+        allowed_tools=['Bash'],
+        prompt_spec=_SYNTHETIC_PROMPT_SPEC,
+    )
+    mapping.update(extra)
+    return mapping
+
+
+def test_bash_capable_unpinned_contract_binds_the_shared_set() -> None:
+    """The factory binds the shared set, the shared predicate and the caller's constant."""
+    contract = bash_capable_unpinned_contract(
+        'SPLICE_UNIT', _SPLICE, all_roles=_bash_capable_mapping()
+    )
+
+    assert contract.roles is BASH_CAPABLE_UNPINNED_ROLES
+    assert contract.constant == _SPLICE
+    assert contract.constant_name == 'SPLICE_UNIT'
+    assert contract.assert_role_set_matches_capability(remedy=_REMEDY) is None
+    # Identity check only, as in `test_all_roles_defaults_to_the_real_roles_mapping`.
+    assert bash_capable_unpinned_contract('SPLICE_UNIT', _SPLICE).all_roles is ROLES
+
+
+def test_bash_capable_unpinned_contract_fires_when_a_role_gains_bash() -> None:
+    """A new literal `Bash` role is reported as gained, naming the shared set."""
+    gamma = AgentRole(name='gamma', system_prompt=_SPLICE, allowed_tools=['Bash'])
+    contract = bash_capable_unpinned_contract(
+        'SPLICE_UNIT', _SPLICE, all_roles=_bash_capable_mapping(gamma=gamma)
+    )
+
+    with pytest.raises(AssertionError) as excinfo:
+        contract.assert_role_set_matches_capability(remedy=_REMEDY)
+
+    message = str(excinfo.value)
+    assert "gained=['gamma']" in message
+    assert 'BASH_CAPABLE_UNPINNED_ROLES' in message
+    assert _REMEDY in message
 
 
 def test_every_role_carries_passes_when_the_whole_set_carries_the_constant() -> None:
@@ -820,3 +905,136 @@ def test_lands_after_records_a_missing_block_as_an_offender(
     message = str(excinfo.value)
     assert 'alpha' in message
     assert f"'{expected_key}': 'ABSENT'" in message
+
+
+# One distinct sentinel per block-owned prose field, so each fire case below
+# proves the mixin renders THAT field, not merely some remedy.
+_RESTORE_SENTINEL = 'RESTORE-SENTINEL'
+_BRACE_SENTINEL = 'BRACE-SENTINEL'
+_EXCLUDED_SENTINEL = 'EXCLUDED-ROLES-SENTINEL'
+_CARRIER_SENTINEL = 'CARRIER-SENTINEL'
+_ORDER_SENTINEL = 'ORDER-SENTINEL'
+
+_TAIL_PROMPT = f'{_IDENTITY}{GREP_LOOKAROUND_GUIDANCE}{_SPLICE}'
+
+
+def _tail_mapping(**overrides: str) -> dict[str, AgentRole]:
+    """A conforming preamble-tail mapping, with ``name=prompt`` overrides.
+
+    Every shared-set role carries the splice after the grep landmark, and
+    `judge` holds git-only `Bash` and no splice. An override names an existing
+    role to replace its prompt, or a NEW name to add a literal `Bash` role.
+    """
+    mapping = {
+        name: AgentRole(name=name, system_prompt=_TAIL_PROMPT, allowed_tools=['Bash'])
+        for name in BASH_CAPABLE_UNPINNED_ROLES
+    }
+    mapping['judge'] = AgentRole(
+        name='judge', system_prompt=_IDENTITY, allowed_tools=['Bash(git:*)']
+    )
+    for name, prompt in overrides.items():
+        base = mapping.get(name, AgentRole(name=name, system_prompt='', allowed_tools=['Bash']))
+        mapping[name] = dataclasses.replace(base, system_prompt=prompt)
+    return mapping
+
+
+def _tail_block(**field_overrides: object) -> PreambleTailBlock:
+    """A `PreambleTailBlock` over `_tail_mapping()`, with every prose field a sentinel."""
+    fields: dict[str, object] = {
+        'constant_name': 'SPLICE_UNIT',
+        'constant': _SPLICE,
+        'restore_remedy': _RESTORE_SENTINEL,
+        'brace_remedy': _BRACE_SENTINEL,
+        'excluded_roles_remedy': _EXCLUDED_SENTINEL,
+        'carrier_note': _CARRIER_SENTINEL,
+        'order_note': _ORDER_SENTINEL,
+        'all_roles': _tail_mapping(),
+    }
+    fields.update(field_overrides)
+    return PreambleTailBlock(**fields)  # type: ignore[arg-type]
+
+
+def _probe(block: PreambleTailBlock) -> PreambleTailContractTests:
+    """A mixin instance bound to ``block``; its `_` name keeps pytest from collecting it."""
+    return type('_Probe', (PreambleTailContractTests,), {'block': block})()
+
+
+class TestPreambleTailContractOnAConformingSplice(PreambleTailContractTests):
+    """The PASS case, run exactly as a consumer runs it: every inherited method."""
+
+    block = _tail_block()
+
+
+@pytest.mark.parametrize(
+    ('method', 'block', 'expected'),
+    [
+        ('test_guidance_is_nonempty', _tail_block(constant='\n'), [_RESTORE_SENTINEL]),
+        ('test_guidance_is_brace_free', _tail_block(constant=f'{_SPLICE}{{'), [_BRACE_SENTINEL]),
+        (
+            'test_guidance_opens_its_own_section',
+            _tail_block(constant='no heading\n'),
+            ['SPLICE_UNIT'],
+        ),
+        (
+            'test_role_set_matches_bash_capability',
+            _tail_block(all_roles=_tail_mapping(gamma=_TAIL_PROMPT)),
+            ["gained=['gamma']", _CARRIER_SENTINEL],
+        ),
+        (
+            'test_every_bash_capable_role_carries_guidance',
+            _tail_block(all_roles=_tail_mapping(merger=f'{_IDENTITY}{GREP_LOOKAROUND_GUIDANCE}')),
+            ["['merger']"],
+        ),
+        (
+            'test_no_other_role_carries_guidance',
+            _tail_block(all_roles=_tail_mapping(judge=f'{_IDENTITY}{_SPLICE}')),
+            ["['judge']", _EXCLUDED_SENTINEL],
+        ),
+        (
+            'test_guidance_appears_exactly_once_per_role',
+            _tail_block(all_roles=_tail_mapping(merger=f'{_TAIL_PROMPT}{_SPLICE}')),
+            ["'merger': 2"],
+        ),
+        (
+            'test_guidance_lands_after_the_grep_block',
+            _tail_block(
+                all_roles=_tail_mapping(merger=f'{_IDENTITY}{_SPLICE}{GREP_LOOKAROUND_GUIDANCE}')
+            ),
+            ['earliest_allowed', _ORDER_SENTINEL],
+        ),
+    ],
+    ids=[
+        'emptied',
+        'brace',
+        'unheaded',
+        'role-gained-bash',
+        'carrier-lost-splice',
+        'excluded-role-spliced',
+        'duplicate-splice',
+        'ahead-of-grep-block',
+    ],
+)
+def test_preamble_tail_contract_fires_with_the_block_remedy(
+    method: str, block: PreambleTailBlock, expected: list[str]
+) -> None:
+    """Each inherited invariant FIRES on its violation and renders the block's own prose."""
+    with pytest.raises(AssertionError) as excinfo:
+        getattr(_probe(block), method)()
+
+    message = str(excinfo.value)
+    for fragment in expected:
+        assert fragment in message
+
+
+def test_tail_exactly_once_skips_an_absent_splice() -> None:
+    """``absent_ok=True``: a missing splice fails the containment test only.
+
+    One root cause, one failing test.
+    """
+    probe = _probe(
+        _tail_block(all_roles=_tail_mapping(merger=f'{_IDENTITY}{GREP_LOOKAROUND_GUIDANCE}'))
+    )
+
+    assert probe.test_guidance_appears_exactly_once_per_role() is None
+    with pytest.raises(AssertionError):
+        probe.test_every_bash_capable_role_carries_guidance()

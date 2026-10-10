@@ -7,13 +7,15 @@ test_legibility_config.py's module docstring for the import mechanics).
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import textwrap
 from datetime import date as dt_date
 from pathlib import Path
 
+import pytest
+from legibility import coder, digest, inventory
 from legibility import config as config_mod
-from legibility import digest, inventory
 from legibility import sampling as mod
 
 MAIN_CWD = '/home/leo/src/dark-factory'
@@ -371,6 +373,135 @@ class TestClassifyAgentClass:
         path = Path('/root/-home-leo-src-dark-factory--worktrees-2573/sess.jsonl')
         text = '## Reconciliation Run\n'
         assert mod.classify_agent_class(_user_turn(text), path) == 'orchestrated-task'
+
+
+def _queue_operation_record() -> dict:
+    return {'type': 'queue-operation', 'operation': 'enqueue', 'timestamp': '2026-07-13T09:59:00.000Z'}
+
+
+def _with_session(record: dict, session_id: str, *, cwd: str = MAIN_CWD) -> dict:
+    return {**record, 'sessionId': session_id, 'cwd': cwd}
+
+
+class TestScanTranscript:
+    """scan_transcript is the one pass over a transcript: signal counts, the
+    first user turn, and the session id the ledger is keyed by."""
+
+    def _signal_transcript(self, tmp_path: Path) -> Path:
+        return _write_transcript(tmp_path / 'sess-abc.jsonl', [
+            _queue_operation_record(),
+            _with_session(_clean_record(0), 'sess-abc'),
+            _with_session(_tool_error_record(), 'sess-abc'),
+            _with_session(_not_found_record(), 'sess-abc'),
+            _with_session(_self_correct_record(), 'sess-abc'),
+        ])
+
+    def test_counts_match_score_signals_and_first_turn_is_located(self, tmp_path):
+        path = self._signal_transcript(tmp_path)
+        scan = mod.scan_transcript(path)
+        assert scan.counts == mod.score_signals(path)
+        assert scan.counts.total_signal > 0
+        assert scan.first_turn is not None
+        assert scan.first_turn['message']['content'] == 'Please do the thing #0.'
+
+    def test_scan_is_frozen(self, tmp_path):
+        scan = mod.scan_transcript(self._signal_transcript(tmp_path))
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            scan.session_id = 'other'  # type: ignore[misc]
+
+    def test_session_id_skips_a_leading_record_without_one(self, tmp_path):
+        assert mod.scan_transcript(self._signal_transcript(tmp_path)).session_id == 'sess-abc'
+
+    def test_session_id_is_none_when_no_record_carries_one(self, tmp_path):
+        path = _write_transcript(tmp_path / 's.jsonl', [_clean_record(0), _tool_error_record()])
+        assert mod.scan_transcript(path).session_id is None
+
+    def test_session_id_of_an_all_sidechain_subagent_transcript_is_the_parents(self, tmp_path):
+        sidechain = {**_with_session(_clean_record(0), 'parent-sess'), 'isSidechain': True}
+        path = _write_transcript(tmp_path / 'agent-a1b2.jsonl', [sidechain])
+        scan = mod.scan_transcript(path)
+        assert scan.first_turn is None
+        assert scan.session_id == 'parent-sess'
+
+    @pytest.mark.parametrize('sidechain', [False, True])
+    def test_session_id_agrees_with_the_digest_frontmatter_session(self, tmp_path, sidechain):
+        records = [
+            _queue_operation_record(),
+            {**_with_session(_clean_record(0), 'sess-agree'), 'isSidechain': sidechain},
+            {**_with_session(_tool_error_record(), 'sess-agree'), 'isSidechain': sidechain},
+        ]
+        path = _write_transcript(tmp_path / 'agent-x.jsonl', records)
+        frontmatter = coder.parse_frontmatter(digest.build_digest(path))
+        assert mod.scan_transcript(path).session_id == frontmatter['session']
+
+    def test_unreadable_path_degrades_to_an_empty_scan(self, tmp_path):
+        scan = mod.scan_transcript(tmp_path / 'missing.jsonl')
+        assert scan.counts == mod.SignalCounts()
+        assert scan.first_turn is None
+        assert scan.session_id is None
+
+
+class TestPeekSessionId:
+    """peek_session_id is scan_transcript's session_id, read only up to the
+    first record that carries one."""
+
+    @pytest.mark.parametrize('records', [
+        pytest.param([_queue_operation_record(), _with_session(_clean_record(0), 'sess-a')],
+                     id='leading-record-without-one'),
+        pytest.param([_clean_record(0), _tool_error_record()], id='none-carries-one'),
+        pytest.param([{**_with_session(_clean_record(0), 'parent'), 'isSidechain': True}],
+                     id='all-sidechain'),
+        pytest.param([_with_session(_clean_record(0), ''), _with_session(_clean_record(1), 'sess-b')],
+                     id='empty-id-skipped'),
+    ])
+    def test_agrees_with_the_full_scan(self, tmp_path, records):
+        path = _write_transcript(tmp_path / 's.jsonl', records)
+        assert mod.peek_session_id(path) == mod.scan_transcript(path).session_id
+
+    def test_unreadable_path_is_none(self, tmp_path):
+        assert mod.peek_session_id(tmp_path / 'missing.jsonl') is None
+
+    def test_stops_at_the_first_record_carrying_one(self, tmp_path):
+        """Bytes no full read can decode, placed well past the first decode
+        chunk, fail the scan but never reach the peek."""
+        path = _write_transcript(tmp_path / 's.jsonl', [
+            _with_session(_clean_record(0), 'sess-c'),
+            {'type': 'padding', 'text': 'x' * 65536},
+        ])
+        with path.open('ab') as f:
+            f.write(b'\xff\xfe not utf-8\n')
+        assert mod.scan_transcript(path).session_id is None
+        assert mod.peek_session_id(path) == 'sess-c'
+
+
+class TestScoreSession:
+    """score_session is the one scan + classify + first-turn-text step every
+    consumer of enumerated sessions shares."""
+
+    def test_scores_classifies_and_carries_the_session_id(self, tmp_path):
+        encoded = tmp_path / '-home-leo-src-dark-factory--worktrees-9'
+        encoded.mkdir()
+        path = _write_transcript(encoded / 'sess-1.jsonl', [
+            _with_session(_clean_record(3), 'sess-1'),
+            _with_session(_not_found_record(), 'sess-1'),
+        ])
+        session = inventory.SessionRecord(
+            path=path, encoded_dir=encoded.name, cwd=MAIN_CWD,
+            date=dt_date(2026, 7, 13), size_bytes=path.stat().st_size,
+        )
+
+        scored = mod.score_session(session)
+
+        scan = mod.scan_transcript(path)
+        assert scored.session is session
+        assert scored.stratum == mod.classify_agent_class(scan.first_turn, path)
+        assert scored.stratum == 'orchestrated-task'
+        assert scored.counts == scan.counts
+        assert scored.first_turn_text == 'Please do the thing #3.'
+        assert scored.session_id == 'sess-1'
+
+    def test_scored_record_session_id_defaults_to_none(self):
+        assert _scored('s', 'interactive', mod.SignalCounts(), '').session_id is None
 
 
 def _scored(session_id, stratum, counts, first_turn_text, size_bytes=1000):

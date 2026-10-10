@@ -4,7 +4,8 @@ Injected in place of the production adapters through
 ``MergeLane(..., verifier=FakeVerifier(...), clock=FakeClock(...))``.
 ``FakeVerifier`` scripts the verify outcome per task id or in call order,
 and records each scoped verify as a ``ScopedVerifyCall``; ``FakeClock`` is a
-hand-advanced clock whose ``sleep`` advances it instead of waiting;
+hand-advanced clock whose ``sleep`` advances it instead of waiting, and
+``healthy_verify_clock`` one on which an in-flight verify keeps writing;
 ``RecordingEscalations`` stands in for the escalation queue and keeps what
 the lane filed; ``lane_state``/``lane_entry`` read an item's state back off
 the lane's public ``snapshot()`` census. ``make_lane`` builds a lane on all three at once, so a test
@@ -307,17 +308,17 @@ class FakeClock:
     the FULL requested timeout while really waiting only ``wait_cap``.
     So a loop that polls on this clock and measures its budget off
     ``monotonic()`` -- the in-flight verify abort-poll is the one that does
-    -- reaches that budget in a bounded number of polls with no real time
-    elapsed, and the task being polled still gets real timer slack to
-    finish in. Every requested timeout lands in ``waits``.
+    -- reaches that budget with no real time elapsed. Every requested
+    timeout lands in ``waits``.
 
-    That slack is finite and DERIVED, so it is worth stating: a polled task
-    gets ``budget / poll * wait_cap`` seconds of real time before the loop
-    exhausts its budget and calls the task dead -- 0.2s at the settings
-    test_merge_queue_lifecycle_registry.py uses (budget 0.2, poll 0.02). A
-    test whose fake verify genuinely needs longer -- an awaited subprocess,
-    a git operation, a loaded host -- raises ``wait_cap`` rather than
-    false-aborting a healthy verify.
+    How much real time the polled task gets before that is NOT dependable,
+    so no ``wait_cap`` buys a load-safe slack. ``sleep`` only yields, so
+    the lane's periodic loops (``_heartbeat_loop``, ``_reprobe_loop``) spin
+    ``mono`` forward at event-loop speed while the lane is otherwise idle,
+    and a parked verify's whole budget can go in under a second. A scene
+    that must not call a verify dead shows the content progress a healthy
+    verify makes -- ``healthy_verify_clock`` -- and only a scene exercising
+    the dead-verify abort leaves ``content_mtime`` frozen.
 
     ``tick`` additionally advances ``mono`` on every ``monotonic()`` read,
     for a lane loop that measures elapsed time off this clock but waits on
@@ -384,6 +385,13 @@ class FakeClock:
         done, _ = await asyncio.wait(aws, timeout=min(timeout, self.wait_cap))
         self.mono += timeout
         return done
+
+
+def healthy_verify_clock() -> FakeClock:
+    """A ``FakeClock`` on which an in-flight verify keeps writing to its merge
+    worktree, as a healthy one does, so the lane's no-progress abort never
+    calls it dead however far the lane's loops have run ``monotonic()``."""
+    return FakeClock(content_mtime=1.0, content_tick=1.0)
 
 
 class RecordingEscalations:
