@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -106,6 +107,18 @@ def update_ewa(
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class CategoryShare:
+    """One escalation category's count out of the window's total."""
+
+    category: str
+    count: int
+    total: int
+
+    def __str__(self) -> str:
+        return f'{self.count}/{self.total} {self.category}'
+
+
 @dataclass
 class EscalationStats:
     """Aggregated escalation statistics for a digest window."""
@@ -119,6 +132,16 @@ class EscalationStats:
     dedupe_children_total: int = 0
     # Count of in-window escalations with status == 'pending'
     pending_total: int = 0
+
+    def dominant_category(self) -> CategoryShare | None:
+        """The most frequent category across every level and status; ties go to the smallest name."""
+        per_category: Counter[str] = Counter()
+        for (category, _level, _status), count in self.category_level_status_counts.items():
+            per_category[category] += count
+        if not per_category:
+            return None
+        category, count = min(per_category.items(), key=lambda kv: (-kv[1], kv[0]))
+        return CategoryShare(category=category, count=count, total=sum(per_category.values()))
 
 
 def aggregate_escalations(
@@ -720,6 +743,8 @@ def render_digest_markdown(inputs: DigestInputs) -> str:
     lines.append(
         f'- Lifecycle events in step (digest gate): {inputs.lifecycle_events_in_step}'
     )
+    share = inputs.escalation_stats.dominant_category()
+    lines.append(f'- Dominant escalation category: {share if share is not None else "none"}')
     lines.append('')
 
     # Anomalies
