@@ -598,6 +598,10 @@ class CensusPostRefusedUnderTest(RuntimeError):
     """
 
 
+class CensusPreconditionFailed(RuntimeError):
+    """A check before any spend refused this run."""
+
+
 _own_endpoint_declared: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "census_own_endpoint_declared", default=False,
 )
@@ -3889,11 +3893,13 @@ def main(argv: list[str] | None = None) -> int:
     project at ``as_of_sha``, its HEAD (``census_identity.resolve_as_of_sha``),
     resolved after the gate and before any spend.
 
-    Returns non-zero only on a genuine fail-loud error (a config-load
-    failure, a project root that is not a git repo, an uncaught exception
-    from ``run_census``, or an ``"unlanded"`` census whose commit did not
-    land) -- a deferred
-    (headroom-preflight) outcome still exits 0, mirroring
+    Returns non-zero only on a genuine fail-loud error. Every such exit
+    after the config has loaded has filed exactly one escalation:
+    :func:`_census_failed`'s for any raise, a refused precondition included,
+    or ``run_census``'s own for an ``"unlanded"`` census whose commit did not
+    land. Before the config loads there is no escalation target, so a bad
+    ``--project-root`` or an unloadable config is reported on stderr only.
+    A deferred (headroom-preflight) outcome still exits 0, mirroring
     ``census_trigger``'s own CLI contract of reserving a non-zero exit for
     an operator-facing failure, not an expected defer/no-fire outcome.
 
@@ -4012,22 +4018,47 @@ def main(argv: list[str] | None = None) -> int:
         print(f"census: failed to load config at {config_path}: {exc}", file=sys.stderr)
         return 1
 
+    # One escalate_fn closure shared by run_census's own defer/unlanded
+    # escalations and this boundary, so every census escalation has one source.
+    escalate_fn = _build_default_escalate_fn(cfg)
+    try:
+        return _run_configured_census(
+            args, project_root=project_root, cfg=cfg, config_path=config_path,
+            escalate_fn=escalate_fn,
+        )
+    except Exception as exc:
+        return _census_failed(cfg, escalate_fn, exc)
+
+
+def _census_failed(cfg, escalate_fn, exc: BaseException) -> int:
+    """Report a census that failed after its config loaded -- stderr, then the
+    journal, then one best-effort escalation -- and return the exit code."""
+    summary = f"legibility census run failed ({cfg.project_id}): {exc}"
+    detail = "".join(traceback.format_exception(exc))
+    print(f"census: FAILED -- {exc}", file=sys.stderr)
+    logger.error("%s -- %s", summary, detail)
+    escalate_fn(category="infra_issue", severity="info", summary=summary, detail=detail)
+    return 1
+
+
+def _run_configured_census(
+    args: argparse.Namespace, *, project_root: Path, cfg, config_path: Path, escalate_fn,
+) -> int:
+    """:func:`main`'s run once *cfg* has loaded. Raises on every failure but an
+    ``"unlanded"`` outcome, which ``run_census`` has already escalated."""
     mismatch = _project_identity_mismatch(project_root, cfg, config_path)
     if mismatch is not None:
-        print(f"census: {mismatch}", file=sys.stderr)
-        return 1
+        raise CensusPreconditionFailed(mismatch)
 
     harness_config_path = (
         Path(args.harness_config) if args.harness_config else DEFAULT_HARNESS_CONFIG_PATH
     )
     try:
         harness_cfg = config.load_config(harness_config_path)
-    except Exception as exc:  # noqa: BLE001 - an unloadable harness config fails loud at CLI startup
-        print(
-            f"census: failed to load harness config at {harness_config_path}: {exc}",
-            file=sys.stderr,
-        )
-        return 1
+    except Exception as exc:
+        raise CensusPreconditionFailed(
+            f"failed to load harness config at {harness_config_path}: {exc}"
+        ) from exc
     harness_project = filing_policy.ProjectRef(
         project_root=harness_cfg.project_root, project_id=harness_cfg.project_id,
     )
@@ -4050,8 +4081,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         as_of_sha = census_identity.resolve_as_of_sha(project_root)
     except RuntimeError as exc:
-        print(f"census: cannot resolve as_of_sha -- {exc}", file=sys.stderr)
-        return 1
+        raise CensusPreconditionFailed(f"cannot resolve as_of_sha -- {exc}") from exc
 
     codebook_path = project_root / "docs" / "legibility" / "confusion-codebook.yaml"
     census_state_path = project_root / "docs" / "legibility" / "census-state.json"
@@ -4076,11 +4106,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         codebook_dict = {"version": 2, "entries": [], "candidates": []}
 
-    # One escalate_fn closure shared by BOTH consumers: run_census's
-    # headroom-defer path and main()'s hard-failure catch-all below -- so
-    # defer and hard-failure escalations share one census escalation source
-    # and one never-mask-the-exit contract.
-    escalate_fn = _build_default_escalate_fn(cfg)
     batch_source = census_window.WindowBatchSource(
         cfg,
         projects_root=DEFAULT_PROJECTS_ROOT,
@@ -4098,62 +4123,47 @@ def main(argv: list[str] | None = None) -> int:
         mining_invoke, verify_invoke, synthesis_invoke = _build_stage_invokes(
             cfg, project_root=project_root, runner=runner,
         )
-        try:
-            outcome = run_census(
-                batch_source=batch_source,
-                selection_of=lambda: batch_source.selection,
-                invoke=mining_invoke,
-                # The in-verify re-probe rides the SAME cwd-scoped invoke as the
-                # verifier it guards (so it fails exactly when the verifier would)
-                # but on the cheap trickle tier, matching every other headroom
-                # gate -- one probe implementation, one model tier, four sites.
-                verify_fn=_build_default_verify_fn(
-                    str(project_root),
-                    verify_invoke,
-                    headroom_probe=functools.partial(
-                        preflight_headroom, verify_invoke, model=cfg.models.trickle,
-                    ),
+        outcome = run_census(
+            batch_source=batch_source,
+            selection_of=lambda: batch_source.selection,
+            invoke=mining_invoke,
+            # The in-verify re-probe rides the SAME cwd-scoped invoke as the
+            # verifier it guards (so it fails exactly when the verifier would)
+            # but on the cheap trickle tier, matching every other headroom
+            # gate -- one probe implementation, one model tier, four sites.
+            verify_fn=_build_default_verify_fn(
+                str(project_root),
+                verify_invoke,
+                headroom_probe=functools.partial(
+                    preflight_headroom, verify_invoke, model=cfg.models.trickle,
                 ),
-                synthesize_fn=_build_default_synthesize_fn(synthesis_invoke),
-                submit_fn=default_submit_fn,
-                escalate_fn=escalate_fn,
-                status_fetcher=status_fetcher,
-                commit=_build_default_commit(project_root),
-                roll_back=functools.partial(
-                    unlanded.roll_back, project_root,
-                    project_id=cfg.project_id, label=f"census-{date_str}",
-                ),
-                codebook_dict=codebook_dict,
-                config=cfg,
-                project_root=str(project_root),
-                project_id=cfg.project_id,
-                codebook_path=codebook_path,
-                census_state_path=census_state_path,
-                report_path=report_path,
-                date=date_str,
-                run_id=identity.run_id,
-                as_of_sha=as_of_sha,
-                since=prior.as_of_sha,
-                force=args.force,
-                max_batches=args.max_batches,
-                max_verify_clusters=args.max_verify_clusters,
-                dry_run_payloads_path=dry_run_payloads_path,
-                harness_project=harness_project,
-            )
-        except Exception as exc:  # noqa: BLE001 - fail loud: escalate (PRD decision 8) AND exit non-zero, never a silent crash
-            print(f"census: FAILED -- {exc}", file=sys.stderr)
-            # PRD decision 8 -- degradation never silent: file a best-effort
-            # escalation via the shared closure so a hard failure leaves an
-            # operator signal, not just a stderr line. The closure swallows all
-            # POST errors internally (logging a best-effort warning), so this
-            # never masks the exit and `return 1` always runs.
-            escalate_fn(
-                category="infra_issue",
-                severity="info",
-                summary=f"legibility census run failed ({cfg.project_id}): {exc}",
-                detail=traceback.format_exc(),
-            )
-            return 1
+            ),
+            synthesize_fn=_build_default_synthesize_fn(synthesis_invoke),
+            submit_fn=default_submit_fn,
+            escalate_fn=escalate_fn,
+            status_fetcher=status_fetcher,
+            commit=_build_default_commit(project_root),
+            roll_back=functools.partial(
+                unlanded.roll_back, project_root,
+                project_id=cfg.project_id, label=f"census-{date_str}",
+            ),
+            codebook_dict=codebook_dict,
+            config=cfg,
+            project_root=str(project_root),
+            project_id=cfg.project_id,
+            codebook_path=codebook_path,
+            census_state_path=census_state_path,
+            report_path=report_path,
+            date=date_str,
+            run_id=identity.run_id,
+            as_of_sha=as_of_sha,
+            since=prior.as_of_sha,
+            force=args.force,
+            max_batches=args.max_batches,
+            max_verify_clusters=args.max_verify_clusters,
+            dry_run_payloads_path=dry_run_payloads_path,
+            harness_project=harness_project,
+        )
 
     if outcome.status == "deferred":
         # The FIELDS, not only the prose. The two defer flavours read much the
