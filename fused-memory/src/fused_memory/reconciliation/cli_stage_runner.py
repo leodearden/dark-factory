@@ -159,7 +159,7 @@ DISALLOW_RECON_REPORT_JOURNAL_WRITES = [
 #
 # Every registered fused-memory tool must be in a deny bucket or reviewed as
 # read-only — see
-# tests/test_recon_stage_fused_memory_tool_classification.py::test_every_fused_memory_server_tool_is_classified.
+# tests/test_stages.py::TestDisallowedToolLists::test_every_fused_memory_tool_is_classified.
 DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES = [
     'mcp__fused-memory__trigger_reconciliation',
     'mcp__fused-memory__unhalt_reconciliation',
@@ -171,6 +171,15 @@ DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES = [
     'mcp__fused-memory__clear_task_priority_override',
     'mcp__fused-memory__reorder_pin_queue',
     'mcp__fused-memory__request_park_eviction',
+]
+
+# Consolidation PROPOSALS (disallowed in Stage 2 and Stage 3 — task 5239, PRD
+# plans/memory-auto-consolidation-prd.md D12/C1): Stage 1 is the one proposer of
+# a near-duplicate cluster; code decides and executes. An additive sublist on
+# the DISALLOW_RECON_REPORT_LEDGER_WRITES pattern, since no existing bucket
+# denies a tool to exactly Stages 2 and 3.
+DISALLOW_CONSOLIDATION_PROPOSALS = [
+    'mcp__fused-memory__propose_consolidation',
 ]
 
 # Escalation READ tools (disallowed in every stage — task 3163,
@@ -263,13 +272,17 @@ STAGE1_DISALLOWED = (
 # Stage 2 keeps full memory + task write access; only built-ins, the escalation
 # reads and the fused-memory control-plane mutators are blocked.
 STAGE2_DISALLOWED = (
-    DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES + DISALLOW_ESCALATION_READS + DISALLOW_BUILTIN
+    DISALLOW_CONSOLIDATION_PROPOSALS
+    + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
+    + DISALLOW_ESCALATION_READS
+    + DISALLOW_BUILTIN
 )
 STAGE3_DISALLOWED = (
     DISALLOW_TASK_WRITES
     + DISALLOW_MEMORY_WRITES
     + DISALLOW_RECON_REPORT_LEDGER_WRITES
     + DISALLOW_RECON_REPORT_JOURNAL_WRITES
+    + DISALLOW_CONSOLIDATION_PROPOSALS
     + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
     + DISALLOW_ESCALATION_READS
     + DISALLOW_ESCALATION_WRITES

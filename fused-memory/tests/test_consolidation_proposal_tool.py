@@ -14,20 +14,21 @@ pass for the wrong reason.
 
 from __future__ import annotations
 
+import dataclasses
 import json
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
 from _fused_memory_tool_surface import registered_fused_memory_tools
+
+from fused_memory.config.schema import ConsolidationAutoConfig
 from fused_memory.reconciliation.consolidation_proposal import (
     RECORD_KIND_CONSOLIDATION_PROPOSAL,
     ConsolidationProposal,
     from_ledger_record,
 )
-
-from fused_memory.config.schema import ConsolidationAutoConfig
 from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
 from fused_memory.server.tools import create_mcp_server
 
@@ -254,3 +255,54 @@ def test_the_tool_takes_exactly_the_proposal_fields():
         'seeded_from',
         'agent_id',
     }
+
+
+_PROPOSAL = ConsolidationProposal(
+    project_id=PROJECT_ID,
+    run_id=RUN_ID,
+    topic=TOPIC,
+    member_ids=tuple(MEMBERS),
+    category=CATEGORY,
+    claim=CLAIM,
+    rationale=RATIONALE,
+)
+_NOW = datetime(2026, 10, 10, 12, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ('now', 'ttl_hours'),
+    [(datetime(2026, 10, 10, 12, 0), 168), (_NOW, 0), (_NOW, -1), (_NOW, True)],
+    ids=['naive-now', 'zero-ttl', 'negative-ttl', 'bool-ttl'],
+)
+def test_a_row_without_a_real_expiry_is_never_built(now, ttl_hours):
+    """gc() reaps only rows that carry expires_at, so this is the TTL's one guard."""
+    with pytest.raises(ValueError, match='now|ttl_hours'):
+        _PROPOSAL.to_ledger_record(now=now, ttl_hours=ttl_hours)
+
+
+def test_a_non_utc_now_is_stored_as_utc():
+    """gc() compares expires_at as text, which holds only for one offset notation."""
+    now = datetime(2026, 10, 10, 14, 0, tzinfo=timezone(timedelta(hours=2)))
+
+    record = _PROPOSAL.to_ledger_record(now=now, ttl_hours=1)
+
+    assert record.created_at == '2026-10-10T12:00:00+00:00'
+    assert record.expires_at == '2026-10-10T13:00:00+00:00'
+
+
+@pytest.mark.parametrize(
+    ('field', 'value', 'named'),
+    [
+        ('record_kind', 'mem0_tombstone', 'record_kind'),
+        ('payload_json', 'not json', 'payload_json'),
+        ('payload_json', '[1, 2]', 'payload_json'),
+        ('payload_json', '{"member_ids": "abc", "category": "c", "claim": "c", "rationale": "r"}', 'member_ids'),
+        ('payload_json', '{"member_ids": [], "category": 3, "claim": "c", "rationale": "r"}', 'category'),
+        ('payload_json', '{"member_ids": [], "category": "c", "rationale": "r"}', 'claim'),
+    ],
+)
+def test_a_malformed_row_is_refused_naming_the_field(field, value, named):
+    record = dataclasses.replace(_PROPOSAL.to_ledger_record(now=_NOW, ttl_hours=1), **{field: value})
+
+    with pytest.raises(ValueError, match=named):
+        from_ledger_record(record)

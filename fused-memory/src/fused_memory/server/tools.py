@@ -86,6 +86,7 @@ from fused_memory.reconciliation.citation_verifier import (
     is_concrete_memory_id,
     repoint_task_citations,
 )
+from fused_memory.reconciliation.consolidation_proposal import ConsolidationProposal
 from fused_memory.reconciliation.flag_record_contract import (
     recon_stage_flag_kind_refusal,
 )
@@ -104,6 +105,7 @@ from fused_memory.reconciliation.task_filter import (
     is_proposed_resolution_framing,
 )
 from fused_memory.server.consolidation import (
+    ProposalLimits,
     build_consolidation_result,
     validate_consolidate_args,
 )
@@ -4147,6 +4149,99 @@ def create_mcp_server(
             _source=source,
         )
         return result.model_dump()
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def propose_consolidation(
+        project_id: str,
+        run_id: str,
+        topic: str,
+        member_ids: list[str],
+        category: str,
+        claim: str,
+        rationale: str,
+        seeded_from: str | None = None,
+        agent_id: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Propose consolidating a near-duplicate Mem0 cluster. Recon Stage 1's one channel for it.
+
+        You propose; code decides whether the cluster is consolidated and
+        executes it. A ValidationError names every offender at once, with a
+        hint: fix them all and call again in the same turn. Re-calling for the
+        same (project, topic, run) overwrites the earlier proposal. Gated on
+        agent_id starting with 'recon-stage-' — a naming convention, not
+        authentication.
+
+        Args:
+            project_id: Project scope.
+            run_id: The reconciliation run emitting this proposal.
+            topic: Topic slug the cluster belongs under (lowercase, hyphenated).
+            member_ids: Full 36-character ids of the cluster's records.
+            category: Memory category the canonical is written under.
+            claim: ONE assertion on one line; it becomes the canonical's first
+                   paragraph verbatim.
+            rationale: Why these records are one cluster. Reviewer-facing;
+                       never reaches the canonical.
+            seeded_from: What surfaced the cluster, e.g. a near-duplicate
+                         soft-block (optional). Reviewer-facing.
+            agent_id: Must start with 'recon-stage-' (optional, auto-derived
+                      from MCP context).
+        """
+        agent_id, _ = _resolve_identity(agent_id, None, ctx)
+        if not (isinstance(agent_id, str) and agent_id.startswith('recon-stage-')):
+            return {
+                'error': 'consolidation_proposal_not_permitted',
+                'error_type': 'ConsolidationProposalNotPermitted',
+                'agent_id': agent_id,
+            }
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
+        if err := validate_project_id(project_id):
+            return err
+        if err := _known_project_gate(project_id):
+            return err
+        # Read per call, never captured, so a reload_config of these leaves
+        # applies to the next proposal.
+        config = memory_service.config.consolidation_auto
+        err, _, members = validate_consolidate_args(
+            canonical_content=None,
+            topic=topic,
+            supersedes=None,
+            retain=member_ids,
+            run_id=run_id,
+            claim=claim,
+            category=category,
+            limits=ProposalLimits.from_config(config),
+        )
+        if err:
+            return err
+        ledger = memory_service.recon_ledger
+        if ledger is None:
+            return {
+                'error': (
+                    'no reconciliation ledger is wired on this server, so the '
+                    'proposal could not be persisted'
+                ),
+                'error_type': 'ReconLedgerUnavailable',
+            }
+        proposal = ConsolidationProposal(
+            project_id=project_id,
+            run_id=run_id,
+            topic=topic,
+            member_ids=tuple(members),
+            category=category,
+            claim=claim,
+            rationale=rationale,
+            seeded_from=seeded_from,
+        )
+        await ledger.upsert(
+            proposal.to_ledger_record(
+                now=datetime.now(UTC), ttl_hours=config.proposal_ttl_hours
+            )
+        )
+        return {'ok': True, 'ledger_key': proposal.ledger_key()}
 
     # ------------------------------------------------------------------
     # Read tools
