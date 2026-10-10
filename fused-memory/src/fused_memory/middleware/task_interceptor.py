@@ -2276,7 +2276,10 @@ class TaskInterceptor:
 
     @staticmethod
     def _build_candidate(kwargs: dict[str, Any]) -> CandidateTask | None:
-        """Extract a CandidateTask from add_task kwargs.
+        """Extract a CandidateTask from any task-shaped mapping.
+
+        Accepts add_task kwargs or a stored ``get_task`` dict (as the
+        update-path re-embed and :meth:`index_committed_tasks` pass).
 
         Returns None if there's no title (e.g. pure prompt-only add_task) —
         the curator cannot judge a candidate it cannot read.
