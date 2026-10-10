@@ -1157,7 +1157,7 @@ SYNTHESIS_NOT_APPLIED_NOTICE = (
 plans/census-incremental-prd.md L10 retires or reconciles it."""
 
 SYNTHESIS_PROPOSALS_HEADING = (
-    "Proposed codebook changes (not applied; for a human or the next census)"
+    "Proposed codebook changes (not applied; act on by hand)"
 )
 """The heading :func:`_synthesis_prompt` tells the model to put any proposed
 codebook change under, in place of the "inputs to the merger" claim earlier
