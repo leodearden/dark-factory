@@ -57,7 +57,7 @@ For each capability, optionally bind a `delivered_check` — the dispatch-time-c
 - **`expect: absent`** is how a rejection-style capability (G6 branch 4) is expressed mechanically — the check passes when the asserted diagnostic/pattern does **not** appear.
 - **`kind: manual`** for capabilities that aren't mechanically expressible — field-population judgments, rejection-mechanism nuances a fixture already covers qualitatively. Record it in the sidecar (with a `reason`), but it is **excluded from the dispatch gate**: only mechanical (`grep`/`script`) checks get copied into a producer task's `metadata.delivered_checks`.
 
-The sidecar's `task_id` fields stay `null` (Greek labels only) until it is stamped — see the post-`commit_planning` step after Step 5.
+The sidecar's `task_id` fields stay `null` (Greek labels only) until it is stamped — see the post-`commit_planning` step after Step 5. Comments you write in the sidecar survive the stamp, but durable scope or provenance belongs in the `.md` twin or a block's declared `note:` field: those are validated and machine-readable, and a comment is neither.
 
 **A block whose producer lives in another project's registry sets `external_task_id` instead.** When a PRD's decomposition assigns a leaf to a task you are filing in a *different* project — a reify-side deploy step, say — that block's producer will never appear in this project's task store, so a stamped integer would read forever as a stale binding and a `null` would be indistinguishable from un-authored. Write the same canonical qualified `"project_id:task_id"` form used for cross-project `depends_on` (Step 3 → **Cross-project dependencies**, below):
 
@@ -115,7 +115,7 @@ Modules touched: <list>
 task_id = result["task_id"]   # status == "deferred", planning_mode == True
 ```
 
-Only a task in the PRD's decomposition plan carries a `prd_task_label`, and it is that plan's own label, verbatim; a task filed against the PRD from outside the plan (an out-of-batch dependent, a later follow-up) keeps `prd_path` and sets no `prd_task_label` — never an invented one — because Step 5.5 binds only labels the sidecar declares.
+Only a task in the PRD's decomposition plan carries a `prd_task_label`, and it is that plan's own label, verbatim; a task filed against the PRD from outside the plan (an out-of-batch dependent, a later follow-up) keeps `prd_path` and sets no `prd_task_label` — never an invented one — because Step 5.5 binds only labels the sidecar declares. The metadata key is **exactly** `prd_task_label` — not `prd_label`, `label`, `task_label` or any other spelling — and its value must equal the sidecar block's `label` **byte-for-byte**: the Greek letter itself, never a transliteration (`"gamma"` ≠ `"γ"`), with no surrounding whitespace. Anything else binds nothing; Step 5.5 reports it, but does not stamp it.
 
 If `submit_task` itself times out (no `task_id` returned), **don't retry**; poll `get_task` (by title, or by IDs above your last known one) to see whether the write landed asynchronously. Re-submitting on timeout risks double-filing — the curator-dedupe path is not active in planning_mode.
 
@@ -163,7 +163,18 @@ If a single bulk call is rejected (e.g. payload-size cap), split into the smalle
 
 ### Step 5.5 — Stamp + commit the sidecar
 
-`commit_planning` is also the mechanical Greek-label → real-task-id mapping point: for every task in the batch carrying `metadata.prd_path` + `metadata.prd_task_label`, it locates the YAML sidecar from Step 2.5, stamps the matching label's `task_id`, writes the file back, and copies that label's mechanical (`grep`/`script`) `delivered_check`s into the producer task's `metadata.delivered_checks` (`manual` checks are never copied — they stay sidecar-only, excluded from the dispatch gate). The response carries a structured `manifest_stamping` report (`{path, stamped: [...], missing_labels: [...], errors: [...]}`); no sidecar on disk is a no-op — every non-manifest batch is byte-identical to today.
+`commit_planning` is also the mechanical Greek-label → real-task-id mapping point: for every task in the batch carrying `metadata.prd_path` + `metadata.prd_task_label`, it locates the YAML sidecar from Step 2.5, stamps the matching label's `task_id`, writes the file back, and copies that label's `delivered_check`s of every kind except `manual` into the producer task's `metadata.delivered_checks` (`manual` checks are never copied — they stay sidecar-only, excluded from the dispatch gate). The write-back rewrites only `task_id` values, so comments, quoting and key order survive; a stamp it cannot verify, or one that would leave the sidecar invalid, is refused, named in `errors`, and nothing is written. No sidecar on disk is a no-op — every non-manifest batch is byte-identical to today.
+
+The response carries a structured `manifest_stamping` report: always `{path, stamped, missing_labels, errors}`, plus `external_labels`, `near_miss_labels`, `near_miss_keys`, `unlabeled_tasks` and `polarity_warnings` when non-empty. Every batch task carrying `prd_path` whose sidecar exists lands in exactly one bucket:
+
+- `stamped` — its label was found and stamped;
+- `missing_labels` — its `prd_task_label` names no block in the sidecar;
+- `external_labels` — its `prd_task_label` names a block that sets `external_task_id`, so it is not stamped (Step 2.5); the other labels in the batch still are;
+- `near_miss_labels` — its `prd_task_label` only resembles a sidecar label (case, whitespace, or a transliteration such as `gamma` for `γ`);
+- `near_miss_keys` — it carries its label under a misspelt key (`prd_label`, `label`, `task_label`, …);
+- `unlabeled_tasks` — it has no label at all, which is correct only for an out-of-plan follow-up (Step 3).
+
+**Stamping never blocks the flip, so a clean `success` does not mean a clean stamp.** If the response carries `manifest_stamping_action_required`, act on every line before committing the sidecar: repair the task's metadata with `update_task` (or the sidecar, if its label is the one that is wrong), then re-run `commit_planning` on those ids. For a task that is already `pending`, that re-run is a no-op flip that stamps the label and copies its checks. Never commit an under-stamped sidecar.
 
 The decompose session then commits the stamped sidecar — `git commit --only <sidecar>` in the same skill turn — mirroring how the `.md` manifest is committed beside the PRD (see CLAUDE.md "Working in the main checkout" for the `--only` rationale: it avoids sweeping up unrelated concurrent state in a machine-operated checkout).
 
