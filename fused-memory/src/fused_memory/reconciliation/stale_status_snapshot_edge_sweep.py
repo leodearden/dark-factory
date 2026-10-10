@@ -252,10 +252,9 @@ patterns at all. Only edges that really do mention 'blocked' pay for the
 second family, and for those the work is irreducible — the two families
 answer different questions.
 
-A task transition does not pay the whole-corpus read (task 4851):
-``sweep_stale_status_snapshot_edges_for_task`` reads only the facts naming
-one task's digits and shares the periodic sweep's core, so the one-pass
-extraction discipline above holds for it too. See its docstring.
+``sweep_stale_status_snapshot_edges_for_task`` (task 4851) shares the
+periodic sweep's core, so the one-pass extraction discipline above holds for
+it too. Its narrowed read is cheap only for a selective id; see its docstring.
 """
 
 from __future__ import annotations
@@ -2151,6 +2150,14 @@ async def sweep_stale_status_snapshot_edges_for_task(
     edges whose extracted ids contain *task_id*. An aggregate edge naming
     *task_id* is judged on ALL its ids, exactly as the periodic sweep would
     judge it.
+
+    Its cost depends on the id. A multi-digit id reads a handful of rows; a
+    one- or two-digit id, or one that also occurs in dates, reads a sizeable
+    fraction of the corpus (row counts in plans/falkordb-resultset-cap-audit.md).
+    That is accepted because it is bounded by the periodic sweep's full read,
+    runs off any request path, and never overlaps another sweep of the
+    project (``_sweep_lock_for``), so a cascade of transitions queues rather
+    than stacks.
 
     Arguments, the best-effort contract and the returned stats are those of
     ``sweep_stale_status_snapshot_edges``, except that ``scanned`` counts the
