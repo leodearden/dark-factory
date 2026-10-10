@@ -4242,18 +4242,8 @@ class GraphitiBackend:
         Idempotent: once the node exists, every later call for the same
         (name, group_id) takes the resolve path and mints nothing.
 
-        The minted property set mirrors graphiti_core's own FalkorDB
-        ``get_entity_node_save_query`` minus ``name_embedding``, which that
-        query wraps in ``vecf32()`` and which this repo writes separately via
-        ``update_node_embedding``. ``created_at`` is written as
-        ``datetime.now(UTC).isoformat()`` — byte-identical to what
-        graphiti_core produces, since FalkorDB has no datetime type and
-        ``FalkorDriver.convert_datetimes_to_strings`` stores ``isoformat()``.
-        That matters because ``find_duplicate_entity_nodes`` orders survivors
-        DB-side on the stored string (``ORDER BY ... n.created_at ASC``), a
-        lexicographic compare that is chronologically correct only for
-        same-format, same-offset ISO strings; ``helpers.parse_db_date`` reads
-        the value back with ``datetime.fromisoformat``.
+        The mint half is :meth:`_mint_entity_node`; see it for the minted
+        property set.
 
         Args:
             name: Exact name of the Entity to resolve or mint.
@@ -4306,7 +4296,50 @@ class GraphitiBackend:
         resolved = await resolve(name, group_id=group_id)
         if resolved is not None:
             return resolved
+        return await self._mint_entity_node(name, group_id=group_id, summary=summary)
 
+    @_canonicalize_group_args
+    async def _mint_entity_node(self, name: str, *, group_id: str, summary: str = '') -> str:
+        """CREATE one :Entity node unconditionally, then best-effort embed its name.
+
+        LOCK CONTRACT AND PRECONDITION: the caller MUST hold
+        ``_identity_lock_for(group_id)`` AND must have seen zero exact-name
+        matches for (name, group_id) under that same hold. This method does no
+        locking and no read of its own, so calling it without that observation
+        creates exactly the duplicate-name pair the identity gate exists to
+        prevent. Its two callers establish it differently:
+        ``GraphitiBackend.ensure_entity_node`` after its resolver returns None,
+        and ``services/memory_service.py::MemoryService.ensure_entity_node``
+        after its guard-2 pre-read returns ``[]``.
+
+        Provisions indices first (PRD D6, ``docs/prds/falkordb-index-provisioning.md``):
+        a registered graph is provisioned before its first write.
+
+        The minted property set mirrors graphiti_core's own FalkorDB
+        ``get_entity_node_save_query`` minus ``name_embedding``, which that
+        query wraps in ``vecf32()`` and which this repo writes separately via
+        ``update_node_embedding``. ``created_at`` is written as
+        ``datetime.now(UTC).isoformat()`` — byte-identical to what
+        graphiti_core produces, since FalkorDB has no datetime type and
+        ``FalkorDriver.convert_datetimes_to_strings`` stores ``isoformat()``.
+        That matters because ``find_duplicate_entity_nodes`` orders survivors
+        DB-side on the stored string (``ORDER BY ... n.created_at ASC``), a
+        lexicographic compare that is chronologically correct only for
+        same-format, same-offset ISO strings; ``helpers.parse_db_date`` reads
+        the value back with ``datetime.fromisoformat``.
+
+        Args:
+            name: Exact name of the Entity to mint.
+            group_id: Project graph to target.
+            summary: Summary property for the new node.
+
+        Returns:
+            The UUID of the newly minted node.
+
+        Raises:
+            RuntimeError: if the backend is not initialized.
+        """
+        await self._ensure_indices(group_id)
         node_uuid = str(uuid.uuid4())
         graph = self._graph_for(group_id)
         await graph.query(
@@ -4321,7 +4354,7 @@ class GraphitiBackend:
             },
         )
         logger.info(
-            'ensure_entity_node: minted node=%s name=%r group_id=%s',
+            '_mint_entity_node: minted node=%s name=%r group_id=%s',
             node_uuid, name, group_id,
         )
         try:
@@ -4335,7 +4368,7 @@ class GraphitiBackend:
             # already exists; a missing embedding only affects fuzzy hybrid
             # node search.
             logger.warning(
-                'ensure_entity_node: failed to generate name_embedding for '
+                '_mint_entity_node: failed to generate name_embedding for '
                 'node=%s name=%r; the node was still minted',
                 node_uuid, name, exc_info=True,
             )
