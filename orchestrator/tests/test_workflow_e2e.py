@@ -6317,10 +6317,10 @@ class TestBornAtL2GatesMergeEntry:
 class TestFormatReescalationDetail:
     """Unit test of ``_format_reescalation_detail`` (task 2553).
 
-    Pins the rendered detail text built from the ``Escalation`` objects an
-    ``_StewardReescalated`` exception carries, so ``_mark_blocked``'s
-    ``detail=`` stops duplicating ``reason`` when the steward re-escalates
-    to a human (workflow.py:2444's ``except _StewardReescalated`` clause).
+    Pins the rendered detail text built from the ``Escalation`` objects a
+    ``_HumanHandoff`` exception carries, so ``_mark_blocked``'s ``detail=``
+    stops duplicating ``reason`` when the task is handed to a human (the
+    ``except _HumanHandoff`` clause in ``run()``'s ESCALATED branch).
     """
 
     def test_single_escalation_contains_all_fields(self):
@@ -6400,8 +6400,8 @@ class TestBornAtL2HaltsRunViaWaitForResolution:
     already-on-main branch-check (fresh worktree HEAD == main SHA → break),
     then reaches the MERGE gate which returns ESCALATED — so the outcome is
     ESCALATED rather than BLOCKED.  With the fix _wait_for_resolution raises
-    _StewardReescalated for level≥2/born-at-L2, causing run() to call
-    _mark_blocked and return BLOCKED.
+    _GatedByOpenL2 for a non-info level≥2 or born-at-L2 record, causing run()
+    to call _mark_blocked and return BLOCKED.
 
     This tests the wait/gate handshake at the run() level, not just the
     inner-gate predicate covered by TestBornAtL2GatesPostImplementer et al.
@@ -6453,7 +6453,7 @@ class TestBornAtL2HaltsRunViaWaitForResolution:
 
         outcome = (await workflow.run()).outcome
 
-        # With the fix: _wait_for_resolution raises _StewardReescalated for the
+        # With the fix: _wait_for_resolution raises _GatedByOpenL2 for the
         # pending level-2 escalation → _mark_blocked → BLOCKED.
         # Without the fix: _wait_for_resolution returns '' (no L0 pending) →
         # git ancestry check breaks (fresh branch at main HEAD) → MERGE gate
