@@ -33,6 +33,7 @@ from shared.asyncio_tasks import abandon_task, track_task
 
 from dashboard.api import burndown as api_burndown_routes
 from dashboard.api import escalations as api_escalations_routes
+from dashboard.api import invariants as api_invariants_routes
 from dashboard.api import memory as api_memory_routes
 from dashboard.api import merge_queue as api_merge_queue_routes
 from dashboard.api import orchestrators as api_orchestrators_routes
@@ -421,6 +422,7 @@ app.include_router(api_memory_routes.router)
 app.include_router(api_orchestrators_routes.router)
 app.include_router(api_escalations_routes.router)
 app.include_router(api_task_prose_routes.router)
+app.include_router(api_invariants_routes.router)
 
 
 # ---------------------------------------------------------------------------
