@@ -4,8 +4,34 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from fused_memory.models.enums import MemoryCategory
+from fused_memory.models.enums import (
+    LLM_CLASSIFIER_FAILURES,
+    ClassificationFallback,
+    MemoryCategory,
+)
 from fused_memory.routing.classifier import WriteClassifier
+
+_NO_HEURISTIC_MATCH = 'Hello world'
+
+
+def _completion_client(content: str) -> MagicMock:
+    """Return a mock AsyncOpenAI client that yields *content* as LLM output."""
+    mock_msg = MagicMock()
+    mock_msg.content = content
+    mock_choice = MagicMock()
+    mock_choice.message = mock_msg
+    mock_response = MagicMock()
+    mock_response.choices = [mock_choice]
+    mock_client = MagicMock()
+    mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+    return mock_client
+
+
+def _raising_client(exc: Exception) -> MagicMock:
+    """Return a mock AsyncOpenAI client whose completion call raises *exc*."""
+    mock_client = MagicMock()
+    mock_client.chat.completions.create = AsyncMock(side_effect=exc)
+    return mock_client
 
 
 @pytest.fixture
@@ -95,16 +121,7 @@ class TestLLMClassification:
     """Test _llm_classify with a mocked OpenAI client."""
 
     def _make_mock_client(self, content: str) -> MagicMock:
-        """Return a mock AsyncOpenAI client that yields *content* as LLM output."""
-        mock_msg = MagicMock()
-        mock_msg.content = content
-        mock_choice = MagicMock()
-        mock_choice.message = mock_msg
-        mock_response = MagicMock()
-        mock_response.choices = [mock_choice]
-        mock_client = MagicMock()
-        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
-        return mock_client
+        return _completion_client(content)
 
     @pytest.mark.asyncio
     async def test_nested_braces_in_reasoning_parsed(self, classifier):
@@ -150,3 +167,88 @@ class TestLLMClassification:
 
         assert result.primary == MemoryCategory.observations_and_summaries
         assert result.confidence < 0.5
+
+
+class TestClassificationFallbackReason:
+    """classify() labels every default category with WHY it is a default."""
+
+    @pytest.fixture
+    def llm_config(self, mock_config):
+        mock_config.routing.llm_fallback = True
+        return mock_config
+
+    @pytest.mark.asyncio
+    async def test_llm_call_raising_is_llm_error(self, llm_config):
+        classifier = WriteClassifier(
+            llm_config, openai_client=_raising_client(RuntimeError('connection refused')),
+        )
+
+        result = await classifier.classify(_NO_HEURISTIC_MATCH)
+
+        assert result.primary == MemoryCategory.observations_and_summaries
+        assert result.fallback is ClassificationFallback.llm_error
+        assert result.fallback in LLM_CLASSIFIER_FAILURES
+
+    @pytest.mark.asyncio
+    async def test_llm_returning_no_json_is_llm_no_json(self, llm_config):
+        classifier = WriteClassifier(
+            llm_config, openai_client=_completion_client('I cannot classify this.'),
+        )
+
+        result = await classifier.classify(_NO_HEURISTIC_MATCH)
+
+        assert result.primary == MemoryCategory.observations_and_summaries
+        assert result.fallback is ClassificationFallback.llm_no_json
+        assert result.fallback in LLM_CLASSIFIER_FAILURES
+
+    @pytest.mark.asyncio
+    async def test_llm_naming_an_invalid_category_is_llm_error(self, llm_config):
+        classifier = WriteClassifier(
+            llm_config, openai_client=_completion_client('{"primary": "nonsense"}'),
+        )
+
+        result = await classifier.classify(_NO_HEURISTIC_MATCH)
+
+        assert result.primary == MemoryCategory.observations_and_summaries
+        assert result.fallback is ClassificationFallback.llm_error
+
+    @pytest.mark.asyncio
+    async def test_successful_llm_classification_is_not_a_fallback(self, llm_config):
+        classifier = WriteClassifier(
+            llm_config,
+            openai_client=_completion_client(
+                '{"primary": "decisions_and_rationale", "secondary": null, '
+                '"confidence": 0.9, "reasoning": "a choice"}'
+            ),
+        )
+
+        result = await classifier.classify(_NO_HEURISTIC_MATCH)
+
+        assert result.primary == MemoryCategory.decisions_and_rationale
+        assert result.fallback is None
+
+    @pytest.mark.asyncio
+    async def test_heuristic_only_no_match_is_no_confident_match(self, classifier):
+        result = await classifier.classify(_NO_HEURISTIC_MATCH)
+
+        assert result.primary == MemoryCategory.observations_and_summaries
+        assert result.fallback is ClassificationFallback.no_confident_match
+        assert result.fallback not in LLM_CLASSIFIER_FAILURES
+
+    @pytest.mark.asyncio
+    async def test_confident_heuristic_match_is_not_a_fallback(self, classifier):
+        result = await classifier.classify(
+            'The payment service depends on the billing API'
+        )
+
+        assert result.primary == MemoryCategory.entities_and_relations
+        assert result.fallback is None
+
+    @pytest.mark.asyncio
+    async def test_best_effort_heuristic_match_is_not_a_fallback(self, classifier):
+        result = await classifier.classify(
+            'We decided to migrate before the deadline changed'
+        )
+
+        assert result.confidence < 0.7
+        assert result.fallback is None
