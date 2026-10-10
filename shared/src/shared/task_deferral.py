@@ -25,7 +25,6 @@ from pydantic import (
 from pydantic_core import ErrorDetails, PydanticCustomError
 
 from shared.process_identity import Liveness, ProcessIdentity
-from shared.task_metadata import register_metadata_submodel
 from shared.task_statuses import TaskStatus
 
 __all__ = [
@@ -341,9 +340,6 @@ Deferral = Annotated[_DeferralVariant, Field(discriminator='kind')]
 
 class DeferralRecord(RootModel[Deferral]):
     model_config = ConfigDict(frozen=True)
-
-
-register_metadata_submodel('deferral', DeferralRecord, cardinality='dict')
 
 
 def _required_holder(

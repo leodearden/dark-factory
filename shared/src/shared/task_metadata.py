@@ -23,6 +23,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from shared.task_deferral import DeferralRecord
+
 __all__ = [
     'HUMAN_CURATOR_ADJUDICATED_AT_KEY',
     'HUMAN_CURATOR_GATE_KEY',
@@ -825,6 +827,9 @@ register_metadata_submodel('merge_retry_pending', MergeRetryPending, cardinality
 # write+enforce instead of silently validating element-wise.
 register_metadata_submodel('recurrence', Recurrence, cardinality='dict')
 
+# deferral: plans/deferral-flip-condition-prd.md §5.1.
+register_metadata_submodel('deferral', DeferralRecord, cardinality='dict')
+
 
 def _normalize_legacy_memory_hints(value: object) -> object:
     """Coerce a legacy list-of-dicts ``memory_hints`` value to canonical dict shape.
@@ -1558,6 +1563,3 @@ def parse_metadata(
         )
 
     return model, warnings
-
-
-import shared.task_deferral  # noqa: E402,F401
