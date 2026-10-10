@@ -202,6 +202,7 @@ def load_ratifications(path: Path) -> tuple[Ratification, ...]:
 # D5 — static discovery of governed-list declarations.
 
 _FUNCTION_NAME = governed_exceptions.__name__
+_VOCABULARY_PACKAGE = governed_exceptions.__module__.rpartition('.')[0]
 _NAME_TEXT = _FUNCTION_NAME.encode()
 _SIGNATURE = inspect.signature(governed_exceptions)
 _LITERAL_CLASSES: Mapping[str, type] = MappingProxyType(
@@ -251,12 +252,20 @@ class SymbolRef:
     symbol: str
 
     def reaches(self, candidate: ListRef) -> bool:
-        """Whether this reference names *candidate*'s container."""
+        """Whether this reference names *candidate*'s container.
+
+        A file under a ``<pkg>/src/`` root has one importable name; elsewhere the
+        import path is not known statically, so any dotted suffix matches.
+        """
         if self.symbol != candidate.symbol:
             return False
         if self.path is not None:
             return self.path == candidate.path
-        dotted = _dotted_module(candidate.path)
+        parts = _module_parts(candidate.path)
+        importable = _importable(parts)
+        if importable is not None:
+            return '.'.join(importable) == self.module
+        dotted = '.'.join(parts)
         return dotted == self.module or dotted.endswith(f'.{self.module}')
 
 
@@ -271,9 +280,16 @@ class ListRef:
         return f'{self.path}::{self.symbol}'
 
 
-def _dotted_module(path: str) -> str:
-    """*path* as a dotted module: ``pkg/a.py`` → ``pkg.a``, ``pkg/__init__.py`` → ``pkg``."""
-    return path.removesuffix('.py').removesuffix('/__init__').replace('/', '.')
+def _module_parts(path: str) -> tuple[str, ...]:
+    """*path* as module parts: ``pkg/a.py`` → ``(pkg, a)``, ``pkg/__init__.py`` → ``(pkg,)``."""
+    return tuple(path.removesuffix('.py').removesuffix('/__init__').split('/'))
+
+
+def _importable(parts: tuple[str, ...]) -> tuple[str, ...] | None:
+    """*parts* below a ``<pkg>/src/`` root, the repo's double nesting; ``None`` outside one."""
+    if len(parts) > 2 and parts[1] == 'src':
+        return parts[2:]
+    return None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -281,7 +297,8 @@ class Declaration:
     """One governed list, as its literals read statically (D5).
 
     The key set is deliberately absent: only the runtime call sees it.
-    ``key_refs`` are the containers its ``keys`` expression names, for D14.
+    ``key_refs`` are the containers its ``keys`` expression names, for D14.  A
+    malformed disposition literal is absent too; its fault is in the discovery.
     """
 
     path: str
@@ -357,12 +374,13 @@ def parse_tracked(path: str, raw: bytes) -> ast.Module:
 class _ModuleScan(ast.NodeVisitor):
     """One file's import-time declaring calls and its module-level bindings.
 
-    A call inside a ``def``, ``async def`` or ``lambda`` runs only when that code
-    does, so it is a use of the function and not a declaration; a call in a class
-    body runs at import and counts.  An import-time binding of the function under
-    any other name raises, since its calls could not be followed.  ``imports``
-    maps each imported name to the dotted name it stands for; ``assigned`` holds
-    names the module assigns.
+    A call in the body of a ``def``, ``async def`` or ``lambda`` runs only when
+    that code does, so it is a use of the function and not a declaration; a call
+    in its decorators, defaults or annotations, or in a class body, runs at import
+    and counts.  An import-time binding of the function under any other name
+    raises, since its calls could not be followed.  ``imports`` maps each
+    imported name to the dotted name it stands for; ``assigned`` holds names the
+    module assigns.
     """
 
     def __init__(self, path: str) -> None:
@@ -373,12 +391,20 @@ class _ModuleScan(ast.NodeVisitor):
         self._functions = 0
         self._classes = 0
 
-    def _in_function(self, node: ast.AST) -> None:
+    def _in_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) -> None:
+        for field, value in ast.iter_fields(node):
+            if field != 'body':
+                self._visit_field(value)
         self._functions += 1
-        self.generic_visit(node)
+        self._visit_field(node.body)
         self._functions -= 1
 
     visit_FunctionDef = visit_AsyncFunctionDef = visit_Lambda = _in_function
+
+    def _visit_field(self, value: object) -> None:
+        for item in value if isinstance(value, list) else [value]:
+            if isinstance(item, ast.AST):
+                self.visit(item)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self._classes += 1
@@ -400,7 +426,7 @@ class _ModuleScan(ast.NodeVisitor):
                 self.imports[alias.asname or dotted[0]] = dotted if alias.asname else dotted[:1]
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-        alias = _renaming_alias(node)
+        alias = _renaming_alias(self.path, node)
         if self._functions == 0 and alias is not None:
             raise _renamed(self.path, node, alias)
         if self._at_module_scope():
@@ -438,11 +464,12 @@ class _ModuleScan(ast.NodeVisitor):
 
 
 def _import_base(path: str, node: ast.ImportFrom) -> tuple[str, ...]:
-    """The dotted package an ``ImportFrom`` reads from; relative to *path*'s directory."""
+    """The dotted package an ``ImportFrom`` reads from; relative to *path*'s package."""
     named = tuple(node.module.split('.')) if node.module else ()
     if node.level == 0:
         return named
-    package = Path(path).parent.parts
+    directory = Path(path).parent.parts
+    package = _importable(directory) or directory
     return (*package[: max(len(package) - (node.level - 1), 0)], *named)
 
 
@@ -468,16 +495,24 @@ class _KeyNames(ast.NodeVisitor):
 
 
 def _key_refs(scan: _ModuleScan, keys: ast.expr) -> tuple[SymbolRef, ...]:
-    """The containers *keys* names, through *scan*'s imports or its own module names."""
+    """The containers *keys* names, through *scan*'s imports or its own module names.
+
+    An imported chain may name its container at the import or at any attribute
+    below it, so each such prefix is a reference; a module name of the declaring
+    file is one whatever is read off it, as in ``X.keys()``.
+    """
     names = _KeyNames()
     names.visit(keys)
     refs: set[SymbolRef] = set()
     for root, *rest in names.chains:
         if root in scan.imports:
-            qualified = (*scan.imports[root], *rest)
-            if len(qualified) > 1:
-                refs.add(SymbolRef('.'.join(qualified[:-1]), None, qualified[-1]))
-        elif not rest and root in scan.assigned:
+            imported = scan.imports[root]
+            qualified = (*imported, *rest)
+            refs.update(
+                SymbolRef('.'.join(qualified[: end - 1]), None, qualified[end - 1])
+                for end in range(max(len(imported), 2), len(qualified) + 1)
+            )
+        elif root in scan.assigned:
             refs.add(SymbolRef(None, scan.path, root))
     return tuple(sorted(refs, key=lambda ref: (ref.module or '', ref.path or '', ref.symbol)))
 
@@ -500,8 +535,13 @@ def _is_function_name(target: ast.expr) -> bool:
     return isinstance(target, ast.Name) and target.id == _FUNCTION_NAME
 
 
-def _renaming_alias(node: ast.ImportFrom) -> str | None:
-    """The other name *node* binds the function under, if any; whatever the source module."""
+def _renaming_alias(path: str, node: ast.ImportFrom) -> str | None:
+    """The other name *node* binds the function under, if any, whatever the source module.
+
+    From the vocabulary's own package that name is the module, renaming nothing.
+    """
+    if '.'.join(_import_base(path, node)) == _VOCABULARY_PACKAGE:
+        return None
     for alias in node.names:
         if alias.name == _FUNCTION_NAME and alias.asname not in (None, _FUNCTION_NAME):
             return alias.asname
@@ -645,15 +685,14 @@ def _overrides(
     return overrides
 
 
-def _declaration(scan: _ModuleScan, call: ast.Call, faults: list[Violation]) -> Declaration | None:
-    """*call* read into a :class:`Declaration`, or ``None`` when a literal is malformed."""
+def _declaration(scan: _ModuleScan, call: ast.Call, faults: list[Violation]) -> Declaration:
+    """*call* read into a :class:`Declaration`, less any disposition recorded in *faults*."""
     path = scan.path
     site = f'{path}:{call.lineno}'
     arguments = _bind(site, call)
     list_id = _str_literal(site, 'list_id', arguments['list_id'])
     rule = _str_literal(site, 'rule', arguments['rule'])
     default_covers = _count_literal(site, arguments.get('default_covers'))
-    found = len(faults)
     default_node = arguments.get('default')
     default = (
         None
@@ -661,8 +700,6 @@ def _declaration(scan: _ModuleScan, call: ast.Call, faults: list[Violation]) -> 
         else _disposition(path, site, 'default', default_node, faults, list_id)
     )
     overrides = _overrides(path, site, arguments.get('dispositions'), faults, list_id)
-    if len(faults) > found:
-        return None
     return Declaration(
         path=path,
         line=call.lineno,
@@ -702,10 +739,7 @@ def declarations_in(corpus: Corpus) -> Discovery:
         parsed += 1
         scan = _ModuleScan(path)
         scan.visit(parse_tracked(path, raw))
-        for call in scan.calls:
-            declaration = _declaration(scan, call, faults)
-            if declaration is not None:
-                declarations.append(declaration)
+        declarations += [_declaration(scan, call, faults) for call in scan.calls]
     _require_unique(declarations)
     return Discovery(
         declarations=tuple(sorted(declarations, key=lambda declaration: declaration.list_id)),
@@ -906,8 +940,9 @@ def _field(block: Mapping[str, object], key: str, kind: type[_T], where: str) ->
     return value
 
 
-def _optional(block: Mapping[str, object], key: str, kind: type[_T], where: str) -> _T | None:
-    if block.get(key, 0) is None:
+def _nullable(block: Mapping[str, object], key: str, kind: type[_T], where: str) -> _T | None:
+    """``block[key]`` as :func:`_field` reads it, or ``None`` when present as null."""
+    if key in block and block[key] is None:
         return None
     return _field(block, key, kind, where)
 
@@ -933,7 +968,7 @@ def _codes(row: Mapping[str, object], where: str) -> tuple[str, ...]:
 
 
 def _total(block: Mapping[str, object], key: str) -> int | None:
-    counts = _optional(block, key, dict, 'baseline.')
+    counts = _nullable(block, key, dict, 'baseline.')
     if counts is None:
         return None
     return sum(_field(counts, name, int, f'baseline.{key}.') for name in counts)
@@ -989,7 +1024,7 @@ def parse_inline_report(document: object) -> InlineReport:
         by_kind_code=tuple(
             KindCodeRow(
                 kind=_field(row, 'kind', str, 'by_kind_code[].'),
-                code=_optional(row, 'code', str, 'by_kind_code[].'),
+                code=_nullable(row, 'code', str, 'by_kind_code[].'),
                 sites=_field(row, 'sites', int, 'by_kind_code[].'),
             )
             for row in _rows(document, 'by_kind_code')

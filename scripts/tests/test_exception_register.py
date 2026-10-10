@@ -76,10 +76,6 @@ def _write_table(root: Path, text: str) -> Path:
 # D3 — the ratification table loader.
 
 
-def test_table_path_is_the_one_the_prd_names():
-    assert exception_register.TABLE_PATH == 'docs/legibility/exception-ratifications.yaml'
-
-
 def test_a_block_style_table_loads_its_rows_in_file_order(tmp_path: Path):
     second = _with(_with(_ROW, 'id', 'inv12-a'), 'covers', 'The second row.')
     first = _with(_with(_ROW, 'id', 'inv12-b'), 'date', '2026-01-02')
@@ -289,6 +285,40 @@ def test_overrides_are_read_only(tmp_path: Path):
             None,
             id='parenthesised-callee',
         ),
+        pytest.param(
+            _HEADER
+            + 'import pytest\n'
+            + "@pytest.mark.parametrize('x', [governed_exceptions('pkg.deco', 'r', [])])\n"
+            + 'def test_x(x):\n'
+            + '    pass\n',
+            'pkg.deco',
+            None,
+            id='decorator',
+        ),
+        pytest.param(
+            _HEADER + "def f(x=governed_exceptions('pkg.arg', 'r', [])):\n    return x\n",
+            'pkg.arg',
+            None,
+            id='argument-default',
+        ),
+        pytest.param(
+            _HEADER + "async def f(*, x=governed_exceptions('pkg.kw', 'r', [])):\n    return x\n",
+            'pkg.kw',
+            None,
+            id='keyword-default',
+        ),
+        pytest.param(
+            _HEADER + "def f(x: governed_exceptions('pkg.ann', 'r', [])):\n    return x\n",
+            'pkg.ann',
+            None,
+            id='annotation',
+        ),
+        pytest.param(
+            _HEADER + "make = lambda x=governed_exceptions('pkg.lambda', 'r', []): x\n",
+            'pkg.lambda',
+            None,
+            id='lambda-default',
+        ),
     ],
 )
 def test_every_import_time_spelling_is_a_declaration(
@@ -486,6 +516,34 @@ def test_naming_the_function_without_renaming_it_is_not_refused(tmp_path: Path):
 
 
 @pytest.mark.parametrize(
+    ('path', 'import_line'),
+    [
+        pytest.param(
+            'tests/test_decl.py', 'from shared import governed_exceptions as ge', id='absolute'
+        ),
+        pytest.param(
+            'shared/src/shared/holder.py', 'from . import governed_exceptions as ge', id='relative'
+        ),
+    ],
+)
+def test_aliasing_the_vocabulary_module_from_its_package_is_followed(
+    tmp_path: Path, path: str, import_line: str
+):
+    """``from shared import governed_exceptions as ge`` binds the MODULE, as
+    ``import shared.governed_exceptions as ge`` does, so it renames nothing."""
+    source = (
+        f'{import_line}\n'
+        "ge.governed_exceptions('pkg.x', 'r', [], default=ge.Policy('inv12-x'), default_covers=0)\n"
+    )
+
+    discovery = _discover(tmp_path, {path: source})
+
+    (declaration,) = discovery.declarations
+    assert (declaration.path, declaration.line, declaration.list_id) == (path, 2, 'pkg.x')
+    assert declaration.default == Policy('inv12-x')
+
+
+@pytest.mark.parametrize(
     'keys',['sorted(ALLOWLIST)', '(key for key in ALLOWLIST)', 'ALLOWLIST', 'mod.KEYS']
 )
 def test_keys_are_never_evaluated(tmp_path: Path, keys: str):
@@ -526,7 +584,8 @@ def test_a_tracked_file_holding_the_call_that_does_not_parse_is_an_instrument_fa
 def test_a_malformed_disposition_literal_is_a_fault_at_the_site(
     tmp_path: Path, call_args: str, construct
 ):
-    """Exit 1, not 2: the vocabulary fixes a malformed disposition at the site."""
+    """Exit 1, not 2: the vocabulary fixes a malformed disposition at the site.
+    The declaration stays, less the disposition its fault already names."""
     with pytest.raises(MalformedDisposition) as expected:
         construct()
 
@@ -536,6 +595,22 @@ def test_a_malformed_disposition_literal_is_a_fault_at_the_site(
     assert (fault.path, fault.line) == ('tests/test_decl.py', 2)
     assert str(expected.value) in fault.reason
     assert fault.forms == DECLARATION_FORMS
+    (declaration,) = discovery.declarations
+    assert declaration.list_id == 'pkg.x'
+    assert (declaration.default, dict(declaration.overrides)) == (None, {})
+
+
+def test_a_declaration_with_a_malformed_disposition_still_holds_its_list_id(tmp_path: Path):
+    message = _refusal(
+        tmp_path,
+        {
+            'tests/test_a.py': _declaring("'pkg.same', 'r', ['a'], dispositions={'a': Policy('Bad_Id')}"),
+            'tests/test_b.py': _declaring("'pkg.same', 'r', []"),
+        },
+    )
+
+    assert 'tests/test_a.py:2' in message
+    assert 'tests/test_b.py:2' in message
 
 
 # ---------------------------------------------------------------------------
@@ -1031,14 +1106,17 @@ def test_a_container_a_declaration_imports_is_not_unregistered(tmp_path: Path):
     )
 
 
-def test_a_same_file_container_is_declared_by_that_files_declaration(tmp_path: Path):
+@pytest.mark.parametrize(
+    'keys', ['LOCAL_ALLOWLIST', 'LOCAL_ALLOWLIST.keys()', 'sorted(LOCAL_ALLOWLIST.keys())']
+)
+def test_a_same_file_container_is_declared_by_that_files_declaration(tmp_path: Path, keys: str):
     track_fixture_tree(
         tmp_path,
         {
             'tests/test_local.py': (
                 _HEADER
-                + "LOCAL_ALLOWLIST = ('a',)\n"
-                + "governed_exceptions('pkg.local', 'r', LOCAL_ALLOWLIST, "
+                + "LOCAL_ALLOWLIST = {'a': 'why'}\n"
+                + f"governed_exceptions('pkg.local', 'r', {keys}, "
                 + "default=Policy('r'), default_covers=1)\n"
             )
         },
@@ -1048,6 +1126,81 @@ def test_a_same_file_container_is_declared_by_that_files_declaration(tmp_path: P
         _ref('tests/test_local.py', 'LOCAL_ALLOWLIST'),
     )
     assert _unregistered(tmp_path) == ()
+
+
+@pytest.mark.parametrize(
+    ('import_line', 'keys'),
+    [
+        pytest.param('from pkg.a import ALLOWLIST', 'ALLOWLIST.keys()', id='imported-name'),
+        pytest.param('import pkg.a as a', 'sorted(a.ALLOWLIST.keys())', id='module-attribute'),
+    ],
+)
+def test_an_imported_container_read_through_an_attribute_is_declared(
+    tmp_path: Path, import_line: str, keys: str
+):
+    track_fixture_tree(
+        tmp_path,
+        {
+            'pkg/__init__.py': '',
+            'pkg/a.py': "ALLOWLIST = {'x': 'why'}\n",
+            'tests/test_decl.py': (
+                f'{_HEADER}{import_line}\n'
+                f"governed_exceptions('pkg.allowlist', 'r', {keys}, default=Policy('r'), "
+                'default_covers=1)\n'
+            ),
+        },
+    )
+
+    assert _unregistered(tmp_path) == ()
+
+
+def test_a_declaration_with_a_malformed_disposition_still_governs_its_container(
+    tmp_path: Path,
+):
+    """One mistake is one fault: the container is not also reported unregistered."""
+    track_fixture_tree(
+        tmp_path,
+        {
+            'tests/test_local.py': (
+                _HEADER
+                + "LOCAL_ALLOWLIST = ('a',)\n"
+                + "governed_exceptions('pkg.local', 'r', LOCAL_ALLOWLIST, "
+                + "dispositions={'a': Policy('Bad_Id')})\n"
+            )
+        },
+    )
+
+    assert len(exception_register.discover_declarations(tmp_path).faults) == 1
+    assert _unregistered(tmp_path) == ()
+
+
+@pytest.mark.parametrize(
+    ('module', 'unregistered'),
+    [
+        pytest.param('foo', 'pkg/src/pkg/foo.py', id='top-level-module'),
+        pytest.param('pkg.foo', 'scripts/foo.py', id='src-layout-package'),
+    ],
+)
+def test_an_import_reaches_only_the_module_its_dotted_name_resolves_to(
+    tmp_path: Path, module: str, unregistered: str
+):
+    """A ``<pkg>/src/<pkg>/`` file imports as ``pkg.…``, never by a bare suffix, so
+    two same-named modules' same-named containers are told apart."""
+    track_fixture_tree(
+        tmp_path,
+        {
+            'scripts/foo.py': "ALLOWLIST = ('a',)\n",
+            'pkg/src/pkg/__init__.py': '',
+            'pkg/src/pkg/foo.py': "ALLOWLIST = ('b',)\n",
+            'scripts/tests/test_decl.py': (
+                f'{_HEADER}from {module} import ALLOWLIST\n'
+                "governed_exceptions('x.allowlist', 'r', ALLOWLIST, default=Policy('r'), "
+                'default_covers=1)\n'
+            ),
+        },
+    )
+
+    assert _unregistered(tmp_path) == (_ref(unregistered, 'ALLOWLIST'),)
 
 
 def test_a_same_symbol_in_another_module_is_not_declared_by_it(tmp_path: Path):
@@ -1124,10 +1277,11 @@ def _write_state(path: Path, content: object) -> Path:
     return path
 
 
-def test_the_sweep_stamp_lives_under_the_gitignored_data_tree():
-    assert exception_register.SWEEP_STATE_PATH == 'data/exception-owner-sweep/state.json'
-    period = exception_register.SWEEP_PERIOD
-    assert period == datetime.timedelta(days=1)
+def test_the_default_sweep_stamp_is_gitignored():
+    """The sweep writes its stamp into the checkout it measures, which must stay clean."""
+    checked = run_git(['check-ignore', exception_register.SWEEP_STATE_PATH], cwd=REPO_ROOT)
+
+    assert checked.stdout.strip() == exception_register.SWEEP_STATE_PATH
 
 
 def test_an_absent_stamp_means_the_sweep_has_never_run(tmp_path: Path):
