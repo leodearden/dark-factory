@@ -3341,6 +3341,19 @@ class Scheduler:
                 task_id, type(e).__name__, e,
             )
 
+    async def clear_claim_then_set_status(self, task_id: str, status: str) -> None:
+        """Clear a DEAD claimant, then write ``status``.
+
+        Precondition: the caller has established that the claimant is not
+        live; on a live claim this un-claims a running workflow (task 2588).
+        The clear is best-effort and never blocks the write, which raises on
+        rejection exactly as :meth:`set_task_status` does. Why the clear comes
+        first: docs/prds/claimant-invariant-enforcement.md, D2 and the G7
+        walk's ``status-matches-liveness`` entry.
+        """
+        await self.set_task_claimant(task_id, claimant_run_id=None, heartbeat_at=None)
+        await self.set_task_status(task_id, status)
+
     async def mark_done(
         self,
         task_id: str,
@@ -6949,12 +6962,9 @@ class Scheduler:
         Writes: none on ctx — a task flipped this tick is picked up on the
         NEXT tick (the server row flips via ``set_task_status``, but this
         tick's in-memory ``ctx.tasks`` still reads 'blocked'), avoiding a
-        current-tick candidate-set race. Also clears the stale
-        ``claimant_run_id``/``heartbeat_at`` via ``set_task_claimant``
-        (best-effort) immediately before the status flip, mirroring the
-        slot-release NULL-claimant convention at harness.py:5693-5696, so a
-        redispatched task is never left carrying a claimant that no longer
-        owns it. Always continues.
+        current-tick candidate-set race. The flip goes through
+        :meth:`clear_claim_then_set_status`, so a redispatched task never
+        carries a claimant that no longer owns it. Always continues.
         """
         if not self.config.stranded_blocked_redispatch_enabled:
             return _CONTINUE
@@ -7093,17 +7103,7 @@ class Scheduler:
                     'pending (no live claimant, deps satisfied, no open escalation)',
                     tid,
                 )
-                # Clear the stale claimant BEFORE the status flip — mirrors the
-                # slot-release ordering at harness.py:5693-5696. The task is
-                # still 'blocked' here (not yet dispatch-contestable), so
-                # nothing should be racing in a fresh claimant stamp; clearing
-                # first means a concurrent orchestrator that dispatches into
-                # this task right after it goes 'pending' below can never have
-                # its fresh stamp clobbered by a late-landing clear.
-                # Best-effort — set_task_claimant already swallows its own
-                # errors, so this can never block the flip.
-                await self.set_task_claimant(tid, claimant_run_id=None, heartbeat_at=None)
-                await self.set_task_status(tid, 'pending')
+                await self.clear_claim_then_set_status(tid, 'pending')
             except Exception:
                 # Isolation guard (task 2849): a single task's predicate/write
                 # failure must never abort the batch — that previously

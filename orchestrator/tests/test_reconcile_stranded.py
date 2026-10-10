@@ -15,7 +15,12 @@ from typing import cast
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import mock_lock_table, pydantic_spec, wire_scheduler_liveness_mock
+from _orch_helpers import (
+    mock_lock_table,
+    pydantic_spec,
+    wire_clear_claim_then_set_status,
+    wire_scheduler_liveness_mock,
+)
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
@@ -228,6 +233,7 @@ def harness(tmp_path: Path, mock_orch_config):
     # directly) so the mid-run sweep and stranded-blocked gate tests below
     # exercise real semantics instead of an auto-mocked (always-truthy) stub.
     wire_scheduler_liveness_mock(h.scheduler)
+    wire_clear_claim_then_set_status(h.scheduler)
     h.scheduler.get_tasks = AsyncMock(return_value=[])
     h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
     h.scheduler.set_task_status = AsyncMock()
