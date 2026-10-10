@@ -151,14 +151,7 @@ fused_memory:
     - "--transport"
     - "http"
 
-# OS filesystem sandbox (Landlock) — dashboard config flip, γ7.
-# Per plans/os-sandbox-worktree-containment-prd.md task γ7 (D6, D10, D13).
-# The backend is pinned to landlock, not left at `auto`: auto takes the first
-# available of landlock, bwrap and none
-# (orchestrator/src/orchestrator/agents/sandbox_dispatch.py::resolve_active_backend),
-# so it could land on bwrap, under which Bun segfaulted on kernel 6.17, whereas
-# a pinned landlock either confines the dispatch or refuses it (D4).
-# Fleet-wide status: docs/sandbox-fleet-status.md.
+# OS sandbox: landlock pinned (γ7, task 2915); why: docs/sandbox-fleet-status.md
 sandbox:
   enabled: true
   backend: landlock

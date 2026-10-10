@@ -53,8 +53,8 @@ def _load_config(rel: str) -> object:
         raise AssertionError(
             f'cannot read {rel} while taking the sandbox census: '
             f'{exc.__class__.__name__}: {exc}.\n'
-            f'FIX: if the config was deleted or renamed, update the census table at the top '
-            f'of this file and the census in docs/sandbox-fleet-status.md.'
+            f'FIX: if the config was deleted or renamed, update FACTORY_TARGETS / '
+            f'SHIPPED_DEFAULTS in this file and the census in docs/sandbox-fleet-status.md.'
         ) from exc
     try:
         return yaml.safe_load(raw)
@@ -79,8 +79,9 @@ def _declared_sandbox_configs() -> set[str]:
     ``--others`` censuses a new config before it is committed, ``--exclude-standard``
     keeps ignored trees (``.worktrees/``, ``.pytest-tmp/``, ``.task/``, ``.venv/``) out,
     and ``GIT_*`` is scrubbed so an exported ``GIT_INDEX_FILE`` (the pre-commit hook
-    sets one) cannot point ls-files at another index. A key declared with no value
-    (a commented-out block) still counts: presence is what makes it a census row.
+    sets one) cannot point ls-files at another index. A bare ``sandbox:`` whose
+    children are commented out (value None) still counts: presence is what makes it
+    a census row.
     """
     command = [
         'git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', '*.yaml',
