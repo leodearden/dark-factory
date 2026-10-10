@@ -3201,7 +3201,9 @@ def create_server(
         3997): the record's OWN framing stays immutable, but the framing a fold
         carried in is no longer lost.  That list is bounded — oldest-shed at
         ``queue._MAX_AMENDMENTS``, with every drop counted in the record's
-        ``amendments_truncated``.
+        ``amendments_truncated``.  The info-only refusal (see *severity*) is
+        judged BEFORE this fold, so an all-info cluster is never folded into an
+        already-pending L2 either.
 
         **Members stay at L1**: the member L1 escalations are referenced but
         NOT promoted; they remain pending at L1 until the L2 is resolved.
@@ -3283,7 +3285,11 @@ def create_server(
             INHERITS ``max(member severities)``** — this is the correct default
             in the overwhelming majority of cases, and is what stops a cluster
             of purely-informational L1s from being born ``'blocking'`` and
-            paging a human (task 3976).
+            paging a human (task 3976).  An omitted severity whose members
+            derive ``'info'`` is REFUSED rather than minted or folded (PRD
+            ``plans/info-l0-disposition-router-prd.md`` D4, task 5222): see
+            **Info-only refusal** under Response shapes.  An explicit value
+            bypasses that refusal in both directions.
 
             An EXPLICIT value overrides the derivation in BOTH directions at
             mint time.  Upward in particular stays fully available and is not
@@ -3318,10 +3324,13 @@ def create_server(
             ``'blocking'`` and classified ``QUEUE_HANDOFF`` in
             ``escalation.pins``, and the only info-severity L2s were ones
             ``escalation.queue.EscalationQueue.park()`` promoted from an
-            already-open L0/L1.  Link 1 in ``escalation.pins`` short-circuits
+            already-open L0/L1.  Since task 5222 a silent all-info promote
+            mints nothing, so an info L2 now comes only from an explicit
+            ``severity='info'`` or from ``park()``.  Link 1 in
+            ``escalation.pins`` short-circuits
             on ``severity == 'info'`` BEFORE the ``level != 0`` link — "an
-            info record never pins, at any level" — so an inherited-info L2
-            no longer vetoes its subject task's ``done`` flip.  That is the
+            info record never pins, at any level" — so such an info L2
+            does not veto its subject task's ``done`` flip.  That is the
             INTENDED semantics and was considered here, not an oversight: the
             members it clusters were themselves non-pinning, and a record that
             does not merit a human's attention must not hold a task open
@@ -3354,6 +3363,13 @@ def create_server(
         ``severity`` reports what was ACTUALLY filed, which for a caller that
         omitted the argument is how the inherited value becomes visible — and
         on the update path is the post-floor value, not the argument.
+
+        Info-only refusal (an omitted *severity* whose members derive
+        ``'info'``; nothing is minted and nothing is folded)::
+
+            {'status': 'refused', 'code': 'info_only_cluster',
+             'members': [<member_ids, de-duplicated>],
+             'derived_severity': 'info'}
 
         Error::
 
@@ -3481,6 +3497,22 @@ def create_server(
                     for member_id, reason in eval_lane_members.items()
                 )
                 return _eval_lane_refusal(f'member(s) {named} are eval-lane artifacts')
+
+            # PRD info-l0-disposition-router D4: a cluster whose members derive
+            # 'info' never enters L2 by default — not minted, not folded into an
+            # existing L2.  An explicit severity bypasses it in both directions.
+            if severity is None and derived == 'info':
+                logger.info(
+                    'promote_to_l2: refused info-only cluster under task_id=%r '
+                    'root_cause=%r; members=%s',
+                    task_id, root_cause, member_ids,
+                )
+                return {
+                    'status': 'refused',
+                    'code': 'info_only_cluster',
+                    'members': list(dict.fromkeys(member_ids)),
+                    'derived_severity': 'info',
+                }
 
             # CREATE must land on some severity, so an underivable set fails safe
             # UP to 'blocking' — unchanged from before task 3976.

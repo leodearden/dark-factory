@@ -249,13 +249,14 @@ def _classify_record(
     """Map one open escalation to its :class:`PinClass` (see the chain above)."""
     sev = normalised_severity(record.severity)
 
-    # Link 1 — spec S6: an info record is an ANNOTATION, not a handoff.  Since
-    # task 3976, `escalation.server.promote_to_l2`'s inherited
-    # max(member severities) default can MINT a fresh L2 at severity='info'
-    # (previously the only info-severity L2s were ones `EscalationQueue.park()`
-    # promoted from an already-open L0/L1, never freshly filed ones), so this
-    # link now also decides an inherited-info L2 as NON_PINNING — see
-    # TestInfoAtL2Coupling in escalation/tests/test_pins.py (task 4402).
+    # Link 1 — spec S6: an info record is an ANNOTATION, not a handoff.  Task
+    # 3976 let `escalation.server.promote_to_l2`'s inherited max(member
+    # severities) default mint a fresh L2 at severity='info'; since task 5222
+    # that default is REFUSED for an all-info cluster, but an explicit
+    # severity='info' promote (and `EscalationQueue.park()` of an already-open
+    # L0/L1) still produce info L2s, and this link decides each of them
+    # NON_PINNING — see TestInfoAtL2Coupling in escalation/tests/test_pins.py
+    # (task 4402).
     if sev == 'info':
         return PinClass.NON_PINNING
 
