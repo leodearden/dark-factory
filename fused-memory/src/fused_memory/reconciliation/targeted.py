@@ -31,6 +31,9 @@ from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     retire_flag_markers_for_terminal_task,
 )
+from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
+    sweep_stale_status_snapshot_edges_for_task,
+)
 from fused_memory.reconciliation.task_filter import (
     ACTIVE_TASK_STATUSES,
     extract_batch_plan_task_ids,
@@ -69,6 +72,14 @@ logger = logging.getLogger(__name__)
 # inner handler short-circuits via `reason.startswith(...)` so the sweep
 # doesn't fan out a second time on each descendant.
 _PARENT_CANCELLED_REOPEN_PREFIX = 'parent_cancelled:'
+
+# Transitions that can contradict a status snapshot about the task itself:
+# done/cancelled any snapshot, deferred only a blocked assertion. 'blocked'
+# contradicts nothing about the task, and an unblock to 'pending' never
+# reaches targeted reconciliation, so it stays periodic-sweep-only (task 4851).
+_SNAPSHOT_CONTRADICTING_TRANSITIONS: frozenset[str] = frozenset(
+    {'done', 'cancelled', 'deferred'}
+)
 
 # Default location of the per-project escalation queue.  Matches the
 # convention used by scope_violation_escalator.py and ticket_janitor.py.
@@ -328,6 +339,11 @@ class TargetedReconciler:
                     **handler_kwargs,
                 )
 
+            if transition in _SNAPSHOT_CONTRADICTING_TRANSITIONS:
+                result.setdefault('actions', []).append(
+                    await self._retire_stale_status_snapshots(task_id, scope, run_id)
+                )
+
             elapsed = (datetime.now(UTC) - start).total_seconds()
             await self.journal.complete_run(run_id, 'completed')
             logger.info(
@@ -351,6 +367,48 @@ class TargetedReconciler:
             await self.journal.complete_run(run_id, 'failed')
             logger.error(f'Targeted reconciliation failed: {e}')
             return {'error': str(e), 'task_id': task_id}
+
+    async def _retire_stale_status_snapshots(
+        self, task_id: str, scope: ProjectScope, run_id: str,
+    ) -> dict:
+        """Retire this task's stale status-snapshot edges now; NEVER raises.
+
+        A latency complement to Stage 1's periodic sweep, which still retires
+        whatever this misses (task 4851). Returns the action to record:
+
+        - ``stale_status_snapshot_sweep_skipped`` for a non-integer (subtask)
+          id: snapshot ids are ints by construction, so nothing can match;
+        - ``stale_status_snapshot_sweep_deferred_to_cycle`` while a full cycle
+          is active: its Stage-1 sweep owns that window, and racing it could
+          double-write the same superseding fact;
+        - ``stale_status_snapshot_edges_swept`` carrying the sweep's stats;
+        - ``stale_status_snapshot_sweep_error`` when anything else raised.
+        """
+        try:
+            if not (task_id.isascii() and task_id.isdecimal()):
+                return {
+                    'type': 'stale_status_snapshot_sweep_skipped',
+                    'reason': 'non_integer_task_id',
+                }
+            if self.buffer is not None and await self.buffer.is_full_recon_active(
+                scope.project_id
+            ):
+                return {'type': 'stale_status_snapshot_sweep_deferred_to_cycle'}
+            stats = await sweep_stale_status_snapshot_edges_for_task(
+                self.memory, self.taskmaster, scope.project_id, scope.project_root,
+                int(task_id), run_id=run_id,
+            )
+            await self.journal.add_run_action(
+                run_id, 'write', 'graphiti', 'invalidate_stale_status_snapshots',
+                {'task_id': task_id, **stats},
+                causation_id=run_id,
+            )
+            return {'type': 'stale_status_snapshot_edges_swept', **stats}
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.warning(f'Stale status-snapshot sweep failed for task {task_id}: {e}')
+            return {'type': 'stale_status_snapshot_sweep_error', 'error': str(e)[:200]}
 
     async def _should_withhold_batch_promotion(
         self,
