@@ -2527,18 +2527,62 @@ async def test_curator_disabled_still_proxies(taskmaster, reconciler, event_buff
     taskmaster.add_task.assert_called_once()
 
 
+_REEMBED_STORED_FILES = {'files': ['src/parser.py', 'tests/test_parser.py']}
+
+
 @pytest.mark.asyncio
-async def test_update_task_reembeds_on_title_change(
+@pytest.mark.parametrize(
+    'stored_metadata',
+    [_REEMBED_STORED_FILES, json.dumps(_REEMBED_STORED_FILES)],
+    ids=['dict', 'json-string'],
+)
+async def test_update_task_reembed_preserves_metadata_files(
     curator_interceptor,
     taskmaster,
+    stored_metadata,
 ):
-    """update_task triggers fire-and-forget reembed when title/details change."""
+    """The update re-embed carries the stored task's metadata.files and priority."""
     curator_mock = _mock_curator(CuratorDecision(action='create'))
     curator_interceptor._curator = curator_mock
     taskmaster.get_task.return_value = {
         'id': '7',
         'status': 'pending',
         'title': 'Updated title',
+        'description': 'desc',
+        'details': 'details',
+        'priority': 'high',
+        'metadata': stored_metadata,
+    }
+
+    await curator_interceptor.update_task(
+        '7',
+        '/project',
+        prompt='rename title to updated',
+    )
+    await asyncio.sleep(0)  # let fire-and-forget run
+    await curator_interceptor.drain()
+
+    curator_mock.reembed_task.assert_called_once()
+    task_id, candidate, _project_id = curator_mock.reembed_task.call_args.args
+    assert task_id == '7'
+    assert candidate.files_to_modify == ['src/parser.py', 'tests/test_parser.py']
+    assert candidate.title == 'Updated title'
+    assert candidate.description == 'desc'
+    assert candidate.priority == 'high'
+
+
+@pytest.mark.asyncio
+async def test_update_task_reembed_skips_blank_stored_title(
+    curator_interceptor,
+    taskmaster,
+):
+    """A stored task whose title is only whitespace is not re-embedded."""
+    curator_mock = _mock_curator(CuratorDecision(action='create'))
+    curator_interceptor._curator = curator_mock
+    taskmaster.get_task.return_value = {
+        'id': '7',
+        'status': 'pending',
+        'title': '   ',
         'description': 'desc',
         'details': 'details',
     }
@@ -2551,7 +2595,7 @@ async def test_update_task_reembeds_on_title_change(
     await asyncio.sleep(0)  # let fire-and-forget run
     await curator_interceptor.drain()
 
-    curator_mock.reembed_task.assert_called_once()
+    curator_mock.reembed_task.assert_not_awaited()
 
 
 @pytest.mark.asyncio
