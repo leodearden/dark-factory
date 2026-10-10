@@ -12,6 +12,8 @@ convention (see plans/capability-delivered-checks-prd.md §Contract):
     checked-in sidecar (not just the one committed exemplar TestLoader
     covers), built on the sibling test-support module
     shared/tests/capability_manifest_corpus.py (task 3362).
+  - TestSidecarPath: the PRD key → sidecar path rule, over examples and the
+    checked-in corpus (task 6582).
   - TestDeliveredCheckMeta / TestMechanicalCheckKinds / TestMetadataRegistration:
     the metadata.delivered_checks registered sub-model and the derived
     MECHANICAL_CHECK_KINDS vocabulary its consumers import.
@@ -52,6 +54,7 @@ from shared.capability_manifest import (
     ManifestTask,
     load_capability_manifest,
     parse_capability_manifest,
+    sidecar_path,
 )
 from shared.task_metadata import parse_metadata
 
@@ -1518,6 +1521,53 @@ class TestCheckedInManifestCorpus:
         expected_prd = rel[: -len(MANIFEST_SUFFIX)] + '.md'
         assert doc.prd == expected_prd
         assert (REPO_ROOT / doc.prd).is_file()
+
+
+class TestSidecarPath:
+    """sidecar_path — the single PRD key → sidecar path rule (task 6582).
+
+    Defined after TestCheckedInManifestCorpus, not beside TestLoader: the
+    corpus case parametrizes over ``_MANIFEST_PATHS``, which is bound at
+    module level further down than TestLoader.
+    """
+
+    @pytest.mark.parametrize(
+        ('prd_key', 'expected'),
+        [
+            pytest.param(
+                'plans/x-prd.md', 'plans/x-prd.capability-manifest.yaml', id='plans'
+            ),
+            pytest.param(
+                'docs/prds/memory-metadata-vocabulary.md',
+                'docs/prds/memory-metadata-vocabulary.capability-manifest.yaml',
+                id='docs_prds',
+            ),
+            pytest.param(
+                'plans/x-prd', 'plans/x-prd.capability-manifest.yaml', id='no_md_suffix'
+            ),
+            pytest.param(
+                'plans/a.md-notes.md',
+                'plans/a.md-notes.capability-manifest.yaml',
+                id='only_trailing_md_stripped',
+            ),
+        ],
+    )
+    def test_maps_a_prd_key_to_its_sidecar(self, prd_key, expected):
+        assert sidecar_path(prd_key) == expected
+
+    @pytest.mark.parametrize('manifest_path', _MANIFEST_PATHS, ids=_MANIFEST_IDS)
+    def test_every_checked_in_sidecar_lives_where_its_prd_derives(self, manifest_path):
+        # The property the stamper and the dashboard reader both rely on:
+        # resolving a sidecar from its PRD key lands on this very file.
+        try:
+            doc = load_capability_manifest(manifest_path)
+        except FileNotFoundError:
+            pytest.fail(_missing_from_worktree_message(manifest_path))
+        rel = str(manifest_path.relative_to(REPO_ROOT))
+        derived = sidecar_path(doc.prd)
+        assert derived == rel, (
+            f'{rel}: prd {doc.prd!r} derives sidecar {derived!r}, not this file {rel!r}'
+        )
 
 
 class TestCheckedInOpenVerdictEvidence:
