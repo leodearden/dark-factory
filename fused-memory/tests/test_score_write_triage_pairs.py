@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import functools
 import json
+import random
 import subprocess
 import sys
 import types
@@ -1073,3 +1074,112 @@ class TestComparativeOutcomes:
         rules = comparative['rules']
         assert set(rules) == (set(comparative) - {'rules'}) | set(OUTCOME_CELLS)
         assert all(isinstance(rule, str) and rule.strip() for rule in rules.values())
+
+
+MISFILE_WRITES = ('d1', 'd2', 'd3', 'd4')
+
+
+def _misfile_everything_comparative() -> dict[str, Any]:
+    """Every write has an earlier home, and arm M attaches each to an earlier misfile."""
+    verdicts = [
+        vote for write in MISFILE_WRITES
+        for vote in (_vote(write, f'h-{write}', 'SAME', 'a'),
+                     _vote(write, f'm-{write}', 'RELATED', 'a'))
+    ]
+    created_at = {
+        **dict.fromkeys(MISFILE_WRITES, T0),
+        **{f'{kind}-{write}': EARLIER for write in MISFILE_WRITES for kind in 'hm'},
+    }
+    rows = [_write_time('M', write, 'amended', f'm-{write}') for write in MISFILE_WRITES]
+    result = _mod().score_pairs(rows, verdicts, reference_arm='M', created_at=created_at)
+    return result['arms']['M']['comparative']
+
+
+def _comparative_refusal(cases: list[dict[str, Any]], **kwargs: Any) -> str:
+    with pytest.raises(ValueError) as caught:
+        _score_comparative(cases, **kwargs)
+    return str(caught.value)
+
+
+class TestComparativeBootstrapAndRefusals:
+    @pytest.mark.parametrize('arm', ['A', 'B'])
+    def test_the_bootstrap_interval_brackets_the_point_delta(self, arm: str) -> None:
+        comparative = _comparative(arm)
+        low, high = comparative['harm_delta_bootstrap95']
+        assert low <= comparative['harm_delta_vs_status_quo'] <= high
+
+    def test_the_bootstrap_settings_are_recorded(self) -> None:
+        bootstrap = _comparative('A')['bootstrap']
+        assert (bootstrap['resamples'], bootstrap['seed']) == (
+            _mod().BOOTSTRAP_RESAMPLES, _mod().BOOTSTRAP_SEED,
+        )
+
+    def test_the_interval_depends_on_neither_row_order_nor_the_other_arms(self) -> None:
+        shuffled = list(COMPARATIVE_CASES)
+        random.Random(7).shuffle(shuffled)
+        alone = [row for row in COMPARATIVE_CASES if row['arm'] == 'B']
+        intervals = [
+            _score_comparative(cases, reference_arm=reference)['arms']['B']['comparative'][
+                'harm_delta_bootstrap95'
+            ]
+            for cases, reference in (
+                (COMPARATIVE_CASES, 'A'), (COMPARATIVE_CASES, 'A'), (shuffled, 'A'), (alone, 'B'),
+            )
+        ]
+        assert intervals[1:] == intervals[:1] * 3
+
+    def test_an_arm_that_stores_everything_has_a_zero_interval(self) -> None:
+        assert _store_everything_comparative()['harm_delta_bootstrap95'] == [0, 0]
+
+    def test_a_constant_per_write_delta_has_a_degenerate_interval(self) -> None:
+        comparative = _misfile_everything_comparative()
+        delta = comparative['harm_delta_vs_status_quo']
+        assert delta == 0.5 * len(MISFILE_WRITES)
+        assert comparative['harm_delta_bootstrap95'] == [delta, delta]
+
+    def test_no_production_judged_write_has_no_interval(self) -> None:
+        rows = [{**row, 'recon_marker': True} for row in STORE_EVERYTHING]
+        comparative = _score_comparative(rows, reference_arm='S')['arms']['S']['comparative']
+        assert comparative['harm_delta_bootstrap95'] is None
+
+    @pytest.mark.parametrize('flag', ['recon_marker', 'declares_attach_keys'])
+    def test_a_judge_band_row_without_a_write_flag_is_refused(self, flag: str) -> None:
+        cases = [
+            {key: value for key, value in row.items() if key != flag}
+            if (row['arm'], row['memory_id']) == ('B', 'c1') else row
+            for row in COMPARATIVE_CASES
+        ]
+        message = _comparative_refusal(cases)
+        assert all(word in message for word in ("'B'", "'c1'", flag)), message
+
+    def test_a_production_judged_write_without_an_instant_is_refused(self) -> None:
+        created_at = {key: value for key, value in CREATED_AT.items() if key != 'c4'}
+        message = _comparative_refusal(COMPARATIVE_CASES, created_at=created_at)
+        assert "'c4'" in message and 'created_at' in message, message
+
+    @pytest.mark.parametrize(('write', 'target'), [('c6', 'a6'), ('c10', 'a10')])
+    def test_an_attach_to_a_target_not_earlier_than_its_write_is_refused(
+        self, write: str, target: str,
+    ) -> None:
+        cases = _replaced(COMPARATIVE_CASES, 'B', write, outcome='amended',
+                          judged_candidate_id=target)
+        message = _comparative_refusal(cases)
+        assert all(word in message for word in ("'B'", f"'{write}'", target, 'write-time')), (
+            message
+        )
+
+    def test_a_write_outside_the_judge_path_may_attach_a_later_target(self) -> None:
+        created_at = {**CREATED_AT, 'a8': LATER, 'a9': LATER}
+        result = _score_comparative(created_at=created_at)
+        assert result['arms']['A']['comparative']['n_writes'] == 10
+
+    def test_without_created_at_none_of_the_comparative_refusals_applies(self) -> None:
+        cases = _replaced(COMPARATIVE_CASES, 'B', 'c6', outcome='amended',
+                          judged_candidate_id='a6')
+        cases = [
+            {key: value for key, value in row.items() if key != 'recon_marker'}
+            if row['memory_id'] == 'c1' else row
+            for row in cases
+        ]
+        result = _score_comparative(cases, created_at=None)
+        assert result['arms']['B']['comparative'] is None
