@@ -2014,12 +2014,10 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
 
             monkeypatch.setattr(nightly.codebook, 'validate', _raise)
 
-        with (
-            pytest.raises(RuntimeError) if outcome == 'raised'
-            else contextlib.nullcontext()
-        ):
-            _run_one_digest_night(tmp_path, recorder=recorder)
+        result, _escalations = _run_one_digest_night(tmp_path, recorder=recorder)
 
+        if outcome == 'raised':
+            assert result.exit_code == 1
         assert [record['closed'] for record in opened] == [1]
         _one_recorded(recorded)
 
@@ -3748,6 +3746,22 @@ def _one_recorded(calls):
     return calls[0][1]
 
 
+def _capture_poster():
+    """A ``poster=`` seam that keeps every envelope. Returns (fn, envelopes)."""
+    envelopes = []
+
+    def _post(url, envelope):
+        envelopes.append(envelope)
+
+    return _post, envelopes
+
+
+def _one_escalation(envelopes):
+    """The ``escalate_info`` arguments of the one envelope posted."""
+    assert len(envelopes) == 1, f'expected exactly ONE escalation, got {envelopes}'
+    return envelopes[0]['params']['arguments']
+
+
 # Spelled once: two of the four branch drivers patch a module global, so they
 # need the caller's own `monkeypatch` fixture handed in (the previous inline
 # form got it from each test's signature). Asserted per-arm rather than once up
@@ -3959,17 +3973,25 @@ class TestRunNightlyRecordsTrickleState:
 
     def test_unexpected_exception_mid_run_still_records(self, tmp_path, monkeypatch):
         """A crashed night that recorded NOTHING would let the progress
-        probe read a stale streak as healthy. The exception must still
-        propagate — recording is not swallowing."""
+        probe read a stale streak as healthy. The boundary converts the
+        exception into a failed, escalated result — recording is not
+        swallowing."""
         def _boom(selected, **kwargs):
             raise RuntimeError('synthetic mid-run explosion')
 
         monkeypatch.setattr(nightly, 'build_digests', _boom)
         recorder, calls = _recorder_spy()
+        poster, posted = _capture_poster()
 
-        with pytest.raises(RuntimeError, match='synthetic mid-run explosion'):
-            _run_e2e_nightly(tmp_path, recorder=recorder)
+        result, _repo = _run_e2e_nightly(tmp_path, recorder=recorder, poster=poster)
 
+        assert result.exit_code == 1
+        assert result.escalated is True
+        arguments = _one_escalation(posted)
+        assert arguments['summary'].startswith('legibility trickle')
+        assert 'RuntimeError' in arguments['summary']
+        assert 'synthetic mid-run explosion' in arguments['summary']
+        assert 'Traceback' in arguments['detail']
         doc = _one_recorded(calls)
         assert doc['outcome'] == trickle_state.OUTCOME_FAILED
         assert doc['exit_code'] != 0, (
@@ -3979,6 +4001,40 @@ class TestRunNightlyRecordsTrickleState:
             'the sample was computed before the crash, so its real counters '
             'are still recordable'
         )
+
+    def test_an_unexpected_raise_before_the_recorded_try_still_escalates(
+        self, tmp_path, monkeypatch,
+    ):
+        def _boom(*args, **kwargs):
+            raise RuntimeError('synthetic sampling explosion')
+
+        monkeypatch.setattr(nightly, 'select_digest_sessions', _boom)
+        poster, posted = _capture_poster()
+
+        result, _repo = _run_e2e_nightly(tmp_path, poster=poster)
+
+        assert result.exit_code == 1
+        assert result.escalated is True
+        arguments = _one_escalation(posted)
+        assert 'RuntimeError' in arguments['summary']
+        assert 'synthetic sampling explosion' in arguments['summary']
+
+    def test_a_codebook_dump_failure_escalates_instead_of_escaping(
+        self, tmp_path, monkeypatch,
+    ):
+        def _failing_dump(cb, path):
+            raise OSError('No such file or directory')
+
+        monkeypatch.setattr(codebook, 'dump', _failing_dump)
+        recorder, calls = _recorder_spy()
+        poster, posted = _capture_poster()
+
+        result, _repo = _run_e2e_nightly(tmp_path, recorder=recorder, poster=poster)
+
+        assert result.exit_code == 1
+        assert result.escalated is True
+        assert 'OSError' in _one_escalation(posted)['summary']
+        assert _one_recorded(calls)['outcome'] == trickle_state.OUTCOME_FAILED
 
     def test_a_crash_after_selecting_digests_records_failed_not_productive(
         self, tmp_path
