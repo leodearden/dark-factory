@@ -478,8 +478,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
-        'ReconciliationHarness.run_full_cycle',
-        '6770f1ceabc5',
+        'ReconciliationHarness._record_failed_run',
+        '652fc88d57ad',
         'filed',
         _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
