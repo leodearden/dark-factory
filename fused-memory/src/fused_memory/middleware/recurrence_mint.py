@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -25,9 +25,11 @@ from shared.task_statuses import ACTIVE, TaskStatus
 
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.middleware.deterministic_task_guard import deterministic_task_error
+from fused_memory.models.scope import is_phantom_project_root
 
 __all__ = [
     'RECURRENCE_MINT_SOURCE',
+    'REMINT_SWEEP_INTERVAL_SECS',
     'BrokenChain',
     'MintOutcome',
     'MintOutcomeKind',
@@ -36,11 +38,13 @@ __all__ = [
     'mint_successor',
     'mints_successor',
     'remint_broken_chain',
+    'run_remint_sweep_loop',
 ]
 
 logger = logging.getLogger(__name__)
 
 RECURRENCE_MINT_SOURCE = 'recurrence-mint'
+REMINT_SWEEP_INTERVAL_SECS: float = 3600.0
 
 
 class MintOutcomeKind(StrEnum):
@@ -274,3 +278,25 @@ async def remint_broken_chain(
             chain.link_id, chain.key, outcome.successor_id, project_root, chain.tag,
         )
     return outcome
+
+
+async def run_remint_sweep_loop(
+    remint: Callable[[str], Awaitable[object]],
+    project_roots: Iterable[str],
+    *,
+    interval_secs: float = REMINT_SWEEP_INTERVAL_SECS,
+) -> None:
+    """Sweep every non-phantom root at once, then every *interval_secs*, until cancelled.
+
+    A phantom root is skipped because reading it would create its task store.
+    """
+    roots = tuple(project_roots)
+    while True:
+        for root in roots:
+            if await asyncio.to_thread(is_phantom_project_root, root):
+                continue
+            try:
+                await remint(root)
+            except Exception:
+                logger.exception('recurrence_remint_sweep_failed: project_root=%s', root)
+        await asyncio.sleep(interval_secs)
