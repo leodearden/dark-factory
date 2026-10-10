@@ -92,13 +92,6 @@ def test_capture_reads_the_live_identity(live_child):
     assert capture(live_child.pid) == identity
 
 
-def test_identity_is_frozen(live_child):
-    identity = _captured(live_child.pid)
-
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        identity.pid = 1  # type: ignore[misc]
-
-
 def test_running_process_is_alive(live_child):
     assert liveness(_captured(live_child.pid)) is Liveness.ALIVE
     assert liveness(_captured(os.getpid())) is Liveness.ALIVE

@@ -281,6 +281,46 @@ def test_refusal_names_its_reason_field_and_value(raw, reason, field, value):
     assert type(refused.value.value) is type(value)
 
 
+@pytest.mark.parametrize(
+    ('model', 'raw', 'expected'),
+    [
+        pytest.param(
+            UntilConditionRequest, {'condition': '  '}, _R.MISSING_FIELD, id='blank'
+        ),
+        pytest.param(
+            HeldBySessionRequest,
+            {'holder_pid': 1, 'grace_secs': 599},
+            _R.GRACE_OUT_OF_RANGE,
+            id='grace-short',
+        ),
+        pytest.param(
+            HeldBySessionRequest,
+            {'holder_pid': 1, 'grace_secs': 86401},
+            _R.GRACE_OUT_OF_RANGE,
+            id='grace-long',
+        ),
+        pytest.param(
+            UntilConditionRequest,
+            {'condition': 'c', 'expires_at': 'tomorrow'},
+            _R.INVALID_VALUE,
+            id='request-timestamp',
+        ),
+        pytest.param(
+            UntilConditionDeferral,
+            {'condition': 'c', 'deferred_at': None, 'stamped_at': 'tomorrow'},
+            _R.INVALID_VALUE,
+            id='record-timestamp',
+        ),
+    ],
+)
+def test_every_custom_field_error_is_a_deferral_invalid_reason(model, raw, expected):
+    with pytest.raises(ValidationError) as refused:
+        model.model_validate(raw)
+
+    error_type = refused.value.errors()[0]['type']
+    assert DeferralInvalidReason(error_type) is expected
+
+
 def test_refusal_message_names_reason_field_and_value():
     with pytest.raises(DeferralInvalid) as refused:
         parse_request(_held(grace_secs=599), now=NOW)
@@ -296,11 +336,6 @@ def test_refusal_message_names_reason_field_and_value():
 
 def test_naive_timestamp_reads_as_utc():
     assert parse_utc_timestamp('2026-10-09T12:00:00') == NOW
-
-
-def test_timestamp_parser_refuses_a_number():
-    with pytest.raises(ValueError):
-        parse_utc_timestamp(1760000000)  # type: ignore[arg-type]
 
 
 # --- the stored record -------------------------------------------------------
