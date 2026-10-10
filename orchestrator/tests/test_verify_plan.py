@@ -63,11 +63,11 @@ from orchestrator.verify_plan import (
     _is_collectable_test_file,
     _is_conftest,
     _is_test_file,
-    _scope_prefix_to_keyword,
     classify_file,
     derive_verify_plan,
     effective_merge_module_configs,
     reverse_dependent_test_targets,
+    scope_prefix_to_keyword,
 )
 
 # The real config command strings this suite exercises live in
@@ -1126,7 +1126,7 @@ class TestDeriveVerifyPlanMergeBreadth:
 # ---------------------------------------------------------------------------
 
 # Every real config command, paired with the keyword its slot scopes on. Used
-# as the lockstep corpus below; `_scope_to_keyword` and `_scope_prefix_to_keyword`
+# as the lockstep corpus below; `_scope_to_keyword` and `scope_prefix_to_keyword`
 # must agree on ALL of them, for EVERY keyword — including the mismatched
 # pairings, which exercise the keyword-absent and keyword-in-a-later-segment
 # rejections.
@@ -1342,7 +1342,7 @@ class TestScoperTrailingClausePreservation:
         asserts a property that holds by construction.
         """
         assert _scope_to_keyword(raw, keyword, self._FILES) == render(
-            _scope_prefix_to_keyword(raw, keyword, self._FILES)
+            scope_prefix_to_keyword(raw, keyword, self._FILES)
         )
 
 
@@ -1357,7 +1357,7 @@ class TestTailPreservationAllowlist:
     """Both scopers must return a STRUCTURED command for a chained pytest slot.
 
     Task 3218 part 1. ``split_chain_tail``'s ACCEPT makes
-    ``_scope_prefix_to_keyword`` return ``VerifyCmd(tool=PYTEST, raw=...)``
+    ``scope_prefix_to_keyword`` return ``VerifyCmd(tool=PYTEST, raw=...)``
     and ``verify._scope_to_keyword`` return a multi-clause string that
     re-parses the same way. ``with_junitxml`` and ``with_pytest_timeout`` are
     documented no-ops on ``raw is not None``, so the merge leg's
@@ -1378,8 +1378,8 @@ class TestTailPreservationAllowlist:
         ids=['sibling-names-the-tool', 'sibling-does-not-name-the-tool'],
     )
     def test_plan_scoper_yields_structured_junit_injectable_pytest(self, raw):
-        """_scope_prefix_to_keyword: raw-retained is the failure mode; assert against it."""
-        scoped = _scope_prefix_to_keyword(raw, 'pytest', self._FILES)
+        """scope_prefix_to_keyword: raw-retained is the failure mode; assert against it."""
+        scoped = scope_prefix_to_keyword(raw, 'pytest', self._FILES)
         assert scoped.tool is ToolKind.PYTEST
         assert scoped.raw is None, 'a raw-retained pytest cmd silently loses --junitxml'
 
@@ -1430,7 +1430,7 @@ class TestTailPreservationAllowlist:
     def test_lockstep_holds_on_the_rejected_pytest_chains(self, raw):
         """The two scopers must agree here too — the gate is shared, so this is structural."""
         assert _scope_to_keyword(raw, 'pytest', self._FILES) == render(
-            _scope_prefix_to_keyword(raw, 'pytest', self._FILES)
+            scope_prefix_to_keyword(raw, 'pytest', self._FILES)
         )
 
 
@@ -1519,7 +1519,7 @@ class TestDroppedChainClausesAreLogged:
         configs, and stay at DEBUG.
         """
         with caplog.at_level(logging.DEBUG, logger='orchestrator.verify_plan'):
-            result = _scope_prefix_to_keyword(raw, keyword, self._FILES)
+            result = scope_prefix_to_keyword(raw, keyword, self._FILES)
 
         messages = self._records(caplog, 'orchestrator.verify_plan', level)
         assert len(messages) == 1, f'expected exactly one record, got {messages}'
@@ -1558,7 +1558,7 @@ class TestDroppedChainClausesAreLogged:
         repo's own root ``test_command``, on every fallback verify.
         """
         with caplog.at_level(logging.DEBUG, logger='orchestrator.verify_plan'):
-            _scope_prefix_to_keyword(raw, keyword, self._FILES)
+            scope_prefix_to_keyword(raw, keyword, self._FILES)
 
         messages = self._records(caplog, 'orchestrator.verify_plan', level)
         assert len(messages) == 1, f'expected exactly one record, got {messages}'
@@ -1605,7 +1605,7 @@ class TestDroppedChainClausesAreLogged:
         ordinary config, so this is reachable in practice.
         """
         with caplog.at_level(logging.DEBUG, logger='orchestrator.verify_plan'):
-            plan_result = _scope_prefix_to_keyword(raw, keyword, self._FILES)
+            plan_result = scope_prefix_to_keyword(raw, keyword, self._FILES)
         assert self._records(caplog, 'orchestrator.verify_plan') == []
 
         caplog.clear()
@@ -1645,7 +1645,7 @@ class TestDroppedChainClausesAreLogged:
     def test_logging_is_the_only_observable_change(self, raw, keyword):
         """Both scopers' returned commands stay byte-identical, and in lockstep."""
         string_scoped = _scope_to_keyword(raw, keyword, self._FILES)
-        plan_scoped = render(_scope_prefix_to_keyword(raw, keyword, self._FILES))
+        plan_scoped = render(scope_prefix_to_keyword(raw, keyword, self._FILES))
         assert string_scoped == plan_scoped
 
 
@@ -2229,7 +2229,7 @@ _SWEEP_MODULE_CONFIGS: list[tuple[str, ModuleConfig]] = [
         test_command='pytest',
     )),
     # Commands the scoper cannot narrow at all: OPAQUE (mypy) and a keyword
-    # that never appears (`true`). _scope_prefix_to_keyword returns the
+    # that never appears (`true`). scope_prefix_to_keyword returns the
     # command UNSCOPED here while _derive_module_runs still labels the slot
     # FILE_SCOPED — a pre-existing property of scope_kind that scoped_targets
     # must track consistently rather than contradict.
@@ -2316,7 +2316,7 @@ class TestPlanRecordScopedTargets:
 
     Task 3219. ``cmd.targets`` cannot answer that question once ``cmd`` is
     raw-retained, which is the shape the tail-preserving chained-lint accept
-    path (_scope_prefix_to_keyword) produces for EVERY subproject — each
+    path (scope_prefix_to_keyword) produces for EVERY subproject — each
     one's lint_command chains a sibling checker. The scoping itself was and
     remains correct; only the machine-readable record was lost.
 
@@ -2777,7 +2777,7 @@ _ESC_3805_FILE = 'orchestrator/tests/test_run_vllm_eval.py'
 
 
 class TestVersionPinSurvivesPrefixScoping:
-    """``_scope_prefix_to_keyword`` must keep a pinned npx package version.
+    """``scope_prefix_to_keyword`` must keep a pinned npx package version.
 
     Task 3931 / esc-3805-1 — the LOCKSTEP counterpart of
     ``test_verify.py::TestVersionPinSurvivesScoping``.
@@ -2795,15 +2795,15 @@ class TestVersionPinSurvivesPrefixScoping:
     MEASURED on this branch before the step-6 change (and after step-4, so this
     is verify_plan.py's own stripping, not the parser's):
 
-        _scope_prefix_to_keyword(PINNED, 'pyright', [file])
+        scope_prefix_to_keyword(PINNED, 'pyright', [file])
             -> ToolKind.PYRIGHT, renders 'npx pyright <file>'   <-- pin GONE
     """
 
     def test_pinned_chain_keeps_its_version(self):
-        cmd = _scope_prefix_to_keyword(_PINNED_TYPE_CHAIN_3931, 'pyright', [_ESC_3805_FILE])
+        cmd = scope_prefix_to_keyword(_PINNED_TYPE_CHAIN_3931, 'pyright', [_ESC_3805_FILE])
         assert cmd.tool is ToolKind.PYRIGHT
         assert render(cmd) == f'npx pyright@1.1.408 {_ESC_3805_FILE}', (
-            f'_scope_prefix_to_keyword dropped the version pin, rendering '
+            f'scope_prefix_to_keyword dropped the version pin, rendering '
             f'{render(cmd)!r} (task 3931, esc-3805-1). This is the '
             'VerifyCmd-layer twin of verify._scope_to_keyword and must be '
             'fixed in lockstep with it — the pair routes through one shared '
@@ -2818,7 +2818,7 @@ class TestVersionPinSurvivesPrefixScoping:
             '(task 3931 / 4538) — the pinned fixture above would then be the '
             'same string as this one and neither guard would mean anything'
         )
-        cmd = _scope_prefix_to_keyword(ROOT_TYPE_CHECK_COMMAND, 'pyright', [_ESC_3805_FILE])
+        cmd = scope_prefix_to_keyword(ROOT_TYPE_CHECK_COMMAND, 'pyright', [_ESC_3805_FILE])
         assert cmd.tool is ToolKind.PYRIGHT
         assert render(cmd) == f'npx pyright {_ESC_3805_FILE}'
 
@@ -2828,7 +2828,7 @@ class TestVersionPinSurvivesPrefixScoping:
         Passes today; it is the floor that makes the step-6 widening provably
         narrow rather than a general "keep the whole token" change.
         """
-        cmd = _scope_prefix_to_keyword('npx pyright-foo', 'pyright', [_ESC_3805_FILE])
+        cmd = scope_prefix_to_keyword('npx pyright-foo', 'pyright', [_ESC_3805_FILE])
         assert render(cmd) == f'npx pyright {_ESC_3805_FILE}'
 
 
