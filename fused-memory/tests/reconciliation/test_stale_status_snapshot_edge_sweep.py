@@ -56,11 +56,13 @@ from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     _last_clause_break,
     build_supersede_fact,
     extract_blocked_assertion_task_ids,
+    extract_marker_task_ids,
     extract_snapshot_edge_task_ids,
     extract_snapshot_edge_task_ids_by_marker_class,
     flatten_dedup_edges,
     select_stale_status_snapshot_edges,
     sweep_stale_status_snapshot_edges,
+    sweep_stale_status_snapshot_edges_for_task,
 )
 
 # The pinned shape corpora live in a plain data module so task 3949's
@@ -913,15 +915,18 @@ class TestExtractSnapshotEdgeTaskIds:
         """
         assert extract_snapshot_edge_task_ids(fact) == set()
 
-    def test_intra_token_dot_narrowing_costs_only_under_selection(self):
-        """Cost of the intra-token-dot narrowing, pinned from both sides. (task 4149)
+    def test_token_internal_break_narrowing_costs_only_under_selection(self):
+        """Cost of the token-internal-break narrowing, pinned from both sides.
 
-        Disqualifying an intra-token '.' as a break introduces exactly one
-        new residual: a genuine SENTENCE period with no following space AND
-        a following alphanumeric, sitting behind a listed preposition. Such
-        a '.' now reads as intra-token (flanked by alphanumerics on both
-        sides), so the backward scan does not stop there and the clause
-        extends back over the preposition, suppressing a genuine
+        (tasks 4149, 4851)
+
+        Disqualifying a token-internal break introduces exactly one new
+        residual: a genuine SENTENCE break ('.', ';', '!' or '?') with no
+        following space AND a following alphanumeric, sitting behind a
+        listed preposition. Such a break now reads as token-internal
+        (flanked by alphanumerics on both sides), so the backward scan does
+        not stop there and the clause extends back over the preposition,
+        suppressing a genuine
         subject-position enumeration. This is the fail-safe under-selection
         direction — the edge is simply not retired this cycle and the next
         sweep sees it again — mirroring
@@ -936,10 +941,14 @@ class TestExtractSnapshotEdgeTaskIds:
         all — it is still a break regardless of the narrowing.
         """
         # ACCEPTED residual: 'done.Then' — the period is flanked by 'e' and
-        # 'T', both alnum, so it reads as intra-token and the scan continues
+        # 'T', both alnum, so it reads as token-internal and the scan continues
         # back over 'for', suppressing the match.
         assert extract_snapshot_edge_task_ids(
             'Reviews for the branch are done.Then tasks 1020 and 1030 are pending.'
+        ) == set()
+        # ACCEPTED residual, the same shape for '?' (task 4851).
+        assert extract_snapshot_edge_task_ids(
+            'Reviews for the branch are done?Then tasks 1020 and 1030 are pending.'
         ) == set()
         # UNAFFECTED: 'done.Tasks' — the period is the prefix's last
         # character (prefix ends right before '\\btasks\\b'), so it has no
@@ -1397,8 +1406,8 @@ class TestExtractBlockedAssertionTaskIds:
     union family (see _build_snapshot_patterns), so every hardening tasks
     2613/3042/3079/3403/4149 bought — transitive-verb guard, negation and
     past-exit guard, intervening-task-reference guard, prepositional-
-    complement subjecthood guard, possessive quantifiers, intra-token-dot
-    narrowing — applies here for free and cannot drift.
+    complement subjecthood guard, possessive quantifiers, token-internal-
+    break narrowing — applies here for free and cannot drift.
     """
 
     # --- the five extraction paths ---
@@ -1666,8 +1675,9 @@ class TestPluralEnumerationPerformance:
     Why this is a liveness property and not a micro-optimisation:
     ``sweep_stale_status_snapshot_edges`` calls this extractor once per
     valid edge in an unguarded dict comprehension with no per-edge timeout,
-    over the whole group's edge set (~5868 edges in the task-3042 record).
-    One pathological fact stalls the entire reconciliation cycle.
+    over the whole group's edge set (tens of thousands of edges; current
+    figure in plans/stale-status-snapshot-sweep-report.md). One
+    pathological fact stalls the entire reconciliation cycle.
 
     SIZING NOTE: the blowup base scales with the WIDTH of the whitespace
     run — each extra whitespace character adds another way to split it — so
@@ -1758,9 +1768,9 @@ class TestPluralEnumerationPerformance:
             GROWING with n is the quadratic signature, and it already blows
             the bound below at every size tested.
 
-        The bound is derived, not guessed: 3 unconditional full backward
-        scans (';', '!', '?' are each absent from this input, so each scans
-        the whole prefix once) + 1 telescoped '.' walk covering the prefix
+        The bound is derived, not guessed: 3 full backward scans (';', '!',
+        '?' are each absent from this input, so each scans the whole prefix
+        once) + 1 telescoped '.' walk covering the prefix
         once + 2 single-character reads per dot (~0.67 dots per 3-char
         'ab.' token) ~= 4.7x prefix length. 8x leaves headroom for an
         innocuous refactor while still failing any superlinear form
@@ -1779,6 +1789,36 @@ class TestPluralEnumerationPerformance:
             f'_last_clause_break touched {prefix.touched} characters for a '
             f'{len(dotted_tokens)}-char dot-dense prefix (budget '
             f'{8 * len(dotted_tokens)} = 8x length) — the intra-token-dot '
+            f'walk is no longer linear'
+        )
+
+    def test_mixed_token_internal_break_walk_touches_linearly_many_characters(self):
+        """The merged four-character walk must not degrade to quadratic. (task 4851)
+
+        Every member of ``CLAUSE_BREAK_CHARS`` now gets the occurrence-level
+        test, so the walk must step past token-internal occurrences of all
+        four characters, interleaved. A naive spelling that re-takes the max
+        of four fresh ``rfind`` calls per step rescans the prefix once per
+        occurrence and is quadratic on dense input like this one.
+
+        The bound is derived, not guessed: four telescoped per-character
+        walks, each covering the prefix about once (~4x length), plus 2
+        single-character reads per occurrence (one occurrence every 2
+        characters, ~1x length), is about 5x. 8x leaves headroom for an
+        innocuous refactor while still failing any superlinear form.
+        """
+        mixed_tokens = 'a;b?c!d.' * 5_000 + 'e'
+        prefix = CountingStr(mixed_tokens)
+
+        result = _last_clause_break(prefix)
+
+        # Correctness alongside cost: every break is alnum-flanked, so no
+        # occurrence ends a sentence and the walk must exhaust to -1.
+        assert result == -1
+        assert prefix.touched <= 8 * len(mixed_tokens), (
+            f'_last_clause_break touched {prefix.touched} characters for a '
+            f'{len(mixed_tokens)}-char break-dense prefix (budget '
+            f'{8 * len(mixed_tokens)} = 8x length) — the token-internal-break '
             f'walk is no longer linear'
         )
 
@@ -2267,7 +2307,7 @@ class TestSelectStaleStatusSnapshotEdgesBlockedRule:
         assert select_stale_status_snapshot_edges([edge], {'2848': 'unknown'}) == []
         assert select_stale_status_snapshot_edges([edge], {'2848': ''}) == []
 
-    @pytest.mark.parametrize('status', ['in-progress', 'review'])
+    @pytest.mark.parametrize('status', ['in-progress', 'review', 'deferred', 'blocked'])
     def test_non_blocked_assertion_is_out_of_the_new_rule_scope(self, status):
         """SCOPE GUARD — this is what forbids the new rule generalising.
 
@@ -2292,6 +2332,32 @@ class TestSelectStaleStatusSnapshotEdgesBlockedRule:
         edge = {'uuid': 'edge-999', 'fact': 'Task 999 is an active pending task', 'name': ''}
 
         assert select_stale_status_snapshot_edges([edge], {'999': status}) == [edge]
+
+    @pytest.mark.parametrize('fact', ['Task 7 is stalled.', 'Task 7 is an active task'])
+    @pytest.mark.parametrize(
+        ('status', 'selected'),
+        [
+            ('pending', False),
+            ('in-progress', False),
+            ('review', False),
+            ('deferred', False),
+            ('blocked', False),
+            ('done', True),
+            ('cancelled', True),
+        ],
+    )
+    def test_stalled_and_active_assertions_are_terminal_rule_only(self, fact, status, selected):
+        """Pins the task-4851 decision NOT to adopt a general contradiction rule.
+
+        'active' maps to several TaskStatus values and 'stalled' to none, so
+        neither marker has a live status it could be contradicted by. Only
+        the terminal rule retires them; any non-terminal live status leaves
+        them alone. Verdict: plans/stale-status-snapshot-sweep-report.md.
+        """
+        edge = {'uuid': 'edge-7', 'fact': fact, 'name': ''}
+
+        expected = [edge] if selected else []
+        assert select_stale_status_snapshot_edges([edge], {'7': status}) == expected
 
     def test_aggregate_blocked_edge_selected_on_a_single_unblocked_member(self):
         """'Blocked tasks: 142, 148' with 142 unblocked to 'pending' and 148
@@ -2875,8 +2941,9 @@ class TestSweepStaleStatusSnapshotEdgesBlockedRuleAndCounters:
 
         Extractor cost is a whole-cycle liveness property in this module (see
         the module docstring): the extractor runs once per valid edge over the
-        whole group's edge set — ~12k edges and ~3.3 s per enumeration on
-        dark_factory post-task-4340 — with no per-edge timeout, so one
+        whole group's edge set — tens of thousands of edges, current figure
+        in plans/stale-status-snapshot-sweep-report.md — with no per-edge
+        timeout, so one
         pathological fact stalls the entire reconciliation cycle. A second
         full pass per edge doubles the cost the module's own performance tests
         exist to bound.
@@ -4040,3 +4107,353 @@ class TestSweepStaleStatusSnapshotEdgesEnumerationCompleteness:
         assert empirical['enumeration_complete'] is False
         assert structural['enumeration_complete'] is False
         assert unread['enumeration_complete'] is None
+
+
+# --------------------------------------------------------------------------- #
+# sweep_stale_status_snapshot_edges_for_task — the per-task sweep (task 4851)
+# --------------------------------------------------------------------------- #
+
+
+def _make_memory_service_mentioning(edges, paged=None) -> MagicMock:
+    """A memory service whose NARROWED read returns *edges*.
+
+    The full-corpus read keeps its default stub, so a test can assert it was
+    never awaited.
+    """
+    memory_service = _make_memory_service()
+    memory_service.graphiti.enumerate_valid_edges_mentioning = AsyncMock(
+        return_value=(
+            {'entity-a': edges},
+            paged if paged is not None else complete_paged_read(rows_seen=len(edges)),
+        ),
+    )
+    return memory_service
+
+
+def _edge(uuid: str, fact: str) -> dict:
+    return {'uuid': uuid, 'fact': fact, 'name': ''}
+
+
+class TestSweepStaleStatusSnapshotEdgesForTask:
+    """The same rules as the periodic sweep, over a narrowed read. (task 4851)"""
+
+    NOW = datetime(2026, 10, 10, 12, 0, tzinfo=UTC)
+    NOISE_EDGES = [
+        _edge('e-1420', 'Task 1420 is pending'),
+        _edge('e-noise', 'The 142 retries were pending review'),
+    ]
+
+    async def _sweep(self, memory_service, taskmaster, task_id):
+        return await sweep_stale_status_snapshot_edges_for_task(
+            memory_service, taskmaster, 'test_project', '/tmp/reify', task_id,
+            run_id='run-4851', now=self.NOW,
+        )
+
+    @staticmethod
+    def _taskmaster_saying(statuses: dict[str, str]) -> MagicMock:
+        taskmaster = _make_taskmaster()
+        taskmaster.get_statuses = AsyncMock(return_value=statuses)
+        return taskmaster
+
+    @pytest.mark.asyncio
+    async def test_reads_only_the_narrowed_population(self):
+        """HOT PATH: one narrowed read, never the whole-graph enumeration."""
+        memory_service = _make_memory_service_mentioning(
+            [_edge('e-142', 'Task 142 is an active pending task')],
+        )
+
+        await self._sweep(memory_service, self._taskmaster_saying({'142': 'done'}), 142)
+
+        memory_service.graphiti.enumerate_valid_edges_mentioning.assert_awaited_once_with(
+            '142', group_id='test_project',
+        )
+        memory_service.graphiti.enumerate_all_valid_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_substring_superset_is_post_filtered_to_the_task(self):
+        """'1420' and a bare '142' match the needle but do not name task 142."""
+        memory_service = _make_memory_service_mentioning(
+            [_edge('e-142', 'Task 142 is an active pending task'), *self.NOISE_EDGES],
+        )
+        taskmaster = self._taskmaster_saying({'142': 'done', '1420': 'done'})
+
+        stats = await self._sweep(memory_service, taskmaster, 142)
+
+        memory_service.update_edge.assert_awaited_once()
+        assert memory_service.update_edge.await_args is not None
+        assert memory_service.update_edge.await_args.args[0] == 'e-142'
+        taskmaster.get_statuses.assert_awaited_once_with('/tmp/reify', ids=['142'])
+        assert stats['scanned'] == 3
+        assert stats['candidate_edges'] == 1
+        assert stats['invalidated'] == 1
+
+    @pytest.mark.asyncio
+    async def test_an_aggregate_naming_the_task_is_judged_on_all_its_ids(self):
+        """Exactly the periodic sweep's judgement: a sibling id may retire it."""
+        memory_service = _make_memory_service_mentioning(
+            [_edge('e-agg', 'Tasks 142 and 1030 are pending')],
+        )
+        taskmaster = self._taskmaster_saying({'142': 'pending', '1030': 'done'})
+
+        stats = await self._sweep(memory_service, taskmaster, 142)
+
+        taskmaster.get_statuses.assert_awaited_once_with('/tmp/reify', ids=['142', '1030'])
+        assert stats['invalidated'] == 1
+
+    @pytest.mark.asyncio
+    async def test_the_blocked_rule_retires_and_supersedes_through_this_path(self):
+        memory_service = _make_memory_service_mentioning(
+            [_edge('e-2848', 'Task 2848 remains blocked as of 2026-07-22')],
+        )
+
+        stats = await self._sweep(
+            memory_service, self._taskmaster_saying({'2848': 'deferred'}), 2848,
+        )
+
+        assert stats['invalidated'] == 1
+        assert stats['superseded'] == 1
+        memory_service.add_memory.assert_awaited_once()
+        assert memory_service.add_memory.await_args is not None
+        assert memory_service.add_memory.await_args.kwargs['content'] == (
+            build_supersede_fact(2848, 'deferred', self.NOW)
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_uncontradicted_live_status_retires_nothing(self):
+        memory_service = _make_memory_service_mentioning(
+            [_edge('e-142', 'Task 142 is pending')],
+        )
+
+        stats = await self._sweep(
+            memory_service, self._taskmaster_saying({'142': 'pending'}), 142,
+        )
+
+        memory_service.update_edge.assert_not_awaited()
+        assert stats['candidate_edges'] == 0
+        assert stats['invalidated'] == 0
+        assert stats['errors'] == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('noise', [False, True], ids=['no-edges', 'only-noise'])
+    async def test_no_edge_naming_the_task_skips_the_status_read(self, noise):
+        edges = list(self.NOISE_EDGES) if noise else []
+        memory_service = _make_memory_service_mentioning(edges)
+        taskmaster = self._taskmaster_saying({'1420': 'done'})
+
+        stats = await self._sweep(memory_service, taskmaster, 142)
+
+        taskmaster.get_statuses.assert_not_awaited()
+        memory_service.update_edge.assert_not_awaited()
+        assert stats['scanned'] == len(edges)
+        for key in ('candidate_edges', 'invalidated', 'errors', 'superseded'):
+            assert stats[key] == 0, f'{key} should be 0, got {stats!r}'
+
+    @pytest.mark.asyncio
+    async def test_a_failing_narrowed_read_is_swallowed_and_counted(self):
+        memory_service = _make_memory_service()
+        memory_service.graphiti.enumerate_valid_edges_mentioning = AsyncMock(
+            side_effect=RuntimeError('falkordb down'),
+        )
+        taskmaster = self._taskmaster_saying({'142': 'done'})
+
+        stats = await self._sweep(memory_service, taskmaster, 142)
+
+        assert stats['errors'] == 1
+        assert stats['enumeration_complete'] is None
+        taskmaster.get_statuses.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('kind', sorted(INCOMPLETE_STRUCTURAL_KINDS))
+    async def test_a_structurally_incomplete_narrowed_read_aborts_like_the_periodic_one(
+        self, kind,
+    ):
+        memory_service = _make_memory_service_mentioning(
+            [_edge('e-142', 'Task 142 is an active pending task')],
+            paged=incomplete_paged_read(kind, rows_seen=1, expected_rows=9999),
+        )
+
+        stats = await self._sweep(
+            memory_service, self._taskmaster_saying({'142': 'done'}), 142,
+        )
+
+        assert stats['errors'] == 1
+        assert stats['enumeration_complete'] is False
+        assert stats['enumeration_incomplete_kind'] == kind
+        memory_service.update_edge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_returns_the_same_stats_keys_as_the_periodic_sweep(self):
+        periodic = await sweep_stale_status_snapshot_edges(
+            _make_memory_service(), _make_taskmaster(), 'test_project', '/tmp/reify',
+            run_id='run-4851',
+        )
+        per_task = await self._sweep(
+            _make_memory_service_mentioning([]), _make_taskmaster(), 142,
+        )
+
+        assert per_task.keys() == periodic.keys()
+
+    @pytest.mark.asyncio
+    async def test_extraction_runs_exactly_once_per_edge_read(self):
+        """LIVENESS twin of test_extraction_runs_exactly_once_per_edge.
+
+        The post-filter must reuse the single by-class extraction, so every
+        edge READ enters the extraction pipeline exactly once, whether it is
+        kept or filtered out.
+        """
+        facts = [
+            CountingStr('Task 142 is an active pending task'),
+            CountingStr('Tasks 142 and 1030 are blocked'),
+            CountingStr('Task 1420 is pending'),
+        ]
+        memory_service = _make_memory_service_mentioning(
+            [_edge(f'edge-{i}', fact) for i, fact in enumerate(facts)],
+        )
+        taskmaster = self._taskmaster_saying(
+            {'142': 'done', '1030': 'pending', '1420': 'done'},
+        )
+
+        await self._sweep(memory_service, taskmaster, 142)
+
+        for fact in facts:
+            assert fact.reads == 1, (
+                f'Expected exactly one extraction entry for {str(fact)!r}, '
+                f'got {fact.reads}'
+            )
+
+
+# --------------------------------------------------------------------------- #
+# Overlapping sweeps of one project (task 4851)
+# --------------------------------------------------------------------------- #
+
+
+class _LiveEdgeGraph:
+    """Valid edges that stop enumerating once retired, yielding inside every call.
+
+    The yields let two sweeps interleave the way concurrent asyncio tasks do in
+    production: both reads can land before either retirement.
+    """
+
+    def __init__(self, edges: list[dict]):
+        self.valid = {edge['uuid']: edge for edge in edges}
+
+    async def _read(self, keep) -> tuple[dict, object]:
+        await asyncio.sleep(0)
+        edges = [edge for edge in self.valid.values() if keep(edge['fact'])]
+        return {'entity-a': edges}, complete_paged_read(rows_seen=len(edges))
+
+    async def enumerate_all_valid_edges(self, *, group_id):
+        return await self._read(lambda fact: True)
+
+    async def enumerate_valid_edges_mentioning(self, substring, *, group_id):
+        return await self._read(lambda fact: substring in fact)
+
+    async def retire(self, uuid, **_kwargs):
+        await asyncio.sleep(0)
+        self.valid.pop(uuid, None)
+
+
+class TestOverlappingSweepsOfOneProject:
+    """One superseding fact per contradicted task, however the sweeps overlap.
+
+    A cancellation cascade starts one targeted sweep per task without awaiting
+    any of them, and a full cycle's Stage-1 sweep can start beside them. Each
+    overlap below would otherwise read the aggregate edge twice while it is
+    still valid and write every task's superseding fact twice.
+    """
+
+    NOW = datetime(2026, 10, 10, 12, 0, tzinfo=UTC)
+    AGGREGATE = _edge('e-agg', 'Tasks 4001 and 4002 are blocked')
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'sweep_task_ids',
+        [(4001, 4002), (None, 4001), (4001, None)],
+        ids=['two-per-task', 'periodic-then-per-task', 'per-task-then-periodic'],
+    )
+    async def test_each_task_gets_exactly_one_superseding_fact(self, sweep_task_ids):
+        graph = _LiveEdgeGraph([self.AGGREGATE])
+        memory_service = MagicMock()
+        memory_service.graphiti = graph
+        memory_service.update_edge = AsyncMock(side_effect=graph.retire)
+        memory_service.add_memory = AsyncMock()
+        taskmaster = _make_taskmaster()
+        taskmaster.get_statuses = AsyncMock(
+            return_value={'4001': 'cancelled', '4002': 'cancelled'},
+        )
+
+        async def sweep(task_id):
+            if task_id is None:
+                return await sweep_stale_status_snapshot_edges(
+                    memory_service, taskmaster, 'test_project', '/tmp/reify',
+                    run_id='run-periodic', now=self.NOW,
+                )
+            return await sweep_stale_status_snapshot_edges_for_task(
+                memory_service, taskmaster, 'test_project', '/tmp/reify', task_id,
+                run_id=f'run-{task_id}', now=self.NOW,
+            )
+
+        results = await asyncio.gather(*(sweep(task_id) for task_id in sweep_task_ids))
+
+        written = sorted(
+            call.kwargs['content'] for call in memory_service.add_memory.await_args_list
+        )
+        assert written == [
+            build_supersede_fact(4001, 'cancelled', self.NOW),
+            build_supersede_fact(4002, 'cancelled', self.NOW),
+        ]
+        assert sum(stats['invalidated'] for stats in results) == 1
+        assert sum(stats['superseded'] for stats in results) == 2
+
+
+# --------------------------------------------------------------------------- #
+# extract_marker_task_ids — the per-marker reporting seam (task 4851)
+# --------------------------------------------------------------------------- #
+
+_PENDING_ALT = r'(?:pending)'
+_IN_PROGRESS_ALT = r'(?:in[-\s]?progress)'
+_BLOCKED_ALT = r'(?:blocked)'
+
+
+class TestExtractMarkerTaskIds:
+    """Which ids a fact asserts under ONE marker, inside the union's result."""
+
+    def test_each_marker_gets_only_its_own_ids(self):
+        fact = 'Task 5 is pending and task 6 is in progress'
+
+        assert extract_marker_task_ids(fact, _PENDING_ALT, None) == {5}
+        assert extract_marker_task_ids(fact, _IN_PROGRESS_ALT, None) == {6}
+
+    def test_a_fact_with_no_status_marker_yields_nothing(self):
+        assert extract_marker_task_ids('Task 5 is done', _PENDING_ALT, None) == set()
+        assert extract_marker_task_ids(None, _PENDING_ALT, None) == set()
+
+    def test_the_union_rejections_are_threaded_into_the_marker_family(self):
+        """The task-3037 over-selection: a narrower family must not claim an id
+        inside an enumeration the union family ruled a prepositional complement."""
+        fact = 'Dependencies for tasks 1020 and task 1030 are pending in blocked status'
+
+        assert extract_marker_task_ids(fact, None, _BLOCKED_ALT) == set()
+
+    @pytest.mark.parametrize(
+        'fact',
+        [
+            *PRECISION_GUARD_SHAPES,
+            *GUARD_REJECTED_SUPPRESSION_SHAPES,
+            *(fact for fact, _ in SUBJECT_POSITIVE_SHAPES),
+            *ADVERBIAL_PREAMBLE_SHAPES,
+            'Task 5 is pending and task 6 is in progress',
+            'Tasks 1020 and 1030 are blocked',
+        ],
+    )
+    @pytest.mark.parametrize(
+        ('adjective_alt', 'transitive_alt'),
+        [(_PENDING_ALT, None), (_IN_PROGRESS_ALT, None), (None, _BLOCKED_ALT)],
+        ids=['pending', 'in-progress', 'blocked'],
+    )
+    def test_marker_ids_are_always_a_subset_of_the_union(
+        self, fact, adjective_alt, transitive_alt,
+    ):
+        assert extract_marker_task_ids(fact, adjective_alt, transitive_alt) <= (
+            extract_snapshot_edge_task_ids(fact)
+        )

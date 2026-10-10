@@ -54,7 +54,7 @@ constant — do not restate them here.)
   aggregate list path was once left resting on the gate alone and had to
   be re-anchored (``LIST_INTRODUCER_RE``) once 'blocked' widened the gate
   — task 2885 repro: 4 stale edges survived a blocked->done transition
-  (scanned=5868, invalidated=0) because the gate short-circuited before
+  (invalidated=0) because the gate short-circuited before
   the ``INACTIVE_TASK_STATUSES`` cross-reference ever ran. Any marker
   added to ``_STATUS_MARKER_ALT`` must therefore be re-checked against
   every path individually, not just the individual form —
@@ -83,7 +83,12 @@ constant — do not restate them here.)
   BLOCKED-ASSERTION rule (a blocked-asserted id has a positively-known
   status other than 'blocked'). Neither ever fires on an id whose census
   value is absent or outside the closed
-  ``shared.task_statuses.TaskStatus`` vocabulary.
+  ``shared.task_statuses.TaskStatus`` vocabulary.  The GENERAL rule
+  (asserted status != live status, for every marker) was measured by task
+  4851 and NOT adopted — verdict in
+  ``plans/stale-status-snapshot-sweep-report.md``.  'active' and 'stalled'
+  have no ``TaskStatus`` counterpart, hence no contradiction test, so they
+  stay terminal-rule-only.
 - The sweep is best-effort throughout (mirrors
   ``degenerate_task_node_sweep``): an edge-enumeration
   (``get_all_valid_edges``) or status cross-reference (``get_statuses``)
@@ -118,8 +123,7 @@ constant — do not restate them here.)
   under the other.  (amendment, task 3037)
 - WHAT ACTUALLY MAKES THAT SUBSET PROPERTY HOLD — and it is NOT pattern
   nesting, which is what this list claimed until it was measured false.
-  Two mechanisms, both in
-  ``extract_snapshot_edge_task_ids_by_marker_class``: the union family's
+  Two mechanisms, both in ``_ids_within_union``: the union family's
   prepositional-complement ``rejected_spans`` are THREADED into the
   blocked call, and the returned ``blocked_ids`` are INTERSECTED with
   ``all_ids`` at the seam.  The general warning, which is the part worth
@@ -166,11 +170,18 @@ Known residuals (deliberate; all fail-safe/under-selection unless noted)
   'Task 5 blocked tasks: 142, 148', whose over-selection the blocked rule
   would trigger almost immediately rather than only at done/cancelled. See
   ``_list_is_governed_by_task_ref``.
-- task 4149: ``_CLAUSE_BREAK_CHARS``'s ';' and '?' are unconditional
-  breaks (only '.' gets the occurrence-level flanking test), so one
-  residual is pointed the WRONG way: a '?' inside a URL query string or a
-  ';' inside a path/branch name truncates the backward scan past the
-  governing preposition and OVER-selects — see ``_CLAUSE_BREAK_CHARS``.
+- tasks 4149 / 4851: a genuine '.', ';', '!' or '?' sentence break
+  immediately followed by an alphanumeric ('done.Then', 'done?Then') reads
+  as token-internal, so a snapshot behind a listed preposition in the
+  previous sentence is missed — see ``is_token_internal_break``.
+- task 4851, measured: four lexical classes of genuine snapshot sit outside
+  the closed-class copula/article anchoring and are not extracted — a
+  relative clause ('task N, which is pending'), an attributive pre-modifier
+  or predicate nominal ('Blocked task N ...'), a gerund ('due to being
+  pending') and a secondary or coordinated predicate ('is filed and
+  pending').  All four under-select; each would need its own precision
+  pass before widening.  Triage and samples:
+  ``plans/stale-status-snapshot-sweep-report.md``.
 
 Two hypotheses were investigated and RULED OUT for the task-2613 miss
 rate; do not re-open them:
@@ -190,13 +201,18 @@ rate; do not re-open them:
    are recorded).  So at the time of the task-2613
    investigation this sweep saw about half the edges, and the miss rate was
    computed against a truncated denominator.  ``get_all_valid_edges`` is
-   paginated as of task 4340 and the truncation is gone, but the RATE has
-   not been recomputed: a re-measurement against the now-complete corpus is
-   warranted, and the residuals list above is calibrated against the old
-   figure.  Filed as ticket tkt_0RSJP92VQNATQB0FSR20YMXGW8 (a TICKET id,
-   not a task id — the curator resolves it to a task asynchronously).  Do
-   not re-open the LEXICAL hypothesis; do not treat the old rate as
-   measured on a whole corpus.
+   paginated as of task 4340 and the truncation is gone.
+
+   RE-MEASURED, task 4851, against the complete corpus.  The metric's
+   definition and every figure live in
+   ``plans/stale-status-snapshot-sweep-report.md`` and nowhere else.  The
+   durable finding: at steady state the shipped rules select approximately
+   nothing, because the sweep keeps up.  The facts that still name a
+   now-terminal task are an UPPER bound on misses, and by-eye triage finds
+   them mostly NOT status snapshots at all.  The genuine misses are the
+   fail-safe lexical classes listed under Known residuals.  Do not re-open
+   the LEXICAL hypothesis; do not treat the task-2613 rate as measured on a
+   whole corpus.
 2. A shared blind spot with ``task_count_verification``: that function is
    an aggregate census-vs-tree consistency check (``task_filter``), not a
    per-task edge sweep at all — its 'healthy' report was correct, not
@@ -206,19 +222,16 @@ Why a regex in this module gets a performance test at all:
 ``sweep_stale_status_snapshot_edges`` calls
 ``extract_snapshot_edge_task_ids_by_marker_class`` once per valid edge from
 an UNGUARDED dict comprehension with no per-edge timeout, over the whole
-group's edge set (tens of thousands of edges; current figures in
-``plans/falkordb-resultset-cap-audit.md``).  Extractor cost is
+group's edge set (tens of thousands of edges; current figure in
+``plans/stale-status-snapshot-sweep-report.md``).  Extractor cost is
 therefore a whole-cycle LIVENESS property — one pathological fact stalls
 the entire reconciliation cycle — not a micro-optimisation. (amendment,
 task 3079)
 
-The figure was ~5868 in the task-3042 record; that number is consistent
-with a truncated enumeration and has been corrected upward by task 4340's
-live census (see the amendment to ruled-out hypothesis 1 above). The
-LIVENESS argument gets STRONGER, not weaker: with the truncation removed
-the per-edge extractor now runs over roughly twice as many edges per
-cycle, so the per-edge cost this test guards matters more than the
-original number implied, not less.  The read that feeds it was timed
+The corpus this guards keeps growing, and the task-4340 pagination
+removed a truncation that had hidden about half of it (see the amendment
+to ruled-out hypothesis 1 above), so the LIVENESS argument only gets
+STRONGER over time.  The read that feeds it was timed
 2026-08-18 at ~3.3 s per full enumeration on dark_factory (~3.7 s on
 reify) — bounded, and roughly +2.6 s per cycle over the old truncated
 read; see the MEASURED COST section of that same audit doc, so this
@@ -237,13 +250,19 @@ extra substring scan and never run the blocked family's five anchored
 patterns at all. Only edges that really do mention 'blocked' pay for the
 second family, and for those the work is irreducible — the two families
 answer different questions.
+
+``sweep_stale_status_snapshot_edges_for_task`` (task 4851) shares the
+periodic sweep's core, so the one-pass extraction discipline above holds for
+it too. Its narrowed read is cheap only for a selective id; see its docstring.
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import re
+import weakref
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import NamedTuple
@@ -256,6 +275,7 @@ from fused_memory.reconciliation.task_filter import (
     STRICT_CLAUSE_BOUNDARY_RE,
     TASK_REF_RE,
 )
+from fused_memory.utils.validation import canonicalize_project_id
 
 logger = logging.getLogger(__name__)
 
@@ -419,9 +439,9 @@ _BLOCKED_MARKER_ALT = r'(?:blocked)'
 # set() after ONE substring scan rather than running five anchored patterns.
 #
 # This is a LIVENESS measure, not a micro-optimisation. The extractor runs
-# once per valid edge over the whole group's edge set (~12k edges post-task-
-# 4340 pagination, ~3.3 s per full enumeration — see the module docstring),
-# and the overwhelming majority of those edges carry no 'blocked' token, so
+# once per valid edge over the whole group's edge set (tens of thousands of
+# edges; current figure in plans/stale-status-snapshot-sweep-report.md; ~3.3 s
+# per full enumeration — see the module docstring), and the overwhelming majority of those edges carry no 'blocked' token, so
 # the pre-gate is what keeps the second pattern family off the hot path.
 _BLOCKED_MARKER_RE: re.Pattern[str] = re.compile(r'\bblocked\b', re.IGNORECASE)
 
@@ -665,29 +685,9 @@ _ENUM_PREP_WORDS: tuple[str, ...] = (
 #
 # A break requires TWO things together, not one: the character must be a
 # member of this class (below), AND the occurrence must plausibly END a
-# sentence — not be an INTRA-TOKEN '.' flanked by alphanumerics on both
-# sides, e.g. a filename extension, version string, dotted module path or
-# dotted section number (see _is_intra_token_dot / _last_clause_break;
-# task 4149). Only '.' gets that second, occurrence-level test — because
-# that is where over-selection was MEASURED and closed, not because ';',
-# '!' and '?' are verified safe. They remain unconditional breaks
-# whenever they appear, and at least one of them has a KNOWN, still-OPEN
-# instance of the identical over-selection class: a '?' inside a URL
-# query string or a ';' inside a path/branch name truncates the backward
-# scan past the governing preposition exactly as an intra-token '.' did,
-# e.g. (measured on this branch; amendment, reviewer_comprehensive
-# correctness-precision finding, task 4149)
-#
-#     'Reviews for https://ci/build?ref=main tasks 1020 and 1030 are
-#      pending.' -> {1020, 1030}
-#     'Statuses of the branch;main tasks 1020 and 1030 are pending.'
-#     -> {1020, 1030}
-#
-# Left open rather than fixed here: extending _is_intra_token_dot's
-# flanking test to all four class members would be a strictly fail-safe
-# generalization (narrowing an occurrence can only cost under-selection,
-# per the asymmetry argument below) if the corpus supports it, but that
-# needs its own measurement pass and is a follow-up, not this task.
+# sentence — not be TOKEN-INTERNAL (see is_token_internal_break /
+# _last_clause_break). Every member of the class gets that second,
+# occurrence-level test (task 4149 for '.', task 4851 for ';', '!' and '?').
 #
 # The CLASS is deliberately minimal — '.', ';', '!', '?' and nothing else,
 # and membership is a verified precision requirement not reopened by this
@@ -699,8 +699,8 @@ _ENUM_PREP_WORDS: tuple[str, ...] = (
 # not actually end a sentence truncates the scan and re-opens the
 # over-selection this guard exists to close, which is unrecoverable. So a
 # character earns a place in the class only by being able to end a
-# sentence, and an occurrence of '.' is treated as a break only by
-# plausibly ending one.
+# sentence, and an occurrence is treated as a break only by plausibly
+# ending one.
 #
 # Excluded from the CLASS on that rule, each verified over-selecting when it
 # was treated as a break (amendment, reviewer_comprehensive
@@ -722,9 +722,9 @@ _ENUM_PREP_WORDS: tuple[str, ...] = (
 # are pending.' still extracts): they carry no listed preposition, so the
 # longer clause gives the guard nothing to fire on.
 #
-# Excluded from OCCURRENCE by the flanking test — an intra-token '.' ends no
-# sentence — each measured over-selecting before this narrowing (amendment,
-# reviewer_comprehensive correctness-precision finding, task 4149):
+# Excluded from OCCURRENCE as token-internal — such an occurrence ends no
+# sentence — each measured over-selecting when it was treated as a break
+# (amendment, reviewer_comprehensive correctness-precision finding, task 4149):
 #
 #     filename extension     'Reviews for verify_cmd.py tasks 1020 and 1030
 #                             are pending.' -> {1020, 1030}; the
@@ -738,61 +738,83 @@ _ENUM_PREP_WORDS: tuple[str, ...] = (
 #     dotted section number  'Reviews for section 4.2.1 tasks 1020 and 1030
 #                             are pending.'
 #
-# A prefix-FINAL '.' (nothing to its right within prefix, e.g. prefix cut at
-# '\\btasks\\b' immediately after the period) has no right flank and so is
-# never intra-token — it stays a break regardless of this narrowing, which
+# The same holds for a token-internal ';', '?' or '!' and for the ';' that
+# ends an HTML entity (task 4851). Every excluded shape is pinned in
+# tests/reconciliation/plural_enum_shapes.py::PRECISION_GUARD_SHAPES.
+#
+# A prefix-FINAL break (nothing to its right within prefix, e.g. prefix cut
+# at '\\btasks\\b' immediately after the period) has no right flank and so is
+# never alnum-flanked — it stays a break regardless of this narrowing, which
 # keeps the common 'X.Tasks 1020 and 1030 are pending.' shape selected.
-_CLAUSE_BREAK_CHARS = '.;!?'
+CLAUSE_BREAK_CHARS = '.;!?'
 
 
-def _is_intra_token_dot(text: str, index: int) -> bool:
-    """Is the '.' at ``text[index]`` flanked by alphanumerics on both sides?
+# The head of an HTML character entity reference ('&lt', '&#60', '&#x3c'),
+# anchored to end exactly where the ';' that terminates it begins. Searched
+# over a bounded window ending at that ';', so the check costs O(1) per
+# occurrence and needs no slice.
+_HTML_ENTITY_HEAD_RE: re.Pattern[str] = re.compile(
+    r'&(?:[A-Za-z][A-Za-z0-9]{1,31}|#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6})\Z'
+)
+_HTML_ENTITY_HEAD_MAX_LEN = 40
+
+
+def is_token_internal_break(text: str, index: int) -> bool:
+    """Does the break character at ``text[index]`` end no sentence?
+
+    True for either of two reasons (tasks 4149, 4851):
+
+    (a) it is flanked by alphanumerics on both sides — a filename
+        extension, version string, dotted module path, dotted section
+        number, URL query '?', path/branch ';' or token-internal '!';
+    (b) it is a ';' terminating an HTML character entity ('&lt;', '&#60;'),
+        which is usually followed by a quote or paren rather than an
+        alphanumeric, so (a) alone would leave it breaking the clause.
 
     Unicode-aware by construction (``str.isalnum()``, the same predicate
     ``is_searchable_term`` uses in falkor_fulltext.py), so 'café.py' or a
-    non-ASCII identifier is recognized as intra-token exactly like an ASCII
-    one. A flanked '.' is a filename extension, version string, dotted
-    module path or dotted section number — it ends no sentence, so it must
-    not count as a clause break. (task 4149)
+    non-ASCII identifier is recognized exactly like an ASCII one.
 
-    Cost (fail-safe, under-selection): a genuine sentence period with no
-    following space AND a following alphanumeric — e.g. 'Reviews for the
-    branch are done.Then tasks 1020 and 1030 are pending.' — is flanked by
-    alphanumerics on both sides too, so it reads as intra-token and the
-    backward scan extends past the governing preposition, suppressing a
-    real snapshot; the edge is simply not retired this cycle. Pinned by
-    test_intra_token_dot_narrowing_costs_only_under_selection in
+    Cost (fail-safe, under-selection): a genuine sentence break with no
+    following space AND a following alphanumeric — 'Reviews for the branch
+    are done.Then tasks 1020 and 1030 are pending.', or the same with '?' —
+    reads as token-internal, so the backward scan extends past the governing
+    preposition and suppresses a real snapshot; the edge is simply not
+    retired this cycle. Pinned by
+    test_token_internal_break_narrowing_costs_only_under_selection in
     test_stale_status_snapshot_edge_sweep.py.
     """
-    return (
+    if (
         index > 0
         and text[index - 1].isalnum()
         and index + 1 < len(text)
         and text[index + 1].isalnum()
-    )
+    ):
+        return True
+    return text[index] == ';' and _HTML_ENTITY_HEAD_RE.search(
+        text, max(0, index - _HTML_ENTITY_HEAD_MAX_LEN), index
+    ) is not None
 
 
 def _last_clause_break(prefix: str) -> int:
     """Index of the last sentence-plausible clause break in *prefix*, or -1.
 
-    ';', '!' and '?' are treated as unconditional breaks; only '.' gets
-    the occurrence-level flanking test below, because that is where
-    over-selection was measured and closed — see the _CLAUSE_BREAK_CHARS
-    comment block above for the known, still-open '?'/';' exception this
-    leaves. '.' additionally requires that the occurrence not be an
-    intra-token dot (see ``_is_intra_token_dot``); when it is, the walk
-    retries at the next '.' to its left, stopping once it reaches or passes
-    ``hard`` (the last unconditional break), since nothing further left
-    could still change the answer. ``dot`` strictly decreases and each
-    ``rfind`` resumes where the previous stopped, so the walk is
-    O(len(prefix)) overall — no slicing, matching the cost property
-    ``_enumeration_is_prepositional_complement`` documents. (task 4149)
+    Every member of ``CLAUSE_BREAK_CHARS`` counts only where the occurrence
+    is not token-internal (see ``is_token_internal_break``). The walk keeps
+    one cursor per break character and repeatedly takes the rightmost; when
+    that occurrence is token-internal, only its own cursor moves left, to the
+    previous occurrence of the same character. Each cursor only moves left
+    and each ``rfind`` resumes where that cursor's previous one stopped, so
+    the walk is O(len(prefix)) overall — no slicing, matching the cost
+    property ``_enumeration_is_prepositional_complement`` documents.
+    (tasks 4149, 4851)
     """
-    hard = max((prefix.rfind(c) for c in _CLAUSE_BREAK_CHARS if c != '.'), default=-1)
-    dot = prefix.rfind('.')
-    while dot > hard and _is_intra_token_dot(prefix, dot):
-        dot = prefix.rfind('.', 0, dot)
-    return max(hard, dot)
+    cursors = {c: prefix.rfind(c) for c in CLAUSE_BREAK_CHARS}
+    while True:
+        char, cursor = max(cursors.items(), key=lambda item: item[1])
+        if cursor < 0 or not is_token_internal_break(prefix, cursor):
+            return cursor
+        cursors[char] = prefix.rfind(char, 0, cursor)
 
 
 _ENUM_PREP_WORD_RE: re.Pattern[str] = re.compile(
@@ -912,7 +934,7 @@ def _build_snapshot_patterns(
     drift structurally impossible: every guard tasks 2613 / 3042 / 3079 /
     3403 / 4149 bought (transitive-verb, negation and past-exit,
     intervening-task-reference, prepositional-complement subjecthood,
-    possessive quantifiers, intra-token-dot narrowing) is written once and
+    possessive quantifiers, token-internal-break narrowing) is written once and
     applies to both families by construction.
 
     Args:
@@ -1344,9 +1366,9 @@ def extract_blocked_assertion_task_ids(fact: str | None) -> set[int]:
     ``_build_snapshot_patterns`` with nesting marker alternations. Shared
     patterns do not share the rejected-span suppression, which is algorithm
     data computed per family. The containment holds because
-    ``extract_snapshot_edge_task_ids_by_marker_class`` threads the union
-    family's rejected spans into this family's call and intersects the result
-    at the seam; see there. (amendment, reviewer_comprehensive
+    ``_ids_within_union`` threads the union family's rejected spans into this
+    family's call and intersects the result at the seam; see there.
+    (amendment, reviewer_comprehensive
     correctness-over-selection finding, task 3037)
 
     ONE guard is blocked-family-only, and it too narrows: an aggregate list
@@ -1386,8 +1408,7 @@ class SnapshotEdgeIds(NamedTuple):
 
     ``blocked_ids`` is always a SUBSET of ``all_ids``. NOT because the
     families' marker alternations nest — that was the original claim and it
-    was measured FALSE — but because
-    ``extract_snapshot_edge_task_ids_by_marker_class`` threads the union
+    was measured FALSE — but because ``_ids_within_union`` threads the union
     family's rejected spans into the blocked call and then intersects the two
     sets at the seam. See that function for both mechanisms and for why
     pattern nesting is not sufficient. (amendment, reviewer_comprehensive
@@ -1446,9 +1467,50 @@ def extract_snapshot_edge_task_ids_by_marker_class(fact: str | None) -> Snapshot
     union = _extract_ids(fact, _UNION_PATTERNS)
     if not _BLOCKED_MARKER_RE.search(fact):
         return SnapshotEdgeIds(all_ids=union.ids, blocked_ids=set())
+    return SnapshotEdgeIds(
+        all_ids=union.ids,
+        blocked_ids=_ids_within_union(fact, _BLOCKED_PATTERNS, union),
+    )
 
+
+def extract_marker_task_ids(
+    fact: str | None, adjective_alt: str | None, transitive_alt: str | None,
+) -> set[int]:
+    """The ids *fact* asserts under ONE marker alternation. (task 4851)
+
+    The family is built by the shipped builder from alternations shaped like
+    ``_ADJECTIVE_MARKER_ALT`` / ``_TRANSITIVE_MARKER_ALT``, so it carries every
+    shipped guard. Its ids pass the same union seam as
+    ``SnapshotEdgeIds.blocked_ids``, which keeps them a subset of
+    ``extract_snapshot_edge_task_ids(fact)``. A reporting seam for probes that
+    ask which ids a fact asserts as, say, pending; selection itself reads
+    ``extract_snapshot_edge_task_ids_by_marker_class``.
+
+    Pure: no I/O, no side effects.
+    """
+    fact = fact or ''
+    if not SNAPSHOT_STATUS_RE.search(fact):
+        return set()
+    union = _extract_ids(fact, _UNION_PATTERNS)
+    return _ids_within_union(fact, _marker_family(adjective_alt, transitive_alt), union)
+
+
+@functools.cache
+def _marker_family(adjective_alt: str | None, transitive_alt: str | None) -> _SnapshotPatterns:
+    return _build_snapshot_patterns(adjective_alt, transitive_alt)
+
+
+def _ids_within_union(
+    fact: str, family: _SnapshotPatterns, union: _ExtractionResult,
+) -> set[int]:
+    """*family*'s ids on an already-gated *fact*, inside the union family's result.
+
+    THE seam every narrower family passes through — the blocked family and
+    ``extract_marker_task_ids`` alike — so a narrower family can never assert
+    an id the union family did not.
+    """
     # THREAD the union family's prepositional-complement rejections into the
-    # blocked family. A rejected span is, by construction, a region
+    # narrower family. A rejected span is, by construction, a region
     # established to be a PREPOSITION'S COMPLEMENT, so no id inside it is the
     # copula's subject — whichever family, and whichever pattern, found it.
     # That is verbatim the argument _extract_ids already gives for applying a
@@ -1470,29 +1532,25 @@ def extract_snapshot_edge_task_ids_by_marker_class(fact: str | None) -> Snapshot
     # status attributed to a subject the fact never made a claim about.
     # (amendment, reviewer_comprehensive correctness-over-selection finding,
     # task 3037)
-    blocked = _extract_ids(
-        fact, _BLOCKED_PATTERNS, inherited_rejected_spans=union.rejected_spans,
+    narrowed = _extract_ids(
+        fact, family, inherited_rejected_spans=union.rejected_spans,
     )
-
-    return SnapshotEdgeIds(
-        all_ids=union.ids,
-        # INTERSECT AT THE SEAM. Be honest about what this is: with the
-        # threading above in place it is MEASURED to be a no-op across the
-        # whole 800-fact _SUBSET_PROPERTY_CORPUS, so it is NOT the fix — it is
-        # what makes this NamedTuple's containment claim true BY CONSTRUCTION
-        # rather than by argument, at the cost of one set intersection on the
-        # small minority of edges that clear the _BLOCKED_MARKER_RE pre-gate.
-        #
-        # It exists because the ORIGINAL 'by construction' argument (the
-        # marker alternations nest, therefore the results nest) is UNSOUND for
-        # regex families in general, independently of the bug above:
-        # finditer is non-overlapping, so narrowing an alternation can delete
-        # an earlier match and thereby UNSHADOW a later one the wider family
-        # never reported. The intersection bounds that entire class of future
-        # surprise in the safe direction — under-selection self-heals on the
-        # next cycle, over-selection retires a live edge forever.
-        blocked_ids=blocked.ids & union.ids,
-    )
+    # INTERSECT AT THE SEAM. Be honest about what this is: with the
+    # threading above in place it is MEASURED to be a no-op across the
+    # whole 800-fact _SUBSET_PROPERTY_CORPUS, so it is NOT the fix — it is
+    # what makes SnapshotEdgeIds' containment claim true BY CONSTRUCTION
+    # rather than by argument, at the cost of one set intersection on the
+    # small minority of edges that clear the _BLOCKED_MARKER_RE pre-gate.
+    #
+    # It exists because the ORIGINAL 'by construction' argument (the
+    # marker alternations nest, therefore the results nest) is UNSOUND for
+    # regex families in general, independently of the bug above:
+    # finditer is non-overlapping, so narrowing an alternation can delete
+    # an earlier match and thereby UNSHADOW a later one the wider family
+    # never reported. The intersection bounds that entire class of future
+    # surprise in the safe direction — under-selection self-heals on the
+    # next cycle, over-selection retires a live edge forever.
+    return narrowed.ids & union.ids
 
 
 class _ExtractionResult(NamedTuple):
@@ -1590,7 +1648,7 @@ def _extract_ids(
     rejections ANOTHER family already established on the same fact, and the
     returned ``rejected_spans`` carries this family's own on top of them.
     That threading is load-bearing, not an optimisation — see
-    ``extract_snapshot_edge_task_ids_by_marker_class``, and the warning about
+    ``_ids_within_union``, and the warning about
     per-family algorithm data in this module's docstring. Sharing the pattern
     BUILDER does not share this: ``rejected_spans`` is computed here, per
     call, from THIS family's own ``plural_enum`` matches, so a span the union
@@ -1847,7 +1905,10 @@ def select_stale_status_snapshot_edges(
     became blocked, and — because rule 1 reads union ids — a blocked-status
     trigger there could fire on an id some OTHER marker contributed. Rule 2
     reads only the ids the fact asserts as blocked, which is exactly its
-    scope.
+    scope. The general rule (any asserted status contradicted by the live
+    one) was measured by task 4851 and not adopted; 'active' and 'stalled'
+    have no ``TaskStatus`` counterpart to contradict, so they remain
+    terminal-rule-only — see ``plans/stale-status-snapshot-sweep-report.md``.
 
     Invalidate-only-on-positively-known, throughout: an id absent from
     *statuses*, or mapped to a value outside the closed
@@ -2088,47 +2149,100 @@ async def sweep_stale_status_snapshot_edges(
     no backend calls. When enumeration yields no candidate ids at all,
     ``taskmaster.get_statuses`` is never called.
     """
-    stats = {
-        'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 0,
-        'superseded': 0, 'supersede_errors': 0, 'supersede_skipped': 0,
-        # Seeded UNKNOWN, not True: neither key is a count, and until the
-        # enumeration has actually returned nothing has been proven about the
-        # corpus. Every early return below therefore reports the honest
-        # 'no corpus observed' rather than a fabricated clean read. (task 4386)
-        'enumeration_complete': None, 'enumeration_incomplete_kind': None,
-    }
+    return await _sweep_status_snapshot_edges(
+        memory_service, taskmaster, project_id, project_root,
+        task_id=None, run_id=run_id, now=now, log=log,
+    )
 
-    if not taskmaster or not project_root:
-        return stats
 
+async def sweep_stale_status_snapshot_edges_for_task(
+    memory_service,
+    taskmaster,
+    project_id: str,
+    project_root: str,
+    task_id: int,
+    *,
+    run_id: str,
+    now: datetime | None = None,
+    log: logging.Logger = logger,
+) -> dict:
+    """Sweep only the status-snapshot edges that name *task_id*. (task 4851)
+
+    A LATENCY complement to ``sweep_stale_status_snapshot_edges``, not a
+    coverage one: the same selection rules and the same fail-safe, retiring
+    an edge only on a status positively known from a LIVE
+    ``taskmaster.get_statuses`` read, never from a transition payload. What
+    it misses, the next periodic cycle still retires.
+
+    The read is ``enumerate_valid_edges_mentioning(str(task_id))``, a
+    digit-substring SUPERSET ('1420', dates), made exact by keeping only the
+    edges whose extracted ids contain *task_id*. An aggregate edge naming
+    *task_id* is judged on ALL its ids, exactly as the periodic sweep would
+    judge it.
+
+    Its cost depends on the id. A multi-digit id reads a handful of rows; a
+    one- or two-digit id, or one that also occurs in dates, reads a sizeable
+    fraction of the corpus (row counts in plans/falkordb-resultset-cap-audit.md).
+    That is accepted because it is bounded by the periodic sweep's full read,
+    runs off any request path, and never overlaps another sweep of the
+    project (``_sweep_lock_for``), so a cascade of transitions queues rather
+    than stacks.
+
+    Arguments, the best-effort contract and the returned stats are those of
+    ``sweep_stale_status_snapshot_edges``, except that ``scanned`` counts the
+    edges the narrowed read returned.
+    """
+    return await _sweep_status_snapshot_edges(
+        memory_service, taskmaster, project_id, project_root,
+        task_id=task_id, run_id=run_id, now=now, log=log,
+    )
+
+
+class _CorpusRead(NamedTuple):
+    """What one sweep read observed. ``edges`` is None when nothing may be swept."""
+
+    edges: list[dict] | None
+    complete: bool | None
+    incomplete_kind: str | None
+
+
+async def _read_corpus(
+    memory_service, project_id: str, task_id: int | None, *, log: logging.Logger,
+) -> _CorpusRead:
+    """THE READ: every valid edge, or only those whose fact contains *task_id*.
+
+    Completeness is reported even when the policy aborts the read, and that
+    is load-bearing: ``apply_incompleteness_policy`` RAISES on a structural
+    incompleteness, and an aborted cycle that reported only errors=1 would
+    leave the operator reconstructing the cause from logs — the exact
+    reconstruction the signal exists to remove. (task 4386)
+
+    ``enumerate_*`` NEVER raises — it reports incompleteness as a value — so
+    the fail-closed structural guard has to be applied here, or a page-capped
+    read is taken for the whole corpus and every edge the missing pages carry
+    is scanned as absent: a silently clean cycle that retires nothing. It is
+    deliberately inside the same try, so a structural incompleteness lands in
+    the one handler (``IncompleteEnumerationError`` subclasses ``Exception``
+    precisely so it is caught). An EMPIRICAL incompleteness only warns —
+    through the sweep's injected ``log``, so the message surfaces with the
+    rest of the cycle's diagnostics — and the sweep proceeds on what it got.
+    """
+    method = (
+        'enumerate_all_valid_edges' if task_id is None
+        else 'enumerate_valid_edges_mentioning'
+    )
+    paged = None
     try:
-        grouped, paged = await memory_service.graphiti.enumerate_all_valid_edges(
-            group_id=project_id,
-        )
-        # Recorded BEFORE the policy is applied, and the ordering is
-        # load-bearing: apply_incompleteness_policy RAISES on a structural
-        # incompleteness, so assigning after it would leave the aborted cycle
-        # reporting errors=1 with no stated reason and the operator
-        # reconstructing the cause from logs — the exact reconstruction this
-        # signal exists to remove. (task 4386)
-        stats['enumeration_complete'] = paged.complete
-        stats['enumeration_incomplete_kind'] = paged.incomplete_kind
-        # ``enumerate_*`` NEVER raises — it reports incompleteness as a value —
-        # so the fail-closed structural guard the ``get_all_valid_edges`` shim
-        # applied on this sweep's behalf has to be re-applied here, or a
-        # page-capped read is taken for the whole corpus and every edge the
-        # missing pages carry is scanned as absent: a silently clean cycle that
-        # retires nothing. Deliberately INSIDE the same try, so a structural
-        # incompleteness lands in the existing handler below exactly as the
-        # shim's raise did (``IncompleteEnumerationError`` subclasses
-        # ``Exception``, never ``BaseException``, precisely so it is caught
-        # here). An EMPIRICAL incompleteness only warns — through this sweep's
-        # injected ``log``, so the one message about a truncated corpus
-        # surfaces with the rest of the cycle's diagnostics — and the sweep
-        # proceeds on what it did get. (task 4386)
+        graphiti = memory_service.graphiti
+        if task_id is None:
+            grouped, paged = await graphiti.enumerate_all_valid_edges(group_id=project_id)
+        else:
+            grouped, paged = await graphiti.enumerate_valid_edges_mentioning(
+                str(task_id), group_id=project_id,
+            )
         apply_incompleteness_policy(
             paged,
-            method='enumerate_all_valid_edges',
+            method=method,
             group_id=project_id,
             returned_count=len(grouped),
             noun='entities',
@@ -2139,15 +2253,103 @@ async def sweep_stale_status_snapshot_edges(
         raise
     except Exception:
         log.exception(
-            'stale_status_snapshot_edge_sweep: enumerate_all_valid_edges failed for '
-            'group_id=%s',
-            project_id,
+            'stale_status_snapshot_edge_sweep: %s failed for group_id=%s',
+            method, project_id,
         )
+        if paged is None:
+            return _CorpusRead(None, None, None)
+        return _CorpusRead(None, paged.complete, paged.incomplete_kind)
+    return _CorpusRead(flatten_dedup_edges(grouped), paged.complete, paged.incomplete_kind)
+
+
+# Per event loop, per canonical project: the lock that keeps two sweeps of one
+# project from overlapping. See ``_sweep_lock_for``.
+_SWEEP_LOCKS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
+] = weakref.WeakKeyDictionary()
+
+
+def _sweep_lock_for(project_id: str) -> asyncio.Lock:
+    """The lock every sweep of *project_id* holds, on the running loop. (task 4851)
+
+    One superseding fact per contradicted task holds only if each sweep READS
+    after the previous one's retirements: a retired edge stops enumerating,
+    and that is the whole dedup. Overlapping sweeps of one project would both
+    read the same still-valid edge, both retire it and both write its facts —
+    a cancellation cascade starts one targeted sweep per task without awaiting
+    any, and a full cycle's Stage-1 sweep can start beside them.
+
+    Keyed by the canonical project id, as the graph itself is, and by event
+    loop, because an ``asyncio.Lock`` binds to the first loop that waits on
+    it. Serializes within one process only, which is where both callers run.
+    """
+    locks = _SWEEP_LOCKS.setdefault(asyncio.get_running_loop(), {})
+    key = canonicalize_project_id(project_id)
+    lock = locks.get(key)
+    if lock is None:
+        lock = locks[key] = asyncio.Lock()
+    return lock
+
+
+def _seed_stats() -> dict:
+    return {
+        'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 0,
+        'superseded': 0, 'supersede_errors': 0, 'supersede_skipped': 0,
+        # Seeded UNKNOWN, not True: neither key is a count, and until the
+        # enumeration has actually returned nothing has been proven about the
+        # corpus. Every early return therefore reports the honest 'no corpus
+        # observed' rather than a fabricated clean read. (task 4386)
+        'enumeration_complete': None, 'enumeration_incomplete_kind': None,
+    }
+
+
+async def _sweep_status_snapshot_edges(
+    memory_service,
+    taskmaster,
+    project_id: str,
+    project_root: str,
+    *,
+    task_id: int | None,
+    run_id: str,
+    now: datetime | None,
+    log: logging.Logger,
+) -> dict:
+    """The one core behind both public sweeps, one sweep per project at a time.
+
+    *task_id* is consulted in exactly two places: THE READ
+    (``_read_corpus``) and THE POST-FILTER right after the single extraction
+    pass. Everything else — the status census, selection, the counted
+    invalidation loop, the supersede ceiling and the stats — is shared, and
+    runs under ``_sweep_lock_for(project_id)``. (task 4851)
+    """
+    if not taskmaster or not project_root:
+        return _seed_stats()
+    async with _sweep_lock_for(project_id):
+        return await _sweep_under_lock(
+            memory_service, taskmaster, project_id, project_root,
+            task_id=task_id, run_id=run_id, now=now, log=log,
+        )
+
+
+async def _sweep_under_lock(
+    memory_service,
+    taskmaster,
+    project_id: str,
+    project_root: str,
+    *,
+    task_id: int | None,
+    run_id: str,
+    now: datetime | None,
+    log: logging.Logger,
+) -> dict:
+    stats = _seed_stats()
+    corpus = await _read_corpus(memory_service, project_id, task_id, log=log)
+    stats['enumeration_complete'] = corpus.complete
+    stats['enumeration_incomplete_kind'] = corpus.incomplete_kind
+    if corpus.edges is None:
         stats['errors'] += 1
         return stats
-
-    edges = flatten_dedup_edges(grouped)
-    stats['scanned'] = len(edges)
+    stats['scanned'] = len(corpus.edges)
 
     # Extract each edge's ids exactly once — ONE by-class pass per edge
     # yielding BOTH id sets, reused below to build candidate_ids and (via
@@ -2157,11 +2359,19 @@ async def sweep_stale_status_snapshot_edges(
     # finding, task 2613; extended to the blocked family, task 3037)
     by_class = {
         edge['uuid']: extract_snapshot_edge_task_ids_by_marker_class(edge.get('fact'))
-        for edge in edges
+        for edge in corpus.edges
     }
-    edge_ids: dict[str, set[int]] = {uuid: ids.all_ids for uuid, ids in by_class.items()}
+    edges = corpus.edges
+    if task_id is not None:
+        # THE POST-FILTER: the narrowed read is a digit-substring superset, so
+        # keep only edges that really name the task, judged from the SAME
+        # extraction pass. (task 4851)
+        edges = [edge for edge in edges if task_id in by_class[edge['uuid']].all_ids]
+    edge_ids: dict[str, set[int]] = {
+        edge['uuid']: by_class[edge['uuid']].all_ids for edge in edges
+    }
     blocked_edge_ids: dict[str, set[int]] = {
-        uuid: ids.blocked_ids for uuid, ids in by_class.items()
+        edge['uuid']: by_class[edge['uuid']].blocked_ids for edge in edges
     }
 
     # The census must cover BOTH maps' ids. blocked_ids is a subset of
@@ -2247,17 +2457,20 @@ async def sweep_stale_status_snapshot_edges(
         # cycle for as long as the invalidation kept failing — and would
         # meanwhile leave the graph asserting both that the task is blocked
         # (the edge is still valid) and that it is not.
-        for task_id in sorted(blocked_edge_ids.get(edge['uuid'], set())):
-            status = statuses.get(str(task_id))
-            if not is_blocked_assertion_contradicted(status) or task_id in superseded_ids:
+        for contradicted_id in sorted(blocked_edge_ids.get(edge['uuid'], set())):
+            status = statuses.get(str(contradicted_id))
+            if (
+                not is_blocked_assertion_contradicted(status)
+                or contradicted_id in superseded_ids
+            ):
                 continue
             if supersede_attempts >= _MAX_SUPERSEDE_WRITES_PER_CYCLE:
-                supersede_skipped_ids.add(task_id)
+                supersede_skipped_ids.add(contradicted_id)
                 continue
             supersede_attempts += 1
             try:
                 await memory_service.add_memory(
-                    content=build_supersede_fact(task_id, status, invalidate_at),
+                    content=build_supersede_fact(contradicted_id, status, invalidate_at),
                     category='temporal_facts',
                     project_id=project_id,
                     agent_id=_SWEEP_AGENT_ID,
@@ -2265,14 +2478,14 @@ async def sweep_stale_status_snapshot_edges(
                 )
                 stats['superseded'] += 1
                 # Marked as done only HERE — see superseded_ids' comment.
-                superseded_ids.add(task_id)
+                superseded_ids.add(contradicted_id)
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
             except Exception:
                 log.exception(
                     'stale_status_snapshot_edge_sweep: add_memory supersede failed '
                     'for task_id=%s (edge uuid=%s already invalidated)',
-                    task_id, edge['uuid'],
+                    contradicted_id, edge['uuid'],
                 )
                 stats['supersede_errors'] += 1
 

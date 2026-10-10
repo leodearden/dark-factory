@@ -1293,6 +1293,9 @@ class MemoryConsolidator(BaseStage):
         # `..._enumeration_incomplete_kind` names which way it was partial.
         # Two additions, one pattern — 0-vs-N ambiguities resolved in the
         # stats rather than left for a reader to reconstruct from logs.
+        # The `_candidates`/`_errors` pair closes the last one (task 4851):
+        # `_invalidated` alone cannot tell "nothing was stale" from "every
+        # invalidation failed".
         # Best-effort: a sweep failure must never abort the stage or leave a
         # partial/incorrect stat — it is logged and swallowed, and NONE of
         # these stats is set for this cycle.  That includes the enumeration
@@ -1319,6 +1322,12 @@ class MemoryConsolidator(BaseStage):
             )
             report.stats['stale_status_snapshot_edges_scanned'] = (
                 snapshot_sweep_stats['scanned']
+            )
+            report.stats['stale_status_snapshot_edges_candidates'] = (
+                snapshot_sweep_stats['candidate_edges']
+            )
+            report.stats['stale_status_snapshot_edges_errors'] = (
+                snapshot_sweep_stats['errors']
             )
             report.stats['stale_blocked_edges_superseded'] = (
                 snapshot_sweep_stats['superseded']

@@ -642,13 +642,22 @@ _ALL_VALID_EDGES_MATCH = (
     'MATCH (n:Entity)-[e:RELATES_TO]-() '
     'WHERE e.invalid_at IS NULL '
 )
-_ALL_VALID_EDGES_PAGE_TEMPLATE = (
-    _ALL_VALID_EDGES_MATCH
-    + 'RETURN n.uuid, e.uuid, e.fact, e.name '
+_VALID_EDGE_ROWS_PAGE_TAIL = (
+    'RETURN n.uuid, e.uuid, e.fact, e.name '
     'ORDER BY e.uuid, n.uuid '
     'SKIP {skip} LIMIT {limit}'
 )
+_ALL_VALID_EDGES_PAGE_TEMPLATE = _ALL_VALID_EDGES_MATCH + _VALID_EDGE_ROWS_PAGE_TAIL
 _ALL_VALID_EDGES_CENSUS = _ALL_VALID_EDGES_MATCH + 'RETURN count(*)'
+
+# The same population narrowed to facts containing a BOUND substring.
+_VALID_EDGES_MENTIONING_MATCH = (
+    _ALL_VALID_EDGES_MATCH + 'AND e.fact CONTAINS $substring '
+)
+_VALID_EDGES_MENTIONING_PAGE_TEMPLATE = (
+    _VALID_EDGES_MENTIONING_MATCH + _VALID_EDGE_ROWS_PAGE_TAIL
+)
+_VALID_EDGES_MENTIONING_CENSUS = _VALID_EDGES_MENTIONING_MATCH + 'RETURN count(*)'
 
 # Entity nodes. Here `n.uuid` alone IS a total order — one row per node, and
 # node uuids are unique — unlike the edge case above.
@@ -2801,32 +2810,90 @@ class GraphitiBackend:
             _ALL_VALID_EDGES_CENSUS,
             page_size=page_size,
         )
-        # The dedup map is built ONCE across every page, never per page: the
-        # same (n.uuid, e.uuid) pair can straddle a page boundary, and a
-        # per-page map would let the repeat through and double-count the edge.
+        return self._group_valid_edge_rows(
+            paged.rows, reader='enumerate_all_valid_edges'
+        ), paged
+
+    @_canonicalize_group_args
+    async def enumerate_valid_edges_mentioning(
+        self,
+        substring: str,
+        *,
+        group_id: str,
+        page_size: int = _DEFAULT_READ_PAGE_SIZE,
+    ) -> tuple[dict[str, list[EdgeDict]], PagedRead]:
+        """``enumerate_all_valid_edges`` narrowed to facts containing *substring*.
+
+        A task-agnostic candidate-NARROWING primitive, in the sense of
+        ``find_entity_nodes_by_name_substring``: it returns a SUPERSET (a
+        digit needle also matches '14201' or a date), and the CALLER applies
+        its precise membership test. The needle is bound as ``$substring``,
+        never interpolated.
+
+        Paged rather than single-shot, unlike that sibling: an unselective
+        needle can exceed the server's row cap, and the shared ``ORDER BY``
+        is the total row order paging needs. Measured row counts live in
+        plans/falkordb-resultset-cap-audit.md.
+
+        Like ``enumerate_all_valid_edges`` it NEVER raises on incompleteness;
+        it reports it, and applying ``apply_incompleteness_policy`` is the
+        caller's job.
+
+        Raises:
+            ValueError: *substring* is empty. An empty CONTAINS matches every
+                edge, silently turning the narrowed read into a full one.
+        """
+        if not substring:
+            raise ValueError(
+                'enumerate_valid_edges_mentioning needs a non-empty substring: '
+                f'an empty one matches every valid edge (got {substring!r})'
+            )
+        graph = self._graph_for(group_id)
+        paged = await _paged_ro_query(
+            graph,
+            _VALID_EDGES_MENTIONING_PAGE_TEMPLATE,
+            _VALID_EDGES_MENTIONING_CENSUS,
+            params={'substring': substring},
+            page_size=page_size,
+        )
+        return self._group_valid_edge_rows(
+            paged.rows, reader='enumerate_valid_edges_mentioning'
+        ), paged
+
+    def _group_valid_edge_rows(
+        self, rows: list[list], *, reader: str
+    ) -> dict[str, list[EdgeDict]]:
+        """Group (n.uuid, e.uuid, fact, name) rows by entity, deduped on the pair.
+
+        The dedup map is built ONCE across every page, never per page: the
+        same (n.uuid, e.uuid) pair can straddle a page boundary, and a
+        per-page map would let the repeat through and double-count the edge.
+        See ``get_all_valid_edges`` for why the pair is the right key.
+        """
         seen: dict[tuple[str, str], EdgeDict] = {}
         grouped: dict[str, list[EdgeDict]] = {}
-        for row in paged.rows:
+        for row in rows:
             entity_uuid, edge_uuid = row[0], row[1]
             key = (entity_uuid, edge_uuid)
             if key in seen:
                 # Diagnostic only: see get_valid_edges_for_node — the same
-                # uuid-uniqueness invariant underpins this method's dedup key.
+                # uuid-uniqueness invariant underpins this dedup key.
                 dup = self._edge_dict(row[1], row[2], row[3])
                 prior = seen[key]
                 if dup['fact'] != prior['fact'] or dup['name'] != prior['name']:
                     logger.debug(
-                        'get_all_valid_edges: (entity, edge) pair %s seen again '
+                        '%s: (entity, edge) pair %s seen again '
                         'with differing fact/name (kept fact=%r name=%r, saw '
                         'fact=%r name=%r) — uuid-uniqueness invariant may be '
                         'violated; keeping first-seen row',
-                        key, prior['fact'], prior['name'], dup['fact'], dup['name'],
+                        reader, key, prior['fact'], prior['name'],
+                        dup['fact'], dup['name'],
                     )
                 continue
             edge = self._edge_dict(row[1], row[2], row[3])
             seen[key] = edge
             grouped.setdefault(entity_uuid, []).append(edge)
-        return grouped, paged
+        return grouped
 
     @_canonicalize_group_args
     async def get_all_valid_edges(self, *, group_id: str) -> dict[str, list[EdgeDict]]:
