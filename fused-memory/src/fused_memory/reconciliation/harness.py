@@ -49,6 +49,7 @@ from fused_memory.reconciliation.active_runs import ActiveRunRegistry
 from fused_memory.reconciliation.backlog_policy import BacklogPolicy
 from fused_memory.reconciliation.cli_stage_runner import (
     gc_run_config_dir,
+    recon_archive_root,
     run_config_dir_path,
 )
 from fused_memory.reconciliation.drained_event_restore import (
@@ -2128,7 +2129,10 @@ class ReconciliationHarness:
         # session-resume depends on is destroyed and resume has nothing to
         # resume from.
         try:
-            gc_run_config_dir(self.journal.data_dir, run.id)
+            gc_run_config_dir(
+                self.journal.data_dir, run.id,
+                archive_root=recon_archive_root(self.config),
+            )
         except Exception as gc_err:  # noqa: BLE001
             logger.warning(
                 'gc_run_config_dir failed for recovered run %s: %r', run.id, gc_err
@@ -4439,7 +4443,8 @@ class ReconciliationHarness:
         cancellation still propagates
         (``tests/test_harness.py::test_run_full_cycle_finally_gcs_config_dir_despite_a_second_cancellation``).
         An interrupted run keeps its dir for the startup ``--resume`` pass
-        (task σ). A GC failure is logged, never raised.
+        (task σ); its stage transcripts were already copied to the archive by
+        ``stages/base.py::BaseStage.run``. A GC failure is logged, never raised.
         """
         stage_reports_write = asyncio.ensure_future(
             self.journal.update_run_stage_reports(run.id, run.stage_reports)
@@ -4452,7 +4457,10 @@ class ReconciliationHarness:
         finally:
             if run.status != RunStatus.interrupted:
                 try:
-                    gc_run_config_dir(self.journal.data_dir, run.id)
+                    gc_run_config_dir(
+                        self.journal.data_dir, run.id,
+                        archive_root=recon_archive_root(self.config),
+                    )
                 except Exception as gc_err:  # noqa: BLE001
                     logger.warning(
                         'gc_run_config_dir failed for %s run %s: %r',
