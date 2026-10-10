@@ -421,7 +421,7 @@ class TestCommittedDarkFactoryCalibration:
         assert _df_report()['provenance']['per_category_pair_counts'] == recomputed
 
     def test_both_target_categories_have_an_outcome(self) -> None:
-        assert TARGET_CATEGORIES <= set(_df_report()['per_category'])
+        assert set(_df_report()['per_category']) >= TARGET_CATEGORIES
 
     @pytest.mark.parametrize('category', sorted(TARGET_CATEGORIES))
     def test_a_category_derives_a_separating_cutoff_or_states_a_measured_refusal(
