@@ -21,9 +21,13 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
+from _jsonl_fixture import parse_jsonl_fixture
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'calibrate_write_triage.py'
 FIXTURE_PATH = Path(__file__).parent / 'fixtures' / 'write_triage_calibration.jsonl'
+DARK_FACTORY_FIXTURE_PATH = (
+    Path(__file__).parent / 'fixtures' / 'write_triage_calibration_dark_factory.jsonl'
+)
 
 UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
 
@@ -56,22 +60,18 @@ def _mod() -> types.ModuleType:
 
 @pytest.fixture(scope='module')
 def records() -> list[dict]:
-    """Parse the committed fixture line-by-line.
+    """The reify fixture — the one the reify-specific rulings and counts pin."""
+    return parse_jsonl_fixture(FIXTURE_PATH)
 
-    Deliberately parsed here with the stdlib rather than through the
-    script's own load_fixture(), so a bug in the loader cannot mask a
-    defect in the data (and vice versa).
-    """
-    assert FIXTURE_PATH.exists(), f'fixture missing: {FIXTURE_PATH}'
-    out: list[dict] = []
-    for lineno, line in enumerate(FIXTURE_PATH.read_text().splitlines(), 1):
-        if not line.strip():
-            continue
-        try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError as exc:  # pragma: no cover - data defect
-            raise AssertionError(f'{FIXTURE_PATH}:{lineno} is not valid JSON: {exc}') from exc
-    return out
+
+@pytest.fixture(
+    scope='module',
+    params=[FIXTURE_PATH, DARK_FACTORY_FIXTURE_PATH],
+    ids=['reify', 'dark_factory'],
+)
+def fixture_records(request: pytest.FixtureRequest) -> list[dict]:
+    """Every committed curator fixture — the shape contract both must keep."""
+    return parse_jsonl_fixture(request.param)
 
 
 def _by_prefix(records: list[dict], prefix: str) -> list[dict]:
@@ -87,16 +87,16 @@ def _cluster(records: list[dict], canonical_prefix: str) -> list[dict]:
 class TestFixtureSchema:
     """Per-record shape. No total-count assertion — see fixtures/README.md."""
 
-    def test_fixture_is_non_empty(self, records: list[dict]) -> None:
-        assert records, 'fixture must carry at least one record'
+    def test_fixture_is_non_empty(self, fixture_records: list[dict]) -> None:
+        assert fixture_records, 'fixture must carry at least one record'
 
-    def test_every_record_has_a_full_uuid_memory_id(self, records: list[dict]) -> None:
-        bad = [r.get('memory_id') for r in records if not UUID_RE.match(str(r.get('memory_id')))]
+    def test_every_record_has_a_full_uuid_memory_id(self, fixture_records: list[dict]) -> None:
+        bad = [r.get('memory_id') for r in fixture_records if not UUID_RE.match(str(r.get('memory_id')))]
         assert not bad, f'memory_id must be a full 36-char UUID; got {bad[:5]}'
 
-    def test_every_record_has_non_empty_string_content(self, records: list[dict]) -> None:
+    def test_every_record_has_non_empty_string_content(self, fixture_records: list[dict]) -> None:
         bad = [
-            r['memory_id'] for r in records
+            r['memory_id'] for r in fixture_records
             if not isinstance(r.get('content'), str) or not r['content'].strip()
         ]
         assert not bad, (
@@ -104,35 +104,49 @@ class TestFixtureSchema:
             f'and tallied, never emitted with a placeholder; got {bad[:5]}'
         )
 
-    def test_every_record_has_a_string_category(self, records: list[dict]) -> None:
-        bad = [r['memory_id'] for r in records if not isinstance(r.get('category'), str)]
+    def test_every_record_has_a_string_category(self, fixture_records: list[dict]) -> None:
+        bad = [r['memory_id'] for r in fixture_records if not isinstance(r.get('category'), str)]
         assert not bad, f'category must be a str (it lives at metadata.category); got {bad[:5]}'
 
-    def test_every_record_has_a_full_uuid_cluster_id(self, records: list[dict]) -> None:
-        bad = [r.get('cluster_id') for r in records if not UUID_RE.match(str(r.get('cluster_id')))]
+    def test_every_record_has_a_full_uuid_cluster_id(self, fixture_records: list[dict]) -> None:
+        bad = [r.get('cluster_id') for r in fixture_records if not UUID_RE.match(str(r.get('cluster_id')))]
         assert not bad, (
             'cluster_id must be a full 36-char UUID (the CANONICAL memory id, '
             f'never the gate id); got {bad[:5]}'
         )
 
-    def test_every_record_has_a_known_label(self, records: list[dict]) -> None:
-        bad = {r['memory_id']: r.get('label') for r in records if r.get('label') not in VALID_LABELS}
+    def test_every_record_has_a_known_label(self, fixture_records: list[dict]) -> None:
+        bad = {r['memory_id']: r.get('label') for r in fixture_records if r.get('label') not in VALID_LABELS}
         assert not bad, f'label must be one of {sorted(VALID_LABELS)}; got {bad}'
 
-    def test_every_record_has_a_provenance_block(self, records: list[dict]) -> None:
-        for r in records:
+    def test_every_record_has_a_provenance_block(self, fixture_records: list[dict]) -> None:
+        for r in fixture_records:
             prov = r.get('provenance')
             assert isinstance(prov, dict), f'{r["memory_id"]}: provenance must be a dict'
             for key in ('gate_id', 'transcript_line', 'source'):
                 assert key in prov, f'{r["memory_id"]}: provenance missing {key!r}'
-            assert isinstance(prov['transcript_line'], int), (
-                f'{r["memory_id"]}: provenance.transcript_line must be an int'
+            assert prov['transcript_line'] is None or isinstance(prov['transcript_line'], int), (
+                f'{r["memory_id"]}: provenance.transcript_line must be an int or null'
             )
             assert str(prov['gate_id']).strip(), f'{r["memory_id"]}: provenance.gate_id is empty'
             assert str(prov['source']).strip(), f'{r["memory_id"]}: provenance.source is empty'
 
-    def test_optional_fields_are_present_and_correctly_typed(self, records: list[dict]) -> None:
-        for r in records:
+    def test_every_transcript_derived_record_names_its_line(self, records: list[dict]) -> None:
+        bad = {
+            r['memory_id']: r['provenance'].get('transcript_line') for r in records
+            if not (
+                isinstance(r['provenance'].get('transcript_line'), int)
+                and not isinstance(r['provenance']['transcript_line'], bool)
+                and r['provenance']['transcript_line'] >= 1
+            )
+        }
+        assert not bad, (
+            'every reify record was recovered from the curator session transcript, '
+            f'so its provenance.transcript_line must be an int >= 1; got {bad}'
+        )
+
+    def test_optional_fields_are_present_and_correctly_typed(self, fixture_records: list[dict]) -> None:
+        for r in fixture_records:
             for key in ('agent_id', 'created_at'):
                 assert key in r, f'{r["memory_id"]}: missing {key!r} (may be null, must be present)'
                 assert r[key] is None or isinstance(r[key], str), (
@@ -150,30 +164,30 @@ class TestClusterReferentialIntegrity:
     and manufacturing the very false positives this calibration measures.
     """
 
-    def test_memory_ids_are_unique(self, records: list[dict]) -> None:
-        dupes = [mid for mid, n in Counter(r['memory_id'] for r in records).items() if n > 1]
+    def test_memory_ids_are_unique(self, fixture_records: list[dict]) -> None:
+        dupes = [mid for mid, n in Counter(r['memory_id'] for r in fixture_records).items() if n > 1]
         assert not dupes, f'duplicate memory_id rows: {dupes}'
 
-    def test_every_cluster_id_resolves_to_a_present_canonical(self, records: list[dict]) -> None:
-        canonical_ids = {r['memory_id'] for r in records if r['label'] == 'canonical'}
+    def test_every_cluster_id_resolves_to_a_present_canonical(self, fixture_records: list[dict]) -> None:
+        canonical_ids = {r['memory_id'] for r in fixture_records if r['label'] == 'canonical'}
         dangling = sorted({
-            r['cluster_id'] for r in records if r['cluster_id'] not in canonical_ids
+            r['cluster_id'] for r in fixture_records if r['cluster_id'] not in canonical_ids
         })
         assert not dangling, (
             f'cluster_id values with no canonical record in the file: {dangling}'
         )
 
-    def test_every_cluster_contains_exactly_one_canonical(self, records: list[dict]) -> None:
+    def test_every_cluster_contains_exactly_one_canonical(self, fixture_records: list[dict]) -> None:
         per_cluster: dict[str, list[str]] = defaultdict(list)
-        for r in records:
+        for r in fixture_records:
             if r['label'] == 'canonical':
                 per_cluster[r['cluster_id']].append(r['memory_id'])
         offenders = {c: ids for c, ids in per_cluster.items() if len(ids) != 1}
         assert not offenders, f'clusters without exactly one canonical: {offenders}'
 
-    def test_each_canonical_is_a_member_of_its_own_cluster(self, records: list[dict]) -> None:
+    def test_each_canonical_is_a_member_of_its_own_cluster(self, fixture_records: list[dict]) -> None:
         offenders = [
-            r['memory_id'] for r in records
+            r['memory_id'] for r in fixture_records
             if r['label'] == 'canonical' and r['cluster_id'] != r['memory_id']
         ]
         assert not offenders, (

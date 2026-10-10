@@ -2535,6 +2535,32 @@ def _default_curator_usage_cap() -> UsageCapConfig:
 JudgeReasoningEffort = Literal['none', 'low', 'medium', 'high']
 
 
+def _require_cutoffs_in_unit_range(
+    value: dict[str, float], *, field_path: str,
+) -> dict[str, float]:
+    """Every per-category cutoff must lie in the cosine unit range, or none load.
+
+    Bounded at load rather than at the consumer because the failure would
+    otherwise be invisible until it changed what got DELETED: a cutoff of
+    42.0 matches nothing and a negative one matches everything, and either
+    surfaces as (un)deleted memories rather than as a config error.
+    Rejecting the whole map on one bad entry keeps a half-valid set of
+    cutoffs from gating a sweep.
+    """
+    out_of_range = {
+        category: cutoff for category, cutoff in value.items()
+        if not 0.0 <= cutoff <= 1.0
+    }
+    if out_of_range:
+        raise ValueError(
+            f'{field_path} cutoffs must lie in the cosine '
+            f'unit range [0.0, 1.0]; got {out_of_range!r}. This map is an '
+            'output of scripts/calibrate_write_triage.py — re-run it rather '
+            'than hand-editing.',
+        )
+    return value
+
+
 class WriteTriageConfig(BaseModel):
     """Server-owned band thresholds for add_memory write triage (task 3130).
 
@@ -2802,29 +2828,44 @@ class WriteTriageConfig(BaseModel):
     def _bound_per_category_cutoffs(
         cls, value: dict[str, float] | None,
     ) -> dict[str, float] | None:
-        """Every cutoff must lie in the cosine unit range, or none load.
-
-        Bounded here rather than at the consumer because the failure would
-        otherwise be invisible until it changed what got DELETED: a cutoff of
-        42.0 matches nothing and a negative one matches everything, and
-        either surfaces as (un)deleted memories rather than as a config
-        error. Rejecting the whole map on one bad entry keeps a half-valid
-        set of cutoffs from gating a sweep.
-        """
         if value is None:
             return None
-        out_of_range = {
-            category: cutoff for category, cutoff in value.items()
-            if not 0.0 <= cutoff <= 1.0
-        }
-        if out_of_range:
-            raise ValueError(
-                f'write_triage.t_high_by_category cutoffs must lie in the cosine '
-                f'unit range [0.0, 1.0]; got {out_of_range!r}. This map is an '
-                'output of scripts/calibrate_write_triage.py — re-run it rather '
-                'than hand-editing.',
-            )
-        return value
+        return _require_cutoffs_in_unit_range(
+            value, field_path='write_triage.t_high_by_category',
+        )
+
+
+class WriteTriageProjectCalibration(BaseModel):
+    """Per-PROJECT ANN cutoffs, measured on that project's own curator-labelled fixture.
+
+    One entry of `write_triage_project_calibrations`, keyed by project_id.
+    Written by scripts/calibrate_write_triage.py --write-project-config and read
+    only by scripts/audit_duplicate_memories.py for a run whose --project-id is
+    the key. The write path never reads it, and it is never pooled with
+    write_triage's reify-derived bands. The corpus each entry describes is
+    documented in fused-memory/tests/fixtures/README.md.
+    """
+
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+    calibration_report_path: str = Field(
+        description=(
+            'Package-relative path to the calibration report that derived these '
+            'cutoffs; its provenance.project_id is this entry\'s key.'
+        ),
+    )
+    t_high_by_category: dict[str, float] = Field(
+        description=(
+            'Per-Mem0-category deterministic cutoffs derived from this project\'s '
+            'own measured pairs. A category absent here falls back to '
+            'write_triage.t_high_by_category.'
+        ),
+    )
+
+    @field_validator('t_high_by_category')
+    @classmethod
+    def _bound_per_category_cutoffs(cls, value: dict[str, float]) -> dict[str, float]:
+        return _require_cutoffs_in_unit_range(value, field_path='t_high_by_category')
 
 
 class Mem0UpdateConfig(BaseModel):
@@ -3389,6 +3430,21 @@ class FusedMemoryConfig(BaseSettings):
     # reload.py descends only into required submodels, so nullability here would
     # cost the section its per-leaf hot-reload.
     write_triage: WriteTriageConfig = Field(default_factory=WriteTriageConfig)
+    # Top-level, NOT inside write_triage: calibrate_write_triage.py's pooled
+    # writer owns that block's span, so a nested key would be re-emitted among
+    # the hand-set knobs or dropped by a reify --write-config.
+    write_triage_project_calibrations: dict[str, WriteTriageProjectCalibration] = Field(
+        default_factory=dict,
+        description=(
+            'Per-project ANN cutoffs keyed by project_id. Written by '
+            'scripts/calibrate_write_triage.py --write-project-config. A project '
+            'ABSENT from this map has no project calibration; absence is the only '
+            'spelling of that. Read by scripts/audit_duplicate_memories.py '
+            'resolve_ann_threshold for the run\'s --project-id, ahead of '
+            'write_triage.t_high_by_category. Green-tier hot-reloadable as ONE '
+            'atomic leaf.'
+        ),
+    )
     # Bare submodel for the same per-leaf-reload reason as write_triage above.
     mem0_update: Mem0UpdateConfig = Field(default_factory=Mem0UpdateConfig)
     # Bare submodel for the same per-leaf-reload reason as write_triage above.
