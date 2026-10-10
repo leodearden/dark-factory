@@ -47,6 +47,12 @@ claimant_run_id alone, so a (NULL, heartbeat) residue is not a violation.
 is_stale_hygiene_tier_claimant(task, now, ttl) is D3's hygiene tier: a stale
 claimant on an allowlisted status (pending/deferred/review/merge-deferred),
 staleness read through is_stranded_any_status, disjoint from C4-E1.
+is_hygiene_tier_claimant(task) is the population that tier is drawn from (an
+allowlisted status carrying a claimant, fresh or stale); the stale tier is its
+subset.
+
+ledger_covers_claimant(task) is E-2's ledger_covers: metadata.claimant_exception
+names the claimant the row still carries. It is status-agnostic.
 """
 
 from __future__ import annotations
@@ -61,10 +67,12 @@ from shared.task_claimant import (
     DEFAULT_CLAIMANT_HEARTBEAT_TTL,
     compose_claimant_run_id,
     has_live_claimant,
+    is_hygiene_tier_claimant,
     is_stale_hygiene_tier_claimant,
     is_stranded,
     is_stranded_any_status,
     is_stranded_blocked,
+    ledger_covers_claimant,
     violates_terminal_claimant_invariant,
 )
 from shared.task_statuses import ACTIVE, TERMINAL, TaskStatus
@@ -581,10 +589,94 @@ class TestIsStaleHygieneTierClaimant:
         )
 
 
+class TestIsHygieneTierClaimant:
+    _FRESH = (_GRID_NOW - timedelta(minutes=1)).isoformat()
+    _STALE = (_GRID_NOW - timedelta(minutes=10)).isoformat()
+
+    @pytest.mark.parametrize(('status', 'expected'), list(_HYGIENE_EXPECTED.items()))
+    @pytest.mark.parametrize('heartbeat', [_FRESH, _STALE])
+    def test_membership_is_status_and_claimant_only(self, status, expected, heartbeat):
+        row = _row(status, 'run-x', heartbeat)
+        assert is_hygiene_tier_claimant(row) is expected
+
+    @pytest.mark.parametrize('claimant', [None, '   '])
+    def test_no_claimant_is_not_a_member(self, claimant):
+        assert is_hygiene_tier_claimant(_row('pending', claimant, self._FRESH)) is False
+
+    @pytest.mark.parametrize(
+        'row',
+        [
+            _row(status, claimant, heartbeat)
+            for status, claimant, heartbeat in itertools.product(
+                list(TaskStatus), [None, '   ', 'run-x'], [_FRESH, _STALE, None]
+            )
+        ],
+    )
+    def test_stale_tier_is_a_subset(self, row):
+        if is_stale_hygiene_tier_claimant(row, _GRID_NOW, _TTL):
+            assert is_hygiene_tier_claimant(row)
+
+    def test_enum_status_matches_str_status(self):
+        enum_row = _row(TaskStatus.PENDING, 'run-x', self._FRESH)
+        str_row = _row('pending', 'run-x', self._FRESH)
+        assert is_hygiene_tier_claimant(enum_row) is True
+        assert is_hygiene_tier_claimant(str_row) is True
+
+
+class TestLedgerCoversClaimant:
+    _CLAIMANT = 'run/s/pid=1'
+
+    @staticmethod
+    def _ledger(claimant_run_id) -> dict:
+        return {
+            'claimant_exception': {
+                'claimant_run_id': claimant_run_id,
+                'target_status': 'done',
+                'agent_id': None,
+                'tag': None,
+                'stamped_at': '2026-10-10T00:00:00+00:00',
+            }
+        }
+
+    def test_ledger_naming_the_carried_claimant_covers_it(self):
+        row = _row('done', self._CLAIMANT, None, metadata=self._ledger(self._CLAIMANT))
+        assert ledger_covers_claimant(row) is True
+
+    def test_ledger_naming_a_different_claimant_does_not_cover(self):
+        row = _row('done', self._CLAIMANT, None, metadata=self._ledger('run/other/pid=2'))
+        assert ledger_covers_claimant(row) is False
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            {},
+            {'unrelated': True},
+            None,
+            'claimant_exception',
+            {'claimant_exception': 'run/s/pid=1'},
+            {'claimant_exception': ['run/s/pid=1']},
+        ],
+    )
+    def test_missing_or_malformed_ledger_does_not_cover(self, metadata):
+        row = _row('done', self._CLAIMANT, None, metadata=metadata)
+        assert ledger_covers_claimant(row) is False
+
+    @pytest.mark.parametrize('claimant', [None, '   '])
+    def test_nothing_to_cover_without_a_claimant(self, claimant):
+        row = _row('done', claimant, None, metadata=self._ledger(claimant))
+        assert ledger_covers_claimant(row) is False
+
+    def test_is_status_agnostic(self):
+        row = _row('pending', self._CLAIMANT, None, metadata=self._ledger(self._CLAIMANT))
+        assert ledger_covers_claimant(row) is True
+
+
 def test_public_api_surface():
     assert {
         'is_stranded_any_status',
         'DEFAULT_CLAIMANT_HEARTBEAT_TTL',
         'violates_terminal_claimant_invariant',
         'is_stale_hygiene_tier_claimant',
+        'is_hygiene_tier_claimant',
+        'ledger_covers_claimant',
     } <= set(shared.task_claimant.__all__)
