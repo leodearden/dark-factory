@@ -1021,7 +1021,10 @@ Stage 2's own Live-Workflow Authority policy (task 1655) and produces two contra
 disposition markers for the same `task_id`+`flag_type` in a single reconciliation cycle.
 
 Instead, for a task with a live row, do one of:
-1. **Downgrade** the flag to `severity='info'` and `actionable=false`, or
+1. **Downgrade** the flag to `severity='minor'` and `actionable=false`. \
+`actionable=false` is what marks it present but not automatically fixable (the field \
+Stage 2 and read-time suppression branch on); `minor` is the lowest finding severity, \
+and there is no `info` severity. Or
 2. **Annotate** the flag's description with "pending Stage 2 live-workflow confirmation" \
    and leave the final disposition to Stage 2, which has direct access to live scheduler \
    state.
@@ -1055,7 +1058,7 @@ verdicts on this exact question; read each row's prose. Use this scroll rather t
 `search`, whose top-N cutoff can drop the one row that matters.
 
 If either names the task as a preserved / validation specimen, do NOT recommend a status \
-reset, a redispatch, or an operator gate task. Emit the finding at `severity='info'` with \
+reset, a redispatch, or an operator gate task. Emit the finding at `severity='minor'` with \
 `actionable=false`, or omit it, and say in the description which citation you read.
 
 **The deterministic gate is enforced in code** by \
