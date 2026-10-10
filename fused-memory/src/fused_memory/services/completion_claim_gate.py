@@ -32,6 +32,12 @@ and requiring the ref is also the volume control — an unanchored detector
 would tag a large fraction of ordinary agent narration, and a tag that fires
 constantly stops being read.
 
+A claim must also be ASSERTED (task 6677). A marker inside a quotation,
+governed by a modal, inside a conditional/interrogative, present-tense
+temporal or imperative scope, or in attributive position is not a claim. See
+tests/test_completion_claim_mood.py and
+docs/completion-claim-mood-filter-2026-10/measurement.md.
+
 Verification is split from detection behind INJECTED probes (mirroring
 :func:`middleware.recon_claim_verification_guard.verify_attributed_claims`),
 so the acceptance criterion is unit-testable with no Taskmaster, no ticket DB
@@ -592,6 +598,13 @@ _TASK_COMPLEMENT_GAP_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
+# A determiner (plus at most one adverb) directly before a marker makes it an
+# attributive participle modifying the noun after it ('the shipped examples').
+_ATTRIBUTIVE_LEAD_RE: re.Pattern[str] = re.compile(
+    r'\b(?:the|a|an|its|their|our|your|his|her|my)\s+(?:(?:\w+ly|already|just|now)\s+)?$',
+    re.IGNORECASE,
+)
+
 
 def _bind_marker(
     clause: str,
@@ -605,12 +618,15 @@ def _bind_marker(
     existence ('task N was merged as commit X' is a claim about X): the first
     ref after the marker, when :func:`_binds_forward` admits the gap. Otherwise
     BACKWARD: the nearest ref before the marker, with no barrier between them.
+    An attributive marker ('the merged commit X') binds forward only.
     """
     following = next((m for m in mentions if m.start >= marker.end), None)
     if following is not None and _binds_forward(
         clause[marker.end:following.start], following, known_project_ids
     ):
         return following
+    if _ATTRIBUTIVE_LEAD_RE.search(clause, 0, marker.start):
+        return None
     preceding = next((m for m in reversed(mentions) if m.end <= marker.start), None)
     if preceding is not None and not _BINDING_BARRIER_RE.search(
         clause[preceding.end:marker.start]
