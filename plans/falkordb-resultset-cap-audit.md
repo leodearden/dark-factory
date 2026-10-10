@@ -108,8 +108,9 @@ Method: `grep -n "ro_query(\|get_by_group_ids\|\.execute_query(" fused-memory/sr
 - `query_stale_node_embeddings` (task 4869). A truncated read made an embedding-dimension migration look COMPLETE when it was not. The operator's evidence of success was the very read being truncated.
 - `query_stale_edge_embeddings` (task 4869). It has no `invalid_at` filter, so it includes superseded edges, which still need re-embedding.
 - `query_edges_by_time_range` (task 4869). It is bounded only by the caller's window, and its consumer (`CleanupManager.find_stale_edges`) feeds `bulk_remove_edges`.
+- `enumerate_valid_edges_mentioning` (task 4851), the valid-edge population narrowed by a bound `e.fact CONTAINS $substring`. It is paged because a one-digit needle is unselective. Measured by the task-4851 architect on 2026-10-05 against `dark_factory`: CONTAINS '5' matched 7,435 rows; '4851' gave a 2-row census in ~0.2 s plus a ~0.2 s page; '142' gave 88 rows in ~0.45 s in total, against ~3.3 s for the full `enumerate_all_valid_edges`.
 
-All five apply the shared `apply_incompleteness_policy`: STRUCTURAL kinds raise `IncompleteEnumerationError`, EMPIRICAL kinds warn and return. The three 4869 reads and `enumerate_entity_nodes` dedup re-emitted boundary rows with `_first_row_per_uuid`.
+All six are policed by the shared `apply_incompleteness_policy`: STRUCTURAL kinds raise `IncompleteEnumerationError`, EMPIRICAL kinds warn and return. For the three `enumerate_*` reads the policy is applied by the caller (a shim, a checked read, or a consumer's own call site), never inside the method. The three 4869 reads and `enumerate_entity_nodes` dedup re-emitted boundary rows with `_first_row_per_uuid`; the two valid-edge reads share `_group_valid_edge_rows`, which dedups on the `(n.uuid, e.uuid)` pair.
 
 ### PAGINATED via keyset through graphiti-core
 
