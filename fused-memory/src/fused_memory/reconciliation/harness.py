@@ -51,6 +51,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     gc_run_config_dir,
     recon_config_base_dir,
 )
+from fused_memory.reconciliation.drained_event_restore import restore_unless_completed
 from fused_memory.reconciliation.escalation_archive import (
     scan_recently_resolved_fingerprints,
 )
@@ -4099,7 +4100,7 @@ class ReconciliationHarness:
 
     async def _journal_failed_and_restore_drained(self, run_id: str, project_id: str) -> None:
         """The bookkeeping every ``run_full_cycle`` failure arm shares: journal
-        *run_id* failed, then re-buffer *project_id*'s drained events.
+        *run_id* failed, then re-buffer *run_id*'s own drained events.
 
         Each write is best-effort, so neither skips the other nor replaces the
         failure being handled. The pair is shielded as one unit, so a second
@@ -4112,7 +4113,7 @@ class ReconciliationHarness:
                 logger=logger, level=logging.ERROR,
             )
             await await_best_effort(
-                self.buffer.restore_drained(project_id),
+                restore_unless_completed(self.journal, self.buffer, project_id, run_id),
                 what='restore_drained', run_id=run_id,
                 logger=logger, level=logging.ERROR,
             )
