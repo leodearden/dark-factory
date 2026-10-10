@@ -4,6 +4,7 @@ import textwrap
 from dataclasses import dataclass, field
 from typing import Literal
 
+from shared.governed_exceptions import DECLARATION_FORMS, INLINE_MARKER_FORMS
 from shared.prompt_artifact import PromptSpec
 
 from orchestrator.agents.bash_cwd_guidance import BASH_CWD_ANCHOR_GUIDANCE
@@ -1757,8 +1758,13 @@ still ends up staged.
 # heuristics argument to compose_prompt, never the contract (see
 # shared.prompt_artifact.PromptArtifactStore.resolve).
 #
+# REVIEWER_INV12_BLOCKERS joins the contract (appended after format(), so it
+# need not be brace-free): a severity fixed by policy rather than judgment,
+# which an optimised artifact must not be able to drop.
+#
 # _REVIEWER_HEURISTICS_TEMPLATE is the EDITABLE judgment guidance (the
-# blocking-vs-suggestion rules and the specialization footer) that a pinned
+# blocking-vs-suggestion rules, CODE_QUALITY_GUIDANCE per PRD
+# tier1-prompt-optimization D-3, and the specialization footer) that a pinned
 # artifact may override.
 #
 # Both templates are per-role (interpolate {name}/{specialization}) and built
@@ -1790,6 +1796,29 @@ Call `submit_review_verdict` with these fields:
   `"suggestion"`), `location` (e.g. `"src/foo.py:42"`), `category`, a
   `description`, and a `suggested_fix`. Empty when `verdict` is `"PASS"`.
 - **summary**: a one-paragraph summary of the review.
+"""
+
+REVIEWER_INV12_BLOCKERS = """
+## Exception-list changes (INV-12) — blockers no tree-pure check can see
+
+A gate checks that every suppression carries a disposition; it cannot judge
+whether the disposition is honest. Report each of these as `blocking`, whatever
+the severity rules below say:
+
+1. **Self-citation** — a marker or declaration the diff adds cites the task under
+   review as its own owner. That task's id ends this branch's name
+   (`git branch --show-current`).
+2. **Unrelated citation** — a marker cites a task or ticket that has nothing to do
+   with the debt it excuses.
+3. **Type contortion** — an Any or cast introduced in place of a scoped ignore
+   (or in place of fixing the type).
+4. **Baseline growth** — any added line in the inline baseline
+   (`scripts/inline_suppression_baseline.json`).
+5. **Raised default** — an incremented `default_covers`.
+6. **Unordered ratification edit** — any edit to
+   `docs/legibility/exception-ratifications.yaml` that no commit on this branch
+   justifies by quoting the brief's order for it (`git log`). You are not shown
+   the brief; the implementer is told to quote the order there.
 """
 
 _REVIEWER_HEURISTICS_TEMPLATE = """\
@@ -1829,7 +1858,10 @@ def build_reviewer_prompt_spec(name: str, specialization: str) -> PromptSpec:
     """
     return PromptSpec(
         prompt_id=f'reviewer_{name}',
-        contract=_REVIEWER_CONTRACT_TEMPLATE.format(name=name, specialization=specialization),
+        contract=(
+            _REVIEWER_CONTRACT_TEMPLATE.format(name=name, specialization=specialization)
+            + REVIEWER_INV12_BLOCKERS
+        ),
         baseline_heuristics=_REVIEWER_HEURISTICS_TEMPLATE.format(specialization=specialization),
     )
 
@@ -2214,8 +2246,35 @@ reaper to maybe recover:
     ),
 )
 
-ARCHITECT.system_prompt = ARCHITECT.system_prompt + _FOLLOWUP_FILING_INSTRUCTIONS
-IMPLEMENTER.system_prompt = IMPLEMENTER.system_prompt + _FOLLOWUP_FILING_INSTRUCTIONS
+_IMPLEMENTER_INV12_INSTRUCTIONS = (
+    """
+## Silencing a detector (INV-12: exceptions are owned or ratified)
+
+Every entry that silences a detector carries a disposition: a named owner who
+will remove it, or a recorded operator ruling that it stays. Accepted inline
+forms (a trailing comment on the suppressed line):
+
+"""
+    + '\n'.join(f'    {form}' for form in INLINE_MARKER_FORMS)
+    + """
+
+Accepted forms in a governed-list declaration:
+
+"""
+    + '\n'.join(f'    {form}' for form in DECLARATION_FORMS)
+    + """
+
+- Fix the type before suppressing it, and never trade an ignore for Any or cast.
+- File one follow-up ticket per branch and cite it on every marker you add.
+- Never cite your own task as the owner of a marker.
+- Edit `docs/legibility/exception-ratifications.yaml` only when your brief orders
+  it, and quote that order in the commit message: the reviewer sees your
+  commits, not your brief.
+"""
+)
+
+ARCHITECT.system_prompt += _FOLLOWUP_FILING_INSTRUCTIONS
+IMPLEMENTER.system_prompt += _FOLLOWUP_FILING_INSTRUCTIONS + _IMPLEMENTER_INV12_INSTRUCTIONS
 
 
 MERGE_HALT_ESCALATION_CATEGORIES: tuple[str, ...] = (
