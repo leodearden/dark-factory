@@ -36,16 +36,22 @@ Outputs
 Usage
 -----
 Run from ``fused-memory/``, with one ``--require`` per ``--require best …``
-of task 5808's metadata.before_done.args (two are shown)::
+of task 5808's metadata.before_done.args, without the ``best`` handle::
 
     uv run python scripts/run_write_triage_config_matrix.py \\
         --data-root /home/leo/src/dark-factory \\
-        --require quality.misfile_rate_of_attaches '<=' 0.08 \\
-        --require quality.unrated_pairs '<=' 0
+        --require comparative.wrong_sibling_rate_placeable '<=' 0.11 \\
+        --require comparative.harm_delta_vs_status_quo '<=' 0 \\
+        --require quality.contradiction_recall '>=' 0.60 \\
+        --require selection.p95_judge_seconds '<=' 10.0 \\
+        --require selection.cost_per_write_usd '<=' 0.01 \\
+        --require quality.unrated_pairs '<=' 0 \\
+        --require population.n_judge_band '>=' 300
 
-An unrated or tied pair, an arm file that differs from what π published, or
-a population artifact that lacks a key μ reads exits 1 with the reason on
-stderr and writes neither artifact. A failure writing them exits 1 too.
+An unrated or tied pair, an arm file or snapshot that differs from what π2
+published, or a population artifact that lacks a key μ reads exits 1 with the
+reason on stderr and writes neither artifact. A failure writing them exits 1
+too.
 """
 from __future__ import annotations
 
@@ -585,8 +591,9 @@ def _build_parser() -> LoudArgumentParser:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        '--population', type=Path, default=_CALIBRATION / 'write_triage_population.json',
-        help="π's published population artifact",
+        '--population', type=Path,
+        default=_CALIBRATION / 'write_triage_population_write_time.json',
+        help="π2's published write-time population artifact",
     )
     parser.add_argument(
         '--verdicts', type=Path, default=_CALIBRATION / 'write_triage_pair_verdicts.jsonl',
@@ -594,7 +601,8 @@ def _build_parser() -> LoudArgumentParser:
     )
     parser.add_argument(
         '--data-root', type=Path, required=True,
-        help="the checkout whose gitignored data/ holds π's arm files, e.g. the main checkout",
+        help="the checkout whose gitignored data/ holds π2's arm files and snapshot,"
+             ' e.g. the main checkout',
     )
     parser.add_argument(
         '--require', action='append', nargs=3, required=True,
@@ -617,6 +625,7 @@ def _compute(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
         _read_jsonl(args.verdicts),
         shipped=shipped_settings(types.SimpleNamespace(config=FusedMemoryConfig())),
         bounds=[Bound(*spec) for spec in args.require],
+        created_at=read_record_created_at(population, args.data_root),
     ) | {'inputs': _inputs(args.population, args.verdicts)}
     return matrix, best_config(matrix)
 
