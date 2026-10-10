@@ -4260,16 +4260,14 @@ class GraphitiBackend:
                 other caller: a merge is irreversible and is only ever a
                 deliberate act, never a side effect (Ratified Decision 1).
 
-                BOTH current False callers are in ``services/memory_service.py``,
-                named here so a reader need not grep for them:
-                ``MemoryService._repair_edge_findings`` (the referent repair
-                pass, which catches the refusal and books the finding
-                ``'unrepairable'`` rather than ``'failed'`` — the backend did
-                not fail, it declined), and ``MemoryService.ensure_entity_node``
-                (task 4932's gated mint wrapper, where the flag is redundant by
-                construction with that wrapper's own pre-read and is passed
-                anyway so Ratified Decision 1 is structural at both non-S1 call
-                sites rather than dependent on one caller's ordering).
+                The one current False caller is
+                ``services/memory_service.py::MemoryService._repair_edge_findings``
+                (the referent repair pass, which catches the refusal and books
+                the finding ``'unrepairable'`` rather than ``'failed'`` — the
+                backend did not fail, it declined).
+                ``MemoryService.ensure_entity_node`` does not call this method;
+                it mints through :meth:`_mint_entity_node` after its own
+                pre-read.
 
                 Seam S1 is absent from that list BY CONSTRUCTION, not by
                 omission: it calls ``_resolve_or_create_entity`` directly and
