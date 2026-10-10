@@ -1534,18 +1534,28 @@ class TestDroppedChainClausesAreLogged:
         assert self._records(caplog, 'orchestrator.verify_plan') == messages
 
     @pytest.mark.parametrize(('raw', 'keyword', 'dropped', 'level'), _DROP_CASES, ids=_DROP_IDS)
-    def test_string_scoper_logs_the_equivalent_record(
+    def test_string_scoper_emits_the_plan_scopers_record(
         self, raw, keyword, dropped, level, caplog: pytest.LogCaptureFixture,
     ):
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
+        """The string scoper renders scope_prefix_to_keyword, so it emits that record and no copy of its own."""
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify_plan'):
+            scope_prefix_to_keyword(raw, keyword, self._FILES)
+        expected = self._records(caplog, 'orchestrator.verify_plan', level)
+        caplog.clear()
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='orchestrator.verify'),
+            caplog.at_level(logging.DEBUG, logger='orchestrator.verify_plan'),
+        ):
             result = _scope_to_keyword(raw, keyword, self._FILES)
 
-        messages = self._records(caplog, 'orchestrator.verify', level)
-        assert len(messages) == 1, f'expected exactly one record, got {messages}'
-        assert keyword in messages[0]
-        assert f'dropped {dropped} trailing' in messages[0]
+        assert len(expected) == 1, f'expected exactly one record, got {expected}'
+        assert f'dropped {dropped} trailing' in expected[0]
+        assert keyword in expected[0]
+        assert self._records(caplog, 'orchestrator.verify_plan', level) == expected
+        assert self._records(caplog, 'orchestrator.verify_plan') == expected
+        assert self._records(caplog, 'orchestrator.verify') == []
         assert result is not None
-        assert self._records(caplog, 'orchestrator.verify') == messages
 
     @pytest.mark.parametrize(('raw', 'keyword', 'dropped', 'level'), _DROP_CASES, ids=_DROP_IDS)
     def test_wording_matches_the_level(
@@ -1609,9 +1619,13 @@ class TestDroppedChainClausesAreLogged:
         assert self._records(caplog, 'orchestrator.verify_plan') == []
 
         caplog.clear()
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
+        with (
+            caplog.at_level(logging.DEBUG, logger='orchestrator.verify'),
+            caplog.at_level(logging.DEBUG, logger='orchestrator.verify_plan'),
+        ):
             string_result = _scope_to_keyword(raw, keyword, self._FILES)
         assert self._records(caplog, 'orchestrator.verify') == []
+        assert self._records(caplog, 'orchestrator.verify_plan') == []
 
         # Pin the premise the silence rests on: these really do come back with
         # every clause intact, so there was genuinely nothing to report.
