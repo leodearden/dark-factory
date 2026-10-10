@@ -1447,17 +1447,13 @@ class ReconReportState:
         surfaced verbatim in the assembled report; ``severity`` is not capped
         because it is a closed vocabulary, checked below.
 
-        ``severity`` must be a member of ``FINDING_SEVERITY_SET``
-        (``models/reconciliation.py::FindingSeverity``); anything else fails
-        the WHOLE call with ``invalid_severity``, echoing the rejected value
-        and listing the legal ones.  The check runs after the run/completed
-        context guards and before supersedes resolution, truncation and
-        dedup, so a rejected call stores no row, writes no dedup-index entry
-        (a corrected retry is not told ``duplicate_finding``) and stamps no
-        supersedes target.  "Present but not automatically fixable" is
-        ``actionable=False``, never a lower severity.  The check guards this
-        write boundary only: rows persisted before it existed may carry other
-        values and still hydrate verbatim.
+        ``severity`` is the closed ``FindingSeverity`` vocabulary; any other
+        value fails the WHOLE call with ``invalid_severity`` (see
+        :func:`_invalid_severity_error`) and mutates nothing.  "Present but
+        not automatically fixable" is ``actionable=False``, never a lower
+        severity.  Ordering against the other guards and legacy hydration:
+        tests/server/test_recon_report.py::TestAddFindingSeverityIsValidated,
+        tests/server/test_recon_report_store.py::TestLegacySeverityHydrates.
 
         ``supersedes`` (task-4653) names the finding_id of an EARLIER finding
         in this run that the new one makes historical; on success the TARGET's
@@ -3688,8 +3684,9 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
 
         severity is a closed vocabulary; any other value fails the WHOLE call
         with {error: invalid_severity, severity, known_severities, hint}, whose
-        known_severities lists the legal values — nothing is filed.  To say a finding is present but not automatically
-        fixable, pass actionable=false; there is no lower severity for it.
+        known_severities lists the legal values — nothing is filed.  To say a
+        finding is present but not automatically fixable, pass
+        actionable=false; there is no lower severity for it.
         """
         return state.add_finding(
             run_id=run_id,
