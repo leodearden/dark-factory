@@ -1404,8 +1404,8 @@ class TestExtractBlockedAssertionTaskIds:
     union family (see _build_snapshot_patterns), so every hardening tasks
     2613/3042/3079/3403/4149 bought — transitive-verb guard, negation and
     past-exit guard, intervening-task-reference guard, prepositional-
-    complement subjecthood guard, possessive quantifiers, intra-token-dot
-    narrowing — applies here for free and cannot drift.
+    complement subjecthood guard, possessive quantifiers, token-internal-
+    break narrowing — applies here for free and cannot drift.
     """
 
     # --- the five extraction paths ---
@@ -1765,9 +1765,9 @@ class TestPluralEnumerationPerformance:
             GROWING with n is the quadratic signature, and it already blows
             the bound below at every size tested.
 
-        The bound is derived, not guessed: 3 unconditional full backward
-        scans (';', '!', '?' are each absent from this input, so each scans
-        the whole prefix once) + 1 telescoped '.' walk covering the prefix
+        The bound is derived, not guessed: 3 full backward scans (';', '!',
+        '?' are each absent from this input, so each scans the whole prefix
+        once) + 1 telescoped '.' walk covering the prefix
         once + 2 single-character reads per dot (~0.67 dots per 3-char
         'ab.' token) ~= 4.7x prefix length. 8x leaves headroom for an
         innocuous refactor while still failing any superlinear form

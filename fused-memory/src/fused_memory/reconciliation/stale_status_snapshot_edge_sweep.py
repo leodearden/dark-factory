@@ -166,11 +166,10 @@ Known residuals (deliberate; all fail-safe/under-selection unless noted)
   'Task 5 blocked tasks: 142, 148', whose over-selection the blocked rule
   would trigger almost immediately rather than only at done/cancelled. See
   ``_list_is_governed_by_task_ref``.
-- task 4149: ``_CLAUSE_BREAK_CHARS``'s ';' and '?' are unconditional
-  breaks (only '.' gets the occurrence-level flanking test), so one
-  residual is pointed the WRONG way: a '?' inside a URL query string or a
-  ';' inside a path/branch name truncates the backward scan past the
-  governing preposition and OVER-selects — see ``_CLAUSE_BREAK_CHARS``.
+- tasks 4149 / 4851: a genuine '.', ';', '!' or '?' sentence break
+  immediately followed by an alphanumeric ('done.Then', 'done?Then') reads
+  as token-internal, so a snapshot behind a listed preposition in the
+  previous sentence is missed — see ``_is_token_internal_break``.
 
 Two hypotheses were investigated and RULED OUT for the task-2613 miss
 rate; do not re-open them:
@@ -665,29 +664,9 @@ _ENUM_PREP_WORDS: tuple[str, ...] = (
 #
 # A break requires TWO things together, not one: the character must be a
 # member of this class (below), AND the occurrence must plausibly END a
-# sentence — not be an INTRA-TOKEN '.' flanked by alphanumerics on both
-# sides, e.g. a filename extension, version string, dotted module path or
-# dotted section number (see _is_intra_token_dot / _last_clause_break;
-# task 4149). Only '.' gets that second, occurrence-level test — because
-# that is where over-selection was MEASURED and closed, not because ';',
-# '!' and '?' are verified safe. They remain unconditional breaks
-# whenever they appear, and at least one of them has a KNOWN, still-OPEN
-# instance of the identical over-selection class: a '?' inside a URL
-# query string or a ';' inside a path/branch name truncates the backward
-# scan past the governing preposition exactly as an intra-token '.' did,
-# e.g. (measured on this branch; amendment, reviewer_comprehensive
-# correctness-precision finding, task 4149)
-#
-#     'Reviews for https://ci/build?ref=main tasks 1020 and 1030 are
-#      pending.' -> {1020, 1030}
-#     'Statuses of the branch;main tasks 1020 and 1030 are pending.'
-#     -> {1020, 1030}
-#
-# Left open rather than fixed here: extending _is_intra_token_dot's
-# flanking test to all four class members would be a strictly fail-safe
-# generalization (narrowing an occurrence can only cost under-selection,
-# per the asymmetry argument below) if the corpus supports it, but that
-# needs its own measurement pass and is a follow-up, not this task.
+# sentence — not be TOKEN-INTERNAL (see _is_token_internal_break /
+# _last_clause_break). Every member of the class gets that second,
+# occurrence-level test (task 4149 for '.', task 4851 for ';', '!' and '?').
 #
 # The CLASS is deliberately minimal — '.', ';', '!', '?' and nothing else,
 # and membership is a verified precision requirement not reopened by this
@@ -699,8 +678,8 @@ _ENUM_PREP_WORDS: tuple[str, ...] = (
 # not actually end a sentence truncates the scan and re-opens the
 # over-selection this guard exists to close, which is unrecoverable. So a
 # character earns a place in the class only by being able to end a
-# sentence, and an occurrence of '.' is treated as a break only by
-# plausibly ending one.
+# sentence, and an occurrence is treated as a break only by plausibly
+# ending one.
 #
 # Excluded from the CLASS on that rule, each verified over-selecting when it
 # was treated as a break (amendment, reviewer_comprehensive
@@ -722,9 +701,10 @@ _ENUM_PREP_WORDS: tuple[str, ...] = (
 # are pending.' still extracts): they carry no listed preposition, so the
 # longer clause gives the guard nothing to fire on.
 #
-# Excluded from OCCURRENCE by the flanking test — an intra-token '.' ends no
-# sentence — each measured over-selecting before this narrowing (amendment,
-# reviewer_comprehensive correctness-precision finding, task 4149):
+# Excluded from OCCURRENCE as token-internal — such an occurrence ends no
+# sentence — each over-selecting when it was treated as a break. The '.'
+# shapes were measured by task 4149 (amendment, reviewer_comprehensive
+# correctness-precision finding); the rest by task 4851:
 #
 #     filename extension     'Reviews for verify_cmd.py tasks 1020 and 1030
 #                             are pending.' -> {1020, 1030}; the
@@ -737,62 +717,90 @@ _ENUM_PREP_WORDS: tuple[str, ...] = (
 #                             1030 are pending.'
 #     dotted section number  'Reviews for section 4.2.1 tasks 1020 and 1030
 #                             are pending.'
+#     URL query '?'          'Reviews for https://ci/build?ref=main tasks
+#                             1020 and 1030 are pending.'
+#     path/branch ';'        'Statuses of the branch;main tasks 1020 and 1030
+#                             are pending.'
+#     token-internal '!'     'Notes about the yahoo!mail tasks 1020 and 1030
+#                             are pending.'
+#     HTML entity ';'        "Reviews for task_id 'review-&lt;id&gt;' tasks
+#                             1020 and 1030 are pending." — the final ';' is
+#                             followed by a quote, so only the entity rule
+#                             (not the flanking test) excludes it.
 #
-# A prefix-FINAL '.' (nothing to its right within prefix, e.g. prefix cut at
-# '\\btasks\\b' immediately after the period) has no right flank and so is
-# never intra-token — it stays a break regardless of this narrowing, which
+# A prefix-FINAL break (nothing to its right within prefix, e.g. prefix cut
+# at '\\btasks\\b' immediately after the period) has no right flank and so is
+# never alnum-flanked — it stays a break regardless of this narrowing, which
 # keeps the common 'X.Tasks 1020 and 1030 are pending.' shape selected.
 _CLAUSE_BREAK_CHARS = '.;!?'
 
 
-def _is_intra_token_dot(text: str, index: int) -> bool:
-    """Is the '.' at ``text[index]`` flanked by alphanumerics on both sides?
+# The head of an HTML character entity reference ('&lt', '&#60', '&#x3c'),
+# anchored to end exactly where the ';' that terminates it begins. Searched
+# over a bounded window ending at that ';', so the check costs O(1) per
+# occurrence and needs no slice.
+_HTML_ENTITY_HEAD_RE: re.Pattern[str] = re.compile(
+    r'&(?:[A-Za-z][A-Za-z0-9]{1,31}|#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6})\Z'
+)
+_HTML_ENTITY_HEAD_MAX_LEN = 40
+
+
+def _is_token_internal_break(text: str, index: int) -> bool:
+    """Does the break character at ``text[index]`` end no sentence?
+
+    True for either of two reasons (tasks 4149, 4851):
+
+    (a) it is flanked by alphanumerics on both sides — a filename
+        extension, version string, dotted module path, dotted section
+        number, URL query '?', path/branch ';' or token-internal '!';
+    (b) it is a ';' terminating an HTML character entity ('&lt;', '&#60;'),
+        which is usually followed by a quote or paren rather than an
+        alphanumeric, so (a) alone would leave it breaking the clause.
 
     Unicode-aware by construction (``str.isalnum()``, the same predicate
     ``is_searchable_term`` uses in falkor_fulltext.py), so 'café.py' or a
-    non-ASCII identifier is recognized as intra-token exactly like an ASCII
-    one. A flanked '.' is a filename extension, version string, dotted
-    module path or dotted section number — it ends no sentence, so it must
-    not count as a clause break. (task 4149)
+    non-ASCII identifier is recognized exactly like an ASCII one.
 
-    Cost (fail-safe, under-selection): a genuine sentence period with no
-    following space AND a following alphanumeric — e.g. 'Reviews for the
-    branch are done.Then tasks 1020 and 1030 are pending.' — is flanked by
-    alphanumerics on both sides too, so it reads as intra-token and the
-    backward scan extends past the governing preposition, suppressing a
-    real snapshot; the edge is simply not retired this cycle. Pinned by
-    test_intra_token_dot_narrowing_costs_only_under_selection in
+    Cost (fail-safe, under-selection): a genuine sentence break with no
+    following space AND a following alphanumeric — 'Reviews for the branch
+    are done.Then tasks 1020 and 1030 are pending.', or the same with '?' —
+    reads as token-internal, so the backward scan extends past the governing
+    preposition and suppresses a real snapshot; the edge is simply not
+    retired this cycle. Pinned by
+    test_token_internal_break_narrowing_costs_only_under_selection in
     test_stale_status_snapshot_edge_sweep.py.
     """
-    return (
+    if (
         index > 0
         and text[index - 1].isalnum()
         and index + 1 < len(text)
         and text[index + 1].isalnum()
-    )
+    ):
+        return True
+    return text[index] == ';' and _HTML_ENTITY_HEAD_RE.search(
+        text, max(0, index - _HTML_ENTITY_HEAD_MAX_LEN), index
+    ) is not None
 
 
 def _last_clause_break(prefix: str) -> int:
     """Index of the last sentence-plausible clause break in *prefix*, or -1.
 
-    ';', '!' and '?' are treated as unconditional breaks; only '.' gets
-    the occurrence-level flanking test below, because that is where
-    over-selection was measured and closed — see the _CLAUSE_BREAK_CHARS
-    comment block above for the known, still-open '?'/';' exception this
-    leaves. '.' additionally requires that the occurrence not be an
-    intra-token dot (see ``_is_intra_token_dot``); when it is, the walk
-    retries at the next '.' to its left, stopping once it reaches or passes
-    ``hard`` (the last unconditional break), since nothing further left
-    could still change the answer. ``dot`` strictly decreases and each
-    ``rfind`` resumes where the previous stopped, so the walk is
-    O(len(prefix)) overall — no slicing, matching the cost property
-    ``_enumeration_is_prepositional_complement`` documents. (task 4149)
+    Every member of ``_CLAUSE_BREAK_CHARS`` counts only where the occurrence
+    is not token-internal (see ``_is_token_internal_break``). The walk keeps
+    one cursor per break character and repeatedly takes the rightmost; when
+    that occurrence is token-internal, only its own cursor moves left, to the
+    previous occurrence of the same character. Each cursor only moves left
+    and each ``rfind`` resumes where that cursor's previous one stopped, so
+    the walk is O(len(prefix)) overall — no slicing, matching the cost
+    property ``_enumeration_is_prepositional_complement`` documents.
+    (tasks 4149, 4851)
     """
-    hard = max((prefix.rfind(c) for c in _CLAUSE_BREAK_CHARS if c != '.'), default=-1)
-    dot = prefix.rfind('.')
-    while dot > hard and _is_intra_token_dot(prefix, dot):
-        dot = prefix.rfind('.', 0, dot)
-    return max(hard, dot)
+    cursors = {c: prefix.rfind(c) for c in _CLAUSE_BREAK_CHARS}
+    while True:
+        char, cursor = max(cursors.items(), key=lambda item: item[1])
+        if cursor < 0 or not _is_token_internal_break(prefix, cursor):
+            return cursor
+        cursors[char] = prefix.rfind(char, 0, cursor)
 
 
 _ENUM_PREP_WORD_RE: re.Pattern[str] = re.compile(
@@ -912,7 +920,7 @@ def _build_snapshot_patterns(
     drift structurally impossible: every guard tasks 2613 / 3042 / 3079 /
     3403 / 4149 bought (transitive-verb, negation and past-exit,
     intervening-task-reference, prepositional-complement subjecthood,
-    possessive quantifiers, intra-token-dot narrowing) is written once and
+    possessive quantifiers, token-internal-break narrowing) is written once and
     applies to both families by construction.
 
     Args:
