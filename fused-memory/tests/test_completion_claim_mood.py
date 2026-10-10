@@ -83,3 +83,38 @@ class TestQuotationsAreMentions:
         assert _triples("task 5422's fix has been applied") == [
             ('applied_work', 'task', '5422'),
         ]
+
+
+class TestModalFormsAreNotClaims:
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            'task 5422 must have landed by now',
+            'task 5422 should have landed yesterday',
+            'task 5422 would have been merged without the conflict',
+            'task 5422 could have shipped earlier',
+            'task 5422 may have been applied twice',
+            'task 5422 must be merged first',
+            'task 5422 will have landed by Friday',
+            "task 5422 won't have shipped",
+            'task 5422 can be closed as duplicate',
+        ],
+    )
+    def test_a_modal_governed_marker_is_not_a_claim(self, text):
+        assert _triples(text) == []
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param(
+                'task 5422 has landed and will be reviewed', id='modal-after-barrier',
+            ),
+            pytest.param(
+                'task 5422 landed; it would have been faster otherwise',
+                id='modal-in-next-clause',
+            ),
+        ],
+    )
+    def test_a_modal_elsewhere_leaves_the_claim(self, text):
+        assert _triples(text) == [('applied_work', 'task', '5422')]
