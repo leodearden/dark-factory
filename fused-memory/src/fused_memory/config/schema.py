@@ -1610,6 +1610,26 @@ class ReconciliationConfig(BaseModel):
     sandbox_recon_agents: bool = Field(default=True)
     sandbox_recon_writable_extras: list[str] = Field(default_factory=list)
 
+    transcript_archive_enabled: bool = Field(
+        default=True,
+        description=(
+            'Archive each recon stage CLI transcript before its per-run config '
+            'dir is destroyed (task 3972). The operator kill switch, and the '
+            'only remedy if the archive root breaks: fused-memory installs no '
+            'archival-failure storm consumer. Green-tier for that reason.'
+        ),
+    )
+    transcript_archive_root: str = Field(
+        default='data/orchestrator/agent-transcripts',
+        description=(
+            'Archive root, resolved against explore_codebase_root (NOT data_dir). '
+            "The default deliberately equals the orchestrator's archive root, "
+            "which docs/legibility/legibility.yaml's agent_transcript_roots "
+            'already mines. Rationale: '
+            'reconciliation/cli_stage_runner.py::recon_archive_root.'
+        ),
+    )
+
     # Quiescence / burst detection
     conditional_trigger_ratio: float = Field(default=0.33)
     burst_window_seconds: float = Field(default=30.0)
