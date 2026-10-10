@@ -32,6 +32,7 @@ import pytest
 import yaml
 from legibility import (
     account_pool,
+    census_identity,
     census_trigger,
     census_window,
     check_census_report,
@@ -5909,6 +5910,140 @@ def test_own_endpoint_grant_does_not_outlive_its_block(monkeypatch):
     assert recorder.calls == [("http://localhost:8103/mcp", "escalate_info", {"a": 1})], (
         "only the one entitled POST may have reached the transport"
     )
+
+
+# ---------------------------------------------------------------------------
+# task 6619: once main() has loaded its config it knows where to escalate, so
+# EVERY later failure -- not only a run_census crash -- files exactly one
+# escalation. Each case below returns (argv, project_id the escalation must
+# name, a marker of the cause).
+# ---------------------------------------------------------------------------
+
+def _raiser(exc):
+    def _fn(*args, **kwargs):
+        raise exc
+
+    return _fn
+
+
+def _codebook_yaml_case(tmp_path, monkeypatch):
+    _census_project(tmp_path)
+    (tmp_path / "docs" / "legibility" / "confusion-codebook.yaml").write_text(
+        "entries: [unclosed\n", encoding="utf-8",
+    )
+    _commit_all(tmp_path)
+    return ["--project-root", str(tmp_path)], "dark_factory", "while parsing a flow sequence"
+
+
+def _run_identity_case(tmp_path, monkeypatch):
+    _census_project(tmp_path)
+    monkeypatch.setattr(
+        census_identity, "allocate_run_identity",
+        _raiser(RuntimeError("no free run identity marker-6619")),
+    )
+    return ["--project-root", str(tmp_path)], "dark_factory", "no free run identity marker-6619"
+
+
+def _runner_open_case(tmp_path, monkeypatch):
+    _census_project(tmp_path)
+    monkeypatch.setattr(
+        session_runner, "open_pooled_runner",
+        _raiser(RuntimeError("pool empty at open marker-6619")),
+    )
+    return ["--project-root", str(tmp_path)], "dark_factory", "pool empty at open marker-6619"
+
+
+def _window_source_case(tmp_path, monkeypatch):
+    _census_project(tmp_path)
+    monkeypatch.setattr(
+        census_window, "WindowBatchSource",
+        _raiser(RuntimeError("window source refused marker-6619")),
+    )
+    return ["--project-root", str(tmp_path)], "dark_factory", "window source refused marker-6619"
+
+
+def _as_of_sha_case(tmp_path, monkeypatch):
+    _write_legibility_yaml(tmp_path)
+    return ["--project-root", str(tmp_path)], "dark_factory", "as_of_sha"
+
+
+def _harness_config_case(tmp_path, monkeypatch):
+    _census_project(tmp_path)
+    missing = tmp_path / "missing" / "legibility.yaml"
+    argv = ["--project-root", str(tmp_path), "--harness-config", str(missing)]
+    return argv, "dark_factory", str(missing)
+
+
+def _identity_mismatch_case(tmp_path, monkeypatch):
+    project_a = tmp_path / "project_a"
+    project_a.mkdir()
+    config_b = _write_legibility_yaml(tmp_path / "project_b", project_id="project_b")
+    argv = ["--project-root", str(project_a), "--config", str(config_b)]
+    return argv, "project_b", "mixed-project"
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        _codebook_yaml_case, _run_identity_case, _runner_open_case, _window_source_case,
+        _as_of_sha_case, _harness_config_case, _identity_mismatch_case,
+    ],
+    ids=[
+        "codebook-yaml", "run-identity", "runner-open", "window-source",
+        "as-of-sha", "harness-config", "identity-mismatch",
+    ],
+)
+def test_main_escalates_once_for_every_failure_after_config_load(
+    setup, tmp_path, monkeypatch, caplog,
+):
+    argv, project_id, marker = setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(mod, "run_census", _poison("run_census"))
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+    recorder = _make_transport_recorder()
+    monkeypatch.setattr(census_trigger, "post_mcp_tool_call", recorder)
+
+    with caplog.at_level(logging.ERROR, logger="legibility.census"), mod.own_endpoint():
+        exit_code = mod.main([*argv, "--force"])
+
+    assert exit_code == 1
+    assert [tool_name for (_url, tool_name, _args) in recorder.calls] == ["escalate_info"], (
+        f"exactly one escalation and nothing else: {recorder.calls}"
+    )
+    [(_url, _tool_name, arguments)] = recorder.calls
+    assert arguments["task_id"] == f"legibility-census-{project_id}"
+    assert arguments["agent_role"] == "legibility-census"
+    assert arguments["category"] == "infra_issue"
+    assert project_id in arguments["summary"]
+    assert marker in arguments["detail"]
+    assert any(
+        record.levelno == logging.ERROR and marker in record.getMessage()
+        for record in caplog.records
+    ), "the cause must reach the journal independently of the POST"
+
+
+def test_main_files_no_second_escalation_when_run_census_reports_unlanded(
+    tmp_path, monkeypatch,
+):
+    """run_census owns the escalation for a census whose commit did not land,
+    so main() exits 1 for it without filing a second one."""
+    _census_project(tmp_path)
+    monkeypatch.setattr(mod, "run_census", _make_fake_main_run_census(outcome=mod.CensusOutcome(
+        status="unlanded",
+        rollback=unlanded.Rollback(
+            quarantine_dir=tmp_path / "q" / "census-2026-07-14-x",
+            paths=("docs/legibility/census-state.json",),
+        ),
+        filed_ticket_ids=["tkt_9"],
+    )))
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+    recorder = _make_transport_recorder()
+    monkeypatch.setattr(census_trigger, "post_mcp_tool_call", recorder)
+
+    with mod.own_endpoint():
+        exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+
+    assert exit_code == 1
+    assert recorder.calls == []
 
 
 # ---------------------------------------------------------------------------
