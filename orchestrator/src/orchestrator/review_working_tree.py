@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import enum
 import logging
+import re
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from shared.git_async import run_git
 
+from orchestrator.verify import VerifyResult
+
 logger = logging.getLogger(__name__)
+
+SECTION_NAMED_PATH_CAP = 20
+_SUMMARY_NAMED_PATH_CAP = 3
 
 _GIT_QUERY_TIMEOUT_SECS = 30.0
 
@@ -91,3 +97,161 @@ async def _query_paths(project_root: Path, query: tuple[str, ...]) -> set[str] |
         )
         return None
     return {path for path in result.stdout.split('\0') if path}
+
+
+@dataclass(frozen=True)
+class NamedChange:
+    path: str
+    change: TreeChange
+
+
+@dataclass(frozen=True)
+class Phase1WorkingTree:
+    """A checkout's state plus the changes a failing Phase 1 output names."""
+
+    state: WorkingTreeState
+    named_in_failure: tuple[NamedChange, ...]
+
+    def __post_init__(self) -> None:
+        kinds = dict(self.state.changes())
+        _reject(
+            'a named path must be a working-tree change of the same kind',
+            (n.path for n in self.named_in_failure if kinds.get(n.path) is not n.change),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            'untracked_count': len(self.state.untracked),
+            'uncommitted_count': len(self.state.uncommitted),
+            'named_in_failure': [
+                {'path': n.path, 'change': n.change.value} for n in self.named_in_failure
+            ],
+        }
+
+
+def attribute_phase1(
+    phase1: VerifyResult, state: WorkingTreeState, run_dirs: Iterable[str],
+) -> Phase1WorkingTree:
+    """Which of *state*'s changes a failing *phase1* output names.
+
+    *run_dirs* are the repo-relative directories verify legs run in; a tool
+    there prints paths relative to that directory.
+    """
+    if phase1.passed:
+        return Phase1WorkingTree(state, ())
+    output = '\n'.join((phase1.test_output, phase1.lint_output, phase1.type_output))
+    prefixes = tuple(f'{d.rstrip("/")}/' for d in run_dirs if d)
+    named = tuple(
+        NamedChange(path, change)
+        for path, change in state.changes()
+        if any(_output_names(output, form) for form in _printed_forms(path, prefixes))
+    )
+    return Phase1WorkingTree(state, named)
+
+
+def _printed_forms(path: str, prefixes: tuple[str, ...]) -> Iterator[str]:
+    yield path
+    for prefix in prefixes:
+        if path.startswith(prefix):
+            yield path[len(prefix):]
+
+
+def _output_names(output: str, form: str) -> bool:
+    if form not in output:
+        return False
+    return re.search(rf'(?<![\w.-]){re.escape(form)}(?![\w.-])', output) is not None
+
+
+def qualified_phase1_summary(
+    phase1: VerifyResult, working_tree: Phase1WorkingTree | None,
+) -> str:
+    """*phase1*'s summary, qualified when the checkout's state bears on it."""
+    tree = _qualifying_tree(phase1, working_tree)
+    if tree is None:
+        return phase1.summary
+    return f'{phase1.summary} — {_summary_qualifier(phase1, tree)}'
+
+
+def render_working_tree_section(
+    phase1: VerifyResult, working_tree: Phase1WorkingTree | None,
+) -> str:
+    """A '### Working-tree state' prompt subsection, or '' when unqualified."""
+    tree = _qualifying_tree(phase1, working_tree)
+    if tree is None:
+        return ''
+    lines = [
+        '',
+        '### Working-tree state',
+        '',
+        'Phase 1 ran in the live checkout, which differs from HEAD by '
+        f'{_counts(tree.state)}.',
+    ]
+    lines += _passed_lines(tree) if phase1.passed else _failed_lines(tree)
+    return '\n'.join(lines) + '\n'
+
+
+def _qualifying_tree(
+    phase1: VerifyResult, working_tree: Phase1WorkingTree | None,
+) -> Phase1WorkingTree | None:
+    if working_tree is None:
+        return None
+    state = working_tree.state
+    bears_on_result = bool(state.uncommitted) if phase1.passed else not state.is_clean
+    return working_tree if bears_on_result else None
+
+
+def _summary_qualifier(phase1: VerifyResult, tree: Phase1WorkingTree) -> str:
+    if phase1.passed:
+        return (
+            f'{len(tree.state.uncommitted)} tracked file(s) carry uncommitted edits, '
+            'so the committed tree may differ from what passed'
+        )
+    named = tree.named_in_failure
+    if not named:
+        return f'the failing output names none of the {_counts(tree.state)}'
+    shown = ', '.join(_describe(n) for n in named[:_SUMMARY_NAMED_PATH_CAP])
+    return (
+        f'the failing output names {len(named)} file(s) that differ from the '
+        f'committed tree: {shown}{_overflow(len(named), _SUMMARY_NAMED_PATH_CAP)}'
+    )
+
+
+def _passed_lines(tree: Phase1WorkingTree) -> list[str]:
+    return [
+        f'{len(tree.state.uncommitted)} tracked file(s) carry uncommitted edits, so '
+        'this PASS may not hold for the committed versions of those files.',
+    ]
+
+
+def _failed_lines(tree: Phase1WorkingTree) -> list[str]:
+    named = tree.named_in_failure
+    if not named:
+        return [
+            'The failing output names none of those files, so its failures '
+            'concern the committed tree.',
+        ]
+    listed = [f'- `{n.path}` ({n.change.value})' for n in named[:SECTION_NAMED_PATH_CAP]]
+    overflow = len(named) - SECTION_NAMED_PATH_CAP
+    if overflow > 0:
+        listed.append(f'- and {overflow} more')
+    return [
+        'The failing output names these files, which differ from the committed tree:',
+        '',
+        *listed,
+        '',
+        'Failures located in these files come from local working-tree state, not '
+        'committed code: do NOT report them as code findings. Failures located '
+        'elsewhere in the output concern the committed tree.',
+    ]
+
+
+def _counts(state: WorkingTreeState) -> str:
+    return f'{len(state.untracked)} untracked and {len(state.uncommitted)} uncommitted file(s)'
+
+
+def _describe(named: NamedChange) -> str:
+    return f'{named.path} ({named.change.value})'
+
+
+def _overflow(total: int, cap: int) -> str:
+    return f' +{total - cap} more' if total > cap else ''
