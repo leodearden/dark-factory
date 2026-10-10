@@ -34,6 +34,7 @@ from _fused_memory_tool_surface import (
 )
 
 from fused_memory.reconciliation.cli_stage_runner import STAGE1_DISALLOWED, STAGE2_DISALLOWED
+from fused_memory.reconciliation.consolidation_proposal import PROPOSER_AGENT_ID
 from fused_memory.reconciliation.prompts import STALE_KNOWLEDGE_ANNOTATION_NORM
 from fused_memory.reconciliation.prompts.stage1 import (
     PROPOSING_A_CONSOLIDATION_HEADING,
@@ -114,6 +115,11 @@ class TestTheProposalCallMatchesTheToolSchema:
 
     def test_the_example_names_every_required_parameter(self):
         assert set(self._schema()['required']) <= self._kwargs()
+
+    def test_the_example_agent_id_is_the_one_the_tool_admits(self):
+        call = _call_text(_section(PROPOSING_A_CONSOLIDATION_HEADING), _PROPOSE_TOOL_ID)
+
+        assert re.findall(r"agent_id='([^']*)'", call) == [PROPOSER_AGENT_ID]
 
     def test_the_section_is_not_duplicated(self):
         # A second copy would make every slice above scope silently to the first.

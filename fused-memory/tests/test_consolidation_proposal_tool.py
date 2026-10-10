@@ -208,8 +208,19 @@ async def test_the_last_write_wins_per_project_topic_and_run(svc, ledger):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('agent_id', [None, 'curator-x', 'orchestrator'])
-async def test_only_a_recon_stage_may_propose(svc, ledger, agent_id):
+@pytest.mark.parametrize(
+    'agent_id',
+    [
+        None,
+        'curator-x',
+        'orchestrator',
+        'recon-stage-task_knowledge_sync',
+        'recon-stage-integrity_check',
+        'recon-stage-audit_trail_rotation',
+    ],
+)
+async def test_only_recon_stage_1_may_propose(svc, ledger, agent_id):
+    """PRD D12's one proposer, enforced here as well as by the stage deny lists."""
     result = await _call(create_mcp_server(svc), agent_id=agent_id)
 
     assert result['error_type'] == 'ConsolidationProposalNotPermitted'

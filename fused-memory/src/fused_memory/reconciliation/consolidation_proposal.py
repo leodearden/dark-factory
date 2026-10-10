@@ -18,9 +18,14 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
+from fused_memory.models.reconciliation import StageId
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
 
 RECORD_KIND_CONSOLIDATION_PROPOSAL = 'consolidation_proposal'
+
+#: The one caller that may propose (PRD D12): recon Stage 1. The stage deny
+#: lists enforce the same rule from the other side.
+PROPOSER_AGENT_ID = f'recon-stage-{StageId.memory_consolidator.value}'
 
 
 class ProposalState(StrEnum):

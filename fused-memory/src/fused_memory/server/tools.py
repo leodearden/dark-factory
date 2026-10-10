@@ -86,7 +86,10 @@ from fused_memory.reconciliation.citation_verifier import (
     is_concrete_memory_id,
     repoint_task_citations,
 )
-from fused_memory.reconciliation.consolidation_proposal import ConsolidationProposal
+from fused_memory.reconciliation.consolidation_proposal import (
+    PROPOSER_AGENT_ID,
+    ConsolidationProposal,
+)
 from fused_memory.reconciliation.flag_record_contract import (
     recon_stage_flag_kind_refusal,
 )
@@ -4169,9 +4172,9 @@ def create_mcp_server(
         You propose; code decides whether the cluster is consolidated and
         executes it. A ValidationError names every offender at once, with a
         hint: fix them all and call again in the same turn. Re-calling for the
-        same (project, topic, run) overwrites the earlier proposal. Gated on
-        agent_id starting with 'recon-stage-' — a naming convention, not
-        authentication.
+        same (project, topic, run) overwrites the earlier proposal. Only recon
+        Stage 1 may propose: agent_id must be 'recon-stage-memory_consolidator'
+        — a naming convention, not authentication.
 
         Args:
             project_id: Project scope.
@@ -4185,11 +4188,11 @@ def create_mcp_server(
                        never reaches the canonical.
             seeded_from: What surfaced the cluster, e.g. a near-duplicate
                          soft-block (optional). Reviewer-facing.
-            agent_id: Must start with 'recon-stage-' (optional, auto-derived
-                      from MCP context).
+            agent_id: Must be 'recon-stage-memory_consolidator' (optional,
+                      auto-derived from MCP context).
         """
         agent_id, _ = _resolve_identity(agent_id, None, ctx)
-        if not (isinstance(agent_id, str) and agent_id.startswith('recon-stage-')):
+        if agent_id != PROPOSER_AGENT_ID:
             return {
                 'error': 'consolidation_proposal_not_permitted',
                 'error_type': 'ConsolidationProposalNotPermitted',
