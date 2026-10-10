@@ -5274,6 +5274,25 @@ def _scope_launch_argv(scope_unit: str, cpu_weight: int | None) -> list[str]:
     return argv
 
 
+async def _reap_command_subtree(
+    proc: asyncio.subprocess.Process | None,
+    pgid: int | None,
+    scope_unit: str | None,
+) -> None:
+    """Kill a spawned verify command's whole subtree: its cgroup scope first
+    (reaps process-group escapes), then its spawn process group as the backstop.
+
+    A no-op when the spawn never returned a process: either it failed before
+    any scope existed, or it was interrupted and asyncio's spawn cleanup
+    already killed the child."""
+    if proc is None:
+        return
+    if scope_unit is not None:
+        await _kill_cgroup_scope(scope_unit)
+    if pgid is not None:
+        await terminate_process_group(proc, pgid, grace_secs=5.0)
+
+
 async def _run_cmd(
     cmd: str,
     cwd: Path,
@@ -5294,8 +5313,9 @@ async def _run_cmd(
 
     When *use_cgroup_scope* is True and ``systemd-run`` is available, the
     command is launched inside a transient systemd ``--user --scope`` (its own
-    cgroup) so a timeout/cancel can reap the WHOLE subtree by cgroup
-    (``_kill_cgroup_scope``), regardless of process-group escapes — e.g. an
+    cgroup) so any abnormal exit after the spawn (a timeout, a cancel, or
+    another exception such as a log-write ``OSError``) reaps the WHOLE subtree
+    by cgroup (``_kill_cgroup_scope``), regardless of process-group escapes — e.g. an
     inner GNU ``timeout`` that setpgid'd cargo into a separate group, which
     defeats the ``killpg``-on-spawn-pgid fallback and was the leak that let a
     defeated post-merge verify strand live ``cargo`` for up to 30 minutes.
@@ -5578,11 +5598,7 @@ async def _run_cmd(
         rc = proc.returncode if proc.returncode is not None else 1
         return rc, buf.decode(errors='replace'), False
     except TimeoutError:
-        # cgroup kill (primary, reaps process-group escapes) then killpg backstop.
-        if scope_unit is not None:
-            await _kill_cgroup_scope(scope_unit)
-        if proc is not None and pgid is not None:
-            await terminate_process_group(proc, pgid, grace_secs=5.0)
+        await _reap_command_subtree(proc, pgid, scope_unit)
         if _cs_timeout_msg:
             # Clock-stop path: include actual wall time and which deadline
             # fired so infra_timeout incidents are distinguishable in the
@@ -5591,12 +5607,10 @@ async def _run_cmd(
             return 1, f'Command clock-stop timed out ({_cs_timeout_msg[-1]}): {cmd}', True
         return 1, f'Command timed out after {timeout}s: {cmd}', True
     except asyncio.CancelledError:
-        if scope_unit is not None:
-            await _kill_cgroup_scope(scope_unit)
-        if proc is not None and pgid is not None:
-            await terminate_process_group(proc, pgid, grace_secs=5.0)
+        await _reap_command_subtree(proc, pgid, scope_unit)
         raise
     except Exception as e:
+        await _reap_command_subtree(proc, pgid, scope_unit)
         return 1, f'Command failed: {e}', False
 
 
