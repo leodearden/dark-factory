@@ -150,6 +150,9 @@ EPISTEMIC_STATES = frozenset(MergeState) - OUTCOME_STATES
 #: What a REQUEST_ID/TASK_ID-scoped ``merge_status`` poll loop may stop on.
 #: Every epistemic state is a stop because each one replaced an answer that
 #: used to read ``unknown``, which was already a stop on these arms.
+#: ``journaled`` is transient but stays a stop, so this flip changes no
+#: consumer's loop exit; its hint therefore asks for no re-poll.  Whether a
+#: consumer waits through recovery is decided on ``reason`` (PRD task δ).
 POLL_STOP_STATES = TERMINAL_STATES | EPISTEMIC_STATES
 
 #: Exactly what ``merge_cancel``'s ``state`` field can be.

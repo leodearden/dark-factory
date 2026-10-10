@@ -5,6 +5,11 @@ epistemic states), D2 (history never sets an outcome state; invariants I1 and
 I3), D4 (``last_outcome`` is an enrichment, not a tier) and D8 (``hint`` is
 derived from ``reason`` through one table).  The tier walk that produces these
 answers is ``escalation/src/escalation/server.py::merge_status``.
+
+I2 holds in its intent, not its letter: no ``state`` is ever derived from a
+prior-run row, which I1 already guarantees.  A git-proven ``done`` beside a
+prior-run ``done`` in ``last_outcome`` is corroboration, not leakage
+(``escalation/tests/test_merge_status_tiers.py::TestGitOutranksCheapTiers``).
 """
 from __future__ import annotations
 
@@ -69,8 +74,9 @@ _HINTS: Mapping[MergeReason, str] = types.MappingProxyType({
     ),
     MergeReason.journaled_not_live: (
         'The durable merge journal holds this request but the live worker does '
-        'not: the orchestrator is between restart and recovery. Poll again; '
-        'startup recovery re-enqueues journaled requests.'
+        'not: the orchestrator is between restart and recovery, and startup '
+        'recovery re-enqueues journaled requests. Do not resubmit; the queue '
+        'still owns this request.'
     ),
     MergeReason.coalesce_train_id: (
         'This id names a coalesced train and has no outcome row of its own; '
