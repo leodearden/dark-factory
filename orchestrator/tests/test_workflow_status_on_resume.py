@@ -148,13 +148,16 @@ def _build_workflow(
     assignment: TaskAssignment,
     queue: EscalationQueue,
     worktree: Path,
+    *,
+    scheduler: FakeScheduler | None = None,
+    steward_factory: type | None = None,
 ) -> tuple[TaskWorkflow, FakeScheduler]:
     """Wire a TaskWorkflow with all fakes for these tests.
 
     Worktree is set externally (eval-mode path) so run() skips create_worktree
     AND skips merge phase (post-success path runs unconditionally though).
     """
-    scheduler = FakeScheduler()
+    scheduler = scheduler if scheduler is not None else FakeScheduler()
     workflow = TaskWorkflow(
         assignment=assignment,
         config=config,
@@ -164,6 +167,7 @@ def _build_workflow(
         mcp=FakeMcp(),  # type: ignore[arg-type]
         escalation_queue=queue,
         initial_plan=dict(PLAN),
+        steward_factory=steward_factory,
     )
     # Pre-set worktree so run() goes through the eval-mode external path.
     # _worktree_external is then set to True inside run() — MERGE block is
@@ -268,11 +272,13 @@ class TestStatusPreservationOnResume:
         wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
         queue = EscalationQueue(tmp_path / 'queue')
         _submit_l0(queue, task_assignment.task_id)
-        workflow, scheduler = _build_workflow(
+        scheduler = FakeScheduler()
+        workflow, _ = _build_workflow(
             config, git_ops, task_assignment, queue, wt,
-        )
-        workflow._steward_factory = _make_status_setting_steward(
-            queue, scheduler, task_assignment.task_id, 'deferred',
+            scheduler=scheduler,
+            steward_factory=_make_status_setting_steward(
+                queue, scheduler, task_assignment.task_id, 'deferred',
+            ),
         )
         evrl_mock, state = _make_evrl_returner(
             [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
@@ -310,11 +316,13 @@ class TestStatusPreservationOnResume:
         wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
         queue = EscalationQueue(tmp_path / 'queue')
         _submit_l0(queue, task_assignment.task_id)
-        workflow, scheduler = _build_workflow(
+        scheduler = FakeScheduler()
+        workflow, _ = _build_workflow(
             config, git_ops, task_assignment, queue, wt,
-        )
-        workflow._steward_factory = _make_status_setting_steward(
-            queue, scheduler, task_assignment.task_id, 'cancelled',
+            scheduler=scheduler,
+            steward_factory=_make_status_setting_steward(
+                queue, scheduler, task_assignment.task_id, 'cancelled',
+            ),
         )
         evrl_mock, state = _make_evrl_returner(
             [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
@@ -340,11 +348,13 @@ class TestStatusPreservationOnResume:
         wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
         queue = EscalationQueue(tmp_path / 'queue')
         _submit_l0(queue, task_assignment.task_id)
-        workflow, scheduler = _build_workflow(
+        scheduler = FakeScheduler()
+        workflow, _ = _build_workflow(
             config, git_ops, task_assignment, queue, wt,
-        )
-        workflow._steward_factory = _make_status_setting_steward(
-            queue, scheduler, task_assignment.task_id, 'done',
+            scheduler=scheduler,
+            steward_factory=_make_status_setting_steward(
+                queue, scheduler, task_assignment.task_id, 'done',
+            ),
         )
         evrl_mock, state = _make_evrl_returner(
             [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
@@ -378,10 +388,10 @@ class TestStatusPreservationOnResume:
         _submit_l0(queue, task_assignment.task_id)
         workflow, scheduler = _build_workflow(
             config, git_ops, task_assignment, queue, wt,
-        )
-        # Resolving steward — does not touch task status.
-        workflow._steward_factory = _make_resolving_steward(
-            queue, task_assignment.task_id,
+            # Resolving steward — does not touch task status.
+            steward_factory=_make_resolving_steward(
+                queue, task_assignment.task_id,
+            ),
         )
         # ESCALATED first, then DONE on the post-resume re-entry.
         evrl_mock, state = _make_evrl_returner(
@@ -421,9 +431,9 @@ class TestStatusPreservationOnResume:
         _submit_l0(queue, task_assignment.task_id)
         workflow, _scheduler = _build_workflow(
             config, git_ops, task_assignment, queue, wt,
-        )
-        workflow._steward_factory = _make_resolving_steward(
-            queue, task_assignment.task_id,
+            steward_factory=_make_resolving_steward(
+                queue, task_assignment.task_id,
+            ),
         )
         evrl_mock, _state = _make_evrl_returner(
             [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
@@ -476,11 +486,11 @@ class TestStatusPreservationOnResume:
         _submit_l0(queue, task_assignment.task_id, category='scope_violation')
         workflow, scheduler = _build_workflow(
             config, git_ops, task_assignment, queue, wt,
-        )
-        # Resolving steward — does not touch task status, so it stays
-        # in-progress and the resume path is live.
-        workflow._steward_factory = _make_resolving_steward(
-            queue, task_assignment.task_id,
+            # Resolving steward — does not touch task status, so it stays
+            # in-progress and the resume path is live.
+            steward_factory=_make_resolving_steward(
+                queue, task_assignment.task_id,
+            ),
         )
         # ESCALATED first, then DONE on the post-resume re-entry.
         evrl_mock, state = _make_evrl_returner(
@@ -522,11 +532,11 @@ class TestStatusPreservationOnResume:
         _submit_l0(queue, task_assignment.task_id, category='scope_violation')
         workflow, scheduler = _build_workflow(
             config, git_ops, task_assignment, queue, wt,
-        )
-        # Granting steward — lock is free (FakeScheduler.blast_radius_result
-        # defaults to applied), so the scope-widen must succeed.
-        workflow._steward_factory = _make_granting_steward(
-            queue, task_assignment.task_id, ['new.py'],
+            # Granting steward — lock is free (FakeScheduler.blast_radius_result
+            # defaults to applied), so the scope-widen must succeed.
+            steward_factory=_make_granting_steward(
+                queue, task_assignment.task_id, ['new.py'],
+            ),
         )
         # ESCALATED first, then DONE on the post-resume re-entry.
         evrl_mock, state = _make_evrl_returner(
@@ -589,17 +599,17 @@ class TestStatusPreservationOnResume:
         _submit_l0(queue, task_assignment.task_id, category='scope_violation')
         workflow, scheduler = _build_workflow(
             config, git_ops, task_assignment, queue, wt,
+            # Granting steward — grant the same-package sibling; lock is free
+            # (blast_radius_result defaults to applied, though for a same-module widen no
+            # blast-radius call is expected at all).
+            steward_factory=_make_granting_steward(
+                queue, task_assignment.task_id, [f2],
+            ),
         )
         # Seed the plan with F1 only and the matching (single-module) lock set,
         # so the granted sibling F2 does NOT change the module set.
         workflow.initial_plan = {**dict(PLAN), 'files': [f1]}
         workflow.modules = files_to_modules([f1], config.lock_depth)
-        # Granting steward — grant the same-package sibling; lock is free
-        # (blast_radius_result defaults to applied, though for a same-module widen no
-        # blast-radius call is expected at all).
-        workflow._steward_factory = _make_granting_steward(
-            queue, task_assignment.task_id, [f2],
-        )
         evrl_mock, state = _make_evrl_returner(
             [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
         )
@@ -661,12 +671,12 @@ class TestStatusPreservationOnResume:
         _submit_l0(queue, task_assignment.task_id, category='scope_violation')
         workflow, scheduler = _build_workflow(
             config, git_ops, task_assignment, queue, wt,
+            steward_factory=_make_granting_steward(
+                queue, task_assignment.task_id, ['new.py'],
+            ),
         )
         # Sibling holds the additional lock the grant needs.
         scheduler.blast_radius_result = BlastRadiusResult(applied=False)
-        workflow._steward_factory = _make_granting_steward(
-            queue, task_assignment.task_id, ['new.py'],
-        )
         evrl_mock, state = _make_evrl_returner(
             [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
         )
@@ -704,12 +714,14 @@ class TestStatusPreservationOnResume:
         wt = wt_info.path
         queue = EscalationQueue(tmp_path / 'queue')
         _submit_l0(queue, task_assignment.task_id)
-        workflow, scheduler = _build_workflow(
+        scheduler = FakeScheduler()
+        workflow, _ = _build_workflow(
             config, git_ops, task_assignment, queue, wt,
-        )
-        # Steward sets deferred — Fix 1 would otherwise return BLOCKED here.
-        workflow._steward_factory = _make_status_setting_steward(
-            queue, scheduler, task_assignment.task_id, 'deferred',
+            scheduler=scheduler,
+            # Steward sets deferred — Fix 1 would otherwise return BLOCKED here.
+            steward_factory=_make_status_setting_steward(
+                queue, scheduler, task_assignment.task_id, 'deferred',
+            ),
         )
         # This fixture's worktree is fresh/empty (no commits), so it has no
         # real implementation work — in eval mode, _setup_worktree_and_artifacts
