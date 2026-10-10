@@ -28,7 +28,9 @@ from fused_memory.config.schema import (
 )
 
 FIELD = 'write_triage_project_calibrations'
-PROJECT = 'dark_factory'
+# Never a shipped key: pydantic-settings deep-merges init kwargs OVER the YAML
+# source, so an entry for a project config.yaml also carries would MERGE with it.
+PROJECT = 'synthetic_project'
 REPORT = 'calibration/x.json'
 
 

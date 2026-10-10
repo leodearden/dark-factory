@@ -757,3 +757,19 @@ write_triage:
   # withheld from `--apply` deletion (`ann_cutoff_not_evidenced_for_category`):
   # still reported, never irreversibly acted on with a cutoff measured
   # elsewhere.
+  # - Per-project cutoffs for these two categories (task 5547, measured on
+  #   the dark_factory corpus) live in write_triage_project_calibrations
+  #   below; a run whose --project-id matches reads them before this map.
+  #   The reify statements above are unchanged.
+
+write_triage_project_calibrations:
+  # CALIBRATION OUTPUT — machine-owned; do not hand-edit.
+  # Per-project per-category cutoffs, each measured on that project's own
+  # fixture by scripts/calibrate_write_triage.py --write-project-config.
+  # Read only by scripts/audit_duplicate_memories.py for a run whose
+  # --project-id equals the key; never pooled with write_triage's bands.
+  # Hand edits inside this section are not preserved.
+  dark_factory:
+    calibration_report_path: calibration/write_triage_calibration_report_dark_factory.json
+    t_high_by_category:
+      observations_and_summaries: 0.8578402160989046
