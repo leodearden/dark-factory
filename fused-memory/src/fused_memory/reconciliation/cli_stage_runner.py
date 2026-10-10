@@ -16,6 +16,7 @@ from shared.cli_invoke import (
     invoke_with_cap_retry,
     is_zero_output_timeout,
 )
+from shared.config_dir import CONFIG_DIR_PREFIX
 
 from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES, StageAgentOutcome
 from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
@@ -674,19 +675,26 @@ def recon_config_base_dir(data_dir: Path) -> Path:
     return base / 'recon-config'
 
 
+def run_config_dir_path(data_dir: Path, run_id: str) -> Path:
+    """Path of a run's per-run recon CLI config dir — a PURE derivation.
+
+    Names exactly ``TaskConfigDir(task_id=run_id, base_dir=recon_config_base_dir(data_dir)).path``
+    without constructing one. That is the point: ``TaskConfigDir.__init__``
+    mkdirs the dir and symlinks settings into it, so a read-only caller — the
+    resume-eligibility probe asking whether a transcript survives — would
+    resurrect the very directory it is probing for.
+    """
+    return recon_config_base_dir(data_dir) / f'{CONFIG_DIR_PREFIX}{run_id}'
+
+
 def gc_run_config_dir(data_dir: Path, run_id: str) -> None:
     """Remove a run's per-run recon CLI config dir, if present (task 2744).
 
-    ``TaskConfigDir(task_id=run_id, base_dir=recon_config_base_dir(data_dir)).path``
-    is ``recon_config_base_dir(data_dir) / f'claude-config-{run_id}'`` by
-    construction (config_dir.py's deterministic naming); this rmtrees exactly
-    that path. ``ignore_errors=True`` makes it a silent no-op when the dir was
-    never created (e.g. a run that short-circuited before any stage launch).
+    Targets ``run_config_dir_path(data_dir, run_id)``, the same path the
+    creator builds. ``ignore_errors=True`` makes it a silent no-op when the dir
+    was never created (e.g. a run that short-circuited before any stage launch).
     """
-    shutil.rmtree(
-        recon_config_base_dir(data_dir) / f'claude-config-{run_id}',
-        ignore_errors=True,
-    )
+    shutil.rmtree(run_config_dir_path(data_dir, run_id), ignore_errors=True)
 
 
 async def run_stage_via_cli(
