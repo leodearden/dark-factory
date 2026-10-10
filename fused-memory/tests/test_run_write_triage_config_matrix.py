@@ -17,6 +17,7 @@ import functools
 import hashlib
 import json
 import types
+from datetime import UTC, datetime, timedelta
 from itertools import chain
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,7 @@ IOTA_PATH = SCRIPTS / 'score_write_triage_pairs.py'
 GATE_PATH = Path(__file__).resolve().parents[2] / 'scripts' / 'check_write_triage_readiness_gate.py'
 
 SNAPSHOT = 'snap'
+SNAPSHOT_PATH = 'data/x/snapshot.json'
 REFERENCE = 'gpt-4o-mini@5'
 PRE_PSI = 'gpt-4o-mini@5+pre-psi'
 SOL = 'gpt-6.1-sol:low@5'
@@ -65,14 +67,18 @@ def _row(
     prompt: int = 100,
     completion: int = 10,
     snapshot: str = SNAPSHOT,
+    recon_marker: bool = False,
+    declares_attach_keys: bool = False,
+    slates: str = 'write-time',
 ) -> dict[str, Any]:
-    """One ι-contract judge-band case row, as π writes it."""
+    """One ι-contract judge-band case row, as π2 writes it on write-time slates."""
     return {
         'arm': arm, 'memory_id': memory_id, 'band': 'judge', 'outcome': outcome,
         'judged_candidate_id': judged, 'band_winner_id': winner,
         'parse_failure': False, 'judge_seconds': seconds, 'judge_model': model,
         'usage': {'prompt_tokens': prompt, 'completion_tokens': completion},
-        'snapshot_sha256': snapshot,
+        'snapshot_sha256': snapshot, 'recon_marker': recon_marker,
+        'declares_attach_keys': declares_attach_keys, 'slates': slates,
     }
 
 
@@ -97,18 +103,32 @@ def _provenance(
 def _population(
     arms: list[dict[str, Any]], n_judge_band: int, snapshot: str = SNAPSHOT,
 ) -> dict[str, Any]:
-    """A doc shaped like ``calibration/write_triage_population.json``."""
+    """A doc shaped like π2's ``calibration/write_triage_population_write_time.json``."""
     return {
         'population': {
+            'slates': 'write-time',
             'n_writes': n_judge_band + 3,
-            'n_judge_band': n_judge_band,
-            'n_judge_band_frozen': n_judge_band,
+            'n_judge_band_write_time': n_judge_band,
             'projects': ['dark_factory', 'reify'],
             'frozen_at': '2026-10-05T10:01:34+00:00',
             'snapshot_sha256': snapshot,
-            'snapshot_path': 'data/x/snapshot.json',
+            'snapshot_path': SNAPSHOT_PATH,
+            't_high': 0.8868,
+            't_low': 0.5230,
         },
         'arms': arms,
+    }
+
+
+def _c2_block(doc: dict[str, Any]) -> dict[str, Any]:
+    """The C2 population block μ carries for a write-time population *doc*."""
+    block = doc['population']
+    return {
+        'n_writes': block['n_writes'],
+        'n_judge_band': block['n_judge_band_write_time'],
+        'projects': block['projects'],
+        'frozen_at': block['frozen_at'],
+        'snapshot_sha256': block['snapshot_sha256'],
     }
 
 
@@ -133,6 +153,42 @@ VERDICTS = [
     _vote('w3', 't3b', 'SAME'),
     _vote('w4', 't4', 'EXTENDS'),
 ]
+
+T0 = datetime(2026, 10, 1, 12, tzinfo=UTC)
+SLATE_OF = {'w1': ('t1',), 'w2': ('t2',), 'w3': ('t3', 't3b'), 'w4': ('t4',)}
+"""Each write's write-time slate: every target it was rated against, all created before it."""
+CREATED_AT: dict[str, datetime] = {
+    **dict.fromkeys(SLATE_OF, T0),
+    **{target: T0 - timedelta(days=1) for slate in SLATE_OF.values() for target in slate},
+}
+
+
+def _snapshot_doc() -> dict[str, Any]:
+    """A frozen snapshot whose writes and slate candidates carry :data:`CREATED_AT`."""
+    return {
+        'writes': [
+            {
+                'memory_id': write, 'created_at': CREATED_AT[write].isoformat(),
+                'candidates': [
+                    {'memory_id': target, 'created_at': CREATED_AT[target].isoformat()}
+                    for target in slate
+                ],
+            }
+            for write, slate in SLATE_OF.items()
+        ],
+        'targets': {},
+    }
+
+
+def _write_snapshot(root: Path, doc: dict[str, Any] | None = None) -> str:
+    """Write *doc* and its sidecar where the population's snapshot_path points; its digest."""
+    path = root / SNAPSHOT_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps(_snapshot_doc() if doc is None else doc, sort_keys=True).encode()
+    path.write_bytes(body)
+    digest = hashlib.sha256(body).hexdigest()
+    (path.parent / 'snapshot.sha256').write_text(digest + '\n')
+    return digest
 
 
 Answers = list[tuple[str, str, str | None]]
@@ -236,11 +292,7 @@ def test_build_matrix_scores_every_pi_arm_with_iota() -> None:
             'p95_judge_seconds': iota['runtime']['p95_judge_seconds'],
             'cost_per_write_usd': iota['runtime']['cost_per_write_usd'],
         }
-    block = _population(THREE_ARMS, 4)['population']
-    assert matrix['population'] == {
-        key: block[key]
-        for key in ('n_writes', 'n_judge_band', 'projects', 'frozen_at', 'snapshot_sha256')
-    }
+    assert matrix['population'] == _c2_block(_population(THREE_ARMS, 4))
     assert matrix['verdict_corpus'] == oracle['verdict_corpus']
     assert matrix['list_prices'] == oracle['list_prices']
 
@@ -533,7 +585,8 @@ def test_read_arm_cases_refuses_a_missing_file(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ('field', 'value'), [('arm', 'other'), ('snapshot_sha256', 'another-snapshot')],
+    ('field', 'value'),
+    [('arm', 'other'), ('snapshot_sha256', 'another-snapshot'), ('slates', 'frozen')],
 )
 def test_read_arm_cases_refuses_rows_of_another_arm_or_snapshot(
     field: str, value: str, tmp_path: Path,
@@ -570,6 +623,22 @@ MALFORMED_POPULATIONS: dict[str, tuple[Any, list[str]]] = {
         lambda doc: dict(doc, population=_without(doc['population'], 'snapshot_sha256')),
         ['snapshot_sha256'],
     ),
+    'block-lacks-write-time-judge-band': (
+        lambda doc: dict(doc, population=_without(doc['population'], 'n_judge_band_write_time')),
+        ['n_judge_band_write_time'],
+    ),
+    'block-lacks-snapshot-path': (
+        lambda doc: dict(doc, population=_without(doc['population'], 'snapshot_path')),
+        ['snapshot_path'],
+    ),
+    'frozen-slates-artifact-without-slates': (
+        lambda doc: dict(doc, population=_without(doc['population'], 'slates')),
+        ['slates', 'None'],
+    ),
+    'frozen-slates': (
+        lambda doc: dict(doc, population={**doc['population'], 'slates': 'frozen'}),
+        ['slates', "'frozen'"],
+    ),
     'no-arms': (lambda doc: _without(doc, 'arms'), ['arms']),
     'arm-not-an-object': (lambda doc: _with_arm(doc, 2, SOL), ['population artifact']),
     'not-an-object': (lambda doc: [doc], ['population artifact']),
@@ -589,6 +658,58 @@ def test_population_from_artifact_refuses_a_malformed_doc_naming_what_is_wrong(c
         _mod().Population.from_artifact(doc)
     message = str(refusal.value)
     assert all(word in message for word in named), message
+
+
+def test_population_reads_the_write_time_artifact_into_the_c2_block() -> None:
+    doc = _population(THREE_ARMS, 4)
+    population = _mod().Population.from_artifact(doc)
+
+    assert population.c2_block() == _c2_block(doc)
+    assert population.c2_block()['n_judge_band'] == doc['population']['n_judge_band_write_time']
+    assert _mod().POPULATION_KEYS == (
+        'n_writes', 'n_judge_band', 'projects', 'frozen_at', 'snapshot_sha256',
+    )
+
+
+def test_read_record_created_at_reads_the_pinned_snapshot(tmp_path: Path) -> None:
+    digest = _write_snapshot(tmp_path)
+    population = _mod().Population.from_artifact(_population(THREE_ARMS, 4, snapshot=digest))
+
+    assert _mod().read_record_created_at(population, tmp_path) == CREATED_AT
+
+
+def test_read_record_created_at_refuses_a_missing_snapshot(tmp_path: Path) -> None:
+    population = _mod().Population.from_artifact(_population(THREE_ARMS, 4))
+
+    with pytest.raises(_mod().MatrixInputError) as refusal:
+        _mod().read_record_created_at(population, tmp_path)
+    message = str(refusal.value)
+    assert str(tmp_path / SNAPSHOT_PATH) in message and '--data-root' in message, message
+
+
+def test_read_record_created_at_refuses_a_snapshot_the_population_does_not_pin(
+    tmp_path: Path,
+) -> None:
+    digest = _write_snapshot(tmp_path)
+    pinned = 'f' * 64
+    population = _mod().Population.from_artifact(_population(THREE_ARMS, 4, snapshot=pinned))
+
+    with pytest.raises(_mod().MatrixInputError) as refusal:
+        _mod().read_record_created_at(population, tmp_path)
+    message = str(refusal.value)
+    assert digest in message and pinned in message, message
+
+
+def test_read_record_created_at_propagates_a_sidecar_mismatch(tmp_path: Path) -> None:
+    digest = _write_snapshot(tmp_path)
+    sidecar = 'e' * 64
+    (tmp_path / SNAPSHOT_PATH).with_name('snapshot.sha256').write_text(sidecar + '\n')
+    population = _mod().Population.from_artifact(_population(THREE_ARMS, 4, snapshot=digest))
+
+    with pytest.raises(ValueError) as refusal:
+        _mod().read_record_created_at(population, tmp_path)
+    assert type(refusal.value) is ValueError
+    assert digest in str(refusal.value) and sidecar in str(refusal.value)
 
 
 def test_build_matrix_refuses_an_arm_whose_judge_band_disagrees_with_the_population() -> None:
