@@ -66,6 +66,7 @@ from fused_memory.middleware.referent_repair_storm_escalator import (
 from fused_memory.models.enums import (
     GRAPHITI_PRIMARY,
     MEM0_PRIMARY,
+    ClassificationFallback,
     MemoryCategory,
     SourceStore,
 )
@@ -103,6 +104,10 @@ from fused_memory.reconciliation.standing_decision_writer import (
 )
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
+from fused_memory.services.classification_fallback_alarm import (
+    ClassificationFallbackAlarm,
+    journal_params,
+)
 from fused_memory.services.completion_claim_gate import UNVERIFIED_CLAIM_TAG
 from fused_memory.services.durable_queue import DeadLetterEvent, DurableWriteQueue
 from fused_memory.services.memory_metadata_census import (
@@ -2300,6 +2305,9 @@ class MemoryService:
         # leaves read back valid, so a green-tier hot reload that fixes and
         # later re-breaks them earns a second line.
         self._entity_mint_storm_config_warned = False
+        # INV-4 storm escape for WriteClassifier LLM fallbacks on the unlabelled
+        # write path: services/classification_fallback_alarm.py.
+        self._classification_fallback_alarm = ClassificationFallbackAlarm()
         # INV-4 storm escape for the referent-set queue channel (task 3670, PRD
         # leaf epsilon). `_decode_referents` degrades an unreadable or absent
         # blob to ('none') rather than raising — losing the memory over a
@@ -6171,6 +6179,15 @@ class MemoryService:
                     error=error_msg,
                 )
 
+    async def _record_classification_fallback(
+        self, fallback: ClassificationFallback | None, project_id: str
+    ) -> None:
+        await self._classification_fallback_alarm.record(
+            fallback,
+            project_id=project_id,
+            project_root=self._known_projects.get(project_id),
+        )
+
     async def _execute_mem0_classify_and_add(
         self, payload: dict[str, Any]
     ) -> Any:
@@ -6213,6 +6230,9 @@ class MemoryService:
             payload={'content': fact_text[:200]},
             coro=self.mem0.add(content=fact_text, scope=scope, metadata=metadata),
         )
+        # Only once the write has landed: a failed write is retried through this
+        # whole executor, and a retry must not count the same fact again.
+        await self._record_classification_fallback(classification.fallback, scope.project_id)
 
         # Log Layer 1 for the derived write
         if self._write_journal:
@@ -6228,6 +6248,7 @@ class MemoryService:
                 params={
                     'content': fact_text[:200],
                     'category': classification.primary.value,
+                    **journal_params(classification.fallback),
                 },
                 result_summary=str(result)[:500] if result else None,
                 success=True,
@@ -6655,9 +6676,12 @@ class MemoryService:
         meta = enforce_flag_record_write_contract(metadata, agent_id=agent_id)
 
         # Resolve category
+        classification_fallback: ClassificationFallback | None = None
         if category is None:
             classification = await self.classifier.classify(content)
             resolved_category = classification.primary
+            classification_fallback = classification.fallback
+            await self._record_classification_fallback(classification_fallback, project_id)
         elif isinstance(category, str):
             resolved_category = MemoryCategory(category)
         else:
@@ -6883,7 +6907,11 @@ class MemoryService:
                 project_id=project_id,
                 agent_id=agent_id,
                 session_id=session_id,
-                params={'content': content[:200], 'category': resolved_category.value},
+                params={
+                    'content': content[:200],
+                    'category': resolved_category.value,
+                    **journal_params(classification_fallback),
+                },
                 result_summary={
                     'memory_ids': memory_ids,
                     'stores': [s.value for s in stores_written],
@@ -6911,12 +6939,15 @@ class MemoryService:
             msg += f' [graphiti_error: {_graphiti_error}]'
         if _mem0_error:
             msg += f' [mem0_error: {_mem0_error}]'
+        if classification_fallback is not None:
+            msg += f' [classification_fallback: {classification_fallback.value}]'
 
         return AddMemoryResponse(
             memory_ids=memory_ids,
             stores_written=stores_written,
             category=resolved_category,
             message=msg,
+            classification_fallback=classification_fallback,
         )
 
     # ------------------------------------------------------------------

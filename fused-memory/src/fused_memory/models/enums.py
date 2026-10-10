@@ -32,6 +32,22 @@ class QueryType(StrEnum):
     broad = 'broad'
 
 
+class ClassificationFallback(StrEnum):
+    """Why a write classification is a default category rather than a classification."""
+
+    llm_error = 'llm_error'  # the LLM call raised, or its answer did not parse
+    llm_no_json = 'llm_no_json'  # the LLM answered with no JSON object
+    no_confident_match = 'no_confident_match'  # heuristic-only mode matched nothing
+
+
+# The classifier's LLM tier failed, as opposed to the configured heuristic-only
+# default; the storm alarm counts only these.
+LLM_CLASSIFIER_FAILURES: frozenset[ClassificationFallback] = frozenset({
+    ClassificationFallback.llm_error,
+    ClassificationFallback.llm_no_json,
+})
+
+
 # Categories whose primary store is Graphiti
 GRAPHITI_PRIMARY: frozenset[MemoryCategory] = frozenset({
     MemoryCategory.entities_and_relations,
