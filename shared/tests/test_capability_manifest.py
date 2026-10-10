@@ -652,6 +652,47 @@ class TestCapabilityManifestDoc:
             )
         assert 'task label must be non-empty' in str(exc_info.value)
 
+    @staticmethod
+    def _doc_with_signal_leaves(signal_leaves):
+        return CapabilityManifestDoc(
+            prd='plans/example-prd.md',
+            schema_version=1,
+            tasks=[_task_dict('α'), _task_dict('β')],  # type: ignore[arg-type]
+            signal_leaves=signal_leaves,
+        )
+
+    def test_signal_leaves_naming_known_labels_load(self):
+        assert self._doc_with_signal_leaves(['β']).signal_leaves == ['β']
+        assert self._doc_with_signal_leaves(['β', 'α']).signal_leaves == ['β', 'α']
+
+    def test_signal_leaves_defaults_to_none(self):
+        doc = CapabilityManifestDoc(
+            prd='plans/example-prd.md',
+            schema_version=1,
+            tasks=[_task_dict('α')],  # type: ignore[arg-type]
+        )
+        assert doc.signal_leaves is None
+
+    def test_signal_leaves_unknown_label_raises_naming_it_and_the_known_labels(self):
+        with pytest.raises(ValidationError) as exc_info:
+            self._doc_with_signal_leaves(['ω'])
+        message = str(exc_info.value)
+        assert 'ω' in message
+        assert 'α' in message
+        assert 'β' in message
+
+    def test_signal_leaves_mixing_known_and_unknown_names_the_unknown_one(self):
+        with pytest.raises(ValidationError) as exc_info:
+            self._doc_with_signal_leaves(['α', 'ω'])
+        assert "'ω'" in str(exc_info.value)
+
+    def test_empty_signal_leaves_raises(self):
+        with pytest.raises(ValidationError) as exc_info:
+            self._doc_with_signal_leaves([])
+        message = str(exc_info.value)
+        assert 'signal_leaves' in message
+        assert 'non-empty' in message
+
 
 #: The one committed exemplar sidecar TestLoader validates directly, and the
 #: anchor TestManifestCorpusDiscovery asserts is present in the full corpus
@@ -750,6 +791,27 @@ tasks:
         assert task.note.startswith('SPLIT 2026-08-19.')
         assert 'this leaf carries fused-memory' in task.note
         assert task.capabilities[0].verdict == 'OPEN'
+
+    #: The minimal sidecar a legacy, chain-only PRD gets (plans/dashboard-prd-lanes-prd.md
+    #: §9 ε): one hand-bound block, no capabilities, and its signal leaf named.
+    _MINIMAL_SIGNAL_LEAF_YAML = """\
+prd: plans/legacy-prd.md
+schema_version: 1
+signal_leaves:
+  - "ζ"
+tasks:
+  - label: "ζ"
+    task_id: 1234
+    capabilities: []
+"""
+
+    def test_minimal_sidecar_with_only_the_signal_leaf_block_loads(self, tmp_path):
+        sidecar = tmp_path / 'legacy-prd.capability-manifest.yaml'
+        sidecar.write_text(self._MINIMAL_SIGNAL_LEAF_YAML, encoding='utf-8')
+        doc = load_capability_manifest(sidecar)
+        assert doc.signal_leaves == ['ζ']
+        assert doc.tasks[0].task_id == 1234
+        assert doc.tasks[0].capabilities == []
 
     def test_load_capability_manifest_accepts_str_path(self, tmp_path):
         sidecar = tmp_path / 'example-prd.capability-manifest.yaml'
