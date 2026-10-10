@@ -639,22 +639,24 @@ class EventBuffer:
         ]
 
     async def drain_by_ids(
-        self, project_id: str, ids: list[str],
+        self, project_id: str, ids: list[str], run_id: str | None = None,
     ) -> int:
         """Mark specific event IDs as drained.
 
         Used after the ContextAssembler determines which events fit the
-        token budget.  Returns the number of rows updated.
+        token budget.  Returns the number of rows updated.  Like ``drain``,
+        a ``run_id`` is stamped as ``drained_by_run_id`` so a later
+        run-scoped ``restore_drained`` can target exactly this chunk.
         """
         if not ids:
             return 0
         placeholders = ','.join('?' for _ in ids)
         async with self._require_access().write() as db:
             cursor = await db.execute(
-                f"""UPDATE event_buffer SET status = 'drained'
+                f"""UPDATE event_buffer SET status = 'drained', drained_by_run_id = ?
                     WHERE project_id = ? AND id IN ({placeholders})
                       AND status = 'buffered'""",
-                [project_id, *ids],
+                [run_id, project_id, *ids],
             )
             rowcount = cursor.rowcount
         return rowcount
