@@ -311,6 +311,7 @@ def _import_graph(sources: Sequence[_FileImports], known: frozenset[str]) -> _Im
         typing_cycles=_cycles(edges),
         field_counts={
             'reach_back_imports': Counter(entry['from'] for entry in reach_back),
+            'cycle_closing_imports': Counter(entry['from'] for entry in deferred if entry['closes_cycle']),
             'fan_out': Counter(source for source, _target in edges),
             'fan_in_src': Counter(target for _source, target in edges),
             'fan_in_tests': _tests_importers(sources, known),
@@ -679,35 +680,37 @@ _STRING = _Leaf(lambda value: isinstance(value, str), 'a string')
 _BOOLEAN = _Leaf(lambda value: isinstance(value, bool), 'a boolean')
 _STRINGS = _ListOf(_STRING)
 
-_RECORD = _ByKind(
-    common={
-        'member': _STRING,
-        'kind': _STRING,
-        'blob': _STRING,
-        'lines': _INTEGER,
-        'prose_lines': _INTEGER,
-        'prose_ratio': _Leaf(lambda value: value is None or _is_number(value), 'a number or null'),
-        'cognitive_total': _INTEGER,
-        'cognitive_max': _INTEGER,
-        'cognitive_max_function': _Leaf(
-            lambda value: value is None or isinstance(value, str), 'a string or null'
-        ),
-        'functions': _INTEGER,
-    },
-    kinds={
-        _SRC: {
-            'module': _STRING,
-            'package_init': _BOOLEAN,
-            'function_local_imports': _INTEGER,
-            'reexport_names': _STRINGS,
-            'reach_back_imports': _INTEGER,
-            'fan_out': _INTEGER,
-            'fan_in_src': _INTEGER,
-            'fan_in_tests': _INTEGER,
+def _record_shape(src: Mapping[str, _Shape]) -> _ByKind:
+    """A file record whose src kind has the fields *src*."""
+    return _ByKind(
+        common={
+            'member': _STRING,
+            'kind': _STRING,
+            'blob': _STRING,
+            'lines': _INTEGER,
+            'prose_lines': _INTEGER,
+            'prose_ratio': _Leaf(lambda value: value is None or _is_number(value), 'a number or null'),
+            'cognitive_total': _INTEGER,
+            'cognitive_max': _INTEGER,
+            'cognitive_max_function': _Leaf(
+                lambda value: value is None or isinstance(value, str), 'a string or null'
+            ),
+            'functions': _INTEGER,
         },
-        _TESTS: {'private_patch_targets': _STRINGS, 'private_reads': _INTEGER},
-    },
-)
+        kinds={_SRC: src, _TESTS: {'private_patch_targets': _STRINGS, 'private_reads': _INTEGER}},
+    )
+
+
+_SCHEMA_1_SRC: Mapping[str, _Shape] = {
+    'module': _STRING,
+    'package_init': _BOOLEAN,
+    'function_local_imports': _INTEGER,
+    'reexport_names': _STRINGS,
+    'reach_back_imports': _INTEGER,
+    'fan_out': _INTEGER,
+    'fan_in_src': _INTEGER,
+    'fan_in_tests': _INTEGER,
+}
 
 _EDGES = _ListOf(_Leaf(_is_edge, 'a [from, to] pair of module names'))
 _REACH_BACKS = _ListOf(_Object({'from': _STRING, 'to': _STRING, 'names': _STRINGS, 'line': _INTEGER}))
@@ -735,7 +738,15 @@ _SCHEMA_1_IMPORT_GRAPH = _Object({
 _INSTRUMENT = _Leaf(lambda value: value == INSTRUMENT, json.dumps(INSTRUMENT))
 
 
-def _snapshot_shape(version: int, import_graph: _Object) -> _Object:
+@dataclasses.dataclass(frozen=True)
+class _Schema:
+    """What a schema version's file record and import graph hold."""
+
+    record: _ByKind
+    import_graph: _Object
+
+
+def _snapshot_shape(version: int, schema: _Schema) -> _Object:
     """Every field a schema-*version* file holds (plans/quality-metrics-snapshot-prd.md §Contract)."""
     return _Object(
         {
@@ -760,18 +771,23 @@ def _snapshot_shape(version: int, import_graph: _Object) -> _Object:
                 'h14_soft_ceiling_lines': _INTEGER,
                 'h14_alarm_lines': _INTEGER,
             }),
-            'files': _MapOf(_RECORD),
+            'files': _MapOf(schema.record),
             'functions': _MapOf(_INTEGER),
-            'import_graph': import_graph,
+            'import_graph': schema.import_graph,
         },
         ordered=True,
     )
 
 
 #: Schema 1 is read so a committed pre-6612 snapshot still diffs and summarises (the PRD's §Contract).
+_SCHEMAS: Mapping[int, _Schema] = {
+    1: _Schema(_record_shape(_SCHEMA_1_SRC), _SCHEMA_1_IMPORT_GRAPH),
+    SCHEMA_VERSION: _Schema(
+        _record_shape({**_SCHEMA_1_SRC, 'cycle_closing_imports': _INTEGER}), _IMPORT_GRAPH
+    ),
+}
 _SNAPSHOTS: Mapping[int, _Object] = {
-    1: _snapshot_shape(1, _SCHEMA_1_IMPORT_GRAPH),
-    SCHEMA_VERSION: _snapshot_shape(SCHEMA_VERSION, _IMPORT_GRAPH),
+    version: _snapshot_shape(version, schema) for version, schema in _SCHEMAS.items()
 }
 
 
@@ -802,6 +818,64 @@ def _require_evidence_agrees(snapshot: Mapping[str, Any], origin: str) -> None:
     for where, found, meaning, expected in agreements:
         if found != expected:
             raise _invalid(origin, where, json.dumps(found), f'{meaning}, {json.dumps(expected)}')
+
+
+# ---------------------------------------------------------------------------
+# The import graph's kinds of entry, as --diff compares and --summary counts them.
+
+
+@dataclasses.dataclass(frozen=True)
+class _GraphKind:
+    """One kind of import-graph entry, named by *label*."""
+
+    label: str
+    needs: tuple[str, ...]  # the import_graph lists it derives from; its entries are the first's
+    key: Callable[[Any], tuple[Any, ...]]  # what --diff compares: never a line number
+    render: Callable[[Any], str]  # a key, as --diff names it
+    keeps: Callable[[Any], bool] = lambda entry: True
+
+    def entries(self, graph: Mapping[str, Any]) -> list[Any]:
+        return [entry for entry in graph[self.needs[0]] if self.keeps(entry)]
+
+
+def _records(snapshot: Mapping[str, Any], kind: _GraphKind) -> bool:
+    """Whether *snapshot*'s schema records *kind*; what it does not is unknown, never empty."""
+    lists = _SCHEMAS[snapshot['schema_version']].import_graph.fields
+    return all(name in lists for name in kind.needs)
+
+
+def _deferred_key(entry: Mapping[str, Any]) -> tuple[str, tuple[str, ...]]:
+    return entry['from'], tuple(entry['imports'])
+
+
+def _deferred_rendered(key: tuple[str, tuple[str, ...]]) -> str:
+    return f'{key[0]}: {", ".join(key[1])}'
+
+
+def _cycle_kind(label: str, name: str) -> _GraphKind:
+    return _GraphKind(label, (name,), lambda cycle: tuple(cycle), lambda key: ', '.join(key))
+
+
+_GRAPH_KINDS: tuple[_GraphKind, ...] = (
+    _GraphKind('edge', ('edges',), lambda edge: tuple(edge), lambda key: f'{key[0]} -> {key[1]}'),
+    _GraphKind(
+        'reach-back',
+        ('reach_back',),
+        lambda entry: (entry['from'], entry['to'], tuple(entry['names'])),
+        lambda key: f'{key[0]} -> {key[1]} ({", ".join(key[2])})',
+    ),
+    _GraphKind('deferred import', ('deferred',), _deferred_key, _deferred_rendered),
+    _GraphKind(
+        'cycle-closing deferred import',
+        ('deferred', 'hidden_cycles'),
+        _deferred_key,
+        _deferred_rendered,
+        keeps=lambda entry: entry['closes_cycle'],
+    ),
+    _cycle_kind('cycle', 'cycles'),
+    _cycle_kind('hidden cycle', 'hidden_cycles'),
+    _cycle_kind('typing cycle', 'typing_cycles'),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1012,45 +1086,22 @@ def _crossing_entries(pairs: Sequence[_RecordPair]) -> list[str]:
     return entries
 
 
-#: (label, import_graph list, comparison key without line numbers, rendering of a key).
-_GRAPH_KINDS: tuple[tuple[str, str, Any, Any], ...] = (
-    ('edge', 'edges', lambda edge: tuple(edge), lambda key: f'{key[0]} -> {key[1]}'),
-    (
-        'reach-back',
-        'reach_back',
-        lambda entry: (entry['from'], entry['to'], tuple(entry['names'])),
-        lambda key: f'{key[0]} -> {key[1]} ({", ".join(key[2])})',
-    ),
-    (
-        'deferred',
-        'deferred',
-        # Not keyed on closes_cycle: a flip is the hidden cycle's own change, reported below.
-        lambda entry: (entry['from'], tuple(entry['imports'])),
-        lambda key: f'{key[0]}: {", ".join(key[1])}',
-    ),
-    ('cycle', 'cycles', lambda cycle: tuple(cycle), lambda key: ', '.join(key)),
-    ('hidden cycle', 'hidden_cycles', lambda cycle: tuple(cycle), lambda key: ', '.join(key)),
-    ('typing cycle', 'typing_cycles', lambda cycle: tuple(cycle), lambda key: ', '.join(key)),
-)
-
-
 def _graph_kind_entries(
-    kind: tuple[str, str, Any, Any], current: Mapping[str, Any], previous: Mapping[str, Any]
+    kind: _GraphKind, current: Mapping[str, Any], previous: Mapping[str, Any]
 ) -> list[str]:
     """One kind's additions and removals; unknown, never compared, when a side's schema lacks it."""
-    label, name, key_of, render = kind
     unknown = [
-        f'{label}s unknown: the {side} snapshot is schema {taken["schema_version"]}'
+        f'{kind.label}s unknown: the {side} snapshot is schema {taken["schema_version"]}'
         for side, taken in (('current', current), ('previous', previous))
-        if name not in taken['import_graph']
+        if not _records(taken, kind)
     ]
     if unknown:
         return unknown
-    before = Counter(key_of(item) for item in previous['import_graph'][name])
-    after = Counter(key_of(item) for item in current['import_graph'][name])
+    before = Counter(kind.key(entry) for entry in kind.entries(previous['import_graph']))
+    after = Counter(kind.key(entry) for entry in kind.entries(current['import_graph']))
     return [
-        *(f'{label} added: {render(key)}' for key in sorted((after - before).elements())),
-        *(f'{label} removed: {render(key)}' for key in sorted((before - after).elements())),
+        *(f'{kind.label} added: {kind.render(key)}' for key in sorted((after - before).elements())),
+        *(f'{kind.label} removed: {kind.render(key)}' for key in sorted((before - after).elements())),
     ]
 
 
@@ -1178,21 +1229,17 @@ def _markdown_row(cells: Sequence[str]) -> str:
     return '| ' + ' | '.join(cells) + ' |'
 
 
-def _graph_line(graph: Mapping[str, Any]) -> str:
-    """The import graph's counts; a schema-1 graph's absent ones are unknown, never zero."""
-    counts = f'{len(graph["edges"])} edges, {len(graph["reach_back"])} reach-backs'
-    deferred, cycles = len(graph['deferred']), len(graph['cycles'])
-    if 'hidden_cycles' not in graph:
-        return (
-            f'import graph: {counts}, {deferred} deferred imports, {cycles} cycles; '
-            'hidden cycles, typing cycles and closes_cycle unknown (schema 1)'
-        )
-    closing = sum(entry['closes_cycle'] for entry in graph['deferred'])
-    return (
-        f'import graph: {counts}, {deferred} deferred imports ({closing} closing a cycle), '
-        f'{cycles} cycles, {len(graph["hidden_cycles"])} hidden cycles, '
-        f'{len(graph["typing_cycles"])} typing cycles'
-    )
+def _graph_line(snapshot: Mapping[str, Any]) -> str:
+    """The import graph's count of each kind; a kind its schema does not record is unknown, never zero."""
+    graph = snapshot['import_graph']
+    counts = [
+        f'{len(kind.entries(graph))} {kind.label}s' for kind in _GRAPH_KINDS if _records(snapshot, kind)
+    ]
+    unknown = [f'{kind.label}s' for kind in _GRAPH_KINDS if not _records(snapshot, kind)]
+    line = f'import graph: {", ".join(counts)}'
+    if unknown:
+        line += f'; {", ".join(unknown)} unknown (schema {snapshot["schema_version"]})'
+    return line
 
 
 def _summary_header(snapshot: Mapping[str, Any]) -> list[str]:
@@ -1201,7 +1248,7 @@ def _summary_header(snapshot: Mapping[str, Any]) -> list[str]:
         f'run: {snapshot["run_id"]} as_of {snapshot["as_of_sha"]} since {snapshot["since"]}',
         f'files: {evidence["measured_files"]}/{evidence["domain_files"]} measured, '
         f'complete={json.dumps(evidence["complete"])}',
-        _graph_line(snapshot['import_graph']),
+        _graph_line(snapshot),
     ]
     if evidence['unreadable']:
         lines.append('unreadable (measures unknown, never zero):')
