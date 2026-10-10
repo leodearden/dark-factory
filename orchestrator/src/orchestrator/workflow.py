@@ -25,9 +25,13 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, cast
 # type annotation; a separate runtime import is needed here because
 # _is_gating_escalation evaluates the set at call time, not just for type hints.
 # This is cycle-safe: escalation/src/escalation/models.py imports only stdlib and
-# nothing in it imports orchestrator.
+# nothing in it imports orchestrator.  escalation.pins (is_queue_handoff, the
+# severity semantics both gating predicates consume since task 5222) is pure and
+# imports only escalation.models, so it is cycle-safe too; harness.py already
+# imports it at module top.
 from escalation.dedupe import submit_or_dedupe
 from escalation.models import BORN_AT_L2_SEVERITIES
+from escalation.pins import is_queue_handoff
 from pydantic import ValidationError
 from shared.cli_invoke import (
     AgentFailureKind,
@@ -364,6 +368,12 @@ def _is_gating_escalation(e: Escalation) -> bool:
     3. Any level ≥ 2: ``level >= 2``
        (escalation-watcher promoted to L2; a human must decide before the
        workflow proceeds — applies to any severity, including 'info').
+       Narrowed by PRD ``plans/info-l0-disposition-router-prd.md`` D3 (task
+       5222): a level ≥ 2 record gates only when ``escalation.pins`` classifies
+       it a queue handoff, so an info-severity L2 never gates, while an unknown
+       severity still fails safe to gating.  Severity semantics live in
+       ``escalation.pins`` (INV-5) — never hand-roll ``severity != 'info'``
+       here.
 
     Deliberately NOT gating:
     - Plain blocking L1 (``severity == 'blocking' and level == 1``): this is a
@@ -377,7 +387,7 @@ def _is_gating_escalation(e: Escalation) -> bool:
     return (
         (e.severity == 'blocking' and e.level == 0)
         or e.severity in BORN_AT_L2_SEVERITIES
-        or e.level >= 2
+        or (e.level >= 2 and is_queue_handoff(e))
     )
 
 
@@ -3675,7 +3685,8 @@ class TaskWorkflow:
         await self._check_scope_invariant(backend_metadata=_entry_metadata)
 
         # Defense-in-depth: any blocking L0 escalation, or any
-        # born-at-L2 (critical/urgent), or any level≥2 escalation
+        # born-at-L2 (critical/urgent), or any non-info level≥2
+        # escalation (see _is_gating_escalation; task 5222)
         # created during execute/verify/review (e.g. plan-overwrite
         # from _amend, or any future code path that escalates outside
         # the implementer/debugger callsites) must gate the merge.
@@ -8574,8 +8585,9 @@ class TaskWorkflow:
             # issues from prior runs of this same task stay in the queue until a
             # human or escalation-watcher resolves them; we must not let them
             # sink the current run.  Fresh L0 blocking escalations gate progress
-            # here, AND born-at-L2 (critical/urgent) escalations AND any level≥2
-            # escalations also gate regardless of severity — D4 accepted consequence:
+            # here, AND born-at-L2 (critical/urgent) escalations AND any non-info
+            # level≥2 escalations (see _is_gating_escalation; info never gates
+            # since task 5222) also gate — D4 accepted consequence:
             # a pending critical/urgent from a prior incarnation DOES sink a fresh
             # run (intended stop-the-line semantics).  See _is_gating_escalation.
             blocking = [e for e in self._check_escalations() if _is_gating_escalation(e)]
@@ -10267,8 +10279,9 @@ class TaskWorkflow:
 
             # Check for escalations from debugger.  Same filter as the post-implementer
             # check — a stale plain blocking L1 from a prior run must not sink a
-            # successful debug pass.  Born-at-L2 (critical/urgent) AND any level≥2
-            # escalations also gate here — D4 accepted consequence: a pending
+            # successful debug pass.  Born-at-L2 (critical/urgent) AND any non-info
+            # level≥2 escalations (see _is_gating_escalation) also gate here —
+            # D4 accepted consequence: a pending
             # critical/urgent from a prior incarnation DOES sink a fresh run
             # (intended stop-the-line semantics).  See _is_gating_escalation.
             blocking = [e for e in self._check_escalations() if _is_gating_escalation(e)]
@@ -14377,7 +14390,10 @@ class TaskWorkflow:
 
         Raises ``_StewardReescalated`` if:
         - A pending escalation with ``severity in BORN_AT_L2_SEVERITIES``
-          or ``level >= 2`` exists — immediate terminal, stop the line; OR
+          or ``level >= 2`` exists — immediate terminal, stop the line (a
+          level ≥ 2 record only when ``escalation.pins`` classifies it a queue
+          handoff, so an info L2 never short-circuits the wait — PRD
+          info-l0-disposition-router D3, task 5222); OR
         - The steward re-escalated to level-1 (consumed by auto-watcher).
 
         When no escalation queue is available (e.g. eval mode), returns
@@ -14485,10 +14501,13 @@ class TaskWorkflow:
         # L0 loop to clear makes no sense and risks a busy resume-spin (gate
         # fires → _wait_for_resolution returns '' → resume → gate fires again).
         # Treat identically to _StewardReescalated so run() calls _mark_blocked
-        # and halts for human intervention rather than looping.
+        # and halts for human intervention rather than looping.  The level≥2
+        # half is narrowed exactly as _is_gating_escalation's disjunct 3 (task
+        # 5222): an info L2 is not a handoff, so it never short-circuits.
         pending_high_sev = [
             e for e in self.escalation_queue.get_by_task(self.task_id, status='pending')
-            if e.severity in BORN_AT_L2_SEVERITIES or e.level >= 2
+            if e.severity in BORN_AT_L2_SEVERITIES
+            or (e.level >= 2 and is_queue_handoff(e))
         ]
         if pending_high_sev:
             raise _StewardReescalated(pending_high_sev)
