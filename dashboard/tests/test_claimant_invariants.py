@@ -243,6 +243,18 @@ async def test_b2_pre_claimant_schema_is_blind(tmp_path):
     assert 'no such column' in wire['error']
 
 
+async def test_b2_a_pooled_connection_closed_under_the_scan_is_blind_not_raised(tmp_path):
+    root = tmp_path / 'proj'
+    db_path = write_tasks_db(_db_path(root), [task_row(1, 'done', _CLAIMANT, STALE)])
+    pool = DbPool()
+    conn = await pool.get(db_path)
+    await pool.close_all()
+    wire = (await scan_root_invariants(root, db_path, conn, now=NOW)).to_wire()
+    _assert_blind(wire)
+    assert wire['error'].startswith('ValueError: ')
+    assert wire['rows_scanned'] is None
+
+
 async def test_b2_zero_rows_scanned_is_blind(tmp_path):
     wire = await _scan(tmp_path / 'proj', [])
     _assert_blind(wire)

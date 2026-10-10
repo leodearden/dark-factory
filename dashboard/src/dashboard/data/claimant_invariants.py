@@ -8,7 +8,6 @@ predicates in ``shared.task_claimant``; this module only fetches rows and counts
 
 from __future__ import annotations
 
-import sqlite3
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
@@ -77,6 +76,9 @@ class HygieneTier:
     count: int
     stale_count: int
 
+    def to_wire(self) -> dict[str, Any]:
+        return {'count': self.count, 'stale_count': self.stale_count}
+
 
 @dataclass(frozen=True)
 class RootInvariants:
@@ -102,7 +104,7 @@ class RootInvariants:
             'rows_scanned': self.rows_scanned,
             'measured_at': self.measured_at.isoformat(),
             'terminal_tier': None if self.terminal_tier is None else self.terminal_tier.to_wire(),
-            'hygiene_tier': None if self.hygiene_tier is None else asdict(self.hygiene_tier),
+            'hygiene_tier': None if self.hygiene_tier is None else self.hygiene_tier.to_wire(),
         }
 
 
@@ -191,11 +193,17 @@ async def scan_root_invariants(
     now: datetime,
     ttl: timedelta = DEFAULT_CLAIMANT_HEARTBEAT_TTL,
 ) -> RootInvariants:
+    """Census one root. Never raises for a failed read: that root alone reports blind.
+
+    The failure need not be a sqlite or OS error; aiosqlite raises ``ValueError`` on
+    a pooled connection closed under the scan. A caller fanning out over the
+    roster therefore never loses the other roots' records to one root's failure.
+    """
     if conn is None:
         return _blind(root, now, _unopened_reason(db_path))
     try:
         rows_scanned, candidates = await _read_tasks(conn)
-    except (sqlite3.Error, OSError) as exc:
+    except Exception as exc:
         return _blind(root, now, f'{type(exc).__name__}: {exc}')
     if rows_scanned == 0:
         return _blind(root, now, 'scanned 0 rows: nothing scanned is not clean', rows_scanned=0)
