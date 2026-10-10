@@ -6597,6 +6597,65 @@ async def test_run_full_cycle_failure_escalates_even_when_failure_bookkeeping_ra
     assert await event_buffer.count_buffered('test-project') == buffered_after
 
 
+async def _fail_run_with_exception(harness):
+    harness.stages[0].run = _raising_stage_run(lambda: RuntimeError('stage exploded'))
+    with pytest.raises(RuntimeError, match='stage exploded'):
+        await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+
+async def _fail_run_with_all_accounts_capped(harness):
+    from shared.cli_invoke import AllAccountsCappedException
+
+    harness.stages[0].run = AsyncMock(
+        side_effect=AllAccountsCappedException(retries=3, elapsed_secs=1.0, label='x'),
+    )
+    result = await harness.run_full_cycle('test-project', 'buffer_size:1')
+    assert result.status == RunStatus.failed
+
+
+async def _fail_run_with_cancellation_resume_off(harness):
+    harness.config.resume_after_restart = False
+    entered = asyncio.Event()
+    harness.stages[0].run = _stalling_stage_run(entered)
+    outer = asyncio.create_task(harness.run_full_cycle('test-project', 'buffer_size:1'))
+    await _cancel_once_entered(outer, entered)
+    with pytest.raises(asyncio.CancelledError):
+        await outer
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'fail_run',
+    [
+        _fail_run_with_exception,
+        _fail_run_with_all_accounts_capped,
+        _fail_run_with_cancellation_resume_off,
+    ],
+    ids=['exception', 'all_accounts_capped', 'cancelled_resume_off'],
+)
+async def test_run_full_cycle_failure_keeps_an_earlier_completed_runs_events_drained(
+    journal, event_buffer, mock_memory_service, tmp_path, fail_run,
+):
+    """Task 6453: a failed run re-buffers only its own drained events, never
+    those of an earlier run the journal records completed."""
+    harness, _ = _make_completing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    await event_buffer.push(_make_event())
+    await event_buffer.push(_make_event())
+    run_a = await harness.run_full_cycle('test-project', 'seed')
+    assert run_a.status == RunStatus.completed
+
+    await event_buffer.push(_make_event())
+    await fail_run(harness)
+
+    assert len(await event_buffer.get_drained_events('test-project', run_a.id)) == 2
+    assert await event_buffer.count_buffered('test-project') == 1
+    row_a = await journal.get_run(run_a.id)
+    assert row_a is not None
+    assert row_a.status == 'completed'
+
+
 @pytest.mark.asyncio
 async def test_run_full_cycle_failure_escalates_even_when_failure_bookkeeping_is_cancelled(
     journal, event_buffer, mock_memory_service, tmp_path,
