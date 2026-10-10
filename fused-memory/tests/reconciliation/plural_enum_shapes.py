@@ -153,7 +153,7 @@ PRECISION_GUARD_SHAPES: list[str] = [
     'Statuses of the v1.2 tasks 1020 and 1030 are pending.',
     'Reviews for section 4.2.1 tasks 1020 and 1030 are pending.',
     'Statuses of tasks in df.core tasks 1020 and 1030 are pending.',
-    # UNICODE flanking: _is_token_internal_break's docstring claims
+    # UNICODE flanking: is_token_internal_break's docstring claims
     # str.isalnum() makes the test unicode-aware by construction,
     # so a non-ASCII filename must be recognized as intra-token
     # exactly like an ASCII one — pin that claim by behaviour

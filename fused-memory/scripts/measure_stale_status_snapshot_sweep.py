@@ -16,8 +16,9 @@ the same read the production sweep uses, on a backend initialised with
 ``skip_maintenance=True``. Statuses come from
 ``SqliteTaskBackend.get_statuses``, as
 ``memory_eval_staleness_sweep.py::fetch_terminal_task_ids`` reads them; a
-project root with no existing task DB is refused rather than opened, because
-opening one would create it. Nothing is written except the artifacts.
+project root whose task DB is missing or empty is refused
+(``assert_task_store_populated``) rather than opened, because opening one
+would create it. Nothing is written except the artifacts.
 
 Regenerate (the root must hold ``.taskmaster/tasks/tasks.db``, so from a
 task worktree pass the main checkout explicitly):
@@ -75,18 +76,20 @@ from shared.task_statuses import TaskStatus  # noqa: E402
 
 from fused_memory.backends.graphiti_client import PagedRead  # noqa: E402
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (  # noqa: E402
-    _CLAUSE_BREAK_CHARS,
-    _UNION_PATTERNS,
+    CLAUSE_BREAK_CHARS,
     SNAPSHOT_STATUS_RE,
-    _build_snapshot_patterns,
-    _extract_ids,
-    _is_token_internal_break,
+    extract_marker_task_ids,
     flatten_dedup_edges,
+    is_token_internal_break,
     select_stale_status_snapshot_edges,
 )
 from fused_memory.reconciliation.task_filter import (  # noqa: E402
     INACTIVE_TASK_STATUSES,
     TASK_REF_RE,
+)
+from fused_memory.utils.target_store_preflight import (  # noqa: E402
+    TargetStoreMissing,
+    assert_task_store_populated,
 )
 
 logger = logging.getLogger('measure_stale_status_snapshot_sweep')
@@ -179,34 +182,22 @@ def measure_coverage(
 # #4588 general-rule simulation
 # --------------------------------------------------------------------------- #
 
-# One candidate family per marker, built by the SHIPPED builder so it carries
-# every shipped guard. The alternations are this rule's own per-marker
-# vocabulary; the mapped status is what a contradiction is judged against.
+# One (adjective, transitive) alternation pair per marker — this rule's own
+# per-marker vocabulary — and the status a contradiction is judged against.
 _MARKERS: dict[str, tuple[str | None, str | None, str | None]] = {
     'pending': (r'(?:pending)', None, TaskStatus.PENDING),
     'in-progress': (r'(?:in[-\s]?progress)', None, TaskStatus.IN_PROGRESS),
     'active': (r'(?:active)', None, None),
     'stalled': (None, r'(?:stalled)', None),
 }
-_MARKER_FAMILIES = {
-    marker: _build_snapshot_patterns(adjective, transitive)
-    for marker, (adjective, transitive, _) in _MARKERS.items()
-}
 _KNOWN_STATUSES = frozenset(TaskStatus)
 
 
 def ids_by_marker(fact: str) -> dict[str, set[int]]:
-    """Per-marker ids, through the shipped seam: union rejections are
-    threaded in and the result is intersected with the union ids, exactly as
-    ``extract_snapshot_edge_task_ids_by_marker_class`` does for 'blocked'."""
-    if not SNAPSHOT_STATUS_RE.search(fact):
-        return {}
-    union = _extract_ids(fact, _UNION_PATTERNS)
+    """Per-marker ids, through the sweep's own per-marker seam."""
     return {
-        marker: _extract_ids(
-            fact, family, inherited_rejected_spans=union.rejected_spans,
-        ).ids & union.ids
-        for marker, family in _MARKER_FAMILIES.items()
+        marker: extract_marker_task_ids(fact, adjective, transitive)
+        for marker, (adjective, transitive, _) in _MARKERS.items()
     }
 
 
@@ -261,7 +252,7 @@ def measure_general_rule(
 # #4260 token-internal clause breaks
 # --------------------------------------------------------------------------- #
 
-_BREAK_CHAR_RE = re.compile('[' + re.escape(_CLAUSE_BREAK_CHARS) + ']')
+_BREAK_CHAR_RE = re.compile('[' + re.escape(CLAUSE_BREAK_CHARS) + ']')
 
 
 @dataclass(frozen=True)
@@ -273,12 +264,12 @@ class TokenInternalBreaks:
 def measure_token_internal_breaks(
     edges: list[dict], *, max_samples: int,
 ) -> TokenInternalBreaks:
-    counts = dict.fromkeys(_CLAUSE_BREAK_CHARS, 0)
-    samples: dict[str, list[str]] = {char: [] for char in _CLAUSE_BREAK_CHARS}
+    counts = dict.fromkeys(CLAUSE_BREAK_CHARS, 0)
+    samples: dict[str, list[str]] = {char: [] for char in CLAUSE_BREAK_CHARS}
     for edge in _by_uuid(edges):
         fact = _fact(edge)
         for match in _BREAK_CHAR_RE.finditer(fact):
-            if not _is_token_internal_break(fact, match.start()):
+            if not is_token_internal_break(fact, match.start()):
                 continue
             char = match.group()
             counts[char] += 1
@@ -513,13 +504,11 @@ async def _main(argv: list[str] | None = None) -> int:
     from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend  # noqa: PLC0415
     from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
 
-    for graph, root in projects:
-        if not SqliteTaskBackend._db_path(root).is_file():  # noqa: SLF001
-            logger.error(
-                'no task DB under %s for graph %s; refusing to open one, since '
-                'that would create it. Pass --project %s=<main checkout root>.',
-                root, graph, graph,
-            )
+    for _graph, root in projects:
+        try:
+            assert_task_store_populated(root, operation='measure_stale_status_snapshot_sweep')
+        except TargetStoreMissing as refusal:
+            logger.error('%s', refusal)
             return 2
 
     measured_at = datetime.now(UTC).isoformat()

@@ -56,6 +56,7 @@ from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     _last_clause_break,
     build_supersede_fact,
     extract_blocked_assertion_task_ids,
+    extract_marker_task_ids,
     extract_snapshot_edge_task_ids,
     extract_snapshot_edge_task_ids_by_marker_class,
     flatten_dedup_edges,
@@ -1794,7 +1795,7 @@ class TestPluralEnumerationPerformance:
     def test_mixed_token_internal_break_walk_touches_linearly_many_characters(self):
         """The merged four-character walk must not degrade to quadratic. (task 4851)
 
-        Every member of ``_CLAUSE_BREAK_CHARS`` now gets the occurrence-level
+        Every member of ``CLAUSE_BREAK_CHARS`` now gets the occurrence-level
         test, so the walk must step past token-internal occurrences of all
         four characters, interleaved. A naive spelling that re-takes the max
         of four fresh ``rfind`` calls per step rescans the prefix once per
@@ -4403,3 +4404,56 @@ class TestOverlappingSweepsOfOneProject:
         ]
         assert sum(stats['invalidated'] for stats in results) == 1
         assert sum(stats['superseded'] for stats in results) == 2
+
+
+# --------------------------------------------------------------------------- #
+# extract_marker_task_ids — the per-marker reporting seam (task 4851)
+# --------------------------------------------------------------------------- #
+
+_PENDING_ALT = r'(?:pending)'
+_IN_PROGRESS_ALT = r'(?:in[-\s]?progress)'
+_BLOCKED_ALT = r'(?:blocked)'
+
+
+class TestExtractMarkerTaskIds:
+    """Which ids a fact asserts under ONE marker, inside the union's result."""
+
+    def test_each_marker_gets_only_its_own_ids(self):
+        fact = 'Task 5 is pending and task 6 is in progress'
+
+        assert extract_marker_task_ids(fact, _PENDING_ALT, None) == {5}
+        assert extract_marker_task_ids(fact, _IN_PROGRESS_ALT, None) == {6}
+
+    def test_a_fact_with_no_status_marker_yields_nothing(self):
+        assert extract_marker_task_ids('Task 5 is done', _PENDING_ALT, None) == set()
+        assert extract_marker_task_ids(None, _PENDING_ALT, None) == set()
+
+    def test_the_union_rejections_are_threaded_into_the_marker_family(self):
+        """The task-3037 over-selection: a narrower family must not claim an id
+        inside an enumeration the union family ruled a prepositional complement."""
+        fact = 'Dependencies for tasks 1020 and task 1030 are pending in blocked status'
+
+        assert extract_marker_task_ids(fact, None, _BLOCKED_ALT) == set()
+
+    @pytest.mark.parametrize(
+        'fact',
+        [
+            *PRECISION_GUARD_SHAPES,
+            *GUARD_REJECTED_SUPPRESSION_SHAPES,
+            *(fact for fact, _ in SUBJECT_POSITIVE_SHAPES),
+            *ADVERBIAL_PREAMBLE_SHAPES,
+            'Task 5 is pending and task 6 is in progress',
+            'Tasks 1020 and 1030 are blocked',
+        ],
+    )
+    @pytest.mark.parametrize(
+        ('adjective_alt', 'transitive_alt'),
+        [(_PENDING_ALT, None), (_IN_PROGRESS_ALT, None), (None, _BLOCKED_ALT)],
+        ids=['pending', 'in-progress', 'blocked'],
+    )
+    def test_marker_ids_are_always_a_subset_of_the_union(
+        self, fact, adjective_alt, transitive_alt,
+    ):
+        assert extract_marker_task_ids(fact, adjective_alt, transitive_alt) <= (
+            extract_snapshot_edge_task_ids(fact)
+        )

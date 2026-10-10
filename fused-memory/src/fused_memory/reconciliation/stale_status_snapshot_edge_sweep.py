@@ -123,8 +123,7 @@ constant — do not restate them here.)
   under the other.  (amendment, task 3037)
 - WHAT ACTUALLY MAKES THAT SUBSET PROPERTY HOLD — and it is NOT pattern
   nesting, which is what this list claimed until it was measured false.
-  Two mechanisms, both in
-  ``extract_snapshot_edge_task_ids_by_marker_class``: the union family's
+  Two mechanisms, both in ``_ids_within_union``: the union family's
   prepositional-complement ``rejected_spans`` are THREADED into the
   blocked call, and the returned ``blocked_ids`` are INTERSECTED with
   ``all_ids`` at the seam.  The general warning, which is the part worth
@@ -174,7 +173,7 @@ Known residuals (deliberate; all fail-safe/under-selection unless noted)
 - tasks 4149 / 4851: a genuine '.', ';', '!' or '?' sentence break
   immediately followed by an alphanumeric ('done.Then', 'done?Then') reads
   as token-internal, so a snapshot behind a listed preposition in the
-  previous sentence is missed — see ``_is_token_internal_break``.
+  previous sentence is missed — see ``is_token_internal_break``.
 - task 4851, measured: four lexical classes of genuine snapshot sit outside
   the closed-class copula/article anchoring and are not extracted — a
   relative clause ('task N, which is pending'), an attributive pre-modifier
@@ -260,6 +259,7 @@ it too. Its narrowed read is cheap only for a selective id; see its docstring.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import re
 import weakref
@@ -685,7 +685,7 @@ _ENUM_PREP_WORDS: tuple[str, ...] = (
 #
 # A break requires TWO things together, not one: the character must be a
 # member of this class (below), AND the occurrence must plausibly END a
-# sentence — not be TOKEN-INTERNAL (see _is_token_internal_break /
+# sentence — not be TOKEN-INTERNAL (see is_token_internal_break /
 # _last_clause_break). Every member of the class gets that second,
 # occurrence-level test (task 4149 for '.', task 4851 for ';', '!' and '?').
 #
@@ -753,7 +753,7 @@ _ENUM_PREP_WORDS: tuple[str, ...] = (
 # at '\\btasks\\b' immediately after the period) has no right flank and so is
 # never alnum-flanked — it stays a break regardless of this narrowing, which
 # keeps the common 'X.Tasks 1020 and 1030 are pending.' shape selected.
-_CLAUSE_BREAK_CHARS = '.;!?'
+CLAUSE_BREAK_CHARS = '.;!?'
 
 
 # The head of an HTML character entity reference ('&lt', '&#60', '&#x3c'),
@@ -766,7 +766,7 @@ _HTML_ENTITY_HEAD_RE: re.Pattern[str] = re.compile(
 _HTML_ENTITY_HEAD_MAX_LEN = 40
 
 
-def _is_token_internal_break(text: str, index: int) -> bool:
+def is_token_internal_break(text: str, index: int) -> bool:
     """Does the break character at ``text[index]`` end no sentence?
 
     True for either of two reasons (tasks 4149, 4851):
@@ -806,8 +806,8 @@ def _is_token_internal_break(text: str, index: int) -> bool:
 def _last_clause_break(prefix: str) -> int:
     """Index of the last sentence-plausible clause break in *prefix*, or -1.
 
-    Every member of ``_CLAUSE_BREAK_CHARS`` counts only where the occurrence
-    is not token-internal (see ``_is_token_internal_break``). The walk keeps
+    Every member of ``CLAUSE_BREAK_CHARS`` counts only where the occurrence
+    is not token-internal (see ``is_token_internal_break``). The walk keeps
     one cursor per break character and repeatedly takes the rightmost; when
     that occurrence is token-internal, only its own cursor moves left, to the
     previous occurrence of the same character. Each cursor only moves left
@@ -816,10 +816,10 @@ def _last_clause_break(prefix: str) -> int:
     property ``_enumeration_is_prepositional_complement`` documents.
     (tasks 4149, 4851)
     """
-    cursors = {c: prefix.rfind(c) for c in _CLAUSE_BREAK_CHARS}
+    cursors = {c: prefix.rfind(c) for c in CLAUSE_BREAK_CHARS}
     while True:
         char, cursor = max(cursors.items(), key=lambda item: item[1])
-        if cursor < 0 or not _is_token_internal_break(prefix, cursor):
+        if cursor < 0 or not is_token_internal_break(prefix, cursor):
             return cursor
         cursors[char] = prefix.rfind(char, 0, cursor)
 
@@ -1373,9 +1373,9 @@ def extract_blocked_assertion_task_ids(fact: str | None) -> set[int]:
     ``_build_snapshot_patterns`` with nesting marker alternations. Shared
     patterns do not share the rejected-span suppression, which is algorithm
     data computed per family. The containment holds because
-    ``extract_snapshot_edge_task_ids_by_marker_class`` threads the union
-    family's rejected spans into this family's call and intersects the result
-    at the seam; see there. (amendment, reviewer_comprehensive
+    ``_ids_within_union`` threads the union family's rejected spans into this
+    family's call and intersects the result at the seam; see there.
+    (amendment, reviewer_comprehensive
     correctness-over-selection finding, task 3037)
 
     ONE guard is blocked-family-only, and it too narrows: an aggregate list
@@ -1415,8 +1415,7 @@ class SnapshotEdgeIds(NamedTuple):
 
     ``blocked_ids`` is always a SUBSET of ``all_ids``. NOT because the
     families' marker alternations nest — that was the original claim and it
-    was measured FALSE — but because
-    ``extract_snapshot_edge_task_ids_by_marker_class`` threads the union
+    was measured FALSE — but because ``_ids_within_union`` threads the union
     family's rejected spans into the blocked call and then intersects the two
     sets at the seam. See that function for both mechanisms and for why
     pattern nesting is not sufficient. (amendment, reviewer_comprehensive
@@ -1475,9 +1474,50 @@ def extract_snapshot_edge_task_ids_by_marker_class(fact: str | None) -> Snapshot
     union = _extract_ids(fact, _UNION_PATTERNS)
     if not _BLOCKED_MARKER_RE.search(fact):
         return SnapshotEdgeIds(all_ids=union.ids, blocked_ids=set())
+    return SnapshotEdgeIds(
+        all_ids=union.ids,
+        blocked_ids=_ids_within_union(fact, _BLOCKED_PATTERNS, union),
+    )
 
+
+def extract_marker_task_ids(
+    fact: str | None, adjective_alt: str | None, transitive_alt: str | None,
+) -> set[int]:
+    """The ids *fact* asserts under ONE marker alternation. (task 4851)
+
+    The family is built by the shipped builder from alternations shaped like
+    ``_ADJECTIVE_MARKER_ALT`` / ``_TRANSITIVE_MARKER_ALT``, so it carries every
+    shipped guard. Its ids pass the same union seam as
+    ``SnapshotEdgeIds.blocked_ids``, which keeps them a subset of
+    ``extract_snapshot_edge_task_ids(fact)``. A reporting seam for probes that
+    ask which ids a fact asserts as, say, pending; selection itself reads
+    ``extract_snapshot_edge_task_ids_by_marker_class``.
+
+    Pure: no I/O, no side effects.
+    """
+    fact = fact or ''
+    if not SNAPSHOT_STATUS_RE.search(fact):
+        return set()
+    union = _extract_ids(fact, _UNION_PATTERNS)
+    return _ids_within_union(fact, _marker_family(adjective_alt, transitive_alt), union)
+
+
+@functools.cache
+def _marker_family(adjective_alt: str | None, transitive_alt: str | None) -> _SnapshotPatterns:
+    return _build_snapshot_patterns(adjective_alt, transitive_alt)
+
+
+def _ids_within_union(
+    fact: str, family: _SnapshotPatterns, union: _ExtractionResult,
+) -> set[int]:
+    """*family*'s ids on an already-gated *fact*, inside the union family's result.
+
+    THE seam every narrower family passes through — the blocked family and
+    ``extract_marker_task_ids`` alike — so a narrower family can never assert
+    an id the union family did not.
+    """
     # THREAD the union family's prepositional-complement rejections into the
-    # blocked family. A rejected span is, by construction, a region
+    # narrower family. A rejected span is, by construction, a region
     # established to be a PREPOSITION'S COMPLEMENT, so no id inside it is the
     # copula's subject — whichever family, and whichever pattern, found it.
     # That is verbatim the argument _extract_ids already gives for applying a
@@ -1499,29 +1539,25 @@ def extract_snapshot_edge_task_ids_by_marker_class(fact: str | None) -> Snapshot
     # status attributed to a subject the fact never made a claim about.
     # (amendment, reviewer_comprehensive correctness-over-selection finding,
     # task 3037)
-    blocked = _extract_ids(
-        fact, _BLOCKED_PATTERNS, inherited_rejected_spans=union.rejected_spans,
+    narrowed = _extract_ids(
+        fact, family, inherited_rejected_spans=union.rejected_spans,
     )
-
-    return SnapshotEdgeIds(
-        all_ids=union.ids,
-        # INTERSECT AT THE SEAM. Be honest about what this is: with the
-        # threading above in place it is MEASURED to be a no-op across the
-        # whole 800-fact _SUBSET_PROPERTY_CORPUS, so it is NOT the fix — it is
-        # what makes this NamedTuple's containment claim true BY CONSTRUCTION
-        # rather than by argument, at the cost of one set intersection on the
-        # small minority of edges that clear the _BLOCKED_MARKER_RE pre-gate.
-        #
-        # It exists because the ORIGINAL 'by construction' argument (the
-        # marker alternations nest, therefore the results nest) is UNSOUND for
-        # regex families in general, independently of the bug above:
-        # finditer is non-overlapping, so narrowing an alternation can delete
-        # an earlier match and thereby UNSHADOW a later one the wider family
-        # never reported. The intersection bounds that entire class of future
-        # surprise in the safe direction — under-selection self-heals on the
-        # next cycle, over-selection retires a live edge forever.
-        blocked_ids=blocked.ids & union.ids,
-    )
+    # INTERSECT AT THE SEAM. Be honest about what this is: with the
+    # threading above in place it is MEASURED to be a no-op across the
+    # whole 800-fact _SUBSET_PROPERTY_CORPUS, so it is NOT the fix — it is
+    # what makes SnapshotEdgeIds' containment claim true BY CONSTRUCTION
+    # rather than by argument, at the cost of one set intersection on the
+    # small minority of edges that clear the _BLOCKED_MARKER_RE pre-gate.
+    #
+    # It exists because the ORIGINAL 'by construction' argument (the
+    # marker alternations nest, therefore the results nest) is UNSOUND for
+    # regex families in general, independently of the bug above:
+    # finditer is non-overlapping, so narrowing an alternation can delete
+    # an earlier match and thereby UNSHADOW a later one the wider family
+    # never reported. The intersection bounds that entire class of future
+    # surprise in the safe direction — under-selection self-heals on the
+    # next cycle, over-selection retires a live edge forever.
+    return narrowed.ids & union.ids
 
 
 class _ExtractionResult(NamedTuple):
@@ -1619,7 +1655,7 @@ def _extract_ids(
     rejections ANOTHER family already established on the same fact, and the
     returned ``rejected_spans`` carries this family's own on top of them.
     That threading is load-bearing, not an optimisation — see
-    ``extract_snapshot_edge_task_ids_by_marker_class``, and the warning about
+    ``_ids_within_union``, and the warning about
     per-family algorithm data in this module's docstring. Sharing the pattern
     BUILDER does not share this: ``rejected_spans`` is computed here, per
     call, from THIS family's own ``plural_enum`` matches, so a span the union

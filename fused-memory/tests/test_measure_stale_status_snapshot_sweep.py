@@ -230,3 +230,11 @@ class TestArtifactSafety:
 
         assert written == (json_out, md_out)
         assert json.loads(json_out.read_text())['complete'] is True
+
+
+class TestTaskStorePreflight:
+    def test_a_root_without_a_populated_task_store_is_refused_before_any_read(
+        self, tmp_path,
+    ):
+        assert probe.main(['--project', f'dark_factory={tmp_path}']) == 2
+        assert not (tmp_path / '.taskmaster').exists()
