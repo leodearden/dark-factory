@@ -64,6 +64,8 @@ class TestQuotationsAreMentions:
         [
             'evidence="task 3016 merged 1a925afbf4"',
             'status:"task 3016 merged"',
+            pytest.param('status: "task 3016 merged"', id='yaml-spaced'),
+            pytest.param('{"status": "task 3016 merged"}', id='json'),
         ],
     )
     def test_a_key_value_literal_is_still_read(self, text):
@@ -73,6 +75,26 @@ class TestQuotationsAreMentions:
         assert _triples('note "x\ntask 5422 has landed') == [
             ('applied_work', 'task', '5422'),
         ]
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param(
+                'the 12" pipe is fine; task 5422 landed; he said "ok"', id='semicolon',
+            ),
+            pytest.param(
+                'the 12" pipe is fine. Task 5422 landed. He said "ok"', id='sentence-end',
+            ),
+            pytest.param(
+                'the 12" pipe is fine? task 5422 landed! he said "ok"', id='question-mark',
+            ),
+        ],
+    )
+    def test_a_stray_quote_does_not_swallow_a_later_clause(self, text):
+        assert _triples(text) == [('applied_work', 'task', '5422')]
+
+    def test_terminal_punctuation_inside_a_quotation_keeps_it_a_quotation(self):
+        assert _triples('the memory said "task 5422 has landed." earlier') == []
 
     def test_backticks_do_not_delimit_a_quotation(self):
         assert _triples('task 5422 was left `cancelled`') == [
@@ -99,6 +121,17 @@ class TestModalFormsAreNotClaims:
             'task 5422 will have landed by Friday',
             "task 5422 won't have shipped",
             'task 5422 can be closed as duplicate',
+            pytest.param("task 5422 can't be merged yet", id='cant'),
+            pytest.param('task 5422 can’t have landed', id='cant-curly'),
+            pytest.param('task 5422 won’t be merged', id='wont-curly'),
+            pytest.param('task 5422 shouldn’t be filed as tkt_0RRRC5AASJ9Z630VP4PCN9H376',
+                         id='shouldnt-curly-filing'),
+            pytest.param("task 5422 must've landed by now", id='must-ve'),
+            pytest.param('task 5422 would’ve been merged', id='would-ve-curly'),
+            pytest.param('task 5422 must have been fully merged', id='adverb-fully'),
+            pytest.param('task 5422 should have been successfully merged',
+                         id='adverb-successfully'),
+            pytest.param('task 5422 is supposed to be fully merged', id='intention-adverb'),
         ],
     )
     def test_a_modal_governed_marker_is_not_a_claim(self, text):

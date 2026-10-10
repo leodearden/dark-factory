@@ -241,10 +241,7 @@ APPLIED_WORK_RE: re.Pattern[str] = re.compile(
 
 # Supplementary strippers: the delta vocabulary above (BOTH families), in the
 # SAME shape as the task_filter originals (each swallows the verb it governs, so
-# removing the span removes the completion evidence). The modal/filler prefixes
-# are copied from FUTURE_ASPIRATIONAL_RE deliberately — a narrower prefix here
-# would leave "the follow-up is supposed to be filed as tkt_X next week" reading
-# as an accomplished filing.
+# removing the span removes the completion evidence).
 _EXTENSION_ANY_FORM: str = _APPLIED_ANY_FORM + r'|' + _FILING_ANY_FORM
 
 _NEGATED_EXTENSION_RE: re.Pattern[str] = re.compile(
@@ -253,23 +250,32 @@ _NEGATED_EXTENSION_RE: re.Pattern[str] = re.compile(
     r'|\b(?:' + _EXTENSION_ANY_FORM + r')\s+nothing\b',
     re.IGNORECASE,
 )
-_ASPIRATIONAL_EXTENSION_RE: re.Pattern[str] = re.compile(
-    r'\b(?:will|going\s+to|plans?\s+to|planned\s+to|intends?\s+to|intended\s+to|'
-    r'aims?\s+to|meant\s+to|hopes?\s+to|expects?\s+to|scheduled\s+to|slated\s+to|'
-    r'supposed\s+to|needs?\s+to|to\s+be|should|would|shall)\b'
-    r'(?:\s+(?:be|been|get|soon|also|now|already|just|then|finally|'
-    r'eventually|not|yet|still)){0,3}'
-    r'\s+(?:' + _EXTENSION_ANY_FORM + r')\b',
-    re.IGNORECASE,
+
+# The gate's ONE modal vocabulary: every contracted form in either apostrophe,
+# optionally with "'ve", and the closed filler run that may separate a governor
+# from the verb it governs. task_filter.FUTURE_ASPIRATIONAL_RE keeps its own
+# narrower copy for its soft-block detectors; the gate strips with both, so
+# this wider list is the one in force here.
+_MODAL: str = (
+    r"(?:will|would|shall|should|must|may|might|can|could|cannot|"
+    r"won['’]t|shan['’]t|can['’]t|(?:would|should|must|might|could)n['’]t)"
+    r"(?:['’]ve)?"
+)
+_FILLER_RUN: str = (
+    r'(?:\s+(?:not|never|have|be|been|being|get|got|also|already|now|just|then|'
+    r'still|yet|soon|finally|eventually|first|only|fully|successfully))*'
 )
 
-# A modal, a closed filler run, then the ONE word it governs ('must have landed').
-_MODAL_GOVERNED_RE: re.Pattern[str] = re.compile(
-    r"\b(?:will|would|shall|should|must|may|might|can|could|cannot|won't|shan't|"
-    r"(?:would|should|must|might|could|can)n't)\b"
-    r'(?:\s+(?:not|never|have|be|been|being|get|got|also|already|now|just|then|'
-    r'still|yet|soon|finally|eventually|first|only))*'
-    r'\s+[\w-]+',
+# A modal or intention phrase, the filler run, then the verb it governs: "must
+# have landed", "won’t be merged", "is supposed to be filed as tkt_X next week".
+# The intention phrases are FUTURE_ASPIRATIONAL_RE's. The governed verb is one
+# word, or a two-word extension form swallowed whole ("re filed").
+_GOVERNED_VERB_RE: re.Pattern[str] = re.compile(
+    r'\b(?:going\s+to|plans?\s+to|planned\s+to|intends?\s+to|intended\s+to|'
+    r'aims?\s+to|meant\s+to|hopes?\s+to|expects?\s+to|scheduled\s+to|slated\s+to|'
+    r'supposed\s+to|needs?\s+to|to\s+be|' + _MODAL + r')\b'
+    + _FILLER_RUN
+    + r'\s+(?:(?:' + _EXTENSION_ANY_FORM + r')\b|[\w-]+)',
     re.IGNORECASE,
 )
 
@@ -304,8 +310,7 @@ _EXEMPTION_STRIPPERS: tuple[re.Pattern[str], ...] = (
     NEGATED_TERMINAL_RE,
     _NEGATED_EXTENSION_RE,
     FUTURE_ASPIRATIONAL_RE,
-    _ASPIRATIONAL_EXTENSION_RE,
-    _MODAL_GOVERNED_RE,
+    _GOVERNED_VERB_RE,
 )
 
 
@@ -314,11 +319,18 @@ def _blank(match: re.Match[str]) -> str:
 
 
 # A double-quoted span is a MENTION of someone's words, not the writer's own
-# assertion. Pairing is sequential within one line; a span opened right after
-# '=' or ':' is a key/value literal and still asserts. Pinned by
+# assertion. Pairing is sequential within one line, and two kinds of pair still
+# assert: a key/value literal, opened after '=' or ':' (spaces allowed, so
+# 'status: "task 3016 merged"' and JSON both count), and a pair that crosses a
+# hard clause boundary (';' or a sentence end). The second is far likelier a
+# stray quote (an inch mark, an unclosed quote) pairing with a later one, and
+# blanking it would silently drop every claim between them. An ellipsis is not
+# a boundary: the esc-unverified-claim-5471-4 quote straddles one. Pinned by
 # tests/test_completion_claim_mood.py::TestQuotationsAreMentions.
-_QUOTATION_RE: re.Pattern[str] = re.compile(r'"[^"\n]*"|“[^”\n]*”')
-_KEY_VALUE_OPENERS: frozenset[str] = frozenset('=:')
+_QUOTATION_RE: re.Pattern[str] = re.compile(
+    r'(?P<key_value_lead>[=:][ \t]*)?(?P<quotation>"[^"\n]*"|“[^”\n]*”)'
+)
+_HARD_CLAUSE_BOUNDARY_RE: re.Pattern[str] = re.compile(r';|(?<!\.)[.!?](?=\s)')
 
 
 def _blank_quotations(text: str) -> str:
@@ -329,13 +341,14 @@ def _blank_quotations(text: str) -> str:
     clause that holds the marker with no closing quote of its own.
     """
 
-    def blank_unless_key_value(match: re.Match[str]) -> str:
-        opener_lead = text[match.start() - 1:match.start()]
-        if opener_lead in _KEY_VALUE_OPENERS:
-            return match.group(0)
-        return _blank(match)
+    def blank_a_mention(match: re.Match[str]) -> str:
+        asserted = (
+            match['key_value_lead'] is not None
+            or _HARD_CLAUSE_BOUNDARY_RE.search(match['quotation']) is not None
+        )
+        return match.group(0) if asserted else _blank(match)
 
-    return _QUOTATION_RE.sub(blank_unless_key_value, text)
+    return _QUOTATION_RE.sub(blank_a_mention, text)
 
 
 _NON_VERIDICAL_CUE_RE: re.Pattern[str] = re.compile(

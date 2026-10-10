@@ -112,6 +112,28 @@ Compared with the architect's prototype (1547 → 1520, 27 dropped), the one ext
   only the word it governs, and the temporal scope is past tense, so task 5 is still
   claimed.
 
+## Review amendment, replayed
+
+The review amendment, an `amend:` commit on this branch after the measured head, changed
+the gate in four ways:
+
+- The modal vocabulary covers `can't`, curly-apostrophe and `'ve` forms.
+- The filler run includes `fully` and `successfully`.
+- The modal and intention-phrase strippers are one regex, built from one modal list.
+- Two kinds of double-quoted pair are now read as assertions: a pair that crosses `;` or
+  a sentence end, and a key/value literal with whitespace after the `:`.
+
+Replayed over the same population dump, the amended gate's claims match the after gate
+exactly: 1525 → 1525, 0 dropped, 0 added. Every number above therefore holds for the
+amended head.
+
+```bash
+uv run python /tmp/6677-replay/replay.py \
+  extract /tmp/6677-replay/population.jsonl /tmp/6677-replay/claims-amended.jsonl
+python3 /tmp/6677-replay/replay.py diff /tmp/6677-replay/claims-after.jsonl \
+  /tmp/6677-replay/claims-amended.jsonl /tmp/6677-replay/claims-diff-amend.json
+```
+
 ## Reproducing
 
 From the worktree root. The three env vars are required, as explained in
@@ -213,7 +235,10 @@ if __name__ == '__main__':
 ```
 
 `/tmp/6677-replay/rules.py` takes the after gate and switches on one rule at a time, with
-the others disabled. A claim is attributed to every rule that drops it on its own:
+the others disabled. A claim is attributed to every rule that drops it on its own. The
+script rebinds the gate's private names by name and by position, so it is pinned to the
+internals at `13760eef35`. It records this measurement only: it is not a maintained tool,
+and it will misattribute rules if run against a later head.
 
 ```python
 import json, re, sys
