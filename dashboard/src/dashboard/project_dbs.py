@@ -21,13 +21,13 @@ A missing DB file is not an error here: ``DbPool.get`` yields ``None`` for
 it, so a consumer fans out over whatever exists and a project that has not
 produced a given DB yet simply contributes nothing.
 
-These seven names are this module's entire interface: ``_project_roots``
+These seven names are this module's entire interface: ``project_roots``
 (the walk itself, for a consumer that needs each root's ``Path``),
 ``TASKS_DB_REL_PATH`` (read by ``api/invariants.py``), and five connection
 helpers. The helpers carry a leading underscore from when they were private
-to ``app.py``, and ``_project_roots`` matches them. Read the underscore as
-vestigial, not as a private-use signal — the move that created this module
-was a pure extraction, with renaming outside its scope.
+to ``app.py``. Read their underscore as vestigial, not as a private-use
+signal — the move that created this module was a pure extraction, with
+renaming outside its scope.
 
 This is the canonical home for that primary-root-first, de-duplicated walk
 but not yet its only copy: ``app.py::_performance_resources``,
@@ -53,7 +53,7 @@ from dashboard.data.db import DbPool
 TASKS_DB_REL_PATH: Final = Path('.taskmaster/tasks/tasks.db')
 
 
-def _project_roots(config: DashboardConfig) -> list[Path]:
+def project_roots(config: DashboardConfig) -> list[Path]:
     """Every known project root, ``config.project_root`` first, each named once."""
     return list(dict.fromkeys([config.project_root, *config.known_project_roots]))
 
@@ -64,7 +64,7 @@ async def _project_scoped_dbs(
     rel_path: Path,
 ) -> list[aiosqlite.Connection | None]:
     """Return DB connections for a project-scoped file across all known roots."""
-    return [await pool.get(root / rel_path) for root in _project_roots(config)]
+    return [await pool.get(root / rel_path) for root in project_roots(config)]
 
 
 async def _project_scoped_dbs_labeled(
@@ -73,7 +73,7 @@ async def _project_scoped_dbs_labeled(
     rel_path: Path,
 ) -> list[tuple[str, aiosqlite.Connection | None]]:
     """Return labeled (str(root), connection|None) pairs across all known project roots."""
-    return [(str(root), await pool.get(root / rel_path)) for root in _project_roots(config)]
+    return [(str(root), await pool.get(root / rel_path)) for root in project_roots(config)]
 
 
 async def _cost_dbs(

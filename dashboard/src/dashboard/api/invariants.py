@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse
 from dashboard.config import DashboardConfig
 from dashboard.data.claimant_invariants import scan_root_invariants
 from dashboard.data.db import DbPool
-from dashboard.project_dbs import TASKS_DB_REL_PATH, _project_roots
+from dashboard.project_dbs import TASKS_DB_REL_PATH, project_roots
 
 router = APIRouter()
 
@@ -30,7 +30,7 @@ async def api_invariants(request: Request) -> JSONResponse:
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     now = datetime.now(UTC)  # clock-exempt: single-capture route
-    roots = _project_roots(config)
+    roots = project_roots(config)
     db_paths = [root / TASKS_DB_REL_PATH for root in roots]
     conns = [await pool.get(db_path) for db_path in db_paths]
     records = await asyncio.gather(
