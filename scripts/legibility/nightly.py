@@ -29,7 +29,7 @@ import sys
 import time
 import traceback
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple
@@ -1310,8 +1310,9 @@ def run_nightly(
     *now* threads through to :func:`evaluate_census_step`'s clock seam and
     to the run-state recorder's ``recorded_at``.
 
-    Every failure after the config loads is returned as ``exit_code=1`` with
-    one escalation (:func:`_crashed_night`); before that it raises.
+    Every failure after the config loads is returned as ``exit_code=1``, and
+    the crash itself files one escalation (:func:`_crashed_night`); before
+    that it raises.
 
     *status_fetcher* defaults to the real MCP-backed ``get_statuses``
     fetcher for ``cfg.project_root``
@@ -1448,12 +1449,14 @@ def _run_configured_nightly(
     #     runs, so _record_trickle_progress mutating `result` in place
     #     is visible to the caller — that is how the barren-streak
     #     escalation flag reaches the returned NightlyResult.
-    # (2) The pre-seeded sentinel below is what gets RECORDED when a
-    #     stage raises: exit_code=1, honest about the crash, and its
-    #     counters are still the real sampler numbers because `sample`
-    #     was computed before the try. Recording only on the happy path
-    #     would let the progress probe read a stale streak as healthy
-    #     after repeated crashes.
+    # (2) The pre-seeded sentinel below is what the night already knows
+    #     when a stage raises. The `except` arm builds the crash result ON
+    #     it (_crashed_night), so the suppression facts and any escalation
+    #     already posted survive, and that crash result is what gets
+    #     RECORDED: exit_code=1, honest about the crash, with the real
+    #     sampler counters because `sample` was computed before the try.
+    #     Recording only on the happy path would let the progress probe
+    #     read a stale streak as healthy after repeated crashes.
     result = NightlyResult(
         exit_code=1,
         budget_suppressed=budget_suppressed,
@@ -1766,6 +1769,9 @@ def _run_configured_nightly(
             ledger_rows_failed=ledger.failed,
         )
         return result
+    except Exception as exc:
+        result = _crashed_night(cfg, exc, poster=poster, known=result)
+        return result
     finally:
         try:
             if runner is not None:
@@ -1777,13 +1783,20 @@ def _run_configured_nightly(
             )
 
 
-def _crashed_night(cfg: LegibilityConfig, exc: Exception, *, poster) -> NightlyResult:
+def _crashed_night(
+    cfg: LegibilityConfig, exc: Exception, *, poster, known: NightlyResult | None = None,
+) -> NightlyResult:
     """The fail-loud result of a pass that raised: one ERROR escalation
-    carrying the full traceback."""
+    carrying the full traceback, on top of *known* -- what the night had
+    already established, such as a budget suppression and the escalation
+    posted for it."""
     summary = f'legibility trickle run crashed: {type(exc).__name__}: {exc}'
     detail = ''.join(traceback.format_exception(exc))
     escalated = post_escalation(cfg, summary, detail, poster=poster)
-    return NightlyResult(exit_code=1, escalated=escalated, reason=summary)
+    known = known if known is not None else NightlyResult()
+    return replace(
+        known, exit_code=1, escalated=known.escalated or escalated, reason=summary,
+    )
 
 
 def _parse_date(value: str) -> date:

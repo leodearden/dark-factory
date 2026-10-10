@@ -1780,6 +1780,22 @@ def _pool_the_night_on(monkeypatch, accounts_file, env_file):
     return opened
 
 
+def _capture_poster():
+    """A ``poster=`` seam that keeps every envelope. Returns (fn, envelopes)."""
+    envelopes = []
+
+    def _post(url, envelope):
+        envelopes.append(envelope)
+
+    return _post, envelopes
+
+
+def _one_escalation(envelopes):
+    """The ``escalate_info`` arguments of the one envelope posted."""
+    assert len(envelopes) == 1, f'expected exactly ONE escalation, got {envelopes}'
+    return envelopes[0]['params']['arguments']
+
+
 def _run_one_digest_night(tmp_path, **kwargs):
     """Drive a night carrying ONE real digest, so the coder is genuinely
     reached (an empty sample returns before it). Returns
@@ -1791,9 +1807,9 @@ def _run_one_digest_night(tmp_path, **kwargs):
         projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl',
         cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
     )
-    escalations = []
+    poster, escalations = _capture_poster()
     kwargs.setdefault('status_fetcher', lambda: {'statuses': {}})
-    kwargs.setdefault('poster', lambda url, envelope: escalations.append(envelope))
+    kwargs.setdefault('poster', poster)
     result = nightly.run_nightly(
         config_path=config_path,
         projects_root=projects_root,
@@ -1802,11 +1818,6 @@ def _run_one_digest_night(tmp_path, **kwargs):
         **kwargs,
     )
     return result, escalations
-
-
-def _escalated_detail(escalations):
-    [envelope] = escalations
-    return envelope['params']['arguments']['detail']
 
 
 class TestRunNightlyRunsOnThePooledSessionRunner:
@@ -1870,7 +1881,7 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
         )
         assert result.reason is not None
         assert 'coder storm' in result.reason
-        detail = _escalated_detail(escalations)
+        detail = _one_escalation(escalations)['detail']
         assert 'credentials rejected' in detail, detail
         assert _P in detail and _Q in detail, detail
         errors = [r for r in _nightly_warnings(caplog) if r.levelno == logging.ERROR]
@@ -1891,7 +1902,7 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
         assert result.commit_made is False
         assert result.reason is not None
         assert 'found no pool account with headroom' in result.reason, result.reason
-        assert 'all 2 pool accounts capped' in _escalated_detail(escalations)
+        assert 'all 2 pool accounts capped' in _one_escalation(escalations)['detail']
         assert [r for r in _nightly_warnings(caplog) if r.levelno >= logging.ERROR] == [], (
             'a capped night is weather (task 4503): nothing belongs in journalctl -p err'
         )
@@ -1933,7 +1944,7 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
 
         assert result.exit_code == 1
         assert result.coder_status == 'failure'
-        assert 'could not be started' in _escalated_detail(escalations)
+        assert 'could not be started' in _one_escalation(escalations)['detail']
         coder_warnings = [
             r.getMessage() for r in caplog.records
             if r.name == 'legibility.coder' and r.levelno >= logging.WARNING
@@ -2014,10 +2025,11 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
 
             monkeypatch.setattr(nightly.codebook, 'validate', _raise)
 
-        result, _escalations = _run_one_digest_night(tmp_path, recorder=recorder)
+        result, escalations = _run_one_digest_night(tmp_path, recorder=recorder)
 
         if outcome == 'raised':
             assert result.exit_code == 1
+            assert 'a stage crashed after coding' in _one_escalation(escalations)['summary']
         assert [record['closed'] for record in opened] == [1]
         _one_recorded(recorded)
 
@@ -3746,22 +3758,6 @@ def _one_recorded(calls):
     return calls[0][1]
 
 
-def _capture_poster():
-    """A ``poster=`` seam that keeps every envelope. Returns (fn, envelopes)."""
-    envelopes = []
-
-    def _post(url, envelope):
-        envelopes.append(envelope)
-
-    return _post, envelopes
-
-
-def _one_escalation(envelopes):
-    """The ``escalate_info`` arguments of the one envelope posted."""
-    assert len(envelopes) == 1, f'expected exactly ONE escalation, got {envelopes}'
-    return envelopes[0]['params']['arguments']
-
-
 # Spelled once: two of the four branch drivers patch a module global, so they
 # need the caller's own `monkeypatch` fixture handed in (the previous inline
 # form got it from each test's signature). Asserted per-arm rather than once up
@@ -4001,6 +3997,38 @@ class TestRunNightlyRecordsTrickleState:
             'the sample was computed before the crash, so its real counters '
             'are still recordable'
         )
+
+    def test_a_crash_keeps_what_the_night_had_already_established(
+        self, tmp_path, monkeypatch,
+    ):
+        """The sampler found a suppressed night and escalated it before the
+        crash; neither fact may be lost, even when the crash's own POST
+        fails."""
+        def _boom(selected, **kwargs):
+            raise RuntimeError('synthetic mid-run explosion')
+
+        monkeypatch.setattr(nightly, 'build_digests', _boom)
+        recorder, calls = _recorder_spy()
+        posted = []
+
+        def _server_gone_after_the_first_post(url, envelope):
+            if posted:
+                raise ConnectionError('escalation server went away')
+            posted.append(envelope)
+
+        result, _repo = _run_e2e_nightly(
+            tmp_path, recorder=recorder, budget_bytes=10,
+            poster=_server_gone_after_the_first_post,
+        )
+
+        assert result.exit_code == 1
+        assert 'RuntimeError' in (result.reason or '')
+        assert result.budget_suppressed is True
+        assert 'suppressed' in _one_escalation(posted)['summary']
+        assert result.escalated is True, (
+            'the suppression escalation was posted this night'
+        )
+        assert _one_recorded(calls)['budget_suppressed'] is True
 
     def test_an_unexpected_raise_before_the_recorded_try_still_escalates(
         self, tmp_path, monkeypatch,
