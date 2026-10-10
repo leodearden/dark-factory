@@ -5060,14 +5060,16 @@ def create_server(
             MergeState.no_record, reason(MergeReason.never_submitted), key.request_id,
         )
 
-    async def _resolve_durable(
-        key: _PollKey, history: _DurableHistory | None,
-    ) -> MergeStatusAnswer:
-        """Current run -> git -> journal -> history -> no_record; a failed probe ends it as unknown."""
+    async def _resolve(key: _PollKey, *, consult_live: bool) -> MergeStatusAnswer:
+        """Walk the tiers, live first only if *consult_live*; the first probe that raises ends it as unknown."""
+        history = _durable_history(key)
         try:
-            return await _walk_durable(key, history)
+            live = _live_answer(key) if consult_live else None
+            answer = live or await _walk_durable(key, history)
         except _ProbeFailed as failure:
-            return failure.answer_for(key)
+            answer = failure.answer_for(key)
+        last_outcome = LastOutcome.from_row(history.row) if history is not None else None
+        return answer.with_last_outcome(last_outcome)
 
     @mcp.tool()
     async def merge_status(
@@ -5093,19 +5095,15 @@ def create_server(
 
         The response shape, its ``source``/``reason``/``hint`` vocabulary and
         the invariants every answer is checked against live in
-        ``escalation/src/escalation/merge_status_answer.py``.
+        ``escalation/src/escalation/merge_status_answer.py``.  A breached
+        invariant raises ValueError naming it: a server defect, surfaced as a
+        tool error, never dressed up as an answer.
         """
         if request_id is None and branch is None and task_id is None:
             return {'error': 'At least one of request_id, branch, or task_id is required'}
 
         key = _PollKey(request_id=request_id, branch=branch, task_id=task_id)
-        history = _durable_history(key)
-        try:
-            answer = _live_answer(key) or await _resolve_durable(key, history)
-        except _ProbeFailed as failure:
-            answer = failure.answer_for(key)
-        last_outcome = LastOutcome.from_row(history.row) if history is not None else None
-        return answer.with_last_outcome(last_outcome).to_response()
+        return (await _resolve(key, consult_live=True)).to_response()
 
     # ── merge_cancel — explicit cancellation via waiter-future cancel (PRD β2 / task 1632) ──
 
@@ -5130,7 +5128,9 @@ def create_server(
                                 the partition, not this list.
             reason    (str|None) — None on success; non-None string on every other path.
 
-        Branch order (all paths return — never raises):
+        Branch order (every path returns; the one raise is a breached
+        merge_status_answer.py invariant on path 1, which surfaces as a tool
+        error naming it — a server defect, never a cancel outcome):
           1. Waiter absent from _waiters (finalized+popped, never submitted, server
              restarted, or a coalesced id): resolve the request_id through merge_status's
              durable walk (current run → journal → prior runs → no_record; git needs a
@@ -5175,8 +5175,7 @@ def create_server(
         rec = _waiters.get(request_id)
 
         if rec is None:
-            key = _PollKey(request_id=request_id)
-            answer = await _resolve_durable(key, _durable_history(key))
+            answer = await _resolve(_PollKey(request_id=request_id), consult_live=False)
             if answer.reason is None:
                 return {
                     'cancelled': False,
