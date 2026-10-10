@@ -687,6 +687,24 @@ def run_config_dir_path(data_dir: Path, run_id: str) -> Path:
     return recon_config_base_dir(data_dir) / f'{CONFIG_DIR_PREFIX}{run_id}'
 
 
+def recon_transcript_archive_key(run_id: str) -> str:
+    """Key a recon run's transcripts are archived under, inside the archive root.
+
+    ``shared.transcript_archive`` files everything under a key it calls
+    ``task_id``, but a recon run has no task id — its run_id is a UUID — so the
+    run needs a key of its own. Its shape is fixed by two constraints:
+
+    - EXACTLY ONE path segment. The archive layout is ``<key>/<enc>/<sid>.jsonl``
+      and ``scripts/legibility/inventory.py::_archive_enc`` reads the
+      archive-root-relative ``parts[1]`` as ``<enc>``; a key with an extra
+      segment would land the archives on disk yet make them unenumerable.
+    - A ``recon-`` prefix. Recon shares the archive root with the
+      orchestrator, whose per-task dirs are bare numeric task ids; the prefix
+      keeps the two producers distinguishable.
+    """
+    return f'recon-{run_id}'
+
+
 def gc_run_config_dir(data_dir: Path, run_id: str) -> None:
     """Remove a run's per-run recon CLI config dir, if present (task 2744).
 
