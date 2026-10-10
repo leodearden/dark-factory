@@ -595,6 +595,11 @@ class TestRowContract:
         del cases[0][missing]
         self._refused(cases, missing, named)
 
+    @pytest.mark.parametrize('flag', ['recon_marker', 'declares_attach_keys'])
+    @pytest.mark.parametrize('value', ['False', 0, 1])
+    def test_a_write_flag_that_is_not_a_boolean_is_refused(self, flag: str, value: object) -> None:
+        self._refused(_replaced(CAND_CASES, 'cand', 'w5', **{flag: value}), 'cand', 'w5', flag)
+
     def test_an_unknown_reference_arm_is_refused_listing_the_arms(self) -> None:
         with pytest.raises(ValueError, match=r"(?s)'cand'.*'ref'"):
             _score(SYNTH_CASES, SYNTH_VERDICTS, reference_arm='nope')

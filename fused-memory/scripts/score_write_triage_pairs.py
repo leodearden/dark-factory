@@ -62,6 +62,7 @@ import sys
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from itertools import chain
 from pathlib import Path
@@ -87,6 +88,8 @@ _REQUIRED_CASE_KEYS = ('arm', 'memory_id', 'band', 'outcome')
 _ATTACH_OUTCOMES = TRIAGE_OUTCOMES - {OUTCOME_STORED}
 _BANDS = frozenset({OUTCOME_RESTATED, OUTCOME_JUDGE, OUTCOME_STORED})
 """Every band ``write_triage.py::decide_band`` routes a write to."""
+_WRITE_FLAGS = ('recon_marker', 'declares_attach_keys')
+"""Case-row flags that take a write out of production's judge path (PRD §12 D19)."""
 _WILSON_Z = 1.96
 
 Pair: TypeAlias = tuple[str, str]
@@ -210,6 +213,8 @@ class JudgedCase:
     judge_model: str | None
     prompt_tokens: int | None
     completion_tokens: int | None
+    recon_marker: bool | None
+    declares_attach_keys: bool | None
 
     def __post_init__(self) -> None:
         violation = self._contract_violation()
@@ -217,6 +222,10 @@ class JudgedCase:
             raise ValueError(f'{_case_label(self.arm, self.memory_id)}: {violation}')
 
     def _contract_violation(self) -> str | None:
+        for flag in _WRITE_FLAGS:
+            value = getattr(self, flag)
+            if value is not None and not isinstance(value, bool):
+                return f'{flag} {value!r} is not a JSON boolean'
         if self.outcome not in TRIAGE_OUTCOMES:
             return f'outcome {self.outcome!r} is not one of {sorted(TRIAGE_OUTCOMES)}'
         if self.band not in _BANDS:
@@ -254,6 +263,8 @@ class JudgedCase:
             judge_model=row.get('judge_model'),
             prompt_tokens=usage.get('prompt_tokens'),
             completion_tokens=usage.get('completion_tokens'),
+            recon_marker=row.get('recon_marker'),
+            declares_attach_keys=row.get('declares_attach_keys'),
         )
 
     @property
@@ -264,6 +275,11 @@ class JudgedCase:
     @property
     def in_judge_band(self) -> bool:
         return self.band == OUTCOME_JUDGE
+
+    @property
+    def production_judged(self) -> bool:
+        """A judge-band write production would also judge: no recon marker, no declared link."""
+        return self.in_judge_band and all(getattr(self, flag) is False for flag in _WRITE_FLAGS)
 
     @property
     def attached(self) -> bool:
@@ -333,6 +349,63 @@ PAIRED_ERRORS: Mapping[str, Callable[[ScoredCase], bool]] = MappingProxyType({
 """The per-write errors each arm is paired against the reference arm on."""
 
 
+def _predates(created_at: Mapping[str, datetime], target: str, write: str) -> bool:
+    target_at, write_at = created_at.get(target), created_at.get(write)
+    return target_at is not None and write_at is not None and target_at < write_at
+
+
+@dataclass(frozen=True)
+class WriteHomes:
+    """Per write, the resolutions of its rated pairs whose target predates it.
+
+    This is the one home of the earlier-target rule: a target predates a write
+    when both have an instant and the target's is strictly earlier. An undated
+    record is never earlier, as ``run_write_triage_population_arms.py::write_time_slate``
+    drops it from a write-time slate.
+    """
+
+    created_at: Mapping[str, datetime]
+    earlier: Mapping[str, frozenset[Resolution]]
+
+    @classmethod
+    def index(
+        cls, truth: Mapping[Pair, Resolution], created_at: Mapping[str, datetime],
+    ) -> WriteHomes:
+        earlier: defaultdict[str, set[Resolution]] = defaultdict(set)
+        for (write, target), resolution in truth.items():
+            if _predates(created_at, target, write):
+                earlier[write].add(resolution)
+        return cls(
+            created_at=MappingProxyType(dict(created_at)),
+            earlier=MappingProxyType({write: frozenset(found) for write, found in earlier.items()}),
+        )
+
+    def predates(self, target: str, write: str) -> bool:
+        return _predates(self.created_at, target, write)
+
+    def placeable(self, write: str) -> bool:
+        """The corpus says *write* belongs under some record that predates it."""
+        return any(resolution.belongs for resolution in self.earlier.get(write, ()))
+
+    def contradicts(self, write: str) -> bool:
+        """*write* corrects some record that predates it."""
+        return Resolution.CORRECTS in self.earlier.get(write, frozenset())
+
+
+@dataclass(frozen=True)
+class ComparedWrite:
+    """A production-judged write as the comparative block reads it."""
+
+    scored: ScoredCase
+    placeable: bool
+    contradicts: bool
+
+    @classmethod
+    def of(cls, scored: ScoredCase, homes: WriteHomes) -> ComparedWrite:
+        write = scored.case.memory_id
+        return cls(scored, homes.placeable(write), homes.contradicts(write))
+
+
 @dataclass(frozen=True)
 class ListPrice:
     usd_per_mtok_input: float
@@ -370,6 +443,7 @@ def score_pairs(
     verdicts: Sequence[Mapping[str, Any]],
     *,
     reference_arm: str,
+    created_at: Mapping[str, datetime] | None = None,
 ) -> dict[str, Any]:
     """Score every arm in *cases* against the verdict corpus *verdicts*.
 
@@ -448,6 +522,25 @@ def score_pairs(
 
     ``list_prices`` is the table those costs were computed from, with its date
     and source.
+
+    ``comparative`` (PRD §12.3, contract C2‴) is None unless *created_at* is
+    given. *created_at* maps record ids, writes and targets alike, to aware
+    instants; :class:`WriteHomes` states when a target predates a write. With
+    it, every judge-band row must also carry ``recon_marker`` and
+    ``declares_attach_keys`` as booleans, and the block covers the arm's
+    production-judged writes, the judge-band rows with both flags false:
+
+    - ``n_writes``: production-judged writes.
+    - ``placeable_writes``, ``contradiction_writes``: writes the corpus says
+      belong under, or correct, some record that predates them.
+    - ``placeable_attaches``, ``wrong_sibling_misfiles``,
+      ``wrong_sibling_rate_placeable``, ``wrong_sibling_rate_wilson95``:
+      decided attaches of placeable writes, how many resolved MISFILE, and
+      that ratio with its Wilson 95% interval.
+    - ``no_known_home_attaches``: decided attaches of writes that are not
+      placeable.
+    - ``unclear_attaches``: attaches whose pair resolved UNCLEAR, outside
+      every figure above.
     """
     cases_by_arm = _cases_by_arm(cases)
     if reference_arm not in cases_by_arm:
@@ -460,6 +553,7 @@ def score_pairs(
     if unrated or tied:
         raise IncompleteCorpusError(unrated, tied)
     true_link_writes = frozenset(entry for (entry, _), r in truth.items() if r.belongs)
+    homes = None if created_at is None else WriteHomes.index(truth, created_at)
     scored = {
         arm: [_scored(case, truth, true_link_writes) for case in arm_cases if case.in_judge_band]
         for arm, arm_cases in cases_by_arm.items()
@@ -473,6 +567,7 @@ def score_pairs(
                 cases_by_arm[arm],
                 scored[arm],
                 None if arm == reference_arm else scored[reference_arm],
+                homes,
             )
             for arm in cases_by_arm
         },
@@ -526,6 +621,7 @@ def _arm_report(
     cases: Sequence[JudgedCase],
     scored: Sequence[ScoredCase],
     reference: Sequence[ScoredCase] | None,
+    homes: WriteHomes | None,
 ) -> dict[str, Any]:
     judged = [s.case for s in scored]
     return {
@@ -533,6 +629,7 @@ def _arm_report(
         'quality': _quality(scored),
         'runtime': _runtime(judged),
         'paired_vs_reference': None if reference is None else _paired(scored, reference),
+        'comparative': None if homes is None else _comparative(scored, homes),
     }
 
 
@@ -589,6 +686,34 @@ def _quality(scored: Sequence[ScoredCase]) -> dict[str, Any]:
         'parse_failures': sum(s.case.parse_failure for s in scored),
         'unrated_pairs': 0,
         'unrated_pair_ids': [],
+    }
+
+
+def _comparative(scored: Sequence[ScoredCase], homes: WriteHomes) -> dict[str, Any]:
+    writes = [ComparedWrite.of(s, homes) for s in scored if s.case.production_judged]
+    return {
+        'n_writes': len(writes),
+        'placeable_writes': sum(write.placeable for write in writes),
+        'contradiction_writes': sum(write.contradicts for write in writes),
+        **_attach_figures([write for write in writes if write.scored.case.attached]),
+    }
+
+
+def _attach_figures(attaches: Sequence[ComparedWrite]) -> dict[str, Any]:
+    placeable = [write.scored for write in attaches if write.placeable]
+    decided = sum(scored.decided for scored in placeable)
+    misfiles = sum(scored.misfile for scored in placeable)
+    return {
+        'placeable_attaches': decided,
+        'wrong_sibling_misfiles': misfiles,
+        'wrong_sibling_rate_placeable': _rate(misfiles, decided),
+        'wrong_sibling_rate_wilson95': _wilson95(misfiles, decided),
+        'no_known_home_attaches': sum(
+            write.scored.decided for write in attaches if not write.placeable
+        ),
+        'unclear_attaches': sum(
+            write.scored.resolution is Resolution.UNCLEAR for write in attaches
+        ),
     }
 
 
