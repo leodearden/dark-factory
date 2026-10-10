@@ -15,20 +15,20 @@ Coverage is **complete**: every category scrolled as many points as `count_by_me
 
 | project | collection | collection points | counted | residue | complete |
 | --- | --- | ---: | ---: | ---: | --- |
-| `dark_factory` | `fused_dark_factory` | 31,181 | 31,181 | +0 | yes |
-| `reify` | `fused_reify` | 37,405 | 37,405 | +0 | yes |
+| `dark_factory` | `fused_dark_factory` | 31,464 | 31,464 | +0 | yes |
+| `reify` | `fused_reify` | 37,477 | 37,477 | +0 | yes |
 
 | project | category | expected | recount | scrolled | delta |
 | --- | --- | ---: | ---: | ---: | ---: |
-| `dark_factory` | `observations_and_summaries` | 21,990 | 21,990 | 21,990 | +0 |
-| `dark_factory` | `preferences_and_norms` | 2,190 | 2,190 | 2,190 | +0 |
-| `dark_factory` | `procedural_knowledge` | 6,977 | 6,977 | 6,977 | +0 |
+| `dark_factory` | `observations_and_summaries` | 22,174 | 22,174 | 22,174 | +0 |
+| `dark_factory` | `preferences_and_norms` | 2,208 | 2,208 | 2,208 | +0 |
+| `dark_factory` | `procedural_knowledge` | 7,058 | 7,058 | 7,058 | +0 |
 | `dark_factory` | `decisions_and_rationale` | 24 | 24 | 24 | +0 |
 | `dark_factory` | `entities_and_relations` | 0 | 0 | 0 | +0 |
 | `dark_factory` | `temporal_facts` | 0 | 0 | 0 | +0 |
-| `reify` | `observations_and_summaries` | 28,570 | 28,570 | 28,570 | +0 |
-| `reify` | `preferences_and_norms` | 2,057 | 2,057 | 2,057 | +0 |
-| `reify` | `procedural_knowledge` | 6,698 | 6,698 | 6,698 | +0 |
+| `reify` | `observations_and_summaries` | 28,626 | 28,626 | 28,626 | +0 |
+| `reify` | `preferences_and_norms` | 2,058 | 2,058 | 2,058 | +0 |
+| `reify` | `procedural_knowledge` | 6,713 | 6,713 | 6,713 | +0 |
 | `reify` | `decisions_and_rationale` | 17 | 17 | 17 | +0 |
 | `reify` | `entities_and_relations` | 45 | 45 | 45 | +0 |
 | `reify` | `temporal_facts` | 18 | 18 | 18 | +0 |
@@ -43,9 +43,9 @@ On the **(all)** row the three canonical columns count (project, topic) CELLS �
 
 | scope | records | `topic` present | coverage | distinct topics | 1 canonical | 0 canonical | >1 canonical |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `dark_factory` | 31,181 | 1,634 | 5.2404% | 560 | 85 | 475 | 0 |
-| `reify` | 37,405 | 1,336 | 3.5717% | 631 | 122 | 509 | 0 |
-| **(all)** | 68,586 | 2,970 | 4.3303% | 1,188 | 207 | 984 | 0 |
+| `dark_factory` | 31,464 | 1,706 | 5.4221% | 616 | 85 | 531 | 0 |
+| `reify` | 37,477 | 1,359 | 3.6262% | 650 | 122 | 528 | 0 |
+| **(all)** | 68,941 | 3,065 | 4.4458% | 1,263 | 207 | 1,059 | 0 |
 
 ### Canonical uniqueness
 
@@ -71,8 +71,8 @@ The standing re-measurement of gate **3626**'s recipe: **item 3** is the non-con
 
 | scope | distinct topics | conforming (item 3) | non-conforming (item 3) | `canonical: true` topics | conforming (item 4) | non-conforming (item 4) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `dark_factory` | 560 | 467 | 93 | 85 | 85 | 0 |
-| `reify` | 631 | 565 | 66 | 122 | 120 | 2 |
+| `dark_factory` | 616 | 523 | 93 | 85 | 85 | 0 |
+| `reify` | 650 | 584 | 66 | 122 | 120 | 2 |
 
 #### `dark_factory` — non-conforming topic values (item 3)
 
@@ -289,20 +289,20 @@ Not gauged — query-surface topics (they key a query, not a `metadata.topic`): 
 
 Movement since the most recent prior run in `plans/memory-metadata-coverage-history.json`.
 
-Baseline: `2026-10-08T04:03:39+00:00`.
+Baseline: `2026-10-09T04:01:21+00:00`.
 
 | project | column | before | after | delta |
 | --- | --- | ---: | ---: | ---: |
-| `dark_factory` | `records` | 31,014 | 31,181 | +167 |
-| `dark_factory` | `topic_present` | 1,591 | 1,634 | +43 |
-| `dark_factory` | `topic_coverage_pct` | 5.1299 | 5.2404 | +0.1105 |
-| `dark_factory` | `distinct_topics` | 520 | 560 | +40 |
+| `dark_factory` | `records` | 31,181 | 31,464 | +283 |
+| `dark_factory` | `topic_present` | 1,634 | 1,706 | +72 |
+| `dark_factory` | `topic_coverage_pct` | 5.2404 | 5.4221 | +0.1817 |
+| `dark_factory` | `distinct_topics` | 560 | 616 | +56 |
 | `dark_factory` | `topics_with_one_canonical` | 85 | 85 | 0 |
-| `dark_factory` | `topics_with_zero_canonical` | 435 | 475 | +40 |
+| `dark_factory` | `topics_with_zero_canonical` | 475 | 531 | +56 |
 | `dark_factory` | `topics_with_multiple_canonical` | 0 | 0 | 0 |
 | `dark_factory` | `canonical_true` | 85 | 85 | 0 |
 | `dark_factory` | `canonical_true_without_topic` | 0 | 0 | 0 |
-| `dark_factory` | `slug_conforming` | 427 | 467 | +40 |
+| `dark_factory` | `slug_conforming` | 467 | 523 | +56 |
 | `dark_factory` | `slug_non_conforming` | 93 | 93 | 0 |
 | `dark_factory` | `canonical_slug_conforming` | 85 | 85 | 0 |
 | `dark_factory` | `canonical_slug_non_conforming` | 0 | 0 | 0 |
@@ -310,16 +310,16 @@ Baseline: `2026-10-08T04:03:39+00:00`.
 | `dark_factory` | `registry_topics_with_exactly_one_canonical` | 2 | 2 | 0 |
 | `dark_factory` | `registry_topics_with_zero_canonical` | 9 | 9 | 0 |
 | `dark_factory` | `registry_topics_with_multiple_canonical` | 0 | 0 | 0 |
-| `reify` | `records` | 37,266 | 37,405 | +139 |
-| `reify` | `topic_present` | 1,298 | 1,336 | +38 |
-| `reify` | `topic_coverage_pct` | 3.4831 | 3.5717 | +0.0886 |
-| `reify` | `distinct_topics` | 600 | 631 | +31 |
+| `reify` | `records` | 37,405 | 37,477 | +72 |
+| `reify` | `topic_present` | 1,336 | 1,359 | +23 |
+| `reify` | `topic_coverage_pct` | 3.5717 | 3.6262 | +0.0545 |
+| `reify` | `distinct_topics` | 631 | 650 | +19 |
 | `reify` | `topics_with_one_canonical` | 122 | 122 | 0 |
-| `reify` | `topics_with_zero_canonical` | 478 | 509 | +31 |
+| `reify` | `topics_with_zero_canonical` | 509 | 528 | +19 |
 | `reify` | `topics_with_multiple_canonical` | 0 | 0 | 0 |
 | `reify` | `canonical_true` | 122 | 122 | 0 |
 | `reify` | `canonical_true_without_topic` | 0 | 0 | 0 |
-| `reify` | `slug_conforming` | 534 | 565 | +31 |
+| `reify` | `slug_conforming` | 565 | 584 | +19 |
 | `reify` | `slug_non_conforming` | 66 | 66 | 0 |
 | `reify` | `canonical_slug_conforming` | 120 | 120 | 0 |
 | `reify` | `canonical_slug_non_conforming` | 2 | 2 | 0 |
@@ -340,7 +340,7 @@ _(none)_
 
 | project | topic | records before | records after |
 | --- | --- | ---: | ---: |
-| `dark_factory` | `pytest-xdist-serial-override` | 21 | 22 |
+| `dark_factory` | `pytest-xdist-serial-override` | 22 | 23 |
 
 #### Newly registered targets
 
@@ -354,54 +354,54 @@ _(none)_
 
 | project | category | records |
 | --- | --- | ---: |
-| `dark_factory` | `observations_and_summaries` | 21,990 |
-| `dark_factory` | `preferences_and_norms` | 2,190 |
-| `dark_factory` | `procedural_knowledge` | 6,977 |
+| `dark_factory` | `observations_and_summaries` | 22,174 |
+| `dark_factory` | `preferences_and_norms` | 2,208 |
+| `dark_factory` | `procedural_knowledge` | 7,058 |
 | `dark_factory` | `decisions_and_rationale` | 24 |
 | `dark_factory` | `entities_and_relations` | 0 |
 | `dark_factory` | `temporal_facts` | 0 |
-| `dark_factory` | **(all)** | **31,181** |
-| `reify` | `observations_and_summaries` | 28,570 |
-| `reify` | `preferences_and_norms` | 2,057 |
-| `reify` | `procedural_knowledge` | 6,698 |
+| `dark_factory` | **(all)** | **31,464** |
+| `reify` | `observations_and_summaries` | 28,626 |
+| `reify` | `preferences_and_norms` | 2,058 |
+| `reify` | `procedural_knowledge` | 6,713 |
 | `reify` | `decisions_and_rationale` | 17 |
 | `reify` | `entities_and_relations` | 45 |
 | `reify` | `temporal_facts` | 18 |
-| `reify` | **(all)** | **37,405** |
-| **(all)** | **(all)** | **68,586** |
+| `reify` | **(all)** | **37,477** |
+| **(all)** | **(all)** | **68,941** |
 
 ## Grand total
 
-Records: **68,586**
+Records: **68,941**
 
 #### Top-level metadata key population
 
 | key | count |
 | --- | ---: |
-| `category` | 68,586 |
-| `created_at` | 68,586 |
-| `data` | 68,586 |
-| `hash` | 68,586 |
-| `user_id` | 68,586 |
-| `updated_at` | 64,850 |
-| `agent_id` | 51,310 |
-| `role` | 45,859 |
-| `task_id` | 23,169 |
-| `source` | 19,612 |
-| `transition` | 18,290 |
-| `_causation_id` | 9,110 |
-| `_deferred` | 9,049 |
-| `run_id` | 4,638 |
-| `stage2_suppress` | 4,371 |
-| `echo_used_provenance` | 3,993 |
-| `kind` | 3,331 |
-| `topic` | 2,970 |
+| `category` | 68,941 |
+| `created_at` | 68,941 |
+| `data` | 68,941 |
+| `hash` | 68,941 |
+| `user_id` | 68,941 |
+| `updated_at` | 65,205 |
+| `agent_id` | 51,615 |
+| `role` | 46,214 |
+| `task_id` | 23,359 |
+| `source` | 19,716 |
+| `transition` | 18,337 |
+| `_causation_id` | 9,114 |
+| `_deferred` | 9,053 |
+| `run_id` | 4,644 |
+| `stage2_suppress` | 4,418 |
+| `echo_used_provenance` | 4,037 |
+| `kind` | 3,335 |
+| `topic` | 3,065 |
 | `stage` | 2,870 |
 | `commit` | 635 |
 | `task_ids` | 601 |
 | `escalation_id` | 436 |
-| `supersedes` | 404 |
-| `parent_id` | 389 |
+| `supersedes` | 408 |
+| `parent_id` | 393 |
 | `memories_deleted` | 364 |
 | `date` | 325 |
 | `memories_added` | 321 |
@@ -409,9 +409,9 @@ Records: **68,586**
 | `edges_updated` | 287 |
 | `related_tasks` | 285 |
 | `memories_written` | 271 |
-| `flag_type` | 269 |
 | `graphiti_writes_queued` | 269 |
-| `canonical` | 258 |
+| `flag_type` | 265 |
+| `canonical` | 259 |
 | `finding` | 257 |
 | `dst_project` | 253 |
 | `original_edge_uuid` | 253 |
@@ -473,22 +473,22 @@ Records: **68,586**
 | `cycle_id` | 56 |
 | `task_status` | 56 |
 | `corrective_write` | 55 |
-| `flag_for_stage2` | 53 |
+| `unverified_claim` | 54 |
 | `recon_run` | 53 |
 | `escalation` | 52 |
 | `watch_cycle` | 52 |
-| `unverified_claim` | 50 |
 | `x_curator_sitting` | 50 |
+| `flag_for_stage2` | 49 |
 | `merged_from` | 49 |
 | `title` | 49 |
 | `additions` | 48 |
 | `provenance` | 48 |
 | `superseded_by` | 48 |
+| `echo_suppressed_stale_description` | 46 |
 | `reconstructed_by` | 46 |
 | `completed_at` | 44 |
 | `escalations` | 44 |
 | `file` | 44 |
-| `echo_suppressed_stale_description` | 43 |
 | `spec_version` | 43 |
 | `reconciliation_run` | 42 |
 | `session_date` | 40 |
@@ -510,6 +510,7 @@ Records: **68,586**
 | `note` | 31 |
 | `related_memories` | 31 |
 | `remediates` | 31 |
+| `verification_verdict` | 31 |
 | `corrects_memory_id` | 30 |
 | `findings_addressed` | 30 |
 | `flag_ids` | 30 |
@@ -523,7 +524,6 @@ Records: **68,586**
 | `component` | 28 |
 | `replaces_memory` | 28 |
 | `scope` | 28 |
-| `verification_verdict` | 28 |
 | `escalation_ids` | 27 |
 | `flag_resolved` | 27 |
 | `actions` | 25 |
@@ -669,7 +669,6 @@ Records: **68,586**
 | `recon_pool` | 9 |
 | `reconstructed_by_run` | 9 |
 | `related_df_tasks` | 9 |
-| `related_memory_ids` | 9 |
 | `resolved_at` | 9 |
 | `root_cause_confirmed` | 9 |
 | `run` | 9 |
@@ -705,6 +704,7 @@ Records: **68,586**
 | `project` | 8 |
 | `refers_to_memory` | 8 |
 | `related_dark_factory_task` | 8 |
+| `related_memory_ids` | 8 |
 | `remaps_stale_memories` | 8 |
 | `removed_tasks` | 8 |
 | `replaces_partial` | 8 |
@@ -725,7 +725,6 @@ Records: **68,586**
 | `cycle_tasks_modified` | 7 |
 | `cycles_flagged` | 7 |
 | `dead_item_count` | 7 |
-| `deduped_against` | 7 |
 | `deleted_mem0_ids` | 7 |
 | `deployment_date` | 7 |
 | `dlq_dead_count` | 7 |
@@ -778,15 +777,16 @@ Records: **68,586**
 | `findings_fixed` | 6 |
 | `fix_file` | 6 |
 | `fix_method` | 6 |
+| `fix_pattern` | 6 |
 
-_Showing top 400 of 2,016 distinct values — this markdown view is **truncated**; the JSON artifact carries the full population, and `--top-n` widens this view._
+_Showing top 400 of 2,015 distinct values — this markdown view is **truncated**; the JSON artifact carries the full population, and `--top-n` widens this view._
 
 #### `kind` values
 
 | kind | count |
 | --- | ---: |
 | `cycle_summary` | 1,323 |
-| `amendment` | 365 |
+| `amendment` | 369 |
 | `cgl_eta_cross_target_rehome` | 253 |
 | `pin_queue_edge_cleanup_audit` | 120 |
 | `task_completion_note` | 104 |
@@ -803,7 +803,7 @@ _Showing top 400 of 2,016 distinct values — this markdown view is **truncated*
 | `done_task_completion_note` | 18 |
 | `task_completion_guard` | 18 |
 | `correction` | 17 |
-| `session_summary` | 16 |
+| `session_summary` | 17 |
 | `stage2_suppress_guard` | 16 |
 | `failure_mode` | 15 |
 | `completion_guard` | 13 |
@@ -860,7 +860,6 @@ _Showing top 400 of 2,016 distinct values — this markdown view is **truncated*
 | `corrective_convention` | 2 |
 | `cycle_summary_correction` | 2 |
 | `deferral_note` | 2 |
-| `flag_for_stage2` | 2 |
 | `flag_resolution_note` | 2 |
 | `human_gate_scope_note` | 2 |
 | `measurement` | 2 |
@@ -992,6 +991,7 @@ _Showing top 400 of 2,016 distinct values — this markdown view is **truncated*
 | `feasibility_measurement` | 1 |
 | `fix_effectiveness_resolution` | 1 |
 | `flag_closure_note` | 1 |
+| `flag_for_stage2` | 1 |
 | `flag_marker_id_mismatch_norm` | 1 |
 | `followup_prd_pointer` | 1 |
 | `followup_scope_note` | 1 |
@@ -1188,21 +1188,21 @@ _Showing top 400 of 2,016 distinct values — this markdown view is **truncated*
 
 _Showing top 400 of 483 distinct values — this markdown view is **truncated**; the JSON artifact carries the full population, and `--top-n` widens this view._
 
-`kind` missing: **65,255** record(s).
+`kind` missing: **65,606** record(s).
 
 #### `supersedes` shapes
 
 | shape | count |
 | --- | ---: |
-| `absent` | 68,182 |
-| `list` | 318 |
+| `absent` | 68,533 |
+| `list` | 322 |
 | `scalar` | 86 |
 
 #### `supersedes` member shapes
 
 | member shape | count |
 | --- | ---: |
-| `full_uuid` | 495 |
+| `full_uuid` | 500 |
 | `other` | 10 |
 | `short_hex` | 3 |
 
@@ -1211,8 +1211,8 @@ _Showing top 400 of 483 distinct values — this markdown view is **truncated**;
 | length | count |
 | --- | ---: |
 | `0` | 138 |
-| `1` | 71 |
-| `2` | 61 |
+| `1` | 74 |
+| `2` | 62 |
 | `3` | 24 |
 | `4` | 6 |
 | `5` | 4 |
@@ -1228,10 +1228,10 @@ _Showing top 400 of 483 distinct values — this markdown view is **truncated**;
 
 | axis | count |
 | --- | ---: |
-| `topic` present | 2,970 |
-| `parent_id` present | 389 |
+| `topic` present | 3,065 |
+| `parent_id` present | 393 |
 | `canonical` true | 207 |
-| `canonical` false | 50 |
+| `canonical` false | 51 |
 | `canonical` non-bool | 1 |
 
 #### `topic` values
@@ -1249,8 +1249,8 @@ _Showing top 400 of 483 distinct values — this markdown view is **truncated**;
 | `orchestrator-full-suite-runtime-budget` | 29 |
 | `vacuous-test-guard` | 29 |
 | `orchestrator-xdist-worker-crash-under-load` | 24 |
-| `tree-sitter-reify-build-grammar` | 23 |
-| `pytest-xdist-serial-override` | 22 |
+| `tree-sitter-reify-build-grammar` | 24 |
+| `pytest-xdist-serial-override` | 23 |
 | `merge-request-bare-task-id-branch-arg` | 21 |
 | `reify-coupled-ri-fixtures-registration` | 21 |
 | `ruff-format-not-enforced` | 20 |
@@ -1308,6 +1308,7 @@ _Showing top 400 of 483 distinct values — this markdown view is **truncated**;
 | `dashboard-classic-script-scope-collision` | 8 |
 | `doc-prose-guard-policy-corrections` | 8 |
 | `escalation-store-ambiguity` | 8 |
+| `merge-lane-ratchet-private-reads-new-test-rows` | 8 |
 | `metadata-mode-replace-key-retirement` | 8 |
 | `no-line-number-citations-norm` | 8 |
 | `orchestratorconfig-magicmock-spec-set` | 8 |
@@ -1320,7 +1321,8 @@ _Showing top 400 of 483 distinct values — this markdown view is **truncated**;
 | `watchdog-clock-gate-test-isolation` | 8 |
 | `entity-summary-accumulation-bug-description` | 7 |
 | `landlock-exdev-rmeta-rename` | 7 |
-| `merge-lane-ratchet-private-reads-new-test-rows` | 7 |
+| `laptop-verify-host-utilisation` | 7 |
+| `merge-lane-ratchet` | 7 |
 | `orchestrator-bug-outstanding` | 7 |
 | `orchestrator-costs` | 7 |
 | `orchestrator-pytest-asyncio-strict-mode` | 7 |
@@ -1356,7 +1358,6 @@ _Showing top 400 of 483 distinct values — this markdown view is **truncated**;
 | `grammar-comment-syntax-bug` | 5 |
 | `graphiti_index_health` | 5 |
 | `head-limited-grep-truncates-the-decisive-hit` | 5 |
-| `merge-lane-ratchet` | 5 |
 | `pdiag-ptodo-baseline-ratchet-staleness` | 5 |
 | `prd-generic-mode-overlay-absent` | 5 |
 | `refs-stash-reference-transaction-hook-reach` | 5 |
@@ -1376,6 +1377,7 @@ _Showing top 400 of 483 distinct values — this markdown view is **truncated**;
 | `gate-probe-echo-interpolation-vs-binding` | 4 |
 | `gitops-quarantine-rename-worktree-bare-branch-name` | 4 |
 | `harness-layout-gate-move-gotchas` | 4 |
+| `inv12-exception-register` | 4 |
 | `m2-completion` | 4 |
 | `mem0-agent-id-promoted-out-of-metadata` | 4 |
 | `memory-metadata-census-report-pinned-oracle` | 4 |
@@ -1439,9 +1441,11 @@ _Showing top 400 of 483 distinct values — this markdown view is **truncated**;
 | `torque-named-dimension-status` | 3 |
 | `write-triage-flip-readiness` | 3 |
 | `architect-narrowing-legitimate-drop-directions` | 2 |
+| `architect-plan-tools-recipe` | 2 |
 | `asyncio-subprocess-mid-spawn-cancel` | 2 |
 | `audit_duplicate_tasks` | 2 |
 | `briefing-query-journal-classification` | 2 |
+| `ctor-conformance-survey-regeneration` | 2 |
 | `curator-dedup-outage-2026-08` | 2 |
 | `dead-feature-activation-detection` | 2 |
 | `delivered-check-stale-scope-paths` | 2 |
@@ -1451,13 +1455,14 @@ _Showing top 400 of 483 distinct values — this markdown view is **truncated**;
 | `escalation_server_ops` | 2 |
 | `eval_worktree_venv_shadowing` | 2 |
 | `falkordb-compose-worktree-hazard` | 2 |
+| `fused-memory-lint-cli-contract` | 2 |
 | `generic-type-param-placeholder-types` | 2 |
 | `get_entity_exact_vs_fuzzy_edge_scoping` | 2 |
 | `git-build-hygiene` | 2 |
 | `harness-git-diff-output-unreliable` | 2 |
-| `inv12-exception-register` | 2 |
 | `lme-arm-harness-code-sha-pin` | 2 |
 | `loft-source-reachability` | 2 |
+| `loop-blocking-gate-allowlist` | 2 |
 | `magicmock-verifyresult-cause-hint` | 2 |
 | `mem0-citation-repoint` | 2 |
 | `mem0-topic-slug-conformance-census` | 2 |
@@ -1475,6 +1480,7 @@ _Showing top 400 of 483 distinct values — this markdown view is **truncated**;
 | `orchestrator-scope-violation` | 2 |
 | `orphan-reaper-stale-l0-promotion` | 2 |
 | `persistent-cache-envelope-format` | 2 |
+| `persistent-fea-cache-invalidation` | 2 |
 | `pooled_worktree_lane_venv_exdev` | 2 |
 | `precision-refine-envelope-loft` | 2 |
 | `process-liveness-shared-host` | 2 |
@@ -1496,6 +1502,8 @@ _Showing top 400 of 483 distinct values — this markdown view is **truncated**;
 | `steward-descope-plan-status` | 2 |
 | `task-count-snapshot-convention` | 2 |
 | `temp-dir-test-hygiene` | 2 |
+| `tempfile-crate-gotchas` | 2 |
+| `timeout-marker-inversion-guard` | 2 |
 | `tmp-purge-safety` | 2 |
 | `update-memory-metadata-patch-authz-gate` | 2 |
 | `verify-resource-measurement` | 2 |
@@ -1516,6 +1524,8 @@ _Showing top 400 of 483 distinct values — this markdown view is **truncated**;
 | `_fetch_filtered_task_tree fix` | 1 |
 | `a-prd-stated-precondition-can-be-the-wrong-gate` | 1 |
 | `adaptive-dorfler-marking-form` | 1 |
+| `adaptive-elastic-result-contract` | 1 |
+| `adaptive-elastic-result-reported-iterate` | 1 |
 | `adaptive-refine-size-proxy` | 1 |
 | `adaptive-refine-size-proxy-zero-mark-growth` | 1 |
 | `adv_wrong_step_plan_fixture` | 1 |
@@ -1523,6 +1533,7 @@ _Showing top 400 of 483 distinct values — this markdown view is **truncated**;
 | `agent-cli-spawn-test-guard` | 1 |
 | `agent-followup-anchor-to-defect-not-literal-value` | 1 |
 | `agent-result-model-id` | 1 |
+| `agent-sandbox-proc-writes` | 1 |
 | `aiosqlite-cancellation-semantics` | 1 |
 | `aiosqlite-scangate-deflake-task-5939` | 1 |
 | `alias-dfs-deferred-reresolution-duplicate-diagnostics` | 1 |
@@ -1531,8 +1542,10 @@ _Showing top 400 of 483 distinct values — this markdown view is **truncated**;
 | `ancestry-check-rc0-false-positive` | 1 |
 | `answered-but-unrecorded-root-cause` | 1 |
 | `aposteriori-fixture-bc-tolerance` | 1 |
+| `architect-dispatch-prompt-composition` | 1 |
 | `architect-plan-files-write-set` | 1 |
 | `architect-plan-revalidation` | 1 |
+| `architect-plan-revalidation-requeue-lock` | 1 |
 | `architect-plan-scoping` | 1 |
 | `assert-tail50-dump-cap` | 1 |
 | `ast-guard-cache-what-and-where` | 1 |
@@ -1541,6 +1554,7 @@ _Showing top 400 of 483 distinct values — this markdown view is **truncated**;
 | `asyncio-subprocess-timeout-anchoring` | 1 |
 | `audit-duplicate-memories-recall-limits` | 1 |
 | `audit-verification-forensic-attribution` | 1 |
+| `auto-resolve-firing-rule` | 1 |
 | `auto-resolve-panel-driving-metric-label` | 1 |
 | `auto-resolve-panel-test-cast-fix` | 1 |
 | `autoparam-field-churn` | 1 |
@@ -1578,9 +1592,11 @@ _Showing top 400 of 483 distinct values — this markdown view is **truncated**;
 | `cargo-test-filter-counting` | 1 |
 | `census-report-conformance` | 1 |
 | `census-report-discovery` | 1 |
+| `census-synthesis-dispositions` | 1 |
 | `census-trigger-test-date-arithmetic` | 1 |
 | `cited-test-path-gate` | 1 |
 | `cited-test-path-ratchet` | 1 |
+| `claimant-invariant-gauge` | 1 |
 | `claude-binary-test-hermeticity` | 1 |
 | `claude-cli-bash-cwd-persistence` | 1 |
 | `claude-cli-dontask-confinement` | 1 |
@@ -1593,6 +1609,7 @@ _Showing top 400 of 483 distinct values — this markdown view is **truncated**;
 | `code-metrics-tooling` | 1 |
 | `cold-build-verify-timeout` | 1 |
 | `commit-citation-pattern` | 1 |
+| `commit-planning-restamp-after-label-repair` | 1 |
 | `commit_planning_manifest_stamping_doc_fix` | 1 |
 | `compile-builder-fn-body-function-table-asymmetry` | 1 |
 | `compile-error-diagnostics-engine` | 1 |
@@ -1615,38 +1632,21 @@ _Showing top 400 of 483 distinct values — this markdown view is **truncated**;
 | `content-driven-config-sweep-scoping` | 1 |
 | `corpus_no_bare_scalar self-scan` | 1 |
 | `corrections-coupling-and-guard-inversion` | 1 |
+| `cost-min-material-waste-substrate` | 1 |
 | `coststore_role_telemetry` | 1 |
 | `cpsat-enumerable-domains` | 1 |
 | `cpu-attribution-verify-ceiling` | 1 |
 | `cpu-overcommit-run-all-storm` | 1 |
 | `cpu-overcommit-run-all-storm-admission-threshold-root` | 1 |
-| `cross-project-escalation-mcp-ports` | 1 |
-| `cross-project-path-scope-guard` | 1 |
-| `cross-project-task-routing` | 1 |
-| `cross-repo-misfile-recurrence` | 1 |
-| `cross-repo-oracle-caller-recipe-errexit` | 1 |
-| `cross-repo-task-recognition-and-landing` | 1 |
-| `cross_repo_unactionability_data_vs_code` | 1 |
-| `ctor-conformance-pinned-clean-scope` | 1 |
-| `ctor-conformance-survey-regeneration` | 1 |
-| `ctor-label-binding-severity` | 1 |
-| `curator-combine-defect-axes` | 1 |
-| `curator-consolidation-protocol` | 1 |
-| `curator-failover-dedup-audit` | 1 |
-| `curator-gate-adjudication` | 1 |
-| `curator-gate-partial-fold-audit` | 1 |
-| `curator-sweep-wave2-session-summary` | 1 |
-| `curator-test-stub-prepared-kwarg` | 1 |
-| `curator-wave3-2026-07-28` | 1 |
 
-_Showing top 400 of 1,188 distinct values — this markdown view is **truncated**; the JSON artifact carries the full population, and `--top-n` widens this view._
+_Showing top 400 of 1,263 distinct values — this markdown view is **truncated**; the JSON artifact carries the full population, and `--top-n` widens this view._
 
 #### `source` values
 
 | source | count |
 | --- | ---: |
-| `targeted_reconciliation` | 17,945 |
-| `orchestrator_completion` | 327 |
+| `targeted_reconciliation` | 17,995 |
+| `orchestrator_completion` | 369 |
 | `consolidation` | 122 |
 | `steward-triage` | 81 |
 | `reconciliation_stage2` | 80 |
@@ -1679,6 +1679,7 @@ _Showing top 400 of 1,188 distinct values — this markdown view is **truncated*
 | `stage2_task_knowledge_sync` | 9 |
 | `curator_gate_5712` | 8 |
 | `curator_wave2_2026_07_27` | 8 |
+| `laptop-utilisation-study-2026-10-08` | 8 |
 | `reconciliation_stage2_task_knowledge_sync` | 8 |
 | `reflect` | 8 |
 | `review-triage` | 8 |
@@ -1757,6 +1758,7 @@ _Showing top 400 of 1,188 distinct values — this markdown view is **truncated*
 | `unblock-3308` | 2 |
 | `unblock-3807` | 2 |
 | `unblock-triage` | 2 |
+| `verify-rate-improvement-2026-10-09` | 2 |
 | `Leo mid-turn instruction; adversarial review of plans/dashboard-one-datum-one-path-prd.md` | 1 |
 | `agent-observation` | 1 |
 | `architect-probe` | 1 |
@@ -1824,6 +1826,7 @@ _Showing top 400 of 1,188 distinct values — this markdown view is **truncated*
 | `memory_consolidator_stage1` | 1 |
 | `orchestrator/src/orchestrator/stop_instruction.py` | 1 |
 | `plans/dashboard-contradiction-sweep-2026-09-14.md` | 1 |
+| `prd-author` | 1 |
 | `recon-stage-1` | 1 |
 | `recon_remediation` | 1 |
 | `recon_stage1_52f5d382` | 1 |
@@ -1838,6 +1841,7 @@ _Showing top 400 of 1,188 distinct values — this markdown view is **truncated*
 | `remediation_run_stage1` | 1 |
 | `remediation_stage1` | 1 |
 | `retroactive_reconstruction` | 1 |
+| `review-all` | 1 |
 | `review-suggestion-backfill-triage` | 1 |
 | `review-suggestion-triage` | 1 |
 | `review_suggestion_triage` | 1 |
@@ -1875,8 +1879,8 @@ _Showing top 400 of 1,188 distinct values — this markdown view is **truncated*
 
 | source | count |
 | --- | ---: |
-| `targeted_reconciliation` | 17,930 |
-| `orchestrator_completion` | 327 |
+| `targeted_reconciliation` | 17,980 |
+| `orchestrator_completion` | 369 |
 | `consolidation` | 121 |
 | `steward-triage` | 81 |
 | `reconciliation_stage2` | 80 |
@@ -1911,6 +1915,7 @@ _Showing top 400 of 1,188 distinct values — this markdown view is **truncated*
 | `reflect` | 8 |
 | `review-triage` | 8 |
 | `stage1_flag_FLAG-S1-REIFY-DUPLICATE-TASK-BUG-ACTIVE` | 8 |
+| `laptop-utilisation-study-2026-10-08` | 7 |
 | `printer_v01 GUI dogfood 2026-05-26` | 7 |
 | `review-cycle` | 7 |
 | `stage1_reconciliation` | 7 |
@@ -1983,6 +1988,7 @@ _Showing top 400 of 1,188 distinct values — this markdown view is **truncated*
 | `unblock-3308` | 2 |
 | `unblock-3807` | 2 |
 | `unblock-triage` | 2 |
+| `verify-rate-improvement-2026-10-09` | 2 |
 | `Leo mid-turn instruction; adversarial review of plans/dashboard-one-datum-one-path-prd.md` | 1 |
 | `agent-observation` | 1 |
 | `architect-probe` | 1 |
@@ -2036,6 +2042,7 @@ _Showing top 400 of 1,188 distinct values — this markdown view is **truncated*
 | `measurement agent + own scripts` | 1 |
 | `memory_consolidator_promotion` | 1 |
 | `orchestrator/src/orchestrator/stop_instruction.py` | 1 |
+| `prd-author` | 1 |
 | `recon-stage-1` | 1 |
 | `recon_stage1_52f5d382` | 1 |
 | `reconciliation_remediation` | 1 |
@@ -2045,6 +2052,7 @@ _Showing top 400 of 1,188 distinct values — this markdown view is **truncated*
 | `remediation_run_828a3379` | 1 |
 | `remediation_run_c3cf3d42` | 1 |
 | `remediation_run_stage1` | 1 |
+| `review-all` | 1 |
 | `review-suggestion-backfill-triage` | 1 |
 | `review-suggestion-triage` | 1 |
 | `review_suggestion_triage` | 1 |
@@ -2081,38 +2089,38 @@ _Showing top 400 of 1,188 distinct values — this markdown view is **truncated*
 
 ### All categories
 
-Records: **31,181**
+Records: **31,464**
 
 #### Top-level metadata key population
 
 | key | count |
 | --- | ---: |
-| `category` | 31,181 |
-| `created_at` | 31,181 |
-| `data` | 31,181 |
-| `hash` | 31,181 |
-| `user_id` | 31,181 |
-| `updated_at` | 29,921 |
-| `agent_id` | 24,611 |
-| `role` | 21,999 |
-| `task_id` | 9,206 |
-| `source` | 7,477 |
-| `transition` | 6,932 |
-| `_causation_id` | 3,573 |
-| `_deferred` | 3,547 |
-| `stage2_suppress` | 2,589 |
-| `echo_used_provenance` | 2,541 |
-| `run_id` | 2,174 |
-| `topic` | 1,634 |
-| `kind` | 1,615 |
+| `category` | 31,464 |
+| `created_at` | 31,464 |
+| `data` | 31,464 |
+| `hash` | 31,464 |
+| `user_id` | 31,464 |
+| `updated_at` | 30,204 |
+| `agent_id` | 24,863 |
+| `role` | 22,282 |
+| `task_id` | 9,336 |
+| `source` | 7,546 |
+| `transition` | 6,963 |
+| `_causation_id` | 3,577 |
+| `_deferred` | 3,551 |
+| `stage2_suppress` | 2,620 |
+| `echo_used_provenance` | 2,569 |
+| `run_id` | 2,184 |
+| `topic` | 1,706 |
+| `kind` | 1,620 |
 | `stage` | 1,106 |
-| `parent_id` | 348 |
+| `parent_id` | 352 |
 | `commit` | 341 |
 | `task_ref` | 248 |
 | `escalation_id` | 234 |
 | `task_ids` | 204 |
 | `date` | 190 |
-| `supersedes` | 177 |
+| `supersedes` | 181 |
 | `memories_deleted` | 172 |
 | `related_tasks` | 171 |
 | `memories_added` | 156 |
@@ -2122,7 +2130,7 @@ Records: **31,181**
 | `recon_run_id` | 140 |
 | `graphiti_writes_queued` | 139 |
 | `uniqueness_token` | 136 |
-| `canonical` | 129 |
+| `canonical` | 130 |
 | `tasks_modified` | 126 |
 | `dst_project` | 123 |
 | `original_edge_uuid` | 123 |
@@ -2163,12 +2171,12 @@ Records: **31,181**
 | `status` | 44 |
 | `resolution` | 42 |
 | `measured_at` | 39 |
+| `unverified_claim` | 38 |
 | `action_needed` | 37 |
 | `flag` | 37 |
 | `related_task_ids` | 37 |
 | `remediation_finding` | 37 |
 | `related_task` | 36 |
-| `unverified_claim` | 36 |
 | `task_refs` | 35 |
 | `provenance` | 32 |
 | `spawned_from` | 32 |
@@ -2183,13 +2191,13 @@ Records: **31,181**
 | `consolidated_from` | 25 |
 | `tasks_hints_updated` | 25 |
 | `corrects` | 24 |
+| `echo_suppressed_stale_description` | 24 |
 | `edges_invalidated` | 24 |
 | `flags_resolved` | 24 |
 | `sprint_date` | 23 |
 | `consolidates` | 22 |
 | `flag_ids` | 22 |
 | `source_finding_id` | 22 |
-| `echo_suppressed_stale_description` | 21 |
 | `actionable` | 20 |
 | `echo_unverified_completion` | 19 |
 | `fix_commit` | 19 |
@@ -2488,14 +2496,14 @@ Records: **31,181**
 | `deferred_to` | 3 |
 | `deferred_to_next_run` | 3 |
 
-_Showing top 400 of 1,126 distinct values — this markdown view is **truncated**; the JSON artifact carries the full population, and `--top-n` widens this view._
+_Showing top 400 of 1,127 distinct values — this markdown view is **truncated**; the JSON artifact carries the full population, and `--top-n` widens this view._
 
 #### `kind` values
 
 | kind | count |
 | --- | ---: |
 | `cycle_summary` | 444 |
-| `amendment` | 330 |
+| `amendment` | 334 |
 | `cgl_eta_cross_target_rehome` | 123 |
 | `pin_queue_edge_cleanup_audit` | 112 |
 | `task_completion_note` | 60 |
@@ -2506,8 +2514,8 @@ _Showing top 400 of 1,126 distinct values — this markdown view is **truncated*
 | `completion_record` | 21 |
 | `done_task_completion_note` | 18 |
 | `task_completion_guard` | 17 |
+| `session_summary` | 12 |
 | `task_completion` | 12 |
-| `session_summary` | 11 |
 | `task_cancellation_rationale` | 9 |
 | `reconciliation_action` | 8 |
 | `stage2_guard` | 8 |
@@ -2727,21 +2735,21 @@ _Showing top 400 of 1,126 distinct values — this markdown view is **truncated*
 | `verified_coverage_map` | 1 |
 | `verified_fix_confirmation` | 1 |
 
-`kind` missing: **29,566** record(s).
+`kind` missing: **29,844** record(s).
 
 #### `supersedes` shapes
 
 | shape | count |
 | --- | ---: |
-| `absent` | 31,004 |
-| `list` | 144 |
+| `absent` | 31,283 |
+| `list` | 148 |
 | `scalar` | 33 |
 
 #### `supersedes` member shapes
 
 | member shape | count |
 | --- | ---: |
-| `full_uuid` | 165 |
+| `full_uuid` | 170 |
 | `other` | 6 |
 | `short_hex` | 3 |
 
@@ -2750,8 +2758,8 @@ _Showing top 400 of 1,126 distinct values — this markdown view is **truncated*
 | length | count |
 | --- | ---: |
 | `0` | 73 |
-| `1` | 36 |
-| `2` | 21 |
+| `1` | 39 |
+| `2` | 22 |
 | `3` | 9 |
 | `6` | 2 |
 | `5` | 1 |
@@ -2762,10 +2770,10 @@ _Showing top 400 of 1,126 distinct values — this markdown view is **truncated*
 
 | axis | count |
 | --- | ---: |
-| `topic` present | 1,634 |
-| `parent_id` present | 348 |
+| `topic` present | 1,706 |
+| `parent_id` present | 352 |
 | `canonical` true | 85 |
-| `canonical` false | 44 |
+| `canonical` false | 45 |
 | `canonical` non-bool | 0 |
 
 #### `topic` values
@@ -2781,7 +2789,7 @@ _Showing top 400 of 1,126 distinct values — this markdown view is **truncated*
 | `orchestrator-full-suite-runtime-budget` | 29 |
 | `vacuous-test-guard` | 29 |
 | `orchestrator-xdist-worker-crash-under-load` | 24 |
-| `pytest-xdist-serial-override` | 22 |
+| `pytest-xdist-serial-override` | 23 |
 | `ruff-format-not-enforced` | 20 |
 | `merge-request-bare-task-id-branch-arg` | 17 |
 | `grep-q-pipefail-sigpipe-misread` | 16 |
@@ -2813,13 +2821,15 @@ _Showing top 400 of 1,126 distinct values — this markdown view is **truncated*
 | `dashboard-classic-script-scope-collision` | 8 |
 | `doc-prose-guard-policy-corrections` | 8 |
 | `escalation-store-ambiguity` | 8 |
+| `merge-lane-ratchet-private-reads-new-test-rows` | 8 |
 | `metadata-mode-replace-key-retirement` | 8 |
 | `no-line-number-citations-norm` | 8 |
 | `orchestratorconfig-magicmock-spec-set` | 8 |
 | `review-suggestion-recovery-disposition` | 8 |
 | `stale-verify-attempt-artifacts` | 8 |
 | `watchdog-clock-gate-test-isolation` | 8 |
-| `merge-lane-ratchet-private-reads-new-test-rows` | 7 |
+| `laptop-verify-host-utilisation` | 7 |
+| `merge-lane-ratchet` | 7 |
 | `orchestrator-pytest-asyncio-strict-mode` | 7 |
 | `pytest-addopts-marker-deselection-false-red` | 7 |
 | `reconciliation_cost_model` | 7 |
@@ -2834,7 +2844,6 @@ _Showing top 400 of 1,126 distinct values — this markdown view is **truncated*
 | `e2-bakeoff-gate-3200-review-findings` | 5 |
 | `git-ops-magicmock-await` | 5 |
 | `head-limited-grep-truncates-the-decisive-hit` | 5 |
-| `merge-lane-ratchet` | 5 |
 | `prd-generic-mode-overlay-absent` | 5 |
 | `ruff-cache-in-worktree` | 5 |
 | `session-resume` | 5 |
@@ -2843,6 +2852,7 @@ _Showing top 400 of 1,126 distinct values — this markdown view is **truncated*
 | `fused-memory-stateless-http-identity-resolution` | 4 |
 | `gate-probe-echo-interpolation-vs-binding` | 4 |
 | `gitops-quarantine-rename-worktree-bare-branch-name` | 4 |
+| `inv12-exception-register` | 4 |
 | `mem0-agent-id-promoted-out-of-metadata` | 4 |
 | `memory-metadata-census-report-pinned-oracle` | 4 |
 | `merge-to-main-rc0-noop` | 4 |
@@ -2874,15 +2884,17 @@ _Showing top 400 of 1,126 distinct values — this markdown view is **truncated*
 | `test-window-close-pidfile-wait-flake` | 3 |
 | `write-triage-flip-readiness` | 3 |
 | `architect-narrowing-legitimate-drop-directions` | 2 |
+| `architect-plan-tools-recipe` | 2 |
 | `asyncio-subprocess-mid-spawn-cancel` | 2 |
 | `briefing-query-journal-classification` | 2 |
 | `curator-dedup-outage-2026-08` | 2 |
 | `delivered-check-stale-scope-paths` | 2 |
 | `eval_worktree_venv_shadowing` | 2 |
 | `falkordb-compose-worktree-hazard` | 2 |
+| `fused-memory-lint-cli-contract` | 2 |
 | `get_entity_exact_vs_fuzzy_edge_scoping` | 2 |
-| `inv12-exception-register` | 2 |
 | `lme-arm-harness-code-sha-pin` | 2 |
+| `loop-blocking-gate-allowlist` | 2 |
 | `magicmock-verifyresult-cause-hint` | 2 |
 | `mem0-topic-slug-conformance-census` | 2 |
 | `merge-lane-fake-verifier` | 2 |
@@ -2893,6 +2905,7 @@ _Showing top 400 of 1,126 distinct values — this markdown view is **truncated*
 | `orphan-reaper-stale-l0-promotion` | 2 |
 | `pooled_worktree_lane_venv_exdev` | 2 |
 | `shared-verify-budget-sizing` | 2 |
+| `timeout-marker-inversion-guard` | 2 |
 | `update-memory-metadata-patch-authz-gate` | 2 |
 | `verify-resource-measurement` | 2 |
 | `write-classifier-hardcoded-openai-provider` | 2 |
@@ -2902,12 +2915,15 @@ _Showing top 400 of 1,126 distinct values — this markdown view is **truncated*
 | `adv_wrong_step_plan_fixture` | 1 |
 | `agent-cli-spawn-test-guard` | 1 |
 | `agent-result-model-id` | 1 |
+| `agent-sandbox-proc-writes` | 1 |
 | `aiosqlite-cancellation-semantics` | 1 |
 | `aiosqlite-scangate-deflake-task-5939` | 1 |
 | `allow_mcp_markup_create_plan_client_boundary` | 1 |
 | `ancestry-check-rc0-false-positive` | 1 |
 | `answered-but-unrecorded-root-cause` | 1 |
+| `architect-dispatch-prompt-composition` | 1 |
 | `architect-plan-revalidation` | 1 |
+| `architect-plan-revalidation-requeue-lock` | 1 |
 | `ast-guard-cache-what-and-where` | 1 |
 | `ast-guard-nested-function-attribution` | 1 |
 | `asyncio-subprocess-budget-anchor` | 1 |
@@ -2925,13 +2941,16 @@ _Showing top 400 of 1,126 distinct values — this markdown view is **truncated*
 | `caplog-deflake-injection` | 1 |
 | `census-report-conformance` | 1 |
 | `census-report-discovery` | 1 |
+| `census-synthesis-dispositions` | 1 |
 | `census-trigger-test-date-arithmetic` | 1 |
+| `claimant-invariant-gauge` | 1 |
 | `claude-binary-test-hermeticity` | 1 |
 | `claude-cli-bash-cwd-persistence` | 1 |
 | `claude-cli-dontask-confinement` | 1 |
 | `claude_pid_ppid_ownership_token` | 1 |
 | `cockpit-redesign-inputs` | 1 |
 | `code-metrics-tooling` | 1 |
+| `commit-planning-restamp-after-label-repair` | 1 |
 | `commit_planning_manifest_stamping_doc_fix` | 1 |
 | `conditional-restart-wrapper-convention` | 1 |
 | `config-and-fleet-facts` | 1 |
@@ -2943,9 +2962,14 @@ _Showing top 400 of 1,126 distinct values — this markdown view is **truncated*
 | `corrections-coupling-and-guard-inversion` | 1 |
 | `coststore_role_telemetry` | 1 |
 | `cpu-attribution-verify-ceiling` | 1 |
+| `cross-graph-move-edge-carry` | 1 |
+| `cross-graph-move-edge-recreate` | 1 |
+| `cross-graph-move-live-test` | 1 |
 | `cross-project-escalation-mcp-ports` | 1 |
 | `cross-project-task-routing` | 1 |
 | `curator-combine-defect-axes` | 1 |
+| `curator-dedup-outage-detection` | 1 |
+| `curator-escalator-helpers` | 1 |
 | `curator-test-stub-prepared-kwarg` | 1 |
 | `cycle_summary_metadata_schema` | 1 |
 | `d4-execution-and-5203-clock` | 1 |
@@ -2998,6 +3022,7 @@ _Showing top 400 of 1,126 distinct values — this markdown view is **truncated*
 | `escalation-mcp-offline-handling` | 1 |
 | `escalation-server-substrate` | 1 |
 | `escalation-sidecar-lock-reap` | 1 |
+| `escalation-startup-sweep-concurrency` | 1 |
 | `escalation-submit-import-chain` | 1 |
 | `escalation-tests-optional-orchestrator-import` | 1 |
 | `escalation-write-privilege-map` | 1 |
@@ -3006,14 +3031,18 @@ _Showing top 400 of 1,126 distinct values — this markdown view is **truncated*
 | `eval-lane-containment` | 1 |
 | `eval-worktree-plan-tools-missing` | 1 |
 | `event-queue-drainer-deflake` | 1 |
+| `extracted-module-logger-name` | 1 |
 | `falkordb-aof-migration` | 1 |
 | `falkordb-cypher-traps` | 1 |
 | `falkordb-db-indexes-volatile-statistics` | 1 |
 | `falkordb-fulltext-number-tokens` | 1 |
+| `falkordb-fulltext-query-cutoff` | 1 |
 | `falkordb-index-activation-verification` | 1 |
 | `falkordb-query-planning` | 1 |
 | `falkordb_async_index_readiness` | 1 |
 | `fastmcp-api` | 1 |
+| `fastmcp-output-schema-validation` | 1 |
+| `fastmcp-tool-description-transform` | 1 |
 | `final-close-out` | 1 |
 | `finalise-merged-done-eval-mode-ordering` | 1 |
 | `find_prior_memory_edge_case` | 1 |
@@ -3026,9 +3055,12 @@ _Showing top 400 of 1,126 distinct values — this markdown view is **truncated*
 | `flake_filing_bound_4974_as_landed` | 1 |
 | `fm-helpers-lazy-imports` | 1 |
 | `fm-helpers-module-level-import-red` | 1 |
+| `fm-staleness-backstop-cadence` | 1 |
+| `forcing-lost-update-race-in-tests` | 1 |
 | `fresh_review_yield_3790_carry` | 1 |
 | `frozen-dataclass-any-field-hashability` | 1 |
 | `frozen-plan-amendment-mechanism` | 1 |
+| `fused-memory-classifier-test-stubs` | 1 |
 | `fused-memory-config-schema-import-cycle` | 1 |
 | `fused-memory-enforce-flags-disambiguation` | 1 |
 | `fused-memory-enumerate-stub-migration` | 1 |
@@ -3038,6 +3070,7 @@ _Showing top 400 of 1,126 distinct values — this markdown view is **truncated*
 | `fused-memory-tasks-shape` | 1 |
 | `fused-memory-test-config-isolation` | 1 |
 | `fused-memory-test-fixtures` | 1 |
+| `fused-memory-unable-to-connect-triage` | 1 |
 | `g7-design-invariants` | 1 |
 | `gamma-baseline-rebase-per-key-resolution` | 1 |
 | `gate-reports-describe-the-worktree-not-the-branch-ref` | 1 |
@@ -3065,6 +3098,8 @@ _Showing top 400 of 1,126 distinct values — this markdown view is **truncated*
 | `implementer-sandbox-main-data-write` | 1 |
 | `import-probe-find-spec-vs-import` | 1 |
 | `inv13_convention` | 1 |
+| `inv8-loop-blocking-gate-scope` | 1 |
+| `keyed-storm-counters` | 1 |
 | `killed-pytest-progress-line-glued-suffix` | 1 |
 | `knowlive_edge_lifecycle` | 1 |
 | `landed-is-not-applied-for-script-preconditions` | 1 |
@@ -3072,10 +3107,12 @@ _Showing top 400 of 1,126 distinct values — this markdown view is **truncated*
 | `lane-state-single-writer-scan` | 1 |
 | `leaked-test-process-attribution` | 1 |
 | `legibility-census-main-git-root` | 1 |
+| `legibility-census-test-helpers` | 1 |
 | `legibility-codebook-schema-access` | 1 |
 | `legibility-dual-module-imports` | 1 |
 | `legibility-nightly-test-census-safety` | 1 |
 | `legibility-orchestrator-import` | 1 |
+| `legibility-sampler-reingested-content` | 1 |
 | `live-yaml-knob-test-blast-radius` | 1 |
 | `lme-arm-harness-token-telemetry` | 1 |
 | `lme-eta-screening-verdict` | 1 |
@@ -3084,13 +3121,14 @@ _Showing top 400 of 1,126 distinct values — this markdown view is **truncated*
 | `local-memory-models-eval` | 1 |
 | `lock-charter-extensionless-sweep` | 1 |
 | `lock-loosening-counterfactual` | 1 |
-| `loop-blocking-gate-allowlist` | 1 |
 | `loop-stall-ticker-test-flake` | 1 |
 | `machine-reboot-degrades-deterministic-deploy-autorecovery` | 1 |
 | `main-health-auto-heal-halt` | 1 |
 | `malformed-milestone-repair-path` | 1 |
+| `markup-guard-storm-state` | 1 |
 | `markup-sink-eval-lane-containment` | 1 |
 | `mcp-client-task-group-exception-wrapping` | 1 |
+| `mcp-client-text-truncation` | 1 |
 | `mcp-tool-docstring-pinning` | 1 |
 | `mcp-update-task-none-kwargs` | 1 |
 | `mcp_envelope_markup_guard_bypass` | 1 |
@@ -3120,6 +3158,7 @@ _Showing top 400 of 1,126 distinct values — this markdown view is **truncated*
 | `merge-lane-facade-pyright-any` | 1 |
 | `merge-lane-frozen-base-test-discriminator` | 1 |
 | `merge-lane-functional-landscape` | 1 |
+| `merge-lane-ghost-entries` | 1 |
 | `merge-lane-mutation-kill-tests` | 1 |
 | `merge-lane-mutation-survivors` | 1 |
 | `merge-lane-pipeline-inventory` | 1 |
@@ -3127,6 +3166,7 @@ _Showing top 400 of 1,126 distinct values — this markdown view is **truncated*
 | `merge-lane-ratchet-alias-importer-sweep` | 1 |
 | `merge-lane-ratchet-instrument` | 1 |
 | `merge-lane-ratchet-new-test-module` | 1 |
+| `merge-lane-speculative-passthrough` | 1 |
 | `merge-lane-test-seams` | 1 |
 | `merge-lane-throughput-2026-09-14` | 1 |
 | `merge-lane-throughput-baseline` | 1 |
@@ -3136,51 +3176,19 @@ _Showing top 400 of 1,126 distinct values — this markdown view is **truncated*
 | `merge-queue-test-worker-teardown` | 1 |
 | `merge-queue-throughput-2026-08-20` | 1 |
 | `merge-queue-timeout-mark-coverage` | 1 |
+| `merge-thrash-signature` | 1 |
 | `merge-train-coalescer-defect` | 1 |
 | `merge-train-frozen-prefix-branch-reset` | 1 |
 | `merge-verify-docs-cost` | 1 |
-| `merger-speculative-predecessor-conflict` | 1 |
-| `metadata-update-semantics` | 1 |
-| `metadata_blob_transport_limit` | 1 |
-| `mock-fspath-pathlike-stray-dirs` | 1 |
-| `namedtuple-classvar-fields` | 1 |
-| `nested-pytest-probe-load-exposure` | 1 |
-| `never_written_ledgers_census_2026_09_23` | 1 |
-| `new-escalation-tool-registration-sites` | 1 |
-| `no-re-export-identity-contract` | 1 |
-| `node-test-invocation-forms` | 1 |
-| `node-test-tap-parsing` | 1 |
-| `npm_cache_verify_lane_eacces` | 1 |
-| `npx-npx-cache-enotempty-wedge` | 1 |
-| `operational-ask-routing-vs-w5-boundary` | 1 |
-| `operational_gate_done_provenance` | 1 |
-| `operational_task_evidence_files` | 1 |
-| `orchestrator-escalation-dedupe-identity` | 1 |
-| `orchestrator-merge-lane-cold-budget` | 1 |
-| `orchestrator-verify-budget-false-infra-timeout` | 1 |
-| `orchestrator-verify-budget-wip24-insufficient` | 1 |
-| `origin_finding_id_citation_discipline` | 1 |
-| `orphaned-recon-escalation-flag-audience` | 1 |
-| `park-eviction-stray-magicmock-file-leak` | 1 |
-| `patch-targets-module-set` | 1 |
-| `piped_pytest_masks_exit_code` | 1 |
-| `plan_json_stale_after_branch_reset_amendment` | 1 |
-| `prd-dated-correction-blocks` | 1 |
-| `prd-gates` | 1 |
-| `prd-skill-fanout-is-overlay-dependent` | 1 |
-| `prose-consistency-sweep-detector-design` | 1 |
-| `prose-meta-test-adjudication` | 1 |
-| `protective_guard_pre_check_before_completion_notes` | 1 |
-| `pydantic-validator-exception-propagation` | 1 |
 
-_Showing top 400 of 560 distinct values — this markdown view is **truncated**; the JSON artifact carries the full population, and `--top-n` widens this view._
+_Showing top 400 of 616 distinct values — this markdown view is **truncated**; the JSON artifact carries the full population, and `--top-n` widens this view._
 
 #### `source` values
 
 | source | count |
 | --- | ---: |
-| `targeted_reconciliation` | 6,842 |
-| `orchestrator_completion` | 219 |
+| `targeted_reconciliation` | 6,873 |
+| `orchestrator_completion` | 245 |
 | `remediation_run` | 28 |
 | `consolidation` | 25 |
 | `steward-triage` | 19 |
@@ -3197,6 +3205,7 @@ _Showing top 400 of 560 distinct values — this markdown view is **truncated**;
 | `reconciliation_stage2_proactive` | 9 |
 | `spawn-brief scoped-verify-guard-inversion-20260903` | 9 |
 | `unblock` | 9 |
+| `laptop-utilisation-study-2026-10-08` | 8 |
 | `reconciliation_stage2_task_knowledge_sync` | 8 |
 | `reflect` | 8 |
 | `review-cycle` | 7 |
@@ -3234,6 +3243,7 @@ _Showing top 400 of 560 distinct values — this markdown view is **truncated**;
 | `stage2_corrective` | 2 |
 | `stage2_tool_discovery` | 2 |
 | `steward` | 2 |
+| `verify-rate-improvement-2026-10-09` | 2 |
 | `Leo mid-turn instruction; adversarial review of plans/dashboard-one-datum-one-path-prd.md` | 1 |
 | `census-failure-rca` | 1 |
 | `census-supervision` | 1 |
@@ -3252,6 +3262,7 @@ _Showing top 400 of 560 distinct values — this markdown view is **truncated**;
 | `measurement agent + own scripts` | 1 |
 | `orchestrator/src/orchestrator/stop_instruction.py` | 1 |
 | `plans/dashboard-contradiction-sweep-2026-09-14.md` | 1 |
+| `prd-author` | 1 |
 | `recon-stage-1` | 1 |
 | `recon_stage2_reconciliation` | 1 |
 | `reify-recovery-session-5` | 1 |
@@ -3259,6 +3270,7 @@ _Showing top 400 of 560 distinct values — this markdown view is **truncated**;
 | `remediation-stage1` | 1 |
 | `remediation_finding_2` | 1 |
 | `remediation_stage1` | 1 |
+| `review-all` | 1 |
 | `review-suggestion-backfill-triage` | 1 |
 | `review-suggestion-triage` | 1 |
 | `review-triage` | 1 |
@@ -3290,8 +3302,8 @@ _Showing top 400 of 560 distinct values — this markdown view is **truncated**;
 
 | source | count |
 | --- | ---: |
-| `targeted_reconciliation` | 6,836 |
-| `orchestrator_completion` | 219 |
+| `targeted_reconciliation` | 6,867 |
+| `orchestrator_completion` | 245 |
 | `remediation_run` | 26 |
 | `consolidation` | 25 |
 | `steward-triage` | 19 |
@@ -3309,6 +3321,7 @@ _Showing top 400 of 560 distinct values — this markdown view is **truncated**;
 | `unblock` | 9 |
 | `reconciliation_stage2_task_knowledge_sync` | 8 |
 | `reflect` | 8 |
+| `laptop-utilisation-study-2026-10-08` | 7 |
 | `review-cycle` | 7 |
 | `steward-triage-fallback` | 7 |
 | `needs-human-review-2026-08-12` | 6 |
@@ -3340,6 +3353,7 @@ _Showing top 400 of 560 distinct values — this markdown view is **truncated**;
 | `stage1_remediation` | 2 |
 | `stage2_corrective` | 2 |
 | `stage2_tool_discovery` | 2 |
+| `verify-rate-improvement-2026-10-09` | 2 |
 | `Leo mid-turn instruction; adversarial review of plans/dashboard-one-datum-one-path-prd.md` | 1 |
 | `census-failure-rca` | 1 |
 | `census-supervision` | 1 |
@@ -3358,12 +3372,14 @@ _Showing top 400 of 560 distinct values — this markdown view is **truncated**;
 | `journalctl dark-factory-dashboard.service + adversarial review of plans/dashboard-one-datum-one-path-prd.md` | 1 |
 | `measurement agent + own scripts` | 1 |
 | `orchestrator/src/orchestrator/stop_instruction.py` | 1 |
+| `prd-author` | 1 |
 | `recon-stage-1` | 1 |
 | `recon-stage-task_knowledge_sync` | 1 |
 | `reify-recovery-session-5` | 1 |
 | `reify-steward-cross-repo-sighting` | 1 |
 | `remediation-stage1` | 1 |
 | `remediation_finding_2` | 1 |
+| `review-all` | 1 |
 | `review-suggestion-backfill-triage` | 1 |
 | `review-suggestion-triage` | 1 |
 | `review-triage` | 1 |
@@ -3393,31 +3409,31 @@ _Showing top 400 of 560 distinct values — this markdown view is **truncated**;
 
 ### `dark_factory` / `observations_and_summaries`
 
-Records: **21,990**
+Records: **22,174**
 
 #### Top-level metadata key population
 
 | key | count |
 | --- | ---: |
-| `category` | 21,990 |
-| `created_at` | 21,990 |
-| `data` | 21,990 |
-| `hash` | 21,990 |
-| `user_id` | 21,990 |
-| `updated_at` | 20,851 |
-| `agent_id` | 15,427 |
-| `role` | 13,511 |
-| `task_id` | 8,644 |
-| `source` | 7,360 |
-| `transition` | 6,930 |
-| `_causation_id` | 3,552 |
-| `_deferred` | 3,547 |
-| `stage2_suppress` | 2,584 |
-| `echo_used_provenance` | 2,541 |
-| `run_id` | 2,100 |
-| `kind` | 1,231 |
+| `category` | 22,174 |
+| `created_at` | 22,174 |
+| `data` | 22,174 |
+| `hash` | 22,174 |
+| `user_id` | 22,174 |
+| `updated_at` | 21,035 |
+| `agent_id` | 15,580 |
+| `role` | 13,695 |
+| `task_id` | 8,719 |
+| `source` | 7,429 |
+| `transition` | 6,961 |
+| `_causation_id` | 3,556 |
+| `_deferred` | 3,551 |
+| `stage2_suppress` | 2,615 |
+| `echo_used_provenance` | 2,569 |
+| `run_id` | 2,109 |
+| `kind` | 1,233 |
 | `stage` | 1,106 |
-| `topic` | 348 |
+| `topic` | 369 |
 | `task_ids` | 188 |
 | `commit` | 179 |
 | `memories_deleted` | 172 |
@@ -3468,26 +3484,26 @@ Records: **21,990**
 | `status` | 44 |
 | `resolution` | 42 |
 | `finding_id` | 40 |
-| `parent_id` | 39 |
+| `parent_id` | 40 |
 | `tasks` | 39 |
 | `action_needed` | 37 |
 | `related_task_ids` | 35 |
 | `task_refs` | 35 |
+| `unverified_claim` | 33 |
 | `flag` | 32 |
 | `provenance` | 32 |
 | `reconstructed_by` | 31 |
-| `unverified_claim` | 31 |
 | `remediation_finding` | 30 |
 | `cycle_type` | 28 |
 | `flag_for_stage2` | 26 |
 | `related_task` | 26 |
 | `tasks_hints_updated` | 25 |
+| `echo_suppressed_stale_description` | 24 |
 | `edges_invalidated` | 24 |
 | `flags_resolved` | 24 |
 | `task_ref` | 24 |
 | `sprint_date` | 23 |
 | `flag_ids` | 22 |
-| `echo_suppressed_stale_description` | 21 |
 | `session_tag` | 21 |
 | `source_finding_id` | 21 |
 | `actionable` | 20 |
@@ -3800,7 +3816,7 @@ Records: **21,990**
 | `related_memory_ids` | 3 |
 | `remediation_mode` | 3 |
 
-_Showing top 400 of 946 distinct values — this markdown view is **truncated**; the JSON artifact carries the full population, and `--top-n` widens this view._
+_Showing top 400 of 947 distinct values — this markdown view is **truncated**; the JSON artifact carries the full population, and `--top-n` widens this view._
 
 #### `kind` values
 
@@ -3811,14 +3827,14 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 | `pin_queue_edge_cleanup_audit` | 112 |
 | `task_completion_note` | 60 |
 | `completion_note` | 46 |
-| `amendment` | 30 |
+| `amendment` | 31 |
 | `investigation_outcome` | 25 |
 | `completion_record` | 21 |
 | `done_task_completion_note` | 18 |
 | `task_completion_guard` | 17 |
 | `gotcha` | 12 |
+| `session_summary` | 12 |
 | `task_completion` | 12 |
-| `session_summary` | 11 |
 | `task_cancellation_rationale` | 9 |
 | `reconciliation_action` | 8 |
 | `stage2_guard` | 8 |
@@ -4009,13 +4025,13 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 | `verified_coverage_map` | 1 |
 | `verified_fix_confirmation` | 1 |
 
-`kind` missing: **20,759** record(s).
+`kind` missing: **20,941** record(s).
 
 #### `supersedes` shapes
 
 | shape | count |
 | --- | ---: |
-| `absent` | 21,938 |
+| `absent` | 22,122 |
 | `list` | 26 |
 | `scalar` | 26 |
 
@@ -4040,8 +4056,8 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 
 | axis | count |
 | --- | ---: |
-| `topic` present | 348 |
-| `parent_id` present | 39 |
+| `topic` present | 369 |
+| `parent_id` present | 40 |
 | `canonical` true | 10 |
 | `canonical` false | 3 |
 | `canonical` non-bool | 0 |
@@ -4055,6 +4071,7 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 | `orchestrator-full-suite-runtime-budget` | 12 |
 | `resolve-ticket-timeout-discriminator` | 12 |
 | `escalation-store-ambiguity` | 8 |
+| `laptop-verify-host-utilisation` | 7 |
 | `reconciliation_cost_model` | 7 |
 | `session-summary` | 7 |
 | `spawn-wrapper-survives-kill` | 6 |
@@ -4089,6 +4106,7 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 | `2-dot-diff-artifact` | 1 |
 | `allow_mcp_markup_create_plan_client_boundary` | 1 |
 | `answered-but-unrecorded-root-cause` | 1 |
+| `architect-dispatch-prompt-composition` | 1 |
 | `audit-duplicate-memories-recall-limits` | 1 |
 | `b3-auto-unblock-hardening` | 1 |
 | `backfill-sibling-combine-expectation` | 1 |
@@ -4096,6 +4114,8 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 | `budget-exhausted-subtype` | 1 |
 | `cancel-ticket-inflight-creation` | 1 |
 | `census-report-conformance` | 1 |
+| `census-synthesis-dispositions` | 1 |
+| `claimant-invariant-gauge` | 1 |
 | `claude_pid_ppid_ownership_token` | 1 |
 | `cockpit-redesign-inputs` | 1 |
 | `code-metrics-tooling` | 1 |
@@ -4107,6 +4127,8 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 | `corrections-coupling-and-guard-inversion` | 1 |
 | `coststore_role_telemetry` | 1 |
 | `cpu-attribution-verify-ceiling` | 1 |
+| `cross-graph-move-edge-carry` | 1 |
+| `cross-graph-move-edge-recreate` | 1 |
 | `cross-project-task-routing` | 1 |
 | `curator-combine-defect-axes` | 1 |
 | `d4-execution-and-5203-clock` | 1 |
@@ -4132,9 +4154,11 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 | `escalation-cross-project-filing` | 1 |
 | `escalation-flow-prd-coordination` | 1 |
 | `escalation-server-substrate` | 1 |
+| `escalation-startup-sweep-concurrency` | 1 |
 | `escalation-submit-import-chain` | 1 |
 | `escalation-write-privilege-map` | 1 |
 | `eval-lane-containment` | 1 |
+| `falkordb-fulltext-query-cutoff` | 1 |
 | `falkordb-index-activation-verification` | 1 |
 | `fastmcp-api` | 1 |
 | `final-close-out` | 1 |
@@ -4143,6 +4167,7 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 | `flag_for_stage2_gc_sweep_overbroad` | 1 |
 | `flake_debt_empty_by_sequencing` | 1 |
 | `flake_filing_bound_4974_as_landed` | 1 |
+| `fm-staleness-backstop-cadence` | 1 |
 | `fresh_review_yield_3790_carry` | 1 |
 | `fused-memory-enforce-flags-disambiguation` | 1 |
 | `fused-memory-get-tasks-empty-statuses` | 1 |
@@ -4157,6 +4182,7 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 | `inv12-exception-register` | 1 |
 | `killed-pytest-progress-line-glued-suffix` | 1 |
 | `legibility-orchestrator-import` | 1 |
+| `legibility-sampler-reingested-content` | 1 |
 | `lme-eta-screening-verdict` | 1 |
 | `load-timing-flakes` | 1 |
 | `local-memory-models-eval` | 1 |
@@ -4173,6 +4199,7 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 | `member-fold-severity-inflation` | 1 |
 | `memory-consumption-coverage-gaps` | 1 |
 | `merge-lane-functional-landscape` | 1 |
+| `merge-lane-ghost-entries` | 1 |
 | `merge-lane-pipeline-inventory` | 1 |
 | `merge-lane-program-rationale` | 1 |
 | `merge-lane-ratchet` | 1 |
@@ -4209,6 +4236,7 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 | `reconciliation_hardening_sprint` | 1 |
 | `reconstruct_retry_transient_gap` | 1 |
 | `remediation_early_return_bypasses_filter_suppressed` | 1 |
+| `remote-task-leg-verify-prd` | 1 |
 | `remote-verify-host-laptop` | 1 |
 | `remote-verify-pool-no-local-runner` | 1 |
 | `requeue-request-emits-no-merge-queued` | 1 |
@@ -4265,8 +4293,11 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 | `warm-lane-dot-task-destruction-paths` | 1 |
 | `warm-lane-thin-live-ref-gate` | 1 |
 | `watchdog-clock-gate-test-isolation` | 1 |
+| `whole-tree-scan-timeout-family` | 1 |
 | `wip-requeue-plan-step-attribution` | 1 |
 | `workspace-test-layering` | 1 |
+| `write-journal-get-task-read-volume` | 1 |
+| `write-journal-growth-alarm` | 1 |
 | `write-ops-success-per-leg-semantics` | 1 |
 | `write-triage-pairs-to-rate-shape` | 1 |
 | `write-triage-population-pi` | 1 |
@@ -4279,8 +4310,8 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 
 | source | count |
 | --- | ---: |
-| `targeted_reconciliation` | 6,832 |
-| `orchestrator_completion` | 219 |
+| `targeted_reconciliation` | 6,863 |
+| `orchestrator_completion` | 245 |
 | `remediation_run` | 19 |
 | `reconciliation_stage2` | 17 |
 | `stage2_reconciliation` | 17 |
@@ -4291,6 +4322,7 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 | `team-dark_factory-1100682` | 10 |
 | `recon_cycle_summary` | 9 |
 | `reconciliation_stage2_proactive` | 9 |
+| `laptop-utilisation-study-2026-10-08` | 8 |
 | `reconciliation_stage2_task_knowledge_sync` | 8 |
 | `reflect` | 8 |
 | `spawn-brief scoped-verify-guard-inversion-20260903` | 8 |
@@ -4325,6 +4357,7 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 | `stage1_remediation_dedup` | 2 |
 | `stage2_corrective` | 2 |
 | `stage2_tool_discovery` | 2 |
+| `verify-rate-improvement-2026-10-09` | 2 |
 | `census-failure-rca` | 1 |
 | `census-supervision` | 1 |
 | `code-finding` | 1 |
@@ -4336,12 +4369,14 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 | `journalctl dark-factory-dashboard.service + adversarial review of plans/dashboard-one-datum-one-path-prd.md` | 1 |
 | `measurement agent + own scripts` | 1 |
 | `plans/dashboard-contradiction-sweep-2026-09-14.md` | 1 |
+| `prd-author` | 1 |
 | `recon-stage-1` | 1 |
 | `recon_stage2_reconciliation` | 1 |
 | `reify-recovery-session-5` | 1 |
 | `reify-steward-cross-repo-sighting` | 1 |
 | `remediation-stage1` | 1 |
 | `remediation_stage1` | 1 |
+| `review-all` | 1 |
 | `review-suggestion-backfill-triage` | 1 |
 | `session-summary` | 1 |
 | `soak-gate-measurement` | 1 |
@@ -4361,8 +4396,8 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 
 | source | count |
 | --- | ---: |
-| `targeted_reconciliation` | 6,826 |
-| `orchestrator_completion` | 219 |
+| `targeted_reconciliation` | 6,857 |
+| `orchestrator_completion` | 245 |
 | `reconciliation_stage2` | 17 |
 | `remediation_run` | 17 |
 | `stage2_reconciliation` | 17 |
@@ -4377,6 +4412,7 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 | `reflect` | 8 |
 | `spawn-brief scoped-verify-guard-inversion-20260903` | 8 |
 | `consolidation` | 7 |
+| `laptop-utilisation-study-2026-10-08` | 7 |
 | `review-cycle` | 7 |
 | `steward-triage-fallback` | 7 |
 | `unblock` | 7 |
@@ -4403,6 +4439,7 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 | `stage1_cycle_summary` | 2 |
 | `stage2_corrective` | 2 |
 | `stage2_tool_discovery` | 2 |
+| `verify-rate-improvement-2026-10-09` | 2 |
 | `census-failure-rca` | 1 |
 | `census-supervision` | 1 |
 | `code-finding` | 1 |
@@ -4414,11 +4451,13 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 | `infra-findings` | 1 |
 | `journalctl dark-factory-dashboard.service + adversarial review of plans/dashboard-one-datum-one-path-prd.md` | 1 |
 | `measurement agent + own scripts` | 1 |
+| `prd-author` | 1 |
 | `recon-stage-1` | 1 |
 | `recon-stage-task_knowledge_sync` | 1 |
 | `reify-recovery-session-5` | 1 |
 | `reify-steward-cross-repo-sighting` | 1 |
 | `remediation-stage1` | 1 |
+| `review-all` | 1 |
 | `review-suggestion-backfill-triage` | 1 |
 | `session-summary` | 1 |
 | `soak-gate-measurement` | 1 |
@@ -4435,32 +4474,32 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 
 ### `dark_factory` / `preferences_and_norms`
 
-Records: **2,190**
+Records: **2,208**
 
 #### Top-level metadata key population
 
 | key | count |
 | --- | ---: |
-| `category` | 2,190 |
-| `created_at` | 2,190 |
-| `data` | 2,190 |
-| `hash` | 2,190 |
-| `user_id` | 2,190 |
-| `agent_id` | 2,186 |
-| `updated_at` | 2,092 |
-| `role` | 1,776 |
-| `topic` | 165 |
-| `task_id` | 60 |
+| `category` | 2,208 |
+| `created_at` | 2,208 |
+| `data` | 2,208 |
+| `hash` | 2,208 |
+| `user_id` | 2,208 |
+| `agent_id` | 2,204 |
+| `updated_at` | 2,110 |
+| `role` | 1,794 |
+| `topic` | 172 |
+| `task_id` | 68 |
 | `source` | 58 |
-| `kind` | 46 |
-| `parent_id` | 34 |
+| `kind` | 47 |
+| `parent_id` | 35 |
 | `escalation_id` | 30 |
-| `run_id` | 26 |
+| `run_id` | 27 |
 | `task_ref` | 18 |
 | `commit` | 16 |
 | `date` | 14 |
+| `supersedes` | 14 |
 | `spawned_from` | 11 |
-| `supersedes` | 11 |
 | `canonical` | 10 |
 | `superseded_by` | 9 |
 | `corrected_by_run` | 8 |
@@ -4562,7 +4601,7 @@ Records: **2,190**
 
 | kind | count |
 | --- | ---: |
-| `amendment` | 33 |
+| `amendment` | 34 |
 | `convention` | 4 |
 | `corrective_convention` | 2 |
 | `recon_stage2_norm` | 2 |
@@ -4572,36 +4611,36 @@ Records: **2,190**
 | `sighting` | 1 |
 | `task_rotation_convention` | 1 |
 
-`kind` missing: **2,144** record(s).
+`kind` missing: **2,161** record(s).
 
 #### `supersedes` shapes
 
 | shape | count |
 | --- | ---: |
-| `absent` | 2,179 |
-| `list` | 10 |
+| `absent` | 2,194 |
+| `list` | 13 |
 | `scalar` | 1 |
 
 #### `supersedes` member shapes
 
 | member shape | count |
 | --- | ---: |
-| `full_uuid` | 6 |
+| `full_uuid` | 10 |
 
 #### `supersedes` list lengths
 
 | length | count |
 | --- | ---: |
 | `0` | 7 |
-| `2` | 2 |
-| `1` | 1 |
+| `1` | 3 |
+| `2` | 3 |
 
 #### Occurrence axes
 
 | axis | count |
 | --- | ---: |
-| `topic` present | 165 |
-| `parent_id` present | 34 |
+| `topic` present | 172 |
+| `parent_id` present | 35 |
 | `canonical` true | 8 |
 | `canonical` false | 2 |
 | `canonical` non-bool | 0 |
@@ -4621,8 +4660,10 @@ Records: **2,190**
 | `patch_import_site_testing` | 6 |
 | `prd-generic-mode-overlay-absent` | 5 |
 | `head-limited-grep-truncates-the-decisive-hit` | 4 |
+| `architect-plan-tools-recipe` | 2 |
 | `code-quality-definition` | 2 |
 | `execution-class-operational-coercion` | 2 |
+| `fused-memory-lint-cli-contract` | 2 |
 | `merge-lane-ratchet-feature-growth` | 2 |
 | `meta-test-review-norm` | 2 |
 | `prompt-pinning-test-accepted-shape` | 2 |
@@ -4651,6 +4692,7 @@ Records: **2,190**
 | `memory-service-search-seam-transforms` | 1 |
 | `merge-queue-ownership-invisible-in-task-table` | 1 |
 | `merge-request-bare-task-id-branch-arg` | 1 |
+| `no-silent-caps-render` | 1 |
 | `operational_gate_done_provenance` | 1 |
 | `operational_task_evidence_files` | 1 |
 | `prd-dated-correction-blocks` | 1 |
@@ -4667,6 +4709,7 @@ Records: **2,190**
 | `shrink-only-debt-baseline-lint-gates` | 1 |
 | `silent-fallthrough-gate` | 1 |
 | `spawn-wrapper-survives-kill` | 1 |
+| `storm-counter-keyed-registry` | 1 |
 | `storm-escalation-file-or-fold` | 1 |
 | `submit-task-guard-chain` | 1 |
 | `submit-task-metadata-files-directory-rejection` | 1 |
@@ -4674,6 +4717,7 @@ Records: **2,190**
 | `target-store-preflight-test-fixtures` | 1 |
 | `task-skipped-is-not-a-throughput-gauge` | 1 |
 | `test_vacuity` | 1 |
+| `ticket-reason-vocabulary` | 1 |
 | `verify-causal-direction-not-just-facts` | 1 |
 | `verify-task-substrate-claims-correct-via-details` | 1 |
 | `workflow-vs-spawned-session-norm` | 1 |
@@ -4738,28 +4782,28 @@ Records: **2,190**
 
 ### `dark_factory` / `procedural_knowledge`
 
-Records: **6,977**
+Records: **7,058**
 
 #### Top-level metadata key population
 
 | key | count |
 | --- | ---: |
-| `category` | 6,977 |
-| `created_at` | 6,977 |
-| `data` | 6,977 |
-| `hash` | 6,977 |
-| `user_id` | 6,977 |
-| `agent_id` | 6,974 |
-| `updated_at` | 6,954 |
-| `role` | 6,688 |
-| `topic` | 1,116 |
-| `task_id` | 499 |
-| `kind` | 338 |
-| `parent_id` | 275 |
+| `category` | 7,058 |
+| `created_at` | 7,058 |
+| `data` | 7,058 |
+| `hash` | 7,058 |
+| `user_id` | 7,058 |
+| `agent_id` | 7,055 |
+| `updated_at` | 7,035 |
+| `role` | 6,769 |
+| `topic` | 1,160 |
+| `task_id` | 546 |
+| `kind` | 340 |
+| `parent_id` | 277 |
 | `task_ref` | 206 |
 | `commit` | 144 |
-| `supersedes` | 114 |
-| `canonical` | 106 |
+| `supersedes` | 115 |
+| `canonical` | 107 |
 | `escalation_id` | 92 |
 | `x_contested` | 69 |
 | `source` | 56 |
@@ -5016,7 +5060,7 @@ Records: **6,977**
 
 | kind | count |
 | --- | ---: |
-| `amendment` | 267 |
+| `amendment` | 269 |
 | `gotcha` | 25 |
 | `sighting` | 15 |
 | `consolidated_canonical` | 2 |
@@ -5045,21 +5089,21 @@ Records: **6,977**
 | `task_dispatch_diagnosis` | 1 |
 | `task_routing_convention` | 1 |
 
-`kind` missing: **6,639** record(s).
+`kind` missing: **6,718** record(s).
 
 #### `supersedes` shapes
 
 | shape | count |
 | --- | ---: |
-| `absent` | 6,863 |
-| `list` | 108 |
+| `absent` | 6,943 |
+| `list` | 109 |
 | `scalar` | 6 |
 
 #### `supersedes` member shapes
 
 | member shape | count |
 | --- | ---: |
-| `full_uuid` | 113 |
+| `full_uuid` | 114 |
 | `other` | 1 |
 | `short_hex` | 1 |
 
@@ -5068,7 +5112,7 @@ Records: **6,977**
 | length | count |
 | --- | ---: |
 | `0` | 59 |
-| `1` | 22 |
+| `1` | 23 |
 | `2` | 15 |
 | `3` | 7 |
 | `6` | 2 |
@@ -5080,10 +5124,10 @@ Records: **6,977**
 
 | axis | count |
 | --- | ---: |
-| `topic` present | 1,116 |
-| `parent_id` present | 275 |
+| `topic` present | 1,160 |
+| `parent_id` present | 277 |
 | `canonical` true | 67 |
-| `canonical` false | 39 |
+| `canonical` false | 40 |
 | `canonical` non-bool | 0 |
 
 #### `topic` values
@@ -5095,8 +5139,8 @@ Records: **6,977**
 | `npx-pyright-eacces-agent-sandbox` | 30 |
 | `vacuous-test-guard` | 29 |
 | `dashboard-js-test-substrate` | 24 |
+| `pytest-xdist-serial-override` | 23 |
 | `orchestrator-xdist-worker-crash-under-load` | 22 |
-| `pytest-xdist-serial-override` | 22 |
 | `orchestrator-full-suite-runtime-budget` | 17 |
 | `architect-plan-files-scope` | 14 |
 | `architect_plan_revalidation` | 14 |
@@ -5118,12 +5162,12 @@ Records: **6,977**
 | `recon-marker-gc-architecture` | 9 |
 | `closed-stdout-pipe-brokenpipeerror` | 8 |
 | `execution-class-operational-coercion` | 8 |
+| `merge-lane-ratchet-private-reads-new-test-rows` | 8 |
 | `orchestratorconfig-magicmock-spec-set` | 8 |
 | `pre-commit-pyright-timeout` | 8 |
 | `review-suggestion-recovery-disposition` | 8 |
 | `stale-verify-attempt-artifacts` | 8 |
 | `dashboard-classic-script-scope-collision` | 7 |
-| `merge-lane-ratchet-private-reads-new-test-rows` | 7 |
 | `metadata-mode-replace-key-retirement` | 7 |
 | `orchestrator-pytest-asyncio-strict-mode` | 7 |
 | `pytest-addopts-marker-deselection-false-red` | 7 |
@@ -5132,6 +5176,7 @@ Records: **6,977**
 | `tasks-json-is-a-stale-mirror` | 7 |
 | `tests-scripts-pyright-ignore-extrapaths-absence` | 7 |
 | `watchdog-clock-gate-test-isolation` | 7 |
+| `merge-lane-ratchet` | 6 |
 | `new-git-ref-creation-denied-in-worktree` | 6 |
 | `pathlib-exists-eacces-propagates` | 6 |
 | `asyncmock-assertion-style-task-525` | 5 |
@@ -5141,7 +5186,6 @@ Records: **6,977**
 | `gate-probe-echo-interpolation-vs-binding` | 4 |
 | `mem0-agent-id-promoted-out-of-metadata` | 4 |
 | `memory-metadata-census-report-pinned-oracle` | 4 |
-| `merge-lane-ratchet` | 4 |
 | `merge-to-main-rc0-noop` | 4 |
 | `ratchet-baseline-keywise-rebase-driver` | 4 |
 | `stale-merge-rr-lock-half-rebased-worktree` | 4 |
@@ -5152,6 +5196,7 @@ Records: **6,977**
 | `architect_report_task_already_done_main_reachability` | 3 |
 | `fused-memory-stateless-http-identity-resolution` | 3 |
 | `graphiti-token-usage-tracking` | 3 |
+| `inv12-exception-register` | 3 |
 | `lock-charter-extension-allowlist` | 3 |
 | `mcp-tool-denial-verification` | 3 |
 | `merge-lane-fakeclock-wait-cap` | 3 |
@@ -5171,6 +5216,7 @@ Records: **6,977**
 | `falkordb-compose-worktree-hazard` | 2 |
 | `get_entity_exact_vs_fuzzy_edge_scoping` | 2 |
 | `lme-arm-harness-code-sha-pin` | 2 |
+| `loop-blocking-gate-allowlist` | 2 |
 | `magicmock-verifyresult-cause-hint` | 2 |
 | `merge-lane-fake-verifier` | 2 |
 | `nested-pytest-subprocess-timeout-output` | 2 |
@@ -5183,9 +5229,11 @@ Records: **6,977**
 | `adv_wrong_step_plan_fixture` | 1 |
 | `agent-cli-spawn-test-guard` | 1 |
 | `agent-result-model-id` | 1 |
+| `agent-sandbox-proc-writes` | 1 |
 | `aiosqlite-cancellation-semantics` | 1 |
 | `aiosqlite-scangate-deflake-task-5939` | 1 |
 | `architect-plan-revalidation` | 1 |
+| `architect-plan-revalidation-requeue-lock` | 1 |
 | `ast-guard-cache-what-and-where` | 1 |
 | `ast-guard-nested-function-attribution` | 1 |
 | `asyncio-subprocess-budget-anchor` | 1 |
@@ -5199,10 +5247,14 @@ Records: **6,977**
 | `claude-binary-test-hermeticity` | 1 |
 | `claude-cli-bash-cwd-persistence` | 1 |
 | `claude-cli-dontask-confinement` | 1 |
+| `commit-planning-restamp-after-label-repair` | 1 |
 | `commit-planning-yaml-sidecar-comment-loss` | 1 |
 | `commit_planning_manifest_stamping_doc_fix` | 1 |
 | `config-reload-gate-shared-scripts` | 1 |
+| `cross-graph-move-live-test` | 1 |
 | `cross-project-escalation-mcp-ports` | 1 |
+| `curator-dedup-outage-detection` | 1 |
+| `curator-escalator-helpers` | 1 |
 | `curator-test-stub-prepared-kwarg` | 1 |
 | `cycle_summary_metadata_schema` | 1 |
 | `dashboard-conftest-served-asset-fixtures` | 1 |
@@ -5229,24 +5281,30 @@ Records: **6,977**
 | `eval-isolation-bypass-permissions` | 1 |
 | `eval-worktree-plan-tools-missing` | 1 |
 | `event-queue-drainer-deflake` | 1 |
+| `extracted-module-logger-name` | 1 |
 | `falkordb-aof-migration` | 1 |
 | `falkordb-cypher-traps` | 1 |
 | `falkordb-db-indexes-volatile-statistics` | 1 |
 | `falkordb-fulltext-number-tokens` | 1 |
 | `falkordb-query-planning` | 1 |
 | `falkordb_async_index_readiness` | 1 |
+| `fastmcp-output-schema-validation` | 1 |
+| `fastmcp-tool-description-transform` | 1 |
 | `finalise-merged-done-eval-mode-ordering` | 1 |
 | `flag-record-write-contract` | 1 |
 | `flag_marker_upsert_pattern` | 1 |
 | `flake-ledger-read-path` | 1 |
 | `fm-helpers-lazy-imports` | 1 |
 | `fm-helpers-module-level-import-red` | 1 |
+| `forcing-lost-update-race-in-tests` | 1 |
 | `frozen-dataclass-any-field-hashability` | 1 |
 | `frozen-plan-amendment-mechanism` | 1 |
+| `fused-memory-classifier-test-stubs` | 1 |
 | `fused-memory-config-schema-import-cycle` | 1 |
 | `fused-memory-enumerate-stub-migration` | 1 |
 | `fused-memory-test-config-isolation` | 1 |
 | `fused-memory-test-fixtures` | 1 |
+| `fused-memory-unable-to-connect-triage` | 1 |
 | `gamma-baseline-rebase-per-key-resolution` | 1 |
 | `gate_task_escalation_two_queues` | 1 |
 | `gather-convention-guard` | 1 |
@@ -5269,12 +5327,14 @@ Records: **6,977**
 | `head-limited-grep-truncates-the-decisive-hit` | 1 |
 | `implementer-sandbox-main-data-write` | 1 |
 | `import-probe-find-spec-vs-import` | 1 |
-| `inv12-exception-register` | 1 |
+| `inv8-loop-blocking-gate-scope` | 1 |
+| `keyed-storm-counters` | 1 |
 | `knowlive_edge_lifecycle` | 1 |
 | `landlock_var_tmp_full_suite_gotcha` | 1 |
 | `lane-state-single-writer-scan` | 1 |
 | `leaked-test-process-attribution` | 1 |
 | `legibility-census-main-git-root` | 1 |
+| `legibility-census-test-helpers` | 1 |
 | `legibility-codebook-schema-access` | 1 |
 | `legibility-dual-module-imports` | 1 |
 | `legibility-nightly-test-census-safety` | 1 |
@@ -5282,11 +5342,12 @@ Records: **6,977**
 | `lme-arm-harness-token-telemetry` | 1 |
 | `lme-usage-tap-inflight-calls` | 1 |
 | `lock-charter-extensionless-sweep` | 1 |
-| `loop-blocking-gate-allowlist` | 1 |
 | `main-health-auto-heal-halt` | 1 |
 | `malformed-milestone-repair-path` | 1 |
+| `markup-guard-storm-state` | 1 |
 | `markup-sink-eval-lane-containment` | 1 |
 | `mcp-client-task-group-exception-wrapping` | 1 |
+| `mcp-client-text-truncation` | 1 |
 | `mcp-tool-docstring-pinning` | 1 |
 | `mcp-update-task-none-kwargs` | 1 |
 | `mem0-tombstone-coverage` | 1 |
@@ -5311,10 +5372,13 @@ Records: **6,977**
 | `merge-lane-ratchet-alias-importer-sweep` | 1 |
 | `merge-lane-ratchet-instrument` | 1 |
 | `merge-lane-ratchet-new-test-module` | 1 |
+| `merge-lane-speculative-passthrough` | 1 |
 | `merge-lane-test-seams` | 1 |
 | `merge-queue-test-worker-teardown` | 1 |
 | `merge-queue-timeout-mark-coverage` | 1 |
 | `merge-queue-wait-budget-audit` | 1 |
+| `merge-thrash-signature` | 1 |
+| `merge-verify-spec-verify-env-channels` | 1 |
 | `merger-speculative-predecessor-conflict` | 1 |
 | `meta-test-review-norm` | 1 |
 | `mock-fspath-pathlike-stray-dirs` | 1 |
@@ -5328,6 +5392,8 @@ Records: **6,977**
 | `npm_cache_verify_lane_eacces` | 1 |
 | `npx-npx-cache-enotempty-wedge` | 1 |
 | `orchestrator-escalation-dedupe-identity` | 1 |
+| `orchestrator-test-config-isolation` | 1 |
+| `orchestrator-verify-test-seams` | 1 |
 | `origin_finding_id_citation_discipline` | 1 |
 | `orphaned-recon-escalation-flag-audience` | 1 |
 | `patch-targets-module-set` | 1 |
@@ -5336,14 +5402,20 @@ Records: **6,977**
 | `prompt-pinning-test-accepted-shape` | 1 |
 | `prose-consistency-sweep-detector-design` | 1 |
 | `protective_guard_pre_check_before_completion_notes` | 1 |
+| `pydantic-strict-stdlib-dataclass-field` | 1 |
 | `pydantic-validator-exception-propagation` | 1 |
 | `pyright-literal-vs-strenum-basic-mode` | 1 |
 | `pyright-mock-attribute-narrowing` | 1 |
 | `pyright-protocol-frozen-dataclass` | 1 |
+| `pyright-python-version-target` | 1 |
+| `pyright-test-double-protocol-names` | 1 |
 | `pyright-typeddict-discriminated-match` | 1 |
 | `pyright-worktree-import-resolution` | 1 |
 | `pytest-config-walk-static-resolution` | 1 |
 | `pytest-factory-fixture-binding-name` | 1 |
+| `pytest-k-filter-scope` | 1 |
+| `pytest-nodeid-cwd-relative` | 1 |
+| `pytest-per-test-timeout-measurement` | 1 |
 | `pytest-timeout-method-under-xdist` | 1 |
 | `pytest-xdist-q-bailout-output` | 1 |
 | `quarantine-lane-recovery` | 1 |
@@ -5382,6 +5454,7 @@ Records: **6,977**
 | `stale-line-pointers-in-amended-prds` | 1 |
 | `stale_completion_narrative_sweep` | 1 |
 | `stale_memory_finding_task_id_discipline` | 1 |
+| `strenum-per-member-attribute` | 1 |
 | `submit-task-timeouts` | 1 |
 | `sys-modules-exploding-stub-dunder-guard` | 1 |
 | `systemd-run-env-propagation` | 1 |
@@ -5393,16 +5466,20 @@ Records: **6,977**
 | `textwrap-break-on-hyphens-mangles-identifiers` | 1 |
 | `thin-warm-lane-live-ref-gate` | 1 |
 | `threading-http-server-daemon-handlers` | 1 |
+| `timeout-marker-inversion-guard` | 1 |
 | `tmp-project-root-literal-census` | 1 |
 | `tmp_leak_verification_dark_factory_host_gotcha` | 1 |
+| `toolcall-markup-b5-opener-rule` | 1 |
 | `triage-stale-orphan-l2` | 1 |
 | `unblock-auto-prompt-contract` | 1 |
 | `unblock-design-decision-resolution` | 1 |
 | `update_edge_case_taxonomy` | 1 |
 | `update_task_append_details_side_effect` | 1 |
 | `usage-gate-park-free-deferral` | 1 |
+| `usage-gate-test-seams` | 1 |
 | `var_tmp_sandboxed_write_set_gap` | 1 |
 | `verify-absence-claims-positive-control` | 1 |
+| `verify-run-cmd-fault-injection` | 1 |
 | `verify-scope-unit-naming` | 1 |
 | `virtual-clock-deflake` | 1 |
 | `virtual-clock-test-scope` | 1 |
@@ -5410,6 +5487,10 @@ Records: **6,977**
 | `wall-clock-proxy-count-floor` | 1 |
 | `workspace-domain-fixture-manifest` | 1 |
 | `worktree-mid-run-revert` | 1 |
+| `worktree-venv-stale-after-rebase` | 1 |
+| `worktree-venv-sync-before-hand-run-gate` | 1 |
+| `write-journal-forensic-queries` | 1 |
+| `write-journal-query-cost` | 1 |
 | `write-triage-attach-metadata` | 1 |
 | `write-triage-config-matrix` | 1 |
 | `write-triage-judge-prompt-budget` | 1 |
@@ -5647,31 +5728,31 @@ _(none)_
 
 ### All categories
 
-Records: **37,405**
+Records: **37,477**
 
 #### Top-level metadata key population
 
 | key | count |
 | --- | ---: |
-| `category` | 37,405 |
-| `created_at` | 37,405 |
-| `data` | 37,405 |
-| `hash` | 37,405 |
-| `user_id` | 37,405 |
-| `updated_at` | 34,929 |
-| `agent_id` | 26,699 |
-| `role` | 23,860 |
-| `task_id` | 13,963 |
-| `source` | 12,135 |
-| `transition` | 11,358 |
+| `category` | 37,477 |
+| `created_at` | 37,477 |
+| `data` | 37,477 |
+| `hash` | 37,477 |
+| `user_id` | 37,477 |
+| `updated_at` | 35,001 |
+| `agent_id` | 26,752 |
+| `role` | 23,932 |
+| `task_id` | 14,023 |
+| `source` | 12,170 |
+| `transition` | 11,374 |
 | `_causation_id` | 5,537 |
 | `_deferred` | 5,502 |
-| `run_id` | 2,464 |
-| `stage2_suppress` | 1,782 |
+| `run_id` | 2,460 |
+| `stage2_suppress` | 1,798 |
 | `stage` | 1,764 |
-| `kind` | 1,716 |
-| `echo_used_provenance` | 1,452 |
-| `topic` | 1,336 |
+| `kind` | 1,715 |
+| `echo_used_provenance` | 1,468 |
+| `topic` | 1,359 |
 | `task_ids` | 397 |
 | `commit` | 294 |
 | `flag_id` | 232 |
@@ -5679,7 +5760,7 @@ Records: **37,405**
 | `cycle` | 219 |
 | `escalation_id` | 202 |
 | `memories_deleted` | 192 |
-| `flag_type` | 170 |
+| `flag_type` | 166 |
 | `memories_added` | 165 |
 | `affected_tasks` | 156 |
 | `finding` | 149 |
@@ -5751,7 +5832,6 @@ Records: **37,405**
 | `cycle_date` | 28 |
 | `flags_processed` | 28 |
 | `status` | 28 |
-| `flag_for_stage2` | 27 |
 | `x_contested` | 26 |
 | `actions` | 25 |
 | `note` | 25 |
@@ -5760,6 +5840,7 @@ Records: **37,405**
 | `entity_refresh_failed_uuids` | 24 |
 | `entity_uuid` | 23 |
 | `findings_addressed` | 23 |
+| `flag_for_stage2` | 23 |
 | `canonical_task` | 22 |
 | `echo_suppressed_stale_description` | 22 |
 | `merged_from` | 22 |
@@ -5778,6 +5859,7 @@ Records: **37,405**
 | `related_finding_id` | 19 |
 | `related_memories` | 19 |
 | `task` | 19 |
+| `verification_verdict` | 19 |
 | `batch` | 18 |
 | `cross_project` | 18 |
 | `escalations` | 18 |
@@ -5792,7 +5874,7 @@ Records: **37,405**
 | `occurrence_count` | 16 |
 | `provenance` | 16 |
 | `session_type` | 16 |
-| `verification_verdict` | 16 |
+| `unverified_claim` | 16 |
 | `area` | 15 |
 | `edges_invalidated` | 15 |
 | `flag_resolved` | 15 |
@@ -5806,7 +5888,6 @@ Records: **37,405**
 | `merges` | 14 |
 | `module` | 14 |
 | `related_memory` | 14 |
-| `unverified_claim` | 14 |
 | `watch_type` | 14 |
 | `cancelled_duplicates` | 13 |
 | `corrects_memory_id` | 13 |
@@ -5890,7 +5971,6 @@ Records: **37,405**
 | `commits` | 7 |
 | `companion_tracker` | 7 |
 | `corrects_flags` | 7 |
-| `deduped_against` | 7 |
 | `df_tasks` | 7 |
 | `infra_component` | 7 |
 | `pending_action` | 7 |
@@ -5946,6 +6026,7 @@ Records: **37,405**
 | `cycle_start` | 5 |
 | `cycles_observed` | 5 |
 | `dark_factory_task` | 5 |
+| `deduped_against` | 5 |
 | `deferred_to` | 5 |
 | `dependency_done` | 5 |
 | `duplicate_task` | 5 |
@@ -5969,7 +6050,6 @@ Records: **37,405**
 | `redispatched_as_inprogress` | 5 |
 | `refines` | 5 |
 | `related_incident` | 5 |
-| `related_memory_ids` | 5 |
 | `remediation_findings` | 5 |
 | `replaces_stage1_flag` | 5 |
 | `replaces_stale` | 5 |
@@ -6050,11 +6130,12 @@ Records: **37,405**
 | `proxy_contamination_resolved` | 4 |
 | `recon_pool` | 4 |
 | `related_df_task` | 4 |
+| `related_memory_ids` | 4 |
 | `remediates_finding` | 4 |
 | `reopened_by` | 4 |
 | `replacement_ids` | 4 |
 
-_Showing top 400 of 1,260 distinct values — this markdown view is **truncated**; the JSON artifact carries the full population, and `--top-n` widens this view._
+_Showing top 400 of 1,258 distinct values — this markdown view is **truncated**; the JSON artifact carries the full population, and `--top-n` widens this view._
 
 #### `kind` values
 
@@ -6105,7 +6186,6 @@ _Showing top 400 of 1,260 distinct values — this markdown view is **truncated*
 | `consolidation_closure_norm` | 2 |
 | `cross_project_routing_note` | 2 |
 | `deferral_note` | 2 |
-| `flag_for_stage2` | 2 |
 | `flag_resolution_note` | 2 |
 | `gotcha` | 2 |
 | `human_gate_scope_note` | 2 |
@@ -6181,6 +6261,7 @@ _Showing top 400 of 1,260 distinct values — this markdown view is **truncated*
 | `extension` | 1 |
 | `false_done_correction` | 1 |
 | `flag_closure_note` | 1 |
+| `flag_for_stage2` | 1 |
 | `flag_marker_id_mismatch_norm` | 1 |
 | `followup_scope_note` | 1 |
 | `found_on_main` | 1 |
@@ -6348,13 +6429,13 @@ _Showing top 400 of 1,260 distinct values — this markdown view is **truncated*
 | `workflow` | 1 |
 | `zombie_reset_bypass_rule` | 1 |
 
-`kind` missing: **35,689** record(s).
+`kind` missing: **35,762** record(s).
 
 #### `supersedes` shapes
 
 | shape | count |
 | --- | ---: |
-| `absent` | 37,178 |
+| `absent` | 37,250 |
 | `list` | 174 |
 | `scalar` | 53 |
 
@@ -6386,7 +6467,7 @@ _Showing top 400 of 1,260 distinct values — this markdown view is **truncated*
 
 | axis | count |
 | --- | ---: |
-| `topic` present | 1,336 |
+| `topic` present | 1,359 |
 | `parent_id` present | 41 |
 | `canonical` true | 122 |
 | `canonical` false | 6 |
@@ -6398,7 +6479,7 @@ _Showing top 400 of 1,260 distinct values — this markdown view is **truncated*
 | --- | ---: |
 | `cite-code-by-symbol-not-file-line` | 40 |
 | `harness-layout-gate-decision-rule` | 30 |
-| `tree-sitter-reify-build-grammar` | 23 |
+| `tree-sitter-reify-build-grammar` | 24 |
 | `reify-coupled-ri-fixtures-registration` | 21 |
 | `reify-diagnosticcode-minting-convention` | 19 |
 | `cargo-skim-output-wrapper` | 18 |
@@ -6498,6 +6579,7 @@ _Showing top 400 of 1,260 distinct values — this markdown view is **truncated*
 | `tmp-hygiene` | 3 |
 | `torque-named-dimension-status` | 3 |
 | `audit_duplicate_tasks` | 2 |
+| `ctor-conformance-survey-regeneration` | 2 |
 | `dead-feature-activation-detection` | 2 |
 | `docs-prd-landing` | 2 |
 | `empty-escalation-read-diagnosis` | 2 |
@@ -6516,6 +6598,7 @@ _Showing top 400 of 1,260 distinct values — this markdown view is **truncated*
 | `orchestrator-bugs` | 2 |
 | `orchestrator-scope-violation` | 2 |
 | `persistent-cache-envelope-format` | 2 |
+| `persistent-fea-cache-invalidation` | 2 |
 | `precision-refine-envelope-loft` | 2 |
 | `process-liveness-shared-host` | 2 |
 | `ptodo-string-literal-cite-liveness` | 2 |
@@ -6536,6 +6619,7 @@ _Showing top 400 of 1,260 distinct values — this markdown view is **truncated*
 | `steward-descope-plan-status` | 2 |
 | `task-count-snapshot-convention` | 2 |
 | `temp-dir-test-hygiene` | 2 |
+| `tempfile-crate-gotchas` | 2 |
 | `tmp-purge-safety` | 2 |
 | `warm-base-deps-prune-liveness` | 2 |
 | `warm-lane-audit-freshness-staleness` | 2 |
@@ -6550,6 +6634,8 @@ _Showing top 400 of 1,260 distinct values — this markdown view is **truncated*
 | `TaskmasterBackend test infrastructure` | 1 |
 | `_fetch_filtered_task_tree fix` | 1 |
 | `adaptive-dorfler-marking-form` | 1 |
+| `adaptive-elastic-result-contract` | 1 |
+| `adaptive-elastic-result-reported-iterate` | 1 |
 | `adaptive-refine-size-proxy` | 1 |
 | `adaptive-refine-size-proxy-zero-mark-growth` | 1 |
 | `afk-b3-ineligible-architect-false-premise` | 1 |
@@ -6561,6 +6647,7 @@ _Showing top 400 of 1,260 distinct values — this markdown view is **truncated*
 | `architect-plan-scoping` | 1 |
 | `assert-tail50-dump-cap` | 1 |
 | `audit-verification-forensic-attribution` | 1 |
+| `auto-resolve-firing-rule` | 1 |
 | `auto-resolve-panel-driving-metric-label` | 1 |
 | `auto-resolve-panel-test-cast-fix` | 1 |
 | `autoparam-field-churn` | 1 |
@@ -6607,6 +6694,7 @@ _Showing top 400 of 1,260 distinct values — this markdown view is **truncated*
 | `consolidation-self-seeding` | 1 |
 | `contains-undef-map-sentinel-false-positive` | 1 |
 | `corpus_no_bare_scalar self-scan` | 1 |
+| `cost-min-material-waste-substrate` | 1 |
 | `cpsat-enumerable-domains` | 1 |
 | `cpu-overcommit-run-all-storm` | 1 |
 | `cpu-overcommit-run-all-storm-admission-threshold-root` | 1 |
@@ -6616,7 +6704,6 @@ _Showing top 400 of 1,260 distinct values — this markdown view is **truncated*
 | `cross-repo-task-recognition-and-landing` | 1 |
 | `cross_repo_unactionability_data_vs_code` | 1 |
 | `ctor-conformance-pinned-clean-scope` | 1 |
-| `ctor-conformance-survey-regeneration` | 1 |
 | `ctor-label-binding-severity` | 1 |
 | `curator-consolidation-protocol` | 1 |
 | `curator-failover-dedup-audit` | 1 |
@@ -6650,7 +6737,9 @@ _Showing top 400 of 1,260 distinct values — this markdown view is **truncated*
 | `drop-guard merge-queue fused-memory polish` | 1 |
 | `edit-source-content-hash-false-green` | 1 |
 | `effect-absent-hot-file-false-positive` | 1 |
+| `elastic-assembly-performance` | 1 |
 | `elastic-options-runtime-honoured-knobs` | 1 |
+| `elastic-p2-cantilever-accuracy` | 1 |
 | `empty-plan-files-at-merge-entry-false-positive` | 1 |
 | `engine-substrate-facts-fields-multikernel-2026-10-08` | 1 |
 | `enum-annotation-resolution-path` | 1 |
@@ -6684,15 +6773,18 @@ _Showing top 400 of 1,260 distinct values — this markdown view is **truncated*
 | `fleet-session-record-quirks` | 1 |
 | `flock-blocked-waiter-barrier` | 1 |
 | `flock-blocked-waiter-proc-locks-probe` | 1 |
+| `fn-body-function-table-visibility` | 1 |
 | `fused-memory-project-id-vs-project-root` | 1 |
 | `g-allow-cite-provenance` | 1 |
 | `g-allow-marker-convention` | 1 |
 | `g-allow-marker-grammar` | 1 |
 | `gate-enumerations-are-unreliable` | 1 |
+| `generic-assoc-fn-return-type-leak` | 1 |
 | `generic-structure-ctor-call-syntax` | 1 |
 | `geometry-builtin-arity-ledgers` | 1 |
 | `geometry-list-realization-cell-correspondence` | 1 |
 | `geometry-list-selective-tessellate` | 1 |
+| `geometry-realization-duplicate-diagnostics` | 1 |
 | `geometry-transform-shipped-arities` | 1 |
 | `geomref-sub-member-name-resolution` | 1 |
 | `git-add-task-gitignore-gotcha` | 1 |
@@ -6709,6 +6801,7 @@ _Showing top 400 of 1,260 distinct values — this markdown view is **truncated*
 | `guards-rs-guarded-block-prepass-type-mismatch` | 1 |
 | `gui-bare-number-edit-seed` | 1 |
 | `gui-kernel-registry-default-pick` | 1 |
+| `gui-lsp-lane-routing` | 1 |
 | `gui-sidecar-mcp-config` | 1 |
 | `gui-valuedata-declared-dimension` | 1 |
 | `harness drain marker` | 1 |
@@ -6729,6 +6822,7 @@ _Showing top 400 of 1,260 distinct values — this markdown view is **truncated*
 | `jcodemunch-serve-readiness-under-load` | 1 |
 | `jcodemunch-smoke-range` | 1 |
 | `joint-dof-self-check-vacuous-oracle` | 1 |
+| `kernel-owner-routing` | 1 |
 | `landlock-exdev-clippy-gap` | 1 |
 | `landlock-fs-refer-exdev-blocks-all-rustc-compiles` | 1 |
 | `lld-nondeterministic-crash-signature` | 1 |
@@ -6771,6 +6865,7 @@ _Showing top 400 of 1,260 distinct values — this markdown view is **truncated*
 | `merge_verify_warm_lane_race_recurrence` | 1 |
 | `meshManager-overlay-ordering` | 1 |
 | `milestone-stub-closure` | 1 |
+| `modal-shift-frequency-surface` | 1 |
 | `named-dimensions-alias-destaling` | 1 |
 | `native-dep-stub-build` | 1 |
 | `nested-mcp-tool-grep` | 1 |
@@ -6782,29 +6877,15 @@ _Showing top 400 of 1,260 distinct values — this markdown view is **truncated*
 | `npx-vitest-tsc-sandbox-failure` | 1 |
 | `objective-term-weight-validation` | 1 |
 | `occt-brepbndlib-usetriangulation-default` | 1 |
-| `occt-draft-fixture-neutral-plane` | 1 |
-| `occt-gate-outlier` | 1 |
-| `occt-stdout-chatter` | 1 |
-| `occt-sweep-scale-tolerance` | 1 |
-| `opaque-state-escalation-bugs` | 1 |
-| `openvdb-voxel-budget-ceiling` | 1 |
-| `optimized-compute-failure-body-inline-fallback` | 1 |
-| `optimized-fixture-eval-leg-asymmetry` | 1 |
-| `orchestrator-journal-querying` | 1 |
-| `orchestrator-launch` | 1 |
-| `orchestrator-manual-merge` | 1 |
-| `orchestrator-restart-side-effects` | 1 |
-| `orchestrator-signal-vs-scheduler-churn-retirement` | 1 |
-| `orchestrator-yaml-role-key-collapse` | 1 |
 
-_Showing top 400 of 631 distinct values — this markdown view is **truncated**; the JSON artifact carries the full population, and `--top-n` widens this view._
+_Showing top 400 of 650 distinct values — this markdown view is **truncated**; the JSON artifact carries the full population, and `--top-n` widens this view._
 
 #### `source` values
 
 | source | count |
 | --- | ---: |
-| `targeted_reconciliation` | 11,103 |
-| `orchestrator_completion` | 108 |
+| `targeted_reconciliation` | 11,122 |
+| `orchestrator_completion` | 124 |
 | `consolidation` | 97 |
 | `stage1_cycle_summary` | 77 |
 | `reconciliation_stage2` | 63 |
@@ -6951,8 +7032,8 @@ _Showing top 400 of 631 distinct values — this markdown view is **truncated**;
 
 | source | count |
 | --- | ---: |
-| `targeted_reconciliation` | 11,094 |
-| `orchestrator_completion` | 108 |
+| `targeted_reconciliation` | 11,113 |
+| `orchestrator_completion` | 124 |
 | `consolidation` | 96 |
 | `stage1_cycle_summary` | 69 |
 | `reconciliation_stage2` | 63 |
@@ -7079,38 +7160,38 @@ _Showing top 400 of 631 distinct values — this markdown view is **truncated**;
 
 ### `reify` / `observations_and_summaries`
 
-Records: **28,570**
+Records: **28,626**
 
 #### Top-level metadata key population
 
 | key | count |
 | --- | ---: |
-| `category` | 28,570 |
-| `created_at` | 28,570 |
-| `data` | 28,570 |
-| `hash` | 28,570 |
-| `user_id` | 28,570 |
-| `updated_at` | 26,351 |
-| `agent_id` | 17,870 |
-| `role` | 16,120 |
-| `task_id` | 13,465 |
-| `source` | 11,867 |
-| `transition` | 11,350 |
+| `category` | 28,626 |
+| `created_at` | 28,626 |
+| `data` | 28,626 |
+| `hash` | 28,626 |
+| `user_id` | 28,626 |
+| `updated_at` | 26,407 |
+| `agent_id` | 17,907 |
+| `role` | 16,176 |
+| `task_id` | 13,512 |
+| `source` | 11,902 |
+| `transition` | 11,366 |
 | `_causation_id` | 5,513 |
 | `_deferred` | 5,502 |
-| `run_id` | 2,378 |
-| `stage2_suppress` | 1,779 |
+| `run_id` | 2,374 |
+| `stage2_suppress` | 1,795 |
 | `stage` | 1,764 |
-| `kind` | 1,537 |
-| `echo_used_provenance` | 1,452 |
-| `topic` | 501 |
+| `kind` | 1,536 |
+| `echo_used_provenance` | 1,468 |
+| `topic` | 512 |
 | `task_ids` | 379 |
 | `commit` | 268 |
 | `cycle` | 217 |
 | `flag_id` | 216 |
 | `memories_deleted` | 192 |
 | `memories_added` | 165 |
-| `flag_type` | 164 |
+| `flag_type` | 160 |
 | `edges_updated` | 146 |
 | `cycle_summary` | 145 |
 | `affected_tasks` | 140 |
@@ -7169,7 +7250,6 @@ Records: **28,570**
 | `cycle_date` | 28 |
 | `file` | 28 |
 | `flags_processed` | 28 |
-| `flag_for_stage2` | 27 |
 | `status` | 27 |
 | `found_during` | 26 |
 | `priority` | 26 |
@@ -7179,6 +7259,7 @@ Records: **28,570**
 | `edge_updates` | 24 |
 | `entity_refresh_failed_uuids` | 24 |
 | `findings_addressed` | 23 |
+| `flag_for_stage2` | 23 |
 | `canonical_task` | 22 |
 | `echo_suppressed_stale_description` | 22 |
 | `note` | 22 |
@@ -7191,6 +7272,7 @@ Records: **28,570**
 | `completion_date` | 19 |
 | `merge_commit` | 19 |
 | `spawned_from` | 19 |
+| `verification_verdict` | 19 |
 | `cross_project` | 18 |
 | `flag_types` | 18 |
 | `tasks_updated` | 18 |
@@ -7203,7 +7285,6 @@ Records: **28,570**
 | `related_finding_id` | 16 |
 | `related_memories` | 16 |
 | `session_type` | 16 |
-| `verification_verdict` | 16 |
 | `edges_invalidated` | 15 |
 | `flag_resolved` | 15 |
 | `flagged_item` | 15 |
@@ -7215,6 +7296,7 @@ Records: **28,570**
 | `merges` | 14 |
 | `modules` | 14 |
 | `section` | 14 |
+| `unverified_claim` | 14 |
 | `watch_type` | 14 |
 | `cancelled_duplicates` | 13 |
 | `escalation_ids` | 13 |
@@ -7226,7 +7308,6 @@ Records: **28,570**
 | `flags_for_stage2` | 12 |
 | `stage2_flag` | 12 |
 | `timestamp` | 12 |
-| `unverified_claim` | 12 |
 | `actionable` | 11 |
 | `corrects` | 11 |
 | `issue` | 11 |
@@ -7290,7 +7371,6 @@ Records: **28,570**
 | `companion_tracker` | 7 |
 | `correction` | 7 |
 | `corrects_flags` | 7 |
-| `deduped_against` | 7 |
 | `df_tasks` | 7 |
 | `infra_component` | 7 |
 | `parent_id` | 7 |
@@ -7347,6 +7427,7 @@ Records: **28,570**
 | `contradictions_fixed` | 5 |
 | `cycle_start` | 5 |
 | `dark_factory_task` | 5 |
+| `deduped_against` | 5 |
 | `deferred_to` | 5 |
 | `dependency_done` | 5 |
 | `duplicate_task` | 5 |
@@ -7369,7 +7450,6 @@ Records: **28,570**
 | `redispatched_as_inprogress` | 5 |
 | `reissued_from` | 5 |
 | `related_df_tasks` | 5 |
-| `related_memory_ids` | 5 |
 | `requires_stage2_attention` | 5 |
 | `resolution_status` | 5 |
 | `root_cause` | 5 |
@@ -7440,6 +7520,7 @@ Records: **28,570**
 | `project` | 4 |
 | `proxy_contamination_resolved` | 4 |
 | `recon_pool` | 4 |
+| `related_memory_ids` | 4 |
 | `replacement_ids` | 4 |
 | `resolution_note` | 4 |
 | `resolved_date` | 4 |
@@ -7486,7 +7567,7 @@ Records: **28,570**
 | `fix_project` | 3 |
 | `flag_ref` | 3 |
 
-_Showing top 400 of 1,080 distinct values — this markdown view is **truncated**; the JSON artifact carries the full population, and `--top-n` widens this view._
+_Showing top 400 of 1,078 distinct values — this markdown view is **truncated**; the JSON artifact carries the full population, and `--top-n` widens this view._
 
 #### `kind` values
 
@@ -7528,7 +7609,6 @@ _Showing top 400 of 1,080 distinct values — this markdown view is **truncated*
 | `consolidated_canonical` | 2 |
 | `cross_project_routing_note` | 2 |
 | `deferral_note` | 2 |
-| `flag_for_stage2` | 2 |
 | `flag_resolution_note` | 2 |
 | `human_gate_scope_note` | 2 |
 | `provenance_correction` | 2 |
@@ -7588,6 +7668,7 @@ _Showing top 400 of 1,080 distinct values — this markdown view is **truncated*
 | `failure_mode` | 1 |
 | `false_done_correction` | 1 |
 | `flag_closure_note` | 1 |
+| `flag_for_stage2` | 1 |
 | `followup_scope_note` | 1 |
 | `found_on_main` | 1 |
 | `gate_race_incident` | 1 |
@@ -7699,13 +7780,13 @@ _Showing top 400 of 1,080 distinct values — this markdown view is **truncated*
 | `unknown_provenance_note` | 1 |
 | `verify_mechanism_fact` | 1 |
 
-`kind` missing: **27,033** record(s).
+`kind` missing: **27,090** record(s).
 
 #### `supersedes` shapes
 
 | shape | count |
 | --- | ---: |
-| `absent` | 28,490 |
+| `absent` | 28,546 |
 | `list` | 42 |
 | `scalar` | 38 |
 
@@ -7730,7 +7811,7 @@ _Showing top 400 of 1,080 distinct values — this markdown view is **truncated*
 
 | axis | count |
 | --- | ---: |
-| `topic` present | 501 |
+| `topic` present | 512 |
 | `parent_id` present | 7 |
 | `canonical` true | 27 |
 | `canonical` false | 0 |
@@ -7815,9 +7896,12 @@ _Showing top 400 of 1,080 distinct values — this markdown view is **truncated*
 | `TaskmasterBackend test infrastructure` | 1 |
 | `_fetch_filtered_task_tree fix` | 1 |
 | `adaptive-dorfler-marking-form` | 1 |
+| `adaptive-elastic-result-contract` | 1 |
+| `adaptive-elastic-result-reported-iterate` | 1 |
 | `adaptive-refine-size-proxy` | 1 |
 | `adaptive-refine-size-proxy-zero-mark-growth` | 1 |
 | `aposteriori-fixture-bc-tolerance` | 1 |
+| `auto-resolve-firing-rule` | 1 |
 | `auto-resolve-panel-driving-metric-label` | 1 |
 | `auto-resolve-panel-test-cast-fix` | 1 |
 | `autoparam-field-churn` | 1 |
@@ -7840,6 +7924,7 @@ _Showing top 400 of 1,080 distinct values — this markdown view is **truncated*
 | `consolidation-clusters-carry-falsified-guidance` | 1 |
 | `consolidation-not-stable-end-state` | 1 |
 | `consolidation-self-seeding` | 1 |
+| `cost-min-material-waste-substrate` | 1 |
 | `cpsat-enumerable-domains` | 1 |
 | `cpu-overcommit-run-all-storm` | 1 |
 | `cpu-overcommit-run-all-storm-admission-threshold-root` | 1 |
@@ -7865,7 +7950,9 @@ _Showing top 400 of 1,080 distinct values — this markdown view is **truncated*
 | `drop-guard merge-queue` | 1 |
 | `drop-guard merge-queue fused-memory polish` | 1 |
 | `effect-absent-hot-file-false-positive` | 1 |
+| `elastic-assembly-performance` | 1 |
 | `elastic-options-runtime-honoured-knobs` | 1 |
+| `elastic-p2-cantilever-accuracy` | 1 |
 | `engine-substrate-facts-fields-multikernel-2026-10-08` | 1 |
 | `enum-annotation-resolution-path` | 1 |
 | `enum-erasure-constraint-arg-check` | 1 |
@@ -7883,9 +7970,11 @@ _Showing top 400 of 1,080 distinct values — this markdown view is **truncated*
 | `fidget-kernel-reachability` | 1 |
 | `fleet-session-record-quirks` | 1 |
 | `gate-enumerations-are-unreliable` | 1 |
+| `generic-assoc-fn-return-type-leak` | 1 |
 | `generic-type-param-placeholder-types` | 1 |
 | `geometry-list-realization-cell-correspondence` | 1 |
 | `geometry-list-selective-tessellate` | 1 |
+| `geometry-realization-duplicate-diagnostics` | 1 |
 | `geometry-transform-shipped-arities` | 1 |
 | `geomref-sub-member-name-resolution` | 1 |
 | `git-rerere-shared-worktree-hazard` | 1 |
@@ -7893,6 +7982,7 @@ _Showing top 400 of 1,080 distinct values — this markdown view is **truncated*
 | `gui-bare-number-edit-seed` | 1 |
 | `gui-feature-gate-debug-server` | 1 |
 | `gui-kernel-registry-default-pick` | 1 |
+| `gui-lsp-lane-routing` | 1 |
 | `gui-sidecar-mcp-config` | 1 |
 | `gui-valuedata-declared-dimension` | 1 |
 | `harness drain marker` | 1 |
@@ -7902,6 +7992,7 @@ _Showing top 400 of 1,080 distinct values — this markdown view is **truncated*
 | `integration-skew-census` | 1 |
 | `inv-geo-1-mesh-contract-mock` | 1 |
 | `jcodemunch-smoke-range` | 1 |
+| `kernel-owner-routing` | 1 |
 | `landlock-fs-refer-exdev-blocks-all-rustc-compiles` | 1 |
 | `lock-depth-and-code-extensions` | 1 |
 | `main-health-cited-test-paths-ratchet` | 1 |
@@ -7931,6 +8022,7 @@ _Showing top 400 of 1,080 distinct values — this markdown view is **truncated*
 | `merge_queue_lane_control` | 1 |
 | `merge_verify_warm_lane_race_recurrence` | 1 |
 | `meshManager-overlay-ordering` | 1 |
+| `modal-shift-frequency-surface` | 1 |
 | `named-dimensions-alias-destaling` | 1 |
 | `no-registered-compute-trampoline-severity` | 1 |
 | `objective-term-weight-validation` | 1 |
@@ -8020,7 +8112,6 @@ _Showing top 400 of 1,080 distinct values — this markdown view is **truncated*
 | `task_overlap_359_475` | 1 |
 | `tasks-db-schema` | 1 |
 | `tessellate-snapshot-reuse-pass-geometry-backing` | 1 |
-| `test-binary-libopenvdb-ld-library-path` | 1 |
 | `test-step-n-label-convention` | 1 |
 | `test-vacuity` | 1 |
 | `test-verify-scope-runtime-cost` | 1 |
@@ -8043,6 +8134,7 @@ _Showing top 400 of 1,080 distinct values — this markdown view is **truncated*
 | `verify-pipeline-guard-infra-glob` | 1 |
 | `verify.py conftest` | 1 |
 | `warm-base-deps-generation-prune` | 1 |
+| `warm-cold-shadow-compare-cadence` | 1 |
 | `warm-lane-acquire-fault-sentinel-missing-mount-present` | 1 |
 | `warm-lane-audit-unset-mount-false-zero` | 1 |
 | `warm-lane-availability-guard-does-not-exist` | 1 |
@@ -8058,8 +8150,8 @@ _Showing top 400 of 1,080 distinct values — this markdown view is **truncated*
 
 | source | count |
 | --- | ---: |
-| `targeted_reconciliation` | 11,081 |
-| `orchestrator_completion` | 108 |
+| `targeted_reconciliation` | 11,100 |
+| `orchestrator_completion` | 124 |
 | `consolidation` | 80 |
 | `stage1_cycle_summary` | 77 |
 | `reconciliation_stage2` | 63 |
@@ -8154,8 +8246,8 @@ _Showing top 400 of 1,080 distinct values — this markdown view is **truncated*
 
 | source | count |
 | --- | ---: |
-| `targeted_reconciliation` | 11,072 |
-| `orchestrator_completion` | 108 |
+| `targeted_reconciliation` | 11,091 |
+| `orchestrator_completion` | 124 |
 | `consolidation` | 80 |
 | `stage1_cycle_summary` | 69 |
 | `reconciliation_stage2` | 63 |
@@ -8244,23 +8336,23 @@ _Showing top 400 of 1,080 distinct values — this markdown view is **truncated*
 
 ### `reify` / `preferences_and_norms`
 
-Records: **2,057**
+Records: **2,058**
 
 #### Top-level metadata key population
 
 | key | count |
 | --- | ---: |
-| `agent_id` | 2,057 |
-| `category` | 2,057 |
-| `created_at` | 2,057 |
-| `data` | 2,057 |
-| `hash` | 2,057 |
-| `user_id` | 2,057 |
-| `updated_at` | 1,935 |
-| `role` | 1,527 |
-| `topic` | 136 |
+| `agent_id` | 2,058 |
+| `category` | 2,058 |
+| `created_at` | 2,058 |
+| `data` | 2,058 |
+| `hash` | 2,058 |
+| `user_id` | 2,058 |
+| `updated_at` | 1,936 |
+| `role` | 1,528 |
+| `topic` | 137 |
 | `source` | 91 |
-| `task_id` | 88 |
+| `task_id` | 89 |
 | `escalation_id` | 48 |
 | `spawned_from` | 17 |
 | `supersedes` | 15 |
@@ -8389,13 +8481,13 @@ Records: **2,057**
 | `snapshot_norm_cross_reference` | 1 |
 | `test_design_norm` | 1 |
 
-`kind` missing: **2,044** record(s).
+`kind` missing: **2,045** record(s).
 
 #### `supersedes` shapes
 
 | shape | count |
 | --- | ---: |
-| `absent` | 2,042 |
+| `absent` | 2,043 |
 | `list` | 13 |
 | `scalar` | 2 |
 
@@ -8418,7 +8510,7 @@ Records: **2,057**
 
 | axis | count |
 | --- | ---: |
-| `topic` present | 136 |
+| `topic` present | 137 |
 | `parent_id` present | 2 |
 | `canonical` true | 12 |
 | `canonical` false | 0 |
@@ -8469,6 +8561,7 @@ Records: **2,057**
 | `reify-doc-chunk-fence-tag-vocabulary` | 1 |
 | `reify-engine-default-kernel-name-predicate` | 1 |
 | `reify-gui-cell-id-namespaces` | 1 |
+| `reify-gui-lsp-test-layout` | 1 |
 | `reify-harness-kloc-cap-measurement` | 1 |
 | `reify-language-spec-citation-by-heading` | 1 |
 | `reify-test-support-engine-factories` | 1 |
@@ -8556,22 +8649,22 @@ Records: **2,057**
 
 ### `reify` / `procedural_knowledge`
 
-Records: **6,698**
+Records: **6,713**
 
 #### Top-level metadata key population
 
 | key | count |
 | --- | ---: |
-| `category` | 6,698 |
-| `created_at` | 6,698 |
-| `data` | 6,698 |
-| `hash` | 6,698 |
-| `user_id` | 6,698 |
-| `agent_id` | 6,692 |
-| `updated_at` | 6,625 |
-| `role` | 6,208 |
-| `topic` | 699 |
-| `task_id` | 407 |
+| `category` | 6,713 |
+| `created_at` | 6,713 |
+| `data` | 6,713 |
+| `hash` | 6,713 |
+| `user_id` | 6,713 |
+| `agent_id` | 6,707 |
+| `updated_at` | 6,640 |
+| `role` | 6,223 |
+| `topic` | 710 |
+| `task_id` | 419 |
 | `kind` | 165 |
 | `supersedes` | 132 |
 | `source` | 111 |
@@ -8937,13 +9030,13 @@ Records: **6,698**
 | `workflow` | 1 |
 | `zombie_reset_bypass_rule` | 1 |
 
-`kind` missing: **6,533** record(s).
+`kind` missing: **6,548** record(s).
 
 #### `supersedes` shapes
 
 | shape | count |
 | --- | ---: |
-| `absent` | 6,566 |
+| `absent` | 6,581 |
 | `list` | 119 |
 | `scalar` | 13 |
 
@@ -8975,7 +9068,7 @@ Records: **6,698**
 
 | axis | count |
 | --- | ---: |
-| `topic` present | 699 |
+| `topic` present | 710 |
 | `parent_id` present | 32 |
 | `canonical` true | 83 |
 | `canonical` false | 6 |
@@ -8986,7 +9079,7 @@ Records: **6,698**
 | topic | count |
 | --- | ---: |
 | `harness-layout-gate-decision-rule` | 30 |
-| `tree-sitter-reify-build-grammar` | 22 |
+| `tree-sitter-reify-build-grammar` | 23 |
 | `cargo-skim-output-wrapper` | 18 |
 | `tests-infra-new-test-forces-full-verify-gate` | 18 |
 | `followup-task-premise-verification` | 14 |
@@ -9041,6 +9134,7 @@ Records: **6,698**
 | `reify-resolve-issue-resolution-class-enum` | 3 |
 | `reify-traitdefs-prelude-merge-required` | 3 |
 | `structure-ctors-do-not-dimension-check-args` | 3 |
+| `ctor-conformance-survey-regeneration` | 2 |
 | `dead-feature-activation-detection` | 2 |
 | `git-build-hygiene` | 2 |
 | `harness-git-diff-output-unreliable` | 2 |
@@ -9050,6 +9144,7 @@ Records: **6,698**
 | `occt-clearance-containment-distance-fold` | 2 |
 | `orchestrator-blocking-pattern-procedure` | 2 |
 | `persistent-cache-envelope-format` | 2 |
+| `persistent-fea-cache-invalidation` | 2 |
 | `process-liveness-shared-host` | 2 |
 | `ptodo-string-literal-cite-liveness` | 2 |
 | `reify-gui-feature-gate-testing-coverage` | 2 |
@@ -9065,6 +9160,7 @@ Records: **6,698**
 | `task-6756-auto-seed-fallback-triage` | 2 |
 | `task-count-snapshot-convention` | 2 |
 | `temp-dir-test-hygiene` | 2 |
+| `tempfile-crate-gotchas` | 2 |
 | `tmp-purge-safety` | 2 |
 | `warm-lane-audit-freshness-staleness` | 2 |
 | `warm-lane-gen-reader-refcount` | 2 |
@@ -9098,7 +9194,6 @@ Records: **6,698**
 | `cross-repo-oracle-caller-recipe-errexit` | 1 |
 | `cross-repo-task-recognition-and-landing` | 1 |
 | `cross_repo_unactionability_data_vs_code` | 1 |
-| `ctor-conformance-survey-regeneration` | 1 |
 | `debug-server-tooldef-descriptions` | 1 |
 | `delivered-checks-pin-file-placement` | 1 |
 | `df-code-deploy-needs-orchestrator-restart` | 1 |
@@ -9123,6 +9218,7 @@ Records: **6,698**
 | `find-own-claude-session-id` | 1 |
 | `flock-blocked-waiter-barrier` | 1 |
 | `flock-blocked-waiter-proc-locks-probe` | 1 |
+| `fn-body-function-table-visibility` | 1 |
 | `fused-memory-project-id-vs-project-root` | 1 |
 | `g-allow-marker-convention` | 1 |
 | `g-allow-marker-grammar` | 1 |
@@ -9181,7 +9277,7 @@ Records: **6,698**
 | `panic-capture-primitive` | 1 |
 | `param-override-validation-paths` | 1 |
 | `pdoccover-baseline` | 1 |
-| `persistent-fea-cache-invalidation` | 1 |
+| `peak-rss-measurement-in-sandbox` | 1 |
 | `pooled-lane-task-meta-sidecar` | 1 |
 | `prd-code-anchors` | 1 |
 | `prd-gate-fixture-rust-coupling` | 1 |
@@ -9194,6 +9290,7 @@ Records: **6,698**
 | `reify-arg-count-test-matcher` | 1 |
 | `reify-audit-comment-lex` | 1 |
 | `reify-audit-comment-lexer` | 1 |
+| `reify-audit-find-references-contract` | 1 |
 | `reify-audit-g-allow-live-gates` | 1 |
 | `reify-audit-g-allow-orphan-rule` | 1 |
 | `reify-audit-jcodemunch-per-call-breadcrumbs` | 1 |
@@ -9256,18 +9353,21 @@ Records: **6,698**
 | `task-85-orphaned-edge-audit` | 1 |
 | `task-dedup-sweep` | 1 |
 | `task-lane-measurement-campaign-restart-resilience` | 1 |
+| `tempfile-permission-preservation` | 1 |
 | `test-assertion-vacuity-entry-point-argument-mutation` | 1 |
 | `test-assertion-vacuity-fixture-choice` | 1 |
 | `test-assertion-vacuity-normalization-invariance` | 1 |
 | `test-assertion-vacuity-over-determined-outcome` | 1 |
 | `test-assertion-vacuity-unreachable-scope` | 1 |
 | `test-verify-scope-fast-iteration-harness` | 1 |
+| `thread-pool-panic-propagation-testing` | 1 |
 | `tokio-blocking-pool-offload-testing` | 1 |
 | `tokio-spawn-blocking-test-observability` | 1 |
 | `torque-named-dimension-status` | 1 |
 | `tracing-interest-cache-poisoning` | 1 |
 | `trait-body-error-diagnosis` | 1 |
 | `trait-member-vector-conformance-strictness` | 1 |
+| `tree-sitter-grammar-byte-identity-sweep` | 1 |
 | `tree-sitter-reify-external-scanner` | 1 |
 | `trickle-resume-on-dip-gate-on-psi-reconcile-to-done` | 1 |
 | `unblock` | 1 |
