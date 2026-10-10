@@ -332,18 +332,66 @@ def _blank_quotations(text: str) -> str:
     return _QUOTATION_RE.sub(blank_unless_key_value, text)
 
 
+_NON_VERIDICAL_CUE_RE: re.Pattern[str] = re.compile(
+    r'(?<![-\w])(?:if|whether|unless|in\s+case)(?![-\w])',
+    re.IGNORECASE,
+)
+_TEMPORAL_CUE_RE: re.Pattern[str] = re.compile(
+    r'(?<![-\w])(?:when(?:ever)?|once|after|before|until|till|as\s+soon\s+as|the\s+day)'
+    r'(?![-\w])',
+    re.IGNORECASE,
+)
+_PRESENT_AUXILIARY_RE: re.Pattern[str] = re.compile(
+    r'\b(?:has|have|is|are)\b', re.IGNORECASE,
+)
+_IMPERATIVE_HEAD_RE: re.Pattern[str] = re.compile(
+    r'(?:^|(?<=\()|(?<=:\s)|(?<=[—–]\s))\s*'
+    r'(?:[-*•]\s+|\(?\d+[.)]\s+)?(?:please\s+)?'
+    r'(?:check|verify|confirm|ensure|make\s+sure|determine|find\s+out|ask|wait|'
+    r're-?check|double-check|look\s+up)(?![-\w])',
+    re.IGNORECASE,
+)
+
+# A mood scope opens at a cue and runs to the next binding barrier (or clause
+# end); a marker inside it is not asserted. Three cue classes: non-veridical
+# (if/whether/unless/in case) and imperative heads (check/verify/confirm...)
+# always blank; a temporal cue blanks only a PRESENT-tense scope, because
+# present tense in a temporal clause is future reference ('once #N has
+# landed') while simple past is narrative and presupposes the event ('after
+# task 5 landed'). Each row is (cue, tense gate); None means always blank.
+# Pinned by tests/test_completion_claim_mood.py::TestNonAssertiveScopes.
+_MOOD_SCOPES: tuple[tuple[re.Pattern[str], re.Pattern[str] | None], ...] = (
+    (_NON_VERIDICAL_CUE_RE, None),
+    (_IMPERATIVE_HEAD_RE, None),
+    (_TEMPORAL_CUE_RE, _PRESENT_AUXILIARY_RE),
+)
+
+
+def _blank_mood_scopes(clause: str) -> str:
+    """*clause* with every non-assertive mood scope blanked, offsets preserved."""
+    chars = list(clause)
+    for cue_re, tense_gate in _MOOD_SCOPES:
+        for cue in cue_re.finditer(clause):
+            barrier = _BINDING_BARRIER_RE.search(clause, cue.end())
+            scope_end = barrier.start() if barrier else len(clause)
+            if tense_gate is None or tense_gate.search(clause, cue.end(), scope_end):
+                chars[cue.start():scope_end] = ' ' * (scope_end - cue.start())
+    return ''.join(chars)
+
+
 def _strip_exemptions(clause: str) -> str:
-    """Blank out negated-terminal and future/aspirational spans in *clause*.
+    """Blank out every span of *clause* that does not assert completion.
 
     Every stripper regex deliberately swallows the completion verb it governs,
     so blanking its span removes the completion EVIDENCE — that is what makes
-    "has not yet landed" and "will land" produce no claim. Each span becomes
-    the same number of spaces, so an offset in the result is an offset in
+    "has not yet landed", "will land" and "must have landed" produce no claim.
+    Mood scopes (:func:`_blank_mood_scopes`) go last. Each span becomes the
+    same number of spaces, so an offset in the result is an offset in
     *clause*, which is what lets a marker found here bind to a ref found there.
     """
     for stripper in _EXEMPTION_STRIPPERS:
         clause = stripper.sub(_blank, clause)
-    return clause
+    return _blank_mood_scopes(clause)
 
 
 @dataclass(frozen=True, slots=True)
