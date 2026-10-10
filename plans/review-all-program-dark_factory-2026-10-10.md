@@ -328,4 +328,4 @@ dependencies added · notes. The trigger-chain gate id, the superseded chain (no
 
 | Stream | PRD | Tasks | Gate deps added | Notes |
 |---|---|---|---|---|
-| (trigger chain) | — | gate: pending first filing | — | interim form; committed when this table is complete |
+| (trigger chain) | — | human gate **6698** (deferred, planning mode; `metadata.trigger_chain.skill=review-all`, `run_id=review-all-dark_factory-20261008`, milestone delayed 259200 s) | — | interim form (`scripts/check_run_completion.py` absent at as_of); no prior chain to supersede; launched_from none; `commit_planning` on 6698 when this table is complete |
