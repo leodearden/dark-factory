@@ -8,6 +8,7 @@ predicates in ``shared.task_claimant``; this module only fetches rows and counts
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
@@ -87,6 +88,11 @@ class RootInvariants:
     terminal_tier: TerminalTier | None
     hygiene_tier: HygieneTier | None
 
+    def __post_init__(self) -> None:
+        problem = _blind_problem(self) if self.status is ScanStatus.BLIND else _ok_problem(self)
+        if problem is not None:
+            raise ValueError(f'RootInvariants status {self.status.value!r}: {problem}')
+
     def to_wire(self) -> dict[str, Any]:
         return {
             'root': str(self.root),
@@ -98,6 +104,48 @@ class RootInvariants:
             'terminal_tier': None if self.terminal_tier is None else self.terminal_tier.to_wire(),
             'hygiene_tier': None if self.hygiene_tier is None else asdict(self.hygiene_tier),
         }
+
+
+def _blind_problem(record: RootInvariants) -> str | None:
+    if not record.error:
+        return f'error must be a non-empty str, got {record.error!r}'
+    if record.rows_scanned not in (None, 0):
+        return f'rows_scanned must be None or 0, got {record.rows_scanned!r}'
+    if record.terminal_tier is not None:
+        return 'terminal_tier must be None: a blind root makes no count claim'
+    if record.hygiene_tier is not None:
+        return 'hygiene_tier must be None: a blind root makes no count claim'
+    return None
+
+
+def _ok_problem(record: RootInvariants) -> str | None:
+    if record.error is not None:
+        return f'error must be None, got {record.error!r}'
+    if record.rows_scanned is None or record.rows_scanned <= 0:
+        return f'rows_scanned must be > 0, got {record.rows_scanned!r}'
+    if record.terminal_tier is None:
+        return 'terminal_tier must be present'
+    if record.hygiene_tier is None:
+        return 'hygiene_tier must be present'
+    return None
+
+
+def _blind(root: Path, now: datetime, error: str, rows_scanned: int | None = None) -> RootInvariants:
+    return RootInvariants(
+        root=root,
+        status=ScanStatus.BLIND,
+        measured_at=now,
+        rows_scanned=rows_scanned,
+        error=error,
+        terminal_tier=None,
+        hygiene_tier=None,
+    )
+
+
+def _unopened_reason(db_path: Path) -> str:
+    if not db_path.exists():
+        return f'tasks.db not found at {db_path}'
+    return f'tasks.db at {db_path} could not be opened read-only (see dashboard log)'
 
 
 def _as_task(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -143,8 +191,14 @@ async def scan_root_invariants(
     now: datetime,
     ttl: timedelta = DEFAULT_CLAIMANT_HEARTBEAT_TTL,
 ) -> RootInvariants:
-    assert conn is not None
-    rows_scanned, candidates = await _read_tasks(conn)
+    if conn is None:
+        return _blind(root, now, _unopened_reason(db_path))
+    try:
+        rows_scanned, candidates = await _read_tasks(conn)
+    except (sqlite3.Error, OSError) as exc:
+        return _blind(root, now, f'{type(exc).__name__}: {exc}')
+    if rows_scanned == 0:
+        return _blind(root, now, 'scanned 0 rows: nothing scanned is not clean', rows_scanned=0)
     terminal, hygiene = classify_candidates(candidates, now=now, ttl=ttl)
     return RootInvariants(
         root=root,
