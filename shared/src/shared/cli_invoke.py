@@ -2414,10 +2414,9 @@ async def invoke_with_cap_retry(
     "Task 7 [implementer]").
 
     When *cost_store* is provided, invocations are recorded via
-    ``save_invocation()`` only.  Account events (cap_hit / near_cap / resumed)
-    are written once per phase transition by the gate on its own cost store,
-    so a caller gets them by giving the gate the same store
-    (``shared/src/shared/usage_gate.py::UsageGate._transition``).
+    ``save_invocation()`` only.  Account events belong to the gate, which
+    writes them to its own cost store, so give the gate the same store
+    (``shared/src/shared/usage_gate.py::UsageGate._write_cost_event``).
 
     All keyword arguments are forwarded to ``invoke_claude_agent()``.  When a
     custom *invoke_fn* is supplied, it additionally receives *backend*
