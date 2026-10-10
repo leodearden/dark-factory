@@ -268,6 +268,19 @@ def test_overrides_are_read_only(tmp_path: Path):
             None,
             id='module-level-block',
         ),
+        pytest.param(
+            _HEADER + "governed_exceptions ('pkg.space', 'r', [])\n",
+            'pkg.space',
+            None,
+            id='space-before-paren',
+        ),
+        pytest.param(
+            'import shared.governed_exceptions as ge\n'
+            "(ge.governed_exceptions\n)('pkg.paren', 'r', [])\n",
+            'pkg.paren',
+            None,
+            id='parenthesised-callee',
+        ),
     ],
 )
 def test_every_import_time_spelling_is_a_declaration(
@@ -316,20 +329,21 @@ def test_an_untracked_declaration_is_not_read(tmp_path: Path):
     assert discovery.declarations == ()
 
 
-def test_only_files_holding_the_call_text_are_parsed(tmp_path: Path):
-    """The byte prefilter decides what the AST sees, so a tracked file that does
-    not parse but never mentions the call is not this instrument's business."""
+def test_only_files_naming_the_function_are_parsed(tmp_path: Path):
+    """The byte prefilter is the function's NAME, so a tracked file that does not
+    parse but never names it is not this instrument's business."""
     discovery = _discover(
         tmp_path,
         {
             'tests/test_decl.py': _declaring("'pkg.x', 'r', []"),
             'pkg/plain.py': 'x = 1\n',
+            'pkg/mention.py': 'import shared.governed_exceptions as ge\n',
             'pkg/broken.py': 'def broken(:\n',
         },
     )
 
-    assert discovery.files_enumerated == 3
-    assert discovery.files_parsed == 1
+    assert discovery.files_enumerated == 4
+    assert discovery.files_parsed == 2
     assert [declaration.list_id for declaration in discovery.declarations] == ['pkg.x']
 
 
