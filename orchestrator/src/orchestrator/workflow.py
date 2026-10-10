@@ -392,10 +392,10 @@ def _is_gating_escalation(e: Escalation) -> bool:
 
 
 def _format_reescalation_detail(escalations: list[Escalation]) -> str:
-    """Render the payload carried by ``_StewardReescalated`` into a rich
+    """Render the payload carried by a ``_HumanHandoff`` into a rich
     ``_mark_blocked(detail=...)`` string (task 2553).
 
-    Without this, ``run()``'s ``except _StewardReescalated`` clause discarded
+    Without this, ``run()``'s hand-off ``except`` clause discarded
     the exception's ``escalations`` payload and called ``_mark_blocked``
     without ``detail=``, so ``_mark_blocked``'s ``detail = detail or reason``
     fallback made ``TerminalReport.detail`` an exact copy of
@@ -408,10 +408,11 @@ def _format_reescalation_detail(escalations: list[Escalation]) -> str:
     and ``detail`` text. Multiple escalations (a burst may hold more than
     one) are joined with a blank line between them. Returns ``''`` for an
     empty list — defensive; the two raise sites in ``_wait_for_resolution``
-    (born-at-L2 / level>=2, and steward-gave-up level-1) both guarantee a
-    non-empty list, and ``''`` preserves ``_mark_blocked``'s
+    (``_GatedByOpenL2`` and the steward-gave-up ``_StewardReescalated``) both
+    guarantee a non-empty list, and ``''`` preserves ``_mark_blocked``'s
     ``detail or reason`` fallback rather than emitting an empty-but-present
-    detail.
+    detail.  The header is disposition-neutral: the block reason names which
+    hand-off fired, so the detail must not claim a steward acted.
     """
     if not escalations:
         return ''
@@ -430,15 +431,44 @@ def _format_reescalation_detail(escalations: list[Escalation]) -> str:
         lines.append(f'Detail: {e.detail}')
         blocks.append('\n'.join(lines))
 
-    header = f'Steward re-escalated; {len(escalations)} pending escalation(s):'
+    header = f'{len(escalations)} pending escalation(s) awaiting a human:'
     return header + '\n\n' + '\n\n'.join(blocks)
 
 
-class _StewardReescalated(Exception):
-    """Raised when the steward re-escalates to level-1 (consumed by the auto-watcher, which may promote to L2 for a human)."""
+class _HumanHandoff(Exception):
+    """``_wait_for_resolution`` ended with the task's open records in a human's hands.
 
-    def __init__(self, escalations):
+    Each subclass names its own ``block_reason``, so the two catch sites
+    report WHICH hand-off fired rather than one fixed string (PRD
+    ``plans/info-l0-disposition-router-prd.md`` D13, task 5222).
+    """
+
+    def __init__(self, escalations: list[Escalation]):
+        super().__init__(escalations)
         self.escalations = escalations
+
+    @property
+    def block_reason(self) -> str:
+        raise NotImplementedError
+
+
+class _StewardReescalated(_HumanHandoff):
+    """The steward handed off: an open L1 remains once the level-0 wait ends
+    (consumed by the auto-watcher, which may promote to L2 for a human)."""
+
+    @property
+    def block_reason(self) -> str:
+        return 'Steward re-escalated to human'
+
+
+class _GatedByOpenL2(_HumanHandoff):
+    """Stop-the-line: a born-at-L2 severity or a non-info level≥2 record that no
+    steward can resolve, raised before the wait ever awaits."""
+
+    @property
+    def block_reason(self) -> str:
+        ids = ', '.join(e.id for e in self.escalations)
+        return f'Gated by open L2 {ids}; no steward applicable'
 
 if TYPE_CHECKING:
     from escalation.models import Escalation, TrainState
@@ -2792,10 +2822,10 @@ class TaskWorkflow:
                     logger.info(f'Task {self.task_id}: waiting for escalation resolution')
                     try:
                         resolution = await self._wait_for_resolution()
-                    except _StewardReescalated as reesc:
+                    except _HumanHandoff as handoff:
                         return await self._mark_blocked(
-                            'Steward re-escalated to human',
-                            detail=_format_reescalation_detail(reesc.escalations),
+                            handoff.block_reason,
+                            detail=_format_reescalation_detail(handoff.escalations),
                             skip_escalation=True,
                         )
                     # If branch is already on main AND has genuine prior
@@ -3987,7 +4017,7 @@ class TaskWorkflow:
         A deliberate mirror of ``run()``'s ESCALATED branch (workflow.py:
         2636-2647) — ``_enter_phase(ESCALATED)`` →
         :meth:`_ensure_steward_started` → :meth:`_wait_for_resolution` →
-        ``except _StewardReescalated`` → :meth:`_mark_blocked`, plus that
+        ``except _HumanHandoff`` → :meth:`_mark_blocked`, plus that
         branch's steward-terminal-decision guard, which honours a row the
         steward parked while resolving instead of proceeding over it.  The
         guard is not copied but SHARED —
@@ -4074,7 +4104,7 @@ class TaskWorkflow:
         _wait_started = asyncio.get_event_loop().time()
         try:
             await self._wait_for_resolution()
-        except _StewardReescalated as reesc:
+        except _HumanHandoff as handoff:
             # Byte-for-byte the shape at :2643-2647.  merge_phase stays at its
             # default False so the row lands `blocked` at _mark_blocked's ENTRY
             # gate (spec S1).  Post-3537 a merge_phase=True call would also
@@ -4085,8 +4115,8 @@ class TaskWorkflow:
             # queue submission in-place, which is the ONLY thing merge_phase
             # is for.
             return await self._mark_blocked(
-                'Steward re-escalated to human',
-                detail=_format_reescalation_detail(reesc.escalations),
+                handoff.block_reason,
+                detail=_format_reescalation_detail(handoff.escalations),
                 skip_escalation=True,
             )
         waited = asyncio.get_event_loop().time() - _wait_started
@@ -4184,7 +4214,7 @@ class TaskWorkflow:
             # 12623) use.  Unlike the sibling exits, this one reaches
             # _mark_blocked with the steward STILL LIVE — the expiry branch's
             # steward was already stopped by the wait itself, and the
-            # _StewardReescalated branch's L2 is out of the steward's reach —
+            # _GatedByOpenL2 branch's L2 is out of the steward's reach —
             # and _mark_blocked(escalate_to_human=True) fires
             # _spawn_dry_run_unblock, which runs run_dry_run_unblock against
             # self.worktree: the SAME worktree TaskSteward invokes its agent in
@@ -14385,16 +14415,18 @@ class TaskWorkflow:
         escalations are stop-the-line events — they cannot be resolved by
         the auto-watcher/steward and require immediate human intervention.
         Rather than waiting (which would either spin or block forever with
-        no resolver), they immediately raise ``_StewardReescalated`` so
+        no resolver), they immediately raise ``_GatedByOpenL2`` so
         that ``run()`` calls ``_mark_blocked`` and halts.
 
-        Raises ``_StewardReescalated`` if:
-        - A pending escalation with ``severity in BORN_AT_L2_SEVERITIES``
-          or ``level >= 2`` exists — immediate terminal, stop the line (a
-          level ≥ 2 record only when ``escalation.pins`` classifies it a queue
-          handoff, so an info L2 never short-circuits the wait — PRD
-          info-l0-disposition-router D3, task 5222); OR
-        - The steward re-escalated to level-1 (consumed by auto-watcher).
+        Raises a ``_HumanHandoff``:
+        - ``_GatedByOpenL2`` if a pending escalation with ``severity in
+          BORN_AT_L2_SEVERITIES`` or ``level >= 2`` exists — immediate
+          terminal, stop the line, before any await (a level ≥ 2 record only
+          when ``escalation.pins`` classifies it a queue handoff, so an info
+          L2 never short-circuits the wait — PRD info-l0-disposition-router
+          D3, task 5222); OR
+        - ``_StewardReescalated`` if the steward re-escalated to level-1
+          (consumed by auto-watcher).
 
         When no escalation queue is available (e.g. eval mode), returns
         an empty string immediately — the caller treats this as "no
@@ -14500,17 +14532,18 @@ class TaskWorkflow:
         # stop-the-line: no auto-watcher can resolve them, so waiting for the
         # L0 loop to clear makes no sense and risks a busy resume-spin (gate
         # fires → _wait_for_resolution returns '' → resume → gate fires again).
-        # Treat identically to _StewardReescalated so run() calls _mark_blocked
-        # and halts for human intervention rather than looping.  The level≥2
-        # half is narrowed exactly as _is_gating_escalation's disjunct 3 (task
-        # 5222): an info L2 is not a handoff, so it never short-circuits.
-        pending_high_sev = [
+        # Raised as a _HumanHandoff so run() calls _mark_blocked and halts for
+        # human intervention rather than looping; _GatedByOpenL2's reason says
+        # no steward was applicable (D13).  The level≥2 half is narrowed
+        # exactly as _is_gating_escalation's disjunct 3 (task 5222): an info
+        # L2 is not a handoff, so it never short-circuits.
+        pending_l2 = [
             e for e in self.escalation_queue.get_by_task(self.task_id, status='pending')
             if e.severity in BORN_AT_L2_SEVERITIES
             or (e.level >= 2 and is_queue_handoff(e))
         ]
-        if pending_high_sev:
-            raise _StewardReescalated(pending_high_sev)
+        if pending_l2:
+            raise _GatedByOpenL2(pending_l2)
 
         # Wait for level-0 pending escalations to clear, BOUNDED by a derived
         # window (task 3170, fix C + review fix D1).  See the method docstring
