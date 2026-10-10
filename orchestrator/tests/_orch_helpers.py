@@ -17,6 +17,7 @@ import logging
 import os
 import threading
 import time
+import types
 import weakref
 from collections import deque
 from collections.abc import Awaitable, Callable, Sequence
@@ -138,6 +139,25 @@ def wire_scheduler_liveness_mock(scheduler_mock: MagicMock) -> None:
         tid in scheduler_mock._dispatched
         or scheduler_mock.lock_table.is_held(tid)
         or scheduler_mock.workflow_cancel_recent(tid)
+    )
+
+
+def wire_clear_claim_then_set_status(scheduler_mock: MagicMock) -> None:
+    """Bind the REAL ``Scheduler.clear_claim_then_set_status`` onto a MagicMock Scheduler.
+
+    On a bare ``MagicMock()`` the method auto-mocks to a non-awaitable. Binding
+    the real one (rather than a forwarding fake) keeps one definition of the
+    clear-then-flip order, and routes both writes to the mock's own
+    ``set_task_claimant`` / ``set_task_status``, so existing assertions on
+    those still hold. The import is function-local to keep importing this
+    module free of ``orchestrator.scheduler`` (collection cost, not a cycle).
+    """
+    from orchestrator.scheduler import Scheduler
+
+    if not isinstance(scheduler_mock.set_task_claimant, AsyncMock):
+        scheduler_mock.set_task_claimant = AsyncMock()
+    scheduler_mock.clear_claim_then_set_status = types.MethodType(
+        Scheduler.clear_claim_then_set_status, scheduler_mock,
     )
 
 

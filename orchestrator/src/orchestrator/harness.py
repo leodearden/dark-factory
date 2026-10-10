@@ -6902,6 +6902,8 @@ class Harness:
         function owns only the physical side effects: worktree cleanup, a
         defensive plan.lock unlink, and the
         ``_recovered_plans``/``_preserved_worktrees`` retention bookkeeping.
+        Its pending flip clears the dead claimant first, via
+        ``Scheduler.clear_claim_then_set_status``.
         Task 2763 retired the worktree ``plan.lock`` READ that formerly
         re-classified liveness here — moot once the durable lock moved to the
         meta-root (the worktree lock never exists in production) and the DB
@@ -7004,7 +7006,8 @@ class Harness:
         # DB claimant is the primary liveness signal (task 2243). So revert
         # UNCONDITIONALLY — this function owns only the physical side effects:
         # worktree cleanup, a defensive plan.lock unlink, and the
-        # _recovered_plans/_preserved_worktrees retention bookkeeping.
+        # _recovered_plans/_preserved_worktrees retention bookkeeping. The
+        # flip clears the dead claimant first (Scheduler.clear_claim_then_set_status).
         #
         # Guard on branch WIP before reaping: a worktree whose leftover branch
         # still carries commits beyond main is a re-attach-eligible shape, not
@@ -7046,7 +7049,7 @@ class Harness:
         # exist; the suppress + missing_ok keep it a harmless no-op then.
         with contextlib.suppress(OSError):
             lock_path.unlink(missing_ok=True)
-        await self.scheduler.set_task_status(tid, 'pending')
+        await self.scheduler.clear_claim_then_set_status(tid, 'pending')
         logger.info(
             'Reconcile: reverted task %s to pending', tid
         )

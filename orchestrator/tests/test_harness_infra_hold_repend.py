@@ -32,7 +32,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import wire_scheduler_liveness_mock
+from _orch_helpers import wire_clear_claim_then_set_status, wire_scheduler_liveness_mock
 
 from orchestrator.harness import Harness
 
@@ -59,6 +59,7 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     # so every row would read as having a live claimant and every
     # resume flip would be silently skipped. Wire the real accessors.
     wire_scheduler_liveness_mock(h.scheduler)
+    wire_clear_claim_then_set_status(h.scheduler)
     h.scheduler.get_tasks = AsyncMock(return_value=[])
     h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
     h.scheduler.set_task_status = AsyncMock()
