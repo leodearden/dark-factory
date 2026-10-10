@@ -24,6 +24,8 @@ from _seed_script_stubs import (
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.warm_lane_pool import LaneState
 
+FAILING_SEED_SCRIPT = '#!/usr/bin/env bash\nexit 1\n'
+
 
 async def _head(repo: Path) -> str:
     _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
@@ -81,6 +83,7 @@ async def test_seed_failure_cold_fallback_warns_naming_the_lane(
 ) -> None:
     caplog.set_level(logging.DEBUG, logger='orchestrator.git_ops')
     repo = make_seed_test_repo(tmp_path)
+    await commit_seed_script(repo, FAILING_SEED_SCRIPT)
     git_ops = GitOps(warm_pool_git_config(), repo, merge_spec_warm_lane_pool_size=1)
 
     _, warm = await git_ops.acquire_spec_lane(await _head(repo))
@@ -89,9 +92,10 @@ async def test_seed_failure_cold_fallback_warns_naming_the_lane(
     assert git_ops.spec_warm_lane_pool is not None
     lane = git_ops.worktree_base / '_spec-0'
     assert git_ops.spec_warm_lane_pool.state(lane) == LaneState.FREE
-    assert _warnings_naming(caplog, '_spec-0'), (
-        'a seed failure gave back an acquired lane and went cold without a '
-        'WARNING naming the lane'
+    warnings = _warnings_naming(caplog, '_spec-0')
+    assert any('rc=1' in warning for warning in warnings), (
+        'a seed that exited 1 gave back an acquired lane and went cold without '
+        f'a WARNING naming the lane and the exit code: {warnings!r}'
     )
 
 
