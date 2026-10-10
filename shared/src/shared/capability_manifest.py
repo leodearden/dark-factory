@@ -7,7 +7,8 @@ accompanies a PRD's ``.capability-manifest.md`` (see
 (fused-memory, task γ) is the canonical writer of the sidecar's ``task_id``
 field and of a producer task's ``metadata.delivered_checks``; the scheduler
 (orchestrator, task δ) is the canonical reader of ``metadata.delivered_checks``
-at the dispatch gate.
+at the dispatch gate. :func:`sidecar_path` is the one home of the rule that
+derives a PRD's sidecar path from its PRD key.
 
 This module also registers the ``metadata.delivered_checks`` sub-model with
 ``shared.task_metadata``'s W10 extension point
@@ -22,6 +23,7 @@ comment at the bottom of this module).
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Literal, get_args
 
@@ -40,7 +42,18 @@ __all__ = [
     'ManifestTask',
     'load_capability_manifest',
     'parse_capability_manifest',
+    'sidecar_path',
 ]
+
+_SIDECAR_SUFFIX = '.capability-manifest.yaml'
+
+
+def sidecar_path(prd_key: str) -> str:
+    """The one PRD key → sidecar path rule, for the commit_planning stamper and the dashboard.
+
+    ``plans/x-prd.md`` → ``plans/x-prd.capability-manifest.yaml``.
+    """
+    return re.sub(r'\.md$', '', prd_key) + _SIDECAR_SUFFIX
 
 
 def _check_kind_conditional_fields(
