@@ -7006,8 +7006,7 @@ class Harness:
         # DB claimant is the primary liveness signal (task 2243). So revert
         # UNCONDITIONALLY — this function owns only the physical side effects:
         # worktree cleanup, a defensive plan.lock unlink, and the
-        # _recovered_plans/_preserved_worktrees retention bookkeeping. The
-        # flip clears the dead claimant first (Scheduler.clear_claim_then_set_status).
+        # _recovered_plans/_preserved_worktrees retention bookkeeping.
         #
         # Guard on branch WIP before reaping: a worktree whose leftover branch
         # still carries commits beyond main is a re-attach-eligible shape, not

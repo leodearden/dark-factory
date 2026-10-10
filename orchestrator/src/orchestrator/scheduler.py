@@ -3344,27 +3344,12 @@ class Scheduler:
     async def clear_claim_then_set_status(self, task_id: str, status: str) -> None:
         """Clear a DEAD claimant, then write ``status``.
 
-        Precondition: the caller has already established that the row's
-        claimant is not live. Calling this on a live claim un-claims a running
-        workflow (the task-2588 class).
-
-        The clear comes first for two reasons:
-
-        1. An orchestrator that dispatches into the task the moment it leaves
-           its current status can never have its fresh stamp clobbered by a
-           late-landing clear.
-        2. A fault between the two writes leaves (old status, NULL claimant),
-           which every liveness predicate reads as stranded, so the next sweep
-           retries. It never leaves (new status, stale claimant).
-
-        This is the crash backstop INV-6 sanctions. INV-6's successor-status-
-        first clause governs exits from a claim that is still held. The clear
-        is best-effort (:meth:`set_task_claimant` swallows its errors) and
-        never blocks the flip. The flip keeps :meth:`set_task_status`'s
-        raise-on-rejection contract. The slot-release clear in
-        ``orchestrator/src/orchestrator/harness.py::Harness._run_slot`` keeps
-        the same order: claimant cleared before the task becomes dispatchable.
-        Rationale: docs/prds/claimant-invariant-enforcement.md (D2, δ, B11/B12).
+        Precondition: the caller has established that the claimant is not
+        live; on a live claim this un-claims a running workflow (task 2588).
+        The clear is best-effort and never blocks the write, which raises on
+        rejection exactly as :meth:`set_task_status` does. Why the clear comes
+        first: docs/prds/claimant-invariant-enforcement.md, D2 and the G7
+        walk's ``status-matches-liveness`` entry.
         """
         await self.set_task_claimant(task_id, claimant_run_id=None, heartbeat_at=None)
         await self.set_task_status(task_id, status)
