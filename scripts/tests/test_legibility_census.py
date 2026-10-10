@@ -5916,7 +5916,7 @@ def test_own_endpoint_grant_does_not_outlive_its_block(monkeypatch):
 # task 6619: once main() has loaded its config it knows where to escalate, so
 # EVERY later failure -- not only a run_census crash -- files exactly one
 # escalation. Each case below returns (argv, project_id the escalation must
-# name, a marker of the cause).
+# name, the "<exception type>: <message>" its summary must carry).
 # ---------------------------------------------------------------------------
 
 def _raiser(exc):
@@ -5932,7 +5932,10 @@ def _codebook_yaml_case(tmp_path, monkeypatch):
         "entries: [unclosed\n", encoding="utf-8",
     )
     _commit_all(tmp_path)
-    return ["--project-root", str(tmp_path)], "dark_factory", "while parsing a flow sequence"
+    return (
+        ["--project-root", str(tmp_path)], "dark_factory",
+        "ParserError: while parsing a flow sequence",
+    )
 
 
 def _run_identity_case(tmp_path, monkeypatch):
@@ -5941,7 +5944,10 @@ def _run_identity_case(tmp_path, monkeypatch):
         census_identity, "allocate_run_identity",
         _raiser(RuntimeError("no free run identity marker-6619")),
     )
-    return ["--project-root", str(tmp_path)], "dark_factory", "no free run identity marker-6619"
+    return (
+        ["--project-root", str(tmp_path)], "dark_factory",
+        "RuntimeError: no free run identity marker-6619",
+    )
 
 
 def _runner_open_case(tmp_path, monkeypatch):
@@ -5950,7 +5956,10 @@ def _runner_open_case(tmp_path, monkeypatch):
         session_runner, "open_pooled_runner",
         _raiser(RuntimeError("pool empty at open marker-6619")),
     )
-    return ["--project-root", str(tmp_path)], "dark_factory", "pool empty at open marker-6619"
+    return (
+        ["--project-root", str(tmp_path)], "dark_factory",
+        "RuntimeError: pool empty at open marker-6619",
+    )
 
 
 def _window_source_case(tmp_path, monkeypatch):
@@ -5959,19 +5968,28 @@ def _window_source_case(tmp_path, monkeypatch):
         census_window, "WindowBatchSource",
         _raiser(RuntimeError("window source refused marker-6619")),
     )
-    return ["--project-root", str(tmp_path)], "dark_factory", "window source refused marker-6619"
+    return (
+        ["--project-root", str(tmp_path)], "dark_factory",
+        "RuntimeError: window source refused marker-6619",
+    )
 
 
 def _as_of_sha_case(tmp_path, monkeypatch):
     _write_legibility_yaml(tmp_path)
-    return ["--project-root", str(tmp_path)], "dark_factory", "as_of_sha"
+    return (
+        ["--project-root", str(tmp_path)], "dark_factory",
+        "CensusPreconditionFailed: cannot resolve as_of_sha",
+    )
 
 
 def _harness_config_case(tmp_path, monkeypatch):
     _census_project(tmp_path)
     missing = tmp_path / "missing" / "legibility.yaml"
     argv = ["--project-root", str(tmp_path), "--harness-config", str(missing)]
-    return argv, "dark_factory", str(missing)
+    return (
+        argv, "dark_factory",
+        f"CensusPreconditionFailed: failed to load harness config at {missing}",
+    )
 
 
 def _identity_mismatch_case(tmp_path, monkeypatch):
@@ -5979,7 +5997,10 @@ def _identity_mismatch_case(tmp_path, monkeypatch):
     project_a.mkdir()
     config_b = _write_legibility_yaml(tmp_path / "project_b", project_id="project_b")
     argv = ["--project-root", str(project_a), "--config", str(config_b)]
-    return argv, "project_b", "mixed-project"
+    return (
+        argv, "project_b",
+        f"CensusPreconditionFailed: --project-root {project_a.resolve()} disagrees",
+    )
 
 
 @pytest.mark.parametrize(
@@ -5996,7 +6017,7 @@ def _identity_mismatch_case(tmp_path, monkeypatch):
 def test_main_escalates_once_for_every_failure_after_config_load(
     setup, tmp_path, monkeypatch, caplog,
 ):
-    argv, project_id, marker = setup(tmp_path, monkeypatch)
+    argv, project_id, cause = setup(tmp_path, monkeypatch)
     monkeypatch.setattr(mod, "run_census", _poison("run_census"))
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
     recorder = _make_transport_recorder()
@@ -6013,10 +6034,13 @@ def test_main_escalates_once_for_every_failure_after_config_load(
     assert arguments["task_id"] == f"legibility-census-{project_id}"
     assert arguments["agent_role"] == "legibility-census"
     assert arguments["category"] == "infra_issue"
-    assert project_id in arguments["summary"]
-    assert marker in arguments["detail"]
+    assert arguments["summary"].startswith(
+        f"legibility census run failed ({project_id}): {cause}"
+    )
+    assert "Traceback" in arguments["detail"]
+    assert cause in arguments["detail"]
     assert any(
-        record.levelno == logging.ERROR and marker in record.getMessage()
+        record.levelno == logging.ERROR and arguments["summary"] in record.getMessage()
         for record in caplog.records
     ), "the cause must reach the journal independently of the POST"
 

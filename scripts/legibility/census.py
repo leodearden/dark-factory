@@ -4030,10 +4030,10 @@ def main(argv: list[str] | None = None) -> int:
         return _census_failed(cfg, escalate_fn, exc)
 
 
-def _census_failed(cfg, escalate_fn, exc: BaseException) -> int:
+def _census_failed(cfg: config.LegibilityConfig, escalate_fn, exc: Exception) -> int:
     """Report a census that failed after its config loaded -- stderr, then the
     journal, then one best-effort escalation -- and return the exit code."""
-    summary = f"legibility census run failed ({cfg.project_id}): {exc}"
+    summary = f"legibility census run failed ({cfg.project_id}): {type(exc).__name__}: {exc}"
     detail = "".join(traceback.format_exception(exc))
     print(f"census: FAILED -- {exc}", file=sys.stderr)
     logger.error("%s -- %s", summary, detail)
@@ -4042,7 +4042,8 @@ def _census_failed(cfg, escalate_fn, exc: BaseException) -> int:
 
 
 def _run_configured_census(
-    args: argparse.Namespace, *, project_root: Path, cfg, config_path: Path, escalate_fn,
+    args: argparse.Namespace, *, project_root: Path, cfg: config.LegibilityConfig,
+    config_path: Path, escalate_fn,
 ) -> int:
     """:func:`main`'s run once *cfg* has loaded. Raises on every failure but an
     ``"unlanded"`` outcome, which ``run_census`` has already escalated."""
