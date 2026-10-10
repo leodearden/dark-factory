@@ -102,6 +102,9 @@ _EPISTEMIC_SOURCE: Mapping[MergeState, MergeStatusSource] = types.MappingProxyTy
 
 _ANSWER_OWNED_KEYS = frozenset({'state', 'request_id', 'generation', 'source', 'hint', 'last_outcome'})
 
+#: Every answer's ``generation`` until request generations exist (PRD P4).
+_RENDERED_GENERATION = 1
+
 
 @dataclass(frozen=True)
 class LastOutcome:
@@ -157,7 +160,12 @@ class MergeStatusAnswer:
         extras = dict(fields)
         state = extras.pop('state')
         request_id = extras.pop('request_id', None)
-        extras.pop('generation', None)
+        generation = extras.pop('generation', _RENDERED_GENERATION)
+        if generation != _RENDERED_GENERATION:
+            raise ValueError(
+                f'merge_status renders generation {_RENDERED_GENERATION} only; '
+                f'a {source.value!r} tier reported generation {generation!r}'
+            )
         return cls(
             state=state, source=source, request_id=request_id, reason=None,
             fields=types.MappingProxyType(extras),
@@ -226,7 +234,7 @@ class MergeStatusAnswer:
         response: dict[str, Any] = {
             'state': self.state,
             'request_id': self.request_id,
-            'generation': 1,
+            'generation': _RENDERED_GENERATION,
             'source': self.source.value,
             **self.fields,
         }

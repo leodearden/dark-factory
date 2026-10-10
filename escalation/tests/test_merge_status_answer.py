@@ -124,7 +124,7 @@ class TestOutcomeAnswers:
         assert response['reason'] == 'wip present on main checkout'
         assert 'hint' not in response
 
-    def test_a_wrapped_tier_dict_keeps_its_own_generation(self) -> None:
+    def test_a_wrapped_tier_dict_at_the_rendered_generation_is_accepted(self) -> None:
         response = MergeStatusAnswer.outcome(
             source=MergeStatusSource.git,
             fields={
@@ -137,6 +137,17 @@ class TestOutcomeAnswers:
         assert response['generation'] == 1
         assert response['kind'] == 'found_on_main'
         assert response['merge_sha'] == 'c' * 40
+
+    def test_a_wrapped_tier_dict_at_another_generation_is_refused(self) -> None:
+        with pytest.raises(ValueError, match='generation'):
+            MergeStatusAnswer.outcome(
+                source=MergeStatusSource.git,
+                fields={
+                    'state': MergeState.done, 'request_id': None, 'generation': 2,
+                    'kind': 'found_on_main', 'merge_sha': 'c' * 40,
+                    'outcome': 'found_on_main',
+                },
+            )
 
     @pytest.mark.parametrize('source', _HISTORICAL)
     def test_an_outcome_state_from_history_violates_i1(
