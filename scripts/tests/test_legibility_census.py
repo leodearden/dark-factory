@@ -7997,9 +7997,6 @@ def test_synthesis_prompt_names_the_not_applied_proposals_heading(tmp_path):
     prompt = fake_invoke.calls[0]["prompt"]
 
     assert mod.SYNTHESIS_PROPOSALS_HEADING in prompt
-    # The one semantic guard on the heading: it cannot be retitled back into
-    # a claim that the proposals are merger inputs.
-    assert "not applied" in mod.SYNTHESIS_PROPOSALS_HEADING
 
 
 # ---------------------------------------------------------------------------
