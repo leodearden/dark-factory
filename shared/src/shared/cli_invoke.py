@@ -2413,8 +2413,11 @@ async def invoke_with_cap_retry(
     *label* identifies the caller in log messages (e.g. "Module tagging",
     "Task 7 [implementer]").
 
-    When *cost_store* is provided, successful invocations are recorded via
-    ``save_invocation()`` and cap-hit events via ``save_account_event()``.
+    When *cost_store* is provided, invocations are recorded via
+    ``save_invocation()`` only.  Account events (cap_hit / near_cap / resumed)
+    are written once per phase transition by the gate on its own cost store,
+    so a caller gets them by giving the gate the same store
+    (``shared/src/shared/usage_gate.py::UsageGate._transition``).
 
     All keyword arguments are forwarded to ``invoke_claude_agent()``.  When a
     custom *invoke_fn* is supplied, it additionally receives *backend*
@@ -2819,18 +2822,6 @@ async def invoke_with_cap_retry(
                     )
 
                     acct_name = usage_gate.active_account_name
-                    if cost_store:
-                        try:
-                            await cost_store.save_account_event(
-                                account_name=account_name,
-                                event_type='cap_hit',
-                                project_id=project_id or None,
-                                run_id=run_id or None,
-                                details=label,
-                                created_at=datetime.now(UTC).isoformat(),
-                            )
-                        except Exception:
-                            logger.warning('Failed to save cap_hit event', exc_info=True)
 
                     # ------------------------------------------------------------------
                     # MEASURED 2026-08-01 (task 3454, claude CLI 2.1.220), and
