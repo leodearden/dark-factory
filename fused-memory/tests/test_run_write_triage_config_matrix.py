@@ -609,14 +609,16 @@ def _write_rows(path: Path, rows: list[dict[str, Any]]) -> None:
     path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
 
 
-def _publish(root: Path, cases_by_arm: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+def _publish(
+    root: Path, cases_by_arm: dict[str, list[dict[str, Any]]], snapshot: str = SNAPSHOT,
+) -> dict[str, Any]:
     """Write each arm's rows under *root* and return a population doc that pins their digests."""
     arms = []
     for provenance in THREE_ARMS:
         path = root / provenance['cases_path']
         _write_rows(path, cases_by_arm[provenance['arm']])
         arms.append(dict(provenance, cases_sha256=_sha256(path)))
-    return _population(arms, 4)
+    return _population(arms, 4, snapshot=snapshot)
 
 
 def _read(doc: dict[str, Any], root: Path) -> dict[str, list[dict[str, Any]]]:
@@ -843,13 +845,17 @@ CLI_BOUNDS = [('quality.unrated_pairs', '<=', '0'), ('population.n_judge_band', 
 
 @pytest.fixture
 def cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
-    """A fake checkout holding π's arm files, the two committed inputs and an out dir.
+    """A fake checkout holding π2's arm files and snapshot, the two committed inputs and an out dir.
 
     The fused-memory config it points CONFIG_PATH at ships gpt-4o-mini@5.
     """
     (tmp_path / '.git').mkdir()
-    cases = _three_arm_cases()
-    doc = _publish(tmp_path, cases)
+    snapshot = _write_snapshot(tmp_path)
+    cases = {
+        arm: [dict(row, snapshot_sha256=snapshot) for row in rows]
+        for arm, rows in _three_arm_cases().items()
+    }
+    doc = _publish(tmp_path, cases, snapshot=snapshot)
     population = tmp_path / 'population.json'
     population.write_text(json.dumps(doc, indent=2))
     verdicts = tmp_path / 'verdicts.jsonl'
@@ -887,6 +893,7 @@ def test_main_writes_both_artifacts(
     expected = _mod().build_matrix(
         _mod().Population.from_artifact(cli.doc), cli.cases, VERDICTS,
         shipped=_shipped(), bounds=[_bound(*bound) for bound in CLI_BOUNDS],
+        created_at=CREATED_AT,
     )
     matrix = json.loads((cli.out / MATRIX_NAME).read_text())
     assert matrix == expected | {'inputs': {
@@ -897,6 +904,8 @@ def test_main_writes_both_artifacts(
     }}
     best = json.loads((cli.out / BEST_NAME).read_text())
     assert best == _mod().best_config(expected)
+    assert all(isinstance(row['comparative'], dict) for row in _scored_rows(matrix))
+    assert isinstance(best['comparative'], dict)
 
     summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert summary['winner'] == expected['winner']
@@ -936,6 +945,24 @@ def test_main_refuses_a_drifted_arm_file_and_writes_nothing(
     err = capsys.readouterr().err
     assert SOL in err and 'sha256' in err
     assert _written(cli) == []
+
+
+def test_main_refuses_a_snapshot_the_population_does_not_pin_and_writes_nothing(
+    cli: types.SimpleNamespace, capsys: pytest.CaptureFixture[str],
+) -> None:
+    pinned = cli.doc['population']['snapshot_sha256']
+    other = _write_snapshot(cli.root, {**_snapshot_doc(), 'targets': {'t9': {'content': 'x'}}})
+
+    assert _main(cli) == 1
+
+    err = capsys.readouterr().err
+    assert pinned in err and other in err, err
+    assert _written(cli) == []
+
+
+def test_the_default_population_is_the_write_time_artifact() -> None:
+    args = _mod()._build_parser().parse_args(['--data-root', '.', '--require', 'a', '<=', '1'])
+    assert args.population == CALIBRATION / 'write_triage_population_write_time.json'
 
 
 def test_main_requires_at_least_one_bound(cli: types.SimpleNamespace) -> None:
@@ -996,11 +1023,24 @@ def _line_prefix_sha256s(path: Path) -> set[str]:
     return prefixes
 
 
+WRITE_TIME_POPULATION = 'write_triage_population_write_time.json'
+GAMMA3_PATHS = (
+    'comparative.wrong_sibling_rate_placeable',
+    'comparative.harm_delta_vs_status_quo',
+    'quality.contradiction_recall',
+    'selection.p95_judge_seconds',
+    'selection.cost_per_write_usd',
+    'quality.unrated_pairs',
+    'population.n_judge_band',
+)
+"""The key paths Γ3 reads (contract C2‴, PRD §12.3); their thresholds live in task 5808's args."""
+
+
 def test_committed_best_config_is_the_committed_matrix_winner() -> None:
     mod = _mod()
     matrix = _committed(MATRIX_NAME)
     best = _committed(BEST_NAME)
-    published = _committed('write_triage_population.json')
+    published = _committed(WRITE_TIME_POPULATION)
     scored = _scored_rows(matrix)
 
     assert [row['arm'] for row in scored] == [arm['arm'] for arm in published['arms']]
@@ -1009,12 +1049,9 @@ def test_committed_best_config_is_the_committed_matrix_winner() -> None:
     for row, provenance in zip(scored, published['arms'], strict=True):
         settings = mod.ArmSettings.from_provenance(provenance).selection_keys()
         assert {key: row['selection'][key] for key in settings} == settings
-    assert matrix['population'] == {
-        key: published['population'][key] for key in mod.POPULATION_KEYS
-    }
-    assert matrix['inputs']['population_sha256'] == _sha256(
-        CALIBRATION / 'write_triage_population.json',
-    )
+    assert matrix['population'] == _c2_block(published)
+    assert matrix['inputs']['population_path'] == f'fused-memory/calibration/{WRITE_TIME_POPULATION}'
+    assert matrix['inputs']['population_sha256'] == _sha256(CALIBRATION / WRITE_TIME_POPULATION)
     assert matrix['inputs']['verdicts_sha256'] in _line_prefix_sha256s(
         CALIBRATION / 'write_triage_pair_verdicts.jsonl',
     )
@@ -1035,5 +1072,34 @@ def test_committed_best_config_is_the_committed_matrix_winner() -> None:
 
     assert best == mod.best_config(matrix)
     assert best['quality']['unrated_pairs'] == 0
-    assert best['population']['n_judge_band'] >= 300
+    assert best['population']['n_judge_band'] == published['population']['n_judge_band_write_time']
     assert 'false_contested_rate' in best['quality']
+
+
+def test_committed_best_config_answers_every_path_gamma3_reads() -> None:
+    gate = _mod_gate()
+    best = _committed(BEST_NAME)
+
+    for path in GAMMA3_PATHS:
+        actual = gate.resolve(best, path)
+        assert gate.numeric_reason(actual) is None, (path, actual)
+
+
+def test_committed_matrix_was_run_with_both_comparative_bounds() -> None:
+    paths = {bound['path'] for bound in _committed(MATRIX_NAME)['selection_rule']['bounds']}
+    assert {
+        'comparative.wrong_sibling_rate_placeable', 'comparative.harm_delta_vs_status_quo',
+    } <= paths
+
+
+def test_committed_comparative_harm_follows_from_its_own_table_and_weights() -> None:
+    for row in _scored_rows(_committed(MATRIX_NAME)):
+        comparative = row['comparative']
+        weights = comparative['harm_weights']
+        totals = comparative['harm_total']
+        for regime, table in comparative['outcomes'].items():
+            expected = round(sum(weight * table[cell] for cell, weight in weights.items()), 4)
+            assert totals[regime] == expected, (row['arm'], regime)
+        assert comparative['harm_delta_vs_status_quo'] == pytest.approx(
+            totals['arm'] - totals['status_quo'], abs=1e-4,
+        ), row['arm']
