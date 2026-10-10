@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ from fused_memory.middleware.recurrence_mint import (
     RECURRENCE_MINT_SOURCE,
     MintOutcomeKind,
     mint_successor,
+    run_remint_sweep_loop,
 )
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.models.reconciliation import EventType
@@ -762,3 +764,98 @@ async def test_sweep_journals_the_repair_as_a_task_created_event(
     assert created[0].payload['minted_from'] == pid
     assert created[0].payload['source'] == 'recurrence-mint'
     assert created[0].payload['trigger'] == 'remint_sweep'
+
+
+
+# ── Re-mint sweep loop: startup sweep, then every interval ──
+
+
+class _RecordingRemint:
+    """Stands in for the interceptor's sweep: records each root it is handed."""
+
+    def __init__(
+        self, *, roots: Sequence[str], sweeps: int, failing_root: str | None = None,
+    ) -> None:
+        self.seen: list[str] = []
+        self.swept_enough = asyncio.Event()
+        self._roots = roots
+        self._sweeps = sweeps
+        self._failing_root = failing_root
+
+    async def __call__(self, root: str) -> None:
+        self.seen.append(root)
+        if all(self.seen.count(r) >= self._sweeps for r in self._roots):
+            self.swept_enough.set()
+        if root == self._failing_root:
+            raise RuntimeError('boom')
+
+
+def _real_roots(tmp_path: Path) -> tuple[str, str]:
+    a, b = tmp_path / 'a', tmp_path / 'b'
+    a.mkdir()
+    b.mkdir()
+    return str(a), str(b)
+
+
+async def _run_loop_until_swept(
+    remint: _RecordingRemint, project_roots: Sequence[str], *, interval_secs: float,
+) -> None:
+    loop = asyncio.create_task(
+        run_remint_sweep_loop(remint, project_roots, interval_secs=interval_secs),
+    )
+    # noqa: wall-clock-deadline — wait_responsive is importable only under orchestrator/tests
+    await asyncio.wait_for(remint.swept_enough.wait(), timeout=5)
+    loop.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await loop
+
+
+@pytest.mark.asyncio
+async def test_loop_sweeps_every_root_at_startup_before_its_first_sleep(tmp_path):
+    a, b = _real_roots(tmp_path)
+    remint = _RecordingRemint(roots=[a, b], sweeps=1)
+
+    await _run_loop_until_swept(remint, [a, b], interval_secs=3600)
+
+    assert remint.seen == [a, b]
+
+
+@pytest.mark.asyncio
+async def test_loop_sweeps_again_every_interval(tmp_path):
+    a, b = _real_roots(tmp_path)
+    remint = _RecordingRemint(roots=[a, b], sweeps=2)
+
+    await _run_loop_until_swept(remint, [a, b], interval_secs=0.01)
+
+    assert remint.seen[:4] == [a, b, a, b]
+
+
+@pytest.mark.asyncio
+async def test_one_roots_failure_does_not_stop_the_sweep(tmp_path, caplog):
+    a, b = _real_roots(tmp_path)
+    remint = _RecordingRemint(roots=[a, b], sweeps=2, failing_root=a)
+
+    with caplog.at_level(logging.ERROR, logger=MINT_LOGGER):
+        await _run_loop_until_swept(remint, [a, b], interval_secs=0.01)
+
+    assert remint.seen[:4] == [a, b, a, b]
+    failures = [
+        r for r in caplog.records
+        if r.levelno == logging.ERROR
+        and r.getMessage().startswith('recurrence_remint_sweep_failed:')
+    ]
+    assert failures, [r.getMessage() for r in caplog.records]
+    assert a in failures[0].getMessage()
+    assert failures[0].exc_info is not None
+
+
+@pytest.mark.asyncio
+async def test_loop_never_sweeps_a_phantom_root(tmp_path):
+    a, b = _real_roots(tmp_path)
+    gone = tmp_path / 'gone'
+    remint = _RecordingRemint(roots=[a, b], sweeps=2)
+
+    await _run_loop_until_swept(remint, [a, str(gone), b], interval_secs=0.01)
+
+    assert str(gone) not in remint.seen
+    assert not gone.exists()
