@@ -68,6 +68,18 @@ class TestReadWorkingTreeState:
         assert state.untracked == ('notes dir/a b.py', 'scripts/bad.py')
         assert state.uncommitted == ('gone.py', 'keep.py', 'staged.py')
 
+    async def test_index_removed_path_is_uncommitted_not_untracked(
+        self, tmp_path: Path,
+    ) -> None:
+        repo = seed_repo(tmp_path / 'repo', _MIXED_SEED)
+        _git(repo, 'rm', '--cached', '-q', 'keep.py')
+
+        state = await read_working_tree_state(repo)
+
+        assert state is not None
+        assert state.untracked == ()
+        assert state.uncommitted == ('keep.py',)
+
     async def test_non_repo_directory_returns_none(self, tmp_path: Path) -> None:
         plain = tmp_path / 'plain'
         plain.mkdir()
