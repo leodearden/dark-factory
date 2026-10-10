@@ -356,7 +356,13 @@ file, which is how this paragraph went stale before.
 Operationally that is what makes a drain self-sufficient: you can rebuild the already-promoted
 set as {`root_cause` of the pending L2s} ∪ {their `member_ids`} from the drain ALONE, so a
 rotation that inherits no session memory does not re-promote a cluster its predecessor already
-promoted. `member_ids` is the projection of the record's `members` list; the raw `members` key
+promoted. The server matches `root_cause` on its canonical form
+(`escalation.canonical.canonical_root_cause` — the single site of that transform; do not
+re-describe or reimplement it here), not on raw string equality. Compare in the same form: a raw
+string comparison of the rebuilt set is strictly more conservative than the server, so a
+near-duplicate `root_cause` you fail to recognise gets re-promoted and comes back as
+`status: 'updated'` (folded into the existing L2, no duplicate created). The server is the
+authority; treat that `updated` as a harmless no-op, not a surprise. `member_ids` is the projection of the record's `members` list; the raw `members` key
 stays dropped, as does `detail` — the unbounded free-text field compact mode exists to keep out
 of your context.
 
