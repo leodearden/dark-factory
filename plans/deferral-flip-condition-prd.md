@@ -137,11 +137,12 @@ Leo confirmed D-e on 2026-10-08 with one change: no notice of any kind while the
 ### 1. One record, one home
 
 `metadata.deferral` is the only home of "why is this deferred, and what ends it" (INV-9). It
-is a typed sub-model defined in a new module, `shared/src/shared/task_deferral.py`. That
-module registers it with `register_metadata_submodel('deferral', …, cardinality='dict')`,
-the way `shared/src/shared/deploy_state.py` and `capability_manifest.py` register their own
-keys. A discriminated union needs a `RootModel` wrapper, because the registry takes a
-`BaseModel`. The module owns:
+is a typed sub-model defined in a new module, `shared/src/shared/task_deferral.py`.
+`shared/src/shared/task_metadata.py` imports `DeferralRecord` from that module and registers
+it with `register_metadata_submodel('deferral', DeferralRecord, cardinality='dict')`, beside
+`milestone`, `routing`, `merge_retry_pending` and `recurrence`, so `task_deferral` does not
+import `task_metadata`. A discriminated union needs a `RootModel` wrapper, because the
+registry takes a `BaseModel`. The module owns:
 - the kind vocabulary (`DeferralKind`);
 - the caller-input and stored models;
 - the pure predicates every consumer uses: `lapse_cause`, `needs_human`.
@@ -650,11 +651,9 @@ The predicates take liveness and times as arguments and do no I/O (heuristic 7).
 registry entry is the **stored** `Deferral` shape (wrapped in a `RootModel`), not the request.
 `deferral` must be a known key in every process that parses metadata, not only in the four
 consumers that import `task_deferral`. Otherwise `parse_metadata` reports `unknown_key` on
-every deferred row in any other process. So `task_deferral.py` calls
-`register_metadata_submodel('deferral', …)` at module level, and
-`shared/src/shared/task_metadata.py` loads it with one bare side-effect import
-(`import shared.task_deferral`) as its last statement, after the registry is defined. Never a
-`from … import`: that would fail on a partially initialised module.
+every deferred row in any other process. So `shared/src/shared/task_metadata.py` imports
+`DeferralRecord` from `task_deferral` and registers it beside `milestone`, `routing`,
+`merge_retry_pending` and `recurrence`, which needs no import cycle and no suppression.
 
 ### 5.2 `shared/src/shared/process_identity.py`
 
