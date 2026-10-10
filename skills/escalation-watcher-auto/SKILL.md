@@ -147,7 +147,12 @@ result = mcp__escalation__promote_to_l2(
 #          'severity': <what was actually filed>}
 #   or, for an eval-lane task_id or any eval-lane member, the refusal
 #          {'error': ..., 'code': 'eval_lane_contained'}  (nothing minted)
+#   or, with severity omitted over a cluster whose members are ALL info, the refusal
+#          {'status': 'refused', 'code': 'info_only_cluster', 'members': [...],
+#           'derived_severity': 'info'}  (nothing minted, nothing folded into an existing L2)
 ```
+
+An `info_only_cluster` refusal is handled by the [info-only cluster rung](#info-only-cluster-info_only_cluster) below.
 
 An `eval_lane_contained` refusal is final for the eval-lane records it names: close them instead, per [Eval-lane records](#eval-lane-records-any-category--close-never-promote), and re-promote any production members without them.
 
@@ -155,9 +160,13 @@ An `eval_lane_contained` refusal is final for the eval-lane records it names: cl
 
 1. **Omit `severity` and the L2 inherits the highest severity among its
    members.** This is what you want in the overwhelming majority of cases —
-   an L2 clustering purely-informational L1s is itself informational, and
-   filing it as `blocking` puts a human in the loop for something no member
-   claimed was blocking.
+   filing a cluster as `blocking` when no member claimed it was blocking puts
+   a human in the loop for nothing. One exception, server-enforced (PRD
+   `plans/info-l0-disposition-router-prd.md` D4): omitting `severity` over a
+   cluster whose members are ALL `info` is **refused** with
+   `code: 'info_only_cluster'` — nothing is minted, and nothing is folded into
+   an already-pending L2 under the same `root_cause` either. See the
+   [info-only cluster rung](#info-only-cluster-info_only_cluster).
 
 2. **Pass it EXPLICITLY and UPWARD when your RCA concluded the cluster is
    collectively worse than any individual member** — a set of individually
@@ -174,6 +183,35 @@ An `eval_lane_contained` refusal is final for the eval-lane records it names: cl
 4. **The response carries `severity`** — report the value actually filed in the
    rotation digest, not the one you asked for. On an `'updated'` result it is
    the post-floor value, which may be higher than your argument.
+
+### Info-only cluster (`info_only_cluster`)
+
+A refusal with `code: 'info_only_cluster'` means every member you named is
+informational, so the cluster does not belong in the human queue. Take exactly
+one of two paths:
+
+1. **Close the members at L1 with a digest** — the default. For each member:
+
+   ```
+   mcp__escalation__resolve_issue(
+     escalation_id="<member esc_id>",
+     resolution="info-only cluster: <member summary, quoted> — informational, no human decision needed. Closed at L1.",
+     action='close_only',
+     resolved_by="escalation-watcher-auto",
+     resolution_class="benign"
+   )
+   ```
+
+   and one digest line per member under
+   `### Auto-closed L1 (info-only cluster)`:
+   `AUTO-CLOSED (L1 <esc_id>): info-only-cluster — <task_id> — <member summary> [benign]`
+
+2. **Re-issue the promote with an explicit severity** (`'blocking'` or
+   higher) if your RCA judges the cluster collectively blocking — the escape
+   hatch in item 2 above — and say why in `evidence`.
+
+**Never re-issue with an explicit `severity='info'` to get past the refusal**:
+that mints exactly the info L2 the refusal keeps out of the human queue.
 
 ### Case A — single judgement-class item (1-member L2)
 
@@ -942,7 +980,7 @@ mcp__escalation__promote_to_l2(
   options=["A: restart the affected service", "B: investigate logs/connectivity", "C: pause orchestration until resolved", "D: something else"],
   summary="Infrastructure issue: " + <summary>,
   category="infra_issue",
-  # severity omitted — inherited from the clustered members.
+  # severity omitted — inherited from the clustered members (an all-info cluster is refused — see the info-only rung).
 )
 ```
 
@@ -1001,7 +1039,7 @@ mcp__escalation__promote_to_l2(
   ],
   summary=<escalation summary>,
   category="risk_identified",
-  # severity omitted — inherited from the members, as in `infra_issue` above.
+  # severity omitted — inherited from the members, as in `infra_issue` above (an all-info cluster is refused — see the info-only rung).
 )
 ```
 
@@ -1137,6 +1175,9 @@ Mode: <"L2-promotion (promote_to_l2 available)" | "LEGACY (promote_to_l2 not ava
 
 ### Auto-closed L1 (eval-lane contained)
 - AUTO-CLOSED (L1 esc-df_task_2430_adv_plan-7): eval-lane-contained — df_task_2430_adv_plan — eval fixture artifact, measurement scored from cell result artifacts [benign]
+
+### Auto-closed L1 (info-only cluster)
+- AUTO-CLOSED (L1 esc-…): info-only-cluster — <task_id> — <member summary> [benign]
 
 ### Auto-closed L2 (narrow carve-out)
 - AUTO-CLOSED (L2 esc-main-sweep-abc123def456-1): superseded_main_sweep — main-sweep-abc123def456 — newer sweep esc-main-sweep-9f8e7d6c5b4a; swept SHA abc123def456 is-ancestor of clean tip [benign]
