@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from escalation.queue import EscalationQueue
 from shared.task_claimant import is_stranded
 
 from orchestrator.config import OrchestratorConfig
@@ -145,11 +146,6 @@ async def test_rejected_flip_leaves_cleared_row_never_pending_with_stale_claiman
     assert is_stranded(row, datetime.now(UTC), timedelta(seconds=300))
 
 
-class _NoOpenEscalations:
-    def get_by_task(self, task_id: str, status: str | None = None) -> list:
-        return []
-
-
 @pytest.mark.asyncio
 async def test_stranded_blocked_sweep_leaves_pending_with_null_claimant(
     tmp_path: Path, forbid_live_mcp,
@@ -160,7 +156,7 @@ async def test_stranded_blocked_sweep_leaves_pending_with_null_claimant(
         mcp_session=store,
         wall_time_source=lambda: FIXED_DT,
     )
-    scheduler.escalation_queue = _NoOpenEscalations()  # type: ignore[assignment]
+    scheduler.escalation_queue = EscalationQueue(tmp_path / 'escalations')
     task = dict(store.row)
     ctx = TickContext(tasks=[task], status_map={TID: 'blocked'}, tasks_by_id={TID: task})
 
