@@ -30,7 +30,10 @@ from fused_memory.models.reconciliation import (
     StageReport,
 )
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope, Scope
-from fused_memory.reconciliation.cli_stage_runner import recon_config_base_dir
+from fused_memory.reconciliation.cli_stage_runner import (
+    recon_config_base_dir,
+    run_config_dir_path,
+)
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.harness import BacklogIterator
 from fused_memory.reconciliation.journal import ReconciliationJournal
@@ -21429,6 +21432,62 @@ async def test_run_full_cycle_rejects_a_run_id_alongside_resume_run(
 
     assert await journal.get_recent_runs('test-project') == []
     assert await event_buffer.count_buffered('test-project') == 2
+
+
+class TestResumeGuardDoesNotCreateTheConfigDir:
+    """The resume-eligibility probe only READS the per-run config dir; probing a
+    run whose dir was already GC'd must not resurrect it (task 3972)."""
+
+    @staticmethod
+    def _run_reaching_the_transcript_rail() -> ReconciliationRun:
+        """Fresh interrupt, no ``_resume`` meta, a captured session: every
+        cheaper rail passes, so evaluation reaches transcript existence."""
+        return ReconciliationRun(
+            id=str(uuid.uuid4()),
+            project_id='test-project',
+            run_type=RunType.full,
+            trigger_reason='unit-test',
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            status=RunStatus.interrupted,
+            session_id='0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0',
+            stage_cursor='task_knowledge_sync',
+            instance_id='dead-pred',
+        )
+
+    @pytest.mark.asyncio
+    async def test_probe_leaves_a_gcd_run_dir_absent(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        run = self._run_reaching_the_transcript_rail()
+        before = sorted(p.name for p in journal.data_dir.iterdir())
+
+        reason = harness._resume_guard_reason(run)
+
+        assert reason is not None
+        assert 'no transcript' in reason
+        assert not run_config_dir_path(journal.data_dir, run.id).exists()
+        assert not recon_config_base_dir(journal.data_dir).exists()
+        assert sorted(p.name for p in journal.data_dir.iterdir()) == before
+
+    @pytest.mark.asyncio
+    async def test_probe_still_passes_when_a_transcript_is_present(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        run = self._run_reaching_the_transcript_rail()
+        assert run.session_id is not None
+        session_dir = (
+            run_config_dir_path(journal.data_dir, run.id)
+            / 'projects' / '-home-leo-src-dark-factory'
+        )
+        session_dir.mkdir(parents=True)
+        (session_dir / f'{run.session_id}.jsonl').write_text(
+            json.dumps({'sessionId': run.session_id}) + '\n'
+        )
+
+        assert harness._resume_guard_reason(run) is None
 
 
 class TestPerRunConfigDirGC:
