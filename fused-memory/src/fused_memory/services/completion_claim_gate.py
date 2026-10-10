@@ -257,6 +257,16 @@ _ASPIRATIONAL_EXTENSION_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
+# A modal, a closed filler run, then the ONE word it governs ('must have landed').
+_MODAL_GOVERNED_RE: re.Pattern[str] = re.compile(
+    r"\b(?:will|would|shall|should|must|may|might|can|could|cannot|won't|shan't|"
+    r"(?:would|should|must|might|could|can)n't)\b"
+    r'(?:\s+(?:not|never|have|be|been|being|get|got|also|already|now|just|then|'
+    r'still|yet|soon|finally|eventually|first|only))*'
+    r'\s+[\w-]+',
+    re.IGNORECASE,
+)
+
 
 # The clause boundary is task_filter.WIDE_CLAUSE_BOUNDARY_RE, the widened
 # alphabet in which a dot followed by a word character ('orchestrator.yaml',
@@ -289,6 +299,7 @@ _EXEMPTION_STRIPPERS: tuple[re.Pattern[str], ...] = (
     _NEGATED_EXTENSION_RE,
     FUTURE_ASPIRATIONAL_RE,
     _ASPIRATIONAL_EXTENSION_RE,
+    _MODAL_GOVERNED_RE,
 )
 
 
