@@ -5,6 +5,9 @@ B11/B12).  Every test drives a REAL ``Scheduler`` whose MCP session is
 ``_TaskRowStore``: a stateful in-process double that models one task row, so
 assertions read the row back through ``Scheduler.get_task`` and inspect the
 snapshot taken after every write, rather than mock call order.
+
+The two sweeps are entered through private methods because neither class
+exposes a public single-sweep entry point.
 """
 from __future__ import annotations
 
@@ -14,6 +17,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _orch_helpers import HermeticMcpSession
 from escalation.queue import EscalationQueue
 from shared.task_claimant import is_stranded
 
@@ -27,35 +31,29 @@ STALE_HEARTBEAT = '2026-08-19T21:57:20+00:00'
 FIXED_DT = datetime(2026, 10, 10, 12, 0, 0, tzinfo=UTC)
 
 
-class _TaskRowStore:
-    """``McpSessionLike`` double holding one task row and every write applied to it.
+class _TaskRowStore(HermeticMcpSession):
+    """``HermeticMcpSession`` whose task tools read and write one stateful row.
 
-    Same JSON-RPC envelope, ``call_tool`` signature and loud failure on unknown
-    tools as ``_orch_helpers.HermeticMcpSession``, plus the per-row state and
-    fault injection that stateless double deliberately lacks.
+    Records a snapshot of the row after every write, and can inject a fault
+    into either write.
     """
 
     def __init__(self, row: dict) -> None:
+        super().__init__()
         self.row = row
         self.writes: list[tuple[str, dict]] = []
         self.fail_status_write = False
         self.fail_claimant_write = False
-        self._request_id = 0
 
-    def _envelope(self, payload: dict) -> dict:
-        self._request_id += 1
-        return {
-            'jsonrpc': '2.0',
-            'id': self._request_id,
-            'result': {'content': [{'type': 'text', 'text': json.dumps(payload)}]},
-        }
+    def _reply(self, payload: dict) -> dict:
+        return self._envelope(json.dumps(payload))
 
     def _record(self, name: str) -> None:
         self.writes.append((name, dict(self.row)))
 
     async def call_tool(self, name: str, arguments: dict, timeout: float = 30) -> dict:
         if name == 'get_task':
-            return self._envelope(dict(self.row))
+            return self._reply(dict(self.row))
         if name == 'set_task_claimant':
             if self.fail_claimant_write:
                 raise ConnectionError('injected set_task_claimant fault')
@@ -63,17 +61,14 @@ class _TaskRowStore:
                 if column in arguments:
                     self.row[column] = arguments[column]
             self._record(name)
-            return self._envelope({})
+            return self._reply({})
         if name == 'set_task_status':
             if self.fail_status_write:
-                return self._envelope({'error': 'injected_fault', 'error_type': 'InjectedFault'})
+                return self._reply({'error': 'injected_fault', 'error_type': 'InjectedFault'})
             self.row['status'] = arguments['status']
             self._record(name)
-            return self._envelope({'id': arguments['id'], 'status': arguments['status']})
-        raise NotImplementedError(
-            f'_TaskRowStore: unknown tool {name!r} — add a branch in call_tool '
-            'if this tool is needed by the test'
-        )
+            return self._reply({'id': arguments['id'], 'status': arguments['status']})
+        return await super().call_tool(name, arguments, timeout)
 
     def pending_with_stale_claimant(self) -> list[tuple[str, dict]]:
         return [
