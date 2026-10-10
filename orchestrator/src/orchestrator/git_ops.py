@@ -104,6 +104,7 @@ from orchestrator.verify_cancel import (
 )
 from orchestrator.verify_classify import _ENOSPC_MARKERS
 from orchestrator.warm_lane_pool import WarmLanePoolCensus
+from orchestrator.worktree_admin_entries import unlock_dangling_locked_entries
 from orchestrator.worktree_identity import identities_match, read_worktree_title
 
 logger = logging.getLogger(__name__)
@@ -2720,6 +2721,16 @@ def _merge_subject(branch: str, main_branch: str) -> str:
     use the new format.
     """
     return f'Merge {branch} into {main_branch}'
+
+
+def _merge_worktree_remove_argv(path: Path) -> list[str]:
+    """``git worktree remove`` for a ``_merge-*`` tree, overriding git's lock.
+
+    git refuses a single ``--force`` on a locked tree. Nothing in this repo
+    locks a worktree, so a lock on a ``_merge-*`` tree is git's abandoned
+    ``initializing`` marker (task 4828), never a liveness signal.
+    """
+    return ['git', 'worktree', 'remove', '--force', '--force', str(path)]
 
 
 # Sentinel range used to represent files that are fully deleted or renamed.
@@ -12716,8 +12727,7 @@ class GitOps:
                 return 'not_present'
             try:
                 rc, _, err = await _run(
-                    ['git', 'worktree', 'remove', str(path), '--force'],
-                    cwd=self.project_root,
+                    _merge_worktree_remove_argv(path), cwd=self.project_root,
                 )
             except OSError as exc:
                 # The SECOND escape from cleanup_merge_worktree's never-raises
@@ -12794,10 +12804,10 @@ class GitOps:
         (its pinned contract — see task 2924's
         ``test_non_worktree_directory_returns_failed``). But ``'failed'`` is
         NOT proof of shape-1 specifically: it is simply *any* non-zero git
-        worktree removal — a ``git worktree lock``-ed tree or a transient
-        filesystem/I/O error yield it too. The fallback deliberately does
-        NOT try to distinguish the cause; it force-removes any unleased
-        ``_merge-`` tree git could not remove, whatever the reason. That is
+        worktree removal — a transient filesystem/I/O error yields it too.
+        The fallback deliberately does NOT try to distinguish the cause; it
+        force-removes any unleased ``_merge-`` tree git could not remove,
+        whatever the reason. That is
         safe here because merge worktrees are throwaway/ephemeral by
         construction AND ``'failed'`` already means the primitive's lease
         acquire confirmed NO live holder (a live holder yields
@@ -12818,10 +12828,10 @@ class GitOps:
         ``.lock`` (the primitive RETAINS it on ``'failed'``, so we clear the
         now-orphaned lane lock, honouring the no-leak convention); (4)
         :meth:`_prune_registrations` clears any dangling admin entry. The
-        order — remove-tree-then-prune — leaves at most the benign inverse
-        shape (admin entry without a tree) that git prune / name-reuse
-        already handle, so an interrupted teardown is always completable by
-        a later sweep.
+        order — remove-tree-then-prune — leaves at most the inverse shape
+        (admin entry without a tree), which :meth:`_prune_registrations`
+        reclaims even when git has it locked, so an interrupted teardown is
+        always completable by a later sweep.
 
         Every other outcome (``'removed'`` / ``'not_present'`` / the three
         ``'skipped_*'``, including ``'skipped_lock_error'``) returns
@@ -12867,8 +12877,8 @@ class GitOps:
         # Crash-safe fallback (task 2922): the guarded git removal returned
         # 'failed' — i.e. ANY non-zero git worktree removal. Most commonly the
         # shape-1 case (the .git/worktrees/<name> admin dir was already removed
-        # by an interrupted teardown), but a locked tree or a transient FS/I/O
-        # error too. We intentionally do NOT distinguish the cause: the
+        # by an interrupted teardown), but a transient FS/I/O error too. We
+        # intentionally do NOT distinguish the cause: the
         # primitive's lease acquire already confirmed no live holder, so we
         # force-remove this unleased throwaway _merge- tree git could no longer
         # remove, whatever the reason. The band guard is defense-in-depth over
@@ -13639,8 +13649,7 @@ class GitOps:
             ):
                 continue
             rc_rm, _, err = await _run(
-                ['git', 'worktree', 'remove', '--force', str(wt_path)],
-                cwd=self.project_root,
+                _merge_worktree_remove_argv(wt_path), cwd=self.project_root,
             )
             if rc_rm == 0:
                 removed.append(str(wt_path))
@@ -13670,9 +13679,11 @@ class GitOps:
         Returns the first matching :class:`~pathlib.Path`, or ``None`` if no
         match is found.
 
-        Fail-closed on git errors: a candidate whose ``git log`` fails is
-        skipped (logged at WARNING level) rather than raising — avoids
-        crashing the coalesce dispatch on a partially-written worktree.
+        Fail-closed on git errors: a candidate whose ``git log`` fails, or
+        whose directory is absent though git still lists it
+        (:class:`WorktreeMissing`), is skipped (logged at WARNING level)
+        rather than raising — avoids crashing the coalesce dispatch on a
+        partially-written or half-torn-down worktree.
 
         Crash-safety / cross-restart source of truth: even if the in-memory
         ``InFlightMergeRegistry`` was cleared by a process restart, an
@@ -13690,10 +13701,18 @@ class GitOps:
 
         async for wt_path, _ in self._iter_merge_worktrees():
             # Read HEAD commit subject of this candidate
-            rc_log, subject, err_log = await _run(
-                ['git', 'log', '-1', '--format=%s'],
-                cwd=wt_path,
-            )
+            try:
+                rc_log, subject, err_log = await _run(
+                    ['git', 'log', '-1', '--format=%s'],
+                    cwd=wt_path,
+                )
+            except WorktreeMissing:
+                logger.warning(
+                    'find_inflight_merge_worktree: registered %s is absent on '
+                    'disk — skipping',
+                    wt_path,
+                )
+                continue
             if rc_log != 0:
                 logger.warning(
                     'find_inflight_merge_worktree: git log failed for %s: %s',
@@ -15834,9 +15853,18 @@ class GitOps:
         refusal — see that method's docstring for why repeated calls from
         hot sweep sites (e.g. ``create_worktree``, ``reap_interactive_worktrees``)
         do not multiply operator-visible escalations.
+
+        **Locked entries (task 4828)**: prune skips a locked entry forever,
+        so :func:`~orchestrator.worktree_admin_entries.unlock_dangling_locked_entries`
+        first unlocks those whose ``worktree_base`` tree is gone. It runs
+        inside the pool-storage gate above, because an unmounted
+        ``worktree_base`` makes every lane look gone.
         """
         if not self._reconcile_pool_storage_before_sweep(context):
             return
+        unlock_dangling_locked_entries(
+            self.project_root / '.git', self.worktree_base, context,
+        )
         try:
             rc, _, err = await _run(
                 ['git', 'worktree', 'prune'], cwd=self.project_root,
