@@ -236,6 +236,11 @@ extra substring scan and never run the blocked family's five anchored
 patterns at all. Only edges that really do mention 'blocked' pay for the
 second family, and for those the work is irreducible — the two families
 answer different questions.
+
+A task transition does not pay the whole-corpus read (task 4851):
+``sweep_stale_status_snapshot_edges_for_task`` reads only the facts naming
+one task's digits and shares the periodic sweep's core, so the one-pass
+extraction discipline above holds for it too. See its docstring.
 """
 
 from __future__ import annotations
@@ -2096,6 +2101,129 @@ async def sweep_stale_status_snapshot_edges(
     no backend calls. When enumeration yields no candidate ids at all,
     ``taskmaster.get_statuses`` is never called.
     """
+    return await _sweep_status_snapshot_edges(
+        memory_service, taskmaster, project_id, project_root,
+        task_id=None, run_id=run_id, now=now, log=log,
+    )
+
+
+async def sweep_stale_status_snapshot_edges_for_task(
+    memory_service,
+    taskmaster,
+    project_id: str,
+    project_root: str,
+    task_id: int,
+    *,
+    run_id: str,
+    now: datetime | None = None,
+    log: logging.Logger = logger,
+) -> dict:
+    """Sweep only the status-snapshot edges that name *task_id*. (task 4851)
+
+    A LATENCY complement to ``sweep_stale_status_snapshot_edges``, not a
+    coverage one: the same selection rules and the same fail-safe, retiring
+    an edge only on a status positively known from a LIVE
+    ``taskmaster.get_statuses`` read, never from a transition payload. What
+    it misses, the next periodic cycle still retires.
+
+    The read is ``enumerate_valid_edges_mentioning(str(task_id))``, a
+    digit-substring SUPERSET ('1420', dates), made exact by keeping only the
+    edges whose extracted ids contain *task_id*. An aggregate edge naming
+    *task_id* is judged on ALL its ids, exactly as the periodic sweep would
+    judge it.
+
+    Arguments, the best-effort contract and the returned stats are those of
+    ``sweep_stale_status_snapshot_edges``, except that ``scanned`` counts the
+    edges the narrowed read returned.
+    """
+    return await _sweep_status_snapshot_edges(
+        memory_service, taskmaster, project_id, project_root,
+        task_id=task_id, run_id=run_id, now=now, log=log,
+    )
+
+
+class _CorpusRead(NamedTuple):
+    """What one sweep read observed. ``edges`` is None when nothing may be swept."""
+
+    edges: list[dict] | None
+    complete: bool | None
+    incomplete_kind: str | None
+
+
+async def _read_corpus(
+    memory_service, project_id: str, task_id: int | None, *, log: logging.Logger,
+) -> _CorpusRead:
+    """THE READ: every valid edge, or only those whose fact contains *task_id*.
+
+    Completeness is reported even when the policy aborts the read, and that
+    is load-bearing: ``apply_incompleteness_policy`` RAISES on a structural
+    incompleteness, and an aborted cycle that reported only errors=1 would
+    leave the operator reconstructing the cause from logs — the exact
+    reconstruction the signal exists to remove. (task 4386)
+
+    ``enumerate_*`` NEVER raises — it reports incompleteness as a value — so
+    the fail-closed structural guard has to be applied here, or a page-capped
+    read is taken for the whole corpus and every edge the missing pages carry
+    is scanned as absent: a silently clean cycle that retires nothing. It is
+    deliberately inside the same try, so a structural incompleteness lands in
+    the one handler (``IncompleteEnumerationError`` subclasses ``Exception``
+    precisely so it is caught). An EMPIRICAL incompleteness only warns —
+    through the sweep's injected ``log``, so the message surfaces with the
+    rest of the cycle's diagnostics — and the sweep proceeds on what it got.
+    """
+    method = (
+        'enumerate_all_valid_edges' if task_id is None
+        else 'enumerate_valid_edges_mentioning'
+    )
+    paged = None
+    try:
+        graphiti = memory_service.graphiti
+        if task_id is None:
+            grouped, paged = await graphiti.enumerate_all_valid_edges(group_id=project_id)
+        else:
+            grouped, paged = await graphiti.enumerate_valid_edges_mentioning(
+                str(task_id), group_id=project_id,
+            )
+        apply_incompleteness_policy(
+            paged,
+            method=method,
+            group_id=project_id,
+            returned_count=len(grouped),
+            noun='entities',
+            consequence='must not drive a staleness verdict',
+            log=log,
+        )
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        log.exception(
+            'stale_status_snapshot_edge_sweep: %s failed for group_id=%s',
+            method, project_id,
+        )
+        if paged is None:
+            return _CorpusRead(None, None, None)
+        return _CorpusRead(None, paged.complete, paged.incomplete_kind)
+    return _CorpusRead(flatten_dedup_edges(grouped), paged.complete, paged.incomplete_kind)
+
+
+async def _sweep_status_snapshot_edges(
+    memory_service,
+    taskmaster,
+    project_id: str,
+    project_root: str,
+    *,
+    task_id: int | None,
+    run_id: str,
+    now: datetime | None,
+    log: logging.Logger,
+) -> dict:
+    """The one core behind both public sweeps. (task 4851)
+
+    *task_id* is consulted in exactly two places: THE READ
+    (``_read_corpus``) and THE POST-FILTER right after the single extraction
+    pass. Everything else — the status census, selection, the counted
+    invalidation loop, the supersede ceiling and the stats — is shared.
+    """
     stats = {
         'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 0,
         'superseded': 0, 'supersede_errors': 0, 'supersede_skipped': 0,
@@ -2109,53 +2237,13 @@ async def sweep_stale_status_snapshot_edges(
     if not taskmaster or not project_root:
         return stats
 
-    try:
-        grouped, paged = await memory_service.graphiti.enumerate_all_valid_edges(
-            group_id=project_id,
-        )
-        # Recorded BEFORE the policy is applied, and the ordering is
-        # load-bearing: apply_incompleteness_policy RAISES on a structural
-        # incompleteness, so assigning after it would leave the aborted cycle
-        # reporting errors=1 with no stated reason and the operator
-        # reconstructing the cause from logs — the exact reconstruction this
-        # signal exists to remove. (task 4386)
-        stats['enumeration_complete'] = paged.complete
-        stats['enumeration_incomplete_kind'] = paged.incomplete_kind
-        # ``enumerate_*`` NEVER raises — it reports incompleteness as a value —
-        # so the fail-closed structural guard the ``get_all_valid_edges`` shim
-        # applied on this sweep's behalf has to be re-applied here, or a
-        # page-capped read is taken for the whole corpus and every edge the
-        # missing pages carry is scanned as absent: a silently clean cycle that
-        # retires nothing. Deliberately INSIDE the same try, so a structural
-        # incompleteness lands in the existing handler below exactly as the
-        # shim's raise did (``IncompleteEnumerationError`` subclasses
-        # ``Exception``, never ``BaseException``, precisely so it is caught
-        # here). An EMPIRICAL incompleteness only warns — through this sweep's
-        # injected ``log``, so the one message about a truncated corpus
-        # surfaces with the rest of the cycle's diagnostics — and the sweep
-        # proceeds on what it did get. (task 4386)
-        apply_incompleteness_policy(
-            paged,
-            method='enumerate_all_valid_edges',
-            group_id=project_id,
-            returned_count=len(grouped),
-            noun='entities',
-            consequence='must not drive a staleness verdict',
-            log=log,
-        )
-    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-        raise
-    except Exception:
-        log.exception(
-            'stale_status_snapshot_edge_sweep: enumerate_all_valid_edges failed for '
-            'group_id=%s',
-            project_id,
-        )
+    corpus = await _read_corpus(memory_service, project_id, task_id, log=log)
+    stats['enumeration_complete'] = corpus.complete
+    stats['enumeration_incomplete_kind'] = corpus.incomplete_kind
+    if corpus.edges is None:
         stats['errors'] += 1
         return stats
-
-    edges = flatten_dedup_edges(grouped)
-    stats['scanned'] = len(edges)
+    stats['scanned'] = len(corpus.edges)
 
     # Extract each edge's ids exactly once — ONE by-class pass per edge
     # yielding BOTH id sets, reused below to build candidate_ids and (via
@@ -2165,11 +2253,19 @@ async def sweep_stale_status_snapshot_edges(
     # finding, task 2613; extended to the blocked family, task 3037)
     by_class = {
         edge['uuid']: extract_snapshot_edge_task_ids_by_marker_class(edge.get('fact'))
-        for edge in edges
+        for edge in corpus.edges
     }
-    edge_ids: dict[str, set[int]] = {uuid: ids.all_ids for uuid, ids in by_class.items()}
+    edges = corpus.edges
+    if task_id is not None:
+        # THE POST-FILTER: the narrowed read is a digit-substring superset, so
+        # keep only edges that really name the task, judged from the SAME
+        # extraction pass. (task 4851)
+        edges = [edge for edge in edges if task_id in by_class[edge['uuid']].all_ids]
+    edge_ids: dict[str, set[int]] = {
+        edge['uuid']: by_class[edge['uuid']].all_ids for edge in edges
+    }
     blocked_edge_ids: dict[str, set[int]] = {
-        uuid: ids.blocked_ids for uuid, ids in by_class.items()
+        edge['uuid']: by_class[edge['uuid']].blocked_ids for edge in edges
     }
 
     # The census must cover BOTH maps' ids. blocked_ids is a subset of

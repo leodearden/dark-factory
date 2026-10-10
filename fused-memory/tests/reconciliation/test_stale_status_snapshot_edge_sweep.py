@@ -4168,7 +4168,7 @@ class TestSweepStaleStatusSnapshotEdgesForTask:
 
         stats = await self._sweep(memory_service, taskmaster, 142)
 
-        taskmaster.get_statuses.assert_awaited_once_with('/tmp/reify', ids=['1030', '142'])
+        taskmaster.get_statuses.assert_awaited_once_with('/tmp/reify', ids=['142', '1030'])
         assert stats['invalidated'] == 1
 
     @pytest.mark.asyncio
