@@ -17,7 +17,7 @@ from shared.cli_invoke import (
     is_zero_output_timeout,
 )
 from shared.config_dir import CONFIG_DIR_PREFIX
-from shared.transcript_archive import resolve_archive_root
+from shared.transcript_archive import archive_before_delete, resolve_archive_root
 
 from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES, StageAgentOutcome
 from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
@@ -745,14 +745,44 @@ def recon_archive_root(config: ReconciliationConfig) -> Path | None:
         return None
 
 
-def gc_run_config_dir(data_dir: Path, run_id: str) -> None:
+def gc_run_config_dir(
+    data_dir: Path, run_id: str, *, archive_root: Path | None = None,
+) -> None:
     """Remove a run's per-run recon CLI config dir, if present (task 2744).
 
     Targets ``run_config_dir_path(data_dir, run_id)``, the same path the
-    creator builds. ``ignore_errors=True`` makes it a silent no-op when the dir
-    was never created (e.g. a run that short-circuited before any stage launch).
+    creator builds, and is a silent no-op when the dir was never created (e.g.
+    a run that short-circuited before any stage launch).
+
+    With an ``archive_root``, deletion is a step archival LICENSES rather than
+    one scheduled after it (task 3619's shape): ``archive_before_delete`` moves
+    each transcript into the archive and unlinks it only once the durable copy
+    exists, holding any it cannot archive. ``archive_root=None`` is the
+    DISABLED / unresolvable-config branch (see ``recon_archive_root``), not a
+    convenience default — every production caller passes the resolver's
+    result — and keeps the plain rmtree.
+
+    SYNCHRONOUS by contract and never raises: callers must not wrap it in
+    ``asyncio.to_thread``, since an ``await`` is a cancellation point and a
+    SIGTERM-driven teardown is exactly what would then skip it.
     """
-    shutil.rmtree(run_config_dir_path(data_dir, run_id), ignore_errors=True)
+    config_dir = run_config_dir_path(data_dir, run_id)
+    if archive_root is None:
+        shutil.rmtree(config_dir, ignore_errors=True)
+        return
+    outcome = archive_before_delete(
+        config_dir, recon_transcript_archive_key(run_id), archive_root=archive_root,
+    )
+    if outcome.archived or outcome.held:
+        logger.info(
+            'recon run %s transcripts archived before gc: archived=%d '
+            'already_current=%d held=%d archive_root=%s',
+            run_id,
+            outcome.archived,
+            outcome.already_current,
+            len(outcome.held),
+            archive_root,
+        )
 
 
 async def run_stage_via_cli(
