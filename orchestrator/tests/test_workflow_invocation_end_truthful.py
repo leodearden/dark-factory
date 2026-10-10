@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _orch_helpers import pydantic_spec
 from _recording_event_store import _RecordingEventStore
+from _workflow_helpers import fixed_prompt
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import IMPLEMENTER
@@ -128,7 +129,7 @@ class TestInvocationEndTruthfulTelemetry:
             ),
             patch.object(wf, '_build_agent_env', return_value=None),
         ):
-            await wf._invoke(IMPLEMENTER, prompt='x', cwd=tmp_path)
+            await wf._invoke(IMPLEMENTER, build_prompt=fixed_prompt('x'), cwd=tmp_path)
 
         invocation_end_entries = [
             entry for (etype, entry) in rec.events if etype == EventType.invocation_end
@@ -158,7 +159,7 @@ class TestInvocationEndTruthfulTelemetry:
             ),
             patch.object(wf, '_build_agent_env', return_value=None),
         ):
-            await wf._invoke(IMPLEMENTER, prompt='p', cwd=tmp_path)
+            await wf._invoke(IMPLEMENTER, build_prompt=fixed_prompt('p'), cwd=tmp_path)
         entries = [entry for (etype, entry) in rec.events if etype == EventType.invocation_end]
         assert len(entries) == 1, f'expected exactly one invocation_end event; got {rec.events!r}'
         return entries[0]['data']
@@ -242,7 +243,7 @@ class TestInvocationRecordsModelIdAndCeilingKills:
             patch('orchestrator.workflow.invoke_with_cap_retry', new=mock_invoke),
             patch.object(wf, '_build_agent_env', return_value=None),
         ):
-            await wf._invoke(IMPLEMENTER, prompt='p', cwd=tmp_path)
+            await wf._invoke(IMPLEMENTER, build_prompt=fixed_prompt('p'), cwd=tmp_path)
 
         invoke_kw = mock_invoke.call_args.kwargs
         assert invoke_kw['max_budget_usd'] == _BUDGET_CEILING
@@ -361,7 +362,7 @@ class TestInvokeForwardsProgressExtensionParams:
             ),
             patch.object(wf, '_build_agent_env', return_value=None),
         ):
-            await wf._invoke(IMPLEMENTER, prompt='x', cwd=tmp_path)
+            await wf._invoke(IMPLEMENTER, build_prompt=fixed_prompt('x'), cwd=tmp_path)
 
         mock_invoke_with_cap_retry.assert_awaited_once()
         call_kwargs = mock_invoke_with_cap_retry.call_args.kwargs

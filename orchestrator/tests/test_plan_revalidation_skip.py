@@ -161,7 +161,8 @@ def _make(
 
     invoke_called: list[bool] = []
 
-    async def _fail_invoke(*args, **kwargs):
+    async def _fail_invoke(_role, build_prompt, *args, **kwargs):
+        await build_prompt()
         invoke_called.append(True)
         raise AssertionError(
             'architect must NOT be invoked when revalidation skip applies'

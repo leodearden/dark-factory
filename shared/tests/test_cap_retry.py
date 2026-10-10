@@ -791,7 +791,7 @@ class TestCapRetryTranscriptReachability:
         )
         # The fresh path must rebuild the prompt — CAP_HIT_RESUME_PROMPT is
         # meaningless to a brand-new session with no history to continue.
-        rebuild.assert_awaited_once_with(True)
+        rebuild.assert_awaited_once_with()
         assert second.kwargs.get('prompt') == 'FRESH REBUILT PROMPT'
 
     async def test_unreachable_transcript_without_rebuild_uses_original_prompt(self, tmp_path):
@@ -834,7 +834,7 @@ class TestCapRetryTranscriptReachability:
 
         capped = make_result(session_id='sess-42')
         ok = make_result()
-        rebuild = AsyncMock(return_value='SHOULD NOT BE USED')
+        rebuild = AsyncMock(return_value='DISCARDED BY THE RESUME')
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
@@ -847,7 +847,7 @@ class TestCapRetryTranscriptReachability:
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('resume_session_id') == 'sess-42'
         assert second.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
-        rebuild.assert_not_awaited()
+        rebuild.assert_awaited_once_with()
 
     async def test_log_states_reason_resumed_transcript_present(self, tmp_path, caplog):
         """The cap-hit line must say WHY it resumed, not just 'resuming'."""
@@ -1034,7 +1034,7 @@ class TestCapRetryResumableProgress:
         )
         # A fresh retry replays the REAL task prompt, which is strictly better
         # than an instruction to continue nothing.
-        rebuild.assert_awaited_once_with(True)
+        rebuild.assert_awaited_once_with()
         assert second.kwargs.get('prompt') == 'FRESH REBUILT PROMPT'
 
     async def test_text_only_transcript_without_rebuild_uses_original_prompt(self, tmp_path):
@@ -1081,7 +1081,7 @@ class TestCapRetryResumableProgress:
 
         capped = make_result(session_id='sess-42')
         ok = make_result()
-        rebuild = AsyncMock(return_value='SHOULD NOT BE USED')
+        rebuild = AsyncMock(return_value='DISCARDED BY THE RESUME')
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
@@ -1094,7 +1094,7 @@ class TestCapRetryResumableProgress:
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('resume_session_id') == 'sess-42'
         assert second.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
-        rebuild.assert_not_awaited()
+        rebuild.assert_awaited_once_with()
 
     async def test_no_config_dir_resumes_without_checking_progress(self):
         """Regression pin: config_dir=None -> resume as today, unchecked.
@@ -1111,7 +1111,7 @@ class TestCapRetryResumableProgress:
             detect_cap_hit=MagicMock(side_effect=[True, False]),
             active_account_name='acct-b',
         )
-        rebuild = AsyncMock(return_value='SHOULD NOT BE USED')
+        rebuild = AsyncMock(return_value='DISCARDED BY THE RESUME')
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock,
                   side_effect=[make_result(session_id='sess-42'), make_result()]) as mock_inv,
@@ -1124,7 +1124,7 @@ class TestCapRetryResumableProgress:
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('resume_session_id') == 'sess-42'
         assert second.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
-        rebuild.assert_not_awaited()
+        rebuild.assert_awaited_once_with()
 
     async def test_log_states_reason_fresh_no_resumable_progress(self, tmp_path, caplog):
         """The cap-hit line must name this reason distinctly.
@@ -3461,17 +3461,17 @@ class TestCapRetryMaxCapRetries:
 
 @pytest.mark.asyncio
 class TestCapRetryRebuildPrompt:
-    """rebuild_prompt: optional hook invoked on an unresumable cap retry.
+    """rebuild_prompt: optional no-arg builder consulted before every retry.
 
-    Fires only on the two FRESH (unresumable) cap-retry paths, with
-    session_lost=True, so the caller can rebuild its prompt (e.g. with fresh
-    pending escalations) instead of reusing the stale original_prompt. The
-    resumable path (session_id present) is untouched — it keeps
-    CAP_HIT_RESUME_PROMPT and resumes, never calling rebuild_prompt.
+    A FRESH cap retry sends what it builds, so the caller can rebuild its
+    prompt (e.g. with fresh pending escalations) instead of reusing the stale
+    original_prompt. The resumable path (session_id present) still consults
+    it but keeps CAP_HIT_RESUME_PROMPT. The full contract is pinned in
+    test_cap_retry_prompt_builder.py.
     """
 
     async def test_rebuild_prompt_invoked_on_unresumable_cap(self):
-        """On a cap hit with no session_id, rebuild_prompt(True) replaces the prompt."""
+        """On a cap hit with no session_id, rebuild_prompt() replaces the prompt."""
         gate = _mock_gate(
             account_count=1,
             before_invoke=AsyncMock(side_effect=['tok', 'tok']),
@@ -3488,13 +3488,13 @@ class TestCapRetryRebuildPrompt:
             await invoke_with_cap_retry(
                 gate, 'lbl', prompt='original', rebuild_prompt=rebuild,
             )
-        rebuild.assert_awaited_once_with(True)
+        rebuild.assert_awaited_once_with()
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('prompt') == 'FRESH ESCALATIONS PROMPT'
         assert 'resume_session_id' not in second.kwargs
 
-    async def test_rebuild_prompt_not_called_on_resumable_cap(self):
-        """On a cap hit WITH a session_id, the resume path is untouched — no rebuild."""
+    async def test_rebuild_prompt_consulted_but_discarded_on_resumable_cap(self):
+        """On a cap hit WITH a session_id, the builder is consulted but the resume keeps its prompt."""
         gate = _mock_gate(
             account_count=1,
             before_invoke=AsyncMock(side_effect=['tok', 'tok']),
@@ -3511,14 +3511,14 @@ class TestCapRetryRebuildPrompt:
             await invoke_with_cap_retry(
                 gate, 'lbl', prompt='original', rebuild_prompt=rebuild,
             )
-        rebuild.assert_not_awaited()
+        rebuild.assert_awaited_once_with()
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('resume_session_id') == 'sess-1'
         assert second.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
 
     async def test_rebuild_prompt_invoked_on_heuristic_cap(self):
         """On the heuristic (zero-cost instant-exit) unresumable cap path,
-        rebuild_prompt(True) also replaces the prompt.
+        rebuild_prompt() also replaces the prompt.
 
         Covers the second FRESH cap-retry site — the exact-detect branch
         (test_rebuild_prompt_invoked_on_unresumable_cap) and this heuristic
@@ -3548,7 +3548,7 @@ class TestCapRetryRebuildPrompt:
             await invoke_with_cap_retry(
                 gate, 'lbl', prompt='original', rebuild_prompt=rebuild,
             )
-        rebuild.assert_awaited_once_with(True)
+        rebuild.assert_awaited_once_with()
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('prompt') == 'HEUR REBUILD'
 
@@ -3577,7 +3577,7 @@ class TestCapRetryRebuildPrompt:
             got = await invoke_with_cap_retry(
                 gate, 'lbl', prompt='original', rebuild_prompt=rebuild,
             )
-        rebuild.assert_awaited_once_with(True)
+        rebuild.assert_awaited_once_with()
         assert got.success is True
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('prompt') == 'original'
@@ -3670,11 +3670,6 @@ class TestCapRetryResumeFailureRebuildsPrompt:
     unchanged to a brand-new session is context-less. This mirrors the two
     existing fresh-fallback rebuild call sites (TestCapRetryRebuildPrompt)
     for the third, non-cap-hit resume-failure site.
-
-    FAILS RED: the non-cap resume-failure branch (cli_invoke.py ~1087-1094)
-    calls _reset_for_fresh_retry(invoke_kwargs, original_prompt) and never
-    awaits _rebuild_fresh_prompt(), so the second call's prompt is still
-    'continuation'.
     """
 
     async def test_non_cap_resume_failure_rebuilds_prompt(self):
@@ -3701,7 +3696,7 @@ class TestCapRetryResumeFailureRebuildsPrompt:
                 resume_delivers_prompt=True,
                 rebuild_prompt=rebuild,
             )
-        rebuild.assert_awaited_once_with(True)
+        rebuild.assert_awaited_once_with()
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('prompt') == 'REBUILT-FULL-PROMPT'
         assert 'resume_session_id' not in second.kwargs
@@ -3723,11 +3718,6 @@ class TestCapRetryWedgeAndAuthRebuildPrompt:
     the per-escalation continuation prompt — valid only inside the resumed
     session. A live-continuation resume that wedges or auth-fails must not
     hand that context-less prompt to the fresh retry.
-
-    FAILS RED: neither branch calls ``_rebuild_fresh_prompt()`` today — both
-    call ``_reset_for_fresh_retry(invoke_kwargs, original_prompt)`` and
-    ``continue`` directly, so the second call's prompt is still 'continuation'
-    and ``rebuild`` is never awaited.
     """
 
     async def test_wedge_branch_rebuilds_prompt(self):
@@ -3755,7 +3745,7 @@ class TestCapRetryWedgeAndAuthRebuildPrompt:
                 resume_delivers_prompt=True,
                 rebuild_prompt=rebuild,
             )
-        rebuild.assert_awaited_once_with(True)
+        rebuild.assert_awaited_once_with()
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('prompt') == 'REBUILT-FULL-PROMPT'
         assert 'resume_session_id' not in second.kwargs
@@ -3783,7 +3773,7 @@ class TestCapRetryWedgeAndAuthRebuildPrompt:
                 resume_delivers_prompt=True,
                 rebuild_prompt=rebuild,
             )
-        rebuild.assert_awaited_once_with(True)
+        rebuild.assert_awaited_once_with()
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('prompt') == 'REBUILT-FULL-PROMPT'
         assert 'resume_session_id' not in second.kwargs

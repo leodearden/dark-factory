@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import pydantic_spec
+from _workflow_helpers import fixed_prompt
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
@@ -555,7 +556,7 @@ class TestInvokeResumesConsumesFields:
             # (both are MagicMock under the spec_set config, but dict.update semantics
             # on non-dict mocks are undefined — bypass to keep the test focused).
             with patch.object(wf, '_build_agent_env', return_value=None):
-                await wf._invoke(IMPLEMENTER, 'test-prompt', tmp_path)
+                await wf._invoke(IMPLEMENTER, fixed_prompt('test-prompt'), tmp_path)
 
         # The resume-selection block must have passed the stashed session id
         call_kwargs = mock_iwcr.call_args.kwargs
@@ -594,7 +595,7 @@ class TestInvokeResumesConsumesFields:
         with patch('orchestrator.workflow.invoke_with_cap_retry', new_callable=AsyncMock) as mock_iwcr:
             mock_iwcr.return_value = resume_result
             with patch.object(wf, '_build_agent_env', return_value=None):
-                await wf._invoke(IMPLEMENTER, 'test-prompt', tmp_path)
+                await wf._invoke(IMPLEMENTER, fixed_prompt('test-prompt'), tmp_path)
 
         call_kwargs = mock_iwcr.call_args.kwargs
         assert call_kwargs.get('resume_session_id') is None, (

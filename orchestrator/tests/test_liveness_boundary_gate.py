@@ -32,6 +32,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
+from _workflow_helpers import fixed_prompt
 from shared.cli_invoke import (
     _run_subprocess,
     count_transcript_turns,
@@ -529,7 +530,7 @@ class TestB3ResumeAcrossWall:
             patch.object(wf, '_build_agent_env', return_value=None),
         ):
             mock_iwcr.return_value = success_result
-            await wf._invoke(IMPLEMENTER, 'test-prompt', tmp_path)
+            await wf._invoke(IMPLEMENTER, fixed_prompt('test-prompt'), tmp_path)
 
         # resume_session_id passed to invoke_with_cap_retry
         assert mock_iwcr.call_args is not None, 'Expected invoke_with_cap_retry to be called'

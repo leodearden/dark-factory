@@ -28,6 +28,7 @@ from _workflow_helpers import (
     _make_resolving_steward,
     _make_review,
     _make_status_setting_steward,
+    fixed_prompt,
 )
 from escalation.queue import EscalationQueue
 from shared.task_statuses import TaskStatus
@@ -8698,7 +8699,7 @@ class TestBuildSpawnEnv:
             capturing_invoke_with_cap_retry,
         )
 
-        await workflow._invoke(ARCHITECT, prompt='x', cwd=config.project_root)
+        await workflow._invoke(ARCHITECT, build_prompt=fixed_prompt('x'), cwd=config.project_root)
 
         assert len(captured_calls) == 1
         architect_kwargs = captured_calls[0]
@@ -8707,7 +8708,7 @@ class TestBuildSpawnEnv:
         assert architect_spawn_env['CLAUDE_SPAWN_PARENT_ID'] == workflow.session_id
         assert workflow._architect_spawn_session_id == architect_kwargs['session_id']
 
-        await workflow._invoke(IMPLEMENTER, prompt='y', cwd=config.project_root)
+        await workflow._invoke(IMPLEMENTER, build_prompt=fixed_prompt('y'), cwd=config.project_root)
 
         assert len(captured_calls) == 2
         implementer_kwargs = captured_calls[1]

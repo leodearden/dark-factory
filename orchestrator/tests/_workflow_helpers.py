@@ -26,6 +26,7 @@ import pytest
 from _git_fixtures import RepoSeed, seed_repo
 from _orch_helpers import pydantic_spec, wire_scheduler_liveness_mock
 from escalation.queue import EscalationQueue
+from shared.cli_invoke import PromptBuilder
 from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
 from shared.locking import normalize_lock
 
@@ -417,6 +418,29 @@ def wire_metadata_backend(
     scheduler.update_task = update_task
     scheduler.get_task = AsyncMock(side_effect=backend.get_task)
     return handle_blast_radius_expansion, update_task
+
+
+def fixed_prompt(text: str) -> PromptBuilder:
+    """A ``TaskWorkflow._invoke`` prompt builder that always returns *text*."""
+
+    async def build_prompt() -> str:
+        return text
+
+    return build_prompt
+
+
+def invoke_stub_awaiting_builder(result: AgentResult) -> AsyncMock:
+    """An ``_invoke`` double that awaits its prompt builder, then returns *result*.
+
+    For tests that replace ``_invoke`` wholesale yet assert on the briefing
+    call the builder makes.
+    """
+
+    async def invoke(_role, build_prompt: PromptBuilder, *_args, **_kwargs) -> AgentResult:
+        await build_prompt()
+        return result
+
+    return AsyncMock(side_effect=invoke)
 
 
 class FakeBriefing:

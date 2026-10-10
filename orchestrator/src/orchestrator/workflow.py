@@ -16,6 +16,7 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, cast
 
@@ -31,6 +32,7 @@ from pydantic import ValidationError
 from shared.cli_invoke import (
     AgentFailureKind,
     AllAccountsCappedException,
+    PromptBuilder,
     classify_agent_failure,
     classify_cap_kill,
     invoke_with_cap_retry,
@@ -2990,12 +2992,17 @@ class TaskWorkflow:
 
                     # Resume with resolution context
                     logger.info(f'Task {self.task_id}: resuming after escalation resolution')
-                    resume_prompt = await self.briefing.build_resume_prompt(
-                        self.task, self.plan,
-                        '\n'.join(e.summary for e in self._check_escalations()),
-                        resolution, self.worktree,
-                    )
-                    await self._invoke(IMPLEMENTER, resume_prompt, self.worktree)
+                    async def build_resume_prompt(
+                        resolution: str = resolution,
+                    ) -> str:
+                        assert self.worktree is not None
+                        return await self.briefing.build_resume_prompt(
+                            self.task, self._live_plan(),
+                            '\n'.join(e.summary for e in self._check_escalations()),
+                            resolution, self.worktree,
+                        )
+
+                    await self._invoke(IMPLEMENTER, build_resume_prompt, self.worktree)
                     continue
                 if outcome != WorkflowOutcome.DONE:
                     return outcome
@@ -4843,6 +4850,7 @@ class TaskWorkflow:
         # so the architect can confirm, update, or recreate the plan.
         revalidation = False
         revalidation_changed_files: list[str] = []
+        build_prompt: PromptBuilder
         existing_plan = self.artifacts.read_plan()
         if (
             existing_plan
@@ -4860,9 +4868,13 @@ class TaskWorkflow:
                 'via the completion pass',
                 self.task_id, len(existing_plan.get('steps', [])),
             )
-            prompt = await self.briefing.build_plan_completion_prompt(
-                self.task, existing_plan, worktree=self.worktree,
-            )
+            async def build_completion_prompt() -> str:
+                return await self.briefing.build_plan_completion_prompt(
+                    self.task, self._live_plan() or existing_plan,
+                    worktree=self.worktree,
+                )
+
+            build_prompt = build_completion_prompt
         elif (
             existing_plan
             and existing_plan.get('steps')
@@ -4900,10 +4912,15 @@ class TaskWorkflow:
                 # Pre-flight check failed inside _apply_revalidation_skip
                 # (e.g. blast-radius lock denied) — fall through.
 
-            prompt = await self.briefing.build_revalidation_prompt(
-                self.task, existing_plan, revalidation_changed_files,
-                worktree=self.worktree,
-            )
+            changed_files = revalidation_changed_files
+
+            async def build_revalidation_prompt() -> str:
+                return await self.briefing.build_revalidation_prompt(
+                    self.task, self._live_plan() or existing_plan, changed_files,
+                    worktree=self.worktree,
+                )
+
+            build_prompt = build_revalidation_prompt
             revalidation = True
         else:
             # include_prior_proposals=True only when an existing_plan fell
@@ -4934,20 +4951,25 @@ class TaskWorkflow:
             # Belt-and-braces best-effort: the detector already swallows its own
             # exceptions and returns [], but a failure here must NEVER sink
             # PLAN, so the call site falls back to [] too.
-            try:
-                committed_work = await self._detect_committed_branch_work()
-            except Exception:
-                logger.warning(
-                    'Task %s: committed-branch-work detection raised at the '
-                    '_plan call site; briefing without it (task 3033)',
-                    self.task_id, exc_info=True,
+            include_prior_proposals = bool(existing_plan)
+
+            async def build_fresh_prompt() -> str:
+                try:
+                    committed_work = await self._detect_committed_branch_work()
+                except Exception:
+                    logger.warning(
+                        'Task %s: committed-branch-work detection raised at the '
+                        '_plan call site; briefing without it (task 3033)',
+                        self.task_id, exc_info=True,
+                    )
+                    committed_work = []
+                return await self.briefing.build_architect_prompt(
+                    self.task, worktree=self.worktree,
+                    include_prior_proposals=include_prior_proposals,
+                    committed_work=committed_work,
                 )
-                committed_work = []
-            prompt = await self.briefing.build_architect_prompt(
-                self.task, worktree=self.worktree,
-                include_prior_proposals=bool(existing_plan),
-                committed_work=committed_work,
-            )
+
+            build_prompt = build_fresh_prompt
 
         # Snapshot pre-architect open L0 ids so the post-loop check can
         # detect "architect filed an L0 in lieu of writing a plan."  This is
@@ -4967,7 +4989,7 @@ class TaskWorkflow:
         rebase_retry_used = False
         for _outer_attempt in range(2):  # at most one rebase-retry round-trip
             for attempt in range(2):
-                result = await self._invoke(ARCHITECT, prompt, self.worktree)
+                result = await self._invoke(ARCHITECT, build_prompt, self.worktree)
 
                 if not result.success:
                     cls = classify_agent_failure(result)
@@ -5464,12 +5486,13 @@ class TaskWorkflow:
         """
         assert self.worktree is not None and self.artifacts is not None
 
-        prompt = await self.briefing.build_simple_task_prompt(
+        build_prompt = partial(
+            self.briefing.build_simple_task_prompt,
             self.task, worktree=self.worktree,
         )
 
         try:
-            result = await self._invoke(SIMPLE_TASK, prompt, self.worktree)
+            result = await self._invoke(SIMPLE_TASK, build_prompt, self.worktree)
         except Exception as exc:  # noqa: BLE001 — fall through to architect
             logger.warning(
                 'Task %s: SIMPLE_TASK invocation failed (%s) — '
@@ -5731,9 +5754,9 @@ class TaskWorkflow:
         if not self.artifacts.read_plan():
             return False
 
-        prompt = await self.briefing.build_plan_schema_repair_prompt(self.task)
+        build_prompt = partial(self.briefing.build_plan_schema_repair_prompt, self.task)
         try:
-            await self._invoke(ARCHITECT, prompt, self.worktree)
+            await self._invoke(ARCHITECT, build_prompt, self.worktree)
         except Exception as e:
             logger.warning(
                 'Task %s: repair prompt invocation failed: %s',
@@ -8525,8 +8548,6 @@ class TaskWorkflow:
             await self._reconcile_done_step_commits()
             self.plan = self.artifacts.read_plan()
 
-            wip_notice = await self._detect_tip_wip_commits()
-
             # Snapshot completed steps before invocation
             completed_before = {
                 s['id']
@@ -8535,12 +8556,12 @@ class TaskWorkflow:
                 if isinstance(s, dict) and s.get('status') == 'done'
             }
 
-            prompt = await self.briefing.build_implementer_prompt(
-                self.plan, rebase_notice=rebase_notice,
-                task_id=self.task_id, wip_notice=wip_notice,
-            )
             pre_head = await self._get_head_commit()
-            result = await self._invoke(IMPLEMENTER, prompt, self.worktree)
+            result = await self._invoke(
+                IMPLEMENTER,
+                partial(self._build_implementer_prompt, rebase_notice),
+                self.worktree,
+            )
 
             self.metrics.execute_iterations += 1
 
@@ -8599,6 +8620,14 @@ class TaskWorkflow:
                     self.task_id,
                 )
             self.artifacts.stamp_plan_provenance(self.session_id)
+
+            if result.retry_aborted:
+                logger.info(
+                    'Task %s: implementer retry cancelled — no pending steps '
+                    'remain; not classifying the cancelled attempt',
+                    self.task_id,
+                )
+                continue
 
             if not result.success:
                 logger.warning(
@@ -9016,12 +9045,13 @@ class TaskWorkflow:
             )
             return None
 
-        prompt = await self.briefing.build_completion_judge_prompt(
-            plan=self.plan,
-            iteration_log=iteration_log,
-            diff=diff,
-            task_id=self.task_id,
-        )
+        async def build_prompt() -> str:
+            return await self.briefing.build_completion_judge_prompt(
+                plan=self._live_plan(),
+                iteration_log=iteration_log,
+                diff=diff,
+                task_id=self.task_id,
+            )
 
         # I-FRESH: never consume a stale verdict from a prior invocation on
         # this same worktree (mirrors the merger/reviewer pre-spawn clear,
@@ -9030,7 +9060,7 @@ class TaskWorkflow:
 
         pre_cost = self.metrics.total_cost_usd
         try:
-            result = await self._invoke(JUDGE, prompt, self.worktree)
+            result = await self._invoke(JUDGE, build_prompt, self.worktree)
         except Exception as exc:
             logger.warning(
                 f'Task {self.task_id}: judge invocation raised '
@@ -9221,12 +9251,11 @@ class TaskWorkflow:
         (the documented manual `git show <wip-sha>` verification), never
         sinks the iteration loop.
 
-        Callers should re-read ``self.plan = self.artifacts.read_plan()``
-        immediately after this so a reconciled commit is picked up before
-        ``_detect_tip_wip_commits`` runs (see ``_execute_iterations``) — that
-        ordering lets the detector's own done-step dedup correctly exclude
-        the now-reconciled sha instead of re-surfacing it as unattributed
-        pending work.
+        Callers run this before the implementer prompt builder re-reads
+        plan.json for ``_detect_tip_wip_commits`` (see
+        ``_execute_iterations``) — that ordering lets the detector's own
+        done-step dedup correctly exclude the now-reconciled sha instead of
+        re-surfacing it as unattributed pending work.
         """
         if self.worktree is None or self.git_ops is None or self.artifacts is None:
             return
@@ -9412,7 +9441,27 @@ class TaskWorkflow:
         )
         self.escalation_queue.submit(esc)
 
-    async def _detect_tip_wip_commits(self) -> list[dict]:
+    def _live_plan(self) -> dict:
+        """plan.json as it is on disk NOW — what every prompt builder renders.
+
+        Never ``self.plan``: that is whatever was last read, and a builder is
+        awaited again before every retry, possibly after a long cap wait.
+        """
+        assert self.artifacts is not None
+        return self.artifacts.read_plan()
+
+    async def _build_implementer_prompt(self, rebase_notice: dict | None) -> str | None:
+        """The execute loop's implementer prompt, or None once no step is pending."""
+        assert self.artifacts is not None
+        if not self.artifacts.get_pending_steps():
+            return None
+        plan = self._live_plan()
+        return await self.briefing.build_implementer_prompt(
+            plan, rebase_notice=rebase_notice,
+            task_id=self.task_id, wip_notice=await self._detect_tip_wip_commits(plan),
+        )
+
+    async def _detect_tip_wip_commits(self, plan: dict) -> list[dict]:
         """Detect a contiguous run of WIP safety-commits sitting at HEAD.
 
         Several harness paths auto-commit uncommitted work as a safety net
@@ -9434,7 +9483,7 @@ class TaskWorkflow:
         Returns HEAD-first ``[{'sha': ..., 'subject': ...}]`` for the
         contiguous run of WIP safety-commits at HEAD (stops at the first
         non-WIP commit), excluding any SHA already recorded as the
-        ``commit`` of a done plan step (dedup against ``self.plan``).
+        ``commit`` of a done step of *plan*.
         """
         if self.worktree is None or self.git_ops is None or self.artifacts is None:
             return []
@@ -9453,7 +9502,7 @@ class TaskWorkflow:
             recorded = {
                 s['commit']
                 for col in ('prerequisites', 'steps')
-                for s in self.plan.get(col, [])
+                for s in plan.get(col, [])
                 if isinstance(s, dict) and s.get('status') == 'done' and s.get('commit')
             }
             # Prefix-match rather than exact-match: the prompt shows an
@@ -10189,11 +10238,15 @@ class TaskWorkflow:
 
             # Invoke debugger
             self.plan = self.artifacts.read_plan()
-            prompt = await self.briefing.build_debugger_prompt(
-                result.failure_report(), self.plan, task_id=self.task_id,
-            )
+            failure_report = result.failure_report()
+
+            async def build_prompt(failure_report: str = failure_report) -> str:
+                return await self.briefing.build_debugger_prompt(
+                    failure_report, self._live_plan(), task_id=self.task_id,
+                )
+
             pre_head = await self._get_head_commit()
-            debug_result = await self._invoke(DEBUGGER, prompt, self.worktree)
+            debug_result = await self._invoke(DEBUGGER, build_prompt, self.worktree)
 
             # Write debugger iteration log entry
             self.artifacts.append_iteration_log({
@@ -10333,7 +10386,10 @@ class TaskWorkflow:
         if n == 0:
             return []
         fail_safe = [NOT_SETTLED] * n
-        prompt = build_resettled_adjudicator_prompt(current_list, prior_settled)
+
+        async def build_prompt() -> str:
+            return build_resettled_adjudicator_prompt(current_list, prior_settled)
+
         schema = {
             'type': 'object',
             'properties': {
@@ -10357,7 +10413,7 @@ class TaskWorkflow:
         try:
             assert self.worktree is not None
             result = await self._invoke(
-                _RESETTLED_ADJUDICATOR, prompt, self.worktree,
+                _RESETTLED_ADJUDICATOR, build_prompt, self.worktree,
                 output_schema=schema,
             )
         except Exception as exc:
@@ -10619,7 +10675,8 @@ class TaskWorkflow:
         scope section into the reviewer prompt (task 2750).
         """
         assert self.worktree is not None and self.artifacts is not None
-        prompt = await self.briefing.build_reviewer_prompt(
+        build_prompt = partial(
+            self.briefing.build_reviewer_prompt,
             role.name, diff, amendment_suggestions=amendment_suggestions,
             task=self.task,
         )
@@ -10641,7 +10698,7 @@ class TaskWorkflow:
         # verdicts/ artifact and an ERROR reviews/ mirror seconds later.
         # Salvage must therefore run here, BEFORE any respawn.
         try:
-            result = await self._invoke(role, prompt, self.worktree)
+            result = await self._invoke(role, build_prompt, self.worktree)
         except (
             TimeoutError,
             AllAccountsCappedException,
@@ -10838,10 +10895,11 @@ class TaskWorkflow:
         """Feed review feedback back to architect for re-planning."""
         assert self.worktree is not None and self.artifacts is not None
         self.plan = self.artifacts.read_plan()
-        prompt = await self.briefing.build_replan_prompt(
+        build_prompt = partial(
+            self.briefing.build_replan_prompt,
             self.task, reviews.format_for_replan(),
         )
-        await self._invoke(ARCHITECT, prompt, self.worktree)
+        await self._invoke(ARCHITECT, build_prompt, self.worktree)
         self.plan = self.artifacts.read_plan()
 
     async def _commit_amendment_wip(self, amendment_round: int) -> str | None:
@@ -10920,14 +10978,18 @@ class TaskWorkflow:
         if corrupted:
             self._escalate_corruption(corrupted)
 
-        prompt = await self.briefing.build_amender_prompt(
-            plan=self.plan,
-            suggestions=in_scope,
-            locked_modules=list(self.modules),
-            task_id=self.task_id,
-        )
+        locked_modules = list(self.modules)
+
+        async def build_prompt() -> str:
+            return await self.briefing.build_amender_prompt(
+                plan=self._live_plan(),
+                suggestions=in_scope,
+                locked_modules=locked_modules,
+                task_id=self.task_id,
+            )
+
         pre_head = await self._get_head_commit()
-        await self._invoke(IMPLEMENTER, prompt, self.worktree)
+        await self._invoke(IMPLEMENTER, build_prompt, self.worktree)
 
         self.artifacts.append_iteration_log({
             'iteration': self.metrics.execute_iterations,
@@ -10974,12 +11036,15 @@ class TaskWorkflow:
         self._plan_tightened = True
 
         before = set(self.plan.get('files', []))
-        prompt = await self.briefing.build_plan_tightening_prompt(
-            self.task, self.plan, not_touched, worktree=self.worktree,
-        )
+
+        async def build_prompt() -> str:
+            return await self.briefing.build_plan_tightening_prompt(
+                self.task, self._live_plan(), not_touched, worktree=self.worktree,
+            )
+
         assert self.worktree is not None
         assert self.artifacts is not None
-        result = await self._invoke(ARCHITECT, prompt, self.worktree)
+        result = await self._invoke(ARCHITECT, build_prompt, self.worktree)
         if not result.success:
             return False
 
@@ -11859,8 +11924,8 @@ class TaskWorkflow:
             f"Task: {self.task.get('title', '')}\n"
             f"{self.task.get('description', '')}"
         )
-        prompt = await self.briefing.build_merger_prompt(
-            conflict_details, task_intent,
+        build_prompt = partial(
+            self.briefing.build_merger_prompt, conflict_details, task_intent,
         )
 
         # Rebase onto current main so MERGER works on up-to-date state
@@ -11868,7 +11933,7 @@ class TaskWorkflow:
         # I-FRESH: never consume a stale verdict from a prior invocation on
         # this same worktree (mirrors steward.py's pre-triage clear).
         self.artifacts.clear_verdict('merger')
-        merger_result = await self._invoke(MERGER, prompt, self.worktree)
+        merger_result = await self._invoke(MERGER, build_prompt, self.worktree)
 
         # Read the merger's structured disposition instead of grepping its
         # free-text output for "BLOCKED" (task 2483 / PRD task γ). Defensive
@@ -13407,11 +13472,23 @@ class TaskWorkflow:
     async def _invoke(
         self,
         role: AgentRole,
-        prompt: str,
+        build_prompt: PromptBuilder,
         cwd: Path,
         output_schema: dict | None = None,
     ) -> AgentResult:
-        """Invoke an agent with role-specific configuration."""
+        """Invoke an agent with role-specific configuration.
+
+        *build_prompt* is awaited for the first dispatch and again before
+        every retry, so a retry is briefed from current state; it may return
+        None only to cancel a retry.
+        """
+        prompt = await build_prompt()
+        if prompt is None:
+            raise ValueError(
+                f'Task {self.task_id} [{role.name}]: the prompt builder declined '
+                f'the first dispatch; a prompt builder may decline only a retry '
+                f'— check for work before invoking'
+            )
         timeouts_cfg = self.config.timeouts
         backends_cfg = self.config.backends
 
@@ -13556,10 +13633,8 @@ class TaskWorkflow:
         # subprocess starts and cleared in the finally below — its presence
         # ⇔ "agent was in flight when the orchestrator exited".
         #
-        # Prompt-substitution ownership: cli_invoke owns the resume-continuation
-        # prompt swap (CRASH_RECOVERY_RESUME_PROMPT = 'continue').  Workflow
-        # always passes the real task prompt so that cli_invoke's
-        # original_prompt capture is correct for any fresh-fallback invocation.
+        # cli_invoke owns the resume-continuation prompt swap; a fresh
+        # fallback is briefed by build_prompt, handed down as rebuild_prompt.
         resume_session_id: str | None = None
         if (
             self._pending_resume_session_id
@@ -13834,6 +13909,7 @@ class TaskWorkflow:
                 config_dir=self._config_dir,
                 invoke_fn=invoke_agent,
                 prompt=prompt,
+                rebuild_prompt=build_prompt,
                 system_prompt=self._resolve_role_system_prompt(role, model),
                 cwd=cwd,
                 model=model,
@@ -14119,6 +14195,9 @@ class TaskWorkflow:
                     # false-positive rate computable from runs.db, since a
                     # True-only key leaves the denominator unknowable.
                     'ended_awaiting_background': result.ended_awaiting_background,
+                    # Present-and-false too: the rate at which a prompt
+                    # builder cancels a retry of finished work (task 5730).
+                    'retry_aborted': result.retry_aborted,
                     # Same present-and-false rationale for the cap pair, so
                     # ceiling saturation is computable.  model_id is the exact
                     # CLI-served version beside the alias in `model`; None

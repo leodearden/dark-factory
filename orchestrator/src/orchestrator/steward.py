@@ -44,7 +44,7 @@ import contextlib
 import json
 import logging
 from collections.abc import MutableMapping, MutableSet
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -690,12 +690,21 @@ class TaskSteward:
                     # False included, so the false-positive rate has a
                     # denominator.
                     'ended_awaiting_background': result.ended_awaiting_background,
+                    'retry_aborted': result.retry_aborted,
                 },
             )
 
+        # A declined retry means the escalation stopped being pending during
+        # the run, so the returned attempt is no verdict on it: neither
+        # recovery carve-out below applies.
+        if result.retry_aborted:
+            logger.info(
+                f'Steward for task {self.task_id}: retry cancelled — '
+                f'{escalation.id} is no longer pending'
+            )
         # Timeout-kill: treat as recoverable — do NOT consume retry budget.
         # The escalation remains pending so the run loop re-queues it naturally.
-        if is_timeout:
+        elif is_timeout:
             self.metrics.timeouts_recovered += 1
             self._timeout_counts[escalation.id] = (
                 self._timeout_counts.get(escalation.id, 0) + 1
@@ -709,8 +718,7 @@ class TaskSteward:
                 f'{self.config.steward_max_timeouts_per_escalation})'
             )
             return
-
-        if _is_empty_output(result):
+        elif _is_empty_output(result):
             self.metrics.empty_outputs_recovered += 1
             self._empty_output_counts[escalation.id] = (
                 self._empty_output_counts.get(escalation.id, 0) + 1
@@ -816,12 +824,20 @@ class TaskSteward:
         delivers that real prompt to the agent on resume, instead of its
         crash-recovery placeholder ('continue').
 
-        On an unresumable cap hit (no session_id survives the capped call),
-        the shared loop calls back into ``rebuild_prompt`` below to rebuild
-        the full initial prompt with freshly-gathered pending escalations —
-        context is lost across account switches.
+        Before every re-dispatch the shared loop awaits ``rebuild_prompt``
+        below.  It re-reads *escalation* from the queue and declines (None)
+        once that record is no longer pending, so a retry never re-runs
+        finished work.  Otherwise it rebuilds the full initial prompt from
+        the LIVE record and freshly-gathered pending escalations; a fresh
+        retry sends it, a resumed one keeps its own continuation.  The
+        handled copy's ``detail``/``summary`` are laid over the live record
+        because pre-triage replaces exactly those two fields on a copy it
+        never persists.
         """
-        async def rebuild_prompt(session_lost: bool) -> str:
+        async def rebuild_prompt() -> str | None:
+            live = self.escalation_queue.get(escalation.id)
+            if live is None or live.status != 'pending':
+                return None
             pending_dicts = [
                 e.to_dict()
                 for e in self.escalation_queue.get_by_task(
@@ -830,7 +846,9 @@ class TaskSteward:
             ]
             return await self.briefing.build_steward_initial_prompt(
                 task=self.task,
-                escalation=escalation.to_dict(),
+                escalation=replace(
+                    live, detail=escalation.detail, summary=escalation.summary,
+                ).to_dict(),
                 pending_escalations=pending_dicts,
                 worktree=self.worktree,
             )
