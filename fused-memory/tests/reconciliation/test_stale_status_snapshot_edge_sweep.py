@@ -4319,3 +4319,87 @@ class TestSweepStaleStatusSnapshotEdgesForTask:
                 f'Expected exactly one extraction entry for {str(fact)!r}, '
                 f'got {fact.reads}'
             )
+
+
+# --------------------------------------------------------------------------- #
+# Overlapping sweeps of one project (task 4851)
+# --------------------------------------------------------------------------- #
+
+
+class _LiveEdgeGraph:
+    """Valid edges that stop enumerating once retired, yielding inside every call.
+
+    The yields let two sweeps interleave the way concurrent asyncio tasks do in
+    production: both reads can land before either retirement.
+    """
+
+    def __init__(self, edges: list[dict]):
+        self.valid = {edge['uuid']: edge for edge in edges}
+
+    async def _read(self, keep) -> tuple[dict, object]:
+        await asyncio.sleep(0)
+        edges = [edge for edge in self.valid.values() if keep(edge['fact'])]
+        return {'entity-a': edges}, complete_paged_read(rows_seen=len(edges))
+
+    async def enumerate_all_valid_edges(self, *, group_id):
+        return await self._read(lambda fact: True)
+
+    async def enumerate_valid_edges_mentioning(self, substring, *, group_id):
+        return await self._read(lambda fact: substring in fact)
+
+    async def retire(self, uuid, **_kwargs):
+        await asyncio.sleep(0)
+        self.valid.pop(uuid, None)
+
+
+class TestOverlappingSweepsOfOneProject:
+    """One superseding fact per contradicted task, however the sweeps overlap.
+
+    A cancellation cascade starts one targeted sweep per task without awaiting
+    any of them, and a full cycle's Stage-1 sweep can start beside them. Each
+    overlap below would otherwise read the aggregate edge twice while it is
+    still valid and write every task's superseding fact twice.
+    """
+
+    NOW = datetime(2026, 10, 10, 12, 0, tzinfo=UTC)
+    AGGREGATE = _edge('e-agg', 'Tasks 4001 and 4002 are blocked')
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'sweep_task_ids',
+        [(4001, 4002), (None, 4001), (4001, None)],
+        ids=['two-per-task', 'periodic-then-per-task', 'per-task-then-periodic'],
+    )
+    async def test_each_task_gets_exactly_one_superseding_fact(self, sweep_task_ids):
+        graph = _LiveEdgeGraph([self.AGGREGATE])
+        memory_service = MagicMock()
+        memory_service.graphiti = graph
+        memory_service.update_edge = AsyncMock(side_effect=graph.retire)
+        memory_service.add_memory = AsyncMock()
+        taskmaster = _make_taskmaster()
+        taskmaster.get_statuses = AsyncMock(
+            return_value={'4001': 'cancelled', '4002': 'cancelled'},
+        )
+
+        async def sweep(task_id):
+            if task_id is None:
+                return await sweep_stale_status_snapshot_edges(
+                    memory_service, taskmaster, 'test_project', '/tmp/reify',
+                    run_id='run-periodic', now=self.NOW,
+                )
+            return await sweep_stale_status_snapshot_edges_for_task(
+                memory_service, taskmaster, 'test_project', '/tmp/reify', task_id,
+                run_id=f'run-{task_id}', now=self.NOW,
+            )
+
+        results = await asyncio.gather(*(sweep(task_id) for task_id in sweep_task_ids))
+
+        written = sorted(
+            call.kwargs['content'] for call in memory_service.add_memory.await_args_list
+        )
+        assert written == [
+            build_supersede_fact(4001, 'cancelled', self.NOW),
+            build_supersede_fact(4002, 'cancelled', self.NOW),
+        ]
+        assert sum(stats['invalidated'] for stats in results) == 1
+        assert sum(stats['superseded'] for stats in results) == 2

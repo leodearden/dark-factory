@@ -263,6 +263,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import weakref
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import NamedTuple
@@ -275,6 +276,7 @@ from fused_memory.reconciliation.task_filter import (
     STRICT_CLAUSE_BOUNDARY_RE,
     TASK_REF_RE,
 )
+from fused_memory.utils.validation import canonicalize_project_id
 
 logger = logging.getLogger(__name__)
 
@@ -2224,6 +2226,47 @@ async def _read_corpus(
     return _CorpusRead(flatten_dedup_edges(grouped), paged.complete, paged.incomplete_kind)
 
 
+# Per event loop, per canonical project: the lock that keeps two sweeps of one
+# project from overlapping. See ``_sweep_lock_for``.
+_SWEEP_LOCKS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
+] = weakref.WeakKeyDictionary()
+
+
+def _sweep_lock_for(project_id: str) -> asyncio.Lock:
+    """The lock every sweep of *project_id* holds, on the running loop. (task 4851)
+
+    One superseding fact per contradicted task holds only if each sweep READS
+    after the previous one's retirements: a retired edge stops enumerating,
+    and that is the whole dedup. Overlapping sweeps of one project would both
+    read the same still-valid edge, both retire it and both write its facts —
+    a cancellation cascade starts one targeted sweep per task without awaiting
+    any, and a full cycle's Stage-1 sweep can start beside them.
+
+    Keyed by the canonical project id, as the graph itself is, and by event
+    loop, because an ``asyncio.Lock`` binds to the first loop that waits on
+    it. Serializes within one process only, which is where both callers run.
+    """
+    locks = _SWEEP_LOCKS.setdefault(asyncio.get_running_loop(), {})
+    key = canonicalize_project_id(project_id)
+    lock = locks.get(key)
+    if lock is None:
+        lock = locks[key] = asyncio.Lock()
+    return lock
+
+
+def _seed_stats() -> dict:
+    return {
+        'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 0,
+        'superseded': 0, 'supersede_errors': 0, 'supersede_skipped': 0,
+        # Seeded UNKNOWN, not True: neither key is a count, and until the
+        # enumeration has actually returned nothing has been proven about the
+        # corpus. Every early return therefore reports the honest 'no corpus
+        # observed' rather than a fabricated clean read. (task 4386)
+        'enumeration_complete': None, 'enumeration_incomplete_kind': None,
+    }
+
+
 async def _sweep_status_snapshot_edges(
     memory_service,
     taskmaster,
@@ -2235,26 +2278,35 @@ async def _sweep_status_snapshot_edges(
     now: datetime | None,
     log: logging.Logger,
 ) -> dict:
-    """The one core behind both public sweeps. (task 4851)
+    """The one core behind both public sweeps, one sweep per project at a time.
 
     *task_id* is consulted in exactly two places: THE READ
     (``_read_corpus``) and THE POST-FILTER right after the single extraction
     pass. Everything else — the status census, selection, the counted
-    invalidation loop, the supersede ceiling and the stats — is shared.
+    invalidation loop, the supersede ceiling and the stats — is shared, and
+    runs under ``_sweep_lock_for(project_id)``. (task 4851)
     """
-    stats = {
-        'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 0,
-        'superseded': 0, 'supersede_errors': 0, 'supersede_skipped': 0,
-        # Seeded UNKNOWN, not True: neither key is a count, and until the
-        # enumeration has actually returned nothing has been proven about the
-        # corpus. Every early return below therefore reports the honest
-        # 'no corpus observed' rather than a fabricated clean read. (task 4386)
-        'enumeration_complete': None, 'enumeration_incomplete_kind': None,
-    }
-
     if not taskmaster or not project_root:
-        return stats
+        return _seed_stats()
+    async with _sweep_lock_for(project_id):
+        return await _sweep_under_lock(
+            memory_service, taskmaster, project_id, project_root,
+            task_id=task_id, run_id=run_id, now=now, log=log,
+        )
 
+
+async def _sweep_under_lock(
+    memory_service,
+    taskmaster,
+    project_id: str,
+    project_root: str,
+    *,
+    task_id: int | None,
+    run_id: str,
+    now: datetime | None,
+    log: logging.Logger,
+) -> dict:
+    stats = _seed_stats()
     corpus = await _read_corpus(memory_service, project_id, task_id, log=log)
     stats['enumeration_complete'] = corpus.complete
     stats['enumeration_incomplete_kind'] = corpus.incomplete_kind
@@ -2369,17 +2421,20 @@ async def _sweep_status_snapshot_edges(
         # cycle for as long as the invalidation kept failing — and would
         # meanwhile leave the graph asserting both that the task is blocked
         # (the edge is still valid) and that it is not.
-        for task_id in sorted(blocked_edge_ids.get(edge['uuid'], set())):
-            status = statuses.get(str(task_id))
-            if not is_blocked_assertion_contradicted(status) or task_id in superseded_ids:
+        for contradicted_id in sorted(blocked_edge_ids.get(edge['uuid'], set())):
+            status = statuses.get(str(contradicted_id))
+            if (
+                not is_blocked_assertion_contradicted(status)
+                or contradicted_id in superseded_ids
+            ):
                 continue
             if supersede_attempts >= _MAX_SUPERSEDE_WRITES_PER_CYCLE:
-                supersede_skipped_ids.add(task_id)
+                supersede_skipped_ids.add(contradicted_id)
                 continue
             supersede_attempts += 1
             try:
                 await memory_service.add_memory(
-                    content=build_supersede_fact(task_id, status, invalidate_at),
+                    content=build_supersede_fact(contradicted_id, status, invalidate_at),
                     category='temporal_facts',
                     project_id=project_id,
                     agent_id=_SWEEP_AGENT_ID,
@@ -2387,14 +2442,14 @@ async def _sweep_status_snapshot_edges(
                 )
                 stats['superseded'] += 1
                 # Marked as done only HERE — see superseded_ids' comment.
-                superseded_ids.add(task_id)
+                superseded_ids.add(contradicted_id)
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
             except Exception:
                 log.exception(
                     'stale_status_snapshot_edge_sweep: add_memory supersede failed '
                     'for task_id=%s (edge uuid=%s already invalidated)',
-                    task_id, edge['uuid'],
+                    contradicted_id, edge['uuid'],
                 )
                 stats['supersede_errors'] += 1
 

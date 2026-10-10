@@ -73,10 +73,11 @@ logger = logging.getLogger(__name__)
 # doesn't fan out a second time on each descendant.
 _PARENT_CANCELLED_REOPEN_PREFIX = 'parent_cancelled:'
 
-# Transitions that can contradict a status snapshot about the task itself:
-# done/cancelled any snapshot, deferred only a blocked assertion. 'blocked'
-# contradicts nothing about the task, and an unblock to 'pending' never
-# reaches targeted reconciliation, so it stays periodic-sweep-only (task 4851).
+# Transitions after which a status snapshot naming the task may have gone
+# stale. They decide only WHEN the per-task sweep runs: it re-reads live
+# statuses and applies every shipped rule to every id of each edge naming the
+# task, sibling ids included. An unblock to 'pending' never reaches targeted
+# reconciliation, so it stays periodic-sweep-only (task 4851).
 _SNAPSHOT_CONTRADICTING_TRANSITIONS: frozenset[str] = frozenset(
     {'done', 'cancelled', 'deferred'}
 )
@@ -379,8 +380,9 @@ class TargetedReconciler:
         - ``stale_status_snapshot_sweep_skipped`` for a non-integer (subtask)
           id: snapshot ids are ints by construction, so nothing can match;
         - ``stale_status_snapshot_sweep_deferred_to_cycle`` while a full cycle
-          is active: its Stage-1 sweep owns that window, and racing it could
-          double-write the same superseding fact;
+          is active: its Stage-1 sweep retires the same edges, so this read
+          would be redundant (overlap itself is safe — the sweep module
+          serializes every sweep of a project);
         - ``stale_status_snapshot_edges_swept`` carrying the sweep's stats;
         - ``stale_status_snapshot_sweep_error`` when anything else raised.
         """
