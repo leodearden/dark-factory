@@ -347,11 +347,13 @@ class TestDispositionsMatchTheCode:
         """
         assert len(archival_ref_sites) >= 5, (
             f'Only {len(archival_ref_sites)} archival reference site(s) found: '
-            f'{sorted(archival_ref_sites)}. Five are known — '
+            f'{sorted(archival_ref_sites)}. Seven are known — '
             f'TaskWorkflow._invoke and run_dry_run_unblock (producer hooks), '
             f'GitOps.cleanup_worktree and '
             f'TaskWorkflow._archive_then_cleanup_config_dir (teardown, task '
-            f'3619), and Harness._sweep_orphaned_transcripts (the boot-time '
-            f'SIGKILL-tail sweeper, task 3619) — is repo_root correct? '
-            f'({_REPO_ROOT})'
+            f'3619), Harness._sweep_orphaned_transcripts (the boot-time '
+            f'SIGKILL-tail sweeper, task 3619), and in fused-memory '
+            f'BaseStage._archive_stage_transcripts (producer hook) and '
+            f'cli_stage_runner.gc_run_config_dir (teardown, both task 3972) — '
+            f'is repo_root correct? ({_REPO_ROOT})'
         )
