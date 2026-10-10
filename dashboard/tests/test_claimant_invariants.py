@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from _tasks_db_fixture import task_row, write_tasks_db
+
 from dashboard.data.claimant_invariants import scan_root_invariants
 from dashboard.data.db import DbPool
 
