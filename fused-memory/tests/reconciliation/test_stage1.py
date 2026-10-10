@@ -3045,6 +3045,14 @@ class TestStaleStatusSnapshotEdgeSweepWiring:
             f"Expected report.stats['stale_status_snapshot_edges_scanned'] == 2; "
             f'got stats={report.stats!r}'
         )
+        assert report.stats.get('stale_status_snapshot_edges_candidates') == 1, (
+            f'Expected the one stale edge surfaced as a candidate; '
+            f'got stats={report.stats!r}'
+        )
+        assert report.stats.get('stale_status_snapshot_edges_errors') == 0, (
+            f'Expected the error counter surfaced at 0 on a clean run rather '
+            f'than absent; got stats={report.stats!r}'
+        )
         assert (
             report.stats.get(STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY) is True
         ), (
@@ -3056,6 +3064,95 @@ class TestStaleStatusSnapshotEdgeSweepWiring:
             report.stats.get(STATUS_SNAPSHOT_ENUMERATION_INCOMPLETE_KIND_STAT_KEY)
             is None
         ), f'A complete read has no incompleteness kind; got stats={report.stats!r}'
+
+    @staticmethod
+    def _stale_and_healthy_consolidator():
+        stage = make_consolidator(project_root='/tmp/reify')
+        stale_edge = {
+            'uuid': 'edge-stale', 'fact': 'Task 142 is an active pending task', 'name': '',
+        }
+        healthy_edge = {
+            'uuid': 'edge-healthy', 'fact': 'Task 999 is an active pending task', 'name': '',
+        }
+        stage.memory.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [stale_edge, healthy_edge]},
+                complete_paged_read(rows_seen=2),
+            ),
+        )
+        assert stage.taskmaster is not None  # AsyncMock() from make_consolidator
+        stage.taskmaster.get_statuses = AsyncMock(
+            return_value={'142': 'done', '999': 'pending'},
+        )
+        return stage
+
+    @staticmethod
+    async def _run_with_empty_base_report(stage, run_id):
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            return await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id=run_id,
+            )
+
+    @pytest.mark.asyncio
+    async def test_invalidation_failure_is_visible_in_stats(self):
+        """A sweep that errored on every edge must not read as healthy. (task 4851)
+
+        With only 'invalidated' surfaced, a 0 there reads identically as
+        'nothing was stale' and 'every invalidation failed' — the blind spot
+        task 3079 hit. Surfacing candidates and errors beside it also pins
+        the sweep's documented identity invalidated == candidates - errors
+        at the stats layer.
+        """
+        stage = self._stale_and_healthy_consolidator()
+        stage.memory.update_edge = AsyncMock(side_effect=RuntimeError('graphiti down'))
+
+        report = await self._run_with_empty_base_report(stage, 'run-4851-invalidation-fails')
+
+        assert report.stats.get('stale_status_snapshot_edges_invalidated') == 0
+        assert report.stats.get('stale_status_snapshot_edges_candidates') == 1, (
+            f'got stats={report.stats!r}'
+        )
+        assert report.stats.get('stale_status_snapshot_edges_errors') == 1, (
+            f'got stats={report.stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_enumeration_failure_inside_the_sweep_surfaces_errors_not_absence(self):
+        """A read failure the sweep SWALLOWS still yields present keys. (task 4851)
+
+        The sweep catches its own enumeration failure and returns errors=1,
+        so the keys are present: errors 1, candidates 0, and an UNKNOWN
+        enumeration_complete. Contrast
+        test_sweep_failure_is_swallowed_and_other_stats_remain_intact, where
+        the sweep itself RAISES and no key is set at all.
+        """
+        stage = self._stale_and_healthy_consolidator()
+        stage.memory.graphiti.enumerate_all_valid_edges = AsyncMock(
+            side_effect=RuntimeError('falkordb down'),
+        )
+        stage.memory.update_edge = AsyncMock()
+
+        report = await self._run_with_empty_base_report(stage, 'run-4851-enumeration-fails')
+
+        stage.memory.update_edge.assert_not_awaited()
+        assert report.stats.get('stale_status_snapshot_edges_errors') == 1, (
+            f'got stats={report.stats!r}'
+        )
+        assert report.stats.get('stale_status_snapshot_edges_candidates') == 0, (
+            f'got stats={report.stats!r}'
+        )
+        assert STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY in report.stats
+        assert report.stats[STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY] is None
 
     @pytest.mark.asyncio
     async def test_run_retires_a_stale_blocked_assertion_and_supersedes_it(self):
@@ -3216,12 +3313,14 @@ class TestStaleStatusSnapshotEdgeSweepWiring:
         )
         assert 'stale_status_snapshot_edges_scanned' not in report.stats
         for key in (
+            'stale_status_snapshot_edges_candidates',
+            'stale_status_snapshot_edges_errors',
             'stale_blocked_edges_superseded',
             'stale_blocked_edges_supersede_errors',
             'stale_blocked_edges_supersede_skipped',
         ):
             assert key not in report.stats, (
-                f'The task-3037 stat {key!r} follows the same convention as its '
+                f'The stat {key!r} follows the same convention as its '
                 'siblings: a failed sweep sets NO key at all, rather than a 0 '
                 'that would read as "the sweep ran and found nothing"'
             )

@@ -2314,10 +2314,10 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # human-gate-owned, so the deterministic gate-owned
             # suggested_action normalizer rewrites nothing.
             'gate_owned_suggested_actions_normalized': 0,
-            # ELEVEN keys from the two stale-edge sweeps, not the four this
+            # THIRTEEN keys from the two stale-edge sweeps, not the four this
             # task added (task 4386).  The count is what needs explaining: the
             # consolidator's per-sweep `else:` branch copies out the WHOLE key
-            # set — 7 for the status-snapshot sweep, 4 for the priority-override
+            # set — 9 for the status-snapshot sweep, 4 for the priority-override
             # sweep — and before this task these tests never reached that branch
             # at all, so none of the 7 pre-existing keys appeared here either.
             # They did not reach it because this class's memory_service is a bare
@@ -2331,6 +2331,8 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # whole) with no incompleteness kind.
             'stale_status_snapshot_edges_invalidated': 0,
             'stale_status_snapshot_edges_scanned': 0,
+            'stale_status_snapshot_edges_candidates': 0,
+            'stale_status_snapshot_edges_errors': 0,
             'stale_blocked_edges_superseded': 0,
             'stale_blocked_edges_supersede_errors': 0,
             'stale_blocked_edges_supersede_skipped': 0,
@@ -2521,10 +2523,10 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # human-gate-owned, so the deterministic gate-owned
             # suggested_action normalizer rewrites nothing.
             'gate_owned_suggested_actions_normalized': 0,
-            # ELEVEN keys from the two stale-edge sweeps, not the four this
+            # THIRTEEN keys from the two stale-edge sweeps, not the four this
             # task added (task 4386).  The count is what needs explaining: the
             # consolidator's per-sweep `else:` branch copies out the WHOLE key
-            # set — 7 for the status-snapshot sweep, 4 for the priority-override
+            # set — 9 for the status-snapshot sweep, 4 for the priority-override
             # sweep — and before this task these tests never reached that branch
             # at all, so none of the 7 pre-existing keys appeared here either.
             # They did not reach it because this class's memory_service is a bare
@@ -2538,6 +2540,8 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # whole) with no incompleteness kind.
             'stale_status_snapshot_edges_invalidated': 0,
             'stale_status_snapshot_edges_scanned': 0,
+            'stale_status_snapshot_edges_candidates': 0,
+            'stale_status_snapshot_edges_errors': 0,
             'stale_blocked_edges_superseded': 0,
             'stale_blocked_edges_supersede_errors': 0,
             'stale_blocked_edges_supersede_skipped': 0,
