@@ -629,7 +629,7 @@ def keyword_truncation_end(head: str, end: int) -> int:
     """Extend a keyword-match end offset across an npx ``@<version>`` suffix.
 
     Task 3931 / esc-3805-1. Both scopers — ``verify._scope_to_keyword`` and
-    ``verify_plan._scope_prefix_to_keyword`` — truncate their matched segment
+    ``verify_plan.scope_prefix_to_keyword`` — truncate their matched segment
     to everything up to and including the first occurrence of the keyword,
     historically with the BYTE-OFFSET slice ``head[: idx + len(keyword)]``.
     That slice cuts mid-token at the ``@`` of a pinned npx package spec, so

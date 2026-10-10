@@ -219,7 +219,7 @@ def _scope_to_keyword(cmd: str | None, keyword: str, files: list[str]) -> str | 
     below return *cmd* with its chain intact, so nothing is dropped there and
     nothing is reported.
 
-    Lockstep with ``verify_plan._scope_prefix_to_keyword`` (the ``VerifyCmd``-
+    Lockstep with ``verify_plan.scope_prefix_to_keyword`` (the ``VerifyCmd``-
     layer counterpart) is now STRUCTURAL rather than a convention: both route
     through that one shared ``split_chain_tail`` gate. When the gate rejects,
     ``head is cmd`` and ``tail == ''``, so the body below collapses to its
@@ -240,7 +240,7 @@ def _scope_to_keyword(cmd: str | None, keyword: str, files: list[str]) -> str | 
     # last cached. See `keyword_truncation_end` for the boundary rule and why
     # it is anchored on `@` rather than "keep the whole token"; the shared
     # helper is also what keeps this in structural lockstep with
-    # `verify_plan._scope_prefix_to_keyword`.
+    # `verify_plan.scope_prefix_to_keyword`.
     retained = head[: keyword_truncation_end(head, idx + len(keyword))]
     parsed = parse_config_command(retained)
     if parsed.tool is ToolKind.OPAQUE or parsed.raw is not None:

@@ -209,7 +209,7 @@ class PlannedRun:
     FIDELITY: it records the scoping INTENT the decision layer computed, NOT
     a guarantee about what the command actually ran on — the executed command
     may be BROADER, never narrower. Two reachable divergences: (i) when
-    :func:`_scope_prefix_to_keyword` cannot narrow (the keyword is absent, or
+    :func:`scope_prefix_to_keyword` cannot narrow (the keyword is absent, or
     the prefix parses OPAQUE) it returns the command UNSCOPED while the slot
     is still labelled FILE_SCOPED, so a ``type_check_command='mypy src/'``
     slot records the touched files but type-checks the whole tree; (ii) after
@@ -223,7 +223,7 @@ class PlannedRun:
     It exists (task 3219) because ``cmd.targets`` CANNOT answer "which files
     was this scoped to?" whenever ``cmd`` is raw-retained, and two paths
     routinely produce exactly that: the tail-preserving chained-lint accept
-    path in :func:`_scope_prefix_to_keyword` (which every subproject's
+    path in :func:`scope_prefix_to_keyword` (which every subproject's
     ``lint_command`` hits, since each chains a sibling checker), and every
     run rebuilt by ``verify._executed_fallback_plan``. In both cases the
     rendered string still carries the narrowed file list, but the
@@ -287,7 +287,7 @@ def log_dropped_chain_clauses(
 ) -> None:
     """Report onto *log* the trailing chain clauses a gate REJECT discarded from *raw*.
 
-    Shared by BOTH scopers — ``_scope_prefix_to_keyword`` below and
+    Shared by BOTH scopers — ``scope_prefix_to_keyword`` below and
     ``verify._scope_to_keyword``, which passes its own module logger — so the
     two records read alike structurally rather than by hand-mirroring. Same
     argument that put the tail-preservation policy in one shared
@@ -356,7 +356,7 @@ def log_dropped_chain_clauses(
     )
 
 
-def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> VerifyCmd:
+def scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> VerifyCmd:
     """Scope *raw* to *files*, first-clause-scoping a raw-retained chain.
 
     The ``VerifyCmd``-layer counterpart of ``verify._scope_to_keyword`` (which
@@ -508,7 +508,7 @@ def pytest_config_path_for_command(
        pyproject's ``addopts`` describe a suite this command never invokes;
     2. a raw-retained command (``cmd.raw is not None`` — OPAQUE, or an ``&&``
        chain): neither the effective cwd nor which invocation is meant is
-       recoverable from it. ``_scope_prefix_to_keyword`` truncates a chained
+       recoverable from it. ``scope_prefix_to_keyword`` truncates a chained
        ``test_command`` to its FIRST ``pytest`` clause, and each ``cd X &&``
        clause reads its own config;
     3. an explicit ``-c``/``--config-file``, which replaces the walk;
@@ -843,7 +843,7 @@ def _derive_module_runs(
     # cross-file invariant to protect, unlike pyright's Protocol/TypedDict
     # concern (D2), so there is no "widen to full suite" branch here. --
     if mc.lint_command:
-        lint_cmd = _scope_prefix_to_keyword(mc.lint_command, 'ruff check', scoped)
+        lint_cmd = scope_prefix_to_keyword(mc.lint_command, 'ruff check', scoped)
         runs.append(PlannedRun(
             mc.prefix, lint_cmd, ScopeKind.FILE_SCOPED, 'lint: file-scoped to touched file(s)',
             scoped_targets=tuple(scoped),
@@ -864,7 +864,7 @@ def _derive_module_runs(
                 f'pyright: structural file {structural_trigger} requires unscoped type check',
             ))
         else:
-            type_cmd = _scope_prefix_to_keyword(mc.type_check_command, 'pyright', scoped)
+            type_cmd = scope_prefix_to_keyword(mc.type_check_command, 'pyright', scoped)
             runs.append(PlannedRun(
                 mc.prefix, type_cmd, ScopeKind.FILE_SCOPED,
                 'pyright: file-scoped to touched file(s)',
@@ -952,7 +952,7 @@ def _derive_module_runs(
                     f'deselected in this run too and are NOT executed by it',
                 ))
             else:
-                test_cmd = _scope_prefix_to_keyword(mc.test_command, 'pytest', collectable_tests)
+                test_cmd = scope_prefix_to_keyword(mc.test_command, 'pytest', collectable_tests)
                 runs.append(PlannedRun(
                     mc.prefix, test_cmd, ScopeKind.FILE_SCOPED,
                     'pytest: file-scoped to touched test file(s)',
