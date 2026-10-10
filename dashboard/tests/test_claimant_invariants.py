@@ -6,13 +6,21 @@ production ``?mode=ro`` open and ``aiosqlite.Row`` row factory are exercised.
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
 from _tasks_db_fixture import task_row, write_tasks_db
 
-from dashboard.data.claimant_invariants import scan_root_invariants
+from dashboard.data.claimant_invariants import (
+    HygieneTier,
+    RootInvariants,
+    ScanStatus,
+    TerminalTier,
+    scan_root_invariants,
+)
 from dashboard.data.db import DbPool
 
 NOW = datetime(2026, 10, 10, 12, 0, tzinfo=UTC)
@@ -26,8 +34,7 @@ def _db_path(root: Path) -> Path:
     return root / '.taskmaster' / 'tasks' / 'tasks.db'
 
 
-async def _scan(root: Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
-    db_path = write_tasks_db(_db_path(root), rows)
+async def _scan_file(root: Path, db_path: Path) -> dict[str, Any]:
     pool = DbPool()
     try:
         conn = await pool.get(db_path)
@@ -35,6 +42,10 @@ async def _scan(root: Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
     finally:
         await pool.close_all()
     return record.to_wire()
+
+
+async def _scan(root: Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return await _scan_file(root, write_tasks_db(_db_path(root), rows))
 
 
 def _ledger(claimant: str) -> dict[str, Any]:
@@ -172,3 +183,95 @@ async def test_metadata_is_decoded_before_the_shared_predicate_sees_it(tmp_path)
         tmp_path / 'proj', [task_row(1, 'pending', _CLAIMANT, STALE, metadata={'infra_hold': True})]
     )
     assert wire['hygiene_tier'] == {'count': 1, 'stale_count': 0}
+
+
+def _assert_blind(wire: dict[str, Any]) -> None:
+    """D-2: a blind root names its error and makes no zero-count claim."""
+    assert wire['status'] == 'blind'
+    assert isinstance(wire['error'], str) and wire['error']
+    assert wire['terminal_tier'] is None
+    assert wire['hygiene_tier'] is None
+    assert wire['measured_at'] == NOW.isoformat()
+
+
+async def test_b2_absent_db_is_blind_not_clean(tmp_path):
+    root = tmp_path / 'proj'
+    db_path = _db_path(root)
+    wire = (await scan_root_invariants(root, db_path, None, now=NOW)).to_wire()
+    _assert_blind(wire)
+    assert str(db_path) in wire['error']
+    assert 'not found' in wire['error']
+    assert wire['rows_scanned'] is None
+
+
+async def test_b2_present_but_unopened_db_is_blind_with_distinct_wording(tmp_path):
+    root = tmp_path / 'proj'
+    db_path = write_tasks_db(_db_path(root), [task_row(1, 'done', _CLAIMANT, STALE)])
+    wire = (await scan_root_invariants(root, db_path, None, now=NOW)).to_wire()
+    _assert_blind(wire)
+    assert str(db_path) in wire['error']
+    assert 'could not be opened read-only' in wire['error']
+    assert 'not found' not in wire['error']
+    assert wire['rows_scanned'] is None
+
+
+async def test_b2_zero_byte_file_is_blind_with_the_sqlite_error(tmp_path):
+    root = tmp_path / 'proj'
+    db_path = _db_path(root)
+    db_path.parent.mkdir(parents=True)
+    db_path.touch()
+    wire = await _scan_file(root, db_path)
+    _assert_blind(wire)
+    assert 'OperationalError' in wire['error']
+    assert 'no such table' in wire['error']
+    assert wire['rows_scanned'] is None
+
+
+async def test_b2_pre_claimant_schema_is_blind(tmp_path):
+    root = tmp_path / 'proj'
+    db_path = _db_path(root)
+    db_path.parent.mkdir(parents=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute('CREATE TABLE tasks (tag TEXT, id INTEGER, status TEXT, metadata TEXT)')
+        conn.execute("INSERT INTO tasks VALUES ('master', 1, 'done', NULL)")
+        conn.commit()
+    finally:
+        conn.close()
+    wire = await _scan_file(root, db_path)
+    _assert_blind(wire)
+    assert 'no such column' in wire['error']
+
+
+async def test_b2_zero_rows_scanned_is_blind(tmp_path):
+    wire = await _scan(tmp_path / 'proj', [])
+    _assert_blind(wire)
+    assert wire['rows_scanned'] == 0
+    assert '0 rows' in wire['error']
+
+
+_OK_TIERS: dict[str, Any] = {
+    'terminal_tier': TerminalTier(()),
+    'hygiene_tier': HygieneTier(count=0, stale_count=0),
+}
+_BLIND_TIERS: dict[str, Any] = {'terminal_tier': None, 'hygiene_tier': None}
+
+
+@pytest.mark.parametrize(
+    ('status', 'fields', 'offending'),
+    [
+        (ScanStatus.OK, {'rows_scanned': 0, 'error': None, **_OK_TIERS}, 'rows_scanned'),
+        (ScanStatus.OK, {'rows_scanned': 3, 'error': 'boom', **_OK_TIERS}, 'error'),
+        (ScanStatus.BLIND, {'rows_scanned': None, 'error': None, **_BLIND_TIERS}, 'error'),
+        (
+            ScanStatus.BLIND,
+            {'rows_scanned': None, 'error': 'boom', **_BLIND_TIERS, 'terminal_tier': TerminalTier(())},
+            'terminal_tier',
+        ),
+    ],
+)
+def test_record_invariant_is_enforced_at_construction(tmp_path, status, fields, offending):
+    with pytest.raises(ValueError) as excinfo:
+        RootInvariants(root=tmp_path, status=status, measured_at=NOW, **fields)
+    assert status.value in str(excinfo.value)
+    assert offending in str(excinfo.value)
