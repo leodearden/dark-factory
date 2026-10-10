@@ -4,11 +4,13 @@
 ``git clean``.  Driven by a stub of reify's seed-mode contract, these tests
 fail for the production reason: ``--reset-in-place`` refuses a non-empty
 ``target/`` (the clobber guard), so every acquire after the first fell back to
-a cold build.
+a cold build.  That went unnoticed because the fallback logged at DEBUG, so a
+fallback that gives back an already-held lane must be visible at WARNING.
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -33,6 +35,13 @@ async def _commit_change(repo: Path) -> str:
     await _run(['git', 'add', 'change.txt'], cwd=repo)
     await _run(['git', 'commit', '-m', 'advance main'], cwd=repo)
     return await _head(repo)
+
+
+def _warnings_naming(caplog: pytest.LogCaptureFixture, needle: str) -> list[str]:
+    return [
+        record.getMessage() for record in caplog.records
+        if record.levelno >= logging.WARNING and needle in record.getMessage()
+    ]
 
 
 @pytest.mark.asyncio
@@ -64,3 +73,49 @@ async def test_reacquired_spec_lane_is_warm_and_reseeded_from_current_base(
     )
     assert git_ops.spec_warm_lane_pool is not None
     assert git_ops.spec_warm_lane_pool.state(lane2) == LaneState.ASSIGNED
+
+
+@pytest.mark.asyncio
+async def test_seed_failure_cold_fallback_warns_naming_the_lane(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger='orchestrator.git_ops')
+    repo = make_seed_test_repo(tmp_path)
+    git_ops = GitOps(warm_pool_git_config(), repo, merge_spec_warm_lane_pool_size=1)
+
+    _, warm = await git_ops.acquire_spec_lane(await _head(repo))
+
+    assert warm is False
+    assert git_ops.spec_warm_lane_pool is not None
+    lane = git_ops.worktree_base / '_spec-0'
+    assert git_ops.spec_warm_lane_pool.state(lane) == LaneState.FREE
+    assert _warnings_naming(caplog, '_spec-0'), (
+        'a seed failure gave back an acquired lane and went cold without a '
+        'WARNING naming the lane'
+    )
+
+
+@pytest.mark.asyncio
+async def test_reset_failure_cold_fallback_warns_naming_the_lane(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger='orchestrator.git_ops')
+    repo = make_seed_test_repo(tmp_path)
+    await commit_seed_script(repo, TARGET_MODE_SEED_SCRIPT)
+    git_ops = GitOps(warm_pool_git_config(), repo, merge_spec_warm_lane_pool_size=1)
+    lane, warm = await git_ops.acquire_spec_lane(await _head(repo))
+    assert warm is True
+    await git_ops.release_spec_lane(lane, warm=True)
+    (lane / '.git').write_text('gitdir: /nonexistent\n')
+    caplog.clear()
+
+    cold, warm2 = await git_ops.acquire_spec_lane(await _head(repo))
+
+    assert warm2 is False
+    assert cold != lane
+    assert git_ops.spec_warm_lane_pool is not None
+    assert git_ops.spec_warm_lane_pool.state(lane) == LaneState.FREE
+    assert _warnings_naming(caplog, '_spec-0'), (
+        'a failed reset gave back an acquired lane and went cold without a '
+        'WARNING naming the lane'
+    )
