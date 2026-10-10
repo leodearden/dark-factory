@@ -1639,6 +1639,13 @@ def _already_landed_gate_shape(*, has_open_escalation: bool | None) -> str:
     return render_shape('pending', None, None, has_open_escalation, None)
 
 
+def _ewa_trip_reason(ewa: float, storm: digest_mod.CategoryShare | None) -> str:
+    """The EWA pause reason: the ``ewa_trip_`` prefix every reader keys on, then the storm share."""
+    if storm is None:
+        return f'ewa_trip_{ewa:.4f}'
+    return f'ewa_trip_{ewa:.4f} · storm: {storm}'
+
+
 class Harness:
     """Top-level orchestration loop."""
 
@@ -18257,7 +18264,9 @@ class Harness:
             # pass (agent-followup-4559-inprocess-ewa-release); do not add an
             # auto-resume here without engaging those three first.
             if tripped and not self.scheduler.is_paused:
-                await self.pause_scheduler(f'ewa_trip_{new_ewa:.4f}')
+                await self.pause_scheduler(
+                    _ewa_trip_reason(new_ewa, escalation_stats.dominant_category())
+                )
 
         except asyncio.CancelledError:
             raise
