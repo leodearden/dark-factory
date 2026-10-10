@@ -352,8 +352,8 @@ SKIPPED_ARMS: tuple[SkippedArm, ...] = (
 
 WINNER_RULE = (
     'fewest failed bounds (scripts/check_write_triage_readiness_gate.py::check_require),'
-    ' so an arm meeting every bound beats every arm that does not; then fewest'
-    ' quality.contested_decision_errors; then lower selection.cost_per_write_usd;'
+    ' so an arm meeting every bound beats every arm that does not; then lowest'
+    ' comparative.harm_delta_vs_status_quo; then lower selection.cost_per_write_usd;'
     ' then arm name'
 )
 
@@ -365,10 +365,13 @@ def build_matrix(
     *,
     shipped: ArmSettings,
     bounds: Sequence[Bound],
+    created_at: Mapping[str, datetime],
 ) -> dict[str, Any]:
-    """Score every π arm with ι, check it against *bounds*, and name the winner.
+    """Score every π2 arm with ι, check it against *bounds*, and name the winner.
 
-    Every arm is paired against the π arm whose settings are *shipped*. An arm
+    Every arm is paired against the π2 arm whose settings are *shipped*, and
+    compared with the status quo on the same writes using *created_at*
+    (:func:`read_record_created_at`) and ι's default harm weights. An arm
     meets a bound exactly when Γ3's ``check_require`` passes on the arm's
     :func:`candidate_doc`, so the winner's best_config passes Γ3 exactly when
     it met every bound here.
@@ -383,6 +386,7 @@ def build_matrix(
     _refuse_scored_and_skipped(population)
     scores = _scorer.score_pairs(
         chain.from_iterable(cases_by_arm.values()), verdicts, reference_arm=reference.name,
+        created_at=created_at,
     )
     _refuse_judge_band_drift(population, scores['arms'])
     block = population.c2_block()
@@ -410,14 +414,20 @@ def build_matrix(
 
 def candidate_doc(row: Mapping[str, Any], population: Mapping[str, Any]) -> dict[str, Any]:
     """The doc Γ3 reads for one scored arm; the one builder of it."""
-    return {'quality': row['quality'], 'selection': row['selection'], 'population': population}
+    return {
+        'quality': row['quality'],
+        'selection': row['selection'],
+        'population': population,
+        'comparative': row['comparative'],
+    }
 
 
 def best_config(matrix: Mapping[str, Any]) -> dict[str, Any]:
     """The winner's :func:`candidate_doc`, the doc its bounds were checked on, plus provenance.
 
-    Γ3 reads ``quality``, ``selection`` and ``population``; ``provenance``
-    names the arm and the bounds it failed, which are the checks Γ3 will fail.
+    Γ3 reads ``quality``, ``selection``, ``population`` and ``comparative``;
+    ``provenance`` names the arm and the bounds it failed, which are the checks
+    Γ3 will fail.
     """
     winners = [
         row for row in matrix['arms']
@@ -450,11 +460,12 @@ def select_winner(rows: Sequence[Mapping[str, Any]]) -> tuple[str, bool]:
     return winner['arm'], not winner['bounds']['met']
 
 
-def _rank(row: Mapping[str, Any]) -> tuple[int, int, float, str]:
+def _rank(row: Mapping[str, Any]) -> tuple[int, float, float, str]:
+    delta = row['comparative']['harm_delta_vs_status_quo']
     cost = row['selection']['cost_per_write_usd']
     return (
         len(_failed_bounds(row)),
-        row['quality']['contested_decision_errors'],
+        math.inf if delta is None else delta,
         math.inf if cost is None else cost,
         row['arm'],
     )
@@ -558,6 +569,7 @@ def _scored_row(arm: PiArm, iota: Mapping[str, Any]) -> dict[str, Any]:
         'quality': iota['quality'],
         'runtime': runtime,
         'paired_vs_reference': iota['paired_vs_reference'],
+        'comparative': iota['comparative'],
     }
 
 
