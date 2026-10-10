@@ -2,7 +2,7 @@ prd: plans/review-all-s21-legibility-pipeline-prd.md
 schema_version: 1
 tasks:
 - label: α
-  task_id: null
+  task_id: 6740
   title: One detector layer for sampler and digest
   capabilities:
   - name: detectors-module
@@ -56,7 +56,7 @@ tasks:
       kind: manual
       reason: live transcript population; the finding's measurement re-run is recorded in the task record (0 of N disagree)
 - label: β
-  task_id: null
+  task_id: 6742
   title: One codebook merge result and one committer
   capabilities:
   - name: batch-merge-entry-point
@@ -117,7 +117,7 @@ tasks:
       - scripts/tests/test_legibility_census.py
       expect: absent
 - label: γ
-  task_id: null
+  task_id: 6744
   title: Typed run outcome and trickle state; barren escalation recorded
   capabilities:
   - name: run-outcome-enum
@@ -173,7 +173,7 @@ tasks:
       kind: manual
       reason: only a real nightly run writes the production document
 - label: δ
-  task_id: null
+  task_id: 6745
   title: run_nightly as stage functions with one result builder
   capabilities:
   - name: one-result-builder
@@ -201,7 +201,7 @@ tasks:
       kind: manual
       reason: journal output of a real nightly run
 - label: ε
-  task_id: null
+  task_id: 6747
   title: One alarm poster over the shared MCP client
   capabilities:
   - name: alarm-module
@@ -247,11 +247,17 @@ tasks:
       - orchestrator/src
       expect: absent
   - name: shared-sync-mcp-client
-    binding: 'producer: S14''s shared synchronous MCP client leaf (program seam table). Required extent: sync tool call; initialize handshake for the stateful escalation servers and the stateless fused-memory server; SSE decode; session release; isError surfaced; neutral transport error. Task id and extent confirmed at decompose'
-    verdict: OPEN
+    binding: 'producer:task-6711 (S14 ζ) upstream of ε — shared/src/shared/mcp_session.py::SyncMcpSession;
+      its filed extent (lead ruling 2026-10-10) covers the initialize handshake for stateful escalation servers
+      (server-minted mcp-session-id captured and echoed) and stateless fused-memory, /mcp via mcp_endpoint_url
+      + MCP_POST_HEADERS, SSE decode, explicit session release, isError as a typed failure, one neutral shared error type'
+    verdict: PASS
     delivered_check:
-      kind: manual
-      reason: producer lives in another stream's batch, not yet filed; bound at decompose
+      kind: grep
+      pattern: ^class SyncMcpSession
+      paths:
+      - shared/src/shared/mcp_session.py
+      expect: present
   - name: real-server-e2e
     binding: escalation/tests/test_legibility_census_escalation_e2e.py drives a real escalation server (serve_escalation_mcp) on ae3047ec3a; ε extends it to all four sources
     verdict: PASS
@@ -259,7 +265,7 @@ tasks:
       kind: manual
       reason: CI test outcome, not a static pattern
 - label: ζ
-  task_id: null
+  task_id: 6749
   title: Census trigger reads validated config and a typed census state
   capabilities:
   - name: second-config-reader-deleted
@@ -307,7 +313,7 @@ tasks:
       kind: manual
       reason: dependency edge, wired at decompose
 - label: η
-  task_id: null
+  task_id: 6750
   title: Candidate identity by merger-minted id; lifecycle as a transition table
   capabilities:
   - name: title-joins-deleted
@@ -344,7 +350,7 @@ tasks:
       kind: manual
       reason: live data; observed through codebook.py validate on the deployed codebook
 - label: θ
-  task_id: null
+  task_id: 6751
   title: run_census as stage functions with an explicit persist order
   capabilities:
   - name: effects-and-stage-types
@@ -366,7 +372,7 @@ tasks:
       - scripts/legibility
       expect: present
 - label: ι
-  task_id: null
+  task_id: 6753
   title: census.py layers and a public verifier module
   capabilities:
   - name: verifier-module
@@ -379,24 +385,21 @@ tasks:
       - scripts/legibility/census_verify.py
       expect: present
   - name: private-poster-patch-target-gone
-    binding: 'grep: census._post_mcp_tool_call exists and tests setattr it on ae3047ec3a'
+    binding: 'grep: census.py defines _post_mcp_tool_call and test_legibility_census.py patches/calls it via mod on ae3047ec3a'
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: _post_mcp_tool_call
+      pattern: def _post_mcp_tool_call|mod\._post_mcp_tool_call|setattr\(mod, ["']_post_mcp_tool_call["']
       paths:
-      - scripts
-      - escalation
+      - scripts/legibility/census.py
+      - scripts/tests/test_legibility_census.py
       expect: absent
   - name: layers-import-downward
-    binding: 'grep: no census_*.py module imports census on ae3047ec3a; ι keeps it so (heuristic 13)'
+    binding: 'grep: no census_*.py module imports census on ae3047ec3a; ι keeps it so (heuristic 13). A preservation property, so not a dispatch gate'
     verdict: PASS
     delivered_check:
-      kind: grep
-      pattern: from legibility import census$|from legibility import census,|^import census$|from legibility\.census import
-      paths:
-      - scripts/legibility
-      expect: absent
+      kind: manual
+      reason: already true on main (vacuous as a delivered_check); reviewed at ι against heuristic 13
   - name: tests-on-public-names
     binding: 'fk-ee9a4bae4e83: 7 private census names, 52 references in test_legibility_census.py at the pin'
     verdict: PASS

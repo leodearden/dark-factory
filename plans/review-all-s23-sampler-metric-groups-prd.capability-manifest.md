@@ -25,7 +25,7 @@ PRD: `plans/review-all-s23-sampler-metric-groups-prd.md`. YAML twin:
 | Capability | Binding | Verdict |
 |---|---|---|
 | `sampler.metrics` importable by the system python (the ε1/ε2 gate interpreter) | `/usr/bin/python3 -I` 3.12.3 with `sampler/src` and `shared/src` prepended imports `sampler.metrics`; `psutil` not loaded (lazy inside `collect_process_metrics`) | PASS |
-| Something puts `sampler/src` and `shared/src` on the system python's `sys.path` for the script | producer-absent at `ae3047ec3a` (`scripts/_checkout.py` not in tree). Resolution (b): S25's `_checkout` leaf, upstream of β, dependency wired at phase B; it must bind sampler's `src/` (precondition) | FAIL → PASS at phase B when S25's leaf is wired upstream |
+| Something puts `sampler/src` and `shared/src` on the system python's `sys.path` for the script | `producer:task-6758` (S25 γ, `scripts/_checkout.py`; binds every workspace member's `src/` from the root pyproject, sampler included; its boundary test B1 asserts `sampler.__file__`). Upstream of β; edge wired at decompose 2026-10-11. Was producer-absent at authoring (`ae3047ec3a`) | PASS |
 | `sampler.store` must NOT be imported by the script at runtime | measured: `/usr/bin/python3` import of `sampler.store` raises `ModuleNotFoundError: aiosqlite` via `shared.async_sqlite_base` — design avoids it (D6) | PASS |
 | `proc.info` populated by `process_iter(attrs)` | psutil 7.2.2 in the sampler env (`uv run --no-sync --project sampler`); `psutil.process_iter` stores `as_dict(attrs)` as `proc.info` (finding `fk-be1621618dee` verification) | PASS |
 | Gate-arm names exist to map onto | `shared/src/shared/psi.py::_ARMS` (owned by shared.psi; table maps onto it, cross-owner parity test kept) | PASS |

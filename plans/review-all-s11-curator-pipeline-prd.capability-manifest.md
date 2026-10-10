@@ -59,7 +59,7 @@ its producer lands.
 | Capability | Check | Evidence | Verdict |
 |---|---|---|---|
 | `curate_prepared` is the pipeline | grep present `async def curate_prepared(` | built by ε | PASS |
-| batch pipeline twin gone | grep absent `curate_batch_prepared` over `fused-memory/src/` | defined and called on main | PASS |
+| batch pipeline twin gone | grep absent `curate_batch_prepared` in `task_curator.py`, `task_interceptor.py` (narrowed at commit_planning: prose mentions in `config/schema.py` and `recon_claim_verification_guard.py` are outside ε's files) | defined and called on main | PASS |
 | exact-match runs in batches (B6) | manual | `TaskCurator._pre_llm_exact_match` and `note_created` (called on the create path of `_dispatch_ticket_decision`) exist on main; only `curate` calls the former today | PASS |
 | outage paths | manual, `producer:task-4513` | upstream; it provides `awaiting_curation`, internal `defer` and `curator_action='uncurated'` | PASS |
 

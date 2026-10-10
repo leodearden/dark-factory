@@ -2,7 +2,7 @@ prd: plans/review-all-s18-evals-measurement-prd.md
 schema_version: 1
 tasks:
 - label: α
-  task_id: null
+  task_id: 6733
   title: ResultStore owns the persisted eval cell
   capabilities:
   - name: result-store-class
@@ -60,7 +60,7 @@ tasks:
       kind: manual
       reason: two-way round-trip behaviour; asserted by the new test_eval_results_store.py, not a grep.
 - label: β
-  task_id: null
+  task_id: 6734
   title: Typed measurement outcome on the architect path; plan predicates leaf
   capabilities:
   - name: unmeasured-cause-enum
@@ -132,7 +132,7 @@ tasks:
       kind: manual
       reason: cross-format equivalence and snapshot diff; asserted by test and the leaf's verification note.
 - label: γ
-  task_id: null
+  task_id: 6736
   title: Every LLM scoring site measures or says it did not
   capabilities:
   - name: no-neutral-fallback-parse
@@ -156,7 +156,9 @@ tasks:
       kind: grep
       pattern: return \[\], reviewer_issues|Judge output parse failure|Assessment failed. unparseable
       paths:
-      - orchestrator/src/orchestrator/evals
+      - orchestrator/src/orchestrator/evals/judge.py
+      - orchestrator/src/orchestrator/evals/compare.py
+      - orchestrator/src/orchestrator/evals/reviewer_trial/scorer.py
       expect: absent
   - name: scoring-result-unmeasured-state
     binding: capability→producer — ScoringResult gains an explicit unmeasured field (PRD §7 D2); the campaign
@@ -187,7 +189,7 @@ tasks:
       kind: manual
       reason: reducer arithmetic over a fixture; asserted by tests, not expressible as a grep.
 - label: δ
-  task_id: null
+  task_id: 6737
   title: run_architect_eval as invoke → classify → assemble; one eval gate lifecycle
   capabilities:
   - name: architect-attempt-type
@@ -248,7 +250,7 @@ tasks:
       kind: manual
       reason: prose relocation judged at review.
 - label: ε
-  task_id: null
+  task_id: 6738
   title: One workflow-cell executor; RoleUnderTest
   capabilities:
   - name: role-under-test-enum
@@ -307,7 +309,7 @@ tasks:
       kind: manual
       reason: depends on the gitignored packaged results dir in the main checkout; run by hand and recorded.
 - label: ζ
-  task_id: null
+  task_id: 6739
   title: One review-payload normaliser
   capabilities:
   - name: normalize-review
@@ -359,7 +361,7 @@ tasks:
       kind: manual
       reason: two-way behavioural parity; asserted by test_review_payload.py.
 - label: η
-  task_id: null
+  task_id: 6741
   title: 'Reviewer-trial drivers: one panel cache, one run-and-score loop'
   capabilities:
   - name: no-second-panel-cache
@@ -391,7 +393,7 @@ tasks:
       - orchestrator/src/orchestrator/evals/reviewer_trial/runner.py
       expect: present
 - label: θ
-  task_id: null
+  task_id: 6743
   title: 'report.py leaves: stats, prices, cell admission, table rendering, Elo'
   capabilities:
   - name: stats-module
@@ -438,7 +440,7 @@ tasks:
       - orchestrator/src/orchestrator/evals/table_render.py
       expect: present
 - label: ι
-  task_id: null
+  task_id: 6746
   title: 'report.py surfaces: composite and plan-quality; rationale to docs'
   capabilities:
   - name: report-module-gone
@@ -474,7 +476,7 @@ tasks:
       kind: manual
       reason: gitignored data in the main checkout; diff recorded in the leaf's verification note.
 - label: κ
-  task_id: null
+  task_id: 6748
   title: Eval CLI as a click group in evals/cli.py
   capabilities:
   - name: eval-cli-module
@@ -524,7 +526,7 @@ tasks:
       - orchestrator/src/orchestrator/cli_config.py
       expect: present
 - label: λ
-  task_id: null
+  task_id: 6752
   title: One checkout root for eval defaults
   capabilities:
   - name: no-checkout-literals

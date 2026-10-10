@@ -152,6 +152,7 @@ The runner computes "standing, no new evidence" from the codebook and renders it
 - **No max-interval condition** (decided, R8). Today's calendar backstop is deleted by L8b. The trigger fires on (a) or (b) only, each subject to the floor. A project with no completion signal (no previous run id, or a previous run that filed nothing) therefore fires only on (b) or by hand (`skills/census/SKILL.md`).
 - **Floor:** `floor_days` is the minimum transcript window, and the calendar's only role (R2). It never fires a census by itself. No condition fires until `now − session_watermark ≥ floor_days`. It is anchored on the watermark, not the date, and a never-censused project measures it from its earliest codebook date. `tasks_landed_*` and `last_census_done_count` are retired by L8b.
 - Every threshold remains an unquoted non-negative int, validated by `census_trigger.py::CensusConfig.from_mapping`.
+  > Superseded mechanism (2026-10-10): `plans/review-all-s21-legibility-pipeline-prd.md` D8 (task 6749, ζ) deletes `CensusConfig.from_mapping`; thresholds are validated once by a strict `config.Census` (`StrictInt`, `ge=0`) at `load_config`, and the trigger reads `LegibilityConfig.census`. The semantics above, including L8b's deprecated-key WARNING, are unchanged.
 
 ### 4.8 Boundary-test sketch
 

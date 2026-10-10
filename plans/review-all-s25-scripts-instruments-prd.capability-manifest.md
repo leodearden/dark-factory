@@ -117,8 +117,45 @@ dependency is wired.
   The guard is the fixture test (lines-only rise passes, cognitive rise fails). **PASS (manual)**
 
 **ξ — sitting structured facts (HELD)**
+- Pending legacy pins are migrated (lead ruling, 2026-10-11).
+  - This is ξ's step 1, with its own check, not a decompose-time action.
+  - `declare_pin` exists, and `queue.declare_pin` is its sole writer.
+  - One pending prefix record exists today: `esc-3169-2`.
+  - The check is a read-only scan of pending records that finds zero unmigrated ones.
+  
+  **PASS (manual; reads the live queue, not the tree)**
 - `duplicate_of`: the producer is S2's C5 leaf, which is not yet filed. `pin_declared_by` exists and
   is enforced today: `Escalation.pin_declared_by`, refused by `resolve_issue` through
   `escalation/declared_pins.py::blocking_pin_declarations`. **OPEN**
 - The string-protocol gates are gone. `VETO_PIN_PREFIX` and `DEDUP_MARKER` are present in
   `scripts/` today. **PASS**
+
+## Decompose record (2026-10-11)
+
+`commit_planning` stamped 12 labels with no errors and no missing labels:
+
+| Label | Task |
+|---|---|
+| α | 6756 |
+| β | 6757 |
+| γ | 6758 |
+| δ | 6759 |
+| ε | 6760 |
+| ζ | 6761 |
+| η | 6762 |
+| θ | 6763 |
+| κ | 6765 |
+| λ | 6766 |
+| μ | 6767 |
+| ν | 6769 |
+
+Two leaves are held. They were filed in planning mode and are `deferred` outside S25's
+`commit_planning`, with `metadata.x_seam_wait` set:
+
+| Label | Task | Waits on | Who stamps it |
+|---|---|---|---|
+| ι | 6764 | S20, contract C3 | the session that runs `commit_planning` on it |
+| ξ | 6770 | S2, contract C5 | the session that runs `commit_planning` on it |
+
+The stamper copied each leaf's mechanical checks into that producer's
+`metadata.delivered_checks`. θ and ν carry manual checks only.

@@ -63,6 +63,7 @@ tooling/infra — grammar-fixture and numeric-floor checks N/A. Live checks: cap
 | The client to move exists with retry, idempotency, handshake | capability→producer (wired) | `orchestrator.mcp_lifecycle::McpSession` (`_raw_call`, `_retry_backoffs`, `maybe_inject_client_op_id`), used by `mcp_call` | PASS |
 | Its dependencies are already in `shared` or injectable | capability→producer | `shared.mcp_post` (`MCP_POST_HEADERS`, `mcp_endpoint_url`, `decode_mcp_response_body`), `shared.mcp_idempotency::maybe_inject_client_op_id`; `orchestrator.fm_retry::fm_retry_backoffs` and `ORCHESTRATOR_MCP_IDENTITY` are passed in | PASS |
 | The success predicate to unify | capability→producer | `task_interceptor::interceptor_write_succeeded`; `migrate_metadata_modules_to_files::write_failure_reason` | PASS |
+| A synchronous client for scripts (lead ruling 2026-10-10, S21 extent): initialize handshake capturing the server-minted `mcp-session-id` for the stateful escalation servers and none for stateless fused-memory, POST `/mcp` with no trailing slash, SSE decode, session release, `isError` surfaced, a neutral error type | capability→producer | built by ζ as `SyncMcpSession` beside `McpSession`; S21's alarm poster consumes it | PASS (built+bound by ζ) |
 | An `isError` reply is rejected rather than returned as a value | rejection-mechanism | built by ζ (`EnvelopeShape.IS_ERROR`); B9's stub-server fixture observes it fire | PASS (built+bound by ζ) |
 
 ## η — Typed scheduler state snapshot *(leaf; seam for S17)*

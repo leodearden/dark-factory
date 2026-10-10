@@ -51,7 +51,7 @@ Each leaf's signal is bound capability by capability. `PASS` = the evidence hold
 | `alarm.raise_alarm`, `fail_loud_boundary` | producer | ε (D11) | PASS |
 | poster constant copies deleted | anti-orphan (deletion) | `_ESCALATION_TOOL_NAME` in two probes on main; nightly's and census's envelope builders | PASS |
 | `census_trigger.py` transport deleted, no importer left | anti-orphan (deletion) | 18 code references on main incl. `scripts/_config_reload_gate.py` | PASS |
-| shared synchronous MCP client | capability→producer, extent | **S14's leaf**; `shared/src/shared/mcp_post.py` is async-only on main, so the client is absent. Required extent: sync tool call, handshake for stateful (escalation :8102/:8103) and stateless (fused-memory :8002) servers, SSE decode, session release, `isError` surfaced, neutral error type | **OPEN** — bind S14's task id and confirm extent at decompose |
+| shared synchronous MCP client | capability→producer, extent, DAG direction | **task 6711 (S14 ζ)**, upstream of ε: `shared/src/shared/mcp_session.py::SyncMcpSession`. Its filed extent matches what ε needs: handshake for stateful escalation servers (server-minted `mcp-session-id` captured and echoed) and stateless fused-memory, `/mcp` via `mcp_endpoint_url` + `MCP_POST_HEADERS`, SSE decode, explicit session release, `isError` typed, one neutral shared error type. `shared/src/shared/mcp_post.py` is async-only on main | PASS (bound at decompose 2026-10-10) |
 | real-server e2e | substrate | `escalation/tests/test_legibility_census_escalation_e2e.py::serve_escalation_mcp` drives census, nightly, transcript-check on main | PASS |
 
 ## ζ — Census trigger reads validated config and a typed census state
@@ -89,4 +89,4 @@ Each leaf's signal is bound capability by capability. `PASS` = the evidence hold
 | layers import downward | heuristic 13 | no `census_*.py` imports `census` on main | PASS |
 | tests on public names | boundary row 17 | 7 private names / 52 references at the pin | PASS (manual) |
 
-No binding is FAIL. One is OPEN (ε's shared client), resolved at decompose by binding S14's leaf.
+No binding is FAIL or OPEN. ε's shared-client binding was OPEN at authoring and was bound to task 6711 at decompose (2026-10-10).

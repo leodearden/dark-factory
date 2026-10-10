@@ -4,7 +4,7 @@ prd: plans/review-all-s11-curator-pipeline-prd.md
 schema_version: 1
 tasks:
   - label: "α"
-    task_id: null
+    task_id: 6703
     title: "Extract the curator vocabulary into middleware/curator_types.py"
     capabilities:
       - name: "curator-types-module-exists"
@@ -60,7 +60,7 @@ tasks:
           expect: present
           paths: ["fused-memory/tests/test_curator_types_leaf.py"]
   - label: "β"
-    task_id: null
+    task_id: 6704
     title: "Delete the dead single-ticket worker path and _intra_batch_key"
     capabilities:
       - name: "dead-symbols-absent"
@@ -86,7 +86,7 @@ tasks:
           kind: manual
           reason: "test-retargeting quality is a review judgement, not a grep"
   - label: "γ"
-    task_id: null
+    task_id: 6705
     title: "resolve_ticket reports an open ticket as open (typed ticket-status vocabulary)"
     capabilities:
       - name: "ticket-status-enum"
@@ -143,7 +143,7 @@ tasks:
           kind: manual
           reason: "INV-7 bound is an argument over existing reapers, pinned by B1-B4 behaviourally"
   - label: "δ"
-    task_id: null
+    task_id: 6706
     title: "One candidate-section renderer, one LLM invoker, one failure mapper"
     capabilities:
       - name: "batch-invoke-twin-deleted"
@@ -177,7 +177,7 @@ tasks:
           kind: manual
           reason: "seam shape is reviewed; B8 exercises it"
   - label: "ε"
-    task_id: null
+    task_id: 6707
     title: "One curation pipeline for every batch size"
     capabilities:
       - name: "pipeline-renamed-and-single"
@@ -194,7 +194,7 @@ tasks:
         delivered_check:
           kind: grep
           pattern: "curate_batch_prepared"
-          paths: ["fused-memory/src/"]
+          paths: ["fused-memory/src/fused_memory/middleware/task_curator.py", "fused-memory/src/fused_memory/middleware/task_interceptor.py"]
           expect: absent
       - name: "exact-match-runs-in-batches"
         binding: "TaskCurator._pre_llm_exact_match + note_created (called from _dispatch_ticket_decision's create path) exist on main; today only curate() calls the former"
@@ -209,7 +209,7 @@ tasks:
           kind: manual
           reason: "external producer; its own delivered behaviour is 4513's"
   - label: "ζ"
-    task_id: null
+    task_id: 6708
     title: "Bound the curator's corpus and R4 reads; surface failed corpus streams"
     capabilities:
       - name: "corpus-read-filtered"

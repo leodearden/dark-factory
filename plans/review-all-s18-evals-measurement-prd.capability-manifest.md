@@ -8,8 +8,13 @@ As of main `ae3047ec3a`, 2026-10-10.
 **Verdict summary: 53 bindings across 11 leaves, all PASS; 46 mechanical checks, every one
 evaluated FAIL at `main` (the undelivered state, as required) with
 `shared.delivered_check_polarity.evaluate_grep_at_tree` / `evaluate_path_at_tree`; zero
-polarity-lint findings from `lint_delivered_checks` (run without declared files; decompose re-runs
-it with each leaf's `metadata.files`). 7 manual bindings (boundary tests B1–B5, the report
+polarity-lint findings from `lint_delivered_checks`. At decompose (2026-10-10) the lint was re-run
+with each leaf's `metadata.files`; it flagged γ's `no-fabricated-tie-or-zero` as
+`absent_overbroad` (the phrase also appears in the committed data files `evals/judge_report.json`
+and `evals/judge_state.json`), so that check's `paths` were narrowed to `evals/judge.py`,
+`evals/compare.py` and `evals/reviewer_trial/scorer.py`, after which every leaf linted clean.
+Stamped by `commit_planning`: α 6733, β 6734, γ 6736, δ 6737, ε 6738, ζ 6739, η 6741, θ 6743,
+ι 6746, κ 6748, λ 6752. 7 manual bindings (boundary tests B1–B5, the report
 snapshot, the implementer-survivor measurement).**
 
 No binding is declared-only, test-only, producer-downstream or producer-absent inside the batch.
