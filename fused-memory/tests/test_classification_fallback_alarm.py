@@ -13,7 +13,7 @@ from fused_memory.middleware import _folded_escalation
 from fused_memory.models.enums import ClassificationFallback
 from fused_memory.services import classification_fallback_alarm
 from fused_memory.services.classification_fallback_alarm import (
-    _ANCHOR_TASK_ID,
+    ANCHOR_TASK_ID,
     DEFAULT_THRESHOLD,
     DEFAULT_WINDOW_SECONDS,
     JOURNAL_PARAM_KEY,
@@ -138,7 +138,7 @@ class TestFiling:
 
         [esc] = _pending(tmp_path)
         assert esc_id == esc.id
-        assert esc.task_id == _ANCHOR_TASK_ID
+        assert esc.task_id == ANCHOR_TASK_ID
         assert esc.level == 1
         assert esc.severity == 'blocking'
         assert 'p1' in esc.summary

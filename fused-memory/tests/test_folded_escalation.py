@@ -879,7 +879,7 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
         _ANCHOR_TASK_ID as WRITE_TRIAGE_ANCHOR,
     )
     from fused_memory.services.classification_fallback_alarm import (  # noqa: PLC0415
-        _ANCHOR_TASK_ID as CLASSIFICATION_FALLBACK_ANCHOR,
+        ANCHOR_TASK_ID as CLASSIFICATION_FALLBACK_ANCHOR,
     )
     from fused_memory.services.completion_claim_gate import (  # noqa: PLC0415
         _ANCHOR_PREFIX as UNVERIFIED_CLAIM_PREFIX,

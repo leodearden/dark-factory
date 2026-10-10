@@ -22,7 +22,7 @@ from fused_memory.models.enums import LLM_CLASSIFIER_FAILURES, ClassificationFal
 
 logger = logging.getLogger(__name__)
 
-_ANCHOR_TASK_ID = 'write-classifier-fallback-storm'
+ANCHOR_TASK_ID = 'write-classifier-fallback-storm'
 _AGENT_ROLE = 'fused-memory/write-classifier'
 _CATEGORY = 'write_classifier_fallback_storm'
 LOG_EVENT = 'write_classifier_fallback_storm'
@@ -66,7 +66,7 @@ def emit_classification_fallback_storm_escalation(
     ))
     return file_folded_escalation(
         project_root,
-        anchor_task_id=_ANCHOR_TASK_ID,
+        anchor_task_id=ANCHOR_TASK_ID,
         agent_role=_AGENT_ROLE,
         category=_CATEGORY,
         severity='blocking',

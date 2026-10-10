@@ -11,12 +11,15 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
+from _fm_helpers import poll_until
+from _openai_stubs import completion_client, raising_client
 
 from fused_memory.middleware import _folded_escalation
 from fused_memory.models.enums import ClassificationFallback, MemoryCategory
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.services.classification_fallback_alarm import (
-    _ANCHOR_TASK_ID,
+    ANCHOR_TASK_ID,
     DEFAULT_THRESHOLD,
     JOURNAL_PARAM_KEY,
 )
@@ -30,30 +33,14 @@ _needs_escalation = pytest.mark.skipif(
 )
 
 
-def _raising_client() -> MagicMock:
-    client = MagicMock()
-    client.chat.completions.create = AsyncMock(side_effect=RuntimeError('connection refused'))
-    return client
-
-
-def _answering_client(content: str) -> MagicMock:
-    message = MagicMock()
-    message.content = content
-    choice = MagicMock()
-    choice.message = message
-    response = MagicMock()
-    response.choices = [choice]
-    client = MagicMock()
-    client.chat.completions.create = AsyncMock(return_value=response)
-    return client
-
-
 def _journal() -> MagicMock:
     journal = MagicMock()
     journal.log_write_op = AsyncMock()
     journal.log_backend_op = AsyncMock()
     journal.log_mem0_intent = AsyncMock()
     journal.resolve_mem0_intent = AsyncMock()
+    journal.record_terminal_outcome = AsyncMock()
+    journal.close = AsyncMock()
     return journal
 
 
@@ -68,6 +55,39 @@ def _service(config, journal: MagicMock, openai_client: MagicMock | None) -> Mem
     svc.classifier = WriteClassifier(config, openai_client=openai_client)
     svc.set_write_journal(journal)  # type: ignore[arg-type]
     return svc
+
+
+def _extracting(*facts: str) -> MagicMock:
+    """A Graphiti add_episode result whose extraction yielded *facts*."""
+    result = MagicMock()
+    result.edges = [
+        MagicMock(fact=fact, source_node_uuid='', target_node_uuid='') for fact in facts
+    ]
+    return result
+
+
+def _fails_once_per_fact() -> AsyncMock:
+    """A Mem0 add that fails each fact's first attempt, so the queue retries it."""
+    attempted: set[str] = set()
+
+    async def add(*, content: str, **_: object) -> dict:
+        if content not in attempted:
+            attempted.add(content)
+            raise RuntimeError('mem0 unavailable')
+        return {'results': [{'id': 'mem0-1'}]}
+
+    return AsyncMock(side_effect=add)
+
+
+async def _drain(service: MemoryService, *, completed: int) -> None:
+    queue = service.durable_queue
+    assert queue is not None
+
+    async def _done() -> bool:
+        stats = await queue.get_stats()
+        return stats['counts'].get('completed') == completed
+
+    await poll_until(_done, message=f'the queue never completed {completed} item(s)')
 
 
 def _add_memory_params(journal: MagicMock) -> list[dict]:
@@ -97,12 +117,28 @@ def journal() -> MagicMock:
 
 @pytest.fixture
 def failing_client() -> MagicMock:
-    return _raising_client()
+    return raising_client(RuntimeError('connection refused'))
 
 
 @pytest.fixture
 def service(llm_config, journal, failing_client) -> MemoryService:
     return _service(llm_config, journal, failing_client)
+
+
+@pytest_asyncio.fixture
+async def queued_service(llm_config, journal, failing_client, tmp_path):
+    """The service over a REAL durable queue, so add_episode's facts run as queued writes."""
+    svc = _service(llm_config, journal, failing_client)
+    svc.graphiti = MagicMock()
+    svc.graphiti.initialize = AsyncMock()
+    svc.graphiti.add_episode = AsyncMock(return_value=None)
+    svc.graphiti.close = AsyncMock()
+    svc.graphiti._require_client = MagicMock()
+    svc.mem0.close = AsyncMock()
+    svc.set_known_projects({'p1': str(tmp_path)})
+    await svc.initialize()
+    yield svc
+    await svc.close()
 
 
 class TestTheResponseReportsTheFallback:
@@ -142,7 +178,7 @@ class TestTheResponseReportsTheFallback:
         service = _service(
             llm_config,
             journal,
-            _answering_client(
+            completion_client(
                 '{"primary": "decisions_and_rationale", "secondary": null, '
                 '"confidence": 0.9, "reasoning": "a choice"}'
             ),
@@ -198,21 +234,35 @@ class TestTheStormAlarmIsWired:
         ]
 
         assert [r.memory_ids for r in responses] == [['mem0-1']] * DEFAULT_THRESHOLD
-        [esc] = [e for e in _pending(tmp_path) if e.task_id == _ANCHOR_TASK_ID]
+        [esc] = [e for e in _pending(tmp_path) if e.task_id == ANCHOR_TASK_ID]
         assert 'p1' in esc.summary
 
+
+@_needs_escalation
+class TestTheEpisodePathFeedsTheStormAlarm:
     @pytest.mark.asyncio
     async def test_an_extracted_fact_burst_files_one_escalation(
-        self, service, journal, tmp_path,
+        self, queued_service, journal, tmp_path,
     ):
-        service.set_known_projects({'p1': str(tmp_path)})
+        facts = [f'{_NO_HEURISTIC_MATCH} {n}' for n in range(DEFAULT_THRESHOLD)]
+        queued_service.graphiti.add_episode.return_value = _extracting(*facts)
 
-        for _ in range(DEFAULT_THRESHOLD):
-            await service._execute_mem0_classify_and_add(
-                {'fact_text': _NO_HEURISTIC_MATCH, 'project_id': 'p1'},
-            )
+        await queued_service.add_episode('an episode', project_id='p1')
+        await _drain(queued_service, completed=1 + len(facts))
 
-        assert len([e for e in _pending(tmp_path) if e.task_id == _ANCHOR_TASK_ID]) == 1
+        assert len([e for e in _pending(tmp_path) if e.task_id == ANCHOR_TASK_ID]) == 1
         params = _add_memory_params(journal)
         assert len(params) == DEFAULT_THRESHOLD
         assert all(p[JOURNAL_PARAM_KEY] == 'llm_error' for p in params)
+
+    @pytest.mark.asyncio
+    async def test_a_retried_fact_is_counted_once(self, queued_service, tmp_path):
+        facts = [f'{_NO_HEURISTIC_MATCH} {n}' for n in range(DEFAULT_THRESHOLD - 1)]
+        queued_service.graphiti.add_episode.return_value = _extracting(*facts)
+        queued_service.mem0.add = _fails_once_per_fact()
+
+        await queued_service.add_episode('an episode', project_id='p1')
+        await _drain(queued_service, completed=1 + len(facts))
+
+        assert queued_service.mem0.add.await_count == 2 * len(facts)
+        assert _pending(tmp_path) == []

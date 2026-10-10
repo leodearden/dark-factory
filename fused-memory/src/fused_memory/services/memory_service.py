@@ -73,7 +73,6 @@ from fused_memory.models.enums import (
 from fused_memory.models.memory import (
     AddEpisodeResponse,
     AddMemoryResponse,
-    ClassificationResult,
     EpisodeStatus,
     MemoryResult,
     ReadRouteResult,
@@ -6180,17 +6179,14 @@ class MemoryService:
                     error=error_msg,
                 )
 
-    async def _classify_unlabelled(
-        self, content: str, project_id: str
-    ) -> ClassificationResult:
-        """Classify a write that carries no category; record any fallback into the alarm."""
-        classification = await self.classifier.classify(content)
+    async def _record_classification_fallback(
+        self, fallback: ClassificationFallback | None, project_id: str
+    ) -> None:
         await self._classification_fallback_alarm.record(
-            classification.fallback,
+            fallback,
             project_id=project_id,
             project_root=self._known_projects.get(project_id),
         )
-        return classification
 
     async def _execute_mem0_classify_and_add(
         self, payload: dict[str, Any]
@@ -6207,7 +6203,7 @@ class MemoryService:
             session_id=payload.get('session_id'),
         )
 
-        classification = await self._classify_unlabelled(fact_text, scope.project_id)
+        classification = await self.classifier.classify(fact_text)
         if classification.primary not in MEM0_PRIMARY and classification.secondary is None:
             return None  # Not Mem0-bound
 
@@ -6234,6 +6230,9 @@ class MemoryService:
             payload={'content': fact_text[:200]},
             coro=self.mem0.add(content=fact_text, scope=scope, metadata=metadata),
         )
+        # Only once the write has landed: a failed write is retried through this
+        # whole executor, and a retry must not count the same fact again.
+        await self._record_classification_fallback(classification.fallback, scope.project_id)
 
         # Log Layer 1 for the derived write
         if self._write_journal:
@@ -6679,9 +6678,10 @@ class MemoryService:
         # Resolve category
         classification_fallback: ClassificationFallback | None = None
         if category is None:
-            classification = await self._classify_unlabelled(content, project_id)
+            classification = await self.classifier.classify(content)
             resolved_category = classification.primary
             classification_fallback = classification.fallback
+            await self._record_classification_fallback(classification_fallback, project_id)
         elif isinstance(category, str):
             resolved_category = MemoryCategory(category)
         else:
