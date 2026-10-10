@@ -3443,10 +3443,7 @@ class ReconciliationHarness:
                             timeout=self.config.cycle_timeout_seconds,
                         )
                     else:
-                        await asyncio.wait_for(
-                            self.run_full_cycle(project_id, reason, tier=tier),
-                            timeout=self.config.cycle_timeout_seconds,
-                        )
+                        await self._run_bounded_full_cycle(project_id, reason, tier)
                 except TimeoutError:
                     # task 2040: name the event for the branch that actually timed
                     # out — conflating the two here previously meant an else-branch
@@ -3470,7 +3467,6 @@ class ReconciliationHarness:
                             'branch': branch,
                         },
                     )
-                    await self.buffer.restore_drained(project_id)
                 finally:
                     try:
                         await self._replay_deferred_writes(ProjectId(project_id))
@@ -3519,6 +3515,26 @@ class ReconciliationHarness:
                 logger.error(f'Project loop error for {project_id}: {e}')
 
             await _sleep(5)  # Cooldown between cycles
+
+    async def _run_bounded_full_cycle(
+        self, project_id: str, reason: str, tier: TierConfig | None,
+    ) -> None:
+        """Run one full cycle within cycle_timeout_seconds as a caller-minted
+        run; if it raises, the timeout included, its own drained events are
+        restored unless the journal records it completed."""
+        run_id = str(uuid4())
+        try:
+            await asyncio.wait_for(
+                self.run_full_cycle(project_id, reason, tier=tier, run_id=run_id),
+                timeout=self.config.cycle_timeout_seconds,
+            )
+        except Exception:
+            await await_best_effort(
+                restore_unless_completed(self.journal, self.buffer, project_id, run_id),
+                what='restore_unless_completed', run_id=run_id,
+                logger=logger, level=logging.ERROR,
+            )
+            raise
 
     async def _heartbeat_loop(self, project_id: str) -> None:
         """Keep the reconciliation lock alive while a run is in progress."""
