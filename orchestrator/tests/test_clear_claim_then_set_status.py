@@ -11,11 +11,13 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from shared.task_claimant import is_stranded
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.harness import Harness
 from orchestrator.scheduler import Scheduler, SetTaskStatusRejected, TickContext
 
 TID = '4621'
@@ -168,3 +170,59 @@ async def test_stranded_blocked_sweep_leaves_pending_with_null_claimant(
     assert row is not None
     assert (row['status'], row['claimant_run_id']) == ('pending', None)
     assert [name for name, _ in store.writes] == ['set_task_claimant', 'set_task_status']
+
+
+@pytest.fixture
+def revert_harness(tmp_path: Path, mock_orch_config, store: _TaskRowStore) -> Harness:
+    """A Harness whose reconcile sweep reverts TID, over a REAL Scheduler on ``store``.
+
+    The branch is GONE_NO_MARKER and no worktree exists, so recovery_for
+    classifies REVERT_TO_PENDING without any cleanup work.
+    """
+    with patch('orchestrator.harness.McpLifecycle'), \
+         patch('orchestrator.harness.Scheduler'), \
+         patch('orchestrator.harness.BriefingAssembler'):
+        h = Harness(mock_orch_config)
+    h.config.convert_to_blocked_enforce = False
+    h.git_ops.worktree_base = (tmp_path / '.worktrees').resolve()
+    h.git_ops.is_ancestor = AsyncMock(return_value=False)
+    h.git_ops.resolve_branch_sha = AsyncMock(return_value=None)
+    h.git_ops.find_merge_marker = AsyncMock(return_value=None)
+    h.scheduler = Scheduler(OrchestratorConfig(project_root=tmp_path), mcp_session=store)
+    return h
+
+
+async def _sweep(harness: Harness) -> str | None:
+    return await harness._reconcile_one_stranded(TID, 'in-progress', mid_run=False)
+
+
+@pytest.mark.asyncio
+async def test_b11_revert_clears_dead_claimant_and_flips_to_pending(
+    revert_harness: Harness, forbid_live_mcp,
+) -> None:
+    assert await _sweep(revert_harness) == 'reverted'
+
+    row = await revert_harness.scheduler.get_task(TID)
+    assert row is not None
+    assert (row['status'], row['claimant_run_id'], row['heartbeat_at']) == ('pending', None, None)
+
+
+@pytest.mark.asyncio
+async def test_b12_fault_between_clear_and_flip_is_backstopped_by_next_sweep(
+    revert_harness: Harness, store: _TaskRowStore, forbid_live_mcp,
+) -> None:
+    store.fail_status_write = True
+    with pytest.raises(SetTaskStatusRejected):
+        await _sweep(revert_harness)
+
+    row = await revert_harness.scheduler.get_task(TID)
+    assert row is not None
+    assert (row['status'], row['claimant_run_id']) == ('in-progress', None)
+
+    store.fail_status_write = False
+    assert await _sweep(revert_harness) == 'reverted'
+
+    row = await revert_harness.scheduler.get_task(TID)
+    assert row is not None
+    assert (row['status'], row['claimant_run_id']) == ('pending', None)
+    assert store.pending_with_stale_claimant() == []
