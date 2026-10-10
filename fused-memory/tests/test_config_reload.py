@@ -1228,3 +1228,10 @@ class TestConsolidationAutoLeavesAreGreenTier:
 
         assert d.applied_candidates[path] == {'old': ['orchestrator'], 'new': []}
         assert path not in d.restart_required
+
+
+def test_transcript_archive_leaves_are_green_tier():
+    """The recon archive kill switch must reach a running server; a
+    restart-only kill switch is no kill switch (task 3972)."""
+    assert 'reconciliation.transcript_archive_enabled' in RELOADABLE_FIELDS
+    assert 'reconciliation.transcript_archive_root' in RELOADABLE_FIELDS
