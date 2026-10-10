@@ -15,6 +15,7 @@ the reason ``_ast_guard`` records.
 
 import asyncio
 import functools
+import re
 from collections.abc import Mapping
 from types import MappingProxyType
 from unittest.mock import AsyncMock
@@ -78,3 +79,25 @@ def registered_fused_memory_tools() -> Mapping[str, Tool]:
 def fused_memory_names(tools) -> frozenset[str]:
     """The fused-memory ids among *tools* (a stage disallow list mixes servers)."""
     return frozenset(name for name in tools if name.startswith(FUSED_MEMORY_TOOL_PREFIX))
+
+
+_PREFIXED_ID_RE = re.compile(re.escape(FUSED_MEMORY_TOOL_PREFIX) + r'([a-z_]+)')
+_BACKTICKED_NAME_RE = re.compile(r'`([a-z_]+)[`(]')
+
+
+def fused_memory_tool_names_mentioned(text: str) -> frozenset[str]:
+    """Bare tool names *text* mentions: prefixed ids, plus backticked bare names.
+
+    Over-collects on purpose (a backticked parameter name is collected too):
+    callers intersect the result with tool names, so an extra token is inert.
+    """
+    return frozenset(_PREFIXED_ID_RE.findall(text)) | frozenset(_BACKTICKED_NAME_RE.findall(text))
+
+
+def denied_fused_memory_tool_names(*stage_lists) -> frozenset[str]:
+    """Bare names of the fused-memory tools any of *stage_lists* denies."""
+    return frozenset(
+        name.removeprefix(FUSED_MEMORY_TOOL_PREFIX)
+        for stage_list in stage_lists
+        for name in fused_memory_names(stage_list)
+    )
