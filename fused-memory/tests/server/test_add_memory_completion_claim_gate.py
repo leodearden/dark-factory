@@ -265,6 +265,16 @@ class TestNonAssertiveMoodIsNotTagged:
                 '5471',
                 id='esc-unverified-claim-5471-4',
             ),
+            pytest.param(
+                'Doing it BEFORE #7407 stamps the PRD SHIPPED is the correct order',
+                '7407',
+                id='esc-unverified-claim-7407-3',
+            ),
+            pytest.param(
+                "check #8246's status for whether it has landed)",
+                '8246',
+                id='esc-unverified-claim-8246-5',
+            ),
         ],
     )
     async def test_non_assertive_phrasing_is_not_tagged(self, tmp_path, content, ref):

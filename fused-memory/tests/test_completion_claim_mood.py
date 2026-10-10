@@ -118,3 +118,86 @@ class TestModalFormsAreNotClaims:
     )
     def test_a_modal_elsewhere_leaves_the_claim(self, text):
         assert _triples(text) == [('applied_work', 'task', '5422')]
+
+
+class TestNonAssertiveScopes:
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param(
+                "check #8246's status for whether it has landed)",
+                id='esc-unverified-claim-8246-5',
+            ),
+            pytest.param(
+                "Merge-stall triage (check #8246's status for whether it has landed on main)",
+                id='imperative-after-paren',
+            ),
+            pytest.param(
+                'if #6020 has landed, ROUTE THROUGH IT rather than re-implementing '
+                'the Applied case',
+                id='esc-unverified-claim-6020-2',
+            ),
+            pytest.param(
+                "the task text says to add an event only 'if #5455 has landed'",
+                id='if-inside-single-quotes',
+            ),
+            pytest.param('unless task 5422 is merged first', id='unless'),
+            pytest.param('in case task 5422 has shipped', id='in-case'),
+            pytest.param('verify task 5422 was merged', id='imperative-verify'),
+            pytest.param('Next: confirm #5422 has shipped', id='imperative-after-colon'),
+            pytest.param('- check that task 5422 landed', id='imperative-bullet'),
+        ],
+    )
+    def test_a_non_veridical_or_imperative_scope_is_not_a_claim(self, text):
+        assert _triples(text) == []
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param(
+                'Doing it BEFORE #7407 stamps the PRD SHIPPED is the correct order',
+                id='esc-unverified-claim-7407-3',
+            ),
+            pytest.param(
+                'Task 1371 can be unblocked once Task 1374 is cancelled', id='once',
+            ),
+            pytest.param(
+                'should NOT be marked superseded until task 791 is merged', id='until',
+            ),
+            pytest.param(
+                'a #5023 cite would rot silently the day #5023 is cancelled',
+                id='esc-unverified-claim-5023-2',
+            ),
+            pytest.param('when task 5422 has landed, re-run the sweep', id='when'),
+        ],
+    )
+    def test_a_present_tense_temporal_scope_is_not_a_claim(self, text):
+        assert _triples(text) == []
+
+    @pytest.mark.parametrize(
+        ('text', 'ref'),
+        [
+            pytest.param('After task 5 landed, the suite went green.', '5', id='after-past'),
+            pytest.param('When task 5 was merged, the queue halted.', '5', id='when-past'),
+            pytest.param('once task 5 landed we re-ran the sweep', '5', id='once-past'),
+            pytest.param(
+                'recorded before task 3445 landed tests/x.py (+1 test)', '3445',
+                id='before-past',
+            ),
+            pytest.param(
+                'Task 3815 (if-then-else returning a Solid) shipped via geometry.rs', '3815',
+                id='hyphen-attached-cue',
+            ),
+            pytest.param(
+                'if task 6 is pending, note that task 5 has landed', '5',
+                id='scope-ends-at-comma',
+            ),
+            pytest.param(
+                'Task 5 has landed. Check the dashboard.', '5',
+                id='imperative-in-next-clause',
+            ),
+        ],
+    )
+    def test_an_asserted_landing_outside_any_scope_is_still_a_claim(self, text, ref):
+        assert _triples(text) == [('applied_work', 'task', ref)]
