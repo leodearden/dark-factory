@@ -4,7 +4,12 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
-from fused_memory.models.enums import MemoryCategory, QueryType, SourceStore
+from fused_memory.models.enums import (
+    ClassificationFallback,
+    MemoryCategory,
+    QueryType,
+    SourceStore,
+)
 
 
 class EpisodeStatus(StrEnum):
@@ -22,6 +27,8 @@ class ClassificationResult(BaseModel):
     secondary: MemoryCategory | None = None
     confidence: float = Field(ge=0.0, le=1.0)
     reasoning: str = ''
+    # None: primary is a real classification. A member names why primary is a default.
+    fallback: ClassificationFallback | None = None
 
 
 class MemoryResult(BaseModel):
