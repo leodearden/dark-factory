@@ -753,7 +753,7 @@ def _fused_memory_liveness_verdict() -> str:
     return "wedged"
 
 
-def restart_unit(unit: str) -> None:
+def restart_unit(unit: str) -> list[str]:
     """Revive *unit* via ``systemctl --user reset-failed`` then ``restart --no-block``.
 
     NEVER STOPS THE UNIT. Each service unit gets
@@ -787,8 +787,15 @@ def restart_unit(unit: str) -> None:
     wedged systemctl invocation cannot hang the oneshot watchdog.
     ``subprocess.TimeoutExpired`` is caught and logged, never raised, and the
     restart phase still runs after a reset-failed timeout.
+
+    Returns the names of the phases whose systemctl invocation exceeded its
+    budget (``[]`` when every phase returned in time). A timeout here is the
+    watchdog's own subprocess budget expiring, not evidence about what systemd
+    did, so callers pass the result to ``_log_restart_outcome`` to keep their
+    closing line from reading as an unqualified success.
     """
     socket_unit = unit.replace(".service", ".socket")
+    timed_out: list[str] = []
     try:
         subprocess.run(
             ["systemctl", "--user", "reset-failed", unit, socket_unit],
@@ -796,6 +803,7 @@ def restart_unit(unit: str) -> None:
             timeout=10,
         )
     except subprocess.TimeoutExpired:
+        timed_out.append("reset-failed")
         log(f"systemctl reset-failed {unit} {socket_unit} timed out after 10s")
 
     try:
@@ -805,7 +813,25 @@ def restart_unit(unit: str) -> None:
             timeout=45,
         )
     except subprocess.TimeoutExpired:
+        timed_out.append("restart")
         log(f"systemctl restart --no-block {unit} timed out after 45s")
+    return timed_out
+
+
+def _log_restart_outcome(unit: str, timed_out_phases: list[str] | None) -> None:
+    """Close a ``restart_unit`` call with a line that names what was observed.
+
+    Clean run: ``<unit> restart issued``. Any phase timeout: the line says so
+    and that the unit's state is unconfirmed, because a timed-out ``systemctl``
+    says nothing about whether systemd completed the transition.
+    """
+    if not timed_out_phases:
+        log(f"{unit} restart issued")
+        return
+    log(
+        f"{unit} restart issued, but systemctl phase(s) "
+        f"{', '.join(timed_out_phases)} timed out; unit state unconfirmed"
+    )
 
 
 def _unit_start_elapsed_secs(unit: str) -> float | None:
@@ -2016,8 +2042,7 @@ def _revive_if_dead(port: int, unit: str, status: UnitRestartStatus) -> None:
     # sequence revives every case.
     log(f"{unit} {reason}; restarting")
     try:
-        restart_unit(unit)
-        log(f"{unit} restart issued")
+        _log_restart_outcome(unit, restart_unit(unit))
     finally:
         # Armed on the raising path too, as fused_memory_liveness_pass does.
         if not _stamp_orch_liveness_restart_clock(unit):
@@ -2164,8 +2189,7 @@ def fused_memory_liveness_pass() -> None:
             f"(streak {streak}/{FM_LIVENESS_STREAK_THRESHOLD}); restarting"
         )
         try:
-            restart_unit(FUSED_MEMORY_UNIT)
-            log(f"{FUSED_MEMORY_UNIT} restart issued")
+            _log_restart_outcome(FUSED_MEMORY_UNIT, restart_unit(FUSED_MEMORY_UNIT))
         finally:
             # Arming before the streak clear, and on the raising path too —
             # see THE BOOKKEEPING RUNS ON THE RAISING PATH TOO above.

@@ -448,9 +448,55 @@ def test_restart_unit_handles_restart_timeout(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     # Must not raise
-    wdog.restart_unit("orchestrator-dark-factory.service")
+    timed_out = wdog.restart_unit("orchestrator-dark-factory.service")
 
     assert len(log_messages) >= 1, "restart timeout must be logged via log()"
+    assert timed_out == ["restart"]
+
+
+def test_restart_unit_reports_no_timed_out_phases_when_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wdog = _load_watchdog()
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "", "")
+    )
+    assert wdog.restart_unit("fused-memory.service") == []
+
+
+def test_restart_unit_reports_every_timed_out_phase(monkeypatch: pytest.MonkeyPatch) -> None:
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        if cmd[0] == "systemctl":
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog.restart_unit("fused-memory.service") == ["reset-failed", "restart"]
+
+
+def test_log_restart_outcome_plain_when_no_phase_timed_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wdog = _load_watchdog()
+    messages: list[str] = []
+    monkeypatch.setattr(wdog, "log", messages.append)
+    wdog._log_restart_outcome("fused-memory.service", [])
+    assert messages == ["fused-memory.service restart issued"]
+
+
+def test_log_restart_outcome_qualifies_success_when_phases_timed_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wdog = _load_watchdog()
+    messages: list[str] = []
+    monkeypatch.setattr(wdog, "log", messages.append)
+    wdog._log_restart_outcome("fused-memory.service", ["reset-failed", "restart"])
+    (line,) = messages
+    assert "reset-failed, restart" in line
+    assert "timed out" in line
+    assert "unconfirmed" in line
 
 
 # ---------------------------------------------------------------------------
