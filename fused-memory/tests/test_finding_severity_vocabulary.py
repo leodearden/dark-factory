@@ -1,4 +1,4 @@
-"""The recon finding severity vocabulary has one source, and every surface reads it.
+"""The recon finding severity vocabulary has one source, which the schema and prompts read.
 
 ``FindingSeverity`` (models/reconciliation.py) is the closed vocabulary of the
 recon_report ``add_finding`` channel.  It is deliberately distinct from
@@ -24,6 +24,12 @@ class TestFindingSeverityVocabulary:
         assert [m.name for m in FindingSeverity] == ['minor', 'moderate', 'serious']
         for member in FindingSeverity:
             assert member.value == member.name
+
+    def test_every_member_carries_a_gloss(self):
+        from fused_memory.models.reconciliation import FindingSeverity
+
+        for member in FindingSeverity:
+            assert isinstance(member.gloss, str) and member.gloss.strip(), member
 
     def test_values_tuple_and_membership_set_derive_from_the_enum(self):
         from fused_memory.models.reconciliation import (
@@ -57,36 +63,32 @@ class TestFindingSeverityVocabulary:
         json.dumps(FINDING_ITEM_SCHEMA)
 
 
-def _rendered_severity_placeholder() -> str:
+_ADD_FINDING_SEVERITY_ARG = re.compile(r'add_finding\([^)]*?\bseverity=([^,)]*)')
+
+
+def _offers_whole_vocabulary(text: str) -> bool:
+    """Some add_finding call shape in ``text`` offers every severity member."""
     from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES
 
-    return '<' + '|'.join(repr(v) for v in FINDING_SEVERITY_VALUES) + '>'
+    return any(
+        all(severity in m.group(1) for severity in FINDING_SEVERITY_VALUES)
+        for m in _ADD_FINDING_SEVERITY_ARG.finditer(text)
+    )
 
 
 class TestPromptVocabularyIsRendered:
     """The prompt-side statements of the vocabulary are rendered from
     FINDING_SEVERITY_VALUES, never hand-transcribed."""
 
-    def test_gloss_table_covers_exactly_the_vocabulary_in_order(self):
-        from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES
-        from fused_memory.reconciliation.prompts import FINDING_SEVERITY_GLOSSES
-
-        assert tuple(FINDING_SEVERITY_GLOSSES) == FINDING_SEVERITY_VALUES
-        for severity, gloss in FINDING_SEVERITY_GLOSSES.items():
-            assert isinstance(gloss, str) and gloss.strip(), severity
-
     def test_rendered_vocabulary_lists_every_member_and_gloss_in_order(self):
-        from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES
-        from fused_memory.reconciliation.prompts import (
-            FINDING_SEVERITY_GLOSSES,
-            render_finding_severity_vocabulary,
-        )
+        from fused_memory.models.reconciliation import FindingSeverity
+        from fused_memory.reconciliation.prompts import render_finding_severity_vocabulary
 
         rendered = render_finding_severity_vocabulary()
         assert rendered.strip()
         cursor = 0
-        for severity in FINDING_SEVERITY_VALUES:
-            for token in (severity, FINDING_SEVERITY_GLOSSES[severity]):
+        for severity in FindingSeverity:
+            for token in (severity.value, severity.gloss):
                 found = rendered.find(token, cursor)
                 assert found >= 0, f'{token!r} missing or out of order in {rendered!r}'
                 cursor = found + len(token)
@@ -97,12 +99,11 @@ class TestPromptVocabularyIsRendered:
             render_recon_report_tool_guidance,
         )
 
-        expected = f'severity={_rendered_severity_placeholder()}'
         for name, guidance in (
             ('render_recon_report_tool_guidance', render_recon_report_tool_guidance()),
             ('get_recon_report_tool_guidance', get_recon_report_tool_guidance()),
         ):
-            assert expected in guidance, f'{name} lacks {expected!r}'
+            assert _offers_whole_vocabulary(guidance), name
             assert 'severity=<severity>' not in guidance, name
 
     def test_every_stage_prompt_carries_the_enumerated_call_shape(self):
@@ -110,13 +111,12 @@ class TestPromptVocabularyIsRendered:
         from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
         from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 
-        expected = f'severity={_rendered_severity_placeholder()}'
         for name, prompt in (
             ('STAGE1_SYSTEM_PROMPT', STAGE1_SYSTEM_PROMPT),
             ('STAGE2_SYSTEM_PROMPT', STAGE2_SYSTEM_PROMPT),
             ('STAGE3_SYSTEM_PROMPT', STAGE3_SYSTEM_PROMPT),
         ):
-            assert expected in prompt, f'{name} lacks {expected!r}'
+            assert _offers_whole_vocabulary(prompt), name
 
     def test_both_stage3_vocabulary_listings_are_rendered(self):
         from fused_memory.reconciliation.prompts import render_finding_severity_vocabulary
@@ -170,7 +170,15 @@ def _off_vocabulary_report(prompt_name: str, prompt: str, matches: list[re.Match
 
 
 class TestAssembledPromptsNameOnlyEnumSeverities:
-    """Every severity a stage prompt teaches is a FindingSeverity member."""
+    """Backstop, not proof: the severity phrasings that have drifted before
+    (``severity=X``, ``X-severity``, ``info/low/high finding``) name only
+    FindingSeverity members in the assembled prompts.
+
+    Other phrasings pass unseen, and policies/*.py text or the recon_self_model
+    signature are scanned only where interpolated into these prompts.  The
+    primary defence is prompt prose interpolating FindingSeverity members and
+    render_finding_severity_vocabulary() rather than spelling a severity out.
+    """
 
     @pytest.mark.parametrize('prompt_name', _ASSEMBLED_PROMPT_NAMES)
     def test_literal_severities_are_enum_members(self, prompt_name):

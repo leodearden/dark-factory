@@ -275,11 +275,19 @@ class FindingSeverity(StrEnum):
     moderate = 'moderate'
     serious = 'serious'
 
+    @property
+    def gloss(self) -> str:
+        """What a finding of this severity is, as the stage prompts teach it."""
+        match self:
+            case FindingSeverity.minor:
+                return 'cosmetic mismatch'
+            case FindingSeverity.moderate:
+                return 'wrong information'
+            case FindingSeverity.serious:
+                return 'fundamentally contradictory state'
 
-# The one spelling of the finding vocabulary, read by
-# reconciliation/cli_stage_runner.py::FINDING_ITEM_SCHEMA,
-# server/recon_report.py::ReconReportState.add_finding and
-# reconciliation/prompts/__init__.py.
+
+# Derived from FindingSeverity; do not hand-declare elsewhere.
 FINDING_SEVERITY_VALUES: tuple[str, ...] = tuple(s.value for s in FindingSeverity)
 FINDING_SEVERITY_SET: frozenset[str] = frozenset(FINDING_SEVERITY_VALUES)
 
