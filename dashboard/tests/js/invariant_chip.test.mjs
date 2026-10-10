@@ -15,13 +15,6 @@ const { invariantChipFor } = chip;
 
 const MEASURED_AT = '2026-10-10T12:00:00+00:00';
 const TONES = new Set(['muted', 'warn', 'bad']);
-const seenChips = [];
-
-function chipFor(invariants, project) {
-  const result = invariantChipFor(invariants, project);
-  if (result !== null) seenChips.push(result);
-  return result;
-}
 
 function violation(taskId, ledgered) {
   return {
@@ -65,15 +58,15 @@ function blindRecord(project, error) {
 }
 
 test('unknown is not clean: no record renders no chip', () => {
-  assert.equal(chipFor(undefined, 'reify'), null);
-  assert.equal(chipFor({ project: 'reify' }, 'reify'), null);
-  assert.equal(chipFor([], 'reify'), null);
-  assert.equal(chipFor([okRecord('dark-factory')], 'reify'), null);
+  assert.equal(invariantChipFor(undefined, 'reify'), null);
+  assert.equal(invariantChipFor({ project: 'reify' }, 'reify'), null);
+  assert.equal(invariantChipFor([], 'reify'), null);
+  assert.equal(invariantChipFor([okRecord('dark-factory')], 'reify'), null);
 });
 
 test('a blind root is loud and makes no count claim', () => {
   const error = 'tasks.db not found at /srv/reify/.taskmaster/tasks/tasks.db';
-  const result = chipFor([blindRecord('reify', error)], 'reify');
+  const result = invariantChipFor([blindRecord('reify', error)], 'reify');
   assert.equal(result.tone, 'bad');
   assert.match(result.text, /blind/);
   assert.doesNotMatch(result.text, /\d/);
@@ -81,7 +74,7 @@ test('a blind root is loud and makes no count claim', () => {
 });
 
 test('a measured zero is shown, muted, with its provenance', () => {
-  const result = chipFor([okRecord('reify', [], 8394)], 'reify');
+  const result = invariantChipFor([okRecord('reify', [], 8394)], 'reify');
   assert.equal(result.tone, 'muted');
   assert.match(result.text, /0/);
   assert.ok(result.title.includes('8394'));
@@ -90,7 +83,7 @@ test('a measured zero is shown, muted, with its provenance', () => {
 
 test('unledgered violations alarm and are named in the title', () => {
   const record = okRecord('reify', [violation(101, false), violation(102, true), violation(103, false)]);
-  const result = chipFor([record], 'reify');
+  const result = invariantChipFor([record], 'reify');
   assert.equal(result.tone, 'bad');
   assert.match(result.text, /3/);
   assert.match(result.text, /2 unledgered/);
@@ -100,7 +93,7 @@ test('unledgered violations alarm and are named in the title', () => {
 
 test('sanctioned (ledgered) mints are reported, not alarmed', () => {
   const record = okRecord('reify', [violation(101, true), violation(102, true)]);
-  const result = chipFor([record], 'reify');
+  const result = invariantChipFor([record], 'reify');
   assert.equal(result.tone, 'muted');
   assert.match(result.text, /2/);
   assert.doesNotMatch(result.text, /unledgered/);
@@ -108,7 +101,7 @@ test('sanctioned (ledgered) mints are reported, not alarmed', () => {
 
 test('a basename collision never drops a root: blind wins', () => {
   const records = [okRecord('reify'), blindRecord('reify', 'OperationalError: no such table: tasks')];
-  const result = chipFor(records, 'reify');
+  const result = invariantChipFor(records, 'reify');
   assert.equal(result.tone, 'bad');
   assert.match(result.text, /blind/);
   assert.ok(result.title.includes('no such table'));
@@ -116,12 +109,20 @@ test('a basename collision never drops a root: blind wins', () => {
 
 test('a basename collision of two measured roots sums their counts', () => {
   const records = [okRecord('reify', [violation(1, true)]), okRecord('reify', [violation(2, true), violation(3, true)])];
-  const result = chipFor(records, 'reify');
+  const result = invariantChipFor(records, 'reify');
   assert.equal(result.tone, 'muted');
   assert.match(result.text, /3/);
 });
 
 test('every tone is in the runtime_format.js vocabulary', () => {
-  assert.ok(seenChips.length > 0);
-  for (const result of seenChips) assert.ok(TONES.has(result.tone), result.tone);
+  const branches = {
+    blind: [blindRecord('reify', 'OperationalError: no such table: tasks')],
+    'measured zero': [okRecord('reify')],
+    ledgered: [okRecord('reify', [violation(1, true)])],
+    unledgered: [okRecord('reify', [violation(1, false)])],
+  };
+  for (const [branch, invariants] of Object.entries(branches)) {
+    const { tone } = invariantChipFor(invariants, 'reify');
+    assert.ok(TONES.has(tone), `${branch}: ${tone}`);
+  }
 });
