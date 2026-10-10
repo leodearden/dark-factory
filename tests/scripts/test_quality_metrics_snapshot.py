@@ -150,7 +150,7 @@ class TestTheHeader:
         out = tmp_path / 'out' / 'snapshot.json'
         assert _run(root, out) == 0
         measured = json.loads(out.read_text(encoding='utf-8'))
-        assert measured['schema_version'] == 1
+        assert measured['schema_version'] == 2
         assert measured['instrument'] == 'quality-metrics-snapshot'
         assert measured['run_id'] == 'run-1'
         assert measured['as_of_sha'] == git(root, 'rev-parse', 'HEAD').strip()
@@ -366,8 +366,10 @@ class TestTheImportGraph:
     def measured(self, tmp_path: Path) -> dict[str, Any]:
         return _measured(tmp_path, _GRAPH)
 
-    def test_it_has_exactly_the_four_sections(self, measured: dict[str, Any]) -> None:
-        assert set(measured['import_graph']) == {'edges', 'reach_back', 'deferred', 'cycles'}
+    def test_it_has_exactly_the_six_sections(self, measured: dict[str, Any]) -> None:
+        assert list(measured['import_graph']) == [
+            'edges', 'reach_back', 'deferred', 'cycles', 'hidden_cycles', 'typing_cycles',
+        ]
 
     def test_edges_are_explicit_first_party_src_imports(self, measured: dict[str, Any]) -> None:
         # Module-level, TYPE_CHECKING and function-local imports all count; no
@@ -390,6 +392,14 @@ class TestTheImportGraph:
         # c <-> d exists only under TYPE_CHECKING, and e -> a is function-local.
         assert measured['import_graph']['cycles'] == [['a', 'b']]
 
+    def test_the_wider_cycle_sets_add_function_local_then_type_checking_edges(
+        self, measured: dict[str, Any]
+    ) -> None:
+        # e -> a is function-local, but a never reaches e; c <-> d is TYPE_CHECKING only.
+        graph = measured['import_graph']
+        assert graph['hidden_cycles'] == [['a', 'b']]
+        assert graph['typing_cycles'] == [['a', 'b'], ['c', 'd']]
+
     def test_a_name_from_the_package_init_is_a_reach_back_and_a_submodule_is_not(
         self, measured: dict[str, Any]
     ) -> None:
@@ -399,7 +409,7 @@ class TestTheImportGraph:
 
     def test_deferred_imports_are_listed_by_site(self, measured: dict[str, Any]) -> None:
         deferred = measured['import_graph']['deferred']
-        assert deferred == [{'from': 'e', 'line': 5, 'imports': ['a']}]
+        assert deferred == [{'from': 'e', 'line': 5, 'imports': ['a'], 'closes_cycle': False}]
         assert (
             len([entry for entry in deferred if entry['from'] == 'e'])
             == measured['files']['alpha/src/e.py']['function_local_imports']
@@ -434,7 +444,7 @@ class TestTheImportGraph:
             'member', 'kind', 'blob', 'lines', 'prose_lines', 'prose_ratio',
             'cognitive_total', 'cognitive_max', 'cognitive_max_function', 'functions',
             'module', 'package_init', 'function_local_imports', 'reexport_names',
-            'reach_back_imports', 'fan_out', 'fan_in_src', 'fan_in_tests',
+            'reach_back_imports', 'cycle_closing_imports', 'fan_out', 'fan_in_src', 'fan_in_tests',
         }
 
     def test_relative_imports_resolve(self, tmp_path: Path) -> None:
@@ -464,6 +474,58 @@ class TestTheImportGraph:
         assert 'alpha/src/broken.py' in measured['evidence']['unreadable']
         assert 'alpha/src/broken.py' not in measured['files']
         assert measured['files']['alpha/src/user.py']['fan_out'] == 1
+
+
+#: Cycles that only function-local (j <-> m, f <-> g) or TYPE_CHECKING (t <-> v) imports close.
+_CYCLE_SETS: dict[str, str] = {
+    'alpha/src/f.py': 'import g\n',
+    'alpha/src/g.py': 'def h():\n    import w, f\n    return f\n',
+    'alpha/src/w.py': 'W = 1\n',
+    'alpha/src/j.py': 'def k():\n    import m\n    return m\n',
+    'alpha/src/m.py': 'def n():\n    import j\n    return j\n',
+    'alpha/src/t.py': (
+        'from typing import TYPE_CHECKING\n\n\ndef u():\n    if TYPE_CHECKING:\n        import v\n'
+    ),
+    'alpha/src/v.py': 'import t\n',
+    'alpha/src/e.py': 'def late():\n    import f\n    return f\n',
+    'beta/src/beta/b.py': 'B = 1\n',
+}
+
+
+class TestTheCycleSets:
+    @pytest.fixture
+    def measured(self, tmp_path: Path) -> dict[str, Any]:
+        return _measured(tmp_path, _CYCLE_SETS)
+
+    def test_each_set_adds_the_edges_of_a_later_moment(self, measured: dict[str, Any]) -> None:
+        graph = measured['import_graph']
+        assert graph['cycles'] == []
+        assert graph['hidden_cycles'] == [['f', 'g'], ['j', 'm']]
+        assert graph['typing_cycles'] == [['f', 'g'], ['j', 'm'], ['t', 'v']]
+
+    def test_a_deferred_import_closes_a_cycle_when_it_lies_on_a_hidden_one(
+        self, measured: dict[str, Any]
+    ) -> None:
+        # g: one target in the importer's hidden cycle suffices; j and m: both
+        # function-local edges of one cycle are marked; t: a TYPE_CHECKING import
+        # lies on a typing cycle only; e: its target never reaches back.
+        assert measured['import_graph']['deferred'] == [
+            {'from': 'e', 'line': 2, 'imports': ['f'], 'closes_cycle': False},
+            {'from': 'g', 'line': 2, 'imports': ['f', 'w'], 'closes_cycle': True},
+            {'from': 'j', 'line': 2, 'imports': ['m'], 'closes_cycle': True},
+            {'from': 'm', 'line': 2, 'imports': ['j'], 'closes_cycle': True},
+            {'from': 't', 'line': 6, 'imports': ['v'], 'closes_cycle': False},
+        ]
+
+    def test_each_src_record_counts_its_cycle_closing_imports(self, measured: dict[str, Any]) -> None:
+        counts = {
+            record['module']: record['cycle_closing_imports']
+            for record in measured['files'].values()
+            if record['kind'] == 'src'
+        }
+        assert counts == {
+            'beta.b': 0, 'e': 0, 'f': 0, 'g': 1, 'j': 1, 'm': 1, 't': 0, 'v': 0, 'w': 0,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -499,7 +561,7 @@ _PATCHING: dict[str, str] = {
 
 _SRC_ONLY_FIELDS = frozenset({
     'module', 'package_init', 'function_local_imports', 'reexport_names',
-    'reach_back_imports', 'fan_out', 'fan_in_src', 'fan_in_tests',
+    'reach_back_imports', 'cycle_closing_imports', 'fan_out', 'fan_in_src', 'fan_in_tests',
 })
 
 
@@ -875,8 +937,10 @@ class TestImportGraphChanges:
             '  edge added: a -> b',
             '  edge added: b -> a',
             '  cycle added: a, b',
+            '  hidden cycle added: a, b',
+            '  typing cycle added: a, b',
             '  reach-back added: pkg.a -> pkg (THING)',
-            '  deferred added: e: a',
+            '  deferred import added: e: a',
         ):
             assert line in added, (line, added)
         removed = _section(chain[2][1], self._GRAPH)
@@ -884,8 +948,10 @@ class TestImportGraphChanges:
             '  edge removed: a -> b',
             '  edge removed: b -> a',
             '  cycle removed: a, b',
+            '  hidden cycle removed: a, b',
+            '  typing cycle removed: a, b',
             '  reach-back removed: pkg.a -> pkg (THING)',
-            '  deferred removed: e: a',
+            '  deferred import removed: e: a',
         ):
             assert line in removed, (line, removed)
 
@@ -896,6 +962,158 @@ class TestImportGraphChanges:
         shifted = '\n' + _GRAPH_CHANGED['alpha/src/pkg/a.py']
         diff = _diff_of(tmp_path, capsys, coupled, _rewrite('alpha/src/pkg/a.py', shifted))
         assert _section(diff, self._GRAPH) == ['  (none)']
+
+    def test_a_function_local_import_closing_a_cycle_is_a_hidden_cycle_only(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        base = {**_BASE, 'alpha/src/f.py': 'import g\n', 'alpha/src/g.py': 'G = 1\n'}
+        diff = _diff_of(
+            tmp_path, capsys, base, _rewrite('alpha/src/g.py', 'def h():\n    import f\n    return f\n')
+        )
+        assert _section(diff, self._GRAPH) == [
+            '  edge added: g -> f',
+            '  deferred import added: g: f',
+            '  cycle-closing deferred import added: g: f',
+            '  hidden cycle added: f, g',
+            '  typing cycle added: f, g',
+        ]
+
+    def test_a_deferred_import_that_starts_closing_a_cycle_is_a_cycle_closing_one_added(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        base = {
+            **_BASE,
+            'alpha/src/f.py': 'F = 1\n',
+            'alpha/src/g.py': 'def h():\n    import f\n    return f\n',
+        }
+        diff = _diff_of(tmp_path, capsys, base, _rewrite('alpha/src/f.py', 'import g\nF = 1\n'))
+        assert _section(diff, self._GRAPH) == [
+            '  edge added: f -> g',
+            '  cycle-closing deferred import added: g: f',
+            '  hidden cycle added: f, g',
+            '  typing cycle added: f, g',
+        ]
+
+    def test_a_deferred_import_leaving_type_checking_onto_a_hidden_cycle_is_reported(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Edges, cycle sets and the deferred imports by (from, imports) all stay the same.
+        guarded = (
+            'from typing import TYPE_CHECKING\n\n\ndef h():\n    import f\n    return f\n\n\n'
+            'def k():\n    if TYPE_CHECKING:\n        import f\n    return TYPE_CHECKING\n'
+        )
+        base = {**_BASE, 'alpha/src/f.py': 'import g\n', 'alpha/src/g.py': guarded}
+        unguarded = guarded.replace('    if TYPE_CHECKING:\n        import f\n', '    import f\n')
+        diff = _diff_of(tmp_path, capsys, base, _rewrite('alpha/src/g.py', unguarded))
+        assert _section(diff, self._GRAPH) == ['  cycle-closing deferred import added: g: f']
+
+    def test_a_type_checking_only_cycle_is_a_typing_cycle_only(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        base = {**_BASE, 'alpha/src/c.py': 'X = 1\n', 'alpha/src/d.py': 'X = 1\n'}
+
+        def couple(root: Path) -> None:
+            _commit(root, 'couple', write={
+                'alpha/src/c.py': _GRAPH['alpha/src/c.py'],
+                'alpha/src/d.py': _GRAPH['alpha/src/d.py'],
+            })
+
+        assert _section(_diff_of(tmp_path, capsys, base, couple), self._GRAPH) == [
+            '  edge added: c -> d',
+            '  edge added: d -> c',
+            '  typing cycle added: c, d',
+        ]
+
+
+def _as_schema_1(taken: dict[str, Any]) -> dict[str, Any]:
+    """What a pre-6612 measurement of the same tree recorded, e.g. plans/quality-metrics/review-all-dark_factory-20261008.json."""
+    old = copy.deepcopy(taken)
+    old['schema_version'] = 1
+    graph = old['import_graph']
+    del graph['hidden_cycles'], graph['typing_cycles']
+    for entry in graph['deferred']:
+        del entry['closes_cycle']
+    for record in old['files'].values():
+        record.pop('cycle_closing_imports', None)
+    return old
+
+
+def _unknown_in_schema_1(side: str) -> list[str]:
+    return [
+        f'  cycle-closing deferred imports unknown: the {side} snapshot is schema 1',
+        f'  hidden cycles unknown: the {side} snapshot is schema 1',
+        f'  typing cycles unknown: the {side} snapshot is schema 1',
+    ]
+
+
+class TestASchema1SnapshotIsStillRead:
+    @pytest.fixture
+    def taken(self, tmp_path: Path) -> dict[str, Any]:
+        return _measured(tmp_path, _GRAPH)
+
+    def test_it_is_valid(self, taken: dict[str, Any]) -> None:
+        old = _as_schema_1(taken)
+        assert snapshot.validate_snapshot(old, origin='v1') == old
+
+    def test_its_absent_cycle_sets_are_unknown_on_either_side(self, taken: dict[str, Any]) -> None:
+        # Nothing else in the section: deferred entries compare equal without closes_cycle.
+        old = _as_schema_1(taken)
+        assert _section(snapshot.diff_lines(taken, old), 'import graph:') == _unknown_in_schema_1(
+            'previous'
+        )
+        assert _section(snapshot.diff_lines(old, taken), 'import graph:') == _unknown_in_schema_1(
+            'current'
+        )
+
+    def test_a_measuring_run_diffs_against_one(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        root = _repo(tmp_path, _GRAPH)
+        first, second, previous = tmp_path / 's1.json', tmp_path / 's2.json', tmp_path / 'prev.json'
+        assert _run(root, first) == 0
+        previous.write_text(json.dumps(_as_schema_1(_load(first))), encoding='utf-8')
+        capsys.readouterr()
+        assert _run(root, second, '--diff', str(previous)) == 0
+        printed = capsys.readouterr().out.splitlines()
+        assert _section(printed, 'import graph:') == _unknown_in_schema_1('previous')
+        assert snapshot.main(['--current', str(second), '--diff', str(previous)]) == 0
+        printed = capsys.readouterr().out.splitlines()
+        assert _section(printed, 'import graph:') == _unknown_in_schema_1('previous')
+
+    @pytest.mark.parametrize(
+        ('named', 'edit'),
+        [
+            pytest.param(
+                'import_graph.deferred[0] keys',
+                lambda old: old['import_graph']['deferred'][0].update(closes_cycle=False),
+                id='closes_cycle',
+            ),
+            pytest.param(
+                "files['alpha/src/a.py'] keys",
+                lambda old: old['files']['alpha/src/a.py'].update(cycle_closing_imports=0),
+                id='cycle_closing_imports',
+            ),
+        ],
+    )
+    def test_one_carrying_a_schema_2_field_is_refused(
+        self, taken: dict[str, Any], named: str, edit: _Edit
+    ) -> None:
+        old = _as_schema_1(taken)
+        edit(old)
+        with pytest.raises(source_measures.MetricsError) as raised:
+            snapshot.validate_snapshot(old, origin='v1')
+        assert named in str(raised.value)
+
+    def test_an_unread_version_is_refused_naming_the_read_ones(self, taken: dict[str, Any]) -> None:
+        with pytest.raises(source_measures.MetricsError) as raised:
+            snapshot.validate_snapshot({**taken, 'schema_version': 3}, origin='v3')
+        assert 'schema_version is 3' in str(raised.value)
+        assert 'one of [1, 2]' in str(raised.value)
+
+    def test_the_instrument_is_checked_before_the_version(self) -> None:
+        with pytest.raises(source_measures.MetricsError) as raised:
+            snapshot.validate_snapshot({'schema_version': 7, 'instrument': 'other'}, origin='foreign')
+        assert 'instrument' in str(raised.value)
 
 
 _COUPLING_BEFORE = 'from pkg import mod\n\ndef test_it():\n    assert mod._y\n'
@@ -1046,11 +1264,30 @@ class TestTheSummary:
         table_at = summary.index(_SUMMARY_HEADER)
         assert summary.index(f'run: run-1 as_of {taken["as_of_sha"]} since none') < table_at
         assert summary.index('files: 12/12 measured, complete=true') < table_at
+        closing = sum(entry['closes_cycle'] for entry in graph['deferred'])
         assert summary.index(
             f'import graph: {len(graph["edges"])} edges, {len(graph["reach_back"])} reach-backs, '
-            f'{len(graph["deferred"])} deferred imports, {len(graph["cycles"])} cycles'
+            f'{len(graph["deferred"])} deferred imports, {closing} cycle-closing deferred imports, '
+            f'{len(graph["cycles"])} cycles, {len(graph["hidden_cycles"])} hidden cycles, '
+            f'{len(graph["typing_cycles"])} typing cycles'
         ) < table_at
         assert 'unreadable (measures unknown, never zero):' not in summary
+
+    def test_a_schema_1_snapshot_names_its_cycle_sets_unknown(
+        self, measured: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        taken = _load(measured)
+        graph = taken['import_graph']
+        old = tmp_path / 'schema-1.json'
+        old.write_text(json.dumps(_as_schema_1(taken)), encoding='utf-8')
+        summary = _summary_of(old, capsys)
+        assert (
+            f'import graph: {len(graph["edges"])} edges, {len(graph["reach_back"])} reach-backs, '
+            f'{len(graph["deferred"])} deferred imports, {len(graph["cycles"])} cycles; '
+            'cycle-closing deferred imports, hidden cycles, typing cycles unknown (schema 1)'
+        ) in summary
+        # The table has no column a schema-1 record lacks.
+        assert _table(summary)[1] == _table(_summary_of(measured, capsys))[1]
 
     def test_an_incomplete_snapshot_names_its_unreadable_paths(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -1259,7 +1496,7 @@ class TestABadPreviousSnapshotIsRefusedBeforeMeasuring:
         assert _run(root, measured) == 0
         previous = tmp_path / 'previous.json'
         previous.write_text(
-            json.dumps({**json.loads(measured.read_text(encoding='utf-8')), 'schema_version': 2}),
+            json.dumps({**json.loads(measured.read_text(encoding='utf-8')), 'schema_version': 3}),
             encoding='utf-8',
         )
         capsys.readouterr()
@@ -1326,6 +1563,7 @@ _MISSHAPEN: list[Any] = [
     _record(_SRC_PATH, 'package_init', 'no'),
     _record(_SRC_PATH, 'reexport_names', None),
     _record(_SRC_PATH, 'fan_in_tests', 1.5),
+    _record(_SRC_PATH, 'cycle_closing_imports', None),
     _record(_TESTS_PATH, 'private_patch_targets', 'alpha.mod._x'),
     _record(_TESTS_PATH, 'private_reads', None),
     pytest.param('functions', _setting('functions', to=[]), id='functions'),
@@ -1352,6 +1590,26 @@ _MISSHAPEN: list[Any] = [
     ),
     pytest.param(
         'import_graph.cycles[0][1]', _setting('import_graph', 'cycles', to=[['a', 1]]), id='cycles'
+    ),
+    pytest.param(
+        'import_graph.deferred[0].closes_cycle',
+        _setting('import_graph', 'deferred', 0, 'closes_cycle', to='no'),
+        id='deferred-closes-cycle',
+    ),
+    pytest.param(
+        'import_graph.hidden_cycles[0][1]',
+        _setting('import_graph', 'hidden_cycles', to=[['a', 1]]),
+        id='hidden-cycles',
+    ),
+    pytest.param(
+        'import_graph.typing_cycles[0][1]',
+        _setting('import_graph', 'typing_cycles', to=[['a', 1]]),
+        id='typing-cycles',
+    ),
+    pytest.param(
+        'import_graph keys',
+        lambda taken: taken['import_graph'].pop('hidden_cycles'),
+        id='import-graph-keys',
     ),
 ]
 
