@@ -200,7 +200,7 @@ def load_ratifications(path: Path) -> tuple[Ratification, ...]:
 # D5 — static discovery of governed-list declarations.
 
 _FUNCTION_NAME = governed_exceptions.__name__
-_CALL_TEXT = f'{_FUNCTION_NAME}('.encode()
+_NAME_TEXT = _FUNCTION_NAME.encode()
 _SIGNATURE = inspect.signature(governed_exceptions)
 _LITERAL_CLASSES: Mapping[str, type] = MappingProxyType(
     {cls.__name__: cls for cls in (Debt, Policy, TaskRef, TicketRef)}
@@ -649,7 +649,7 @@ def declarations_in(corpus: Corpus) -> Discovery:
     faults: list[Violation] = []
     parsed = 0
     for path, raw in sorted(corpus.files.items()):
-        if _CALL_TEXT not in raw:
+        if _NAME_TEXT not in raw:
             continue
         parsed += 1
         scan = _ModuleScan(path)
