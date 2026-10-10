@@ -58,6 +58,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import sys
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -366,6 +367,10 @@ class OutcomeCell(StrEnum):
     FALSE_CONTESTED = 'false_contested'
 
 
+BOOTSTRAP_RESAMPLES = 10_000
+BOOTSTRAP_SEED = 6532
+"""The paired bootstrap's settings; each arm draws from a fresh ``random.Random(BOOTSTRAP_SEED)``."""
+
 DEFAULT_HARM_WEIGHTS: Mapping[str, float] = MappingProxyType({
     OutcomeCell.CONTESTED_MISFILE: 3,
     OutcomeCell.FALSE_CONTESTED: 2,
@@ -426,6 +431,14 @@ COMPARATIVE_RULES: Mapping[str, str] = MappingProxyType({
         'harm_total.arm - harm_total.status_quo, on the same writes; at most 0 means no more'
         ' harm than storing every write flat; None when n_writes is 0'
     ),
+    'harm_delta_bootstrap95': (
+        'paired bootstrap 95% interval of harm_delta_vs_status_quo, reported and not gated:'
+        ' each production-judged write contributes its arm harm minus its status-quo harm; the'
+        ' writes, ordered by memory_id, are resampled with replacement bootstrap.resamples'
+        ' times from random.Random(bootstrap.seed), and the interval is the nearest-rank 2.5th'
+        ' and 97.5th percentiles of the resampled sums; None when n_writes is 0'
+    ),
+    'bootstrap': 'the settings harm_delta_bootstrap95 was computed with',
     OutcomeCell.ATTACH_BELONGS: 'attached, not filed contested, pair resolved AGREEING',
     OutcomeCell.CONTRADICTION_FLAGGED: 'filed contested, pair resolved CORRECTS',
     OutcomeCell.PLACEABLE_LEFT_FLAT: 'a placeable write stored flat',
@@ -697,6 +710,8 @@ def score_pairs(
             f'reference arm {reference_arm!r} is not among the arms {sorted(cases_by_arm)}'
         )
     _refuse_unshared_routing(cases_by_arm, reference_arm)
+    if created_at is not None:
+        _refuse_uncomparable_rows(chain.from_iterable(cases_by_arm.values()), created_at)
     truth = resolve_verdicts(verdicts)
     unrated, tied = _incomplete(_judged_pairs(cases_by_arm), truth)
     if unrated or tied:
@@ -746,6 +761,37 @@ def _refuse_unshared_routing(
                 f' band winner {theirs.band_winner_id!r} in reference arm {reference_arm!r};'
                 ' the arms were not run on one frozen population'
             )
+
+
+def _refuse_uncomparable_rows(
+    cases: Iterable[JudgedCase], created_at: Mapping[str, datetime],
+) -> None:
+    for case in cases:
+        violation = _comparative_violation(case, created_at)
+        if violation is not None:
+            raise ValueError(f'{_case_label(case.arm, case.memory_id)}: {violation}')
+
+
+def _comparative_violation(case: JudgedCase, created_at: Mapping[str, datetime]) -> str | None:
+    if not case.in_judge_band:
+        return None
+    missing = [flag for flag in _WRITE_FLAGS if getattr(case, flag) is None]
+    if missing:
+        return (
+            f'a judge-band row lacks {", ".join(missing)}, so the comparative block cannot tell'
+            ' whether production would have judged it'
+        )
+    if not case.production_judged:
+        return None
+    if created_at.get(case.memory_id) is None:
+        return 'a production-judged write has no instant in created_at'
+    target = case.judged_candidate_id
+    if target is not None and not _predates(created_at, target, case.memory_id):
+        return (
+            f'attached to {target!r}, which does not predate the write; the comparative block'
+            ' reads write-time rows only (PRD §12 D19)'
+        )
+    return None
 
 
 def _judged_pairs(cases_by_arm: Mapping[str, Sequence[JudgedCase]]) -> dict[Pair, tuple[str, ...]]:
@@ -854,8 +900,34 @@ def _comparative(
         'outcomes': outcomes,
         'harm_weights': {cell.value: weight for cell, weight in weights.items()},
         **_harm_figures(outcomes, weights, measured=bool(writes)),
+        'harm_delta_bootstrap95': _paired_bootstrap95({
+            write.scored.case.memory_id:
+                _write_harm(write.arm_cells, weights) - _write_harm(write.status_quo_cells, weights)
+            for write in writes
+        }),
+        'bootstrap': {
+            'resamples': BOOTSTRAP_RESAMPLES,
+            'seed': BOOTSTRAP_SEED,
+            'unit': 'production-judged write',
+        },
         'rules': {str(key): rule for key, rule in COMPARATIVE_RULES.items()},
     }
+
+
+def _write_harm(cells: frozenset[OutcomeCell], weights: Mapping[OutcomeCell, float]) -> float:
+    return sum(weights.get(cell, 0) for cell in cells)
+
+
+def _paired_bootstrap95(delta_by_write: Mapping[str, float]) -> list[float] | None:
+    """Nearest-rank 95% interval of the summed per-write delta over resampled writes."""
+    if not delta_by_write:
+        return None
+    deltas = [delta_by_write[write] for write in sorted(delta_by_write)]
+    draws = random.Random(BOOTSTRAP_SEED)
+    sums = sorted(
+        sum(draws.choices(deltas, k=len(deltas))) for _ in range(BOOTSTRAP_RESAMPLES)
+    )
+    return [round(_nearest_rank(sums, 2.5), 4), round(_nearest_rank(sums, 97.5), 4)]
 
 
 def _harm_figures(
@@ -924,9 +996,9 @@ def _runtime(calls: Sequence[JudgedCase]) -> dict[str, Any]:
     }
 
 
-def _nearest_rank(sorted_values: Sequence[float], percent: int) -> float:
+def _nearest_rank(sorted_values: Sequence[float], percent: float) -> float:
     """The smallest observed value with at least *percent*% of values at or below it."""
-    rank = -(-percent * len(sorted_values) // 100)
+    rank = math.ceil(percent * len(sorted_values) / 100)
     return sorted_values[rank - 1]
 
 
