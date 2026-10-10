@@ -1302,39 +1302,7 @@ sandbox:
 # plain boundary-safe string-prefix matching against changed file paths with
 # no filesystem check), chosen deliberately so a typo'd prefix fails CI
 # instead of silently never matching a changed file at fire time.
-# DEPLOY PAUSE — TEMPORARY, 2026-09-03. Restore to `true` once tasks 3730,
-# 3733 and 4755 have landed (task 5020 is the deterministic gate that asks for
-# exactly that; do not remove this comment without closing it).
-#
-# WHY: this tier restarts the WHOLE FLEET (restart-all-orchestrators.sh restarts
-# all seven units) whenever a merge touches orchestrator_restart_watch_prefixes.
-# MEASURED 2026-08-28 -> 09-03: 8 of 12 run boundaries were this tier. Every
-# restart soft-cancels every in-flight task, and at the current ~6.8h median task
-# duration against an ~8.3h run, most tasks never finish. Runs <10h delivered
-# 0.254 done/h at 22.4 cancellations per completed task; runs >=10h delivered
-# 0.426 done/h at 7.5. So the fleet does ~1.7x more work per hour, and wastes 3x
-# less, when it is simply left alone.
-#
-# THE TRAP THIS BREAKS: the survival fixes (3730/3733/4755) are THEMSELVES
-# orchestrator code, so landing one triggers this tier, which restarts the fleet,
-# which kills the in-flight work — including, historically, those very fixes.
-# Task 3728 was killed eight times this way before landing on its ninth attempt.
-#
-# SCOPE — read before widening: this pauses the merge-landed COORDINATOR tier
-# only. The watchdog LIVENESS probe is deliberately untouched and must stay on;
-# it is not clock-gated, never invokes the sweep script, and is the only thing
-# that revives a genuinely wedged unit. The watchdog STALENESS tier is throttled
-# separately via ORCH_RESTART_MIN_INTERVAL_SECS in its own systemd unit env.
-#
-# COST: orchestrator code stops reaching the fleet while this is false (deploy
-# latency was a ~2h median). Unpausing deploys everything accumulated in one
-# restart. If something lands that fixes an actively-breaking fleet problem,
-# flip this back deliberately rather than waiting for 4907.
-#
-# RED TIER: not in RELOADABLE_FIELDS, so this takes effect at the next restart
-# — which is the point. It was edited ~1.6h before a scheduled 8h-clock restart
-# so it costs no additional restart of its own.
-orchestrator_restart_on_merge_enabled: false
+orchestrator_restart_on_merge_enabled: true
 orchestrator_restart_script: "scripts/restart-all-orchestrators.sh"
 orchestrator_restart_watch_prefixes:
   - "orchestrator/src/"
