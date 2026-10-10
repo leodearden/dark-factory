@@ -160,6 +160,19 @@ PRECISION_GUARD_SHAPES: list[str] = [
     # rather than by prose. (amendment, reviewer_comprehensive
     # test-coverage finding, task 4149)
     'Reviews for café.py tasks 1020 and 1030 are pending.',
+    # TOKEN-INTERNAL ';', '?' and '!' end no sentence either, so the
+    # occurrence-level test covers every break character, not just
+    # '.'. The first two over-selected before task 4851; the '!'
+    # shape has no corpus occurrence and is pinned for symmetry.
+    'Reviews for https://ci/build?ref=main tasks 1020 and 1030 are pending.',
+    'Statuses of the branch;main tasks 1020 and 1030 are pending.',
+    'Notes about the yahoo!mail tasks 1020 and 1030 are pending.',
+    # HTML character entities: the corpus-observed shape. Its final
+    # ';' is followed by a quote, not an alphanumeric, so only the
+    # entity-terminator rule keeps it from breaking the clause.
+    # (task 4851)
+    "Reviews for task_id 'review-&lt;id&gt;' tasks 1020 and 1030 are pending.",
+    'Statuses of the &quot;next&quot; tasks 1020 and 1030 are pending.',
 ]
 
 
@@ -233,6 +246,21 @@ SUBJECT_POSITIVE_SHAPES: list[tuple[str, set[int]]] = [
     # stopping at the '.' after 'branch'. (amendment,
     # reviewer_comprehensive test-coverage finding, task 4149)
     ('Notes v1.2 for the branch. Statuses v3.4 tasks 1020 and 1030 are pending.',
+     {1020, 1030}),
+    # ...and the other edge of extending that test to ';', '?' and
+    # '!' (task 4851): a break followed by a space, or one that is
+    # the prefix's last character, still ends the clause.
+    ('Blockers on scheduler.py are resolved? Tasks 1020 and 1030 are pending.',
+     {1020, 1030}),
+    ('Reviews for the branch are done;Tasks 1020 and 1030 are pending.',
+     {1020, 1030}),
+    # CROSS-CHARACTER RETRY: the walk must step past the
+    # token-internal '?' to the earlier genuine '!'. Giving up at
+    # the '?' scans back over 'for' and yields set().
+    ('Notes for the branch! Statuses ci/build?ref=1 tasks 1020 and 1030 are pending.',
+     {1020, 1030}),
+    # An entity in an EARLIER sentence must not swallow the real '.'.
+    ('Reviews for the merge &amp; release. Tasks 1020 and 1030 are pending.',
      {1020, 1030}),
 ]
 

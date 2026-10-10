@@ -913,15 +913,18 @@ class TestExtractSnapshotEdgeTaskIds:
         """
         assert extract_snapshot_edge_task_ids(fact) == set()
 
-    def test_intra_token_dot_narrowing_costs_only_under_selection(self):
-        """Cost of the intra-token-dot narrowing, pinned from both sides. (task 4149)
+    def test_token_internal_break_narrowing_costs_only_under_selection(self):
+        """Cost of the token-internal-break narrowing, pinned from both sides.
 
-        Disqualifying an intra-token '.' as a break introduces exactly one
-        new residual: a genuine SENTENCE period with no following space AND
-        a following alphanumeric, sitting behind a listed preposition. Such
-        a '.' now reads as intra-token (flanked by alphanumerics on both
-        sides), so the backward scan does not stop there and the clause
-        extends back over the preposition, suppressing a genuine
+        (tasks 4149, 4851)
+
+        Disqualifying a token-internal break introduces exactly one new
+        residual: a genuine SENTENCE break ('.', ';', '!' or '?') with no
+        following space AND a following alphanumeric, sitting behind a
+        listed preposition. Such a break now reads as token-internal
+        (flanked by alphanumerics on both sides), so the backward scan does
+        not stop there and the clause extends back over the preposition,
+        suppressing a genuine
         subject-position enumeration. This is the fail-safe under-selection
         direction — the edge is simply not retired this cycle and the next
         sweep sees it again — mirroring
@@ -936,10 +939,14 @@ class TestExtractSnapshotEdgeTaskIds:
         all — it is still a break regardless of the narrowing.
         """
         # ACCEPTED residual: 'done.Then' — the period is flanked by 'e' and
-        # 'T', both alnum, so it reads as intra-token and the scan continues
+        # 'T', both alnum, so it reads as token-internal and the scan continues
         # back over 'for', suppressing the match.
         assert extract_snapshot_edge_task_ids(
             'Reviews for the branch are done.Then tasks 1020 and 1030 are pending.'
+        ) == set()
+        # ACCEPTED residual, the same shape for '?' (task 4851).
+        assert extract_snapshot_edge_task_ids(
+            'Reviews for the branch are done?Then tasks 1020 and 1030 are pending.'
         ) == set()
         # UNAFFECTED: 'done.Tasks' — the period is the prefix's last
         # character (prefix ends right before '\\btasks\\b'), so it has no
@@ -1779,6 +1786,36 @@ class TestPluralEnumerationPerformance:
             f'_last_clause_break touched {prefix.touched} characters for a '
             f'{len(dotted_tokens)}-char dot-dense prefix (budget '
             f'{8 * len(dotted_tokens)} = 8x length) — the intra-token-dot '
+            f'walk is no longer linear'
+        )
+
+    def test_mixed_token_internal_break_walk_touches_linearly_many_characters(self):
+        """The merged four-character walk must not degrade to quadratic. (task 4851)
+
+        Every member of ``_CLAUSE_BREAK_CHARS`` now gets the occurrence-level
+        test, so the walk must step past token-internal occurrences of all
+        four characters, interleaved. A naive spelling that re-takes the max
+        of four fresh ``rfind`` calls per step rescans the prefix once per
+        occurrence and is quadratic on dense input like this one.
+
+        The bound is derived, not guessed: four telescoped per-character
+        walks, each covering the prefix about once (~4x length), plus 2
+        single-character reads per occurrence (one occurrence every 2
+        characters, ~1x length), is about 5x. 8x leaves headroom for an
+        innocuous refactor while still failing any superlinear form.
+        """
+        mixed_tokens = 'a;b?c!d.' * 5_000 + 'e'
+        prefix = CountingStr(mixed_tokens)
+
+        result = _last_clause_break(prefix)
+
+        # Correctness alongside cost: every break is alnum-flanked, so no
+        # occurrence ends a sentence and the walk must exhaust to -1.
+        assert result == -1
+        assert prefix.touched <= 8 * len(mixed_tokens), (
+            f'_last_clause_break touched {prefix.touched} characters for a '
+            f'{len(mixed_tokens)}-char break-dense prefix (budget '
+            f'{8 * len(mixed_tokens)} = 8x length) — the token-internal-break '
             f'walk is no longer linear'
         )
 
