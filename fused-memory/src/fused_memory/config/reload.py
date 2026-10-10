@@ -103,6 +103,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # Replaced wholesale rather than merged, so a category the latest run
     # stopped deriving a cutoff for does not keep a stale one.
     'write_triage.t_high_by_category',
+    # Per-project cutoffs (task 5547). No server-side consumer: the audit CLI
+    # builds a fresh FusedMemoryConfig per run, so an in-place reload is safe
+    # and restart_required would be a false alarm. Yielded whole by
+    # _iter_leaves, so it reloads all-or-nothing like the map above.
+    'write_triage_project_calibrations',
     # The two write-triage OPERATOR KNOBS (task 3127), green-tier for a
     # different reason than the calibrated thresholds above: they are hand-set,
     # not derived, and both are read LIVE off the shared

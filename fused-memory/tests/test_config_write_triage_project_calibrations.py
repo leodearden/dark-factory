@@ -37,7 +37,8 @@ def _entry(t_high_by_category: dict) -> dict:
 
 
 def _config(entries: dict) -> FusedMemoryConfig:
-    return FusedMemoryConfig(**{FIELD: entries})
+    # Raw YAML-shaped entries, deliberately: what is pinned is how they load.
+    return FusedMemoryConfig(write_triage_project_calibrations=entries)  # pyright: ignore[reportArgumentType]
 
 
 class TestShape:
