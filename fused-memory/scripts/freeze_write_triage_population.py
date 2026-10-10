@@ -386,6 +386,29 @@ def load_snapshot(path: Path) -> tuple[dict[str, Any], str]:
     return json.loads(body), actual
 
 
+def record_created_at(snapshot: Mapping[str, Any]) -> dict[str, datetime]:
+    """The aware instant of every dated write and slate candidate in *snapshot*.
+
+    ``run_write_triage_config_matrix.py`` reads it so that
+    ``score_write_triage_pairs.py::WriteHomes`` can tell which targets predate a write.
+    """
+    instants: dict[str, datetime] = {}
+    records = (
+        record for write in snapshot['writes'] for record in (write, *write['candidates'])
+    )
+    for record in records:
+        instant = parse_created_at(record.get('created_at'))
+        if instant is None:
+            continue
+        seen = instants.setdefault(record['memory_id'], instant)
+        if seen != instant:
+            raise ValueError(
+                f'record {record["memory_id"]} appears in the snapshot at two instants:'
+                f' {seen.isoformat()} and {record["created_at"]}'
+            )
+    return instants
+
+
 # --- CLI ---------------------------------------------------------------------
 
 def _aware_datetime(text: str) -> datetime:
