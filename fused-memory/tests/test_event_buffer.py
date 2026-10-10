@@ -542,10 +542,10 @@ async def test_restore_drained_moves_events_back_to_buffered(buf):
     for _ in range(3):
         await buf.push(_make_event())
 
-    await buf.drain('test-project')
+    await buf.drain('test-project', run_id='R1')
     assert (await buf.get_buffer_stats('test-project'))['size'] == 0
 
-    restored = await buf.restore_drained('test-project')
+    restored = await buf.restore_drained('test-project', run_id='R1')
     assert restored == 3
     assert (await buf.get_buffer_stats('test-project'))['size'] == 3
 
@@ -553,7 +553,7 @@ async def test_restore_drained_moves_events_back_to_buffered(buf):
 @pytest.mark.asyncio
 async def test_restore_drained_returns_zero_when_empty(buf):
     """Restore on empty buffer returns 0."""
-    restored = await buf.restore_drained('test-project')
+    restored = await buf.restore_drained('test-project', run_id='R1')
     assert restored == 0
 
 
@@ -566,10 +566,10 @@ async def test_restore_drained_only_affects_target_project(tmp_path):
         await buf.push(_make_event(project_id='project-a'))
         await buf.push(_make_event(project_id='project-b'))
 
-        await buf.drain('project-a')
-        await buf.drain('project-b')
+        await buf.drain('project-a', run_id='R1')
+        await buf.drain('project-b', run_id='R1')
 
-        restored = await buf.restore_drained('project-a')
+        restored = await buf.restore_drained('project-a', run_id='R1')
         assert restored == 1
         assert (await buf.get_buffer_stats('project-a'))['size'] == 1
         assert (await buf.get_buffer_stats('project-b'))['size'] == 0
@@ -1974,26 +1974,6 @@ async def test_mark_drained_run_id_attributes_pre_drained_events_to_a_run(buf):
     restored_ry = await buf.restore_drained('test-project', run_id='RY')
     assert restored_ry == 1
     assert await _status(id4) == 'drained'
-
-
-@pytest.mark.asyncio
-async def test_restore_drained_without_run_id_restores_all_project_wide(buf):
-    """(c) Legacy backward-compat: restore_drained(project) with no run_id still
-    restores ALL remaining drained rows project-wide (guards existing callers)."""
-    events_r1 = [_make_event() for _ in range(2)]
-    events_r2 = [_make_event() for _ in range(3)]
-    for e in events_r1:
-        await buf.push(e)
-    await buf.drain('test-project', run_id='R1')
-    for e in events_r2:
-        await buf.push(e)
-    await buf.drain('test-project', run_id='R2')
-
-    assert (await buf.get_buffer_stats('test-project'))['size'] == 0
-
-    restored = await buf.restore_drained('test-project')
-    assert restored == 5
-    assert (await buf.get_buffer_stats('test-project'))['size'] == 5
 
 
 @pytest.mark.asyncio

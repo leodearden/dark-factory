@@ -11571,9 +11571,9 @@ async def test_backlog_iterator_budget_yield_stops_after_one_chunk(
     restore_calls: list[str] = []
     original_restore = event_buffer.restore_drained
 
-    async def spy_restore(pid):
+    async def spy_restore(pid, *args, **kwargs):
         restore_calls.append(pid)
-        return await original_restore(pid)
+        return await original_restore(pid, *args, **kwargs)
 
     event_buffer.restore_drained = spy_restore
 
@@ -11703,9 +11703,9 @@ async def test_backlog_iterator_budget_bounds_chunks_and_converges_across_invoca
     restore_calls: list[str] = []
     original_restore = event_buffer.restore_drained
 
-    async def spy_restore(pid):
+    async def spy_restore(pid, *args, **kwargs):
         restore_calls.append(pid)
-        return await original_restore(pid)
+        return await original_restore(pid, *args, **kwargs)
 
     event_buffer.restore_drained = spy_restore
 

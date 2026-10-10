@@ -664,24 +664,23 @@ class EventBuffer:
     async def restore_drained(
         self,
         project_id: str,
-        run_id: str | None = None,
+        run_id: str,
         *,
         include_unattributed: bool = False,
     ) -> int:
-        """Restore drained events to 'buffered' after a failed run.
+        """Restore one run's drained events to 'buffered' after it failed.
 
-        When ``run_id`` is provided, only rows stamped with
-        ``drained_by_run_id = run_id`` are restored — this protects a
-        concurrent live run's drained events from being clobbered when the
-        reaper recovers a *different* orphaned run on the same project (task
-        2711 / E7). When omitted (the default), behaviour is unchanged: every
-        drained row for the project is restored, project-wide.
+        Only rows stamped with ``drained_by_run_id = run_id`` are restored —
+        this protects a concurrent live run's drained events from being
+        clobbered when the reaper recovers a *different* orphaned run on the
+        same project (task 2711 / E7), and an earlier completed run's consumed
+        events from being re-processed (task 6453). There is deliberately no
+        project-wide mode.
 
         ``include_unattributed`` additionally restores rows with
-        ``drained_by_run_id IS NULL`` when ``run_id`` is set (ignored
-        otherwise — the project-wide path already covers them). This closes
-        the upgrade-boundary gap where events drained by a pre-task-2711
-        process carry no run attribution: since every production drain path
+        ``drained_by_run_id IS NULL``. This closes the upgrade-boundary gap
+        where events drained by a pre-task-2711 process carry no run
+        attribution: since every production drain path
         (``drain`` from ``run_full_cycle``, ``drain_by_ids`` from
         ``BacklogIterator``, task 6453) stamps ``drained_by_run_id`` as it
         drains, a NULL row can only be left over from a process that no longer
@@ -693,15 +692,7 @@ class EventBuffer:
         ``mark_drained_run_id`` attribution racing another's) must keep the
         default ``False``.
         """
-        if run_id is None:
-            async with self._require_access().write() as db:
-                cursor = await db.execute(
-                    "UPDATE event_buffer SET status = 'buffered' "
-                    "WHERE project_id = ? AND status = 'drained'",
-                    (project_id,),
-                )
-                count = cursor.rowcount
-        elif include_unattributed:
+        if include_unattributed:
             async with self._require_access().write() as db:
                 cursor = await db.execute(
                     "UPDATE event_buffer SET status = 'buffered' "
