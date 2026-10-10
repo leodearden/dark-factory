@@ -258,6 +258,14 @@ def _build(
         VERDICTS if verdicts is None else verdicts,
         shipped=_shipped() if shipped is None else shipped,
         bounds=[_bound('quality.unrated_pairs', '<=', '0')] if bounds is None else bounds,
+        created_at=CREATED_AT,
+    )
+
+
+def _oracle(cases: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    """ι's own scores of *cases*, with the comparative block μ asks it for."""
+    return _mod_iota().score_pairs(
+        chain(*cases.values()), VERDICTS, reference_arm=REFERENCE, created_at=CREATED_AT,
     )
 
 
@@ -270,9 +278,7 @@ def _scored_rows(matrix: dict[str, Any]) -> list[dict[str, Any]]:
 def test_build_matrix_scores_every_pi_arm_with_iota() -> None:
     cases = _three_arm_cases()
     matrix = _build(cases_by_arm=cases)
-    oracle = _mod_iota().score_pairs(
-        chain(*cases.values()), VERDICTS, reference_arm=REFERENCE,
-    )
+    oracle = _oracle(cases)
 
     assert matrix['reference_arm'] == REFERENCE
     scored = _scored_rows(matrix)
@@ -282,6 +288,8 @@ def test_build_matrix_scores_every_pi_arm_with_iota() -> None:
         assert row['quality'] == iota['quality']
         assert row['runtime'] == iota['runtime']
         assert row['paired_vs_reference'] == iota['paired_vs_reference']
+        assert row['comparative'] == iota['comparative']
+        assert isinstance(row['comparative'], dict)
         assert row['selection'] == {
             'judge_provider': provenance['provider'],
             'judge_model': provenance['model'],
@@ -336,7 +344,7 @@ CHEAP = '0.001'
 def _gate_checks(row: dict[str, Any], matrix: dict[str, Any], bounds: list[Any]) -> list[dict]:
     doc = {
         'quality': row['quality'], 'selection': row['selection'],
-        'population': matrix['population'],
+        'population': matrix['population'], 'comparative': row['comparative'],
     }
     return [
         _mod_gate().check_require({'best': doc}, 'best', b.path, b.op, b.value) for b in bounds
@@ -348,6 +356,8 @@ def test_every_arm_is_checked_against_the_bounds_the_way_gamma3_checks_them() ->
         _bound('quality.misfile_rate_of_attaches', '<=', '0.3'),
         _bound('selection.cost_per_write_usd', '<=', CHEAP),
         _bound('population.n_judge_band', '>=', '4'),
+        _bound('comparative.wrong_sibling_rate_placeable', '<=', '0.25'),
+        _bound('comparative.harm_delta_vs_status_quo', '<=', '0'),
     ]
     matrix = _build(bounds=bounds)
 
@@ -355,8 +365,19 @@ def test_every_arm_is_checked_against_the_bounds_the_way_gamma3_checks_them() ->
     for row in _scored_rows(matrix):
         checks = _gate_checks(row, matrix, bounds)
         assert row['bounds'] == {'met': all(c['ok'] for c in checks), 'checks': checks}
+        assert [c['note'] for c in checks] == [None] * len(checks)
         met[row['arm']] = row['bounds']['met']
-    assert met == {REFERENCE: True, PRE_PSI: True, SOL: False}
+    assert met == {REFERENCE: False, PRE_PSI: True, SOL: False}
+
+
+def test_candidate_doc_is_what_gamma3_reads() -> None:
+    [row] = [row for row in _scored_rows(_build()) if row['arm'] == SOL]
+    population = _c2_block(_population(THREE_ARMS, 4))
+
+    assert _mod().candidate_doc(row, population) == {
+        'quality': row['quality'], 'selection': row['selection'],
+        'population': population, 'comparative': row['comparative'],
+    }
 
 
 def test_a_metric_that_is_none_fails_its_bound() -> None:
@@ -374,15 +395,21 @@ def test_a_metric_that_is_none_fails_its_bound() -> None:
         assert row['bounds']['met'] is False
 
 
-def test_winner_is_the_qualifying_arm_with_fewest_contested_decision_errors() -> None:
+def _harm_deltas(matrix: dict[str, Any]) -> dict[str, float]:
+    return {
+        row['arm']: row['comparative']['harm_delta_vs_status_quo'] for row in _scored_rows(matrix)
+    }
+
+
+def test_winner_is_the_qualifying_arm_with_the_lowest_harm_delta() -> None:
     bounds = [
         _bound('quality.misfile_rate_of_attaches', '<=', '0.3'),
         _bound('selection.cost_per_write_usd', '<=', CHEAP),
     ]
     matrix = _build(bounds=bounds)
 
-    errors = {row['arm']: row['quality']['contested_decision_errors'] for row in _scored_rows(matrix)}
-    assert errors == {REFERENCE: 2, PRE_PSI: 1, SOL: 0}
+    assert _harm_deltas(matrix) == {REFERENCE: 1.0, PRE_PSI: -1.0, SOL: -4.0}
+    assert [row['arm'] for row in _scored_rows(matrix) if not row['bounds']['met']] == [SOL]
     assert matrix['winner'] == PRE_PSI
     rule = matrix['selection_rule']
     assert set(rule) == {'bounds', 'rule', 'fallback_applied'}
@@ -393,12 +420,38 @@ def test_winner_is_the_qualifying_arm_with_fewest_contested_decision_errors() ->
     assert rule['fallback_applied'] is False
 
 
-def _ranked(arm: str, errors: int, cost: float | None, failed: int = 0) -> dict[str, Any]:
+STORE = 'gpt-6-luna:low@5'
+#: Stores every write flat: no contested-decision error at all, and no change from the status quo.
+STORED: Answers = [(write, 'stored', None) for write in SLATE_OF]
+
+
+def test_the_harm_delta_not_the_contested_decision_errors_picks_the_winner() -> None:
+    arms = [*THREE_ARMS, _provenance(STORE, 'gpt-6-luna', 'low', 5, 'shipped')]
+    cases = _three_arm_cases() | {STORE: _arm_rows(STORE, STORED, model='gpt-6-luna')}
+    matrix = _build(arms=arms, cases_by_arm=cases,
+                    bounds=[_bound('selection.cost_per_write_usd', '<=', CHEAP)])
+
+    qualified = [row for row in _scored_rows(matrix) if row['bounds']['met']]
+    assert [row['arm'] for row in qualified] == [REFERENCE, PRE_PSI, STORE]
+    assert min(qualified, key=lambda row: row['quality']['contested_decision_errors'])['arm'] == (
+        STORE
+    )
+    assert _harm_deltas(matrix)[STORE] == 0
+    assert matrix['winner'] == PRE_PSI
+
+
+def test_the_winner_rule_names_the_harm_delta() -> None:
+    rule = _mod().WINNER_RULE
+    assert 'comparative.harm_delta_vs_status_quo' in rule
+    assert 'contested_decision_errors' not in rule
+
+
+def _ranked(arm: str, delta: float | None, cost: float | None, failed: int = 0) -> dict[str, Any]:
     """A scored row that fails *failed* bounds, shaped as ``_with_bounds`` writes it."""
     checks = [{'check': f'bound {index}', 'ok': False, 'note': None} for index in range(failed)]
     return {
         'arm': arm, 'status': 'scored', 'bounds': {'met': not failed, 'checks': checks},
-        'quality': {'contested_decision_errors': errors},
+        'comparative': {'harm_delta_vs_status_quo': delta},
         'selection': {'cost_per_write_usd': cost},
     }
 
@@ -407,15 +460,22 @@ def test_winner_ties_break_to_lower_cost_then_arm_name() -> None:
     select = _mod().select_winner
     skipped = {'arm': 'aaa', 'status': 'skipped', 'provider': 'anthropic', 'reason': 'no route'}
 
-    assert select([_ranked('a', 3, 0.002), _ranked('b', 3, 0.001)]) == ('b', False)
-    assert select([_ranked('a', 3, None), _ranked('b', 3, 0.5)]) == ('b', False)
-    assert select([_ranked('z', 3, 0.001), _ranked('a', 3, 0.001)]) == ('a', False)
-    assert select([skipped, _ranked('z', 3, 0.001)]) == ('z', False)
+    assert select([_ranked('a', -3.0, 0.002), _ranked('b', -3.0, 0.001)]) == ('b', False)
+    assert select([_ranked('a', -3.0, None), _ranked('b', -3.0, 0.5)]) == ('b', False)
+    assert select([_ranked('z', -3.0, 0.001), _ranked('a', -3.0, 0.001)]) == ('a', False)
+    assert select([skipped, _ranked('z', -3.0, 0.001)]) == ('z', False)
     with pytest.raises(ValueError):
         select([skipped])
 
 
-def test_no_qualifying_arm_falls_back_to_fewest_errors() -> None:
+def test_a_lower_harm_delta_wins_and_a_missing_one_ranks_last() -> None:
+    select = _mod().select_winner
+
+    assert select([_ranked('a', -1.0, 0.001), _ranked('b', -2.5, 0.009)]) == ('b', False)
+    assert select([_ranked('a', None, 0.001), _ranked('b', 40.0, 0.5)]) == ('b', False)
+
+
+def test_no_qualifying_arm_falls_back_to_the_lowest_harm_delta() -> None:
     matrix = _build(bounds=[_bound('population.n_judge_band', '>=', '5')])
 
     assert not any(row['bounds']['met'] for row in _scored_rows(matrix))
@@ -423,17 +483,17 @@ def test_no_qualifying_arm_falls_back_to_fewest_errors() -> None:
     assert matrix['selection_rule']['fallback_applied'] is True
 
 
-def test_without_a_qualifying_arm_the_winner_fails_fewest_bounds_before_fewest_errors() -> None:
+def test_without_a_qualifying_arm_the_winner_fails_fewest_bounds_before_lowest_delta() -> None:
     select = _mod().select_winner
 
     assert select([
-        _ranked('fewest-errors', 48, 0.017, failed=2), _ranked('one-miss', 52, 0.002, failed=1),
+        _ranked('lowest-delta', -60.0, 0.017, failed=2), _ranked('one-miss', 10.0, 0.002, failed=1),
     ]) == ('one-miss', True)
     assert select([
-        _ranked('a', 60, 0.001, failed=1), _ranked('b', 49, 0.001, failed=1),
+        _ranked('a', 60.0, 0.001, failed=1), _ranked('b', 49.0, 0.001, failed=1),
     ]) == ('b', True)
     assert select([
-        _ranked('close', 0, 0.001, failed=1), _ranked('qualified', 206, 0.001),
+        _ranked('close', -100.0, 0.001, failed=1), _ranked('qualified', 206.0, 0.001),
     ]) == ('qualified', False)
 
     matrix = _build(bounds=[
@@ -481,6 +541,11 @@ QUALIFYING_BOUNDS = [
 ]
 UNMET_BOUNDS = [('population.n_judge_band', '>=', '5')]
 UNEVENLY_UNMET_BOUNDS = [*UNMET_BOUNDS, ('selection.cost_per_write_usd', '<=', CHEAP)]
+COMPARATIVE_BOUNDS = [
+    ('comparative.wrong_sibling_rate_placeable', '<=', '0.11'),
+    ('comparative.harm_delta_vs_status_quo', '<=', '0'),
+]
+UNMET_COMPARATIVE_BOUNDS = [('comparative.harm_delta_vs_status_quo', '<=', '-5')]
 
 
 @pytest.mark.parametrize(
@@ -489,8 +554,13 @@ UNEVENLY_UNMET_BOUNDS = [*UNMET_BOUNDS, ('selection.cost_per_write_usd', '<=', C
         (QUALIFYING_BOUNDS, PRE_PSI, 0),
         (UNMET_BOUNDS, SOL, 1),
         (UNEVENLY_UNMET_BOUNDS, PRE_PSI, 1),
+        (COMPARATIVE_BOUNDS, SOL, 0),
+        (UNMET_COMPARATIVE_BOUNDS, SOL, 1),
     ],
-    ids=['winner-qualified', 'fallback', 'fallback-fewest-failed-bounds'],
+    ids=[
+        'winner-qualified', 'fallback', 'fallback-fewest-failed-bounds',
+        'comparative-qualified', 'comparative-fallback',
+    ],
 )
 def test_best_config_copies_the_winner_verbatim(
     spec: list[tuple[str, str, str]], winner: str, gate_exit: int, tmp_path: Path,
@@ -499,12 +569,13 @@ def test_best_config_copies_the_winner_verbatim(
     matrix = _build(cases_by_arm=cases, bounds=[_bound(*bound) for bound in spec])
     assert matrix['winner'] == winner
     [row] = [row for row in _scored_rows(matrix) if row['arm'] == winner]
-    oracle = _mod_iota().score_pairs(chain(*cases.values()), VERDICTS, reference_arm=REFERENCE)
+    oracle = _oracle(cases)
 
     best = _mod().best_config(matrix)
 
-    assert set(best) == {'quality', 'selection', 'population', 'provenance'}
+    assert set(best) == {'quality', 'selection', 'population', 'comparative', 'provenance'}
     assert best['quality'] == row['quality'] == oracle['arms'][winner]['quality']
+    assert best['comparative'] == row['comparative'] == oracle['arms'][winner]['comparative']
     assert best['selection'] == row['selection']
     assert set(best['selection']) == {
         'judge_provider', 'judge_model', 'judge_reasoning_effort', 'judge_candidate_count',
