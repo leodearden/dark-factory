@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from shared.cli_invoke import AllAccountsCappedException, read_transcript_records
-from shared.config_dir import TaskConfigDir
 from shared.project_layout import escalation_queue_dir
 from shared.scheduler_state import SchedulerStateSnapshot
 from shared.storm_counter import StormCounter
@@ -50,7 +49,7 @@ from fused_memory.reconciliation.active_runs import ActiveRunRegistry
 from fused_memory.reconciliation.backlog_policy import BacklogPolicy
 from fused_memory.reconciliation.cli_stage_runner import (
     gc_run_config_dir,
-    recon_config_base_dir,
+    run_config_dir_path,
 )
 from fused_memory.reconciliation.drained_event_restore import (
     restore_unless_completed_best_effort,
@@ -2419,7 +2418,9 @@ class ReconciliationHarness:
           must differ from ``run.stage_cursor`` (never re-resume the same stage).
         * **transcript-exists** — only when a session was captured
           (``run.session_id`` non-null): its transcript must still be on disk in
-          the per-run config dir.  ``record_run_session``'s snapshot is
+          the per-run config dir, whose path is derived rather than built as a
+          ``TaskConfigDir``, because a read-only probe must not create the dir
+          it probes for.  ``record_run_session``'s snapshot is
           best-effort (can go stale after an internal cap retry), so a missing
           transcript means there is nothing to ``--resume``.  A NULL session_id
           is NOT a failure — no session was captured (the interrupt landed
@@ -2454,15 +2455,12 @@ class ReconciliationHarness:
 
         # Transcript existence — only meaningful when a session was captured.
         if run.session_id:
-            config_dir = TaskConfigDir(
-                task_id=run.id,
-                base_dir=recon_config_base_dir(self.journal.data_dir),
-            )
-            transcript = read_transcript_records(config_dir.path, run.session_id)
+            config_dir_path = run_config_dir_path(self.journal.data_dir, run.id)
+            transcript = read_transcript_records(config_dir_path, run.session_id)
             if not transcript:
                 return (
                     f'session {run.session_id} has no transcript on disk '
-                    f'({config_dir.path}) — unresumable'
+                    f'({config_dir_path}) — unresumable'
                 )
 
         return None
