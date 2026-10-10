@@ -7,12 +7,23 @@ matters is in ``fused_memory/backends/graphiti_client.py::GraphitiBackend.redire
 
 from __future__ import annotations
 
+import contextlib
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _fm_helpers import extract_cypher, extract_params
+import pytest_asyncio
+from _fm_helpers import (
+    FALKOR_HOST,
+    FALKOR_PORT,
+    extract_cypher,
+    extract_params,
+    falkor_skipif,
+    unique_graph_name,
+)
 from _relates_to_doubles import EdgeFixture, answer_edge_read, written_edge_properties
+from falkordb.asyncio import FalkorDB
 
+from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantFalkorDriver
 from fused_memory.maintenance import cross_graph_move
 from fused_memory.maintenance.cross_graph_move import (
     merge_foreign_duplicate,
@@ -224,3 +235,83 @@ async def test_edge_read_row_width_mismatch_fails_loudly_before_any_mutation(
     assert 'edge-x' in message
     home.query.assert_not_awaited()
     wrong.query.assert_not_awaited()
+
+
+@pytest_asyncio.fixture
+async def live_source_and_target():
+    """Two throwaway, uniquely-named FalkorDB graphs as (name, graph) pairs, deleted afterwards."""
+    client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
+    pairs = [
+        (name, client.select_graph(name))
+        for name in (unique_graph_name('6616_carry_source'), unique_graph_name('6616_carry_target'))
+    ]
+    try:
+        yield pairs
+    finally:
+        for _name, graph in pairs:
+            with contextlib.suppress(Exception):
+                await graph.delete()
+        with contextlib.suppress(Exception):
+            await client.aclose()
+
+
+def _as_stored(edge: EdgeFixture) -> dict:
+    """*edge*'s properties as FalkorDB keeps them: a null property is absent."""
+    return {prop: value for prop, value in edge.properties.items() if value is not None}
+
+
+async def _seed_edge(graph, edge: EdgeFixture) -> None:
+    await graph.query(
+        'MATCH (a:Entity {uuid: $src}), (b:Entity {uuid: $dst}) '
+        'CREATE (a)-[e:RELATES_TO]->(b) '
+        'SET e = $stored, e.fact_embedding = vecf32([0.5, 0.25])',
+        {'src': edge.src_uuid, 'dst': edge.dst_uuid, 'stored': _as_stored(edge)},
+    )
+
+
+@falkor_skipif()
+@pytest.mark.timeout(15)
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_live_move_round_trips_every_stored_edge_property_and_invents_none(
+    mock_config, live_source_and_target,
+):
+    """Only a real server shows that the generated RETURN/SET Cypher runs, that an
+    absent property reads back null, and that SETting that null leaves it absent."""
+    (source_name, source), (target_name, target) = live_source_and_target
+    node_uuid, name, group_id, summary, created_at = NODE_ROW
+    await source.query(
+        'CREATE (n:Entity {uuid: $node, name: $name, group_id: $group_id, '
+        '                  summary: $summary, created_at: $created_at}), '
+        '       (:Entity {uuid: $other, name: "Bob"}), (:Entity {uuid: $third, name: "Carol"}) '
+        'SET n.name_embedding = vecf32([0.125, 0.0625])',
+        {'node': node_uuid, 'name': name, 'group_id': group_id, 'summary': summary,
+         'created_at': created_at, 'other': OTHER_NODE_UUID, 'third': THIRD_NODE_UUID},
+    )
+    await target.query(
+        'CREATE (:Entity {uuid: $other, name: "Bob"}), (:Entity {uuid: $third, name: "Carol"})',
+        {'other': OTHER_NODE_UUID, 'third': THIRD_NODE_UUID},
+    )
+    for edge in (RESTORED_EDGE, PLAIN_EDGE):
+        await _seed_edge(source, edge)
+
+    backend = GraphitiBackend(mock_config)
+    backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+    try:
+        result = await move_entity_across_graphs(backend, NODE_UUID, source_name, target_name)
+    finally:
+        await backend.close()
+
+    assert result.edges_moved == 2
+    copies = await target.ro_query(
+        'MATCH (s:Entity)-[e:RELATES_TO]->(t:Entity) RETURN s.uuid, t.uuid, properties(e)'
+    )
+    arrived = {
+        stored['uuid']: (src_uuid, dst_uuid, stored)
+        for src_uuid, dst_uuid, stored in copies.result_set
+    }
+    for edge in (RESTORED_EDGE, PLAIN_EDGE):
+        src_uuid, dst_uuid, stored = arrived[edge.properties['uuid']]
+        assert (src_uuid, dst_uuid) == (edge.src_uuid, edge.dst_uuid)
+        assert stored.pop('fact_embedding') is not None
+        assert stored == _as_stored(edge)
