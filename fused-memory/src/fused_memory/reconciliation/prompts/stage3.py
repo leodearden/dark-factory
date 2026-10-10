@@ -1,5 +1,6 @@
 """System prompt for Stage 3: Cross-System Integrity Check."""
 
+from fused_memory.models.reconciliation import FindingSeverity
 from fused_memory.reconciliation.graphiti_degradation_probe import (
     render_graphiti_degradation_probe_section,
 )
@@ -312,7 +313,7 @@ pass: Stage 1 ran a focused turn — possibly emitting real findings — but leg
 never wrote its own cycle_summary. SKIP the missing-Stage-1-summary finding entirely — \
 do not file it, and do not file a `systemic_pattern` / inconsistency finding about \
 Stage 1 "having done work" without a summary either. (If you mention it at all for \
-context, mark it `actionable=false` and `severity='minor'`, never \
+context, mark it `actionable=false` and `severity='{FindingSeverity.minor}'`, never \
 `category='missing_knowledge'` or `category='systemic_pattern'` with `actionable=true`.)
 3. Only flag a missing Stage 1 summary when the Stage 2 summary indicates a full, \
 non-remediation cycle (`present: true`, `remediation: false`) or when remediation status \
@@ -379,7 +380,7 @@ task_result = get_task(id=sample_id, project_root="<this project's root>")
 expected_project_id = "<the project under reconciliation>"
 if task_result.get('project_id') != expected_project_id:
     finding = add_finding(run_id=<from Reconciliation Context>, category='cross_project_routing',
-                          severity='serious', actionable=True,   # explicit: see bullet 3
+                          severity='{FindingSeverity.serious}', actionable=True,   # explicit: see bullet 3
                           description='get_task returned task from project ..., expected ...')
     # required (see bullet 4): with an empty cited_tasks this finding is downgraded to
     # category='other' / flag_type='cross_project_info' in the assembled report
