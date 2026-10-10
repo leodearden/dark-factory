@@ -585,6 +585,48 @@ class TestReconConfigDirHelpers:
         )
 
 
+class TestReconTranscriptArchiveKey:
+    """The archive key a recon run files its transcripts under (task 3972)."""
+
+    RUN_ID = 'd6782083-9319-48fa-b72c-1730fd9b1a35'
+
+    def test_key_is_run_id_namespaced(self):
+        from fused_memory.reconciliation.cli_stage_runner import (
+            recon_transcript_archive_key,
+        )
+
+        assert (
+            recon_transcript_archive_key(self.RUN_ID)
+            == 'recon-d6782083-9319-48fa-b72c-1730fd9b1a35'
+        )
+
+    def test_key_is_a_single_path_segment(self):
+        """``scripts/legibility/inventory.py::_archive_enc`` reads the
+        archive-root-relative ``parts[1]`` as ``<enc>``; a key with an extra
+        segment would land the archives on disk but make them unenumerable."""
+        import os
+        from pathlib import PurePosixPath
+
+        from fused_memory.reconciliation.cli_stage_runner import (
+            recon_transcript_archive_key,
+        )
+
+        key = recon_transcript_archive_key(self.RUN_ID)
+
+        assert len(PurePosixPath(key).parts) == 1
+        assert '/' not in key
+        assert os.sep not in key
+
+    def test_key_does_not_collide_with_orchestrator_task_ids(self):
+        """Orchestrator task-id dirs in the shared archive root are bare numbers."""
+        from fused_memory.reconciliation.cli_stage_runner import (
+            recon_transcript_archive_key,
+        )
+
+        assert not recon_transcript_archive_key('4578').isdigit()
+        assert not recon_transcript_archive_key(self.RUN_ID).isdigit()
+
+
 class TestResumeParamForwarding:
     """run_stage_via_cli forwards resume_session_id + resume_delivers_prompt into
     invoke_with_cap_retry (task 2717 σ resume seam); both default to None/False so
