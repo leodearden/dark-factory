@@ -7,6 +7,7 @@ shared predicates, and every store is a synthetic temp tasks.db.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import sqlite3
 import subprocess
@@ -17,7 +18,13 @@ from pathlib import Path
 
 import pytest
 from _task_db_scan import UNREADABLE_STORE_ERRORS
-from clear_leaked_claimants import Bucket, Tier, apply_repairs, take_census
+from clear_leaked_claimants import (
+    STILL_VIOLATING_DETAIL,
+    Bucket,
+    Tier,
+    apply_repairs,
+    take_census,
+)
 from cli_subprocess_timeout import cli_timeout_from_env
 
 NOW = datetime(2026, 10, 11, 12, tzinfo=UTC)
@@ -441,3 +448,115 @@ class TestPerRowCorroboration:
         outcome = _outcome_for(report, 103)
         assert outcome.bucket is Bucket.SKIPPED_CHANGED_UNDER_US
         assert outcome.delta == {'tier': ('hygiene', None)}
+
+
+ARRIVAL_CLAIM = ('run-z/9001-q/pid=9', _iso(NOW - timedelta(days=3)))
+
+
+def _insert_arrival(root: str) -> None:
+    _mutate_store(
+        root,
+        'INSERT INTO tasks (tag, id, title, status, updated_at, claimant_run_id, heartbeat_at) '
+        "VALUES ('master', 9001, 'arrival', 'done', ?, ?, ?)",
+        (_iso(NOW), *ARRIVAL_CLAIM),
+    )
+
+
+def _ticking_clock():
+    ticks = (NOW + timedelta(seconds=n) for n in itertools.count())
+    return lambda: next(ticks)
+
+
+def _reclaim_4028(root: str) -> None:
+    _mutate_store(
+        root,
+        "UPDATE tasks SET status = 'in-progress', claimant_run_id = ?, heartbeat_at = ? WHERE id = 4028",
+        ('run-new/4028-y/pid=2', _iso(NOW)),
+    )
+
+
+class TestBucketAccounting:
+    def test_a_violation_that_arrived_after_the_census_is_reported_not_written(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        census = take_census(root, NOW)
+        _insert_arrival(root)
+        server = _FakeClaimantServer()
+
+        report = _apply(census, server, clock=_ticking_clock())
+
+        assert 9001 not in server.written_ids()
+        arrival = _outcome_for(report, 9001)
+        assert arrival.bucket is Bucket.ARRIVED_DURING_WINDOW
+        assert arrival.violation.measured_at == report.verification_census.measured_at
+        assert arrival.violation.measured_at > NOW
+        assert _claimants(root)[9001] == ARRIVAL_CLAIM
+
+    def test_a_rejected_write_is_failed_with_the_server_error(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        server = _FakeClaimantServer()
+        server.error_replies[5225] = {'error': 'boom', 'error_type': 'TaskmasterError'}
+
+        report = _apply(take_census(root, NOW), server)
+
+        rejected = _outcome_for(report, 5225)
+        assert rejected.bucket is Bucket.FAILED
+        assert 'TaskmasterError' in rejected.detail
+        assert _buckets(report)[4028] is Bucket.REPAIRED
+        assert _buckets(report)[101] is Bucket.REPAIRED
+
+    def test_a_raised_write_is_failed_and_the_batch_continues(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        server = _FakeClaimantServer()
+        server.raises[4028] = OSError('connection reset')
+
+        report = _apply(take_census(root, NOW), server)
+
+        raised = _outcome_for(report, 4028)
+        assert raised.bucket is Bucket.FAILED
+        assert 'OSError' in raised.detail
+        assert 5225 in server.written_ids()
+        assert _buckets(report)[5225] is Bucket.REPAIRED
+
+    def test_an_acknowledged_write_that_did_not_stick_is_failed(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        server = _FakeClaimantServer()
+        server.ack_without_write.add(101)
+
+        report = _apply(take_census(root, NOW), server)
+
+        unstuck = _outcome_for(report, 101)
+        assert unstuck.bucket is Bucket.FAILED
+        assert unstuck.detail == STILL_VIOLATING_DETAIL
+
+    def test_every_row_lands_in_exactly_one_bucket_and_no_repaired_row_still_violates(
+        self, seed_root,
+    ):
+        root = seed_root(TIER_TABLE_ROWS)
+        census = take_census(root, NOW)
+        _insert_arrival(root)
+        _reclaim_4028(root)
+        server = _FakeClaimantServer()
+        server.error_replies[5225] = {'error': 'boom', 'error_type': 'TaskmasterError'}
+
+        report = _apply(census, server, clock=_ticking_clock())
+
+        keys = [outcome.violation.key for outcome in report.outcomes]
+        assert len(keys) == len(set(keys))
+        selected = {v.key for v in census.violations if v.tier is Tier.TERMINAL}
+        remaining = {
+            v.key for v in report.verification_census.violations if v.tier is Tier.TERMINAL
+        }
+        assert set(keys) == selected | remaining
+        by_bucket = {
+            bucket: {o.violation.key for o in report.outcomes if o.bucket is bucket}
+            for bucket in Bucket
+        }
+        arrived = by_bucket[Bucket.ARRIVED_DURING_WINDOW]
+        assert not arrived & (by_bucket[Bucket.REPAIRED] | by_bucket[Bucket.SKIPPED_CHANGED_UNDER_US])
+        assert not by_bucket[Bucket.REPAIRED] & remaining
+        assert _buckets(report) == {
+            101: Bucket.REPAIRED,
+            4028: Bucket.SKIPPED_CHANGED_UNDER_US,
+            5225: Bucket.FAILED,
+            9001: Bucket.ARRIVED_DURING_WINDOW,
+        }
