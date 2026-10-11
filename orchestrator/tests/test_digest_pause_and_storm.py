@@ -138,6 +138,63 @@ class TestRependedWhilePausedSinceResume:
     def test_missing_db_is_empty(self, tmp_path: Path) -> None:
         assert digest.repended_while_paused_since_resume(tmp_path / 'absent.db') == ()
 
+    def test_restart_that_declines_to_reassert_ends_the_pause(self, tmp_path: Path) -> None:
+        db_path = tmp_path / 'events.db'
+        _emit_repend(EventStore(db_path, 'run-a'), '1', 'esc-1-1')
+        run_b = EventStore(db_path, 'run-b')
+        run_b.emit(
+            EventType.scheduler_pause_restored,
+            data={'reason': 'ewa_trip_73.5900', 'reasserted': False},
+        )
+        run_b.emit(EventType.scheduler_paused, data={'reason': 'park_stop_trip: later'})
+        _emit_repend(run_b, '2', 'esc-2-1')
+
+        waiting = digest.repended_while_paused_since_resume(db_path)
+
+        assert [(w.task_id, w.escalation_id) for w in waiting] == [('2', 'esc-2-1')]
+
+    def test_restart_that_reasserts_continues_the_pause(self, tmp_path: Path) -> None:
+        db_path = tmp_path / 'events.db'
+        _emit_repend(EventStore(db_path, 'run-a'), '1', 'esc-1-1')
+        run_b = EventStore(db_path, 'run-b')
+        run_b.emit(
+            EventType.scheduler_pause_restored,
+            data={'reason': 'ewa_trip_73.5900', 'reasserted': True},
+        )
+        _emit_repend(run_b, '2', 'esc-2-1')
+
+        waiting = digest.repended_while_paused_since_resume(db_path)
+
+        assert [w.task_id for w in waiting] == ['1', '2']
+
+    def test_pre_4559_restore_without_reasserted_key_continues_the_pause(
+        self, tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / 'events.db'
+        _emit_repend(EventStore(db_path, 'run-a'), '1', 'esc-1-1')
+        run_b = EventStore(db_path, 'run-b')
+        run_b.emit(EventType.scheduler_pause_restored, data={'reason': 'park_stop_trip: x'})
+        _emit_repend(run_b, '2', 'esc-2-1')
+
+        waiting = digest.repended_while_paused_since_resume(db_path)
+
+        assert [w.task_id for w in waiting] == ['1', '2']
+
+    def test_the_later_pause_end_wins(self, tmp_path: Path) -> None:
+        db_path = tmp_path / 'events.db'
+        store = EventStore(db_path, 'run-a')
+        store.emit(
+            EventType.scheduler_pause_restored,
+            data={'reason': 'ewa_trip_73.5900', 'reasserted': False},
+        )
+        _emit_repend(store, '1', 'esc-1-1')
+        store.emit(EventType.scheduler_resumed)
+        _emit_repend(store, '2', 'esc-2-1')
+
+        waiting = digest.repended_while_paused_since_resume(db_path)
+
+        assert [w.task_id for w in waiting] == ['2']
+
 
 FIXED_NOW = datetime(2026, 10, 11, 12, 0, tzinfo=UTC)
 

@@ -28,6 +28,7 @@ import orchestrator.harness as harness_mod
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
+from orchestrator.run_store import RunStore
 
 
 @pytest_asyncio.fixture
@@ -366,3 +367,57 @@ class TestPausedWaitingDigest:
         section = _paused_waiting(await _write_digest(digest_rig))
 
         assert young_esc_id not in section
+
+
+def _runs_db(tmp_path: Path) -> Path:
+    db_dir = tmp_path / 'data' / 'orchestrator'
+    db_dir.mkdir(parents=True, exist_ok=True)
+    return db_dir / 'runs.db'
+
+
+async def _pause_and_repend_in_first_process(rig: _DigestRig, reason: str) -> None:
+    rig.harness._run_store = RunStore(_runs_db(rig.tmp_path))
+    await rig.harness.pause_scheduler(reason, file_escalation=False)
+    await _resolve_stranded(rig.harness, rig.queue)
+
+
+async def _restart_second_process(rig: _DigestRig, cost_store: CostStore) -> _DigestRig:
+    restarted, _, event_store = _make_harness_with_mocks(rig.tmp_path)
+    restarted._run_store = RunStore(_runs_db(rig.tmp_path))
+    restarted.config = OrchestratorConfig(
+        project_root=rig.tmp_path,
+        digest_every_n_escalations=1,
+        digest_ewa_threshold=1e9,
+    )
+    restarted.cost_store = cost_store
+    assert [row['task_id'] for row in _repend_rows(event_store)] == ['5260']
+    await restarted._load_persisted_scheduler_pause()
+    return _DigestRig(restarted, rig.queue, rig.tmp_path)
+
+
+@pytest.mark.asyncio
+class TestPauseEndedByRestart:
+    async def test_declined_restore_does_not_carry_repends_into_the_next_pause(
+        self, digest_rig: _DigestRig, cost_store: CostStore,
+    ) -> None:
+        await _pause_and_repend_in_first_process(digest_rig, PAUSE_REASON)
+
+        restarted = await _restart_second_process(digest_rig, cost_store)
+        assert restarted.harness.scheduler.is_paused is False
+        await restarted.harness.pause_scheduler('park_stop_trip: later', file_escalation=False)
+        section = _paused_waiting(await _write_digest(restarted))
+
+        assert 'Paused with 0 re-pended tasks waiting' in section
+        assert 'task 5260' not in section
+
+    async def test_reasserted_restore_keeps_the_waiting_task(
+        self, digest_rig: _DigestRig, cost_store: CostStore,
+    ) -> None:
+        await _pause_and_repend_in_first_process(digest_rig, 'park_stop_trip: test')
+
+        restarted = await _restart_second_process(digest_rig, cost_store)
+        assert restarted.harness.scheduler.is_paused is True
+        section = _paused_waiting(await _write_digest(restarted))
+
+        assert 'Paused with 1 re-pended tasks waiting' in section
+        assert sum('task 5260' in line for line in section.splitlines()) == 1
