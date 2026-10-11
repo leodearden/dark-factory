@@ -6,13 +6,20 @@ every locator must return exactly the spelling its current call sites build.
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
+import shared.project_layout
 from shared.project_layout import (
     ESCALATION_QUEUE_RELPATH,
     KNOWN_PROJECT_ROOTS_ENV,
+    CheckoutRootError,
+    default_project_root,
     escalation_queue_dir,
     known_project_roots,
     orchestrator_data_dir,
@@ -116,3 +123,137 @@ class TestKnownProjectRoots:
     def test_default_reads_the_live_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, '/x,/y')
         assert known_project_roots() == (Path('/x'), Path('/y'))
+
+
+# default_project_root() answers from where its module FILE lives, so the honest
+# fixture moves the file: the local package is copied into a temp checkout and
+# asked from a child interpreter. `-I` keeps an inherited PYTHONPATH or
+# VIRTUAL_ENV from supplying another tree's copy; the __file__ assert proves
+# which copy answered.
+_CHILD = """
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+import shared.project_layout as layout
+
+assert Path(layout.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve()), layout.__file__
+print(layout.default_project_root())
+"""
+
+
+def _git(cwd: Path, *args: str) -> str:
+    return subprocess.run(
+        ['git', '-C', str(cwd), *args], check=True, capture_output=True, text=True
+    ).stdout
+
+
+def _git_main_checkout(checkout: Path) -> Path:
+    common_dir = _git(checkout, 'rev-parse', '--path-format=absolute', '--git-common-dir')
+    return Path(common_dir.strip()).parent.resolve()
+
+
+def _answer_from(dest_src: Path) -> tuple[int, str, str]:
+    package = Path(shared.project_layout.__file__).resolve().parent
+    target = dest_src / 'shared'
+    target.mkdir(parents=True)
+    for name in ('__init__.py', 'project_layout.py'):
+        shutil.copyfile(package / name, target / name)
+    proc = subprocess.run(
+        [sys.executable, '-I', '-c', _CHILD, str(dest_src)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def _resolved_answer(dest_src: Path) -> Path:
+    returncode, stdout, stderr = _answer_from(dest_src)
+    assert returncode == 0, f'child exited {returncode}\n--- stderr ---\n{stderr}'
+    return Path(stdout.strip())
+
+
+@pytest.fixture
+def base(tmp_path: Path) -> Path:
+    return tmp_path.resolve()
+
+
+@pytest.fixture
+def main_repo(base: Path) -> Path:
+    main = base / 'main'
+    subprocess.run(['git', 'init', '-q', '-b', 'main', str(main)], check=True, capture_output=True)
+    _git(main, 'config', 'user.email', 'project-layout-test@example.com')
+    _git(main, 'config', 'user.name', 'Project Layout Test')
+    _git(main, 'config', 'commit.gpgsign', 'false')
+    _git(main, 'commit', '-q', '--allow-empty', '--no-verify', '-m', 'seed')
+    return main
+
+
+def _add_worktree(main: Path, worktree: Path, branch: str) -> Path:
+    _git(main, 'worktree', 'add', '-q', str(worktree), '-b', branch)
+    return worktree
+
+
+def _gitdir_of_worktree(worktree: Path) -> Path:
+    text = (worktree / '.git').read_text()
+    assert text.startswith('gitdir: '), text
+    return Path(text.removeprefix('gitdir: ').strip())
+
+
+class TestDefaultProjectRoot:
+    def test_main_checkout_answers_itself(self, main_repo: Path) -> None:
+        src = main_repo / 'src'
+        answer = _resolved_answer(src)
+        assert answer == _git_main_checkout(src) == main_repo
+
+    def test_nested_linked_worktree_answers_the_main_checkout(self, main_repo: Path) -> None:
+        worktree = _add_worktree(main_repo, main_repo / '.worktrees' / 'wt', 'wt')
+        src = worktree / 'src'
+        answer = _resolved_answer(src)
+        assert answer == _git_main_checkout(src) == main_repo
+
+    def test_linked_worktree_outside_the_main_tree(self, base: Path, main_repo: Path) -> None:
+        worktree = _add_worktree(main_repo, base / 'elsewhere' / 'wt2', 'wt2')
+        src = worktree / 'src'
+        answer = _resolved_answer(src)
+        assert answer == _git_main_checkout(src) == main_repo
+
+    def test_relative_gitdir_in_the_worktree_file(self, main_repo: Path) -> None:
+        worktree = _add_worktree(main_repo, main_repo / '.worktrees' / 'wt', 'wt')
+        relative = os.path.relpath(_gitdir_of_worktree(worktree).resolve(), worktree)
+        (worktree / '.git').write_text(f'gitdir: {relative}\n')
+        src = worktree / 'src'
+        answer = _resolved_answer(src)
+        assert answer == _git_main_checkout(src) == main_repo
+
+    def test_no_enclosing_checkout_fails_loudly(self, base: Path) -> None:
+        src = base / 'plain' / 'src'
+        assert not any((ancestor / '.git').exists() for ancestor in src.parents), (
+            f'fixture premise: no ancestor of {src} may hold .git'
+        )
+        returncode, _, stderr = _answer_from(src)
+        assert returncode != 0
+        assert 'CheckoutRootError' in stderr
+        assert str(src / 'shared' / 'project_layout.py') in stderr
+
+    def test_missing_gitdir_fails_loudly_rather_than_answering_the_worktree(
+        self, base: Path, main_repo: Path
+    ) -> None:
+        worktree = _add_worktree(main_repo, main_repo / '.worktrees' / 'wt', 'wt')
+        nowhere = base / 'nowhere'
+        (worktree / '.git').write_text(f'gitdir: {nowhere}\n')
+        returncode, stdout, stderr = _answer_from(worktree / 'src')
+        assert returncode != 0, f'answered {stdout.strip()!r} instead of failing'
+        assert 'CheckoutRootError' in stderr
+        assert str(nowhere) in stderr
+
+    def test_real_tree_answer_matches_git(self) -> None:
+        module_dir = Path(shared.project_layout.__file__).resolve().parent
+        answer = default_project_root()
+        assert answer == _git_main_checkout(module_dir)
+        assert (answer / '.git').is_dir()
+
+    def test_error_is_a_runtime_error_not_an_os_error(self) -> None:
+        assert issubclass(CheckoutRootError, RuntimeError)
+        assert not issubclass(CheckoutRootError, OSError)
