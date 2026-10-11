@@ -842,7 +842,7 @@ def test_env_matches_directive_missing_directive_is_drift():
     assert drifts[0].key == _RELATION_KEY
     assert "WorkingDirectory" in drifts[0].reason
     assert systemd_unit_parity.ABSENT in drifts[0].installed_value, (
-        "The absent half must be rendered as _ABSENT so the report shows which "
+        "The absent half must be rendered as ABSENT so the report shows which "
         f"of the two is missing. Got: {drifts[0].installed_value!r}"
     )
 
@@ -1909,7 +1909,7 @@ def test_watchdog_environment_injected_on_the_installed_copy_is_drift():
     # [Install] stanza), so appending at EOF currently lands in the same
     # section too — but relying on that would silently couple this fixture to
     # section order: a future [Install] or [Unit] added after [Service] would
-    # make the appended line land outside it, _environment_map would read an
+    # make the appended line land outside it, environment_map would read an
     # empty [Service] on both sides, and this test would fail with
     # `assert [] == [...]`, reading like the checker regressed rather than
     # like the fixture drifted. [Service] appears exactly once, so inserting

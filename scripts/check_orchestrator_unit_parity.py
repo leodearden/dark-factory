@@ -289,13 +289,8 @@ import pathlib
 import sys
 from collections.abc import Sequence
 
-# Both names live in scripts/systemd_unit_parity.py and are RE-EXPORTED here.
-# find_dropins was forked, code-identical, between this file and
-# check_dashboard_unit_parity.py until check_lms_unit_parity.py would have made
-# it three copies; this suite's existing find_dropins tests still call
-# mod.find_dropins, so they are what proves the lift was behaviour-preserving.
 from systemd_unit_parity import (
-    _ABSENT,
+    ABSENT,
     Drift,
     find_dropins,
     parse_unit_directives,
@@ -345,11 +340,6 @@ def _log(message: str, *, stream=None) -> None:
 # Drift records and comparison
 # ---------------------------------------------------------------------------
 
-# ``Drift`` and ``_ABSENT`` are re-exported from scripts/systemd_unit_parity.py
-# (see the import above). They were code-identical in all three checkers; the
-# lift COLLAPSED that fork rather than pre-empting a hypothetical one.
-
-
 def _render(values: list[str] | None) -> str:
     """Render one side's values for the operator's report.
 
@@ -368,7 +358,7 @@ def _render(values: list[str] | None) -> str:
     guess at occurrence boundaries has been handed a diff they cannot act on.
     """
     if values is None:
-        return _ABSENT
+        return ABSENT
     if len(values) == 1:
         return values[0]
     return "[" + ", ".join(repr(v) for v in values) + "]"

@@ -1,11 +1,13 @@
-"""Shared helpers for the unit-parity checkers.
+"""Shared pieces of the unit-parity checkers, and the driver they all run on.
 
-Holds no CLI and no policy of its own — just the pieces the unit tooling
-needs: the parser (``_join_continuations`` + ``parse_unit_directives``) that
-turns a unit file into ``{section: {key: [value, ...]}}``; ``environment_map``,
-which reads a section's ``Environment=`` lines the way systemd does; and
-``find_dropins``, which reports the ``.conf`` files systemd would layer over a
-unit.
+- ``parse_unit_directives`` turns a unit file into
+  ``{section: {key: [value, ...]}}``, joining backslash continuations first.
+- ``environment_map`` reads a section's ``Environment=`` lines the way systemd
+  does. The dashboard checker compares with it and scripts/render_systemd_unit.py
+  preserves host-local values with it, so the two cannot disagree.
+- ``find_dropins`` lists the ``.conf`` drop-ins systemd would merge over a unit.
+- ``Drift`` is the record a checker's ``compare`` returns, and ``ABSENT`` is
+  the value it renders for a side that does not declare the directive.
 
 Driver
 ------
@@ -17,174 +19,17 @@ and returns a ``ParityExit`` — whose docstring is the one statement of what 0,
 and 2 mean. A checker supplies only its ``compare``, its ``ReportText`` wording
 deltas, and any ``Probe`` adding a verdict class of its own.
 
-The parser landed first, because a SECOND consumer appeared:
-``scripts/check_dashboard_unit_parity.py`` wrote it, and
-``scripts/check_orchestrator_unit_parity.py`` needs exactly it and nothing
-else from that module.
+Constraints
+-----------
+- It imports no checker, and the driver lives HERE rather than in a new
+  sibling: setup-host.sh's section harnesses copy only this file beside a real
+  or stubbed checker (tests/scripts/setup_host_sections.py::write_checker), so
+  whatever a checker needs from scripts/ must be in it.
+- Stdlib-only, so every checker runs under a bare system ``python3`` with no
+  environment set up.
 
-``find_dropins`` is the SECOND lift, and it arrived here in worse shape than
-the parser did: it was ALREADY duplicated, code-identical, in both of those
-checkers (only the docstrings' example directives differed). So this move
-collapses an existing fork rather than pre-empting a hypothetical one. What
-forced it was a THIRD consumer, ``scripts/check_lms_unit_parity.py``, whose
-whole subject is a drop-in that survives reinstallation — writing a third
-pasted copy to detect silent overrides would have been the same silent
-duplication one level up.
-
-``Drift`` and ``_ABSENT`` are the FOURTH lift, and like ``find_dropins`` they
-arrived as a fork COLLAPSE rather than a pre-emptive move: both were already
-duplicated, code-identical, across all THREE comparison checkers
-(``check_dashboard_unit_parity.py``, ``check_orchestrator_unit_parity.py``,
-``check_lms_unit_parity.py``), with ``_ABSENT``'s rationale comment reproduced
-verbatim in each. They are also the SAFE part of the comparison core, which is
-why they moved while ``UnitSpec``/``compare_unit`` did not: ``Drift`` is a pure
-record with no rendering and ``_ABSENT`` is a pure constant whose value is
-identical on all three sides, so no consumer's report text could change — the
-check being that all four parity suites, which assert on report CONTENT, stayed
-green across the move. Each consumer re-exports them and asserts the re-export
-is the SAME object rather than a look-alike, which for a frozen dataclass is
-the only assertion that bites: a pasted copy compares equal field-for-field
-while being a distinct type.
-
-``environment_map`` is the THIRD lift, and its second consumer is NOT a fourth
-checker: it is ``scripts/render_systemd_unit.py``, the renderer setup-host.sh
-now uses in place of a truncating ``sed`` redirect to install BOTH
-dark-factory-dashboard.service (task 4793) and fused-memory.service (task 4796
-— one renderer, selected by ``--unit`` off its ``UNITS`` registry). That
-renderer must PRESERVE this host's host-local
-``Environment=DASHBOARD_KNOWN_PROJECT_ROOTS`` value across a re-render, which
-means reading the installed unit's ``Environment=`` map — and it must read it
-through the SAME code ``check_dashboard_unit_parity.py`` compares those
-variables with, or a value the checker can see stops being a value the installer
-can preserve.
-
-The fused-memory unit is where that reader earns its keep rather than merely
-being consistent: ``_join_continuations`` is what makes that template's
-FOUR-PHYSICAL-LINE ``ExecStart=`` parse as one directive, and
-``environment_map``'s ``shlex.split`` is what correctly reads its quoted
-``Environment="FUSED_MEMORY_PREDONE_HOOK_REIFY=... --task {id} ..."`` line,
-which a naive split would mangle. Its documented last-wins semantics also handle
-the operator who registered extra roots by APPENDING a second
-``DASHBOARD_KNOWN_PROJECT_ROOTS`` line rather than editing the first.
-
-It could not get that by importing the checker, and the obstacle is measured
-rather than stylistic: ``tests/scripts/test_check_dashboard_unit_parity.py``'s
-section-8 harness builds a tmp repo in which ``write_checker(body=...)``
-REPLACES check_dashboard_unit_parity.py with an argparse-usage-error stub (and,
-with ``with_checker=False``, omits it and its siblings entirely), precisely to
-test that the install still happens when the parity gate did not run. A
-renderer importing that module would ImportError under exactly those two tests,
-turning them red for a reason unrelated to what they assert. So the shared
-dependency went DOWN into this module rather than sideways into the checker.
-
-Lifting rather than duplicating follows the precedent
-``tests/scripts/systemd_unit_invariants.py`` set, which task 3408 moved out of
-a single suite the moment a second consumer appeared, with the stated reason
-that duplicating it into both is how the two copies drift until one silently
-stops catching the defect. That reason binds with extra force here: a second
-pasted copy of the parser inside the tooling built to catch silent drift would
-reproduce, in the checkers themselves, precisely the failure they exist to
-report. ``check_dashboard_unit_parity.py`` re-exports these three names so its
-own module surface (and its test suite) stays intact, and
-``tests/scripts/test_check_orchestrator_unit_parity.py`` (for the parser and
-``find_dropins``) and ``tests/scripts/test_render_systemd_unit.py`` (for
-``environment_map``) each assert the re-export is the SAME function object
-rather than a look-alike.
-
-What is NOT here yet: the COMPARISON core (read this before assuming it is)
---------------------------------------------------------------------------
-Four lifts have happened, and this module deliberately does not yet read as
-the home for everything shared.  Still duplicated across the consumers, and NOT
-because nobody noticed:
-
-- ``UnitSpec``'s ``compared``/``present_only`` core and ``compare_unit`` are
-  duplicated between the dashboard and lms checkers only.  The orchestrator
-  checker deliberately has NEITHER: it compares by full symmetric equality over
-  the union of sections and keys, with no curated registry, and its own
-  docstring argues for that.
-
-- The ``[override]`` drop-in REPORT BLOCK is duplicated across ALL FOUR
-  checkers -- ``check_dashboard_unit_parity.py``,
-  ``check_orchestrator_unit_parity.py``, ``check_lms_unit_parity.py``, and (as
-  of task 4882) ``check_fused_memory_unit_parity.py``'s ``_report_override``.
-  They share the same two sentences, so a reader of THIS list would otherwise
-  conclude the override reporter is already shared: it is not, and the reason
-  is ``compare_unit``'s, not oversight.  The block IS report text, and all four
-  suites assert on its content.  MEASURED 2026-09-06, the four copies already
-  differ four ways:
-
-  * fused-memory is SINGLE-unit -- it takes ``--installed <FILE>``, so it
-    prints ``  {dropin}`` from a standalone ``_report_override()``; the three
-    siblings are multi-unit, print ``  {name}: {dropin}``, and inline the block
-    in their report function.
-  * the "Inspect ..." tail names a different unit in each: ``<unit>`` plus a
-    parenthetical remedy (dashboard, orchestrator), ``lms-arm@<arm>.service``
-    (lms), ``fused-memory.service`` (fused-memory).
-  * lms and fused-memory add a "Nothing was removed" paragraph the other two
-    do not, and those two paragraphs are themselves different: lms names
-    ``scripts/remove-lms-arm-worktree-dropin.sh``, fused-memory instead
-    explains why its ``--fix`` cannot resolve an override.
-  * fused-memory's ``_log`` tags EVERY physical line (its own docstring gives
-    the reason) while the siblings tag once per call, so a shared renderer
-    would be emitting through three different logging contracts.
-
-  A shared renderer would therefore need a per-checker unit name and two
-  optional paragraphs before it saved a line, and would change the text of
-  whichever copies lost.  Left duplicated on purpose, recorded here so the
-  absence is a decision rather than a gap.
-
-``environment_map`` is deliberately NOT a counter-example to this list. It moved
-because it had a second consumer that could not reach it any other way (see
-above), and — unlike ``compare_unit`` — it is pure parsing with no policy and no
-report text, so no consumer's output changed. It was also a FIRST lift rather
-than a fork collapse: ``check_lms_unit_parity.py`` never had a copy of it, which
-was checked before the move rather than assumed.
-
-What stopped the COMPARISON-CORE lift is not tidiness but a real decision: the
-copies already RENDER differently, and MEASURED 2026-09-05 there are THREE
-renderings across the family rather than the two this paragraph used to claim.
-It said "the dashboard and orchestrator share a ``_render`` helper (single-value
-shortcut, then ``" | ".join``)". They do not, and have not: the dashboard tests
-falsiness (``if not values: return _ABSENT``) and returns ``" | ".join(values)``;
-the orchestrator tests ``values is None`` and returns
-``"[" + ", ".join(repr(v) for v in values) + "]"``, with a long docstring
-arguing for that quoted-bracket form; the lms checker joins with ``", "``
-inline. So one shared ``compare_unit`` would have to pick one of three and
-change the report text of the two that lose, and all three suites assert on
-report content. The divergence STRENGTHENS the obstacle rather than weakening
-it — a correction recorded here rather than lifted on top of, because a shared
-module that misdescribes its own consumers is how the next author concludes the
-lift is complete and pastes a fourth copy.  The
-dashboard's ``UnitSpec`` also carries four extra fields and a ``__post_init__``
-validator, so the shared part is a CORE the dashboard extends, not the class.
-That is a design step, and task 3775 — which wrote the lms copy — held only an
-amendment-pass mandate for focused edits.  It is filed as a follow-up (ticket
-``tkt_0RSJTASQDQAFHYWCK5VW8BFGC3``, "Lift Drift / UnitSpec / compare_unit into
-scripts/systemd_unit_parity.py"), which carries the obstacle above so the work
-starts from it.
-
-Recorded here rather than left implicit because the alternative is worse than
-the duplication: a module that looks like the shared home while a third pasted
-copy of the comparison sits in the consumers invites the next author to assume
-the lift is complete and paste a fourth.
-
-Why ``check_fused_memory_unit_parity.parse_unit_sections`` is NOT here
-----------------------------------------------------------------------
-That third parser stays where it is, deliberately.  It returns
-``{section: [line, ...]}`` — whole non-comment LINES, unsplit and with
-continuations left unjoined — because its checker asks whole-line membership
-questions (``"Environment=MEM0_TELEMETRY=false" in sections["Service"]``) and
-synthesizes those same literal lines in its ``--fix`` path.  It is not a
-degenerate case of ``parse_unit_directives``: reconstructing a line from a
-``{key: [values]}`` mapping cannot reproduce the original spacing that
-membership check and that rewriter both depend on.  So folding it in would
-mean changing its checker's semantics, not just its imports — a different
-change, in a module this task holds no lock on.  What is shared below is the
-CLASSIFICATION (section headers, ``#``/``;`` comments, blanks, pre-header
-lines), which ``parse_unit_directives`` took from it verbatim and documents as
-such.  If that classification is ever changed here it must be changed there
-too, and vice versa: two parsers is the tolerated cost of two different return
-types, not license for the rules to diverge.
+Why the family is shaped this way, and what stays per-checker:
+plans/review-all-s25-scripts-instruments-prd.md (finding fk-3042baa5983e).
 
 Import mechanics
 ----------------
@@ -198,10 +43,6 @@ both contexts these scripts run in:
   ``pyproject.toml`` sets ``--import-mode=importlib``, and under importlib
   mode pytest deliberately does NOT perform the ``sys.path`` mutation the
   prepend/append modes do.
-
-Stdlib-only by design, so every consumer stays runnable under a plain
-``python3`` with no environment set up: anything needing more than the stdlib's
-most boring corner does not belong here.
 """
 
 import dataclasses
@@ -215,7 +56,7 @@ from typing import Final, TextIO
 # directive at all.  Deliberately not '' or None: it appears verbatim in the
 # operator's report, where "<absent>" reads unambiguously and an empty string
 # would look like a directive set to nothing.
-_ABSENT = "<absent>"
+ABSENT: Final = "<absent>"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -268,15 +109,16 @@ def _join_continuations(text: str) -> list[str]:
 def parse_unit_directives(text: str) -> dict[str, dict[str, list[str]]]:
     """Parse a systemd unit into ``{section: {key: [value, ...]}}``.
 
-    Classification rules are taken verbatim from the precedent's
-    ``parse_unit_sections`` (scripts/check_fused_memory_unit_parity.py):
+    Classification rules are shared with
+    ``check_fused_memory_unit_parity.parse_unit_sections``; change both or
+    neither:
 
     - ``[X]`` opens section X.
     - Lines starting with ``#`` or ``;`` are comments — skipped.
     - Blank lines are skipped.
     - Lines before the first section header are DROPPED, not attributed.
 
-    Two deliberate divergences from that precedent, each required here:
+    Two deliberate divergences from it, each required here:
 
     1. **key → values LIST, not a flat line list.**  This checker compares
        directives BY KEY, which a flat list of lines cannot express, and it

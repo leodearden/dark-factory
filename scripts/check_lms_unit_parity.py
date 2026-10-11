@@ -83,15 +83,10 @@ from collections.abc import Sequence
 # conftest.py inserts scripts/ explicitly, load-bearing because pyproject sets
 # --import-mode=importlib) and under pyright ([tool.pyright] extraPaths).
 #
-# What is NOT shared yet: Drift, UnitSpec's compared/present_only core and
-# compare_unit below are still duplicated with check_dashboard_unit_parity.py.
-# That is KNOWN, and the obstacle is recorded in systemd_unit_parity.py's own
-# docstring next to this rationale (the two copies already render Drift values
-# differently, so one shared compare_unit would change a report text both
-# suites assert on) with a filed follow-up. Do not read the import above as
-# evidence the lift is finished.
+# What stays per-checker, and why: plans/review-all-s25-scripts-instruments-prd.md
+# (finding fk-3042baa5983e).
 from systemd_unit_parity import (
-    _ABSENT,
+    ABSENT,
     Drift,
     find_dropins,
     parse_unit_directives,
@@ -159,11 +154,6 @@ def _same_file_key(path: str | pathlib.Path) -> str:
 # ---------------------------------------------------------------------------
 # Drift records and unit specs
 # ---------------------------------------------------------------------------
-
-
-# ``Drift`` and ``_ABSENT`` are re-exported from scripts/systemd_unit_parity.py
-# (see the import above). They were code-identical in all three checkers; the
-# lift COLLAPSED that fork rather than pre-empting a hypothetical one.
 
 
 @dataclasses.dataclass(frozen=True)
@@ -254,7 +244,7 @@ def compare_unit(spec: UnitSpec, repo_text: str, installed_text: str) -> list[Dr
 
     Comparison is SYMMETRIC over the curated key set: a compared directive the
     installed copy declares and the committed one does not is drift just as
-    much as the reverse. A missing key is treated as ``_ABSENT`` on its side,
+    much as the reverse. A missing key is treated as ``ABSENT`` on its side,
     so both asymmetric cases fall out of the same equality test.
 
     The full values LIST is compared, not just the first value: systemd
@@ -278,9 +268,9 @@ def compare_unit(spec: UnitSpec, repo_text: str, installed_text: str) -> list[Dr
                 unit=spec.name,
                 section=section,
                 key=key,
-                repo_value=", ".join(repo_values) if repo_values else _ABSENT,
+                repo_value=", ".join(repo_values) if repo_values else ABSENT,
                 installed_value=(
-                    ", ".join(installed_values) if installed_values else _ABSENT
+                    ", ".join(installed_values) if installed_values else ABSENT
                 ),
                 reason="value differs between the committed and installed copies",
             )
@@ -296,8 +286,8 @@ def compare_unit(spec: UnitSpec, repo_text: str, installed_text: str) -> list[Dr
                 unit=spec.name,
                 section=section,
                 key=key,
-                repo_value="<declared>" if in_repo else _ABSENT,
-                installed_value="<declared>" if in_installed else _ABSENT,
+                repo_value="<declared>" if in_repo else ABSENT,
+                installed_value="<declared>" if in_installed else ABSENT,
                 reason=(
                     f"{key} declared in the installed copy, absent from the "
                     "committed copy"
@@ -553,7 +543,7 @@ def main(argv: Sequence[str], *, probe_runner=None) -> int:
             )
         elif effective.working_directory != expected:
             effective_drifts.append(
-                (name, expected, effective.working_directory or _ABSENT)
+                (name, expected, effective.working_directory or ABSENT)
             )
         elif not effective.dropin_paths:
             confirmed.append((name, expected))

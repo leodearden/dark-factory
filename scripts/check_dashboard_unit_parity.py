@@ -165,6 +165,14 @@ import re
 import sys
 from collections.abc import Sequence
 
+from systemd_unit_parity import (
+    ABSENT,
+    Drift,
+    environment_map,
+    find_dropins,
+    parse_unit_directives,
+)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -231,40 +239,8 @@ def _log(message: str, *, stream=None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Unit parser
+# Unit specs
 # ---------------------------------------------------------------------------
-
-
-# The parser lives in scripts/systemd_unit_parity.py and is RE-EXPORTED here
-# deliberately. A second consumer appeared (check_orchestrator_unit_parity.py),
-# and duplicating ~90 lines of parser into it is how the two copies drift until
-# one silently stops catching the defect -- inside the tooling built to catch
-# exactly that. Re-exporting rather than rewriting call sites keeps the module
-# surface this script's test suite reads (mod.parse_unit_directives,
-# mod._join_continuations) intact, so that suite is the extraction's own
-# regression net.
-#
-# find_dropins moved there too, for a sharper version of the same reason: it
-# was already forked, code-identical, between this file and
-# check_orchestrator_unit_parity.py, and check_lms_unit_parity.py would have
-# been a third copy. Re-exported on the same terms -- this suite's existing
-# find_dropins tests still call mod.find_dropins and are what proves the lift
-# was behaviour-preserving.
-from systemd_unit_parity import (  # noqa: E402  (kept beside the other parser code)
-    _ABSENT,
-    Drift,
-    _join_continuations,  # noqa: F401  (re-exported: read by the test suite)
-    find_dropins,
-    parse_unit_directives,
-)
-
-# ---------------------------------------------------------------------------
-# Drift records and unit specs
-# ---------------------------------------------------------------------------
-
-# ``Drift`` and ``_ABSENT`` are re-exported from scripts/systemd_unit_parity.py
-# (see the import above). They were code-identical in all three checkers; the
-# lift COLLAPSED that fork rather than pre-empting a hypothetical one.
 
 
 @dataclasses.dataclass(frozen=True)
@@ -354,7 +330,7 @@ class UnitSpec:
     # that is merely configured elsewhere.
     #
     # BOTH halves are read out of environment_section — the variable through
-    # _environment_map, the directive through that same section's parsed keys.
+    # environment_map, the directive through that same section's parsed keys.
     # A pair whose directive lives ELSEWHERE (('SOME_VAR', 'WantedBy'), which
     # is in [Install]) would therefore compare against <absent> in both copies
     # forever: permanent, unexplainable drift, which is the always-red-gate
@@ -436,7 +412,7 @@ class UnitSpec:
 def _render(values: list[str] | None) -> str:
     """Render a directive's values for a Drift record / the report."""
     if not values:
-        return _ABSENT
+        return ABSENT
     if len(values) == 1:
         return values[0]
     return " | ".join(values)
@@ -501,38 +477,13 @@ def _compare_exec_start_flags(
                 # send the operator back to a manual diff to find the token
                 # that actually moved.
                 key=f"ExecStart --{flag}",
-                repo_value=repo_value if repo_value is not None else _ABSENT,
-                installed_value=installed_value if installed_value is not None else _ABSENT,
+                repo_value=repo_value if repo_value is not None else ABSENT,
+                installed_value=installed_value if installed_value is not None else ABSENT,
                 reason=reason,
             )
         )
 
     return drifts
-
-
-# _environment_map lives in scripts/systemd_unit_parity.py and is RE-EXPORTED
-# here under its existing PRIVATE name, on the same terms as the parser and
-# find_dropins above.  The THIRD lift, and the first whose second consumer is
-# not another checker: scripts/render_systemd_unit.py must read the INSTALLED
-# unit's Environment= map to preserve this host's host-local
-# DASHBOARD_KNOWN_PROJECT_ROOTS when setup-host.sh re-renders that unit, and a
-# value this checker can SEE has to be exactly a value the installer can
-# PRESERVE -- two readers with two ideas of what an Environment= line means is
-# how the installer silently drops a variable this gate then reports as fine.
-#
-# The renderer deliberately does NOT import this module to get it: the
-# section-8 harness in tests/scripts/test_check_dashboard_unit_parity.py builds
-# a tmp repo where write_checker(body=...) replaces this file with an argparse
-# stub (and with_checker=False omits it entirely), so a renderer importing it
-# would ImportError under the two tests asserting the install still happens
-# when the gate did not run.  Hence DOWN into the shared module, not sideways.
-#
-# Kept under the private name because this suite reads mod._environment_map
-# directly (test_check_dashboard_unit_parity.py's registry-staleness guards),
-# so that surface stays intact and IS the extraction's regression net.
-from systemd_unit_parity import (  # noqa: E402  (kept beside the other parser code)
-    environment_map as _environment_map,
-)
 
 
 def _compare_environment(
@@ -561,8 +512,8 @@ def _compare_environment(
     if section is None:
         return []
 
-    repo_env = _environment_map(repo, section)
-    installed_env = _environment_map(installed, section)
+    repo_env = environment_map(repo, section)
+    installed_env = environment_map(installed, section)
     drifts: list[Drift] = []
 
     for name in sorted(set(repo_env) | set(installed_env)):
@@ -581,8 +532,8 @@ def _compare_environment(
                 unit=spec.name,
                 section=section,
                 key=f"Environment={name}",
-                repo_value=repo_env.get(name, _ABSENT),
-                installed_value=installed_env.get(name, _ABSENT),
+                repo_value=repo_env.get(name, ABSENT),
+                installed_value=installed_env.get(name, ABSENT),
                 reason=reason,
             )
         )
@@ -639,11 +590,11 @@ def _compare_env_matches_directive(
         mismatched_sides: list[str] = []
 
         for side_name, side in (("repo", repo), ("installed", installed)):
-            env = _environment_map(side, section) if section is not None else {}
+            env = environment_map(side, section) if section is not None else {}
             directive = _render(side.get(section or "", {}).get(key))
             if var not in env:
                 # Reported by the name-set branch; see the docstring.
-                observed[side_name] = _ABSENT
+                observed[side_name] = ABSENT
                 continue
             observed[side_name] = f"{var}={env[var]} / {key}={directive}"
             if not env[var].strip() or not directive.strip():
@@ -697,7 +648,7 @@ def compare_unit(
 
     Comparison is SYMMETRIC over the curated key set: a compared directive the
     installed copy declares and the repo copy does not is drift just as much
-    as the reverse.  A missing key is treated as ``_ABSENT`` on its side, so
+    as the reverse.  A missing key is treated as ``ABSENT`` on its side, so
     both asymmetric cases fall out of the same equality test.
 
     The full values LIST is compared, not just the first value, so a repeated
