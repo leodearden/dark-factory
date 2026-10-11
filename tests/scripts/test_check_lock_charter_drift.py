@@ -672,8 +672,9 @@ class TestCheckComposition:
 # What THIS file pins is only what is specific to THIS call site: that it
 # DELEGATES rather than keeping a private copy of the walk, that it binds the
 # right marker and starts at its own tree, that an explicit flag out-ranks the
-# env var, that the answer does not vary with the caller's cwd, and that no
-# `parents[N]` index arithmetic has crept back in.
+# env var, that the answer does not vary with the caller's cwd, that no
+# `parents[N]` index arithmetic has crept back in, and that provenance is never
+# re-derived from an ambient REIFY_ROOT.
 # ---------------------------------------------------------------------------
 
 
@@ -763,6 +764,24 @@ class TestResolve:
             f'start varied with cwd {cwd} — resolution must key off the script, '
             f'not the caller'
         )
+
+    def test_ambient_reify_root_neither_replaces_nor_reattributes_a_discovered_root(
+        self, tmp_path, monkeypatch,
+    ):
+        """A root the resolver DISCOVERED stays discovered, whatever REIFY_ROOT holds now.
+
+        Re-reading the env var here would credit the operator with a path they
+        never set; see ``resolve``'s docstring.
+        """
+        discovered = tmp_path / 'discovered-reify'
+        monkeypatch.setattr(
+            reify_checkout,
+            'resolve_reify_checkout',
+            lambda marker, *, start: reify_checkout.ReifyCheckout(discovered, False),
+        )
+        monkeypatch.setenv('REIFY_ROOT', str(tmp_path / 'operator-set-elsewhere'))
+
+        assert drift.resolve() == reify_checkout.ReifyCheckout(discovered, False)
 
 
 class TestMainCli:
@@ -868,6 +887,37 @@ class TestMainCli:
         err = capsys.readouterr().err
         assert str(bogus) in err
         assert 'REIFY_ROOT' in err
+
+    def test_message_about_a_discovered_root_never_blames_reify_root(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        """A DISCOVERED root that cannot serve must not be reported as the operator's typo.
+
+        Blaming REIFY_ROOT here would send the operator hunting for a path they
+        never set; see ``resolve``'s docstring.
+        """
+        discovered = tmp_path / 'discovered-reify'
+        discovered.mkdir()  # a checkout WITHOUT the guard script, so main() explains why
+        elsewhere = tmp_path / 'operator-set-elsewhere'
+        monkeypatch.setattr(
+            reify_checkout,
+            'resolve_reify_checkout',
+            lambda marker, *, start: reify_checkout.ReifyCheckout(discovered, False),
+        )
+        monkeypatch.setenv('REIFY_ROOT', str(elsewhere))
+
+        rc = drift.main([])
+
+        assert rc == drift.EXIT_UNAVAILABLE
+        assert rc != drift.EXIT_OK
+        err = capsys.readouterr().err
+        expected = reify_checkout.reify_skip_reason(
+            drift.GUARD_RELPATH, discovered, named_by_env=False
+        )
+        assert expected is not None
+        assert expected in err
+        assert 'REIFY_ROOT' not in err
+        assert str(elsewhere) not in err
 
     def test_module_is_executable(self):
         """A script an operator is told to run must be runnable."""
