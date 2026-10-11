@@ -27,6 +27,7 @@ from fused_memory.maintenance.link_heal_ledger import (
     RunLock,
     RunLockHeld,
     RunSource,
+    UndoTarget,
     UnknownRun,
 )
 from fused_memory.server.grouped_read import CONTESTED_METADATA_KEY
@@ -184,8 +185,10 @@ class TestRuns:
 
         assert corpus_plan is not None
         assert corpus_plan.run_id == newest_corpus
+        assert corpus_plan.kind is RunKind.PLAN
         assert adjudicator_plan is not None
         assert adjudicator_plan.run_id == adjudicator
+        assert adjudicator_plan.kind is RunKind.PLAN
         fresh = LinkHealLedger(tmp_path / 'fresh.db')
         try:
             assert fresh.latest_plan_run(RunSource.CORPUS) is None
@@ -277,12 +280,13 @@ class TestUndoTargets:
 
         assert ledger.resolve_run(run_id).kind is kind
 
-    def test_undoable_heals_are_the_heals_an_apply_run_applied(self, ledger):
+    def test_an_undo_target_holds_the_heals_its_apply_run_applied(self, ledger):
         _plan_run, apply_run, ids = _plan_and_apply_two(ledger)
 
-        heals = ledger.undoable_heals(ledger.resolve_run(apply_run))
+        target = ledger.undo_target(ledger.resolve_run(apply_run))
 
-        assert [heal.action_id for heal in heals] == ids
+        assert target.run.run_id == apply_run
+        assert [heal.action_id for heal in target.heals] == ids
 
     @pytest.mark.parametrize(
         ('target_of', 'kind'),
@@ -298,13 +302,22 @@ class TestUndoTargets:
         target = ledger.resolve_run(target_of(ledger))
 
         with pytest.raises(NothingToUndo) as excinfo:
-            ledger.undoable_heals(target)
+            ledger.undo_target(target)
 
         message = str(excinfo.value)
         assert target.run_id[:8] in message
         assert f'{kind.value} run' in message
-        assert '0 applied heals' in message
+        assert 'no heal still applied' in message
         assert excinfo.value.run.run_id == target.run_id
+
+    def test_an_undo_target_cannot_be_built_empty_or_from_a_non_apply_run(self, ledger):
+        plan_run, apply_run, _ids = _plan_and_apply_two(ledger)
+        heals = tuple(ledger.applied_actions(apply_run))
+
+        with pytest.raises(NothingToUndo):
+            UndoTarget(ledger.resolve_run(apply_run), ())
+        with pytest.raises(NothingToUndo):
+            UndoTarget(ledger.resolve_run(plan_run), heals)
 
 
 class TestActions:

@@ -239,23 +239,27 @@ def _latest_plan_lines(ledger: LinkHealLedger) -> list[str]:
     for source in PLAN_SOURCES:
         run = ledger.latest_plan_run(source)
         if run is not None:
-            lines.append(_plan_line(run, pending_plan_sha256(ledger.pending_actions(source))))
+            lines.append(_plan_line(run, ledger.pending_actions(source)))
     return lines
 
 
-def _plan_line(run: RunRow, pending_sha: str) -> str:
-    """The latest plan of *run*'s source, and whether its sha is that of the plan pending now."""
+def _plan_line(run: RunRow, pending: Sequence[ActionRow]) -> str:
+    """The latest plan of *run*'s source, and how it stands against the heals pending now."""
     heading = f'latest {run.source.value} plan {run.run_id[:8]}'
     if run.plan_sha256 is None:
         return f'{heading}  no plan document'
-    standing = (
-        'pending now' if run.plan_sha256 == pending_sha
-        else 'stale (pending heals changed since; re-plan)'
-    )
     return (
         f'{heading}  plan {run.plan_path or "unrecorded"}  '
-        f'plan_sha256 {run.plan_sha256}  {standing}'
+        f'plan_sha256 {run.plan_sha256}  {_plan_standing(run.plan_sha256, pending)}'
     )
+
+
+def _plan_standing(plan_sha256: str, pending: Sequence[ActionRow]) -> str:
+    if not pending:
+        return 'nothing pending'
+    if plan_sha256 == pending_plan_sha256(pending):
+        return 'pending now'
+    return 'stale (pending heals changed since; re-plan)'
 
 
 @dataclass(frozen=True)
@@ -368,9 +372,8 @@ async def _apply(args: argparse.Namespace, session: _Session) -> RunReport:
 
 
 async def _undo(args: argparse.Namespace, session: _Session) -> RunReport:
-    target = session.ledger.resolve_run(args.run)
-    heals = session.ledger.undoable_heals(target)
-    await session.probe(_first_project(heals))
+    target = session.ledger.undo_target(session.ledger.resolve_run(args.run))
+    await session.probe(_first_project(target.heals))
     return await run_undo(
         target, store=session.store, ledger=session.ledger, limits=session.limits,
     )

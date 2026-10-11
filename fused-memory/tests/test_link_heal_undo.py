@@ -72,7 +72,8 @@ async def plan_and_apply(
 
 async def undo(harness: LinkHealHarness, ledger: LinkHealLedger, run_ref: str) -> RunReport:
     return await run_undo(
-        ledger.resolve_run(run_ref), store=harness.store(), ledger=ledger, limits=DEFAULT_LIMITS,
+        ledger.undo_target(ledger.resolve_run(run_ref)),
+        store=harness.store(), ledger=ledger, limits=DEFAULT_LIMITS,
     )
 
 
@@ -159,7 +160,7 @@ class TestUndoADetach:
         writes_before = harness.mem0.write_count
         runs_before = len(ledger.recent_runs(100))
 
-        with pytest.raises(NothingToUndo, match='0 applied heals'):
+        with pytest.raises(NothingToUndo, match='no heal still applied'):
             await undo(harness, ledger, applied.run_id)
 
         assert harness.mem0.write_count == writes_before

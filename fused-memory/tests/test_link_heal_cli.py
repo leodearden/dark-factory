@@ -69,6 +69,7 @@ DEFAULT_SERVER_URL = f'http://127.0.0.1:{SERVER_PORT}'
 WRONG_SHA = 'deadbeef' * 8
 PENDING_NOW = 'pending now'
 STALE = 'stale (pending heals changed since; re-plan)'
+NOTHING_PENDING = 'nothing pending'
 
 
 @dataclasses.dataclass
@@ -476,7 +477,7 @@ class TestRefusedBeforeAnyRun:
         assert code == 2
         assert planned['run_id'][:8] in err
         assert 'plan run' in err
-        assert '0 applied heals' in err
+        assert 'no heal still applied' in err
         assert [run.run_id for run in workspace.runs()] == [planned['run_id']]
         assert harness.mem0.write_count == 0
 
@@ -496,7 +497,7 @@ class TestRefusedBeforeAnyRun:
         err = capsys.readouterr().err
         assert code == 2
         assert 'apply run' in err
-        assert '0 applied heals' in err
+        assert 'no heal still applied' in err
         assert len(workspace.runs()) == runs_before
 
     @pytest.mark.asyncio
@@ -866,6 +867,23 @@ class TestStatusShowsWhatAPlanCameTo:
         current_line = latest_plan_line(status_lines(capsys), RunSource.CORPUS)
         assert replanned['run_id'][:8] in current_line
         assert PENDING_NOW in current_line
+
+    @pytest.mark.asyncio
+    async def test_a_fully_applied_plan_says_nothing_is_pending_rather_than_stale(
+        self, harness, workspace, capsys,
+    ):
+        env = env_for(harness, workspace)
+        planned = await plan_from(env, workspace, seed_corpus(harness, workspace, 2), capsys)
+        code, applied = await apply(env, workspace, capsys)
+        assert (code, applied['counts']['applied']) == (0, 2)
+
+        assert await run_cli(env, workspace, 'status') == 0
+
+        applied_line = latest_plan_line(status_lines(capsys), RunSource.CORPUS)
+        assert planned['plan_sha256'] in applied_line
+        assert NOTHING_PENDING in applied_line
+        assert STALE not in applied_line
+        assert PENDING_NOW not in applied_line
 
     @pytest.mark.asyncio
     async def test_a_relative_out_path_is_recorded_absolute(

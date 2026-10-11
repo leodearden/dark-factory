@@ -76,8 +76,8 @@ from fused_memory.maintenance.link_heal_ledger import (
     AdjudicationRecord,
     AdjudicationRow,
     LinkHealLedger,
-    RunRow,
     RunSource,
+    UndoTarget,
 )
 from fused_memory.maintenance.link_heal_store import (
     LinkCensus,
@@ -953,13 +953,10 @@ async def _undo_heal(
 
 
 async def run_undo(
-    target: RunRow, *, store: LinkHealStore, ledger: LinkHealLedger, limits: RunLimits,
+    target: UndoTarget, *, store: LinkHealStore, ledger: LinkHealLedger, limits: RunLimits,
 ) -> RunReport:
-    """A writing run taking back every heal *target* applied, newest first.
-
-    Raises NothingToUndo, before any run row, when *target* is not an apply run with a heal
-    still applied."""
-    heals = ledger.undoable_heals(target)[::-1]
+    """A writing run taking back every heal *target* still has applied, newest first."""
+    heals = target.heals[::-1]
     run_id = ledger.start_run(RunSource.UNDO, writes=True)
     drain = _Drain()
     for index, row in enumerate(heals):
