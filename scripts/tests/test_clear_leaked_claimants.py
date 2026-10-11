@@ -6,6 +6,7 @@ shared predicates, and every store is a synthetic temp tasks.db.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import subprocess
@@ -16,7 +17,7 @@ from pathlib import Path
 
 import pytest
 from _task_db_scan import UNREADABLE_STORE_ERRORS
-from clear_leaked_claimants import Tier, take_census
+from clear_leaked_claimants import Bucket, Tier, apply_repairs, take_census
 from cli_subprocess_timeout import cli_timeout_from_env
 
 NOW = datetime(2026, 10, 11, 12, tzinfo=UTC)
@@ -68,6 +69,31 @@ def seed_root(tmp_path, make_tasks_db):
         return str(root)
 
     return _seed
+
+
+def _store_path(root: str) -> Path:
+    return Path(root) / '.taskmaster' / 'tasks' / 'tasks.db'
+
+
+def _store_rows(root: str) -> list[tuple]:
+    with closing(sqlite3.connect(f'file:{_store_path(root)}?mode=ro', uri=True)) as conn:
+        return conn.execute('SELECT * FROM tasks ORDER BY tag, id').fetchall()
+
+
+def _claimants(root: str) -> dict[int, tuple[str | None, str | None]]:
+    with closing(sqlite3.connect(f'file:{_store_path(root)}?mode=ro', uri=True)) as conn:
+        rows = conn.execute('SELECT id, claimant_run_id, heartbeat_at FROM tasks')
+        return {task_id: (claimant, heartbeat) for task_id, claimant, heartbeat in rows}
+
+
+def _mutate_store(root: str, sql: str, params: tuple = ()) -> None:
+    with closing(sqlite3.connect(_store_path(root))) as conn:
+        conn.execute(sql, params)
+        conn.commit()
+
+
+def _seeded_claimant(row: dict) -> tuple[str | None, str | None]:
+    return (row['claimant_run_id'], row['heartbeat_at'])
 
 
 class TestCensus:
@@ -141,12 +167,6 @@ def _run_cli(*args: str, timeout: float = CLI_TIMEOUT) -> subprocess.CompletedPr
     return subprocess.run(
         [sys.executable, _SCRIPT, *args], capture_output=True, text=True, timeout=timeout,
     )
-
-
-def _store_rows(root: str) -> list[tuple]:
-    store = Path(root) / '.taskmaster' / 'tasks' / 'tasks.db'
-    with closing(sqlite3.connect(f'file:{store}?mode=ro', uri=True)) as conn:
-        return conn.execute('SELECT * FROM tasks ORDER BY tag, id').fetchall()
 
 
 def _violation_line(stdout: str, task_id: int) -> str:
@@ -225,3 +245,117 @@ class TestDryRunCli:
 
     def test_project_root_is_required(self):
         assert _run_cli().returncode == 2
+
+
+class _FakeClaimantServer:
+    """Answers set_task_claimant by really writing the named project's store, as the backend does."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+        self.error_replies: dict[int, dict] = {}
+        self.raises: dict[int, Exception] = {}
+        self.ack_without_write: set[int] = set()
+
+    async def call_tool(self, name: str, arguments: dict) -> dict:
+        self.calls.append((name, dict(arguments)))
+        if name != 'set_task_claimant':
+            raise AssertionError(f'unexpected tool call: {name}')
+        task_id = int(arguments['id'])
+        if task_id in self.raises:
+            raise self.raises[task_id]
+        if task_id in self.error_replies:
+            return self.error_replies[task_id]
+        if task_id not in self.ack_without_write:
+            _mutate_store(
+                arguments['project_root'],
+                'UPDATE tasks SET claimant_run_id = ?, heartbeat_at = ? WHERE tag = ? AND id = ?',
+                (arguments['claimant_run_id'], arguments['heartbeat_at'], arguments['tag'], task_id),
+            )
+        return {'id': arguments['id'], 'message': f"Updated claimant fields for task {arguments['id']}"}
+
+    def written_ids(self) -> set[int]:
+        return {int(arguments['id']) for _, arguments in self.calls}
+
+
+TERMINAL_ONLY = frozenset({Tier.TERMINAL})
+BOTH_TIERS = frozenset({Tier.TERMINAL, Tier.HYGIENE})
+TERMINAL_IDS = {4028, 5225, 101}
+HYGIENE_IDS = {103, 109}
+
+
+def _apply(census, client, tiers=TERMINAL_ONLY, clock=lambda: NOW):
+    return asyncio.run(apply_repairs(census, client, tiers=tiers, clock=clock))
+
+
+def _buckets(report) -> dict[int, Bucket]:
+    return {outcome.violation.task_id: outcome.bucket for outcome in report.outcomes}
+
+
+class TestApplyRepairs:
+    def test_clears_each_terminal_row_with_one_set_task_claimant_call(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        server = _FakeClaimantServer()
+
+        _apply(take_census(root, NOW), server)
+
+        calls = sorted(server.calls, key=lambda call: int(call[1]['id']))
+        assert calls == [
+            ('set_task_claimant', {
+                'id': str(task_id), 'tag': 'master', 'project_root': root,
+                'claimant_run_id': None, 'heartbeat_at': None,
+            })
+            for task_id in sorted(TERMINAL_IDS)
+        ]
+
+    def test_terminal_rows_end_cleared_and_repaired_and_hygiene_rows_untouched(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+
+        report = _apply(take_census(root, NOW), _FakeClaimantServer())
+
+        live = _claimants(root)
+        assert all(live[task_id] == (None, None) for task_id in TERMINAL_IDS)
+        assert live[103] == _seeded_claimant(STALE_PENDING)
+        assert live[109] == _seeded_claimant(STALE_MERGE_DEFERRED)
+        assert _buckets(report) == {task_id: Bucket.REPAIRED for task_id in TERMINAL_IDS}
+
+    def test_verification_census_shows_no_terminal_violation_and_keeps_the_hygiene_rows(
+        self, seed_root,
+    ):
+        root = seed_root(TIER_TABLE_ROWS)
+
+        report = _apply(take_census(root, NOW), _FakeClaimantServer())
+
+        verification = report.verification_census
+        assert verification.totals()['by_tier'][Tier.TERMINAL] == 0
+        assert {v.task_id for v in verification.violations} == HYGIENE_IDS
+
+    def test_freeform_claimant_with_no_heartbeat_is_repaired_not_skipped(self, seed_root):
+        root = seed_root([FREEFORM_CANCELLED])
+
+        report = _apply(take_census(root, NOW), _FakeClaimantServer())
+
+        assert _buckets(report) == {5225: Bucket.REPAIRED}
+        assert _claimants(root)[5225] == (None, None)
+
+    def test_hygiene_tier_is_cleared_only_when_selected(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        server = _FakeClaimantServer()
+
+        report = _apply(take_census(root, NOW), server, tiers=BOTH_TIERS)
+
+        assert server.written_ids() == TERMINAL_IDS | HYGIENE_IDS
+        assert _buckets(report) == {
+            task_id: Bucket.REPAIRED for task_id in TERMINAL_IDS | HYGIENE_IDS
+        }
+        live = _claimants(root)
+        assert live[103] == (None, None)
+        assert live[109] == (None, None)
+        for row in TIER_TABLE_ROWS:
+            if row['id'] not in TERMINAL_IDS | HYGIENE_IDS:
+                assert live[row['id']] == _seeded_claimant(row)
+
+    def test_refuses_to_run_without_a_client(self, seed_root):
+        census = take_census(seed_root(TIER_TABLE_ROWS), NOW)
+
+        with pytest.raises(ValueError):
+            _apply(census, None)
