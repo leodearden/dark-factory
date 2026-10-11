@@ -33,6 +33,7 @@ from fused_memory.backends.sqlite_task_backend import (
     _MACHINE_AUTHORED_METADATA_KEYS,
     SqliteTaskBackend,
     stamp_pending_since,
+    task_timestamp_now,
 )
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.config.schema import TaskmasterConfig
@@ -875,7 +876,9 @@ class TestPendingSinceBatchIdentity:
 
         interceptor, event_buffer = await self._interceptor_over(tm, tmp_path)
         try:
+            before = task_timestamp_now()
             result = await interceptor.set_task_status('1,2', TaskStatus.PENDING, '/project')
+            after = task_timestamp_now()
         finally:
             await event_buffer.close()
 
@@ -886,6 +889,11 @@ class TestPendingSinceBatchIdentity:
             call.kwargs['pending_since_now'] for call in tm.set_task_status.call_args_list
         }
         assert len(batch_clocks) == 1
+        (batch_clock,) = batch_clocks
+        assert len(batch_clock) == len(before) and before <= batch_clock <= after, (
+            'the batch clock must be one task_timestamp_now() reading taken '
+            f'during the flip; got {batch_clock!r} outside [{before!r}, {after!r}]'
+        )
 
 
 class TestPendingSinceIsMachineAuthored:

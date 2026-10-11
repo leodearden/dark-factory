@@ -145,8 +145,6 @@ class TaskBackendProtocol(Protocol):
         ``fused_memory/backends/sqlite_task_backend.py::task_timestamp_now``,
         never a ``datetime.isoformat()`` string. It supplies only the clock:
         whether a stamp is owed is still the backend's transition table.
-        ``TaskInterceptor``'s CSV branch passes one value per batch so a
-        ``commit_planning`` release lands on one instant.
 
         Returns :class:`StatusWriteNotPersistedResult` instead of a fabricated
         success (task 2649) when a post-write read-back shows the status
