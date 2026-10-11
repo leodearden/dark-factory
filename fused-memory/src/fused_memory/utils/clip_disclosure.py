@@ -48,3 +48,24 @@ def elide_text(value: object, cap: int, *, field: str) -> TextClip:
 
 def truncation_facts(*clips: TextClip) -> list[TruncationFact]:
     return [clip.fact for clip in clips if clip.fact is not None]
+
+
+def clip_note(*, omitted: int, omitted_noun: str, cap_name: str, cap: int, dropped_first: str) -> str:
+    """The ``_NOTE:`` line a prompt reads as clipped coverage; '' when nothing was omitted."""
+    if omitted <= 0:
+        return ''
+    return (
+        f'_NOTE: {omitted} additional {omitted_noun} were omitted from this render by the '
+        f'{cap_name}={cap} cap. Coverage was clipped — NOT complete this cycle; '
+        f'{dropped_first} were dropped first._'
+    )
+
+
+def fetch_cap_note(*, fetched: int, noun: str, cap_name: str, cap: int) -> str:
+    """The ``_NOTE:`` line for a retrieval that filled its cap, where the omitted count is unknowable."""
+    if fetched < cap:
+        return ''
+    return (
+        f'_NOTE: {fetched} {noun} were fetched, reaching the {cap_name}={cap} cap; any beyond it '
+        f'were not fetched. Coverage may be clipped — NOT known complete this cycle._'
+    )
