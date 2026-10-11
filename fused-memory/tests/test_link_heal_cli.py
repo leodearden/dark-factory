@@ -443,6 +443,55 @@ class TestRefusedBeforeAnyRun:
         assert FailingCensus.DETAIL in capsys.readouterr().err
         assert workspace.runs() == []
 
+    @pytest.mark.asyncio
+    async def test_undo_of_a_plan_run_is_refused_naming_its_kind(
+        self, harness, workspace, capsys,
+    ):
+        env = env_for(harness, workspace)
+        planned = await plan_from(env, workspace, seed_corpus(harness, workspace, 2), capsys)
+
+        code = await run_cli(env, workspace, 'undo', '--run', planned['run_id'][:8])
+
+        err = capsys.readouterr().err
+        assert code == 2
+        assert planned['run_id'][:8] in err
+        assert 'plan run' in err
+        assert '0 applied heals' in err
+        assert [run.run_id for run in workspace.runs()] == [planned['run_id']]
+        assert harness.mem0.write_count == 0
+
+    @pytest.mark.asyncio
+    async def test_undo_of_an_already_undone_apply_is_refused(
+        self, harness, workspace, capsys,
+    ):
+        env = env_for(harness, workspace)
+        await plan_from(env, workspace, seed_corpus(harness, workspace, 1), capsys)
+        _code, applied = await apply(env, workspace, capsys)
+        assert await run_cli(env, workspace, 'undo', '--run', applied['run_id'][:8]) == 0
+        printed_report(capsys)
+        runs_before = len(workspace.runs())
+
+        code = await run_cli(env, workspace, 'undo', '--run', applied['run_id'][:8])
+
+        err = capsys.readouterr().err
+        assert code == 2
+        assert 'apply run' in err
+        assert '0 applied heals' in err
+        assert len(workspace.runs()) == runs_before
+
+    @pytest.mark.asyncio
+    async def test_a_refused_undo_never_probes_the_server(self, harness, workspace, capsys):
+        planned = await plan_from(
+            env_for(harness, workspace), workspace, seed_corpus(harness, workspace, 1), capsys,
+        )
+        calls: list[tuple[str, dict[str, Any]]] = []
+        env = env_for(harness, workspace, tool_caller=harness.recording_tool_caller(calls))
+
+        code = await run_cli(env, workspace, 'undo', '--run', planned['run_id'][:8])
+
+        assert code == 2
+        assert calls == []
+
 
 class TestTheHomeProject:
     @pytest.mark.asyncio
