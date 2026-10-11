@@ -938,7 +938,9 @@ def promote_candidate(
     what was actually observed, not *entry_fields*). The candidate itself
     is stamped ``disposition="promoted"`` and ``promoted_to`` naming the
     new entry id -- RETAINED, never removed (PRD decision 3). A *finding*
-    identity is stamped on the candidate (``census_findings.stamped``).
+    identity is stamped on the candidate (``census_findings.stamped``), and
+    the entry carries the stamped candidate's identity and supersedes chain
+    (``census_findings.carried_identity``).
     ``codebook.assert_no_deletion`` is run against the pre-transform *cb*
     before returning, as a construction-independent safety net.
     """
@@ -948,7 +950,7 @@ def promote_candidate(
         candidate.update(census_findings.stamped(candidate, finding))
 
     new_entry_id = entry_fields["id"]
-    entry = dict(entry_fields)
+    entry = {**entry_fields, **census_findings.carried_identity(candidate)}
     entry["sightings"] = copy.deepcopy(candidate.get("sightings") or [])
     result.setdefault("entries", []).append(entry)
 
@@ -2998,7 +3000,6 @@ def run_census(
             "status": "open",
             "origin_phase": cluster.get("origin_phase") or "unknown",
             "manifested_phase": cluster.get("manifested_phase") or "unknown",
-            **cluster["finding"].to_fields(),
             **census_findings.first_sighting_fields(run_id),
         }
         held = held_back.get(cluster.get("title"))

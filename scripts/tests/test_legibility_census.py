@@ -1141,6 +1141,57 @@ def test_promote_candidate_appends_entry_and_stamps_disposition():
     assert len(before["entries"]) == 1
 
 
+_PROMOTION_ENTRY_FIELDS = {
+    "id": "new-entry-a",
+    "title": "A novel confusion shape",
+    "severity": "medium",
+    "status": "open",
+    "origin_phase": "implement",
+    "manifested_phase": "verify",
+}
+
+
+def _promotion_identity(anchor: str, primary_tag: str = "h13") -> census_findings.FindingIdentity:
+    return census_findings.FindingIdentity.mint("orchestrator", anchor, (primary_tag, verdict.KIND_TAG))
+
+
+def _promoted_pair(cb: dict, finding: census_findings.FindingIdentity) -> tuple[dict, dict]:
+    result = mod.promote_candidate(cb, "cand-20260714-1", dict(_PROMOTION_ENTRY_FIELDS), finding=finding)
+    assert codebook.validate(result) == []
+    return result["candidates"][0], next(e for e in result["entries"] if e["id"] == "new-entry-a")
+
+
+def _identity_and_supersedes(record: dict) -> dict:
+    return {field: record[field] for field in (*codebook.FINDING_IDENTITY_FIELDS, "supersedes")}
+
+
+def test_a_promoted_entry_carries_its_unkeyed_candidates_new_identity():
+    finding = _promotion_identity("orchestrator/x.py::f")
+    candidate, entry = _promoted_pair(_codebook_with_candidate(), finding)
+    assert _identity_and_supersedes(entry) == {**finding.to_fields(), "supersedes": []}
+    assert candidate["finding_key"] == entry["finding_key"]
+
+
+def test_a_promoted_entry_keeps_the_key_its_candidate_already_stands_on():
+    cb = _codebook_with_candidate()
+    standing = _promotion_identity("orchestrator/x.py::f", primary_tag="h13")
+    cb["candidates"][0].update(standing.to_fields())
+    candidate, entry = _promoted_pair(cb, _promotion_identity("orchestrator/x.py::f", primary_tag="h4"))
+    assert entry["finding_key"] == candidate["finding_key"] == standing.key
+    assert _identity_and_supersedes(entry) == _identity_and_supersedes({**candidate, "supersedes": []})
+
+
+def test_a_promoted_entry_carries_the_supersedes_chain_its_moved_candidate_records():
+    cb = _codebook_with_candidate()
+    prior = finding_key("orchestrator", "orchestrator/x.py::older", "h13")
+    standing = _promotion_identity("orchestrator/x.py::old_name")
+    cb["candidates"][0].update({**standing.to_fields(), "supersedes": [prior]})
+    moved = _promotion_identity("orchestrator/x.py::new_name")
+    candidate, entry = _promoted_pair(cb, moved)
+    assert entry["finding_key"] == candidate["finding_key"] == moved.key
+    assert entry["supersedes"] == candidate["supersedes"] == [prior, standing.key]
+
+
 def test_reject_candidate_stamps_disposition_retained():
     before = _codebook_with_candidate()
 

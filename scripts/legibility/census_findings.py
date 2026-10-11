@@ -88,8 +88,17 @@ def stamped(record: Mapping[str, Any], identity: FindingIdentity) -> dict[str, A
     return {**record, **identity.to_fields(), "supersedes": supersedes}
 
 
+def carried_identity(record: Mapping[str, Any]) -> dict[str, Any]:
+    """The identity fields and supersedes chain a record promoted from *record*
+    carries, so :func:`stamped` alone decides the key of both."""
+    identity = FindingIdentity.from_record(record)
+    if identity is None:
+        return {}
+    return {**identity.to_fields(), "supersedes": list(record.get("supersedes") or [])}
+
+
 def first_sighting_fields(run_id: str) -> dict[str, Any]:
-    return {"first_seen_run": run_id, "last_seen_runs": [run_id], "supersedes": []}
+    return {"first_seen_run": run_id, "last_seen_runs": [run_id]}
 
 
 def _sighted(entry: Mapping[str, Any], sessions: Collection[str]) -> bool:
