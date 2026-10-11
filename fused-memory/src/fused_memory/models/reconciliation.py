@@ -79,8 +79,9 @@ class AssembledPayload:
     events: list  # list[ReconciliationEvent] — forward ref avoids circular
     context_items: dict[str, ContextItem] = field(default_factory=dict)
     total_tokens: int = 0
-    events_remaining: int = 0
+    events_remaining: int = 0  # > 0 exactly when token_budget stopped the assembly
     effective_watermark: datetime | None = None
+    token_budget: int = 0
 
 
 class JournalEntry(BaseModel):

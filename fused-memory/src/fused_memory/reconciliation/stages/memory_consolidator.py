@@ -106,6 +106,7 @@ from fused_memory.reconciliation.task_filter import (
     strip_snapshot_lines,
 )
 from fused_memory.server.grouped_read import PARENT_ID_KEY, _parent_id_in_meta
+from fused_memory.utils.clip_disclosure import clip_note
 
 if TYPE_CHECKING:
     from fused_memory.services.memory_service import MemoryService
@@ -1724,6 +1725,15 @@ Review the above data and perform memory consolidation:
         self._undatable_freshness_records = 0
 
         event_summary = _format_events(ap.events)
+        deferred_events_note = clip_note(
+            omitted=ap.events_remaining,
+            omitted_noun='buffered event(s)',
+            cap_name='reconciliation.token_budget',
+            cap=ap.token_budget,
+            dropped_first='the newest events (still buffered for a later chunk)',
+        )
+        if deferred_events_note:
+            event_summary = f'{event_summary}\n\n{deferred_events_note}'
 
         # Store status (cheap fetch, always useful)
         status = await self._fetch_status()

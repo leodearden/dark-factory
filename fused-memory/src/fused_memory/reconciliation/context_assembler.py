@@ -206,6 +206,7 @@ class ContextAssembler:
             total_tokens=used,
             events_remaining=events_remaining,
             effective_watermark=effective_wm,
+            token_budget=budget,
         )
 
     def _compute_effective_watermark(
