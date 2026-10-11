@@ -48,7 +48,7 @@ if __name__ == '__main__':
     sys.path.insert(0, str(_HERE.parent.parent))  # scripts/
     sys.path.insert(0, str(_HERE.parents[2] / 'orchestrator' / 'src'))  # <repo>/orchestrator/src
 
-from legibility import census_trigger, config, detectors, inventory  # noqa: E402
+from legibility import census_trigger, config, detectors, inventory  # noqa: E402  # debt: task 6760
 
 from orchestrator import session_registry  # noqa: E402
 

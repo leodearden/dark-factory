@@ -35,7 +35,7 @@ from typing import Any
 if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from legibility import detectors, digest  # noqa: E402
+from legibility import detectors, digest  # noqa: E402  # debt: task 6760
 from legibility.config import LegibilityConfig, load_config  # noqa: E402
 from legibility.inventory import (  # noqa: E402
     SessionRecord,

@@ -202,9 +202,9 @@ def _write_quiet_transcript(
     ``tool_result`` — but the exchange SUCCEEDS: no ``is_error``, and no
     literal from legibility.detectors' tables (``NOT_FOUND_PATTERNS``,
     ``SELF_CORRECTION_PATTERNS``, ``DF_GUARD_PATTERNS``,
-    ``INTERRUPT_PATTERN``) in any carrier. So the record scores 0 and the sampler drops it
-    as zero-signal BEFORE the budget phase — a genuinely quiet night, never
-    a budget-skipped candidate. The score-0 claim is asserted (not assumed)
+    ``INTERRUPT_PATTERN``) in any carrier. So the record scores 0 and the
+    sampler drops it as zero-signal BEFORE the budget phase — a genuinely
+    quiet night, never a budget-skipped candidate. The score-0 claim is asserted (not assumed)
     in ``test_run_nightly_quiet_night_is_not_reported_as_suppressed``.
     """
     lines = [

@@ -36,7 +36,7 @@ from typing import Any
 if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from legibility.detectors import (  # noqa: E402
+from legibility.detectors import (  # noqa: E402  # debt: task 6760
     CarrierKind,
     ErrorHit,
     RecordHits,
