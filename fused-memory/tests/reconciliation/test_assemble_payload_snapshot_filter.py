@@ -15,6 +15,8 @@ from fused_memory.models.reconciliation import (
     Watermark,
 )
 from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.reconciliation.stages.memory_consolidator import _RECORD_BODY_CHARS
+from fused_memory.utils.clip_disclosure import elision_marker
 from reconciliation.consolidator_fixtures import make_consolidator, make_scope
 
 _SNAPSHOT_LINE = '1505 done / 148 cancelled / 1653 total'
@@ -155,6 +157,90 @@ class TestAssembledPayloadDisclosesTheTokenBudgetClip:
         )
 
         assert '_NOTE:' not in _buffered_events_block(result)
+
+
+_EPISODES_HEADER = '### New Episodes Since Last Reconciliation'
+_MEMORIES_HEADER = '### New Mem0 Memories Since Last Reconciliation'
+
+
+def _section(payload: str, header: str) -> str:
+    return payload.split(header, 1)[1].split('\n### ', 1)[0]
+
+
+def _episodes(*contents: str) -> list[dict]:
+    return [
+        {'uuid': f'e{i}', 'created_at': '2026-05-28T00:00:00Z', 'content': c}
+        for i, c in enumerate(contents)
+    ]
+
+
+def _memories(*contents: str) -> dict:
+    return {'results': [
+        {'id': f'm{i}', 'memory': c, 'metadata': {'category': 'temporal_facts'}}
+        for i, c in enumerate(contents)
+    ]}
+
+
+async def _time_windowed_payload(stage) -> str:
+    return await stage.assemble_payload(
+        events=[], watermark=Watermark(project_id='test_project'), prior_reports=[],
+    )
+
+
+class TestTimeWindowedPayloadDisclosesClips:
+    """Per-record body clips and saturated fetch caps are both visible in the Stage-1 payload."""
+
+    @pytest.mark.asyncio
+    async def test_long_records_carry_the_elision_marker_and_short_ones_do_not(self):
+        long_episode = f'{_SNAPSHOT_LINE}\n' + 'e' * (_RECORD_BODY_CHARS + 30)
+        long_memory = 'm' * (_RECORD_BODY_CHARS + 45) + f'\n{_SNAPSHOT_LINE}'
+        stage = make_consolidator()
+        stage.memory.get_episodes = AsyncMock(return_value=_episodes(long_episode, 'short episode'))
+        stage.memory.mem0.get_all = AsyncMock(return_value=_memories(long_memory, 'short memory'))
+
+        result = await _time_windowed_payload(stage)
+
+        episodes = _section(result, _EPISODES_HEADER)
+        assert f'{"e" * _RECORD_BODY_CHARS}{elision_marker(30)}' in episodes
+        assert 'short episode' in episodes and 'short episode…' not in episodes
+        memories = _section(result, _MEMORIES_HEADER)
+        assert f'{"m" * _RECORD_BODY_CHARS}{elision_marker(45)}' in memories
+        assert 'short memory' in memories and 'short memory…' not in memories
+        assert stage._entity_summary_snapshot_lines_stripped == 2
+
+    @pytest.mark.asyncio
+    async def test_a_fetch_that_fills_its_limit_renders_a_fetch_cap_note(self):
+        stage = make_consolidator()
+        stage.episode_limit = 2
+        stage.memory_limit = 3
+        stage.memory.get_episodes = AsyncMock(return_value=_episodes('a', 'b'))
+        stage.memory.mem0.get_all = AsyncMock(return_value=_memories('x', 'y', 'z'))
+
+        result = await _time_windowed_payload(stage)
+
+        [episode_note] = [
+            line for line in _section(result, _EPISODES_HEADER).splitlines() if line.startswith('_NOTE:')
+        ]
+        assert 'episode_limit=2' in episode_note
+        assert 'NOT known complete this cycle' in episode_note
+        [memory_note] = [
+            line for line in _section(result, _MEMORIES_HEADER).splitlines() if line.startswith('_NOTE:')
+        ]
+        assert 'memory_limit=3' in memory_note
+        assert 'NOT known complete this cycle' in memory_note
+
+    @pytest.mark.asyncio
+    async def test_a_fetch_under_its_limit_renders_no_note(self):
+        stage = make_consolidator()
+        stage.episode_limit = 2
+        stage.memory_limit = 3
+        stage.memory.get_episodes = AsyncMock(return_value=_episodes('a'))
+        stage.memory.mem0.get_all = AsyncMock(return_value=_memories('x', 'y'))
+
+        result = await _time_windowed_payload(stage)
+
+        assert '_NOTE:' not in _section(result, _EPISODES_HEADER)
+        assert '_NOTE:' not in _section(result, _MEMORIES_HEADER)
 
 
 class TestRunSurfacesSnapshotStrippedStat:
