@@ -44,6 +44,10 @@ from fused_memory.server.wal_status import (  # noqa: E402
     CHECKPOINT_STATUS as _CHECKPOINT_STATUS,
 )
 from fused_memory.services.memory_service import MemoryService  # noqa: E402
+from fused_memory.services.write_ops_retention import (  # noqa: E402
+    prune_write_ops_pass,
+    run_periodic_write_ops_prune,
+)
 
 if TYPE_CHECKING:
     from shared.cost_store import CostStore
@@ -613,15 +617,7 @@ async def run_server():
     # it would corrupt the very telemetry it is pruning. A first run against the
     # current backlog will legitimately need many restarts to drain, which the
     # prune discloses at WARNING rather than hiding. Fire-and-forget.
-    _wj = config.write_journal
-    _write_ops_pruned = await write_journal.prune_write_ops(
-        read_older_than_days=_wj.read_retention_days,
-        search_older_than_days=_wj.search_retention_days,
-        write_older_than_days=_wj.write_retention_days,
-        batch_size=_wj.prune_batch_size,
-        max_rows=_wj.prune_max_rows_per_run,
-        max_seconds=_wj.prune_max_seconds,
-    )
+    _write_ops_pruned = await prune_write_ops_pass(write_journal, config.write_journal)
     if _write_ops_pruned:
         logger.info(
             f'write_ops retention prune at startup: {_write_ops_pruned} rows'
@@ -1179,6 +1175,16 @@ async def run_server():
     else:
         logger.info('  Summary rebuild loop: disabled')
 
+    write_ops_prune_task = asyncio.create_task(
+        run_periodic_write_ops_prune(write_journal, config.write_journal),
+    )
+    logger.info(
+        '  Write-ops prune loop: every %.0fs, each pass bounded by %.0fs / %d rows',
+        config.write_journal.prune_interval_seconds,
+        config.write_journal.prune_max_seconds,
+        config.write_journal.prune_max_rows_per_run,
+    )
+
     # Run transport
     transport = config.server.transport
     logger.info(f'Starting MCP server with transport: {transport}')
@@ -1352,6 +1358,9 @@ async def run_server():
             rebuild_summaries_task.cancel()
             with contextlib.suppress(BaseException):
                 await rebuild_summaries_task
+        write_ops_prune_task.cancel()
+        with contextlib.suppress(BaseException):
+            await write_ops_prune_task
         loop_lag_task.cancel()
         with contextlib.suppress(BaseException):
             await loop_lag_task
