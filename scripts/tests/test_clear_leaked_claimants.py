@@ -12,6 +12,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+from collections.abc import Callable
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -21,8 +22,13 @@ from _task_db_scan import UNREADABLE_STORE_ERRORS
 from clear_leaked_claimants import (
     STILL_VIOLATING_DETAIL,
     Bucket,
+    ExitCode,
     Tier,
     apply_repairs,
+    exit_code,
+    render_json,
+    render_text,
+    sweep,
     take_census,
 )
 from cli_subprocess_timeout import cli_timeout_from_env
@@ -262,12 +268,15 @@ class _FakeClaimantServer:
         self.error_replies: dict[int, dict] = {}
         self.raises: dict[int, Exception] = {}
         self.ack_without_write: set[int] = set()
+        self.concurrent_traffic: dict[int, Callable[[], None]] = {}
 
     async def call_tool(self, name: str, arguments: dict) -> dict:
         self.calls.append((name, dict(arguments)))
         if name != 'set_task_claimant':
             raise AssertionError(f'unexpected tool call: {name}')
         task_id = int(arguments['id'])
+        if task_id in self.concurrent_traffic:
+            self.concurrent_traffic.pop(task_id)()
         if task_id in self.raises:
             raise self.raises[task_id]
         if task_id in self.error_replies:
@@ -631,3 +640,128 @@ class TestHolderPreflight:
 
         assert report.refused is False
         assert server.written_ids() == TERMINAL_IDS
+
+
+def _sweep(roots, client, *, apply=True, tiers=TERMINAL_ONLY, clock=lambda: NOW):
+    return asyncio.run(sweep(roots, apply=apply, tiers=tiers, client=client, clock=clock))
+
+
+def _mixed_traffic_server(root: str) -> _FakeClaimantServer:
+    """101 is written first; while it is, 4028 is reclaimed and 9001 arrives. 5225 is rejected."""
+    server = _FakeClaimantServer()
+    server.concurrent_traffic[101] = lambda: (_reclaim_4028(root), _insert_arrival(root))
+    server.error_replies[5225] = {'error': 'boom', 'error_type': 'TaskmasterError'}
+    return server
+
+
+class TestApplyOutput:
+    def test_json_apply_section_after_a_clean_apply(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+
+        payload = json.loads(render_json(_sweep([root], _FakeClaimantServer())))
+
+        assert payload['mode'] == 'apply'
+        project = payload['projects'][0]
+        assert 4028 in {v['task_id'] for v in project['census']['violations']}
+        applied = project['apply']
+        assert applied['refused'] is False
+        assert applied['holder_intersection'] == []
+        assert applied['counts'] == {
+            'repaired': 3, 'skipped_changed_under_us': 0, 'arrived_during_window': 0, 'failed': 0,
+        }
+        assert {row['task_id'] for row in applied['buckets']['repaired']} == TERMINAL_IDS
+        assert all(set(row) == VIOLATION_JSON_KEYS for row in applied['buckets']['repaired'])
+        verification = applied['verification_census']
+        assert set(verification) == set(project['census'])
+        assert verification['totals']['by_tier']['terminal'] == 0
+
+    def test_json_skipped_rows_carry_their_delta_and_failed_rows_their_detail(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+
+        payload = json.loads(render_json(_sweep([root], _mixed_traffic_server(root))))
+
+        buckets = payload['projects'][0]['apply']['buckets']
+        (skipped,) = buckets['skipped_changed_under_us']
+        assert skipped['task_id'] == 4028
+        assert skipped['delta']['status'] == ['done', 'in-progress']
+        (failed,) = buckets['failed']
+        assert failed['task_id'] == 5225
+        assert 'TaskmasterError' in failed['detail']
+        assert [row['task_id'] for row in buckets['arrived_during_window']] == [9001]
+
+    def test_text_names_each_bucket_count_and_the_skipped_rows_delta(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+
+        text = render_text(_sweep([root], _mixed_traffic_server(root)))
+
+        tokens = text.split()
+        for count in ('repaired=1', 'skipped_changed_under_us=1', 'arrived_during_window=1', 'failed=1'):
+            assert count in tokens
+        (skipped_line,) = [
+            line for line in text.splitlines()
+            if 'task_id=4028' in line.split() and 'bucket=skipped_changed_under_us' in line.split()
+        ]
+        fields = {token.split('=', 1)[0] for token in skipped_line.split()}
+        assert {'delta.status', 'delta.claimant_run_id'} <= fields
+
+
+class TestExitCode:
+    def test_a_clean_apply_is_ok(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+
+        assert exit_code(_sweep([root], _FakeClaimantServer())) is ExitCode.OK
+
+    def test_skipped_and_arrived_rows_alone_are_ok(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        server = _FakeClaimantServer()
+        server.concurrent_traffic[101] = lambda: (_reclaim_4028(root), _insert_arrival(root))
+
+        assert exit_code(_sweep([root], server)) is ExitCode.OK
+
+    def test_any_failed_row_is_a_repair_failure(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+
+        assert exit_code(_sweep([root], _mixed_traffic_server(root))) is ExitCode.REPAIR_FAILED
+
+    def test_a_refused_project_is_a_holder_refusal(self, seed_root):
+        refused = seed_root(TIER_TABLE_ROWS, name='refused')
+        clean = seed_root(TIER_TABLE_ROWS, name='clean')
+        _write_scheduler_state(refused, _holders(orchestrator_src='4028'))
+
+        result = _sweep([refused, clean], _FakeClaimantServer())
+
+        assert exit_code(result) is ExitCode.HOLDER_REFUSED
+
+    def test_a_failed_row_outranks_a_refusal(self, seed_root):
+        refused = seed_root(TIER_TABLE_ROWS, name='refused')
+        failing = seed_root(TIER_TABLE_ROWS, name='failing')
+        _write_scheduler_state(refused, _holders(orchestrator_src='4028'))
+
+        result = _sweep([refused, failing], _mixed_traffic_server(failing))
+
+        assert exit_code(result) is ExitCode.REPAIR_FAILED
+
+    def test_every_root_unreadable_reads_nothing(self, tmp_path):
+        result = _sweep([str(tmp_path / 'missing')], _FakeClaimantServer())
+
+        assert exit_code(result) is ExitCode.NOTHING_READ
+
+    def test_a_dry_run_is_ok_whatever_it_found(self, seed_root):
+        result = _sweep([seed_root(TIER_TABLE_ROWS)], None, apply=False)
+
+        assert exit_code(result) is ExitCode.OK
+
+    def test_apply_without_a_client_is_refused_before_any_read(self, tmp_path):
+        with pytest.raises(ValueError):
+            _sweep([str(tmp_path / 'missing')], None)
+
+
+def test_apply_against_an_unreachable_server_exits_4_and_writes_nothing(seed_root):
+    root = seed_root(CLI_ROWS)
+    before = _store_rows(root)
+
+    result = _run_cli('--apply', '--project-root', root, '--server-url', _CLOSED_PORT_URL)
+
+    assert result.returncode == ExitCode.SERVER_UNREACHABLE
+    assert _CLOSED_PORT_URL in result.stderr
+    assert _store_rows(root) == before
