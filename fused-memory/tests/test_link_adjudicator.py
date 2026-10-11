@@ -14,6 +14,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 import pytest
+from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
 from shared.cli_invoke import AgentResult, no_mcp_servers_config
 from shared.neutral_cwd import neutral_cli_cwd
 
@@ -534,6 +535,35 @@ class TestConfiguredAdjudicator:
         assert len(ask.shards) == 2
         assert [storm['threshold'] for storm in storms] == [2]
         assert _failures(verdicts)[2:] == [AdjudicationFailure.NOT_ATTEMPTED] * 2
+
+
+class TestTheLiveEdgeCapacityGuard:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('banner', REAL_CLI_CAP_HIT_MESSAGES)
+    async def test_a_capacity_banner_skips_the_live_edge(self, banner):
+        invoke = FakeInvoke(AgentResult(success=False, output=banner))
+
+        with pytest.raises(pytest.skip.Exception, match=re.escape(banner)):
+            await _live_edge_verdict(invoke)
+
+    @pytest.mark.asyncio
+    async def test_an_auth_failure_is_not_skipped(self):
+        invoke = FakeInvoke(AgentResult(success=False, output='Not logged in · Please run /login'))
+
+        verdict = await _live_edge_verdict(invoke)
+
+        assert verdict.failed
+        assert verdict.failure is AdjudicationFailure.CLI_FAILED
+
+    @pytest.mark.asyncio
+    async def test_a_successful_reply_is_returned_as_is(self):
+        answer = {'verdicts': [{'id': 'p1', 'verdict': Verdict.SAME.value, 'reason': 'r'}]}
+        invoke = FakeInvoke(_ok(structured_output=answer))
+
+        verdict = await _live_edge_verdict(invoke)
+
+        assert not verdict.failed
+        assert verdict.verdict is Verdict.SAME
 
 
 @pytest.mark.integration
