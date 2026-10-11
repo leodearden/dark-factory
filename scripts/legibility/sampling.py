@@ -3,7 +3,7 @@
 
 Scores a session transcript's confusion signals with a single zero-token
 pass (:func:`score_signals`), classifies its agent class
-(:func:`classify_agent_class`), collapses near-duplicate shapes
+(:func:`detectors.classify_agent_class`), collapses near-duplicate shapes
 (:func:`shape_fingerprint` / :func:`dedupe_shapes`), and picks a
 budget-bounded, stratified subset for the nightly digest
 (:func:`stratified_sample`). :func:`main` wires
@@ -97,13 +97,15 @@ class SignalCounts(Mapping[detectors.SignalClass, int]):
 
 @dataclass(frozen=True)
 class TranscriptScan:
-    """What one read of a transcript yields: its signal counts, its first
-    non-sidechain, non-meta user turn, and the first ``sessionId`` any
-    record carries (the session string the digest frontmatter, and so
-    every coding record and ledger row, carries)."""
+    """What one read of a transcript yields: its signal counts, its agent
+    class, the text of its first non-sidechain, non-meta user turn ('' when
+    there is none), and the first ``sessionId`` any record carries (the
+    session string the digest frontmatter, and so every coding record and
+    ledger row, carries)."""
 
     counts: SignalCounts
-    first_turn: dict[str, Any] | None
+    agent_class: detectors.AgentClass
+    first_turn_text: str
     session_id: str | None
 
 
@@ -135,7 +137,7 @@ def scan_transcript(path: Path) -> TranscriptScan:
     try:
         records = list(iter_json_lines(path))
     except OSError:
-        return TranscriptScan(SignalCounts(), None, None)
+        return TranscriptScan(SignalCounts(), detectors.AgentClass.UNKNOWN, '', None)
 
     counts = dict.fromkeys(detectors.SignalClass, 0)
     for record in records:
@@ -143,19 +145,16 @@ def scan_transcript(path: Path) -> TranscriptScan:
         for signal in detectors.SignalClass:
             if hits.count(signal):
                 counts[signal] += 1
-    first_turn = next((
-        record for record in records
-        if record.get('type') == 'user'
-        and not record.get('isSidechain')
-        and not record.get('isMeta')
-    ), None)
+    first_turn = detectors.first_user_turn(records)
+    first_turn_text = detectors.user_turn_text(first_turn) if first_turn is not None else None
     session_id = next(
         (session_id for record in records if (session_id := _record_session_id(record))),
         None,
     )
     return TranscriptScan(
         SignalCounts(**{signal.value: count for signal, count in counts.items()}),
-        first_turn,
+        detectors.classify_agent_class(path, records),
+        first_turn_text or '',
         session_id,
     )
 
@@ -165,99 +164,12 @@ def score_signals(path: Path) -> SignalCounts:
     return scan_transcript(path).counts
 
 
-# ---------------------------------------------------------------------------
-# classify_agent_class — 5-stratum classifier (PRD §5.2 point 2)
-# ---------------------------------------------------------------------------
-
-STRATA: tuple[str, ...] = (
-    'recon', 'curator-classifier', 'watcher', 'orchestrated-task', 'interactive',
+STRATA: tuple[detectors.AgentClass, ...] = tuple(
+    agent_class for agent_class in detectors.AgentClass
+    if agent_class is not detectors.AgentClass.UNKNOWN
 )
-"""The 5 agent-class strata the sampler groups by."""
-
-_WORKTREE_DIR_MARKERS: tuple[str, ...] = (
-    '--worktrees-', '--claude-worktrees-',
-    # reify's warm-lane and build-worktree encoded-dir shapes (task 2612):
-    # encode_cwd (inventory.py) maps '/', '.' and '_' all to '-', so
-    # /home/leo/src/reify/.warm-lanes/worktrees/<id> and
-    # .../reify/build-worktrees/<id> never produce the double-dash
-    # '--worktrees-'/'--claude-worktrees-' form above.
-    # The two are deliberately asymmetric: 'build-worktrees' is a generic
-    # enough phrase that an unqualified '-build-worktrees-' marker could
-    # false-match an unrelated repo's own build/worktrees dir (e.g. a repo
-    # named '...-build'), so it's qualified with the repo name; whereas
-    # 'warm-lanes-worktrees' is distinctive enough on its own that no
-    # project qualifier is needed.
-    '-warm-lanes-worktrees-', '-reify-build-worktrees-',
-)
-
-_RECON_HEADER_PREFIXES: tuple[str, ...] = (
-    '## Reconciliation Run',
-    '## Stage 2: Task-Knowledge Sync',
-)
-_RECON_SUBSTRING_MARKERS: tuple[str, ...] = ('memory_consolidator',)
-
-_WATCHER_SUBSTRING_MARKERS: tuple[str, ...] = ('recon-escalation-watcher',)
-"""skills/recon-escalation-watcher — a real dark_factory skill/slash-command."""
-
-_CURATOR_CLASSIFIER_SUBSTRING_MARKERS: tuple[str, ...] = ('review suggestion classifier',)
-"""Verbatim opening of TRIAGE_SYSTEM_PROMPT
-(orchestrator/src/orchestrator/agents/triage.py:131), matched
-case-insensitively."""
-
-
-def _first_user_turn_text(record: dict[str, Any] | None) -> str:
-    """Flatten a first-non-sidechain-user-turn record's text content to a string.
-
-    *record* is the RAW transcript-line dict the caller already located
-    (this function does no file I/O); returns '' when *record* is None
-    (no such turn found) or carries no text content.
-    """
-    if record is None:
-        return ''
-    content = detectors.message_content(record)
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = [
-            block_text for block in content
-            if isinstance(block, dict) and block.get('type') == 'text'
-            and isinstance(block_text := block.get('text'), str)
-        ]
-        return '\n'.join(parts)
-    return ''
-
-
-def classify_agent_class(record: dict[str, Any] | None, path: Path) -> str:
-    """Classify a session's agent class (one of :data:`STRATA`).
-
-    Priority: *path*'s encoded-dir SHAPE is checked first — only its
-    parent directory's name is inspected, never any file content — an
-    orchestrated-worktree marker (dark_factory's ``--worktrees-``/
-    ``--claude-worktrees-``, or reify's ``-warm-lanes-worktrees-``/
-    ``-reify-build-worktrees-``; see :data:`_WORKTREE_DIR_MARKERS`) means
-    ``'orchestrated-task'`` and wins even over a recon-marker turn.
-    Otherwise, cheap content markers in *record* (the session's
-    already-located first non-sidechain, non-meta user turn) decide:
-    recon header / ``memory_consolidator`` -> ``'recon'``;
-    ``recon-escalation-watcher`` -> ``'watcher'``; the triage classifier's
-    system-prompt opening -> ``'curator-classifier'``. Falls back to
-    ``'interactive'`` — a main-dir freeform human turn, or no matching
-    user turn at all (*record* is None).
-    """
-    encoded_dir = path.parent.name
-    if any(marker in encoded_dir for marker in _WORKTREE_DIR_MARKERS):
-        return 'orchestrated-task'
-
-    text = _first_user_turn_text(record)
-    if text.startswith(_RECON_HEADER_PREFIXES) or any(
-        marker in text for marker in _RECON_SUBSTRING_MARKERS
-    ):
-        return 'recon'
-    if any(marker in text for marker in _WATCHER_SUBSTRING_MARKERS):
-        return 'watcher'
-    if any(marker in text.lower() for marker in _CURATOR_CLASSIFIER_SUBSTRING_MARKERS):
-        return 'curator-classifier'
-    return 'interactive'
+"""The agent-class strata the sampler groups by. UNKNOWN is an empty
+transcript, which carries no signal and never passes the zero-signal gate."""
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +185,7 @@ class ScoredRecord:
     """
 
     session: SessionRecord
-    stratum: str
+    stratum: detectors.AgentClass
     counts: SignalCounts
     first_turn_text: str = ''
     session_id: str | None = None
@@ -296,9 +208,9 @@ def score_session(session: SessionRecord) -> ScoredRecord:
     scan = scan_transcript(session.path)
     return ScoredRecord(
         session=session,
-        stratum=classify_agent_class(scan.first_turn, session.path),
+        stratum=scan.agent_class,
         counts=scan.counts,
-        first_turn_text=_first_user_turn_text(scan.first_turn),
+        first_turn_text=scan.first_turn_text,
         session_id=scan.session_id,
     )
 
@@ -830,17 +742,6 @@ def format_sample_summary_line(result: SampleResult, *, max_bytes: int) -> str:
         f'selected={len(result.selected)} '
         f'bytes_used={result.bytes_used}/{max_bytes}'
     )
-
-
-def _find_first_user_turn(path: Path) -> dict[str, Any] | None:
-    """Find a session's first non-sidechain, non-meta user-turn record.
-
-    Returns the raw record dict (as :func:`classify_agent_class` expects),
-    or None if the transcript has no such turn. Malformed/unreadable input
-    degrades to None rather than raising. The first turn of
-    :func:`scan_transcript`.
-    """
-    return scan_transcript(path).first_turn
 
 
 def main(argv: Sequence[str]) -> int:

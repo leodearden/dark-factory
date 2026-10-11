@@ -42,10 +42,10 @@ from legibility.detectors import (  # noqa: E402
     ErrorHit,
     RecordHits,
     SignalClass,
+    classify_agent_class,
     error_hits,
     is_non_dialogue_carrier,
     message_content,
-    raw_carriers,
     record_hits,
     user_turn_text,
 )
@@ -462,70 +462,6 @@ def score_signals(counts: Mapping[str, int], n_user_turns: int) -> float:
     for signal, weight in SIGNAL_WEIGHTS.items():
         score += weight * counts.get(signal, 0)
     return score
-
-
-ORCHESTRATED_TASK_MARKERS: tuple[str, ...] = ('task id:', 'worktree:')
-"""Injected task-briefing preamble literal
-(orchestrator/src/orchestrator/dry_run_unblock.py: f'Task ID: {task_id}\\n'
-f'Worktree: {worktree}\\n'). Both markers must co-occur (matched via
-all(), not any()) since they are the two lines of a single injected
-preamble -- a lone incidental mention of one marker (e.g. bare 'Worktree:'
-prose in an ordinary interactive session) must not alone trigger this
-classification."""
-
-RECON_MARKERS: tuple[str, ...] = ('operating in sleep mode',)
-"""Phrase shared by all three reconciliation stage system prompts
-(fused_memory/reconciliation/prompts/stage{1,2,3}.py: Memory Consolidator /
-Task-Knowledge Sync / Integrity Check agents are each described as
-"operating in sleep mode")."""
-
-WATCHER_MARKERS: tuple[str, ...] = ('escalation-watcher-auto',)
-"""The canonical auto-watcher identity string
-(escalation/src/escalation/authority.py: _WATCHER_AUTO_IDENTITY =
-'orchestrator-escalation-watcher-auto')."""
-
-CURATOR_CLASSIFIER_MARKERS: tuple[str, ...] = (
-    'task curator for the dark-factory orchestrator',
-    'code module classifier',
-)
-"""Literal system-prompt fragments for the task curator
-(fused_memory/src/fused_memory/middleware/task_curator.py) and the
-code-module classifier (orchestrator/src/orchestrator/harness.py)."""
-
-def classify_agent_class(
-    records: list[dict[str, Any]], override: str | None = None,
-) -> str:
-    """Best-effort agent-class classification from transcript markers.
-
-    A caller-supplied *override* (e.g. the CLI ``--agent-class`` flag, or
-    the authoritative class beta already computed) always wins, verbatim --
-    alpha never guesses when the caller already knows. Otherwise: a
-    genuinely empty transcript classifies as 'unknown'; a non-empty
-    transcript with no marker match falls back to 'interactive'.
-
-    Unlike every signal detector, it reads the RAW carriers
-    (:func:`detectors.raw_carriers`), never the dialogue-filtered ones: it
-    classifies BY injected markers, so filtering them out would delete its
-    own evidence.
-    """
-    if override is not None:
-        return override
-    if not records:
-        return 'unknown'
-
-    haystack = '\n'.join(
-        text for record in records for _, text in raw_carriers(record)
-    ).lower()
-
-    if all(marker in haystack for marker in ORCHESTRATED_TASK_MARKERS):
-        return 'orchestrated-task'
-    if any(marker in haystack for marker in RECON_MARKERS):
-        return 'recon'
-    if any(marker in haystack for marker in WATCHER_MARKERS):
-        return 'watcher'
-    if any(marker in haystack for marker in CURATOR_CLASSIFIER_MARKERS):
-        return 'curator-classifier'
-    return 'interactive'
 
 
 def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1259,7 +1195,7 @@ def render_digest(
     non-empty signal class (PRD Sec 7.2), soft-capped at *max_bytes*.
 
     *agent_class* is the caller's already-resolved class (typically
-    :func:`classify_agent_class`'s result) -- render_digest never
+    :func:`detectors.classify_agent_class`'s result) -- render_digest never
     classifies on its own. *path*, when given, sources ``encoded_dir``
     from the transcript file's real parent dir name; otherwise it falls
     back to mirror-encoding the derived ``cwd`` (see
@@ -1307,12 +1243,15 @@ def build_digest(
     classify, render. This is the headline entry point (PRD Sec 8.1
     boundary test, producer side) -- what beta/delta and :func:`main` call.
 
-    *agent_class_override*, when given, is passed straight through to
-    :func:`classify_agent_class` (e.g. beta's already-authoritative class);
-    otherwise alpha's best-effort marker heuristics decide.
+    *agent_class_override*, when given, is rendered verbatim (e.g. beta's
+    already-authoritative stratum); otherwise
+    :func:`detectors.classify_agent_class` decides.
     """
     records = load_transcript(path)
-    agent_class = classify_agent_class(records, override=agent_class_override)
+    agent_class = (
+        agent_class_override if agent_class_override is not None
+        else classify_agent_class(Path(path), records)
+    )
     return render_digest(records, agent_class=agent_class, path=path, max_bytes=max_bytes)
 
 
@@ -1336,7 +1275,7 @@ def main(argv: Sequence[str]) -> int:
     parser.add_argument('transcript', help='Path to a Claude Code session transcript JSONL file')
     parser.add_argument(
         '--agent-class', dest='agent_class', default=None,
-        help="Override alpha's best-effort agent_class classification",
+        help='Render this agent_class instead of classifying the transcript',
     )
     parser.add_argument(
         '--max-bytes', type=int, default=15360,

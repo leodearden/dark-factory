@@ -3,17 +3,18 @@
 One record in, one :class:`RecordHits` out (:func:`record_hits`): which of
 the record's native carriers count as this session's own dialogue, which
 pattern of which signal class each one holds, and what every structured
-error in it means. Both readers reduce these hits, so a session's signal
-classes cannot disagree between the sampler's ranking and the digest's
-frontmatter (plans/confusion-reduction-prd.md §7.2.4). Imports only
-:mod:`legibility.reingestion`.
+error in it means. Both readers reduce these hits, and both take a
+session's agent class from :func:`classify_agent_class`, so neither can
+disagree with the other (plans/confusion-reduction-prd.md §7.2.4). Imports
+only :mod:`legibility.reingestion`.
 """
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 
 from legibility.reingestion import has_non_human_origin, is_reingested_content
@@ -89,7 +90,7 @@ def _flatten_content(content: Any) -> str:
     return ''
 
 
-def raw_carriers(record: Mapping[str, Any]) -> Iterator[tuple[CarrierKind, str]]:
+def _raw_carriers(record: Mapping[str, Any]) -> Iterator[tuple[CarrierKind, str]]:
     """Yield *record*'s native text carriers, unfiltered, in block order.
 
     A user record yields each tool_result block's flattened content and then,
@@ -474,7 +475,7 @@ def record_hits(record: Mapping[str, Any]) -> RecordHits:
     reads its kind matches its patterns there, one hit per pattern found.
     """
     found: dict[SignalClass, list[PatternHit]] = {signal: [] for signal in TEXT_SIGNALS}
-    for carrier, text in raw_carriers(record):
+    for carrier, text in _raw_carriers(record):
         if is_non_dialogue_carrier(record, text):
             continue
         stripped = _strip_decoy_lines(text)
@@ -490,3 +491,104 @@ def record_hits(record: Mapping[str, Any]) -> RecordHits:
         patterns={signal: tuple(hits) for signal, hits in found.items()},
         errors=error_hits(record),
     )
+
+
+class AgentClass(StrEnum):
+    """The sampler's five strata, plus UNKNOWN for an empty transcript."""
+
+    RECON = 'recon'
+    CURATOR_CLASSIFIER = 'curator-classifier'
+    WATCHER = 'watcher'
+    ORCHESTRATED_TASK = 'orchestrated-task'
+    INTERACTIVE = 'interactive'
+    UNKNOWN = 'unknown'
+
+
+WORKTREE_DIR_MARKERS: tuple[str, ...] = (
+    '--worktrees-', '--claude-worktrees-', '-warm-lanes-worktrees-', '-reify-build-worktrees-',
+)
+"""Encoded-dir substrings of an orchestrated worktree. 'build-worktrees' is a
+generic phrase, so it is qualified with reify's name; 'warm-lanes-worktrees'
+is distinctive on its own."""
+
+
+@dataclass(frozen=True)
+class AgentMarker:
+    """Lowercase literals that mark *agent_class*: any one of them, or all of
+    them together when *require_all*."""
+
+    agent_class: AgentClass
+    literals: tuple[str, ...]
+    require_all: bool = False
+
+    def matches(self, lowered: str) -> bool:
+        found = (literal in lowered for literal in self.literals)
+        return all(found) if self.require_all else any(found)
+
+
+AGENT_CLASS_MARKERS: tuple[AgentMarker, ...] = (
+    # orchestrator/src/orchestrator/dry_run_unblock.py injects the
+    # 'Task ID: {task_id}' / 'Worktree: {worktree}' preamble; its two lines
+    # must co-occur, since a bare 'Worktree:' is ordinary prose here.
+    AgentMarker(AgentClass.ORCHESTRATED_TASK, ('task id:', 'worktree:'), require_all=True),
+    # fused_memory/reconciliation/prompts/stage{1,2,3}.py all say 'operating
+    # in sleep mode'; the run headers and memory_consolidator open recon runs.
+    AgentMarker(AgentClass.RECON, (
+        'operating in sleep mode', '## reconciliation run', '## stage 2: task-knowledge sync',
+        'memory_consolidator',
+    )),
+    # escalation/src/escalation/authority.py::_WATCHER_AUTO_IDENTITY, and the
+    # skills/recon-escalation-watcher slash command.
+    AgentMarker(AgentClass.WATCHER, ('escalation-watcher-auto', 'recon-escalation-watcher')),
+    # fused_memory/middleware/task_curator.py's system prompt, the code-module
+    # classifier in orchestrator/src/orchestrator/harness.py, and
+    # orchestrator/src/orchestrator/agents/triage.py::TRIAGE_SYSTEM_PROMPT.
+    AgentMarker(AgentClass.CURATOR_CLASSIFIER, (
+        'task curator for the dark-factory orchestrator', 'code module classifier',
+        'review suggestion classifier',
+    )),
+)
+"""The one agent-class marker table, in precedence order."""
+
+
+def is_primary_user_turn(record: Mapping[str, Any]) -> bool:
+    """A user turn of the session itself: not a sidechain, not an isMeta injection."""
+    return (
+        record.get('type') == 'user'
+        and not record.get('isSidechain')
+        and not record.get('isMeta')
+    )
+
+
+def first_user_turn(records: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
+    return next((record for record in records if is_primary_user_turn(record)), None)
+
+
+def _marked_class(lowered: str) -> AgentClass | None:
+    return next(
+        (marker.agent_class for marker in AGENT_CLASS_MARKERS if marker.matches(lowered)),
+        None,
+    )
+
+
+def classify_agent_class(path: Path, records: Sequence[Mapping[str, Any]]) -> AgentClass:
+    """The session's agent class.
+
+    In order: an empty transcript is UNKNOWN; a worktree encoded dir (the
+    parent of *path*) is ORCHESTRATED_TASK; then the marker table over the
+    raw first user turn, then over every raw carrier. The carriers are read
+    unfiltered on purpose: the class is decided BY injected markers, which
+    the dialogue filter exists to drop. No marker is INTERACTIVE.
+    """
+    if not records:
+        return AgentClass.UNKNOWN
+    if any(marker in path.parent.name for marker in WORKTREE_DIR_MARKERS):
+        return AgentClass.ORCHESTRATED_TASK
+    first = first_user_turn(records)
+    first_text = user_turn_text(first) if first is not None else None
+    marked = _marked_class((first_text or '').lower())
+    if marked is None:
+        marked = _marked_class('\n'.join(
+            text for record in records for _, text in _raw_carriers(record)
+        ).lower())
+    return AgentClass.INTERACTIVE if marked is None else marked

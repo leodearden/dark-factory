@@ -652,7 +652,7 @@ def _scored(session_id, stratum, counts, first_turn_text, size_bytes=1000):
         size_bytes=size_bytes,
     )
     return mod.ScoredRecord(
-        session=session, stratum=stratum, counts=counts, first_turn_text=first_turn_text
+        session=session, stratum=AgentClass(stratum), counts=counts, first_turn_text=first_turn_text
     )
 
 
@@ -1574,7 +1574,7 @@ class TestDigestByteCostFn:
             date=dt_date(2026, 7, 13), size_bytes=path.stat().st_size,
         )
         record = mod.ScoredRecord(
-            session=session, stratum='interactive',
+            session=session, stratum=AgentClass.INTERACTIVE,
             counts=mod.SignalCounts(tool_error=1), first_turn_text='Please help with the thing',
         )
 
