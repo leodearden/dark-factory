@@ -251,6 +251,35 @@ class TestFlagAssertsStranded:
         }
         assert flag_asserts_stranded(flag) is False
 
+    @pytest.mark.parametrize('shape', ['realistic', 'reverse_split'])
+    def test_verb_and_target_split_across_fields_matches(self, shape):
+        """The action channel reads description and suggested_action TOGETHER.
+
+        Real findings state the status in description and ask for the reset in
+        suggested_action, so a novel naming must still match on that shape.
+        """
+        flag_type = 'liveness_anomaly_unattended_workflow'
+        flag = {
+            'realistic': _stranded_flag(flag_type=flag_type),
+            'reverse_split': {
+                'task_id': '3105',
+                'flag_type': flag_type,
+                'description': 'Task 3105 should be reset; nothing is driving it.',
+                'suggested_action': 'Move task 3105 out of in-progress.',
+            },
+        }[shape]
+        assert flag_asserts_stranded(flag) is True
+
+    def test_a_status_mention_without_a_reset_verb_does_not_match(self):
+        """The verb half stays required when the match spans both fields."""
+        flag = {
+            'task_id': '3105',
+            'flag_type': 'missing_deliverable',
+            'description': 'Task 3105 is in-progress; its acceptance criteria lack a deliverable.',
+            'suggested_action': 'Add the missing deliverable to task 3105.',
+        }
+        assert flag_asserts_stranded(flag) is False
+
     @pytest.mark.parametrize('flag_type', UNRELATED_LIVE_FLAG_TYPES)
     def test_unrelated_live_flag_types_do_not_match(self, flag_type):
         """Behavioural distinctiveness guard, run against the live vocabulary.
