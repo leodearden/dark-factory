@@ -68,17 +68,17 @@ logger = logging.getLogger('legibility.nightly')
 
 
 # ---------------------------------------------------------------------------
-# resolve_config_path — map a bare project_id to its legibility.yaml
+# resolve_config / resolve_config_path — map a bare project_id to its legibility.yaml
 # ---------------------------------------------------------------------------
 
 def _default_search_roots() -> list[Path]:
-    """Default search roots for :func:`resolve_config_path`.
+    """Default search roots for :func:`resolve_config`.
 
     Env ``LEGIBILITY_SEARCH_ROOTS`` (``os.pathsep``-split) if set, else the
     dark-factory repo's own parent directory -- mirrors
     ``skills/factory-init/scripts/find_escalation_port.known_project_roots``'s
     sibling-repos-under-``/home/leo/src`` convention. Each returned path is a
-    PARENT directory: :func:`resolve_config_path` globs one level down for
+    PARENT directory: :func:`resolve_config` globs one level down for
     candidate project roots, it is not itself a project root.
     """
     env_value = os.environ.get('LEGIBILITY_SEARCH_ROOTS')
@@ -91,7 +91,17 @@ def _default_search_roots() -> list[Path]:
 def resolve_config_path(
     project_id: str, search_roots: Sequence[str | Path] | None = None,
 ) -> Path:
-    """Resolve *project_id* to its ``docs/legibility/legibility.yaml`` path.
+    """Resolve *project_id* to its ``docs/legibility/legibility.yaml`` path
+    (:func:`resolve_config`, without the config it loaded on the way)."""
+    path, _cfg = resolve_config(project_id, search_roots)
+    return path
+
+
+def resolve_config(
+    project_id: str, search_roots: Sequence[str | Path] | None = None,
+) -> tuple[Path, LegibilityConfig]:
+    """Resolve *project_id* to its ``docs/legibility/legibility.yaml`` path
+    and the config loaded from it.
 
     *search_roots* (default: :func:`_default_search_roots`) is a list of
     PARENT directories; each is globbed one level down for candidate
@@ -121,7 +131,7 @@ def resolve_config_path(
             except Exception:
                 continue
             if cfg.project_id == project_id:
-                return config_path
+                return config_path, cfg
     raise FileNotFoundError(
         f'no legibility.yaml found for project_id={project_id!r} under '
         f'search roots {[str(r) for r in roots]!r}'
@@ -1320,7 +1330,7 @@ def run_nightly(
     """Run one full nightly trickle pass for a single project (PRD §5.5).
 
     *config_path* (preferred) or *project_id* (resolved via
-    :func:`resolve_config_path`) selects the project -- exactly one of the
+    :func:`resolve_config`) selects the project -- exactly one of the
     two is expected to identify it, mirroring the ``nightly.py run`` CLI's
     ``--config``/``--project-id`` pair. *target_date* defaults to
     yesterday UTC; *projects_root* defaults to ``~/.claude/projects``.
@@ -1392,11 +1402,10 @@ def run_nightly(
 def _load_config_for_project(
     project_id: str, target_date: date, *, recorder, now: datetime | None,
 ) -> tuple[Path, LegibilityConfig]:
-    """Resolve and load *project_id*'s config, recording a failed night for
-    *project_id* before re-raising when either step fails."""
+    """Resolve *project_id*'s config (:func:`resolve_config`), recording a
+    failed night for *project_id* before re-raising when none resolves."""
     try:
-        path = resolve_config_path(project_id)
-        return path, load_config(path)
+        return resolve_config(project_id)
     except Exception:
         _record_run_state(
             project_id, _nothing_sampled(), target_date, NightlyResult(exit_code=1),

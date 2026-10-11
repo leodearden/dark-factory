@@ -42,6 +42,7 @@ from legibility import (
     config as config_mod,
 )
 from legibility.config import TrickleCensusCaps, load_config
+from pydantic import ValidationError
 from quality_doc_texts import definition_body, heuristic_headlines
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
 
@@ -2136,6 +2137,16 @@ def test_resolve_config_path_matches_by_project_id_field(tmp_path):
     assert resolved == config_a
 
 
+def test_resolve_config_returns_the_matched_path_with_its_loaded_config(tmp_path):
+    config_a = _write_config(tmp_path / "proj-a", project_id="proj_a")
+    _write_config(tmp_path / "proj-b", project_id="proj_b")
+
+    path, cfg = nightly.resolve_config("proj_a", search_roots=[tmp_path])
+
+    assert path == config_a
+    assert cfg == load_config(config_a)
+
+
 def test_resolve_config_path_unknown_id_raises(tmp_path):
     _write_config(tmp_path / "proj-a", project_id="proj_a")
 
@@ -3750,6 +3761,15 @@ def _recorder_spy():
     return _record, calls
 
 
+def _write_unloadable_config(root: Path, *, project_id: str) -> Path:
+    """Write *project_id*'s legibility.yaml under *root* with a budget that
+    fails validation, so ``load_config`` raises on it."""
+    config_path = _write_config(root, project_id=project_id)
+    with config_path.open('a', encoding='utf-8') as fh:
+        fh.write('budgets:\n  max_daily_digest_bytes: lots\n')
+    return config_path
+
+
 def _one_recorded(calls):
     assert len(calls) == 1, (
         f'expected exactly ONE recorder call, got {len(calls)}: '
@@ -3828,8 +3848,6 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
         )
     else:
         projects_root.mkdir(parents=True, exist_ok=True)
-    if unreadable_transcripts:
-        projects_root.chmod(0)
 
     # Annotated: a heterogeneous dict (Paths, a date, a datetime, injected
     # callables, None) whose inferred value union would otherwise be
@@ -3866,6 +3884,8 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
         raise AssertionError(f'unknown decision-8 branch {branch!r}')
 
     try:
+        if unreadable_transcripts:
+            projects_root.chmod(0)
         return nightly.run_nightly(**kwargs), repo
     finally:
         projects_root.chmod(0o755)
@@ -4062,12 +4082,10 @@ class TestRunNightlyRecordsTrickleState:
             'sampling never returned, so nothing was counted'
         )
 
-    def test_an_unloadable_config_under_project_id_records_a_failed_night_then_raises(
+    def test_a_project_id_with_no_loadable_config_records_a_failed_night_then_raises(
         self, tmp_path, monkeypatch,
     ):
-        config_path = _write_config(tmp_path / 'proj', project_id='testproj')
-        with config_path.open('a', encoding='utf-8') as fh:
-            fh.write('budgets:\n  max_daily_digest_bytes: lots\n')
+        _write_unloadable_config(tmp_path / 'proj', project_id='testproj')
         monkeypatch.setenv('LEGIBILITY_SEARCH_ROOTS', str(tmp_path))
         recorder, calls = _recorder_spy()
 
@@ -4084,6 +4102,18 @@ class TestRunNightlyRecordsTrickleState:
         assert doc['target_date'] == '2026-07-13'
         assert doc['consecutive_failed_runs'] == 1
         assert set(doc['counters'].values()) == {0}
+
+    def test_an_unloadable_config_path_raises_without_recording(self, tmp_path):
+        config_path = _write_unloadable_config(tmp_path / 'proj', project_id='testproj')
+        recorder, calls = _recorder_spy()
+
+        with pytest.raises(ValidationError):
+            nightly.run_nightly(
+                config_path=config_path, target_date=date(2026, 7, 13),
+                now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC), recorder=recorder,
+            )
+
+        assert calls == []
 
     def test_a_codebook_dump_failure_escalates_instead_of_escaping(
         self, tmp_path, monkeypatch,
