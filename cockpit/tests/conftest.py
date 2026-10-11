@@ -1,4 +1,4 @@
-"""pytest configuration for the cockpit suite — suite-wide git isolation.
+"""pytest configuration for the cockpit suite — git isolation and the Hypothesis settings profile.
 
 This subproject has no git-invoking test today.  It is wired anyway: task 3355
 exists to close a defect CLASS, not today's instances, and the anti-drift guard
@@ -11,6 +11,8 @@ conftests hierarchically, so the smoke suite inherits everything below.
 """
 import sys
 from pathlib import Path
+
+from hypothesis import settings
 
 # Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
 # runs `cd cockpit && uv run pytest tests/`, which makes rootdir the SUBPROJECT —
@@ -33,3 +35,8 @@ from df_pytest_isolation import (  # noqa: E402
 def pytest_configure(config):
     """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3)."""
     reject_unsafe_basetemp(config)
+
+
+# The stock 200ms deadline measures host load, not these pure-arithmetic properties (esc-5449-2).
+settings.register_profile("cockpit", deadline=None)
+settings.load_profile("cockpit")

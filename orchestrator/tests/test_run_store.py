@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, datetime
 
 import pytest
 
@@ -596,6 +597,73 @@ class TestSchedulerStatePersistence:
         assert result is None, (
             f'Expected None after clear, got {result!r}'
         )
+
+
+class TestMainSweepColdVerdictLedger:
+    """task 5812: the last COLD main-tip sweep verdict, restart-durable in runs.db."""
+
+    def test_load_returns_none_when_unset(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        assert store.load_main_sweep_last_cold_verdict('proj-a') is None
+
+    def test_save_then_load_round_trips_an_aware_utc_datetime(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        verdict_at = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
+
+        store.save_main_sweep_cold_verdict(
+            'proj-a', verdict_at=verdict_at, swept_sha='a' * 40,
+        )
+
+        loaded = store.load_main_sweep_last_cold_verdict('proj-a')
+        assert loaded == verdict_at
+        assert loaded is not None and loaded.tzinfo is not None
+
+    def test_save_is_last_wins_upsert(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        first = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
+        second = datetime(2026, 9, 24, 12, 0, tzinfo=UTC)
+
+        store.save_main_sweep_cold_verdict('proj-a', verdict_at=first, swept_sha='a' * 40)
+        store.save_main_sweep_cold_verdict('proj-a', verdict_at=second, swept_sha='b' * 40)
+
+        assert store.load_main_sweep_last_cold_verdict('proj-a') == second
+
+    def test_projects_are_isolated(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        store.save_main_sweep_cold_verdict(
+            'proj-a', verdict_at=datetime(2026, 9, 23, tzinfo=UTC), swept_sha='a' * 40,
+        )
+        assert store.load_main_sweep_last_cold_verdict('proj-b') is None
+
+    def test_survives_reopen(self, tmp_path):
+        """The restart property: a NEW RunStore on the same file reads it back."""
+        db_path = tmp_path / 'runs.db'
+        verdict_at = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
+        RunStore(db_path).save_main_sweep_cold_verdict(
+            'proj-a', verdict_at=verdict_at, swept_sha='a' * 40,
+        )
+
+        assert RunStore(db_path).load_main_sweep_last_cold_verdict('proj-a') == verdict_at
+
+    def test_existing_runs_db_without_the_table_gains_it(self, tmp_path):
+        db_path = tmp_path / 'runs.db'
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                'CREATE TABLE runs (run_id TEXT PRIMARY KEY, project_id TEXT NOT NULL,'
+                ' started_at TEXT NOT NULL)'
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        store = RunStore(db_path)
+        verdict_at = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
+
+        store.save_main_sweep_cold_verdict(
+            'proj-a', verdict_at=verdict_at, swept_sha='a' * 40,
+        )
+
+        assert store.load_main_sweep_last_cold_verdict('proj-a') == verdict_at
 
 
 # ---------------------------------------------------------------------------

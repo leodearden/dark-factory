@@ -261,9 +261,8 @@ class TestAbandonedOracleRegistry:
         ``_ABANDONED_ORACLES`` until it finishes, then released — whether it
         cancels cleanly or its cleanup raises during unwinding. A registry
         that only ever grows is itself a leak, so both terminal shapes are
-        parametrized to force the drain to sit at the head of the
-        done-callback, outside its ``try``, rather than only on the
-        cancelled branch.
+        parametrized: the release must happen for each of them, not only
+        for a clean cancel.
         """
         from orchestrator.merge_skew_tripwire import _run_load_bearing_oracle
 

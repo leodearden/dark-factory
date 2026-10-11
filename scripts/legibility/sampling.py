@@ -7,24 +7,12 @@ pass (:func:`score_signals`), classifies its agent class
 (:func:`shape_fingerprint` / :func:`dedupe_shapes`), and picks a
 budget-bounded, stratified subset for the nightly digest
 (:func:`stratified_sample`). :func:`main` wires
-``config.load_config -> inventory.enumerate_sessions -> score_signals ->
-classify_agent_class -> stratified_sample -> render_manifest`` into the
-CLI acceptance surface.
+``config.load_config -> inventory.enumerate_sessions -> score_session ->
+stratified_sample -> render_manifest`` into the CLI acceptance surface.
 
 Task β of the confusion-reduction PRD (plans/confusion-reduction-prd.md
-§5.2, contract §7.4). It owns its own signal-scoring primitives, reusing
-only the low-level JSONL-line iterator
-(:func:`legibility.inventory.iter_json_lines`) from its own sibling
-module rather than duplicating it.
-
-This module was originally "self-contained — does not import task α's
-``digest.py``". That is now deliberately relaxed for exactly one reason:
-``budgets.max_daily_digest_bytes`` is a DIGEST-OUTPUT budget, and charging
-a record's real cost against it means knowing how big its digest will be,
-which only the digest renderer can answer (:func:`digest_byte_cost_fn`).
-The signal-scoring primitives remain unshared; the dependency is on
-α's renderer alone, and it is one-directional (``digest.py`` imports
-nothing from ``legibility.*``, so there is no cycle).
+§5.2, contract §7.4). Its pattern tables and carrier extraction are its
+own; what it takes from ``digest.py``, and why, is PRD §7.2.3.
 """
 from __future__ import annotations
 
@@ -125,49 +113,75 @@ def _message_content(record: dict[str, Any]) -> Any:
     return message.get('content')
 
 
-def _record_text(record: dict[str, Any]) -> str:
-    """Flatten a record's message.content into one lowercased text blob.
+@dataclass(frozen=True)
+class _Carrier:
+    """One raw text carrier from a record's message.content."""
 
-    ``content`` is either a plain string or a list of content blocks; each
-    block contributes its 'text' field (assistant/user text, thinking) and
-    its 'content' field (tool_result output, itself sometimes a string).
-    Used for the plain substring-scan classes (not_found, df_guard text
-    patterns, interrupt) — never for self_correct, which is scoped to
-    assistant text blocks only via :func:`_assistant_text`.
+    text: str
+    is_assistant_text: bool
+    """An assistant 'text' block: the only carrier self_correct reads."""
+
+
+def _record_carriers(record: dict[str, Any]) -> list[_Carrier]:
+    """Every raw text carrier in a record's message.content, cut where the
+    digest cuts its carriers, so the shared predicate judges the same strings.
+
+    ``content`` is either a plain string, which is one carrier, or a list of
+    content blocks. In a list, each block's 'text' field (assistant text,
+    thinking) and its string 'content' field (tool_result output) are
+    separate carriers, except that a user record's 'text' blocks join into
+    ONE carrier, its turn text, as digest.py::_user_turn_text joins them.
     """
     content = _message_content(record)
     if isinstance(content, str):
-        return content.lower()
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            text = block.get('text')
-            if isinstance(text, str):
-                parts.append(text)
-            block_content = block.get('content')
-            if isinstance(block_content, str):
-                parts.append(block_content)
-        return '\n'.join(parts).lower()
-    return ''
-
-
-def _assistant_text(record: dict[str, Any]) -> str:
-    """Flatten only assistant 'text' content blocks (native-carrier scoping)."""
-    if record.get('type') != 'assistant':
-        return ''
-    content = _message_content(record)
+        return [_Carrier(content, is_assistant_text=False)]
     if not isinstance(content, list):
-        return ''
-    # Walrus-bound so the isinstance narrowing reaches the element expression;
-    # see the note in digest.py's _first_text_block. Filtering is unchanged.
-    parts = [
-        block_text for block in content
-        if isinstance(block, dict) and block.get('type') == 'text'
-        and isinstance(block_text := block.get('text'), str)
+        return []
+    record_type = record.get('type')
+    carriers = []
+    turn_texts = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        text = block.get('text')
+        if isinstance(text, str):
+            is_text_block = block.get('type') == 'text'
+            if record_type == 'user' and is_text_block:
+                turn_texts.append(text)
+            else:
+                carriers.append(_Carrier(text, record_type == 'assistant' and is_text_block))
+        block_content = block.get('content')
+        if isinstance(block_content, str):
+            carriers.append(_Carrier(block_content, is_assistant_text=False))
+    if turn_texts:
+        carriers.append(_Carrier('\n'.join(turn_texts), is_assistant_text=False))
+    return carriers
+
+
+@dataclass(frozen=True)
+class _DialogueText:
+    """A record's dialogue carriers, lowercased and joined for the
+    substring scans. A carrier is dialogue unless
+    :func:`digest.is_non_dialogue_carrier` rejects it, and each carrier is
+    asked exactly once."""
+
+    whole: str
+    """Every dialogue carrier: not_found, interrupt, the df_guard text patterns."""
+    assistant: str
+    """Assistant 'text' blocks only (native-carrier scoping): self_correct."""
+
+
+def _dialogue_text(record: dict[str, Any]) -> _DialogueText:
+    kept = [
+        carrier for carrier in _record_carriers(record)
+        if not digest.is_non_dialogue_carrier(record, carrier.text)
     ]
-    return '\n'.join(parts).lower()
+    return _DialogueText(
+        whole='\n'.join(carrier.text for carrier in kept).lower(),
+        assistant='\n'.join(
+            carrier.text for carrier in kept if carrier.is_assistant_text
+        ).lower(),
+    )
 
 
 def _classify_tool_errors(record: dict[str, Any]) -> tuple[bool, bool]:
@@ -266,25 +280,47 @@ class SignalCounts:
         )
 
 
-def _score_and_find_first_turn(path: Path) -> tuple[SignalCounts, dict[str, Any] | None]:
-    """Single pass over *path*, producing both a signal score and the first user turn.
+@dataclass(frozen=True)
+class TranscriptScan:
+    """What one read of a transcript yields: its signal counts, its first
+    non-sidechain, non-meta user turn, and the first ``sessionId`` any
+    record carries (the session string the digest frontmatter, and so
+    every coding record and ledger row, carries)."""
 
-    :func:`score_signals` already has to read every record in *path* (a
-    confusion signal can occur anywhere in the file); :func:`main`'s
-    scoring loop separately called :func:`_find_first_user_turn` on the
-    same path, re-opening and re-parsing the same transcript purely to
-    locate its first non-sidechain, non-meta user turn
-    (reviewer_comprehensive/performance, task 2573 amendment pass #2).
-    This helper folds both searches into the SAME iteration over
-    :func:`legibility.inventory.iter_json_lines`, so a session transcript
-    is read once instead of twice. :func:`score_signals` and
-    :func:`_find_first_user_turn` both delegate to this function, so every
-    other caller (including the direct unit tests of :func:`score_signals`)
-    keeps its existing single-purpose signature and exact return value.
+    counts: SignalCounts
+    first_turn: dict[str, Any] | None
+    session_id: str | None
+
+
+def _record_session_id(record: dict[str, Any]) -> str | None:
+    return record.get('sessionId') or None
+
+
+def peek_session_id(path: Path) -> str | None:
+    """The ``session_id`` :func:`scan_transcript` reports for *path*, read
+    only as far as the first record that carries one, so a caller can
+    cheaply skip a session it already holds before paying for a full scan.
+    Unreadable input yields ``None``."""
+    try:
+        for record in iter_json_lines(path):
+            if session_id := _record_session_id(record):
+                return session_id
+    except OSError:
+        return None
+    return None
+
+
+def scan_transcript(path: Path) -> TranscriptScan:
+    """Read *path* once, producing everything the sampler needs from it.
+
+    A confusion signal can occur anywhere in the file, so the whole file
+    is read anyway; the first user turn and the session id come from that
+    same pass. Unreadable input degrades to an empty scan.
     """
     tool_error = not_found = self_correct = df_guard = interrupt = 0
     designed_outcome = 0
     first_turn: dict[str, Any] | None = None
+    session_id: str | None = None
     try:
         for record in iter_json_lines(path):
             has_genuine, has_designed = _classify_tool_errors(record)
@@ -293,13 +329,14 @@ def _score_and_find_first_turn(path: Path) -> tuple[SignalCounts, dict[str, Any]
             if has_designed:
                 designed_outcome += 1
 
-            text = _record_text(record)
+            dialogue = _dialogue_text(record)
+            text = dialogue.whole
             if text and any(pattern in text for pattern in _NOT_FOUND_PATTERNS):
                 not_found += 1
             if text and any(pattern in text for pattern in _INTERRUPT_PATTERNS):
                 interrupt += 1
 
-            assistant_text = _assistant_text(record)
+            assistant_text = dialogue.assistant
             if assistant_text and any(
                 pattern in assistant_text for pattern in _SELF_CORRECT_PATTERNS
             ):
@@ -318,8 +355,10 @@ def _score_and_find_first_turn(path: Path) -> tuple[SignalCounts, dict[str, Any]
                 and not record.get('isMeta')
             ):
                 first_turn = record
+            if session_id is None:
+                session_id = _record_session_id(record)
     except OSError:
-        return SignalCounts(), None
+        return TranscriptScan(SignalCounts(), None, None)
 
     counts = SignalCounts(
         tool_error=tool_error,
@@ -329,7 +368,7 @@ def _score_and_find_first_turn(path: Path) -> tuple[SignalCounts, dict[str, Any]
         interrupt=interrupt,
         designed_outcome=designed_outcome,
     )
-    return counts, first_turn
+    return TranscriptScan(counts, first_turn, session_id)
 
 
 def score_signals(path: Path) -> SignalCounts:
@@ -339,17 +378,15 @@ def score_signals(path: Path) -> SignalCounts:
     carrying multiple synonymous markers for the same class still counts
     once. ``tool_error``/``designed_outcome`` and the tool-use half of
     ``df_guard`` are structural checks; every other class is a plain
-    case-insensitive substring scan. ``tool_error`` counts only GENUINE
+    case-insensitive substring scan of dialogue carriers only
+    (:class:`_DialogueText`). ``tool_error`` counts only GENUINE
     failures: declared-designed outcomes are split off into
     ``designed_outcome`` by :func:`_classify_tool_errors`, which reuses
     digest's classifier so the two modules cannot drift. Malformed/unreadable input degrades to an all-zero
-    :class:`SignalCounts` rather than raising. Delegates to
-    :func:`_score_and_find_first_turn` (shared with
-    :func:`_find_first_user_turn` so :func:`main`'s scoring loop can get
-    both in one file read); see its docstring for why.
+    :class:`SignalCounts` rather than raising. The counts of
+    :func:`scan_transcript`.
     """
-    counts, _ = _score_and_find_first_turn(path)
-    return counts
+    return scan_transcript(path).counts
 
 
 # ---------------------------------------------------------------------------
@@ -455,15 +492,15 @@ def classify_agent_class(record: dict[str, Any] | None, path: Path) -> str:
 class ScoredRecord:
     """A :class:`~legibility.inventory.SessionRecord` enriched with its
     signal score and agent-class stratum — the unit :func:`stratified_sample`
-    operates on. Produced by :func:`main` via
-    ``inventory.enumerate_sessions -> score_signals -> classify_agent_class``,
-    or constructed directly for pure in-memory testing (PRD §8.4).
+    operates on. Produced by :func:`score_session`, or constructed directly
+    for pure in-memory testing (PRD §8.4).
     """
 
     session: SessionRecord
     stratum: str
     counts: SignalCounts
     first_turn_text: str = ''
+    session_id: str | None = None
 
     @property
     def score(self) -> int:
@@ -476,6 +513,18 @@ class ScoredRecord:
     @property
     def path(self) -> Path:
         return self.session.path
+
+
+def score_session(session: SessionRecord) -> ScoredRecord:
+    """Scan, classify and summarise one enumerated session for sampling."""
+    scan = scan_transcript(session.path)
+    return ScoredRecord(
+        session=session,
+        stratum=classify_agent_class(scan.first_turn, session.path),
+        counts=scan.counts,
+        first_turn_text=_first_user_turn_text(scan.first_turn),
+        session_id=scan.session_id,
+    )
 
 
 _DIGITS_RE = re.compile(r'\d+')
@@ -1016,19 +1065,17 @@ def _find_first_user_turn(path: Path) -> dict[str, Any] | None:
 
     Returns the raw record dict (as :func:`classify_agent_class` expects),
     or None if the transcript has no such turn. Malformed/unreadable input
-    degrades to None rather than raising. Delegates to
-    :func:`_score_and_find_first_turn`; see its docstring for why.
+    degrades to None rather than raising. The first turn of
+    :func:`scan_transcript`.
     """
-    _, first_turn = _score_and_find_first_turn(path)
-    return first_turn
+    return scan_transcript(path).first_turn
 
 
 def main(argv: Sequence[str]) -> int:
     """CLI entry point: the full inventory -> score -> classify -> sample -> render pipeline.
 
     Wires ``config.load_config -> inventory.enumerate_sessions ->
-    score_signals -> classify_agent_class -> stratified_sample ->
-    render_manifest``. Prints the JSONL manifest to stdout and a
+    score_session -> stratified_sample -> render_manifest``. Prints the JSONL manifest to stdout and a
     per-stratum-counts / zero-signal-drops / budget-accounting summary to
     stderr. This is the CLI acceptance surface — a manual run against live
     ``~/.claude/projects`` is the observable, not a pytest.
@@ -1075,18 +1122,7 @@ def main(argv: Sequence[str]) -> int:
         ),
     )
 
-    scored: list[ScoredRecord] = []
-    for session in sessions:
-        counts, first_turn = _score_and_find_first_turn(session.path)
-        stratum = classify_agent_class(first_turn, session.path)
-        scored.append(
-            ScoredRecord(
-                session=session,
-                stratum=stratum,
-                counts=counts,
-                first_turn_text=_first_user_turn_text(first_turn),
-            )
-        )
+    scored = [score_session(session) for session in sessions]
 
     result = stratified_sample(
         scored, cfg, cost_fn=digest_byte_cost_fn(max_bytes=DEFAULT_DIGEST_MAX_BYTES),

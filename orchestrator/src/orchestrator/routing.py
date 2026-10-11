@@ -40,10 +40,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Claude-backend model aliases admitted by default (task beta). claude-fable-5
-# is deliberately NOT included here — task xi admits it to the runtime
-# allowlist once probe_models confirms availability across every pool account
-# (see FABLE_CANDIDATE_MODEL below).
+# The CODE-DEFAULT Claude-backend allowlist (task beta): what a config that
+# specifies no routing.allowed_models falls back to. It deliberately carries
+# no fable alias, because admission is a per-config operator decision rather
+# than a code default that would silently apply to every project the factory
+# operates. An operator config MAY admit one (dark-factory's own does), and
+# probe_models unions in FABLE_CANDIDATE_MODEL either way, so the candidate
+# is exercised even where a config has not admitted it.
 DEFAULT_ALLOWED_MODELS: tuple[str, ...] = ('haiku', 'sonnet', 'opus')
 
 # Default model ladder (weakest -> strongest), used by the resolver (task
@@ -53,10 +56,15 @@ DEFAULT_ALLOWED_MODELS: tuple[str, ...] = ('haiku', 'sonnet', 'opus')
 # unordered admission set consulted at every resolution layer.
 DEFAULT_LADDER: tuple[str, ...] = ('haiku', 'sonnet', 'opus')
 
-# Candidate model probed for availability even though it is not yet admitted
-# to the runtime allowlist — beta is the G3 gate that produces the
-# per-account fable-availability data task xi's admission gate consumes.
-FABLE_CANDIDATE_MODEL: str = 'claude-fable-5'
+# The ADMITTED Fable literal: the string the live evals dispatch
+# (orchestrator.evals.reviewer_trial.variants::VARIANT_FABLE51_SOLO) and the
+# one a live routing.allowed_models carries. INVARIANT: it must track
+# whatever string admission actually names -- probe_models unions it into its
+# target set so the per-(account, model) availability evidence an admission
+# decision consumes exists even for a config that has not admitted it, and a
+# value no admission ruling names makes that evidence vacuous. Pinned
+# referentially against the eval arm by test_routing.py, not just by eye.
+FABLE_CANDIDATE_MODEL: str = 'claude-fable-5-1'
 
 # Default path for the committed probe-models artifact, sibling of
 # config/usage-accounts.yaml (the account-pool source of truth).
@@ -66,6 +74,33 @@ DEFAULT_PROBE_ARTIFACT_PATH: str = 'config/model-availability.yaml'
 # enough to confirm the model string resolves and the account can complete a
 # turn, without incurring meaningful cost.
 DEFAULT_PROBE_PROMPT: str = 'Reply with the single word: ok'
+
+# AgentResult.subtype the Claude CLI stamps when the local --max-budget-usd
+# ceiling fires: ``error_max_budget_usd``, WITH the ``_usd`` suffix -- not
+# ``error_max_budget`` (the same warning
+# ``orchestrator.dry_run_unblock::_BUDGET_SUBTYPES`` carries). This is a CLI
+# wire contract, so its canonical home is beside AgentResult in
+# ``shared.cli_invoke``, which every package that spells it already depends
+# on; consolidating the several per-package copies is filed follow-up work,
+# outside this module's scope.
+PROBE_BUDGET_EXHAUSTED_SUBTYPE: str = 'error_max_budget_usd'
+
+# Per-invocation USD ceiling probe_models forwards as max_budget_usd.
+# INVARIANT: it must clear one turn of the most expensive probed model. A
+# one-turn probe still pays for the CLI's own preamble, and one
+# FABLE_CANDIDATE_MODEL turn measures ~$0.15-0.25 that way, so a ceiling
+# below that aborts every such probe with PROBE_BUDGET_EXHAUSTED_SUBTYPE and
+# yields no availability evidence at all. $1.00 leaves ~4x headroom while
+# staying a trivially small per-(account, model) spend, and it is a CEILING,
+# not a spend: a probe that completes normally still costs one cheap turn.
+DEFAULT_PROBE_BUDGET_USD: float = 1.0
+
+# The status classify_probe_outcome returns for a turn that aborted on that
+# ceiling. Named because it is the one status crossing a module boundary:
+# `orchestrator probe-models` counts these rows to warn that the run produced
+# no availability evidence for them. The other statuses stay internal to this
+# module and the artifact it renders.
+PROBE_BUDGET_TOO_LOW_STATUS: str = 'budget_too_low'
 
 
 def _dedup_preserve_order(items: list[str]) -> list[str]:
@@ -89,18 +124,41 @@ class ProbeReport:
     accounts: dict[str, dict[str, str]]
 
 
-def classify_probe_outcome(outcome: object) -> str:
-    """Map a ``shared.invocation_outcome.InvocationOutcome`` to a probe
-    status string: OK->available, ModelNotFound->unavailable,
-    AuthFailed->auth_error, CapHit/NearCap->capped, else->error.
+def classify_probe_outcome(result: AgentResult) -> str:
+    """Map one probe invocation's ``AgentResult`` to a probe status string.
 
-    Pure -- reads only *outcome*, performs no I/O. Note this 'error'
-    catch-all is only reachable via a classified Failure *outcome*; a raised
-    exception from *invoke_fn* itself is handled separately by
-    ``probe_models`` as the distinct ``'invoke_error'`` status.
+    A budget abort is checked FIRST, above every other tier including cap
+    detection: ``PROBE_BUDGET_EXHAUSTED_SUBTYPE`` means the API accepted the
+    request and consumed real tokens, so the model resolved for this account
+    and the account is NOT capped -- the distinction
+    ``shared.usage_gate::_probe_hit_local_budget_cap`` draws. Detection keys
+    on that subtype ALONE, never on a ``cost_usd >= budget_usd`` heuristic:
+    an agent can spend close to the ceiling and then fail for an unrelated
+    reason (the rule ``orchestrator.dry_run_unblock::_is_budget_exhausted``
+    records).
+
+    Otherwise the result is classified through ``classify_invocation`` and
+    mapped: OK->available, ModelNotFound->unavailable, AuthFailed->auth_error,
+    CapHit/NearCap->capped, else->error. This function owns the probe's
+    ``strict_confirm=False, backend='claude'`` regime so it is spelled in
+    exactly one place.
+
+    Pure -- reads only *result*. ``'invoke_error'`` and ``'no_token'`` are
+    assigned by ``probe_models`` around this function, never by it.
     """
-    from shared.invocation_outcome import OK, AuthFailed, CapHit, ModelNotFound, NearCap
+    from shared.invocation_outcome import (
+        OK,
+        AuthFailed,
+        CapHit,
+        ModelNotFound,
+        NearCap,
+        classify_invocation,
+    )
 
+    if (result.subtype or '') == PROBE_BUDGET_EXHAUSTED_SUBTYPE:
+        return PROBE_BUDGET_TOO_LOW_STATUS
+
+    outcome = classify_invocation(result, strict_confirm=False, backend='claude')
     if isinstance(outcome, OK):
         return 'available'
     if isinstance(outcome, ModelNotFound):
@@ -122,28 +180,34 @@ async def probe_models(
     prompt: str = DEFAULT_PROBE_PROMPT,
     cwd: Path | None = None,
     max_turns: int = 1,
-    budget_usd: float = 0.05,
+    budget_usd: float = DEFAULT_PROBE_BUDGET_USD,
 ) -> ProbeReport:
     """Probe every (account, model) pair for availability.
 
     The target model set defaults to ``dedup(allowed_models +
-    [FABLE_CANDIDATE_MODEL])``, order-preserving, so the probe always
-    exercises ``claude-fable-5`` even though it is not yet admitted to the
-    runtime allowlist (task xi's G3 gate; see this task's plan
-    design_decisions) -- pass *models* explicitly to override.
+    [FABLE_CANDIDATE_MODEL])``, so the probe always exercises the fable
+    candidate even where a config has not admitted it. The union is
+    order-preserving and deduplicated, so a config that already admits the
+    candidate probes it exactly once, with no trailing duplicate row. Pass
+    *models* explicitly to override.
 
     For each account, the OAuth token is resolved once via
     ``token_resolver(account.oauth_token_env)``. When unresolvable, every
     target model is recorded as ``'no_token'`` for that account and
     *invoke_fn* is never called for it. Otherwise, *invoke_fn* (default
     ``invoke_claude_agent``) is called once per target model with a cheap
-    1-turn invocation, and the result is classified via
-    ``classify_invocation`` / ``classify_probe_outcome`` into a status
-    string. If *invoke_fn* raises (network error, subprocess crash, or any
+    1-turn invocation, and the result is classified into a status string
+    by ``classify_probe_outcome``. If *invoke_fn* raises (network error, subprocess crash, or any
     other exception not surfaced as an ``AgentResult``), that single
     (account, model) pair is recorded as ``'invoke_error'`` and the probe
     continues -- a single transient failure must not abort the whole run
     and discard every status already collected.
+
+    *budget_usd* is a per-invocation ceiling, forwarded as
+    ``max_budget_usd`` on every probe call. It must clear one turn of the
+    MOST expensive probed model -- undershooting it does not fail quietly:
+    the pair is recorded as the distinct ``'budget_too_low'`` status rather
+    than as unavailability (see ``classify_probe_outcome``).
 
     *invoke_fn* and *token_resolver* are dependency-injected (mirrors
     ``invoke_with_cap_retry``'s ``invoke_fn=`` seam) so callers can drive
@@ -159,7 +223,6 @@ async def probe_models(
     from pathlib import Path as _Path
 
     from shared.cli_invoke import invoke_claude_agent
-    from shared.invocation_outcome import classify_invocation
 
     invoke = invoke_fn or invoke_claude_agent
     target_models = (
@@ -199,8 +262,7 @@ async def probe_models(
                 )
                 statuses[model] = 'invoke_error'
                 continue
-            outcome = classify_invocation(result, strict_confirm=False, backend='claude')
-            statuses[model] = classify_probe_outcome(outcome)
+            statuses[model] = classify_probe_outcome(result)
         report_accounts[account.name] = statuses
 
     return ProbeReport(models=target_models, accounts=report_accounts)

@@ -154,9 +154,17 @@ here. It is enforced twice:
   keeps identity fields, the run's exit provenance keeps its scalar fields
   (`exit_code`, `killed_by_probe`, `stderr_len`) and drops only the CLI-authored
   text, since it is stamped onto every observation of the run. A degraded
-  observation also carries `captured_at` / `session_id` when they match their
-  probe-authored shapes, so a `redaction_failed` row in an appended-to `--out`
-  file can still be traced to the run that produced it;
+  observation also carries `captured_at` / `session_id` / `probe_run_id` when
+  they match their probe-authored shapes, so a `redaction_failed` row in an
+  appended-to `--out` file can still be traced to the run that produced it.
+  `probe_run_id` additionally keeps such a row JOINABLE: it is the key the
+  Provenance table above is built on, and the key
+  `test_every_row_is_linked_to_a_raw_probe_run` enforces — every value in that
+  table is exactly the anchored `<mode>-<12 hex>` shape the validator accepts,
+  because `main()` generates it. An operator-supplied `--probe-run-id` that does
+  not match degrades to `null` rather than riding through unvalidated.
+  `wedge_shape` is carried under the closed-set check `mode` already gets,
+  against `MODE_WEDGE_SHAPE`'s own values;
 - **commit time** — `assert_no_credential_material()` is asserted over the full
   text of both corpus files and the raw capture by `TestCorpusSecretHygiene`,
   so a later hand-edit cannot reintroduce what the probe would have refused to

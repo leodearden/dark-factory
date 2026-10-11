@@ -1,0 +1,147 @@
+{
+  "arms": [
+    {
+      "arm": "gpt-4o-mini@5",
+      "calls": 658,
+      "cases_path": "data/write-triage-population-2026-10-05/arms-write-time/gpt-4o-mini@5.jsonl",
+      "cases_sha256": "1c86024786e2f9cee55d9a8200aac45ebb1e364d5edf35c790ed4268ffeba171",
+      "field_chars": 4000,
+      "model": "gpt-4o-mini",
+      "outcomes": {
+        "amended": 116,
+        "contested": 237,
+        "restated": 57,
+        "stored": 248
+      },
+      "p50_seconds": 1.1794849038124084,
+      "p95_seconds": 1.6945951250381768,
+      "parse_failures": 0,
+      "provider": "openai",
+      "reasoning_effort": null,
+      "system_prompt_sha256": "312a8c9a7f6ff5fff7d6e8b0af8d327b73e8f860d7025cbac70ceb9b8304cd6a",
+      "timeout_seconds": 15.0,
+      "transport_failures": 0,
+      "transport_failures_by_type": {},
+      "unpriced_calls": 0,
+      "usd": 0.2838,
+      "width": 5,
+      "wording": "shipped"
+    },
+    {
+      "arm": "gpt-5.6-terra:none@5",
+      "calls": 658,
+      "cases_path": "data/write-triage-population-2026-10-05/arms-write-time/gpt-5.6-terra:none@5.jsonl",
+      "cases_sha256": "c931f4204ad98389795285f330dfc4fdf6a5a1bccbebcd4a34bd1d69b673cefe",
+      "field_chars": 4000,
+      "model": "gpt-5.6-terra",
+      "outcomes": {
+        "amended": 429,
+        "contested": 80,
+        "restated": 26,
+        "stored": 123
+      },
+      "p50_seconds": 1.6132812248542905,
+      "p95_seconds": 2.1119027230888605,
+      "parse_failures": 1,
+      "provider": "openai",
+      "reasoning_effort": "none",
+      "system_prompt_sha256": "312a8c9a7f6ff5fff7d6e8b0af8d327b73e8f860d7025cbac70ceb9b8304cd6a",
+      "timeout_seconds": 15.0,
+      "transport_failures": 0,
+      "transport_failures_by_type": {},
+      "unpriced_calls": 0,
+      "usd": 3.920106,
+      "width": 5,
+      "wording": "shipped"
+    },
+    {
+      "arm": "gpt-6.1-sol:low@5",
+      "calls": 658,
+      "cases_path": "data/write-triage-population-2026-10-05/arms-write-time/gpt-6.1-sol:low@5.jsonl",
+      "cases_sha256": "8f7b209383c290cc9106d648dd2e5e27571fd271fbfc3c8ed0c2228c9ba93769",
+      "field_chars": 4000,
+      "model": "gpt-6.1-sol",
+      "outcomes": {
+        "amended": 280,
+        "contested": 144,
+        "restated": 3,
+        "stored": 231
+      },
+      "p50_seconds": 2.71151201473549,
+      "p95_seconds": 4.5697954329662025,
+      "parse_failures": 0,
+      "provider": "openai",
+      "reasoning_effort": "low",
+      "system_prompt_sha256": "312a8c9a7f6ff5fff7d6e8b0af8d327b73e8f860d7025cbac70ceb9b8304cd6a",
+      "timeout_seconds": 15.0,
+      "transport_failures": 0,
+      "transport_failures_by_type": {},
+      "unpriced_calls": 0,
+      "usd": 4.004492,
+      "width": 5,
+      "wording": "shipped"
+    }
+  ],
+  "pairs_to_rate": {
+    "already_rated": [
+      {
+        "path": "fused-memory/calibration/write_triage_pair_verdicts.jsonl",
+        "rows": 1216,
+        "sha256": "ecd95fc0b97bee838118dca5458d8cb3a2e3291ddd06e6211d3ef408bbb37ee9"
+      },
+      {
+        "path": "fused-memory/tests/fixtures/write_triage_pair_verdicts_seed.jsonl",
+        "rows": 155,
+        "sha256": "f24681fdf23ad200e57fd48e8add8e6a6e24c481b6c91d8b21a3cc6fc11d9098"
+      }
+    ],
+    "excluded_already_rated": 618,
+    "missing_target_text": 0,
+    "n_pairs": 123,
+    "order": "sha256(snapshot_sha256:entry_id:target_id)",
+    "path": "fused-memory/calibration/write_triage_pairs_to_rate_write_time.jsonl",
+    "sha256": "ac7fab695b4aebf0146f7f89f757f84961619dfd022129e72047c65cfab6575d"
+  },
+  "population": {
+    "band_winner_changed": 129,
+    "candidates_dropped": 1166,
+    "declares_attach_keys_run_set": 10,
+    "excluded_by_write_time_filter": {
+      "by_band": {},
+      "count": 0,
+      "memory_ids": []
+    },
+    "frozen_at": "2026-10-05T10:01:34.841370+00:00",
+    "judge_band_sample": {
+      "of": 1454,
+      "order": "sha256(snapshot_sha256:memory_id)",
+      "size": 658
+    },
+    "n_judge_band_frozen": 1454,
+    "n_judge_band_write_time": 658,
+    "n_writes": 1517,
+    "projects": [
+      "dark_factory",
+      "reify"
+    ],
+    "recon_marker_run_set": 165,
+    "slates": "write-time",
+    "slates_rule": "Each write is judged on the candidates of its frozen slate whose created_at is strictly before the write's (an unparseable created_at cannot be shown earlier, so it is dropped); band, band winner and similarity are re-decided by the shipped decide_band at the snapshot's t_high and t_low. Where at least n candidates remain, the top n equal production's write-time top n among records still live at the freeze. The sample is the frozen judge-band prefix; a sampled write that leaves the judge band is listed, never replaced.",
+    "snapshot_path": "data/write-triage-population-2026-10-05/snapshot.json",
+    "snapshot_sha256": "55398cd73c9a355d05f9454a2e1cca9e7da760bd89df141b2f6b5b8f28293e38",
+    "t_high": 0.8868282526657318,
+    "t_low": 0.5229672433064231,
+    "write_time_slate_size": {
+      "max": 19,
+      "median": 18.0,
+      "min": 5
+    },
+    "writes_with_later_candidates": 405
+  },
+  "spend": {
+    "budget_usd": 15.0,
+    "list_prices_as_of": "2026-09-30",
+    "list_prices_source": "https://developers.openai.com/api/docs/pricing",
+    "usd_total": 8.208398
+  }
+}

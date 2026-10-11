@@ -18,11 +18,11 @@ import logging
 import os
 import re
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import pytest  # pyright: ignore[reportMissingImports]
+import pytest
 
 from orchestrator import session_hooks as sh
 from orchestrator import session_registry as sr
@@ -1421,6 +1421,128 @@ def test_forked_inheritor_does_not_claim_the_spawners_window(
     assert forked.display is None
 
 
+def test_forked_inheritor_does_not_inherit_the_spawners_role_task_or_title(
+    tmp_path: Path,
+) -> None:
+    # Task 4663 (task-4193-review residual): parent_session_id/display/
+    # launcher_pid were already guarded above, but resolve_hook_identity
+    # still read CLAUDE_SPAWN_ROLE/TASK_ID/ESCALATION_ID/TITLE straight out
+    # of the inherited env, so a forked record got the SPAWNER's role,
+    # task_id, escalation_id and display title -- two cockpit rows
+    # identical except for slug. These must resolve to this session's own
+    # non-spawn defaults instead.
+    slug = 'session-cockpit-3215093'
+    _write_bound_parent(slug, tmp_path, 3215093)
+    hook_input = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory'}
+    env = {
+        'CLAUDE_SPAWN_SESSION_ID': slug,
+        'CLAUDE_SPAWN_ROLE': 'unblock',
+        'CLAUDE_SPAWN_PROJECT': 'df',
+        'CLAUDE_SPAWN_TASK_ID': '9999',
+        'CLAUDE_SPAWN_ESCALATION_ID': 'esc-9999-1',
+        'CLAUDE_SPAWN_TITLE': 'unblock:dark-factory#9999 spawner-title',
+    }
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    forked = sr.read_record(sh.hook_session_slug(hook_input, env, root=tmp_path), root=tmp_path)
+    assert forked.role == 'session'
+    # 'dark-factory' is the cwd basename, NOT the inherited 'df': every
+    # load-bearing key of _SPAWNER_IDENTITY_ENV_KEYS is set here with a value
+    # that differs from the fall-through default, so dropping any one of them
+    # from the frozenset reddens this test rather than silently putting the
+    # spawner's identity back on the forked row.
+    assert forked.project == 'dark-factory'
+    assert forked.task_id is None
+    assert forked.escalation_id is None
+    assert forked.title == 'session:dark-factory'
+    # And the spawning session's own record is untouched -- role/title
+    # never carried spawn env in the first place (see _write_bound_parent).
+    spawner = sr.read_record(slug, root=tmp_path)
+    assert spawner.role == ''
+    assert spawner.title == ''
+
+
+@pytest.mark.parametrize(
+    ('handler', 'status'),
+    [
+        (sh.run_stop, sr.Status.IDLE),
+        (sh.run_notification, sr.Status.AWAITING_INPUT),
+    ],
+    ids=['stop', 'notification'],
+)
+def test_forked_inheritor_retitle_describes_its_own_record(
+    tmp_path: Path,
+    handler: Callable[..., str],
+    status: sr.Status,
+) -> None:
+    # The escape goes to the hook process's OWN controlling terminal, so it
+    # describes the session whose hook fired; a Bash-tool-launched nested
+    # claude cannot reach its spawner's tab at all (task 5421).
+    slug = 'session-cockpit-3215094'
+    _write_bound_parent(slug, tmp_path, 3215094)
+    hook_input = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory'}
+    env = {
+        'CLAUDE_SPAWN_SESSION_ID': slug,
+        'CLAUDE_SPAWN_TITLE': 'unblock:dark-factory#9999 spawner-title',
+    }
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+    osc = handler(hook_input, env, root=tmp_path)
+
+    forked = sr.read_record(sh.hook_session_slug(hook_input, env, root=tmp_path), root=tmp_path)
+    assert forked.title == 'session:dark-factory'
+    assert osc == sh.osc_retitle_sequence(status, forked.title)
+    assert forked.status == status
+
+
+def test_forked_inheritor_retitle_falls_back_to_its_own_identity(
+    tmp_path: Path,
+) -> None:
+    # No SessionStart, so the forked record is synthesized with a blank
+    # title and the retitle takes hook_display_title's identity fallback:
+    # that identity must be this session's own, not its spawner's.
+    slug = 'session-cockpit-3215095'
+    _write_bound_parent(slug, tmp_path, 3215095)
+    hook_input = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory'}
+    env = {
+        'CLAUDE_SPAWN_SESSION_ID': slug,
+        'CLAUDE_SPAWN_ROLE': 'unblock',
+        'CLAUDE_SPAWN_PROJECT': 'df',
+        'CLAUDE_SPAWN_TASK_ID': '9999',
+    }
+
+    osc = sh.run_stop(hook_input, env, root=tmp_path)
+
+    assert osc == sh.osc_retitle_sequence(sr.Status.IDLE, 'session:dark-factory')
+
+
+def test_adopted_session_retitle_keeps_its_spawn_identity(tmp_path: Path) -> None:
+    # The strip is fork-only: the owning session's blank-titled record still
+    # retitles from its own spawn identity.
+    slug = 'session-cockpit-3215096'
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.RUNNING,
+            launcher_pid=3215096,
+            claude_session_id='uuid-owner',
+        ),
+        root=tmp_path,
+    )
+    hook_input = {'session_id': 'uuid-owner', 'cwd': '/home/leo/src/dark-factory'}
+    env = {
+        'CLAUDE_SPAWN_SESSION_ID': slug,
+        'CLAUDE_SPAWN_ROLE': 'unblock',
+        'CLAUDE_SPAWN_PROJECT': 'df',
+        'CLAUDE_SPAWN_TASK_ID': '2085',
+    }
+
+    osc = sh.run_stop(hook_input, env, root=tmp_path)
+
+    assert osc == sh.osc_retitle_sequence(sr.Status.IDLE, 'unblock:df#2085')
+
+
 def test_adopted_session_still_resolves_the_spawn_window_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2601,7 +2723,7 @@ def _real_settings_snapshot() -> dict:
                     'hooks': [
                         {
                             'type': 'command',
-                            'command': '/home/leo/.claude/hooks/skim-rewrite.sh',
+                            'command': '/home/leo/.claude/hooks/some-bash-pretooluse.sh',
                             'timeout': 5,
                         }
                     ],

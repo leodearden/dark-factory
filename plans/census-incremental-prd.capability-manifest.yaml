@@ -1,0 +1,485 @@
+prd: plans/census-incremental-prd.md
+schema_version: 1
+tasks:
+- label: L1
+  task_id: 6397
+  title: Census run identity, processed-session ledger, resumable window
+  capabilities:
+  - name: session-ledger-module-exists
+    binding: producer:L1 (this leaf creates scripts/legibility/session_ledger.py;
+      C2)
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - scripts/legibility/session_ledger.py
+      expect: present
+  - name: ledger-table-coded-sessions
+    binding: producer:L1 — C2 fixes the one table name coded_sessions
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: coded_sessions
+      paths:
+      - scripts/legibility/session_ledger.py
+      expect: present
+  - name: method-section-key-rendered
+    binding: producer:L1 — C3 SECTION_METHOD beside the existing SECTION_* keys (census.py::census_report_sections)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: SECTION_METHOD[[:space:]]*=
+      paths:
+      - scripts/legibility/census.py
+      expect: present
+  - name: private-scorer-callers-moved-to-public-name
+    binding: 'grep: census.py::default_batch_source and nightly.py::select_scored_records
+      call sampling._score_and_find_first_turn today; L1 promotes it (heuristic 13)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: sampling\._score_and_find_first_turn
+      paths:
+      - scripts/legibility/census.py
+      - scripts/legibility/nightly.py
+      expect: absent
+  - name: date-anchored-window-retired
+    binding: 'grep: census.py::_census_window_dates exists on main; L1 retires it
+      for the retention window (C2, D2)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def _census_window_dates
+      paths:
+      - scripts/legibility/census.py
+      expect: absent
+  - name: trickle-writes-ledger-in-production
+    binding: producer:L1 wired into nightly.py::run_nightly (production path); signal
+      = session_ledger.py stats shows non-zero trickle rows after a real nightly run
+      (INV-13)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'production-row evidence: only a real nightly run writes it; observed
+        by the operator via the stats CLI'
+  - name: project-state-dir-substrate
+    binding: 'grep: scripts/legibility/trickle_state.py::project_state_dir(project_id)
+      exists and is used by the nightly writer'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: existing substrate, already green on main; a present-check would be
+        vacuous
+- label: L11
+  task_id: 6398
+  title: Census report conformance checker
+  capabilities:
+  - name: checker-replaces-stub-and-knows-section-set
+    binding: 'producer:L11 — real checker replaces the decomposer-committed stub;
+      checks the C3 section set including ## Screened'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: Screened
+      paths:
+      - scripts/legibility/check_census_report.py
+      expect: present
+  - name: no-conforming-report-yet-distinct-state
+    binding: 'producer:L11 — INV-2/INV-13: ''no conforming report yet'' vs ''keys
+      missing''; signal = run on main exits 1 naming plans/confusion-census-2026-10-03.md''s
+      missing ## Method (verified: that report has no ## Method heading)'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: message distinction is asserted by L11's row-16 tests, not a grep
+- label: L8a
+  task_id: 6399
+  title: 'Census trigger: relative novelty spike and session-watermark floor'
+  capabilities:
+  - name: novelty-baseline-config
+    binding: producer:L8a — config.py::NoveltySpike gains multiple/baseline_days (C7
+      b)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: baseline_days
+      paths:
+      - scripts/legibility/config.py
+      expect: present
+  - name: trigger-evaluates-relative-spike
+    binding: producer:L8a — census_trigger.py::evaluate / CensusConfig read the baseline
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: baseline_days
+      paths:
+      - scripts/legibility/census_trigger.py
+      expect: present
+  - name: trigger-wired-into-nightly
+    binding: 'grep: nightly.py::evaluate_census_step -> census_trigger.decide_for_project
+      -> evaluate (wired on main)'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: existing wiring, already green on main
+  - name: session-watermark-written
+    binding: producer:L1 upstream writes session_watermark via census.py::advance_census_state;
+      until a post-L1 census runs, the floor line names the fallback 'since last_census_at
+      (no watermark yet)' (PRD L8a signal, G6)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: field-population depends on a real census run after L1 lands
+- label: L9
+  task_id: 6400
+  title: Invariant slugs and the quality Definition to the coder; slug check in the
+    merger
+  capabilities:
+  - name: invariants-reader-module
+    binding: producer:L9 — new scripts/legibility/invariants.py (D10)
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - scripts/legibility/invariants.py
+      expect: present
+  - name: heading-regex-replaced-by-import
+    binding: 'grep: scripts/tests/test_design_invariants_consistency.py::_HEADING_RE
+      exists on main; D10 replaces it with an import of the reader (INV-5)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _HEADING_RE[[:space:]]*=[[:space:]]*re\.compile
+      paths:
+      - scripts/tests/test_design_invariants_consistency.py
+      expect: absent
+  - name: coder-prompt-carries-definition-section
+    binding: 'grep: orchestrator/src/orchestrator/agents/code_quality.py::section
+      and ::NORMATIVE_DOC exist; stdlib-only import via orchestrator/src verified
+      (Definition = 138 words)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '## Definition'
+      paths:
+      - scripts/legibility/coder.py
+      expect: present
+  - name: trickle-journal-slug-line
+    binding: 'producer:L9 — nightly.py journal summary line ''invariant slugs: N valid,
+      M rejected'''
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: invariant slugs
+      paths:
+      - scripts/legibility/nightly.py
+      expect: present
+- label: L2
+  task_id: 6401
+  title: 'Census verifier: typed verdict, judged against the rendered quality definition'
+  capabilities:
+  - name: verdict-parser-module
+    binding: producer:L2 — scripts/legibility/verdict.py::parse_verdict (C4)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def parse_verdict
+      paths:
+      - scripts/legibility/verdict.py
+      expect: present
+  - name: local-severity-enum-deleted
+    binding: 'grep: census.py::_VALID_ENTRY_SEVERITIES exists on main; L2 deletes
+      it in favour of the codebook enum (INV-5)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _VALID_ENTRY_SEVERITIES
+      paths:
+      - scripts/legibility/census.py
+      expect: absent
+  - name: verify-prompt-embeds-guidance
+    binding: 'grep: orchestrator/src/orchestrator/agents/code_quality.py::guidance
+      exists, wired in orchestrator/src/orchestrator/agents/roles.py; L2 embeds it
+      in census.py::_verify_prompt via the orchestrator/src path'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: guidance\(
+      paths:
+      - scripts/legibility/census.py
+      expect: present
+- label: L3
+  task_id: 6402
+  title: Finding keys on codebook records and census tickets
+  capabilities:
+  - name: shared-finding-key-module
+    binding: producer:L3 — contract §2 names shared/src/shared/finding_key.py as the
+      one key implementation
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def finding_key
+      paths:
+      - shared/src/shared/finding_key.py
+      expect: present
+  - name: finding-area-module
+    binding: producer:L3 — contract §3 path->area rule; briefing subprojects (fused-memory,
+      orchestrator, shared, dashboard, escalation, sampler) exist; overlay rule scripts/legibility/**
+      -> shared in skills/review-all/references/project-overlay.md
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - scripts/legibility/finding_area.py
+      expect: present
+  - name: codebook-accepted-status
+    binding: producer:L3 — C1 adds accepted to codebook.py::STATUSES
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: STATUSES = \[[^]]*"accepted"
+      paths:
+      - scripts/legibility/codebook.py
+      expect: present
+  - name: ticket-metadata-x-finding-run
+    binding: producer:L3 — census.py::build_task_payloads writes x_finding_key/x_finding_run
+      on the production filing path (field-population consumed by L8b via check_run_completion.py)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: x_finding_run
+      paths:
+      - scripts/legibility/census.py
+      expect: present
+  - name: interim-key-parity
+    binding: 'grep: skills/hotspot-survey/scripts/findings_artefact.py::finding_key
+      and its `key` subcommand exist on main; no committed fixture exists yet, so
+      L3 commits one (contract §2)'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: parity is a test property of L3's suite
+- label: L4
+  task_id: 6403
+  title: Census dedup protocol (contract §8) and ticket-to-task back-link
+  capabilities:
+  - name: disposition-module
+    binding: producer:L4 — new scripts/legibility/disposition.py
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - scripts/legibility/disposition.py
+      expect: present
+  - name: key-lookup-consumes-find-tasks-by-metadata
+    binding: producer:plans/task-metadata-lookup-prd.md L1 (external, upstream dep;
+      absent on main today); transport census_trigger.py::post_mcp_tool_call exists
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: find_tasks_by_metadata
+      paths:
+      - scripts/legibility/disposition.py
+      - scripts/legibility/census.py
+      expect: present
+  - name: structural-section-key
+    binding: producer:L4 — SECTION_STRUCTURAL (contract §6, D6)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: SECTION_STRUCTURAL[[:space:]]*=
+      paths:
+      - scripts/legibility/census.py
+      expect: present
+  - name: resolve-ticket-search-tasks-get-task
+    binding: 'grep: fused-memory/src/fused_memory/server/tools.py::resolve_ticket
+      (created|combined|failed|refused), ::search_tasks, ::get_task exist'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: existing substrate, already green on main
+- label: L5
+  task_id: 6404
+  title: Census outcome feedback from back-linked tasks to codebook entries
+  capabilities:
+  - name: dispositions-section-key
+    binding: producer:L5 — SECTION_DISPOSITIONS
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: SECTION_DISPOSITIONS[[:space:]]*=
+      paths:
+      - scripts/legibility/census.py
+      expect: present
+  - name: fixed-requires-reverify
+    binding: producer:L5 — fixed_at_sha set only after an L2 re-verify at as_of_sha
+      (D8, INV-3)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: fixed_at_sha
+      paths:
+      - scripts/legibility/disposition.py
+      - scripts/legibility/census.py
+      expect: present
+  - name: statuses-read-path
+    binding: 'grep: get_statuses exists (fused-memory tools.py) and is wired through
+      census_trigger.py::default_status_fetcher; filed_tickets producer:L4 upstream'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: existing substrate plus upstream producer
+- label: L6
+  task_id: 6405
+  title: Census verifier pre-screen against the codebook and other instruments' keys
+  capabilities:
+  - name: prescreen-module
+    binding: producer:L6 — new scripts/legibility/prescreen.py
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - scripts/legibility/prescreen.py
+      expect: present
+  - name: screened-section-key
+    binding: producer:L6 — SECTION_SCREENED; keys from L3 upstream
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: SECTION_SCREENED[[:space:]]*=
+      paths:
+      - scripts/legibility/census.py
+      expect: present
+- label: L7
+  task_id: 6406
+  title: Similarity index and capped pending-candidate adjudication queue
+  capabilities:
+  - name: similarity-module
+    binding: producer:L7 — new scripts/legibility/similarity.py (embed, cache, nearest,
+      clusters, queue CLI)
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - scripts/legibility/similarity.py
+      expect: present
+  - name: adjudication-section-key
+    binding: producer:L7 — SECTION_ADJUDICATION
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: SECTION_ADJUDICATION[[:space:]]*=
+      paths:
+      - scripts/legibility/census.py
+      expect: present
+  - name: adjudication-cap-config
+    binding: producer:L7 — config.py::Census adjudication block (max_clusters_per_run
+      default 10)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: max_clusters_per_run
+      paths:
+      - scripts/legibility/config.py
+      expect: present
+  - name: embedding-transport-and-key
+    binding: 'grep: httpx>=0.27 in shared/pyproject.toml; scripts/legibility-trickle@.service
+      carries EnvironmentFile=-/home/leo/src/dark-factory/.env; OPENAI_API_KEY in
+      that .env is asserted by PRD §6 and NOT re-read by this seat (outside the worktree)'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: host secret presence; checked by the operator, never grepped
+- label: L10
+  task_id: 6407
+  title: Structured census synthesis rendered from validated JSON
+  capabilities:
+  - name: synthesis-schema-module
+    binding: producer:L10 — new scripts/legibility/synthesis.py carrying the C6 schema
+      (new / re_observed / phase_refinements / corrections / notes)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: re_observed
+      paths:
+      - scripts/legibility/synthesis.py
+      expect: present
+  - name: corrections-op
+    binding: 'grep: codebook.py::apply_coding_record carries the corrections op on
+      main'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: existing substrate, already green on main
+- label: L8b
+  task_id: 6408
+  title: 'Census trigger: completion condition; retire tasks-landed and the max-interval
+    backstop'
+  capabilities:
+  - name: backstop-field-deleted
+    binding: 'grep: config.py::Census.max_interval_days exists on main; R8 deletes
+      it'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: max_interval_days
+      paths:
+      - scripts/legibility/config.py
+      expect: absent
+  - name: tasks-landed-retired
+    binding: 'grep: config.py::Census.tasks_landed_threshold and the legibility.yaml
+      census key exist on main; L8b retires them'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: tasks_landed_threshold
+      paths:
+      - scripts/legibility/config.py
+      - docs/legibility/legibility.yaml
+      expect: absent
+  - name: completion-threshold-config
+    binding: producer:L8b — census.completion_threshold_pct (default 70)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: completion_threshold_pct
+      paths:
+      - scripts/legibility/config.py
+      expect: present
+  - name: check-run-completion-cli
+    binding: producer:plans/completion-driven-triggers-prd.md δ (external, upstream
+      dep; scripts/check_run_completion.py absent on main today); x_finding_run populated
+      by L3 upstream
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: external producer's file; gated by the cross-PRD dependency edge, not
+        a local grep
+- label: G
+  task_id: 6409
+  title: Live census conformance gate
+  capabilities:
+  - name: predicate-script-exists-at-filing
+    binding: 'LEAD ACTION: the decomposer commits an executable fail-loud stub scripts/legibility/check_census_report.py
+      before filing G (submit_task validates before_done.script; precedent plans/confusion-reduction-prd.md
+      decision 10); producer:L11 upstream replaces it'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: G is deterministic; it carries no delivered_checks of its own
+  - name: every-section-produced-upstream
+    binding: 'DAG-direction — Method (L1), Findings (L3), Filed Tasks/Structural (L4),
+      Dispositions (L5), Screened (L6), Adjudication (L7), Synthesis (L10), trigger
+      lines (L8a, L8b), slug counts (L9), checker (L11): all upstream of G'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the gate's predicate IS the end-to-end check
+  - name: real-producer-writes-the-report
+    binding: INV-13 — G reads the first report the automatic census writes after the
+      batch lands; on 'no conforming report yet' the remedy is a forced census (skills/census/SKILL.md)
+      then resume
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: production evidence only

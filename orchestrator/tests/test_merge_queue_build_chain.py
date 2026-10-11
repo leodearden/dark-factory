@@ -23,9 +23,9 @@ Harness notes (see plan pre-1):
     runs STRICT, so ``@pytest.mark.asyncio`` is required on async test classes.
   * That same config turns "marked with @pytest.mark.asyncio but not an async
     function" into an ERROR — never put a sync ``test_*`` inside a marked class.
-  * Default per-test ``timeout = 60``; real-git classes carry
-    ``@pytest.mark.timeout(180)`` since a chain of 3 merges plus worktree
-    creation can exceed it.
+  * Real-git classes carry
+    ``@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)`` because a chain of 3
+    merges plus worktree creation is slow.
 """
 
 from __future__ import annotations
@@ -35,10 +35,11 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import MergeRequest, SpeculativeMergeWorker
+from orchestrator.merge_queue import ItemLifecycleState, MergeRequest, SpeculativeMergeWorker
 from orchestrator.merge_types import GroupMergeRequest, QueuedBranch
 
 # ── repo fixtures (mirrors test_merge_queue_conflict_graph.py:34-50) ──────────
@@ -127,6 +128,24 @@ def _make_git_ops(repo: Path, *, pool: bool = True, size: int = 1) -> GitOps:
         _make_spec_git_config(on=pool), repo, merge_spec_warm_lane_pool_size=size,
     )
 
+
+
+def _registry_states(worker: SpeculativeMergeWorker) -> dict[str, ItemLifecycleState]:
+    """The item-lifecycle registry's non-terminal map, read from the registry itself.
+
+    ``snapshot()['entries']`` is NOT a usable stand-in here: its lane-buffer
+    section hard-codes ``'queued'`` and excludes buffered ids from the
+    registry-sourced section, so it stays identical whether or not
+    ``chain_snapshot()`` registers or transitions a buffered item. The one
+    private hop (``_lifecycle``) is a measured residual — the public surface
+    that would remove it is task 5446's.
+
+    EXCLUDES TERMINAL entries, so a regression that registered an item
+    directly AT ``ItemLifecycleState.TERMINAL`` is outside what callers of
+    this helper can see; a later TRANSITION to TERMINAL still shows up, as a
+    key that disappears from the mapping.
+    """
+    return worker._lifecycle.non_terminal_items()
 
 def _make_config(repo: Path, git_config: GitConfig | None = None) -> OrchestratorConfig:
     return OrchestratorConfig(
@@ -333,7 +352,7 @@ class TestChainResultContract:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestMergeBranchIntoWorktree:
     """merge_branch_into_worktree merges into a CALLER-SUPPLIED worktree.
 
@@ -596,7 +615,7 @@ class TestMergeBranchIntoWorktree:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestChainBuildLane:
     """The chain-build worktree-routing seam in merge_liveness.py."""
 
@@ -641,12 +660,12 @@ class TestChainBuildLane:
         assert await git_ops._is_registered_worktree(lane)
         assert await _rev_parse(lane) == head_sha
         assert git_ops.spec_warm_lane_pool is not None
-        assert git_ops.spec_warm_lane_pool._lanes[lane] == LaneState.ASSIGNED
+        assert git_ops.spec_warm_lane_pool.state(lane) is LaneState.ASSIGNED
 
         await release_chain_build_lane(git_ops, lane, warm=warm)
 
         # Warm release: pool FREE, worktree retained (target/ stays warm).
-        assert git_ops.spec_warm_lane_pool._lanes[lane] == LaneState.FREE
+        assert git_ops.spec_warm_lane_pool.state(lane) is LaneState.FREE
         assert await git_ops._is_registered_worktree(lane)
 
     async def test_cold_path_when_pool_knob_off(self, git_repo: Path):
@@ -769,7 +788,7 @@ class TestChainBuildLane:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestChainSnapshot:
     """chain_snapshot() returns queued items in pick order without mutating."""
 
@@ -865,11 +884,11 @@ class TestChainSnapshot:
         worker._lane_buffers['normal'].extend(
             _make_req(str(i), str(i), config, git_repo) for i in (101, 102)
         )
-        before = dict(worker._lifecycle._states)
+        before = _registry_states(worker)
 
         worker.chain_snapshot()
 
-        assert dict(worker._lifecycle._states) == before
+        assert _registry_states(worker) == before
 
     async def test_is_idempotent(self, git_repo: Path):
         """Two consecutive calls return equal tuples."""
@@ -962,7 +981,7 @@ def _count_spec_lane_acquires(git_ops: GitOps, monkeypatch) -> list[str]:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestBuildChainDegenerate:
     """Degenerate inputs return an empty ChainResult and touch ZERO worktrees.
 
@@ -988,8 +1007,8 @@ class TestBuildChainDegenerate:
         assert calls == []
         assert git_ops.spec_warm_lane_pool is not None
         assert all(
-            s == LaneState.FREE
-            for s in git_ops.spec_warm_lane_pool._lanes.values()
+            git_ops.spec_warm_lane_pool.state(lane) is LaneState.FREE
+            for lane in git_ops.spec_warm_lane_pool.lane_paths()
         )
 
     async def test_cap_zero_is_the_kill_switch(self, git_repo: Path, monkeypatch):
@@ -1102,7 +1121,7 @@ class TestBuildChainDegenerate:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestBuildChainClean:
     """A clean 3-item chain builds in exactly one worktree."""
 
@@ -1154,7 +1173,7 @@ class TestBuildChainClean:
         assert res.lane == git_ops.worktree_base / '_spec-0'
         assert res.lane_warm is True
         assert git_ops.spec_warm_lane_pool is not None
-        assert git_ops.spec_warm_lane_pool._lanes[res.lane] == LaneState.ASSIGNED
+        assert git_ops.spec_warm_lane_pool.state(res.lane) is LaneState.ASSIGNED
 
         # Cumulative tree correctness — the chain is a real superset, which is
         # why ONE verify can authorise the whole prefix.
@@ -1172,7 +1191,7 @@ class TestBuildChainClean:
 
         # The documented release path works end to end.
         await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
-        assert git_ops.spec_warm_lane_pool._lanes[res.lane] == LaneState.FREE
+        assert git_ops.spec_warm_lane_pool.state(res.lane) is LaneState.FREE
 
     async def test_clean_chain_from_a_frozen_merge_commit_head(self, git_repo: Path):
         """head == a prior merge commit (the frozen-prefix-non-empty variant)."""
@@ -1273,7 +1292,14 @@ def _spy_merges(git_ops: GitOps, monkeypatch) -> list[str]:
 
 
 def _spy_merge_attempt_events(monkeypatch) -> list[tuple[str, object]]:
-    """Replace ``merge_queue._emit_merge_attempt`` with a recorder."""
+    """Replace ``merge_queue._emit_merge_attempt`` with a recorder.
+
+    Ruled residual (esc-5029-12): ``build_chain`` takes no event store and
+    ``_emit_merge_attempt`` sits behind none of the injected ports, so a
+    dotted-path spy on the module global is the only seam that can observe
+    an emit from inside the chain builder. ``store.events`` on a worker
+    constructed only for ``chain_snapshot()`` cannot.
+    """
     from orchestrator import merge_queue as _mq
 
     calls: list[tuple[str, object]] = []
@@ -1323,7 +1349,7 @@ async def _assert_lane_clean_at(lane: Path, tip: str) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestBuildChainTruncation:
     """The task's headline signal: clean prefix, conflicted item UNTOUCHED, ONE worktree.
 
@@ -1412,16 +1438,18 @@ class TestBuildChainTruncation:
         await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
 
     async def test_emits_no_merge_attempt_event(self, git_repo: Path, monkeypatch):
-        """Zero events of ANY type — an outcome event would be a false report."""
-        from _recording_event_store import _RecordingEventStore
+        """No merge_attempt emit from inside build_chain — it would be a false report.
 
+        Observed through the ``_emit_merge_attempt`` spy: build_chain holds no
+        event store, so the worker's store is not a seam here (the worker
+        exists only to produce ``chain_snapshot()``).
+        """
         from orchestrator.merge_liveness import release_chain_build_lane
         from orchestrator.merge_queue import build_chain
 
         git_ops = _make_git_ops(git_repo)
         config = _make_config(git_repo)
-        store = _RecordingEventStore()
-        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), store)  # type: ignore[arg-type]
+        worker = _make_worker(git_ops)
         emitted = _spy_merge_attempt_events(monkeypatch)
         await self._conflicting_trio(git_repo)
         head = await _rev_parse(git_repo)
@@ -1435,7 +1463,6 @@ class TestBuildChainTruncation:
 
         assert res.truncated_at == '102'
         assert emitted == []
-        assert store.events == []
         await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
 
     async def test_does_not_mutate_queue_state(self, git_repo: Path, monkeypatch):
@@ -1453,7 +1480,7 @@ class TestBuildChainTruncation:
             _make_req(str(i), str(i), config, git_repo) for i in (101, 102, 103)
         )
         buffers_before = {k: list(v) for k, v in worker._lane_buffers.items()}
-        lifecycle_before = dict(worker._lifecycle._states)
+        lifecycle_before = _registry_states(worker)
 
         res = await build_chain(
             git_ops, worker.chain_snapshot(), head, cap=6, target_depth=3,
@@ -1467,7 +1494,7 @@ class TestBuildChainTruncation:
             assert len(after[lane_name]) == len(items)
             for got, want in zip(after[lane_name], items, strict=True):
                 assert got is want
-        assert dict(worker._lifecycle._states) == lifecycle_before
+        assert _registry_states(worker) == lifecycle_before
         assert noted == []
         await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
 
@@ -1623,8 +1650,8 @@ class TestBuildChainTruncation:
         assert res.lane_warm is False
         assert git_ops.spec_warm_lane_pool is not None
         assert all(
-            s == LaneState.FREE
-            for s in git_ops.spec_warm_lane_pool._lanes.values()
+            git_ops.spec_warm_lane_pool.state(lane) is LaneState.FREE
+            for lane in git_ops.spec_warm_lane_pool.lane_paths()
         )
         assert not snap[0].result.done()
 
@@ -1735,8 +1762,8 @@ class TestBuildChainTruncation:
         assert res.lane_warm is False
         assert git_ops.spec_warm_lane_pool is not None
         assert all(
-            s == LaneState.FREE
-            for s in git_ops.spec_warm_lane_pool._lanes.values()
+            git_ops.spec_warm_lane_pool.state(lane) is LaneState.FREE
+            for lane in git_ops.spec_warm_lane_pool.lane_paths()
         )
         assert not snap[0].result.done()
 
@@ -1794,8 +1821,8 @@ class TestBuildChainTruncation:
         # stranded ASSIGNED by the unwinding cancellation.
         assert git_ops.spec_warm_lane_pool is not None
         assert all(
-            s == LaneState.FREE
-            for s in git_ops.spec_warm_lane_pool._lanes.values()
+            git_ops.spec_warm_lane_pool.state(lane) is LaneState.FREE
+            for lane in git_ops.spec_warm_lane_pool.lane_paths()
         )
         # A WARM release deliberately retains the worktree for pool reuse, so
         # the worktree set legitimately grows — what must not happen is a
@@ -1804,7 +1831,7 @@ class TestBuildChainTruncation:
             n for n in (await _worktree_names(git_ops)) - before
             if n.startswith('_spec-')
         }
-        assert leaked <= {p.name for p in git_ops.spec_warm_lane_pool._lanes}
+        assert leaked <= {p.name for p in git_ops.spec_warm_lane_pool.lane_paths()}
         # Purity (decision #4) holds on the cancellation path too: no outcome
         # was emitted for either item, including the one that DID chain.
         assert not snap[0].result.done()
@@ -1832,26 +1859,26 @@ def _fail_rev_parse_head(monkeypatch, *, after_merge: bool) -> dict[str, int]:
     """
     from orchestrator import git_ops as _go
 
-    real = _go._run
+    unpatched = _run
     state = {'merged': 0, 'failed': 0}
 
     async def _fake(cmd, cwd=None, *, input_text=None):
         if cmd[:3] == ['git', 'merge', '--no-ff']:
             state['merged'] += 1
-            return await real(cmd, cwd, input_text=input_text)
+            return await unpatched(cmd, cwd, input_text=input_text)
         is_head_read = cmd == ['git', 'rev-parse', 'HEAD']
         armed = (state['merged'] > 0) if after_merge else (state['merged'] == 0)
         if is_head_read and armed and not state['failed']:
             state['failed'] += 1
             return 1, '', 'fatal: not a git repository (simulated)\n'
-        return await real(cmd, cwd, input_text=input_text)
+        return await unpatched(cmd, cwd, input_text=input_text)
 
     monkeypatch.setattr(_go, '_run', _fake)
     return state
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestMergeBranchIntoWorktreeRevParseGuard:
     """An unreadable HEAD must be a loud failure, never a phantom empty sha.
 

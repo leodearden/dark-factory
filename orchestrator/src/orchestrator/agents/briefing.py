@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
+from shared.briefing_queries import BriefingScope
+
+from orchestrator.agents.memory_recall import MemoryRecall
 from orchestrator.agents.roles import WAIT_PATTERN_REMINDER
 from orchestrator.config import OrchestratorConfig
-from orchestrator.mcp_lifecycle import mcp_call
 
 logger = logging.getLogger(__name__)
 
@@ -52,341 +54,199 @@ def _format_commit_bullets(commits: list[dict], limit: int | None = None) -> str
         )
     return '\n'.join(lines)
 
+DELIVERED_CHECK_BULLET_LIMIT = 20
+"""Max delivered-check bullets rendered in one briefing section (task 5359).
 
-FOREIGN_PROJECT_TAG_KEYS = ('src_project', 'project_id', 'group_id', 'project')
-"""Metadata keys, in precedence order, that name a memory result's owning project.
+Bounds the capability-gate section, whose source — a task's author-supplied
+``metadata.delivered_checks`` — carries no length ceiling of its own, and whose
+per-entry cost is unbounded too: a ``grep`` descriptor's ``pattern`` is an
+arbitrary regex. Without a cap the section grows with the author's list in
+EVERY architect/simple_task dispatch of that task. As with
+``COMMIT_BULLET_LIMIT``, the truncation is rendered VISIBLY so the agent knows
+the list is partial and can read the rest from the task record itself.
+"""
 
-``src_project`` is FIRST: the task-2273 CGL-eta rehome
-(``fused-memory/src/fused_memory/maintenance/rehome_scope_tag.py``, kind
-``cgl_eta_cross_target_rehome``) wrote Mem0 entries that physically live in
-``dst_project``'s collection but reference ``src_project``'s task numbers —
-``src_project`` is the authoritative origin project, so it must win over any
-co-present ``project_id``/``group_id`` on the same entry. ``dst_project`` is
-deliberately ABSENT from this tuple: consulting it would falsely certify a
-rehomed foreign fact as local, since it names where the fact was relocated
-TO, not where it came from.
+_DELIVERED_CHECK_FIELDS_BY_KIND = {
+    'grep': ('pattern', 'expect', 'paths'),
+    'script': ('script', 'args', 'timeout_secs'),
+}
+"""Descriptor fields to render per ``kind``, mirroring
+``shared.capability_manifest.DeliveredCheckMeta``'s mutually exclusive
+grep/script slices. Single source for BOTH the recognised-kind bullet and the
+unrecognised-kind fallback (which renders whichever of the union is present),
+so the two paths cannot drift. ``test_briefing.py`` pins the union against the
+live model's ``model_fields``, so a field added to ``_CheckFieldsBase`` and not
+added here fails there rather than vanishing silently from every prompt.
+"""
+
+_DELIVERED_CHECK_LIST_FIELDS = {'paths': 'whole tree', 'args': 'none'}
+"""List-valued descriptor fields, mapped to what an EMPTY list means to the
+runner — ``paths: []`` greps the whole tree, ``args: []`` passes none. Rendering
+the meaning rather than a bare ``[]`` keeps the bullet readable for an agent.
 """
 
 
-GROUPED_CHILD_KEYS = ('amendments', 'matched_children')
-"""The keys under which fused-memory nests CHILD bodies inside a kept result.
+def _format_delivered_checks(checks: object) -> str:
+    """Render a task's ``metadata.delivered_checks`` as an agent-readable block.
 
-``fused_memory.server.grouped_read.group_search_results`` collapses an
-amendment/sighting hit into its parent and hangs the child data off the
-surviving parent entry at ``entry['grouped']``: truncated bodies under
-``amendments`` (bounded digests) and FULL bodies under ``matched_children``
-(``MATCHED_CHILDREN_KEY`` — where a swallowed matched child is pinned so its
-text stays reachable). Both render verbatim into the ``# Context`` block, so
-both must be walked.
+    Returns '' for a falsy input so ``BriefingAssembler._format_task`` can omit
+    the whole section on the common path (most tasks declare no capability).
 
-``grouped['parent']`` is deliberately ABSENT from this tuple: it is produced
-only by ``group_memory_document``, which serves the ``get_memory_by_id`` tool,
-and this module never calls that tool (verified — briefing.py contains no
-``get_memory_by_id`` reference; its only memory-tool call is ``search``, in
-:meth:`BriefingAssembler._mcp_search`). A branch for it would be unreachable
-code.
+    One bullet per descriptor, field-labelled so the rendered text names every
+    field of :class:`shared.capability_manifest.DeliveredCheckMeta` — a field
+    added to that model must not vanish silently from the prompt, which
+    ``test_briefing.py::TestFormatDeliveredChecks`` pins against the live
+    schema. Output is capped at ``DELIVERED_CHECK_BULLET_LIMIT`` with a visible
+    "…and N more" line, the never-silent-truncation convention
+    :func:`_format_commit_bullets` documents.
+
+    ``metadata`` is persisted, untyped data and ``_format_task`` runs on every
+    dispatch, so this fails OPEN the way
+    ``BriefingAssembler._format_prior_proposal`` does for ``files_referenced``:
+    a bare dict is accepted as a one-element list (a shape ``parse_metadata``
+    accepts, so a real task can carry one), ``paths``/``args`` elements are
+    ``str()``-coerced, and an entry whose ``kind`` is missing or unrecognised
+    degrades to a VISIBLE partial bullet rather than being dropped — dropping it
+    would reproduce this section's own reason for existing one level down, since
+    an unseen check still blocks mark-done. An element that is not a dict at all
+    cannot be given a bullet, so it is COUNTED visibly instead and the section is
+    still emitted: ``parse_metadata`` preserves a wrong-shaped slice with only a
+    ``SchemaWarning``, ``run_delivered_check`` maps such an entry to ERRORED, and
+    the gate turns that into a withheld mark-done — so returning '' would block a
+    task from ever stamping done while showing its agent no gate at all. '' is
+    reserved for a value that is neither a dict nor a list/tuple, i.e. genuinely
+    nothing to show.
+
+    The gate's own arming is CONDITIONAL (``delivered_checks.enabled``,
+    green-tier hot-reloadable), and this renderer is pure with no view of
+    config — so the block states the mechanical claim conditionally rather than
+    asserting a gate that may be disarmed at dispatch time. The directive is
+    unconditional either way: the descriptors are the acceptance contract the
+    task was filed under, armed gate or not.
+
+    The block carries its OWN reading directive rather than relying on the six
+    consuming prompt bodies to explain it — the same co-location precedent
+    ``_format_prior_proposal`` follows with its verify-before-reuse line. The
+    directive is load-bearing: ``docs/task-authoring.md`` §3.3 records that a
+    symbol-name grep "is satisfiable by prose — a comment, a docstring, or a
+    variable named after the thing", so handing an agent the literal pattern is
+    a teach-to-the-test hazard unless the same text tells it that matching the
+    pattern without delivering the behaviour is a defect.
+    """
+    if not checks:
+        return ''
+    if isinstance(checks, dict):
+        checks = [checks]
+    if not isinstance(checks, (list, tuple)):
+        return ''
+
+    entries = [check for check in checks if isinstance(check, dict)]
+    dropped = len(checks) - len(entries)
+
+    shown = entries[:DELIVERED_CHECK_BULLET_LIMIT]
+    lines = [_delivered_check_bullet(check) for check in shown]
+    hidden = len(entries) - len(shown)
+    if hidden > 0:
+        lines.append(
+            f'- …and {hidden} more declared check(s) (not shown — read the full '
+            f'list from this task\'s `metadata.delivered_checks`)'
+        )
+    if dropped > 0:
+        noun = 'entry' if dropped == 1 else 'entries'
+        lines.append(
+            f'- ⚠ {dropped} malformed {noun} on this task\'s '
+            f'`metadata.delivered_checks` could not be rendered here — still '
+            f'evaluated by the gate, so read the raw list from the task record.'
+        )
+    bullets = '\n'.join(lines)
+
+    return f"""\
+## Declared Capability Gate (metadata.delivered_checks)
+
+When the capability gate is enabled (the `delivered_checks.enabled` config leaf,
+which an operator can hot-reload), this task's OWN mark-done is gated on the
+capability checks below — not only its dependents'
+(`orchestrator/src/orchestrator/delivered_checks.py::gate_mark_done_on_delivered_checks`).
+
+{bullets}
+
+After this task lands, a `grep` check is re-run with `git grep -E` against the
+COMMITTED `main` tree and a `script` check against the working checkout. Under
+that gate a FAILED check blocks mark-done; on the dependency path it also fires
+an escalation routed straight at a human. Treat the checks as binding whether or
+not the gate is armed on this fleet: they are the acceptance contract this task
+was filed under.
+
+Deliver the BEHAVIOUR each capability names. Satisfying a pattern with a comment, a
+docstring, or a variable named after the thing is a defect, not a pass. If a
+descriptor cannot be satisfied by the work this task should do, escalate it
+(`escalate_blocker(category='design_concern')`) rather than writing the string to
+make the check match. The descriptor contract lives in `docs/task-authoring.md` §3.3
+— read it there rather than inferring it from these bullets.
 """
 
 
-def _canonical_project(value: str) -> str:
-    """Canonicalise a project identifier for comparison.
+def _delivered_check_bullet(check: dict) -> str:
+    """Render one delivered-check descriptor as a single field-labelled bullet.
 
-    Mirrors fused-memory's ``canonicalize_project_id`` semantics
-    (``fused_memory/utils/validation.py``; see the divergent-spelling
-    contract in ``plans/cross-graph-entity-leak-prd.md`` decision 1 / S1) —
-    strip, lowercase, ``'-'`` -> ``'_'`` — so a tag spelled ``dark-factory``
-    is not mistaken for a project distinct from ``dark_factory``.
-
-    Re-implemented locally rather than imported: orchestrator declares no
-    runtime dependency on fused-memory (it appears only in
-    ``orchestrator/pyproject.toml``'s ``[tool.pyright] extraPaths``, a
-    type-checking-only reference), so importing it here would risk an
-    ``ImportError`` in any deployment where fused-memory is not co-installed.
+    An unrecognised or missing ``kind`` renders whichever descriptor fields are
+    present, flagged UNRECOGNISED so the malformation is visible to whoever
+    reads the prompt and the agent can ask rather than guess.
     """
-    return value.strip().lower().replace('-', '_')
+    kind = check.get('kind')
+    fields = [f'kind: `{kind}`']
+    if kind in _DELIVERED_CHECK_FIELDS_BY_KIND:
+        fields += [
+            _delivered_check_field(check, name)
+            for name in _DELIVERED_CHECK_FIELDS_BY_KIND[kind]
+        ]
+    else:
+        fields.append('UNRECOGNISED descriptor, shown as-is')
+        fields += [
+            _delivered_check_field(check, name)
+            for group in _DELIVERED_CHECK_FIELDS_BY_KIND.values()
+            for name in group
+            if name in check
+        ]
+    return f'- name: `{check.get("name")}` — ' + ', '.join(fields)
 
 
-def _result_project(entry: dict) -> tuple[str, str] | None:
-    """Read a result's owning-project tag from its metadata, if any.
+def _delivered_check_field(check: dict, name: str) -> str:
+    """Render one descriptor field as ``name: value``, coercing defensively."""
+    value = check.get(name)
+    if name not in _DELIVERED_CHECK_LIST_FIELDS:
+        return f'{name}: `{value}`'
+    if value is None:
+        items: list = []
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        items = [value]
+    return f'{name}: {", ".join(str(v) for v in items) or _DELIVERED_CHECK_LIST_FIELDS[name]}'
 
-    Walks :data:`FOREIGN_PROJECT_TAG_KEYS` in precedence order and returns
-    the ``(key, value)`` pair of the first present, non-empty **string**
-    value found in ``entry['metadata']``. A non-string value (e.g. an int)
-    is treated as absent rather than crashing the comparison. Returns
-    ``None`` — i.e. untagged — when ``entry['metadata']`` is missing, not a
-    dict, or carries none of the recognised keys.
 
-    The matched key is returned alongside the value (not just the value) so
-    a drop can be logged with enough context — which key fired, and what it
-    said — to diagnose a false-positive filter from the logs alone.
+def _caller_agent_id(task_id: str | None, role: str) -> str:
+    """The agent-id a dispatch is known by, in its prompt and in the journal.
+
+    One home for the format (INV-5): :meth:`BriefingAssembler._agent_identity`
+    renders the prompt's ``## Agent Identity`` block from this, and every
+    memory search declares the same string as ``caller_agent_id`` (D8). A
+    second copy at the search call site would let the identity an agent is
+    TOLD it has drift from the one the journal records it asking under.
     """
-    metadata = entry.get('metadata')
-    if not isinstance(metadata, dict):
-        return None
-    for key in FOREIGN_PROJECT_TAG_KEYS:
-        tag = metadata.get(key)
-        if isinstance(tag, str) and tag.strip():
-            return key, tag
-    return None
+    return f'claude-task-{task_id}-{role}' if task_id else f'claude-{role}'
 
 
-def _foreign_tag(entry: dict, target: str) -> tuple[str, str] | None:
-    """The ``(key, value)`` of *entry*'s project tag when it names a FOREIGN project.
+def _plan_scope(plan: dict, task_id: str | None) -> BriefingScope:
+    """Scope a post-planning role from the plan it was handed.
 
-    THE single spelling of the drop decision, shared by the top-level result
-    loop in :func:`filter_foreign_project_results` and the nested-child loop in
-    :func:`_filter_grouped_children`. The whole value of the descent is that a
-    nested child is judged by the SAME rule as a top-level result; two
-    independent copies of "read the tag, canonicalise, compare" would be
-    exactly the silent-divergence class this module otherwise works hard to
-    prevent — a later change to the comparison (a project whitelist, an
-    allow-empty-tag rule) applied to only one site would leave the other
-    quietly stricter, and a nested-only divergence surfaces as ``dropped == 0``,
-    indistinguishable from "nothing foreign found".
-
-    ``target`` must ALREADY be canonicalised by :func:`_canonical_project`: it
-    is loop-invariant, so it is normalised once by the caller rather than once
-    per entry.
-
-    Returns ``None`` — i.e. KEEP — both when the entry carries no readable tag
-    (the deliberate keep-untagged policy documented on
-    :func:`filter_foreign_project_results`) and when its tag canonicalises
-    equal to ``target``. The two are not distinguished here because neither
-    caller acts on the difference; each only needs to know whether to drop.
-
-    The firing key rides along with the value so a caller can log WHICH key
-    fired and WHAT it said, and so diagnose a false-positive filter from the
-    logs alone.
+    An explicitly-passed *task_id* wins over the plan's own copy, exactly as
+    the ``task_id or plan.get('task_id')`` these call sites used to spell did:
+    the workflow holds the authoritative id, and a plan written in an earlier
+    session can carry a stale one.
     """
-    match = _result_project(entry)
-    if match is None:
-        return None
-    key, tag = match
-    if _canonical_project(tag) == target:
-        return None
-    return key, tag
-
-
-def _filter_grouped_children(entry: dict, target: str) -> int:
-    """Drop cross-project CHILD entries nested inside a KEPT result's block.
-
-    Walks :data:`GROUPED_CHILD_KEYS` inside ``entry['grouped']`` and applies
-    the SAME rule the top-level loop applies — literally the same predicate,
-    :func:`_foreign_tag`, so the ``src_project`` precedence order, the
-    canonicalisation and the keep-untagged policy exist in ONE place and
-    cannot drift apart between the two call sites. Returns the number of
-    nested entries dropped, which the caller reports SEPARATELY from its own
-    top-level drops — see :func:`filter_foreign_project_results`.
-
-    SURGICAL. Only the child LISTS are rewritten, and only when something was
-    actually dropped. ``amendment_count`` / ``sighting_count`` are NEVER
-    recomputed: they are the EXACT values ``_read_grouped_document``
-    (``fused_memory/server/grouped_read.py``:292-327) got from
-    ``count_memories_by_metadata``, deliberately independent of what the
-    bounded digest list happens to contain — the block already reports a
-    short list via ``truncated`` rather than by shrinking the count. A
-    briefing that "fixed" the apparent inconsistency between a shortened list
-    and its count would be fabricating a number the store never returned.
-    ``truncated``, ``children_unavailable`` and every other ``grouped`` key
-    are likewise left exactly as the server sent them.
-
-    FAILS OPEN, like the rest of this module: a ``grouped`` value or a child
-    collection of an unexpected TYPE is left untouched (and logged at WARNING,
-    since a shape surprise means the safeguard did not run on that entry)
-    rather than raising, and a nested entry that is not a dict is KEPT — the
-    same treatment the top-level loop gives a stray non-dict result.
-    """
-    grouped = entry.get('grouped')
-    if grouped is None:
-        # The overwhelmingly common shape: a canonical with no child records
-        # gets no grouped block at all.
-        return 0
-    if not isinstance(grouped, dict):
-        logger.warning(
-            f'filter_foreign_project_results: entry {entry.get("id")!r} has a '
-            f"'grouped' value of type {type(grouped).__name__}, not a dict; "
-            'nested children left unfiltered'
-        )
-        return 0
-    dropped = 0
-    for key in GROUPED_CHILD_KEYS:
-        children = grouped.get(key)
-        if children is None:
-            continue
-        if not isinstance(children, list):
-            logger.warning(
-                f'filter_foreign_project_results: entry {entry.get("id")!r} has '
-                f'grouped[{key!r}] of type {type(children).__name__}, not a list; '
-                'left unfiltered'
-            )
-            continue
-        kept = []
-        for child in children:
-            # A non-dict nested entry is unclassifiable, not foreign — kept,
-            # exactly as an untagged child is. (``_result_project``, reached
-            # through ``_foreign_tag``, already tolerates a non-dict
-            # ``metadata`` on a well-formed one.)
-            if isinstance(child, dict) and (foreign := _foreign_tag(child, target)) is not None:
-                tag_key, tag = foreign
-                dropped += 1
-                logger.debug(
-                    f'filter_foreign_project_results: dropped nested '
-                    f'{child.get("id")!r} under {entry.get("id")!r} '
-                    f'({tag_key}={tag!r})'
-                )
-                continue
-            kept.append(child)
-        if len(kept) != len(children):
-            grouped[key] = kept
-    return dropped
-
-
-def filter_foreign_project_results(
-    payload_text: str, project_id: str
-) -> tuple[str, int, int]:
-    """Drop cross-project results from a fused-memory ``search`` JSON payload.
-
-    ``payload_text`` is the JSON-serialised ``{'results': [...]}`` dict that
-    FastMCP returns as the ``search`` tool's text block (see
-    :meth:`BriefingAssembler._mcp_search`). Each result's project tag is read
-    via :func:`_result_project` (see :data:`FOREIGN_PROJECT_TAG_KEYS`); the
-    entry is dropped when a tag is present and, after
-    :func:`_canonical_project` normalisation, differs from ``project_id``,
-    and kept otherwise — including when ``metadata`` is missing, empty, or
-    not a dict.
-
-    GROUPED CHILDREN (task 4008). Reading only each result's TOP-LEVEL tag is
-    not enough: ``fused_memory.server.grouped_read.group_search_results``
-    nests child bodies inside a KEPT parent's entry (see
-    :data:`GROUPED_CHILD_KEYS`), and ``_get_memory_context`` appends this
-    payload verbatim, so a mis-tagged child hanging off a correctly-tagged
-    canonical would render as raw JSON in the agent's ``# Context`` block
-    having bypassed the safeguard entirely. :func:`_filter_grouped_children`
-    therefore descends into every KEPT entry and applies the same rule
-    (:func:`_foreign_tag`) to its children. This depends on grouped_read.py's
-    ``_origin_tags`` projection actually emitting ``metadata`` on nested
-    entries — without it every nested entry is untagged and the descent is a
-    safeguard that never fires.
-
-    Nested drops are returned SEPARATELY from top-level drops rather than
-    summed into one number. A dropped child is not a dropped result: the two
-    have different blast radii (a dropped result removes a whole recalled
-    fact; a dropped child only shortens a kept fact's amendment list), and
-    ``_get_memory_context`` renders these counts to an operator as the ONLY
-    signal that a leak was blocked, so the arithmetic has to say which kind
-    happened. Both still gate the no-op fast path below, so a nested-only
-    drop can never be swallowed by it.
-
-    Untagged results are deliberately kept rather than dropped: every
-    Graphiti-sourced result has ``metadata == {}`` today (verified at
-    ``fused-memory/src/fused_memory/services/memory_service.py:3332-3407``,
-    ``_search_graphiti``, which only ever adds a ``planned`` key), so
-    dropping untagged results would empty the ``# Context`` block for most
-    queries. Only Mem0-sourced results can carry a project tag today.
-
-    Returns ``(payload_text, dropped, nested_dropped)``: the re-serialised
-    payload — sibling top-level keys such as
-    ``degraded``/``failed_stores``/``failed_store_diagnostics`` are preserved
-    verbatim — then the number of top-level RESULTS dropped, then the number
-    of nested CHILDREN dropped from inside results that survived. Returns
-    ``('', dropped, nested_dropped)`` when nothing survives, so the existing
-    ``if section:`` guards in ``_get_memory_context`` skip an all-foreign
-    section the same way they skip an empty one. (``nested_dropped`` is
-    necessarily 0 in that case: a dropped parent is never descended into.)
-
-    When nothing is dropped (the common case — see above), ``payload_text``
-    is returned unchanged rather than re-serialised: this preserves the
-    upstream formatting byte-for-byte and avoids the cost of a needless
-    round-trip. When something IS dropped, the re-serialisation uses
-    ``ensure_ascii=False`` so non-ASCII content (dark-factory memory text is
-    dense with em dashes and accented characters) is not escaped into
-    ``\\uXXXX`` sequences in the rendered ``# Context`` block.
-
-    Fails OPEN on a malformed payload — non-JSON text, JSON that is not an
-    object, or a missing/non-list ``results`` — returning ``(payload_text,
-    0, 0)`` unchanged and logging a WARNING. Blanking the ``# Context`` block on
-    a serialisation surprise would be a silent capability loss across every
-    prompt builder; preserving today's (unfiltered) behaviour with a loud
-    warning is the safer failure direction. A stray non-dict entry, or a
-    non-dict ``metadata`` on an otherwise-well-formed entry, is kept rather
-    than raising — treated the same as an untagged result.
-    """
-    try:
-        payload = json.loads(payload_text)
-    except (json.JSONDecodeError, TypeError, ValueError) as e:
-        logger.warning(f'filter_foreign_project_results: payload is not valid JSON ({e}); keeping unfiltered')
-        return payload_text, 0, 0
-
-    if not isinstance(payload, dict):
-        logger.warning(
-            f'filter_foreign_project_results: payload is a {type(payload).__name__}, '
-            'not a JSON object; keeping unfiltered'
-        )
-        return payload_text, 0, 0
-
-    results = payload.get('results')
-    if not isinstance(results, list):
-        logger.warning(
-            f"filter_foreign_project_results: payload['results'] is a "
-            f'{type(results).__name__}, not a list; keeping unfiltered'
-        )
-        return payload_text, 0, 0
-
-    target = _canonical_project(project_id)
-    kept = []
-    dropped = 0
-    nested_dropped = 0
-    for entry in results:
-        if not isinstance(entry, dict):
-            kept.append(entry)
-            continue
-        if (foreign := _foreign_tag(entry, target)) is not None:
-            key, tag = foreign
-            dropped += 1
-            logger.debug(
-                f'filter_foreign_project_results: dropped {entry.get("id")!r} '
-                f'({key}={tag!r})'
-            )
-            continue
-        # Only for a KEPT entry: a dropped parent takes its whole subtree with
-        # it, so descending into one would double-count what is already gone.
-        nested_dropped += _filter_grouped_children(entry, target)
-        kept.append(entry)
-
-    if not kept:
-        return '', dropped, nested_dropped
-
-    if dropped == 0 and nested_dropped == 0:
-        # No-op: nothing was filtered, so avoid re-serialising a payload
-        # that is byte-for-byte unchanged — this is the overwhelmingly
-        # common case, since every Graphiti-sourced result is untagged
-        # today and the filter never fires on it. Gated on BOTH counters:
-        # a nested-only drop mutated a child list in place, so returning
-        # the original text here would silently un-drop it.
-        return payload_text, 0, 0
-
-    payload = dict(payload)
-    payload['results'] = kept
-    return json.dumps(payload, indent=2, ensure_ascii=False), dropped, nested_dropped
-
-
-MEMORY_CONTEXT_CAVEAT = (
-    "_This context was recalled from the `{project_id}` project's memory — "
-    'it is NOT a description of this worktree. It may name tasks, repos, '
-    'crates, or file paths that do not exist here. Do not assume a recalled '
-    'path is real: verify it exists before reading it or `cd`-ing into it._'
-)
-"""Standing provenance caveat rendered right after the ``# Context`` heading.
-
-Covers the leak channel :func:`filter_foreign_project_results` cannot reach:
-every Graphiti-sourced memory result has ``metadata == {}`` today (see that
-function's docstring), so an untagged foreign fact — e.g. a path belonging
-to a different project's repo — survives the filter unclassified and
-renders verbatim. The tag filter is the permanent chokepoint for taggable
-(Mem0) results; this caveat is what actually converts "agent `cd`'s/reads
-into a recalled foreign path" into "agent verifies the path first" for the
-untagged majority. Interpolated with ``self.project_id`` via ``.format()``.
-"""
+    scope = BriefingScope.from_plan(plan)
+    return replace(scope, task_id=str(task_id)) if task_id else scope
 
 
 @dataclass
@@ -425,16 +285,31 @@ class BriefingAssembler:
 
     def __init__(self, config: OrchestratorConfig):
         self.config = config
-        self.memory_url = config.fused_memory.url
         self.project_id = config.fused_memory.project_id
+        self._memory_recall = MemoryRecall(config.fused_memory.url, self.project_id)
 
     def _agent_identity(self, task_id: str | None, role: str) -> str:
-        agent_id = f'claude-task-{task_id}-{role}' if task_id else f'claude-{role}'
+        agent_id = _caller_agent_id(task_id, role)
         return (
             f'## Agent Identity\n\n'
             f'- **agent_id:** `{agent_id}`\n'
             f'- **project_id:** `{self.project_id}`\n'
         )
+
+    async def _task_preamble(
+        self,
+        task: dict,
+        role: str,
+        context: str | None,
+        *,
+        include_files: bool = True,
+    ) -> str:
+        """The memory, identity and ``# Task`` header a task-scoped briefing opens with."""
+        if context is None:
+            context = await self._get_memory_context(BriefingScope.from_task(task), role)
+        identity = self._agent_identity(task.get('id'), role)
+        task_block = self._format_task(task, include_files=include_files)
+        return f'{context}\n\n{identity}\n\n# Task\n\n{task_block}'
 
     async def build_architect_prompt(
         self,
@@ -465,11 +340,9 @@ class BriefingAssembler:
                 byte-identical to the pre-γ baseline, so nothing is added on
                 the common path.
         """
-        if context is None:
-            context = await self._get_memory_context(task.get('id'))
-
-        task_block = self._format_task(task, include_files=False)
-        identity = self._agent_identity(task.get('id'), 'architect')
+        preamble = await self._task_preamble(
+            task, 'architect', context, include_files=False,
+        )
 
         prior_proposal_section = ''
         if include_prior_proposals:
@@ -517,13 +390,7 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
 """
 
         return f"""\
-{context}
-
-{identity}
-
-# Task
-
-{task_block}
+{preamble}
 
 {prior_proposal_section}{committed_section}
 # Action
@@ -554,11 +421,7 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         merged).  The architect reviews the existing plan against the changes
         and either confirms, updates, or recreates it.
         """
-        if context is None:
-            context = await self._get_memory_context(task.get('id'))
-
-        task_block = self._format_task(task)
-        identity = self._agent_identity(task.get('id'), 'architect')
+        preamble = await self._task_preamble(task, 'architect', context)
         prior_proposal_section = self._format_prior_proposal(task)
 
         plan_files = set(existing_plan.get('files', []))
@@ -590,13 +453,7 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         plan_json = json.dumps(existing_plan, indent=2)
 
         return f"""\
-{context}
-
-{identity}
-
-# Task
-
-{task_block}
+{preamble}
 
 {prior_proposal_section}
 # Plan Revalidation
@@ -649,11 +506,7 @@ and either confirm it, update it, or recreate it from scratch.
         partial entirely (``create_plan`` overwrites it) if it reflects a
         flawed approach.
         """
-        if context is None:
-            context = await self._get_memory_context(task.get('id'))
-
-        task_block = self._format_task(task)
-        identity = self._agent_identity(task.get('id'), 'architect')
+        preamble = await self._task_preamble(task, 'architect', context)
 
         existing_steps = [
             s for s in partial_plan.get('steps', []) if isinstance(s, dict)
@@ -661,13 +514,7 @@ and either confirm it, update it, or recreate it from scratch.
         plan_json = json.dumps(partial_plan, indent=2)
 
         return f"""\
-{context}
-
-{identity}
-
-# Task
-
-{task_block}
+{preamble}
 
 # Plan Completion — Finish an Interrupted Plan
 
@@ -724,8 +571,12 @@ to start over from nothing.
 
         The merge gate flagged ``not_touched``: plan-declared files that
         no commit on the branch actually touched.  Give the architect
-        ONE bounded chance to drop genuinely-unneeded entries via
-        ``update_plan_metadata(files=[narrowed list])``.
+        ONE bounded chance to reconcile the plan with branch reality.
+        Option (c), ``drop_plan_file``, gives an over-declared file a
+        truthful exit from the "drop = falsify provenance, confirm = mislabel
+        complete work" dilemma named at
+        ``orchestrator/src/orchestrator/merge_gates.py::CROSS_REPO_DELIVERABLE_REASON_PREFIX``
+        and ``::ALREADY_LANDED_REASON_PREFIX``.
 
         Lenient semantics — the architect may keep some flagged entries
         (treating them as genuinely needed; the gate's re-check is then
@@ -733,24 +584,14 @@ to start over from nothing.
         a post-pass subset check rejects any plan that added entries
         beyond the current ``plan.files`` set.
         """
-        if context is None:
-            context = await self._get_memory_context(task.get('id'))
-
-        task_block = self._format_task(task)
-        identity = self._agent_identity(task.get('id'), 'architect')
+        preamble = await self._task_preamble(task, 'architect', context)
 
         current_files = list(plan.get('files', []))
         files_list = '\n'.join(f'- `{f}`' for f in current_files) or '_(empty)_'
         not_touched_list = '\n'.join(f'- `{f}`' for f in not_touched) or '_(none)_'
 
         return f"""\
-{context}
-
-{identity}
-
-# Task
-
-{task_block}
+{preamble}
 
 # Plan Tightening — Architect Narrowing Pass
 
@@ -768,16 +609,33 @@ work is genuinely incomplete.
 
 {not_touched_list}
 
-## Action — choose exactly ONE
+## Action — choose ONE of (a) or (b); (c) is per-entry and may be repeated
 
 a. **Drop genuinely-unneeded entries**: call
    `update_plan_metadata(files=[<narrowed list>])` with a subset of the
-   current plan files.  You may keep some flagged entries if you judge
-   them genuinely needed; the gate's re-check is the source of truth.
+   current plan files.  A flagged entry you LEAVE in the list
+   will re-fire the gate's re-check and escalate — keeping one is a
+   deliberate choice to escalate, not a neutral default.  Either way,
+   the gate's re-check is the source of truth.
 b. **Plan is honest as-is**: call `confirm_plan()` unchanged.  The
    workflow will then file a level-1 escalation (auto-watcher triages; promotes to L2 if a human is needed) — choose this only when the
    work is genuinely incomplete and the flagged files really do need
-   edits.
+   edits.  A DELIVERED branch whose flagged file simply needed no edit
+   is NOT this case — that belongs in (c) via `drop_plan_file`.
+c. **Correctly declared, and correctly needed no change**: call
+   `drop_plan_file(path, reason)` — ONCE PER SUCH ENTRY, repeating for
+   each one.  Use this when you were right to declare the file AND the
+   branch was right to leave it alone: the work landed, and this entry
+   simply needed no change.  `reason` is one line saying why the entry
+   was in scope and why no edit was needed.
+
+   This is not falsification, and that is the whole point of the
+   separate call.  The entry leaves the `files` list, so the gate's
+   re-check can pass; the reason stays in the plan record, so why the
+   file was ever declared remains auditable.  Dropping an entry with no
+   recorded reason is what would falsify the plan — which is why (a)
+   is the wrong tool for this case and `drop_plan_file` refuses a blank
+   reason.
 
 ## Forbidden for this pass
 
@@ -789,6 +647,93 @@ You must NOT add new files to the plan: the post-pass verifier rejects
 any plan whose `files` list contains entries beyond the current set
 above.  If the work needs new files, call `confirm_plan()` instead and
 let a human triage the scope change.
+
+The plan must also never be narrowed to an empty `files` list — an empty
+list is not a narrowed plan, it is an unchecked one, because the gate has
+nothing left to re-check.  `drop_plan_file` refuses to remove the last
+entry; do not use (a) to empty the list either.  If nothing legitimately
+remains, that is option (b): call `confirm_plan()` and let the escalation
+triage it.
+"""
+
+    async def build_plan_schema_repair_prompt(
+        self,
+        task: dict,
+        context: str | None = None,
+    ) -> str:
+        """Architect pass that restructures an on-disk plan missing ``steps``.
+
+        The plan is never copied into the prompt: plan.json is its single home,
+        read through the lane's ``.task/plan.json``. Completeness is attested
+        only by the architect's own ``confirm_plan()``.
+        """
+        preamble = await self._task_preamble(task, 'architect', context)
+
+        return f"""\
+{preamble}
+
+# Plan Schema Repair
+
+The plan for this task is on disk at `.task/plan.json` (a symlink into the
+durable `<worktree_base>/.task-meta/<worktree-name>/plan.json`), but it has no
+non-empty top-level `steps` array, so it cannot advance. It is NOT reproduced
+here — read the file in full.
+
+## Action
+
+1. Read `.task/plan.json` in full.
+2. Record its existing step content with the plan-tools:
+   `add_prerequisite(prereq_id, description)` for setup work and
+   `add_plan_step(step_id, step_type, description)` for each TDD step, in the
+   plan's own order, carrying each description across unchanged. If `files`
+   is missing or empty, set it with `update_plan_metadata(files=[...])`.
+3. Restructure only: do not redesign the plan or explore beyond what
+   restructuring needs. Do not call `create_plan` — it replaces the document
+   wholesale and would discard the analysis and decisions you are
+   restructuring.
+4. Call `confirm_plan()` as your FINAL action. Without it the repaired plan is
+   treated as incomplete and will not advance.
+
+If the file holds no step content to restructure, do not invent steps: stop
+without calling `confirm_plan()` and the task will be re-planned.
+"""
+
+    async def build_replan_prompt(
+        self,
+        task: dict,
+        review_feedback: str,
+        context: str | None = None,
+    ) -> str:
+        """Architect pass that extends the plan to answer blocking review issues.
+
+        The plan is never copied into the prompt: plan.json is its single home,
+        read through the lane's ``.task/plan.json``, so a replayed prompt cannot
+        show stale steps.
+        """
+        preamble = await self._task_preamble(task, 'architect', context)
+
+        return f"""\
+{preamble}
+
+# Re-Plan After Review
+
+The implementation was reviewed and blocking issues were found.
+
+{review_feedback}
+
+## Action
+
+1. Read `.task/plan.json` (a symlink into the durable
+   `<worktree_base>/.task-meta/<worktree-name>/plan.json`) for the current plan
+   and each step's status — it is not reproduced here.
+2. Add the steps that address the blocking issues with
+   `add_plan_step(step_id, step_type, description)`, using step ids not
+   already in the plan. New steps are recorded as pending.
+3. If those steps touch files the plan does not list, call
+   `update_plan_metadata(files=[...])` with the full widened list.
+4. Keep every existing step in place, in order: do not remove or reorder
+   steps, and do not call `create_plan` — it replaces the plan wholesale and
+   would discard completed steps.
 """
 
     async def build_simple_task_prompt(
@@ -804,13 +749,9 @@ let a human triage the scope change.
         ``mark_step_done`` and stop. The orchestrator then advances to VERIFY
         without invoking the implementer.
         """
-        if context is None:
-            context = await self._get_memory_context(task.get('id'))
+        preamble = await self._task_preamble(task, 'simple_task', context)
 
-        task_block = self._format_task(task)
-        identity = self._agent_identity(task.get('id'), 'simple_task')
-
-        files = (task.get('metadata') or {}).get('files') or []
+        files =(task.get('metadata') or {}).get('files') or []
         if files:
             files_list = '\n'.join(f'- `{f}`' for f in files)
             files_section = f'## Listed files\n\n{files_list}'
@@ -821,13 +762,7 @@ let a human triage the scope change.
         # substantial architectural thought") mirrors _COMPLEXITY_RUBRIC in roles.py.
         # Update both in lockstep if the rubric changes.
         return f"""\
-{context}
-
-{identity}
-
-# Task
-
-{task_block}
+{preamble}
 
 # Action
 
@@ -871,35 +806,26 @@ suggestions-only on this exact tree — call
     async def build_implementer_prompt(
         self,
         plan: dict,
-        iteration_log: list[dict],
         context: str | None = None,
         rebase_notice: dict | None = None,
         task_id: str | None = None,
         wip_notice: list[dict] | None = None,
     ) -> str:
-        """Build prompt for the implementer agent."""
-        effective_tid = task_id or plan.get('task_id')
+        """Build prompt for the implementer agent.
+
+        Renders NO plan progress and NO iteration history (tasks 5728, 5744):
+        plan.json and iterations.jsonl are their single homes, and the Session
+        Startup Protocol below mandates reading both. A copy frozen into this
+        string is the one that can lie, because the retry ladder replays an
+        assembled prompt verbatim into a fresh session
+        (shared/src/shared/cli_invoke.py::_reset_for_fresh_retry). Pinned by
+        orchestrator/tests/test_briefing_progress_spot.py.
+        """
+        scope = _plan_scope(plan, task_id)
         if context is None:
-            context = await self._get_memory_context(effective_tid)
+            context = await self._get_memory_context(scope, 'implementer')
 
-        identity = self._agent_identity(effective_tid, 'implementer')
-
-        completed = [s for s in plan.get('steps', []) if isinstance(s, dict) and s.get('status') == 'done']
-        pending = [s for s in plan.get('steps', []) if isinstance(s, dict) and s.get('status') == 'pending']
-        pre_completed = [s for s in plan.get('prerequisites', []) if isinstance(s, dict) and s.get('status') == 'done']
-        pre_pending = [s for s in plan.get('prerequisites', []) if isinstance(s, dict) and s.get('status') == 'pending']
-
-        log_summary = ''
-        if iteration_log:
-            recent = iteration_log[-3:]
-            log_lines = []
-            for entry in recent:
-                log_lines.append(
-                    f"- Iteration {entry.get('iteration', '?')}: "
-                    f"completed {entry.get('steps_completed', [])}, "
-                    f"summary: {entry.get('summary', 'N/A')}"
-                )
-            log_summary = "## Recent Iterations\n\n" + '\n'.join(log_lines)
+        identity = self._agent_identity(scope.task_id, 'implementer')
 
         rebase_section = ''
         if rebase_notice:
@@ -925,23 +851,37 @@ Review any overlap with your plan steps before continuing — file contents may 
             # No limit: _detect_tip_wip_commits is bounded by the contiguous
             # WIP run at HEAD, unlike the architect's whole-branch detector.
             commits_list = _format_commit_bullets(wip_notice)
+            # Attribution protocol and why (task 5177): orchestrator/tests/test_harness_wip_step_detection.py::TestWipSectionStepAttribution
             wip_section = f"""
 ## Already-Committed WIP — Verify Before Re-Implementing
 
 The harness auto-commits uncommitted work as a safety net before a
 rebase/requeue/reclaim. The commit(s) below landed at branch HEAD this way,
-which means the next pending step's implementation may already be sitting
+which means one or more pending steps' implementation may already be sitting
 there, complete, waiting on `mark_step_done`.
 
 {commits_list}
 
-Before writing any new code:
+A step's recorded commit is the commit whose diff carries that step's change.
+Passing tests alone do not identify it: they pass just the same when the
+change was committed earlier on this branch, below the commit(s) above.
+
+Before writing any new code, walk the pending steps in plan order:
 
 1. Run `git show <sha>` for each commit above to see what it contains.
-2. Run the next pending step's tests.
-3. If they already pass, call `mark_step_done(step_id, commit_sha)` with the
-   WIP commit's SHA instead of re-implementing the step.
-4. Only write new code if the step is genuinely unsatisfied by this commit.
+2. For each step, run `git log --oneline {self.config.git.main_branch}..HEAD -- <path>`
+   over the files it changes to find the commit on this branch that carries
+   its change, and run its tests. Only a step whose tests behave as its spec
+   says counts as carried.
+   - **Carried by an earlier, non-WIP commit:** call
+     `mark_step_done(step_id, <that commit's sha>)` and move to the next step.
+   - **Carried by a WIP commit above:** call
+     `mark_step_done(step_id, <that WIP sha>)` and move to the next step.
+     Several steps citing one WIP sha is correct when its diff carries each of
+     them. Do not split, amend or rewrite a WIP commit, and do not make an
+     empty commit to get a distinct sha.
+   - **Only partly carried, or not carried:** the walk ends here. Finish the
+     step normally, commit, and cite that new commit.
 """
 
         return f"""\
@@ -954,12 +894,6 @@ Before writing any new code:
 **Task:** {plan.get('title', 'Unknown')}
 **Analysis:** {plan.get('analysis', 'N/A')}
 
-## Progress
-
-- Prerequisites: {len(pre_completed)} done, {len(pre_pending)} pending
-- Steps: {len(completed)} done, {len(pending)} pending
-
-{log_summary}
 {rebase_section}
 {wip_section}
 # Session Startup Protocol
@@ -994,7 +928,6 @@ Execute the next pending steps in TDD order. Commit after each step. Call `mark_
     async def build_amender_prompt(
         self,
         plan: dict,
-        iteration_log: list[dict],
         suggestions: list[dict],
         locked_modules: list[str],
         context: str | None = None,
@@ -1017,24 +950,16 @@ Execute the next pending steps in TDD order. Commit after each step. Call `mark_
         and is not a scope violation (esc-3147-7, ruled 2026-08-24: act, then
         auto-widen). Phrase the rules around the EDIT/CREATE distinction, which
         holds at any depth, never around containment in a "module".
+
+        Renders NO iteration history (task 5744), for the same reason as
+        :meth:`build_implementer_prompt`: iterations.jsonl is its single home
+        and the Action section below mandates reading it.
         """
-        effective_tid = task_id or plan.get('task_id')
+        scope = _plan_scope(plan, task_id)
         if context is None:
-            context = await self._get_memory_context(effective_tid)
+            context = await self._get_memory_context(scope, 'implementer')
 
-        identity = self._agent_identity(effective_tid, 'implementer')
-
-        log_summary = ''
-        if iteration_log:
-            recent = iteration_log[-3:]
-            log_lines = []
-            for entry in recent:
-                log_lines.append(
-                    f"- Iteration {entry.get('iteration', '?')} "
-                    f"[{entry.get('agent', '?')}]: "
-                    f"{entry.get('summary', 'N/A')}"
-                )
-            log_summary = "## Recent Iterations\n\n" + '\n'.join(log_lines)
+        identity = self._agent_identity(scope.task_id, 'implementer')
 
         modules_list = '\n'.join(f'- `{m}`' for m in sorted(locked_modules))
 
@@ -1073,8 +998,6 @@ expanding the task's concurrency footprint.
 
 **Task:** {plan.get('title', 'Unknown')}
 **Analysis:** {plan.get('analysis', 'N/A')}
-
-{log_summary}
 
 ## Scope Discipline
 
@@ -1120,11 +1043,11 @@ This task holds locks for the following modules:
         task_id: str | None = None,
     ) -> str:
         """Build prompt for the debugger agent."""
-        effective_tid = task_id or plan.get('task_id')
+        scope = _plan_scope(plan, task_id)
         if context is None:
-            context = await self._get_memory_context(effective_tid)
+            context = await self._get_memory_context(scope, 'debugger')
 
-        identity = self._agent_identity(effective_tid, 'debugger')
+        identity = self._agent_identity(scope.task_id, 'debugger')
 
         return f"""\
 {context}
@@ -1153,8 +1076,16 @@ This task holds locks for the following modules:
     async def build_reviewer_prompt(
         self, reviewer_type: str, diff: str, context: str | None = None,
         *, amendment_suggestions: list[dict] | None = None,
+        task: dict | None = None,
     ) -> str:
         """Build prompt for a reviewer agent.
+
+        *task* scopes the memory block to the work under review (D7). The
+        reviewer is the highest-volume role in the fleet and had only the
+        generic project-wide block, even though the workflow holds the task
+        at every dispatch site. It stays optional so callers that hold no
+        task — and every test that passes ``context`` directly — keep
+        working, falling back to the generic conventions query.
 
         When *amendment_suggestions* is provided, this review immediately
         follows an in-workflow amendment round; an advisory "# Amendment
@@ -1166,7 +1097,7 @@ This task holds locks for the following modules:
         ``partition_suggestions_by_delta`` filter is the enforceable guarantee.
         """
         if context is None:
-            context = await self._get_memory_context()
+            context = await self._get_memory_context(BriefingScope.from_task(task), 'reviewer')
 
         # Truncate very large diffs to avoid blowing the context
         if len(diff) > 50000:
@@ -1219,11 +1150,11 @@ Prior suggestions the amendment was asked to address:
         context: str | None = None,
     ) -> str:
         """Build prompt for the completion judge agent."""
-        effective_tid = task_id or plan.get('task_id')
+        scope = _plan_scope(plan, task_id)
         if context is None:
-            context = await self._get_memory_context(effective_tid)
+            context = await self._get_memory_context(scope, 'judge')
 
-        identity = self._agent_identity(effective_tid, 'judge')
+        identity = self._agent_identity(scope.task_id, 'judge')
 
         # Truncate diff (same cap as reviewer)
         if len(diff) > 50000:
@@ -1276,16 +1207,17 @@ your verdict as JSON matching the schema. Follow the safety rules: if the
 diff is empty or trivial, `substantive_work=false` and `complete=false`.
 """
 
-    async def build_merger_prompt(
-        self, conflicts: str, task_intent: str, context: str | None = None
-    ) -> str:
-        """Build prompt for the merger agent."""
-        if context is None:
-            context = await self._get_memory_context()
+    async def build_merger_prompt(self, conflicts: str, task_intent: str) -> str:
+        """Build prompt for the merger agent.
 
+        Carries NO memory block, by decision (D7). Merging is mechanical —
+        read both sides of a conflict, preserve both intents, test — and the
+        role is rare (7 dispatches in 14 days, measured). What it had was the
+        generic project-wide recall nobody could show helped it, so the block
+        and its ``context`` parameter are gone rather than rescoped: this
+        absence is deliberate, not an oversight.
+        """
         return f"""\
-{context}
-
 # Task Intent
 
 {task_intent}
@@ -1315,7 +1247,7 @@ Your disposition is read from the `submit_merge_disposition` tool call, not from
         worktree: Path | None = None,
     ) -> str:
         """Build prompt for resuming after an escalation resolution."""
-        context = await self._get_memory_context(task.get('id'))
+        context = await self._get_memory_context(BriefingScope.from_task(task), 'implementer')
         prior_proposal_section = self._format_prior_proposal(task)
 
         return f"""\
@@ -1353,9 +1285,7 @@ from where the previous agent left off.
         Includes memory context, task details, escalation info, and action
         instructions.  Used for the initial session and after cap-hit resets.
         """
-        context = await self._get_memory_context(task.get('id'))
-        identity = self._agent_identity(task.get('id'), 'steward')
-        task_block = self._format_task(task)
+        preamble = await self._task_preamble(task, 'steward', None)
         esc_block = self._format_escalation(escalation)
 
         pending_block = ''
@@ -1368,13 +1298,7 @@ from where the previous agent left off.
             pending_block = f'\n## Other Pending Escalations\n\n{items}\n'
 
         return f"""\
-{context}
-
-{identity}
-
-# Task
-
-{task_block}
+{preamble}
 
 # Escalation
 
@@ -1431,170 +1355,9 @@ Handle this escalation, then call `resolve_issue` with a summary.
             lines.append(f'- **Suggested action:** {escalation["suggested_action"]}')
         return chr(10).join(lines)
 
-    async def _get_memory_context(self, task_id: str | None = None) -> str:
-        """Call fused-memory search for project context."""
-        recalled_sections: list[str] = []
-        foreign_dropped = 0
-        nested_dropped = 0
-        queries_fired = 0
-        memory_unavailable = False
-
-        try:
-            # Project overview
-            overview, dropped, nested = await self._scoped_search('project overview architecture goals')
-            foreign_dropped += dropped
-            nested_dropped += nested
-            queries_fired += 1
-            if overview:
-                recalled_sections.append(f'## Project Context\n\n{overview}')
-
-            # Conventions
-            conventions, dropped, nested = await self._scoped_search('coding conventions and project norms')
-            foreign_dropped += dropped
-            nested_dropped += nested
-            queries_fired += 1
-            if conventions:
-                recalled_sections.append(f'## Conventions\n\n{conventions}')
-
-            # Recent decisions
-            decisions, dropped, nested = await self._scoped_search('recent decisions and rationale')
-            foreign_dropped += dropped
-            nested_dropped += nested
-            queries_fired += 1
-            if decisions:
-                recalled_sections.append(f'## Recent Decisions\n\n{decisions}')
-
-            # Task-specific context
-            if task_id:
-                task_ctx, dropped, nested = await self._scoped_search(
-                    f'task {task_id} context and related decisions'
-                )
-                foreign_dropped += dropped
-                nested_dropped += nested
-                queries_fired += 1
-                if task_ctx:
-                    recalled_sections.append(f'## Task Context\n\n{task_ctx}')
-
-        except Exception as e:
-            logger.warning(f'Failed to fetch memory context: {e}')
-            memory_unavailable = True
-
-        # Compute (and log) the filtered-result summary BEFORE any early
-        # return below: an all-foreign result set and a partial failure are
-        # both "no facts survived" outcomes, and the fact that a leak was
-        # caught and blocked must never be discarded along with them — see
-        # filter_foreign_project_results' loud-over-silent fail-open stance.
-        # foreign_dropped sums per-query drops over the SAME corpus (four
-        # queries can all match one distinct foreign memory), so the note
-        # names both numbers rather than implying `foreign_dropped` distinct
-        # facts were found.
-        #
-        # Top-level and NESTED drops are named as separate quantities (task
-        # 4008 amendment). A nested drop removed an amendment digest or a
-        # pinned body from INSIDE a result that survived — it did not vacate
-        # a result slot — so folding the two into one "result slot(s)" figure
-        # would show an operator a number that does not match what they can
-        # see in the block. This note is the only signal a human gets that a
-        # leak was blocked; its arithmetic has to be legible.
-        drop_note = ''
-        if foreign_dropped > 0 or nested_dropped > 0:
-            query_word = 'query' if queries_fired == 1 else 'queries'
-            counted = []
-            if foreign_dropped > 0:
-                counted.append(f'{foreign_dropped} memory result slot(s)')
-            if nested_dropped > 0:
-                counted.append(f'{nested_dropped} nested memory record(s)')
-            drop_note = (
-                f'{" and ".join(counted)} across {queries_fired} '
-                f'{query_word} were tagged to another project and filtered out'
-            )
-            logger.info(
-                f'_get_memory_context: {drop_note} of the context assembled for '
-                f'{self.project_id!r}'
-            )
-
-        if not recalled_sections:
-            if memory_unavailable:
-                if drop_note:
-                    return (
-                        '# Context\n\n_Memory unavailable — proceed with codebase '
-                        f'exploration. Note: {drop_note} before the failure._'
-                    )
-                return '# Context\n\n_Memory unavailable — proceed with codebase exploration._'
-            if drop_note:
-                return f'# Context\n\n_No memory context available ({drop_note})._'
-            return '# Context\n\n_No memory context available._'
-
-        # recalled_sections is non-empty: gate the provenance caveat on that
-        # fact alone, NOT on memory_unavailable — a later query failing must
-        # not suppress the caveat (the untagged-leak mitigation) for
-        # sections that were already genuinely recalled. The failure, if
-        # any, is appended afterwards as its own section rather than
-        # silently dropped.
-        caveat = MEMORY_CONTEXT_CAVEAT.format(project_id=self.project_id)
-        if drop_note:
-            caveat += f'\n\n_In total, {drop_note}._'
-
-        rendered_sections = list(recalled_sections)
-        if memory_unavailable:
-            rendered_sections.append(
-                '_Memory unavailable for the remaining queries — proceed with '
-                'codebase exploration for anything not covered above._'
-            )
-
-        return '# Context\n\n' + caveat + '\n\n' + '\n\n---\n\n'.join(rendered_sections)
-
-    async def _scoped_search(self, query: str) -> tuple[str | None, int, int]:
-        """Search fused-memory and drop cross-project results from the reply.
-
-        Thin wrapper over the UNCHANGED :meth:`_mcp_search` — never touches
-        which queries fire or their ``limit`` (task 3253 owns that
-        adjudication) — that applies :func:`filter_foreign_project_results`
-        to the raw text before it reaches :meth:`_get_memory_context`.
-        Returns the filter's ``(text, dropped, nested_dropped)`` triple
-        verbatim, or ``(None, 0, 0)`` when the underlying search itself
-        returned nothing (nothing to filter).
-
-        Assumes :meth:`_mcp_search` answers with a single JSON document: it
-        joins every MCP response text block with ``'\\n'`` before returning
-        (unchanged by this task, to keep its silent-fallthrough allowlist
-        entry valid). If the search tool ever replies with more than one
-        text block, the joined text is not valid JSON and the filter fails
-        open (unfiltered, WARNING logged) for that query — see
-        ``test_briefing_project_scope.py``'s ``TestScopedSearch`` for the
-        pinned limitation.
-        """
-        raw = await self._mcp_search(query)
-        if not raw:
-            return None, 0, 0
-        return filter_foreign_project_results(raw, self.project_id)
-
-    async def _mcp_search(self, query: str) -> str | None:
-        """Search fused-memory via its MCP HTTP endpoint."""
-        try:
-            result = await mcp_call(
-                f'{self.memory_url}/mcp',
-                'tools/call',
-                {
-                    'name': 'search',
-                    'arguments': {
-                        'query': query,
-                        'project_id': self.project_id,
-                        'limit': 5,
-                    },
-                },
-                timeout=10,
-            )
-            content = result.get('result', {}).get('content', [])
-            texts = []
-            for block in content:
-                if isinstance(block, dict) and block.get('type') == 'text':
-                    texts.append(block['text'])
-            return '\n'.join(texts) if texts else None
-
-        except Exception as e:
-            logger.debug(f'MCP search failed for "{query}": {e}')
-            return None
+    async def _get_memory_context(self, scope: BriefingScope, role: str) -> str:
+        """The ``# Context`` block for a dispatch about *scope* by *role*."""
+        return await self._memory_recall.context_block(scope, _caller_agent_id(scope.task_id, role))
 
     def _format_prior_proposal(self, task: dict) -> str:
         """Format the most recent dry-run block-time proposal, if any.
@@ -1671,7 +1434,33 @@ A prior block-time investigation concluded the following; verify against the cur
                 ``build_architect_prompt`` to anti-anchor the first plan
                 derivation (C-A1): the architect must derive its own file
                 footprint rather than echoing the queue-time metadata guess.
+
+        Appends the task's own ``metadata.delivered_checks`` as a capability-gate
+        section via :func:`_format_delivered_checks` (task 5359) — the gate
+        ``orchestrator/src/orchestrator/delivered_checks.py::gate_mark_done_on_delivered_checks``
+        applies to THIS task's mark-done, not only to its dependents, so an agent
+        that cannot see it is measured against a contract it was never shown.
+        Deliberately NOT suppressed by ``include_files=False``: C-A1 hides a
+        queue-time GUESS, whereas this is an authored acceptance contract the
+        first derivation must plan against.
+
+        That exemption knowingly covers a grep descriptor's ``paths``, which IS
+        a file footprint and so does overlap C-A1's subject — the overlap was
+        noticed, not missed. The two differ in what they BIND. ``metadata.files``
+        binds nothing: the architect is told to derive its own footprint, so
+        echoing the guess only anchors it. ``paths`` binds the capability: it is
+        the scope ``git grep -E`` will actually search at mark-done, so an
+        architect that plans the behaviour into a directory ``paths`` does not
+        name has failed a check it was never shown. Hiding it would hand the
+        first derivation a contract it cannot evaluate while still blocking the
+        task on it — strictly the failure this section exists to cure. The
+        residual anchoring cost (``paths`` does convey a location) is accepted
+        as the cheaper half of that trade.
+
+        The descriptor contract itself lives in ``docs/task-authoring.md`` §3.3
+        — pointed at, never restated (INV-9).
         """
+        metadata = task.get('metadata') or {}
         lines = []
         if task.get('id'):
             lines.append(f'**ID:** {task["id"]}')
@@ -1681,10 +1470,12 @@ A prior block-time investigation concluded the following; verify against the cur
             lines.append(f'**Description:** {task["description"]}')
         if task.get('details'):
             lines.append(f'**Details:** {task["details"]}')
-        if include_files and task.get('metadata', {}).get('files'):
-            lines.append(f'**Files:** {", ".join(task["metadata"]["files"])}')
+        if include_files and metadata.get('files'):
+            lines.append(f'**Files:** {", ".join(metadata["files"])}')
         deps = task.get('dependencies', [])
         if deps:
             dep_ids = [str(d.get('id', d)) if isinstance(d, dict) else str(d) for d in deps]
             lines.append(f'**Dependencies:** {", ".join(dep_ids)}')
-        return '\n'.join(lines) if lines else json.dumps(task, indent=2)
+        body = '\n'.join(lines) if lines else json.dumps(task, indent=2)
+        checks_block = _format_delivered_checks(metadata.get('delivered_checks'))
+        return f'{body}\n\n{checks_block}' if checks_block else body

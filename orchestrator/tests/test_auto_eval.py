@@ -7,6 +7,7 @@ branch + worktree and submits a sibling task with ``force_full_path=True``.
 
 from __future__ import annotations
 
+import copy
 import json as _json
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,10 +15,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import _init_harness_state_for_test, assert_update_wire_mode, pydantic_spec
+from _workflow_helpers import FakeMetadataBackend, wire_metadata_backend
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness, TaskReport
+from orchestrator.module_charter import derive_modules
 from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.task_status import ACTIVE_TASK_STATUSES
 from orchestrator.workflow import WorkflowOutcome
@@ -48,6 +51,8 @@ def _make(
     rename_raises: Exception | None = None,
     worktree_exists: bool = True,
     seen_redo_costs: list[float] | None = None,
+    files: list[str] | None = None,
+    metadata_backend: FakeMetadataBackend | None = None,
 ) -> _Fixture:
     if auto_eval_phases is None:
         auto_eval_phases = {'plan', 'execute', 'verify', 'review'}
@@ -91,11 +96,9 @@ def _make(
         return await dispatch_tool(name, args, timeout=timeout)
 
     dispatch_tool.return_value = submit_returns
-    update_task = AsyncMock(return_value=True)
 
     scheduler = MagicMock()
     scheduler.dispatch_tool = _dispatch
-    scheduler.update_task = update_task
     # Default: no prior auto-eval redo siblings. Tests exercising the
     # dedupe/supersede behaviour override this per-test.
     scheduler.get_tasks = AsyncMock(return_value=[])
@@ -122,12 +125,21 @@ def _make(
 
     metadata: dict = {
         'modules': ['mod_a'],
-        'files': ['mod_a/f.py'],
+        'files': list(files) if files is not None else ['mod_a/f.py'],
     }
     if optimistic_path:
         metadata['optimistic_path'] = optimistic_path
     if auto_eval_redo:
         metadata['auto_eval_redo'] = True
+
+    if metadata_backend is not None:
+        _, update_task = wire_metadata_backend(
+            scheduler, metadata_backend,
+            seed=copy.deepcopy(metadata), grants=True,
+        )
+    else:
+        update_task = AsyncMock(return_value=True)
+        scheduler.update_task = update_task
 
     assignment = TaskAssignment(
         task_id='orig-task',
@@ -486,19 +498,17 @@ async def test_extract_task_id_handles_structured_content_dict(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_auto_eval_back_link_forwards_merge_mode(tmp_path: Path, monkeypatch):
-    """Back-link update_task wire call must carry metadata_mode='merge' (#4271 fix).
+async def test_auto_eval_back_link_wire_payload_is_single_key_merge(
+    tmp_path: Path, monkeypatch,
+):
+    """The back-link sends only ``auto_eval_pair``, at ``metadata_mode='merge'``.
 
-    The auto-eval redo back-link writes the full task_metadata blob enriched
-    with auto_eval_pair.  Under merge (shallow last-write-wins) sibling keys
-    present in the DB but absent from task_metadata survive; under replace they
-    are silently deleted.
-
-    RED today: wrapper forwards nothing instead of metadata_mode='merge'.
-    GREEN after step-5 impl (scheduler.py update_task gains metadata_mode param).
+    A payload holding only the key this site owns cannot clobber any sibling
+    key under any merge mode, however stale the in-memory ``task_metadata``
+    snapshot is by the time the redo is dispatched.
     """
-    # Seed task_metadata with a sibling key so the full-blob assertion can
-    # verify it is present in the wire payload.
+    # Seed an extra sibling into the in-memory metadata so a whole-blob
+    # payload would visibly differ from the single-key one.
     f = _make(project_root=tmp_path / 'proj')
     f.assignment.task['metadata']['memory_hints'] = ['hint-A']
 
@@ -518,17 +528,100 @@ async def test_auto_eval_back_link_forwards_merge_mode(tmp_path: Path, monkeypat
 
     await f.harness._maybe_auto_eval(f.assignment, _make_report())
 
-    # update_task must have been called exactly once (the back-link write).
     arguments = assert_update_wire_mode(captured_update_payloads, 'merge')
+    assert _json.loads(arguments['metadata']) == {'auto_eval_pair': 'redo-1'}
 
-    # Full-blob assertions: auto_eval_pair and seeded sibling memory_hints both present.
-    blob = _json.loads(arguments['metadata'])
-    assert blob.get('auto_eval_pair') == 'redo-1', (
-        f"auto_eval_pair must be 'redo-1' in blob; got: {blob}"
+
+_NARROWED = (['mod_a/src/foo.py', 'mod_b/src/bar.py'], ['mod_a/src/foo.py'])
+_WIDENED = (['mod_a/src/foo.py'], ['mod_a/src/foo.py', 'mod_b/src/bar.py'])
+
+
+async def _persist_plan_files_backend_only(
+    backend: FakeMetadataBackend, dispatch_files: list[str], plan_files: list[str],
+) -> None:
+    """Model the run's scope reconcile: plan-refined files land on the backend only."""
+    await backend.handle_blast_radius_expansion(
+        'orig-task',
+        derive_modules(dispatch_files, backend.lock_depth),
+        derive_modules(plan_files, backend.lock_depth),
+        persist_files=plan_files,
     )
-    assert blob.get('memory_hints') == ['hint-A'], (
-        f"Sibling memory_hints must survive in written blob; got: {blob}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('dispatch_files', 'plan_files'),
+    [_NARROWED, _WIDENED],
+    ids=['plan-narrowed', 'plan-widened'],
+)
+async def test_back_link_preserves_run_persisted_files(
+    tmp_path: Path,
+    dispatch_files: list[str],
+    plan_files: list[str],
+):
+    backend = FakeMetadataBackend()
+    f = _make(
+        project_root=tmp_path / 'proj',
+        optimistic_path='revalidation_skip',
+        files=dispatch_files,
+        metadata_backend=backend,
     )
+    await _persist_plan_files_backend_only(backend, dispatch_files, plan_files)
+    assert backend.blob['files'] == plan_files
+    assert f.assignment.task['metadata']['files'] == dispatch_files
+
+    await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    assert backend.blob['files'] == plan_files
+    assert backend.blob['auto_eval_pair'] == 'redo-1'
+
+
+@pytest.mark.asyncio
+async def test_back_link_sets_pair_without_disturbing_sibling_keys(tmp_path: Path):
+    dispatch_files, plan_files = _NARROWED
+    backend = FakeMetadataBackend()
+    f = _make(
+        project_root=tmp_path / 'proj',
+        files=dispatch_files,
+        metadata_backend=backend,
+    )
+    await _persist_plan_files_backend_only(backend, dispatch_files, plan_files)
+    # A post-dispatch Stage-2 re-attach the in-memory snapshot never saw.
+    backend.blob['memory_hints'] = ['hint-A']
+    before = copy.deepcopy(backend.blob)
+    assert 'auto_eval_pair' not in before
+
+    await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    assert backend.blob == {**before, 'auto_eval_pair': 'redo-1'}
+
+
+def _submitted_redo_metadata(f: _Fixture) -> dict:
+    submitted = [c for c in f.submit_calls if c[0] == 'submit_task']
+    assert len(submitted) == 1
+    return submitted[0][1]['metadata']
+
+
+@pytest.mark.asyncio
+async def test_redo_sibling_does_not_carry_modules(tmp_path: Path):
+    f = _make(project_root=tmp_path / 'proj')
+    assert f.assignment.task['metadata']['modules'] == ['mod_a']
+
+    await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    assert 'modules' not in _submitted_redo_metadata(f)
+
+
+@pytest.mark.asyncio
+async def test_redo_sibling_files_are_sanitized(tmp_path: Path):
+    f = _make(
+        project_root=tmp_path / 'proj',
+        files=['mod_a/src/foo.py', 'mod_b/src/', 'mod_c/src'],
+    )
+
+    await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    assert _submitted_redo_metadata(f)['files'] == ['mod_a/src/foo.py']
 
 
 # ---------------------------------------------------------------------------

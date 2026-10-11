@@ -26,9 +26,8 @@ from escalation.models import Escalation
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps
-from orchestrator.merge_gates import PostMergePyrightResult
-from orchestrator.merge_lane.types import DiskGuardOutcome, EscalationRecord
-from orchestrator.merge_types import MergeRequest
+from orchestrator.merge_lane.gates import PostMergePyrightResult
+from orchestrator.merge_lane.types import DiskGuardOutcome, EscalationRecord, MergeRequest
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import VerifyResult
 
@@ -133,7 +132,7 @@ class VerifyPort(Protocol):
 
 
 class ClockPort(Protocol):
-    """The worker's two clocks, its sleep, and its merge-worktree progress probe."""
+    """The worker's clocks, its sleep and bounded wait, and its merge-worktree progress probe."""
 
     def now(self) -> float: ...
 
@@ -143,6 +142,21 @@ class ClockPort(Protocol):
 
     async def sleep(self, secs: float) -> None: ...
 
+    async def wait_for_any(self, aws: Collection[Any], timeout: float) -> set[Any]:
+        """Wait up to *timeout* for any of *aws* to finish; the DONE set, never a raise.
+
+        A lane wait belongs on this port iff it sits in a REPEATING loop
+        whose elapsed time is measured against this same clock -- that
+        pairing is what makes the loop's budget reachable under an injected
+        clock. A one-shot join or a race for an event edge does not qualify,
+        however much it looks like this one to a grep.
+
+        *aws* must be non-empty (``asyncio.wait`` rejects an empty set).
+        Only the done half is returned because no caller uses the pending
+        half.
+        """
+        ...
+
 
 class EscalationPort(Protocol):
     """Where the worker files an escalation of its own."""
@@ -150,6 +164,17 @@ class EscalationPort(Protocol):
     def file(self, record: EscalationRecord) -> str | None:
         """File *record*; returns the escalation id, or ``None`` when nothing was filed."""
         ...
+
+
+class ContainmentPredicate(Protocol):
+    """Whether every commit of *head* is already in *upstream* by patch-id.
+
+    False whenever that cannot be established, so a guard that skips only on
+    True fails open into a merge. Production implementation:
+    ``orchestrator/src/orchestrator/merge_lane/landing_evidence.py::patch_content_contained``.
+    """
+
+    async def __call__(self, head: str, upstream: str, git_ops: GitOps, /) -> bool: ...
 
 
 @dataclasses.dataclass(frozen=True)
@@ -212,6 +237,10 @@ class ProductionClock:
 
     async def sleep(self, secs: float) -> None:
         await asyncio.sleep(secs)
+
+    async def wait_for_any(self, aws: Collection[Any], timeout: float) -> set[Any]:
+        done, _ = await asyncio.wait(aws, timeout=timeout)
+        return done
 
 
 @dataclasses.dataclass(frozen=True)

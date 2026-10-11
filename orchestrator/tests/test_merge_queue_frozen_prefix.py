@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
+from _merge_lane_fakes import FakeClock, FakeVerifier, make_lane
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
@@ -144,8 +145,14 @@ def _make_req(
 
 
 def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
-    """Build a bare SpeculativeMergeWorker for unit tests (no harness wiring)."""
-    return SpeculativeMergeWorker(git_ops, asyncio.Queue())
+    """Build a lane on the fakes for unit tests (no harness wiring).
+
+    The verifier and clock are injected rather than left to the production
+    adapters, so no row here shells out or reads the wall clock -- which is
+    also what keeps a snapshot's derived ``age_secs`` stable across the
+    before/after comparisons below.
+    """
+    return make_lane(git_ops, verifier=FakeVerifier(), clock=FakeClock())
 
 
 def _make_fake_item(
@@ -204,6 +211,92 @@ def _make_inflight_entry(
     )
 
 
+# ── The lane-state seam, and the public observations that replace it ─────────
+#
+# §5.3's accessors are pure functions of the lane's in-flight region and its
+# lane buffers, and the rows below need regions the live pipeline cannot
+# produce: a broken base chain, one rid in BOTH regions, a passthrough entry
+# carrying no merge commit, a finalize head parked mid-phase.  The lane
+# exposes no public seam for admitting such a region, so the five helpers
+# below are the ONLY places in this file that name a lane internal -- one per
+# internal, so the whole file moves the day a seam lands (task 5032 filed an
+# escalate_info naming them, for PRD task δ).  Everything a row OBSERVES goes
+# through the public accessors and snapshot() instead.
+
+
+def _seed_frozen(worker: SpeculativeMergeWorker, *entries: InflightEntry) -> None:
+    """Admit *entries* to the lane's in-flight region, oldest first."""
+    worker._inflight.extend(entries)
+
+
+def _seed_suffix(
+    worker: SpeculativeMergeWorker,
+    *reqs: MergeRequest,
+    lane: Literal['normal', 'high'] = 'normal',
+    replace: bool = False,
+) -> None:
+    """Admit *reqs* to *lane*'s buffer; *replace* reorders the lane wholesale."""
+    buffer = worker._lane_buffers[lane]
+    if replace:
+        buffer.clear()
+    buffer.extend(reqs)
+
+
+def _seed_finalizing_head(
+    worker: SpeculativeMergeWorker,
+    entry: InflightEntry,
+    *,
+    phase: ItemLifecycleState = ItemLifecycleState.VERIFYING,
+    then: ItemLifecycleState | None = None,
+) -> None:
+    """Park *entry* as the finalize head at *phase*, then move it to *then*.
+
+    The head is derived from the lifecycle registry, so registering the entry
+    is what puts it at the submission-order head of the frozen prefix.
+    """
+    worker._register_item(entry, initial=phase)
+    if then is not None:
+        worker._note_transition(entry.item.request.request_id, phase, then)
+
+
+def _guard_warn(
+    worker: SpeculativeMergeWorker, item: SpeculativeItem, main_sha: str,
+) -> None:
+    """Call the §5.3 log-only verify-base guard directly."""
+    return worker._warn_if_verify_base_not_frozen_tip(item, main_sha)
+
+
+async def _dispatch(
+    worker: SpeculativeMergeWorker, item: SpeculativeItem,
+) -> InflightEntry | None:
+    """Drive *item* through the lane's dispatch step."""
+    return await worker._dispatch_item(item)
+
+
+_INFLIGHT_STATES = frozenset(
+    {'dispatching', 'verifying', 'gate_reverify', 'finalizing', 'passthrough'},
+)
+
+
+def _inflight_region(worker: SpeculativeMergeWorker) -> list[dict]:
+    """The in-flight region as the lane publishes it, submission order first.
+
+    The public twin of the private deque: what ``snapshot()`` reports for
+    every entry past the queue, which is what an immutability assertion
+    actually needs to pin (membership, order and each entry's published
+    state), rather than the identity of the objects behind them.
+    """
+    return [
+        entry for entry in worker.snapshot()['entries']
+        if entry['state'] in _INFLIGHT_STATES
+    ]
+
+
+def _suffix_graph_nodes(worker: SpeculativeMergeWorker) -> list[str]:
+    """The suffix-conflict graph's nodes in pick order, from ``snapshot()``."""
+    return worker.snapshot()['suffix_conflict_graph']['nodes']
+
+
 # ── step-01 RED: frozen_prefix() + unfrozen_suffix() ─────────────────────────
 
 
@@ -239,8 +332,8 @@ class TestFrozenAndUnfrozenAccessors:
                                     config=config, git_repo=git_repo)
         entry_a = _make_inflight_entry(item_a, verifying=True)
         entry_b = _make_inflight_entry(item_b, verifying=True)
-        worker._inflight.append(entry_a)
-        worker._inflight.append(entry_b)
+        _seed_frozen(worker, entry_a)
+        _seed_frozen(worker, entry_b)
 
         fp = worker.frozen_prefix()
         assert fp == (item_a.request.request_id, item_b.request.request_id)
@@ -256,8 +349,8 @@ class TestFrozenAndUnfrozenAccessors:
                                        config=config, git_repo=git_repo)
         entry_a = _make_inflight_entry(item_a, verifying=True)
         entry_pass = _make_inflight_entry(item_pass, verifying=False)  # passthrough
-        worker._inflight.append(entry_a)
-        worker._inflight.append(entry_pass)
+        _seed_frozen(worker, entry_a)
+        _seed_frozen(worker, entry_pass)
 
         fp = worker.frozen_prefix()
         assert item_a.request.request_id in fp
@@ -271,9 +364,9 @@ class TestFrozenAndUnfrozenAccessors:
         req_hi = _make_req('t-hi', 'task/t-hi', config, git_repo, lane='high')
         req_n1 = _make_req('t-n1', 'task/t-n1', config, git_repo)
         req_n2 = _make_req('t-n2', 'task/t-n2', config, git_repo)
-        worker._lane_buffers['high'].append(req_hi)
-        worker._lane_buffers['normal'].append(req_n1)
-        worker._lane_buffers['normal'].append(req_n2)
+        _seed_suffix(worker, req_hi, lane='high')
+        _seed_suffix(worker, req_n1)
+        _seed_suffix(worker, req_n2)
 
         us = worker.unfrozen_suffix()
         # high lane before normal
@@ -291,9 +384,9 @@ class TestFrozenAndUnfrozenAccessors:
                                     config=config, git_repo=git_repo)
         _, item_b = _make_fake_item('t-b', config=config, git_repo=git_repo)
         entry_a = _make_inflight_entry(item_a, verifying=True)
-        worker._inflight.append(entry_a)
+        _seed_frozen(worker, entry_a)
         req_b = item_b.request
-        worker._lane_buffers['normal'].append(req_b)
+        _seed_suffix(worker, req_b)
 
         fp = set(worker.frozen_prefix())
         us = set(worker.unfrozen_suffix())
@@ -325,7 +418,7 @@ class TestFrozenPrefixTip:
         _, item = _make_fake_item('t-x', base_sha='main0', merge_commit='commitX',
                                   config=config, git_repo=git_repo)
         entry = _make_inflight_entry(item, verifying=True)
-        worker._inflight.append(entry)
+        _seed_frozen(worker, entry)
         assert worker.frozen_prefix_tip('main0') == 'commitX'
 
     async def test_two_stacked_entries_returns_newest(
@@ -337,8 +430,8 @@ class TestFrozenPrefixTip:
                                     config=config, git_repo=git_repo)
         _, item_e = _make_fake_item('t-e', base_sha='commitX', merge_commit='commitY',
                                     config=config, git_repo=git_repo)
-        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
-        worker._inflight.append(_make_inflight_entry(item_e, verifying=True))
+        _seed_frozen(worker, _make_inflight_entry(item_d, verifying=True))
+        _seed_frozen(worker, _make_inflight_entry(item_e, verifying=True))
 
         # Deque order: D (left/head) → E (right/tail); tip is E (last/newest)
         assert worker.frozen_prefix_tip('main0') == 'commitY'
@@ -354,8 +447,8 @@ class TestFrozenPrefixTip:
         # A passthrough entry (merge_result=None → no merge_commit)
         _, item_p = _make_fake_item('t-p', base_sha='main0', merge_commit=None,
                                     config=config, git_repo=git_repo)
-        worker._inflight.append(_make_inflight_entry(item_v, verifying=True))
-        worker._inflight.append(_make_inflight_entry(item_p, verifying=False))
+        _seed_frozen(worker, _make_inflight_entry(item_v, verifying=True))
+        _seed_frozen(worker, _make_inflight_entry(item_p, verifying=False))
 
         # The passthrough is not frozen; tip is still the verifying entry's commit
         assert worker.frozen_prefix_tip('main0') == 'commitV'
@@ -381,8 +474,8 @@ class TestCheckFrozenPrefixInvariant:
                                     config=config, git_repo=git_repo)
         _, item_e = _make_fake_item('t-e', base_sha='commitDc', merge_commit='commitEc',
                                     config=config, git_repo=git_repo)
-        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
-        worker._inflight.append(_make_inflight_entry(item_e, verifying=True))
+        _seed_frozen(worker, _make_inflight_entry(item_d, verifying=True))
+        _seed_frozen(worker, _make_inflight_entry(item_e, verifying=True))
 
         violations = worker.check_frozen_prefix_invariant(main_sha)
         assert violations == [], f'expected no violations, got: {violations}'
@@ -399,8 +492,8 @@ class TestCheckFrozenPrefixInvariant:
         _, item_e = _make_fake_item('t-e', base_sha='wrong_speculative_sha',
                                     merge_commit='commitEc',
                                     config=config, git_repo=git_repo)
-        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
-        worker._inflight.append(_make_inflight_entry(item_e, verifying=True))
+        _seed_frozen(worker, _make_inflight_entry(item_d, verifying=True))
+        _seed_frozen(worker, _make_inflight_entry(item_e, verifying=True))
 
         violations = worker.check_frozen_prefix_invariant(main_sha)
         assert len(violations) > 0, 'expected a base-chain violation'
@@ -416,9 +509,9 @@ class TestCheckFrozenPrefixInvariant:
         req, item_d = _make_fake_item('t-d', base_sha=main_sha, merge_commit='commitDc',
                                       config=config, git_repo=git_repo)
         entry = _make_inflight_entry(item_d, verifying=True)
-        worker._inflight.append(entry)
+        _seed_frozen(worker, entry)
         # Same request also in lane buffer — violates frozen/suffix disjointness
-        worker._lane_buffers['normal'].append(req)
+        _seed_suffix(worker, req)
 
         violations = worker.check_frozen_prefix_invariant(main_sha)
         assert len(violations) > 0, 'expected a disjointness violation'
@@ -463,34 +556,34 @@ class TestFrozenPrefixPropertyTest:
                                     config=config, git_repo=git_repo)
         _, item_e = _make_fake_item('t-e', base_sha='sha-Dc', merge_commit='sha-Ec',
                                     config=config, git_repo=git_repo)
-        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
-        worker._inflight.append(_make_inflight_entry(item_e, verifying=True))
+        _seed_frozen(worker, _make_inflight_entry(item_d, verifying=True))
+        _seed_frozen(worker, _make_inflight_entry(item_e, verifying=True))
 
         # F and G are lane-buffer items (simple MergeRequest objects; fake branches
         # that recompute_suffix_conflict_graph will fail-open on for edges/footprint,
         # but their request_ids still appear in nodes which is what we assert).
         req_f = _make_req('t-f', 'task/t-f', config, git_repo)
         req_g = _make_req('t-g', 'task/t-g', config, git_repo)
-        worker._lane_buffers['normal'].append(req_f)
-        worker._lane_buffers['normal'].append(req_g)
+        _seed_suffix(worker, req_f)
+        _seed_suffix(worker, req_g)
 
         # ── Capture pre-reorder state ─────────────────────────────────────────
         pre_d_base = item_d.base_sha
         pre_e_base = item_e.base_sha
         pre_frozen = worker.frozen_prefix()
         pre_tip = worker.frozen_prefix_tip(main_sha)
-        pre_inflight = list(worker._inflight)  # shallow copy for identity check
+        pre_region = _inflight_region(worker)
 
         # ── Reorder: F, G → G, F ─────────────────────────────────────────────
-        worker._lane_buffers['normal'].clear()
-        worker._lane_buffers['normal'].append(req_g)
-        worker._lane_buffers['normal'].append(req_f)
+        _seed_suffix(worker, req_g, req_f, replace=True)
         await worker.recompute_suffix_conflict_graph()
 
         # ── Assert inflight immutability ──────────────────────────────────────
         assert item_d.base_sha == pre_d_base, 'D.base_sha mutated by reorder'
         assert item_e.base_sha == pre_e_base, 'E.base_sha mutated by reorder'
-        assert list(worker._inflight) == pre_inflight, '_inflight order/identity changed'
+        assert _inflight_region(worker) == pre_region, (
+            'in-flight region changed: membership, order or a published state'
+        )
         assert worker.frozen_prefix() == pre_frozen, 'frozen_prefix() changed'
         assert worker.frozen_prefix_tip(main_sha) == pre_tip, 'frozen_prefix_tip changed'
         assert worker.check_frozen_prefix_invariant(main_sha) == [], (
@@ -498,8 +591,7 @@ class TestFrozenPrefixPropertyTest:
         )
 
         # ── Assert suffix graph reflects new order (G before F) ──────────────
-        g_after = worker._suffix_conflict_graph
-        g_nodes = g_after.nodes
+        g_nodes = _suffix_graph_nodes(worker)
         assert req_g.request_id in g_nodes, 'G missing from suffix graph nodes'
         assert req_f.request_id in g_nodes, 'F missing from suffix graph nodes'
         assert g_nodes.index(req_g.request_id) < g_nodes.index(req_f.request_id), (
@@ -536,20 +628,20 @@ class TestFrozenPrefixPropertyTest:
         req_d, item_d = _make_fake_item('t-d-excl', base_sha=main_sha,
                                         merge_commit='sha-Dc-excl',
                                         config=config, git_repo=git_repo)
-        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+        _seed_frozen(worker, _make_inflight_entry(item_d, verifying=True))
 
         # Intentionally push the SAME request into _lane_buffers (simulates the
         # bug this filter guards against: a frozen rid leaking into the suffix).
-        worker._lane_buffers['normal'].append(req_d)
+        _seed_suffix(worker, req_d)
 
         # Also add an innocent item so the suffix is non-empty (gives
         # recompute something to build without the early-empty-suffix return)
         req_innocent = _make_req('t-innocent', 'task/t-innocent', config, git_repo)
-        worker._lane_buffers['normal'].append(req_innocent)
+        _seed_suffix(worker, req_innocent)
 
         await worker.recompute_suffix_conflict_graph()
 
-        g_nodes = worker._suffix_conflict_graph.nodes
+        g_nodes = _suffix_graph_nodes(worker)
         assert req_d.request_id not in g_nodes, (
             f'frozen rid {req_d.request_id!r} appeared in suffix graph nodes '
             f'(exclusion filter missing)'
@@ -590,8 +682,8 @@ class TestSnapshotFrozenPrefixKey:
                                     config=config, git_repo=git_repo)
         _, item_e = _make_fake_item('t-e', base_sha='Dc', merge_commit='Ec',
                                     config=config, git_repo=git_repo)
-        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
-        worker._inflight.append(_make_inflight_entry(item_e, verifying=True))
+        _seed_frozen(worker, _make_inflight_entry(item_d, verifying=True))
+        _seed_frozen(worker, _make_inflight_entry(item_e, verifying=True))
 
         snap = worker.snapshot()
         fp = snap['frozen_prefix']
@@ -626,11 +718,16 @@ class TestSnapshotFrozenPrefixKey:
     async def test_metrics_key_unaffected_by_frozen_prefix(
         self, git_ops: GitOps,
     ) -> None:
-        """'metrics' key is present and equals _merge_metrics.as_snapshot()."""
+        """'metrics' key still carries its whole documented shape."""
         worker = _make_worker(git_ops)
         snap = worker.snapshot()
         assert 'metrics' in snap
-        assert snap['metrics'] == worker._merge_metrics.as_snapshot()
+        assert snap['metrics'].keys() == {
+            'retries_per_landing',
+            'drift_at_detection',
+            'landings_total',
+            'retries_total',
+        }, f'unexpected metrics shape: {snap["metrics"]}'
 
 
 # ── step-11 RED: _warn_if_verify_base_not_frozen_tip log-only guard ───────────
@@ -662,7 +759,7 @@ class TestWarnIfVerifyBaseNotFrozenTip:
             't-d', base_sha='main0', merge_commit='sha-Dc',
             config=config, git_repo=git_repo,
         )
-        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+        _seed_frozen(worker, _make_inflight_entry(item_d, verifying=True))
 
         # Candidate item: base_sha is a speculative-only SHA (not the frozen tip)
         req_e, item_e = _make_fake_item(
@@ -671,7 +768,7 @@ class TestWarnIfVerifyBaseNotFrozenTip:
         )
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
-            result = worker._warn_if_verify_base_not_frozen_tip(item_e, 'main0')
+            result = _guard_warn(worker, item_e, 'main0')
 
         # Returns None (log-only, no side effect)
         assert result is None
@@ -709,7 +806,7 @@ class TestWarnIfVerifyBaseNotFrozenTip:
             't-d', base_sha='main0', merge_commit='sha-Dc',
             config=config, git_repo=git_repo,
         )
-        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+        _seed_frozen(worker, _make_inflight_entry(item_d, verifying=True))
 
         # Candidate item: base_sha == frozen_prefix_tip (correct)
         _, item_e = _make_fake_item(
@@ -718,7 +815,7 @@ class TestWarnIfVerifyBaseNotFrozenTip:
         )
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
-            result = worker._warn_if_verify_base_not_frozen_tip(item_e, 'main0')
+            result = _guard_warn(worker, item_e, 'main0')
 
         assert result is None
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -745,7 +842,7 @@ class TestWarnIfVerifyBaseNotFrozenTip:
         )
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
-            result = worker._warn_if_verify_base_not_frozen_tip(item_d, 'main0')
+            result = _guard_warn(worker, item_d, 'main0')
 
         assert result is None
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -765,7 +862,7 @@ class TestWarnIfVerifyBaseNotFrozenTip:
             't-d', base_sha='main0', merge_commit='sha-Dc',
             config=config, git_repo=git_repo,
         )
-        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+        _seed_frozen(worker, _make_inflight_entry(item_d, verifying=True))
 
         # Candidate with wrong base (triggers warning path)
         _, item_e = _make_fake_item(
@@ -775,14 +872,14 @@ class TestWarnIfVerifyBaseNotFrozenTip:
 
         # Capture state before
         pre_frozen = worker.frozen_prefix()
-        pre_inflight_len = len(worker._inflight)
+        pre_region = _inflight_region(worker)
         pre_tip = worker.frozen_prefix_tip('main0')
 
-        worker._warn_if_verify_base_not_frozen_tip(item_e, 'main0')
+        _guard_warn(worker, item_e, 'main0')
 
         # State must be entirely unchanged
         assert worker.frozen_prefix() == pre_frozen
-        assert len(worker._inflight) == pre_inflight_len
+        assert _inflight_region(worker) == pre_region
         assert worker.frozen_prefix_tip('main0') == pre_tip
 
 
@@ -847,7 +944,7 @@ class TestRemergeCarveOutAtDispatchGuard:
             't-d', base_sha='main0', merge_commit='sha-Dc',
             config=config, git_repo=git_repo,
         )
-        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+        _seed_frozen(worker, _make_inflight_entry(item_d, verifying=True))
 
         # Recovery re-merge: _remerge always sets base_sha=actual_main (here
         # 'main0'), which is NOT the frozen tip 'sha-Dc'.  That is correct by
@@ -859,7 +956,7 @@ class TestRemergeCarveOutAtDispatchGuard:
         item_r = _mark_recovery(item_r)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
-            result = worker._warn_if_verify_base_not_frozen_tip(item_r, 'main0')
+            result = _guard_warn(worker, item_r, 'main0')
 
         assert result is None
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -888,7 +985,7 @@ class TestRemergeCarveOutAtDispatchGuard:
             't-d', base_sha='main0', merge_commit='sha-Dc',
             config=config, git_repo=git_repo,
         )
-        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+        _seed_frozen(worker, _make_inflight_entry(item_d, verifying=True))
 
         _, item_e = _make_fake_item(
             't-e', base_sha='main0', merge_commit='sha-Ec',
@@ -896,7 +993,7 @@ class TestRemergeCarveOutAtDispatchGuard:
         )
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
-            result = worker._warn_if_verify_base_not_frozen_tip(item_e, 'main0')
+            result = _guard_warn(worker, item_e, 'main0')
 
         assert result is None
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -921,7 +1018,7 @@ class TestRemergeCarveOutAtDispatchGuard:
             't-d', base_sha='main0', merge_commit='sha-Dc',
             config=config, git_repo=git_repo,
         )
-        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+        _seed_frozen(worker, _make_inflight_entry(item_d, verifying=True))
 
         for marked in (False, True):
             caplog.clear()
@@ -933,7 +1030,7 @@ class TestRemergeCarveOutAtDispatchGuard:
                 item_e = _mark_recovery(item_e)
 
             with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
-                assert worker._warn_if_verify_base_not_frozen_tip(item_e, 'main0') is None
+                assert _guard_warn(worker, item_e, 'main0') is None
 
             warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
             assert len(warnings) == 0, (
@@ -1002,7 +1099,7 @@ class TestGuardWarningCarriesCallTimeContext:
             't-d', base_sha='main0', merge_commit='sha-Dc',
             config=config, git_repo=git_repo,
         )
-        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+        _seed_frozen(worker, _make_inflight_entry(item_d, verifying=True))
 
         req_e, item_e = _make_fake_item(
             't-e', base_sha='live-main-tip', merge_commit='sha-Ec',
@@ -1016,7 +1113,7 @@ class TestGuardWarningCarriesCallTimeContext:
         expected_tip = worker.frozen_prefix_tip('main0')
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
-            worker._warn_if_verify_base_not_frozen_tip(item_e, 'main0')
+            _guard_warn(worker, item_e, 'main0')
 
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warnings) == 1
@@ -1068,8 +1165,8 @@ class TestFinalizingHeadInFrozenPrefix:
         entry_d = _make_inflight_entry(item_d, verifying=True)  # phase='verifying'
         entry_e = _make_inflight_entry(item_e, verifying=True)
 
-        worker._register_item(entry_d, initial=ItemLifecycleState.VERIFYING)
-        worker._inflight.append(entry_e)
+        _seed_finalizing_head(worker, entry_d)
+        _seed_frozen(worker, entry_e)
 
         fp = worker.frozen_prefix()
         assert len(fp) == 2, f'expected 2 frozen entries, got {fp!r}'
@@ -1098,8 +1195,8 @@ class TestFinalizingHeadInFrozenPrefix:
         entry_d = _make_inflight_entry(item_d, verifying=True)
         entry_e = _make_inflight_entry(item_e, verifying=True)
 
-        worker._register_item(entry_d, initial=ItemLifecycleState.VERIFYING)
-        worker._inflight.append(entry_e)
+        _seed_finalizing_head(worker, entry_d)
+        _seed_frozen(worker, entry_e)
 
         tip = worker.frozen_prefix_tip('main0')
         assert tip == 'sha-Ec', (
@@ -1122,7 +1219,9 @@ class TestFinalizingHeadInFrozenPrefix:
         _, item_p = _make_fake_item('t-p', base_sha='main0', merge_commit='sha-Pc',
                                     config=config, git_repo=git_repo)
         entry_p = _make_inflight_entry(item_p, verifying=True)
-        worker._register_item(entry_p, initial=ItemLifecycleState.DISPATCHING)  # non-qualifying phase
+        _seed_finalizing_head(
+            worker, entry_p, phase=ItemLifecycleState.DISPATCHING,  # non-qualifying
+        )
 
         fp = worker.frozen_prefix()
         assert fp == (), (
@@ -1144,10 +1243,10 @@ class TestFinalizingHeadInFrozenPrefix:
         _, item_g = _make_fake_item('t-g', base_sha='main0', merge_commit='sha-Gc',
                                     config=config, git_repo=git_repo)
         entry_g = _make_inflight_entry(item_g, verifying=True)
-        worker._register_item(entry_g, initial=ItemLifecycleState.VERIFYING)
-        worker._note_transition(
-            item_g.request.request_id, ItemLifecycleState.VERIFYING, ItemLifecycleState.GATE_REVERIFY,
-        )  # a qualifying phase distinct from 'verifying'
+        # gate_reverify: a qualifying phase distinct from 'verifying'
+        _seed_finalizing_head(
+            worker, entry_g, then=ItemLifecycleState.GATE_REVERIFY,
+        )
 
         fp = worker.frozen_prefix()
         assert item_g.request.request_id in fp, (
@@ -1207,7 +1306,7 @@ class TestDispatchItemGuardWiring:
             mock.patch.object(git_ops, 'get_main_sha', side_effect=_raise_on_get_main),
             mock.patch.object(worker, '_run_inflight_verify', _noop_verify),
         ):
-            result = await worker._dispatch_item(item)
+            result = await _dispatch(worker, item)
 
         # Fail-open: dispatch must return a verifying InflightEntry, not None.
         assert result is not None, (
@@ -1215,8 +1314,9 @@ class TestDispatchItemGuardWiring:
             'even when get_main_sha() raises inside the §5.3 guard (fail-open)'
         )
         assert isinstance(result, InflightEntry)
-        assert worker._entry_phase(result) == 'verifying', (
-            f'expected phase=verifying, got {worker._entry_phase(result)!r}'
+        assert result.verify_task is not None, (
+            'dispatch returned an entry with no verify task: the guard refused '
+            'the dispatch instead of failing open'
         )
 
         # Clean up the background verify task to prevent event-loop warnings.
@@ -1249,7 +1349,7 @@ class TestDispatchItemGuardWiring:
             't-d-frozen', base_sha='main0', merge_commit='sha-Dc',
             config=config, git_repo=git_repo,
         )
-        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+        _seed_frozen(worker, _make_inflight_entry(item_d, verifying=True))
 
         # Dispatch item: base_sha='wrong-base' does not match frozen tip 'sha-Dc'.
         req_e, item_e = _make_fake_item(
@@ -1272,7 +1372,7 @@ class TestDispatchItemGuardWiring:
             mock.patch.object(worker, '_run_inflight_verify', _noop_verify),
             caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
         ):
-            result = await worker._dispatch_item(item_e)
+            result = await _dispatch(worker, item_e)
 
         # Guard must have fired at least one WARNING naming the dispatched rid.
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -1294,7 +1394,9 @@ class TestDispatchItemGuardWiring:
 
         # Dispatch must still succeed — the guard is purely observational.
         assert result is not None, 'dispatch must succeed even when guard warns'
-        assert worker._entry_phase(result) == 'verifying'
+        assert result.verify_task is not None, (
+            'guard is observational: it must not withhold the verify task'
+        )
 
         # Clean up the background verify task.
         if result.verify_task is not None:

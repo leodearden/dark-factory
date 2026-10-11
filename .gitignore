@@ -54,6 +54,15 @@ __pycache__/
 htmlcov/
 coverage.xml
 
+# ── Mutation-testing artifacts — mutmut run products ─────────────────
+# `mutmut run` (configured under [tool.mutmut] in orchestrator/pyproject.toml,
+# task 5035) copies the source tree plus every mutant into mutants/ in its
+# working directory: hundreds of MB, never to be committed. The two symlinks
+# are the run's harness (plans/merge-lane-quality-prd.mutation-baseline.md).
+mutants/
+/orchestrator/dark-factory-orchestrator.yaml
+/orchestrator/df_pytest_isolation.py
+
 # ── Test SQLite artifacts — MagicMock path side-effects ──────────────
 # OverrideStore creates an SQLite DB at config.overrides_db_path; when
 # tests pass an unpatched MagicMock as config the stringified mock name
@@ -113,8 +122,10 @@ orchestrator/data/
 dashboard/data/
 # recon-escalation-watcher run manifests (mcp.json + run.sh stay tracked):
 recon-watch/close-manifest*.json
-# /review skill phase outputs (review/briefing.yaml stays tracked):
-review/reports/
+# /review run reports (review/reports/<run_id>.*) are tracked. Only the
+# pre-contract phase files, which carry no as_of_sha, stay ignored:
+review/reports/phase[12]-*.json
+review/reports/summary-*.md
 # Editor/tool temp-backup files (e.g. foo.py.tmp.<pid>.<hash>) — one was
 # accidentally committed as test_merge_queue_concurrent_verify.py.tmp.* (task 1990):
 *.tmp.*

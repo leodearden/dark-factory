@@ -15,13 +15,6 @@ unit or before_done predicate wired to it today (the watch gate is retired,
 task 3923), so the defect was LATENT rather than observed here directly --
 these tests pin the same absolute-uv-resolution fix so a future re-wiring
 doesn't reinherit it.
-
-CITATION STATE: task 2917's fix to the sweep wrapper is PENDING on branch
-task/2917 (commit 2e74b9f51d), NOT an ancestor of main. On main's lineage
-fused-memory-flag-marker-sweep.sh still carries the bare `uv run --frozen
---project "$FM" python` default, and test_flag_marker_sweep_wrapper.py
-alongside this file carries no uv-resolution tests. Bare `uv` there means
-2917 has not landed yet, not that the sweep wrapper regressed.
 """
 from __future__ import annotations
 
@@ -516,10 +509,11 @@ def test_wrapper_resolves_uv_after_sourcing_dotenv_so_env_can_supply_uv_bin(tmp_
     MUTATION-VERIFIED by hoisting the whole resolve + CHECK_CMD block above
     the `set -a` -- this test then fails with exactly the 127 + ERROR: line
     described above. Note what does NOT move the needle, since it is the
-    non-obvious part: relocating the resolve_uv_bin DEFINITION alone changes
-    nothing, because the call site lives inside the FLAG_MARKER_SWEEP_CMD
-    else-branch further down. The invocation point is the invariant, not the
-    definition point.
+    non-obvious part: relocating the line that sources
+    scripts/lib/resolve_uv.sh alone changes nothing, because it only defines
+    functions and the require_uv_bin call lives inside the
+    FLAG_MARKER_SWEEP_CMD else-branch further down. The invocation point is
+    the invariant, not the definition point.
 
     (The cgl wrapper hardcodes REPO and so cannot be pointed at a fake .env;
     its copy of this invariant is pinned structurally instead, in

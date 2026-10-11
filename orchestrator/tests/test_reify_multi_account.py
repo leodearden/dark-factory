@@ -38,12 +38,12 @@ REIFY_ACCOUNT_DEFS = [
 REIFY_ACCOUNT_NAMES = ['max-f', 'max-e', 'max-c', 'max-d']
 
 #: The dark-factory production pool, as config/usage-accounts.yaml lists it.
-#: Alphabetised and taken 6 -> 7 by task 4741 (commit 6a84ac50c4, 2026-08-30),
-#: which added max-h and retired the never-real "reserved for eval" convention
-#: per Leo's ruling on gate esc-4741-1. max-a is absent by design: it is
+#: Taken 6 -> 7 by task 4741 (commit 6a84ac50c4, ruling on gate esc-4741-1).
+#: 2026-09-30: org-disabled max-b/c/h moved to the end of the failover order
+#: (esc-legibility-trickle-dark_factory-9). max-a is absent by design: it is
 #: reserved for INTERACTIVE use only (see test_reserved_accounts_absent).
 PRODUCTION_POOL_ORDER = [
-    'max-b', 'max-c', 'max-d', 'max-e', 'max-f', 'max-g', 'max-h',
+    'max-d', 'max-e', 'max-f', 'max-g', 'max-b', 'max-c', 'max-h',
 ]
 REIFY_ENV_VARS = [
     'CLAUDE_OAUTH_TOKEN_F',

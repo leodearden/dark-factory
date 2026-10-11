@@ -31,8 +31,19 @@ class _CaptureClient:
     async def __aexit__(self, *exc: object) -> bool:
         return False
 
-    async def post(self, url: str, *, json: dict, timeout: float | None = None):
-        self._captured.append({'url': url, 'json': json})
+    async def post(
+        self,
+        url: str,
+        *,
+        json: dict,
+        timeout: float | None = None,
+        headers: dict | None = None,
+    ):
+        # ``headers`` is accepted (and recorded) because the writer now sends
+        # the MCP Accept header: without it the live server answers 406 and the
+        # write is lost — see shared/mcp_post.py.  A stub that rejected the
+        # kwarg would turn that fix into a spurious failure here.
+        self._captured.append({'url': url, 'json': json, 'headers': headers})
         return MagicMock()
 
 

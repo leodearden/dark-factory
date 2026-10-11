@@ -38,23 +38,21 @@ echo "${ORCH_CONFIG_PATH:-unset}"
 # If "unset": continue below.
 ```
 
-If unset, find the config file in the target project. Filenames vary across projects (no auto-discovery — every project chose its own name); check all common locations:
+If unset, the config is the target project's `dark-factory-orchestrator.yaml` — the
+canonical, required filename for every factory-operated project (`CLAUDE.md`, "Repo Map";
+it is what the dashboard's escalation-URL discovery keys on):
 
 ```bash
-ls "$TARGET_PROJECT"/dark-factory-orchestrator.yaml \
-   "$TARGET_PROJECT"/orchestrator.yaml \
-   "$TARGET_PROJECT"/orchestrator-config.yaml \
-   "$TARGET_PROJECT"/config.yaml \
-   "$TARGET_PROJECT"/orchestrator/config.yaml 2>/dev/null
+TARGET_CONFIG="$TARGET_PROJECT"/dark-factory-orchestrator.yaml
+ls "$TARGET_CONFIG"
 ```
 
-Known locations for the three current projects:
-
-| Project | TARGET_CONFIG |
-|---------|---------------|
-| dark-factory | `/home/leo/src/dark-factory/dark-factory-orchestrator.yaml` |
-| reify | `/home/leo/src/reify/orchestrator.yaml` |
-| autopilot-video | `/home/leo/src/autopilot-video/orchestrator-config.yaml` |
+As of 2026-09-29 every project under `DASHBOARD_KNOWN_PROJECT_ROOTS` carries that file.
+The legacy spellings (`orchestrator.yaml`, `orchestrator-config.yaml`, `config.yaml`,
+`orchestrator/config.yaml`) are honoured only as a discovery fallback for a not-yet-migrated
+project, never as a choice for a new one — and a stray legacy file can sit BESIDE the canonical
+one (autopilot-video still has a `config.yaml`, pump-web-ui an `orchestrator.yaml`), so never let a
+glob over the legacy names win over the canonical path when both exist.
 
 Verify the file actually points at the target:
 
@@ -263,6 +261,8 @@ The orchestrator will:
 
 Each task gets its own git worktree and branch (`task/<id>`). Merges use `--no-ff` to preserve history.
 
+That is one landing per verify, which is the stock pipeline. When `merge_deep.chain_cap > 0` and the queue holds 2 or more mergeable items, a single verify instead covers a **chain** of queued items: the chain is built in one lane by merging them onto the head in submission order, only its tip is verified, and on a pass the whole verified prefix is CAS-landed in submission order — so one passing verify lands several tasks. The shipped default `chain_cap=0` disables this entirely, leaving the pipeline exactly as described above. A tip failure lands nothing via the chain and leaves the queue untouched, and the next round halves its target depth (any pass resets it) — see OPERATIONS.md §5 "Deep merge-ahead chains" and `plans/deep-merge-ahead-prd.md` for the full contract.
+
 The **debugger** is a distinct agent role invoked automatically on each verify failure. It receives the failure report (test output, lint errors, type errors) and makes targeted fixes. The verify→debug loop repeats up to `max_verify_attempts` times (default 5) before the task blocks.
 
 After merge, **post-merge verification** re-runs the full verification suite on main. If it fails, the merge is automatically reverted and the task blocks — this catches integration issues that only appear after combining with other tasks' changes.
@@ -321,7 +321,7 @@ If children (agent subprocesses) are orphaned, kill them by PID. Do **not** use 
 
 ## Reload Config (vs Restart)
 
-Some config edits don't need a restart. `mcp__escalation__reload_config` hot-applies a **safe, allowlisted subset** of `orchestrator.yaml` changes to the already-running orchestrator process — no SIGTERM, no cold start, no in-flight agents or verify suites killed.
+Some config edits don't need a restart. `mcp__escalation__reload_config` hot-applies a **safe, allowlisted subset** of `dark-factory-orchestrator.yaml` changes to the already-running orchestrator process — no SIGTERM, no cold start, no in-flight agents or verify suites killed.
 
 ### Why this exists
 
@@ -347,6 +347,7 @@ It takes **no path argument** — it always re-reads the process's own `ORCH_CON
 | Scheduler + starvation-watchdog tuning, loop-pass thresholds (`idle_poll_secs`, `orphan_l0_timeout_secs`, watcher-rotation params) | Reload |
 | `review.*` checkpoint knobs, `unblock_auto.*`, `verify_env` | Reload |
 | `git.offline_lane_*` leaf tunables (test threads, poll interval, red-advance count) | Reload |
+| `merge_deep.chain_cap` — the deep merge-ahead chain cap; `0` is the shipped default and the kill switch (mechanism: OPERATIONS.md §5 "Deep merge-ahead chains") | Reload |
 | `max_concurrent_tasks`, pool sizes / `verify_runners`, `escalation` bind host/port, `sandbox.backend`, `project_root`, merge-lane `git.*` structural fields (`branch_prefix`, `main_branch`, `persistent_merge_worktree`, …) | **Restart** — these are startup-baked (semaphores, pool sizes, bound sockets, module globals); reload reports them in `restart_required` without touching the running process |
 | Any code change (not just YAML) | **Restart** — reload only re-reads config, never code |
 
@@ -387,18 +388,19 @@ The orchestrator resolves `(model, effort, budget_usd, max_turns)` for every LLM
 
 ### Probing model availability
 
-`orchestrator probe-models` exercises every configured pool account (`config.usage_cap.accounts`) × candidate model — default `config.routing.allowed_models` plus the fable candidate model (`claude-fable-5`) — with a cheap 1-turn invocation, and writes a deterministic, committable YAML availability artifact:
+`orchestrator probe-models` exercises every configured pool account (`config.usage_cap.accounts`) × candidate model — default `config.routing.allowed_models` plus the fable candidate model (`routing.FABLE_CANDIDATE_MODEL`) — with a cheap 1-turn invocation, and writes a deterministic, committable YAML availability artifact:
 
 ```bash
 cd /home/leo/src/dark-factory
 uv run --project orchestrator orchestrator probe-models --config "$TARGET_CONFIG" \
-  [--models m1,m2] [--output PATH]
+  [--models m1,m2] [--output PATH] [--budget-usd N]
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
 | `--config` | required (or `ORCH_CONFIG_PATH`) | Same target-project rule as every other subcommand — selects `project_root` and the probed account/model config |
 | `--models` | `routing.allowed_models` + the fable candidate | Comma-separated override for the probed model set |
+| `--budget-usd` | `routing.DEFAULT_PROBE_BUDGET_USD` | Per-invocation USD ceiling for each one-turn probe — must clear one turn of the most expensive probed model, or every pair reports `budget_too_low` |
 | `--output` | `routing.DEFAULT_PROBE_ARTIFACT_PATH` (`config/model-availability.yaml`) | Where to write the rendered artifact |
 
 Per `(account, model)` pair, the artifact records one status (from `routing.classify_probe_outcome`, except `no_token`/`invoke_error` which the probe runner assigns directly around it):
@@ -411,9 +413,12 @@ Per `(account, model)` pair, the artifact records one status (from `routing.clas
 | `capped` | account is at or near its usage cap |
 | `no_token` | account's OAuth token env var is unresolvable — the model was never invoked for it |
 | `invoke_error` | the invocation call itself raised (network/subprocess) |
-| `error` | any other classified failure outcome (not a raised exception — that's `invoke_error`) |
+| `budget_too_low` | the probe turn aborted on the local `--budget-usd` ceiling. The API accepted the request and consumed real tokens, so the model DID resolve for this account — the turn simply never completed. This is a mis-sized budget, NOT unavailability: re-run with a higher `--budget-usd` |
+| `error` | a classified failure outcome matching none of the rows above (not a raised exception — that's `invoke_error`; not a budget abort — that's `budget_too_low`) |
 
-This artifact is the input a future fable-admission gate consumes to decide whether `claude-fable-5` is safe to add to `routing.allowed_models` fleet-wide — running the probe does not itself admit it.
+A mis-sized but *positive* `--budget-usd` clears the parse-time check and still produces an artifact that is uniformly and plausibly wrong, so the command reports budget aborts itself rather than leaving them for whoever opens the YAML: any `budget_too_low` rows raise a stderr warning naming how many pairs aborted and the ceiling in force, and a run in which **every** probed pair aborted exits **non-zero** — it produced no availability evidence at all, so it must not read as a successful probe. The artifact is written either way, before the non-zero exit; `budget_too_low` rows are honest evidence about the budget and are not discarded.
+
+This artifact is the per-`(account, model)` availability evidence an admission decision consumes — including for `routing.FABLE_CANDIDATE_MODEL`, which the probe unions into its target set whether or not a config already admits it. Running the probe does not itself admit anything: admission is a per-config operator edit to that project's `routing.allowed_models`.
 
 ### Reading routing decisions
 
@@ -523,11 +528,13 @@ All paths below operate on the **target** project (`$TARGET_PROJECT`), not dark-
 
    **If `MERGE_SHA` is not in hand** — step 6 reached in a fresh shell, a resumed session, or a merge performed earlier — do **not** substitute `git rev-parse HEAD`. Re-derive by the *hand-merge* subject and prove containment first:
    ```bash
-   sha=$(git log main --fixed-strings --grep="Merge branch 'task/<task-id>'" --max-count=1 --format=%H)
+   S="Merge branch 'task/<task-id>'"
+   sha=$(git log main --fixed-strings --grep="$S" --format='%H%x09%s' \
+           | awk -F'\t' -v s="$S" '$2==s && !seen {print $1; seen=1}')
    echo "hand-merge sha=$sha"
    [ -n "$sha" ] && { git merge-base --is-ancestor task/<task-id> "$sha"; echo "containment rc=$?"; }
    ```
-   `--fixed-strings` against the full quoted subject is substring-safe — the trailing `'` stops `task/1` matching inside `Merge branch 'task/10'`. Stamp `$sha` only when it is **non-empty AND containment rc=0**, which is what proves that merge brought *this* branch in. rc=1 means it did not (a different or earlier merge), rc=128 means one of the two shas did not resolve, and an empty `$sha` means no hand-merge subject is on main: on any of those, stamp nothing here and fall through to the ladder below. **Never stamp a bare `git rev-parse HEAD`** — that is main's current tip, not necessarily your merge, and the server's only backstop (`git merge-base --is-ancestor <sha> main`) passes for every recent commit on main, so nothing downstream would catch the substitution.
+   `--fixed-strings` against the full quoted subject is substring-safe — the trailing `'` stops `task/1` matching inside `Merge branch 'task/10'`. The `awk` half selects the newest hit whose **subject** is exactly that, scanning past commits that merely quote it in a body; **do not add `--max-count=1`**, which would stop at the newest *message* match and discard a genuine merge shadowed behind it — see [step 1](../_shared/deriving-landed-sha.md#step-1-subject-check) for the measured population. Stamp `$sha` only when it is **non-empty AND containment rc=0**, which together prove that merge brought *this* branch in — the subject conjunct is already discharged by the selection. The subject conjunct is load-bearing and **containment does not supply it**: `git log --grep` matches the whole commit message, so a commit that merely *quotes* the hand-merge subject in its body is matched too, and containment cannot reject it — containment exists to reject a **stale** marker from a previous incarnation (whose tip is a *descendant*, not an ancestor), but for a branch that genuinely landed earlier, *any* later commit on main has the branch as an ancestor and so passes rc=0. This is the same body-match hole [step 1](../_shared/deriving-landed-sha.md#step-1-subject-check) closes for the orchestrator-shaped marker. rc=1 means it did not (a different or earlier merge), rc=128 means one of the two shas did not resolve, and an empty `$sha` means no commit on main carries the hand-merge subject: on any of those, stamp nothing here and fall through to the ladder below. **Never stamp a bare `git rev-parse HEAD`** — that is main's current tip, not necessarily your merge, and the server's only backstop (`git merge-base --is-ancestor <sha> main`) passes for every recent commit on main, so nothing downstream would catch the substitution.
 
    **Otherwise** — when the work was already on main and you are deriving rather than recording a merge you performed — derive the sha with the task-scoped ladder, never from main's current HEAD and never from an eyeballed listing: [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#the-ladder), the single normative copy (exact-subject marker search, ref-existence gate, containment, the group-merge candidate, the phantom-branch citation gate, and the `DoneProvenance` contract). Run it in full. Two adaptations for this call site: run every command in `$TARGET_PROJECT`, not dark-factory, and the shared doc writes the task id as `<TASK_ID>` where this workflow writes `<task-id>` — same value.
 

@@ -1,0 +1,146 @@
+{
+  "arms": [
+    {
+      "arm": "opus",
+      "corrects_recall": 0.9069767441860465,
+      "corrects_recall_ci95": [
+        0.8444297827197439,
+        0.9459852679872635
+      ],
+      "corrects_recall_den": 129,
+      "corrects_recall_num": 117,
+      "cost_usd": 20.6276482,
+      "failure_storm": null,
+      "false_corrects_rate": 0.01981981981981982,
+      "false_corrects_rate_ci95": [
+        0.01110231736670655,
+        0.03513905049137703
+      ],
+      "false_corrects_rate_den": 555,
+      "false_corrects_rate_num": 11,
+      "false_detach_rate": 0.019005847953216373,
+      "false_detach_rate_ci95": [
+        0.01114010104524451,
+        0.032244306062438416
+      ],
+      "false_detach_rate_den": 684,
+      "false_detach_rate_num": 13,
+      "misfile_recall": 0.8571428571428571,
+      "misfile_recall_ci95": [
+        0.8248430762388765,
+        0.8843217217163399
+      ],
+      "misfile_recall_den": 532,
+      "misfile_recall_num": 456,
+      "parse_failure_rate": 0.0,
+      "parse_failure_rate_ci95": [
+        0.0,
+        0.0031492613467191143
+      ],
+      "parse_failure_rate_den": 1216,
+      "parse_failure_rate_num": 0
+    },
+    {
+      "arm": "sonnet",
+      "corrects_recall": 0.3798449612403101,
+      "corrects_recall_ci95": [
+        0.30071077692282255,
+        0.4659285890589181
+      ],
+      "corrects_recall_den": 129,
+      "corrects_recall_num": 49,
+      "cost_usd": 6.148068199999999,
+      "failure_storm": null,
+      "false_corrects_rate": 0.02882882882882883,
+      "false_corrects_rate_ci95": [
+        0.017821597664663055,
+        0.04631392839495742
+      ],
+      "false_corrects_rate_den": 555,
+      "false_corrects_rate_num": 16,
+      "false_detach_rate": 0.15789473684210525,
+      "false_detach_rate_ci95": [
+        0.13248772142057996,
+        0.18712307269248324
+      ],
+      "false_detach_rate_den": 684,
+      "false_detach_rate_num": 108,
+      "misfile_recall": 0.7875939849624061,
+      "misfile_recall_ci95": [
+        0.7508392270203748,
+        0.8202250576488261
+      ],
+      "misfile_recall_den": 532,
+      "misfile_recall_num": 419,
+      "parse_failure_rate": 0.0,
+      "parse_failure_rate_ci95": [
+        0.0,
+        0.0031492613467191143
+      ],
+      "parse_failure_rate_den": 1216,
+      "parse_failure_rate_num": 0
+    }
+  ],
+  "population": {
+    "excluded": 0,
+    "excluded_by_reason": {},
+    "n_belongs": 684,
+    "n_corrects": 129,
+    "n_misfile": 532,
+    "n_pairs": 1216,
+    "n_unclear": 0
+  },
+  "provenance": {
+    "brief_sha256": "7f161b0ed8b8cd5d24592a926068c00d075efdc2106375d65cfe1879bbebed11",
+    "corpus_sha256": "ecd95fc0b97bee838118dca5458d8cb3a2e3291ddd06e6211d3ef408bbb37ee9",
+    "field_chars": 4000,
+    "mode": "triage",
+    "pairs_sha256": "3f51509a110cc53acc0f8468fe61ada30198faba77fc7fd8d28b5b11485549e8",
+    "shard_size": 40,
+    "text_key_basis": "the keys of task 6151's committed fused-memory/calibration/write_triage_pairs_to_rate.jsonl, built by scripts/run_write_triage_population_arms.py::build_pairs_to_rate",
+    "text_keys": {
+      "child": "entry_text",
+      "parent": "target_text"
+    }
+  },
+  "selection": {
+    "arm": "opus",
+    "corrects_recall": 0.9069767441860465,
+    "corrects_recall_ci95": [
+      0.8444297827197439,
+      0.9459852679872635
+    ],
+    "corrects_recall_den": 129,
+    "corrects_recall_num": 117,
+    "cost_usd": 20.6276482,
+    "failure_storm": null,
+    "false_corrects_rate": 0.01981981981981982,
+    "false_corrects_rate_ci95": [
+      0.01110231736670655,
+      0.03513905049137703
+    ],
+    "false_corrects_rate_den": 555,
+    "false_corrects_rate_num": 11,
+    "false_detach_rate": 0.019005847953216373,
+    "false_detach_rate_ci95": [
+      0.01114010104524451,
+      0.032244306062438416
+    ],
+    "false_detach_rate_den": 684,
+    "false_detach_rate_num": 13,
+    "misfile_recall": 0.8571428571428571,
+    "misfile_recall_ci95": [
+      0.8248430762388765,
+      0.8843217217163399
+    ],
+    "misfile_recall_den": 532,
+    "misfile_recall_num": 456,
+    "parse_failure_rate": 0.0,
+    "parse_failure_rate_ci95": [
+      0.0,
+      0.0031492613467191143
+    ],
+    "parse_failure_rate_den": 1216,
+    "parse_failure_rate_num": 0
+  }
+}

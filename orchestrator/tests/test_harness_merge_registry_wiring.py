@@ -188,7 +188,7 @@ class TestStartMergeWorkerCallsLivenessGuard:
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw_cls, \
              patch.object(h, '_build_service_restart_coordinator') as mock_build_coord, \
              patch('asyncio.create_task') as mock_create_task, \
-             patch('orchestrator.merge_queue.enforce_merge_liveness_margin') as mock_guard:
+             patch('orchestrator.merge_lane.liveness.enforce_merge_liveness_margin') as mock_guard:
 
             # SpeculativeMergeWorker.run() must be awaitable to satisfy create_task
             mock_smw = MagicMock()
@@ -251,9 +251,10 @@ class TestRunSlotInjectsRegistryIntoWorkflow:
                 'Expected the SAME InFlightMergeRegistry instance as h._merge_inflight_registry'
             )
 
-            # Clean up: hard-cancel the wedged workflow and wait for wrapper_task
-            if tid in h._workflow_slot_tasks:
-                h.hard_cancel_workflow(tid)
+            # Clean up: hard-cancel the wedged workflow and wait for wrapper_task.
+            # hard_cancel_workflow() is already a safe no-op when tid has no
+            # registered slot task, so no membership pre-check is needed here.
+            h.hard_cancel_workflow(tid)
             wrapper_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await wrapper_task

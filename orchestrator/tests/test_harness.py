@@ -23,7 +23,7 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.config import OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.harness import Harness
-from orchestrator.merge_queue import MergeLivenessConfigError
+from orchestrator.merge_lane.liveness import MergeLivenessConfigError
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -411,7 +411,7 @@ class TestHarnessMergeLivenessGuard:
         config = OrchestratorConfig(project_root=tmp_path)
         harness = Harness(config)
 
-        with patch('orchestrator.merge_queue.TOUCH_MISS_TOLERANCE', 1000), pytest.raises(MergeLivenessConfigError):
+        with patch('orchestrator.merge_lane.liveness.TOUCH_MISS_TOLERANCE', 1000), pytest.raises(MergeLivenessConfigError):
             await harness._start_merge_worker()
 
 

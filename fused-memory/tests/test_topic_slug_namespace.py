@@ -18,6 +18,7 @@ from fused_memory.config.schema import _default_topic_guard_clusters
 from fused_memory.topic_slug import (
     TOPIC_SLUG_MAX_LEN,
     TOPIC_SLUG_RE,
+    derive_topic_slug,
     is_valid_topic_slug,
 )
 
@@ -126,12 +127,127 @@ class TestTopicSlugLeafModule:
             "assert 'mem0' not in sys.modules, sorted(k for k in sys.modules if 'mem0' in k); "
             "assert 'fused_memory.config.schema' not in sys.modules; "
             "assert 'fused_memory.memory_metadata' not in sys.modules; "
-            'assert t.TOPIC_SLUG_MAX_LEN == 100'
+            'assert t.TOPIC_SLUG_MAX_LEN == 100; '
+            # The fold (task 4878) lives here too now, and must not have
+            # dragged an import in with it: it needs nothing beyond ``re``.
+            # Exercising it in the SAME fresh interpreter proves the
+            # stdlib-only claim covers the whole surface, not just the
+            # constants that predate it.
+            "assert t.derive_topic_slug('mem0_tombstone_coverage') == 'mem0-tombstone-coverage'"
         )
         result = subprocess.run(
             [sys.executable, '-c', probe], capture_output=True, text=True, timeout=120
         )
         assert result.returncode == 0, result.stderr
+
+
+class TestDeriveTopicSlugFold:
+    """The FOLD — snake_case -> hyphen-case — promoted here by task 4878.
+
+    It was defined in ``scripts/retro_stamp_topics.py`` when exactly one
+    script needed it.  ``scripts/normalize_topic_slugs.py`` (the corpus-wide
+    migration) needs the *same* fold, and INV-5 gives a shared rule one
+    home — so it moved next to the predicate whose verdict it defers to,
+    and both scripts import it.
+
+    The load-bearing property under test is the REFUSAL: a value with no
+    honest fold returns ``None``, never a repaired guess.  A migration that
+    truncated an over-long topic to the cap, or substituted a placeholder
+    for ``'!!!'``, would file records under a topic no human ever chose —
+    and, because ``topic`` scopes canonical uniqueness, would do it at a
+    key nobody is watching.
+    """
+
+    def test_folds_snake_case_to_hyphen_case(self):
+        """The motivating case: the shape all 98 non-conforming values have."""
+        assert derive_topic_slug('mem0_tombstone_coverage') == 'mem0-tombstone-coverage'
+
+    @pytest.mark.parametrize(
+        ('value', 'expected', 'why'),
+        [
+            ('Mem0_Tombstone_Coverage', 'mem0-tombstone-coverage', 'lowercases'),
+            ('  padded_topic  ', 'padded-topic', 'strips surrounding whitespace'),
+            ('a.b', 'a-b', 'a dot is a separator run'),
+            ('a b', 'a-b', 'a space is a separator run'),
+            ('a/b', 'a-b', 'a slash is a separator run'),
+            ('a___b', 'a-b', 'a RUN collapses to ONE hyphen, not three'),
+            ('a-_-b', 'a-b', 'mixed separators still collapse to one'),
+            ('_lead_', 'lead', 'edge separators are stripped, not kept'),
+            ('--lead--', 'lead', 'edge hyphens are stripped too'),
+            ('a1_2b', 'a1-2b', 'digits survive inside segments'),
+        ],
+    )
+    def test_fold_table(self, value, expected, why):
+        assert derive_topic_slug(value) == expected, f'{value!r}: {why}'
+
+    def test_conforming_value_is_returned_unchanged(self):
+        """Idempotence: folding an already-good slug is a no-op.
+
+        This is what makes a second migration run cost zero writes rather
+        than zero net effect.
+        """
+        for value in ('a', 'a-good-slug', 'x1-2y'):
+            assert derive_topic_slug(value) == value
+
+    def test_fold_output_is_always_accepted_by_the_predicate(self):
+        """Whatever comes back is a slug ε accepts — the two are wired.
+
+        The fold does not get its own opinion about validity; it defers to
+        :func:`is_valid_topic_slug`, which is where the cap lives.
+        """
+        for value, _expected, _why in _SLUG_CASES:
+            folded = derive_topic_slug(value)
+            if folded is not None:
+                assert is_valid_topic_slug(folded) is True, value
+
+    def test_non_str_is_none_not_a_crash(self):
+        """Matches the predicate's "non-str is a verdict" convention.
+
+        Both are handed untrusted values straight off live records.
+        """
+        for value in (None, 1, 1.5, True, b'a_slug', ['a_slug'], {'topic': 'a'}):
+            assert derive_topic_slug(value) is None
+
+    def test_unfoldable_value_is_none_not_a_placeholder(self):
+        """``'!!!'`` folds to empty — report it, do not name it.
+
+        Deliberately NOT ``memory_eval_retrieval_probe._slugify``, which
+        falls back to ``'unnamed-topic'``.  That is right for naming
+        derivation candidates for human review and wrong for writing a
+        validated vocabulary key to the corpus.
+        """
+        for value in ('!!!', '', '   ', '---', '___'):
+            assert derive_topic_slug(value) is None, value
+
+    def test_over_long_value_is_none_not_truncated(self):
+        """The cap refuses; it never repairs by truncation.
+
+        Truncating would produce a slug that PASSES the predicate while
+        naming a topic no human chose — the silent failure mode this
+        function exists to make loud.
+        """
+        over = 'a' * (TOPIC_SLUG_MAX_LEN + 1)
+        assert is_valid_topic_slug(over) is False
+        assert derive_topic_slug(over) is None
+        assert derive_topic_slug('a' * TOPIC_SLUG_MAX_LEN) == 'a' * TOPIC_SLUG_MAX_LEN
+
+    def test_expansion_over_the_cap_is_refused(self):
+        """A fold can GROW a value past the cap; that is still a refusal.
+
+        ``'_' * 60`` interleaved with characters collapses, but a value at
+        the cap whose fold adds nothing stays at the cap.  The case that
+        matters is one that only exceeds the cap AFTER folding — proving
+        the check runs on the RESULT, not on the input.
+        """
+        source = 'a' * TOPIC_SLUG_MAX_LEN
+        assert derive_topic_slug(source) is not None
+        assert derive_topic_slug(source + '_b') is None
+
+    def test_is_exported(self):
+        """In ``__all__`` — it is part of this leaf's advertised surface."""
+        import fused_memory.topic_slug as _leaf
+
+        assert 'derive_topic_slug' in _leaf.__all__
 
 
 class TestOneNamespaceOneConstant:

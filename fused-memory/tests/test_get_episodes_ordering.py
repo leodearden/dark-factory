@@ -43,7 +43,7 @@ class TestRetrieveEpisodesOrdering:
         ]
         with patch(
             'fused_memory.backends.graphiti_client.EpisodicNode.get_by_group_ids',
-            AsyncMock(return_value=episodes),
+            AsyncMock(side_effect=[episodes, []]),
         ):
             result = await backend.retrieve_episodes(group_ids=['dark_factory'], last_n=3)
 
@@ -65,7 +65,7 @@ class TestRetrieveEpisodesOrdering:
         ]
         with patch(
             'fused_memory.backends.graphiti_client.EpisodicNode.get_by_group_ids',
-            AsyncMock(return_value=episodes),
+            AsyncMock(side_effect=[episodes, []]),
         ):
             # No exception (e.g. TypeError from comparing None to a datetime).
             result = await backend.retrieve_episodes(group_ids=['dark_factory'], last_n=len(episodes))
@@ -103,7 +103,7 @@ class TestRetrieveEpisodesOrdering:
         ]
         with patch(
             'fused_memory.backends.graphiti_client.EpisodicNode.get_by_group_ids',
-            AsyncMock(return_value=episodes),
+            AsyncMock(side_effect=[episodes, []]),
         ):
             # last_n (10) exceeds the number of available episodes (3).
             result = await backend.retrieve_episodes(group_ids=['dark_factory'], last_n=10)

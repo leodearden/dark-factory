@@ -109,6 +109,8 @@ logger = logging.getLogger(__name__)
 
 _QUEUE_DIRNAME: str = 'data/escalations'
 
+# Not a ``middleware/_folded_escalation`` filer — see that module's docstring.
+
 # Anchor task_id used by ``EscalationQueue.make_id`` so the resulting
 # escalation IDs (e.g. ``esc-task-path-guard-37``) are easily greppable.
 _ANCHOR_TASK_ID: str = 'task-path-guard'

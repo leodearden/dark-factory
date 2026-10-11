@@ -23,6 +23,8 @@
 #   step-7  — single-ref LIVE/LANDED/ABSENT + substring-safety
 #   step-9  — fleet-audit mode (no status oracle)
 #   step-11 — fleet-audit status-oracle (advisory filter)
+#   esc-7244-16 — K1-K6: the conventional-commit citation form, the usual
+#            landed tip in both repos
 #
 # Driven by orchestrator/tests/test_warm_lane_bash_suite.py (PORTED_TESTS).
 
@@ -427,6 +429,115 @@ run_helper --task 5 --repo "$R1_REPO" --branch-prefix "wip+"
 assert "R1: '+'-bearing --branch-prefix self-citation exits 4 (landed)" test "$RC" -eq 4
 assert "R1: stdout is 'landed <tip sha>' (prefix matched literally, not as ERE quantifier)" \
     bash -c '[ "$1" = "landed $2" ]' _ "$OUT" "$R1_TIP"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Amendment (esc-7244-16) — conventional-commit citation-form coverage
+#
+# Task commits in both repos read `kind(<id>): …`, so the commonest landed tip
+# cites its task that way and in no other. Before the grammar recognised the
+# form, 81 such refs in the live pool classified as degenerate.
+#
+# K1 — task/47 tip is a non-merge `fix(47): …` commit on main (count==0)
+#      -> exit 4, "landed <sha>" (the conventional-commit path alone: no
+#      merge subject, no '#47').
+# K2 — task/48 tip reads `impl(4812): …` (count==0) -> exit 0, "degenerate
+#      <sha>": the arm's boundary, mirroring L4 and H2.
+# K3 — task/49 tip's SUBJECT cites nothing and its BODY lists `impl(49): …`
+#      (count==0) -> exit 0, "degenerate <sha>": the arm is subject-only, so
+#      a squash body listing this task's commits is not a citation.
+# K4 — show-ref is byte-identical across all five runs (read-only invariant).
+# K5 — task/50 tip's first paragraph spans two lines, the id on the second
+#      -> exit 4, "landed <sha>": this script holds %B, and the grammar's
+#      subject is git's %s (the joined first paragraph), so it agrees with the
+#      sweep and dark-factory, which hold %s.
+# K6 — task/51 tip is ANOTHER task's `fix(4812): rebase onto task/51` commit
+#      -> exit 4, "landed <sha>". Pinned as a known consequence, not a goal:
+#      the verdict is "the tip cites N", and that subject does. dark-factory
+#      accepts that direction of error on the MEASUREMENT (81 of 427
+#      live-pool refs flipped degenerate -> landed, none the reverse), NOT
+#      because a false `landed` is cheap at both its call sites. It is not:
+#        * `git_ops.py::_abort_lane_acquisition` deletes only on
+#          `degenerate`, so a false `landed` costs a retained, stale branch;
+#        * `harness.py`'s MARK_DONE_WITH_PROVENANCE downgrade also fires only
+#          on `degenerate`, so a false `landed` lets MARK_DONE proceed — a
+#          PHANTOM-DONE task, the exact failure that guard was written to
+#          prevent. Its one degeneracy-specific backstop is the independent
+#          `_branch_is_degenerate(branch, metadata)` disjunct, and that is
+#          fail-open: `landing_evidence.py::branch_is_degenerate` returns
+#          False whenever `metadata['branch_base_sha']` is absent or is not
+#          a 40-hex sha. THIS FIXTURE is that shape — a foreign on-main tip
+#          citing task 51 would phantom-complete task 51 at that site.
+#      A false `degenerate` is still the worse error (it re-dispatches landed
+#      work, or deletes its branch, on EVERY such ref rather than on a
+#      contrived one), which is what makes the widening net-positive.
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "--- amendment: conventional-commit citation-form coverage ---"
+
+# fixture_branch_at_message_commit <repo> <branch_task_id> <message> [prefix]
+# Creates a NEW non-merge commit directly on main carrying <message>, then
+# points refs/heads/<prefix><branch_task_id> at it, so exactly one citation
+# form — whichever <message> spells — can decide the verdict.
+fixture_branch_at_message_commit() {
+    local repo="$1" branch_id="$2" message="$3" prefix="${4:-task/}"
+    local sha
+    git -C "$repo" commit -q --allow-empty -m "$message" >/dev/null
+    sha="$(git -C "$repo" rev-parse HEAD)"
+    git -C "$repo" branch -q "${prefix}${branch_id}" "$sha"
+}
+
+K_TMP="$(mktemp -d /tmp/test-warm-lane-degen-ref-kind-XXXXXX)"
+_TMPDIRS+=("$K_TMP")
+K_REPO="$K_TMP/repo"
+build_fixture "$K_REPO"
+fixture_branch_at_message_commit "$K_REPO" 47 "fix(47): the task's last step"
+fixture_branch_at_message_commit "$K_REPO" 48 "impl(4812): a different task's step"
+fixture_branch_at_message_commit "$K_REPO" 49 "chore: squash summary
+
+impl(49): a listed commit, not a citation"
+fixture_branch_at_message_commit "$K_REPO" 50 "fix: rebase the loader
+onto task/50 before landing"
+fixture_branch_at_message_commit "$K_REPO" 51 "fix(4812): rebase onto task/51"
+
+K_47_TIP="$(git -C "$K_REPO" rev-parse refs/heads/task/47)"
+K_48_TIP="$(git -C "$K_REPO" rev-parse refs/heads/task/48)"
+K_49_TIP="$(git -C "$K_REPO" rev-parse refs/heads/task/49)"
+K_50_TIP="$(git -C "$K_REPO" rev-parse refs/heads/task/50)"
+K_51_TIP="$(git -C "$K_REPO" rev-parse refs/heads/task/51)"
+K_SHOWREF_BEFORE="$(git -C "$K_REPO" show-ref 2>/dev/null || true)"
+
+run_helper --task 47 --repo "$K_REPO"
+assert "K1: 'fix(47): …' tip (ancestor of main) exits 4" test "$RC" -eq 4
+assert "K1: stdout is 'landed <tip sha>'" \
+    bash -c '[ "$1" = "landed $2" ]' _ "$OUT" "$K_47_TIP"
+
+run_helper --task 48 --repo "$K_REPO"
+assert "K2: task 48 (tip reads 'impl(4812)', count==0) exits 0 (degenerate, not landed)" \
+    test "$RC" -eq 0
+assert "K2: stdout is 'degenerate <tip sha>'" \
+    bash -c '[ "$1" = "degenerate $2" ]' _ "$OUT" "$K_48_TIP"
+
+run_helper --task 49 --repo "$K_REPO"
+assert "K3: task 49 (own id only in a BODY line, count==0) exits 0 (degenerate)" \
+    test "$RC" -eq 0
+assert "K3: stdout is 'degenerate <tip sha>'" \
+    bash -c '[ "$1" = "degenerate $2" ]' _ "$OUT" "$K_49_TIP"
+
+run_helper --task 50 --repo "$K_REPO"
+assert "K5: a two-line first paragraph citing 50 on its second line exits 4 (landed)" \
+    test "$RC" -eq 4
+assert "K5: stdout is 'landed <tip sha>'" \
+    bash -c '[ "$1" = "landed $2" ]' _ "$OUT" "$K_50_TIP"
+
+run_helper --task 51 --repo "$K_REPO"
+assert "K6: a foreign 'fix(4812): rebase onto task/51' tip exits 4 (landed — the subject cites 51)" \
+    test "$RC" -eq 4
+assert "K6: stdout is 'landed <tip sha>'" \
+    bash -c '[ "$1" = "landed $2" ]' _ "$OUT" "$K_51_TIP"
+
+K_SHOWREF_AFTER="$(git -C "$K_REPO" show-ref 2>/dev/null || true)"
+assert "K4: show-ref is byte-identical across all five runs (read-only invariant)" \
+    bash -c '[ "$1" = "$2" ]' _ "$K_SHOWREF_BEFORE" "$K_SHOWREF_AFTER"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # step-9 — fleet-audit mode (no status oracle)

@@ -41,7 +41,7 @@ else
   FALKOR_PING=$(docker run --rm --network host redis:7-alpine redis-cli -p 6379 ping 2>/dev/null || echo "FAIL")
 fi
 
-if echo "$FALKOR_PING" | grep -q PONG; then
+if [[ "$FALKOR_PING" == *PONG* ]]; then
   check_pass "FalkorDB PING → PONG (port 6379)"
 
   if command -v redis-cli &>/dev/null; then
@@ -56,8 +56,10 @@ if echo "$FALKOR_PING" | grep -q PONG; then
     check_fail "FalkorDB DBSIZE = ${DBSIZE:-0} (no data — migration may not have imported)"
   fi
 
-  # Also confirm the container is running via docker ps
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q falkordb; then
+  # Also confirm the container is running via docker ps.
+  # Verdict read from the captured listing, not a pipeline's status: see scripts/export-data.sh section 3.
+  RUNNING_CONTAINERS="$(docker ps --format '{{.Names}}' 2>/dev/null)" || true
+  if [[ "$RUNNING_CONTAINERS" == *falkordb* ]]; then
     check_pass "FalkorDB container running"
   else
     check_warn "FalkorDB port 6379 responds but container not found via docker ps"

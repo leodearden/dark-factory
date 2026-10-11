@@ -39,6 +39,7 @@ from typing import Any
 
 import pytest
 from _escalation_http import escalation_http_call
+from _escalation_seed import seed_escalation
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
@@ -60,17 +61,14 @@ from escalation.queue import EscalationQueue
 # once in ``_serve_escalation_mcp_impl``, with its regression test in
 # ``test_serve_escalation_mcp_fixture.py``.
 #
-# Both halves of the harness are now shared, and neither has a second copy
-# (task 4345 finished what 3736 started, per INV-5). The SERVER-LIFECYCLE half
-# comes from ``conftest.py``'s ``serve_escalation_mcp_module``; the CALL half
-# from ``_escalation_http.escalation_http_call``, a uniquely-named sibling
-# module rather than a conftest fixture because a plain function is not a
-# fixture and would be unreachable from the module-level ``async def`` partials
-# below. Those partials survive on purpose: each is a single delegation
-# carrying no header logic, no transport construction and no protocol
-# knowledge, so there is nothing left that could drift -- what they still carry
-# is per-tool intent in their docstrings, which a shared module could not state
-# without making one docstring serve two different arguments. The single-source
+# Every part of the harness is now shared, none with a second copy (tasks
+# 3736 / 4345 / 4997, per INV-5). The SERVER-LIFECYCLE half comes from
+# ``conftest.py``'s ``serve_escalation_mcp_module``; the CALL half from
+# ``_escalation_http.escalation_http_call``; record seeding from
+# ``_escalation_seed.seed_escalation``. The ``async def`` partials and ``_seed``
+# below survive on purpose: each is a single delegation carrying one
+# per-module fact (per-tool intent in a docstring, or a default summary), so
+# there is nothing left that could drift. The CALL half's single-source
 # property is asserted, not merely asserted-to:
 # ``test_escalation_http_helper.py`` AST-scans this directory for it.
 # ---------------------------------------------------------------------------
@@ -130,27 +128,13 @@ def _seed(
     *,
     level: int,
     task_id: str,
-    agent_role: str = 'implementer',
+    summary: str | None = None,
     **kw: Any,
 ) -> Escalation:
-    """Seed a pending escalation at *level* directly via ``queue.submit()``.
-
-    Bypasses the MCP tools entirely (mirrors the ``_seed_esc`` helper in
-    test_server.py). ``severity``/``category``/``summary`` default to
-    innocuous values but can be overridden via **kw.
-    """
-    kw.setdefault('severity', 'blocking')
-    kw.setdefault('category', 'scope_violation')
-    kw.setdefault('summary', f'capability-guard test escalation (level={level})')
-    esc = Escalation(
-        id=queue.make_id(task_id),
-        task_id=task_id,
-        agent_role=agent_role,
-        level=level,
-        **kw,
-    )
-    queue.submit(esc)
-    return esc
+    """Delegates to ``seed_escalation`` with this module's default summary."""
+    if summary is None:
+        summary = f'capability-guard test escalation (level={level})'
+    return seed_escalation(queue, level=level, task_id=task_id, summary=summary, **kw)
 
 
 async def _resolve_over_http(base_url: str, **kwargs: Any) -> dict[str, Any]:
@@ -170,6 +154,14 @@ async def _stamp_triage_over_http(base_url: str, **kwargs: Any) -> dict[str, Any
     ``triaged_by`` is still server-attributed from X-Escalation-Identity when
     present."""
     return await escalation_http_call(base_url, 'stamp_triage', **kwargs)
+
+
+async def _amend_over_http(base_url: str, **kwargs: Any) -> dict[str, Any]:
+    """``amend_escalation`` over real HTTP — used to prove it is never gated by
+    X-Escalation-Levels (an append-only annotation, not a state transition)
+    while the amendment's ``agent_role`` is server-attributed from
+    X-Escalation-Identity when present."""
+    return await escalation_http_call(base_url, 'amend_escalation', **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -1282,4 +1274,66 @@ class TestTriageAnnotationUngated:
         )
         assert reread_b.triaged_at == stamped_triaged_at, (
             'Expected the triage stamp from (a) unchanged by the denied resolve attempt'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestAmendAnnotationUngated (task 4886): amend_escalation is NOT gated by the
+# connection-capability level check — a {0,1}-level-capped connection can
+# write a ruling onto a pending L2 it is forbidden to resolve. The amendment's
+# agent_role is server-attributed from X-Escalation-Identity, non-spoofable,
+# mirroring triaged_by / resolved_by.
+# ---------------------------------------------------------------------------
+
+
+class TestAmendAnnotationUngated:
+    """A {0,1}-capped connection can amend a pending L2 it cannot resolve."""
+
+    @pytest.mark.asyncio
+    async def test_capped_connection_amends_what_it_cannot_resolve(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        base_url, queue = http_server
+        esc = _seed(queue, level=2, task_id='task-amend-ungated')
+
+        denied = await _resolve_over_http(
+            base_url, levels='0,1',
+            escalation_id=esc.id, resolution='x', action='resume',
+        )
+        assert denied.get('code') == 'level_forbidden', (
+            f"Expected code='level_forbidden', got: {denied}"
+        )
+
+        result = await _amend_over_http(
+            base_url, levels='0,1',
+            escalation_id=esc.id, summary='ruled elsewhere: proceed',
+            agent_role='interactive',
+        )
+        assert 'error' not in result, f'Expected the amend to succeed (ungated), got: {result}'
+        assert result['amendment_recorded'] is True
+        assert result['status'] == 'pending'
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert [a['summary'] for a in reread.amendments] == ['ruled elsewhere: proceed']
+
+    @pytest.mark.asyncio
+    async def test_identity_header_attributes_the_amendment(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        base_url, queue = http_server
+        esc = _seed(queue, level=2, task_id='task-amend-identity')
+
+        result = await _amend_over_http(
+            base_url, levels='0,1', identity='orchestrator-escalation-watcher-auto',
+            escalation_id=esc.id, summary='attributed ruling',
+            agent_role='spoofed-by-agent',
+        )
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        reread = queue.get(esc.id)
+        assert reread is not None
+        [entry] = reread.amendments
+        assert entry['agent_role'] == 'orchestrator-escalation-watcher-auto', (
+            f'Expected the identity header to win over the spoofed tool arg, '
+            f"got: {entry['agent_role']!r}"
         )

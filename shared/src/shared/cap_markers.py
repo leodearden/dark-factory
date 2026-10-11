@@ -9,13 +9,15 @@ coming?".  Three independent consumers share it:
   legibility census's mining and verify stages.  Matches capacity OR auth,
   since either means the probe reply is a banner rather than a model turn.
 * ``scripts/legibility/coder.py`` (task 4736) — the trickle coder's defer
-  gate, on its two already-FAILED paths only (a non-zero CLI exit, and a
-  reply that failed to parse as a verdict).  Matches capacity OR auth for
-  the same reason the census does.  It deliberately consumes this loose
-  matcher rather than ``cli_invoke.invoke_with_cap_retry``: the trickle unit
-  runs under an interpreter where the orchestrator config — and therefore a
-  multi-account ``UsageGate`` — is unreachable, so it has nothing to fail
-  over to and needs exactly a defer gate.
+  gate, on its one remaining path: a reply that failed to parse as a
+  verdict.  Matches capacity OR auth for the same reason the census does.
+  Deciding whether an ACCOUNT is out is not the coder's: every trickle and
+  census call runs through the shared session runner
+  (``shared.cli_invoke.invoke_with_cap_retry``, task 6042), whose strict
+  detector owns that — and which, for these callers, cap-scans a SUCCESSFUL
+  reply only when the stage could not use it, so a banner that detector does
+  not recognise reaches this loose scan instead.  Two contracts, two
+  consequences, two matchers.
 
 **Why this lives in ``src/`` rather than ``tests/``.**  The list started in
 ``shared/tests/_capacity_skip.py``, which is importable solely via that

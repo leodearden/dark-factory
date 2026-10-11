@@ -1,0 +1,18 @@
+{
+  "arm_id": "incumbent-embed-a",
+  "arm_role": "control",
+  "axis": "embedding",
+  "code_sha": "8bb8c8893b0f58957753954ab0338d47f4b609b9",
+  "corpus_sha": "1eb3ed883afb5396fcba47a240e41f4b501d5b678789c48541325eb7c811b287",
+  "incomplete": false,
+  "index_configuration": "embedding-only",
+  "measured_at": "2026-10-09T09:25:41.596680Z",
+  "metric": {
+    "kind": "scalar",
+    "metric_id": "mrr",
+    "n": 199,
+    "value": 0.7570252053920395
+  },
+  "preregistration_sha": null,
+  "schema_version": 1
+}

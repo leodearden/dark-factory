@@ -33,18 +33,41 @@ has_live_claimant(task, now, ttl) (task 2408 mechanism 1) is status-agnostic —
 no status gate, no infra_hold check — and is simply the negation of the
 liveness core: True iff there is a live (non-blank claimant, fresh-heartbeat)
 claim, regardless of the task's current status.
+
+is_stranded_any_status(task, now, ttl) (C4-E6) is the status-agnostic read rule
+"is anyone alive holding this row?": the legacy metadata.infra_hold carve-out
+plus the liveness core. is_stranded / is_stranded_blocked are pinned, over a
+grid, as status gates delegating to it. DEFAULT_CLAIMANT_HEARTBEAT_TTL carries
+the single exact-value pin for the one shared heartbeat TTL.
+
+violates_terminal_claimant_invariant(task) is C4-E1 (status in TERMINAL implies
+no claimant): any claimant, fresh or stale, on a terminal row; stated on
+claimant_run_id alone, so a (NULL, heartbeat) residue is not a violation.
+
+is_stale_hygiene_tier_claimant(task, now, ttl) is D3's hygiene tier: a stale
+claimant on an allowlisted status (pending/deferred/review/merge-deferred),
+staleness read through is_stranded_any_status, disjoint from C4-E1.
 """
 
 from __future__ import annotations
 
+import itertools
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
+import shared.task_claimant
 from shared.task_claimant import (
+    DEFAULT_CLAIMANT_HEARTBEAT_TTL,
     compose_claimant_run_id,
     has_live_claimant,
+    is_stale_hygiene_tier_claimant,
     is_stranded,
+    is_stranded_any_status,
     is_stranded_blocked,
+    violates_terminal_claimant_invariant,
 )
+from shared.task_statuses import ACTIVE, TERMINAL, TaskStatus
 
 _TTL = timedelta(minutes=5)
 
@@ -363,3 +386,205 @@ class TestComposeClaimantRunId:
         a = compose_claimant_run_id('run-abc123', '2188-8b8e2ee4', 1111)
         b = compose_claimant_run_id('run-abc123', '2188-8b8e2ee4', 2222)
         assert a != b
+
+
+class TestDefaultClaimantHeartbeatTtl:
+    def test_is_exactly_ten_minutes(self):
+        """The one exact-value pin for the one claimant heartbeat TTL definition.
+
+        Deliberately an exact-value pin: ``isinstance(..., timedelta)`` plus a
+        positive-duration check is satisfied equally by 1 microsecond and by
+        100 years, so it cannot catch a units slip (``seconds=10`` for
+        ``minutes=10``) — the one error this constant is actually prone to.
+        """
+        assert isinstance(DEFAULT_CLAIMANT_HEARTBEAT_TTL, timedelta)
+        assert timedelta(minutes=10) == DEFAULT_CLAIMANT_HEARTBEAT_TTL
+
+
+def _row(status, claimant, heartbeat, metadata=None) -> dict:
+    return {
+        'status': status,
+        'claimant_run_id': claimant,
+        'heartbeat_at': heartbeat,
+        'metadata': metadata,
+    }
+
+
+_GRID_NOW = datetime(2026, 10, 9, 12, 0, tzinfo=UTC)
+_GRID_FRESH = (_GRID_NOW - timedelta(minutes=1)).isoformat()
+_GRID_STALE = (_GRID_NOW - timedelta(minutes=10)).isoformat()
+_GRID = [
+    _row(status, claimant, heartbeat, metadata)
+    for status, claimant, heartbeat, metadata in itertools.product(
+        list(TaskStatus),
+        [None, '   ', 'run-x'],
+        [_GRID_FRESH, _GRID_STALE, None, 'not-a-timestamp'],
+        [None, {'infra_hold': True}],
+    )
+]
+
+
+class TestIsStrandedAnyStatus:
+    @pytest.mark.parametrize('row', _GRID)
+    def test_stranded_unless_live_claimant_or_legacy_infra_hold(self, row):
+        """Status never matters; the infra_hold carve-out has no status gate (boundary B9)."""
+        live = row['claimant_run_id'] == 'run-x' and row['heartbeat_at'] == _GRID_FRESH
+        infra_held = row['metadata'] == {'infra_hold': True}
+        assert is_stranded_any_status(row, _GRID_NOW, _TTL) is not (live or infra_held)
+
+    def test_non_mapping_metadata_does_not_trigger_carve_out(self):
+        row = _row('in-progress', 'run-x', _GRID_STALE, metadata='infra_hold')
+        assert is_stranded_any_status(row, _GRID_NOW, _TTL) is True
+
+    def test_naive_now_is_normalized_not_raised(self):
+        now_naive = _GRID_NOW.replace(tzinfo=None)
+        assert is_stranded_any_status(_row('pending', 'run-x', _GRID_FRESH), now_naive, _TTL) is False
+
+    def test_naive_now_past_ttl_is_stranded(self):
+        now_naive = _GRID_NOW.replace(tzinfo=None)
+        assert is_stranded_any_status(_row('pending', 'run-x', _GRID_STALE), now_naive, _TTL) is True
+
+
+class TestSpecialisationsDelegate:
+    """C4-E6: the status-gated predicates are status gates over is_stranded_any_status."""
+
+    @pytest.mark.parametrize('row', _GRID)
+    def test_is_stranded_is_in_progress_gate(self, row):
+        expected = row['status'] == 'in-progress' and is_stranded_any_status(row, _GRID_NOW, _TTL)
+        assert is_stranded(row, _GRID_NOW, _TTL) == expected
+
+    @pytest.mark.parametrize('row', _GRID)
+    def test_is_stranded_blocked_is_blocked_gate(self, row):
+        expected = row['status'] == 'blocked' and is_stranded_any_status(row, _GRID_NOW, _TTL)
+        assert is_stranded_blocked(row, _GRID_NOW, _TTL) == expected
+
+    @pytest.mark.parametrize('row', [r for r in _GRID if r['metadata'] is None])
+    def test_without_infra_hold_is_negated_has_live_claimant(self, row):
+        assert is_stranded_any_status(row, _GRID_NOW, _TTL) == (
+            not has_live_claimant(row, _GRID_NOW, _TTL)
+        )
+
+
+class TestViolatesTerminalClaimantInvariant:
+    _FRESH = (_GRID_NOW - timedelta(minutes=1)).isoformat()
+    _STALE = (_GRID_NOW - timedelta(hours=12)).isoformat()
+
+    @pytest.mark.parametrize('status', sorted(TERMINAL))
+    @pytest.mark.parametrize('heartbeat', [_FRESH, _STALE, None])
+    def test_terminal_row_with_any_claimant_violates(self, status, heartbeat):
+        row = _row(status, 'run-a/4028-x/pid=1', heartbeat)
+        assert violates_terminal_claimant_invariant(row) is True
+
+    def test_freeform_claimant_without_heartbeat_violates(self):
+        """The reify-5225 shape: freeform claimant, no pid=, no heartbeat."""
+        row = _row('cancelled', 'agent-esc-5053-2-docs-fix', None)
+        assert violates_terminal_claimant_invariant(row) is True
+
+    def test_heartbeat_residue_without_claimant_is_not_a_violation(self):
+        """Boundary case B15: C4-E1 is stated on claimant_run_id alone."""
+        row = _row('done', None, self._FRESH)
+        assert violates_terminal_claimant_invariant(row) is False
+
+    def test_blank_claimant_is_not_a_violation(self):
+        row = _row('done', '   ', self._FRESH)
+        assert violates_terminal_claimant_invariant(row) is False
+
+    @pytest.mark.parametrize('status', sorted(ACTIVE))
+    @pytest.mark.parametrize('heartbeat', [_FRESH, _STALE])
+    def test_active_status_never_violates(self, status, heartbeat):
+        row = _row(status, 'run-a/4028-x/pid=1', heartbeat)
+        assert violates_terminal_claimant_invariant(row) is False
+
+    def test_enum_status_matches_str_status(self):
+        enum_row = _row(TaskStatus.DONE, 'run-x', self._FRESH)
+        str_row = _row('done', 'run-x', self._FRESH)
+        assert violates_terminal_claimant_invariant(enum_row) is True
+        assert violates_terminal_claimant_invariant(str_row) is True
+
+    def test_row_without_status_does_not_violate(self):
+        row = {'claimant_run_id': 'run-x', 'heartbeat_at': self._FRESH}
+        assert violates_terminal_claimant_invariant(row) is False
+
+
+_HYGIENE_EXPECTED: dict[TaskStatus, bool] = {
+    TaskStatus.PENDING: True,
+    TaskStatus.DEFERRED: True,
+    TaskStatus.REVIEW: True,
+    TaskStatus.MERGE_DEFERRED: True,
+    TaskStatus.IN_PROGRESS: False,
+    TaskStatus.BLOCKED: False,
+    TaskStatus.INFRA_HOLD: False,
+    TaskStatus.DONE: False,
+    TaskStatus.CANCELLED: False,
+}
+_HYGIENE_STATUSES = [status for status, expected in _HYGIENE_EXPECTED.items() if expected]
+
+
+class TestIsStaleHygieneTierClaimant:
+    _FRESH = (_GRID_NOW - timedelta(minutes=1)).isoformat()
+    _STALE = (_GRID_NOW - timedelta(minutes=10)).isoformat()
+
+    def test_expectation_classifies_every_status(self):
+        assert set(_HYGIENE_EXPECTED) == set(TaskStatus)
+
+    @pytest.mark.parametrize(('status', 'expected'), list(_HYGIENE_EXPECTED.items()))
+    def test_stale_claimant_by_status(self, status, expected):
+        row = _row(status, 'run-x', self._STALE)
+        assert is_stale_hygiene_tier_claimant(row, _GRID_NOW, _TTL) is expected
+
+    @pytest.mark.parametrize('status', _HYGIENE_STATUSES)
+    def test_fresh_claimant_is_not_hygiene(self, status):
+        """The C3.1 teardown window: an allowlisted status with a fresh claimant is legal."""
+        row = _row(status, 'run-x', self._FRESH)
+        assert is_stale_hygiene_tier_claimant(row, _GRID_NOW, _TTL) is False
+
+    @pytest.mark.parametrize('claimant', [None, '   '])
+    def test_no_claimant_is_nothing_to_clear(self, claimant):
+        row = _row('pending', claimant, self._STALE)
+        assert is_stale_hygiene_tier_claimant(row, _GRID_NOW, _TTL) is False
+
+    @pytest.mark.parametrize('heartbeat', [None, 'not-a-timestamp'])
+    def test_missing_or_unparseable_heartbeat_is_stale(self, heartbeat):
+        """The B14 shape on a hygiene status."""
+        row = _row('pending', 'run-x', heartbeat)
+        assert is_stale_hygiene_tier_claimant(row, _GRID_NOW, _TTL) is True
+
+    def test_legacy_infra_hold_metadata_is_exempt(self):
+        row = _row('pending', 'run-x', self._STALE, metadata={'infra_hold': True})
+        assert is_stale_hygiene_tier_claimant(row, _GRID_NOW, _TTL) is False
+
+    def test_ttl_is_honoured(self):
+        row = _row('pending', 'run-x', self._STALE)
+        assert is_stale_hygiene_tier_claimant(row, _GRID_NOW, timedelta(minutes=5)) is True
+        assert is_stale_hygiene_tier_claimant(row, _GRID_NOW, timedelta(hours=1)) is False
+
+    def test_naive_now_is_tolerated(self):
+        now_naive = _GRID_NOW.replace(tzinfo=None)
+        assert is_stale_hygiene_tier_claimant(_row('pending', 'run-x', self._STALE), now_naive, _TTL)
+        assert not is_stale_hygiene_tier_claimant(
+            _row('pending', 'run-x', self._FRESH), now_naive, _TTL
+        )
+
+    @pytest.mark.parametrize(
+        'row',
+        [
+            _row(status, claimant, heartbeat)
+            for status, claimant, heartbeat in itertools.product(
+                list(TaskStatus), [None, '   ', 'run-x'], [_FRESH, _STALE, None]
+            )
+        ],
+    )
+    def test_tiers_are_disjoint(self, row):
+        assert not (
+            violates_terminal_claimant_invariant(row)
+            and is_stale_hygiene_tier_claimant(row, _GRID_NOW, _TTL)
+        )
+
+
+def test_public_api_surface():
+    assert {
+        'is_stranded_any_status',
+        'DEFAULT_CLAIMANT_HEARTBEAT_TTL',
+        'violates_terminal_claimant_invariant',
+        'is_stale_hygiene_tier_claimant',
+    } <= set(shared.task_claimant.__all__)

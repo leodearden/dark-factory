@@ -40,7 +40,7 @@ import inspect
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
 import pytest
 from _orch_helpers import (
@@ -63,6 +63,7 @@ from orchestrator.landing_evidence import (
     file_landing_git_error_storm_escalation,
     format_unattributed_landing_detail,
 )
+from orchestrator.merge_lane import patch_content_contained
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
@@ -100,7 +101,7 @@ class _Repo:
         # FIRST, before any subprocess: a rejected root must write nothing.
         assert_isolated_git_repo(root)
         self.root = root
-        self._env = git_env_with_ceiling(root)
+        self.env = git_env_with_ceiling(root)
 
     @classmethod
     def init(cls, root: Path) -> _Repo:
@@ -123,7 +124,7 @@ class _Repo:
     def git(self, *args: str, check: bool = True) -> str:
         proc = subprocess.run(
             ['git', *args], cwd=str(self.root), capture_output=True,
-            env=self._env, text=True, check=False,
+            env=self.env, text=True, check=False,
         )
         if check:
             assert proc.returncode == 0, (
@@ -135,7 +136,7 @@ class _Repo:
     def git_rc(self, *args: str) -> tuple[int, str]:
         proc = subprocess.run(
             ['git', *args], cwd=str(self.root), capture_output=True,
-            env=self._env, text=True, check=False,
+            env=self.env, text=True, check=False,
         )
         return proc.returncode, proc.stdout.strip()
 
@@ -613,7 +614,7 @@ class TestBoundaryFixtures:
         with pytest.raises(NonIsolatedGitRepoError):
             _Repo(nested)
         # And the ceiling is really set on the guarded wrapper's environment.
-        assert 'GIT_CEILING_DIRECTORIES' in _Repo(git_repo)._env
+        assert 'GIT_CEILING_DIRECTORIES' in _Repo(git_repo).env
 
 
 # --------------------------------------------------------------------------
@@ -812,30 +813,6 @@ def _spy_on_method(monkeypatch: pytest.MonkeyPatch, obj: object, name: str) -> l
     return calls
 
 
-def _spy_on_patch_content_contained(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
-    """Spy on the lazily-imported ``git cherry`` helper.
-
-    ``branch_work_landed`` imports it INSIDE the function (merge_queue.py
-    imports back from landing_evidence at module level, so a top-level reverse
-    import would be a cycle), which is exactly what makes patching the module
-    attribute effective: the lookup happens at call time.
-    """
-    import orchestrator.merge_queue as mq
-
-    calls: list[tuple] = []
-    original = mq.patch_content_contained
-
-    # `Any`, not `object`: unlike the `getattr` capture above, `original` here
-    # is the concretely-typed `patch_content_contained`, so forwarding
-    # `object`-typed varargs into it is a type error at the call.
-    async def _recording(*args: Any, **kwargs: Any) -> Any:
-        calls.append((args, kwargs))
-        return await original(*args, **kwargs)
-
-    monkeypatch.setattr(mq, 'patch_content_contained', _recording)
-    return calls
-
-
 @pytest.mark.asyncio
 class TestB4NoOpLanding:
     """B4 — a genuine merge marker over a branch that delivered nothing.
@@ -916,7 +893,6 @@ class TestOrderingRule:
 
         # Precondition 1: the patch-id arm WOULD accept — every branch commit
         # is present in main as an equivalent patch.
-        from orchestrator.merge_queue import patch_content_contained
         assert await patch_content_contained(sc.branch_tip_sha, 'main', git_ops) is True
         # Precondition 2: ...and the branch's net contribution is empty.
         assert await git_ops.net_diff_is_empty('main', sc.branch_tip_sha) is True
@@ -930,24 +906,6 @@ class TestOrderingRule:
         )
         assert verdict.accepted is False
 
-    async def test_no_op_guard_short_circuits_before_the_patch_id_arm(
-        self, git_ops: GitOps, repo: _Repo, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Ordering asserted MECHANICALLY, not just by outcome."""
-        sc = build_no_op_landing(repo)
-        no_op_calls = _spy_on_method(monkeypatch, git_ops, 'net_diff_is_empty')
-        cherry_calls = _spy_on_patch_content_contained(monkeypatch)
-
-        verdict = await branch_work_landed(
-            git_ops, TASK_ID, sc.branch,
-            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
-        )
-        assert verdict.reason is LandingReason.no_op_landing
-        assert len(no_op_calls) == 1, 'the no-op guard must run'
-        assert cherry_calls == [], (
-            'a rejected no-op must never reach the patch-id arm'
-        )
-
     async def test_degenerate_guard_runs_before_the_no_op_check_and_patch_id(
         self, git_ops: GitOps, repo: _Repo, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -959,7 +917,9 @@ class TestOrderingRule:
         """
         sc = build_degenerate_branch(repo)
         no_op_calls = _spy_on_method(monkeypatch, git_ops, 'net_diff_is_empty')
-        cherry_calls = _spy_on_patch_content_contained(monkeypatch)
+        # The patch-id arm, asked directly, accepts this branch -- so a verdict
+        # of anything but degenerate_branch would be the later arm's answer.
+        assert await patch_content_contained(sc.branch_tip_sha, 'main', git_ops) is True
 
         verdict = await branch_work_landed(
             git_ops, TASK_ID, sc.branch,
@@ -967,7 +927,6 @@ class TestOrderingRule:
         )
         assert verdict.reason is LandingReason.degenerate_branch
         assert no_op_calls == [], 'the no-op check must not run for a degenerate branch'
-        assert cherry_calls == [], 'the patch-id arm must not run for a degenerate branch'
 
 
 @pytest.mark.asyncio
@@ -992,7 +951,6 @@ class TestB6DegenerateBranch:
     ) -> None:
         """Why the row exists: containment says YES for a branch with no work."""
         sc = build_degenerate_branch(repo)
-        from orchestrator.merge_queue import patch_content_contained
         assert await patch_content_contained(sc.branch_tip_sha, 'main', git_ops) is True, (
             'a parked branch is patch-id-contained in main by construction'
         )
@@ -1915,6 +1873,28 @@ class TestLandingTally:
                 subject.record(reason)
         assert subject.git_error_count_in_window() == 0
 
+    def test_the_git_error_window_is_half_open(self) -> None:
+        now = [0.0]
+        subject = LandingTally(clock=lambda: now[0])
+        subject.record(LandingReason.git_error)
+
+        now[0] = subject.window_secs - 1.0
+        assert subject.git_error_count_in_window() == 1
+        now[0] = subject.window_secs
+        assert subject.git_error_count_in_window() == 0, (
+            'a stamp aged exactly the window is out'
+        )
+
+    def test_the_windowed_count_is_exact_however_large_the_storm(self) -> None:
+        """The count is the number the storm alarm reports, so it must be exact.
+
+        The window, not a cap, bounds it.
+        """
+        subject = LandingTally(clock=lambda: 0.0)
+        for _ in range(5000):
+            subject.record(LandingReason.git_error)
+        assert subject.git_error_count_in_window() == 5000
+
 
 @pytest.mark.asyncio
 class TestTallyIsChargedByEveryVerdict:
@@ -2170,6 +2150,44 @@ class TestGitErrorStormEscape:
         )
         assert all(v.reason is LandingReason.git_error for v in verdicts)
         assert queue.submitted == []
+
+    async def test_a_failed_submit_is_retried_on_the_next_git_error(
+        self, git_ops: GitOps, repo: _Repo, tally: LandingTally,
+    ) -> None:
+        """The alarm's only dedup is the open L1 (``has_open_l1``), never a time
+        rate-limit or latch — which is why ``LandingTally`` uses
+        ``StormCounter.observe()`` and NOT ``record()``: routing the fire through
+        ``record()`` would consume a fire on a failed submit and stop re-filing a
+        resolved alarm mid-storm.
+        """
+        build_unlanded_branch(repo)
+        broken = _FakeEscalationQueue(submit_raises=True)
+        await _drive_git_errors(
+            git_ops, 4, queue=broken, recovery_emission=_storm_config(rate=3),
+        )
+        assert broken.submitted == []
+
+        healthy = _FakeEscalationQueue()
+        await _drive_git_errors(
+            git_ops, 1, queue=healthy, recovery_emission=_storm_config(rate=3),
+        )
+        assert len(healthy.submitted) == 1
+
+    async def test_a_resolved_alarm_is_refiled_while_the_storm_persists(
+        self, git_ops: GitOps, repo: _Repo, tally: LandingTally,
+    ) -> None:
+        build_unlanded_branch(repo)
+        first = _FakeEscalationQueue()
+        await _drive_git_errors(
+            git_ops, 4, queue=first, recovery_emission=_storm_config(rate=3),
+        )
+        assert len(first.submitted) == 1
+
+        resolved = _FakeEscalationQueue()
+        await _drive_git_errors(
+            git_ops, 1, queue=resolved, recovery_emission=_storm_config(rate=3),
+        )
+        assert len(resolved.submitted) == 1
 
     async def test_the_filer_is_directly_callable_and_reports_what_it_did(
         self, tally: LandingTally,

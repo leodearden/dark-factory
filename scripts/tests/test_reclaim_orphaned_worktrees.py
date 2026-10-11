@@ -691,7 +691,9 @@ def test_cli_default_parking_root_derived_from_repo(tmp_path):
 # ---------------------------------------------------------------------------
 
 # An environment poisoned with every name that retargets git away from the path
-# it is given, plus one indexed `git -c` pair. `-C <path>` / `cwd=` only change
+# it is given, plus one indexed GIT_CONFIG_COUNT pair and git's own `-c`
+# propagation channel, GIT_CONFIG_PARAMETERS (read at command-line precedence,
+# so it can inject a core.hooksPath). `-C <path>` / `cwd=` only change
 # DIRECTORY; GIT_DIR and its siblings SKIP repository discovery outright, so an
 # ambient GIT_DIR redirects EVERY git call this module makes regardless of
 # --repo / --parking-root / cwd. Measured against the pre-guard script: under
@@ -710,6 +712,7 @@ POISONED_GIT_ENV = {
     "GIT_CONFIG_COUNT": "1",
     "GIT_CONFIG_KEY_0": "core.hooksPath",
     "GIT_CONFIG_VALUE_0": "/decoy/hooks",
+    "GIT_CONFIG_PARAMETERS": "'core.hooksPath=/decoy/hooks'",
 }
 
 # Names the scrub must LEAVE ALONE. The ceiling is a DIFFERENT defence's own
@@ -823,6 +826,31 @@ def test_run_git_chokepoint_scrubs_ambient_redirection(tmp_path, monkeypatch):
     for name, value in PRESERVED_GIT_ENV.items():
         assert env[name] == value, f"{name} must survive to git"
     assert env["LC_ALL"] == "C"
+
+
+def test_run_git_ignores_ambient_git_config_parameters(tmp_path, monkeypatch):
+    """REAL git: a config injected through git's own `-c` channel never reaches
+    the chokepoint's git. The premise control proves this host's git honours
+    GIT_CONFIG_PARAMETERS, so the final assertion cannot pass vacuously."""
+    repo = _init_repo(tmp_path)
+    poisoned = POISONED_GIT_ENV["GIT_CONFIG_PARAMETERS"]
+
+    premise = subprocess.run(
+        ["git", "-C", str(repo), "config", "--get", "core.hooksPath"],
+        env={**os.environ, "GIT_CONFIG_PARAMETERS": poisoned},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert premise.stdout.strip() == "/decoy/hooks", (
+        f"this git does not honour GIT_CONFIG_PARAMETERS: {premise!r}"
+    )
+
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", poisoned)
+    rc, out, _ = row._run_git(["config", "--get", "core.hooksPath"], cwd=repo)
+
+    assert "/decoy/hooks" not in out
+    assert rc == 1, f"core.hooksPath should be unset in the sandbox (rc={rc}, out={out!r})"
 
 
 def _decoy_and_sandbox(tmp_path):

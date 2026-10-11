@@ -80,6 +80,17 @@ INTERNALERROR_RESULT = VerifyResult(
     category='pytest_internalerror',
 )
 
+TIMEOUT_RESULT = VerifyResult(
+    passed=False,
+    test_output='',
+    lint_output='',
+    type_output='',
+    summary='Verification timed out',
+    timed_out=True,
+    category='infra_timeout',
+    cause_hint='Command timed out',
+)
+
 
 def _make_config(tmp_path: Path) -> OrchestratorConfig:
     return OrchestratorConfig(
@@ -424,6 +435,107 @@ class TestRunMainTipSweepRetryOnFlake:
             f'got {rfv.call_count}'
         )
 
+    def test_run_main_tip_sweep_logs_confirmed_deterministic_drift(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """The deterministic-drift exit must SAY SO (2026-09-22 incident).
+
+        On that day this branch was the one actually taken and it logged
+        NOTHING: the last journal line was the first-pass WARNING, the retry
+        then ran for 5h16m, and from outside the process "detected and handed
+        to the harness" was indistinguishable from the outer ``except
+        Exception`` swallow, which also produces no line and returns the "no
+        signal" sentinel.
+        """
+        import logging
+
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.verify'),
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(
+                verify_module, 'run_full_verification',
+                AsyncMock(side_effect=[FAILING_RESULT, FAILING_RESULT]),
+            ),
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        assert result is not None and result[1].passed is False
+        confirmations = [
+            r for r in caplog.records
+            if 'REPRODUCED on retry' in r.getMessage()
+        ]
+        assert len(confirmations) == 1, (
+            f'expected exactly one deterministic-drift confirmation line, got '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+        msg = confirmations[0].getMessage()
+        assert MAIN_SHA[:12] in msg, f'line must name the swept SHA: {msg!r}'
+        assert confirmations[0].levelno >= logging.WARNING, (
+            'the confirmation must be at WARNING or above, or the journal '
+            'will not carry it'
+        )
+
+    def test_run_main_tip_sweep_swallowed_exception_is_loud(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """The bare ``except Exception`` swallow must log at ERROR.
+
+        It collapses a possibly-real red-main signal into the None "no signal"
+        sentinel, so the harness files nothing and the drift is dropped on the
+        floor.  At DEBUG that was below the journal's effective level and
+        therefore completely invisible.  Control flow is unchanged: the
+        sentinel is still returned.
+        """
+        import logging
+
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='orchestrator.verify'),
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(
+                verify_module, 'run_full_verification',
+                AsyncMock(side_effect=RuntimeError('boom')),
+            ),
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        assert result is None, (
+            f'control flow must be unchanged — still the sentinel, got {result!r}'
+        )
+        swallows = [
+            r for r in caplog.records
+            if 'unexpected error during the main-tip sweep' in r.getMessage()
+        ]
+        assert len(swallows) == 1, (
+            f'expected exactly one swallow line, got '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+        assert swallows[0].levelno >= logging.ERROR, (
+            f'the swallow must be at ERROR or above (it was DEBUG, i.e. '
+            f'invisible in the journal); got {swallows[0].levelname}'
+        )
+        assert MAIN_SHA[:12] in swallows[0].getMessage(), (
+            'the swallow line must name the SHA whose signal was dropped'
+        )
+        assert swallows[0].exc_info is not None, (
+            'the swallow line must carry the traceback'
+        )
+
     def test_run_main_tip_sweep_passes_first_time_no_retry(
         self, tmp_path: Path
     ) -> None:
@@ -613,6 +725,91 @@ class TestRunMainTipSweepRoleStamp:
             "Expected the real run_full_verification to thread role='background' "
             f'down to run_verification; got kwargs={run_verification_calls[0]!r}'
         )
+
+
+class TestRunMainTipSweepNoTimeoutRetries:
+    """task 5812: host CPU is the throughput bottleneck, so neither sweep pass
+    re-runs on a timeout, and a timed-out first pass is not retried in full."""
+
+    def _sweep(self, tmp_path: Path, rfv: AsyncMock):
+        from orchestrator import verify as verify_module
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_full_verification', rfv),
+        ):
+            return asyncio.run(verify_module.run_main_tip_sweep(
+                _make_config(tmp_path), _make_git_ops(tmp_path),
+            ))
+
+    def test_both_sweep_passes_disable_timeout_retries(self, tmp_path: Path) -> None:
+        rfv = AsyncMock(side_effect=[FAILING_RESULT, PASSING_RESULT])
+
+        self._sweep(tmp_path, rfv)
+
+        assert rfv.call_count == 2, 'expected first pass + full retry'
+        for call_index, one_call in enumerate(rfv.call_args_list):
+            assert one_call.kwargs.get('max_retries') == 0, (
+                f'call #{call_index} to run_full_verification must pass '
+                f'max_retries=0; got kwargs={one_call.kwargs!r}'
+            )
+
+    def test_max_retries_zero_reaches_run_verification_through_real_run_full_verification(
+        self, tmp_path: Path,
+    ) -> None:
+        """Only run_verification is faked, so the real run_full_verification
+        must carry the sweep's max_retries=0 the whole way down."""
+        from orchestrator import verify as verify_module
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        run_verification_calls: list = []
+
+        async def _fake_run_verification(project_root, cfg, module_config=None, **kwargs):
+            run_verification_calls.append(kwargs)
+            return PASSING_RESULT
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_verification', side_effect=_fake_run_verification),
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(
+                _make_config(tmp_path), _make_git_ops(tmp_path),
+            ))
+
+        assert result is not None
+        assert len(run_verification_calls) == 1
+        assert run_verification_calls[0]['max_retries'] == 0, run_verification_calls[0]
+
+    def test_first_pass_infra_timeout_returns_its_verdict_without_a_full_retry(
+        self, tmp_path: Path,
+    ) -> None:
+        rfv = AsyncMock(return_value=TIMEOUT_RESULT)
+
+        result = self._sweep(tmp_path, rfv)
+
+        assert result == (MAIN_SHA, TIMEOUT_RESULT)
+        assert rfv.call_count == 1, (
+            'a timed-out first pass must not pay for a second full-suite run; '
+            f'got {rfv.call_count} run_full_verification calls'
+        )
+
+    def test_non_timeout_first_pass_failure_still_pays_the_full_retry(
+        self, tmp_path: Path,
+    ) -> None:
+        """Control: only INFRA_TIMEOUT short-circuits the retry."""
+        rfv = AsyncMock(side_effect=[FAILING_RESULT, PASSING_RESULT])
+
+        result = self._sweep(tmp_path, rfv)
+
+        assert rfv.call_count == 2
+        assert result is not None
+        _, vr = result
+        assert vr.passed is True
 
 
 # ---------------------------------------------------------------------------

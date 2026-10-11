@@ -1,5 +1,7 @@
 """Tests for the submit_and_resolve helper in _fm_helpers.py."""
 
+import asyncio
+import concurrent.futures
 import json
 import sys
 import types
@@ -9,6 +11,7 @@ import httpx
 import pytest
 from _fm_helpers import (
     _LOADED_SCRIPT_MODULE_NAMES,
+    LoopFreedomProbe,
     load_script_module,
     submit_and_resolve,
 )
@@ -1547,6 +1550,111 @@ class TestRetryUntilObserved:
             await retry_until_observed(observe, attempts=bad_attempts)
 
         assert log == [], f'expected no observation at all, got {log!r}'
+
+
+# ---------------------------------------------------------------------------
+# Tests for the shared LoopFreedomProbe oracle (task 5920)
+# ---------------------------------------------------------------------------
+
+#: Only a held loop ever reaches the ceiling, so shortening it cannot turn a
+#: False verdict True; it only keeps the held-loop cases fast.
+_HELD_LOOP_CEILING_SECONDS = 0.01
+
+
+def _drive_without_yielding_to_loop(coro) -> None:
+    with pytest.raises(StopIteration):
+        while True:
+            coro.send(None)
+
+
+def _run_on_a_worker_while_the_loop_thread_waits(fn, *args) -> None:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(fn, *args).result()
+
+
+class TestLoopFreedomProbe:
+    """Unit tests for LoopFreedomProbe.suspend() / .block() / .observations / .assert_loop_stayed_free()."""
+
+    @pytest.mark.asyncio
+    async def test_a_free_loop_reads_true(self):
+        probe = LoopFreedomProbe()
+
+        await probe.suspend()
+
+        assert probe.observations == (True,)
+        probe.assert_loop_stayed_free()
+
+    @pytest.mark.asyncio
+    async def test_a_call_site_that_resumes_the_coroutine_itself_reads_false(self):
+        probe = LoopFreedomProbe()
+
+        _drive_without_yielding_to_loop(probe.suspend())
+
+        assert probe.observations == (False,)
+
+    @pytest.mark.asyncio
+    async def test_a_call_site_waiting_on_another_threads_loop_reads_false(self):
+        probe = LoopFreedomProbe(ceiling_seconds=_HELD_LOOP_CEILING_SECONDS)
+
+        _run_on_a_worker_while_the_loop_thread_waits(asyncio.run, probe.suspend())
+
+        assert probe.observations == (False,)
+
+    @pytest.mark.asyncio
+    async def test_a_call_site_awaiting_another_threads_loop_reads_true(self):
+        probe = LoopFreedomProbe()
+
+        await asyncio.to_thread(asyncio.run, probe.suspend())
+
+        assert probe.observations == (True,)
+
+    @pytest.mark.asyncio
+    async def test_a_blocking_call_offloaded_from_the_loop_reads_true(self):
+        probe = LoopFreedomProbe()
+
+        await asyncio.to_thread(probe.block)
+
+        assert probe.observations == (True,)
+
+    @pytest.mark.asyncio
+    async def test_a_blocking_call_on_the_loop_thread_reads_false(self):
+        probe = LoopFreedomProbe()
+
+        probe.block()
+
+        assert probe.observations == (False,)
+
+    @pytest.mark.asyncio
+    async def test_a_blocking_call_the_loop_thread_waits_on_reads_false(self):
+        probe = LoopFreedomProbe(ceiling_seconds=_HELD_LOOP_CEILING_SECONDS)
+
+        _run_on_a_worker_while_the_loop_thread_waits(probe.block)
+
+        assert probe.observations == (False,)
+
+    @pytest.mark.asyncio
+    async def test_assert_loop_stayed_free_rejects_an_unreached_probe(self):
+        probe = LoopFreedomProbe()
+
+        with pytest.raises(AssertionError, match='never reached'):
+            probe.assert_loop_stayed_free()
+
+    @pytest.mark.asyncio
+    async def test_assert_loop_stayed_free_rejects_a_held_loop(self):
+        probe = LoopFreedomProbe()
+        _drive_without_yielding_to_loop(probe.suspend())
+
+        with pytest.raises(AssertionError, match='held'):
+            probe.assert_loop_stayed_free()
+
+    @pytest.mark.asyncio
+    async def test_each_suspension_is_recorded(self):
+        probe = LoopFreedomProbe()
+
+        await probe.suspend()
+        await probe.suspend()
+
+        assert probe.observations == (True, True)
 
 
 # ---------------------------------------------------------------------------

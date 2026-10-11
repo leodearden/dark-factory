@@ -221,23 +221,21 @@ class TestCheckSerialLaneTripwire:
     def test_bound_defaults_to_engine_constant_resolved_at_call_time(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Omitted bound reaches back to merge_queue._MERGE_AHEAD_BOUND AT CALL TIME.
+        """Omitted bound resolves liveness._MERGE_AHEAD_BOUND AT CALL TIME.
 
-        A def-time default would need a top-level ``import
-        orchestrator.merge_queue`` in merge_liveness (module-load deadlock — the
-        shim needs merge_liveness fully defined first) AND would defeat this
-        monkeypatch, which the suite already relies on for
+        A def-time default would freeze the value at import and defeat this
+        monkeypatch, which the suite also relies on for
         ``enforce_persistent_worktree_serial_lane``.
         """
         from orchestrator.merge_liveness import check_serial_lane_tripwire  # noqa: PLC0415
 
-        monkeypatch.setattr('orchestrator.merge_queue._MERGE_AHEAD_BOUND', 4)
+        monkeypatch.setattr('orchestrator.merge_lane.liveness._MERGE_AHEAD_BOUND', 4)
         assessment = check_serial_lane_tripwire(2)
         assert assessment.merge_ahead_bound == 4
         assert assessment.breached is False  # 2 > ceil(4/1)=4 is False
 
     def test_unpatched_bound_default_is_the_real_engine_constant(self) -> None:
-        """Unpatched, the reach-back yields the real _MERGE_AHEAD_BOUND (1)."""
+        """Unpatched, the omitted bound is the real _MERGE_AHEAD_BOUND (1)."""
         from orchestrator.merge_liveness import check_serial_lane_tripwire  # noqa: PLC0415
 
         assessment = check_serial_lane_tripwire(2)
@@ -540,11 +538,17 @@ class TestSerialLaneTripwireWiredIntoDispatch:
                 fut.cancel()
 
     def _bare_worker(self, git_ops: GitOps, rec):
-        """A worker at the production single-host shape: bound=1, num_hosts=1."""
-        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), event_store=rec)
-        # speculation_depth stays at its default (_MERGE_AHEAD_BOUND = 1) and
-        # _host_allocator stays None so num_hosts resolves to 1.
-        assert worker._speculation_depth == 1
+        """A worker at the production single-host shape: bound=1, num_hosts=1.
+
+        ``speculation_depth=1`` is passed explicitly — it is the constructor's
+        own parameter and also what the ``_MERGE_AHEAD_BOUND`` default resolves
+        to, so the shape is stated rather than asserted after the fact.
+        """
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(), event_store=rec, speculation_depth=1,
+        )
+        # No host_allocator constructor parameter exists, so the single-host
+        # shape (num_hosts == 1) still has to be read off the attribute.
         assert worker._host_allocator is None
         return worker
 
@@ -614,10 +618,9 @@ class TestSerialLaneTripwireWiredIntoDispatch:
         assert worker._inflight_append(entry_a) is None
         assert worker._inflight_append(entry_b) is None
 
-        assert len(worker._inflight) == 2
-        assert list(worker._inflight) == [entry_a, entry_b]
-        # inflight_by_host is the LOSSLESS occupancy view (the sibling by_host
-        # collapses two entries sharing a host, last-writer-wins).
+        # Both entries landed, in order. inflight_by_host is the LOSSLESS
+        # occupancy view (the sibling by_host collapses two entries sharing a
+        # host, last-writer-wins), so it pins count AND order publicly.
         assert worker.snapshot()['occupancy']['inflight_by_host']['local'] == ['9004', '9005']
 
     async def test_third_local_dispatch_fires_again(

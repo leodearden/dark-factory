@@ -8,7 +8,7 @@ Isolated from test_server.py because:
 
 Shared patterns from the existing test suite:
 - Cross-package import guard (mirrors test_server.py lines 30-54)
-- _call_merge_status helper (mirrors test_server.py line 2825)
+- call_merge_status / call_merge_request from _merge_tool_calls
 - _stub_git_ops: returns SimpleNamespace with AsyncMock methods for unit tests
 - Real-git fixtures (git_repo/_init_repo/orch_config/git_ops) modeled on
   test_workflow_status_on_resume.py:47-80 and test_git_ops.py
@@ -20,8 +20,10 @@ import types
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
+from unittest.mock import call as mock_call
 
 import pytest
+from _merge_tool_calls import call_merge_request, call_merge_status
 
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -47,12 +49,6 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-async def _call_merge_status(server, **kwargs) -> dict:
-    """Invoke the merge_status MCP tool (async tool)."""
-    tool = await server.get_tool('merge_status')
-    return await tool.fn(**kwargs)
 
 
 def _stub_git_ops(**overrides) -> types.SimpleNamespace:
@@ -121,7 +117,8 @@ def _stub_harness(
     """Return the standard merge_status harness stub wired to *git_ops*.
 
     By default the stub has NO ``scheduler`` attribute at all — which is the
-    fail-soft path task 3103's ``_git_authority_task_metadata`` helper is
+    fail-soft path task 3103's
+    ``escalation/src/escalation/git_authority.py::task_metadata`` helper is
     built for (metadata unavailable → skip the degeneracy check → still apply
     the citation gate), and the shape every pre-existing test in this module
     already uses.
@@ -144,6 +141,47 @@ def _stub_harness(
             get_task=AsyncMock(return_value={'metadata': metadata}),
         )
     return harness
+
+
+def _record_validate_landing_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[Any]:
+    """Patch ``validate_landing_evidence`` with a DELEGATING recorder.
+
+    Returns the list of :class:`unittest.mock.call` objects it accumulates,
+    one per invocation, so a test can assert on the CALL CONTRACT.
+
+    This is the first mocking seam in this module, which otherwise steers the
+    real ``validate_landing_evidence`` entirely through ``_stub_git_ops``.
+    That strategy is right for behaviour but structurally cannot observe an
+    OPTIONAL keyword argument that is simply never passed — the exact
+    miswiring these tests exist to catch.  A recorder that DELEGATES to the
+    real function is the minimum-damage seam: the existing behavioural pins
+    keep running the real decision logic, and only the call contract is
+    additionally observed.
+
+    Patch the DEFINING module, not the importer: server.py's
+    ``from orchestrator.landing_evidence import ...`` is lazy and inside the
+    function body, so the module attribute is re-resolved on every call.
+
+    Read ``call.kwargs['delivered_checks']`` BY NAME rather than by positional
+    index, so the pin survives task 4500 flipping that parameter to
+    keyword-only.
+    """
+    from orchestrator.landing_evidence import (  # type: ignore[reportMissingImports]
+        validate_landing_evidence as _real,
+    )
+
+    calls: list[Any] = []
+
+    async def _recorder(*args: Any, **kwargs: Any) -> Any:
+        calls.append(mock_call(*args, **kwargs))
+        return await _real(*args, **kwargs)
+
+    monkeypatch.setattr(
+        'orchestrator.landing_evidence.validate_landing_evidence', _recorder,
+    )
+    return calls
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +246,7 @@ class TestMergeStatusGitAuthority:
         - state == 'done', kind == 'found_on_main', generation == 1
         - merge_sha == the citation commit discovered on main (task 3103; this
           assertion used to pin ``merge_sha == tip``, the documented
-          ``_found_on_main_response`` wart that the citation gate retires)
+          ``found_on_main_response`` wart that the citation gate retires)
         - the (tip, 'main') ancestry call is made
         - find_merge_marker was NOT called (cheaper-common-path ordering: skip
           the find_merge_marker scan when the branch ref is still live)
@@ -232,7 +270,7 @@ class TestMergeStatusGitAuthority:
         # NO event_store — durable tiers miss, so Tier-3.5 must fire
         server = create_server(esc_queue, harness=stub_harness, orch_config=config)
 
-        result = await _call_merge_status(server, task_id='123')
+        result = await call_merge_status(server, task_id='123')
 
         assert result.get('state') == 'done', f'Expected state=done, got: {result}'
         assert result.get('kind') == 'found_on_main', f'Expected kind=found_on_main, got: {result}'
@@ -281,7 +319,7 @@ class TestMergeStatusGitAuthority:
         config = _make_config(tmp_path)
         server = create_server(esc_queue, harness=stub_harness, orch_config=config)
 
-        result = await _call_merge_status(server, task_id='456')
+        result = await call_merge_status(server, task_id='456')
 
         assert result.get('state') == 'done', f'Expected state=done, got: {result}'
         assert result.get('kind') == 'found_on_main', f'Expected kind=found_on_main, got: {result}'
@@ -318,7 +356,7 @@ class TestMergeStatusGitAuthority:
         stub_git = _stub_git_ops(resolve_branch_sha=rsb)
         server = await self._make_server_with_git_ops(tmp_path, stub_git)
 
-        result = await _call_merge_status(server, task_id='T')
+        result = await call_merge_status(server, task_id='T')
 
         assert result.get('state') == 'unknown', f'Expected unknown, got: {result}'
         assert 'hint' in result, f'Expected hint key in unknown response: {result}'
@@ -333,7 +371,7 @@ class TestMergeStatusGitAuthority:
         stub_git = _stub_git_ops(resolve_branch_sha=rsb, is_ancestor=ia)
         server = await self._make_server_with_git_ops(tmp_path, stub_git)
 
-        result = await _call_merge_status(server, task_id='T')
+        result = await call_merge_status(server, task_id='T')
 
         assert result.get('state') == 'unknown', f'Expected unknown, got: {result}'
         assert 'hint' in result, f'Expected hint key in unknown response: {result}'
@@ -354,7 +392,7 @@ class TestMergeStatusGitAuthority:
                                   find_merge_marker=fmm)
         server = await self._make_server_with_git_ops(tmp_path, stub_git)
 
-        result = await _call_merge_status(server, task_id='T-pending')
+        result = await call_merge_status(server, task_id='T-pending')
 
         assert result.get('state') == 'unknown', (
             f'Branch not on main must stay unknown, got: {result}'
@@ -379,7 +417,7 @@ class TestMergeStatusGitAuthority:
         # No orch_config passed — Tier-3.5 must be skipped
         server = create_server(esc_queue, harness=stub_harness)
 
-        result = await _call_merge_status(server, task_id='T-noconfig')
+        result = await call_merge_status(server, task_id='T-noconfig')
 
         assert result.get('state') == 'unknown', (
             f'No orch_config must yield unknown, got: {result}'
@@ -403,7 +441,7 @@ class TestMergeStatusGitAuthority:
         )
         server = create_server(esc_queue, harness=stub_harness, orch_config=config)
 
-        result = await _call_merge_status(server, task_id='T-nogit')
+        result = await call_merge_status(server, task_id='T-nogit')
 
         assert result.get('state') == 'unknown', (
             f'No git_ops must yield unknown, got: {result}'
@@ -435,7 +473,7 @@ class TestMergeStatusGitAuthority:
         )
         server = await self._make_server_with_git_ops(tmp_path, stub_git)
 
-        result = await _call_merge_status(server, task_id='same-as-main')
+        result = await call_merge_status(server, task_id='same-as-main')
 
         assert result.get('state') == 'unknown', (
             f'Branch at main HEAD must return unknown (not false-positive done): {result}'
@@ -478,7 +516,7 @@ class TestMergeStatusGitAuthority:
             esc_queue, harness=stub_harness, orch_config=_make_config(tmp_path),
         )
 
-        result = await _call_merge_status(server, task_id='3024')
+        result = await call_merge_status(server, task_id='3024')
 
         assert result.get('state') == 'unknown', (
             f'Degenerate branch must NOT resolve as done, got: {result}'
@@ -519,7 +557,7 @@ class TestMergeStatusGitAuthority:
             esc_queue, harness=stub_harness, orch_config=_make_config(tmp_path),
         )
 
-        result = await _call_merge_status(server, task_id='5493')
+        result = await call_merge_status(server, task_id='5493')
 
         assert result.get('state') == 'unknown', (
             f'Degenerate branch must stay unknown even with a citation on '
@@ -551,7 +589,7 @@ class TestMergeStatusGitAuthority:
             esc_queue, harness=stub_harness, orch_config=_make_config(tmp_path),
         )
 
-        result = await _call_merge_status(server, branch='task/3024')
+        result = await call_merge_status(server, branch='task/3024')
 
         assert result.get('state') == 'unknown', (
             f'Degenerate branch via branch= form must be unknown, got: {result}'
@@ -615,7 +653,7 @@ class TestMergeStatusGitAuthority:
             metadata={'branch_base_sha': 'b' * 40},   # != tip → non-degenerate
         )
 
-        result = await _call_merge_status(server, task_id='3031')
+        result = await call_merge_status(server, task_id='3031')
 
         assert result.get('state') == 'unknown', (
             f'Uncited ancestor branch must be unknown, got: {result}'
@@ -628,7 +666,7 @@ class TestMergeStatusGitAuthority:
         """TRUE POSITIVE: a cited, effect-present landing still resolves done.
 
         merge_sha must be the CITATION commit found on main, not the branch
-        tip — this pins the fix to the documented ``_found_on_main_response``
+        tip — this pins the fix to the documented ``found_on_main_response``
         wart (for a --no-ff merge the branch tip is a different commit from
         the one on main).
         """
@@ -639,7 +677,7 @@ class TestMergeStatusGitAuthority:
             metadata={'branch_base_sha': 'b' * 40},
         )
 
-        result = await _call_merge_status(server, task_id='900')
+        result = await call_merge_status(server, task_id='900')
 
         assert result.get('state') == 'done', f'Expected done, got: {result}'
         assert result.get('kind') == 'found_on_main', f'Expected found_on_main: {result}'
@@ -657,7 +695,7 @@ class TestMergeStatusGitAuthority:
             metadata={'branch_base_sha': 'b' * 40},
         )
 
-        result = await _call_merge_status(server, task_id='901')
+        result = await call_merge_status(server, task_id='901')
 
         assert result.get('state') == 'unknown', (
             f'A citation whose effect is absent at main HEAD must be unknown, '
@@ -672,7 +710,7 @@ class TestMergeStatusGitAuthority:
             tmp_path, '902', tip='a' * 40, citation=None, metadata={},
         )
 
-        result = await _call_merge_status(server, task_id='902')
+        result = await call_merge_status(server, task_id='902')
 
         assert result.get('state') == 'unknown', (
             f'No branch_base_sha and no citation must be unknown, got: {result}'
@@ -693,7 +731,7 @@ class TestMergeStatusGitAuthority:
             metadata={},
         )
 
-        result = await _call_merge_status(server, task_id='903')
+        result = await call_merge_status(server, task_id='903')
 
         assert result.get('state') == 'done', f'Expected done, got: {result}'
         assert result.get('merge_sha') == citation, (
@@ -717,7 +755,7 @@ class TestMergeStatusGitAuthority:
             commit_citation_pattern='',
         )
 
-        result = await _call_merge_status(server, task_id='904')
+        result = await call_merge_status(server, task_id='904')
 
         assert result.get('state') == 'done', (
             f'Citation-disabled projects must keep pre-fix behaviour, got: {result}'
@@ -738,7 +776,7 @@ class TestMergeStatusGitAuthority:
             commit_citation_pattern=None,
         )
 
-        await _call_merge_status(server, task_id='905')
+        await call_merge_status(server, task_id='905')
 
         stub_git.find_task_citation_commit.assert_awaited_once_with(
             '905', pattern_template=None,
@@ -763,7 +801,7 @@ class TestMergeStatusGitAuthority:
             get_task_raises=True,
         )
 
-        result = await _call_merge_status(server, task_id='906')
+        result = await call_merge_status(server, task_id='906')
 
         assert isinstance(result, dict), 'merge_status must not raise'
         assert result.get('state') == expected_state, (
@@ -815,7 +853,7 @@ class TestMergeStatusGitAuthority:
             metadata={'branch_base_sha': 'b' * 40},
         )
 
-        result = await _call_merge_status(server, task_id='800')
+        result = await call_merge_status(server, task_id='800')
 
         assert result.get('state') == 'unknown', (
             f'A marker predating branch_base_sha must be unknown, got: {result}'
@@ -832,7 +870,7 @@ class TestMergeStatusGitAuthority:
             effect_present=True, metadata={'branch_base_sha': 'b' * 40},
         )
 
-        result = await _call_merge_status(server, task_id='801')
+        result = await call_merge_status(server, task_id='801')
 
         assert result.get('state') == 'done', f'Expected done, got: {result}'
         assert result.get('kind') == 'found_on_main', f'Expected found_on_main: {result}'
@@ -861,7 +899,7 @@ class TestMergeStatusGitAuthority:
             effect_present=True, metadata=metadata,
         )
 
-        result = await _call_merge_status(server, task_id='802')
+        result = await call_merge_status(server, task_id='802')
 
         assert result.get('state') == 'done', (
             f'An unusable branch_base_sha must skip the veto, got: {result}'
@@ -883,11 +921,126 @@ class TestMergeStatusGitAuthority:
             effect_present=False, metadata={'branch_base_sha': 'b' * 40},
         )
 
-        result = await _call_merge_status(server, task_id='803')
+        result = await call_merge_status(server, task_id='803')
 
         assert result.get('state') == 'unknown', (
             f'A marker whose effect is absent at main HEAD must be unknown, '
             f'got: {result}'
+        )
+
+    # ── task 4498: delivered_checks wiring at both git-authority arms ────────
+    #
+    # ``validate_landing_evidence``'s ``delivered_checks`` parameter is
+    # THREE-STATE and the states are not interchangeable: ``None`` is the
+    # documented 'unwired' sentinel (recorded as
+    # ``probe['delivered_checks_state']``), while ``[]`` means "wired, and
+    # this task declares no checks".  That function's own docstring names
+    # these two arms as task 4498's, and task 4500 as the capstone that flips
+    # the parameter to required + keyword-only once all seven sites are wired,
+    # warning: "If ``delivered_checks_state == 'unwired'`` is still appearing
+    # in escalations after 4500 has landed, that is the bug: one of the seven
+    # sites regressed to the default."  Each arm is pinned INDEPENDENTLY —
+    # they are separate call sites and either can regress alone.
+
+    async def test_ancestor_arm_forwards_declared_delivered_checks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """DISCOVERY arm: a task's declared checks reach the validator."""
+        calls = _record_validate_landing_evidence(monkeypatch)
+        declared = [{'kind': 'grep', 'pattern': 'def foo', 'expect': 'present'}]
+        server, _ = self._ancestor_arm_server(
+            tmp_path, '4498', tip='a' * 40, citation='c' * 40,
+            metadata={'branch_base_sha': 'b' * 40, 'delivered_checks': declared},
+        )
+
+        await call_merge_status(server, task_id='4498')
+
+        assert len(calls) == 1, (
+            f'Expected exactly one validate_landing_evidence call, got: {calls}'
+        )
+        assert calls[0].kwargs['delivered_checks'] == declared, (
+            f"Ancestor arm must forward the task's declared delivered_checks, "
+            f'got: {calls[0].kwargs.get("delivered_checks")!r}'
+        )
+
+    async def test_ancestor_arm_forwards_empty_list_never_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """DISCOVERY arm: an unavailable metadata fetch still reads as WIRED.
+
+        The load-bearing assertion.  With no ``.scheduler`` on the harness the
+        metadata fetch fails open to ``{}``, so there is no ``delivered_checks``
+        key to forward — but the site IS wired, and must therefore pass ``[]``
+        rather than the ``None`` that would make it report
+        ``delivered_checks_state == 'unwired'`` to task 4500.
+        """
+        calls = _record_validate_landing_evidence(monkeypatch)
+        server, _ = self._ancestor_arm_server(
+            tmp_path, '4499', tip='a' * 40, citation='c' * 40,
+            metadata=None,   # no .scheduler at all → metadata fetch yields {}
+        )
+
+        await call_merge_status(server, task_id='4499')
+
+        assert len(calls) == 1, (
+            f'Expected exactly one validate_landing_evidence call, got: {calls}'
+        )
+        forwarded = calls[0].kwargs['delivered_checks']
+        assert forwarded == [], (
+            f'Ancestor arm must forward [], got: {forwarded!r}'
+        )
+        assert forwarded is not None, (
+            'None is the documented UNWIRED sentinel — a wired site must never '
+            'send it, or task 4500 loses the signal it acts on'
+        )
+
+    async def test_marker_arm_forwards_declared_delivered_checks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CANDIDATE arm: a task's declared checks reach the validator."""
+        calls = _record_validate_landing_evidence(monkeypatch)
+        declared = [{'kind': 'grep', 'pattern': 'def bar', 'expect': 'absent'}]
+        server, _ = self._marker_arm_server(
+            tmp_path, marker='d' * 40, marker_predates_base=False,
+            metadata={'branch_base_sha': 'b' * 40, 'delivered_checks': declared},
+        )
+
+        await call_merge_status(server, task_id='4498')
+
+        assert len(calls) == 1, (
+            f'Expected exactly one validate_landing_evidence call, got: {calls}'
+        )
+        assert calls[0].kwargs['delivered_checks'] == declared, (
+            f"Marker arm must forward the task's declared delivered_checks, "
+            f'got: {calls[0].kwargs.get("delivered_checks")!r}'
+        )
+
+    async def test_marker_arm_forwards_empty_list_never_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CANDIDATE arm: an unavailable metadata fetch still reads as WIRED.
+
+        Same load-bearing assertion as the ancestor arm's, pinned separately
+        because these are two independent call sites.
+        """
+        calls = _record_validate_landing_evidence(monkeypatch)
+        server, _ = self._marker_arm_server(
+            tmp_path, marker='d' * 40, marker_predates_base=False,
+            metadata=None,   # no .scheduler at all → metadata fetch yields {}
+        )
+
+        await call_merge_status(server, task_id='4499')
+
+        assert len(calls) == 1, (
+            f'Expected exactly one validate_landing_evidence call, got: {calls}'
+        )
+        forwarded = calls[0].kwargs['delivered_checks']
+        assert forwarded == [], (
+            f'Marker arm must forward [], got: {forwarded!r}'
+        )
+        assert forwarded is not None, (
+            'None is the documented UNWIRED sentinel — a wired site must never '
+            'send it, or task 4500 loses the signal it acts on'
         )
 
 
@@ -963,7 +1116,7 @@ class TestMergeStatusGitAuthorityIntegration:
         server = create_server(esc_queue, harness=stub_harness, orch_config=orch_config)
 
         # --- Step 5 & 6: call merge_status and assert ---
-        result = await _call_merge_status(server, task_id=tid)
+        result = await call_merge_status(server, task_id=tid)
 
         assert result.get('state') == 'done', (
             f'Expected done/found_on_main after 4352 shape, got: {result}'
@@ -1036,7 +1189,7 @@ class TestMergeStatusGitAuthorityIntegration:
             esc_queue, harness=stub_harness, orch_config=orch_config,
         )
 
-        result = await _call_merge_status(server, task_id=tid)
+        result = await call_merge_status(server, task_id=tid)
 
         assert result.get('state') == 'unknown', (
             f'A branch parked on an old main commit must return unknown, '
@@ -1113,7 +1266,7 @@ class TestMergeStatusGitAuthorityIntegration:
             esc_queue, harness=stub_harness, orch_config=orch_config,
         )
 
-        result = await _call_merge_status(server, task_id=tid)
+        result = await call_merge_status(server, task_id=tid)
 
         assert result.get('state') == 'unknown', (
             f'A re-seeded, uncited ancestor branch must return unknown, '
@@ -1126,7 +1279,7 @@ class TestMergeStatusGitAuthorityIntegration:
         """Live-branch path: merge_sha is the citation commit ON MAIN.
 
         Inverts the pre-3103 pin (``merge_sha == branch_tip``), which recorded
-        the documented ``_found_on_main_response`` wart: for a ``--no-ff``
+        the documented ``found_on_main_response`` wart: for a ``--no-ff``
         merge the branch tip is NOT a commit on main's first-parent chain, so
         provenance stamped from it pointed at the wrong commit.
 
@@ -1187,7 +1340,7 @@ class TestMergeStatusGitAuthorityIntegration:
         server = create_server(esc_queue, harness=stub_harness, orch_config=orch_config)
 
         # --- Steps 6 & 7: call merge_status and assert merge_sha == merge_commit ---
-        result = await _call_merge_status(server, task_id=tid)
+        result = await call_merge_status(server, task_id=tid)
 
         assert result.get('state') == 'done', (
             f'Expected done/found_on_main for live branch on main, got: {result}'
@@ -1302,7 +1455,7 @@ class TestMergeStatusGitAuthorityIntegration:
         esc_queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(esc_queue, harness=stub_harness, orch_config=orch_config)
 
-        result = await _call_merge_status(server, task_id=tid)
+        result = await call_merge_status(server, task_id=tid)
 
         assert result.get('state') == 'done', (
             f'A landed-then-EXTENDED task must now read as done — the survival '
@@ -1313,4 +1466,137 @@ class TestMergeStatusGitAuthorityIntegration:
         )
         assert result.get('merge_sha') == merge_result.merge_commit, (
             f'Expected merge_sha={merge_result.merge_commit!r}, got: {result}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# merge_request's use of the extracted tier (task 4887 / PRD label ζ)
+#
+# This module contained ZERO references to ``merge_request`` before this
+# class, which is the narrow sense in which ζ calls its degenerate-branch
+# fast path "uncovered".  At REPO level that is false — ``test_server_
+# chokepoint.py::TestMergeRequestDegenerateBranchFastPath`` is a 10-test
+# class covering the guard behaviourally, and those cases are the real
+# behaviour pin for this site.  So nothing here re-asserts behaviour they
+# already prove; what genuinely had no coverage is the SEAM the extraction
+# creates, and that is all this class pins.
+# ---------------------------------------------------------------------------
+
+
+async def _run_merge_request_fast_path(
+    tmp_path: Path,
+    *,
+    tip: str = 'a' * 40,
+    task_id: str = '591',
+    branch: str = '591',
+    metadata: dict[str, Any] | None = None,
+    scheduler_raises: bool = False,
+) -> dict[str, Any]:
+    """Drive merge_request's submit-time fast path once, ancestor arm.
+
+    Adapted from ``test_server_chokepoint.py::_run_fast_path_probe`` (which
+    threads far more knobs than this seam needs) down to the wiring these two
+    tests actually exercise.  ``is_ancestor`` always answers True, so the
+    ancestor arm hits and the tool returns ``already_merged`` before any
+    worker or queue interaction — which is why no fake worker is needed here.
+    """
+    from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        InFlightMergeRegistry,
+    )
+
+    git_ops = types.SimpleNamespace(
+        resolve_branch_sha=AsyncMock(return_value=tip),
+        is_ancestor=AsyncMock(return_value=True),
+        find_inflight_merge_worktree=AsyncMock(return_value=None),
+    )
+    harness = types.SimpleNamespace(git_ops=git_ops)
+    harness.scheduler = types.SimpleNamespace(
+        get_task=(
+            AsyncMock(side_effect=RuntimeError('scheduler unreachable'))
+            if scheduler_raises else AsyncMock(return_value={'metadata': metadata or {}})
+        ),
+    )
+
+    server = create_server(
+        EscalationQueue(tmp_path / 'esc'),
+        merge_queue=asyncio.Queue(),
+        orch_config=_make_config(tmp_path),
+        harness=harness,
+        merge_inflight_registry=InFlightMergeRegistry(),
+    )
+    return await call_merge_request(
+        server,
+        task_id=task_id, branch=branch,
+        worktree=str(tmp_path / 'wt'), description='', wait_secs=5,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
+class TestMergeRequestUsesTheExtractedTier:
+    """merge_request reaches task metadata through the EXTRACTED seam."""
+
+    async def test_probes_with_the_merge_request_site_and_a_branch_derived_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two wiring facts one call proves, neither of them behavioural.
+
+        ``site='merge_request'`` — task 3103 review #3: a submit-path
+        scheduler fault logged as a ``merge_status`` failure is invisible to
+        an operator grepping for a submit-path degradation.
+
+        The id comes from ``full_branch.removeprefix(branch_prefix)``, NOT
+        from the independently-supplied ``task_id`` parameter (review #6).
+        merge_request takes the two as separate parameters; keying the
+        metadata off one and the tip off the other would compare task X's
+        recorded ``branch_base_sha`` against task Y's branch tip, silently
+        disabling the guard on every mismatched submission.  Passing
+        DIFFERING values is what makes the distinction observable at all.
+        """
+        import escalation.git_authority as git_authority
+        real = git_authority.task_metadata
+        calls: list[Any] = []
+
+        async def _recorder(*args: Any, **kwargs: Any) -> Any:
+            calls.append(mock_call(*args, **kwargs))
+            return await real(*args, **kwargs)
+
+        monkeypatch.setattr(git_authority, 'task_metadata', _recorder)
+
+        await _run_merge_request_fast_path(
+            tmp_path, task_id='591', branch='777',
+            metadata={'branch_base_sha': 'b' * 40},
+        )
+
+        assert len(calls) == 1, f'Expected exactly one probe, got: {calls}'
+        assert calls[0].kwargs['site'] == 'merge_request', (
+            f'got site={calls[0].kwargs.get("site")!r}'
+        )
+        assert '777' in calls[0].args, (
+            f'The id must be derived from the BRANCH (777), not from the '
+            f'task_id parameter (591); got args={calls[0].args!r}'
+        )
+        assert '591' not in calls[0].args, (
+            f'The caller-supplied task_id must not key the lookup; '
+            f'got args={calls[0].args!r}'
+        )
+
+    async def test_fails_open_when_the_fetch_reports_unavailable(
+        self, tmp_path: Path
+    ) -> None:
+        """Behaviour-preservation: merge_request reads ``.metadata`` and
+        IGNORES the new ``unavailable`` flag, exactly as today.
+
+        With a scheduler whose ``get_task`` raises, the extracted probe
+        reports ``unavailable=True`` — and the fast path must still answer
+        its legacy ``already_merged`` rather than raising or declining.  A
+        metadata fault must degrade a single guard, not the whole submission.
+        Surfacing the flag here is task 4651's, not this task's.
+        """
+        result = await _run_merge_request_fast_path(
+            tmp_path, scheduler_raises=True,
+        )
+
+        assert result.get('status') == 'already_merged', (
+            f'A scheduler fault must not change the fast path, got: {result}'
         )

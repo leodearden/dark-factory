@@ -1,0 +1,164 @@
+{
+  "n_rows": 359,
+  "n_rows_rule": "one row per rated pair: 140 check2 (P000-P139) + 219 check3 (H000-H218)",
+  "counts": {
+    "CORRECTS": {
+      "amendment": 65,
+      "child_amendment": 3,
+      "correction": 12,
+      "null": 16,
+      "peer": 1,
+      "sighting": 14
+    },
+    "EXTENDS": {
+      "amendment": 98,
+      "null": 32,
+      "peer": 3,
+      "sighting": 66
+    },
+    "RELATED": {
+      "amendment": 10,
+      "extension": 1,
+      "null": 1,
+      "sighting": 3
+    },
+    "SAME": {
+      "amendment": 2
+    },
+    "SUBSUMED": {
+      "amendment": 19,
+      "null": 11,
+      "sighting": 2
+    }
+  },
+  "counts_rule": "majority verdict x kind_at_rating (population.jsonl `kind`; null shown as \"null\")",
+  "misfiles": 15,
+  "misfiles_rule": "majority verdict in {RELATED, UNRELATED}",
+  "first_rater_misfiles": 16,
+  "first_rater_misfiles_rule": "primary rater word in {RELATED, UNRELATED}",
+  "second_rater_misfiles": 18,
+  "second_rater_misfiles_rule": "second rater word in {RELATED, UNRELATED}",
+  "sightings": 85,
+  "sightings_rule": "kind_at_rating == 'sighting'",
+  "sightings_by_majority": {
+    "CORRECTS": 14,
+    "EXTENDS": 66,
+    "RELATED": 3,
+    "SUBSUMED": 2
+  },
+  "third_rater_rows": 20,
+  "third_rater_rows_rule": "rows with a third rating (judgments_third.jsonl)",
+  "rated_text_mismatches": 0,
+  "rated_text_mismatches_rule": "rated_text_matches_live == false: cap(live child text) != the CHILD string the raters saw, or the same for PARENT, or either live text missing; cap = the per-source rating-time function in cap_function",
+  "rated_text_mismatch_ids": [],
+  "rated_text_mismatch_detail": {},
+  "parent_missing": 0,
+  "parent_missing_rule": "parent point absent from Qdrant now, or present with no non-empty text under data/memory/content",
+  "parent_missing_ids": [],
+  "child_missing": 0,
+  "child_missing_rule": "child point absent from Qdrant now, or no non-empty text",
+  "live_parent_changed": 0,
+  "live_parent_changed_rule": "live_parent_id (child payload parent_id now; null if child missing) != target_id",
+  "live_parent_changed_ids": [],
+  "live_contested": 1,
+  "live_contested_rule": "child payload x_contested truthy now",
+  "majority_rule": "Port of data/write-triage-stronger-models-2026-09-30/score_models.py::truth_l2 (primary = truth_l1: check2 population verdict, else check3 primary verdict). With a=primary, b=second, c=third and binaries(v)=(v=='CORRECTS', v in {RELATED,UNRELATED}): (1) if binaries(a)==binaries(b) and neither is UNCLEAR, the verdict is a (the PRIMARY word, even when b is a different word with the same binaries; third is not consulted). (2) Otherwise c is consulted; the verdict is the plurality word of (a,b,c) if some word occurs >=2 times (ties impossible with 3 votes). (3) If all three differ: CORRECTS if >=2 of them are CORRECTS (cannot occur when all differ; kept for fidelity), else RELATED if >=2 are in {RELATED,UNRELATED}, else c if binaries(c)==(False,False), else EXTENDS. 'misfile' = majority verdict in {RELATED, UNRELATED}.",
+  "sources": [
+    {
+      "path": "/home/leo/src/dark-factory/data/write-triage-jev-trial-2026-09-29/work/check2/population.jsonl",
+      "sha256": "53e5d7197c8dc990b657c2fae48cdb749a22d3c8b23dd9195eb56c583013e74d"
+    },
+    {
+      "path": "/home/leo/src/dark-factory/data/write-triage-jev-trial-2026-09-29/work/check3/population.jsonl",
+      "sha256": "2496b2c196137a98afcb17c8be9e04bc49e5702e44f9c98e19d98b98867b854a"
+    },
+    {
+      "path": "/home/leo/src/dark-factory/data/write-triage-jev-trial-2026-09-29/work/check3/rating/key.json",
+      "sha256": "5dca814aed4bde4d8fc754b78c5959fa9e3d66a403c48fdcb6bfcd28e07929ff"
+    },
+    {
+      "path": "/home/leo/src/dark-factory/data/write-triage-jev-trial-2026-09-29/work/check3/rating/judgments_p0.jsonl",
+      "sha256": "5221820970ccad78955112a301f8d9817a91904b121e36a504577eb2331cfa6a"
+    },
+    {
+      "path": "/home/leo/src/dark-factory/data/write-triage-jev-trial-2026-09-29/work/check3/rating/judgments_p1.jsonl",
+      "sha256": "6f9bbd7e1979f3e1d90e143437ad7ab814d00cc1e4f6dd9834e549809d6dac6a"
+    },
+    {
+      "path": "/home/leo/src/dark-factory/data/write-triage-jev-trial-2026-09-29/work/check3/rating/judgments_p2.jsonl",
+      "sha256": "d05908cb881a5e4a3a772c4538ecc307b5e8162763220676b2dddbeb38be21d3"
+    },
+    {
+      "path": "/home/leo/src/dark-factory/data/write-triage-jev-trial-2026-09-29/work/check3/rating/judgments_p3.jsonl",
+      "sha256": "17b71b43c644686ba63d15fd70d5d5eb7745aaab0485b3bf09eaa2a8c6ac4426"
+    },
+    {
+      "path": "/home/leo/src/dark-factory/data/write-triage-jev-trial-2026-09-29/work/check3/rating/judgments_p4.jsonl",
+      "sha256": "3c4a4f30c6b1667def4220f0dc11745ab36ac4e53ac2009dfe2c2affce7ecb68"
+    },
+    {
+      "path": "/home/leo/src/dark-factory/data/write-triage-stronger-models-2026-09-30/rating/judgments_second.jsonl",
+      "sha256": "345c762b0dfa63e99cda0a7099a9e99cfce0ed6cd47c50aa621a238fbb5d586b"
+    },
+    {
+      "path": "/home/leo/src/dark-factory/data/write-triage-stronger-models-2026-09-30/rating/key.json",
+      "sha256": "0057cea8839e253ea6339e415d0429993671f5456e288501105f1a92ebf01623"
+    },
+    {
+      "path": "/home/leo/src/dark-factory/data/write-triage-stronger-models-2026-09-30/rating/judgments_third.jsonl",
+      "sha256": "114c1bea09d9c4f1c6f3ac395dc3a70146e7a2cf1adf6fc82468aaa7d7eeae1e"
+    },
+    {
+      "path": "/home/leo/src/dark-factory/data/write-triage-stronger-models-2026-09-30/rating/key_third.json",
+      "sha256": "0045319169440b665ed0f72323cf1540b91ddb6bb4109de012a4a8aec493de58"
+    },
+    {
+      "path": "/home/leo/src/dark-factory/data/write-triage-stronger-models-2026-09-30/score_models.py",
+      "sha256": "28510cb12aaa71e52ac4a3d7640900434eb0de71cb364fd5df93d232e7c08b90"
+    },
+    {
+      "path": "/home/leo/src/dark-factory/data/write-triage-jev-trial-2026-09-29/work/check3/score_check3.py",
+      "sha256": "1fbb9aa800aaeb188094375a374093e0914c1097dc7cb2f26bea9aeda679babd"
+    },
+    {
+      "path": "/home/leo/src/dark-factory/data/write-triage-jev-trial-2026-09-29/work/check3/make_rating.py",
+      "sha256": "7552d1737361b65aca5f492253b22ce5f8a0cd6920cb272e2d4d91849e0e4534"
+    },
+    {
+      "path": "/home/leo/src/dark-factory/data/write-triage-jev-trial-2026-09-29/work/check3/freeze_population.py",
+      "sha256": "1ef6b5cb0e1924c9ce51aed7898106cfb7416913cf02ef17d4e6c86388b04a2e"
+    },
+    {
+      "path": "/home/leo/src/dark-factory/data/write-triage-jev-trial-2026-09-29/work/check2/freeze_population.py",
+      "sha256": "d13873742e1379f5cab22e69233ee2a93ebff3e8f01e1b875896a1eb6a625cb9"
+    },
+    {
+      "path": "/home/leo/src/dark-factory/data/write-triage-jev-trial-2026-09-29/work/make_rating.py",
+      "sha256": "dae842d4f61c2d066b0b1a8d9dcfa88500f9c71fa68f6e5ea1be5303a1140b75"
+    },
+    {
+      "path": "/home/leo/src/dark-factory/data/write-triage-stronger-models-2026-09-30/make_rating.py",
+      "sha256": "4c823828f99b7a61a03789ab682259a72d4f7fa78439411f37f66fb653403d9b"
+    },
+    {
+      "path": "/home/leo/src/dark-factory/data/write-triage-jev-trial-2026-09-29/rater_brief.md",
+      "sha256": "7f161b0ed8b8cd5d24592a926068c00d075efdc2106375d65cfe1879bbebed11"
+    },
+    {
+      "path": "/home/leo/src/dark-factory/fused-memory/src/fused_memory/backends/mem0_client.py",
+      "sha256": "75350214a04f4d3afa511fb83cfe15546467d64768676562647f0893ac736ea8"
+    }
+  ],
+  "cap_function": {
+    "check3 (H rows) and every later rating pass": "work/check3/make_rating.py::capped  (identical to work/make_rating.py::capped)\nCAP = 4_000\ndef capped(text: str) -> str:\n    return text if len(text) <= CAP else f'{text[:CAP]}\u2026[truncated, {len(text)} chars total]'\nstronger-models make_rating.py::capped adds idempotence: `text if len(text) <= CAP or '\u2026[truncated, ' in text[CAP:] else <same>`",
+    "check2 (P rows, \u03932 baseline)": "The \u03932 freeze script is NOT in the repo (shards were built in a scratchpad session). Inferred from the 17 capped strings in work/check2/population.jsonl: text if len(text) <= 4000 else f'{text[:4000]} \u2026[truncated, {len(text)} chars total]'  (note the SPACE before the ellipsis, absent in the later capped()). Verified: every capped P string is exactly 4000 chars + that suffix, and every other P string is <= 4000."
+  },
+  "content_key": {
+    "payload_key": "data",
+    "cite": "fused-memory/src/fused_memory/backends/mem0_client.py::_MEM0_TEXT_KEY = 'data' and ::_extract_payload_text (order data, memory, content; first non-empty str). Payload keys are top-level; get_point_by_id returns the raw payload dict. This script reads the same order."
+  },
+  "exported_at": "2026-10-01T16:26:39Z",
+  "repo_head": "4422831754",
+  "rater_brief_sha256": "7f161b0ed8b8cd5d24592a926068c00d075efdc2106375d65cfe1879bbebed11",
+  "rater_brief_copy": "write_triage_rater_brief.md (byte-identical copy of data/write-triage-jev-trial-2026-09-29/rater_brief.md)"
+}

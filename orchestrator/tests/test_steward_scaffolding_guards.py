@@ -1,6 +1,6 @@
 """The single findable home for this suite's steward test-scaffolding invariants.
 
-Consolidation lineage 3461 → 3514 → 3551 → 3647.  Task 3461 merged the two
+Consolidation lineage 3461 → 3514 → 3551 → 3647 → 4452.  Task 3461 merged the two
 near-identical ``_make_steward`` copies from ``test_suggestion_triage.py`` and
 ``test_workflow_state_machine_boundary.py``; task 3514 folded in the two that
 remained (``test_out_of_band_routing.py``'s, and ``test_steward.py``'s
@@ -17,7 +17,8 @@ CHECKABLE invariants, matching the ethos the suite already states elsewhere
 guard).  Task 4389 extended the lineage one further, adjudicating the 17
 absolute-``/tmp`` ``project_root`` literals task 3551's sweep had found and left
 classified as "unknown", and turning that ruling into the fourth concern below.
-Four concerns live here, deliberately in ONE module because the lineage's actual
+Task 4452 folded the verdict-gate steward site onto ``make_steward``, retiring
+its sanction.  Four concerns live here, deliberately in ONE module because the lineage's actual
 failure mode is that they keep getting scattered and re-derived:
 
 1. :class:`TestAssertSandboxedProjectRoot` — the contract of
@@ -574,7 +575,7 @@ class _Sanctioned(NamedTuple):
 
     *sites* is deliberately a COUNT, not just a flag.  Sanctioning a module
     wholesale would pre-approve every FUTURE construction it grows — someone
-    could add a fourth idiom inside an already-listed module and the census
+    could add a new idiom inside an already-listed module and the census
     would stay green, which is the exact silent appearance this guard exists to
     stop.  Pinning the count means a new construction in a sanctioned module
     still trips, and still forces its own adjudication.  Line numbers are
@@ -623,19 +624,6 @@ _SANCTIONED_STEWARD_CONSTRUCTION: dict[str, _Sanctioned] = {
             'restate them here'
         ),
     ),
-    'test_verdict_servers_integration_gate.py': _Sanctioned(
-        sites=1,
-        reason=(
-            '`_build_steward_for_triage`: builds a real `TaskSteward` against a '
-            'REAL `OrchestratorConfig` and a real on-disk meta-root, which '
-            "`make_steward`'s `spec_set` MagicMock cannot supply. Rationale and "
-            'the 2488-postdates-3514 history are owned by '
-            '`conftest.make_steward.__doc__`; whether `make_steward` should grow '
-            'a `config=` passthrough is left open and filed as ticket '
-            'tkt_0RSMX59FSJ27QWSS9VKBYRFMFG (task 3647 owned the ADJUDICATION, '
-            'not the redesign)'
-        ),
-    ),
     'test_workflow_e2e.py': _Sanctioned(
         sites=1,
         reason=(
@@ -662,7 +650,7 @@ def _steward_construction_sites(tree: ast.Module) -> list[str]:
     * an ``ast.Call`` whose func is an ``ast.Attribute`` whose ``.attr`` ends in
       ``Steward`` (``harness.TaskSteward(...)``, ``_SpyStewardFactory.Steward()``).
       Matching only the Name form would leave the attribute form invisible, so a
-      fourth idiom could appear silently through a module-qualified or nested
+      new idiom could appear silently through a module-qualified or nested
       name — exactly what this census exists to prevent;
     * an ``ast.ClassDef`` with a base ending in ``Steward`` — a subclass is a
       second steward SHAPE even before it is instantiated, and the standing
@@ -781,7 +769,7 @@ class TestStewardConstructionSitesAreCensused:
             'Unsanctioned steward-construction site(s).\n'
             'This suite has ONE steward factory: the `make_steward` fixture in '
             'conftest.py (task 3461 merged two copies into it, task 3514 folded '
-            'in the two that remained). A construction outside it is a fourth '
+            'in the two that remained). A construction outside it is a new '
             'idiom of the kind this census exists to stop appearing silently.\n'
             'Fix, and it is a real choice between two options:\n'
             '  (a) fold the site onto `make_steward` — extend that fixture '
@@ -1132,20 +1120,18 @@ def _tmp_literal(value: ast.expr) -> str | None:
     cost is that a hypothetical ``/tmpfoo`` would also match, which is a
     false-positive costing one allowlist line rather than a blind spot.
 
-    ONE DELIBERATE FALSE NEGATIVE, recorded so it reads as a decision and not an
-    oversight: a COMPOUND value is not inspected, so
-    ``test_harness_train_callbacks.py``'s
-    ``config.project_root = tmp_path or Path('/tmp/proj')`` does not match.  That
-    site is a hybrid — its ``_tc_config`` factory already takes the sandboxed
-    ``tmp_path`` keyword this task's remedy points authors at, and the ``/tmp``
-    literal is only the fallback when a caller omits it.  Recursing into
-    ``BoolOp``/``IfExp`` would flag it, but the census would then be asserting a
-    COUNT over sites whose literal may never be evaluated, which is a weaker
-    claim than the one the allowlist makes about the other 22.  It is left out
-    of the population rather than adjudicated into it.
+    COMPOUND values are seen through: every ``BoolOp`` operand and both
+    ``IfExp`` branches go through this same rule, but never an ``IfExp``
+    condition, which is not a bound value.  So
+    ``tmp_path or Path('/tmp/proj')`` matches.  A fallback literal escapes
+    whenever a caller omits the sandboxed argument, so it meets the same bar as
+    a plain one.
     """
     if isinstance(value, ast.Constant) and isinstance(value.value, str):
         return value.value if value.value.startswith('/tmp') else None
+    if isinstance(value, ast.BoolOp | ast.IfExp):
+        operands = value.values if isinstance(value, ast.BoolOp) else [value.body, value.orelse]
+        return next(filter(None, map(_tmp_literal, operands)), None)
     if isinstance(value, ast.Call):
         called = (
             value.func.id if isinstance(value.func, ast.Name)
@@ -1166,9 +1152,10 @@ def _names_project_root(name: str) -> bool:
     """True if the bare identifier *name* denotes a ``project_root``.
 
     Split out from ``_is_project_root_target`` because the detector must apply
-    the SAME rule to an ``ast.arg``, whose ``.arg`` is a plain ``str`` and not an
-    expression node.  Two callers, one rule — a second spelling here is how the
-    parameter-default shape would drift out from under the assignment shape.
+    the SAME rule to an ``ast.arg`` and an ``ast.keyword``, whose ``.arg`` is a
+    plain ``str`` and not an expression node.  Three binding shapes, one rule —
+    a second spelling here is how the parameter-default or keyword shape would
+    drift out from under the assignment shape.
     """
     return name.lower().strip('_').endswith('project_root')
 
@@ -1239,9 +1226,10 @@ def _absolute_tmp_project_root_literals(tree: ast.Module) -> list[str]:
     Shape matches ``_steward_construction_sites``'s return so both censuses read
     the same way in a failure message.
 
-    WHAT IT MATCHES — two BINDING shapes, both of which put the literal in the
-    defining module rather than at a call site, and whose value is a ``/tmp``
-    string literal, bare or wrapped in ``Path(...)`` (see ``_tmp_literal``):
+    WHAT IT MATCHES — three BINDING shapes, each spelling ``project_root`` as an
+    identifier at the binding site, and whose value is a ``/tmp`` string
+    literal — bare, wrapped in ``Path(...)``, or inside a compound value (see
+    ``_tmp_literal``):
 
     * an ``ast.Assign`` or ``ast.AnnAssign`` whose target names a
       ``project_root`` (see ``_is_project_root_target``).  ``Assign.targets`` is
@@ -1259,26 +1247,16 @@ def _absolute_tmp_project_root_literals(tree: ast.Module) -> list[str]:
       very census the advice was meant to satisfy.  A remedy that opens a hole
       in its own detector is worse than no remedy, so the hole is closed rather
       than documented.
+    * a CALL KEYWORD — an ``ast.keyword`` whose name passes
+      ``_names_project_root`` (``**kwargs``, whose name is ``None``, is
+      skipped).  A keyword binds a real parameter, so it can carry a real
+      escape — which is why keyword sites are sandboxed, not allowlisted.
 
-    WHAT IT DELIBERATELY DOES NOT MATCH, and this is a DECISION rather than a
-    limitation — ``ast.keyword``.  The line is drawn at DEFINITION versus CALL,
-    which is why a parameter default is in scope and a call keyword is not: a
-    default is one literal living in the module that owns the factory, exactly
-    like an assignment, whereas a keyword is one of N literals at N call sites
-    binding someone else's parameter.  The tree holds ~16 call-keyword sites
-    (``LandedReconciler(project_root='/tmp/proj')`` and friends:
-    test_merge_queue_landed_reconciler.py x13,
-    test_merge_queue_landed_dispatch_gate.py, test_multihost_verify_integration.py).
-    Those bind a real constructor/dataclass PARAMETER rather than an attribute on
-    a ``spec_set`` MagicMock — a structurally different population, and not the
-    one task 3551's sweep found or task 4389 was filed to adjudicate.  Widening
-    the rule to cover them would force this guard to either fix 16 out-of-scope
-    sites or pre-approve them wholesale in the allowlist, and a wholesale
-    sanction is precisely the silent appearance this guard family exists to stop
-    (see ``_Sanctioned.__doc__`` on why ``sites`` is a COUNT, not a flag).  So
-    the boundary is structural, it is pinned by a detector self-test so it reads
-    as deliberate rather than as an oversight, and the kwarg population is
-    carried by its own follow-up ticket.
+    WHAT IT DOES NOT MATCH, by decision — a binding with no ``project_root``
+    IDENTIFIER at the site.  A positional argument binds by position to a
+    callee signature a single-module AST walk cannot resolve, and a string dict
+    key is a meaningful string, not a binding.  Pinned by
+    ``test_the_detector_ignores_a_binding_with_no_project_root_identifier``.
 
     A REFERENCE is not a literal.  ``config.project_root = MOCK_WORKFLOW_PROJECT_ROOT``
     does not match: the literal lives once, in ``_orch_helpers``, where it is
@@ -1296,6 +1274,13 @@ def _absolute_tmp_project_root_literals(tree: ast.Module) -> list[str]:
                 if literal is not None:
                     sites.append(f'{default.lineno} ({literal})')
             continue
+        if isinstance(node, ast.keyword):
+            if node.arg is None or not _names_project_root(node.arg):
+                continue
+            literal = _tmp_literal(node.value)
+            if literal is not None:
+                sites.append(f'{node.value.lineno} ({literal})')
+            continue
         if isinstance(node, ast.Assign):
             targets: list[ast.expr] = list(node.targets)
         elif isinstance(node, ast.AnnAssign):
@@ -1307,9 +1292,9 @@ def _absolute_tmp_project_root_literals(tree: ast.Module) -> list[str]:
         literal = _tmp_literal(node.value)
         if literal is not None:
             sites.append(f'{node.lineno} ({literal})')
-    # Sorted because the walk is BFS over two different node kinds now, so source
-    # order is not the visit order; a census failure message is read by a human
-    # looking for a line number.
+    # Sorted because the walk is BFS over several node kinds, so source order is
+    # not the visit order; a census failure message is read by a human looking
+    # for a line number.
     return sorted(sites, key=lambda site: int(site.split(' ', 1)[0]))
 
 
@@ -1346,13 +1331,14 @@ class TestAbsoluteTmpProjectRootLiteralsAreCensused:
 
     THE POPULATION, named precisely rather than as "every literal", because a
     census that overstates its own reach is the failure it exists to prevent:
-    assignments and parameter DEFAULTS — the shapes that bind a ``/tmp`` literal
-    in the module that owns it.  Three shapes are outside it, each by a recorded
-    decision rather than by omission: ~16 call-KEYWORD sites
-    (``_absolute_tmp_project_root_literals.__doc__``, pinned by
-    ``test_the_detector_ignores_the_call_keyword_shape``), the COMPOUND
-    ``tmp_path or Path('/tmp/proj')`` form (``_tmp_literal.__doc__``), and
-    non-``/tmp`` absolute roots (pinned by
+    assignments, parameter DEFAULTS and call KEYWORDS — every binding that
+    spells ``project_root`` as an identifier at the site — including a ``/tmp``
+    literal inside a COMPOUND value such as ``tmp_path or Path('/tmp/proj')``
+    (``_tmp_literal.__doc__``).  Three shapes are outside it, each by a
+    recorded decision rather than by omission: positional arguments and string
+    dict keys (``_absolute_tmp_project_root_literals.__doc__``, pinned by
+    ``test_the_detector_ignores_a_binding_with_no_project_root_identifier``),
+    and non-``/tmp`` absolute roots (pinned by
     ``test_the_detector_ignores_an_absolute_literal_outside_tmp``).
 
     Same teeth as the steward census above, in both directions: a new
@@ -1628,25 +1614,106 @@ class TestAbsoluteTmpProjectRootLiteralsAreCensused:
 
         assert _absolute_tmp_project_root_literals(tree) == []
 
-    def test_the_detector_ignores_the_call_keyword_shape(self) -> None:
-        """Negative, and this one is a DECISION rather than a limitation — pinned
-        here so it reads as deliberate to whoever finds the excluded sites.
-
-        The tree also holds ~16 ``project_root=<literal>`` CALL-KEYWORD sites
-        (test_merge_queue_landed_reconciler.py x13,
-        test_merge_queue_landed_dispatch_gate.py, test_multihost_verify_integration.py).
-        Those bind a real constructor/dataclass PARAMETER rather than an
-        attribute on a ``spec_set`` MagicMock: a structurally different
-        population that nobody has adjudicated, and not the one task 3551's
-        sweep found or task 4389 was filed to rule on.
-
-        Widening the detector to cover them would force this guard to either fix
-        16 out-of-scope sites or pre-approve them wholesale in the allowlist —
-        and a wholesale sanction is precisely the silent appearance this guard
-        family exists to stop (see ``_Sanctioned.__doc__`` on why ``sites`` is a
-        COUNT rather than a flag).  So the boundary is drawn structurally, at
-        ``ast.keyword``, and a follow-up ticket carries the kwarg population.
+    @pytest.mark.parametrize(
+        ('source', 'literal'),
+        [
+            ("reconcile_landed_row(row, project_root='/tmp/proj')\n", '/tmp/proj'),
+            (
+                "OrchestratorConfig(project_root=Path('/tmp/xcheck-fake'))\n",
+                '/tmp/xcheck-fake',
+            ),
+            ("Foo(review_project_root=pathlib.Path('/tmp/r'))\n", '/tmp/r'),
+        ],
+        ids=['bare-str', 'path-wrapped', 'suffix-name-pathlib-attribute'],
+    )
+    def test_the_detector_matches_a_call_keyword(self, source, literal) -> None:
+        """A call keyword binds a real parameter, so it can carry a real escape:
+        code handed an ``OrchestratorConfig`` writes ``data/orchestrator/runs.db``
+        under its ``project_root``.  The keyword shape is therefore inside the
+        census, under the same name rule as the other shapes.
         """
-        tree = ast.parse("reconciler = LandedReconciler(project_root='/tmp/proj')\n")
+        tree = ast.parse(source)
+
+        sites = _absolute_tmp_project_root_literals(tree)
+
+        assert len(sites) == 1, sites
+        assert literal in sites[0], sites
+
+    def test_the_detector_ignores_a_sandboxed_call_keyword(self) -> None:
+        """Negative: the fix for a keyword site must not trip the guard."""
+        tree = ast.parse("Foo(project_root=tmp_path / 'proj')\n")
+
+        assert _absolute_tmp_project_root_literals(tree) == []
+
+    def test_the_detector_ignores_a_double_star_keyword(self) -> None:
+        """Negative: ``**kwargs`` is an ``ast.keyword`` whose ``arg`` is ``None``,
+        and the keyword arm must skip it rather than crash on it.
+        """
+        tree = ast.parse('Foo(**kwargs)\n')
+
+        assert _absolute_tmp_project_root_literals(tree) == []
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            "GitOps(git_config, Path('/tmp/repo'))\n",
+            "OrchestratorConfig.model_validate({'project_root': '/tmp/x'})\n",
+        ],
+        ids=['positional-argument', 'string-dict-key'],
+    )
+    def test_the_detector_ignores_a_binding_with_no_project_root_identifier(
+        self, source,
+    ) -> None:
+        """The detector's recorded EDGE: it sees a binding only where
+        ``project_root`` is spelled as an identifier at the site.
+
+        A positional argument binds by position to a callee signature a
+        single-module AST walk cannot resolve, and a dict key is a string, not a
+        binding.
+        """
+        tree = ast.parse(source)
+
+        assert _absolute_tmp_project_root_literals(tree) == []
+
+    @pytest.mark.parametrize(
+        ('source', 'literal'),
+        [
+            ("config.project_root = tmp_path or Path('/tmp/proj')\n", '/tmp/proj'),
+            ("config.project_root = Path('/tmp/a') if flag else tmp_path\n", '/tmp/a'),
+            ("config.project_root = tmp_path if flag else '/tmp/b'\n", '/tmp/b'),
+            ("Foo(project_root=root or '/tmp/c')\n", '/tmp/c'),
+        ],
+        ids=['boolop', 'ifexp-body', 'ifexp-orelse', 'compound-call-keyword'],
+    )
+    def test_the_detector_sees_through_a_compound_value(self, source, literal) -> None:
+        """A fallback literal escapes whenever a caller omits the sandboxed
+        argument, so it meets the same bar as any other literal: ONE site per
+        binding.  The keyword case shows value shape and binding shape are
+        orthogonal.
+        """
+        tree = ast.parse(source)
+
+        sites = _absolute_tmp_project_root_literals(tree)
+
+        assert len(sites) == 1, sites
+        assert literal in sites[0], sites
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            'config.project_root = tmp_path or other_root\n',
+            "config.project_root = tmp_path if '/tmp/q' else other_root\n",
+            "config.project_root = tmp_path if flag == '/tmp/q' else other_root\n",
+        ],
+        ids=['references-only', 'ifexp-condition-is-a-literal', 'ifexp-condition-compares-a-literal'],
+    )
+    def test_the_detector_ignores_a_compound_value_that_binds_no_tmp_literal(
+        self, source,
+    ) -> None:
+        """Negative: seeing through a compound must not flag one whose bound
+        operands are all references.  An ``IfExp`` condition selects a value
+        rather than binding one, so a ``/tmp`` literal there is never a site.
+        """
+        tree = ast.parse(source)
 
         assert _absolute_tmp_project_root_literals(tree) == []

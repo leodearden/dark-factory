@@ -65,14 +65,13 @@ from orchestrator.scheduler import Scheduler, StaleEvidenceRejection
 
 pytestmark = pytest.mark.asyncio
 
-# Bridge-synthesised agent_id for every dispatch_tool('set_task_status', ...)
-# call. The real Scheduler.set_task_status never forwards an agent_id over
-# the wire (every internal orchestrator caller omits it — see scheduler.py),
-# so this in-process bridge supplies a fixed, KNOWN-SAFE value: the exact
-# agent_id used throughout fused-memory's own real-backend enforce tests
-# (test_task_interceptor.py's test_reopen_freshness_enforce_rejects_stale_
-# evidence_real_backend et al.), so this e2e cannot be tripped up by an
-# actor-classification gate unrelated to reopen-freshness.
+# Bridge-substituted agent_id for every dispatch_tool('set_task_status', ...)
+# call. The real Scheduler.set_task_status sends agent_id='orchestrator'; this
+# in-process bridge deliberately replaces it with a fixed, KNOWN-SAFE value
+# (the exact agent_id used throughout fused-memory's own real-backend enforce
+# tests: test_task_interceptor.py's test_reopen_freshness_enforce_rejects_
+# stale_evidence_real_backend et al.), so this reopen e2e stays independent of
+# the actor/caller gates unrelated to reopen-freshness.
 _BRIDGE_AGENT_ID = 'claude-interactive'
 
 

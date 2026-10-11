@@ -32,6 +32,7 @@ import aiosqlite
 import pytest
 from _orch_helpers import (
     ORCH_PYPROJECT,
+    VERIFY_CLI_PER_TEST_TIMEOUT,
     reap_leaked_aiosqlite_connections,
     require_orchestrator_inifile,
     sanitized_probe_env,
@@ -420,7 +421,10 @@ def test_the_promotion_is_in_effect_for_this_run(pytestconfig):
     )
 
 
-@pytest.mark.timeout(120)
+# Verify's own budget; why a marker below it inverts rather than loosens: the
+# VERIFY_CLI_PER_TEST_TIMEOUT block in _orch_helpers.py, enforced by
+# test_timeout_marker_inversion_guard.py.
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 def test_a_thread_exception_actually_fails_a_test_under_this_projects_inifile(
     tmp_path, pytestconfig
 ):

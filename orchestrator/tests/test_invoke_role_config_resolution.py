@@ -40,7 +40,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
-from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
+from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler, fixed_prompt
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import REVIEWER_COMPREHENSIVE, SIMPLE_TASK
@@ -140,7 +140,7 @@ async def _invoke_probe(role, config, git_ops, task_assignment):
         new_callable=AsyncMock,
         return_value=AgentResult(success=True, output=''),
     ) as mock_cap_retry:
-        await workflow._invoke(role, 'p', cwd)
+        await workflow._invoke(role, fixed_prompt('p'), cwd)
 
     assert mock_cap_retry.await_count == 1, 'invoke_with_cap_retry must be called once'
     assert mock_cap_retry.await_args is not None, 'await_args must be set after one await'
@@ -339,7 +339,7 @@ class TestCapstoneHotReloadFlipsSimpleTaskModel:
             new_callable=AsyncMock,
             return_value=AgentResult(success=True, output=''),
         ) as mock_cap_retry:
-            await workflow._invoke(SIMPLE_TASK, 'p', wt_info.path)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), wt_info.path)
 
         assert mock_cap_retry.await_count == 1
         assert mock_cap_retry.await_args is not None, 'await_args must be set after one await'

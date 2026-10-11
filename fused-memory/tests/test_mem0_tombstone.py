@@ -682,3 +682,100 @@ class TestTheReversePointer:
             )
             is False
         )
+
+
+class TestSweepDeletionGuardReadsRealTombstones:
+    """The sweep-deletion guard against the REAL tombstone substrate (task 5271).
+
+    The trim path's own batched writer puts rows into a REAL ReconLedgerStore,
+    and the guard reads them back through a REAL MemoryService, so a drift
+    between the writer's ``deleter`` payload key and what the guard reads fails
+    here even though every other guard test uses a fake reader.  Heavy imports
+    live inside the test body, keeping this module's own imports light.
+    """
+
+    _PROJECT = 'solar_challenge_platform'
+    _TRIMMED = '445c97ac-14d7-4956-9e46-e4475eecff16'
+    _HAND_SWEPT = '9529e396-761a-4914-93cc-19ec00c74ab8'
+
+    def _flag(self, memory_id: str) -> dict:
+        return {
+            'task_id': '165',
+            'flag_type': 'mem0_evidentiary_anchor_deletion_pattern',
+            'description': f'mem0 {memory_id} deleted +0.065s after the ledger-stamp write',
+        }
+
+    def _deleted(self, memory_id: str):
+        from fused_memory.models.reconciliation import (
+            EventSource,
+            EventType,
+            ReconciliationEvent,
+        )
+
+        return ReconciliationEvent(
+            id=f'evt-{memory_id}',
+            type=EventType.memory_deleted,
+            source=EventSource.agent,
+            project_id=self._PROJECT,
+            timestamp=datetime.now(UTC),
+            payload={'memory_id': memory_id},
+        )
+
+    @pytest.mark.asyncio
+    async def test_trim_tombstone_clears_and_unregistered_deleter_keeps(
+        self, tmp_path, mock_config,
+    ):
+        from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+        from fused_memory.reconciliation.sweep_deletion_guard import (
+            filter_benign_sweep_deletion_flags,
+        )
+        from fused_memory.services.memory_service import MemoryService
+
+        store = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await store.initialize()
+        try:
+            service = MemoryService(mock_config)
+            service.set_recon_ledger(store)
+            for memory_id, deleter in (
+                (self._TRIMMED, 'stage1_cycle_summary_trim'),
+                (self._HAND_SWEPT, 'unregistered_manual_sweep'),
+            ):
+                written = await record_mem0_deletion_tombstones(
+                    service,
+                    self._PROJECT,
+                    [{'id': memory_id, 'metadata': _VICTIM_METADATA, 'created_at': None}],
+                    deleter=deleter,
+                    deleting_run_id='ea597ad1-f634-4b33-a074-0aa755c40b4a',
+                )
+                assert written == 1
+
+            trimmed_flag = self._flag(self._TRIMMED)
+            hand_swept_flag = self._flag(self._HAND_SWEPT)
+            dropped = await filter_benign_sweep_deletion_flags(
+                service,
+                self._PROJECT,
+                [trimmed_flag],
+                events=[self._deleted(self._TRIMMED)],
+            )
+            kept = await filter_benign_sweep_deletion_flags(
+                service,
+                self._PROJECT,
+                [hand_swept_flag],
+                events=[self._deleted(self._HAND_SWEPT)],
+            )
+        finally:
+            await store.close()
+
+        assert dropped == [], (
+            'the trim path tombstoned the only swept id, so the flag must drop'
+        )
+        assert kept == [hand_swept_flag], (
+            'an undocumented deleter is not a designed sweep, so the flag stays'
+        )
+        swept = hand_swept_flag['sweep_deletion_provenance']['swept']
+        assert swept == [{
+            'memory_id': self._HAND_SWEPT,
+            'deleter': 'unregistered_manual_sweep',
+            'deleting_run_id': 'ea597ad1-f634-4b33-a074-0aa755c40b4a',
+            'classification': 'undocumented_deleter',
+        }]

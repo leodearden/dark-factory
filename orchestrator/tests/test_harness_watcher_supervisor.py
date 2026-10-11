@@ -15,9 +15,13 @@ Steps covered by this file:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import re
+import threading
 import time
 from collections import deque
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -25,6 +29,7 @@ import pytest
 from _orch_helpers import _init_harness_state_for_test
 from escalation.queue import EscalationQueue
 
+from orchestrator.agents.skill_prompt import load_skill_system_prompt
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import (
     _WATCHER_ALLOWED_TOOLS,
@@ -914,6 +919,23 @@ def _make_loop_harness(tmp_path: Path) -> Harness:
     return h
 
 
+@contextlib.contextmanager
+def _patch_monotonic_for_this_thread(fake: Callable[[], float]) -> Iterator[None]:
+    """Serve *fake* as ``time.monotonic`` to the entering thread only (task 5676).
+
+    ``orchestrator.harness.time`` is the stdlib module, so the patch is
+    process-global; every other thread keeps reading the real clock.
+    """
+    real_monotonic = time.monotonic
+    owner = threading.get_ident()
+
+    def monotonic() -> float:
+        return fake() if threading.get_ident() == owner else real_monotonic()
+
+    with patch('orchestrator.harness.time.monotonic', new=monotonic):
+        yield
+
+
 def _build_monotonic_timestamps(
     durations: list[float],
     *,
@@ -955,7 +977,8 @@ async def _run_supervisor_with_rotation_durations(
     """Drive _watcher_supervisor_loop with controlled per-rotation durations.
 
     Each entry in *rotation_durations_secs* becomes one paired (start, end)
-    timestamp consumed by the patched ``time.monotonic``.
+    timestamp served by a thread-scoped ``time.monotonic`` patch, so only the
+    calling thread consumes the script.
 
     When *expect_cancelled* is ``True`` (the default), a final start timestamp
     is appended and ``fake_rotation`` raises ``CancelledError`` on the (n+1)th
@@ -998,18 +1021,92 @@ async def _run_supervisor_with_rotation_durations(
     if expect_cancelled:
         with (
             patch('orchestrator.harness.asyncio.sleep', recording_sleep),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
             pytest.raises(asyncio.CancelledError),
         ):
             await h._watcher_supervisor_loop()
     else:
         with (
             patch('orchestrator.harness.asyncio.sleep', recording_sleep),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
         ):
             await h._watcher_supervisor_loop()
 
     return sleep_durations
+
+
+# ---------------------------------------------------------------------------
+# task 5676: the scripted supervisor clock serves only the test's own thread
+# ---------------------------------------------------------------------------
+
+class TestScriptedSupervisorClockIgnoresOtherThreads:
+
+    @pytest.mark.asyncio
+    async def test_background_monotonic_reader_does_not_consume_scripted_timestamps(
+        self, tmp_path: Path,
+    ) -> None:
+        """A foreign thread reading ``time.monotonic()`` mid-loop must not
+        consume the supervisor's exact-length timestamp script.
+
+        The digest hook blocks each iteration until the reader has read the
+        clock inside the patched window, so the steal is forced
+        deterministically rather than left to GIL scheduling.
+        """
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_misconfigured_clean_exits': 99,
+            'watcher_misconfigured_min_rotation_secs': 120.0,
+            'watcher_subprocess_restart_backoff_secs': 1.0,
+            'watcher_crashloop_window_secs': 600,
+            'watcher_max_crashloop_restarts': 99,
+        })
+
+        stop = threading.Event()
+        window_open = threading.Event()
+        read_in_window = threading.Event()
+        reader_errors: list[BaseException] = []
+
+        def read_clock_until_stopped() -> None:
+            while not stop.is_set():
+                if not window_open.wait(timeout=0.05):
+                    continue
+                try:
+                    time.monotonic()
+                except BaseException as exc:
+                    reader_errors.append(exc)
+                    return
+                read_in_window.set()
+
+        async def digest_hook_forcing_a_foreign_read() -> None:
+            read_in_window.clear()
+            window_open.set()
+            if not read_in_window.wait(timeout=5.0):
+                pytest.fail(
+                    'monotonic-reader thread never read the clock inside the '
+                    'patched window; the regression test cannot prove anything'
+                )
+            window_open.clear()
+
+        h._maybe_write_digest = digest_hook_forcing_a_foreign_read  # type: ignore[method-assign]
+
+        reader = threading.Thread(
+            target=read_clock_until_stopped, name='monotonic-reader', daemon=True,
+        )
+        reader.start()
+        try:
+            sleep_durations = await _run_supervisor_with_rotation_durations(h, [1.0] * 4)
+        finally:
+            stop.set()
+            reader.join(timeout=5.0)
+
+        assert not reader.is_alive(), 'monotonic-reader thread did not stop within 5s'
+        assert reader_errors == [], (
+            f'monotonic-reader thread hit the scripted clock and raised: {reader_errors!r}'
+        )
+        assert sleep_durations == pytest.approx([1.0, 2.0, 4.0, 8.0]), (
+            f'Expected the scripted exponential floor [1.0, 2.0, 4.0, 8.0] with a '
+            f'concurrent foreign clock reader; got {sleep_durations}'
+        )
 
 
 class TestWatcherSupervisorLoopClassification:
@@ -1328,7 +1425,7 @@ class TestWatcherCrashloopTrip:
         # patch monotonic to return a stable time (all exits within the window)
         stable_time = time.monotonic()
         with patch('orchestrator.harness.asyncio.sleep', fake_sleep), \
-             patch('orchestrator.harness.time.monotonic', return_value=stable_time):
+             _patch_monotonic_for_this_thread(lambda: stable_time):
             # Loop should exit after max_restarts unclean exits
             await h._watcher_supervisor_loop()
 
@@ -1429,7 +1526,7 @@ class TestWatcherCrashloopTrip:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
             pytest.raises(asyncio.CancelledError),
         ):
             # Loop should cancel (not trip) because old exits are evicted
@@ -1483,7 +1580,7 @@ class TestWatcherCrashloopTrip:
         stable_time = time.monotonic()
         with (
             patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
-            patch('orchestrator.harness.time.monotonic', return_value=stable_time),
+            _patch_monotonic_for_this_thread(lambda: stable_time),
         ):
             # Supervisor must return even though pause_scheduler raises.
             # In RED state: CancelledError fires at max_restarts*2+1 rotations, and
@@ -1548,7 +1645,7 @@ class TestWatcherMisconfiguredGuard:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
             pytest.raises(asyncio.CancelledError),
         ):
             await h._watcher_supervisor_loop()
@@ -1594,7 +1691,7 @@ class TestWatcherMisconfiguredGuard:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
             pytest.raises(asyncio.CancelledError),
         ):
             await h._watcher_supervisor_loop()
@@ -1655,7 +1752,7 @@ class TestWatcherMisconfiguredGuard:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
         ):
             # Loop should exit after max_misconfig fast-clean exits (no CancelledError)
             await h._watcher_supervisor_loop()
@@ -1743,7 +1840,7 @@ class TestWatcherMisconfiguredGuard:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
             pytest.raises(asyncio.CancelledError),
         ):
             # Loop should cancel (not trip) because old entries are evicted
@@ -1823,7 +1920,7 @@ class TestWatcherMisconfiguredGuard:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
         ):
             # Supervisor must return even though pause_scheduler raises.
             await h._watcher_supervisor_loop()
@@ -2170,7 +2267,7 @@ class TestWatcherMisconfiguredGuard:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', fake_sleep),
-            patch('orchestrator.harness.time.monotonic', side_effect=lambda: next(monotonic_iter)),
+            _patch_monotonic_for_this_thread(lambda: next(monotonic_iter)),
             pytest.raises(asyncio.CancelledError),
         ):
             await h._watcher_supervisor_loop()
@@ -2524,7 +2621,7 @@ class TestMaybeWriteDigestSurfacesMissingState:
         # asyncio.sleep: instant no-op so the degenerate-clean backoff floor
         # doesn't actually sleep.
         with (
-            patch('orchestrator.harness.time.monotonic', return_value=0.0),
+            _patch_monotonic_for_this_thread(lambda: 0.0),
             patch('orchestrator.harness.asyncio.sleep', new=AsyncMock()),
             pytest.raises(AttributeError, match='_escalation_event_count'),
         ):
@@ -2569,7 +2666,7 @@ class TestMaybeWriteDigestSurfacesMissingState:
         # propagates the error regardless of its origin.
         digest_mock = AsyncMock(side_effect=AttributeError('scheduler'))
         with (
-            patch('orchestrator.harness.time.monotonic', return_value=0.0),
+            _patch_monotonic_for_this_thread(lambda: 0.0),
             patch('orchestrator.harness.asyncio.sleep', new=AsyncMock()),
             patch.object(h, '_maybe_write_digest', digest_mock),
             pytest.raises(AttributeError, match='scheduler'),
@@ -3058,6 +3155,151 @@ class TestWatcherAllowedTools:
             f'current list: {_WATCHER_DISALLOWED_TOOLS}'
         )
 
+    def test_archive_inclusive_read_tool_is_granted(self) -> None:
+        """get_task_escalations must be allowed, and not disallowed.
+
+        allowed_tools reaches the CLI as --allowed-tools, an ALLOWLIST
+        (shared/src/shared/cli_invoke.py), and MCP tools are not covered by
+        permission-bypass mode (SKILL.md "Headless-mode permission gotchas").
+        Without this entry the drain protocol's archive-inclusive read
+        (task 3999) is permission-denied: a silent no-op.
+        """
+        tool = 'mcp__escalation__get_task_escalations'
+        assert tool in _WATCHER_ALLOWED_TOOLS, (
+            f'{tool} must be in _WATCHER_ALLOWED_TOOLS so the drain can read '
+            "archived L2s' member_ids and keep already-promoted L1s out of "
+            f'work_batch (task 3999); current list: {_WATCHER_ALLOWED_TOOLS}'
+        )
+        assert tool not in _WATCHER_DISALLOWED_TOOLS, (
+            f'{tool} must not be in _WATCHER_DISALLOWED_TOOLS — that would '
+            'silently blind the drain to archived L2s (task 3999); '
+            f'current list: {_WATCHER_DISALLOWED_TOOLS}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3999: the drain protocol in the rotation's system prompt
+# ---------------------------------------------------------------------------
+
+_DRAIN_HEADING = '### Draining pending escalations'
+
+
+def _watcher_skill_text() -> str:
+    return load_skill_system_prompt('escalation-watcher-auto')
+
+
+def _fenced_code_blocks(text: str) -> list[str]:
+    return re.findall(r'```.*?\n(.*?)```', text, re.S)
+
+
+def _skill_section(text: str, heading: str) -> str:
+    """The `heading` line up to (not including) the next line starting '### '."""
+    lines = text.splitlines()
+    start = lines.index(heading)
+    end = next(
+        (i for i in range(start + 1, len(lines)) if lines[i].startswith('### ')),
+        len(lines),
+    )
+    return '\n'.join(lines[start:end])
+
+
+class TestWatcherSkillDrainProtocol:
+    """The rotation's drain protocol, read as the harness injects it.
+
+    SKILL.md's body IS the rotation's system prompt, and its fenced code
+    blocks are the calls the rotation makes. These tests pin only that API
+    surface: tool names, call shapes and projection keys.
+    """
+
+    def test_every_mcp_tool_the_skill_calls_is_granted(self) -> None:
+        called = {
+            token
+            for block in _fenced_code_blocks(_watcher_skill_text())
+            for token in re.findall(r'mcp__[a-z-]+__[a-z0-9_]+', block)
+        }
+        assert called, 'found no MCP tool calls in SKILL.md code blocks'
+        ungranted = sorted(called - set(_WATCHER_ALLOWED_TOOLS))
+        assert not ungranted, (
+            'SKILL.md code blocks call MCP tools missing from '
+            '_WATCHER_ALLOWED_TOOLS; --allowed-tools is an allowlist, so each '
+            f'call is permission-denied (a silent no-op): {ungranted}'
+        )
+
+    def test_drain_rebuilds_already_promoted_archive_inclusively(self) -> None:
+        drain = _skill_section(_watcher_skill_text(), _DRAIN_HEADING)
+        assert 'get_task_escalations' in drain, (
+            'the drain must read L2s archive-inclusively via '
+            'get_task_escalations: get_pending_escalations is pending-only, so '
+            "a resolved L2's members re-enter work_batch "
+            '(delivered_check drain-loop-reads-the-escalation-archive)'
+        )
+        assert 'member_ids' in drain, (
+            'the drain must union member_ids, the compact projection key '
+            '(escalation/src/escalation/server.py::_compact_escalation)'
+        )
+
+    def test_drain_reads_l2s_compact_and_l1_candidates_full(self) -> None:
+        drain = _skill_section(_watcher_skill_text(), _DRAIN_HEADING)
+        lines = [
+            line
+            for block in _fenced_code_blocks(drain)
+            for line in block.splitlines()
+        ]
+        pending_l2_reads = [
+            line for line in lines if 'get_pending_escalations(level=2' in line
+        ]
+        archive_l2_reads = [line for line in lines if 'get_task_escalations(' in line]
+        l1_reads = [line for line in lines if 'get_pending_escalations(level=1' in line]
+        assert pending_l2_reads and archive_l2_reads and l1_reads, (
+            'the drain section must show the pending-L2, archive-L2 and L1 '
+            'candidate reads as one-line calls in a code block; found '
+            f'{pending_l2_reads=} {archive_l2_reads=} {l1_reads=}'
+        )
+        full_l2_reads = [
+            line
+            for line in pending_l2_reads + archive_l2_reads
+            if 'compact=True' not in line
+        ]
+        assert not full_l2_reads, (
+            'every L2 read must pass compact=True: member_ids exists only on '
+            f'compact rows (server.py::_compact_escalation): {full_l2_reads}'
+        )
+        compact_l1_reads = [line for line in l1_reads if 'compact=True' in line]
+        assert not compact_l1_reads, (
+            'the L1 candidate read must stay FULL-shape: the compact projection '
+            'drops agent_role and detail, which the path-guard carve-out and '
+            f'the handlers read: {compact_l1_reads}'
+        )
+
+    def test_skill_never_reads_members_off_an_escalation_row(self) -> None:
+        """No code block reads the model field `members` off an escalation row.
+
+        Every L2 read in this skill is compact (pinned by
+        test_drain_reads_l2s_compact_and_l1_candidates_full), and
+        server.py::_compact_escalation emits the projection key `member_ids`;
+        the model field `members` exists only in the FULL shape. Reading
+        `members` off an L2 row therefore silently yields nothing — in the
+        stranded_blocked guard that fails OPEN and re-resumes a task a
+        sibling escalation is already handling.
+
+        A read is `.members`, `.get("members"` or `["members"]` in either
+        quote style, off any receiver. The one legitimate read is
+        promote_to_l2's RESPONSE key `members`, so a read is exempt exactly
+        when its receiver is a variable bound to a promote_to_l2 call.
+        """
+        code = '\n'.join(_fenced_code_blocks(_watcher_skill_text()))
+        promote_results = set(
+            re.findall(r'(\w+)\s*=\s*mcp__escalation__promote_to_l2\(', code)
+        )
+        reads = re.finditer(
+            r'''(\w*)\s*(?:\.\s*get\(\s*["']|\[\s*["']|\.)\s*members\b''', code
+        )
+        found = [m.group(0) for m in reads if m.group(1) not in promote_results]
+        assert not found, (
+            'SKILL.md reads `members` off an escalation row; compact rows carry '
+            f'only `member_ids`, so the read silently yields nothing: {found}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # task 2629 step-3: _watcher_has_actionable_l1 — empty-queue rotation precheck
@@ -3135,6 +3377,35 @@ class TestWatcherHasActionableL1:
         promoted_id = _submit_sample_l1(queue, 'task-promoted')
         _submit_sample_l1(queue, 'task-unpromoted')
         _submit_sample_l2(queue, 'task-promoted-cluster', members=[promoted_id])
+        assert h._watcher_has_actionable_l1() is True
+
+    def test_member_missed_by_a_dispositioned_l2_cascade_returns_true(
+        self, tmp_path: Path,
+    ) -> None:
+        """A pending L1 whose resolved L2's cascade missed it — actionable.
+
+        The rotation's drain closes such a stranded member (SKILL.md
+        "Draining pending escalations"), so launching for it is how it leaves
+        the queue. Excluding archived L2s' members here would strand it.
+        """
+        h, queue = _make_harness_with_queue(tmp_path)
+        l1_id = _submit_sample_l1(queue, 'task-stranded')
+        l2_id = _submit_sample_l2(queue, 'task-stranded', members=[l1_id])
+        resolve = EscalationQueue.resolve
+
+        def resolve_missing_the_member(
+            self: EscalationQueue, escalation_id: str, *args, **kwargs,
+        ):
+            if escalation_id == l1_id:
+                raise OSError('simulated cascade failure')
+            return resolve(self, escalation_id, *args, **kwargs)
+
+        with patch.object(EscalationQueue, 'resolve', resolve_missing_the_member):
+            queue.resolve(l2_id, 'human answered the cluster')
+
+        l2, l1 = queue.get(l2_id), queue.get(l1_id)
+        assert l2 is not None and l2.status == 'resolved'
+        assert l1 is not None and l1.status == 'pending'
         assert h._watcher_has_actionable_l1() is True
 
     def test_only_l0_returns_false(self, tmp_path: Path) -> None:
@@ -3294,7 +3565,7 @@ class TestWatcherSupervisorLoopEmptyQueueSkip:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', recording_sleep),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
             pytest.raises(asyncio.CancelledError),
         ):
             await h._watcher_supervisor_loop()
@@ -3413,7 +3684,7 @@ class TestDigestRunsRegardlessOfEmptyQueuePrecheck:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', recording_sleep),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
             pytest.raises(asyncio.CancelledError),
         ):
             await h._watcher_supervisor_loop()

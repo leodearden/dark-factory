@@ -295,9 +295,12 @@ done
 # Validate --critical-free-gib is a non-negative integer (misconfiguration is
 # a wiring bug, not transient pressure — exit 2 so it's loud rather than
 # silently comparing against a bogus floor). Mirrors warm-lane-disk-guard.sh's
-# MIN_FREE_GIB validation (scripts/warm-lane-disk-guard.sh:130-138).
-if ! printf '%s\n' "$CRITICAL_FREE_GIB" | grep -qE '^[0-9]+$'; then
-    _warn "REIFY_WARM_LANE_GC_SWEEP_CRITICAL_FREE_GIB (or --critical-free-gib) is not a valid integer: '$CRITICAL_FREE_GIB'."
+# MIN_FREE_GIB validation: canonical decimal of at most 5 digits, because the
+# value feeds $(( CRITICAL_FREE_GIB * 1024^3 )) — a leading zero would be read
+# as OCTAL (08/09 error out leaving the variable unset, 010 silently means 8)
+# and a huge value would wrap negative on 64-bit and invert the comparison.
+if ! printf '%s\n' "$CRITICAL_FREE_GIB" | grep -qE '^(0|[1-9][0-9]{0,4})$'; then
+    _warn "REIFY_WARM_LANE_GC_SWEEP_CRITICAL_FREE_GIB (or --critical-free-gib) is not a valid integer (0-99999, no leading zeros): '$CRITICAL_FREE_GIB'."
     _warn "Run '$(basename "$0") --help' for usage."
     exit 2
 fi

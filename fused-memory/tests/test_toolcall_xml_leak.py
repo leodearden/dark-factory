@@ -309,7 +309,7 @@ class TestCleanTextAndNearMisses:
             'invoke the handler and return',
             'content ends here',
             'A description of the details of the content.',
-            'Use </> as a shorthand in the docs.',
+            'Use \x3c/> as a shorthand in the docs.',
             'priority: low',
             'A multi-line\nbody with\nreal newlines but no tags at all.',
         ],

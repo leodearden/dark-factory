@@ -131,9 +131,10 @@ function rtProbe(status) {
     : PROBE_STATUS.unknown;
 }
 
-// ── Tasks-tab banner aggregation over ACTIVE_TASKS rows ──
-// Pure over an array of task rows ({project, runtime_status}). Derived
-// frontend-side rather than as a new top-level payload key: the per-project
+// ── Tasks-tab banner aggregation over the snapshot rows ──
+// Pure over an array of task rows ({project, runtime_status}): every
+// TASKS_SNAPSHOT[p].rows value, read through task_snapshot.js::snapshotRowsOver.
+// Derived frontend-side rather than as a new top-level payload key: the per-project
 // fact is already fully recoverable from the rows, so a new key would carry
 // zero extra information while churning every exact-set payload assertion.
 // Returns null when there is nothing to ALARM about, else
@@ -191,7 +192,7 @@ function rtProbeSummary(rows) {
   // The threshold (>= 2) and the all-probed-must-be-deadline_exceeded rule are
   // now identical to task_runtime.fetch_task_runtime's aggregate WARNING. The
   // two can still differ, but only in ONE way: this denominator is derived
-  // from ACTIVE_TASKS ROWS, so a probed project with zero task rows is
+  // from the snapshot ROWS, so a probed project with zero task rows is
   // invisible here while Python counts it in `labels`. (Do not restate this as
   // "can never disagree" — that unqualified claim was asserted here once and
   // was false.) With ONE probed project the all-at-once pattern is degenerate

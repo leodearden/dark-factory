@@ -434,7 +434,7 @@ class TestTopicPinScoreContract:
     async def test_injected_anchor_carries_no_store_score_at_all(self, service):
         """ABSENT is not the same as 0.0 — and only absent is safe.
 
-        ``near_duplicate_guard._cosine_of`` treats a missing cosine as "not
+        ``near_duplicate_guard.cosine_of`` treats a missing cosine as "not
         comparable", which can never qualify at ANY threshold; a measured 0.0
         would still be a measurement, and a low threshold could clear it. This
         assertion is what stops a future refactor 'helpfully' copying a score
@@ -463,8 +463,8 @@ class TestTopicPinFailOpenAndGating:
     the near-duplicate guard's pre-check on every procedural_knowledge write.
     Without fail-open, one Qdrant read timeout would break every search in the
     system. ``get_memories_by_metadata`` genuinely PROPAGATES a TimeoutError
-    (unlike ``Mem0Backend.search``, which swallows failures into ``{}``), so
-    this is a real path, not a defensive hypothetical.
+    (as every ``Mem0Backend`` read does), so this is a live path, not a
+    defensive hypothetical.
     """
 
     @pytest.mark.asyncio

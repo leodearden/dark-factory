@@ -113,11 +113,12 @@ def _globals(stdout: str) -> dict[str, str]:
     return out
 
 
-#: Appended to a snippet to publish the three globals for inspection.  Printed
+#: Appended to a snippet to publish the four globals for inspection.  Printed
 #: one per line with no quoting so an empty value is an empty tail.
 _ECHO_GLOBALS = (
-    "printf 'RAW=%s\\nTASK=%s\\nCAUSE=%s\\n' "
-    '"$LANE_STATE_RAW" "$LANE_STATE_TASK_ID" "$LANE_STATE_CAUSE"'
+    "printf 'RAW=%s\\nTASK=%s\\nCAUSE=%s\\nUPDATED=%s\\n' "
+    '"$LANE_STATE_RAW" "$LANE_STATE_TASK_ID" "$LANE_STATE_CAUSE" '
+    '"$LANE_STATE_UPDATED_AT"'
 )
 
 #: A realistic record: the shape ``LaneRecord`` actually serializes.
@@ -163,7 +164,7 @@ class TestLaneStateReadHappyPath:
             f'path; got {proc.stdout!r}'
         )
 
-    def test_publishes_the_three_globals_for_an_assigned_lane(
+    def test_publishes_the_four_globals_for_an_assigned_lane(
         self, tmp_path: Path,
     ) -> None:
         base = _mount(tmp_path / 'mount', {'_lane-28': _ASSIGNED_RECORD})
@@ -173,12 +174,17 @@ class TestLaneStateReadHappyPath:
         )
         assert proc.returncode == 0, f'stderr={proc.stderr!r}'
         published = _globals(proc.stdout)
-        assert published == {'RAW': 'assigned', 'TASK': '5551', 'CAUSE': ''}, (
-            'the three globals must describe ONE observation of ONE record; '
+        assert published == {
+            'RAW': 'assigned',
+            'TASK': '5551',
+            'CAUSE': '',
+            'UPDATED': _ASSIGNED_RECORD['updated_at'],
+        }, (
+            'the four globals must describe ONE observation of ONE record; '
             f'got {published!r}'
         )
 
-    def test_publishes_the_three_globals_for_a_recordless_lane(
+    def test_publishes_the_four_globals_for_a_recordless_lane(
         self, tmp_path: Path,
     ) -> None:
         base = _mount(tmp_path / 'mount', {'_iact-demo': None})
@@ -193,6 +199,9 @@ class TestLaneStateReadHappyPath:
         )
         assert published['TASK'] == '', (
             f'no record means no task id to publish; got {published!r}'
+        )
+        assert published['UPDATED'] == '', (
+            f'no record means no timestamp to publish; got {published!r}'
         )
 
     def test_accepts_a_bare_lane_name_against_an_explicit_state_dir(
@@ -310,7 +319,9 @@ class TestLaneStateReadFailsOpenWithAnAttributableCause:
             f'a null task_id must not suppress the state; got {proc.stdout!r}'
         )
         published = _globals(proc.stdout)
-        assert published == {'RAW': 'released', 'TASK': '', 'CAUSE': ''}, published
+        assert published == {
+            'RAW': 'released', 'TASK': '', 'CAUSE': '', 'UPDATED': '',
+        }, published
 
     def test_absent_task_id_key_reads_empty_without_losing_the_state(
         self, tmp_path: Path,
@@ -321,7 +332,9 @@ class TestLaneStateReadFailsOpenWithAnAttributableCause:
         )
         assert proc.stdout.startswith('seed\n'), proc.stdout
         published = _globals(proc.stdout)
-        assert published == {'RAW': 'seed', 'TASK': '', 'CAUSE': ''}, published
+        assert published == {
+            'RAW': 'seed', 'TASK': '', 'CAUSE': '', 'UPDATED': '',
+        }, published
 
 
 class TestLaneStateReadIsNonCreating:
@@ -458,9 +471,144 @@ class TestLaneStateReadNeverInheritsAPredecessorsValues:
             f'{_ECHO_GLOBALS}',
         )
         published = _globals(proc.stdout)
-        assert published == {'RAW': 'assigned', 'TASK': '5551', 'CAUSE': ''}, (
+        assert published == {
+            'RAW': 'assigned',
+            'TASK': '5551',
+            'CAUSE': '',
+            'UPDATED': _ASSIGNED_RECORD['updated_at'],
+        }, (
             'a successful read must clear the previous lane\'s UNKNOWN cause, or '
             f'the audit would warn about a lane that resolved fine; {published!r}'
+        )
+
+
+class TestLaneStateReadPublishesUpdatedAt:
+    """``updated_at`` is the FOURTH global, from the SAME single slurp.
+
+    ``warm-lane-gc.sh``'s Pass-1 record gate bounds an ASSIGNED preserve by the
+    record's age, so it needs the record's timestamp alongside its state and
+    task id.  Publishing it from the same slurp is the whole point: the
+    orchestrator rewrites these records on every acquire and release, so a
+    second read of the record would be a DIFFERENT INSTANT and could pair a
+    state with a timestamp that never coexisted — which on the gc side would
+    mean judging a live lane's freshness by a released record's stamp.
+
+    The EMPTY string is the "age unjudgeable" reading the consumer acts on, and
+    it must be reachable from every way a timestamp can be missing: no record,
+    an unparseable record, and a readable record with no ``updated_at`` key.
+    """
+
+    def test_assigned_record_publishes_its_timestamp_verbatim(
+        self, tmp_path: Path,
+    ) -> None:
+        base = _mount(tmp_path / 'mount', {'_lane-28': _ASSIGNED_RECORD})
+        proc = _run_sourced(
+            f'lane_state_read {shlex.quote(str(base / "_lane-28"))} >/dev/null\n'
+            f'{_ECHO_GLOBALS}',
+        )
+        assert proc.returncode == 0, f'stderr={proc.stderr!r}'
+        published = _globals(proc.stdout)
+        assert published['UPDATED'] == _ASSIGNED_RECORD['updated_at'], (
+            'LANE_STATE_UPDATED_AT must carry the record\'s `updated_at` string '
+            f'verbatim, unreformatted; got {published!r}'
+        )
+
+    def test_recordless_lane_publishes_the_empty_string(self, tmp_path: Path) -> None:
+        base = _mount(tmp_path / 'mount', {'_iact-demo': None})
+        proc = _run_sourced(
+            f'lane_state_read {shlex.quote(str(base / "_iact-demo"))} >/dev/null\n'
+            f'{_ECHO_GLOBALS}',
+        )
+        published = _globals(proc.stdout)
+        assert published['UPDATED'] == '', (
+            'a lane with no record has no age to judge, and that reading is the '
+            'EMPTY string — not "unknown", which would be indistinguishable from '
+            f'a record literally carrying that text; got {published!r}'
+        )
+
+    def test_corrupt_record_publishes_the_empty_string(self, tmp_path: Path) -> None:
+        base = _mount(
+            tmp_path / 'mount',
+            {'_lane-9': '{"state": "assig'},   # truncated mid-write
+        )
+        proc = _run_sourced(
+            f'lane_state_read {shlex.quote(str(base / "_lane-9"))} >/dev/null\n'
+            f'{_ECHO_GLOBALS}',
+        )
+        published = _globals(proc.stdout)
+        assert published['CAUSE'] == 'unparseable-record', published
+        assert published['UPDATED'] == '', (
+            'a record truncated before its `updated_at` yields no timestamp; '
+            f'got {published!r}'
+        )
+
+    def test_record_with_no_updated_at_key_publishes_the_empty_string(
+        self, tmp_path: Path,
+    ) -> None:
+        """A readable ``assigned`` record can still lack the timestamp.
+
+        This is the case that separates the two facts: the STATE is trustworthy
+        and the AGE is not, which is exactly the split the gc gate's fail-safe
+        direction turns on.
+        """
+        base = _mount(
+            tmp_path / 'mount',
+            {'_lane-9': {'state': 'assigned', 'task_id': '77'}},
+        )
+        proc = _run_sourced(
+            f'lane_state_read {shlex.quote(str(base / "_lane-9"))} >/dev/null\n'
+            f'{_ECHO_GLOBALS}',
+        )
+        published = _globals(proc.stdout)
+        assert published['RAW'] == 'assigned', (
+            f'the state must still resolve normally; got {published!r}'
+        )
+        assert published['UPDATED'] == '', (
+            f'an absent `updated_at` key yields no timestamp; got {published!r}'
+        )
+
+    def test_recordless_lane_after_an_assigned_one_never_inherits_its_timestamp(
+        self, tmp_path: Path,
+    ) -> None:
+        """The reset-at-entry contract, extended to the fourth global.
+
+        Without it a recordless lane would report the PREVIOUS lane's stamp —
+        and on the gc side a fresh predecessor's timestamp would make an
+        unjudgeable lane read as judgeably fresh, silently disabling the bound
+        for exactly the lanes whose records are in the worst shape.
+        """
+        base = _mount(
+            tmp_path / 'mount',
+            {'_lane-28': _ASSIGNED_RECORD, '_iact-demo': None},
+        )
+        proc = _run_sourced(
+            f'lane_state_read {shlex.quote(str(base / "_lane-28"))} >/dev/null\n'
+            f'lane_state_read {shlex.quote(str(base / "_iact-demo"))} >/dev/null\n'
+            f'{_ECHO_GLOBALS}',
+        )
+        published = _globals(proc.stdout)
+        assert published['UPDATED'] == '', (
+            'the recordless lane inherited its predecessor\'s timestamp — the '
+            f'fourth global must be reset at entry too; got {published!r}'
+        )
+
+    def test_the_default_before_any_read_matches_a_failed_read(
+        self, tmp_path: Path,
+    ) -> None:
+        """Sourcing the lib alone must publish the same fail-open shape.
+
+        A caller that inspects the globals before its first read must not see an
+        UNBOUND variable — under ``set -u`` (which ``warm-lane-gc.sh`` runs
+        under) that is an abort, not a degraded read.
+        """
+        proc = _run_sourced(f'set -u\n{_ECHO_GLOBALS}')
+        assert proc.returncode == 0, (
+            'the published defaults must satisfy `set -u` before any read; '
+            f'stderr={proc.stderr!r}'
+        )
+        published = _globals(proc.stdout)
+        assert published['UPDATED'] == '', (
+            f'the pre-read default must be the unjudgeable reading; {published!r}'
         )
 
 

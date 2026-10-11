@@ -236,23 +236,19 @@ class TestCarriesCrossRepoSignal:
         """The ordinary shape must stay OUT of the gate, silently.
 
         Absent / ``None`` metadata is READABLE — it simply declares nothing —
-        so it normalizes to ``{}`` rather than to the unreadable sentinel.  Were
-        the two conflated, every metadata-free task on the factory would enter
-        the gate and emit a SKIP warning on each dispatch.
+        so it stays out of the gate, while unreadable metadata is admitted.
+        Were the two conflated, every metadata-free task on the factory would
+        enter the gate and emit a SKIP warning on each dispatch.
         """
-        from orchestrator.cross_repo_gate import _extract_metadata, carries_cross_repo_signal
+        from orchestrator.cross_repo_gate import carries_cross_repo_signal
 
         absent = make_cross_repo_task()
         assert 'metadata' not in absent
-        assert _extract_metadata(absent) == {}
         assert carries_cross_repo_signal(absent) is False
+        assert carries_cross_repo_signal(make_cross_repo_task(metadata=None)) is False
 
-        explicit_none = make_cross_repo_task(metadata=None)
-        assert _extract_metadata(explicit_none) == {}
-        assert carries_cross_repo_signal(explicit_none) is False
-
-        assert _extract_metadata(make_cross_repo_task(metadata=42)) is None, (
-            'a present non-dict is UNREADABLE — the sentinel, not an empty dict'
+        assert carries_cross_repo_signal(make_cross_repo_task(metadata=42)) is True, (
+            'a present non-dict is UNREADABLE — admitted to the gate, not skipped'
         )
 
     def test_never_raises_on_degenerate_input(self):
@@ -898,6 +894,49 @@ class TestClassifyDegenerateMetadata:
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
             'absent metadata is the ordinary shape — it must not warn'
         )
+
+    def test_empty_string_metadata_is_a_silent_allow(self, two_roots, caplog):
+        """``''`` carries no content, so no marker can have been lost: absent, not unreadable."""
+        from orchestrator.cross_repo_gate import (
+            ALLOW,
+            carries_cross_repo_signal,
+            classify_cross_repo,
+        )
+
+        project_root, _ = two_roots
+        caplog.set_level(logging.WARNING, logger='orchestrator.cross_repo_gate')
+        task = make_cross_repo_task(metadata='')
+
+        assert classify_cross_repo(task=task, project_root=project_root).verdict == ALLOW
+        assert carries_cross_repo_signal(task) is False
+        assert not [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'orchestrator.cross_repo_gate'
+        ], "metadata='' is absent — it must not warn"
+
+    @pytest.mark.parametrize(
+        'raw', [None, '', '{}', '{not json', '[1,2]', '"x"', 'null', '   ', [], 42, True, {}]
+    )
+    def test_skip_iff_shared_wire_rule_says_unreadable(self, raw, two_roots):
+        """SKIP is defined by the shared wire rule's unreadable result, nothing else."""
+        from shared.task_metadata_wire import coerce_task_metadata
+
+        from orchestrator.cross_repo_gate import (
+            SKIP,
+            carries_cross_repo_signal,
+            classify_cross_repo,
+        )
+
+        project_root, _ = two_roots
+        task = make_cross_repo_task(metadata=raw)
+        unreadable = coerce_task_metadata(raw) is None
+
+        verdict = classify_cross_repo(task=task, project_root=project_root)
+        assert (verdict.verdict == SKIP) == unreadable, (
+            f'metadata={raw!r}: verdict={verdict.verdict!r}, shared rule unreadable={unreadable}'
+        )
+        if unreadable:
+            assert carries_cross_repo_signal(task) is True
 
     def test_never_raises_on_any_metadata_shape(self, two_roots):
         """classify runs on the dispatch path — it must never take down a slot."""

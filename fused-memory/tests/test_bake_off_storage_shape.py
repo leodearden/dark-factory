@@ -30,11 +30,12 @@ tests assert exact values with no tolerances.
 from __future__ import annotations
 
 import functools
-import importlib.util
 import re
 import types
 from collections.abc import Container
 from pathlib import Path
+
+from _fm_helpers import load_script_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'bake_off_storage_shape.py'
 
@@ -47,32 +48,9 @@ DISTRACTOR_SLAB_PATH = FIXTURES_DIR / 'e2_distractor_slab.jsonl'
 REGROWTH_INJECTION_PATH = FIXTURES_DIR / 'e2_regrowth_injection.jsonl'
 
 
-def _load_module() -> types.ModuleType:
-    """Load bake_off_storage_shape.py from its file path.
-
-    The module is registered in sys.modules under its bare name so that
-    @dataclass and other reflection-based decorators work correctly (they
-    call sys.modules.get(cls.__module__)).
-    """
-    import sys  # noqa: PLC0415
-
-    mod_name = 'bake_off_storage_shape'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
 @functools.cache
 def _mod() -> types.ModuleType:
-    return _load_module()
+    return load_script_module(SCRIPT_PATH, mod_name='bake_off_storage_shape')
 
 
 # ===========================================================================
@@ -85,6 +63,10 @@ def _mod() -> types.ModuleType:
 import json  # noqa: E402
 
 import pytest  # noqa: E402
+
+# Lease-dir isolation (task 4775), autouse for every test in this module:
+# see _fm_helpers.py::lease_dir_fixture.
+from _fm_helpers import lease_dir_fixture  # noqa: E402,F401
 
 
 class TestLoadCalibrationClusters:
@@ -4567,6 +4549,119 @@ class TestGuardProbeSelfDrop:
 class TestRunBakeOffWiring:
     """What the driver does to the world, measured through doubles."""
 
+
+    async def test_it_holds_a_live_lease_at_the_moment_it_seeds(self, monkeypatch):
+        """The bake-off seeds under a prefix the 6-hourly cron deletes, so a
+        sweep landing between its seed and measure phases empties the corpus
+        out from under it.
+
+        Asserted on lease LIVENESS observed from inside the run, at two
+        instants: the pre-run drop (the first statement in the run's `try`,
+        before any collection exists) and the seeding itself.  A call-count
+        assertion would pass even if the lease were taken and dropped again
+        before the seeding began, which is the failure this has to exclude.
+        """
+        mod = _mod()
+        drops = _install_driver_doubles(monkeypatch)
+        reaper = mod.load_cleanup_script()
+        at_drop: list[list[dict]] = []
+        at_seed: list[list[dict]] = []
+        seed_arm = mod.seed_arm
+
+        def _drop_and_look(*args, **kwargs):
+            at_drop.append(reaper.live_leases())
+            return drops(*args, **kwargs)
+
+        async def _seed_and_look(*args, **kwargs):
+            at_seed.append(reaper.live_leases())
+            return await seed_arm(*args, **kwargs)
+
+        monkeypatch.setattr(mod, 'drop_collections', _drop_and_look)
+        monkeypatch.setattr(mod, 'seed_arm', _seed_and_look)
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        assert at_drop and at_seed, 'the observation seams never fired'
+        for live in (at_drop[0], at_seed[0]):
+            assert len(live) == 1, live
+            owner = live[0]['owner']
+            assert mod.__name__ in owner, owner
+            assert mod.worker_suffix() in owner, owner
+
+    async def test_the_lease_is_released_once_the_run_returns(self, monkeypatch):
+        """Held for the run, not for the process.  A lease that outlived the
+        run would wedge the cron until the pytest session ended."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+        reaper = mod.load_cleanup_script()
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        assert reaper.live_leases() == []
+
+    async def test_the_lease_is_released_when_the_run_raises(self, monkeypatch):
+        """A failed bake-off must not hold the cron off — the case a TTL
+        would exist to bound, and the reason none is needed."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+        reaper = mod.load_cleanup_script()
+
+        async def _initialize_explodes(self):
+            raise RuntimeError('qdrant unreachable')
+
+        monkeypatch.setattr(_FakeMemoryService, 'initialize', _initialize_explodes)
+
+        with pytest.raises(RuntimeError, match='qdrant unreachable'):
+            await mod.run_bake_off(**_SMALL_RUN)
+
+        assert reaper.live_leases() == []
+
+    async def test_the_reaper_is_resolved_before_any_resource_is_acquired(
+        self, monkeypatch,
+    ):
+        """Nothing that can raise may sit between an acquisition and the
+        `try` whose `finally` releases it.
+
+        The temp queue directory is the run's FIRST acquisition, and the
+        service is built right after it — both before the `with`.  A
+        `load_cleanup_script()` evaluated in the `with` header therefore sits
+        in the one unprotected window: `_load_sibling_script` raises
+        `FixtureError` when the spec cannot be built, and that raise would
+        leak the queue directory and skip `close()` on a half-built service.
+        (It is unreachable TODAY only because `ephemeral_collection_prefix()`
+        has already cached the module — an accident of ordering, not a
+        property, and reordering two lines restores the leak silently.)
+
+        Asserted as "NO resolution happens once a resource exists", not as
+        "some resolution happens first": `ephemeral_collection_prefix()`
+        resolves the reaper three times before `mkdtemp` either way, so an
+        index comparison would pass on the unfixed driver.
+        """
+        import tempfile  # noqa: PLC0415
+
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+        order: list[str] = []
+        resolve = mod.load_cleanup_script
+        mkdtemp = tempfile.mkdtemp
+
+        def _record_resolve():
+            order.append('reaper')
+            return resolve()
+
+        def _record_mkdtemp(*args, **kwargs):
+            order.append('queue_dir')
+            return mkdtemp(*args, **kwargs)
+
+        monkeypatch.setattr(mod, 'load_cleanup_script', _record_resolve)
+        monkeypatch.setattr(tempfile, 'mkdtemp', _record_mkdtemp)
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        assert 'queue_dir' in order, order
+        assert 'reaper' in order, order
+        assert 'reaper' not in order[order.index('queue_dir'):], order
+
     async def test_it_seeds_exactly_three_collections_for_six_arms(self, monkeypatch):
         mod = _mod()
         _install_driver_doubles(monkeypatch)
@@ -4792,19 +4887,21 @@ class TestRunBakeOffWiring:
         assert smallest_arm > mod.SEED_CONCURRENCY  # the bound has to actually bite
         assert mem0.max_inflight <= mod.SEED_CONCURRENCY
 
-    async def test_fetching_stays_serial_because_a_swallowed_read_timeout_is_silent(
+    async def test_fetching_stays_serial_because_concurrent_reads_aborted_the_live_run(
         self, monkeypatch,
     ):
-        """The read side is the one half that must NOT be made concurrent.
+        """The read side stays serial until someone re-measures it.
 
         Bounding it at SEED_CONCURRENCY is the obvious efficiency win — 753
         independent, order-insensitive round trips across the three arms — and
         it was implemented and measured. The live run aborted partway through
         the second arm with `MeasurementError: ... returned no results for a
-        10-limit query`. `Mem0Client.search` SWALLOWS its read timeout (logs,
-        returns `{}`), so on the read side concurrency converts a latency win
-        into a silently-empty ranking; `add` propagates its timeout instead,
-        which is why the write side keeps its bound.
+        10-limit query`. The hypothesis at the time: concurrent searches
+        exceeded the backend read timeout, which `search` then returned as
+        `{}`. Since task 5265 that timeout raises instead
+        (`backends/mem0_client.py::Mem0Backend._timed`), so the failure would
+        now be loud rather than an empty ranking, but nobody has re-run the
+        concurrent read path against a live store, so the serial bound stays.
 
         Asserted as the OBSERVABLE property — one search in flight at a time —
         rather than as "no semaphore exists", so a future re-attempt has to
@@ -8171,13 +8268,16 @@ class TestTheSelfHitFilterIsProvenanceBasedNotIdBased:
 
 @pytest.mark.asyncio
 class TestAFailedQueryIsNotAMeasuredZero:
-    """`Mem0Client.search` swallows `TimeoutError` and returns `{}`.
+    """A backend read can come back empty without having measured anything.
 
-    So a network failure and a shape that ranked nothing arrive at `_search`
-    as the same empty list — which this module's own rule ("an empty hits list
-    with a real expectation IS a measured zero") then scores as 0.0 recall,
-    0.0 discoverability and 0.0 guard, indistinguishable in the artifact from
-    a real result.  Every arm seeds the SHARED distractor slab, so an empty
+    The backend's `search` propagates a read `TimeoutError`, but an empty
+    response (`{}`, `None`, no results) is still a possible reply, and a
+    failed query must never be counted as a measured zero.  If a network
+    failure and a shape that ranked nothing ever arrived at `_search` as the
+    same empty list, this module's own rule ("an empty hits list with a real
+    expectation IS a measured zero") would score it as 0.0 recall, 0.0
+    discoverability and 0.0 guard, indistinguishable in the artifact from a
+    real result.  Every arm seeds the SHARED distractor slab, so an empty
     ranking is not a possible outcome here: it is unambiguously detectable and
     must be loud, per the no-silent-fail-soft design invariant.
     """

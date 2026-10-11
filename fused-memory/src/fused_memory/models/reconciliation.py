@@ -263,6 +263,35 @@ class VerdictSeverity(StrEnum):
     serious = 'serious'
 
 
+class FindingSeverity(StrEnum):
+    """Severity of a recon_report finding, in ascending order.
+
+    Distinct from ``VerdictSeverity`` (judge verdicts carry ``ok``) and from the
+    escalation-queue severities (info/blocking/critical/urgent).  "Present but
+    not automatically fixable" is ``actionable=False``, not a severity.
+    """
+
+    minor = 'minor'
+    moderate = 'moderate'
+    serious = 'serious'
+
+    @property
+    def gloss(self) -> str:
+        """What a finding of this severity is, as the stage prompts teach it."""
+        match self:
+            case FindingSeverity.minor:
+                return 'cosmetic mismatch'
+            case FindingSeverity.moderate:
+                return 'wrong information'
+            case FindingSeverity.serious:
+                return 'fundamentally contradictory state'
+
+
+# Derived from FindingSeverity; do not hand-declare elsewhere.
+FINDING_SEVERITY_VALUES: tuple[str, ...] = tuple(s.value for s in FindingSeverity)
+FINDING_SEVERITY_SET: frozenset[str] = frozenset(FINDING_SEVERITY_VALUES)
+
+
 class VerdictAction(StrEnum):
     """Action taken based on a judge verdict."""
 

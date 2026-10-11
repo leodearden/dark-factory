@@ -15,12 +15,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import shutil
 import types
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from _filing_tools import call_blocker as _blocker
+from _filing_tools import call_info as _info
+from _merge_tool_calls import call_merge_cancel, call_merge_request, call_merge_status
 
 from escalation.dedupe import DedupeConfig
 from escalation.models import Escalation
@@ -52,16 +56,6 @@ async def _make_lookup(status: str | None):
         return status
 
     return _lookup
-
-
-async def _blocker(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('escalate_blocker')
-    return await tool.fn(**kwargs)
-
-
-async def _info(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('escalate_info')
-    return await tool.fn(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -632,12 +626,6 @@ class TestAutoResolveSingleNotification:
 # ---------------------------------------------------------------------------
 
 
-async def _call_merge_request(server, **kwargs: Any) -> dict[str, Any]:
-    """Invoke the merge_request MCP tool directly."""
-    tool = await server.get_tool('merge_request')
-    return await tool.fn(**kwargs)
-
-
 def _make_orch_config(tmp_path: Path):
     """Create a minimal OrchestratorConfig without a git remote."""
     from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
@@ -698,7 +686,7 @@ class TestMergeRequestRequestId:
         worker_task = asyncio.create_task(_worker())
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='591',
                 branch='591',
@@ -796,7 +784,7 @@ class TestMergeRequestRequestId:
         )
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='591',
                 branch='591',
@@ -919,7 +907,7 @@ class TestMergeRequestRequestId:
         )
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='591',
                 branch='591',
@@ -992,7 +980,7 @@ class TestMergeRequestFastPathFallThrough:
         Returns the asyncio.Task; caller must cancel it when done.
         """
         task = asyncio.create_task(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id=branch,
                 branch=branch,
@@ -1167,7 +1155,7 @@ class TestMergeRequestWaitSecsZeroFree:
         )
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='free-b',
                 branch='free-b',
@@ -1251,7 +1239,7 @@ class TestMergeRequestWaitSecsZeroAttached:
         )
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='X',
                 branch='X',
@@ -1314,7 +1302,7 @@ class TestMergeRequestDefaultFlip:
         )
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='def-free',
                 branch='def-free',
@@ -1371,7 +1359,7 @@ class TestMergeRequestDefaultFlip:
         )
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='X',
                 branch='X',
@@ -1440,7 +1428,7 @@ class TestMergeRequestWaitSecsPositive:
         worker_task = asyncio.create_task(_worker())
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='task-wp',
                 branch='task-wp',
@@ -1490,7 +1478,7 @@ class TestMergeRequestWaitSecsPositive:
         )
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='task-ct',
                 branch='task-ct',
@@ -1556,7 +1544,7 @@ class TestMergeRequestExplicitNoneQueued:
         )
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='none-free',
                 branch='none-free',
@@ -1619,7 +1607,7 @@ class TestMergeRequestExplicitNoneAttached:
         )
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='X',
                 branch='X',
@@ -1680,7 +1668,7 @@ class TestMergeRequestDurableIntent:
         # Start the merge_request call as a Task (simulates an MCP session lifetime).
         # wait_secs=30 → bounded wait; no worker → blocks inside wait_for.
         merge_task = asyncio.create_task(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='task-di',
                 branch='task-di',
@@ -1717,17 +1705,6 @@ class TestMergeRequestDurableIntent:
 
 
 # ---------------------------------------------------------------------------
-# Helpers for merge_cancel tests (β2)
-# ---------------------------------------------------------------------------
-
-
-async def _call_merge_cancel(server, **kwargs: Any) -> dict[str, Any]:
-    """Invoke the merge_cancel MCP tool directly."""
-    tool = await server.get_tool('merge_cancel')
-    return await tool.fn(**kwargs)
-
-
-# ---------------------------------------------------------------------------
 # Step-1 RED test: success path — pending waiter → cancel
 # ---------------------------------------------------------------------------
 
@@ -1761,7 +1738,7 @@ class TestMergeCancel:
         )
 
         # Submit via merge_request(wait_secs=0) — registers a WaiterRecord in _waiters
-        result_mr = await _call_merge_request(
+        result_mr = await call_merge_request(
             server,
             task_id='c1',
             branch='c1',
@@ -1773,7 +1750,7 @@ class TestMergeCancel:
         assert rid, 'Expected non-empty request_id from merge_request'
 
         # Cancel the in-flight waiter
-        result_cancel = await _call_merge_cancel(server, request_id=rid)
+        result_cancel = await call_merge_cancel(server, request_id=rid)
 
         assert result_cancel.get('cancelled') is True, (
             f"Expected cancelled=True, got: {result_cancel}"
@@ -1815,7 +1792,7 @@ class TestMergeCancel:
             merge_inflight_registry=registry,
         )
 
-        result = await _call_merge_cancel(server, request_id='mr-doesnotexist')
+        result = await call_merge_cancel(server, request_id='mr-doesnotexist')
 
         assert result.get('cancelled') is False, (
             f"Expected cancelled=False for unknown id, got: {result}"
@@ -1865,7 +1842,7 @@ class TestMergeCancel:
         # Acquire the tool up front — no awaited suspension between here and .fn() calls
         tool = await server.get_tool('merge_cancel')
 
-        result_mr = await _call_merge_request(
+        result_mr = await call_merge_request(
             server,
             task_id='c2',
             branch='c2',
@@ -1929,7 +1906,7 @@ class TestMergeCancel:
         # Acquire the tool up front — no awaited suspension until .fn() call
         tool = await server.get_tool('merge_cancel')
 
-        result_mr = await _call_merge_request(
+        result_mr = await call_merge_request(
             server,
             task_id='c3',
             branch='c3',
@@ -1993,7 +1970,7 @@ class TestMergeCancel:
         # Acquire the tool up front — no awaited suspension until .fn() call
         tool = await server.get_tool('merge_cancel')
 
-        result_mr = await _call_merge_request(
+        result_mr = await call_merge_request(
             server,
             task_id='c4',
             branch='c4',
@@ -2058,7 +2035,7 @@ class TestMergeCancel:
         )
 
         # No waiter registered for 'mr-finalized' (simulates finalized+popped)
-        result_finalized = await _call_merge_cancel(server, request_id='mr-finalized')
+        result_finalized = await call_merge_cancel(server, request_id='mr-finalized')
 
         assert result_finalized.get('cancelled') is False, (
             f"Expected cancelled=False for finalized id, got: {result_finalized}"
@@ -2071,7 +2048,7 @@ class TestMergeCancel:
         )
 
         # An id not in the event_store must still return 'unknown'
-        result_never = await _call_merge_cancel(server, request_id='mr-never')
+        result_never = await call_merge_cancel(server, request_id='mr-never')
         assert result_never.get('state') == 'unknown', (
             f"Expected state='unknown' for truly unknown id, got: {result_never}"
         )
@@ -2144,7 +2121,7 @@ class TestMergeCancel:
         )
 
         # Ring hit: returns state='done' from ring (not 'conflict' from event_store)
-        result_ring = await _call_merge_cancel(server, request_id='mr-ring-hit')
+        result_ring = await call_merge_cancel(server, request_id='mr-ring-hit')
         assert result_ring.get('cancelled') is False, (
             f"Expected cancelled=False for finalized ring-hit id, got: {result_ring}"
         )
@@ -2156,13 +2133,13 @@ class TestMergeCancel:
         )
 
         # Event-store only: ring misses, falls through to event_store
-        result_store = await _call_merge_cancel(server, request_id='mr-store-only')
+        result_store = await call_merge_cancel(server, request_id='mr-store-only')
         assert result_store.get('state') == 'conflict', (
             f"Expected state='conflict' from event_store (Tier 3), got: {result_store}"
         )
 
         # Truly unknown: both tiers miss
-        result_never = await _call_merge_cancel(server, request_id='mr-never')
+        result_never = await call_merge_cancel(server, request_id='mr-never')
         assert result_never.get('state') == 'unknown', (
             f"Expected state='unknown' when both durable tiers miss, got: {result_never}"
         )
@@ -2211,7 +2188,7 @@ class TestMergeCancelSlotRelease:
         )
 
         # First dispatch: acquires the registry slot for branch 're'
-        result1 = await _call_merge_request(
+        result1 = await call_merge_request(
             server,
             task_id='re',
             branch='re',
@@ -2222,7 +2199,7 @@ class TestMergeCancelSlotRelease:
         rid = result1['request_id']
 
         # Cancel the in-flight waiter
-        cancel_result = await _call_merge_cancel(server, request_id=rid)
+        cancel_result = await call_merge_cancel(server, request_id=rid)
         assert cancel_result.get('cancelled') is True, (
             f'merge_cancel must succeed: {cancel_result}'
         )
@@ -2232,7 +2209,7 @@ class TestMergeCancelSlotRelease:
             await asyncio.sleep(0)
 
         # Re-submit on the same branch — must dispatch fresh (not 'in_flight'/'attached')
-        result2 = await _call_merge_request(
+        result2 = await call_merge_request(
             server,
             task_id='re',
             branch='re',
@@ -2314,12 +2291,6 @@ def _build_merge_server(
     return server, mq, reg, event_store, harness
 
 
-async def _call_merge_status(server: Any, **kwargs: Any) -> dict[str, Any]:
-    """Invoke the merge_status MCP tool directly."""
-    tool = await server.get_tool('merge_status')
-    return await tool.fn(**kwargs)
-
-
 # ---------------------------------------------------------------------------
 # TestBoundaryTableMcpSurface — §8 rows 1-8 at the MCP/skill seam
 # ---------------------------------------------------------------------------
@@ -2330,8 +2301,8 @@ class TestBoundaryTableMcpSurface:
     """PRD §8 boundary-test table: scenarios 1-8 at the MCP/skill seam.
 
     Each method is one row, asserting the FULL postcondition.
-    Reuses _build_merge_server / _call_merge_request / _call_merge_status /
-    _call_merge_cancel helpers from pre-1.
+    Reuses _build_merge_server from pre-1 and the merge-tool wrappers from
+    _merge_tool_calls.
     """
 
     async def test_scenario_1_non_blocking_busy_queue(
@@ -2372,7 +2343,7 @@ class TestBoundaryTableMcpSurface:
         await mq.put(dummy_req)
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='Y',
                 branch='Y',
@@ -2419,7 +2390,7 @@ class TestBoundaryTableMcpSurface:
         server, mq, _, _, _ = _build_merge_server(tmp_path)
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='task-sc2',
                 branch='task-sc2',
@@ -2489,7 +2460,7 @@ class TestBoundaryTableMcpSurface:
         )
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server3,
                 task_id='sc3',
                 branch='sc3',
@@ -2540,7 +2511,7 @@ class TestBoundaryTableMcpSurface:
 
         # Submit to get a real request_id
         result_submit = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='sc4',
                 branch='sc4',
@@ -2560,7 +2531,7 @@ class TestBoundaryTableMcpSurface:
             'position': 0,
             'enqueued_at': time.time(),
         }])
-        status_queued = await _call_merge_status(server, request_id=rid)
+        status_queued = await call_merge_status(server, request_id=rid)
         assert status_queued['state'] == 'queued', (
             f"Expected 'queued' state, got: {status_queued}"
         )
@@ -2577,7 +2548,7 @@ class TestBoundaryTableMcpSurface:
             'position': 0,
             'enqueued_at': time.time(),
         }])
-        status_verifying = await _call_merge_status(server, request_id=rid)
+        status_verifying = await call_merge_status(server, request_id=rid)
         assert status_verifying['state'] == 'verifying', (
             f"Expected 'verifying' state, got: {status_verifying}"
         )
@@ -2592,7 +2563,7 @@ class TestBoundaryTableMcpSurface:
             merge_sha='abc123sc4',
         ))
 
-        status_done = await _call_merge_status(server, request_id=rid)
+        status_done = await call_merge_status(server, request_id=rid)
         assert status_done['state'] == 'done', (
             f"Expected 'done' from retention ring, got: {status_done}"
         )
@@ -2664,7 +2635,7 @@ class TestBoundaryTableMcpSurface:
         )
 
         # (a) Known request_id → should come from event store
-        status_known = await _call_merge_status(fresh_server, request_id=KNOWN_RID)
+        status_known = await call_merge_status(fresh_server, request_id=KNOWN_RID)
         assert status_known.get('state') == 'done', (
             f"Expected state='done' from event store after restart, got: {status_known}"
         )
@@ -2673,7 +2644,7 @@ class TestBoundaryTableMcpSurface:
         )
 
         # (b) Unknown id → {state:'unknown', hint:...}
-        status_unknown = await _call_merge_status(fresh_server, request_id='mr-doesnotexist')
+        status_unknown = await call_merge_status(fresh_server, request_id='mr-doesnotexist')
         assert status_unknown.get('state') == 'unknown', (
             f"Expected state='unknown' for unknown id, got: {status_unknown}"
         )
@@ -2699,7 +2670,7 @@ class TestBoundaryTableMcpSurface:
         es = EventStore(db_path=tmp_path / 'events-sc6.db', run_id='sc6')
         server, mq, _, _, _ = _build_merge_server(tmp_path, event_store=es)
 
-        result_mr = await _call_merge_request(
+        result_mr = await call_merge_request(
             server,
             task_id='sc6',
             branch='sc6',
@@ -2709,7 +2680,7 @@ class TestBoundaryTableMcpSurface:
         assert result_mr['status'] == 'queued', f"Unexpected status: {result_mr}"
         rid = result_mr['request_id']
 
-        result_cancel = await _call_merge_cancel(server, request_id=rid)
+        result_cancel = await call_merge_cancel(server, request_id=rid)
         assert result_cancel.get('cancelled') is True, (
             f"Expected cancelled=True, got: {result_cancel}"
         )
@@ -2725,14 +2696,14 @@ class TestBoundaryTableMcpSurface:
             await asyncio.sleep(0)
 
         # merge_status must report 'abandoned' from event store (Tier 3)
-        status = await _call_merge_status(server, request_id=rid)
+        status = await call_merge_status(server, request_id=rid)
         assert status.get('state') == 'abandoned', (
             f"Expected 'abandoned' from event store after cancel, got: {status}"
         )
 
         # Queue not halted: a second distinct branch can still be submitted and queued
         result2 = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='sc6-b',
                 branch='sc6-b',
@@ -2774,7 +2745,7 @@ class TestBoundaryTableMcpSurface:
         server, mq, _, _, _ = _build_merge_server(tmp_path, retention=retention)
 
         merge_task = asyncio.create_task(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='sc7',
                 branch='sc7',
@@ -2823,7 +2794,7 @@ class TestBoundaryTableMcpSurface:
         )
 
         # New session: merge_status must find 'done' from retention ring
-        status = await _call_merge_status(fresh_server, request_id=rid)
+        status = await call_merge_status(fresh_server, request_id=rid)
         assert status.get('state') == 'done', (
             f"Expected 'done' from retention ring in new session, got: {status}"
         )
@@ -2850,7 +2821,7 @@ class TestBoundaryTableMcpSurface:
 
         # First submit: acquires the registry slot for branch B
         result1 = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='sc8',
                 branch='sc8',
@@ -2865,7 +2836,7 @@ class TestBoundaryTableMcpSurface:
 
         # Second submit for same branch B: must return 'attached' with R1
         result2 = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='sc8',
                 branch='sc8',
@@ -2906,15 +2877,15 @@ class TestBoundaryTableMcpSurface:
 
         This is the runtime analogue of the §7.3 invariant — exercised end-to-end
         through the real MCP tool layer rather than via prose-pinning assertions.
-        Reuses _build_merge_server + _FakeMergeWorker + _call_merge_request +
-        _call_merge_status from pre-1.
+        Reuses _build_merge_server + _FakeMergeWorker from pre-1 and
+        call_merge_request / call_merge_status from _merge_tool_calls.
         """
         worker = _FakeMergeWorker()
         server, mq, _, _, _ = _build_merge_server(tmp_path, worker=worker)
 
         # (a) SUBMIT: non-blocking, must return promptly with 'queued' + valid R
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='sc14',
                 branch='sc14',
@@ -2944,7 +2915,7 @@ class TestBoundaryTableMcpSurface:
 
         # Poll by request_id
         status_by_rid = await asyncio.wait_for(
-            _call_merge_status(server, request_id=R),
+            call_merge_status(server, request_id=R),
             timeout=2.0,
         )
         assert status_by_rid.get('state') != 'unknown', (
@@ -2956,7 +2927,7 @@ class TestBoundaryTableMcpSurface:
 
         # Poll by branch
         status_by_branch = await asyncio.wait_for(
-            _call_merge_status(server, branch='sc14'),
+            call_merge_status(server, branch='sc14'),
             timeout=2.0,
         )
         assert status_by_branch.get('state') != 'unknown', (
@@ -3013,7 +2984,7 @@ class TestBoundaryTableMcpSurface:
         ))
 
         # Assert absorbed → state='superseded', outcome='superseded', superseded_by='mr-train'
-        status_absorbed = await _call_merge_status(server, request_id='mr-absorbed')
+        status_absorbed = await call_merge_status(server, request_id='mr-absorbed')
         assert status_absorbed.get('state') == 'superseded', (
             f"Expected state='superseded' for absorbed request, got: {status_absorbed}"
         )
@@ -3025,7 +2996,7 @@ class TestBoundaryTableMcpSurface:
         )
 
         # Assert train → state='done'
-        status_train = await _call_merge_status(server, request_id='mr-train')
+        status_train = await call_merge_status(server, request_id='mr-train')
         assert status_train.get('state') == 'done', (
             f"Expected state='done' for train request, got: {status_train}"
         )
@@ -3095,7 +3066,7 @@ class TestBoundaryTableMcpSurface:
         )
 
         # Assert absorbed request resolved from event store post-restart
-        status = await _call_merge_status(fresh_server, request_id=ABSORBED_RID)
+        status = await call_merge_status(fresh_server, request_id=ABSORBED_RID)
         assert status.get('state') == 'superseded', (
             f"Expected state='superseded' from event store after restart, got: {status}"
         )
@@ -3171,7 +3142,7 @@ class TestBoundaryTableMcpSurface:
         )
 
         # --- branch lookup ---
-        status_branch = await _call_merge_status(fresh_server, branch=ABSORBED_BRANCH)
+        status_branch = await call_merge_status(fresh_server, branch=ABSORBED_BRANCH)
         assert status_branch.get('state') == 'superseded', (
             f"branch lookup: expected state='superseded', got: {status_branch}"
         )
@@ -3183,7 +3154,7 @@ class TestBoundaryTableMcpSurface:
         )
 
         # --- task_id lookup ---
-        status_task = await _call_merge_status(fresh_server, task_id=ABSORBED_TASK)
+        status_task = await call_merge_status(fresh_server, task_id=ABSORBED_TASK)
         assert status_task.get('state') == 'superseded', (
             f"task_id lookup: expected state='superseded', got: {status_task}"
         )
@@ -3222,7 +3193,7 @@ class TestBoundaryTableMcpSurface:
         worker_task = asyncio.create_task(_worker())
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='sc-sup5',
                 branch='sc-sup5',
@@ -3297,7 +3268,7 @@ class TestMergeRequestSnapshotReconcile:
         )
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='B',
                 branch='B',
@@ -3365,7 +3336,7 @@ class TestMergeRequestSnapshotReconcile:
         )
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='B',
                 branch='B',
@@ -3493,7 +3464,7 @@ class TestMergeRequestTipRecency:
 
         # Submit merge_request for branch B (which will resolve tip=NEW_TIP)
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='task-new',
                 branch='B',
@@ -3611,7 +3582,7 @@ class TestMergeRequestDuplicateInVerify:
         )
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='task-new',
                 branch='B',
@@ -3682,7 +3653,7 @@ class TestMergeRequestRetentionParity:
         server, mq, _reg, _, _ = _build_merge_server(tmp_path, retention=ring)
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='ret-a',
                 branch='ret-a',
@@ -3742,7 +3713,7 @@ class TestMergeRequestRetentionParity:
         server, mq, _reg, _, _ = _build_merge_server(tmp_path, retention=ring)
 
         result1 = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='ret-b',
                 branch='ret-b',
@@ -3757,7 +3728,7 @@ class TestMergeRequestRetentionParity:
         primary_rid = result1['request_id']
 
         result2 = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='ret-b',
                 branch='ret-b',
@@ -3801,7 +3772,7 @@ class TestMergeRequestRetentionParity:
         # via the record_alias entry asserted above — to the primary's real
         # terminal outcome.
         status = await asyncio.wait_for(
-            _call_merge_status(server, request_id=coalesced_id), timeout=2.0,
+            call_merge_status(server, request_id=coalesced_id), timeout=2.0,
         )
         assert status.get('state') == 'done', (
             f'Expected merge_status(request_id={coalesced_id!r}) to resolve '
@@ -3825,7 +3796,7 @@ class TestMergeRequestRetentionParity:
         server, mq, _reg, _, _ = _build_merge_server(tmp_path, retention=ring)
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='ret-c',
                 branch='ret-c',
@@ -3842,7 +3813,7 @@ class TestMergeRequestRetentionParity:
         await asyncio.sleep(0)
 
         status = await asyncio.wait_for(
-            _call_merge_status(server, request_id=rid), timeout=2.0,
+            call_merge_status(server, request_id=rid), timeout=2.0,
         )
         assert status.get('state') == 'done', (
             "Expected merge_status to resolve 'done' from the retention "
@@ -3956,7 +3927,7 @@ class TestBoundary9CancelRetire:
 
         # (1) First submit dispatches fresh (worktree not on disk yet) and
         # acquires the 'b9' registry slot as rid_a.
-        result_a = await _call_merge_request(
+        result_a = await call_merge_request(
             server, task_id='b9', branch='b9',
             worktree=str(tmp_path / 'wt-a'), wait_secs=0,
         )
@@ -3978,7 +3949,7 @@ class TestBoundary9CancelRetire:
         ))
 
         # (3) Cancel rid_a — retirement must complete BEFORE the call returns.
-        cancel_result = await _call_merge_cancel(server, request_id=rid_a)
+        cancel_result = await call_merge_cancel(server, request_id=rid_a)
         assert cancel_result.get('cancelled') is True, f'cancel must succeed: {cancel_result}'
 
         # (i) slot released before return
@@ -3999,7 +3970,7 @@ class TestBoundary9CancelRetire:
         worker.set_entries([])
 
         # (4) IMMEDIATE resubmit — must dispatch a FRESH entry, not coalesce/attach.
-        result_b = await _call_merge_request(
+        result_b = await call_merge_request(
             server, task_id='b9', branch='b9',
             worktree=str(tmp_path / 'wt-b'), wait_secs=0,
         )
@@ -4030,8 +4001,9 @@ class _ExplodingMetadata:
     Models a malformed task record reaching the degeneracy probe: the server
     reads ``task.get('metadata') or {}``, which passes any truthy non-dict
     straight through to ``branch_is_degenerate``, where ``.get`` blows up
-    INSIDE the probe rather than inside ``_git_authority_task_metadata``'s
-    own handler.  That is the only way to reach merge_request's outer
+    INSIDE the probe rather than inside
+    ``escalation/src/escalation/git_authority.py::task_metadata``'s own
+    handler.  That is the only way to reach merge_request's outer
     fast-path ``except`` — see
     ``test_probe_fault_inside_the_guard_preserves_the_fast_path``.
     """
@@ -4146,7 +4118,7 @@ async def _run_fast_path_probe(
     worker_task = asyncio.create_task(_worker())
     try:
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id=task_id,
                 branch=branch,
@@ -4334,7 +4306,8 @@ class TestMergeRequestDegenerateBranchFastPath:
 
         NOTE this does NOT reach merge_request's own fast-path ``except``: the
         RuntimeError is swallowed one level deeper, inside
-        ``_git_authority_task_metadata``'s handler, which returns ``{}`` — so
+        ``escalation/src/escalation/git_authority.py::task_metadata``'s
+        handler, which returns an empty ``metadata`` — so
         the probe then runs normally and reads "no degeneracy signal".  The
         outer handler is covered by
         ``test_probe_fault_inside_the_guard_preserves_the_fast_path`` below.
@@ -4360,7 +4333,8 @@ class TestMergeRequestDegenerateBranchFastPath:
         malformed metadata record is the reachable way to trigger it: the
         server passes any truthy ``task['metadata']`` through verbatim, so a
         non-dict raises on ``.get`` inside the probe, PAST
-        ``_git_authority_task_metadata``'s own handler.
+        ``escalation/src/escalation/git_authority.py::task_metadata``'s own
+        handler.
 
         Fail-soft direction: the fault degrades the guard (treat as
         non-degenerate) and the legacy fast path answers, rather than the
@@ -4424,24 +4398,38 @@ class TestMergeRequestDegenerateBranchFastPath:
     async def test_guard_probes_at_most_once_across_both_arms(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The probe is memoized, and is not paid when no arm hits.
+        """The task-metadata read is paid at most once, and the arms share it.
 
-        The guard's only power is to SUPPRESS an already_merged return, so it
-        runs after an arm tests positive — never on the common
-        not-yet-merged submission, where it would add a scheduler round-trip
-        (a Taskmaster MCP dispatch with an internal timeout=15) to the submit
-        path for no possible effect.  When an arm does hit, the two arms share
-        one lookup.
+        Task 4888 superseded the zero-read half of this contract, deliberately
+        and by its design decision 5: honouring ``metadata.merge_lane``
+        requires reading the metadata, so a submission that supplies no
+        explicit ``lane`` now pays exactly one memoized
+        ``scheduler.get_task``.  The superseded assertion rested on the
+        premise that the read could have no possible effect on a plain
+        not-yet-merged submission — true while the PROBE was its only
+        consumer, false now that the same read also resolves the lane.
+
+        The two consumers stay individually attributable.  With neither arm
+        hitting, the guard's ``_declined()`` is never awaited, so the single
+        recorded lookup can only be the lane fallback's.  With an arm hitting,
+        both consumers want the metadata and the memo is the whole reason the
+        count is one rather than two.  The remaining cell — an explicit
+        ``lane=`` skipping the fallback, so nothing reads at all — is pinned
+        in scope by ``escalation/tests/test_merge_request_lane.py``
+        ``::TestMetadataReadIsPaidAtMostOnce``
+        ``::test_explicit_lane_pays_no_metadata_read_at_all``.
         """
-        # Neither arm hits → the probe must not run at all.
-        quiet: list[str] = []
+        # Neither arm hits → the probe stays off, and the lane fallback pays
+        # the one read on its own.
+        lane_only: list[str] = []
         await _run_fast_path_probe(
             tmp_path, monkeypatch, is_ancestor_result=False, patch_contained=False,
-            metadata={'branch_base_sha': 'b' * 40}, requested_ids=quiet,
+            metadata={'branch_base_sha': 'b' * 40}, requested_ids=lane_only,
         )
-        assert quiet == [], (
-            f'A plain not-yet-merged submission must not consult the task '
-            f'store at all, got: {quiet}'
+        assert lane_only == ['591'], (
+            f'A plain not-yet-merged submission must consult the task store '
+            f'exactly once — the lane fallback, not the suppressed probe — '
+            f'got: {lane_only}'
         )
 
         # The patch-id arm hits (is_ancestor misses first) → exactly one lookup.
@@ -4603,23 +4591,30 @@ class TestHonestResponseContract:
 
         assert result.get('level') == 2, f"No persisted level echoed: {result}"
 
-    # -- Fail-open: a bookkeeping read must never lose a filing -------------
+    # -- A bookkeeping read must never lose a filing, nor confirm one ------
 
     @pytest.mark.asyncio
-    async def test_unreadable_reread_falls_back_to_queued(self, tmp_path: Path):
-        """A re-read returning None falls back to 'queued' rather than raising."""
+    async def test_absent_reread_reports_unpersisted(self, tmp_path: Path):
+        """A re-read returning None reports 'accepted_unpersisted', not 'queued'.
+
+        The filing is never lost — the id still comes back — but an
+        unconfirmed write is no longer reported in the words that mean a
+        confirmed one (task 5368).
+        """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
         queue.get = lambda escalation_id: None  # type: ignore[method-assign]
 
         result = await _blocker(server, **_COMMON_KWARGS)
 
-        assert result['status'] == 'queued', f'Expected fail-open queued, got: {result}'
+        assert result['status'] == 'accepted_unpersisted', (
+            f'Expected accepted_unpersisted, got: {result}'
+        )
         assert 'id' in result
 
     @pytest.mark.asyncio
-    async def test_raising_reread_falls_back_to_queued(self, tmp_path: Path):
-        """A re-read that RAISES falls back to 'queued' and does not propagate."""
+    async def test_raising_reread_reports_unpersisted(self, tmp_path: Path):
+        """A re-read that RAISES reports 'accepted_unpersisted' and does not propagate."""
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
@@ -4630,5 +4625,149 @@ class TestHonestResponseContract:
 
         result = await _blocker(server, **_COMMON_KWARGS)
 
-        assert result['status'] == 'queued', f'Expected fail-open queued, got: {result}'
+        assert result['status'] == 'accepted_unpersisted', (
+            f'Expected accepted_unpersisted, got: {result}'
+        )
         assert 'id' in result
+
+
+# ---------------------------------------------------------------------------
+# Task 5368 (S8-25): an unknown queue position is reported as unknown
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPositionIsNoneWhenTheSnapshotIsUnavailable:
+    """`_nonblocking_state_response` must not fabricate a position.
+
+    Three of its four branches set `position` from something real — the index
+    the request_id was found at, or `max(0, queue_depth - 1)` for a request
+    that was just enqueued.  The fourth, where `worker.snapshot()` raises,
+    returned the `0` initialiser: the single most misleading value in the
+    range, since it is indistinguishable from a genuine front-of-queue and is
+    what an operator reads as "next to merge".
+    """
+
+    @staticmethod
+    def _raising_worker_harness():
+        def _boom():
+            raise RuntimeError('simulated merge-worker snapshot failure')
+
+        return types.SimpleNamespace(
+            _merge_worker=types.SimpleNamespace(snapshot=_boom),
+            git_ops=None,  # skip already_merged fast-path and worktree scan
+        )
+
+    @staticmethod
+    async def _submit(server, tmp_path: Path, *, branch: str = 'snap-fail'):
+        return await asyncio.wait_for(
+            call_merge_request(
+                server,
+                task_id=branch,
+                branch=branch,
+                worktree=str(tmp_path / f'wt-{branch}'),
+                wait_secs=0,
+            ),
+            timeout=3.0,
+        )
+
+    async def test_raising_snapshot_reports_position_none(self, tmp_path: Path):
+        """(a) A snapshot that raises yields position=None, never 0."""
+        mq: asyncio.Queue = asyncio.Queue()
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            merge_queue=mq,
+            orch_config=_make_orch_config(tmp_path / 'repo'),
+            merge_inflight_registry=_make_registry(),
+            harness=self._raising_worker_harness(),
+        )
+
+        result = await self._submit(server, tmp_path)
+
+        assert result['position'] is None, (
+            'A position nobody computed must be reported as unknown, not as '
+            f'front-of-queue: {result}'
+        )
+
+    async def test_rest_of_the_shape_survives_a_raising_snapshot(self, tmp_path: Path):
+        """(b) Only `position` degrades — every other key is present and real.
+
+        `queue_depth` in particular still reports the bare `merge_queue.qsize()`
+        initialiser, which is a genuine measurement the snapshot failure does
+        not invalidate.  `position` must stay PRESENT so a caller keying on it
+        reads "unknown" rather than hitting a KeyError.
+        """
+        mq: asyncio.Queue = asyncio.Queue()
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            merge_queue=mq,
+            orch_config=_make_orch_config(tmp_path / 'repo'),
+            merge_inflight_registry=_make_registry(),
+            harness=self._raising_worker_harness(),
+        )
+
+        result = await self._submit(server, tmp_path)
+
+        for key in ('request_id', 'snapshot_tip', 'generation', 'position',
+                    'queue_depth', 'eta_seconds'):
+            assert key in result, f'Missing key {key!r}: {result}'
+        assert result['status'] == 'queued', f'Unexpected status: {result}'
+        assert result['request_id'].startswith('mr-'), f'Malformed request_id: {result}'
+        assert result['generation'] == 0, f'Unexpected generation: {result}'
+        assert result['queue_depth'] >= 1, (
+            f'queue_depth is a real measurement and must survive: {result}'
+        )
+
+    async def test_raising_snapshot_is_logged_not_swallowed(self, tmp_path: Path, caplog):
+        """(c) The failure is visible: a WARNING naming the request_id.
+
+        `except Exception: pass` left an operator with no way to learn the
+        live worker was unreachable.
+        """
+        mq: asyncio.Queue = asyncio.Queue()
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            merge_queue=mq,
+            orch_config=_make_orch_config(tmp_path / 'repo'),
+            merge_inflight_registry=_make_registry(),
+            harness=self._raising_worker_harness(),
+        )
+
+        with caplog.at_level(logging.WARNING, logger='escalation.server'):
+            result = await self._submit(server, tmp_path)
+
+        matching = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and result['request_id'] in r.getMessage()
+        ]
+        assert matching, (
+            f"Expected a WARNING naming request_id {result['request_id']!r}; got: "
+            f'{[(r.levelname, r.getMessage()) for r in caplog.records]}'
+        )
+
+    async def test_succeeding_snapshot_still_reports_an_int(self, tmp_path: Path):
+        """(d) The None is confined to the failure branch.
+
+        A live worker whose snapshot works keeps returning an int, so this
+        change cannot be mistaken for "position is now optional everywhere".
+        """
+        mq: asyncio.Queue = asyncio.Queue()
+        healthy_harness = types.SimpleNamespace(
+            _merge_worker=types.SimpleNamespace(
+                snapshot=lambda: {'entries': [], 'depth': 1, 'head_of_line': None},
+            ),
+            git_ops=None,
+        )
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            merge_queue=mq,
+            orch_config=_make_orch_config(tmp_path / 'repo'),
+            merge_inflight_registry=_make_registry(),
+            harness=healthy_harness,
+        )
+
+        result = await self._submit(server, tmp_path, branch='snap-ok')
+
+        assert isinstance(result['position'], int), (
+            f"Expected an int position from a healthy snapshot, got: {result}"
+        )

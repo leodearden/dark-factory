@@ -30,7 +30,14 @@ from _orch_helpers import make_placeholder_future
 from test_verify_merge_flake_suppression import _module_config
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
-from orchestrator.merge_queue import GroupMergeRequest, MergeRequest
+from orchestrator.event_store import EventStore
+from orchestrator.merge_lane import MergeOutcome
+from orchestrator.merge_lane.worker import enqueue_merge_request, select_recovery_winner
+from orchestrator.merge_queue import (
+    GroupMergeRequest,
+    MergeRequest,
+    patch_content_contained,
+)
 
 # Import the module under test — will fail (ImportError) until step-2 creates it.
 from orchestrator.merge_queue_store import (
@@ -465,6 +472,8 @@ class TestRecoverPendingMerges:
             event_store=None,
             main_branch=main_branch,
             branch_prefix=branch_prefix,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         # --- queue assertions ---
@@ -511,6 +520,7 @@ class TestRecoverPendingMergesRegistryDedup:
         full_branch: str,
         branch_sha: str = 'sha-live',
         ancestor_pairs: set[tuple[str, str]] | None = None,
+        project_root: Path | None = None,
     ) -> MagicMock:
         """Fake git_ops for the dedup tests.
 
@@ -520,6 +530,10 @@ class TestRecoverPendingMergesRegistryDedup:
           survival check ``is_ancestor(full_branch, 'main')`` is therefore False
           (branch not yet landed) unless that pair is explicitly supplied, and
           the Phase-2 tip classification is driven by the snapshot-tip pairs.
+        * ``project_root`` is the cwd the REAL
+          ``merge_queue.patch_content_contained`` runs ``git cherry`` in.  Point
+          it at a NON-git directory to exercise that helper's documented
+          fail-open clause (``rc != 0`` → False) without patching it.
         """
         pairs = ancestor_pairs if ancestor_pairs is not None else set()
 
@@ -532,6 +546,8 @@ class TestRecoverPendingMergesRegistryDedup:
         git_ops = MagicMock()
         git_ops.resolve_branch_sha = fake_resolve
         git_ops.is_ancestor = fake_is_ancestor
+        if project_root is not None:
+            git_ops.project_root = project_root
         return git_ops
 
     async def test_same_sha_coalesces_to_one_with_peer_mirror(
@@ -556,6 +572,8 @@ class TestRecoverPendingMergesRegistryDedup:
         report = await recover_pending_merges(
             store, queue, git_ops, config, event_store=None,
             main_branch='main', branch_prefix='task/', registry=registry,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         # Exactly ONE enqueued winner; the duplicate coalesced.
@@ -596,6 +614,43 @@ class TestRecoverPendingMergesRegistryDedup:
         assert req2.request_id not in remaining_ids, 'loser must be store.remove()d'
         assert req1.request_id in remaining_ids, 'winner stays journaled'
 
+    async def test_attached_loser_resolves_to_the_winner_after_restart(
+        self, tmp_path: Path
+    ) -> None:
+        """The recovery loser never gets a merge_finalized row of its own, so the
+        winner's row lists it and a fresh run still resolves it (task 4830,
+        PRD plans/merge-status-durable-non-landed-prd.md boundary row B7)."""
+        config = _real_config(tmp_path)
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        store = MergeQueueStore(tmp_path / 'merge_queue.json')
+
+        req1 = _make_req('5326', '5326', wt, config, snapshot_tip='sha-same')
+        req2 = _make_req('5326', '5326', wt, config, snapshot_tip='sha-same')
+        store.record(req1)
+        store.record(req2)
+
+        report = await recover_pending_merges(
+            store, asyncio.Queue(), self._make_git_ops(full_branch='task/5326'),
+            config, event_store=EventStore(tmp_path / 'runs.db', 'run-1'),
+            main_branch='main', branch_prefix='task/',
+            registry=InFlightMergeRegistry(),
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
+        )
+        assert report['coalesced'] == 1
+
+        report['requests'][0].result.set_result(MergeOutcome('blocked', reason='r'))
+        await asyncio.sleep(0)
+
+        row = EventStore(tmp_path / 'runs.db', 'run-2').merge_finalized_absorbing(
+            req2.request_id, cross_run=True,
+        )
+        assert row is not None
+        assert (row['request_id'], row['state'], row['is_current_run']) == (
+            req1.request_id, 'blocked', False,
+        )
+
     async def test_descendant_wins_ancestor_first(self, tmp_path: Path) -> None:
         """Journal order [ancestor, descendant] → the DESCENDANT is enqueued (REPLACE)."""
         config = _real_config(tmp_path)
@@ -617,6 +672,8 @@ class TestRecoverPendingMergesRegistryDedup:
         report = await recover_pending_merges(
             store, queue, git_ops, config, event_store=None,
             main_branch='main', branch_prefix='task/', registry=registry,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         assert queue.qsize() == 1
@@ -648,6 +705,8 @@ class TestRecoverPendingMergesRegistryDedup:
         report = await recover_pending_merges(
             store, queue, git_ops, config, event_store=None,
             main_branch='main', branch_prefix='task/', registry=registry,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         assert queue.qsize() == 1
@@ -658,7 +717,7 @@ class TestRecoverPendingMergesRegistryDedup:
         )
 
     async def test_divergence_replaces_and_warns(
-        self, tmp_path: Path, caplog, monkeypatch
+        self, tmp_path: Path, caplog
     ) -> None:
         """Divergent pair (is_ancestor False both ways) + patch NOT contained →
         resolve_divergent SUPERSET → REPLACE to the later record + a D2 WARNING
@@ -673,21 +732,33 @@ class TestRecoverPendingMergesRegistryDedup:
         store.record(req_x)
         store.record(req_y)
 
-        async def _pcc(head: str, upstream: str, git_ops: object) -> bool:
-            return False
-
-        monkeypatch.setattr(
-            'orchestrator.merge_queue.patch_content_contained', _pcc,
-        )
+        # No patch of patch_content_contained: a non-git project_root makes the
+        # REAL helper take its documented fail-open branch (``git cherry``
+        # rc != 0 → False), which is exactly the "patch NOT contained" input
+        # this test needs.
+        not_a_repo = tmp_path / 'not-a-git-repo'
+        not_a_repo.mkdir()
 
         registry = InFlightMergeRegistry()
-        git_ops = self._make_git_ops(full_branch='task/5326')  # DIVERGENT
+        git_ops = self._make_git_ops(  # DIVERGENT
+            full_branch='task/5326', project_root=not_a_repo,
+        )
+        # The fail-open branch is the INPUT this test classifies on, and it is
+        # environmental (it needs `git cherry` to find no repo above
+        # *not_a_repo*).  Assert it up front so a TMPDIR inside a git checkout
+        # fails here, naming the cause, instead of surfacing as a confusing
+        # SUPERSET/SUBSET mismatch further down.
+        assert await patch_content_contained('Y', 'X', git_ops) is False, (
+            'fail-open precondition not met — is TMPDIR inside a git repo?'
+        )
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
 
         with caplog.at_level(logging.WARNING):
             report = await recover_pending_merges(
                 store, queue, git_ops, config, event_store=None,
                 main_branch='main', branch_prefix='task/', registry=registry,
+                enqueue_merge_request=enqueue_merge_request,
+                select_recovery_winner=select_recovery_winner,
             )
 
         assert queue.qsize() == 1
@@ -729,6 +800,8 @@ class TestRecoverPendingMergesRegistryDedup:
         report = await recover_pending_merges(
             store, queue, git_ops, config, event_store=None,
             main_branch='main', branch_prefix='task/',
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         assert queue.qsize() == 2, (
@@ -782,6 +855,8 @@ class TestRecoverPendingMergesRegistryDedup:
             store, queue, git_ops, config, event_store=None,
             main_branch='main', branch_prefix='task/',
             registry=registry, retention=_FakeRetention(),
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         # Nothing enqueued — both recovered records coalesced onto the entry.
@@ -936,6 +1011,8 @@ class TestRecoverPendingMergesCorruptSignal:
                 event_store=None,
                 main_branch='main',
                 branch_prefix='task/',
+                enqueue_merge_request=enqueue_merge_request,
+                select_recovery_winner=select_recovery_winner,
             )
 
         assert report.get('journal_corrupt') is True, (
@@ -972,6 +1049,8 @@ class TestRecoverPendingMergesCorruptSignal:
                 event_store=None,
                 main_branch='main',
                 branch_prefix='task/',
+                enqueue_merge_request=enqueue_merge_request,
+                select_recovery_winner=select_recovery_winner,
             )
 
         assert report.get('journal_corrupt') is False, (
@@ -1134,6 +1213,8 @@ class TestRecoverPendingMergesPrefixedBranch:
             event_store=None,
             main_branch=main_branch,
             branch_prefix=branch_prefix,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         # --- live branch: re-enqueued, NOT dropped ---
@@ -1227,6 +1308,8 @@ class TestRecoverPendingMergesPrefixedBranch:
             event_store=None,
             main_branch=main_branch,
             branch_prefix=branch_prefix,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         assert report['recovered'] == 1, f'Expected 1 recovered; got {report}'
@@ -1342,6 +1425,8 @@ class TestRecoverPendingMergesTypedBranch:
             event_store=None,
             main_branch=main_branch,
             branch_prefix=branch_prefix,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         assert report['recovered'] == 1, f'Expected 1 recovered; got {report}'
@@ -1378,6 +1463,18 @@ class TestDelegatesToSharedAtomicWriter:
     """
 
     @staticmethod
+    def _a_request(tmp_path: Path) -> MergeRequest:
+        """Any journalable request — the PUBLIC entry point to ``_save_raw``.
+
+        ``record`` is the only public writer (``merge_queue_store.py::
+        MergeQueueStore.record``); its payload is irrelevant here, the
+        delegation contract is what this class pins.
+        """
+        wt = tmp_path / 'wt'
+        wt.mkdir(exist_ok=True)
+        return _make_req('t1', 't1', wt, _real_config(tmp_path))
+
+    @staticmethod
     def _recorder(monkeypatch):
         import shared.safe_io as _safe_io
 
@@ -1403,8 +1500,8 @@ class TestDelegatesToSharedAtomicWriter:
     def test_delegates_with_preserved_semantics(self, tmp_path: Path, monkeypatch) -> None:
         calls = self._recorder(monkeypatch)
         store = MergeQueueStore(tmp_path / 'data' / 'merge_queue.json')
-        store.remove('nope')  # no-op; drive _save_raw directly instead
-        store._save_raw({})
+        store.remove('nope')  # genuinely a no-op: absent id never reaches the writer
+        store.record(self._a_request(tmp_path))
 
         assert len(calls) == 1, f'expected exactly one delegated call, got {calls}'
         self._assert_common(calls[0][2])
@@ -1413,7 +1510,7 @@ class TestDelegatesToSharedAtomicWriter:
         reference = tmp_path / 'reference.json'
         reference.write_text('ref', encoding='utf-8')
         path = tmp_path / 'merge_queue.json'
-        MergeQueueStore(path)._save_raw({})
+        MergeQueueStore(path).record(self._a_request(tmp_path))
         assert path.stat().st_mode & 0o777 == reference.stat().st_mode & 0o777
 
     def test_oserror_still_swallowed_with_warning(self, tmp_path: Path, monkeypatch, caplog) -> None:
@@ -1429,7 +1526,7 @@ class TestDelegatesToSharedAtomicWriter:
         store = MergeQueueStore(tmp_path / 'merge_queue.json')
 
         with caplog.at_level(logging.WARNING):
-            store._save_raw({})  # must NOT raise
+            store.record(self._a_request(tmp_path))  # must NOT raise
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1, f'expected one WARNING, got {caplog.records}'

@@ -323,6 +323,184 @@ class TestPytestTable:
         assert _classify(ToolKind.PYTEST, output, 4, False) == FailureCategory.UNKNOWN_TEST_FAILURE
 
 
+#: pytest's argparse rejection, captured VERBATIM from the real binary in this
+#: worktree (rc=4) by rendering the merge gate's own spliced re-run command::
+#:
+#:     pytest -p no:xdist -o addopts= --timeout --junitxml /tmp/j.xml 300 <node>
+#:
+#: Not a hypothetical shape: this is what 350 merge-gate isolated re-runs
+#: actually produced between 2026-08-30 and 2026-09-17 (task 5580).
+PYTEST_USAGE_ERROR_OUTPUT = (
+    'ERROR: usage: pytest [options] [file_or_dir] [file_or_dir] [...]\n'
+    'pytest: error: argument --timeout: expected one argument\n'
+    '  inifile: /home/leo/src/dark-factory/orchestrator/pyproject.toml\n'
+    '  rootdir: /home/leo/src/dark-factory/orchestrator\n'
+)
+
+# The SAME rejection from the same binary launched as a module — measured from
+# `python -m pytest --timeout --junitxml /tmp/j.xml 300` in this worktree
+# (rc=4). The two argparse lines are verbatim; the trailing inifile/rootdir
+# paths are normalized to match the sample above, which is the only difference.
+# argparse renders `basename(sys.argv[0])`, so the program name is a fact about
+# the launch, not about the error.
+_PYTEST_USAGE_ERROR_MODULE_LAUNCH_OUTPUT = (
+    'ERROR: usage: __main__.py [options] [file_or_dir] [file_or_dir] [...]\n'
+    '__main__.py: error: argument --timeout: expected one argument\n'
+    '  inifile: /home/leo/src/dark-factory/orchestrator/pyproject.toml\n'
+    '  rootdir: /home/leo/src/dark-factory/orchestrator\n'
+)
+
+
+def _captured_stdout_section(printed: str) -> str:
+    """A pytest report whose captured-stdout section carries *printed*.
+
+    pytest renders `--- Captured stdout call ---` and the captured bytes
+    themselves at COLUMN 0, unindented — which is why a line anchor alone is
+    not the whole false-positive margin.
+    """
+    return (
+        '=================================== FAILURES ===================================\n'
+        '__________________________________ test_forge __________________________________\n'
+        'E   assert False\n'
+        '----------------------------- Captured stdout call -----------------------------\n'
+        f'{printed}'
+        '=========================== short test summary info ============================\n'
+    )
+
+
+class TestPytestUsageError:
+    """pytest REJECTING our argv is its own category, not an unknown failure.
+
+    The distinction is the difference between "the suite ran and we could not
+    read the result" and "the suite never ran at all". Today the second one
+    wears the first one's label: a usage error matches no pattern and falls
+    through to ``unknown_test_failure``, which the isolated-rerun path then
+    reads as a real red.
+
+    The table already carries the exact analogue on the other side —
+    ``CARGO_CLI_ERROR`` means "cargo rejected the CLI invocation" — so the
+    pytest row is a missing member of an existing concept, not a new one.
+    """
+
+    def test_argparse_rejection_classifies_as_pytest_usage_error(self):
+        assert (
+            _classify(ToolKind.PYTEST, PYTEST_USAGE_ERROR_OUTPUT, 4, False)
+            == FailureCategory.PYTEST_USAGE_ERROR
+        )
+
+    def test_the_marker_must_start_a_line(self):
+        """The line anchor, the first of the three parts of the margin.
+
+        pytest writes the marker at column 0 before any test output, but a
+        FAILING TEST that merely quotes the text has it rendered indented
+        behind assertion-diff framing. Without the anchor such a test could
+        forge the category by printing, and the discriminator would stop
+        believing a genuine red — the one failure direction its doctrine
+        forbids.
+
+        The anchor alone is NOT the whole margin, because pytest's own
+        captured-output sections are unindented — see the two tests below for
+        the parts that cover that.
+        """
+        quoted = ''.join(
+            f'E   {line}\n' for line in PYTEST_USAGE_ERROR_OUTPUT.splitlines()
+        )
+        assert (
+            _classify(ToolKind.PYTEST, quoted, 1, False)
+            != FailureCategory.PYTEST_USAGE_ERROR
+        )
+
+    def test_the_program_name_is_not_pinned(self):
+        """`python -m pytest` renders a different prog and the SAME error.
+
+        argparse's prog is `basename(sys.argv[0])`, so pinning `pytest` would
+        have left any target project whose module test_command is
+        `python -m pytest` recording a rejected argv as a real red — this
+        task's own defect, silently un-closed for that project.
+        """
+        assert (
+            _classify(ToolKind.PYTEST, _PYTEST_USAGE_ERROR_MODULE_LAUNCH_OUTPUT, 4, False)
+            == FailureCategory.PYTEST_USAGE_ERROR
+        )
+
+    def test_a_printed_marker_line_alone_is_not_a_rejection(self):
+        """Part two of the margin: argparse's `<prog>: error:` continuation.
+
+        A captured-stdout section is rendered at column 0, so a test that
+        prints the usage line clears the line anchor. It does not clear the
+        adjacency requirement, which the real rejection meets on every
+        measured sample.
+        """
+        output = _captured_stdout_section(
+            'ERROR: usage: pytest [options] [file_or_dir] [file_or_dir] [...]\n'
+        )
+        assert (
+            _classify(ToolKind.PYTEST, output, 1, False)
+            != FailureCategory.PYTEST_USAGE_ERROR
+        )
+
+    def test_a_printed_rejection_beside_real_failures_stays_a_red(self):
+        """Part three: the arm is consulted AFTER the FAILED arms.
+
+        A test that prints the whole two-line rejection verbatim clears both
+        the anchor and the adjacency requirement — but a genuine rejection
+        never ran a test, so it never carries a FAILED line, and an output
+        that has one is a red that merely quotes the text. Ordering decides
+        it, and it stays a red.
+
+        The residual is stated rather than hidden: an output with no FAILED
+        line at all (a collection ERROR leg that prints the two lines) can
+        still forge the category. That direction is honest — the verdict
+        becomes `unconfirmable`, which suppresses nothing — whereas letting a
+        forgery outrank a real FAILED line would stop the discriminator
+        believing a genuine red.
+        """
+        output = _captured_stdout_section(PYTEST_USAGE_ERROR_OUTPUT) + (
+            'FAILED tests/test_forge.py::test_forge - assert False\n'
+        )
+        assert _classify(ToolKind.PYTEST, output, 1, False) == FailureCategory.TEST_FAILURE
+
+    def test_an_ordinary_pytest_failure_is_untouched(self):
+        """The new pattern must not shadow the table it joins."""
+        output = 'FAILED tests/test_foo.py::test_bar - AssertionError\n'
+        assert _classify(ToolKind.PYTEST, output, 1, False) == FailureCategory.TEST_FAILURE
+
+    def test_file_not_found_is_not_a_usage_error(self):
+        """A deliberate scope boundary, not an oversight.
+
+        pytest's other rc=4 shape is branch-reachable in the ordinary way — a
+        diff that deletes or renames a test file produces it legitimately — so
+        reading it as "we could not re-run" would suppress a real red.
+        """
+        output = 'ERROR: file or directory not found: tests/test_gone.py\n'
+        assert (
+            _classify(ToolKind.PYTEST, output, 4, False)
+            == FailureCategory.UNKNOWN_TEST_FAILURE
+        )
+
+    def test_xdist_absence_usage_error_keeps_its_env_transient_verdict(self):
+        """A usage error caused by the xdist plugin vanishing is a HOST
+
+        condition, and ``_classify_pytest`` consults the env-transient
+        patterns first. The new arm must not take that case over: it retries,
+        and the new one deliberately does not.
+        """
+        assert (
+            _classify(ToolKind.PYTEST, _XDIST_USAGE_ERROR_OUTPUT, 4, False)
+            == FailureCategory.ENV_TRANSIENT
+        )
+
+    @pytest.mark.parametrize(
+        'tool', [ToolKind.CARGO_TEST, ToolKind.CARGO_CLIPPY, ToolKind.NPX, ToolKind.OPAQUE],
+    )
+    def test_only_the_pytest_table_carries_it(self, tool):
+        """Invariant C1: a tool-T pattern lives ONLY in tool-T's table."""
+        assert (
+            _classify(tool, PYTEST_USAGE_ERROR_OUTPUT, 4, False)
+            != FailureCategory.PYTEST_USAGE_ERROR
+        )
+
+
 class TestEnvTransientIsPytestScopedC1:
     """CRITICAL C1: env_transient is consulted ONLY under ToolKind.PYTEST —
     the structural win of per-tool dispatch. A pip/xdist-absence signature

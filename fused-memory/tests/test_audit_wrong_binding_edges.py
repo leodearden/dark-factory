@@ -16,14 +16,13 @@ mechanically (:class:`TestNoSecondVocabulary`), not merely by convention.
 from __future__ import annotations
 
 import ast
-import importlib.util
 import json
 import re
-import types
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _fm_helpers import load_script_module
 
 from fused_memory.backends.graphiti_client import PagedRead
 from fused_memory.utils.canonical_labels import Referent
@@ -31,30 +30,7 @@ from fused_memory.utils.canonical_labels import Referent
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_wrong_binding_edges.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load audit_wrong_binding_edges.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    import sys  # noqa: PLC0415
-
-    mod_name = 'audit_wrong_binding_edges'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='audit_wrong_binding_edges')
 fact_referents = _mod.fact_referents
 endpoint_referent = _mod.endpoint_referent
 bare_id_present = _mod.bare_id_present

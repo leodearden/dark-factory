@@ -22,13 +22,14 @@ import subprocess
 import sys
 import threading
 import time
+from collections import Counter
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-import pytest  # pyright: ignore[reportMissingImports]
+import pytest
 
 from orchestrator import session_registry as sr
 
@@ -84,6 +85,12 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
 # established by orchestrator.harness._pid_alive's own test suite: 2**31 - 1,
 # orchestrator/tests/test_reconcile_stranded.py:34).
 _DEAD_PID = 2**31 - 1
+
+# A pid that is not merely dead but UNREPRESENTABLE: larger than the platform's
+# C pid_t, so os.kill cannot even be asked about it. Sibling of _DEAD_PID and a
+# genuinely different class of input -- _DEAD_PID exercises the
+# ProcessLookupError branch, this one the OverflowError that branch never sees.
+_UNREPRESENTABLE_PID = 2**70
 
 _NOW = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC)
 
@@ -389,9 +396,50 @@ def _make_decision(**overrides: object) -> sr.DecisionRecord:
         'manual_boost': 2,
         'state': 'answered',
         'severity': 'critical',
+        'record_slug': 'unblock-df-2085-uuid',
     }
     fields.update(overrides)
     return sr.DecisionRecord(**fields)
+
+
+def _identity_of(record: sr.DecisionRecord) -> dict[str, str]:
+    """close_decision_with_evidence's compare-and-swap expectations for *record*, as it was filed."""
+    return {'expected_project': record.project, 'expected_escalations_dir': record.escalations_dir}
+
+
+def _qid(local_id: str, project: str = 'df') -> str:
+    """The stored id write-decision files a CLI ``--id`` under (task 4835)."""
+    return sr.qualify_decision_id(project, local_id)
+
+
+def _names_the_destination_token(message: str) -> bool:
+    """True when *message* names ``solar_challenge`` as a token in its OWN
+    right -- not merely as the tail of ``my_solar_challenge``.
+
+    Exists because the obvious spelling of that assertion is VACUOUS:
+    ``'solar_challenge' in msg`` is implied by ``'my_solar_challenge' in
+    msg``, so a regression that dropped the destination token entirely --
+    leaving the operator exactly where the silent zero-row no-op did --
+    passes it. The word-boundary lookaround is what makes the check
+    discriminating; a bare substring test is not.
+
+    Deliberately boundary-based rather than quote-based (``"'solar_challenge'"``
+    would also work today) so it survives a message that renders the token
+    without ``!r`` quoting -- it pins the CLAIM, not the formatting.
+    """
+    return re.search(r'(?<!\w)solar_challenge(?!\w)', message) is not None
+
+
+def _claims_zero_matches(message: str) -> bool:
+    """True when *message* asserts the passed token matched nothing.
+
+    The one wording pin in this area, and a deliberate one: that claim is
+    TRUE for ``reap-decisions`` (which matches) and FALSE for
+    ``write-decision`` (which creates, and files a row under exactly that
+    token one line later). Pinning it in both directions is what keeps the
+    hint's verb-awareness from silently regressing to a single message.
+    """
+    return re.search(r'matches (no|zero)\b', message, re.IGNORECASE) is not None
 
 
 def test_make_decision_defaults_to_the_unset_queue_sentinel() -> None:
@@ -547,6 +595,40 @@ def test_decision_path_for_id_sanitizes_unsafe_id(tmp_path: Path) -> None:
     # '/' maps to '-' via _DECISION_ID_SANITIZE_RE while '.' is preserved.
     assert path.name == '..-..-etc-passwd.json'
     assert '/' not in path.name
+
+
+def test_qualify_decision_id_prefixes_the_canonical_project() -> None:
+    assert sr.qualify_decision_id('dark_factory', 'esc-42-1') == 'dark_factory-esc-42-1'
+
+
+@pytest.mark.parametrize('project', ['df', 'Dark-Factory', '  DARK_FACTORY '])
+def test_qualify_decision_id_folds_the_project(project: str) -> None:
+    assert sr.qualify_decision_id(project, 'esc-42-1') == 'dark_factory-esc-42-1'
+
+
+def test_qualify_decision_id_is_injective_across_projects() -> None:
+    assert sr.qualify_decision_id('dark_factory', 'esc-42-1') != sr.qualify_decision_id(
+        'reify', 'esc-42-1'
+    )
+    # Canonical tokens never contain '-', so the separator cannot be smuggled
+    # in from the project side of the join.
+    assert sr.qualify_decision_id('a', 'b-c') != sr.qualify_decision_id('a_b', 'c')
+
+
+@pytest.mark.parametrize(
+    ('project', 'local_id'),
+    [('dark_factory', 'esc-42-1'), ('reify', 'recon-esc-7459-1'), ('df', 'watcher-lease-orphan-df')],
+)
+def test_qualify_decision_id_survives_the_path_sanitizer(
+    tmp_path: Path, project: str, local_id: str
+) -> None:
+    qualified = sr.qualify_decision_id(project, local_id)
+    assert sr.decision_path_for_id(qualified, root=tmp_path).stem == qualified
+
+
+@pytest.mark.parametrize('project', [None, '', '  '])
+def test_qualify_decision_id_leaves_an_unset_project_unqualified(project: object) -> None:
+    assert sr.qualify_decision_id(project, 'esc-42-1') == 'esc-42-1'
 
 
 # ---------------------------------------------------------------------------
@@ -1439,7 +1521,33 @@ class TestDecisionHelpersAdoptLock:
         )
 
         assert rc == 0
-        assert 'dec-spy-4' in acquired, f'Expected lock acquisition for dec-spy-4; got {acquired}'
+        assert _qid('dec-spy-4') in acquired, (
+            f'Expected lock acquisition for {_qid("dec-spy-4")}; got {acquired}'
+        )
+
+    def test_close_decision_with_evidence_acquires_lock_for_decision_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The FIFTH writer (task 5376): the sitting preparer's apply step, via close-decision."""
+        rec = _make_decision(id='dec-spy-6', state=sr.DecisionState.OPEN)
+        sr.write_decision(rec, root=tmp_path)
+
+        real_lock = sr.decision_id_lock
+        acquired: list[str] = []
+
+        @contextlib.contextmanager
+        def recording_lock(decision_id: str, root: Path | str | None = None):
+            acquired.append(decision_id)
+            with real_lock(decision_id, root=root):
+                yield
+
+        monkeypatch.setattr(sr, 'decision_id_lock', recording_lock)
+
+        sr.close_decision_with_evidence(
+            'dec-spy-6', sr.DecisionState.ANSWERED, 'gate evidence', root=tmp_path, **_identity_of(rec)
+        )
+
+        assert 'dec-spy-6' in acquired, f'Expected lock acquisition for dec-spy-6; got {acquired}'
 
     def test_main_write_decision_refusal_takes_no_lock(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1556,7 +1664,7 @@ def test_main_write_decision_enrichment_span_is_serialized_per_decision_id(
     third.mkdir()
     sr.write_decision(
         _make_decision(
-            id='esc-race-1',
+            id=_qid('esc-race-1'),
             project='df',
             text='Adopt the reify plan?',
             state=sr.DecisionState.OPEN,
@@ -1589,7 +1697,7 @@ def test_main_write_decision_enrichment_span_is_serialized_per_decision_id(
     assert not t1.is_alive(), 'recon-queue write-decision thread did not finish in time'
     assert not t2.is_alive(), 'third-queue write-decision thread did not finish in time'
 
-    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == 'esc-race-1']
+    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == _qid('esc-race-1')]
     # Neither filer's contribution was dropped...
     assert reread.task_id == '5914'
     assert reread.session_id == 'watcher-3'
@@ -3919,10 +4027,11 @@ def test_main_lease_claim_on_free_name_acquires_and_prints_decision_token(
     assert lines[0] == 'decision=acquired'
     assert lines[2] == 'holder_liveness=none'
     # Task 4248 appended a `slug=` line after it (pinned in that task's own
-    # section); anchored by INDEX here so this keeps asserting the position of
-    # `holder_liveness`, which is what this test is about, rather than silently
-    # re-aiming at whatever line happens to be last.
-    assert len(lines) == 4
+    # section), and task 4237 a `holder_record=` line after that; anchored by
+    # INDEX here so this keeps asserting the position of `holder_liveness`,
+    # which is what this test is about, rather than silently re-aiming at
+    # whatever line happens to be last.
+    assert len(lines) == 5
     assert sr.lease_path_for_name('watcher-df', root=tmp_path).is_file()
 
 
@@ -4096,13 +4205,14 @@ class TestLeaseSlugIsNotASessionRecordKey:
       project token is the registry's project id (``dark_factory``), not the
       lease's short name (``df``).
 
-    Only ONE test lives here, on purpose: the disjointness RATIONALE belongs to
-    (and is recorded in) ``LeaseHolder.session_slug``'s docstring, and a test
-    that merely compares a literal this file wrote against
-    ``build_session_slug``'s output cannot fail as a result of any production
-    change. The single assertion below has real coupling — it would break if
-    ``read_record`` ever started resolving a lease slug, which is exactly the
-    reintroduction worth catching.
+    No test here compares a literal this file wrote against
+    ``build_session_slug``'s output, on purpose: the disjointness RATIONALE
+    belongs to (and is recorded in) ``LeaseHolder.session_slug``'s docstring,
+    and such a test cannot fail as a result of any production change. The
+    first test has real coupling — it would break if ``read_record`` ever
+    started resolving a lease slug, which is exactly the reintroduction worth
+    catching. The second pins the pid pointer (task 4237) as the join that
+    does reach the record, side by side with the lookup that cannot.
     """
 
     # A hand-launched session's uniqueness token: hook_session_slug passes the
@@ -4144,6 +4254,22 @@ class TestLeaseSlugIsNotASessionRecordKey:
         # is why holder_session_state was a constant 'absent' in production.
         with pytest.raises(FileNotFoundError):
             sr.read_record(self._lease_slug(), root=tmp_path)
+
+    def test_the_pid_pointer_reaches_the_record_the_lease_slug_cannot(
+        self, tmp_path: Path
+    ) -> None:
+        pid = 1894895
+        record_slug = self._record_slug()
+        sr.write_record(
+            _make_record(session_slug=record_slug, claude_owner_pid=pid), root=tmp_path
+        )
+        sr.write_session_pointer(pid, record_slug, root=tmp_path)
+
+        with pytest.raises(FileNotFoundError):
+            sr.read_record(self._lease_slug(pid=pid), root=tmp_path)
+        linked = sr.resolve_session_slug_for_pid(pid, root=tmp_path)
+        assert linked is not None
+        assert sr.read_record(linked, root=tmp_path).session_slug == record_slug
 
 
 # --- resolve_session_pid (task 3994 defect 2) ------------------------------
@@ -4491,7 +4617,9 @@ def test_main_lease_claim_prints_the_derived_slug_last_on_the_acquired_path(
     assert lines[0] == 'decision=acquired'
     assert lines[2] == 'holder_liveness=none'
     assert lines[3] == f'slug=watcher-df-{_DEAD_PID}'
-    assert len(lines) == 4
+    # Task 4237 appended `holder_record=` after it (pinned in
+    # test_session_record_linkage.py); `slug=` keeps its index.
+    assert len(lines) == 5
 
 
 def test_main_lease_claim_slug_line_names_this_caller_not_the_holder(
@@ -4568,7 +4696,7 @@ def test_main_lease_claim_echoes_an_explicit_slug_verbatim(
     assert rc == 0
     # The line reports the slug ACTUALLY claimed with, not the one that would
     # have been derived — otherwise it would misreport the override path.
-    assert capsys.readouterr().out.splitlines()[-1] == 'slug=watcher-df-OPERATOR'
+    assert capsys.readouterr().out.splitlines()[3] == 'slug=watcher-df-OPERATOR'
 
 
 # --- CLI ownership on the mutating verbs (task 3994 defect 1) -------------
@@ -4998,7 +5126,7 @@ def test_main_write_decision_files_open_record(
     listed = sr.list_decisions(root=tmp_path)
     assert len(listed) == 1
     rec = listed[0]
-    assert rec.id == 'dec-park-1'
+    assert rec.id == _qid('dec-park-1')
     # Stored CANONICAL, not verbatim: --project is normalized at the CLI
     # boundary (task 3807, see test_main_write_decision_canonicalizes_project).
     assert rec.project == 'dark_factory'
@@ -5008,6 +5136,37 @@ def test_main_write_decision_files_open_record(
     assert rec.session_id == 'watcher-df-99'
     assert rec.state == sr.DecisionState.OPEN
     assert rec.filed_at != ''
+
+
+def test_main_write_decision_files_under_the_project_qualified_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--id is project-LOCAL: the stored, printed id is ``<canonical project>-<--id>``
+    (task 4835), so one escalation id in two projects can never share a row.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'esc-42-1',
+            '--project',
+            'df',
+            '--text',
+            'q?',
+            '--escalations-dir',
+            str(tmp_path / 'escalations'),
+        ]
+    )
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == 'dark_factory-esc-42-1'
+    assert [d.id for d in sr.list_decisions(root=tmp_path)] == ['dark_factory-esc-42-1']
+    assert sr.decision_path_for_id('dark_factory-esc-42-1', root=tmp_path).is_file()
+    assert not sr.decision_path_for_id('esc-42-1', root=tmp_path).exists()
 
 
 @pytest.mark.parametrize(
@@ -5078,19 +5237,15 @@ def test_main_write_decision_canonicalizes_an_unaliased_project(
     assert listed[0].project == 'autopilot_video'
 
 
-def test_main_write_decision_project_normalization_never_touches_the_id(
+def test_main_write_decision_qualifies_the_id_by_the_canonical_project_only(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The ``df-`` prefix belongs to --id, which YOU type; write-decision
-    never derives it from, or rewrites it because of, --project.
-
-    Conflating the two is how the three-way split arose in the first place --
-    a human reading ``df-esc-3524-1`` inferred that ``--project df`` was the
-    right spelling. The id (and therefore the record's filename) must survive
-    project canonicalization byte-for-byte, or every cockpit cross-link to a
-    filed decision would break.
+    """The stored id is ``<canonical project>-<--id>`` with --id carried
+    byte-for-byte (task 4835): the prefix comes from the FOLDED --project, so
+    a raw ``df`` never leaks into the id, and --id is never parsed or
+    rewritten -- not even a legacy hand-typed ``df-`` prefix on it.
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
 
@@ -5109,10 +5264,11 @@ def test_main_write_decision_project_normalization_never_touches_the_id(
     )
 
     assert rc == 0
-    assert (tmp_path / 'decisions' / 'df-esc-3524-1.json').is_file()
-    assert 'df-esc-3524-1' in capsys.readouterr().out
+    qualified = 'dark_factory-df-esc-3524-1'
+    assert (tmp_path / 'decisions' / f'{qualified}.json').is_file()
+    assert capsys.readouterr().out.strip() == qualified
     listed = sr.list_decisions(root=tmp_path)
-    assert [(d.id, d.project) for d in listed] == [('df-esc-3524-1', 'dark_factory')]
+    assert [(d.id, d.project) for d in listed] == [(qualified, 'dark_factory')]
 
 
 def test_main_write_decision_logs_a_project_rewrite(
@@ -5178,6 +5334,85 @@ def test_main_write_decision_already_canonical_project_logs_nothing(
 
     assert rc == 0
     assert sr.list_decisions(root=tmp_path)[0].project == 'dark_factory'
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+def test_main_write_decision_warns_on_a_declined_alias_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Passing a DECLINED alias target warns, and changes nothing else.
+
+    This is the load-bearing pair of assertions for task 3813: the record is
+    still filed under EXACTLY what the caller passed (we warn, we do not
+    silently move another project's rows -- rewriting here would be the very
+    cross-project behaviour change the task declined), and the return code
+    is unaffected (advisory, never a refusal -- contrast the two hard
+    refusals in _run_write_decision, which return without filing).
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    with caplog.at_level(logging.WARNING):
+        rc = sr.main(
+            [
+                'write-decision',
+                '--id',
+                'd-declined',
+                '--project',
+                'my_solar_challenge',
+                '--text',
+                'q?',
+                '--escalations-dir',
+                str(tmp_path / 'escalations'),
+            ]
+        )
+
+    assert rc == 0
+    # NOT rewritten: filed under exactly the token the caller passed.
+    assert sr.list_decisions(root=tmp_path)[0].project == 'my_solar_challenge'
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    # Non-vacuous on BOTH tokens: see _names_the_destination_token.
+    assert any('my_solar_challenge' in m and _names_the_destination_token(m) for m in warnings)
+    # ...and the message must be TRUE on this path. write-decision CREATES;
+    # it matches nothing by definition, and one line after this warning it
+    # files a row under this very token. A "matches no decisions" line here
+    # would be false the moment it is acted on.
+    assert not any(_claims_zero_matches(m) for m in warnings)
+
+
+def test_main_write_decision_recommended_solar_token_warns_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The token the skills recommend must stay silent.
+
+    Same strict no-noise assertion as
+    test_main_write_decision_already_canonical_project_logs_nothing: a
+    watcher following the documented ``--project solar_challenge`` guidance
+    must not be warned on every park, or the new hint is noise rather than
+    signal.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    with caplog.at_level(logging.WARNING):
+        rc = sr.main(
+            [
+                'write-decision',
+                '--id',
+                'd-solar-ok',
+                '--project',
+                'solar_challenge',
+                '--text',
+                'q?',
+                '--escalations-dir',
+                str(tmp_path / 'escalations'),
+            ]
+        )
+
+    assert rc == 0
+    assert sr.list_decisions(root=tmp_path)[0].project == 'solar_challenge'
     assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
@@ -5519,7 +5754,7 @@ def test_main_write_decision_refiling_same_id_overwrites_not_duplicates(
     assert rc2 == 0
     listed = sr.list_decisions(root=tmp_path)
     assert len(listed) == 1
-    assert listed[0].id == 'dec-park-4'
+    assert listed[0].id == _qid('dec-park-4')
     assert listed[0].text == 'second?'
 
 
@@ -5891,6 +6126,222 @@ def test_merge_decision_enrichment_touches_only_the_documented_fields() -> None:
 
     assert merged == dataclasses.replace(existing, severity='urgent')
 
+# ---------------------------------------------------------------------------
+# Task 3872: merge_same_queue_refile -- the SAME watcher re-filing its own id
+# ---------------------------------------------------------------------------
+
+
+def test_merge_same_queue_refile_holds_the_cockpit_owned_fields() -> None:
+    """The three COCKPIT-owned fields survive a same-queue re-file at any state.
+
+    Sibling of test_merge_decision_enrichment_keeps_custody_fields_with_the_
+    first_filer: the custody set is the same one, because custody does not
+    depend on which queue re-filed. ``filed_at`` is queue age (it drives the
+    cockpit's ordering, and a watcher restart is not news about it),
+    ``manual_boost`` is the operator's C5 field (set_manual_boost's), and
+    ``state`` is the operator's / reaper's disposition
+    (update_decision_state's) -- so a watcher restart must not restamp the
+    age, reset the boost, or RE-OPEN a row the human already dropped.
+
+    ``id``/``project`` are asserted unchanged as the caller's PRECONDITION,
+    not as a field this helper forces: unlike merge_decision_enrichment (which
+    rebuilds from *existing* and so pins them structurally), this helper
+    rebuilds from *incoming*, and is only ever reached from
+    _run_write_decision after ``existing.project == project`` and with the id
+    as the on-disk file key. Stating it here is what makes a future caller
+    that widens those preconditions fail loudly rather than silently reassign
+    a live row to another project.
+    """
+    existing = _make_decision(
+        id='esc-5914-1',
+        project='df',
+        filed_at='2026-07-07T00:00:00+00:00',
+        state=sr.DecisionState.DROPPED,
+        manual_boost=7,
+    )
+    incoming = _make_decision(
+        id='esc-5914-1',
+        project='df',
+        filed_at='2026-08-19T00:00:00+00:00',
+        state=sr.DecisionState.OPEN,
+        manual_boost=0,
+    )
+
+    merged = sr.merge_same_queue_refile(existing, incoming)
+
+    assert merged.filed_at == '2026-07-07T00:00:00+00:00'
+    assert merged.state == sr.DecisionState.DROPPED
+    assert merged.manual_boost == 7
+    assert merged.id == 'esc-5914-1'
+    assert merged.project == 'df'
+
+
+def test_merge_same_queue_refile_takes_the_watcher_owned_fields_verbatim() -> None:
+    """The WATCHER-owned half lands exactly as filed -- downgrades and empties too.
+
+    This is the half that keeps the watcher the sole authority on its own
+    escalation, and the one place this helper deliberately differs from
+    merge_decision_enrichment: there a second watcher may only FILL fields
+    the first left empty and may never downgrade severity
+    (_max_decision_severity), because two watchers are two views of one gate.
+    Here there is only ONE view -- the same watcher's, revised -- so freezing
+    the first values would strand stale prose and a stale severity in the
+    cockpit queue forever.
+    """
+    queue = '/queues/orch'
+    existing = _make_decision(
+        text='the original prose',
+        severity='critical',
+        task_id='5914',
+        session_id='watcher-df-1',
+        escalation_id='esc-5914-1',
+        options=['yes', 'no'],
+        escalations_dir=queue,
+    )
+    incoming = _make_decision(
+        text='the rephrased prose',
+        severity='info',
+        task_id=None,
+        session_id=None,
+        escalation_id='esc-5914-2',
+        options=None,
+        escalations_dir=queue,
+    )
+
+    merged = sr.merge_same_queue_refile(existing, incoming)
+
+    assert merged.text == 'the rephrased prose'
+    assert merged.severity == 'info'  # a DOWNGRADE lands (unlike enrichment)
+    assert merged.task_id is None  # ...and so does an EMPTYING
+    assert merged.session_id is None
+    assert merged.escalation_id == 'esc-5914-2'
+    assert merged.options is None
+    assert merged.escalations_dir == queue
+
+
+@pytest.mark.parametrize(
+    'state',
+    [
+        sr.DecisionState.ANSWERED,
+        sr.DecisionState.DROPPED,
+        'deferred-by-hand',
+    ],
+)
+def test_merge_same_queue_refile_preserves_an_unrecognized_state_verbatim(
+    state: str,
+) -> None:
+    """``state`` is copied as an opaque str, never coerced through DecisionState.
+
+    Mirrors DecisionState's own documented additive-safe contract:
+    DecisionRecord.state is a plain ``str`` with NO from_dict coercion, so an
+    unrecognized value must round-trip rather than raise -- or, here, be
+    silently reset to 'open'. A disposition some future writer adds is
+    therefore held back by this helper for free, instead of needing this
+    module to be taught about it first.
+    """
+    existing = _make_decision(state=state)
+    incoming = _make_decision(state=sr.DecisionState.OPEN)
+
+    assert sr.merge_same_queue_refile(existing, incoming).state == state
+
+
+def test_merge_same_queue_refile_is_pure() -> None:
+    """Neither argument may be mutated in place.
+
+    Mirrors test_merge_decision_enrichment_is_pure. The helper is
+    deliberately side-effect-free -- including of LOGGING, which stays in the
+    CLI verb at the policy boundary -- so it is trivially testable in
+    isolation, and so a caller holding the pre-merge record (e.g. to name the
+    held-back state in its divergence warning) still sees what it read.
+    """
+    existing = _make_decision(id='esc-5914-1', text='first?', state='dropped')
+    incoming = _make_decision(id='esc-5914-1', text='second?', state='open')
+    before_existing = existing.to_dict()
+    before_incoming = incoming.to_dict()
+
+    merged = sr.merge_same_queue_refile(existing, incoming)
+
+    assert merged is not existing
+    assert merged is not incoming
+    assert existing.to_dict() == before_existing
+    assert incoming.to_dict() == before_incoming
+
+
+def test_same_queue_refile_and_enrichment_agree_on_the_custody_field_set() -> None:
+    """THE ANTI-DIVERGENCE INVARIANT: one custody set, two merge branches.
+
+    After task 3872 the write-decision upsert has two merge arms --
+    merge_decision_enrichment (cross-queue) and merge_same_queue_refile
+    (same-queue) -- and the load-bearing shared rule is WHICH fields are
+    cockpit-owned. They differ only in how the WATCHER-owned half is taken
+    (fill-if-empty + severity-max vs. verbatim). Add a fourth custody field
+    to one and forget the other and the regression is silent: every
+    field-specific test above still passes.
+
+    Arranged so the two halves are separable. *existing* leaves every
+    fill-if-empty field empty (text/task_id/session_id/record_slug/
+    escalation_id/options/severity), so BOTH helpers take the watcher-owned half from *incoming*
+    and the two runs can only differ on custody. The queue axis is
+    neutralized (equal normalized ``escalations_dir`` on both), which is also
+    the precondition of the same-queue arm.
+
+    ``id``/``project``/``escalations_dir`` land in the set because both
+    records agree on them, not because either helper had to choose -- that
+    agreement is exactly the caller's precondition for this arm, so the set
+    is spelled out in full rather than filtered down to the three fields that
+    genuinely differ.
+    """
+    queue = '/queues/orch'
+    existing = _make_decision(
+        text='',
+        task_id=None,
+        session_id=None,
+        record_slug='',
+        escalation_id=None,
+        options=None,
+        severity='',
+        filed_at='2026-07-07T00:00:00+00:00',
+        state=sr.DecisionState.DROPPED,
+        manual_boost=7,
+        escalations_dir=queue,
+        closing_evidence='the operator dropped it: superseded by esc-5914-2',
+        closed_at='2026-08-01T00:00:00+00:00',
+    )
+    incoming = _make_decision(
+        text="the watcher's current view",
+        task_id='5914',
+        session_id='watcher-df-1',
+        escalation_id='esc-5914-1',
+        options=['yes', 'no'],
+        severity='critical',
+        filed_at='2026-08-19T00:00:00+00:00',
+        state=sr.DecisionState.OPEN,
+        manual_boost=0,
+        escalations_dir=queue,
+    )
+
+    def _kept_from_existing(merged: sr.DecisionRecord) -> set[str]:
+        return {
+            f.name
+            for f in dataclasses.fields(sr.DecisionRecord)
+            if getattr(merged, f.name) == getattr(existing, f.name)
+        }
+
+    enriched = _kept_from_existing(sr.merge_decision_enrichment(existing, incoming))
+    refiled = _kept_from_existing(sr.merge_same_queue_refile(existing, incoming))
+
+    assert enriched == refiled
+    assert refiled == {
+        'id',
+        'project',
+        'filed_at',
+        'state',
+        'manual_boost',
+        'closing_evidence',
+        'closed_at',
+        'escalations_dir',
+    }
+
 
 # ---------------------------------------------------------------------------
 # Project-token canonicalization (task 3807)
@@ -6005,22 +6456,33 @@ def test_normalize_project_token_maps_none_to_the_unset_sentinel() -> None:
     assert sr.normalize_project_token(None) != 'none'
 
 
-def test_normalize_project_token_solar_challenge_gap_is_known_not_resolved() -> None:
-    """RESIDUAL GAP, pinned so it stays a known state rather than a surprise.
+def test_solar_challenge_alias_was_decided_and_declined() -> None:
+    """The naming mismatch is a DECIDED, standing state -- not a pending gap.
 
-    Folding DOES merge solar-challenge's two filed spellings into one bucket
-    -- an improvement, since a reap scoped to either previously missed the
-    other (live 2026-08-07: 3 OPEN under ``solar-challenge``, 2 under
-    ``solar_challenge``). But that bucket is ``solar_challenge``, while
+    Folding merges solar-challenge's two filed spellings into one bucket --
+    an improvement, since a reap scoped to either previously missed the
+    other (re-measured 2026-09-07 over 748 records: 3 OPEN under
+    ``solar-challenge``, 2 under ``solar_challenge``, ZERO under
+    ``my_solar_challenge``; unchanged from 2026-08-07). But that bucket is
+    ``solar_challenge``, while
     ``/home/leo/src/solar-challenge/dark-factory-orchestrator.yaml`` declares
     ``my_solar_challenge``, and no alias bridges them. So a reaper passing
     the config-declared token matches ZERO of those 5 rows.
 
-    This test exists so nobody reads the folding rows above as "solved" and
-    so the day an alias IS added (its own filed decision task, 3813) this
-    test fails loudly and must be updated deliberately -- rather than the
-    gap silently changing shape. The skills' ``--project`` guidance carries
-    the same caveat for the humans and watchers that read it.
+    Task 3813 was the decision task for that bridge, and it DECLINED it --
+    chiefly because the fold left no split to heal (an alias would rename a
+    populated bucket onto an empty one) and because the identity question is
+    an open human gate in that project, marked "Do NOT auto-act". See
+    ``sr.PROJECT_TOKEN_ALIASES_DECLINED`` for the full evidence.
+
+    So this is no longer "pending"; the assertions below pin a settled
+    outcome. They keep their fail-loudly-on-promotion property -- adding the
+    alias breaks the last two -- which
+    test_project_token_alias_declines_registry_shape now also enforces from
+    the other side, via the disjointness of the two tables. The skills'
+    ``--project`` guidance carries the same, now-permanent caveat for the
+    humans and watchers that read it, and both CLI verbs warn if you pass
+    the config-declared token.
     """
     assert sr.normalize_project_token('solar-challenge') == 'solar_challenge'
     assert sr.normalize_project_token('solar-challenge') == sr.normalize_project_token(
@@ -6041,6 +6503,167 @@ def test_project_token_aliases_maps_folded_to_folded() -> None:
     for alias, canonical in sr.PROJECT_TOKEN_ALIASES.items():
         assert sr.normalize_project_token(alias) == canonical
         assert sr.normalize_project_token(canonical) == canonical
+
+
+def test_project_token_alias_declines_registry_shape() -> None:
+    """The DECLINE registry is the mirror image of PROJECT_TOKEN_ALIASES, and
+    it is what makes task 3813's decision durable rather than prose.
+
+    A decision task's product has to survive the session that made it. Task
+    3807 already tried a docstring ("KNOWN RESIDUAL GAP ... owned by its own
+    filed decision task") and prose cannot fail a test -- someone could add
+    ``solar_challenge -> my_solar_challenge`` tomorrow and nothing would
+    object. The DISJOINTNESS assertion below is that objection: promoting a
+    declined alias into the live table without first REMOVING the decline
+    fails here by name, forcing the next editor to read the recorded
+    evidence instead of rediscovering it from scratch.
+    """
+    declined = sr.PROJECT_TOKEN_ALIASES_DECLINED
+    assert isinstance(declined, dict)
+
+    # Exactly one recorded decline: the solar-challenge alias (task 3813).
+    assert set(declined) == {'solar_challenge'}
+    assert declined['solar_challenge'][0] == 'my_solar_challenge'
+
+    # A decline can never be added without STATING WHY. Existence and
+    # non-emptiness of the reason field only -- deliberately not a pin on
+    # its wording.
+    for alias, entry in declined.items():
+        assert len(entry) == 2, alias
+        assert isinstance(entry[1], str), alias
+        assert entry[1].strip(), alias
+
+    # THE GUARD: the two tables partition the alias space. Adding a declined
+    # alias to the live table without removing the decline fails right here.
+    assert set(declined) & set(sr.PROJECT_TOKEN_ALIASES) == set()
+
+    # Same folded-to-folded hygiene invariant the live table carries (see
+    # test_project_token_aliases_maps_folded_to_folded), so promoting an
+    # entry is a one-line move between the two dicts.
+    for alias, (canonical, _reason) in declined.items():
+        assert sr.normalize_project_token(alias) == alias
+        assert sr.normalize_project_token(canonical) == canonical
+
+    # The decline is IN FORCE in the fold, not merely recorded beside it.
+    assert sr.normalize_project_token('solar_challenge') != sr.normalize_project_token(
+        'my_solar_challenge'
+    )
+
+
+def test_declined_project_token_hint_names_both_tokens() -> None:
+    """The hint must name BOTH tokens: what the operator typed, and where the
+    rows actually are.
+
+    Declining the alias makes the naming mismatch PERMANENT, so the honest
+    companion to the decline is that the mismatch announces itself. A message
+    naming only one side leaves the operator exactly where the silent
+    zero-row no-op did.
+    """
+    hint = sr.declined_project_token_hint('my_solar_challenge')
+
+    assert hint is not None
+    assert isinstance(hint, str)
+    # Token PRESENCE, deliberately not sentence wording. The destination
+    # token goes through _names_the_destination_token because the bare
+    # `'solar_challenge' in hint` spelling is VACUOUS -- it is implied by the
+    # line above it, so a message that named only the typed token would pass.
+    assert 'my_solar_challenge' in hint
+    assert _names_the_destination_token(hint)
+
+    # The fold runs FIRST, so a spelling variant still hits. This is the case
+    # that matters: an operator copying the config-declared value with
+    # different case/separators must still be warned.
+    assert sr.declined_project_token_hint('My-Solar-Challenge') is not None
+    assert sr.declined_project_token_hint('  MY_SOLAR_CHALLENGE  ') is not None
+
+
+def test_declined_project_token_hint_consequence_is_verb_aware() -> None:
+    """One message cannot be true for both callers, so *action* picks one.
+
+    ``reap-decisions`` MATCHES, so its consequence is a zero-row no-op.
+    ``write-decision`` CREATES: it matches nothing by definition, and one
+    line after the warning it files a row under exactly the token passed --
+    so the reap wording would be false the moment it is acted on. Its real
+    consequence is also the worse of the two (the row lands where no
+    documented reap scopes, and can never auto-close), which the shared
+    wording left unstated entirely.
+
+    Asserts on the CLAIM each message makes, not its sentences: the
+    zero-match claim must be present on the reap path and absent on the
+    write path, and every variant must still name both tokens.
+    """
+    reap = sr.declined_project_token_hint('my_solar_challenge', action='reap')
+    file_ = sr.declined_project_token_hint('my_solar_challenge', action='file')
+
+    assert reap is not None and file_ is not None
+    assert reap != file_
+    for message in (reap, file_):
+        assert 'my_solar_challenge' in message
+        assert _names_the_destination_token(message)
+
+    assert _claims_zero_matches(reap)
+    assert not _claims_zero_matches(file_)
+
+
+@pytest.mark.parametrize('action', ['', 'bogus-verb'])
+def test_declined_project_token_hint_unknown_action_stays_verb_neutral(action: str) -> None:
+    """An omitted or unrecognised *action* is not an error, and is not guessed.
+
+    Fail-soft in the direction that matters for a message a human acts on: a
+    future caller that forgets the argument gets the verb-neutral core --
+    less specific, but TRUE on any path -- rather than a confident
+    description of the wrong verb. Pinning this is what stops the default
+    from quietly being set to one of the two real verbs later.
+    """
+    hint = sr.declined_project_token_hint('my_solar_challenge', action=action)
+
+    assert hint is not None
+    assert 'my_solar_challenge' in hint
+    assert _names_the_destination_token(hint)
+    # No verb-specific claim, in either direction.
+    assert not _claims_zero_matches(hint)
+    assert hint != sr.declined_project_token_hint('my_solar_challenge', action='reap')
+    assert hint != sr.declined_project_token_hint('my_solar_challenge', action='file')
+    # The default really is the neutral variant, not one of the two verbs.
+    assert sr.declined_project_token_hint('my_solar_challenge') == hint
+
+
+@pytest.mark.parametrize(
+    'token',
+    [
+        'dark_factory',
+        # Aliases to dark_factory -- a healthy project must never be warned.
+        'df',
+        # The RECOMMENDED token, in both spellings. A warning here would be
+        # pure noise a watcher accrues every Main Loop cycle.
+        'solar_challenge',
+        'solar-challenge',
+        # The collapse-guard sibling: a distinct project root. A false
+        # warning here would be actively misleading.
+        'solar_challenge_platform',
+        'reify',
+        '',
+        '   ',
+    ],
+)
+def test_declined_project_token_hint_is_none_for_everything_else(token: str) -> None:
+    """The hint fires on the declined VALUE, never on the declined KEY.
+
+    The trap being closed is "operator reads their project's config, types
+    the declared ``memory.project_id``, matches zero rows". So the warning
+    must land on ``my_solar_challenge`` and stay SILENT on
+    ``solar_challenge`` -- the token both SKILL.md files tell people to
+    pass -- or the signal degrades into noise.
+    """
+    assert sr.declined_project_token_hint(token) is None
+
+
+@pytest.mark.parametrize('token', [None, 42, 3.5, Path('/tmp/x'), object()])
+def test_declined_project_token_hint_fail_soft_on_non_str(token: object) -> None:
+    """Fail-soft, mirroring normalize_project_token's contract: a helper a C8
+    watch loop calls on its filing path never raises into the caller.
+    """
+    assert sr.declined_project_token_hint(token) is None
 
 
 def test_read_escalation_status_reads_queue_root_file(tmp_path: Path) -> None:
@@ -6241,6 +6864,199 @@ def test_main_reap_decisions_leaves_pending_escalation_open(
     assert rc == 0
     listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
     assert listed['dec-cli-pending'] == sr.DecisionState.OPEN
+
+
+def test_main_reap_decisions_warns_on_a_declined_alias_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The operationally important half of task 3813's hint.
+
+    Filing under the wrong token is recoverable -- the record still exists
+    and is still visible. REAPING under it is the silent zero-row no-op that
+    started this whole thread: it looks exactly like "nothing to reap", and
+    the only way to discover otherwise today is the hand-run Counter
+    one-liner both SKILL.md files tell humans to paste.
+
+    A decision is seeded under ``solar_challenge`` so there IS a populated
+    bucket to miss, exactly as the live population has it.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    escalations_dir = tmp_path / 'esc'
+    archive_dir = escalations_dir / 'archive' / '2026-07-16'
+    archive_dir.mkdir(parents=True)
+    (archive_dir / 'esc-solar.json').write_text(json.dumps({'status': 'resolved'}))
+    sr.write_decision(
+        _make_decision(
+            id='dec-solar',
+            project='solar_challenge',
+            escalation_id='esc-solar',
+            escalations_dir=str(escalations_dir),
+            state=sr.DecisionState.OPEN,
+        ),
+        root=tmp_path,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        rc = sr.main(
+            [
+                'reap-decisions',
+                '--project',
+                'my_solar_challenge',
+                '--escalations-dir',
+                str(escalations_dir),
+            ]
+        )
+
+    assert rc == 0
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    # Non-vacuous on BOTH tokens: see _names_the_destination_token.
+    assert any('my_solar_challenge' in m and _names_the_destination_token(m) for m in warnings)
+    # On THIS path the zero-match claim is the true one -- the reap really is
+    # matching, and really does match none of the seeded rows.
+    assert any(_claims_zero_matches(m) for m in warnings)
+    # The warning changes NO reaping behaviour: the seeded decision would
+    # have been closed under the right token, and is still OPEN under this
+    # one. All the hint does is make the zero-match visible.
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-solar'] == sr.DecisionState.OPEN
+
+
+def test_project_token_census_counts_every_state_under_the_folded_token() -> None:
+    decisions = [
+        _make_decision(id='a', project='df', state=sr.DecisionState.OPEN),
+        _make_decision(id='b', project='dark-factory', state=sr.DecisionState.ANSWERED),
+        _make_decision(id='c', project='dark_factory', state=sr.DecisionState.DROPPED),
+        _make_decision(id='d', project='reify', state=sr.DecisionState.OPEN),
+    ]
+
+    assert sr.project_token_census(decisions) == Counter({'dark_factory': 3, 'reify': 1})
+
+
+class TestReapExpectMatches:
+    """``reap-decisions --expect-matches`` names a --project no registry record carries (task 4835)."""
+
+    @staticmethod
+    def _seed(root: Path) -> Path:
+        for decision_id, project, state in [
+            ('dec-df-1', 'dark_factory', sr.DecisionState.ANSWERED),
+            ('dec-df-2', 'df', sr.DecisionState.DROPPED),
+            ('dec-reify', 'reify', sr.DecisionState.ANSWERED),
+        ]:
+            sr.write_decision(_make_decision(id=decision_id, project=project, state=state), root=root)
+        return root / 'esc'
+
+    @staticmethod
+    def _reap(queue: Path, project: str, *flags: str) -> int:
+        return sr.main(['reap-decisions', '--project', project, '--escalations-dir', str(queue), *flags])
+
+    @staticmethod
+    def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_a_token_no_record_carries_warns_once_naming_the_tokens_that_exist(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        queue = self._seed(tmp_path)
+
+        with caplog.at_level(logging.WARNING):
+            rc = self._reap(queue, 'autopilot_video', '--expect-matches')
+
+        assert rc == 0
+        assert capsys.readouterr().out == ''
+        [warning] = self._warnings(caplog)
+        for named in ('autopilot_video', 'ZERO', 'dark_factory=2', 'reify=1'):
+            assert named in warning
+
+    def test_a_token_with_records_but_nothing_to_reap_is_quiet(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        queue = self._seed(tmp_path)
+
+        with caplog.at_level(logging.WARNING):
+            assert self._reap(queue, 'reify', '--expect-matches') == 0
+
+        assert self._warnings(caplog) == []
+
+    def test_without_the_flag_an_unmatched_token_is_quiet(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The per-cycle Main Loop reap: a never-filed project must not warn every cycle."""
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        queue = self._seed(tmp_path)
+
+        with caplog.at_level(logging.WARNING):
+            assert self._reap(queue, 'autopilot_video') == 0
+
+        assert self._warnings(caplog) == []
+
+    def test_a_declined_alias_target_warns_once_with_the_declined_hint(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        queue = self._seed(tmp_path)
+
+        with caplog.at_level(logging.WARNING):
+            assert self._reap(queue, 'my_solar_challenge', '--expect-matches') == 0
+
+        [warning] = self._warnings(caplog)
+        assert 'DECLINED' in warning
+
+
+def test_main_reap_decisions_recommended_solar_token_warns_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Same fixture with the DOCUMENTED token: reaps, and stays silent.
+
+    A watcher reaping with the token both SKILL.md files recommend runs this
+    every Main Loop cycle, so a warning here would accumulate indefinitely
+    and drown the one case the hint exists to surface.
+
+    The ANSWERED assertion below also keeps its sibling honest: it proves
+    this fixture's decision really is reapable, so the sibling's "still
+    OPEN under my_solar_challenge" is a genuine contrast rather than a
+    vacuous pass for some unrelated reason.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    escalations_dir = tmp_path / 'esc'
+    archive_dir = escalations_dir / 'archive' / '2026-07-16'
+    archive_dir.mkdir(parents=True)
+    (archive_dir / 'esc-solar.json').write_text(json.dumps({'status': 'resolved'}))
+    sr.write_decision(
+        _make_decision(
+            id='dec-solar',
+            project='solar_challenge',
+            escalation_id='esc-solar',
+            escalations_dir=str(escalations_dir),
+            state=sr.DecisionState.OPEN,
+        ),
+        root=tmp_path,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        rc = sr.main(
+            [
+                'reap-decisions',
+                '--project',
+                'solar_challenge',
+                '--escalations-dir',
+                str(escalations_dir),
+            ]
+        )
+
+    assert rc == 0
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-solar'] == sr.DecisionState.ANSWERED
 
 
 def test_main_reap_decisions_scopes_to_project(
@@ -6958,7 +7774,7 @@ def test_main_reap_decisions_mode2_collapsed_decision_is_reapable_only_by_its_st
 
     assert rc == 0
     listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
-    assert listed['esc-5914-1'] == sr.DecisionState.OPEN
+    assert listed[_qid('esc-5914-1')] == sr.DecisionState.OPEN
 
 
 def test_main_write_decision_same_id_from_two_queues_stays_one_decision(
@@ -6975,12 +7791,12 @@ def test_main_write_decision_same_id_from_two_queues_stays_one_decision(
     regression of its own.
 
     This design satisfies MODE 2 BY CONSTRUCTION: the queue is recorded as a
-    FIELD on the record and the decision id is left untouched, so a second
-    watcher filing the same question lands on the same id. This case passes
-    both before and after the fix by design -- it is the guard that a future
-    refactor to per-queue decision ids ('recon:esc-5914-1' vs
-    'orch:esc-5914-1') would double-file the same question and must not be
-    adopted. Complements test_main_write_decision_refiling_same_id_overwrites_not_duplicates,
+    FIELD on the record and the decision id is qualified by PROJECT only
+    (task 4835), never by queue, so a second watcher filing the same question
+    lands on the same id. It is the guard that a future refactor to per-queue
+    decision ids ('recon:esc-5914-1' vs 'orch:esc-5914-1') would double-file
+    the same question and must not be adopted. Complements
+    test_main_write_decision_refiling_same_id_overwrites_not_duplicates,
     which pins the same-queue restart case.
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
@@ -7020,14 +7836,13 @@ def test_main_write_decision_same_id_from_two_queues_stays_one_decision(
     assert rc1 == 0
     assert rc2 == 0
     listed = sr.list_decisions(root=tmp_path)
-    assert [d.id for d in listed] == ['esc-5914-1']
+    assert [d.id for d in listed] == ['dark_factory-esc-5914-1']
     # The discriminator is a FIELD holding a normalized queue path, never a
-    # namespace prefix baked into the id. The field is scalar, so only ONE of
+    # queue prefix baked into the id. The field is scalar, so only ONE of
     # the two queues can survive: the FIRST filer's (task 3559 -- the second
     # filing enriches rather than overwrites), which makes the outcome
     # deterministic instead of "whichever watcher happened to write last".
     assert listed[0].escalations_dir == sr.normalize_escalations_dir(orch)
-    assert listed[0].id == 'esc-5914-1'
 
 
 def _file_decision(**kwargs: str) -> int:
@@ -7086,7 +7901,7 @@ def test_main_write_decision_mode2_second_queue_enriches_and_never_downgrades(
     assert rc1 == 0
     assert rc2 == 0
     listed = sr.list_decisions(root=tmp_path)
-    assert [d.id for d in listed] == ['esc-5914-1']
+    assert [d.id for d in listed] == ['dark_factory-esc-5914-1']
     survivor = listed[0]
     assert survivor.text == 'Adopt the reify plan?'  # never clobbered
     assert survivor.severity == 'critical'  # never downgraded
@@ -7140,7 +7955,7 @@ def test_main_write_decision_same_queue_refile_still_fully_overwrites(
     # An operator triages the cockpit between the two filings: boosts the row
     # to the top of the queue. The watcher then restarts and re-files.
     filed_at = sr.list_decisions(root=tmp_path)[0].filed_at
-    assert sr.set_manual_boost('esc-5914-1', 9, root=tmp_path) is not None
+    assert sr.set_manual_boost(_qid('esc-5914-1'), 9, root=tmp_path) is not None
     _file_decision(
         id='esc-5914-1',
         project='df',
@@ -7150,42 +7965,274 @@ def test_main_write_decision_same_queue_refile_still_fully_overwrites(
     )
 
     listed = sr.list_decisions(root=tmp_path)
-    assert [d.id for d in listed] == ['esc-5914-1']
+    assert [d.id for d in listed] == [_qid('esc-5914-1')]
     assert listed[0].text == 'reify? (rephrased)'
     assert listed[0].severity == 'info'
     assert listed[0].task_id is None
     assert listed[0].manual_boost == 9  # the operator's boost survives
     assert listed[0].filed_at == filed_at  # queue age not restamped
 
+@pytest.mark.parametrize(
+    'closed_state',
+    [
+        sr.DecisionState.DROPPED,
+        sr.DecisionState.ANSWERED,
+        'deferred-by-hand',
+    ],
+)
+def test_main_write_decision_same_queue_refile_does_not_resurrect_a_closed_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    closed_state: str,
+) -> None:
+    """THE HEADLINE REGRESSION (task 3872), at the CLI boundary.
 
-def test_main_write_decision_same_id_different_project_is_refused(
+    An operator dismisses a still-PARKED row in the cockpit decision queue
+    (C5b), and the watcher that filed it restarts. Both watcher SKILLs tell
+    an agent to re-file the same stable id on every restart while an item
+    stays parked -- so before this change the dismissal was silently undone
+    on the very next restart, and again, and again: the guarded upsert block
+    was scoped to an OPEN record, so a non-open one fell through to
+    ``record = incoming``, a freshly constructed record carrying state=open,
+    manual_boost=0 and a restamped filed_at. reap_answered_decisions likewise
+    skips a non-open decision, so nothing downstream re-closed it either.
+    C5b's drop action was therefore INERT for exactly the class of row it
+    exists for, and the operator's dismissal could never stick.
+
+    Arranged through the REAL cross-subsystem sequence rather than a
+    hand-built record: filed through the verb, then triaged via the same
+    set_manual_boost / update_decision_state helpers cockpit/app.py calls,
+    then re-filed through the verb from the SAME queue.
+
+    Parametrized over an unrecognized state as well as the two DecisionState
+    members, since DecisionRecord.state is a plain str with no from_dict
+    coercion -- a disposition a future writer adds must be held back too,
+    not silently reset to 'open' by a module that has not been taught it.
+
+    The final two asserts are what keep this from over-firing into "a closed
+    row is frozen": the watcher's OWN fields still land, so the row's prose
+    and severity stay current even while it stays closed.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+
+    rc1 = _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='Adopt the reify plan?',
+        severity='critical',
+        task_id='5914',
+        escalations_dir=str(orch),
+    )
+    filed_at = sr.list_decisions(root=tmp_path)[0].filed_at
+    # The operator triages the row in the cockpit: boosts it, then dismisses
+    # it. Same two helpers cockpit/app.py's C5b drop action calls.
+    assert sr.set_manual_boost(_qid('esc-5914-1'), 9, root=tmp_path) is not None
+    assert sr.update_decision_state(_qid('esc-5914-1'), closed_state, root=tmp_path) is not None
+
+    # ...and the watcher restarts, re-filing its own id from its own queue.
+    rc2 = _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='reify? (rephrased)',
+        severity='info',
+        escalations_dir=str(orch),
+    )
+
+    assert rc1 == 0
+    assert rc2 == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert [d.id for d in listed] == [_qid('esc-5914-1')]
+    survivor = listed[0]
+    assert survivor.state == closed_state  # the operator's disposition STICKS
+    assert survivor.manual_boost == 9  # ...as does their boost
+    assert survivor.filed_at == filed_at  # ...and queue age is not restamped
+    assert survivor.text == 'reify? (rephrased)'  # but the row is not FROZEN
+    assert survivor.severity == 'info'  # ...a downgrade still lands
+
+
+@pytest.mark.parametrize(
+    'closed_state', [sr.DecisionState.DROPPED, sr.DecisionState.ANSWERED]
+)
+def test_main_write_decision_cross_queue_refile_of_a_closed_record_still_overwrites(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    closed_state: str,
+) -> None:
+    """The deliberately-UNCHANGED neighbour: the QUEUE is the discriminator.
+
+    Stated adjacently to the test above so a future reader cannot mistake
+    task 3872's change for "non-open records are now always protected". The
+    axis is the QUEUE, not the state: within ONE queue an ``esc-<taskid>-<n>``
+    id is unique (task 3528's premise), so a same-queue re-file is
+    definitively the same gate the human already dealt with. ACROSS queues
+    the id namespaces genuinely collide -- dark_factory runs
+    ``data/escalations`` and ``data/reconciliation/escalations`` over one
+    namespace -- so a non-open cross-queue filing may be an unrelated NEW
+    ask, and holding it closed would make a live gate invisible, which is
+    the fail-CLOSED direction _run_reap_decisions' docstring rules out.
+
+    Absorbs (task 3872's amendment pass) the older
+    test_main_write_decision_non_open_record_is_still_overwritten, which
+    pinned this same orch-seed -> recon-file shape for an ANSWERED record and
+    is now parametrized in here instead of kept as a near-clone whose
+    docstring ("protection is scoped to an OPEN record") had gone false on
+    the same-queue axis. This version files through the CLI verb on both
+    sides and carries an operator boost as well, so the contrast with the
+    same-queue case is visible in every custody field rather than only in
+    `state`.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+
+    _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='Adopt the reify plan?',
+        severity='critical',
+        escalations_dir=str(orch),
+    )
+    assert sr.set_manual_boost(_qid('esc-5914-1'), 9, root=tmp_path) is not None
+    assert sr.update_decision_state(_qid('esc-5914-1'), closed_state, root=tmp_path) is not None
+
+    # A DIFFERENT queue files the same id -- possibly an unrelated new ask.
+    rc = _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='a brand new question that merely shares the id',
+        severity='info',
+        escalations_dir=str(recon),
+    )
+
+    assert rc == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert [d.id for d in listed] == [_qid('esc-5914-1')]
+    survivor = listed[0]
+    assert survivor.state == sr.DecisionState.OPEN  # re-opened: a new ask
+    assert survivor.manual_boost == 0
+    assert survivor.text == 'a brand new question that merely shares the id'
+    assert survivor.escalations_dir == sr.normalize_escalations_dir(recon)
+
+def test_main_write_decision_warns_when_a_same_queue_refile_is_held_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Holding a closed row closed must be LOUD, not silent.
+
+    This is the ONE place the verb deliberately declines to do what the filer
+    asked: the watcher's filing carries ``state=open`` (the verb's own
+    default) and the row stays closed. The repo's loud-over-silent-degradation
+    norm applies, and the watcher SKILLs' own discipline is to ADJUDICATE such
+    a divergence rather than assume the re-file landed -- which it can only do
+    if the divergence is visible.
+
+    The message must name BOTH the decision id and the held state, so an
+    operator or agent reading the log can tell WHICH row and WHAT disposition
+    was preserved; a bare "held back" line would send them to read the file.
+
+    stdout is asserted UNCHANGED on purpose: both SKILLs document "if the id
+    doesn't come back on stdout, your filing did not land" as the
+    did-it-work signal, and this filing DID land (its text and severity were
+    written) -- so repurposing that channel as a failure indicator here would
+    break a contract agents already rely on. The divergence goes to the log.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+
+    _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='Adopt the reify plan?',
+        severity='critical',
+        escalations_dir=str(orch),
+    )
+    assert (
+        sr.update_decision_state(_qid('esc-5914-1'), sr.DecisionState.DROPPED, root=tmp_path)
+        is not None
+    )
+    capsys.readouterr()  # discard the first filing's stdout
+
+    with caplog.at_level(logging.WARNING):
+        rc = _file_decision(
+            id='esc-5914-1',
+            project='df',
+            text='reify? (rephrased)',
+            severity='info',
+            escalations_dir=str(orch),
+        )
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == _qid('esc-5914-1')  # the id still lands
+    held = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and 'esc-5914-1' in r.getMessage()
+    ]
+    assert held, 'holding a closed row closed must be logged, not silent'
+    assert 'dropped' in held[0].getMessage()  # names the PRESERVED disposition
+    assert 'reopen-decision' in held[0].getMessage()  # ...and a remedy that exists
+
+
+def test_main_write_decision_same_queue_refile_of_an_open_record_is_quiet(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A cross-PROJECT id collision is not a MODE-2 collapse, and must not merge.
+    """THE NOISE GUARD: the ordinary restart re-file must say nothing.
 
-    DecisionRecords are fleet-global, both watcher SKILLs tell a watcher to
-    use the escalation id as the decision id, and ``esc-<taskid>-<n>`` task
-    numbering RESTARTS per project -- so 'esc-42-1' in dark_factory and
-    'esc-42-1' in reify are two unrelated human gates that collide. Two
-    projects also always run different queue dirs, so such a collision lands
-    on exactly the queue-differs axis the enrichment branch keys on: without
-    a project check it would be folded into the other project's record,
-    producing ONE cockpit row that claims to be A's ask (A's project, text
-    and filed_at kept, severity maxed up by B) while B's gate is invisible
-    and unreapable by B's reaper.
+    A same-queue re-file against an OPEN record is by far the common path --
+    every watcher restart, for every still-parked item. Nothing the filer
+    asked for was declined there (it files ``state=open`` and the row IS
+    open), so a warning would be pure noise, and a warning on every restart
+    is how the genuinely-actionable one above gets tuned out.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
 
-    Refused rather than overwritten: overwriting would delete a live row
-    instead, which is the clobber this task exists to stop. Same
-    first-writer-wins policy as a conflicting queue stamp, and loud, so the
-    collision is a log line rather than a silent misfiling.
+    _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='Adopt the reify plan?',
+        severity='critical',
+        escalations_dir=str(orch),
+    )
 
-    Deliberately arranged so the merge is DETECTABLE rather than a no-op:
-    the incumbent is the POORER record (info, no task/session id) and the
-    colliding filing is richer, so enrichment would visibly leak B's
-    severity and ids onto A's row. Asserting only `project`/`text` would be
-    vacuous -- enrichment keeps those from *existing* too.
+    with caplog.at_level(logging.WARNING):
+        rc = _file_decision(
+            id='esc-5914-1',
+            project='df',
+            text='reify? (rephrased)',
+            severity='info',
+            escalations_dir=str(orch),
+        )
+
+    assert rc == 0
+    assert sr.list_decisions(root=tmp_path)[0].state == sr.DecisionState.OPEN
+    noise = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and 'esc-5914-1' in r.getMessage()
+    ]
+    assert not noise, f'the common restart path must be quiet, got: {noise}'
+
+
+def test_main_write_decision_same_local_id_in_two_projects_files_two_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A shared escalation id across PROJECTS is two asks, filed as two rows (task 4835).
+
+    ``esc-<taskid>-<n>`` numbering restarts per project, so 'esc-42-1' in
+    dark_factory and 'esc-42-1' in reify are unrelated human gates. Qualifying
+    the stored id by project gives each its own row, so neither is refused,
+    merged into the other, or overwritten.
+
+    Arranged so a merge would be DETECTABLE: the df incumbent is the POORER
+    record and reify's filing is richer, so any leak of reify's severity or
+    ids onto df's row shows.
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     orch, recon = _two_queues(tmp_path)
@@ -7211,69 +8258,164 @@ def test_main_write_decision_same_id_different_project_is_refused(
         )
 
     assert rc1 == 0
-    assert rc2 == 0  # loud, but fail-soft: never changes spawn-claude.sh's rc
-    listed = sr.list_decisions(root=tmp_path)
-    assert [d.id for d in listed] == ['esc-42-1']
-    survivor = listed[0]
-    # Untouched in EVERY field -- not merged, not overwritten, not enriched.
-    # 'dark_factory', not the 'df' filed above: write-decision canonicalizes
-    # --project at the CLI boundary (task 3807), so that IS this record's
-    # untouched stored value. The incumbent still has to survive the colliding
-    # filing unchanged, which is what this test pins.
-    assert survivor.project == 'dark_factory'
-    assert survivor.text == 'Adopt the reify plan?'
-    assert survivor.severity == 'info'  # NOT maxed up by the other project
-    assert survivor.task_id is None  # no empty field filled from reify
-    assert survivor.session_id is None
-    assert survivor.escalations_dir == sr.normalize_escalations_dir(orch)
-    refusals = [
-        r
-        for r in caplog.records
-        if r.levelno >= logging.ERROR and 'esc-42-1' in r.getMessage()
-    ]
-    assert refusals, 'the refusal must be logged, not silent'
-    assert 'reify' in refusals[0].getMessage()  # names the refused project
-    # ...and the incumbent, under its canonical stored spelling (task 3807).
-    assert 'dark_factory' in refusals[0].getMessage()
+    assert rc2 == 0
+    rows = {d.id: d for d in sr.list_decisions(root=tmp_path)}
+    assert set(rows) == {'dark_factory-esc-42-1', 'reify-esc-42-1'}
+    df_row = rows['dark_factory-esc-42-1']
+    assert df_row.project == 'dark_factory'
+    assert df_row.text == 'Adopt the reify plan?'
+    assert df_row.severity == 'info'
+    assert df_row.task_id is None
+    assert df_row.session_id is None
+    assert df_row.escalations_dir == sr.normalize_escalations_dir(orch)
+    reify_row = rows['reify-esc-42-1']
+    assert reify_row.project == 'reify'
+    assert reify_row.text == 'an unrelated reify gate that merely shares the id'
+    assert reify_row.severity == 'critical'
+    assert reify_row.task_id == '42'
+    assert reify_row.session_id == 'watcher-reify-1'
+    assert reify_row.escalations_dir == sr.normalize_escalations_dir(recon)
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
 
-def test_main_write_decision_non_open_record_is_still_overwritten(
+def test_main_write_decision_cross_project_filing_leaves_a_closed_row_closed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Protection is scoped to an OPEN record, as the task words it.
+    """Another project's filing of the same local id never touches this project's
+    dismissed row: it lands on its own qualified id as a fresh OPEN ask (task 4835).
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
 
-    An ANSWERED record is a question the human already dealt with; a second
-    watcher filing that id is starting a NEW ask, not enriching a live one,
-    so it gets today's plain overwrite (which re-opens it -- state comes
-    from the incoming record). Enriching instead would silently graft the
-    new question onto a closed row's history.
+    _file_decision(
+        id='esc-42-1',
+        project='df',
+        text='Adopt the reify plan?',
+        severity='info',
+        escalations_dir=str(orch),
+    )
+    assert sr.set_manual_boost('dark_factory-esc-42-1', 9, root=tmp_path) is not None
+    assert (
+        sr.update_decision_state(
+            'dark_factory-esc-42-1', sr.DecisionState.DROPPED, root=tmp_path
+        )
+        is not None
+    )
+
+    rc = _file_decision(
+        id='esc-42-1',
+        project='reify',
+        text='an unrelated reify gate that merely shares the id',
+        severity='critical',
+        escalations_dir=str(recon),
+    )
+
+    assert rc == 0
+    rows = {d.id: d for d in sr.list_decisions(root=tmp_path)}
+    assert set(rows) == {'dark_factory-esc-42-1', 'reify-esc-42-1'}
+    assert rows['reify-esc-42-1'].state == sr.DecisionState.OPEN
+    assert rows['reify-esc-42-1'].manual_boost == 0
+    assert rows['dark_factory-esc-42-1'].state == sr.DecisionState.DROPPED
+    assert rows['dark_factory-esc-42-1'].manual_boost == 9
+
+
+def test_main_write_decision_refuses_a_qualified_id_held_open_by_another_project(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The cross-PROJECT refusal arm survives qualification as defense in depth.
+
+    It is reachable only when the QUALIFIED id is itself held by another
+    project's record: a legacy hand-prefixed id, filed before task 4835, whose
+    prefix spells a different project than the record carries (the live
+    ``recon-esc-7459-1`` held by project reify is the shape). Merging would hide
+    this ask inside that row and overwriting would delete a live row, so the
+    filing is refused, loudly and fail-soft.
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     orch, recon = _two_queues(tmp_path)
     sr.write_decision(
         _make_decision(
-            id='esc-5914-1',
-            project='df',
-            text='the old, answered question',
-            state=sr.DecisionState.ANSWERED,
-            escalations_dir=sr.normalize_escalations_dir(orch),
+            id='reify-esc-42-1',
+            project='dark_factory',
+            text='Adopt the reify plan?',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=str(orch),
+        ),
+        root=tmp_path,
+    )
+    path = sr.decision_path_for_id('reify-esc-42-1', root=tmp_path)
+    before = path.read_bytes()
+
+    with caplog.at_level(logging.ERROR):
+        rc = _file_decision(
+            id='esc-42-1',
+            project='reify',
+            text='an unrelated reify gate that merely shares the id',
+            severity='critical',
+            escalations_dir=str(recon),
+        )
+
+    assert rc == 0
+    assert path.read_bytes() == before
+    refusals = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert refusals, 'the refusal must be logged, not silent'
+    assert 'reify' in refusals[0].getMessage()
+    assert 'dark_factory' in refusals[0].getMessage()
+
+
+@pytest.mark.parametrize(
+    'closed_state', [sr.DecisionState.DROPPED, sr.DecisionState.ANSWERED]
+)
+def test_main_write_decision_overwrites_a_qualified_id_held_closed_by_another_project(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    closed_state: str,
+) -> None:
+    """The refusal arm keeps its OPEN scoping (task 3872).
+
+    A closed incumbent is a question already dealt with, and a cross-project
+    filing is by construction a cross-queue one, where a closed row cannot be
+    shown to be the same gate. So the filing starts a new ask with a full
+    overwrite, and no ERROR: a refusal here would be a silent drop.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+    sr.write_decision(
+        _make_decision(
+            id='reify-esc-42-1',
+            project='dark_factory',
+            text='Adopt the reify plan?',
+            state=closed_state,
+            manual_boost=9,
+            escalations_dir=str(orch),
         ),
         root=tmp_path,
     )
 
-    _file_decision(
-        id='esc-5914-1',
-        project='df',
-        text='a brand new question',
-        escalations_dir=str(recon),
-    )
+    with caplog.at_level(logging.ERROR):
+        rc = _file_decision(
+            id='esc-42-1',
+            project='reify',
+            text='an unrelated reify gate that merely shares the id',
+            severity='critical',
+            escalations_dir=str(recon),
+        )
 
-    listed = sr.list_decisions(root=tmp_path)
-    assert [d.id for d in listed] == ['esc-5914-1']
-    assert listed[0].text == 'a brand new question'
-    assert listed[0].state == sr.DecisionState.OPEN
-    assert listed[0].escalations_dir == sr.normalize_escalations_dir(recon)
+    assert rc == 0
+    assert [d.id for d in sr.list_decisions(root=tmp_path)] == ['reify-esc-42-1']
+    survivor = sr.list_decisions(root=tmp_path)[0]
+    assert survivor.project == 'reify'
+    assert survivor.text == 'an unrelated reify gate that merely shares the id'
+    assert survivor.severity == 'critical'
+    assert survivor.state == sr.DecisionState.OPEN
+    assert survivor.manual_boost == 0
+    assert survivor.escalations_dir == sr.normalize_escalations_dir(recon)
+    refusals = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert not refusals, f'a closed incumbent must not be defended, got: {refusals}'
 
 
 def test_main_write_decision_enriches_a_legacy_unstamped_record(
@@ -7293,7 +8435,7 @@ def test_main_write_decision_enriches_a_legacy_unstamped_record(
     orch, _recon = _two_queues(tmp_path)
     sr.write_decision(
         _make_decision(
-            id='esc-5914-1',
+            id=_qid('esc-5914-1'),
             project='df',
             text='Adopt the reify plan?',
             state=sr.DecisionState.OPEN,
@@ -7317,9 +8459,219 @@ def test_main_write_decision_enriches_a_legacy_unstamped_record(
     )
 
     listed = sr.list_decisions(root=tmp_path)
-    assert [d.id for d in listed] == ['esc-5914-1']
+    assert [d.id for d in listed] == [_qid('esc-5914-1')]
     assert listed[0].escalations_dir == sr.normalize_escalations_dir(orch)
     assert listed[0].text == 'Adopt the reify plan?'  # enriched, not clobbered
+
+
+# ---------------------------------------------------------------------------
+# Lazy adoption of bare-keyed decisions filed before task 4835
+# ---------------------------------------------------------------------------
+
+
+def _seed_legacy_decision(root: Path, **overrides: object) -> Path:
+    """Write a bare-keyed record, as write-decision filed it before task 4835."""
+    record = _make_decision(
+        **{
+            'id': 'esc-5914-1',
+            'project': 'df',
+            'text': 'Adopt the reify plan?',
+            'state': sr.DecisionState.OPEN,
+            **overrides,
+        }
+    )
+    sr.write_decision(record, root=root)
+    return sr.decision_path_for_id(record.id, root=root)
+
+
+def _decision_files(root: Path) -> list[str]:
+    return sorted(path.name for path in sr.decisions_dir(root).glob('*.json'))
+
+
+def test_main_write_decision_continues_a_same_project_legacy_record_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A same-queue re-file of a pre-4835 bare-keyed record lands ON that record,
+    keeping its custody, rather than opening a second, qualified row.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    _seed_legacy_decision(tmp_path, manual_boost=4, escalations_dir=str(orch))
+    capsys.readouterr()
+
+    rc = _file_decision(
+        id='esc-5914-1',
+        project='dark_factory',
+        text='reify? (rephrased)',
+        escalations_dir=str(orch),
+    )
+
+    assert rc == 0
+    assert _decision_files(tmp_path) == ['esc-5914-1.json']
+    assert capsys.readouterr().out.strip() == 'esc-5914-1'
+    [survivor] = sr.list_decisions(root=tmp_path)
+    assert survivor.text == 'reify? (rephrased)'
+    assert survivor.manual_boost == 4
+    assert survivor.filed_at == _make_decision().filed_at
+
+
+def test_main_write_decision_holds_a_dropped_legacy_record_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Task 3872's guarantee survives the id-format change: the first
+    post-deploy restart of a watcher must not undo an operator's dismissal of
+    a row filed under the old bare id.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    _seed_legacy_decision(
+        tmp_path, state=sr.DecisionState.DROPPED, escalations_dir=str(orch)
+    )
+
+    with caplog.at_level(logging.WARNING):
+        rc = _file_decision(
+            id='esc-5914-1',
+            project='dark_factory',
+            text='reify? (rephrased)',
+            escalations_dir=str(orch),
+        )
+
+    assert rc == 0
+    assert _decision_files(tmp_path) == ['esc-5914-1.json']
+    [survivor] = sr.list_decisions(root=tmp_path)
+    assert survivor.state == sr.DecisionState.DROPPED
+    held = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and 'dropped' in r.getMessage()
+    ]
+    assert held and 'esc-5914-1' in held[0]
+
+
+def test_main_write_decision_enriches_a_same_project_legacy_record_from_the_other_queue(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """MODE-2 holds across the transition: the second queue's filing folds into
+    the legacy row instead of opening a qualified twin beside it.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+    _seed_legacy_decision(tmp_path, severity='critical', escalations_dir=str(orch))
+
+    rc = _file_decision(
+        id='esc-5914-1',
+        project='dark_factory',
+        text='reify?',
+        severity='info',
+        escalations_dir=str(recon),
+    )
+
+    assert rc == 0
+    assert _decision_files(tmp_path) == ['esc-5914-1.json']
+    [survivor] = sr.list_decisions(root=tmp_path)
+    assert survivor.severity == 'critical'
+    assert survivor.text == 'Adopt the reify plan?'
+    assert survivor.escalations_dir == sr.normalize_escalations_dir(orch)
+
+
+def test_main_write_decision_ignores_another_projects_legacy_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+    legacy = _seed_legacy_decision(
+        tmp_path, id='esc-42-1', project='dark_factory', escalations_dir=str(orch)
+    )
+    before = legacy.read_bytes()
+
+    with caplog.at_level(logging.ERROR):
+        rc = _file_decision(
+            id='esc-42-1',
+            project='reify',
+            text='an unrelated reify gate that merely shares the id',
+            escalations_dir=str(recon),
+        )
+
+    assert rc == 0
+    assert _decision_files(tmp_path) == ['esc-42-1.json', 'reify-esc-42-1.json']
+    assert legacy.read_bytes() == before
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def test_main_write_decision_prefers_the_qualified_record_over_a_legacy_one(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    legacy = _seed_legacy_decision(
+        tmp_path, id='esc-7-1', project='dark_factory', escalations_dir=str(orch)
+    )
+    _seed_legacy_decision(
+        tmp_path, id='dark_factory-esc-7-1', project='dark_factory', escalations_dir=str(orch)
+    )
+    before = legacy.read_bytes()
+
+    rc = _file_decision(
+        id='esc-7-1',
+        project='dark_factory',
+        text='reify? (rephrased)',
+        escalations_dir=str(orch),
+    )
+
+    assert rc == 0
+    rows = {d.id: d for d in sr.list_decisions(root=tmp_path)}
+    assert rows['dark_factory-esc-7-1'].text == 'reify? (rephrased)'
+    assert legacy.read_bytes() == before
+
+
+class TestLegacyAdoptionLocks:
+    @staticmethod
+    def _spy_on_locks(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        real_lock = sr.decision_id_lock
+        acquired: list[str] = []
+
+        @contextlib.contextmanager
+        def recording_lock(decision_id: str, root: Path | str | None = None):
+            acquired.append(decision_id)
+            with real_lock(decision_id, root=root):
+                yield
+
+        monkeypatch.setattr(sr, 'decision_id_lock', recording_lock)
+        return acquired
+
+    def test_adoption_locks_the_qualified_key_then_the_legacy_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        orch, _recon = _two_queues(tmp_path)
+        _seed_legacy_decision(tmp_path, escalations_dir=str(orch))
+        acquired = self._spy_on_locks(monkeypatch)
+
+        _file_decision(
+            id='esc-5914-1', project='dark_factory', text='q', escalations_dir=str(orch)
+        )
+
+        assert acquired == ['dark_factory-esc-5914-1', 'esc-5914-1']
+
+    def test_a_fresh_filing_locks_only_the_qualified_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        orch, _recon = _two_queues(tmp_path)
+        acquired = self._spy_on_locks(monkeypatch)
+
+        _file_decision(id='esc-9-1', project='dark_factory', text='q', escalations_dir=str(orch))
+
+        assert acquired == ['dark_factory-esc-9-1']
+        assert not (sr.decisions_dir(tmp_path) / 'esc-9-1.json.lock').exists()
 
 
 def test_main_reap_decisions_fail_soft_on_bad_escalations_dir(
@@ -8987,3 +10339,710 @@ def test_main_migrate_decision_projects_fail_soft_when_fleet_root_under_a_file(
     assert rc == 0
     assert capsys.readouterr().out.strip() == ''
     assert not (blocker / 'fleet').exists()
+
+
+# ---------------------------------------------------------------------------
+# _pid_alive against an out-of-range pid (task 4755 review fix 1/4)
+#
+# This predicate is not only asked about pids this module itself recorded:
+# orchestrator/src/orchestrator/service_restart.py imports it to evaluate the
+# fleet-redeploy lease, whose pid is parsed out of JSON that
+# scripts/restart-all-orchestrators.sh wrote. A value no C pid_t can hold is
+# therefore ordinary untrusted input, and os.kill answers it with
+# OverflowError -- which is NOT an OSError, so the predicate's final except
+# clause does not catch it and it escapes to every caller.
+# ---------------------------------------------------------------------------
+
+
+def test_pid_alive_reports_dead_for_a_pid_too_large_for_the_platform() -> None:
+    """A pid larger than C ``pid_t`` reads as DEAD and must not raise.
+
+    ``os.kill(2**70, 0)`` raises ``OverflowError('Python int too large to
+    convert to C long')``. "Cannot name a live process" is exactly the
+    judgment the existing ``other OSError -> treated as dead`` branch already
+    makes for every other value the syscall refuses, so answering False here
+    is this predicate's own documented contract rather than a new tolerance.
+
+    It is also the contract ``service_restart.lease_is_live`` states
+    absolutely on this predicate's behalf -- "FAIL-OPEN throughout: a missing,
+    corrupt, unreadable or nonsensical lease reads as 'no sweep in flight' and
+    never raises" -- and that promise cannot hold if the pid check can throw.
+    """
+    assert sr._pid_alive(_UNREPRESENTABLE_PID) is False
+
+
+# ---------------------------------------------------------------------------
+# DecisionRecord.closing_evidence and the close-decision verb (task 5376)
+# ---------------------------------------------------------------------------
+
+_EVIDENCE = 'gate 1 ruling_is_leos_own: held\nLeo 2026-09-20: esc-400-1 option A'
+
+
+def _assert_utc_instant_within(stamp: str, before: datetime, after: datetime) -> None:
+    instant = datetime.fromisoformat(stamp)
+    assert instant.utcoffset() == timedelta(0)
+    assert before <= instant <= after
+
+
+class TestClosingEvidence:
+    """The deciding evidence, quoted verbatim on the closed record, and the one mutator that writes it."""
+
+    def _seed(self, root: Path, **overrides: object) -> Path:
+        sr.write_decision(_make_decision(id='dec-close', **{'state': sr.DecisionState.OPEN, **overrides}), root=root)
+        return sr.decision_path_for_id('dec-close', root=root)
+
+    def _close(self, root: Path, state: str = sr.DecisionState.ANSWERED, evidence: str = _EVIDENCE):
+        return sr.close_decision_with_evidence(
+            'dec-close', state, evidence, root=root, **_identity_of(_make_decision())
+        )
+
+    def test_defaults_to_empty(self) -> None:
+        d = sr.DecisionRecord(id='dec-1', project='df', text='approve?', filed_at='2026-07-07T00:00:00+00:00')
+
+        assert d.closing_evidence == ''
+
+    def test_round_trips_losslessly(self) -> None:
+        d = _make_decision(closing_evidence=_EVIDENCE, escalations_dir='/p/data/escalations')
+
+        assert d.to_dict()['closing_evidence'] == _EVIDENCE
+        assert sr.DecisionRecord.from_dict(d.to_dict()) == d
+        assert sr.DecisionRecord.from_json(d.to_json()) == d
+
+    @pytest.mark.parametrize('present', [{}, {'closing_evidence': None}], ids=['absent', 'null'])
+    def test_an_absent_or_null_key_parses_as_empty(self, present: dict) -> None:
+        data = _make_decision().to_dict()
+        del data['closing_evidence']
+
+        assert sr.DecisionRecord.from_dict({**data, **present}).closing_evidence == ''
+
+    def test_a_pre_severity_era_minimal_record_parses_as_empty(self) -> None:
+        minimal = {'id': 'dec-old', 'project': 'df', 'text': 'q', 'filed_at': '2026-05-01T00:00:00+00:00'}
+
+        assert sr.DecisionRecord.from_dict(minimal).closing_evidence == ''
+
+    @pytest.mark.parametrize('state', [sr.DecisionState.ANSWERED, sr.DecisionState.DROPPED])
+    def test_open_to_terminal_sets_state_and_evidence_in_one_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str
+    ) -> None:
+        self._seed(tmp_path)
+        real_write = sr.write_decision
+        written: list[dict[str, Any]] = []
+
+        def recording_write(record: sr.DecisionRecord, root: Path | str | None = None) -> bool:
+            written.append(record.to_dict())
+            return real_write(record, root=root)
+
+        monkeypatch.setattr(sr, 'write_decision', recording_write)
+
+        before = datetime.now(UTC)
+        updated = self._close(tmp_path, state)
+        after = datetime.now(UTC)
+
+        assert updated is not None
+        assert (updated.state, updated.closing_evidence) == (state, _EVIDENCE)
+        [write] = written
+        assert (write['state'], write['closing_evidence'], write['closed_at']) == (state, _EVIDENCE, updated.closed_at)
+        _assert_utc_instant_within(updated.closed_at, before, after)
+        [reread] = sr.list_decisions(root=tmp_path)
+        assert reread == updated
+
+    def test_evidence_attaches_to_a_record_the_reaper_already_closed(self, tmp_path: Path) -> None:
+        self._seed(tmp_path, state=sr.DecisionState.ANSWERED)
+
+        updated = self._close(tmp_path)
+
+        assert updated is not None
+        assert (updated.state, updated.closing_evidence) == (sr.DecisionState.ANSWERED, _EVIDENCE)
+
+    @pytest.mark.parametrize(('seeded', 'state', 'evidence', 'reason'), [
+        ({}, sr.DecisionState.OPEN, _EVIDENCE, r"not 'open'"),
+        ({}, sr.DecisionState.ANSWERED, '', 'evidence is empty'),
+        ({}, sr.DecisionState.ANSWERED, '  \n\t', 'evidence is empty'),
+        ({'state': sr.DecisionState.ANSWERED}, sr.DecisionState.DROPPED, _EVIDENCE, 'between terminal states'),
+        ({'state': sr.DecisionState.ANSWERED, 'closing_evidence': 'the reaper-era evidence'},
+         sr.DecisionState.ANSWERED, _EVIDENCE, 'overwrite'),
+    ], ids=['to-open', 'empty', 'whitespace', 'terminal-to-terminal', 'overwrite'])
+    def test_refusals_raise_naming_the_refusal_and_write_nothing(
+        self, tmp_path: Path, seeded: dict, state: str, evidence: str, reason: str
+    ) -> None:
+        path = self._seed(tmp_path, **seeded)
+        before = path.read_bytes()
+
+        with pytest.raises(sr.DecisionCloseRefused, match=reason):
+            self._close(tmp_path, state, evidence)
+
+        assert path.read_bytes() == before
+        assert sr.DecisionRecord.from_json(path.read_text()).closed_at == ''
+
+    @pytest.mark.parametrize(('state', 'evidence'), [
+        (sr.DecisionState.OPEN, _EVIDENCE),
+        (sr.DecisionState.ANSWERED, ' '),
+    ])
+    def test_argument_refusals_take_no_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str, evidence: str
+    ) -> None:
+        """Mirrors test_main_write_decision_refusal_takes_no_lock: a lock sidecar is never cleaned up."""
+        self._seed(tmp_path)
+        acquired: list[str] = []
+
+        @contextlib.contextmanager
+        def recording_lock(decision_id: str, root: Path | str | None = None):
+            acquired.append(decision_id)
+            yield
+
+        monkeypatch.setattr(sr, 'decision_id_lock', recording_lock)
+
+        with pytest.raises(sr.DecisionCloseRefused):
+            self._close(tmp_path, state, evidence)
+
+        assert acquired == []
+
+    def test_fail_soft_when_absent(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.ERROR):
+            assert self._close(tmp_path) is None
+
+        assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+    def test_fail_soft_on_a_corrupt_body(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        path = sr.decision_path_for_id('dec-close', root=tmp_path)
+        path.parent.mkdir(parents=True)
+        path.write_text('{not valid json')
+
+        with caplog.at_level(logging.ERROR):
+            assert self._close(tmp_path) is None
+
+        assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+    def test_fail_soft_on_an_unwritable_root(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        blocker = tmp_path / 'blocker'
+        blocker.write_text('not a directory')
+
+        with caplog.at_level(logging.ERROR):
+            assert sr.close_decision_with_evidence(
+                'dec-close', sr.DecisionState.ANSWERED, _EVIDENCE, root=blocker / 'fleet',
+                **_identity_of(_make_decision()),
+            ) is None
+
+        assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+    @pytest.mark.timeout(30)
+    def test_a_concurrent_boost_loses_neither_mutation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same technique as test_concurrent_state_and_boost_updates_do_not_lose_a_field."""
+        self._seed(tmp_path, manual_boost=0)
+        real_write = sr.write_decision
+
+        def delayed_write(record: sr.DecisionRecord, root: Path | str | None = None) -> bool:
+            time.sleep(0.3)
+            return real_write(record, root=root)
+
+        monkeypatch.setattr(sr, 'write_decision', delayed_write)
+        threads = [
+            threading.Thread(target=self._close, args=(tmp_path,)),
+            threading.Thread(target=sr.set_manual_boost, args=('dec-close', 7, tmp_path)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert not any(thread.is_alive() for thread in threads)
+        [reread] = sr.list_decisions(root=tmp_path)
+        assert (reread.state, reread.closing_evidence, reread.manual_boost) == (
+            sr.DecisionState.ANSWERED, _EVIDENCE, 7,
+        )
+
+    def test_same_queue_refile_keeps_the_evidence(self) -> None:
+        closed_at = '2026-09-20T05:31:00+00:00'
+        existing = _make_decision(
+            state=sr.DecisionState.ANSWERED, closing_evidence=_EVIDENCE, closed_at=closed_at, escalations_dir='/q'
+        )
+        incoming = _make_decision(state=sr.DecisionState.OPEN, escalations_dir='/q')
+
+        for merged in (sr.merge_same_queue_refile(existing, incoming), sr.merge_decision_enrichment(existing, incoming)):
+            assert (merged.closing_evidence, merged.closed_at) == (_EVIDENCE, closed_at)
+
+
+class TestClosedAt:
+    """When the evidence-carrying close happened: custody, stamped by close_decision_with_evidence alone."""
+
+    def test_defaults_to_empty(self) -> None:
+        d = sr.DecisionRecord(id='dec-1', project='df', text='approve?', filed_at='2026-07-07T00:00:00+00:00')
+
+        assert d.closed_at == ''
+
+    def test_round_trips_losslessly(self) -> None:
+        d = _make_decision(closing_evidence=_EVIDENCE, closed_at='2026-09-20T05:31:00+00:00')
+
+        assert d.to_dict()['closed_at'] == '2026-09-20T05:31:00+00:00'
+        assert sr.DecisionRecord.from_dict(d.to_dict()) == d
+        assert sr.DecisionRecord.from_json(d.to_json()) == d
+
+    @pytest.mark.parametrize('present', [{}, {'closed_at': None}], ids=['absent', 'null'])
+    def test_an_absent_or_null_key_parses_as_empty(self, present: dict) -> None:
+        data = _make_decision().to_dict()
+        del data['closed_at']
+
+        assert sr.DecisionRecord.from_dict({**data, **present}).closed_at == ''
+
+    def test_a_pre_severity_era_minimal_record_parses_as_empty(self) -> None:
+        minimal = {'id': 'dec-old', 'project': 'df', 'text': 'q', 'filed_at': '2026-05-01T00:00:00+00:00'}
+
+        assert sr.DecisionRecord.from_dict(minimal).closed_at == ''
+
+    def test_attaching_evidence_after_the_reaper_closed_stamps_it(self, tmp_path: Path) -> None:
+        seeded = _make_decision(id='dec-close', state=sr.DecisionState.ANSWERED)
+        sr.write_decision(seeded, root=tmp_path)
+
+        before = datetime.now(UTC)
+        updated = sr.close_decision_with_evidence(
+            'dec-close', sr.DecisionState.ANSWERED, _EVIDENCE, root=tmp_path, **_identity_of(seeded)
+        )
+        after = datetime.now(UTC)
+
+        assert updated is not None
+        _assert_utc_instant_within(updated.closed_at, before, after)
+
+    def test_a_same_queue_write_decision_refile_keeps_it(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        queue = str(tmp_path / 'data' / 'escalations')
+        filing = {'id': 'dec-close', 'project': 'dark_factory', 'text': 'approve?', 'escalations_dir': queue}
+        _file_decision(**filing)
+        closed = sr.close_decision_with_evidence(
+            _qid('dec-close'), sr.DecisionState.ANSWERED, _EVIDENCE, root=tmp_path,
+            expected_project='dark_factory', expected_escalations_dir=queue,
+        )
+        assert closed is not None and closed.closed_at
+
+        _file_decision(**{**filing, 'text': 'approve? (rephrased)'})
+
+        [reread] = sr.list_decisions(root=tmp_path)
+        assert reread.text == 'approve? (rephrased)'
+        assert (reread.state, reread.closing_evidence, reread.closed_at) == (
+            sr.DecisionState.ANSWERED, _EVIDENCE, closed.closed_at,
+        )
+
+    def test_the_other_state_and_boost_writers_never_stamp_it(self, tmp_path: Path) -> None:
+        sr.write_decision(_make_decision(id='dec-close', state=sr.DecisionState.OPEN), root=tmp_path)
+
+        closed = sr.update_decision_state('dec-close', sr.DecisionState.ANSWERED, root=tmp_path)
+        boosted = sr.set_manual_boost('dec-close', 7, root=tmp_path)
+
+        assert closed is not None and boosted is not None
+        assert (closed.closed_at, boosted.closed_at) == ('', '')
+
+
+class TestCloseDecisionVerb:
+    def _argv(self, root: Path, *, state: str = 'answered', evidence: str = _EVIDENCE) -> list[str]:
+        seeded = _make_decision()
+        return [
+            'close-decision', '--id', 'dec-close', '--state', state, '--evidence', evidence,
+            '--project', seeded.project, '--escalations-dir', seeded.escalations_dir, '--root', str(root),
+        ]
+
+    def test_is_registered_in_the_parser(self, tmp_path: Path) -> None:
+        args = sr._build_parser().parse_args(self._argv(tmp_path))
+        seeded = _make_decision()
+
+        assert (args.verb, args.id, args.state, args.evidence, args.root) == (
+            'close-decision', 'dec-close', 'answered', _EVIDENCE, str(tmp_path),
+        )
+        assert (args.project, args.escalations_dir) == (seeded.project, seeded.escalations_dir)
+
+    def test_success_prints_the_id_and_exits_0(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        sr.write_decision(_make_decision(id='dec-close', state=sr.DecisionState.OPEN), root=tmp_path)
+
+        rc = sr.main(self._argv(tmp_path))
+
+        assert rc == 0
+        assert capsys.readouterr().out.strip() == 'dec-close'
+        [reread] = sr.list_decisions(root=tmp_path)
+        assert (reread.state, reread.closing_evidence) == (sr.DecisionState.ANSWERED, _EVIDENCE)
+
+    def test_a_refusal_exits_nonzero_naming_it(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        sr.write_decision(_make_decision(id='dec-close', state=sr.DecisionState.OPEN), root=tmp_path)
+
+        rc = sr.main(self._argv(tmp_path, evidence=' '))
+
+        assert rc != 0
+        assert 'evidence is empty' in capsys.readouterr().err
+
+    def test_an_absent_record_exits_nonzero(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = sr.main(self._argv(tmp_path))
+
+        assert rc != 0
+        assert 'dec-close' in capsys.readouterr().err
+
+
+class TestCloseDecisionIdentity:
+    """A close lands only on the record the caller names: decision ids are fleet-global, esc numbering is per project."""
+
+    _A_PROJECT = 'know_live'
+    _A_QUEUE = '/a/data/escalations'
+    _B_PROJECT = 'reify'
+    _B_QUEUE = '/b/data/escalations'
+
+    def _seed(self, root: Path, **overrides: object) -> Path:
+        fields = {'id': 'esc-42-1', 'project': self._A_PROJECT, 'escalations_dir': self._A_QUEUE,
+                  'state': sr.DecisionState.OPEN, 'closing_evidence': '', **overrides}
+        sr.write_decision(_make_decision(**fields), root=root)
+        return sr.decision_path_for_id('esc-42-1', root=root)
+
+    def _close(self, root: Path, project: str, queue: str) -> sr.DecisionRecord | None:
+        return sr.close_decision_with_evidence(
+            'esc-42-1', sr.DecisionState.ANSWERED, _EVIDENCE, root=root,
+            expected_project=project, expected_escalations_dir=queue,
+        )
+
+    @pytest.mark.parametrize(('project', 'queue'), [
+        (_A_PROJECT, _B_QUEUE),
+        (_B_PROJECT, _A_QUEUE),
+        (_B_PROJECT, _B_QUEUE),
+    ], ids=['queue-only', 'project-only', 'both'])
+    def test_another_projects_record_at_the_same_id_is_refused_and_untouched(
+        self, tmp_path: Path, project: str, queue: str
+    ) -> None:
+        """The reviewer's scenario: project B's close payload names an id project A already holds OPEN."""
+        path = self._seed(tmp_path)
+        before = path.read_bytes()
+
+        with pytest.raises(sr.DecisionCloseRefused) as refused:
+            self._close(tmp_path, project, queue)
+
+        message = str(refused.value)
+        for named in ('esc-42-1', self._A_PROJECT, self._A_QUEUE, project, queue):
+            assert named in message
+        assert path.read_bytes() == before
+        [reread] = sr.list_decisions(root=tmp_path)
+        assert (reread.state, reread.closing_evidence, reread.closed_at) == (sr.DecisionState.OPEN, '', '')
+
+    @pytest.mark.parametrize('queue', ['/q/data/escalations/', '/q/./data/escalations'], ids=['slash', 'dot'])
+    def test_both_sides_are_folded_before_the_compare(self, tmp_path: Path, queue: str) -> None:
+        self._seed(tmp_path, project='df', escalations_dir=sr.normalize_escalations_dir('/q/data/escalations'))
+
+        updated = self._close(tmp_path, 'dark_factory', queue)
+
+        assert updated is not None
+        assert (updated.state, updated.closing_evidence) == (sr.DecisionState.ANSWERED, _EVIDENCE)
+
+    @pytest.mark.parametrize('stamp', ['', sr.UNKNOWN_QUEUE], ids=['legacy', 'unknown'])
+    def test_a_sentinel_stamp_closes_under_the_same_sentinel(self, tmp_path: Path, stamp: str) -> None:
+        self._seed(tmp_path, escalations_dir=stamp)
+
+        updated = self._close(tmp_path, self._A_PROJECT, stamp)
+
+        assert updated is not None
+        assert updated.closing_evidence == _EVIDENCE
+
+    @pytest.mark.parametrize(('stamp', 'queue'), [
+        ('', '/q/data/escalations'),
+        (sr.UNKNOWN_QUEUE, ''),
+        (sr.UNKNOWN_QUEUE, '/q/data/escalations'),
+    ], ids=['legacy-vs-real', 'unknown-vs-legacy', 'unknown-vs-real'])
+    def test_a_sentinel_stamp_is_refused_under_any_other_expectation(
+        self, tmp_path: Path, stamp: str, queue: str
+    ) -> None:
+        path = self._seed(tmp_path, escalations_dir=stamp)
+        before = path.read_bytes()
+
+        with pytest.raises(sr.DecisionCloseRefused, match='esc-42-1'):
+            self._close(tmp_path, self._A_PROJECT, queue)
+
+        assert path.read_bytes() == before
+
+    def test_the_identity_check_runs_before_the_overwrite_check(self, tmp_path: Path) -> None:
+        path = self._seed(tmp_path, state=sr.DecisionState.ANSWERED, closing_evidence='project A evidence')
+        before = path.read_bytes()
+
+        with pytest.raises(sr.DecisionCloseRefused) as refused:
+            self._close(tmp_path, self._B_PROJECT, self._B_QUEUE)
+
+        assert self._B_PROJECT in str(refused.value)
+        assert 'overwrite' not in str(refused.value)
+        assert path.read_bytes() == before
+
+    def _argv(self, root: Path, *, project: str, queue: str) -> list[str]:
+        return [
+            'close-decision', '--id', 'esc-42-1', '--state', 'answered', '--evidence', _EVIDENCE,
+            '--project', project, '--escalations-dir', queue, '--root', str(root),
+        ]
+
+    @pytest.mark.parametrize('dropped', ['--project', '--escalations-dir'])
+    def test_the_verb_requires_both_expectations(self, tmp_path: Path, dropped: str) -> None:
+        argv = self._argv(tmp_path, project=self._A_PROJECT, queue=self._A_QUEUE)
+        at = argv.index(dropped)
+        del argv[at:at + 2]
+
+        with pytest.raises(SystemExit) as exited:
+            sr.main(argv)
+
+        assert exited.value.code == 2
+
+    def test_the_verb_exits_nonzero_on_a_mismatch_and_leaves_the_record(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        path = self._seed(tmp_path)
+        before = path.read_bytes()
+
+        rc = sr.main(self._argv(tmp_path, project=self._B_PROJECT, queue=self._B_QUEUE))
+
+        assert rc != 0
+        err = capsys.readouterr().err
+        assert 'close-decision refused' in err
+        assert self._B_PROJECT in err
+        assert path.read_bytes() == before
+
+    def test_the_verb_closes_the_record_it_names(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        self._seed(tmp_path)
+
+        rc = sr.main(self._argv(tmp_path, project=self._A_PROJECT, queue=self._A_QUEUE))
+
+        assert rc == 0
+        assert capsys.readouterr().out.strip() == 'esc-42-1'
+        [reread] = sr.list_decisions(root=tmp_path)
+        assert (reread.state, reread.closing_evidence) == (sr.DecisionState.ANSWERED, _EVIDENCE)
+
+
+class TestReopenDecision:
+    """reopen_decision re-opens a closed record IN PLACE, under the same compare-and-swap as a close (task 4835)."""
+
+    _A_PROJECT = 'know_live'
+    _A_QUEUE = '/a/data/escalations'
+    _B_PROJECT = 'reify'
+    _B_QUEUE = '/b/data/escalations'
+    _FILED_AT = '2026-07-07T00:00:00+00:00'
+
+    def _seed(self, root: Path, **overrides: object) -> sr.DecisionRecord:
+        fields = {
+            'id': 'esc-42-1', 'project': self._A_PROJECT, 'escalations_dir': self._A_QUEUE,
+            'state': sr.DecisionState.DROPPED, 'closing_evidence': _EVIDENCE,
+            'closed_at': '2026-09-20T09:00:00+00:00', 'manual_boost': 3, 'filed_at': self._FILED_AT,
+            **overrides,
+        }
+        seeded = _make_decision(**fields)
+        sr.write_decision(seeded, root=root)
+        return seeded
+
+    def _path(self, root: Path) -> Path:
+        return sr.decision_path_for_id('esc-42-1', root=root)
+
+    @pytest.mark.parametrize('closed_state', [sr.DecisionState.DROPPED, sr.DecisionState.ANSWERED])
+    def test_a_closed_record_reopens_with_its_closing_fields_cleared(
+        self, tmp_path: Path, closed_state: str
+    ) -> None:
+        seeded = self._seed(tmp_path, state=closed_state)
+
+        reopened = sr.reopen_decision('esc-42-1', root=tmp_path, **_identity_of(seeded))
+
+        [reread] = sr.list_decisions(root=tmp_path)
+        for record in (reopened, reread):
+            assert record is not None
+            assert (record.state, record.closing_evidence, record.closed_at) == (sr.DecisionState.OPEN, '', '')
+            assert (record.filed_at, record.text, record.manual_boost, record.escalations_dir) == (
+                self._FILED_AT, seeded.text, 3, self._A_QUEUE,
+            )
+
+    def test_an_open_record_stays_open(self, tmp_path: Path) -> None:
+        seeded = self._seed(tmp_path, state=sr.DecisionState.OPEN, closing_evidence='', closed_at='')
+
+        reopened = sr.reopen_decision('esc-42-1', root=tmp_path, **_identity_of(seeded))
+
+        assert reopened is not None
+        assert reopened.state == sr.DecisionState.OPEN
+
+    @pytest.mark.parametrize(('project', 'queue'), [
+        (_A_PROJECT, _B_QUEUE),
+        (_B_PROJECT, _A_QUEUE),
+        (_B_PROJECT, _B_QUEUE),
+    ], ids=['queue-only', 'project-only', 'both'])
+    def test_another_projects_record_at_the_same_id_is_refused_and_untouched(
+        self, tmp_path: Path, project: str, queue: str
+    ) -> None:
+        self._seed(tmp_path)
+        before = self._path(tmp_path).read_bytes()
+
+        with pytest.raises(sr.DecisionReopenRefused) as refused:
+            sr.reopen_decision(
+                'esc-42-1', root=tmp_path, expected_project=project, expected_escalations_dir=queue
+            )
+
+        message = str(refused.value)
+        for named in ('esc-42-1', self._A_PROJECT, self._A_QUEUE, project, queue):
+            assert named in message
+        assert self._path(tmp_path).read_bytes() == before
+
+    @pytest.mark.parametrize('stamp', ['', sr.UNKNOWN_QUEUE], ids=['legacy', 'unknown'])
+    def test_a_sentinel_stamp_reopens_under_the_same_sentinel(self, tmp_path: Path, stamp: str) -> None:
+        self._seed(tmp_path, escalations_dir=stamp)
+
+        reopened = sr.reopen_decision(
+            'esc-42-1', root=tmp_path, expected_project=self._A_PROJECT, expected_escalations_dir=stamp
+        )
+
+        assert reopened is not None
+        assert reopened.state == sr.DecisionState.OPEN
+
+    @pytest.mark.parametrize(('stamp', 'queue'), [
+        ('', '/q/data/escalations'),
+        (sr.UNKNOWN_QUEUE, ''),
+        (sr.UNKNOWN_QUEUE, '/q/data/escalations'),
+    ], ids=['legacy-vs-real', 'unknown-vs-legacy', 'unknown-vs-real'])
+    def test_a_sentinel_stamp_is_refused_under_any_other_expectation(
+        self, tmp_path: Path, stamp: str, queue: str
+    ) -> None:
+        self._seed(tmp_path, escalations_dir=stamp)
+        before = self._path(tmp_path).read_bytes()
+
+        with pytest.raises(sr.DecisionReopenRefused, match='esc-42-1'):
+            sr.reopen_decision(
+                'esc-42-1', root=tmp_path, expected_project=self._A_PROJECT, expected_escalations_dir=queue
+            )
+
+        assert self._path(tmp_path).read_bytes() == before
+
+    def test_a_missing_record_is_none(self, tmp_path: Path) -> None:
+        assert sr.reopen_decision(
+            'esc-42-1', root=tmp_path, expected_project=self._A_PROJECT, expected_escalations_dir=self._A_QUEUE
+        ) is None
+
+    def test_a_reopened_record_can_be_closed_with_fresh_evidence(self, tmp_path: Path) -> None:
+        seeded = self._seed(tmp_path)
+        sr.reopen_decision('esc-42-1', root=tmp_path, **_identity_of(seeded))
+
+        closed = sr.close_decision_with_evidence(
+            'esc-42-1', sr.DecisionState.ANSWERED, 'new evidence', root=tmp_path, **_identity_of(seeded)
+        )
+
+        assert closed is not None
+        assert (closed.state, closed.closing_evidence) == (sr.DecisionState.ANSWERED, 'new evidence')
+
+    def test_a_same_queue_refile_after_a_reopen_stays_open_and_quiet(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        queue = str(tmp_path / 'data' / 'escalations')
+        filing = {
+            'id': 'esc-5914-1', 'project': 'dark_factory', 'text': 'Adopt the reify plan?', 'escalations_dir': queue,
+        }
+        _file_decision(**filing)
+        filed_id = _qid('esc-5914-1')
+        assert sr.update_decision_state(filed_id, sr.DecisionState.DROPPED, root=tmp_path) is not None
+        assert sr.reopen_decision(
+            filed_id, root=tmp_path, expected_project='dark_factory', expected_escalations_dir=queue
+        ) is not None
+
+        with caplog.at_level(logging.WARNING):
+            _file_decision(**{**filing, 'text': 'reify? (rephrased)'})
+
+        [reread] = sr.list_decisions(root=tmp_path)
+        assert reread.state == sr.DecisionState.OPEN
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+class TestReopenDecisionVerb:
+    _PROJECT = 'know_live'
+    _QUEUE = '/a/data/escalations'
+
+    def _argv(self, root: Path, *, project: str = _PROJECT, queue: str = _QUEUE) -> list[str]:
+        return [
+            'reopen-decision', '--id', 'esc-42-1', '--project', project, '--escalations-dir', queue,
+            '--root', str(root),
+        ]
+
+    def _seed(self, root: Path) -> Path:
+        sr.write_decision(
+            _make_decision(
+                id='esc-42-1', project=self._PROJECT, escalations_dir=self._QUEUE,
+                state=sr.DecisionState.DROPPED, closing_evidence=_EVIDENCE,
+            ),
+            root=root,
+        )
+        return sr.decision_path_for_id('esc-42-1', root=root)
+
+    @pytest.mark.parametrize('dropped', ['--project', '--escalations-dir'])
+    def test_the_verb_requires_both_expectations(self, tmp_path: Path, dropped: str) -> None:
+        argv = self._argv(tmp_path)
+        at = argv.index(dropped)
+        del argv[at:at + 2]
+
+        with pytest.raises(SystemExit) as exited:
+            sr.main(argv)
+
+        assert exited.value.code == 2
+
+    def test_success_prints_the_id_and_exits_0(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        self._seed(tmp_path)
+
+        rc = sr.main(self._argv(tmp_path))
+
+        assert rc == 0
+        assert capsys.readouterr().out == 'esc-42-1\n'
+        [reread] = sr.list_decisions(root=tmp_path)
+        assert reread.state == sr.DecisionState.OPEN
+
+    def test_a_mismatch_exits_nonzero_and_leaves_the_record(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        before = self._seed(tmp_path).read_bytes()
+
+        rc = sr.main(self._argv(tmp_path, project='reify'))
+
+        assert rc != 0
+        err = capsys.readouterr().err
+        assert 'reopen-decision refused' in err
+        assert 'reify' in err
+        assert sr.decision_path_for_id('esc-42-1', root=tmp_path).read_bytes() == before
+
+    def test_an_absent_record_exits_nonzero(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = sr.main(self._argv(tmp_path))
+
+        assert rc != 0
+        assert 'esc-42-1' in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        ('status', 'warned'), [('resolved', True), ('dismissed', True), ('pending', False)]
+    )
+    def test_reopening_a_row_the_next_reap_would_close_again_warns(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], status: str, warned: bool
+    ) -> None:
+        queue = tmp_path / 'queue'
+        queue.mkdir()
+        (queue / 'esc-42-1.json').write_text(json.dumps({'status': status}))
+        sr.write_decision(
+            _make_decision(
+                id='esc-42-1', project=self._PROJECT, escalations_dir=str(queue), escalation_id='esc-42-1',
+                state=sr.DecisionState.DROPPED, closing_evidence=_EVIDENCE,
+            ),
+            root=tmp_path,
+        )
+
+        rc = sr.main(self._argv(tmp_path, queue=str(queue)))
+
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert captured.out == 'esc-42-1\n'
+        assert ('reap-decisions' in captured.err) is warned
+        assert (status in captured.err) is warned
+        assert sr.list_decisions(root=tmp_path)[0].state == sr.DecisionState.OPEN
+
+    def test_a_held_closed_row_is_reopened_in_place_by_its_printed_id(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        orch, _recon = _two_queues(tmp_path)
+        filing = {'id': 'esc-5914-1', 'project': 'df', 'text': 'Adopt the reify plan?', 'escalations_dir': str(orch)}
+        capsys.readouterr()
+        assert _file_decision(**filing) == 0
+        printed = capsys.readouterr().out.strip()
+        assert sr.update_decision_state(printed, sr.DecisionState.DROPPED, root=tmp_path) is not None
+        _file_decision(**{**filing, 'text': 'reify? (rephrased)'})
+        assert sr.list_decisions(root=tmp_path)[0].state == sr.DecisionState.DROPPED
+
+        rc = sr.main(
+            ['reopen-decision', '--id', printed, '--project', 'dark_factory', '--escalations-dir', str(orch)]
+        )
+
+        assert rc == 0
+        [reread] = sr.list_decisions(root=tmp_path)
+        assert (reread.id, reread.state) == (printed, sr.DecisionState.OPEN)

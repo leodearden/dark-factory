@@ -72,6 +72,46 @@ class DuplicateCandidateKeyError(TaskmasterError):
         self.candidate_key = candidate_key
 
 
+class LeakedEnvelopeMarkupError(TaskmasterError):
+    """Raised by ``add_task``/``update_task`` when task text carries a leaked
+    tool-call envelope fragment (task 4419).
+
+    The fragment is positive evidence that a harness parser terminated an
+    argument early and may have swallowed the arguments after it, so the
+    write is refused and its transaction rolled back rather than stored or
+    stripped: stripping would destroy the evidence of which writer leaked.
+    Detection and column scope come from
+    ``fused_memory/backends/task_text_markup_gate.py``.
+
+    Attributes:
+        column: The task-text column whose value carries the fragment.
+        fragment: The leaked fragment, from the stray closing tag onward.
+        recovered: The arguments the fragment swallowed, name -> value, i.e.
+            what the write would otherwise have silently defaulted. Empty when
+            no boundary is provable, never a guess.
+        clean_value: The column's value up to the fragment, or ``None`` under
+            that same condition.
+    """
+
+    def __init__(
+        self,
+        column: str,
+        fragment: str,
+        recovered: dict[str, str],
+        clean_value: str | None,
+    ) -> None:
+        super().__init__(
+            'LEAKED_ENVELOPE_MARKUP',
+            f'Refusing to store task text: {column!r} carries a leaked tool-call '
+            f'fragment {fragment!r}, so arguments after it may have been swallowed; '
+            f'recovered={recovered!r} clean_value={clean_value!r}',
+        )
+        self.column = column
+        self.fragment = fragment
+        self.recovered = recovered
+        self.clean_value = clean_value
+
+
 class TaskNotFoundError(TaskmasterError):
     """Raised by ``get_task`` when a successful zero-row query proves absence.
 
@@ -128,27 +168,32 @@ def status_via_update_task_error(task_id: str, status: object) -> dict[str, Any]
     }
 
 
+_DONE_PROVENANCE_HINT = (
+    'update_task cannot write metadata.done_provenance. Use '
+    'set_task_status(status="done", done_provenance={...}) instead — '
+    'it validates the kind/commit/note schema and runs an ancestor '
+    "backstop on the merge sha. Under metadata_mode='replace' the stored "
+    'done_provenance must be carried through verbatim: a whole-blob replace '
+    'may neither add, change nor drop it, so re-read the task and send the '
+    'stored value back unmodified.'
+)
+
+
 def done_provenance_via_update_task_error(task_id: str) -> dict[str, Any]:
-    """Canonical rejection shape for ``update_task`` calls writing ``metadata.done_provenance``.
+    """Canonical rejection shape for ``update_task`` calls that would add, change
+    or remove ``metadata.done_provenance``.
 
     ``set_task_status`` is the only sanctioned writer for ``done_provenance``
     — it validates the kind/commit/note schema and runs an ancestor backstop
-    on the merge sha. This dict is byte-identical to the historical
-    ``success: False`` variant produced by ``task_interceptor.py``'s
-    ``_reject_done_provenance_in_update_metadata``, so callers branching on
-    ``error == 'done_provenance_via_update_task'`` keep working across the
-    cutover.
+    on the merge sha. The stable promise across every surface is the ERROR
+    CODE: callers branch on ``error == 'done_provenance_via_update_task'``.
+    The ``hint`` is prose for the caller reading the failure and may grow.
     """
     return {
         'success': False,
         'error': 'done_provenance_via_update_task',
         'task_id': task_id,
-        'hint': (
-            'update_task cannot write metadata.done_provenance. Use '
-            'set_task_status(status="done", done_provenance={...}) instead — '
-            'it validates the kind/commit/note schema and runs an ancestor '
-            'backstop on the merge sha.'
-        ),
+        'hint': _DONE_PROVENANCE_HINT,
     }
 
 
@@ -179,38 +224,88 @@ class StatusWriteAuthorityError(TaskmasterError):
 
 
 class DoneProvenanceWriteAuthorityError(TaskmasterError):
-    """Raised when ``update_task`` is asked to write ``metadata.done_provenance``.
+    """Raised when ``update_task`` would add, change or remove ``metadata.done_provenance``.
 
     ``set_task_status`` is the sole sanctioned writer for ``done_provenance``
     — it validates the kind/commit/note schema and runs an ancestor backstop
     on the merge sha. Subclasses :class:`TaskmasterError` with the
-    ``TASKMASTER_TOOL_ERROR`` code and a ``set_task_status``-mentioning
-    message so existing ``TaskmasterError`` catchers/assertions keep working
-    unchanged; call :meth:`to_error_dict` for the canonical wire shape.
+    ``TASKMASTER_TOOL_ERROR`` code and the canonical hint as its message, so
+    existing ``TaskmasterError`` catchers/assertions keep working unchanged;
+    call :meth:`to_error_dict` for the canonical wire shape.
     """
 
     def __init__(self, task_id: str) -> None:
         self.task_id = task_id
-        super().__init__(
-            'TASKMASTER_TOOL_ERROR',
-            'update_task cannot write metadata.done_provenance. Use '
-            'set_task_status(status="done", done_provenance={...}) instead — '
-            'it validates the kind/commit/note schema and runs an ancestor '
-            'backstop on the merge sha.',
-        )
+        super().__init__('TASKMASTER_TOOL_ERROR', _DONE_PROVENANCE_HINT)
 
     def to_error_dict(self) -> dict[str, Any]:
         return done_provenance_via_update_task_error(self.task_id)
+
+
+class AppendUnsupportedFieldError(TaskmasterError):
+    """Raised when ``update_task`` combines ``append=True`` with a REPLACE-ONLY column.
+
+    ``title``, ``description`` and ``priority`` can only ever be REPLACED —
+    ``append`` has never governed them; it governs only the ``details`` /
+    ``prompt`` concatenation and the metadata merge mode. Before task 4039
+    the pair was accepted silently and the incoming text OVERWROTE the
+    column, destroying multi-KB authored prose with no error and no warning.
+
+    This mirrors the loud-over-silent guards
+    ``sqlite_task_backend.py::_resolve_metadata_mode`` already applies to the
+    two destructive metadata flag combinations (the task-2180 metadata-wipe
+    and the task-3581 nested-metadata clobber) — same method, same shape of
+    destructive combination, same principle — for the text columns that
+    cannot append at all.
+
+    Keeps ``code='TASKMASTER_TOOL_ERROR'`` so every existing ``except
+    TaskmasterError`` site and ``err.code == 'TASKMASTER_TOOL_ERROR'`` branch
+    keeps working unchanged (the same compatibility trick
+    :class:`TaskNotFoundError` uses); the subclass exists for ``isinstance``
+    discrimination and so the MCP boundary reports a specific
+    ``error_type='AppendUnsupportedFieldError'``. Deliberately has no
+    ``to_error_dict()`` — unlike the two write-authority errors above it has
+    no historical ``success: False`` wire shape to reproduce, and it reaches
+    callers by propagating raw to ``server/tool_errors.py::mcp_tool_errors``.
+
+    Attributes:
+        fields: The offending replace-only field name(s), in
+            ``sqlite_task_backend.py::_REPLACE_ONLY_FIELDS`` order.
+        task_id: The task the rejected write targeted (``None`` if not supplied).
+    """
+
+    def __init__(self, fields: tuple[str, ...], task_id: str | None = None) -> None:
+        self.fields = fields
+        self.task_id = task_id
+        named = ', '.join(fields)
+        plural = 's' if len(fields) > 1 else ''
+        super().__init__(
+            'TASKMASTER_TOOL_ERROR',
+            f'Refusing an append=True write to {named}: append has NEVER applied '
+            f'to the {named} column{plural} and never will — these columns are '
+            'REPLACE-ONLY, so this write would OVERWRITE the current value, not '
+            'concatenate onto it. Accepting it silently destroyed authored prose '
+            'in four recorded live repros, including reify task 6586 and reify '
+            'task 5791, the latter wiping ~17KB of a human-ratified decomposition '
+            'record that existed nowhere else. To EXTEND the field, read-modify-'
+            'write: call get_task to read the current text, concatenate locally, '
+            f'then resend the COMPLETE new {named} with append omitted. To '
+            'REPLACE it deliberately, drop append (or pass append=False) to '
+            'confirm the overwrite. If the append=True was meant for details/'
+            'prompt/metadata, split it into a separate update_task call.',
+        )
 
 
 __all__ = [
     'TASKMASTER_TOOL_ERROR',
     'TASKMASTER_UNAVAILABLE',
     'DuplicateCandidateKeyError',
+    'LeakedEnvelopeMarkupError',
     'TaskmasterError',
     'TaskNotFoundError',
     'StatusWriteAuthorityError',
     'DoneProvenanceWriteAuthorityError',
+    'AppendUnsupportedFieldError',
     'status_via_update_task_error',
     'done_provenance_via_update_task_error',
 ]

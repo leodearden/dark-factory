@@ -41,14 +41,17 @@ from pathlib import Path
 # falsified it. Same correction in
 # tests/scripts/test_migrate_metadata_modules_to_files.py.
 #
-# _task_db_scan is imported by the TEST only, never by
-# repair_wiped_metadata_files.py itself — see the lockstep guard at the bottom of
-# this file for why that asymmetry is deliberate.
+# The AUDIT_EXIT_* ladder is imported by the TEST only, never by
+# repair_wiped_metadata_files.py itself (whose one _task_db_scan import is
+# UNREADABLE_STORE_ERRORS) — see the lockstep guard at the bottom of this file
+# for why that asymmetry is deliberate.
 from _task_db_scan import (
     AUDIT_EXIT_FINDINGS,
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
+    TaskDbProblem,
+    TaskDbUnreadable,
 )
 from audit_wiped_metadata_files import (
     CLEAN_MERGE_SHA,
@@ -1676,6 +1679,35 @@ def test_main_one_unreadable_root_does_not_abort_the_other_roots(tmp_path):
     assert "skipping unreadable project" in result.stderr
     assert str(bad) in result.stderr
     assert "incomplete" in result.stderr
+
+
+def _stub_project(tmp_path, name="stub"):
+    """A project whose tasks.db EXISTS (so discovery keeps it) but is 0 bytes,
+    the shape connect_ro refuses as an EMPTY_STUB."""
+    root = _wiped_project(tmp_path, name=name, task_id=99)
+    (root / ".taskmaster" / "tasks" / "tasks.db").write_bytes(b"")
+    return root
+
+
+def test_main_skips_a_stub_root_naming_connect_ros_reason(tmp_path):
+    """The in-process audit refuses a stub with TaskDbUnreadable, not a
+    sqlite3.Error, so the per-root guard must skip that too — with the
+    refusal's remedy rather than sqlite's `no such table: tasks`."""
+    stub = _stub_project(tmp_path)
+    good = _wiped_project(tmp_path, name="good", task_id=11)
+
+    result = _run_cli(
+        "--project-root", str(stub), "--project-root", str(good), "--json"
+    )
+
+    assert result.returncode == EXIT_OK, result.stderr
+    payload = json.loads(result.stdout)
+    assert [p["project_root"] for p in payload["projects"]] == [str(good)]
+    assert [o["task_id"] for o in payload["projects"][0]["outcomes"]] == [11]
+    assert "skipping unreadable project" in result.stderr
+    stub_db = stub / ".taskmaster" / "tasks" / "tasks.db"
+    refusal = TaskDbUnreadable(stub_db.resolve(), TaskDbProblem.EMPTY_STUB)
+    assert str(refusal) in result.stderr
 
 
 def test_main_exit_3_when_every_resolved_root_is_unreadable(tmp_path):

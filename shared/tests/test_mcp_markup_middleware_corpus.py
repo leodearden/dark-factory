@@ -239,6 +239,18 @@ class Observation(NamedTuple):
     outcome: str | None
     error_type: str | None
     recovered_params: tuple[str, ...]
+    #: Task **4502**. Read from the SAME caller-facing channel as
+    #: ``recovered_params`` — the refusal payload or the forwarded meta, never
+    #: the fact stream — because the assertion it feeds is about what a CALLER
+    #: can see. A caller that cannot see this is the one that retries forever.
+    quoted_markup_params: tuple[str, ...]
+    #: The names ``FORWARD_REPAIR`` DROPPED as untypable, from the same channel.
+    #: Empty in this harness — ``_synthetic_tool`` types every parameter
+    #: ``str | None``, so nothing is ever untypable here — and carried anyway
+    #: because ``quoted_markup_params`` is a census of the caller's VERBATIM
+    #: text, which includes names that did not land. Without this the subset
+    #: assertion below is only accidentally true.
+    unrecovered_params: tuple[str, ...]
     #: What the tool body ACTUALLY received. Empty means it never ran.
     delivered: tuple[dict[str, Any], ...]
     repaired_call: dict[str, Any] | None
@@ -318,16 +330,25 @@ def _observe(record: dict[str, Any], harness: _Harness, result: Any, error: Tool
     """Fold one specimen's outcome into an :class:`Observation`."""
     repaired_call = None
     error_type = None
+    quoted: list[str] = []
+    # Omitted-when-empty on the forward meta, and absent from a refusal payload
+    # altogether — REJECT_WITH_REPAIR drops nothing. ``or []`` reads both as the
+    # empty answer, which is what they mean.
+    unrecovered: list[str] = []
     if error is not None:
         payload = json.loads(str(error))
         outcome = payload.get('outcome')
         error_type = payload.get('error_type')
         recovered = payload.get('recovered_params') or []
+        quoted = payload.get('quoted_markup_params') or []
+        unrecovered = payload.get('unrecovered_params') or []
         repaired_call = payload.get('repaired_call')
     else:
         warning = (result.meta or {}).get('markup_repair') or {}
         outcome = warning.get('outcome')
         recovered = warning.get('recovered_params') or []
+        quoted = warning.get('quoted_markup_params') or []
+        unrecovered = warning.get('unrecovered_params') or []
 
     return Observation(
         tool_use_id=record['tool_use_id'],
@@ -340,6 +361,8 @@ def _observe(record: dict[str, Any], harness: _Harness, result: Any, error: Tool
         outcome=outcome,
         error_type=error_type,
         recovered_params=tuple(sorted(recovered)),
+        quoted_markup_params=tuple(sorted(quoted)),
+        unrecovered_params=tuple(sorted(unrecovered)),
         delivered=tuple(harness.delivered),
         repaired_call=repaired_call,
         escalations=tuple(harness.escalations),
@@ -575,34 +598,183 @@ class TestRecoveredParameters:
 
 
 class TestNoStillPoisonedValueEverEscapes:
-    """No specimen leaves this guard carrying markup the guard would reject.
+    """No value leaves this guard carrying markup UNACCOUNTED FOR.
 
     Re-derived from :func:`detect` against what actually crossed the boundary,
-    so it holds even if every stored expectation is wrong. Both halves matter:
-    a value forwarded still-poisoned would re-trip fused-memory's write-time
-    tripwire downstream — the guard laundering a leak into a deeper failure —
-    and a ``repaired_call`` still carrying one would send the caller into an
-    infinite mechanical-retry loop against its own rejection.
+    so it holds even if every stored expectation is wrong.
+
+    TASK **4502** NARROWED THIS, AND REPLACED WHAT IT GAVE UP. It used to read
+    "no value trips detect", scanning every string in the delivered call and in
+    the offered ``repaired_call``. Narrowing boundary row B5 made that
+    unsatisfiable for an honest reason: a faithful REPORT of a markup leak
+    quotes the pattern that tripped the tripwire, so recovering it necessarily
+    delivers a recovered value that still trips ``detect``. Keeping the old
+    assertion would mean keeping the refusal, which drops the caller's real
+    characters on the floor — the exact information loss this PRD exists to
+    end. The two halves of the value are NOT the same thing:
+
+    * the ABSORBING parameter's value is ``fix.clean_value`` — the value this
+      guard REWROTE. Its envelope-free post-condition is contract C1's, and it
+      is unchanged and exactly as strict below as it was before;
+    * a RECOVERED value is verbatim caller text, guaranteed by invariant D5 to
+      be a substring of what the caller actually sent. It is not something the
+      guard produced, and it may legitimately quote a literal.
+
+    So the invariant is now "no value trips detect UNACCOUNTED FOR": anything
+    that still trips must be a recovered parameter, never the absorbing one,
+    AND must be named in that outcome's ``quoted_markup_params``. That is
+    strictly harder to satisfy by accident than a deleted assertion — a guard
+    that quietly started laundering leaks into the absorbing parameter, or that
+    delivered a quoting value without publishing it, fails here.
+
+    BOTH HALVES OF THE ORIGINAL RATIONALE ARE STILL ANSWERED.
+
+    * *A value forwarded still-poisoned would re-trip fused-memory's write-time
+      tripwire downstream.* Still true, and still forbidden for the absorbing
+      parameter, which is the one this guard rewrote and the one C1 contracts.
+    * *A ``repaired_call`` still carrying one would send the caller into an
+      infinite mechanical-retry loop against its own rejection.* Now answered
+      by ``quoted_markup_params`` plus the existing ``allow_mcp_markup``
+      override lifecycle — which is precisely this repo's already-live answer
+      for markup a caller is quoting DELIBERATELY. The caller can see WHY the
+      offered call still carries a literal and reach for the override, rather
+      than resubmitting blind.
+
+    ``quoted_markup_params`` IS A CENSUS OF THE CALLER'S VERBATIM TEXT (D5),
+    taken from the pre-coercion recovered map, NOT of the map the tool was
+    handed. That distinction is what makes the second bullet actually true for
+    the ``list``-typed parameter it was written about: on the real
+    ``escalate_info``, ``evidence`` is decoded to a ``list`` before delivery, so
+    a census read off the delivered map would name nothing at all and the
+    caller would be back to retrying blind. It also means the census does not
+    partition against ``unrecovered_params`` — a value can honestly be both
+    quoted and dropped — which the subset assertion below is stated to allow.
+
+    MEASURED POPULATION, so the carve-out's size is on the record rather than
+    assumed small: exactly ONE corpus record, ``toolu_01XbCz5NFCA6pCvmseyqFgvy``
+    (``mcp__escalation__escalate_info`` / ``detail``, quoting in ``evidence``),
+    which is the same underlying leaked call as the two ``esc-3514`` specimens
+    in ``escalation/tests/fixtures/markup_specimens/``.
     """
 
-    def test_no_value_delivered_to_a_tool_trips_detect(self, replay):
+    def test_no_absorbing_value_delivered_to_a_tool_trips_detect(self, replay):
+        """C1's post-condition, UNCHANGED and undiminished.
+
+        ``obs.param`` is the parameter the guard rewrote, so this is the exact
+        strictness the whole test carried before the narrowing.
+        """
         poisoned = [
+            (obs.tool_use_id, obs.policy, obs.param)
+            for obs in _all(replay)
+            for call in obs.delivered
+            if isinstance(call.get(obs.param), str)
+            and detect(call[obs.param]) is not None
+        ]
+        assert not poisoned, poisoned[:5]
+
+    def test_no_absorbing_value_offered_to_a_caller_trips_detect(self, replay):
+        """Same, for the ``repaired_call`` a caller is told to resubmit."""
+        poisoned = [
+            (obs.tool_use_id, obs.policy, obs.param)
+            for obs in _all(replay)
+            if isinstance((obs.repaired_call or {}).get(obs.param), str)
+            and detect((obs.repaired_call or {})[obs.param]) is not None
+        ]
+        assert not poisoned, poisoned[:5]
+
+    def test_every_delivered_value_that_trips_detect_is_ACCOUNTED_FOR(self, replay):
+        """THE REPLACEMENT. Not "nothing trips" but "nothing trips unnamed".
+
+        Any string the tool actually received that still trips ``detect`` must
+        be a RECOVERED parameter and must be named in the outcome's
+        ``quoted_markup_params``, which the caller can read off the forwarded
+        meta.
+        """
+        unaccounted = [
             (obs.tool_use_id, obs.policy, name)
             for obs in _all(replay)
             for call in obs.delivered
             for name, value in call.items()
             if isinstance(value, str) and detect(value) is not None
+            if name == obs.param
+            or name not in obs.recovered_params
+            or name not in obs.quoted_markup_params
         ]
-        assert not poisoned, poisoned[:5]
+        assert not unaccounted, unaccounted[:5]
 
-    def test_no_repaired_call_offered_to_a_caller_trips_detect(self, replay):
-        poisoned = [
+    def test_every_offered_value_that_trips_detect_is_ACCOUNTED_FOR(self, replay):
+        """Same replacement for the offered ``repaired_call``. This is the half
+        that stops a caller retrying forever without being told why."""
+        unaccounted = [
             (obs.tool_use_id, obs.policy, name)
             for obs in _all(replay)
             for name, value in (obs.repaired_call or {}).items()
             if isinstance(value, str) and detect(value) is not None
+            if name == obs.param
+            or name not in obs.recovered_params
+            or name not in obs.quoted_markup_params
         ]
-        assert not poisoned, poisoned[:5]
+        assert not unaccounted, unaccounted[:5]
+
+    def test_the_carve_out_is_REACHED_by_this_corpus(self, replay):
+        """Guards the four assertions above against going vacuous.
+
+        If no specimen ever quotes, "nothing trips unnamed" is satisfied by
+        nothing tripping at all, and a regression that re-broke the publication
+        would pass unnoticed. The measured population is one record; assert it
+        is still reached rather than trusting that it is.
+
+        WHAT IT DOES NOT COVER, stated because this test PASSED throughout the
+        period ``quoted_markup_params`` shipped empty for the real schema.
+        Every tool in this harness declares every parameter ``str | None``
+        (:func:`_synthetic_tool`, and its docstring says so), so no specimen
+        here ever reaches ``_coerce_recovered``'s decode branch. A census read
+        off the POST-coercion delivered map therefore satisfies this test in
+        full while returning ``[]`` on the real ``escalate_info``, whose
+        ``evidence`` is declared ``list[dict[str, Any]] | None`` and decodes to
+        a ``list``. This test guards reachability, not the map the census reads.
+
+        The pin that does cover it is
+        ``escalation/tests/test_markup_middleware_registration.py``'s
+        ``TestTheQuotedMarkupCensusAgainstTheREALSchema``, which drives the same
+        record through the REAL server against its REAL declared types. Anyone
+        widening this harness should know which guarantee lives where.
+        """
+        quoting = {
+            obs.tool_use_id for obs in _all(replay) if obs.quoted_markup_params
+        }
+        assert quoting == {'toolu_01XbCz5NFCA6pCvmseyqFgvy'}, sorted(quoting)
+
+    def test_a_quoted_name_is_never_the_absorbing_parameter(self, replay):
+        """The narrowing's own boundary, asserted directly rather than implied.
+
+        THE STRICT HALF, unchanged: a quoted name is NEVER ``obs.param``. That
+        is the parameter the guard rewrote, so naming it here would be the
+        guard reporting its own C1 violation as if it were caller text.
+
+        THE SUBSET HALF is stated against the VERBATIM recovered names, which
+        is ``recovered_params`` PLUS ``unrecovered_params``. ``quoted_markup_
+        params`` is a census of what the CALLER sent (invariant D5), taken
+        before the coercion, while ``recovered_params`` reports what the tool
+        received — so on ``FORWARD_REPAIR`` a name whose value could not be
+        typed is dropped from the second and legitimately stays in the first.
+        The two keys answer different questions and are allowed to overlap.
+
+        In THIS harness the widening is a no-op — ``_synthetic_tool`` types
+        every parameter ``str | None``, so nothing is ever untypable and
+        ``unrecovered_params`` is always empty — and it is written this way
+        anyway because the invariant, not the harness, is what a reader will
+        carry to the real server. Verified green both before and after the
+        census moved to the verbatim map.
+        """
+        wrong = [
+            (obs.tool_use_id, obs.policy, name)
+            for obs in _all(replay)
+            for name in obs.quoted_markup_params
+            if name == obs.param
+            or name not in (*obs.recovered_params, *obs.unrecovered_params)
+        ]
+        assert not wrong, wrong[:5]
 
 
 # ---------------------------------------------------------------------------

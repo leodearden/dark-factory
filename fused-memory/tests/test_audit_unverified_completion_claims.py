@@ -7,7 +7,6 @@ sys.path pollution — mirrors the pattern in test_audit_found_on_main_provenanc
 from __future__ import annotations
 
 import ast
-import importlib.util
 import json
 import logging
 import re
@@ -16,36 +15,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _distinct_git_repo import init_distinct_git_repo
+from _fm_helpers import load_script_module
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'audit_unverified_completion_claims.py'
 )
 
 
-def _load_module() -> types.ModuleType:
-    """Load audit_unverified_completion_claims.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    import sys  # noqa: PLC0415
-
-    mod_name = 'audit_unverified_completion_claims'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='audit_unverified_completion_claims')
 parse_category = _mod.parse_category
 IN_SCOPE_CATEGORIES = _mod.IN_SCOPE_CATEGORIES
 CorpusRecord = _mod.CorpusRecord
@@ -315,17 +293,15 @@ class TestAdjudicate:
         assert findings[0].ref == 'tkt_0RRRC5AASJ9Z630VP4PCN9H376'
 
     def test_unresolvable_ticket_registry_is_unverifiable_not_mismatch(self) -> None:
-        """THE CRITICAL ASSERTION — the deliberate divergence from the live gate.
+        """THE CRITICAL ASSERTION: an unreadable registry is never a mismatch.
 
-        ``TaskInterceptor.get_ticket_row`` returns None BOTH for "no such
-        ticket" and for "no ticket store configured" (task_interceptor.py:
-        3006-3012), and ``_verify_ticket`` maps a None row to 'mismatch'
-        (completion_claim_gate.py:575). On the write path that conflation is
-        contained upstream by the _taskmaster_configured guard and costs one
-        spurious tag. In a BATCH sweep it would print a fabrication accusation
-        against every ticket claim in the corpus whenever tickets.db is merely
-        absent. The gate's own module makes this distinction load-bearing at the
-        sentinel level (:123-127, INV-2); honouring it here follows that intent.
+        ``_verify_ticket`` maps a None row to 'mismatch', so None must mean
+        only "no such ticket". The live path gets that from
+        ``TaskInterceptor.get_ticket_row``, which raises
+        ``TicketStoreNotConfiguredError`` when no store is configured; the
+        sweep reads tickets.db itself and passes UNRESOLVABLE when it cannot.
+        Without that, a merely absent tickets.db would print a fabrication
+        accusation against every ticket claim in the corpus (INV-2).
         """
         findings = self._adjudicate(ESC_3085_1_INSTANCE_2, ticket=UNRESOLVABLE)
         assert len(findings) == 1
@@ -342,6 +318,12 @@ class TestAdjudicate:
     def test_terminal_task_status_verifies_and_is_dropped(self) -> None:
         """Verified claims never appear — the report is a report of problems."""
         assert self._adjudicate(ESC_3085_1_INSTANCE_1, task_status='done') == []
+
+    def test_filing_claim_about_an_open_task_is_not_a_finding(self) -> None:
+        """Filing asserts existence, so a pending task verifies it (sweep Class A)."""
+        assert self._adjudicate(
+            'the regression was refiled as task 4263', task_status='pending',
+        ) == []
 
     def test_open_task_status_is_a_mismatch(self) -> None:
         findings = self._adjudicate(ESC_3085_1_INSTANCE_1, task_status='in-progress')
@@ -1826,3 +1808,18 @@ class TestProbeBuilders:
         repo_root = SCRIPT_PATH.parents[2]
         probe = _mod._build_commit_probe({'dark_factory': str(repo_root)})
         assert probe('0' * 40, 'dark_factory') is False
+
+    async def test_commit_probe_finds_a_sha_in_another_registered_repo(
+        self, tmp_path
+    ) -> None:
+        """Sweep Class C: a reify writer naming a dark_factory commit."""
+        reify_root = tmp_path / 'reify'
+        df_root = tmp_path / 'dark_factory'
+        reify_sha = init_distinct_git_repo(reify_root)
+        df_sha = init_distinct_git_repo(df_root)
+        assert df_sha != reify_sha
+
+        probe = _mod._build_commit_probe(
+            {'reify': str(reify_root), 'dark_factory': str(df_root)}
+        )
+        assert probe(df_sha, 'reify') is True

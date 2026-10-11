@@ -86,9 +86,7 @@ arms:
     # Confirmed on the 13:50Z slate run at reasoning: off -- 39 tokens,
     # `entities: []`, FAIL extraction_missed_entities, 0 of 4.
     #
-    # Whether the EVAL crosses reasoning modes as a factor is zeta's separate
-    # call (task 3719); this field only states the mode alpha certified in, and
-    # the report row records it so nothing is inherited invisibly.
+    # zeta (3719) ruled: `on`, not crossed (preregistration doc §Reasoning mode).
     reasoning: 'on'
     # Load-bearing, not decorative: _vllm_argv emits it only when reasoning is
     # `on`, and lms_manifest REFUSES reasoning: on without it -- because without
@@ -268,8 +266,8 @@ arms:
     #   off -> 236-276 tokens, 2.3-2.9 s
     #   on  -> 1807 tokens (84% thought), 16.5-17.2 s
     # So on this arm reasoning costs 6.4x the wall clock and buys nothing
-    # measurable. `off` restores the model author's own default; zeta (3719)
-    # owns whether it stays there.
+    # measurable. `off` restores the model author's own default.
+    # zeta (3719) ruled: `off`, not crossed (preregistration doc §Reasoning mode).
     reasoning: 'off'
     est_vram_gib: 14.5
     max_model_len: 16384
@@ -295,8 +293,19 @@ arms:
   #
   # RE-MEASURED 2026-08-06 AFTER the pooling KV bound landed, superseding the
   # figures this comment used to carry (qwen3-0.6b 16603 MiB, qwen3-4b 16078
-  # MiB): granite 789 MiB/129 ms, gte-modernbert 788 MiB/115 ms, qwen3-0.6b
-  # 3584 MiB/507 ms, qwen3-4b 10114 MiB/630 ms.  The two ~790 MiB arms are
+  # MiB), and the LATENCIES re-measured again 2026-09-12 (task 4229's live
+  # slate, on the instrument task 3781 built) -- COLD (discarded warm-up) then
+  # WARM (measured).  These are the figures the COMMITTED artifact carries:
+  #   granite         787 MiB    53.4 ms cold ->  36.2 ms warm
+  #   gte-modernbert  787 MiB    37.9 ms cold ->  27.5 ms warm
+  #   qwen3-0.6b     3581 MiB   571.3 ms cold ->  38.8 ms warm
+  #   qwen3-4b      10123 MiB   616.4 ms cold ->  40.8 ms warm
+  # The old single figures (129/115/507/630 ms) were the COLD column and
+  # overstated served latency by up to 14.7x.  NOT COMPARABLE ACROSS ARMS: each
+  # is a single-sample health probe, engine-warm and prefix-cold, and is not
+  # zeta's p95-under-load envelope metric (task 3719).  Do not rank arms on
+  # them -- see the artifact's `latency_caveat` field and the README section
+  # "How the instrument separates cold from warm".  The two ~790 MiB arms are
   # encoder models; the other two are DECODERS that emit embeddings, and vLLM
   # hands a decoder a paged KV cache sized to fill --gpu-memory-utilization
   # whether a pooling model can use it or not.

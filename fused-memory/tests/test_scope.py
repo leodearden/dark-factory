@@ -1,5 +1,6 @@
 """Tests for resolve_project_id() — converts filesystem project_root to logical project_id."""
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ from fused_memory.models.scope import (
     KNOWN_PROJECT_ROOTS_ENV,
     Scope,
     build_known_projects_map,
+    is_phantom_project_root,
     known_project_roots_from_env,
     read_declared_project_id,
     resolve_project_id,
@@ -282,6 +284,27 @@ class TestKnownProjectRootsFromEnv:
         assert known_project_roots_from_env('SOME_OTHER_VAR') == ['/x', '/y']
 
 
+class TestIsPhantomProjectRoot:
+    """is_phantom_project_root: a root is phantom when it is not a directory."""
+
+    def test_existing_directory_is_not_phantom(self, tmp_path):
+        assert is_phantom_project_root(tmp_path) is False
+
+    def test_never_created_path_is_phantom(self, tmp_path):
+        assert is_phantom_project_root(tmp_path / 'does-not-exist') is True
+
+    def test_regular_file_is_phantom(self, tmp_path):
+        f = tmp_path / 'not-a-checkout'
+        f.write_text('x')
+        assert is_phantom_project_root(f) is True
+
+    def test_accepts_str_and_path(self, tmp_path):
+        ghost = tmp_path / 'does-not-exist'
+        assert is_phantom_project_root(str(tmp_path)) is False
+        assert is_phantom_project_root(str(ghost)) is True
+        assert is_phantom_project_root(Path(str(ghost))) is True
+
+
 class TestBuildKnownProjectsMap:
     """build_known_projects_map composes a {project_id → project_root} mapping."""
 
@@ -353,6 +376,87 @@ class TestBuildKnownProjectsMap:
         assert result['my_solar_challenge'] == str(renamed.resolve())
         assert 'solar_challenge' not in result
         assert result['plain_proj'] == str(plain.resolve())
+
+    @staticmethod
+    def _scope_warnings(caplog):
+        return [
+            r.getMessage() for r in caplog.records
+            if r.name == 'fused_memory.models.scope'
+            and r.levelno == logging.WARNING
+        ]
+
+    def test_nonexistent_extra_root_is_admitted_with_one_warning(
+        self, tmp_path, caplog,
+    ):
+        """Arm (b) of task 5286: a typo'd or moved root is ADMITTED, and
+        the builder says so loudly, once, naming the root and its id."""
+        primary = tmp_path / 'reify'
+        healthy = tmp_path / 'dark-factory'
+        primary.mkdir()
+        healthy.mkdir()
+        ghost = tmp_path / 'does-not-exist'
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.models.scope'):
+            result = build_known_projects_map(
+                str(primary), extra_roots=[str(healthy), str(ghost)],
+            )
+
+        assert result['does_not_exist'] == str(ghost.resolve())
+        warnings = self._scope_warnings(caplog)
+        naming_ghost = [
+            m for m in warnings if str(ghost) in m and 'does_not_exist' in m
+        ]
+        assert len(naming_ghost) == 1, warnings
+        assert not any(str(primary) in m for m in warnings), warnings
+        assert not any(str(healthy) in m for m in warnings), warnings
+
+    def test_directory_roots_emit_no_phantom_warning(self, tmp_path, caplog):
+        primary = tmp_path / 'reify'
+        healthy = tmp_path / 'dark-factory'
+        primary.mkdir()
+        healthy.mkdir()
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.models.scope'):
+            build_known_projects_map(str(primary), extra_roots=[str(healthy)])
+
+        assert self._scope_warnings(caplog) == []
+
+    def test_regular_file_root_is_admitted_with_a_warning(
+        self, tmp_path, caplog,
+    ):
+        primary = tmp_path / 'reify'
+        primary.mkdir()
+        file_root = tmp_path / 'stray-file'
+        file_root.write_text('not a checkout')
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.models.scope'):
+            result = build_known_projects_map(
+                str(primary), extra_roots=[str(file_root)],
+            )
+
+        assert result['stray_file'] == str(file_root.resolve())
+        naming_file = [
+            m for m in self._scope_warnings(caplog) if str(file_root) in m
+        ]
+        assert len(naming_file) == 1
+
+    def test_phantom_root_listed_twice_warns_once(self, tmp_path, caplog):
+        """The WARNING is per ADMITTED phantom root: the second listing
+        loses first-wins and is reported only at INFO."""
+        primary = tmp_path / 'reify'
+        primary.mkdir()
+        ghost = tmp_path / 'does-not-exist'
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.models.scope'):
+            result = build_known_projects_map(
+                str(primary), extra_roots=[str(ghost), str(ghost)],
+            )
+
+        assert list(result) == ['reify', 'does_not_exist']
+        naming_ghost = [
+            m for m in self._scope_warnings(caplog) if str(ghost) in m
+        ]
+        assert len(naming_ghost) == 1
 
 
 class TestScopeCanonicalizesProjectId:

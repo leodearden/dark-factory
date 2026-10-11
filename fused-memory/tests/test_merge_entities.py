@@ -11,6 +11,8 @@ Covers:
 from __future__ import annotations
 
 import contextlib
+import json
+import logging
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
@@ -157,9 +159,16 @@ class TestRedirectNodeEdges:
             assert 'new.fact = old.fact' in cypher
             assert 'new.valid_at = old.valid_at' in cypher
             assert 'new.invalid_at = old.invalid_at' in cypher
+            # task 4986 loss mode 3: `expired_at` SET + `invalid_at` NULL is the
+            # restore hooks' deliberately-restored signature, so dropping it here
+            # re-exposes restored edges to false supersession. Kept adjacent to
+            # `invalid_at`, matching reassign_edge's SET list.
+            assert 'new.expired_at = old.expired_at' in cypher
             assert 'new.created_at = old.created_at' in cypher
             assert 'new.group_id = old.group_id' in cypher
             assert 'new.episodes = old.episodes' in cypher
+            # task 4986 loss mode 4a: which node this endpoint left.
+            assert 'new.reassigned_from_node_uuid = $dep_uuid' in cypher
             assert 'new.source_node_uuid = $sur_uuid' in cypher
 
         assert len(seen_new_uuids) == 2, 'each redirected edge must get a DISTINCT fresh uuid'
@@ -219,9 +228,16 @@ class TestRedirectNodeEdges:
             assert 'new.fact = old.fact' in cypher
             assert 'new.valid_at = old.valid_at' in cypher
             assert 'new.invalid_at = old.invalid_at' in cypher
+            # task 4986 loss mode 3: `expired_at` SET + `invalid_at` NULL is the
+            # restore hooks' deliberately-restored signature, so dropping it here
+            # re-exposes restored edges to false supersession. Kept adjacent to
+            # `invalid_at`, matching reassign_edge's SET list.
+            assert 'new.expired_at = old.expired_at' in cypher
             assert 'new.created_at = old.created_at' in cypher
             assert 'new.group_id = old.group_id' in cypher
             assert 'new.episodes = old.episodes' in cypher
+            # task 4986 loss mode 4a: which node this endpoint left.
+            assert 'new.reassigned_from_node_uuid = $dep_uuid' in cypher
             assert 'new.target_node_uuid = $sur_uuid' in cypher
 
         assert len(seen_new_uuids) == 2, 'each redirected edge must get a DISTINCT fresh uuid'
@@ -289,31 +305,43 @@ class TestDeleteEntityNode:
 # step-5: GraphitiBackend.merge_entities
 # ---------------------------------------------------------------------------
 
+@pytest.fixture
+def backend_with_mocks(mock_config, make_backend):
+    """GraphitiBackend with sub-methods mocked for orchestration testing.
+
+    Module-scoped rather than class-scoped because two classes consume it:
+    TestMergeEntities drives the orchestration, TestMergeEntitiesStructuredLog
+    drives the record that orchestration emits. One fixture, not a parallel
+    copy per class.
+    """
+    backend = make_backend(mock_config)
+    backend.get_node_text = AsyncMock(side_effect=[
+        ('DeprecatedName', 'old dep summary'),   # first call: deprecated node
+        ('SurvivingName', 'old sur summary'),     # second call: surviving node
+    ])
+    backend.redirect_node_edges = AsyncMock(return_value={
+        'outgoing_redirected': 2,
+        'incoming_redirected': 1,
+        'inter_node_deleted': 0,
+    })
+    backend.redirect_node_mentions = AsyncMock(return_value={
+        'redirected': 2,
+        'already_linked': 1,
+    })
+    backend.count_foreign_relationships = AsyncMock(return_value=1)
+    backend.delete_entity_node = AsyncMock()
+    backend.dedup_valid_edges_for_node = AsyncMock(return_value=0)
+    backend.refresh_entity_summary = AsyncMock(return_value=make_rebuild_detail(
+        'sur-uuid', 'SurvivingName',
+        old_summary='old sur summary',
+        new_summary='SurvivingName knows Foo\nDeprecatedName knows Bar',
+        edge_count=3,
+    ))
+    return backend
+
+
 class TestMergeEntities:
     """GraphitiBackend.merge_entities(deprecated_uuid, surviving_uuid) merges two nodes."""
-
-    @pytest.fixture
-    def backend_with_mocks(self, mock_config, make_backend):
-        """GraphitiBackend with sub-methods mocked for orchestration testing."""
-        backend = make_backend(mock_config)
-        backend.get_node_text = AsyncMock(side_effect=[
-            ('DeprecatedName', 'old dep summary'),   # first call: deprecated node
-            ('SurvivingName', 'old sur summary'),     # second call: surviving node
-        ])
-        backend.redirect_node_edges = AsyncMock(return_value={
-            'outgoing_redirected': 2,
-            'incoming_redirected': 1,
-            'inter_node_deleted': 0,
-        })
-        backend.delete_entity_node = AsyncMock()
-        backend.dedup_valid_edges_for_node = AsyncMock(return_value=0)
-        backend.refresh_entity_summary = AsyncMock(return_value=make_rebuild_detail(
-            'sur-uuid', 'SurvivingName',
-            old_summary='old sur summary',
-            new_summary='SurvivingName knows Foo\nDeprecatedName knows Bar',
-            edge_count=3,
-        ))
-        return backend
 
     @pytest.mark.asyncio
     async def test_validates_both_nodes_exist(self, backend_with_mocks):
@@ -355,6 +383,14 @@ class TestMergeEntities:
                 'outgoing_redirected': 0, 'incoming_redirected': 0, 'inter_node_deleted': 0
             }
         )
+        backend.redirect_node_mentions = AsyncMock(
+            side_effect=lambda *a, **kw: call_order.append('mentions') or {
+                'redirected': 0, 'already_linked': 0
+            }
+        )
+        backend.count_foreign_relationships = AsyncMock(
+            side_effect=lambda *a, **kw: call_order.append('residual') or 0
+        )
         backend.delete_entity_node = AsyncMock(
             side_effect=lambda *a, **kw: call_order.append('delete')
         )
@@ -365,7 +401,12 @@ class TestMergeEntities:
             side_effect=lambda *a, **kw: call_order.append('refresh') or make_rebuild_detail('sur-uuid', 'S')
         )
         await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
-        assert call_order == ['redirect', 'delete', 'dedup', 'refresh']
+        # The MENTIONS relocation MUST precede the delete. This is the whole
+        # point of loss mode 1: delete_entity_node's DETACH DELETE destroys
+        # every remaining link, so a relocation ordered after it has nothing
+        # left to move. The residual census is likewise taken before the
+        # delete -- afterwards there is nothing left to count.
+        assert call_order == ['redirect', 'mentions', 'residual', 'delete', 'dedup', 'refresh']
 
     @pytest.mark.asyncio
     async def test_dedups_surviving_node_edges(self, backend_with_mocks):
@@ -396,6 +437,88 @@ class TestMergeEntities:
         assert 'surviving_summary' in result
 
     @pytest.mark.asyncio
+    async def test_relocates_mentions_onto_the_survivor(self, backend_with_mocks):
+        """Awaits redirect_node_mentions once with both uuids and the group_id
+        (task 4986 loss mode 1)."""
+        backend = backend_with_mocks
+        await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+        backend.redirect_node_mentions.assert_awaited_once_with(
+            'dep-uuid', 'sur-uuid', group_id='test',
+        )
+
+    @pytest.mark.asyncio
+    async def test_audit_dict_reports_mentions_redirected(self, backend_with_mocks):
+        """The MENTIONS relocation counts reach the audit dict verbatim, so the
+        record distinguishes 'two links moved' from 'two moved, one redundant'."""
+        backend = backend_with_mocks
+        result = await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+        assert result['mentions_redirected'] == {'redirected': 2, 'already_linked': 1}
+
+    @pytest.mark.asyncio
+    async def test_audit_dict_keeps_the_deprecated_nodes_summary(self, backend_with_mocks):
+        """Loss mode 5: merge_entities already FETCHES the loser's summary to
+        validate the node exists, then throws it away -- and refresh_entity_summary
+        rebuilds the survivor's summary from EDGES only, so any summary text no
+        edge backs is unrecoverable after the merge. Keeping it in the audit dict
+        is the minimum fix."""
+        backend = backend_with_mocks
+        result = await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+        assert result['deprecated_summary'] == 'old dep summary'
+
+    @pytest.mark.asyncio
+    async def test_audit_dict_reports_residual_relationships_destroyed(
+        self, backend_with_mocks,
+    ):
+        """What this DETACH DELETE actually destroyed: a census taken AFTER both
+        relocations and BEFORE the delete. Loss modes 1-4 were only discoverable
+        because someone went looking; this field makes the same question
+        answerable from the record itself."""
+        backend = backend_with_mocks
+        result = await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+        backend.count_foreign_relationships.assert_awaited_once_with(
+            'dep-uuid', group_id='test',
+        )
+        assert result['residual_relationships_destroyed'] == 1
+
+    @pytest.mark.asyncio
+    async def test_residual_probe_failure_never_aborts_the_merge(self, backend_with_mocks):
+        """The probe is an audit datum, never a gate. By the time it is taken the
+        edge and mention relocations are already committed and irreversible, so a
+        raise must not propagate -- that would abort a half-applied merge on the
+        strength of a failed OBSERVATION. None is honest about the difference
+        between 'measured zero' and 'could not measure', which is the same
+        distinction count_foreign_relationships itself refuses to blur."""
+        backend = backend_with_mocks
+        backend.count_foreign_relationships = AsyncMock(
+            side_effect=RuntimeError('census query failed'),
+        )
+        result = await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+        assert result['residual_relationships_destroyed'] is None
+        # The merge still COMPLETED: the delete and everything after it ran.
+        backend.delete_entity_node.assert_awaited_once_with('dep-uuid', group_id='test')
+        backend.refresh_entity_summary.assert_awaited_once_with('sur-uuid', group_id='test')
+
+    @pytest.mark.asyncio
+    async def test_pre_existing_audit_keys_keep_their_values(self, backend_with_mocks):
+        """The new keys are ADDITIVE: every key the audit dict carried before
+        task 4986 still reports exactly what it did."""
+        backend = backend_with_mocks
+        result = await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+        assert result['surviving_uuid'] == 'sur-uuid'
+        assert result['surviving_name'] == 'SurvivingName'
+        assert result['deprecated_uuid'] == 'dep-uuid'
+        assert result['deprecated_name'] == 'DeprecatedName'
+        assert result['edges_redirected'] == {
+            'outgoing_redirected': 2, 'incoming_redirected': 1, 'inter_node_deleted': 0,
+        }
+        assert result['duplicate_edges_removed'] == 0
+        assert result['surviving_summary'] == {
+            'before': 'old sur summary',
+            'after': 'SurvivingName knows Foo\nDeprecatedName knows Bar',
+            'edge_count': 3,
+        }
+
+    @pytest.mark.asyncio
     async def test_merge_with_zero_edges_succeeds(self, mock_config, make_backend):
         """When deprecated node has zero edges, merge still succeeds."""
         backend = make_backend(mock_config)
@@ -408,6 +531,10 @@ class TestMergeEntities:
             'incoming_redirected': 0,
             'inter_node_deleted': 0,
         })
+        backend.redirect_node_mentions = AsyncMock(return_value={
+            'redirected': 0, 'already_linked': 0,
+        })
+        backend.count_foreign_relationships = AsyncMock(return_value=0)
         backend.delete_entity_node = AsyncMock()
         backend.dedup_valid_edges_for_node = AsyncMock(return_value=0)
         backend.refresh_entity_summary = AsyncMock(return_value=make_rebuild_detail(
@@ -418,6 +545,133 @@ class TestMergeEntities:
         backend.delete_entity_node.assert_awaited_once_with('dep-uuid', group_id='test')
         backend.refresh_entity_summary.assert_awaited_once_with('sur-uuid', group_id='test')
         assert result['surviving_uuid'] == 'sur-uuid'
+
+
+# ---------------------------------------------------------------------------
+# task 4986: one structured, machine-readable record per merge (loss mode 4b)
+# ---------------------------------------------------------------------------
+
+class TestMergeEntitiesStructuredLog:
+    """merge_entities emits EXACTLY ONE record per merge, and its payload IS
+    the audit dict the method returns.
+
+    A payload assembled separately from the returned dict would be a second
+    copy of the same facts and would drift the first time a key is added to
+    one of them; emitting the returned object makes that drift impossible by
+    construction. It also means the log line and the write journal's
+    result_summary -- which MemoryService.merge_entities already persists from
+    this same dict -- carry identical fields, so the durable record and the
+    operator-visible one cannot disagree.
+
+    JSON rather than a key=value line because the payload must carry the
+    loser's full summary text: arbitrary prose with quotes, newlines and
+    non-ASCII, which a reader should not need an ad-hoc parser to recover.
+    """
+
+    LOGGER = 'fused_memory.backends.graphiti_client'
+    PREFIX = 'merge_entities: '
+
+    @staticmethod
+    def _merge_records(caplog):
+        return [
+            r for r in caplog.records
+            if r.name == TestMergeEntitiesStructuredLog.LOGGER
+            and r.getMessage().startswith(TestMergeEntitiesStructuredLog.PREFIX)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_emits_one_json_record_equal_to_the_returned_audit_dict(
+        self, backend_with_mocks, caplog,
+    ):
+        backend = backend_with_mocks
+        with caplog.at_level(logging.INFO, logger=self.LOGGER):
+            result = await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+
+        records = self._merge_records(caplog)
+        assert len(records) == 1, (
+            'exactly one record per merge -- the old unstructured line must be '
+            f'REPLACED, not joined, so an auditor never reconciles two records '
+            f'of one event; got {[r.getMessage() for r in records]}'
+        )
+
+        payload = json.loads(records[0].getMessage()[len(self.PREFIX):])
+        assert payload == result, 'the logged payload IS the returned audit dict'
+
+    @pytest.mark.asyncio
+    async def test_payload_carries_the_whole_merge_provenance(
+        self, backend_with_mocks, caplog,
+    ):
+        """Everything an auditor needs about one merge, in one record."""
+        backend = backend_with_mocks
+        with caplog.at_level(logging.INFO, logger=self.LOGGER):
+            await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+
+        payload = json.loads(self._merge_records(caplog)[0].getMessage()[len(self.PREFIX):])
+
+        assert payload['surviving_uuid'] == 'sur-uuid'
+        assert payload['surviving_name'] == 'SurvivingName'
+        assert payload['deprecated_uuid'] == 'dep-uuid'
+        assert payload['deprecated_name'] == 'DeprecatedName'
+        assert payload['edges_redirected'] == {
+            'outgoing_redirected': 2, 'incoming_redirected': 1, 'inter_node_deleted': 0,
+        }
+        assert payload['mentions_redirected'] == {'redirected': 2, 'already_linked': 1}
+        assert payload['residual_relationships_destroyed'] == 1
+        # Loss mode 5: the loser's summary must be recoverable from the record.
+        assert payload['deprecated_summary'] == 'old dep summary'
+
+    @pytest.mark.asyncio
+    async def test_awkward_summary_text_round_trips(
+        self, mock_config, make_backend, caplog,
+    ):
+        """Quotes, newlines and non-ASCII survive intact -- the case an ad-hoc
+        key=value line would mangle, and the reason the payload is JSON."""
+        awkward = 'She said "hi"\nline two\ttab; naïve — 日本語 {braces} \\backslash'
+        backend = make_backend(mock_config)
+        backend.get_node_text = AsyncMock(side_effect=[
+            ('DepName', awkward),
+            ('SurName', 'sur summary'),
+        ])
+        backend.redirect_node_edges = AsyncMock(return_value={
+            'outgoing_redirected': 0, 'incoming_redirected': 0, 'inter_node_deleted': 0,
+        })
+        backend.redirect_node_mentions = AsyncMock(return_value={
+            'redirected': 0, 'already_linked': 0,
+        })
+        backend.count_foreign_relationships = AsyncMock(return_value=0)
+        backend.delete_entity_node = AsyncMock()
+        backend.dedup_valid_edges_for_node = AsyncMock(return_value=0)
+        backend.refresh_entity_summary = AsyncMock(
+            return_value=make_rebuild_detail('sur-uuid', 'SurName'),
+        )
+
+        with caplog.at_level(logging.INFO, logger=self.LOGGER):
+            await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+
+        payload = json.loads(self._merge_records(caplog)[0].getMessage()[len(self.PREFIX):])
+        assert payload['deprecated_summary'] == awkward
+
+    @pytest.mark.asyncio
+    async def test_unmeasurable_residual_is_null_in_the_payload(
+        self, backend_with_mocks, caplog,
+    ):
+        """None round-trips as JSON null, keeping "could not measure" distinct
+        from "measured zero" in the durable record too."""
+        backend = backend_with_mocks
+        backend.count_foreign_relationships = AsyncMock(
+            side_effect=RuntimeError('census query failed'),
+        )
+        with caplog.at_level(logging.INFO, logger=self.LOGGER):
+            await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+
+        # The census failure logs its own diagnostic, which must NOT carry the
+        # structured record's prefix: an auditor greps that prefix and parses
+        # the remainder as JSON, so a prose line sharing it would break them.
+        records = self._merge_records(caplog)
+        assert len(records) == 1, [r.getMessage() for r in records]
+
+        payload = json.loads(records[0].getMessage()[len(self.PREFIX):])
+        assert payload['residual_relationships_destroyed'] is None
 
 
 # ---------------------------------------------------------------------------
@@ -590,17 +844,22 @@ class TestDedupValidEdgesForNode:
 
 class TestFindDuplicateEntityNodes:
     """GraphitiBackend.find_duplicate_entity_nodes(name, *, group_id) returns every
-    Entity node sharing an exact name, canonical-ordered (most valid edges, then
-    oldest created_at, then uuid) so the post-write node-dedup sweep can pick
-    matches[0] as the merge survivor."""
+    Entity node sharing an exact name, canonical-ordered (highest provenance_rank,
+    then oldest created_at, then uuid) so the post-write node-dedup sweep can pick
+    matches[0] as the merge survivor.
+
+    provenance_rank is edge_count + mentions_count (task 4986). edge_count keeps
+    its exact pre-4986 meaning -- valid RELATES_TO only -- because two consumers
+    read it for something other than ranking; MENTIONS enters ranking ONLY
+    through the two new keys."""
 
     @pytest.mark.asyncio
     async def test_uses_ro_query_only(self, mock_config, make_backend, make_graph_mock):
         """Read-only lookup: awaits graph.ro_query exactly once, never graph.query."""
         backend = make_backend(mock_config)
         rows = [
-            ['canon-uuid', 100, 5],
-            ['dup-uuid-1', 200, 2],
+            ['canon-uuid', 100, 5, 1, 6],
+            ['dup-uuid-1', 200, 2, 0, 2],
         ]
         await assert_ro_query_only(
             backend, make_graph_mock, rows, 'find_duplicate_entity_nodes',
@@ -626,7 +885,8 @@ class TestFindDuplicateEntityNodes:
 
     @pytest.mark.asyncio
     async def test_cypher_orders_canonical_first(self, mock_config, make_backend, make_graph_mock):
-        """ORDER BY ranks highest edge_count first, then oldest created_at, then uuid."""
+        """ORDER BY ranks highest provenance_rank first, then oldest created_at,
+        then uuid (task 4986: was edge_count DESC, which is MENTIONS-blind)."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
@@ -635,28 +895,44 @@ class TestFindDuplicateEntityNodes:
         order_idx = cypher.find('ORDER BY')
         assert order_idx != -1, f'Expected ORDER BY clause in cypher: {cypher}'
         order_clause = cypher[order_idx:]
-        assert 'edge_count DESC' in order_clause
+        assert 'provenance_rank DESC' in order_clause
         assert 'created_at ASC' in order_clause
         assert 'uuid ASC' in order_clause
-        # edge_count must be the primary sort key, then created_at, then uuid
-        assert order_clause.find('edge_count') < order_clause.find('created_at') < order_clause.find('uuid')
+        # The ordinal check below compares str.find results, which return -1 for
+        # an ABSENT key -- so an ordinal chain on a key that has left the clause
+        # passes VACUOUSLY rather than going red. That is exactly how this
+        # assertion would have degraded silently when edge_count stopped being
+        # the sort key, so each key's PRESENCE is asserted before its position.
+        keys = ('provenance_rank', 'created_at', 'uuid')
+        positions = [order_clause.find(k) for k in keys]
+        assert all(pos != -1 for pos in positions), (
+            f'every ordinal-checked key must be PRESENT in the clause, else the '
+            f'ordering assertion passes by absence: {dict(zip(keys, positions, strict=True))} '
+            f'in {order_clause!r}'
+        )
+        assert positions == sorted(positions), (
+            f'sort keys must appear in rank order {keys}: {order_clause!r}'
+        )
 
     @pytest.mark.asyncio
     async def test_returns_rows_preserving_order(self, mock_config, make_backend, make_graph_mock):
         """Returns list[dict] with uuid/created_at/edge_count, preserving DB row order."""
         backend = make_backend(mock_config)
         rows = [
-            ['canon-uuid', 100, 5],
-            ['dup-uuid-1', 200, 2],
-            ['dup-uuid-2', 300, 1],
+            ['canon-uuid', 100, 5, 1, 6],
+            ['dup-uuid-1', 200, 2, 3, 5],
+            ['dup-uuid-2', 300, 1, 0, 1],
         ]
         graph = make_graph_mock(rows)
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.find_duplicate_entity_nodes('Reify', group_id='test')
         assert result == [
-            {'uuid': 'canon-uuid', 'created_at': 100, 'edge_count': 5},
-            {'uuid': 'dup-uuid-1', 'created_at': 200, 'edge_count': 2},
-            {'uuid': 'dup-uuid-2', 'created_at': 300, 'edge_count': 1},
+            {'uuid': 'canon-uuid', 'created_at': 100, 'edge_count': 5,
+             'mentions_count': 1, 'provenance_rank': 6},
+            {'uuid': 'dup-uuid-1', 'created_at': 200, 'edge_count': 2,
+             'mentions_count': 3, 'provenance_rank': 5},
+            {'uuid': 'dup-uuid-2', 'created_at': 300, 'edge_count': 1,
+             'mentions_count': 0, 'provenance_rank': 1},
         ]
 
     @pytest.mark.asyncio
@@ -674,11 +950,12 @@ class TestFindDuplicateEntityNodes:
     ):
         """A single matching node -> single-element list (no duplicate to merge)."""
         backend = make_backend(mock_config)
-        rows = [['only-uuid', 100, 0]]
+        rows = [['only-uuid', 100, 0, 0, 0]]
         graph = make_graph_mock(rows)
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.find_duplicate_entity_nodes('Unique', group_id='test')
-        assert result == [{'uuid': 'only-uuid', 'created_at': 100, 'edge_count': 0}]
+        assert result == [{'uuid': 'only-uuid', 'created_at': 100, 'edge_count': 0,
+                           'mentions_count': 0, 'provenance_rank': 0}]
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):
@@ -1111,5 +1388,681 @@ class TestRedirectNodeEdgesLiveFalkorDB:
             assert list(embeddings_by_fact['dep relates to t3']) == pytest.approx([5.0, 6.0])
             assert list(embeddings_by_fact['s1 relates to dep']) == pytest.approx([7.0, 8.0])
             assert list(embeddings_by_fact['s2 relates to dep']) == pytest.approx([9.0, 10.0])
+        finally:
+            await backend.close()
+
+
+@falkor_skipif()
+@pytest.mark.timeout(15)
+@pytest.mark.integration
+class TestRedirectNodeEdgesPreservesExpiredAtLiveFalkorDB:
+    """Pin the two properties the redirect used to DROP, against a real server
+    (task 4986 loss modes 3 and 4a).
+
+    `expired_at` is load-bearing and its loss is silent: `expired_at` SET with
+    `invalid_at` NULL is the restore hooks' deliberately-restored signature
+    (the hooks clear `invalid_at` and never `expired_at`), so a redirect that
+    drops it re-exposes those edges to false supersession. `reassign_edge` —
+    this method's single-edge sibling — already copies it; `redirect_node_edges`
+    did not, which is the copy-drift between two SET lists that the fix closes.
+
+    A mock can only confirm the SET clause was SENT. Only a live server shows
+    that copying a NULL source leaves the property ABSENT rather than inventing
+    a value, which is the half of the contract a Cypher-substring test cannot
+    reach.
+    """
+
+    RESTORED_EXPIRED_AT = '2026-01-02T03:04:05Z'
+
+    @pytest.mark.asyncio
+    async def test_redirect_preserves_expired_at_and_stamps_losing_node(
+        self, mock_config, merge_entities_live_graph,
+    ):
+        graph_name, graph = merge_entities_live_graph
+
+        await graph.query(
+            "CREATE (:Entity {uuid: 'dep', name: 'Dep'}), "
+            "(:Entity {uuid: 'sur', name: 'Sur'}), "
+            "(:Entity {uuid: 't1', name: 'T1'}), "
+            "(:Entity {uuid: 't2', name: 'T2'}), "
+            "(:Entity {uuid: 's1', name: 'S1'}), "
+            "(:Entity {uuid: 's2', name: 'S2'})"
+        )
+
+        async def seed_edge(src, dst, edge_uuid, fact, expired_at=None):
+            await graph.query(
+                'MATCH (a:Entity {uuid: $src}), (b:Entity {uuid: $dst}) '
+                'CREATE (a)-[e:RELATES_TO {uuid: $edge_uuid, name: $name, fact: $fact}]->(b)',
+                {'src': src, 'dst': dst, 'edge_uuid': edge_uuid, 'name': 'rel', 'fact': fact},
+            )
+            if expired_at is not None:
+                await graph.query(
+                    'MATCH ()-[e:RELATES_TO {uuid: $edge_uuid}]-() SET e.expired_at = $expired_at',
+                    {'edge_uuid': edge_uuid, 'expired_at': expired_at},
+                )
+
+        # The deliberately-restored signature in each direction: expired_at SET,
+        # invalid_at never written (so NULL) — exactly what a restore hook leaves.
+        await seed_edge('dep', 't1', 'o-restored', 'dep restored to t1',
+                        expired_at=self.RESTORED_EXPIRED_AT)
+        await seed_edge('s1', 'dep', 'i-restored', 's1 restored to dep',
+                        expired_at=self.RESTORED_EXPIRED_AT)
+        # Plain edges with NO expired_at: copying a NULL must not invent a value.
+        await seed_edge('dep', 't2', 'o-plain', 'dep plain to t2')
+        await seed_edge('s2', 'dep', 'i-plain', 's2 plain to dep')
+
+        backend = GraphitiBackend(mock_config)
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        try:
+            result = await backend.redirect_node_edges('dep', 'sur', group_id=graph_name)
+
+            assert result['outgoing_redirected'] == 2
+            assert result['incoming_redirected'] == 2
+            assert result['inter_node_deleted'] == 0
+
+            sur_edges = await graph.query(
+                'MATCH (sur:Entity {uuid: "sur"})-[e:RELATES_TO]-() '
+                'RETURN e.fact, e.uuid, e.superseded_edge_uuid, e.expired_at, '
+                '       e.invalid_at, e.reassigned_from_node_uuid'
+            )
+            rows = {row[0]: row[1:] for row in sur_edges.result_set}
+            assert len(rows) == 4, f'no edge may be lost by the redirect: {rows!r}'
+
+            originals = {
+                'dep restored to t1': 'o-restored',
+                's1 restored to dep': 'i-restored',
+                'dep plain to t2': 'o-plain',
+                's2 plain to dep': 'i-plain',
+            }
+            for fact, (new_uuid, superseded, expired_at, invalid_at, stamp) in rows.items():
+                # Pre-existing contract, unchanged by this fix.
+                assert superseded == originals[fact]
+                assert new_uuid != superseded
+                assert uuid.UUID(new_uuid).version == 4
+                # Loss mode 4a: the redirect records WHICH node the endpoint left.
+                assert stamp == 'dep', (
+                    f'{fact!r} must carry reassigned_from_node_uuid=dep, got {stamp!r}'
+                )
+                # Loss mode 3: the restored signature survives intact.
+                if 'restored' in fact:
+                    assert expired_at == self.RESTORED_EXPIRED_AT
+                    assert invalid_at is None
+                else:
+                    # Copying a NULL source must leave the property absent, not
+                    # invent one — the half only a live server can show.
+                    assert expired_at is None
+                    assert invalid_at is None
+        finally:
+            await backend.close()
+
+
+class _WriteCountingGraph:
+    """Delegating proxy that counts `query` (write channel) calls.
+
+    Lets a live test assert that a no-op path issues NO WRITES, which is a
+    stronger and more honest claim than "the graph looks unchanged" — the
+    latter also holds for a write that happened to write nothing.
+    """
+
+    def __init__(self, graph):
+        self._graph = graph
+        self.writes = 0
+
+    async def query(self, *args, **kwargs):
+        self.writes += 1
+        return await self._graph.query(*args, **kwargs)
+
+    async def ro_query(self, *args, **kwargs):
+        return await self._graph.ro_query(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._graph, name)
+
+
+@falkor_skipif()
+@pytest.mark.timeout(15)
+@pytest.mark.integration
+class TestRedirectNodeMentionsLiveFalkorDB:
+    """Pin `redirect_node_mentions` — the MENTIONS sibling of
+    `redirect_node_edges` (task 4986 loss mode 1).
+
+    `redirect_node_edges` is RELATES_TO-typed in all three phases, and
+    `delete_entity_node` then issues a bare DETACH DELETE that destroys every
+    `(ep:Episodic)-[:MENTIONS]->(loser)` link. Nothing on the merge path
+    relocated them, so a merge silently destroyed the loser's episode
+    provenance. This primitive is what moves it.
+
+    It is a pure RELOCATION primitive: it never destroys. A loser link whose
+    episode is ALREADY on the survivor is SKIPPED and left in place — moving
+    it would duplicate the episode link, and deleting it would make the
+    primitive destructive. Provenance is the (episode, entity) PAIR, so
+    nothing is lost by leaving the redundant copy for the caller's own
+    DETACH DELETE to remove. That choice is also what makes a re-run after a
+    partial failure converge instead of double-counting.
+    """
+
+    @staticmethod
+    async def _seed(graph):
+        await graph.query(
+            "CREATE (:Entity {uuid: 'dep', name: 'Dep'}), "
+            "(:Entity {uuid: 'sur', name: 'Sur'}), "
+            "(:Episodic {uuid: 'ep1'}), "
+            "(:Episodic {uuid: 'ep2'}), "
+            "(:Episodic {uuid: 'ep3'})"
+        )
+
+    @staticmethod
+    async def _link(graph, episode, entity, link_uuid, created_at):
+        await graph.query(
+            'MATCH (ep:Episodic {uuid: $ep}), (n:Entity {uuid: $n}) '
+            'CREATE (ep)-[m:MENTIONS {uuid: $uuid, group_id: $gid, created_at: $created_at}]->(n)',
+            {'ep': episode, 'n': entity, 'uuid': link_uuid,
+             'gid': 'seeded-group', 'created_at': created_at},
+        )
+
+    @staticmethod
+    def _backend(mock_config):
+        backend = GraphitiBackend(mock_config)
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        return backend
+
+    @staticmethod
+    async def _mentions_of(graph, entity_uuid):
+        """{episode_uuid: [(link_uuid, group_id, created_at, stamp), ...]}"""
+        result = await graph.query(
+            'MATCH (ep:Episodic)-[m:MENTIONS]->(n:Entity {uuid: $n}) '
+            'RETURN ep.uuid, m.uuid, m.group_id, m.created_at, m.reassigned_from_node_uuid',
+            {'n': entity_uuid},
+        )
+        out: dict[str, list] = {}
+        for ep_uuid, link_uuid, gid, created_at, stamp in result.result_set:
+            out.setdefault(ep_uuid, []).append((link_uuid, gid, created_at, stamp))
+        return out
+
+    @pytest.mark.asyncio
+    async def test_relocates_unlinked_episodes_and_skips_already_linked(
+        self, mock_config, merge_entities_live_graph,
+    ):
+        graph_name, graph = merge_entities_live_graph
+        await self._seed(graph)
+        # All three episodes mention the loser; ep1 ALSO already mentions the
+        # survivor — the collision case.
+        await self._link(graph, 'ep1', 'dep', 'm-ep1-dep', '2026-01-01T00:00:01Z')
+        await self._link(graph, 'ep2', 'dep', 'm-ep2-dep', '2026-01-01T00:00:02Z')
+        await self._link(graph, 'ep3', 'dep', 'm-ep3-dep', '2026-01-01T00:00:03Z')
+        await self._link(graph, 'ep1', 'sur', 'm-ep1-sur', '2026-01-01T00:00:04Z')
+
+        backend = self._backend(mock_config)
+        try:
+            result = await backend.redirect_node_mentions('dep', 'sur', group_id=graph_name)
+            assert result == {'redirected': 2, 'already_linked': 1}
+
+            sur_links = await self._mentions_of(graph, 'sur')
+            # Episode provenance is now complete on the survivor, and no
+            # episode is linked twice.
+            assert sorted(sur_links) == ['ep1', 'ep2', 'ep3']
+            assert all(len(v) == 1 for v in sur_links.values()), sur_links
+
+            # The two MOVED links keep uuid/group_id/created_at verbatim and
+            # carry the relocation stamp.
+            for episode, link_uuid, created_at in (
+                ('ep2', 'm-ep2-dep', '2026-01-01T00:00:02Z'),
+                ('ep3', 'm-ep3-dep', '2026-01-01T00:00:03Z'),
+            ):
+                moved_uuid, gid, moved_created_at, stamp = sur_links[episode][0]
+                assert moved_uuid == link_uuid
+                assert gid == 'seeded-group'
+                assert moved_created_at == created_at
+                assert stamp == 'dep'
+
+            # The survivor's PRE-EXISTING ep1 link is untouched: original uuid,
+            # no stamp. It was never rewritten, only recognised.
+            pre_uuid, _, _, pre_stamp = sur_links['ep1'][0]
+            assert pre_uuid == 'm-ep1-sur'
+            assert pre_stamp is None
+
+            # The skipped link is NOT deleted: this primitive never destroys.
+            # The merge's own DETACH DELETE is what removes the redundant copy.
+            dep_links = await self._mentions_of(graph, 'dep')
+            assert sorted(dep_links) == ['ep1']
+            assert dep_links['ep1'][0][0] == 'm-ep1-dep'
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_second_call_is_a_no_op(self, mock_config, merge_entities_live_graph):
+        """Idempotent re-run: a crash partway through leaves some links already
+        moved, so retrying from the top must converge rather than double-count."""
+        graph_name, graph = merge_entities_live_graph
+        await self._seed(graph)
+        await self._link(graph, 'ep1', 'dep', 'm-ep1-dep', '2026-01-01T00:00:01Z')
+        await self._link(graph, 'ep2', 'dep', 'm-ep2-dep', '2026-01-01T00:00:02Z')
+        await self._link(graph, 'ep3', 'dep', 'm-ep3-dep', '2026-01-01T00:00:03Z')
+        await self._link(graph, 'ep1', 'sur', 'm-ep1-sur', '2026-01-01T00:00:04Z')
+
+        backend = self._backend(mock_config)
+        try:
+            await backend.redirect_node_mentions('dep', 'sur', group_id=graph_name)
+            again = await backend.redirect_node_mentions('dep', 'sur', group_id=graph_name)
+            # Only the skipped ep1 link is left on the loser, and it is still
+            # skipped — nothing moved twice.
+            assert again == {'redirected': 0, 'already_linked': 1}
+
+            sur_links = await self._mentions_of(graph, 'sur')
+            assert sorted(sur_links) == ['ep1', 'ep2', 'ep3']
+            assert all(len(v) == 1 for v in sur_links.values()), sur_links
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_same_episode_duplicate_links_collapse_to_one(
+        self, mock_config, merge_entities_live_graph,
+    ):
+        """Two links from the SAME episode to the loser collapse to one on the
+        survivor. This is what pins the existence probe INSIDE the loop: hoisted
+        above it, the probe would read 'not linked' once and move both."""
+        graph_name, graph = merge_entities_live_graph
+        await self._seed(graph)
+        await self._link(graph, 'ep2', 'dep', 'm-ep2-dep-a', '2026-01-01T00:00:01Z')
+        await self._link(graph, 'ep2', 'dep', 'm-ep2-dep-b', '2026-01-01T00:00:02Z')
+
+        backend = self._backend(mock_config)
+        try:
+            result = await backend.redirect_node_mentions('dep', 'sur', group_id=graph_name)
+            assert result == {'redirected': 1, 'already_linked': 1}
+
+            sur_links = await self._mentions_of(graph, 'sur')
+            assert sorted(sur_links) == ['ep2']
+            assert len(sur_links['ep2']) == 1, sur_links
+            # The second link stayed on the loser rather than being destroyed.
+            dep_links = await self._mentions_of(graph, 'dep')
+            assert len(dep_links.get('ep2', [])) == 1
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_loser_with_no_mentions_writes_nothing(
+        self, mock_config, merge_entities_live_graph,
+    ):
+        graph_name, graph = merge_entities_live_graph
+        await self._seed(graph)
+
+        # Hold the driver concretely: backend._driver is Optional, and the spy
+        # has to be installed on the same object the backend will read through.
+        driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        backend = GraphitiBackend(mock_config)
+        backend._driver = driver
+        spy = _WriteCountingGraph(driver._get_graph(graph_name))
+        driver._get_graph = MagicMock(return_value=spy)
+        try:
+            result = await backend.redirect_node_mentions('dep', 'sur', group_id=graph_name)
+            assert result == {'redirected': 0, 'already_linked': 0}
+            assert spy.writes == 0, (
+                f'a loser with zero MENTIONS must issue no writes, got {spy.writes}'
+            )
+        finally:
+            await backend.close()
+
+
+@falkor_skipif()
+@pytest.mark.timeout(15)
+@pytest.mark.integration
+class TestFindDuplicateEntityNodesProvenanceRankLiveFalkorDB:
+    """Survivor rank counts episode provenance, not just valid edges
+    (task 4986 loss mode 2).
+
+    `find_duplicate_entity_nodes` ordered by `edge_count DESC` alone, so an
+    episode-rich but edge-poor node LOST the rank and was deleted — destroying
+    provenance the survivor never had. Measured in 12 of 50 live duplicate
+    groups on 2026-08-31.
+
+    `edge_count` deliberately keeps its exact pre-4986 meaning (valid
+    RELATES_TO only). MENTIONS enters ONLY through `mentions_count` and
+    `provenance_rank`, and only `provenance_rank` orders the result — see
+    the sweep-contract guard below for the consumer that forces the split.
+    """
+
+    @staticmethod
+    def _backend(mock_config):
+        backend = GraphitiBackend(mock_config)
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        return backend
+
+    @staticmethod
+    async def _node(graph, uuid_, name, group_id, created_at):
+        await graph.query(
+            'CREATE (:Entity {uuid: $uuid, name: $name, group_id: $gid, created_at: $created})',
+            {'uuid': uuid_, 'name': name, 'gid': group_id, 'created': created_at},
+        )
+
+    @staticmethod
+    async def _relates(graph, src, dst, edge_uuid, invalid_at=None):
+        await graph.query(
+            'MATCH (a:Entity {uuid: $src}), (b:Entity {uuid: $dst}) '
+            'CREATE (a)-[:RELATES_TO {uuid: $uuid, invalid_at: $invalid_at}]->(b)',
+            {'src': src, 'dst': dst, 'uuid': edge_uuid, 'invalid_at': invalid_at},
+        )
+
+    @staticmethod
+    async def _mentions(graph, episode, entity, link_uuid):
+        await graph.query(
+            'MATCH (ep:Episodic {uuid: $ep}), (n:Entity {uuid: $n}) '
+            'CREATE (ep)-[:MENTIONS {uuid: $uuid}]->(n)',
+            {'ep': episode, 'n': entity, 'uuid': link_uuid},
+        )
+
+    @pytest.mark.asyncio
+    async def test_episode_richer_node_wins_the_rank(
+        self, mock_config, merge_entities_live_graph,
+    ):
+        graph_name, graph = merge_entities_live_graph
+        # A: 2 valid RELATES_TO + 1 MENTIONS -> rank 3
+        # B: 1 valid RELATES_TO + 3 MENTIONS -> rank 4, and created LATER so
+        #    the created_at tie-break cannot be what puts it first.
+        await self._node(graph, 'A', 'Dup', graph_name, '2026-01-01T00:00:00Z')
+        await self._node(graph, 'B', 'Dup', graph_name, '2026-06-01T00:00:00Z')
+        await self._node(graph, 'nbr', 'Neighbour', graph_name, '2026-01-01T00:00:00Z')
+        for ep in ('ep1', 'ep2', 'ep3'):
+            await graph.query('CREATE (:Episodic {uuid: $u})', {'u': ep})
+
+        await self._relates(graph, 'A', 'nbr', 'a-e1')
+        await self._relates(graph, 'A', 'nbr', 'a-e2')
+        await self._relates(graph, 'B', 'nbr', 'b-e1')
+        # An INVALIDATED edge on B must still not count toward edge_count.
+        await self._relates(graph, 'B', 'nbr', 'b-e-dead', invalid_at='2026-02-02T00:00:00Z')
+        await self._mentions(graph, 'ep1', 'A', 'm-a1')
+        for i, ep in enumerate(('ep1', 'ep2', 'ep3')):
+            await self._mentions(graph, ep, 'B', f'm-b{i}')
+
+        backend = self._backend(mock_config)
+        try:
+            dups = await backend.find_duplicate_entity_nodes('Dup', group_id=graph_name)
+            by_uuid = {row['uuid']: row for row in dups}
+
+            assert [row['uuid'] for row in dups] == ['B', 'A'], (
+                'the episode-richer node must survive; under edge_count DESC '
+                f'alone A wins and its provenance is destroyed: {dups!r}'
+            )
+            # edge_count is UNCHANGED: valid RELATES_TO only, invalidated
+            # edges excluded exactly as before.
+            assert by_uuid['A']['edge_count'] == 2
+            assert by_uuid['B']['edge_count'] == 1
+            assert by_uuid['A']['mentions_count'] == 1
+            assert by_uuid['B']['mentions_count'] == 3
+            assert by_uuid['A']['provenance_rank'] == 3
+            assert by_uuid['B']['provenance_rank'] == 4
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_edge_count_stays_zero_for_a_mentions_only_node(
+        self, mock_config, merge_entities_live_graph,
+    ):
+        """SWEEP CONTRACT GUARD (task 3673 hazard note 2).
+
+        `reconciliation/degenerate_task_node_sweep.py` DELETES a placeholder
+        node when `int(match['edge_count']) == 0`. Folding MENTIONS into
+        edge_count would silently change WHICH nodes that sweep deletes — a
+        behaviour change in a file task 4986 never edits and whose tests would
+        never have shown it. This assertion is what protects it.
+        """
+        graph_name, graph = merge_entities_live_graph
+        await self._node(graph, 'M', 'Dup', graph_name, '2026-01-01T00:00:00Z')
+        for ep in ('ep1', 'ep2'):
+            await graph.query('CREATE (:Episodic {uuid: $u})', {'u': ep})
+            await self._mentions(graph, ep, 'M', f'm-{ep}')
+
+        backend = self._backend(mock_config)
+        try:
+            (row,) = await backend.find_duplicate_entity_nodes('Dup', group_id=graph_name)
+            assert row['edge_count'] == 0, (
+                'a node with zero valid RELATES_TO must still report '
+                "edge_count == 0, or the degenerate-node sweep's predicate "
+                'silently changes meaning'
+            )
+            assert row['mentions_count'] == 2
+            assert row['provenance_rank'] == 2
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_equal_rank_falls_through_to_created_at_then_uuid(
+        self, mock_config, merge_entities_live_graph,
+    ):
+        """The pre-existing tie-breaks are unchanged beneath the new primary key."""
+        graph_name, graph = merge_entities_live_graph
+        # Equal provenance_rank (1 each), reached DIFFERENTLY: one by an edge,
+        # one by a mention -- so the tie-break is genuinely exercised.
+        await self._node(graph, 'older', 'Dup', graph_name, '2026-01-01T00:00:00Z')
+        await self._node(graph, 'newer-a', 'Dup', graph_name, '2026-09-01T00:00:00Z')
+        await self._node(graph, 'newer-b', 'Dup', graph_name, '2026-09-01T00:00:00Z')
+        await self._node(graph, 'nbr', 'Neighbour', graph_name, '2026-01-01T00:00:00Z')
+        await graph.query("CREATE (:Episodic {uuid: 'ep1'})")
+
+        await self._mentions(graph, 'ep1', 'older', 'm-older')
+        await self._relates(graph, 'newer-a', 'nbr', 'na-e1')
+        await self._relates(graph, 'newer-b', 'nbr', 'nb-e1')
+
+        backend = self._backend(mock_config)
+        try:
+            dups = await backend.find_duplicate_entity_nodes('Dup', group_id=graph_name)
+            assert all(row['provenance_rank'] == 1 for row in dups), dups
+            # oldest created_at first; the two same-instant nodes then by uuid.
+            assert [row['uuid'] for row in dups] == ['older', 'newer-a', 'newer-b']
+        finally:
+            await backend.close()
+
+
+@falkor_skipif()
+@pytest.mark.timeout(30)
+@pytest.mark.integration
+class TestLosslessMergeEndToEndLiveFalkorDB:
+    """THE ACCEPTANCE SIGNAL (task 4986): drive the real merge against a real
+    server and assert, in one place, that nothing the task set out to preserve
+    is lost.
+
+    Composes units steps 1-12 already GREENed. Its value is that it exercises
+    them TOGETHER through the real merge_entities, where an ordering mistake
+    between two individually-correct pieces still destroys data.
+    """
+
+    RESTORED_EXPIRED_AT = '2026-03-04T05:06:07Z'
+    UNBACKED_SUMMARY = 'Dep is the "legacy" node.\nNo edge asserts this — naïve prose.'
+
+    @staticmethod
+    def _backend(mock_config):
+        backend = GraphitiBackend(mock_config)
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        return backend
+
+    @pytest.mark.asyncio
+    async def test_a_real_merge_preserves_edges_mentions_and_the_losers_summary(
+        self, mock_config, merge_entities_live_graph, caplog,
+    ):
+        graph_name, graph = merge_entities_live_graph
+
+        await graph.query(
+            'CREATE (:Entity {uuid: "dep", name: "Dup", group_id: $gid, summary: $summary}), '
+            '(:Entity {uuid: "sur", name: "Dup", group_id: $gid, summary: "Sur summary"}), '
+            '(:Entity {uuid: "nbr", name: "Neighbour", group_id: $gid, summary: ""}), '
+            '(:Episodic {uuid: "ep1"}), (:Episodic {uuid: "ep2"})',
+            {'gid': graph_name, 'summary': self.UNBACKED_SUMMARY},
+        )
+        # The loser's RELATES_TO: one carrying the deliberately-restored
+        # signature, one plain.
+        await graph.query(
+            'MATCH (d:Entity {uuid: "dep"}), (n:Entity {uuid: "nbr"}) '
+            'CREATE (d)-[:RELATES_TO {uuid: "e-restored", fact: "restored fact", '
+            '                         expired_at: $exp}]->(n), '
+            '       (d)-[:RELATES_TO {uuid: "e-plain", fact: "plain fact"}]->(n)',
+            {'exp': self.RESTORED_EXPIRED_AT},
+        )
+        # The loser's episode provenance, and one unrelated survivor edge.
+        await graph.query(
+            'MATCH (e1:Episodic {uuid: "ep1"}), (e2:Episodic {uuid: "ep2"}), '
+            '(d:Entity {uuid: "dep"}), (s:Entity {uuid: "sur"}), (n:Entity {uuid: "nbr"}) '
+            'CREATE (e1)-[:MENTIONS {uuid: "m-ep1"}]->(d), '
+            '       (e2)-[:MENTIONS {uuid: "m-ep2"}]->(d), '
+            '       (s)-[:RELATES_TO {uuid: "e-sur", fact: "sur fact"}]->(n)'
+        )
+
+        backend = self._backend(mock_config)
+        try:
+            with caplog.at_level(logging.INFO, logger='fused_memory.backends.graphiti_client'):
+                audit = await backend.merge_entities('dep', 'sur', group_id=graph_name)
+
+            # (1) Episode provenance survived the DETACH DELETE.
+            mentions = await graph.query(
+                'MATCH (ep:Episodic)-[m:MENTIONS]->(n:Entity {uuid: "sur"}) '
+                'RETURN ep.uuid, m.uuid, m.reassigned_from_node_uuid'
+            )
+            by_episode = {row[0]: (row[1], row[2]) for row in mentions.result_set}
+            assert sorted(by_episode) == ['ep1', 'ep2'], (
+                f'both episodes must now mention the survivor: {by_episode!r}'
+            )
+            for episode, (link_uuid, stamp) in by_episode.items():
+                assert link_uuid == f'm-{episode}'   # uuid preserved
+                assert stamp == 'dep'                # relocation stamped
+
+            # (2) The restored signature survived intact, and (3) every
+            # redirected edge is stamped and freshly re-minted.
+            sur_edges = await graph.query(
+                'MATCH (s:Entity {uuid: "sur"})-[e:RELATES_TO]-() '
+                'RETURN e.fact, e.uuid, e.superseded_edge_uuid, e.expired_at, '
+                '       e.invalid_at, e.reassigned_from_node_uuid'
+            )
+            rows = {row[0]: row[1:] for row in sur_edges.result_set}
+            assert sorted(rows) == ['plain fact', 'restored fact', 'sur fact']
+
+            restored_uuid, superseded, expired_at, invalid_at, stamp = rows['restored fact']
+            assert expired_at == self.RESTORED_EXPIRED_AT
+            assert invalid_at is None
+            assert superseded == 'e-restored'
+            assert restored_uuid != 'e-restored'
+            assert uuid.UUID(restored_uuid).version == 4
+            assert stamp == 'dep'
+
+            plain_uuid, plain_superseded, plain_expired, _, plain_stamp = rows['plain fact']
+            assert plain_expired is None
+            assert plain_superseded == 'e-plain'
+            assert plain_uuid != 'e-plain'
+            assert plain_stamp == 'dep'
+
+            # The survivor's OWN pre-existing edge was never touched.
+            own_uuid, own_superseded, _, _, own_stamp = rows['sur fact']
+            assert own_uuid == 'e-sur'
+            assert own_superseded is None
+            assert own_stamp is None
+
+            # (4) Exactly one structured record, carrying the unbacked summary
+            # verbatim and relocation counts matching what was seeded.
+            records = [
+                r for r in caplog.records
+                if r.name == 'fused_memory.backends.graphiti_client'
+                and r.getMessage().startswith('merge_entities: ')
+            ]
+            assert len(records) == 1, [r.getMessage() for r in records]
+            payload = json.loads(records[0].getMessage()[len('merge_entities: '):])
+            assert payload == audit
+            assert payload['deprecated_summary'] == self.UNBACKED_SUMMARY
+            assert payload['edges_redirected']['outgoing_redirected'] == 2
+            assert payload['edges_redirected']['incoming_redirected'] == 0
+            assert payload['mentions_redirected'] == {'redirected': 2, 'already_linked': 0}
+
+            # (5) The loser is gone, and the pre-existing S4 invariant still
+            # holds graph-wide.
+            gone = await graph.query('MATCH (n:Entity {uuid: "dep"}) RETURN count(n)')
+            assert gone.result_set[0][0] == 0
+            dup_check = await graph.query(
+                'MATCH ()-[e:RELATES_TO]->() '
+                'WITH e.uuid AS u, count(*) AS c WHERE c > 1 RETURN count(u)'
+            )
+            assert dup_check.result_set[0][0] == 0
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_both_ranking_paths_keep_the_episode_rich_node_alive(
+        self, mock_config, merge_entities_live_graph,
+    ):
+        """The survivor-selection half, on BOTH ranking methods -- each now
+        feeds a merge, so each can destroy provenance by mis-ranking.
+
+        Feeding [0]/[1:] into the real merge_entities is what closes the loop:
+        the node the ranking picks is the node that is still there afterwards.
+        """
+        graph_name, graph = merge_entities_live_graph
+
+        async def node(uuid_, name, created_at):
+            await graph.query(
+                'CREATE (:Entity {uuid: $u, name: $n, group_id: $g, created_at: $c, summary: ""})',
+                {'u': uuid_, 'n': name, 'g': graph_name, 'c': created_at},
+            )
+
+        async def edges(node_uuid, n, prefix):
+            for i in range(n):
+                await graph.query(
+                    'MATCH (a:Entity {uuid: $a}), (b:Entity {uuid: "nbr"}) '
+                    'CREATE (a)-[:RELATES_TO {uuid: $u, fact: $f}]->(b)',
+                    {'a': node_uuid, 'u': f'{prefix}-e{i}', 'f': f'{prefix} fact {i}'},
+                )
+
+        async def mentions(node_uuid, episodes, prefix):
+            for ep in episodes:
+                await graph.query('MERGE (:Episodic {uuid: $u})', {'u': ep})
+                await graph.query(
+                    'MATCH (e:Episodic {uuid: $ep}), (n:Entity {uuid: $n}) '
+                    'CREATE (e)-[:MENTIONS {uuid: $u}]->(n)',
+                    {'ep': ep, 'n': node_uuid, 'u': f'{prefix}-{ep}'},
+                )
+
+        await node('nbr', 'Neighbour', '2026-01-01T00:00:00Z')
+        # Exact-name group: edge-rich 'x-edgy' vs episode-rich 'x-episodic'.
+        await node('x-edgy', 'Exact', '2026-01-01T00:00:00Z')
+        await node('x-episodic', 'Exact', '2026-02-01T00:00:00Z')
+        await edges('x-edgy', 3, 'xe')
+        await edges('x-episodic', 1, 'xp')
+        await mentions('x-edgy', ['xa'], 'mxe')
+        await mentions('x-episodic', ['xb', 'xc', 'xd', 'xe'], 'mxp')
+        # Task family (substring path): same shape, different spellings.
+        await node('t-edgy', 'task 4986', '2026-01-01T00:00:00Z')
+        await node('t-episodic', 'Task 4986', '2026-02-01T00:00:00Z')
+        await edges('t-edgy', 3, 'te')
+        await edges('t-episodic', 1, 'tp')
+        await mentions('t-edgy', ['ta'], 'mte')
+        await mentions('t-episodic', ['tb', 'tc', 'td', 'te'], 'mtp')
+
+        backend = self._backend(mock_config)
+        try:
+            exact = await backend.find_duplicate_entity_nodes('Exact', group_id=graph_name)
+            assert [r['uuid'] for r in exact] == ['x-episodic', 'x-edgy']
+
+            family = await backend.find_entity_nodes_by_name_substring(
+                '4986', group_id=graph_name,
+            )
+            assert [r['uuid'] for r in family] == ['t-episodic', 't-edgy']
+
+            for rows in (exact, family):
+                survivor = rows[0]['uuid']
+                for loser in rows[1:]:
+                    await backend.merge_entities(
+                        loser['uuid'], survivor, group_id=graph_name,
+                    )
+                alive = await graph.query(
+                    'MATCH (n:Entity {uuid: $u}) RETURN count(n)', {'u': survivor},
+                )
+                assert alive.result_set[0][0] == 1, f'{survivor} must survive'
+
+            # The episode-rich survivors kept their own provenance AND absorbed
+            # the loser's -- the whole point of ranking on it.
+            for survivor, expected in (
+                ('x-episodic', ['xa', 'xb', 'xc', 'xd', 'xe']),
+                ('t-episodic', ['ta', 'tb', 'tc', 'td', 'te']),
+            ):
+                got = await graph.query(
+                    'MATCH (ep:Episodic)-[:MENTIONS]->(n:Entity {uuid: $u}) RETURN ep.uuid',
+                    {'u': survivor},
+                )
+                assert sorted(row[0] for row in got.result_set) == expected
         finally:
             await backend.close()

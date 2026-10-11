@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -77,6 +78,13 @@ CREATE TABLE IF NOT EXISTS scheduler_state (
     -- predates task 4559", which the restart predicate treats as unknowable
     -- and therefore restores the halt blind.
     ewa_value      REAL
+);
+
+-- Task 5812: the last COLD main-tip sweep that reached a verdict.
+CREATE TABLE IF NOT EXISTS main_sweep_cold_control (
+    project_id  TEXT PRIMARY KEY,
+    verdict_at  TEXT NOT NULL,
+    swept_sha   TEXT NOT NULL
 );
 """
 
@@ -549,3 +557,43 @@ class RunStore:
             conn.commit()
         finally:
             conn.close()
+
+    # ------------------------------------------------------------------ #
+    # Main-tip sweep cold-control cadence (task 5812)                     #
+    # ------------------------------------------------------------------ #
+
+    def save_main_sweep_cold_verdict(
+        self, project_id: str, *, verdict_at: datetime, swept_sha: str,
+    ) -> None:
+        """Persist (last wins) when *project_id*'s last COLD sweep reached a verdict.
+
+        Stored here so the cold-control cadence survives an orchestrator restart;
+        the consumer is ``orchestrator/main_tip_sweep_cadence.py::MainSweepColdControl``.
+        """
+        conn = self._connect()
+        try:
+            conn.execute(
+                'INSERT OR REPLACE INTO main_sweep_cold_control '
+                '(project_id, verdict_at, swept_sha) VALUES (?, ?, ?)',
+                (project_id, verdict_at.isoformat(), swept_sha),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def load_main_sweep_last_cold_verdict(self, project_id: str) -> datetime | None:
+        """The aware-UTC time of *project_id*'s last cold sweep verdict, or ``None``."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                'SELECT verdict_at FROM main_sweep_cold_control WHERE project_id = ?',
+                (project_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        verdict_at = datetime.fromisoformat(row[0])
+        if verdict_at.tzinfo is None:
+            return verdict_at.replace(tzinfo=UTC)
+        return verdict_at

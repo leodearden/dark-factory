@@ -46,6 +46,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 from test_warm_lane_bash_suite import PORTED_TESTS
 
 from orchestrator.config import LaneCommand, OrchestratorConfig
@@ -225,7 +226,7 @@ def test_bucket_coverage_is_relocated_never_dropped(monkeypatch: pytest.MonkeyPa
     )
 
 
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 def test_the_configured_lane_command_actually_collects_the_bucket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

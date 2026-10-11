@@ -32,12 +32,31 @@ Load-bearing invariants (callers MUST rely on these):
       equivalent) and MUST tolerate spurious wakes (events that produce no
       matching escalation after the drain).  A spurious wake is normal and
       not an error.
+
+  (c) A dropped ntfy push is visible ONLY as a marker line: the push is
+      best-effort, so its failure never blocks the stdout emit and never
+      changes the exit code — a re-arm whose push was dropped still reports
+      `WATCHER_REARM_OUTCOME: FIRED exit=0`.  The one signal is a
+      `WATCHER_NTFY_OUTCOME: FAILED` line on stderr, one per dropped push.
+      `main` configures the logging stream to stderr at INFO, as every sibling
+      CLI in this package does, so the line is there for a plain
+      `python -m escalation.watcher` run rather than by grace of
+      `logging.lastResort` — which anything configuring a root handler
+      in-process would take away.
+      That line is also the only way to COUNT an outage: `_emit` runs at most
+      once per process (both call sites `sys.exit(0)` on the next line), so a
+      process-local integer could never read more than 1 — the aggregate is
+      taken across the re-arm loop's stderr instead.  The marker deliberately
+      copies `scripts/watcher-rearm.sh`'s `WATCHER_REARM_OUTCOME` idiom and
+      its channel: stderr, keeping stdout pure escalation JSON for the
+      consumers that parse it.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import signal
 import sys
 import time
@@ -49,6 +68,15 @@ from inotify_simple import INotify, flags
 from shared.timestamps import parse_timestamp_or_warn
 
 from escalation.models import BORN_AT_L2_SEVERITIES, Escalation
+from escalation.queue import read_escalation_for_scan
+
+logger = logging.getLogger(__name__)
+
+#: UnicodeDecodeError: a long-lived watcher must survive one undecodable record
+#: (see ``escalation/queue.py::read_escalation_for_scan``).
+_WATCHER_PARSE_ERRORS: tuple[type[BaseException], ...] = (
+    json.JSONDecodeError, KeyError, TypeError, UnicodeDecodeError,
+)
 
 
 def _matches(
@@ -76,7 +104,8 @@ def _initial_scan(
     """Scan the queue directory for already-pending matching escalations.
 
     Returns the OLDEST by timestamp, or None if no match found.
-    Malformed / unreadable JSON files are skipped (never silently dropped).
+    Malformed / unreadable files are skipped with a log line from
+    ``read_escalation_for_scan`` (WARNING; DEBUG for a record archived mid-scan).
     Mirrors the get_pending + find_pending_l2_by_root_cause idiom in queue.py.
     """
     best: Escalation | None = None
@@ -86,9 +115,10 @@ def _initial_scan(
         if path.stem in exclude_ids:
             continue
 
-        try:
-            esc = Escalation.from_json(path.read_text())
-        except (json.JSONDecodeError, KeyError, OSError, TypeError):
+        esc, _reason = read_escalation_for_scan(
+            path, context='watcher._initial_scan', parse_errors=_WATCHER_PARSE_ERRORS,
+        )
+        if esc is None:
             continue
 
         if not _matches(esc, task_id, level, exclude_ids):
@@ -174,16 +204,29 @@ def _send_ntfy(url: str, escalation: Escalation) -> None:
 
 
 def _emit(esc: Escalation, ntfy_url: str | None) -> None:
-    """Print escalation JSON to stdout and optionally send an ntfy push notification."""
+    """Print escalation JSON to stdout and optionally send an ntfy push notification.
+
+    The push is best-effort: a failure is reported (invariant (c)) and then
+    dropped, so it never costs the operator the queue item nor changes the
+    exit code.
+    """
     print(json.dumps(esc.to_dict(), indent=2))
     if ntfy_url:
         try:
             _send_ntfy(ntfy_url, esc)
         except Exception as e:
-            print(f'ntfy send failed: {e}', file=sys.stderr)
+            logger.error('WATCHER_NTFY_OUTCOME: FAILED esc=%s url=%s: %s', esc.id, ntfy_url, e)
 
 
 def main() -> None:
+    # Invariant (c)'s marker is an operator-facing STDERR line, so this process
+    # has to own a handler: without one it reaches stderr only by grace of
+    # `logging.lastResort`, which anything configuring a root handler in-process
+    # silently takes away — and which emits the bare message with no level.
+    # basicConfig defaults to stderr, so stdout stays pure escalation JSON, and
+    # it is a no-op when a caller has already configured logging — the same call
+    # every sibling CLI here makes (submit, sweep, archive).
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
     parser = argparse.ArgumentParser(description='Watch for escalation events')
@@ -277,9 +320,10 @@ def main() -> None:
                 continue
 
             path = queue_dir / name
-            try:
-                esc = Escalation.from_json(path.read_text())
-            except (json.JSONDecodeError, KeyError, OSError, TypeError):
+            esc, _reason = read_escalation_for_scan(
+                path, context='watcher.main', parse_errors=_WATCHER_PARSE_ERRORS,
+            )
+            if esc is None:
                 continue
 
             if not _matches(esc, args.task_id, args.level, excludes):

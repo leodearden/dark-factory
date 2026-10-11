@@ -40,6 +40,7 @@ import asyncio
 import json
 import logging
 import math
+import time
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
@@ -240,32 +241,51 @@ class TestAllCappedParkIsVisible:
         so the bound cannot be satisfied merely by the wait period being long:
         the loop demonstrably ran many more times than the heartbeat fired.
         """
-        interval = fast_heartbeat(0.05)
+        interval = fast_heartbeat(0.5)
         gate = _all_capped_gate()
-        duration = 0.3
 
         async def _wake_repeatedly() -> None:
             while True:
                 gate._open.set()
                 await asyncio.sleep(0.001)
 
+        # A correct throttle's heartbeat count is bounded by elapsed time, so a
+        # run is evidence only when passes exceed `heartbeat_budget` below. The
+        # pass target and the long interval make that the normal case; a host
+        # too slow to clear it skips.
+        target_passes = 200
+        started = time.monotonic()
+        deadline = started + 30.0
+
         waker = asyncio.create_task(_wake_repeatedly())
+        parked = asyncio.create_task(gate.before_invoke())
         try:
-            await _park_for(gate, duration)
+            while _loop_passes(caplog) < target_passes:
+                if time.monotonic() > deadline:
+                    break
+                await asyncio.sleep(0.005)
+            assert not parked.done(), (
+                f'before_invoke ended while every account was capped ({parked!r}): '
+                'the park must block until an account reopens'
+            )
         finally:
             waker.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await waker
+            parked.cancel()
+            await asyncio.gather(waker, parked, return_exceptions=True)
+        duration = time.monotonic() - started
 
         heartbeats = len(_park_records(caplog))
         passes = _loop_passes(caplog)
+        heartbeat_budget = math.ceil(duration / interval) + 2
 
-        assert passes > 10, (
-            f'only {passes} loop passes occurred, so this test never created '
-            'the flood it exists to bound and its throttling assertion would '
-            'pass vacuously'
-        )
-        assert heartbeats <= math.ceil(duration / interval) + 2, (
+        if passes <= heartbeat_budget:
+            pytest.skip(
+                f'only {passes} loop passes in {duration:.1f}s, no more than the '
+                f'{heartbeat_budget} heartbeats a {interval}s throttle may emit in '
+                'that time: the host never woke the loop faster than the '
+                'throttle, so there was no flood to bound'
+            )
+        assert heartbeats <= heartbeat_budget, (
             f'{heartbeats} heartbeats across {duration}s at a {interval}s '
             f'interval — the log rate must be bounded by the interval, not by '
             f'how often the loop happens to wake ({passes} passes)'

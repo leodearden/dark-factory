@@ -57,7 +57,7 @@ async def test_fake_briefing_smoke() -> None:
 
     # build_implementer_prompt returns a fixed string ('Implement the plan')
     # without interpolating its arguments, so only a shape check applies here.
-    impl_prompt = await briefing.build_implementer_prompt({'title': 't'}, [])
+    impl_prompt = await briefing.build_implementer_prompt({'title': 't'})
     assert isinstance(impl_prompt, str) and impl_prompt, 'implementer prompt must be non-empty'
 
     arch_prompt = await briefing.build_architect_prompt({'title': 'my task'})
@@ -231,6 +231,124 @@ def test_e2e_factories_identity() -> None:
     assert e2e._build_workflow_with_escalation is _build_workflow_with_escalation
     assert e2e._init_repo is _init_repo
     assert e2e._derive_meta_root_like_production is _workflow_helpers._derive_meta_root_like_production
+
+
+# ---------------------------------------------------------------------------
+# Group E: transcript-archival harness (task 4384): ENC, _config,
+# _make_git_ops, _make_transcript_workflow, _config_dir, _write_transcript,
+# _archive_root, _archived —
+# promoted out of three divergent copies (test_transcript_archive_producer_hook.py,
+# test_transcript_archive_backstop.py, test_transcript_archival_boundary_gate.py).
+#
+# The anti-duplication identity guard that pairs with the smoke test below lives
+# in test_workflow_helpers_transcript_identity.py, NOT here: its reads of the
+# consumers' `_`-prefixed helper names are counted by the merge-lane ratchet,
+# which this file is enrolled in and that one deliberately is not. That module's
+# docstring carries the full reasoning.
+# ---------------------------------------------------------------------------
+
+
+def test_transcript_archival_factories_smoke(tmp_path) -> None:
+    """The transcript-archival factories build the paths and objects the suites assert on.
+
+    Only the cheap, pure-path contracts are exercised. `_make_transcript_workflow` is
+    deliberately NOT driven here: it needs a real git repo plus
+    `create_worktree`, and all three consumer suites already drive it
+    end-to-end, so duplicating that cost buys nothing.
+
+    Both path contracts are anchored to PRODUCTION, not to a re-spelling of
+    the helper bodies: the config dir against the real ``TaskConfigDir``
+    constructor, the archive root against ``TranscriptArchiveConfig().root``.
+    A literal-vs-literal assertion here would restate the one-line helpers and
+    could not detect the only drift that matters — the harness diverging from
+    the code it stands in for. ``ENC`` is deliberately NOT pinned: its value is
+    arbitrary (the archiver mirrors whatever ``projects/`` subdir name it
+    finds), so an equality check against its own literal would assert nothing.
+    """
+    from _workflow_helpers import (  # noqa: PLC0415
+        ENC,
+        _archive_root,
+        _archived,
+        _config,
+        _config_dir,
+        _make_git_ops,
+        _write_transcript,
+    )
+    from shared.config_dir import TaskConfigDir  # noqa: PLC0415
+
+    from orchestrator.config import TranscriptArchiveConfig  # noqa: PLC0415
+    from orchestrator.git_ops import GitOps  # noqa: PLC0415
+
+    repo = tmp_path / 'repo'
+    wt = tmp_path / 'wt'
+
+    # The per-task Claude config dir, cross-checked against the REAL
+    # constructor production uses (workflow.py builds exactly
+    # ``TaskConfigDir(task_id, base_dir=worktree / '.task')``). This is what
+    # goes red if the naming template behind CONFIG_DIR_PREFIX ever moves.
+    assert _config_dir(wt, '7') == TaskConfigDir('7', base_dir=wt / '.task').path
+
+    src = _write_transcript(wt, '7', 'sess-A', b'x')
+    assert src.exists()
+    assert src == _config_dir(wt, '7') / 'projects' / ENC / 'sess-A.jsonl'
+    assert src.read_bytes() == b'x'
+
+    # The archive root, composed from the config default production resolves
+    # against project_root (git_ops.py / harness.py both do
+    # ``project_root / transcript_archive.root``) rather than from hardcoded
+    # path segments.
+    assert _archive_root(repo) == repo / TranscriptArchiveConfig().root
+    # ...and _archived hangs off that root, so the two cannot drift apart.
+    assert _archived(repo, '7', 'sess-A') == (
+        _archive_root(repo) / '7' / ENC / 'sess-A.jsonl'
+    )
+
+    assert _config(repo).project_root == repo
+    assert _config(repo).transcript_archive.enabled is True
+    # Overrides reach OrchestratorConfig.
+    disabled = _config(repo, transcript_archive={'enabled': False})
+    assert disabled.transcript_archive.enabled is False
+
+    ops = _make_git_ops(repo)
+    assert isinstance(ops, GitOps)
+    assert ops.project_root == repo
+    # No transcript_archive => the teardown backstop is inert...
+    assert ops.transcript_archive is None
+    # ...and the passthrough kwarg reaches GitOps.__init__ and arms it.
+    armed = _make_git_ops(repo, transcript_archive=TranscriptArchiveConfig())
+    assert armed.transcript_archive is not None
+    assert armed.transcript_archive.enabled is True
+
+
+@pytest.mark.asyncio
+async def test_init_transcript_repo_smoke(tmp_path) -> None:
+    """_init_transcript_repo seeds a real, committed git repo with the trivial greet stub.
+
+    A THIRD seeder beside _init_git_repo (README.md) and _init_repo (lib.py +
+    test_lib.py with a working greet); see its docstring for why it is not a
+    merge of them. The seed contents are what the transcript suites' worktrees
+    are branched from, so they are pinned here.
+    """
+    from _workflow_helpers import _init_transcript_repo  # noqa: PLC0415
+
+    from orchestrator.git_ops import _run  # noqa: PLC0415
+
+    await _init_transcript_repo(tmp_path)
+
+    assert (tmp_path / '.git').is_dir()
+    assert (tmp_path / 'lib.py').exists()
+    assert (tmp_path / 'lib.py').read_text() == 'def greet(name): return name\n'
+
+    # A committed, non-empty repo on branch main carrying the single
+    # "Initial commit" — an EMPTY repo has no HEAD, so create_worktree
+    # (which every consumer suite calls) would fail against it.
+    rc, branch, _ = await _run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=tmp_path)
+    assert rc == 0
+    assert branch.strip() == 'main'
+
+    rc, log, _ = await _run(['git', 'log', '--format=%s'], cwd=tmp_path)
+    assert rc == 0
+    assert log.split() == ['Initial', 'commit']
 
 
 # ---------------------------------------------------------------------------

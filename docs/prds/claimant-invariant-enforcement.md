@@ -53,13 +53,20 @@ several exits **never go through release**, so the clearing half of C4 is unenfo
 |---|---|---|
 | `_run_slot` finally (`harness.py:8873`, `finally:` at `:8804`) | yes | — |
 | blocked→pending sweep `_phase_redispatch_stranded_blocked` (`scheduler.py:6430-6431`) | yes (explicit pre-clear) | — |
-| `consume_redispatch_requests.py::_apply_repend` (`:604-620`) | yes (pre-clear, ABORTs on rejection) | — |
+| `consume_redispatch_requests.py::_apply_repend` (`:604-620`) — **RETIRED** (task 5247) | yes (pre-clear, ABORTs on rejection) | — |
 | `Harness._revert_in_progress_if_no_live_claimant` (`harness.py:6174`) | **no** | 75 `pending` |
 | `Scheduler.mark_done` / `_finalise_recovery_done` (`scheduler.py:2898` / `workflow.py:13421`) | **no** | 28 `done` |
-| `scripts/consume_redispatch_requests.py::_apply_close` (`:599`) | **no** | 1 `cancelled` |
+| `scripts/consume_redispatch_requests.py::_apply_close` (`:599`) — **RETIRED** (task 5247) | **no** | 1 `cancelled` |
 | `sqlite_task_backend.py:705` raw-SQL `status='cancelled'` self-heal | **no** — bypasses the choke point entirely | unmeasured |
 
 **Three of six compliant, plus a seventh writer that never reaches the choke point at all.**
+
+*Dated note (2026-09-13), separate from the measurement above:* task 5247 retired both
+`consume_redispatch_requests` rows along with the whole nightly reify closure-staleness sweep. The
+tally and the per-row counts above are the ORIGINAL finding and are deliberately left as measured —
+they are what the survey found when it ran, and re-scoring them now would falsify it. Read the two
+annotated rows as history: four of the surveyed paths remain live, and the seventh writer
+(`sqlite_task_backend.py:705`) is untouched by the retirement.
 
 Two corrections to the earlier reading of this inventory, both established first-hand and both worth
 recording because the mistakes were instructive:
@@ -302,8 +309,9 @@ step would have no such affordance.
 
 The script writes via `set_task_claimant`, **never raw SQL** — the backend's claimant writer
 (`sqlite_task_backend.py:2265-2268`) deliberately does not bump `updated_at`, and a hand-rolled UPDATE
-would reset `updatedAt`-keyed staleness detectors (including
-`consume_redispatch_requests.py:465`) for no benefit. It is `--dry-run` by default and gated on staleness **as well as** status. Four hardening
+would reset `updatedAt`-keyed staleness detectors (the example this PRD cited,
+`consume_redispatch_requests.py:465`, was retired by task 5247; the argument stands on the ones that
+remain) for no benefit. It is `--dry-run` by default and gated on staleness **as well as** status. Four hardening
 requirements, each from a first-hand finding:
 
 1. **Per-row corroboration, not just aggregate.** The batch-level "affected rows ∩ current
@@ -719,6 +727,14 @@ could not see. Resolutions actually adopted:
   convention-propagated-by-imitation is this defect's root cause; a waiver here would be
   self-refuting.
   > `G7 waiver: no-lockstep-duplication — the third clear-then-flip site, scripts/consume_redispatch_requests.py::_apply_repend, is an out-of-process consumer reaching fused-memory through an MCP client with a different call signature (client.set_task_claimant(task_id, project_root, ...)), so it cannot call the in-process Scheduler helper this batch extracts. Its ordering is additionally strictly stronger (a rejected clear ABORTs rather than proceeding best-effort), so rendering it from the shared site would be a behaviour regression. Mitigation: the extracted helper's docstring becomes the single normative statement of the ordering rule, and _apply_repend's docstring is repointed at it by symbol name rather than line anchor — its current citation (scheduler.py:5726-5736) has already rotted, which is the failure this waiver bounds rather than denies.`
+
+  **Waiver DISCHARGED (task 5247, 2026-09-13).** Its subject —
+  `scripts/consume_redispatch_requests.py::_apply_repend`, the out-of-process third
+  clear-then-flip site — was deleted with the rest of the nightly reify closure-staleness sweep
+  wiring, so the duplication the waiver bounded no longer exists and the waiver is moot rather
+  than outstanding. The quoted text above is kept verbatim, not deleted: it records why the
+  exemption was granted, and a discharged waiver whose reasoning has been erased cannot be
+  audited. Nothing in the mitigation it promised is owed any more.
 - **`structured-facts-at-failure`** — ζ emits `--json` per the house pattern
   (`scripts/repair_wiped_metadata_files.py:1120`, `scripts/audit_combine_gate_marker_loss.py:1162`),
   so "zero" is machine-readable rather than recovered by parsing prose.

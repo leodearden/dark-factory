@@ -215,7 +215,7 @@ UV_PATH="$(command -v uv)"
 # directives and is structurally incapable of seeing this variable's value.
 #
 # THE RENDERER OWNS THE DESTINATION rather than being redirected into it.
-# `python3 render_dashboard_unit.py ... > "$UNIT_DIR/<unit>"` would be the same
+# `python3 render_systemd_unit.py ... > "$UNIT_DIR/<unit>"` would be the same
 # defect one level up: bash truncates the destination before python ever opens
 # it, so the installed value would be gone before it could be read and the tool
 # would preserve nothing while reporting success. --output is read FIRST as the
@@ -240,7 +240,7 @@ UV_PATH="$(command -v uv)"
 # belongs in BOTH sites. The one INTENTIONAL divergence is documented at the
 # `restart` gate below — section 8 has no equivalent because the dashboard is
 # started by hand and never restarted by this script.
-_fm_render_script="$REPO_ROOT/scripts/render_dashboard_unit.py"
+_fm_render_script="$REPO_ROOT/scripts/render_systemd_unit.py"
 
 # Set to 1 only by the branch that actually rendered. `fail` here is a printf,
 # not an exit, so without this flag every degraded path still reached the
@@ -277,6 +277,11 @@ else
   fail "  run. Re-run this script once the cause is fixed."
 fi
 
+# The socket unit holds port 8002 across service restarts. It carries no
+# host-local values, so it is copied rather than rendered (see the template's
+# header for why its committed name ends in .template).
+install -m 0644 "$REPO_ROOT/scripts/fused-memory.socket.template" "$UNIT_DIR/fused-memory.socket"
+
 # UNCONDITIONAL, exactly as before this task and exactly as in section 8. It is
 # a no-op when nothing changed, and skipping it on a degraded path would leave
 # systemd reading a stale generation of whatever unit IS on disk.
@@ -297,6 +302,7 @@ systemctl --user daemon-reload
 # is what makes that promise true rather than true-only-when-a-unit-was-there.
 if [ -f "$UNIT_DIR/fused-memory.service" ]; then
   systemctl --user enable fused-memory
+  systemctl --user enable fused-memory.socket
 else
   fail "fused-memory NOT enabled: no unit file in $UNIT_DIR."
   fail "  The render above did not happen and this host had no previous copy,"
@@ -315,7 +321,10 @@ fi
 if [ "$_fm_rendered" = "1" ]; then
   # Only start if .env exists (needs secrets)
   if [ -f "$REPO_ROOT/fused-memory/.env" ]; then
-    systemctl --user restart fused-memory
+    # Stop before starting the socket: on the first install the running
+    # process still binds 8002 itself. On later runs this is a plain restart.
+    systemctl --user stop fused-memory
+    systemctl --user start fused-memory.socket fused-memory
     ok "fused-memory unit installed and started (host-local Environment= values preserved — see the [fused_memory_unit_render] lines above)"
   else
     warn "fused-memory unit installed but NOT started (fused-memory/.env missing)"
@@ -327,7 +336,7 @@ fi
 # ---------------------------------------------------------------------------
 # The install is gated PER UNIT (task 4198). Each unit is judged on its own
 # parity verdict, so a finding on one no longer declines the install of all
-# nine. The POLICY is unchanged and still ratified — a unit that did not clear
+# sixteen. The POLICY is unchanged and still ratified — a unit that did not clear
 # is never overwritten without DF_INSTALL_ORCH_UNITS=1, because a difference
 # does not tell you which side is stale — only the blast radius shrinks.
 #
@@ -353,6 +362,18 @@ fi
 #     reinstall or re-enable the supervision safety net. On 2026-08-10 that
 #     left the fleet 31.8h stale. It now blocks reify alone, and a plain
 #     `bash scripts/setup-host.sh` is the natural repair path for the pair.
+#   - orchestrator-<project>.socket, one per project above (holds that
+#     project's escalation MCP port across a restart — Claude Code's HTTP MCP
+#     client gives up for good after ~15s of refused connections, and an
+#     orchestrator restart takes up to ~97s). Committed as
+#     scripts/orchestrator-<project>.socket.template ONLY because `.socket` is
+#     not in the shared lock-charter extension allowlist — there are no
+#     placeholders, and `_orch_unit_source` below is the one place that maps
+#     the installed name back to that template. This section never starts,
+#     stops or restarts anything: a later `systemctl restart` of the service
+#     migrates it onto its socket, because the service carries
+#     `Wants=`/`After=` on the socket and systemd orders the service's stop
+#     before the socket's start.
 #
 # Drift direction (task 3641): know-live and pump-web-ui were transcribed from
 # the running host into the repo, i.e. committed-follows-installed. BOTH have
@@ -372,12 +393,32 @@ fi
 # NOT to reconcile RestartSteps=4 back out, since a rebuilt host or a stale
 # re-install would reopen exactly the gap it warns about.
 #
-# The orchestrator units run `uv run --frozen ...`, so process start never
-# implicitly re-syncs the shared dark-factory/.venv. After any dependency change
-# (or a fresh checkout) run scripts/sync-orchestrator-env.sh once to materialize
-# the runtime venv on the .python-version pin — the watchdog only port-probes and
-# will NOT repair a missing/stale venv (a frozen-start failure that exhausts
-# StartLimitBurst is left stopped for operator attention).
+# The orchestrator units run `uv run --no-sync ...`, so process start never
+# installs into the shared dark-factory/.venv. CORRECTION (task 5553): this note
+# said `--frozen` and said it was what stopped the re-sync. It is not — `--frozen`
+# is a LOCKFILE option and a start synced anyway; `--no-sync` is the flag that
+# actually stops it. The measurement behind that is in
+# scripts/orchestrator-autopilot-video.service, above its ExecStart.
+#
+# PROPAGATING THAT FLAG CHANGE TO THIS HOST IS A DELIBERATE, ONE-TIME STEP.
+# check_orchestrator_unit_parity.py below compares parsed directives for FULL
+# symmetric equality, so every unit installed before task 5553 differs from its
+# committed copy on ExecStart, reports verdict `drift`, and is SKIPPED by the
+# per-unit install decision. Until an operator runs
+#   DF_INSTALL_ORCH_UNITS=1 bash scripts/setup-host.sh
+#   systemctl --user daemon-reload && scripts/sync-orchestrator-env.sh
+# the running units keep `--frozen` and keep syncing into the shared venv, and
+# every setup-host run keeps reporting drift on all seven. The dashboard and
+# fused-memory units have their own gates and need the same treatment.
+#
+# After any dependency change (or a fresh checkout) run
+# scripts/sync-orchestrator-env.sh once to materialize the runtime venv on the
+# .python-version pin — it now runs `uv sync --all-packages`, the only form that
+# repairs the whole workspace without pruning siblings. A start against a
+# missing/stale venv now fails with ModuleNotFoundError rather than bootstrapping
+# one (uv still creates an empty .venv first). The watchdog only port-probes and
+# will NOT repair a missing/stale venv, so such a start failure, once it exhausts
+# StartLimitBurst, is left stopped for operator attention.
 #
 # The unit files reference /home/leo/bin/wait-for-port.py from ExecStartPre,
 # so the helper lives under ~/bin (stable absolute path across repo moves).
@@ -396,9 +437,10 @@ install -m 0755 "$REPO_ROOT/scripts/wait-for-port.py" "$HOME/bin/wait-for-port.p
 # a second run would only restate what the copy just did.)
 #
 # NON-FATAL, but not merely advisory: a finding never aborts this script (the
-# sections below still run, and five of the seven registered units are KNOWN
-# RED on this host until the follow-up task lands) — it makes the install of
-# THAT UNIT opt-in instead. A bare warning would not be an intervention point
+# sections below still run, and two of the sixteen registered units carry a
+# standing, deliberate finding on this host — re-measured 2026-09-05, see the
+# checker's KNOWN RED section) — it makes the install of THAT UNIT opt-in
+# instead. A bare warning would not be an intervention point
 # in a non-interactive `set -e` script: it scrolls past and the next line
 # overwrites the units anyway, so the operator is told to check the direction
 # at the one moment they can no longer act on it.
@@ -407,12 +449,18 @@ install -m 0755 "$REPO_ROOT/scripts/wait-for-port.py" "$HOME/bin/wait-for-port.p
 # per-unit install decision is taken from those verdicts further down. See the
 # section header for the policy that shape implements.
 #
-# NOTE the report does not mean "the installed copy is stale". Measured
-# 2026-08-02, the direction varies per unit: the repo copy is correct for
-# RestartSteps=4, but the INSTALLED copy is correct for the ExecStart --config
-# path (two committed units name config files that do not exist). That is why
-# the skip is the default and DF_INSTALL_ORCH_UNITS=1 is the override, rather
-# than the reverse.
+# NOTE the report does not mean "the installed copy is stale". The direction
+# varies per unit, which is why the skip is the default and
+# DF_INSTALL_ORCH_UNITS=1 is the override, rather than the reverse.
+# The instance that established this, measured 2026-08-02: the repo copy was
+# correct for RestartSteps=4, but the INSTALLED copy was correct for the
+# ExecStart --config path (two committed units named config files that did not
+# exist). Resolved by commit 4fcd43eec0 (task 3512) — but the argument is not
+# historical, only that instance is. Re-measured 2026-09-05, the direction
+# still varies and now runs the other way: orchestrator-watchdog.service
+# carries an installed-only Environment=ORCH_RESTART_MIN_INTERVAL_SECS the
+# committed copy lacks (a deliberate, self-expiring deploy pause owned by task
+# 5020), so installing the committed copy would silently delete it.
 # The exit code alone is NOT trusted, because 2 is overloaded three ways:
 # the checker's "not installed on this host" (benign), `python3` refusing to
 # open a missing script file, and argparse rejecting an unknown flag. Renaming
@@ -469,7 +517,30 @@ _orch_units=(
   orchestrator-pump-web-ui.service               # joined 2026-07-17, escalation 8108; ran on the host with no committed template until task 3641 transcribed it
   orchestrator-watchdog.service                  # static (no [Install]) — pulled in by the .timer, so the enable loop below skips it
   orchestrator-watchdog.timer                    # 60s liveness probe + dead-enabled revival: the safety net that revives an orchestrator killed by e.g. a boot-race dependency cancel
+  orchestrator-dark-factory.socket               # holds escalation port 8102 across a restart (socket activation)
+  orchestrator-reify.socket                      # holds escalation port 8100 across a restart
+  orchestrator-autopilot-video.socket            # holds escalation port 8101 across a restart
+  orchestrator-my-solar-challenge.socket         # holds escalation port 8106 across a restart
+  orchestrator-solar-challenge-platform.socket   # holds escalation port 8107 across a restart
+  orchestrator-know-live.socket                  # holds escalation port 8105 across a restart
+  orchestrator-pump-web-ui.socket                # holds escalation port 8108 across a restart
 )
+
+# `.socket` is not in the shared lock-charter extension allowlist, so each
+# socket unit's committed source lives one basename over, as `<name>.template`
+# (scripts/orchestrator-dark-factory.socket.template, etc.) — the templates
+# carry no placeholders; the suffix is only what the charter forced. This is
+# the ONE place a unit name becomes a repo-relative path to read FROM, used by
+# the existence test, the `cp`, the `[Install]` grep and the failed-copy
+# warning below. It answers only "where do I read this unit's committed bytes
+# from" — the INSTALLED name is unaffected and always `$_unit` itself, so a
+# `.socket`'s installed copy is never named `.socket.template`.
+_orch_unit_source() {
+  case "$1" in
+  *.socket) printf 'scripts/%s.template' "$1" ;;
+  *)        printf 'scripts/%s' "$1" ;;
+  esac
+}
 
 # 1 => the run as a WHOLE reported something unverifiable. Still used for the
 # operator-facing summary below; the install decision itself is per-unit.
@@ -535,9 +606,14 @@ fi
 # A unit that did not clear is SKIPPED rather than warned about, because a
 # warning scrolling past in a non-interactive `set -e` script is not an
 # intervention point: the very next line would overwrite the installed unit.
-# A finding does not mean the installed copy is the stale one — measured
-# 2026-08-02, two COMMITTED units name --config paths that do not exist on this
-# host, so copying them would break those orchestrators on their next restart.
+# A finding does not mean the installed copy is the stale one. The instance
+# that established that, measured 2026-08-02: two COMMITTED units named
+# --config paths that did not exist on this host, so copying them would have
+# broken those orchestrators on their next restart (resolved by commit
+# 4fcd43eec0, task 3512). Re-measured 2026-09-05 the hazard is still live in a
+# different directive — the sole drift is an installed-only
+# Environment=ORCH_RESTART_MIN_INTERVAL_SECS on orchestrator-watchdog.service
+# that a copy would silently delete.
 # The gate stays non-fatal (it never aborts the run; sections below still
 # execute), it just declines to act on an unverified diff without being told.
 #
@@ -648,7 +724,7 @@ for _unit in "${_orch_units[@]}"; do
   # still be uncopyable (mode 000, or an installed copy this user cannot
   # overwrite). That half is caught by the install loop's own failure handling
   # below rather than by a pre-flight test, because only the copy itself knows.
-  if [ ! -f "$REPO_ROOT/scripts/$_unit" ]; then
+  if [ ! -f "$REPO_ROOT/$(_orch_unit_source "$_unit")" ]; then
     warn "SKIPPING $_unit — $(_orch_skip_reason vanished "$_unit"); its installed copy is UNCHANGED"
     continue
   fi
@@ -689,10 +765,10 @@ else
   # nor counted in the success line below.
   _orch_installed_units=()
   for _unit in "${_orch_install_units[@]}"; do
-    if cp "$REPO_ROOT/scripts/$_unit" "$UNIT_DIR/"; then
+    if cp "$REPO_ROOT/$(_orch_unit_source "$_unit")" "$UNIT_DIR/$_unit"; then
       _orch_installed_units+=("$_unit")
     else
-      warn "FAILED to install $_unit — its installed copy is UNCHANGED; check permissions on $REPO_ROOT/scripts/$_unit and $UNIT_DIR/$_unit"
+      warn "FAILED to install $_unit — its installed copy is UNCHANGED; check permissions on $REPO_ROOT/$(_orch_unit_source "$_unit") and $UNIT_DIR/$_unit"
     fi
   done
 
@@ -719,14 +795,14 @@ else
   # This is the same rule tests/scripts/test_orchestrator_service_files.py's
   # _unit_has_install_section predicate expresses in Python.
   for _unit in "${_orch_installed_units[@]}"; do
-    if grep -q '^\[Install\]' "$REPO_ROOT/scripts/$_unit"; then
+    if grep -q '^\[Install\]' "$REPO_ROOT/$(_orch_unit_source "$_unit")"; then
       systemctl --user enable "$_unit"
     fi
   done
 
   # Reports what was ACTUALLY done, not what was attempted: with a per-unit
   # gate a partial install is now a normal outcome, and an unqualified success
-  # line would read as "all nine" on a run that installed one. Counted from the
+  # line would read as "all sixteen" on a run that installed one. Counted from the
   # units that COPIED, so a failed `cp` is never reported as an install.
   if [ "${#_orch_installed_units[@]}" -eq 0 ]; then
     warn "NO orchestrator unit was installed — every copy that cleared the gate"
@@ -793,19 +869,39 @@ else
   ok "Project config already exists"
 fi
 
-# Add jcodemunch MCP to user-level Claude config (idempotent)
-if command -v claude &>/dev/null; then
-  # Matched in BASH, not through `| grep -q` — see falkordb_pings above for why
-  # that pipeline can report an installed server as absent.
-  # Here the cost is re-running `claude mcp add` on a server already registered.
-  # The capture stays INSIDE the `command -v claude` guard: hoisting it would
-  # run `claude mcp list` on hosts with no claude installed.
-  _jcodemunch_mcp_out="$(claude mcp list --scope user 2>/dev/null)" || true
-  if [[ "$_jcodemunch_mcp_out" == *jcodemunch* ]]; then
-    ok "jcodemunch MCP already in user config"
+# Install the prebuilt, version-pinned launcher the shared launch contract
+# (shared/src/shared/jcodemunch_launch.py) names, then register jcodemunch in
+# the user-level Claude config from that contract, replacing any existing entry
+# so every run converges on it: `claude mcp add-json` refuses a name that
+# already exists. `uv tool install` exits 0 even when its bin dir is not on
+# PATH, so registration is gated on the registered command resolving.
+if ! _jcodemunch_server_json="$(PYTHONPATH="$REPO_ROOT/shared/src" python3 -m shared.jcodemunch_launch)" \
+  || ! _jcodemunch_install_argv_lines="$(PYTHONPATH="$REPO_ROOT/shared/src" python3 -m shared.jcodemunch_launch install-argv)" \
+  || ! _jcodemunch_command="$(jq -r .command <<<"$_jcodemunch_server_json")"; then
+  fail "The jcodemunch launch contract did not render, so its launcher was not installed and jcodemunch was not registered in user config"
+  warn "  Fix: make 'PYTHONPATH=$REPO_ROOT/shared/src python3 -m shared.jcodemunch_launch [install-argv]' succeed, then re-run scripts/setup-host.sh"
+else
+  mapfile -t _jcodemunch_install_argv <<<"$_jcodemunch_install_argv_lines"
+  if "${_jcodemunch_install_argv[@]}"; then
+    ok "$_jcodemunch_command launcher installed at the contract's pin"
   else
-    claude mcp add --scope user jcodemunch -- uvx --python 3.12 jcodemunch-mcp
-    ok "jcodemunch MCP added to user config"
+    fail "$_jcodemunch_command launcher install failed"
+    warn "  Fix: ${_jcodemunch_install_argv[*]}"
+  fi
+  if ! command -v "$_jcodemunch_command" &>/dev/null; then
+    fail "$_jcodemunch_command is not on PATH, so jcodemunch was not registered in user config"
+    warn "  Fix: put \"\$(uv tool dir --bin)\" on PATH (uv tool update-shell), then re-run scripts/setup-host.sh"
+  elif command -v claude &>/dev/null; then
+    _jcodemunch_removed=""
+    if claude mcp remove --scope user jcodemunch >/dev/null 2>&1; then
+      _jcodemunch_removed=", and its previous registration there was removed"
+    fi
+    if claude mcp add-json --scope user jcodemunch "$_jcodemunch_server_json"; then
+      ok "jcodemunch MCP registered in user config"
+    else
+      fail "jcodemunch MCP not registered in user config$_jcodemunch_removed"
+      warn "  Fix: claude mcp add-json --scope user jcodemunch \"\$(PYTHONPATH=$REPO_ROOT/shared/src python3 -m shared.jcodemunch_launch)\""
+    fi
   fi
 fi
 
@@ -822,98 +918,7 @@ systemctl --user restart jcodemunch-watcher
 ok "jcodemunch-watcher unit installed and started"
 
 # ---------------------------------------------------------------------------
-# 7. Skim — context compression for coding agents
-# ---------------------------------------------------------------------------
-info "Installing skim (context compression)"
-
-if command -v skim &>/dev/null; then
-  ok "skim already installed ($(skim --version 2>/dev/null))"
-else
-  # Find cargo: may be on PATH, in ~/.cargo/bin, or only in a rustup toolchain
-  CARGO=""
-  if command -v cargo &>/dev/null; then
-    CARGO="cargo"
-  elif [ -x "$HOME/.cargo/bin/cargo" ]; then
-    CARGO="$HOME/.cargo/bin/cargo"
-  else
-    # Fall back to rustup stable toolchain
-    RUSTUP_CARGO="$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo"
-    [ -x "$RUSTUP_CARGO" ] && CARGO="$RUSTUP_CARGO"
-  fi
-
-  if [ -n "$CARGO" ]; then
-    $CARGO install rskim --quiet
-    ok "skim installed via cargo ($CARGO)"
-  else
-    warn "cargo not found — install Rust (rustup.rs) then: cargo install rskim"
-  fi
-fi
-
-# Install global Claude Code hook (idempotent — skim init checks existing state)
-if command -v skim &>/dev/null && command -v claude &>/dev/null; then
-  if [ -f "$HOME/.claude/hooks/skim-rewrite.sh" ]; then
-    ok "skim hook already installed"
-  else
-    skim init --yes
-    ok "skim hook installed for Claude Code"
-  fi
-
-  # The hook rewrites commands to bare `skim`, which must be on PATH for all
-  # shell types (login, interactive, non-interactive bash -c).  ~/.cargo/bin
-  # is only added by profile/bashrc sourcing — symlink into /usr/local/bin
-  # so it's on the base OS PATH unconditionally.
-  SKIM_BIN="$HOME/.cargo/bin/skim"
-  if [ ! -e /usr/local/bin/skim ]; then
-    if [ -x "$SKIM_BIN" ]; then
-      sudo ln -s "$SKIM_BIN" /usr/local/bin/skim
-      ok "symlinked skim → /usr/local/bin/skim"
-    fi
-  else
-    ok "skim already on system PATH (/usr/local/bin/skim)"
-  fi
-fi
-
-# Verify skim is on PATH for all shell types an agent session might use.
-# The hook rewrites commands to bare `skim`, so it must be findable without
-# inheriting a profile-enhanced PATH.  Non-login, non-interactive shells
-# (gnome-terminal -- bash -c '...', systemd ExecStart=, asyncio subprocesses)
-# only get the base OS PATH unless ~/.cargo/env is sourced outside an
-# interactivity guard.
-if command -v skim &>/dev/null; then
-  info "Checking skim PATH visibility across shell types"
-
-  BASE_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
-  # Login shell (sources ~/.profile → ~/.cargo/env)
-  if env -i HOME="$HOME" TERM="$TERM" bash --login -c 'command -v skim' &>/dev/null; then
-    ok "skim on PATH: login shell"
-  else
-    fail "skim NOT on PATH: login shell"
-  fi
-
-  # Interactive shell (sources ~/.bashrc — needs to pass interactivity guard)
-  # stderr suppressed: bash -ic warns about missing terminal/job-control
-  if env -i HOME="$HOME" TERM="$TERM" bash -ic 'command -v skim' >/dev/null 2>&1; then
-    ok "skim on PATH: interactive shell"
-  else
-    fail "skim NOT on PATH: interactive shell"
-  fi
-
-  # Non-interactive, non-login shell with base OS PATH only.
-  # This simulates: gnome-terminal -- bash -c '...' when the parent env
-  # was not profile-initialised, or asyncio.create_subprocess_exec with a
-  # stripped env, or a systemd unit without Environment=PATH additions.
-  if env -i HOME="$HOME" PATH="$BASE_PATH" bash -c 'command -v skim' &>/dev/null; then
-    ok "skim on PATH: non-login non-interactive shell (base PATH)"
-  else
-    fail "skim NOT on PATH: non-login non-interactive shell (base PATH)"
-    warn "  Agents spawned without profile init will fail on skim-rewritten commands"
-    warn "  Fix: sudo ln -s $HOME/.cargo/bin/skim /usr/local/bin/skim"
-  fi
-fi
-
-# ---------------------------------------------------------------------------
-# 8. Dashboard systemd units
+# 7. Dashboard systemd units
 # ---------------------------------------------------------------------------
 info "Installing dashboard systemd units"
 
@@ -933,8 +938,7 @@ info "Installing dashboard systemd units"
 # open since April".
 #
 # Deliberately no --fix in the checker (see its module docstring): re-running
-# this installer is the propagation path, and re-ARMING the watchdog timer
-# belongs to task 3289.
+# this installer is the propagation path.
 #
 # The gate distinguishes "ran and found drift" from "did not run at all", and
 # the install proceeds either way. Exit code alone is NOT trusted, because 2 is
@@ -1013,7 +1017,7 @@ fi
 # script, so following the advice was what caused the loss.
 #
 # THE RENDERER OWNS THE DESTINATION rather than being redirected into it.
-# `python3 render_dashboard_unit.py ... > "$UNIT_DIR/<unit>"` would be the same
+# `python3 render_systemd_unit.py ... > "$UNIT_DIR/<unit>"` would be the same
 # defect one level up: bash truncates the destination before python ever opens
 # it, so the installed value would be gone before it could be read and the tool
 # would preserve nothing while reporting success. --output is read FIRST as the
@@ -1034,7 +1038,7 @@ fi
 # control flow or the failure modes here belongs in BOTH sites. Section 4's
 # extra `restart` gate has no counterpart here on purpose: the dashboard is
 # started by hand, never restarted by this script.
-_dash_render_script="$REPO_ROOT/scripts/render_dashboard_unit.py"
+_dash_render_script="$REPO_ROOT/scripts/render_systemd_unit.py"
 
 # Set to 1 only by the branch that actually rendered. The section's closing line
 # and the enable below are worded off it rather than printed unconditionally:
@@ -1105,7 +1109,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 9. Claude Code skill symlinks
+# 8. Claude Code skill symlinks
 # ---------------------------------------------------------------------------
 info "Creating Claude Code skill symlinks"
 
@@ -1147,13 +1151,13 @@ for name in "${!SKILLS[@]}"; do
   fi
 done
 
-# Directory-form skills (the newer Claude Code Skill mechanism): these three
+# Directory-form skills (the newer Claude Code Skill mechanism): these four
 # are wired as whole-directory symlinks under ~/.claude/skills/<name> so their
 # references/ and scripts/ travel with them (convention documented in
 # skills/prd/references/project-overlay.md).
 SKILLS_DIR="$HOME/.claude/skills"
 mkdir -p "$SKILLS_DIR"
-for name in factory-init prd hotspot-survey; do
+for name in factory-init prd hotspot-survey review-all; do
   target="$REPO_ROOT/skills/$name"
   link="$SKILLS_DIR/$name"
   if [ -d "$target" ]; then
@@ -1165,7 +1169,7 @@ for name in factory-init prd hotspot-survey; do
 done
 
 # ---------------------------------------------------------------------------
-# 10. Git hooks
+# 9. Git hooks
 # ---------------------------------------------------------------------------
 info "Setting up git hooks"
 
@@ -1177,7 +1181,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 11. Manual steps reminder
+# 10. Manual steps reminder
 # ---------------------------------------------------------------------------
 info "Manual steps (if migrating from another host)"
 echo ""
@@ -1192,7 +1196,7 @@ echo "    bash $REPO_ROOT/scripts/import-data.sh ~/dark-factory-export"
 echo ""
 
 # ---------------------------------------------------------------------------
-# 12. Health checks
+# 11. Health checks
 # ---------------------------------------------------------------------------
 info "Health checks"
 
@@ -1279,7 +1283,36 @@ else
     ;;
   finding | *)
     # `*` folded in for the reason given at the orchestrator gate.
-    warn "Fused-memory unit: DRIFT detected — run: python3 $_fm_parity_script --fix"
+    #
+    # A finding is "drift OR unverifiable": it also covers a drop-in override,
+    # which the checker words apart so the operator is not sent hunting for a
+    # directive diff that does not exist. The two remedies differ, so naming
+    # only --fix here would collapse that distinction back and point at a
+    # command that CANNOT help — --fix appends to the unit FILE and can
+    # neither synthesize nor resolve an override living in a different one.
+    #
+    # The HEADLINE therefore has to be true for BOTH inputs, which is why the
+    # dashboard and orchestrator gates lead with "drift or unverifiable state"
+    # rather than with drift alone. This one follows them: leading with "DRIFT
+    # detected — run --fix" and only then conceding it might be an override
+    # states something false in the override case (every required directive
+    # matched; nothing drifted) and points first at the command that cannot
+    # help. A follow-up line cannot retract a headline the operator has
+    # already acted on. The remedies are each named UNDER their own condition
+    # instead.
+    #
+    # "DRIFT" stays capitalised where the siblings lowercase it: it is the
+    # checker's own report vocabulary, and two tests in
+    # tests/scripts/test_check_fused_memory_unit_parity.py pin the literal
+    # token (::test_gate_reports_drift_when_a_required_directive_is_missing
+    # and ::test_gate_still_names_fix_for_plain_directive_drift, whose
+    # docstring states the pin is a CONSTRAINT on exactly this rewording).
+    warn "Fused-memory unit: DRIFT detected or unverifiable state — see the"
+    warn "  [fused_memory_unit_parity] report above for which it was."
+    warn "  Missing directives: run python3 $_fm_parity_script --fix."
+    warn "  A drop-in override: --fix CANNOT resolve it — it appends to the"
+    warn "  unit FILE and the override lives in a different one, so it needs"
+    warn "  manual removal (or move the setting into the committed template)."
     ;;
   esac
 fi

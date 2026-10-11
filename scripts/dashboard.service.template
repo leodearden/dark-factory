@@ -31,7 +31,7 @@ WorkingDirectory=__REPO_ROOT__
 # test_keep_alive_timeout_is_pinned_above_poll_interval, which derives this floor from
 # every poller registered in CLIENT_POLLERS -- so adding a slower poller, or slowing an
 # existing one, requires raising this value in BOTH unit files.
-ExecStart=__UV_PATH__ run --project dashboard \
+ExecStart=__UV_PATH__ run --no-sync --project dashboard \
   python -m uvicorn dashboard.app:app \
   --host 127.0.0.1 --port 8080 \
   --timeout-graceful-shutdown 8 \
@@ -99,14 +99,13 @@ RestartMaxDelaySec=60
 # something is dark-factory-dashboard-watchdog.timer, which is slower by an
 # order of magnitude: it probes /api/health every 30s and requires FAIL_STREAK
 # (=3) CONSECUTIVE failures before it restarts anything, so detection is ~90s,
-# not 30s. And that coverage is CONTINGENT — the installed timer is not armed
-# yet (task 3289), so until 3289 lands an out-of-band SIGTERM leaves the
-# dashboard down with nothing watching it at all.
+# not 30s.
 #
 # Accepted deliberately: nothing in normal operation sends this unit an
 # out-of-band SIGTERM, whereas every routine restart was planting a false
-# failure. Trading a rare slow recovery for an everyday-correct failed state
-# is the right side of that bet, but it is a bet, and 3289 is what settles it.
+# failure. Trading a rare ~90s recovery for an everyday-correct failed state
+# is the right side of that bet. It holds only while that timer is armed —
+# without it the slow recovery becomes no recovery at all.
 SuccessExitStatus=143
 
 TimeoutStopSec=15

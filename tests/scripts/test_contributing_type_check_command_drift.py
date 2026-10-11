@@ -47,11 +47,11 @@ on merge verify would be vacuous the same way the drift it watches for is — th
 rationale ``test_contributing_lint_command_drift.py`` and
 ``test_pyright_version_pin.py`` both state.
 
-OUT OF SCOPE, and deliberately not pinned here. ``hooks/project-checks`` sets
-``PYRIGHT_PACKAGES=(fused-memory orchestrator dashboard)`` — really three — so
-CONTRIBUTING.md's §4 item 3 (``uv run pyright`` in each touched,
-pyright-configured package) and its pre-commit "pyright up to 3x" sentence are
-ACCURATE ABOUT THE HOOK and must stay that way. §4 item 3 is additionally the
+OUT OF SCOPE, and deliberately not pinned here. ``hooks/project-checks`` carries its own
+``PYRIGHT_PACKAGES`` list, pinned against the live chain by
+``test_hook_pyright_packages_drift.py`` (task 5338). CONTRIBUTING.md's §4
+item 3 (``uv run pyright`` in each touched, pyright-configured package) and its
+pre-commit pyright sentence are generic advice and must stay unpinned here. §4 item 3 is additionally the
 DECOY this module's extractor is explicitly tested against below: pinning that
 generic instruction to the live config would be wrong twice over — it would fail
 immediately, and "fixing" it would destroy correct, audience-appropriate advice.
@@ -319,10 +319,8 @@ def test_documented_type_check_command_is_immune_to_the_generic_pyright_decoy() 
 
     Pinning either to the live config would be wrong twice over: it would fail
     immediately, and "fixing" it would destroy correct, audience-appropriate
-    advice. Both really describe ``hooks/project-checks``'s
-    ``PYRIGHT_PACKAGES=(fused-memory orchestrator dashboard)``, which genuinely
-    is three packages — the hook is a different gate from the merge-verify chain
-    this guard mirrors, and this task deliberately leaves it alone.
+    advice. Both really describe ``hooks/project-checks``, a different gate from
+    the merge-verify chain this guard mirrors.
     """
     assert _documented_type_check_command(_DECOY_DOC) == _HAPPY_COMMAND
 

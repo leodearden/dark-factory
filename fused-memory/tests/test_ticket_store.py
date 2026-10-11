@@ -6,6 +6,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
+from _fm_helpers import seed_resolved_ticket
+from shared.async_sqlite_base import CheckpointResult
 from test_daemon_connect_consolidation import assert_connection_thread_is_daemon
 
 from fused_memory.middleware.ticket_store import TicketStore, _new_ticket_id
@@ -48,7 +50,7 @@ async def test_initialize_creates_schema_and_reinit_after_close_is_safe(tmp_path
     # initialize() unconditionally opens a new aiosqlite connection, orphaning
     # the previous one if not explicitly closed first.  The orphaned non-daemon
     # worker thread raises "Event loop is closed" on GC.
-    first_db = store._db
+    first_db = store._require_access().connection
     # Close the first connection before the idempotent re-init so it is not
     # orphaned (task 1560: its non-daemon worker would otherwise leak).
     await store.close()
@@ -56,7 +58,7 @@ async def test_initialize_creates_schema_and_reinit_after_close_is_safe(tmp_path
     await store.initialize()
     try:
         # Verify the table exists with the expected columns
-        db = store._db
+        db = store._require_access().connection
         assert db is not None
         cursor = await db.execute("PRAGMA table_info(tickets)")
         rows = await cursor.fetchall()
@@ -84,7 +86,7 @@ async def test_initialize_creates_schema_and_reinit_after_close_is_safe(tmp_path
     # task 1560: every connection this test opened must now be closed.
     assert first_db is not None, 'first_db should have been set after initialize()'
     _assert_connection_closed(first_db)
-    assert store._db is None, 'store._db must be None after close() (task 1560)'
+    assert await store.checkpoint() == CheckpointResult.unavailable(), 'the store must be closed after close() (task 1560)'
 
 
 @pytest.mark.asyncio
@@ -102,18 +104,18 @@ async def test_double_initialize_without_close_is_idempotent_and_no_leak(tmp_pat
     """
     store = TicketStore(tmp_path / 'tickets.db')
     await store.initialize()
-    first_db = store._db
+    first_db = store._require_access().connection
     assert first_db is not None
 
     # Second initialize() WITHOUT an intervening close() — the idempotency path.
     store_second_db = None
     try:
         await store.initialize()
-        store_second_db = store._db
+        store_second_db = store._require_access().connection
 
         # (a) A fresh connection was opened.
-        assert store._db is not None and store._db is not first_db, (
-            'store._db should be a new connection after the second initialize()'
+        assert store._require_access().connection is not first_db, (
+            'the second initialize() should open a new connection'
         )
 
         # (b) RED ASSERTION: the prior connection must be closed, not orphaned.
@@ -129,7 +131,7 @@ async def test_double_initialize_without_close_is_idempotent_and_no_leak(tmp_pat
         _assert_connection_closed(first_db)
 
         # (c) The NEW connection is a live daemon-backed worker.
-        assert_connection_thread_is_daemon(store._db, 'TicketStore re-init')
+        assert_connection_thread_is_daemon(store._require_access().connection, 'TicketStore re-init')
 
         # (d) Usability: submit + get through the new connection.
         tid = await store.submit(project_id='p', candidate_json='{}')
@@ -138,7 +140,7 @@ async def test_double_initialize_without_close_is_idempotent_and_no_leak(tmp_pat
 
     finally:
         await store.close()
-        assert store._db is None, 'store._db must be None after close()'
+        assert await store.checkpoint() == CheckpointResult.unavailable(), 'the store must be closed after close()'
         if store_second_db is not None:
             _assert_connection_closed(store_second_db)
 
@@ -156,20 +158,20 @@ async def test_reconnect_close_then_initialize_preserves_data_and_no_leak(tmp_pa
     store = TicketStore(tmp_path / 'tickets.db')
     await store.initialize()
     tid = await store.submit(project_id='p', candidate_json='{}')
-    first_db = store._db
+    first_db = store._require_access().connection
     assert first_db is not None
 
     # Explicit close — the canonical safe teardown path.
     await store.close()
-    assert store._db is None
+    assert await store.checkpoint() == CheckpointResult.unavailable()
 
     # Reconnect via initialize().
     try:
         await store.initialize()
 
         # New connection is a fresh daemon-backed worker, distinct from the prior one.
-        assert store._db is not None and store._db is not first_db
-        assert_connection_thread_is_daemon(store._db, 'TicketStore reconnect')
+        assert store._require_access().connection is not first_db
+        assert_connection_thread_is_daemon(store._require_access().connection, 'TicketStore reconnect')
 
         # Data survived the reconnect — net-new assertion over the schema-only test.
         row = await store.get(tid)
@@ -179,7 +181,7 @@ async def test_reconnect_close_then_initialize_preserves_data_and_no_leak(tmp_pa
 
     finally:
         await store.close()
-        assert store._db is None
+        assert await store.checkpoint() == CheckpointResult.unavailable()
 
 
 @pytest.mark.asyncio
@@ -337,7 +339,7 @@ async def test_flush_pending_on_startup_marks_all_pending_failed(store):
 
 async def _force_failed(store: TicketStore, ticket_id: str, *, reason: str) -> None:
     """Test helper: terminalise a ticket as failed with the given reason."""
-    db = store._db
+    db = store._require_access().connection
     assert db is not None
     now = datetime.now(UTC).isoformat()
     await db.execute(
@@ -433,7 +435,7 @@ async def test_fetch_unescalated_failures_orders_by_resolved_at(store):
     older = await store.submit(project_id='p', candidate_json='{}')
     newer = await store.submit(project_id='p', candidate_json='{}')
     # Force resolved_at directly so ordering is deterministic in CI.
-    db = store._db
+    db = store._require_access().connection
     await db.execute(
         "UPDATE tickets SET status='failed', reason='r', resolved_at=? WHERE ticket_id=?",
         ('2026-01-01T00:00:00+00:00', older),
@@ -507,10 +509,9 @@ async def test_migration_adds_escalated_at_to_legacy_db(tmp_path):
     # initialize() unconditionally opens a new aiosqlite connection, orphaning
     # the previous one if not explicitly closed first.  The orphaned non-daemon
     # worker thread raises "Event loop is closed" on GC.
-    first_db = store._db
+    first_db = store._require_access().connection
     try:
-        assert store._db is not None
-        cursor = await store._db.execute('PRAGMA table_info(tickets)')
+        cursor = await store._require_access().connection.execute('PRAGMA table_info(tickets)')
         cols = {r[1] for r in await cursor.fetchall()}
         assert 'escalated_at' in cols
         # Close the first connection before the idempotent re-init so it is not
@@ -523,7 +524,7 @@ async def test_migration_adds_escalated_at_to_legacy_db(tmp_path):
     # task 1560: every connection this test opened must now be closed.
     assert first_db is not None, 'first_db should have been set after initialize()'
     _assert_connection_closed(first_db)
-    assert store._db is None, 'store._db must be None after close() (task 1560)'
+    assert await store.checkpoint() == CheckpointResult.unavailable(), 'the store must be closed after close() (task 1560)'
 
 
 # ---------------------------------------------------------------------------
@@ -533,7 +534,7 @@ async def test_migration_adds_escalated_at_to_legacy_db(tmp_path):
 
 async def _force_created_at(store: TicketStore, ticket_id: str, when: datetime) -> None:
     """Test helper: rewrite a ticket's created_at so window filters can be exercised."""
-    db = store._db
+    db = store._require_access().connection
     assert db is not None
     await db.execute(
         'UPDATE tickets SET created_at = ? WHERE ticket_id = ?',
@@ -564,7 +565,7 @@ async def test_list_tickets_status_filter_excludes_other_states(store):
     failed = await store.submit(project_id='p', candidate_json='{}')
     combined = await store.submit(project_id='p', candidate_json='{}')
     await _force_failed(store, failed, reason='curator_failed')
-    db = store._db
+    db = store._require_access().connection
     await db.execute(
         "UPDATE tickets SET status='combined', resolved_at=? WHERE ticket_id=?",
         (datetime.now(UTC).isoformat(), combined),
@@ -657,3 +658,264 @@ async def test_mark_pending_failed_for_project_returns_reaped_ids(store):
     # Project B ticket stays pending.
     row_b = await store.get(b1)
     assert row_b['status'] == 'pending', f'B ticket was unexpectedly reaped: {row_b}'
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_write_does_not_discard_a_concurrent_submit(tmp_path):
+    """Cancelling one unit must not roll back another coroutine's in-flight submit.
+
+    Rollback is a property of the CONNECTION, and every coroutine shares the
+    store's one connection, so a cancelled unit that rolls back takes any other
+    coroutine's uncommitted INSERT with it — whose own commit then succeeds.
+    Measured before ``AtomicConnection``: the survivor ticket was LOST 3/3.
+    Same shape as
+    ``tests/test_recon_db_atomicity.py::test_a_cancelled_write_does_not_discard_a_concurrent_one``.
+    """
+    store = TicketStore(tmp_path / 'tickets.db')
+    await store.initialize()
+    try:
+        seed = await store.submit('p', '{}')
+        victim = asyncio.create_task(store.mark_pending_failed_for_project('p', reason='x'))
+        survivor = asyncio.create_task(store.submit('q', '{}'))
+        await asyncio.sleep(0)
+        victim.cancel()
+
+        _, tid = await asyncio.wait_for(
+            asyncio.gather(victim, survivor, return_exceptions=True), 10
+        )
+
+        assert isinstance(tid, str), tid
+        assert await store.get(tid) is not None, (
+            "the surviving submit is gone: the cancelled unit's connection-wide "
+            'rollback discarded it, and its own commit reported success'
+        )
+        seed_row = await store.get(seed)
+        assert seed_row is not None
+        assert seed_row['status'] == 'pending', (
+            'the cancelled reap left a partial write behind'
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_after_close_answers_unavailable(tmp_path):
+    """A checkpoint tick landing after ``close()`` answers the sentinel, never a raise.
+
+    ``server/main.py::_run_checkpoint_cycle`` runs on a timer against stores
+    whose shutdown it does not own, so this is an expected race.
+    """
+    store = TicketStore(tmp_path / 'tickets.db')
+    await store.initialize()
+    try:
+        await store.close()
+        assert await store.checkpoint() == CheckpointResult.unavailable()
+    finally:
+        await store.close()
+
+
+# ---------------------------------------------------------------------------
+# dedup_health — the rolling-window read behind the dedup-outage detector
+# ---------------------------------------------------------------------------
+
+
+class TestDedupHealthWindow:
+    """``TicketStore.dedup_health`` summarises one project's curator verdicts
+    over a window: resolved/combined counts, raw wall-clock median resolve
+    latency, and the most common create reasons as opaque strings.
+    """
+
+    _OUTAGE_REASON = 'create: llm-failed: FileNotFoundError: x'
+
+    @pytest.fixture
+    def db_path(self, tmp_path):
+        return tmp_path / 'tickets.db'
+
+    @pytest.fixture
+    def now(self):
+        return datetime.now(UTC)
+
+    @pytest.fixture
+    def since(self, now):
+        return now - timedelta(hours=6)
+
+    @pytest.mark.asyncio
+    async def test_outage_shape(self, store, db_path, now, since):
+        for i in range(20):
+            await seed_resolved_ticket(
+                store, db_path, 'proj', status='created',
+                latency_s=1.5 + i * (1.5 / 19), resolved_at=now - timedelta(minutes=i + 1),
+                reason=self._OUTAGE_REASON,
+            )
+
+        health = await store.dedup_health('proj', since=since)
+
+        assert health.resolved == 20
+        assert health.combined == 0
+        assert health.median_resolve_seconds == pytest.approx(2.25, abs=1e-3)
+        assert health.top_create_reasons == ((self._OUTAGE_REASON, 20),)
+
+    @pytest.mark.asyncio
+    async def test_healthy_shape(self, store, db_path, now, since):
+        for i in range(15):
+            await seed_resolved_ticket(
+                store, db_path, 'proj', status='created', latency_s=60 + i * 8,
+                resolved_at=now - timedelta(minutes=i + 1), reason='create: new work',
+            )
+        for i in range(5):
+            await seed_resolved_ticket(
+                store, db_path, 'proj', status='combined', latency_s=100 + i * 20,
+                resolved_at=now - timedelta(minutes=i + 1), reason='combine: same as 12',
+            )
+
+        health = await store.dedup_health('proj', since=since)
+
+        assert health.resolved == 20
+        assert health.combined == 5
+        assert health.median_resolve_seconds is not None
+        assert 60 <= health.median_resolve_seconds <= 180
+        assert health.top_create_reasons == (('create: new work', 15),)
+
+    @pytest.mark.asyncio
+    async def test_since_excludes_older_rows(self, store, db_path, now, since):
+        await seed_resolved_ticket(
+            store, db_path, 'proj', status='created', latency_s=2.0,
+            resolved_at=now - timedelta(days=7), reason=self._OUTAGE_REASON,
+        )
+        await seed_resolved_ticket(
+            store, db_path, 'proj', status='created', latency_s=90.0,
+            resolved_at=now - timedelta(minutes=5), reason='create: new work',
+        )
+
+        health = await store.dedup_health('proj', since=since)
+
+        assert health.resolved == 1
+        assert health.median_resolve_seconds == pytest.approx(90.0, abs=1e-3)
+        assert health.top_create_reasons == (('create: new work', 1),)
+
+    @pytest.mark.asyncio
+    async def test_only_the_named_project_is_counted(self, store, db_path, now, since):
+        await seed_resolved_ticket(
+            store, db_path, 'proj', status='created', latency_s=2.0,
+            resolved_at=now - timedelta(minutes=5), reason=self._OUTAGE_REASON,
+        )
+        for _ in range(3):
+            await seed_resolved_ticket(
+                store, db_path, 'other', status='combined', latency_s=120.0,
+                resolved_at=now - timedelta(minutes=5), reason='combine: x',
+            )
+
+        health = await store.dedup_health('proj', since=since)
+
+        assert health.resolved == 1
+        assert health.combined == 0
+
+    @pytest.mark.asyncio
+    async def test_pending_and_non_verdict_statuses_are_excluded(
+        self, store, db_path, now, since,
+    ):
+        for latency in (1.0, 2.0, 3.0):
+            await seed_resolved_ticket(
+                store, db_path, 'proj', status='created', latency_s=latency,
+                resolved_at=now - timedelta(minutes=5), reason=self._OUTAGE_REASON,
+            )
+        await store.submit('proj', '{}')
+        for status in ('failed', 'refused', 'cancelled'):
+            await seed_resolved_ticket(
+                store, db_path, 'proj', status=status, latency_s=500.0,
+                resolved_at=now - timedelta(minutes=5), reason=f'{status}: x',
+            )
+
+        health = await store.dedup_health('proj', since=since)
+
+        assert health.resolved == 3
+        assert health.combined == 0
+        assert health.median_resolve_seconds == pytest.approx(2.0, abs=1e-3)
+        assert health.top_create_reasons == ((self._OUTAGE_REASON, 3),)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('latencies', 'expected_median'),
+        [((1.0, 2.0, 10.0), 2.0), ((1.0, 2.0, 4.0, 10.0), 3.0)],
+        ids=['odd', 'even'],
+    )
+    async def test_median_for_odd_and_even_counts(
+        self, store, db_path, now, since, latencies, expected_median,
+    ):
+        for latency in latencies:
+            await seed_resolved_ticket(
+                store, db_path, 'proj', status='created', latency_s=latency,
+                resolved_at=now - timedelta(minutes=5), reason='create: x',
+            )
+
+        health = await store.dedup_health('proj', since=since)
+
+        assert health.median_resolve_seconds == pytest.approx(expected_median, abs=1e-3)
+
+    @pytest.mark.asyncio
+    async def test_empty_window(self, store, since):
+        health = await store.dedup_health('proj', since=since)
+
+        assert health.resolved == 0
+        assert health.combined == 0
+        assert health.median_resolve_seconds is None
+        assert health.top_create_reasons == ()
+
+    @pytest.mark.asyncio
+    async def test_null_reason_buckets_as_unrecorded(self, store, db_path, now, since):
+        await seed_resolved_ticket(
+            store, db_path, 'proj', status='created', latency_s=2.0,
+            resolved_at=now - timedelta(minutes=5), reason=None,
+        )
+
+        health = await store.dedup_health('proj', since=since)
+
+        assert health.top_create_reasons == (('(unrecorded)', 1),)
+
+    @pytest.mark.asyncio
+    async def test_top_create_reasons_keeps_the_five_most_frequent(
+        self, store, db_path, now, since,
+    ):
+        for count, reason in enumerate(('a', 'b', 'c', 'd', 'e', 'f', 'g'), start=1):
+            for _ in range(count):
+                await seed_resolved_ticket(
+                    store, db_path, 'proj', status='created', latency_s=2.0,
+                    resolved_at=now - timedelta(minutes=5), reason=f'create: {reason}',
+                )
+
+        health = await store.dedup_health('proj', since=since)
+
+        assert health.top_create_reasons == (
+            ('create: g', 7), ('create: f', 6), ('create: e', 5),
+            ('create: d', 4), ('create: c', 3),
+        )
+
+    @pytest.mark.asyncio
+    async def test_window_read_seeks_on_resolved_at(self, store, db_path, since):
+        """EXPLAIN QUERY PLAN, so the per-tick read is bounded by the window, not the table."""
+        import sqlite3
+
+        from fused_memory.middleware.ticket_store import DEDUP_HEALTH_SQL
+
+        with sqlite3.connect(db_path) as conn:
+            plan = ' '.join(
+                row[3] for row in conn.execute(
+                    f'EXPLAIN QUERY PLAN {DEDUP_HEALTH_SQL}', ('proj', since.isoformat()),
+                )
+            )
+
+        assert 'SEARCH' in plan, plan
+        assert 'resolved_at>?' in plan, plan
+        assert 'SCAN' not in plan, plan
+
+    @pytest.mark.asyncio
+    async def test_value_is_frozen(self, store, since):
+        import dataclasses
+
+        from fused_memory.middleware.ticket_store import DedupHealth
+
+        health = await store.dedup_health('proj', since=since)
+
+        assert isinstance(health, DedupHealth)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            health.resolved = 1  # type: ignore[misc]

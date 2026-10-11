@@ -27,7 +27,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import yaml
-from _workflow_helpers import FakeBriefing, FakeScheduler
+from _workflow_helpers import FakeBriefing, FakeScheduler, fixed_prompt
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import ARCHITECT, IMPLEMENTER
@@ -277,7 +277,7 @@ class TestS2AllowlistedNextSpawn:
         }
         assert harness.config.models.implementer == new_implementer
 
-        result = await workflow._invoke(IMPLEMENTER, 'do the task', tmp_path)
+        result = await workflow._invoke(IMPLEMENTER, fixed_prompt('do the task'), tmp_path)
 
         assert result.success is True
         assert stub.calls, 'Expected the stubbed invoke_agent to have been called'
@@ -498,7 +498,7 @@ class TestS8Straddle:
         workflow, stub = _make_reload_workflow(harness, tmp_path, monkeypatch)
 
         live_architect = harness.config.models.architect
-        architect_result = await workflow._invoke(ARCHITECT, 'plan it', tmp_path)
+        architect_result = await workflow._invoke(ARCHITECT, fixed_prompt('plan it'), tmp_path)
         assert architect_result.success is True
         assert stub.calls[-1]['model'] == live_architect, (
             'the architect stage must run under the pre-reload model'
@@ -510,7 +510,7 @@ class TestS8Straddle:
         report = await harness.reload_config()
         assert report['error'] is None
 
-        implementer_result = await workflow._invoke(IMPLEMENTER, 'implement it', tmp_path)
+        implementer_result = await workflow._invoke(IMPLEMENTER, fixed_prompt('implement it'), tmp_path)
         assert implementer_result.success is True
         assert stub.calls[-1]['model'] == new_implementer, (
             'the implementer stage spawned after the reload must use the NEW '

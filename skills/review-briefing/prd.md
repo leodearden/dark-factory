@@ -1,5 +1,7 @@
 # Review Briefing Generator Skill — PRD
 
+> Historical design record (2026-03). Live behaviour and the current schema are `SKILL.md` and `references/briefing-schema.md`; where this file disagrees with them, it is out of date.
+
 ## Overview
 
 The `/review-briefing` skill creates and maintains the **review briefing** — a versioned, project-specific configuration file that tells the `/review` skill how to evaluate a particular project. It uses an agent team to inspect the codebase, query project memory, and interview the user to produce a briefing covering smoke tests, critical execution paths, architectural invariants, and known gaps.
@@ -56,7 +58,7 @@ subprojects:
     # How to verify the subproject runs at all
     smoke_tests:
       - name: "Server starts"
-        command: "uv run --project fused-memory python -m fused_memory.server --help"
+        command: "uv run --directory fused-memory python -m fused_memory.server --help"
         expect: "exit 0"
         setup: null                    # Optional: commands to run first
         teardown: null                 # Optional: cleanup after
@@ -64,7 +66,7 @@ subprojects:
       - name: "Health endpoint responds"
         command: "curl -sf http://localhost:8002/health"
         expect: "json_field: status = ok"
-        setup: "uv run --project fused-memory python -m fused_memory.server &"
+        setup: "uv run --directory fused-memory python -m fused_memory.server &"
         teardown: "kill %1"
 
     # End-to-end execution paths that must be fully wired

@@ -14,13 +14,17 @@ all, which is precisely what makes these tests hermetic.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import logging
-import sys
-import types
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent
@@ -29,51 +33,17 @@ SCRIPT_PATH = (
 )
 
 
-def _load_module() -> types.ModuleType:
-    """Load invalidate_fabricated_shipping_edges.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    mod_name = 'invalidate_fabricated_shipping_edges'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+_mod = load_script_module(SCRIPT_PATH, mod_name='invalidate_fabricated_shipping_edges')
 
 
-_mod = _load_module()
-
-
-@pytest.fixture(autouse=True)
-def _neutralise_store_mutation_preflight(monkeypatch):
-    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
-
-    ``_run(...)`` with ``--apply`` runs a fail-closed capability preflight
-    before it builds a backend (task 4293). That probe touches the real
-    filesystem, so without this fixture every test here would pass or fail
-    according to whether the machine running pytest happens to be able to
-    write mem0's history directory -- and it genuinely cannot inside an agent
-    sandbox, which is the whole reason the guard exists. This suite is
-    deliberately MOCK-unit (no live store at all), so the environment must not
-    be an input to it.
-
-    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
-    to record, or to pass -- so the guard's own behaviour is still pinned
-    explicitly rather than assumed away.
-
-    Deliberately NOT ``raising=False``: if the guard is ever removed from the
-    script this fixture must break loudly rather than silently no-op.
-    """
-    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``_run(...)`` with ``--apply`` runs the preflight before it builds a
+    backend (task 4293). This suite is deliberately MOCK-unit (no live store at
+    all). ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to
+    refuse, to record, or to pass -- so the guard's own behaviour is still
+    pinned explicitly rather than assumed away.""",
+)
 
 
 class _BackendWasConstructed(RuntimeError):
@@ -128,44 +98,6 @@ class TestRunApplyStoreMutationPreflight:
             keep_unverified=keep_unverified,
         )
 
-    @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
-    @staticmethod
-    def _fail_closed_records(caplog) -> list:
-        """The guard site's OWN diagnosis.
-
-        ``main`` has no handler at all here -- it hands ``_run`` straight to
-        ``asyncio.run`` -- so the refusal exits as an uncaught traceback and
-        this ERROR record is the ONLY place the operator is told what was
-        refused and what to do instead. Pinned on the fail-closed marker and
-        the remedy noun ONLY, so every other word stays free to reword.
-
-        Asserting on message CONTENT is deliberate, and is the narrow exception
-        to the repo's don't-pin-guard-message-prose norm (task 3799): the record
-        this test is about is defined BY its content -- mere record-existence
-        would still pass if the whole diagnosis were replaced by "boom",
-        precisely the regression this exists to catch. Verified non-vacuous:
-        mutating the marker in the script turns this assertion red (task 4127
-        amendment).
-
-        NOTE the logger name is ``invalidate_shipping_edges``, which is NOT the
-        module name -- filtering on the module name would silently match
-        nothing and make every assertion below vacuous.
-        """
-        return [
-            rec for rec in caplog.records
-            if rec.name == 'invalidate_shipping_edges'
-            and rec.levelname == 'ERROR'
-            and 'NOT started (fail-closed)' in rec.getMessage()
-            and 'MCP server' in rec.getMessage()
-        ]
-
     @pytest.mark.asyncio
     async def test_apply_refuses_to_start_when_the_store_is_unwritable(
         self, monkeypatch
@@ -176,10 +108,10 @@ class TestRunApplyStoreMutationPreflight:
         would become N ``logger.error`` lines and a return of 0 -- an exit code
         an operator and any CI caller would read as a clean run.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod._run(self._args(apply=True))
 
@@ -194,7 +126,7 @@ class TestRunApplyStoreMutationPreflight:
         above the ``ro_query`` candidate scan and the ``update_edge`` calls
         that follow it.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _install_backend_sentinel(monkeypatch)
 
         with pytest.raises(_mod.StoreMutationUnavailable):
@@ -268,7 +200,7 @@ class TestRunApplyStoreMutationPreflight:
         so without this record the operator sees a bare traceback naming an
         exception class and no remedy.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
 
         with (
             caplog.at_level(logging.ERROR),
@@ -276,7 +208,9 @@ class TestRunApplyStoreMutationPreflight:
         ):
             await _mod._run(self._args(apply=True))
 
-        assert self._fail_closed_records(caplog), (
+        # The logger is ``invalidate_shipping_edges``, NOT the module name --
+        # filtering on the module name would match nothing and be vacuous.
+        assert fail_closed_records(caplog, 'invalidate_shipping_edges'), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'

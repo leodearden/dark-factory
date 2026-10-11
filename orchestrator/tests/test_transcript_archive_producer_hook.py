@@ -2,13 +2,17 @@
 (task 2742, plans/agent-transcript-archival-prd.md α).
 
 Reuses the _invoke-probe pattern (build TaskWorkflow + patch
-invoke_with_cap_retry) from test_invoke_role_config_resolution.py, with the
-git_repo/git_ops/task_assignment fixture trio duplicated module-local per the
-established convention. These probes drive _invoke directly (skipping run()'s
-setup), so workflow._config_dir is set MANUALLY.
+invoke_with_cap_retry) from test_invoke_role_config_resolution.py. These probes
+drive _invoke directly (skipping run()'s setup), so workflow._config_dir is set
+MANUALLY.
 
-Fixtures are kept module-local (no conftest.py) — see
-test_config_verify_admission_reload.py's rationale.
+The git_repo/git_ops/task_assignment fixtures are kept module-local (no
+conftest.py) — see test_config_verify_admission_reload.py's rationale — but
+their BODIES are no longer duplicated: the shared harness (``ENC``,
+``_config``, ``_make_git_ops``, ``_make_transcript_workflow``,
+``_archive_root``, ``_archived``,
+``_init_transcript_repo``) lives in ``_workflow_helpers.py``, promoted there
+from three divergent copies by task 4384.
 """
 
 from __future__ import annotations
@@ -16,52 +20,37 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
-from shared.config_dir import TaskConfigDir
+from _workflow_helpers import (
+    ENC,
+    _archive_root,
+    _archived,
+    _config,
+    _init_transcript_repo,
+    _make_git_ops,
+    _make_transcript_workflow,
+    fixed_prompt,
+)
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import SIMPLE_TASK
-from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import TaskAssignment
-from orchestrator.workflow import TaskWorkflow
-
-# The encoded-project dir the fake transcript is laid down under.
-ENC = '-home-leo-projX'
 
 
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    asyncio.run(_init_transcript_repo(repo))
     return repo
-
-
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'lib.py').write_text('def greet(name): return name\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
 
 
 @pytest.fixture
 def git_ops(git_repo: Path) -> GitOps:
-    return GitOps(
-        GitConfig(
-            main_branch='main',
-            branch_prefix='task/',
-            remote='origin',
-            worktree_dir='.worktrees',
-        ),
-        git_repo,
-    )
+    return _make_git_ops(git_repo)
 
 
 @pytest.fixture
@@ -80,39 +69,6 @@ def task_assignment() -> TaskAssignment:
     )
 
 
-def _config(git_repo: Path, **overrides) -> OrchestratorConfig:
-    kwargs: dict[str, Any] = dict(
-        project_root=git_repo,
-        max_concurrent_tasks=1,
-        git=GitConfig(
-            main_branch='main',
-            branch_prefix='task/',
-            remote='origin',
-            worktree_dir='.worktrees',
-        ),
-    )
-    kwargs.update(overrides)
-    return OrchestratorConfig(**kwargs)
-
-
-async def _make_workflow(config, git_ops, task_assignment):
-    """Build a probe TaskWorkflow with _config_dir set manually (run() skipped)."""
-    wt_info = await git_ops.create_worktree(task_assignment.task_id)
-    cwd = wt_info.path
-    workflow = TaskWorkflow(
-        assignment=task_assignment,
-        config=config,
-        git_ops=git_ops,
-        scheduler=FakeScheduler(),  # type: ignore[arg-type]
-        briefing=FakeBriefing(),  # type: ignore[arg-type]
-        mcp=FakeMcp(),  # type: ignore[arg-type]
-    )
-    workflow.artifacts = None
-    # Direct _invoke skips run() setup where _config_dir is created.
-    workflow._config_dir = TaskConfigDir(task_assignment.task_id, base_dir=cwd / '.task')
-    return workflow, cwd
-
-
 @pytest.mark.asyncio
 class TestProducerHook:
 
@@ -121,7 +77,7 @@ class TestProducerHook:
     ):
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)  # transcript_archive enabled by default
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         config_dir = workflow._config_dir
         fake_bytes = b'{"transcript":"hello"}\n'
 
@@ -139,13 +95,11 @@ class TestProducerHook:
             new_callable=AsyncMock,
             side_effect=_side_effect,
         ):
-            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
         sid = workflow._last_invoke_session_id
-        archived = (
-            git_repo / 'data' / 'orchestrator' / 'agent-transcripts'
-            / task_assignment.task_id / ENC / f'{sid}.jsonl'
-        )
+        assert sid is not None
+        archived = _archived(git_repo, task_assignment.task_id, sid)
         assert archived.exists()
         assert archived.read_bytes() == fake_bytes
 
@@ -154,14 +108,14 @@ class TestProducerHook:
     ):
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo, transcript_archive={'enabled': False})
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
 
         with patch('orchestrator.workflow.archive_task_transcripts') as mock_helper, patch(
             'orchestrator.workflow.invoke_with_cap_retry',
             new_callable=AsyncMock,
             return_value=AgentResult(success=True, output=''),
         ):
-            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
         mock_helper.assert_not_called()
 
@@ -170,14 +124,14 @@ class TestProducerHook:
     ):
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)  # enabled by default
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
 
         with patch('orchestrator.workflow.archive_task_transcripts') as mock_helper, patch(
             'orchestrator.workflow.invoke_with_cap_retry',
             new_callable=AsyncMock,
             return_value=AgentResult(success=True, output=''),
         ):
-            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
         assert workflow._config_dir is not None
         mock_helper.assert_called_once_with(
@@ -201,7 +155,7 @@ class TestProducerHook:
         """
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)  # enabled by default
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
 
         with patch(
             'orchestrator.workflow.archive_task_transcripts',
@@ -213,7 +167,7 @@ class TestProducerHook:
         ):
             # Must NOT raise RuntimeError out of the finally — _invoke returns
             # its result normally and the hook logs+swallows the archival error.
-            result = await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            result = await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
         assert result.success is True
         mock_helper.assert_called_once()
@@ -232,7 +186,7 @@ class TestProducerHook:
         """
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)  # enabled by default
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
 
         with patch(
             'orchestrator.workflow.archive_task_transcripts',
@@ -242,7 +196,7 @@ class TestProducerHook:
             new_callable=AsyncMock,
             return_value=AgentResult(success=True, output=''),
         ), pytest.raises(asyncio.CancelledError):
-            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
 
 @pytest.mark.asyncio
@@ -273,17 +227,14 @@ class TestCleanupConfigDirArchivesFirst:
         """(a) The measured bug, closed at its source."""
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
-        workflow, _cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, _cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         assert workflow._config_dir is not None
         config_dir_path = workflow._config_dir.path
         _src, payload = self._plant_transcript(workflow)
 
         workflow._cleanup_config_dir()
 
-        archived = (
-            git_repo / 'data' / 'orchestrator' / 'agent-transcripts'
-            / task_assignment.task_id / ENC / 'sess-teardown.jsonl'
-        )
+        archived = _archived(git_repo, task_assignment.task_id, 'sess-teardown')
         assert archived.read_bytes() == payload
         # ...and the dir is still torn down. Archival is a precondition of the
         # delete, not a replacement for it.
@@ -302,7 +253,7 @@ class TestCleanupConfigDirArchivesFirst:
         """
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
-        workflow, _cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, _cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         assert workflow._config_dir is not None
         config_dir_path = workflow._config_dir.path
 
@@ -327,7 +278,7 @@ class TestCleanupConfigDirArchivesFirst:
         """
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
-        workflow, _cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, _cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         assert workflow._config_dir is not None
         config_dir_path = workflow._config_dir.path
         src, payload = self._plant_transcript(workflow)
@@ -357,7 +308,7 @@ class TestCleanupConfigDirArchivesFirst:
         """
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo, transcript_archive={'enabled': False})
-        workflow, _cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, _cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         assert workflow._config_dir is not None
         config_dir_path = workflow._config_dir.path
         self._plant_transcript(workflow)
@@ -367,7 +318,7 @@ class TestCleanupConfigDirArchivesFirst:
 
         mock_helper.assert_not_called()
         assert not config_dir_path.exists()
-        assert not (git_repo / 'data' / 'orchestrator' / 'agent-transcripts').exists()
+        assert not _archive_root(git_repo).exists()
 
     async def test_recycle_also_archives_before_it_destroys(
         self, monkeypatch, git_repo, git_ops, task_assignment
@@ -381,17 +332,14 @@ class TestCleanupConfigDirArchivesFirst:
         """
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         workflow.worktree = cwd
         assert workflow._config_dir is not None
         src, payload = self._plant_transcript(workflow, sid='sess-wedged')
 
         workflow._recycle_config_dir()
 
-        archived = (
-            git_repo / 'data' / 'orchestrator' / 'agent-transcripts'
-            / task_assignment.task_id / ENC / 'sess-wedged.jsonl'
-        )
+        archived = _archived(git_repo, task_assignment.task_id, 'sess-wedged')
         assert archived.read_bytes() == payload
         # The recycle rebuilds at the SAME path (TaskConfigDir is named from
         # the task id), so "the dir is gone" is not the observable here — the
@@ -414,7 +362,7 @@ class TestCleanupConfigDirArchivesFirst:
         """
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
-        workflow, _cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, _cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         assert workflow._config_dir is not None
         config_dir_path = workflow._config_dir.path
         self._plant_transcript(workflow)
@@ -469,7 +417,7 @@ class TestProducerHookIsUncancellable:
         """
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         payload = b'{"transcript":"in flight at SIGTERM"}\n'
 
         def _boom():
@@ -480,13 +428,11 @@ class TestProducerHookIsUncancellable:
             new_callable=AsyncMock,
             side_effect=self._writes_then(workflow, payload, _boom),
         ), pytest.raises(asyncio.CancelledError):
-            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
         sid = workflow._last_invoke_session_id
-        archived = (
-            git_repo / 'data' / 'orchestrator' / 'agent-transcripts'
-            / task_assignment.task_id / ENC / f'{sid}.jsonl'
-        )
+        assert sid is not None
+        archived = _archived(git_repo, task_assignment.task_id, sid)
         # Cancellation still propagates — teardown is cooperative. What changed
         # is that it can no longer take the archival with it.
         assert archived.read_bytes() == payload
@@ -503,7 +449,7 @@ class TestProducerHookIsUncancellable:
         """
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         payload = b'{"transcript":"synchronous"}\n'
 
         async def _explode(*_a, **_kw):
@@ -515,13 +461,11 @@ class TestProducerHookIsUncancellable:
             side_effect=self._writes_then(workflow, payload, lambda: AgentResult(
                 success=True, output='')),
         ):
-            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
         sid = workflow._last_invoke_session_id
-        archived = (
-            git_repo / 'data' / 'orchestrator' / 'agent-transcripts'
-            / task_assignment.task_id / ENC / f'{sid}.jsonl'
-        )
+        assert sid is not None
+        archived = _archived(git_repo, task_assignment.task_id, sid)
         assert archived.read_bytes() == payload
 
     async def test_this_site_copies_so_a_resumed_session_keeps_reading(
@@ -536,7 +480,7 @@ class TestProducerHookIsUncancellable:
         """
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         payload = b'{"transcript":"still live"}\n'
 
         with patch(
@@ -545,7 +489,7 @@ class TestProducerHookIsUncancellable:
             side_effect=self._writes_then(workflow, payload, lambda: AgentResult(
                 success=True, output='')),
         ):
-            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
         assert workflow._config_dir is not None
         sid = workflow._last_invoke_session_id

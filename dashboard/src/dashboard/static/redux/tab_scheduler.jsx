@@ -133,6 +133,14 @@ function ActivePinsStrip({ pinQueue, rows, onReorder, onUnpin }) {
   );
 }
 
+// The priority a park-stack entry was installed at, as the orchestrator names
+// it. An orchestrator still running pre-6144 code names nothing, so its raw
+// rank is shown instead of an empty label.
+function parkEntryLabel(entry) {
+  if (entry.source === 'pin') return `pin #${entry.pin_order}`;
+  return entry.tier ?? `rank ${entry.rank}`;
+}
+
 // ── Park Stacks section ──
 // Rendered in the Modules sub-tab below ModulesView.
 // For each module with a non-empty park_stack, shows the full LIFO stack
@@ -195,7 +203,7 @@ function ParkStacksSection({ modules, rows, onEvict }) {
                       T-{entry.owner}
                     </span>
                     <span style={{ color: 'var(--fg-3)', fontSize: 10 }}>
-                      tier {entry.rank}
+                      {parkEntryLabel(entry)}
                     </span>
                     {ageStr && (
                       <span style={{ color: 'var(--fg-3)', fontSize: 10 }}>{ageStr}</span>
@@ -410,9 +418,19 @@ function SchedulerTab() {
   const effectiveSelected = chipSelected !== null ? chipSelected : chipOptions;
 
   // Filter rows by chip selection (explicit: row visible iff !r.project or selection includes r.project)
-  const visibleRows = effectiveSelected.length === chipOptions.length || chipOptions.length === 0
-    ? rows
-    : rows.filter(r => !r.project || effectiveSelected.includes(r.project));
+  //
+  // Memoised so the array IDENTITY is stable between renders that changed
+  // nothing relevant — SchedulerHeatmap is a React.memo component, and an
+  // inline .filter() would hand it a fresh array on every one of App's 1 Hz
+  // clock ticks, defeating the memo entirely.  `chipOptions` is itself
+  // memoised and `chipSelected` is state, so `effectiveSelected` is
+  // referentially stable between ticks and this memo holds.
+  const visibleRows = stUseMemo(
+    () => (effectiveSelected.length === chipOptions.length || chipOptions.length === 0
+      ? rows
+      : rows.filter(r => !r.project || effectiveSelected.includes(r.project))),
+    [rows, effectiveSelected, chipOptions]
+  );
 
   // Filter modules by chip selection — same strict per-project predicate as visibleRows.
   // A module is visible iff:
@@ -422,9 +440,14 @@ function SchedulerTab() {
   // holder_project == project whenever a holder exists, making it redundant.
   // cellStateFor already returns 'not-in-set' for cross-project cells, so no genuine
   // cross-project conflict is hidden by this strictness.
-  const visibleModules = effectiveSelected.length === chipOptions.length || chipOptions.length === 0
-    ? modules
-    : modules.filter(m => !m.project || effectiveSelected.includes(m.project));
+  // Memoised for the same reason as visibleRows above; the predicate moves
+  // inside the callback verbatim.
+  const visibleModules = stUseMemo(
+    () => (effectiveSelected.length === chipOptions.length || chipOptions.length === 0
+      ? modules
+      : modules.filter(m => !m.project || effectiveSelected.includes(m.project))),
+    [modules, effectiveSelected, chipOptions]
+  );
 
   // ── Override submit ──
   const handleSubmitOverride = stUseCallback(async (body) => {

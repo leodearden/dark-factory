@@ -1,0 +1,346 @@
+prd: plans/remote-task-leg-verify-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 6667
+  title: TaskVerifySpec + RemoteRunner._dispatch / run_task_verify transport (no-verdict
+    → RunnerUnavailable)
+  note: Absorbs task 6106's no-verdict classification item (6106 amended 2026-10-09
+    to the MemoryMax config field and drop-in retirement). Owns the single probe-pattern
+    constant for verify-(merge|task); β reuses it.
+  capabilities:
+  - name: task-verify-spec-type
+    binding: capability→producer — α creates orchestrator/src/orchestrator/task_verify_spec.py::TaskVerifySpec
+      (PRD §5.1). Absent on main f188b4b568; β and γ are downstream consumers.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class TaskVerifySpec[(:]
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: run-task-verify-transport
+    binding: capability→producer — α adds RemoteRunner.run_task_verify over a factored
+      RemoteRunner._dispatch in verify_runner.py (PRD §5.2). Substrate verified on
+      main — RemoteRunner.run_merge_verify (push → ssh → result_from_json → archive
+      → delete-ref, single _inflight_request_id).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def run_task_verify\(
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: public-no-verdict-predicate
+    binding: capability→producer — α adds verify.py::is_no_verdict_summary over the
+      existing private verify.py::_NO_VERDICT_SUMMARY_MARKERS (present on main), so
+      verify_runner.py reaches no private name.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def is_no_verdict_summary\(
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: no-verdict-raises-runner-unavailable-both-callers
+    binding: rejection-mechanism — built by α at RemoteRunner._dispatch; boundary
+      row 4 observes it fire for run_merge_verify AND run_task_verify on a 'killed
+      by signal 9' summary.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behaviour asserted by boundary row 4's executed fakes, not greppable
+  - name: wire-shape-and-exclusive-use-rejections
+    binding: rejection-mechanism — built by α; row 1 observes from_dict reject an
+      extra key (TypeError), row 19 observes a concurrent _dispatch raise before pushing.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: rejection quality is judged by boundary rows 1 and 19
+- label: β
+  task_id: 6668
+  title: orchestrator verify-task laptop subcommand + cancel-time worktree reap
+  note: Ratchet raise on git_ops.py (scripts/merge_lane_metrics.py::CLUSTER_PATHS,
+    line-frozen) authorised in the same commit. Row 3's CLI half (VerifyInfraError
+    → exit 1) lives here; its transport half is α's.
+  capabilities:
+  - name: verify-task-subcommand
+    binding: capability→producer — β adds the `verify-task` click command to cli.py
+      beside verify_merge (PRD §5.3). Absent on main (cli.py mentions neither verify_task
+      nor verify-task).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: (def verify_task\(|['"]verify-task['"])
+      paths:
+      - orchestrator/src/orchestrator/cli.py
+      expect: present
+  - name: ephemeral-verify-worktree-public
+    binding: capability→producer — β exposes GitOps.create_ephemeral_verify_worktree
+      (the ephemeral branch of the existing private git_ops.py::GitOps._create_merge_worktree,
+      present on main).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def create_ephemeral_verify_worktree\(
+      paths:
+      - orchestrator/src/orchestrator/git_ops.py
+      expect: present
+  - name: cancel-reaps-ephemeral-worktree
+    binding: capability→producer — β adds write_worktree_path beside the existing
+      verify_cancel.py::write_pgid_file and makes verify_cancel.py::cancel_request
+      reap the recorded worktree (both present on main).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def write_worktree_path\(
+      paths:
+      - orchestrator/src/orchestrator/verify_cancel.py
+      expect: present
+  - name: spec-codec-and-apply-from-alpha
+    binding: DAG-direction — apply_task_verify_spec and task_spec_from_json are produced
+      by α, upstream of β (edge β→α).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: dependency direction, asserted by the wired edge, not a grep
+  - name: fresh-worktree-reads-cold
+    binding: substrate — verify.py::_is_verify_cold keys on `.task/verify_warmed`
+      (present on main); β's prepare_task_verify_worktree creates `.task/` so preprovision
+      runs (row 2 observes the spec's vs the host's command).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: cold-path behaviour is asserted by boundary row 2 on a fixture repo
+- label: γ
+  task_id: 6669
+  title: HostPool + TaskVerifyDispatcher (static leg class, local fallback, dispatch
+    sidecar)
+  note: 'Decompose re-scope (G6 branch 3, producer-downstream): the verify_task_*
+    config keys land in δ2, after γ. γ therefore owns a frozen TaskVerifyPolicy value,
+    eligible() takes it, and the dispatcher reads it per call through an injected
+    policy_of(config) callable; δ2 adds the config keys and the real reader. Rows
+    9 and 12 assert only the on_unavailable hook call here (tracker half: δ1/ι); row
+    13 asserts the dispatcher-side cancel ordering (workflow SOFT_CANCELLED half:
+    ι).'
+  capabilities:
+  - name: host-pool
+    binding: capability→producer — γ creates orchestrator/src/orchestrator/verify_hosts.py::HostPool
+      over verify_runner.py::HostAllocator (acquire_remote, cancel_and_release, is_parked,
+      readmit all present on main).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class HostPool[(:]
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: task-verify-dispatcher
+    binding: capability→producer — γ creates orchestrator/src/orchestrator/task_verify_dispatch.py::TaskVerifyDispatcher;
+      consumers δ1 (pool hooks), δ2 (workflow port), ι.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class TaskVerifyDispatcher[(:]
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: build-remote-runners-public-home
+    binding: capability→producer — γ moves merge_lane/drift.py::_build_remote_runners
+      (present on main) to a public verify_hosts.py::build_remote_runners that the
+      workflow side may import without importing merge_lane.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def build_remote_runners\(
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: policy-without-config-keys
+    binding: DAG-direction — AS WRITTEN the dispatcher read config.verify_task_* keys
+      produced by δ2 (downstream) = producer-downstream FAIL; RESOLVED at decompose
+      by a γ-owned TaskVerifyPolicy value injected via policy_of(config), with δ2
+      supplying the config-backed reader.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a dependency-direction resolution, recorded here and in the PRD's decompose
+        record
+  - name: dispatcher-substrate
+    binding: substrate — verify_plan.py::derive_verify_plan, git_ops.py::GitOps.has_uncommitted_work,
+      verify_runner.py::RemoteRunner.sync_if_stale and verify_categories.py INFRA_TRANSIENT_CATEGORIES
+      all present on main.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing substrate; a present-check would be vacuous at authoring
+        time
+  - name: lease-released-on-every-exit
+    binding: rejection-mechanism — built by γ (one try/finally; cancel_and_release
+      under asyncio.shield when in flight); rows 13, 14 and 21 observe slot FREE /
+      PARKED and holders() empty.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: release discipline is asserted by executed boundary rows 13, 14 and
+        21
+- label: δ1
+  task_id: 6670
+  title: Harness-owned HostAllocator + HostPool, injected into the merge worker (HUB
+    carry, stage 1)
+  note: 'Decompose re-scope: δ1 builds the quarantine set, allocator and pool in Harness.__init__
+    and injects the allocator, quarantine set and held_by reader into the worker;
+    the TaskVerifyDispatcher and the build_workflow wiring move to δ2, because the
+    dispatcher needs the config-backed policy reader δ2 adds. Ratchet raise on merge_lane/worker.py
+    authorised in the same commit.'
+  capabilities:
+  - name: merge-lane-wants-host
+    binding: capability→producer — δ1 adds SpeculativeMergeWorker.merge_lane_wants_host
+      reading _redispatch, _verifier_queue, _pending_verifier_get and _merge_ahead_ledger.live
+      (all present on main in merge_lane/worker.py).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def merge_lane_wants_host\(
+      paths:
+      - orchestrator/src/orchestrator/merge_lane/
+      expect: present
+  - name: public-ru-tracker-entry
+    binding: capability→producer — δ1 adds note_runner_unavailable / note_runner_recovered
+      over the existing private _quarantine_unreachable_host, _record_runner_unavailable
+      and _record_runner_recovered (present on main), so task-path RU enters the reprobe
+      sweep (critic F1).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def note_runner_unavailable\(
+      paths:
+      - orchestrator/src/orchestrator/merge_lane/
+      expect: present
+  - name: harness-owns-pool
+    binding: capability→producer (wired) — δ1 constructs HostPool (γ, upstream) in
+      harness.py::Harness.__init__ and injects the allocator through harness.py::Harness._start_merge_worker
+      (present on main).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: HostPool\(
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+- label: δ2
+  task_id: 6671
+  title: Workflow consumer, config keys and harness dispatcher wiring (HUB carry,
+    stage 2)
+  note: 'Decompose re-scope: δ2 also owns the config-backed TaskVerifyPolicy reader
+    (task_verify_dispatch.py), constructs the dispatcher in harness.py and passes
+    task_verify= at the harness.py build_workflow call; defaults.yaml carries the
+    new keys. Depends on 6580 (one task-role verify site left).'
+  capabilities:
+  - name: task-verify-config-keys
+    binding: capability→producer — δ2 adds verify_task_host_policy, verify_task_remote_modules
+      (+ validator), verify_task_remote_cross_check_every_n, verify_task_remote_red_confirms_locally
+      to config.py (PRD §5.7). Absent on main.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: verify_task_host_policy
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: workflow-task-verify-port
+    binding: capability→producer — δ2 adds TaskWorkflow(..., task_verify=TaskVerifyPort
+      | None) forwarded by workflow.py::build_workflow; the call site workflow.py::TaskWorkflow._run_scoped_verification_with_infra_retry
+      is present on main.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: task_verify:[[:space:]]*['"]?TaskVerifyPort
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: present
+  - name: harness-passes-dispatcher
+    binding: capability→producer (wired) — δ2 passes task_verify=self._task_verify_dispatcher
+      at the harness.py build_workflow call (absent on main).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: task_verify=self\.
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+  - name: single-task-role-site
+    binding: DAG-direction — producer:task-6580 (removes the _run_merge_phase task-role
+      verify site) is upstream of δ2 (out-of-batch edge δ2→6580).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: out-of-batch dependency, asserted by the wired edge
+  - name: workflow-verify-carries-runner
+    binding: field-population — δ2 writes `runner` from the dispatcher's per-(task,
+      attempt) DispatchDecision (γ, upstream) onto the workflow_verify green; row
+      17 observes 'laptop' through a real TaskWorkflow.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: payload population is asserted by boundary row 17, not greppable
+- label: ι
+  task_id: 6672
+  title: Integration gate — all 25 boundary rows against the real Harness, worker,
+    workflow and verify-task CLI
+  capabilities:
+  - name: integration-module
+    binding: capability→producer — ι creates orchestrator/tests/test_task_verify_integration.py;
+      every leg it drives (α β γ δ1 δ2) is in its transitive dependency closure.
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - orchestrator/tests/test_task_verify_integration.py
+      expect: present
+  - name: boundary-sketch-green-e2e
+    binding: DAG-direction — all producers upstream (β, γ, δ2 direct; α, δ1 transitive).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the task IS the check suite; its signal is the 25 executed rows
+- label: ε
+  task_id: 6673
+  title: DF rollout, parity window and the post-6580 baseline (operator gate)
+  capabilities:
+  - name: preflight-dispatch-sidecar
+    binding: producer:γ (sidecar writer) and β (verify-task) upstream via ι; ε step
+      2 writes the first production row (INV-13).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: operator pre-flight on the laptop
+  - name: rollout-prerequisites
+    binding: DAG-direction — 6565, 6127, 3310, 6648, 6580 and ι are all upstream (out-of-batch
+      edges wired).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: dependency direction, asserted by the wired edges
+  - name: measurement-note-and-policy
+    binding: no numeric threshold asserted in advance (G6); the decision is Leo's
+      on the dated note under plans/merge-lane-throughput-prd.measurements/.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a human ruling on a measured report
+- label: η
+  task_id: 6674
+  title: Binary pressure hold for task legs (deferred; flipped only by ε step 6)
+  note: Filed deferred and left out of the pending flip; task_id hand-stamped because
+    commit_planning stamps only on a pending flip. Depends on ι so a premature flip
+    cannot dispatch it before the dispatcher exists.
+  capabilities:
+  - name: pressure-hold-refusal
+    binding: capability→producer — η adds verify_task_remote_pressure_hold (config.py)
+      and a PressureReading probe loop (verify_hosts.py); Refusal('pressure_hold')
+      is already in γ's vocabulary.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: η has no dependent, so a mechanical check would gate nothing

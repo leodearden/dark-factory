@@ -1,0 +1,101 @@
+{
+  "code_sha": "8bb8c8893b0f58957753954ab0338d47f4b609b9",
+  "control_arm_ids": [
+    "incumbent-embed-a",
+    "incumbent-embed-b"
+  ],
+  "corpus_sha": "1eb3ed883afb5396fcba47a240e41f4b501d5b678789c48541325eb7c811b287",
+  "incumbent_query_latency_p95_ms": 263.4535771794617,
+  "margins": [
+    {
+      "control_values": [
+        0.864321608040201,
+        0.864321608040201
+      ],
+      "direction": "lower_is_worse",
+      "floor": 0.005025125628140704,
+      "index_configuration": "embedding-only",
+      "margin": 0.005025125628140704,
+      "metric_id": "known-item-recall@10",
+      "reference_value": 0.864321608040201,
+      "sigma": 0.0,
+      "sigma_source": "run-pair"
+    },
+    {
+      "control_values": [
+        0.8793969849246231,
+        0.8793969849246231
+      ],
+      "direction": "lower_is_worse",
+      "floor": 0.005025125628140704,
+      "index_configuration": "with-indices",
+      "margin": 0.005025125628140704,
+      "metric_id": "known-item-recall@10",
+      "reference_value": 0.8793969849246231,
+      "sigma": 0.0,
+      "sigma_source": "run-pair"
+    },
+    {
+      "control_values": [
+        0.8291457286432161,
+        0.8291457286432161
+      ],
+      "direction": "lower_is_worse",
+      "floor": 0.005025125628140704,
+      "index_configuration": "embedding-only",
+      "margin": 0.005025125628140704,
+      "metric_id": "known-item-recall@5",
+      "reference_value": 0.8291457286432161,
+      "sigma": 0.0,
+      "sigma_source": "run-pair"
+    },
+    {
+      "control_values": [
+        0.8190954773869347,
+        0.8190954773869347
+      ],
+      "direction": "lower_is_worse",
+      "floor": 0.005025125628140704,
+      "index_configuration": "with-indices",
+      "margin": 0.005025125628140704,
+      "metric_id": "known-item-recall@5",
+      "reference_value": 0.8190954773869347,
+      "sigma": 0.0,
+      "sigma_source": "run-pair"
+    },
+    {
+      "control_values": [
+        0.7570252053920395,
+        0.7570252053920395
+      ],
+      "direction": "lower_is_worse",
+      "floor": null,
+      "index_configuration": "embedding-only",
+      "margin": 0.0,
+      "metric_id": "mrr",
+      "reference_value": 0.7570252053920395,
+      "sigma": 0.0,
+      "sigma_source": "run-pair"
+    },
+    {
+      "control_values": [
+        0.681064050410784,
+        0.681064050410784
+      ],
+      "direction": "lower_is_worse",
+      "floor": null,
+      "index_configuration": "with-indices",
+      "margin": 0.0,
+      "metric_id": "mrr",
+      "reference_value": 0.681064050410784,
+      "sigma": 0.0,
+      "sigma_source": "run-pair"
+    }
+  ],
+  "query_latency_envelope": {
+    "headroom": 2.0,
+    "p95_bound_ms": 15000.0,
+    "search_timeout_s": 30.0
+  },
+  "schema_version": 1
+}

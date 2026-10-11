@@ -22,7 +22,14 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
+from _serial_recovery_helpers import (
+    ORCH_SHAPED_ADDOPTS,
+    ORCH_SHAPED_PYPROJECT,
+    ROOT_SHAPED_PYPROJECT,
+    pyproject_with_addopts,
+)
 from _verify_config_corpus import (
+    DASHBOARD_LINT_COMMAND,
     FM_LINT_COMMAND,
     MODULE_LINT_COMMANDS,
     ROOT_LINT_COMMAND,
@@ -30,9 +37,17 @@ from _verify_config_corpus import (
     ROOT_TYPE_CHECK_COMMAND,
 )
 
-from orchestrator import verify
 from orchestrator import verify_plan as verify_plan_module
 from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.verify import (
+    _FALLBACK_UV_PROJECT,
+    _executed_fallback_plan,
+    _reproject_str,
+    _scope_to_keyword,
+)
+from orchestrator.verify import _is_collectable_test_file as _legacy_is_collectable_test_file
+from orchestrator.verify import _is_conftest as _legacy_is_conftest
+from orchestrator.verify import _is_test_file as _legacy_is_test_file
 from orchestrator.verify_cmd import (
     ToolKind,
     parse_config_command,
@@ -261,15 +276,15 @@ class TestDerivedPredicates:
 
     def test_is_conftest_matches_legacy(self):
         for path in _PREDICATE_PATH_TABLE:
-            assert _is_conftest(path) == verify._is_conftest(path), path
+            assert _is_conftest(path) == _legacy_is_conftest(path), path
 
     def test_is_collectable_test_file_matches_legacy(self):
         for path in _PREDICATE_PATH_TABLE:
-            assert _is_collectable_test_file(path) == verify._is_collectable_test_file(path), path
+            assert _is_collectable_test_file(path) == _legacy_is_collectable_test_file(path), path
 
     def test_is_test_file_matches_legacy(self):
         for path in _PREDICATE_PATH_TABLE:
-            assert _is_test_file(path) == verify._is_test_file(path), path
+            assert _is_test_file(path) == _legacy_is_test_file(path), path
 
     # -- explicit narrow/broad pin against FileKind membership ----------------
 
@@ -1118,6 +1133,7 @@ class TestDeriveVerifyPlanMergeBreadth:
 _REAL_CONFIG_COMMANDS: list[tuple[str, str]] = [
     *((f'{module}-lint', cmd) for module, cmd in MODULE_LINT_COMMANDS.items()),
     ('fm-lint', FM_LINT_COMMAND),
+    ('dashboard-lint', DASHBOARD_LINT_COMMAND),
     ('root-lint', ROOT_LINT_COMMAND),
     ('root-type-check', ROOT_TYPE_CHECK_COMMAND),
     ('root-test', ROOT_TEST_COMMAND),
@@ -1171,7 +1187,7 @@ class TestScoperTrailingClausePreservation:
         byte-identically, still pointed at the whole ``fused-memory/tests``
         directory they assert an invariant over.
         """
-        scoped = verify._scope_to_keyword(FM_LINT_COMMAND, 'ruff check', self._FILES)
+        scoped = _scope_to_keyword(FM_LINT_COMMAND, 'ruff check', self._FILES)
         assert scoped == (
             'uv run --project fused-memory ruff check fused-memory/tests/test_harness.py'
             ' && python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
@@ -1185,9 +1201,31 @@ class TestScoperTrailingClausePreservation:
             assert checker in scoped, f'{checker!r} must survive verbatim'
             assert checker in FM_LINT_COMMAND, 'the slice asserted above must be verbatim'
 
+    def test_dashboard_lint_chain_scopes_ruff_and_keeps_both_checkers(self):
+        """The second 3-segment chain (task 4485), as a full literal golden.
+
+        Same shape as the fused-memory case above: the ruff clause narrows
+        to the touched file while both sibling checkers survive verbatim,
+        still pointed at the whole ``dashboard/tests`` directory.
+        """
+        files = ['dashboard/tests/test_index_html.py']
+        scoped = _scope_to_keyword(DASHBOARD_LINT_COMMAND, 'ruff check', files)
+        assert scoped == (
+            'uv run --project dashboard ruff check dashboard/tests/test_index_html.py'
+            ' && python3 fused-memory/scripts/check_bare_magicmock_config.py dashboard/tests'
+            ' && python3 fused-memory/scripts/check_module_local_testclient.py dashboard/tests'
+        )
+        assert 'src/ tests/' not in scoped
+        for checker in (
+            '&& python3 fused-memory/scripts/check_bare_magicmock_config.py dashboard/tests',
+            '&& python3 fused-memory/scripts/check_module_local_testclient.py dashboard/tests',
+        ):
+            assert checker in scoped, f'{checker!r} must survive verbatim'
+            assert checker in DASHBOARD_LINT_COMMAND, 'the slice asserted above must be verbatim'
+
     def test_root_lint_chain_scopes_ruff_and_keeps_the_checker(self):
         """dark-factory-orchestrator.yaml::lint_command — the fallback path's own command."""
-        scoped = verify._scope_to_keyword(ROOT_LINT_COMMAND, 'ruff check', self._FILES)
+        scoped = _scope_to_keyword(ROOT_LINT_COMMAND, 'ruff check', self._FILES)
         assert scoped == (
             'uv run ruff check fused-memory/tests/test_harness.py'
             ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
@@ -1202,7 +1240,7 @@ class TestScoperTrailingClausePreservation:
         ``scope_to`` if the whole segment were parsed, so truncating at the
         keyword WITHIN the matched segment stays exactly as it was.
         """
-        scoped = verify._scope_to_keyword('ruff check src/ --select E', 'ruff check', ['a.py'])
+        scoped = _scope_to_keyword('ruff check src/ --select E', 'ruff check', ['a.py'])
         assert scoped == 'ruff check a.py'
         assert '--select' not in scoped
 
@@ -1210,7 +1248,7 @@ class TestScoperTrailingClausePreservation:
         'raw', ['mypy src/', 'true'], ids=['opaque-mypy', 'no-op-true'],
     )
     def test_keyword_absent_returns_byte_identical(self, raw):
-        assert verify._scope_to_keyword(raw, 'ruff check', self._FILES) == raw
+        assert _scope_to_keyword(raw, 'ruff check', self._FILES) == raw
 
     def test_root_type_check_fan_out_still_truncates(self):
         """HAZARD GUARD: a cwd-sequenced same-tool fan-out must NOT keep its tail.
@@ -1227,7 +1265,7 @@ class TestScoperTrailingClausePreservation:
         surviving ``cd ../orchestrator`` would resolve relative to the
         worktree ROOT and escape the repo.
         """
-        scoped = verify._scope_to_keyword(ROOT_TYPE_CHECK_COMMAND, 'pyright', self._FILES)
+        scoped = _scope_to_keyword(ROOT_TYPE_CHECK_COMMAND, 'pyright', self._FILES)
         assert scoped == 'npx pyright fused-memory/tests/test_harness.py'
         assert 'cd ../orchestrator' not in scoped
         assert 'cd ../dashboard' not in scoped
@@ -1252,7 +1290,7 @@ class TestScoperTrailingClausePreservation:
         to equal ``verify._FALLBACK_UV_PROJECT``; the previous bare ``uv run``
         was the depless-workspace-root shape of regression ef68777a17.
         """
-        scoped = verify._scope_to_keyword(ROOT_TEST_COMMAND, 'pytest', self._FILES)
+        scoped = _scope_to_keyword(ROOT_TEST_COMMAND, 'pytest', self._FILES)
         assert scoped == 'uv run --project shared pytest fused-memory/tests/test_harness.py'
         assert 'cd ../escalation' not in scoped
         assert 'cockpit' not in scoped
@@ -1277,7 +1315,7 @@ class TestScoperTrailingClausePreservation:
         pre-existing one. The character-level grouping check must reject
         these, restoring the byte-identical pre-feature output.
         """
-        scoped = verify._scope_to_keyword(raw, 'ruff check', self._FILES)
+        scoped = _scope_to_keyword(raw, 'ruff check', self._FILES)
         assert scoped is not None  # `raw` is a str, so the None passthrough is unreachable
         expected = (
             raw
@@ -1303,7 +1341,7 @@ class TestScoperTrailingClausePreservation:
         Both now route through the shared ``split_chain_tail`` gate, so this
         asserts a property that holds by construction.
         """
-        assert verify._scope_to_keyword(raw, keyword, self._FILES) == render(
+        assert _scope_to_keyword(raw, keyword, self._FILES) == render(
             _scope_prefix_to_keyword(raw, keyword, self._FILES)
         )
 
@@ -1365,7 +1403,7 @@ class TestTailPreservationAllowlist:
         string, so what matters there is the string's PARSE, not the scoper's
         internal shape.
         """
-        scoped = verify._scope_to_keyword(raw, 'pytest', self._FILES)
+        scoped = _scope_to_keyword(raw, 'pytest', self._FILES)
         assert scoped is not None
         parsed = parse_config_command(scoped)
         assert parsed.tool is ToolKind.PYTEST
@@ -1377,7 +1415,7 @@ class TestTailPreservationAllowlist:
 
     def test_lint_slot_still_preserves_its_sibling_checker(self):
         """Non-regression: the allowlisted lint keyword keeps task 3061's behaviour."""
-        scoped = verify._scope_to_keyword(FM_LINT_COMMAND, 'ruff check', self._FILES)
+        scoped = _scope_to_keyword(FM_LINT_COMMAND, 'ruff check', self._FILES)
         assert scoped is not None
         assert (
             '&& python3 fused-memory/scripts/check_bare_magicmock_config.py'
@@ -1391,7 +1429,7 @@ class TestTailPreservationAllowlist:
     )
     def test_lockstep_holds_on_the_rejected_pytest_chains(self, raw):
         """The two scopers must agree here too — the gate is shared, so this is structural."""
-        assert verify._scope_to_keyword(raw, 'pytest', self._FILES) == render(
+        assert _scope_to_keyword(raw, 'pytest', self._FILES) == render(
             _scope_prefix_to_keyword(raw, 'pytest', self._FILES)
         )
 
@@ -1500,7 +1538,7 @@ class TestDroppedChainClausesAreLogged:
         self, raw, keyword, dropped, level, caplog: pytest.LogCaptureFixture,
     ):
         with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
-            result = verify._scope_to_keyword(raw, keyword, self._FILES)
+            result = _scope_to_keyword(raw, keyword, self._FILES)
 
         messages = self._records(caplog, 'orchestrator.verify', level)
         assert len(messages) == 1, f'expected exactly one record, got {messages}'
@@ -1572,7 +1610,7 @@ class TestDroppedChainClausesAreLogged:
 
         caplog.clear()
         with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
-            string_result = verify._scope_to_keyword(raw, keyword, self._FILES)
+            string_result = _scope_to_keyword(raw, keyword, self._FILES)
         assert self._records(caplog, 'orchestrator.verify') == []
 
         # Pin the premise the silence rests on: these really do come back with
@@ -1606,7 +1644,7 @@ class TestDroppedChainClausesAreLogged:
     )
     def test_logging_is_the_only_observable_change(self, raw, keyword):
         """Both scopers' returned commands stay byte-identical, and in lockstep."""
-        string_scoped = verify._scope_to_keyword(raw, keyword, self._FILES)
+        string_scoped = _scope_to_keyword(raw, keyword, self._FILES)
         plan_scoped = render(_scope_prefix_to_keyword(raw, keyword, self._FILES))
         assert string_scoped == plan_scoped
 
@@ -1652,7 +1690,7 @@ class TestReprojectStrChainTail:
             'uv run ruff check f.py'
             ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
         )
-        assert verify._reproject_str(raw, verify._FALLBACK_UV_PROJECT) == (
+        assert _reproject_str(raw, _FALLBACK_UV_PROJECT) == (
             'uv run --project shared ruff check f.py'
             ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
         )
@@ -1679,7 +1717,7 @@ class TestReprojectStrChainTail:
     )
     def test_single_clause_commands_are_byte_identical_goldens(self, raw, expected):
         """No-tail regression corpus: literal goldens, deliberately not derived."""
-        assert verify._reproject_str(raw, verify._FALLBACK_UV_PROJECT) == expected
+        assert _reproject_str(raw, _FALLBACK_UV_PROJECT) == expected
 
     @pytest.mark.parametrize(
         'raw',
@@ -1688,10 +1726,10 @@ class TestReprojectStrChainTail:
     )
     def test_gate_reject_cases_still_no_op(self, raw):
         """A cwd-sequenced / subshell fan-out is returned untouched, never truncated."""
-        assert verify._reproject_str(raw, verify._FALLBACK_UV_PROJECT) == raw
+        assert _reproject_str(raw, _FALLBACK_UV_PROJECT) == raw
 
     def test_none_is_passed_through(self):
-        assert verify._reproject_str(None, verify._FALLBACK_UV_PROJECT) is None
+        assert _reproject_str(None, _FALLBACK_UV_PROJECT) is None
 
     # -- cwd-shifting head + preserved tail must bail (task 3061 step-7) -----
 
@@ -1708,7 +1746,7 @@ class TestReprojectStrChainTail:
         no ``--project`` injection to lose.
         """
         raw = 'uv run --directory sub pyright src/ && python3 tools/check.py d'
-        assert verify._reproject_str(raw, verify._FALLBACK_UV_PROJECT) == raw
+        assert _reproject_str(raw, _FALLBACK_UV_PROJECT) == raw
 
     def test_real_module_lint_command_does_not_double_its_own_path(self):
         """The realistic shape: every module ``lint_command`` is this chain.
@@ -1718,7 +1756,7 @@ class TestReprojectStrChainTail:
         — i.e. ``fused-memory/fused-memory/scripts/...`` -> exit 2 "can't open
         file" -> a spurious RED verify on a clean tree.
         """
-        result = verify._reproject_str(FM_LINT_COMMAND, verify._FALLBACK_UV_PROJECT)
+        result = _reproject_str(FM_LINT_COMMAND, _FALLBACK_UV_PROJECT)
         assert result == FM_LINT_COMMAND
         assert 'fused-memory/fused-memory' not in (result or '')
 
@@ -1726,6 +1764,7 @@ class TestReprojectStrChainTail:
         'raw',
         [
             FM_LINT_COMMAND,
+            DASHBOARD_LINT_COMMAND,
             *MODULE_LINT_COMMANDS.values(),
             ROOT_LINT_COMMAND,
             ROOT_TYPE_CHECK_COMMAND,
@@ -1734,6 +1773,7 @@ class TestReprojectStrChainTail:
         ],
         ids=[
             'fused-memory-lint',
+            'dashboard-lint',
             *(f'{module}-lint' for module in MODULE_LINT_COMMANDS),
             'root-lint',
             'root-type-check-cd-fan-out',
@@ -1749,7 +1789,7 @@ class TestReprojectStrChainTail:
         the leading ``cd`` they arrived with. What must never happen is the
         rewrite ADDING one under a tail.
         """
-        result = verify._reproject_str(raw, verify._FALLBACK_UV_PROJECT)
+        result = _reproject_str(raw, _FALLBACK_UV_PROJECT)
         assert result is not None
         if '&&' in result:
             assert result.startswith('cd ') == raw.startswith('cd '), (
@@ -1763,8 +1803,8 @@ class TestReprojectStrChainTail:
         head with nothing chained after it, and predates task 3061. Only the
         TAIL case is being fixed, so this golden must not move.
         """
-        assert verify._reproject_str(
-            'uv run --directory sub pyright src/', verify._FALLBACK_UV_PROJECT,
+        assert _reproject_str(
+            'uv run --directory sub pyright src/', _FALLBACK_UV_PROJECT,
         ) == 'cd sub && uv run pyright src/'
 
 
@@ -2472,7 +2512,7 @@ class TestPlanRecordScopedTargets:
             type_check_command='cd orchestrator && npx pyright',
             test_command='cd orchestrator && uv run pytest tests/test_sweep.py',
         )
-        reconciled = verify._executed_fallback_plan(plan, executed)
+        reconciled = _executed_fallback_plan(plan, executed)
 
         for run in reconciled.runs:
             tool = run.reason.split(':')[0]
@@ -2790,3 +2830,164 @@ class TestVersionPinSurvivesPrefixScoping:
         """
         cmd = _scope_prefix_to_keyword('npx pyright-foo', 'pyright', [_ESC_3805_FILE])
         assert render(cmd) == f'npx pyright {_ESC_3805_FILE}'
+
+
+#: A repo-shaped tree: the root and two subprojects each carry pytest config.
+_CONFIG_TREE = {
+    'pyproject.toml': ROOT_SHAPED_PYPROJECT,
+    'orchestrator/pyproject.toml': ORCH_SHAPED_PYPROJECT,
+    'cockpit/pyproject.toml': pyproject_with_addopts(('-n', 'auto', '--dist', 'loadgroup', '-m', 'not smoke')),
+}
+
+
+class _RecordingTreeReader:
+    """A dict-backed ``worktree_reader`` that records every path it is asked for."""
+
+    def __init__(self, contents: dict[str, str]) -> None:
+        self.contents = contents
+        self.paths: list[str] = []
+
+    def __call__(self, path: str) -> str | None:
+        self.paths.append(path)
+        return self.contents.get(path)
+
+
+class TestPytestConfigPathForCommand:
+    """``pytest_config_path_for_command(cmd, worktree_reader)``.
+
+    Maps the command ACTUALLY being run to the config pytest reads for it:
+    pytest's own walk from the common ancestor of its positional targets (or
+    its cwd when it names none), bounded at the reader's root. Correct for
+    scoped, cwd-stripped commands as well as the module's unscoped one.
+    """
+
+    @staticmethod
+    def _resolve(command: str, contents: dict[str, str] = _CONFIG_TREE):
+        reader = _RecordingTreeReader(contents)
+        return verify_plan_module.pytest_config_path_for_command(parse_config_command(command), reader), reader
+
+    @pytest.mark.parametrize(
+        ('command', 'expected'),
+        [
+            pytest.param(
+                'uv run --directory orchestrator pytest tests/ --tb=short -q --timeout=300',
+                'orchestrator/pyproject.toml',
+                id='module-directory',
+            ),
+            pytest.param(
+                'uv run --project shared pytest tests/scripts/ scripts/tests/ --tb=short -q '
+                '--import-mode=importlib -n auto --dist loadgroup',
+                'pyproject.toml',
+                id='scripts-from-root',
+            ),
+            pytest.param(
+                'uv run --project orchestrator pytest '
+                'orchestrator/tests/test_x.py::TestA::test_b --tb=short -q',
+                'orchestrator/pyproject.toml',
+                id='scoped-cwd-stripped',
+            ),
+            pytest.param('cd cockpit && uv run pytest tests/', 'cockpit/pyproject.toml', id='cd'),
+            pytest.param('pytest -m warm_lane_bash', 'pyproject.toml', id='no-targets'),
+            pytest.param(
+                'cd orchestrator && pytest -m warm_lane_bash',
+                'orchestrator/pyproject.toml',
+                id='no-targets-under-cd',
+            ),
+            pytest.param(
+                'pytest orchestrator/tests/test_a.py cockpit/tests/test_b.py',
+                'pyproject.toml',
+                id='two-subtrees',
+            ),
+        ],
+    )
+    def test_real_command_shapes_resolve_to_the_config_pytest_reads(self, command, expected):
+        assert self._resolve(command)[0] == expected
+
+    def test_a_readable_file_target_starts_the_walk_at_its_parent(self):
+        path, reader = self._resolve(
+            'pytest orchestrator/tests/test_x.py',
+            {**_CONFIG_TREE, 'orchestrator/tests/test_x.py': 'def test_x():\n    pass\n'},
+        )
+        assert path == 'orchestrator/pyproject.toml'
+        assert not any(p.startswith('orchestrator/tests/test_x.py/') for p in reader.paths)
+
+    @pytest.mark.parametrize(
+        'target',
+        [
+            pytest.param('pkg/tests/v1.2/', id='dotted-directory'),
+            pytest.param('pkg/tests/v1.2/test_a.py::test_t', id='node-id-inside-a-dotted-directory'),
+        ],
+    )
+    def test_a_dotted_directory_is_walked_as_a_directory(self, target):
+        """A dot in a directory name does not make it a file: pytest asks the filesystem."""
+        contents = {
+            'pkg/pyproject.toml': ROOT_SHAPED_PYPROJECT,
+            'pkg/tests/v1.2/pyproject.toml': ORCH_SHAPED_PYPROJECT,
+            'pkg/tests/v1.2/test_a.py': 'def test_t():\n    pass\n',
+        }
+        assert self._resolve(f'pytest {target}', contents)[0] == 'pkg/tests/v1.2/pyproject.toml'
+
+    @pytest.mark.parametrize(
+        'command',
+        [
+            pytest.param('', id='empty'),
+            pytest.param('cargo test --workspace', id='cargo'),
+            pytest.param('npm test', id='npm'),
+            pytest.param('cd orchestrator && pytest tests/ && cd ../cockpit && pytest tests/', id='raw-chain'),
+            pytest.param('pytest -c x.ini tests/', id='dash-c'),
+            pytest.param('pytest --config-file x.ini tests/', id='config-file'),
+            pytest.param('pytest --config-file=x.ini tests/', id='config-file-attached'),
+            pytest.param('pytest /abs/tests/', id='absolute-target'),
+            pytest.param('pytest ../x/tests/', id='escaping-target'),
+            pytest.param('cd orchestrator && pytest ../../x/', id='escaping-under-cd'),
+        ],
+    )
+    def test_refused_commands_resolve_to_none_without_a_read(self, command):
+        path, reader = self._resolve(command)
+        assert path is None
+        assert reader.paths == []
+
+
+class TestGoverningAddopts:
+    """``governing_addopts(cmd, worktree_reader)``: the RAW addopts pytest will apply.
+
+    xdist tokens included — stripping them is ``verify_cmd.serial_pytest``'s
+    job, beside the ``-p no:xdist`` that requires it. Every refusal is ``()``,
+    which renders the historical blank ``-o addopts=``.
+    """
+
+    @staticmethod
+    def _addopts(command: str, contents: dict[str, str]) -> tuple[str, ...]:
+        return verify_plan_module.governing_addopts(
+            parse_config_command(command), _RecordingTreeReader(contents),
+        )
+
+    def test_the_resolved_pyprojects_raw_addopts_are_returned(self):
+        assert self._addopts(
+            'uv run --project orchestrator pytest orchestrator/tests/test_x.py', _CONFIG_TREE,
+        ) == ORCH_SHAPED_ADDOPTS
+
+    @pytest.mark.parametrize(
+        ('command', 'contents'),
+        [
+            pytest.param('pytest tests/', {}, id='nothing-resolves'),
+            pytest.param(
+                'cd sub && pytest tests/',
+                {'sub/pytest.ini': '[pytest]\naddopts = -q\n', 'pyproject.toml': ROOT_SHAPED_PYPROJECT},
+                id='non-pyproject-config',
+            ),
+            pytest.param(
+                'cd sub && pytest tests/',
+                {'sub/pyproject.toml': '[tool.pytest.ini_options]\ntimeout = 300\n'},
+                id='no-addopts-key',
+            ),
+            pytest.param(
+                'cd sub && pytest tests/',
+                {'sub/pyproject.toml': '[tool.pytest]\naddopts = ["-q"]\n'},
+                id='toml-mode',
+            ),
+            pytest.param('cargo test --workspace', _CONFIG_TREE, id='refused-command'),
+        ],
+    )
+    def test_every_refusal_is_the_empty_tuple(self, command, contents):
+        assert self._addopts(command, contents) == ()

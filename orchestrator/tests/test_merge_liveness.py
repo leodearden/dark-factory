@@ -12,36 +12,15 @@ mirroring task β's test_merge_gates.py:
    logger name (not ``orchestrator.merge_liveness``) so existing ``caplog``
    assertions filtered to the merge_queue logger keep capturing the moved
    guards' WARNING-level messages.
-3. Reach-back / string-path monkeypatch routing — the existing test suite
-   monkeypatches liveness-guard dependencies (including two module-level
-   CONSTANTS that stay behind in merge_queue.py) by STRING PATH
-   ``orchestrator.merge_queue.<name>``.  A moved function must resolve a
-   monkeypatched-or-staying sibling via a function-local deferred import so
-   those patches stay effective even though the function body now lives in
-   this module.  Each ``TestReachBackRouting`` test below patches BOTH
-   namespaces (merge_liveness-local naive vs. merge_queue reach-back
-   target) with CONTRASTING behaviour.  Every target in this module is a
-   SYNC function, so — unlike merge_shadow / merge_drift — this class
-   carries no ``@pytest.mark.asyncio`` marker.  Also covers the
-   engine-constant default-argument hazard's OTHER half:
-   ``enforce_persistent_worktree_serial_lane``'s ``_MERGE_AHEAD_BOUND``
-   None-default (design_decisions #3 in plan.json names both
-   ``liveness_secs``/``INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS`` and
-   ``merge_ahead_bound``/``_MERGE_AHEAD_BOUND``; the step-3 plan prose only
-   spelled out the former by name).
-4. Shim re-export identity (added in a later step, once merge_queue.py's
-   shim swap lands).
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
-
-from orchestrator.config import GitConfig, OrchestratorConfig
 
 
 def test_merge_liveness_exports_moved_public_symbols() -> None:
@@ -213,101 +192,50 @@ def test_merge_liveness_logger_name_is_merge_queue() -> None:
     assert merge_liveness.logger.name == 'orchestrator.merge_queue'
 
 
-class TestReachBackRouting:
-    """Reach-back / string-path monkeypatch routing contract.
 
-    Every target below is a SYNC function; see the module docstring for why
-    this class carries no ``@pytest.mark.asyncio`` marker.
+class TestEngineConstantsAreReadAtCallTime:
+    """The liveness guards read their engine constants when CALLED, not when defined.
+
+    Each test patches one constant on ``orchestrator.merge_lane.liveness``, the
+    module that defines it and reads it, and calls the guard with the
+    corresponding argument omitted. A def-time default would have frozen the
+    original value and ignored the patch (see the module docstring of
+    ``orchestrator/src/orchestrator/merge_lane/liveness.py``).
     """
 
-    def test_enforce_merge_liveness_margin_reachback_to_check_merge_liveness_margin(
+    def test_check_merge_liveness_margin_defaults_liveness_secs_at_call_time(
         self, tmp_path: Path,
     ) -> None:
-        """(6) enforce_merge_liveness_margin must resolve check_merge_liveness_margin
-        via orchestrator.merge_queue, not the co-located merge_liveness copy."""
-        from orchestrator.merge_liveness import (
-            MergeLivenessAssessment,
-            MergeLivenessConfigError,
-            enforce_merge_liveness_margin,
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
+
+        cfg = OrchestratorConfig(project_root=tmp_path)
+        with patch('orchestrator.merge_lane.liveness.INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS', 600.0):
+            result = check_merge_liveness_margin(cfg)
+
+        assert result.liveness_secs == 600.0, result
+
+    def test_check_merge_liveness_margin_reads_heartbeat_poll_at_call_time(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.merge_lane.liveness import (
+            TOUCH_MISS_TOLERANCE,
+            check_merge_liveness_margin,
         )
 
         cfg = OrchestratorConfig(project_root=tmp_path)
-
-        # Naive-resolution target: reports safe → would NOT raise.
-        naive_safe = MergeLivenessAssessment(
-            worst_case_secs=1.0, threshold_secs=100.0, liveness_secs=10800.0,
-            heartbeat_poll_secs=30.0, touch_miss_tolerance=20,
-            safety_factor=0.75, safe=True,
-        )
-        # Reach-back target: reports UNSAFE → must raise MergeLivenessConfigError.
-        reachback_unsafe = MergeLivenessAssessment(
-            worst_case_secs=999999.0, threshold_secs=100.0, liveness_secs=10800.0,
-            heartbeat_poll_secs=30.0, touch_miss_tolerance=20,
-            safety_factor=0.75, safe=False,
-        )
-
-        with (
-            patch(
-                'orchestrator.merge_liveness.check_merge_liveness_margin',
-                MagicMock(return_value=naive_safe),
-            ),
-            patch(
-                'orchestrator.merge_queue.check_merge_liveness_margin',
-                MagicMock(return_value=reachback_unsafe),
-            ),
-            pytest.raises(MergeLivenessConfigError),
-        ):
-            enforce_merge_liveness_margin(cfg)
-
-    def test_check_merge_liveness_margin_reachback_to_heartbeat_constants(
-        self, tmp_path: Path,
-    ) -> None:
-        """(7a) check_merge_liveness_margin must read _HEARTBEAT_POLL_S and
-        TOUCH_MISS_TOLERANCE from orchestrator.merge_queue at call time."""
-        from orchestrator.merge_liveness import check_merge_liveness_margin
-
-        cfg = OrchestratorConfig(project_root=tmp_path)
-
-        with (
-            patch('orchestrator.merge_queue._HEARTBEAT_POLL_S', 1000.0),
-            patch('orchestrator.merge_queue.TOUCH_MISS_TOLERANCE', 1000),
-        ):
+        with patch('orchestrator.merge_lane.liveness._HEARTBEAT_POLL_S', 1000.0):
             result = check_merge_liveness_margin(cfg, liveness_secs=10800.0)
 
-        assert result.worst_case_secs == 1000.0 * 1000, (
-            f'expected worst_case_secs to reflect the orchestrator.merge_queue-patched '
-            f'_HEARTBEAT_POLL_S x TOUCH_MISS_TOLERANCE (1,000,000), got '
-            f'{result.worst_case_secs!r}'
-        )
-        assert result.safe is False, (
-            f'floor of 1,000,000s must blow well past the threshold; got safe={result.safe!r}'
-        )
+        assert result.worst_case_secs == 1000.0 * TOUCH_MISS_TOLERANCE, result
+        assert result.safe is False, result
 
-    def test_check_merge_liveness_margin_reachback_to_inflight_liveness_default(
+    def test_enforce_persistent_worktree_serial_lane_defaults_merge_ahead_bound_at_call_time(
         self, tmp_path: Path,
     ) -> None:
-        """(7b) check_merge_liveness_margin's None-default liveness_secs must
-        resolve INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS from orchestrator.merge_queue."""
-        from orchestrator.merge_liveness import check_merge_liveness_margin
-
-        cfg = OrchestratorConfig(project_root=tmp_path)
-
-        with patch('orchestrator.merge_queue.INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS', 600.0):
-            result = check_merge_liveness_margin(cfg)  # liveness_secs omitted → None-default path
-
-        assert result.liveness_secs == 600.0, (
-            f'expected the None-default liveness_secs to resolve via the '
-            f'orchestrator.merge_queue-patched INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS, '
-            f'got {result.liveness_secs!r}'
-        )
-
-    def test_enforce_persistent_worktree_serial_lane_reachback_to_merge_ahead_bound_default(
-        self, tmp_path: Path,
-    ) -> None:
-        """enforce_persistent_worktree_serial_lane's None-default merge_ahead_bound
-        must resolve _MERGE_AHEAD_BOUND from orchestrator.merge_queue (same
-        def-time-constant hazard as liveness_secs above; design_decisions #3)."""
-        from orchestrator.merge_liveness import (
+        from orchestrator.config import GitConfig, OrchestratorConfig
+        from orchestrator.merge_lane.liveness import (
             PersistentWorktreeConfigError,
             enforce_persistent_worktree_serial_lane,
         )
@@ -316,50 +244,9 @@ class TestReachBackRouting:
             project_root=tmp_path,
             git=GitConfig(persistent_merge_worktree=True),
         )
-
+        # merge_ahead_bound omitted; num_hosts=1, so per-host ceil(5/1)=5 > 1 raises.
         with (
-            patch('orchestrator.merge_queue._MERGE_AHEAD_BOUND', 5),
+            patch('orchestrator.merge_lane.liveness._MERGE_AHEAD_BOUND', 5),
             pytest.raises(PersistentWorktreeConfigError),
         ):
-            # merge_ahead_bound omitted → None-default path; num_hosts=1 →
-            # per_host=ceil(5/1)=5 > 1 → raises.
             enforce_persistent_worktree_serial_lane(cfg)
-
-
-def test_merge_queue_reexports_identical_objects() -> None:
-    """merge_queue re-exports the SAME objects from merge_liveness (shim identity).
-
-    Covers every one of the 14 moved names.
-
-    RED (pre-shim): merge_queue.py still defines its own independent copies
-    of these names (the duplicate definitions left in place by the EXPAND
-    step), so ``getattr(merge_queue, name) is getattr(merge_liveness, name)``
-    fails for every name — two distinct objects that merely share a name.
-    """
-    import orchestrator.merge_liveness as merge_liveness
-    import orchestrator.merge_queue as merge_queue
-
-    moved_names = [
-        'MergeLivenessAssessment',
-        'check_merge_liveness_margin',
-        'MergeLivenessConfigError',
-        'enforce_merge_liveness_margin',
-        'PersistentWorktreeConfigError',
-        '_safety_valve_due',
-        '_VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX',
-        '_VERIFY_HOST_RECOVERED_SENTINEL_PREFIX',
-        '_MERGE_WORKER_LOOP_DIED_SENTINEL',
-        '_verify_host_unreachable_sentinel',
-        '_alarm_verify_host_unreachable',
-        '_clear_verify_host_unreachable',
-        '_acquire_warm_verify_worktree',
-        'enforce_persistent_worktree_serial_lane',
-    ]
-
-    for name in moved_names:
-        mq_obj = getattr(merge_queue, name)
-        ml_obj = getattr(merge_liveness, name)
-        assert mq_obj is ml_obj, (
-            f'{name}: orchestrator.merge_queue.{name} and '
-            f'orchestrator.merge_liveness.{name} must be the identical object'
-        )

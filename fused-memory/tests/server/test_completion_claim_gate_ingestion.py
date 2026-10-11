@@ -31,7 +31,9 @@ import subprocess
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _distinct_git_repo import init_distinct_git_repo
 
+from fused_memory.middleware.task_interceptor import TicketStoreNotConfiguredError
 from fused_memory.server.tools import create_mcp_server
 
 # An applied-work completion claim naming task 5422 — the esc-5603-1 shape.
@@ -248,6 +250,12 @@ _BASELINE_SERVICE_KWARGS = frozenset(
         'causation_id',
         'temporal_context',
         'reference_time',
+        # task 3669 (PRD leaf delta): the caller's `entities` declaration, always
+        # forwarded — None when omitted. It belongs in the BASELINE rather than
+        # among the gate's `extra` keys precisely because it is unconditional:
+        # this gate must neither add it nor drop it, and folding it in here
+        # keeps that assertion exact instead of loosening it to a subset check.
+        'declared_referents',
         '_source',
     }
 )
@@ -382,6 +390,85 @@ class TestVerifiedClaimsAreInert:
         assert 'unverified_claim' not in result, f'Unexpected flag: {result!r}'
         assert _gate_warnings(caplog) == [], f'Unexpected logs: {_gate_warnings(caplog)!r}'
 
+    @pytest.mark.asyncio
+    async def test_commit_in_another_registered_repo_is_not_tagged(self, tmp_path):
+        """A reify writer naming a dark_factory commit (sweep Class C): the sha
+        exists in a registered repository, so the claim verifies."""
+        reify_root = tmp_path / 'reify'
+        df_root = tmp_path / 'dark_factory'
+        reify_sha = init_distinct_git_repo(reify_root)
+        df_sha = init_distinct_git_repo(df_root)
+        assert df_sha != reify_sha
+        mock_service = _episode_service()
+        server = _server(
+            mock_service,
+            statuses={},
+            known_projects={'reify': str(reify_root), 'dark_factory': str(df_root)},
+        )
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': f'the fix landed in commit {df_sha}',
+                'agent_id': 'claude-task-5422-implementer',
+                'project_id': 'reify',
+            },
+        )
+
+        mock_service.add_episode.assert_awaited_once()
+        assert _service_kwargs(mock_service).get('unverified_claim', False) is False, (
+            f'A commit present in a registered repo must not tag; got: '
+            f'{_service_kwargs(mock_service)!r}'
+        )
+        assert 'unverified_claim' not in result, f'Unexpected flag: {result!r}'
+
+    @pytest.mark.asyncio
+    async def test_one_commit_probe_serves_every_episode(self, monkeypatch):
+        """The registry probe caches each repository's resolved git top level,
+        so it is built once per server rather than once per episode."""
+        import fused_memory.server.tools as tools_mod
+
+        commit_probe = MagicMock(return_value=True)
+        commit_probe_factory = MagicMock(return_value=commit_probe)
+        monkeypatch.setattr(tools_mod, 'make_registry_commit_probe', commit_probe_factory)
+        server = _server(_episode_service(), statuses={})
+
+        for sha in ('7bbcd5d815', '1d3aaeb030'):
+            await server._tool_manager.call_tool(
+                'add_episode',
+                {
+                    'content': f'the fix landed in commit {sha}',
+                    'agent_id': 'claude-task-5422-implementer',
+                    'project_id': _PROJECT_ID,
+                },
+            )
+
+        assert commit_probe_factory.call_count == 1, commit_probe_factory.call_args_list
+        assert commit_probe.call_count == 2, commit_probe.call_args_list
+
+    @pytest.mark.asyncio
+    async def test_filing_claim_about_an_open_task_is_not_tagged(self):
+        """'filed as task N' asserts the task EXISTS; an in-progress task does
+        (esc-unverified-claim-6169-3)."""
+        mock_service = _episode_service()
+        server = _server(mock_service, statuses={'6169': 'in-progress'})
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': 'the flake ledger debt was filed as task 6169',
+                'agent_id': 'claude-task-5422-implementer',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        mock_service.add_episode.assert_awaited_once()
+        assert _service_kwargs(mock_service).get('unverified_claim', False) is False, (
+            f'A filing claim about an existing task must not tag; got: '
+            f'{_service_kwargs(mock_service)!r}'
+        )
+        assert 'unverified_claim' not in result, f'Unexpected flag: {result!r}'
+
 
 class TestNoClaimPathIsUntouched:
     """The control: content carrying no completion claim must not pay for this
@@ -395,10 +482,12 @@ class TestNoClaimPathIsUntouched:
     ):
         import fused_memory.server.tools as tools_mod
 
-        commit_probe_factory = MagicMock(
+        commit_probe = MagicMock(
             side_effect=AssertionError('git must not be touched without a commit claim')
         )
-        monkeypatch.setattr(tools_mod, 'make_commit_probe', commit_probe_factory)
+        monkeypatch.setattr(
+            tools_mod, 'make_registry_commit_probe', MagicMock(return_value=commit_probe)
+        )
 
         mock_service = _episode_service()
         task_interceptor = MagicMock()
@@ -425,9 +514,9 @@ class TestNoClaimPathIsUntouched:
         # A plain (sync) MagicMock, so call_count rather than an assert_not_*
         # helper: the task-525 style check forbids mixing assert_not_called with
         # assert_not_awaited in one function, and the two above are the async ones.
-        assert commit_probe_factory.call_count == 0, (
-            'git must not be touched without a commit claim; the probe factory '
-            f'was built {commit_probe_factory.call_count} time(s)'
+        assert commit_probe.call_count == 0, (
+            'git must not be touched without a commit claim; the commit probe '
+            f'ran {commit_probe.call_count} time(s)'
         )
         mock_service.add_episode.assert_awaited_once()
         assert set(_service_kwargs(mock_service)) == set(_BASELINE_SERVICE_KWARGS), (
@@ -602,12 +691,21 @@ class TestUnresolvableAuthoritiesTag:
 
     @pytest.mark.asyncio
     async def test_ticket_store_unconfigured_tags(self):
-        """The real get_ticket_row returns None (never raises) when no ticket
-        store is configured. The tools layer cannot tell that from "no such
-        ticket" — both are non-verified, so both tag.
+        """get_ticket_row raises TicketStoreNotConfiguredError when no ticket
+        store is configured, so a missing store reads as UNVERIFIABLE and is
+        never reported as a ticket that does not exist.
         """
         mock_service = _episode_service()
-        server = _server(mock_service, statuses={})
+        task_interceptor = MagicMock()
+        task_interceptor.get_statuses = AsyncMock(return_value={})
+        task_interceptor.get_ticket_row = AsyncMock(
+            side_effect=TicketStoreNotConfiguredError('no store'),
+        )
+        server = create_mcp_server(
+            mock_service,
+            task_interceptor=task_interceptor,
+            known_projects=_KNOWN_PROJECTS,
+        )
 
         result = await server._tool_manager.call_tool(
             'add_episode',
@@ -618,7 +716,13 @@ class TestUnresolvableAuthoritiesTag:
             },
         )
 
-        _assert_tagged(result, mock_service, ref=_TICKET_ID)
+        entry = _assert_tagged(result, mock_service, ref=_TICKET_ID)
+        assert entry.get('status') == 'unverifiable', (
+            f'An unconfigured registry is unchecked, not contradicted; got: {entry!r}'
+        )
+        assert 'exists in the registry' not in entry.get('observed', ''), (
+            f'The flag must not accuse the writer of a fabricated ticket; got: {entry!r}'
+        )
 
     @pytest.mark.asyncio
     async def test_unresolvable_commit_probe_tags(self, tmp_path):

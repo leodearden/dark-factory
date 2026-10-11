@@ -7,40 +7,19 @@ test_tag_cgl_eta_rehome_scope.py / test_prune_recon_cycle_summaries.py.
 from __future__ import annotations
 
 import dataclasses
-import importlib.util
-import sys
-import types
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import deny, neutralise_fixture
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'amend_stale_resume_cwd_records.py'
 )
 
 
-def _load_module() -> types.ModuleType:
-    """Load amend_stale_resume_cwd_records.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators (e.g. @dataclass) work correctly.
-    """
-    mod_name = 'amend_stale_resume_cwd_records'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='amend_stale_resume_cwd_records')
 
 STALE_ID = '6403e96b-f1af-403a-9513-59f007ed6d39'
 WARNING_ID = 'd007aa46-5800-455c-af3c-32d8fd8445b2'
@@ -445,26 +424,14 @@ class TestBuildAmendReport:
         assert report['targets'] == 2
 
 
-@pytest.fixture(autouse=True)
-def _neutralise_store_mutation_preflight(monkeypatch):
-    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
-
-    ``run(..., apply=True)`` runs a fail-closed capability preflight before it
-    writes. That probe touches the real filesystem, so without this fixture
-    every ``--apply`` test would pass or fail according to whether the machine
-    running pytest happens to be able to write mem0's history directory -- and
-    it genuinely cannot inside an agent sandbox, which is the whole reason the
-    guard exists. This suite is deliberately MOCK-unit (an AsyncMock memory
-    service, no live Qdrant), so the environment must not be an input to it.
-
-    ``TestApplyStoreMutationPreflight`` re-rigs this per test -- to refuse, to
-    record, or to pass -- so the guard's own behaviour is still pinned
-    explicitly rather than assumed away.
-
-    Deliberately NOT ``raising=False``: if the guard is ever removed from the
-    script this fixture must break loudly rather than silently no-op.
-    """
-    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``run(..., apply=True)`` runs the preflight before it writes. This
+    suite is deliberately MOCK-unit (an AsyncMock memory service, no live
+    Qdrant). ``TestApplyStoreMutationPreflight`` re-rigs this per test -- to
+    refuse, to record, or to pass -- so the guard's own behaviour is still
+    pinned explicitly rather than assumed away.""",
+)
 
 
 def _memory_service(contents: dict[str, str] | None = None) -> AsyncMock:
@@ -844,10 +811,7 @@ class TestApplyStoreMutationPreflight:
 
     @pytest.mark.asyncio
     async def test_refused_preflight_performs_zero_writes(self, monkeypatch):
-        def _refuse(**_kw):
-            raise _mod.StoreMutationUnavailable('sandboxed: cannot write ~/.mem0')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _refuse)
+        deny(_mod, monkeypatch)
         service = _memory_service()
         await _mod.run(service, project_id='dark_factory', apply=True)
         service.update_memory.assert_not_awaited()
@@ -858,10 +822,7 @@ class TestApplyStoreMutationPreflight:
     ):
         # A sandboxed operator must get the report back and see WHY, rather
         # than a stack trace they have to interpret.
-        def _refuse(**_kw):
-            raise _mod.StoreMutationUnavailable('sandboxed: cannot write ~/.mem0')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _refuse)
+        deny(_mod, monkeypatch)
         report = await _mod.run(
             _memory_service(), project_id='dark_factory', apply=True,
         )

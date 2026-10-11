@@ -517,7 +517,6 @@ class TestResolveReduxBaseStateWhenNoBaseRefResolves:
 _REQUIRED_ASSETS = (
     'graph_layout.js',
     'prd_grouping.js',
-    'task_status_counts.js',
     'runtime_format.js',
     'orch_filter.js',
     'esc_flow_layout.js',

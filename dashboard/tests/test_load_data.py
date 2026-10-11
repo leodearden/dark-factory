@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 
 import aiosqlite
@@ -235,3 +236,253 @@ def test_load_schema_and_metrics_match_sampler() -> None:
         f'Process metric mismatch — sampler emits {sorted(process_keys)}, '
         f'dashboard PROCESS_METRICS has {sorted(PROCESS_METRICS)}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests: recency bound (task 3592)
+# ---------------------------------------------------------------------------
+
+
+def test_recency_slack_is_sized_for_the_sparkline_span() -> None:
+    """Pin the slack's SIZING, which no behavioural test can express.
+
+    Once the bound exists, cost is linear in the SLACK rather than in
+    retention: measured 1h = 28.7 ms, 24h = 347 ms, 7d = 2,168 ms against a
+    4,665,600-row probe.  So the value has a floor (it must clear the
+    sparkline's span or a full sparkline gets truncated) and a ceiling (or the
+    bound stops paying for itself).  Both ends are real, and a value assertion
+    is the only way to state them.
+
+    The bound's BEHAVIOUR is deliberately not asserted here.  The two async
+    tests below cover it non-vacuously, and an earlier version of this test
+    grepped _QUERY_SQL for the substrings 'ts >=' and 'MAX(ts)' instead --
+    which pinned the SQL's SPELLING, not its behaviour.  That form went red on
+    a behaviour-preserving rewrite (`ts>=`, lowercase `max(ts)`, BETWEEN, a
+    CTE) while staying green for a bound applied to the wrong side.
+    """
+    from dashboard.data.load import _RECENCY_SLACK_SECONDS
+
+    # Sparkline spans 60 samples x 5s tick = 300s; slack must clear that...
+    assert _RECENCY_SLACK_SECONDS >= 300
+    # ...but stay modest, since cost is linear in the slack (7d measured 2.2s).
+    assert _RECENCY_SLACK_SECONDS <= 86400
+
+
+@pytest.mark.asyncio
+async def test_bound_excludes_ancient_rows_but_keeps_the_live_window(tmp_path: Path) -> None:
+    """Rows far older than the newest sample are excluded from the sparkline.
+
+    Deliberately uses FEWER than 60 live samples: with a full 60 the ancient
+    rows sort to rn 61+ and `rn <= 60` masks them regardless of the bound, so
+    such a test would pass unbounded and guard nothing.  With 10 live samples
+    the unbounded query yields a 12-entry sparkline starting at 1.0, and only
+    the recency bound trims it back to the 10 live ones.
+    """
+    db_path = tmp_path / 'bounded-load.db'
+    conn_sync = sqlite3.connect(str(db_path))
+    conn_sync.executescript(LOAD_SAMPLES_SCHEMA)
+    base = 10_000_000
+    rows = [(base - 500_000, 'verify_concurrency', 1.0, None, None),
+            (base - 400_000, 'verify_concurrency', 2.0, None, None)]
+    # 10 live samples at the 5s tick, ending at `base`.
+    rows += [(base - (9 - i) * 5, 'verify_concurrency', 100.0 + i, None, None)
+             for i in range(10)]
+    conn_sync.executemany(
+        'INSERT INTO samples (ts, metric, value, window_mean, window_max) VALUES (?, ?, ?, ?, ?)',
+        rows,
+    )
+    conn_sync.commit()
+    conn_sync.close()
+
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        result = await get_load_metrics(conn)
+
+    sparkline = result['verify_concurrency']['sparkline']
+    assert len(sparkline) == 10, 'ancient rows must not enter the sparkline'
+    assert sparkline[0] == 100.0
+    assert sparkline[-1] == 109.0
+    assert result['verify_concurrency']['current'] == 109.0
+
+
+@pytest.mark.asyncio
+async def test_bound_is_anchored_to_newest_row_not_wall_clock(tmp_path: Path) -> None:
+    """A stale DB (sampler down) still returns its last samples, not placeholders.
+
+    A now()-relative bound would blank the card here; anchoring to MAX(ts)
+    preserves the unbounded query's behaviour across a sampler outage.
+    """
+    db_path = tmp_path / 'stale-load.db'
+    conn_sync = sqlite3.connect(str(db_path))
+    conn_sync.executescript(LOAD_SAMPLES_SCHEMA)
+    # ts values far in the past relative to any real wall clock.
+    conn_sync.executemany(
+        'INSERT INTO samples (ts, metric, value, window_mean, window_max) VALUES (?, ?, ?, ?, ?)',
+        [(100, 'occt_queue_depth', 1.0, None, None),
+         (105, 'occt_queue_depth', 2.0, 1.5, 2.0)],
+    )
+    conn_sync.commit()
+    conn_sync.close()
+
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        result = await get_load_metrics(conn)
+
+    assert result['occt_queue_depth']['current'] == 2.0
+    assert result['occt_queue_depth']['sparkline'] == [1.0, 2.0]
+
+
+@pytest.mark.asyncio
+async def test_a_group_that_stops_writing_blanks_while_its_siblings_keep_ticking(
+    tmp_path: Path,
+) -> None:
+    """The PARTIAL degrade, which the whole-sampler-down test above does not cover.
+
+    ``sampler/__main__.py`` degrades each collection group independently: the
+    PSI group can hand run_tick ``{}`` every tick while the process and load
+    groups keep writing.  The recency bound is anchored to a GLOBAL MAX(ts), so
+    the still-writing groups advance the anchor and the stalled group's last
+    rows fall outside the window.  Those cards then return the placeholder
+    shape, where the unbounded query kept serving hour-old values.
+
+    That blanking is INTENDED rather than incidental; the argument for it, and
+    why the anchor stays global, lives with the statement it constrains —
+    ``dashboard/src/dashboard/data/load.py::_ANCHOR_SQL``.  The
+    whole-sampler-down case above is genuinely different: there the anchor
+    moves with the data, so nothing is claimed to be fresher than anything
+    else.
+    """
+    db_path = tmp_path / 'partial-degrade.db'
+    conn_sync = sqlite3.connect(str(db_path))
+    conn_sync.executescript(LOAD_SAMPLES_SCHEMA)
+    base = 10_000_000
+    rows = [
+        # The load group kept ticking right up to `base`.
+        (base - (9 - i) * 5, 'verify_concurrency', 100.0 + i, None, None)
+        for i in range(10)
+    ]
+    # The PSI group stopped two hours ago — beyond the 1 h slack.
+    rows += [(base - 7200 - (9 - i) * 5, 'psi_cpu_some_avg10', 5.0 + i, None, None)
+             for i in range(10)]
+    conn_sync.executemany(
+        'INSERT INTO samples (ts, metric, value, window_mean, window_max)'
+        ' VALUES (?, ?, ?, ?, ?)',
+        rows,
+    )
+    conn_sync.commit()
+    conn_sync.close()
+
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        result = await get_load_metrics(conn)
+
+    assert result['verify_concurrency']['current'] == 109.0
+    assert result['psi_cpu_some_avg10'] == {
+        'current': None, 'sparkline': [], 'window_mean': None, 'window_max': None,
+    }, 'a collector stalled beyond the slack must read as no-data, not as live'
+
+
+@pytest.mark.asyncio
+async def test_the_anchor_is_computed_over_the_allowlist_not_the_whole_table(
+    tmp_path: Path,
+) -> None:
+    """The load group writes metrics this endpoint does not serve, into this table.
+
+    ``samples`` is shared: the sampler writes ``runqueue_ratio``,
+    ``runqueue_read_ok``, ``own_cpu_some10:<leaf>`` and ``own_read_ok:<leaf>``
+    alongside the nine metrics KNOWN_METRICS admits, and none of those four is
+    served here (PRD section 9 dropped the load-view panel).  The anchor
+    subquery therefore carries its own ``WHERE metric IN (...)``, spelling the
+    same named allowlist group the outer filter uses.
+
+    Without that scoping the partial-degrade semantics the module docstring
+    claims invert: a still-ticking load group would advance the anchor past
+    every served metric and blank all nine cards, while the collector it is
+    reporting on is the one still healthy.  The test above pins the degrade
+    when a SERVED group stalls; this one pins that an UNSERVED group cannot
+    cause it.
+    """
+    db_path = tmp_path / 'unserved-anchor.db'
+    conn_sync = sqlite3.connect(str(db_path))
+    conn_sync.executescript(LOAD_SAMPLES_SCHEMA)
+    base = 10_000_000
+    rows = [(base - (9 - i) * 5, 'verify_concurrency', 100.0 + i, None, None)
+            for i in range(10)]
+    # Two hours AHEAD of every served row, and beyond the 1 h slack -- so an
+    # unscoped MAX(ts) would exclude every row above.
+    rows += [(base + 7200, 'runqueue_ratio', 1.5, None, None),
+             (base + 7200, 'own_cpu_some10:orchestrator-reify.service', 4.0, None, None)]
+    conn_sync.executemany(
+        'INSERT INTO samples (ts, metric, value, window_mean, window_max)'
+        ' VALUES (?, ?, ?, ?, ?)',
+        rows,
+    )
+    conn_sync.commit()
+    conn_sync.close()
+
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        result = await get_load_metrics(conn)
+
+    assert result['verify_concurrency']['current'] == 109.0, (
+        'a metric this endpoint does not serve dragged the anchor past one it '
+        'does -- the anchor subquery is not scoped to the allowlist'
+    )
+    assert result['verify_concurrency']['sparkline'] == [100.0 + i for i in range(10)]
+    # And the unserved rows stay unserved: scoping the anchor must not leak them
+    # into the result the way a bare MAX(ts) would have hidden everything else.
+    assert set(result) == set(KNOWN_METRICS)
+
+
+@pytest.mark.asyncio
+async def test_one_future_dated_row_does_not_blank_the_other_eight_metrics(
+    tmp_path: Path,
+) -> None:
+    """The clock-skew poison pill the anchor clamp exists to defuse.
+
+    The sampler stamps ``ts = int(time.time())`` with no monotonicity guard, so
+    an NTP step forward, a VM suspend/resume, or a hand-seeded probe row can
+    land ONE sample far beyond every real tick.  Unclamped, that row becomes
+    the global ``MAX(ts)`` anchor and every other metric falls outside the
+    slack — all eight siblings go to the placeholder and the dashboard is
+    blank.  It is also unrecoverable on its own: a past-only retention sweep
+    never reaches a future row, so at the 30-day retention it outlives the
+    corpus it is hiding.
+
+    This is the one case that separates the clamp from the bound.  It is NOT
+    the partial-degrade above: nothing here has stopped writing.
+    """
+    db_path = tmp_path / 'future-row.db'
+    conn_sync = sqlite3.connect(str(db_path))
+    conn_sync.executescript(LOAD_SAMPLES_SCHEMA)
+    now = int(time.time())
+    rows = [
+        (now - (59 - i) * 5, 'verify_concurrency', 100.0 + i, None, None)
+        for i in range(60)
+    ]
+    rows += [(now - (59 - i) * 5, 'psi_cpu_some_avg10', 5.0 + i, None, None)
+             for i in range(60)]
+    # One row a year ahead of every real tick.
+    rows.append((now + 365 * 86400, 'occt_queue_depth', 7.0, None, None))
+    conn_sync.executemany(
+        'INSERT INTO samples (ts, metric, value, window_mean, window_max)'
+        ' VALUES (?, ?, ?, ?, ?)',
+        rows,
+    )
+    conn_sync.commit()
+    conn_sync.close()
+
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        result = await get_load_metrics(conn)
+
+    assert result['verify_concurrency']['current'] == 159.0, (
+        'a single future-dated row dragged the anchor past every real sample'
+    )
+    assert len(result['verify_concurrency']['sparkline']) == 60
+    assert result['psi_cpu_some_avg10']['current'] == 64.0
+    # The clamp bounds the anchor, not the rows: the skewed row is still the
+    # newest sample of its own metric and still serves as that card's current,
+    # exactly as the pre-bound unbounded query did.  Blanking it is not this
+    # change's job — `cleanup_old` prunes it on the next sweep.
+    assert result['occt_queue_depth']['current'] == 7.0

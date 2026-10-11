@@ -626,12 +626,8 @@ class TestProvenanceStampDoesNotDisarmOperationalSuggestion:
         gates a weak marker ('confirm') in that field, even though the same
         stamp's "bug" no longer arms the code-change suppression.
 
-        Left unfixed deliberately (task 4569 is scoped to the code-change
-        scan; extending the strip into the marker loop would break the
-        monotonicity invariant and needs its own precision matrix). Follow-up
-        ticket tkt_0RT8E1WV27YBJ2RYS22GYK1Q49 is scoped to close it — this
-        test is its regression anchor, so closing it means flipping the first
-        assertion here, not discovering the behaviour from scratch.
+        Closed as won't-fix by task 5106 after a live-corpus census found zero
+        incidence of this shape; this pair stays as its pin.
 
         Asserted as a PAIR so the pin is specific to the artifact noun rather
         than to the whole stamp: swapping the single word 'field' -> 'prose'
@@ -651,7 +647,7 @@ class TestProvenanceStampDoesNotDisarmOperationalSuggestion:
         )
         assert gated is None, (
             "A stamp's own code-artifact noun still gates the weak marker "
-            f'(the tkt_0RT8E1WV27YBJ2RYS22GYK1Q49 boundary), got: {gated!r}'
+            f"(task 5106 won't-fix), got: {gated!r}"
         )
 
         ungated = operational_suggestion_finding(
@@ -670,6 +666,28 @@ class TestProvenanceStampDoesNotDisarmOperationalSuggestion:
             'all (the part task 4569 DID fix)'
         )
         assert 'confirm' in ungated.markers
+
+    def test_weak_marker_and_artifact_noun_both_inside_a_stamp_stay_gated(self):
+        """The one near-miss shape the task-5106 census found in live task
+        rows: the stamp carries BOTH the weak marker and the artifact noun, so
+        the raw-text gate keeps the marker gated. Gating stamp-stripped text
+        instead would turn this into a finding built from annotator wording,
+        not the filing author's."""
+        finding = operational_suggestion_finding(
+            title=None,
+            description=(
+                'Add a typed verdict adapter to the triage judge.'
+                '\n\n[2026-09-30 RULING] Confirm first on a fresh population; '
+                'the verdict schema trial was inconclusive.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is None, (
+            "A weak marker inside a stamp stays gated by that stamp's own "
+            f'artifact noun (task 5106 won\'t-fix), got: {finding!r}'
+        )
 
 
 class TestProvenanceStampRecognizerParityWithRoutingIntentGuard:

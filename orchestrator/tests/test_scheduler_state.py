@@ -16,6 +16,7 @@ import pytest
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.overrides import OverrideStore
+from orchestrator.pin_reservation import PinOrder
 from orchestrator.scheduler import ModuleLockTable, Scheduler
 
 # ---------------------------------------------------------------------------
@@ -404,6 +405,9 @@ class TestSnapshotParkStacks:
         assert e0['owner'] == 'L'
         assert e0['shadowed'] is True
         assert isinstance(e0['rank'], int)
+        assert e0['source'] == 'fairness'
+        assert e0['tier'] == 'low'
+        assert 'pin_order' not in e0
         datetime.fromisoformat(e0['installed_at'])
 
         # top entry: H (active)
@@ -444,6 +448,18 @@ class TestSnapshotParkStacks:
         assert entries[-1]['shadowed'] is False
         for e in entries[:-1]:
             assert e['shadowed'] is True
+
+    def test_pin_and_fairness_entries_for_one_owner_carry_source(self):
+        """A pin entry reports source/pin_order; the owner's fairness entry its tier."""
+        lt = self._make_lock_table()
+        lt.install_parks('T', ['mod/a'], 'medium')
+        lt.install_parks('T', ['mod/a'], PinOrder(1))
+
+        fairness, pin = lt.snapshot_park_stacks()['mod/a']
+        assert (fairness['source'], fairness['tier']) == ('fairness', 'medium')
+        assert 'pin_order' not in fairness
+        assert (pin['source'], pin['pin_order']) == ('pin', 1)
+        assert 'tier' not in pin
 
     def test_empty_when_no_parks(self):
         """Fresh table returns empty dict."""
@@ -531,14 +547,14 @@ class TestEffectivePrioritiesCache:
 _SNAPSHOT_KEYS = frozenset({
     'skip_counts', 'parks', 'park_stacks', 'effective_priorities',
     'pin_queue', 'overrides', 'current_holders', 'lock_depth', 'snapshot_at',
-    'is_paused', 'pause_reason', 'requeue_cooldowns',
+    'is_paused', 'pause_reason', 'requeue_cooldowns', 'pin_reservations',
 })
 
 
 class TestGetStateSnapshotShape:
-    """get_state_snapshot() returns the correct twelve-key dict."""
+    """get_state_snapshot() returns the correct thirteen-key dict."""
 
-    def test_snapshot_returns_twelve_top_level_keys(self):
+    def test_snapshot_returns_thirteen_top_level_keys(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         scheduler.finish_startup()
         snap = scheduler.get_state_snapshot()
@@ -556,6 +572,7 @@ class TestGetStateSnapshotShape:
         assert snap['overrides'] == {}
         assert snap['current_holders'] == {}
         assert snap['requeue_cooldowns'] == {}
+        assert snap['pin_reservations'] == {}
         # snapshot_at must be an ISO8601 string.
         datetime.fromisoformat(snap['snapshot_at'])
         # Pause state defaults — scheduler is not paused at construction.

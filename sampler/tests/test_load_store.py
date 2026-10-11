@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from pathlib import Path
+from typing import Any, NamedTuple
 
 import pytest
 
@@ -188,6 +189,15 @@ class TestTrailingWindow:
         assert mx == pytest.approx(5.0)
 
     def test_caps_at_window_minus_one_prior_rows(self, tmp_path: Path):
+        """The span is left to the DEFAULT on purpose.
+
+        ``_TRAILING_WINDOW_SAMPLES`` is the single home for the 60-sample span
+        and every other value-sensitive test here passes ``window=``
+        explicitly or seeds at most two prior rows — so the default was free
+        to change with nothing going red, silently reshaping every
+        ``window_mean``/``window_max`` in the calibration corpus. This
+        fixture's 80 rows discriminate 60 from any other span.
+        """
         from sampler.store import LoadSampleStore
 
         store = LoadSampleStore(tmp_path / 'db.sqlite')
@@ -200,7 +210,7 @@ class TestTrailingWindow:
         # Values 0..79 inserted; most recent 59 are values 21..79 (59 rows)
         # current_value = 100.0
         # window = [21.0, 22.0, ..., 79.0, 100.0] = 59 + 1 = 60 values
-        mean, mx = store.trailing_window('metric_x', 100.0, window=60)
+        mean, mx = store.trailing_window('metric_x', 100.0)
         expected_values = [float(i) for i in range(21, 80)] + [100.0]
         expected_mean = sum(expected_values) / len(expected_values)
         expected_max = max(expected_values)
@@ -278,14 +288,35 @@ class TestRetentionAndVacuum:
         store.maybe_vacuum(now)
         assert store.should_vacuum(now + 86400) is True
 
-    def test_maybe_vacuum_runs_and_records_timestamp(self, tmp_path: Path):
+    def test_maybe_vacuum_runs_and_records_timestamp(self, tmp_path: Path, monkeypatch):
+        """The stamp is recorded on the path where a VACUUM actually RUNS.
+
+        The store must carry reclaimable pages or
+        ``_VACUUM_MIN_RECLAIMABLE_FRACTION`` short-circuits maybe_vacuum, and
+        this then stamps via the SKIP path — which
+        ``test_the_clock_is_still_stamped_so_the_check_is_not_per_tick``
+        already covers, leaving this test asserting nothing of its own.  The
+        contract it uniquely pins is the retry rule: the clock is stamped
+        AFTER a successful VACUUM, not before it.
+        """
         from sampler.store import LoadSampleStore
 
         store = LoadSampleStore(tmp_path / 'db.sqlite')
-        now = 1_000_000
+        _bulk_insert(store.db_path, 'psi_cpu_some_avg10', 1_000_000, 20_000)
+        now = 1_000_000 + 20_000 * 5
+        store.cleanup_old(now, retain_seconds=100)
+        assert store.reclaimable_fraction() >= 0.10, (
+            'setup must open the reclaimable-fraction gate, or this test is vacuous'
+        )
+        executed = _vacuum_spy(monkeypatch)
 
         store.maybe_vacuum(now)
 
+        # The stamp alone cannot distinguish this path from the skip path --
+        # both write the same `now` -- so pin that a VACUUM really ran.
+        assert [sql for sql in executed if sql.strip().upper().startswith('VACUUM')], (
+            'stamped without running a VACUUM: the retry rule is not being honoured'
+        )
         # Verify last_vacuum_ts was recorded in meta table
         conn = sqlite3.connect(str(tmp_path / 'db.sqlite'))
         row = conn.execute(
@@ -307,3 +338,814 @@ class TestRetentionAndVacuum:
 
         # should_vacuum still False (only 1h elapsed)
         assert store.should_vacuum(now + 3600) is False
+
+
+# ---------------------------------------------------------------------------
+# Task 3592 step-13: the retention window widens from 24 hours to 30 days
+# ---------------------------------------------------------------------------
+
+DAY = 86_400
+THIRTY_DAYS = 30 * DAY
+
+
+def _count_at(db_path: Path, ts: int) -> int:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute(
+            'SELECT COUNT(*) FROM samples WHERE ts = ?', (ts,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+class TestThirtyDayRetention:
+    """Asserted by BEHAVIOUR, not by signature introspection.
+
+    A default read off the signature would pass against a `cleanup_old` that
+    ignored it; what ε1/ε2 need is that a 29-day-old sample is still in the
+    corpus when the calibration runs.
+    """
+
+    def test_a_row_older_than_the_old_24h_default_now_survives(self, tmp_path: Path):
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        just_over_a_day = now - DAY - 60
+        just_over_thirty_days = now - THIRTY_DAYS - 60
+        store.insert_sample(just_over_a_day, 'runqueue_ratio', 1.0)
+        store.insert_sample(just_over_thirty_days, 'runqueue_ratio', 2.0)
+
+        store.cleanup_old(now)
+
+        assert _count_at(db_path, just_over_a_day) == 1, (
+            '25-hour-old rows must survive the widened window'
+        )
+        assert _count_at(db_path, just_over_thirty_days) == 0
+
+    def test_explicit_override_still_prunes_to_that_window(self, tmp_path: Path):
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        two_hours_old = now - 7200
+        half_an_hour_old = now - 1800
+        store.insert_sample(two_hours_old, 'runqueue_ratio', 1.0)
+        store.insert_sample(half_an_hour_old, 'runqueue_ratio', 2.0)
+
+        store.cleanup_old(now, retain_seconds=3600)
+
+        assert _count_at(db_path, two_hours_old) == 0
+        assert _count_at(db_path, half_an_hour_old) == 1
+
+    def test_the_cutoff_stays_exclusive_exactly_as_today(self, tmp_path: Path):
+        """Only the NUMBER widens: a row exactly at the cutoff still survives."""
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        at_cutoff = now - THIRTY_DAYS
+        one_second_older = at_cutoff - 1
+        store.insert_sample(at_cutoff, 'runqueue_ratio', 1.0)
+        store.insert_sample(one_second_older, 'runqueue_ratio', 2.0)
+
+        store.cleanup_old(now)
+
+        assert _count_at(db_path, at_cutoff) == 1
+        assert _count_at(db_path, one_second_older) == 0
+
+    def test_a_far_future_row_is_pruned_rather_than_outliving_the_corpus(
+        self, tmp_path: Path
+    ):
+        """A past-only cutoff can never reach a clock-skew row.
+
+        `ts` is stamped `int(time.time())` with no monotonicity guard, so an
+        NTP step forward, a VM suspend/resume or a hand-seeded probe row lands
+        a sample beyond every real tick.  Against a past-only cutoff that row
+        is immortal — at 30-day retention it outlives the entire corpus — and
+        it is not inert: every MAX(ts)-anchored consumer is dragged forward
+        with it (the dashboard's recency bound served placeholders for all
+        nine metrics off exactly one such row).
+        """
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        healthy = now - 60
+        a_year_ahead = now + 365 * DAY
+        store.insert_sample(healthy, 'runqueue_ratio', 1.0)
+        store.insert_sample(a_year_ahead, 'runqueue_ratio', 2.0)
+
+        store.cleanup_old(now)
+
+        assert _count_at(db_path, a_year_ahead) == 0, (
+            'a future-dated row survived the sweep and will outlive the corpus'
+        )
+        assert _count_at(db_path, healthy) == 1
+
+    def test_a_backwards_clock_does_not_delete_a_healthy_corpus(self, tmp_path: Path):
+        """Why the future cutoff is `retain_seconds` and not a tight tolerance.
+
+        The skew cuts both ways: a host whose NTP has not synced at boot reads
+        `now` in the PAST, and every real row then looks future-dated.  A tight
+        future tolerance would delete the whole corpus for a clock that is
+        merely hours out.  At ±30 days only a clock wrong by more than a month
+        loses data, and such a host has no usable corpus either way.
+        """
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        real_now = 10_000_000
+        clock_reads = real_now - 3 * DAY  # NTP three days behind
+        store.insert_sample(real_now, 'runqueue_ratio', 1.0)
+        store.insert_sample(real_now - 60, 'runqueue_ratio', 2.0)
+
+        store.cleanup_old(clock_reads)
+
+        assert _count_at(db_path, real_now) == 1, (
+            'a three-day-behind clock deleted rows a healthy sampler had just written'
+        )
+        assert _count_at(db_path, real_now - 60) == 1
+
+    def test_the_future_cutoff_is_exclusive_too(self, tmp_path: Path):
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        at_cutoff = now + THIRTY_DAYS
+        one_second_further = at_cutoff + 1
+        store.insert_sample(at_cutoff, 'runqueue_ratio', 1.0)
+        store.insert_sample(one_second_further, 'runqueue_ratio', 2.0)
+
+        store.cleanup_old(now)
+
+        assert _count_at(db_path, at_cutoff) == 1
+        assert _count_at(db_path, one_second_further) == 0
+
+
+# ---------------------------------------------------------------------------
+# Task 3592 step-15: cleanup_old is interval-gated (decision 4)
+# ---------------------------------------------------------------------------
+
+
+class _DeleteFailingConnection:
+    """A real connection with exactly one statement broken: the DELETE.
+
+    The stamp-after-prune invariant is precisely that the DELETE can fail while
+    the meta write still succeeds, so the injection has to fail that one
+    statement and nothing else. Everything else — the INSERT OR REPLACE
+    ``_set_meta`` issues, commit, close — delegates to the real connection.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def execute(self, sql: str, *args: Any) -> sqlite3.Cursor:
+        if sql.lstrip().upper().startswith('DELETE'):
+            raise sqlite3.OperationalError('injected: DELETE failed')
+        return self._conn.execute(sql, *args)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+
+class TestCleanupIsIntervalGated:
+    """Why this gate exists, pinned so it cannot be "simplified" away.
+
+    `DELETE FROM samples WHERE ts < ?` cannot use idx_samples_metric_ts(metric,
+    ts) — a leading-column index does not serve a bare-ts predicate — so every
+    call is a full table SCAN. Measured at 2.5M rows, a NO-OP cleanup (nothing
+    old enough to delete) costs 106.7 ms; extrapolated to the 12.96M-row
+    30-day steady state that is ~550 ms every 5 s, forever, to delete nothing.
+
+    Two fixes were measured. Adding idx_samples_ts makes the plan an index
+    SEARCH at ~0 ms but grew the probe file 33% (98 -> 130 MB, i.e. 1.62 ->
+    ~2.15 GB at 30 d). The interval gate amortises the same scan to once per
+    interval, where 550 ms is irrelevant, and costs zero bytes. The gate wins
+    on 530 MB and on reusing the should_vacuum/last_vacuum_ts machinery next
+    door; its only cost is up to one interval of over-retention, which is
+    meaningless for a calibration corpus. Doing both would make the index dead
+    weight, so exactly one is taken.
+    """
+
+    def test_the_delete_predicate_really_is_a_full_scan(self, tmp_path: Path):
+        """The measured fact the gate is the answer to — read off the schema."""
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        LoadSampleStore(db_path)
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            plan = ' '.join(
+                str(row[3])
+                for row in conn.execute(
+                    'EXPLAIN QUERY PLAN DELETE FROM samples WHERE ts < ?', (0,)
+                ).fetchall()
+            )
+        finally:
+            conn.close()
+
+        assert 'SCAN samples' in plan, plan
+        assert 'USING INDEX' not in plan, plan
+
+    def test_trailing_windows_query_is_index_backed_and_untouched(self, tmp_path: Path):
+        """The counterpart: this one IS served by the existing index."""
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        LoadSampleStore(db_path)
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            plan = ' '.join(
+                str(row[3])
+                for row in conn.execute(
+                    'EXPLAIN QUERY PLAN SELECT value FROM samples'
+                    ' WHERE metric = ? ORDER BY ts DESC LIMIT ?',
+                    ('runqueue_ratio', 59),
+                ).fetchall()
+            )
+        finally:
+            conn.close()
+
+        assert 'USING INDEX idx_samples_metric_ts' in plan, plan
+
+    def test_virgin_store_is_due_and_running_prunes_and_stamps(self, tmp_path: Path):
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        stale = now - THIRTY_DAYS - 60
+        store.insert_sample(stale, 'runqueue_ratio', 1.0)
+
+        assert store.should_cleanup(now) is True
+        store.cleanup_old(now)
+
+        assert _count_at(db_path, stale) == 0
+        assert store.should_cleanup(now) is False
+
+    def test_a_second_call_in_the_same_interval_does_not_re_scan(self, tmp_path: Path):
+        """Behavioural, not a mock call count: plant an over-age row AFTER."""
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        store.cleanup_old(now)
+
+        planted_after = now - THIRTY_DAYS - 60
+        store.insert_sample(planted_after, 'runqueue_ratio', 1.0)
+        store.cleanup_old(now)
+
+        assert _count_at(db_path, planted_after) == 1, (
+            'the second call in the same interval must not have run the DELETE'
+        )
+
+    def test_one_interval_later_it_runs_again(self, tmp_path: Path):
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        store.cleanup_old(now)
+
+        planted_after = now - THIRTY_DAYS - 60
+        store.insert_sample(planted_after, 'runqueue_ratio', 1.0)
+        later = now + DAY
+        assert store.should_cleanup(later) is True
+        store.cleanup_old(later)
+
+        assert _count_at(db_path, planted_after) == 0
+
+    def test_a_stamp_from_the_future_does_not_disable_the_sweep(self, tmp_path: Path):
+        """The clock steps forward, one tick stamps it, and the skew must heal.
+
+        A plain ``elapsed >= interval`` gate reads a future stamp as "not due"
+        for the whole skew, which is the one case where the suppression is
+        self-sealing: the rows preserved are exactly the future-dated ones
+        ``cleanup_old``'s symmetric cutoff exists to prune, so the corpus
+        cannot recover from the condition that disabled its recovery. Both
+        gates are checked here because ``maybe_vacuum`` is suppressed by the
+        same arithmetic on its own key, and a 30-day corpus that stops being
+        pruned is also one that stops being compacted.
+        """
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        a_year = 365 * DAY
+
+        # ONE tick during the skew, through the public path that stamps both
+        # clocks — not a hand-planted meta row, so what is under test is the
+        # state a real forward step leaves behind.
+        store.cleanup_old(now + a_year)
+        store.maybe_vacuum(now + a_year)
+
+        assert store.should_cleanup(now) is True
+        assert store.should_vacuum(now) is True
+
+        stale = now - THIRTY_DAYS - 60
+        from_the_future = now + THIRTY_DAYS + 60
+        store.insert_sample(stale, 'runqueue_ratio', 1.0)
+        store.insert_sample(from_the_future, 'runqueue_ratio', 2.0)
+        store.cleanup_old(now)
+
+        assert _count_at(db_path, stale) == 0
+        assert _count_at(db_path, from_the_future) == 0, (
+            'the future-dated row survived, so the corpus is still anchored '
+            'forward with no sweep that can reach it'
+        )
+
+    def test_interval_override_is_honoured(self, tmp_path: Path):
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        store.cleanup_old(now)
+
+        planted_after = now - THIRTY_DAYS - 60
+        store.insert_sample(planted_after, 'runqueue_ratio', 1.0)
+        store.cleanup_old(now + 60, interval_seconds=30)
+
+        assert _count_at(db_path, planted_after) == 0
+        assert store.should_cleanup(now + 60, interval_seconds=30) is False
+
+    def test_the_stamp_is_written_only_after_a_successful_prune(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Mirrors maybe_vacuum: a transient failure must not suppress retries.
+
+        A stamp written before the DELETE would silence cleanup for a whole
+        interval on one locked-database error, and the next window would then
+        be double-length.
+
+        Reaching for the private ``_connect`` is deliberate: there is no public
+        seam for "make the DELETE fail and only the DELETE", and failure
+        injection is the recognised reason to reach into internals — read it as
+        that, not as the tests-touch-internals smell. The obvious alternative,
+        chmod(0o444) on the database file, is what this test used to do and it
+        was vacuous: it breaks the meta write too, so a stamp-first
+        implementation satisfies every assertion below.
+        """
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        stale = now - THIRTY_DAYS - 60
+        store.insert_sample(stale, 'runqueue_ratio', 1.0)
+
+        # Bind the real method BEFORE patching — calling store._connect() from
+        # inside the replacement would re-enter the replacement itself.
+        real_connect = store._connect
+        monkeypatch.setattr(
+            store, '_connect', lambda: _DeleteFailingConnection(real_connect())
+        )
+        with pytest.raises(sqlite3.Error):
+            store.cleanup_old(now)
+        monkeypatch.undo()
+
+        assert store._get_meta('last_cleanup_ts') is None, (
+            'a failed prune must leave the clock unstamped'
+        )
+        assert store.should_cleanup(now) is True, (
+            'a failed prune must leave the store still due, not stamped'
+        )
+        store.cleanup_old(now)
+        assert _count_at(db_path, stale) == 0
+
+    def test_the_gate_reuses_the_vacuum_machinery_not_a_new_mechanism(
+        self, tmp_path: Path
+    ):
+        """Two meta keys side by side, and the two gates stay independent."""
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+
+        store.cleanup_old(now)
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            keys = {row[0] for row in conn.execute('SELECT key FROM meta').fetchall()}
+        finally:
+            conn.close()
+        assert 'last_cleanup_ts' in keys
+        assert 'last_vacuum_ts' not in keys, (
+            'cleanup must not stamp the vacuum clock — the two gates are separate'
+        )
+        assert store.should_vacuum(now) is True
+
+
+# ---------------------------------------------------------------------------
+# Review suggestion 1: the daily VACUUM was sized for 24h retention, not 30d
+# ---------------------------------------------------------------------------
+
+
+def _bulk_insert(db_path: Path, metric: str, first_ts: int, count: int, step: int = 5) -> None:
+    """Seed rows straight through sqlite3 — insert_sample commits per row."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executemany(
+            'INSERT INTO samples (ts, metric, value) VALUES (?, ?, ?)',
+            [(first_ts + i * step, metric, float(i % 97)) for i in range(count)],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _vacuum_spy(monkeypatch) -> list[str]:
+    """Return a list that accumulates every SQL statement the store executes.
+
+    maybe_vacuum opens its own connection with sqlite3.connect rather than
+    self._connect (it needs isolation_level=None so VACUUM is not inside a
+    transaction), so the seam is the module's sqlite3 attribute.
+    """
+    import sampler.store as store_module
+
+    real_connect = store_module.sqlite3.connect
+    executed: list[str] = []
+
+    class Spy:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args, **kwargs):
+            executed.append(sql)
+            return self._conn.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    monkeypatch.setattr(
+        store_module.sqlite3, 'connect', lambda *a, **kw: Spy(real_connect(*a, **kw))
+    )
+    return executed
+
+
+class TestVacuumIsGatedOnThereBeingSomethingToReclaim:
+    """VACUUM rewrites the WHOLE file, so its cost tracks the 30-day size.
+
+    MEASURED on this host against a probe carrying the real schema and the real
+    25-metrics-per-5s-tick vocabulary, built out to the 30-day steady state
+    (12,960,000 rows, 1.16 GB after packing):
+
+      VACUUM, no free pages ............................... 15.9 s
+      VACUUM after one steady-state day ................... 15.5 s
+      ...and it reclaimed 2 MB of 1.160 GB ................ 0.17%
+
+    The reason it reclaims so little is the finding that decides the design:
+    free pages ARE fully reused. One steady-state day — prune the oldest day,
+    write a new one — left freelist_count at 9232 immediately after the DELETE
+    and at 0 after the day's inserts, with page_count up 0.25%. So at steady
+    state the file does not bloat, and the unconditional daily VACUUM was
+    buying ~0.17% of space for ~15 s.
+
+    Fifteen seconds matters because the systemd unit is Type=oneshot: the whole
+    VACUUM is one tick, so the corpus ε1/ε2 calibrate against would get a daily
+    ~15 s hole. And a VACUUM needs ~as much free space again for its temp copy,
+    so on a tight filesystem it raises, is swallowed by the existing
+    `except Exception`, and the file is never compacted at all.
+
+    Gating on free pages keeps the compaction where compaction is actually
+    wanted — after a retention change or a post-outage bulk prune — and skips
+    it in the steady state where it accomplishes nothing.
+    """
+
+    def test_reclaimable_fraction_is_zero_with_no_free_pages(self, tmp_path: Path):
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        _bulk_insert(store.db_path, 'psi_cpu_some_avg10', 1_000_000, 5000)
+
+        assert store.reclaimable_fraction() == 0.0
+
+    def test_reclaimable_fraction_is_high_after_a_bulk_prune(self, tmp_path: Path):
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        _bulk_insert(store.db_path, 'psi_cpu_some_avg10', 1_000_000, 20_000)
+        now = 1_000_000 + 20_000 * 5
+        store.cleanup_old(now, retain_seconds=100)
+
+        assert store.reclaimable_fraction() > 0.10
+
+    def test_a_steady_state_store_runs_no_vacuum(self, tmp_path: Path, monkeypatch):
+        """The 15 s daily hole this closes. Nothing to reclaim -> do not rewrite."""
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        _bulk_insert(store.db_path, 'psi_cpu_some_avg10', 1_000_000, 5000)
+        executed = _vacuum_spy(monkeypatch)
+
+        store.maybe_vacuum(1_000_000)
+
+        assert not [sql for sql in executed if sql.strip().upper().startswith('VACUUM')], (
+            'VACUUM rewrote a file with no free pages'
+        )
+
+    def test_the_clock_is_still_stamped_so_the_check_is_not_per_tick(
+        self, tmp_path: Path
+    ):
+        """A deliberate skip is a successful evaluation, not a transient failure.
+
+        Stamping keeps the pragma read to once per interval rather than once
+        per 5 s tick, and it is what lets the four pre-existing interval tests
+        above go on describing maybe_vacuum's contract unchanged.
+        """
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        _bulk_insert(store.db_path, 'psi_cpu_some_avg10', 1_000_000, 5000)
+
+        store.maybe_vacuum(1_000_000)
+
+        assert store.should_vacuum(1_000_000 + 1) is False
+        assert store.should_vacuum(1_000_000 + 86400) is True
+
+    def test_a_bulk_prune_is_still_compacted(self, tmp_path: Path, monkeypatch):
+        """The case the VACUUM exists for must keep working."""
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        _bulk_insert(store.db_path, 'psi_cpu_some_avg10', 1_000_000, 20_000)
+        now = 1_000_000 + 20_000 * 5
+        store.cleanup_old(now, retain_seconds=100)
+        size_before = store.db_path.stat().st_size
+        executed = _vacuum_spy(monkeypatch)
+
+        store.maybe_vacuum(now)
+
+        assert [sql for sql in executed if sql.strip().upper().startswith('VACUUM')], (
+            'a file that is mostly free pages was left uncompacted'
+        )
+        assert store.db_path.stat().st_size < size_before
+
+
+# ---------------------------------------------------------------------------
+# Review suggestion 1: one tick is one connection and one transaction
+# ---------------------------------------------------------------------------
+
+
+class _CountingConnection:
+    """A connection that records its commits and forwards everything else.
+
+    A proxy and not a patched method: ``sqlite3.Connection`` is a C type, so
+    its instances accept no attribute assignment and ``commit`` cannot be
+    wrapped in place.
+    """
+
+    def __init__(self, conn, commits: list[str]):
+        self._conn = conn
+        self._commits = commits
+
+    def __getattr__(self, name: str):
+        return getattr(self._conn, name)
+
+    def commit(self) -> None:
+        self._commits.append('commit')
+        self._conn.commit()
+
+
+class _ConnectionSpy(NamedTuple):
+    opened: list[str]
+    commits: list[str]
+
+
+def _connect_spy(monkeypatch) -> _ConnectionSpy:
+    """Accumulate one entry per connection the store opens, and per commit.
+
+    The seam is the module's ``sqlite3`` attribute, as ``_vacuum_spy`` above
+    already uses. Counting CONNECTIONS and COMMITS rather than timing the tick
+    is deliberate: the cost being bought back is one connect + five durability
+    pragmas + one ``synchronous=FULL`` fsync per row, and a wall-clock
+    assertion would be flaky on a loaded host while measuring the same thing
+    indirectly. The two counts are kept apart because they pin different
+    properties — one connection is the pragma cost, one commit is the fsync
+    cost AND the atomicity — and a per-row ``execute(); commit()`` loop on a
+    single connection satisfies the first while destroying the second.
+    """
+    import sampler.store as store_module
+
+    real_connect = store_module.sqlite3.connect
+    spy = _ConnectionSpy(opened=[], commits=[])
+
+    def counting_connect(*args, **kwargs):
+        spy.opened.append(str(args[0]) if args else '')
+        return _CountingConnection(real_connect(*args, **kwargs), spy.commits)
+
+    monkeypatch.setattr(store_module.sqlite3, 'connect', counting_connect)
+    return spy
+
+
+class TestWriteTickIsOneConnectionAndOneTransaction:
+    """The per-row write path did not survive the 9 -> 25 metric widening.
+
+    MEASURED in this worktree against warmed stores on ext4 (200 ticks of
+    history), the two paths INTERLEAVED in one process so host noise hits both,
+    40 ticks each:
+
+      per-row writes, the 25-metric tick ......... 309.6 ms median (max 592.8)
+      the same 25 rows, one connection, one txn ..  13.2 ms median (max  34.6)
+
+    Every row took its own connection, its own five durability pragmas and its
+    own ``synchronous=FULL`` commit, and each non-PSI metric took a SECOND
+    connection for its trailing window: ~44 connections and ~25 fsyncs per
+    tick. At the paired timer's 5 s cadence that is 6.2% duty forever, on a
+    host that also runs seven orchestrators — the same order of magnitude as
+    the ~550 ms/tick cleanup scan this change goes to considerable lengths to
+    gate away. Batched it is 0.26%.
+
+    Atomicity comes with it, and it is not incidental: the corpus ε1/ε2
+    calibrate against is read tick-by-tick, and a crash between the PSI rows
+    and the windowed rows used to leave a half-written tick in it.
+    """
+
+    def _tick(self, store, now: int, leaves: int = 7) -> None:
+        store.write_tick(
+            now,
+            unwindowed={'psi_cpu_some_avg10': 1.0, 'psi_mem_full_avg10': 2.0},
+            windowed={
+                'verify_concurrency': 3.0,
+                **{f'own_cpu_some10:leaf{i}': float(i) for i in range(leaves)},
+            },
+        )
+
+    def test_a_tick_opens_one_connection(self, tmp_path: Path, monkeypatch):
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        spy = _connect_spy(monkeypatch)
+
+        self._tick(store, 1_000_000)
+
+        assert len(spy.opened) == 1, (
+            f'one tick opened {len(spy.opened)} connections; the point of '
+            'write_tick is that it opens exactly one'
+        )
+
+    def test_the_cost_of_a_tick_does_not_scale_with_its_metric_count(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The property the measurement above is really about.
+
+        Pinning the ABSOLUTE connection count would go red on any unrelated
+        retention change; pinning that the count is INDEPENDENT of how many
+        metrics the tick carries is the thing that stops the regression, and it
+        is what a per-row loop can never satisfy — the cgroup leaf count is
+        discovered per tick and is not bounded by anything here.
+        """
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+
+        spy = _connect_spy(monkeypatch)
+        self._tick(store, 1_000_000, leaves=1)
+        few = len(spy.opened)
+
+        spy.opened.clear()
+        self._tick(store, 1_000_005, leaves=100)
+        many = len(spy.opened)
+
+        # The floor its sibling in test_load_sampler.py already carries: an
+        # equality between two counts holds trivially at 0 == 0 if the spy ever
+        # detaches from the seam, and would then pin nothing at all.
+        assert few >= 1, 'the connect spy never fired'
+        assert few == many, (
+            f'a 4-metric tick opened {few} connections and a 103-metric tick '
+            f'opened {many} — the write path still scales with metric count'
+        )
+
+    def test_a_tick_commits_exactly_once_whatever_it_carries(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Atomicity and fsync cost, measured where they live: the commit count.
+
+        Its failure-injection sibling below raises inside the row-BUILDING
+        loop, before any INSERT is issued, so it only witnesses "an exception
+        before the first write leaves no rows". A per-row ``execute();
+        commit()`` loop passes that test AND the one-connection test above,
+        while destroying both properties ``write_tick`` exists for: the tick
+        lands whole or not at all, and its fsync cost is flat in the metric
+        count rather than linear in it.
+        """
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+
+        spy = _connect_spy(monkeypatch)
+        self._tick(store, 1_000_000, leaves=1)
+        few = len(spy.commits)
+
+        spy.commits.clear()
+        self._tick(store, 1_000_005, leaves=100)
+        many = len(spy.commits)
+
+        assert (few, many) == (1, 1), (
+            f'a 4-metric tick committed {few} times and a 103-metric tick '
+            f'{many} — one tick is meant to be one transaction'
+        )
+
+    def test_a_tick_that_raises_partway_leaves_no_rows_at_all(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Atomicity: a half-written tick must never reach the corpus.
+
+        Under the per-row path the PSI rows were already committed by the time
+        a windowed metric failed, so the tick landed truncated and silently —
+        ε1/ε2 would read it as a tick on which those metrics were unreadable.
+        """
+        import sampler.store as store_module
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        calls: list[int] = []
+
+        def fmean_that_fails_on_the_second_metric(values):
+            calls.append(1)
+            if len(calls) >= 2:
+                raise RuntimeError('window computation failed mid-tick')
+            return sum(values) / len(values)
+
+        monkeypatch.setattr(
+            store_module.statistics, 'fmean', fmean_that_fails_on_the_second_metric
+        )
+
+        with pytest.raises(RuntimeError):
+            self._tick(store, 1_000_000)
+
+        conn = sqlite3.connect(str(store.db_path))
+        try:
+            rows = conn.execute(
+                'SELECT COUNT(*) FROM samples WHERE ts = ?', (1_000_000,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert rows == 0, f'a failed tick left {rows} rows behind'
+
+    def test_unwindowed_rows_keep_null_windows_and_windowed_rows_keep_theirs(
+        self, tmp_path: Path
+    ):
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        store.write_tick(
+            1_000_000,
+            unwindowed={'psi_cpu_some_avg10': 1.5},
+            windowed={'verify_concurrency': 4.0},
+        )
+
+        conn = sqlite3.connect(str(store.db_path))
+        try:
+            rows = {
+                metric: (mean, mx)
+                for metric, mean, mx in conn.execute(
+                    'SELECT metric, window_mean, window_max FROM samples'
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+        assert rows['psi_cpu_some_avg10'] == (None, None)
+        assert rows['verify_concurrency'] == (4.0, 4.0)
+
+    def test_the_batched_windows_agree_with_the_trailing_window_helper(
+        self, tmp_path: Path
+    ):
+        """One home for the window arithmetic, reconciled (heuristic 11).
+
+        ``write_tick`` computes the windows on its own connection rather than
+        calling the public helper, so this is the test that stops the two
+        drifting apart.
+        """
+        from sampler.store import LoadSampleStore
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        for i in range(5):
+            store.insert_sample(1_000_000 + i, 'verify_concurrency', float(i))
+        expected = store.trailing_window('verify_concurrency', 99.0)
+
+        store.write_tick(
+            1_000_010, unwindowed={}, windowed={'verify_concurrency': 99.0}
+        )
+
+        conn = sqlite3.connect(str(store.db_path))
+        try:
+            got = conn.execute(
+                'SELECT window_mean, window_max FROM samples WHERE ts = ?',
+                (1_000_010,),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert got == expected

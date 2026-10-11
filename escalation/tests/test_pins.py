@@ -33,7 +33,7 @@ from pathlib import Path
 import pytest
 
 from escalation.models import BORN_AT_L2_SEVERITIES, KNOWN_SEVERITIES, Escalation
-from escalation.pins import PinClass, PinRecord, PinReport, classify_pins
+from escalation.pins import PinClass, PinRecord, PinReport, classify_pins, is_queue_handoff
 
 # ---------------------------------------------------------------------------
 # step-3 — pure type-surface contract
@@ -113,7 +113,9 @@ class TestPinsModuleExports:
         that each name exists and is importable."""
         import escalation.pins as pins_mod
 
-        assert {'PinClass', 'PinRecord', 'PinReport', 'classify_pins'} <= set(pins_mod.__all__)
+        assert {
+            'PinClass', 'PinRecord', 'PinReport', 'classify_pins', 'is_queue_handoff',
+        } <= set(pins_mod.__all__)
 
 
 # ---------------------------------------------------------------------------
@@ -450,7 +452,7 @@ class TestInfoAtL2Coupling:
         self, tmp_path: Path,
     ) -> None:
         from escalation.queue import EscalationQueue
-        from escalation.server import _derive_l2_severity
+        from escalation.server import _derive_l2_severity, _read_members
 
         queue = EscalationQueue(tmp_path / 'esc')
         queue.submit(Escalation(
@@ -464,7 +466,7 @@ class TestInfoAtL2Coupling:
 
         # Producer side: an all-info member cluster derives severity='info' —
         # this is what an omitted promote_to_l2(severity=...) resolves to.
-        derived = _derive_l2_severity(queue, ['esc-42-1', 'esc-42-2'])
+        derived = _derive_l2_severity(_read_members(queue, ['esc-42-1', 'esc-42-2']))
         assert derived == 'info'
 
         # The shape promote_to_l2's create path mints from `derived`: an
@@ -790,3 +792,162 @@ class TestRealEscalationRecordsClassify:
         )
 
         assert report.queue_handoff == ('esc-42-1',)
+
+
+# ---------------------------------------------------------------------------
+# task 4541 RC#1 — "is everything that pins this task already before a human?"
+# ---------------------------------------------------------------------------
+
+
+class TestPinnedOnlyByHumanParked:
+    """``pinned_only_by_human_parked``: the streak alarm's suppression predicate.
+
+    True only when the read succeeded and EVERY record in the same
+    ``queue_handoff`` bucket ``PinReport.pins`` reads sits at ``level >= 2``.
+    Every uncertain input answers False, because a false True silences the
+    detector for a genuinely stranded task.
+    """
+
+    @staticmethod
+    def _parked(
+        records: typing.Any,
+        *,
+        live_claimant: bool = False,
+        live_claimant_id: str | None = None,
+    ) -> bool:
+        from escalation.pins import pinned_only_by_human_parked
+
+        report = classify_pins(
+            '42', records, live_claimant=live_claimant, live_claimant_id=live_claimant_id,
+        )
+        return pinned_only_by_human_parked(report, records)
+
+    def test_a_single_l2_is_human_parked(self) -> None:
+        assert self._parked([_esc(level=2)]) is True
+
+    def test_a_level_above_two_is_human_parked(self) -> None:
+        assert self._parked([_rec(level=3)]) is True
+
+    def test_an_l1_only_hold_is_not(self) -> None:
+        assert self._parked([_rec(level=1)]) is False
+
+    def test_an_l1_beside_an_l2_is_not(self) -> None:
+        """A pin nobody has promoted is still waiting on the auto-watcher."""
+        records = [_rec(id='esc-42-1', level=2), _rec(id='esc-42-2', level=1)]
+        assert self._parked(records) is False
+
+    def test_an_info_record_beside_an_l2_is_ignored(self) -> None:
+        """Link 1: an info record never pins, so it cannot spoil the answer."""
+        records = [_rec(id='esc-42-1', level=2), _rec(id='esc-42-2', severity='info')]
+        assert self._parked(records) is True
+
+    def test_a_dead_l0_beside_an_l2_is_ignored(self) -> None:
+        """A dead-filer L0 does not pin recovery (task 3541); the reaper owns it."""
+        records = [
+            _rec(id='esc-42-1', level=2),
+            _rec(id='esc-42-2', level=0, severity='blocking', filing=OTHER_ID),
+        ]
+        assert self._parked(records, live_claimant=False) is True
+
+    def test_a_dead_l0_alone_is_not(self) -> None:
+        """Nothing pins, so nothing is parked before a human."""
+        assert self._parked([_rec(level=0, severity='blocking')]) is False
+
+    def test_info_only_is_not(self) -> None:
+        assert self._parked([_rec(level=2, severity='info')]) is False
+
+    def test_no_records_is_not(self) -> None:
+        assert self._parked([]) is False
+
+    def test_store_unavailable_is_not(self) -> None:
+        """``records=None`` means the read FAILED (esc-3163), not "no records".
+
+        A store that cannot be read proves nothing about who holds the task,
+        so it must never suppress the alarm.
+        """
+        assert self._parked(None) is False
+
+    @pytest.mark.parametrize('severity', ['', None, 'warn'])
+    def test_an_unknown_severity_is_judged_on_its_level(self, severity: str | None) -> None:
+        assert self._parked([_rec(level=2, severity=severity)]) is True
+        assert self._parked([_rec(level=1, severity=severity)]) is False
+
+    def test_a_born_at_l2_severity_at_level_zero_is_not(self) -> None:
+        """Link 3b's contradictory state is no proof that a human holds the task."""
+        assert self._parked([_rec(level=0, severity='critical')]) is False
+
+    def test_a_live_filer_l0_beside_an_l2_is_not(self) -> None:
+        records = [
+            _rec(id='esc-42-1', level=2),
+            _rec(id='esc-42-2', level=0, severity='blocking', filing=LIVE_ID),
+        ]
+        assert self._parked(records, live_claimant=True, live_claimant_id=LIVE_ID) is False
+
+    def test_is_pure(self) -> None:
+        records = [_rec(id='esc-42-1', level=2), _rec(id='esc-42-2', severity='info')]
+        before = [dataclasses.replace(rec) for rec in records]
+
+        first = self._parked(records)
+        second = self._parked(records)
+
+        assert records == before
+        assert first == second
+
+    @pytest.mark.parametrize('level', ['3', 2.9, True, None])
+    def test_a_level_that_is_not_an_int_is_not(self, level: typing.Any) -> None:
+        """Never coerced: ``int()`` would read ``'3'`` and ``2.9`` as human levels."""
+        assert self._parked([_rec(level=level)]) is False
+
+    def test_a_handoff_id_the_records_do_not_carry_is_not(self) -> None:
+        """A report and records that disagree prove nothing about who holds the task."""
+        from escalation.pins import pinned_only_by_human_parked
+
+        report = classify_pins('42', [_rec(id='esc-42-1', level=2)], live_claimant=False)
+
+        assert pinned_only_by_human_parked(report, [_rec(id='esc-42-2', level=2)]) is False
+
+
+# ---------------------------------------------------------------------------
+# is_queue_handoff — the one-record gating answer (task 5221)
+# ---------------------------------------------------------------------------
+
+#: (record, expected is_queue_handoff) over the severity x level table.
+_HANDOFF_TABLE: list[tuple[Escalation, bool]] = [
+    # Link 1: info never gates, at any level, whatever its spelling.
+    (_esc(id='esc-42-1', severity='info', level=0), False),
+    (_esc(id='esc-42-2', severity='info', level=1), False),
+    (_esc(id='esc-42-3', severity='info', level=2), False),
+    (_esc(id='esc-42-4', severity=' INFO ', level=0), False),
+    # Link 3: queue-backed L1/L2 handoffs gate.
+    (_esc(id='esc-42-5', severity='blocking', level=1), True),
+    (_esc(id='esc-42-6', severity='blocking', level=2), True),
+    # Link 4: with no live id to compare, an L0 fails safe to a handoff.
+    (_esc(id='esc-42-7', severity='blocking', level=0), True),
+    (_esc(id='esc-42-8', severity='blocking', level=0, filing_claimant_run_id=LIVE_ID), True),
+    # Link 3b: born-at-L2 severities gate at either level.
+    (_esc(id='esc-42-9', severity='critical', level=2), True),
+    (_esc(id='esc-42-10', severity='critical', level=0), True),
+    # Link 2: an unknown severity fails safe to a handoff.
+    (_esc(id='esc-42-11', severity='', level=2), True),
+    (_esc(id='esc-42-12', severity='weird', level=2), True),
+]
+
+
+class TestIsQueueHandoff:
+    """``is_queue_handoff`` answers "does this ONE open record gate a live run?"
+    by delegating to the shared chain, never by a second predicate (INV-5)."""
+
+    @pytest.mark.parametrize(('record', 'expected'), _HANDOFF_TABLE, ids=lambda v: getattr(v, 'id', None))
+    def test_answer_over_the_severity_level_table(self, record: Escalation, expected: bool) -> None:
+        assert is_queue_handoff(record) is expected
+
+    @pytest.mark.parametrize(('record', 'expected'), _HANDOFF_TABLE, ids=lambda v: getattr(v, 'id', None))
+    def test_parity_with_the_shared_chain(self, record: Escalation, expected: bool) -> None:
+        report = classify_pins(record.task_id, [record], live_claimant=True)
+        assert is_queue_handoff(record) == (record.id in report.queue_handoff)
+
+    @pytest.mark.parametrize(('record', 'expected'), _HANDOFF_TABLE, ids=lambda v: getattr(v, 'id', None))
+    def test_is_pure(self, record: Escalation, expected: bool) -> None:
+        before = record.to_dict()
+        is_queue_handoff(record)
+        assert record.to_dict() == before

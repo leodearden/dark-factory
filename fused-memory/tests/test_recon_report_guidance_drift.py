@@ -1095,3 +1095,25 @@ class TestEveryRegisteredToolReachesTheAgentSomehow:
             '(cli_stage_runner.py); if that is genuinely no longer true, the disallow '
             'list is what should have changed first.'
         )
+
+
+class TestSupersedesPlaceholderIsMeaningful:
+    """task-4653: the rendered add_finding example must show what `supersedes`
+    TAKES, not render_call's generic `<supersedes>` fallback.
+
+    Not tautological against the signature: _RECON_REPORT_PLACEHOLDERS is a
+    second, hand-maintained table, and a parameter absent from it renders as
+    `<param_name>` — syntactically fine, and useless to the agent reading it,
+    since the value required here is a finding_id from an earlier response.
+    """
+
+    def test_rendered_guidance_shows_a_curated_supersedes_placeholder(self):
+        rendered = render_recon_report_tool_guidance()
+        assert 'supersedes=' in rendered, (
+            'the rendered guidance shows no supersedes kwarg at all'
+        )
+        assert 'supersedes=<supersedes>' not in rendered, (
+            'supersedes rendered with render_call()\'s generic fallback — add a '
+            'curated entry to _RECON_REPORT_PLACEHOLDERS naming what it takes '
+            '(a finding_id).'
+        )

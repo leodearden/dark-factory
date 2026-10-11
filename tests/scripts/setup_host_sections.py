@@ -39,22 +39,62 @@ while letting a future caller silently lose the observability.
 Generalized from the reference implementation in
 tests/scripts/test_check_orchestrator_unit_parity.py (task 3424) and migrated
 onto this module by task 3909, so all four parity suites now share one slicer,
-one preamble and one stub. The stub directory's own PATH literal is owned here
-too, by `stub_bin_dir`: a caller that drops stubs of its own alongside the
-harness's `systemctl` imports that accessor instead of re-deriving
-``tmp_path / "stub-bin"`` and depending on this module's private choice by
+one preamble and one stub.
+
+THIS MODULE IS NOW A THIN BINDER. Task 4488 needed the same slicer for
+export-data.sh and import-data.sh, so the script-agnostic core — `find_in_code`,
+`slice_section`, `slice_shell_function`, `stub_bin_dir`, `write_stub` and the
+generic runner — moved to tests/scripts/shell_sections.py parameterized by
+script path. What stays here is exactly what is SETUP-HOST-SPECIFIC: the path
+binding, the four log shims, the `_parity_verdict` preamble, the recording
+`systemctl` stub, and the checker/unit helpers. The public API is unchanged
+byte-for-byte, so this module's four consumer suites needed no edits and are
+the regression net for that move.
+
+`stub_bin_dir` and `write_stub` are RE-EXPORTED rather than re-implemented: the
+stub directory's PATH literal is owned once, in shell_sections. A caller that
+drops stubs of its own alongside the harness's `systemctl` imports that
+accessor — from either module, they are the same function — instead of
+re-deriving ``tmp_path / "stub-bin"`` and depending on a private choice by
 string equality.
 """
 
 from __future__ import annotations
 
-import os
 import pathlib
 import subprocess
 from collections.abc import Iterable
 
-REPO_ROOT = pathlib.Path(__file__).parents[2]
+from shell_sections import (
+    REPO_ROOT,
+    run_with_preamble,
+    stub_bin_dir,
+    write_stub,
+)
+from shell_sections import slice_section as _slice_section
+from shell_sections import slice_shell_function as _slice_shell_function
+
 SETUP_HOST_PATH = REPO_ROOT / "scripts" / "setup-host.sh"
+
+# Re-exported so `from setup_host_sections import stub_bin_dir, write_stub`
+# keeps resolving for this module's consumers; they are shell_sections' own
+# functions, not copies.
+__all__ = [
+    "REPO_ROOT",
+    "SETUP_HOST_PATH",
+    "SYSTEMCTL_LOG",
+    "checker_repo",
+    "enabled_units",
+    "run_section",
+    "setup_host_text",
+    "slice_section",
+    "slice_shell_function",
+    "stub_bin_dir",
+    "systemctl_calls",
+    "usage_error_checker",
+    "write_checker",
+    "write_stub",
+]
 
 # The four logging shims, reduced to PLAIN TEXT so assertions can match on
 # prefixes without ANSI escapes. Prefixes mirror the reference harness.
@@ -112,144 +152,27 @@ def setup_host_text() -> str:
     return SETUP_HOST_PATH.read_text(encoding="utf-8")
 
 
-def stub_bin_dir(tmp_path: pathlib.Path) -> pathlib.Path:
-    """The (created) directory `run_section` prepends to PATH for *tmp_path*.
-
-    THE PATH LITERAL LIVES HERE, ONCE. Callers that need to drop their own
-    stubs alongside the harness's `systemctl` previously re-derived
-    ``tmp_path / "stub-bin"`` and depended on this module's private choice by
-    string equality — a rename here would silently drop their stubs off PATH.
-    Going through this accessor makes that coupling an import instead.
-    """
-    stub_bin = tmp_path / "stub-bin"
-    stub_bin.mkdir(exist_ok=True)
-    return stub_bin
-
-
-def write_stub(stub_bin: pathlib.Path, name: str, body: str) -> pathlib.Path:
-    """Drop an executable bash stub *name* carrying *body* into *stub_bin*."""
-    path = stub_bin / name
-    path.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8")
-    path.chmod(0o755)
-    return path
-
-
-def _find_in_code(text: str, marker: str, *, start: int = 0) -> int:
-    """Index of the first occurrence of *marker* on a NON-COMMENT line.
-
-    Enforces this module's "MARKERS ARE CODE, NOT COMMENT PROSE" rule rather
-    than merely stating it, and matches the discovery rule the structural sweep
-    in test_check_dashboard_unit_parity.py::_parity_call_sites already applies
-    (`line.lstrip().startswith("#")`).
-
-    Not cosmetic. MEASURED before this existed: a plain `text.find` for
-    `_orch_parity_script=` landed on setup-host.sh's own harness-constraint
-    COMMENT, which quotes the anchor, and the resulting slice reached back over
-    189 lines of real installer code — including an `install -m 0755` writing
-    into `$HOME`. These slices are EXECUTED, so that is a test running against
-    the developer's real home directory.
-
-    Returns -1 when *marker* appears only in comments (or not at all), so the
-    caller raises its own self-naming AssertionError.
-    """
-    pos = text.find(marker, start)
-    while pos != -1:
-        line_start = text.rfind("\n", 0, pos) + 1
-        if not text[line_start:pos].lstrip().startswith("#"):
-            return pos
-        pos = text.find(marker, pos + 1)
-    return -1
-
-
 def slice_section(
     start_marker: str, end_marker: str, *, end_after: str | None = None
 ) -> str:
-    """Return setup-host.sh from the line carrying *start_marker* through *end_marker*.
+    """`shell_sections.slice_section` bound to setup-host.sh — see it for the rules.
 
-    The slice runs from the START of the line containing the first instance of
-    *start_marker* through the END of the line containing the first
-    *end_marker* at or after it — both endpoints derived, so the slice survives
-    a reflow of the block.
-
-    Every marker is located on a NON-COMMENT line (see `_find_in_code`): a
-    comment that quotes an anchor is prose about the code, not the code.
-
-    *end_after* is an optional THIRD anchor. When given, the search for
-    *end_marker* begins at it rather than at *start_marker*, so a slice can be
-    made to run THROUGH an inner construct that closes with the same token —
-    the orchestrator installer slice must end at the column-0 `fi` closing the
-    INSTALL construct, not at the gate's own, which is the first one after the
-    start.
-
-    Deliberately an ANCHOR rather than the counted `occurrence` parameter task
-    3557 deleted as dead. "The second `fi`" is a number that shifts silently
-    the moment the block is reflowed — re-pointing the slice at a region nobody
-    chose — whereas a marker that moves out from under the slice fails loudly,
-    which is the same reason 3557 removed the counted form.
-
-    Raises AssertionError NAMING the missing marker when any is absent. That
-    matters: the silent alternative is a slice of the wrong (or empty) region,
-    which runs cleanly and produces a vacuously green test — the same
-    "reported green because it never ran" failure these tests exist to catch.
+    Endpoints derived from CODE anchors (never line numbers), *end_after* an
+    optional third anchor, and a missing marker raises an AssertionError naming
+    it rather than silently slicing the wrong region.
     """
-    text = setup_host_text()
-
-    pos = _find_in_code(text, start_marker)
-    assert pos != -1, (
-        f"start_marker {start_marker!r} not found in {SETUP_HOST_PATH} on a "
-        f"non-comment line. A renamed anchor must fail here, not slice an "
-        f"empty region."
+    return _slice_section(
+        SETUP_HOST_PATH, start_marker, end_marker, end_after=end_after
     )
-
-    start = text.rfind("\n", 0, pos) + 1
-
-    search_from = pos
-    if end_after is not None:
-        after_pos = _find_in_code(text, end_after, start=pos)
-        assert after_pos != -1, (
-            f"end_after {end_after!r} not found in {SETUP_HOST_PATH} on a "
-            f"non-comment line at or after {start_marker!r}."
-        )
-        search_from = after_pos
-
-    end_pos = text.find(end_marker, search_from)
-    # Names whichever anchor the search actually started from, so the message
-    # points at the region that was searched rather than at a marker that was
-    # found.
-    assert end_pos != -1, (
-        f"end_marker {end_marker!r} not found in {SETUP_HOST_PATH} at or after "
-        f"{end_after if end_after is not None else start_marker!r}."
-    )
-    # Search for the line end from the marker's LAST character, not its first.
-    # An end_marker may itself span lines (`"\nfi\n"` is the natural way to name
-    # a column-0 `fi` without also matching an indented inner one); starting the
-    # search at end_pos would then land on the marker's own leading newline and
-    # cut the slice one line short — dropping the very `fi` it was asked for.
-    marker_last = end_pos + len(end_marker) - 1
-    line_end = text.find("\n", marker_last)
-    end = len(text) if line_end == -1 else line_end + 1
-
-    return text[start:end]
 
 
 def slice_shell_function(name: str) -> str:
-    """Return setup-host.sh's ``name() {`` ... column-0 ``}`` definition, verbatim.
+    """`shell_sections.slice_shell_function` bound to setup-host.sh.
 
-    A slice that CALLS a helper defined elsewhere in the file dies with exit
-    127 under the preamble, which knows only the four logging shims. Prepending
-    the REAL definition is what keeps such a section runnable WITHOUT giving up
-    what these tests are for: defining a copy of the helper in `_preamble`
-    instead would make every assertion downstream a claim about the harness's
-    own bash, green no matter what the shipped helper does — the same
-    "verdict manufactured by the mechanism" failure a behavioural test exists
-    to catch.
-
-    Both endpoints are derived, as in `slice_section`: the header line, and the
-    first column-0 ``}`` at or after it. A helper whose body ever grew a
-    column-0 ``}`` of its own would slice short and fail LOUDLY under `bash`,
-    not silently.
+    Lifts the SHIPPED definition of ``name``, so a slice that calls it exercises
+    the installer's own helper rather than a copy this harness wrote.
     """
-    return slice_section(f"{name}() {{", "\n}\n")
+    return _slice_shell_function(SETUP_HOST_PATH, name)
 
 
 def run_section(
@@ -268,24 +191,16 @@ def run_section(
     ``tmp_path / SYSTEMCTL_LOG`` before exiting 0 — see the module docstring
     for why that is unconditional.
     """
-    stub_bin = stub_bin_dir(tmp_path)
     write_stub(
-        stub_bin,
+        stub_bin_dir(tmp_path),
         "systemctl",
         f"printf '%s\\n' \"$*\" >> {tmp_path / SYSTEMCTL_LOG}\nexit 0\n",
     )
-
-    script = tmp_path / "section.sh"
-    script.write_text(
-        _preamble(repo_root, unit_dir) + section_text,
-        encoding="utf-8",
-    )
-
-    env = dict(os.environ)
-    env["PATH"] = f"{stub_bin}:{env.get('PATH', '')}"
-    env.update(env_extra or {})
-    return subprocess.run(
-        ["bash", str(script)], capture_output=True, text=True, env=env
+    return run_with_preamble(
+        tmp_path,
+        _preamble(repo_root, unit_dir),
+        section_text,
+        env_extra=env_extra,
     )
 
 

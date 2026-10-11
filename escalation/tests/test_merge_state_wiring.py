@@ -15,9 +15,7 @@ precisely because this module is NOT re-exported from the package ``__init__``.
 Harness patterns are taken wholesale from the existing suite: ``_stub_git_ops``
 / ``_make_config`` (test_merge_status_git_authority.py), ``_make_orch_config`` /
 ``_make_registry`` (test_server_chokepoint.py).  The three merge-tool invocation
-wrappers, which the suite had re-typed verbatim in four modules, are imported
-from ``_merge_tool_calls`` instead — see that module for why the copies were not
-migrated here too.
+wrappers come from ``_merge_tool_calls``, shared with the rest of the suite.
 """
 from __future__ import annotations
 
