@@ -261,7 +261,7 @@ The judge arms' own behaviour given a slate, and the rater verdicts on pairs alr
 
 ### 13.2 Who re-measures what
 
-- **The cutover PRD's η** recalibrates the write-triage bands in the granite space (`fused-memory/scripts/calibrate_write_triage.py`, `--write-config` and `--write-project-config dark_factory`) and commits the reports. That step re-derives `t_high`/`t_low`. It does not re-measure the flip evidence below.
+- **The cutover PRD's η** recalibrates the write-triage bands in the granite space with `fused-memory/scripts/calibrate_write_triage.py`, covering both the pooled bands and the `dark_factory` per-project calibration, and commits the reports. The invocation belongs to η's row in the cutover PRD's §10 and is not restated here. That step re-derives `t_high`/`t_low`. It does not re-measure the flip evidence below.
 - **The cutover PRD's ε** stamps each band group with `{embedder_model, embedder_dimensions}`. Its provenance guard refuses any band still stamped 1536 (`CalibrationProvenanceMismatch`), so a stale band cannot be applied silently between η's window and the recalibration.
 - **This PRD** owns re-measuring its flip evidence in the granite space. The leaves whose figures depend on retrieval are:
   - from §11.6: **π** (fresh population and arm runs), **λ** (blind rating of the pairs that π surfaces), **μ** (task 5807) and **Γ3** (task 5808);
@@ -270,5 +270,6 @@ The judge arms' own behaviour given a slate, and the rater verdicts on pairs alr
 
 ### 13.3 Task 3169 and notification
 
-- **3169.** The cutover PRD recorded 3169 as on HOLD (D6, §9). By this amendment's date that no longer holds: §12.5 records the flip as ruled and applied on 2026-10-11, resting on `write_triage_best_config.json` `comparative` and `comparative_rules`, and 3169's record carries the ruling (`x_flip_ruling_2026_10_11`). The consequence is that the live judge configuration was selected on 1536-space evidence, and η changes the embedder underneath it. Re-measuring in the granite space (§13.2) is how that selection is confirmed or re-opened. This amendment makes no ruling on the flip.
+- **3169.** The cutover PRD recorded 3169 as on HOLD (D6, §9). By this amendment's date that no longer holds: §12.5 records the flip as ruled and applied on 2026-10-11, resting on `write_triage_best_config.json` `comparative` and `comparative_rules`, and 3169's record carries the ruling (`x_flip_ruling_2026_10_11`). The consequence is that the live judge configuration was selected on 1536-space evidence, and η changes the embedder underneath it. Re-measuring in the granite space (§13.2) is how that selection is confirmed or re-opened. This amendment makes no ruling on the flip. The cutover PRD's D6 and §9 still read HOLD; on this point, this section supersedes them.
+- **Triage is live during η's window.** Because 3169 has flipped, live writes are triaged while η swaps the embedder, and the bands they would apply are still stamped 1536. ε lands before η (ε → δ → ζ → η, cutover PRD §14), so its guard is already in place when the embedder changes: it refuses those bands (§13.2) until η's recalibration writes granite-stamped ones.
 - **Notification.** The cutover PRD's η notifies this PRD's owner when it lands. That notice is the trigger for the re-measurement in §13.2.
