@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from pathlib import Path
 
 import digest as mod
 import pytest
@@ -988,7 +989,7 @@ class TestReingestedContentIsBucketAgnostic:
         records = [_user_text(text)]
 
         assert reingestion.is_reingested_content(text) is True
-        assert mod.classify_agent_class(records) == 'orchestrated-task'
+        assert detectors.classify_agent_class(_MAIN_DIR_PATH, records) == 'orchestrated-task'
 
 
 class TestTrickleCoderSessionDigest:
@@ -1586,77 +1587,26 @@ class TestSignalCountsAndScore:
 
 
 # ---------------------------------------------------------------------------
-# classify_agent_class — best-effort marker heuristics grounded in real
-# system-prompt/injection literals, with an 'unknown' empty-transcript
-# fallback and 'interactive' as the no-marker-matched default. A caller
-# override always wins verbatim (beta owns the authoritative class).
+# build_digest's agent_class_override: a caller-supplied class (beta's
+# already-authoritative stratum) is rendered verbatim, never re-derived.
 # ---------------------------------------------------------------------------
 
-class TestClassifyAgentClass:
-    def test_empty_transcript_is_unknown(self):
-        assert mod.classify_agent_class([]) == 'unknown'
+class TestBuildDigestAgentClassOverride:
+    def test_override_is_rendered_verbatim_even_with_a_marker_present(self, tmp_path):
+        path = _write_jsonl(tmp_path, [_assistant(_text('operating in sleep mode'))])
 
-    def test_task_id_worktree_injection_is_orchestrated_task(self):
-        # Literal orchestrator task-briefing preamble
-        # (orchestrator/src/orchestrator/dry_run_unblock.py).
-        records = [_meta_user(
-            'Task ID: 2572\nWorktree: /home/leo/src/dark-factory/.worktrees/2572\n'
-        )]
+        digest = mod.build_digest(path, agent_class_override='beta-authoritative-class')
 
-        assert mod.classify_agent_class(records) == 'orchestrated-task'
+        assert yaml.safe_load(_split_frontmatter(digest)[0])['agent_class'] == (
+            'beta-authoritative-class'
+        )
 
-    def test_bare_worktree_mention_alone_is_not_orchestrated_task(self):
-        # 'Worktree:' alone (without its paired 'Task ID:' preamble line) is
-        # ordinary interactive prose -- e.g. this very project's docs and
-        # sessions mention worktrees constantly -- and must not by itself
-        # trigger a false-positive orchestrated-task classification. Both
-        # preamble lines must co-occur (PRD Sec 13.2-adjacent decoy-style
-        # false-positive guard, owned here).
-        records = [_assistant(_text(
-            'The worktree: /home/leo/src/dark-factory/.worktrees/2572 is where this runs.'
-        ))]
+    def test_override_wins_even_on_an_empty_transcript(self, tmp_path):
+        path = _write_jsonl(tmp_path, [])
 
-        assert mod.classify_agent_class(records) == 'interactive'
+        digest = mod.build_digest(path, agent_class_override='custom')
 
-    def test_recon_stage_marker_is_recon(self):
-        # Shared phrase across all reconciliation stage system prompts
-        # (fused_memory/reconciliation/prompts/stage{1,2,3}.py).
-        records = [_assistant(_text(
-            'You are a Memory Consolidator agent operating in sleep mode.'
-        ))]
-
-        assert mod.classify_agent_class(records) == 'recon'
-
-    def test_watcher_marker_is_watcher(self):
-        # Canonical auto-watcher identity string
-        # (escalation/src/escalation/authority.py: _WATCHER_AUTO_IDENTITY).
-        records = [_tool_result('tu-1', 'resolved_by=orchestrator-escalation-watcher-auto')]
-
-        assert mod.classify_agent_class(records) == 'watcher'
-
-    def test_curator_classifier_marker_is_curator_classifier(self):
-        # Literal task-curator system-prompt fragment
-        # (fused_memory/middleware/task_curator.py).
-        records = [_assistant(_text(
-            'You are the task curator for the dark-factory orchestrator.'
-        ))]
-
-        assert mod.classify_agent_class(records) == 'curator-classifier'
-
-    def test_no_marker_falls_back_to_interactive(self):
-        records = [_user_text('just a normal conversation, please fix this bug')]
-
-        assert mod.classify_agent_class(records) == 'interactive'
-
-    def test_override_returned_verbatim_even_with_a_marker_present(self):
-        records = [_assistant(_text('operating in sleep mode'))]
-
-        result = mod.classify_agent_class(records, override='beta-authoritative-class')
-
-        assert result == 'beta-authoritative-class'
-
-    def test_override_wins_even_on_empty_transcript(self):
-        assert mod.classify_agent_class([], override='custom') == 'custom'
+        assert yaml.safe_load(_split_frontmatter(digest)[0])['agent_class'] == 'custom'
 
 
 # ---------------------------------------------------------------------------
@@ -1839,6 +1789,8 @@ class TestRenderFrontmatter:
 # (ground truth) and falls back to the cwd-derived mirror encoding when no
 # path is given.
 # ---------------------------------------------------------------------------
+
+_MAIN_DIR_PATH = Path('/root/-home-leo-src-dark-factory/sess.jsonl')
 
 _DIGEST_SESSION_ID = '000a8a42-3ca1-44f2-aa82-7f7ed46231fd'
 _DIGEST_CWD = '/home/leo/src/dark-factory'
@@ -2165,7 +2117,7 @@ class TestHarnessInjectedTurnFilter:
         records = [_user_text(text)]
 
         assert mod.iter_user_turns(records) == []
-        assert mod.classify_agent_class(records) == 'orchestrated-task'
+        assert detectors.classify_agent_class(_MAIN_DIR_PATH, records) == 'orchestrated-task'
 
     def test_signal_counts_unaffected_by_signal_free_briefing_turn(self):
         # The filter must not leak into _signal_text_sources: adding a
@@ -2355,7 +2307,7 @@ class TestHarnessInjectedTurnFilter:
         records = [_user_text(text)]
 
         assert mod.iter_user_turns(records) == []
-        assert mod.classify_agent_class(records) == 'orchestrated-task'
+        assert detectors.classify_agent_class(_MAIN_DIR_PATH, records) == 'orchestrated-task'
 
 
 # ---------------------------------------------------------------------------
@@ -2508,7 +2460,7 @@ class TestNonHumanOriginFilter:
         records = [_task_notification(text)]
 
         assert mod.iter_user_turns(records) == []
-        assert mod.classify_agent_class(records) == 'orchestrated-task'
+        assert detectors.classify_agent_class(_MAIN_DIR_PATH, records) == 'orchestrated-task'
 
 
 # ---------------------------------------------------------------------------

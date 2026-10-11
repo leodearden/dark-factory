@@ -18,7 +18,7 @@ import pytest
 from legibility import coder, detectors, digest, inventory
 from legibility import config as config_mod
 from legibility import sampling as mod
-from legibility.detectors import SignalClass
+from legibility.detectors import AgentClass, SignalClass
 from legibility_carrier_fixtures import (
     PROSE_QUOTING_THE_SCHEMA,
     briefing_text,
@@ -323,74 +323,6 @@ def _user_turn(text: str) -> dict:
     return {'type': 'user', 'isSidechain': False, 'message': {'content': text}}
 
 
-class TestClassifyAgentClass:
-    """classify_agent_class(record, path) maps to the 5 strata. *record* is
-    the session's already-located first non-sidechain, non-meta user turn
-    (or None); *path*'s PARENT DIRECTORY NAME is the encoded dir — its
-    shape is checked first, before any content marker.
-    """
-
-    MAIN_DIR_PATH = Path('/root/-home-leo-src-dark-factory/sess.jsonl')
-
-    def test_worktrees_encoded_dir_is_orchestrated_task(self):
-        path = Path('/root/-home-leo-src-dark-factory--worktrees-2573/sess.jsonl')
-        assert mod.classify_agent_class(_user_turn('anything'), path) == 'orchestrated-task'
-
-    def test_claude_worktrees_variant_is_orchestrated_task(self):
-        path = Path('/root/-home-leo-src-dark-factory--claude-worktrees-fix-foo/sess.jsonl')
-        assert mod.classify_agent_class(_user_turn('anything'), path) == 'orchestrated-task'
-
-    def test_reify_warm_lane_worktree_is_orchestrated_task(self):
-        # Faithful encoding of /home/leo/src/reify/.warm-lanes/worktrees/5187
-        # (encode_cwd maps '/', '.' and '_' all to '-'), embedding the
-        # '-warm-lanes-worktrees-' substring (task 2612).
-        path = Path('/root/-home-leo-src-reify--warm-lanes-worktrees-5187/sess.jsonl')
-        assert mod.classify_agent_class(_user_turn('anything'), path) == 'orchestrated-task'
-
-    def test_reify_build_worktree_is_orchestrated_task(self):
-        # Embeds the '-reify-build-worktrees-' substring (task 2612).
-        path = Path('/root/-home-leo-src-reify-build-worktrees-abc/sess.jsonl')
-        assert mod.classify_agent_class(_user_turn('anything'), path) == 'orchestrated-task'
-
-    def test_reconciliation_run_header_is_recon(self):
-        text = '## Reconciliation Run\nStage 1: sync\n'
-        assert mod.classify_agent_class(_user_turn(text), self.MAIN_DIR_PATH) == 'recon'
-
-    def test_stage_2_task_knowledge_sync_header_is_recon(self):
-        # Real marker observed in ~/.claude/projects transcripts (task 2573 premise research).
-        text = '## Stage 2: Task-Knowledge Sync\n## Project: know_live\n'
-        assert mod.classify_agent_class(_user_turn(text), self.MAIN_DIR_PATH) == 'recon'
-
-    def test_memory_consolidator_marker_is_recon(self):
-        text = 'Invoking memory_consolidator for this pass.'
-        assert mod.classify_agent_class(_user_turn(text), self.MAIN_DIR_PATH) == 'recon'
-
-    def test_recon_escalation_watcher_marker_is_watcher(self):
-        # skills/recon-escalation-watcher is a real dark_factory skill.
-        text = '<command-name>recon-escalation-watcher</command-name>'
-        assert mod.classify_agent_class(_user_turn(text), self.MAIN_DIR_PATH) == 'watcher'
-
-    def test_curator_classifier_marker_is_curator_classifier(self):
-        # Verbatim opening of TRIAGE_SYSTEM_PROMPT
-        # (orchestrator/src/orchestrator/agents/triage.py:131).
-        text = 'You are a review suggestion classifier. You receive a numbered list...'
-        assert mod.classify_agent_class(_user_turn(text), self.MAIN_DIR_PATH) == 'curator-classifier'
-
-    def test_main_dir_freeform_human_turn_is_interactive(self):
-        text = 'Can you help me fix this bug in the parser?'
-        assert mod.classify_agent_class(_user_turn(text), self.MAIN_DIR_PATH) == 'interactive'
-
-    def test_none_record_defaults_to_interactive(self):
-        assert mod.classify_agent_class(None, self.MAIN_DIR_PATH) == 'interactive'
-
-    def test_worktree_shape_wins_over_content_markers(self):
-        # Encoded-dir shape is checked FIRST — even a recon-marker turn in
-        # a worktree dir classifies as orchestrated-task, not recon.
-        path = Path('/root/-home-leo-src-dark-factory--worktrees-2573/sess.jsonl')
-        text = '## Reconciliation Run\n'
-        assert mod.classify_agent_class(_user_turn(text), path) == 'orchestrated-task'
-
-
 def _queue_operation_record() -> dict:
     return {'type': 'queue-operation', 'operation': 'enqueue', 'timestamp': '2026-07-13T09:59:00.000Z'}
 
@@ -417,8 +349,8 @@ class TestScanTranscript:
         scan = mod.scan_transcript(path)
         assert scan.counts == mod.score_signals(path)
         assert scan.counts.total_signal > 0
-        assert scan.first_turn is not None
-        assert scan.first_turn['message']['content'] == 'Please do the thing #0.'
+        assert scan.first_turn_text == 'Please do the thing #0.'
+        assert scan.agent_class is AgentClass.INTERACTIVE
 
     def test_scan_is_frozen(self, tmp_path):
         scan = mod.scan_transcript(self._signal_transcript(tmp_path))
@@ -436,7 +368,7 @@ class TestScanTranscript:
         sidechain = {**_with_session(_clean_record(0), 'parent-sess'), 'isSidechain': True}
         path = _write_transcript(tmp_path / 'agent-a1b2.jsonl', [sidechain])
         scan = mod.scan_transcript(path)
-        assert scan.first_turn is None
+        assert scan.first_turn_text == ''
         assert scan.session_id == 'parent-sess'
 
     @pytest.mark.parametrize('sidechain', [False, True])
@@ -453,7 +385,8 @@ class TestScanTranscript:
     def test_unreadable_path_degrades_to_an_empty_scan(self, tmp_path):
         scan = mod.scan_transcript(tmp_path / 'missing.jsonl')
         assert scan.counts == mod.SignalCounts()
-        assert scan.first_turn is None
+        assert scan.agent_class is AgentClass.UNKNOWN
+        assert scan.first_turn_text == ''
         assert scan.session_id is None
 
 
@@ -510,7 +443,7 @@ class TestScoreSession:
 
         scan = mod.scan_transcript(path)
         assert scored.session is session
-        assert scored.stratum == mod.classify_agent_class(scan.first_turn, path)
+        assert scored.stratum == scan.agent_class
         assert scored.stratum == 'orchestrated-task'
         assert scored.counts == scan.counts
         assert scored.first_turn_text == 'Please do the thing #3.'

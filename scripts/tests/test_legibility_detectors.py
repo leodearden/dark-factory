@@ -6,11 +6,13 @@ record_hits.
 from __future__ import annotations
 
 import dataclasses
+import json
+from datetime import date
 from pathlib import Path
 
 import pytest
-from legibility import detectors, digest, sampling
-from legibility.detectors import CarrierKind, SignalClass
+from legibility import coder, detectors, digest, inventory, sampling
+from legibility.detectors import AgentClass, CarrierKind, SignalClass
 from legibility_carrier_fixtures import (
     PROSE_QUOTING_THE_SCHEMA,
     TRICKLE_CODER_PREAMBLE,
@@ -534,3 +536,189 @@ class TestSamplerAndDigestAgreeOnTheCorpus:
         digested = bool(digest.signal_counts(digest.load_transcript(path))[signal])
 
         assert sampled == digested == (signal in EXPECTED_PRESENT[name])
+
+
+# ---------------------------------------------------------------------------
+# Boundary row 2: one agent-class classifier, read by the sampler's stratum
+# and the digest's frontmatter alike.
+# ---------------------------------------------------------------------------
+
+_MAIN_DIR_PATH = Path('/root/-home-leo-src-dark-factory/sess.jsonl')
+
+_WORKTREE_DIRS = (
+    '-home-leo-src-dark-factory--worktrees-2573',
+    '-home-leo-src-dark-factory--claude-worktrees-fix-foo',
+    '-home-leo-src-reify--warm-lanes-worktrees-5187',
+    '-home-leo-src-reify-build-worktrees-abc',
+)
+
+
+def _classify(*records):
+    return detectors.classify_agent_class(_MAIN_DIR_PATH, list(records))
+
+
+class TestAgentClassVocabulary:
+    def test_agent_classes_are_the_five_strata_plus_unknown(self):
+        assert [c.value for c in AgentClass] == [
+            'recon', 'curator-classifier', 'watcher', 'orchestrated-task', 'interactive',
+            'unknown',
+        ]
+
+    def test_the_sampler_strata_are_the_five_in_order(self):
+        assert sampling.STRATA == (
+            'recon', 'curator-classifier', 'watcher', 'orchestrated-task', 'interactive',
+        )
+
+
+class TestClassifyAgentClass:
+    @pytest.mark.parametrize('path', [_MAIN_DIR_PATH, Path(f'/root/{_WORKTREE_DIRS[0]}/s.jsonl')])
+    def test_empty_records_are_unknown_whatever_the_dir(self, path):
+        assert detectors.classify_agent_class(path, []) is AgentClass.UNKNOWN
+
+    @pytest.mark.parametrize('encoded', _WORKTREE_DIRS)
+    def test_a_worktree_encoded_dir_wins_over_any_content_marker(self, encoded):
+        records = [
+            user_record('## Reconciliation Run\nStage 1: sync\n'),
+            assistant_record(text_block('You are the task curator for the dark-factory orchestrator.')),
+        ]
+
+        assert detectors.classify_agent_class(
+            Path(f'/root/{encoded}/sess.jsonl'), records,
+        ) is AgentClass.ORCHESTRATED_TASK
+
+    @pytest.mark.parametrize(
+        ('text', 'expected'),
+        [
+            ('## Reconciliation Run\nStage 1: sync\n', AgentClass.RECON),
+            ('## Stage 2: Task-Knowledge Sync\n## Project: know_live\n', AgentClass.RECON),
+            ('Invoking memory_consolidator for this pass.', AgentClass.RECON),
+            ('<command-name>recon-escalation-watcher</command-name>', AgentClass.WATCHER),
+            (
+                'You are a review suggestion classifier. You receive a numbered list...',
+                AgentClass.CURATOR_CLASSIFIER,
+            ),
+        ],
+        ids=[
+            'reconciliation_run', 'stage_2_sync', 'memory_consolidator',
+            'recon_escalation_watcher', 'review_suggestion_classifier',
+        ],
+    )
+    def test_a_first_turn_marker_classifies(self, text, expected):
+        assert _classify(user_record(text)) is expected
+
+    @pytest.mark.parametrize(
+        ('record', 'expected'),
+        [
+            (
+                assistant_record(text_block('You are a Memory Consolidator agent operating in sleep mode.')),
+                AgentClass.RECON,
+            ),
+            (
+                tool_result_record('tu-1', 'resolved_by=orchestrator-escalation-watcher-auto'),
+                AgentClass.WATCHER,
+            ),
+            (
+                assistant_record(text_block('You are the task curator for the dark-factory orchestrator.')),
+                AgentClass.CURATOR_CLASSIFIER,
+            ),
+            (
+                assistant_record(text_block('You are a code module classifier.')),
+                AgentClass.CURATOR_CLASSIFIER,
+            ),
+            (
+                user_record(
+                    'Task ID: 2572\nWorktree: /home/leo/src/dark-factory/.worktrees/2572\n',
+                    isMeta=True,
+                ),
+                AgentClass.ORCHESTRATED_TASK,
+            ),
+        ],
+        ids=['sleep_mode', 'watcher_auto', 'task_curator', 'code_module_classifier', 'task_preamble_in_meta'],
+    )
+    def test_a_marker_anywhere_in_the_raw_carriers_classifies(self, record, expected):
+        assert _classify(user_record('please look at this'), record) is expected
+
+    def test_the_first_turn_is_the_first_non_meta_user_turn(self):
+        records = [
+            user_record('<command-name>recon-escalation-watcher</command-name>', isMeta=True),
+            user_record('You are a review suggestion classifier.'),
+        ]
+
+        assert _classify(*records) is AgentClass.CURATOR_CLASSIFIER
+
+    def test_a_first_turn_marker_wins_over_a_different_haystack_marker(self):
+        records = [
+            user_record('<command-name>recon-escalation-watcher</command-name>'),
+            assistant_record(text_block('You are a Memory Consolidator agent operating in sleep mode.')),
+        ]
+
+        assert _classify(*records) is AgentClass.WATCHER
+
+    def test_a_harness_injected_first_turn_is_read_raw(self):
+        record = user_record(briefing_text(body_filler='Invoking memory_consolidator for this pass.'))
+
+        assert _classify(record) is AgentClass.RECON
+
+    def test_matching_is_a_lowercase_substring_on_every_row(self):
+        assert _classify(user_record('Context first.\n## RECONCILIATION RUN\n')) is AgentClass.RECON
+
+    def test_no_marker_falls_back_to_interactive(self):
+        assert _classify(user_record('just a normal conversation, please fix this bug')) is (
+            AgentClass.INTERACTIVE
+        )
+
+    def test_a_lone_worktree_mention_stays_interactive(self):
+        # Both task-preamble lines must co-occur: 'Worktree:' alone is
+        # ordinary prose in this project.
+        record = assistant_record(text_block(
+            'The worktree: /home/leo/src/dark-factory/.worktrees/2572 is where this runs.'
+        ))
+
+        assert _classify(user_record('where does it run?'), record) is AgentClass.INTERACTIVE
+
+
+_SHAPES = [
+    pytest.param(_WORKTREE_DIRS[0], [user_record('please fix it')], 'orchestrated-task', id='worktree_path'),
+    pytest.param(
+        '-home-leo-src-dark-factory', [user_record('## Reconciliation Run\nStage 1: sync\n')],
+        'recon', id='first_turn_recon',
+    ),
+    pytest.param(
+        '-home-leo-src-dark-factory',
+        [
+            user_record('<command-name>recon-escalation-watcher</command-name>'),
+            assistant_record(text_block('You are a Memory Consolidator agent operating in sleep mode.')),
+        ],
+        'watcher', id='first_turn_beats_haystack',
+    ),
+    pytest.param(
+        '-home-leo-src-dark-factory',
+        [
+            user_record('please check the escalation queue'),
+            tool_result_record('tu-1', 'resolved_by=orchestrator-escalation-watcher-auto'),
+        ],
+        'watcher', id='haystack_only_watcher',
+    ),
+    pytest.param(
+        '-home-leo-src-dark-factory', [user_record('please fix the parser')], 'interactive',
+        id='no_marker',
+    ),
+    pytest.param('-home-leo-src-dark-factory', [], 'unknown', id='empty'),
+]
+
+
+@pytest.mark.parametrize(('encoded', 'records', 'expected'), _SHAPES)
+def test_sampler_stratum_and_digest_agent_class_agree(tmp_path, encoded, records, expected):
+    directory = tmp_path / encoded
+    directory.mkdir()
+    path = directory / 'sess.jsonl'
+    path.write_text(''.join(json.dumps(record) + '\n' for record in records))
+    session = inventory.SessionRecord(
+        path=path, encoded_dir=encoded, cwd='/home/leo/src/dark-factory',
+        date=date(2026, 10, 11), size_bytes=path.stat().st_size,
+    )
+
+    stratum = sampling.score_session(session).stratum
+    rendered = coder.parse_frontmatter(digest.build_digest(path))['agent_class']
+
+    assert stratum == rendered == expected
