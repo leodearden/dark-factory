@@ -112,6 +112,7 @@ from fused_memory.server.consolidation import (
     ProposalLimits,
     build_consolidation_result,
     validate_consolidate_args,
+    validate_proposal_args,
 )
 from fused_memory.server.entities_gate import entities_gate
 from fused_memory.server.entity_mint_authz import (
@@ -4210,14 +4211,14 @@ def create_mcp_server(
         # Read per call, never captured, so a reload_config of these leaves
         # applies to the next proposal.
         config = memory_service.config.consolidation_auto
-        err, _, members = validate_consolidate_args(
-            canonical_content=None,
+        err, members = validate_proposal_args(
             topic=topic,
-            supersedes=None,
-            retain=member_ids,
+            member_ids=member_ids,
             run_id=run_id,
             claim=claim,
             category=category,
+            rationale=rationale,
+            seeded_from=seeded_from,
             limits=ProposalLimits.from_config(config),
         )
         if err:

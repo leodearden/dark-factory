@@ -17,11 +17,12 @@ THE ONE VALIDATOR, TWO ARMS
 :func:`validate_consolidate_args` serves both callers of this shape (PRD D6 —
 one fact, one home).  ``limits=None`` selects the OP arm, taken by
 ``server/tools.py::consolidate_memories``.  Passing a :class:`ProposalLimits`
-selects the PROPOSAL arm, taken by task gamma's ``propose_consolidation`` at
+selects the PROPOSAL arm, which callers reach through
+:func:`validate_proposal_args`: ``server/tools.py::propose_consolidation`` at
 the emit boundary — so the LLM that wrote a mis-shaped claim fixes it in-turn
-— and again by task delta's executor when it re-checks an aged ledger row
-whose limits have since moved (PRD B7).  The id, topic and arm rules are
-therefore checked once, in one place, rather than re-typed per caller.
+— and task delta's executor when it re-checks an aged ledger row whose limits
+have since moved (PRD B7).  The id, topic and arm rules are therefore checked
+once, in one place, rather than re-typed per caller.
 
 ``reconciliation/consolidation_auto.py::evaluate_auto_predicate`` deliberately
 calls NONE of this: PRD C2 makes the benign codes the emit boundary's business,
@@ -81,6 +82,7 @@ __all__ = [
     'ProposalLimits',
     'build_consolidation_result',
     'validate_consolidate_args',
+    'validate_proposal_args',
 ]
 
 #: Pointer to the ONE topic-slug namespace (PRD D4), quoted at the wire so a
@@ -258,11 +260,34 @@ _PROPOSAL_RUN_ID_HINT = (
     'and a re-call for the same pair overwrites it.'
 )
 
-#: Which caller-facing names an error speaks, per arm. The proposal's caller
-#: passed `member_ids` to `propose_consolidation`; naming `retain` or
-#: `consolidate_memories` to it would describe an interface it never saw.
-_OP_LABELS = ('consolidate_memories', 'retain')
-_PROPOSAL_LABELS = ('propose_consolidation', 'member_ids')
+#: Caps on the two reviewer-facing proposal fields. Unlike `claim` they never
+#: reach a canonical, so they are not operator-tunable; they exist so a
+#: runaway stage cannot grow the shared recon ledger without bound.
+_RATIONALE_MAX_CHARS = 2000
+_SEEDED_FROM_MAX_CHARS = 500
+
+_REVIEWER_TEXT_HINT = (
+    '`rationale` and `seeded_from` are the reviewer\'s evidence and never reach '
+    'the canonical. `rationale` is required: why these records are one cluster, '
+    f'at most {_RATIONALE_MAX_CHARS} characters. `seeded_from` is optional: what '
+    f'surfaced the cluster, at most {_SEEDED_FROM_MAX_CHARS} characters — omit it '
+    'rather than passing a blank.'
+)
+
+
+@dataclass(frozen=True)
+class _ArmLabels:
+    """The caller-facing names an error speaks for one arm."""
+
+    tool: str
+    member_arm: str
+
+
+#: The proposal's caller passed `member_ids` to `propose_consolidation`;
+#: naming `retain` or `consolidate_memories` to it would describe an
+#: interface it never saw.
+_OP_LABELS = _ArmLabels(tool='consolidate_memories', member_arm='retain')
+_PROPOSAL_LABELS = _ArmLabels(tool='propose_consolidation', member_arm='member_ids')
 
 
 def _claim_problems(claim: str, topic: str, *, max_chars: int) -> list[str]:
@@ -335,12 +360,13 @@ def _member_count_problems(
 
 
 def _op_arm_problems(
-    canonical_content: Any, claim: Any, category: Any
+    canonical_content: Any, proposal_only_fields: dict[str, tuple[Any, str]]
 ) -> tuple[list[str], list[str]]:
     """The op shape's own rules: ``(problems, hints)``.
 
-    A *claim* or *category* without limits is refused rather than dropped:
-    dropping either would silently skip every rule that applies to it.
+    *proposal_only_fields* maps each proposal-only parameter's name to its
+    ``(value, hint)``. One passed without limits is refused rather than
+    dropped: dropping it would silently skip every rule that applies to it.
     """
     problems: list[str] = []
     hints: list[str] = []
@@ -353,21 +379,43 @@ def _op_arm_problems(
             'canonical_content is the consolidated record\'s TEXT — the single '
             'claim the surviving canonical will state.'
         )
-    if claim is not None:
-        problems.append(
-            '`claim` was passed without `limits`, so no claim rule could be '
-            'applied; pass ProposalLimits built from '
-            'ConsolidationAutoConfig to select the proposal shape'
-        )
-        hints.append(_CLAIM_HINT)
-    if category is not None:
-        problems.append(
-            '`category` was passed without `limits`, so no category rule could '
-            'be applied; pass ProposalLimits built from '
-            'ConsolidationAutoConfig to select the proposal shape'
-        )
-        hints.append(_CATEGORY_HINT)
+    for name, (value, hint) in proposal_only_fields.items():
+        if value is not None:
+            problems.append(
+                f'`{name}` was passed without `limits`, so no {name} rule could '
+                'be applied; pass ProposalLimits built from '
+                'ConsolidationAutoConfig to select the proposal shape'
+            )
+            hints.append(hint)
     return problems, hints
+
+
+def _reviewer_text_problems(rationale: Any, seeded_from: Any) -> list[str]:
+    """Bound the proposal's two reviewer-facing fields; *rationale* is required."""
+    problems: list[str] = []
+    if not isinstance(rationale, str) or not rationale.strip():
+        problems.append(
+            '`rationale` must be a non-empty string in a proposal, got '
+            f'{_safe_repr(rationale)}'
+        )
+    elif len(rationale) > _RATIONALE_MAX_CHARS:
+        problems.append(
+            f'`rationale` is {len(rationale)} characters, over the '
+            f'{_RATIONALE_MAX_CHARS} limit'
+        )
+    if seeded_from is None:
+        return problems
+    if not isinstance(seeded_from, str) or not seeded_from.strip():
+        problems.append(
+            '`seeded_from` must be omitted or a non-empty string, got '
+            f'{_safe_repr(seeded_from)}'
+        )
+    elif len(seeded_from) > _SEEDED_FROM_MAX_CHARS:
+        problems.append(
+            f'`seeded_from` is {len(seeded_from)} characters, over the '
+            f'{_SEEDED_FROM_MAX_CHARS} limit'
+        )
+    return problems
 
 
 def _proposal_arm_problems(
@@ -377,6 +425,8 @@ def _proposal_arm_problems(
     topic: Any,
     category: Any,
     run_id: Any,
+    rationale: Any,
+    seeded_from: Any,
     member_ids: list[Any],
     limits: ProposalLimits,
 ) -> tuple[list[str], list[str]]:
@@ -419,12 +469,18 @@ def _proposal_arm_problems(
         )
         hints.append(_PROPOSAL_RUN_ID_HINT)
 
-    count_problems = _member_count_problems(member_ids, limits, _PROPOSAL_LABELS[1])
+    reviewer_text_problems = _reviewer_text_problems(rationale, seeded_from)
+    if reviewer_text_problems:
+        problems.extend(reviewer_text_problems)
+        hints.append(_REVIEWER_TEXT_HINT)
+
+    member_arm = _PROPOSAL_LABELS.member_arm
+    count_problems = _member_count_problems(member_ids, limits, member_arm)
     if count_problems:
         problems.extend(count_problems)
         hints.append(
             'A proposal names the cluster it wants consolidated in '
-            f'`{_PROPOSAL_LABELS[1]}`. Below the minimum there is no duplication '
+            f'`{member_arm}`. Below the minimum there is no duplication '
             'to fold; above the maximum a human sitting reads the cluster better '
             'than an automatic write does.'
         )
@@ -440,6 +496,8 @@ def validate_consolidate_args(
     run_id: Any,
     claim: Any = None,
     category: Any = None,
+    rationale: Any = None,
+    seeded_from: Any = None,
     limits: ProposalLimits | None = None,
 ) -> tuple[dict[str, str] | None, list[Any], list[Any]]:
     """Check a ``consolidate_memories`` call and normalize its two id arms.
@@ -448,22 +506,21 @@ def validate_consolidate_args(
     D6), so the id, topic and arm rules below have a single home rather than a
     re-typed copy per caller:
 
-    * ``limits is None`` — the OP shape. A non-``None`` *claim* or *category*
-      is itself collected as a problem, so a mis-wired caller that passes
-      either without limits fails CLOSED instead of having it (and therefore
-      every rule on it) silently dropped.
+    * ``limits is None`` — the OP shape. A non-``None`` *claim*, *category*,
+      *rationale* or *seeded_from* is itself collected as a problem, so a
+      mis-wired caller that passes one without limits fails CLOSED instead of
+      having it (and therefore every rule on it) silently dropped.
       ``server/tools.py::consolidate_memories`` takes this arm by omission.
     * ``limits is not None`` — the PROPOSAL shape. A proposal has no canonical
       text yet, by construction, so a non-``None`` ``canonical_content`` is
       REFUSED rather than dropped. *claim*, a *category* naming one of the six
-      memory categories, and a non-blank *run_id* (the proposal row's ledger
-      identity) are required, and the member arm — passed as *retain* — must
+      memory categories, a non-blank *run_id* (the proposal row's ledger
+      identity) and a bounded *rationale* are required, an optional
+      *seeded_from* is bounded, and the member arm — passed as *retain* — must
       hold ``[member_min, member_max]`` ids. Errors speak the proposal's own
-      vocabulary: ``propose_consolidation`` and ``member_ids``. Task gamma's
-      ``propose_consolidation`` takes this arm at the EMIT boundary so the LLM
-      fixes its own shape in-turn, and task delta's executor takes it again
-      when re-checking an aged ledger row whose limits have since moved (PRD
-      B7).
+      vocabulary: ``propose_consolidation`` and ``member_ids``. Proposal
+      callers reach this arm through :func:`validate_proposal_args`, which
+      speaks those names on the way in too.
 
     ``evaluate_auto_predicate`` deliberately calls NONE of this. PRD C2 makes
     the benign codes the emit boundary's business, and the predicate re-derives
@@ -499,9 +556,18 @@ def validate_consolidate_args(
     supersedes_ids = normalize_supersedes(supersedes)
     retain_ids = normalize_supersedes(retain)
 
-    op_label, member_label = _OP_LABELS if limits is None else _PROPOSAL_LABELS
+    labels = _OP_LABELS if limits is None else _PROPOSAL_LABELS
+    member_label = labels.member_arm
     if limits is None:
-        arm_problems, arm_hints = _op_arm_problems(canonical_content, claim, category)
+        arm_problems, arm_hints = _op_arm_problems(
+            canonical_content,
+            {
+                'claim': (claim, _CLAIM_HINT),
+                'category': (category, _CATEGORY_HINT),
+                'rationale': (rationale, _REVIEWER_TEXT_HINT),
+                'seeded_from': (seeded_from, _REVIEWER_TEXT_HINT),
+            },
+        )
     else:
         arm_problems, arm_hints = _proposal_arm_problems(
             canonical_content=canonical_content,
@@ -509,6 +575,8 @@ def validate_consolidate_args(
             topic=topic,
             category=category,
             run_id=run_id,
+            rationale=rationale,
+            seeded_from=seeded_from,
             member_ids=retain_ids,
             limits=limits,
         )
@@ -626,13 +694,44 @@ def validate_consolidate_args(
 
     return (
         {
-            'error': f'{op_label}: ' + '; '.join(problems),
+            'error': f'{labels.tool}: ' + '; '.join(problems),
             'error_type': 'ValidationError',
             'hint': ' '.join(hints),
         },
         supersedes_ids,
         retain_ids,
     )
+
+
+def validate_proposal_args(
+    *,
+    topic: Any,
+    member_ids: Any,
+    run_id: Any,
+    claim: Any,
+    category: Any,
+    rationale: Any,
+    seeded_from: Any = None,
+    limits: ProposalLimits,
+) -> tuple[dict[str, str] | None, list[Any]]:
+    """Check a ``propose_consolidation`` call; return ``(error_or_None, normalized_member_ids)``.
+
+    The proposal arm of :func:`validate_consolidate_args`, spoken in the
+    proposal's own names. The rules live there; this only maps the names.
+    """
+    err, _, members = validate_consolidate_args(
+        canonical_content=None,
+        topic=topic,
+        supersedes=None,
+        retain=member_ids,
+        run_id=run_id,
+        claim=claim,
+        category=category,
+        rationale=rationale,
+        seeded_from=seeded_from,
+        limits=limits,
+    )
+    return err, members
 
 
 def _closure_member_ref(row: Any) -> dict[str, Any]:

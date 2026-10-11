@@ -125,6 +125,17 @@ async def test_every_offender_is_named_in_one_error(svc, ledger):
 
 
 @pytest.mark.asyncio
+async def test_unbounded_reviewer_text_is_refused_and_writes_nothing(svc, ledger):
+    """Both fields are stored verbatim in the shared ledger and read back in full."""
+    result = await _call(create_mcp_server(svc), rationale=' ', seeded_from='s' * 501)
+
+    assert result['error_type'] == 'ValidationError'
+    assert '`rationale`' in result['error']
+    assert '`seeded_from` is 501 characters' in result['error']
+    assert await _proposals(ledger) == []
+
+
+@pytest.mark.asyncio
 async def test_a_valid_proposal_lands_as_one_ledger_row(svc, ledger):
     result = await _call(create_mcp_server(svc))
 
