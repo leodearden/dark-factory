@@ -3396,8 +3396,9 @@ class LinkHealConfig(BaseModel):
         default=3,
         ge=1,
         description=(
-            'Consecutive failed adjudicator shards that escalate under '
-            'link-heal-adjudicator and stop adjudicating. PRD H2.'
+            'Consecutive failed adjudicator shards that stop adjudicating. A plan run '
+            'records the storm as would_escape under link-heal-adjudicator and files '
+            'nothing; a writing run that adjudicates files it. PRD H1, H2.'
         ),
     )
 

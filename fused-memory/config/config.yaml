@@ -523,7 +523,8 @@ mem0_update:
 #   misfile_share_ceiling: 0.25
 #   # Apply writes nothing past this adjudicated CORRECTS share (link-heal-corrects-share).
 #   corrects_share_ceiling: 0.60
-#   # Consecutive failed adjudicator shards that stop adjudicating (link-heal-adjudicator).
+#   # Consecutive failed adjudicator shards that stop adjudicating; a plan run records
+#   # link-heal-adjudicator as would_escape, a writing run files it.
 #   shard_failure_streak: 3
 
 # Entity-node minting (task 4932) — the ensure_entity_node MCP tool, which
