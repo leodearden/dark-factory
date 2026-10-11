@@ -467,7 +467,7 @@ def test_restart_unit_reports_no_timed_out_phases_when_clean(
 def test_restart_unit_reports_every_timed_out_phase(monkeypatch: pytest.MonkeyPatch) -> None:
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         if cmd[0] == "systemctl":
             raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
