@@ -18,17 +18,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import sqlite3
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import IntEnum, StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
+import httpx
 from _task_db_scan import (
     UNREADABLE_STORE_ERRORS,
     connect_ro,
@@ -36,7 +37,7 @@ from _task_db_scan import (
     format_kv_line,
     tasks_db_path,
 )
-from migrate_metadata_modules_to_files import write_failure_reason
+from migrate_metadata_modules_to_files import FusedMemoryClient, write_failure_reason
 
 # Bind shared/ and fused-memory/ to THIS checkout rather than whichever copy an
 # editable install put on sys.path (scripts/audit_manifest_descriptor_drift.py::_SHARED_SRC).
@@ -145,7 +146,7 @@ def _ordered(tiers: frozenset[Tier]) -> tuple[Tier, ...]:
 
 
 def take_census(project_root: str, now: datetime) -> Census:
-    with closing(connect_ro(tasks_db_path(project_root))) as conn:
+    with contextlib.closing(connect_ro(tasks_db_path(project_root))) as conn:
         (rows_in_store,) = conn.execute('SELECT count(*) FROM tasks').fetchone()
         rows = _read_claimant_rows(conn, 'claimant_run_id IS NOT NULL')
     violations = tuple(
@@ -312,7 +313,7 @@ async def apply_repairs(
             outcomes=(),
             verification_census=None,
         )
-    with closing(connect_ro(tasks_db_path(root))) as conn:
+    with contextlib.closing(connect_ro(tasks_db_path(root))) as conn:
         attempts = {
             violation.key: await _attempt_repair(client, conn, root, violation, clock())
             for violation in selected
@@ -354,6 +355,8 @@ async def sweep(
     client: ToolClient | None,
     clock: Callable[[], datetime],
 ) -> SweepResult:
+    if apply and client is None:
+        raise ValueError('an applying sweep writes through an MCP client; none was given')
     projects: list[ProjectReport] = []
     unreadable: list[str] = []
     for root in roots:
@@ -381,22 +384,44 @@ def _census_lines(census: Census) -> list[str]:
     ]
     for tier, statuses in totals['by_tier_status'].items():
         lines.append(format_kv_line(sorted(statuses.items()), indent=f'  {tier}: ').rstrip())
-    lines.extend(_violation_line(violation) for violation in census.violations)
+    lines.extend(format_kv_line(_violation_pairs(v), indent='    ') for v in census.violations)
     return lines
 
 
-def _violation_line(violation: Violation, *, indent: str = '    ') -> str:
-    return format_kv_line(
-        [
-            ('tier', violation.tier),
-            ('task_id', violation.task_id),
-            ('tag', violation.tag),
-            ('status', violation.status),
-            ('claimant_run_id', violation.claimant_run_id),
-            ('heartbeat_at', violation.heartbeat_at),
-        ],
-        indent=indent,
-    )
+def _violation_pairs(violation: Violation) -> list[tuple[str, Any]]:
+    return [
+        ('tier', violation.tier),
+        ('task_id', violation.task_id),
+        ('tag', violation.tag),
+        ('status', violation.status),
+        ('claimant_run_id', violation.claimant_run_id),
+        ('heartbeat_at', violation.heartbeat_at),
+    ]
+
+
+def _outcome_line(outcome: RowOutcome) -> str:
+    delta = outcome.delta or {}
+    pairs = [
+        ('bucket', outcome.bucket),
+        *_violation_pairs(outcome.violation),
+        *((f'delta.{field}', f'{before}->{after}') for field, (before, after) in delta.items()),
+    ]
+    if outcome.detail is not None:
+        pairs.append(('detail', outcome.detail))
+    return format_kv_line(pairs, indent='    ')
+
+
+def _apply_lines(report: ApplyReport) -> list[str]:
+    if report.refused:
+        held = ' '.join(str(task_id) for task_id in report.holder_intersection)
+        return [f'  apply: refused, nothing was written; current lock holders among the selected rows: {held}']
+    lines = [format_kv_line(list(report.counts().items()), indent='  buckets: ')]
+    lines.extend(_outcome_line(outcome) for outcome in report.outcomes)
+    if report.verification_census is not None:
+        verification = report.verification_census
+        lines.append(f'  verification_census: measured_at={verification.measured_at.isoformat()}')
+        lines.extend(_census_lines(verification))
+    return lines
 
 
 def render_text(result: SweepResult) -> str:
@@ -412,7 +437,9 @@ def render_text(result: SweepResult) -> str:
             indent='',
         ))
         lines.extend(_census_lines(census))
-        if not result.applied:
+        if project.apply is not None:
+            lines.extend(_apply_lines(project.apply))
+        elif not result.applied:
             would_clear = ' '.join(result.repair_tiers)
             lines.append(f'  dry-run: nothing was written; --apply would clear tiers: {would_clear}')
     lines.extend(f'unreadable: {root}' for root in result.unreadable)
@@ -428,6 +455,29 @@ def _census_json(census: Census) -> dict[str, Any]:
     }
 
 
+def _outcome_json(outcome: RowOutcome) -> dict[str, Any]:
+    row = outcome.violation.as_json()
+    if outcome.delta is not None:
+        row['delta'] = dict(outcome.delta)
+    if outcome.detail is not None:
+        row['detail'] = outcome.detail
+    return row
+
+
+def _apply_json(report: ApplyReport) -> dict[str, Any]:
+    verification = report.verification_census
+    return {
+        'refused': report.refused,
+        'holder_intersection': list(report.holder_intersection),
+        'counts': report.counts(),
+        'buckets': {
+            bucket: [_outcome_json(o) for o in report.outcomes if o.bucket is bucket]
+            for bucket in Bucket
+        },
+        'verification_census': None if verification is None else _census_json(verification),
+    }
+
+
 def render_json(result: SweepResult) -> str:
     return json.dumps(
         {
@@ -437,7 +487,7 @@ def render_json(result: SweepResult) -> str:
                 {
                     'project_root': project.census.project_root,
                     'census': _census_json(project.census),
-                    'apply': None,
+                    'apply': None if project.apply is None else _apply_json(project.apply),
                 }
                 for project in result.projects
             ],
@@ -472,6 +522,11 @@ _EXIT_CODE_MEANINGS = {
 def exit_code(result: SweepResult) -> ExitCode:
     if not result.projects:
         return ExitCode.NOTHING_READ
+    reports = [project.apply for project in result.projects if project.apply is not None]
+    if any(report.counts()[Bucket.FAILED] for report in reports):
+        return ExitCode.REPAIR_FAILED
+    if any(report.refused for report in reports):
+        return ExitCode.HOLDER_REFUSED
     return ExitCode.OK
 
 
@@ -513,13 +568,44 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+CLIENT_NAME = 'clear-leaked-claimants-4625'
+
+
+class ClaimantRepairClient(FusedMemoryClient):
+    _client_name = CLIENT_NAME
+
+
+_HANDSHAKE_ERRORS = (httpx.HTTPError, OSError, RuntimeError)
+
+
+async def _applying_sweep(
+    server_url: str, roots: Sequence[str], tiers: frozenset[Tier],
+) -> SweepResult | None:
+    async with contextlib.AsyncExitStack() as stack:
+        try:
+            client = await stack.enter_async_context(ClaimantRepairClient(server_url))
+        except _HANDSHAKE_ERRORS as exc:
+            print(
+                f'error: could not reach the fused-memory MCP server at {server_url}: '
+                f'{type(exc).__name__}: {exc}; nothing was written',
+                file=sys.stderr,
+            )
+            return None
+        return await sweep(roots, apply=True, tiers=tiers, client=client, clock=_utcnow)
+
+
 async def main_async(args: argparse.Namespace) -> int:
     tiers = frozenset({Tier.TERMINAL, Tier.HYGIENE} if args.repair_hygiene else {Tier.TERMINAL})
-    result = await sweep(args.project_roots, apply=False, tiers=tiers, client=None, clock=_utcnow)
-    code = exit_code(result)
-    if code is ExitCode.NOTHING_READ:
-        print(f'error: {_EXIT_CODE_MEANINGS[code]} (not a clean result)', file=sys.stderr)
+    if args.apply:
+        result = await _applying_sweep(args.server_url, args.project_roots, tiers)
+        if result is None:
+            return ExitCode.SERVER_UNREACHABLE
+    else:
+        result = await sweep(args.project_roots, apply=False, tiers=tiers, client=None, clock=_utcnow)
     print(render_json(result) if args.json else render_text(result))
+    code = exit_code(result)
+    if code is not ExitCode.OK:
+        print(f'error: {_EXIT_CODE_MEANINGS[code]}', file=sys.stderr)
     return code
 
 

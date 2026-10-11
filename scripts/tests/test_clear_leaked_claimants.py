@@ -12,7 +12,7 @@ import json
 import sqlite3
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -21,7 +21,9 @@ import pytest
 from _task_db_scan import UNREADABLE_STORE_ERRORS
 from clear_leaked_claimants import (
     STILL_VIOLATING_DETAIL,
+    ApplyReport,
     Bucket,
+    Census,
     ExitCode,
     Tier,
     apply_repairs,
@@ -268,7 +270,7 @@ class _FakeClaimantServer:
         self.error_replies: dict[int, dict] = {}
         self.raises: dict[int, Exception] = {}
         self.ack_without_write: set[int] = set()
-        self.concurrent_traffic: dict[int, Callable[[], None]] = {}
+        self.concurrent_traffic: dict[int, Callable[[], object]] = {}
 
     async def call_tool(self, name: str, arguments: dict) -> dict:
         self.calls.append((name, dict(arguments)))
@@ -307,6 +309,11 @@ def _buckets(report) -> dict[int, Bucket]:
     return {outcome.violation.task_id: outcome.bucket for outcome in report.outcomes}
 
 
+def _verification(report: ApplyReport) -> Census:
+    assert report.verification_census is not None
+    return report.verification_census
+
+
 class TestApplyRepairs:
     def test_clears_each_terminal_row_with_one_set_task_claimant_call(self, seed_root):
         root = seed_root(TIER_TABLE_ROWS)
@@ -341,7 +348,7 @@ class TestApplyRepairs:
 
         report = _apply(take_census(root, NOW), _FakeClaimantServer())
 
-        verification = report.verification_census
+        verification = _verification(report)
         assert verification.totals()['by_tier'][Tier.TERMINAL] == 0
         assert {v.task_id for v in verification.violations} == HYGIENE_IDS
 
@@ -382,6 +389,20 @@ def _outcome_for(report, task_id: int):
     return outcome
 
 
+def _skip_delta(report, task_id: int) -> Mapping:
+    outcome = _outcome_for(report, task_id)
+    assert outcome.bucket is Bucket.SKIPPED_CHANGED_UNDER_US
+    assert outcome.delta is not None
+    return outcome.delta
+
+
+def _failure_detail(report, task_id: int) -> str:
+    outcome = _outcome_for(report, task_id)
+    assert outcome.bucket is Bucket.FAILED
+    assert outcome.detail is not None
+    return outcome.detail
+
+
 class TestPerRowCorroboration:
     def test_a_row_reclaimed_after_the_census_keeps_its_live_claim(self, seed_root):
         root = seed_root(TIER_TABLE_ROWS)
@@ -397,10 +418,9 @@ class TestPerRowCorroboration:
         report = _apply(census, server)
 
         assert 4028 not in server.written_ids()
-        outcome = _outcome_for(report, 4028)
-        assert outcome.bucket is Bucket.SKIPPED_CHANGED_UNDER_US
-        assert outcome.delta['status'] == ('done', 'in-progress')
-        assert outcome.delta['claimant_run_id'] == (POSITIVE_CONTROL['claimant_run_id'], live_claim[0])
+        delta = _skip_delta(report, 4028)
+        assert delta['status'] == ('done', 'in-progress')
+        assert delta['claimant_run_id'] == (POSITIVE_CONTROL['claimant_run_id'], live_claim[0])
         assert _claimants(root)[4028] == live_claim
         assert _buckets(report)[5225] is Bucket.REPAIRED
         assert _buckets(report)[101] is Bucket.REPAIRED
@@ -414,9 +434,8 @@ class TestPerRowCorroboration:
         report = _apply(census, server)
 
         assert 101 not in server.written_ids()
-        outcome = _outcome_for(report, 101)
-        assert outcome.bucket is Bucket.SKIPPED_CHANGED_UNDER_US
-        assert outcome.delta['claimant_run_id'] == (FRESH_DONE['claimant_run_id'], 'run-other/101-z/pid=4')
+        delta = _skip_delta(report, 101)
+        assert delta['claimant_run_id'] == (FRESH_DONE['claimant_run_id'], 'run-other/101-z/pid=4')
 
     def test_a_refreshed_hygiene_heartbeat_declines_the_write(self, seed_root):
         root = seed_root(TIER_TABLE_ROWS)
@@ -427,10 +446,9 @@ class TestPerRowCorroboration:
         report = _apply(census, server, tiers=BOTH_TIERS)
 
         assert 103 not in server.written_ids()
-        outcome = _outcome_for(report, 103)
-        assert outcome.bucket is Bucket.SKIPPED_CHANGED_UNDER_US
-        assert outcome.delta['heartbeat_at'] == (STALE_PENDING['heartbeat_at'], _iso(FRESH))
-        assert outcome.delta['tier'] == ('hygiene', None)
+        delta = _skip_delta(report, 103)
+        assert delta['heartbeat_at'] == (STALE_PENDING['heartbeat_at'], _iso(FRESH))
+        assert delta['tier'] == ('hygiene', None)
 
     def test_a_row_deleted_after_the_census_is_skipped_as_absent(self, seed_root):
         root = seed_root(TIER_TABLE_ROWS)
@@ -441,9 +459,7 @@ class TestPerRowCorroboration:
         report = _apply(census, server)
 
         assert 4028 not in server.written_ids()
-        outcome = _outcome_for(report, 4028)
-        assert outcome.bucket is Bucket.SKIPPED_CHANGED_UNDER_US
-        assert outcome.delta == {'row': ('present', 'absent')}
+        assert _skip_delta(report, 4028) == {'row': ('present', 'absent')}
 
     def test_an_infra_hold_flag_set_after_the_census_declines_the_write(self, seed_root):
         root = seed_root(TIER_TABLE_ROWS)
@@ -454,9 +470,7 @@ class TestPerRowCorroboration:
         report = _apply(census, server, tiers=BOTH_TIERS)
 
         assert 103 not in server.written_ids()
-        outcome = _outcome_for(report, 103)
-        assert outcome.bucket is Bucket.SKIPPED_CHANGED_UNDER_US
-        assert outcome.delta == {'tier': ('hygiene', None)}
+        assert _skip_delta(report, 103) == {'tier': ('hygiene', None)}
 
 
 ARRIVAL_CLAIM = ('run-z/9001-q/pid=9', _iso(NOW - timedelta(days=3)))
@@ -496,7 +510,7 @@ class TestBucketAccounting:
         assert 9001 not in server.written_ids()
         arrival = _outcome_for(report, 9001)
         assert arrival.bucket is Bucket.ARRIVED_DURING_WINDOW
-        assert arrival.violation.measured_at == report.verification_census.measured_at
+        assert arrival.violation.measured_at == _verification(report).measured_at
         assert arrival.violation.measured_at > NOW
         assert _claimants(root)[9001] == ARRIVAL_CLAIM
 
@@ -507,9 +521,7 @@ class TestBucketAccounting:
 
         report = _apply(take_census(root, NOW), server)
 
-        rejected = _outcome_for(report, 5225)
-        assert rejected.bucket is Bucket.FAILED
-        assert 'TaskmasterError' in rejected.detail
+        assert 'TaskmasterError' in _failure_detail(report, 5225)
         assert _buckets(report)[4028] is Bucket.REPAIRED
         assert _buckets(report)[101] is Bucket.REPAIRED
 
@@ -520,9 +532,7 @@ class TestBucketAccounting:
 
         report = _apply(take_census(root, NOW), server)
 
-        raised = _outcome_for(report, 4028)
-        assert raised.bucket is Bucket.FAILED
-        assert 'OSError' in raised.detail
+        assert 'OSError' in _failure_detail(report, 4028)
         assert 5225 in server.written_ids()
         assert _buckets(report)[5225] is Bucket.REPAIRED
 
@@ -533,9 +543,7 @@ class TestBucketAccounting:
 
         report = _apply(take_census(root, NOW), server)
 
-        unstuck = _outcome_for(report, 101)
-        assert unstuck.bucket is Bucket.FAILED
-        assert unstuck.detail == STILL_VIOLATING_DETAIL
+        assert _failure_detail(report, 101) == STILL_VIOLATING_DETAIL
 
     def test_every_row_lands_in_exactly_one_bucket_and_no_repaired_row_still_violates(
         self, seed_root,
@@ -553,7 +561,7 @@ class TestBucketAccounting:
         assert len(keys) == len(set(keys))
         selected = {v.key for v in census.violations if v.tier is Tier.TERMINAL}
         remaining = {
-            v.key for v in report.verification_census.violations if v.tier is Tier.TERMINAL
+            v.key for v in _verification(report).violations if v.tier is Tier.TERMINAL
         }
         assert set(keys) == selected | remaining
         by_bucket = {
