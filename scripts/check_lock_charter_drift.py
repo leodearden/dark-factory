@@ -87,17 +87,17 @@ _STATUS_BY_EXIT = {
 #: steers both to the same root.
 GUARD_RELPATH = Path('scripts') / 'lock-charter-guard.sh'
 
-#: Bound on a single guard-script invocation.  Generous — the real script is a
-#: pure `printf` — but finite: an unbounded call would let a hung sibling script
-#: hang a scheduled job indefinitely, which is the never-answers failure of a
-#: missing script with no output at all to diagnose it from.
-GUARD_TIMEOUT_SECS = 30.0
+#: Bound on every subprocess this script runs — the guard script and ``git``.
+#: Generous (the real guard is a pure `printf`) but finite: an unbounded call
+#: would let a hung sibling script, or a ``git`` stuck on a lock or a network
+#: filesystem, hang a scheduled job indefinitely with no output to diagnose.
+SUBPROCESS_TIMEOUT_SECS = 30.0
 
 Report = dict[str, Any]
 
 
 class GuardUnavailable(Exception):
-    """The reify guard script could not be run, or ran and failed.
+    """A subprocess asking reify a question — its guard script or ``git`` — could not run, or failed.
 
     Deliberately a narrow, module-local exception rather than a reused builtin:
     callers catch it to convert "could not look" into `EXIT_UNAVAILABLE`, and a
@@ -111,7 +111,7 @@ class GuardUnavailable(Exception):
     """
 
 
-def _guard_vector(script: Path, flag: str, *, timeout: float = GUARD_TIMEOUT_SECS) -> list[str]:
+def _guard_vector(script: Path, flag: str, *, timeout: float = SUBPROCESS_TIMEOUT_SECS) -> list[str]:
     """Return the sorted vector emitted by reify's guard *script* for *flag*.
 
     LOUD on failure, by design, and the distinction matters.  The in-suite
@@ -189,7 +189,7 @@ _VECTORS = (
 )
 
 
-def check_vectors(reify_repo: Path, *, timeout: float = GUARD_TIMEOUT_SECS) -> Report:
+def check_vectors(reify_repo: Path, *, timeout: float = SUBPROCESS_TIMEOUT_SECS) -> Report:
     """Compare reify's declared allowlist vectors against dark-factory's.
 
     Returns a report dict carrying ``status``, ``exit_code``, a per-vector
@@ -252,7 +252,9 @@ def check_vectors(reify_repo: Path, *, timeout: float = GUARD_TIMEOUT_SECS) -> R
     }
 
 
-def tracked_paths(repo_root: Path) -> tuple[list[str], list[str]]:
+def tracked_paths(
+    repo_root: Path, *, timeout: float = SUBPROCESS_TIMEOUT_SECS,
+) -> tuple[list[str], list[str]]:
     """``(non_gitlink_paths, gitlink_paths)`` for *repo_root*'s tracked corpus.
 
     ONE parse of the corpus, split by git's OWN mode column, so nothing
@@ -265,15 +267,25 @@ def tracked_paths(repo_root: Path) -> tuple[list[str], list[str]]:
     deriving the exclusion from the mode column rather than from hardcoded
     submodule names means it keeps working the day reify renames or adds one.
 
-    Raises `GuardUnavailable` on a non-zero rc — a directory that is not a
-    checkout did not answer the question, and returning an empty corpus would
-    report a vacuous, confident OK.
+    Raises `GuardUnavailable` whenever ``git`` did not answer — a non-zero rc
+    (not a checkout), an ``OSError`` (no ``git`` on ``PATH``), or a timeout.
+    Returning an empty corpus would report a vacuous, confident OK, and an
+    escaping ``OSError`` would exit 1, which a caller reads as DRIFT.
     """
-    result = subprocess.run(
-        ['git', '-C', str(repo_root), 'ls-files', '-s', '-z'],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ['git', '-C', str(repo_root), 'ls-files', '-s', '-z'],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise GuardUnavailable(
+            f'`git ls-files` in {repo_root} did not finish within {timeout}s — '
+            f'the tracked corpus was never swept'
+        ) from exc
+    except OSError as exc:
+        raise GuardUnavailable(f'could not run `git ls-files` in {repo_root}: {exc}') from exc
     if result.returncode != 0:
         raise GuardUnavailable(
             f'`git ls-files` in {repo_root} exited {result.returncode} — not a '
@@ -296,7 +308,7 @@ def tracked_paths(repo_root: Path) -> tuple[list[str], list[str]]:
     return paths, gitlinks
 
 
-def check_corpus(reify_repo: Path) -> Report:
+def check_corpus(reify_repo: Path, *, timeout: float = SUBPROCESS_TIMEOUT_SECS) -> Report:
     """Sweep reify's tracked corpus and report paths the predicate REJECTS.
 
     Direction: **corpus -> allowlist**.  This is the failure mode that produced
@@ -319,7 +331,7 @@ def check_corpus(reify_repo: Path) -> Report:
     name-by-name judgement and stays out of this sweep.
     """
     try:
-        paths, gitlinks = tracked_paths(Path(reify_repo))
+        paths, gitlinks = tracked_paths(Path(reify_repo), timeout=timeout)
     except GuardUnavailable as exc:
         return {
             'status': _STATUS_BY_EXIT[EXIT_UNAVAILABLE],
@@ -376,7 +388,7 @@ def check_corpus(reify_repo: Path) -> Report:
 _SEVERITY = {EXIT_OK: 0, EXIT_DRIFT: 1, EXIT_UNAVAILABLE: 2}
 
 
-def check(reify_repo: Path, *, timeout: float = GUARD_TIMEOUT_SECS) -> Report:
+def check(reify_repo: Path, *, timeout: float = SUBPROCESS_TIMEOUT_SECS) -> Report:
     """Run both halves and fold them into one report, worst outcome wins.
 
     Ordering is UNAVAILABLE > DRIFT > OK.  This is the same "absence is never a
@@ -396,7 +408,7 @@ def check(reify_repo: Path, *, timeout: float = GUARD_TIMEOUT_SECS) -> Report:
     """
     parts = {
         'vectors': check_vectors(Path(reify_repo), timeout=timeout),
-        'corpus': check_corpus(Path(reify_repo)),
+        'corpus': check_corpus(Path(reify_repo), timeout=timeout),
     }
     exit_code = max((p['exit_code'] for p in parts.values()), key=lambda c: _SEVERITY[c])
     return {

@@ -363,29 +363,30 @@ class TestGuardVectorHelper:
 class TestImportIsHermetic:
     """Importing the module must not touch a real checkout (task 3226 pre-3)."""
 
-    def test_module_import_resolves_no_checkout_at_module_scope(self):
-        """A fresh interpreter importing the module must not shell out or resolve reify.
+    def test_importing_the_module_neither_resolves_reify_nor_spawns_a_process(self):
+        """A fresh interpreter whose resolver and process spawners all raise
+        must still import the module.
 
         Module-level resolution is what makes the in-suite guards' constants
-        evaluate at IMPORT time and therefore un-steerable by ``monkeypatch``.
-        Here it would also mean a scheduled job's ``--help`` silently depended on
-        the ambient ``REIFY_ROOT``.
-
-        Deliberately NOT a source-text scan.  A column-0 substring sweep for
-        ``resolve_reify_checkout(`` also matches this module's OWN docstring
-        lines, so rewording prose -- changing no code -- turned it red: it
-        pinned comment content, not referential integrity.
-
-        What this case still buys: a fresh interpreter must import the module
-        cleanly, so an import-time shell-out or raise is caught here.  The
-        stronger half of the invariant -- that resolution is per-call and so
-        remains steerable by ``monkeypatch`` -- is covered BEHAVIOURALLY by
-        `TestResolve`, whose cases set ``REIFY_ROOT`` *after* import.  Verified
-        by construction (task 3226): freezing the answer in a module-scope
-        constant and serving it from ``resolve()`` reds six of them.
+        evaluate at IMPORT time and therefore un-steerable by ``monkeypatch``;
+        here it would also make a scheduled job's ``--help`` depend on the
+        ambient ``REIFY_ROOT``.  Patching the seams themselves, rather than
+        steering ``REIFY_ROOT``, catches a module-scope call whether it would
+        have succeeded or failed.
         """
+        forbid_then_import = (
+            'import subprocess\n'
+            'import shared.reify_checkout as reify_checkout\n'
+            'def _forbidden(*args, **kwargs):\n'
+            '    raise SystemExit(f"reached at import time: {args!r}")\n'
+            'reify_checkout.resolve_reify_checkout = _forbidden\n'
+            'reify_checkout.reify_skip_reason = _forbidden\n'
+            'subprocess.Popen = _forbidden\n'
+            'subprocess.run = _forbidden\n'
+            'import check_lock_charter_drift\n'
+        )
         proc = subprocess.run(
-            [sys.executable, '-c', 'import check_lock_charter_drift'],
+            [sys.executable, '-c', forbid_then_import],
             capture_output=True,
             text=True,
             cwd=str(Path(drift.__file__).parent),
@@ -560,6 +561,42 @@ class TestTrackedPaths:
         plain.mkdir()
         with pytest.raises(drift.GuardUnavailable):
             drift.tracked_paths(plain)
+
+    def test_raises_guard_unavailable_when_git_is_not_on_path(self, tmp_path, monkeypatch):
+        """No ``git`` is "could not look": an escaping FileNotFoundError would
+        exit 1, which a caller reads as DRIFT — a false accusation."""
+        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
+        empty_bin = tmp_path / 'empty-bin'
+        empty_bin.mkdir()
+        monkeypatch.setenv('PATH', str(empty_bin))
+
+        with pytest.raises(drift.GuardUnavailable):
+            drift.tracked_paths(repo)
+
+    def test_raises_guard_unavailable_when_git_hangs(self, tmp_path, monkeypatch):
+        """A ``git`` stuck on a lock or a network filesystem is bounded, not waited on."""
+        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
+        fake_bin = tmp_path / 'fake-bin'
+        fake_bin.mkdir()
+        fake_git = fake_bin / 'git'
+        fake_git.write_text('#!/bin/sh\nexec sleep 30\n')
+        fake_git.chmod(0o755)
+        monkeypatch.setenv('PATH', f'{fake_bin}{os.pathsep}{os.environ["PATH"]}')
+
+        with pytest.raises(drift.GuardUnavailable):
+            drift.tracked_paths(repo, timeout=0.5)
+
+    def test_missing_git_makes_the_corpus_sweep_unavailable_not_drift(
+        self, tmp_path, monkeypatch,
+    ):
+        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
+        empty_bin = tmp_path / 'empty-bin'
+        empty_bin.mkdir()
+        monkeypatch.setenv('PATH', str(empty_bin))
+
+        report = drift.check_corpus(repo)
+
+        assert report['exit_code'] == drift.EXIT_UNAVAILABLE, report
 
 
 class TestCheckComposition:
