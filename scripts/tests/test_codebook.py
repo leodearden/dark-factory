@@ -20,6 +20,7 @@ from typing import Any
 import pytest
 from legibility import codebook as mod
 from legibility import coder, invariants
+from shared.finding_key import finding_key
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -2313,3 +2314,181 @@ def test_live_codebook_withdraws_the_refuted_em_dash_framing():
         f"the index line the coder actually reads still asserts the refuted "
         f"framing via {still_rendered}: {rendered!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# task 6402 (census PRD leaf L3, C1): finding identity, run history and ticket
+# fields on entries and candidates. Every field is optional; each rejection
+# names the field path and carries the offending value (INV-2).
+# ---------------------------------------------------------------------------
+
+_C1_RUN = "census-dark_factory-20261010"
+_C1_KEY = finding_key("orchestrator", "orchestrator/x.py::f", "h13")
+_C1_OLD_KEY = finding_key("orchestrator", "orchestrator/x.py::old", "h13")
+_C1_ENTRY_FIELDS = {
+    "finding_key": _C1_KEY,
+    "finding_area": "orchestrator",
+    "finding_anchor": "orchestrator/x.py::f",
+    "finding_tags": ["h13", "kind:confusion"],
+    "severity_reason": "r",
+    "first_seen_run": _C1_RUN,
+    "last_seen_runs": [_C1_RUN],
+    "supersedes": [_C1_OLD_KEY],
+    "fixed_at_sha": "abc1234",
+    "accepted_by": 42,
+}
+
+
+def _c1_ticket(**overrides: Any) -> dict:
+    row = {
+        "ticket": "tkt_1",
+        "project_root": "/r",
+        "run_id": "census-x-20261010",
+        "finding_key": _C1_KEY,
+        "task_id": 12,
+        "resolution": "created",
+        "step": "curator",
+    }
+    row.update(overrides)
+    return row
+
+
+def _c1_entry(**overrides: Any) -> dict:
+    entry = _minimal_v2()["entries"][0]
+    entry.update(copy.deepcopy(_C1_ENTRY_FIELDS))
+    entry["status"] = "accepted"
+    entry["filed_tickets"] = [
+        _c1_ticket(),
+        _c1_ticket(ticket=None, task_id=None, resolution=None),
+    ]
+    entry.update(overrides)
+    return entry
+
+
+def _c1_candidate(**overrides: Any) -> dict:
+    candidate = {
+        "id": "cand-20261010-1",
+        "title": "a novel shape",
+        "first_seen": "2026-10-10",
+        "disposition": "rejected",
+        "sightings": [],
+        "finding_key": _C1_KEY,
+        "finding_area": "orchestrator",
+        "finding_anchor": "orchestrator/x.py::f",
+        "finding_tags": ["h13", "kind:confusion"],
+        "attached_by": {"method": "similarity", "score": 0.93, "run_id": "census-x-20261010"},
+        "adjudicated_with": "cand-20261010-3",
+    }
+    candidate.update(overrides)
+    return candidate
+
+
+def _c1_codebook(*, entry: dict | None = None, candidate: dict | None = None) -> dict:
+    codebook = _minimal_v2()
+    codebook["entries"] = [entry if entry is not None else _c1_entry()]
+    codebook["candidates"] = [candidate] if candidate is not None else []
+    return codebook
+
+
+def _c1_errors_naming(codebook: dict, path: str, offending: Any) -> list[str]:
+    return [error for error in mod.validate(codebook) if path in error and repr(offending) in error]
+
+
+def test_accepted_is_a_codebook_status():
+    assert "accepted" in mod.STATUSES
+
+
+def test_an_entry_carrying_every_c1_field_validates():
+    assert mod.validate(_c1_codebook()) == []
+
+
+def test_the_c1_fields_are_all_optional_on_an_entry():
+    entry = _c1_entry(status="open")
+    for field in [*_C1_ENTRY_FIELDS, "filed_tickets"]:
+        del entry[field]
+    assert mod.validate(_c1_codebook(entry=entry)) == []
+
+
+@pytest.mark.parametrize(
+    "field, value, offending",
+    [
+        ("finding_key", "fk-ZZZ", "fk-ZZZ"),
+        ("finding_key", "fk-0123456789ab0", "fk-0123456789ab0"),
+        ("finding_area", "orchestrator/merge-queue", "orchestrator/merge-queue"),
+        ("finding_tags", [], []),
+        ("finding_tags", "h13", "h13"),
+        ("last_seen_runs", _C1_RUN, _C1_RUN),
+        ("supersedes", ["not-a-key"], "not-a-key"),
+        ("fixed_at_sha", "XYZ", "XYZ"),
+        ("accepted_by", "42", "42"),
+    ],
+)
+def test_validate_rejects_a_malformed_c1_entry_field(field, value, offending):
+    codebook = _c1_codebook(entry=_c1_entry(**{field: value}))
+    assert _c1_errors_naming(codebook, f"entries/0/{field}", offending)
+
+
+@pytest.mark.parametrize(
+    "overrides, offending",
+    [
+        ({"resolution": "maybe"}, "maybe"),
+        ({"step": "guess"}, "guess"),
+        ({"task_id": True}, True),
+        ({"task_id": "12"}, "12"),
+    ],
+)
+def test_validate_rejects_a_malformed_filed_ticket_row(overrides, offending):
+    codebook = _c1_codebook(entry=_c1_entry(filed_tickets=[_c1_ticket(**overrides)]))
+    assert _c1_errors_naming(codebook, "entries/0/filed_tickets/0", offending)
+
+
+def test_validate_rejects_a_filed_ticket_row_missing_its_step():
+    row = _c1_ticket()
+    del row["step"]
+    codebook = _c1_codebook(entry=_c1_entry(filed_tickets=[row]))
+    assert _c1_errors_naming(codebook, "entries/0/filed_tickets/0", "step")
+
+
+def test_validate_rejects_an_accepted_entry_without_accepted_by():
+    entry = _c1_entry()
+    del entry["accepted_by"]
+    errors = mod.validate(_c1_codebook(entry=entry))
+    assert [error for error in errors if "entry-a" in error and "accepted_by" in error]
+
+
+def test_legacy_filed_tasks_stay_unconstrained():
+    for filed_tasks in ("2547, 2548", [2559]):
+        entry = _c1_entry(filed_tasks=filed_tasks)
+        assert mod.validate(_c1_codebook(entry=entry)) == []
+
+
+def test_a_candidate_carrying_every_c1_field_validates():
+    assert mod.validate(_c1_codebook(candidate=_c1_candidate())) == []
+
+
+def test_validate_rejects_a_candidate_attached_by_with_an_unknown_method():
+    candidate = _c1_candidate(attached_by={"method": "vibes", "run_id": _C1_RUN})
+    codebook = _c1_codebook(candidate=candidate)
+    assert _c1_errors_naming(codebook, "candidates/0/attached_by/method", "vibes")
+
+
+def test_validate_rejects_a_candidate_attached_by_with_a_string_score():
+    candidate = _c1_candidate(attached_by={"method": "similarity", "score": "0.9", "run_id": _C1_RUN})
+    codebook = _c1_codebook(candidate=candidate)
+    assert _c1_errors_naming(codebook, "candidates/0/attached_by/score", "0.9")
+
+
+def test_validate_rejects_a_candidate_attached_by_without_a_run_id():
+    candidate = _c1_candidate(attached_by={"method": "key"})
+    codebook = _c1_codebook(candidate=candidate)
+    assert _c1_errors_naming(codebook, "candidates/0/attached_by", "run_id")
+
+
+def test_validate_rejects_a_candidate_adjudicated_with_a_non_candidate_id():
+    codebook = _c1_codebook(candidate=_c1_candidate(adjudicated_with="cand-x"))
+    assert _c1_errors_naming(codebook, "candidates/0/adjudicated_with", "cand-x")
+
+
+def test_a_candidates_finding_identity_is_validated_like_an_entrys():
+    codebook = _c1_codebook(candidate=_c1_candidate(finding_area="orchestrator/merge-queue"))
+    assert _c1_errors_naming(codebook, "candidates/0/finding_area", "orchestrator/merge-queue")
