@@ -33,6 +33,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from orchestrator.evals.metrics import EvalMetrics, compute_composite
+from orchestrator.evals.results import CellName, ResultStore
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff
 from orchestrator.evals.reviewer_trial.runner import _run_single_reviewer
 from orchestrator.evals.reviewer_trial.variants import VARIANT_A
@@ -48,8 +49,7 @@ logger = logging.getLogger(__name__)
 # Override via ``--cutoff`` if this is off.
 CUTOFF = datetime(2026, 4, 8, 10, 32, 0, tzinfo=UTC)
 
-RESULTS_DIR = Path(__file__).parent / 'results'
-RE_REVIEWS_DIR = RESULTS_DIR / 're_reviews'
+RE_REVIEWS_DIR = ResultStore.packaged().directory / 're_reviews'
 PROGRESS_FILE = RE_REVIEWS_DIR / '_progress.jsonl'
 
 MAX_CONCURRENCY = 24
@@ -123,14 +123,19 @@ def append_jsonl(path: Path, entry: dict) -> None:
         f.write(json.dumps(entry) + '\n')
 
 
+def _filename_run_id(result_path: Path) -> str:
+    try:
+        return ResultStore.parse_name(result_path).run_id
+    except ValueError:
+        return ''
+
+
 def _extract_run_id(result_path: Path, data: dict) -> str:
-    """Pull run_id from the result data, filename suffix, or worktree path."""
+    """Pull run_id from the result data, the cell's filename, or worktree path."""
     rid = data.get('run_id') or ''
     if rid:
         return rid
-    # Filename convention: task_id__config_name__<runid>.json
-    parts = result_path.stem.split('__')
-    tail = parts[-1] if len(parts) >= 3 else ''
+    tail = _filename_run_id(result_path)
     if len(tail) == 8 and all(c in _HEX for c in tail):
         return tail
     wt = data.get('worktree_path', '')
@@ -145,10 +150,15 @@ def _extract_run_id(result_path: Path, data: dict) -> str:
 # Enumeration
 # ---------------------------------------------------------------------------
 
-def enumerate_candidates(cutoff: datetime, force: bool) -> list[Candidate]:
-    """Return done-outcome pre-cutoff results whose worktree is intact."""
+def enumerate_candidates(
+    cutoff: datetime, force: bool, *, store: ResultStore | None = None,
+) -> list[Candidate]:
+    """Return done-outcome pre-cutoff cells of *store* whose worktree is intact.
+
+    ``None`` reads :meth:`ResultStore.packaged`.
+    """
     cands: list[Candidate] = []
-    for path in sorted(RESULTS_DIR.glob('*.json')):
+    for path in (store or ResultStore.packaged()).cell_paths():
         try:
             data = json.loads(path.read_text())
         except (json.JSONDecodeError, OSError) as e:
@@ -295,8 +305,7 @@ async def rereview_one(cand: Candidate) -> RereviewOutcome:
 
     # 3. Dump the raw review JSON (atomic).
     raw_path = (
-        RE_REVIEWS_DIR
-        / f'{cand.task_id}__{cand.config_name}__{cand.run_id}.json'
+        RE_REVIEWS_DIR / CellName(cand.task_id, cand.config_name, cand.run_id).filename
     )
     atomic_write_json(raw_path, {
         'task_id': cand.task_id,

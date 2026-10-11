@@ -152,7 +152,11 @@ class ResultStore:
         return bool(self.paths_matching(task_id, config_name))
 
     def load_all(self) -> list[EvalResult]:
-        """Every top-level cell, whatever its name; a bad cell or dir is named loudly."""
+        """Every top-level cell, whatever its name.
+
+        A missing dir or an unreadable cell raises naming it, never an empty or
+        shortened list: either would read as a real, smaller measurement.
+        """
         if not self.directory.is_dir():
             raise MissingResultsDirError(
                 self.directory, 'results dir not found (or is not a directory)'
