@@ -188,6 +188,7 @@ from orchestrator.verify import (
     VerifyResult,
     _derive_task_files_from_git,
     cached_main_baseline_failing_ids,
+    describe_new_failing_ids,
     diff_new_failures,
     known_failing_ids_on_main,
     red_module_prefixes_of,
@@ -3492,9 +3493,8 @@ async def _run_post_merge_verify(
                 if _cached_baseline is not None:
                     new_ids = diff_new_failures(verify.failing_test_ids, _cached_baseline)
         if new_ids:
-            reason = (
-                f'Post-merge verification failed: {len(new_ids)} new failing '
-                f"test(s) not present on main: {', '.join(sorted(new_ids))}"
+            reason = 'Post-merge verification failed: ' + describe_new_failing_ids(
+                new_ids, _current_main_sha,
             )
         else:
             reason = f'Post-merge verification failed: {verify.summary}'
@@ -3713,7 +3713,7 @@ async def _run_post_merge_verify(
                 req.task_id, len(verify.failing_test_ids),
                 ', '.join(sorted(verify.failing_test_ids)), merge_sha,
             )
-        seed_main_baseline(merge_sha, frozenset())
+        seed_main_baseline(merge_sha, frozenset(), skipped=verify.skipped_test_ids)
 
     return None
 

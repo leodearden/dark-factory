@@ -1946,6 +1946,160 @@ class TestExtractFailingTestIdsFromJunit:
         ]
 
 
+class TestExtractTestIdsFromJunit:
+    """``_extract_test_ids_from_junit(path)`` — ONE parse, failing and skipped vectors.
+
+    Task 3226.  The failing vector alone leaves ``main_baseline_failing_ids``
+    unable to tell "main RAN this test and it passed" from "main never ran it";
+    only the first supports the task-fault conclusion the id-diff fast path in
+    ``verify_failure_is_preexisting_on_main`` draws.  The skipped vector is the
+    never-executed population, so it must hold exactly the tests the run did
+    not execute — an xfail ran.
+    """
+
+    # DELIBERATELY the failing parser's fixture, verbatim: the partition
+    # assertion below is that ONE report yields two disjoint vectors.
+    _JUNIT_XML = TestExtractFailingTestIdsFromJunit._JUNIT_XML
+
+    @staticmethod
+    def _parse(tmp_path: Path, xml: str) -> verify._JunitTestIds | None:
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text(xml)
+        return verify._extract_test_ids_from_junit(junit_path)
+
+    @staticmethod
+    def _suite(*testcases: str) -> str:
+        return (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuites><testsuite name="pytest">'
+            + ''.join(testcases)
+            + '</testsuite></testsuites>\n'
+        )
+
+    def test_one_report_partitions_into_failing_and_skipped(self, tmp_path: Path):
+        """Failing and skipped are DISJOINT, a pass is in neither, and the
+        failing projection agrees with the pair."""
+        ids = self._parse(tmp_path, self._JUNIT_XML)
+
+        assert ids == (
+            ['tests.test_sample::test_error', 'tests.test_sample::test_fail'],
+            ['tests.test_sample::test_skip'],
+        ), ids
+        assert ids is not None
+        assert verify._extract_failing_test_ids_from_junit(tmp_path / 'junit.xml') == ids.failing
+
+    def test_nothing_skipped_is_an_empty_vector_not_none(self, tmp_path: Path):
+        """``[]`` ("junit collected, zero skipped") licenses "main ran
+        everything"; ``None`` (no report) licenses nothing."""
+        ids = self._parse(
+            tmp_path,
+            self._suite('<testcase classname="tests.test_sample" name="test_pass" />'),
+        )
+
+        assert ids == ([], [])
+
+    def test_xfail_ran_so_it_is_not_skipped(self, tmp_path: Path):
+        """pytest writes an xfail as ``<skipped type="pytest.xfail">``
+        (``_pytest/junitxml.py::_NodeReporter.append_skipped``), but the test
+        RAN.  Counting it as skipped would let the merge-queue reason say
+        "main never ran" about a test main did run."""
+        ids = self._parse(
+            tmp_path,
+            self._suite(
+                '<testcase classname="t" name="test_xfail">'
+                '<skipped type="pytest.xfail" message="known bug" /></testcase>',
+                '<testcase classname="t" name="test_skip">'
+                '<skipped type="pytest.skip" message="no reify checkout">x</skipped>'
+                '</testcase>',
+            ),
+        )
+
+        assert ids == ([], ['t::test_skip']), ids
+
+    def test_strict_xpass_ran_so_it_is_not_skipped(self, tmp_path: Path):
+        """A strict XPASS is written as an UNTYPED ``<skipped>`` with a fixed
+        message (``_pytest/junitxml.py::_NodeReporter.append_failure``); it ran
+        too.  An untyped collection skip did not, and stays skipped."""
+        ids = self._parse(
+            tmp_path,
+            self._suite(
+                '<testcase classname="t" name="test_xpass_strict">'
+                '<skipped message="xfail-marked test passes unexpectedly" /></testcase>',
+                '<testcase classname="t" name="test_module">'
+                '<skipped message="collection skipped">reason</skipped></testcase>',
+            ),
+        )
+
+        assert ids == ([], ['t::test_module']), ids
+
+    def test_a_testcase_with_a_failure_is_failing_whatever_else_it_records(
+        self, tmp_path: Path,
+    ):
+        """A skip in the call phase plus a teardown error lands in ``failing``
+        only, so the two vectors stay disjoint by construction."""
+        ids = self._parse(
+            tmp_path,
+            self._suite(
+                '<testcase classname="t" name="test_both">'
+                '<skipped type="pytest.skip" message="s" />'
+                '<error message="failed on teardown">boom</error></testcase>',
+            ),
+        )
+
+        assert ids == (['t::test_both'], []), ids
+
+    def test_bare_testsuite_root_is_handled(self, tmp_path: Path):
+        """A writer that omits the ``<testsuites>`` wrapper must not yield an
+        empty vector, which would read as "nothing skipped"."""
+        ids = self._parse(
+            tmp_path,
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuite name="pytest" tests="1">'
+            '<testcase classname="tests.test_sample" name="test_skip">'
+            '<skipped message="no reify checkout" type="pytest.skip" />'
+            '</testcase></testsuite>\n',
+        )
+
+        assert ids == ([], ['tests.test_sample::test_skip'])
+
+    def test_both_vectors_share_the_classname_file_name_id_fallback(self, tmp_path: Path):
+        """The vectors are set-differenced against each other downstream, so
+        they must spell an id identically: classname, then file, then name."""
+        ids = self._parse(
+            tmp_path,
+            self._suite(
+                '<testcase file="tests/test_x.py" name="test_by_file">'
+                '<skipped message="s" /></testcase>',
+                '<testcase name="test_bare"><failure message="f" /></testcase>',
+            ),
+        )
+
+        assert ids == (['test_bare'], ['tests/test_x.py::test_by_file']), ids
+
+    def test_duplicate_ids_across_testsuites_are_deduplicated(self, tmp_path: Path):
+        ids = self._parse(
+            tmp_path,
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuites>'
+            '<testsuite name="pytest"><testcase classname="tests.test_sample" name="test_skip">'
+            '<skipped message="x" /></testcase></testsuite>'
+            '<testsuite name="pytest-rerun"><testcase classname="tests.test_sample" name="test_skip">'
+            '<skipped message="x" /></testcase></testsuite>'
+            '</testsuites>\n',
+        )
+
+        assert ids == ([], ['tests.test_sample::test_skip'])
+
+    def test_nonexistent_path_returns_none(self, tmp_path: Path):
+        """No junit collected — the B3 degrade signal, and NOT ``([], [])``,
+        which would license "main ran everything" from a report never written."""
+        assert verify._extract_test_ids_from_junit(tmp_path / 'missing.xml') is None
+
+    @pytest.mark.parametrize('content', ['not valid xml <<<', ''], ids=['malformed', 'empty'])
+    def test_unparseable_report_returns_none(self, tmp_path: Path, content: str):
+        assert self._parse(tmp_path, content) is None
+
+
 # ---------------------------------------------------------------------------
 # Task μ (verify-scope-inversion-prd.md) step-05: VerifyResult.failing_test_ids
 # — a plain JSON-native `list[str] | None` (mirrors the `contention` (task
@@ -1995,6 +2149,208 @@ class TestVerifyResultFailingTestIds:
 
         assert restored.failing_test_ids == []
         assert restored.failing_test_ids is not None
+
+
+class TestVerifyResultSkippedTestIds:
+    """VerifyResult carries `skipped_test_ids` beside `failing_test_ids` (task 3226).
+
+    Same three seams as the failing field — dataclass default, generic
+    asdict/**d codec, and `_aggregate_results` — because the two vectors are
+    consumed TOGETHER: a caller asks "did main run this test?" by checking one
+    against the other, and a field that survived only two of the three seams
+    would answer that question with stale or absent data at the third.
+
+    JSON-native `list[str] | None` like `contention`/`plan`/`failing_test_ids`,
+    so no serialization allowlist needs editing.
+    """
+
+    def _make_result(self, **overrides: Any) -> VerifyResult:
+        defaults: dict[str, Any] = dict(
+            passed=True,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='all good',
+        )
+        defaults.update(overrides)
+        return VerifyResult(**defaults)
+
+    def test_default_skipped_test_ids_is_none(self):
+        """None is the fail-OPAQUE default: no junit collected, nothing may be concluded."""
+        assert self._make_result().skipped_test_ids is None
+
+    def test_skipped_test_ids_round_trips_via_asdict_codec(self):
+        vr = self._make_result(skipped_test_ids=['a::b'])
+
+        restored = VerifyResult(**asdict(vr))
+
+        assert restored.skipped_test_ids == ['a::b']
+        assert restored == vr
+
+    def test_empty_skipped_test_ids_is_preserved_not_coerced_to_none(self):
+        """`[]` ("junit collected, zero skipped") must survive the codec distinctly.
+
+        Coercing it to None across the wire would erase the only positive
+        evidence that main ran its whole suite — turning a genuine "main ran
+        everything" into "we do not know", which fails the wrong way for the
+        caller this field exists to serve.
+        """
+        vr = self._make_result(skipped_test_ids=[])
+
+        restored = VerifyResult(**asdict(vr))
+
+        assert restored.skipped_test_ids == []
+        assert restored.skipped_test_ids is not None
+
+    @pytest.mark.asyncio
+    async def test_run_verification_parses_both_vectors_from_one_report(
+        self, tmp_path: Path,
+    ):
+        """Both vectors reach the result from ONE parse of the report.
+
+        Drives the real ``run_verification`` seam (nothing executes —
+        ``_run_cmd`` is a spy).  ``role='merge'`` plus
+        ``merge_verify_breadth='full'`` is exactly what makes ``junit_path``
+        non-None, so the seam is reached.  A single parse is what guarantees
+        the two vectors describe the same run.
+        """
+        worktree = tmp_path / 'merge-wt'
+        worktree.mkdir()
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        failing_sentinel = ['sentinel::failing']
+        skipped_sentinel = ['sentinel::skipped']
+        parser = MagicMock(
+            return_value=verify._JunitTestIds(failing=failing_sentinel, skipped=skipped_sentinel),
+        )
+
+        with (
+            patch('orchestrator.verify._run_cmd', new=AsyncMock(return_value=(0, '', False))),
+            patch.object(verify, '_extract_test_ids_from_junit', new=parser),
+        ):
+            result = await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=ModuleConfig(prefix='pkg', test_command='pytest'),
+                role='merge',
+                attempt_id=None,
+            )
+
+        # (a) both vectors reach the result on the correct fields — neither
+        #     dropped, aliased, nor swapped.
+        assert result.failing_test_ids == failing_sentinel, (
+            f'the failing vector must reach the result; got {result.failing_test_ids!r}'
+        )
+        assert result.skipped_test_ids == skipped_sentinel, (
+            f'the skipped vector must reach the result; got {result.skipped_test_ids!r}'
+        )
+
+        # (b) the report was parsed exactly once.
+        assert parser.call_count == 1, parser.call_args_list
+
+    @pytest.mark.asyncio
+    async def test_neither_vector_is_parsed_when_the_seam_is_not_reached(
+        self, tmp_path: Path,
+    ):
+        """(c) role='task' leaves junit_path None: the report is not parsed and
+        BOTH fields come back None."""
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        parser = MagicMock(
+            return_value=verify._JunitTestIds(
+                failing=['sentinel::failing'], skipped=['sentinel::skipped'],
+            ),
+        )
+
+        with (
+            patch('orchestrator.verify._run_cmd', new=AsyncMock(return_value=(0, '', False))),
+            patch.object(verify, '_extract_test_ids_from_junit', new=parser),
+        ):
+            result = await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=ModuleConfig(prefix='pkg', test_command='pytest'),
+                role='task',
+                attempt_id=None,
+            )
+
+        parser.assert_not_called()
+        assert result.failing_test_ids is None, result.failing_test_ids
+        assert result.skipped_test_ids is None, result.skipped_test_ids
+
+    def test_both_id_vectors_coexist_on_one_result(self):
+        """The two fields are independent — neither aliases nor overwrites the other."""
+        vr = self._make_result(failing_test_ids=['f::1'], skipped_test_ids=['s::1'])
+
+        restored = VerifyResult(**asdict(vr))
+
+        assert restored.failing_test_ids == ['f::1']
+        assert restored.skipped_test_ids == ['s::1']
+
+
+class TestAggregateResultsSkippedTestIds:
+    """`_aggregate_results` unions skipped_test_ids by the SAME rule as the failing side."""
+
+    def _r(self, **overrides: Any) -> VerifyResult:
+        defaults: dict[str, Any] = dict(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok'
+        )
+        defaults.update(overrides)
+        return VerifyResult(**defaults)
+
+    def test_all_none_stays_none(self):
+        agg = _aggregate_results([self._r(), self._r()])
+        assert agg.skipped_test_ids is None
+
+    def test_one_none_child_does_not_erase_another_childs_skip_evidence(self):
+        """The mixed case, and the reason the rule is None-iff-EVERY-child-is-None.
+
+        A module that collected no junit at all (None — OPAQUE command, or
+        breadth != full) knows nothing about skips; letting it POISON the
+        aggregate to None would discard a sibling module's real, collected skip
+        evidence and silently return the whole run to the can't-tell state this
+        task closes. None contributes nothing; it does not suppress.
+        """
+        agg = _aggregate_results([self._r(), self._r(skipped_test_ids=['a::b'])])
+
+        assert agg.skipped_test_ids == ['a::b'], (
+            f'an OPAQUE module must not erase a sibling\'s collected skips; got '
+            f'{agg.skipped_test_ids!r}'
+        )
+
+    def test_unions_sorts_and_dedupes_across_children(self):
+        agg = _aggregate_results(
+            [
+                self._r(skipped_test_ids=['y::2', 'shared::s']),
+                self._r(skipped_test_ids=['x::1', 'shared::s']),
+            ]
+        )
+
+        assert agg.skipped_test_ids == ['shared::s', 'x::1', 'y::2']
+
+    def test_empty_child_makes_the_aggregate_non_none(self):
+        """A child that collected junit and found zero skips is EVIDENCE, not silence."""
+        agg = _aggregate_results([self._r(), self._r(skipped_test_ids=[])])
+
+        assert agg.skipped_test_ids == []
+        assert agg.skipped_test_ids is not None
+
+    def test_failing_and_skipped_aggregate_independently(self):
+        """Wiring the new field must not perturb the failing side's aggregation."""
+        agg = _aggregate_results(
+            [
+                self._r(failing_test_ids=['f::1']),
+                self._r(skipped_test_ids=['s::1']),
+            ]
+        )
+
+        assert agg.failing_test_ids == ['f::1']
+        assert agg.skipped_test_ids == ['s::1']
+
 
 
 # ---------------------------------------------------------------------------
