@@ -142,6 +142,7 @@ from orchestrator.merge_lane.speculation_controller import (
 from orchestrator.merge_lane.types import (
     CapPermit,
     ChainResult,
+    ChainTruncationReason,
     Decided,
     DecidedItem,
     EscalationRecord,
@@ -6048,7 +6049,7 @@ async def classify_and_merge(
 # Deep merge-ahead chain builder (task 3184, PRD β —
 # ``plans/deep-merge-ahead-prd.md``)
 #
-# TWO INVARIANTS A FUTURE EDITOR MUST NOT BREAK:
+# THREE INVARIANTS A FUTURE EDITOR MUST NOT BREAK:
 #
 # 1. PURITY.  ``build_chain`` is pure w.r.t. queue state: it never calls
 #    ``_pop_next_pickable``, ``_note_transition``, ``_emit_merge_attempt``,
@@ -6062,6 +6063,12 @@ async def classify_and_merge(
 # 2. ONE WORKTREE.  Exactly one ``acquire_chain_build_lane`` per invocation;
 #    the merge loop reuses that lane via ``GitOps.merge_branch_into_worktree``.
 #    (``merge_to_main`` would provision a fresh worktree per item.)
+#
+# 3. BASE.  Nothing is merged until the lane's HEAD is confirmed to be
+#    ``head_merge_commit``: the tip is what δ's ``_land_chain_prefix``
+#    CAS-advances main onto, so a lane left off-base by any
+#    ``acquire_spec_lane`` route (worktree add, ``reset --hard``, the repo's
+#    ``seed-warm-lane.sh``) is refused, never stacked on.
 # ---------------------------------------------------------------------------
 
 
@@ -6107,8 +6114,8 @@ async def build_chain(
     :meth:`SpeculativeMergeWorker._run_inflight_verify`'s remaining
     non-adopting arms.
 
-    See the module section comment above for the two invariants (purity and
-    one-worktree) this function exists to uphold.
+    See the module section comment above for the three invariants (purity,
+    one-worktree and base) this function exists to uphold.
 
     **Caller cost — γ must bound this.**  One call blocks on one lane
     acquisition (``acquire_spec_lane``: ``git reset --hard``, ``git clean
@@ -6143,7 +6150,10 @@ async def build_chain(
             :meth:`SpeculativeMergeWorker.chain_snapshot`.
         head_merge_commit: The base to stack on — the frozen prefix tip, from
             :meth:`SpeculativeMergeWorker.frozen_prefix_tip` (which returns
-            ``main_sha`` when nothing is verifying).
+            ``main_sha`` when nothing is verifying).  The acquired lane is
+            confirmed to be checked out there before anything is merged;
+            otherwise the result is empty with
+            ``truncated_reason='lane_base_mismatch'``.
         cap: Hard ceiling from ``MergeDeepConfig.chain_cap``.  ``0`` is the
             kill switch.  Keyword-only, so a call site can never transpose it
             with *target_depth*.
@@ -6183,8 +6193,22 @@ async def build_chain(
     # `tip` starts at the base so a zero-link result still names a verifiable tip.
     tip = head_merge_commit
     truncated_at: str | None = None
-    truncated_reason: str | None = None
+    truncated_reason: ChainTruncationReason | None = None
     try:
+        rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane)
+        lane_head = out.strip() if rc == 0 else None
+        if lane_head != head_merge_commit:
+            logger.warning(
+                'build_chain: lane_base_mismatch — lane %s HEAD=%s, expected '
+                '%s; stacked nothing (depth=%d)',
+                lane.name, lane_head, head_merge_commit[:8], depth,
+            )
+            await release_chain_build_lane(git_ops, lane, warm=warm)
+            return ChainResult(
+                links=[], tip=head_merge_commit,
+                truncated_at=queue_snapshot[0].task_id,
+                truncated_reason='lane_base_mismatch',
+            )
         for req in queue_snapshot[:depth]:
             # ── DO NOT EMIT AN OUTCOME FOR `truncated_at` ────────────────
             # PRD decision #4: item j may conflict only with an *unlanded*
