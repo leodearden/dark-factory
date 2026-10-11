@@ -1,12 +1,6 @@
 """Dashboard data module for host load metrics — /api/load.
 
-Source-of-truth note
---------------------
-``LOAD_SAMPLES_SCHEMA`` is a copy of ``sampler.store._SCHEMA`` (task 1536).
-The dashboard tests run from the ``dashboard/`` subdir and must not take a
-runtime dependency on the sampler package.  If the sampler schema changes,
-this constant MUST be updated to stay aligned — the DB join columns (metric,
-ts, value, window_mean, window_max) are the consumer contract.
+The ``samples`` schema is owned by ``sampler/src/sampler/store.py::SCHEMA``.
 
 9-key allowlist
 ---------------
@@ -45,28 +39,6 @@ import aiosqlite
 from dashboard.data.db import with_db
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Schema (mirrors sampler.store._SCHEMA — keep in sync)
-# ---------------------------------------------------------------------------
-
-LOAD_SAMPLES_SCHEMA: str = """\
-CREATE TABLE IF NOT EXISTS samples (
-    ts          INTEGER NOT NULL,
-    metric      TEXT    NOT NULL,
-    value       REAL    NOT NULL,
-    window_mean REAL,
-    window_max  REAL
-);
-
-CREATE INDEX IF NOT EXISTS idx_samples_metric_ts
-    ON samples (metric, ts);
-
-CREATE TABLE IF NOT EXISTS meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT
-);
-"""
 
 # ---------------------------------------------------------------------------
 # Known metric allowlist

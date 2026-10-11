@@ -2,8 +2,9 @@
 
 Schema
 ------
-samples(ts INTEGER, metric TEXT, value REAL, window_mean REAL, window_max REAL)
-    idx_samples_metric_ts ON samples(metric, ts)
+samples(ts INTEGER, metric TEXT, value REAL, window_mean REAL, window_max REAL,
+        leaf TEXT)
+    idx_samples_metric_ts_leaf ON samples(metric, ts, leaf)
 
 meta(key TEXT PRIMARY KEY, value TEXT)
     Tracks last_vacuum_ts for the daily VACUUM gate and last_cleanup_ts for
@@ -80,27 +81,38 @@ from typing import Protocol
 
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 
-__all__ = ['Connect', 'LoadSampleStore', 'connect_durably']
+__all__ = ['SCHEMA', 'Connect', 'LoadSampleStore', 'connect_durably']
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA = """\
+# ``leaf`` is last because ALTER TABLE ADD COLUMN appends, so a migrated file
+# and a fresh one have the same shape.
+_TABLES_DDL = """\
 CREATE TABLE IF NOT EXISTS samples (
     ts          INTEGER NOT NULL,
     metric      TEXT    NOT NULL,
     value       REAL    NOT NULL,
     window_mean REAL,
-    window_max  REAL
+    window_max  REAL,
+    leaf        TEXT
 );
-
-CREATE INDEX IF NOT EXISTS idx_samples_metric_ts
-    ON samples (metric, ts);
 
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
 """
+
+_INDEX_DDL = 'CREATE INDEX IF NOT EXISTS idx_samples_metric_ts_leaf ON samples (metric, ts, leaf)'
+
+SCHEMA: str = f'{_TABLES_DDL}\n{_INDEX_DDL};\n'
+
+# The right-hand sides read the row's OLD metric, so one statement splits it.
+_SPLIT_LEGACY_KEYS_SQL = (
+    "UPDATE samples SET metric = substr(metric, 1, instr(metric, ':') - 1),"
+    " leaf = substr(metric, instr(metric, ':') + 1)"
+    " WHERE instr(metric, ':') > 0"
+)
 
 
 # A VACUUM is worth its whole-file rewrite only past this share of free pages.
@@ -132,6 +144,36 @@ def connect_durably(db_path: Path, *, autocommit: bool = False) -> sqlite3.Conne
     return conn
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Give a pre-leaf ``samples`` its ``leaf`` column, in ONE transaction.
+
+    The ADD COLUMN, the split of every legacy ``metric:leaf`` row, and the
+    swap to the leaf index commit together or roll back together, so a
+    failure leaves the file exactly as it was and the next construction
+    retries. The feature-detect runs under the write lock, so a concurrent
+    construction waits, then reads ``leaf`` present and does nothing.
+    Statements are ``execute()``d one by one: ``executescript`` would commit
+    first. The additive idiom is the one
+    ``orchestrator/src/orchestrator/run_store.py::RunStore._migrate_task_results_block_context``
+    follows; unlike it, a failure here raises, and the store is not built.
+    """
+    conn.execute('BEGIN IMMEDIATE')
+    try:
+        columns = {row[1] for row in conn.execute('PRAGMA table_info(samples)')}
+        if 'leaf' in columns:
+            conn.rollback()
+            return
+        conn.execute('ALTER TABLE samples ADD COLUMN leaf TEXT')
+        split = conn.execute(_SPLIT_LEGACY_KEYS_SQL).rowcount
+        conn.execute(_INDEX_DDL)
+        conn.execute('DROP INDEX IF EXISTS idx_samples_metric_ts')
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    logger.info('migrated samples to the leaf column: %d metric:leaf rows split', split)
+
+
 class LoadSampleStore:
     """Synchronous SQLite writer for per-tick load samples."""
 
@@ -149,13 +191,17 @@ class LoadSampleStore:
         return self._open(self.db_path, autocommit=autocommit)
 
     def _ensure_schema(self) -> None:
-        """Create the samples + meta tables and index idempotently."""
-        conn = self._connect()
-        try:
-            conn.executescript(_SCHEMA)
+        """Bring a fresh, pre-leaf or current file to ``SCHEMA``'s shape.
+
+        Tables, then the migration, then the index: running ``SCHEMA`` whole on
+        a pre-leaf file would fail, because its index names the ``leaf`` column
+        the migration has not added yet.
+        """
+        with contextlib.closing(self._connect()) as conn:
+            conn.executescript(_TABLES_DDL)
+            _migrate(conn)
+            conn.execute(_INDEX_DDL)
             conn.commit()
-        finally:
-            conn.close()
 
     # ------------------------------------------------------------------
     # Write
