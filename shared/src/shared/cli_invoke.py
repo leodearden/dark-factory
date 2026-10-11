@@ -2522,8 +2522,9 @@ async def invoke_with_cap_retry(
             last_cap_wait_log_at = now
 
     account_name = ''
-    unattributed_cap = False  # True when heuristic fires but token is unresolvable;
-    # controls: (1) skip confirm, (2) mark capped=True in cost_store
+    # The RETURNED attempt's unattributed heuristic-cap verdict, read only by
+    # the cost row after the loop; re-stamped per dispatch like started_at.
+    unattributed_cap = False
     started_at = ''
     completed_at = ''
     # Loop-local, stamped onto the RETURNED result at the single exit below
@@ -2645,6 +2646,7 @@ async def invoke_with_cap_retry(
                 if config_dir and slot.token:
                     config_dir.write_credentials(slot.token)
 
+                unattributed_cap = False
                 started_at = datetime.now(UTC).isoformat()
                 logger.info(f'{label}: dispatching on account {account_name!r}')
                 result = await invoke(
@@ -2716,8 +2718,7 @@ async def invoke_with_cap_retry(
                         f'{account_name} ({outcome.reason}) — terminal, no '
                         f'cross-account failover',
                     )
-                    if not unattributed_cap:
-                        slot.confirm(result.cost_usd)
+                    slot.confirm(result.cost_usd)
                     break
 
                 # Pre-turn CLI REJECTION (task 3143 / esc-3118-1): the prompt
@@ -2757,8 +2758,7 @@ async def invoke_with_cap_retry(
                 # the ACCOUNT failed.
                 if _should_retry_cli_input_rejected(result, cli_input_rejected_retries):
                     cli_input_rejected_retries += 1
-                    if not unattributed_cap:
-                        slot.confirm(result.cost_usd)
+                    slot.confirm(result.cost_usd)
                     logger.warning(
                         f'{label}: CLI rejected the invocation before any model turn '
                         f'(no prompt reached the CLI) on account {account_name} — '
@@ -3169,8 +3169,7 @@ async def invoke_with_cap_retry(
                         f'cross-account failover; returning result to caller for '
                         f'transient requeue',
                     )
-                    if not unattributed_cap:
-                        slot.confirm(result.cost_usd)
+                    slot.confirm(result.cost_usd)
                     break
 
                 # Progress-timeout guard (reify-4827, task 2360 fix #2): a
@@ -3193,8 +3192,7 @@ async def invoke_with_cap_retry(
                         f'caller for γ re-resume instead of discarding into '
                         f'a fresh retry',
                     )
-                    if not unattributed_cap:
-                        slot.confirm(result.cost_usd)
+                    slot.confirm(result.cost_usd)
                     break
 
                 # Non-cap-hit failure while resuming → fall back to fresh invocation.
@@ -3225,8 +3223,7 @@ async def invoke_with_cap_retry(
                     _reset_for_fresh_retry(invoke_kwargs, original_prompt)
                     continue  # __aexit__ releases probe slot
 
-                if not unattributed_cap:
-                    slot.confirm(result.cost_usd)
+                slot.confirm(result.cost_usd)
                 break
 
     if retry_aborted:
