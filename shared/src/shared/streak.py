@@ -5,7 +5,7 @@ Contract: plans/review-all-s14-shared-leaves-prd.md, decision 11 and invariant I
 
 from __future__ import annotations
 
-from collections.abc import Hashable
+from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
@@ -50,3 +50,14 @@ class KeyedStreaks(Generic[K]):
     def count(self, key: K) -> int:
         """*key*'s current run length; 0 when it has none."""
         return self._counts.get(key, 0)
+
+    def forget(self, keys: Iterable[K]) -> None:
+        """Discard the runs of *keys*; unknown keys are ignored."""
+        for key in keys:
+            self._counts.pop(key, None)
+
+    def retain(self, keep: Callable[[K], bool]) -> None:
+        """Discard every run whose key *keep* rejects, deciding all keys before removing any."""
+        doomed = [key for key in self._counts if not keep(key)]
+        for key in doomed:
+            del self._counts[key]
