@@ -1680,6 +1680,49 @@ class TestTheVerdictCarriesTheCallsUsage:
         assert verdict.usage is None
 
 
+class TestJudgeWriteDisclosesTheSlateTrim:
+    """A verdict says how many comparable candidates the judge was NOT shown.
+
+    Structured only: no prompt prose, so JUDGE_PROMPT_CHAR_BUDGET is untouched.
+    """
+
+    @staticmethod
+    async def _verdict(candidates, **write_triage) -> TriageJudgeVerdict:
+        client = _openai_client(_payload('distinct'))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            return await judge_write(
+                memory_service=_judge_svc(**write_triage),
+                content='c', project_id='p',
+                decision=_decision('m0'), candidates=candidates,
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_trimmed_slate_reports_the_comparable_candidates_left_out(self) -> None:
+        candidates = [_result(f'm{i}', 0.90 - i / 100) for i in range(9)]
+
+        verdict = await self._verdict(candidates, judge_candidate_count=3)
+
+        assert verdict.truncated == ({'field': 'judge_candidates', 'cap': 3, 'elided': 6},)
+
+    @pytest.mark.asyncio
+    async def test_uncomparable_candidates_are_not_counted_as_left_out(self) -> None:
+        candidates = [_result(f'm{i}', 0.90 - i / 100) for i in range(4)]
+        candidates += [_result(f'pin{i}', None, omit_store_score=True) for i in range(5)]
+
+        verdict = await self._verdict(candidates, judge_candidate_count=3)
+
+        assert verdict.truncated == ({'field': 'judge_candidates', 'cap': 3, 'elided': 1},)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('comparable', [1, 3])
+    async def test_a_slate_within_the_count_reports_nothing(self, comparable: int) -> None:
+        candidates = [_result(f'm{i}', 0.90 - i / 100) for i in range(comparable)]
+
+        verdict = await self._verdict(candidates, judge_candidate_count=3)
+
+        assert verdict.truncated == ()
+
+
 class TestJudgeWriteDecisionsThatAreNotFailures:
     """Two paths answer `stored` WITHOUT raising, and they must not be counted.
 

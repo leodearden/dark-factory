@@ -47,6 +47,7 @@ from fused_memory.server.write_triage import (
     ROUTED_KEY,
     TRIAGE_OUTCOMES,
     TriageFailOpenCounter,
+    TriageJudgeVerdict,
     _canonical_id_of,
     _stub_judge,
     attach_write_landed,
@@ -1527,6 +1528,54 @@ class TestTheRetrievedCandidatesReachTheJudge:
         )
 
         assert called == [], label
+
+
+class TestTheDecisionDisclosesClippedCandidates:
+    """A decision says when retrieval filled its width and when the judge saw a trimmed slate."""
+
+    _RETRIEVAL_FACT = {'field': 'triage_candidates', 'cap': 3, 'elided': None}
+
+    @staticmethod
+    def _service(results) -> types.SimpleNamespace:
+        service = _svc(enabled=True, t_high=T_HIGH, t_low=T_LOW, candidate_k=3)
+        service.search = AsyncMock(return_value=SearchResults(results))
+        return service
+
+    @staticmethod
+    async def _triage(service, judge=None):
+        return await triage_write(
+            service, content='c', project_id='p',
+            counter=TriageFailOpenCounter(time_provider=_Clock()), judge=judge,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('score', [0.99, 0.10], ids=['restated', 'stored'])
+    async def test_a_retrieval_that_fills_candidate_k_says_so(self, score: float) -> None:
+        results = [_result(f'm{i}', score - i / 1000) for i in range(3)]
+
+        decision = await self._triage(self._service(results))
+
+        assert decision.truncated == (self._RETRIEVAL_FACT,)
+
+    @pytest.mark.asyncio
+    async def test_a_retrieval_under_candidate_k_reports_nothing(self) -> None:
+        decision = await self._triage(self._service([_result('m0', 0.99), _result('m1', 0.98)]))
+
+        assert decision.truncated == ()
+
+    @pytest.mark.asyncio
+    async def test_a_judged_decision_carries_the_judges_facts_too(self) -> None:
+        judge_fact = {'field': 'judge_candidates', 'cap': 2, 'elided': 1}
+
+        async def _judge(**_kwargs):
+            return TriageJudgeVerdict(OUTCOME_RESTATED, 'm0', truncated=(judge_fact,))
+
+        results = [_result(f'm{i}', 0.75 - i / 1000) for i in range(3)]
+
+        decision = await self._triage(self._service(results), judge=_judge)
+
+        assert decision.outcome == OUTCOME_RESTATED
+        assert decision.truncated == (self._RETRIEVAL_FACT, judge_fact)
 
 
 # ---------------------------------------------------------------------------
