@@ -149,6 +149,16 @@ This is the pre-fix-trace vs live-regression discriminator that `plans/confusion
 
 **07-31 census R1–R3 (`plans/confusion-census-2026-07-31.md:129-135`)**: R3 (exit-code / designed-outcome awareness) was discharged by task 3610, together with the R6 gold-turn filter relaxation. **R1** (pasted-report-content and mid-field truncation marking) and **R2** (`n_user_turns` frontmatter itemization) were named in task 3610's title but absent from its FIX list, so they were deliberately not folded in there; both are discharged by **task 3614** — R2 as the `n_user_turns` key above, R1 as `truncated_items` plus the gold-turn filter's pasted-report coverage.
 
+#### 7.2.3 Sampler carrier classification (task 5693)
+
+The β pre-scorer (`scripts/legibility/sampling.py`) asks the digest's one carrier predicate, `scripts/legibility/digest.py::is_non_dialogue_carrier`, of every carrier its text classes scan (`not_found`, the `df_guard` text patterns, `interrupt`, `self_correct`). A carrier the predicate rejects scores nothing: a non-human-origin record, a prior coder judgment, or a harness-injected briefing or prompt. Of its carrier logic the sampler shares only that classifier; its pattern tables and its carrier extraction stay its own. The extraction cuts carriers where the digest does, so the predicate judges the same strings in both: a user record's text blocks join into one turn, as `digest.py::_user_turn_text` joins them, so a briefing split across blocks is rejected by both. `TestSamplerReingestedContentParity` (`scripts/tests/test_legibility_sampling.py`) holds the two in step. The structural classes are **not** filtered: `tool_error`/`designed_outcome` (an `is_error` flag) and the guard `tool_use` half of `df_guard`. Quoted text cannot fake a structural flag, and the digest's error neighborhoods are unfiltered too.
+
+That predicate is one of three things `sampling.py` takes from `digest.py`. The other two came earlier. `digest.py::classify_error_content` splits genuine errors from designed outcomes for `tool_error` (task 3610), so the two layers cannot disagree on what an error is. The renderer, `digest.py::build_digest`, prices a record against `budgets.max_daily_digest_bytes` (`sampling.py::digest_byte_cost_fn`). That is a digest-output budget, and only the renderer knows how big a record's digest will be. The dependency runs one way: `digest.py` imports only `legibility.inventory`.
+
+There is **no `instrument_version` bump**: under §7.2.2's same-transcript test no digest changes. Only the set of sessions the sampler selects changes.
+
+Measured 2026-10-09, read-only, over all 29,902 dark-factory transcripts. 14,985 sessions scored non-zero at the sampler, and 4,488 of them were **phantom-only**: every signal came from a carrier the predicate rejects, so they reached the sample on re-ingested content alone. Sessions affected per class: `not_found` 4,448, `df_guard` 1,102, `interrupt` 327, `self_correct` 41. The dominant cause is the harness-injected turn (the orchestrator briefing and the trickle-coder prompt), not the coder answer. The figures are the same whether each user text block is judged on its own or the blocks are joined into one turn, so the boundary rule above changes none of them.
+
 ### 7.3 Coding record (coder output → merger input)
 
 JSONL, one object per digest, strict schema:

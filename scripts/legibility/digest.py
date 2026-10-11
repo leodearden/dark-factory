@@ -602,7 +602,7 @@ def _dialogue_text_sources(
     user_text: bool = False,
 ) -> list[tuple[int, str]]:
     """The carriers :func:`_signal_text_sources` yields, minus every one
-    :func:`_is_non_dialogue_carrier` rejects.
+    :func:`is_non_dialogue_carrier` rejects.
 
     Two layers, two questions: :func:`_signal_text_sources` answers "which
     native carriers exist", and this answers "which of them are this
@@ -625,7 +625,7 @@ def _dialogue_text_sources(
             assistant_text=assistant_text,
             user_text=user_text,
         )
-        if not _is_non_dialogue_carrier(records[index], text)
+        if not is_non_dialogue_carrier(records[index], text)
     ]
 
 
@@ -713,10 +713,11 @@ def has_non_human_origin(record: dict[str, Any]) -> bool:
     return isinstance(kind, str) and kind != HUMAN_ORIGIN_KIND
 
 
-def _is_non_dialogue_carrier(record: dict[str, Any], text: str) -> bool:
-    """The ONE question the gold bucket and every signal detector ask of a
-    carrier: the record half is provenance, the text half is content. The
-    record half covers every carrier the record holds, tool_results included."""
+def is_non_dialogue_carrier(record: dict[str, Any], text: str) -> bool:
+    """The ONE question asked of a carrier before it counts as this
+    session's own dialogue (plans/confusion-reduction-prd.md §7.2.3): the
+    record half is provenance, the text half is content. The record half
+    covers every carrier the record holds, tool_results included."""
     return has_non_human_origin(record) or is_reingested_content(text)
 
 
@@ -1298,17 +1299,15 @@ test_context_heading_mentioned_mid_sentence_is_not_excluded) must keep
 passing unchanged."""
 
 
-def _has_all_heading_lines(text: str, headings: tuple[str, ...]) -> bool:
-    """True when every entry of *headings* occurs in *text* as its own
-    stripped, lowercased line.
+def _heading_lines(text: str) -> frozenset[str]:
+    """*text*'s lines, each stripped and lowercased.
 
-    The single normalization used by every line-anchored heading-set
-    match. Shared rather than repeated per call site so a future change to
-    the anchoring rule (stripping trailing '#', handling '\\r\\n', ...)
-    lands in one place instead of silently diverging between two copies.
+    The single normalization used by every line-anchored heading match.
+    Shared rather than repeated per rule so a future change to the
+    anchoring rule (stripping trailing '#', handling '\\r\\n', ...) lands
+    in one place instead of silently diverging between two copies.
     """
-    lines = {line.strip() for line in text.lower().splitlines()}
-    return all(heading in lines for heading in headings)
+    return frozenset(line.strip() for line in text.lower().splitlines())
 
 
 def is_harness_injected_turn(text: str) -> bool:
@@ -1363,13 +1362,13 @@ def is_harness_injected_turn(text: str) -> bool:
     the worse error.
     """
     lowered = text.lower()
-    lines = {line.strip() for line in lowered.splitlines()}
+    lines = _heading_lines(text)
     anchors = [h for h in HARNESS_BRIEFING_HEADINGS if h in lines]
     if anchors:
         corroborators = [h for h in HARNESS_BRIEFING_SUBHEADINGS if h in lines]
         if len(anchors) + len(corroborators) >= 2:
             return True
-    if any(_has_all_heading_lines(text, headings) for headings in HARNESS_HEADING_SETS):
+    if any(lines.issuperset(headings) for headings in HARNESS_HEADING_SETS):
         return True
     if any(marker in lowered for marker in HARNESS_PROMPT_MARKERS):
         return True
@@ -1430,7 +1429,7 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     one of those injected shapes lands in the transcript as ordinary
     user-role text (isMeta unset), so isMeta alone cannot exclude any of
     them. The gold bucket asks the SAME predicate every scalar detector asks
-    (:func:`_is_non_dialogue_carrier`) rather than holding a private copy of
+    (:func:`is_non_dialogue_carrier`) rather than holding a private copy of
     the rule: task 5685's ruling that the fix belongs at the
     content-classification layer, not per bucket.
 
@@ -1453,7 +1452,7 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         text = _user_turn_text(_message_content(record))
         if text is None:
             continue
-        if _is_non_dialogue_carrier(record, text):
+        if is_non_dialogue_carrier(record, text):
             continue
         turns.append({'index': index, 'text': text})
     return turns
