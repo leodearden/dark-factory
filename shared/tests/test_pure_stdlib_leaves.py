@@ -82,6 +82,7 @@ PURE_STDLIB_LEAVES = (
     'ratchet',
     'reify_checkout',
     'safe_io',
+    'streak',
     'task_claimant',
     'task_metadata_wire',
     'task_statuses',
