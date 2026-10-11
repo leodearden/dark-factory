@@ -111,6 +111,33 @@ class GuardUnavailable(Exception):
     """
 
 
+def _run_or_unavailable(argv: list[str], *, what: str, timeout: float) -> subprocess.CompletedProcess[str]:
+    """Run *argv* to completion and return its result, or raise `GuardUnavailable`.
+
+    Owns only "did the process answer at all"; each caller judges its rc.  Every
+    could-not-answer escape — a timeout, an ``OSError`` (no binary, permission
+    bits, ENOENT), output that is not UTF-8 — becomes `GuardUnavailable`,
+    because an escaping exception exits 1, which a caller reads as DRIFT: a
+    false accusation against reify.  The codec is pinned rather than taken from
+    the locale, so whether the same bytes are readable never depends on who ran
+    this.
+    """
+    try:
+        return subprocess.run(argv, capture_output=True, encoding='utf-8', timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise GuardUnavailable(
+            f'{what} did not finish within {timeout}s — treated as unavailable '
+            f'rather than waited on indefinitely'
+        ) from exc
+    except OSError as exc:
+        raise GuardUnavailable(f'could not run {what}: {exc}') from exc
+    except UnicodeDecodeError as exc:
+        raise GuardUnavailable(
+            f'{what} produced output that is not valid UTF-8 ({exc}) — its '
+            f'answer could not be read'
+        ) from exc
+
+
 def _guard_vector(script: Path, flag: str, *, timeout: float = SUBPROCESS_TIMEOUT_SECS) -> list[str]:
     """Return the sorted vector emitted by reify's guard *script* for *flag*.
 
@@ -267,25 +294,16 @@ def tracked_paths(
     deriving the exclusion from the mode column rather than from hardcoded
     submodule names means it keeps working the day reify renames or adds one.
 
-    Raises `GuardUnavailable` whenever ``git`` did not answer — a non-zero rc
-    (not a checkout), an ``OSError`` (no ``git`` on ``PATH``), or a timeout.
-    Returning an empty corpus would report a vacuous, confident OK, and an
-    escaping ``OSError`` would exit 1, which a caller reads as DRIFT.
+    Raises `GuardUnavailable` whenever ``git`` did not answer: a non-zero rc
+    (not a checkout) here, and every other could-not-answer escape — including
+    a tracked path whose name is not UTF-8 — via `_run_or_unavailable`.
+    Returning an empty corpus would report a vacuous, confident OK.
     """
-    try:
-        result = subprocess.run(
-            ['git', '-C', str(repo_root), 'ls-files', '-s', '-z'],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise GuardUnavailable(
-            f'`git ls-files` in {repo_root} did not finish within {timeout}s — '
-            f'the tracked corpus was never swept'
-        ) from exc
-    except OSError as exc:
-        raise GuardUnavailable(f'could not run `git ls-files` in {repo_root}: {exc}') from exc
+    result = _run_or_unavailable(
+        ['git', '-C', str(repo_root), 'ls-files', '-s', '-z'],
+        what=f'`git ls-files` in {repo_root}',
+        timeout=timeout,
+    )
     if result.returncode != 0:
         raise GuardUnavailable(
             f'`git ls-files` in {repo_root} exited {result.returncode} — not a '
