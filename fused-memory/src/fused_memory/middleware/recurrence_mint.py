@@ -50,6 +50,7 @@ REMINT_SWEEP_INTERVAL_SECS: float = 3600.0
 class MintOutcomeKind(StrEnum):
     MINTED = 'minted'
     SKIPPED_EXISTING_LINK = 'skipped_existing_link'
+    SKIPPED_NOT_BROKEN = 'skipped_not_broken'
     FAILED = 'failed'
 
 
@@ -88,18 +89,17 @@ def _metadata_of(task: object) -> Mapping[str, Any]:
     return metadata if isinstance(metadata, Mapping) else {}
 
 
-def _recurrence_of(task: object) -> Mapping[str, Any]:
-    recurrence = _metadata_of(task).get('recurrence')
-    return recurrence if isinstance(recurrence, Mapping) else {}
-
-
 def mints_successor(new_status: str, predecessor: object) -> bool:
     """True iff writing *new_status* onto *predecessor* must mint the chain's next link.
 
-    Only ``done`` on a recurrence carrier qualifies: ``cancelled`` ends the
-    chain and a non-terminal status leaves it alone (C-2).
+    Only ``done`` on a chain link qualifies: ``cancelled`` ends the chain and
+    a non-terminal status leaves it alone (C-2).
     """
-    return new_status == TaskStatus.DONE and bool(_recurrence_of(predecessor))
+    return (
+        new_status == TaskStatus.DONE
+        and isinstance(predecessor, Mapping)
+        and recurrence_key(predecessor) is not None
+    )
 
 
 def _run_label(at: str) -> str:
@@ -161,7 +161,7 @@ def _failed(
 ) -> MintOutcome:
     logger.error(
         'recurrence_mint_failed: predecessor=%s key=%s reason=%s',
-        predecessor_id, _recurrence_of(predecessor).get('key'), reason, exc_info=exc_info,
+        predecessor_id, recurrence_key(predecessor), reason, exc_info=exc_info,
     )
     return MintOutcome(MintOutcomeKind.FAILED, detail=reason)
 
@@ -221,9 +221,31 @@ async def mint_successor(
     ``recurrence_mint_failed:`` ERROR line; cancellation logs that same line
     and is re-raised.
     """
+    return await _locked_mint(
+        tm,
+        write_lock=write_lock,
+        predecessor_id=predecessor_id,
+        project_root=project_root,
+        tag=tag,
+        precheck=None,
+    )
+
+
+async def _locked_mint(
+    tm: TaskBackendProtocol,
+    *,
+    write_lock: asyncio.Lock,
+    predecessor_id: str,
+    project_root: str,
+    tag: str | None,
+    precheck: Callable[[], Awaitable[MintOutcome | None]] | None,
+) -> MintOutcome:
+    """:func:`mint_successor`, first running *precheck* under the lock; its outcome skips the mint."""
     predecessor: Mapping[str, Any] = {}
     try:
         async with write_lock:
+            if precheck is not None and (skipped := await precheck()) is not None:
+                return skipped
             predecessor = await tm.get_task(predecessor_id, project_root, tag)
             return await _mint(
                 tm,
@@ -244,17 +266,35 @@ async def broken_chains(tm: TaskBackendProtocol, project_root: str) -> tuple[Bro
 
     A done current link means its mint failed or never ran (a crash between
     the done write and the mint). Read-only and lock-free: each repair
-    re-checks C-2 under the write lock.
+    re-reads its chain under the write lock.
     """
     broken: list[BrokenChain] = []
     for tag in await tm.list_tags(project_root):
-        rows = (await tm.get_tasks(project_root, tag))['tasks']
-        broken.extend(
-            BrokenChain(key=key, tag=tag, link_id=str(link['id']))
-            for key, link in current_links(rows).items()
-            if link['status'] == TaskStatus.DONE
-        )
+        broken.extend(await _broken_chains_in_tag(tm, project_root, tag))
     return tuple(broken)
+
+
+async def _broken_chains_in_tag(
+    tm: TaskBackendProtocol, project_root: str, tag: str,
+) -> list[BrokenChain]:
+    rows = (await tm.get_tasks(project_root, tag))['tasks']
+    return [
+        BrokenChain(key=key, tag=tag, link_id=str(link['id']))
+        for key, link in current_links(rows).items()
+        if link['status'] == TaskStatus.DONE
+    ]
+
+
+async def _skip_unless_still_broken(
+    tm: TaskBackendProtocol, chain: BrokenChain, project_root: str,
+) -> MintOutcome | None:
+    if chain in await _broken_chains_in_tag(tm, project_root, chain.tag):
+        return None
+    logger.info(
+        'recurrence_remint_skipped: predecessor=%s key=%s reason=no_longer_broken',
+        chain.link_id, chain.key,
+    )
+    return MintOutcome(MintOutcomeKind.SKIPPED_NOT_BROKEN)
 
 
 async def remint_broken_chain(
@@ -264,13 +304,18 @@ async def remint_broken_chain(
     chain: BrokenChain,
     project_root: str,
 ) -> MintOutcome:
-    """Mint *chain*'s missing successor through :func:`mint_successor`, logging each repair."""
-    outcome = await mint_successor(
+    """Mint *chain*'s missing successor if it is still broken under *write_lock*, logging each repair.
+
+    *chain* came from a lock-free read, so its tag is read again under the
+    lock: a link reopened, renewed or superseded since then is left alone.
+    """
+    outcome = await _locked_mint(
         tm,
         write_lock=write_lock,
         predecessor_id=chain.link_id,
         project_root=project_root,
         tag=chain.tag,
+        precheck=lambda: _skip_unless_still_broken(tm, chain, project_root),
     )
     if outcome.kind is MintOutcomeKind.MINTED:
         logger.warning(

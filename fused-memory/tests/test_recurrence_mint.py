@@ -27,7 +27,9 @@ from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.recurrence_mint import (
     RECURRENCE_MINT_SOURCE,
     MintOutcomeKind,
+    broken_chains,
     mint_successor,
+    remint_broken_chain,
     run_remint_sweep_loop,
 )
 from fused_memory.middleware.task_interceptor import TaskInterceptor
@@ -237,13 +239,14 @@ async def _seed_carrier(
     status: str = 'in-progress',
     tag: str | None = None,
     files: list[str] | None = FILES,
+    recurrence: dict[str, Any] | None = None,
 ) -> str:
     _write_check_script(project_root)
     metadata: dict[str, Any] = {
         'task_kind': 'deterministic',
         'before_done': BEFORE_DONE,
         'milestone': {'mode': 'dated', 'at': '2026-09-01T00:00:00+00:00'},
-        'recurrence': {'key': key, 'interval_secs': interval_secs},
+        'recurrence': recurrence or {'key': key, 'interval_secs': interval_secs},
     }
     if files is not None:
         metadata['files'] = files
@@ -415,6 +418,26 @@ def _mint_failures(caplog: pytest.LogCaptureFixture) -> list[str]:
         r.getMessage() for r in caplog.records
         if r.levelno == logging.ERROR and r.getMessage().startswith('recurrence_mint_failed:')
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'recurrence',
+    [{'interval_secs': INTERVAL_SECS}, {'key': '', 'interval_secs': INTERVAL_SECS}],
+    ids=['no-key', 'empty-key'],
+)
+async def test_a_recurrence_without_a_chain_key_is_not_a_carrier(
+    recurrence, interceptor, backend, root, caplog,
+):
+    task_id = await _seed_carrier(interceptor, backend, root, recurrence=recurrence)
+    count_before = len(await _all_tasks(backend, root))
+
+    with caplog.at_level(logging.ERROR, logger=MINT_LOGGER):
+        assert 'error' not in await interceptor.set_task_status(task_id, 'done', root)
+        assert await interceptor.remint_broken_recurrence_chains(root) == ()
+
+    assert len(await _all_tasks(backend, root)) == count_before
+    assert _mint_failures(caplog) == []
 
 
 @pytest.mark.asyncio
@@ -675,6 +698,30 @@ async def test_sweep_does_not_renew_a_done_link_whose_successor_was_cancelled(
     assert await interceptor.remint_broken_recurrence_chains(root) == ()
 
     assert len(await _all_tasks(backend, root)) == count_before
+
+
+@pytest.mark.asyncio
+async def test_a_stale_sweep_snapshot_does_not_revive_a_chain_cancelled_since(
+    interceptor, backend, root, caplog,
+):
+    pid = await _seed_carrier(interceptor, backend, root)
+    await _done_without_mint(backend, pid, root)
+    [stale] = await broken_chains(backend, root)
+    await interceptor.remint_broken_recurrence_chains(root)
+    [link2] = await _chain_links(backend, root, excluding=pid)
+    assert 'error' not in await interceptor.set_task_status(str(link2['id']), 'cancelled', root)
+    count_before = len(await _all_tasks(backend, root))
+    caplog.clear()
+
+    with caplog.at_level(logging.INFO, logger=MINT_LOGGER):
+        outcome = await remint_broken_chain(
+            backend, write_lock=asyncio.Lock(), chain=stale, project_root=root,
+        )
+
+    assert outcome.kind is MintOutcomeKind.SKIPPED_NOT_BROKEN
+    assert len(await _all_tasks(backend, root)) == count_before
+    assert _remints(caplog) == []
+    assert _mint_failures(caplog) == []
 
 
 @pytest.mark.asyncio

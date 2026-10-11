@@ -1234,8 +1234,10 @@ chain *broken*: its current link is `done` and no live link exists
 definition of a chain's current link). It stays broken until fused-memory's
 re-mint sweep
 (`fused-memory/src/fused_memory/middleware/recurrence_mint.py::run_remint_sweep_loop`)
-repairs it. The sweep runs at startup and then hourly. It mints through the
-same C-2-checked path, so a re-run never double-mints, and it anchors the
+repairs it. The sweep runs at startup and then hourly. Under the write lock it
+re-reads each chain it found and leaves alone one that is no longer broken,
+then mints through the same C-2-checked path, so a re-run never double-mints
+and a chain ended since the sweep looked stays ended. It anchors the
 successor's `at` on the predecessor's stored terminal time. Each repair logs a
 `recurrence_remint:` WARNING and journals a `task_created` event with
 `trigger='remint_sweep'`. A chain that still cannot be minted, such as the
