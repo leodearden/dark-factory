@@ -181,6 +181,24 @@ class TestReviewPhase1WorkingTree:
         saved = _saved_report(tmp_path, report.review_id)
         assert saved['phase1_working_tree']['named_in_failure'] == []
 
+    async def test_committed_failure_ending_in_a_dirty_path_names_nothing(
+        self, review_repo: Path, reviewer: AsyncMock, tmp_path: Path,
+    ) -> None:
+        committed = review_repo / 'tools' / 'scripts' / 'bad.py'
+        committed.parent.mkdir(parents=True)
+        committed.write_text(f'{_LINT_MARKER}\n')
+        _git(review_repo, 'add', 'tools/scripts/bad.py')
+        _git(review_repo, 'commit', '-q', '-m', 'commit the lint error')
+        (review_repo / 'scripts' / 'bad.py').write_text('y = 1\n')
+
+        report = await _make_checkpoint(review_repo, tmp_path).run_focused()
+
+        saved = _saved_report(tmp_path, report.review_id)
+        assert saved['phase1_working_tree']['named_in_failure'] == []
+        assert report.phase1_working_tree is not None
+        assert report.phase1_working_tree.named_in_failure == ()
+        assert 'scripts/bad.py' not in _summary_line(_prompt(reviewer))
+
     async def test_uncommitted_edit_named_in_failure_is_labelled_uncommitted(
         self, review_repo: Path, reviewer: AsyncMock, tmp_path: Path,
     ) -> None:

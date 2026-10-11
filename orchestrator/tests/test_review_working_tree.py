@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
 
 import pytest
@@ -141,11 +142,24 @@ def _has_number(text: str, number: int) -> bool:
     return re.search(rf'\b{number}\b', text) is not None
 
 
+_ABS_ROOT = Path('/abs/root')
+
+
+def _attribute(
+    phase1: VerifyResult,
+    state: WorkingTreeState,
+    *,
+    run_dirs: Iterable[str] = (),
+    root: Path = _ABS_ROOT,
+) -> Phase1WorkingTree:
+    return attribute_phase1(phase1, state, root=root, run_dirs=run_dirs)
+
+
 class TestAttributePhase1:
     def test_ruff_shaped_lint_output_names_untracked_path(self) -> None:
         state = WorkingTreeState(untracked=('scripts/bad.py',), uncommitted=())
 
-        tree = attribute_phase1(_failed(lint=_RUFF_LINT_OUTPUT), state, [])
+        tree = _attribute(_failed(lint=_RUFF_LINT_OUTPUT), state)
 
         assert tree.state is state
         assert tree.named_in_failure == (NamedChange('scripts/bad.py', TreeChange.UNTRACKED),)
@@ -154,8 +168,8 @@ class TestAttributePhase1:
         state = WorkingTreeState(untracked=(), uncommitted=('pkg/src/pkg/x.py',))
         phase1 = _failed(lint='src/pkg/x.py:3:1: F401 `os` imported but unused\n')
 
-        with_dir = attribute_phase1(phase1, state, ['pkg'])
-        without_dir = attribute_phase1(phase1, state, [])
+        with_dir = _attribute(phase1, state, run_dirs=['pkg'])
+        without_dir = _attribute(phase1, state)
 
         assert with_dir.named_in_failure == (
             NamedChange('pkg/src/pkg/x.py', TreeChange.UNCOMMITTED),
@@ -166,7 +180,7 @@ class TestAttributePhase1:
         state = WorkingTreeState(untracked=('scripts/bad.py',), uncommitted=())
         phase1 = _failed(type_='/abs/root/scripts/bad.py:1:1 - error: bad type\n')
 
-        tree = attribute_phase1(phase1, state, [])
+        tree = _attribute(phase1, state)
 
         assert tree.named_in_failure == (NamedChange('scripts/bad.py', TreeChange.UNTRACKED),)
 
@@ -174,18 +188,110 @@ class TestAttributePhase1:
         state = WorkingTreeState(untracked=('foo.py',), uncommitted=())
         phase1 = _failed(test='FAILED tests/test_foo.py::test_it - AssertionError\n')
 
-        assert attribute_phase1(phase1, state, []).named_in_failure == ()
+        assert _attribute(phase1, state).named_in_failure == ()
 
     def test_output_naming_only_committed_paths_names_nothing(self) -> None:
         state = WorkingTreeState(untracked=('scripts/bad.py',), uncommitted=('keep.py',))
         phase1 = _failed(lint='  --> scripts/committed.py:1:1\nFound 1 error.\n')
 
-        assert attribute_phase1(phase1, state, []).named_in_failure == ()
+        assert _attribute(phase1, state).named_in_failure == ()
 
     def test_passing_result_names_nothing_even_when_output_mentions_dirty_path(self) -> None:
         state = WorkingTreeState(untracked=('scripts/bad.py',), uncommitted=())
 
-        tree = attribute_phase1(_passed(lint=_RUFF_LINT_OUTPUT), state, [])
+        tree = _attribute(_passed(lint=_RUFF_LINT_OUTPUT), state)
+
+        assert tree.named_in_failure == ()
+
+
+_BAD_UNTRACKED = WorkingTreeState(untracked=('scripts/bad.py',), uncommitted=())
+_BAD_NAMED = (NamedChange('scripts/bad.py', TreeChange.UNTRACKED),)
+
+
+class TestAttributionPrecision:
+    def test_committed_path_ending_in_dirty_paths_names_neither(self) -> None:
+        state = WorkingTreeState(
+            untracked=('orchestrator/conftest.py', 'tests/conftest.py'), uncommitted=(),
+        )
+        phase1 = _failed(lint='  --> orchestrator/tests/conftest.py:1:1\n')
+
+        tree = _attribute(phase1, state, run_dirs=['orchestrator'])
+
+        assert tree.named_in_failure == ()
+
+    def test_repo_relative_suffix_of_a_longer_path_is_not_named(self) -> None:
+        phase1 = _failed(lint='  --> tools/scripts/bad.py:1:1\n')
+
+        assert _attribute(phase1, _BAD_UNTRACKED).named_in_failure == ()
+
+    @pytest.mark.parametrize('output', [
+        'scripts/bad.py:1:1: F401 x\n',
+        'header\nscripts/bad.py:1:1\n',
+        'FAILED scripts/bad.py::test_x - E\n',
+        "E   'scripts/bad.py'\n",
+        'E   "scripts/bad.py"\n',
+        '(scripts/bad.py)\n',
+        '  --> ./scripts/bad.py:1:1\n',
+    ])
+    def test_delimited_relative_form_is_named(self, output: str) -> None:
+        assert _attribute(_failed(lint=output), _BAD_UNTRACKED).named_in_failure == _BAD_NAMED
+
+    def test_path_continuing_past_the_dirty_path_is_not_named(self) -> None:
+        state = WorkingTreeState(untracked=('docs/notes',), uncommitted=())
+
+        assert _attribute(_failed(lint='docs/notes/x.py:1:1\n'), state).named_in_failure == ()
+
+    @pytest.mark.parametrize(('template', 'named'), [
+        ('{root}/scripts/bad.py:1:1 - error', True),
+        ('File "{root}/scripts/bad.py", line 3', True),
+        ('/elsewhere/scripts/bad.py:1:1 - error', False),
+        ('/x{root}/scripts/bad.py:1:1', False),
+    ])
+    def test_absolute_form_matches_only_the_checkout_root(
+        self, tmp_path: Path, template: str, named: bool,
+    ) -> None:
+        root = tmp_path / 'repo'
+        root.mkdir()
+        phase1 = _failed(type_=template.format(root=root))
+
+        tree = _attribute(phase1, _BAD_UNTRACKED, root=root)
+
+        assert tree.named_in_failure == (_BAD_NAMED if named else ())
+
+    def test_absolute_form_under_the_resolved_root_is_named(self, tmp_path: Path) -> None:
+        root = tmp_path / 'repo'
+        root.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(root, target_is_directory=True)
+        phase1 = _failed(type_=f'{root.resolve()}/scripts/bad.py:1:1 - error\n')
+
+        assert _attribute(phase1, _BAD_UNTRACKED, root=link).named_in_failure == _BAD_NAMED
+
+    def test_module_relative_form_another_module_also_has_is_not_named(
+        self, tmp_path: Path,
+    ) -> None:
+        _write(tmp_path, 'orchestrator/tests/conftest.py', 'a = 1\n')
+        _write(tmp_path, 'fused-memory/tests/conftest.py', 'b = 1\n')
+        state = WorkingTreeState(untracked=('orchestrator/tests/conftest.py',), uncommitted=())
+        phase1 = _failed(lint='tests/conftest.py:1:1: F401 x\n')
+        run_dirs = ['orchestrator', 'fused-memory']
+
+        ambiguous = _attribute(phase1, state, run_dirs=run_dirs, root=tmp_path)
+        (tmp_path / 'fused-memory' / 'tests' / 'conftest.py').unlink()
+        unambiguous = _attribute(phase1, state, run_dirs=run_dirs, root=tmp_path)
+
+        assert ambiguous.named_in_failure == ()
+        assert unambiguous.named_in_failure == (
+            NamedChange('orchestrator/tests/conftest.py', TreeChange.UNTRACKED),
+        )
+
+    def test_root_relative_form_a_module_also_has_is_not_named(self, tmp_path: Path) -> None:
+        _write(tmp_path, 'tests/conftest.py', 'a = 1\n')
+        _write(tmp_path, 'orchestrator/tests/conftest.py', 'b = 1\n')
+        state = WorkingTreeState(untracked=('tests/conftest.py',), uncommitted=())
+        phase1 = _failed(lint='tests/conftest.py:1:1\n')
+
+        tree = _attribute(phase1, state, run_dirs=['orchestrator'], root=tmp_path)
 
         assert tree.named_in_failure == ()
 
@@ -208,9 +314,6 @@ class TestPhase1WorkingTreeInvariant:
             )
 
 
-_BAD_UNTRACKED = WorkingTreeState(untracked=('scripts/bad.py',), uncommitted=())
-
-
 def _unqualified_cases() -> list[tuple[VerifyResult, Phase1WorkingTree | None]]:
     clean = WorkingTreeState(untracked=(), uncommitted=())
     return [
@@ -231,7 +334,7 @@ class TestQualifiedPhase1Summary:
 
     def test_failure_naming_untracked_path_is_qualified_with_it(self) -> None:
         phase1 = _failed(lint=_RUFF_LINT_OUTPUT)
-        tree = attribute_phase1(phase1, _BAD_UNTRACKED, [])
+        tree = _attribute(phase1, _BAD_UNTRACKED)
 
         summary = qualified_phase1_summary(phase1, tree)
 
@@ -247,7 +350,7 @@ class TestQualifiedPhase1Summary:
             uncommitted=tuple(f'c{i}.py' for i in range(4)),
         )
 
-        summary = qualified_phase1_summary(phase1, attribute_phase1(phase1, state, []))
+        summary = qualified_phase1_summary(phase1, _attribute(phase1, state))
 
         assert summary != phase1.summary
         assert _has_number(summary, 7)
@@ -257,7 +360,7 @@ class TestQualifiedPhase1Summary:
         phase1 = _passed()
         state = WorkingTreeState(untracked=(), uncommitted=('a.py', 'b.py', 'c.py'))
 
-        summary = qualified_phase1_summary(phase1, attribute_phase1(phase1, state, []))
+        summary = qualified_phase1_summary(phase1, _attribute(phase1, state))
 
         assert summary != phase1.summary
         assert _has_number(summary, 3)
@@ -273,7 +376,7 @@ class TestRenderWorkingTreeSection:
     def test_failure_lists_each_named_path_with_its_kind(self) -> None:
         state = WorkingTreeState(untracked=('scripts/bad.py',), uncommitted=('keep.py',))
         phase1 = _failed(lint=_RUFF_LINT_OUTPUT + '  --> keep.py:2:1\n')
-        tree = attribute_phase1(phase1, state, [])
+        tree = _attribute(phase1, state)
         assert len(tree.named_in_failure) == 2
 
         lines = render_working_tree_section(phase1, tree).splitlines()
@@ -285,7 +388,7 @@ class TestRenderWorkingTreeSection:
         paths = tuple(f'pkg/file_{i:02d}.py' for i in range(30))
         state = WorkingTreeState(untracked=paths, uncommitted=())
         phase1 = _failed(lint=''.join(f'  --> {p}:1:1\n' for p in paths))
-        tree = attribute_phase1(phase1, state, [])
+        tree = _attribute(phase1, state)
         assert len(tree.named_in_failure) == 30
 
         section = render_working_tree_section(phase1, tree)
@@ -298,7 +401,7 @@ class TestPhase1WorkingTreeRecord:
     def test_to_dict_is_json_native_counts_plus_named_paths(self) -> None:
         state = WorkingTreeState(untracked=('scripts/bad.py', 'u.py'), uncommitted=('keep.py',))
         phase1 = _failed(lint=_RUFF_LINT_OUTPUT)
-        tree = attribute_phase1(phase1, state, [])
+        tree = _attribute(phase1, state)
 
         record = tree.to_dict()
 
