@@ -10107,14 +10107,15 @@ class MemoryService:
     ) -> dict:
         """Resolve an Entity node by exact name, MINTING one if none exists.
 
-        Wraps ``graphiti_client.py::GraphitiBackend.ensure_entity_node`` with the
-        two guards an MCP-reachable mint needs and the backend deliberately does
-        not carry.
+        Composes three ``backends/graphiti_client.py::GraphitiBackend``
+        primitives — ``_identity_lock_for``, ``get_nodes_by_exact_name`` and
+        ``_mint_entity_node`` — under the two guards an MCP-reachable mint needs
+        and the backend deliberately does not carry.
 
-        GUARD 1 — BOUNDED IDENTITY-LOCK ACQUIRE. The backend method's docstring
-        states the LOCK CONTRACT: callers MUST hold
-        ``graphiti_client.py::GraphitiBackend._identity_lock_for(group_id)``; it
-        performs no locking of its own. This is the SECOND acquisition site in
+        GUARD 1 — BOUNDED IDENTITY-LOCK ACQUIRE. ``_mint_entity_node``'s
+        docstring states the LOCK CONTRACT: callers MUST hold
+        ``_identity_lock_for(group_id)``; it performs no locking of its own.
+        This is the SECOND acquisition site in
         all of ``fused-memory/src/`` — the first is
         ``memory_service.py::MemoryService._execute_graphiti_write``, which holds
         the same lock across a full LLM extraction plus the entire
@@ -10129,39 +10130,12 @@ class MemoryService:
         INSIDE the lock, which is the other reason the hold time matters.
 
         GUARD 2 — EXACT-NAME PRE-READ under that lock, via the read-only
-        ``get_nodes_by_exact_name``. This is deliberately a WRAPPER-level
-        pre-read rather than an edit to
-        ``graphiti_client.py::GraphitiBackend._resolve_or_create_entity``: that
-        primitive is the shared write-time-identity chokepoint that
-        ``_dedup_episode_nodes`` and the leaf-eta repair path both depend on, and
-        both WANT its >=2-match COLLAPSE arm. Narrowing it would change behaviour
-        for callers this tool never touches and would break its documented
-        post-condition. Refusing here leaves the primitive intact while making
-        the collapse structurally unreachable from the tool: having observed 0
-        matches under the lock we hold, the >=2 branch cannot fire on the mint
-        path; the 1-match case short-circuits to a pure resolve with no backend
-        call at all; and >=2 returns a structured refusal that merges NOTHING.
-
-        THE MINT BRANCH THEREFORE READS THE NAME TWICE, DELIBERATELY. The
-        pre-read above runs, and then ``graphiti.ensure_entity_node`` calls
-        ``_resolve_or_create_entity``, which issues the SAME
-        ``get_nodes_by_exact_name`` query with the same arguments — two
-        identical Cypher round trips inside the very lock guard 1 exists to keep
-        short. This is a known, accepted cost, not an oversight:
-
-        * Only the MINT branch pays it. A resolve (the common case once the
-          graph is populated) short-circuits above with no backend call at all,
-          and both refusals return before the backend is reached.
-        * The mint already makes a far more expensive embedding round trip
-          inside the same lock, so a second read-only exact-name query is not
-          what sets the hold time.
-        * Removing it means a new backend entry point that accepts the
-          already-read node list (a ``_mint_entity_node`` primitive this wrapper
-          could call directly, leaving ``_resolve_or_create_entity`` untouched
-          for its other callers). That is a change to
-          ``backends/graphiti_client.py``, which task 4932 held no lock on, so
-          it was recorded here and filed as an agent-followup ticket against
-          that module rather than done inline.
+        ``get_nodes_by_exact_name``. It is the mint's ONLY identity read: on 0
+        matches the wrapper calls ``_mint_entity_node``, which has no resolve
+        arm, so the irreversible >=2 COLLAPSE is unreachable from this tool by
+        construction. The pre-read is therefore load-bearing — removing it
+        would mint duplicates. 1 match short-circuits to a pure resolve with no
+        backend write, and >=2 returns a structured refusal that merges NOTHING.
 
         Refusals are VALUES, never raises, so an MCP caller gets machine-readable
         data — an ambiguous-name refusal must hand back the conflicting uuids so
@@ -10256,20 +10230,9 @@ class MemoryService:
                     'name': name,
                 }
             else:
-                uuid = await self.graphiti.ensure_entity_node(
+                # 0 matches observed under the lock we hold: the primitive's precondition.
+                uuid = await self.graphiti._mint_entity_node(
                     name, group_id=project_id, summary=summary,
-                    # Redundant BY CONSTRUCTION with the pre-read above — this
-                    # branch is reached only when `existing` was empty, so the
-                    # backend's >=2 arm cannot fire — and that is precisely why
-                    # it is spelled out. Today the collapse is unreachable here
-                    # through an ORDERING property of this method's body, which
-                    # a later refactor dropping the redundant pre-read would
-                    # silently undo. The keyword makes it structurally
-                    # unreachable instead of contingently unreachable, so
-                    # Ratified Decision 1 holds at BOTH non-S1 call sites (the
-                    # other is `_repair_edge_findings`) as an invariant rather
-                    # than as a coincidence of one caller's ordering.
-                    merge_duplicates=False,
                 )
                 result = {
                     'status': 'minted',
