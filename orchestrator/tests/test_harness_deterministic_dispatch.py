@@ -38,8 +38,8 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     ):
         h = Harness(mock_orch_config)
 
-    # Async-mock scheduler
-    h.scheduler = MagicMock()
+    # Async-mock scheduler; pinned unpaused, since a bare MagicMock().is_paused is truthy.
+    h.scheduler = MagicMock(is_paused=False, pause_reason=None)
     h.scheduler.is_deterministic = MagicMock(return_value=False)  # overridden per test
     h.scheduler.get_status = AsyncMock(return_value='blocked')
     h.scheduler.set_task_status = AsyncMock()
@@ -271,7 +271,7 @@ class TestRestartStampClear:
         harness.scheduler.is_deterministic = MagicMock(return_value=True)
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
 
-        await harness._action_teardown_and_set_status(task_id, 'pending', 'restart')
+        await harness._action_teardown_and_set_status(task_id, 'pending', 'restart', escalation_id=f'esc-{task_id}-1')
 
         # update_task must have been called to clear the stamps
         harness.scheduler.update_task.assert_awaited()  # type: ignore[attr-defined]
@@ -296,7 +296,7 @@ class TestRestartStampClear:
         harness.scheduler.is_deterministic = MagicMock(return_value=True)
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
 
-        await harness._action_teardown_and_set_status(task_id, 'pending', 'restart')
+        await harness._action_teardown_and_set_status(task_id, 'pending', 'restart', escalation_id=f'esc-{task_id}-1')
 
         # Check before_done_ran_at is also cleared
         stamp_clear_calls = [
@@ -315,7 +315,7 @@ class TestRestartStampClear:
         harness.scheduler.is_deterministic = MagicMock(return_value=True)
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
 
-        await harness._action_teardown_and_set_status(task_id, 'blocked', 'park')
+        await harness._action_teardown_and_set_status(task_id, 'blocked', 'park', escalation_id=f'esc-{task_id}-1')
 
         # update_task must NOT be called for stamp clearing on park
         stamp_clear_calls = [
@@ -336,7 +336,7 @@ class TestRestartStampClear:
         harness.scheduler.is_deterministic = MagicMock(return_value=True)
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
 
-        await harness._action_teardown_and_set_status(task_id, 'cancelled', 'abandon')
+        await harness._action_teardown_and_set_status(task_id, 'cancelled', 'abandon', escalation_id=f'esc-{task_id}-1')
 
         stamp_clear_calls = [
             c for c in harness.scheduler.update_task.call_args_list  # type: ignore[attr-defined]
