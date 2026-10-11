@@ -25,6 +25,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
+from fused_memory.utils.clip_disclosure import TRUNCATED_KEY, clip_text, truncation_facts
 
 if TYPE_CHECKING:
     from fused_memory.config.schema import ProceduralTopicCluster
@@ -42,6 +43,8 @@ _DEFAULT_NEAR_DUP_GUARD_ENABLED = True
 # Default for the machine-derived topic-cluster switch when config is
 # absent/partial/non-bool; mirrors the schema default.
 _DEFAULT_TOPIC_CLUSTER_AUTOSEED_ENABLED = True
+
+GUARD_EXCERPT_CHARS = 200
 
 # Surfaced in the soft-block dict, the add_memory tool docstring, and
 # FUSED_MEMORY_INSTRUCTIONS so the override is discoverable at the point of
@@ -366,6 +369,19 @@ def _reconciliation_attr(memory_service: Any, attr: str) -> Any:
     return getattr(reconciliation, attr, None)
 
 
+def excerpt_fields(*, content_excerpt: str, matched_excerpt: str | None = None) -> dict[str, Any]:
+    """The excerpt keys a pre-service guard block echoes, plus ``truncated`` facts for each one cut."""
+    clips = {'content_excerpt': clip_text(content_excerpt, GUARD_EXCERPT_CHARS, field='content_excerpt')}
+    if matched_excerpt is not None:
+        clips['matched_excerpt'] = clip_text(
+            matched_excerpt, GUARD_EXCERPT_CHARS, field='matched_excerpt'
+        )
+    fields: dict[str, Any] = {key: clip.text for key, clip in clips.items()}
+    if facts := truncation_facts(*clips.values()):
+        fields[TRUNCATED_KEY] = facts
+    return fields
+
+
 def build_near_duplicate_block(
     agent_id: str | None,
     content: str,
@@ -391,11 +407,10 @@ def build_near_duplicate_block(
         'error': 'procedural_knowledge_near_duplicate_write_blocked',
         'error_type': 'ProceduralKnowledgeNearDuplicateWriteRejected',
         'agent_id': agent_id,
-        'content_excerpt': content[:200],
+        **excerpt_fields(content_excerpt=content, matched_excerpt=match.content),
         'matched_memory_id': match.id,
         'similarity': cosine_of(match),
         'threshold': threshold,
-        'matched_excerpt': match.content[:200],
         'hint': _NEAR_DUPLICATE_HINT,
     }
 
@@ -427,7 +442,7 @@ def build_topic_cluster_block(
         'error': 'procedural_knowledge_known_topic_cluster_write_blocked',
         'error_type': 'ProceduralKnowledgeKnownTopicClusterWriteRejected',
         'agent_id': agent_id,
-        'content_excerpt': content[:200],
+        **excerpt_fields(content_excerpt=content),
         'topic_id': cluster.topic_id,
         'matched_phrases': matched_phrases,
         'hint': cluster.hint or _TOPIC_CLUSTER_DEFAULT_HINT,

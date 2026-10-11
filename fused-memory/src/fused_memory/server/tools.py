@@ -151,6 +151,7 @@ from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorizat
 from fused_memory.server.near_duplicate_guard import (
     build_near_duplicate_block,
     build_topic_cluster_block,
+    excerpt_fields,
     find_matching_topic_cluster,
     find_near_duplicate_memory,
     resolve_near_dup_guard_enabled,
@@ -1522,7 +1523,7 @@ def create_mcp_server(
             'error': refusal.error,
             'error_type': refusal.error_type,
             'agent_id': agent_id,
-            'content_excerpt': content[:200],
+            **excerpt_fields(content_excerpt=content),
             'hint': refusal.hint,
         }
 
@@ -1759,7 +1760,7 @@ def create_mcp_server(
             'error': 'premature_completion_claim_write_blocked',
             'error_type': 'ReconPrematureCompletionClaimWriteRejected',
             'agent_id': agent_id,
-            'content_excerpt': content[:200],
+            **excerpt_fields(content_excerpt=content),
             'blocked_task_ids': sorted(blocked),
             'hint': _PREMATURE_COMPLETION_HINT,
         }
@@ -3246,7 +3247,7 @@ def create_mcp_server(
                 'error': 'mixed_temporal_framing_write_blocked',
                 'error_type': 'ReconMixedFramingWriteRejected',
                 'agent_id': agent_id,
-                'content_excerpt': content[:200],
+                **excerpt_fields(content_excerpt=content),
             }
         if isinstance(agent_id, str) and agent_id.startswith('recon-stage-'):
             conflicting_task_ids = find_conflicting_task_status_ids(content)
@@ -3255,7 +3256,7 @@ def create_mcp_server(
                     'error': 'conflicting_task_status_framing_write_blocked',
                     'error_type': 'ReconConflictingTaskStatusWriteRejected',
                     'agent_id': agent_id,
-                    'content_excerpt': content[:200],
+                    **excerpt_fields(content_excerpt=content),
                     'conflicting_task_ids': sorted(conflicting_task_ids),
                     'hint': _CONFLICTING_TASK_STATUS_HINT,
                 }
@@ -3268,7 +3269,7 @@ def create_mcp_server(
                 'error': 'live_task_status_current_fact_write_blocked',
                 'error_type': 'ReconLiveTaskStatusWriteRejected',
                 'agent_id': agent_id,
-                'content_excerpt': content[:200],
+                **excerpt_fields(content_excerpt=content),
                 'hint': _LIVE_TASK_STATUS_HINT,
             }
         # task 2824: reject a recon-stage present-tense completion claim ("task N
@@ -3579,7 +3580,7 @@ def create_mcp_server(
                 'error': 'count_snapshot_write_blocked',
                 'error_type': 'ReconSnapshotWriteRejected',
                 'agent_id': agent_id,
-                'content_excerpt': content[:200],
+                **excerpt_fields(content_excerpt=content),
             }
         if (
             category == 'temporal_facts'
@@ -3591,7 +3592,7 @@ def create_mcp_server(
                 'error': 'mixed_temporal_framing_write_blocked',
                 'error_type': 'ReconMixedFramingWriteRejected',
                 'agent_id': agent_id,
-                'content_excerpt': content[:200],
+                **excerpt_fields(content_excerpt=content),
             }
         if (
             category == 'temporal_facts'
@@ -3604,7 +3605,7 @@ def create_mcp_server(
                     'error': 'conflicting_task_status_framing_write_blocked',
                     'error_type': 'ReconConflictingTaskStatusWriteRejected',
                     'agent_id': agent_id,
-                    'content_excerpt': content[:200],
+                    **excerpt_fields(content_excerpt=content),
                     'conflicting_task_ids': sorted(conflicting_task_ids),
                     'hint': _CONFLICTING_TASK_STATUS_HINT,
                 }
@@ -3620,7 +3621,7 @@ def create_mcp_server(
                 'error': 'live_task_status_current_fact_write_blocked',
                 'error_type': 'ReconLiveTaskStatusWriteRejected',
                 'agent_id': agent_id,
-                'content_excerpt': content[:200],
+                **excerpt_fields(content_excerpt=content),
                 'hint': _LIVE_TASK_STATUS_HINT,
             }
         # task 2824: reject a recon-stage present-tense completion claim ("task N
