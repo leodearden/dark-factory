@@ -51,7 +51,9 @@ from fused_memory.reconciliation.cli_stage_runner import (
     gc_run_config_dir,
     recon_config_base_dir,
 )
-from fused_memory.reconciliation.drained_event_restore import restore_unless_completed
+from fused_memory.reconciliation.drained_event_restore import (
+    restore_unless_completed_best_effort,
+)
 from fused_memory.reconciliation.escalation_archive import (
     scan_recently_resolved_fingerprints,
 )
@@ -3517,10 +3519,8 @@ class ReconciliationHarness:
                 timeout=self.config.cycle_timeout_seconds,
             )
         except Exception:
-            await await_best_effort(
-                restore_unless_completed(self.journal, self.buffer, project_id, run_id),
-                what='restore_unless_completed', run_id=run_id,
-                logger=logger, level=logging.ERROR,
+            await restore_unless_completed_best_effort(
+                self.journal, self.buffer, project_id, run_id,
             )
             raise
 
@@ -3708,15 +3708,15 @@ class ReconciliationHarness:
         # no buffer drain) if project_id has no KNOWN_PROJECT_ROOTS entry.
         scope = self._known_project_scope_for(project_id)
         project_root = scope.project_root
-
-        tier = tier or TierConfig()
-        watermark = await self.journal.get_watermark(project_id)
-
         if resume_run is not None and run_id is not None:
             raise ValueError(
                 'run_full_cycle(resume_run=..., run_id=...) are mutually exclusive: '
                 'a resumed run keeps resume_run.id'
             )
+
+        tier = tier or TierConfig()
+        watermark = await self.journal.get_watermark(project_id)
+
         if resume_run is not None:
             # Task σ adopt-and-resume: reuse the interrupted run wholesale — no
             # fresh run row, no re-drain. The startup pass supplies the run's
@@ -4124,10 +4124,8 @@ class ReconciliationHarness:
                 what='complete_run(failed)', run_id=run_id,
                 logger=logger, level=logging.ERROR,
             )
-            await await_best_effort(
-                restore_unless_completed(self.journal, self.buffer, project_id, run_id),
-                what='restore_drained', run_id=run_id,
-                logger=logger, level=logging.ERROR,
+            await restore_unless_completed_best_effort(
+                self.journal, self.buffer, project_id, run_id,
             )
 
         await asyncio.shield(journal_failed_then_restore())
@@ -6586,7 +6584,9 @@ class BacklogIterator:
                     in_flight_run_id = None
         except TimeoutError:
             if in_flight_run_id is not None:
-                await self._restore_unless_completed(project_id, in_flight_run_id)
+                await restore_unless_completed_best_effort(
+                    self.journal, self.buffer, project_id, in_flight_run_id,
+                )
             raise
 
     async def _run_chunk(
@@ -6627,7 +6627,9 @@ class BacklogIterator:
                 'recon_backlog_overflow', chunk_id,
                 f'Backlog chunk {chunk_num} failed, stopping iteration: {e}',
             )
-            await self._restore_unless_completed(project_id, run_id)
+            await restore_unless_completed_best_effort(
+                self.journal, self.buffer, project_id, run_id,
+            )
             return False
         return True
 
@@ -6643,13 +6645,6 @@ class BacklogIterator:
             )
         except Exception as e:
             logger.error(f'Backlog final consolidation failed: {e}')
-            await self._restore_unless_completed(project_id, run_id)
-
-    async def _restore_unless_completed(self, project_id: str, run_id: str) -> None:
-        """Best-effort: a failing restore is logged, never raised over the
-        failure or deadline being handled."""
-        await await_best_effort(
-            restore_unless_completed(self.journal, self.buffer, project_id, run_id),
-            what='restore_unless_completed', run_id=run_id,
-            logger=logger, level=logging.ERROR,
-        )
+            await restore_unless_completed_best_effort(
+                self.journal, self.buffer, project_id, run_id,
+            )

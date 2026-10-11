@@ -2,6 +2,7 @@
 unless the journal records that run as completed (task 6453)."""
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime
 
@@ -16,7 +17,10 @@ from fused_memory.models.reconciliation import (
     RunStatus,
     RunType,
 )
-from fused_memory.reconciliation.drained_event_restore import restore_unless_completed
+from fused_memory.reconciliation.drained_event_restore import (
+    restore_unless_completed,
+    restore_unless_completed_best_effort,
+)
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
 
@@ -96,3 +100,35 @@ async def test_unfinished_run_restores_only_its_own_events(journal, buffer, b_st
 
     assert await buffer.count_buffered(PROJECT_ID) == 1
     assert len(await buffer.get_drained_events(PROJECT_ID, 'A')) == 2
+
+
+@pytest.mark.asyncio
+async def test_best_effort_restore_applies_the_same_policy(journal, buffer):
+    await _drain_new_events(buffer, 2, run_id='A')
+    await _journaled_run(journal, 'A', RunStatus.completed)
+    await _drain_new_events(buffer, 1, run_id='B')
+
+    await restore_unless_completed_best_effort(journal, buffer, PROJECT_ID, 'A')
+    await restore_unless_completed_best_effort(journal, buffer, PROJECT_ID, 'B')
+
+    assert await buffer.count_buffered(PROJECT_ID) == 1
+    assert len(await buffer.get_drained_events(PROJECT_ID, 'A')) == 2
+
+
+@pytest.mark.asyncio
+async def test_best_effort_restore_logs_a_failing_restore_instead_of_raising(
+    journal, buffer, caplog, monkeypatch,
+):
+    async def locked_restore(project_id, run_id, *, include_unattributed=False):
+        raise RuntimeError('database is locked')
+
+    monkeypatch.setattr(buffer, 'restore_drained', locked_restore)
+
+    with caplog.at_level(logging.ERROR):
+        await restore_unless_completed_best_effort(journal, buffer, PROJECT_ID, 'B')
+
+    [line] = [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.ERROR and r.getMessage().startswith('restore_drained failed:')
+    ]
+    assert 'run_id=B' in line
