@@ -58,12 +58,15 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import sys
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from itertools import chain
+from numbers import Real
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, TypeAlias
@@ -87,6 +90,8 @@ _REQUIRED_CASE_KEYS = ('arm', 'memory_id', 'band', 'outcome')
 _ATTACH_OUTCOMES = TRIAGE_OUTCOMES - {OUTCOME_STORED}
 _BANDS = frozenset({OUTCOME_RESTATED, OUTCOME_JUDGE, OUTCOME_STORED})
 """Every band ``write_triage.py::decide_band`` routes a write to."""
+_WRITE_FLAGS = ('recon_marker', 'declares_attach_keys')
+"""Case-row flags that take a write out of production's judge path (PRD §12 D19)."""
 _WILSON_Z = 1.96
 
 Pair: TypeAlias = tuple[str, str]
@@ -210,6 +215,8 @@ class JudgedCase:
     judge_model: str | None
     prompt_tokens: int | None
     completion_tokens: int | None
+    recon_marker: bool | None
+    declares_attach_keys: bool | None
 
     def __post_init__(self) -> None:
         violation = self._contract_violation()
@@ -217,6 +224,10 @@ class JudgedCase:
             raise ValueError(f'{_case_label(self.arm, self.memory_id)}: {violation}')
 
     def _contract_violation(self) -> str | None:
+        for flag in _WRITE_FLAGS:
+            value = getattr(self, flag)
+            if value is not None and not isinstance(value, bool):
+                return f'{flag} {value!r} is not a JSON boolean'
         if self.outcome not in TRIAGE_OUTCOMES:
             return f'outcome {self.outcome!r} is not one of {sorted(TRIAGE_OUTCOMES)}'
         if self.band not in _BANDS:
@@ -254,6 +265,8 @@ class JudgedCase:
             judge_model=row.get('judge_model'),
             prompt_tokens=usage.get('prompt_tokens'),
             completion_tokens=usage.get('completion_tokens'),
+            recon_marker=row.get('recon_marker'),
+            declares_attach_keys=row.get('declares_attach_keys'),
         )
 
     @property
@@ -264,6 +277,11 @@ class JudgedCase:
     @property
     def in_judge_band(self) -> bool:
         return self.band == OUTCOME_JUDGE
+
+    @property
+    def production_judged(self) -> bool:
+        """A judge-band write production would also judge: no recon marker, no declared link."""
+        return self.in_judge_band and all(getattr(self, flag) is False for flag in _WRITE_FLAGS)
 
     @property
     def attached(self) -> bool:
@@ -311,6 +329,10 @@ class ScoredCase:
         return self.resolution is Resolution.CORRECTS and not self.contested
 
     @property
+    def contradiction_flagged(self) -> bool:
+        return self.resolution is Resolution.CORRECTS and self.contested
+
+    @property
     def false_contested(self) -> bool:
         return self.resolution is Resolution.AGREEING and self.contested
 
@@ -331,6 +353,226 @@ PAIRED_ERRORS: Mapping[str, Callable[[ScoredCase], bool]] = MappingProxyType({
     'true_link_answered_distinct': lambda scored: scored.true_link_answered_distinct,
 })
 """The per-write errors each arm is paired against the reference arm on."""
+
+
+class OutcomeCell(StrEnum):
+    """What one production-judged write came to under one regime (PRD §12.3 C2‴).
+
+    :data:`COMPARATIVE_RULES` states each cell's rule; :func:`_outcome_cells`
+    is its one implementation.
+    """
+
+    ATTACH_BELONGS = 'attach_belongs'
+    CONTRADICTION_FLAGGED = 'contradiction_flagged'
+    PLACEABLE_LEFT_FLAT = 'placeable_left_flat'
+    CONTRADICTION_UNFLAGGED = 'contradiction_unflagged'
+    MISFILE_ATTACH = 'misfile_attach'
+    CONTESTED_MISFILE = 'contested_misfile'
+    FALSE_CONTESTED = 'false_contested'
+
+
+BOOTSTRAP_RESAMPLES = 10_000
+BOOTSTRAP_SEED = 6532
+"""The paired bootstrap's settings; each arm draws from a fresh ``random.Random(BOOTSTRAP_SEED)``."""
+
+DEFAULT_HARM_WEIGHTS: Mapping[str, float] = MappingProxyType({
+    OutcomeCell.CONTESTED_MISFILE: 3,
+    OutcomeCell.FALSE_CONTESTED: 2,
+    OutcomeCell.CONTRADICTION_UNFLAGGED: 2,
+    OutcomeCell.MISFILE_ATTACH: 1,
+    OutcomeCell.PLACEABLE_LEFT_FLAT: 0.5,
+})
+"""PRD §12 D20, provisional (G6). A cell left out weighs 0."""
+
+COMPARATIVE_RULES: Mapping[str, str] = MappingProxyType({
+    'n_writes': (
+        'production-judged writes: judge-band rows whose recon_marker and declares_attach_keys'
+        ' are both false'
+    ),
+    'placeable_writes': (
+        'production-judged writes with at least one pair resolved AGREEING or CORRECTS whose'
+        ' target predates the write (strictly earlier created_at; an undated record is never'
+        ' earlier)'
+    ),
+    'contradiction_writes': (
+        'production-judged writes with at least one pair resolved CORRECTS whose target'
+        ' predates the write'
+    ),
+    'placeable_attaches': (
+        'attaches of placeable writes whose pair resolved AGREEING, CORRECTS or MISFILE'
+    ),
+    'wrong_sibling_misfiles': (
+        'attaches of placeable writes whose pair resolved MISFILE: the write had an earlier'
+        ' home and the arm filed it under another record'
+    ),
+    'wrong_sibling_rate_placeable': (
+        'wrong_sibling_misfiles / placeable_attaches; None when placeable_attaches is 0'
+    ),
+    'wrong_sibling_rate_wilson95': (
+        'Wilson 95% interval (z = 1.96) on wrong_sibling_misfiles of placeable_attaches;'
+        ' None when placeable_attaches is 0'
+    ),
+    'no_known_home_attaches': (
+        'attaches whose pair resolved AGREEING, CORRECTS or MISFILE, of writes that are not'
+        ' placeable'
+    ),
+    'unclear_attaches': (
+        'attaches whose pair resolved UNCLEAR; outside every other figure and every outcome cell'
+    ),
+    'outcomes': (
+        'per regime, the production-judged writes in each cell; one write may fall in two'
+        ' cells. status_quo stores every write flat; arm is what this arm did'
+    ),
+    'harm_weights': (
+        'the weight of each outcome cell, as passed to the scorer; a cell left out weighs 0'
+        ' (PRD §12 D20, provisional)'
+    ),
+    'harm_total': (
+        'per regime, the sum over cells of harm_weights[cell] x outcomes[regime][cell];'
+        ' None when n_writes is 0'
+    ),
+    'harm_delta_vs_status_quo': (
+        'harm_total.arm - harm_total.status_quo, on the same writes; at most 0 means no more'
+        ' harm than storing every write flat; None when n_writes is 0'
+    ),
+    'harm_delta_bootstrap95': (
+        'paired bootstrap 95% interval of harm_delta_vs_status_quo, reported and not gated:'
+        ' each production-judged write contributes its arm harm minus its status-quo harm; the'
+        ' writes, ordered by memory_id, are resampled with replacement bootstrap.resamples'
+        ' times from random.Random(bootstrap.seed), and the interval is the nearest-rank 2.5th'
+        ' and 97.5th percentiles of the resampled sums; None when n_writes is 0'
+    ),
+    'bootstrap': 'the settings harm_delta_bootstrap95 was computed with',
+    OutcomeCell.ATTACH_BELONGS: 'attached, not filed contested, pair resolved AGREEING',
+    OutcomeCell.CONTRADICTION_FLAGGED: 'filed contested, pair resolved CORRECTS',
+    OutcomeCell.PLACEABLE_LEFT_FLAT: 'a placeable write stored flat',
+    OutcomeCell.CONTRADICTION_UNFLAGGED: (
+        'a contradiction write that was not filed contested against a target resolved'
+        ' CORRECTS, whatever else the regime did with it'
+    ),
+    OutcomeCell.MISFILE_ATTACH: 'attached, not filed contested, pair resolved MISFILE',
+    OutcomeCell.CONTESTED_MISFILE: 'filed contested, pair resolved MISFILE',
+    OutcomeCell.FALSE_CONTESTED: 'filed contested, pair resolved AGREEING',
+})
+"""The rule of every comparative figure and outcome cell; the report carries it as ``comparative_rules``."""
+
+_ATTACH_CELLS: Mapping[OutcomeCell, Callable[[ScoredCase], bool]] = MappingProxyType({
+    OutcomeCell.ATTACH_BELONGS: lambda attach: (
+        attach.resolution is Resolution.AGREEING and not attach.contested
+    ),
+    OutcomeCell.CONTRADICTION_FLAGGED: lambda attach: attach.contradiction_flagged,
+    OutcomeCell.CONTRADICTION_UNFLAGGED: lambda attach: attach.missed_contradiction,
+    OutcomeCell.MISFILE_ATTACH: lambda attach: attach.misfile and not attach.contested,
+    OutcomeCell.CONTESTED_MISFILE: lambda attach: attach.misfile and attach.contested,
+    OutcomeCell.FALSE_CONTESTED: lambda attach: attach.false_contested,
+})
+"""Each attach cell, read off :class:`ScoredCase`'s predicates; an UNCLEAR attach is in none."""
+
+
+def _outcome_cells(
+    attach: ScoredCase | None, placeable: bool, contradicts: bool,
+) -> frozenset[OutcomeCell]:
+    """The cells one write falls in under a regime that made *attach*, or stored it flat (None)."""
+    if attach is None:
+        cells = {OutcomeCell.PLACEABLE_LEFT_FLAT} if placeable else set()
+    else:
+        cells = {cell for cell, holds in _ATTACH_CELLS.items() if holds(attach)}
+    flagged = attach is not None and attach.contradiction_flagged
+    if contradicts and not flagged:
+        cells.add(OutcomeCell.CONTRADICTION_UNFLAGGED)
+    return frozenset(cells)
+
+
+def _validated_weights(harm_weights: Mapping[str, float]) -> Mapping[OutcomeCell, float]:
+    validated: dict[OutcomeCell, float] = {}
+    for key, weight in harm_weights.items():
+        if key not in OutcomeCell.__members__.values():
+            raise ValueError(
+                f'harm weight {key!r}: {weight!r} names no outcome cell;'
+                f' the cells are {[cell.value for cell in OutcomeCell]}'
+            )
+        if isinstance(weight, bool) or not isinstance(weight, Real) or not (
+            math.isfinite(weight) and weight >= 0
+        ):
+            raise ValueError(
+                f'harm weight {key!r}: {weight!r} is not a finite non-negative number'
+            )
+        validated[OutcomeCell(key)] = weight
+    return MappingProxyType(validated)
+
+
+def _predates(created_at: Mapping[str, datetime], target: str, write: str) -> bool:
+    target_at, write_at = created_at.get(target), created_at.get(write)
+    return target_at is not None and write_at is not None and target_at < write_at
+
+
+@dataclass(frozen=True)
+class WriteHomes:
+    """Per write, the resolutions of its rated pairs whose target predates it.
+
+    This is the one home of the earlier-target rule: a target predates a write
+    when both have an instant and the target's is strictly earlier. An undated
+    record is never earlier, as ``run_write_triage_population_arms.py::write_time_slate``
+    drops it from a write-time slate.
+    """
+
+    created_at: Mapping[str, datetime]
+    earlier: Mapping[str, frozenset[Resolution]]
+
+    @classmethod
+    def index(
+        cls, truth: Mapping[Pair, Resolution], created_at: Mapping[str, datetime],
+    ) -> WriteHomes:
+        earlier: defaultdict[str, set[Resolution]] = defaultdict(set)
+        for (write, target), resolution in truth.items():
+            if _predates(created_at, target, write):
+                earlier[write].add(resolution)
+        return cls(
+            created_at=MappingProxyType(dict(created_at)),
+            earlier=MappingProxyType({write: frozenset(found) for write, found in earlier.items()}),
+        )
+
+    def predates(self, target: str, write: str) -> bool:
+        return _predates(self.created_at, target, write)
+
+    def placeable(self, write: str) -> bool:
+        """The corpus says *write* belongs under some record that predates it."""
+        return any(resolution.belongs for resolution in self.earlier.get(write, ()))
+
+    def contradicts(self, write: str) -> bool:
+        """*write* corrects some record that predates it."""
+        return Resolution.CORRECTS in self.earlier.get(write, frozenset())
+
+
+@dataclass(frozen=True)
+class ComparedWrite:
+    """A production-judged write as the comparative block reads it."""
+
+    scored: ScoredCase
+    placeable: bool
+    contradicts: bool
+
+    @classmethod
+    def of(cls, scored: ScoredCase, homes: WriteHomes) -> ComparedWrite:
+        write = scored.case.memory_id
+        return cls(scored, homes.placeable(write), homes.contradicts(write))
+
+    @property
+    def arm_cells(self) -> frozenset[OutcomeCell]:
+        attach = self.scored if self.scored.case.attached else None
+        return _outcome_cells(attach, self.placeable, self.contradicts)
+
+    @property
+    def status_quo_cells(self) -> frozenset[OutcomeCell]:
+        """Production today stores every write flat."""
+        return _outcome_cells(None, self.placeable, self.contradicts)
+
+
+REGIMES: Mapping[str, Callable[[ComparedWrite], frozenset[OutcomeCell]]] = MappingProxyType({
+    'status_quo': lambda write: write.status_quo_cells,
+    'arm': lambda write: write.arm_cells,
+})
+"""The two regimes every arm's comparative block scores on the same writes."""
 
 
 @dataclass(frozen=True)
@@ -370,6 +612,8 @@ def score_pairs(
     verdicts: Sequence[Mapping[str, Any]],
     *,
     reference_arm: str,
+    created_at: Mapping[str, datetime] | None = None,
+    harm_weights: Mapping[str, float] = DEFAULT_HARM_WEIGHTS,
 ) -> dict[str, Any]:
     """Score every arm in *cases* against the verdict corpus *verdicts*.
 
@@ -448,18 +692,35 @@ def score_pairs(
 
     ``list_prices`` is the table those costs were computed from, with its date
     and source.
+
+    ``comparative`` (PRD §12.3, contract C2‴) is None unless *created_at* is
+    given. *created_at* maps record ids, writes and targets alike, to aware
+    instants; :class:`WriteHomes` states when a target predates a write. With
+    it, every judge-band row must also carry ``recon_marker`` and
+    ``declares_attach_keys`` as booleans, and the block scores the arm's
+    production-judged writes, the judge-band rows with both flags false,
+    against the status quo, which stores every one of them flat. Each figure
+    and :class:`OutcomeCell` is defined by its entry in
+    :data:`COMPARATIVE_RULES`, which the report carries once, as
+    ``comparative_rules``, when *created_at* is given and is None otherwise.
+    *harm_weights* weighs the cells (default :data:`DEFAULT_HARM_WEIGHTS`)
+    and is recorded in each block.
     """
+    weights = _validated_weights(harm_weights)
     cases_by_arm = _cases_by_arm(cases)
     if reference_arm not in cases_by_arm:
         raise ValueError(
             f'reference arm {reference_arm!r} is not among the arms {sorted(cases_by_arm)}'
         )
     _refuse_unshared_routing(cases_by_arm, reference_arm)
+    if created_at is not None:
+        _refuse_uncomparable_rows(chain.from_iterable(cases_by_arm.values()), created_at)
     truth = resolve_verdicts(verdicts)
     unrated, tied = _incomplete(_judged_pairs(cases_by_arm), truth)
     if unrated or tied:
         raise IncompleteCorpusError(unrated, tied)
     true_link_writes = frozenset(entry for (entry, _), r in truth.items() if r.belongs)
+    homes = None if created_at is None else WriteHomes.index(truth, created_at)
     scored = {
         arm: [_scored(case, truth, true_link_writes) for case in arm_cases if case.in_judge_band]
         for arm, arm_cases in cases_by_arm.items()
@@ -468,11 +729,13 @@ def score_pairs(
         'reference_arm': reference_arm,
         'verdict_corpus': _corpus_summary(verdicts, truth),
         'list_prices': _price_table(),
+        'comparative_rules': None if homes is None else _comparative_rules(),
         'arms': {
             arm: _arm_report(
                 cases_by_arm[arm],
                 scored[arm],
                 None if arm == reference_arm else scored[reference_arm],
+                None if homes is None else _comparative(scored[arm], homes, weights),
             )
             for arm in cases_by_arm
         },
@@ -504,6 +767,37 @@ def _refuse_unshared_routing(
             )
 
 
+def _refuse_uncomparable_rows(
+    cases: Iterable[JudgedCase], created_at: Mapping[str, datetime],
+) -> None:
+    for case in cases:
+        violation = _comparative_violation(case, created_at)
+        if violation is not None:
+            raise ValueError(f'{_case_label(case.arm, case.memory_id)}: {violation}')
+
+
+def _comparative_violation(case: JudgedCase, created_at: Mapping[str, datetime]) -> str | None:
+    if not case.in_judge_band:
+        return None
+    missing = [flag for flag in _WRITE_FLAGS if getattr(case, flag) is None]
+    if missing:
+        return (
+            f'a judge-band row lacks {", ".join(missing)}, so the comparative block cannot tell'
+            ' whether production would have judged it'
+        )
+    if not case.production_judged:
+        return None
+    if created_at.get(case.memory_id) is None:
+        return 'a production-judged write has no instant in created_at'
+    target = case.judged_candidate_id
+    if target is not None and not _predates(created_at, target, case.memory_id):
+        return (
+            f'attached to {target!r}, which does not predate the write; the comparative block'
+            ' reads write-time rows only (PRD §12 D19)'
+        )
+    return None
+
+
 def _judged_pairs(cases_by_arm: Mapping[str, Sequence[JudgedCase]]) -> dict[Pair, tuple[str, ...]]:
     named_by: defaultdict[Pair, set[str]] = defaultdict(set)
     for arm, cases in cases_by_arm.items():
@@ -526,6 +820,7 @@ def _arm_report(
     cases: Sequence[JudgedCase],
     scored: Sequence[ScoredCase],
     reference: Sequence[ScoredCase] | None,
+    comparative: dict[str, Any] | None,
 ) -> dict[str, Any]:
     judged = [s.case for s in scored]
     return {
@@ -533,6 +828,7 @@ def _arm_report(
         'quality': _quality(scored),
         'runtime': _runtime(judged),
         'paired_vs_reference': None if reference is None else _paired(scored, reference),
+        'comparative': comparative,
     }
 
 
@@ -564,7 +860,7 @@ def _quality(scored: Sequence[ScoredCase]) -> dict[str, Any]:
     decided = sum(s.decided for s in attached)
     misfiles = sum(s.misfile for s in attached)
     contradictions = sum(s.resolution is Resolution.CORRECTS for s in attached)
-    contradictions_contested = contradictions - sum(s.missed_contradiction for s in scored)
+    contradictions_contested = sum(s.contradiction_flagged for s in scored)
     agreeing = sum(s.resolution is Resolution.AGREEING for s in attached)
     agreeing_contested = sum(s.false_contested for s in scored)
     true_links = sum(s.has_true_link for s in scored)
@@ -589,6 +885,90 @@ def _quality(scored: Sequence[ScoredCase]) -> dict[str, Any]:
         'parse_failures': sum(s.case.parse_failure for s in scored),
         'unrated_pairs': 0,
         'unrated_pair_ids': [],
+    }
+
+
+def _comparative(
+    scored: Sequence[ScoredCase], homes: WriteHomes, weights: Mapping[OutcomeCell, float],
+) -> dict[str, Any]:
+    writes = [ComparedWrite.of(s, homes) for s in scored if s.case.production_judged]
+    outcomes = {
+        regime: {cell.value: sum(cell in cells_of(write) for write in writes) for cell in OutcomeCell}
+        for regime, cells_of in REGIMES.items()
+    }
+    return {
+        'n_writes': len(writes),
+        'placeable_writes': sum(write.placeable for write in writes),
+        'contradiction_writes': sum(write.contradicts for write in writes),
+        **_attach_figures([write for write in writes if write.scored.case.attached]),
+        'outcomes': outcomes,
+        'harm_weights': {cell.value: weight for cell, weight in weights.items()},
+        **_harm_figures(outcomes, weights, measured=bool(writes)),
+        'harm_delta_bootstrap95': _paired_bootstrap95({
+            write.scored.case.memory_id:
+                _write_harm(write.arm_cells, weights) - _write_harm(write.status_quo_cells, weights)
+            for write in writes
+        }),
+        'bootstrap': {
+            'resamples': BOOTSTRAP_RESAMPLES,
+            'seed': BOOTSTRAP_SEED,
+            'unit': 'production-judged write',
+        },
+    }
+
+
+def _comparative_rules() -> dict[str, str]:
+    return {str(key): rule for key, rule in COMPARATIVE_RULES.items()}
+
+
+def _write_harm(cells: frozenset[OutcomeCell], weights: Mapping[OutcomeCell, float]) -> float:
+    return sum(weights.get(cell, 0) for cell in cells)
+
+
+def _paired_bootstrap95(delta_by_write: Mapping[str, float]) -> list[float] | None:
+    """Nearest-rank 95% interval of the summed per-write delta over resampled writes."""
+    if not delta_by_write:
+        return None
+    deltas = [delta_by_write[write] for write in sorted(delta_by_write)]
+    draws = random.Random(BOOTSTRAP_SEED)
+    sums = sorted(
+        sum(draws.choices(deltas, k=len(deltas))) for _ in range(BOOTSTRAP_RESAMPLES)
+    )
+    return [round(_nearest_rank(sums, 2.5), 4), round(_nearest_rank(sums, 97.5), 4)]
+
+
+def _harm_figures(
+    outcomes: Mapping[str, Mapping[str, int]], weights: Mapping[OutcomeCell, float],
+    *, measured: bool,
+) -> dict[str, Any]:
+    totals = {
+        regime: sum(weight * table[cell] for cell, weight in weights.items())
+        for regime, table in outcomes.items()
+    }
+    return {
+        'harm_total': {regime: round(total, 4) if measured else None
+                       for regime, total in totals.items()},
+        'harm_delta_vs_status_quo': (
+            round(totals['arm'] - totals['status_quo'], 4) if measured else None
+        ),
+    }
+
+
+def _attach_figures(attaches: Sequence[ComparedWrite]) -> dict[str, Any]:
+    placeable = [write.scored for write in attaches if write.placeable]
+    decided = sum(scored.decided for scored in placeable)
+    misfiles = sum(scored.misfile for scored in placeable)
+    return {
+        'placeable_attaches': decided,
+        'wrong_sibling_misfiles': misfiles,
+        'wrong_sibling_rate_placeable': _rate(misfiles, decided),
+        'wrong_sibling_rate_wilson95': _wilson95(misfiles, decided),
+        'no_known_home_attaches': sum(
+            write.scored.decided for write in attaches if not write.placeable
+        ),
+        'unclear_attaches': sum(
+            write.scored.resolution is Resolution.UNCLEAR for write in attaches
+        ),
     }
 
 
@@ -623,9 +1003,9 @@ def _runtime(calls: Sequence[JudgedCase]) -> dict[str, Any]:
     }
 
 
-def _nearest_rank(sorted_values: Sequence[float], percent: int) -> float:
+def _nearest_rank(sorted_values: Sequence[float], percent: float) -> float:
     """The smallest observed value with at least *percent*% of values at or below it."""
-    rank = -(-percent * len(sorted_values) // 100)
+    rank = math.ceil(percent * len(sorted_values) / 100)
     return sorted_values[rank - 1]
 
 

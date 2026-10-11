@@ -386,6 +386,31 @@ def load_snapshot(path: Path) -> tuple[dict[str, Any], str]:
     return json.loads(body), actual
 
 
+def record_created_at(snapshot: Mapping[str, Any]) -> dict[str, datetime]:
+    """Each write's and each slate candidate's instant in *snapshot*, by memory id.
+
+    Every instant is aware, as :func:`parse_created_at` reads it. A record
+    without one (naive, absent or unparseable) is left out, never guessed. The
+    off-slate ``targets`` carry no instant and are not read. A record that
+    appears at two different instants is refused with ValueError.
+    """
+    instants: dict[str, datetime] = {}
+    records = (
+        record for write in snapshot['writes'] for record in (write, *write['candidates'])
+    )
+    for record in records:
+        instant = parse_created_at(record.get('created_at'))
+        if instant is None:
+            continue
+        seen = instants.setdefault(record['memory_id'], instant)
+        if seen != instant:
+            raise ValueError(
+                f'record {record["memory_id"]} appears in the snapshot at two instants:'
+                f' {seen.isoformat()} and {record["created_at"]}'
+            )
+    return instants
+
+
 # --- CLI ---------------------------------------------------------------------
 
 def _aware_datetime(text: str) -> datetime:
