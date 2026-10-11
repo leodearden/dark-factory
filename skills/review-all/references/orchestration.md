@@ -5,24 +5,26 @@ The Workflow-tool script for phases 3–4 of `/review-all`, in the house pattern
 ## Design notes
 
 - Keys are minted in the lead's Phase 5 digest by importing the one key implementation — `shared/src/shared/finding_key.py` once it lands, until then `skills/hotspot-survey/scripts/findings_artefact.py` (`finding_key`, `normalise_anchor`) — never by a second implementation; the digest must agree with that module's test fixture. Inside the script the join identity is the contract §2 `canonical` string, whose normalisation mirrors that module's, so no hashing is needed. Same identity, two representations.
+- The large static inputs live on disk, not in `args`: one brief file per seat (§The slice brief) and one JSON file holding every prior open finding in full. `args` carries identities, paths and counts only, so the lead can emit it as a tool-call value (failure mode 11).
+- The synthesis and the critic refer to findings by short ids the script assigns (`f<n>` for this run's findings, `p<n>` for priors, one id per canonical), and the script maps them back to canonicals before returning. Canonicals are long and the synthesis abbreviates them when asked to repeat them (failure mode 13); an id has nothing to abbreviate.
 - A prior finding re-observed through `prior_canonical` is recorded under the prior's canonical; when the new anchor differs, the new finding carries `supersedes_canonical` (contract §2 anchor-moved rule) and the digest fills `supersedes` with the prior key. Every prior open finding assigned to a slice comes back with a verdict or is listed under `observation.unchecked`.
-- A seat reviews a *slice* (an allocation of files); a finding carries the briefing *area* of its anchor. Slices never appear in findings.
+- A seat reviews a *slice* (an allocation of files); a finding carries the briefing *area* of its anchor. Slices never appear in findings. The script asserts a seat's identity itself (`r.seat = s.seat`, `r.area = s.area`) rather than trusting the seat to echo it (failure mode 12).
 - Line counts set a seat's read budget and nothing else; ranking inside the budget uses the §What to measure instruments. The `Do not steer by` list is enforced twice: in every prompt and by the critic.
-- The skeptic sees statements and measurements, never proposals (hotspot failure mode 5, now the default rather than the fallback).
+- The skeptic sees statements and measurements, never proposals (hotspot failure mode 5, now the default rather than the fallback), and records one falsification attempt per measurement; a measurement it did not reproduce cannot support `confirmed` (failure mode 4).
 - Cross-area seats run behind a barrier because they need every area seat's canonical set to dedup against — one of the three justified barrier cases in the Workflow reference.
-- The critic is a second reader of the join, not a third reviewer of the code. Its error classes are the ones `skills/team/SKILL.md` §4 names, plus the quality doc's two measurement traps (one term of the complexity pair; a do-not-steer measure as severity input).
+- The critic is a second reader of the join, not a third reviewer of the code. Its error classes are the ones `skills/team/SKILL.md` §4 names, plus the quality doc's two measurement traps (one term of the complexity pair; a do-not-steer measure as severity input). A `severity-unsupported` item carries the severity it argues for, and the revised synthesis says whether it accepted each item, so the lead's digest can apply the accepted corrections to the record (failure mode 14).
 - `routing` arrives in `args` so the fable provenance rule (`skills/team/SKILL.md` §Fable) is decided by the lead, outside the script.
 - The quality definition reaches every judging prompt one of the contract §10's two ways: `Read docs/code-quality.md` when the tree carries it, else the lead embeds the `code_quality.py::guidance` render as `args.quality_guidance` and the `QUALITY` clause carries it; the prompts never restate it.
 
 ## `args` shape
 
-Written by the lead to `<scratch>/args.json` after Phase 1 and passed as a JSON value (never a string).
+Written by the lead to `<scratch>/args.json` after Phase 1 (SKILL.md Phase 1 §Slices describes the generator) and passed as a JSON value (never a string). Measured on the first dark-factory run: 60 KB in this shape against 820 KB with every slice's read list, test patch targets, prior statements and leads inline.
 
 ```js
 // JSON Schema for args
 const ARGS_SCHEMA = {
   type: 'object',
-  required: ['run_id', 'as_of_sha', 'since', 'project', 'root', 'scratch', 'areas', 'slices', 'cross', 'metrics_summary', 'import_graph_path', 'prior', 'routing', 'ceilings'],
+  required: ['run_id', 'as_of_sha', 'since', 'project', 'root', 'scratch', 'areas', 'slices', 'cross', 'metrics_summary', 'import_graph_path', 'snapshot_path', 'prior', 'routing', 'ceilings'],
   properties: {
     run_id: { type: 'string', description: 'review-all-<project_id>-<YYYYMMDD>[-<n>]' },
     as_of_sha: { type: 'string' },
@@ -33,28 +35,29 @@ const ARGS_SCHEMA = {
     scratch: { type: 'string', description: '<session scratchpad>/review-all/<run_id>' },
     areas: { type: 'array', items: { type: 'string' }, description: "briefing subprojects keys + 'repo'" },
     slices: { type: 'array', items: { type: 'object',
-      required: ['seat', 'area', 'read_fully', 'index_only', 'tests_reaching_internals', 'size_alarms', 'prior_open', 'leads'],
+      required: ['seat', 'area', 'brief', 'read_fully', 'index_only_count', 'tests_reaching_internals_count', 'size_alarms', 'prior_open', 'leads_count'],
       properties: {
         seat: { type: 'string', description: '<area>/<slice-slug>, or <area> when the area is one slice' },
         area: { type: 'string' },
-        read_fully: { type: 'array', description: "each entry's numbers come from the snapshot's file record for its path: prose_share = prose_ratio (0 where that is null, a 0-line file); fan_in = fan_in_src; reexports = len(reexport_names); patch_targets = the count of distinct private_patch_targets, across tests records, that continue this record's module; the rest are the record's own fields", items: { type: 'object', required: ['path', 'lines', 'prose_share', 'cognitive_max', 'cognitive_total', 'fan_in', 'fan_out', 'reach_back_imports', 'cycle_closing_imports', 'reexports', 'patch_targets'],
-          properties: { path: { type: 'string' }, lines: { type: 'integer' }, prose_share: { type: 'number' }, cognitive_max: { type: 'integer' }, cognitive_total: { type: 'integer' }, fan_in: { type: 'integer' }, fan_out: { type: 'integer' }, reach_back_imports: { type: 'integer' }, cycle_closing_imports: { type: 'integer' }, reexports: { type: 'integer' }, patch_targets: { type: 'integer' } } } },
-        index_only: { type: 'array', items: { type: 'string' } },
-        tests_reaching_internals: { type: 'array', items: { type: 'object', required: ['test_path', 'targets'], properties: { test_path: { type: 'string' }, targets: { type: 'array', items: { type: 'string' } } } } },
+        brief: { type: 'string', description: 'absolute path of the seat brief file (§The slice brief); the seat reads it first, in full' },
+        read_fully: { type: 'array', description: 'the brief holds each entry with its snapshot numbers; here only the identity, in rank order, so the prompt can name the top entries', items: { type: 'object', required: ['path', 'lines'], properties: { path: { type: 'string' }, lines: { type: 'integer' } } } },
+        index_only_count: { type: 'integer' },
+        tests_reaching_internals_count: { type: 'integer' },
         size_alarms: { type: 'array', items: { type: 'string' }, description: 'files over ceilings.alarm_lines; heuristic-14 protocol is mandatory for each' },
-        prior_open: { type: 'array', items: { type: 'object', required: ['canonical', 'key', 'statement', 'severity', 'source_run'],
-          properties: { canonical: { type: 'string' }, key: { type: 'string' }, statement: { type: 'string' }, severity: { type: 'string' }, source_run: { type: 'string' },
+        prior_open: { type: 'array', items: { type: 'object', required: ['canonical'],
+          properties: { canonical: { type: 'string' }, key: { type: 'string' },
             sub_area: { type: 'string', description: 'contract §1 sub_area; a legacy <area>/<sub> hotspot area is split in Phase 0 into the plain area (in the key) and this field, and the finding is assigned to the slice holding the sub-area files' } } },
-          description: 'every prior open finding of this area assigned to this slice; each must come back in prior_verdicts — the script lists any that do not' },
-        leads: { type: 'array', items: { type: 'object', required: ['source', 'text'], properties: { source: { type: 'string', enum: ['hotspot', 'review', 'codebook', 'memory'] }, text: { type: 'string' } } } },
+          description: 'every prior open finding of this area assigned to this slice, identity only (statements are in the brief and in prior.full_path); each must come back in prior_verdicts — the script lists any that do not' },
+        leads_count: { type: 'integer' },
       } } },
     cross: { type: 'array', items: { type: 'object', required: ['lens', 'tag', 'title', 'question'],
       properties: { lens: { type: 'string' }, tag: { type: 'string' }, title: { type: 'string' }, question: { type: 'string' } } } },
     metrics_summary: { type: 'string', description: '`scripts/quality_metrics_snapshot.py --summary` plus its `--diff` sections, ≤4k chars' },
     quality_guidance: { type: ['string', 'null'], description: "null when <root>/docs/code-quality.md exists (prompts say Read it); otherwise the render of orchestrator/src/orchestrator/agents/code_quality.py::guidance, embedded verbatim (contract §10)" },
     import_graph_path: { type: 'string', description: "JSON file under scratch: the snapshot's import_graph section unchanged — {edges:[[from,to]], reach_back:[{from,to,names,line}], deferred:[{from,line,imports,closes_cycle}], cycles:[[module,...]], hidden_cycles:[[module,...]], typing_cycles:[[module,...]]}, nodes are module import names (a file record's `module`); cycles are over import-time edges, hidden_cycles add function-local imports, typing_cycles add `if TYPE_CHECKING:` ones, and closes_cycle marks a deferred import lying on a hidden cycle (plans/quality-metrics-snapshot-prd.md decision 10)" },
-    prior: { type: 'object', required: ['open', 'standing'], properties: {
-      open: { type: 'array', items: { type: 'object', required: ['canonical', 'key', 'area', 'statement', 'severity', 'source_run', 'disposition'] } },
+    snapshot_path: { type: 'string', description: "the Phase 1 snapshot JSON under scratch; a seat with a file larger than its remaining budget reads that file's rows of the `functions` table ({'<path>::<Class>::<func>': cognitive, ...}) to rank what it reads (failure mode 15)" },
+    prior: { type: 'object', required: ['standing', 'full_path'], properties: {
+      full_path: { type: 'string', description: 'JSON file under scratch holding every prior open finding in full — contract §1 fields plus canonical, source_run, sub_area, disposition — the synthesis reads it; the script derives the open set from slices[].prior_open and never carries a second copy' },
       standing: { type: 'array', items: { type: 'object', required: ['canonical', 'key', 'area', 'statement', 'disposition'] } } } },
     routing: { type: 'object', required: ['area', 'skeptic', 'cross', 'synthesis', 'critic'],
       additionalProperties: { type: 'object', required: ['model', 'effort'], properties: { model: { type: 'string' }, effort: { type: 'string' } } } },
@@ -63,6 +66,19 @@ const ARGS_SCHEMA = {
   },
 }
 ```
+
+### The slice brief
+
+One markdown file per seat at `<scratch>/seats/<seat>/brief.md`, written by the lead's generator (SKILL.md Phase 1 §Slices) from the full slice record, in this order, each section headed as named so the prompt can cite it:
+
+1. **READ FULLY, in this order** — one line per file with its snapshot numbers: lines, prose share, cognitive max / total, fan-in, fan-out, reach-back imports, cycle-closing deferred imports, re-exports, test patch targets. The numbers come from the snapshot's file record for the path: `prose_share = prose_ratio` (0 where null), `fan_in = fan_in_src`, `reexports = len(reexport_names)`, `patch_targets` = the count of distinct `private_patch_targets` across tests records that continue this record's module, `cycle_closing_imports` from the import graph's `deferred` entries with `closes_cycle` for this module; the rest are the record's own fields.
+2. **INDEX ONLY** — the remaining paths.
+3. **TESTS THAT REACH THIS SLICE'S INTERNALS** — `test_path -> targets`.
+4. **SIZE ALARMS** — paths over `ceilings.alarm_lines`.
+5. **PRIOR OPEN FINDINGS AT THIS AREA** — per prior: the exact `canonical`, key, severity, source run, sub-area, and the full statement (never truncated below what the seat needs to re-verify it).
+6. **LEADS** — `(source) text`.
+
+`<scratch>/prior_open.json` holds the same priors (every slice's, plus the unassigned ones) in full for the synthesis. `args.prior.full_path` names it.
 
 Default `cross` lenses (an overlay may add, never remove):
 
@@ -83,7 +99,7 @@ export const meta = {
     { title: 'Area review', detail: 'one seat per area slice; all fourteen heuristics and both stances', model: 'opus' },
     { title: 'Verify', detail: 'one skeptic per seat, blinded to proposals', model: 'sonnet' },
     { title: 'Cross-area', detail: 'h11 SPOT, h9 layering, h3 orthogonal dimensions, h7 stateless interactions', model: 'opus' },
-    { title: 'Synthesize', detail: 'join prior and new findings by canonical; area x heuristic ranked view; candidate streams' },
+    { title: 'Synthesize', detail: 'join prior and new findings by short id; area x heuristic ranked view; candidate streams' },
     { title: 'Critique', detail: 'a critic reads the assembled synthesis for join errors' },
   ],
 }
@@ -141,7 +157,9 @@ const AREA_SCHEMA = { type: 'object',
     read_coverage: { type: 'object', required: ['files_read_fully', 'files_indexed', 'lines_read'], properties: {
       files_read_fully: { type: 'array', items: { type: 'string' } },
       files_indexed: { type: 'array', items: { type: 'string' } },
-      lines_read: { type: 'integer' } } },
+      lines_read: { type: 'integer' },
+      partial: { type: 'array', description: 'files larger than the remaining budget, read by the symbol-index + ranked-functions + module-state protocol instead of in full', items: { type: 'object', required: ['path', 'lines_read_verbatim', 'how'], properties: {
+        path: { type: 'string' }, lines_read_verbatim: { type: 'integer' }, how: { type: 'string', description: 'which functions (by cognitive max rank) and which module-level state were read, and what was only indexed' } } } } } },
     area_health: { type: 'string', description: 'how the slice is structured today and where the next-change cost sits; >=200 chars' },
     prior_verdicts: { type: 'array', items: PRIOR_VERDICT },
     findings: { type: 'array', maxItems: MAX, items: FINDING },
@@ -149,12 +167,21 @@ const AREA_SCHEMA = { type: 'object',
     seams_for_cross_area: { type: 'string', description: 'duplicated policies, layering doubts, flag axes, attribute reaches you suspect but could not anchor inside this slice' },
   } }
 
+const FALSIFICATION = { type: 'object', required: ['measurement', 'ran', 'would_refute', 'found', 'reproduced'], properties: {
+  measurement: { type: 'string', description: "the measurement's name, or 'gone' for a prior marked gone" },
+  ran: { type: 'string', description: 'the command run, or the file and symbol opened' },
+  would_refute: { type: 'string', description: 'the result that would have refuted this measurement' },
+  found: { type: 'string', description: 'what you actually found, with your own figure' },
+  reproduced: { type: 'boolean', description: "true only when your own figure agrees with the reviewer's under the stated rule" },
+} }
+
 const SKEPTIC_SCHEMA = { type: 'object', required: ['verdicts'], properties: {
-  verdicts: { type: 'array', items: { type: 'object', required: ['display_id', 'verdict', 'checked', 'notes'], properties: {
+  verdicts: { type: 'array', items: { type: 'object', required: ['display_id', 'verdict', 'checked', 'notes', 'falsification'], properties: {
     display_id: { type: 'string', description: 'the finding display_id, or the prior canonical for a gone verdict' },
     verdict: { type: 'string', enum: ['confirmed', 'weakened', 'refuted'] },
     checked: { type: 'string', description: 'the files opened and the commands run' },
     notes: { type: 'string', description: 'what was found; for weakened/refuted, which fact fails' },
+    falsification: { type: 'array', minItems: 1, items: FALSIFICATION, description: 'one entry per measurement of the finding' },
   } } } } }
 
 const CROSS_SCHEMA = { type: 'object', required: ['lens', 'findings', 're_observations', 'method'], properties: {
@@ -165,17 +192,18 @@ const CROSS_SCHEMA = { type: 'object', required: ['lens', 'findings', 're_observ
   method: { type: 'string', description: 'what was read and computed, with counts' },
 } }
 
+const ID_DESC = 'short ids from the digest (f<n> for this run, p<n> for priors), bare — never canonicals, paths, abbreviations or appended flags'
 const SYNTHESIS_SCHEMA = { type: 'object',
   required: ['matrix', 'streams', 'invariant_candidates', 'contradictions', 'exonerations', 'method'],
   properties: {
     matrix: { type: 'array', items: { type: 'object', required: ['area', 'tag', 'ranked'], properties: {
       area: { type: 'string' }, tag: { type: 'string' },
-      ranked: { type: 'array', items: { type: 'string' }, description: 'canonicals, best payoff first' } } } },
+      ranked: { type: 'array', items: { type: 'string' }, description: `${ID_DESC}; best payoff first` } } } },
     streams: { type: 'array', items: { type: 'object',
       required: ['name', 'canonicals', 'remedy', 'deletable', 'size', 'risk', 'mode', 'seam_candidates', 'open_choices'],
       properties: {
         name: { type: 'string' },
-        canonicals: { type: 'array', items: { type: 'string' } },
+        canonicals: { type: 'array', items: { type: 'string' }, description: `${ID_DESC}; the script maps them back to canonicals` },
         remedy: { type: 'string', description: 'the named mechanism: module, type, chokepoint, invariant and where enforced' },
         deletable: { type: 'string', description: 'existing code the remedy makes deletable' },
         size: { type: 'string', enum: ['S', 'M', 'L'] },
@@ -189,16 +217,21 @@ const SYNTHESIS_SCHEMA = { type: 'object',
     invariant_candidates: { type: 'array', items: { type: 'object', required: ['statement', 'heuristic', 'checkable_form', 'fixture_sketch'], properties: {
       statement: { type: 'string' }, heuristic: { type: 'string' }, checkable_form: { type: 'string' }, fixture_sketch: { type: 'string' } } } },
     contradictions: { type: 'array', items: { type: 'object', required: ['between', 'conflict', 'resolution_or_question'], properties: {
-      between: { type: 'array', items: { type: 'string' } }, conflict: { type: 'string' }, resolution_or_question: { type: 'string' } } } },
-    exonerations: { type: 'string', description: 'areas or files the metrics flag that the reading shows healthy, and why; empty string if none' },
+      between: { type: 'array', items: { type: 'string' }, description: ID_DESC }, conflict: { type: 'string' }, resolution_or_question: { type: 'string' } } } },
+    exonerations: { type: 'string', description: 'areas or files the metrics flag that the reading shows healthy, and why, naming findings by short id; empty string if none' },
     method: { type: 'string', description: 'the ranking rule used, stated once' },
+    critic_responses: { type: 'array', description: 'present only in a revision: one entry per critic join_error, in order', items: { type: 'object', required: ['join_error', 'accepted', 'how'], properties: {
+      join_error: { type: 'integer', description: '0-based index into the critic join_errors you were given' },
+      accepted: { type: 'boolean' },
+      how: { type: 'string', description: 'what changed, or why the item was declined' } } } },
   } }
 
 const CRITIC_SCHEMA = { type: 'object', required: ['join_errors', 'verdict', 'notes'], properties: {
   join_errors: { type: 'array', items: { type: 'object', required: ['kind', 'where', 'detail', 'fix'], properties: {
     kind: { type: 'string', enum: ['inconsistent-rule', 'one-term-of-sum', 'evidence-contradicts-conclusion', 'do-not-steer-leak', 'duplicate-mechanism', 'unverified-fixed', 'severity-unsupported', 'area-unmapped', 'weakened-hidden'] },
-    where: { type: 'string', description: 'canonical, stream name or matrix cell' },
-    detail: { type: 'string' }, fix: { type: 'string' } } } },
+    where: { type: 'string', description: 'a short id (f<n>/p<n>), a stream name or a matrix cell' },
+    detail: { type: 'string' }, fix: { type: 'string' },
+    severity_to: { type: 'string', enum: ['high', 'medium', 'low'], description: 'severity-unsupported only: the severity the next_change scenario supports' } } } },
   verdict: { type: 'string', enum: ['accept', 'revise'] },
   notes: { type: 'string' },
 } }
@@ -258,8 +291,8 @@ function degenerateSeat(r, raw) {
   return rawCount > 0 && r.findings.length === 0
 }
 
-function prettyFiles(list) {
-  return list.map(f => `- ${f.path} (${f.lines} lines, prose ${Math.round(f.prose_share * 100)}%, cognitive max ${f.cognitive_max} / total ${f.cognitive_total}, fan-in ${f.fan_in}, fan-out ${f.fan_out}, reach-back imports ${f.reach_back_imports}, cycle-closing deferred imports ${f.cycle_closing_imports}, re-exports ${f.reexports}, test patch targets ${f.patch_targets})`).join('\n')
+function topReads(s) {
+  return s.read_fully.slice(0, 6).map(f => `${f.path} (${f.lines} lines)`).join(', ') + (s.read_fully.length > 6 ? `, … (${s.read_fully.length} files)` : '')
 }
 
 function areaPrompt(s) {
@@ -267,25 +300,9 @@ function areaPrompt(s) {
 
 ${QUALITY}quality is the expected cost and risk of the next change, made by an agent from a partial view. The fourteen heuristics and the two stances are lenses you name on each finding (tags), not a checklist to walk; one finding per heuristic is the failure mode this prompt exists to prevent.
 
-YOUR SLICE: ${s.seat} (findings carry area "${s.area}"). The reading list was ranked by the instruments in that doc's "What to measure" table; line counts set only how much fits in your budget.
+YOUR SLICE: ${s.seat} (findings carry area "${s.area}"). Your slice brief is the file ${s.brief} — Read it first, in full. It holds, in this order: READ FULLY (ranked by the instruments in that doc's "What to measure" table, each entry with its snapshot numbers; line counts set only how much fits in your budget — top entries: ${topReads(s)}), INDEX ONLY (${s.index_only_count} files), TESTS THAT REACH THIS SLICE'S INTERNALS (${s.tests_reaching_internals_count} test files), SIZE ALARMS (${s.size_alarms.length ? s.size_alarms.join(', ') : 'none'} — heuristic 14 protocol mandatory for each; fill h14_measurements with prose share and whether the prose is in its right home, a named partition of top-level symbols, and per candidate the heuristic-13 symptom naming the two modules and the specific import, or none), PRIOR OPEN FINDINGS AT THIS AREA (${s.prior_open.length}, with full statements; re-verify each at this tree and report every one in prior_verdicts using its exact canonical string — still_present or gone, a gone needs the commit or the replacing code; set prior_canonical on a new finding only when it adds evidence to one rather than restating it), and LEADS (${s.leads_count}; things to verify, never findings in themselves).
 
-READ FULLY, in this order:
-${prettyFiles(s.read_fully)}
-
-INDEX ONLY (module docstring + grep -n 'def \\|class ' listing; open a symbol only when a fully-read file leads you there):
-${s.index_only.map(p => `- ${p}`).join('\n') || '- none'}
-
-TESTS THAT REACH THIS SLICE'S INTERNALS (Tests stance; read the patch and attribute sites, not whole test files):
-${s.tests_reaching_internals.map(t => `- ${t.test_path} -> ${t.targets.join(', ')}`).join('\n') || '- none measured'}
-
-SIZE ALARMS (heuristic 14 protocol is mandatory for each; fill h14_measurements — prose share and whether the prose is in its right home, a named partition of top-level symbols, and per candidate the heuristic-13 symptom naming the two modules and the specific import, or none):
-${s.size_alarms.map(p => `- ${p}`).join('\n') || '- none'}
-
-PRIOR OPEN FINDINGS AT THIS AREA (re-verify each at this tree; report still_present or gone in prior_verdicts — a gone needs the commit or the replacing code; set prior_canonical on a new finding only when it adds evidence to one of these rather than restating it):
-${s.prior_open.map(p => `- ${p.canonical}${p.sub_area ? ` (sub-area ${p.sub_area})` : ''} [${p.severity}, ${p.source_run}] ${p.statement}`).join('\n') || '- none'}
-
-LEADS (fix-history themes, codebook confusions, operator memory — things to verify, never findings in themselves):
-${s.leads.map(l => `- (${l.source}) ${l.text}`).join('\n') || '- none'}
+A FILE LARGER THAN YOUR REMAINING BUDGET: when one READ FULLY entry exceeds the lines you can still read in full, do not read it from the top until the budget runs out. Read its symbol index (grep -n 'def \\|class '), its module-level state (assignments and constants outside any def), and its functions in descending cognitive max — the rows of the snapshot's functions table at ${A.snapshot_path} whose key starts with that path (a {"<path>::<Class>::<func>": cognitive} map; filter with a small script) — until the budget is spent; the rest stays indexed. Record it under read_coverage.partial (path, lines read verbatim, which functions and state you read), never under files_read_fully.
 
 METHOD
 1. Map: symbol index, module docstrings, top-level state, and this slice's rows in the import graph at ${A.import_graph_path}.
@@ -304,12 +321,15 @@ function skepticPrompt(label, findings, gone) {
   return `You are an adversarial verifier for a whole-project quality review of ${A.project.id} at ${ROOT} (detached checkout of ${A.as_of_sha}). READ-ONLY.
 
 ${A.quality_guidance ? QUALITY : ''}A reviewer judged "${label}" against ${QUALITY_REF} and produced the findings below as statements with measurements. You are deliberately not shown their proposals or severities. Try to REFUTE each.
-- refuted: the anchor does not exist at this tree; or a measured fact is wrong by enough to remove the claim; or the cost is already removed — a derivation, guard, test or mechanism exists that the statement implies is missing (grep for it before agreeing it is missing); or the claim rests on a "Do not steer by" measure of the quality doc.
-- weakened: the structure is real but a measurement is materially off, an existing mechanism covers most of the cost, or the next_change scenario does not support the claim's weight.
-- confirmed: only after opening the anchor and reproducing at least one measurement yourself (say what you ran).
-Check the code, not the prose. For duplication claims open every named site. One verdict per display_id.
 
-${gone.length ? `The reviewer also marked these prior findings GONE. Confirm each by locating the change (git log -S, the replacing code); an unlocatable gone is refuted, meaning the prior finding stands. Use the canonical as display_id.\n${JSON.stringify(gone, null, 1)}\n` : ''}
+FOR EVERY FINDING, FOR EACH OF ITS MEASUREMENTS, make one explicit falsification attempt and record it in falsification: what you ran (the command, or the file and symbol you opened), what result would have refuted the measurement, what you found with your own figure, and reproduced = true only when your figure agrees with the reviewer's under the stated rule. A measurement you did not reproduce cannot support confirmed: the verdict is then weakened by default (the pipeline enforces this), or refuted when your figure removes the claim.
+- refuted: the anchor does not exist at this tree; or a measured fact is wrong by enough to remove the claim; or the cost is already removed — a derivation, guard, test or mechanism exists that the statement implies is missing (grep for it before agreeing it is missing); or the claim rests on a "Do not steer by" measure of the quality doc.
+- weakened: the structure is real but a measurement is materially off or not reproduced, an existing mechanism covers most of the cost, or the next_change scenario does not support the claim's weight.
+- confirmed: only when every measurement reproduced and no falsification attempt succeeded.
+Check the code, not the prose. For duplication claims open every named site. One verdict per display_id.
+Calibration: in the first dark-factory run and its two sibling instruments at the same tree, 536 findings drew zero refutations. A verifier that never refutes is not measuring; a refutation that holds is the most valuable output you can return.
+
+${gone.length ? `The reviewer also marked these prior findings GONE. Confirm each by locating the change (git log -S, the replacing code); an unlocatable gone is refuted, meaning the prior finding stands. Use the canonical as display_id and 'gone' as the falsification measurement name.\n${JSON.stringify(gone, null, 1)}\n` : ''}
 FINDINGS:
 ${JSON.stringify(findings, null, 1)}`
 }
@@ -328,6 +348,9 @@ async function reviewSeat(s) {
     r = cleanSeat(raw, s.seat)
   }
   if (degenerateSeat(r, raw)) { log(`${s.seat}: seat lost — recorded in dropped`); dropped.push({ seat: s.seat, problems: ['seat degenerate twice'] }); return null }
+  if (r.seat !== s.seat || r.area !== s.area) log(`${s.seat}: seat echoed identity "${r.seat}"/"${r.area}" — overwritten with the slice's`)
+  r.seat = s.seat
+  r.area = s.area
   return r
 }
 
@@ -339,12 +362,24 @@ async function verifySeat(r, label) {
   return { ...r, verdicts: (v && v.verdicts) || [] }
 }
 
+const calibration = { downgraded_unreproduced: 0 }
+function enforceFalsification(v) {
+  const missing = (v.falsification || []).filter(x => x && x.reproduced === false)
+  if (v.verdict === 'confirmed' && missing.length) {
+    calibration.downgraded_unreproduced += 1
+    log(`verdict ${v.display_id}: confirmed with ${missing.length} unreproduced measurement(s) — downgraded to weakened`)
+    return { ...v, verdict: 'weakened', notes: `[pipeline: confirmed → weakened; not reproduced: ${missing.map(x => x.measurement).join(', ')}] ${v.notes}` }
+  }
+  return v
+}
+
 function applyVerdicts(r) {
-  const by = new Map(r.verdicts.map(v => [v.display_id, v]))
+  const by = new Map(r.verdicts.map(v => [v.display_id, enforceFalsification(v)]))
   for (const f of r.findings) {
     const v = by.get(f.display_id)
     f.verdict = v ? v.verdict : 'unverified'
     f.verdict_notes = v ? `${v.checked} — ${v.notes}` : 'no verdict matched this display_id'
+    f.falsification = v ? v.falsification : []
   }
   for (const p of r.prior_verdicts || []) {
     if (p.status !== 'gone') continue
@@ -375,7 +410,7 @@ for (const s of A.slices) {
   const r = seats.find(x => x.seat === s.seat)
   const answered = new Set(((r && r.prior_verdicts) || []).map(p => p.canonical))
   for (const p of s.prior_open) if (!answered.has(p.canonical)) {
-    unchecked.push({ seat: s.seat, canonical: p.canonical, key: p.key, sub_area: p.sub_area || null, why: r ? 'seat returned no verdict' : 'seat lost' })
+    unchecked.push({ seat: s.seat, canonical: p.canonical, key: p.key || null, sub_area: p.sub_area || null, why: r ? 'seat returned no verdict' : 'seat lost' })
   }
 }
 if (unchecked.length) log(`${unchecked.length} prior open findings came back without a verdict — listed under observation.unchecked, never silently not_checked`)
@@ -433,7 +468,7 @@ const crossSeats = (await pipeline(
       else fresh.push(f)
     }
     const v = fresh.length ? await agent(skepticPrompt(`cross:${l.lens}`, blind(fresh), []), { label: `verify:cross:${l.lens}`, phase: 'Verify', model: A.routing.skeptic.model, effort: A.routing.skeptic.effort, schema: SKEPTIC_SCHEMA }) : { verdicts: [] }
-    return applyVerdicts({ ...r, seat: `cross:${l.lens}`, findings: fresh, prior_verdicts: [], verdicts: (v && v.verdicts) || [] })
+    return applyVerdicts({ ...r, seat: `cross:${l.lens}`, area: null, findings: fresh, prior_verdicts: [], verdicts: (v && v.verdicts) || [] })
   },
 )).filter(Boolean)
 for (const r of crossSeats) for (const f of r.findings) if (f.verdict !== 'refuted' && !known.has(f.canonical)) known.set(f.canonical, f)
@@ -441,9 +476,40 @@ for (const r of crossSeats) for (const f of r.findings) if (f.verdict !== 'refut
 const all = [...seats, ...crossSeats]
 const counts = { confirmed: 0, weakened: 0, refuted: 0, unverified: 0 }
 for (const r of all) for (const f of r.findings) counts[f.verdict] = (counts[f.verdict] || 0) + 1
-if (counts.refuted === 0 && (counts.confirmed + counts.weakened) > 10) log('YELLOW FLAG: zero refutations across the run — lead re-verifies a sample inline before trusting the verdict counts')
+const verified = counts.confirmed + counts.weakened + counts.refuted
+calibration.refutation_rate = verified ? Math.round(1000 * counts.refuted / verified) / 1000 : null
+if (counts.refuted === 0 && (counts.confirmed + counts.weakened) > 10) log('YELLOW FLAG: zero refutations across the run — the lead re-verifies a stratified sample of ten confirmed findings (all highs first, then random) inline before trusting the verdict counts, and compares refutation_rate with prior runs')
 
-const priorOpen = new Map(A.prior.open.map(p => [p.canonical, p]))
+// Short ids: one per canonical. Priors first (p<n>), then this run's findings (f<n>); a finding whose
+// canonical is also a prior keeps the prior's id, so the synthesis never sees two ids for one canonical.
+const PRIOR_OPEN_ALL = A.slices.flatMap(s => s.prior_open)
+const priorOpen = new Map(PRIOR_OPEN_ALL.map(p => [p.canonical, p]))
+const idOf = new Map()
+let pn = 0
+for (const p of PRIOR_OPEN_ALL) if (!idOf.has(p.canonical)) idOf.set(p.canonical, `p${++pn}`)
+let fn = 0
+for (const c of known.keys()) if (!idOf.has(c)) idOf.set(c, `f${++fn}`)
+const canonicalOf = new Map([...idOf].map(([c, id]) => [id, c]))
+const ID_RE = /^[fp]\d+$/
+function resolveIds(list, where, unresolved) {
+  return (list || []).map(x => {
+    const s = String(x).trim()
+    const c = canonicalOf.get(s)
+    if (c) return c
+    unresolved.push({ where, id: s, why: ID_RE.test(s) ? 'unknown id' : 'not a short id' })
+    return s
+  })
+}
+function mapIds(syn) {
+  if (!syn) return syn
+  const unresolved = []
+  for (const cell of syn.matrix || []) cell.ranked = resolveIds(cell.ranked, `matrix ${cell.area}×${cell.tag}`, unresolved)
+  for (const st of syn.streams || []) st.canonicals = resolveIds(st.canonicals, `stream ${st.name}`, unresolved)
+  for (const c of syn.contradictions || []) c.between = resolveIds(c.between, 'contradiction', unresolved)
+  if (unresolved.length) log(`synthesis: ${unresolved.length} entries were not bare short ids — kept verbatim and listed under unresolved_ids`)
+  return { ...syn, unresolved_ids: unresolved }
+}
+
 const observation = { new: [], re_observed: [], standing: A.prior.standing.map(p => p.canonical), fixed: [], unchecked }
 const addOnce = (list, c) => { if (!list.includes(c)) list.push(c) }
 for (const r of seats) for (const p of r.prior_verdicts || []) {
@@ -461,23 +527,27 @@ for (const r of crossSeats) for (const o of r.re_observations || []) addOnce(obs
 
 const digest = {
   run_id: A.run_id, as_of_sha: A.as_of_sha, since: A.since,
-  seats: all.map(r => ({ seat: r.seat, area: r.area, area_health: r.area_health, read_coverage: r.read_coverage, h14_measurements: r.h14_measurements, prior_verdicts: r.prior_verdicts, findings: digestFindings(r.findings).map(f => ({ ...f, proposal: (known.get(f.canonical) || {}).proposal, next_change: (known.get(f.canonical) || {}).next_change, supersedes_canonical: (known.get(f.canonical) || {}).supersedes_canonical })) })),
-  prior_open: A.prior.open, standing: A.prior.standing, observation, verification: counts, dropped,
+  ids_rule: 'every finding and prior carries a short id (f<n> this run, p<n> prior; one id per canonical); the synthesis and critic refer to findings by these ids only',
+  seats: all.map(r => ({ seat: r.seat, area: r.area, area_health: r.area_health, read_coverage: r.read_coverage, h14_measurements: r.h14_measurements, prior_verdicts: r.prior_verdicts, findings: digestFindings(r.findings).map(f => ({ id: idOf.get(f.canonical), ...f, proposal: (known.get(f.canonical) || {}).proposal, next_change: (known.get(f.canonical) || {}).next_change, supersedes_canonical: (known.get(f.canonical) || {}).supersedes_canonical })) })),
+  prior_ids: PRIOR_OPEN_ALL.filter((p, i, a) => a.findIndex(q => q.canonical === p.canonical) === i).map(p => ({ id: idOf.get(p.canonical), canonical: p.canonical, key: p.key || null, sub_area: p.sub_area || null })),
+  prior_open_file: A.prior.full_path, prior_open_count: priorOpen.size, standing: A.prior.standing, observation, verification: counts, calibration, dropped,
 }
 
 function synthesisPrompt(critique) {
   return `You are the synthesis seat of a whole-project quality review of ${A.project.id} at ${ROOT} (detached checkout of ${A.as_of_sha}). READ-ONLY; verify in code where a join depends on it.
 
-${QUALITY}then read docs/quality-findings-contract.md §1–§4, §6 (in the dark-factory checkout if this project carries no copy). Below: verified findings from ${seats.length} area seats and ${crossSeats.length} cross-area seats, the prior open findings from earlier instrument runs, standing (accepted) findings, and the observation classes already computed (new / re_observed / standing / fixed).
+${QUALITY}then read docs/quality-findings-contract.md §1–§4, §6 (in the dark-factory checkout if this project carries no copy). Below: verified findings from ${seats.length} area seats and ${crossSeats.length} cross-area seats, standing (accepted) findings, and the observation classes already computed (new / re_observed / standing / fixed). The ${priorOpen.size} prior open findings from earlier instrument runs are in the JSON file ${A.prior.full_path} — Read it: their statements, severities, classes and keys are inputs to the matrix and streams exactly like this run's findings. digest.prior_ids maps each prior's short id to its canonical in that file.
+
+IDS: every finding and prior has a short id (f<n>, p<n>) in the digest. In matrix.ranked, streams.canonicals and contradictions.between write bare ids and nothing else — no canonicals, no paths, no abbreviation scheme of your own, no area prefixes, no appended flags such as [w] or [p]; the pipeline maps ids back to canonicals, and anything that is not a bare id is reported as unresolved. Name findings by id in exonerations and method too.
 
 JOBS
-1. MATRIX: one ranked view per area × primary tag that has findings, canonicals best payoff first. Payoff = next-change cost removed × breadth (sites, areas) × verdict weight (confirmed 1, weakened 0.5). Standing findings are listed, never ranked. State the rule once in method and apply it everywhere.
+1. MATRIX: one ranked view per area × primary tag that has findings, ids best payoff first. Payoff = next-change cost removed × breadth (sites, areas) × verdict weight (confirmed 1, weakened 0.5; a prior re-checked this run takes this run's verdict, an unchecked prior keeps its instrument's). Standing findings are listed, never ranked. State the rule once in method and apply it everywhere.
 2. STREAMS: group findings that one named remedy removes together. Each stream names the mechanism, what becomes deletable, size and risk, the shared artefacts needing one owner, and mode (agent for mechanical, spawn for design-heavy). Mechanical findings that need no design stay out of streams — the lead files them. Where two viable designs exist, write open_choices with options, trade-offs and the long-term consequence; do not pick unless the analysis converges.
 3. INVARIANT CANDIDATES: only rules with a checkable form and a fixture sketch (docs/code-quality.md §Relationship to the design invariants); map to an existing INV when one already encodes it instead of proposing a new one.
 4. CONTRADICTIONS: seats proposing conflicting remedies, or a remedy that duplicates a mechanism that already exists; resolve or pose the question.
 5. EXONERATIONS: what the metrics flag that the reading shows healthy.
-Mark weakened findings visibly wherever they appear. Never rank by, or justify a severity with, a measure from the doc's Do-not-steer list.
-${critique ? `\nA critic read your previous synthesis and found these join errors; fix each and say in method how:\n${JSON.stringify(critique, null, 1)}\n` : ''}
+A weakened finding keeps its weight through its id; the report marks it from the record. Never rank by, or justify a severity with, a measure from the doc's Do-not-steer list.
+${critique ? `\nA critic read your previous synthesis and found these join errors. Fix each you accept, say in method how, and fill critic_responses with one entry per item in order (accepted true/false and how); a declined item needs its reason:\n${JSON.stringify(critique, null, 1)}\n` : ''}
 DIGEST:
 ${JSON.stringify(digest, null, 1)}`
 }
@@ -491,14 +561,14 @@ let synthesis = await seatWithRetry('synthesize', (note) => agent(synthesisPromp
 function criticPrompt() {
   return `You are the critic of an assembled synthesis for a whole-project quality review of ${A.project.id} at ${ROOT}. READ-ONLY; open code where a check needs it.
 
-You are not a third reviewer of the code. You read the JOIN: the places where seats' results were combined. ${QUALITY}attend to its "What to measure" and "Do not steer by" sections. Check, and report each hit as a join_error with a fix:
+You are not a third reviewer of the code. You read the JOIN: the places where seats' results were combined. ${QUALITY}attend to its "What to measure" and "Do not steer by" sections. Findings are named by short id (f<n>, p<n>) in both documents below; use those ids in where. Check, and report each hit as a join_error with a fix:
 - inconsistent-rule: two figures compared under different rules (one seat counted prose lines, another did not; one measured per function, another per module) — compare the rules figure by figure, not seat by seat.
 - one-term-of-sum: a conclusion about complexity or size that reads one term of a pair (module total without the per-function maximum, or the reverse; a split that lowers file size while total complexity rises).
 - evidence-contradicts-conclusion: a ranking, stream or exoneration that a seat's own measurements or a skeptic's notes contradict.
 - do-not-steer-leak: a line count, average complexity, coverage or test count used as ranking input or severity support.
 - duplicate-mechanism: a stream remedy that re-creates a mechanism the tree already has (grep for it).
 - unverified-fixed: a canonical classed fixed without a confirmed gone verdict.
-- severity-unsupported: a high whose next_change scenario does not support it.
+- severity-unsupported: a high whose next_change scenario does not support it — set severity_to to the severity the scenario does support, so the correction can be applied to the record.
 - area-unmapped: a finding whose area is not the area of its anchor path.
 - weakened-hidden: a weakened verdict that vanished from the matrix or a stream.
 Verdict: accept, or revise when any error changes a ranking, a stream or a disposition.
@@ -526,12 +596,25 @@ if (!synthesis) {
   }
 }
 
+// Severity corrections the critic argued for, with the revised synthesis's acceptance; the lead's
+// digest applies the accepted ones to the findings record (report-format.md §Artefact 2).
+const severityCorrections = ((critic && critic.join_errors) || []).map((e, i) => ({ e, i }))
+  .filter(({ e }) => e.kind === 'severity-unsupported' && e.severity_to)
+  .map(({ e, i }) => {
+    const c = canonicalOf.get(String(e.where).trim())
+    const f = c ? known.get(c) : null
+    const resp = ((revised && synthesis && synthesis.critic_responses) || []).find(r => r.join_error === i)
+    return { canonical: c || null, where: e.where, from: f ? f.severity : null, to: e.severity_to, reason: e.detail, accepted: resp ? resp.accepted : null, how: resp ? resp.how : null }
+  })
+if (severityCorrections.some(s => !s.canonical)) log(`critic: ${severityCorrections.filter(s => !s.canonical).length} severity correction(s) name no resolvable id — listed with canonical null`)
+
 return {
   run_id: A.run_id, as_of_sha: A.as_of_sha, since: A.since,
   seats: all.map(r => ({ ...r, verdicts: undefined })),
   refuted: all.flatMap(r => r.findings.filter(f => f.verdict === 'refuted').map(f => ({ seat: r.seat, display_id: f.display_id, canonical: f.canonical, anchor: f.anchor, why: f.verdict_notes }))),
-  verification: counts, observation, dropped,
-  synthesis, critic, synthesis_revised: revised,
+  verification: counts, calibration, observation, dropped,
+  short_ids: [...idOf].map(([c, id]) => ({ id, canonical: c })),
+  synthesis: mapIds(synthesis), critic, synthesis_revised: revised, severity_corrections: severityCorrections,
 }
 ```
 
@@ -549,17 +632,22 @@ Set in `args.routing` by the lead, explicit on every `agent()`; the session mode
 
 Provenance rule (`skills/team/SKILL.md` §Fable): a fable lead sets the two fable seats directly; an opus lead sets them under the project overlay's standing ruling (`.claude/skills/review-all/project.md`, as dark-factory's grants since 2026-10-05), `--fable`, or a statement in the conversation, otherwise runs the fallback and says in the report that fable was wanted.
 
-Expected per-seat spend, extrapolated from the hotspot run's measured 100–140k for a deep reviewer: area seats 150–250k (they read more), skeptics 60–100k, cross seats 150–250k, synthesis 200–300k, critic 100–200k.
+Expected per-seat spend, extrapolated from the hotspot run's measured 100–140k for a deep reviewer: area seats 150–250k (they read more), skeptics 60–100k, cross seats 150–250k, synthesis 200–300k, critic 100–200k. Measured on the first dark-factory run: 14.2M subagent tokens over 50 seats for phases 3–4 (20 area, 23 skeptic, 4 cross, 3 fable); SKILL.md §Cost gate carries the whole-run calibration.
 
 ## Failure modes
 
 1. **Degenerate structured output passes the schema** (hotspot failure mode 1). `cleanSeat` + `degenerateSeat` check every finding's anchor shape, statement length, measurement presence, next-change scenario and placeholder text; cross seats (`degenerateCross`), the synthesis (`degenerateSynthesis`) and the critic (`degenerateCritic`) have their own checks through `seatWithRetry`. Every seat is re-run once and then dropped with a `dropped` record the report prints; a lost synthesis skips the critic rather than handing it `null`.
 2. **Fourteen-times-N trivial findings.** Prevented by the prompt's next-change filter and the `maxItems` cap; detected by the critic's `severity-unsupported` class. If a seat returns `MAX` findings all `low`, the lead reads its `area_health` before trusting any of them.
 3. **A split proposed without the heuristic-14 protocol.** Dropped mechanically (`h14 without measurement protocol`); the report lists it so the seat's omission is visible.
-4. **Skeptic anchoring.** The skeptic never sees proposals or severities (`blind`). Zero refutations with more than ten surviving findings logs a YELLOW FLAG; the lead samples five confirmed findings and re-verifies inline, and the report says so under `verification`.
+4. **Skeptic anchoring and a skeptic that never refutes.** The skeptic never sees proposals or severities (`blind`). Measured on the first dark-factory run: 0 refutations across 203 findings, and 0 across the hotspot refresh (174) and the `/review` run (159) at the same tree — 536 findings, 0 refuted; the five-finding sample all reproduced, which cannot tell "all real" from "skeptic too soft". So the skeptic now records one falsification attempt per measurement (what it ran, what would have refuted it, what it found, whether it reproduced), and `enforceFalsification` downgrades a `confirmed` verdict with any unreproduced measurement to `weakened` (counted in `calibration.downgraded_unreproduced`). Zero refutations with more than ten surviving findings logs a YELLOW FLAG; the lead re-verifies a stratified sample of ten confirmed findings inline (all highs first, then random), records the per-key outcome in the report's `extra.yellow_flag_sample`, and compares `calibration.refutation_rate` with the previous runs' `## Method` `verification.refutation_rate`.
 5. **Verdict join by display_id.** Unmatched ids fall to `unverified` and are counted separately; never conflate "survived" with "confirmed".
 6. **`fixed` without evidence.** A prior finding is `fixed` only when the seat said `gone` and the skeptic confirmed the locating evidence; the critic's `unverified-fixed` is the backstop.
 7. **The result is too large to read raw** (expect 300–600 KB). The lead writes it to `<scratch>/workflow-result.json` and digests with a script (SKILL.md Phase 5).
 8. **Main moves during a three-hour run.** Every seat reads the detached worktree at `as_of_sha`, never the main checkout; the lead removes the worktree after the report is committed. No stash anywhere (CLAUDE.md §Working in the main checkout).
 9. **Budget directive.** `budget` (`total`, `spent()`, `remaining()`) is a documented Workflow script global (`workflow-authoring` reference §Script body hooks). Under a `+Nk` directive, the guard before `phase('Cross-area')` skips the lenses when fewer than ~800k tokens remain (four opus seats plus skeptics) and logs it; synthesis and critic still run on what exists, and the report lists the lenses under Dropped and degraded. Without a directive `budget.total` is null and the guard is inert.
 10. **A prior finding silently unchecked.** Legacy hotspot areas `<area>/<sub>` are split in Phase 0 into the plain area and `sub_area` and assigned to the slice holding those files; after the area pipeline the script lists every assigned prior that came back without a verdict under `observation.unchecked`, so a seat that skipped its re-verification duty is visible in the report rather than read as "still open, nothing changed".
+11. **`args` too large to pass inline.** With every slice's read list, test patch targets, prior statements and leads embedded, the first dark-factory run's `args` was 820 KB, which the lead would have had to emit as a single tool-call value. The run moved the static inputs to one brief file per seat and one `prior_open.json` (§The slice brief) and passed a 60 KB `args` of identities, paths and counts; that is now the shape. The script derives the open prior set from `slices[].prior_open` and never carries a second copy.
+12. **Seat name drift.** Two of 19 area seats echoed `seat` without the area prefix (`harness-agents`, `task-layer-curator`); the post-pipeline join `seats.find(x => x.seat === s.seat)` missed them and 41 priors they had in fact re-verified were reported as `unchecked`. `reviewSeat` now overwrites `seat` and `area` from the slice after the call (logging a mismatch), and the cross arm sets its own `seat`; a seat's echo is never a join key.
+13. **The synthesis invents an abbreviation scheme.** Asked to repeat 480 canonicals in the matrix, the fable synthesis shortened them its own way — path tokens (`O:=` for the orchestrator package), omitted `<area>|` prefixes, trailing `[w,p,m]` flags, `alias:filed-by-anchor` notes — and the lead's digest had to reverse-engineer it. The script now assigns short ids (`p<n>` priors, `f<n>` findings, one per canonical), the prompts forbid anything but bare ids in `ranked`, `canonicals` and `between`, and `mapIds` maps them back before returning, listing anything unresolvable under `synthesis.unresolved_ids`; `short_ids` in the result lets the lead's digest read the ids the critic prose and `method`/`exonerations` still use.
+14. **An accepted critic correction never reaches the record.** The critic's `severity-unsupported` on `fk-3505aba0481d` (`evals/runner.py::run_architect_eval`, high → medium) was accepted in the revised synthesis, but the findings record kept the seat's `high` and the lead had to rule at decompose. The critic now states `severity_to`, the revision answers each item in `critic_responses`, and the script returns `severity_corrections` with the acceptance; the lead's digest applies the accepted ones and flags the rest (`report-format.md` §Artefact 2).
+15. **A file larger than the read budget.** `merge_lane/worker.py` was 22,081 lines against a 15k budget; the seat read 9,970 verbatim and the rest as a code-only rendition, and nothing in `read_coverage` said so. The area prompt now prescribes the protocol (symbol index, module-level state, functions in descending cognitive max from the snapshot's `functions` table) and `read_coverage.partial` records it, so the report can show what was not read.
