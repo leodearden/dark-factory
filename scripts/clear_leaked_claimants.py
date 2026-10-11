@@ -124,20 +124,32 @@ class Violation:
 
 
 @dataclass(frozen=True)
+class CensusTotals:
+    by_tier: Mapping[Tier, int]
+    by_tier_status: Mapping[Tier, Mapping[str, int]]
+
+    def as_json(self) -> dict[str, Any]:
+        return {
+            'by_tier': dict(self.by_tier),
+            'by_tier_status': {tier: dict(statuses) for tier, statuses in self.by_tier_status.items()},
+        }
+
+
+@dataclass(frozen=True)
 class Census:
     project_root: str
     measured_at: datetime
     rows_in_store: int
     violations: tuple[Violation, ...]
 
-    def totals(self) -> dict[str, dict[Tier, Any]]:
+    def totals(self) -> CensusTotals:
         by_tier = {tier: 0 for tier in Tier}
         by_tier_status: dict[Tier, dict[str, int]] = {tier: {} for tier in Tier}
         for violation in self.violations:
             by_tier[violation.tier] += 1
             statuses = by_tier_status[violation.tier]
             statuses[violation.status] = statuses.get(violation.status, 0) + 1
-        return {'by_tier': by_tier, 'by_tier_status': by_tier_status}
+        return CensusTotals(by_tier=by_tier, by_tier_status=by_tier_status)
 
 
 def _ordered(tiers: frozenset[Tier]) -> tuple[Tier, ...]:
@@ -379,9 +391,9 @@ def _census_lines(census: Census) -> list[str]:
     totals = census.totals()
     lines = [
         format_kv_line([('rows_in_store', census.rows_in_store)]),
-        format_kv_line(list(totals['by_tier'].items()), indent='  totals: '),
+        format_kv_line(list(totals.by_tier.items()), indent='  totals: '),
     ]
-    for tier, statuses in totals['by_tier_status'].items():
+    for tier, statuses in totals.by_tier_status.items():
         lines.append(format_kv_line(sorted(statuses.items()), indent=f'  {tier}: ').rstrip())
     lines.extend(format_kv_line(_violation_pairs(v), indent='    ') for v in census.violations)
     return lines
@@ -449,7 +461,7 @@ def _census_json(census: Census) -> dict[str, Any]:
     return {
         'measured_at': census.measured_at.isoformat(),
         'rows_in_store': census.rows_in_store,
-        'totals': census.totals(),
+        'totals': census.totals().as_json(),
         'violations': [violation.as_json() for violation in census.violations],
     }
 

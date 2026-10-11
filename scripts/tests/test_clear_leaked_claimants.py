@@ -90,13 +90,17 @@ def _store_path(root: str) -> Path:
     return Path(root) / '.taskmaster' / 'tasks' / 'tasks.db'
 
 
+def _ro(root: str) -> closing[sqlite3.Connection]:
+    return closing(sqlite3.connect(f'file:{_store_path(root)}?mode=ro', uri=True))
+
+
 def _store_rows(root: str) -> list[tuple]:
-    with closing(sqlite3.connect(f'file:{_store_path(root)}?mode=ro', uri=True)) as conn:
+    with _ro(root) as conn:
         return conn.execute('SELECT * FROM tasks ORDER BY tag, id').fetchall()
 
 
 def _claimants(root: str) -> dict[int, tuple[str | None, str | None]]:
-    with closing(sqlite3.connect(f'file:{_store_path(root)}?mode=ro', uri=True)) as conn:
+    with _ro(root) as conn:
         rows = conn.execute('SELECT id, claimant_run_id, heartbeat_at FROM tasks')
         return {task_id: (claimant, heartbeat) for task_id, claimant, heartbeat in rows}
 
@@ -143,8 +147,8 @@ class TestCensus:
     def test_totals_by_tier_and_by_tier_and_status(self, seed_root):
         totals = take_census(seed_root(TIER_TABLE_ROWS), NOW).totals()
 
-        assert totals['by_tier'] == {Tier.TERMINAL: 3, Tier.HYGIENE: 2}
-        assert totals['by_tier_status'] == {
+        assert totals.by_tier == {Tier.TERMINAL: 3, Tier.HYGIENE: 2}
+        assert totals.by_tier_status == {
             Tier.TERMINAL: {'done': 2, 'cancelled': 1},
             Tier.HYGIENE: {'pending': 1, 'merge-deferred': 1},
         }
@@ -152,7 +156,7 @@ class TestCensus:
     def test_zero_tiers_are_reported_not_omitted(self, seed_root):
         totals = take_census(seed_root([POSITIVE_CONTROL]), NOW).totals()
 
-        assert totals['by_tier'] == {Tier.TERMINAL: 1, Tier.HYGIENE: 0}
+        assert totals.by_tier == {Tier.TERMINAL: 1, Tier.HYGIENE: 0}
 
     def test_an_empty_stub_store_is_unreadable_not_a_clean_zero(self, tmp_path):
         root = tmp_path / 'stub'
@@ -349,7 +353,7 @@ class TestApplyRepairs:
         report = _apply(take_census(root, NOW), _FakeClaimantServer())
 
         verification = _verification(report)
-        assert verification.totals()['by_tier'][Tier.TERMINAL] == 0
+        assert verification.totals().by_tier[Tier.TERMINAL] == 0
         assert {v.task_id for v in verification.violations} == HYGIENE_IDS
 
     def test_freeform_claimant_with_no_heartbeat_is_repaired_not_skipped(self, seed_root):
