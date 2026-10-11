@@ -8,9 +8,8 @@ retry loops), plus a handful of scalar signal counts (not-found, df-guard
 trips, interrupts).
 
 Task alpha of the confusion-reduction PRD (plans/confusion-reduction-prd.md
-Sec 5.1, contract Sec 7.2, boundary test Sec 8.1 producer side). A rewrite
-of the agent-legibility survey's ephemeral scorer logic, properly, with
-tests -- not a port of survey hacks.
+Sec 5.1, contract Sec 7.2, boundary test Sec 8.1 producer side). Signal hits
+and the agent class come from :mod:`legibility.detectors` (Sec 7.2.4).
 
 Pure-function core + a thin `main(argv) -> int` argparse CLI, mirroring the
 scripts/analyze_speculation_depth.py convention: every function below is
@@ -564,14 +563,14 @@ before ``signal_counts``, which is rendered as its own nested block).
 ``n_user_turns`` follows ``score`` so the block reads score -> its dominant
 5.0-weighted basis -> the remaining weighted counts. Rationale
 (confusion-census-2026-07-31 R2 / Sec 1.2): :func:`score_signals` adds
-``SIGNAL_WEIGHTS['user_turn'] * n_user_turns`` on top of the weighted
+``USER_TURN_WEIGHT * n_user_turns`` on top of the weighted
 ``signal_counts``, so rendering only the counts left the score
 unreconstructible from the digest -- a session whose sole "user turn" was a
 pasted report showed ``score: 5.0`` beside an all-zero ``signal_counts``.
 It is deliberately NOT a sixth ``signal_counts`` entry: that block is
-specifically :func:`signal_counts`' five detector hit-counts (mirrored by
-``sampling.SignalCounts``, and read by :func:`_warn_if_body_evicted`'s
-``any(counts.values())`` guard), and a user-turn tally is neither.
+specifically :func:`signal_counts`' per-class detector hit counts (read by
+:func:`_warn_if_body_evicted`'s ``any(counts.values())`` guard), and a
+user-turn tally is neither.
 
 ``truncated_items`` follows it (confusion-census-2026-07-31 R1): the
 per-item :data:`ITEM_TRUNCATION_MARKER` is legible only to a reader who

@@ -1618,15 +1618,15 @@ class TestBuildDigestAgentClassOverride:
 # key order, explicit formatting, deterministic byte-stable output).
 #
 # n_user_turns is present because of confusion-census-2026-07-31 R2 / §1.2:
-# score_signals adds SIGNAL_WEIGHTS['user_turn'] * n_user_turns on top of the
+# score_signals adds USER_TURN_WEIGHT * n_user_turns on top of the
 # weighted signal_counts, but the frontmatter used to render only the five
 # counts -- so a session whose single "user turn" was a pasted report showed
 # `score: 5.0` beside an all-zero `signal_counts` and a reader could not
 # reconstruct the score from the rendered fields. It is a top-level key, NOT
 # a sixth signal_counts entry: signal_counts is specifically signal_counts()'s
-# five detector hit-counts (mirrored by sampling.SignalCounts and read by
-# _warn_if_body_evicted's any(counts.values()) guard), and n_user_turns is
-# neither produced by that function nor a detector hit count.
+# per-class detector hit counts (read by _warn_if_body_evicted's
+# any(counts.values()) guard), and n_user_turns is neither produced by that
+# function nor a detector hit count.
 # ---------------------------------------------------------------------------
 
 def _frontmatter_meta():
@@ -2613,7 +2613,7 @@ class TestRenderDigest:
 
     def test_frontmatter_score_is_reconstructible_from_rendered_fields(self):
         # confusion-census-2026-07-31 R2 / §1.2: score_signals' dominant
-        # component is SIGNAL_WEIGHTS['user_turn'] * n_user_turns, which the
+        # component is USER_TURN_WEIGHT * n_user_turns, which the
         # frontmatter used to omit entirely -- so `score` could not be
         # checked against `signal_counts` by a reader of the digest alone.
         # With n_user_turns rendered, the score is fully reconstructible.

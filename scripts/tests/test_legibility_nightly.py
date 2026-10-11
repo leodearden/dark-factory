@@ -144,8 +144,8 @@ def _write_transcript(
     turn plus a structural tool-error (nonzero confusion signal): a user
     turn, an assistant tool_use, and a user tool_result carrying
     ``is_error: true`` with 'No such file or directory' content (matches
-    sampling._NOT_FOUND_PATTERNS too, for a score > 0 on more than one
-    signal class).
+    legibility.detectors.NOT_FOUND_PATTERNS too, for a score > 0 on more
+    than one signal class).
 
     *user_text* overrides the first user turn. It exists so a test can write
     TWO transcripts that both survive to the digest phase: the sampler's
@@ -199,12 +199,10 @@ def _write_quiet_transcript(
     """A sibling of :func:`_write_transcript` that carries NO confusion signal.
 
     Same JSONL shape — a user turn, an assistant ``tool_use``, a user
-    ``tool_result`` — but the exchange SUCCEEDS: no ``is_error``, no
-    ``sampling._NOT_FOUND_PATTERNS`` text ('no such file' / 'not found' /
-    'does not exist' / 'command not found'), no
-    ``_SELF_CORRECT_PATTERNS`` in the assistant's text blocks, no
-    ``_DF_GUARD_TEXT_PATTERNS`` / ``_DF_GUARD_TOOL_NAMES``, and no
-    ``_INTERRUPT_PATTERNS``. So the record scores 0 and the sampler drops it
+    ``tool_result`` — but the exchange SUCCEEDS: no ``is_error``, and no
+    literal from legibility.detectors' tables (``NOT_FOUND_PATTERNS``,
+    ``SELF_CORRECTION_PATTERNS``, ``DF_GUARD_PATTERNS``,
+    ``INTERRUPT_PATTERN``) in any carrier. So the record scores 0 and the sampler drops it
     as zero-signal BEFORE the budget phase — a genuinely quiet night, never
     a budget-skipped candidate. The score-0 claim is asserted (not assumed)
     in ``test_run_nightly_quiet_night_is_not_reported_as_suppressed``.
