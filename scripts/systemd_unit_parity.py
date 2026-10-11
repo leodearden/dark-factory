@@ -7,6 +7,16 @@ which reads a section's ``Environment=`` lines the way systemd does; and
 ``find_dropins``, which reports the ``.conf`` files systemd would layer over a
 unit.
 
+Driver
+------
+``run_parity(ParityRun(...), out=...)`` owns the per-unit loop every multi-unit
+checker used to repeat: it classifies each ``UnitRef`` (vanished, not
+installed, unreadable, compared), renders the report blocks in one fixed order
+through ``emit``/``emit_block``, prints ``--print-verdicts`` lines when asked,
+and returns a ``ParityExit`` — whose docstring is the one statement of what 0, 1
+and 2 mean. A checker supplies only its ``compare``, its ``ReportText`` wording
+deltas, and any ``Probe`` adding a verdict class of its own.
+
 The parser landed first, because a SECOND consumer appeared:
 ``scripts/check_dashboard_unit_parity.py`` wrote it, and
 ``scripts/check_orchestrator_unit_parity.py`` needs exactly it and nothing
@@ -190,16 +200,16 @@ both contexts these scripts run in:
   prepend/append modes do.
 
 Stdlib-only by design, so every consumer stays runnable under a plain
-``python3`` with no environment set up. ``pathlib`` (required by
-``find_dropins``) and ``shlex`` (required by ``environment_map`` — see its
-docstring for why a naive split is wrong) are the module's ONLY imports, and it
-should stay that way: anything needing more than the stdlib's most boring corner
-does not belong here.
+``python3`` with no environment set up: anything needing more than the stdlib's
+most boring corner does not belong here.
 """
 
 import dataclasses
+import enum
 import pathlib
 import shlex
+from collections.abc import Callable, Iterable, Sequence
+from typing import Final, TextIO
 
 # Rendered in place of a value on whichever side does not declare the
 # directive at all.  Deliberately not '' or None: it appears verbatim in the
@@ -384,3 +394,358 @@ def find_dropins(installed_dir: pathlib.Path, unit_name: str) -> list[pathlib.Pa
     if not dropin_dir.is_dir():
         return []
     return sorted(p for p in dropin_dir.glob("*.conf") if p.is_file())
+
+
+# ---------------------------------------------------------------------------
+# The parity driver
+# ---------------------------------------------------------------------------
+
+
+class ParityExit(enum.IntEnum):
+    """What a parity checker's exit status means: the one statement of the ladder.
+
+    PARITY: at least one unit was compared, and every compared unit matched
+    with no drop-in and no probe finding.
+    FINDING: drift, OR something that could not be verified (a vanished
+    committed copy, an unreadable file, a drop-in, a probe finding, or a run
+    that compared nothing). "I could not verify" sits with "I found a
+    difference", never with parity.
+    NOT_INSTALLED: the only thing found was units not installed on this host.
+    Any FINDING dominates it, and the skipped units are still reported.
+    """
+
+    PARITY = 0
+    FINDING = 1
+    NOT_INSTALLED = 2
+
+
+# ``--print-verdicts`` kinds in RENDERING PRECEDENCE order, so ``drift,override``
+# is a contract rather than an artifact of set iteration. Public because it IS
+# the contract: setup-host.sh needs a case arm for every kind, and a test derives
+# this tuple and asserts the installer handles each one.
+VERDICT_KINDS: Final[tuple[str, ...]] = (
+    "clean",
+    "absent",
+    "drift",
+    "override",
+    "vanished",
+    "unreadable",
+)
+
+# The kinds that are not a finding: everything else lands on ParityExit.FINDING.
+_BENIGN_KINDS: Final = frozenset({"clean", "absent"})
+
+
+@dataclasses.dataclass(frozen=True)
+class UnitRef:
+    """One unit to compare; the driver opens nothing but these two paths and their drop-ins."""
+
+    name: str
+    repo_path: pathlib.Path
+    installed_path: pathlib.Path
+
+
+@dataclasses.dataclass(frozen=True)
+class BlockText:
+    """A report block: ``[tag] header`` (``{count}`` its only placeholder), entries, ``[tag] tail``."""
+
+    tag: str
+    header: str
+    tail: tuple[str, ...] = ()
+
+
+@dataclasses.dataclass(frozen=True)
+class ReportText:
+    """A checker's report wording. Only ``drift`` is required: every checker names its own remedy."""
+
+    drift: BlockText
+    skip: str = "installed unit not found: {path} (not installed on this host)"
+    vanished: BlockText = BlockText(
+        "vanished",
+        "{count} committed unit(s) not found — nothing was verified for them:",
+        (
+            "The committed unit is this checker's source of truth. Check --repo-root, "
+            "and whether the unit was renamed or moved (the paths live in UNITS in "
+            "this script).",
+        ),
+    )
+    override: BlockText = BlockText(
+        "override",
+        "{count} unit(s) have drop-in overrides — the unit files were compared, but "
+        "the EFFECTIVE configuration was NOT verified:",
+        (
+            "systemd merges these over the unit at load time, so a directive set here "
+            "silently wins over the committed value. Inspect with: systemctl --user cat "
+            "<unit>  (and remove the drop-in, or move the setting into the committed unit).",
+        ),
+    )
+    repo_label: str = "repo"
+
+
+_UNREADABLE: Final = BlockText(
+    "unreadable",
+    "{count} unit file(s) could not be read — nothing was verified for them:",
+    (
+        "The file exists but could not be decoded as UTF-8 or opened. Check its "
+        "permissions and encoding — this is not a directive diff, so there is "
+        "nothing to propagate.",
+    ),
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProbeFinding:
+    """One entry a probe adds to one of its declared blocks."""
+
+    block: BlockText
+    entry: tuple[str, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class ProbeOutcome:
+    """What a probe established for one compared unit."""
+
+    findings: tuple[ProbeFinding, ...] = ()
+    # Drop-ins found beyond the installed directory's glob; merged into [override].
+    dropins: tuple[pathlib.Path, ...] = ()
+    # An affirmative line printed just before [ok], and only on a parity run.
+    confirmation: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Probe:
+    """A checker-specific verdict class, run on each compared unit with its committed text."""
+
+    blocks: tuple[BlockText, ...]
+    run: Callable[[UnitRef, str], ProbeOutcome]
+
+
+@dataclasses.dataclass(frozen=True)
+class ParityRun:
+    """Everything a checker hands the driver."""
+
+    tool: str
+    units: Sequence[UnitRef]
+    compare: Callable[[UnitRef, str, str], list[Drift]]
+    report: ReportText
+    probes: Sequence[Probe] = ()
+    print_verdicts: bool = False
+
+
+def emit(tool: str, message: str, *, out: TextIO) -> None:
+    """Print *message* with ``[tool]`` prefixed onto EVERY physical line.
+
+    setup-host.sh reads the tag's ABSENCE as "the checker did not run", which is
+    sound only if no continuation line is ever left untagged.
+    """
+    for line in message.split("\n"):
+        print(f"[{tool}] {line}", file=out)
+
+
+def emit_block(
+    tool: str,
+    tag: str,
+    header: str,
+    entries: Iterable[str],
+    tail: Iterable[str],
+    *,
+    out: TextIO,
+) -> None:
+    """Render one report block: ``[tag] header``, each entry, then ``[tag] <line>`` per tail line."""
+    emit(tool, f"[{tag}] {header}", out=out)
+    for entry in entries:
+        emit(tool, entry, out=out)
+    for line in tail:
+        emit(tool, f"[{tag}] {line}", out=out)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Vanished:
+    unit: UnitRef
+
+
+@dataclasses.dataclass(frozen=True)
+class _NotInstalled:
+    unit: UnitRef
+
+
+@dataclasses.dataclass(frozen=True)
+class _Unreadable:
+    unit: UnitRef
+    dropins: tuple[pathlib.Path, ...]
+    path: pathlib.Path
+    error: str
+
+
+@dataclasses.dataclass(frozen=True)
+class _Compared:
+    unit: UnitRef
+    dropins: tuple[pathlib.Path, ...]
+    drifts: tuple[Drift, ...]
+    findings: tuple[ProbeFinding, ...]
+    confirmations: tuple[str, ...]
+
+
+_Outcome = _Vanished | _NotInstalled | _Unreadable | _Compared
+
+
+def _same_file(path: pathlib.Path) -> str:
+    """A spelling-independent identity: a symlinked $HOME must not list one drop-in twice."""
+    return str(path.resolve())
+
+
+def _merge_dropins(
+    globbed: Sequence[pathlib.Path], reported: Iterable[pathlib.Path]
+) -> tuple[pathlib.Path, ...]:
+    """The glob's drop-ins, then each probe-reported one not already listed, as its source spelled it."""
+    merged = list(globbed)
+    seen = {_same_file(path) for path in merged}
+    for path in reported:
+        if _same_file(path) not in seen:
+            seen.add(_same_file(path))
+            merged.append(path)
+    return tuple(merged)
+
+
+def _run_probe(probe: Probe, unit: UnitRef, repo_text: str) -> ProbeOutcome:
+    outcome = probe.run(unit, repo_text)
+    for finding in outcome.findings:
+        if finding.block not in probe.blocks:
+            raise ValueError(
+                f"a probe finding for {unit.name} targets block [{finding.block.tag}], "
+                "which its Probe does not declare in blocks — an undeclared block is "
+                "never rendered, so the finding would vanish from the report"
+            )
+    return outcome
+
+
+def _classify(run: ParityRun, unit: UnitRef) -> _Outcome:
+    if not unit.repo_path.is_file():
+        return _Vanished(unit)
+    if not unit.installed_path.is_file():
+        return _NotInstalled(unit)
+    # Consulted even at file parity: a drop-in is merged OVER a matching unit file.
+    dropins = tuple(find_dropins(unit.installed_path.parent, unit.installed_path.name))
+    texts: list[str] = []
+    for path in (unit.repo_path, unit.installed_path):
+        try:
+            texts.append(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError) as exc:
+            return _Unreadable(unit, dropins, path, str(exc))
+    repo_text, installed_text = texts
+    drifts = tuple(run.compare(unit, repo_text, installed_text))
+    outcomes = [_run_probe(probe, unit, repo_text) for probe in run.probes]
+    return _Compared(
+        unit,
+        _merge_dropins(dropins, (path for o in outcomes for path in o.dropins)),
+        drifts,
+        tuple(finding for o in outcomes for finding in o.findings),
+        tuple(o.confirmation for o in outcomes if o.confirmation is not None),
+    )
+
+
+def _verdict_kinds(outcome: _Outcome) -> frozenset[str]:
+    if isinstance(outcome, _Vanished):
+        return frozenset({"vanished"})
+    if isinstance(outcome, _NotInstalled):
+        return frozenset({"absent"})
+    kinds = {"override"} if outcome.dropins else set()
+    if isinstance(outcome, _Unreadable):
+        return frozenset({*kinds, "unreadable"})
+    kinds.update(finding.block.tag for finding in outcome.findings)
+    if outcome.drifts:
+        kinds.add("drift")
+    return frozenset(kinds or {"clean"})
+
+
+def _render_kinds(kinds: frozenset[str]) -> str:
+    """VERDICT_KINDS order; a kind outside it (a probe's block tag) is appended, never dropped."""
+    ordered = [kind for kind in VERDICT_KINDS if kind in kinds]
+    return ",".join(ordered + sorted(kinds.difference(VERDICT_KINDS)))
+
+
+def _drift_entry(drift: Drift, unit: UnitRef, repo_label: str) -> tuple[str, ...]:
+    return (
+        f"  {drift.unit} [{drift.section}] {drift.key}",
+        f"      {drift.reason}",
+        f"      {repo_label.ljust(len('installed'))} {unit.repo_path}: {drift.repo_value}",
+        f"      installed {unit.installed_path}: {drift.installed_value}",
+    )
+
+
+def _emit_bucket(
+    tool: str, text: BlockText, items: Sequence[tuple[str, ...]], *, out: TextIO
+) -> None:
+    """Emit *text*'s block over *items* (each one counted item's entry lines), if there are any."""
+    if items:
+        header = text.header.format(count=len(items))
+        emit_block(tool, text.tag, header, [line for item in items for line in item], text.tail, out=out)
+
+
+def _declared_blocks(probes: Sequence[Probe]) -> list[BlockText]:
+    return list(dict.fromkeys(block for probe in probes for block in probe.blocks))
+
+
+def _emit_report(run: ParityRun, outcomes: Sequence[_Outcome], out: TextIO) -> None:
+    """The human report, in the fixed order skip, vanished, unreadable, override, drift, probes."""
+    report, tool = run.report, run.tool
+    for o in outcomes:
+        if isinstance(o, _NotInstalled):
+            skip = report.skip.format(name=o.unit.name, path=o.unit.installed_path)
+            emit(tool, f"[skip] {skip}", out=out)
+    compared = [o for o in outcomes if isinstance(o, _Compared)]
+    vanished = [
+        (f"  {o.unit.name}: expected committed copy at {o.unit.repo_path}",)
+        for o in outcomes
+        if isinstance(o, _Vanished)
+    ]
+    unreadable = [
+        (f"  {o.unit.name}: {o.path}: {o.error}",) for o in outcomes if isinstance(o, _Unreadable)
+    ]
+    overridden = [
+        tuple(f"  {o.unit.name}: {path}" for path in o.dropins)
+        for o in outcomes
+        if isinstance(o, _Unreadable | _Compared) and o.dropins
+    ]
+    drifts = [_drift_entry(d, o.unit, report.repo_label) for o in compared for d in o.drifts]
+    _emit_bucket(tool, report.vanished, vanished, out=out)
+    _emit_bucket(tool, _UNREADABLE, unreadable, out=out)
+    _emit_bucket(tool, report.override, overridden, out=out)
+    _emit_bucket(tool, report.drift, drifts, out=out)
+    for block in _declared_blocks(run.probes):
+        found = [f.entry for o in compared for f in o.findings if f.block == block]
+        _emit_bucket(tool, block, found, out=out)
+
+
+def _conclude(
+    tool: str, outcomes: Sequence[_Outcome], kinds: Sequence[frozenset[str]], out: TextIO
+) -> ParityExit:
+    if any(unit_kinds - _BENIGN_KINDS for unit_kinds in kinds):
+        return ParityExit.FINDING
+    if any("absent" in unit_kinds for unit_kinds in kinds):
+        return ParityExit.NOT_INSTALLED
+    compared = [o for o in outcomes if isinstance(o, _Compared)]
+    if not compared:
+        emit(tool, "[error] no units were compared — nothing was verified.", out=out)
+        return ParityExit.FINDING
+    for o in compared:
+        for confirmation in o.confirmations:
+            emit(tool, confirmation, out=out)
+    emit(tool, f"[ok] parity — {len(compared)} unit(s) match their committed copies.", out=out)
+    return ParityExit.PARITY
+
+
+def run_parity(run: ParityRun, *, out: TextIO) -> ParityExit:
+    """Compare every unit, print the report (verdict lines first, if asked), return the exit code.
+
+    Each unit's verdict kinds feed BOTH the verdict lines and the ladder, so the
+    machine channel and the exit status can never describe different runs.
+    """
+    outcomes = [_classify(run, unit) for unit in run.units]
+    kinds = [_verdict_kinds(outcome) for outcome in outcomes]
+    if run.print_verdicts:
+        verdicts = sorted(zip((o.unit.name for o in outcomes), kinds, strict=True))
+        for name, unit_kinds in verdicts:
+            emit(run.tool, f"verdict {name} {_render_kinds(unit_kinds)}", out=out)
+    _emit_report(run, outcomes, out)
+    return _conclude(run.tool, outcomes, kinds, out)

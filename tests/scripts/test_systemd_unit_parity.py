@@ -15,6 +15,7 @@ import pytest
 import systemd_unit_parity as parity
 
 TOOL = "t"
+VERDICT = "[t] verdict "
 UNDECODABLE = b"[Service]\nType=\xff\xfe\n"
 
 
@@ -393,7 +394,7 @@ def test_verdict_lines_are_sorted_and_precede_every_human_block(tmp_path):
         "[t] verdict b-absent absent",
         "[t] verdict c-drift drift,override",
     ]
-    assert not any(line.startswith("[t] verdict") for line in lines[3:])
+    assert not any(line.startswith(VERDICT) for line in lines[3:])
 
 
 def test_verdict_lines_are_purely_additive(tmp_path):
@@ -402,9 +403,11 @@ def test_verdict_lines_are_purely_additive(tmp_path):
 
     def normalised(result, root):
         rc, lines = result
-        return rc, [line.replace(str(root), "<ROOT>") for line in lines if "verdict" not in line]
+        return rc, [
+            line.replace(str(root), "<ROOT>") for line in lines if not line.startswith(VERDICT)
+        ]
 
-    assert not any("verdict" in line for line in without[1])
+    assert not any(line.startswith(VERDICT) for line in without[1])
     assert normalised(with_verdicts, tmp_path / "on") == normalised(without, tmp_path / "off")
 
 
