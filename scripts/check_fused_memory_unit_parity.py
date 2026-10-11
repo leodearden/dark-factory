@@ -6,12 +6,9 @@ carries all host-invariant safety directives committed in the template
 
 Exit codes
 ----------
-0 — parity (all required directives present, and no drop-in overrides the unit)
-1 — drift, OR a drop-in override applies (the unit FILE was compared, the
-    EFFECTIVE configuration was NOT). Both on 1 because "I could not verify"
-    belongs with "I found a difference", not with the benign 2 below, which
-    setup-host.sh's gate treats as a skip.
-2 — installed unit absent (no installed unit found at the given path)
+The family's codes are defined once, in
+``systemd_unit_parity.py::ParityExit``. Here, drift means a required directive
+is missing from the installed unit.
 
 An exit status alone is not enough to read this script's verdict: 2 is also
 what `python3` returns for a script it cannot open and what argparse returns

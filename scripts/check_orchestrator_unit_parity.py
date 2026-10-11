@@ -68,30 +68,10 @@ gate.  A gate nobody believes is worse than no gate.
 
 Exit codes
 ----------
-0 — parity (every compared directive agrees, at least one unit was actually
-    compared, and nothing overrides the units that were)
-1 — drift, OR a committed unit VANISHED (no committed copy, so nothing could
-    be verified for it), OR an installed unit carries a drop-in override (so
-    the unit file was compared but the EFFECTIVE configuration was not), OR a
-    unit file exists but is UNREADABLE (permissions / not valid UTF-8)
-2 — installed unit absent (no installed copy found for one or more units)
-
-Everything on the 1 side is "I found a difference, or I could not verify" and
-is worded APART in the report — ``[drift]`` / ``[vanished]`` / ``[override]``
-/ ``[unreadable]`` — because they share an exit code but send the operator to
-four different places.  Only ``[drift]`` is a directive diff to propagate.
-
-PRECEDENCE: drift (1) DOMINATES absence (2).  With sixteen units a single run
-can hit both at once, and returning 2 there would let an unrelated
-uninstalled unit mask an actionable finding — ``setup-host.sh`` treats 2 as a
-benign "not installed on this host, skipping" and only 1 as something to act
-on.  An absent unit is still REPORTED in that case: dominated, not hidden.
-
-A run that compared ZERO units can NEVER report parity.  This vocabulary is
-adopted unchanged from ``check_dashboard_unit_parity.py`` so setup-host.sh's
-existing 0/2/other branch shape carries over verbatim.
-
-A consumer that needs to act per UNIT rather than per run wants the
+The family's codes are defined once, in
+``systemd_unit_parity.py::ParityExit``. Of the report blocks that share
+exit 1, only ``[drift]`` is a directive difference to propagate. A consumer
+that needs to act per UNIT rather than per run wants the
 ``--print-verdicts`` channel described next, not these codes.
 
 Machine-readable verdicts
@@ -113,22 +93,10 @@ emitted before the human summary blocks::
 
     [orchestrator_unit_parity] verdict <unit> <kind>[,<kind>...]
 
-The kind vocabulary is ``VERDICT_KINDS`` below, and that tuple's ORDER is the
-rendering precedence, so a unit that is both directive-drifted and drop-in'd
-always renders ``drift,override`` and never the reverse:
-
-    clean       compared, no directive drift, no drop-in — safe to overwrite
-    absent      no installed copy — nothing to overwrite, safe to install
-    drift       at least one directive differs
-    override    a ``<unit>.d/*.conf`` drop-in is layered over it
-    vanished    no COMMITTED copy — there is no source to install FROM
-    unreadable  the file exists but could not be opened / decoded
-
-``clean`` and ``absent`` are the two install-eligible kinds, and each is
-mutually exclusive with every other kind and with the other.  They are kept
-APART rather than merged because this checker may only claim what it actually
-verified: an absent installed copy was never compared, so reporting it as
-``clean`` would assert a parity measurement that never happened.
+The kinds, what each means, and their rendering order are defined in
+``systemd_unit_parity.py::VERDICT_KINDS``. ``clean`` (safe to overwrite) and
+``absent`` (nothing to overwrite) are the two kinds a unit can be installed
+under.
 
 The sole consumer is ``scripts/setup-host.sh`` section 5, which installs the
 units whose verdict is ``clean`` or ``absent`` and skips the rest, naming each

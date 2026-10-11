@@ -251,9 +251,17 @@ class ParityExit(enum.IntEnum):
     FINDING: drift, OR something that could not be verified (a vanished
     committed copy, an unreadable file, a drop-in, a probe finding, or a run
     that compared nothing). "I could not verify" sits with "I found a
-    difference", never with parity.
+    difference", never with parity. Each cause gets its own report block,
+    because they share one code but send the operator to different places.
     NOT_INSTALLED: the only thing found was units not installed on this host.
-    Any FINDING dominates it, and the skipped units are still reported.
+    Any FINDING outranks it, and the skipped units are still reported.
+    setup-host.sh reads this code as a harmless skip, so if it outranked a
+    finding, one uninstalled unit would hide that finding.
+
+    A run that compared nothing is never PARITY. The dashboard checker once
+    did exactly that: a mistyped ``--repo-root`` compared no units and still
+    printed "parity — 3 unit(s) match". That is why the success line counts
+    the units it COMPARED, not the units it selected.
     """
 
     PARITY = 0
@@ -264,14 +272,17 @@ class ParityExit(enum.IntEnum):
 # ``--print-verdicts`` kinds in RENDERING PRECEDENCE order, so ``drift,override``
 # is a contract rather than an artifact of set iteration. Public because it IS
 # the contract: setup-host.sh needs a case arm for every kind, and a test derives
-# this tuple and asserts the installer handles each one.
+# this tuple and asserts the installer handles each one. ``clean`` and ``absent``
+# never appear together, or with any other kind. They are kept apart because an
+# absent unit was never compared, so calling it clean would claim a check that
+# never ran. A Probe's block tags are extra kinds, and may not reuse these names.
 VERDICT_KINDS: Final[tuple[str, ...]] = (
-    "clean",
-    "absent",
-    "drift",
-    "override",
-    "vanished",
-    "unreadable",
+    "clean",  # compared: no directive drift, no drop-in, no probe finding
+    "absent",  # no installed copy, so nothing was compared
+    "drift",  # at least one directive differs
+    "override",  # a <unit>.d/*.conf drop-in is layered over the unit
+    "vanished",  # no COMMITTED copy, so there is no source to install from
+    "unreadable",  # a file exists but could not be opened or decoded
 )
 
 # The kinds that are not a finding: everything else lands on ParityExit.FINDING.

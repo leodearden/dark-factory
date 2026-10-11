@@ -18,20 +18,15 @@ committed template while the arms served a frozen tree. Reinstalling did not
 clear it and nothing reported it. This checker closes both halves: it compares
 the files AND asks systemd what will really be applied.
 
-Exit codes (the family vocabulary, so setup-host.sh branches the same way)
--------------------------------------------------------------------------
-0 — parity: the files match AND the committed template is the effective
-    configuration (and something was actually compared).
-1 — drift, OR the committed template vanished, OR a unit file could not be
-    read, OR a drop-in override, OR the effective configuration disagrees, OR
-    the probe could not be run.
-    "I could not verify" belongs here with "I found a difference", never with
-    the benign 2 — a run that could not ask systemd has established nothing.
-2 — the unit is not installed on this host. Benign and expected: most hosts
-    never install the arms.
-
-Drift DOMINATES absence: a run hitting both returns 1, with the absence still
-reported rather than hidden.
+Exit codes
+----------
+The family's codes are defined once, in
+``systemd_unit_parity.py::ParityExit``. This checker's probe adds two findings:
+``[effective]`` means systemd resolves the unit to a WorkingDirectory other
+than the committed template's, and ``[unverifiable]`` means the probe could not
+get an answer from systemd. A
+run that could not ask systemd has established nothing. Not installed is the
+common case, because most hosts never install the arms.
 
 Read-only, and NO --fix
 -----------------------
@@ -514,8 +509,7 @@ _REPORT = ReportText(
 def main(argv: Sequence[str], *, probe_runner=None) -> int:
     """Parse args and run the parity check.
 
-    Returns 0/1/2 per the exit-code table in the module docstring. Drift
-    DOMINATES absence, and a run that compared ZERO units never reports parity.
+    Exit codes: see ``systemd_unit_parity.ParityExit``.
 
     *probe_runner* is the injection seam for the effective-config probe: a
     callable taking an argv list and returning ``(returncode, stdout)``. Tests

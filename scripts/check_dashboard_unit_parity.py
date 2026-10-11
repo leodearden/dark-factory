@@ -17,32 +17,9 @@ nothing reported that until this check existed.
 
 Exit codes
 ----------
-0 — parity (every compared directive agrees, at least one unit was actually
-    compared, and nothing overrides the units that were)
-1 — drift (one or more compared directives disagree), OR a committed unit
-    VANISHED (no committed copy found, so nothing could be verified for it),
-    OR an installed unit carries a drop-in override (so the unit file was
-    compared but the EFFECTIVE configuration was not), OR a unit file exists
-    but could not be read
-2 — installed unit absent (no installed copy found for one or more units)
-
-PRECEDENCE: drift (1) DOMINATES absence (2).  With three units a single run can
-hit both at once, and returning 2 there would let an unrelated uninstalled unit
-mask an actionable finding — ``setup-host.sh`` treats 2 as a benign "not
-installed on this host, skipping" and only 1 as something to act on.
-
-A run that compared ZERO units can NEVER report parity.  A vanished committed
-unit and a drop-in override share exit 1 with drift rather than minting new
-codes, for the same reason: both mean the gate could not make its claim, which
-is the opposite of the benign "not installed here" that 2 denotes, and
-``setup-host.sh`` already branches on this 0/1/2 vocabulary.  Exit 1 therefore
-means "drift or unverifiable", and the three cases are worded APART in the
-report ([drift] / [vanished] / [override]) so an operator is sent to the right
-place.  Before that was true, ``--repo-root`` naming a tree with no units
-compared nothing and still printed "parity — 3 unit(s) match", so a typo'd
-path, a renamed unit or a ``git mv`` of ``dashboard/*.service`` silently
-disarmed the whole check.  The success line therefore reports the number of
-units actually COMPARED, never the number selected.
+The family's codes are defined once, in
+``systemd_unit_parity.py::ParityExit``. Its consumers are listed under
+Design notes below.
 
 Usage
 -----
