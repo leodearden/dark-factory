@@ -32,13 +32,13 @@ if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # Bind `shared` to this checkout, as coder.py::_SHARED_SRC does, so a worktree
-# run validates keys against its own shared.finding_key.
-_SHARED_SRC = Path(__file__).resolve().parents[2] / "shared" / "src"
-if str(_SHARED_SRC) not in sys.path:
-    sys.path.insert(0, str(_SHARED_SRC))
+# run validates keys against its own shared.finding_key. No module-level
+# assignment precedes the imports below, so they need no E402 suppression.
+if (_SHARED_SRC := str(Path(__file__).resolve().parents[2] / "shared" / "src")) not in sys.path:
+    sys.path.insert(0, _SHARED_SRC)
 
-from legibility import finding_area, invariants  # noqa: E402
-from shared.finding_key import KEY_PATTERN  # noqa: E402
+from legibility import finding_area, invariants
+from shared.finding_key import KEY_PATTERN
 
 logger = logging.getLogger("legibility.codebook")
 

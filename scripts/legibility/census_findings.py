@@ -13,12 +13,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-_SHARED_SRC = Path(__file__).resolve().parents[2] / "shared" / "src"
-if str(_SHARED_SRC) not in sys.path:
-    sys.path.insert(0, str(_SHARED_SRC))
+# Bound as codebook.py binds it: no module-level assignment precedes the
+# imports below, so they need no E402 suppression.
+if (_SHARED_SRC := str(Path(__file__).resolve().parents[2] / "shared" / "src")) not in sys.path:
+    sys.path.insert(0, _SHARED_SRC)
 
-from legibility import codebook, finding_area, verdict  # noqa: E402
-from shared.finding_key import finding_key, is_finding_key  # noqa: E402
+from legibility import codebook, finding_area, verdict
+from shared.finding_key import finding_key, is_finding_key
 
 
 def _are_tags(tags: object) -> bool:
