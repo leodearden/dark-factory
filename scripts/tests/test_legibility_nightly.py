@@ -4062,6 +4062,29 @@ class TestRunNightlyRecordsTrickleState:
             'sampling never returned, so nothing was counted'
         )
 
+    def test_an_unloadable_config_under_project_id_records_a_failed_night_then_raises(
+        self, tmp_path, monkeypatch,
+    ):
+        config_path = _write_config(tmp_path / 'proj', project_id='testproj')
+        with config_path.open('a', encoding='utf-8') as fh:
+            fh.write('budgets:\n  max_daily_digest_bytes: lots\n')
+        monkeypatch.setenv('LEGIBILITY_SEARCH_ROOTS', str(tmp_path))
+        recorder, calls = _recorder_spy()
+
+        with pytest.raises(FileNotFoundError):
+            nightly.run_nightly(
+                project_id='testproj', target_date=date(2026, 7, 13),
+                now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC), recorder=recorder,
+            )
+
+        doc = _one_recorded(calls)
+        assert calls[0][0]['project_id'] == 'testproj'
+        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
+        assert doc['exit_code'] == 1
+        assert doc['target_date'] == '2026-07-13'
+        assert doc['consecutive_failed_runs'] == 1
+        assert set(doc['counters'].values()) == {0}
+
     def test_a_codebook_dump_failure_escalates_instead_of_escaping(
         self, tmp_path, monkeypatch,
     ):
