@@ -10,7 +10,7 @@ The report is `plans/local-memory-models-eval-embedder-residency-2026-10-10.md`.
   samplers (device every 100 ms, per-process every 250 ms), then runs one probe phase.
 - `analyse.py <logs/tag>`: per-phase device peaks, per-pid peaks, Whisper latency, load
   summaries.
-- `logs/<tag>/`: `gpu.csv`, `apps.csv`, `events.jsonl` and `probe.out` for each run:
+- `logs/<tag>/`: `gpu.csv`, `apps.csv`, `events.jsonl` and `probe.log` for each run:
   - `baseline`: no embedder;
   - `granite`, `granite2`, `granite_ab`: granite-embedding-english-r2;
   - `qwen06`, `qwen06_ab`: qwen3-embedding-0.6b.

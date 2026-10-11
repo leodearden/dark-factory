@@ -18,7 +18,7 @@ nvidia-smi --query-compute-apps=timestamp,pid,process_name,used_memory --format=
 s2=$!
 trap 'kill $s1 $s2 2>/dev/null || true' EXIT
 sleep 2
-rc=0; python "$here/probe.py" --phase "$phase" --out "$logs/events.jsonl" "$@" > "$logs/probe.out" 2>&1 || rc=$?
+rc=0; python "$here/probe.py" --phase "$phase" --out "$logs/events.jsonl" "$@" > "$logs/probe.log" 2>&1 || rc=$?
 
 sleep 3
 echo "probe rc=$rc"
