@@ -41,16 +41,24 @@ the first cycle somebody remembers to write a suppression record for it.
 COMPOSITE TASK IDS, AND THE DEFECT THIS AVOIDS.  A flag's OWN ``task_id`` is
 routinely comma-joined — task 3105 has been flagged as ``'3105,5080'`` and
 ``'3105,4223'``, among others — so every candidate id is DECOMPOSED before
-corroboration and the counters key on the corroborated COMPONENT, not on the
-raw string.  That is a correctness requirement rather than a refinement, and the reason is visible in
-the sibling: ``flag_dedup.filter_suppressed._keep`` looks its flag's task_id up
+corroboration and the counters key on a corroborated COMPONENT, not on the
+raw string.  Decomposition is what lets the guard SEE a specimen inside a
+composite at all, and the sibling shows the gap it avoids:
+``flag_dedup.filter_suppressed._keep`` looks its flag's task_id up
 VERBATIM while only the suppression ROW side is decomposed (see
 ``_decompose_suppression_task_id``'s docstring, which scopes itself to that
 side), so a suppression row for ``'3105'`` still does not match a finding
-carrying ``'3105,4223'``.  Inheriting that gap would make this guard
-zero-recall on exactly the task it exists to protect.  This guard and
+carrying ``'3105,4223'``.  Inheriting that gap would leave this guard blind
+to the specimen inside every composite that names it.  This guard and
 ``flag_dedup._flag_candidate_task_ids`` both decompose a flag's own task_id
 through the one shared splitter, ``flag_task_ids.task_id_components``.
+
+Seeing a specimen is not licence to drop the finding.  A composite is dropped
+only when EVERY component corroborates: ``'3105,4223'`` claims something about
+4223 too, and the under-suppression bias below forbids hiding that claim on
+3105's citation.  A mixed composite is instead kept on a copy annotated with
+:data:`PRESERVED_SPECIMEN_COMPONENTS_KEY`, so Stage 2 sees the specimen
+evidence beside the reset request.
 
 LEAF CONTRACT.  This module imports only from
 ``standing_decision_constants`` (for the one genuinely shared fact, the
@@ -110,6 +118,7 @@ __all__ = [
     'PRESERVATION_CORROBORATION_BUDGET_SECONDS',
     'PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE',
     'PRESERVATION_TOKEN_FAMILY',
+    'PRESERVED_SPECIMEN_COMPONENTS_KEY',
     'STRANDED_ACTION_TARGET_FAMILY',
     'STRANDED_ACTION_VERB_FAMILY',
     'STRANDED_FLAG_TOKEN_FAMILY',
@@ -191,6 +200,10 @@ STRANDED_ACTION_TARGET_FAMILY: tuple[str, ...] = ('in-progress', 'in progress')
 #: different fields.
 _STRANDED_ACTION_FIELDS: tuple[str, ...] = ('suggested_action', 'description')
 
+#: The key a KEPT mixed-composite flag's copy carries: ``{component: citation}``
+#: for each component of its task_id that corroborated as a preserved specimen.
+#: Stage 2 is handed each flag as JSON, so the evidence travels beside the claim.
+PRESERVED_SPECIMEN_COMPONENTS_KEY: str = 'preserved_specimen_components'
 
 #: Per-cycle, per-task suppression ceiling for the INV-4 storm escape.  One
 #: preserved specimen legitimately draws one stranded finding a cycle, very
@@ -379,12 +392,15 @@ class PreservationSuppressionResult:
     """Outcome of :func:`filter_preservation_specimen_flags`.
 
     - ``kept_flags`` — the flags that survived, input order preserved, to be
-      assigned back to ``report.items_flagged``.
-    - ``suppressed_by_task`` — ``{task_id: count}`` of flags dropped, attributed
-      per corroborated task.  Its ``values()`` sum is the per-cycle
-      ``preservation_specimen_suppressed`` stat, and it drives the storm escape.
+      assigned back to ``report.items_flagged``.  A mixed composite survives
+      as an annotated COPY (the module docstring's COMPOSITE TASK IDS); every
+      other kept flag is the input object itself.
+    - ``suppressed_by_task`` — ``{task_id: count}`` of flags dropped, each
+      counted ONCE, against its first component, so its ``values()`` sum is
+      the per-cycle ``preservation_specimen_suppressed`` stat.  It drives the
+      storm escape.
     - ``citations_by_task`` — ``{task_id: citation_ref}``, the Mem0 memory id or
-      Graphiti uuid each suppression actually relied on.  A suppression is never
+      Graphiti uuid of every component citation a drop relied on.  A drop is never
       anonymous: without this, "one flag suppressed" gives an operator no way to
       check whether the citation is real, current, or over-broad.
     - ``unresolved_task_ids`` — tasks this cycle reached no verdict on: a
@@ -721,6 +737,21 @@ async def _corroborate_preservation(
     return _Corroboration(citation=_graphiti_citation(entity), degraded=degraded)
 
 
+def _component_citations(
+    task_ids: tuple[str, ...], verdicts: dict[str, _Corroboration],
+) -> dict[str, str]:
+    """``{component: citation}`` for each of *task_ids* that corroborated, in order.
+
+    A component with no verdict (the cycle's budget ran out before it was
+    looked up) or no citation is simply absent.  Pure, sync, no I/O.
+    """
+    return {
+        task_id: verdict.citation
+        for task_id in task_ids
+        if (verdict := verdicts.get(task_id)) is not None and verdict.citation is not None
+    }
+
+
 # ── Orchestrator ─────────────────────────────────────────────────────────────
 
 
@@ -743,8 +774,9 @@ async def filter_preservation_specimen_flags(
     2. Each candidate is corroborated ONCE by
        :func:`_corroborate_preservation`, positive and negative verdicts alike,
        so a task appearing on N flags costs one corroboration pass.
-    3. A corroborated task's stranded flags are dropped and the citation
-       recorded.
+    3. A stranded flag is dropped, and its citations recorded, only when EVERY
+       component of its task_id corroborated; one where only some did is kept
+       on an annotated copy (the module docstring's COMPOSITE TASK IDS).
 
     An empty candidate set short-circuits before any I/O, so a cycle with
     nothing in this class — the overwhelming majority — costs zero backend
@@ -842,43 +874,33 @@ async def filter_preservation_specimen_flags(
     kept: list[dict[str, Any]] = []
     suppressed_by_task: dict[str, int] = {}
     citations_by_task: dict[str, str] = {}
-    kept_task_ids: set[str] = set()
     for flag, task_ids in candidacy:
-        cited = next(
-            (
-                (tid, verdict.citation)
-                for tid in task_ids
-                if (verdict := verdicts.get(tid)) is not None and verdict.citation is not None
-            ),
-            None,
-        )
-        if cited is None:
+        citations = _component_citations(task_ids, verdicts)
+        if not citations:
             kept.append(flag)
-            kept_task_ids.update(task_ids)
-            continue
-        # Counters key on the CORROBORATED COMPONENT, never the raw composite:
-        # one task is flagged under several comma-joined spellings, and keying on
-        # the string would scatter its suppressions across a counter per
-        # permutation — the storm threshold would never trip and the citation
-        # audit trail would fragment.
-        cited_task, citation = cited
-        suppressed_by_task[cited_task] = suppressed_by_task.get(cited_task, 0) + 1
-        citations_by_task[cited_task] = citation
-        log.info(
-            'preservation_specimen_guard: suppressed flag_type=%r (task_id=%r) for '
-            'task %s in project %s — corroborated as a preserved specimen by %s',
-            flag.get('flag_type'), flag.get('task_id'), cited_task, project_id, citation,
-        )
+        elif len(citations) < len(task_ids):
+            kept.append({**flag, PRESERVED_SPECIMEN_COMPONENTS_KEY: citations})
+            log.info(
+                'preservation_specimen_guard: kept flag_type=%r (task_id=%r) in project '
+                '%s annotated with specimen citations %s — not every component '
+                'corroborated as a preserved specimen',
+                flag.get('flag_type'), flag.get('task_id'), project_id, citations,
+            )
+        else:
+            first = task_ids[0]
+            suppressed_by_task[first] = suppressed_by_task.get(first, 0) + 1
+            citations_by_task.update(citations)
+            log.info(
+                'preservation_specimen_guard: suppressed flag_type=%r (task_id=%r) in '
+                'project %s — every component corroborated as a preserved specimen: %s',
+                flag.get('flag_type'), flag.get('task_id'), project_id, citations,
+            )
 
-    # Disclose a degraded verdict only for a task that is actually LEFT
-    # UNPROTECTED by it — one whose flags were kept.  A component whose read
-    # failed alongside a sibling that DID corroborate changed no outcome, and
-    # reporting it would raise a false alarm about an unprotected specimen.
     return PreservationSuppressionResult(
         kept_flags=kept,
         suppressed_by_task=suppressed_by_task,
         citations_by_task=citations_by_task,
-        unresolved_task_ids=tuple(t for t in unresolved if t in kept_task_ids),
+        unresolved_task_ids=tuple(unresolved),
     )
 
 
