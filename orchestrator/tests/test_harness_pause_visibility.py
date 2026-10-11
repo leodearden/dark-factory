@@ -11,6 +11,7 @@ import dataclasses
 import json
 import logging
 import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -257,3 +258,111 @@ class TestRependWhilePaused:
         assert _resolution(rig.queue, esc_id) == 'resume: lane is green'
         [row] = _repend_rows(rig.event_store)
         assert json.loads(row['data'])['escalation_id'] == esc_id
+
+
+def _hours_ago(hours: float) -> str:
+    return (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
+
+
+class _DigestRig(NamedTuple):
+    harness: Harness
+    queue: EscalationQueue
+    tmp_path: Path
+
+
+@pytest.fixture
+def digest_rig(
+    tmp_path: Path, cost_store: CostStore, monkeypatch: pytest.MonkeyPatch,
+) -> _DigestRig:
+    harness, _, _ = _make_harness_with_mocks(tmp_path)
+    harness.config = OrchestratorConfig(
+        project_root=tmp_path,
+        digest_every_n_escalations=1,
+        digest_ewa_threshold=1e9,
+    )
+    harness.cost_store = cost_store
+    queue = _queue_for(harness, tmp_path)
+    harness._escalation_queue = queue
+    scheduler = harness.scheduler
+    monkeypatch.setattr(
+        scheduler, 'get_task', AsyncMock(return_value=claimant_row('blocked', task_id='5260')),
+    )
+    monkeypatch.setattr(scheduler, 'get_status', AsyncMock(return_value='blocked'))
+    monkeypatch.setattr(scheduler, 'set_task_status', AsyncMock())
+    monkeypatch.setattr(scheduler, 'update_task', AsyncMock(return_value=True))
+    return _DigestRig(harness, queue, tmp_path)
+
+
+async def _write_digest(rig: _DigestRig) -> str:
+    before = _digest_files(rig.tmp_path)
+    rig.harness._escalation_event_count = rig.harness._last_digest_event_count + 1
+    await rig.harness._maybe_write_digest()
+    after = _digest_files(rig.tmp_path)
+    assert len(after) == len(before) + 1
+    return after[-1].read_text()
+
+
+async def _pause_with_overdue_l1_and_repend(rig: _DigestRig) -> tuple[str, str]:
+    pause_esc_id = _submit(
+        rig.queue, Harness._SCHEDULER_PAUSE_SENTINEL,
+        category='scheduler_paused', level=1, timestamp=_hours_ago(3),
+    )
+    await rig.harness.pause_scheduler(PAUSE_REASON)
+    assert len(rig.queue.get_pending()) == 1
+    repend_esc_id = await _resolve_stranded(rig.harness, rig.queue)
+    return pause_esc_id, repend_esc_id
+
+
+def _paused_waiting(markdown: str) -> str:
+    start = markdown.index('## Paused, waiting\n')
+    end = markdown.find('\n## ', start + 1)
+    return markdown[start:end]
+
+
+@pytest.mark.asyncio
+class TestPausedWaitingDigest:
+    async def test_digest_lists_the_waiting_task_and_the_overdue_pause_l1(
+        self, digest_rig: _DigestRig,
+    ) -> None:
+        pause_esc_id, repend_esc_id = await _pause_with_overdue_l1_and_repend(digest_rig)
+
+        section = _paused_waiting(await _write_digest(digest_rig))
+
+        assert 'Paused with 1 re-pended tasks waiting' in section
+        [task_line] = [line for line in section.splitlines() if 'task 5260' in line]
+        assert repend_esc_id in task_line
+        [overdue_line] = [line for line in section.splitlines() if pause_esc_id in line]
+        assert re.search(r'pending 3\.\dh', overdue_line)
+
+    async def test_overdue_pause_l1_resurfaces_in_every_digest(
+        self, digest_rig: _DigestRig,
+    ) -> None:
+        pause_esc_id, _ = await _pause_with_overdue_l1_and_repend(digest_rig)
+
+        await _write_digest(digest_rig)
+        second = _paused_waiting(await _write_digest(digest_rig))
+
+        assert pause_esc_id in second
+
+    async def test_resume_clears_the_waiting_line_but_not_the_overdue_l1(
+        self, digest_rig: _DigestRig,
+    ) -> None:
+        pause_esc_id, _ = await _pause_with_overdue_l1_and_repend(digest_rig)
+        await _write_digest(digest_rig)
+
+        await digest_rig.harness.resume_scheduler()
+        section = _paused_waiting(await _write_digest(digest_rig))
+
+        assert '- Not paused' in section.splitlines()
+        assert 'task 5260' not in section
+        assert pause_esc_id in section
+
+    async def test_young_pause_l1_is_not_listed(self, digest_rig: _DigestRig) -> None:
+        young_esc_id = _submit(
+            digest_rig.queue, Harness._SCHEDULER_PAUSE_SENTINEL,
+            category='scheduler_paused', level=1, timestamp=_hours_ago(1),
+        )
+
+        section = _paused_waiting(await _write_digest(digest_rig))
+
+        assert young_esc_id not in section
