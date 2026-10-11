@@ -52,6 +52,7 @@ from shared.cap_markers import (
     REAL_CLI_CAP_HIT_MESSAGES,
     REAL_CLI_CAP_MESSAGES,
 )
+from shared.finding_key import finding_key
 
 import config as config_mod
 
@@ -4927,8 +4928,14 @@ def test_run_census_dry_run_does_not_clobber_an_existing_payload_file(tmp_path, 
     # (b) this run's payloads landed on the numbered sibling, in
     # build_task_payloads' own shape
     assert sibling_path.exists()
+    area_map = finding_area.load_area_map(tmp_path)
     verified = [
-        c for c in fake_verify_fn.calls[0]["result"]["verified"]
+        {
+            **c,
+            "finding": census_findings.identity_of(c["verdict"], area_map),
+            "severity": c["verdict"].severity,
+        }
+        for c in fake_verify_fn.calls[0]["result"]["verified"]
         if c.get("title") == "Silent no-op subagent contract"
     ]
     expected = mod.build_task_payloads(
@@ -8924,3 +8931,296 @@ def test_run_census_counts_a_rejected_candidates_sightings_as_recurrence(tmp_pat
     [filed] = second["submit_fn"].calls
     assert filed["title"] == f"[legibility census] {_GATED_TITLE}"
     assert outcome.withheld == ()
+
+
+# ---------------------------------------------------------------------------
+# task 6402 step-11: RED — run_census stamps contract finding keys at
+# promotion and rejection, appends last_seen_runs on every sighted entry, files
+# with the key and the severity, and reports the §1 rows (PRD §4.8 row 5).
+# ---------------------------------------------------------------------------
+
+_ROW5_ANCHOR = "orchestrator/x.py::f"
+_ROW5_KEY = finding_key("orchestrator", _ROW5_ANCHOR, "h13")
+_ROW5_FIELDS = {
+    "finding_key": _ROW5_KEY,
+    "finding_area": "orchestrator",
+    "finding_anchor": _ROW5_ANCHOR,
+    "finding_tags": ["h13", verdict.KIND_TAG],
+}
+
+
+def _write_briefing(root) -> None:
+    (root / "review").mkdir(parents=True, exist_ok=True)
+    (root / "review" / "briefing.yaml").write_text(
+        "subprojects:\n  orchestrator: {}\n  shared: {}\n", encoding="utf-8",
+    )
+    (root / "orchestrator").mkdir(exist_ok=True)
+    (root / "orchestrator" / "x.py").write_text("def f():\n    pass\n", encoding="utf-8")
+
+
+def _keyed_verdict(*, verified=True, tags=("h13", verdict.KIND_TAG), severity="high"):
+    return verdict.Verdict(
+        verified=verified,
+        reason="the verifier read orchestrator/x.py",
+        anchor=_ROW5_ANCHOR,
+        tags=tags,
+        severity=severity,
+        severity_reason="r",
+        route=verdict.Route.MECHANICAL if verified else verdict.Route.STRUCTURAL,
+        remediation=verdict.Remediation("orchestrator/x.py", "fix it") if verified else None,
+    )
+
+
+def _keyed_verify_fn(*, rejected_verdict=None):
+    """Verifies _PROMOTED_TITLE with the row-5 Verdict; rejects every other
+    title, carrying *rejected_verdict* when one is given."""
+    def verify_fn(clusters, *, model):
+        verified = [
+            {**c, "verdict": _keyed_verdict()} for c in clusters if c.get("title") == _PROMOTED_TITLE
+        ]
+        rejected = [
+            c if rejected_verdict is None else {**c, "verdict": rejected_verdict}
+            for c in clusters
+            if c.get("title") != _PROMOTED_TITLE
+        ]
+        return {"verified": verified, "rejected": rejected, "fixed": []}
+
+    return verify_fn
+
+
+def _run_record(kwargs) -> dict:
+    return json.loads(kwargs["report_path"].with_suffix(".json").read_text(encoding="utf-8"))
+
+
+def _findings_of_report(kwargs) -> str:
+    report = kwargs["report_path"].read_text(encoding="utf-8")
+    assert "Findings" in check_census_report.level2_titles(report)
+    return report.split("\n## Findings\n", 1)[1].split("\n## ", 1)[0]
+
+
+def _promoted_candidate_of(kwargs, entry_id) -> dict:
+    persisted = codebook.load(kwargs["codebook_path"])
+    [candidate] = [c for c in persisted["candidates"] if c.get("promoted_to") == entry_id]
+    return candidate
+
+
+def test_run_census_row5_verdict_key_ticket(tmp_path):
+    _write_briefing(tmp_path)
+    kwargs = _promotion_kwargs(tmp_path, verify_fn=_keyed_verify_fn())
+    run_id = kwargs["run_id"]
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    entry = _persisted_promoted_entry(kwargs)
+    assert {field: entry[field] for field in _ROW5_FIELDS} == _ROW5_FIELDS
+    assert entry["first_seen_run"] == run_id
+    assert entry["last_seen_runs"] == [run_id]
+    assert entry["supersedes"] == []
+    candidate = _promoted_candidate_of(kwargs, entry["id"])
+    assert {field: candidate[field] for field in _ROW5_FIELDS} == _ROW5_FIELDS
+
+    [payload] = kwargs["submit_fn"].calls
+    assert payload["metadata"]["x_finding_key"] == _ROW5_KEY
+    assert payload["metadata"]["x_finding_run"] == run_id
+    assert payload["priority"] == "high"
+
+    record = _run_record(kwargs)
+    [row] = record["findings"]
+    assert row["key"] == _ROW5_KEY
+    assert row["verdict"] == "confirmed"
+    assert row["disposition"] == "open"
+    assert row["first_seen"] == run_id
+    assert row["area"] == "orchestrator"
+    assert check_census_report.check_findings(record) == []
+    assert _ROW5_KEY in _findings_of_report(kwargs)
+
+
+def _rejection_kwargs(tmp_path, *, rejected_verdict):
+    _write_briefing(tmp_path)
+    return _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[_happy_batch("b0")],
+        verify_fn=_keyed_verify_fn(rejected_verdict=rejected_verdict),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        commit=_make_fake_commit(),
+    )
+
+
+def _rejected_candidate(kwargs) -> dict:
+    persisted = codebook.load(kwargs["codebook_path"])
+    [candidate] = [c for c in persisted["candidates"] if c["title"] == "Spurious pattern"]
+    return candidate
+
+
+def test_run_census_stamps_a_rejected_cluster_that_carries_a_verdict(tmp_path):
+    refuting = _keyed_verdict(verified=False, tags=("h4", verdict.KIND_TAG), severity="low")
+    kwargs = _rejection_kwargs(tmp_path, rejected_verdict=refuting)
+
+    mod.run_census(**kwargs)
+
+    candidate = _rejected_candidate(kwargs)
+    assert candidate["disposition"] == "rejected"
+    assert candidate["finding_key"] == finding_key("orchestrator", _ROW5_ANCHOR, "h4")
+    assert candidate["finding_area"] == "orchestrator"
+    assert candidate["finding_anchor"] == _ROW5_ANCHOR
+    assert candidate["finding_tags"] == ["h4", verdict.KIND_TAG]
+    refuted = [row for row in _run_record(kwargs)["findings"] if row["verdict"] == "refuted"]
+    assert [row["id"] for row in refuted] == [candidate["id"]]
+    assert refuted[0]["severity"] == "low"
+
+
+def test_run_census_leaves_a_verdictless_rejection_unkeyed_and_unreported(tmp_path):
+    kwargs = _rejection_kwargs(tmp_path, rejected_verdict=None)
+
+    mod.run_census(**kwargs)
+
+    candidate = _rejected_candidate(kwargs)
+    assert candidate["disposition"] == "rejected"
+    assert not any(field in candidate for field in _ROW5_FIELDS)
+    assert [row["verdict"] for row in _run_record(kwargs)["findings"]] == ["confirmed"]
+
+
+_SIGHTED_OLD_RUN = "census-dark_factory-20260701"
+
+
+def _sighting_codebook() -> dict:
+    cb = _minimal_v2_codebook()
+    keyed = census_findings.stamped(
+        {
+            "id": "entry-keyed",
+            "title": "A keyed confusion",
+            "severity": "medium",
+            "status": "open",
+            "origin_phase": "implement",
+            "manifested_phase": "verify",
+            "sightings": [],
+        },
+        census_findings.FindingIdentity.mint("orchestrator", _ROW5_ANCHOR, ("h13", verdict.KIND_TAG)),
+    )
+    cb["entries"].append({**keyed, **census_findings.first_sighting_fields(_SIGHTED_OLD_RUN)})
+    cb["entries"].append(
+        {
+            "id": "entry-legacy",
+            "title": "A legacy confusion",
+            "severity": "low",
+            "status": "open",
+            "origin_phase": "implement",
+            "manifested_phase": "verify",
+            "sightings": [],
+        }
+    )
+    return cb
+
+
+def _sighting_kwargs(tmp_path, cb):
+    def response_fn(prompt, model):
+        if "re-sighted" in prompt:
+            return json.dumps(_record(matches=[{"entry_id": "entry-keyed"}, {"entry_id": "entry-legacy"}]))
+        return json.dumps(_record())
+
+    return _run_census_kwargs(
+        tmp_path,
+        codebook_dict=cb,
+        invoke=_make_fake_invoke(response_fn),
+        batch_source=[[_hand_digest("s2-re-sighted", "both confusions again")]],
+        verify_fn=_make_fake_verify_fn(),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        commit=_make_fake_commit(),
+    )
+
+
+def test_run_census_appends_the_run_to_every_sighted_entry(tmp_path):
+    _write_briefing(tmp_path)
+    cb = _sighting_codebook()
+    kwargs = _sighting_kwargs(tmp_path, cb)
+    run_id = kwargs["run_id"]
+
+    mod.run_census(**kwargs)
+
+    persisted = {entry["id"]: entry for entry in codebook.load(kwargs["codebook_path"])["entries"]}
+    assert persisted["entry-keyed"]["last_seen_runs"] == [_SIGHTED_OLD_RUN, run_id]
+    assert persisted["entry-legacy"]["last_seen_runs"] == [run_id]
+    assert persisted["entry-a"] == cb["entries"][0]
+
+    rows = _run_record(kwargs)["findings"]
+    assert [(row["id"], row["verdict"], row["first_seen"]) for row in rows] == [
+        ("entry-keyed", "unverified", _SIGHTED_OLD_RUN),
+    ]
+    assert "unverified" in _findings_of_report(kwargs)
+
+
+def _with_entry_severity(codebook_path, entry_id, severity) -> dict:
+    cb = codebook.load(codebook_path)
+    for entry in cb["entries"]:
+        if entry["id"] == entry_id:
+            entry["severity"] = severity
+    return cb
+
+
+def test_run_census_files_a_released_keyed_entry_with_its_severity_and_key(tmp_path):
+    first = _withheld_first_run(tmp_path)
+    entry_id = _withheld_entry_id(first)
+    entry = _persisted_entry(first["codebook_path"], _GATED_TITLE)
+    assert census_findings.FindingIdentity.from_record(entry) is not None
+    second = _recurrence_kwargs(
+        tmp_path, first, reply=_matches_reply,
+        codebook_dict=_with_entry_severity(first["codebook_path"], entry_id, "high"),
+    )
+
+    mod.run_census(**second)
+
+    [filed] = second["submit_fn"].calls
+    assert filed["priority"] == "high"
+    assert filed["metadata"]["x_finding_key"] == entry["finding_key"]
+    assert filed["metadata"]["x_finding_run"] == second["run_id"]
+
+
+def test_run_census_files_a_released_legacy_entry_without_a_key(tmp_path):
+    cb = _codebook_with_withheld_entry()
+    withheld = cb["entries"][1]
+    withheld["severity"] = "low"
+    withheld["sightings"] = [
+        {
+            "date": "2026-07-01",
+            "project": "dark_factory",
+            "session": "s0-earlier",
+            "origin_phase": "implement",
+            "manifested_phase": "verify",
+        }
+    ]
+
+    def response_fn(prompt, model):
+        if "recurrence" in prompt:
+            return json.dumps(_matches_reply("entry-withheld"))
+        return json.dumps(_record())
+
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        codebook_dict=cb,
+        invoke=_make_fake_invoke(response_fn),
+        batch_source=[[_hand_digest("s2-recurrence", "the same confusion again")]],
+        verify_fn=_make_fake_verify_fn(remediation=None),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        commit=_make_fake_commit(),
+    )
+
+    mod.run_census(**kwargs)
+
+    [filed] = kwargs["submit_fn"].calls
+    assert filed["priority"] == "low"
+    assert "x_finding_key" not in filed["metadata"]
+    assert filed["metadata"]["x_finding_run"] == kwargs["run_id"]
+
+
+def test_run_census_without_a_briefing_keys_everything_to_repo_and_says_so(tmp_path):
+    kwargs = _promotion_kwargs(tmp_path, verify_fn=_keyed_verify_fn())
+
+    mod.run_census(**kwargs)
+
+    assert _persisted_promoted_entry(kwargs)["finding_area"] == "repo"
+    assert finding_area.BRIEFING_RELPATH in _findings_of_report(kwargs)
