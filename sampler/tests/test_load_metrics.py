@@ -1267,16 +1267,15 @@ class TestCalibrationScriptArmTableLockstep:
             'at gate time and cannot import sampler.'
         )
 
-    def test_the_script_reads_a_corpus_THIS_STORE_wrote(self, tmp_path):
-        """The THIRD copy of the samples schema, and until now the unguarded one.
+    def test_the_script_reads_a_corpus_THIS_STORE_wrote(self, tmp_path, capsys):
+        """The schema copy the calibration suite cannot import, guarded here.
 
-        The schema is spelled in sampler.store (the writer), in
-        dashboard/.../load.py (guarded by its own reconciler) and a third time
-        as a fixture in scripts/tests/test_load_threshold_calibration.py, which
+        The schema is published once, as sampler.store.SCHEMA, and copied as a
+        fixture into scripts/tests/test_load_threshold_calibration.py, which
         cannot import sampler at all. That fixture is what every calibration
         test reads from, so the whole suite can stay green against a DDL the
-        real store stopped writing years ago, and the first sign would be the
-        gate returning `no_samples_in_window` against the live corpus.
+        real store no longer writes, and the first sign would be the gate
+        misreading the live corpus.
 
         Guarded from the WRITER's side rather than by comparing two DDL strings.
         A string comparison would pin the schema's SPELLING -- it would go red
@@ -1290,6 +1289,11 @@ class TestCalibrationScriptArmTableLockstep:
         the series, and that count is the denominator of every coverage row --
         so this is the only place it can be checked against the number of ticks
         ``write_tick`` actually wrote.
+
+        And it reconciles the LEAF: what the store writes per cgroup leaf, the
+        script reads back per leaf, pairing each value series with the
+        readability series of the same leaf, including a leaf that never read
+        and so wrote no value row at all.
         """
         from sampler.store import LoadSampleStore
 
@@ -1303,19 +1307,49 @@ class TestCalibrationScriptArmTableLockstep:
                 windowed={
                     SampleKey('runqueue_ratio'): 1.0 + i,
                     SampleKey('runqueue_read_ok'): 1.0,
+                    SampleKey('own_cpu_some10', 'orchestrator-a.service'): 10.0 + i,
+                    SampleKey('own_read_ok', 'orchestrator-a.service'): 1.0,
+                    SampleKey('own_read_ok', 'orchestrator-b.service'): 0.0,
                 },
             )
 
         read = module.read_series(db_path, None)
 
         assert read.degradations == [], read.degradations
-        assert [v for _, v in read.series['runqueue_ratio']] == [1.0, 2.0, 3.0]
-        assert [v for _, v in read.series['psi_cpu_some_avg10']] == [10.0, 11.0, 12.0]
-        assert [v for _, v in read.readability['runqueue_read_ok']] == [1.0, 1.0, 1.0]
+        assert [v for _, v in read.series[('runqueue_ratio', None)]] == [1.0, 2.0, 3.0]
+        assert [v for _, v in read.series[('psi_cpu_some_avg10', None)]] == [
+            10.0, 11.0, 12.0]
+        assert [k for k in read.series if k[0] == 'own_cpu_some10'] == [
+            ('own_cpu_some10', 'orchestrator-a.service')]
+        assert [v for _, v in read.series[
+            ('own_cpu_some10', 'orchestrator-a.service')]] == [10.0, 11.0, 12.0]
+        assert [v for _, v in read.readability[('runqueue_read_ok', None)]] == [
+            1.0, 1.0, 1.0]
+        assert [v for _, v in read.readability[
+            ('own_read_ok', 'orchestrator-a.service')]] == [1.0, 1.0, 1.0]
+        assert [v for _, v in read.readability[
+            ('own_read_ok', 'orchestrator-b.service')]] == [0.0, 0.0, 0.0]
         assert read.ticks_in_corpus == 3, (
             'the script counted a different number of ticks than write_tick '
             f'wrote: {read.ticks_in_corpus} against 3'
         )
+
+        coverage = module.coverage_table(
+            read.series, read.readability,
+            list(module.ARM_METRIC_SELECTORS.values()), ticks_in_corpus=3,
+        )
+        dark = coverage[('own_cpu_some10', 'orchestrator-b.service')]
+        assert dark is not None
+        assert (dark['ticks_with_a_row'], dark['readable']) == (3, 0), dark
+
+        absent = tmp_path / 'absent'
+        module.main([
+            '--db', str(db_path), '--arm', 'own_cpu_some_avg10', '--no-report',
+            '--config', str(absent / 'local.yaml'),
+            '--peer-config', str(absent / 'peer.yaml'),
+            '--uv-bin', str(absent / 'uv'),
+        ])
+        assert '### `own_cpu_some10:orchestrator-a.service` —' in capsys.readouterr().out
 
     def test_every_declared_readability_metric_is_one_the_collectors_emit(
         self, tmp_path
