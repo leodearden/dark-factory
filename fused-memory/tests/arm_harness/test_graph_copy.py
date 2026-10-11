@@ -280,6 +280,20 @@ async def test_copy_reference_graph_retries_a_fork_refusal_until_the_copy_lands(
 
 
 @pytest.mark.asyncio
+async def test_copy_reference_graph_retries_a_fork_refusal_that_carries_a_reason():
+    client = FakeGraphClient()
+    refusal = ResponseError(f'{graph_copy.COPY_FORK_REFUSAL}: File exists')
+    reference = _reference_graph(client, copy_errors=[refusal])
+    sleep = RecordingSleep()
+
+    await copy_reference_graph(client, REFERENCE, TARGET, sleep=sleep)
+
+    assert client.graphs[TARGET].nodes == reference.nodes
+    assert _copy_calls(client) == [('copy', REFERENCE, TARGET)] * 2
+    assert sleep.waits == [graph_copy.COPY_RETRY_INTERVAL_S]
+
+
+@pytest.mark.asyncio
 async def test_copy_reference_graph_does_not_retry_any_other_server_error():
     client = FakeGraphClient()
     error = ResponseError('some other server error')
@@ -308,6 +322,8 @@ async def test_copy_reference_graph_gives_up_after_its_attempts_naming_the_refus
     refused = caught.value
     assert (refused.reference, refused.target, refused.attempts) == (
         REFERENCE, TARGET, graph_copy.COPY_ATTEMPTS)
+    assert refused.waited_s == (graph_copy.COPY_ATTEMPTS - 1) * graph_copy.COPY_RETRY_INTERVAL_S
+    assert refused.reply == graph_copy.COPY_FORK_REFUSAL
     message = str(refused)
     assert REFERENCE in message
     assert TARGET in message

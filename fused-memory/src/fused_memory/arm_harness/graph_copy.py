@@ -8,7 +8,7 @@ every arm, the 1536-dimension incumbent included.
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -18,6 +18,7 @@ from fused_memory.arm_harness.arm_embedder import DocumentEmbedder, DocumentEmbe
 from fused_memory.arm_harness.frozen_model import FrozenModel
 from fused_memory.arm_harness.normalization import NormStats, norm_stats
 from fused_memory.arm_harness.scratch_guard import GuardCheckpoint, require_scratch_name
+from fused_memory.arm_harness.sleep_seam import Sleep
 
 ADOPT_NODE_GROUP_CYPHER = 'MATCH (n) SET n.group_id = $group_id RETURN count(n)'
 ADOPT_EDGE_GROUP_CYPHER = 'MATCH ()-[r]->() SET r.group_id = $group_id RETURN count(r)'
@@ -45,7 +46,7 @@ COUNT_FACT_EMBEDDINGS_CYPHER = (
 DEFAULT_WRITE_BATCH_SIZE = 64
 
 COPY_FORK_REFUSAL = 'GRAPH.COPY failed, could not fork'
-"""FalkorDB's reply while another child process (e.g. a BGSAVE) holds the fork; graph module 4.18.0."""
+"""How FalkorDB's reply begins while another child process (e.g. a BGSAVE) holds the fork; graph module 4.18.0."""
 
 COPY_ATTEMPTS = 60
 COPY_RETRY_INTERVAL_S = 2.0
@@ -81,6 +82,8 @@ class GraphCopyRefused(RuntimeError):
         self.reference = reference
         self.target = target
         self.attempts = attempts
+        self.waited_s = waited_s
+        self.reply = reply
         super().__init__(
             f'GRAPH.COPY {reference!r} -> {target!r} was refused {attempts} times over '
             f'{waited_s:.0f}s: {reply}; the server could not fork, so no copy was made'
@@ -140,7 +143,7 @@ async def copy_reference_graph(
     reference: str,
     target: str,
     *,
-    sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
+    sleep: Sleep = asyncio.sleep,
 ) -> None:
     require_scratch_name(reference, checkpoint=GuardCheckpoint.GRAPH_COPY)
     require_scratch_name(target, checkpoint=GuardCheckpoint.GRAPH_COPY)
@@ -158,7 +161,7 @@ async def _copy_through_fork_refusals(
     graph: CopyableGraph,
     reference: str,
     target: str,
-    sleep: Callable[[float], Awaitable[object]],
+    sleep: Sleep,
 ) -> None:
     """A refused copy leaves no target behind (measured), so the same copy is simply reissued."""
     refusal: ResponseError | None = None
@@ -182,7 +185,7 @@ async def _copy_through_fork_refusals(
 
 
 def _is_fork_refusal(error: ResponseError) -> bool:
-    return str(error) == COPY_FORK_REFUSAL
+    return str(error).startswith(COPY_FORK_REFUSAL)
 
 
 async def adopt_group_id(graph: ScratchGraph, name: str) -> GroupAdoption:
