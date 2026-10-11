@@ -22,7 +22,8 @@ Exit codes
 1 — drift (one or more compared directives disagree), OR a committed unit
     VANISHED (no committed copy found, so nothing could be verified for it),
     OR an installed unit carries a drop-in override (so the unit file was
-    compared but the EFFECTIVE configuration was not)
+    compared but the EFFECTIVE configuration was not), OR a unit file exists
+    but could not be read
 2 — installed unit absent (no installed copy found for one or more units)
 
 PRECEDENCE: drift (1) DOMINATES absence (2).  With three units a single run can
@@ -167,10 +168,14 @@ from collections.abc import Sequence
 
 from systemd_unit_parity import (
     ABSENT,
+    BlockText,
     Drift,
+    ParityRun,
+    ReportText,
+    UnitRef,
     environment_map,
-    find_dropins,
     parse_unit_directives,
+    run_parity,
 )
 
 # ---------------------------------------------------------------------------
@@ -231,11 +236,6 @@ DIVERGENCE_ALLOWLIST: dict[str, str] = {
 _SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parent
 _DEFAULT_INSTALLED_DIR = pathlib.Path.home() / ".config" / "systemd" / "user"
-
-
-def _log(message: str, *, stream=None) -> None:
-    """Print *message* prefixed with the log tag."""
-    print(f"[{LOG_TAG}] {message}", file=stream if stream is not None else sys.stdout)
 
 
 # ---------------------------------------------------------------------------
@@ -939,18 +939,27 @@ UNITS: dict[str, UnitSpec] = {
 # ---------------------------------------------------------------------------
 
 
+def _compare(unit: UnitRef, repo_text: str, installed_text: str) -> list[Drift]:
+    return compare_unit(UNITS[unit.name], repo_text, installed_text)
+
+
+_REPORT = ReportText(
+    drift=BlockText(
+        "drift",
+        "{count} directive(s) differ between repo and installed units:",
+        (
+            "To propagate the committed units to this host, run: scripts/setup-host.sh  "
+            "(this checker is read-only by design — see the module docstring for why "
+            "there is no --fix)",
+        ),
+    )
+)
+
+
 def main(argv: Sequence[str]) -> int:
-    """Parse args and run the parity check.
+    """Parse args and run the parity check through ``systemd_unit_parity.run_parity``.
 
-    Returns:
-        0 — parity (and at least one unit was actually compared)
-        1 — drift, OR a committed unit vanished, OR a drop-in override
-        2 — one or more installed units absent
-
-    Drift DOMINATES absence: a run that hits both returns 1.  An absent unit
-    is still reported in that case — dominated, not hidden.  A run that
-    compared ZERO units never reports parity: see the exit-code table in the
-    module docstring.
+    Exit codes: see ``systemd_unit_parity.ParityExit``.
     """
     parser = argparse.ArgumentParser(
         description="Verify parity between the in-repo and installed dashboard units."
@@ -978,127 +987,11 @@ def main(argv: Sequence[str]) -> int:
         ),
     )
     args = parser.parse_args(argv)
-
-    installed_dir: pathlib.Path = args.installed_dir
-    repo_root: pathlib.Path = args.repo_root
-    selected = args.unit or sorted(UNITS)
-
-    drifts: list[tuple[Drift, pathlib.Path, pathlib.Path]] = []
-    missing: list[pathlib.Path] = []
-    vanished: list[tuple[str, pathlib.Path]] = []
-    overridden: list[tuple[str, list[pathlib.Path]]] = []
-    # Units that actually reached compare_unit. The success line reports THIS
-    # count, not len(selected): a report may only claim what it verified.
-    compared: list[str] = []
-
-    for name in selected:
-        spec = UNITS[name]
-        repo_path = repo_root / spec.repo_relpath
-        installed_path = installed_dir / name
-
-        if not repo_path.is_file():
-            # The committed unit is the source of truth; without it there is
-            # nothing to compare against, so this unit was NOT checked.
-            vanished.append((name, repo_path))
-            continue
-
-        if not installed_path.is_file():
-            missing.append(installed_path)
-            continue
-
-        # Checked even when the unit itself is at parity: a drop-in is layered
-        # OVER a matching unit file, so it is invisible to every text
-        # comparison below.
-        dropins = find_dropins(installed_dir, name)
-        if dropins:
-            overridden.append((name, dropins))
-
-        compared.append(name)
-        for drift in compare_unit(
-            spec,
-            repo_path.read_text(encoding="utf-8"),
-            installed_path.read_text(encoding="utf-8"),
-        ):
-            drifts.append((drift, repo_path, installed_path))
-
-    for path in missing:
-        _log(f"[skip] installed unit not found: {path} (not installed on this host)")
-
-    if vanished:
-        # Deliberately worded apart from the drift block below. Both exit 1,
-        # but they send the operator to different places: a drift is a
-        # directive diff to propagate, whereas this is "the file I compare
-        # against is gone" — telling them to hunt for a diff would waste the
-        # trip.
-        _log(
-            f"[vanished] {len(vanished)} committed unit(s) not found — "
-            "nothing was verified for them:"
-        )
-        for name, repo_path in vanished:
-            _log(f"  {name}: expected committed copy at {repo_path}")
-        _log(
-            "[vanished] The committed unit is this checker's source of truth. "
-            "Check --repo-root, and whether the unit was renamed or moved "
-            "(the paths live in UNITS in this script)."
-        )
-
-    if overridden:
-        # Worded apart from [drift] for the same reason [vanished] is: this is
-        # not a directive diff to propagate. The unit files may match exactly;
-        # what the run could not establish is that the EFFECTIVE configuration
-        # matches, because systemd merges these over the unit at load time.
-        # It shares exit 1 because "I could not verify" belongs with "I found
-        # a difference", not with the benign "not installed here" that 2
-        # denotes — reporting parity here would overstate what was checked.
-        _log(
-            f"[override] {len(overridden)} unit(s) have drop-in overrides — "
-            "the unit files were compared, but the EFFECTIVE configuration "
-            "was NOT verified:"
-        )
-        for name, dropins in overridden:
-            for dropin in dropins:
-                _log(f"  {name}: {dropin}")
-        _log(
-            "[override] systemd merges these over the unit at load time, so a "
-            "directive set here silently wins over the committed value. "
-            "Inspect with: systemctl --user cat <unit>  (and remove the "
-            "drop-in, or move the setting into the committed unit)."
-        )
-
-    if drifts:
-        _log(f"[drift] {len(drifts)} directive(s) differ between repo and installed units:")
-        for drift, repo_path, installed_path in drifts:
-            _log(f"  {drift.unit} [{drift.section}] {drift.key}")
-            _log(f"      {drift.reason}")
-            _log(f"      repo      {repo_path}: {drift.repo_value}")
-            _log(f"      installed {installed_path}: {drift.installed_value}")
-        _log(
-            "[drift] To propagate the committed units to this host, run: "
-            "scripts/setup-host.sh  (this checker is read-only by design — "
-            "see the module docstring for why there is no --fix)"
-        )
-
-    if drifts or vanished or overridden:
-        return 1
-
-    if missing:
-        return 2
-
-    if not compared:
-        # UNREACHABLE BY CONSTRUCTION, kept as defence — not a tested path.
-        # Every unit that was not compared took an earlier `continue` into
-        # `vanished` or `missing`, and both return above, so reaching here
-        # requires `selected` itself to be empty: impossible while UNITS is
-        # non-empty (`args.unit or sorted(UNITS)`) and argparse `choices`
-        # rejects an unknown --unit. It stays because the invariant it
-        # enforces — a run that verified nothing must never report parity — is
-        # one a future early-`continue` could quietly break, and the cost of
-        # holding it is three lines.
-        _log("[error] no units were compared — nothing was verified.")
-        return 1
-
-    _log(f"[ok] parity — {len(compared)} unit(s) match their committed copies.")
-    return 0
+    units = [
+        UnitRef(name, args.repo_root / UNITS[name].repo_relpath, args.installed_dir / name)
+        for name in args.unit or sorted(UNITS)
+    ]
+    return run_parity(ParityRun(LOG_TAG, units, _compare, _REPORT), out=sys.stdout)
 
 
 if __name__ == "__main__":
