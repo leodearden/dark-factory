@@ -20,7 +20,9 @@ from pathlib import Path
 import pytest
 from _task_db_scan import UNREADABLE_STORE_ERRORS
 from clear_leaked_claimants import (
+    REREAD_FAILED_DETAIL,
     STILL_VIOLATING_DETAIL,
+    UNVERIFIED_DETAIL,
     ApplyReport,
     Bucket,
     Census,
@@ -581,6 +583,66 @@ class TestBucketAccounting:
             5225: Bucket.FAILED,
             9001: Bucket.ARRIVED_DURING_WINDOW,
         }
+
+
+def _turn_store_unreadable(root: str, aside: Path) -> None:
+    _store_path(root).rename(aside)
+    _store_path(root).write_bytes(b'not a sqlite database\n' * 256)
+
+
+def _apply_while_the_store_turns_unreadable(root: str, aside: Path):
+    """101 is written; while 4028 is being written the store turns unreadable; 5225 comes after.
+
+    The real store is put back afterwards, so a test can read what was really written.
+    """
+    server = _FakeClaimantServer()
+    server.concurrent_traffic[4028] = lambda: _turn_store_unreadable(root, aside)
+    report = _apply(take_census(root, NOW), server)
+    aside.replace(_store_path(root))
+    return report, server
+
+
+class TestUnreadableStoreMidBatch:
+    def test_the_batch_continues_and_every_selected_row_is_failed(self, seed_root, tmp_path):
+        root = seed_root(TIER_TABLE_ROWS)
+
+        report, server = _apply_while_the_store_turns_unreadable(root, tmp_path / 'aside')
+
+        assert _buckets(report) == {task_id: Bucket.FAILED for task_id in TERMINAL_IDS}
+        assert 'DatabaseError' in _failure_detail(report, 4028)
+        assert _failure_detail(report, 5225).startswith(REREAD_FAILED_DETAIL)
+        assert 5225 not in server.written_ids()
+
+    def test_a_row_written_before_the_store_turned_unreadable_is_failed_as_unverified(
+        self, seed_root, tmp_path,
+    ):
+        root = seed_root(TIER_TABLE_ROWS)
+
+        report, _ = _apply_while_the_store_turns_unreadable(root, tmp_path / 'aside')
+
+        assert _failure_detail(report, 101) == UNVERIFIED_DETAIL
+        assert _claimants(root)[101] == (None, None)
+        assert report.verification_census is None
+        assert report.verification_error is not None
+        assert 'TaskDbUnreadable' in report.verification_error
+
+    def test_the_sweep_still_reports_every_project(self, seed_root, tmp_path):
+        failing = seed_root(TIER_TABLE_ROWS, name='failing')
+        clean = seed_root(TIER_TABLE_ROWS, name='clean')
+        server = _FakeClaimantServer()
+        server.concurrent_traffic[4028] = lambda: _turn_store_unreadable(failing, tmp_path / 'aside')
+
+        result = _sweep([failing, clean], server)
+
+        assert [project.census.project_root for project in result.projects] == [failing, clean]
+        assert exit_code(result) is ExitCode.REPAIR_FAILED
+        payload = json.loads(render_json(result))
+        failing_apply, clean_apply = (project['apply'] for project in payload['projects'])
+        assert failing_apply['verification_census'] is None
+        assert 'TaskDbUnreadable' in failing_apply['verification_error']
+        assert clean_apply['verification_error'] is None
+        assert clean_apply['counts']['repaired'] == len(TERMINAL_IDS)
+        assert 'verification_census: unavailable' in render_text(result)
 
 
 def _write_scheduler_state(root: str, text: str) -> None:

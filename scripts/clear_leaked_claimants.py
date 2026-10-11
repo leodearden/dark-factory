@@ -198,6 +198,7 @@ class ApplyReport:
     holder_intersection: tuple[int, ...]
     outcomes: tuple[RowOutcome, ...]
     verification_census: Census | None
+    verification_error: str | None
 
     def counts(self) -> dict[Bucket, int]:
         counts = {bucket: 0 for bucket in Bucket}
@@ -208,13 +209,19 @@ class ApplyReport:
 
 @dataclass(frozen=True)
 class _Attempt:
-    """A non-None delta means the re-read declined the row and no write was issued."""
+    """delta: the re-read declined the row. error: the re-read or the write failed. Neither: written."""
 
     delta: Delta | None = None
-    write_error: str | None = None
+    error: str | None = None
 
 
 STILL_VIOLATING_DETAIL = 'still violating at verification census'
+REREAD_FAILED_DETAIL = 're-read failed, nothing was written'
+UNVERIFIED_DETAIL = 'written, but the verification census could not read the store'
+
+
+def _describe(exc: BaseException) -> str:
+    return f'{type(exc).__name__}: {exc}'
 
 
 async def _clear_claimant(client: ToolClient, project_root: str, violation: Violation) -> str | None:
@@ -228,7 +235,7 @@ async def _clear_claimant(client: ToolClient, project_root: str, violation: Viol
     try:
         reply = await client.call_tool('set_task_claimant', arguments)
     except Exception as exc:
-        return f'{type(exc).__name__}: {exc}'
+        return _describe(exc)
     return write_failure_reason(reply)
 
 
@@ -261,27 +268,34 @@ def observed_delta(
     return delta or None
 
 
+def _read_live_row(project_root: str, key: tuple[str, int]) -> dict[str, Any] | None:
+    with contextlib.closing(connect_ro(tasks_db_path(project_root))) as conn:
+        rows = _read_claimant_rows(conn, 'tag = ? AND id = ?', key)
+    return rows[0] if rows else None
+
+
 async def _attempt_repair(
-    client: ToolClient,
-    conn: sqlite3.Connection,
-    project_root: str,
-    violation: Violation,
-    now: datetime,
+    client: ToolClient, project_root: str, violation: Violation, now: datetime,
 ) -> _Attempt:
-    live_rows = _read_claimant_rows(conn, 'tag = ? AND id = ?', violation.key)
-    delta = observed_delta(violation, live_rows[0] if live_rows else None, now)
+    try:
+        live = _read_live_row(project_root, violation.key)
+    except UNREADABLE_STORE_ERRORS as exc:
+        return _Attempt(error=f'{REREAD_FAILED_DETAIL}: {_describe(exc)}')
+    delta = observed_delta(violation, live, now)
     if delta is not None:
         return _Attempt(delta=delta)
-    return _Attempt(write_error=await _clear_claimant(client, project_root, violation))
+    return _Attempt(error=await _clear_claimant(client, project_root, violation))
 
 
 def _outcome(
-    violation: Violation, attempt: _Attempt, still_violating: frozenset[tuple[str, int]],
+    violation: Violation, attempt: _Attempt, still_violating: frozenset[tuple[str, int]] | None,
 ) -> RowOutcome:
     if attempt.delta is not None:
         return RowOutcome(violation, Bucket.SKIPPED_CHANGED_UNDER_US, delta=attempt.delta)
-    if attempt.write_error is not None:
-        return RowOutcome(violation, Bucket.FAILED, detail=attempt.write_error)
+    if attempt.error is not None:
+        return RowOutcome(violation, Bucket.FAILED, detail=attempt.error)
+    if still_violating is None:
+        return RowOutcome(violation, Bucket.FAILED, detail=UNVERIFIED_DETAIL)
     if violation.key in still_violating:
         return RowOutcome(violation, Bucket.FAILED, detail=STILL_VIOLATING_DETAIL)
     return RowOutcome(violation, Bucket.REPAIRED)
@@ -290,9 +304,11 @@ def _outcome(
 def bucket_outcomes(
     selected: Sequence[Violation],
     attempts: Mapping[tuple[str, int], _Attempt],
-    verification: Census,
+    verification: Census | None,
     tiers: frozenset[Tier],
 ) -> tuple[RowOutcome, ...]:
+    if verification is None:
+        return tuple(_outcome(v, attempts[v.key], None) for v in selected)
     remaining = tuple(v for v in verification.violations if v.tier in tiers)
     still_violating = frozenset(v.key for v in remaining)
     enumerated = frozenset(v.key for v in selected)
@@ -323,13 +339,16 @@ async def apply_repairs(
             holder_intersection=held,
             outcomes=(),
             verification_census=None,
+            verification_error=None,
         )
-    with contextlib.closing(connect_ro(tasks_db_path(root))) as conn:
-        attempts = {
-            violation.key: await _attempt_repair(client, conn, root, violation, clock())
-            for violation in selected
-        }
-    verification = take_census(root, clock())
+    attempts = {
+        violation.key: await _attempt_repair(client, root, violation, clock())
+        for violation in selected
+    }
+    try:
+        verification, verification_error = take_census(root, clock()), None
+    except UNREADABLE_STORE_ERRORS as exc:
+        verification, verification_error = None, _describe(exc)
     return ApplyReport(
         project_root=root,
         tiers=_ordered(tiers),
@@ -337,6 +356,7 @@ async def apply_repairs(
         holder_intersection=(),
         outcomes=bucket_outcomes(selected, attempts, verification, tiers),
         verification_census=verification,
+        verification_error=verification_error,
     )
 
 
@@ -432,6 +452,8 @@ def _apply_lines(report: ApplyReport) -> list[str]:
         verification = report.verification_census
         lines.append(f'  verification_census: measured_at={verification.measured_at.isoformat()}')
         lines.extend(_census_lines(verification))
+    if report.verification_error is not None:
+        lines.append(f'  verification_census: unavailable, {report.verification_error}')
     return lines
 
 
@@ -486,6 +508,7 @@ def _apply_json(report: ApplyReport) -> dict[str, Any]:
             for bucket in Bucket
         },
         'verification_census': None if verification is None else _census_json(verification),
+        'verification_error': report.verification_error,
     }
 
 
@@ -598,7 +621,7 @@ async def _applying_sweep(
         except _HANDSHAKE_ERRORS as exc:
             print(
                 f'error: could not reach the fused-memory MCP server at {server_url}: '
-                f'{type(exc).__name__}: {exc}; nothing was written',
+                f'{_describe(exc)}; nothing was written',
                 file=sys.stderr,
             )
             return None
