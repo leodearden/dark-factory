@@ -796,14 +796,8 @@ class TestDeriveTruthLiveClaimant:
         assert report.live_claimant is None
 
     async def test_stale_db_claimant_on_blocked_task_is_not_live(self) -> None:
-        """Formerly ``test_stale_db_claimant_on_blocked_task_is_treated_as_live_by_design``,
-        which pinned the opposite BY DESIGN because ``is_stranded`` is
-        in-progress-gated. Task 4623 reverses it per
-        docs/prds/claimant-invariant-enforcement.md D4 / C4-E6: "is anyone
-        alive holding this row?" has no status content, so a claimant stale
-        past the TTL is dead on any status — which makes ``_RECOVERY`` row
-        (g) reachable for a stranded ``blocked`` task.
-        """
+        """A claimant stale past the TTL is dead on any status
+        (docs/prds/claimant-invariant-enforcement.md D4 / C4-E6)."""
         fixed_now = datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC)
         task = {
             'status': 'blocked',
@@ -1732,6 +1726,29 @@ class TestDeriveTruthRemainingFields:
 # ---------------------------------------------------------------------------
 
 
+_CLAIMED_RUN_ID = 'run-1/session-1/pid=123'
+
+
+async def _recover_claimed_row(
+    *, status: str, heartbeat_at: str, metadata: dict | None = None,
+) -> tuple[TruthReport, RecoveryAction]:
+    """``recovery_for`` over a claimed row at 2026-07-12T12:00Z, TTL 10 minutes,
+    branch GONE_NO_MARKER and no open escalation."""
+    task = {
+        'status': status,
+        'claimant_run_id': _CLAIMED_RUN_ID,
+        'heartbeat_at': heartbeat_at,
+        'metadata': metadata or {},
+    }
+    resolver = _make_ground_truth(
+        scheduler=_fake_scheduler(is_actively_held=False, task=task),
+        escalation_queue=_fake_escalation_queue(),
+        now_fn=lambda: datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC),
+        heartbeat_ttl=timedelta(minutes=10),
+    )
+    return await resolver.recovery_for('4623')
+
+
 @pytest.mark.asyncio
 class TestRecoveryFor:
     """``recovery_for(tid)`` composes ``derive_truth`` -> ``classify_recovery``
@@ -1835,29 +1852,6 @@ class TestRecoveryFor:
         assert report.live_claimant is not None
         assert report.live_claimant.source == ClaimantSource.DB
         assert action == RecoveryAction.LEAVE
-
-
-_CLAIMED_RUN_ID = 'run-1/session-1/pid=123'
-
-
-async def _recover_claimed_row(
-    *, status: str, heartbeat_at: str, metadata: dict | None = None,
-) -> tuple[TruthReport, RecoveryAction]:
-    """``recovery_for`` over a claimed row at 2026-07-12T12:00Z, TTL 10 minutes,
-    branch GONE_NO_MARKER and no open escalation."""
-    task = {
-        'status': status,
-        'claimant_run_id': _CLAIMED_RUN_ID,
-        'heartbeat_at': heartbeat_at,
-        'metadata': metadata or {},
-    }
-    resolver = _make_ground_truth(
-        scheduler=_fake_scheduler(is_actively_held=False, task=task),
-        escalation_queue=_fake_escalation_queue(),
-        now_fn=lambda: datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC),
-        heartbeat_ttl=timedelta(minutes=10),
-    )
-    return await resolver.recovery_for('4623')
 
 
 # ---------------------------------------------------------------------------
