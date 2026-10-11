@@ -68,17 +68,17 @@ logger = logging.getLogger('legibility.nightly')
 
 
 # ---------------------------------------------------------------------------
-# resolve_config_path — map a bare project_id to its legibility.yaml
+# resolve_config / resolve_config_path — map a bare project_id to its legibility.yaml
 # ---------------------------------------------------------------------------
 
 def _default_search_roots() -> list[Path]:
-    """Default search roots for :func:`resolve_config_path`.
+    """Default search roots for :func:`resolve_config`.
 
     Env ``LEGIBILITY_SEARCH_ROOTS`` (``os.pathsep``-split) if set, else the
     dark-factory repo's own parent directory -- mirrors
     ``skills/factory-init/scripts/find_escalation_port.known_project_roots``'s
     sibling-repos-under-``/home/leo/src`` convention. Each returned path is a
-    PARENT directory: :func:`resolve_config_path` globs one level down for
+    PARENT directory: :func:`resolve_config` globs one level down for
     candidate project roots, it is not itself a project root.
     """
     env_value = os.environ.get('LEGIBILITY_SEARCH_ROOTS')
@@ -91,7 +91,17 @@ def _default_search_roots() -> list[Path]:
 def resolve_config_path(
     project_id: str, search_roots: Sequence[str | Path] | None = None,
 ) -> Path:
-    """Resolve *project_id* to its ``docs/legibility/legibility.yaml`` path.
+    """Resolve *project_id* to its ``docs/legibility/legibility.yaml`` path
+    (:func:`resolve_config`, without the config it loaded on the way)."""
+    path, _cfg = resolve_config(project_id, search_roots)
+    return path
+
+
+def resolve_config(
+    project_id: str, search_roots: Sequence[str | Path] | None = None,
+) -> tuple[Path, LegibilityConfig]:
+    """Resolve *project_id* to its ``docs/legibility/legibility.yaml`` path
+    and the config loaded from it.
 
     *search_roots* (default: :func:`_default_search_roots`) is a list of
     PARENT directories; each is globbed one level down for candidate
@@ -121,7 +131,7 @@ def resolve_config_path(
             except Exception:
                 continue
             if cfg.project_id == project_id:
-                return config_path
+                return config_path, cfg
     raise FileNotFoundError(
         f'no legibility.yaml found for project_id={project_id!r} under '
         f'search roots {[str(r) for r in roots]!r}'
@@ -1142,6 +1152,25 @@ def _record_trickle_progress(
     A FAILED NIGHT'S TARGET DATE IS GONE, NOT RETRIED. See
     ``scripts/legibility-trickle@.timer``'s ``Persistent=true`` comment
     for why, and for the decision to leave it that way.
+    """
+    doc = _record_run_state(
+        cfg.project_id, sample, target_date, result, recorder=recorder, now=now,
+    )
+    _escalate_barren_streak(cfg, doc, target_date, result, poster=poster)
+
+
+def _record_run_state(
+    project_id: str,
+    sample: sampling.SampleResult,
+    target_date: date,
+    result: NightlyResult,
+    *,
+    recorder,
+    now: datetime | None,
+) -> dict | None:
+    """Record one night through *recorder* (default
+    :func:`trickle_state.record_run`) and return the document it wrote, or
+    ``None`` when the write failed.
 
     BEST-EFFORT, ALWAYS: the whole call is wrapped in ``try/except`` ->
     one WARNING, swallowed — mirroring :func:`post_escalation`'s
@@ -1152,8 +1181,8 @@ def _record_trickle_progress(
     record = recorder if recorder is not None else trickle_state.record_run
     recorded_at = now if now is not None else datetime.now(UTC)
     try:
-        doc = record(
-            cfg.project_id,
+        return record(
+            project_id,
             target_date=target_date,
             recorded_at=recorded_at,
             exit_code=result.exit_code,
@@ -1172,11 +1201,9 @@ def _record_trickle_progress(
             'legibility trickle: could not record run state for project=%s '
             'date=%s (%s: %s); the run itself is unaffected, but the '
             'progress probe will read a stale streak',
-            cfg.project_id, target_date.isoformat(), type(exc).__name__, exc,
+            project_id, target_date.isoformat(), type(exc).__name__, exc,
         )
-        return
-
-    _escalate_barren_streak(cfg, doc, target_date, result, poster=poster)
+        return None
 
 
 def _escalate_barren_streak(
@@ -1303,16 +1330,19 @@ def run_nightly(
     """Run one full nightly trickle pass for a single project (PRD §5.5).
 
     *config_path* (preferred) or *project_id* (resolved via
-    :func:`resolve_config_path`) selects the project -- exactly one of the
+    :func:`resolve_config`) selects the project -- exactly one of the
     two is expected to identify it, mirroring the ``nightly.py run`` CLI's
     ``--config``/``--project-id`` pair. *target_date* defaults to
     yesterday UTC; *projects_root* defaults to ``~/.claude/projects``.
     *now* threads through to :func:`evaluate_census_step`'s clock seam and
     to the run-state recorder's ``recorded_at``.
 
-    Every failure after the config loads is returned as ``exit_code=1``, and
-    the crash itself files one escalation (:func:`_crashed_night`); before
-    that it raises.
+    After the config loads, every failure is recorded as a failed night,
+    returned as ``exit_code=1``, and escalated once (:func:`_crashed_night`).
+    A config that does not load raises. It is first recorded as a failed
+    night when *project_id* selected the project (the systemd unit's
+    ``--project-id %i``), and left unrecorded under *config_path*, which
+    names no project to record against.
 
     *status_fetcher* defaults to the real MCP-backed ``get_statuses``
     fetcher for ``cfg.project_root``
@@ -1347,13 +1377,17 @@ def run_nightly(
     ``exit_code=0``; the decision-8 fail-loud triggers are added by later
     steps.
     """
+    if target_date is None:
+        target_date = (datetime.now(UTC) - timedelta(days=1)).date()
     if config_path is not None:
         resolved_config_path = Path(config_path).resolve()
+        cfg = load_config(resolved_config_path)
+    elif project_id is not None:
+        resolved_config_path, cfg = _load_config_for_project(
+            project_id, target_date, recorder=recorder, now=now,
+        )
     else:
-        if project_id is None:
-            raise ValueError('run_nightly requires either config_path or project_id')
-        resolved_config_path = resolve_config_path(project_id)
-    cfg = load_config(resolved_config_path)
+        raise ValueError('run_nightly requires either config_path or project_id')
     try:
         return _run_configured_nightly(
             cfg, resolved_config_path,
@@ -1365,12 +1399,34 @@ def run_nightly(
         return _crashed_night(cfg, exc, poster=poster)
 
 
+def _load_config_for_project(
+    project_id: str, target_date: date, *, recorder, now: datetime | None,
+) -> tuple[Path, LegibilityConfig]:
+    """Resolve *project_id*'s config (:func:`resolve_config`), recording a
+    failed night for *project_id* before re-raising when none resolves."""
+    try:
+        return resolve_config(project_id)
+    except Exception:
+        _record_run_state(
+            project_id, _nothing_sampled(), target_date, NightlyResult(exit_code=1),
+            recorder=recorder, now=now,
+        )
+        raise
+
+
+def _nothing_sampled() -> sampling.SampleResult:
+    """The counters of a night whose sampling never returned."""
+    return sampling.SampleResult(
+        selected=[], per_stratum_counts={}, zero_signal_dropped=0, bytes_used=0,
+    )
+
+
 def _run_configured_nightly(
     cfg: LegibilityConfig,
     resolved_config_path: Path,
     *,
     projects_root: Path | str | None,
-    target_date: date | None,
+    target_date: date,
     now: datetime | None,
     invoke,
     status_fetcher,
@@ -1379,67 +1435,6 @@ def _run_configured_nightly(
     recorder,
 ) -> NightlyResult:
     """:func:`run_nightly`'s pass once *cfg* has loaded."""
-    if target_date is None:
-        target_date = (datetime.now(UTC) - timedelta(days=1)).date()
-    if projects_root is None:
-        projects_root = DEFAULT_PROJECTS_ROOT
-    commit_fn = committer if committer is not None else _git_commit_docs_only
-    # Task 4148. The systemd path is `nightly.py run --project-id %i` ->
-    # main() -> run_nightly, and main() never built a fetcher -- so
-    # `status_fetcher=None` reached `compute_tasks_landed` on every real run
-    # and hit its `status_fetcher is None` arm (census_trigger.py:735-739;
-    # journal 2026-08-10/11/12), leaving condition (b) tasks-landed unable to
-    # fire at all. Every OTHER seam here already resolves None to its real
-    # implementation (committer -> _git_commit_docs_only above, recorder ->
-    # trickle_state.record_run, poster -> _default_poster); status_fetcher
-    # alone resolved to nothing, and that asymmetry is how three prior repairs
-    # of this same code (2953's 406 fix, 3291's baseline fix, 4085's fail-safe
-    # arms) each left the wiring loop open.
-    #
-    # Defaulted HERE rather than in main() because `cfg.project_root` is the
-    # first point in the chain where the ABSOLUTE root is known (config.py's
-    # validator guarantees absolute -- exactly what the MCP wire requires
-    # post-3291) while main() holds only --config/--project-id; and it is the
-    # identical value `evaluate_census_step` hands to `decide`, so the fetcher
-    # and the decision can never disagree about which project they are for.
-    # Deliberately NOT wrapped in try/except: the construction does no I/O
-    # (a resolve, an environ read, a returned closure), and every call-time
-    # failure is already fail-safe inside compute_tasks_landed.
-    #
-    # HAZARD, for whoever writes the next run_nightly test (amendment): this
-    # default is LIVE, so a test that seeds census-state.json with a valid
-    # non-negative `last_census_done_count` and injects no `status_fetcher`
-    # issues a REAL POST to $FUSED_MEMORY_MCP_URL (default localhost:8002) --
-    # and on a dev box where fused-memory is actually up, a stale fixture
-    # baseline against the real done-count can produce a genuine FIRE that
-    # subprocess-launches scripts/legibility/census.py (real LLM spend, real
-    # git writes). Such a test MUST fake httpx (conftest's install_fake_httpx)
-    # AND stub `_default_census_launcher`; see the task-4148 block in
-    # scripts/tests/test_legibility_nightly.py for the worked pattern.
-    status_fetcher = (
-        status_fetcher if status_fetcher is not None
-        else census_trigger.default_status_fetcher(cfg.project_root)
-    )
-
-    # One render cache for the whole run: select_digest_sessions renders each
-    # candidate to CHARGE it against the byte budget, and build_digests reuses
-    # that render instead of paying for it twice. Rendering is super-linear in
-    # signal-item count, so this is roughly a 2x on the job's dominant cost.
-    rendered: dict[tuple, str] = {}
-    sample = select_digest_sessions(cfg, projects_root, target_date, rendered=rendered)
-
-    # The operator's grep anchor plus the total-suppression signal, emitted on
-    # EVERY run whatever the outcome. Placed BEFORE the digest stage so the
-    # numbers are reported even when a later stage fails loud and returns
-    # early. Its VISIBILITY depends on main()'s config.configure_logging()
-    # call -- the journal's root logger defaults to WARNING, so an INFO line
-    # nobody configured for is an INFO line nobody sees; the two halves are
-    # one contract.
-    budget_suppressed = not sample.selected and sample.budget_skipped > 0
-    suppression_escalated = _report_sample_outcome(
-        cfg, sample, target_date, poster=poster,
-    )
-
     # ONE recording point for all five return sites AND an unexpected
     # raise: a single try/finally cannot forget a branch, the way five
     # separate record calls could. Two load-bearing, non-obvious
@@ -1449,22 +1444,83 @@ def _run_configured_nightly(
     #     runs, so _record_trickle_progress mutating `result` in place
     #     is visible to the caller — that is how the barren-streak
     #     escalation flag reaches the returned NightlyResult.
-    # (2) The pre-seeded sentinel below is what the night already knows
-    #     when a stage raises. The `except` arm builds the crash result ON
-    #     it (_crashed_night), so the suppression facts and any escalation
-    #     already posted survive, and that crash result is what gets
-    #     RECORDED: exit_code=1, honest about the crash, with the real
-    #     sampler counters because `sample` was computed before the try.
-    #     Recording only on the happy path would let the progress probe
-    #     read a stale streak as healthy after repeated crashes.
+    # (2) The pre-seeded `result` and `sample` below are what the night
+    #     knows when a stage raises. The `except` arm builds the crash
+    #     result ON `result` (_crashed_night), so the suppression facts and
+    #     any escalation already posted survive, and that is what gets
+    #     RECORDED: exit_code=1, with zero counters if sampling never
+    #     returned and the real ones otherwise. Recording only on the happy
+    #     path would let the progress probe read a stale streak as healthy
+    #     after repeated crashes.
+    sample = _nothing_sampled()
     result = NightlyResult(
         exit_code=1,
-        budget_suppressed=budget_suppressed,
-        escalated=suppression_escalated,
         reason='legibility trickle run crashed before completing',
     )
     runner = None
     try:
+        if projects_root is None:
+            projects_root = DEFAULT_PROJECTS_ROOT
+        commit_fn = committer if committer is not None else _git_commit_docs_only
+        # Task 4148. The systemd path is `nightly.py run --project-id %i` ->
+        # main() -> run_nightly, and main() never built a fetcher -- so
+        # `status_fetcher=None` reached `compute_tasks_landed` on every real run
+        # and hit its `status_fetcher is None` arm (census_trigger.py:735-739;
+        # journal 2026-08-10/11/12), leaving condition (b) tasks-landed unable to
+        # fire at all. Every OTHER seam here already resolves None to its real
+        # implementation (committer -> _git_commit_docs_only above, recorder ->
+        # trickle_state.record_run, poster -> _default_poster); status_fetcher
+        # alone resolved to nothing, and that asymmetry is how three prior repairs
+        # of this same code (2953's 406 fix, 3291's baseline fix, 4085's fail-safe
+        # arms) each left the wiring loop open.
+        #
+        # Defaulted HERE rather than in main() because `cfg.project_root` is the
+        # first point in the chain where the ABSOLUTE root is known (config.py's
+        # validator guarantees absolute -- exactly what the MCP wire requires
+        # post-3291) while main() holds only --config/--project-id; and it is the
+        # identical value `evaluate_census_step` hands to `decide`, so the fetcher
+        # and the decision can never disagree about which project they are for.
+        # Deliberately NOT wrapped in try/except: the construction does no I/O
+        # (a resolve, an environ read, a returned closure), and every call-time
+        # failure is already fail-safe inside compute_tasks_landed.
+        #
+        # HAZARD, for whoever writes the next run_nightly test (amendment): this
+        # default is LIVE, so a test that seeds census-state.json with a valid
+        # non-negative `last_census_done_count` and injects no `status_fetcher`
+        # issues a REAL POST to $FUSED_MEMORY_MCP_URL (default localhost:8002) --
+        # and on a dev box where fused-memory is actually up, a stale fixture
+        # baseline against the real done-count can produce a genuine FIRE that
+        # subprocess-launches scripts/legibility/census.py (real LLM spend, real
+        # git writes). Such a test MUST fake httpx (conftest's install_fake_httpx)
+        # AND stub `_default_census_launcher`; see the task-4148 block in
+        # scripts/tests/test_legibility_nightly.py for the worked pattern.
+        status_fetcher = (
+            status_fetcher if status_fetcher is not None
+            else census_trigger.default_status_fetcher(cfg.project_root)
+        )
+
+        # One render cache for the whole run: select_digest_sessions renders each
+        # candidate to CHARGE it against the byte budget, and build_digests reuses
+        # that render instead of paying for it twice. Rendering is super-linear in
+        # signal-item count, so this is roughly a 2x on the job's dominant cost.
+        rendered: dict[tuple, str] = {}
+        sample = select_digest_sessions(cfg, projects_root, target_date, rendered=rendered)
+
+        # The operator's grep anchor plus the total-suppression signal, emitted on
+        # EVERY run whatever the outcome. Placed BEFORE the digest stage so the
+        # numbers are reported even when a later stage fails loud and returns
+        # early. Its VISIBILITY depends on main()'s config.configure_logging()
+        # call -- the journal's root logger defaults to WARNING, so an INFO line
+        # nobody configured for is an INFO line nobody sees; the two halves are
+        # one contract.
+        budget_suppressed = not sample.selected and sample.budget_skipped > 0
+        suppression_escalated = _report_sample_outcome(
+            cfg, sample, target_date, poster=poster,
+        )
+        result = replace(
+            result, budget_suppressed=budget_suppressed, escalated=suppression_escalated,
+        )
+
         # Task 5488's lesson: `invoke=None` -- what main() passes -- must
         # resolve to the real pooled invoker, never to nothing. ONE runner for
         # the whole night, because cap state lives in its gate and only there:
