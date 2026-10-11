@@ -114,6 +114,66 @@ def _meta(db_path: Path, key: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Schema shape, and the pre-leaf file the migration starts from
+# ---------------------------------------------------------------------------
+
+# The store's DDL before task 6772, verbatim: a historical fixture, not a copy
+# of anything live, so it must never be "kept in sync".
+_LEGACY_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS samples (
+    ts          INTEGER NOT NULL,
+    metric      TEXT    NOT NULL,
+    value       REAL    NOT NULL,
+    window_mean REAL,
+    window_max  REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_samples_metric_ts
+    ON samples (metric, ts);
+
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+"""
+
+_LegacyRow = tuple[int, str, float, float | None, float | None]
+
+
+def _legacy_store(db_path: Path, rows: list[_LegacyRow]) -> None:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executescript(_LEGACY_SCHEMA)
+        conn.executemany(
+            'INSERT INTO samples (ts, metric, value, window_mean, window_max)'
+            ' VALUES (?, ?, ?, ?, ?)',
+            rows,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _shape(db_path: Path) -> tuple[list[tuple], list[str]]:
+    """``samples``' columns as PRAGMA table_info reports them, and its index names."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        columns = conn.execute('PRAGMA table_info(samples)').fetchall()
+        indexes = sorted(row[1] for row in conn.execute('PRAGMA index_list(samples)'))
+    finally:
+        conn.close()
+    return columns, indexes
+
+
+def _all_rows(db_path: Path) -> list[tuple]:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute('SELECT * FROM samples ORDER BY rowid').fetchall()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Step-5 tests: schema creation, pragmas, insert, idempotent open
 # ---------------------------------------------------------------------------
 
@@ -136,31 +196,49 @@ class TestLoadSampleStoreSchema:
         assert 'samples' in tables
 
     def test_samples_table_columns(self, tmp_path: Path):
+        """``leaf`` is LAST: ADD COLUMN appends, so a migrated file matches a fresh one."""
         from sampler.store import LoadSampleStore
 
         db_path = tmp_path / 'load-samples.db'
         LoadSampleStore(db_path)
 
-        conn = sqlite3.connect(str(db_path))
-        cols = {row[1] for row in conn.execute('PRAGMA table_info(samples)').fetchall()}
-        conn.close()
-        assert cols == {'ts', 'metric', 'value', 'window_mean', 'window_max'}
+        columns, _indexes = _shape(db_path)
+        assert [c[1] for c in columns] == [
+            'ts', 'metric', 'value', 'window_mean', 'window_max', 'leaf'
+        ]
 
-    def test_idx_samples_metric_ts_exists(self, tmp_path: Path):
+    def test_the_single_index_is_metric_ts_leaf(self, tmp_path: Path):
         from sampler.store import LoadSampleStore
 
         db_path = tmp_path / 'load-samples.db'
         LoadSampleStore(db_path)
 
+        _columns, indexes = _shape(db_path)
+        assert indexes == ['idx_samples_metric_ts_leaf']
         conn = sqlite3.connect(str(db_path))
-        indexes = {
-            row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='index'"
-            ).fetchall()
-        }
-        conn.close()
-        assert 'idx_samples_metric_ts' in indexes
+        try:
+            indexed = [
+                row[2]
+                for row in conn.execute("PRAGMA index_info('idx_samples_metric_ts_leaf')")
+            ]
+        finally:
+            conn.close()
+        assert indexed == ['metric', 'ts', 'leaf']
+
+    def test_SCHEMA_on_a_blank_file_has_the_shape_the_store_creates(self, tmp_path: Path):
+        """Every consumer fixture builds from ``SCHEMA``, so it must BE the store's DDL."""
+        from sampler.store import SCHEMA, LoadSampleStore
+
+        from_schema = tmp_path / 'from-schema.db'
+        conn = sqlite3.connect(str(from_schema))
+        try:
+            conn.executescript(SCHEMA)
+        finally:
+            conn.close()
+        from_store = tmp_path / 'from-store.db'
+        LoadSampleStore(from_store)
+
+        assert _shape(from_schema) == _shape(from_store)
 
     def test_wal_mode(self, tmp_path: Path):
         from sampler.store import LoadSampleStore
@@ -247,6 +325,118 @@ class TestLoadSampleStoreSchema:
         # Must not raise even if parent dirs don't exist
         LoadSampleStore(db_path)
         assert db_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Task 6772: a pre-leaf file is migrated in place, whole or not at all
+# ---------------------------------------------------------------------------
+
+_LEGACY_ROWS: list[_LegacyRow] = [
+    (1_000_000, 'own_cpu_some10:a', 1.5, 1.0, 2.0),
+    (1_000_000, 'own_read_ok:a', 1.0, None, None),
+    (1_000_000, 'own_read_ok:weird:leaf.slice', 1.0, None, None),
+    (1_000_000, 'psi_cpu_some_avg10', 2.0, None, None),
+    (1_000_000, 'runqueue_ratio', 3.0, None, None),
+]
+
+
+class TestLeafMigration:
+    def test_a_legacy_file_is_migrated_in_place(self, tmp_path: Path):
+        from sampler.store import LoadSampleStore
+
+        legacy = tmp_path / 'legacy.db'
+        _legacy_store(legacy, _LEGACY_ROWS)
+        fresh = tmp_path / 'fresh.db'
+        LoadSampleStore(fresh)
+
+        LoadSampleStore(legacy)
+
+        conn = sqlite3.connect(str(legacy))
+        try:
+            rows = conn.execute(
+                'SELECT metric, leaf, value, window_mean, window_max'
+                ' FROM samples ORDER BY rowid'
+            ).fetchall()
+            still_encoded = conn.execute(
+                "SELECT COUNT(*) FROM samples WHERE instr(metric, ':') > 0"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert rows == [
+            ('own_cpu_some10', 'a', 1.5, 1.0, 2.0),
+            ('own_read_ok', 'a', 1.0, None, None),
+            # Only the FIRST ':' splits: the leaf is everything after it.
+            ('own_read_ok', 'weird:leaf.slice', 1.0, None, None),
+            ('psi_cpu_some_avg10', None, 2.0, None, None),
+            ('runqueue_ratio', None, 3.0, None, None),
+        ]
+        assert still_encoded == 0
+        assert _shape(legacy) == _shape(fresh), (
+            'a migrated file must be indistinguishable in shape from a fresh one, '
+            'idx_samples_metric_ts dropped and idx_samples_metric_ts_leaf built'
+        )
+
+    def test_reopening_is_a_no_op_in_every_starting_state(self, tmp_path: Path):
+        from sampler.store import SCHEMA, LoadSampleStore
+
+        fresh = tmp_path / 'fresh.db'
+        LoadSampleStore(fresh)
+        legacy = tmp_path / 'legacy.db'
+        _legacy_store(legacy, _LEGACY_ROWS)
+        LoadSampleStore(legacy)
+        built_from_schema = tmp_path / 'built-from-schema.db'
+        conn = sqlite3.connect(str(built_from_schema))
+        try:
+            conn.executescript(SCHEMA)
+            conn.execute(
+                'INSERT INTO samples (ts, metric, leaf, value) VALUES (?, ?, ?, ?)',
+                (1_000_000, 'own_cpu_some10', 'a', 1.5),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        LoadSampleStore(built_from_schema)
+
+        files = (fresh, legacy, built_from_schema)
+        shapes = {path.name: _shape(path) for path in files}
+        for path in files:
+            before = _all_rows(path)
+            spy = ConnectSpy()
+
+            LoadSampleStore(path, connect=spy)
+
+            assert _all_rows(path) == before, f'reopening {path.name} changed its rows'
+            assert _shape(path) == shapes[path.name]
+            rewrites = [
+                sql
+                for sql in spy.executed
+                if sql.lstrip().upper().startswith(('ALTER', 'UPDATE', 'DROP INDEX'))
+            ]
+            assert rewrites == [], f'reopening {path.name} rewrote it again: {rewrites}'
+        assert len({repr(shape) for shape in shapes.values()}) == 1, shapes
+
+    def test_a_migration_that_fails_midway_leaves_the_file_untouched(self, tmp_path: Path):
+        """The ADD COLUMN, the split, and the index swap commit together or not at all."""
+        from sampler.store import LoadSampleStore
+
+        legacy = tmp_path / 'legacy.db'
+        _legacy_store(legacy, _LEGACY_ROWS)
+        legacy_shape = _shape(legacy)
+
+        with pytest.raises(sqlite3.Error):
+            LoadSampleStore(legacy, connect=ConnectSpy(fails=_statements_starting('UPDATE')))
+
+        columns, indexes = _shape(legacy)
+        assert 'leaf' not in [c[1] for c in columns], 'the ADD COLUMN outlived the failure'
+        assert indexes == ['idx_samples_metric_ts']
+        assert (columns, indexes) == legacy_shape
+        assert _all_rows(legacy) == _LEGACY_ROWS, 'rows were rewritten by a failed migration'
+
+        LoadSampleStore(legacy)
+
+        columns, indexes = _shape(legacy)
+        assert columns[-1][1] == 'leaf', 'the next construction did not retry the migration'
+        assert indexes == ['idx_samples_metric_ts_leaf']
 
 
 # ---------------------------------------------------------------------------
@@ -605,9 +795,9 @@ class TestThirtyDayRetention:
 class TestCleanupIsIntervalGated:
     """Why this gate exists, pinned so it cannot be "simplified" away.
 
-    `DELETE FROM samples WHERE ts < ?` cannot use idx_samples_metric_ts(metric,
-    ts) — a leading-column index does not serve a bare-ts predicate — so every
-    call is a full table SCAN. Measured at 2.5M rows, a NO-OP cleanup (nothing
+    The retention DELETE cannot use idx_samples_metric_ts_leaf(metric, ts,
+    leaf) — a leading-column index does not serve a bare-ts predicate — so
+    every call is a full table SCAN. Measured at 2.5M rows, a NO-OP cleanup (nothing
     old enough to delete) costs 106.7 ms; extrapolated to the 12.96M-row
     30-day steady state that is ~550 ms every 5 s, forever, to delete nothing.
 
@@ -621,7 +811,7 @@ class TestCleanupIsIntervalGated:
     weight, so exactly one is taken.
     """
 
-    def test_the_delete_predicate_really_is_a_full_scan(self, tmp_path: Path):
+    def test_the_cleanup_delete_is_still_a_full_scan(self, tmp_path: Path):
         """The measured fact the gate is the answer to — read off the schema."""
         from sampler.store import LoadSampleStore
 
@@ -633,7 +823,8 @@ class TestCleanupIsIntervalGated:
             plan = ' '.join(
                 str(row[3])
                 for row in conn.execute(
-                    'EXPLAIN QUERY PLAN DELETE FROM samples WHERE ts < ?', (0,)
+                    'EXPLAIN QUERY PLAN DELETE FROM samples WHERE ts < ? OR ts > ?',
+                    (0, 0),
                 ).fetchall()
             )
         finally:
@@ -642,8 +833,8 @@ class TestCleanupIsIntervalGated:
         assert 'SCAN samples' in plan, plan
         assert 'USING INDEX' not in plan, plan
 
-    def test_trailing_windows_query_is_index_backed_and_untouched(self, tmp_path: Path):
-        """The counterpart: this one IS served by the existing index."""
+    def test_trailing_windows_query_is_index_backed(self, tmp_path: Path):
+        """The counterpart: a per-(metric, leaf) window read IS served by the index."""
         from sampler.store import LoadSampleStore
 
         db_path = tmp_path / 'db.sqlite'
@@ -655,14 +846,15 @@ class TestCleanupIsIntervalGated:
                 str(row[3])
                 for row in conn.execute(
                     'EXPLAIN QUERY PLAN SELECT value FROM samples'
-                    ' WHERE metric = ? ORDER BY ts DESC LIMIT ?',
-                    ('runqueue_ratio', 59),
+                    ' WHERE metric = ? AND leaf IS ? ORDER BY ts DESC LIMIT ?',
+                    ('own_cpu_some10', 'a.service', 59),
                 ).fetchall()
             )
         finally:
             conn.close()
 
-        assert 'USING INDEX idx_samples_metric_ts' in plan, plan
+        assert 'USING INDEX idx_samples_metric_ts_leaf' in plan, plan
+        assert 'TEMP B-TREE' not in plan, plan
 
     def test_virgin_store_is_due_and_running_prunes_and_stamps(self, tmp_path: Path):
         from sampler.store import LoadSampleStore
