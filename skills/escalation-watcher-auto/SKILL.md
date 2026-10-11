@@ -149,7 +149,8 @@ result = mcp__escalation__promote_to_l2(
 #          {'error': ..., 'code': 'eval_lane_contained'}  (nothing minted)
 #   or, with severity omitted over a cluster whose members are ALL info, the refusal
 #          {'status': 'refused', 'code': 'info_only_cluster', 'members': [...],
-#           'derived_severity': 'info'}  (nothing minted, nothing folded into an existing L2)
+#           'unusable': [...], 'derived_severity': 'info'}
+#          (nothing minted, nothing folded into an existing L2)
 ```
 
 An `info_only_cluster` refusal is handled by the [info-only cluster rung](#info-only-cluster-info_only_cluster) below.
@@ -186,11 +187,16 @@ An `eval_lane_contained` refusal is final for the eval-lane records it names: cl
 
 ### Info-only cluster (`info_only_cluster`)
 
-A refusal with `code: 'info_only_cluster'` means every member you named is
-informational, so the cluster does not belong in the human queue. Take exactly
-one of two paths:
+A refusal with `code: 'info_only_cluster'` means every member the server could
+read is informational, so the cluster does not belong in the human queue. Its
+`members` lists exactly those info records; `unusable` lists the ids you named
+that contributed nothing — a phantom id, or a record with an out-of-vocabulary
+severity. Never close an `unusable` id under this rung: a phantom has no record,
+and an out-of-vocabulary record is triaged on its own merits. Take exactly one
+of two paths:
 
-1. **Close the members at L1 with a digest** — the default. For each member:
+1. **Close the members at L1 with a digest** — the default. For each id in
+   `members`:
 
    ```
    mcp__escalation__resolve_issue(

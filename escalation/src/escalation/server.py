@@ -221,6 +221,28 @@ def _derive_l2_severity(members: dict[str, Escalation | None]) -> str | None:
     return derived
 
 
+def _info_only_refusal(members: dict[str, Escalation | None]) -> dict[str, Any]:
+    """The ``info_only_cluster`` refusal for a cluster that derived ``'info'``.
+
+    The refusal's ``members`` key names only the records the derivation used —
+    each one ``'info'``, so each is safe to close at L1.  Every other id goes
+    to ``unusable``: a phantom id has no record to close, and an
+    out-of-vocabulary severity is not known to be informational.  The
+    *members* argument is :func:`_read_members`' answer.
+    """
+    info_ids = [
+        mid for mid, member in members.items()
+        if member is not None and member.severity == 'info'
+    ]
+    return {
+        'status': 'refused',
+        'code': 'info_only_cluster',
+        'members': info_ids,
+        'unusable': [mid for mid in members if mid not in info_ids],
+        'derived_severity': 'info',
+    }
+
+
 def _sentinel_bound_task_ids(members: dict[str, Escalation | None]) -> frozenset[str]:
     """Return the task ids a promote of *members* must be minted under, or empty if unconstrained.
 
@@ -3368,7 +3390,9 @@ def create_server(
         ``'info'``; nothing is minted and nothing is folded)::
 
             {'status': 'refused', 'code': 'info_only_cluster',
-             'members': [<member_ids, de-duplicated>],
+             'members': [<the info members the derivation used>],
+             'unusable': [<ids that did not resolve, or carry an
+                           out-of-vocabulary severity>],
              'derived_severity': 'info'}
 
         Error::
@@ -3476,6 +3500,7 @@ def create_server(
                 members = _read_members(queue, member_ids)
                 derived = None if severity is not None else _derive_l2_severity(members)
                 return (
+                    members,
                     derived,
                     queue.find_pending_l2_by_root_cause(root_cause),
                     _sentinel_bound_task_ids(members),
@@ -3483,7 +3508,7 @@ def create_server(
                 )
 
             (
-                derived, existing_id, required_task_ids, eval_lane_members,
+                members, derived, existing_id, required_task_ids, eval_lane_members,
             ) = await asyncio.to_thread(_read_for_promote)
 
             if eval_lane_members:
@@ -3507,12 +3532,7 @@ def create_server(
                     'root_cause=%r; members=%s',
                     task_id, root_cause, member_ids,
                 )
-                return {
-                    'status': 'refused',
-                    'code': 'info_only_cluster',
-                    'members': list(dict.fromkeys(member_ids)),
-                    'derived_severity': 'info',
-                }
+                return _info_only_refusal(members)
 
             # CREATE must land on some severity, so an underivable set fails safe
             # UP to 'blocking' — unchanged from before task 3976.

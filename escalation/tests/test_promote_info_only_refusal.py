@@ -98,6 +98,7 @@ async def test_silent_all_info_promote_is_refused(queue, server, member_ids):
         'status': 'refused',
         'code': 'info_only_cluster',
         'members': distinct,
+        'unusable': [],
         'derived_severity': 'info',
     }
     assert _level_two_records(queue) == []
@@ -105,6 +106,21 @@ async def test_silent_all_info_promote_is_refused(queue, server, member_ids):
         member = queue.get(esc_id)
         assert member is not None
         assert (member.status, member.level, member.severity) == ('pending', 1, 'info')
+
+
+@pytest.mark.asyncio
+async def test_refusal_lists_only_the_info_members_it_derived_from(queue, server):
+    _seed_member(queue, 'esc-info-1', severity='info')
+    _seed_member(queue, 'esc-corrupt-2', severity='warn')
+
+    result = await call_promote(
+        server, **_promote_args(['esc-phantom-1', 'esc-info-1', 'esc-corrupt-2']),
+    )
+
+    assert result['code'] == 'info_only_cluster', result
+    assert result['members'] == ['esc-info-1']
+    assert result['unusable'] == ['esc-phantom-1', 'esc-corrupt-2']
+    assert _level_two_records(queue) == []
 
 
 @pytest.mark.asyncio
