@@ -73,6 +73,7 @@ PURE_STDLIB_LEAVES = (
     'neutral_cwd',
     'proc_group',
     'process_identity',
+    'project_id',
     'project_layout',
     'psi',
     'pytest_jobserver',
