@@ -24,6 +24,11 @@ class KeyedStreaks(Generic[K]):
     """Per-key consecutive-failure counts; only keys in a live failure run hold state."""
 
     def __init__(self, *, threshold: int) -> None:
+        if isinstance(threshold, bool) or not isinstance(threshold, int) or threshold < 1:
+            raise ValueError(
+                'KeyedStreaks threshold must be an int >= 1 so a run of failures '
+                f'can reach it; got threshold={threshold!r}'
+            )
         self._threshold = threshold
         self._counts: dict[K, int] = {}
 
