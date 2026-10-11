@@ -1365,6 +1365,13 @@ def run_nightly(
         return _crashed_night(cfg, exc, poster=poster)
 
 
+def _nothing_sampled() -> sampling.SampleResult:
+    """The counters of a night whose sampling never returned."""
+    return sampling.SampleResult(
+        selected=[], per_stratum_counts={}, zero_signal_dropped=0, bytes_used=0,
+    )
+
+
 def _run_configured_nightly(
     cfg: LegibilityConfig,
     resolved_config_path: Path,
@@ -1381,64 +1388,6 @@ def _run_configured_nightly(
     """:func:`run_nightly`'s pass once *cfg* has loaded."""
     if target_date is None:
         target_date = (datetime.now(UTC) - timedelta(days=1)).date()
-    if projects_root is None:
-        projects_root = DEFAULT_PROJECTS_ROOT
-    commit_fn = committer if committer is not None else _git_commit_docs_only
-    # Task 4148. The systemd path is `nightly.py run --project-id %i` ->
-    # main() -> run_nightly, and main() never built a fetcher -- so
-    # `status_fetcher=None` reached `compute_tasks_landed` on every real run
-    # and hit its `status_fetcher is None` arm (census_trigger.py:735-739;
-    # journal 2026-08-10/11/12), leaving condition (b) tasks-landed unable to
-    # fire at all. Every OTHER seam here already resolves None to its real
-    # implementation (committer -> _git_commit_docs_only above, recorder ->
-    # trickle_state.record_run, poster -> _default_poster); status_fetcher
-    # alone resolved to nothing, and that asymmetry is how three prior repairs
-    # of this same code (2953's 406 fix, 3291's baseline fix, 4085's fail-safe
-    # arms) each left the wiring loop open.
-    #
-    # Defaulted HERE rather than in main() because `cfg.project_root` is the
-    # first point in the chain where the ABSOLUTE root is known (config.py's
-    # validator guarantees absolute -- exactly what the MCP wire requires
-    # post-3291) while main() holds only --config/--project-id; and it is the
-    # identical value `evaluate_census_step` hands to `decide`, so the fetcher
-    # and the decision can never disagree about which project they are for.
-    # Deliberately NOT wrapped in try/except: the construction does no I/O
-    # (a resolve, an environ read, a returned closure), and every call-time
-    # failure is already fail-safe inside compute_tasks_landed.
-    #
-    # HAZARD, for whoever writes the next run_nightly test (amendment): this
-    # default is LIVE, so a test that seeds census-state.json with a valid
-    # non-negative `last_census_done_count` and injects no `status_fetcher`
-    # issues a REAL POST to $FUSED_MEMORY_MCP_URL (default localhost:8002) --
-    # and on a dev box where fused-memory is actually up, a stale fixture
-    # baseline against the real done-count can produce a genuine FIRE that
-    # subprocess-launches scripts/legibility/census.py (real LLM spend, real
-    # git writes). Such a test MUST fake httpx (conftest's install_fake_httpx)
-    # AND stub `_default_census_launcher`; see the task-4148 block in
-    # scripts/tests/test_legibility_nightly.py for the worked pattern.
-    status_fetcher = (
-        status_fetcher if status_fetcher is not None
-        else census_trigger.default_status_fetcher(cfg.project_root)
-    )
-
-    # One render cache for the whole run: select_digest_sessions renders each
-    # candidate to CHARGE it against the byte budget, and build_digests reuses
-    # that render instead of paying for it twice. Rendering is super-linear in
-    # signal-item count, so this is roughly a 2x on the job's dominant cost.
-    rendered: dict[tuple, str] = {}
-    sample = select_digest_sessions(cfg, projects_root, target_date, rendered=rendered)
-
-    # The operator's grep anchor plus the total-suppression signal, emitted on
-    # EVERY run whatever the outcome. Placed BEFORE the digest stage so the
-    # numbers are reported even when a later stage fails loud and returns
-    # early. Its VISIBILITY depends on main()'s config.configure_logging()
-    # call -- the journal's root logger defaults to WARNING, so an INFO line
-    # nobody configured for is an INFO line nobody sees; the two halves are
-    # one contract.
-    budget_suppressed = not sample.selected and sample.budget_skipped > 0
-    suppression_escalated = _report_sample_outcome(
-        cfg, sample, target_date, poster=poster,
-    )
 
     # ONE recording point for all five return sites AND an unexpected
     # raise: a single try/finally cannot forget a branch, the way five
@@ -1449,22 +1398,83 @@ def _run_configured_nightly(
     #     runs, so _record_trickle_progress mutating `result` in place
     #     is visible to the caller — that is how the barren-streak
     #     escalation flag reaches the returned NightlyResult.
-    # (2) The pre-seeded sentinel below is what the night already knows
-    #     when a stage raises. The `except` arm builds the crash result ON
-    #     it (_crashed_night), so the suppression facts and any escalation
-    #     already posted survive, and that crash result is what gets
-    #     RECORDED: exit_code=1, honest about the crash, with the real
-    #     sampler counters because `sample` was computed before the try.
-    #     Recording only on the happy path would let the progress probe
-    #     read a stale streak as healthy after repeated crashes.
+    # (2) The pre-seeded `result` and `sample` below are what the night
+    #     knows when a stage raises. The `except` arm builds the crash
+    #     result ON `result` (_crashed_night), so the suppression facts and
+    #     any escalation already posted survive, and that is what gets
+    #     RECORDED: exit_code=1, with zero counters if sampling never
+    #     returned and the real ones otherwise. Recording only on the happy
+    #     path would let the progress probe read a stale streak as healthy
+    #     after repeated crashes.
+    sample = _nothing_sampled()
     result = NightlyResult(
         exit_code=1,
-        budget_suppressed=budget_suppressed,
-        escalated=suppression_escalated,
         reason='legibility trickle run crashed before completing',
     )
     runner = None
     try:
+        if projects_root is None:
+            projects_root = DEFAULT_PROJECTS_ROOT
+        commit_fn = committer if committer is not None else _git_commit_docs_only
+        # Task 4148. The systemd path is `nightly.py run --project-id %i` ->
+        # main() -> run_nightly, and main() never built a fetcher -- so
+        # `status_fetcher=None` reached `compute_tasks_landed` on every real run
+        # and hit its `status_fetcher is None` arm (census_trigger.py:735-739;
+        # journal 2026-08-10/11/12), leaving condition (b) tasks-landed unable to
+        # fire at all. Every OTHER seam here already resolves None to its real
+        # implementation (committer -> _git_commit_docs_only above, recorder ->
+        # trickle_state.record_run, poster -> _default_poster); status_fetcher
+        # alone resolved to nothing, and that asymmetry is how three prior repairs
+        # of this same code (2953's 406 fix, 3291's baseline fix, 4085's fail-safe
+        # arms) each left the wiring loop open.
+        #
+        # Defaulted HERE rather than in main() because `cfg.project_root` is the
+        # first point in the chain where the ABSOLUTE root is known (config.py's
+        # validator guarantees absolute -- exactly what the MCP wire requires
+        # post-3291) while main() holds only --config/--project-id; and it is the
+        # identical value `evaluate_census_step` hands to `decide`, so the fetcher
+        # and the decision can never disagree about which project they are for.
+        # Deliberately NOT wrapped in try/except: the construction does no I/O
+        # (a resolve, an environ read, a returned closure), and every call-time
+        # failure is already fail-safe inside compute_tasks_landed.
+        #
+        # HAZARD, for whoever writes the next run_nightly test (amendment): this
+        # default is LIVE, so a test that seeds census-state.json with a valid
+        # non-negative `last_census_done_count` and injects no `status_fetcher`
+        # issues a REAL POST to $FUSED_MEMORY_MCP_URL (default localhost:8002) --
+        # and on a dev box where fused-memory is actually up, a stale fixture
+        # baseline against the real done-count can produce a genuine FIRE that
+        # subprocess-launches scripts/legibility/census.py (real LLM spend, real
+        # git writes). Such a test MUST fake httpx (conftest's install_fake_httpx)
+        # AND stub `_default_census_launcher`; see the task-4148 block in
+        # scripts/tests/test_legibility_nightly.py for the worked pattern.
+        status_fetcher = (
+            status_fetcher if status_fetcher is not None
+            else census_trigger.default_status_fetcher(cfg.project_root)
+        )
+
+        # One render cache for the whole run: select_digest_sessions renders each
+        # candidate to CHARGE it against the byte budget, and build_digests reuses
+        # that render instead of paying for it twice. Rendering is super-linear in
+        # signal-item count, so this is roughly a 2x on the job's dominant cost.
+        rendered: dict[tuple, str] = {}
+        sample = select_digest_sessions(cfg, projects_root, target_date, rendered=rendered)
+
+        # The operator's grep anchor plus the total-suppression signal, emitted on
+        # EVERY run whatever the outcome. Placed BEFORE the digest stage so the
+        # numbers are reported even when a later stage fails loud and returns
+        # early. Its VISIBILITY depends on main()'s config.configure_logging()
+        # call -- the journal's root logger defaults to WARNING, so an INFO line
+        # nobody configured for is an INFO line nobody sees; the two halves are
+        # one contract.
+        budget_suppressed = not sample.selected and sample.budget_skipped > 0
+        suppression_escalated = _report_sample_outcome(
+            cfg, sample, target_date, poster=poster,
+        )
+        result = replace(
+            result, budget_suppressed=budget_suppressed, escalated=suppression_escalated,
+        )
+
         # Task 5488's lesson: `invoke=None` -- what main() passes -- must
         # resolve to the real pooled invoker, never to nothing. ONE runner for
         # the whole night, because cap state lives in its gate and only there:
