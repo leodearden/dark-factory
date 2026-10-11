@@ -47,7 +47,7 @@ from fused_memory.models.scope import Scope
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.server.topic_cluster_store import TopicClusterStore, derive_topic_cluster
 from fused_memory.services.memory_service import RRF_K
-from fused_memory.utils.clip_disclosure import TRUNCATED_KEY
+from fused_memory.utils.clip_disclosure import TRUNCATION_FACTS_KEY
 
 _PROJECT_ID = 'dark_factory'
 _CONTENT = 'canonical .task gitignore gotcha'
@@ -1481,7 +1481,7 @@ class TestAddMemoryGuardBlocksDiscloseTheirExcerptClip:
     ``near_duplicate_guard`` owns the excerpt shape every pre-service guard
     spreads, so this pins it at the tool boundary for the near-duplicate gate
     and for one recon-stage gate in ``server/tools.py``: the excerpt stays
-    ``content[:200]``, and a ``truncated`` list says what was cut.
+    ``content[:200]``, and a ``truncation_facts`` list says what was cut.
     """
 
     @pytest.mark.asyncio
@@ -1497,7 +1497,7 @@ class TestAddMemoryGuardBlocksDiscloseTheirExcerptClip:
         assert result.get('error_type') == 'ProceduralKnowledgeNearDuplicateWriteRejected', result
         assert result['content_excerpt'] == content[:200], result
         assert result['matched_excerpt'] == matched.content[:200], result
-        assert result[TRUNCATED_KEY] == [
+        assert result[TRUNCATION_FACTS_KEY] == [
             {'field': 'content_excerpt', 'cap': 200, 'elided': len(content) - 200},
             {'field': 'matched_excerpt', 'cap': 200, 'elided': len(matched.content) - 200},
         ], result
@@ -1517,7 +1517,7 @@ class TestAddMemoryGuardBlocksDiscloseTheirExcerptClip:
 
         assert result.get('error') == 'count_snapshot_write_blocked', result
         assert result['content_excerpt'] == _LONG_SNAPSHOT_CONTENT[:200], result
-        assert result[TRUNCATED_KEY] == [
+        assert result[TRUNCATION_FACTS_KEY] == [
             {
                 'field': 'content_excerpt',
                 'cap': 200,
@@ -1527,7 +1527,7 @@ class TestAddMemoryGuardBlocksDiscloseTheirExcerptClip:
         mock_service.add_memory.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_an_uncut_rejection_carries_no_truncated_key(self):
+    async def test_an_uncut_rejection_carries_no_truncation_facts(self):
         mock_service = AsyncMock()
         mock_service.search.return_value = [_near_duplicate_result()]
         server = create_mcp_server(mock_service)
@@ -1535,4 +1535,4 @@ class TestAddMemoryGuardBlocksDiscloseTheirExcerptClip:
         result = await _add(server, _CONTENT)
 
         assert result.get('error_type') == 'ProceduralKnowledgeNearDuplicateWriteRejected', result
-        assert TRUNCATED_KEY not in result, result
+        assert TRUNCATION_FACTS_KEY not in result, result

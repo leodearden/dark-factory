@@ -1532,13 +1532,13 @@ class TestTheRetrievedCandidatesReachTheJudge:
 
 
 class TestTheDecisionDisclosesClippedCandidates:
-    """A decision says when retrieval filled its width and when the judge saw a trimmed slate."""
+    """A decision says when retrieval may have cut in-band candidates and when the judge saw a trimmed slate."""
 
-    _RETRIEVAL_FACT = {'field': 'triage_candidates', 'cap': 3, 'elided': None}
+    _RETRIEVAL_FACT = TruncationFact(field='triage_candidates', cap=3, elided=None)
 
     @staticmethod
-    def _service(results) -> types.SimpleNamespace:
-        service = _svc(enabled=True, t_high=T_HIGH, t_low=T_LOW, candidate_k=3)
+    def _service(results, *, t_low: float | None = T_LOW) -> types.SimpleNamespace:
+        service = _svc(enabled=True, t_high=T_HIGH, t_low=t_low, candidate_k=3)
         service.search = AsyncMock(return_value=SearchResults(results))
         return service
 
@@ -1549,34 +1549,57 @@ class TestTheDecisionDisclosesClippedCandidates:
             counter=TriageFailOpenCounter(time_provider=_Clock()), judge=judge,
         )
 
+    @staticmethod
+    def _results(*scores: float | None) -> list[MemoryResult]:
+        return [_result(f'm{i}', score, omit_store_score=score is None) for i, score in enumerate(scores)]
+
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('score', [0.99, 0.10], ids=['restated', 'stored'])
-    async def test_a_retrieval_that_fills_candidate_k_says_so(self, score: float) -> None:
-        results = [_result(f'm{i}', score - i / 1000) for i in range(3)]
+    @pytest.mark.parametrize(
+        'scores',
+        [(0.99, 0.98, 0.97), (0.99, 0.80, T_LOW), (0.99, 0.98, None)],
+        ids=['all-high', 'weakest-exactly-t_low', 'uncomparable-ignored'],
+    )
+    async def test_a_full_retrieval_still_in_band_at_its_weakest_says_so(self, scores) -> None:
+        decision = await self._triage(self._service(self._results(*scores)))
 
-        decision = await self._triage(self._service(results))
+        assert decision.truncation_facts == (self._RETRIEVAL_FACT,)
 
-        assert decision.truncated == (self._RETRIEVAL_FACT,)
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'scores',
+        [(0.99, 0.98, T_LOW - 0.01), (0.30, 0.20, 0.10), (None, None, None)],
+        ids=['restated-tail-below-band', 'stored', 'nothing-comparable'],
+    )
+    async def test_a_full_retrieval_cut_below_the_band_reports_nothing(self, scores) -> None:
+        decision = await self._triage(self._service(self._results(*scores)))
+
+        assert decision.truncation_facts == ()
+
+    @pytest.mark.asyncio
+    async def test_an_uncalibrated_band_reports_nothing(self) -> None:
+        decision = await self._triage(self._service(self._results(0.99, 0.98, 0.97), t_low=None))
+
+        assert decision.truncation_facts == ()
 
     @pytest.mark.asyncio
     async def test_a_retrieval_under_candidate_k_reports_nothing(self) -> None:
-        decision = await self._triage(self._service([_result('m0', 0.99), _result('m1', 0.98)]))
+        decision = await self._triage(self._service(self._results(0.99, 0.98)))
 
-        assert decision.truncated == ()
+        assert decision.truncation_facts == ()
 
     @pytest.mark.asyncio
     async def test_a_judged_decision_carries_the_judges_facts_too(self) -> None:
         judge_fact = TruncationFact(field='judge_candidates', cap=2, elided=1)
 
         async def _judge(**_kwargs):
-            return TriageJudgeVerdict(OUTCOME_RESTATED, 'm0', truncated=(judge_fact,))
+            return TriageJudgeVerdict(OUTCOME_RESTATED, 'm0', truncation_facts=(judge_fact,))
 
         results = [_result(f'm{i}', 0.75 - i / 1000) for i in range(3)]
 
         decision = await self._triage(self._service(results), judge=_judge)
 
         assert decision.outcome == OUTCOME_RESTATED
-        assert decision.truncated == (self._RETRIEVAL_FACT, judge_fact)
+        assert decision.truncation_facts == (self._RETRIEVAL_FACT, judge_fact)
 
 
 # ---------------------------------------------------------------------------

@@ -38,7 +38,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fused_memory.server.near_duplicate_guard import excerpt_fields
+from fused_memory.server.guard_excerpt import excerpt_fields
 from fused_memory.utils.canonical_labels import scan_content
 from fused_memory.utils.referent_resolution import ReferentSet, resolve_referents
 from fused_memory.utils.validation import InputValidationError

@@ -1120,7 +1120,7 @@ def _cancelled_section_lines(output: str) -> list[str]:
 
 
 class TestRetainedCapDisclosure:
-    """The done/cancelled retained caps say what they clipped, in the payload text."""
+    """The done/cancelled retained caps name the window they show, in the payload text."""
 
     def _tree(self, *, cancelled: int = 0, done: int = 0) -> FilteredTaskTree:
         tasks = [_make_task(1, 'pending')]
@@ -1128,16 +1128,20 @@ class TestRetainedCapDisclosure:
         tasks += [_make_task(1000 + i, 'done') for i in range(done)]
         return filter_task_tree({'tasks': tasks})
 
-    def test_cancelled_section_ends_with_a_clip_note_over_the_cap(self):
-        output = format_filtered_task_tree(self._tree(cancelled=MAX_CANCELLED_TASKS_RETAINED + 3))
+    def test_cancelled_section_ends_with_a_window_note_over_the_cap(self):
+        total = MAX_CANCELLED_TASKS_RETAINED + 3
+        output = format_filtered_task_tree(self._tree(cancelled=total))
 
         lines = _cancelled_section_lines(output)
         assert len([line for line in lines if line.startswith('- [')]) == MAX_CANCELLED_TASKS_RETAINED
         note = lines[-1]
-        assert note.startswith('_NOTE: 3 additional cancelled task(s) were omitted')
-        assert f'MAX_CANCELLED_TASKS_RETAINED={MAX_CANCELLED_TASKS_RETAINED} cap' in note
-        assert 'NOT complete this cycle' in note
-        assert 'the lowest-id (oldest) cancelled tasks were dropped first' in note
+        assert note.startswith(
+            f'_NOTE: showing the {MAX_CANCELLED_TASKS_RETAINED} highest-id (most recent) '
+            f'of {total} cancelled task(s)'
+        )
+        assert f'MAX_CANCELLED_TASKS_RETAINED={MAX_CANCELLED_TASKS_RETAINED}' in note
+        assert 'window by design' in note
+        assert 'this cycle' not in note
 
     @pytest.mark.parametrize('cancelled', [1, MAX_CANCELLED_TASKS_RETAINED])
     def test_cancelled_section_at_or_under_the_cap_carries_no_note(self, cancelled):
@@ -1154,16 +1158,20 @@ class TestRetainedCapDisclosure:
         assert '### Recently Cancelled Tasks' not in output
         assert '_NOTE:' not in output
 
-    def test_retained_done_tasks_over_the_cap_end_with_a_clip_note(self):
-        tree = self._tree(done=MAX_DONE_TASKS_RETAINED + 4)
+    def test_retained_done_tasks_over_the_cap_end_with_a_window_note(self):
+        total = MAX_DONE_TASKS_RETAINED + 4
+        tree = self._tree(done=total)
 
         rendered = render_retained_done_tasks(tree)
 
         list_part, note = rendered.rsplit('\n\n', 1)
         assert list_part == format_task_list(tree.done_tasks)
-        assert note.startswith('_NOTE: 4 additional done task(s) were omitted')
-        assert f'MAX_DONE_TASKS_RETAINED={MAX_DONE_TASKS_RETAINED} cap' in note
-        assert 'the lowest-id (oldest) done tasks were dropped first' in note
+        assert note.startswith(
+            f'_NOTE: showing the {MAX_DONE_TASKS_RETAINED} highest-id (most recent) of {total} done task(s)'
+        )
+        assert f'MAX_DONE_TASKS_RETAINED={MAX_DONE_TASKS_RETAINED}' in note
+        assert 'window by design' in note
+        assert 'this cycle' not in note
 
     @pytest.mark.parametrize('done', [0, 3, MAX_DONE_TASKS_RETAINED])
     def test_retained_done_tasks_at_or_under_the_cap_is_the_plain_list(self, done):

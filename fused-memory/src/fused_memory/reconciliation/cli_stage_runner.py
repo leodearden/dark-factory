@@ -18,7 +18,7 @@ from fused_memory.reconciliation.sandbox_guard import (
     RemediationSandboxUnavailable,
     resolve_recon_sandbox_wrap,
 )
-from fused_memory.utils.clip_disclosure import TRUNCATED_KEY, elide_text, truncation_facts
+from fused_memory.utils.clip_disclosure import elide_text, truncation_fields
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -825,9 +825,7 @@ _FALLBACK_SUMMARY_CHARS = 2000
 
 def _raw_text_fallback_report(output: str) -> dict:
     clip = elide_text(output, _FALLBACK_SUMMARY_CHARS, field='summary')
-    stats: dict[str, Any] = {RAW_TEXT_FALLBACK_STAT: True}
-    if facts := truncation_facts(clip):
-        stats[TRUNCATED_KEY] = facts
+    stats = {RAW_TEXT_FALLBACK_STAT: True, **truncation_fields(clip.fact)}
     return {'summary': clip.text, 'flagged_items': [], 'stats': stats}
 
 

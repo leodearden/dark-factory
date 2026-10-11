@@ -86,6 +86,7 @@ from fused_memory.server.write_triage_judge import (
     select_judge_candidates,
 )
 from fused_memory.services.memory_service import RRF_K, SearchResults
+from fused_memory.utils.clip_disclosure import TruncationFact
 
 
 def _payload(word: object, candidate_id: object = None) -> str:
@@ -1702,7 +1703,7 @@ class TestJudgeWriteDisclosesTheSlateTrim:
 
         verdict = await self._verdict(candidates, judge_candidate_count=3)
 
-        assert verdict.truncated == ({'field': 'judge_candidates', 'cap': 3, 'elided': 6},)
+        assert verdict.truncation_facts == (TruncationFact(field='judge_candidates', cap=3, elided=6),)
 
     @pytest.mark.asyncio
     async def test_uncomparable_candidates_are_not_counted_as_left_out(self) -> None:
@@ -1711,7 +1712,7 @@ class TestJudgeWriteDisclosesTheSlateTrim:
 
         verdict = await self._verdict(candidates, judge_candidate_count=3)
 
-        assert verdict.truncated == ({'field': 'judge_candidates', 'cap': 3, 'elided': 1},)
+        assert verdict.truncation_facts == (TruncationFact(field='judge_candidates', cap=3, elided=1),)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('comparable', [1, 3])
@@ -1720,7 +1721,7 @@ class TestJudgeWriteDisclosesTheSlateTrim:
 
         verdict = await self._verdict(candidates, judge_candidate_count=3)
 
-        assert verdict.truncated == ()
+        assert verdict.truncation_facts == ()
 
 
 class TestJudgeWriteDecisionsThatAreNotFailures:

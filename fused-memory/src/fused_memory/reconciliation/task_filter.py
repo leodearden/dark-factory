@@ -27,7 +27,7 @@ from typing import Any
 
 from shared.task_statuses import ACTIVE as ACTIVE_TASK_STATUSES
 
-from fused_memory.utils.clip_disclosure import clip_note
+from fused_memory.utils.clip_disclosure import window_note
 
 # --------------------------------------------------------------------------- #
 # Count-snapshot detection
@@ -1517,20 +1517,21 @@ def format_task_list(tasks: list[Any]) -> str:
     return '\n'.join(_render_task_line(t) for t in tasks if isinstance(t, dict)) or 'No tasks.'
 
 
-def _retained_clip_note(*, status: str, cap_name: str, cap: int, count: int, retained: list[dict]) -> str:
-    return clip_note(
-        omitted=count - len(retained),
-        omitted_noun=f'{status} task(s)',
+def _retained_window_note(*, status: str, cap_name: str, cap: int, count: int, retained: list[dict]) -> str:
+    return window_note(
+        shown=len(retained),
+        total=count,
+        noun=f'{status} task(s)',
+        window='highest-id (most recent)',
         cap_name=cap_name,
         cap=cap,
-        dropped_first=f'the lowest-id (oldest) {status} tasks',
     )
 
 
 def render_retained_done_tasks(tree: FilteredTaskTree) -> str:
-    """Render ``tree.done_tasks``, ending with a clip note when MAX_DONE_TASKS_RETAINED dropped some."""
+    """Render ``tree.done_tasks``, ending with a window note when MAX_DONE_TASKS_RETAINED left some out."""
     listing = format_task_list(tree.done_tasks)
-    note = _retained_clip_note(
+    note = _retained_window_note(
         status='done',
         cap_name='MAX_DONE_TASKS_RETAINED',
         cap=MAX_DONE_TASKS_RETAINED,
@@ -1609,7 +1610,7 @@ def _build_surrounding(
 
     if tree.cancelled_tasks:
         cancelled_lines = '\n'.join(_render_task_line(t) for t in tree.cancelled_tasks)
-        note = _retained_clip_note(
+        note = _retained_window_note(
             status='cancelled',
             cap_name='MAX_CANCELLED_TASKS_RETAINED',
             cap=MAX_CANCELLED_TASKS_RETAINED,
@@ -1858,8 +1859,8 @@ def format_filtered_task_tree(
       summary retains the format '{done_count} done, {cancelled_count}
       cancelled — omitted' for backward compatibility.
 
-    When MAX_CANCELLED_TASKS_RETAINED dropped cancelled tasks, the section ends
-    with a clip note saying how many.
+    When MAX_CANCELLED_TASKS_RETAINED left cancelled tasks out, the section ends
+    with a note naming the window it shows.
 
     The cancelled section is never truncated by the max_chars clamp — only
     active task lines are trimmed. The cancelled section length is subtracted

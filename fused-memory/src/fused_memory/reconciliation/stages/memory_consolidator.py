@@ -1663,9 +1663,13 @@ class MemoryConsolidator(BaseStage):
         episodes_str, ep_n = _format_episodes(new_episodes)
         memories_str, mem_n = _format_memories(new_memories)
         self._entity_summary_snapshot_lines_stripped = ep_n + mem_n
-        episodes_str = _append_note(episodes_str, fetch_cap_note(
-            fetched=len(episodes), noun='episode(s)', cap_name='episode_limit', cap=self.episode_limit,
-        ))
+        # Episodes arrive newest-first (undatable last), so one the watermark filter
+        # dropped proves nothing newer lay past the cap. mem0's get_all scrolls in
+        # point-id order, which proves nothing, so its note rests on the count alone.
+        if len(new_episodes) == len(episodes):
+            episodes_str = _append_note(episodes_str, fetch_cap_note(
+                fetched=len(episodes), noun='episode(s)', cap_name='episode_limit', cap=self.episode_limit,
+            ))
         memories_str = _append_note(memories_str, fetch_cap_note(
             fetched=len(mem0_memories), noun='memory record(s)', cap_name='memory_limit',
             cap=self.memory_limit,

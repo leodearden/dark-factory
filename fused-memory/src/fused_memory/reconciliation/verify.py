@@ -9,7 +9,7 @@ from shared.agent_result import extract_agent_verdict
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import VerificationResult, VerificationVerdict
 from fused_memory.reconciliation.agent_loop import AgentLoop, ToolDefinition
-from fused_memory.utils.clip_disclosure import TRUNCATED_KEY, elide_text, truncation_facts
+from fused_memory.utils.clip_disclosure import elide_text, truncation_fields
 
 logger = logging.getLogger(__name__)
 
@@ -378,10 +378,7 @@ class CodebaseVerifier:
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
                 clip = elide_text(stdout.decode(), _GIT_SHOW_CHARS, field='output')
-                result: dict = {'commit': commit, 'output': clip.text}
-                if facts := truncation_facts(clip):
-                    result[TRUNCATED_KEY] = facts
-                return result
+                return {'commit': commit, 'output': clip.text, **truncation_fields(clip.fact)}
             except Exception as e:
                 return {'error': str(e)}
 

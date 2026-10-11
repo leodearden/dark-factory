@@ -45,7 +45,7 @@ from fused_memory.server.near_duplicate_guard import (
 )
 from fused_memory.server.topic_cluster_store import TopicClusterStore
 from fused_memory.services.memory_service import RRF_K
-from fused_memory.utils.clip_disclosure import TRUNCATED_KEY
+from fused_memory.utils.clip_disclosure import TRUNCATION_FACTS_KEY
 
 # The real post-RRF relevance_score for a rank-1 hit on the guard's
 # single-store search(stores=['mem0'], limit=5) path — 1/(RRF_K + 1).
@@ -554,7 +554,7 @@ class TestGuardBlocksDiscloseTheirExcerptClip:
 
     The excerpt VALUES stay ``content[:200]`` with no inline marker, so every
     reader comparing them is untouched; the cut rides as a sibling
-    ``truncated`` list of ``{field, cap, elided}`` facts instead.
+    ``truncation_facts`` list of ``{field, cap, elided}`` dicts instead.
     """
 
     def test_a_near_duplicate_block_reports_both_cut_excerpts(self):
@@ -565,7 +565,7 @@ class TestGuardBlocksDiscloseTheirExcerptClip:
 
         assert block['content_excerpt'] == content[:200]
         assert block['matched_excerpt'] == match.content[:200]
-        assert block[TRUNCATED_KEY] == [
+        assert block[TRUNCATION_FACTS_KEY] == [
             {'field': 'content_excerpt', 'cap': 200, 'elided': 250},
             {'field': 'matched_excerpt', 'cap': 200, 'elided': 130},
         ]
@@ -576,7 +576,7 @@ class TestGuardBlocksDiscloseTheirExcerptClip:
         block = build_near_duplicate_block('agent', 'short content', match, 0.92)
 
         assert block['content_excerpt'] == 'short content'
-        assert block[TRUNCATED_KEY] == [
+        assert block[TRUNCATION_FACTS_KEY] == [
             {'field': 'matched_excerpt', 'cap': 200, 'elided': 130},
         ]
 
@@ -586,19 +586,19 @@ class TestGuardBlocksDiscloseTheirExcerptClip:
         block = build_topic_cluster_block('agent', content, _cluster(topic_id='t'), ['alpha'])
 
         assert block['content_excerpt'] == content[:200]
-        assert block[TRUNCATED_KEY] == [
+        assert block[TRUNCATION_FACTS_KEY] == [
             {'field': 'content_excerpt', 'cap': 200, 'elided': 300},
         ]
 
-    def test_an_uncut_block_carries_no_truncated_key(self):
+    def test_an_uncut_block_carries_no_truncation_facts(self):
         at_cap = 'x' * 200
         near_duplicate = build_near_duplicate_block(
             'agent', at_cap, _result('m1', 0.97, content=at_cap), 0.92
         )
         topic_cluster = build_topic_cluster_block('agent', at_cap, _cluster(topic_id='t'), ['a'])
 
-        assert TRUNCATED_KEY not in near_duplicate, near_duplicate
-        assert TRUNCATED_KEY not in topic_cluster, topic_cluster
+        assert TRUNCATION_FACTS_KEY not in near_duplicate, near_duplicate
+        assert TRUNCATION_FACTS_KEY not in topic_cluster, topic_cluster
 
 
 class TestMergeTopicClusters:

@@ -1155,7 +1155,7 @@ async def judge_write(
     verdict = parse_judge_verdict(reply.text, [candidate.id for candidate in selected])
     return verdict._replace(
         usage=reply.usage,
-        truncated=_slate_trim_facts(candidates, selected, candidate_count),
+        truncation_facts=_slate_trim_facts(candidates, selected, candidate_count),
     )
 
 

@@ -67,7 +67,7 @@ from fused_memory.server.write_triage import (
     TriageFailOpenCounter,
 )
 from fused_memory.services.memory_service import RRF_K, SearchResults
-from fused_memory.utils.clip_disclosure import TRUNCATED_KEY, TruncationFact
+from fused_memory.utils.clip_disclosure import TRUNCATION_FACTS_KEY, TruncationFact
 
 _PROJECT_ID = 'dark_factory'
 
@@ -1523,12 +1523,12 @@ class TestTheAckDisclosesClippedCandidates:
         result = await _call(server)
 
         assert result[ROUTED_KEY] == OUTCOME_RESTATED, f'{result!r}'
-        assert result[TRUNCATED_KEY] == [
+        assert result[TRUNCATION_FACTS_KEY] == [
             {'field': 'triage_candidates', 'cap': 1, 'elided': None},
         ], f'{result!r}'
 
     @pytest.mark.asyncio
-    async def test_every_fact_on_the_decision_reaches_the_ack_as_a_list(self, monkeypatch) -> None:
+    async def test_every_fact_on_the_decision_reaches_the_ack_as_plain_dicts(self, monkeypatch) -> None:
         facts = (
             TruncationFact(field='triage_candidates', cap=20, elided=None),
             TruncationFact(field='judge_candidates', cap=5, elided=15),
@@ -1537,13 +1537,16 @@ class TestTheAckDisclosesClippedCandidates:
         _configure_config(mock_service)
         _configure_pass_through_add_memory(mock_service)
         monkeypatch.setattr(tools, 'triage_write', AsyncMock(return_value=BandDecision(
-            OUTCOME_RESTATED, 'canonical-A', 0.95, _T_HIGH, _T_LOW, truncated=facts,
+            OUTCOME_RESTATED, 'canonical-A', 0.95, _T_HIGH, _T_LOW, truncation_facts=facts,
         )))
         server = create_mcp_server(mock_service)
 
         result = await _call(server)
 
-        assert result[TRUNCATED_KEY] == list(facts), f'{result!r}'
+        assert result[TRUNCATION_FACTS_KEY] == [
+            {'field': 'triage_candidates', 'cap': 20, 'elided': None},
+            {'field': 'judge_candidates', 'cap': 5, 'elided': 15},
+        ], f'{result!r}'
 
     @pytest.mark.asyncio
     async def test_a_decision_with_no_facts_adds_no_key(self) -> None:
@@ -1556,7 +1559,7 @@ class TestTheAckDisclosesClippedCandidates:
         result = await _call(server)
 
         assert result[ROUTED_KEY] == OUTCOME_RESTATED, f'{result!r}'
-        assert TRUNCATED_KEY not in result, f'{result!r}'
+        assert TRUNCATION_FACTS_KEY not in result, f'{result!r}'
 
 
 #: The judge as `tools.py` binds it, for `patch()`. Patched at the CONSUMER's

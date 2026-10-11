@@ -5,16 +5,26 @@ Named 'clip' because ``shared/cap_markers.py`` already owns 'cap' for CLI usage 
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TypedDict
+from dataclasses import asdict, dataclass
+from typing import Any
 
-TRUNCATED_KEY = 'truncated'
+# Not 'truncated': that response key already carries a bool elsewhere in fused-memory.
+TRUNCATION_FACTS_KEY = 'truncation_facts'
 
 
-class TruncationFact(TypedDict):
+@dataclass(frozen=True)
+class TruncationFact:
+    """``field`` was cut at ``cap``, losing ``elided``; ``None`` when a retrieval cap hides the count."""
+
     field: str
     cap: int
-    elided: int | None  # None: a retrieval cap was hit, so how much lay beyond it is unknown
+    elided: int | None
+
+    def __post_init__(self) -> None:
+        if self.cap <= 0:
+            raise ValueError(f'TruncationFact.cap must be positive, got {self.cap!r}')
+        if self.elided is not None and self.elided <= 0:
+            raise ValueError(f'TruncationFact.elided must be positive or None, got {self.elided!r}')
 
 
 @dataclass(frozen=True)
@@ -46,8 +56,10 @@ def elide_text(value: object, cap: int, *, field: str) -> TextClip:
     return _clip(value, cap, field=field, marked=True)
 
 
-def truncation_facts(*clips: TextClip) -> list[TruncationFact]:
-    return [clip.fact for clip in clips if clip.fact is not None]
+def truncation_fields(*facts: TruncationFact | None) -> dict[str, list[dict[str, Any]]]:
+    """The facts present, as plain dicts under ``TRUNCATION_FACTS_KEY`` for a dict channel; ``{}`` when none."""
+    present = [asdict(fact) for fact in facts if fact is not None]
+    return {TRUNCATION_FACTS_KEY: present} if present else {}
 
 
 def clip_note(*, omitted: int, omitted_noun: str, cap_name: str, cap: int, dropped_first: str) -> str:
@@ -68,4 +80,14 @@ def fetch_cap_note(*, fetched: int, noun: str, cap_name: str, cap: int) -> str:
     return (
         f'_NOTE: {fetched} {noun} were fetched, reaching the {cap_name}={cap} cap; any beyond it '
         f'were not fetched. Coverage may be clipped — NOT known complete this cycle._'
+    )
+
+
+def window_note(*, shown: int, total: int, noun: str, window: str, cap_name: str, cap: int) -> str:
+    """The ``_NOTE:`` line for a section capped by design: it names the window, not a coverage gap."""
+    if total <= shown:
+        return ''
+    return (
+        f'_NOTE: showing the {shown} {window} of {total} {noun} ({cap_name}={cap}). '
+        f'This section is a window by design, not a complete list._'
     )

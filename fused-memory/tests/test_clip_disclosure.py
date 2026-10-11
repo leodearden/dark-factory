@@ -6,14 +6,16 @@ import pytest
 
 from fused_memory.middleware.task_curator import clip_for_prompt
 from fused_memory.utils.clip_disclosure import (
-    TRUNCATED_KEY,
+    TRUNCATION_FACTS_KEY,
     TextClip,
+    TruncationFact,
     clip_note,
     clip_text,
     elide_text,
     elision_marker,
     fetch_cap_note,
-    truncation_facts,
+    truncation_fields,
+    window_note,
 )
 
 
@@ -34,7 +36,7 @@ def test_elide_text_over_the_cap_keeps_the_head_and_counts_the_rest():
     clip = elide_text(value, 10, field='desc')
 
     assert clip.text == 'a' * 10 + elision_marker(7)
-    assert clip.fact == {'field': 'desc', 'cap': 10, 'elided': 7}
+    assert clip.fact == TruncationFact(field='desc', cap=10, elided=7)
 
 
 @pytest.mark.parametrize(
@@ -51,7 +53,7 @@ def test_clip_text_reports_the_same_fact_but_leaves_the_text_unmarked():
     clip = clip_text(value, 10, field='content_excerpt')
 
     assert clip.text == 'a' * 10
-    assert clip.fact == {'field': 'content_excerpt', 'cap': 10, 'elided': 7}
+    assert clip.fact == TruncationFact(field='content_excerpt', cap=10, elided=7)
 
 
 @pytest.mark.parametrize('clipper', [clip_text, elide_text])
@@ -65,26 +67,49 @@ def test_non_string_input_is_coerced_before_clipping(clipper):
     clip = clipper(1234567, 3, field='f')
 
     assert clip.text.startswith('123')
-    assert clip.fact == {'field': 'f', 'cap': 3, 'elided': 4}
+    assert clip.fact == TruncationFact(field='f', cap=3, elided=4)
 
 
-def test_truncation_facts_keeps_only_the_clips_that_cut_in_order():
+def test_truncation_fields_serializes_only_the_present_facts_in_order():
     cut_a = clip_text('abcdef', 2, field='a')
     whole = clip_text('ab', 2, field='b')
     cut_c = elide_text('abcdef', 3, field='c')
 
-    assert truncation_facts(cut_a, whole, cut_c) == [
-        {'field': 'a', 'cap': 2, 'elided': 4},
-        {'field': 'c', 'cap': 3, 'elided': 3},
-    ]
+    assert truncation_fields(cut_a.fact, whole.fact, cut_c.fact) == {
+        TRUNCATION_FACTS_KEY: [
+            {'field': 'a', 'cap': 2, 'elided': 4},
+            {'field': 'c', 'cap': 3, 'elided': 3},
+        ],
+    }
 
 
-def test_truncation_facts_is_empty_when_nothing_was_cut():
-    assert truncation_facts(clip_text('ab', 2, field='a'), clip_text(None, 2, field='b')) == []
+def test_truncation_fields_serializes_an_unknown_elided_count_as_none():
+    fact = TruncationFact(field='triage_candidates', cap=20, elided=None)
+
+    assert truncation_fields(fact) == {
+        TRUNCATION_FACTS_KEY: [{'field': 'triage_candidates', 'cap': 20, 'elided': None}],
+    }
 
 
-def test_truncated_key_is_the_one_dict_channel_spelling():
-    assert TRUNCATED_KEY == 'truncated'
+def test_truncation_fields_is_empty_when_nothing_was_cut():
+    assert truncation_fields(clip_text('ab', 2, field='a').fact, clip_text(None, 2, field='b').fact) == {}
+    assert truncation_fields() == {}
+
+
+def test_the_dict_channel_key_is_not_the_bool_truncated_key():
+    assert TRUNCATION_FACTS_KEY == 'truncation_facts'
+
+
+@pytest.mark.parametrize('cap', [0, -1])
+def test_a_fact_rejects_a_non_positive_cap(cap):
+    with pytest.raises(ValueError, match='cap'):
+        TruncationFact(field='f', cap=cap, elided=1)
+
+
+@pytest.mark.parametrize('elided', [0, -3])
+def test_a_fact_rejects_a_non_positive_elided_count(elided):
+    with pytest.raises(ValueError, match='elided'):
+        TruncationFact(field='f', cap=1, elided=elided)
 
 
 def _widget_note(omitted: int) -> str:
@@ -131,3 +156,29 @@ def test_fetch_cap_note_at_the_cap_says_coverage_is_not_known_complete(fetched):
     assert 'not fetched' in note
     assert 'may be clipped' in note
     assert 'NOT known complete this cycle' in note
+
+
+def _done_window_note(*, shown: int, total: int) -> str:
+    return window_note(
+        shown=shown,
+        total=total,
+        noun='done task(s)',
+        window='highest-id (most recent)',
+        cap_name='MAX_DONE_TASKS_RETAINED',
+        cap=30,
+    )
+
+
+@pytest.mark.parametrize(('shown', 'total'), [(0, 0), (3, 3), (30, 30)])
+def test_window_note_is_empty_when_the_window_holds_everything(shown, total):
+    assert _done_window_note(shown=shown, total=total) == ''
+
+
+def test_window_note_names_the_window_rather_than_a_coverage_gap():
+    note = _done_window_note(shown=30, total=1500)
+
+    assert note == (
+        '_NOTE: showing the 30 highest-id (most recent) of 1500 done task(s) '
+        '(MAX_DONE_TASKS_RETAINED=30). This section is a window by design, not a complete list._'
+    )
+    assert 'this cycle' not in note

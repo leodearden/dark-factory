@@ -26,9 +26,8 @@ from _git_root_helper import make_git_root
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import VerificationVerdict
-from fused_memory.reconciliation import verify
 from fused_memory.reconciliation.verify import CodebaseVerifier
-from fused_memory.utils.clip_disclosure import TRUNCATED_KEY, elision_marker
+from fused_memory.utils.clip_disclosure import TRUNCATION_FACTS_KEY, elision_marker
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -261,39 +260,51 @@ def _commit(root: Path, filename: str, message: str) -> str:
     return _git(root, 'rev-parse', 'HEAD').strip()
 
 
-@pytest.mark.asyncio
-async def test_git_show_discloses_a_clipped_stat_view(tmp_path):
-    """A clipped ``git show`` says so, and by how much, like read_file and glob_search do."""
-    root = tmp_path / 'repo'
-    root.mkdir()
-    _git(root, 'init', '-q')
-    small_sha = _commit(root, 'small.txt', 'small commit')
-    big_sha = _commit(root, 'big.txt', 'big commit\n\n' + 'word ' * (verify._GIT_SHOW_CHARS // 5 + 200))
-
+async def _git_show_tool(root: Path):
     patcher, mock_cls, _instance = _mock_agent_loop()
     try:
         await CodebaseVerifier(_config()).verify(claim='Task X completed', codebase_root=root)
     finally:
         patcher.stop()
-    git_show = mock_cls.call_args.kwargs['tools']['git_show'].function
+    return mock_cls.call_args.kwargs['tools']['git_show'].function
 
-    cap = verify._GIT_SHOW_CHARS
-    full_big = _git(root, 'show', '--stat', big_sha)
-    elided = len(full_big) - cap
-    assert elided > 0
+
+def _repo(tmp_path: Path) -> Path:
+    root = tmp_path / 'repo'
+    root.mkdir()
+    _git(root, 'init', '-q')
+    return root
+
+
+@pytest.mark.asyncio
+async def test_git_show_discloses_a_clipped_stat_view(tmp_path):
+    """A clipped ``git show`` says so, and by how much, like read_file and glob_search do."""
+    root = _repo(tmp_path)
+    big_sha = _commit(root, 'big.txt', 'big commit\n\n' + 'word ' * 20_000)
+    git_show = await _git_show_tool(root)
 
     big = await git_show(commit=big_sha)
-    assert big['output'] == full_big[:cap] + elision_marker(elided)
-    assert big[TRUNCATED_KEY] == [{'field': 'output', 'cap': cap, 'elided': elided}]
 
-    small = await git_show(commit=small_sha)
-    assert small['output'] == _git(root, 'show', '--stat', small_sha)
-    assert TRUNCATED_KEY not in small
+    full_big = _git(root, 'show', '--stat', big_sha)
+    [fact] = big[TRUNCATION_FACTS_KEY]
+    cap = fact['cap']
+    assert fact == {'field': 'output', 'cap': cap, 'elided': len(full_big) - cap}
+    assert big['output'] == full_big[:cap] + elision_marker(len(full_big) - cap)
 
 
-def test_git_show_cap_clears_the_measured_ordinary_commit_worst_case():
+@pytest.mark.asyncio
+async def test_git_show_returns_the_measured_ordinary_worst_case_commit_whole(tmp_path):
     """10789 chars was the largest ordinary ``git show --stat`` measured on 2026-09-14."""
-    assert verify._GIT_SHOW_CHARS >= 11000
+    root = _repo(tmp_path)
+    sha = _commit(root, 'ordinary.txt', 'ordinary commit\n\n' + 'word ' * 2_200)
+    git_show = await _git_show_tool(root)
+    full = _git(root, 'show', '--stat', sha)
+    assert len(full) > 11_000
+
+    shown = await git_show(commit=sha)
+
+    assert shown['output'] == full
+    assert TRUNCATION_FACTS_KEY not in shown
 
 
 @pytest.mark.asyncio

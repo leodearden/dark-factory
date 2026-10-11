@@ -24,7 +24,7 @@ import json
 import pytest
 
 from fused_memory.server.entities_gate import entities_gate
-from fused_memory.utils.clip_disclosure import TRUNCATED_KEY
+from fused_memory.utils.clip_disclosure import TRUNCATION_FACTS_KEY
 from fused_memory.utils.referent_resolution import _DECLARED_REFERENT_HINT
 
 GROUP = 'dark_factory'
@@ -391,7 +391,7 @@ class TestBlocksDiscloseTheirExcerptClip:
     """A block whose 200-char excerpt cut the content says so (task 5365).
 
     The excerpt itself stays ``content[:200]``; the cut rides beside it as the
-    same ``truncated`` fact every sibling pre-service guard carries.
+    same ``truncation_facts`` every sibling pre-service guard carries.
     """
 
     def test_a_conflict_block_reports_its_cut_excerpt(self):
@@ -401,7 +401,7 @@ class TestBlocksDiscloseTheirExcerptClip:
 
         assert isinstance(block, dict), f'expected a block, got {block!r}'
         assert block['content_excerpt'] == _LONG_CITES_3127[:200], f'{block!r}'
-        assert block[TRUNCATED_KEY] == [
+        assert block[TRUNCATION_FACTS_KEY] == [
             {'field': 'content_excerpt', 'cap': 200, 'elided': len(_LONG_CITES_3127) - 200},
         ], f'{block!r}'
 
@@ -410,16 +410,16 @@ class TestBlocksDiscloseTheirExcerptClip:
 
         assert isinstance(block, dict), f'expected a block, got {block!r}'
         assert block['content_excerpt'] == _LONG_CITES_3127[:200], f'{block!r}'
-        assert block[TRUNCATED_KEY] == [
+        assert block[TRUNCATION_FACTS_KEY] == [
             {'field': 'content_excerpt', 'cap': 200, 'elided': len(_LONG_CITES_3127) - 200},
         ], f'{block!r}'
 
-    def test_an_uncut_block_carries_no_truncated_key(self):
+    def test_an_uncut_block_carries_no_truncation_facts(self):
         conflict = entities_gate([{'kind': 'task', 'id': 3129}], content=_CITES_3127, group_id=GROUP)
         malformed = entities_gate([{'id': 'abc'}], content=_CITES_3127, group_id=GROUP)
 
-        assert isinstance(conflict, dict) and TRUNCATED_KEY not in conflict, f'{conflict!r}'
-        assert isinstance(malformed, dict) and TRUNCATED_KEY not in malformed, f'{malformed!r}'
+        assert isinstance(conflict, dict) and TRUNCATION_FACTS_KEY not in conflict, f'{conflict!r}'
+        assert isinstance(malformed, dict) and TRUNCATION_FACTS_KEY not in malformed, f'{malformed!r}'
 
     def test_a_cut_block_stays_json_safe(self):
         block = entities_gate(

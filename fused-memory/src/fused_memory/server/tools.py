@@ -133,6 +133,7 @@ from fused_memory.server.grouped_read import (
     group_memory_document,
     group_search_results,
 )
+from fused_memory.server.guard_excerpt import excerpt_fields
 from fused_memory.server.manifest_stamping import (
     stamp_capability_manifests,
     stamping_action_required,
@@ -151,7 +152,6 @@ from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorizat
 from fused_memory.server.near_duplicate_guard import (
     build_near_duplicate_block,
     build_topic_cluster_block,
-    excerpt_fields,
     find_matching_topic_cluster,
     find_near_duplicate_memory,
     resolve_near_dup_guard_enabled,
@@ -207,7 +207,7 @@ from fused_memory.services.read_telemetry import (
     summarize_search_query,
     summarize_search_results,
 )
-from fused_memory.utils.clip_disclosure import TRUNCATED_KEY
+from fused_memory.utils.clip_disclosure import truncation_fields
 from fused_memory.utils.validation import (
     PathShapedProjectIdError,
     _to_underscore_canonical,
@@ -4046,8 +4046,7 @@ def create_mcp_server(
             ack = {**ack, ROUTED_KEY: outcome}
             if attached_to is not None:
                 ack[CANONICAL_ID_KEY] = attached_to
-            if triage_decision.truncated:
-                ack[TRUNCATED_KEY] = list(triage_decision.truncated)
+            ack.update(truncation_fields(*triage_decision.truncation_facts))
             # Drained AFTER any fallback record above, so one drain covers both
             # triage_write's internal fail-opens and this body's own.
             storm = _triage_fail_open_counter.drain_storm()

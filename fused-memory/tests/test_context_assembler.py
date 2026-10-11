@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+from _clip_assertions import assert_elided
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.memory import MemoryCategory, MemoryResult, SourceStore
@@ -19,8 +20,6 @@ from fused_memory.models.reconciliation import (
     Watermark,
 )
 from fused_memory.reconciliation.context_assembler import (
-    _MEMORY_BODY_CHARS,
-    _TASK_DESC_CHARS,
     ContextAssembler,
     _format_task,  # Intentional private-API coupling: targeted unit coverage of
     #                the display_id parameter that the integration tests alone
@@ -28,7 +27,6 @@ from fused_memory.reconciliation.context_assembler import (
     estimate_tokens,
     format_event,
 )
-from fused_memory.utils.clip_disclosure import elision_marker
 
 
 def _make_event(
@@ -762,26 +760,29 @@ def _desc_line(rendered: str) -> str:
     return next(line for line in rendered.splitlines() if line.startswith('  desc: '))
 
 
+def _task_with_description(desc: str) -> dict:
+    return {'id': '7', 'title': 'T', 'status': 'done', 'dependencies': [], 'description': desc}
+
+
+def _memory_body(formatted: str) -> str:
+    return formatted.split('): ', 1)[1]
+
+
 def test_format_task_discloses_a_clipped_description():
-    desc = 'd' * _TASK_DESC_CHARS + 'tail of the description'
-    task = {'id': '7', 'title': 'Long', 'status': 'done', 'dependencies': [], 'description': desc}
+    desc = 'd' * 10_000
 
-    line = _desc_line(_format_task(task))
+    line = _desc_line(_format_task(_task_with_description(desc)))
 
-    assert line == f'  desc: {desc[:_TASK_DESC_CHARS]}{elision_marker(len(desc) - _TASK_DESC_CHARS)}'
+    assert_elided(line.removeprefix('  desc: '), desc)
 
 
 def test_format_task_leaves_a_short_description_unmarked():
-    desc = 'd' * _TASK_DESC_CHARS
-    task = {'id': '7', 'title': 'Short', 'status': 'done', 'dependencies': [], 'description': desc}
+    desc = 'a short description'
 
-    assert _desc_line(_format_task(task)) == f'  desc: {desc}'
+    assert _desc_line(_format_task(_task_with_description(desc))) == f'  desc: {desc}'
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize('overflow', [0, 1, 900])
-async def test_memory_context_discloses_a_clipped_body(mock_memory, overflow):
-    body = 'm' * (_MEMORY_BODY_CHARS + overflow)
+async def _memory_context(mock_memory, body: str) -> str:
     memory = _make_memory_result(content=body)
     mock_memory.search = AsyncMock(return_value=[memory])
     assembler = _make_assembler(memory_service=mock_memory)
@@ -789,21 +790,31 @@ async def test_memory_context_discloses_a_clipped_body(mock_memory, overflow):
 
     result = await assembler.assemble(events, _make_watermark(), 'test-project')
 
-    rendered_body = result.context_items[memory.id].formatted.split('): ', 1)[1]
-    marker = elision_marker(overflow) if overflow else ''
-    assert rendered_body == body[:_MEMORY_BODY_CHARS] + marker
+    return _memory_body(result.context_items[memory.id].formatted)
+
+
+@pytest.mark.asyncio
+async def test_memory_context_discloses_a_clipped_body(mock_memory):
+    body = 'm' * 10_000
+
+    assert_elided(await _memory_context(mock_memory, body), body)
+
+
+@pytest.mark.asyncio
+async def test_memory_context_leaves_a_short_body_unmarked(mock_memory):
+    assert await _memory_context(mock_memory, 'a short memory') == 'a short memory'
 
 
 @pytest.mark.asyncio
 async def test_assembled_task_context_carries_the_elision_markers(mock_memory, mock_taskmaster):
     """The formatted strings are what Stages 1/2/3 read verbatim, so the marker must reach them."""
-    desc = 'x' * (_TASK_DESC_CHARS + 40)
+    desc = 'x' * 10_000
     mock_taskmaster.get_task = AsyncMock(return_value={
-        'id': '42', 'title': 'Long task', 'status': 'done', 'dependencies': [],
-        'description': desc,
+        **_task_with_description(desc),
+        'id': '42',
         'metadata': {'memory_hints': {'queries': ['long hint']}},
     })
-    hinted = _make_memory_result(content='y' * (_MEMORY_BODY_CHARS + 60))
+    hinted = _make_memory_result(content='y' * 10_000)
     mock_memory.search = AsyncMock(return_value=[hinted])
     assembler = _make_assembler(memory_service=mock_memory, taskmaster=mock_taskmaster)
     events = [_make_event(
@@ -813,8 +824,9 @@ async def test_assembled_task_context_carries_the_elision_markers(mock_memory, m
 
     result = await assembler.assemble(events, _make_watermark(), 'test-project')
 
-    assert _desc_line(result.context_items['task:42'].formatted).endswith(elision_marker(40))
-    assert result.context_items[hinted.id].formatted.endswith(elision_marker(60))
+    task_line = _desc_line(result.context_items['task:42'].formatted)
+    assert_elided(task_line.removeprefix('  desc: '), desc)
+    assert_elided(_memory_body(result.context_items[hinted.id].formatted), hinted.content)
 
 
 # ── _ctx_task_event subtask qualification ────────────────────────────

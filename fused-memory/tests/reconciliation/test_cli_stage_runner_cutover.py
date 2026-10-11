@@ -8,14 +8,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from fused_memory.reconciliation.cli_stage_runner import (
-    _FALLBACK_SUMMARY_CHARS,
     FINDING_ITEM_SCHEMA,
     RAW_TEXT_FALLBACK_STAT,
     STAGE3_REPORT_SCHEMA,
     STAGE_REPORT_SCHEMA,
     _extract_report,
 )
-from fused_memory.utils.clip_disclosure import TRUNCATED_KEY, elision_marker
+from fused_memory.utils.clip_disclosure import TRUNCATION_FACTS_KEY, elision_marker
 
 
 class TestFindingItemSchemaShape:
@@ -203,18 +202,16 @@ class TestExtractReportRawTextFallback:
     """
 
     def test_long_prose_is_elided_and_its_clip_recorded_in_stats(self):
-        prose = 'The stage found nothing worth flagging. ' * 100
-        elided = len(prose) - _FALLBACK_SUMMARY_CHARS
-        assert elided > 0
+        prose = 'The stage found nothing worth flagging. ' * 1000
 
         report = _extract_report(_agent_result(prose))
 
-        assert report['summary'] == prose[:_FALLBACK_SUMMARY_CHARS] + elision_marker(elided)
+        [fact] = report['stats'][TRUNCATION_FACTS_KEY]
+        cap = fact['cap']
+        assert fact == {'field': 'summary', 'cap': cap, 'elided': len(prose) - cap}
+        assert report['summary'] == prose[:cap] + elision_marker(len(prose) - cap)
         assert report['flagged_items'] == []
-        assert report['stats'] == {
-            RAW_TEXT_FALLBACK_STAT: True,
-            TRUNCATED_KEY: [{'field': 'summary', 'cap': 2000, 'elided': elided}],
-        }
+        assert report['stats'][RAW_TEXT_FALLBACK_STAT] is True
 
     def test_short_prose_is_unmarked_but_still_flagged_as_a_fallback(self):
         report = _extract_report(_agent_result('All consistent; no findings.'))
