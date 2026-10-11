@@ -15,7 +15,6 @@ import logging
 import sqlite3
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any, cast
 
 import aiosqlite
@@ -26,6 +25,7 @@ from shared.async_sqlite_base import (
     apply_wal_pragmas,
     connect_daemon,
 )
+from shared.project_layout import tasks_db
 from shared.task_metadata import (
     _WHOLE_METADATA_FIELD,
     SchemaWarning,
@@ -1627,10 +1627,6 @@ class SqliteTaskBackend:
 
     # ── Connection management ──────────────────────────────────────────
 
-    @staticmethod
-    def _db_path(project_root: str) -> Path:
-        return Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
-
     async def _get_write_access(self, project_root: str) -> AtomicConnection:
         """Return the open, schema-applied WRITE connection for ``project_root``.
 
@@ -1654,7 +1650,7 @@ class SqliteTaskBackend:
             if access is not None:
                 return access
 
-            db_path = self._db_path(project_root)
+            db_path = tasks_db(project_root)
             db_path.parent.mkdir(parents=True, exist_ok=True)
             conn = await connect_daemon(str(db_path))
             conn.row_factory = aiosqlite.Row
@@ -1802,7 +1798,7 @@ class SqliteTaskBackend:
             if self._closed:
                 raise RuntimeError('SqliteTaskBackend is closed')
 
-            conn = await connect_daemon(str(self._db_path(project_root)), isolation_level=None)
+            conn = await connect_daemon(str(tasks_db(project_root)), isolation_level=None)
             await apply_wal_pragmas(conn, busy_timeout_ms=5000)
             conn.row_factory = aiosqlite.Row
             # Re-check once more: close() could have run to completion
@@ -2259,7 +2255,7 @@ class SqliteTaskBackend:
             ``{str(id): status}`` mapping; ``{}`` if the DB file does not
             exist yet or the read fails for any reason.
         """
-        db_path = self._db_path(project_root)
+        db_path = tasks_db(project_root)
         if not db_path.exists():
             return {}
         # conn is opened *inside* the try (not before it) so that a failure
