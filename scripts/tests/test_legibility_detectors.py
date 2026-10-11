@@ -557,6 +557,19 @@ def _classify(*records):
     return detectors.classify_agent_class(_MAIN_DIR_PATH, list(records))
 
 
+_READ_OF_MARKER_SOURCE = (
+    user_record('why did the sampler restratify my session?'),
+    assistant_record(tool_use_block(
+        'Read', {'file_path': '/home/leo/src/dark-factory/scripts/legibility/detectors.py'}, 'tu-read',
+    )),
+    tool_result_record('tu-read', (
+        "    # orchestrator/src/orchestrator/dry_run_unblock.py injects the\n"
+        "    # 'Task ID: {task_id}' / 'Worktree: {worktree}' preamble; its two lines\n"
+        "    AgentMarker(AgentClass.RECON, ('operating in sleep mode', 'memory_consolidator')),\n"
+    )),
+)
+
+
 class TestAgentClassVocabulary:
     def test_agent_classes_are_the_five_strata_plus_unknown(self):
         assert [c.value for c in AgentClass] == [
@@ -685,6 +698,17 @@ class TestClassifyAgentClass:
 
         assert _classify(*records) is AgentClass.ORCHESTRATED_TASK
 
+    def test_a_read_of_source_quoting_the_marker_table_classifies_by_the_quote(self):
+        """Decided, not incidental. The raw carriers include tool_results
+        because a watcher's identity reaches its own session only as one
+        (``resolved_by=orchestrator-escalation-watcher-auto``). The price
+        is this case: an interactive main-checkout session that Reads a
+        module quoting the markers is restratified by the quote. Telling a
+        session's own markers from foreign material it reads is task
+        5785's, which already names a session restratified by a Read of
+        digest.py."""
+        assert _classify(*_READ_OF_MARKER_SOURCE) is AgentClass.ORCHESTRATED_TASK
+
     def test_records_are_read_once_in_order_from_any_iterable(self):
         records = iter([
             user_record('please look at this'),
@@ -752,6 +776,10 @@ _SHAPES = [
             tool_result_record('tu-1', 'resolved_by=orchestrator-escalation-watcher-auto'),
         ],
         'watcher', id='haystack_only_watcher',
+    ),
+    pytest.param(
+        '-home-leo-src-dark-factory', list(_READ_OF_MARKER_SOURCE), 'orchestrated-task',
+        id='read_of_marker_source',
     ),
     pytest.param(
         '-home-leo-src-dark-factory', [user_record('please fix the parser')], 'interactive',
