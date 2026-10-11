@@ -11,7 +11,7 @@ import json
 import logging
 import subprocess
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -27,7 +27,7 @@ from _recording_event_store import _RecordingEventStore
 from df_pytest_isolation import git_redirect_env
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.verify import VerifyResult
 
@@ -60,9 +60,23 @@ def review_repo() -> Iterator[Path]:
         yield repo
 
 
-async def _tree_walking_lint(project_root: Path, _config: object) -> VerifyResult:
+@pytest.fixture
+def plain_dir() -> Iterator[Path]:
+    with tempfile.TemporaryDirectory(prefix='df-review-plain-') as scratch:
+        plain = Path(scratch) / 'plain'
+        (plain / 'scripts').mkdir(parents=True)
+        yield plain
+
+
+def _printed_as(rel: str, module_dirs: Iterable[str]) -> str:
+    return next(
+        (rel.removeprefix(f'{d}/') for d in module_dirs if rel.startswith(f'{d}/')), rel,
+    )
+
+
+async def _tree_walking_lint(project_root: Path, config: OrchestratorConfig) -> VerifyResult:
     offenders = sorted(
-        path.relative_to(project_root).as_posix()
+        _printed_as(path.relative_to(project_root).as_posix(), config.module_configs_or_empty)
         for path in project_root.rglob('*.py')
         if '.git' not in path.relative_to(project_root).parts
         and _LINT_MARKER in path.read_text()
@@ -80,7 +94,9 @@ async def _tree_walking_lint(project_root: Path, _config: object) -> VerifyResul
     )
 
 
-def _make_checkpoint(project_root: Path, tmp_path: Path) -> ReviewCheckpoint:
+def _make_checkpoint(
+    project_root: Path, tmp_path: Path, *, module_dirs: Iterable[str] = (),
+) -> ReviewCheckpoint:
     config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     config.project_root = project_root
     config.models.deep_reviewer = 'opus'
@@ -91,7 +107,7 @@ def _make_checkpoint(project_root: Path, tmp_path: Path) -> ReviewCheckpoint:
     config.fused_memory.project_id = 'test-project'
     config.escalation.host = 'localhost'
     config.escalation.port = 9999
-    config.module_configs_or_empty = {}
+    config.module_configs_or_empty = {d: ModuleConfig(prefix=d) for d in module_dirs}
     config.review.briefing_path = 'df-6687-no-such-briefing.yaml'
     config.review.reports_dir = str(tmp_path / 'reports')
     stamp_stock_routing_config(config)
@@ -236,3 +252,31 @@ class TestReviewPhase1WorkingTree:
         assert [n.path for n in report.phase1_working_tree.named_in_failure] == [
             'scripts/bad.py',
         ]
+
+    async def test_module_relative_failure_is_attributed_through_the_module_dir(
+        self, review_repo: Path, reviewer: AsyncMock, tmp_path: Path,
+    ) -> None:
+        bad = review_repo / 'pkg' / 'src' / 'bad.py'
+        bad.parent.mkdir(parents=True)
+        bad.write_text(f'{_LINT_MARKER}\n')
+
+        report = await _make_checkpoint(review_repo, tmp_path, module_dirs=['pkg']).run_focused()
+
+        assert 'pkg/src/bad.py' not in report.phase1.lint_output
+        saved = _saved_report(tmp_path, report.review_id)
+        assert saved['phase1_working_tree']['named_in_failure'] == [
+            {'path': 'pkg/src/bad.py', 'change': 'untracked'},
+        ]
+
+    async def test_checkout_git_cannot_describe_leaves_phase1_unqualified(
+        self, plain_dir: Path, reviewer: AsyncMock, tmp_path: Path,
+    ) -> None:
+        (plain_dir / 'scripts' / 'bad.py').write_text(f'{_LINT_MARKER}\n')
+
+        report = await _make_checkpoint(plain_dir, tmp_path).run_focused()
+
+        prompt = _prompt(reviewer)
+        assert _summary_line(prompt) == f'**Summary:** {_BARE_FAIL_SUMMARY}'
+        assert '### Working-tree state' not in prompt
+        assert report.phase1_working_tree is None
+        assert 'phase1_working_tree' not in _saved_report(tmp_path, report.review_id)
