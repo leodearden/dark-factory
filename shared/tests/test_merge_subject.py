@@ -9,10 +9,18 @@ from __future__ import annotations
 
 import dataclasses
 import re
+import subprocess
+from pathlib import Path
 
 import pytest
 
-from shared.merge_subject import MergeSubject, format_merge_subject, parse_merge_subject
+from shared.merge_subject import (
+    MergeSubject,
+    format_merge_subject,
+    merge_subject_pattern,
+    parse_merge_subject,
+    rendered_prefix,
+)
 
 _BRANCHES = ['feat/12', 'task/v1.0', 'rel.v1+(x)/5', 'a/b/c', 'ünï/7', '\x00BRANCH\x00']
 _MAINS = ['trunk', 'main', 'release/2.0']
@@ -94,3 +102,170 @@ class TestRefTokenInvariant:
         with pytest.raises(ValueError) as formatted:
             format_merge_subject(branch, main_branch)
         assert str(formatted.value) == str(constructed.value)
+
+
+# Every POSIX ERE special character, so an unescaped renderer selects the near
+# misses below and a renderer escaping too much trips grep's stray-backslash
+# warning.
+_WILD_PREFIX = 'a.b*c+d?e(f)g{1}h|i^j$k[l]m\\n/'
+_WILD = format_merge_subject(_WILD_PREFIX + '5', 'trunk')
+
+_LANDED_INTO_TRUNK = {
+    'Merge feat/12 into trunk',
+    'Merge feat/123 into trunk',
+    'Merge feat/1 into trunk',
+    'Merge feat/v1.0 into trunk',
+}
+
+_CORPUS = (
+    'seed',
+    *sorted(_LANDED_INTO_TRUNK),
+    'Merge feat/12 into main',
+    'Merge task/12 into trunk',
+    'Merge feat/12 into trunk (retry)',
+    'Revert "Merge feat/12 into trunk"',
+    'Merge feat/12: legacy subject',
+    'Merge feat/12:no-space',
+    "Merge branch 'feat/12' into trunk",
+    'impl(12): x',
+    _WILD,
+    'Merge aXb*c+d?e(f)g{1}h|i^j$k[l]m\\n/5 into trunk',
+    'Merge abbbc+d?e(f)g{1}h|i^j$k[l]m\\n/5 into trunk',
+)
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ['git', '-C', str(repo), *args], check=True, capture_output=True, text=True
+    ).stdout
+
+
+@pytest.fixture
+def subject_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / 'subjects'
+    subprocess.run(['git', 'init', '-q', '-b', 'trunk', str(repo)], check=True, capture_output=True)
+    _git(repo, 'config', 'user.email', 'merge-subject-test@example.com')
+    _git(repo, 'config', 'user.name', 'Merge Subject Test')
+    _git(repo, 'config', 'commit.gpgsign', 'false')
+    for subject in _CORPUS:
+        _git(repo, 'commit', '-q', '--allow-empty', '--no-verify', '--cleanup=verbatim', '-m', subject)
+    return repo
+
+
+def _git_selected(repo: Path, pattern: str) -> set[str]:
+    return set(_git(repo, 'log', '-E', f'--grep={pattern}', '--format=%s', 'trunk').splitlines())
+
+
+def _python_selected(pattern: str) -> set[str]:
+    return {subject for subject in _CORPUS if re.search(pattern, subject)}
+
+
+class TestMergeSubjectPatternAcrossEngines:
+    @pytest.mark.parametrize(
+        ('kwargs', 'expected'),
+        [
+            (dict(task_id='12', main_branch='trunk'), {'Merge feat/12 into trunk'}),
+            (dict(task_id='12'), {'Merge feat/12 into trunk', 'Merge feat/12 into main'}),
+            (dict(main_branch='trunk'), _LANDED_INTO_TRUNK),
+            (dict(), _LANDED_INTO_TRUNK | {'Merge feat/12 into main'}),
+            (
+                dict(task_id='12', main_branch='trunk', legacy_colon_form=True),
+                {'Merge feat/12 into trunk', 'Merge feat/12: legacy subject'},
+            ),
+            (
+                dict(legacy_colon_form=True),
+                _LANDED_INTO_TRUNK | {'Merge feat/12 into main', 'Merge feat/12: legacy subject'},
+            ),
+            (dict(branch_prefix=_WILD_PREFIX, task_id='5', main_branch='trunk'), {_WILD}),
+        ],
+        ids=[
+            'task-and-main',
+            'task-any-main',
+            'any-task-main',
+            'any-task-any-main',
+            'task-and-main-or-legacy',
+            'any-or-legacy',
+            'every-ere-special-in-prefix',
+        ],
+    )
+    def test_git_and_python_select_the_same_subjects(
+        self, subject_repo: Path, kwargs: dict, expected: set[str]
+    ) -> None:
+        pattern = merge_subject_pattern(**{'branch_prefix': 'feat/', **kwargs})
+        by_git = _git_selected(subject_repo, pattern)
+        by_python = _python_selected(pattern)
+        assert by_git == by_python == expected, (
+            f'pattern={pattern!r}\n  git:      {sorted(by_git)}\n'
+            f'  python:   {sorted(by_python)}\n  expected: {sorted(expected)}'
+        )
+
+    @pytest.mark.parametrize('subject', _CORPUS)
+    def test_pattern_accepts_exactly_what_parse_accepts(self, subject: str) -> None:
+        parsed = parse_merge_subject(subject)
+        parsed_as_feat = (
+            parsed is not None
+            and parsed.branch.startswith('feat/')
+            and len(parsed.branch) > len('feat/')
+        )
+        matched = re.search(merge_subject_pattern(branch_prefix='feat/'), subject) is not None
+        assert matched == parsed_as_feat
+
+
+def _bash_line_arm_verdict(head: str, task_id: str, into: str, subject: str) -> bool:
+    proc = subprocess.run(
+        ['bash', '-c', 'grep -qE -- "^$1$2$3" <<<"$4"', '_', head, task_id, into, subject],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode in (0, 1), f'grep exited {proc.returncode}: {proc.stderr}'
+    assert proc.stderr == '', proc.stderr
+    return proc.returncode == 0
+
+
+class TestRenderedPrefixInBash:
+    @pytest.mark.parametrize(
+        ('branch_prefix', 'task_id', 'expected'),
+        [
+            (
+                'feat/',
+                '12',
+                {'Merge feat/12 into trunk', 'Merge feat/12 into main', 'Merge feat/12 into trunk (retry)'},
+            ),
+            (_WILD_PREFIX, '5', {_WILD}),
+        ],
+        ids=['feat', 'every-ere-special-in-prefix'],
+    )
+    def test_bash_grep_line_arm_agrees_with_python(
+        self, branch_prefix: str, task_id: str, expected: set[str]
+    ) -> None:
+        head, into = rendered_prefix(branch_prefix)
+        selected = set()
+        for subject in _CORPUS:
+            verdict = _bash_line_arm_verdict(head, task_id, into, subject)
+            assert verdict == (re.search('^' + head + task_id + into, subject) is not None), subject
+            if verdict:
+                selected.add(subject)
+        assert selected == expected
+
+
+class TestPatternArgumentsShareTheRefTokenInvariant:
+    @pytest.mark.parametrize(
+        ('field', 'kwargs'),
+        [
+            ('task_id', dict(branch_prefix='feat/', task_id='')),
+            ('main_branch', dict(branch_prefix='feat/', main_branch='a b')),
+            ('branch_prefix', dict(branch_prefix='fe at/')),
+        ],
+    )
+    def test_refuses_and_names_the_argument(self, field: str, kwargs: dict) -> None:
+        with pytest.raises(ValueError, match=rf'\b{field}\b'):
+            merge_subject_pattern(**kwargs)
+
+    def test_rendered_prefix_refuses_whitespace(self) -> None:
+        with pytest.raises(ValueError, match=r'\bbranch_prefix\b'):
+            rendered_prefix('fe at/')
+
+    def test_empty_branch_prefix_is_accepted(self) -> None:
+        assert rendered_prefix('') == ('Merge ', ' into ')
+        assert re.search(merge_subject_pattern(branch_prefix=''), 'Merge feat/12 into trunk')
