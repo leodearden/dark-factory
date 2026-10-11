@@ -266,8 +266,8 @@ def _probe(stdout: str, returncode: int = 0) -> ProbeRunner:
 def _lms(
     tmp_path: pathlib.Path,
     *,
-    repo: str | None = LMS_TEMPLATE,
-    installed: dict[str, str] | None = None,
+    repo: str | bytes | None = LMS_TEMPLATE,
+    installed: Mapping[str, str | bytes] | None = None,
     probe_stdout: str = CLEAN_PROBE_STDOUT,
     probe_rc: int = 0,
     installed_dir_arg: pathlib.Path | None = None,
@@ -849,7 +849,22 @@ UNREADABLE_CASES: dict[str, UnreadableCase] = {
         f"dashboard/{DASH_TIMER}",
         DASH_TIMER_TEXT,
     ),
+    "lms": UnreadableCase(
+        lambda tmp, repo, installed: _lms(tmp, repo=repo, installed={LMS_UNIT: installed}),
+        "lms_unit_parity",
+        LMS_UNIT,
+        LMS_RELPATH,
+        LMS_TEMPLATE,
+    ),
 }
+
+
+def _recording_clean_probe(calls: list[list[str]]) -> ProbeRunner:
+    def runner(argv: list[str]) -> tuple[int, str]:
+        calls.append(argv)
+        return 0, CLEAN_PROBE_STDOUT
+
+    return runner
 
 
 @pytest.mark.parametrize("side", ["installed", "committed"])
@@ -864,6 +879,11 @@ def test_an_unreadable_unit_is_reported_naming_the_file_that_failed(
     else:
         invocation = case.build(tmp_path, UNDECODABLE, case.text)
         failed = f"<TMP>/repo/{case.committed_relpath}"
+    probe_calls: list[list[str]] = []
+    if invocation.probe_runner is not None:
+        invocation = dataclasses.replace(
+            invocation, probe_runner=_recording_clean_probe(probe_calls)
+        )
 
     rc, out, _ = _run(invocation, tmp_path, capsys)
 
@@ -874,3 +894,4 @@ def test_an_unreadable_unit_is_reported_naming_the_file_that_failed(
     ) in out
     assert f"[{case.tag}]   {case.unit}: {failed}: " in out
     assert "[ok]" not in out
+    assert probe_calls == [], "a run that could not read the unit must not probe it"
