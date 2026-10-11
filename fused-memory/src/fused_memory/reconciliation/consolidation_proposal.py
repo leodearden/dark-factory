@@ -19,7 +19,7 @@ from enum import StrEnum
 from typing import Any
 
 from fused_memory.models.reconciliation import StageId
-from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
+from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 
 RECORD_KIND_CONSOLIDATION_PROPOSAL = 'consolidation_proposal'
 
@@ -87,6 +87,25 @@ class ConsolidationProposal:
             created_at=created.isoformat(),
             expires_at=(created + timedelta(hours=ttl_hours)).isoformat(),
         )
+
+
+async def record_proposal(
+    ledger: ReconLedgerStore,
+    proposal: ConsolidationProposal,
+    *,
+    now: datetime,
+    ttl_hours: int,
+) -> bool:
+    """Write *proposal* as a ``proposed`` row; ``False`` if its identity was already acted on.
+
+    A re-proposal overwrites the earlier row only while that row is still
+    ``proposed``. Once code has moved it on, resetting it would hand the
+    executor the same cluster twice, so the stored row is left as it is.
+    """
+    return await ledger.upsert_if_state(
+        proposal.to_ledger_record(now=now, ttl_hours=ttl_hours),
+        existing_state=ProposalState.PROPOSED.value,
+    )
 
 
 def from_ledger_record(record: ReconLedgerRecord) -> ConsolidationProposal:

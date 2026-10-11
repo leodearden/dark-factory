@@ -89,6 +89,7 @@ from fused_memory.reconciliation.citation_verifier import (
 from fused_memory.reconciliation.consolidation_proposal import (
     PROPOSER_AGENT_ID,
     ConsolidationProposal,
+    record_proposal,
 )
 from fused_memory.reconciliation.flag_record_contract import (
     recon_stage_flag_kind_refusal,
@@ -4172,7 +4173,8 @@ def create_mcp_server(
         You propose; code decides whether the cluster is consolidated and
         executes it. A ValidationError names every offender at once, with a
         hint: fix them all and call again in the same turn. Re-calling for the
-        same (project, topic, run) overwrites the earlier proposal. Only recon
+        same (project, topic, run) overwrites the earlier proposal until code
+        has acted on it; after that the call is refused. Only recon
         Stage 1 may propose: agent_id must be 'recon-stage-memory_consolidator'
         — a naming convention, not authentication.
 
@@ -4239,11 +4241,18 @@ def create_mcp_server(
             rationale=rationale,
             seeded_from=seeded_from,
         )
-        await ledger.upsert(
-            proposal.to_ledger_record(
-                now=datetime.now(UTC), ttl_hours=config.proposal_ttl_hours
-            )
+        recorded = await record_proposal(
+            ledger, proposal, now=datetime.now(UTC), ttl_hours=config.proposal_ttl_hours
         )
+        if not recorded:
+            return {
+                'error': (
+                    'the proposal for this (project, topic, run) has already been '
+                    'acted on, so it was not overwritten'
+                ),
+                'error_type': 'ConsolidationProposalAlreadyActed',
+                'ledger_key': proposal.ledger_key(),
+            }
         return {'ok': True, 'ledger_key': proposal.ledger_key()}
 
     # ------------------------------------------------------------------

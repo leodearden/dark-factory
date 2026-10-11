@@ -142,6 +142,10 @@ _UPSERT_SQL = """
         entity_uuid = excluded.entity_uuid
 """
 
+# _UPSERT_SQL whose overwrite applies only while the stored row is in the bound
+# state; built from it so the column list and SET clause stay single-sourced.
+_UPSERT_IF_STATE_SQL = _UPSERT_SQL + '    WHERE recon_ledger.state = ?\n'
+
 
 @dataclass(frozen=True)
 class ReconLedgerRecord:
@@ -383,6 +387,19 @@ class ReconLedgerStore:
         """
         async with self._require_access().write() as db:
             await db.execute(_UPSERT_SQL, self._upsert_params(record))
+
+    async def upsert_if_state(self, record: ReconLedgerRecord, *, existing_state: str) -> bool:
+        """Insert *record*, or overwrite its identity's row only while that row is in *existing_state*.
+
+        One statement, so the row cannot change state between the check and the
+        write. Returns ``False`` when a row in another state was left untouched.
+        """
+        async with self._require_access().write() as db:
+            cursor = await db.execute(
+                _UPSERT_IF_STATE_SQL, (*self._upsert_params(record), existing_state)
+            )
+            written = cursor.rowcount
+        return written > 0
 
     async def upsert_many(self, records: Sequence[ReconLedgerRecord]) -> int:
         """Insert or update many records in ONE transaction (task 3041 amendment).

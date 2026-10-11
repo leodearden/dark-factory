@@ -2077,3 +2077,41 @@ async def test_gc_reaps_an_expired_consolidation_proposal_row_and_keeps_a_live_o
     await store.gc('proj-p', now='2026-07-12T00:00:00+00:00', terminal_task_ids=[])
 
     assert await store.list_by_kind('proj-p', 'consolidation_proposal', 'proposed') == [live]
+
+
+# ---------------------------------------------------------------------------
+# upsert_if_state: an overwrite that applies only while the stored row is
+# still in the named state (task 5239 amendment).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upsert_if_state_inserts_a_row_that_does_not_exist(store):
+    record = _kind_row()
+
+    assert await store.upsert_if_state(record, existing_state='proposed') is True
+    assert await store.list_by_kind('proj-p', 'kind-a', 'proposed') == [record]
+
+
+@pytest.mark.asyncio
+async def test_upsert_if_state_overwrites_a_row_in_that_state(store):
+    await store.upsert(_kind_row(payload='{"k": 1}'))
+    newer = _kind_row(payload='{"k": 2}', created_at='2026-07-02T00:00:00+00:00')
+
+    assert await store.upsert_if_state(newer, existing_state='proposed') is True
+    assert await store.list_by_kind('proj-p', 'kind-a', 'proposed') == [newer]
+
+
+@pytest.mark.asyncio
+async def test_upsert_if_state_leaves_a_row_in_another_state_untouched(store):
+    acted_on = _kind_row(state='executed', payload='{"k": 1}')
+    await store.upsert(acted_on)
+
+    written = await store.upsert_if_state(
+        _kind_row(payload='{"k": 2}'), existing_state='proposed'
+    )
+
+    assert written is False
+    assert await store.get_by_identity(
+        'proj-p', 'kind-a', flag_type='topic-a', run_id='run-1'
+    ) == acted_on

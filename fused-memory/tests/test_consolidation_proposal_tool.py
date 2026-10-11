@@ -208,6 +208,23 @@ async def test_the_last_write_wins_per_project_topic_and_run(svc, ledger):
 
 
 @pytest.mark.asyncio
+async def test_a_proposal_already_acted_on_is_never_reset(svc, ledger):
+    """A reset row would hand the executor the same cluster a second time."""
+    server = create_mcp_server(svc)
+    await _call(server)
+    (proposed,) = await _proposals(ledger)
+    acted_on = dataclasses.replace(proposed, state='executed')
+    await ledger.upsert(acted_on)
+
+    result = await _call(server, claim=OTHER_CLAIM)
+
+    assert 'ok' not in result
+    assert result['error_type'] == 'ConsolidationProposalAlreadyActed'
+    assert result['ledger_key']['flag_type'] == TOPIC
+    assert await ledger.get_by_identity(**result['ledger_key']) == acted_on
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     'agent_id',
     [
