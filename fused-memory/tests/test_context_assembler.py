@@ -799,7 +799,7 @@ async def test_assembled_task_context_carries_the_elision_markers(mock_memory, m
 
     result = await assembler.assemble(events, _make_watermark(), 'test-project')
 
-    assert result.context_items['task:42'].formatted.endswith(elision_marker(40))
+    assert _desc_line(result.context_items['task:42'].formatted).endswith(elision_marker(40))
     assert result.context_items[hinted.id].formatted.endswith(elision_marker(60))
 
 
