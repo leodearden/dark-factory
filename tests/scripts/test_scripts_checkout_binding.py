@@ -228,3 +228,26 @@ def test_merge_lane_metrics_run_from_a_copy_uses_the_copys_shared(tmp_path: Path
     ]
     assert len(loaded) == 1, proc.stderr
     assert _lies_under(loaded[0], checkout / 'shared' / 'src'), loaded[0]
+
+
+def test_the_ratchet_commit_gate_reports_an_unbindable_checkout_as_an_instrument_failure(
+    tmp_path: Path,
+) -> None:
+    gate_scripts = (
+        '_checkout.py',
+        'merge_lane_metrics.py',
+        'source_measures.py',
+        'check_staged_ratchet_raise.py',
+    )
+    checkout = _layout(tmp_path, pyproject=None, scripts=gate_scripts)
+
+    proc = _python(
+        [str(checkout / 'scripts' / 'check_staged_ratchet_raise.py'), '--root', str(checkout)],
+        decoy=tmp_path / _DECOY,
+    )
+
+    assert proc.returncode == 2, proc.stderr
+    assert 'Traceback' not in proc.stderr
+    assert 'CheckoutBindingError' in proc.stderr
+    assert str(checkout.resolve() / 'pyproject.toml') in proc.stderr
+    assert 'scripts/_checkout.py' in proc.stderr
