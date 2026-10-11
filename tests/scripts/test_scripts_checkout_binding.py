@@ -23,12 +23,13 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 _REAL_PYPROJECT = (REPO_ROOT / 'pyproject.toml').read_text(encoding='utf-8')
 _STUB_MEMBERS: Mapping[str, str] = MappingProxyType({'shared': 'shared', 'sampler': 'sampler'})
 _DECOY_PACKAGES = ('shared', 'sampler')
+_DECOY = 'decoy'
 _BIND = 'import _checkout as _checkout\n'
 _PRINT_MEMBER_FILES = 'import sampler, shared\nprint(shared.__file__)\nprint(sampler.__file__)\n'
 
 
 def _decoy(tmp_path: Path) -> Path:
-    decoy = tmp_path / 'decoy'
+    decoy = tmp_path / _DECOY
     for package in _DECOY_PACKAGES:
         (decoy / package).mkdir(parents=True)
         (decoy / package / '__init__.py').write_text('', encoding='utf-8')
@@ -64,17 +65,24 @@ def _env(decoy: Path) -> dict[str, str]:
     return env
 
 
-def _run_probe(checkout: Path, source: str) -> subprocess.CompletedProcess[str]:
-    probe = checkout / 'scripts' / 'probe.py'
-    probe.write_text(source, encoding='utf-8')
+def _python(
+    args: list[str], *, decoy: Path, cwd: Path | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, '-s', str(probe)],
-        env=_env(checkout.parent / 'decoy'),
+        [sys.executable, '-s', *args],
+        cwd=cwd,
+        env=_env(decoy),
         capture_output=True,
         text=True,
         timeout=120,
         check=False,
     )
+
+
+def _run_probe(checkout: Path, source: str) -> subprocess.CompletedProcess[str]:
+    probe = checkout / 'scripts' / 'probe.py'
+    probe.write_text(source, encoding='utf-8')
+    return _python([str(probe)], decoy=checkout.parent / _DECOY)
 
 
 def _lies_under(path: str, directory: Path) -> bool:
@@ -92,8 +100,8 @@ def test_binding_beats_a_decoy_the_environment_resolves(tmp_path: Path, bound: b
         assert _lies_under(shared_file, checkout / 'shared' / 'src'), shared_file
         assert _lies_under(sampler_file, checkout / 'sampler' / 'src'), sampler_file
     else:
-        assert _lies_under(shared_file, tmp_path / 'decoy'), shared_file
-        assert _lies_under(sampler_file, tmp_path / 'decoy'), sampler_file
+        assert _lies_under(shared_file, tmp_path / _DECOY), shared_file
+        assert _lies_under(sampler_file, tmp_path / _DECOY), sampler_file
 
 
 def test_member_src_is_the_declared_members_with_a_src_in_order_and_prefixes_sys_path(
@@ -166,3 +174,57 @@ def test_an_unbindable_checkout_refuses_to_import(tmp_path: Path, pyproject: str
     assert reported['runtime_error'] is True
     assert reported['path'] == pyproject_path
     assert pyproject_path in reported['message']
+
+
+_BOUND_SCRIPTS = (
+    'merge_lane_metrics',
+    'quality_metrics_snapshot',
+    'inline_suppression_classify',
+    'inline_suppressions',
+    'gen_dashboard_task_vocab',
+    'suite_census',
+    'trial_module_tagger_haiku',
+)
+
+_IMPORT_THEN_PRINT_MEMBER_FILES = (
+    'import importlib, sys; importlib.import_module(sys.argv[1]); '
+    'import sampler, shared; print(shared.__file__); print(sampler.__file__)'
+)
+
+
+@pytest.mark.parametrize('module', _BOUND_SCRIPTS)
+def test_a_script_imports_the_members_of_its_own_checkout(tmp_path: Path, module: str) -> None:
+    proc = _python(
+        ['-c', _IMPORT_THEN_PRINT_MEMBER_FILES, module],
+        decoy=_decoy(tmp_path),
+        cwd=REPO_ROOT / 'scripts',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    shared_file, sampler_file = proc.stdout.splitlines()[-2:]
+    assert _lies_under(shared_file, REPO_ROOT / 'shared' / 'src'), shared_file
+    assert _lies_under(sampler_file, REPO_ROOT / 'sampler' / 'src'), sampler_file
+
+
+_SAFE_IO_REPORTS_ITS_FILE = "import sys\nprint('safe_io:' + __file__, file=sys.stderr)\n"
+
+
+def test_merge_lane_metrics_run_from_a_copy_uses_the_copys_shared(tmp_path: Path) -> None:
+    checkout = _layout(
+        tmp_path, scripts=('_checkout.py', 'merge_lane_metrics.py', 'source_measures.py')
+    )
+    for shared_package in (checkout / 'shared' / 'src' / 'shared', tmp_path / _DECOY / 'shared'):
+        (shared_package / 'safe_io.py').write_text(_SAFE_IO_REPORTS_ITS_FILE, encoding='utf-8')
+
+    proc = _python(
+        [str(checkout / 'scripts' / 'merge_lane_metrics.py'), '--help'], decoy=tmp_path / _DECOY
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    loaded = [
+        line.removeprefix('safe_io:')
+        for line in proc.stderr.splitlines()
+        if line.startswith('safe_io:')
+    ]
+    assert len(loaded) == 1, proc.stderr
+    assert _lies_under(loaded[0], checkout / 'shared' / 'src'), loaded[0]
