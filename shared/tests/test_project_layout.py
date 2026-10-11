@@ -7,6 +7,7 @@ every locator must return exactly the spelling its current call sites build.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,7 @@ from shared.project_layout import (
     default_project_root,
     escalation_queue_dir,
     known_project_roots,
+    main_checkout_of,
     orchestrator_data_dir,
     park_eviction_requests_db,
     runs_db,
@@ -155,10 +157,7 @@ def _git_main_checkout(checkout: Path) -> Path:
 
 def _answer_from(dest_src: Path) -> tuple[int, str, str]:
     package = Path(shared.project_layout.__file__).resolve().parent
-    target = dest_src / 'shared'
-    target.mkdir(parents=True)
-    for name in ('__init__.py', 'project_layout.py'):
-        shutil.copyfile(package / name, target / name)
+    shutil.copytree(package, dest_src / 'shared', ignore=shutil.ignore_patterns('__pycache__'))
     proc = subprocess.run(
         [sys.executable, '-I', '-c', _CHILD, str(dest_src)],
         capture_output=True,
@@ -201,6 +200,88 @@ def _gitdir_of_worktree(worktree: Path) -> Path:
     return Path(text.removeprefix('gitdir: ').strip())
 
 
+def _src_of(checkout: Path) -> Path:
+    src = checkout / 'src'
+    src.mkdir(parents=True, exist_ok=True)
+    return src
+
+
+class TestMainCheckoutOf:
+    def test_main_checkout_answers_itself(self, main_repo: Path) -> None:
+        src = _src_of(main_repo)
+        assert main_checkout_of(src) == _git_main_checkout(src) == main_repo
+
+    def test_nested_linked_worktree_answers_the_main_checkout(self, main_repo: Path) -> None:
+        src = _src_of(_add_worktree(main_repo, main_repo / '.worktrees' / 'wt', 'wt'))
+        assert main_checkout_of(src) == _git_main_checkout(src) == main_repo
+
+    def test_linked_worktree_outside_the_main_tree(self, base: Path, main_repo: Path) -> None:
+        src = _src_of(_add_worktree(main_repo, base / 'elsewhere' / 'wt2', 'wt2'))
+        assert main_checkout_of(str(src)) == _git_main_checkout(src) == main_repo
+
+    def test_relative_gitdir_in_the_worktree_file(self, main_repo: Path) -> None:
+        worktree = _add_worktree(main_repo, main_repo / '.worktrees' / 'wt', 'wt')
+        relative = os.path.relpath(_gitdir_of_worktree(worktree).resolve(), worktree)
+        (worktree / '.git').write_text(f'gitdir: {relative}\n')
+        src = _src_of(worktree)
+        assert main_checkout_of(src) == _git_main_checkout(src) == main_repo
+
+    def test_no_enclosing_checkout_is_refused(self, base: Path) -> None:
+        src = base / 'plain' / 'src'
+        assert not any((ancestor / '.git').exists() for ancestor in src.parents), (
+            f'fixture premise: no ancestor of {src} may hold .git'
+        )
+        with pytest.raises(CheckoutRootError, match=re.escape(str(src))):
+            main_checkout_of(src)
+
+    def test_missing_gitdir_is_refused_rather_than_answering_the_worktree(
+        self, base: Path, main_repo: Path
+    ) -> None:
+        worktree = _add_worktree(main_repo, main_repo / '.worktrees' / 'wt', 'wt')
+        nowhere = base / 'nowhere'
+        (worktree / '.git').write_text(f'gitdir: {nowhere}\n')
+        with pytest.raises(CheckoutRootError, match=re.escape(str(nowhere))):
+            main_checkout_of(_src_of(worktree))
+
+    def test_bare_backed_worktree_is_refused(self, base: Path, main_repo: Path) -> None:
+        bare = base / 'bare.git'
+        subprocess.run(
+            ['git', 'clone', '-q', '--bare', str(main_repo), str(bare)], check=True, capture_output=True
+        )
+        src = _src_of(_add_worktree(bare, base / 'bare-wt', 'bwt'))
+        common_dir = _git(src, 'rev-parse', '--path-format=absolute', '--git-common-dir').strip()
+        assert Path(common_dir) == bare, 'fixture premise: the bare repo is the common git dir'
+        with pytest.raises(CheckoutRootError, match=re.escape(str(bare))):
+            main_checkout_of(src)
+
+    @pytest.mark.parametrize('pointer', ['gitfile', 'commondir'])
+    def test_undecodable_pointer_file_is_refused_naming_it(
+        self, main_repo: Path, pointer: str
+    ) -> None:
+        worktree = _add_worktree(main_repo, main_repo / '.worktrees' / 'wt', 'wt')
+        dot_git = worktree / '.git'
+        target = dot_git if pointer == 'gitfile' else _gitdir_of_worktree(worktree) / 'commondir'
+        target.write_bytes(b'gitdir: \xff\xfe\n' if pointer == 'gitfile' else b'\xff\xfe\n')
+        with pytest.raises(CheckoutRootError) as refused:
+            main_checkout_of(_src_of(worktree))
+        assert str(target) in str(refused.value)
+        assert isinstance(refused.value.__cause__, UnicodeDecodeError)
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason='root reads a mode-000 file')
+    def test_unreadable_gitfile_is_refused_naming_it(self, main_repo: Path) -> None:
+        worktree = _add_worktree(main_repo, main_repo / '.worktrees' / 'wt', 'wt')
+        src = _src_of(worktree)
+        dot_git = worktree / '.git'
+        dot_git.chmod(0)
+        try:
+            with pytest.raises(CheckoutRootError) as refused:
+                main_checkout_of(src)
+        finally:
+            dot_git.chmod(0o644)
+        assert str(dot_git) in str(refused.value)
+        assert isinstance(refused.value.__cause__, PermissionError)
+
+
 class TestDefaultProjectRoot:
     def test_main_checkout_answers_itself(self, main_repo: Path) -> None:
         src = main_repo / 'src'
@@ -209,20 +290,6 @@ class TestDefaultProjectRoot:
 
     def test_nested_linked_worktree_answers_the_main_checkout(self, main_repo: Path) -> None:
         worktree = _add_worktree(main_repo, main_repo / '.worktrees' / 'wt', 'wt')
-        src = worktree / 'src'
-        answer = _resolved_answer(src)
-        assert answer == _git_main_checkout(src) == main_repo
-
-    def test_linked_worktree_outside_the_main_tree(self, base: Path, main_repo: Path) -> None:
-        worktree = _add_worktree(main_repo, base / 'elsewhere' / 'wt2', 'wt2')
-        src = worktree / 'src'
-        answer = _resolved_answer(src)
-        assert answer == _git_main_checkout(src) == main_repo
-
-    def test_relative_gitdir_in_the_worktree_file(self, main_repo: Path) -> None:
-        worktree = _add_worktree(main_repo, main_repo / '.worktrees' / 'wt', 'wt')
-        relative = os.path.relpath(_gitdir_of_worktree(worktree).resolve(), worktree)
-        (worktree / '.git').write_text(f'gitdir: {relative}\n')
         src = worktree / 'src'
         answer = _resolved_answer(src)
         assert answer == _git_main_checkout(src) == main_repo
@@ -236,17 +303,6 @@ class TestDefaultProjectRoot:
         assert returncode != 0
         assert 'CheckoutRootError' in stderr
         assert str(src / 'shared' / 'project_layout.py') in stderr
-
-    def test_missing_gitdir_fails_loudly_rather_than_answering_the_worktree(
-        self, base: Path, main_repo: Path
-    ) -> None:
-        worktree = _add_worktree(main_repo, main_repo / '.worktrees' / 'wt', 'wt')
-        nowhere = base / 'nowhere'
-        (worktree / '.git').write_text(f'gitdir: {nowhere}\n')
-        returncode, stdout, stderr = _answer_from(worktree / 'src')
-        assert returncode != 0, f'answered {stdout.strip()!r} instead of failing'
-        assert 'CheckoutRootError' in stderr
-        assert str(nowhere) in stderr
 
     def test_real_tree_answer_matches_git(self) -> None:
         module_dir = Path(shared.project_layout.__file__).resolve().parent

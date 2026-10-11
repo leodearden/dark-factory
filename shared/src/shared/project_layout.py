@@ -17,6 +17,7 @@ __all__ = [
     'default_project_root',
     'escalation_queue_dir',
     'known_project_roots',
+    'main_checkout_of',
     'orchestrator_data_dir',
     'park_eviction_requests_db',
     'runs_db',
@@ -70,11 +71,16 @@ class CheckoutRootError(RuntimeError):
 
 def default_project_root() -> Path:
     """The main checkout enclosing this module, even when imported from a linked worktree."""
-    return _main_checkout_of(Path(__file__).resolve())
+    return main_checkout_of(Path(__file__))
 
 
-def _main_checkout_of(start: Path) -> Path:
-    checkout = _enclosing_checkout(start)
+def main_checkout_of(path: StrPath) -> Path:
+    """The main checkout of the git checkout enclosing *path*, following a linked worktree.
+
+    Raises CheckoutRootError when none can be derived (no enclosing checkout, an
+    unreadable or broken gitfile, or a bare-backed worktree).
+    """
+    checkout = _enclosing_checkout(Path(path).resolve())
     dot_git = checkout / '.git'
     if dot_git.is_dir():
         return checkout
@@ -82,7 +88,7 @@ def _main_checkout_of(start: Path) -> Path:
     commondir = gitdir / 'commondir'
     if not commondir.is_file():
         return checkout
-    common = (gitdir / commondir.read_text(encoding='utf-8').strip()).resolve()
+    common = (gitdir / _read_pointer_file(commondir).strip()).resolve()
     if common.name != '.git':
         raise CheckoutRootError(
             f'{checkout} is a linked worktree whose common git dir {common} is not '
@@ -96,14 +102,21 @@ def _enclosing_checkout(start: Path) -> Path:
     for candidate in (start, *start.parents):
         if (candidate / '.git').exists():
             return candidate
-    raise CheckoutRootError(
-        f'no git checkout encloses {start}: shared must be imported from a checkout '
-        f'(no ancestor has .git)'
-    )
+    raise CheckoutRootError(f'no git checkout encloses {start}: no ancestor has .git')
+
+
+def _read_pointer_file(pointer_file: Path) -> str:
+    try:
+        return pointer_file.read_text(encoding='utf-8')
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CheckoutRootError(
+            f'git pointer file {pointer_file} is unreadable ({type(exc).__name__}: {exc}), '
+            f'so no main checkout can be derived'
+        ) from exc
 
 
 def _gitdir_of(dot_git: Path) -> Path:
-    text = dot_git.read_text(encoding='utf-8')
+    text = _read_pointer_file(dot_git)
     values = [
         line.removeprefix('gitdir:').strip()
         for line in text.splitlines()
