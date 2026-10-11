@@ -18,6 +18,7 @@ import pytest
 from legibility import coder, detectors, digest, inventory
 from legibility import config as config_mod
 from legibility import sampling as mod
+from legibility.detectors import SignalClass
 from legibility_carrier_fixtures import (
     PROSE_QUOTING_THE_SCHEMA,
     briefing_text,
@@ -75,19 +76,16 @@ def _self_correct_record() -> dict:
 
 
 def _df_guard_record() -> dict:
-    # mcp__plan-tools__report_false_premise is a real dark_factory guard
-    # tool (orchestrator/src/orchestrator/mcp/plan_tools.py) — a structural
-    # tool_use.name match, not a text/substring guess.
     return {
-        'type': 'assistant',
+        'type': 'user',
         'timestamp': '2026-07-13T10:03:00.000Z',
         'message': {
             'content': [
                 {
-                    'type': 'tool_use',
-                    'id': 'tu1',
-                    'name': 'mcp__plan-tools__report_false_premise',
-                    'input': {'task_id': '2573', 'reason': 'premise invalid'},
+                    'type': 'tool_result',
+                    'tool_use_id': 'tu1',
+                    'is_error': False,
+                    'content': 'BLOCKED: merge gate refused',
                 },
             ]
         },
@@ -126,28 +124,28 @@ class TestScoreSignalsAllClasses:
         )
 
     def test_tool_error(self, tmp_path):
-        assert mod.score_signals(self._build(tmp_path)).tool_error == 1
+        assert mod.score_signals(self._build(tmp_path))[SignalClass.TOOL_ERROR] == 1
 
     def test_not_found(self, tmp_path):
-        assert mod.score_signals(self._build(tmp_path)).not_found == 1
+        assert mod.score_signals(self._build(tmp_path))[SignalClass.NOT_FOUND] == 1
 
     def test_self_correct(self, tmp_path):
-        assert mod.score_signals(self._build(tmp_path)).self_correct == 1
+        assert mod.score_signals(self._build(tmp_path))[SignalClass.SELF_CORRECT] == 1
 
     def test_df_guard(self, tmp_path):
-        assert mod.score_signals(self._build(tmp_path)).df_guard == 1
+        assert mod.score_signals(self._build(tmp_path))[SignalClass.DF_GUARD] == 1
 
     def test_interrupt(self, tmp_path):
-        assert mod.score_signals(self._build(tmp_path)).interrupt == 1
+        assert mod.score_signals(self._build(tmp_path))[SignalClass.INTERRUPT] == 1
 
     def test_total_signal_is_sum_of_classes(self, tmp_path):
         counts = mod.score_signals(self._build(tmp_path))
         assert counts.total_signal == (
-            counts.tool_error
-            + counts.not_found
-            + counts.self_correct
-            + counts.df_guard
-            + counts.interrupt
+            counts[SignalClass.TOOL_ERROR]
+            + counts[SignalClass.NOT_FOUND]
+            + counts[SignalClass.SELF_CORRECT]
+            + counts[SignalClass.DF_GUARD]
+            + counts[SignalClass.INTERRUPT]
         )
         assert counts.total_signal == 5
 
@@ -208,8 +206,8 @@ class TestSamplerDesignedOutcomeParity:
 
         counts = mod.score_signals(path)
 
-        assert counts.tool_error == 0
-        assert counts.designed_outcome == 13
+        assert counts[SignalClass.TOOL_ERROR] == 0
+        assert counts[SignalClass.DESIGNED_OUTCOME] == 13
 
     def test_genuine_failure_still_increments_tool_error(self, tmp_path):
         path = _write_transcript(
@@ -219,8 +217,8 @@ class TestSamplerDesignedOutcomeParity:
 
         counts = mod.score_signals(path)
 
-        assert counts.tool_error == 1
-        assert counts.designed_outcome == 3
+        assert counts[SignalClass.TOOL_ERROR] == 1
+        assert counts[SignalClass.DESIGNED_OUTCOME] == 3
 
     def test_total_signal_excludes_designed_outcome(self, tmp_path):
         # total_signal is the sampler's RANKING scale over the five scored
@@ -234,8 +232,8 @@ class TestSamplerDesignedOutcomeParity:
         base_counts = mod.score_signals(base)
         noisy_counts = mod.score_signals(noisy)
 
-        assert noisy_counts.designed_outcome == 9
-        assert base_counts.designed_outcome == 0
+        assert noisy_counts[SignalClass.DESIGNED_OUTCOME] == 9
+        assert base_counts[SignalClass.DESIGNED_OUTCOME] == 0
         assert noisy_counts.total_signal == base_counts.total_signal == 1
 
     def test_ceiling_only_session_is_dropped_before_digest_time(self):
@@ -277,8 +275,8 @@ class TestSamplerDesignedOutcomeParity:
 
         counts = mod.score_signals(path)
 
-        assert counts.tool_error == 1
-        assert counts.designed_outcome == 0
+        assert counts[SignalClass.TOOL_ERROR] == 1
+        assert counts[SignalClass.DESIGNED_OUTCOME] == 0
         assert counts.total_signal == 1
 
     def test_sampler_and_digest_agree_on_the_same_records(self, tmp_path):
@@ -294,8 +292,19 @@ class TestSamplerDesignedOutcomeParity:
         sampled = mod.score_signals(path)
         digested = digest.signal_counts(records)
 
-        assert sampled.tool_error == digested['tool_error'] == 1
-        assert sampled.designed_outcome == digested['designed_outcome'] == 3
+        assert sampled[SignalClass.TOOL_ERROR] == digested['tool_error'] == 1
+        assert sampled[SignalClass.DESIGNED_OUTCOME] == digested['designed_outcome'] == 3
+
+
+class TestSignalCounts:
+    def test_an_unknown_class_name_is_rejected_naming_the_vocabulary(self):
+        with pytest.raises(ValueError, match='bogus') as raised:
+            mod.SignalCounts(bogus=1)
+
+        assert all(signal.value in str(raised.value) for signal in SignalClass)
+
+    def test_the_default_maps_every_class_to_zero(self):
+        assert dict(mod.SignalCounts()) == dict.fromkeys(SignalClass, 0)
 
 
 class TestScoreSignalsClean:
@@ -303,11 +312,11 @@ class TestScoreSignalsClean:
         path = _write_transcript(tmp_path / 'clean.jsonl', [_clean_record(i) for i in range(3)])
         counts = mod.score_signals(path)
         assert counts.total_signal == 0
-        assert counts.tool_error == 0
-        assert counts.not_found == 0
-        assert counts.self_correct == 0
-        assert counts.df_guard == 0
-        assert counts.interrupt == 0
+        assert counts[SignalClass.TOOL_ERROR] == 0
+        assert counts[SignalClass.NOT_FOUND] == 0
+        assert counts[SignalClass.SELF_CORRECT] == 0
+        assert counts[SignalClass.DF_GUARD] == 0
+        assert counts[SignalClass.INTERRUPT] == 0
 
 
 def _user_turn(text: str) -> dict:
@@ -517,7 +526,9 @@ class TestScoreSession:
 # quoted machine content or harness material is not ranked on it.
 # ---------------------------------------------------------------------------
 
-_TEXT_CLASSES = ('self_correct', 'not_found', 'df_guard', 'interrupt')
+_TEXT_CLASSES = (
+    SignalClass.SELF_CORRECT, SignalClass.NOT_FOUND, SignalClass.DF_GUARD, SignalClass.INTERRUPT,
+)
 
 _SIGNAL_LITERALS = (
     "that's wrong",
@@ -568,8 +579,8 @@ def _stamped_tool_result_record() -> dict:
     )
 
 
-def _text_class_counts(tmp_path: Path, records: list[dict]) -> dict[str, int]:
-    counts = dataclasses.asdict(mod.score_signals(_write_transcript(tmp_path / 's.jsonl', records)))
+def _text_class_counts(tmp_path: Path, records: list[dict]) -> dict[SignalClass, int]:
+    counts = dict(mod.score_signals(_write_transcript(tmp_path / 's.jsonl', records)))
     return {name: counts[name] for name in _TEXT_CLASSES}
 
 
@@ -624,12 +635,12 @@ class TestReingestedContentIsNotScored:
     def test_prose_quoting_the_schema_inline_still_self_corrects(self, tmp_path):
         records = [_assistant_texts(PROSE_QUOTING_THE_SCHEMA)]
 
-        assert _text_class_counts(tmp_path, records)['self_correct'] == 1
+        assert _text_class_counts(tmp_path, records)[SignalClass.SELF_CORRECT] == 1
 
     def test_a_coder_judgment_block_does_not_mask_a_sibling_self_correction(self, tmp_path):
         records = [_assistant_texts(coder_judgment(_LITERAL_LINE), _GENUINE_SELF_CORRECTION)]
 
-        assert _text_class_counts(tmp_path, records)['self_correct'] == 1
+        assert _text_class_counts(tmp_path, records)[SignalClass.SELF_CORRECT] == 1
 
     def test_a_coder_judgment_tool_result_does_not_mask_a_sibling_not_found(self, tmp_path):
         records = [_user_blocks(
@@ -637,26 +648,18 @@ class TestReingestedContentIsNotScored:
             _tool_result_block('cat: x: No such file or directory'),
         )]
 
-        assert _text_class_counts(tmp_path, records)['not_found'] == 1
+        assert _text_class_counts(tmp_path, records)[SignalClass.NOT_FOUND] == 1
 
     def test_human_origin_keeps_every_text_class(self, tmp_path):
         records = [
             _origin_stamped(_user_turn(_LITERAL_LINE), 'human'),
+            _origin_stamped(
+                _user_blocks(_tool_result_block('cat: x: No such file or directory')), 'human',
+            ),
             _assistant_texts(_GENUINE_SELF_CORRECTION),
         ]
 
         assert _text_class_counts(tmp_path, records) == dict.fromkeys(_TEXT_CLASSES, 1)
-
-    def test_a_guard_tool_use_still_counts_beside_a_coder_judgment(self, tmp_path):
-        record = _assistant_texts(coder_judgment(_LITERAL_LINE))
-        record['message']['content'].append({
-            'type': 'tool_use',
-            'id': 'tu-g',
-            'name': 'mcp__plan-tools__report_false_premise',
-            'input': {'task_id': '42', 'reason': 'premise invalid'},
-        })
-
-        assert _text_class_counts(tmp_path, [record])['df_guard'] == 1
 
     def test_a_structural_error_in_a_non_human_record_still_counts(self, tmp_path):
         records = [_origin_stamped(
@@ -665,7 +668,7 @@ class TestReingestedContentIsNotScored:
         )]
         path = _write_transcript(tmp_path / 's.jsonl', records)
 
-        assert mod.score_signals(path).tool_error == digest.signal_counts(records)['tool_error'] == 1
+        assert mod.score_signals(path)[SignalClass.TOOL_ERROR] == digest.signal_counts(records)['tool_error'] == 1
 
 
 class TestSamplerReingestedContentParity:
@@ -686,7 +689,7 @@ class TestSamplerReingestedContentParity:
         ]
         path = _write_transcript(tmp_path / 'parity.jsonl', records)
 
-        sampled = dataclasses.asdict(mod.score_signals(path))
+        sampled = dict(mod.score_signals(path))
         digested = digest.signal_counts(records)
 
         assert {name: sampled[name] for name in _TEXT_CLASSES} == dict.fromkeys(_TEXT_CLASSES, 1)
@@ -699,7 +702,7 @@ class TestSamplerReingestedContentParity:
         record = _user_blocks({'type': 'text', 'text': head}, {'type': 'text', 'text': tail})
         path = _write_transcript(tmp_path / 'split.jsonl', [record])
 
-        sampled = dataclasses.asdict(mod.score_signals(path))
+        sampled = dict(mod.score_signals(path))
         digested = digest.signal_counts([record])
 
         assert detectors.is_non_dialogue_carrier(record, head) is False

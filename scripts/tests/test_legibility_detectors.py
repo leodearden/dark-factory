@@ -6,9 +6,10 @@ record_hits.
 from __future__ import annotations
 
 import dataclasses
+from pathlib import Path
 
 import pytest
-from legibility import detectors, digest
+from legibility import detectors, digest, sampling
 from legibility.detectors import CarrierKind, SignalClass
 from legibility_carrier_fixtures import (
     PROSE_QUOTING_THE_SCHEMA,
@@ -492,3 +493,44 @@ class TestUserTurnText:
 
     def test_a_tool_result_only_record_has_no_turn_text(self):
         assert detectors.user_turn_text(tool_result_record('tu-1', 'output')) is None
+
+
+# ---------------------------------------------------------------------------
+# Boundary row 1: the sampler and the digest agree on class presence. Each
+# committed transcript holds ONLY its stated class; the first eight are the
+# discriminating cases the two scorers used to disagree on.
+# ---------------------------------------------------------------------------
+
+_CORPUS = Path(__file__).parent / 'fixtures' / 'legibility_detectors'
+
+EXPECTED_PRESENT: dict[str, frozenset[SignalClass]] = {
+    'bare_scope_violation.jsonl': frozenset(),
+    'phantom_done.jsonl': frozenset(),
+    'guard_tool_use.jsonl': frozenset(),
+    'sampler_only_self_correct.jsonl': frozenset(),
+    'not_found_outside_tool_result.jsonl': frozenset(),
+    'interrupt_in_tool_result.jsonl': frozenset(),
+    'reingested_coder_judgment.jsonl': frozenset(),
+    'harness_briefing.jsonl': frozenset(),
+    'tool_error.jsonl': frozenset({SignalClass.TOOL_ERROR}),
+    'self_correct.jsonl': frozenset({SignalClass.SELF_CORRECT}),
+    'not_found.jsonl': frozenset({SignalClass.NOT_FOUND}),
+    'df_guard.jsonl': frozenset({SignalClass.DF_GUARD}),
+    'interrupt.jsonl': frozenset({SignalClass.INTERRUPT}),
+    'designed_outcome.jsonl': frozenset({SignalClass.DESIGNED_OUTCOME}),
+}
+
+
+class TestSamplerAndDigestAgreeOnTheCorpus:
+    def test_the_corpus_is_exactly_the_table(self):
+        assert {path.name for path in _CORPUS.glob('*.jsonl')} == set(EXPECTED_PRESENT)
+
+    @pytest.mark.parametrize('signal', list(SignalClass), ids=str)
+    @pytest.mark.parametrize('name', sorted(EXPECTED_PRESENT))
+    def test_class_presence_agrees(self, name, signal):
+        path = _CORPUS / name
+
+        sampled = bool(sampling.scan_transcript(path).counts[signal])
+        digested = bool(digest.signal_counts(digest.load_transcript(path))[signal])
+
+        assert sampled == digested == (signal in EXPECTED_PRESENT[name])
