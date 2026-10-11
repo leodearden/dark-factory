@@ -46,6 +46,12 @@ class RunSource(StrEnum):
     UNDO = 'undo'
 
 
+class RunKind(StrEnum):
+    PLAN = 'plan'
+    APPLY = 'apply'
+    UNDO = 'undo'
+
+
 class ActionState(StrEnum):
     PLANNED = 'planned'
     APPLIED = 'applied'
@@ -162,6 +168,25 @@ class RunRow:
     finished_at: str | None
     counts: Mapping[str, Any] | None
     plan_sha256: str | None
+
+    @property
+    def kind(self) -> RunKind:
+        if self.source is RunSource.UNDO:
+            return RunKind.UNDO
+        return RunKind.APPLY if self.writes else RunKind.PLAN
+
+
+class NothingToUndo(LookupError):
+    """The run has no heal still applied for an undo to take back."""
+
+    def __init__(self, run: RunRow, applied: int) -> None:
+        self.run = run
+        self.applied = applied
+        super().__init__(
+            f'link-heal run {run.run_id[:8]} is a {run.kind.value} run '
+            f'(source {run.source.value}) with {applied} applied heals; '
+            'undo takes back only the heals an apply run applied',
+        )
 
 
 @dataclass(frozen=True)
@@ -330,6 +355,13 @@ class LinkHealLedger:
             f'AND {_HEALS_ONLY} ORDER BY id',
             (executed_run_id, ActionState.APPLIED.value),
         )
+
+    def undoable_heals(self, target: RunRow) -> list[ActionRow]:
+        """The heals an undo of *target* takes back, oldest first; refuses a run with none."""
+        heals = self.applied_actions(target.run_id) if target.kind is RunKind.APPLY else []
+        if not heals:
+            raise NothingToUndo(target, applied=len(heals))
+        return heals
 
     def set_outcome(
         self,
