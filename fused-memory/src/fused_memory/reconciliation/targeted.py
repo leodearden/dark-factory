@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from shared.project_layout import escalation_queue_dir
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claimant
 
 from fused_memory.config.schema import FusedMemoryConfig
@@ -81,10 +82,6 @@ _PARENT_CANCELLED_REOPEN_PREFIX = 'parent_cancelled:'
 _SNAPSHOT_CONTRADICTING_TRANSITIONS: frozenset[str] = frozenset(
     {'done', 'cancelled', 'deferred'}
 )
-
-# Default location of the per-project escalation queue.  Matches the
-# convention used by scope_violation_escalator.py and ticket_janitor.py.
-_ESCALATION_QUEUE_DIRNAME = 'data/escalations'
 
 # What the dependent-unblock claimant clear did, carried on the action as
 # ``claimant_clear`` (see TargetedReconciler._clear_claimant_before_unblock).
@@ -1785,7 +1782,7 @@ class TargetedReconciler:
         detail = '\n'.join(detail_lines)
 
         try:
-            queue = EscalationQueue(Path(project_root) / _ESCALATION_QUEUE_DIRNAME)
+            queue = EscalationQueue(escalation_queue_dir(project_root))
             esc = Escalation(
                 id=queue.make_id(task_id),
                 task_id=task_id,
@@ -1941,7 +1938,7 @@ class TargetedReconciler:
             # contradicted branch would create data/escalations/ in every
             # target project as a side effect of an unrelated done
             # transition — the trap _escalation_pin_index_for documents.
-            queue = queue_cls(Path(project_root) / _ESCALATION_QUEUE_DIRNAME)
+            queue = queue_cls(escalation_queue_dir(project_root))
             esc = esc_cls(
                 id=queue.make_id(task_id),
                 task_id=task_id,
@@ -2132,7 +2129,7 @@ class TargetedReconciler:
             return None
         index: dict[str, list[str]] | None
         try:
-            queue = EscalationQueue(Path(project_root) / _ESCALATION_QUEUE_DIRNAME)
+            queue = EscalationQueue(escalation_queue_dir(project_root))
             index = {}
             for esc in await asyncio.to_thread(queue.get_pending):
                 # str() both sides of what get_by_task compared with ==, so an
