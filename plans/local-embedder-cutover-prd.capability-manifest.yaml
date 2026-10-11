@@ -2,7 +2,7 @@ prd: plans/local-embedder-cutover-prd.md
 schema_version: 1
 tasks:
 - label: α1
-  task_id: null
+  task_id: 6797
   title: Define the granite embedder compose service and the fused-memory hold drop-in
   note: >-
     docker-compose.yml already carries three services (falkordb, qdrant, fused-mcp), so
@@ -79,7 +79,7 @@ tasks:
       kind: manual
       reason: a docker CLI validation, not expressible as a grep over the tree
 - label: β1
-  task_id: null
+  task_id: 6798
   title: Config overlay loader, native-width requests, startup endpoint probe, get_status
     embedder and overlay blocks
   note: >-
@@ -149,7 +149,7 @@ tasks:
       kind: manual
       reason: rejection quality is judged by boundary row B19
 - label: β2
-  task_id: null
+  task_id: 6800
   title: C0 scope enumerator, C2 width guard, chokepoint asserts, loud search_corpus
   note: >-
     Decompose rebindings (see the .md twin, F1-F3): C0's registry is built on
@@ -270,7 +270,7 @@ tasks:
       kind: manual
       reason: rejection behaviour asserted by β2's executed fixture test
 - label: α2
-  task_id: null
+  task_id: 6801
   title: Install and verify the embedder on the host (attended operator step)
   note: >-
     execution_class operational (born-at-L2 gate), files []. Signal (4) is β1/β2's live
@@ -306,7 +306,7 @@ tasks:
       kind: manual
       reason: a live get_status observation by the operator
 - label: γ1
-  task_id: null
+  task_id: 6802
   title: 'Reembed engine part 1: derivation module, text cache, census, prepare'
   note: >-
     Owns B1, B2, B3, B15a and the engine half of B4. Decides Q1 (cache format) and, with δ,
@@ -360,7 +360,7 @@ tasks:
       kind: manual
       reason: dependency direction, asserted by the wired edge
 - label: γ2
-  task_id: null
+  task_id: 6803
   title: 'Reembed engine part 2: record-keyed backup, apply; retire reindex.py and orphaned
     helpers'
   note: >-
@@ -448,7 +448,7 @@ tasks:
       kind: manual
       reason: behaviour asserted by boundary rows B10a and B15b against real store fixtures
 - label: ε
-  task_id: null
+  task_id: 6804
   title: search_tasks config key, provenance stamps + guard (C4), quantile mapper (D4)
   note: >-
     R7: ε stamps every existing embedder-space group in tracked config.yaml (write_triage
@@ -530,7 +530,7 @@ tasks:
       kind: manual
       reason: the mapper's name is the leaf's choice; asserted by ε's fixture test
 - label: δ
-  task_id: null
+  task_id: 6805
   title: 'reembed cutover: profiles, phases P0–P6, hold, journal, transient unit with dead-owner
     restore, auto-restore, P5 semantics, smoke'
   note: >-
@@ -647,7 +647,7 @@ tasks:
       kind: manual
       reason: asserted by boundary row B9 and δ's P0 preflight test
 - label: ζ
-  task_id: null
+  task_id: 6806
   title: Dress rehearsal on scratch copies (integration gate)
   note: >-
     task_kind normal, full path (precedent task 3722). The report carries the line
@@ -705,7 +705,7 @@ tasks:
       kind: manual
       reason: a rehearsal observation recorded in the report
 - label: η
-  task_id: null
+  task_id: 6807
   title: Live cutover (born-at-L2 attended operator gate)
   note: >-
     execution_class operational, files []. Decides Q4 (halt every orchestrator's scheduler
@@ -734,7 +734,7 @@ tasks:
       kind: manual
       reason: dependency direction, asserted by the wired edge
 - label: λ
-  task_id: null
+  task_id: 6808
   title: Fold the embedder overlay into tracked config after the soak
   note: >-
     R4: task_kind normal, complexity simple, milestone delayed 1209600 s after η. Reads
@@ -759,7 +759,7 @@ tasks:
       kind: manual
       reason: a live get_status comparison
 - label: θ
-  task_id: null
+  task_id: 6809
   title: Remove the overlay and the 1536 backups after the fold
   note: >-
     R1: task_kind deterministic, before_done {script: scripts/embedder-cutover-cleanup.sh,
@@ -775,7 +775,7 @@ tasks:
       kind: manual
       reason: a deterministic before_done; its own exit code is the gate
 - label: κ1
-  task_id: null
+  task_id: 6799
   title: 'Cross-PRD corrections: write-triage evidence stale at η; eval PRD pointer'
   capabilities:
   - name: write-triage-prd-amended
@@ -799,7 +799,7 @@ tasks:
       - plans/local-memory-models-eval-prd.md
       expect: present
 - label: κ2
-  task_id: null
+  task_id: 6810
   title: Docs and secondary config after cutover
   note: >-
     R2: the text-embedding-3-small grep is restricted to κ2's own files (SETUP.md README.md

@@ -348,6 +348,13 @@ leaf builds on landed substrate (§8).
     equal tracked config.
   - **Failure:** nothing is committed in the window. A P5 failure removes the overlay and
     the drop-in and takes the I4 auto-restore.
+  - **Extension (Leo, 2026-10-11, at decompose):** the drop-in goes on
+    `fused-memory.service` and on both timer services
+    (`fused-memory-flag-marker-sweep.service`, `memory-metadata-coverage-census.service`).
+    Their jobs build `MemoryService` / `Mem0Backend` straight from tracked `config.yaml`,
+    which keeps the 1536 identity for the soak. Leo chose this over "guard only" (both jobs
+    refuse nightly for 14 days) and over pausing the timers. δ's `live` profile lists all
+    three units; a rollback, the auto-restore and θ's cleanup remove all three.
 
 ## 6. Contract
 
@@ -629,3 +636,64 @@ deterministic.
 | `no-silent-fail-soft` | No OpenAI fallback; `search_corpus` raises; truncated reads are incomplete; unclassified containers refuse |
 | `readers-prove-their-producer` | β2's guard reports on the live 1536 stores at α2 before any cutover |
 | `exceptions-owned-or-ratified` | `embedder_scope.excluded` entries each carry a reason; no suppression is added |
+
+## 14. Decompose record (2026-10-11)
+
+Decomposed by a `/team` + `/prd` session. All 14 leaves were filed with
+`planning_mode=True`, wired, and released together.
+
+| Leaf | Task | Execution path | Depends on |
+|---|---|---|---|
+| α1 | 6797 | simple | — |
+| α2 | 6801 | operator gate | α1 6797, β2 6800 |
+| β1 | 6798 | normal | — |
+| β2 | 6800 | normal | β1 6798 |
+| γ1 | 6802 | normal | β2 6800 |
+| γ2 | 6803 | normal | γ1 6802 |
+| ε | 6804 | normal | γ1 6802, β2 6800 |
+| δ | 6805 | normal | α1 6797, β2 6800, γ2 6803, ε 6804 |
+| ζ | 6806 | normal (integration gate) | α2 6801, δ 6805 |
+| η | 6807 | operator gate | ζ 6806, κ1 6799 |
+| λ | 6808 | simple, delayed milestone 14 d | η 6807 |
+| θ | 6809 | deterministic | λ 6808 |
+| κ1 | 6799 | simple | — |
+| κ2 | 6810 | simple | η 6807 |
+
+**Manifest.** `plans/local-embedder-cutover-prd.capability-manifest.md` and its YAML
+sidecar bind each leaf's capabilities to evidence. The manifest also records every
+resolution made at decompose; this section lists only what changes the PRD's own text.
+
+**Cancelled as superseded by β2 (D8):** tasks 3867 and 4877, and task 4294, the other
+half that had been coalesced into 4877. 4877's documentation item (a configured `api_url`
+beats an ambient `OPENAI_BASE_URL`) moved into κ2.
+
+**One edge added.** η depends on κ1, because η's signal includes notifying the
+write-triage owner "per κ1". The other 17 edges are §10's.
+
+**Statements above that did not hold on main, and what the leaves do instead:**
+
+- **§2 fact 9 and C2.** `fused-memory/scripts/cgl_eta_auto_apply_impl.py` writes no
+  vector; its recovery dump only reads. β2's chokepoints are
+  `GraphitiBackend.update_node_embedding`, `cross_graph_move._embedding_set_clause` and
+  `arm_harness/graph_copy.py::_write_vectors`.
+- **C0's registry.** The dashboard's discovery is dashboard-only and maps to escalation
+  URLs. C0 builds on `fused_memory/models/scope.py`, which reads the canonical config
+  only. D13 leaves "vector-bearing" undefined; β2 defines it and seeds the exclusions.
+- **C1 never restarts the two timers it stops at P1.** δ's P6 and every restore path
+  start them again.
+- **C1 does not say how P5 finds the dated C4b file.** `cutover` takes
+  `--threshold-map`, validated at P0; ζ runs the mapper before the scratch cutover.
+- **C2's "at startup".** The guard binds wherever a backend initialises, in any process,
+  and its probe has a third outcome, `unknown`, for a timeout or connection error.
+- **D14's "deep-merges".** `embedder.*` merges per key; each calibration unit in the
+  overlay replaces the base unit wholesale, so a stamp never vouches for a base value.
+- **§4 item 1.** The compose file already has three services; the embedder is the fourth.
+- **§10 θ.** `submit_task` requires θ's script to exist at filing, so a fail-loud stub
+  `scripts/embedder-cutover-cleanup.sh` was committed with the manifest and δ replaces it.
+- **§10 κ2.** The `text-embedding-3-small` grep is scoped to κ2's own files: tracked
+  `config.yaml` keeps the string until λ, and task 6406's path keeps it by design.
+
+**Review.** Two critic passes ran at decompose. The first reviewed the raw drafts; the
+second reviewed the integrated package and found two of the first round's fixes wrong.
+Both sets of findings are resolved in the filed task texts.
+
