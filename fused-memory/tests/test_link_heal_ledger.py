@@ -22,6 +22,8 @@ from fused_memory.maintenance.link_heal_ledger import (
     AdjudicationRecord,
     AmbiguousRun,
     LinkHealLedger,
+    NothingToUndo,
+    RunKind,
     RunLock,
     RunLockHeld,
     RunSource,
@@ -156,6 +158,82 @@ class TestRuns:
 
         with pytest.raises(AmbiguousRun):
             ledger.resolve_run('abcdef01')
+
+
+def _plan_and_apply_two(ledger) -> tuple[str, str, list[int]]:
+    plan_run = ledger.start_run(RunSource.CORPUS, writes=False)
+    ids = ledger.add_planned(plan_run, [_planned(1), _planned(2)])
+    apply_run = ledger.start_run(RunSource.CORPUS, writes=True)
+    for action_id in ids:
+        ledger.set_outcome(action_id, ActionState.APPLIED, apply_run, None)
+    return plan_run, apply_run, ids
+
+
+def _undo_run_with_a_step(ledger) -> str:
+    _plan_run, apply_run, _ids = _plan_and_apply_two(ledger)
+    original = ledger.applied_actions(apply_run)[0]
+    undo_run = ledger.start_run(RunSource.UNDO, writes=True)
+    ledger.add_undo_step(
+        undo_run, original,
+        before=original.planned.post_image, after=original.planned.pre_image,
+        state=ActionState.APPLIED, detail=None,
+    )
+    return undo_run
+
+
+def _undone_apply_run(ledger) -> str:
+    plan_run = ledger.start_run(RunSource.CORPUS, writes=False)
+    (action_id,) = ledger.add_planned(plan_run, [_planned()])
+    apply_run = ledger.start_run(RunSource.CORPUS, writes=True)
+    ledger.set_outcome(action_id, ActionState.APPLIED, apply_run, None)
+    ledger.mark_undone(action_id, ledger.start_run(RunSource.UNDO, writes=True))
+    return apply_run
+
+
+class TestUndoTargets:
+    @pytest.mark.parametrize(
+        ('source', 'writes', 'kind'),
+        [
+            (RunSource.CORPUS, False, RunKind.PLAN),
+            (RunSource.ADJUDICATOR, False, RunKind.PLAN),
+            (RunSource.CORPUS, True, RunKind.APPLY),
+            (RunSource.ADJUDICATOR, True, RunKind.APPLY),
+            (RunSource.UNDO, True, RunKind.UNDO),
+        ],
+    )
+    def test_a_runs_kind_follows_its_source_and_writes(self, ledger, source, writes, kind):
+        run_id = ledger.start_run(source, writes=writes)
+
+        assert ledger.resolve_run(run_id).kind is kind
+
+    def test_undoable_heals_are_the_heals_an_apply_run_applied(self, ledger):
+        _plan_run, apply_run, ids = _plan_and_apply_two(ledger)
+
+        heals = ledger.undoable_heals(ledger.resolve_run(apply_run))
+
+        assert [heal.action_id for heal in heals] == ids
+
+    @pytest.mark.parametrize(
+        ('target_of', 'kind'),
+        [
+            (lambda ledger: _plan_and_apply_two(ledger)[0], RunKind.PLAN),
+            (_undo_run_with_a_step, RunKind.UNDO),
+            (lambda ledger: ledger.start_run(RunSource.CORPUS, writes=True), RunKind.APPLY),
+            (_undone_apply_run, RunKind.APPLY),
+        ],
+        ids=['plan', 'undo', 'empty apply', 'undone apply'],
+    )
+    def test_a_run_with_no_applied_heal_is_refused(self, ledger, target_of, kind):
+        target = ledger.resolve_run(target_of(ledger))
+
+        with pytest.raises(NothingToUndo) as excinfo:
+            ledger.undoable_heals(target)
+
+        message = str(excinfo.value)
+        assert target.run_id[:8] in message
+        assert f'{kind.value} run' in message
+        assert '0 applied heals' in message
+        assert excinfo.value.run.run_id == target.run_id
 
 
 class TestActions:
