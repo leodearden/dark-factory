@@ -93,7 +93,7 @@ class TestReportFailure:
 
     @pytest.mark.asyncio
     async def test_files_into_the_layout_escalation_queue_when_relocated(
-        self, tmp_path, relocated_escalation_queue,
+        self, tmp_path, escalation_queue_relocation,
     ):
         handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
         try:
@@ -105,7 +105,7 @@ class TestReportFailure:
             )
 
             assert len(sorted(escalation_queue_dir(tmp_path).glob('esc-*.json'))) == 1
-            assert not (tmp_path / relocated_escalation_queue).exists()
+            assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
         finally:
             handle.close()
 

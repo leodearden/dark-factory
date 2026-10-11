@@ -47,7 +47,7 @@ class TestEscalationEnabled:
         assert payload['suggested_action'] == 'resubmit_to_dark_factory'
 
     def test_files_into_the_layout_escalation_queue_when_relocated(
-        self, tmp_path, relocated_escalation_queue,
+        self, tmp_path, escalation_queue_relocation,
     ):
         esc_id = ScopeViolationEscalator().report_rejection(
             project_root=str(tmp_path),
@@ -60,7 +60,7 @@ class TestEscalationEnabled:
 
         filed = sorted(escalation_queue_dir(tmp_path).glob('esc-*.json'))
         assert [json.loads(p.read_text())['id'] for p in filed] == [esc_id]
-        assert not (tmp_path / relocated_escalation_queue).exists()
+        assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
 
     def test_caches_queue_per_project_root(self, tmp_path):
         """Repeated rejections for the same project_root reuse one EscalationQueue."""

@@ -22,6 +22,7 @@ import sys
 import warnings
 import weakref
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -330,14 +331,23 @@ def code_default_config(monkeypatch, tmp_path):
     monkeypatch.setenv('CONFIG_PATH', str(tmp_path / 'no-such-config.yaml'))
 
 
+@dataclass(frozen=True)
+class EscalationQueueRelocation:
+    legacy_relpath: str
+    relocated_relpath: str
+
+
 @pytest.fixture
-def relocated_escalation_queue(monkeypatch) -> str:
-    """Simulate an operator relocating the escalation queue in its one home; return the legacy relpath."""
-    legacy = shared.project_layout.ESCALATION_QUEUE_RELPATH
-    monkeypatch.setattr(
-        shared.project_layout, 'ESCALATION_QUEUE_RELPATH', 'data/relocated-escalations'
+def escalation_queue_relocation(monkeypatch) -> EscalationQueueRelocation:
+    """Simulate an operator relocating the escalation queue in its one home."""
+    relocation = EscalationQueueRelocation(
+        legacy_relpath=shared.project_layout.ESCALATION_QUEUE_RELPATH,
+        relocated_relpath='data/relocated-escalations',
     )
-    return legacy
+    monkeypatch.setattr(
+        shared.project_layout, 'ESCALATION_QUEUE_RELPATH', relocation.relocated_relpath
+    )
+    return relocation
 
 
 @pytest_asyncio.fixture(autouse=True)

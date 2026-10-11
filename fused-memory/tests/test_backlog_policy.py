@@ -185,7 +185,7 @@ async def test_escalation_when_over_threshold_and_orchestrator_live(
 
 @pytest.mark.asyncio
 async def test_escalation_lands_in_the_layout_escalation_queue_when_relocated(
-    event_buffer, tmp_path, relocated_escalation_queue,
+    event_buffer, tmp_path, escalation_queue_relocation,
 ):
     await _seed_buffered(event_buffer, 'proj', n=12)
     project_root = tmp_path / 'proj_root'
@@ -197,7 +197,7 @@ async def test_escalation_lands_in_the_layout_escalation_queue_when_relocated(
     assert verdict.escalation_path is not None
     assert Path(verdict.escalation_path).parent == escalation_queue_dir(project_root)
     assert Path(verdict.escalation_path).exists()
-    assert not (project_root / relocated_escalation_queue).exists()
+    assert not (project_root / escalation_queue_relocation.legacy_relpath).exists()
 
 
 @pytest.mark.asyncio
@@ -1316,7 +1316,7 @@ class TestOnJudgeUnhalt:
 
     @pytest.mark.asyncio
     async def test_closes_the_halt_in_the_layout_escalation_queue_when_relocated(
-        self, event_buffer, tmp_path, relocated_escalation_queue,
+        self, event_buffer, tmp_path, escalation_queue_relocation,
     ):
         project_root = tmp_path / 'proj_root'
         esc_dir = escalation_queue_dir(project_root)
@@ -1327,7 +1327,7 @@ class TestOnJudgeUnhalt:
         policy.register_project_root('proj', str(project_root))
 
         assert await policy.on_judge_unhalt('proj') == [halt_id]
-        assert not (project_root / relocated_escalation_queue).exists()
+        assert not (project_root / escalation_queue_relocation.legacy_relpath).exists()
 
 
 # ── Fold isolation: what the fingerprint must keep apart ──────────────────

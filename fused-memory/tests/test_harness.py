@@ -21990,15 +21990,6 @@ def _orch_finding(**over) -> dict:
     return finding
 
 
-def _orch_queue_dir(root):
-    """The per-project ORCHESTRATOR escalation queue dir under *root*.
-
-    Distinct from the RECON queue (`config.escalation_queue_dir`, drained by the
-    port-8103 watcher) that `_escalate` writes to — see the A7b scope note.
-    """
-    return escalation_queue_dir(root)
-
-
 def _wire_orchestrator_queue(harness, tmp_path, monkeypatch, *, live=True):
     """Point 'test-project' at *tmp_path* and force the orchestrator-liveness gate."""
     import fused_memory.reconciliation.harness as _h
@@ -22006,7 +21997,7 @@ def _wire_orchestrator_queue(harness, tmp_path, monkeypatch, *, live=True):
     harness._known_projects = dict(harness._known_projects)
     harness._known_projects['test-project'] = str(tmp_path)
     monkeypatch.setattr(_h, 'is_orchestrator_live_for', lambda _root: live)
-    return _orch_queue_dir(tmp_path)
+    return escalation_queue_dir(tmp_path)
 
 
 def _wire_remediation_tree(harness, task_ids):
@@ -22152,7 +22143,7 @@ def test_file_finding_task_escalation_lands_a_record_on_the_real_task(
 
 def test_file_finding_task_escalation_files_into_the_layout_escalation_queue_when_relocated(
     journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
-    relocated_escalation_queue,
+    escalation_queue_relocation,
 ):
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
@@ -22164,7 +22155,7 @@ def test_file_finding_task_escalation_files_into_the_layout_escalation_queue_whe
     )
 
     assert [e.id for e in EscalationQueue(queue_dir).get_pending()] == [esc_id]
-    assert not (tmp_path / relocated_escalation_queue).exists()
+    assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
 
 
 def test_routed_record_is_invisible_to_the_orchestrator_l1_guards(
@@ -22555,7 +22546,7 @@ def test_unregistered_project_files_nothing(
     assert harness._file_finding_task_escalation(
         'never-registered', 'run-1', _orch_finding(), 4,
     ) is None
-    assert not _orch_queue_dir(tmp_path).exists()
+    assert not escalation_queue_dir(tmp_path).exists()
 
 
 @pytest.mark.parametrize(
@@ -22585,7 +22576,7 @@ def test_unroutable_target_files_nothing_and_touches_no_queue_directory(
     )
 
     assert result is None
-    assert not _orch_queue_dir(tmp_path).exists()
+    assert not escalation_queue_dir(tmp_path).exists()
     assert list(tmp_path.rglob('esc-*')) == []
 
 

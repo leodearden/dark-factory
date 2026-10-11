@@ -545,7 +545,7 @@ async def test_emits_l1_escalation_on_trip(tmp_path):
 @pytest.mark.asyncio
 @pytest.mark.parametrize('uses_project_root', [True, False], ids=['project_root', 'fallback_dir'])
 async def test_escalation_lands_in_the_layout_escalation_queue_when_relocated(
-    tmp_path, relocated_escalation_queue, uses_project_root,
+    tmp_path, escalation_queue_relocation, uses_project_root,
 ):
     clock = [1000.0]
     guard = BulkResetGuard(
@@ -575,7 +575,7 @@ async def test_escalation_lands_in_the_layout_escalation_queue_when_relocated(
     assert verdict.escalation_path is not None
     assert Path(verdict.escalation_path).parent == escalation_queue_dir(tmp_path)
     assert Path(verdict.escalation_path).exists()
-    assert not (tmp_path / relocated_escalation_queue).exists()
+    assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
 
 
 # ---------------------------------------------------------------------------

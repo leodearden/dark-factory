@@ -2844,7 +2844,7 @@ class TestSweepCancelledDescendants:
     @pytest.mark.asyncio
     async def test_escalate_files_into_the_layout_escalation_queue_when_relocated(
         self, wired_reconciler, mock_taskmaster, monkeypatch, tmp_path,
-        relocated_escalation_queue,
+        escalation_queue_relocation,
     ):
         self._orchestrator_live(monkeypatch)
         mock_taskmaster.get_tasks = AsyncMock(return_value=self._block_branch_tasks())
@@ -2855,7 +2855,7 @@ class TestSweepCancelledDescendants:
         filed = sorted(escalation_queue_dir(tmp_path).glob('esc-*.json'))
         assert [p.stem for p in filed] == [a.get('escalation_id') for a in escalated]
         assert len(filed) == 1
-        assert not (tmp_path / relocated_escalation_queue).exists()
+        assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('stage,raised', [
@@ -5865,7 +5865,7 @@ async def test_unblock_dependent_vetoed_by_open_escalation(
 
 @pytest.mark.asyncio
 async def test_unblock_dependent_vetoed_by_open_escalation_in_relocated_layout_queue(
-    wired_reconciler, mock_taskmaster, tmp_path, relocated_escalation_queue,
+    wired_reconciler, mock_taskmaster, tmp_path, escalation_queue_relocation,
 ):
     esc_id = _seed_open_escalation_pinning_task_2(str(tmp_path))
 
@@ -5876,7 +5876,7 @@ async def test_unblock_dependent_vetoed_by_open_escalation_in_relocated_layout_q
     [action] = _dep_actions_for(result, '2')
     assert action.get('reason') == 'escalation_pinned', action
     assert action.get('escalation_ids') == [esc_id], action
-    assert not (tmp_path / relocated_escalation_queue).exists()
+    assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
 
 
 @pytest.mark.asyncio
@@ -7109,7 +7109,7 @@ class TestContradictedEscalation:
 
     @pytest.mark.asyncio
     async def test_contradicted_files_into_the_layout_escalation_queue_when_relocated(
-        self, reconciler, tmp_path, relocated_escalation_queue,
+        self, reconciler, tmp_path, escalation_queue_relocation,
     ):
         from escalation.queue import EscalationQueue
 
@@ -7117,7 +7117,7 @@ class TestContradictedEscalation:
 
         await _run_done_transition(reconciler, project_root=str(tmp_path))
 
-        assert not (tmp_path / relocated_escalation_queue).exists()
+        assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
         assert len(EscalationQueue(escalation_queue_dir(tmp_path)).get_pending()) == 1
 
     @pytest.mark.asyncio

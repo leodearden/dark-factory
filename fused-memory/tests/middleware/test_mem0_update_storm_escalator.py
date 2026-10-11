@@ -71,7 +71,7 @@ class TestStormEscalationEnabled:
         assert 'recon-stage-1' in payload['summary']
 
     def test_files_into_the_layout_escalation_queue_when_relocated(
-        self, tmp_path, relocated_escalation_queue,
+        self, tmp_path, escalation_queue_relocation,
     ):
         esc = Mem0UpdateStormEscalator()
         esc.set_known_projects({'dark_factory': str(tmp_path)})
@@ -85,7 +85,7 @@ class TestStormEscalationEnabled:
 
         filed = sorted(escalation_queue_dir(tmp_path).glob('esc-*.json'))
         assert [json.loads(p.read_text())['id'] for p in filed] == [esc_id]
-        assert not (tmp_path / relocated_escalation_queue).exists()
+        assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
 
     def test_dedupe_fingerprint_is_over_category_and_agent_only(self, tmp_path):
         """The fingerprint must not vary with count/window — else folding is defeated.

@@ -97,13 +97,13 @@ class TestTheFiledEscalation:
         assert (tmp_path / 'data' / 'escalations').is_dir()
 
     def test_files_into_the_layout_escalation_queue_when_relocated(
-        self, tmp_path, relocated_escalation_queue,
+        self, tmp_path, escalation_queue_relocation,
     ):
         esc_id = _emit(tmp_path)
 
         filed = sorted(escalation_queue_dir(tmp_path).glob('esc-*.json'))
         assert [json.loads(p.read_text())['id'] for p in filed] == [esc_id]
-        assert not (tmp_path / relocated_escalation_queue).exists()
+        assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
 
     def test_the_id_is_minted_off_the_anchor(self, tmp_path):
         esc_id = _emit(tmp_path)

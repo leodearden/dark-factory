@@ -145,7 +145,7 @@ async def test_groups_failures_and_emits_one_escalation_per_group(store, tmp_pat
 
 @pytest.mark.asyncio
 async def test_files_into_the_layout_escalation_queue_when_relocated(
-    store, tmp_path, relocated_escalation_queue,
+    store, tmp_path, escalation_queue_relocation,
 ):
     handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
     try:
@@ -158,7 +158,7 @@ async def test_files_into_the_layout_escalation_queue_when_relocated(
         await TicketJanitor(store, primary_project_root=str(tmp_path)).tick()
 
         assert len(sorted(escalation_queue_dir(tmp_path).glob('esc-*.json'))) == 1
-        assert not (tmp_path / relocated_escalation_queue).exists()
+        assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
     finally:
         handle.close()
 
