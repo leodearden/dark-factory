@@ -1965,3 +1965,153 @@ async def test_tombstone_round_trips_from_writer_to_memory_service(store, mock_c
     # The ROW's own timestamps, kept separate so neither clobbers the victim's.
     assert tombstone['tombstone_created_at'] == '2026-07-20T00:00:00+00:00'
     assert tombstone['tombstone_expires_at'] == '2026-08-19T00:00:00+00:00'
+
+
+# ---------------------------------------------------------------------------
+# list_by_kind: the generic (project, kind, state) reader (task 5239), and the
+# TTL contract a kind gets for free by always stamping expires_at.
+# ---------------------------------------------------------------------------
+
+
+def _kind_row(
+    *,
+    project: str = 'proj-p',
+    kind: str = 'kind-a',
+    state: str = 'proposed',
+    task_id: str = '',
+    flag_type: str = 'topic-a',
+    run_id: str = 'run-1',
+    created_at: str = '2026-07-01T00:00:00+00:00',
+    expires_at: str | None = '2026-07-08T00:00:00+00:00',
+    payload: str = '{"k": 1}',
+) -> ReconLedgerRecord:
+    return ReconLedgerRecord(
+        project_id=project,
+        record_kind=kind,
+        task_id=task_id,
+        flag_type=flag_type,
+        run_id=run_id,
+        payload_json=payload,
+        state=state,
+        created_at=created_at,
+        expires_at=expires_at,
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_by_kind_returns_only_rows_matching_project_kind_and_state(store):
+    """Each of the three selectors excludes a row that differs only in it."""
+    wanted = _kind_row()
+    other_project = _kind_row(project='proj-q')
+    other_kind = _kind_row(kind='kind-b')
+    other_state = _kind_row(state='executed', flag_type='topic-b')
+    await store.upsert_many([wanted, other_project, other_kind, other_state])
+
+    assert await store.list_by_kind('proj-p', 'kind-a', 'proposed') == [wanted]
+
+
+@pytest.mark.asyncio
+async def test_list_by_kind_round_trips_every_field(store):
+    record = _kind_row(
+        task_id='',
+        flag_type='topic-x',
+        run_id='run-9',
+        payload='{"member_ids": ["a", "b"], "claim": "c"}',
+        created_at='2026-07-02T03:04:05+00:00',
+        expires_at='2026-07-09T03:04:05+00:00',
+    )
+    await store.upsert(record)
+
+    (fetched,) = await store.list_by_kind('proj-p', 'kind-a', 'proposed')
+
+    assert isinstance(fetched, ReconLedgerRecord)
+    assert fetched == record
+    assert fetched.payload_json == record.payload_json
+    assert fetched.created_at == '2026-07-02T03:04:05+00:00'
+    assert fetched.expires_at == '2026-07-09T03:04:05+00:00'
+    assert fetched.flag_type == 'topic-x'
+    assert fetched.run_id == 'run-9'
+
+
+@pytest.mark.asyncio
+async def test_list_by_kind_is_empty_when_nothing_matches(store):
+    await store.upsert(_kind_row(kind='kind-b'))
+
+    assert await store.list_by_kind('proj-p', 'kind-a', 'proposed') == []
+
+
+@pytest.mark.asyncio
+async def test_list_by_kind_orders_by_created_at_then_identity(store):
+    late = _kind_row(flag_type='topic-0', created_at='2026-07-03T00:00:00+00:00')
+    early_b = _kind_row(flag_type='topic-b', created_at='2026-07-01T00:00:00+00:00')
+    early_a_run2 = _kind_row(
+        flag_type='topic-a', run_id='run-2', created_at='2026-07-01T00:00:00+00:00'
+    )
+    early_a_run1 = _kind_row(
+        flag_type='topic-a', run_id='run-1', created_at='2026-07-01T00:00:00+00:00'
+    )
+    await store.upsert_many([late, early_b, early_a_run2, early_a_run1])
+
+    listed = await store.list_by_kind('proj-p', 'kind-a', 'proposed')
+
+    assert listed == [early_a_run1, early_a_run2, early_b, late]
+
+
+@pytest.mark.asyncio
+async def test_gc_reaps_an_expired_consolidation_proposal_row_and_keeps_a_live_one(store):
+    """A kind that always stamps expires_at needs no reaper of its own."""
+    expired = _kind_row(
+        kind='consolidation_proposal',
+        flag_type='topic-old',
+        created_at='2026-07-01T00:00:00+00:00',
+        expires_at='2026-07-08T00:00:00+00:00',
+    )
+    live = _kind_row(
+        kind='consolidation_proposal',
+        flag_type='topic-new',
+        created_at='2026-07-10T00:00:00+00:00',
+        expires_at='2026-07-17T00:00:00+00:00',
+    )
+    await store.upsert_many([expired, live])
+
+    await store.gc('proj-p', now='2026-07-12T00:00:00+00:00', terminal_task_ids=[])
+
+    assert await store.list_by_kind('proj-p', 'consolidation_proposal', 'proposed') == [live]
+
+
+# ---------------------------------------------------------------------------
+# upsert_if_state: an overwrite that applies only while the stored row is
+# still in the named state (task 5239 amendment).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upsert_if_state_inserts_a_row_that_does_not_exist(store):
+    record = _kind_row()
+
+    assert await store.upsert_if_state(record, existing_state='proposed') is True
+    assert await store.list_by_kind('proj-p', 'kind-a', 'proposed') == [record]
+
+
+@pytest.mark.asyncio
+async def test_upsert_if_state_overwrites_a_row_in_that_state(store):
+    await store.upsert(_kind_row(payload='{"k": 1}'))
+    newer = _kind_row(payload='{"k": 2}', created_at='2026-07-02T00:00:00+00:00')
+
+    assert await store.upsert_if_state(newer, existing_state='proposed') is True
+    assert await store.list_by_kind('proj-p', 'kind-a', 'proposed') == [newer]
+
+
+@pytest.mark.asyncio
+async def test_upsert_if_state_leaves_a_row_in_another_state_untouched(store):
+    acted_on = _kind_row(state='executed', payload='{"k": 1}')
+    await store.upsert(acted_on)
+
+    written = await store.upsert_if_state(
+        _kind_row(payload='{"k": 2}'), existing_state='proposed'
+    )
+
+    assert written is False
+    assert await store.get_by_identity(
+        'proj-p', 'kind-a', flag_type='topic-a', run_id='run-1'
+    ) == acted_on
