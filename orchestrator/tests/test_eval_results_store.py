@@ -1,17 +1,24 @@
 """ResultStore owns the persisted eval cell: its type, on-disk name and directory.
 
 Driven only through the public names of ``orchestrator.evals.results`` against
-real files under ``tmp_path``.
+real files under ``tmp_path``; the B1 boundary case drives a real executor and
+reads its cell back through both loaders.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _campaign_gate_helpers import eval_base_config
 
 import orchestrator.evals.results as results_module
+from orchestrator.evals import runner
+from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.results import (
     CellName,
     EvalResult,
@@ -20,6 +27,9 @@ from orchestrator.evals.results import (
     ResultStore,
     normalize_legacy_metrics,
 )
+from orchestrator.workflow import WorkflowOutcome
+
+_SCRIPTS_LOADER = Path(__file__).resolve().parents[2] / 'scripts' / '_eval_results_io.py'
 
 
 def _result(
@@ -222,3 +232,59 @@ def test_the_packaged_store_lives_beside_the_results_module():
     assert ResultStore.packaged().directory == (
         Path(results_module.__file__).parent / 'results'
     )
+
+
+def _load_scripts_loader():
+    spec = importlib.util.spec_from_file_location('_eval_results_io', _SCRIPTS_LOADER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.asyncio
+async def test_b1_an_executor_cell_reads_back_through_both_loaders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    store = ResultStore(tmp_path / 'results')
+    task = {
+        'id': 'df_task_b1',
+        'project_root': str(tmp_path),
+        'pre_task_commit': 'basecommit',
+        'task_definition': {'title': 'W', 'description': 'd'},
+        'modules': ['pkg/mod.py'],
+        'plan': {'steps': [{'id': 's1', 'status': 'pending'}]},
+    }
+
+    async def fake_create_wt(*_a, **_k):
+        return Path('/fake/wt'), 'run-b1'
+
+    workflow = MagicMock()
+    workflow.run = AsyncMock(return_value=SimpleNamespace(outcome=WorkflowOutcome.DONE))
+    metrics = MagicMock()
+    metrics.to_dict.return_value = {'composite_score': 0.9, 'tests_pass': True}
+    monkeypatch.setattr(runner, 'create_eval_worktree', fake_create_wt)
+    monkeypatch.setattr(runner, 'build_workflow', lambda **_kw: workflow)
+    monkeypatch.setattr(runner, 'collect_metrics', AsyncMock(return_value=metrics))
+    monkeypatch.setattr(runner, 'load_task', lambda _p: task)
+
+    result = await runner.run_eval(
+        Path('/fake/task.json'),
+        EvalConfig('claude-sonnet-max', 'claude', 'sonnet', 'max'),
+        eval_base_config(tmp_path),
+        usage_gate=None,
+        store=store,
+    )
+
+    scripts_loader = _load_scripts_loader()
+    assert store.load_all() == [result]
+    assert scripts_loader.load_results_from_dir(store.directory) == [result]
+
+    truncated = store.directory / 'zz_truncated.json'
+    truncated.write_text('{"task_id": "x", "conf')
+    with pytest.raises(ResultLoadError) as store_error:
+        store.load_all()
+    assert store_error.value.path == truncated
+    with pytest.raises(SystemExit) as scripts_error:
+        scripts_loader.load_results_from_dir(store.directory)
+    assert str(truncated) in str(scripts_error.value)

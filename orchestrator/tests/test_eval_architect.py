@@ -37,6 +37,7 @@ from _campaign_gate_helpers import NO_INJECTED_GATE as _NO_INJECTED_GATE
 from _campaign_gate_helpers import eval_base_config
 
 from orchestrator.evals.metrics import EvalMetrics
+from orchestrator.evals.results import ResultStore
 
 # ---------------------------------------------------------------------------
 # Synthetic produced-plan builders (shared across the θ tests)
@@ -1786,7 +1787,7 @@ async def _run_architect_eval_hermetic(
 
     mock_judge = AsyncMock(return_value=judge_return, side_effect=judge_side_effect)
     mock_verify = AsyncMock()
-    mock_save = MagicMock()
+    mock_store = MagicMock(spec=ResultStore)
     mock_sleep = AsyncMock()
 
     # NOT named *_config/*_cfg on purpose: this is the anonymous stand-in for
@@ -1844,7 +1845,6 @@ async def _run_architect_eval_hermetic(
                     side_effect=orch_config_side_effect,
                 )))
         p(patch('orchestrator.evals.judge.judge_plan_quality', mock_judge))
-        p(patch('orchestrator.evals.runner.save_result', mock_save))
         p(patch('orchestrator.evals.runner.load_task',
                 MagicMock(return_value=_task_def)))
         p(patch('orchestrator.verify.run_verification', mock_verify))
@@ -1856,11 +1856,12 @@ async def _run_architect_eval_hermetic(
             else {'usage_gate': injected_gate}
         )
         result = await runner.run_architect_eval(
-            Path('/fake/task.json'), cfg, base_config=MagicMock(), **extra,
+            Path('/fake/task.json'), cfg, base_config=MagicMock(),
+            store=mock_store, **extra,
         )
     return result, {
         'invoke': mock_invoke, 'verify': mock_verify,
-        'save': mock_save, 'judge': mock_judge,
+        'save': mock_store.save, 'judge': mock_judge,
         'sleep': mock_sleep, 'UsageGate': gate_factory, 'gate': usage_gate,
         'cleanup': mock_cleanup, 'artifacts': artifacts_instance,
         'cap_retry': mock_cap_retry,
@@ -1899,7 +1900,7 @@ class TestRunArchitectEval:
         assert mocks['invoke'].call_count == 1
         mocks['verify'].assert_not_called()
 
-        # Persisted via save_result.
+        # Persisted through the store.
         mocks['save'].assert_called_once()
 
     async def test_judge_failure_degrades_to_deterministic_floor(self):
@@ -2363,7 +2364,7 @@ class TestArchitectCellRecordsJudgeSpend:
         # PLUS the judge spend, never the architect spend alone.
         assert result.metrics['cost_usd'] == pytest.approx(1.23 + 0.42)
 
-        # ...and what was actually PERSISTED via save_result, not just what
+        # ...and what was actually PERSISTED through the store, not just what
         # the function happens to return.
         persisted = mocks['save'].call_args.args[0].metrics
         assert persisted['judge_cost_usd'] == pytest.approx(0.42)
@@ -3091,7 +3092,7 @@ class TestJudgedWithoutReference:
             task_override=_arch_task_no_reference(),
             reference_diff='',
         )
-        # Assert on the dict handed to save_result — that dict is what both the
+        # Assert on the cell handed to the store — that cell is what both the
         # report layer and the downstream campaign driver actually read.
         persisted = mocks['save'].call_args.args[0].metrics
 
