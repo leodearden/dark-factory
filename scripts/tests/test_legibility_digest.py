@@ -28,8 +28,8 @@ import re
 import digest as mod
 import pytest
 import yaml
+from legibility import detectors, reingestion
 from legibility import inventory as inventory_mod
-from legibility import reingestion
 from legibility_carrier_fixtures import (
     CENSUS_MEMORY_CONTEXT_TURN,
     NON_HUMAN_ORIGIN_IDS,
@@ -1247,7 +1247,7 @@ class TestRetryLoopDesignedOutcomeJoin:
 
         assert rearm['designed_outcomes'] == [(124, 'watcher-rearm-declared')]
         assert rearm['designed_outcomes'] == [
-            mod.classify_error_content(_CEILING_DECLARATION)
+            detectors.classify_error_content(_CEILING_DECLARATION)
         ]
 
     def test_two_distinct_rules_are_ordered_by_first_appearance(self):
@@ -3118,7 +3118,7 @@ class TestDesignedOutcomesSection:
     def test_designed_outcome_line_names_the_rule_that_fired(self):
         # Distinct labels per rule keep which-rule-fired legible: a
         # self-declared CEILING must not read the same as a bare 124.
-        _, declared = mod.classify_error_content(_CEILING_DECLARATION)
+        _, declared = detectors.classify_error_content(_CEILING_DECLARATION)
         assert declared is not None
 
         digest = mod.render_digest(

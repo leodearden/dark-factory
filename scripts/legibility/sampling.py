@@ -35,7 +35,7 @@ from typing import Any
 if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from legibility import digest  # noqa: E402
+from legibility import detectors, digest  # noqa: E402
 from legibility.config import LegibilityConfig, load_config  # noqa: E402
 from legibility.inventory import (  # noqa: E402
     SessionRecord,
@@ -162,7 +162,7 @@ def _record_carriers(record: dict[str, Any]) -> list[_Carrier]:
 class _DialogueText:
     """A record's dialogue carriers, lowercased and joined for the
     substring scans. A carrier is dialogue unless
-    :func:`digest.is_non_dialogue_carrier` rejects it, and each carrier is
+    :func:`detectors.is_non_dialogue_carrier` rejects it, and each carrier is
     asked exactly once."""
 
     whole: str
@@ -174,7 +174,7 @@ class _DialogueText:
 def _dialogue_text(record: dict[str, Any]) -> _DialogueText:
     kept = [
         carrier for carrier in _record_carriers(record)
-        if not digest.is_non_dialogue_carrier(record, carrier.text)
+        if not detectors.is_non_dialogue_carrier(record, carrier.text)
     ]
     return _DialogueText(
         whole='\n'.join(carrier.text for carrier in kept).lower(),
@@ -195,7 +195,7 @@ def _classify_tool_errors(record: dict[str, Any]) -> tuple[bool, bool]:
     substring hunt can resurrect a decoy.
 
     Splitting genuine from designed reuses digest's SINGLE definition --
-    the one PUBLIC entry point :func:`digest.classify_error_content`,
+    the one PUBLIC entry point :func:`detectors.classify_error_content`,
     which takes a raw tool_result ``content`` field and returns
     ``(exit_code, designed_label)`` -- rather than growing a second one
     here or reaching across the module boundary into digest's private
@@ -222,7 +222,7 @@ def _classify_tool_errors(record: dict[str, Any]) -> tuple[bool, bool]:
             continue
         if not block.get('is_error'):
             continue
-        _, label = digest.classify_error_content(block.get('content'))
+        _, label = detectors.classify_error_content(block.get('content'))
         if label is None:
             genuine = True
         else:

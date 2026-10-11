@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from typing import Any
 
 CODER_JUDGMENT_KEYS: frozenset[str] = frozenset({'matches', 'candidates'})
@@ -374,7 +375,7 @@ HUMAN_ORIGIN_KIND: str = 'human'
 """The only Claude Code ``origin.kind`` that asserts a human typed the record."""
 
 
-def has_non_human_origin(record: dict[str, Any]) -> bool:
+def has_non_human_origin(record: Mapping[str, Any]) -> bool:
     """True when *record*'s own structured provenance names a non-human
     producer: Claude Code stamps queued user prompts with ``origin`` (a
     background task-notification, an auto-continuation, a coordinator or

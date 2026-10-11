@@ -23,9 +23,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import re
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -37,13 +37,21 @@ from typing import Any
 if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from legibility.detectors import (  # noqa: E402
+    CarrierKind,
+    ErrorHit,
+    RecordHits,
+    SignalClass,
+    error_hits,
+    is_non_dialogue_carrier,
+    message_content,
+    raw_carriers,
+    record_hits,
+    user_turn_text,
+)
 from legibility.inventory import (  # noqa: E402
     UNREADABLE_FILE_ERRORS,
     as_unreadable_file_error,
-)
-from legibility.reingestion import (  # noqa: E402
-    has_non_human_origin,
-    is_reingested_content,
 )
 
 logger = logging.getLogger('legibility.digest')
@@ -96,60 +104,6 @@ def load_transcript(path: Any) -> list[dict[str, Any]]:
     return records
 
 
-def _message_content(record: dict[str, Any]) -> Any:
-    """Return a record's ``message.content``, or None if absent/malformed."""
-    message = record.get('message')
-    if not isinstance(message, dict):
-        return None
-    return message.get('content')
-
-
-def _user_turn_text(content: Any) -> str | None:
-    """Extract genuine human-typed text from a user record's content.
-
-    ``content`` is either a plain string (the common case) or a list of
-    content blocks. A list contributes only its 'text' blocks -- a user
-    record whose content is entirely tool_result blocks (an answer TO the
-    agent, not a human speaking) yields no text and is excluded.
-    """
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        # The `isinstance(..., str)` guard already excludes None and non-str at
-        # runtime, but binding it with a walrus is what carries that narrowing
-        # into the element expression — pyright cannot narrow an unbound
-        # `.get()` CALL across the guard, so the un-bound spelling inferred
-        # list[Unknown | None] and rejected the join. Same iteration, same
-        # filter, same values.
-        texts = [
-            block_text for block in content
-            if isinstance(block, dict) and block.get('type') == 'text'
-            and isinstance(block_text := block.get('text'), str)
-        ]
-        if texts:
-            return '\n'.join(texts)
-    return None
-
-
-def _content_to_text(content: Any) -> str:
-    """Best-effort flatten of a tool_result/message 'content' field to text.
-
-    ``content`` is either a plain string (the common case) or a list of
-    content blocks (dicts). Blocks without a 'text' field (e.g. the
-    ``tool_reference`` blocks ToolSearch results carry) contribute nothing
-    rather than being guessed at.
-    """
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = [
-            block_text for block in content
-            if isinstance(block, dict) and isinstance(block_text := block.get('text'), str)
-        ]
-        return '\n'.join(parts)
-    return ''
-
-
 def _summarize_input(tool_input: Any, *, limit: int = 200) -> str:
     """Canonical, size-capped string summary of a tool_use ``input`` dict."""
     try:
@@ -169,7 +123,7 @@ def _iter_tool_use_blocks(
     for index, record in enumerate(records):
         if record.get('type') != 'assistant':
             continue
-        content = _message_content(record)
+        content = message_content(record)
         if not isinstance(content, list):
             continue
         for block in content:
@@ -178,202 +132,13 @@ def _iter_tool_use_blocks(
     return found
 
 
-def _iter_tool_result_blocks(
-    records: list[dict[str, Any]],
-) -> list[tuple[int, dict[str, Any]]]:
-    """Return (record_index, block) for every user tool_result block."""
-    found = []
-    for index, record in enumerate(records):
-        if record.get('type') != 'user':
-            continue
-        content = _message_content(record)
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if isinstance(block, dict) and block.get('type') == 'tool_result':
-                found.append((index, block))
-    return found
-
-
-EXIT_CODE_PATTERN = re.compile(
-    r'exit\s*=\s*(\d+)|exit\s+code\s+(\d+)|exit\s+status\s+(\d+)',
-    re.IGNORECASE,
-)
-"""The three exit-code spellings observed in tool_result content: the
-machine-readable ``exit=<rc>`` form emitted by scripts/watcher-rearm.sh
-(:228-237) and the two prose forms ('exit code N', 'exit status N') shells
-and harness wrappers produce. Case-insensitive, like every other pattern in
-this module."""
-
-BOUNDED_WAIT_EXIT_CODE = 124
-"""``timeout(1)``'s ceiling exit -- the status it returns when the command
-was still running when the time limit expired (as opposed to the command's
-own status). In this repo a 124 is overwhelmingly produced by a deliberately
-bounded poll or wait, not by a broken command."""
-
-
-def _exit_codes(
-    text: str, *, ignoring: tuple[tuple[int, int], ...] = (),
-) -> list[int]:
-    """Every exit code mentioned in *text*, in order of appearance.
-
-    Spans in *ignoring* are skipped, which is how
-    :func:`classify_error_content` tells a code a declaration already
-    accounts for (the ``exit=124`` inside ``WATCHER_REARM_OUTCOME:
-    CEILING exit=124``) from an UNACCOUNTED one appearing elsewhere in
-    the same blob.
-    """
-    return [
-        int(next(g for g in match.groups() if g is not None))
-        for match in EXIT_CODE_PATTERN.finditer(text)
-        if not any(start <= match.start() < end for start, end in ignoring)
-    ]
-
-
-def _extract_exit_code(text: str) -> int | None:
-    """Return the FIRST exit code mentioned in *text*, or None.
-
-    The positional fallback for content that carries no self-declaration
-    to key off. :func:`classify_error_content` prefers the code attached
-    to the DECIDING declaration and only falls back here when a
-    declaration names none.
-    """
-    codes = _exit_codes(text)
-    return codes[0] if codes else None
-
-
-DESIGNED_OUTCOME_PATTERNS: tuple[tuple[re.Pattern[str], frozenset[str], str], ...] = (
-    (
-        re.compile(
-            r'WATCHER_REARM_OUTCOME:\s*(?P<outcome>[A-Za-z_]+)'
-            r'(?:\s+exit\s*=\s*(?P<code>\d+))?',
-            re.IGNORECASE,
-        ),
-        frozenset({'ceiling', 'fired'}),
-        'watcher-rearm-declared',
-    ),
-)
-"""Table of (compiled regex, designed tokens, label) triples recognising a
-self-DECLARED outcome, so a future contract is a one-line addition. The
-regex matches EVERY outcome of its family -- designed and undesigned
-alike -- and names two groups: ``outcome`` (the declared token, compared
-case-insensitively against the designed set) and the optional ``code``
-the declaration carries. Matching the whole family, not just the designed
-tokens, is what lets :func:`classify_error_content` see a dissenting
-declaration instead of stopping at the first agreeable one.
-
-Seeded with scripts/watcher-rearm.sh's marker (:228-237), which emits four
-outcomes and means different things by them: FIRED (exit=0, :228) and
-CEILING (exit=124, :231) are designed loop-continuation outcomes, while
-KILLED (137|143|144, :234) and ERROR (the catch-all, :237) are REAL
-failures. Only the first two are in the designed set -- deliberately.
-Suppressing all four because they share a marker token would trade one
-over-count for an under-count and hide genuine watcher breakage, the
-opposite of the 07-31 census cluster 1.3 finding's intent.
-
-Two traps documented in that script's header (:52-73) bound what this
-table can be relied on to mean:
-  * usage/guard failures (exit 2 -- missing DARK_FACTORY_ROOT, unresolved
-    queue dir, bad flag) return BEFORE the watcher is ever invoked and emit
-    NO marker at all (:59-63), so absence of a marker is NOT absence of
-    failure -- which is why a bare exit code still classifies below.
-  * a SIGTERM delivered to the watcher is converted to a clean exit 0 by
-    its own handler, surfacing as ``FIRED exit=0`` with EMPTY stdout
-    (:66-73). It is still a designed outcome by the shell contract; a
-    caller needing to know whether an escalation actually fired must check
-    stdout, which is beyond what a digest signal tally can see.
-"""
-
-
-def _declared_exit_code(match: re.Match[str], text: str) -> int | None:
-    """The code a declaration *match* carries, else the first in *text*."""
-    declared = match.groupdict().get('code')
-    if declared is not None:
-        return int(declared)
-    return _extract_exit_code(text)
-
-
-def classify_error_content(content: Any) -> tuple[int | None, str | None]:
-    """Classify one structured error's content as (exit_code, designed label).
-
-    THE public entry point for the genuine/designed split -- used by
-    :func:`iter_error_neighborhoods` here and by ``sampling.py``'s
-    parallel scan, so the two never drift (task 3610). *content* is a raw
-    tool_result ``content`` field: a string or a list of blocks, flattened
-    the same way for both callers. ``label`` is None for a genuine
-    failure; ``exit_code`` is the code of whatever DECIDED that verdict,
-    so the digest renders the code that explains the line it is on.
-
-    Two tiers, most authoritative first:
-      1. a machine-readable self-declaration matching DESIGNED_OUTCOME_PATTERNS;
-      2. a bare BOUNDED_WAIT_EXIT_CODE with no declaration at all.
-    The label differs per tier so a digest reader can tell which rule fired.
-
-    A designed verdict must hold for the WHOLE content, never just its
-    first agreeable marker: one tool_result routinely carries several
-    outcomes (a Bash call looping scripts/watcher-rearm.sh, or tailing its
-    stderr log beside a failing command). So a tier-1 declaration
-    classifies as designed only when every declaration of its family is a
-    designed token AND every exit code the content mentions is one a
-    declaration accounts for (or is itself the bounded-wait ceiling); a
-    dissenting declaration or an unaccounted code decides genuine and
-    supplies the reported code. Tier 2 applies the same rule one level
-    down: a bare 124 classifies only when it is the ONLY code present.
-    Every ambiguity therefore fails toward GENUINE -- the over-count
-    direction, which costs one weight-1.0 noise signal, rather than the
-    under-count that would hide a real failure (see
-    DESIGNED_OUTCOME_PATTERNS).
-
-    Tier 2 is a deliberate precision/recall tradeoff, and a deliberately
-    cheap one to be wrong about: misclassifying a genuine un-designed
-    timeout as designed costs exactly one weight-1.0 noise signal
-    (tool_error is joint-lowest in SIGNAL_WEIGHTS) and never a gold user
-    turn. Tightening to declaration-only, should a future census show real
-    suppressions, is deleting the tier-2 branch -- the table above is what
-    keeps the decision reversible rather than diffuse.
-    """
-    text = _content_to_text(content)
-    for pattern, designed_tokens, label in DESIGNED_OUTCOME_PATTERNS:
-        matches = list(pattern.finditer(text))
-        if not matches:
-            continue
-        designed = [
-            match for match in matches
-            if match.group('outcome').lower() in designed_tokens
-        ]
-        dissenting = [match for match in matches if match not in designed]
-        # A code a DESIGNED declaration carries is explained by it; any
-        # other code in the blob is unexplained evidence of a failure.
-        unaccounted = [
-            code
-            for code in _exit_codes(text, ignoring=tuple(m.span() for m in designed))
-            if code != BOUNDED_WAIT_EXIT_CODE
-        ]
-        if dissenting or unaccounted:
-            declared = dissenting[0].groupdict().get('code') if dissenting else None
-            if declared is not None:
-                return int(declared), None
-            return (unaccounted[0] if unaccounted else _extract_exit_code(text)), None
-        return _declared_exit_code(matches[-1], text), label
-
-    codes = _exit_codes(text)
-    if codes and all(code == BOUNDED_WAIT_EXIT_CODE for code in codes):
-        return BOUNDED_WAIT_EXIT_CODE, 'bounded-wait-ceiling'
-    undesigned = [code for code in codes if code != BOUNDED_WAIT_EXIT_CODE]
-    if undesigned:
-        return undesigned[0], None
-    return None, None
-
-
 def iter_error_neighborhoods(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Pair each structured-error tool_result with its preceding attempt.
+    """Pair each structured error (:func:`detectors.error_hits`) with the
+    assistant attempt that produced it.
 
-    Only tool_result blocks carrying a truthy ``is_error`` flag count --
-    never a substring match on the result content (the core of the
-    decoy-FAIL suppression decision, PRD Sec 13.2). Matching to the
-    assistant's attempt is via ``tool_use_id``; an unmatched id (e.g. the
-    attempt was truncated off the front of the transcript window) degrades
-    to None attempt fields rather than raising.
+    Matching to the attempt is via ``tool_use_id``; an unmatched id (e.g.
+    the attempt was truncated off the front of the transcript window)
+    degrades to None attempt fields rather than raising.
 
     That id is also EXPOSED on each neighborhood as ``tool_use_id``: it is
     the stable join key letting a caller relate a classified result back to
@@ -387,39 +152,36 @@ def iter_error_neighborhoods(records: list[dict[str, Any]]) -> list[dict[str, An
     an unmatched attempt, the same degradation contract the None attempt
     fields above already document.
 
-    Returns EVERY structured error -- this is the single scan and the single
-    source of truth. Each neighborhood is enriched with ``exit_code`` and
-    ``designed_outcome`` (see :func:`classify_error_content`) so callers
-    can partition without rescanning; :func:`iter_genuine_errors` and
-    :func:`iter_designed_outcomes` are those partitions, and both accept
-    an already-computed list via ``neighborhoods=`` so one digest costs
-    one scan rather than one per partition. Classification reads only the
-    structured ``is_error`` flag plus the already-extracted content, never
-    a fresh substring hunt that could resurrect a decoy.
+    Each neighborhood carries ``exit_code`` and ``designed_outcome`` (see
+    :func:`detectors.classify_error_content`);
+    :func:`iter_genuine_errors` and :func:`iter_designed_outcomes` are its
+    two partitions.
     """
+    return _error_neighborhoods(records, [error_hits(record) for record in records])
+
+
+def _error_neighborhoods(
+    records: list[dict[str, Any]], errors_per_record: Sequence[tuple[ErrorHit, ...]],
+) -> list[dict[str, Any]]:
     attempts_by_id = {
         block.get('id'): block
         for _, block in _iter_tool_use_blocks(records)
     }
-
     neighborhoods = []
-    for index, block in _iter_tool_result_blocks(records):
-        if not block.get('is_error'):
-            continue
-        attempt = attempts_by_id.get(block.get('tool_use_id'))
-        error_content = _content_to_text(block.get('content'))
-        exit_code, designed_outcome = classify_error_content(error_content)
-        neighborhoods.append({
-            'index': index,
-            'tool_use_id': block.get('tool_use_id'),
-            'attempt_tool': attempt.get('name') if attempt else None,
-            'attempt_input_summary': (
-                _summarize_input(attempt.get('input')) if attempt else None
-            ),
-            'error_content': error_content,
-            'exit_code': exit_code,
-            'designed_outcome': designed_outcome,
-        })
+    for index, errors in enumerate(errors_per_record):
+        for error in errors:
+            attempt = attempts_by_id.get(error.tool_use_id)
+            neighborhoods.append({
+                'index': index,
+                'tool_use_id': error.tool_use_id,
+                'attempt_tool': attempt.get('name') if attempt else None,
+                'attempt_input_summary': (
+                    _summarize_input(attempt.get('input')) if attempt else None
+                ),
+                'error_content': error.content,
+                'exit_code': error.exit_code,
+                'designed_outcome': error.designed_outcome,
+            })
     return neighborhoods
 
 
@@ -450,10 +212,8 @@ def iter_genuine_errors(
     :func:`iter_designed_outcomes`. This is what ``signal_counts``
     tallies as ``tool_error``.
 
-    Pass ``neighborhoods=`` to partition a scan the caller already has:
-    :func:`signal_counts` and :func:`_build_sections` each need BOTH
-    halves, so rescanning per half would run the (attempts index +
-    per-error regex) scan four times per digest instead of twice.
+    Pass ``neighborhoods=`` to partition a scan the caller already has, as
+    :func:`_build_sections` does with its one per-build scan.
     """
     return [
         n for n in _neighborhoods_to_partition(records, neighborhoods)
@@ -489,270 +249,48 @@ def iter_designed_outcomes(
     ]
 
 
-_NEIGHBORHOOD_PARTITIONS = (iter_genuine_errors, iter_designed_outcomes)
-"""The detectors in _SECTION_RENDERERS that partition an existing
-neighborhood scan rather than scanning *records* themselves -- see
-:func:`_build_sections`, which is what keeps _SECTION_RENDERERS the single
-declaration of WHICH detector feeds which section."""
+_CARRIER_ORDER = {kind: rank for rank, kind in enumerate(CarrierKind)}
 
 
-SELF_CORRECTION_PATTERNS: tuple[str, ...] = (
-    "that's wrong",
-    'let me fix',
-    'my mistake',
-    'i was wrong',
-    'actually,',
-    'correction:',
-)
-"""Curated self-correction markers, matched case-insensitively against
-assistant TEXT blocks only (native-carrier scoping)."""
+def _signal_items(hits: Sequence[RecordHits], signal: SignalClass) -> list[dict[str, Any]]:
+    """One text class's hits as digest items ``{index, pattern, context}``.
 
-
-def _line_context(text: str, pos: int) -> str:
-    """Return the newline-delimited line of *text* containing offset *pos*."""
-    start = text.rfind('\n', 0, pos) + 1  # rfind returns -1 when absent -> 0
-    end = text.find('\n', pos)
-    if end == -1:
-        end = len(text)
-    return text[start:end].strip()
-
-
-def _assistant_text_blocks(
-    records: list[dict[str, Any]],
-) -> list[tuple[int, str]]:
-    """Return (record_index, text) for every assistant 'text' content block.
-
-    Excludes 'thinking' and 'tool_use' blocks -- only genuine assistant
-    text shown to the user is the self-correction carrier.
+    Record-major, then a STABLE sort on carrier kind, so a class read in
+    several carrier kinds lists every tool_result hit, then every assistant
+    text hit, then every user-turn hit. Section trimming pops trailing
+    items, so this order decides which items survive the byte cap.
     """
-    found = []
-    for index, record in enumerate(records):
-        if record.get('type') != 'assistant':
-            continue
-        content = _message_content(record)
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if isinstance(block, dict) and block.get('type') == 'text':
-                text = block.get('text')
-                if isinstance(text, str):
-                    found.append((index, text))
-    return found
-
-
-DECOY_MARKER = '# decoy-fail'
-"""Inline same-line sentinel: a fixture/test author appends this to a line
-to explicitly declare "this is not a real signal, don't count it", without
-having to relocate the string out of its otherwise-native carrier. Matched
-case-insensitively, like every other pattern in this module."""
-
-
-def _strip_decoy_lines(text: str) -> str:
-    """Return *text* with every line containing DECOY_MARKER removed.
-
-    Applied before pattern matching in the text-pattern signal detectors
-    (not_found, df_guard, self_correct) so a same-line decoy marker
-    suppresses only that line's occurrence -- other lines in the same
-    carrier are unaffected.
-    """
-    marker = DECOY_MARKER.lower()
-    lines = [line for line in text.split('\n') if marker not in line.lower()]
-    return '\n'.join(lines)
-
-
-def _signal_text_sources(
-    records: list[dict[str, Any]],
-    *,
-    tool_result: bool = False,
-    assistant_text: bool = False,
-    user_text: bool = False,
-) -> list[tuple[int, str]]:
-    """Yield (record_index, text) pairs from the requested NATIVE carriers
-    only: tool_result content, assistant 'text' blocks, and non-sidechain
-    user-turn text (incl. isMeta system injections). Carriers are opt-in
-    per call, since each text-pattern detector is scoped to its own subset.
-
-    NEVER includes the ``input`` of a Write/Edit/MultiEdit/NotebookEdit (or
-    any) tool_use block -- an assistant-authored file mutation is not a
-    native signal carrier, so a decoy string planted there is structurally
-    excluded rather than merely filtered (the core of the decoy-FAIL
-    suppression decision, PRD Sec 13.2).
-    """
-    sources: list[tuple[int, str]] = []
-    if tool_result:
-        for index, block in _iter_tool_result_blocks(records):
-            sources.append((index, _content_to_text(block.get('content'))))
-    if assistant_text:
-        sources.extend(_assistant_text_blocks(records))
-    if user_text:
-        for index, record in enumerate(records):
-            if record.get('type') == 'user' and not record.get('isSidechain'):
-                text = _user_turn_text(_message_content(record))
-                if text:
-                    sources.append((index, text))
-    return sources
-
-
-def _dialogue_text_sources(
-    records: list[dict[str, Any]],
-    *,
-    tool_result: bool = False,
-    assistant_text: bool = False,
-    user_text: bool = False,
-) -> list[tuple[int, str]]:
-    """The carriers :func:`_signal_text_sources` yields, minus every one
-    :func:`is_non_dialogue_carrier` rejects.
-
-    Two layers, two questions: :func:`_signal_text_sources` answers "which
-    native carriers exist", and this answers "which of them are this
-    session's own dialogue". Every signal detector reads this layer.
-
-    Dropping is WHOLE-carrier on every carrier kind, tool_results and
-    assistant text included, so a genuine literal printed beside a harness
-    prompt goes with it. That cost is accepted on measurement: across the
-    2026-09-23 dark-factory corpus the harness rule dropped 59 non-user
-    carriers with signal hits, each one foreign material (a Read of a
-    module holding the marker literals, a task record, a dump of another
-    session). Merely NAMING a harness heading drops nothing, because the
-    heading rules are line-anchored.
-    """
-    return [
-        (index, text)
-        for index, text in _signal_text_sources(
-            records,
-            tool_result=tool_result,
-            assistant_text=assistant_text,
-            user_text=user_text,
-        )
-        if not is_non_dialogue_carrier(records[index], text)
+    items = [
+        (hit.carrier, {'index': index, 'pattern': hit.pattern, 'context': hit.line})
+        for index, record in enumerate(hits)
+        for hit in record.patterns[signal]
     ]
+    items.sort(key=lambda pair: _CARRIER_ORDER[pair[0]])
+    return [item for _, item in items]
 
 
-def is_non_dialogue_carrier(record: dict[str, Any], text: str) -> bool:
-    """The ONE question asked of a carrier before it counts as this
-    session's own dialogue (plans/confusion-reduction-prd.md §7.2.3): the
-    record half is provenance, the text half is content. The record half
-    covers every carrier the record holds, tool_results included."""
-    return has_non_human_origin(record) or is_reingested_content(text)
+def _all_record_hits(records: list[dict[str, Any]]) -> list[RecordHits]:
+    return [record_hits(record) for record in records]
 
 
 def iter_self_corrections(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Detect curated self-correction markers in assistant TEXT blocks only.
-
-    Native-carrier scoping: the same phrase inside a tool_result or inside
-    a Write/Edit/MultiEdit/NotebookEdit tool_use input (an agent authoring
-    test data, not a real correction) is never scanned -- restricting the
-    scan to assistant 'text' blocks (see :func:`_assistant_text_blocks`)
-    structurally excludes both. A same-line ``# decoy-fail`` sentinel
-    suppresses an otherwise-matching line, and a block that is re-ingested
-    machine content as a WHOLE (a prior coder judgment quoting the digest it
-    coded, say) is dropped before the scan by :func:`_dialogue_text_sources`.
-    Block type, whole carrier and single line are three separate filters.
-    """
-    hits = []
-    for index, text in _dialogue_text_sources(records, assistant_text=True):
-        stripped = _strip_decoy_lines(text)
-        lowered = stripped.lower()
-        for pattern in SELF_CORRECTION_PATTERNS:
-            pos = lowered.find(pattern)
-            if pos == -1:
-                continue
-            hits.append({
-                'index': index,
-                'pattern': pattern,
-                'context': _line_context(stripped, pos),
-            })
-    return hits
-
-
-NOT_FOUND_PATTERNS: tuple[str, ...] = (
-    'no such file or directory',
-    'modulenotfounderror',
-    'command not found',
-    'does not exist',
-    'not found in',
-)
-"""Matched case-insensitively against tool_result content only."""
-
-DF_GUARD_PATTERNS: tuple[str, ...] = (
-    'blocked:',
-    'darkfactorypathscopeviolation',
-    'done_gate_missing_files',
-    'known-false premise about recon internals',
-)
-"""Real dark-factory guard TRIP literals -- never the bare, lowercase
-category-name mention (e.g. ``category="scope_violation"``). Grounded in
-the actual enforcement code: PathGuardVerdict's ``DarkFactoryPathScopeViolation``
-error_type (fused_memory/middleware/path_scope_guard.py), the phantom-done
-gate's ``done_gate_missing_files`` error code
-(fused_memory/middleware/task_interceptor.py, orchestrator/scheduler.py),
-and premise_lint_guard's fixed error-message prefix. ``scope_violation`` and
-``phantom-done`` alone are common bare mentions (category labels, design-intent
-prose/docstrings) and are deliberately NOT matched."""
-
-INTERRUPT_PATTERN = 'request interrupted by user'
-"""The literal Claude-Code-injected marker for a user-interrupted tool call
-(e.g. "[Request interrupted by user for tool use]")."""
+    """Self-correction markers in assistant text blocks."""
+    return _signal_items(_all_record_hits(records), SignalClass.SELF_CORRECT)
 
 
 def iter_not_found(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Detect NOT_FOUND_PATTERNS in tool_result content only.
-
-    A tool_result that is re-ingested machine content as a whole -- a coder
-    judgment, or foreign material carrying a harness prompt such as a dump
-    of another session's digest -- is dropped first
-    (:func:`_dialogue_text_sources`). A same-line ``# decoy-fail`` sentinel
-    suppresses an otherwise-matching line (PRD Sec 13.2 decoy-FAIL
-    suppression).
-    """
-    hits = []
-    for index, text in _dialogue_text_sources(records, tool_result=True):
-        lowered = _strip_decoy_lines(text).lower()
-        for pattern in NOT_FOUND_PATTERNS:
-            if pattern in lowered:
-                hits.append({'index': index, 'pattern': pattern})
-    return hits
+    """Not-found literals in tool_result content."""
+    return _signal_items(_all_record_hits(records), SignalClass.NOT_FOUND)
 
 
 def iter_df_guards(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Detect DF_GUARD_PATTERNS (real trip literals) in their native carriers:
-    tool_result content, assistant text, and user-turn text (incl. isMeta
-    system injections, excluding isSidechain subagent turns).
-
-    A carrier that is re-ingested machine content as a whole -- the
-    trickle-coder prompt embedding the digest it codes, or a coder judgment
-    quoting that digest back -- is dropped first
-    (:func:`_dialogue_text_sources`). A same-line ``# decoy-fail`` sentinel
-    suppresses an otherwise-matching line (PRD Sec 13.2 decoy-FAIL
-    suppression).
-    """
-    hits = []
-    for index, text in _dialogue_text_sources(
-        records, tool_result=True, assistant_text=True, user_text=True,
-    ):
-        lowered = _strip_decoy_lines(text).lower()
-        for pattern in DF_GUARD_PATTERNS:
-            if pattern in lowered:
-                hits.append({'index': index, 'pattern': pattern})
-    return hits
+    """Guard trip literals in tool_results, assistant text and user turns."""
+    return _signal_items(_all_record_hits(records), SignalClass.DF_GUARD)
 
 
 def iter_interrupts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Detect the injected interrupt marker in non-sidechain user turns.
-
-    A user turn that is re-ingested machine content as a whole -- notably
-    the trickle-coder prompt, whose embedded digest lists earlier
-    '(turn N) request interrupted by user' hits -- is dropped first
-    (:func:`_dialogue_text_sources`). A same-line ``# decoy-fail`` sentinel
-    suppresses an otherwise-matching line, for parity with the other
-    text-pattern detectors (not_found, df_guard, self_correct) and PRD Sec
-    13.2's decoy-FAIL suppression contract.
-    """
-    hits = []
-    for index, text in _dialogue_text_sources(records, user_text=True):
-        if INTERRUPT_PATTERN in _strip_decoy_lines(text).lower():
-            hits.append({'index': index, 'pattern': INTERRUPT_PATTERN})
-    return hits
+    """The injected interrupt marker in non-sidechain user turns."""
+    return _signal_items(_all_record_hits(records), SignalClass.INTERRUPT)
 
 
 RETRY_MIN = 3
@@ -815,10 +353,9 @@ def find_retry_loops(
     TypeError the moment a declaration carries no code.
 
     Pass ``neighborhoods=`` to annotate from a scan the caller already
-    holds -- the same efficiency contract and the same resolver
+    holds -- the same contract and the same resolver
     (:func:`_neighborhoods_to_partition`) as :func:`iter_genuine_errors`
-    and :func:`iter_designed_outcomes`, which is what keeps a digest at two
-    neighborhood scans rather than three (see :data:`_NEIGHBORHOOD_ANNOTATORS`).
+    and :func:`iter_designed_outcomes`.
     """
     # `str | None` in the key, not `str`: _iter_tool_use_blocks selects on
     # `type == 'tool_use'` only, so a malformed block with no 'name' yields a
@@ -875,97 +412,55 @@ def find_retry_loops(
     return loops
 
 
-_NEIGHBORHOOD_ANNOTATORS = (find_retry_loops,)
-"""The detectors in _SECTION_RENDERERS that scan *records* themselves but
-ALSO annotate from an existing neighborhood scan -- invoked as
-``detector(records, neighborhoods=...)``, the third dispatch shape in
-:func:`_build_sections`.
-
-Sibling to :data:`_NEIGHBORHOOD_PARTITIONS` (which is invoked as
-``detector(neighborhoods=...)`` alone) and declared here rather than
-literally beside it only because :func:`find_retry_loops` is defined
-further down the module. Both exist so _SECTION_RENDERERS remains the
-single declaration of WHICH detector feeds which section, with only HOW it
-is invoked varying."""
-
-
 def signal_counts(records: list[dict[str, Any]]) -> dict[str, int]:
-    """Assemble the signal tally required by the frontmatter contract
-    (PRD Sec 7.2): ``{tool_error, self_correct, not_found, df_guard,
-    interrupt, designed_outcome}``. Each value is the hit count from the
-    corresponding detector; an absent signal class reports 0 rather than
-    being omitted.
+    """The frontmatter's ``signal_counts`` (PRD Sec 7.2): every signal
+    class's hit total over the transcript, 0 for an absent class.
 
-    ``tool_error`` counts only GENUINE failures
-    (:func:`iter_genuine_errors`); declared-designed outcomes are tallied
-    separately under ``designed_outcome``
-    (:func:`iter_designed_outcomes`). The two were one key until task 3610:
-    the 07-31 census cluster 1.3 sighting
-    (``plans/confusion-census-2026-07-31.md:97``) found session a189558e
-    reporting 4 tool_errors of which 3 were benign
-    ``WATCHER_REARM_OUTCOME: CEILING exit=124`` lines, burying the single
-    genuine exit-2 failure. Splitting the tally is what makes that one
-    real error visible again. The partition is total and lossless, so
-    ``tool_error + designed_outcome`` still equals the number of
-    ``is_error`` neighborhoods -- and both halves come from ONE
-    :func:`iter_error_neighborhoods` scan, not one per half.
+    ``tool_error`` counts only GENUINE failures; declared-designed outcomes
+    are tallied separately under ``designed_outcome`` (task 3610), so one
+    real error is not buried among bounded-wait ceilings. The split is total
+    and lossless: the two sum to the number of ``is_error`` results.
     """
-    neighborhoods = iter_error_neighborhoods(records)
-    return {
-        'tool_error': len(iter_genuine_errors(neighborhoods=neighborhoods)),
-        'self_correct': len(iter_self_corrections(records)),
-        'not_found': len(iter_not_found(records)),
-        'df_guard': len(iter_df_guards(records)),
-        'interrupt': len(iter_interrupts(records)),
-        'designed_outcome': len(iter_designed_outcomes(neighborhoods=neighborhoods)),
-    }
+    hits = _all_record_hits(records)
+    return {signal.value: sum(record.count(signal) for record in hits) for signal in SignalClass}
 
 
-SIGNAL_WEIGHTS: dict[str, float] = {
-    'user_turn': 5.0,
-    'self_correct': 3.0,
-    'df_guard': 2.0,
-    'interrupt': 2.0,
-    'tool_error': 1.0,
-    'not_found': 1.0,
+SIGNAL_WEIGHTS: dict[SignalClass, float] = {
+    SignalClass.SELF_CORRECT: 3.0,
+    SignalClass.DF_GUARD: 2.0,
+    SignalClass.INTERRUPT: 2.0,
+    SignalClass.TOOL_ERROR: 1.0,
+    SignalClass.NOT_FOUND: 1.0,
 }
-"""Documented weights for :func:`score_signals`. Non-sidechain user turns
-are gold (PRD Sec 5) and outweigh any single occurrence of any other
-individual signal class. Self-corrections (an explicit "I was wrong"
-moment) are the strongest non-gold signal; df_guard/interrupt are
+"""Documented weights for :func:`score_signals`, one per
+:data:`detectors.CONFUSION_CLASSES` member. Self-corrections (an explicit
+"I was wrong" moment) are the strongest signal; df_guard/interrupt are
 mid-weight structural signals; tool_error/not_found are the lowest-weight,
 highest-frequency noise signals. Every weight is strictly positive, which
 is what makes score_signals monotonic.
 
-``designed_outcome`` is DELIBERATELY absent from this table. Because
-:func:`score_signals` iterates SIGNAL_WEIGHTS, omitting the entry means a
-declared-designed outcome is *reported* in ``signal_counts`` but
-contributes exactly zero to the confusion score — which is the point: a
-bounded-poll ceiling is a designed loop-continuation, not agent
-confusion, so no session's rank may shift merely because its noise got
-reclassified. Adding a 0.0 entry instead would break the
-strictly-positive invariant above; leaving the key out keeps
-score_signals monotonic over exactly the scored classes.
+``designed_outcome`` is DELIBERATELY absent: a declared-designed outcome is
+*reported* in ``signal_counts`` but contributes exactly zero to the
+confusion score, because a bounded-poll ceiling is a designed
+loop-continuation, not agent confusion. *Reported* is bounded by where a
+report exists: the sampler drops a session scoring zero before any digest
+is rendered (PRD Sec 7.2.1)."""
 
-*Reported* is bounded by where a report exists: the sampler drops a
-session scoring zero before any digest is rendered, so a session whose
-only structured errors are designed outcomes is never digested and its
-count never seen. The key disambiguates a MIXED session's errors; it is
-not a corpus-wide ceiling census (PRD Sec 7.2.1)."""
+USER_TURN_WEIGHT: float = 5.0
+"""Weight of one non-sidechain human user turn: gold (PRD Sec 5), outweighing
+any single occurrence of any :data:`SIGNAL_WEIGHTS` class."""
 
 
-def score_signals(counts: dict[str, int], n_user_turns: int) -> float:
+def score_signals(counts: Mapping[str, int], n_user_turns: int) -> float:
     """Weighted-sum confusion score used by beta's sampler to rank sessions.
 
-    Strictly monotonic in every input: since every SIGNAL_WEIGHTS entry is
-    positive, incrementing any one count (or n_user_turns) by 1 strictly
-    raises the score.
+    Strictly monotonic in every input: since every weight is positive,
+    incrementing any one count (or n_user_turns) by 1 strictly raises the
+    score.
     """
-    score = SIGNAL_WEIGHTS['user_turn'] * n_user_turns
-    for key, weight in SIGNAL_WEIGHTS.items():
-        if key == 'user_turn':
-            continue
-        score += weight * counts.get(key, 0)
+    score = USER_TURN_WEIGHT * n_user_turns
+    for signal, weight in SIGNAL_WEIGHTS.items():
+        score += weight * counts.get(signal, 0)
     return score
 
 
@@ -1009,7 +504,7 @@ def classify_agent_class(
     transcript with no marker match falls back to 'interactive'.
 
     Unlike every signal detector, it reads the RAW carriers
-    (:func:`_signal_text_sources`), not :func:`_dialogue_text_sources`: it
+    (:func:`detectors.raw_carriers`), never the dialogue-filtered ones: it
     classifies BY injected markers, so filtering them out would delete its
     own evidence.
     """
@@ -1019,9 +514,7 @@ def classify_agent_class(
         return 'unknown'
 
     haystack = '\n'.join(
-        text for _, text in _signal_text_sources(
-            records, tool_result=True, assistant_text=True, user_text=True,
-        )
+        text for record in records for _, text in raw_carriers(record)
     ).lower()
 
     if all(marker in haystack for marker in ORCHESTRATED_TASK_MARKERS):
@@ -1051,7 +544,7 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     one of those injected shapes lands in the transcript as ordinary
     user-role text (isMeta unset), so isMeta alone cannot exclude any of
     them. The gold bucket asks the SAME predicate every scalar detector asks
-    (:func:`is_non_dialogue_carrier`) rather than holding a private copy of
+    (:func:`detectors.is_non_dialogue_carrier`) rather than holding a private copy of
     the rule: task 5685's ruling that the fix belongs at the
     content-classification layer, not per bucket.
 
@@ -1071,7 +564,7 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         if record.get('isMeta'):
             continue
-        text = _user_turn_text(_message_content(record))
+        text = user_turn_text(record)
         if text is None:
             continue
         if is_non_dialogue_carrier(record, text):
@@ -1171,15 +664,11 @@ key in FRONTMATTER_KEYS is double-quoted via :func:`_yaml_dquote`. Named
 rather than inlined into :func:`render_frontmatter` so a further numeric
 key is a one-word addition here instead of a growing inline literal."""
 
-SIGNAL_COUNT_KEYS: tuple[str, ...] = (
-    'tool_error', 'self_correct', 'not_found', 'df_guard', 'interrupt',
-    'designed_outcome',
-)
+SIGNAL_COUNT_KEYS: tuple[SignalClass, ...] = tuple(SignalClass)
 """``signal_counts`` nested keys in the exact PRD Sec 7.2 order.
 
-``designed_outcome`` is APPENDED last (task 3610) so the pre-existing
-five-key prefix stays byte-stable for anything diffing rendered
-frontmatter."""
+``designed_outcome`` is last (task 3610) so the pre-existing five-key
+prefix stays byte-stable for anything diffing rendered frontmatter."""
 
 
 def render_frontmatter(meta: dict[str, Any]) -> str:
@@ -1414,23 +903,57 @@ def _render_scalar_signal(items: list[dict[str, Any]]) -> list[str]:
     return [f"- (turn {item['index']}) {item['pattern']}" for item in items]
 
 
-_SECTION_RENDERERS: dict[str, Any] = {
-    'user_corrections': (iter_user_turns, _render_user_corrections),
-    'error_neighborhoods': (iter_genuine_errors, _render_error_neighborhoods),
-    'self_corrections': (iter_self_corrections, _render_self_corrections),
-    'retry_loops': (find_retry_loops, _render_retry_loops),
-    'not_found': (iter_not_found, _render_scalar_signal),
-    'df_guard': (iter_df_guards, _render_scalar_signal),
-    'interrupt': (iter_interrupts, _render_scalar_signal),
-    'designed_outcomes': (iter_designed_outcomes, _render_designed_outcomes),
+@dataclass(frozen=True)
+class _DigestScan:
+    """What every section is detected from, computed once per build."""
+
+    records: list[dict[str, Any]]
+    hits: list[RecordHits]
+    neighborhoods: list[dict[str, Any]]
+
+
+def _scan(records: list[dict[str, Any]]) -> _DigestScan:
+    hits = _all_record_hits(records)
+    return _DigestScan(records, hits, _error_neighborhoods(records, [h.errors for h in hits]))
+
+
+_SectionDetector = Callable[[_DigestScan], list[dict[str, Any]]]
+_ItemRenderer = Callable[[list[dict[str, Any]]], list[str]]
+
+_SECTION_RENDERERS: dict[str, tuple[_SectionDetector, _ItemRenderer]] = {
+    'user_corrections': (
+        lambda scan: iter_user_turns(scan.records), _render_user_corrections,
+    ),
+    'error_neighborhoods': (
+        lambda scan: iter_genuine_errors(neighborhoods=scan.neighborhoods),
+        _render_error_neighborhoods,
+    ),
+    'self_corrections': (
+        lambda scan: _signal_items(scan.hits, SignalClass.SELF_CORRECT),
+        _render_self_corrections,
+    ),
+    'retry_loops': (
+        lambda scan: find_retry_loops(scan.records, neighborhoods=scan.neighborhoods),
+        _render_retry_loops,
+    ),
+    'not_found': (
+        lambda scan: _signal_items(scan.hits, SignalClass.NOT_FOUND), _render_scalar_signal,
+    ),
+    'df_guard': (
+        lambda scan: _signal_items(scan.hits, SignalClass.DF_GUARD), _render_scalar_signal,
+    ),
+    'interrupt': (
+        lambda scan: _signal_items(scan.hits, SignalClass.INTERRUPT), _render_scalar_signal,
+    ),
+    'designed_outcomes': (
+        lambda scan: iter_designed_outcomes(neighborhoods=scan.neighborhoods),
+        _render_designed_outcomes,
+    ),
 }
 """(detector, item-renderer) pair per section key, keyed identically to
-SECTION_HEADINGS/SECTION_PRIORITY.
-
-'error_neighborhoods' detects via :func:`iter_genuine_errors`, NOT
-:func:`iter_error_neighborhoods` -- the two halves of that partition
-render in separate sections, so each neighborhood appears exactly once
-in the body (task 3610)."""
+SECTION_HEADINGS/SECTION_PRIORITY. The genuine and designed halves of the
+error partition render in separate sections, so each neighborhood appears
+exactly once in the body (task 3610)."""
 
 ITEM_TRUNCATION_MARKER = '... [item truncated'
 """Stable, greppable PREFIX of the tail appended to a per-item line that
@@ -1562,15 +1085,6 @@ def _build_sections(
     trim loop. A section with zero hits maps to an empty list --
     render_digest skips emitting a heading for it.
 
-    The two neighborhood partitions (_NEIGHBORHOOD_PARTITIONS) are fed one
-    shared scan instead of scanning *records* once each, and the
-    annotators (_NEIGHBORHOOD_ANNOTATORS) are fed that SAME scan alongside
-    *records*: which detector serves which section still comes from
-    _SECTION_RENDERERS alone, only HOW it is invoked differs. Feeding the
-    shared scan is required, not an optimisation --
-    :func:`find_retry_loops` would otherwise self-scan here and make a
-    single digest pay three full neighborhood passes.
-
     Returns ``(sections, truncated)``, where *truncated* is the set of
     ``(section_key, item_index)`` positions :func:`_cap_item` actually
     byte-capped. Recording it HERE, at the only place truncation happens,
@@ -1584,16 +1098,11 @@ def _build_sections(
     :func:`_truncate_sections` because it only ever pops the TRAILING item
     of a section, never reindexes a surviving one.
     """
-    neighborhoods = iter_error_neighborhoods(records)
+    scan = _scan(records)
     sections: dict[str, list[str]] = {}
     truncated: set[tuple[str, int]] = set()
     for key, (detector, renderer) in _SECTION_RENDERERS.items():
-        if detector in _NEIGHBORHOOD_PARTITIONS:
-            items = detector(neighborhoods=neighborhoods)
-        elif detector in _NEIGHBORHOOD_ANNOTATORS:
-            items = detector(records, neighborhoods=neighborhoods)
-        else:
-            items = detector(records)
+        items = detector(scan)
         lines = []
         for index, line in enumerate(renderer(items)):
             capped = _cap_item(line, item_max_bytes)

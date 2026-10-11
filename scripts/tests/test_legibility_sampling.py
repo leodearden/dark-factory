@@ -15,7 +15,7 @@ from datetime import date as dt_date
 from pathlib import Path
 
 import pytest
-from legibility import coder, digest, inventory
+from legibility import coder, detectors, digest, inventory
 from legibility import config as config_mod
 from legibility import sampling as mod
 from legibility_carrier_fixtures import (
@@ -702,7 +702,7 @@ class TestSamplerReingestedContentParity:
         sampled = dataclasses.asdict(mod.score_signals(path))
         digested = digest.signal_counts([record])
 
-        assert digest.is_non_dialogue_carrier(record, head) is False
+        assert detectors.is_non_dialogue_carrier(record, head) is False
         assert {name: sampled[name] for name in _TEXT_CLASSES} == dict.fromkeys(_TEXT_CLASSES, 0)
         assert {name: digested[name] for name in _TEXT_CLASSES} == dict.fromkeys(_TEXT_CLASSES, 0)
 
