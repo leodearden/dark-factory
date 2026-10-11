@@ -234,3 +234,12 @@ Deps: π2 (6530) ← —; λ2 (6531, operational) ← π2; ι2 (6532) ← λ2; �
 - **λ2 — blind rating top-up** (operational): the new pairs, same brief and protocol as λ, appended to the verdict corpus as batch `write-time-2026-10`.
 - **ι2 — comparative scorer and μ rerun**: C2‴ above; regenerates and commits the matrix and best_config.
 - **Γ3 — re-based** (task 5808; D18–D21).
+
+### 12.5 Erratum 2026-10-11 — the 10-05 harm figures in §12.1 and D20 are superseded
+
+**Origin:** esc-6532-3 (task 6532, ι2), accepted by Leo on 2026-10-11.
+
+- **The 10-05 figures were computed asymmetrically.** D20's "sol:low@5 scores 192 against the status quo's 283 and terra:none@5 231" charges the status quo `0.5 × 230 + 2 × 84`, but leaves each arm's own `placeable_left_flat` term out and counts an arm's `contradiction_unflagged` only when a CORRECTS target was attached without contest. They are superseded here, not corrected in place.
+- **ι2 scores both regimes with one per-write classifier** (`fused-memory/scripts/score_write_triage_pairs.py::_outcome_cells`; rules text under `comparative_rules` in the committed artifacts; pinned by `fused-memory/tests/test_score_write_triage_pairs.py::test_an_arm_that_stores_everything_is_the_status_quo`). Under the task spec's literal arm rule, an arm that stores every write behaves exactly as the status quo yet scores `2 × contradiction_writes` (176) better than it. The adopted rule is the stricter of the two.
+- **Governing figures** (write-time slates, 484 production-judged writes; `fused-memory/calibration/write_triage_config_matrix.json`): status quo harm 329 (306 placeable writes, 88 contradiction writes). gpt-6.1-sol:low@5 delta −62.5 [−118.5, −6.5], wrong sibling 22/279 = 0.079. gpt-5.6-terra:none@5 −2.0 [−48.5, 44.0], 38/298 = 0.128. gpt-4o-mini@5 +278 [215.0, 339.5], 35/242 = 0.145. Under the literal rule the deltas are −106.5, −70 and +190 (esc-6532-3; re-run 2026-10-11). Sol is the only arm meeting every D19 bound under either reading, and Γ3 (5808) passed on the adopted rule on 2026-10-11.
+- **The 3169 flip (ruled and applied 2026-10-11) rests on `write_triage_best_config.json` `comparative` and `comparative_rules`, not on these 10-05 figures.** Read those when reviewing it. D20's weights are unchanged and remain provisional (G6).
