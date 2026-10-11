@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import inspect
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +20,7 @@ from _pending_tool_fixtures import _file
 from fastmcp import Client, FastMCP
 from mcp.types import TextContent
 
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
 from escalation.store_identity import StoreIdentity
@@ -42,6 +43,18 @@ async def call(server, name: str, **kw: Any) -> Any:
     if inspect.isawaitable(result):
         result = await result
     return result
+
+
+def storm_records(queue: EscalationQueue) -> list[Escalation]:
+    return [e for e in queue.get_pending() if e.category == 'infra_issue' and e.level == 1]
+
+
+async def assert_refused(
+    server, kwargs_for: Callable[[str], dict[str, Any]], root: str, names: Iterable[str],
+) -> None:
+    for name in names:
+        result = await call(server, name, **kwargs_for(name), project_root=root)
+        assert set(result) == {'error'}, name
 
 
 @pytest.fixture
@@ -81,11 +94,15 @@ def kwargs_for(seeded_id: str) -> Callable[[str], dict[str, Any]]:
 
 
 @pytest.fixture
-def project_server(queue: EscalationQueue, proj: Path) -> FastMCP:
-    identity = StoreIdentity(
+def project_identity(proj: Path) -> StoreIdentity:
+    return StoreIdentity(
         kind='project', queue_dir=proj / 'esc', project_id='proj', project_root=proj,
     )
-    return create_server(queue, startup_sweep=False, store_identity=identity)
+
+
+@pytest.fixture
+def project_server(queue: EscalationQueue, project_identity: StoreIdentity) -> FastMCP:
+    return create_server(queue, startup_sweep=False, store_identity=project_identity)
 
 
 @pytest.fixture
@@ -285,3 +302,118 @@ class TestWireShape:
             )
 
         assert 'reconciliation store' in result.data['error']
+
+
+class TestMismatchStormEscape:
+    @pytest.mark.asyncio
+    async def test_fifth_mismatch_files_once_and_the_next_streak_folds(
+        self,
+        project_server: FastMCP,
+        queue: EscalationQueue,
+        kwargs_for: Callable[[str], dict[str, Any]],
+        other: Path,
+    ) -> None:
+        first_four = (
+            'get_pending_escalations',
+            'get_escalation',
+            'escalate_info',
+            'get_task_escalation_history',
+        )
+        await assert_refused(project_server, kwargs_for, str(other), first_four)
+        assert storm_records(queue) == []
+
+        await assert_refused(project_server, kwargs_for, str(other), ['escalate_blocker'])
+        records = storm_records(queue)
+        assert len(records) == 1
+        assert str(other) in records[0].summary
+        assert str(queue.queue_dir) in records[0].summary
+
+        await assert_refused(project_server, kwargs_for, str(other), ['get_escalation'])
+        records = storm_records(queue)
+        assert len(records) == 1
+        assert records[0].dedupe_count == 0
+
+        await assert_refused(project_server, kwargs_for, str(other), TOOLS[1:])
+        records = storm_records(queue)
+        assert len(records) == 1
+        assert records[0].dedupe_count == 1
+
+    @pytest.mark.asyncio
+    async def test_the_storm_lands_in_the_reconciliation_queue(
+        self,
+        recon_server: FastMCP,
+        recon_queue: EscalationQueue,
+        kwargs_for: Callable[[str], dict[str, Any]],
+        other: Path,
+    ) -> None:
+        await assert_refused(recon_server, kwargs_for, str(other), TOOLS)
+
+        records = storm_records(recon_queue)
+        assert len(records) == 1
+        assert 'reconciliation' in records[0].summary
+
+    @pytest.mark.asyncio
+    async def test_streaks_are_per_asserted_root(
+        self,
+        tmp_path: Path,
+        project_server: FastMCP,
+        queue: EscalationQueue,
+        kwargs_for: Callable[[str], dict[str, Any]],
+    ) -> None:
+        for root in (tmp_path / 'other-a', tmp_path / 'other-b'):
+            await assert_refused(project_server, kwargs_for, str(root), TOOLS[:4])
+
+        assert storm_records(queue) == []
+
+    @pytest.mark.asyncio
+    async def test_threshold_is_tunable(
+        self,
+        queue: EscalationQueue,
+        project_identity: StoreIdentity,
+        kwargs_for: Callable[[str], dict[str, Any]],
+        other: Path,
+    ) -> None:
+        server = create_server(
+            queue, startup_sweep=False, store_identity=project_identity,
+            mismatch_streak_threshold=3,
+        )
+
+        await assert_refused(server, kwargs_for, str(other), READS[:2])
+        assert storm_records(queue) == []
+        await assert_refused(server, kwargs_for, str(other), READS[2:])
+        assert len(storm_records(queue)) == 1
+
+    def test_invalid_threshold_fails_at_construction_without_an_identity(
+        self, queue: EscalationQueue,
+    ) -> None:
+        with pytest.raises(ValueError, match='mismatch_streak'):
+            create_server(
+                queue, startup_sweep=False, store_identity=None, mismatch_streak_threshold=0,
+            )
+
+    @pytest.mark.asyncio
+    async def test_matching_and_omitted_calls_never_feed_the_streak(
+        self,
+        project_server: FastMCP,
+        queue: EscalationQueue,
+        kwargs_for: Callable[[str], dict[str, Any]],
+        proj: Path,
+    ) -> None:
+        for name in READS * 4:
+            await call(project_server, name, **kwargs_for(name), project_root=str(proj))
+            await call(project_server, name, **kwargs_for(name))
+
+        assert storm_records(queue) == []
+
+    @pytest.mark.asyncio
+    async def test_identityless_server_never_feeds_the_streak(
+        self,
+        bare_server: FastMCP,
+        queue: EscalationQueue,
+        kwargs_for: Callable[[str], dict[str, Any]],
+        other: Path,
+    ) -> None:
+        for name in READS * 4:
+            await call(bare_server, name, **kwargs_for(name), project_root=str(other))
+
+        assert storm_records(queue) == []
