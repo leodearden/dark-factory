@@ -62,6 +62,19 @@ def test_success_on_an_untracked_key_is_a_noop():
     assert streaks.count('never-seen') == 0
 
 
+@pytest.mark.parametrize('bad', [0, -1, 2.5, True, '3'])
+def test_rejects_a_threshold_that_could_never_fire(bad):
+    with pytest.raises(ValueError) as excinfo:
+        KeyedStreaks(threshold=bad)
+
+    assert 'threshold' in str(excinfo.value)
+    assert repr(bad) in str(excinfo.value)
+
+
+def test_accepts_threshold_one():
+    assert KeyedStreaks(threshold=1).failure('k') == StreakStep(1, True)
+
+
 @pytest.mark.parametrize('field', ['count', 'fired'])
 def test_streak_step_is_a_frozen_value(field: str):
     step = StreakStep(2, False)
