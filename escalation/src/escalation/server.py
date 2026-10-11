@@ -61,6 +61,7 @@ from escalation.merge_status_answer import (
     hint_for,
     map_terminal_state,
 )
+from escalation.mismatch_streak import DEFAULT_MISMATCH_STREAK_THRESHOLD, MismatchStreak
 from escalation.models import (
     ACTION_KEEP_DRIVING,
     ACTION_TERMINATE_CLEANLY,
@@ -1047,6 +1048,7 @@ def create_server(
     startup_sweep: bool = True,
     startup_sweep_now: datetime | None = None,
     store_identity: StoreIdentity | None = None,
+    mismatch_streak_threshold: int = DEFAULT_MISMATCH_STREAK_THRESHOLD,
 ) -> FastMCP:
     """Create the escalation MCP server with all tools registered.
 
@@ -1110,6 +1112,10 @@ def create_server(
     its docstring.  It is also read by the optional ``project_root`` guard
     (``plans/escalation-store-ambiguity-prd.md`` §6.3): a tool call asserting a
     root this store does not serve is refused; with no identity, nothing is.
+
+    *mismatch_streak_threshold* (default 5) — how many refused assertions of
+    one ``project_root`` file (or fold) ONE ``infra_issue`` L1 into this
+    server's own queue (``escalation.mismatch_streak::MismatchStreak``).
     """
     mcp = FastMCP('escalation', instructions=ESCALATION_SERVER_INSTRUCTIONS)
     if store_identity is not None:
@@ -1352,6 +1358,8 @@ def create_server(
     cfg = dedupe_config if dedupe_config is not None else DedupeConfig()
 
     # --- Optional project_root assertion (PRD §6.3) ---
+    mismatch_streak = MismatchStreak(queue, threshold=mismatch_streak_threshold)
+
     # An omitted or '' assertion, or a server with no identity, proceeds.  The
     # sync tools call the guard directly (FastMCP threadpools them); the async
     # ones hop only when there is something to resolve.
@@ -1361,6 +1369,7 @@ def create_server(
         refusal = _project_root_refusal(store_identity, project_root)
         if refusal is None:
             return None
+        mismatch_streak.record_mismatch(store_identity, project_root, refusal)
         return {'error': refusal}
 
     async def _refuse_misdirected_call_off_loop(
