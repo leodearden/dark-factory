@@ -1586,6 +1586,56 @@ class TestSignalCountsAndScore:
             assert one_user_turn_score > mod.score_signals(single_signal, n_user_turns=0)
 
 
+def _one_record_per_text_class():
+    return [
+        _assistant(_text('My mistake, let me redo this.')),
+        _tool_result('tu-2', 'command not found', is_error=False),
+        _tool_result('tu-3', 'BLOCKED: real block', is_error=False),
+        _user_text('[Request interrupted by user for tool use]'),
+        _assistant(_tool_use('Bash', {'command': 'false'}, id='tu-1')),
+        _tool_result('tu-1', 'Exit code 1', is_error=True),
+    ]
+
+
+_PER_CLASS_READERS = [
+    mod.iter_self_corrections, mod.iter_not_found, mod.iter_df_guards, mod.iter_interrupts,
+    mod.signal_counts,
+]
+
+
+class TestPrecomputedRecordHits:
+    """Every per-class reader takes ``hits=``, one detectors.record_hits
+    result per record, so a caller reading several classes pays one
+    detector pass rather than one per class."""
+
+    @pytest.mark.parametrize('reader', _PER_CLASS_READERS, ids=lambda reader: reader.__name__)
+    def test_a_reader_given_hits_answers_as_it_does_from_records(self, reader):
+        records = _one_record_per_text_class()
+        hits = [detectors.record_hits(record) for record in records]
+
+        assert reader(hits=hits) == reader(records)
+        assert reader(records)
+
+    @pytest.mark.parametrize('reader', _PER_CLASS_READERS, ids=lambda reader: reader.__name__)
+    def test_a_reader_given_neither_raises(self, reader):
+        with pytest.raises(TypeError):
+            reader()
+
+    def test_render_digest_runs_the_detectors_once_per_record(self, monkeypatch):
+        records = _one_record_per_text_class()
+        calls = []
+        original = mod.record_hits
+
+        def counting(record):
+            calls.append(record)
+            return original(record)
+
+        monkeypatch.setattr(mod, 'record_hits', counting)
+        mod.render_digest(records, agent_class='interactive')
+
+        assert len(calls) == len(records)
+
+
 # ---------------------------------------------------------------------------
 # build_digest's agent_class_override: a caller-supplied class (beta's
 # already-authoritative stratum) is rendered verbatim, never re-derived.

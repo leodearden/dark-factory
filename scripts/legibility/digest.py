@@ -272,24 +272,48 @@ def _all_record_hits(records: list[dict[str, Any]]) -> list[RecordHits]:
     return [record_hits(record) for record in records]
 
 
-def iter_self_corrections(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _hits_to_reduce(
+    records: list[dict[str, Any]] | None,
+    hits: Sequence[RecordHits] | None,
+) -> Sequence[RecordHits]:
+    """Resolve what a per-class reader reduces: the caller's ``hits`` (one
+    :func:`detectors.record_hits` result per record, in record order) when
+    given, else a fresh pass over ``records``. Exactly one is required, as
+    for :func:`_neighborhoods_to_partition`, so a caller reading several
+    classes pays for one detector pass instead of one per class."""
+    if hits is not None:
+        return hits
+    if records is None:
+        raise TypeError('pass either records or hits=')
+    return _all_record_hits(records)
+
+
+def iter_self_corrections(
+    records: list[dict[str, Any]] | None = None, *, hits: Sequence[RecordHits] | None = None,
+) -> list[dict[str, Any]]:
     """Self-correction markers in assistant text blocks."""
-    return _signal_items(_all_record_hits(records), SignalClass.SELF_CORRECT)
+    return _signal_items(_hits_to_reduce(records, hits), SignalClass.SELF_CORRECT)
 
 
-def iter_not_found(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def iter_not_found(
+    records: list[dict[str, Any]] | None = None, *, hits: Sequence[RecordHits] | None = None,
+) -> list[dict[str, Any]]:
     """Not-found literals in tool_result content."""
-    return _signal_items(_all_record_hits(records), SignalClass.NOT_FOUND)
+    return _signal_items(_hits_to_reduce(records, hits), SignalClass.NOT_FOUND)
 
 
-def iter_df_guards(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def iter_df_guards(
+    records: list[dict[str, Any]] | None = None, *, hits: Sequence[RecordHits] | None = None,
+) -> list[dict[str, Any]]:
     """Guard trip literals in tool_results, assistant text and user turns."""
-    return _signal_items(_all_record_hits(records), SignalClass.DF_GUARD)
+    return _signal_items(_hits_to_reduce(records, hits), SignalClass.DF_GUARD)
 
 
-def iter_interrupts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def iter_interrupts(
+    records: list[dict[str, Any]] | None = None, *, hits: Sequence[RecordHits] | None = None,
+) -> list[dict[str, Any]]:
     """The injected interrupt marker in non-sidechain user turns."""
-    return _signal_items(_all_record_hits(records), SignalClass.INTERRUPT)
+    return _signal_items(_hits_to_reduce(records, hits), SignalClass.INTERRUPT)
 
 
 RETRY_MIN = 3
@@ -411,7 +435,9 @@ def find_retry_loops(
     return loops
 
 
-def signal_counts(records: list[dict[str, Any]]) -> dict[str, int]:
+def signal_counts(
+    records: list[dict[str, Any]] | None = None, *, hits: Sequence[RecordHits] | None = None,
+) -> dict[str, int]:
     """The frontmatter's ``signal_counts`` (PRD Sec 7.2): every signal
     class's hit total over the transcript, 0 for an absent class.
 
@@ -420,8 +446,8 @@ def signal_counts(records: list[dict[str, Any]]) -> dict[str, int]:
     real error is not buried among bounded-wait ceilings. The split is total
     and lossless: the two sum to the number of ``is_error`` results.
     """
-    hits = _all_record_hits(records)
-    return {signal.value: sum(record.count(signal) for record in hits) for signal in SignalClass}
+    reduced = _hits_to_reduce(records, hits)
+    return {signal.value: sum(record.count(signal) for record in reduced) for signal in SignalClass}
 
 
 SIGNAL_WEIGHTS: dict[SignalClass, float] = {
@@ -843,13 +869,13 @@ class _DigestScan:
     """What every section is detected from, computed once per build."""
 
     records: list[dict[str, Any]]
-    hits: list[RecordHits]
+    hits: Sequence[RecordHits]
     neighborhoods: list[dict[str, Any]]
 
 
-def _scan(records: list[dict[str, Any]]) -> _DigestScan:
-    hits = _all_record_hits(records)
-    return _DigestScan(records, hits, _error_neighborhoods(records, [h.errors for h in hits]))
+def _scan(records: list[dict[str, Any]], hits: Sequence[RecordHits] | None) -> _DigestScan:
+    reduced = _hits_to_reduce(records, hits)
+    return _DigestScan(records, reduced, _error_neighborhoods(records, [h.errors for h in reduced]))
 
 
 _SectionDetector = Callable[[_DigestScan], list[dict[str, Any]]]
@@ -864,7 +890,7 @@ _SECTION_RENDERERS: dict[str, tuple[_SectionDetector, _ItemRenderer]] = {
         _render_error_neighborhoods,
     ),
     'self_corrections': (
-        lambda scan: _signal_items(scan.hits, SignalClass.SELF_CORRECT),
+        lambda scan: iter_self_corrections(hits=scan.hits),
         _render_self_corrections,
     ),
     'retry_loops': (
@@ -872,13 +898,13 @@ _SECTION_RENDERERS: dict[str, tuple[_SectionDetector, _ItemRenderer]] = {
         _render_retry_loops,
     ),
     'not_found': (
-        lambda scan: _signal_items(scan.hits, SignalClass.NOT_FOUND), _render_scalar_signal,
+        lambda scan: iter_not_found(hits=scan.hits), _render_scalar_signal,
     ),
     'df_guard': (
-        lambda scan: _signal_items(scan.hits, SignalClass.DF_GUARD), _render_scalar_signal,
+        lambda scan: iter_df_guards(hits=scan.hits), _render_scalar_signal,
     ),
     'interrupt': (
-        lambda scan: _signal_items(scan.hits, SignalClass.INTERRUPT), _render_scalar_signal,
+        lambda scan: iter_interrupts(hits=scan.hits), _render_scalar_signal,
     ),
     'designed_outcomes': (
         lambda scan: iter_designed_outcomes(neighborhoods=scan.neighborhoods),
@@ -1009,7 +1035,10 @@ def _cap_item(line: str, cap: int) -> str:
 
 
 def _build_sections(
-    records: list[dict[str, Any]], *, item_max_bytes: int = _item_byte_cap(15360),
+    records: list[dict[str, Any]],
+    *,
+    item_max_bytes: int = _item_byte_cap(15360),
+    hits: Sequence[RecordHits] | None = None,
 ) -> tuple[dict[str, list[str]], set[tuple[str, int]]]:
     """Run every detector once and render its hits to markdown bullet
     lines, keyed by section key, capping each rendered line to
@@ -1019,6 +1048,9 @@ def _build_sections(
     never evict every sibling section during :func:`_truncate_sections`'
     trim loop. A section with zero hits maps to an empty list --
     render_digest skips emitting a heading for it.
+
+    *hits* is the caller's :func:`detectors.record_hits` pass over
+    *records*, when it has one (:func:`_hits_to_reduce`).
 
     Returns ``(sections, truncated)``, where *truncated* is the set of
     ``(section_key, item_index)`` positions :func:`_cap_item` actually
@@ -1033,7 +1065,7 @@ def _build_sections(
     :func:`_truncate_sections` because it only ever pops the TRAILING item
     of a section, never reindexes a surviving one.
     """
-    scan = _scan(records)
+    scan = _scan(records, hits)
     sections: dict[str, list[str]] = {}
     truncated: set[tuple[str, int]] = set()
     for key, (detector, renderer) in _SECTION_RENDERERS.items():
@@ -1204,7 +1236,8 @@ def render_digest(
     returned unmodified (zero trim iterations).
     """
     cwd = _derive_cwd(records)
-    counts = signal_counts(records)
+    hits = _all_record_hits(records)
+    counts = signal_counts(hits=hits)
     # Bound ONCE and used for both the rendered key and the scored
     # argument, so the frontmatter's stated basis and the score computed
     # from it can never diverge (confusion-census-2026-07-31 R2).
@@ -1226,7 +1259,7 @@ def render_digest(
     }
 
     sections, truncated = _build_sections(
-        records, item_max_bytes=_item_byte_cap(max_bytes),
+        records, item_max_bytes=_item_byte_cap(max_bytes), hits=hits,
     )
     digest, trimmed_sections = _truncate_sections(
         meta, sections, max_bytes, truncated=truncated,
