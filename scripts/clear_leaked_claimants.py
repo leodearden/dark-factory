@@ -41,14 +41,13 @@ from migrate_metadata_modules_to_files import FusedMemoryClient, write_failure_r
 
 # Bind shared/ and fused-memory/ to THIS checkout rather than whichever copy an
 # editable install put on sys.path (scripts/audit_manifest_descriptor_drift.py::_SHARED_SRC).
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-for _src in (_REPO_ROOT / 'shared' / 'src', _REPO_ROOT / 'fused-memory' / 'src'):
-    if str(_src) not in sys.path:
-        sys.path.insert(0, str(_src))
+# Bare sys.path.insert statements, which ruff's E402 exempts, so the imports below need no noqa.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'fused-memory' / 'src'))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'shared' / 'src'))
 
 # A stdlib-only module under empty package __init__s, so the scripts env can import it.
-from fused_memory.mcp_tools.scheduler_state import read_scheduler_state  # noqa: E402
-from shared.task_claimant import (  # noqa: E402
+from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
+from shared.task_claimant import (
     DEFAULT_CLAIMANT_HEARTBEAT_TTL,
     is_stale_hygiene_tier_claimant,
     violates_terminal_claimant_invariant,
