@@ -374,6 +374,14 @@ def test_a_probe_finding_in_an_undeclared_block_is_rejected_by_tag(tmp_path):
         _run([_unit(tmp_path, "a")], probes=[probe])
 
 
+@pytest.mark.parametrize("kind", parity.VERDICT_KINDS)
+def test_a_probe_block_reusing_a_built_in_verdict_kind_is_rejected_when_declared(kind):
+    clashing = parity.BlockText(kind, "{count} C:", ())
+
+    with pytest.raises(ValueError, match=kind):
+        parity.Probe(blocks=(clashing,), run=lambda unit, text: parity.ProbeOutcome())
+
+
 # ---------------------------------------------------------------------------
 # Verdict lines
 # ---------------------------------------------------------------------------

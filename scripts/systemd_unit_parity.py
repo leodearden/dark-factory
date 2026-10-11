@@ -372,6 +372,15 @@ class Probe:
     blocks: tuple[BlockText, ...]
     run: Callable[[UnitRef, str], ProbeOutcome]
 
+    def __post_init__(self) -> None:
+        for block in self.blocks:
+            if block.tag in VERDICT_KINDS:
+                raise ValueError(
+                    f"a Probe block is tagged [{block.tag}], a built-in verdict kind; a "
+                    "probe's tags are extra verdict kinds, so a finding tagged 'clean' or "
+                    "'absent' would never set the exit code to FINDING"
+                )
+
 
 @dataclasses.dataclass(frozen=True)
 class ParityRun:
@@ -570,22 +579,26 @@ def _emit_report(run: ParityRun, outcomes: Sequence[_Outcome], out: TextIO) -> N
         _emit_bucket(tool, block, found, out=out)
 
 
-def _conclude(
-    tool: str, outcomes: Sequence[_Outcome], kinds: Sequence[frozenset[str]], out: TextIO
-) -> ParityExit:
+def _conclude(kinds: Sequence[frozenset[str]], compared: int) -> ParityExit:
+    """The ladder: each unit's verdict kinds and the number of units compared decide the code."""
     if any(unit_kinds - _BENIGN_KINDS for unit_kinds in kinds):
         return ParityExit.FINDING
     if any("absent" in unit_kinds for unit_kinds in kinds):
         return ParityExit.NOT_INSTALLED
+    return ParityExit.PARITY if compared else ParityExit.FINDING
+
+
+def _emit_closing(
+    tool: str, outcomes: Sequence[_Outcome], code: ParityExit, *, out: TextIO
+) -> None:
+    """On PARITY, each confirmation and then [ok]. On an empty run, [error], since no block explains it."""
     compared = [o for o in outcomes if isinstance(o, _Compared)]
-    if not compared:
-        emit(tool, "[error] no units were compared — nothing was verified.", out=out)
-        return ParityExit.FINDING
-    for o in compared:
-        for confirmation in o.confirmations:
+    if code is ParityExit.PARITY:
+        for confirmation in (line for o in compared for line in o.confirmations):
             emit(tool, confirmation, out=out)
-    emit(tool, f"[ok] parity — {len(compared)} unit(s) match their committed copies.", out=out)
-    return ParityExit.PARITY
+        emit(tool, f"[ok] parity — {len(compared)} unit(s) match their committed copies.", out=out)
+    elif not outcomes:
+        emit(tool, "[error] no units were compared — nothing was verified.", out=out)
 
 
 def run_parity(run: ParityRun, *, out: TextIO) -> ParityExit:
@@ -596,9 +609,11 @@ def run_parity(run: ParityRun, *, out: TextIO) -> ParityExit:
     """
     outcomes = [_classify(run, unit) for unit in run.units]
     kinds = [_verdict_kinds(outcome) for outcome in outcomes]
+    code = _conclude(kinds, sum(isinstance(o, _Compared) for o in outcomes))
     if run.print_verdicts:
         verdicts = sorted(zip((o.unit.name for o in outcomes), kinds, strict=True))
         for name, unit_kinds in verdicts:
             emit(run.tool, f"verdict {name} {_render_kinds(unit_kinds)}", out=out)
     _emit_report(run, outcomes, out)
-    return _conclude(run.tool, outcomes, kinds, out)
+    _emit_closing(run.tool, outcomes, code, out=out)
+    return code
