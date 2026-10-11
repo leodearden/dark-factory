@@ -676,6 +676,60 @@ class TestClassifyAgentClass:
 
         assert _classify(user_record('where does it run?'), record) is AgentClass.INTERACTIVE
 
+    def test_a_require_all_marker_may_be_spread_across_carriers(self):
+        records = [
+            user_record('please look at this'),
+            tool_result_record('tu-1', 'Task ID: 2572'),
+            assistant_record(text_block('Worktree: /home/leo/src/dark-factory/.worktrees/2572')),
+        ]
+
+        assert _classify(*records) is AgentClass.ORCHESTRATED_TASK
+
+    def test_records_are_read_once_in_order_from_any_iterable(self):
+        records = iter([
+            user_record('please look at this'),
+            assistant_record(text_block('You are a Memory Consolidator agent operating in sleep mode.')),
+        ])
+
+        assert detectors.classify_agent_class(_MAIN_DIR_PATH, records) is AgentClass.RECON
+
+
+class TestAgentClassEvidence:
+    def test_folding_records_one_at_a_time_is_classify_agent_class(self):
+        records = [
+            user_record('<command-name>recon-escalation-watcher</command-name>', isMeta=True),
+            user_record('please check the queue'),
+            tool_result_record('tu-1', 'resolved_by=orchestrator-escalation-watcher-auto'),
+        ]
+        evidence = detectors.AgentClassEvidence.for_path(_MAIN_DIR_PATH)
+
+        for record in records:
+            evidence = evidence.observe(record)
+
+        assert evidence.agent_class is _classify(*records) is AgentClass.WATCHER
+        assert evidence.first_turn_text == 'please check the queue'
+
+    def test_no_record_yet_is_unknown_and_no_first_turn(self):
+        evidence = detectors.AgentClassEvidence.for_path(_MAIN_DIR_PATH)
+
+        assert evidence.agent_class is AgentClass.UNKNOWN
+        assert evidence.first_turn_text is None
+
+    def test_a_first_turn_without_text_is_empty_text(self):
+        evidence = detectors.AgentClassEvidence.for_path(_MAIN_DIR_PATH).observe(
+            tool_result_record('tu-1', 'ok'),
+        )
+
+        assert evidence.first_turn_text == ''
+
+    def test_observing_returns_new_evidence_and_leaves_the_old_unchanged(self):
+        before = detectors.AgentClassEvidence.for_path(_MAIN_DIR_PATH)
+
+        after = before.observe(user_record('## Reconciliation Run\n'))
+
+        assert before.agent_class is AgentClass.UNKNOWN
+        assert after.agent_class is AgentClass.RECON
+
 
 _SHAPES = [
     pytest.param(_WORKTREE_DIRS[0], [user_record('please fix it')], 'orchestrated-task', id='worktree_path'),

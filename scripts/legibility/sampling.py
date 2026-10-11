@@ -26,6 +26,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 # Self-bootstrap for standalone `python scripts/legibility/sampling.py` runs
@@ -52,23 +53,28 @@ logger = logging.getLogger('legibility.sampling')
 # ---------------------------------------------------------------------------
 
 class SignalCounts(Mapping[detectors.SignalClass, int]):
-    """How many records of one session hold each signal class. Its keys are
-    exactly :class:`detectors.SignalClass`; it never changes once built."""
+    """How many records of one session hold each signal class. Every
+    :class:`detectors.SignalClass` is a key, 0 where *counts* has none, and
+    the counts are read-only."""
 
     __slots__ = ('_counts',)
-    _counts: dict[detectors.SignalClass, int]
 
-    def __init__(self, **counts: int) -> None:
+    def __init__(self, counts: Mapping[detectors.SignalClass, int]) -> None:
+        strays = [key for key in counts if not isinstance(key, detectors.SignalClass)]
+        if strays:
+            raise TypeError(f'signal counts are keyed by detectors.SignalClass, not {strays!r}')
+        self._counts: Mapping[detectors.SignalClass, int] = MappingProxyType({
+            signal: counts.get(signal, 0) for signal in detectors.SignalClass
+        })
+
+    @classmethod
+    def of(cls, **counts: int) -> SignalCounts:
+        """Counts named by signal-class value, e.g. ``SignalCounts.of(tool_error=1)``."""
         vocabulary = [signal.value for signal in detectors.SignalClass]
         unknown = sorted(set(counts) - set(vocabulary))
         if unknown:
             raise ValueError(f'unknown signal classes {unknown}; the vocabulary is {vocabulary}')
-        object.__setattr__(self, '_counts', {
-            signal: counts.get(signal.value, 0) for signal in detectors.SignalClass
-        })
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        raise AttributeError(f'{type(self).__name__} is immutable')
+        return cls({detectors.SignalClass(name): count for name, count in counts.items()})
 
     def __getitem__(self, signal: detectors.SignalClass) -> int:
         return self._counts[signal]
@@ -131,31 +137,26 @@ def scan_transcript(path: Path) -> TranscriptScan:
     """Read *path* once, producing everything the sampler needs from it.
 
     Each class counts the RECORDS holding at least one of its hits, so a
-    record carrying several synonymous markers still counts once.
-    Unreadable input degrades to an empty scan.
+    record carrying several synonymous markers still counts once. Every
+    record is folded in as it is read and dropped before the next, so
+    memory stays bounded by the largest single record. Unreadable input
+    degrades to an empty scan.
     """
-    try:
-        records = list(iter_json_lines(path))
-    except OSError:
-        return TranscriptScan(SignalCounts(), detectors.AgentClass.UNKNOWN, '', None)
-
     counts = dict.fromkeys(detectors.SignalClass, 0)
-    for record in records:
-        hits = detectors.record_hits(record)
-        for signal in detectors.SignalClass:
-            if hits.count(signal):
-                counts[signal] += 1
-    first_turn = detectors.first_user_turn(records)
-    first_turn_text = detectors.user_turn_text(first_turn) if first_turn is not None else None
-    session_id = next(
-        (session_id for record in records if (session_id := _record_session_id(record))),
-        None,
-    )
+    evidence = detectors.AgentClassEvidence.for_path(path)
+    session_id: str | None = None
+    try:
+        for record in iter_json_lines(path):
+            hits = detectors.record_hits(record)
+            for signal in detectors.SignalClass:
+                if hits.count(signal):
+                    counts[signal] += 1
+            evidence = evidence.observe(record)
+            session_id = session_id or _record_session_id(record)
+    except OSError:
+        return TranscriptScan(SignalCounts({}), detectors.AgentClass.UNKNOWN, '', None)
     return TranscriptScan(
-        SignalCounts(**{signal.value: count for signal, count in counts.items()}),
-        detectors.classify_agent_class(path, records),
-        first_turn_text or '',
-        session_id,
+        SignalCounts(counts), evidence.agent_class, evidence.first_turn_text or '', session_id,
     )
 
 

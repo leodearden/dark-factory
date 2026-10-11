@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import textwrap
+import weakref
 from datetime import date as dt_date
 from pathlib import Path
 
@@ -245,8 +246,8 @@ class TestSamplerDesignedOutcomeParity:
         # scope of the claim is exactly what a reader would otherwise
         # over-read.
         records = [
-            _scored('ceilings-only', 'watcher', mod.SignalCounts(designed_outcome=13), 'poll'),
-            _scored('real-signal', 'watcher', mod.SignalCounts(tool_error=1), 'boom'),
+            _scored('ceilings-only', 'watcher', mod.SignalCounts.of(designed_outcome=13), 'poll'),
+            _scored('real-signal', 'watcher', mod.SignalCounts.of(tool_error=1), 'boom'),
         ]
         config = config_mod.LegibilityConfig(
             project_id='dark_factory',
@@ -297,14 +298,34 @@ class TestSamplerDesignedOutcomeParity:
 
 
 class TestSignalCounts:
-    def test_an_unknown_class_name_is_rejected_naming_the_vocabulary(self):
+    def test_every_class_absent_from_the_mapping_counts_zero(self):
+        counts = mod.SignalCounts({SignalClass.NOT_FOUND: 2})
+
+        assert dict(counts) == {**dict.fromkeys(SignalClass, 0), SignalClass.NOT_FOUND: 2}
+
+    def test_a_key_that_is_not_a_signal_class_is_rejected(self):
+        with pytest.raises(TypeError, match='tool_error'):
+            mod.SignalCounts(json.loads('{"tool_error": 1}'))
+
+    def test_the_counts_do_not_follow_the_callers_mapping(self):
+        source = {SignalClass.TOOL_ERROR: 1}
+        counts = mod.SignalCounts(source)
+
+        source[SignalClass.TOOL_ERROR] = 9
+
+        assert counts[SignalClass.TOOL_ERROR] == 1
+
+    def test_of_names_classes_by_value(self):
+        assert mod.SignalCounts.of(tool_error=1) == mod.SignalCounts({SignalClass.TOOL_ERROR: 1})
+
+    def test_of_rejects_an_unknown_class_name_naming_the_vocabulary(self):
         with pytest.raises(ValueError, match='bogus') as raised:
-            mod.SignalCounts(bogus=1)
+            mod.SignalCounts.of(bogus=1)
 
         assert all(signal.value in str(raised.value) for signal in SignalClass)
 
-    def test_the_default_maps_every_class_to_zero(self):
-        assert dict(mod.SignalCounts()) == dict.fromkeys(SignalClass, 0)
+    def test_of_with_no_names_maps_every_class_to_zero(self):
+        assert dict(mod.SignalCounts.of()) == dict.fromkeys(SignalClass, 0)
 
 
 class TestScoreSignalsClean:
@@ -329,6 +350,10 @@ def _queue_operation_record() -> dict:
 
 def _with_session(record: dict, session_id: str, *, cwd: str = MAIN_CWD) -> dict:
     return {**record, 'sessionId': session_id, 'cwd': cwd}
+
+
+class _WeakRecord(dict):
+    """A transcript record a test can hold a weak reference to."""
 
 
 class TestScanTranscript:
@@ -382,9 +407,40 @@ class TestScanTranscript:
         frontmatter = coder.parse_frontmatter(digest.build_digest(path))
         assert mod.scan_transcript(path).session_id == frontmatter['session']
 
+    def test_no_earlier_record_is_still_held_when_the_next_is_read(self, tmp_path, monkeypatch):
+        records = [
+            _with_session(_clean_record(0), 'sess-stream'),
+            _tool_error_record(),
+            _not_found_record(),
+            _self_correct_record(),
+        ]
+        still_held: list[int] = []
+
+        def streamed(_path):
+            refs: list[weakref.ref] = []
+            for record in records:
+                still_held.append(sum(ref() is not None for ref in refs[:-1]))
+                refs.append(weakref.ref(fresh := _WeakRecord(record)))
+                yield fresh
+                del fresh
+
+        monkeypatch.setattr(mod, 'iter_json_lines', streamed)
+        scan = mod.scan_transcript(tmp_path / 'sess-stream.jsonl')
+
+        assert still_held == [0] * len(records)
+        assert scan.counts == mod.SignalCounts.of(tool_error=1, not_found=1, self_correct=1)
+        assert scan.first_turn_text == 'Please do the thing #0.'
+
+    def test_a_read_failing_midway_degrades_to_an_empty_scan(self, tmp_path):
+        path = _write_transcript(tmp_path / 's.jsonl', [_tool_error_record(), _not_found_record()])
+        with path.open('ab') as f:
+            f.write(b'\xff\xfe not utf-8\n')
+
+        assert mod.scan_transcript(path) == mod.scan_transcript(tmp_path / 'missing.jsonl')
+
     def test_unreadable_path_degrades_to_an_empty_scan(self, tmp_path):
         scan = mod.scan_transcript(tmp_path / 'missing.jsonl')
-        assert scan.counts == mod.SignalCounts()
+        assert scan.counts == mod.SignalCounts.of()
         assert scan.agent_class is AgentClass.UNKNOWN
         assert scan.first_turn_text == ''
         assert scan.session_id is None
@@ -450,7 +506,7 @@ class TestScoreSession:
         assert scored.session_id == 'sess-1'
 
     def test_scored_record_session_id_defaults_to_none(self):
-        assert _scored('s', 'interactive', mod.SignalCounts(), '').session_id is None
+        assert _scored('s', 'interactive', mod.SignalCounts.of(), '').session_id is None
 
 
 # ---------------------------------------------------------------------------
@@ -663,22 +719,22 @@ class TestShapeFingerprint:
     same classes night after night even when exact counts drift."""
 
     def test_clones_share_a_fingerprint(self):
-        a = _scored('a', 'recon', mod.SignalCounts(tool_error=1), '## Reconciliation Run\nDate: 2026-07-10\n')
-        b = _scored('b', 'recon', mod.SignalCounts(tool_error=3), '## Reconciliation Run\nDate: 2026-07-12\n')
+        a = _scored('a', 'recon', mod.SignalCounts.of(tool_error=1), '## Reconciliation Run\nDate: 2026-07-10\n')
+        b = _scored('b', 'recon', mod.SignalCounts.of(tool_error=3), '## Reconciliation Run\nDate: 2026-07-12\n')
         assert mod.shape_fingerprint(a) == mod.shape_fingerprint(b)
 
     def test_distinct_content_differs(self):
-        a = _scored('a', 'recon', mod.SignalCounts(tool_error=1), '## Reconciliation Run\nDate: 2026-07-10\n')
+        a = _scored('a', 'recon', mod.SignalCounts.of(tool_error=1), '## Reconciliation Run\nDate: 2026-07-10\n')
         distinct = _scored(
             'distinct', 'recon',
-            mod.SignalCounts(self_correct=1, not_found=1),
+            mod.SignalCounts.of(self_correct=1, not_found=1),
             'A completely different opening about something else entirely.',
         )
         assert mod.shape_fingerprint(a) != mod.shape_fingerprint(distinct)
 
     def test_different_stratum_differs_even_with_same_text_and_shape(self):
-        a = _scored('a', 'recon', mod.SignalCounts(tool_error=1), 'same text')
-        b = _scored('b', 'watcher', mod.SignalCounts(tool_error=1), 'same text')
+        a = _scored('a', 'recon', mod.SignalCounts.of(tool_error=1), 'same text')
+        b = _scored('b', 'watcher', mod.SignalCounts.of(tool_error=1), 'same text')
         assert mod.shape_fingerprint(a) != mod.shape_fingerprint(b)
 
 
@@ -689,20 +745,20 @@ class TestDedupeShapes:
 
     def _build(self):
         clone_low = _scored(
-            'recon-a', 'recon', mod.SignalCounts(tool_error=1),
+            'recon-a', 'recon', mod.SignalCounts.of(tool_error=1),
             '## Reconciliation Run\nDate: 2026-07-10\n',
         )
         clone_mid = _scored(
-            'recon-b', 'recon', mod.SignalCounts(tool_error=2),
+            'recon-b', 'recon', mod.SignalCounts.of(tool_error=2),
             '## Reconciliation Run\nDate: 2026-07-11\n',
         )
         clone_high = _scored(
-            'recon-c', 'recon', mod.SignalCounts(tool_error=3),
+            'recon-c', 'recon', mod.SignalCounts.of(tool_error=3),
             '## Reconciliation Run\nDate: 2026-07-12\n',
         )
         distinct = _scored(
             'recon-distinct', 'recon',
-            mod.SignalCounts(self_correct=1, not_found=1),
+            mod.SignalCounts.of(self_correct=1, not_found=1),
             'A completely different opening about something else entirely.',
         )
         return [clone_low, clone_mid, clone_high, distinct]
@@ -781,21 +837,21 @@ class TestSampleResultAccounting:
         """
         return [
             _scored(
-                'recon-clone-a', 'recon', mod.SignalCounts(tool_error=3),
+                'recon-clone-a', 'recon', mod.SignalCounts.of(tool_error=3),
                 '## Reconciliation Run\nDate: 2026-07-10\n', 200_000,
             ),
             _scored(
-                'recon-clone-b', 'recon', mod.SignalCounts(tool_error=2),
+                'recon-clone-b', 'recon', mod.SignalCounts.of(tool_error=2),
                 '## Reconciliation Run\nDate: 2026-07-11\n', 200_000,
             ),
             _scored(
-                'recon-distinct', 'recon', mod.SignalCounts(self_correct=1, not_found=4),
+                'recon-distinct', 'recon', mod.SignalCounts.of(self_correct=1, not_found=4),
                 'A completely different opening about something else entirely.', 200_000,
             ),
-            _scored('quiet-a', 'interactive', mod.SignalCounts(), 'nothing went wrong here', 1_000),
-            _scored('quiet-b', 'interactive', mod.SignalCounts(), 'all green, no surprises', 1_000),
-            _scored('human-a', 'interactive', mod.SignalCounts(tool_error=9), 'human turn one', 1_000),
-            _scored('human-b', 'interactive', mod.SignalCounts(not_found=8), 'human turn two', 1_000),
+            _scored('quiet-a', 'interactive', mod.SignalCounts.of(), 'nothing went wrong here', 1_000),
+            _scored('quiet-b', 'interactive', mod.SignalCounts.of(), 'all green, no surprises', 1_000),
+            _scored('human-a', 'interactive', mod.SignalCounts.of(tool_error=9), 'human turn one', 1_000),
+            _scored('human-b', 'interactive', mod.SignalCounts.of(not_found=8), 'human turn two', 1_000),
         ]
 
     def _build_narrowed_records(self):
@@ -823,7 +879,7 @@ class TestSampleResultAccounting:
         return [
             _scored(
                 f'distinct-{index:02d}', 'interactive',
-                mod.SignalCounts(tool_error=index),
+                mod.SignalCounts.of(tool_error=index),
                 f'{opener} is behaving oddly and I need help working out why.',
                 1_000,
             )
@@ -1011,25 +1067,25 @@ class TestStratifiedSampleBoundary:
 
     def _build_records(self):
         records = [
-            _scored('recon-huge-1', 'recon', mod.SignalCounts(tool_error=500), 'recon run A', 200_000),
-            _scored('recon-huge-2', 'recon', mod.SignalCounts(tool_error=600), 'recon run B', 200_000),
-            _scored('recon-mid-1', 'recon', mod.SignalCounts(tool_error=25), 'recon mid run 1', 5_000),
-            _scored('recon-mid-2', 'recon', mod.SignalCounts(tool_error=27), 'recon mid run 2', 5_000),
-            _scored('recon-mid-3', 'recon', mod.SignalCounts(tool_error=29), 'recon mid run 3', 5_000),
+            _scored('recon-huge-1', 'recon', mod.SignalCounts.of(tool_error=500), 'recon run A', 200_000),
+            _scored('recon-huge-2', 'recon', mod.SignalCounts.of(tool_error=600), 'recon run B', 200_000),
+            _scored('recon-mid-1', 'recon', mod.SignalCounts.of(tool_error=25), 'recon mid run 1', 5_000),
+            _scored('recon-mid-2', 'recon', mod.SignalCounts.of(tool_error=27), 'recon mid run 2', 5_000),
+            _scored('recon-mid-3', 'recon', mod.SignalCounts.of(tool_error=29), 'recon mid run 3', 5_000),
         ]
         for i in range(12):
             records.append(
-                _scored(f'recon-zero-{i}', 'recon', mod.SignalCounts(), f'recon zero {i}', 500)
+                _scored(f'recon-zero-{i}', 'recon', mod.SignalCounts.of(), f'recon zero {i}', 500)
             )
         for i, score in enumerate((5, 6, 7, 8)):
             records.append(
                 _scored(
-                    f'watcher-clone-{i}', 'watcher', mod.SignalCounts(tool_error=score),
+                    f'watcher-clone-{i}', 'watcher', mod.SignalCounts.of(tool_error=score),
                     'watcher polling cycle', 2_000,
                 )
             )
-        records.append(_scored('interactive-1', 'interactive', mod.SignalCounts(tool_error=3), 'human turn A', 800))
-        records.append(_scored('interactive-2', 'interactive', mod.SignalCounts(tool_error=4), 'human turn B', 900))
+        records.append(_scored('interactive-1', 'interactive', mod.SignalCounts.of(tool_error=3), 'human turn A', 800))
+        records.append(_scored('interactive-2', 'interactive', mod.SignalCounts.of(tool_error=4), 'human turn B', 900))
         return records
 
     def _config(self):
@@ -1135,11 +1191,11 @@ class TestStratifiedSampleReserveExceedsBudget:
     def _build_records(self):
         return [
             # "recon" floor: expensive (200_000 bytes each -> 400_000 total).
-            _scored('recon-1', 'recon', mod.SignalCounts(tool_error=10), 'recon a', 200_000),
-            _scored('recon-2', 'recon', mod.SignalCounts(tool_error=9), 'recon b', 200_000),
+            _scored('recon-1', 'recon', mod.SignalCounts.of(tool_error=10), 'recon a', 200_000),
+            _scored('recon-2', 'recon', mod.SignalCounts.of(tool_error=9), 'recon b', 200_000),
             # "interactive" floor: cheap (1_000 bytes each -> 2_000 total).
-            _scored('interactive-1', 'interactive', mod.SignalCounts(tool_error=2), 'human a', 1_000),
-            _scored('interactive-2', 'interactive', mod.SignalCounts(tool_error=1), 'human b', 1_000),
+            _scored('interactive-1', 'interactive', mod.SignalCounts.of(tool_error=2), 'human a', 1_000),
+            _scored('interactive-2', 'interactive', mod.SignalCounts.of(tool_error=1), 'human b', 1_000),
         ]
 
     def test_total_never_exceeds_budget_even_when_floors_alone_would(self):
@@ -1197,7 +1253,7 @@ class TestStratifiedSampleRealWorldSizes:
         return [
             _scored(
                 f'orch-{name}', 'orchestrated-task',
-                mod.SignalCounts(tool_error=score),
+                mod.SignalCounts.of(tool_error=score),
                 f'orchestrated task session {name}',
                 6_000_000,
             )
@@ -1209,7 +1265,7 @@ class TestStratifiedSampleRealWorldSizes:
         for name, score in zip(('one', 'two', 'three'), (18, 14, 11), strict=True):
             records.append(
                 _scored(
-                    f'recon-{name}', 'recon', mod.SignalCounts(not_found=score),
+                    f'recon-{name}', 'recon', mod.SignalCounts.of(not_found=score),
                     f'reconciliation run {name}', 4_500_000,
                 )
             )
@@ -1278,10 +1334,10 @@ class TestStratifiedSampleCostSeam:
     def _build_records(self):
         """Four candidates across two strata, each 6MB of raw transcript."""
         return [
-            _scored('recon-a', 'recon', mod.SignalCounts(tool_error=9), 'recon alpha opening', 6_000_000),
-            _scored('recon-b', 'recon', mod.SignalCounts(not_found=8), 'recon beta opening', 6_000_000),
-            _scored('interactive-a', 'interactive', mod.SignalCounts(tool_error=5), 'human turn one', 6_000_000),
-            _scored('interactive-b', 'interactive', mod.SignalCounts(self_correct=4), 'human turn two', 6_000_000),
+            _scored('recon-a', 'recon', mod.SignalCounts.of(tool_error=9), 'recon alpha opening', 6_000_000),
+            _scored('recon-b', 'recon', mod.SignalCounts.of(not_found=8), 'recon beta opening', 6_000_000),
+            _scored('interactive-a', 'interactive', mod.SignalCounts.of(tool_error=5), 'human turn one', 6_000_000),
+            _scored('interactive-b', 'interactive', mod.SignalCounts.of(self_correct=4), 'human turn two', 6_000_000),
         ]
 
     def _build_records_with_noise(self):
@@ -1289,17 +1345,17 @@ class TestStratifiedSampleCostSeam:
         that ``dedupe_shapes`` collapses — records that must never be costed."""
         records = self._build_records()
         records.append(
-            _scored('recon-zero', 'recon', mod.SignalCounts(), 'recon zero opening', 6_000_000)
+            _scored('recon-zero', 'recon', mod.SignalCounts.of(), 'recon zero opening', 6_000_000)
         )
         records.append(
             _scored(
-                'recon-clone-1', 'recon', mod.SignalCounts(tool_error=1),
+                'recon-clone-1', 'recon', mod.SignalCounts.of(tool_error=1),
                 'recon clone cycle 2026-07-10', 6_000_000,
             )
         )
         records.append(
             _scored(
-                'recon-clone-2', 'recon', mod.SignalCounts(tool_error=2),
+                'recon-clone-2', 'recon', mod.SignalCounts.of(tool_error=2),
                 'recon clone cycle 2026-07-11', 6_000_000,
             )
         )
@@ -1384,7 +1440,7 @@ class TestDigestByteCostFn:
 
     def _record(self, size_bytes=6_000_000):
         return _scored(
-            'cost-sess', 'orchestrated-task', mod.SignalCounts(tool_error=7),
+            'cost-sess', 'orchestrated-task', mod.SignalCounts.of(tool_error=7),
             'orchestrated task session alpha', size_bytes,
         )
 
@@ -1529,11 +1585,11 @@ class TestDigestByteCostFn:
 
         records = [
             # Higher score -> reserved first, and it eats the whole budget.
-            _scored('ok-1', 'interactive', mod.SignalCounts(tool_error=9),
+            _scored('ok-1', 'interactive', mod.SignalCounts.of(tool_error=9),
                     'healthy session alpha', 900),
             # Lower score -> reaches the budget phase in the leftover fill,
             # where the strict greedy halt is unforgiving of an over-charge.
-            _scored('boom', 'interactive', mod.SignalCounts(tool_error=8),
+            _scored('boom', 'interactive', mod.SignalCounts.of(tool_error=8),
                     'failing session beta', 900),
         ]
         cfg = config_mod.LegibilityConfig(
@@ -1575,7 +1631,7 @@ class TestDigestByteCostFn:
         )
         record = mod.ScoredRecord(
             session=session, stratum=AgentClass.INTERACTIVE,
-            counts=mod.SignalCounts(tool_error=1), first_turn_text='Please help with the thing',
+            counts=mod.SignalCounts.of(tool_error=1), first_turn_text='Please help with the thing',
         )
 
         expected = len(
@@ -1617,8 +1673,8 @@ class TestDigestByteCostFn:
 class TestRenderManifest:
     def test_emits_one_json_object_per_line(self):
         records = [
-            _scored('sess-a', 'recon', mod.SignalCounts(tool_error=5), 'text', 1000),
-            _scored('sess-b', 'watcher', mod.SignalCounts(tool_error=3), 'text', 2000),
+            _scored('sess-a', 'recon', mod.SignalCounts.of(tool_error=5), 'text', 1000),
+            _scored('sess-b', 'watcher', mod.SignalCounts.of(tool_error=3), 'text', 2000),
         ]
         lines = mod.render_manifest(records).splitlines()
         assert len(lines) == 2
@@ -1832,8 +1888,8 @@ class TestFormatSampleSummaryLine:
         wrong attribute is caught (an all-zeros fixture would not be)."""
         return mod.SampleResult(
             selected=[
-                _scored('sess-a', 'recon', mod.SignalCounts(tool_error=5), 'text a'),
-                _scored('sess-b', 'interactive', mod.SignalCounts(not_found=3), 'text b'),
+                _scored('sess-a', 'recon', mod.SignalCounts.of(tool_error=5), 'text a'),
+                _scored('sess-b', 'interactive', mod.SignalCounts.of(not_found=3), 'text b'),
             ],
             per_stratum_counts={'recon': 1, 'interactive': 1},
             zero_signal_dropped=3,

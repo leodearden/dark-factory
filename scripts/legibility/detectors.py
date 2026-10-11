@@ -11,8 +11,9 @@ only :mod:`legibility.reingestion`.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Set as AbstractSet
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -521,8 +522,8 @@ class AgentMarker:
     literals: tuple[str, ...]
     require_all: bool = False
 
-    def matches(self, lowered: str) -> bool:
-        found = (literal in lowered for literal in self.literals)
+    def matches(self, sighted: AbstractSet[str]) -> bool:
+        found = (literal in sighted for literal in self.literals)
         return all(found) if self.require_all else any(found)
 
 
@@ -550,6 +551,8 @@ AGENT_CLASS_MARKERS: tuple[AgentMarker, ...] = (
 )
 """The one agent-class marker table, in precedence order."""
 
+_MARKER_LITERALS = frozenset(literal for marker in AGENT_CLASS_MARKERS for literal in marker.literals)
+
 
 def is_primary_user_turn(record: Mapping[str, Any]) -> bool:
     """A user turn of the session itself: not a sidechain, not an isMeta injection."""
@@ -560,35 +563,86 @@ def is_primary_user_turn(record: Mapping[str, Any]) -> bool:
     )
 
 
-def first_user_turn(records: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
-    return next((record for record in records if is_primary_user_turn(record)), None)
+def _sighted(text: str, literals: AbstractSet[str]) -> frozenset[str]:
+    lowered = text.lower()
+    return frozenset(literal for literal in literals if literal in lowered)
 
 
-def _marked_class(lowered: str) -> AgentClass | None:
+def _marked_class(sighted: AbstractSet[str]) -> AgentClass | None:
     return next(
-        (marker.agent_class for marker in AGENT_CLASS_MARKERS if marker.matches(lowered)),
+        (marker.agent_class for marker in AGENT_CLASS_MARKERS if marker.matches(sighted)),
         None,
     )
 
 
-def classify_agent_class(path: Path, records: Sequence[Mapping[str, Any]]) -> AgentClass:
-    """The session's agent class.
+@dataclass(frozen=True)
+class AgentClassEvidence:
+    """What a session's records have shown so far about its agent class.
 
-    In order: an empty transcript is UNKNOWN; a worktree encoded dir (the
-    parent of *path*) is ORCHESTRATED_TASK; then the marker table over the
-    raw first user turn, then over every raw carrier. The carriers are read
-    unfiltered on purpose: the class is decided BY injected markers, which
-    the dialogue filter exists to drop. No marker is INTERACTIVE.
+    Start from :meth:`for_path`, fold each record in with :meth:`observe` as
+    it is read, and read :attr:`agent_class` at the end, so no caller ever
+    holds a transcript's records together. *first_turn_text* is None until
+    the first primary user turn arrives, and '' when that turn holds no text.
     """
-    if not records:
-        return AgentClass.UNKNOWN
-    if any(marker in path.parent.name for marker in WORKTREE_DIR_MARKERS):
-        return AgentClass.ORCHESTRATED_TASK
-    first = first_user_turn(records)
-    first_text = user_turn_text(first) if first is not None else None
-    marked = _marked_class((first_text or '').lower())
-    if marked is None:
-        marked = _marked_class('\n'.join(
-            text for record in records for _, text in _raw_carriers(record)
-        ).lower())
-    return AgentClass.INTERACTIVE if marked is None else marked
+
+    in_worktree: bool
+    has_records: bool = False
+    first_turn_text: str | None = None
+    first_turn_class: AgentClass | None = None
+    carrier_literals: frozenset[str] = frozenset()
+
+    @classmethod
+    def for_path(cls, path: Path) -> AgentClassEvidence:
+        """No records yet, from a transcript at *path*: its encoded dir (the
+        parent of *path*) says whether it ran in an orchestrated worktree."""
+        return cls(in_worktree=any(marker in path.parent.name for marker in WORKTREE_DIR_MARKERS))
+
+    def observe(self, record: Mapping[str, Any]) -> AgentClassEvidence:
+        """This evidence with *record*, the session's next record, folded in.
+
+        A marker literal counts once sighted in any raw carrier, so a
+        require-all marker whose literals sit in different carriers matches.
+        """
+        evidence = self if self.has_records else replace(self, has_records=True)
+        if evidence.first_turn_text is None and is_primary_user_turn(record):
+            text = user_turn_text(record) or ''
+            evidence = replace(
+                evidence,
+                first_turn_text=text,
+                first_turn_class=_marked_class(_sighted(text, _MARKER_LITERALS)),
+            )
+        unsighted = _MARKER_LITERALS - evidence.carrier_literals
+        if evidence.in_worktree or evidence.first_turn_class is not None or not unsighted:
+            return evidence
+        found = frozenset().union(*(_sighted(text, unsighted) for _, text in _raw_carriers(record)))
+        if not found:
+            return evidence
+        return replace(evidence, carrier_literals=evidence.carrier_literals | found)
+
+    @property
+    def agent_class(self) -> AgentClass:
+        """The session's agent class.
+
+        In order: no records is UNKNOWN; a worktree encoded dir is
+        ORCHESTRATED_TASK; then the marker table over the raw first user
+        turn, then over every raw carrier. The carriers are read unfiltered
+        on purpose: the class is decided BY injected markers, which the
+        dialogue filter exists to drop. No marker is INTERACTIVE.
+        """
+        if not self.has_records:
+            return AgentClass.UNKNOWN
+        if self.in_worktree:
+            return AgentClass.ORCHESTRATED_TASK
+        if self.first_turn_class is not None:
+            return self.first_turn_class
+        marked = _marked_class(self.carrier_literals)
+        return AgentClass.INTERACTIVE if marked is None else marked
+
+
+def classify_agent_class(path: Path, records: Iterable[Mapping[str, Any]]) -> AgentClass:
+    """The agent class of the session at *path*: :class:`AgentClassEvidence`
+    with every one of *records* folded in."""
+    evidence = AgentClassEvidence.for_path(path)
+    for record in records:
+        evidence = evidence.observe(record)
+    return evidence.agent_class
