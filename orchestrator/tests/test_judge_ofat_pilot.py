@@ -16,7 +16,6 @@ non-inferiority margin is an exposed policy parameter, never an asserted bound).
 from __future__ import annotations
 
 import importlib.util
-import json
 from pathlib import Path
 from typing import Any
 
@@ -352,7 +351,7 @@ class TestFormatReport:
 # ---------------------------------------------------------------------------
 
 def _jres(task_id: str, config: str, role: str, *, quality: float, cost_usd: float, duration_ms: int = 1000):
-    from orchestrator.evals.runner import EvalResult
+    from orchestrator.evals.results import EvalResult
 
     return EvalResult(
         task_id, config, 'done',
@@ -426,8 +425,8 @@ def _load_cli():
 
 
 def _write_result(results_dir: Path, task_id: str, config: str, *, quality: float, cost_usd: float):
-    """Persist one judge EvalResult JSON in the {task}__{config}__{run_id}.json shape."""
-    from orchestrator.evals.runner import EvalResult
+    """Persist one judge EvalResult through the store, as the executors do."""
+    from orchestrator.evals.results import EvalResult, ResultStore
 
     r = EvalResult(
         task_id, config, 'done',
@@ -441,8 +440,7 @@ def _write_result(results_dir: Path, task_id: str, config: str, *, quality: floa
         '/tmp/wt',
         run_id='r1',
     )
-    path = results_dir / f'{task_id}__{config}__{r.run_id}.json'
-    path.write_text(json.dumps(r.to_dict()))
+    ResultStore(results_dir).save(r)
 
 
 def _seed(results_dir: Path, *, haiku_quality: float):

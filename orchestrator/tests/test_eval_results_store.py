@@ -94,8 +94,8 @@ class TestParseName:
 
 
 class TestCellNameInvariant:
-    @pytest.mark.parametrize('bad', ['a__b', 'a/b'])
-    def test_a_component_holding_the_separator_or_a_slash_is_rejected(self, bad: str):
+    @pytest.mark.parametrize('bad', ['a__b', 'a/b', 'cfg_', '_cfg'])
+    def test_a_component_that_would_not_round_trip_is_rejected(self, bad: str):
         with pytest.raises(ValueError) as excinfo:
             CellName('t', bad, 'r')
         message = str(excinfo.value)

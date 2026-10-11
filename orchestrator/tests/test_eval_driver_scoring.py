@@ -18,7 +18,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.evals.runner import EvalResult
+from orchestrator.evals.results import EvalResult
 from orchestrator.mcp import verdict_tools as _verdict_tools
 
 _REVIEWER = 'reviewer_comprehensive'

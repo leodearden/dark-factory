@@ -60,7 +60,7 @@ def _cell(
     ``drop_metrics=_PRE_SIGMA``. Do not pass the same key in both.
     """
     from orchestrator.evals.metrics import EvalMetrics
-    from orchestrator.evals.runner import EvalResult
+    from orchestrator.evals.results import EvalResult
 
     m = EvalMetrics(
         plan_quality=plan_quality,

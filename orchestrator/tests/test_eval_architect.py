@@ -3298,7 +3298,7 @@ def _architect_result(
     measured. The default is an explicit ``False``: a healthy modern cell, not
     a legacy one.
     """
-    from orchestrator.evals.runner import EvalResult
+    from orchestrator.evals.results import EvalResult
 
     metrics = {
         'role_under_test': 'architect',
@@ -3322,7 +3322,7 @@ def _implementer_result(
     task_id: str = 'df_task_1993',
     config_name: str = 'opus-high',
 ):
-    from orchestrator.evals.runner import EvalResult
+    from orchestrator.evals.results import EvalResult
 
     # No plan_quality / role_under_test keys at all → the null sentinel path.
     return EvalResult(
@@ -3345,7 +3345,7 @@ def _cap_tainted_result(
     stage-prefixed marker (e.g. ``'architect:model_not_found: ...'``) to build a
     cell excluded for a PERMANENT rather than a transient cause.
     """
-    from orchestrator.evals.runner import EvalResult
+    from orchestrator.evals.results import EvalResult
 
     return EvalResult(
         task_id=task_id,
@@ -3889,7 +3889,7 @@ class TestPlanQualityReport:
 # ---------------------------------------------------------------------------
 
 def _fake_eval_result(**over):
-    from orchestrator.evals.runner import EvalResult
+    from orchestrator.evals.results import EvalResult
 
     defaults: dict = dict(
         task_id='df_task_2605',

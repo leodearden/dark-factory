@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from orchestrator.evals.runner import EvalResult
+from orchestrator.evals.results import EvalResult
 
 # Distinguishes "this case passed no usage_gate at all" (the OWNED path, where
 # the executor builds and tears down its own) from "this case passed

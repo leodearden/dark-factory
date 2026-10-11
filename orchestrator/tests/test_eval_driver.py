@@ -45,7 +45,7 @@ from _campaign_gate_helpers import (
 )
 
 from orchestrator.evals.configs import EvalConfig
-from orchestrator.evals.runner import EvalResult
+from orchestrator.evals.results import EvalResult
 from orchestrator.workflow import WorkflowOutcome
 
 

@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 from .report import build_composite_report, format_composite_table
 
 if TYPE_CHECKING:
-    from .runner import EvalResult
+    from .results import EvalResult
 
 # Default names for the ο judge-OFAT candidates (configs.JUDGE_EVAL_CONFIGS).
 INCUMBENT_JUDGE = 'judge-sonnet'

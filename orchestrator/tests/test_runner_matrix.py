@@ -28,7 +28,8 @@ from _campaign_gate_helpers import (
 
 import orchestrator.evals.runner as runner_mod
 from orchestrator.evals.configs import EvalConfig
-from orchestrator.evals.runner import EvalResult, run_eval_matrix
+from orchestrator.evals.results import EvalResult
+from orchestrator.evals.runner import run_eval_matrix
 
 _CFG = EvalConfig(name='test-cfg', backend='claude', model='sonnet', effort='high')
 

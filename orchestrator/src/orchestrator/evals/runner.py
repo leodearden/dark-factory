@@ -9,7 +9,6 @@ import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -61,6 +60,7 @@ from .metrics import (
 )
 from .profile import apply_eval_profile
 from .replay_frame import REPLAY_FRAME_ID, ReplayFramedBriefingAssembler
+from .results import EvalResult
 from .snapshots import create_eval_worktree, read_python_pin
 
 logger = logging.getLogger(__name__)
@@ -335,23 +335,6 @@ async def campaign_usage_gate(
                     '(the campaign is already complete)',
                     exc_info=True,
                 )
-
-
-@dataclass
-class EvalResult:
-    """Result of one (task, config) eval run."""
-
-    task_id: str
-    config_name: str
-    outcome: str
-    metrics: dict[str, Any]
-    worktree_path: str
-    wall_clock_ms: int = 0
-    run_id: str = ''
-    trial: int = 1
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
 
 
 def _find_repo_root(start: Path) -> Path:

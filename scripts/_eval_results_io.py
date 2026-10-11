@@ -26,7 +26,7 @@ from typing import Any
 
 # scripts/ is not on sys.path when this module is imported as a plain script
 # sibling rather than through scripts/tests/conftest.py's insertion — add the
-# orchestrator src so `from orchestrator.evals.runner import EvalResult` below
+# orchestrator src so `from orchestrator.evals.results import EvalResult` below
 # resolves the same way it does for both callers (idempotent — a no-op when
 # already present).
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -57,7 +57,7 @@ def load_results_from_dir(results_dir: Path) -> list[Any]:
       deliberate: a silently skipped cell shifts every count in a downstream
       report.
     """
-    from orchestrator.evals.runner import EvalResult
+    from orchestrator.evals.results import EvalResult
 
     results_dir = Path(results_dir)
     if not results_dir.is_dir():
