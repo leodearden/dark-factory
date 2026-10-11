@@ -718,8 +718,13 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
     environment (the model sets ``env_prefix=''``).  A test asserting on a
     field this factory does not name is asserting on the tracked
     ``fused-memory/config/config.yaml``, not on a code default.
+
+    ``write_triage.enabled`` is the one YAML-sourced field pinned here, to
+    off: the tracked YAML ships it on (task 3169), and with it on every
+    Mem0-primary ``add_memory`` in a unit test would reach the real judge
+    client.  A test of the triage path opts in on its own config.
     """
-    return FusedMemoryConfig(
+    config = FusedMemoryConfig(
         llm=LLMConfig(
             provider='openai',
             model='gpt-4o-mini',
@@ -748,6 +753,8 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
             data_dir=str(tmp_path / 'queue'),
         ),
     )
+    config.write_triage.enabled = False
+    return config
 
 
 # ---------------------------------------------------------------------------
