@@ -3772,7 +3772,8 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
                      branch=None, recorder=None, budget_bytes=None,
                      invoke=_fake_invoke_known_cause, committer=None, poster=None,
                      transcript=True, now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
-                     invariants_doc: str | None = None):
+                     invariants_doc: str | None = None,
+                     unreadable_transcripts: bool = False):
     """Run ``run_nightly`` end to end on a real temp git repo + transcript and
     return ``(result, repo)``.
 
@@ -3801,7 +3802,9 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
     is committed as the project's design-invariants doc, and
     *recorder* / *committer* / *poster* / *invoke* are the injected seams
     (*poster* defaults to a no-op, so a test that does not care about
-    escalations never has to build one).
+    escalations never has to build one). *unreadable_transcripts* is the
+    exception: it strips every permission bit from the projects root for the
+    run, so enumerating the transcripts raises inside sampling.
     """
     work_cwd = str(tmp_path / 'work')
     repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
@@ -3825,6 +3828,8 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
         )
     else:
         projects_root.mkdir(parents=True, exist_ok=True)
+    if unreadable_transcripts:
+        projects_root.chmod(0)
 
     # Annotated: a heterogeneous dict (Paths, a date, a datetime, injected
     # callables, None) whose inferred value union would otherwise be
@@ -3860,7 +3865,10 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
     elif branch is not None:  # pragma: no cover - guards a typo'd branch id
         raise AssertionError(f'unknown decision-8 branch {branch!r}')
 
-    return nightly.run_nightly(**kwargs), repo
+    try:
+        return nightly.run_nightly(**kwargs), repo
+    finally:
+        projects_root.chmod(0o755)
 
 
 class TestRunNightlyRecordsTrickleState:
@@ -4030,22 +4038,29 @@ class TestRunNightlyRecordsTrickleState:
         )
         assert _one_recorded(calls)['budget_suppressed'] is True
 
-    def test_an_unexpected_raise_before_the_recorded_try_still_escalates(
-        self, tmp_path, monkeypatch,
+    @pytest.mark.skipif(os.geteuid() == 0, reason='root ignores permission bits')
+    def test_an_unreadable_transcript_dir_escalates_and_records_a_failed_night(
+        self, tmp_path,
     ):
-        def _boom(*args, **kwargs):
-            raise RuntimeError('synthetic sampling explosion')
-
-        monkeypatch.setattr(nightly, 'select_digest_sessions', _boom)
+        recorder, calls = _recorder_spy()
         poster, posted = _capture_poster()
 
-        result, _repo = _run_e2e_nightly(tmp_path, poster=poster)
+        result, _repo = _run_e2e_nightly(
+            tmp_path, recorder=recorder, poster=poster, unreadable_transcripts=True,
+        )
 
         assert result.exit_code == 1
         assert result.escalated is True
-        arguments = _one_escalation(posted)
-        assert 'RuntimeError' in arguments['summary']
-        assert 'synthetic sampling explosion' in arguments['summary']
+        assert 'PermissionError' in _one_escalation(posted)['summary']
+        doc = _one_recorded(calls)
+        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
+        assert doc['exit_code'] == 1
+        assert doc['target_date'] == '2026-07-13'
+        assert doc['consecutive_failed_runs'] == 1
+        assert doc['budget_suppressed'] is False
+        assert set(doc['counters'].values()) == {0}, (
+            'sampling never returned, so nothing was counted'
+        )
 
     def test_a_codebook_dump_failure_escalates_instead_of_escaping(
         self, tmp_path, monkeypatch,
