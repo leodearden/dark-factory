@@ -2685,8 +2685,7 @@ class TestB10StormEscape:
         — which is DONE and CLOSED to appends, so a reader sent there reports
         it nowhere. Same correction commit e0ea6e3fe9 already made to the
         ``_markup_gate`` ERROR line and commit 2b38fd89a2 made across
-        ``markup_tripwire.py``. The routing sentence now has a single home,
-        ``MARKUP_RECURRENCE_ROUTING``, so it cannot drift again (task 5698).
+        ``markup_tripwire.py``.
         """
         clock = _Clock()
         h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)

@@ -583,9 +583,11 @@ def _caller_label(
 MARKUP_BOUNDARY_STORM_CATEGORY = 'mcp_markup_boundary_storm'
 
 #: Where an operator takes a recurrence of the envelope-markup leak: the live
-#: PRD, never DF 3083, which is done and closed to appends. The ONE spelling
-#: every markup guard's storm and residue records and log lines interpolate —
-#: hand-kept copies of this sentence drifted three times (task 5698).
+#: PRD, never DF 3083, which is done and closed to appends. Interpolated by
+#: this module's storm ERROR line and by the storm and residue text of
+#: fused-memory's markup_guard and markup_tripwire and orchestrator's
+#: markup_sink. The escalation server's filers still keep their own copy
+#: (task 6732).
 MARKUP_RECURRENCE_ROUTING = (
     'report the recurrence against plans/toolcall-markup-containment-prd.md '
     '(DF 3083 is done and closed to appends, so not against 3083)'

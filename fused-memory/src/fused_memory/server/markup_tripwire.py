@@ -402,8 +402,8 @@ def emit_markup_storm_escalation(
         'can be added or overwritten, but none can be removed or renamed, '
         'because deletion needs metadata_mode=replace and any faithful replace '
         'payload carries done_provenance, which the write-authority floor '
-        'refuses. Its successor plans/toolcall-markup-containment-prd.md '
-        'owns the live blast-radius, deterministic-repair and retro-sweep work. '
+        'refuses. Its successor PRD owns the live blast-radius, '
+        'deterministic-repair and retro-sweep work in its open leaves. '
         "Attach the agent_id, tool, param and matched pattern from the guard's "
         "own log lines — grep 'markup_guard_storm' for this burst and 'markup "
         "guard:' for each individual call — when you "
