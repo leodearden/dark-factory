@@ -70,15 +70,17 @@ trailing_window(metric, current_value, window=60):
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import sqlite3
 import statistics
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Protocol
 
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 
-__all__ = ['LoadSampleStore']
+__all__ = ['Connect', 'LoadSampleStore', 'connect_durably']
 
 logger = logging.getLogger(__name__)
 
@@ -111,12 +113,31 @@ _VACUUM_MIN_RECLAIMABLE_FRACTION = 0.10
 # ``write_tick`` and ``trailing_window`` cannot disagree about the span.
 _TRAILING_WINDOW_SAMPLES = 60
 
+_SET_META_SQL = 'INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)'
+
+
+class Connect(Protocol):
+    def __call__(self, db_path: Path, *, autocommit: bool = False) -> sqlite3.Connection: ...
+
+
+def connect_durably(db_path: Path, *, autocommit: bool = False) -> sqlite3.Connection:
+    """Open *db_path* under the full durability pragmas; ``autocommit`` is for VACUUM.
+
+    SQLite refuses some statements inside a transaction, VACUUM among them, so
+    an autocommit connection opens with ``isolation_level=None`` from the
+    start and no pragma can begin an implicit transaction on it.
+    """
+    conn = sqlite3.connect(str(db_path), isolation_level=None if autocommit else 'DEFERRED')
+    apply_full_durability_pragmas_sync(conn, busy_timeout_ms=5000)
+    return conn
+
 
 class LoadSampleStore:
     """Synchronous SQLite writer for per-tick load samples."""
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, *, connect: Connect = connect_durably):
         self.db_path = db_path
+        self._open = connect
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
 
@@ -124,11 +145,8 @@ class LoadSampleStore:
     # Connection helpers
     # ------------------------------------------------------------------
 
-    def _connect(self) -> sqlite3.Connection:
-        """Open a connection and apply the full durability pragma triad."""
-        conn = sqlite3.connect(str(self.db_path))
-        apply_full_durability_pragmas_sync(conn, busy_timeout_ms=5000)
-        return conn
+    def _connect(self, *, autocommit: bool = False) -> sqlite3.Connection:
+        return self._open(self.db_path, autocommit=autocommit)
 
     def _ensure_schema(self) -> None:
         """Create the samples + meta tables and index idempotently."""
@@ -440,10 +458,7 @@ class LoadSampleStore:
     def _set_meta(self, key: str, value: str) -> None:
         conn = self._connect()
         try:
-            conn.execute(
-                'INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)',
-                (key, value),
-            )
+            conn.execute(_SET_META_SQL, (key, value))
             conn.commit()
         finally:
             conn.close()
@@ -505,22 +520,13 @@ class LoadSampleStore:
         if self.reclaimable_fraction() < _VACUUM_MIN_RECLAIMABLE_FRACTION:
             self._set_meta('last_vacuum_ts', str(now))
             return
-        # VACUUM must run outside a transaction.  Connect with isolation_level=None
-        # (autocommit) from the start so that pragma application inside
-        # apply_full_durability_pragmas_sync cannot begin an implicit transaction
-        # that would cause VACUUM to error with
-        # "cannot VACUUM from within a transaction".
-        conn = sqlite3.connect(str(self.db_path), isolation_level=None)
+        # The connect sits inside the try, so a failure opening the autocommit
+        # connection is logged and retried like a failed VACUUM. The stamp
+        # follows a successful VACUUM only, so a transient failure does not
+        # suppress retries for a whole interval.
         try:
-            apply_full_durability_pragmas_sync(conn, busy_timeout_ms=5000)
-            conn.execute('VACUUM')
-            # Record the timestamp only after a successful VACUUM so that a
-            # transient VACUUM failure doesn't suppress retries for 24h.
-            conn.execute(
-                'INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)',
-                ('last_vacuum_ts', str(now)),
-            )
+            with contextlib.closing(self._connect(autocommit=True)) as conn:
+                conn.execute('VACUUM')
+                conn.execute(_SET_META_SQL, ('last_vacuum_ts', str(now)))
         except Exception:
             logger.exception('VACUUM failed; will retry on next eligible tick')
-        finally:
-            conn.close()
