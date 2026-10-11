@@ -4913,7 +4913,7 @@ class TestStaleClaimantBlockedStrandIsReFiled:
     async def _sweep_claimed_blocked(
         self, harness: Harness, tmp_path: Path, *, heartbeat_age: timedelta,
     ) -> tuple[EscalationQueue, AsyncMock]:
-        """Run one real sweep over a claimed GONE_NO_MARKER blocked row.
+        """Reconcile one claimed GONE_NO_MARKER blocked row into a real queue.
 
         Returns the bound queue and the ``set_task_status`` mock every status
         flip routes through, for asserting that nothing was re-pended.
@@ -4927,7 +4927,7 @@ class TestStaleClaimantBlockedStrandIsReFiled:
         set_task_status = AsyncMock()
         harness.scheduler.set_task_status = set_task_status
 
-        await harness._reconcile_stranded_in_progress()
+        await _reconcile_stranded(harness, '4623', 'blocked')
 
         return queue, set_task_status
 
