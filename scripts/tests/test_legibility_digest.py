@@ -21,21 +21,28 @@ no package __init__ needed).
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
 
-import coder as coder_mod
 import digest as mod
 import pytest
 import yaml
 from legibility import inventory as inventory_mod
+from legibility import reingestion
 from legibility_carrier_fixtures import (
+    CENSUS_MEMORY_CONTEXT_TURN,
+    NON_HUMAN_ORIGIN_IDS,
+    NON_HUMAN_ORIGIN_TURNS,
     PROSE_QUOTING_THE_SCHEMA,
+    TASK_NOTIFICATION_TEXT,
+    TRICKLE_CODER_PREAMBLE,
+    UNKNOWN_PROVENANCE_TEXT,
     briefing_text,
     coder_judgment,
     json_fenced,
+    merger_prompt,
+    recon_run_review_text,
 )
 from orchestrator.agents.memory_recall import (
     MEMORY_CONTEXT_CAVEAT,
@@ -1024,7 +1031,7 @@ def _trickle_coder_session_records():
     the one user turn, and the coder's answer as the one assistant text
     block. Every signal literal in it is re-ingested."""
     prompt = (
-        f'{_TRICKLE_CODER_PREAMBLE}\n\n=== SESSION DIGEST ===\n'
+        f'{TRICKLE_CODER_PREAMBLE}\n\n=== SESSION DIGEST ===\n'
         '## Guard Trips\n- (turn 21) blocked:\n'
     )
     answer = coder_judgment(note="that's wrong: its turn 21 reads blocked: twice")
@@ -1036,7 +1043,7 @@ def _trickle_coder_session_records():
 
 class TestReingestedContentIsBucketAgnostic:
     def test_df_guard_ignores_the_digest_a_coder_prompt_embeds(self):
-        records = [_user_text(f'{_TRICKLE_CODER_PREAMBLE}\n\n- (turn 21) blocked:')]
+        records = [_user_text(f'{TRICKLE_CODER_PREAMBLE}\n\n- (turn 21) blocked:')]
 
         assert mod.iter_df_guards(records) == []
 
@@ -1059,7 +1066,7 @@ class TestReingestedContentIsBucketAgnostic:
         # dropped WHOLE, so a genuine error printed beside the marker would
         # go too: the accepted trade-off _dialogue_text_sources states.
         records = [_tool_result(
-            'tu-1', f'{_TRICKLE_CODER_PREAMBLE}\n## Not Found\n- (turn 3) no such file or directory',
+            'tu-1', f'{TRICKLE_CODER_PREAMBLE}\n## Not Found\n- (turn 3) no such file or directory',
         )]
 
         assert mod.iter_not_found(records) == []
@@ -1106,7 +1113,7 @@ class TestReingestedContentIsBucketAgnostic:
 
     def test_interrupt_ignores_the_digest_a_harness_prompt_embeds(self):
         records = [_user_text(
-            f'{_TRICKLE_CODER_PREAMBLE}\n\n## Interrupts\n- (turn 7) request interrupted by user',
+            f'{TRICKLE_CODER_PREAMBLE}\n\n## Interrupts\n- (turn 7) request interrupted by user',
         )]
 
         assert mod.iter_interrupts(records) == []
@@ -1127,7 +1134,7 @@ class TestReingestedContentIsBucketAgnostic:
         )
         records = [_user_text(text)]
 
-        assert mod.is_reingested_content(text) is True
+        assert reingestion.is_reingested_content(text) is True
         assert mod.classify_agent_class(records) == 'orchestrated-task'
 
 
@@ -2047,28 +2054,6 @@ def _split_frontmatter(digest):
 # (HARNESS_PROMPT_MARKERS).
 # ---------------------------------------------------------------------------
 
-_CENSUS_MEMORY_CONTEXT_TURN = (
-    '# Context\n\n'
-    '## Project Context\n\n'
-    '{ "results": [ { "id": "ccf73ca4-8240-4f9a-8abf-32b210e5b35b", '
-    '"content": "Task 1470 wired /audit into /review Phase-2 Architectural '
-    'Coherence." } ] }\n'
-)
-"""The 07-31 census cluster 1.1(b) sighting verbatim
-(plans/confusion-census-2026-07-31.md:85): a context-ONLY briefing injection
-that the all-three-headings rule admitted into the gold section."""
-
-
-_TRICKLE_CODER_PREAMBLE = (
-    'You are the trickle coder for the dark-factory agent-confusion '
-    'codebook (plans/confusion-reduction-prd.md §7.3). Read the '
-    'session digest below and decide which existing codebook entries '
-    'it matches.'
-)
-"""Literal prefix of scripts/legibility/coder.py:174 build_prompt's
-harness-authored preamble."""
-
-
 def _memory_context_block(body='## Project Context\n\n{...}'):
     """Build the real shape of a LONE '# Context' memory-context block --
     ``orchestrator/src/orchestrator/agents/memory_recall.py::render_context_block``'s
@@ -2148,34 +2133,6 @@ def _recalled_sections_with_trailing_unavailable_note():
     )
 
 
-def _merger_prompt(tmp_path):
-    """The real text ``BriefingAssembler.build_merger_prompt`` injects
-    (orchestrator/src/orchestrator/agents/briefing.py), built by calling the
-    production builder rather than restating its headings here — the same
-    lockstep discipline ``test_resume_prompt_is_excluded_lockstep`` applies
-    to the cli_invoke resume constants.
-
-    The builder is async and touches no I/O and no config, so a throwaway
-    assembler over *tmp_path* and a plain ``asyncio.run`` suffice; this file
-    is otherwise synchronous and stays that way."""
-    from orchestrator.agents.briefing import BriefingAssembler
-    from orchestrator.config import GitConfig, OrchestratorConfig
-
-    assembler = BriefingAssembler(OrchestratorConfig(
-        project_root=tmp_path,
-        git=GitConfig(
-            main_branch='main',
-            branch_prefix='task/',
-            remote='origin',
-            worktree_dir='.worktrees',
-        ),
-    ))
-    return asyncio.run(assembler.build_merger_prompt(
-        conflicts='<<<<<<< ours\na\n=======\nb\n>>>>>>> theirs',
-        task_intent='Rescope the briefing memory block.',
-    ))
-
-
 def _resume_and_context_block_records():
     """The confusion-census sighting shape (session b976febe), minus its
     one genuine correction: a turn-0 lone '# Context' memory block,
@@ -2199,7 +2156,7 @@ class TestHarnessInjectedTurnFilter:
         assert mod.iter_user_turns(records) == []
 
     def test_trickle_coder_preamble_turn_is_excluded(self):
-        records = [_user_text(_TRICKLE_CODER_PREAMBLE)]
+        records = [_user_text(TRICKLE_CODER_PREAMBLE)]
 
         assert mod.iter_user_turns(records) == []
 
@@ -2220,9 +2177,8 @@ class TestHarnessInjectedTurnFilter:
         # injection -- '# Context' + '## Project Context' + the memory-search
         # JSON dump. It carries NEITHER '## Agent Identity' NOR '# Task', so
         # the old all-three rule let it through into the gold section.
-        text = _CENSUS_MEMORY_CONTEXT_TURN
+        text = CENSUS_MEMORY_CONTEXT_TURN
 
-        assert mod.is_harness_injected_turn(text) is True
         assert mod.iter_user_turns([_user_text(text)]) == []
 
     def test_context_plus_conventions_subheading_is_excluded(self):
@@ -2266,7 +2222,6 @@ class TestHarnessInjectedTurnFilter:
             '## Conventions\n\nplease stop using tabs, this is wrong'
         )
 
-        assert mod.is_harness_injected_turn(text) is False
         assert len(mod.iter_user_turns([_user_text(text)])) == 1
 
     def test_human_task_plus_action_prose_turn_is_retained(self):
@@ -2283,17 +2238,7 @@ class TestHarnessInjectedTurnFilter:
             '# Action\n\nStart with the tests, then the loop itself.\n'
         )
 
-        assert mod.is_harness_injected_turn(text) is False
         assert len(mod.iter_user_turns([_user_text(text)])) == 1
-
-    def test_every_corroborator_is_a_double_hash_subblock(self):
-        # Structural guard, so a future agent does not re-add a top-level
-        # heading to the corroborator tuple: a '# '-level corroborator pairs
-        # with the '# task' anchor to clear the >=2 threshold on its own,
-        # which is exactly the human shape above.
-        assert all(
-            heading.startswith('## ') for heading in mod.HARNESS_BRIEFING_SUBHEADINGS
-        )
 
     def test_lone_context_anchor_with_prose_is_retained(self):
         # The relaxation's boundary: ONE anchor and NO corroborating
@@ -2378,52 +2323,13 @@ class TestHarnessInjectedTurnFilter:
 
         assert mod.signal_counts(with_briefing) == mod.signal_counts(base)
 
-    @pytest.mark.parametrize(
-        'resume_prompt', [CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT],
-        ids=['usage_limit', 'crash_recovery'],
-    )
-    def test_resume_prompt_is_excluded_lockstep(self, resume_prompt):
-        # LOCKSTEP: asserted against each canonical constant, not a
-        # restated literal, so a harness rewording of either resume prompt
-        # turns this suite red instead of silently drifting out of
-        # coverage. One parametrize row per resume prompt -- a future
-        # resume prompt is covered by adding one more row.
-        assert mod.is_harness_injected_turn(resume_prompt) is True
-
-    def test_merger_prompt_is_excluded_lockstep(self, tmp_path):
-        # LOCKSTEP: built by the REAL prompt builder, not a hand-copied
-        # literal, the same way test_resume_prompt_is_excluded_lockstep
-        # pins the cli_invoke constants -- so a future merger-prompt
-        # rewording turns this red instead of silently dropping the role
-        # out of coverage.
-        #
-        # The merger is the one dispatched role with NO memory block
-        # (task 3659, D7), so it emits no '# Context' anchor and the
-        # briefing anchor+corroborator rule cannot see it at all. Before
-        # 3659 it was classified via that anchor; MERGER_HEADINGS is what
-        # keeps merge-conflict dispatches (7 per 14 days, measured) out of
-        # the digest's gold user_corrections section.
-        assert mod.is_harness_injected_turn(_merger_prompt(tmp_path)) is True
-
     def test_merger_prompt_is_excluded_from_iter_user_turns(self, tmp_path):
-        # The end-to-end consequence of the lockstep pin above: a merger
+        # The end-to-end consequence of the merger-prompt lockstep pin in
+        # test_legibility_reingestion.py: a merger
         # dispatch transcript presents no user turn to mine.
-        records = [_user_text(_merger_prompt(tmp_path))]
+        records = [_user_text(merger_prompt(tmp_path))]
 
         assert mod.iter_user_turns(records) == []
-
-    def test_human_turn_with_one_merger_heading_is_retained(self, tmp_path):
-        # The all-of guard MERGER_HEADINGS is matched under: a human turn
-        # writing '# Action' (an ordinary spec-writing heading, emitted by
-        # every role template and deliberately NOT a briefing corroborator
-        # since task 3610) must stay gold.
-        human = (
-            '# Action\n\n'
-            'Please resolve the conflict in briefing.py by hand -- the '
-            'merge queue keeps picking the wrong side.\n'
-        )
-
-        assert mod.is_harness_injected_turn(human) is False
 
     def test_crash_recovery_resume_prompt_excluded_from_iter_user_turns(self):
         # The sibling of the usage-limit resume prompt: same defect class
@@ -2606,29 +2512,10 @@ class TestHarnessInjectedTurnFilter:
 # and origin={'kind': 'task-notification'} -- so no text rule saw it, and it
 # rendered as a gold "User Correction". Census sighting: reify session
 # 50e12d17's only gold turn was record 196, a sub-agent's weekly-limit
-# failure notification (_TASK_NOTIFICATION_TEXT, verbatim).
+# failure notification (TASK_NOTIFICATION_TEXT, verbatim).
 # ---------------------------------------------------------------------------
 
-_TASK_NOTIFICATION_TEXT = (
-    '<task-notification>\n'
-    '<task-id>a1ab810a169bbb353</task-id>\n'
-    '<tool-use-id>toolu_019A8emLVkosytrg3s2up7AD</tool-use-id>\n'
-    '<output-file>/tmp/claude-1000/-home-leo-src-warm-lanes-worktrees--lane-20/'
-    '50e12d17-9e73-4686-a364-7ae08109140c/tasks/a1ab810a169bbb353.output</output-file>\n'
-    '<status>failed</status>\n'
-    '<summary>Agent "Find .ri fixture test harness patterns" failed: Agent terminated'
-    " early due to an API error: You've hit your weekly limit · resets Aug 26, 11am"
-    ' (Europe/London)</summary>\n'
-    '<note>A task-notification fires each time this agent stops with no live background'
-    ' children of its own. The user can send it another message and resume it, so the'
-    ' same task-id may notify more than once.</note>\n'
-    '<result>Now the harness and builtin tests.</result>\n'
-    '</task-notification>'
-)
-
 _GENUINE_CORRECTION = 'This is wrong, please redo it.'
-
-_UNKNOWN_PROVENANCE_TEXT = 'please redo the merge'
 
 
 def _with_origin(rec, kind):
@@ -2652,7 +2539,7 @@ _TASK_NOTIFICATION_WITH_SIGNAL_LITERALS = (
 )
 
 
-def _task_notification(text=_TASK_NOTIFICATION_TEXT):
+def _task_notification(text=TASK_NOTIFICATION_TEXT):
     """A background-task notification record, shaped like census record 196."""
     return _with_origin(_user_text(text), 'task-notification')
 
@@ -2661,61 +2548,22 @@ class TestNonHumanOriginFilter:
     def test_census_task_notification_is_excluded_from_iter_user_turns(self):
         assert mod.iter_user_turns([_task_notification()]) == []
 
-    @pytest.mark.parametrize(
-        ('kind', 'text'),
-        [
-            ('task-notification', _TASK_NOTIFICATION_TEXT),
-            (
-                'auto-continuation',
-                'Implement the following plan:\n\n# Fix: the laptop verify host is benched'
-                '\n\n## Objective\n\nMake the sync find uv on the remote host.',
-            ),
-            (
-                'auto-continuation',
-                'Your claude.ai usage limit has reset. Continue the task you were working on'
-                ' when the limit was reached; do not repeat work that is already complete.',
-            ),
-            (
-                'coordinator',
-                'The coordinator sent a message while you were working:\n'
-                'Task 5878 has landed; stop now and make no further changes.',
-            ),
-            (
-                'peer',
-                'Another Claude session sent a message:\n'
-                '<cross-session-message from="uds:/run/user/1000/cc-socks/1.sock"'
-                ' from-name="dark-factory-19">\nplease pick up the dedup scope\n'
-                '</cross-session-message>',
-            ),
-            ('a-future-kind', _UNKNOWN_PROVENANCE_TEXT),
-        ],
-        ids=[
-            'task_notification', 'auto_continuation_plan',
-            'auto_continuation_usage_limit_reset', 'coordinator', 'peer',
-            'unseen_future_kind',
-        ],
-    )
+    @pytest.mark.parametrize(('kind', 'text'), NON_HUMAN_ORIGIN_TURNS, ids=NON_HUMAN_ORIGIN_IDS)
     def test_every_non_human_origin_kind_is_excluded(self, kind, text):
-        # The text alone is ordinary dialogue to the content classifier, so
-        # only the record's provenance can exclude it -- and the rule is
-        # "anything but human", never an allowlist of known machine kinds.
         rec = _with_origin(_user_text(text), kind)
 
-        assert mod.is_reingested_content(text) is False
-        assert mod.has_non_human_origin(rec) is True
         assert mod.iter_user_turns([rec]) == []
 
     def test_human_origin_record_quoting_a_notification_mid_prose_is_kept(self):
         text = 'why did the <task-notification> for the lint run say failed? please look again'
         rec = _with_origin(_user_text(text), 'human')
 
-        assert mod.has_non_human_origin(rec) is False
         assert [t['text'] for t in mod.iter_user_turns([rec])] == [text]
 
     def test_human_origin_record_opening_with_a_pasted_notification_is_kept(self):
         # PROVENANCE decides, not text: there is no '<task-notification>'
         # prefix fallback, so a human who pastes one to ask about it stays gold.
-        text = _TASK_NOTIFICATION_TEXT + '\n\nwhat does this failure mean? redo it'
+        text = TASK_NOTIFICATION_TEXT + '\n\nwhat does this failure mean? redo it'
         rec = _with_origin(_user_text(text), 'human')
 
         assert [t['text'] for t in mod.iter_user_turns([rec])] == [text]
@@ -2723,18 +2571,17 @@ class TestNonHumanOriginFilter:
     @pytest.mark.parametrize(
         'record',
         [
-            _user_text(_UNKNOWN_PROVENANCE_TEXT),
-            {**_user_text(_UNKNOWN_PROVENANCE_TEXT), 'origin': 'task-notification'},
-            {**_user_text(_UNKNOWN_PROVENANCE_TEXT), 'origin': {}},
-            {**_user_text(_UNKNOWN_PROVENANCE_TEXT), 'origin': {'kind': None}},
-            {**_user_text(_UNKNOWN_PROVENANCE_TEXT), 'origin': {'body': 'x'}},
+            _user_text(UNKNOWN_PROVENANCE_TEXT),
+            {**_user_text(UNKNOWN_PROVENANCE_TEXT), 'origin': 'task-notification'},
+            {**_user_text(UNKNOWN_PROVENANCE_TEXT), 'origin': {}},
+            {**_user_text(UNKNOWN_PROVENANCE_TEXT), 'origin': {'kind': None}},
+            {**_user_text(UNKNOWN_PROVENANCE_TEXT), 'origin': {'body': 'x'}},
         ],
         ids=['absent', 'bare_string', 'empty_dict', 'none_kind', 'no_kind_key'],
     )
     def test_unknown_provenance_falls_through_to_text_rules(self, record):
-        assert mod.has_non_human_origin(record) is False
         assert [t['text'] for t in mod.iter_user_turns([record])] == [
-            _UNKNOWN_PROVENANCE_TEXT,
+            UNKNOWN_PROVENANCE_TEXT,
         ]
 
     def test_genuine_turn_between_notifications_keeps_its_record_index(self):
@@ -2812,129 +2659,13 @@ class TestNonHumanOriginFilter:
     def test_classify_agent_class_still_reads_markers_inside_a_notification(self):
         # classify_agent_class reads the RAW carriers, which stay unfiltered.
         text = (
-            _TASK_NOTIFICATION_TEXT
+            TASK_NOTIFICATION_TEXT
             + 'Task ID: 5956\nWorktree: /home/leo/src/dark-factory/.worktrees/5956\n'
         )
         records = [_task_notification(text)]
 
         assert mod.iter_user_turns(records) == []
         assert mod.classify_agent_class(records) == 'orchestrated-task'
-
-
-# ---------------------------------------------------------------------------
-# is_coder_judgment_payload -- the re-ingestion content classifier's
-# machine-answer half (task 5685). A prior trickle-coder answer re-enters a
-# transcript as ONE carrier holding the coder's whole {"matches",
-# "candidates"} object (scripts/legibility/coder.py::build_prompt), and its
-# notes quote the digest being coded, so every signal literal they carry
-# used to fire as this session's own. The classifier PARSES the whole
-# carrier, bare or inside one outer ```json fence; it never substring-matches
-# or brace-slices, so prose that merely quotes the schema stays dialogue.
-# ---------------------------------------------------------------------------
-
-class TestCoderJudgmentPayloadClassifier:
-    @pytest.mark.parametrize(
-        'text',
-        [
-            coder_judgment(),
-            '{"matches": [], "candidates": []}',
-            json_fenced(coder_judgment()),
-            f'\n\n  {coder_judgment()}  \n\n',
-            json.dumps({'matches': [], 'candidates': [], 'rationale': 'nothing fits'}),
-        ],
-        ids=['bare', 'empty_judgment', 'json_fenced', 'surrounding_whitespace', 'extra_key'],
-    )
-    def test_whole_carrier_judgment_is_recognised(self, text):
-        assert mod.is_coder_judgment_payload(text) is True
-
-    def test_the_reply_the_coder_prompt_prescribes_is_recognised_lockstep(self):
-        """LOCKSTEP with scripts/legibility/coder.py::build_prompt, the one
-        copy of the response schema CODER_JUDGMENT_KEYS restates. The reply
-        is read out of the prompt, never hand-built: a hand-built reply stays
-        green when that schema is renamed, and a rename is the drift this
-        pins."""
-        prompt = coder_mod.build_prompt(digest_text='', codebook_index='', invariant_slugs=())
-        [prescribed_reply] = [line for line in prompt.splitlines() if line.startswith('{')]
-
-        assert mod.is_coder_judgment_payload(prescribed_reply) is True
-
-    def test_prose_quoting_the_schema_inline_is_not_a_payload(self):
-        # A genuine self-correction that merely MENTIONS the schema is this
-        # session's own dialogue and must never be suppressed.
-        text = (
-            'The coder answers with {"matches": [], "candidates": []} '
-            "— that's wrong, it should be a single object per session."
-        )
-
-        assert mod.is_coder_judgment_payload(text) is False
-
-    @pytest.mark.parametrize(
-        'text',
-        [
-            '{"matches": []}',
-            '{"candidates": []}',
-            '[{"matches": [], "candidates": []}]',
-            '{"results": [{"id": "ccf73ca4", "content": "Task 1470 wired /audit."}]}',
-            'not json at all',
-            '',
-        ],
-        ids=[
-            'matches_only', 'candidates_only', 'top_level_array',
-            'unrelated_object', 'non_json', 'empty',
-        ],
-    )
-    def test_anything_but_a_judgment_object_is_not_a_payload(self, text):
-        assert mod.is_coder_judgment_payload(text) is False
-
-    def test_pathologically_nested_object_answers_false_without_raising(self):
-        # json.loads raises RecursionError, which is not a ValueError, on
-        # this input under CPython 3.13. The predicate runs on every carrier
-        # of arbitrary transcripts, tool_results included, so it must
-        # answer rather than abort the whole digest.
-        text = '{"a":' * 200_000 + '1' + '}' * 200_000
-
-        assert mod.is_coder_judgment_payload(text) is False
-
-
-# ---------------------------------------------------------------------------
-# is_reingested_content -- the ONE predicate every signal bucket consults
-# (task 5685). It answers "is this carrier machine content re-ingested as
-# session material rather than this session's own dialogue?", and its two
-# known members are a prior coder judgment and a harness-injected prompt or
-# briefing.
-# ---------------------------------------------------------------------------
-
-class TestReingestedContentClassifier:
-    @pytest.mark.parametrize(
-        'text', [coder_judgment(), json_fenced(coder_judgment())],
-        ids=['bare', 'json_fenced'],
-    )
-    def test_a_coder_judgment_is_reingested(self, text):
-        assert mod.is_reingested_content(text) is True
-
-    @pytest.mark.parametrize(
-        'text', [briefing_text(), _CENSUS_MEMORY_CONTEXT_TURN, _TRICKLE_CODER_PREAMBLE],
-        ids=['briefing', 'census_memory_context', 'trickle_coder_prompt'],
-    )
-    def test_a_harness_prompt_or_briefing_is_reingested(self, text):
-        assert mod.is_reingested_content(text) is True
-
-    @pytest.mark.parametrize(
-        'resume_prompt', [CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT],
-        ids=['usage_limit', 'crash_recovery'],
-    )
-    def test_resume_prompt_is_reingested_lockstep(self, resume_prompt):
-        # LOCKSTEP, as in test_resume_prompt_is_excluded_lockstep: asserted
-        # against each canonical constant, never a restated literal.
-        assert mod.is_reingested_content(resume_prompt) is True
-
-    @pytest.mark.parametrize(
-        'text',
-        ['please fix the bug in the merge worker', "Actually, that's wrong — use the other branch", ''],
-        ids=['ordinary_turn', 'genuine_self_correction', 'empty'],
-    )
-    def test_dialogue_is_not_reingested(self, text):
-        assert mod.is_reingested_content(text) is False
 
 
 # ---------------------------------------------------------------------------
@@ -2954,7 +2685,7 @@ class TestNonDialogueCarrierPredicate:
             (_assistant(_text(coder_judgment())), coder_judgment()),
             (_assistant(_text(json_fenced(coder_judgment()))), json_fenced(coder_judgment())),
             (_user_text(briefing_text()), briefing_text()),
-            (_user_text(_TRICKLE_CODER_PREAMBLE), _TRICKLE_CODER_PREAMBLE),
+            (_user_text(TRICKLE_CODER_PREAMBLE), TRICKLE_CODER_PREAMBLE),
         ],
         ids=[
             'non_human_origin_alone_decides', 'coder_judgment', 'json_fenced_coder_judgment',
@@ -3004,50 +2735,15 @@ class TestNonDialogueCarrierPredicate:
 # human turn is strictly the worse error.
 # ---------------------------------------------------------------------------
 
-def _recon_run_review_text():
-    """Build the text of an injected reconciliation-run-review user turn --
-    the literal shape ``ReconciliationJudge._build_review_prompt`` emits
-    (fused-memory/src/fused_memory/reconciliation/judge.py:411-476): a
-    '## Reconciliation Run Review' heading, a '### Run Metadata' block whose
-    first bullet is '- Run ID: {run.id}', a '### Stage Reports' block of
-    ``json.dumps`` output, and '### MCP Actions (N total)' / '### Journal
-    Entries (N total)' blocks. The run id matches the one the census quotes
-    verbatim at §1.1 (:85).
-
-    Deliberately free of every detector literal (NOT_FOUND_PATTERNS,
-    DF_GUARD_PATTERNS, INTERRUPT_PATTERN, SELF_CORRECTION_PATTERNS) so
-    test_signal_counts_unaffected_by_pasted_report_turn isolates the
-    iter_user_turns filter rather than an incidental pattern hit.
-    """
-    return (
-        '## Reconciliation Run Review\n\n'
-        '### Run Metadata\n'
-        '- Run ID: 84e6ce03-1f2a-4c7b-9d84-6b0f1a2e35cc\n'
-        '- Project: dark_factory\n'
-        '- Type: targeted\n'
-        '- Trigger: task_status_change\n'
-        '- Events processed: 12\n'
-        '- Status: completed\n\n'
-        '### Stage Reports\n'
-        '[\n  {\n    "stage": 1,\n    "status": "completed",\n'
-        '    "summary": "consolidated 4 memories"\n  }\n]\n\n'
-        '### MCP Actions (2 total)\n'
-        '[\n  {\n    "tool": "add_memory",\n    "created_at": "2026-07-31T09:00:00Z"\n  }\n]\n\n'
-        '### Journal Entries (5 total)\n'
-        '[\n  {\n    "kind": "stage_start",\n    "created_at": "2026-07-31T09:00:00Z"\n  }\n]\n\n'
-        'Review this run and provide your verdict as JSON.\n'
-    )
-
-
 class TestRunReviewPromptTurnFilter:
     def test_recon_run_review_turn_is_excluded(self):
-        records = [_user_text(_recon_run_review_text())]
+        records = [_user_text(recon_run_review_text())]
 
         assert mod.iter_user_turns(records) == []
 
     def test_ordinary_correction_after_pasted_report_retained_with_index(self):
         records = [
-            _user_text(_recon_run_review_text()),
+            _user_text(recon_run_review_text()),
             _user_text('This is wrong, please redo it.'),
         ]
 
@@ -3083,7 +2779,7 @@ class TestRunReviewPromptTurnFilter:
 
     def test_render_digest_excludes_pasted_report_from_body_and_n_user_turns(self):
         records = [
-            _with_session_meta(_user_text(_recon_run_review_text())),
+            _with_session_meta(_user_text(recon_run_review_text())),
             _with_session_meta(_user_text('This is wrong, please redo it.')),
         ]
 
@@ -3105,40 +2801,9 @@ class TestRunReviewPromptTurnFilter:
         # The filter must not leak into _signal_text_sources: prepending a
         # signal-free pasted report must not perturb any of the five counts.
         base = _all_signals_records()
-        with_report = [_user_text(_recon_run_review_text())] + base
+        with_report = [_user_text(recon_run_review_text())] + base
 
         assert mod.signal_counts(with_report) == mod.signal_counts(base)
-
-    def test_run_review_prompt_is_classified_as_harness_injected(self):
-        # The run-review block IS harness-injected -- the judge's own prompt,
-        # recorded as the session's sole user record by `claude --print`
-        # (verified on all five census sightings) -- so it belongs to
-        # is_harness_injected_turn rather than to a separate predicate whose
-        # name would assert a human typed it.
-        assert mod.is_harness_injected_turn(_recon_run_review_text()) is True
-        assert mod.is_harness_injected_turn(briefing_text()) is True
-
-    def test_each_harness_heading_set_is_matched_independently(self):
-        # HARNESS_HEADING_SETS is an any()-over-sets fan-out with two real
-        # entries: a turn carrying ONE set's headings is excluded without
-        # needing the other's. Cross-set heading mixtures are not a match.
-        assert mod.HARNESS_BRIEFING_HEADINGS in mod.HARNESS_HEADING_SETS
-        assert mod.RECON_RUN_REVIEW_HEADINGS in mod.HARNESS_HEADING_SETS
-
-        crossed = '\n\n'.join(
-            ('# Context', '### Stage Reports', 'so what should I do here?'),
-        )
-        assert mod.is_harness_injected_turn(crossed) is False
-
-    def test_both_heading_sets_use_the_same_line_anchoring(self):
-        # One shared normalization (_heading_lines), so the two sets
-        # cannot silently diverge on what counts as a heading line: leading
-        # and trailing whitespace and case are stripped for both alike.
-        for headings in mod.HARNESS_HEADING_SETS:
-            padded = '\n'.join(f'  {heading.upper()}  ' for heading in headings)
-
-            assert mod.is_harness_injected_turn(padded) is True
-            assert mod.is_harness_injected_turn(' | '.join(headings)) is False
 
 
 class TestRenderDigest:
