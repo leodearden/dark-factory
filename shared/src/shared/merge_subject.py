@@ -11,13 +11,16 @@ from dataclasses import dataclass
 __all__ = [
     'MergeSubject',
     'format_merge_subject',
+    'merge_subject_pattern',
     'parse_merge_subject',
+    'rendered_prefix',
 ]
 
 _HEAD = 'Merge '
 _INTO = ' into '
 _LEGACY_SEPARATOR = ': '
 _REF_TOKEN = '[^ ]+'
+_ERE_SPECIALS = frozenset('.[\\()*+?{|^$')
 
 
 def _is_ref_token(text: str) -> bool:
@@ -55,3 +58,40 @@ def parse_merge_subject(subject: str) -> MergeSubject | None:
     if match is None or not all(_is_ref_token(group) for group in match.groups()):
         return None
     return MergeSubject(*match.groups())
+
+
+def _ere_escape(text: str) -> str:
+    return ''.join('\\' + ch if ch in _ERE_SPECIALS else ch for ch in text)
+
+
+def _escaped_ref(field: str, value: str) -> str:
+    _require_ref_token(field, value)
+    return _ere_escape(value)
+
+
+def rendered_prefix(branch_prefix: str) -> tuple[str, str]:
+    """ERE (head, into): `'^' + head + <escaped id> + into` is the line arm bash's grep -E takes."""
+    if branch_prefix:
+        _require_ref_token('branch_prefix', branch_prefix)
+    return _ere_escape(_HEAD + branch_prefix), _ere_escape(_INTO)
+
+
+def merge_subject_pattern(
+    *,
+    branch_prefix: str,
+    task_id: str | None = None,
+    main_branch: str | None = None,
+    legacy_colon_form: bool = False,
+) -> str:
+    """One pattern valid as both git --extended-regexp and Python re; None means any ref token.
+
+    The landing form is anchored to the whole subject; the legacy colon form only to its
+    prefix. As a git --grep it matches per message LINE, so re-test the subject in Python.
+    """
+    head, into = rendered_prefix(branch_prefix)
+    task = _REF_TOKEN if task_id is None else _escaped_ref('task_id', task_id)
+    main = _REF_TOKEN if main_branch is None else _escaped_ref('main_branch', main_branch)
+    landing = f'{into}{main}$'
+    if legacy_colon_form:
+        landing = f'({landing}|{_ere_escape(_LEGACY_SEPARATOR)})'
+    return f'^{head}{task}{landing}'
