@@ -281,21 +281,14 @@ class TestKnownProjectRootsFromEnv:
         monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, '/a,,,/b,')
         assert known_project_roots_from_env() == ['/a', '/b']
 
-    def test_custom_env_var(self, monkeypatch):
-        monkeypatch.setenv('SOME_OTHER_VAR', '/x,/y')
-        assert known_project_roots_from_env('SOME_OTHER_VAR') == ['/x', '/y']
+    def test_entries_are_path_normalised(self, monkeypatch):
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, ' /a/b/ ,,//c//d/,/e ')
+        assert known_project_roots_from_env() == ['/a/b', '//c/d', '/e']
 
     def test_agrees_with_the_shared_parser_on_unnormalised_entries(self, monkeypatch):
         monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, ' /a/b/ ,,//c//d/,/e ')
         assert known_project_roots_from_env() == [
             str(root) for root in known_project_roots(os.environ)
-        ]
-
-    def test_a_custom_env_var_agrees_with_the_shared_parser(self, monkeypatch):
-        value = ' /a/b/ ,,//c//d/,/e '
-        monkeypatch.setenv('SOME_OTHER_VAR', value)
-        assert known_project_roots_from_env('SOME_OTHER_VAR') == [
-            str(root) for root in known_project_roots({KNOWN_PROJECT_ROOTS_ENV: value})
         ]
 
 

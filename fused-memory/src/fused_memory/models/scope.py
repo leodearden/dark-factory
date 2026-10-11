@@ -255,21 +255,17 @@ def resolve_project_id_for_root(project_root: str | Path) -> str:
     )
 
 
-def known_project_roots_from_env(
-    env_var: str = KNOWN_PROJECT_ROOTS_ENV,
-) -> list[str]:
-    """Parse the configured comma-separated env var into a list of project_roots.
+def known_project_roots_from_env() -> list[str]:
+    """The project_roots named by ``KNOWN_PROJECT_ROOTS_ENV``, as strings.
 
-    The parser is ``shared.project_layout.known_project_roots``, handed
-    *env_var*'s value under the canonical name, so every consumer reads the
-    variable the same way: ``[]`` when unset or empty, whitespace stripped,
-    empty entries skipped, each entry path-normalised.  Does *not* resolve
-    symlinks or check existence: :func:`build_known_projects_map` admits a
-    root that is not a directory with a WARNING, and
-    :func:`is_phantom_project_root` is the detector.
+    The parser is ``shared.project_layout.known_project_roots``, so every
+    consumer reads the variable the same way: ``[]`` when unset or empty,
+    whitespace stripped, empty entries skipped, each entry path-normalised.
+    Does *not* resolve symlinks or check existence:
+    :func:`build_known_projects_map` admits a root that is not a directory
+    with a WARNING, and :func:`is_phantom_project_root` is the detector.
     """
-    environ = {KNOWN_PROJECT_ROOTS_ENV: os.environ.get(env_var, '')}
-    return [str(root) for root in known_project_roots(environ)]
+    return [str(root) for root in known_project_roots()]
 
 
 def is_phantom_project_root(root: str | os.PathLike[str]) -> bool:
