@@ -243,16 +243,20 @@ const QUALITY = A.quality_guidance
   : `Read ${ROOT}/docs/code-quality.md first and judge by its Definition: `
 const QUALITY_REF = A.quality_guidance ? 'the quality definition above' : `${ROOT}/docs/code-quality.md`
 
-// ANCHOR_RE, LINE_PIN_RE and normAnchor mirror skills/hotspot-survey/scripts/findings_artefact.py
-// (ANCHOR_RE, LINE_PIN_RE, normalise_anchor) — the interim key reference of contract §2; the
+// ANCHOR_RE, LINE_PIN_RE, SYMBOL_PATH_RE and normAnchor mirror skills/hotspot-survey/scripts/findings_artefact.py
+// (ANCHOR_RE, LINE_PIN_RE, SYMBOL_PATH_RE, normalise_anchor) — the interim key reference of contract §2; the
 // lead's Python digest imports that module (or shared/finding_key.py once landed) to mint keys.
 const ANCHOR_RE = /^(slug:[a-z0-9]+(-[a-z0-9]+)*|[\w.-][\w./-]*(::[A-Za-z_][\w.]*)?)$/
 const LINE_PIN_RE = /(\.[A-Za-z0-9]{1,8}):\d+(?:[-,]\d+)*/g
-function normAnchor(a) {
+// A symbol path after the file (Rust `Type::method`) is a class-level definition, written `Type.method` (failure mode 17).
+const SYMBOL_PATH_RE = /::([A-Za-z_][\w.]*(?:::[A-Za-z_][\w.]*)+)$/
+function unpinAnchor(a) {
   let s = String(a || '').trim().replace(/\\/g, '/')
   while (s.startsWith('./')) s = s.slice(2)
   return s.replace(LINE_PIN_RE, '$1')
 }
+const dotSymbolPath = (s) => s.replace(SYMBOL_PATH_RE, (_, path) => '::' + path.split('::').join('.'))
+const normAnchor = (a) => dotSymbolPath(unpinAnchor(a))
 function canonical(f) {
   return `${f.area}|${normAnchor(f.anchor)}|${(f.tags || [])[0] || ''}`.toLowerCase()
 }
@@ -282,7 +286,13 @@ function cleanSeat(r, label) {
   for (const f of r.findings) {
     const problems = findingProblems(f, r)
     if (problems.length) { dropped.push({ seat: label, display_id: f.display_id, anchor: f.anchor, problems }); log(`${label}: dropped ${f.display_id} (${problems.join('; ')})`) }
-    else { f.anchor = normAnchor(f.anchor); f.canonical = canonical(f); kept.push(f) }
+    else {
+      const unpinned = unpinAnchor(f.anchor)
+      if (dotSymbolPath(unpinned) !== unpinned) log(`${label}: ${f.display_id} anchor ${unpinned} normalised to ${dotSymbolPath(unpinned)} (failure mode 17)`)
+      f.anchor = normAnchor(f.anchor)
+      f.canonical = canonical(f)
+      kept.push(f)
+    }
   }
   return { ...r, findings: kept }
 }
@@ -704,3 +714,4 @@ Expected per-seat spend, extrapolated from the hotspot run's measured 100–140k
 14. **An accepted critic correction never reaches the record.** The critic's `severity-unsupported` on `fk-3505aba0481d` (`evals/runner.py::run_architect_eval`, high → medium) was accepted in the revised synthesis, but the findings record kept the seat's `high` and the lead had to rule at decompose. The critic now states `severity_to`, the revision answers each item in `critic_responses`, and the script returns `severity_corrections` with the acceptance; the lead's digest applies the accepted ones and flags the rest (`report-format.md` §Artefact 2).
 15. **A file larger than the read budget.** `merge_lane/worker.py` was 22,081 lines against a 15k budget; the seat read 9,970 verbatim and the rest as a code-only rendition, and nothing in `read_coverage` said so. The area prompt now prescribes the protocol (symbol index, module-level state, functions in descending cognitive max from the snapshot's `functions` table) and `read_coverage.partial` records it, so the report can show what was not read.
 16. **A usage cap mid-run.** Measured on the first reify run (`review-all-reify-20261010`): the account's weekly usage limit fired at 11.2M subagent tokens, 37 of 70 agents failed with "usage limit", and the workflow kept dispatching until every remaining call had failed — `agent()` returns `null` on a terminal API error, so each failure was logged as a degenerate seat and its retry burned another call. Such a run must be **resumed, not restarted**: `Workflow({scriptPath, resumeFromRunId})` once the limit resets. But a resume replays only the longest unchanged prefix of `agent()` calls *in journal order*, and under `pipeline()` (and the Calibrate phase running beside the cross lenses) the completion order differs between runs, so every call after the first divergence runs live again: on reify 5 already-completed area seats and 6 completed skeptics re-ran, about 1.2M tokens. Two rules follow. (a) Never stop a run to patch prompts for seats that have not run yet — an edited prompt moves the divergence point earlier still. Let it finish, then re-run only the changed tail as a standalone workflow over the completed results: a script that rebuilds the synthesis digest from `workflow-result.json` (seat identity from the slice list, short ids, `prior_ids`, `calibration`), embeds it with the current `orchestration.md`'s Calibrate, Synthesize and Critique code lifted verbatim, and runs Calibrate → Synthesize → Critique (the reify run's `build_synth_input.py` + `gen_synth_workflow.py` pair, kept with its intermediates, is the shape to lift; its paths are that run's). (b) At the cost gate, check the account's remaining weekly headroom against the roster's estimate, Phase 2 included (SKILL.md §Cost gate); a run that will not fit waits for the reset rather than being cut by the cap mid-pipeline.
+17. **An anchor-shape drop is silent to the seat.** `cleanSeat` drops a finding whose anchor fails `ANCHOR_RE` and never re-asks, so neither its skeptic nor the synthesis sees it. Measured on the first reify run: 15 of 347 findings dropped for `anchor shape`, 3 of them `high` — Rust method anchors `path.rs::Type::method` (`engine_eval.rs::Engine::eval_cached`, `::Engine::evaluate_let_bindings`, `reify-kernel-occt/src/lib.rs::OcctKernel::execute`), which the grammar's single `::symbol` rejects; the lead recovered them from the journal by hand. `normAnchor` now maps a symbol path after the file onto the class-level form (`::Type::method` → `::Type.method`, in parity with `findings_artefact.py::normalise_anchor`) before the shape check, and `cleanSeat` logs each normalisation; other shape failures are still dropped and listed under `dropped`, so read that list before trusting a seat's count.
