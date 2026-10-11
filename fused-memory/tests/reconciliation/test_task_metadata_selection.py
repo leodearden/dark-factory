@@ -13,8 +13,13 @@ takes ``Iterable[object]``, so such an element is in-contract for it, whereas
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
+import pytest
+
+from fused_memory.reconciliation.curator_gate_resolution_sweep import extract_open_gate_task_ids
+from fused_memory.reconciliation.gate_owned_finding_phrasing import extract_human_gated_task_ids
 from fused_memory.reconciliation.task_filter import FilteredTaskTree
 from fused_memory.reconciliation.task_metadata_selection import select_task_ids_by_metadata
 
@@ -104,3 +109,61 @@ class TestSelectTaskIdsByMetadata:
         """No tasks -> []."""
         assert select_task_ids_by_metadata(FilteredTaskTree().active_tasks, lambda m: True) == []
         assert select_task_ids_by_metadata([], lambda m: True) == []
+
+
+def _gate_rows_with_malformed_shapes() -> list[dict]:
+    """Malformed shapes plus valid rows that BOTH gate predicates match.
+
+    Every valid row carries ``operational_mode == 'gate'``, so the two
+    selectors must return the same ids from it.
+    """
+    return FilteredTaskTree(active_tasks=[
+        'not-a-dict',  # type: ignore[list-item]
+        None,  # type: ignore[list-item]
+        {'id': 1, 'metadata': 'operational_mode=gate'},
+        {'id': 2, 'metadata': ['gate']},
+        {'id': 3, 'metadata': None},
+        {'id': 4},
+        {'id': None, 'metadata': {'operational_mode': 'gate'}},
+        {'metadata': {'operational_mode': 'gate'}},
+        {'id': 5563, 'metadata': {'operational_mode': 'gate'}},
+        {'id': '5561', 'metadata': {'operational_mode': 'gate'}},
+        {'id': 5561, 'metadata': {'operational_mode': 'gate'}},
+    ]).active_tasks
+
+
+_GATE_SELECTORS = pytest.mark.parametrize(
+    'selector',
+    [extract_open_gate_task_ids, extract_human_gated_task_ids],
+    ids=['open_gate', 'human_gated'],
+)
+
+
+class TestGateSelectorsShareTheTraversal:
+    """Both public gate selectors honour the traversal contract pinned above.
+
+    Driven through their public seams with one shared fixture, so each
+    selector's documented "malformed shapes are skipped" contract stays
+    covered without either suite restating it.
+    """
+
+    @_GATE_SELECTORS
+    def test_skips_malformed_shapes_and_returns_sorted_deduped_str_ids(
+        self, selector: Callable[[list[dict]], list[str]],
+    ):
+        """Malformed shapes contribute nothing; int and str ids collapse; the result is sorted."""
+        result = selector(_gate_rows_with_malformed_shapes())
+
+        assert result == ['5561', '5563'], (
+            'malformed elements must be skipped without raising, int and str '
+            'spellings of one id must collapse, and the result must be sorted; '
+            f'got {result!r}'
+        )
+
+    @_GATE_SELECTORS
+    def test_empty_input_returns_empty_list(
+        self, selector: Callable[[list[dict]], list[str]],
+    ):
+        """No active tasks -> []."""
+        assert selector(FilteredTaskTree().active_tasks) == []
+        assert selector([]) == []
