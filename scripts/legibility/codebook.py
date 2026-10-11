@@ -19,7 +19,7 @@ import os
 import re
 import sys
 import tempfile
-from collections.abc import Collection
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,7 +38,7 @@ if (_SHARED_SRC := str(Path(__file__).resolve().parents[2] / "shared" / "src")) 
     sys.path.insert(0, _SHARED_SRC)
 
 from legibility import finding_area, invariants
-from shared.finding_key import KEY_PATTERN
+from shared.finding_key import KEY_PATTERN, is_finding_key
 
 logger = logging.getLogger("legibility.codebook")
 
@@ -114,16 +114,10 @@ _SIGHTING_SCHEMA = {
     "required": ["date", "project", "session", "origin_phase", "manifested_phase"],
 }
 
-# Contract finding identity, run history and ticket fields
-# (plans/census-incremental-prd.md C1; docs/quality-findings-contract.md §1, §2, §8).
+# Contract run history and ticket fields (plans/census-incremental-prd.md C1;
+# docs/quality-findings-contract.md §1, §2, §8). The finding identity fields
+# are checked by finding_identity_errors, not by these schemas.
 _FINDING_KEY_SCHEMA = {"type": "string", "pattern": KEY_PATTERN}
-
-_FINDING_IDENTITY_PROPERTIES = {
-    "finding_key": _FINDING_KEY_SCHEMA,
-    "finding_area": {"type": "string", "pattern": finding_area.AREA_KEY_PATTERN},
-    "finding_anchor": {"type": "string", "minLength": 1},
-    "finding_tags": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
-}
 
 _RUN_ID_SCHEMA = {"type": "string", "minLength": 1}
 
@@ -151,7 +145,6 @@ _ENTRY_SCHEMA = {
         "origin_phase": {"enum": PHASES},
         "manifested_phase": {"enum": PHASES},
         "sightings": {"type": "array", "items": _SIGHTING_SCHEMA},
-        **_FINDING_IDENTITY_PROPERTIES,
         "severity_reason": {"type": "string"},
         "first_seen_run": _RUN_ID_SCHEMA,
         "last_seen_runs": {"type": "array", "items": _RUN_ID_SCHEMA},
@@ -179,7 +172,6 @@ _CANDIDATE_SCHEMA = {
         "first_seen": {"type": "string"},
         "disposition": {"enum": DISPOSITIONS},
         "sightings": {"type": "array", "items": _SIGHTING_SCHEMA},
-        **_FINDING_IDENTITY_PROPERTIES,
         "attached_by": {
             "type": "object",
             "properties": {
@@ -360,6 +352,79 @@ def _schema_errors(instance: dict, schema: dict) -> list[str]:
     return _validate_node(instance, schema, [])
 
 
+FINDING_IDENTITY_FIELDS = ("finding_key", "finding_area", "finding_anchor", "finding_tags")
+
+
+@dataclass(frozen=True)
+class FindingIdentityError:
+    field: str
+    problem: str
+
+    def at(self, location: str) -> str:
+        return f"{location}/{self.field}: {self.problem}"
+
+
+def finding_identity_errors(record: Mapping[str, object]) -> list[FindingIdentityError]:
+    """The finding identity a codebook record carries (contract §1, §2):
+    either none of FINDING_IDENTITY_FIELDS, or all four, holding a §2 key, a
+    plain area key, a §1 anchor and a non-empty list of §1 tags.
+
+    The one statement of that invariant: validate() applies it to every
+    entry and candidate, and census_findings.FindingIdentity to itself.
+    """
+    # verdict owns the §1 anchor and tag vocabulary and imports this module.
+    from legibility import verdict
+
+    present = [field for field in FINDING_IDENTITY_FIELDS if field in record]
+    missing = [field for field in FINDING_IDENTITY_FIELDS if field not in record]
+    if not present:
+        return []
+    if missing:
+        return [
+            FindingIdentityError(
+                field,
+                f"is missing beside {', '.join(present)}: a finding identity is all four fields or none",
+            )
+            for field in missing
+        ]
+    checks: tuple[tuple[str, Callable[[object], bool], str], ...] = (
+        ("finding_key", is_finding_key, "a finding key fk-<12 hex>"),
+        (
+            "finding_area",
+            lambda value: isinstance(value, str) and re.fullmatch(finding_area.AREA_KEY_PATTERN, value) is not None,
+            "a plain area key",
+        ),
+        (
+            "finding_anchor",
+            lambda value: isinstance(value, str) and verdict.is_anchor(value),
+            "a contract §1 anchor: slug:<kebab> or a repo-relative path[::symbol] with no line pin",
+        ),
+        (
+            "finding_tags",
+            lambda value: isinstance(value, (list, tuple))
+            and bool(value)
+            and all(isinstance(tag, str) and verdict.is_finding_tag(tag) for tag in value),
+            "a non-empty list of contract §1 tags",
+        ),
+    )
+    return [
+        FindingIdentityError(field, f"{record[field]!r} is not {expected}")
+        for field, holds, expected in checks
+        if not holds(record[field])
+    ]
+
+
+def _finding_identity_errors_at(records: object, path: str) -> list[str]:
+    if not isinstance(records, list):
+        return []
+    return [
+        error.at(f"{path}/{index}")
+        for index, record in enumerate(records)
+        if isinstance(record, dict)
+        for error in finding_identity_errors(record)
+    ]
+
+
 def validate(codebook: dict) -> list[str]:
     """Structural + semantic validation of a v2 codebook.
 
@@ -367,10 +432,14 @@ def validate(codebook: dict) -> list[str]:
     codebook is valid. Strict on v2-relevant fields (version, entry
     id/title/severity/status, origin_phase/manifested_phase enums, sighting
     shape, candidate id regex + disposition, the optional C1 finding fields,
-    accepted ⇒ accepted_by); permissive on v1 free-form fields (validate()
-    never rejects on their presence, absence, or type).
+    finding_identity_errors, accepted ⇒ accepted_by); permissive on v1
+    free-form fields (validate() never rejects on their presence, absence,
+    or type).
     """
     errors = _schema_errors(codebook, V2_SCHEMA)
+    if isinstance(codebook, dict):
+        errors.extend(_finding_identity_errors_at(codebook.get("entries"), "entries"))
+        errors.extend(_finding_identity_errors_at(codebook.get("candidates"), "candidates"))
 
     entries = codebook.get("entries", []) if isinstance(codebook, dict) else []
     if isinstance(entries, list):

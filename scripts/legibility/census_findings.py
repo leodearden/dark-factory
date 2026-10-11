@@ -6,9 +6,8 @@ from __future__ import annotations
 
 import copy
 import enum
-import re
 import sys
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,41 +18,27 @@ if (_SHARED_SRC := str(Path(__file__).resolve().parents[2] / "shared" / "src")) 
     sys.path.insert(0, _SHARED_SRC)
 
 from legibility import codebook, finding_area, verdict
-from shared.finding_key import finding_key, is_finding_key
+from shared.finding_key import finding_key
 
 
-def _are_tags(tags: object) -> bool:
-    return (
-        isinstance(tags, tuple)
-        and bool(tags)
-        and all(isinstance(tag, str) and verdict.is_finding_tag(tag) for tag in tags)
-    )
-
-
-_IDENTITY_INVARIANTS: tuple[tuple[str, Callable[[object], bool], str], ...] = (
-    ("key", is_finding_key, "a finding key fk-<12 hex>"),
-    (
-        "area",
-        lambda value: isinstance(value, str) and re.fullmatch(finding_area.AREA_KEY_PATTERN, value) is not None,
-        "a plain area key",
-    ),
-    ("anchor", lambda value: isinstance(value, str) and verdict.is_anchor(value), "a contract §1 anchor"),
-    ("tags", _are_tags, "a non-empty tuple of finding tags"),
-)
+def _raise_on(errors: list[codebook.FindingIdentityError], location: str) -> None:
+    if errors:
+        raise ValueError("; ".join(error.at(location) for error in errors))
 
 
 @dataclass(frozen=True)
 class FindingIdentity:
+    """A record's finding identity, held to ``codebook.finding_identity_errors``."""
+
     key: str
     area: str
     anchor: str
     tags: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        for field_name, holds, expected in _IDENTITY_INVARIANTS:
-            value = getattr(self, field_name)
-            if not holds(value):
-                raise ValueError(f"FindingIdentity.{field_name} must be {expected}, got {value!r}")
+        if not isinstance(self.tags, tuple):
+            raise ValueError(f"FindingIdentity/tags must be a tuple, got {self.tags!r}")
+        _raise_on(codebook.finding_identity_errors(self._fields()), "FindingIdentity")
 
     @classmethod
     def mint(cls, area: str, anchor: str, tags: tuple[str, ...]) -> FindingIdentity:
@@ -61,22 +46,26 @@ class FindingIdentity:
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> FindingIdentity | None:
-        if record.get("finding_key") is None:
+        """The identity *record* carries, or None when it carries none.
+
+        Raises ValueError on a partial or malformed identity, which
+        ``codebook.validate`` reports for the same record."""
+        if not any(field in record for field in codebook.FINDING_IDENTITY_FIELDS):
             return None
+        _raise_on(codebook.finding_identity_errors(record), f"record {record.get('id')!r}")
         return cls(
             key=record["finding_key"],
-            area=record.get("finding_area", ""),
-            anchor=record.get("finding_anchor", ""),
-            tags=tuple(record.get("finding_tags") or ()),
+            area=record["finding_area"],
+            anchor=record["finding_anchor"],
+            tags=tuple(record["finding_tags"]),
         )
 
+    def _fields(self) -> dict[str, Any]:
+        values = (self.key, self.area, self.anchor, self.tags)
+        return dict(zip(codebook.FINDING_IDENTITY_FIELDS, values, strict=True))
+
     def to_fields(self) -> dict[str, Any]:
-        return {
-            "finding_key": self.key,
-            "finding_area": self.area,
-            "finding_anchor": self.anchor,
-            "finding_tags": list(self.tags),
-        }
+        return {**self._fields(), "finding_tags": list(self.tags)}
 
 
 def identity_of(found: verdict.Verdict, area_map: finding_area.AreaMap) -> FindingIdentity:

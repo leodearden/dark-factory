@@ -145,6 +145,32 @@ def test_from_record_of_an_unkeyed_record_is_none():
     assert census_findings.FindingIdentity.from_record(_entry("entry-a")) is None
 
 
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {"finding_area": None, "finding_anchor": None, "finding_tags": None},
+        {"finding_anchor": None},
+        {"finding_anchor": "orchestrator/x.py:12"},
+        {"finding_tags": ["h99"]},
+    ],
+)
+def test_from_record_refuses_exactly_the_identities_codebook_validate_rejects(malformed):
+    """One invariant: an identity validate() rejects never reaches a run as a
+    FindingIdentity, and from_record names the record and the field."""
+    record = _keyed_entry()
+    for field, value in malformed.items():
+        if value is None:
+            del record[field]
+        else:
+            record[field] = value
+    errors = codebook.validate({"version": 2, "entries": [record], "candidates": []})
+    assert errors and all(field in " ".join(errors) for field in malformed)
+    with pytest.raises(ValueError) as raised:
+        census_findings.FindingIdentity.from_record(record)
+    assert "entry-a" in str(raised.value)
+    assert all(field in str(raised.value) for field in malformed)
+
+
 def test_to_fields_is_plain_yaml():
     fields = _identity().to_fields()
     assert set(fields) == {"finding_key", "finding_area", "finding_anchor", "finding_tags"}

@@ -2492,3 +2492,37 @@ def test_validate_rejects_a_candidate_adjudicated_with_a_non_candidate_id():
 def test_a_candidates_finding_identity_is_validated_like_an_entrys():
     codebook = _c1_codebook(candidate=_c1_candidate(finding_area="orchestrator/merge-queue"))
     assert _c1_errors_naming(codebook, "candidates/0/finding_area", "orchestrator/merge-queue")
+
+
+_C1_KEY_ONLY_DROPS = ("finding_area", "finding_anchor", "finding_tags")
+
+
+def _key_only(record: dict) -> dict:
+    return {field: value for field, value in record.items() if field not in _C1_KEY_ONLY_DROPS}
+
+
+@pytest.mark.parametrize(
+    "codebook, path",
+    [
+        (_c1_codebook(entry=_key_only(_c1_entry())), "entries/0"),
+        (_c1_codebook(candidate=_key_only(_c1_candidate())), "candidates/0"),
+    ],
+)
+def test_validate_rejects_a_partial_finding_identity(codebook, path):
+    errors = mod.validate(codebook)
+    for missing in _C1_KEY_ONLY_DROPS:
+        assert [error for error in errors if f"{path}/{missing}" in error and "finding_key" in error]
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("finding_anchor", "orchestrator/x.py:12"),
+        ("finding_anchor", "/abs/x.py"),
+        ("finding_tags", ["h99"]),
+        ("finding_tags", ["h13", ""]),
+    ],
+)
+def test_validate_holds_the_identity_to_the_contract_anchor_and_tag_vocabulary(field, value):
+    codebook = _c1_codebook(entry=_c1_entry(**{field: value}))
+    assert _c1_errors_naming(codebook, f"entries/0/{field}", value)
