@@ -1509,7 +1509,7 @@ async def test_drain_by_ids_marks_specific_events(buf):
     await buf.push(e2)
     await buf.push(e3)
 
-    count = await buf.drain_by_ids('test-project', [e1.id, e3.id])
+    count = await buf.drain_by_ids('test-project', [e1.id, e3.id], run_id='R1')
     assert count == 2
 
     # e2 should still be buffered
@@ -1526,7 +1526,7 @@ async def test_drain_by_ids_marks_specific_events(buf):
 async def test_drain_by_ids_empty_list(buf):
     """drain_by_ids with empty list is a no-op."""
     await buf.push(_make_event())
-    count = await buf.drain_by_ids('test-project', [])
+    count = await buf.drain_by_ids('test-project', [], run_id='R1')
     assert count == 0
     assert (await buf.get_buffer_stats('test-project'))['size'] == 1
 
@@ -1539,7 +1539,7 @@ async def test_drain_by_ids_ignores_wrong_project(buf):
     await buf.push(e1)
     await buf.push(e2)
 
-    count = await buf.drain_by_ids('project-a', [e1.id, e2.id])
+    count = await buf.drain_by_ids('project-a', [e1.id, e2.id], run_id='R1')
     # e2 belongs to project-b, so only e1 should be drained
     assert count == 1
     assert (await buf.get_buffer_stats('project-a'))['size'] == 0
@@ -1557,7 +1557,7 @@ async def test_peek_then_drain_by_ids_workflow(buf):
 
     # "Assemble" selects first 3
     selected_ids = [e.id for e in peeked[:3]]
-    count = await buf.drain_by_ids('test-project', selected_ids)
+    count = await buf.drain_by_ids('test-project', selected_ids, run_id='R1')
     assert count == 3
     assert (await buf.get_buffer_stats('test-project'))['size'] == 2
 
@@ -1576,14 +1576,6 @@ async def test_drain_by_ids_stamps_run_id_for_run_scoped_restore(buf):
     assert await buf.restore_drained('test-project', run_id='R1') == 2
     assert await buf.count_buffered('test-project') == 2
     assert [e.id for e in await buf.get_drained_events('test-project', 'R2')] == [e3.id]
-
-    unattributed = _make_event()
-    await buf.push(unattributed)
-    assert await buf.drain_by_ids('test-project', [unattributed.id]) == 1
-    for run_id in ('R1', 'R2'):
-        drained_ids = {e.id for e in await buf.get_drained_events('test-project', run_id)}
-        assert unattributed.id not in drained_ids
-    assert await buf.count_buffered('test-project') == 2
 
 
 # ── _debug_get_deferred_row tests ─────────────────────────────────────
@@ -1904,15 +1896,13 @@ async def test_get_drained_events_reads_run_scoped_without_restoring(buf):
 @pytest.mark.asyncio
 async def test_mark_drained_run_id_attributes_pre_drained_events_to_a_run(buf):
     """mark_drained_run_id lets an already-drained (NULL-attributed) row be
-    retroactively attributed to the run about to process it — used by the
-    BacklogIterator path, which drains events via drain_by_ids() before
-    run_full_cycle mints a run_id."""
+    retroactively attributed to the run about to process it — run_full_cycle's
+    attribution of caller-supplied events."""
     events = [_make_event() for _ in range(4)]
     for e in events:
         await buf.push(e)
 
-    # drain() with no run_id — rows land 'drained' with NULL drained_by_run_id,
-    # mirroring drain_by_ids()'s pre-existing (unattributed) behaviour.
+    # drain() with no run_id — rows land 'drained' with NULL drained_by_run_id.
     drained = await buf.drain('test-project')
     assert len(drained) == 4
     id1, id2, id3, id4 = (e.id for e in events)

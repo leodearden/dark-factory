@@ -639,14 +639,15 @@ class EventBuffer:
         ]
 
     async def drain_by_ids(
-        self, project_id: str, ids: list[str], run_id: str | None = None,
+        self, project_id: str, ids: list[str], run_id: str,
     ) -> int:
-        """Mark specific event IDs as drained.
+        """Mark specific event IDs as drained by run *run_id*.
 
         Used after the ContextAssembler determines which events fit the
-        token budget.  Returns the number of rows updated.  Like ``drain``,
-        a ``run_id`` is stamped as ``drained_by_run_id`` so a later
-        run-scoped ``restore_drained`` can target exactly this chunk.
+        token budget.  Returns the number of rows updated.  *run_id* is
+        stamped as ``drained_by_run_id`` so a later run-scoped
+        ``restore_drained`` can target exactly this chunk; it is required so
+        this path can never leave an unattributed row (task 6453).
         """
         if not ids:
             return 0
@@ -680,14 +681,14 @@ class EventBuffer:
         ``include_unattributed`` additionally restores rows with
         ``drained_by_run_id IS NULL``. This closes the upgrade-boundary gap
         where events drained by a pre-task-2711 process carry no run
-        attribution: since every production drain path
-        (``drain`` from ``run_full_cycle``, ``drain_by_ids`` from
-        ``BacklogIterator``, task 6453) stamps ``drained_by_run_id`` as it
-        drains, a NULL row can only be left over from a process that no longer
-        exists by the time a recovery pass runs, so it is provably safe to
-        fold into a *specific* run's recovery without reintroducing the
-        concurrent-run clobber the run scoping was added to prevent (task 2711
-        amendment, reviewer finding).
+        attribution: since every production drain path stamps
+        ``drained_by_run_id`` as it drains (``drain_by_ids`` requires a
+        ``run_id``, and ``run_full_cycle``, ``drain``'s only production
+        caller, always passes one; task 6453), a NULL row can only be left
+        over from a process that no longer exists by the time a recovery pass
+        runs, so it is provably safe to fold into a *specific* run's recovery
+        without reintroducing the concurrent-run clobber the run scoping was
+        added to prevent (task 2711 amendment, reviewer finding).
         Callers that need the exact-match-only contract (e.g. one caller's
         ``mark_drained_run_id`` attribution racing another's) must keep the
         default ``False``.
