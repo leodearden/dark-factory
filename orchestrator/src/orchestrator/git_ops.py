@@ -9392,12 +9392,17 @@ class GitOps:
         newly introduces is unstaged before committing (see
         ``orchestrator/src/orchestrator/staged_gitlinks.py``), while a
         registered submodule's pointer bump passes through.
+        ``--ignore-errors`` keeps one commit-less embedded repo (exit 128,
+        "does not have a commit checked out") from aborting the whole
+        ``git add`` and silently leaving the real WIP unstaged.
         """
         conflicted = await self._detect_unmerged_paths(worktree)
         if conflicted:
             raise WorktreeConflictError(worktree, conflicted)
 
-        await _run(['git', 'add', '-A', '--', '.', ':!.claude'], cwd=worktree)
+        await _run(
+            ['git', 'add', '-A', '--ignore-errors', '--', '.', ':!.claude'], cwd=worktree,
+        )
         await self._unstage_new_gitlinks(worktree)
 
         # Check for changes
