@@ -49,8 +49,10 @@ mining sightings/candidates merge through the EXISTING
 ``codebook.apply_coding_record``. Census-only lifecycle transitions
 (promote/reject/retire) are deterministic in-memory transforms in this
 module, persisted via ``codebook.dump()`` after ``codebook.validate()``
-and ``codebook.assert_no_deletion()`` confirm the write is safe.
-``codebook.py`` itself is NOT modified.
+and ``codebook.assert_no_deletion()`` confirm the write is safe. The
+contract finding fields those transforms stamp (finding identity, run
+history) are defined in ``codebook.py``'s schema and minted by
+``census_findings.py``.
 """
 from __future__ import annotations
 
@@ -109,6 +111,7 @@ import codebook  # noqa: E402
 import coder  # noqa: E402
 import filing_policy  # noqa: E402
 from legibility import (  # noqa: E402
+    census_findings,
     census_identity,
     census_trigger,
     census_window,
@@ -823,6 +826,7 @@ def build_task_payloads(
     *,
     project_root: str,
     project_id: str,
+    run_id: str,
     harness: filing_policy.ProjectRef | None = None,
 ) -> list[dict]:
     """Map each verified cluster to one curator-path ``submit_task`` kwarg
@@ -838,6 +842,13 @@ def build_task_payloads(
     ``metadata.x_fix_surface``, and ``metadata.origin_project_id`` always names
     the observed project.
 
+    Every payload names its run under ``metadata.x_finding_run``, and a cluster
+    carrying a ``finding`` identity names its key under
+    ``metadata.x_finding_key`` (quality-findings contract §8);
+    ``x_supersedes_task`` arrives with the dedup protocol's step 1c
+    (plans/census-incremental-prd.md L4). ``priority`` is the cluster's
+    severity (contract §4).
+
     ``title`` and ``description`` pass through
     ``shared.toolcall_markup::escape_envelope_literals`` because cluster
     evidence may QUOTE tool-call envelope literals, which the boundary
@@ -850,7 +861,14 @@ def build_task_payloads(
     payloads = []
     for cluster in clusters:
         target = filing_policy.resolve_target(cluster, observed=observed, harness=harness)
-        metadata: dict = {"source": "legibility_census", "origin_project_id": project_id}
+        metadata: dict = {
+            "source": "legibility_census",
+            "origin_project_id": project_id,
+            "x_finding_run": run_id,
+        }
+        finding = cluster.get("finding")
+        if finding is not None:
+            metadata["x_finding_key"] = finding.key
         if target.fix_surface:
             metadata["x_fix_surface"] = [
                 {"component": match.component, "evidence": match.evidence}
@@ -865,7 +883,7 @@ def build_task_payloads(
                     _cluster_description(cluster, observed_project_id=project_id)
                 ),
                 "task_kind": "normal",
-                "priority": cluster.get("priority", "medium"),
+                "priority": cluster.get("severity", verdict_mod.DEFAULT_SEVERITY),
                 "metadata": metadata,
             }
         )
@@ -894,8 +912,7 @@ def _ticket_id_from_submit_result(result) -> str | None:
 # ---------------------------------------------------------------------------
 # promote_candidate / reject_candidate / retire_entry / mark_entry_filed —
 # census-only codebook lifecycle transforms (PRD decision 1: deterministic, in-memory,
-# reuse gamma's validator + never-delete assertion + sole-writer dump;
-# codebook.py itself is NOT modified)
+# reuse gamma's validator + never-delete assertion + sole-writer dump)
 # ---------------------------------------------------------------------------
 
 def _find_by_id(items: list[dict], item_id: str, *, kind: str) -> dict:
@@ -1145,6 +1162,7 @@ SECTION_VERIFICATION = "verification"
 SECTION_UNRESOLVED_VERDICTS = "unresolved-verdicts"
 SECTION_MATRIX = "matrix"
 SECTION_SYNTHESIS = "synthesis"
+SECTION_FINDINGS = "findings"
 SECTION_FILED_TASKS = "filed-tasks"
 SECTION_WITHHELD = "withheld-clusters"
 SECTION_COST = "cost"
@@ -1320,10 +1338,14 @@ def build_census_record(
     mass_rejection: MassRejection | None = None,
     withheld: tuple[filing_policy.WithheldCluster, ...] = (),
     cross_project_tickets: tuple[CrossProjectTicket, ...] = (),
+    findings: Sequence[Mapping[str, Any]] = (),
+    area_map: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The run's JSON record: everything :func:`census_report_sections`
     renders, as plain JSON-safe values. The mining records themselves are
-    not carried; the codebook holds what they merged."""
+    not carried; the codebook holds what they merged. *findings* are the
+    contract §1 rows (``census_findings.FindingRow.to_record``) and
+    *area_map* the ``finding_area.AreaMap.to_record`` that keyed them."""
     return {
         "record_version": CENSUS_RECORD_VERSION,
         "run_id": method["run_id"],
@@ -1345,12 +1367,64 @@ def build_census_record(
         "cross_project_tickets": [asdict(ticket) for ticket in cross_project_tickets],
         "dry_run": _optional_asdict(dry_run),
         "withheld": [asdict(cluster) for cluster in withheld],
+        "findings": [dict(row) for row in findings],
+        "area_map": None if area_map is None else dict(area_map),
         "cost_note": cost_note,
     }
 
 
 def _from_record(cls, value: Mapping[str, Any] | None):
     return cls(**value) if value is not None else None
+
+
+def _finding_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    text = ", ".join(str(item) for item in value) if isinstance(value, list) else str(value)
+    return " ".join(text.split()).replace("|", "\\|")
+
+
+def _finding_table_row(cells: Sequence[str]) -> str:
+    return "| " + " | ".join(cells) + " |"
+
+
+def _area_map_lines(area_map: Mapping[str, Any] | None) -> list[str]:
+    if area_map is None:
+        return []
+    rules = ", ".join(f"`{glob}` → `{area}`" for glob, area in area_map["rules"]) or "none"
+    summary = (
+        f"- area map: briefing {area_map['briefing'] or 'none'}; "
+        f"areas {', '.join(area_map['areas'])}; overlay {area_map['overlay'] or 'none'}; "
+        f"rules {rules}"
+    )
+    return [summary, *(f"- area map note: {note}" for note in area_map["notes"])]
+
+
+def _unverified_lines(findings: Sequence[Mapping[str, Any]]) -> list[str]:
+    unverified = sum(
+        1 for row in findings if row["verdict"] == census_findings.FindingVerdict.UNVERIFIED
+    )
+    if not unverified:
+        return []
+    return [
+        f"- {unverified} re-observed finding(s) are unverified: the census does not "
+        "re-verify a catalogued finding, so a sighting this run only appends to its last_seen."
+    ]
+
+
+def _findings_lines(record: Mapping[str, Any]) -> list[str]:
+    findings = record["findings"]
+    notes = [*_area_map_lines(record["area_map"]), *_unverified_lines(findings)]
+    lines = ["", "## Findings", "", *notes, *([""] if notes else [])]
+    if not findings:
+        return [*lines, "_no findings touched this run._"]
+    columns = census_findings.FINDING_ROW_FIELDS
+    return [
+        *lines,
+        _finding_table_row(columns),
+        _finding_table_row(["---"] * len(columns)),
+        *(_finding_table_row([_finding_cell(row[column]) for column in columns]) for row in findings),
+    ]
 
 
 def census_report_sections(record: Mapping[str, Any]) -> tuple[ReportSection, ...]:
@@ -1553,6 +1627,8 @@ def census_report_sections(record: Mapping[str, Any]) -> tuple[ReportSection, ..
         SECTION_SYNTHESIS,
         ["## Synthesis", "", SYNTHESIS_NOT_APPLIED_NOTICE, "", record["synthesis_md"]],
     )
+
+    emit(SECTION_FINDINGS, _findings_lines(record))
 
     filed_tasks = ["", "## Filed Tasks", ""]
     if dry_run is not None:
@@ -2902,7 +2978,8 @@ def run_census(
     filing_queue = _filing_queue(fileable, updated_codebook)
     task_payloads = build_task_payloads(
         [pending.cluster for pending in filing_queue],
-        project_root=project_root, project_id=project_id, harness=harness_project,
+        project_root=project_root, project_id=project_id, run_id=run_id,
+        harness=harness_project,
     )
     filed_ticket_ids = []
     cross_project_tickets: list[CrossProjectTicket] = []

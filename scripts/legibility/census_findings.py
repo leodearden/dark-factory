@@ -124,6 +124,26 @@ def mark_seen(cb: dict, *, run_id: str, sessions: Collection[str]) -> tuple[dict
     return result, tuple(sighted)
 
 
+FINDING_ROW_FIELDS = (
+    "id",
+    "key",
+    "area",
+    "sub_area",
+    "anchor",
+    "tags",
+    "severity",
+    "evidence_source",
+    "statement",
+    "proposal",
+    "verdict",
+    "disposition",
+    "first_seen",
+    "last_seen",
+    "supersedes",
+)
+"""The keys of :meth:`FindingRow.to_record`, in order: the display id, then contract §1's fields."""
+
+
 class FindingVerdict(enum.StrEnum):
     CONFIRMED = "confirmed"
     REFUTED = "refuted"

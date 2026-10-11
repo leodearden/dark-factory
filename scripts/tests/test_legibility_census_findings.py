@@ -282,3 +282,9 @@ def test_a_row_falls_back_to_the_title_when_there_is_no_cause():
     entry = _keyed_entry()
     record = census_findings.observed_row(entry, None).to_record()
     assert entry["title"] in record["statement"]
+
+
+def test_a_rows_record_keys_are_the_published_row_fields_in_order():
+    record = census_findings.observed_row(_keyed_entry(), "c").to_record()
+    assert tuple(record) == census_findings.FINDING_ROW_FIELDS
+    assert ("id", *check_census_report.FINDING_FIELDS) == census_findings.FINDING_ROW_FIELDS
