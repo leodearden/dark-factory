@@ -753,7 +753,7 @@ def _fused_memory_liveness_verdict() -> str:
     return "wedged"
 
 
-def restart_unit(unit: str) -> list[str]:
+def restart_unit(unit: str) -> tuple[str, ...]:
     """Revive *unit* via ``systemctl --user reset-failed`` then ``restart --no-block``.
 
     NEVER STOPS THE UNIT. Each service unit gets
@@ -789,7 +789,7 @@ def restart_unit(unit: str) -> list[str]:
     restart phase still runs after a reset-failed timeout.
 
     Returns the names of the phases whose systemctl invocation exceeded its
-    budget (``[]`` when every phase returned in time). A timeout here is the
+    budget (``()`` when every phase returned in time). A timeout here is the
     watchdog's own subprocess budget expiring, not evidence about what systemd
     did, so callers pass the result to ``_log_restart_outcome`` to keep their
     closing line from reading as an unqualified success.
@@ -815,10 +815,10 @@ def restart_unit(unit: str) -> list[str]:
     except subprocess.TimeoutExpired:
         timed_out.append("restart")
         log(f"systemctl restart --no-block {unit} timed out after 45s")
-    return timed_out
+    return tuple(timed_out)
 
 
-def _log_restart_outcome(unit: str, timed_out_phases: list[str] | None) -> None:
+def _log_restart_outcome(unit: str, timed_out_phases: tuple[str, ...]) -> None:
     """Close a ``restart_unit`` call with a line that names what was observed.
 
     Clean run: ``<unit> restart issued``. Any phase timeout: the line says so

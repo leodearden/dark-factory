@@ -451,7 +451,7 @@ def test_restart_unit_handles_restart_timeout(monkeypatch: pytest.MonkeyPatch) -
     timed_out = wdog.restart_unit("orchestrator-dark-factory.service")
 
     assert len(log_messages) >= 1, "restart timeout must be logged via log()"
-    assert timed_out == ["restart"]
+    assert timed_out == ("restart",)
 
 
 def test_restart_unit_reports_no_timed_out_phases_when_clean(
@@ -461,7 +461,7 @@ def test_restart_unit_reports_no_timed_out_phases_when_clean(
     monkeypatch.setattr(
         subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "", "")
     )
-    assert wdog.restart_unit("fused-memory.service") == []
+    assert wdog.restart_unit("fused-memory.service") == ()
 
 
 def test_restart_unit_reports_every_timed_out_phase(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -473,7 +473,7 @@ def test_restart_unit_reports_every_timed_out_phase(monkeypatch: pytest.MonkeyPa
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    assert wdog.restart_unit("fused-memory.service") == ["reset-failed", "restart"]
+    assert wdog.restart_unit("fused-memory.service") == ("reset-failed", "restart")
 
 
 def test_log_restart_outcome_plain_when_no_phase_timed_out(
@@ -482,7 +482,7 @@ def test_log_restart_outcome_plain_when_no_phase_timed_out(
     wdog = _load_watchdog()
     messages: list[str] = []
     monkeypatch.setattr(wdog, "log", messages.append)
-    wdog._log_restart_outcome("fused-memory.service", [])
+    wdog._log_restart_outcome("fused-memory.service", ())
     assert messages == ["fused-memory.service restart issued"]
 
 
@@ -492,11 +492,52 @@ def test_log_restart_outcome_qualifies_success_when_phases_timed_out(
     wdog = _load_watchdog()
     messages: list[str] = []
     monkeypatch.setattr(wdog, "log", messages.append)
-    wdog._log_restart_outcome("fused-memory.service", ["reset-failed", "restart"])
+    wdog._log_restart_outcome("fused-memory.service", ("reset-failed", "restart"))
     (line,) = messages
     assert "reset-failed, restart" in line
     assert "timed out" in line
     assert "unconfirmed" in line
+
+
+def _assert_restart_closed_unconfirmed(logged: list[str], unit: str) -> None:
+    """The caller's closing line is _log_restart_outcome's, not a bare 'issued'."""
+    assert f"{unit} restart issued" not in logged, (
+        f"a timed-out restart must not close with the unqualified line: {logged}"
+    )
+    closing = [m for m in logged if m.startswith(f"{unit} restart issued")]
+    assert len(closing) == 1, f"expected one closing line for {unit}: {logged}"
+    assert "unconfirmed" in closing[0]
+
+
+def test_main_closes_a_timed_out_restart_as_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    _wire_liveness_probe(wdog, monkeypatch, down_port=_DF_PORT)
+    monkeypatch.setattr(wdog, "FLEET_LEASE_PATH", str(tmp_path / "absent-lease.json"))
+    monkeypatch.setattr(wdog, "restart_unit", lambda _u: ("restart",))
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", logged.append)
+
+    wdog.main()
+
+    _assert_restart_closed_unconfirmed(logged, _DF_UNIT)
+
+
+def test_liveness_pass_closes_a_timed_out_restart_as_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    threshold = wdog.FM_LIVENESS_STREAK_THRESHOLD
+    _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"] * threshold)
+    monkeypatch.setattr(wdog, "restart_unit", lambda _u: ("restart",))
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", logged.append)
+
+    for _ in range(threshold):
+        wdog.fused_memory_liveness_pass()
+
+    _assert_restart_closed_unconfirmed(logged, wdog.FUSED_MEMORY_UNIT)
 
 
 # ---------------------------------------------------------------------------
