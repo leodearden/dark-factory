@@ -117,7 +117,10 @@ instrument-specific ones outside a `extra:` map:
 - `inputs_consumed`: the `run_id` of every other instrument's report this
   run read (§9).
 
-Report homes: `/review` → `review/reports/` (tracked, not gitignored);
+Report homes: `/review` → `review/reports/` (tracked, not gitignored:
+every run record and rendering there is committed; files left there by
+the pre-contract format carry no `as_of_sha`, are not reports, and may
+stay gitignored — `skills/review/SKILL.md` names them);
 `/hotspot-survey` and `/review-all` → the project's plans directory;
 `/census` → the project's plans directory plus
 `docs/legibility/confusion-codebook.yaml`, whose entries carry the
