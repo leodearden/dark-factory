@@ -70,6 +70,7 @@ PURE_STDLIB_LEAVES = (
     'locking',
     'mcp_envelope',
     'mcp_idempotency',
+    'merge_subject',
     'neutral_cwd',
     'proc_group',
     'process_identity',
