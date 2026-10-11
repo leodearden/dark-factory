@@ -443,6 +443,19 @@ def _plant_repo(root: Path, paths: list[str], *, gitlinks: list[str] | None = No
     return root
 
 
+def _track_non_utf8_path(repo: Path) -> None:
+    """Track a file in *repo* whose NAME is bytes that are not valid UTF-8.
+
+    ``.py`` is an allowlisted extension, so only a decode problem, never a
+    finding, can change the outcome of a sweep over this repo.
+    """
+    name = b'caf\xe9.py'  # 0xE9 is Latin-1 é; a lone 0xE9 is invalid UTF-8
+    with open(os.fsencode(repo) + b'/' + name, 'wb') as fh:
+        fh.write(b'x\n')
+    # `ls-files -z` suppresses git's quoting, so these raw bytes reach the decoder.
+    subprocess.run(['git', '-C', str(repo), 'add', '--', name], check=True, capture_output=True)
+
+
 class TestCheckCorpus:
     """``check_corpus(reify_repo)`` — every tracked path must classify as a file."""
 
@@ -597,6 +610,34 @@ class TestTrackedPaths:
         report = drift.check_corpus(repo)
 
         assert report['exit_code'] == drift.EXIT_UNAVAILABLE, report
+
+    def test_non_utf8_tracked_path_raises_guard_unavailable(self, tmp_path):
+        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
+        _track_non_utf8_path(repo)
+
+        with pytest.raises(drift.GuardUnavailable):
+            drift.tracked_paths(repo)
+
+    def test_non_utf8_tracked_path_exits_unavailable_never_drift(self, tmp_path):
+        """An escaping UnicodeDecodeError exits 1, which this script's own contract
+        reads as DRIFT: could-not-look reported as a finding."""
+        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
+        _track_non_utf8_path(repo)
+        _plant_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
+
+        env = {k: v for k, v in os.environ.items() if k != 'REIFY_ROOT'}
+        proc = subprocess.run(
+            [sys.executable, drift.__file__, '--reify-repo', str(repo)],
+            capture_output=True,
+            text=True,
+            cwd=str(Path(drift.__file__).parent),
+            env=env,
+            timeout=60,
+        )
+
+        assert proc.returncode == drift.EXIT_UNAVAILABLE, proc.stderr
+        assert proc.returncode != drift.EXIT_DRIFT
+        assert 'Traceback' not in proc.stderr
 
 
 class TestCheckComposition:
