@@ -74,6 +74,7 @@ from pathlib import Path
 from types import MappingProxyType, ModuleType
 from typing import TYPE_CHECKING
 
+import _checkout as _checkout
 from inline_suppression_classify import (
     Classification,
     Classified,

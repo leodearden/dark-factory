@@ -1062,6 +1062,8 @@ _WIRED_FILES = (
     'scripts/merge_lane_metrics.py',
     'scripts/source_measures.py',
     'scripts/check_staged_ratchet_raise.py',
+    'scripts/_checkout.py',
+    'pyproject.toml',
 )
 
 
