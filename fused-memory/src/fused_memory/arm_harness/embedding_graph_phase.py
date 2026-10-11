@@ -121,7 +121,7 @@ async def run_graph_phase(
 ) -> GraphPhase:
     name = arm.scratch_group_id
     reference, frozen = await _require_frozen_reference(arm, client, probe_set.reference)
-    await copy_reference_graph(client, probe_set.reference.graph, name)
+    await copy_reference_graph(client, probe_set.reference.graph, name, sleep=sleep)
     graph = client.select_graph(name)
     await adopt_group_id(graph, name)
     reembed = await reembed_graph(graph, name, embedder)
