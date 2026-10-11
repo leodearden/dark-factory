@@ -19,6 +19,8 @@ from fused_memory.models.reconciliation import (
     Watermark,
 )
 from fused_memory.reconciliation.context_assembler import (
+    _MEMORY_BODY_CHARS,
+    _TASK_DESC_CHARS,
     ContextAssembler,
     _format_task,  # Intentional private-API coupling: targeted unit coverage of
     #                the display_id parameter that the integration tests alone
@@ -26,6 +28,7 @@ from fused_memory.reconciliation.context_assembler import (
     estimate_tokens,
     format_event,
 )
+from fused_memory.utils.clip_disclosure import elision_marker
 
 
 def _make_event(
@@ -739,6 +742,65 @@ def test_format_task_no_display_id_uses_task_id_field():
     }
     result = _format_task(task)
     assert '[task:42]' in result
+
+
+def _desc_line(rendered: str) -> str:
+    return next(line for line in rendered.splitlines() if line.startswith('  desc: '))
+
+
+def test_format_task_discloses_a_clipped_description():
+    desc = 'd' * _TASK_DESC_CHARS + 'tail of the description'
+    task = {'id': '7', 'title': 'Long', 'status': 'done', 'dependencies': [], 'description': desc}
+
+    line = _desc_line(_format_task(task))
+
+    assert line == f'  desc: {desc[:_TASK_DESC_CHARS]}{elision_marker(len(desc) - _TASK_DESC_CHARS)}'
+
+
+def test_format_task_leaves_a_short_description_unmarked():
+    desc = 'd' * _TASK_DESC_CHARS
+    task = {'id': '7', 'title': 'Short', 'status': 'done', 'dependencies': [], 'description': desc}
+
+    assert _desc_line(_format_task(task)) == f'  desc: {desc}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('overflow', [0, 1, 900])
+async def test_memory_context_discloses_a_clipped_body(mock_memory, overflow):
+    body = 'm' * (_MEMORY_BODY_CHARS + overflow)
+    memory = _make_memory_result(content=body)
+    mock_memory.search = AsyncMock(return_value=[memory])
+    assembler = _make_assembler(memory_service=mock_memory)
+    events = [_make_event(payload={'content_preview': 'anything'})]
+
+    result = await assembler.assemble(events, _make_watermark(), 'test-project')
+
+    rendered_body = result.context_items[memory.id].formatted.split('): ', 1)[1]
+    marker = elision_marker(overflow) if overflow else ''
+    assert rendered_body == body[:_MEMORY_BODY_CHARS] + marker
+
+
+@pytest.mark.asyncio
+async def test_assembled_task_context_carries_the_elision_markers(mock_memory, mock_taskmaster):
+    """The formatted strings are what Stages 1/2/3 read verbatim, so the marker must reach them."""
+    desc = 'x' * (_TASK_DESC_CHARS + 40)
+    mock_taskmaster.get_task = AsyncMock(return_value={
+        'id': '42', 'title': 'Long task', 'status': 'done', 'dependencies': [],
+        'description': desc,
+        'metadata': {'memory_hints': {'queries': ['long hint']}},
+    })
+    hinted = _make_memory_result(content='y' * (_MEMORY_BODY_CHARS + 60))
+    mock_memory.search = AsyncMock(return_value=[hinted])
+    assembler = _make_assembler(memory_service=mock_memory, taskmaster=mock_taskmaster)
+    events = [_make_event(
+        event_type=EventType.task_status_changed,
+        payload={'task_id': '42', 'old_status': 'in-progress', 'new_status': 'done'},
+    )]
+
+    result = await assembler.assemble(events, _make_watermark(), 'test-project')
+
+    assert result.context_items['task:42'].formatted.endswith(elision_marker(40))
+    assert result.context_items[hinted.id].formatted.endswith(elision_marker(60))
 
 
 # ── _ctx_task_event subtask qualification ────────────────────────────
