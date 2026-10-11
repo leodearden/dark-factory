@@ -7,6 +7,7 @@ Contract: plans/review-all-s14-shared-leaves-prd.md, decision 11, invariant I7
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Hashable
 
 import pytest
 
@@ -73,6 +74,59 @@ def test_rejects_a_threshold_that_could_never_fire(bad):
 
 def test_accepts_threshold_one():
     assert KeyedStreaks(threshold=1).failure('k') == StreakStep(1, True)
+
+
+def test_tuple_keys_are_independent_per_component():
+    streaks: KeyedStreaks[tuple[str, str]] = KeyedStreaks(threshold=2)
+    first, second = ('task-1', 'dep-a'), ('task-1', 'dep-b')
+
+    assert [streaks.failure(first) for _ in range(2)] == [
+        StreakStep(1, False),
+        StreakStep(2, True),
+    ]
+    assert streaks.count(second) == 0
+    assert streaks.failure(second) == StreakStep(1, False)
+
+
+def test_str_and_tuple_keys_do_not_collide():
+    streaks: KeyedStreaks[Hashable] = KeyedStreaks(threshold=3)
+
+    streaks.failure('a')
+    streaks.failure(('a',))
+    streaks.failure(('a',))
+
+    assert streaks.count('a') == 1
+    assert streaks.count(('a',)) == 2
+
+
+def test_success_resets_only_its_own_key():
+    streaks: KeyedStreaks[str] = KeyedStreaks(threshold=5)
+    for _ in range(2):
+        streaks.failure('a')
+        streaks.failure('b')
+
+    streaks.success('a')
+
+    assert streaks.count('a') == 0
+    assert streaks.count('b') == 2
+    assert streaks.failure('b') == StreakStep(3, False)
+
+
+def test_tracked_keys_holds_only_keys_in_a_failure_run():
+    streaks: KeyedStreaks[Hashable] = KeyedStreaks(threshold=3)
+    assert streaks.tracked_keys == frozenset()
+
+    streaks.failure('a')
+    streaks.failure(('b', 1))
+    assert streaks.tracked_keys == frozenset({'a', ('b', 1)})
+
+    streaks.count('never')
+    assert 'never' not in streaks.tracked_keys
+
+    streaks.success('a')
+    snapshot = streaks.tracked_keys
+    assert snapshot == frozenset({('b', 1)})
+    assert isinstance(snapshot, frozenset)
 
 
 @pytest.mark.parametrize('field', ['count', 'fired'])
