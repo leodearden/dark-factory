@@ -19,6 +19,7 @@ import contextlib
 import functools
 import json
 import logging
+import re
 import subprocess
 from datetime import UTC, datetime, time, timedelta
 from typing import Any
@@ -32,10 +33,12 @@ import pytest
 import yaml
 from legibility import (
     account_pool,
+    census_findings,
     census_identity,
     census_trigger,
     census_window,
     check_census_report,
+    finding_area,
     invariants,
     session_ledger,
     session_runner,
@@ -727,10 +730,14 @@ def _verified_cluster(**overrides):
     return cluster
 
 
+_PAYLOAD_RUN_ID = "census-dark_factory-20260714"
+
+
 def test_build_task_payloads_one_payload_per_cluster_curator_path():
     clusters = [_verified_cluster(title="Cluster A"), _verified_cluster(title="Cluster B")]
     payloads = mod.build_task_payloads(
         clusters, project_root="/home/leo/src/some-project", project_id="some_project",
+        run_id=_PAYLOAD_RUN_ID,
     )
 
     assert len(payloads) == 2
@@ -746,14 +753,18 @@ def test_build_task_payloads_title_and_description_sourced_from_cluster():
     cluster = _verified_cluster(
         title="A specific novel cause", summary="A precise factual summary of what happened.",
     )
-    payloads = mod.build_task_payloads([cluster], project_root="/root", project_id="proj")
+    payloads = mod.build_task_payloads(
+        [cluster], project_root="/root", project_id="proj", run_id=_PAYLOAD_RUN_ID,
+    )
     assert "A specific novel cause" in payloads[0]["title"]
     assert "A precise factual summary of what happened." in payloads[0]["description"]
 
 
 def test_build_task_payloads_description_has_no_prose_routing_intent():
     clusters = [_verified_cluster()]
-    payloads = mod.build_task_payloads(clusters, project_root="/root", project_id="proj")
+    payloads = mod.build_task_payloads(
+        clusters, project_root="/root", project_id="proj", run_id=_PAYLOAD_RUN_ID,
+    )
     description = payloads[0]["description"].lower()
     for banned_phrase in ("file this into", "route to", "planning_mode"):
         assert banned_phrase not in description
@@ -769,6 +780,7 @@ def test_build_task_payloads_harness_rooted_cause_can_target_dark_factory():
     ]
     payloads = mod.build_task_payloads(
         clusters, project_root="/home/leo/src/hosted-project", project_id="hosted_project",
+        run_id=_PAYLOAD_RUN_ID,
     )
     assert payloads[0]["project_root"] == "/home/leo/src/dark-factory"
 
@@ -786,6 +798,7 @@ def test_build_task_payloads_partial_target_override_falls_back_to_own_project()
     ]
     payloads = mod.build_task_payloads(
         only_root, project_root="/home/leo/src/hosted-project", project_id="hosted_project",
+        run_id=_PAYLOAD_RUN_ID,
     )
     assert payloads[0]["project_root"] == "/home/leo/src/hosted-project", (
         "a lone target_project_root override must be ignored, never mixed with the "
@@ -796,6 +809,7 @@ def test_build_task_payloads_partial_target_override_falls_back_to_own_project()
     only_id = [_verified_cluster(title="Only id override", target_project_id="dark_factory")]
     payloads = mod.build_task_payloads(
         only_id, project_root="/home/leo/src/hosted-project", project_id="hosted_project",
+        run_id=_PAYLOAD_RUN_ID,
     )
     assert payloads[0]["project_root"] == "/home/leo/src/hosted-project", (
         "a lone target_project_id override must be ignored, never mixed with the "
@@ -842,6 +856,7 @@ _REIFY_7909_SHAPED = _verified_cluster(
 def _reify_payloads(clusters, *, harness: filing_policy.ProjectRef | None = _HARNESS):
     return mod.build_task_payloads(
         clusters, project_root=_REIFY_ROOT, project_id="reify", harness=harness,
+        run_id=_PAYLOAD_RUN_ID,
     )
 
 
@@ -885,8 +900,60 @@ def test_remediated_payload_stays_observed_and_describes_the_remediation():
 
 def test_build_task_payloads_without_harness_targets_the_observed_project():
     clusters = [param.values[0] for param in _MISFILED_INTO_REIFY]
-    payloads = mod.build_task_payloads(clusters, project_root=_REIFY_ROOT, project_id="reify")
+    payloads = mod.build_task_payloads(
+        clusters, project_root=_REIFY_ROOT, project_id="reify", run_id=_PAYLOAD_RUN_ID,
+    )
     assert [payload["project_root"] for payload in payloads] == [_REIFY_ROOT] * len(clusters)
+
+
+# ---------------------------------------------------------------------------
+# task 6402 step-9: RED — payload metadata names the run and the finding key
+# (contract §8), and priority is the cluster's severity (contract §4).
+# ---------------------------------------------------------------------------
+
+def _keyed_cluster(**overrides):
+    identity = census_findings.FindingIdentity.mint(
+        "orchestrator", "orchestrator/x.py::f", ("h13", verdict.KIND_TAG),
+    )
+    return _verified_cluster(finding=identity, **overrides)
+
+
+def _single_payload(cluster):
+    [payload] = mod.build_task_payloads(
+        [cluster], project_root="/root", project_id="proj", run_id=_PAYLOAD_RUN_ID,
+    )
+    return payload
+
+
+def test_build_task_payloads_names_the_run_on_every_payload():
+    payloads = mod.build_task_payloads(
+        [_verified_cluster(), _keyed_cluster()], project_root="/root", project_id="proj",
+        run_id=_PAYLOAD_RUN_ID,
+    )
+    for payload in payloads:
+        assert payload["metadata"]["x_finding_run"] == _PAYLOAD_RUN_ID
+        assert payload["metadata"]["source"] == "legibility_census"
+        assert payload["metadata"]["origin_project_id"] == "proj"
+
+
+def test_build_task_payloads_names_a_keyed_clusters_finding_key():
+    cluster = _keyed_cluster()
+    assert _single_payload(cluster)["metadata"]["x_finding_key"] == cluster["finding"].key
+
+
+def test_build_task_payloads_omits_the_finding_key_of_an_unkeyed_cluster():
+    assert "x_finding_key" not in _single_payload(_verified_cluster())["metadata"]
+
+
+@pytest.mark.parametrize("severity", ["high", "low"])
+def test_build_task_payloads_priority_is_the_clusters_severity(severity):
+    assert _single_payload(_verified_cluster(severity=severity))["priority"] == severity
+
+
+def test_build_task_payloads_priority_defaults_to_the_default_severity():
+    cluster = _verified_cluster()
+    del cluster["severity"]
+    assert _single_payload(cluster)["priority"] == verdict.DEFAULT_SEVERITY
 
 
 # ---------------------------------------------------------------------------
@@ -1302,6 +1369,7 @@ def test_render_report_carries_each_piece_in_its_own_section():
         mod.SECTION_SATURATION,
         mod.SECTION_MATRIX,
         mod.SECTION_SYNTHESIS,
+        mod.SECTION_FINDINGS,
         mod.SECTION_FILED_TASKS,
         mod.SECTION_COST,
     ]
@@ -1441,6 +1509,10 @@ matrix
 _The census does not parse this section: nothing proposed in it has been applied to the codebook._
 
 prose
+
+## Findings
+
+_no findings touched this run._
 
 ## Filed Tasks
 
@@ -1926,8 +1998,56 @@ def _sample_dropped_verdicts() -> tuple:
     )
 
 
+_FINDING_ANCHOR = "orchestrator/x.py::f"
+_FINDING_VERDICT = verdict.Verdict(
+    verified=True,
+    reason="the verifier saw it",
+    anchor=_FINDING_ANCHOR,
+    tags=("h13", verdict.KIND_TAG),
+    severity="high",
+    severity_reason="r",
+    route=verdict.Route.MECHANICAL,
+    remediation=verdict.Remediation("orchestrator/x.py", "fix it"),
+)
+_FINDING_AREA_MAP = finding_area.AreaMap(
+    briefing=finding_area.BRIEFING_RELPATH,
+    members=("orchestrator",),
+    overlay=None,
+    rules=(),
+    notes=(),
+)
+
+
+def _sample_finding_entry() -> dict:
+    identity = census_findings.FindingIdentity.mint(
+        "orchestrator", _FINDING_ANCHOR, ("h13", verdict.KIND_TAG),
+    )
+    return {
+        "id": "entry-cand-20260714-1",
+        "title": "A keyed finding",
+        "severity": "high",
+        "status": "open",
+        "origin_phase": "implement",
+        "manifested_phase": "verify",
+        "sightings": [],
+        **identity.to_fields(),
+        **census_findings.first_sighting_fields(_PAYLOAD_RUN_ID),
+    }
+
+
+def _sample_finding_record(*, cause: str = "the cause", observed: bool = False) -> dict:
+    entry = _sample_finding_entry()
+    if observed:
+        return census_findings.observed_row(entry, cause).to_record()
+    return census_findings.confirmed_row(entry, _FINDING_VERDICT, cause=cause).to_record()
+
+
 _REPORT_FLAG_CASES: dict[str, dict[str, Any]] = {
     "flagless": {},
+    "findings": {
+        "findings": (_sample_finding_record(),),
+        "area_map": _FINDING_AREA_MAP.to_record(),
+    },
     "forced": {"force": True},
     "capped": {"mining_result": _capped_mining_result(stop_reason="capped", max_batches=2)},
     "verify_capped": {"verify_coverage": mod.VerifyCoverage(novel=5, offered=2, cap=2)},
@@ -1976,6 +2096,79 @@ def test_render_report_renders_from_the_json_record_alone(case):
     parsed = json.loads(json.dumps(record))
 
     assert mod.render_report(parsed) == mod.render_report(record)
+
+
+# ---------------------------------------------------------------------------
+# task 6402 step-9: RED — the record's contract §1 findings rows and the area
+# map that keyed them, rendered as ## Findings on every report.
+# ---------------------------------------------------------------------------
+
+def _findings_text(**overrides) -> str:
+    return _section_text(_sections(**overrides), mod.SECTION_FINDINGS)
+
+
+def _table_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line.startswith("|")]
+
+
+def _cells(line: str) -> list[str]:
+    return [cell.strip() for cell in re.split(r"(?<!\\)\|", line.strip())[1:-1]]
+
+
+def test_build_census_record_carries_findings_and_the_area_map():
+    finding = _sample_finding_record()
+    record = _census_record(findings=(finding,), area_map=_FINDING_AREA_MAP.to_record())
+    assert record["findings"] == [finding]
+    assert record["area_map"] == _FINDING_AREA_MAP.to_record()
+    assert check_census_report.check_findings(record) == []
+
+
+def test_build_census_record_defaults_to_no_findings_and_no_area_map():
+    record = _census_record()
+    assert record["findings"] == []
+    assert record["area_map"] is None
+
+
+@pytest.mark.parametrize("case", sorted(_REPORT_FLAG_CASES))
+def test_findings_renders_on_every_report_between_synthesis_and_filed_tasks(case):
+    sections = _sections(**_REPORT_FLAG_CASES[case])
+    keys = [section.key for section in sections]
+    assert keys.index(mod.SECTION_SYNTHESIS) < keys.index(mod.SECTION_FINDINGS)
+    assert keys.index(mod.SECTION_FINDINGS) < keys.index(mod.SECTION_FILED_TASKS)
+    assert "## Findings" in _section(sections, mod.SECTION_FINDINGS).lines
+
+
+def test_findings_table_names_every_oracle_field_and_the_row():
+    finding = _sample_finding_record()
+    text = _findings_text(findings=(finding,), area_map=_FINDING_AREA_MAP.to_record())
+    header, *rest = _table_lines(text)
+    assert _cells(header) == ["id", *check_census_report.FINDING_FIELDS]
+    rows = [line for line in rest if finding["key"] in line]
+    assert len(rows) == 1
+    assert finding["anchor"] in rows[0]
+    assert len(_cells(rows[0])) == len(_cells(header))
+
+
+def test_findings_section_names_the_area_maps_degradation(tmp_path):
+    area_map = finding_area.load_area_map(tmp_path)
+    assert area_map.briefing is None and area_map.notes
+    text = _findings_text(area_map=area_map.to_record())
+    for note in area_map.notes:
+        assert note in text
+
+
+def test_findings_section_counts_the_unverified_rows():
+    text = _findings_text(findings=(_sample_finding_record(observed=True),))
+    bullets = [line for line in text.splitlines() if line.startswith("- ")]
+    assert [line for line in bullets if "1" in line and "unverified" in line.lower()]
+
+
+def test_a_pipe_in_a_statement_does_not_break_the_findings_table():
+    plain = _findings_text(findings=(_sample_finding_record(cause="a plain cause"),))
+    piped = _findings_text(findings=(_sample_finding_record(cause="a | piped\ncause"),))
+    assert len(piped.splitlines()) == len(plain.splitlines())
+    header, row = _table_lines(piped)[0], _table_lines(piped)[-1]
+    assert len(_cells(row)) == len(_cells(header))
 
 
 def test_build_census_record_carries_identity_and_method():
@@ -2152,6 +2345,7 @@ def test_census_report_sections_flagless_key_set_and_order():
         mod.SECTION_SATURATION,
         mod.SECTION_MATRIX,
         mod.SECTION_SYNTHESIS,
+        mod.SECTION_FINDINGS,
         mod.SECTION_FILED_TASKS,
         mod.SECTION_COST,
     ]
@@ -4739,6 +4933,7 @@ def test_run_census_dry_run_does_not_clobber_an_existing_payload_file(tmp_path, 
     ]
     expected = mod.build_task_payloads(
         verified, project_root=str(tmp_path), project_id="dark_factory",
+        run_id=kwargs["run_id"],
     )
     assert expected, "guard: the scenario must actually produce a payload"
     assert json.loads(sibling_path.read_text(encoding="utf-8")) == expected
