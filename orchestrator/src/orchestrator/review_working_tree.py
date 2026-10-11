@@ -20,6 +20,9 @@ _SUMMARY_NAMED_PATH_CAP = 3
 
 _GIT_QUERY_TIMEOUT_SECS = 30.0
 
+_PATH_START = r'''(?<![^\s'"`(\[{<=,])'''
+_PATH_END = r'(?![\w./-])'
+
 _UNTRACKED_QUERY = (
     'git', '--no-optional-locks', 'ls-files', '--others', '--exclude-standard', '-z',
 )
@@ -130,36 +133,63 @@ class Phase1WorkingTree:
 
 
 def attribute_phase1(
-    phase1: VerifyResult, state: WorkingTreeState, run_dirs: Iterable[str],
+    phase1: VerifyResult,
+    state: WorkingTreeState,
+    *,
+    root: Path,
+    run_dirs: Iterable[str],
 ) -> Phase1WorkingTree:
-    """Which of *state*'s changes a failing *phase1* output names.
+    """A change is named only by a printed form that starts at a delimiter.
 
-    *run_dirs* are the repo-relative directories verify legs run in; a tool
-    there prints paths relative to that directory.
+    A relative form counts only when no other file in the checkout could be
+    what it denotes.
     """
     if phase1.passed:
         return Phase1WorkingTree(state, ())
     output = '\n'.join((phase1.test_output, phase1.lint_output, phase1.type_output))
     prefixes = tuple(f'{d.rstrip("/")}/' for d in run_dirs if d)
+    roots = tuple(dict.fromkeys((root, root.resolve())))
     named = tuple(
         NamedChange(path, change)
         for path, change in state.changes()
-        if any(_output_names(output, form) for form in _printed_forms(path, prefixes))
+        if _named_relatively(output, path, root=root, prefixes=prefixes)
+        or _named_absolutely(output, path, roots=roots)
     )
     return Phase1WorkingTree(state, named)
 
 
-def _printed_forms(path: str, prefixes: tuple[str, ...]) -> Iterator[str]:
+def _named_relatively(
+    output: str, path: str, *, root: Path, prefixes: tuple[str, ...],
+) -> bool:
+    return any(
+        _output_names(output, form, relative=True)
+        and _denotes_only(root, path, form, prefixes)
+        for form in _relative_forms(path, prefixes)
+    )
+
+
+def _named_absolutely(output: str, path: str, *, roots: tuple[Path, ...]) -> bool:
+    return any(_output_names(output, str(r / path), relative=False) for r in roots)
+
+
+def _relative_forms(path: str, prefixes: tuple[str, ...]) -> Iterator[str]:
     yield path
     for prefix in prefixes:
         if path.startswith(prefix):
             yield path[len(prefix):]
 
 
-def _output_names(output: str, form: str) -> bool:
+def _output_names(output: str, form: str, *, relative: bool) -> bool:
     if form not in output:
         return False
-    return re.search(rf'(?<![\w.-]){re.escape(form)}(?![\w.-])', output) is not None
+    dot_slash = r'(?:\./)?' if relative else ''
+    pattern = _PATH_START + dot_slash + re.escape(form) + _PATH_END
+    return re.search(pattern, output) is not None
+
+
+def _denotes_only(root: Path, path: str, form: str, prefixes: tuple[str, ...]) -> bool:
+    referents = {form, *(prefix + form for prefix in prefixes)} - {path}
+    return not any((root / ref).exists() for ref in referents)
 
 
 def qualified_phase1_summary(

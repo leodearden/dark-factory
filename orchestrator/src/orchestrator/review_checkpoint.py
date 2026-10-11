@@ -392,7 +392,9 @@ class ReviewCheckpoint:
             self.config.project_root, self.config, role='background', event_store=self.event_store,
         )
         working_tree = None if state is None else await asyncio.to_thread(
-            attribute_phase1, phase1, state, tuple(self.config.module_configs_or_empty),
+            attribute_phase1, phase1, state,
+            root=self.config.project_root,
+            run_dirs=tuple(self.config.module_configs_or_empty),
         )
         logger.info(
             'Review [%s]: Phase 1 complete — %s',
