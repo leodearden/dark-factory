@@ -654,11 +654,13 @@ class TestCapabilityManifestDoc:
 
     @staticmethod
     def _doc_with_signal_leaves(signal_leaves):
-        return CapabilityManifestDoc(
-            prd='plans/example-prd.md',
-            schema_version=1,
-            tasks=[_task_dict('α'), _task_dict('β')],  # type: ignore[arg-type]
-            signal_leaves=signal_leaves,
+        return parse_capability_manifest(
+            {
+                'prd': 'plans/example-prd.md',
+                'schema_version': 1,
+                'tasks': [_task_dict('α'), _task_dict('β')],
+                'signal_leaves': signal_leaves,
+            }
         )
 
     def test_signal_leaves_naming_known_labels_load(self):
@@ -666,10 +668,12 @@ class TestCapabilityManifestDoc:
         assert self._doc_with_signal_leaves(['β', 'α']).signal_leaves == ['β', 'α']
 
     def test_signal_leaves_defaults_to_none(self):
-        doc = CapabilityManifestDoc(
-            prd='plans/example-prd.md',
-            schema_version=1,
-            tasks=[_task_dict('α')],  # type: ignore[arg-type]
+        doc = parse_capability_manifest(
+            {
+                'prd': 'plans/example-prd.md',
+                'schema_version': 1,
+                'tasks': [_task_dict('α')],
+            }
         )
         assert doc.signal_leaves is None
 
