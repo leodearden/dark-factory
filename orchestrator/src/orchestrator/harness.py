@@ -5396,6 +5396,37 @@ class Harness:
             )
         return released
 
+    def _pause_visibility_for_digest(
+        self, events_db_path: Path | None,
+    ) -> digest_mod.PauseVisibility:
+        """Inputs for the digest's '## Paused, waiting' section; fail-open."""
+        paused = self.scheduler.is_paused
+        repended = (
+            digest_mod.repended_while_paused_since_resume(events_db_path)
+            if paused and events_db_path is not None
+            else ()
+        )
+        pending: list[Escalation] = []
+        if self._escalation_queue is not None:
+            try:
+                pending = self._escalation_queue.get_pending()
+            except Exception:
+                logger.warning(
+                    '_pause_visibility_for_digest: get_pending failed (fail-open)',
+                    exc_info=True,
+                )
+        overdue = digest_mod.overdue_pending_escalations(
+            pending,
+            category=self._SCHEDULER_PAUSE_CATEGORY,
+            min_age=digest_mod.SCHEDULER_PAUSE_RESURFACE_AGE,
+            now=datetime.now(UTC),
+        )
+        return digest_mod.PauseVisibility(
+            pause_reason=(self.scheduler.pause_reason or '<unknown>') if paused else None,
+            repended_waiting=repended,
+            overdue_pause_escalations=overdue,
+        )
+
     async def _stale_lane_assignment_census(self) -> list[str]:
         """Census lines for NON-terminal warm-lane assignments idle past the threshold.
 
@@ -7417,6 +7448,7 @@ class Harness:
     # so the orphan-L0 reaper (L0-only), _on_escalation (no registered event),
     # and reconcile (no such task) all leave it alone.
     _SCHEDULER_PAUSE_SENTINEL: str = '__scheduler__'
+    _SCHEDULER_PAUSE_CATEGORY: str = 'scheduler_paused'
 
     # Synthetic task_id for the no-landings circuit-breaker INFO escalation.
     # Deduped to one open at a time (via get_by_task + agent_role filter).
@@ -8146,7 +8178,7 @@ class Harness:
                 task_id=self._SCHEDULER_PAUSE_SENTINEL,
                 agent_role='orchestrator-scheduler',
                 severity='blocking',
-                category='scheduler_paused',
+                category=self._SCHEDULER_PAUSE_CATEGORY,
                 summary=(f'Scheduler paused — dispatch halted: {reason}')[:200],
                 detail=(
                     'The orchestrator scheduler is paused and will dispatch no '
@@ -18063,6 +18095,7 @@ class Harness:
         9. Read parked-task counts from Scheduler state.
         10. Update EWA using EventStore done_count.
         11. Compute trip flag and anomaly flags.
+        11c. Gather the paused-waiting section inputs (fail-open; task 5311).
         12. Write digest file (fail-open via write_digest_entry).
         13. Advance counters/state using the snapshot from step 2 (not the
             live counter), so that concurrent callbacks firing inside this
@@ -18209,6 +18242,8 @@ class Harness:
             # degraded status read) and runs inside this try/except so a census
             # hiccup can never break the digest write.
             stale_lane_census = await self._stale_lane_assignment_census()
+            # (11c) Paused re-pends and overdue pause L1s (task 5311) — fail-open.
+            pause_visibility = self._pause_visibility_for_digest(events_db_path)
 
             inputs = digest_mod.DigestInputs(
                 window_start_iso=window_start,
@@ -18229,6 +18264,7 @@ class Harness:
                 # Task 4559: surface the split that produced new_ewa.
                 submissions_in_step=submissions_in_step,
                 lifecycle_events_in_step=diff,
+                pause_visibility=pause_visibility,
             )
 
             digest_mod.write_digest_entry(digest_dir, inputs)
