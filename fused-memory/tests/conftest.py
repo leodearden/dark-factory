@@ -68,6 +68,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
+import shared.project_layout  # noqa: E402
 from _fm_helpers import (  # noqa: E402
     _leaked_async_httpx_clients,
     _warn_if_drain_closed_a_foreign_client,
@@ -327,6 +328,16 @@ def code_default_config(monkeypatch, tmp_path):
     trick this copies.
     """
     monkeypatch.setenv('CONFIG_PATH', str(tmp_path / 'no-such-config.yaml'))
+
+
+@pytest.fixture
+def relocated_escalation_queue(monkeypatch) -> str:
+    """Simulate an operator relocating the escalation queue in its one home; return the legacy relpath."""
+    legacy = shared.project_layout.ESCALATION_QUEUE_RELPATH
+    monkeypatch.setattr(
+        shared.project_layout, 'ESCALATION_QUEUE_RELPATH', 'data/relocated-escalations'
+    )
+    return legacy
 
 
 @pytest_asyncio.fixture(autouse=True)
