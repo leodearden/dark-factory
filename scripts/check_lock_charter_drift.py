@@ -151,32 +151,19 @@ def _guard_vector(script: Path, flag: str, *, timeout: float = SUBPROCESS_TIMEOU
     renamed or dropped an emitter, leaving it green forever while enforcing
     nothing.
 
-    Every could-not-answer path funnels into `GuardUnavailable`: a missing file,
-    an ``OSError`` (no bash, permission bits, ENOENT), a non-zero rc, and a
-    timeout.  Letting an ``OSError`` escape instead would exit with Python's own
-    code 1 — which a caller reads as DRIFT, a false accusation against reify.
+    Raises `GuardUnavailable` for a missing script and a non-zero rc here, and
+    for a timeout, an ``OSError`` or undecodable output via `_run_or_unavailable`.
     """
     if not script.is_file():
         raise GuardUnavailable(
             f'reify guard script {script} is not a file — no cross-repo '
             f'comparison was performed'
         )
-    try:
-        result = subprocess.run(
-            ['bash', str(script), flag],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise GuardUnavailable(
-            f'reify guard script {script} {flag} did not finish within '
-            f'{timeout}s — treated as unavailable rather than waited on '
-            f'indefinitely'
-        ) from exc
-    except OSError as exc:
-        raise GuardUnavailable(f'could not run {script} {flag}: {exc}') from exc
-
+    result = _run_or_unavailable(
+        ['bash', str(script), flag],
+        what=f'reify guard script {script} {flag}',
+        timeout=timeout,
+    )
     if result.returncode != 0:
         raise GuardUnavailable(
             f'reify guard script {script} {flag} exited {result.returncode}, '
