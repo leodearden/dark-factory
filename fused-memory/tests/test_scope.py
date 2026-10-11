@@ -96,7 +96,7 @@ class TestReadDeclaredProjectId:
 
     def test_hyphenated_declared_value_is_normalized(self, tmp_path):
         """A hyphenated declared value normalizes with the same
-        _to_underscore_canonical rule resolve_project_id uses."""
+        normalize_project_id rule resolve_project_id uses."""
         d = tmp_path / 'solar-challenge'
         d.mkdir()
         self._write_manifest(d, 'project_id: "my-solar-challenge"\n')

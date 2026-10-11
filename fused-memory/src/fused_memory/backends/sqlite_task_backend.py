@@ -25,6 +25,7 @@ from shared.async_sqlite_base import (
     apply_wal_pragmas,
     connect_daemon,
 )
+from shared.project_id import normalize_project_id
 from shared.project_layout import tasks_db
 from shared.task_metadata import (
     _WHOLE_METADATA_FIELD,
@@ -258,9 +259,9 @@ def _parse_qualified_dep(depends_on: str) -> tuple[str, int]:
     """Parse a cross-project dependency string of the form ``"project_id:task_id"``.
 
     Assumes the caller has already detected that ``':'`` is present.
-    Strips whitespace, normalises ``'-'`` to ``'_'`` in the project_id portion,
-    and rejects any malformed input with a ``TaskmasterError`` whose code is
-    ``TASKMASTER_TOOL_ERROR``.
+    Strips whitespace, normalises the project_id portion with
+    ``shared.project_id.normalize_project_id``, and rejects any malformed
+    input with a ``TaskmasterError`` whose code is ``TASKMASTER_TOOL_ERROR``.
 
     Returns:
         ``(normalized_project_id, dep_int)`` where ``dep_int > 0``.
@@ -292,7 +293,7 @@ def _parse_qualified_dep(depends_on: str) -> tuple[str, int]:
         raise TaskmasterError(*_MALFORMED) from err
     if dep_int <= 0:
         raise TaskmasterError(*_MALFORMED)
-    norm_pid = raw_pid.lower().replace('-', '_')
+    norm_pid = normalize_project_id(raw_pid)
     return norm_pid, dep_int
 
 
