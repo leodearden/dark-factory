@@ -560,3 +560,74 @@ class TestBucketAccounting:
             5225: Bucket.FAILED,
             9001: Bucket.ARRIVED_DURING_WINDOW,
         }
+
+
+def _write_scheduler_state(root: str, text: str) -> None:
+    state = Path(root) / 'data' / 'orchestrator' / 'scheduler_state.json'
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text(text)
+
+
+def _holders(**holders: str) -> str:
+    return json.dumps({'current_holders': holders, 'parks': {}})
+
+
+class TestHolderPreflight:
+    def test_a_selected_row_held_by_the_scheduler_refuses_the_whole_project(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        _write_scheduler_state(root, _holders(orchestrator_src='4028'))
+        census = take_census(root, NOW)
+        before = _store_rows(root)
+        server = _FakeClaimantServer()
+
+        report = _apply(census, server)
+
+        assert report.refused is True
+        assert report.holder_intersection == (4028,)
+        assert server.calls == []
+        assert _store_rows(root) == before
+        assert report.outcomes == ()
+        assert report.verification_census is None
+
+    def test_holders_outside_the_selected_rows_do_not_refuse(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        _write_scheduler_state(root, _holders(scripts='103', docs='7777'))
+        server = _FakeClaimantServer()
+
+        report = _apply(take_census(root, NOW), server)
+
+        assert report.refused is False
+        assert report.holder_intersection == ()
+        assert server.written_ids() == TERMINAL_IDS
+
+    def test_no_scheduler_snapshot_means_no_holders(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        server = _FakeClaimantServer()
+
+        report = _apply(take_census(root, NOW), server)
+
+        assert report.refused is False
+        assert server.written_ids() == TERMINAL_IDS
+
+    def test_holders_are_read_at_apply_time_not_census_time(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        census = take_census(root, NOW)
+        _write_scheduler_state(root, _holders(shared_src='5225'))
+        server = _FakeClaimantServer()
+
+        report = _apply(census, server)
+
+        assert report.refused is True
+        assert report.holder_intersection == (5225,)
+        assert server.calls == []
+
+    @pytest.mark.parametrize('snapshot', ['[]', '{"current_holders": ["4028"]}'])
+    def test_a_malformed_snapshot_is_treated_as_no_holders(self, seed_root, snapshot):
+        root = seed_root(TIER_TABLE_ROWS)
+        _write_scheduler_state(root, snapshot)
+        server = _FakeClaimantServer()
+
+        report = _apply(take_census(root, NOW), server)
+
+        assert report.refused is False
+        assert server.written_ids() == TERMINAL_IDS
