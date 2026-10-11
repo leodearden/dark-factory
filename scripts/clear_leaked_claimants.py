@@ -194,6 +194,9 @@ class ApplyReport:
 
 @dataclass(frozen=True)
 class _Attempt:
+    """A non-None delta means the re-read declined the row and no write was issued."""
+
+    delta: Delta | None = None
     write_error: str | None = None
 
 
@@ -215,7 +218,44 @@ async def _clear_claimant(client: ToolClient, project_root: str, violation: Viol
     return write_failure_reason(reply)
 
 
+def observed_delta(
+    violation: Violation, live: Mapping[str, Any] | None, now: datetime,
+) -> dict[str, tuple[Any, Any]] | None:
+    if live is None:
+        return {'row': ('present', 'absent')}
+    census_values = {
+        'status': violation.status,
+        'claimant_run_id': violation.claimant_run_id,
+        'heartbeat_at': violation.heartbeat_at,
+    }
+    delta = {
+        field: (census_value, live[field])
+        for field, census_value in census_values.items()
+        if census_value != live[field]
+    }
+    live_tier = classify_tier(live, now)
+    if live_tier is not violation.tier:
+        delta['tier'] = (violation.tier.value, None if live_tier is None else live_tier.value)
+    return delta or None
+
+
+async def _attempt_repair(
+    client: ToolClient,
+    conn: sqlite3.Connection,
+    project_root: str,
+    violation: Violation,
+    now: datetime,
+) -> _Attempt:
+    live_rows = _read_claimant_rows(conn, 'tag = ? AND id = ?', violation.key)
+    delta = observed_delta(violation, live_rows[0] if live_rows else None, now)
+    if delta is not None:
+        return _Attempt(delta=delta)
+    return _Attempt(write_error=await _clear_claimant(client, project_root, violation))
+
+
 def _outcome(violation: Violation, attempt: _Attempt, still_violating: frozenset) -> RowOutcome:
+    if attempt.delta is not None:
+        return RowOutcome(violation, Bucket.SKIPPED_CHANGED_UNDER_US, delta=attempt.delta)
     if attempt.write_error is not None:
         return RowOutcome(violation, Bucket.FAILED, detail=attempt.write_error)
     if violation.key in still_violating:
@@ -244,10 +284,11 @@ async def apply_repairs(
         raise ValueError('apply_repairs writes through an MCP client; none was given')
     root = census.project_root
     selected = tuple(v for v in census.violations if v.tier in tiers)
-    attempts = {
-        violation.key: _Attempt(write_error=await _clear_claimant(client, root, violation))
-        for violation in selected
-    }
+    with closing(connect_ro(tasks_db_path(root))) as conn:
+        attempts = {
+            violation.key: await _attempt_repair(client, conn, root, violation, clock())
+            for violation in selected
+        }
     verification = take_census(root, clock())
     return ApplyReport(
         project_root=root,
