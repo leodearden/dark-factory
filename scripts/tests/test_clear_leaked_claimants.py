@@ -29,7 +29,9 @@ from clear_leaked_claimants import (
     ExitCode,
     Tier,
     apply_repairs,
+    emit_report,
     exit_code,
+    exit_conditions,
     render_json,
     render_text,
     sweep,
@@ -814,6 +816,32 @@ class TestExitCode:
         result = _sweep([refused, failing], _mixed_traffic_server(failing))
 
         assert exit_code(result) is ExitCode.REPAIR_FAILED
+        assert exit_conditions(result) == (ExitCode.REPAIR_FAILED, ExitCode.HOLDER_REFUSED)
+
+    def test_stderr_names_every_condition_not_only_the_winning_one(self, seed_root, capsys):
+        refused = seed_root(TIER_TABLE_ROWS, name='refused')
+        failing = seed_root(TIER_TABLE_ROWS, name='failing')
+        _write_scheduler_state(refused, _holders(orchestrator_src='4028'))
+        result = _sweep([refused, failing], _mixed_traffic_server(failing))
+        capsys.readouterr()
+
+        code = emit_report(result, as_json=True)
+
+        assert code is ExitCode.REPAIR_FAILED
+        captured = capsys.readouterr()
+        assert json.loads(captured.out)['mode'] == 'apply'
+        errors = [line for line in captured.err.splitlines() if line.startswith('error:')]
+        assert len(errors) == 2
+        assert any('refused' in line for line in errors)
+        assert any('failed bucket' in line for line in errors)
+
+    def test_a_clean_run_has_no_conditions_and_prints_no_error(self, seed_root, capsys):
+        result = _sweep([seed_root(TIER_TABLE_ROWS)], _FakeClaimantServer())
+        capsys.readouterr()
+
+        assert exit_conditions(result) == ()
+        assert emit_report(result, as_json=False) is ExitCode.OK
+        assert 'error:' not in capsys.readouterr().err
 
     def test_every_root_unreadable_reads_nothing(self, tmp_path):
         result = _sweep([str(tmp_path / 'missing')], _FakeClaimantServer())

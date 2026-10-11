@@ -553,15 +553,28 @@ _EXIT_CODE_MEANINGS = {
 }
 
 
-def exit_code(result: SweepResult) -> ExitCode:
+def exit_conditions(result: SweepResult) -> tuple[ExitCode, ...]:
+    """Every non-OK condition present, highest precedence first."""
     if not result.projects:
-        return ExitCode.NOTHING_READ
+        return (ExitCode.NOTHING_READ,)
     reports = [project.apply for project in result.projects if project.apply is not None]
-    if any(report.counts()[Bucket.FAILED] for report in reports):
-        return ExitCode.REPAIR_FAILED
-    if any(report.refused for report in reports):
-        return ExitCode.HOLDER_REFUSED
-    return ExitCode.OK
+    conditions = {
+        ExitCode.REPAIR_FAILED: any(report.counts()[Bucket.FAILED] for report in reports),
+        ExitCode.HOLDER_REFUSED: any(report.refused for report in reports),
+    }
+    return tuple(code for code, present in conditions.items() if present)
+
+
+def exit_code(result: SweepResult) -> ExitCode:
+    conditions = exit_conditions(result)
+    return conditions[0] if conditions else ExitCode.OK
+
+
+def emit_report(result: SweepResult, *, as_json: bool) -> ExitCode:
+    print(render_json(result) if as_json else render_text(result))
+    for condition in exit_conditions(result):
+        print(f'error: {_EXIT_CODE_MEANINGS[condition]}', file=sys.stderr)
+    return exit_code(result)
 
 
 DEFAULT_SERVER_URL = 'http://127.0.0.1:8002'
@@ -636,11 +649,7 @@ async def main_async(args: argparse.Namespace) -> int:
             return ExitCode.SERVER_UNREACHABLE
     else:
         result = await sweep(args.project_roots, apply=False, tiers=tiers, client=None, clock=_utcnow)
-    print(render_json(result) if args.json else render_text(result))
-    code = exit_code(result)
-    if code is not ExitCode.OK:
-        print(f'error: {_EXIT_CODE_MEANINGS[code]}', file=sys.stderr)
-    return code
+    return emit_report(result, as_json=args.json)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
