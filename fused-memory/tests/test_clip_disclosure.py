@@ -8,9 +8,11 @@ from fused_memory.middleware.task_curator import clip_for_prompt
 from fused_memory.utils.clip_disclosure import (
     TRUNCATED_KEY,
     TextClip,
+    clip_note,
     clip_text,
     elide_text,
     elision_marker,
+    fetch_cap_note,
     truncation_facts,
 )
 
@@ -83,3 +85,49 @@ def test_truncation_facts_is_empty_when_nothing_was_cut():
 
 def test_truncated_key_is_the_one_dict_channel_spelling():
     assert TRUNCATED_KEY == 'truncated'
+
+
+def _widget_note(omitted: int) -> str:
+    return clip_note(
+        omitted=omitted,
+        omitted_noun='widget task(s)',
+        cap_name='MAX_WIDGETS_RENDERED',
+        cap=3,
+        dropped_first='the newest widgets',
+    )
+
+
+@pytest.mark.parametrize('omitted', [0, -2])
+def test_clip_note_is_empty_when_nothing_was_omitted(omitted):
+    assert _widget_note(omitted) == ''
+
+
+def test_clip_note_states_the_count_the_cap_and_the_dropped_end():
+    assert _widget_note(2) == (
+        '_NOTE: 2 additional widget task(s) were omitted from this render by the '
+        'MAX_WIDGETS_RENDERED=3 cap. Coverage was clipped — NOT complete this cycle; '
+        'the newest widgets were dropped first._'
+    )
+
+
+def _episode_fetch_note(fetched: int) -> str:
+    return fetch_cap_note(fetched=fetched, noun='episode(s)', cap_name='episode_limit', cap=50)
+
+
+@pytest.mark.parametrize('fetched', [0, 49])
+def test_fetch_cap_note_is_empty_below_the_cap(fetched):
+    assert _episode_fetch_note(fetched) == ''
+
+
+@pytest.mark.parametrize('fetched', [50, 51])
+def test_fetch_cap_note_at_the_cap_says_coverage_is_not_known_complete(fetched):
+    note = _episode_fetch_note(fetched)
+
+    assert note.startswith('_NOTE: ')
+    assert note.endswith('_')
+    assert '\n' not in note
+    assert f'{fetched} episode(s)' in note
+    assert 'episode_limit=50' in note
+    assert 'not fetched' in note
+    assert 'may be clipped' in note
+    assert 'NOT known complete this cycle' in note
