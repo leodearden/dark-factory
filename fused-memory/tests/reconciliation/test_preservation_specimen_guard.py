@@ -38,6 +38,7 @@ from fused_memory.reconciliation.preservation_specimen_guard import (
     PRESERVATION_CORROBORATION_BUDGET_SECONDS,
     PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
     PRESERVATION_TOKEN_FAMILY,
+    PRESERVED_SPECIMEN_COMPONENTS_KEY,
     STRANDED_FLAG_TOKEN_FAMILY,
     UNRESOLVED_CORROBORATION_SUBJECT,
     PreservationSuppressionResult,
@@ -351,6 +352,13 @@ LIVE_MEM0_ROW = {
         'agent_id': 'recon-stage-task_knowledge_sync',
         'data': LIVE_MEM0_PRESERVATION_PROSE,
     },
+}
+
+#: A second specimen's row, for a composite whose every component corroborates.
+SECOND_SPECIMEN_MEM0_ROW = {
+    **LIVE_MEM0_ROW,
+    'id': '6f0c2b9e-41d7-4a3e-9b58-0c7e2d1a93f4',
+    'metadata': {**LIVE_MEM0_ROW['metadata'], 'task_id': '4223'},
 }
 
 #: The live Graphiti shape for ``get_entity('Task 3105', ...)``.
@@ -1730,11 +1738,19 @@ class TestCompositeFlagTaskIds:
     task_id up verbatim while only the suppression ROW side is decomposed. This
     guard must not inherit it. ``flag_task_ids.task_id_components`` is the
     shared flag-side splitter it decomposes through.
+
+    A composite is dropped only when EVERY component corroborates; a mixed one
+    is kept on a copy annotated with each corroborated component's citation.
     """
 
     @pytest.mark.asyncio
-    async def test_composite_with_a_corroborated_component_is_suppressed(self):
-        """The live shape: '3105,4223' where only 3105 is a preserved specimen."""
+    async def test_a_mixed_composite_is_kept_and_annotated(self):
+        """The live shape: '3105,4223' where only 3105 is a preserved specimen.
+
+        The finding claims both tasks are stranded, so 3105's citation alone
+        must not hide the claim about 4223 — and the specimen evidence travels
+        with the kept finding so Stage 2 sees it beside the reset request.
+        """
         memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
         flag = _stranded_flag(task_id='3105,4223')
 
@@ -1742,8 +1758,32 @@ class TestCompositeFlagTaskIds:
             memory_service=memory_service, project_id=PROJECT, flags=[flag],
         )
 
+        assert result.kept_flags == [
+            {**flag, PRESERVED_SPECIMEN_COMPONENTS_KEY: {'3105': LIVE_MEM0_ROW['id']}},
+        ]
+        assert PRESERVED_SPECIMEN_COMPONENTS_KEY not in flag
+        assert result.suppressed_by_task == {}
+        assert result.citations_by_task == {}
+        assert result.unresolved_task_ids == ()
+
+    @pytest.mark.asyncio
+    async def test_a_composite_whose_every_component_is_corroborated_is_suppressed(self):
+        """Dropped, counted once against its first component, every citation kept."""
+        memory_service = _make_memory_service(
+            rows={'3105': [LIVE_MEM0_ROW], '4223': [SECOND_SPECIMEN_MEM0_ROW]},
+        )
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service,
+            project_id=PROJECT,
+            flags=[_stranded_flag(task_id='3105,4223')],
+        )
+
         assert result.kept_flags == []
         assert result.suppressed_by_task == {'3105': 1}
+        assert result.citations_by_task == {
+            '3105': LIVE_MEM0_ROW['id'], '4223': SECOND_SPECIMEN_MEM0_ROW['id'],
+        }
 
     @pytest.mark.asyncio
     async def test_a_junk_component_costs_only_itself(self):
@@ -1789,18 +1829,18 @@ class TestCompositeFlagTaskIds:
 
     @pytest.mark.asyncio
     async def test_counters_key_on_the_component_not_the_composite(self):
-        """Aggregation must be per REAL task, not per string permutation.
+        """Aggregation must be per REAL task, not per raw spelling.
 
-        Task 3105 is flagged as '3105,5080', '3105,5080,5104' and '3105,4223'.
-        Keying on the raw composite would scatter one task's suppressions across
-        three counters, so the storm threshold would never trip and the citation
-        audit trail would fragment.
+        One task arrives under several raw task_id strings that all decompose to
+        it. Keying on the raw string would scatter its suppressions across a
+        counter per spelling, so the storm threshold would never trip and the
+        citation audit trail would fragment.
         """
         memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
         flags = [
-            _stranded_flag(task_id='3105,5080'),
-            _stranded_flag(task_id='3105,5080,5104'),
-            _stranded_flag(task_id='3105,4223'),
+            _stranded_flag(task_id='3105'),
+            _stranded_flag(task_id=' 3105 , '),
+            _stranded_flag(task_id='0,3105'),
         ]
 
         result = await filter_preservation_specimen_flags(
@@ -1817,14 +1857,21 @@ class TestCompositeFlagTaskIds:
     async def test_each_component_is_corroborated_independently(self):
         """Every component is looked up — the citation may be on any of them."""
         memory_service = _make_memory_service(rows={'4223': [LIVE_MEM0_ROW]})
-        flag = _stranded_flag(task_id='3105,4223')
 
         result = await filter_preservation_specimen_flags(
-            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+            memory_service=memory_service,
+            project_id=PROJECT,
+            flags=[_stranded_flag(task_id='3105,4223')],
         )
 
-        assert result.kept_flags == []
-        assert result.suppressed_by_task == {'4223': 1}
+        queried = sorted(
+            call.kwargs['filters']['task_id']
+            for call in memory_service.get_memories_by_metadata.await_args_list
+        )
+        assert queried == ['3105', '4223']
+        assert result.kept_flags[0][PRESERVED_SPECIMEN_COMPONENTS_KEY] == {
+            '4223': LIVE_MEM0_ROW['id'],
+        }
 
     @pytest.mark.asyncio
     async def test_composite_of_uncorroborated_ids_is_kept(self):
@@ -1842,7 +1889,10 @@ class TestCompositeFlagTaskIds:
 
     @pytest.mark.asyncio
     async def test_whitespace_padded_components_resolve(self):
-        """LLM-authored joins carry spaces; '3105, 4223' must still resolve."""
+        """LLM-authored joins carry spaces; '3105, 4223' must still resolve.
+
+        The annotation's stripped key is what proves the padded component did.
+        """
         memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
 
         result = await filter_preservation_specimen_flags(
@@ -1851,8 +1901,9 @@ class TestCompositeFlagTaskIds:
             flags=[_stranded_flag(task_id='3105, 4223')],
         )
 
-        assert result.kept_flags == []
-        assert result.suppressed_by_task == {'3105': 1}
+        assert result.kept_flags[0][PRESERVED_SPECIMEN_COMPONENTS_KEY] == {
+            '3105': LIVE_MEM0_ROW['id'],
+        }
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('task_id', [',', ',,', ' , ', ''])
@@ -1888,11 +1939,11 @@ class TestCompositeFlagTaskIds:
         assert queried == ['3105', '5080', '5104']
 
     @pytest.mark.asyncio
-    async def test_one_unreadable_component_does_not_hide_a_citation(self):
-        """A corroborated component still suppresses when a sibling read fails.
+    async def test_an_unreadable_component_blocks_the_drop_and_is_disclosed(self):
+        """A sibling whose read failed keeps the flag, and that is disclosed.
 
-        The citation WAS resolved, so the task is not unresolved — degradation
-        is only disclosed when it actually changed the verdict.
+        No verdict on 5080 means not every component corroborated, so the
+        unreadable component is exactly what kept the flag.
         """
         def _scroll(project_id, filters):
             if filters['task_id'] == '5080':
@@ -1909,12 +1960,11 @@ class TestCompositeFlagTaskIds:
             flags=[_stranded_flag(task_id='3105,5080')],
         )
 
-        assert result.kept_flags == []
-        assert result.suppressed_by_task == {'3105': 1}
-        # 5080's read failed, but nothing was left unprotected by it, so the
-        # cycle is NOT reported degraded — this is the assertion that covers
-        # the `if t in kept_task_ids` filter.
-        assert result.unresolved_task_ids == ()
+        assert [flag[PRESERVED_SPECIMEN_COMPONENTS_KEY] for flag in result.kept_flags] == [
+            {'3105': LIVE_MEM0_ROW['id']},
+        ]
+        assert result.suppressed_by_task == {}
+        assert result.unresolved_task_ids == ('5080',)
 
     @pytest.mark.asyncio
     async def test_unreadable_component_of_an_uncorroborated_flag_is_disclosed(self):
