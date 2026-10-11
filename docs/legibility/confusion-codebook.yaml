@@ -1306,6 +1306,13 @@ entries:
     origin_phase: recon
     manifested_phase: review
     note: Guard trip at turn 195 rendered as bare conclusion 'blocked:' without stating the observation that triggered it — states assertion instead of evidence
+  - date: '2026-10-10'
+    project: dark_factory
+    session: 8c56b8c5-b2f5-4ad9-bfba-f00bcc171a49
+    origin_phase: verify
+    manifested_phase: verify
+    invariant_violated: corroborate-before-acting
+    note: Block reason asserts the test_quality_metrics_snapshot failure is 'preexisting on main' without any run-on-main evidence visible in the digest. The digest excerpt shows only the failing test list and log paths. The claim is unverified here, though the digest alone cannot prove it false.
 - id: merge-state-not-git-corroborated
   title: Merge-lane state answers come from run-scoped caches and persisted snapshots that diverge from git truth
   severity: high
@@ -2356,6 +2363,12 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: The harness guard blocked a 'sleep 45' chained with tail during a watcher-style wait and directed the agent to Monitor or run_in_background, which is the same bash-wait mismatch this entry describes.
+  - date: '2026-10-10'
+    project: dark_factory
+    session: e8c6b5cc-89d8-409a-9904-d601d0e0a6fa
+    origin_phase: ops
+    manifested_phase: ops
+    note: Escalation-watcher re-arm was repeated six times via run_in_background, and a chained 'sleep 30; cd ... && python3 ...' Bash call was blocked by the harness with advice to use Monitor or run_in_background. This is the watcher loop fighting the Bash wait harness, though the digest shows no bg-task reaping or 2-min kill directly.
 - id: subagent-runner-protocol-defects
   title: 'Sub-agent runner protocol defects: StructuredOutput shape/turn-contract traps, usage-limit resume storms, and falsy-[] predictions never persisted'
   severity: medium
@@ -8531,6 +8544,24 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: The only 'User Correction' is the injected task-framing prompt (Task ID, Worktree, Block reason, Title, Description), not a human correction. n_user_turns is 1 and the tool_error and self_correct counters are both 0.
+  - date: '2026-10-10'
+    project: dark_factory
+    session: af785379-748e-46db-b42b-198cd539dd73
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The 'User Corrections' bucket (turn 9) holds a /team command-args block containing a fleet spawn brief and an injected session-outcome-writing instruction. It reads as an injected dispatch prompt, not a human correction. Phase is unknown because the digest does not establish which dark-factory phase produced the injection.
+  - date: '2026-10-10'
+    project: dark_factory
+    session: f8aa0be0-8f87-4ccc-8b02-0ef405ef7ddb
+    origin_phase: review
+    manifested_phase: ops
+    note: The digest files an injected review-round adjudicator prompt (all signal_counts zero) under 'User Corrections' as if it were corrective user feedback, the same injected-prompt mislabeling this entry describes.
+  - date: '2026-10-10'
+    project: dark_factory
+    session: 234f6243-126f-48b1-80be-671fcc02a1da
+    origin_phase: unknown
+    manifested_phase: review
+    note: The 'User Corrections' bucket holds the injected review-round adjudicator task prompt (PRIOR-ROUND SUGGESTIONS block and instructions), not a user correction. The session is an orchestrated-task review adjudication, so the manifested phase is review. The generator is a digest tool, not a dark-factory phase, so origin is unknown.
 - id: entry-cand-20260723-5
   title: Recon terminal-task write guard's corrective_path covers only done_provenance, leaving other terminal-task string fields permanently unrepairable and silently re-diagnosed each recurrence
   severity: medium
@@ -10842,6 +10873,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: The 'User Corrections' bucket holds the injected escalation report for task 4919 (esc-4919-5, review cycles exhausted). It is pasted non-corrective report content, not user feedback.
+  - date: '2026-10-10'
+    project: dark_factory
+    session: 8c56b8c5-b2f5-4ad9-bfba-f00bcc171a49
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The 'User Corrections' bucket holds a machine-generated verify block report and log listing, not user corrective feedback. This is the digest-pipeline mislabel pattern for pasted non-corrective report content. Phase is unknown because the mislabel is in the digest tooling, not the agent.
 - id: entry-cand-20260728-1
   title: Digest pipeline mislabels an ordinary task's injected '# Context' project-briefing block as a 'User Correction'
   severity: medium
@@ -17200,6 +17237,36 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Orchestrated worktree task whose only signal is a bare 'no such file or directory' not_found (turn 63), with no other diagnostics. The digest holds no path, command or user turns, so the cause (e.g. cwd drift) cannot be determined and the phase stays unknown.
+  - date: '2026-10-10'
+    project: dark_factory
+    session: 296b7105-6a87-4506-abe3-0e425ed2da67
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated worktree task (cwd .worktrees/3972) logs 10 not_found signals ('no such file or directory' / 'does not exist') with all other signal counts at zero and no further diagnostic text, matching the entry's description. The digest does not show which phase or path was involved, so both phases are unknown.
+  - date: '2026-10-10'
+    project: dark_factory
+    session: db19372b-c19d-4ed9-ad32-6baeddae31f5
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Nine 'no such file or directory' / 'does not exist' not-found signals in an orchestrated-task session in a worktree, with tool_error, self_correct, and df_guard all at zero and no other diagnostic text. This matches the entry's description. The digest does not show which phase the session was in, so both phases are unknown.
+  - date: '2026-10-10'
+    project: dark_factory
+    session: 5041e2e8-f9d8-4582-84c8-ae339c29aecd
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Partial match. The digest shows five not_found signals ('no such file or directory' / 'does not exist') in an orchestrated worktree session, and the only error neighborhood with a stated path is an `ls` of a fused-memory/data directory that does not exist in the worktree. Nothing else in the digest explains the failures. The digest does not establish the phase, so both phases are unknown.
+  - date: '2026-10-10'
+    project: dark_factory
+    session: 7541d6b6-e8e6-4755-ae52-8aba57399f4f
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Orchestrated-task worktree session (cwd .worktrees/5890) with two ''no such file or directory'' not_found signals (turns 90 and 389) and no other diagnostic signal. The digest does not show which file or phase the agent was working in, so phases are unknown. Match is weak: the not_found events are thin and the single tool_error is an exit-2 grep/ls probe for pyright/ruff config files.'
+  - date: '2026-10-10'
+    project: dark_factory
+    session: 8c56b8c5-b2f5-4ad9-bfba-f00bcc171a49
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: signal_counts.not_found=3 with 'no such file or directory' at turns 22 and 23 in an orchestrated worktree task, with no other diagnostic signal.
 - id: entry-cand-20260809-16
   title: Agent falls back to a whole-filesystem `find /` to locate an installed package's source, timing out the Bash call
   severity: medium
@@ -33547,3 +33614,16 @@ candidates:
     origin_phase: implement
     manifested_phase: review
     evidence_quote: cross-project ("external") dependencies are not stored in `dependencies`. docs/task-authoring.md §3.2 says a qualified `project_id:task_id` dep is routed to `metadata.external_deps` instead of the integer table... `test_cross_project_dependency_spelling_is_skipped_not_raised` tests a shape that cannot reach the guard and gives false assurance
+- id: cand-20261010-1
+  title: Restart teardown leaves the task worktree, branch, and plan intact, so re-dispatch silently re-adopts stale state
+  cause: harness.py::_action_teardown(action='restart') clears merge_retry_pending and gate stamps and resets the task to pending, but does not touch the task worktree, its branch, or .task-meta/<id>/plan.json (or the in-worktree .task/plan.json). A re-dispatched architect therefore re-adopts a plan authored against an 11k-commit-stale branch, marks every step pre-satisfied, and the restart loops on the same failure.
+  area: orchestrator-restart-teardown
+  first_seen: '2026-10-10'
+  disposition: pending
+  sightings:
+  - date: '2026-10-10'
+    project: dark_factory
+    session: 674fe2fc-7999-4738-8ab6-7509e1b7aa2f
+    origin_phase: ops
+    manifested_phase: architect
+    evidence_quote: harness.py::_action_teardown(action='restart') clears merge_retry_pending and deterministic gate stamps, sets the task to pending and kills the workflow. It does NOT touch the task worktree, its branch, or .task-meta/<id>/plan.json (also .task/plan.json inside the worktree).
