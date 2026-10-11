@@ -76,8 +76,8 @@ from fused_memory.maintenance.link_heal_ledger import (
     AdjudicationRecord,
     AdjudicationRow,
     LinkHealLedger,
-    RunRow,
     RunSource,
+    UndoTarget,
 )
 from fused_memory.maintenance.link_heal_store import (
     LinkCensus,
@@ -376,6 +376,11 @@ def plan_sha256(document: bytes) -> str:
     return hashlib.sha256(document).hexdigest()
 
 
+def pending_plan_sha256(pending: Sequence[ActionRow]) -> str:
+    """The sha an --approved-plan-sha is checked against: that of the plan document *pending* renders."""
+    return plan_sha256(render_plan_document(pending))
+
+
 def _plan_entry(row: ActionRow) -> dict[str, Any]:
     heal = row.planned
     return {
@@ -491,7 +496,7 @@ async def _publish_plan(
         escape.anchor for escape in (backlog, *shares, *escapes) if escape is not None
     )
     counts = replace(counts, would_escape=would_escape)
-    ledger.finish_run(run_id, counts=counts.as_json(), plan_sha256=sha)
+    ledger.finish_run(run_id, counts=counts.as_json(), plan_sha256=sha, plan_path=plan_path)
     return RunReport(run_id=run_id, counts=counts, plan_sha256=sha, plan_path=plan_path)
 
 
@@ -738,7 +743,7 @@ class ApprovalMismatch(ValueError):
 
 
 def _check_approval(approved: str, pending: Sequence[ActionRow]) -> None:
-    actual = plan_sha256(render_plan_document(pending))
+    actual = pending_plan_sha256(pending)
     if actual != approved:
         raise ApprovalMismatch(expected=approved, actual=actual)
 
@@ -948,10 +953,10 @@ async def _undo_heal(
 
 
 async def run_undo(
-    target: RunRow, *, store: LinkHealStore, ledger: LinkHealLedger, limits: RunLimits,
+    target: UndoTarget, *, store: LinkHealStore, ledger: LinkHealLedger, limits: RunLimits,
 ) -> RunReport:
-    """A writing run taking back every heal *target* applied, newest first."""
-    heals = ledger.applied_actions(target.run_id)[::-1]
+    """A writing run taking back every heal *target* still has applied, newest first."""
+    heals = target.heals[::-1]
     run_id = ledger.start_run(RunSource.UNDO, writes=True)
     drain = _Drain()
     for index, row in enumerate(heals):
