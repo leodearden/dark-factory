@@ -136,8 +136,9 @@ def test_finding_identity_rejects_a_malformed_field(overrides, field, offending)
 def test_from_record_round_trips_a_keyed_record():
     identity = _identity()
     record = {"id": "entry-a", **identity.to_fields()}
-    assert census_findings.FindingIdentity.from_record(record) == identity
-    assert census_findings.FindingIdentity.from_record(record).to_fields() == identity.to_fields()
+    restored = census_findings.FindingIdentity.from_record(record)
+    assert restored == identity
+    assert restored is not None and restored.to_fields() == identity.to_fields()
 
 
 def test_from_record_of_an_unkeyed_record_is_none():
