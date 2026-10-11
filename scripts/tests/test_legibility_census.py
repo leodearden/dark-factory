@@ -2209,10 +2209,17 @@ def test_findings_section_names_the_area_maps_degradation(tmp_path):
         assert note in text
 
 
-def test_findings_section_counts_the_unverified_rows():
-    text = _findings_text(findings=(_sample_finding_record(observed=True),))
+@pytest.mark.parametrize("unverified", [1, 2])
+def test_findings_section_counts_the_unverified_rows(unverified):
+    observed = tuple(_sample_finding_record(observed=True) for _ in range(unverified))
+    text = _findings_text(findings=(*observed, _sample_finding_record()))
     bullets = [line for line in text.splitlines() if line.startswith("- ")]
-    assert [line for line in bullets if "1" in line and "unverified" in line.lower()]
+    assert [line for line in bullets if line.startswith(f"- {unverified} re-observed finding(s)")]
+
+
+def test_findings_section_has_no_unverified_bullet_without_unverified_rows():
+    text = _findings_text(findings=(_sample_finding_record(),))
+    assert "re-observed" not in text
 
 
 def test_a_pipe_in_a_statement_does_not_break_the_findings_table():

@@ -1,5 +1,6 @@
 """The census's side of docs/quality-findings-contract.md §1: the finding
-identity a Verdict gives a codebook record, and the §1 row that record reports
+identity a Verdict gives a codebook record, the §1 row that record reports,
+and the report's ``## Findings`` section those rows render to
 (plans/census-incremental-prd.md leaf L3).
 """
 from __future__ import annotations
@@ -7,7 +8,7 @@ from __future__ import annotations
 import copy
 import enum
 import sys
-from collections.abc import Collection, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,8 +18,12 @@ from typing import Any
 if (_SHARED_SRC := str(Path(__file__).resolve().parents[2] / "shared" / "src")) not in sys.path:
     sys.path.insert(0, _SHARED_SRC)
 
-from legibility import codebook, finding_area, verdict
+from legibility import check_census_report, codebook, finding_area, verdict
 from shared.finding_key import finding_key
+
+
+def has_identity(record: Mapping[str, Any]) -> bool:
+    return any(field in record for field in codebook.FINDING_IDENTITY_FIELDS)
 
 
 def _raise_on(errors: list[codebook.FindingIdentityError], location: str) -> None:
@@ -50,7 +55,7 @@ class FindingIdentity:
 
         Raises ValueError on a partial or malformed identity, which
         ``codebook.validate`` reports for the same record."""
-        if not any(field in record for field in codebook.FINDING_IDENTITY_FIELDS):
+        if not has_identity(record):
             return None
         _raise_on(codebook.finding_identity_errors(record), f"record {record.get('id')!r}")
         return cls(
@@ -123,23 +128,7 @@ def mark_seen(cb: dict, *, run_id: str, sessions: Collection[str]) -> tuple[dict
     return result, tuple(sighted)
 
 
-FINDING_ROW_FIELDS = (
-    "id",
-    "key",
-    "area",
-    "sub_area",
-    "anchor",
-    "tags",
-    "severity",
-    "evidence_source",
-    "statement",
-    "proposal",
-    "verdict",
-    "disposition",
-    "first_seen",
-    "last_seen",
-    "supersedes",
-)
+FINDING_ROW_FIELDS = ("id", *check_census_report.FINDING_FIELDS)
 """The keys of :meth:`FindingRow.to_record`, in order: the display id, then contract §1's fields."""
 
 
@@ -251,3 +240,89 @@ def refuted_row(
         last_seen=(run_id,),
         supersedes=(),
     )
+
+
+@dataclass(frozen=True)
+class Adjudication:
+    """One verdict this run applied to a codebook record: *record_id* is the
+    entry a promotion created or the candidate a rejection stamped."""
+
+    record_id: str
+    found: verdict.Verdict
+    cause: str | None
+
+
+def finding_rows(
+    cb: Mapping[str, Any],
+    *,
+    promoted: Sequence[Adjudication],
+    refuted: Sequence[Adjudication],
+    sighted: Sequence[str],
+    run_id: str,
+    cause_of: Callable[[Mapping[str, Any]], str | None],
+) -> list[FindingRow]:
+    """The run's contract §1 rows: confirmed per promotion, refuted per
+    verdict-bearing rejection, unverified per keyed entry re-sighted and not
+    promoted this run, stated by *cause_of* that entry."""
+    entries = {entry["id"]: entry for entry in cb.get("entries") or []}
+    candidates = {candidate["id"]: candidate for candidate in cb.get("candidates") or []}
+    promoted_ids = {adjudication.record_id for adjudication in promoted}
+    observed = [
+        entries[entry_id] for entry_id in sighted
+        if entry_id not in promoted_ids and has_identity(entries[entry_id])
+    ]
+    return [
+        *(confirmed_row(entries[a.record_id], a.found, a.cause) for a in promoted),
+        *(refuted_row(candidates[a.record_id], a.found, a.cause, run_id=run_id) for a in refuted),
+        *(observed_row(entry, cause_of(entry)) for entry in observed),
+    ]
+
+
+def _cell(value: Any) -> str:
+    if value is None:
+        return ""
+    text = ", ".join(str(item) for item in value) if isinstance(value, list) else str(value)
+    return " ".join(text.split()).replace("|", "\\|")
+
+
+def _table_row(cells: Sequence[str]) -> str:
+    return "| " + " | ".join(cells) + " |"
+
+
+def _area_map_lines(area_map: Mapping[str, Any] | None) -> list[str]:
+    if area_map is None:
+        return []
+    rules = ", ".join(f"`{glob}` → `{area}`" for glob, area in area_map["rules"]) or "none"
+    summary = (
+        f"- area map: briefing {area_map['briefing'] or 'none'}; "
+        f"areas {', '.join(area_map['areas'])}; overlay {area_map['overlay'] or 'none'}; "
+        f"rules {rules}"
+    )
+    return [summary, *(f"- area map note: {note}" for note in area_map["notes"])]
+
+
+def _unverified_lines(findings: Sequence[Mapping[str, Any]]) -> list[str]:
+    unverified = sum(1 for row in findings if row["verdict"] == FindingVerdict.UNVERIFIED)
+    if not unverified:
+        return []
+    return [
+        f"- {unverified} re-observed finding(s) are unverified: the census does not "
+        "re-verify a catalogued finding, so a sighting this run only appends to its last_seen."
+    ]
+
+
+def report_lines(record: Mapping[str, Any]) -> list[str]:
+    """The report's ``## Findings`` section, rendered from the run record's
+    ``findings`` rows (:meth:`FindingRow.to_record`) and ``area_map``
+    (``finding_area.AreaMap.to_record``)."""
+    findings = record["findings"]
+    notes = [*_area_map_lines(record["area_map"]), *_unverified_lines(findings)]
+    lines = ["", "## Findings", "", *notes, *([""] if notes else [])]
+    if not findings:
+        return [*lines, "_no findings touched this run._"]
+    return [
+        *lines,
+        _table_row(FINDING_ROW_FIELDS),
+        _table_row(["---"] * len(FINDING_ROW_FIELDS)),
+        *(_table_row([_cell(row[column]) for column in FINDING_ROW_FIELDS]) for row in findings),
+    ]

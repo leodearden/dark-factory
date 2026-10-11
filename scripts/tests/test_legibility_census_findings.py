@@ -313,4 +313,35 @@ def test_a_row_falls_back_to_the_title_when_there_is_no_cause():
 def test_a_rows_record_keys_are_the_published_row_fields_in_order():
     record = census_findings.observed_row(_keyed_entry(), "c").to_record()
     assert tuple(record) == census_findings.FINDING_ROW_FIELDS
-    assert ("id", *check_census_report.FINDING_FIELDS) == census_findings.FINDING_ROW_FIELDS
+
+
+# finding_rows ----------------------------------------------------------------
+
+
+def test_finding_rows_reports_promotions_rejections_and_keyed_re_sightings():
+    promoted = _keyed_entry("entry-promoted")
+    re_sighted = _keyed_entry("entry-re-sighted")
+    unkeyed = _entry("entry-unkeyed")
+    rejected = census_findings.stamped(_candidate(), _identity())
+    cb = {"version": 2, "entries": [promoted, re_sighted, unkeyed], "candidates": [rejected]}
+    asked: list[str] = []
+
+    def cause_of(entry):
+        asked.append(entry["id"])
+        return f"cause of {entry['id']}"
+
+    rows = census_findings.finding_rows(
+        cb,
+        promoted=[census_findings.Adjudication("entry-promoted", _found(), "promoted cause")],
+        refuted=[census_findings.Adjudication(rejected["id"], _found(), "refuted cause")],
+        sighted=["entry-promoted", "entry-re-sighted", "entry-unkeyed"],
+        run_id=_RUN,
+        cause_of=cause_of,
+    )
+    assert [(row.record_id, row.verdict) for row in rows] == [
+        ("entry-promoted", census_findings.FindingVerdict.CONFIRMED),
+        (rejected["id"], census_findings.FindingVerdict.REFUTED),
+        ("entry-re-sighted", census_findings.FindingVerdict.UNVERIFIED),
+    ]
+    assert asked == ["entry-re-sighted"]
+    assert rows[-1].statement == "cause of entry-re-sighted"

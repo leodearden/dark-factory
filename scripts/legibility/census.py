@@ -1390,56 +1390,6 @@ def _from_record(cls, value: Mapping[str, Any] | None):
     return cls(**value) if value is not None else None
 
 
-def _finding_cell(value: Any) -> str:
-    if value is None:
-        return ""
-    text = ", ".join(str(item) for item in value) if isinstance(value, list) else str(value)
-    return " ".join(text.split()).replace("|", "\\|")
-
-
-def _finding_table_row(cells: Sequence[str]) -> str:
-    return "| " + " | ".join(cells) + " |"
-
-
-def _area_map_lines(area_map: Mapping[str, Any] | None) -> list[str]:
-    if area_map is None:
-        return []
-    rules = ", ".join(f"`{glob}` → `{area}`" for glob, area in area_map["rules"]) or "none"
-    summary = (
-        f"- area map: briefing {area_map['briefing'] or 'none'}; "
-        f"areas {', '.join(area_map['areas'])}; overlay {area_map['overlay'] or 'none'}; "
-        f"rules {rules}"
-    )
-    return [summary, *(f"- area map note: {note}" for note in area_map["notes"])]
-
-
-def _unverified_lines(findings: Sequence[Mapping[str, Any]]) -> list[str]:
-    unverified = sum(
-        1 for row in findings if row["verdict"] == census_findings.FindingVerdict.UNVERIFIED
-    )
-    if not unverified:
-        return []
-    return [
-        f"- {unverified} re-observed finding(s) are unverified: the census does not "
-        "re-verify a catalogued finding, so a sighting this run only appends to its last_seen."
-    ]
-
-
-def _findings_lines(record: Mapping[str, Any]) -> list[str]:
-    findings = record["findings"]
-    notes = [*_area_map_lines(record["area_map"]), *_unverified_lines(findings)]
-    lines = ["", "## Findings", "", *notes, *([""] if notes else [])]
-    if not findings:
-        return [*lines, "_no findings touched this run._"]
-    columns = census_findings.FINDING_ROW_FIELDS
-    return [
-        *lines,
-        _finding_table_row(columns),
-        _finding_table_row(["---"] * len(columns)),
-        *(_finding_table_row([_finding_cell(row[column]) for column in columns]) for row in findings),
-    ]
-
-
 def census_report_sections(record: Mapping[str, Any]) -> tuple[ReportSection, ...]:
     """The census report, decomposed, rendered from *record*
     (:func:`build_census_record`) alone: the record is the source and the
@@ -1641,7 +1591,7 @@ def census_report_sections(record: Mapping[str, Any]) -> tuple[ReportSection, ..
         ["## Synthesis", "", SYNTHESIS_NOT_APPLIED_NOTICE, "", record["synthesis_md"]],
     )
 
-    emit(SECTION_FINDINGS, _findings_lines(record))
+    emit(SECTION_FINDINGS, census_findings.report_lines(record))
 
     filed_tasks = ["", "## Filed Tasks", ""]
     if dry_run is not None:
@@ -1871,17 +1821,20 @@ _RELEASABLE_ENTRY_STATUSES = frozenset({"open", "partially"})
 retired confusion needs no ticket."""
 
 
+def _entry_text(cb: dict, entry: Mapping[str, Any], field: str) -> str | None:
+    """*entry*'s *field* (``cause`` or ``area``): its own when a correction has
+    written it, else that of the candidate it was promoted from."""
+    return entry.get(field) or (_promoted_from(cb, entry["id"]) or {}).get(field)
+
+
 def _entry_cluster(cb: dict, entry: dict) -> dict:
-    """A fileable cluster rebuilt from codebook *entry*. Its cause and area are
-    the entry's own when a correction has written them, else those of the
-    candidate it was promoted from; its severity and finding identity are the
-    entry's own."""
-    source = _promoted_from(cb, entry["id"]) or {}
+    """A fileable cluster rebuilt from codebook *entry*, by :func:`_entry_text`;
+    its severity and finding identity are the entry's own."""
     sightings = list(entry.get("sightings") or [])
     cluster = _cluster_record(
         title=entry["title"],
-        cause=entry.get("cause") or source.get("cause"),
-        area=entry.get("area") or source.get("area"),
+        cause=_entry_text(cb, entry, "cause"),
+        area=_entry_text(cb, entry, "area"),
         origin_phase=entry["origin_phase"],
         manifested_phase=entry["manifested_phase"],
         evidence=[s["evidence_quote"] for s in sightings if s.get("evidence_quote")],
@@ -1957,47 +1910,6 @@ def _with_finding(cluster: dict, area_map: finding_area.AreaMap) -> dict:
         "finding": census_findings.identity_of(found, area_map),
         "severity": found.severity,
     }
-
-
-@dataclass(frozen=True)
-class Adjudication:
-    """One verdict this run applied to a codebook record: *record_id* is the
-    entry a promotion created or the candidate a rejection stamped."""
-
-    record_id: str
-    found: verdict_mod.Verdict
-    cause: str | None
-
-
-def _finding_rows(
-    cb: dict,
-    *,
-    promoted: Sequence[Adjudication],
-    refuted: Sequence[Adjudication],
-    sighted: Sequence[str],
-    run_id: str,
-) -> list[census_findings.FindingRow]:
-    """The run's contract §1 rows: confirmed per promotion, refuted per
-    verdict-bearing rejection, unverified per keyed entry re-sighted and not
-    promoted this run."""
-    entries = {entry["id"]: entry for entry in cb.get("entries") or []}
-    candidates = {candidate["id"]: candidate for candidate in cb.get("candidates") or []}
-    promoted_ids = {adjudication.record_id for adjudication in promoted}
-    return [
-        *(
-            census_findings.confirmed_row(entries[a.record_id], a.found, a.cause)
-            for a in promoted
-        ),
-        *(
-            census_findings.refuted_row(candidates[a.record_id], a.found, a.cause, run_id=run_id)
-            for a in refuted
-        ),
-        *(
-            census_findings.observed_row(entries[entry_id], _entry_cluster(cb, entries[entry_id])["cause"])
-            for entry_id in sighted
-            if entry_id not in promoted_ids and entries[entry_id].get("finding_key")
-        ),
-    ]
 
 
 def _find_adjudicated_candidate(cb: dict, title: str | None) -> dict | None:
@@ -2966,8 +2878,8 @@ def run_census(
     # sightings into its entry, and _sighting_counts_by_title dedups by session.
     fileable, held_back = _split_fileable(verified, updated_codebook)
     marked_withheld: list[filing_policy.WithheldCluster] = []
-    promoted: list[Adjudication] = []
-    refuted: list[Adjudication] = []
+    promoted: list[census_findings.Adjudication] = []
+    refuted: list[census_findings.Adjudication] = []
 
     for cluster in verified:
         cand_id = _find_pending_candidate_id(updated_codebook, cluster.get("title"))
@@ -3009,7 +2921,7 @@ def run_census(
         updated_codebook = promote_candidate(
             updated_codebook, cand_id, entry_fields, finding=cluster["finding"],
         )
-        promoted.append(Adjudication(entry_fields["id"], found, cluster.get("cause")))
+        promoted.append(census_findings.Adjudication(entry_fields["id"], found, cluster.get("cause")))
 
     withheld = tuple(marked_withheld)
     if withheld:
@@ -3041,7 +2953,7 @@ def run_census(
             updated_codebook, cand_id, finding=cluster.get("finding"),
         )
         if cluster.get("finding") is not None:
-            refuted.append(Adjudication(cand_id, cluster["verdict"], cluster.get("cause")))
+            refuted.append(census_findings.Adjudication(cand_id, cluster["verdict"], cluster.get("cause")))
 
     for entry_id in fixed_entry_ids:
         updated_codebook = retire_entry(updated_codebook, entry_id)
@@ -3223,8 +3135,13 @@ def run_census(
         cross_project_tickets=tuple(cross_project_tickets),
         findings=[
             row.to_record()
-            for row in _finding_rows(
-                updated_codebook, promoted=promoted, refuted=refuted, sighted=sighted, run_id=run_id,
+            for row in census_findings.finding_rows(
+                updated_codebook,
+                promoted=promoted,
+                refuted=refuted,
+                sighted=sighted,
+                run_id=run_id,
+                cause_of=functools.partial(_entry_text, updated_codebook, field="cause"),
             )
         ],
         area_map=area_map.to_record(),
