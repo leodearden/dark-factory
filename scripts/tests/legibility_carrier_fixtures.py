@@ -1,5 +1,6 @@
-"""Carrier texts shared by the digest and sampler suites, so both pin
-``digest.is_non_dialogue_carrier`` against the same payloads.
+"""Carrier texts shared by the legibility suites, so the provenance
+predicates in ``legibility.reingestion``, and every reader that filters
+carriers through them, are pinned against the same payloads.
 
 A plain module rather than a conftest fixture, the same convention as
 ``suite_census_fixtures``: conftest appends this directory to ``sys.path``, so
