@@ -51,7 +51,6 @@ from orchestrator.evals.judge_pilot import (  # noqa: E402
     analyze_judge_ofat,
     format_judge_ofat_report,
 )
-from orchestrator.evals.results import ResultStore  # noqa: E402
 
 # adopt → 0 so `run_judge_ofat_pilot.py --analyze-only && apply-flip` gates
 # cleanly; every non-adopt verdict is a distinct non-zero code for triage.
@@ -64,6 +63,8 @@ def _load_results(results_dir: Path | None) -> list:
     Both branches go through :func:`_eval_results_io.load_results_from_dir`, so
     a missing dir or a malformed cell exits naming it either way.
     """
+    from orchestrator.evals.results import ResultStore
+
     return load_results_from_dir(
         results_dir if results_dir is not None else ResultStore.packaged().directory
     )
@@ -113,6 +114,8 @@ def _run_pilot(
 
 
 def _default_out() -> Path:
+    from orchestrator.evals.results import ResultStore
+
     return ResultStore.packaged().directory / 'judge_ofat_pilot_report.md'
 
 

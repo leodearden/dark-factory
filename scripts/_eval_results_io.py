@@ -8,26 +8,29 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from orchestrator.evals.results import EvalResult
 
 # scripts/ is not on sys.path when this module is imported as a plain script
 # sibling rather than through scripts/tests/conftest.py's insertion — add the
-# orchestrator src so the import below resolves the same way it does for both
-# callers (idempotent — a no-op when already present).
+# orchestrator src so the import inside load_results_from_dir resolves the same
+# way it does for both callers (idempotent — a no-op when already present).
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _ORCHESTRATOR_SRC = str(_REPO_ROOT / 'orchestrator' / 'src')
 if _ORCHESTRATOR_SRC not in sys.path:
     sys.path.insert(0, _ORCHESTRATOR_SRC)
 
-from orchestrator.evals.results import (  # noqa: E402
-    EvalResult,
-    MissingResultsDirError,
-    ResultLoadError,
-    ResultStore,
-)
-
 
 def load_results_from_dir(results_dir: Path) -> list[EvalResult]:
     """Every persisted cell in *results_dir*, or an exit naming what could not be read."""
+    from orchestrator.evals.results import (
+        MissingResultsDirError,
+        ResultLoadError,
+        ResultStore,
+    )
+
     try:
         return ResultStore(Path(results_dir)).load_all()
     except MissingResultsDirError as e:

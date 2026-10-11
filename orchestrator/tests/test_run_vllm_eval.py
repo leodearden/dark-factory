@@ -18,6 +18,8 @@ from uuid import uuid4
 import pytest
 import yaml
 
+from orchestrator.evals.results import CellName, ResultStore
+
 # Stub out runpod_toolkit BEFORE importing the launcher. The real package has
 # a transitive paramiko dependency that's not installed in the orchestrator
 # test venv, and we never need real RunPod calls in tests anyway — pod
@@ -74,7 +76,6 @@ from run_vllm_eval import (  # type: ignore[import-not-found]  # noqa: E402
     wait_for_vllm,
 )
 
-from orchestrator.evals.results import CellName, ResultStore  # noqa: E402
 from orchestrator.evals.snapshots import eval_worktree_root  # noqa: E402
 
 # ---------------------------------------------------------------------------
