@@ -2,8 +2,8 @@
 
 An ADDITIVE, CONSUME-ONLY analysis surface over the eval-revival ο judge-OFAT
 seam (task 2825). This module IMPORTS ``report.build_composite_report`` /
-``format_composite_table`` and ``runner.load_results`` / ``run_ofat_stage`` and
-MODIFIES NONE of them (PRD decision 11 forbids this PRD from editing the eval
+``format_composite_table`` and consumes ``ResultStore.load_all`` / ``run_ofat_stage``
+output, and MODIFIES NONE of them (PRD decision 11 forbids this PRD from editing the eval
 instrument — runner.py / configs.py / the judge / the Elo machinery). It is the
 consumer of ο's composite that turns a judge-OFAT run into a decide-and-act
 verdict: trial ``judge-haiku`` against the ``judge-sonnet`` incumbent on the

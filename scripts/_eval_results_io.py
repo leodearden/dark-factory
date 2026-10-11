@@ -13,9 +13,7 @@ the hardening from one implementation instead of two independently-maintained
 copies.
 
 Both drivers import ``load_results_from_dir`` directly rather than each
-keeping a private wrapper — there is exactly one implementation to keep in
-sync with ``orchestrator.evals.runner.load_results``, which this mirrors over
-an arbitrary dir rather than the packaged ``RESULTS_DIR``.
+keeping a private wrapper.
 """
 from __future__ import annotations
 
@@ -38,9 +36,9 @@ if _ORCHESTRATOR_SRC not in sys.path:
 def load_results_from_dir(results_dir: Path) -> list[Any]:
     """Load every persisted ``EvalResult`` JSON in *results_dir*.
 
-    Filters each loaded dict to the known dataclass fields, mirroring
-    ``runner.load_results``, so a cell persisted before a field existed still
-    loads instead of raising on an unexpected keyword.
+    Filters each loaded dict to the known dataclass fields, so a cell
+    persisted before a field existed still loads instead of raising on an
+    unexpected keyword.
 
     TWO LOUD FAILURES, both because this path is aimed by default at the
     SHARED packaged results dir holding cells written by many campaigns over

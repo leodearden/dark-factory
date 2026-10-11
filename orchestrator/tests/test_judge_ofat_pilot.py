@@ -4,7 +4,7 @@ Pure-function tests over λ's ``build_composite_report``-shaped dict — the sam
 hermetic ``_row``/``_report`` style as ``test_eval_driver_report.py``. The pilot
 module is a CONSUME-ONLY analysis surface over the ο judge-OFAT seam (task 2825):
 it imports ``report.build_composite_report`` / ``format_composite_table`` and
-``runner.load_results`` / ``run_ofat_stage`` and edits none of them (decision 11).
+``ResultStore.load_all`` / ``run_ofat_stage`` and edits none of them (decision 11).
 
 Every ``decide_judge_adoption`` / ``format_judge_ofat_report`` test is hermetic:
 it constructs the composite-report dict directly with hand-set composite means +

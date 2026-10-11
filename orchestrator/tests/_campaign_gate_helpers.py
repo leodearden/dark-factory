@@ -59,8 +59,8 @@ def stage_task_loader(path: Path) -> dict:
     """Minimal task dict for a fan-out whose executors are all faked.
 
     Carries the union of what the campaign loops read before dispatch:
-    ``run_eval_matrix`` reads ``task['id']`` (only for ``_result_exists``,
-    which ``force=True`` skips) and the stage thunks read nothing else. The
+    ``run_eval_matrix`` reads ``task['id']`` (only for its store's ``exists``
+    check, which ``force=True`` skips) and the stage thunks read nothing else. The
     executors themselves are monkeypatched, so it is never deeply inspected.
     """
     return {'id': path.stem, 'project_root': '/fake', 'pre_task_commit': 'x'}
