@@ -23,29 +23,10 @@ from legibility_carrier_fixtures import (
     json_fenced,
     merger_prompt,
     recon_run_review_text,
+    user_record,
+    with_origin,
 )
 from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT
-
-
-def _user_record(text):
-    """A minimal genuine user record carrying *text*."""
-    return {
-        'type': 'user',
-        'message': {'role': 'user', 'content': text},
-        'isSidechain': False,
-        'isMeta': False,
-    }
-
-
-def _with_origin(rec, kind):
-    """Return a copy of *rec* stamped with Claude Code's structured
-    provenance ``origin={'kind': kind}`` and with its 'isMeta' key REMOVED:
-    a real origin-stamped record carries isMeta absent, not False."""
-    out = dict(rec)
-    out.pop('isMeta', None)
-    out['origin'] = {'kind': kind}
-    return out
-
 
 # ---------------------------------------------------------------------------
 # is_coder_judgment_payload -- the re-ingestion content classifier's
@@ -312,25 +293,25 @@ class TestNonHumanOriginFilter:
         # The text alone is ordinary dialogue to the content classifier, so
         # only the record's provenance can exclude it -- and the rule is
         # "anything but human", never an allowlist of known machine kinds.
-        rec = _with_origin(_user_record(text), kind)
+        rec = with_origin(user_record(text), kind)
 
         assert reingestion.is_reingested_content(text) is False
         assert reingestion.has_non_human_origin(rec) is True
 
     def test_human_origin_record_quoting_a_notification_mid_prose_is_kept(self):
         text = 'why did the <task-notification> for the lint run say failed? please look again'
-        rec = _with_origin(_user_record(text), 'human')
+        rec = with_origin(user_record(text), 'human')
 
         assert reingestion.has_non_human_origin(rec) is False
 
     @pytest.mark.parametrize(
         'record',
         [
-            _user_record(UNKNOWN_PROVENANCE_TEXT),
-            {**_user_record(UNKNOWN_PROVENANCE_TEXT), 'origin': 'task-notification'},
-            {**_user_record(UNKNOWN_PROVENANCE_TEXT), 'origin': {}},
-            {**_user_record(UNKNOWN_PROVENANCE_TEXT), 'origin': {'kind': None}},
-            {**_user_record(UNKNOWN_PROVENANCE_TEXT), 'origin': {'body': 'x'}},
+            user_record(UNKNOWN_PROVENANCE_TEXT),
+            {**user_record(UNKNOWN_PROVENANCE_TEXT), 'origin': 'task-notification'},
+            {**user_record(UNKNOWN_PROVENANCE_TEXT), 'origin': {}},
+            {**user_record(UNKNOWN_PROVENANCE_TEXT), 'origin': {'kind': None}},
+            {**user_record(UNKNOWN_PROVENANCE_TEXT), 'origin': {'body': 'x'}},
         ],
         ids=['absent', 'bare_string', 'empty_dict', 'none_kind', 'no_kind_key'],
     )

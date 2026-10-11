@@ -15,6 +15,58 @@ from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.config import GitConfig, OrchestratorConfig
 
 
+def user_record(content, **flags) -> dict:
+    """A user record carrying *content* (a str turn or a list of blocks),
+    genuine by default: non-sidechain, non-meta. *flags* override the
+    top-level keys, e.g. ``isSidechain=True``."""
+    return {
+        'type': 'user',
+        'message': {'role': 'user', 'content': content},
+        'isSidechain': False,
+        'isMeta': False,
+        **flags,
+    }
+
+
+def text_block(text: str) -> dict:
+    """An assistant or user 'text' content block."""
+    return {'type': 'text', 'text': text}
+
+
+def tool_use_block(name: str, tool_input: dict, tool_use_id: str = 'tool-1') -> dict:
+    """An assistant 'tool_use' content block."""
+    return {'type': 'tool_use', 'id': tool_use_id, 'name': name, 'input': tool_input}
+
+
+def assistant_record(*blocks: dict) -> dict:
+    """An assistant record wrapping *blocks*."""
+    return {
+        'type': 'assistant',
+        'message': {'role': 'assistant', 'content': list(blocks)},
+        'isSidechain': False,
+    }
+
+
+def tool_result_record(tool_use_id: str, content, *, is_error: bool = False) -> dict:
+    """A user record wrapping a single tool_result block."""
+    return user_record([{
+        'type': 'tool_result',
+        'tool_use_id': tool_use_id,
+        'content': content,
+        'is_error': is_error,
+    }])
+
+
+def with_origin(record: dict, kind: str) -> dict:
+    """Return a copy of *record* stamped with Claude Code's structured
+    provenance ``origin={'kind': kind}`` and with its 'isMeta' key REMOVED:
+    a real origin-stamped record carries isMeta absent, not False."""
+    out = dict(record)
+    out.pop('isMeta', None)
+    out['origin'] = {'kind': kind}
+    return out
+
+
 def coder_judgment(note: str = "that's wrong: the watcher re-armed on a stale lease") -> str:
     """A trickle-coder answer as it lands in a transcript: the whole
     judgment on ONE line, shaped after session b203a05c record 22. *note*

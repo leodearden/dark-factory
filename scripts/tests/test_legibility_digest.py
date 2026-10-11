@@ -34,7 +34,6 @@ from legibility_carrier_fixtures import (
     CENSUS_MEMORY_CONTEXT_TURN,
     NON_HUMAN_ORIGIN_IDS,
     NON_HUMAN_ORIGIN_TURNS,
-    PROSE_QUOTING_THE_SCHEMA,
     TASK_NOTIFICATION_TEXT,
     TRICKLE_CODER_PREAMBLE,
     UNKNOWN_PROVENANCE_TEXT,
@@ -43,6 +42,7 @@ from legibility_carrier_fixtures import (
     json_fenced,
     merger_prompt,
     recon_run_review_text,
+    with_origin,
 )
 from orchestrator.agents.memory_recall import (
     MEMORY_CONTEXT_CAVEAT,
@@ -653,166 +653,19 @@ class TestErrorNeighborhoodPartition:
 
 
 # ---------------------------------------------------------------------------
-# _extract_exit_code / classify_designed_outcome — the 07-31 census cluster
-# 1.3 finding (plans/confusion-census-2026-07-31.md:97): watcher-rearm.sh's
-# bounded-wait CEILING is a DESIGNED loop-continuation outcome that the
-# extractor counted as a tool_error, inflating session a189558e's error
-# signal 4x and burying the one genuine failure among false positives.
-# Recognition is two-tier: the machine-readable self-declaration first
-# (scripts/watcher-rearm.sh:228-237), the bare exit code second.
+# Designed outcomes -- the 07-31 census cluster 1.3 finding
+# (plans/confusion-census-2026-07-31.md:97). The classifier itself is pinned
+# in test_legibility_detectors.py; these tests pin its digest consequences.
 # ---------------------------------------------------------------------------
 
 _CEILING_DECLARATION = 'WATCHER_REARM_OUTCOME: CEILING exit=124'
 """The sighted line verbatim (plans/confusion-census-2026-07-31.md:97)."""
 
 
-class TestDesignedOutcomeRecognition:
-    def test_extracts_exit_equals_form(self):
-        assert mod._extract_exit_code(_CEILING_DECLARATION) == 124
-
-    def test_extracts_exit_code_prose_form(self):
-        assert mod._extract_exit_code('command failed with exit code 2') == 2
-
-    def test_extracts_exit_status_prose_form(self):
-        assert mod._extract_exit_code('exit status 137') == 137
-
-    def test_extraction_is_case_insensitive(self):
-        assert mod._extract_exit_code('Exit Code 2') == 2
-
-    def test_returns_none_when_no_code_present(self):
-        assert mod._extract_exit_code('something went wrong') is None
-
-    def test_first_match_wins_when_several_appear(self):
-        text = 'exit=124\nlater the retry gave exit code 2\n'
-
-        assert mod._extract_exit_code(text) == 124
-
-    def test_declared_ceiling_is_designed(self):
-        exit_code, label = mod.classify_error_content(_CEILING_DECLARATION)
-
-        assert exit_code == 124
-        assert label is not None
-
-    def test_declared_fired_is_designed(self):
-        _, label = mod.classify_error_content('WATCHER_REARM_OUTCOME: FIRED exit=0')
-
-        assert label is not None
-
-    def test_declared_fired_reports_its_own_zero_exit_code(self):
-        # exit=0 is falsy: the deciding-marker code must be selected with an
-        # explicit None check, never a truthiness fallback.
-        exit_code, _ = mod.classify_error_content('WATCHER_REARM_OUTCOME: FIRED exit=0')
-
-        assert exit_code == 0
-
-    def test_declared_killed_is_a_genuine_failure(self):
-        # scripts/watcher-rearm.sh:234 classes 137|143|144 as KILLED -- a
-        # REAL failure the census should still see, not a designed outcome.
-        assert mod.classify_error_content(
-            'WATCHER_REARM_OUTCOME: KILLED exit=137',
-        ) == (137, None)
-
-    def test_declared_error_is_a_genuine_failure(self):
-        # scripts/watcher-rearm.sh:237's catch-all ERROR branch.
-        assert mod.classify_error_content(
-            'WATCHER_REARM_OUTCOME: ERROR exit=2',
-        ) == (2, None)
-
-    def test_bare_exit_124_is_a_designed_bounded_wait(self):
-        _, label = mod.classify_error_content('command timed out after 600s, exit=124')
-
-        assert label is not None
-
-    def test_ordinary_failure_is_not_designed(self):
-        assert mod.classify_error_content('boom, exit code 2') == (2, None)
-
-    def test_empty_content_with_no_exit_code_is_not_designed(self):
-        assert mod.classify_error_content('') == (None, None)
-
-    def test_declaration_and_bare_124_labels_are_distinct(self):
-        # Which rule fired must stay legible to a digest reader.
-        _, declared = mod.classify_error_content(_CEILING_DECLARATION)
-        _, bare = mod.classify_error_content('timed out, exit=124')
-
-        assert declared != bare
-
-    def test_accepts_a_raw_block_list_content_field(self):
-        # The public entry point takes a tool_result 'content' field as-is
-        # (str OR list of blocks), so no caller -- in this module or in
-        # sampling.py -- needs digest's private text flattener.
-        blocks = [{'type': 'text', 'text': _CEILING_DECLARATION}]
-
-        assert (
-            mod.classify_error_content(blocks)
-            == mod.classify_error_content(_CEILING_DECLARATION)
-        )
-
-    def test_bounded_wait_exit_code_constant_is_timeout_ceiling(self):
-        assert mod.BOUNDED_WAIT_EXIT_CODE == 124
-
-
 class TestCoMingledDesignedAndGenuineContent:
-    """A designed classification must hold for the WHOLE content.
-
-    One tool_result can carry both a designed declaration and a real
-    failure: a Bash call that loops scripts/watcher-rearm.sh, or that
-    tails its log beside a failing command. The script writes its marker
-    to STDERR (:228-237), so it co-mingles with any other stderr in the
-    same result. Classifying on the first designed marker alone deletes
-    the genuine failure from BOTH ``signal_counts['tool_error']`` and the
-    Error Neighborhoods section, and renders it under Designed Outcomes
-    with the wrong exit code -- exactly the under-count that
-    DESIGNED_OUTCOME_PATTERNS' own docstring refuses to trade for.
-    """
-
-    def test_ceiling_followed_by_an_error_marker_is_genuine(self):
-        text = (
-            'WATCHER_REARM_OUTCOME: CEILING exit=124\n'
-            'WATCHER_REARM_OUTCOME: ERROR exit=2'
-        )
-
-        assert mod.classify_error_content(text) == (2, None)
-
-    def test_fired_followed_by_a_killed_marker_is_genuine(self):
-        text = (
-            'WATCHER_REARM_OUTCOME: FIRED exit=0\n'
-            'WATCHER_REARM_OUTCOME: KILLED exit=137'
-        )
-
-        assert mod.classify_error_content(text) == (137, None)
-
-    def test_a_dissenting_marker_decides_even_when_it_comes_first(self):
-        text = (
-            'WATCHER_REARM_OUTCOME: ERROR exit=2\n'
-            'WATCHER_REARM_OUTCOME: CEILING exit=124'
-        )
-
-        assert mod.classify_error_content(text) == (2, None)
-
-    def test_repeated_designed_markers_stay_designed(self):
-        text = _CEILING_DECLARATION + '\nWATCHER_REARM_OUTCOME: CEILING exit=124'
-
-        exit_code, label = mod.classify_error_content(text)
-
-        assert exit_code == 124
-        assert label is not None
-
-    def test_unaccounted_failure_code_beside_a_ceiling_is_genuine(self):
-        # A declaration speaks only for its OWN invocation: a fatal code
-        # that no declaration accounts for outvotes it.
-        text = (
-            'tail of watcher.log: WATCHER_REARM_OUTCOME: CEILING exit=124\n'
-            'fatal: repo corrupt, exit code 128'
-        )
-
-        assert mod.classify_error_content(text) == (128, None)
-
-    def test_bare_ceiling_code_beside_a_failure_code_is_genuine(self):
-        # The same rule one tier down: a bare 124 classifies only when it
-        # is the ONLY outcome code in the content.
-        text = 'poll timed out, exit=124\nthe retry then died, exit code 2'
-
-        assert mod.classify_error_content(text) == (2, None)
+    """The digest consequences of classify_error_content's whole-content
+    rule: a co-mingled result is a genuine tool_error, rendered with the
+    code that decided it."""
 
     def test_co_mingled_result_counts_as_a_tool_error(self):
         records = [
@@ -2518,16 +2371,6 @@ class TestHarnessInjectedTurnFilter:
 _GENUINE_CORRECTION = 'This is wrong, please redo it.'
 
 
-def _with_origin(rec, kind):
-    """Return a copy of *rec* stamped with Claude Code's structured
-    provenance ``origin={'kind': kind}`` and with its 'isMeta' key REMOVED:
-    a real origin-stamped record carries isMeta absent, not False."""
-    out = dict(rec)
-    out.pop('isMeta', None)
-    out['origin'] = {'kind': kind}
-    return out
-
-
 _TASK_NOTIFICATION_WITH_SIGNAL_LITERALS = (
     '<task-notification>\n'
     '<task-id>b2bc921b279ccc464</task-id>\n'
@@ -2541,7 +2384,7 @@ _TASK_NOTIFICATION_WITH_SIGNAL_LITERALS = (
 
 def _task_notification(text=TASK_NOTIFICATION_TEXT):
     """A background-task notification record, shaped like census record 196."""
-    return _with_origin(_user_text(text), 'task-notification')
+    return with_origin(_user_text(text), 'task-notification')
 
 
 class TestNonHumanOriginFilter:
@@ -2550,13 +2393,13 @@ class TestNonHumanOriginFilter:
 
     @pytest.mark.parametrize(('kind', 'text'), NON_HUMAN_ORIGIN_TURNS, ids=NON_HUMAN_ORIGIN_IDS)
     def test_every_non_human_origin_kind_is_excluded(self, kind, text):
-        rec = _with_origin(_user_text(text), kind)
+        rec = with_origin(_user_text(text), kind)
 
         assert mod.iter_user_turns([rec]) == []
 
     def test_human_origin_record_quoting_a_notification_mid_prose_is_kept(self):
         text = 'why did the <task-notification> for the lint run say failed? please look again'
-        rec = _with_origin(_user_text(text), 'human')
+        rec = with_origin(_user_text(text), 'human')
 
         assert [t['text'] for t in mod.iter_user_turns([rec])] == [text]
 
@@ -2564,7 +2407,7 @@ class TestNonHumanOriginFilter:
         # PROVENANCE decides, not text: there is no '<task-notification>'
         # prefix fallback, so a human who pastes one to ask about it stays gold.
         text = TASK_NOTIFICATION_TEXT + '\n\nwhat does this failure mean? redo it'
-        rec = _with_origin(_user_text(text), 'human')
+        rec = with_origin(_user_text(text), 'human')
 
         assert [t['text'] for t in mod.iter_user_turns([rec])] == [text]
 
@@ -2587,7 +2430,7 @@ class TestNonHumanOriginFilter:
     def test_genuine_turn_between_notifications_keeps_its_record_index(self):
         records = [
             _task_notification(),
-            _with_origin(_user_text(_GENUINE_CORRECTION), 'human'),
+            with_origin(_user_text(_GENUINE_CORRECTION), 'human'),
             _task_notification(),
         ]
 
@@ -2612,7 +2455,7 @@ class TestNonHumanOriginFilter:
     def test_render_digest_keeps_only_the_genuine_correction_beside_notifications(self):
         records = [
             _with_session_meta(_task_notification()),
-            _with_session_meta(_with_origin(_user_text(_GENUINE_CORRECTION), 'human')),
+            _with_session_meta(with_origin(_user_text(_GENUINE_CORRECTION), 'human')),
             _with_session_meta(_task_notification()),
         ]
 
@@ -2633,7 +2476,7 @@ class TestNonHumanOriginFilter:
 
     def test_same_literals_under_human_origin_still_fire(self):
         # The carrier filter keys on provenance, not on the text.
-        records = [_with_origin(_user_text(_TASK_NOTIFICATION_WITH_SIGNAL_LITERALS), 'human')]
+        records = [with_origin(_user_text(_TASK_NOTIFICATION_WITH_SIGNAL_LITERALS), 'human')]
 
         assert len(mod.iter_df_guards(records)) == 1
         assert len(mod.iter_interrupts(records)) == 1
@@ -2642,7 +2485,7 @@ class TestNonHumanOriginFilter:
         # Provenance is a property of the RECORD, so it filters every carrier
         # the record holds -- not only its user text.
         content = 'BLOCKED: gate refused\nls: cannot access x: No such file or directory'
-        stamped = [_with_origin(_tool_result('tool-1', content), 'task-notification')]
+        stamped = [with_origin(_tool_result('tool-1', content), 'task-notification')]
         unstamped = [_tool_result('tool-1', content)]
 
         assert mod.iter_df_guards(stamped) == []
@@ -2666,46 +2509,6 @@ class TestNonHumanOriginFilter:
 
         assert mod.iter_user_turns(records) == []
         assert mod.classify_agent_class(records) == 'orchestrated-task'
-
-
-# ---------------------------------------------------------------------------
-# is_non_dialogue_carrier -- the ONE composite question (provenance + content)
-# the digest's detectors and the sampler's pre-scorer both ask of a carrier.
-# ---------------------------------------------------------------------------
-
-_ORDINARY_DIALOGUE = 'please fix the bug in the merge worker'
-_PROSE_SELF_CORRECTION = "Actually, that's wrong — use the other branch"
-
-
-class TestNonDialogueCarrierPredicate:
-    @pytest.mark.parametrize(
-        ('record', 'text'),
-        [
-            (_with_origin(_user_text(_ORDINARY_DIALOGUE), 'task-notification'), _ORDINARY_DIALOGUE),
-            (_assistant(_text(coder_judgment())), coder_judgment()),
-            (_assistant(_text(json_fenced(coder_judgment()))), json_fenced(coder_judgment())),
-            (_user_text(briefing_text()), briefing_text()),
-            (_user_text(TRICKLE_CODER_PREAMBLE), TRICKLE_CODER_PREAMBLE),
-        ],
-        ids=[
-            'non_human_origin_alone_decides', 'coder_judgment', 'json_fenced_coder_judgment',
-            'briefing', 'trickle_coder_prompt',
-        ],
-    )
-    def test_a_non_dialogue_carrier_is_rejected(self, record, text):
-        assert mod.is_non_dialogue_carrier(record, text) is True
-
-    @pytest.mark.parametrize(
-        ('record', 'text'),
-        [
-            (_with_origin(_user_text(_ORDINARY_DIALOGUE), 'human'), _ORDINARY_DIALOGUE),
-            (_assistant(_text(_PROSE_SELF_CORRECTION)), _PROSE_SELF_CORRECTION),
-            (_assistant(_text(PROSE_QUOTING_THE_SCHEMA)), PROSE_QUOTING_THE_SCHEMA),
-        ],
-        ids=['human_origin', 'genuine_self_correction', 'prose_quoting_the_schema_inline'],
-    )
-    def test_this_sessions_own_dialogue_is_kept(self, record, text):
-        assert mod.is_non_dialogue_carrier(record, text) is False
 
 
 # ---------------------------------------------------------------------------
