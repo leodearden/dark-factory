@@ -114,7 +114,13 @@ def wire_scheduler_liveness_mock(scheduler_mock: MagicMock) -> None:
     state, so tests may still freely reassign ``scheduler_mock._dispatched``
     (a plain set) or ``scheduler_mock.lock_table`` (use :func:`mock_lock_table`)
     and have the accessors reflect it.
+
+    It also pins ``is_paused=False`` / ``pause_reason=None`` (task 5311): a
+    bare MagicMock attribute is truthy, so every re-pend would otherwise read
+    as landing in a paused scheduler.
     """
+    scheduler_mock.is_paused = False
+    scheduler_mock.pause_reason = None
     scheduler_mock._dispatched = set()
     scheduler_mock.lock_table = mock_lock_table()
     scheduler_mock._workflow_cancel_at = {}

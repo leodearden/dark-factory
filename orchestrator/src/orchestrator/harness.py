@@ -1646,6 +1646,18 @@ def _ewa_trip_reason(ewa: float, storm: digest_mod.CategoryShare | None) -> str:
     return f'ewa_trip_{ewa:.4f} · storm: {storm}'
 
 
+REPEND_WHILE_PAUSED_MARKER = (
+    '[!! RE-PENDED INTO A PAUSED SCHEDULER: WILL NOT DISPATCH UNTIL RESUMED !!]'
+)
+
+
+def _repend_while_paused_note(task_id: str, pause_reason: str) -> str:
+    return (
+        f'{REPEND_WHILE_PAUSED_MARKER} task {task_id} is pending, but dispatch is '
+        f'paused ({pause_reason}); it waits until a human resumes the scheduler.'
+    )
+
+
 class Harness:
     """Top-level orchestration loop."""
 
@@ -16146,6 +16158,7 @@ class Harness:
         self._schedule_coro_threadsafe(
             self._action_teardown_and_set_status(
                 escalation.task_id, effect.target_status, action,
+                escalation_id=escalation.id,
             ),
             label=(
                 f'action-teardown task {escalation.task_id} '
@@ -16158,6 +16171,8 @@ class Harness:
         task_id: str,
         target_status: str,
         action: str,
+        *,
+        escalation_id: str,
     ) -> None:
         """Async helper: execute a non-resume resolution action on a task.
 
@@ -16272,6 +16287,8 @@ class Harness:
                     action, task_id, target_status, e,
                 )
                 return
+            if target_status == 'pending':
+                self._flag_repend_while_paused(task_id, escalation_id)
 
             # Restart path: clear deterministic gate stamps so the re-dispatched
             # runner re-fires the gate from scratch.  resume preserves stamps so
@@ -17142,6 +17159,34 @@ class Harness:
                 'will re-escalate)', task_id, exc_info=True,
             )
 
+    def _flag_repend_while_paused(self, task_id: str, escalation_id: str) -> None:
+        """Mark a resolution that re-pended *task_id* into a paused scheduler; never raises."""
+        if not self.scheduler.is_paused:
+            return
+        reason = self.scheduler.pause_reason or '<unknown>'
+        if self._escalation_queue is not None:
+            try:
+                self._escalation_queue.patch_resolution_metadata(
+                    escalation_id,
+                    append_to_resolution=_repend_while_paused_note(task_id, reason),
+                )
+            except Exception:
+                logger.warning(
+                    'repend-while-paused: failed to mark resolution of %s for task %s',
+                    escalation_id, task_id, exc_info=True,
+                )
+        if self.event_store:
+            self.event_store.emit(
+                EventType.repend_while_paused,
+                task_id=task_id,
+                data={'escalation_id': escalation_id, 'pause_reason': reason},
+            )
+        logger.warning(
+            'repend-while-paused: task %s re-pended via %s, but dispatch is paused (%s); '
+            'it will not run until the scheduler is resumed',
+            task_id, escalation_id, reason,
+        )
+
     async def _cascade_unblock_member(self, escalation) -> None:
         """Async helper: re-pend a resolution-resumed task to Table B's target.
 
@@ -17319,6 +17364,8 @@ class Harness:
                 self._escalate_cascade_status_rejection(
                     task_id, 'pending', e, resolved_by=escalation.resolved_by,
                 )
+            else:
+                self._flag_repend_while_paused(task_id, escalation.id)
             return
 
         # Deliberately a fresh, independent round-trip — not reused from
@@ -17488,6 +17535,8 @@ class Harness:
             self._escalate_cascade_status_rejection(
                 task_id, _resume_target, e, resolved_by=escalation.resolved_by,
             )
+        else:
+            self._flag_repend_while_paused(task_id, escalation.id)
 
     def get_merge_halt_status(self) -> dict[str, Any]:
         """Inspect the merge queue's halt state for operator tooling."""

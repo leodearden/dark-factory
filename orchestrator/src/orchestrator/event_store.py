@@ -650,6 +650,9 @@ class EventType(StrEnum):
     scheduler_paused = 'scheduler_paused'
     scheduler_resumed = 'scheduler_resumed'
     scheduler_pause_restored = 'scheduler_pause_restored'
+    # A resolution re-pended a task while dispatch is paused (task 5311).
+    #   Emitted by Harness._flag_repend_while_paused; payload {escalation_id, pause_reason}.
+    repend_while_paused = 'repend_while_paused'
 
     # Plan revalidation
     plan_revalidated = 'plan_revalidated'
