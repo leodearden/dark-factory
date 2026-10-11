@@ -2,13 +2,14 @@
 
 Driven only through the public names of ``orchestrator.evals.results`` against
 real files under ``tmp_path``; the B1 boundary case drives a real executor and
-reads its cell back through both loaders.
+reads its cell back through the store. The scripts loader's half of B1 lives in
+``scripts/tests/test_eval_results_io.py``, where a scripts-only change runs it.
 """
 
 from __future__ import annotations
 
-import importlib.util
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -17,7 +18,7 @@ import pytest
 from _campaign_gate_helpers import eval_base_config
 
 import orchestrator.evals.results as results_module
-from orchestrator.evals import runner
+from orchestrator.evals import runner, snapshots
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.results import (
     CellName,
@@ -29,7 +30,7 @@ from orchestrator.evals.results import (
 )
 from orchestrator.workflow import WorkflowOutcome
 
-_SCRIPTS_LOADER = Path(__file__).resolve().parents[2] / 'scripts' / '_eval_results_io.py'
+_TASK_PATH = Path('/fake/task.json')
 
 
 def _result(
@@ -72,16 +73,20 @@ class TestRoundTrip:
         assert store.load_all() == [earlier, later]
 
 
-class TestParseName:
-    def test_parse_name_inverts_path_for(self, store: ResultStore):
+class TestCellNameFromPath:
+    def test_from_path_inverts_path_for(self, store: ResultStore):
         r = _result()
-        assert ResultStore.parse_name(store.path_for(r)) == CellName(
+        assert CellName.from_path(store.path_for(r)) == CellName(
             r.task_id, r.config_name, r.run_id
         )
 
+    def test_from_path_inverts_filename(self, tmp_path: Path):
+        name = CellName('df_task_1', 'cfg-a', 'abcd1234')
+        assert CellName.from_path(tmp_path / name.filename) == name
+
     def test_a_combo_label_with_plus_round_trips(self, store: ResultStore):
         r = _result(config_name='arch-a+impl-b')
-        assert ResultStore.parse_name(store.path_for(r)) == CellName(
+        assert CellName.from_path(store.path_for(r)) == CellName(
             'df_task_1', 'arch-a+impl-b', 'abcd1234'
         )
 
@@ -91,15 +96,16 @@ class TestParseName:
             'df_task_12__claude-opus-high.json',
             'truncated.json',
             'a__b__c__d.json',
+            'a___b__c.json',
             'df_task_1__cfg-a__abcd1234.txt',
         ],
     )
-    def test_parse_name_rejects_names_outside_the_grammar(
+    def test_from_path_rejects_names_outside_the_grammar(
         self, tmp_path: Path, name: str
     ):
         path = tmp_path / name
         with pytest.raises(ValueError) as excinfo:
-            ResultStore.parse_name(path)
+            CellName.from_path(path)
         assert str(path) in str(excinfo.value)
 
 
@@ -195,6 +201,64 @@ class TestLoudLoad:
         assert excinfo.value.detail.startswith(error_type)
 
 
+class TestRewrite:
+    def test_the_change_lands_and_keys_eval_result_does_not_declare_survive(
+        self, store: ResultStore
+    ):
+        path = store.save(_result())
+        cell = json.loads(path.read_text())
+        cell['retired_field'] = 'kept'
+        path.write_text(json.dumps(cell))
+
+        def add_legacy_metric(cell: dict) -> dict:
+            cell['metrics']['legacy_sonnet_review_blocking_issues'] = 3
+            return cell
+
+        assert store.rewrite(path, add_legacy_metric) is True
+        rewritten = json.loads(path.read_text())
+        assert rewritten['retired_field'] == 'kept'
+        assert rewritten['metrics'] == {
+            **_result().metrics, 'legacy_sonnet_review_blocking_issues': 3,
+        }
+
+    def test_a_rewrite_that_changes_nothing_leaves_the_file_untouched(
+        self, store: ResultStore
+    ):
+        path = store.save(_result())
+        os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+        before = path.read_text()
+        assert store.rewrite(path, lambda cell: cell) is False
+        assert path.read_text() == before
+        assert path.stat().st_mtime_ns == 1_000_000_000
+
+    @pytest.mark.parametrize(
+        'text', ['{"task_id": "x", "conf', '[1, 2, 3]', None],
+        ids=['truncated', 'not-an-object', 'missing'],
+    )
+    def test_an_unreadable_cell_is_named_and_left_as_it_was(
+        self, store: ResultStore, text: str | None
+    ):
+        store.directory.mkdir(parents=True)
+        bad = store.directory / 'bad.json'
+        if text is not None:
+            bad.write_text(text)
+        with pytest.raises(ResultLoadError) as excinfo:
+            store.rewrite(bad, lambda cell: {**cell, 'outcome': 'blocked'})
+        assert excinfo.value.path == bad
+        assert str(bad) in str(excinfo.value)
+        assert (bad.read_text() if bad.exists() else None) == text
+
+    def test_a_cell_of_another_store_is_refused(
+        self, store: ResultStore, tmp_path: Path
+    ):
+        path = ResultStore(tmp_path / 'elsewhere').save(_result())
+        before = path.read_text()
+        with pytest.raises(ValueError) as excinfo:
+            store.rewrite(path, lambda cell: {**cell, 'outcome': 'blocked'})
+        assert str(path) in str(excinfo.value)
+        assert path.read_text() == before
+
+
 class TestSchemaDriftTolerance:
     def test_a_legacy_cell_without_run_id_or_trial_loads_with_defaults(
         self, store: ResultStore
@@ -234,20 +298,8 @@ def test_the_packaged_store_lives_beside_the_results_module():
     )
 
 
-def _load_scripts_loader():
-    spec = importlib.util.spec_from_file_location('_eval_results_io', _SCRIPTS_LOADER)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-@pytest.mark.asyncio
-async def test_b1_an_executor_cell_reads_back_through_both_loaders(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    store = ResultStore(tmp_path / 'results')
-    task = {
+def _executor_task(tmp_path: Path) -> dict:
+    return {
         'id': 'df_task_b1',
         'project_root': str(tmp_path),
         'pre_task_commit': 'basecommit',
@@ -256,35 +308,73 @@ async def test_b1_an_executor_cell_reads_back_through_both_loaders(
         'plan': {'steps': [{'id': 's1', 'status': 'pending'}]},
     }
 
-    async def fake_create_wt(*_a, **_k):
-        return Path('/fake/wt'), 'run-b1'
 
+async def _fake_create_wt(*_a, **_k):
+    return Path('/fake/wt'), 'run-b1'
+
+
+@pytest.mark.asyncio
+async def test_b1_an_executor_cell_reads_back_through_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    store = ResultStore(tmp_path / 'results')
     workflow = MagicMock()
     workflow.run = AsyncMock(return_value=SimpleNamespace(outcome=WorkflowOutcome.DONE))
     metrics = MagicMock()
     metrics.to_dict.return_value = {'composite_score': 0.9, 'tests_pass': True}
-    monkeypatch.setattr(runner, 'create_eval_worktree', fake_create_wt)
+    monkeypatch.setattr(runner, 'create_eval_worktree', _fake_create_wt)
     monkeypatch.setattr(runner, 'build_workflow', lambda **_kw: workflow)
     monkeypatch.setattr(runner, 'collect_metrics', AsyncMock(return_value=metrics))
-    monkeypatch.setattr(runner, 'load_task', lambda _p: task)
+    monkeypatch.setattr(runner, 'load_task', lambda _p: _executor_task(tmp_path))
 
     result = await runner.run_eval(
-        Path('/fake/task.json'),
+        _TASK_PATH,
         EvalConfig('claude-sonnet-max', 'claude', 'sonnet', 'max'),
         eval_base_config(tmp_path),
         usage_gate=None,
         store=store,
     )
 
-    scripts_loader = _load_scripts_loader()
     assert store.load_all() == [result]
-    assert scripts_loader.load_results_from_dir(store.directory) == [result]
 
     truncated = store.directory / 'zz_truncated.json'
     truncated.write_text('{"task_id": "x", "conf')
     with pytest.raises(ResultLoadError) as store_error:
         store.load_all()
     assert store_error.value.path == truncated
-    with pytest.raises(SystemExit) as scripts_error:
-        scripts_loader.load_results_from_dir(store.directory)
-    assert str(truncated) in str(scripts_error.value)
+
+
+_UNADDRESSABLE = EvalConfig('cfg__bad', 'claude', 'sonnet', 'max')
+_ADDRESSABLE = EvalConfig('cfg-fine', 'claude', 'sonnet', 'max')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'executor', ['run_eval', 'run_architect_eval', 'run_end_to_end'],
+)
+async def test_an_unaddressable_cell_fails_before_the_run_spends_anything(
+    executor: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    store = ResultStore(tmp_path / 'results')
+    config_builder = MagicMock(spec=runner.build_eval_orch_config)
+    monkeypatch.setattr(runner, 'create_eval_worktree', _fake_create_wt)
+    monkeypatch.setattr(snapshots, 'create_eval_worktree', _fake_create_wt)
+    monkeypatch.setattr(runner, 'load_task', lambda _p: _executor_task(tmp_path))
+    monkeypatch.setattr(runner, 'build_eval_orch_config', config_builder)
+    runs = {
+        'run_eval': lambda: runner.run_eval(
+            _TASK_PATH, _UNADDRESSABLE, usage_gate=None, store=store,
+        ),
+        'run_architect_eval': lambda: runner.run_architect_eval(
+            _TASK_PATH, _UNADDRESSABLE, usage_gate=None, store=store,
+        ),
+        'run_end_to_end': lambda: runner.run_end_to_end(
+            _TASK_PATH, _UNADDRESSABLE, _ADDRESSABLE, usage_gate=None, store=store,
+        ),
+    }
+
+    with pytest.raises(ValueError, match='cfg__bad'):
+        await runs[executor]()
+
+    config_builder.assert_not_called()
+    assert store.cell_paths() == []

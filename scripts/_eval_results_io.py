@@ -36,9 +36,7 @@ def load_results_from_dir(results_dir: Path) -> list[EvalResult]:
     except MissingResultsDirError as e:
         raise SystemExit(
             f'Error: results dir not found (or is not a directory): {e.path}\n'
-            '  This is a path problem, not a contamination problem: Path.glob returns '
-            'empty for a nonexistent dir rather than raising, so without this check the '
-            'typo would be reported downstream as "no in-campaign cells found".'
+            '  Check the --results-dir path.'
         ) from e
     except ResultLoadError as e:
         raise SystemExit(

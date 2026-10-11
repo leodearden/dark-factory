@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
 import logging
@@ -66,6 +67,17 @@ class CellName:
     def filename(self) -> str:
         return f'{self.task_id}{_SEP}{self.config_name}{_SEP}{self.run_id}{_SUFFIX}'
 
+    @classmethod
+    def from_path(cls, path: Path) -> CellName:
+        """The inverse of :attr:`filename`; a name outside the grammar raises ValueError."""
+        segments = path.stem.split(_SEP)
+        if path.suffix != _SUFFIX or len(segments) != 3:
+            raise ValueError(f'{path} is not a cell name of the form {_GRAMMAR}')
+        try:
+            return cls(*segments)
+        except ValueError as e:
+            raise ValueError(f'{path} is not a cell name: {e}') from e
+
 
 class ResultLoadError(Exception):
     """A persisted cell (or its directory) could not be read."""
@@ -90,15 +102,6 @@ def normalize_legacy_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def _split_name(path: Path) -> CellName | None:
-    if path.suffix != _SUFFIX:
-        return None
-    segments = path.stem.split(_SEP)
-    if len(segments) != 3 or not all(map(_is_component, segments)):
-        return None
-    return CellName(*segments)
-
-
 _EVAL_RESULT_FIELDS = frozenset(f.name for f in dataclasses.fields(EvalResult))
 
 
@@ -106,6 +109,16 @@ def _load_cell(path: Path) -> EvalResult:
     data = json.loads(path.read_text())
     result = EvalResult(**{k: v for k, v in data.items() if k in _EVAL_RESULT_FIELDS})
     return dataclasses.replace(result, metrics=normalize_legacy_metrics(result.metrics))
+
+
+def _read_raw_cell(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text())
+    except (ValueError, OSError) as e:
+        raise ResultLoadError(path, f'{type(e).__name__}: {e}') from e
+    if not isinstance(data, dict):
+        raise ResultLoadError(path, f'not a JSON object but {type(data).__name__}')
+    return data
 
 
 @dataclass(frozen=True)
@@ -133,23 +146,39 @@ class ResultStore:
             return []
         return sorted(p for p in self.directory.glob(f'*{_SUFFIX}') if p.is_file())
 
-    @staticmethod
-    def parse_name(path: Path) -> CellName:
-        name = _split_name(path)
-        if name is None:
-            raise ValueError(f'{path} is not a cell name of the form {_GRAMMAR}')
-        return name
-
     def paths_matching(self, task_id: str, config_name: str) -> list[Path]:
-        return [
-            path
-            for path in self.cell_paths()
-            if (name := _split_name(path)) is not None
-            and (name.task_id, name.config_name) == (task_id, config_name)
-        ]
+        matches = []
+        for path in self.cell_paths():
+            try:
+                name = CellName.from_path(path)
+            except ValueError:
+                continue
+            if (name.task_id, name.config_name) == (task_id, config_name):
+                matches.append(path)
+        return matches
 
     def exists(self, task_id: str, config_name: str) -> bool:
         return bool(self.paths_matching(task_id, config_name))
+
+    def rewrite(
+        self, path: Path, change: Callable[[dict[str, Any]], dict[str, Any]]
+    ) -> bool:
+        """Apply *change* to the raw JSON of one of this store's cells, atomically.
+
+        The raw object is handed over, so keys :class:`EvalResult` does not
+        declare survive. A change that leaves the cell equal writes nothing, so
+        the file's mtime still says when its content last changed. Returns
+        whether the cell was written.
+        """
+        if path.parent != self.directory:
+            raise ValueError(f'{path} is not a cell of the store at {self.directory}')
+        original = _read_raw_cell(path)
+        changed = change(copy.deepcopy(original))
+        if changed == original:
+            return False
+        atomic_write_text(path, json.dumps(changed, indent=2))
+        logger.info(f'Rewrote result: {path}')
+        return True
 
     def load_all(self) -> list[EvalResult]:
         """Every top-level cell, whatever its name.

@@ -60,7 +60,7 @@ from .metrics import (
 )
 from .profile import apply_eval_profile
 from .replay_frame import REPLAY_FRAME_ID, ReplayFramedBriefingAssembler
-from .results import EvalResult, ResultStore
+from .results import CellName, EvalResult, ResultStore
 from .snapshots import create_eval_worktree, read_python_pin
 
 logger = logging.getLogger(__name__)
@@ -642,6 +642,7 @@ async def run_eval(
             project_root, task_id, task['pre_task_commit'],
             setup_commands=task.get('setup_commands'),
         )
+    address = CellName(task_id, result_label, run_id)
 
     # 2. Build orchestrator config for this eval
     orch_config = build_eval_orch_config(
@@ -738,13 +739,13 @@ async def run_eval(
             metrics_dict['role_under_test'] = 'judge'
 
         result = EvalResult(
-            task_id=task_id,
-            config_name=result_label,
+            task_id=address.task_id,
+            config_name=address.config_name,
             outcome=outcome.value if isinstance(outcome, WorkflowOutcome) else str(outcome),
             metrics=metrics_dict,
             worktree_path=str(worktree),
             wall_clock_ms=wall_clock_ms,
-            run_id=run_id,
+            run_id=address.run_id,
             trial=trial,
         )
 
@@ -959,6 +960,7 @@ async def run_architect_eval(
     worktree, run_id = await snapshots.create_eval_worktree(
         project_root, task_id, pre, setup_commands=task.get('setup_commands'),
     )
+    address = CellName(task_id, config.name, run_id)
 
     plan: dict = {}
     # Pre-initialised for the same reason ``artifacts``/``usage_gate`` below
@@ -1648,13 +1650,13 @@ async def run_architect_eval(
         judged_without_reference=judged_without_reference,
     )
     result_obj = EvalResult(
-        task_id=task_id,
-        config_name=config.name,
+        task_id=address.task_id,
+        config_name=address.config_name,
         outcome=outcome,
         metrics=metrics.to_dict(),
         worktree_path=str(worktree),
         wall_clock_ms=wall_clock_ms,
-        run_id=run_id,
+        run_id=address.run_id,
         trial=trial,
     )
     (store or ResultStore.packaged()).save(result_obj)
@@ -1722,6 +1724,7 @@ async def run_end_to_end(
         project_root, task_id, task['pre_task_commit'],
         setup_commands=task.get('setup_commands'),
     )
+    address = CellName(task_id, config_name, run_id)
 
     # 2. Both-live orch config: architect derived from arch_config, implementer
     #    from impl_config.
@@ -1801,13 +1804,13 @@ async def run_end_to_end(
         metrics_dict['replay_frame'] = REPLAY_FRAME_ID
 
         result = EvalResult(
-            task_id=task_id,
-            config_name=config_name,
+            task_id=address.task_id,
+            config_name=address.config_name,
             outcome=outcome.value if isinstance(outcome, WorkflowOutcome) else str(outcome),
             metrics=metrics_dict,
             worktree_path=str(worktree),
             wall_clock_ms=wall_clock_ms,
-            run_id=run_id,
+            run_id=address.run_id,
             trial=trial,
         )
         (store or ResultStore.packaged()).save(result)
