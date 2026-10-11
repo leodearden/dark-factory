@@ -14,6 +14,7 @@ import pytest
 import pytest_asyncio
 from qdrant_client.http.exceptions import UnexpectedResponse
 from shared.config_dir import TaskConfigDir
+from shared.project_layout import escalation_queue_dir
 from shared.testing import make_gate_mock
 
 from fused_memory.models.reconciliation import (
@@ -21995,7 +21996,7 @@ def _orch_queue_dir(root):
     Distinct from the RECON queue (`config.escalation_queue_dir`, drained by the
     port-8103 watcher) that `_escalate` writes to — see the A7b scope note.
     """
-    return root / 'data' / 'escalations'
+    return escalation_queue_dir(root)
 
 
 def _wire_orchestrator_queue(harness, tmp_path, monkeypatch, *, live=True):
@@ -22147,6 +22148,23 @@ def test_file_finding_task_escalation_lands_a_record_on_the_real_task(
     assert detail['run_id'] == 'abcdef0123456789'
     assert detail['project_id'] == 'test-project'
     assert detail['persistence'] == 4
+
+
+def test_file_finding_task_escalation_files_into_the_layout_escalation_queue_when_relocated(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+    relocated_escalation_queue,
+):
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    esc_id = harness._file_finding_task_escalation(
+        'test-project', 'abcdef0123456789', _orch_finding(), 4,
+    )
+
+    assert [e.id for e in EscalationQueue(queue_dir).get_pending()] == [esc_id]
+    assert not (tmp_path / relocated_escalation_queue).exists()
 
 
 def test_routed_record_is_invisible_to_the_orchestrator_l1_guards(
