@@ -15,6 +15,7 @@ import pytest
 import pytest_asyncio
 from _fm_helpers import make_db_without_claimant_columns
 from pydantic import ValidationError
+from shared.project_layout import tasks_db
 from shared.task_metadata import SchemaWarning
 
 from fused_memory.backends.sqlite_task_backend import (
@@ -5417,7 +5418,7 @@ async def _pin_write_connection_then_commit_out_of_band(backend, project_root) -
 
     # Simulate a separate process committing a status change out-of-band,
     # via a fresh autocommit connection to the same DB file on disk.
-    db_path = SqliteTaskBackend._db_path(project_root)
+    db_path = tasks_db(project_root)
     writer = await connect_daemon(str(db_path), isolation_level=None)
     try:
         await apply_wal_pragmas(writer, busy_timeout_ms=5000)
@@ -5469,7 +5470,7 @@ async def test_get_statuses_fresh_returns_empty_when_db_file_missing(backend, pr
     ``if not db_path.exists(): return {}`` fast path documented on
     get_statuses_fresh ("{} if the DB file does not exist yet...").
     """
-    assert not SqliteTaskBackend._db_path(project_root).exists()
+    assert not tasks_db(project_root).exists()
 
     result = await backend.get_statuses_fresh(project_root)
 
@@ -5582,7 +5583,7 @@ async def test_get_statuses_hot_path_fresh_on_reused_warm_connection(
     # Commit a status change out-of-band via a separate autocommit
     # connection — simulating a second process writing to the same DB file
     # while the cached read connection sits idle in between calls.
-    db_path = SqliteTaskBackend._db_path(project_root)
+    db_path = tasks_db(project_root)
     writer = await connect_daemon(str(db_path), isolation_level=None)
     try:
         await apply_wal_pragmas(writer, busy_timeout_ms=5000)
@@ -5729,7 +5730,7 @@ async def _pin_cached_read_connection_then_commit_out_of_band(backend, project_r
 
     # Simulate a separate process committing a status change out-of-band,
     # via a fresh autocommit connection to the same DB file on disk.
-    db_path = SqliteTaskBackend._db_path(project_root)
+    db_path = tasks_db(project_root)
     writer = await connect_daemon(str(db_path), isolation_level=None)
     try:
         await apply_wal_pragmas(writer, busy_timeout_ms=5000)
