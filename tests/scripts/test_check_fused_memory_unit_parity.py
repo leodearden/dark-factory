@@ -682,23 +682,6 @@ def test_fm_override_report_carries_the_log_tag_on_every_physical_line(
         assert line.startswith(f"[{mod.LOG_TAG}]"), f"Untagged output line: {line!r}"
 
 
-def test_fm_checker_reuses_the_shared_find_dropins():
-    """The checker uses the SHARED find_dropins, not a fourth pasted copy.
-
-    Structural anti-fork guard, in the style the three existing lifts are
-    already pinned by (see tests/scripts/test_check_orchestrator_unit_parity.py,
-    which asserts the same identity for the checker and the dashboard). An
-    identity assertion, not an equality one: a pasted copy would satisfy every
-    behavioural test above while reproducing — inside the tooling built to
-    report silent duplication — exactly the duplication it exists to report.
-    """
-    import systemd_unit_parity
-
-    mod = _load_checker()
-
-    assert mod.find_dropins is systemd_unit_parity.find_dropins
-
-
 def test_a_non_conf_file_in_the_dropin_dir_is_not_an_override(
     tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
 ):

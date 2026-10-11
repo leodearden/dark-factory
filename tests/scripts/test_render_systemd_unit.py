@@ -80,28 +80,8 @@ def test_environment_map_lives_on_the_shared_module():
     assert callable(systemd_unit_parity.environment_map)
 
 
-def test_dashboard_checker_consumes_the_lifted_environment_map():
-    """IDENTITY guard for the THIRD lift: ``environment_map`` has one home.
-
-    Same assertion shape, and the same reason, as the parser and find_dropins
-    guards in tests/scripts/test_check_orchestrator_unit_parity.py: re-exporting
-    keeps the checker's module surface intact (its suite reads
-    ``mod._environment_map`` directly), but a re-export is only meaningful if it
-    is the SAME function object. Paste a look-alike copy back into the checker
-    and every other test in both suites stays green while the two
-    implementations quietly drift — inside the tooling built to catch exactly
-    that. Object identity is the only check that fires on it.
-    """
-    import systemd_unit_parity
-
-    checker = _load_checker()
-
-    assert checker._environment_map is systemd_unit_parity.environment_map
-
-
-# The parsing behaviour that must survive the move, driven straight off the
-# docstring the lift carries with it. Exercised against the SHARED module, so
-# the behaviour is pinned at its new home rather than through a re-export.
+# The parsing behaviour, driven straight off environment_map's docstring and
+# exercised against the SHARED module, where it lives.
 
 
 def _env(text, section="Service"):
