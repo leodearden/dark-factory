@@ -23,12 +23,12 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, cast
 # Runtime import of the BORN_AT_L2_SEVERITIES constant from escalation.models.
 # escalation.models is listed under TYPE_CHECKING above (:77-78) for the Escalation
 # type annotation; a separate runtime import is needed here because
-# _is_gating_escalation evaluates the set at call time, not just for type hints.
+# _needs_human evaluates the set at call time, not just for type hints.
 # This is cycle-safe: escalation/src/escalation/models.py imports only stdlib and
 # nothing in it imports orchestrator.  escalation.pins (is_queue_handoff, the
-# severity semantics both gating predicates consume since task 5222) is pure and
-# imports only escalation.models, so it is cycle-safe too; harness.py already
-# imports it at module top.
+# severity semantics _needs_human consumes) is pure and imports only
+# escalation.models, so it is cycle-safe too; harness.py already imports it at
+# module top.
 from escalation.dedupe import submit_or_dedupe
 from escalation.models import BORN_AT_L2_SEVERITIES
 from escalation.pins import is_queue_handoff
@@ -356,24 +356,38 @@ def _is_transient_architect_glitch(result: AgentResult, *, plan_on_disk: bool) -
     return result.turns <= 2 and result.cost_usd < 0.20 and not plan_on_disk
 
 
+def _needs_human(e: Escalation) -> bool:
+    """Return True if only a human can dispose of *e* — no steward applies.
+
+    Either disjunct suffices:
+    - Born-at-L2 severity: ``severity in BORN_AT_L2_SEVERITIES``, i.e.
+      'critical' or 'urgent' — these bypass the auto-watcher and route
+      straight to a human regardless of level.
+    - A level ≥ 2 record that ``escalation.pins`` classifies a queue handoff
+      (PRD ``plans/info-l0-disposition-router-prd.md`` D3): an info-severity
+      L2 never needs a human here, while an unknown severity fails safe to
+      needing one.  Severity semantics live in ``escalation.pins`` (INV-5) —
+      never hand-roll ``severity != 'info'`` here.
+
+    The single home of that rule for both consumers: disjuncts 2 and 3 of
+    :func:`_is_gating_escalation`, and the stop-the-line short-circuit in
+    ``TaskWorkflow._wait_for_resolution``.
+    """
+    return e.severity in BORN_AT_L2_SEVERITIES or (
+        e.level >= 2 and is_queue_handoff(e)
+    )
+
+
 def _is_gating_escalation(e: Escalation) -> bool:
     """Return True if *e* should gate workflow progress (PRD C7 / decisions D4, D8).
 
     Gating policy — an escalation gates when ANY disjunct fires:
     1. Plain blocking L0: ``severity == 'blocking' and level == 0``
        (fresh agent-filed blocker awaiting steward triage).
-    2. Born-at-L2 severity: ``severity in BORN_AT_L2_SEVERITIES``
-       i.e. 'critical' or 'urgent' — these bypass the auto-watcher and route
-       straight to a human regardless of level.
-    3. Any level ≥ 2: ``level >= 2``
-       (escalation-watcher promoted to L2; a human must decide before the
-       workflow proceeds — applies to any severity, including 'info').
-       Narrowed by PRD ``plans/info-l0-disposition-router-prd.md`` D3 (task
-       5222): a level ≥ 2 record gates only when ``escalation.pins`` classifies
-       it a queue handoff, so an info-severity L2 never gates, while an unknown
-       severity still fails safe to gating.  Severity semantics live in
-       ``escalation.pins`` (INV-5) — never hand-roll ``severity != 'info'``
-       here.
+    2. Born-at-L2 severity — see :func:`_needs_human`.
+    3. A level ≥ 2 queue handoff (escalation-watcher promoted to L2; a human
+       must decide before the workflow proceeds; never an info record) — see
+       :func:`_needs_human`.
 
     Deliberately NOT gating:
     - Plain blocking L1 (``severity == 'blocking' and level == 1``): this is a
@@ -384,11 +398,7 @@ def _is_gating_escalation(e: Escalation) -> bool:
       DOES gate the current run — that is the intended stop-the-line semantics
       for high-severity escalations (D4 accepted consequence).
     """
-    return (
-        (e.severity == 'blocking' and e.level == 0)
-        or e.severity in BORN_AT_L2_SEVERITIES
-        or (e.level >= 2 and is_queue_handoff(e))
-    )
+    return (e.severity == 'blocking' and e.level == 0) or _needs_human(e)
 
 
 def _format_reescalation_detail(escalations: list[Escalation]) -> str:
@@ -438,37 +448,34 @@ def _format_reescalation_detail(escalations: list[Escalation]) -> str:
 class _HumanHandoff(Exception):
     """``_wait_for_resolution`` ended with the task's open records in a human's hands.
 
-    Each subclass names its own ``block_reason``, so the two catch sites
-    report WHICH hand-off fired rather than one fixed string (PRD
-    ``plans/info-l0-disposition-router-prd.md`` D13, task 5222).
+    Every hand-off is constructed with the ``block_reason`` its catch site
+    reports, so the two catch sites say WHICH hand-off fired rather than one
+    fixed string (PRD ``plans/info-l0-disposition-router-prd.md`` D13).
     """
 
-    def __init__(self, escalations: list[Escalation]):
-        super().__init__(escalations)
+    def __init__(self, escalations: list[Escalation], block_reason: str):
+        super().__init__(block_reason)
         self.escalations = escalations
-
-    @property
-    def block_reason(self) -> str:
-        raise NotImplementedError
+        self.block_reason = block_reason
 
 
 class _StewardReescalated(_HumanHandoff):
     """The steward handed off: an open L1 remains once the level-0 wait ends
     (consumed by the auto-watcher, which may promote to L2 for a human)."""
 
-    @property
-    def block_reason(self) -> str:
-        return 'Steward re-escalated to human'
+    def __init__(self, escalations: list[Escalation]):
+        super().__init__(escalations, 'Steward re-escalated to human')
 
 
 class _GatedByOpenL2(_HumanHandoff):
-    """Stop-the-line: a born-at-L2 severity or a non-info level≥2 record that no
-    steward can resolve, raised before the wait ever awaits."""
+    """Stop-the-line: records that :func:`_needs_human` says no steward can
+    resolve, raised before the wait ever awaits."""
 
-    @property
-    def block_reason(self) -> str:
-        ids = ', '.join(e.id for e in self.escalations)
-        return f'Gated by open L2 {ids}; no steward applicable'
+    def __init__(self, escalations: list[Escalation]):
+        ids = ', '.join(e.id for e in escalations)
+        super().__init__(
+            escalations, f'Gated by open L2 {ids}; no steward applicable',
+        )
 
 if TYPE_CHECKING:
     from escalation.models import Escalation, TrainState
@@ -14411,20 +14418,17 @@ class TaskWorkflow:
     async def _wait_for_resolution(self) -> str:
         """Wait for all level-0 pending escalations to be resolved.
 
-        Born-at-L2 (critical/urgent severity) and any level≥2 pending
-        escalations are stop-the-line events — they cannot be resolved by
-        the auto-watcher/steward and require immediate human intervention.
+        Pending escalations that :func:`_needs_human` selects (a born-at-L2
+        severity, or a level≥2 queue handoff — never an info record) are
+        stop-the-line events — they cannot be resolved by the
+        auto-watcher/steward and require immediate human intervention.
         Rather than waiting (which would either spin or block forever with
         no resolver), they immediately raise ``_GatedByOpenL2`` so
         that ``run()`` calls ``_mark_blocked`` and halts.
 
         Raises a ``_HumanHandoff``:
-        - ``_GatedByOpenL2`` if a pending escalation with ``severity in
-          BORN_AT_L2_SEVERITIES`` or ``level >= 2`` exists — immediate
-          terminal, stop the line, before any await (a level ≥ 2 record only
-          when ``escalation.pins`` classifies it a queue handoff, so an info
-          L2 never short-circuits the wait — PRD info-l0-disposition-router
-          D3, task 5222); OR
+        - ``_GatedByOpenL2`` if any pending escalation needs a human —
+          immediate terminal, stop the line, before any await; OR
         - ``_StewardReescalated`` if the steward re-escalated to level-1
           (consumed by auto-watcher).
 
@@ -14528,19 +14532,16 @@ class TaskWorkflow:
         if self._escalation_event is None:
             self._escalation_event = asyncio.Event()
 
-        # Born-at-L2 (critical/urgent) and any level≥2 escalations are
-        # stop-the-line: no auto-watcher can resolve them, so waiting for the
+        # Records that need a human are stop-the-line: no auto-watcher or
+        # steward can resolve them, so waiting for the
         # L0 loop to clear makes no sense and risks a busy resume-spin (gate
         # fires → _wait_for_resolution returns '' → resume → gate fires again).
         # Raised as a _HumanHandoff so run() calls _mark_blocked and halts for
         # human intervention rather than looping; _GatedByOpenL2's reason says
-        # no steward was applicable (D13).  The level≥2 half is narrowed
-        # exactly as _is_gating_escalation's disjunct 3 (task 5222): an info
-        # L2 is not a handoff, so it never short-circuits.
+        # no steward was applicable (D13).
         pending_l2 = [
             e for e in self.escalation_queue.get_by_task(self.task_id, status='pending')
-            if e.severity in BORN_AT_L2_SEVERITIES
-            or (e.level >= 2 and is_queue_handoff(e))
+            if _needs_human(e)
         ]
         if pending_l2:
             raise _GatedByOpenL2(pending_l2)
