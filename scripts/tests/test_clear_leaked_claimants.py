@@ -359,3 +359,85 @@ class TestApplyRepairs:
 
         with pytest.raises(ValueError):
             _apply(census, None)
+
+
+def _outcome_for(report, task_id: int):
+    (outcome,) = [o for o in report.outcomes if o.violation.task_id == task_id]
+    return outcome
+
+
+class TestPerRowCorroboration:
+    def test_a_row_reclaimed_after_the_census_keeps_its_live_claim(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        census = take_census(root, NOW)
+        live_claim = ('run-new/4028-y/pid=2', _iso(NOW))
+        _mutate_store(
+            root,
+            "UPDATE tasks SET status = 'in-progress', claimant_run_id = ?, heartbeat_at = ? WHERE id = 4028",
+            live_claim,
+        )
+        server = _FakeClaimantServer()
+
+        report = _apply(census, server)
+
+        assert 4028 not in server.written_ids()
+        outcome = _outcome_for(report, 4028)
+        assert outcome.bucket is Bucket.SKIPPED_CHANGED_UNDER_US
+        assert outcome.delta['status'] == ('done', 'in-progress')
+        assert outcome.delta['claimant_run_id'] == (POSITIVE_CONTROL['claimant_run_id'], live_claim[0])
+        assert _claimants(root)[4028] == live_claim
+        assert _buckets(report)[5225] is Bucket.REPAIRED
+        assert _buckets(report)[101] is Bucket.REPAIRED
+
+    def test_a_restamped_claimant_on_the_same_status_is_skipped(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        census = take_census(root, NOW)
+        _mutate_store(root, "UPDATE tasks SET claimant_run_id = 'run-other/101-z/pid=4' WHERE id = 101")
+        server = _FakeClaimantServer()
+
+        report = _apply(census, server)
+
+        assert 101 not in server.written_ids()
+        outcome = _outcome_for(report, 101)
+        assert outcome.bucket is Bucket.SKIPPED_CHANGED_UNDER_US
+        assert outcome.delta['claimant_run_id'] == (FRESH_DONE['claimant_run_id'], 'run-other/101-z/pid=4')
+
+    def test_a_refreshed_hygiene_heartbeat_declines_the_write(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        census = take_census(root, NOW)
+        _mutate_store(root, 'UPDATE tasks SET heartbeat_at = ? WHERE id = 103', (_iso(FRESH),))
+        server = _FakeClaimantServer()
+
+        report = _apply(census, server, tiers=BOTH_TIERS)
+
+        assert 103 not in server.written_ids()
+        outcome = _outcome_for(report, 103)
+        assert outcome.bucket is Bucket.SKIPPED_CHANGED_UNDER_US
+        assert outcome.delta['heartbeat_at'] == (STALE_PENDING['heartbeat_at'], _iso(FRESH))
+        assert outcome.delta['tier'] == ('hygiene', None)
+
+    def test_a_row_deleted_after_the_census_is_skipped_as_absent(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        census = take_census(root, NOW)
+        _mutate_store(root, 'DELETE FROM tasks WHERE id = 4028')
+        server = _FakeClaimantServer()
+
+        report = _apply(census, server)
+
+        assert 4028 not in server.written_ids()
+        outcome = _outcome_for(report, 4028)
+        assert outcome.bucket is Bucket.SKIPPED_CHANGED_UNDER_US
+        assert outcome.delta == {'row': ('present', 'absent')}
+
+    def test_an_infra_hold_flag_set_after_the_census_declines_the_write(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        census = take_census(root, NOW)
+        _mutate_store(root, 'UPDATE tasks SET metadata = ? WHERE id = 103', ('{"infra_hold": true}',))
+        server = _FakeClaimantServer()
+
+        report = _apply(census, server, tiers=BOTH_TIERS)
+
+        assert 103 not in server.written_ids()
+        outcome = _outcome_for(report, 103)
+        assert outcome.bucket is Bucket.SKIPPED_CHANGED_UNDER_US
+        assert outcome.delta == {'tier': ('hygiene', None)}
