@@ -752,15 +752,21 @@ class TestMintEntityNode:
         assert exact_name_reads == []
 
     @pytest.mark.asyncio
-    async def test_mints_even_when_a_same_name_node_exists(self, backend_with_mocks):
+    async def test_mints_even_when_a_same_name_node_exists(
+        self, backend_with_mocks, make_graph_mock
+    ):
         """The 0-match precondition is the CALLER's to establish; the primitive
-        must not quietly re-introduce a read to check it."""
+        must not quietly re-introduce a read to check it. Both read routes, the
+        method and raw Cypher on the graph, would see the existing node."""
         backend = backend_with_mocks
-        backend.get_nodes_by_exact_name.return_value = [
-            {'uuid': 'u-1', 'name': 'dark_factory:2500', 'summary': '', 'labels': []}
-        ]
+        existing = {'uuid': 'u-1', 'name': 'dark_factory:2500', 'summary': '', 'labels': []}
+        backend.get_nodes_by_exact_name.return_value = [existing]
+        graph = make_graph_mock(ro_rows=[list(existing.values())], q_rows=[])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
         await backend._mint_entity_node('dark_factory:2500', group_id='reify')
-        assert len(_create_calls(backend._test_graph)) == 1
+
+        assert len(_create_calls(graph)) == 1
 
     @pytest.mark.asyncio
     async def test_summary_defaults_to_empty_string(self, backend_with_mocks):

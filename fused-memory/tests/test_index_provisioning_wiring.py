@@ -416,14 +416,16 @@ class TestFirstWriteProvisioning:
         assert statements_written(graph) == _plan_for(_TRAP_PRESENT)
 
     @pytest.mark.asyncio
-    async def test_ensure_entity_node_on_a_registered_absent_graph_provisions_before_minting(
+    async def test_ensure_entity_node_on_a_registered_absent_graph_provisions_before_its_resolve_read(
         self, mock_config, make_backend, make_graph_mock,
     ):
+        """Every read of a never-written key raises until a write creates it, so
+        provisioning must run before the resolve read, not merely before the mint."""
         backend = make_backend(mock_config, registered_graph_ids={'reg'})
         graph = make_graph_mock([], header=LIVE_HEADER)
 
         async def _ro_query(statement, *args, **kwargs):
-            if 'db.indexes' in statement:
+            if graph.query.await_count == 0:
                 raise EMPTY_KEY_ERROR
             return MagicMock(result_set=[], header=[])  # the resolve read: no such node
 
