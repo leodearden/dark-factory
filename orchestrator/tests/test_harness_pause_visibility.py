@@ -265,6 +265,12 @@ def _hours_ago(hours: float) -> str:
     return (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
 
 
+def _statuses_read(
+    statuses: dict[str, str], error: Exception | None = None,
+) -> AsyncMock:
+    return AsyncMock(return_value=(statuses, error))
+
+
 class _DigestRig(NamedTuple):
     harness: Harness
     queue: EscalationQueue
@@ -291,6 +297,7 @@ def digest_rig(
     monkeypatch.setattr(scheduler, 'get_status', AsyncMock(return_value='blocked'))
     monkeypatch.setattr(scheduler, 'set_task_status', AsyncMock())
     monkeypatch.setattr(scheduler, 'update_task', AsyncMock(return_value=True))
+    monkeypatch.setattr(scheduler, 'get_statuses', _statuses_read({'5260': 'pending'}))
     return _DigestRig(harness, queue, tmp_path)
 
 
@@ -358,6 +365,44 @@ class TestPausedWaitingDigest:
         assert 'task 5260' not in section
         assert pause_esc_id in section
 
+    @pytest.mark.parametrize('status', ['cancelled', 'blocked', 'done'])
+    async def test_a_repended_task_that_left_pending_is_not_waiting(
+        self, digest_rig: _DigestRig, status: str,
+    ) -> None:
+        await _pause_with_overdue_l1_and_repend(digest_rig)
+        digest_rig.harness.scheduler.get_statuses = _statuses_read({'5260': status})
+
+        section = _paused_waiting(await _write_digest(digest_rig))
+
+        assert 'Paused with 0 re-pended tasks waiting' in section
+        assert 'task 5260' not in section
+        digest_rig.harness.scheduler.get_statuses.assert_awaited_once_with(['5260'])
+
+    async def test_a_repended_task_that_no_longer_exists_is_not_waiting(
+        self, digest_rig: _DigestRig,
+    ) -> None:
+        await _pause_with_overdue_l1_and_repend(digest_rig)
+        digest_rig.harness.scheduler.get_statuses = _statuses_read({})
+
+        section = _paused_waiting(await _write_digest(digest_rig))
+
+        assert 'Paused with 0 re-pended tasks waiting' in section
+
+    async def test_an_unreadable_status_keeps_the_waiting_task(
+        self, digest_rig: _DigestRig, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        await _pause_with_overdue_l1_and_repend(digest_rig)
+        digest_rig.harness.scheduler.get_statuses = _statuses_read(
+            {}, RuntimeError('fused-memory down'),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            section = _paused_waiting(await _write_digest(digest_rig))
+
+        assert 'Paused with 1 re-pended tasks waiting' in section
+        assert 'task 5260' in section
+        assert any('fused-memory down' in r.getMessage() for r in caplog.records)
+
     async def test_young_pause_l1_is_not_listed(self, digest_rig: _DigestRig) -> None:
         young_esc_id = _submit(
             digest_rig.queue, Harness._SCHEDULER_PAUSE_SENTINEL,
@@ -390,6 +435,7 @@ async def _restart_second_process(rig: _DigestRig, cost_store: CostStore) -> _Di
         digest_ewa_threshold=1e9,
     )
     restarted.cost_store = cost_store
+    restarted.scheduler.get_statuses = _statuses_read({'5260': 'pending'})
     assert [row['task_id'] for row in _repend_rows(event_store)] == ['5260']
     await restarted._load_persisted_scheduler_pause()
     return _DigestRig(restarted, rig.queue, rig.tmp_path)

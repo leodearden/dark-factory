@@ -5396,13 +5396,33 @@ class Harness:
             )
         return released
 
-    def _pause_visibility_for_digest(
+    def _current_pause_reason(self) -> str:
+        return self.scheduler.pause_reason or '<unknown>'
+
+    async def _still_pending(
+        self, repended: tuple[digest_mod.RependedWhilePaused, ...],
+    ) -> tuple[digest_mod.RependedWhilePaused, ...]:
+        """Drop re-pends whose task has since left 'pending'; an unreadable status keeps them."""
+        if not repended:
+            return ()
+        statuses, err = await self.scheduler.get_statuses([w.task_id for w in repended])
+        if err is not None:
+            logger.warning(
+                '_pause_visibility_for_digest: status re-check failed, listing every '
+                're-pend unverified (fail-open): %s', err,
+            )
+            return repended
+        return tuple(w for w in repended if statuses.get(w.task_id) == 'pending')
+
+    async def _pause_visibility_for_digest(
         self, events_db_path: Path | None,
     ) -> digest_mod.PauseVisibility:
         """Inputs for the digest's '## Paused, waiting' section; fail-open."""
         paused = self.scheduler.is_paused
         repended = (
-            digest_mod.repended_during_current_pause(events_db_path)
+            await self._still_pending(
+                digest_mod.repended_during_current_pause(events_db_path),
+            )
             if paused and events_db_path is not None
             else ()
         )
@@ -5422,7 +5442,7 @@ class Harness:
             now=datetime.now(UTC),
         )
         return digest_mod.PauseVisibility(
-            pause_reason=(self.scheduler.pause_reason or '<unknown>') if paused else None,
+            pause_reason=self._current_pause_reason() if paused else None,
             repended_waiting=repended,
             overdue_pause_escalations=overdue,
         )
@@ -17195,7 +17215,7 @@ class Harness:
         """Mark a resolution that re-pended *task_id* into a paused scheduler; never raises."""
         if not self.scheduler.is_paused:
             return
-        reason = self.scheduler.pause_reason or '<unknown>'
+        reason = self._current_pause_reason()
         if self._escalation_queue is not None:
             try:
                 self._escalation_queue.patch_resolution_metadata(
@@ -18243,7 +18263,7 @@ class Harness:
             # hiccup can never break the digest write.
             stale_lane_census = await self._stale_lane_assignment_census()
             # (11c) Paused re-pends and overdue pause L1s (task 5311) — fail-open.
-            pause_visibility = self._pause_visibility_for_digest(events_db_path)
+            pause_visibility = await self._pause_visibility_for_digest(events_db_path)
 
             inputs = digest_mod.DigestInputs(
                 window_start_iso=window_start,
