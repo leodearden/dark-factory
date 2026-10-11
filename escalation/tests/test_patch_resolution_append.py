@@ -61,6 +61,17 @@ class TestAppendToResolution:
         assert stored.resolution.count('[MARK] note') == 1
         assert stored.resolution == 'resumed by steward\n\n[MARK] note'
 
+    def test_idempotency_is_keyed_on_the_exact_note_text(self, queue: EscalationQueue) -> None:
+        queue.submit(_escalation('esc-5260-1'))
+        queue.resolve('esc-5260-1', 'already says [MARK] note', resolved_by='steward')
+
+        queue.patch_resolution_metadata('esc-5260-1', append_to_resolution='[MARK] note')
+        queue.patch_resolution_metadata('esc-5260-1', append_to_resolution='[MARK] other note')
+
+        stored = queue.get('esc-5260-1')
+        assert stored is not None
+        assert stored.resolution == 'already says [MARK] note\n\n[MARK] other note'
+
     def test_empty_string_resolution_becomes_the_note(self, queue: EscalationQueue) -> None:
         queue.submit(_escalation('esc-5260-1'))
         queue.resolve('esc-5260-1', '', resolved_by='steward')

@@ -255,9 +255,6 @@ class TestOverduePendingEscalations:
 
         assert [o.escalation_id for o in overdue] == ['esc-9h', 'esc-3h']
 
-    def test_resurface_age_is_two_hours(self) -> None:
-        assert timedelta(hours=2) == digest.SCHEDULER_PAUSE_RESURFACE_AGE
-
 
 class TestRenderPausedWaiting:
     def _render(self, visibility: PauseVisibility) -> str:

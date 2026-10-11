@@ -2707,8 +2707,11 @@ class EscalationQueue:
         """Patch resolution fields on an already-closed escalation.
 
         ``append_to_resolution`` appends a note to the resolution text after a
-        blank line; it is append-only and idempotent (a note already present is
-        not appended again, and nothing is written).
+        blank line.  It is append-only, and idempotent on the EXACT note text:
+        when that text already occurs anywhere in the resolution (a substring
+        test), nothing is appended or written.  A note that differs in any
+        character, for example one carrying a different pause reason, is a
+        new note and is appended.
 
         Updates the existing file in place wherever it lives (root or archive); never
         resurrects an archived file into the queue root.  The tmp file used for the
