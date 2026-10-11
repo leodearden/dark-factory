@@ -205,7 +205,7 @@ def test_dashboard_metric_sets_match_what_the_sampler_collectors_emit() -> None:
     # collect_psi only needs a callable reader; no filesystem or kernel access.
     stub_psi_text = 'some avg10=0.0\nfull avg10=0.0'
     sampler_psi_keys = frozenset(
-        sampler_metrics_mod.collect_psi(read=lambda _name: stub_psi_text).keys()
+        k.metric for k in sampler_metrics_mod.collect_psi(read=lambda _name: stub_psi_text)
     )
     assert sampler_psi_keys == PSI_METRICS, (
         f'PSI metric mismatch — sampler emits {sorted(sampler_psi_keys)}, '
@@ -214,10 +214,11 @@ def test_dashboard_metric_sets_match_what_the_sampler_collectors_emit() -> None:
 
     # --- Process metric names ---
     process_keys = frozenset(
-        sampler_metrics_mod.collect_process_metrics(
+        k.metric
+        for k in sampler_metrics_mod.collect_process_metrics(
             proc_iter=lambda *_a, **_kw: [],
             fd9_exists=lambda _pid: False,
-        ).keys()
+        )
     )
     assert process_keys == PROCESS_METRICS, (
         f'Process metric mismatch — sampler emits {sorted(process_keys)}, '

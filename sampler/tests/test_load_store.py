@@ -10,6 +10,12 @@ from typing import Any, NamedTuple
 
 import pytest
 
+from sampler.metrics import SampleKey
+
+RUNQ = SampleKey('runqueue_ratio')
+VERIFY = SampleKey('verify_concurrency')
+PSI_CPU = SampleKey('psi_cpu_some_avg10')
+
 # ---------------------------------------------------------------------------
 # The store's one connection seam, observed
 # ---------------------------------------------------------------------------
@@ -269,7 +275,7 @@ class TestLoadSampleStoreSchema:
         store = LoadSampleStore(db_path)
 
         ts = int(time.time())
-        store.insert_sample(ts, 'psi_cpu_some_avg10', 1.23)
+        store.insert_sample(ts, PSI_CPU, 1.23)
 
         conn = sqlite3.connect(str(db_path))
         row = conn.execute(
@@ -290,7 +296,7 @@ class TestLoadSampleStoreSchema:
         store = LoadSampleStore(db_path)
 
         ts = int(time.time())
-        store.insert_sample(ts, 'verify_concurrency', 3.0, window_mean=2.5, window_max=4.0)
+        store.insert_sample(ts, VERIFY, 3.0, window_mean=2.5, window_max=4.0)
 
         conn = sqlite3.connect(str(db_path))
         row = conn.execute(
@@ -309,7 +315,7 @@ class TestLoadSampleStoreSchema:
 
         # First open: insert a row
         store1 = LoadSampleStore(db_path)
-        store1.insert_sample(ts, 'test_metric', 42.0)
+        store1.insert_sample(ts, SampleKey('test_metric'), 42.0)
 
         # Second open: must not raise, must see the row
         LoadSampleStore(db_path)  # reopen must not raise (return value unused)
@@ -449,7 +455,7 @@ class TestTrailingWindow:
         from sampler.store import LoadSampleStore
 
         store = LoadSampleStore(tmp_path / 'db.sqlite')
-        mean, mx = store.trailing_window('new_metric', 5.0)
+        mean, mx = store.trailing_window(SampleKey('new_metric'), 5.0)
         assert mean == pytest.approx(5.0)
         assert mx == pytest.approx(5.0)
 
@@ -460,12 +466,12 @@ class TestTrailingWindow:
         now = 1_000_000
 
         # Insert two prior values
-        store.insert_sample(now - 20, 'verify_concurrency', 10.0)
-        store.insert_sample(now - 10, 'verify_concurrency', 20.0)
+        store.insert_sample(now - 20, VERIFY, 10.0)
+        store.insert_sample(now - 10, VERIFY, 20.0)
 
         # trailing_window called with current value 30.0
         # -> window = [10.0, 20.0, 30.0], mean=20.0, max=30.0
-        mean, mx = store.trailing_window('verify_concurrency', 30.0)
+        mean, mx = store.trailing_window(VERIFY, 30.0)
         assert mean == pytest.approx(20.0)
         assert mx == pytest.approx(30.0)
 
@@ -475,10 +481,10 @@ class TestTrailingWindow:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         now = 1_000_000
 
-        store.insert_sample(now - 10, 'other_metric', 999.0)
+        store.insert_sample(now - 10, SampleKey('other_metric'), 999.0)
 
         # No prior rows for 'verify_concurrency'
-        mean, mx = store.trailing_window('verify_concurrency', 5.0)
+        mean, mx = store.trailing_window(VERIFY, 5.0)
         assert mean == pytest.approx(5.0)
         assert mx == pytest.approx(5.0)
 
@@ -499,17 +505,55 @@ class TestTrailingWindow:
 
         # Insert 80 rows; only the last 59 (window=60 -> window-1=59) should be used
         for i in range(80):
-            store.insert_sample(base_ts + i, 'metric_x', float(i))
+            store.insert_sample(base_ts + i, SampleKey('metric_x'), float(i))
 
         # Values 0..79 inserted; most recent 59 are values 21..79 (59 rows)
         # current_value = 100.0
         # window = [21.0, 22.0, ..., 79.0, 100.0] = 59 + 1 = 60 values
-        mean, mx = store.trailing_window('metric_x', 100.0)
+        mean, mx = store.trailing_window(SampleKey('metric_x'), 100.0)
         expected_values = [float(i) for i in range(21, 80)] + [100.0]
         expected_mean = sum(expected_values) / len(expected_values)
         expected_max = max(expected_values)
         assert mean == pytest.approx(expected_mean, rel=1e-6)
         assert mx == pytest.approx(expected_max)
+
+    def test_each_leafs_trailing_window_spans_only_its_own_rows(self, tmp_path: Path):
+        """Two leaves of one metric, and a host-level row beside them, never pool."""
+        from sampler.store import LoadSampleStore
+
+        leaf_a = SampleKey('own_cpu_some10', 'a')
+        leaf_b = SampleKey('own_cpu_some10', 'b')
+        store = LoadSampleStore(tmp_path / 'db.sqlite')
+
+        def tick(i: int) -> None:
+            store.write_tick(
+                1_000_000 + i * 5,
+                unwindowed={},
+                windowed={leaf_a: float(i), leaf_b: 1000.0 + i, RUNQ: 500.0},
+            )
+
+        for i in range(69):
+            tick(i)
+        expected_a = store.trailing_window(leaf_a, 69.0)
+        tick(69)
+
+        conn = sqlite3.connect(str(store.db_path))
+        try:
+            windows = {
+                leaf: (mean, mx)
+                for leaf, mean, mx in conn.execute(
+                    'SELECT leaf, window_mean, window_max FROM samples'
+                    ' WHERE ts = ? AND metric = ?',
+                    (1_000_000 + 69 * 5, 'own_cpu_some10'),
+                )
+            }
+        finally:
+            conn.close()
+        own_a = [float(i) for i in range(10, 70)]
+        own_b = [1000.0 + i for i in range(10, 70)]
+        assert windows['a'] == (pytest.approx(sum(own_a) / 60), max(own_a))
+        assert windows['b'] == (pytest.approx(sum(own_b) / 60), max(own_b))
+        assert windows['a'] == expected_a
 
 
 # ---------------------------------------------------------------------------
@@ -528,8 +572,8 @@ class TestRetentionAndVacuum:
         old_ts = now - retain - 1
         recent_ts = now - 100
 
-        store.insert_sample(old_ts, 'metric', 1.0)
-        store.insert_sample(recent_ts, 'metric', 2.0)
+        store.insert_sample(old_ts, SampleKey('metric'), 1.0)
+        store.insert_sample(recent_ts, SampleKey('metric'), 2.0)
 
         store.cleanup_old(now, retain_seconds=retain)
 
@@ -546,8 +590,8 @@ class TestRetentionAndVacuum:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         now = 1_000_000
 
-        store.insert_sample(now - 100, 'metric', 1.0)
-        store.insert_sample(now - 200, 'metric', 2.0)
+        store.insert_sample(now - 100, SampleKey('metric'), 1.0)
+        store.insert_sample(now - 200, SampleKey('metric'), 2.0)
 
         store.cleanup_old(now, retain_seconds=86400)
 
@@ -672,8 +716,8 @@ class TestThirtyDayRetention:
         now = 10_000_000
         just_over_a_day = now - DAY - 60
         just_over_thirty_days = now - THIRTY_DAYS - 60
-        store.insert_sample(just_over_a_day, 'runqueue_ratio', 1.0)
-        store.insert_sample(just_over_thirty_days, 'runqueue_ratio', 2.0)
+        store.insert_sample(just_over_a_day, RUNQ, 1.0)
+        store.insert_sample(just_over_thirty_days, RUNQ, 2.0)
 
         store.cleanup_old(now)
 
@@ -690,8 +734,8 @@ class TestThirtyDayRetention:
         now = 10_000_000
         two_hours_old = now - 7200
         half_an_hour_old = now - 1800
-        store.insert_sample(two_hours_old, 'runqueue_ratio', 1.0)
-        store.insert_sample(half_an_hour_old, 'runqueue_ratio', 2.0)
+        store.insert_sample(two_hours_old, RUNQ, 1.0)
+        store.insert_sample(half_an_hour_old, RUNQ, 2.0)
 
         store.cleanup_old(now, retain_seconds=3600)
 
@@ -707,8 +751,8 @@ class TestThirtyDayRetention:
         now = 10_000_000
         at_cutoff = now - THIRTY_DAYS
         one_second_older = at_cutoff - 1
-        store.insert_sample(at_cutoff, 'runqueue_ratio', 1.0)
-        store.insert_sample(one_second_older, 'runqueue_ratio', 2.0)
+        store.insert_sample(at_cutoff, RUNQ, 1.0)
+        store.insert_sample(one_second_older, RUNQ, 2.0)
 
         store.cleanup_old(now)
 
@@ -735,8 +779,8 @@ class TestThirtyDayRetention:
         now = 10_000_000
         healthy = now - 60
         a_year_ahead = now + 365 * DAY
-        store.insert_sample(healthy, 'runqueue_ratio', 1.0)
-        store.insert_sample(a_year_ahead, 'runqueue_ratio', 2.0)
+        store.insert_sample(healthy, RUNQ, 1.0)
+        store.insert_sample(a_year_ahead, RUNQ, 2.0)
 
         store.cleanup_old(now)
 
@@ -760,8 +804,8 @@ class TestThirtyDayRetention:
         store = LoadSampleStore(db_path)
         real_now = 10_000_000
         clock_reads = real_now - 3 * DAY  # NTP three days behind
-        store.insert_sample(real_now, 'runqueue_ratio', 1.0)
-        store.insert_sample(real_now - 60, 'runqueue_ratio', 2.0)
+        store.insert_sample(real_now, RUNQ, 1.0)
+        store.insert_sample(real_now - 60, RUNQ, 2.0)
 
         store.cleanup_old(clock_reads)
 
@@ -778,8 +822,8 @@ class TestThirtyDayRetention:
         now = 10_000_000
         at_cutoff = now + THIRTY_DAYS
         one_second_further = at_cutoff + 1
-        store.insert_sample(at_cutoff, 'runqueue_ratio', 1.0)
-        store.insert_sample(one_second_further, 'runqueue_ratio', 2.0)
+        store.insert_sample(at_cutoff, RUNQ, 1.0)
+        store.insert_sample(one_second_further, RUNQ, 2.0)
 
         store.cleanup_old(now)
 
@@ -863,7 +907,7 @@ class TestCleanupIsIntervalGated:
         store = LoadSampleStore(db_path)
         now = 10_000_000
         stale = now - THIRTY_DAYS - 60
-        store.insert_sample(stale, 'runqueue_ratio', 1.0)
+        store.insert_sample(stale, RUNQ, 1.0)
 
         assert store.should_cleanup(now) is True
         store.cleanup_old(now)
@@ -881,7 +925,7 @@ class TestCleanupIsIntervalGated:
         store.cleanup_old(now)
 
         planted_after = now - THIRTY_DAYS - 60
-        store.insert_sample(planted_after, 'runqueue_ratio', 1.0)
+        store.insert_sample(planted_after, RUNQ, 1.0)
         store.cleanup_old(now)
 
         assert _count_at(db_path, planted_after) == 1, (
@@ -897,7 +941,7 @@ class TestCleanupIsIntervalGated:
         store.cleanup_old(now)
 
         planted_after = now - THIRTY_DAYS - 60
-        store.insert_sample(planted_after, 'runqueue_ratio', 1.0)
+        store.insert_sample(planted_after, RUNQ, 1.0)
         later = now + DAY
         assert store.should_cleanup(later) is True
         store.cleanup_old(later)
@@ -934,8 +978,8 @@ class TestCleanupIsIntervalGated:
 
         stale = now - THIRTY_DAYS - 60
         from_the_future = now + THIRTY_DAYS + 60
-        store.insert_sample(stale, 'runqueue_ratio', 1.0)
-        store.insert_sample(from_the_future, 'runqueue_ratio', 2.0)
+        store.insert_sample(stale, RUNQ, 1.0)
+        store.insert_sample(from_the_future, RUNQ, 2.0)
         store.cleanup_old(now)
 
         assert _count_at(db_path, stale) == 0
@@ -953,7 +997,7 @@ class TestCleanupIsIntervalGated:
         store.cleanup_old(now)
 
         planted_after = now - THIRTY_DAYS - 60
-        store.insert_sample(planted_after, 'runqueue_ratio', 1.0)
+        store.insert_sample(planted_after, RUNQ, 1.0)
         store.cleanup_old(now + 60, interval_seconds=30)
 
         assert _count_at(db_path, planted_after) == 0
@@ -979,7 +1023,7 @@ class TestCleanupIsIntervalGated:
         store = LoadSampleStore(db_path, connect=spy)
         now = 10_000_000
         stale = now - THIRTY_DAYS - 60
-        store.insert_sample(stale, 'runqueue_ratio', 1.0)
+        store.insert_sample(stale, RUNQ, 1.0)
 
         spy.fails = _statements_starting('DELETE')
         with pytest.raises(sqlite3.Error):
@@ -1169,10 +1213,10 @@ class TestWriteTickIsOneConnectionAndOneTransaction:
     def _tick(self, store, now: int, leaves: int = 7) -> None:
         store.write_tick(
             now,
-            unwindowed={'psi_cpu_some_avg10': 1.0, 'psi_mem_full_avg10': 2.0},
+            unwindowed={PSI_CPU: 1.0, SampleKey('psi_mem_full_avg10'): 2.0},
             windowed={
-                'verify_concurrency': 3.0,
-                **{f'own_cpu_some10:leaf{i}': float(i) for i in range(leaves)},
+                VERIFY: 3.0,
+                **{SampleKey('own_cpu_some10', f'leaf{i}'): float(i) for i in range(leaves)},
             },
         )
 
@@ -1299,8 +1343,8 @@ class TestWriteTickIsOneConnectionAndOneTransaction:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         store.write_tick(
             1_000_000,
-            unwindowed={'psi_cpu_some_avg10': 1.5},
-            windowed={'verify_concurrency': 4.0},
+            unwindowed={PSI_CPU: 1.5},
+            windowed={VERIFY: 4.0},
         )
 
         conn = sqlite3.connect(str(store.db_path))
@@ -1329,11 +1373,11 @@ class TestWriteTickIsOneConnectionAndOneTransaction:
 
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         for i in range(5):
-            store.insert_sample(1_000_000 + i, 'verify_concurrency', float(i))
-        expected = store.trailing_window('verify_concurrency', 99.0)
+            store.insert_sample(1_000_000 + i, VERIFY, float(i))
+        expected = store.trailing_window(VERIFY, 99.0)
 
         store.write_tick(
-            1_000_010, unwindowed={}, windowed={'verify_concurrency': 99.0}
+            1_000_010, unwindowed={}, windowed={VERIFY: 99.0}
         )
 
         conn = sqlite3.connect(str(store.db_path))
@@ -1375,16 +1419,16 @@ class TestEveryConnectionGoesThroughTheInjectedConnect:
 
         now = 1_000_000 + 20_000 * 5
         operations: list[tuple[str, Callable[[LoadSampleStore], object]]] = [
-            ('insert_sample', lambda s: s.insert_sample(now, 'runqueue_ratio', 1.0)),
+            ('insert_sample', lambda s: s.insert_sample(now, RUNQ, 1.0)),
             (
                 'write_tick',
                 lambda s: s.write_tick(
                     now + 5,
-                    unwindowed={'psi_cpu_some_avg10': 1.0},
-                    windowed={'runqueue_ratio': 2.0},
+                    unwindowed={PSI_CPU: 1.0},
+                    windowed={RUNQ: 2.0},
                 ),
             ),
-            ('trailing_window', lambda s: s.trailing_window('runqueue_ratio', 3.0)),
+            ('trailing_window', lambda s: s.trailing_window(RUNQ, 3.0)),
             ('cleanup_old', lambda s: s.cleanup_old(now, retain_seconds=100)),
             ('reclaimable_fraction', lambda s: s.reclaimable_fraction()),
             ('maybe_vacuum', lambda s: s.maybe_vacuum(now)),
