@@ -13,6 +13,7 @@ from typing import Any
 
 from graphiti_core.embedder import EmbedderClient
 from qdrant_client.models import Filter, PointStruct, VectorParams
+from redis.exceptions import ResponseError
 
 from fused_memory.arm_harness import checks, graph_copy, topology
 from fused_memory.arm_harness.mem0_replica import Mem0Record, Mem0Snapshot
@@ -67,7 +68,8 @@ class FakeGraph:
 
     ``log`` is shared with every other double, so the run's order across stores is one
     list. ``answers_fulltext_unindexed`` makes the fulltext probe find its seed with no
-    index, as a stale index would.
+    index, as a stale index would. ``refused_copies`` copies are refused as FalkorDB
+    refuses one while a BGSAVE holds the fork.
     """
 
     def __init__(
@@ -80,6 +82,7 @@ class FakeGraph:
         catalog: Iterable[IndexSpec] = (),
         answers_fulltext_unindexed: bool = False,
         lossy_copy: frozenset[str] = frozenset(),
+        refused_copies: int = 0,
     ) -> None:
         self.name = name
         self.log = log
@@ -88,6 +91,7 @@ class FakeGraph:
         self.catalog: set[IndexSpec] = set(catalog)
         self.answers_fulltext_unindexed = answers_fulltext_unindexed
         self.lossy_copy = lossy_copy
+        self.refused_copies = refused_copies
         self.client: FakeGraphClient | None = None
 
     # graph_copy -------------------------------------------------------------------------
@@ -217,6 +221,9 @@ class FakeGraph:
     async def copy(self, clone: str) -> None:
         assert self.client is not None
         self.log.append('copy')
+        if self.refused_copies:
+            self.refused_copies -= 1
+            raise ResponseError(graph_copy.COPY_FORK_REFUSAL)
         kept = {uuid: p for uuid, p in self.edges.items() if uuid not in self.lossy_copy}
         self.client.add(FakeGraph(
             clone, log=self.log, nodes=copy.deepcopy(self.nodes), edges=copy.deepcopy(kept),
