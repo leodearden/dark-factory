@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import IntEnum, StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from _task_db_scan import (
     UNREADABLE_STORE_ERRORS,
@@ -36,6 +36,7 @@ from _task_db_scan import (
     format_kv_line,
     tasks_db_path,
 )
+from migrate_metadata_modules_to_files import write_failure_reason
 
 # Bind shared/ and fused-memory/ to THIS checkout rather than whichever copy an
 # editable install put on sys.path (scripts/audit_manifest_descriptor_drift.py::_SHARED_SRC).
@@ -137,6 +138,10 @@ class Census:
         return {'by_tier': by_tier, 'by_tier_status': by_tier_status}
 
 
+def _ordered(tiers: frozenset[Tier]) -> tuple[Tier, ...]:
+    return tuple(tier for tier in Tier if tier in tiers)
+
+
 def take_census(project_root: str, now: datetime) -> Census:
     with closing(connect_ro(tasks_db_path(project_root))) as conn:
         (rows_in_store,) = conn.execute('SELECT count(*) FROM tasks').fetchone()
@@ -149,10 +154,115 @@ def take_census(project_root: str, now: datetime) -> Census:
     return Census(project_root, now, rows_in_store, violations)
 
 
+class ToolClient(Protocol):
+    async def call_tool(self, name: str, arguments: dict) -> dict: ...
+
+
+class Bucket(StrEnum):
+    REPAIRED = 'repaired'
+    SKIPPED_CHANGED_UNDER_US = 'skipped_changed_under_us'
+    ARRIVED_DURING_WINDOW = 'arrived_during_window'
+    FAILED = 'failed'
+
+
+Delta = Mapping[str, tuple[Any, Any]]
+
+
+@dataclass(frozen=True)
+class RowOutcome:
+    violation: Violation
+    bucket: Bucket
+    delta: Delta | None = None
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
+class ApplyReport:
+    project_root: str
+    tiers: tuple[Tier, ...]
+    refused: bool
+    holder_intersection: tuple[int, ...]
+    outcomes: tuple[RowOutcome, ...]
+    verification_census: Census | None
+
+    def counts(self) -> dict[Bucket, int]:
+        counts = {bucket: 0 for bucket in Bucket}
+        for outcome in self.outcomes:
+            counts[outcome.bucket] += 1
+        return counts
+
+
+@dataclass(frozen=True)
+class _Attempt:
+    write_error: str | None = None
+
+
+STILL_VIOLATING_DETAIL = 'still violating at verification census'
+
+
+async def _clear_claimant(client: ToolClient, project_root: str, violation: Violation) -> str | None:
+    arguments = {
+        'id': str(violation.task_id),
+        'tag': violation.tag,
+        'project_root': project_root,
+        'claimant_run_id': None,
+        'heartbeat_at': None,
+    }
+    try:
+        reply = await client.call_tool('set_task_claimant', arguments)
+    except Exception as exc:
+        return f'{type(exc).__name__}: {exc}'
+    return write_failure_reason(reply)
+
+
+def _outcome(violation: Violation, attempt: _Attempt, still_violating: frozenset) -> RowOutcome:
+    if attempt.write_error is not None:
+        return RowOutcome(violation, Bucket.FAILED, detail=attempt.write_error)
+    if violation.key in still_violating:
+        return RowOutcome(violation, Bucket.FAILED, detail=STILL_VIOLATING_DETAIL)
+    return RowOutcome(violation, Bucket.REPAIRED)
+
+
+def bucket_outcomes(
+    selected: Sequence[Violation],
+    attempts: Mapping[tuple[str, int], _Attempt],
+    verification: Census,
+    tiers: frozenset[Tier],
+) -> tuple[RowOutcome, ...]:
+    still_violating = frozenset(v.key for v in verification.violations if v.tier in tiers)
+    return tuple(_outcome(v, attempts[v.key], still_violating) for v in selected)
+
+
+async def apply_repairs(
+    census: Census,
+    client: ToolClient | None,
+    *,
+    tiers: frozenset[Tier],
+    clock: Callable[[], datetime],
+) -> ApplyReport:
+    if client is None:
+        raise ValueError('apply_repairs writes through an MCP client; none was given')
+    root = census.project_root
+    selected = tuple(v for v in census.violations if v.tier in tiers)
+    attempts = {
+        violation.key: _Attempt(write_error=await _clear_claimant(client, root, violation))
+        for violation in selected
+    }
+    verification = take_census(root, clock())
+    return ApplyReport(
+        project_root=root,
+        tiers=_ordered(tiers),
+        refused=False,
+        holder_intersection=(),
+        outcomes=bucket_outcomes(selected, attempts, verification, tiers),
+        verification_census=verification,
+    )
+
+
 @dataclass(frozen=True)
 class ProjectReport:
     census: Census
-    apply: object | None = None
+    apply: ApplyReport | None = None
 
 
 @dataclass(frozen=True)
@@ -172,7 +282,7 @@ async def sweep(
     *,
     apply: bool,
     tiers: frozenset[Tier],
-    client: object | None,
+    client: ToolClient | None,
     clock: Callable[[], datetime],
 ) -> SweepResult:
     projects: list[ProjectReport] = []
@@ -184,10 +294,11 @@ async def sweep(
             print(f'warning: skipping unreadable project {root}: {exc}', file=sys.stderr)
             unreadable.append(root)
             continue
-        projects.append(ProjectReport(census))
+        report = await apply_repairs(census, client, tiers=tiers, clock=clock) if apply else None
+        projects.append(ProjectReport(census, report))
     return SweepResult(
         applied=apply,
-        repair_tiers=tuple(tier for tier in Tier if tier in tiers),
+        repair_tiers=_ordered(tiers),
         projects=tuple(projects),
         unreadable=tuple(unreadable),
     )
