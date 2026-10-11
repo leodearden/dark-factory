@@ -53,6 +53,7 @@ const ARGS_SCHEMA = {
     cross: { type: 'array', items: { type: 'object', required: ['lens', 'tag', 'title', 'question'],
       properties: { lens: { type: 'string' }, tag: { type: 'string' }, title: { type: 'string' }, question: { type: 'string' } } } },
     metrics_summary: { type: 'string', description: '`scripts/quality_metrics_snapshot.py --summary` plus its `--diff` sections, ≤4k chars' },
+    language_note: { type: ['string', 'null'], description: "the overlay's Language note slot verbatim, or null/absent for a Python project: how to read the quality doc's Python-flavoured heuristic-13 and Tests-stance symptoms (reach-back and deferred imports, re-export shims, satellites over private state, patching privates) in the project's language, and what the complexity instrument measures; the area prompt inserts it after YOUR SLICE" },
     quality_guidance: { type: ['string', 'null'], description: "null when <root>/docs/code-quality.md exists (prompts say Read it); otherwise the render of orchestrator/src/orchestrator/agents/code_quality.py::guidance, embedded verbatim (contract §10)" },
     import_graph_path: { type: 'string', description: "JSON file under scratch: the snapshot's import_graph section unchanged — {edges:[[from,to]], reach_back:[{from,to,names,line}], deferred:[{from,line,imports,closes_cycle}], cycles:[[module,...]], hidden_cycles:[[module,...]], typing_cycles:[[module,...]]}, nodes are module import names (a file record's `module`); cycles are over import-time edges, hidden_cycles add function-local imports, typing_cycles add `if TYPE_CHECKING:` ones, and closes_cycle marks a deferred import lying on a hidden cycle (plans/quality-metrics-snapshot-prd.md decision 10)" },
     snapshot_path: { type: 'string', description: "the Phase 1 snapshot JSON under scratch; a seat with a file larger than its remaining budget reads that file's rows of the `functions` table ({'<path>::<Class>::<func>': cognitive, ...}) to rank what it reads (failure mode 15)" },
@@ -71,7 +72,7 @@ const ARGS_SCHEMA = {
 
 One markdown file per seat at `<scratch>/seats/<seat>/brief.md`, written by the lead's generator (SKILL.md Phase 1 §Slices) from the full slice record, in this order, each section headed as named so the prompt can cite it:
 
-1. **READ FULLY, in this order** — one line per file with its snapshot numbers: lines, prose share, cognitive max / total, fan-in, fan-out, reach-back imports, cycle-closing deferred imports, re-exports, test patch targets. The numbers come from the snapshot's file record for the path: `prose_share = prose_ratio` (0 where null), `fan_in = fan_in_src`, `reexports = len(reexport_names)`, `patch_targets` = the count of distinct `private_patch_targets` across tests records that continue this record's module, `cycle_closing_imports` from the import graph's `deferred` entries with `closes_cycle` for this module; the rest are the record's own fields.
+1. **READ FULLY, in this order** — one line per file with its snapshot numbers: lines, prose share, cognitive max / total, fan-in, fan-out, reach-back imports, cycle-closing deferred imports, re-exports, test patch targets. The numbers come from the snapshot's file record for the path: `prose_share = prose_ratio` (0 where null), `fan_in = fan_in_src`, `reexports = len(reexport_names)`, `patch_targets` = the count of distinct `private_patch_targets` across tests records that continue this record's module, `cycle_closing_imports` from the import graph's `deferred` entries with `closes_cycle` for this module; the rest are the record's own fields. An entry whose area is not the slice's — a one-small-file area read inside a neighbouring slice (SKILL.md Phase 1 §Slices) — carries `area: <area>` on its line, and the seat anchors findings there in that area.
 2. **INDEX ONLY** — the remaining paths.
 3. **TESTS THAT REACH THIS SLICE'S INTERNALS** — `test_path -> targets`.
 4. **SIZE ALARMS** — paths over `ceilings.alarm_lines`.
@@ -98,6 +99,7 @@ export const meta = {
   phases: [
     { title: 'Area review', detail: 'one seat per area slice; all fourteen heuristics and both stances', model: 'opus' },
     { title: 'Verify', detail: 'one skeptic per seat, blinded to proposals', model: 'sonnet' },
+    { title: 'Calibrate', detail: 'when the area skeptics refuted nothing: ten confirmed findings (every high first) re-verified by fresh skeptics', model: 'sonnet' },
     { title: 'Cross-area', detail: 'h11 SPOT, h9 layering, h3 orthogonal dimensions, h7 stateless interactions', model: 'opus' },
     { title: 'Synthesize', detail: 'join prior and new findings by short id; area x heuristic ranked view; candidate streams' },
     { title: 'Critique', detail: 'a critic reads the assembled synthesis for join errors' },
@@ -300,7 +302,7 @@ function areaPrompt(s) {
 
 ${QUALITY}quality is the expected cost and risk of the next change, made by an agent from a partial view. The fourteen heuristics and the two stances are lenses you name on each finding (tags), not a checklist to walk; one finding per heuristic is the failure mode this prompt exists to prevent.
 
-YOUR SLICE: ${s.seat} (findings carry area "${s.area}"). Your slice brief is the file ${s.brief} — Read it first, in full. It holds, in this order: READ FULLY (ranked by the instruments in that doc's "What to measure" table, each entry with its snapshot numbers; line counts set only how much fits in your budget — top entries: ${topReads(s)}), INDEX ONLY (${s.index_only_count} files), TESTS THAT REACH THIS SLICE'S INTERNALS (${s.tests_reaching_internals_count} test files), SIZE ALARMS (${s.size_alarms.length ? s.size_alarms.join(', ') : 'none'} — heuristic 14 protocol mandatory for each; fill h14_measurements with prose share and whether the prose is in its right home, a named partition of top-level symbols, and per candidate the heuristic-13 symptom naming the two modules and the specific import, or none), PRIOR OPEN FINDINGS AT THIS AREA (${s.prior_open.length}, with full statements; re-verify each at this tree and report every one in prior_verdicts using its exact canonical string — still_present or gone, a gone needs the commit or the replacing code; set prior_canonical on a new finding only when it adds evidence to one rather than restating it), and LEADS (${s.leads_count}; things to verify, never findings in themselves).
+YOUR SLICE: ${s.seat} (findings carry area "${s.area}" unless a READ FULLY entry names another area). ${A.language_note ? `LANGUAGE NOTE: ${A.language_note}\n\n` : ''}Your slice brief is the file ${s.brief} — Read it first, in full. It holds, in this order: READ FULLY (ranked by the instruments in that doc's "What to measure" table, each entry with its snapshot numbers; line counts set only how much fits in your budget — top entries: ${topReads(s)}), INDEX ONLY (${s.index_only_count} files), TESTS THAT REACH THIS SLICE'S INTERNALS (${s.tests_reaching_internals_count} test files), SIZE ALARMS (${s.size_alarms.length ? s.size_alarms.join(', ') : 'none'} — heuristic 14 protocol mandatory for each; fill h14_measurements with prose share and whether the prose is in its right home, a named partition of top-level symbols, and per candidate the heuristic-13 symptom naming the two modules and the specific import, or none), PRIOR OPEN FINDINGS AT THIS AREA (${s.prior_open.length}, with full statements; re-verify each at this tree and report every one in prior_verdicts using its exact canonical string — still_present or gone, a gone needs the commit or the replacing code; set prior_canonical on a new finding only when it adds evidence to one rather than restating it), and LEADS (${s.leads_count}; things to verify, never findings in themselves).
 
 A FILE LARGER THAN YOUR REMAINING BUDGET: when one READ FULLY entry exceeds the lines you can still read in full, do not read it from the top until the budget runs out. Read its symbol index (grep -n 'def \\|class '), its module-level state (assignments and constants outside any def), and its functions in descending cognitive max — the rows of the snapshot's functions table at ${A.snapshot_path} whose key starts with that path (a {"<path>::<Class>::<func>": cognitive} map; filter with a small script) — until the budget is spent; the rest stays indexed. Record it under read_coverage.partial (path, lines read verbatim, which functions and state you read), never under files_read_fully.
 
@@ -363,14 +365,25 @@ async function verifySeat(r, label) {
 }
 
 const calibration = { downgraded_unreproduced: 0 }
-function enforceFalsification(v) {
+// A confirmed verdict with an unreproduced measurement is weakened (failure mode 4). Pure, so the Calibrate
+// phase applies the same rule without counting its sample into the run's figures.
+function falsificationGate(v) {
   const missing = (v.falsification || []).filter(x => x && x.reproduced === false)
-  if (v.verdict === 'confirmed' && missing.length) {
+  if (v.verdict !== 'confirmed' || !missing.length) return v
+  return { ...v, verdict: 'weakened', notes: `[pipeline: confirmed → weakened; not reproduced: ${missing.map(x => x.measurement).join(', ')}] ${v.notes}` }
+}
+function enforceFalsification(v) {
+  const g = falsificationGate(v)
+  if (g !== v) {
     calibration.downgraded_unreproduced += 1
-    log(`verdict ${v.display_id}: confirmed with ${missing.length} unreproduced measurement(s) — downgraded to weakened`)
-    return { ...v, verdict: 'weakened', notes: `[pipeline: confirmed → weakened; not reproduced: ${missing.map(x => x.measurement).join(', ')}] ${v.notes}` }
+    log(`verdict ${v.display_id}: confirmed with unreproduced measurement(s) — downgraded to weakened`)
   }
-  return v
+  return g
+}
+function countVerdicts(rs) {
+  const c = { confirmed: 0, weakened: 0, refuted: 0, unverified: 0 }
+  for (const r of rs) for (const f of r.findings) c[f.verdict] = (c[f.verdict] || 0) + 1
+  return c
 }
 
 function applyVerdicts(r) {
@@ -446,6 +459,43 @@ RULES
 At most ${MAX} findings. State what you read and computed in method.`
 }
 
+// Calibrate (failure mode 4): when the area skeptics refuted nothing, one fresh skeptic per sampled confirmed
+// finding re-verifies it, so the lead reads ten outcomes rather than re-reading code. Started here, it runs
+// alongside the cross lenses with no barrier and is awaited before the return; its agents name their phase
+// in opts rather than calling phase(), which the concurrent cross arm sets.
+const CALIBRATION_SAMPLE = 10
+// Evenly spaced picks over a canonical-sorted list: deterministic (the script cannot use Math.random) and
+// spread across areas, where the first k entries would all come from the alphabetically first area.
+function spreadPick(list, k) {
+  if (list.length <= k) return list
+  return Array.from({ length: k }, (_, i) => list[Math.floor(i * list.length / k)])
+}
+async function calibrate() {
+  const c = countVerdicts(seats)
+  if (c.refuted > 0 || (c.confirmed + c.weakened) <= 10) return null
+  const byCanonical = (a, b) => (a.f.canonical < b.f.canonical ? -1 : a.f.canonical > b.f.canonical ? 1 : 0)
+  const confirmed = seats.flatMap(r => r.findings.filter(f => f.verdict === 'confirmed').map(f => ({ f, seat: r.seat }))).sort(byCanonical)
+  const highs = spreadPick(confirmed.filter(x => x.f.severity === 'high'), CALIBRATION_SAMPLE)
+  const rest = spreadPick(confirmed.filter(x => x.f.severity !== 'high'), CALIBRATION_SAMPLE - highs.length)
+  const sample = [...highs, ...rest]
+  log(`calibrate: the area skeptics refuted nothing — ${sample.length} confirmed findings (${highs.length} high) go to fresh skeptics`)
+  const results = await parallel(sample.map(({ f, seat }) => async () => {
+    const v = await agent(skepticPrompt(seat, blind([f]), []), { label: `calibrate:${f.display_id}`, phase: 'Calibrate', model: A.routing.skeptic.model, effort: A.routing.skeptic.effort, schema: SKEPTIC_SCHEMA })
+    const vs = (v && v.verdicts) || []
+    const got = vs.find(x => x.display_id === f.display_id) || vs[0]
+    return got ? falsificationGate(got) : null
+  }))
+  const outcomes = sample.map(({ f }, i) => {
+    const g = results[i]
+    return { canonical: f.canonical, display_id: f.display_id, severity: f.severity, outcome: g ? g.verdict : 'lost', note: g ? g.notes : 'skeptic lost', falsification: g ? g.falsification : [] }
+  })
+  const n = (o) => outcomes.filter(x => x.outcome === o).length
+  const sampled = { sampled: sample.length, strata: { high: highs.length, random: rest.length }, confirmed: n('confirmed'), weakened: n('weakened'), refuted: n('refuted'), lost: n('lost'), outcomes }
+  log(`calibrate: ${sampled.confirmed} confirmed, ${sampled.weakened} weakened, ${sampled.refuted} refuted, ${sampled.lost} lost of ${sample.length}`)
+  return sampled
+}
+const calibrationRun = calibrate()
+
 phase('Cross-area')
 let crossLenses = A.cross
 if (budget.total && budget.remaining() < 800_000) { log(`budget: ${Math.round(budget.remaining() / 1000)}k left — cross-area lenses skipped, record under Dropped and degraded`); crossLenses = [] }
@@ -474,11 +524,10 @@ const crossSeats = (await pipeline(
 for (const r of crossSeats) for (const f of r.findings) if (f.verdict !== 'refuted' && !known.has(f.canonical)) known.set(f.canonical, f)
 
 const all = [...seats, ...crossSeats]
-const counts = { confirmed: 0, weakened: 0, refuted: 0, unverified: 0 }
-for (const r of all) for (const f of r.findings) counts[f.verdict] = (counts[f.verdict] || 0) + 1
+const counts = countVerdicts(all)
 const verified = counts.confirmed + counts.weakened + counts.refuted
 calibration.refutation_rate = verified ? Math.round(1000 * counts.refuted / verified) / 1000 : null
-if (counts.refuted === 0 && (counts.confirmed + counts.weakened) > 10) log('YELLOW FLAG: zero refutations across the run — the lead re-verifies a stratified sample of ten confirmed findings (all highs first, then random) inline before trusting the verdict counts, and compares refutation_rate with prior runs')
+if (counts.refuted === 0 && (counts.confirmed + counts.weakened) > 10) log('YELLOW FLAG: zero refutations across the run — the lead reads yellow_flag_sample (the Calibrate phase) before trusting the verdict counts, and compares refutation_rate with prior runs')
 
 // Short ids: one per canonical. Priors first (p<n>), then this run's findings (f<n>); a finding whose
 // canonical is also a prior keeps the prior's id, so the synthesis never sees two ids for one canonical.
@@ -608,11 +657,13 @@ const severityCorrections = ((critic && critic.join_errors) || []).map((e, i) =>
   })
 if (severityCorrections.some(s => !s.canonical)) log(`critic: ${severityCorrections.filter(s => !s.canonical).length} severity correction(s) name no resolvable id — listed with canonical null`)
 
+const yellowFlagSample = await calibrationRun
+
 return {
   run_id: A.run_id, as_of_sha: A.as_of_sha, since: A.since,
   seats: all.map(r => ({ ...r, verdicts: undefined })),
   refuted: all.flatMap(r => r.findings.filter(f => f.verdict === 'refuted').map(f => ({ seat: r.seat, display_id: f.display_id, canonical: f.canonical, anchor: f.anchor, why: f.verdict_notes }))),
-  verification: counts, calibration, observation, dropped,
+  verification: counts, calibration, yellow_flag_sample: yellowFlagSample, observation, dropped,
   short_ids: [...idOf].map(([c, id]) => ({ id, canonical: c })),
   synthesis: mapIds(synthesis), critic, synthesis_revised: revised, severity_corrections: severityCorrections,
 }
@@ -626,6 +677,7 @@ Set in `args.routing` by the lead, explicit on every `agent()`; the session mode
 |---|---|---|---|
 | area review (per slice) | opus | high | judgment-dense: architectural review against a definition, not a checklist |
 | skeptic (per seat) | sonnet | high | bounded verification of concrete claims that rewards thinking; the cheapest seat that reproduces a measurement |
+| calibration skeptic (×10, only when the area skeptics refuted nothing) | sonnet | high | the same skeptic prompt and falsification protocol on one finding, fresh context; ~60–100k each |
 | cross-area lens (×4) | opus | high | cross-input synthesis over a graph plus N reports |
 | synthesis | fable (standing in the DF overlay; else per the provenance rule) | high | synthesis of conflicting complex reports — the team skill's named fable case; fallback opus / xhigh |
 | critic | fable (standing in the DF overlay; else per the provenance rule) | high | adversarial review of that synthesis — the other named case; fallback opus / xhigh |
@@ -639,15 +691,16 @@ Expected per-seat spend, extrapolated from the hotspot run's measured 100–140k
 1. **Degenerate structured output passes the schema** (hotspot failure mode 1). `cleanSeat` + `degenerateSeat` check every finding's anchor shape, statement length, measurement presence, next-change scenario and placeholder text; cross seats (`degenerateCross`), the synthesis (`degenerateSynthesis`) and the critic (`degenerateCritic`) have their own checks through `seatWithRetry`. Every seat is re-run once and then dropped with a `dropped` record the report prints; a lost synthesis skips the critic rather than handing it `null`.
 2. **Fourteen-times-N trivial findings.** Prevented by the prompt's next-change filter and the `maxItems` cap; detected by the critic's `severity-unsupported` class. If a seat returns `MAX` findings all `low`, the lead reads its `area_health` before trusting any of them.
 3. **A split proposed without the heuristic-14 protocol.** Dropped mechanically (`h14 without measurement protocol`); the report lists it so the seat's omission is visible.
-4. **Skeptic anchoring and a skeptic that never refutes.** The skeptic never sees proposals or severities (`blind`). Measured on the first dark-factory run: 0 refutations across 203 findings, and 0 across the hotspot refresh (174) and the `/review` run (159) at the same tree — 536 findings, 0 refuted; the five-finding sample all reproduced, which cannot tell "all real" from "skeptic too soft". So the skeptic now records one falsification attempt per measurement (what it ran, what would have refuted it, what it found, whether it reproduced), and `enforceFalsification` downgrades a `confirmed` verdict with any unreproduced measurement to `weakened` (counted in `calibration.downgraded_unreproduced`). Zero refutations with more than ten surviving findings logs a YELLOW FLAG; the lead re-verifies a stratified sample of ten confirmed findings inline (all highs first, then random), records the per-key outcome in the report's `extra.yellow_flag_sample`, and compares `calibration.refutation_rate` with the previous runs' `## Method` `verification.refutation_rate`.
+4. **Skeptic anchoring and a skeptic that never refutes.** The skeptic never sees proposals or severities (`blind`). Measured on the first dark-factory run: 0 refutations across 203 findings, and 0 across the hotspot refresh (174) and the `/review` run (159) at the same tree — 536 findings, 0 refuted; the five-finding sample all reproduced, which cannot tell "all real" from "skeptic too soft". So the skeptic now records one falsification attempt per measurement (what it ran, what would have refuted it, what it found, whether it reproduced), and `enforceFalsification` downgrades a `confirmed` verdict with any unreproduced measurement to `weakened` (counted in `calibration.downgraded_unreproduced`). Zero refutations from the area skeptics with more than ten surviving findings starts the `Calibrate` phase: a stratified sample of ten confirmed findings — every confirmed `high` first, then the rest, each stratum taken as evenly spaced picks over its canonical-sorted list because the script cannot use `Math.random` — goes to one fresh skeptic each (`A.routing.skeptic`, the same `skepticPrompt` and falsification protocol, `falsificationGate` applied without counting into `calibration`), concurrently with the cross lenses, and the result's `yellow_flag_sample` carries the per-finding outcomes (`lost` for a skeptic that returned nothing). The lead's context is the scarce resource, so the re-verification is a seat's job, not the lead's (SKILL.md §Lead context budget): the lead reads the sample's outcomes, the digest copies it to `extra.yellow_flag_sample`, and the lead compares `calibration.refutation_rate` with the previous runs' `## Method` `verification.refutation_rate`. The full-run YELLOW FLAG log still fires on zero refutations across every seat.
 5. **Verdict join by display_id.** Unmatched ids fall to `unverified` and are counted separately; never conflate "survived" with "confirmed".
 6. **`fixed` without evidence.** A prior finding is `fixed` only when the seat said `gone` and the skeptic confirmed the locating evidence; the critic's `unverified-fixed` is the backstop.
 7. **The result is too large to read raw** (expect 300–600 KB). The lead writes it to `<scratch>/workflow-result.json` and digests with a script (SKILL.md Phase 5).
 8. **Main moves during a three-hour run.** Every seat reads the detached worktree at `as_of_sha`, never the main checkout; the lead removes the worktree after the report is committed. No stash anywhere (CLAUDE.md §Working in the main checkout).
 9. **Budget directive.** `budget` (`total`, `spent()`, `remaining()`) is a documented Workflow script global (`workflow-authoring` reference §Script body hooks). Under a `+Nk` directive, the guard before `phase('Cross-area')` skips the lenses when fewer than ~800k tokens remain (four opus seats plus skeptics) and logs it; synthesis and critic still run on what exists, and the report lists the lenses under Dropped and degraded. Without a directive `budget.total` is null and the guard is inert.
 10. **A prior finding silently unchecked.** Legacy hotspot areas `<area>/<sub>` are split in Phase 0 into the plain area and `sub_area` and assigned to the slice holding those files; after the area pipeline the script lists every assigned prior that came back without a verdict under `observation.unchecked`, so a seat that skipped its re-verification duty is visible in the report rather than read as "still open, nothing changed".
-11. **`args` too large to pass inline.** With every slice's read list, test patch targets, prior statements and leads embedded, the first dark-factory run's `args` was 820 KB, which the lead would have had to emit as a single tool-call value. The run moved the static inputs to one brief file per seat and one `prior_open.json` (§The slice brief) and passed a 60 KB `args` of identities, paths and counts; that is now the shape. The script derives the open prior set from `slices[].prior_open` and never carries a second copy.
+11. **`args` too large to pass inline.** With every slice's read list, test patch targets, prior statements and leads embedded, the first dark-factory run's `args` was 820 KB, which the lead would have had to emit as a single tool-call value. The run moved the static inputs to one brief file per seat and one `prior_open.json` (§The slice brief) and passed a 60 KB `args` of identities, paths and counts; that is now the shape. The script derives the open prior set from `slices[].prior_open` and never carries a second copy. Even 60 KB is a large tool-call value; the zero-paste alternative, used on the first reify run, is to write `const A = <args JSON>` into the script file in place of `const A = args` and launch with `scriptPath` only (`args` unused) — the journal's replay key is each call's prompt and opts, which this leaves unchanged.
 12. **Seat name drift.** Two of 19 area seats echoed `seat` without the area prefix (`harness-agents`, `task-layer-curator`); the post-pipeline join `seats.find(x => x.seat === s.seat)` missed them and 41 priors they had in fact re-verified were reported as `unchecked`. `reviewSeat` now overwrites `seat` and `area` from the slice after the call (logging a mismatch), and the cross arm sets its own `seat`; a seat's echo is never a join key.
 13. **The synthesis invents an abbreviation scheme.** Asked to repeat 480 canonicals in the matrix, the fable synthesis shortened them its own way — path tokens (`O:=` for the orchestrator package), omitted `<area>|` prefixes, trailing `[w,p,m]` flags, `alias:filed-by-anchor` notes — and the lead's digest had to reverse-engineer it. The script now assigns short ids (`p<n>` priors, `f<n>` findings, one per canonical), the prompts forbid anything but bare ids in `ranked`, `canonicals` and `between`, and `mapIds` maps them back before returning, listing anything unresolvable under `synthesis.unresolved_ids`; `short_ids` in the result lets the lead's digest read the ids the critic prose and `method`/`exonerations` still use.
 14. **An accepted critic correction never reaches the record.** The critic's `severity-unsupported` on `fk-3505aba0481d` (`evals/runner.py::run_architect_eval`, high → medium) was accepted in the revised synthesis, but the findings record kept the seat's `high` and the lead had to rule at decompose. The critic now states `severity_to`, the revision answers each item in `critic_responses`, and the script returns `severity_corrections` with the acceptance; the lead's digest applies the accepted ones and flags the rest (`report-format.md` §Artefact 2).
 15. **A file larger than the read budget.** `merge_lane/worker.py` was 22,081 lines against a 15k budget; the seat read 9,970 verbatim and the rest as a code-only rendition, and nothing in `read_coverage` said so. The area prompt now prescribes the protocol (symbol index, module-level state, functions in descending cognitive max from the snapshot's `functions` table) and `read_coverage.partial` records it, so the report can show what was not read.
+16. **A usage cap mid-run.** Measured on the first reify run (`review-all-reify-20261010`): the account's weekly usage limit fired at 11.2M subagent tokens, 37 of 70 agents failed with "usage limit", and the workflow kept dispatching until every remaining call had failed — `agent()` returns `null` on a terminal API error, so each failure was logged as a degenerate seat and its retry burned another call. Such a run must be **resumed, not restarted**: `Workflow({scriptPath, resumeFromRunId})` once the limit resets. But a resume replays only the longest unchanged prefix of `agent()` calls *in journal order*, and under `pipeline()` (and the Calibrate phase running beside the cross lenses) the completion order differs between runs, so every call after the first divergence runs live again: on reify 5 already-completed area seats and 6 completed skeptics re-ran, about 1.2M tokens. Two rules follow. (a) Never stop a run to patch prompts for seats that have not run yet — an edited prompt moves the divergence point earlier still. Let it finish, then re-run only the changed tail as a standalone workflow over the completed results: a script that rebuilds the synthesis digest from `workflow-result.json` (seat identity from the slice list, short ids, `prior_ids`, `calibration`), embeds it with the current `orchestration.md`'s Calibrate, Synthesize and Critique code lifted verbatim, and runs Calibrate → Synthesize → Critique (the reify run's `build_synth_input.py` + `gen_synth_workflow.py` pair, kept with its intermediates, is the shape to lift; its paths are that run's). (b) At the cost gate, check the account's remaining weekly headroom against the roster's estimate, Phase 2 included (SKILL.md §Cost gate); a run that will not fit waits for the reset rather than being cut by the cap mid-pipeline.

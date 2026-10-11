@@ -20,7 +20,7 @@ Required sections, in order. Measurements from the quality doc's `Do not steer b
    extra:
      findings_json: <path>
      worktree: {path: <detached path>, removed: true}
-     yellow_flag_sample: <null | {sampled: 10, strata: {high: <n>, random: <n>}, confirmed: n, weakened: n, refuted: n, outcomes: [{key, severity, outcome: confirmed | weakened | refuted, note}]}>
+     yellow_flag_sample: <null | {sampled: 10, strata: {high: <n>, random: <n>}, confirmed: n, weakened: n, refuted: n, lost: n, outcomes: [{key, severity, outcome: confirmed | weakened | refuted | lost, note}]}>
      refutation_rate_prior_runs: [{run_id, refutation_rate}]   # this instrument's previous runs, for the comparison SKILL.md Phases 3–4 asks for
      instruments: [{run_id, as_of_sha, commits_since, verdict: fresh | re-run | stale-not-run, why}]
      fable_seats: {wanted: [synthesis, critic], run: [...]}
