@@ -63,8 +63,8 @@ that lands in the same change.
 
 Trailing window
 ---------------
-trailing_window(metric, current_value, window=60):
-  Reads the last `window-1` rows from the DB for the metric, combines with
+trailing_window(key, current_value, window=60):
+  Reads the last `window-1` rows from the DB for the key, combines with
   current_value, returns (fmean, max).  Under the oneshot model the in-process
   ring-buffer approach is impossible; DB-backed windows are the only option.
 """
@@ -75,11 +75,12 @@ import contextlib
 import logging
 import sqlite3
 import statistics
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Protocol
 
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
+
+from sampler.metrics import SampleKey, Samples
 
 __all__ = ['SCHEMA', 'Connect', 'LoadSampleStore', 'connect_durably']
 
@@ -126,6 +127,11 @@ _VACUUM_MIN_RECLAIMABLE_FRACTION = 0.10
 _TRAILING_WINDOW_SAMPLES = 60
 
 _SET_META_SQL = 'INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)'
+
+_INSERT_SQL = (
+    'INSERT INTO samples (ts, metric, leaf, value, window_mean, window_max)'
+    ' VALUES (?, ?, ?, ?, ?, ?)'
+)
 
 
 class Connect(Protocol):
@@ -210,7 +216,7 @@ class LoadSampleStore:
     def insert_sample(
         self,
         ts: int,
-        metric: str,
+        key: SampleKey,
         value: float,
         *,
         window_mean: float | None = None,
@@ -231,9 +237,7 @@ class LoadSampleStore:
         conn = self._connect()
         try:
             conn.execute(
-                'INSERT INTO samples (ts, metric, value, window_mean, window_max)'
-                ' VALUES (?, ?, ?, ?, ?)',
-                (ts, metric, value, window_mean, window_max),
+                _INSERT_SQL, (ts, key.metric, key.leaf, value, window_mean, window_max)
             )
             conn.commit()
         finally:
@@ -243,8 +247,8 @@ class LoadSampleStore:
         self,
         ts: int,
         *,
-        unwindowed: Mapping[str, float],
-        windowed: Mapping[str, float],
+        unwindowed: Samples,
+        windowed: Samples,
         window: int = _TRAILING_WINDOW_SAMPLES,
     ) -> None:
         """Write one whole tick on ONE connection inside ONE transaction.
@@ -306,19 +310,16 @@ class LoadSampleStore:
             # Annotated because the unwindowed comprehension alone would fix the
             # element type at ``None`` for both window columns, which the
             # windowed append below then contradicts.
-            rows: list[tuple[int, str, float, float | None, float | None]] = [
-                (ts, metric, value, None, None) for metric, value in unwindowed.items()
+            rows: list[tuple[int, str, str | None, float, float | None, float | None]] = [
+                (ts, key.metric, key.leaf, value, None, None)
+                for key, value in unwindowed.items()
             ]
-            for metric, value in windowed.items():
+            for key, value in windowed.items():
                 window_mean, window_max = self._trailing_window(
-                    conn, metric, value, window=window
+                    conn, key, value, window=window
                 )
-                rows.append((ts, metric, value, window_mean, window_max))
-            conn.executemany(
-                'INSERT INTO samples (ts, metric, value, window_mean, window_max)'
-                ' VALUES (?, ?, ?, ?, ?)',
-                rows,
-            )
+                rows.append((ts, key.metric, key.leaf, value, window_mean, window_max))
+            conn.executemany(_INSERT_SQL, rows)
             conn.commit()
         finally:
             conn.close()
@@ -330,7 +331,7 @@ class LoadSampleStore:
     @staticmethod
     def _trailing_window(
         conn: sqlite3.Connection,
-        metric: str,
+        key: SampleKey,
         current_value: float,
         *,
         window: int,
@@ -353,30 +354,30 @@ class LoadSampleStore:
         """
         rows = conn.execute(
             'SELECT value FROM samples'
-            ' WHERE metric = ?'
+            ' WHERE metric = ? AND leaf IS ?'
             ' ORDER BY ts DESC'
             ' LIMIT ?',
-            (metric, window - 1),
+            (key.metric, key.leaf, window - 1),
         ).fetchall()
         values = [current_value] + [r[0] for r in rows]
         return statistics.fmean(values), max(values)
 
     def trailing_window(
         self,
-        metric: str,
+        key: SampleKey,
         current_value: float,
         *,
         window: int = _TRAILING_WINDOW_SAMPLES,
     ) -> tuple[float, float]:
         """Return (window_mean, window_max) over the last `window` samples.
 
-        Reads the `window-1` most-recent prior DB rows for *metric*, prepends
+        Reads the `window-1` most-recent prior DB rows for *key*, prepends
         *current_value*, and computes mean and max over the combined list.
         If there are no prior rows, returns (current_value, current_value).
         """
         conn = self._connect()
         try:
-            return self._trailing_window(conn, metric, current_value, window=window)
+            return self._trailing_window(conn, key, current_value, window=window)
         finally:
             conn.close()
 
