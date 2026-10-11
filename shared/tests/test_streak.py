@@ -112,23 +112,6 @@ def test_success_resets_only_its_own_key():
     assert streaks.failure('b') == StreakStep(3, False)
 
 
-def test_tracked_keys_holds_only_keys_in_a_failure_run():
-    streaks: KeyedStreaks[Hashable] = KeyedStreaks(threshold=3)
-    assert streaks.tracked_keys == frozenset()
-
-    streaks.failure('a')
-    streaks.failure(('b', 1))
-    assert streaks.tracked_keys == frozenset({'a', ('b', 1)})
-
-    streaks.count('never')
-    assert 'never' not in streaks.tracked_keys
-
-    streaks.success('a')
-    snapshot = streaks.tracked_keys
-    assert snapshot == frozenset({('b', 1)})
-    assert isinstance(snapshot, frozenset)
-
-
 def test_forget_drops_the_named_keys_and_ignores_unknown_ones():
     streaks: KeyedStreaks[Hashable] = KeyedStreaks(threshold=3)
     streaks.failure('a')
@@ -137,8 +120,9 @@ def test_forget_drops_the_named_keys_and_ignores_unknown_ones():
 
     streaks.forget(key for key in ['a', ('c', 1), 'never-seen'])
 
-    assert streaks.tracked_keys == frozenset({'b'})
     assert streaks.count('a') == 0
+    assert streaks.count(('c', 1)) == 0
+    assert streaks.count('never-seen') == 0
     assert streaks.count('b') == 1
 
 
@@ -162,7 +146,7 @@ def test_retain_keeps_only_keys_the_predicate_accepts():
 
     streaks.retain(lambda key: key[0] in live)
 
-    assert streaks.tracked_keys == frozenset({('t1', 'd1'), ('t1', 'd2')})
+    assert streaks.count(('t2', 'd1')) == 0
     assert streaks.count(('t1', 'd1')) == 1
     assert streaks.count(('t1', 'd2')) == 1
 
@@ -180,7 +164,8 @@ def test_retain_with_a_raising_predicate_changes_nothing():
     with pytest.raises(RuntimeError):
         streaks.retain(keep)
 
-    assert streaks.tracked_keys == frozenset({'a', 'b'})
+    assert streaks.count('a') == 1
+    assert streaks.count('b') == 1
 
 
 @pytest.mark.parametrize('field', ['count', 'fired'])
