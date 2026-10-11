@@ -27,6 +27,8 @@ from typing import Any
 
 from shared.task_statuses import ACTIVE as ACTIVE_TASK_STATUSES
 
+from fused_memory.utils.clip_disclosure import clip_note
+
 # --------------------------------------------------------------------------- #
 # Count-snapshot detection
 # --------------------------------------------------------------------------- #
@@ -1515,6 +1517,29 @@ def format_task_list(tasks: list[Any]) -> str:
     return '\n'.join(_render_task_line(t) for t in tasks if isinstance(t, dict)) or 'No tasks.'
 
 
+def _retained_clip_note(*, status: str, cap_name: str, cap: int, count: int, retained: list[dict]) -> str:
+    return clip_note(
+        omitted=count - len(retained),
+        omitted_noun=f'{status} task(s)',
+        cap_name=cap_name,
+        cap=cap,
+        dropped_first=f'the lowest-id (oldest) {status} tasks',
+    )
+
+
+def render_retained_done_tasks(tree: FilteredTaskTree) -> str:
+    """Render ``tree.done_tasks``, ending with a clip note when MAX_DONE_TASKS_RETAINED dropped some."""
+    listing = format_task_list(tree.done_tasks)
+    note = _retained_clip_note(
+        status='done',
+        cap_name='MAX_DONE_TASKS_RETAINED',
+        cap=MAX_DONE_TASKS_RETAINED,
+        count=tree.done_count,
+        retained=tree.done_tasks,
+    )
+    return f'{listing}\n\n{note}' if note else listing
+
+
 # --------------------------------------------------------------------------- #
 # Surrounding-strings helper
 # --------------------------------------------------------------------------- #
@@ -1584,6 +1609,15 @@ def _build_surrounding(
 
     if tree.cancelled_tasks:
         cancelled_lines = '\n'.join(_render_task_line(t) for t in tree.cancelled_tasks)
+        note = _retained_clip_note(
+            status='cancelled',
+            cap_name='MAX_CANCELLED_TASKS_RETAINED',
+            cap=MAX_CANCELLED_TASKS_RETAINED,
+            count=tree.cancelled_count,
+            retained=tree.cancelled_tasks,
+        )
+        if note:
+            cancelled_lines = f'{cancelled_lines}\n\n{note}'
         cancelled_section = f'\n### Recently Cancelled Tasks\n{cancelled_lines}\n'
         summary_line = f'{tree.done_count} done — omitted'
     else:
@@ -1823,6 +1857,9 @@ def format_filtered_task_tree(
     - When tree.cancelled_tasks is empty, the section is omitted and the
       summary retains the format '{done_count} done, {cancelled_count}
       cancelled — omitted' for backward compatibility.
+
+    When MAX_CANCELLED_TASKS_RETAINED dropped cancelled tasks, the section ends
+    with a clip note saying how many.
 
     The cancelled section is never truncated by the max_chars clamp — only
     active task lines are trimmed. The cancelled section length is subtracted
