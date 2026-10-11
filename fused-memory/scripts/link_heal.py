@@ -19,6 +19,8 @@ Usage:
         behind the pending heals pass a share ceiling, nothing is written.
     undo --run RUN_ID
         Take back every heal one apply run applied. RUN_ID may be its first 8 characters.
+        A run with no heal still applied (a plan run, an undo run, an apply run
+        already undone) is refused.
     status [--limit N]
         List recent runs from the ledger. Never creates the ledger.
 
@@ -62,6 +64,7 @@ from fused_memory.maintenance.link_heal_ledger import (
     ActionRow,
     AmbiguousRun,
     LinkHealLedger,
+    NothingToUndo,
     RunLock,
     RunLockHeld,
     RunRow,
@@ -141,8 +144,8 @@ class Refused(Exception):
 
 
 REFUSALS = (
-    Refused, RunLockHeld, ApprovalMismatch, UnknownRun, AmbiguousRun, CorpusFormatError,
-    CensusFailed,
+    Refused, RunLockHeld, ApprovalMismatch, UnknownRun, AmbiguousRun, NothingToUndo,
+    CorpusFormatError, CensusFailed,
 )
 
 
@@ -332,7 +335,8 @@ async def _apply(args: argparse.Namespace, session: _Session) -> RunReport:
 
 async def _undo(args: argparse.Namespace, session: _Session) -> RunReport:
     target = session.ledger.resolve_run(args.run)
-    await session.probe(_first_project(session.ledger.applied_actions(target.run_id)))
+    heals = session.ledger.undoable_heals(target)
+    await session.probe(_first_project(heals))
     return await run_undo(
         target, store=session.store, ledger=session.ledger, limits=session.limits,
     )
