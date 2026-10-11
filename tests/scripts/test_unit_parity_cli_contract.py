@@ -103,8 +103,8 @@ DASH_TIMER_TEXT = (
 
 def _dashboard(
     tmp_path: pathlib.Path,
-    repo: dict[str, str],
-    installed: dict[str, str],
+    repo: Mapping[str, str | bytes],
+    installed: Mapping[str, str | bytes],
     units: tuple[str, ...],
 ) -> Invocation:
     repo_root, installed_dir = _trees(
@@ -163,8 +163,8 @@ ORCH_SERVICE_DRIFTED = "[Service]\nType=simple\nTimeoutStartSec=60\nAccuracySec=
 
 def _orchestrator(
     tmp_path: pathlib.Path,
-    repo: dict[str, str | bytes],
-    installed: dict[str, str | bytes],
+    repo: Mapping[str, str | bytes],
+    installed: Mapping[str, str | bytes],
     units: tuple[str, ...],
     *,
     print_verdicts: bool = False,
@@ -812,3 +812,65 @@ def test_every_checker_maps_a_scenario_class_to_one_exit_code(
         root = tmp_path / str(index)
         observed[scenario] = _run(SCENARIOS[scenario](root), root, capsys)[0]
     assert observed == dict.fromkeys(scenarios, expected)
+
+
+# ---------------------------------------------------------------------------
+# An unreadable unit is a report, never a traceback
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class UnreadableCase:
+    """How one driver-run checker meets a unit file it cannot decode."""
+
+    build: Callable[[pathlib.Path, str | bytes, str | bytes], Invocation]
+    tag: str
+    unit: str
+    committed_relpath: str
+    text: str
+
+
+UNREADABLE_CASES: dict[str, UnreadableCase] = {
+    "orchestrator": UnreadableCase(
+        lambda tmp, repo, installed: _orchestrator(
+            tmp, {ORCH_TIMER: repo}, {ORCH_TIMER: installed}, (ORCH_TIMER,)
+        ),
+        "orchestrator_unit_parity",
+        ORCH_TIMER,
+        f"scripts/{ORCH_TIMER}",
+        ORCH_TIMER_TEXT,
+    ),
+    "dashboard": UnreadableCase(
+        lambda tmp, repo, installed: _dashboard(
+            tmp, {DASH_TIMER: repo}, {DASH_TIMER: installed}, (DASH_TIMER,)
+        ),
+        "dashboard_unit_parity",
+        DASH_TIMER,
+        f"dashboard/{DASH_TIMER}",
+        DASH_TIMER_TEXT,
+    ),
+}
+
+
+@pytest.mark.parametrize("side", ["installed", "committed"])
+@pytest.mark.parametrize("checker", sorted(UNREADABLE_CASES))
+def test_an_unreadable_unit_is_reported_naming_the_file_that_failed(
+    checker: str, side: str, tmp_path: pathlib.Path, capsys
+):
+    case = UNREADABLE_CASES[checker]
+    if side == "installed":
+        invocation = case.build(tmp_path, case.text, UNDECODABLE)
+        failed = f"<TMP>/installed/{case.unit}"
+    else:
+        invocation = case.build(tmp_path, UNDECODABLE, case.text)
+        failed = f"<TMP>/repo/{case.committed_relpath}"
+
+    rc, out, _ = _run(invocation, tmp_path, capsys)
+
+    assert rc == 1
+    assert (
+        f"[{case.tag}] [unreadable] 1 unit file(s) could not be read — "
+        "nothing was verified for them:\n"
+    ) in out
+    assert f"[{case.tag}]   {case.unit}: {failed}: " in out
+    assert "[ok]" not in out
