@@ -663,23 +663,29 @@ class PauseVisibility:
     overdue_pause_escalations: tuple[OverdueEscalation, ...] = ()
 
 
-def repended_while_paused_since_resume(events_db: Path) -> tuple[RependedWhilePaused, ...]:
-    """Latest re-pend per task since the last scheduler resume, across every run; fail-open ()."""
+def repended_during_current_pause(events_db: Path) -> tuple[RependedWhilePaused, ...]:
+    """Latest re-pend per task since the last pause ended (a resume, or a restart that
+    declined to re-assert it), across every run; fail-open ()."""
 
     def _query(conn: sqlite3.Connection) -> tuple[RependedWhilePaused, ...]:
         rows = conn.execute(
             "SELECT task_id, json_extract(data, '$.escalation_id'), timestamp, MAX(id) "
             'FROM events WHERE event_type = ? '
-            'AND id > (SELECT COALESCE(MAX(id), 0) FROM events WHERE event_type = ?) '
+            'AND id > (SELECT COALESCE(MAX(id), 0) FROM events WHERE event_type = ? '
+            "OR (event_type = ? AND json_extract(data, '$.reasserted') = 0)) "
             'GROUP BY task_id ORDER BY task_id',
-            (EventType.repend_while_paused.value, EventType.scheduler_resumed.value),
+            (
+                EventType.repend_while_paused.value,
+                EventType.scheduler_resumed.value,
+                EventType.scheduler_pause_restored.value,
+            ),
         ).fetchall()
         return tuple(
             RependedWhilePaused(task_id=task_id, escalation_id=escalation_id, repended_at=ts)
             for task_id, escalation_id, ts, _ in rows
         )
 
-    return _query_events_ro(events_db, 'repended_while_paused_since_resume', (), _query)
+    return _query_events_ro(events_db, 'repended_during_current_pause', (), _query)
 
 
 def overdue_pending_escalations(

@@ -646,7 +646,9 @@ class EventType(StrEnum):
     # scheduler_pause_restored: emitted on orchestrator restart when a persisted
     #   pause is loaded from runs.db.  Distinct from scheduler_paused so the
     #   event timeline self-documents cross-run continuity.  Data payload:
-    #   {reason, pause_at, restored_from_run_id}.
+    #   {reason, pause_at, restored_from_run_id, reasserted, ewa_value,
+    #   ewa_threshold, disposition}.  reasserted=false ends the pause (read by
+    #   digest.py::repended_during_current_pause).
     scheduler_paused = 'scheduler_paused'
     scheduler_resumed = 'scheduler_resumed'
     scheduler_pause_restored = 'scheduler_pause_restored'

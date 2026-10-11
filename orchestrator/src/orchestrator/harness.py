@@ -5402,7 +5402,7 @@ class Harness:
         """Inputs for the digest's '## Paused, waiting' section; fail-open."""
         paused = self.scheduler.is_paused
         repended = (
-            digest_mod.repended_while_paused_since_resume(events_db_path)
+            digest_mod.repended_during_current_pause(events_db_path)
             if paused and events_db_path is not None
             else ()
         )

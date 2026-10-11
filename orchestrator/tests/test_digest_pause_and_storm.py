@@ -95,7 +95,7 @@ def _emit_repend(store: EventStore, task_id: str, escalation_id: str) -> None:
     )
 
 
-class TestRependedWhilePausedSinceResume:
+class TestRependedDuringCurrentPause:
     def test_only_repends_after_the_latest_resume_latest_per_task(self, tmp_path: Path) -> None:
         db_path = tmp_path / 'events.db'
         store = EventStore(db_path, 'run-a')
@@ -105,7 +105,7 @@ class TestRependedWhilePausedSinceResume:
         _emit_repend(store, '3', 'esc-3-1')
         _emit_repend(store, '2', 'esc-2-4')
 
-        waiting = digest.repended_while_paused_since_resume(db_path)
+        waiting = digest.repended_during_current_pause(db_path)
 
         assert isinstance(waiting, tuple)
         assert [(w.task_id, w.escalation_id) for w in waiting] == [
@@ -122,7 +122,7 @@ class TestRependedWhilePausedSinceResume:
         _emit_repend(store, '1', 'esc-1-1')
         _emit_repend(store, '2', 'esc-2-1')
 
-        waiting = digest.repended_while_paused_since_resume(db_path)
+        waiting = digest.repended_during_current_pause(db_path)
 
         assert [w.task_id for w in waiting] == ['1', '2']
 
@@ -131,12 +131,12 @@ class TestRependedWhilePausedSinceResume:
         EventStore(db_path, 'run-a').emit(EventType.scheduler_resumed)
         _emit_repend(EventStore(db_path, 'run-b'), '7', 'esc-7-1')
 
-        waiting = digest.repended_while_paused_since_resume(db_path)
+        waiting = digest.repended_during_current_pause(db_path)
 
         assert [(w.task_id, w.escalation_id) for w in waiting] == [('7', 'esc-7-1')]
 
     def test_missing_db_is_empty(self, tmp_path: Path) -> None:
-        assert digest.repended_while_paused_since_resume(tmp_path / 'absent.db') == ()
+        assert digest.repended_during_current_pause(tmp_path / 'absent.db') == ()
 
     def test_restart_that_declines_to_reassert_ends_the_pause(self, tmp_path: Path) -> None:
         db_path = tmp_path / 'events.db'
@@ -149,7 +149,7 @@ class TestRependedWhilePausedSinceResume:
         run_b.emit(EventType.scheduler_paused, data={'reason': 'park_stop_trip: later'})
         _emit_repend(run_b, '2', 'esc-2-1')
 
-        waiting = digest.repended_while_paused_since_resume(db_path)
+        waiting = digest.repended_during_current_pause(db_path)
 
         assert [(w.task_id, w.escalation_id) for w in waiting] == [('2', 'esc-2-1')]
 
@@ -163,7 +163,7 @@ class TestRependedWhilePausedSinceResume:
         )
         _emit_repend(run_b, '2', 'esc-2-1')
 
-        waiting = digest.repended_while_paused_since_resume(db_path)
+        waiting = digest.repended_during_current_pause(db_path)
 
         assert [w.task_id for w in waiting] == ['1', '2']
 
@@ -176,7 +176,7 @@ class TestRependedWhilePausedSinceResume:
         run_b.emit(EventType.scheduler_pause_restored, data={'reason': 'park_stop_trip: x'})
         _emit_repend(run_b, '2', 'esc-2-1')
 
-        waiting = digest.repended_while_paused_since_resume(db_path)
+        waiting = digest.repended_during_current_pause(db_path)
 
         assert [w.task_id for w in waiting] == ['1', '2']
 
@@ -191,7 +191,7 @@ class TestRependedWhilePausedSinceResume:
         store.emit(EventType.scheduler_resumed)
         _emit_repend(store, '2', 'esc-2-1')
 
-        waiting = digest.repended_while_paused_since_resume(db_path)
+        waiting = digest.repended_during_current_pause(db_path)
 
         assert [w.task_id for w in waiting] == ['2']
 
