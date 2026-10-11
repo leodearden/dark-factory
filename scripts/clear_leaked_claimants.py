@@ -253,7 +253,9 @@ async def _attempt_repair(
     return _Attempt(write_error=await _clear_claimant(client, project_root, violation))
 
 
-def _outcome(violation: Violation, attempt: _Attempt, still_violating: frozenset) -> RowOutcome:
+def _outcome(
+    violation: Violation, attempt: _Attempt, still_violating: frozenset[tuple[str, int]],
+) -> RowOutcome:
     if attempt.delta is not None:
         return RowOutcome(violation, Bucket.SKIPPED_CHANGED_UNDER_US, delta=attempt.delta)
     if attempt.write_error is not None:
@@ -269,8 +271,13 @@ def bucket_outcomes(
     verification: Census,
     tiers: frozenset[Tier],
 ) -> tuple[RowOutcome, ...]:
-    still_violating = frozenset(v.key for v in verification.violations if v.tier in tiers)
-    return tuple(_outcome(v, attempts[v.key], still_violating) for v in selected)
+    remaining = tuple(v for v in verification.violations if v.tier in tiers)
+    still_violating = frozenset(v.key for v in remaining)
+    enumerated = frozenset(v.key for v in selected)
+    return (
+        *(_outcome(v, attempts[v.key], still_violating) for v in selected),
+        *(RowOutcome(v, Bucket.ARRIVED_DURING_WINDOW) for v in remaining if v.key not in enumerated),
+    )
 
 
 async def apply_repairs(
