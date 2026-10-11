@@ -61,6 +61,7 @@ from fused_memory.server.write_triage import (
     triage_write,
 )
 from fused_memory.services.memory_service import RRF_K, SearchResults
+from fused_memory.utils.clip_disclosure import TruncationFact
 
 # The real post-RRF relevance_score for a rank-1 hit, from production rather
 # than restated as the literal 60 — see test_near_duplicate_guard.py.
@@ -1565,7 +1566,7 @@ class TestTheDecisionDisclosesClippedCandidates:
 
     @pytest.mark.asyncio
     async def test_a_judged_decision_carries_the_judges_facts_too(self) -> None:
-        judge_fact = {'field': 'judge_candidates', 'cap': 2, 'elided': 1}
+        judge_fact = TruncationFact(field='judge_candidates', cap=2, elided=1)
 
         async def _judge(**_kwargs):
             return TriageJudgeVerdict(OUTCOME_RESTATED, 'm0', truncated=(judge_fact,))

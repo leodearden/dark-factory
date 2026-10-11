@@ -67,7 +67,7 @@ from fused_memory.server.write_triage import (
     TriageFailOpenCounter,
 )
 from fused_memory.services.memory_service import RRF_K, SearchResults
-from fused_memory.utils.clip_disclosure import TRUNCATED_KEY
+from fused_memory.utils.clip_disclosure import TRUNCATED_KEY, TruncationFact
 
 _PROJECT_ID = 'dark_factory'
 
@@ -1530,8 +1530,8 @@ class TestTheAckDisclosesClippedCandidates:
     @pytest.mark.asyncio
     async def test_every_fact_on_the_decision_reaches_the_ack_as_a_list(self, monkeypatch) -> None:
         facts = (
-            {'field': 'triage_candidates', 'cap': 20, 'elided': None},
-            {'field': 'judge_candidates', 'cap': 5, 'elided': 15},
+            TruncationFact(field='triage_candidates', cap=20, elided=None),
+            TruncationFact(field='judge_candidates', cap=5, elided=15),
         )
         mock_service = AsyncMock()
         _configure_config(mock_service)
