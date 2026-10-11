@@ -322,6 +322,20 @@ class TestCheckVectors:
         repo.mkdir()
         assert 'lock-charter-guard.sh' in drift.check_vectors(repo)['detail']
 
+    def test_non_utf8_guard_output_is_unavailable_not_drift(self, tmp_path):
+        """The guard answered in bytes this script cannot read: could-not-look, not a vector to diff."""
+        repo = tmp_path / 'reify'
+        script = repo / 'scripts' / 'lock-charter-guard.sh'
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/usr/bin/env bash\nprintf '\\351\\n'\n")  # emits byte 0xE9
+        script.chmod(0o755)
+
+        report = drift.check_vectors(repo)
+
+        assert report['exit_code'] == drift.EXIT_UNAVAILABLE
+        assert report['exit_code'] not in (drift.EXIT_OK, drift.EXIT_DRIFT)
+        assert report['status'] == 'unavailable'
+
 
 class TestGuardVectorHelper:
     """``_guard_vector`` — the bounded, loud-on-broken subprocess wrapper."""
