@@ -2057,16 +2057,18 @@ class TestBuildChainLaneBase:
         assert res.lane_warm is False
         assert _all_pool_lanes_free(git_ops)
         assert all(not r.result.done() for r in snap)
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
         assert any(
-            rec.levelno >= logging.WARNING
-            and 'lane_base_mismatch' in rec.getMessage()
-            and off[:8] in rec.getMessage()
-            for rec in caplog.records
+            'lane_base_mismatch' in m and f'HEAD={off[:8]}, expected {head[:8]};' in m
+            for m in warnings
         )
+        assert any('reason=lane_base_mismatch' in m and 'elapsed_ms=' in m for m in warnings)
 
     async def test_unreadable_lane_head_is_a_base_mismatch_not_an_item_merge_error(
-        self, git_repo: Path, monkeypatch,
+        self, git_repo: Path, monkeypatch, caplog,
     ):
+        caplog.set_level(logging.WARNING, logger='orchestrator.merge_queue')
+
         git_ops, snap, head, res, _, merges = await self._build_on_a_seeded_lane(
             git_repo, monkeypatch,
             'echo "gitdir: /nonexistent-4206" > "$2/.git"\n',
@@ -2082,6 +2084,10 @@ class TestBuildChainLaneBase:
         assert res.lane_warm is False
         assert _all_pool_lanes_free(git_ops)
         assert all(not r.result.done() for r in snap)
+        assert any(
+            f'HEAD=None, expected {head[:8]};' in r.getMessage()
+            for r in caplog.records if r.levelno >= logging.WARNING
+        )
 
     async def test_cold_fallback_lane_passes_the_base_check(self, git_repo: Path):
         """The production default (no warm pool) still chains: no false positive."""

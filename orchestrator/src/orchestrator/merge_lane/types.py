@@ -1247,6 +1247,9 @@ class Decided:
 ChainTruncationReason: TypeAlias = Literal[
     'conflict', 'train_request', 'already_merged', 'merge_error', 'lane_base_mismatch',
 ]
+CHAIN_FAULT_REASONS: frozenset[ChainTruncationReason] = frozenset(
+    {'merge_error', 'lane_base_mismatch'},
+)
 
 
 @dataclass
@@ -1286,7 +1289,8 @@ class ChainResult:
       ``head_merge_commit``, or could not be read, so nothing was stacked —
       a lane-provisioning fault, distinct from ``'merge_error'``, which is
       an ITEM's merge failing).  **Only ``'merge_error'`` and
-      ``'lane_base_mismatch'`` denote genuine faults** — conflict /
+      ``'lane_base_mismatch'`` denote genuine faults**
+      (``CHAIN_FAULT_REASONS``) — conflict /
       train_request / already_merged are benign caps and are deliberately
       NOT collapsed into them, so ε's deep-fail reader is not inflated with
       non-faults.
