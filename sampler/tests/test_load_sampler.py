@@ -524,18 +524,19 @@ class TestMainDegradesEachGroupIndependently:
 
         from sampler.store import LoadSampleStore
 
-        store = LoadSampleStore(db_path)
-        stamped = store._get_meta('last_vacuum_ts')
-        assert stamped is not None, (
-            'main() left the vacuum clock unset, so maybe_vacuum was never called'
-        )
-
         conn = sqlite3.connect(str(db_path))
         try:
             tick_ts = conn.execute('SELECT MAX(ts) FROM samples').fetchone()[0]
         finally:
             conn.close()
-        assert int(stamped) == tick_ts
+
+        # _is_due reads "due" as elapsed outside [0, interval), so this boundary
+        # pair holds only for a stamp of exactly tick_ts.
+        store = LoadSampleStore(db_path)
+        assert store.should_vacuum(tick_ts + 86399) is False, (
+            'main() left the vacuum clock unset, so maybe_vacuum was never called'
+        )
+        assert store.should_vacuum(tick_ts + 86400) is True
 
     def test_the_tick_log_line_reports_the_load_group(self, monkeypatch, tmp_path: Path, caplog):
         """An operator watching journalctl must be able to see the new group."""
@@ -578,13 +579,16 @@ class TestTickCostIsFlatInTheMetricCount:
             },
         )
 
-    def test_one_leaf_and_a_hundred_leaves_cost_the_same_connections(
-        self, tmp_path: Path, monkeypatch
-    ):
-        import sampler.store as store_module
-        from sampler.store import LoadSampleStore
+    def test_one_leaf_and_a_hundred_leaves_cost_the_same_connections(self, tmp_path: Path):
+        from sampler.store import LoadSampleStore, connect_durably
 
-        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        opened: list[int] = []
+
+        def counting_connect(db_path: Path, *, autocommit: bool = False):
+            opened.append(1)
+            return connect_durably(db_path, autocommit=autocommit)
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite', connect=counting_connect)
         # Prime the retention clock first. On a VIRGIN store the first tick
         # also runs the interval-gated cleanup, which opens its own
         # connections — comparing a cleanup tick against a steady-state one
@@ -592,14 +596,7 @@ class TestTickCostIsFlatInTheMetricCount:
         # this test went red on exactly that before the priming tick existed.
         self._tick(store, 999_995, leaves=1)
 
-        real_connect = store_module.sqlite3.connect
-        opened: list[int] = []
-        monkeypatch.setattr(
-            store_module.sqlite3,
-            'connect',
-            lambda *a, **kw: (opened.append(1), real_connect(*a, **kw))[1],
-        )
-
+        opened.clear()
         self._tick(store, 1_000_000, leaves=1)
         few = len(opened)
         opened.clear()
@@ -607,9 +604,9 @@ class TestTickCostIsFlatInTheMetricCount:
         many = len(opened)
 
         # A FLOOR before the equality, because both sides are spy counts: if the
-        # monkeypatched seam ever stops being the one write_tick uses — a
-        # connection helper, a pool, a module-level alias — both stay 0 and
-        # `0 == many` holds while measuring nothing.
+        # injected connect ever stops being the one write_tick uses — a cached
+        # connection, a pool — both stay 0 and `0 == many` holds while
+        # measuring nothing.
         assert few >= 1, 'the connect spy never fired — the seam has detached'
         assert few == many, (
             f'a 4-metric tick opened {few} connections and a 103-metric tick '

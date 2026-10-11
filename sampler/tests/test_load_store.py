@@ -4,10 +4,114 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NamedTuple
 
 import pytest
+
+# ---------------------------------------------------------------------------
+# The store's one connection seam, observed
+# ---------------------------------------------------------------------------
+
+
+def _no_statement(_sql: str) -> bool:
+    return False
+
+
+def _statements_starting(prefix: str) -> Callable[[str], bool]:
+    return lambda sql: sql.lstrip().upper().startswith(prefix)
+
+
+def _is_vacuum(sql: str) -> bool:
+    return sql.strip().upper().startswith('VACUUM')
+
+
+class _CountingConnection:
+    """A real connection that records its statements and commits, and can fail some.
+
+    A proxy and not a patched method: ``sqlite3.Connection`` is a C type, so
+    its instances accept no attribute assignment and ``commit`` cannot be
+    wrapped in place. A statement the spy's ``fails`` predicate matches raises
+    ``sqlite3.OperationalError`` instead of running; everything else — commit,
+    rollback, close — delegates to the real connection.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, spy: ConnectSpy, statements: list[str]):
+        self._conn = conn
+        self._spy = spy
+        self._statements = statements
+
+    def _admit(self, sql: str) -> None:
+        self._statements.append(sql)
+        self._spy.executed.append(sql)
+        if self._spy.fails(sql):
+            raise sqlite3.OperationalError(f'injected: {sql.split()[0]} failed')
+
+    def execute(self, sql: str, *args: Any) -> sqlite3.Cursor:
+        self._admit(sql)
+        return self._conn.execute(sql, *args)
+
+    def executemany(self, sql: str, *args: Any) -> sqlite3.Cursor:
+        self._admit(sql)
+        return self._conn.executemany(sql, *args)
+
+    def commit(self) -> None:
+        self._spy.commits.append('commit')
+        self._conn.commit()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+
+class _Opened(NamedTuple):
+    autocommit: bool
+    statements: list[str]
+
+
+class ConnectSpy:
+    """An injectable ``connect`` that hands out ``connect_durably``'s own connections.
+
+    The pragma policy under test is therefore the production one. What the spy
+    adds is a record: one ``opened`` entry per connection (its autocommit flag
+    and the statements run on it), every statement in ``executed``, every
+    commit in ``commits``. ``fails`` names statements to break, and can be
+    swapped between calls to arm or disarm the failure.
+    """
+
+    def __init__(self, *, fails: Callable[[str], bool] = _no_statement) -> None:
+        self.fails = fails
+        self.opened: list[_Opened] = []
+        self.executed: list[str] = []
+        self.commits: list[str] = []
+
+    def __call__(self, db_path: Path, *, autocommit: bool = False) -> Any:
+        from sampler.store import connect_durably
+
+        opened = _Opened(autocommit, [])
+        self.opened.append(opened)
+        return _CountingConnection(
+            connect_durably(db_path, autocommit=autocommit), self, opened.statements
+        )
+
+    def clear(self) -> None:
+        self.opened.clear()
+        self.executed.clear()
+        self.commits.clear()
+
+    def vacuums_ran_on(self) -> list[bool]:
+        """The autocommit flag of each connection a VACUUM was issued on."""
+        return [o.autocommit for o in self.opened if any(map(_is_vacuum, o.statements))]
+
+
+def _meta(db_path: Path, key: str) -> str | None:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute('SELECT value FROM meta WHERE key = ?', (key,)).fetchone()
+    finally:
+        conn.close()
+    return row[0] if row else None
+
 
 # ---------------------------------------------------------------------------
 # Step-5 tests: schema creation, pragmas, insert, idempotent open
@@ -288,7 +392,7 @@ class TestRetentionAndVacuum:
         store.maybe_vacuum(now)
         assert store.should_vacuum(now + 86400) is True
 
-    def test_maybe_vacuum_runs_and_records_timestamp(self, tmp_path: Path, monkeypatch):
+    def test_maybe_vacuum_runs_and_records_timestamp(self, tmp_path: Path):
         """The stamp is recorded on the path where a VACUUM actually RUNS.
 
         The store must carry reclaimable pages or
@@ -301,21 +405,25 @@ class TestRetentionAndVacuum:
         """
         from sampler.store import LoadSampleStore
 
-        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        spy = ConnectSpy()
+        store = LoadSampleStore(tmp_path / 'db.sqlite', connect=spy)
         _bulk_insert(store.db_path, 'psi_cpu_some_avg10', 1_000_000, 20_000)
         now = 1_000_000 + 20_000 * 5
         store.cleanup_old(now, retain_seconds=100)
         assert store.reclaimable_fraction() >= 0.10, (
             'setup must open the reclaimable-fraction gate, or this test is vacuous'
         )
-        executed = _vacuum_spy(monkeypatch)
 
         store.maybe_vacuum(now)
 
         # The stamp alone cannot distinguish this path from the skip path --
         # both write the same `now` -- so pin that a VACUUM really ran.
-        assert [sql for sql in executed if sql.strip().upper().startswith('VACUUM')], (
+        assert [sql for sql in spy.executed if _is_vacuum(sql)], (
             'stamped without running a VACUUM: the retry rule is not being honoured'
+        )
+        assert spy.vacuums_ran_on() == [True], (
+            'SQLite refuses VACUUM inside a transaction, so it must run on a '
+            'connection the seam opened with autocommit=True'
         )
         # Verify last_vacuum_ts was recorded in meta table
         conn = sqlite3.connect(str(tmp_path / 'db.sqlite'))
@@ -494,27 +602,6 @@ class TestThirtyDayRetention:
 # ---------------------------------------------------------------------------
 
 
-class _DeleteFailingConnection:
-    """A real connection with exactly one statement broken: the DELETE.
-
-    The stamp-after-prune invariant is precisely that the DELETE can fail while
-    the meta write still succeeds, so the injection has to fail that one
-    statement and nothing else. Everything else — the INSERT OR REPLACE
-    ``_set_meta`` issues, commit, close — delegates to the real connection.
-    """
-
-    def __init__(self, conn: sqlite3.Connection) -> None:
-        self._conn = conn
-
-    def execute(self, sql: str, *args: Any) -> sqlite3.Cursor:
-        if sql.lstrip().upper().startswith('DELETE'):
-            raise sqlite3.OperationalError('injected: DELETE failed')
-        return self._conn.execute(sql, *args)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._conn, name)
-
-
 class TestCleanupIsIntervalGated:
     """Why this gate exists, pinned so it cannot be "simplified" away.
 
@@ -680,42 +767,34 @@ class TestCleanupIsIntervalGated:
         assert _count_at(db_path, planted_after) == 0
         assert store.should_cleanup(now + 60, interval_seconds=30) is False
 
-    def test_the_stamp_is_written_only_after_a_successful_prune(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_the_stamp_is_written_only_after_a_successful_prune(self, tmp_path: Path):
         """Mirrors maybe_vacuum: a transient failure must not suppress retries.
 
         A stamp written before the DELETE would silence cleanup for a whole
         interval on one locked-database error, and the next window would then
         be double-length.
 
-        Reaching for the private ``_connect`` is deliberate: there is no public
-        seam for "make the DELETE fail and only the DELETE", and failure
-        injection is the recognised reason to reach into internals — read it as
-        that, not as the tests-touch-internals smell. The obvious alternative,
-        chmod(0o444) on the database file, is what this test used to do and it
-        was vacuous: it breaks the meta write too, so a stamp-first
-        implementation satisfies every assertion below.
+        Only the DELETE is broken, through the injected connect: the stamp-
+        after-prune invariant is precisely that the DELETE can fail while the
+        meta write still succeeds. chmod(0o444) on the file, what this test
+        used to do, was vacuous — it breaks the meta write too, so a
+        stamp-first implementation satisfied every assertion below.
         """
         from sampler.store import LoadSampleStore
 
         db_path = tmp_path / 'db.sqlite'
-        store = LoadSampleStore(db_path)
+        spy = ConnectSpy()
+        store = LoadSampleStore(db_path, connect=spy)
         now = 10_000_000
         stale = now - THIRTY_DAYS - 60
         store.insert_sample(stale, 'runqueue_ratio', 1.0)
 
-        # Bind the real method BEFORE patching — calling store._connect() from
-        # inside the replacement would re-enter the replacement itself.
-        real_connect = store._connect
-        monkeypatch.setattr(
-            store, '_connect', lambda: _DeleteFailingConnection(real_connect())
-        )
+        spy.fails = _statements_starting('DELETE')
         with pytest.raises(sqlite3.Error):
             store.cleanup_old(now)
-        monkeypatch.undo()
+        spy.fails = _no_statement
 
-        assert store._get_meta('last_cleanup_ts') is None, (
+        assert _meta(db_path, 'last_cleanup_ts') is None, (
             'a failed prune must leave the clock unstamped'
         )
         assert store.should_cleanup(now) is True, (
@@ -766,35 +845,6 @@ def _bulk_insert(db_path: Path, metric: str, first_ts: int, count: int, step: in
         conn.close()
 
 
-def _vacuum_spy(monkeypatch) -> list[str]:
-    """Return a list that accumulates every SQL statement the store executes.
-
-    maybe_vacuum opens its own connection with sqlite3.connect rather than
-    self._connect (it needs isolation_level=None so VACUUM is not inside a
-    transaction), so the seam is the module's sqlite3 attribute.
-    """
-    import sampler.store as store_module
-
-    real_connect = store_module.sqlite3.connect
-    executed: list[str] = []
-
-    class Spy:
-        def __init__(self, conn):
-            self._conn = conn
-
-        def execute(self, sql, *args, **kwargs):
-            executed.append(sql)
-            return self._conn.execute(sql, *args, **kwargs)
-
-        def __getattr__(self, name):
-            return getattr(self._conn, name)
-
-    monkeypatch.setattr(
-        store_module.sqlite3, 'connect', lambda *a, **kw: Spy(real_connect(*a, **kw))
-    )
-    return executed
-
-
 class TestVacuumIsGatedOnThereBeingSomethingToReclaim:
     """VACUUM rewrites the WHOLE file, so its cost tracks the 30-day size.
 
@@ -842,17 +892,18 @@ class TestVacuumIsGatedOnThereBeingSomethingToReclaim:
 
         assert store.reclaimable_fraction() > 0.10
 
-    def test_a_steady_state_store_runs_no_vacuum(self, tmp_path: Path, monkeypatch):
+    def test_a_steady_state_store_runs_no_vacuum(self, tmp_path: Path):
         """The 15 s daily hole this closes. Nothing to reclaim -> do not rewrite."""
         from sampler.store import LoadSampleStore
 
-        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        spy = ConnectSpy()
+        store = LoadSampleStore(tmp_path / 'db.sqlite', connect=spy)
         _bulk_insert(store.db_path, 'psi_cpu_some_avg10', 1_000_000, 5000)
-        executed = _vacuum_spy(monkeypatch)
 
         store.maybe_vacuum(1_000_000)
 
-        assert not [sql for sql in executed if sql.strip().upper().startswith('VACUUM')], (
+        assert spy.opened, 'the connect spy never fired, so the absence below pins nothing'
+        assert not [sql for sql in spy.executed if _is_vacuum(sql)], (
             'VACUUM rewrote a file with no free pages'
         )
 
@@ -875,79 +926,29 @@ class TestVacuumIsGatedOnThereBeingSomethingToReclaim:
         assert store.should_vacuum(1_000_000 + 1) is False
         assert store.should_vacuum(1_000_000 + 86400) is True
 
-    def test_a_bulk_prune_is_still_compacted(self, tmp_path: Path, monkeypatch):
+    def test_a_bulk_prune_is_still_compacted(self, tmp_path: Path):
         """The case the VACUUM exists for must keep working."""
         from sampler.store import LoadSampleStore
 
-        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        spy = ConnectSpy()
+        store = LoadSampleStore(tmp_path / 'db.sqlite', connect=spy)
         _bulk_insert(store.db_path, 'psi_cpu_some_avg10', 1_000_000, 20_000)
         now = 1_000_000 + 20_000 * 5
         store.cleanup_old(now, retain_seconds=100)
         size_before = store.db_path.stat().st_size
-        executed = _vacuum_spy(monkeypatch)
 
         store.maybe_vacuum(now)
 
-        assert [sql for sql in executed if sql.strip().upper().startswith('VACUUM')], (
+        assert [sql for sql in spy.executed if _is_vacuum(sql)], (
             'a file that is mostly free pages was left uncompacted'
         )
+        assert spy.vacuums_ran_on() == [True]
         assert store.db_path.stat().st_size < size_before
 
 
 # ---------------------------------------------------------------------------
 # Review suggestion 1: one tick is one connection and one transaction
 # ---------------------------------------------------------------------------
-
-
-class _CountingConnection:
-    """A connection that records its commits and forwards everything else.
-
-    A proxy and not a patched method: ``sqlite3.Connection`` is a C type, so
-    its instances accept no attribute assignment and ``commit`` cannot be
-    wrapped in place.
-    """
-
-    def __init__(self, conn, commits: list[str]):
-        self._conn = conn
-        self._commits = commits
-
-    def __getattr__(self, name: str):
-        return getattr(self._conn, name)
-
-    def commit(self) -> None:
-        self._commits.append('commit')
-        self._conn.commit()
-
-
-class _ConnectionSpy(NamedTuple):
-    opened: list[str]
-    commits: list[str]
-
-
-def _connect_spy(monkeypatch) -> _ConnectionSpy:
-    """Accumulate one entry per connection the store opens, and per commit.
-
-    The seam is the module's ``sqlite3`` attribute, as ``_vacuum_spy`` above
-    already uses. Counting CONNECTIONS and COMMITS rather than timing the tick
-    is deliberate: the cost being bought back is one connect + five durability
-    pragmas + one ``synchronous=FULL`` fsync per row, and a wall-clock
-    assertion would be flaky on a loaded host while measuring the same thing
-    indirectly. The two counts are kept apart because they pin different
-    properties — one connection is the pragma cost, one commit is the fsync
-    cost AND the atomicity — and a per-row ``execute(); commit()`` loop on a
-    single connection satisfies the first while destroying the second.
-    """
-    import sampler.store as store_module
-
-    real_connect = store_module.sqlite3.connect
-    spy = _ConnectionSpy(opened=[], commits=[])
-
-    def counting_connect(*args, **kwargs):
-        spy.opened.append(str(args[0]) if args else '')
-        return _CountingConnection(real_connect(*args, **kwargs), spy.commits)
-
-    monkeypatch.setattr(store_module.sqlite3, 'connect', counting_connect)
-    return spy
 
 
 class TestWriteTickIsOneConnectionAndOneTransaction:
@@ -983,11 +984,26 @@ class TestWriteTickIsOneConnectionAndOneTransaction:
             },
         )
 
-    def test_a_tick_opens_one_connection(self, tmp_path: Path, monkeypatch):
+    def _spied_store(self, tmp_path: Path):
+        """A store whose connections are counted from the first tick on.
+
+        Counting CONNECTIONS and COMMITS rather than timing the tick is
+        deliberate: a wall-clock assertion would be flaky on a loaded host
+        while measuring the same thing indirectly. The two counts are kept
+        apart because they pin different properties — one connection is the
+        pragma cost, one commit is the fsync cost AND the atomicity — and a
+        per-row ``execute(); commit()`` loop on one connection satisfies the
+        first while destroying the second.
+        """
         from sampler.store import LoadSampleStore
 
-        store = LoadSampleStore(tmp_path / 'db.sqlite')
-        spy = _connect_spy(monkeypatch)
+        spy = ConnectSpy()
+        store = LoadSampleStore(tmp_path / 'db.sqlite', connect=spy)
+        spy.clear()
+        return store, spy
+
+    def test_a_tick_opens_one_connection(self, tmp_path: Path):
+        store, spy = self._spied_store(tmp_path)
 
         self._tick(store, 1_000_000)
 
@@ -996,9 +1012,7 @@ class TestWriteTickIsOneConnectionAndOneTransaction:
             'write_tick is that it opens exactly one'
         )
 
-    def test_the_cost_of_a_tick_does_not_scale_with_its_metric_count(
-        self, tmp_path: Path, monkeypatch
-    ):
+    def test_the_cost_of_a_tick_does_not_scale_with_its_metric_count(self, tmp_path: Path):
         """The property the measurement above is really about.
 
         Pinning the ABSOLUTE connection count would go red on any unrelated
@@ -1007,15 +1021,12 @@ class TestWriteTickIsOneConnectionAndOneTransaction:
         is what a per-row loop can never satisfy — the cgroup leaf count is
         discovered per tick and is not bounded by anything here.
         """
-        from sampler.store import LoadSampleStore
+        store, spy = self._spied_store(tmp_path)
 
-        store = LoadSampleStore(tmp_path / 'db.sqlite')
-
-        spy = _connect_spy(monkeypatch)
         self._tick(store, 1_000_000, leaves=1)
         few = len(spy.opened)
 
-        spy.opened.clear()
+        spy.clear()
         self._tick(store, 1_000_005, leaves=100)
         many = len(spy.opened)
 
@@ -1028,9 +1039,7 @@ class TestWriteTickIsOneConnectionAndOneTransaction:
             f'opened {many} — the write path still scales with metric count'
         )
 
-    def test_a_tick_commits_exactly_once_whatever_it_carries(
-        self, tmp_path: Path, monkeypatch
-    ):
+    def test_a_tick_commits_exactly_once_whatever_it_carries(self, tmp_path: Path):
         """Atomicity and fsync cost, measured where they live: the commit count.
 
         Its failure-injection sibling below raises inside the row-BUILDING
@@ -1041,15 +1050,12 @@ class TestWriteTickIsOneConnectionAndOneTransaction:
         lands whole or not at all, and its fsync cost is flat in the metric
         count rather than linear in it.
         """
-        from sampler.store import LoadSampleStore
+        store, spy = self._spied_store(tmp_path)
 
-        store = LoadSampleStore(tmp_path / 'db.sqlite')
-
-        spy = _connect_spy(monkeypatch)
         self._tick(store, 1_000_000, leaves=1)
         few = len(spy.commits)
 
-        spy.commits.clear()
+        spy.clear()
         self._tick(store, 1_000_005, leaves=100)
         many = len(spy.commits)
 
@@ -1058,32 +1064,30 @@ class TestWriteTickIsOneConnectionAndOneTransaction:
             f'{many} — one tick is meant to be one transaction'
         )
 
-    def test_a_tick_that_raises_partway_leaves_no_rows_at_all(
-        self, tmp_path: Path, monkeypatch
-    ):
+    def test_a_tick_that_raises_partway_leaves_no_rows_at_all(self, tmp_path: Path):
         """Atomicity: a half-written tick must never reach the corpus.
 
         Under the per-row path the PSI rows were already committed by the time
         a windowed metric failed, so the tick landed truncated and silently —
         ε1/ε2 would read it as a tick on which those metrics were unreadable.
+        The failure lands on the SECOND trailing-window read, partway through
+        the row-building loop and before any INSERT.
         """
-        import sampler.store as store_module
         from sampler.store import LoadSampleStore
 
-        store = LoadSampleStore(tmp_path / 'db.sqlite')
-        calls: list[int] = []
+        window_reads: list[str] = []
 
-        def fmean_that_fails_on_the_second_metric(values):
-            calls.append(1)
-            if len(calls) >= 2:
-                raise RuntimeError('window computation failed mid-tick')
-            return sum(values) / len(values)
+        def second_window_read(sql: str) -> bool:
+            if not sql.lstrip().startswith('SELECT value FROM samples'):
+                return False
+            window_reads.append(sql)
+            return len(window_reads) == 2
 
-        monkeypatch.setattr(
-            store_module.statistics, 'fmean', fmean_that_fails_on_the_second_metric
+        store = LoadSampleStore(
+            tmp_path / 'db.sqlite', connect=ConnectSpy(fails=second_window_read)
         )
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(sqlite3.OperationalError):
             self._tick(store, 1_000_000)
 
         conn = sqlite3.connect(str(store.db_path))
@@ -1149,3 +1153,63 @@ class TestWriteTickIsOneConnectionAndOneTransaction:
         finally:
             conn.close()
         assert got == expected
+
+
+# ---------------------------------------------------------------------------
+# Task 6772: every connection comes from the one injected connect
+# ---------------------------------------------------------------------------
+
+
+class TestEveryConnectionGoesThroughTheInjectedConnect:
+    def test_every_connection_the_store_opens_goes_through_the_injected_connect(
+        self, tmp_path: Path
+    ):
+        """Nothing is monkeypatched; the injected connect redirects instead.
+
+        The store is handed one path and its connect opens another, so a
+        connection that bypassed the seam would create the named file — and
+        every public operation must ALSO have opened at least one connection
+        through the spy, so none of them can be serving itself some other way.
+        """
+        from sampler.store import LoadSampleStore
+
+        named = tmp_path / 'named.sqlite'
+        real = tmp_path / 'real.sqlite'
+        spy = ConnectSpy()
+
+        def redirected(db_path: Path, *, autocommit: bool = False) -> Any:
+            assert db_path == named
+            return spy(real, autocommit=autocommit)
+
+        now = 1_000_000 + 20_000 * 5
+        operations: list[tuple[str, Callable[[LoadSampleStore], object]]] = [
+            ('insert_sample', lambda s: s.insert_sample(now, 'runqueue_ratio', 1.0)),
+            (
+                'write_tick',
+                lambda s: s.write_tick(
+                    now + 5,
+                    unwindowed={'psi_cpu_some_avg10': 1.0},
+                    windowed={'runqueue_ratio': 2.0},
+                ),
+            ),
+            ('trailing_window', lambda s: s.trailing_window('runqueue_ratio', 3.0)),
+            ('cleanup_old', lambda s: s.cleanup_old(now, retain_seconds=100)),
+            ('reclaimable_fraction', lambda s: s.reclaimable_fraction()),
+            ('maybe_vacuum', lambda s: s.maybe_vacuum(now)),
+        ]
+
+        store = LoadSampleStore(named, connect=redirected)
+        assert spy.opened, 'construction opened no connection through the seam'
+        _bulk_insert(real, 'psi_cpu_some_avg10', 1_000_000, 20_000)
+        bypassed = []
+        for name, operation in operations:
+            before = len(spy.opened)
+            operation(store)
+            if len(spy.opened) == before:
+                bypassed.append(name)
+
+        assert bypassed == [], f'these operations opened no connection through the seam: {bypassed}'
+        assert spy.vacuums_ran_on() == [True], 'the VACUUM path was not reached'
+        assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith('named')) == [], (
+            'a connection bypassed the injected connect and created the named file'
+        )
