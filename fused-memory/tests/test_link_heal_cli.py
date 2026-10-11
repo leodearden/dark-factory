@@ -67,6 +67,8 @@ NO_WRITING_RUN = 'no link-heal run has written here'
 SERVER_PORT = 8765
 DEFAULT_SERVER_URL = f'http://127.0.0.1:{SERVER_PORT}'
 WRONG_SHA = 'deadbeef' * 8
+PENDING_NOW = 'pending now'
+STALE = 'stale (pending heals changed since; re-plan)'
 
 
 @dataclasses.dataclass
@@ -230,6 +232,21 @@ def printed_report(capsys) -> dict[str, Any]:
     return json.loads(capsys.readouterr().out)
 
 
+def status_lines(capsys) -> list[str]:
+    return capsys.readouterr().out.splitlines()
+
+
+def run_line(lines: list[str], run_id: str) -> str:
+    """The status line listing run *run_id* itself."""
+    (line,) = [line for line in lines if line.startswith(run_id[:8])]
+    return line
+
+
+def latest_plan_line(lines: list[str], source: RunSource) -> str:
+    (line,) = [line for line in lines if line.startswith(f'latest {source.value} plan')]
+    return line
+
+
 async def plan_from(env: Any, workspace: Workspace, corpus: Path, capsys) -> dict[str, Any]:
     assert await run_cli(env, workspace, 'plan', '--from-corpus', str(corpus)) == 0
     return printed_report(capsys)
@@ -267,9 +284,8 @@ class TestStatus:
 
         assert await run_cli(env, workspace, 'status') == 0
 
-        lines = capsys.readouterr().out.splitlines()
-        (run_line,) = [line for line in lines if planned['run_id'][:8] in line]
-        assert 'writes no' in run_line
+        lines = status_lines(capsys)
+        assert 'writes no' in run_line(lines, planned['run_id'])
         assert NO_WRITING_RUN in lines
 
     @pytest.mark.asyncio
@@ -280,10 +296,10 @@ class TestStatus:
 
         assert await run_cli(env, workspace, 'status') == 0
 
-        lines = capsys.readouterr().out.splitlines()
-        (run_line,) = [line for line in lines if applied['run_id'][:8] in line]
-        assert 'writes yes' in run_line
-        assert 'applied 0' in run_line
+        lines = status_lines(capsys)
+        applied_line = run_line(lines, applied['run_id'])
+        assert 'writes yes' in applied_line
+        assert 'applied 0' in applied_line
         assert NO_WRITING_RUN not in lines
 
     @pytest.mark.asyncio
@@ -701,9 +717,7 @@ class TestPlanFromAdjudicator:
 
         assert await run_cli(env, workspace, 'status') == 0
 
-        lines = capsys.readouterr().out.splitlines()
-        (run_line,) = [line for line in lines if report['run_id'][:8] in line]
-        assert 'adjudicator  writes no' in run_line
+        assert 'adjudicator  writes no' in run_line(status_lines(capsys), report['run_id'])
 
     @pytest.mark.asyncio
     async def test_a_partly_failed_adjudication_exits_1(self, harness, workspace, capsys):
@@ -775,19 +789,6 @@ class TestApplyFromAdjudicator:
         assert harness.mem0.write_count == 0
 
 
-PENDING_NOW = 'pending now'
-STALE = 'stale (pending heals changed since; re-plan)'
-
-
-def status_lines(capsys) -> list[str]:
-    return capsys.readouterr().out.splitlines()
-
-
-def latest_plan_line(lines: list[str], source: RunSource) -> str:
-    (line,) = [line for line in lines if f'latest {source.value} plan' in line]
-    return line
-
-
 class TestStatusShowsWhatAPlanCameTo:
     @pytest.mark.asyncio
     async def test_a_plan_runs_line_shows_adjudication_failed_and_would_escape(
@@ -804,12 +805,9 @@ class TestStatusShowsWhatAPlanCameTo:
 
         assert await run_cli(env, workspace, 'status') == 0
 
-        (run_line,) = [
-            line for line in status_lines(capsys)
-            if report['run_id'][:8] in line and 'latest' not in line
-        ]
-        assert 'adjudication_failed 1' in run_line
-        assert f'would_escape {ADJUDICATOR_ANCHOR}' in run_line
+        plan_run_line = run_line(status_lines(capsys), report['run_id'])
+        assert 'adjudication_failed 1' in plan_run_line
+        assert f'would_escape {ADJUDICATOR_ANCHOR}' in plan_run_line
 
     @pytest.mark.asyncio
     async def test_a_run_with_nothing_to_escape_says_none(self, harness, workspace, capsys):
@@ -818,12 +816,9 @@ class TestStatusShowsWhatAPlanCameTo:
 
         assert await run_cli(env, workspace, 'status') == 0
 
-        (run_line,) = [
-            line for line in status_lines(capsys)
-            if planned['run_id'][:8] in line and 'latest' not in line
-        ]
-        assert 'would_escape none' in run_line
-        assert 'adjudication_failed 0' in run_line
+        plan_run_line = run_line(status_lines(capsys), planned['run_id'])
+        assert 'would_escape none' in plan_run_line
+        assert 'adjudication_failed 0' in plan_run_line
 
     @pytest.mark.asyncio
     async def test_status_names_the_latest_plan_of_each_source_with_its_document_and_sha(
