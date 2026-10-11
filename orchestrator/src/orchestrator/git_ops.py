@@ -96,6 +96,7 @@ from orchestrator.lane_lifecycle import (
     LaneLifecycle,
     LaneState,
 )
+from orchestrator.staged_gitlinks import STAGED_RAW_DIFF_ARGV, newly_staged_gitlinks
 from orchestrator.verify_cancel import (
     acquire_merge_verify_flock,
     lane_lock_holder_pids,
@@ -9385,12 +9386,19 @@ class GitOps:
         conflicted tree (which may contain literal conflict markers) is
         never snapshotted.  All WIP-save call sites funnel through this
         method, so this single guard covers every one of them.
+
+        Staging is guarded against embedded git repositories by failure mode,
+        not by directory name (task 3389): any gitlink the staged change set
+        newly introduces is unstaged before committing (see
+        ``orchestrator/src/orchestrator/staged_gitlinks.py``), while a
+        registered submodule's pointer bump passes through.
         """
         conflicted = await self._detect_unmerged_paths(worktree)
         if conflicted:
             raise WorktreeConflictError(worktree, conflicted)
 
         await _run(['git', 'add', '-A', '--', '.', ':!.claude'], cwd=worktree)
+        await self._unstage_new_gitlinks(worktree)
 
         # Check for changes
         rc, _, _ = await _run(['git', 'diff', '--cached', '--quiet'], cwd=worktree)
@@ -9404,6 +9412,25 @@ class GitOps:
         # Get sha
         _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
         return sha
+
+    async def _unstage_new_gitlinks(self, worktree: Path) -> None:
+        _, raw_diff, _ = await _run(list(STAGED_RAW_DIFF_ARGV), cwd=worktree)
+        paths = newly_staged_gitlinks(raw_diff)
+        if not paths:
+            return
+        rc, _, err = await _run(
+            ['git', '--literal-pathspecs', 'reset', '-q', 'HEAD', '--', *paths],
+            cwd=worktree,
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f'commit: could not unstage embedded-repo gitlink(s) {list(paths)} '
+                f'in {worktree} (rc={rc}): {err.strip()}'
+            )
+        logger.warning(
+            'commit: left %d embedded git repositor%s out of the commit in %s: %s',
+            len(paths), 'y' if len(paths) == 1 else 'ies', worktree, ', '.join(paths),
+        )
 
     async def get_diff_from_main(self, worktree: Path) -> str:
         """Get diff of worktree branch vs main (dynamic — may be empty if main moved)."""
