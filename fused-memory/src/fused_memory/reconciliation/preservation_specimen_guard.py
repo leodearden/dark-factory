@@ -168,8 +168,9 @@ STRANDED_FLAG_TOKEN_FAMILY: tuple[str, ...] = ('strand',)
 #: Second, orthogonal channel: what the finding ASKS FOR.  A flag_type nobody
 #: has seen yet still makes the stranded claim if its suggested action is to
 #: move the task out of ``in-progress``.  Matched as a CONJUNCTION with
-#: :data:`STRANDED_ACTION_TARGET_FAMILY` — each half alone is far too common
-#: ("reset the priority override", "the task is in-progress") to gate a drop.
+#: :data:`STRANDED_ACTION_TARGET_FAMILY` across the action fields — each half
+#: alone is far too common ("reset the priority override", "the task is
+#: in-progress") to gate a drop.
 STRANDED_ACTION_VERB_FAMILY: tuple[str, ...] = (
     'reset',
     'redispatch',
@@ -185,8 +186,9 @@ STRANDED_ACTION_TARGET_FAMILY: tuple[str, ...] = ('in-progress', 'in progress')
 
 #: Flag fields consulted for the ACTION channel.  ``suggested_action`` is the
 #: canonical field (``FINDING_ITEM_SCHEMA``); ``description`` is read too
-#: because the LLM routinely states the requested reset there and leaves
-#: ``suggested_action`` terse.
+#: because the LLM routinely states the task's status there and leaves
+#: ``suggested_action`` terse, so the verb and the target may sit in
+#: different fields.
 _STRANDED_ACTION_FIELDS: tuple[str, ...] = ('suggested_action', 'description')
 
 
@@ -284,11 +286,14 @@ def flag_asserts_stranded(flag: Any) -> bool:
     1. **Vocabulary** — ``flag['flag_type']`` contains a
        :data:`STRANDED_FLAG_TOKEN_FAMILY` stem.  Catches the namings already
        observed, and any future one built on the same word.
-    2. **Requested action** — the flag's ``suggested_action``/``description``
-       contains BOTH a :data:`STRANDED_ACTION_VERB_FAMILY` verb and a
-       :data:`STRANDED_ACTION_TARGET_FAMILY` status.  Catches a naming built on
-       a different word entirely, which the vocabulary channel must eventually
-       miss because ``flag_type`` is free-form LLM output.
+    2. **Requested action** — the flag's action prose, ``suggested_action``
+       and ``description`` TOGETHER, contains BOTH a
+       :data:`STRANDED_ACTION_VERB_FAMILY` verb and a
+       :data:`STRANDED_ACTION_TARGET_FAMILY` status, in either field.  Real
+       findings state the status in ``description`` and ask for the reset in
+       ``suggested_action``.  Catches a naming built on a different word
+       entirely, which the vocabulary channel must eventually miss because
+       ``flag_type`` is free-form LLM output.
 
     The conjunction in channel 2 is load-bearing.  ``'reset'`` alone matches
     ``stale_priority_override``'s perfectly reasonable "reset the priority
@@ -309,12 +314,20 @@ def flag_asserts_stranded(flag: Any) -> bool:
         return False
     if contains_any_casefolded(flag.get('flag_type'), STRANDED_FLAG_TOKEN_FAMILY):
         return True
-    return any(
-        contains_any_casefolded(flag.get(field), STRANDED_ACTION_VERB_FAMILY)
-        and contains_any_casefolded(flag.get(field), STRANDED_ACTION_TARGET_FAMILY)
-        for field in _STRANDED_ACTION_FIELDS
+    return (
+        _action_prose_contains(flag, STRANDED_ACTION_VERB_FAMILY)
+        and _action_prose_contains(flag, STRANDED_ACTION_TARGET_FAMILY)
     )
 
+
+def _action_prose_contains(flag: dict[str, Any], family: tuple[str, ...]) -> bool:
+    """Return True iff any :data:`_STRANDED_ACTION_FIELDS` field contains a *family* member.
+
+    Checked per field rather than over the fields joined, so a match can never
+    straddle the boundary between two of them.  Total over non-``str`` values.
+    Pure, sync, no I/O.
+    """
+    return any(contains_any_casefolded(flag.get(field), family) for field in _STRANDED_ACTION_FIELDS)
 
 
 def _is_usable_task_id(component: str) -> bool:
