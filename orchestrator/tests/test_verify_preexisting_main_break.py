@@ -2614,7 +2614,6 @@ class TestIdDiffFastPathSkippedOnMainGuard:
         worktree = tmp_path / 'task-wt'
         worktree.mkdir()
         mock_git_ops = GitOps(config.git, config.project_root)
-        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
         mock_git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
 
         verify_module.seed_main_baseline(MAIN_SHA, main_failing, skipped=main_skipped)
@@ -2630,7 +2629,10 @@ class TestIdDiffFastPathSkippedOnMainGuard:
         # somehow missed — asserted un-awaited so a real probe can't hide.
         legacy_probe_mock = AsyncMock(return_value=DIFFERENT_RESULT)
 
-        with patch.object(verify_module, 'run_scoped_verification', new=legacy_probe_mock):
+        with (
+            patch.object(verify_module, 'run_scoped_verification', new=legacy_probe_mock),
+            patch.object(mock_git_ops, 'get_main_sha', new=AsyncMock(return_value=MAIN_SHA)),
+        ):
             result = asyncio.run(
                 verify_module.verify_failure_is_preexisting_on_main(
                     worktree, config, [], ['src/foo.py'], failing_result, mock_git_ops,

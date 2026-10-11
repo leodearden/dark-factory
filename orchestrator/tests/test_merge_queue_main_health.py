@@ -1259,7 +1259,6 @@ class TestPostMergeVerifySeedsBaseline:
         worktree = tmp_path / 'branch-wt'
         worktree.mkdir()
         probe_git_ops = GitOps(config.git, config.project_root)
-        probe_git_ops.get_main_sha = AsyncMock(return_value='abcsha')  # type: ignore[method-assign]
         probe_git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
 
         failing_result = VerifyResult(
@@ -1271,8 +1270,13 @@ class TestPostMergeVerifySeedsBaseline:
         legacy_probe_mock = AsyncMock(return_value=COMPILE_ERROR_RESULT)
 
         async def _ask() -> tuple[bool, str]:
-            with patch.object(
-                verify_module, 'run_scoped_verification', new=legacy_probe_mock,
+            with (
+                patch.object(
+                    verify_module, 'run_scoped_verification', new=legacy_probe_mock,
+                ),
+                patch.object(
+                    probe_git_ops, 'get_main_sha', new=AsyncMock(return_value='abcsha'),
+                ),
             ):
                 return await verify_module.verify_failure_is_preexisting_on_main(
                     worktree, config, [], ['src/foo.py'], failing_result, probe_git_ops,
