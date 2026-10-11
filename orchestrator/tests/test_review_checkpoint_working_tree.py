@@ -17,7 +17,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
-from _orch_helpers import git_env_with_ceiling, pydantic_spec, stamp_stock_routing_config
+from _orch_helpers import (
+    WHOLE_TREE_SCAN_TEST_TIMEOUT,
+    git_env_with_ceiling,
+    pydantic_spec,
+    stamp_stock_routing_config,
+)
 from _recording_event_store import _RecordingEventStore
 from df_pytest_isolation import git_redirect_env
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
@@ -25,6 +30,10 @@ from shared.cli_invoke import AgentResult, AllAccountsCappedException
 from orchestrator.config import OrchestratorConfig
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.verify import VerifyResult
+
+# Compelled by test_whole_tree_scan_timeout_guard.py, whose detector matches the
+# fake linter's rglob('*.py'); that sweep covers only a few-file scratch repo.
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _LINT_MARKER = 'LINT_BAD'
 _BARE_FAIL_SUMMARY = 'Failures: lint issues'
