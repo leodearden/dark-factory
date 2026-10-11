@@ -103,15 +103,57 @@ class TestSchema:
         finally:
             ledger.close()
 
+    def test_a_ledger_written_before_plan_path_gains_the_column(self, tmp_path):
+        db = tmp_path / 'link_heal.db'
+        old_id = 'a' * 32
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute(
+                'CREATE TABLE runs ('
+                'id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL UNIQUE, '
+                'source TEXT NOT NULL, writes INTEGER NOT NULL, started_at TEXT NOT NULL, '
+                'finished_at TEXT, counts_json TEXT, plan_sha256 TEXT)',
+            )
+            conn.execute(
+                'INSERT INTO runs (run_id, source, writes, started_at, finished_at, '
+                'counts_json, plan_sha256) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                (
+                    old_id, RunSource.CORPUS.value, 0, '2026-10-08T00:00:00+00:00',
+                    '2026-10-08T00:01:00+00:00', '{}', 'e' * 64,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ledger = LinkHealLedger(db)
+        try:
+            old = ledger.resolve_run(old_id)
+            assert old.plan_path is None
+            assert old.plan_sha256 == 'e' * 64
+            new_id = ledger.start_run(RunSource.CORPUS, writes=False)
+            ledger.finish_run(
+                new_id, counts={}, plan_sha256='f' * 64, plan_path=tmp_path / 'plan.json',
+            )
+            assert ledger.resolve_run(new_id).plan_path == tmp_path / 'plan.json'
+        finally:
+            ledger.close()
+        LinkHealLedger(db).close()
+
 
 class TestRuns:
     def test_start_run_mints_a_32_hex_run_id(self, ledger):
         assert re.fullmatch(r'[0-9a-f]{32}', ledger.start_run(RunSource.CORPUS, writes=False))
 
-    def test_finish_run_stores_counts_and_plan_sha(self, ledger):
+    def test_finish_run_stores_counts_and_plan_sha(self, ledger, tmp_path):
         run_id = ledger.start_run(RunSource.CORPUS, writes=False)
 
-        ledger.finish_run(run_id, counts={'planned': 3, 'would_escape': []}, plan_sha256='f' * 64)
+        ledger.finish_run(
+            run_id,
+            counts={'planned': 3, 'would_escape': []},
+            plan_sha256='f' * 64,
+            plan_path=tmp_path / 'plan.json',
+        )
 
         run = ledger.resolve_run(run_id)
         assert run.run_id == run_id
@@ -120,6 +162,35 @@ class TestRuns:
         assert run.finished_at is not None
         assert run.counts == {'planned': 3, 'would_escape': []}
         assert run.plan_sha256 == 'f' * 64
+        assert run.plan_path == tmp_path / 'plan.json'
+
+    def test_a_run_finished_without_a_plan_has_no_plan_path(self, ledger):
+        run_id = ledger.start_run(RunSource.CORPUS, writes=True)
+
+        ledger.finish_run(run_id, counts={'applied': 0})
+
+        assert ledger.resolve_run(run_id).plan_path is None
+
+    def test_latest_plan_run_is_the_newest_non_writing_run_of_its_source(self, ledger, tmp_path):
+        assert ledger.latest_plan_run(RunSource.CORPUS) is None
+        ledger.start_run(RunSource.CORPUS, writes=False)
+        ledger.start_run(RunSource.CORPUS, writes=True)
+        newest_corpus = ledger.start_run(RunSource.CORPUS, writes=False)
+        adjudicator = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+        ledger.start_run(RunSource.CORPUS, writes=True)
+
+        corpus_plan = ledger.latest_plan_run(RunSource.CORPUS)
+        adjudicator_plan = ledger.latest_plan_run(RunSource.ADJUDICATOR)
+
+        assert corpus_plan is not None
+        assert corpus_plan.run_id == newest_corpus
+        assert adjudicator_plan is not None
+        assert adjudicator_plan.run_id == adjudicator
+        fresh = LinkHealLedger(tmp_path / 'fresh.db')
+        try:
+            assert fresh.latest_plan_run(RunSource.CORPUS) is None
+        finally:
+            fresh.close()
 
     def test_writing_run_count_counts_only_writing_runs(self, ledger):
         ledger.finish_run(ledger.start_run(RunSource.CORPUS, writes=False), counts={})
