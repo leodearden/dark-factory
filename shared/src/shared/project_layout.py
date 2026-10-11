@@ -12,7 +12,9 @@ from pathlib import Path
 __all__ = [
     'ESCALATION_QUEUE_RELPATH',
     'KNOWN_PROJECT_ROOTS_ENV',
+    'CheckoutRootError',
     'StrPath',
+    'default_project_root',
     'escalation_queue_dir',
     'known_project_roots',
     'orchestrator_data_dir',
@@ -60,3 +62,62 @@ def tasks_db(root: StrPath) -> Path:
 def known_project_roots(environ: Mapping[str, str] = os.environ) -> tuple[Path, ...]:
     entries = environ.get(KNOWN_PROJECT_ROOTS_ENV, '').split(',')
     return tuple(Path(entry.strip()) for entry in entries if entry.strip())
+
+
+class CheckoutRootError(RuntimeError):
+    """The main checkout cannot be derived from where this module lives."""
+
+
+def default_project_root() -> Path:
+    """The main checkout enclosing this module, even when imported from a linked worktree."""
+    return _main_checkout_of(Path(__file__).resolve())
+
+
+def _main_checkout_of(start: Path) -> Path:
+    checkout = _enclosing_checkout(start)
+    dot_git = checkout / '.git'
+    if dot_git.is_dir():
+        return checkout
+    gitdir = _gitdir_of(dot_git)
+    commondir = gitdir / 'commondir'
+    if not commondir.is_file():
+        return checkout
+    common = (gitdir / commondir.read_text(encoding='utf-8').strip()).resolve()
+    if common.name != '.git':
+        raise CheckoutRootError(
+            f'{checkout} is a linked worktree whose common git dir {common} is not '
+            f'the .git of a main checkout (bare repo or separate git dir; named by '
+            f'{commondir}), so no main checkout can be derived'
+        )
+    return common.parent
+
+
+def _enclosing_checkout(start: Path) -> Path:
+    for candidate in (start, *start.parents):
+        if (candidate / '.git').exists():
+            return candidate
+    raise CheckoutRootError(
+        f'no git checkout encloses {start}: shared must be imported from a checkout '
+        f'(no ancestor has .git)'
+    )
+
+
+def _gitdir_of(dot_git: Path) -> Path:
+    text = dot_git.read_text(encoding='utf-8')
+    values = [
+        line.removeprefix('gitdir:').strip()
+        for line in text.splitlines()
+        if line.startswith('gitdir:')
+    ]
+    if not values or not values[0]:
+        raise CheckoutRootError(
+            f'{dot_git} is not a worktree .git file: expected a "gitdir: <path>" line, '
+            f'got {text!r}'
+        )
+    gitdir = (dot_git.parent / values[0]).resolve()
+    if not gitdir.is_dir():
+        raise CheckoutRootError(
+            f'{dot_git} names gitdir {values[0]!r}, which is not an existing directory '
+            f'(resolved: {gitdir}); the main checkout\'s .git must be visible here'
+        )
+    return gitdir
