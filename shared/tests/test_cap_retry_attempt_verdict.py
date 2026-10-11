@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+import logging
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _usage_gate_test_helpers import make_gate, make_mock_cost_store
@@ -11,12 +12,24 @@ from shared.cli_invoke import AgentResult, invoke_with_cap_retry
 from shared.invocation_outcome import CapHit
 from shared.testing import make_gate_mock
 
-_SIBLING_CAP_STDERR = "You've hit your usage limit resets in 3h"
+_CAP_STDERR = "You've hit your usage limit resets in 3h"
 
 
 def _report_cap_then_confirm(slot) -> None:
     slot.report(CapHit(resets_at=None, reason='cap'))
     slot.confirm(1.0)
+
+
+def _detect_cap_then_confirm(slot) -> None:
+    assert slot.detect_cap_hit(_CAP_STDERR, '')
+    slot.confirm(1.0)
+
+
+_SETTLE_THEN_CONFIRM = pytest.mark.parametrize(
+    'drive',
+    [_report_cap_then_confirm, _detect_cap_then_confirm],
+    ids=['report', 'detect_cap_hit'],
+)
 
 
 async def test_confirm_after_report_adds_no_cost_and_keeps_the_cap():
@@ -26,6 +39,21 @@ async def test_confirm_after_report_adds_no_cost_and_keeps_the_cap():
             _report_cap_then_confirm(slot)
         assert gate.cumulative_cost == 0.0
         assert gate.active_account_name is None
+    finally:
+        await gate.shutdown()
+
+
+async def test_confirm_on_settled_slot_logs_the_dropped_cost(caplog):
+    gate = make_gate(['a'])
+    try:
+        with caplog.at_level(logging.DEBUG, logger='shared.usage_gate'):
+            async with gate.invoke_slot() as slot:
+                _report_cap_then_confirm(slot)
+        assert any(
+            r.levelno == logging.DEBUG and 'already-settled' in r.getMessage()
+            and '$1.0000' in r.getMessage()
+            for r in caplog.records
+        )
     finally:
         await gate.shutdown()
 
@@ -59,17 +87,18 @@ async def _production_verdict_calls(drive) -> tuple[int, int]:
 
 
 async def _double_verdict_calls(drive) -> tuple[int, int]:
-    gate = make_gate_mock()
+    gate = make_gate_mock(detect_cap_hit=MagicMock(return_value=True))
     async with gate.invoke_slot() as slot:
         drive(slot)
     return gate.on_agent_complete.call_count, gate.confirm_account_ok.call_count
 
 
-async def test_gate_double_matches_production_on_confirm_after_report():
+@_SETTLE_THEN_CONFIRM
+async def test_gate_double_matches_production_on_confirm_after_settling(drive):
     """(on_agent_complete calls, confirm_account_ok calls) per party."""
     parties = {
-        'production': await _production_verdict_calls(_report_cap_then_confirm),
-        'make_gate_mock': await _double_verdict_calls(_report_cap_then_confirm),
+        'production': await _production_verdict_calls(drive),
+        'make_gate_mock': await _double_verdict_calls(drive),
     }
     assert parties == dict.fromkeys(parties, (0, 0))
 
@@ -81,7 +110,7 @@ def _stale_lease_then_success(gate):
     async def invoke_fn(**kw):
         calls.append(dict(kw))
         if len(calls) == 1:
-            gate.detect_cap_hit(_SIBLING_CAP_STDERR, '', oauth_token=kw['oauth_token'])
+            gate.detect_cap_hit(_CAP_STDERR, '', oauth_token=kw['oauth_token'])
             return AgentResult(
                 success=False, output='', stderr='', cost_usd=0.0, turns=1, duration_ms=100,
             )
