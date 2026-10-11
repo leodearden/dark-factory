@@ -376,6 +376,11 @@ def plan_sha256(document: bytes) -> str:
     return hashlib.sha256(document).hexdigest()
 
 
+def pending_plan_sha256(pending: Sequence[ActionRow]) -> str:
+    """The sha an --approved-plan-sha is checked against: that of the plan document *pending* renders."""
+    return plan_sha256(render_plan_document(pending))
+
+
 def _plan_entry(row: ActionRow) -> dict[str, Any]:
     heal = row.planned
     return {
@@ -491,7 +496,7 @@ async def _publish_plan(
         escape.anchor for escape in (backlog, *shares, *escapes) if escape is not None
     )
     counts = replace(counts, would_escape=would_escape)
-    ledger.finish_run(run_id, counts=counts.as_json(), plan_sha256=sha)
+    ledger.finish_run(run_id, counts=counts.as_json(), plan_sha256=sha, plan_path=plan_path)
     return RunReport(run_id=run_id, counts=counts, plan_sha256=sha, plan_path=plan_path)
 
 
@@ -738,7 +743,7 @@ class ApprovalMismatch(ValueError):
 
 
 def _check_approval(approved: str, pending: Sequence[ActionRow]) -> None:
-    actual = plan_sha256(render_plan_document(pending))
+    actual = pending_plan_sha256(pending)
     if actual != approved:
         raise ApprovalMismatch(expected=approved, actual=actual)
 
