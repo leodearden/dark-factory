@@ -216,7 +216,7 @@ def render_working_tree_section(
         'Phase 1 ran in the live checkout, which differs from HEAD by '
         f'{_counts(tree.state)}.',
     ]
-    lines += _passed_lines(tree) if phase1.passed else _failed_lines(tree)
+    lines += [f'{_pass_caveat(tree.state)}.'] if phase1.passed else _failed_lines(tree)
     return '\n'.join(lines) + '\n'
 
 
@@ -232,47 +232,62 @@ def _qualifying_tree(
 
 def _summary_qualifier(phase1: VerifyResult, tree: Phase1WorkingTree) -> str:
     if phase1.passed:
-        return (
-            f'{len(tree.state.uncommitted)} tracked file(s) carry uncommitted edits, '
-            'so the committed tree may differ from what passed'
-        )
+        return _pass_caveat(tree.state)
     named = tree.named_in_failure
     if not named:
         return f'the failing output names none of the {_counts(tree.state)}'
-    shown = ', '.join(_describe(n) for n in named[:_SUMMARY_NAMED_PATH_CAP])
+    shown, hidden = _capped(named, _SUMMARY_NAMED_PATH_CAP)
+    more = f' +{hidden} more' if hidden else ''
     return (
         f'the failing output names {len(named)} file(s) that differ from the '
-        f'committed tree: {shown}{_overflow(len(named), _SUMMARY_NAMED_PATH_CAP)}'
+        f'committed tree: {", ".join(_describe(n) for n in shown)}{more}'
     )
 
 
-def _passed_lines(tree: Phase1WorkingTree) -> list[str]:
-    return [
-        f'{len(tree.state.uncommitted)} tracked file(s) carry uncommitted edits, so '
-        'this PASS may not hold for the committed versions of those files.',
-    ]
+def _pass_caveat(state: WorkingTreeState) -> str:
+    return (
+        f'{len(state.uncommitted)} tracked file(s) carry uncommitted edits, so this '
+        'PASS may not hold for the committed versions of those files'
+    )
+
+
+_FAILURE_GUIDANCE = {
+    TreeChange.UNTRACKED: (
+        'Failures located in an untracked file come from a file absent from the '
+        'committed tree: do NOT report them as code findings.'
+    ),
+    TreeChange.UNCOMMITTED: (
+        'Failures located in an uncommitted file may come from its local edit or from '
+        'committed code it still carries: compare the committed version '
+        '(`git show HEAD:<path>`) before dismissing them.'
+    ),
+}
 
 
 def _failed_lines(tree: Phase1WorkingTree) -> list[str]:
     named = tree.named_in_failure
+    unattributed = 'are not attributed to any local change.'
     if not named:
-        return [
-            'The failing output names none of those files, so its failures '
-            'concern the committed tree.',
-        ]
-    listed = [f'- `{n.path}` ({n.change.value})' for n in named[:SECTION_NAMED_PATH_CAP]]
-    overflow = len(named) - SECTION_NAMED_PATH_CAP
-    if overflow > 0:
-        listed.append(f'- and {overflow} more')
+        return [f'The failing output names none of those files, so its failures {unattributed}']
+    shown, hidden = _capped(named, SECTION_NAMED_PATH_CAP)
+    listed = [f'- `{n.path}` ({n.change.value})' for n in shown]
+    if hidden:
+        listed.append(f'- and {hidden} more')
+    kinds = {n.change for n in named}
     return [
         'The failing output names these files, which differ from the committed tree:',
         '',
         *listed,
         '',
-        'Failures located in these files come from local working-tree state, not '
-        'committed code: do NOT report them as code findings. Failures located '
-        'elsewhere in the output concern the committed tree.',
+        *(_FAILURE_GUIDANCE[kind] for kind in TreeChange if kind in kinds),
+        f'Failures located elsewhere in the output {unattributed}',
     ]
+
+
+def _capped(
+    named: tuple[NamedChange, ...], cap: int,
+) -> tuple[tuple[NamedChange, ...], int]:
+    return named[:cap], max(len(named) - cap, 0)
 
 
 def _counts(state: WorkingTreeState) -> str:
@@ -281,7 +296,3 @@ def _counts(state: WorkingTreeState) -> str:
 
 def _describe(named: NamedChange) -> str:
     return f'{named.path} ({named.change.value})'
-
-
-def _overflow(total: int, cap: int) -> str:
-    return f' +{total - cap} more' if total > cap else ''

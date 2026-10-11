@@ -236,6 +236,21 @@ class TestAttributionPrecision:
     def test_delimited_relative_form_is_named(self, output: str) -> None:
         assert _attribute(_failed(lint=output), _BAD_UNTRACKED).named_in_failure == _BAD_NAMED
 
+    @pytest.mark.parametrize('path', ['notes dir/a b.py', 'pkg/a+b.py', 'pkg/naïve.py'])
+    def test_path_with_characters_beyond_the_common_alphabet_is_named(self, path: str) -> None:
+        state = WorkingTreeState(untracked=(path,), uncommitted=())
+
+        tree = _attribute(_failed(lint=f'  --> {path}:1:1\n'), state)
+
+        assert tree.named_in_failure == (NamedChange(path, TreeChange.UNTRACKED),)
+
+    def test_absolute_form_under_a_root_with_a_space_is_named(self, tmp_path: Path) -> None:
+        root = tmp_path / 'my repo'
+        root.mkdir()
+        phase1 = _failed(type_=f'{root}/scripts/bad.py:1:1 - error\n')
+
+        assert _attribute(phase1, _BAD_UNTRACKED, root=root).named_in_failure == _BAD_NAMED
+
     def test_path_continuing_past_the_dirty_path_is_not_named(self) -> None:
         state = WorkingTreeState(untracked=('docs/notes',), uncommitted=())
 
@@ -383,6 +398,26 @@ class TestRenderWorkingTreeSection:
 
         for named in tree.named_in_failure:
             assert any(named.path in line and named.change.value in line for line in lines)
+
+    def test_untracked_file_named_in_failure_is_not_to_be_reported(self) -> None:
+        phase1 = _failed(lint=_RUFF_LINT_OUTPUT)
+
+        section = render_working_tree_section(phase1, _attribute(phase1, _BAD_UNTRACKED))
+
+        assert 'do NOT report' in section
+
+    def test_uncommitted_file_named_in_failure_is_checked_against_head_not_suppressed(
+        self,
+    ) -> None:
+        state = WorkingTreeState(untracked=(), uncommitted=('keep.py',))
+        phase1 = _failed(lint='  --> keep.py:2:1\n')
+        tree = _attribute(phase1, state)
+        assert tree.named_in_failure == (NamedChange('keep.py', TreeChange.UNCOMMITTED),)
+
+        section = render_working_tree_section(phase1, tree)
+
+        assert 'do NOT report' not in section
+        assert 'git show HEAD:' in section
 
     def test_named_paths_beyond_the_cap_are_counted_not_listed(self) -> None:
         paths = tuple(f'pkg/file_{i:02d}.py' for i in range(30))
