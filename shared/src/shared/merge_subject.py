@@ -85,8 +85,10 @@ def merge_subject_pattern(
 ) -> str:
     """One pattern valid as both git --extended-regexp and Python re; None means any ref token.
 
-    The landing form is anchored to the whole subject; the legacy colon form only to its
-    prefix. As a git --grep it matches per message LINE, so re-test the subject in Python.
+    The landing form is anchored to the whole line; the legacy colon form only to its
+    prefix. Its ref token excludes only ' ', so a tab or a newline gets past it: in Python
+    apply it to one git %s subject line, and read any other string with
+    parse_merge_subject, the exact reader.
     """
     head, into = rendered_prefix(branch_prefix)
     task = _REF_TOKEN if task_id is None else _escaped_ref('task_id', task_id)

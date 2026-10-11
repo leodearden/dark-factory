@@ -35,6 +35,7 @@ _NOT_A_MERGE_SUBJECT = [
     'Merge  into trunk',
     'Merge a\tb into trunk',
     'fix: x\n\nMerge feat/12 into trunk',
+    'Merge feat/12 into trunk\n',
     'Merge feat/12 into trunk\n\nbody',
     'impl(12): x',
     '',
@@ -134,6 +135,25 @@ _CORPUS = (
 )
 
 
+def _is_subject_line(text: str) -> bool:
+    return not any(ch.isspace() and ch != ' ' for ch in text)
+
+
+# merge_subject_pattern's Python domain is one git %s subject line; these are the
+# inputs outside it where the pattern and parse_merge_subject part ways.
+_OUTSIDE_THE_PYTHON_DOMAIN = [
+    'Merge feat/a\tb into trunk',
+    'Merge feat/12 into trunk\n',
+    'Merge feat/12 into trunk\n\nbody',
+]
+
+_SUBJECT_LINES = [
+    subject
+    for subject in (*_CORPUS, *_NOT_A_MERGE_SUBJECT, 'Merge feat/ into trunk')
+    if _is_subject_line(subject)
+]
+
+
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(
         ['git', '-C', str(repo), *args], check=True, capture_output=True, text=True
@@ -199,8 +219,8 @@ class TestMergeSubjectPatternAcrossEngines:
             f'  python:   {sorted(by_python)}\n  expected: {sorted(expected)}'
         )
 
-    @pytest.mark.parametrize('subject', _CORPUS)
-    def test_pattern_accepts_exactly_what_parse_accepts(self, subject: str) -> None:
+    @pytest.mark.parametrize('subject', _SUBJECT_LINES)
+    def test_on_a_subject_line_pattern_accepts_exactly_what_parse_accepts(self, subject: str) -> None:
         parsed = parse_merge_subject(subject)
         parsed_as_feat = (
             parsed is not None
@@ -209,6 +229,11 @@ class TestMergeSubjectPatternAcrossEngines:
         )
         matched = re.search(merge_subject_pattern(branch_prefix='feat/'), subject) is not None
         assert matched == parsed_as_feat
+
+    @pytest.mark.parametrize('subject', _OUTSIDE_THE_PYTHON_DOMAIN)
+    def test_tab_or_newline_is_selected_by_the_pattern_but_refused_by_parse(self, subject: str) -> None:
+        assert re.search(merge_subject_pattern(branch_prefix='feat/'), subject)
+        assert parse_merge_subject(subject) is None
 
 
 def _bash_line_arm_verdict(head: str, task_id: str, into: str, subject: str) -> bool:
