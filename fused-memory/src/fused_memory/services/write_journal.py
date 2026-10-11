@@ -290,6 +290,13 @@ CREATE TABLE IF NOT EXISTS referent_findings (
 CREATE INDEX IF NOT EXISTS idx_rf_group_time ON referent_findings(group_id, created_at);
 """
 
+#: Rows ``prune_write_ops`` ages out on its read horizon; parameter: the cutoff timestamp.
+READ_HORIZON_PREDICATE = "kind = 'read' AND operation <> 'search' AND created_at < ?"
+#: Its search horizon; every search producer journals kind='read', so this seeks idx_wo_kind_time.
+SEARCH_HORIZON_PREDICATE = "kind = 'read' AND operation = 'search' AND created_at < ?"
+#: Its write horizon; parameter: the cutoff timestamp.
+WRITE_HORIZON_PREDICATE = "kind = 'write' AND created_at < ?"
+
 #: Parameters: ``(since_iso_timestamp, limit)``.
 OPERATOR_TELEMETRY_QUERY = """
 SELECT
@@ -1215,27 +1222,12 @@ class WriteJournal:
         rewrite requiring another ~16 GB of scratch, which is categorically not
         a startup operation.
         """
+        # All three horizons range-seek idx_wo_kind_time (kind, created_at);
+        # INDEXED BY pins it, so a missing index errors instead of scanning.
         horizons = (
-            # Cheapest first, and each written against an index that already
-            # exists — no new DDL, because building one on this table would
-            # reintroduce the startup stall the batching exists to avoid.
-            #
-            # The two kind-scoped horizons range-seek idx_wo_kind_time
-            # (kind, created_at), so the cutoff bounds the scan. The search
-            # horizon does NOT: idx_wo_operation is on (operation) alone, so it
-            # seeks the operation='search' partition and applies created_at as
-            # a residual filter — a scan of that whole partition (~481k rows
-            # measured) on every startup, even once the horizon is drained.
-            # Correct, and cheap relative to the read horizon, but it is a
-            # partition scan and not a seek. Only widen the index to
-            # (operation, created_at) if that scan ever shows up in startup
-            # timings: the DDL cost above is the reason it is not there today.
-            ('read', "kind = 'read' AND operation <> 'search' AND created_at < ?",
-             read_older_than_days),       # idx_wo_kind_time — seek
-            ('search', "operation = 'search' AND created_at < ?",
-             search_older_than_days),     # idx_wo_operation — partition scan
-            ('write', "kind = 'write' AND created_at < ?",
-             write_older_than_days),      # idx_wo_kind_time — seek
+            ('read', READ_HORIZON_PREDICATE, read_older_than_days),
+            ('search', SEARCH_HORIZON_PREDICATE, search_older_than_days),
+            ('write', WRITE_HORIZON_PREDICATE, write_older_than_days),
         )
         try:
             deadline = _monotonic() + max_seconds
@@ -1260,7 +1252,8 @@ class WriteJournal:
                     async with self._require_access().write() as db:
                         cursor = await db.execute(
                             f'DELETE FROM write_ops WHERE id IN '
-                            f'(SELECT id FROM write_ops WHERE {predicate} LIMIT ?)',
+                            f'(SELECT id FROM write_ops INDEXED BY idx_wo_kind_time '
+                            f'WHERE {predicate} LIMIT ?)',
                             (cutoff, limit),
                         )
                         removed = max(cursor.rowcount, 0)
