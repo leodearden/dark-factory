@@ -387,10 +387,12 @@ def load_snapshot(path: Path) -> tuple[dict[str, Any], str]:
 
 
 def record_created_at(snapshot: Mapping[str, Any]) -> dict[str, datetime]:
-    """The aware instant of every dated write and slate candidate in *snapshot*.
+    """Each write's and each slate candidate's instant in *snapshot*, by memory id.
 
-    ``run_write_triage_config_matrix.py`` reads it so that
-    ``score_write_triage_pairs.py::WriteHomes`` can tell which targets predate a write.
+    Every instant is aware, as :func:`parse_created_at` reads it. A record
+    without one (naive, absent or unparseable) is left out, never guessed. The
+    off-slate ``targets`` carry no instant and are not read. A record that
+    appears at two different instants is refused with ValueError.
     """
     instants: dict[str, datetime] = {}
     records = (

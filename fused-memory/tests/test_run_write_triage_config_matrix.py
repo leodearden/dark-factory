@@ -281,6 +281,8 @@ def test_build_matrix_scores_every_pi_arm_with_iota() -> None:
     oracle = _oracle(cases)
 
     assert matrix['reference_arm'] == REFERENCE
+    assert matrix['comparative_rules'] == oracle['comparative_rules']
+    assert isinstance(matrix['comparative_rules'], dict)
     scored = _scored_rows(matrix)
     assert [row['arm'] for row in scored] == [REFERENCE, PRE_PSI, SOL]
     for row, provenance in zip(scored, THREE_ARMS, strict=True):
@@ -440,12 +442,6 @@ def test_the_harm_delta_not_the_contested_decision_errors_picks_the_winner() -> 
     assert matrix['winner'] == PRE_PSI
 
 
-def test_the_winner_rule_names_the_harm_delta() -> None:
-    rule = _mod().WINNER_RULE
-    assert 'comparative.harm_delta_vs_status_quo' in rule
-    assert 'contested_decision_errors' not in rule
-
-
 def _ranked(arm: str, delta: float | None, cost: float | None, failed: int = 0) -> dict[str, Any]:
     """A scored row that fails *failed* bounds, shaped as ``_with_bounds`` writes it."""
     checks = [{'check': f'bound {index}', 'ok': False, 'note': None} for index in range(failed)]
@@ -573,9 +569,12 @@ def test_best_config_copies_the_winner_verbatim(
 
     best = _mod().best_config(matrix)
 
-    assert set(best) == {'quality', 'selection', 'population', 'comparative', 'provenance'}
+    assert set(best) == {
+        'quality', 'selection', 'population', 'comparative', 'comparative_rules', 'provenance',
+    }
     assert best['quality'] == row['quality'] == oracle['arms'][winner]['quality']
     assert best['comparative'] == row['comparative'] == oracle['arms'][winner]['comparative']
+    assert best['comparative_rules'] == matrix['comparative_rules'] == oracle['comparative_rules']
     assert best['selection'] == row['selection']
     assert set(best['selection']) == {
         'judge_provider', 'judge_model', 'judge_reasoning_effort', 'judge_candidate_count',

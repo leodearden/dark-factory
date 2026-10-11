@@ -329,6 +329,10 @@ class ScoredCase:
         return self.resolution is Resolution.CORRECTS and not self.contested
 
     @property
+    def contradiction_flagged(self) -> bool:
+        return self.resolution is Resolution.CORRECTS and self.contested
+
+    @property
     def false_contested(self) -> bool:
         return self.resolution is Resolution.AGREEING and self.contested
 
@@ -450,30 +454,31 @@ COMPARATIVE_RULES: Mapping[str, str] = MappingProxyType({
     OutcomeCell.CONTESTED_MISFILE: 'filed contested, pair resolved MISFILE',
     OutcomeCell.FALSE_CONTESTED: 'filed contested, pair resolved AGREEING',
 })
-"""The rule of every comparative figure and outcome cell; the block carries it as ``rules``."""
+"""The rule of every comparative figure and outcome cell; the report carries it as ``comparative_rules``."""
 
-_ATTACH_CELLS: Mapping[tuple[Resolution, bool], OutcomeCell] = MappingProxyType({
-    (Resolution.AGREEING, False): OutcomeCell.ATTACH_BELONGS,
-    (Resolution.AGREEING, True): OutcomeCell.FALSE_CONTESTED,
-    (Resolution.CORRECTS, False): OutcomeCell.CONTRADICTION_UNFLAGGED,
-    (Resolution.CORRECTS, True): OutcomeCell.CONTRADICTION_FLAGGED,
-    (Resolution.MISFILE, False): OutcomeCell.MISFILE_ATTACH,
-    (Resolution.MISFILE, True): OutcomeCell.CONTESTED_MISFILE,
+_ATTACH_CELLS: Mapping[OutcomeCell, Callable[[ScoredCase], bool]] = MappingProxyType({
+    OutcomeCell.ATTACH_BELONGS: lambda attach: (
+        attach.resolution is Resolution.AGREEING and not attach.contested
+    ),
+    OutcomeCell.CONTRADICTION_FLAGGED: lambda attach: attach.contradiction_flagged,
+    OutcomeCell.CONTRADICTION_UNFLAGGED: lambda attach: attach.missed_contradiction,
+    OutcomeCell.MISFILE_ATTACH: lambda attach: attach.misfile and not attach.contested,
+    OutcomeCell.CONTESTED_MISFILE: lambda attach: attach.misfile and attach.contested,
+    OutcomeCell.FALSE_CONTESTED: lambda attach: attach.false_contested,
 })
-"""An attach's cell by (its pair's resolution, filed contested); UNCLEAR has none."""
+"""Each attach cell, read off :class:`ScoredCase`'s predicates; an UNCLEAR attach is in none."""
 
 
 def _outcome_cells(
-    attached: bool, contested: bool, resolution: Resolution | None,
-    placeable: bool, contradicts: bool,
+    attach: ScoredCase | None, placeable: bool, contradicts: bool,
 ) -> frozenset[OutcomeCell]:
-    """The cells one write falls in, under whichever regime took this action."""
-    if attached:
-        cell = _ATTACH_CELLS.get((resolution, contested)) if resolution is not None else None
-        cells = set() if cell is None else {cell}
-    else:
+    """The cells one write falls in under a regime that made *attach*, or stored it flat (None)."""
+    if attach is None:
         cells = {OutcomeCell.PLACEABLE_LEFT_FLAT} if placeable else set()
-    if contradicts and not (contested and resolution is Resolution.CORRECTS):
+    else:
+        cells = {cell for cell, holds in _ATTACH_CELLS.items() if holds(attach)}
+    flagged = attach is not None and attach.contradiction_flagged
+    if contradicts and not flagged:
         cells.add(OutcomeCell.CONTRADICTION_UNFLAGGED)
     return frozenset(cells)
 
@@ -554,16 +559,13 @@ class ComparedWrite:
 
     @property
     def arm_cells(self) -> frozenset[OutcomeCell]:
-        scored = self.scored
-        return _outcome_cells(
-            scored.case.attached, scored.contested, scored.resolution,
-            self.placeable, self.contradicts,
-        )
+        attach = self.scored if self.scored.case.attached else None
+        return _outcome_cells(attach, self.placeable, self.contradicts)
 
     @property
     def status_quo_cells(self) -> frozenset[OutcomeCell]:
         """Production today stores every write flat."""
-        return _outcome_cells(False, False, None, self.placeable, self.contradicts)
+        return _outcome_cells(None, self.placeable, self.contradicts)
 
 
 REGIMES: Mapping[str, Callable[[ComparedWrite], frozenset[OutcomeCell]]] = MappingProxyType({
@@ -699,9 +701,10 @@ def score_pairs(
     production-judged writes, the judge-band rows with both flags false,
     against the status quo, which stores every one of them flat. Each figure
     and :class:`OutcomeCell` is defined by its entry in
-    :data:`COMPARATIVE_RULES`, which the block carries as ``rules``.
+    :data:`COMPARATIVE_RULES`, which the report carries once, as
+    ``comparative_rules``, when *created_at* is given and is None otherwise.
     *harm_weights* weighs the cells (default :data:`DEFAULT_HARM_WEIGHTS`)
-    and is recorded in the block.
+    and is recorded in each block.
     """
     weights = _validated_weights(harm_weights)
     cases_by_arm = _cases_by_arm(cases)
@@ -726,6 +729,7 @@ def score_pairs(
         'reference_arm': reference_arm,
         'verdict_corpus': _corpus_summary(verdicts, truth),
         'list_prices': _price_table(),
+        'comparative_rules': None if homes is None else _comparative_rules(),
         'arms': {
             arm: _arm_report(
                 cases_by_arm[arm],
@@ -856,7 +860,7 @@ def _quality(scored: Sequence[ScoredCase]) -> dict[str, Any]:
     decided = sum(s.decided for s in attached)
     misfiles = sum(s.misfile for s in attached)
     contradictions = sum(s.resolution is Resolution.CORRECTS for s in attached)
-    contradictions_contested = contradictions - sum(s.missed_contradiction for s in scored)
+    contradictions_contested = sum(s.contradiction_flagged for s in scored)
     agreeing = sum(s.resolution is Resolution.AGREEING for s in attached)
     agreeing_contested = sum(s.false_contested for s in scored)
     true_links = sum(s.has_true_link for s in scored)
@@ -910,8 +914,11 @@ def _comparative(
             'seed': BOOTSTRAP_SEED,
             'unit': 'production-judged write',
         },
-        'rules': {str(key): rule for key, rule in COMPARATIVE_RULES.items()},
     }
+
+
+def _comparative_rules() -> dict[str, str]:
+    return {str(key): rule for key, rule in COMPARATIVE_RULES.items()}
 
 
 def _write_harm(cells: frozenset[OutcomeCell], weights: Mapping[OutcomeCell, float]) -> float:

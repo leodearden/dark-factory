@@ -28,24 +28,21 @@ Inputs
 Outputs
 -------
 - ``calibration/write_triage_config_matrix.json``: one row per π arm with ι's
-  blocks and the bound checks, the arms no route reached, the wording
-  attribution and the winner.
+  blocks and the bound checks, ι's comparative rules once, the arms no route
+  reached, the wording attribution and the winner.
 - ``calibration/write_triage_best_config.json``: the winner's doc, the one Γ3
   reads.
 
 Usage
 -----
-Run from ``fused-memory/``, with one ``--require`` per ``--require best …``
-of task 5808's metadata.before_done.args, without the ``best`` handle::
+Run from ``fused-memory/``. The full set of bounds and their thresholds is
+task 5808's metadata.before_done.args: pass one ``--require`` per
+``--require best …`` there, without the ``best`` handle. Two of them, for
+illustration::
 
     uv run python scripts/run_write_triage_config_matrix.py \\
         --data-root /home/leo/src/dark-factory \\
-        --require comparative.wrong_sibling_rate_placeable '<=' 0.11 \\
         --require comparative.harm_delta_vs_status_quo '<=' 0 \\
-        --require quality.contradiction_recall '>=' 0.60 \\
-        --require selection.p95_judge_seconds '<=' 10.0 \\
-        --require selection.cost_per_write_usd '<=' 0.01 \\
-        --require quality.unrated_pairs '<=' 0 \\
         --require population.n_judge_band '>=' 300
 
 An unrated or tied pair, an arm file or snapshot that differs from what π2
@@ -407,6 +404,7 @@ def build_matrix(
         'population': block,
         'verdict_corpus': scores['verdict_corpus'],
         'list_prices': scores['list_prices'],
+        'comparative_rules': scores['comparative_rules'],
         'arms': scored + [skipped.row() for skipped in SKIPPED_ARMS],
         'wording_attribution': _wording_attribution(population, cases_by_arm, verdicts),
         'selection_rule': {
@@ -429,11 +427,11 @@ def candidate_doc(row: Mapping[str, Any], population: Mapping[str, Any]) -> dict
 
 
 def best_config(matrix: Mapping[str, Any]) -> dict[str, Any]:
-    """The winner's :func:`candidate_doc`, the doc its bounds were checked on, plus provenance.
+    """The winner's :func:`candidate_doc`, the doc its bounds were checked on, plus context.
 
     Γ3 reads ``quality``, ``selection``, ``population`` and ``comparative``;
-    ``provenance`` names the arm and the bounds it failed, which are the checks
-    Γ3 will fail.
+    ``comparative_rules`` defines every comparative figure, and ``provenance``
+    names the arm and the bounds it failed, which are the checks Γ3 will fail.
     """
     winners = [
         row for row in matrix['arms']
@@ -443,6 +441,7 @@ def best_config(matrix: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError(f'the matrix winner {matrix["winner"]!r} names no single scored arm')
     [row] = winners
     return candidate_doc(row, matrix['population']) | {
+        'comparative_rules': matrix['comparative_rules'],
         'provenance': {
             'arm': row['arm'],
             'reference_arm': matrix['reference_arm'],

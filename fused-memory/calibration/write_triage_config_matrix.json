@@ -66,6 +66,30 @@
       }
     }
   },
+  "comparative_rules": {
+    "n_writes": "production-judged writes: judge-band rows whose recon_marker and declares_attach_keys are both false",
+    "placeable_writes": "production-judged writes with at least one pair resolved AGREEING or CORRECTS whose target predates the write (strictly earlier created_at; an undated record is never earlier)",
+    "contradiction_writes": "production-judged writes with at least one pair resolved CORRECTS whose target predates the write",
+    "placeable_attaches": "attaches of placeable writes whose pair resolved AGREEING, CORRECTS or MISFILE",
+    "wrong_sibling_misfiles": "attaches of placeable writes whose pair resolved MISFILE: the write had an earlier home and the arm filed it under another record",
+    "wrong_sibling_rate_placeable": "wrong_sibling_misfiles / placeable_attaches; None when placeable_attaches is 0",
+    "wrong_sibling_rate_wilson95": "Wilson 95% interval (z = 1.96) on wrong_sibling_misfiles of placeable_attaches; None when placeable_attaches is 0",
+    "no_known_home_attaches": "attaches whose pair resolved AGREEING, CORRECTS or MISFILE, of writes that are not placeable",
+    "unclear_attaches": "attaches whose pair resolved UNCLEAR; outside every other figure and every outcome cell",
+    "outcomes": "per regime, the production-judged writes in each cell; one write may fall in two cells. status_quo stores every write flat; arm is what this arm did",
+    "harm_weights": "the weight of each outcome cell, as passed to the scorer; a cell left out weighs 0 (PRD §12 D20, provisional)",
+    "harm_total": "per regime, the sum over cells of harm_weights[cell] x outcomes[regime][cell]; None when n_writes is 0",
+    "harm_delta_vs_status_quo": "harm_total.arm - harm_total.status_quo, on the same writes; at most 0 means no more harm than storing every write flat; None when n_writes is 0",
+    "harm_delta_bootstrap95": "paired bootstrap 95% interval of harm_delta_vs_status_quo, reported and not gated: each production-judged write contributes its arm harm minus its status-quo harm; the writes, ordered by memory_id, are resampled with replacement bootstrap.resamples times from random.Random(bootstrap.seed), and the interval is the nearest-rank 2.5th and 97.5th percentiles of the resampled sums; None when n_writes is 0",
+    "bootstrap": "the settings harm_delta_bootstrap95 was computed with",
+    "attach_belongs": "attached, not filed contested, pair resolved AGREEING",
+    "contradiction_flagged": "filed contested, pair resolved CORRECTS",
+    "placeable_left_flat": "a placeable write stored flat",
+    "contradiction_unflagged": "a contradiction write that was not filed contested against a target resolved CORRECTS, whatever else the regime did with it",
+    "misfile_attach": "attached, not filed contested, pair resolved MISFILE",
+    "contested_misfile": "filed contested, pair resolved MISFILE",
+    "false_contested": "filed contested, pair resolved AGREEING"
+  },
   "arms": [
     {
       "arm": "gpt-4o-mini@5",
@@ -169,30 +193,6 @@
           "resamples": 10000,
           "seed": 6532,
           "unit": "production-judged write"
-        },
-        "rules": {
-          "n_writes": "production-judged writes: judge-band rows whose recon_marker and declares_attach_keys are both false",
-          "placeable_writes": "production-judged writes with at least one pair resolved AGREEING or CORRECTS whose target predates the write (strictly earlier created_at; an undated record is never earlier)",
-          "contradiction_writes": "production-judged writes with at least one pair resolved CORRECTS whose target predates the write",
-          "placeable_attaches": "attaches of placeable writes whose pair resolved AGREEING, CORRECTS or MISFILE",
-          "wrong_sibling_misfiles": "attaches of placeable writes whose pair resolved MISFILE: the write had an earlier home and the arm filed it under another record",
-          "wrong_sibling_rate_placeable": "wrong_sibling_misfiles / placeable_attaches; None when placeable_attaches is 0",
-          "wrong_sibling_rate_wilson95": "Wilson 95% interval (z = 1.96) on wrong_sibling_misfiles of placeable_attaches; None when placeable_attaches is 0",
-          "no_known_home_attaches": "attaches whose pair resolved AGREEING, CORRECTS or MISFILE, of writes that are not placeable",
-          "unclear_attaches": "attaches whose pair resolved UNCLEAR; outside every other figure and every outcome cell",
-          "outcomes": "per regime, the production-judged writes in each cell; one write may fall in two cells. status_quo stores every write flat; arm is what this arm did",
-          "harm_weights": "the weight of each outcome cell, as passed to the scorer; a cell left out weighs 0 (PRD §12 D20, provisional)",
-          "harm_total": "per regime, the sum over cells of harm_weights[cell] x outcomes[regime][cell]; None when n_writes is 0",
-          "harm_delta_vs_status_quo": "harm_total.arm - harm_total.status_quo, on the same writes; at most 0 means no more harm than storing every write flat; None when n_writes is 0",
-          "harm_delta_bootstrap95": "paired bootstrap 95% interval of harm_delta_vs_status_quo, reported and not gated: each production-judged write contributes its arm harm minus its status-quo harm; the writes, ordered by memory_id, are resampled with replacement bootstrap.resamples times from random.Random(bootstrap.seed), and the interval is the nearest-rank 2.5th and 97.5th percentiles of the resampled sums; None when n_writes is 0",
-          "bootstrap": "the settings harm_delta_bootstrap95 was computed with",
-          "attach_belongs": "attached, not filed contested, pair resolved AGREEING",
-          "contradiction_flagged": "filed contested, pair resolved CORRECTS",
-          "placeable_left_flat": "a placeable write stored flat",
-          "contradiction_unflagged": "a contradiction write that was not filed contested against a target resolved CORRECTS, whatever else the regime did with it",
-          "misfile_attach": "attached, not filed contested, pair resolved MISFILE",
-          "contested_misfile": "filed contested, pair resolved MISFILE",
-          "false_contested": "filed contested, pair resolved AGREEING"
         }
       },
       "bounds": {
@@ -401,30 +401,6 @@
           "resamples": 10000,
           "seed": 6532,
           "unit": "production-judged write"
-        },
-        "rules": {
-          "n_writes": "production-judged writes: judge-band rows whose recon_marker and declares_attach_keys are both false",
-          "placeable_writes": "production-judged writes with at least one pair resolved AGREEING or CORRECTS whose target predates the write (strictly earlier created_at; an undated record is never earlier)",
-          "contradiction_writes": "production-judged writes with at least one pair resolved CORRECTS whose target predates the write",
-          "placeable_attaches": "attaches of placeable writes whose pair resolved AGREEING, CORRECTS or MISFILE",
-          "wrong_sibling_misfiles": "attaches of placeable writes whose pair resolved MISFILE: the write had an earlier home and the arm filed it under another record",
-          "wrong_sibling_rate_placeable": "wrong_sibling_misfiles / placeable_attaches; None when placeable_attaches is 0",
-          "wrong_sibling_rate_wilson95": "Wilson 95% interval (z = 1.96) on wrong_sibling_misfiles of placeable_attaches; None when placeable_attaches is 0",
-          "no_known_home_attaches": "attaches whose pair resolved AGREEING, CORRECTS or MISFILE, of writes that are not placeable",
-          "unclear_attaches": "attaches whose pair resolved UNCLEAR; outside every other figure and every outcome cell",
-          "outcomes": "per regime, the production-judged writes in each cell; one write may fall in two cells. status_quo stores every write flat; arm is what this arm did",
-          "harm_weights": "the weight of each outcome cell, as passed to the scorer; a cell left out weighs 0 (PRD §12 D20, provisional)",
-          "harm_total": "per regime, the sum over cells of harm_weights[cell] x outcomes[regime][cell]; None when n_writes is 0",
-          "harm_delta_vs_status_quo": "harm_total.arm - harm_total.status_quo, on the same writes; at most 0 means no more harm than storing every write flat; None when n_writes is 0",
-          "harm_delta_bootstrap95": "paired bootstrap 95% interval of harm_delta_vs_status_quo, reported and not gated: each production-judged write contributes its arm harm minus its status-quo harm; the writes, ordered by memory_id, are resampled with replacement bootstrap.resamples times from random.Random(bootstrap.seed), and the interval is the nearest-rank 2.5th and 97.5th percentiles of the resampled sums; None when n_writes is 0",
-          "bootstrap": "the settings harm_delta_bootstrap95 was computed with",
-          "attach_belongs": "attached, not filed contested, pair resolved AGREEING",
-          "contradiction_flagged": "filed contested, pair resolved CORRECTS",
-          "placeable_left_flat": "a placeable write stored flat",
-          "contradiction_unflagged": "a contradiction write that was not filed contested against a target resolved CORRECTS, whatever else the regime did with it",
-          "misfile_attach": "attached, not filed contested, pair resolved MISFILE",
-          "contested_misfile": "filed contested, pair resolved MISFILE",
-          "false_contested": "filed contested, pair resolved AGREEING"
         }
       },
       "bounds": {
@@ -633,30 +609,6 @@
           "resamples": 10000,
           "seed": 6532,
           "unit": "production-judged write"
-        },
-        "rules": {
-          "n_writes": "production-judged writes: judge-band rows whose recon_marker and declares_attach_keys are both false",
-          "placeable_writes": "production-judged writes with at least one pair resolved AGREEING or CORRECTS whose target predates the write (strictly earlier created_at; an undated record is never earlier)",
-          "contradiction_writes": "production-judged writes with at least one pair resolved CORRECTS whose target predates the write",
-          "placeable_attaches": "attaches of placeable writes whose pair resolved AGREEING, CORRECTS or MISFILE",
-          "wrong_sibling_misfiles": "attaches of placeable writes whose pair resolved MISFILE: the write had an earlier home and the arm filed it under another record",
-          "wrong_sibling_rate_placeable": "wrong_sibling_misfiles / placeable_attaches; None when placeable_attaches is 0",
-          "wrong_sibling_rate_wilson95": "Wilson 95% interval (z = 1.96) on wrong_sibling_misfiles of placeable_attaches; None when placeable_attaches is 0",
-          "no_known_home_attaches": "attaches whose pair resolved AGREEING, CORRECTS or MISFILE, of writes that are not placeable",
-          "unclear_attaches": "attaches whose pair resolved UNCLEAR; outside every other figure and every outcome cell",
-          "outcomes": "per regime, the production-judged writes in each cell; one write may fall in two cells. status_quo stores every write flat; arm is what this arm did",
-          "harm_weights": "the weight of each outcome cell, as passed to the scorer; a cell left out weighs 0 (PRD §12 D20, provisional)",
-          "harm_total": "per regime, the sum over cells of harm_weights[cell] x outcomes[regime][cell]; None when n_writes is 0",
-          "harm_delta_vs_status_quo": "harm_total.arm - harm_total.status_quo, on the same writes; at most 0 means no more harm than storing every write flat; None when n_writes is 0",
-          "harm_delta_bootstrap95": "paired bootstrap 95% interval of harm_delta_vs_status_quo, reported and not gated: each production-judged write contributes its arm harm minus its status-quo harm; the writes, ordered by memory_id, are resampled with replacement bootstrap.resamples times from random.Random(bootstrap.seed), and the interval is the nearest-rank 2.5th and 97.5th percentiles of the resampled sums; None when n_writes is 0",
-          "bootstrap": "the settings harm_delta_bootstrap95 was computed with",
-          "attach_belongs": "attached, not filed contested, pair resolved AGREEING",
-          "contradiction_flagged": "filed contested, pair resolved CORRECTS",
-          "placeable_left_flat": "a placeable write stored flat",
-          "contradiction_unflagged": "a contradiction write that was not filed contested against a target resolved CORRECTS, whatever else the regime did with it",
-          "misfile_attach": "attached, not filed contested, pair resolved MISFILE",
-          "contested_misfile": "filed contested, pair resolved MISFILE",
-          "false_contested": "filed contested, pair resolved AGREEING"
         }
       },
       "bounds": {

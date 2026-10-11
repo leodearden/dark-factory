@@ -902,6 +902,7 @@ class TestComparativePopulation:
         assert {arm: report['comparative'] for arm, report in result['arms'].items()} == {
             'A': None, 'B': None,
         }
+        assert result['comparative_rules'] is None
 
     def test_the_c2_scorer_reports_comparative_none_on_its_own_inputs(self) -> None:
         assert all(report['comparative'] is None for report in _synth_result()['arms'].values())
@@ -1069,10 +1070,9 @@ class TestComparativeOutcomes:
         assert key in str(caught.value) and repr(value) in str(caught.value), str(caught.value)
 
     @pytest.mark.parametrize('arm', ['A', 'B'])
-    def test_every_figure_and_cell_carries_its_rule(self, arm: str) -> None:
-        comparative = _comparative(arm)
-        rules = comparative['rules']
-        assert set(rules) == (set(comparative) - {'rules'}) | set(OUTCOME_CELLS)
+    def test_every_figure_and_cell_carries_its_rule_once_per_report(self, arm: str) -> None:
+        rules = _comparative_result()['comparative_rules']
+        assert set(rules) == set(_comparative(arm)) | set(OUTCOME_CELLS)
         assert all(isinstance(rule, str) and rule.strip() for rule in rules.values())
 
 
