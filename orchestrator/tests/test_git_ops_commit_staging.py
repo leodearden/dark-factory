@@ -134,6 +134,22 @@ class TestCommitEmbeddedRepoGitlinks:
         assert _git(wt, 'rev-parse', 'HEAD') == head_before
         assert _git(wt, 'diff', '--cached', '--name-only') == ''
 
+    async def test_commitless_embedded_repo_does_not_abort_staging(
+        self, git_ops: GitOps,
+    ) -> None:
+        wt = (await git_ops.create_worktree('commitless')).path
+        (wt / 'work.py').write_text('x = 1\n')
+        _plant_embedded_repo(wt, 'scratch/t1', with_commit=False)
+        head_before = _git(wt, 'rev-parse', 'HEAD')
+
+        sha = await git_ops.commit(wt, 'wip')
+
+        assert sha is not None
+        assert sha != head_before
+        entries = _committed_entries(wt, sha)
+        assert 'work.py' in entries
+        assert [path for path in entries if path.startswith('scratch/')] == []
+
     async def test_registered_submodule_pointer_bump_is_still_committed(
         self, git_ops: GitOps, git_repo: Path,
     ) -> None:
