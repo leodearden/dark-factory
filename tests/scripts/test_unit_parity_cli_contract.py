@@ -7,10 +7,23 @@ whole ``(rc, stdout, stderr)`` triple — with ``str(tmp_path)`` spelled
 ``<TMP>`` — against a literal captured from the checkers BEFORE the parity
 driver was lifted into scripts/systemd_unit_parity.py.
 
-The literals ARE the contract that setup-host.sh, orchestrator-watchdog.py and
-install-lms-units.sh read. A red here means operator-visible output changed:
-fix the code, or escalate the change as a design concern. Never regenerate a
-golden to make it pass.
+A golden holds two kinds of text, and each changes under its own rule:
+
+- What consumers parse. setup-host.sh, orchestrator-watchdog.py and
+  install-lms-units.sh read only the exit status, the checker's tag on every
+  line, and the orchestrator's ``verdict`` lines. Each of these is also pinned
+  apart from the prose: exit status by scenario class in ``LADDER``, the tag
+  by ``test_every_output_line_carries_the_tag_consumers_grep_for``, and the
+  verdict lines in test_check_orchestrator_unit_parity.py. A red in any of
+  them breaks a consumer. Fix the code, or escalate the change as a design
+  concern.
+- Operator prose: block headers, entries and remedy lines. No consumer parses
+  these. Rewording one is a legitimate change: edit the goldens it moves in
+  the same commit, and say in the commit message that the wording changed on
+  purpose.
+
+Never regenerate goldens wholesale to turn an unexplained red green. Read the
+diff first; that is how an unintended output change gets caught.
 """
 
 import dataclasses
@@ -765,6 +778,29 @@ def test_every_scenario_has_exactly_one_golden():
 @pytest.mark.parametrize("scenario", sorted(SCENARIOS))
 def test_cli_output_is_the_frozen_golden(scenario: str, tmp_path: pathlib.Path, capsys):
     assert _run(SCENARIOS[scenario](tmp_path), tmp_path, capsys) == GOLDENS[scenario]
+
+
+# Spelled out rather than read from each checker's LOG_TAG, because the
+# consumers grep for these literals: renaming a LOG_TAG must turn this red.
+CONSUMER_TAGS: dict[str, str] = {
+    "check_dashboard_unit_parity": "dashboard_unit_parity",
+    "check_orchestrator_unit_parity": "orchestrator_unit_parity",
+    "check_lms_unit_parity": "lms_unit_parity",
+    "check_fused_memory_unit_parity": "fused_memory_unit_parity",
+}
+
+
+@pytest.mark.parametrize("scenario", sorted(SCENARIOS))
+def test_every_output_line_carries_the_tag_consumers_grep_for(
+    scenario: str, tmp_path: pathlib.Path, capsys
+):
+    invocation = SCENARIOS[scenario](tmp_path)
+    _, out, err = _run(invocation, tmp_path, capsys)
+    tag = f"[{CONSUMER_TAGS[invocation.checker]}] "
+    lines = (out + err).splitlines()
+
+    assert lines, "a run that prints nothing gives a consumer no tag to find"
+    assert [line for line in lines if not line.startswith(tag)] == []
 
 
 # ---------------------------------------------------------------------------
