@@ -20,8 +20,11 @@ _SUMMARY_NAMED_PATH_CAP = 3
 
 _GIT_QUERY_TIMEOUT_SECS = 30.0
 
+_PATH_CHAR = r'[\w./-]'
 _PATH_START = r'''(?<![^\s'"`(\[{<=,])'''
-_PATH_END = r'(?![\w./-])'
+_PATH_END = rf'(?!{_PATH_CHAR})'
+_PRINTED_RUN = re.compile(f'{_PATH_START}{_PATH_CHAR}+')
+_RUN_SHAPED = re.compile(f'{_PATH_CHAR}+')
 
 _UNTRACKED_QUERY = (
     'git', '--no-optional-locks', 'ls-files', '--others', '--exclude-standard', '-z',
@@ -146,30 +149,59 @@ def attribute_phase1(
     """
     if phase1.passed:
         return Phase1WorkingTree(state, ())
-    output = '\n'.join((phase1.test_output, phase1.lint_output, phase1.type_output))
+    printed = _PrintedPaths.scan(
+        '\n'.join((phase1.test_output, phase1.lint_output, phase1.type_output)),
+    )
     prefixes = tuple(f'{d.rstrip("/")}/' for d in run_dirs if d)
     roots = tuple(dict.fromkeys((root, root.resolve())))
     named = tuple(
         NamedChange(path, change)
         for path, change in state.changes()
-        if _named_relatively(output, path, root=root, prefixes=prefixes)
-        or _named_absolutely(output, path, roots=roots)
+        if _named_relatively(printed, path, root=root, prefixes=prefixes)
+        or _named_absolutely(printed, path, roots=roots)
     )
     return Phase1WorkingTree(state, named)
 
 
+@dataclass(frozen=True)
+class _PrintedPaths:
+    """Forms an output prints: each starts at a delimiter and ends before a path character.
+
+    A form made only of path characters is printed exactly when it equals a
+    maximal run of path characters starting at a delimiter, so one scan
+    answers every such lookup. Any other form is searched for directly.
+    """
+
+    output: str
+    runs: frozenset[str]
+
+    @classmethod
+    def scan(cls, output: str) -> _PrintedPaths:
+        return cls(output, frozenset(_PRINTED_RUN.findall(output)))
+
+    def names(self, form: str, *, relative: bool) -> bool:
+        spellings = (form, f'./{form}') if relative else (form,)
+        if _RUN_SHAPED.fullmatch(form):
+            return any(spelling in self.runs for spelling in spellings)
+        return any(
+            re.search(_PATH_START + re.escape(spelling) + _PATH_END, self.output)
+            for spelling in spellings
+        )
+
+
 def _named_relatively(
-    output: str, path: str, *, root: Path, prefixes: tuple[str, ...],
+    printed: _PrintedPaths, path: str, *, root: Path, prefixes: tuple[str, ...],
 ) -> bool:
     return any(
-        _output_names(output, form, relative=True)
-        and _denotes_only(root, path, form, prefixes)
+        printed.names(form, relative=True) and _denotes_only(root, path, form, prefixes)
         for form in _relative_forms(path, prefixes)
     )
 
 
-def _named_absolutely(output: str, path: str, *, roots: tuple[Path, ...]) -> bool:
-    return any(_output_names(output, str(r / path), relative=False) for r in roots)
+def _named_absolutely(
+    printed: _PrintedPaths, path: str, *, roots: tuple[Path, ...],
+) -> bool:
+    return any(printed.names(str(r / path), relative=False) for r in roots)
 
 
 def _relative_forms(path: str, prefixes: tuple[str, ...]) -> Iterator[str]:
@@ -177,14 +209,6 @@ def _relative_forms(path: str, prefixes: tuple[str, ...]) -> Iterator[str]:
     for prefix in prefixes:
         if path.startswith(prefix):
             yield path[len(prefix):]
-
-
-def _output_names(output: str, form: str, *, relative: bool) -> bool:
-    if form not in output:
-        return False
-    dot_slash = r'(?:\./)?' if relative else ''
-    pattern = _PATH_START + dot_slash + re.escape(form) + _PATH_END
-    return re.search(pattern, output) is not None
 
 
 def _denotes_only(root: Path, path: str, form: str, prefixes: tuple[str, ...]) -> bool:
