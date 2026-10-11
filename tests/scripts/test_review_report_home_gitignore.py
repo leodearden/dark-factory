@@ -21,6 +21,8 @@ FUTURE_RUN_RECORDS: tuple[str, ...] = (
     'review/reports/review-dark_factory-20991231.md',
     'review/reports/review-dark_factory-20991231-2.json',
     'review/reports/review-dark_factory-20991231-2.md',
+    'review/reports/review-cockpit-20991231.json',
+    'review/reports/review-cockpit-20991231.md',
 )
 PRE_CONTRACT_FILES: tuple[str, ...] = (
     'review/reports/summary-20260526T103500.md',
@@ -75,7 +77,7 @@ def test_pre_contract_review_files_stay_ignored(path: str) -> None:
     rule = _ignoring_rule(path)
     assert rule is not None and rule.startswith('.gitignore:'), (
         f'{path} is no longer ignored by the root .gitignore (rule: {rule}). '
-        f'Option (b) of task 6785 keeps these pre-contract non-reports ignored; '
-        f'if they are deliberately un-ignored, skills/review/SKILL.md "Report home" '
-        f'and contract §5 change with it.'
+        f'skills/review/SKILL.md "Report home" and contract §5 keep these '
+        f'pre-contract non-reports ignored; if they are deliberately un-ignored, '
+        f'both change with it.'
     )
