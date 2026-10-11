@@ -98,6 +98,7 @@ from fused_memory.reconciliation.task_filter import (
     format_task_list,
     id_key,
     render_active_section,
+    render_retained_done_tasks,
     select_done_since_boundary,
 )
 from fused_memory.utils.async_utils import gather_collect
@@ -4353,16 +4354,7 @@ class TaskKnowledgeSync(BaseStage):
         # Defensive invariant check (task-782): see _check_filtered_tree_invariant.
         self._check_filtered_tree_invariant(filtered)
 
-        # Render "Recently Completed Tasks" section.
-        # Invariant: filter_task_tree() always appends to done_tasks when it increments
-        # done_count (capped at MAX_DONE_TASKS_RETAINED=30), so done_tasks is guaranteed
-        # non-empty whenever done_count > 0.  No fallback summary branch is needed.
-        # _check_filtered_tree_invariant() warns for externally-constructed trees that
-        # violate this.
-        if filtered.done_tasks:
-            recently_completed_text = format_task_list(filtered.done_tasks)
-        else:
-            recently_completed_text = format_task_list([])  # 'No tasks.'
+        recently_completed_text = render_retained_done_tasks(filtered)
 
         # Done-task provenance section — feeds verified evidence to the agent
         # so 'shipped via X' edges come from commit diffs instead of being

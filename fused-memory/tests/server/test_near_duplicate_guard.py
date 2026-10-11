@@ -32,6 +32,7 @@ from fused_memory.server.near_duplicate_guard import (
     _DEFAULT_NEAR_DUP_GUARD_ENABLED,
     _DEFAULT_NEAR_DUP_THRESHOLD,
     _TOPIC_CLUSTER_DEFAULT_HINT,
+    build_near_duplicate_block,
     build_topic_cluster_block,
     find_matching_topic_cluster,
     find_near_duplicate_memory,
@@ -44,6 +45,7 @@ from fused_memory.server.near_duplicate_guard import (
 )
 from fused_memory.server.topic_cluster_store import TopicClusterStore
 from fused_memory.services.memory_service import RRF_K
+from fused_memory.utils.clip_disclosure import TRUNCATION_FACTS_KEY
 
 # The real post-RRF relevance_score for a rank-1 hit on the guard's
 # single-store search(stores=['mem0'], limit=5) path — 1/(RRF_K + 1).
@@ -545,6 +547,58 @@ class TestBuildTopicClusterBlock:
         cluster = _cluster(topic_id='topic-a')
         block = build_topic_cluster_block(None, 'content', cluster, ['alpha'])
         assert block['agent_id'] is None
+
+
+class TestGuardBlocksDiscloseTheirExcerptClip:
+    """A 200-char excerpt that cut its source says so beside itself (task 5365).
+
+    The excerpt VALUES stay ``content[:200]`` with no inline marker, so every
+    reader comparing them is untouched; the cut rides as a sibling
+    ``truncation_facts`` list of ``{field, cap, elided}`` dicts instead.
+    """
+
+    def test_a_near_duplicate_block_reports_both_cut_excerpts(self):
+        content = 'x' * 450
+        match = _result('m1', 0.97, content='y' * 330)
+
+        block = build_near_duplicate_block('agent', content, match, 0.92)
+
+        assert block['content_excerpt'] == content[:200]
+        assert block['matched_excerpt'] == match.content[:200]
+        assert block[TRUNCATION_FACTS_KEY] == [
+            {'field': 'content_excerpt', 'cap': 200, 'elided': 250},
+            {'field': 'matched_excerpt', 'cap': 200, 'elided': 130},
+        ]
+
+    def test_a_near_duplicate_block_reports_only_the_cut_side(self):
+        match = _result('m1', 0.97, content='y' * 330)
+
+        block = build_near_duplicate_block('agent', 'short content', match, 0.92)
+
+        assert block['content_excerpt'] == 'short content'
+        assert block[TRUNCATION_FACTS_KEY] == [
+            {'field': 'matched_excerpt', 'cap': 200, 'elided': 130},
+        ]
+
+    def test_a_topic_cluster_block_reports_its_cut_excerpt(self):
+        content = 'x' * 500
+
+        block = build_topic_cluster_block('agent', content, _cluster(topic_id='t'), ['alpha'])
+
+        assert block['content_excerpt'] == content[:200]
+        assert block[TRUNCATION_FACTS_KEY] == [
+            {'field': 'content_excerpt', 'cap': 200, 'elided': 300},
+        ]
+
+    def test_an_uncut_block_carries_no_truncation_facts(self):
+        at_cap = 'x' * 200
+        near_duplicate = build_near_duplicate_block(
+            'agent', at_cap, _result('m1', 0.97, content=at_cap), 0.92
+        )
+        topic_cluster = build_topic_cluster_block('agent', at_cap, _cluster(topic_id='t'), ['a'])
+
+        assert TRUNCATION_FACTS_KEY not in near_duplicate, near_duplicate
+        assert TRUNCATION_FACTS_KEY not in topic_cluster, topic_cluster
 
 
 class TestMergeTopicClusters:

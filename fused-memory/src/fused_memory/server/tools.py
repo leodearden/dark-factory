@@ -133,6 +133,7 @@ from fused_memory.server.grouped_read import (
     group_memory_document,
     group_search_results,
 )
+from fused_memory.server.guard_excerpt import excerpt_fields
 from fused_memory.server.manifest_stamping import (
     stamp_capability_manifests,
     stamping_action_required,
@@ -206,6 +207,7 @@ from fused_memory.services.read_telemetry import (
     summarize_search_query,
     summarize_search_results,
 )
+from fused_memory.utils.clip_disclosure import truncation_fields
 from fused_memory.utils.validation import (
     PathShapedProjectIdError,
     _to_underscore_canonical,
@@ -1521,7 +1523,7 @@ def create_mcp_server(
             'error': refusal.error,
             'error_type': refusal.error_type,
             'agent_id': agent_id,
-            'content_excerpt': content[:200],
+            **excerpt_fields(content_excerpt=content),
             'hint': refusal.hint,
         }
 
@@ -1758,7 +1760,7 @@ def create_mcp_server(
             'error': 'premature_completion_claim_write_blocked',
             'error_type': 'ReconPrematureCompletionClaimWriteRejected',
             'agent_id': agent_id,
-            'content_excerpt': content[:200],
+            **excerpt_fields(content_excerpt=content),
             'blocked_task_ids': sorted(blocked),
             'hint': _PREMATURE_COMPLETION_HINT,
         }
@@ -3245,7 +3247,7 @@ def create_mcp_server(
                 'error': 'mixed_temporal_framing_write_blocked',
                 'error_type': 'ReconMixedFramingWriteRejected',
                 'agent_id': agent_id,
-                'content_excerpt': content[:200],
+                **excerpt_fields(content_excerpt=content),
             }
         if isinstance(agent_id, str) and agent_id.startswith('recon-stage-'):
             conflicting_task_ids = find_conflicting_task_status_ids(content)
@@ -3254,7 +3256,7 @@ def create_mcp_server(
                     'error': 'conflicting_task_status_framing_write_blocked',
                     'error_type': 'ReconConflictingTaskStatusWriteRejected',
                     'agent_id': agent_id,
-                    'content_excerpt': content[:200],
+                    **excerpt_fields(content_excerpt=content),
                     'conflicting_task_ids': sorted(conflicting_task_ids),
                     'hint': _CONFLICTING_TASK_STATUS_HINT,
                 }
@@ -3267,7 +3269,7 @@ def create_mcp_server(
                 'error': 'live_task_status_current_fact_write_blocked',
                 'error_type': 'ReconLiveTaskStatusWriteRejected',
                 'agent_id': agent_id,
-                'content_excerpt': content[:200],
+                **excerpt_fields(content_excerpt=content),
                 'hint': _LIVE_TASK_STATUS_HINT,
             }
         # task 2824: reject a recon-stage present-tense completion claim ("task N
@@ -3578,7 +3580,7 @@ def create_mcp_server(
                 'error': 'count_snapshot_write_blocked',
                 'error_type': 'ReconSnapshotWriteRejected',
                 'agent_id': agent_id,
-                'content_excerpt': content[:200],
+                **excerpt_fields(content_excerpt=content),
             }
         if (
             category == 'temporal_facts'
@@ -3590,7 +3592,7 @@ def create_mcp_server(
                 'error': 'mixed_temporal_framing_write_blocked',
                 'error_type': 'ReconMixedFramingWriteRejected',
                 'agent_id': agent_id,
-                'content_excerpt': content[:200],
+                **excerpt_fields(content_excerpt=content),
             }
         if (
             category == 'temporal_facts'
@@ -3603,7 +3605,7 @@ def create_mcp_server(
                     'error': 'conflicting_task_status_framing_write_blocked',
                     'error_type': 'ReconConflictingTaskStatusWriteRejected',
                     'agent_id': agent_id,
-                    'content_excerpt': content[:200],
+                    **excerpt_fields(content_excerpt=content),
                     'conflicting_task_ids': sorted(conflicting_task_ids),
                     'hint': _CONFLICTING_TASK_STATUS_HINT,
                 }
@@ -3619,7 +3621,7 @@ def create_mcp_server(
                 'error': 'live_task_status_current_fact_write_blocked',
                 'error_type': 'ReconLiveTaskStatusWriteRejected',
                 'agent_id': agent_id,
-                'content_excerpt': content[:200],
+                **excerpt_fields(content_excerpt=content),
                 'hint': _LIVE_TASK_STATUS_HINT,
             }
         # task 2824: reject a recon-stage present-tense completion claim ("task N
@@ -4044,6 +4046,7 @@ def create_mcp_server(
             ack = {**ack, ROUTED_KEY: outcome}
             if attached_to is not None:
                 ack[CANONICAL_ID_KEY] = attached_to
+            ack.update(truncation_fields(*triage_decision.truncation_facts))
             # Drained AFTER any fallback record above, so one drain covers both
             # triage_write's internal fail-opens and this body's own.
             storm = _triage_fail_open_counter.drain_storm()

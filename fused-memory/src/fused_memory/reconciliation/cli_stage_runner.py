@@ -18,6 +18,7 @@ from fused_memory.reconciliation.sandbox_guard import (
     RemediationSandboxUnavailable,
     resolve_recon_sandbox_wrap,
 )
+from fused_memory.utils.clip_disclosure import elide_text, truncation_fields
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -817,6 +818,17 @@ async def run_stage_via_cli(
     )
 
 
+# The stats flag on a report whose agent reply was prose rather than a JSON report.
+RAW_TEXT_FALLBACK_STAT = 'raw_text_fallback'
+_FALLBACK_SUMMARY_CHARS = 2000
+
+
+def _raw_text_fallback_report(output: str) -> dict:
+    clip = elide_text(output, _FALLBACK_SUMMARY_CHARS, field='summary')
+    stats = {RAW_TEXT_FALLBACK_STAT: True, **truncation_fields(clip.fact)}
+    return {'summary': clip.text, 'flagged_items': [], 'stats': stats}
+
+
 def _normalize_report(report: dict) -> dict:
     """Normalize a raw stage report dict.
 
@@ -874,8 +886,7 @@ def _extract_report(result: AgentResult) -> dict:
         except json.JSONDecodeError:
             pass
 
-        # Fallback: wrap raw text as summary
-        return {'summary': result.output[:2000]}
+        return _raw_text_fallback_report(result.output)
 
     # PRD γ: return {} instead of a placeholder so BaseStage.run's recon_report
     # fallback path (empty assembled dict) triggers cleanly rather than masking

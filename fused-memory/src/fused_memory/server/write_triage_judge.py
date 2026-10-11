@@ -65,6 +65,7 @@ from fused_memory.server.write_triage import (
     JudgeUsage,
     TriageJudgeVerdict,
 )
+from fused_memory.utils.clip_disclosure import TruncationFact
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Sequence
@@ -1132,9 +1133,10 @@ async def judge_write(
         )
         return TriageJudgeVerdict(OUTCOME_STORED)
 
+    candidate_count = resolve_judge_candidate_count(memory_service)
     selected = select_judge_candidates(
         candidates,
-        resolve_judge_candidate_count(memory_service),
+        candidate_count,
         canonical_id=getattr(decision, 'canonical_id', None),
     )
     if not selected:
@@ -1151,4 +1153,18 @@ async def judge_write(
         reasoning_effort=resolve_judge_reasoning_effort(memory_service),
     )
     verdict = parse_judge_verdict(reply.text, [candidate.id for candidate in selected])
-    return verdict._replace(usage=reply.usage)
+    return verdict._replace(
+        usage=reply.usage,
+        truncation_facts=_slate_trim_facts(candidates, selected, candidate_count),
+    )
+
+
+def _slate_trim_facts(
+    candidates: Any, selected: Sequence[MemoryResult], candidate_count: int,
+) -> tuple[TruncationFact, ...]:
+    """How many COMPARABLE candidates the judge was not shown, counted with ``cosine_of``."""
+    comparable = sum(1 for result in candidates or () if cosine_of(result) is not None)
+    elided = comparable - len(selected)
+    if elided <= 0:
+        return ()
+    return (TruncationFact(field='judge_candidates', cap=candidate_count, elided=elided),)
