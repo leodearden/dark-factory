@@ -1142,6 +1142,25 @@ def _record_trickle_progress(
     A FAILED NIGHT'S TARGET DATE IS GONE, NOT RETRIED. See
     ``scripts/legibility-trickle@.timer``'s ``Persistent=true`` comment
     for why, and for the decision to leave it that way.
+    """
+    doc = _record_run_state(
+        cfg.project_id, sample, target_date, result, recorder=recorder, now=now,
+    )
+    _escalate_barren_streak(cfg, doc, target_date, result, poster=poster)
+
+
+def _record_run_state(
+    project_id: str,
+    sample: sampling.SampleResult,
+    target_date: date,
+    result: NightlyResult,
+    *,
+    recorder,
+    now: datetime | None,
+) -> dict | None:
+    """Record one night through *recorder* (default
+    :func:`trickle_state.record_run`) and return the document it wrote, or
+    ``None`` when the write failed.
 
     BEST-EFFORT, ALWAYS: the whole call is wrapped in ``try/except`` ->
     one WARNING, swallowed — mirroring :func:`post_escalation`'s
@@ -1152,8 +1171,8 @@ def _record_trickle_progress(
     record = recorder if recorder is not None else trickle_state.record_run
     recorded_at = now if now is not None else datetime.now(UTC)
     try:
-        doc = record(
-            cfg.project_id,
+        return record(
+            project_id,
             target_date=target_date,
             recorded_at=recorded_at,
             exit_code=result.exit_code,
@@ -1172,11 +1191,9 @@ def _record_trickle_progress(
             'legibility trickle: could not record run state for project=%s '
             'date=%s (%s: %s); the run itself is unaffected, but the '
             'progress probe will read a stale streak',
-            cfg.project_id, target_date.isoformat(), type(exc).__name__, exc,
+            project_id, target_date.isoformat(), type(exc).__name__, exc,
         )
-        return
-
-    _escalate_barren_streak(cfg, doc, target_date, result, poster=poster)
+        return None
 
 
 def _escalate_barren_streak(
@@ -1310,9 +1327,12 @@ def run_nightly(
     *now* threads through to :func:`evaluate_census_step`'s clock seam and
     to the run-state recorder's ``recorded_at``.
 
-    Every failure after the config loads is returned as ``exit_code=1``, and
-    the crash itself files one escalation (:func:`_crashed_night`); before
-    that it raises.
+    After the config loads, every failure is recorded as a failed night,
+    returned as ``exit_code=1``, and escalated once (:func:`_crashed_night`).
+    A config that does not load raises. It is first recorded as a failed
+    night when *project_id* selected the project (the systemd unit's
+    ``--project-id %i``), and left unrecorded under *config_path*, which
+    names no project to record against.
 
     *status_fetcher* defaults to the real MCP-backed ``get_statuses``
     fetcher for ``cfg.project_root``
@@ -1347,13 +1367,17 @@ def run_nightly(
     ``exit_code=0``; the decision-8 fail-loud triggers are added by later
     steps.
     """
+    if target_date is None:
+        target_date = (datetime.now(UTC) - timedelta(days=1)).date()
     if config_path is not None:
         resolved_config_path = Path(config_path).resolve()
+        cfg = load_config(resolved_config_path)
+    elif project_id is not None:
+        resolved_config_path, cfg = _load_config_for_project(
+            project_id, target_date, recorder=recorder, now=now,
+        )
     else:
-        if project_id is None:
-            raise ValueError('run_nightly requires either config_path or project_id')
-        resolved_config_path = resolve_config_path(project_id)
-    cfg = load_config(resolved_config_path)
+        raise ValueError('run_nightly requires either config_path or project_id')
     try:
         return _run_configured_nightly(
             cfg, resolved_config_path,
@@ -1363,6 +1387,22 @@ def run_nightly(
         )
     except Exception as exc:
         return _crashed_night(cfg, exc, poster=poster)
+
+
+def _load_config_for_project(
+    project_id: str, target_date: date, *, recorder, now: datetime | None,
+) -> tuple[Path, LegibilityConfig]:
+    """Resolve and load *project_id*'s config, recording a failed night for
+    *project_id* before re-raising when either step fails."""
+    try:
+        path = resolve_config_path(project_id)
+        return path, load_config(path)
+    except Exception:
+        _record_run_state(
+            project_id, _nothing_sampled(), target_date, NightlyResult(exit_code=1),
+            recorder=recorder, now=now,
+        )
+        raise
 
 
 def _nothing_sampled() -> sampling.SampleResult:
@@ -1377,7 +1417,7 @@ def _run_configured_nightly(
     resolved_config_path: Path,
     *,
     projects_root: Path | str | None,
-    target_date: date | None,
+    target_date: date,
     now: datetime | None,
     invoke,
     status_fetcher,
@@ -1386,9 +1426,6 @@ def _run_configured_nightly(
     recorder,
 ) -> NightlyResult:
     """:func:`run_nightly`'s pass once *cfg* has loaded."""
-    if target_date is None:
-        target_date = (datetime.now(UTC) - timedelta(days=1)).date()
-
     # ONE recording point for all five return sites AND an unexpected
     # raise: a single try/finally cannot forget a branch, the way five
     # separate record calls could. Two load-bearing, non-obvious
