@@ -588,8 +588,9 @@ class TestBucketAccounting:
 
 
 def _turn_store_unreadable(root: str, aside: Path) -> None:
-    _store_path(root).rename(aside)
-    _store_path(root).write_bytes(b'not a sqlite database\n' * 256)
+    store = _store_path(root)
+    aside.write_bytes(store.read_bytes())
+    store.write_bytes(b'not a sqlite database\n' * 256)
 
 
 def _apply_while_the_store_turns_unreadable(root: str, aside: Path):
@@ -600,7 +601,7 @@ def _apply_while_the_store_turns_unreadable(root: str, aside: Path):
     server = _FakeClaimantServer()
     server.concurrent_traffic[4028] = lambda: _turn_store_unreadable(root, aside)
     report = _apply(take_census(root, NOW), server)
-    aside.replace(_store_path(root))
+    _store_path(root).write_bytes(aside.read_bytes())
     return report, server
 
 
