@@ -1228,13 +1228,12 @@ class TestPostMergeVerifySeedsBaseline:
             f'the failing side must still seed the empty set; got {seeded_failing!r}'
         )
 
-    def test_passing_verify_with_no_skipped_ids_seeds_empty_not_unseeded(
+    def test_passing_verify_with_no_skip_evidence_leaves_the_skipped_side_unknown(
         self, tmp_path: Path,
     ) -> None:
-        """(b) skipped_test_ids=None seeds the skipped side EMPTY rather than
-        leaving it unseeded, so the two caches never disagree about WHICH SHAS
-        WERE PROBED — the same invariant main_baseline_failing_ids already
-        honours and seed_main_baseline's docstring asserts is universal."""
+        """(b) skipped_test_ids=None is "no skip evidence", so the skipped side
+        reads None rather than a confident empty set, while the failing side is
+        still seeded empty (task 2590)."""
         from orchestrator.verify import (
             _BASELINE_FAILING_IDS_CACHE,
             cached_main_baseline_skipped_ids,
@@ -1251,11 +1250,11 @@ class TestPostMergeVerifySeedsBaseline:
         )
         assert outcome is None
 
-        assert 'abcsha' in _BASELINE_FAILING_IDS_CACHE
-        assert cached_main_baseline_skipped_ids('abcsha') == frozenset(), (
-            'skipped_test_ids=None must seed the EMPTY set, not leave the sha '
-            'unseeded (an unseeded sha is indistinguishable from never-probed); '
-            f'got {cached_main_baseline_skipped_ids("abcsha")!r}'
+        _, seeded_failing = _BASELINE_FAILING_IDS_CACHE['abcsha']
+        assert seeded_failing == frozenset()
+        assert cached_main_baseline_skipped_ids('abcsha') is None, (
+            'skipped_test_ids=None must not claim "main skipped nothing"; got '
+            f'{cached_main_baseline_skipped_ids("abcsha")!r}'
         )
 
     def test_degraded_pass_seeds_neither_cache(self, tmp_path: Path) -> None:

@@ -1917,159 +1917,158 @@ class TestExtractFailingTestIdsFromJunit:
         ]
 
 
-class TestExtractSkippedTestIdsFromJunit:
-    """``_extract_skipped_test_ids_from_junit(path)`` — the SKIPPED half of the same report.
+class TestExtractTestIdsFromJunit:
+    """``_extract_test_ids_from_junit(path)`` — ONE parse, failing and skipped vectors.
 
-    Task 3226.  The failing parser above deliberately excludes ``<skipped>``,
-    and that exclusion is correct — a skipped test did not fail.  But it leaves
-    ``main_baseline_failing_ids`` recording only what main FAILED, so nothing
-    downstream can tell "main RAN this test and it passed" apart from "main
-    never ran it at all".  Only the first supports the confident task-fault
-    conclusion the id-diff fast path in ``verify_failure_is_preexisting_on_main``
-    draws from it; from the second, the honest answer is "unknown".
-
-    This parser supplies the missing half.  Same file, same traversal, same id
-    composition — only the selection predicate differs — so the two vectors are
-    directly comparable and cannot drift on what an "id" means.
-
-    RED today: the helper does not exist yet.
+    Task 3226.  The failing vector alone leaves ``main_baseline_failing_ids``
+    unable to tell "main RAN this test and it passed" from "main never ran it";
+    only the first supports the task-fault conclusion the id-diff fast path in
+    ``verify_failure_is_preexisting_on_main`` draws.  The skipped vector is the
+    never-executed population, so it must hold exactly the tests the run did
+    not execute — an xfail ran.
     """
 
-    # DELIBERATELY the same fixture the failing parser's class uses, verbatim.
-    # The point of the partition assertion below is that ONE report yields two
-    # disjoint vectors; a separate fixture could drift and make that claim
-    # vacuous.
+    # DELIBERATELY the failing parser's fixture, verbatim: the partition
+    # assertion below is that ONE report yields two disjoint vectors.
     _JUNIT_XML = TestExtractFailingTestIdsFromJunit._JUNIT_XML
 
-    def test_returns_sorted_deduped_ids_for_skipped_only(self, tmp_path: Path):
+    @staticmethod
+    def _parse(tmp_path: Path, xml: str) -> verify._JunitTestIds | None:
         junit_path = tmp_path / 'junit.xml'
-        junit_path.write_text(self._JUNIT_XML)
+        junit_path.write_text(xml)
+        return verify._extract_test_ids_from_junit(junit_path)
 
-        ids = verify._extract_skipped_test_ids_from_junit(junit_path)
-
-        assert ids == ['tests.test_sample::test_skip'], (
-            f'expected only the <skipped> cases, sorted+deduped; got {ids!r}'
-        )
-
-    def test_the_two_parsers_partition_one_report(self, tmp_path: Path):
-        """Failing and skipped are DISJOINT, and neither swallows the other.
-
-        The pinned exclusion of ``<skipped>`` from the failing side must remain
-        green and unmoved: widening it would misreport a skip as a failure,
-        which is a strictly worse error than the one this task fixes — it would
-        manufacture a main-health red out of a test main deliberately declined
-        to run.
-        """
-        junit_path = tmp_path / 'junit.xml'
-        junit_path.write_text(self._JUNIT_XML)
-
-        failing = verify._extract_failing_test_ids_from_junit(junit_path)
-        skipped = verify._extract_skipped_test_ids_from_junit(junit_path)
-
-        assert failing == ['tests.test_sample::test_error', 'tests.test_sample::test_fail']
-        assert skipped == ['tests.test_sample::test_skip']
-        assert set(failing or []).isdisjoint(skipped or [])
-        assert 'tests.test_sample::test_pass' not in (failing or []) + (skipped or []), (
-            'a passing testcase belongs to NEITHER vector — that is exactly the '
-            'state the id-diff fast path may draw a confident conclusion from'
-        )
-
-    def test_nothing_skipped_returns_empty_list_not_none(self, tmp_path: Path):
-        """``[]`` is "junit collected, zero skipped" and is NOT the same as ``None``.
-
-        The distinction is the whole mechanism: ``[]`` licenses the downstream
-        conclusion "main ran everything", while ``None`` means the report is
-        missing and nothing may be concluded from its absence.
-        """
-        junit_path = tmp_path / 'junit.xml'
-        junit_path.write_text(
+    @staticmethod
+    def _suite(*testcases: str) -> str:
+        return (
             '<?xml version="1.0" encoding="utf-8"?>\n'
-            '<testsuites><testsuite name="pytest" tests="1">'
-            '<testcase classname="tests.test_sample" name="test_pass" time="0.001" />'
-            '</testsuite></testsuites>\n'
+            '<testsuites><testsuite name="pytest">'
+            + ''.join(testcases)
+            + '</testsuite></testsuites>\n'
         )
 
-        assert verify._extract_skipped_test_ids_from_junit(junit_path) == []
+    def test_one_report_partitions_into_failing_and_skipped(self, tmp_path: Path):
+        """Failing and skipped are DISJOINT, a pass is in neither, and the
+        failing projection agrees with the pair."""
+        ids = self._parse(tmp_path, self._JUNIT_XML)
+
+        assert ids == (
+            ['tests.test_sample::test_error', 'tests.test_sample::test_fail'],
+            ['tests.test_sample::test_skip'],
+        ), ids
+        assert ids is not None
+        assert verify._extract_failing_test_ids_from_junit(tmp_path / 'junit.xml') == ids.failing
+
+    def test_nothing_skipped_is_an_empty_vector_not_none(self, tmp_path: Path):
+        """``[]`` ("junit collected, zero skipped") licenses "main ran
+        everything"; ``None`` (no report) licenses nothing."""
+        ids = self._parse(
+            tmp_path,
+            self._suite('<testcase classname="tests.test_sample" name="test_pass" />'),
+        )
+
+        assert ids == ([], [])
+
+    def test_xfail_ran_so_it_is_not_skipped(self, tmp_path: Path):
+        """pytest writes an xfail as ``<skipped type="pytest.xfail">``
+        (``_pytest/junitxml.py::_NodeReporter.append_skipped``), but the test
+        RAN.  Counting it as skipped would let the merge-queue reason say
+        "main never ran" about a test main did run."""
+        ids = self._parse(
+            tmp_path,
+            self._suite(
+                '<testcase classname="t" name="test_xfail">'
+                '<skipped type="pytest.xfail" message="known bug" /></testcase>',
+                '<testcase classname="t" name="test_skip">'
+                '<skipped type="pytest.skip" message="no reify checkout">x</skipped>'
+                '</testcase>',
+            ),
+        )
+
+        assert ids == ([], ['t::test_skip']), ids
+
+    def test_strict_xpass_ran_so_it_is_not_skipped(self, tmp_path: Path):
+        """A strict XPASS is written as an UNTYPED ``<skipped>`` with a fixed
+        message (``_pytest/junitxml.py::_NodeReporter.append_failure``); it ran
+        too.  An untyped collection skip did not, and stays skipped."""
+        ids = self._parse(
+            tmp_path,
+            self._suite(
+                '<testcase classname="t" name="test_xpass_strict">'
+                '<skipped message="xfail-marked test passes unexpectedly" /></testcase>',
+                '<testcase classname="t" name="test_module">'
+                '<skipped message="collection skipped">reason</skipped></testcase>',
+            ),
+        )
+
+        assert ids == ([], ['t::test_module']), ids
+
+    def test_a_testcase_with_a_failure_is_failing_whatever_else_it_records(
+        self, tmp_path: Path,
+    ):
+        """A skip in the call phase plus a teardown error lands in ``failing``
+        only, so the two vectors stay disjoint by construction."""
+        ids = self._parse(
+            tmp_path,
+            self._suite(
+                '<testcase classname="t" name="test_both">'
+                '<skipped type="pytest.skip" message="s" />'
+                '<error message="failed on teardown">boom</error></testcase>',
+            ),
+        )
+
+        assert ids == (['t::test_both'], []), ids
 
     def test_bare_testsuite_root_is_handled(self, tmp_path: Path):
-        """Both ``<testsuites><testsuite>`` and a bare ``<testsuite>`` root work.
-
-        ``root.iter('testcase')`` rather than a fixed path, matching the failing
-        parser: a writer that omits the ``<testsuites>`` wrapper must not
-        silently yield an empty vector, which would read as "nothing skipped".
-        """
-        junit_path = tmp_path / 'junit.xml'
-        junit_path.write_text(
+        """A writer that omits the ``<testsuites>`` wrapper must not yield an
+        empty vector, which would read as "nothing skipped"."""
+        ids = self._parse(
+            tmp_path,
             '<?xml version="1.0" encoding="utf-8"?>\n'
             '<testsuite name="pytest" tests="1">'
             '<testcase classname="tests.test_sample" name="test_skip">'
             '<skipped message="no reify checkout" type="pytest.skip" />'
-            '</testcase></testsuite>\n'
+            '</testcase></testsuite>\n',
         )
 
-        assert verify._extract_skipped_test_ids_from_junit(junit_path) == [
-            'tests.test_sample::test_skip',
-        ]
+        assert ids == ([], ['tests.test_sample::test_skip'])
 
-    def test_falls_back_to_file_then_bare_name_for_the_id(self, tmp_path: Path):
-        """Identical id composition to the failing parser — classname, then file, then name.
-
-        Load-bearing rather than symmetry for its own sake: the two vectors are
-        SET-DIFFERENCED against each other downstream, so any divergence in how
-        an id is spelled would silently make every comparison miss.
-        """
-        junit_path = tmp_path / 'junit.xml'
-        junit_path.write_text(
-            '<?xml version="1.0" encoding="utf-8"?>\n'
-            '<testsuites><testsuite name="pytest">'
-            '<testcase file="tests/test_x.py" name="test_by_file">'
-            '<skipped message="s" /></testcase>'
-            '<testcase name="test_bare"><skipped message="s" /></testcase>'
-            '</testsuite></testsuites>\n'
+    def test_both_vectors_share_the_classname_file_name_id_fallback(self, tmp_path: Path):
+        """The vectors are set-differenced against each other downstream, so
+        they must spell an id identically: classname, then file, then name."""
+        ids = self._parse(
+            tmp_path,
+            self._suite(
+                '<testcase file="tests/test_x.py" name="test_by_file">'
+                '<skipped message="s" /></testcase>',
+                '<testcase name="test_bare"><failure message="f" /></testcase>',
+            ),
         )
 
-        assert verify._extract_skipped_test_ids_from_junit(junit_path) == [
-            'test_bare',
-            'tests/test_x.py::test_by_file',
-        ]
+        assert ids == (['test_bare'], ['tests/test_x.py::test_by_file']), ids
 
     def test_duplicate_ids_across_testsuites_are_deduplicated(self, tmp_path: Path):
-        junit_path = tmp_path / 'junit.xml'
-        junit_path.write_text(
+        ids = self._parse(
+            tmp_path,
             '<?xml version="1.0" encoding="utf-8"?>\n'
             '<testsuites>'
             '<testsuite name="pytest"><testcase classname="tests.test_sample" name="test_skip">'
             '<skipped message="x" /></testcase></testsuite>'
             '<testsuite name="pytest-rerun"><testcase classname="tests.test_sample" name="test_skip">'
             '<skipped message="x" /></testcase></testsuite>'
-            '</testsuites>\n'
+            '</testsuites>\n',
         )
 
-        assert verify._extract_skipped_test_ids_from_junit(junit_path) == [
-            'tests.test_sample::test_skip',
-        ]
+        assert ids == ([], ['tests.test_sample::test_skip'])
 
     def test_nonexistent_path_returns_none(self, tmp_path: Path):
-        """No junit collected — the B3 degrade signal, and NOT "nothing was skipped".
+        """No junit collected — the B3 degrade signal, and NOT ``([], [])``,
+        which would license "main ran everything" from a report never written."""
+        assert verify._extract_test_ids_from_junit(tmp_path / 'missing.xml') is None
 
-        Returning ``[]`` here would be the very conflation this task closes, one
-        layer down: it would license the downstream "main ran everything"
-        conclusion from a report that was never written.
-        """
-        assert verify._extract_skipped_test_ids_from_junit(tmp_path / 'missing.xml') is None
-
-    def test_malformed_xml_returns_none(self, tmp_path: Path):
-        junit_path = tmp_path / 'junit.xml'
-        junit_path.write_text('not valid xml <<<')
-
-        assert verify._extract_skipped_test_ids_from_junit(junit_path) is None
-
-    def test_empty_file_returns_none(self, tmp_path: Path):
-        junit_path = tmp_path / 'junit.xml'
-        junit_path.write_text('')
-
-        assert verify._extract_skipped_test_ids_from_junit(junit_path) is None
-
+    @pytest.mark.parametrize('content', ['not valid xml <<<', ''], ids=['malformed', 'empty'])
+    def test_unparseable_report_returns_none(self, tmp_path: Path, content: str):
+        assert self._parse(tmp_path, content) is None
 
 
 # ---------------------------------------------------------------------------
@@ -2175,24 +2174,16 @@ class TestVerifyResultSkippedTestIds:
         assert restored.skipped_test_ids is not None
 
     @pytest.mark.asyncio
-    async def test_run_verification_parses_both_vectors_from_the_same_report(
+    async def test_run_verification_parses_both_vectors_from_one_report(
         self, tmp_path: Path,
     ):
-        """Both vectors reach the result, parsed ONCE each from the SAME report.
+        """Both vectors reach the result from ONE parse of the report.
 
         Drives the real ``run_verification`` seam (nothing executes —
-        ``_run_cmd`` is a spy), rather than asserting on verify.py's source
-        text or AST shape: the invariant is behavioural, and it must survive
-        any refactor that preserves it (extracting the two parses into a
-        shared helper, ``**kwargs`` construction, a different guard spelling).
-
-        ``role='merge'`` plus ``merge_verify_breadth='full'`` is exactly what
-        makes ``junit_path`` non-None, so the seam is reached.  Asserting the
-        two parsers get the SAME path argument is the real same-report
-        invariant a divergent second condition would break: a skipped vector
-        read from a different (or stale) report would silently pair a fresh
-        failing vector with one describing a different run, and every
-        downstream comparison between them would be answering about two runs.
+        ``_run_cmd`` is a spy).  ``role='merge'`` plus
+        ``merge_verify_breadth='full'`` is exactly what makes ``junit_path``
+        non-None, so the seam is reached.  A single parse is what guarantees
+        the two vectors describe the same run.
         """
         worktree = tmp_path / 'merge-wt'
         worktree.mkdir()
@@ -2201,13 +2192,13 @@ class TestVerifyResultSkippedTestIds:
         )
         failing_sentinel = ['sentinel::failing']
         skipped_sentinel = ['sentinel::skipped']
-        failing_parser = MagicMock(return_value=failing_sentinel)
-        skipped_parser = MagicMock(return_value=skipped_sentinel)
+        parser = MagicMock(
+            return_value=verify._JunitTestIds(failing=failing_sentinel, skipped=skipped_sentinel),
+        )
 
         with (
             patch('orchestrator.verify._run_cmd', new=AsyncMock(return_value=(0, '', False))),
-            patch.object(verify, '_extract_failing_test_ids_from_junit', new=failing_parser),
-            patch.object(verify, '_extract_skipped_test_ids_from_junit', new=skipped_parser),
+            patch.object(verify, '_extract_test_ids_from_junit', new=parser),
         ):
             result = await run_verification(
                 worktree=worktree,
@@ -2226,35 +2217,29 @@ class TestVerifyResultSkippedTestIds:
             f'the skipped vector must reach the result; got {result.skipped_test_ids!r}'
         )
 
-        # (b) each parser ran exactly once, against the SAME junit path.
-        assert failing_parser.call_count == 1, failing_parser.call_args_list
-        assert skipped_parser.call_count == 1, skipped_parser.call_args_list
-        assert failing_parser.call_args.args == skipped_parser.call_args.args, (
-            'both vectors must be parsed from ONE report, or they describe two '
-            f'different runs; failing={failing_parser.call_args.args!r} '
-            f'skipped={skipped_parser.call_args.args!r}'
-        )
+        # (b) the report was parsed exactly once.
+        assert parser.call_count == 1, parser.call_args_list
 
     @pytest.mark.asyncio
     async def test_neither_vector_is_parsed_when_the_seam_is_not_reached(
         self, tmp_path: Path,
     ):
-        """(c) role='task' leaves junit_path None: NEITHER parser is called and
-        BOTH fields come back None.  This is what pins that the two vectors
-        share ONE guard rather than merely both existing — a skipped vector
-        wired under its own condition would still be parsed here."""
+        """(c) role='task' leaves junit_path None: the report is not parsed and
+        BOTH fields come back None."""
         worktree = tmp_path / 'task-wt'
         worktree.mkdir()
         config = OrchestratorConfig(
             project_root=tmp_path, merge_verify_breadth='full',
         )
-        failing_parser = MagicMock(return_value=['sentinel::failing'])
-        skipped_parser = MagicMock(return_value=['sentinel::skipped'])
+        parser = MagicMock(
+            return_value=verify._JunitTestIds(
+                failing=['sentinel::failing'], skipped=['sentinel::skipped'],
+            ),
+        )
 
         with (
             patch('orchestrator.verify._run_cmd', new=AsyncMock(return_value=(0, '', False))),
-            patch.object(verify, '_extract_failing_test_ids_from_junit', new=failing_parser),
-            patch.object(verify, '_extract_skipped_test_ids_from_junit', new=skipped_parser),
+            patch.object(verify, '_extract_test_ids_from_junit', new=parser),
         ):
             result = await run_verification(
                 worktree=worktree,
@@ -2264,8 +2249,7 @@ class TestVerifyResultSkippedTestIds:
                 attempt_id=None,
             )
 
-        failing_parser.assert_not_called()
-        skipped_parser.assert_not_called()
+        parser.assert_not_called()
         assert result.failing_test_ids is None, result.failing_test_ids
         assert result.skipped_test_ids is None, result.skipped_test_ids
 

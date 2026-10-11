@@ -1943,9 +1943,9 @@ class TestPreexistingVerdictDowngradedByIsolatedRerun:
 
 class TestMainBaselineSkippedIds:
     """seed_main_baseline's *skipped* side and cached_main_baseline_skipped_ids
-    mirror the failing-side pair, and ONE seed — from the pass path or from a
-    probe — fills BOTH sides, so the two caches never disagree about whether a
-    given sha has a baseline at all."""
+    mirror the failing-side pair.  A skipped entry always describes the same
+    run as the failing entry seeded beside it; a run with no skip evidence
+    leaves the skipped side UNKNOWN (None), never a confident empty set."""
 
     def test_seed_then_cached_round_trips_a_frozenset(self) -> None:
         """seed_main_baseline(sha, ..., skipped=ids) -> cached_main_baseline_skipped_ids(sha)
@@ -2019,13 +2019,12 @@ class TestMainBaselineSkippedIds:
             {'m::skipped', 'm::also_skipped'}
         ), 'the same probe must seed the skipped baseline'
 
-    def test_probe_with_no_skipped_ids_seeds_the_skipped_side_as_empty(
+    def test_probe_with_no_skip_evidence_leaves_the_skipped_side_unknown(
         self, tmp_path: Path,
     ) -> None:
-        """A probe whose skipped_test_ids is None still seeds the skipped side —
-        as EMPTY, not unseeded.  Leaving it unseeded would make the two caches
-        disagree about whether that sha was probed at all, and a cache-only peek
-        would then read "main skipped nothing" as "we never probed main"."""
+        """A probe whose skipped_test_ids is None collected no skip evidence, so
+        the skipped side reads None ("unknown"), NOT frozenset() ("main skipped
+        nothing") — the latter is a claim that run never made."""
         from orchestrator import verify as verify_module
 
         config = _make_config(tmp_path)
@@ -2050,9 +2049,31 @@ class TestMainBaselineSkippedIds:
                 verify_module.main_baseline_failing_ids(config, [], git_ops, MAIN_SHA)
             )
 
-        assert verify_module.cached_main_baseline_skipped_ids(MAIN_SHA) == frozenset(), (
-            'a None skipped_test_ids must seed the skipped side as EMPTY, not leave it unseeded'
+        assert verify_module.cached_main_baseline_failing_ids(MAIN_SHA) == frozenset({'m::fails'})
+        assert verify_module.cached_main_baseline_skipped_ids(MAIN_SHA) is None, (
+            'a None skipped_test_ids is unknown and must not seed a confident empty set'
         )
+
+    def test_omitting_skipped_records_unknown_not_an_empty_set(self) -> None:
+        """A caller that forgets skipped= must not quietly record "main skipped
+        nothing"."""
+        from orchestrator import verify as verify_module
+
+        verify_module.seed_main_baseline(MAIN_SHA, ['t::fails'])
+
+        assert verify_module.cached_main_baseline_skipped_ids(MAIN_SHA) is None
+
+    def test_reseeding_without_skip_evidence_forgets_the_old_skipped_entry(self) -> None:
+        """The skipped entry describes the same run as the failing entry, or is
+        absent: a later seed with no skip evidence must not leave an earlier
+        run's skipped ids paired with its own failing ids."""
+        from orchestrator import verify as verify_module
+
+        verify_module.seed_main_baseline(MAIN_SHA, ['t::old'], skipped=['t::old_skip'])
+        verify_module.seed_main_baseline(MAIN_SHA, ['t::new'], skipped=None)
+
+        assert verify_module.cached_main_baseline_failing_ids(MAIN_SHA) == frozenset({'t::new'})
+        assert verify_module.cached_main_baseline_skipped_ids(MAIN_SHA) is None
 
     def test_degraded_probe_seeds_neither_cache(self, tmp_path: Path) -> None:
         """The B3 degrade (failing_test_ids is None) still caches nothing on
@@ -2108,9 +2129,10 @@ class TestMainBaselineSkippedIds:
 #           Only the first licenses the confident `(False, '')` task-fault
 #           verdict.  This is the exact shape of the 2026-07-29 incident: a
 #           guard that skips on one side of the comparison and is pass-shaped
-#           on the other.  When any unattributable id is present the function
+#           on the other.  When EVERY new id is unattributable the function
 #           must FALL THROUGH to the legacy (category, cause_hint) signature
-#           comparison instead of blaming the branch.
+#           comparison instead of blaming the branch; one id main ran green
+#           is enough to blame it.
 # ---------------------------------------------------------------------------
 
 
@@ -2221,10 +2243,14 @@ class TestIdDiffFastPathSkippedOnMainGuard:
         )
         legacy_probe_mock.assert_not_awaited()
 
-    def test_one_unattributable_id_invalidates_the_whole_diff(self, tmp_path: Path) -> None:
+    def test_an_id_main_ran_green_blames_the_branch_beside_a_skipped_one(
+        self, tmp_path: Path,
+    ) -> None:
         """A branch-failing set MIXING a genuinely-new id with a skipped-on-main
-        id must also fall through: a single unattributable id is enough to
-        invalidate the diff as a basis for the confident verdict."""
+        id is task fault: the id main ran green is positive evidence on its
+        own, and the skipped id cannot cancel it.  The seeded signature verdict
+        says preexisting, so a fall-through would show up as (True, MAIN_SHA).
+        This is the same partition the merge-queue block reason counts by."""
         result, legacy_probe_mock = self._run(
             tmp_path,
             branch_ids=['t::genuinely_new', 't::skipped_on_main'],
@@ -2233,8 +2259,25 @@ class TestIdDiffFastPathSkippedOnMainGuard:
             signature_verdict=True,
         )
 
+        assert result == (False, ''), (
+            f'an id main ran green must blame the branch; got {result!r}'
+        )
+        legacy_probe_mock.assert_not_awaited()
+
+    def test_only_the_new_ids_need_be_skipped_on_main_to_fall_through(
+        self, tmp_path: Path,
+    ) -> None:
+        """An id already red on main is not new; when every NEW id was skipped
+        on main the diff proves nothing and the signature comparison decides."""
+        result, legacy_probe_mock = self._run(
+            tmp_path,
+            branch_ids=['t::red_on_main', 't::skipped_on_main'],
+            main_failing={'t::red_on_main'},
+            main_skipped={'t::skipped_on_main'},
+            signature_verdict=True,
+        )
+
         assert result == (True, MAIN_SHA), (
-            'one unattributable id must invalidate the whole diff and defer to '
-            f'the signature probe; got {result!r}'
+            f'every new id was skipped on main, so the probe must decide; got {result!r}'
         )
         legacy_probe_mock.assert_not_awaited()

@@ -1349,14 +1349,17 @@ from the failing baseline conflates two different worlds:
 - main **ran** it and it passed → the branch broke it (task fault);
 - main **never ran** it → the id diff is evidence of nothing.
 
-When a branch-failing id appears in main's *skipped* baseline,
-`verify.verify_failure_is_preexisting_on_main` no longer returns the
-confident task-fault verdict from the id diff — it logs the unattributable
-ids and falls through to the `(category, cause_hint)` signature comparison.
-A single unattributable id is enough to invalidate the whole diff. The
-merge-queue branch-block reason partitions the same way, so
-"N new failing test(s) not present on main" counts only tests main actually
-ran, and skipped-on-main ids are named under their own clause stating they
+"Skipped" means never executed: an xfail ran, so it is not in that baseline.
+
+`verify.partition_new_failing_ids` splits the new branch-failing ids into
+attributable ones and ones main skipped, and both consumers use it. When
+**every** new id was skipped on main,
+`verify.verify_failure_is_preexisting_on_main` does not return the task-fault
+verdict from the id diff. It logs the ids and falls through to the
+`(category, cause_hint)` signature comparison. A single id that main ran
+green still blames the branch. The merge-queue branch-block reason uses the
+same split: "N new failing test(s) not present on main" counts only tests
+main actually ran, and skipped-on-main ids get their own clause saying they
 are not evidence of a branch fault.
 
 Both refinements are **cache-only** — they never trigger a probe on the
