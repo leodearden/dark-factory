@@ -126,6 +126,18 @@ class TestFoldAgreesWithNormalizeOnCanonicalIds:
         assert fold_project_token(project_id) == folded
 
 
+def _replace_df(aliases) -> None:
+    aliases['df'] = 'other'
+
+
+def _add_entry(aliases) -> None:
+    aliases['new'] = 'other'
+
+
+def _delete_df(aliases) -> None:
+    del aliases['df']
+
+
 class TestProjectIdAliases:
     def test_df_is_dark_factory(self) -> None:
         assert PROJECT_ID_ALIASES['df'] == 'dark_factory'
@@ -140,15 +152,7 @@ class TestProjectIdAliases:
     def test_is_not_a_mutable_mapping(self) -> None:
         assert not isinstance(PROJECT_ID_ALIASES, MutableMapping)
 
-    @pytest.mark.parametrize(
-        'mutate',
-        [
-            lambda aliases: aliases.__setitem__('df', 'other'),
-            lambda aliases: aliases.__setitem__('new', 'other'),
-            lambda aliases: aliases.__delitem__('df'),
-        ],
-        ids=['replace', 'add', 'delete'],
-    )
+    @pytest.mark.parametrize('mutate', [_replace_df, _add_entry, _delete_df])
     def test_refuses_mutation(self, mutate) -> None:
         with pytest.raises(TypeError):
             mutate(PROJECT_ID_ALIASES)
