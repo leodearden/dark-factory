@@ -121,6 +121,42 @@ class TestAssemblePayloadSnapshotStripping:
         )
 
 
+def _buffered_events_block(payload: str) -> str:
+    return payload.split('### Buffered Events', 1)[1].split('### Related Context', 1)[0]
+
+
+class TestAssembledPayloadDisclosesTheTokenBudgetClip:
+    """Events the token budget deferred are named under the Buffered Events block."""
+
+    @pytest.mark.asyncio
+    async def test_deferred_events_render_a_clip_note(self):
+        stage = make_consolidator()
+        stage.assembled_payload = AssembledPayload(events=[], events_remaining=7, token_budget=65_000)
+
+        result = await stage.assemble_payload(
+            events=[], watermark=Watermark(project_id='test_project'), prior_reports=[],
+        )
+
+        [note] = [
+            line for line in _buffered_events_block(result).splitlines() if line.startswith('_NOTE:')
+        ]
+        assert '7 additional buffered event(s)' in note
+        assert 'reconciliation.token_budget=65000 cap' in note
+        assert 'NOT complete this cycle' in note
+        assert 'the newest events (still buffered for a later chunk) were dropped first' in note
+
+    @pytest.mark.asyncio
+    async def test_no_deferred_events_render_no_note(self):
+        stage = make_consolidator()
+        stage.assembled_payload = AssembledPayload(events=[], events_remaining=0, token_budget=65_000)
+
+        result = await stage.assemble_payload(
+            events=[], watermark=Watermark(project_id='test_project'), prior_reports=[],
+        )
+
+        assert '_NOTE:' not in _buffered_events_block(result)
+
+
 class TestRunSurfacesSnapshotStrippedStat:
     """run() copies _entity_summary_snapshot_lines_stripped into report.stats."""
 

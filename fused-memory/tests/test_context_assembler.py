@@ -155,6 +155,20 @@ async def test_budget_stops_accumulation(mock_memory):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('token_budget', [1_450, 65_000])
+async def test_payload_states_the_budget_it_was_assembled_under(mock_memory, token_budget):
+    """Both the budget-stopped path and the all-fit path carry the budget value."""
+    config = _make_config(token_budget=token_budget)
+    assembler = _make_assembler(memory_service=mock_memory, config=config)
+    events = [_make_event(payload={'content_preview': f'content {i}'}) for i in range(10)]
+
+    result = await assembler.assemble(events, _make_watermark(), 'test-project')
+
+    assert result.token_budget == token_budget
+    assert (result.events_remaining > 0) == (token_budget == 1_450)
+
+
+@pytest.mark.asyncio
 async def test_all_events_fit_when_under_budget(mock_memory):
     """When total tokens < budget, all events are included."""
     config = _make_config(token_budget=65_000)
