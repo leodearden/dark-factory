@@ -31,7 +31,14 @@ import yaml
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from legibility import invariants  # noqa: E402
+# Bind `shared` to this checkout, as coder.py::_SHARED_SRC does, so a worktree
+# run validates keys against its own shared.finding_key.
+_SHARED_SRC = Path(__file__).resolve().parents[2] / "shared" / "src"
+if str(_SHARED_SRC) not in sys.path:
+    sys.path.insert(0, str(_SHARED_SRC))
+
+from legibility import finding_area, invariants  # noqa: E402
+from shared.finding_key import KEY_PATTERN  # noqa: E402
 
 logger = logging.getLogger("legibility.codebook")
 
@@ -53,7 +60,7 @@ PHASES = [
     "unknown",
 ]
 
-STATUSES = ["open", "partially", "fixed", "retired", "mined-unverified"]
+STATUSES = ["open", "partially", "fixed", "retired", "mined-unverified", "accepted"]
 
 DISPOSITIONS = ["pending", "promoted", "rejected"]
 
@@ -107,6 +114,33 @@ _SIGHTING_SCHEMA = {
     "required": ["date", "project", "session", "origin_phase", "manifested_phase"],
 }
 
+# Contract finding identity, run history and ticket fields
+# (plans/census-incremental-prd.md C1; docs/quality-findings-contract.md §1, §2, §8).
+_FINDING_KEY_SCHEMA = {"type": "string", "pattern": KEY_PATTERN}
+
+_FINDING_IDENTITY_PROPERTIES = {
+    "finding_key": _FINDING_KEY_SCHEMA,
+    "finding_area": {"type": "string", "pattern": finding_area.AREA_KEY_PATTERN},
+    "finding_anchor": {"type": "string", "minLength": 1},
+    "finding_tags": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+}
+
+_RUN_ID_SCHEMA = {"type": "string", "minLength": 1}
+
+_FILED_TICKET_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "ticket": {"type": ["string", "null"]},
+        "project_root": {"type": "string"},
+        "run_id": _RUN_ID_SCHEMA,
+        "finding_key": _FINDING_KEY_SCHEMA,
+        "task_id": {"type": ["integer", "null"]},
+        "resolution": {"enum": ["created", "combined", "refused", "failed", "existing", None]},
+        "step": {"enum": ["key", "semantic", "curator"]},
+    },
+    "required": ["ticket", "project_root", "run_id", "finding_key", "task_id", "resolution", "step"],
+}
+
 _ENTRY_SCHEMA = {
     "type": "object",
     "properties": {
@@ -117,6 +151,14 @@ _ENTRY_SCHEMA = {
         "origin_phase": {"enum": PHASES},
         "manifested_phase": {"enum": PHASES},
         "sightings": {"type": "array", "items": _SIGHTING_SCHEMA},
+        **_FINDING_IDENTITY_PROPERTIES,
+        "severity_reason": {"type": "string"},
+        "first_seen_run": _RUN_ID_SCHEMA,
+        "last_seen_runs": {"type": "array", "items": _RUN_ID_SCHEMA},
+        "supersedes": {"type": "array", "items": _FINDING_KEY_SCHEMA},
+        "filed_tickets": {"type": "array", "items": _FILED_TICKET_SCHEMA},
+        "fixed_at_sha": {"type": "string", "pattern": r"^[0-9a-f]{7,40}$"},
+        "accepted_by": {"type": "integer"},
     },
     "required": [
         "id",
@@ -137,6 +179,17 @@ _CANDIDATE_SCHEMA = {
         "first_seen": {"type": "string"},
         "disposition": {"enum": DISPOSITIONS},
         "sightings": {"type": "array", "items": _SIGHTING_SCHEMA},
+        **_FINDING_IDENTITY_PROPERTIES,
+        "attached_by": {
+            "type": "object",
+            "properties": {
+                "method": {"enum": ["session", "title", "key", "similarity"]},
+                "score": {"type": "number"},
+                "run_id": _RUN_ID_SCHEMA,
+            },
+            "required": ["method", "run_id"],
+        },
+        "adjudicated_with": {"type": "string", "pattern": _CANDIDATE_ID_RE.pattern},
     },
     "required": ["id", "title", "first_seen", "disposition", "sightings"],
 }
@@ -231,6 +284,8 @@ def _type_matches(value, type_spec) -> bool:
         "object": lambda v: isinstance(v, dict),
         "array": lambda v: isinstance(v, list),
         "string": lambda v: isinstance(v, str),
+        "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+        "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
         "null": lambda v: v is None,
     }
     return any(checks[t](value) for t in types if t in checks)
@@ -239,7 +294,7 @@ def _type_matches(value, type_spec) -> bool:
 def _validate_node(instance, schema: dict, path: list[str]) -> list[str]:
     """Minimal recursive validator for the small JSON-Schema subset this
     module's schemas use (type/properties/required/items/enum/const/
-    minLength).
+    minLength/minItems/pattern).
 
     Not a general-purpose JSON-Schema implementation: the `jsonschema` PyPI
     package is NOT available in this module's actual verify environment
@@ -276,6 +331,16 @@ def _validate_node(instance, schema: dict, path: list[str]) -> list[str]:
         )
         return errors
 
+    pattern = schema.get("pattern")
+    if pattern is not None and isinstance(instance, str) and not re.search(pattern, instance):
+        errors.append(f"{loc}: {instance!r} does not match the pattern {pattern!r}")
+        return errors
+
+    min_items = schema.get("minItems")
+    if min_items is not None and isinstance(instance, list) and len(instance) < min_items:
+        errors.append(f"{loc}: {instance!r} has fewer than the required minItems {min_items}")
+        return errors
+
     if "properties" in schema and isinstance(instance, dict):
         for required in schema.get("required", []):
             if required not in instance:
@@ -301,8 +366,9 @@ def validate(codebook: dict) -> list[str]:
     Returns a list of human-readable error strings; an empty list means the
     codebook is valid. Strict on v2-relevant fields (version, entry
     id/title/severity/status, origin_phase/manifested_phase enums, sighting
-    shape, candidate id regex + disposition); permissive on v1 free-form
-    fields (validate() never rejects on their presence, absence, or type).
+    shape, candidate id regex + disposition, the optional C1 finding fields,
+    accepted ⇒ accepted_by); permissive on v1 free-form fields (validate()
+    never rejects on their presence, absence, or type).
     """
     errors = _schema_errors(codebook, V2_SCHEMA)
 
@@ -319,6 +385,8 @@ def validate(codebook: dict) -> list[str]:
                 errors.append(f"duplicate entry id: {entry_id!r}")
             else:
                 seen_ids.add(entry_id)
+            if entry.get("status") == "accepted" and "accepted_by" not in entry:
+                errors.append(f"entry {entry_id!r}: status 'accepted' requires accepted_by (contract §7)")
 
     candidates = codebook.get("candidates", []) if isinstance(codebook, dict) else []
     if isinstance(candidates, list):
