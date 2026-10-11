@@ -506,18 +506,8 @@ class ReconLedgerStore:
         return [_record_from_row(row) for row in rows]
 
     async def list_suppressions(self, project_id: str) -> list[ReconLedgerRecord]:
-        """Return the active ``stage1_flag_suppression`` rows for a project.
-
-        Satisfied by the ``(project_id, record_kind, state)`` index.
-        """
-        rows = await self._require_access().read_all(
-            """
-            SELECT * FROM recon_ledger
-            WHERE project_id = ? AND record_kind = 'stage1_flag_suppression' AND state = 'active'
-            """,
-            (project_id,),
-        )
-        return [_record_from_row(row) for row in rows]
+        """Return the active ``stage1_flag_suppression`` rows for a project."""
+        return await self.list_by_kind(project_id, 'stage1_flag_suppression', 'active')
 
     async def is_suppressed(self, project_id: str, task_id: str, flag_type: str) -> bool:
         """Return True if ``task_id``/``flag_type`` is actively suppressed.

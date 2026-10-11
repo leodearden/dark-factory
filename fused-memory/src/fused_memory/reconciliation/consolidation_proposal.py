@@ -2,7 +2,10 @@
 
 Recon Stage 1 emits a proposal through ``server/tools.py::propose_consolidation``
 and the auto-consolidation executor reads it back. Both go through this module,
-so the row's identity, payload keys and states have one home.
+so the row's identity, payload keys and states have one home: the executor
+lists rows with ``ReconLedgerStore.list_by_kind(project_id,
+RECORD_KIND_CONSOLIDATION_PROPOSAL, ProposalState.PROPOSED)`` and decodes each
+with :func:`from_ledger_record`, rather than growing a second reader.
 
 Clock-injected like :mod:`fused_memory.reconciliation.recon_ledger`: the
 builder takes ``now`` rather than reading a clock. ``rationale`` and
