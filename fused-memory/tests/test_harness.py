@@ -13563,6 +13563,32 @@ async def test_project_loop_pre_completion_timeout_restores_only_the_timed_out_r
 
 
 @pytest.mark.asyncio
+async def test_project_loop_full_cycle_raising_before_its_run_row_restores_its_events(
+    journal, event_buffer, mock_memory_service, tmp_path,
+):
+    """Task 6453: run_full_cycle raising after its drain but before its own
+    failure arms (journal.start_run) leaves no run row to fail; the loop's
+    bounded call still re-buffers that run's events, and only those."""
+    harness, _ = _make_completing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    await event_buffer.push(_make_event())
+    await event_buffer.push(_make_event())
+    run_a = await harness.run_full_cycle('test-project', 'seed')
+    assert run_a.status == RunStatus.completed
+
+    _fail_first_call(journal, 'start_run', lambda: RuntimeError('start_run exploded'))
+    await event_buffer.push(_make_event())
+    await event_buffer.push(_make_event())
+
+    await _drive_one_project_loop_cycle(harness)
+
+    assert len(await event_buffer.get_drained_events('test-project', run_a.id)) == 2
+    assert await event_buffer.count_buffered('test-project') == 2
+    assert [r.id for r in await journal.get_recent_runs('test-project')] == [run_a.id]
+
+
+@pytest.mark.asyncio
 async def test_project_loop_replays_before_releasing_lock_on_halt(
     journal, event_buffer, mock_memory_service
 ):
@@ -21014,18 +21040,15 @@ async def test_run_full_cycle_attributes_drained_events_to_run_id(
     # the next scenario starts from an empty 'buffered' set.
     await event_buffer.drain('test-project')
 
-    # (b) Iterator-fed path: events pre-drained by the caller (mirroring
-    # BacklogIterator.run's drain_by_ids call, which drains BEFORE
-    # run_full_cycle mints a run_id) must be attributed via
-    # buffer.mark_drained_run_id(project_id, event_ids, run_id).
+    # (b) Iterator-fed path: events pre-drained by the caller must be
+    # attributed via buffer.mark_drained_run_id(project_id, event_ids, run_id).
     original_mark = event_buffer.mark_drained_run_id
     harness.buffer.mark_drained_run_id = AsyncMock(side_effect=original_mark)
 
     pre_drained = [_make_event(), _make_event()]
     for e in pre_drained:
         await event_buffer.push(e)
-    # Pre-drain with no run_id, exactly like drain_by_ids leaves them before
-    # run_full_cycle has a run_id to attribute them with.
+    # Pre-drain with no run_id, so only run_full_cycle can attribute them.
     await event_buffer.drain('test-project')
 
     run_b = await harness.run_full_cycle(
