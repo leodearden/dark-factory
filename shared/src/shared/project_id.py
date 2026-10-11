@@ -33,7 +33,14 @@ def normalize_project_id(raw: str) -> str:
 
 
 def project_id_for_root(root: str | os.PathLike[str]) -> str:
-    return normalize_project_id(PurePath(os.fspath(root)).name)
+    """normalize_project_id of the root's basename; ValueError when no basename names it."""
+    basename = PurePath(os.fspath(root)).name
+    if basename in ('', '..'):
+        raise ValueError(
+            f'project root {os.fspath(root)!r} has no basename naming a directory, so no '
+            f'project id derives from it; pass the resolved project root'
+        )
+    return normalize_project_id(basename)
 
 
 def fold_project_token(value: object) -> str:

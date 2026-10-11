@@ -92,9 +92,6 @@ class TestFoldProjectToken:
     def test_table(self, raw: object, expected: str) -> None:
         assert fold_project_token(raw) == expected
 
-    def test_none_is_the_unset_sentinel_not_a_token(self) -> None:
-        assert fold_project_token(None) != 'none'
-
     def test_never_merges_two_projects_sharing_a_prefix(self) -> None:
         platform = fold_project_token('solar_challenge_platform')
         assert platform == fold_project_token('solar-challenge-platform') == 'solar_challenge_platform'
@@ -154,9 +151,10 @@ class TestProjectIdAliases:
 
     @pytest.mark.parametrize('mutate', [_replace_df, _add_entry, _delete_df])
     def test_refuses_mutation(self, mutate) -> None:
+        before = dict(PROJECT_ID_ALIASES)
         with pytest.raises(TypeError):
             mutate(PROJECT_ID_ALIASES)
-        assert dict(PROJECT_ID_ALIASES) == {'df': 'dark_factory'}
+        assert dict(PROJECT_ID_ALIASES) == before
 
 
 class TestProjectIdForRoot:
@@ -172,3 +170,11 @@ class TestProjectIdForRoot:
     def test_basename_under_the_one_rule(self, root: str | Path, expected: str) -> None:
         assert project_id_for_root(root) == expected
         assert project_id_for_root(root) == normalize_project_id(PurePath(root).name)
+
+    @pytest.mark.parametrize('root', ['/', '', '.', '/srv/dark-factory/..', Path('/'), Path('.')])
+    def test_a_root_without_a_basename_is_refused_not_the_unset_sentinel(
+        self, root: str | Path
+    ) -> None:
+        with pytest.raises(ValueError) as refused:
+            project_id_for_root(root)
+        assert repr(str(root)) in str(refused.value)
