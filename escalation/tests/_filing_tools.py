@@ -1,18 +1,12 @@
 """The two-line dance every test that files an escalation has to repeat.
 
-``escalate_blocker`` and ``escalate_info`` are async FastMCP tools, so calling
-one means ``await server.get_tool(name)`` and then ``await tool.fn(**kwargs)``.
-That pair was copied verbatim into a THIRD test module before this one existed
+``escalate_blocker``, ``escalate_info`` and ``promote_to_l2`` are async FastMCP
+tools, so calling one means ``await server.get_tool(name)`` and then
+``await tool.fn(**kwargs)``.  That pair was copied verbatim into a THIRD test
+module before this one existed
 (``test_server_chokepoint.py`` and ``test_observed_submit_response.py`` each
 carried its own identical copy) — the point at which a copy stops being cheaper
 than a name.
-
-``promote_to_l2`` shares the same async call shape, and had already been copied
-privately three times when task 5222 needed it once more
-(``test_server.py::_promote_to_l2``,
-``test_write_path_scans_off_loop.py::_promote`` and
-``test_server_eval_lane.py::_promote``), so a fourth copy would have crossed
-this module's own third-copy rule; ``call_promote`` is its shared name.
 
 A uniquely-named sibling support module rather than a ``conftest.py`` fixture,
 matching ``_escalation_http.py``: these are plain callables with no setup or
