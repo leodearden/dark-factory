@@ -17,6 +17,7 @@ Kept separate from ``test_verify_agent_failure.py`` — that file is task 4343's
 failure-token census guard, and each file here pins ONE contract.
 """
 
+import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -25,7 +26,9 @@ from _git_root_helper import make_git_root
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import VerificationVerdict
+from fused_memory.reconciliation import verify
 from fused_memory.reconciliation.verify import CodebaseVerifier
+from fused_memory.utils.clip_disclosure import TRUNCATED_KEY, elision_marker
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -241,6 +244,56 @@ async def test_subprocess_tools_run_in_the_per_call_root(tmp_path):
         search_path = Path(mock_exec.call_args.args[-1])
         assert search_path.is_relative_to(root_a.resolve()), search_path
         assert not search_path.is_relative_to(decoy.resolve()), search_path
+
+
+def _git(root: Path, *args: str) -> str:
+    return subprocess.run(
+        ['git', '-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false',
+         '-c', 'core.hooksPath=/dev/null', *args],
+        cwd=root, check=True, capture_output=True, text=True,
+    ).stdout
+
+
+def _commit(root: Path, filename: str, message: str) -> str:
+    (root / filename).write_text(f'{filename}\n')
+    _git(root, 'add', filename)
+    _git(root, 'commit', '-q', '-m', message)
+    return _git(root, 'rev-parse', 'HEAD').strip()
+
+
+@pytest.mark.asyncio
+async def test_git_show_discloses_a_clipped_stat_view(tmp_path):
+    """A clipped ``git show`` says so, and by how much, like read_file and glob_search do."""
+    root = tmp_path / 'repo'
+    root.mkdir()
+    _git(root, 'init', '-q')
+    small_sha = _commit(root, 'small.txt', 'small commit')
+    big_sha = _commit(root, 'big.txt', 'big commit\n\n' + 'word ' * (verify._GIT_SHOW_CHARS // 5 + 200))
+
+    patcher, mock_cls, _instance = _mock_agent_loop()
+    try:
+        await CodebaseVerifier(_config()).verify(claim='Task X completed', codebase_root=root)
+    finally:
+        patcher.stop()
+    git_show = mock_cls.call_args.kwargs['tools']['git_show'].function
+
+    cap = verify._GIT_SHOW_CHARS
+    full_big = _git(root, 'show', '--stat', big_sha)
+    elided = len(full_big) - cap
+    assert elided > 0
+
+    big = await git_show(commit=big_sha)
+    assert big['output'] == full_big[:cap] + elision_marker(elided)
+    assert big[TRUNCATED_KEY] == [{'field': 'output', 'cap': cap, 'elided': elided}]
+
+    small = await git_show(commit=small_sha)
+    assert small['output'] == _git(root, 'show', '--stat', small_sha)
+    assert TRUNCATED_KEY not in small
+
+
+def test_git_show_cap_clears_the_measured_ordinary_commit_worst_case():
+    """10789 chars was the largest ordinary ``git show --stat`` measured on 2026-09-14."""
+    assert verify._GIT_SHOW_CHARS >= 11000
 
 
 @pytest.mark.asyncio
