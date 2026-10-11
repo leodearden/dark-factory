@@ -45,6 +45,8 @@ for _src in (_REPO_ROOT / 'shared' / 'src', _REPO_ROOT / 'fused-memory' / 'src')
     if str(_src) not in sys.path:
         sys.path.insert(0, str(_src))
 
+# A stdlib-only module under empty package __init__s, so the scripts env can import it.
+from fused_memory.mcp_tools.scheduler_state import read_scheduler_state  # noqa: E402
 from shared.task_claimant import (  # noqa: E402
     DEFAULT_CLAIMANT_HEARTBEAT_TTL,
     is_stale_hygiene_tier_claimant,
@@ -218,6 +220,14 @@ async def _clear_claimant(client: ToolClient, project_root: str, violation: Viol
     return write_failure_reason(reply)
 
 
+def holder_task_ids(project_root: str) -> frozenset[str]:
+    state = read_scheduler_state(Path(project_root))
+    holders = state.get('current_holders') if isinstance(state, Mapping) else None
+    if not isinstance(holders, Mapping):
+        return frozenset()
+    return frozenset(str(task_id) for task_id in holders.values())
+
+
 def observed_delta(
     violation: Violation, live: Mapping[str, Any] | None, now: datetime,
 ) -> dict[str, tuple[Any, Any]] | None:
@@ -291,6 +301,17 @@ async def apply_repairs(
         raise ValueError('apply_repairs writes through an MCP client; none was given')
     root = census.project_root
     selected = tuple(v for v in census.violations if v.tier in tiers)
+    holders = holder_task_ids(root)
+    held = tuple(sorted(v.task_id for v in selected if str(v.task_id) in holders))
+    if held:
+        return ApplyReport(
+            project_root=root,
+            tiers=_ordered(tiers),
+            refused=True,
+            holder_intersection=held,
+            outcomes=(),
+            verification_census=None,
+        )
     with closing(connect_ro(tasks_db_path(root))) as conn:
         attempts = {
             violation.key: await _attempt_repair(client, conn, root, violation, clock())
