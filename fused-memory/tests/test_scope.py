@@ -1,10 +1,12 @@
 """Tests for resolve_project_id() — converts filesystem project_root to logical project_id."""
 
 import logging
+import os
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
+from shared.project_layout import known_project_roots
 
 from fused_memory.models.scope import (
     KNOWN_PROJECT_ROOTS_ENV,
@@ -282,6 +284,19 @@ class TestKnownProjectRootsFromEnv:
     def test_custom_env_var(self, monkeypatch):
         monkeypatch.setenv('SOME_OTHER_VAR', '/x,/y')
         assert known_project_roots_from_env('SOME_OTHER_VAR') == ['/x', '/y']
+
+    def test_agrees_with_the_shared_parser_on_unnormalised_entries(self, monkeypatch):
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, ' /a/b/ ,,//c//d/,/e ')
+        assert known_project_roots_from_env() == [
+            str(root) for root in known_project_roots(os.environ)
+        ]
+
+    def test_a_custom_env_var_agrees_with_the_shared_parser(self, monkeypatch):
+        value = ' /a/b/ ,,//c//d/,/e '
+        monkeypatch.setenv('SOME_OTHER_VAR', value)
+        assert known_project_roots_from_env('SOME_OTHER_VAR') == [
+            str(root) for root in known_project_roots({KNOWN_PROJECT_ROOTS_ENV: value})
+        ]
 
 
 class TestIsPhantomProjectRoot:
