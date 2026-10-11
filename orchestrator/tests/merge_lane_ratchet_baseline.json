@@ -1083,6 +1083,7 @@
     "orchestrator/tests/test_ephemeral_worktree.py": {"patch_targets": [], "private_reads": 3},
     "orchestrator/tests/test_eval_mcp_isolation.py": {"patch_targets": [], "private_reads": 1},
     "orchestrator/tests/test_git_ops.py": {"patch_targets": [], "private_reads": 110},
+    "orchestrator/tests/test_git_ops_citation_pattern.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_git_ops_no_op_landing.py": {"patch_targets": [], "private_reads": 1},
     "orchestrator/tests/test_git_ops_rebased_citation.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_git_ops_train_solo.py": {"patch_targets": [], "private_reads": 0},
