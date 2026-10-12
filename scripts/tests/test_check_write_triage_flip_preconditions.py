@@ -49,6 +49,8 @@ _GATE_SCRIPT = _REPO_ROOT / 'scripts' / 'check_write_triage_flip_preconditions.s
 _PROBE = _REPO_ROOT / 'scripts' / 'check_write_triage_attach_target.py'
 #: Item 5's probe: does anything downstream CONSUME the binding item 1 asserts?
 _PROBE5 = _REPO_ROOT / 'scripts' / 'check_write_triage_attach_consumption.py'
+#: The plumbing both probes import as a flat sibling.
+_PROBE_COMMON = _REPO_ROOT / 'scripts' / '_write_triage_probe_common.py'
 
 # The probe's stable stdout vocabulary. Kept as named constants so the tests
 # and the probe cannot drift apart silently, and so it is obvious at a glance
@@ -1696,9 +1698,9 @@ def _make_gate_repo(
     """A throwaway git repo the gate script can be run from.
 
     The script derives ``REPO`` from ``BASH_SOURCE/..`` with no env override,
-    so BOTH scripts are copied into ``<repo>/scripts/`` — that is what makes
-    the fixture repo, rather than the real checkout, the thing item 1's
-    ``git archive`` reads.
+    so the gate, both probes and their shared helper are copied into
+    ``<repo>/scripts/`` — that is what makes the fixture repo, rather than the
+    real checkout, the thing item 1's ``git archive`` reads.
 
     ``triage`` selects the ``write_triage`` stand-in item 5's probe executes.
     It defaults to ``'band_top1'`` — main's shape, where the attach lands on
@@ -1721,7 +1723,7 @@ def _make_gate_repo(
     )
     repo = tmp_path / repo_name
     (repo / 'scripts').mkdir(parents=True)
-    for script in (_GATE_SCRIPT, _PROBE, _PROBE5):
+    for script in (_GATE_SCRIPT, _PROBE, _PROBE5, _PROBE_COMMON):
         dest = repo / 'scripts' / script.name
         dest.write_bytes(script.read_bytes())
         dest.chmod(0o755)
@@ -2916,6 +2918,20 @@ class TestARcOneWithoutAVerdictIsUnverifiable:
         assert 'NOT consumed by the attach' not in proc.stdout, proc.stdout
         assert _CRASH_BEFORE_REPORT in proc.stdout, proc.stdout
         assert 'PASS  item 1' in proc.stdout, proc.stdout
+
+    def test_a_missing_probe_helper_fails_item_1_unverifiable(self, tmp_path):
+        """The real carrier, end to end: the helper is gone from the tree.
+
+        The gate runs the probes from the WORKING TREE, so unlinking the file
+        is enough; no commit is needed.
+        """
+        repo = self._repo(tmp_path)
+        (repo / 'scripts' / _PROBE_COMMON.name).unlink()
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert 'FAIL  item 1  UNVERIFIABLE' in proc.stdout, proc.stdout
+        assert _PROBE_COMMON.stem in proc.stdout, proc.stdout
+        assert 'FAIL  item 1  the judge path does NOT bind' not in proc.stdout, proc.stdout
 
     def test_a_real_not_held_verdict_still_reads_as_one(self, tmp_path):
         """The control: the new arm must not swallow a verdict the probe made."""
