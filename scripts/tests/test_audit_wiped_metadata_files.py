@@ -32,6 +32,7 @@ from audit_wiped_metadata_files import (
     CLEAN_MERGE_SHA,
     CONFIRMED_NULL_SHA_DONE_PATH,
     CONTRADICTED_REAL_MERGE_SHA,
+    EVENT_LOG_ABSENT,
     FIDELITY_FILE_LEVEL,
     FIDELITY_LOCK_LEVEL,
     NO_MERGE_EVENT,
@@ -52,6 +53,8 @@ from audit_wiped_metadata_files import (
     load_task_records,
     merge_plan_file_sources,
 )
+
+from shared import project_layout
 
 # ---------------------------------------------------------------------------
 # Temp-DB fixture builders.
@@ -1060,17 +1063,41 @@ def test_audit_project_coverage_tiers_partition_tasks_even_across_tags(tmp_path,
     ] == [("master", 42)]
 
 
-def test_audit_project_degrades_to_no_merge_event_without_a_runs_db(tmp_path, make_tasks_db):
-    """A project with no runs.db still audits; every signature is UNKNOWN."""
+def test_audit_project_without_a_runs_db_records_the_event_log_absent(tmp_path, make_tasks_db):
+    """A project with no runs.db still audits, but claims nothing about merges.
+
+    NO_MERGE_EVENT asserts a READ log holds no merge_finalized for the task;
+    with no log there was nothing to read, so every signature is
+    EVENT_LOG_ABSENT and the coverage says the log was absent (INV-13).
+    """
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[{"id": 1, "metadata": {"files": []}}, {"id": 2, "metadata": {"files": []}}],
+        plans=[
+            ("1", {"task_id": 1, "files": ["a.py"]}),
+            ("2", {"task_id": 2, "files": ["b.py"]}),
+        ],
+    )
+    project_layout.runs_db(root).unlink()
+
+    audit = audit_project(str(root))
+
+    assert audit.coverage.event_log_present is False
+    assert [c.wipe_signature for c in audit.candidates] == [EVENT_LOG_ABSENT, EVENT_LOG_ABSENT]
+
+
+def test_audit_project_with_a_runs_db_lacking_the_tasks_merge_reports_no_merge_event(
+    tmp_path, make_tasks_db
+):
     root = _make_project(
         tmp_path, make_tasks_db,
         tasks=[{"id": 1, "metadata": {"files": []}}],
         plans=[("1", {"task_id": 1, "files": ["a.py"]})],
     )
-    (root / "data" / "orchestrator" / "runs.db").unlink()
 
     audit = audit_project(str(root))
 
+    assert audit.coverage.event_log_present is True
     assert [c.wipe_signature for c in audit.candidates] == [NO_MERGE_EVENT]
 
 
@@ -1114,6 +1141,7 @@ def _coverage(root="/tmp/proj", **overrides):
         "tasks_with_lock_level_signal_only": 400,
         "tasks_without_plan_signal": 2049,
         "plan_records_without_task": 2,
+        "event_log_present": True,
     }
     fields.update(overrides)
     return AuditCoverage(**fields)
@@ -1198,13 +1226,25 @@ def test_format_report_renders_every_coverage_line_verbatim():
     ]
     start = lines.index(caveat[0])
     assert lines[start:start + 3] == caveat
-    assert lines[start + 3:start + 8] == [
+    assert lines[start + 3:start + 9] == [
         "    total tasks scanned:                8123",
         "    with a file-level plan signal:      415",
         "    with only a lock-level signal:      662",
         "    with NO plan signal at all:         1990",
         "    plan records with no such task:     37",
+        "    event log (runs.db):                present",
     ]
+
+
+def test_format_report_renders_an_absent_event_log_row_verbatim():
+    report = format_report([_audit([], event_log_present=False)])
+    lines = report.splitlines()
+
+    start = lines.index("    plan records with no such task:     2")
+    assert lines[start + 1] == (
+        "    event log (runs.db):                ABSENT at /tmp/proj/data/orchestrator/runs.db"
+        " — wipe signatures unknown (event_log_absent)"
+    )
 
 
 def test_format_report_marks_lock_level_candidates_with_an_explicit_caveat():
@@ -1520,20 +1560,28 @@ def test_main_exits_3_when_every_resolved_project_was_unreadable(tmp_path, make_
 
 
 def test_main_audits_a_project_whose_runs_db_is_missing(tmp_path, make_tasks_db):
-    """(f) a readable tasks.db with no runs.db still audits, degrading every
-    signature to NO_MERGE_EVENT rather than crashing."""
+    """(f) a readable tasks.db with no runs.db still audits, and says the event
+    log was ABSENT instead of reporting every task NO_MERGE_EVENT (INV-13)."""
     root = _make_project(
         tmp_path, make_tasks_db,
         tasks=[{"id": 3, "metadata": {"files": []}}],
         plans=[("3", {"task_id": 3, "files": ["a.py"]})],
     )
-    (root / "data" / "orchestrator" / "runs.db").unlink()
+    project_layout.runs_db(root).unlink()
 
-    result = _run_cli("--project-root", str(root), "--json")
+    as_json = _run_cli("--project-root", str(root), "--json")
+    as_text = _run_cli("--project-root", str(root))
 
-    assert result.returncode == 1
-    payload = json.loads(result.stdout)
-    assert payload["projects"][0]["candidates"][0]["wipe_signature"] == NO_MERGE_EVENT
+    assert as_json.returncode == 1
+    project = json.loads(as_json.stdout)["projects"][0]
+    assert project["coverage"]["event_log_present"] is False
+    assert project["candidates"][0]["wipe_signature"] == "event_log_absent"
+    assert as_text.returncode == 1
+    assert (
+        f"    {'event log (runs.db):':<36}ABSENT at {project_layout.runs_db(root)}"
+        " — wipe signatures unknown (event_log_absent)"
+    ) in as_text.stdout.splitlines()
+    assert "no_merge_event" not in as_text.stdout
 
 
 def test_main_min_fidelity_defaults_to_file_level(tmp_path, make_tasks_db):
