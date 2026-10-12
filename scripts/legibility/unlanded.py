@@ -23,6 +23,7 @@ Nothing expires a quarantine; the operator removes one after recovering it.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -33,15 +34,13 @@ from pathlib import Path
 
 from legibility import trickle_state
 
-_LOCK_ERROR_PATTERNS: tuple[str, ...] = (
-    'cannot lock ref',
-    'index.lock',
-    'another git process',
-    'unable to create',
+_LOCK_CONTENTION = re.compile(
+    r"^(?:fatal|error): (?:cannot lock ref\b|unable to create '[^'\n]*\.lock')",
+    re.IGNORECASE | re.MULTILINE,
 )
-"""Case-insensitive git stderr substrings of a transient ref/index-lock
-contention (the merge worker or a hook holding the lock in the shared main
-checkout): retried. Any other failure (e.g. "nothing to commit") is final."""
+"""git's own report of a transient ref/index-lock contention (the merge worker
+or a hook holding the lock in the shared main checkout): retried. Anything
+else, such as a hook refusal, is final: a retry re-runs the whole hook."""
 
 COMMIT_ATTEMPTS = 5
 COMMIT_BACKOFF_SECONDS = 0.2
@@ -130,13 +129,14 @@ def _commit_once(run: _Runner, git: list[str], paths: list[str], message: str) -
 
 
 def _diagnostic(completed: subprocess.CompletedProcess[str]) -> str:
-    """git's stderr, or its stdout where it says why there (a no-op commit)."""
-    return (completed.stderr or completed.stdout or '').strip()
+    """Both of git's streams: hook output arrives on stderr, while git's own
+    verdict on a no-op commit arrives on stdout."""
+    streams = (completed.stderr, completed.stdout)
+    return '\n'.join(text.strip() for text in streams if text and text.strip())
 
 
 def _is_lock_contention(diagnostic: str) -> bool:
-    lowered = diagnostic.lower()
-    return any(pattern in lowered for pattern in _LOCK_ERROR_PATTERNS)
+    return _LOCK_CONTENTION.search(diagnostic) is not None
 
 
 def quarantine_root(project_id: str) -> Path:

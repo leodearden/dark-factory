@@ -395,12 +395,7 @@ def test_commit_only_reports_git_that_cannot_be_launched(tmp_path):
 
 def test_commit_only_reports_a_refusing_pre_commit_hook_without_retrying(tmp_path):
     repo = _repo(tmp_path)
-    hooks = tmp_path / 'hooks'
-    hooks.mkdir()
-    hook = hooks / 'pre-commit'
-    hook.write_text('#!/bin/sh\necho "cited-test-path gate: refused"\nexit 1\n')
-    hook.chmod(0o755)
-    _git(repo, 'config', 'core.hooksPath', str(hooks))
+    _install_pre_commit_hook(tmp_path, repo, 'echo "cited-test-path gate: refused"\nexit 1')
     (repo / _CODEBOOK).write_bytes(_REFUSED)
     head = _git(repo, 'rev-parse', 'HEAD')
 
@@ -409,6 +404,46 @@ def test_commit_only_reports_a_refusing_pre_commit_hook_without_retrying(tmp_pat
     assert (result.ok, result.attempts) == (False, 1)
     assert 'cited-test-path gate' in result.stderr
     assert _git(repo, 'rev-parse', 'HEAD') == head
+
+
+def _install_pre_commit_hook(tmp_path: Path, repo: Path, script: str) -> None:
+    hooks = tmp_path / 'hooks'
+    hooks.mkdir()
+    hook = hooks / 'pre-commit'
+    hook.write_text(f'#!/bin/sh\n{script}\n')
+    hook.chmod(0o755)
+    _git(repo, 'config', 'core.hooksPath', str(hooks))
+
+
+def test_commit_only_reports_both_streams_of_a_failed_commit(tmp_path):
+    """git routes hook output to stderr and its own no-op verdict to stdout; the
+    diagnostic an operator is escalated must carry both."""
+    repo = _repo(tmp_path)
+    _install_pre_commit_hook(tmp_path, repo, 'echo "pyright: 3 warnings" >&2\nexit 0')
+
+    result = unlanded.commit_only(repo, [_CODEBOOK], 'legibility: no-op', sleep=_no_sleep)
+
+    assert (result.ok, result.attempts) == (False, 1)
+    assert 'pyright: 3 warnings' in result.stderr
+    assert 'nothing to commit' in result.stderr
+
+
+def test_commit_only_does_not_retry_a_hook_refusal_that_mentions_creating(tmp_path):
+    """Only git's own lock failure is contention. A hook refusal is final even
+    when its text happens to say "unable to create": every retry re-runs the
+    whole hook."""
+    repo = _repo(tmp_path)
+    _install_pre_commit_hook(
+        tmp_path, repo, 'echo "error: unable to create the coverage report"\nexit 1',
+    )
+    (repo / _CODEBOOK).write_bytes(_REFUSED)
+    backoffs: list[float] = []
+
+    result = unlanded.commit_only(repo, [_CODEBOOK], 'msg', sleep=backoffs.append)
+
+    assert (result.ok, result.attempts) == (False, 1)
+    assert backoffs == []
+    assert 'unable to create the coverage report' in result.stderr
 
 
 @pytest.mark.parametrize('field', ['ok', 'sha', 'stderr', 'attempts'])
