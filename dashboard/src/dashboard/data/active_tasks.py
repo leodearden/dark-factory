@@ -728,8 +728,9 @@ async def _shape_one_project(
     3. ``fetch_task_page(statuses=sorted(_TERMINAL_STATUSES), page_size=...,
        offset=...)``
        — a bounded window of terminal rows, issued ONLY when a terminal cap is
-       actually requested.  ``collect_active_tasks``'s scheduler path passes
-       both caps as 0 and therefore transfers no terminal row at all.
+       actually requested.  The scheduler path
+       (``scheduler.collect_scheduler_state``) leaves both caps at 0 and
+       therefore transfers no terminal row at all.
 
     The only component that still grows with the tree is the ~15 B/task status
     map, not the ~10 KB/task rows.
@@ -1083,7 +1084,7 @@ async def collect_tasks_with_counts(
     ``fetch_external_statuses`` call (skipped when the union is empty), and
     overwrites each entry's status.  Deps absent from the map keep the honest
     ``'unknown'`` sentinel.  Defaults to ``False`` so the scheduler-page path
-    (``collect_active_tasks``) issues no extra MCP round-trip.
+    (``scheduler.collect_scheduler_state``) issues no extra MCP round-trip.
 
     That call runs AFTER the per-project walk and is inside the same deadline:
     it is both CHECKED (skipped outright once the budget is spent) and BOUNDED
@@ -1359,7 +1360,7 @@ async def collect_active_tasks(
 
     When *max_done_per_project* > 0, the most-recent N done tasks per project
     are appended to the returned list (each with a ``completed`` field).
-    Default 0 leaves the return shape unchanged — scheduler.py is unaffected.
+    Default 0 leaves the return shape unchanged.
 
     *now* is forwarded to ``collect_tasks_with_counts`` so every row's
     ``started`` derives from a single shared instant; see that function's

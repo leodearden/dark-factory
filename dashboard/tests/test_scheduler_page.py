@@ -375,9 +375,9 @@ async def test_collect_scheduler_state_happy_path(dummy_client, dummy_config):
 
     Patches:
       - mcp_tool_call → returns snapshot then events list
-      - collect_active_tasks → returns one synthetic in-progress task
-    Asserts the 5-tuple (rows, modules, pin_queue, events_by_task, offline_projects)
-    has the right shapes and a couple of joined field values.
+      - collect_tasks_with_counts → returns one synthetic in-progress task
+    Asserts rows, modules, pin_queue, events_by_task and offline_projects
+    have the right shapes and a couple of joined field values.
     """
     from unittest.mock import AsyncMock, patch
 

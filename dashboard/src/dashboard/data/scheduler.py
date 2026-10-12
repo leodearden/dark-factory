@@ -482,7 +482,7 @@ def _compose_rows(
 
     Each active task in *active_tasks* must carry a ``task_id`` field (the raw
     numeric string used as key in the snapshot dicts).  The ``started`` field is
-    the task age in minutes (from ``collect_active_tasks``).
+    the task age in minutes (from ``collect_tasks_with_counts``).
 
     The row's ``lock_set`` is the task's footprint **normalized to module locks**
     at *depth* (the scheduler's ``lock_depth``) via ``files_to_modules`` — so the
