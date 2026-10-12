@@ -539,3 +539,58 @@ class TestStructuredContentPreference:
         value, err = parse_tool_result(env, "k", str)
         assert err is None
         assert value == "from-text"
+
+
+# ---------------------------------------------------------------------------
+# write_failure_reason — the one write-success predicate
+# ---------------------------------------------------------------------------
+
+_WRITE_REPLIES = [
+    (None, True),
+    ("ok", True),
+    ([], True),
+    (42, True),
+    ({}, True),
+    ({"success": False}, True),
+    ({"success": None}, True),
+    ({"success": 0}, True),
+    ({"error": "lock_charter_error"}, True),
+    ({"error": "x", "error_type": "ReconciliationBacklogExceeded"}, True),
+    ({"success": False, "error": "status_via_update_task", "task_id": "1"}, True),
+    ({"success": True, "error": "boom"}, True),
+    ({"success": True}, False),
+    ({"id": "1.1", "title": "t"}, False),
+    ({"success": True, "error": None}, False),
+    ({"success": True, "error": ""}, False),
+]
+
+
+class TestWriteFailureReason:
+    @pytest.fixture
+    def write_failure_reason(self):
+        from shared.mcp_envelope import write_failure_reason
+
+        return write_failure_reason
+
+    @pytest.mark.parametrize("reply,is_failure", _WRITE_REPLIES, ids=repr)
+    def test_truth_table(self, write_failure_reason, reply, is_failure):
+        reason = write_failure_reason(reply)
+        assert (reason is not None) == is_failure
+        if is_failure:
+            assert isinstance(reason, str) and reason
+
+    def test_error_reason_names_the_error_type_and_text(self, write_failure_reason):
+        reason = write_failure_reason(
+            {"error": "backlog is 900 deep", "error_type": "ReconciliationBacklogExceeded"}
+        )
+        assert "ReconciliationBacklogExceeded" in reason
+        assert "backlog is 900 deep" in reason
+
+    @pytest.mark.parametrize("reply", [None, "ok", [], 42], ids=repr)
+    def test_non_dict_reason_names_the_type(self, write_failure_reason, reply):
+        assert type(reply).__name__ in write_failure_reason(reply)
+
+    def test_empty_reply_is_never_success(self, write_failure_reason):
+        reason = write_failure_reason({})
+        assert reason is not None
+        assert "no positive write signal" in reason
