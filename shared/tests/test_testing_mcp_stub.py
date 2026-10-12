@@ -212,3 +212,10 @@ class TestFailureAnswers:
         resp, _ = self._call(stateful, StubAnswer.REDIRECT_307)
         assert resp.status_code == 307
         assert resp.headers["location"] == "/mcp"
+
+    def test_json_rpc_error(self, stateful):
+        resp, _ = self._call(stateful, StubAnswer.JSON_RPC_ERROR)
+        assert resp.status_code == 200
+        body = decode_mcp_response_body(resp)
+        assert "result" not in body
+        assert body["error"]["code"] == -32602

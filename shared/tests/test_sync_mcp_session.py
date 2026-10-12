@@ -108,10 +108,12 @@ class TestLifecycle:
         assert still_open == frozenset()
 
     def test_a_failed_release_is_not_raised(self):
-        with StubMcpServer(stateful=True, payload=PAYLOAD) as server:
-            with SyncMcpSession(server.url, client_name='c') as session:
-                assert session.call_tool('escalate_info', ARGUMENTS) == PAYLOAD
-                server.close()
+        with (
+            StubMcpServer(stateful=True, payload=PAYLOAD) as server,
+            SyncMcpSession(server.url, client_name='c') as session,
+        ):
+            assert session.call_tool('escalate_info', ARGUMENTS) == PAYLOAD
+            server.close()
 
     def test_call_tool_outside_an_entered_session_is_refused(self):
         with StubMcpServer(stateful=False) as server:

@@ -32,6 +32,7 @@ __all__ = ['RecordedRequest', 'StubAnswer', 'StubMcpServer']
 _ENDPOINT = '/mcp'
 _INVALID_REQUEST = -32600
 _METHOD_NOT_FOUND = -32601
+_INVALID_PARAMS = -32602
 _DEFAULT_PAYLOAD: Mapping[str, Any] = MappingProxyType({'success': True})
 #: ``shutdown()`` waits up to one poll; the stdlib default 0.5s is paid by every test.
 _SHUTDOWN_POLL_SECS = 0.01
@@ -46,6 +47,7 @@ class StubAnswer(enum.StrEnum):
     NON_JSON_TEXT = 'NON_JSON_TEXT'
     EMPTY_202 = 'EMPTY_202'
     REDIRECT_307 = 'REDIRECT_307'
+    JSON_RPC_ERROR = 'JSON_RPC_ERROR'
 
 
 @dataclass(frozen=True)
@@ -241,6 +243,9 @@ class StubMcpServer:
                 return _Reply(202, session_id=session_id)
             case StubAnswer.REDIRECT_307:
                 return _Reply(307, location=_ENDPOINT, session_id=session_id)
+            case StubAnswer.JSON_RPC_ERROR:
+                error = {'code': _INVALID_PARAMS, 'message': 'Invalid params: scripted stub failure'}
+                return self._frame(message, None, session_id, error=error)
         raise AssertionError(f'{self._answer} is not a scripted failure')
 
     def _initialize_result(self, message: dict) -> dict:

@@ -1,12 +1,14 @@
-"""The one MCP client every package uses.
+"""The one MCP client every package uses, async and sync.
 
 :class:`McpSession` serves long-lived async processes: a Streamable-HTTP
 session with the ``initialize`` handshake, transport retries on a schedule the
 caller injects, and one ``client_op_id`` per logical call to a mutating task
-tool. ``clientInfo.name`` is injected too: it is the identity fused-memory
-records for the caller. Every failure the client itself detects is one type,
-:class:`McpCallError`, whose :class:`McpFailureKind` says what failed.
-Endpoint, headers and body decoding come from :mod:`shared.mcp_post`.
+tool. :class:`SyncMcpSession` serves scripts: one handshake per ``with``
+block, no retries. Both send the one handshake :func:`_initialize_params`
+spells, with an injected ``clientInfo.name`` — the identity fused-memory
+records for the caller — and both fail with one type, :class:`McpCallError`,
+whose :class:`McpFailureKind` says what failed. Endpoint, headers and body
+decoding come from :mod:`shared.mcp_post`.
 
 Not re-exported from ``shared/__init__.py``; import ``shared.mcp_session``.
 """
@@ -18,10 +20,12 @@ import enum
 import json
 import logging
 from collections.abc import Mapping, Sequence
+from types import TracebackType
 from typing import Any
 
 import httpx
 
+from shared.mcp_envelope import EnvelopeShape, parse_tool_result
 from shared.mcp_idempotency import maybe_inject_client_op_id
 from shared.mcp_post import MCP_POST_HEADERS, decode_mcp_response_body, mcp_endpoint_url
 
@@ -30,6 +34,7 @@ __all__ = [
     'McpCallError',
     'McpFailureKind',
     'McpSession',
+    'SyncMcpSession',
     'is_timeout_failure',
 ]
 
@@ -311,3 +316,114 @@ class McpSession:
         )
         self._session_id = None
         self._initialized = False
+
+
+def _rpc_result(method: str, resp: httpx.Response) -> Any:
+    body = _decoded(method, resp)
+    if isinstance(body, dict) and body.get('error') is not None:
+        raise McpCallError(
+            McpFailureKind.JSON_RPC_ERROR, f'MCP {method} returned a JSON-RPC error: {body["error"]}',
+        )
+    return body
+
+
+def _tool_reply(name: str, body: Any) -> dict:
+    reply, err = parse_tool_result(body, None, dict)
+    if err is not None:
+        is_error = err.shape is EnvelopeShape.IS_ERROR
+        kind = McpFailureKind.TOOL_ERROR if is_error else McpFailureKind.REPLY_SHAPE
+        raise McpCallError(
+            kind, f'MCP tool {name} reply refused ({err.shape}): {err.payload_prefix}',
+        ) from err
+    if not isinstance(reply, dict):
+        raise McpCallError(
+            McpFailureKind.REPLY_SHAPE, f'MCP tool {name} reply is not a dict: {reply!r:.200}',
+        )
+    return reply
+
+
+class SyncMcpSession:
+    """An MCP session for a script: entering handshakes, exiting releases.
+
+    The handshake captures a server-minted ``mcp-session-id`` and echoes it on
+    every later request; the client never mints one, so a stateless server
+    sees none. Exit DELETEs a captured id, best-effort: a failed release must
+    never turn a delivered call into a failure. No transport retry, and so no
+    ``client_op_id``. ``call_tool`` returns the tool's reply dict and raises
+    :class:`McpCallError` for every failure, ``result.isError`` included.
+    """
+
+    def __init__(self, base_url: str, *, client_name: str, timeout: float = 30.0) -> None:
+        self._endpoint = mcp_endpoint_url(base_url)
+        self._client_name = client_name
+        self._timeout = timeout
+        self._client: httpx.Client | None = None
+        self._session_id: str | None = None
+        self._request_id = 0
+
+    def __enter__(self) -> SyncMcpSession:
+        self._client = httpx.Client(follow_redirects=True, timeout=self._timeout)
+        try:
+            self._handshake()
+        except BaseException:
+            self._release()
+            raise
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self._release()
+
+    def call_tool(self, name: str, arguments: Mapping[str, Any]) -> dict:
+        """Call the MCP tool *name* and return its reply dict."""
+        payload = self._request('tools/call', {'name': name, 'arguments': dict(arguments)})
+        return _tool_reply(name, _rpc_result('tools/call', self._post('tools/call', payload)))
+
+    def _handshake(self) -> None:
+        payload = self._request('initialize', _initialize_params(self._client_name))
+        resp = self._post('initialize', payload)
+        self._session_id = resp.headers.get('mcp-session-id')
+        _rpc_result('initialize', resp)
+        notified = self._post(
+            'notify notifications/initialized',
+            {'jsonrpc': '2.0', 'method': 'notifications/initialized'},
+        )
+        if notified.status_code not in (200, 202, 204):
+            raise McpCallError(
+                McpFailureKind.HTTP_STATUS,
+                f'MCP notify notifications/initialized answered HTTP {notified.status_code}',
+                status=notified.status_code,
+            )
+
+    def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        self._request_id += 1
+        return {'jsonrpc': '2.0', 'id': self._request_id, 'method': method, 'params': params}
+
+    def _post(self, label: str, payload: dict[str, Any]) -> httpx.Response:
+        if self._client is None:
+            raise RuntimeError('SyncMcpSession is used only inside its with-block')
+        try:
+            return self._client.post(
+                self._endpoint, json=payload, headers=_request_headers(self._session_id),
+            )
+        except httpx.HTTPError as exc:
+            raise McpCallError(
+                McpFailureKind.TRANSPORT, f'MCP {label} failed: {type(exc).__name__}: {exc}',
+            ) from exc
+
+    def _release(self) -> None:
+        client, self._client = self._client, None
+        session_id, self._session_id = self._session_id, None
+        if client is None:
+            return
+        try:
+            if session_id is not None:
+                client.delete(self._endpoint, headers=_request_headers(session_id))
+        except Exception as exc:  # noqa: BLE001 — a release must never mask the call's outcome
+            logger.debug('MCP session %s release to %s failed: %s', session_id, self._endpoint, exc)
+        finally:
+            client.close()
