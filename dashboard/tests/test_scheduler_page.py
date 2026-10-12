@@ -1094,6 +1094,25 @@ def test_scheduler_endpoint_returns_envelope_shape(client):
     assert inner['paused_projects'] == []
 
 
+def test_scheduler_endpoint_keeps_offline_and_degraded_apart(client):
+    """``api_scheduler`` unpacks the collector by POSITION, and both lists are
+    ``list[str]``, so a swap type-checks.  Distinct members pin each one to
+    its own payload key."""
+    from unittest.mock import AsyncMock, patch
+
+    state = ([], [], [], {}, ['down'], [], {}, ['slow'])
+    with patch(
+        'dashboard.app.get_scheduler_snapshot',
+        new=AsyncMock(return_value=(state, None)),
+    ):
+        inner = client.get('/api/v2/dashboard/scheduler').json()['SCHEDULER']
+
+    assert inner['offline_projects'] == ['down']
+    assert inner['degraded_projects'] == ['slow']
+    assert inner['offline'] is True
+    assert inner['degraded'] is True
+
+
 # ---------------------------------------------------------------------------
 # task-1569 step-1: get_scheduler_snapshot — TTL cache and expiry
 # ---------------------------------------------------------------------------
