@@ -235,3 +235,23 @@ def test_a_partially_read_escalation_queue_leaves_the_pinning_escalation_unknown
     chains = _chains_by_key(record_a)
     assert chains['failing-job']['state'] == 'paused'
     assert chains['failing-job']['pending_escalation_ids'] is None
+
+
+def test_a_failed_escalation_corpus_walk_costs_no_root_its_record(client, tmp_path, monkeypatch):
+    a, b, _ = _roots(tmp_path)
+    _seed_every_chain_state(a)
+    _write_escalation(a, 'esc-7-1', task_id='7')
+    write_tasks_db(_real_db(b), [task_row(1, 'done', _CLAIMANT, _STALE)])
+
+    def _denied(queues):
+        raise PermissionError(13, 'Permission denied', str(a / 'data' / 'escalations'))
+
+    monkeypatch.setattr(escalation_corpus, 'walk_corpus', _denied)
+    records = _by_root(_get(client, a, [b]))
+
+    assert [records[str(root)]['status'] for root in (a, b)] == ['ok', 'ok']
+    [violation] = records[str(b)]['terminal_tier']['violations']
+    assert violation['task_id'] == 1
+    chains = _chains_by_key(records[str(a)])
+    assert chains['failing-job']['state'] == 'paused'
+    assert all(chain['pending_escalation_ids'] is None for chain in chains.values())

@@ -9,24 +9,46 @@ response's ``served_at``.
 
 Each record also carries the recurrence chains section
 (``docs/prds/recurring-deterministic-tasks.md`` R-D5/C-4). A paused chain's
-pinning escalations are read through the escalation corpus' one cache.
+pinning escalations are read through the escalation corpus' one cache; a
+corpus walk that raises leaves them unknown and costs no root its record.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from dashboard.config import DashboardConfig
+from dashboard.data.datum import Datum, unknown_datum
 from dashboard.data.db import DbPool
-from dashboard.data.escalation_corpus import acquire_corpus, corpus_queues, pending_escalation_ids
+from dashboard.data.escalation_corpus import (
+    CORPUS_FRESHNESS_BOUND_SECONDS,
+    EscalationCorpus,
+    acquire_corpus,
+    corpus_queues,
+    pending_escalation_ids,
+)
 from dashboard.data.root_invariants import scan_root_invariants
 from dashboard.project_dbs import TASKS_DB_REL_PATH, project_roots
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
+
+
+async def _escalation_corpus(config: DashboardConfig, *, now: datetime) -> Datum[EscalationCorpus]:
+    try:
+        return await acquire_corpus(corpus_queues(config), now=now)
+    except Exception as exc:
+        logger.exception('invariants: escalation corpus walk failed; pinning escalations unknown')
+        return unknown_datum(
+            f'the escalation corpus walk failed: {type(exc).__name__}: {exc}',
+            CORPUS_FRESHNESS_BOUND_SECONDS,
+        )
 
 
 @router.get('/api/v2/dashboard/invariants')
@@ -35,7 +57,7 @@ async def api_invariants(request: Request) -> JSONResponse:
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     now = datetime.now(UTC)  # clock-exempt: single-capture route
-    corpus = await acquire_corpus(corpus_queues(config), now=now)
+    corpus = await _escalation_corpus(config, now=now)
     roots = project_roots(config)
     db_paths = [root / TASKS_DB_REL_PATH for root in roots]
     conns = [await pool.get(db_path) for db_path in db_paths]
