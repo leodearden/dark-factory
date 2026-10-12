@@ -237,12 +237,7 @@ class CostStore(AsyncSqliteBase):
         Additive only: one ``ALTER TABLE ... ADD COLUMN`` per missing column.
         Idempotent, and a no-op on a fresh DB.  Pre-existing rows read NULL for
         the new columns, meaning "not recorded".  No ``PRAGMA user_version``
-        ladder, per the runs.db convention at
-        ``orchestrator/src/orchestrator/flake_ledger.py``.
-
-        Tolerance of a concurrent ``CostStore`` open, and loud propagation of
-        every other failure, are owned by
-        ``shared/src/shared/sqlite_column_migration.py::add_column_if_missing``.
+        ladder, per the rule in ``shared/src/shared/sqlite_column_migration.py``.
         The caller commits.
         """
         conn = self._require_conn()

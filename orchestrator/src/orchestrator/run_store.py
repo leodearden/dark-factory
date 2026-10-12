@@ -139,13 +139,9 @@ class RunStore:
     def _migrate_task_results_block_context(self, conn: sqlite3.Connection) -> None:
         """Add ``block_reason``/``block_phase`` to a pre-3068 ``task_results``.
 
-        Deliberately additive-only, with no ``PRAGMA user_version`` ladder:
-        ``RunStore`` has never had one, and this change needs no destructive
-        table rebuild, so the light feature-detect idiom
-        (``shared/src/shared/sqlite_column_migration.py::add_column_if_missing_sync``)
-        is sufficient.  Introducing a version header to an existing
-        un-versioned DB would itself need a "version 0 means unknown" special
-        case, for no benefit.
+        Additive-only, with no ``PRAGMA user_version`` ladder (``RunStore`` has
+        never had one), per the rule in
+        ``shared/src/shared/sqlite_column_migration.py``.
 
         Idempotent, and a no-op on a fresh DB — ``_SCHEMA`` already declares
         both columns there, so the probe finds them present.
@@ -161,9 +157,7 @@ class RunStore:
         continues, so a raise here does NOT halt the run — it drops
         ``task_results`` persistence for the whole run.  That is strictly worse
         than writing NULLs, which is why tolerating a concurrent construction
-        that already added the column matters here.  That tolerance, and the
-        loud propagation of every other failure, are owned by
-        ``shared/src/shared/sqlite_column_migration.py::add_column_if_missing``.
+        that already added the column matters here.
         """
         added = [
             column
@@ -180,10 +174,7 @@ class RunStore:
         """Add ``ewa_value`` to a pre-4559 ``scheduler_state``.
 
         Same shape as :meth:`_migrate_task_results_block_context`, deliberately:
-        additive-only feature-detect, no ``PRAGMA user_version`` ladder.
-        ``RunStore`` has never had a version header, and adding one to an
-        existing un-versioned DB would itself need a "version 0 means unknown"
-        special case for no benefit.
+        additive-only, no ``PRAGMA user_version`` ladder.
 
         Idempotent, and a no-op on a fresh DB — ``_SCHEMA`` already declares the
         column there, so the probe finds it present.
@@ -198,9 +189,7 @@ class RunStore:
         (``Harness.run``) wraps ``RunStore(db_path)`` in
         ``except Exception: logger.error(...)`` and continues, so it would drop
         persistence for the whole run rather than halt it.  That is strictly
-        worse than a NULL column; concurrent-construction tolerance and loud
-        propagation of every other failure are owned by
-        ``shared/src/shared/sqlite_column_migration.py::add_column_if_missing``.
+        worse than a NULL column.
         """
         if add_column_if_missing_sync(conn, 'scheduler_state', 'ewa_value', 'REAL'):
             conn.commit()

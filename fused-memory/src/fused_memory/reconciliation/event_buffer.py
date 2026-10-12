@@ -167,11 +167,7 @@ class EventBuffer:
         logger.info(f'EventBuffer initialized (db={self._db_path}, instance={self.instance_id})')
 
     async def _migrate(self) -> None:
-        """Add new columns to pre-existing DBs.
-
-        Idempotence and the concurrent-init race are owned by
-        ``shared/src/shared/sqlite_column_migration.py::add_column_if_missing``.
-        """
+        """Add new columns to pre-existing DBs."""
         async with self._require_access().write() as db:
             # Add drained_by_run_id if missing — attributes a drained row to the run
             # that drained it (task 2711 / E7) so restore_drained() can be scoped to

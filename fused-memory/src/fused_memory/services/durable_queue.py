@@ -336,12 +336,8 @@ class DurableWriteQueue:
     async def _migrate(self) -> None:
         """Add columns that post-date a DB's creation.
 
-        ``CREATE TABLE IF NOT EXISTS`` is a no-op against an existing table, so
-        additive changes need an explicit ALTER for DBs already on disk.
-
-        No ``PRAGMA user_version`` ladder — the project's rule (stated in
-        orchestrator/run_store.py) is that purely additive changes use this
-        light feature-detect idiom.
+        Additive-only, with no ``PRAGMA user_version`` ladder, per the rule in
+        ``shared/src/shared/sqlite_column_migration.py``.
         """
         async with self._require_access().write() as db:
             added = await add_column_if_missing(db, 'write_queue', 'executed', 'INTEGER')

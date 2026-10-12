@@ -1,4 +1,19 @@
-"""Add a SQLite column if it is missing, tolerating a concurrent adder."""
+"""Add a SQLite column if it is missing, tolerating a concurrent adder.
+
+This is the project's one idiom for a purely additive schema change: a new
+column that is NULLable or carries a DEFAULT, so every row already on disk
+stays valid untouched. ``CREATE TABLE IF NOT EXISTS`` is a no-op against an
+existing table, so a store that grows a column calls one of these at open
+time, after its CREATE and before anything that names the column.
+
+An additive change is feature-detected from the schema, never versioned. A
+store with no ``PRAGMA user_version`` ladder must not grow one for it: a
+header added to an already-deployed, unversioned file would need its own
+"version 0 means unknown" special case, for no benefit. A store that already
+keeps a ladder may call these from inside one of its version steps, and the
+gating stays the ladder's. A destructive change (a table rebuild, a type
+change) is outside this idiom.
+"""
 
 from __future__ import annotations
 
@@ -59,9 +74,7 @@ async def add_column_if_missing(
     original error, since a silently half-migrated schema surfaces much later
     as a confusing "no such column", which is worse than a loud open failure.
 
-    Never commits: the caller owns the transaction. The additive-only,
-    no-user_version rule these migrations follow is stated at
-    ``orchestrator/src/orchestrator/run_store.py::RunStore._migrate_task_results_block_context``.
+    Never commits: the caller owns the transaction.
     """
     statement = _alter_sql(table, column, column_ddl)
     if await _column_present(db, table, column):

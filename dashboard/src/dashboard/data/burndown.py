@@ -160,14 +160,11 @@ class SnapshotState(enum.StrEnum):
 async def ensure_snapshot_columns(conn: aiosqlite.Connection) -> None:
     """Bring an existing ``snapshots`` table up to the current column set.
 
-    Additive only: one ``ALTER TABLE ... ADD COLUMN`` per missing column,
-    through
-    ``shared/src/shared/sqlite_column_migration.py::add_column_if_missing``,
-    which also owns concurrent-open tolerance.  Idempotent, never drops
-    or rewrites anything, so pre-existing rows keep their data and take the
-    column defaults: ``0`` for the split (task 3543), and ``NULL`` for the cap
-    and for every column task 5591 added — an honest "not recorded", since
-    none of them was measured when the row was written.
+    Additive only: one ``ALTER TABLE ... ADD COLUMN`` per missing column.
+    Idempotent, never drops or rewrites anything, so pre-existing rows keep
+    their data and take the column defaults: ``0`` for the split (task 3543),
+    and ``NULL`` for the cap and for every column task 5591 added — an honest
+    "not recorded", since none of them was measured when the row was written.
 
     Mandatory, not cosmetic: :data:`BURNDOWN_SCHEMA` is applied with
     ``CREATE TABLE IF NOT EXISTS``, which is a no-op against every already
