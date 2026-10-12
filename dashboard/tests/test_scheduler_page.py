@@ -486,7 +486,7 @@ async def test_collect_scheduler_state_surfaces_offline_when_mcp_unreachable(
 ):
     """When every fused-memory URL is unreachable, offline_projects is non-empty.
 
-    Mirrors test_collect_active_tasks_surfaces_offline_projects.
+    Mirrors test_collect_tasks_with_counts_surfaces_offline_projects.
     All other tuple members must be empty.
     """
     from unittest.mock import AsyncMock, patch

@@ -364,9 +364,9 @@ def test_a_healthy_root_is_fresh_when_the_real_collector_measures_it(client, cap
     microseconds AFTER it. ``validate_datum`` refuses a negative age, so
     ``_validated`` routed every project to ``unknown`` on every cache-miss
     render, and 350 green dashboard tests sat over that handler.
-    ``dashboard/src/dashboard/data/scheduler.py::collect_scheduler_state`` and
-    ``collect_active_tasks`` already forward ``now``; ``api_tasks`` was the only
-    call site that did not.
+    ``dashboard/src/dashboard/data/scheduler.py::collect_scheduler_state``
+    already forwards ``now``; ``api_tasks`` was the only call site that did
+    not.
     """
     import logging
     from datetime import datetime
