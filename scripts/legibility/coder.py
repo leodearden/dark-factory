@@ -250,19 +250,25 @@ def _invariant_slugs_block(invariant_slugs: Sequence[str]) -> str:
 _MATCHES_KEY = "matches"
 _CANDIDATES_KEY = "candidates"
 
-_PRESCRIBED_REPLY = {
-    _MATCHES_KEY: [{
-        "entry_id": "...", "origin_phase": "...", "manifested_phase": "...",
-        "invariant_violated": None, "note": "...",
-    }],
-    _CANDIDATES_KEY: [{
-        "title": "...", "cause": "...", "area": "...", "origin_phase": "...",
-        "manifested_phase": "...", "evidence_quote": "...",
-    }],
-}
-"""The reply build_prompt prescribes; its keys are the reply schema code_digest
-reads. Tied to the §7.3 record contract by
-``scripts/tests/test_legibility_coder.py::test_a_reply_shaped_as_the_prompt_prescribes_reaches_the_merger``."""
+
+def _prescribed_reply() -> dict[str, list[dict[str, str | None]]]:
+    """The reply build_prompt prescribes, one placeholder finding per key; a
+    fresh dict per call. Tied to the §7.3 record contract by
+    ``scripts/tests/test_legibility_coder.py::test_a_reply_shaped_as_the_prompt_prescribes_reaches_the_merger``."""
+    return {
+        _MATCHES_KEY: [{
+            "entry_id": "...", "origin_phase": "...", "manifested_phase": "...",
+            "invariant_violated": None, "note": "...",
+        }],
+        _CANDIDATES_KEY: [{
+            "title": "...", "cause": "...", "area": "...", "origin_phase": "...",
+            "manifested_phase": "...", "evidence_quote": "...",
+        }],
+    }
+
+
+_REPLY_KEYS = tuple(_prescribed_reply())
+"""The reply schema code_digest reads: exactly the keys build_prompt prescribes."""
 
 
 def build_prompt(
@@ -289,9 +295,9 @@ def build_prompt(
         '"unknown" instead. Legal phase values: ' + phases + ".\n\n"
         "Respond with STRICT JSON ONLY (no prose, no markdown fences), "
         "exactly this shape:\n"
-        + json.dumps(_PRESCRIBED_REPLY) + "\n"
+        + json.dumps(_prescribed_reply()) + "\n"
         "If nothing matches and nothing is novel, respond with "
-        + json.dumps({key: [] for key in _PRESCRIBED_REPLY}) + ".\n\n"
+        + json.dumps({key: [] for key in _REPLY_KEYS}) + ".\n\n"
         "=== QUALITY DEFINITION ===\n"
         "Mint a candidate only for a confusion that meets this definition, "
         "that is, one that shows a cost or risk to the next change. "
@@ -500,7 +506,7 @@ def code_digest(
             )
         return CodingResult(ok=False, record=None, reason=str(exc), session=session)
 
-    missing = [key for key in _PRESCRIBED_REPLY if key not in judgment]
+    missing = [key for key in _REPLY_KEYS if key not in judgment]
     if missing:
         return CodingResult(
             ok=False, record=None, session=session,
@@ -515,7 +521,7 @@ def code_digest(
         "date": meta.get("date"),
         "project": project,
         "agent_class": meta.get("agent_class"),
-        **{key: judgment[key] for key in _PRESCRIBED_REPLY},
+        **{key: judgment[key] for key in _REPLY_KEYS},
     }
 
     errors = codebook_mod.validate_coding_record(record)

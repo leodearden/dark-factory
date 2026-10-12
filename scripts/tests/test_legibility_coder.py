@@ -1553,14 +1553,14 @@ def test_a_reply_shaped_as_the_prompt_prescribes_reaches_the_merger():
 
 
 @pytest.mark.parametrize(
-    ("reply", "named_key"),
+    ("reply", "named_keys"),
     [
-        ({"verified": False, "reason": "cannot verify the cluster"}, "matches"),
-        ({}, "candidates"),
-        ({"matches": []}, "candidates"),
-        ({"hits": [{"entry_id": "one-shot-subagent-contract"}], "candidates": []}, "matches"),
-        ({"matches": None, "candidates": []}, "matches"),
-        ({"verified": False, "reason": REAL_CLI_CAP_MESSAGES[0]}, "matches"),
+        ({"verified": False, "reason": "cannot verify the cluster"}, ("matches", "candidates")),
+        ({}, ("matches", "candidates")),
+        ({"matches": []}, ("candidates",)),
+        ({"hits": [{"entry_id": "one-shot-subagent-contract"}], "candidates": []}, ("matches",)),
+        ({"matches": None, "candidates": []}, ("matches",)),
+        ({"verified": False, "reason": REAL_CLI_CAP_MESSAGES[0]}, ("matches", "candidates")),
     ],
     ids=[
         "foreign_verdict_shape",
@@ -1572,7 +1572,7 @@ def test_a_reply_shaped_as_the_prompt_prescribes_reaches_the_merger():
     ],
 )
 def test_code_digest_a_reply_off_the_prescribed_schema_is_a_failure_not_an_empty_verdict(
-    reply, named_key
+    reply, named_keys
 ):
     """A parsed reply missing a key build_prompt prescribes is not "coded fine,
     found nothing" (never-fabricate)."""
@@ -1585,4 +1585,4 @@ def test_code_digest_a_reply_off_the_prescribed_schema_is_a_failure_not_an_empty
     assert result.record is None
     assert result.capped is False
     assert result.session == _SESSION_ID
-    assert named_key in result.reason
+    assert [key for key in named_keys if key not in result.reason] == []
