@@ -11,12 +11,14 @@ import re
 from collections.abc import Iterable
 from pathlib import Path
 
+from shared.capability_manifest import load_capability_manifest
+
 _GREEK_NAMES = (
     'alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta', 'eta', 'theta',
     'iota', 'kappa', 'lambda', 'mu', 'nu', 'xi', 'omicron', 'pi',
     'rho', 'sigma', 'tau', 'upsilon', 'phi', 'chi', 'psi', 'omega',
 )
-_GREEK_LETTER_BY_NAME = dict(zip(_GREEK_NAMES, 'αβγδεζηθικλμνξοπρστυφχψω', strict=True))
+_GREEK_LETTER_BY_NAME: dict[str, str] = dict(zip(_GREEK_NAMES, 'αβγδεζηθικλμνξοπρστυφχψω', strict=True))
 _TRANSLITERATED_LABEL = re.compile('(' + '|'.join(_GREEK_NAMES) + r')(\d*)')
 _LABEL_CHAR = r'[\w′-]'
 
@@ -44,4 +46,30 @@ def unmentioned_labels(labels: Iterable[str], md_text: str) -> tuple[str, ...]:
         label
         for label in labels
         if not any(_occurs_as_token(s, md_text) for s in _label_spellings(label))
+    )
+
+
+def _display(path: Path, repo_root: Path) -> Path:
+    try:
+        return path.relative_to(repo_root)
+    except ValueError:
+        return path
+
+
+def check_md_twin(sidecar: Path, repo_root: Path) -> str | None:
+    twin = md_twin_path(sidecar)
+    sidecar_rel, twin_rel = _display(sidecar, repo_root), _display(twin, repo_root)
+    if not twin.is_file():
+        return (
+            f'{sidecar_rel}: no .md twin at {twin_rel} — '
+            'the human-readable manifest must sit beside its sidecar'
+        )
+    labels = [task.label for task in load_capability_manifest(sidecar).tasks]
+    missing = unmentioned_labels(labels, twin.read_text(encoding='utf-8'))
+    if not missing:
+        return None
+    return (
+        f'{twin_rel}: never mentions sidecar label(s) {", ".join(map(repr, missing))} '
+        f'declared in {sidecar_rel} — add a section or table row naming each '
+        '(verbatim, or its Greek letter for an ASCII-spelled name)'
     )
