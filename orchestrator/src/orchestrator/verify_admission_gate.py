@@ -218,9 +218,9 @@ class AdmissionGate:
             turn=asyncio.get_running_loop().create_future(),
         )
         self._queued[waiter.seq] = waiter
-        self._dispatch(policy())
-        turn = await waiter.turn
         try:
+            self._dispatch(policy())
+            turn = await waiter.turn
             yield AdmissionGrant(
                 request=request,
                 order=turn.order,
@@ -230,8 +230,7 @@ class AdmissionGate:
                 depth_at_arrival=waiter.depth_at_arrival,
             )
         finally:
-            self._holding.pop(waiter.seq, None)
-            self._dispatch(policy())
+            self._leave(waiter, policy)
 
     def snapshot(self) -> AdmissionSnapshot:
         now = time.monotonic()
@@ -244,6 +243,15 @@ class AdmissionGate:
             for w in sorted(self._holding.values(), key=lambda w: w.seq)
         )
         return AdmissionSnapshot(waiters=waiters, holders=holders)
+
+    def _leave(self, waiter: _Waiter, policy: Callable[[], AdmissionPolicy]) -> None:
+        # The single queue exit (PRD invariant 1): a waiter still queued just
+        # leaves; one already granted, even if cancelled before it resumed,
+        # hands its turn on.
+        if self._queued.pop(waiter.seq, None) is not None:
+            return
+        if self._holding.pop(waiter.seq, None) is not None:
+            self._dispatch(policy())
 
     def _dispatch(self, policy: AdmissionPolicy) -> None:
         while self._queued and len(self._holding) < policy.slots:
