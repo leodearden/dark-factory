@@ -1485,73 +1485,63 @@ class TestCalibrationScriptArmTableLockstep:
 
 
 # ---------------------------------------------------------------------------
-# Review suggestion 3: the metrics <-> sampler vocabulary reconciler
+# Every key a live collector emits is admitted by its own group and stored
 # ---------------------------------------------------------------------------
 
 
 class TestEmittedNamesAreAdmittedByRunTick:
-    """The one pair of vocabularies inside this package with no reconciler.
+    """The REAL collectors, through the REAL run_tick, over the live table.
 
-    sampler.metrics EMITS metric names; sampler.sampler ADMITS them, against
-    its own frozensets, with an ``assert`` placed BEFORE every insert. So a
-    mismatch does not degrade one group — it aborts the whole tick, and the
-    sampler writes zero rows of any group every 5 s until someone reads the
-    journal.
-
-    Nothing caught that. The lockstep guards added by this task reconcile
-    metrics.py against the calibration script, and _ARMS against
-    ARM_METRIC_STEMS, but every run_tick test feeds a hand-written dict and
-    every __main__ test monkeypatches the collectors away. Renaming an emitted
-    stem consistently across metrics.py, ARM_METRIC_STEMS and the calibration
-    script therefore left the whole suite green and production broken.
-
-    This drives the REAL collectors into the REAL run_tick, through public
-    interfaces only — no private frozenset is imported here, because a row
-    landing in the store is the property that actually matters.
+    Each group of METRIC_GROUPS keeps its admission rule and window mode, and
+    only its collector is rebound to this module's fixtures. A row landing in
+    the store is the property that matters, so that is what is asserted.
     """
 
     @staticmethod
-    def _collect_all(tree):
+    def _bound_table(tree):
+        """METRIC_GROUPS with each group's collector bound to this module's fixtures."""
+        import dataclasses
+
         from shared.psi import RunqueueReading
 
         from sampler.metrics import (
+            METRIC_GROUPS,
+            GroupName,
             collect_load_metrics,
             collect_process_metrics,
             collect_psi,
         )
 
-        mapping = {'cpu': PSI_CPU_TEXT, 'memory': PSI_MEM_TEXT, 'io': PSI_IO_TEXT}
-        return {
-            'psi': collect_psi(read=lambda name: mapping[name]),
-            'process_metrics': collect_process_metrics(
+        pressure = {'cpu': PSI_CPU_TEXT, 'memory': PSI_MEM_TEXT, 'io': PSI_IO_TEXT}
+        bound = {
+            GroupName.PSI: lambda: collect_psi(read=lambda name: pressure[name]),
+            GroupName.PROCESS: lambda: collect_process_metrics(
                 proc_iter=lambda _attrs: iter(()), fd9_exists=lambda _pid: False
             ),
-            'load_metrics': collect_load_metrics(
+            GroupName.LOAD: lambda: collect_load_metrics(
                 read_runqueue=lambda **_kwargs: RunqueueReading(2.5, True),
                 own_cgroup_path=tree.own_cgroup_path,
                 cgroup_root=tree.cgroup_root,
             ),
         }
+        return tuple(
+            dataclasses.replace(group, collect=bound[group.name]) for group in METRIC_GROUPS
+        )
 
-    def test_every_name_the_collectors_emit_reaches_the_store(self, tmp_path):
+    def _store_one_tick(self, tmp_path, tree) -> tuple[set[SampleKey], set[SampleKey]]:
+        """Collect every bound group, run one tick, and return (emitted, stored)."""
         import sqlite3
 
         from sampler.sampler import run_tick
         from sampler.store import LoadSampleStore
 
-        tree = live_topology(tmp_path)
-        groups = self._collect_all(tree)
-        emitted = {key for group in groups.values() for key in group}
-        # 14 own_* (7 leaves x value+read_ok) + 2 runqueue + 6 psi + 3 process
-        # — the 25 metrics/tick the retention sizing was measured against.
-        assert len(emitted) == 14 + 2 + 6 + 3, (
-            f'the fixture did not exercise all three groups; got {sorted(emitted)}'
-        )
+        collected = {group: group.collect() for group in self._bound_table(tree)}
+        for group, samples in collected.items():
+            unadmitted = sorted(key.label() for key in samples if not group.admits(key))
+            assert not unadmitted, f'the {group.name} group does not admit {unadmitted}'
 
         db_path = tmp_path / 'db.sqlite'
-        # Raises AssertionError out of run_tick if any emitted name is one the
-        # guard does not admit — which is exactly the production failure.
-        run_tick(LoadSampleStore(db_path), 1_000_000, **groups)
+        run_tick(LoadSampleStore(db_path), 1_000_000, collected)
 
         conn = sqlite3.connect(str(db_path))
         try:
@@ -1561,16 +1551,24 @@ class TestEmittedNamesAreAdmittedByRunTick:
             }
         finally:
             conn.close()
+        emitted = {key for samples in collected.values() for key in samples}
+        return emitted, stored
+
+    def test_every_name_the_collectors_emit_reaches_the_store(self, tmp_path):
+        from sampler.metrics import METRIC_GROUPS
+
+        emitted, stored = self._store_one_tick(tmp_path, live_topology(tmp_path))
+
+        exact = [name for group in METRIC_GROUPS for name in group.exact]
+        per_leaf = [name for group in METRIC_GROUPS for name in group.per_leaf]
+        assert len(emitted) == len(exact) + len(per_leaf) * len(LIVE_ORCHESTRATOR_LEAVES), (
+            f'the fixture did not exercise every group; got {sorted(emitted)}'
+        )
         assert stored == emitted
 
     def test_the_df_topology_vocabulary_is_admitted_too(self, tmp_path):
         """Post-3394 the leaf names change shape; admission must still take them."""
-        from sampler.sampler import run_tick
-        from sampler.store import LoadSampleStore
+        emitted, stored = self._store_one_tick(tmp_path, df_topology(tmp_path, 'dark-factory', 'reify'))
 
-        tree = df_topology(tmp_path, 'dark-factory', 'reify')
-        groups = self._collect_all(tree)
-        load = groups['load_metrics']
-        assert SampleKey('own_cpu_some10', 'df-dark-factory.slice') in load, sorted(load)
-
-        run_tick(LoadSampleStore(tmp_path / 'db.sqlite'), 1_000_000, **groups)
+        assert SampleKey('own_cpu_some10', 'df-dark-factory.slice') in emitted, sorted(emitted)
+        assert stored == emitted
