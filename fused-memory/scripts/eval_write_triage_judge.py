@@ -16,14 +16,15 @@ asserted in code would silently become the decision.
 
 Structure
 ---------
-Mirrors the sibling script exactly: a pure synchronous core, unit-tested
-against an injected ``judge_fn``, with the live LLM edge constructed only
-inside the CLI. The whole test suite therefore runs with no
-``OPENAI_API_KEY``, no network and no Qdrant.
-
-Alpha's fixture loader, label vocabulary and ``package_relative`` are IMPORTED
-from ``calibrate_write_triage`` rather than re-implemented (INV-5) — the
-fixture format and the label words have one home.
+Imports point downward only: this CLI -> ``eval_write_triage_cases.py`` ->
+``eval_write_triage_scoring.py``, and this CLI ->
+``eval_write_triage_live_judge.py`` -> ``eval_write_triage_scoring.py``.
+Scoring says what counts as correct and how the report reads, cases builds
+what a run asks, the live judge is the only module that reaches an LLM, and
+this CLI runs, dumps, guards and writes. ``eval_write_triage_retrieval.py`` is
+loaded only for ``--slate-mode retrieved``. Alpha's fixture loader and
+``package_relative`` are IMPORTED from ``calibrate_write_triage`` rather than
+re-implemented (INV-5).
 
 Usage
 -----
@@ -95,9 +96,11 @@ def _load_calibrate() -> types.ModuleType:
 
     ``scripts/`` is not an importable package, so the sibling is reached the
     same way its own test suite reaches it. Importing it rather than copying
-    its four label constants and its fixture loader is the point: a fixture
-    format change or a fifth label lands in ONE place, and this script either
-    follows it or fails loudly at ``build_judge_cases``.
+    its fixture loader is the point: a fixture format change lands in ONE
+    place, and this script follows it. Its four label constants reach the eval
+    through ``eval_write_triage_scoring.py``, which loads this same module, so
+    a fifth label fails loudly at
+    ``eval_write_triage_cases.py::build_judge_cases``.
     """
     return _load_script(_CALIBRATE_PATH, 'calibrate_write_triage')
 
@@ -177,8 +180,9 @@ def markdown_sibling(report_path: str | Path) -> Path:
     A FUNCTION OF THE ARGUMENT ALONE, which is why it is one: nothing about
     the collision depends on what the run measures, so it is knowable before
     any work is done. It used to be evaluated at the bottom of
-    :func:`run_judge_eval`, after ``build_judge_cases``, after the whole
-    per-case ``judge_fn`` loop and after ``score_cases`` — which protected
+    :func:`run_judge_eval`, after ``eval_write_triage_cases.py::build_judge_cases``,
+    after the whole per-case ``judge_fn`` loop and after
+    ``eval_write_triage_scoring.py::score_cases`` — which protected
     the two FILES and nothing else. On a live run ``--report-path foo.md``
     spent every LLM call for the corpus and then raised with no artifact
     written at all, so the operator paid for the run and got nothing.
@@ -243,8 +247,9 @@ def run_judge_eval(
     ``judge_fn(case, candidates)`` receives the case and its slate RESOLVED to
     records — a judge handed bare ids has no text to compare and is answering
     noise, which is the same defect the production seam's own tests pin. It
-    returns a verdict word, or a :class:`JudgeAnswer` when it has more to
-    report: whether an LLM was called at all, what was elided, what was spent.
+    returns a verdict word, or an ``eval_write_triage_scoring.py::JudgeAnswer``
+    when it has more to report: whether an LLM was called at all, what was
+    elided, what was spent.
 
     Every case is dumped to *cases_path* AS IT COMPLETES, before the next one
     is asked. A provider failure mid-run therefore costs the remaining cases,
@@ -311,9 +316,10 @@ def _record_slate_widths(
 ) -> None:
     """Publish the width the run MEASURED, and warn when it is not the ask.
 
-    `_rotated` truncates when the pool is short, so `distractors + 1` is what
-    was REQUESTED and can silently exceed what the slates actually carried. A
-    run whose slates all came out 1 wide must not publish `candidate_count: 5`.
+    `eval_write_triage_cases.py::_rotated` truncates when the pool is short, so
+    `distractors + 1` is what was REQUESTED and can silently exceed what the
+    slates actually carried. A run whose slates all came out 1 wide must not
+    publish `candidate_count: 5`.
     """
     widths = [len(case['candidates']) for case in cases]
     run_provenance.setdefault('candidate_count', max(widths) if widths else 0)
@@ -488,9 +494,10 @@ def _limited(
     cluster's canonical while keeping its members, whose slates then cannot resolve.
 
     Round-robin and not a head slice: the fixture is grouped by cluster in file
-    order, so `records[:5]` is five records of ONE cluster, `_distractor_pool`
-    draws only from OTHER clusters and comes back empty, every slate collapses
-    to width 1, and the lone control case gets `candidates == []` — which
+    order, so `records[:5]` is five records of ONE cluster,
+    `eval_write_triage_cases.py::_distractor_pool` draws only from OTHER
+    clusters and comes back empty, every slate collapses to width 1, and the
+    lone control case gets `candidates == []` — which
     `judge_write` short-circuits to `stored` with no provider call at all.
 
     Only NON-canonical records are drawn, since a canonical produces no

@@ -146,9 +146,10 @@ def _seeded_case(
     """A case whose slate is CONSTRUCTED rather than retrieved.
 
     The lead record is the band winner and the band is the middle one — the
-    only band that reaches a judge — because that is what `build_judge_fn`
-    synthesizes. Similarity and canonical liveness are unmeasured here, and
-    `None` says so rather than claiming a figure.
+    only band that reaches a judge — because that is what
+    `eval_write_triage_live_judge.py::build_judge_fn` synthesizes. Similarity
+    and canonical liveness are unmeasured here, and `None` says so rather than
+    claiming a figure.
     """
     return _case(
         record,
@@ -179,9 +180,10 @@ def build_judge_cases(
     about a different memory than the one an attach would touch. Canonical
     records produce no labelled case, because they ARE the target.
 
-    CONTROL (``CLASS_DISTRACTOR``) — one per CLUSTER, capped there on cost,
-    since every case is a paid LLM call and one control per cluster already
-    answers the question the control asks. Its slate is ``distractors + 1``
+    CONTROL (``eval_write_triage_scoring.py::CLASS_DISTRACTOR``) — one per
+    CLUSTER, capped there on cost, since every case is a paid LLM call and one
+    control per cluster already answers the question the control asks. Its
+    slate is ``distractors + 1``
     records drawn only from OTHER clusters, so it is exactly as wide as a
     labelled slate and nothing on it is a correct attach.
 
@@ -189,7 +191,8 @@ def build_judge_cases(
     sorted by ``memory_id`` before anything is drawn, so the committed report
     is reproducible from the fixture alone.
 
-    An unrecognised label raises :class:`UnknownLabelError`.
+    An unrecognised label raises
+    ``eval_write_triage_scoring.py::UnknownLabelError``.
     """
     ordered = sorted(records, key=lambda r: str(r['memory_id']))
     cases: list[dict[str, Any]] = []

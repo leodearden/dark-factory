@@ -130,9 +130,10 @@ EVAL_OUTCOMES: tuple[str, ...] = tuple(sorted(TRIAGE_OUTCOMES))
 #: Every provenance field the report is expected to carry, in report order —
 #: the same "one list, two consumers" shape as ``EVAL_CLASSES`` above, and for
 #: a sharper version of the same reason. :func:`build_report` backfills from
-#: THIS tuple and ``_run`` supplies its own subset of it, so a field added in
-#: one place cannot go missing from reports assembled through the other. Two
-#: hand-typed lists is exactly how ``candidate_count_min`` and
+#: THIS tuple and ``eval_write_triage_judge.py::_run`` supplies its own subset
+#: of it, so a field added in one place cannot go missing from reports
+#: assembled through the other. Two hand-typed lists is exactly how
+#: ``candidate_count_min`` and
 #: ``distractor_count_requested`` — the pair that discloses a NARROWED slate —
 #: came to be absent from every report ``build_report`` backfilled.
 #:
@@ -154,7 +155,8 @@ PROVENANCE_KEYS: tuple[str, ...] = (
     # other field in this block, so an artifact missing them is unreadable.
     'slate_mode',
     'field_chars',
-    # Measured by `run_judge_eval` — the population and the slate it BUILT.
+    # Measured by `eval_write_triage_judge.py::run_judge_eval` — the
+    # population and the slate it BUILT.
     'record_count',
     'case_count',
     'candidate_count',
@@ -206,9 +208,9 @@ ATTACH_OUTCOMES: frozenset[str] = frozenset({
 #:
 #: ``LABEL_CANONICAL`` is deliberately ABSENT rather than mapped to anything:
 #: a canonical IS the attach target, so submitting one would score the
-#: fixture's construction rather than the judge. :func:`build_judge_cases`
-#: skips those records, and a label in neither this table nor
-#: ``LABEL_CANONICAL`` RAISES.
+#: fixture's construction rather than the judge.
+#: ``eval_write_triage_cases.py::build_judge_cases`` skips those records, and a
+#: label in neither this table nor ``LABEL_CANONICAL`` RAISES.
 ACCEPTABLE_OUTCOMES: dict[str, frozenset[str]] = {
     LABEL_DUPLICATE: frozenset({OUTCOME_RESTATED, OUTCOME_AMENDED}),
     LABEL_DISTINCT: frozenset({OUTCOME_STORED}),

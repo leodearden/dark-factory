@@ -70,9 +70,10 @@ else:
 #: one, so a slate carrying no scores would arrive at the model empty.
 #:
 #: Descending by slate position, which preserves the order
-#: ``build_judge_cases`` chose — the band winner first. These numbers never
-#: reach the model: ``build_judge_prompt`` renders id and text only, no
-#: metadata at all (PRD C1). They exist solely to survive the selector.
+#: ``eval_write_triage_cases.py::build_judge_cases`` chose — the band winner
+#: first. These numbers never reach the model: ``build_judge_prompt`` renders
+#: id and text only, no metadata at all (PRD C1). They exist solely to survive
+#: the selector.
 _SYNTHETIC_TOP_SCORE = 0.90
 _SYNTHETIC_SCORE_STEP = 0.01
 
@@ -99,7 +100,8 @@ def _elision_flags(
 def _usage_row(usage: JudgeUsage | None) -> dict[str, int] | None:
     """The verdict's usage under the artifact's ESTABLISHED keys, or ``None``.
 
-    The key names are kept because ``_spend`` and
+    The key names are kept because
+    ``fused-memory/scripts/eval_write_triage_scoring.py::_spend`` and
     ``fused-memory/scripts/score_write_triage_pairs.py::JudgedCase.from_row``
     read them, and the row carries nothing they do not read. The mapping is
     exact: output (``completion_tokens``) already includes reasoning on both
