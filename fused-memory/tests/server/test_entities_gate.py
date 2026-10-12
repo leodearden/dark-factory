@@ -185,7 +185,7 @@ class TestMalformedDeclarationsAreRejected:
 class TestConflictingDeclarationsAreRejected:
     """The leaf's user-observable signal: a declaration its own prose refutes.
 
-    Every case here reaches ``_conflicting_referents``, whose four documented
+    Every case here reaches ``_conflicting_referents``, whose five documented
     choices this class pins from the OUTSIDE — the scoping rules are gamma's,
     and what delta adds is that a non-empty ``.conflicts`` blocks the write and
     names BOTH sides of the disagreement (INV-2, structured-facts-at-failure).

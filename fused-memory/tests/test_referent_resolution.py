@@ -1954,19 +1954,20 @@ class TestKnownProjectIdsNarrowing:
         no longer evidence of a conflict, while an in-registry one still is.
 
         The result holds the contradicted DECLARED referents, not the scanned
-        ones (``_conflicting_referents``), so both arms assert on 'Task 3127'
-        and the registry moves it between present and absent.
+        ones (``_conflicting_referents``), so both arms assert on 'Task 132'
+        — contradicted on the project axis — and the registry moves it between
+        present and absent.
         """
         genuine = resolve_referents(
-            declared=[{'kind': 'task', 'id': 3127}],
+            declared=[{'kind': 'task', 'id': 132}],
             metadata={},
             content='mirrors reify:132',
             group_id=GROUP,
             known_project_ids=self.REGISTRY,
         )
-        assert genuine.conflicts == (Referent(kind='task', number='3127'),)
+        assert genuine.conflicts == (Referent(kind='task', number='132'),)
         junk = resolve_referents(
-            declared=[{'kind': 'task', 'id': 3127}],
+            declared=[{'kind': 'task', 'id': 132}],
             metadata={},
             content='mirrors evil_proj:132',
             group_id=GROUP,

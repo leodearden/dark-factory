@@ -37,12 +37,13 @@ assumes completeness (PRD resolved decision 8): a node named with bare digits
 or codename aliases ('Task θ2=2184') are all invisible to the DERIVED path by
 design. Precision over recall — consumers perform destructive edge surgery, so
 a false positive misattributes a fact. The load-bearing consequence is in
-:func:`resolve_referents`: an empty scan is UNINFORMATIVE, never contradictory,
-so it can never produce a conflict and can never reject an honest write. The
-same reasoning scopes a FOREIGN declaration's conflict test to the project it
-names: the scan reaches a foreign task ONLY through an explicit qualifier, so
-its silence about that project is silence rather than disagreement
-(:func:`_conflicting_referents`, choice 2).
+:func:`_conflicting_referents`: the scan's silence about a declared referent is
+UNINFORMATIVE PER REFERENT, never contradictory, whatever else the scan saw. A
+declared referent the scan did not name conflicts only on positive evidence
+(choices 4 and 5), so a blind spot can never reject an honest write. The same
+reasoning scopes a FOREIGN declaration's conflict test to the project it names:
+the scan reaches a foreign task ONLY through an explicit qualifier, so its
+silence about that project is silence rather than disagreement (choice 2).
 
 This module also owns the caller-facing teaching of the shape it enforces
 (:func:`render_referent_declaration_guidance`), so that the rule and the way it
@@ -59,6 +60,7 @@ from __future__ import annotations
 
 from collections.abc import Collection
 from dataclasses import dataclass
+from itertools import groupby
 from typing import Literal, get_args
 
 from fused_memory.utils.canonical_labels import (
@@ -182,7 +184,10 @@ class ReferentResolution:
     #: regardless of ``.source``.
     referents: ReferentSet = ()
     #: DECLARED referents the scanned content contradicts — a declared referent
-    #: of kind K whose kind the scan did see, but which the scan did not name.
+    #: the scan did not name, judged PER REFERENT: it conflicts only when a
+    #: scanned referent of its kind carries its number under another project,
+    #: or is a one-edit near-miss of a number the content writes nowhere
+    #: (``_conflicting_referents``, choices 4 and 5).
     #:
     #: Populated on the ``'declared'`` path ONLY. Ambient ``metadata.task_id``
     #: is not a claim about the prose (an agent working on task 3668
@@ -283,15 +288,55 @@ def local_referent(referent: Referent, *, group_id: str) -> Referent:
     return referent
 
 
-def _conflicting_referents(declared: ReferentSet, scan: LabelScan) -> ReferentSet:
+def _written_numbers(content: str) -> frozenset[str]:
+    """Every maximal run of ASCII digits *content* writes, scannable or not."""
+    return frozenset(
+        ''.join(run) for is_digit, run in groupby(content, key=_is_task_number) if is_digit
+    )
+
+
+def _one_typo_apart(declared: str, scanned: str) -> bool:
+    """Whether two digit strings are exactly one Damerau edit apart.
+
+    One substitution or one adjacent transposition between equal lengths, or
+    one insertion/deletion between lengths that differ by one. Equal strings
+    are zero edits apart.
+    """
+    if len(declared) == len(scanned):
+        diffs = [i for i, (a, b) in enumerate(zip(declared, scanned, strict=True)) if a != b]
+        if len(diffs) == 2:
+            i, j = diffs
+            return j == i + 1 and (declared[i], declared[j]) == (scanned[j], scanned[i])
+        return len(diffs) == 1
+    shorter, longer = sorted((declared, scanned), key=len)
+    return len(longer) - len(shorter) == 1 and any(
+        longer[:i] + longer[i + 1:] == shorter for i in range(len(longer))
+    )
+
+
+def _contradicts(declared: Referent, scanned: Referent, *, written: frozenset[str]) -> bool:
+    """Whether *scanned* is positive evidence against an unnamed *declared*.
+
+    PROJECT axis: the same number, which within one kind bucket means another
+    project's task. TYPO axis: a one-edit near-miss, unless the content itself
+    writes the declared number somewhere in *written*.
+    """
+    if scanned.number == declared.number:
+        return True
+    return declared.number not in written and _one_typo_apart(declared.number, scanned.number)
+
+
+def _conflicting_referents(
+    declared: ReferentSet, scan: LabelScan, *, content: str
+) -> ReferentSet:
     """The declared referents the scanned content CONTRADICTS.
 
-    A declared referent ``d`` conflicts iff the scan found at least one
+    A declared referent ``d`` conflicts iff the scan did not name it and a
     referent that COULD have corroborated it — same kind, and for a FOREIGN
-    declaration the same project — and ``d`` is not among them. Declared order
-    is preserved; the result is de-duplicated.
+    declaration the same project — is positive evidence against it (choice
+    5). Declared order is preserved; the result is de-duplicated.
 
-    Four load-bearing choices, each invisible from the code alone:
+    Five load-bearing choices, each invisible from the code alone:
 
     1. KIND-SCOPED, not global. ``_KIND_LABELS`` holds one entry today, so the
        scoping is a no-op and NO test can construct a second kind — the guard
@@ -324,17 +369,33 @@ def _conflicting_referents(declared: ReferentSet, scan: LabelScan) -> ReferentSe
        names an AMBIGUOUS referent counts as RESOLVING the ambiguity rather
        than contradicting it — the single most useful thing a declaration can
        do.
-    4. An EMPTY per-kind scan never conflicts. This is the load-bearing
+    4. Silence is uninformative PER REFERENT: a declared referent the scan did
+       not name conflicts only on positive evidence. This is the load-bearing
        consequence of resolved decision 8: the scanner cannot see bare-digit
-       node names, title-only references or Greek-letter aliases, so its
-       SILENCE is uninformative and must not reject an honest write.
+       node names, title-only references, Greek-letter aliases, list
+       continuations or non-task vocabulary, and it is exactly as blind to a
+       referent beside a scannable task as it is alone. Read per KIND, its
+       silence rejected 'Merged task-173-fillet-fix after task 170 landed.'
+       declaring 173, purely because Task 170 was visible.
+    5. Two evidence axes (:func:`_contradicts`). PROJECT: a scanned referent
+       carries the declared number under another project. TYPO: a scanned
+       number is one Damerau edit from the declared one AND the declared
+       number is written nowhere in the content as a digit run. The
+       literal-presence clause exists because list continuations ('Tasks
+       5949/5849') and consecutively filed siblings (4754/4755) make a scanned
+       near-miss routine for honest writes, and a declaration that copies a
+       number the prose itself wrote is not a typo of the declaration. A real
+       typo — 3129 declared beside 'Task 3127' — is written nowhere.
 
     The rejected alternative — a set-level "declared and scanned are disjoint"
     verdict — is more permissive but stops catching ``[3127, 3129]`` where 3129
     is an adjacent-number typo and 3127 corroborates, which is precisely the
     misattribution this PRD exists to prevent. A per-ref list is also strictly
     more informative: δ can derive the disjoint verdict from it, not the
-    reverse.
+    reverse. The same example bounds choice 5: an honest sibling declared by
+    number, written nowhere, beside a scanned one-edit sibling is
+    indistinguishable from that typo and still conflicts; writing it as
+    'task NNN' resolves it.
 
     The result is de-duplicated HERE as a function-LOCAL guarantee, not a
     caller-dependency. Through :func:`resolve_referents` the branch cannot fire
@@ -350,6 +411,7 @@ def _conflicting_referents(declared: ReferentSet, scan: LabelScan) -> ReferentSe
     scan_by_kind: dict[str, set[Referent]] = {}
     for referent in scan.refs + scan.ambiguous:
         scan_by_kind.setdefault(referent.kind, set()).add(referent)
+    written = _written_numbers(content)
 
     conflicts: list[Referent] = []
     seen: set[Referent] = set()
@@ -360,7 +422,9 @@ def _conflicting_referents(declared: ReferentSet, scan: LabelScan) -> ReferentSe
             # THAT project are evidence about it. An own-project declaration
             # (project_id == '') deliberately keeps the whole-kind bucket.
             scanned = {ref for ref in scanned if ref.project_id == referent.project_id}
-        if not scanned or referent in scanned:
+        if referent in scanned or not any(
+            _contradicts(referent, ref, written=written) for ref in scanned
+        ):
             continue
         if referent in seen:
             continue
@@ -802,7 +866,7 @@ def resolve_referents(
             # untouched by a conflict. γ is mechanism and δ is policy — a
             # resolver that degraded to the scan here would produce a write the
             # caller never asked for.
-            conflicts=_conflicting_referents(declared_referents, scan),
+            conflicts=_conflicting_referents(declared_referents, scan, content=content or ''),
             ambiguous=ambiguous,
         )
 
