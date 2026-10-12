@@ -1550,3 +1550,39 @@ def test_a_reply_shaped_as_the_prompt_prescribes_reaches_the_merger():
     merged_text = json.dumps(merged)
     assert populated
     assert [value for value in populated if value not in merged_text] == []
+
+
+@pytest.mark.parametrize(
+    ("reply", "named_key"),
+    [
+        ({"verified": False, "reason": "cannot verify the cluster"}, "matches"),
+        ({}, "candidates"),
+        ({"matches": []}, "candidates"),
+        ({"hits": [{"entry_id": "one-shot-subagent-contract"}], "candidates": []}, "matches"),
+        ({"matches": None, "candidates": []}, "matches"),
+        ({"verified": False, "reason": REAL_CLI_CAP_MESSAGES[0]}, "matches"),
+    ],
+    ids=[
+        "foreign_verdict_shape",
+        "empty_object",
+        "candidates_missing",
+        "renamed_key",
+        "null_where_a_list_is_prescribed",
+        "foreign_verdict_quoting_a_banner",
+    ],
+)
+def test_code_digest_a_reply_off_the_prescribed_schema_is_a_failure_not_an_empty_verdict(
+    reply, named_key
+):
+    """A parsed reply missing a key build_prompt prescribes is not "coded fine,
+    found nothing" (never-fabricate)."""
+    result = mod.code_digest(
+        _hand_digest(_SESSION_ID, "marker"), _tiny_codebook(), project="dark_factory",
+        invariant_slugs=_NO_SLUGS, invoke=lambda prompt, model: json.dumps(reply),
+    )
+
+    assert result.ok is False
+    assert result.record is None
+    assert result.capped is False
+    assert result.session == _SESSION_ID
+    assert named_key in result.reason
