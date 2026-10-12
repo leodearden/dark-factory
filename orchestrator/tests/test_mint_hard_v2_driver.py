@@ -21,6 +21,7 @@ from types import ModuleType
 from typing import Any
 
 import pytest
+from shared.project_layout import runs_db, tasks_db
 
 # Matches the parents[2] convention used by conftest.py and the sibling
 # evals tests (test_eval_bootstrap_smoke.py). Defined locally rather than
@@ -224,6 +225,33 @@ class TestCensusFilter:
         db = _make_runs_db(tmp_path, _CENSUS_ROWS)
         durations = driver.census_durations_ms(db)
         assert sorted(durations) == [600_000, 900_000, 1_200_000]
+
+
+class TestCollectCandidatesReadsTheLayoutStores:
+    def test_reads_runs_db_and_tasks_db_where_the_shared_layout_puts_them(
+        self, tmp_path: Path,
+    ) -> None:
+        root = tmp_path / 'checkout'
+        census_db = _make_runs_db(tmp_path, [
+            {'task_id': '100', 'data': '{"subtype": "error_max_turns", "turns": 121}'},
+        ])
+        runs_db(root).parent.mkdir(parents=True)
+        census_db.rename(runs_db(root))
+        tasks_db(root).parent.mkdir(parents=True)
+        conn = sqlite3.connect(tasks_db(root))
+        conn.execute(
+            'CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, '
+            'description TEXT, status TEXT, metadata TEXT)'
+        )
+        conn.execute(
+            "INSERT INTO tasks VALUES ('100', 'the seeded title', NULL, 'done', NULL)"
+        )
+        conn.commit()
+        conn.close()
+
+        (cand,) = driver.collect_candidates('reify', root)
+
+        assert (cand.task_id, cand.title) == ('100', 'the seeded title')
 
 
 # ---------------------------------------------------------------------------
