@@ -1091,7 +1091,7 @@ class TestMalformedDeclarationIsRejectedLoudly:
     ):
         """The declared path never mints a foreign node for a Unicode
         lookalike of task vocabulary. ``str.lower()`` does not fold the long
-        s, so the long-s spelling reaches the vocabulary guard unrecognised,
+        s, so the vocabulary guard would not recognise the long-s spelling,
         and only ``validate_project_id``'s ASCII allowlist stops it.
         ``str.lower()`` does fold the Kelvin sign, so the Kelvin spelling
         passes the allowlist as ``'task'``, and the vocabulary guard stops
