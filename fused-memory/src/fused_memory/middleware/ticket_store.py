@@ -35,6 +35,7 @@ from shared.async_sqlite_base import (
     apply_full_durability_pragmas,
     connect_daemon,
 )
+from shared.sqlite_column_migration import add_column_if_missing
 
 from fused_memory.middleware.curation_deferral import DeferReason, deferral_justification
 
@@ -252,14 +253,11 @@ class TicketStore:
         """Add the ``escalated_at`` column to existing DBs that pre-date it.
 
         ``CREATE TABLE IF NOT EXISTS`` is a no-op on existing tables, so the
-        column needs an explicit ALTER for legacy DBs. Idempotent: probes
-        ``PRAGMA table_info`` first.
+        column needs an explicit ALTER for legacy DBs.
         """
-        access = self._require_access()
-        cols = {row[1] for row in await access.read_all('PRAGMA table_info(tickets)')}
-        if 'escalated_at' not in cols:
-            async with access.write() as db:
-                await db.execute('ALTER TABLE tickets ADD COLUMN escalated_at TEXT')
+        async with self._require_access().write() as db:
+            added = await add_column_if_missing(db, 'tickets', 'escalated_at', 'TEXT')
+        if added:
             logger.info('TicketStore: migrated tickets table — added escalated_at column')
 
     async def _migrate_add_curation_retry_columns(self) -> None:

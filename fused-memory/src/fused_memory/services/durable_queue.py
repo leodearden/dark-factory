@@ -25,6 +25,7 @@ from shared.async_sqlite_base import (
     apply_full_durability_pragmas,
     connect_daemon,
 )
+from shared.sqlite_column_migration import add_column_if_missing
 
 logger = logging.getLogger(__name__)
 
@@ -337,30 +338,15 @@ class DurableWriteQueue:
 
         ``CREATE TABLE IF NOT EXISTS`` is a no-op against an existing table, so
         additive changes need an explicit ALTER for DBs already on disk.
-        Idempotent: probes ``PRAGMA table_info`` first.
 
         No ``PRAGMA user_version`` ladder — the project's rule (stated in
         orchestrator/run_store.py) is that purely additive changes use this
         light feature-detect idiom.
         """
-        access = self._require_access()
-        cols = {row[1] for row in await access.read_all('PRAGMA table_info(write_queue)')}
-        if 'executed' not in cols:
-            try:
-                async with access.write() as db:
-                    await db.execute('ALTER TABLE write_queue ADD COLUMN executed INTEGER')
-                logger.info(
-                    'DurableWriteQueue: migrated write_queue — added executed column'
-                )
-            except Exception as exc:
-                # Multiple processes can open this same DB file, so two
-                # initialize() calls can race between the probe and the ALTER.
-                # Losing that race is benign; anything else is not.
-                if 'duplicate column name' not in str(exc).lower():
-                    raise
-                logger.debug(
-                    'DurableWriteQueue: executed column already exists (concurrent init)'
-                )
+        async with self._require_access().write() as db:
+            added = await add_column_if_missing(db, 'write_queue', 'executed', 'INTEGER')
+        if added:
+            logger.info('DurableWriteQueue: migrated write_queue — added executed column')
 
     async def close(self) -> None:
         self._closed = True
