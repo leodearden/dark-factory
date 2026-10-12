@@ -8,7 +8,7 @@ nothing. See plans/recon-stage-startup-wedge-rca-2026-09-27.md.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -19,9 +19,10 @@ from shared.cli_invoke import AgentResult
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import StageAgentOutcome, StageId, StageReport
 from fused_memory.reconciliation.cli_stage_runner import StageResult, run_stage_via_cli
-from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 from fused_memory.reconciliation.sandbox_guard import RemediationSandboxUnavailable
 from fused_memory.reconciliation.summary_pool import write_cycle_summary
+from fused_memory.services.memory_service import MemoryService
 
 _INVOKE = 'fused_memory.reconciliation.cli_stage_runner.invoke_with_cap_retry'
 _RESOLVE_SANDBOX = 'fused_memory.reconciliation.cli_stage_runner.resolve_recon_sandbox_wrap'
@@ -212,3 +213,97 @@ class TestCycleSummaryRecordsAgentOutcome:
 
         assert payload['agent_outcome'] is None
         assert 'Agent outcome: unrecorded' in mirror['content']
+
+
+class TestPresenceReportsAgentOutcome:
+    _PROJECT_ID = 'dark_factory'
+    _STAGE = 'task_knowledge_sync'
+
+    @pytest_asyncio.fixture
+    async def service(self, mock_config, tmp_path):
+        service = MemoryService(mock_config)
+        store = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await store.initialize()
+        service.set_recon_ledger(store)
+        service.add_system_record = AsyncMock(return_value=SimpleNamespace(memory_ids=['m1']))
+        service.get_memories_by_metadata = AsyncMock(return_value=[])
+        yield service
+        await store.close()
+
+    async def _presence(self, service: MemoryService, run_id: str) -> dict:
+        return await service.get_cycle_summary_presence(
+            project_id=self._PROJECT_ID, run_id=run_id, stage=self._STAGE,
+        )
+
+    async def _upsert_raw_payload(self, service: MemoryService, run_id: str, payload: dict):
+        now = datetime.now(UTC)
+        await service.recon_ledger.upsert(ReconLedgerRecord(
+            project_id=self._PROJECT_ID,
+            record_kind='cycle_summary',
+            task_id='',
+            flag_type=self._STAGE,
+            run_id=run_id,
+            payload_json=json.dumps(payload),
+            state='active',
+            created_at=now.isoformat(),
+            expires_at=(now + timedelta(days=7)).isoformat(),
+        ))
+
+    @pytest.mark.asyncio
+    async def test_written_wedge_kill_is_reported(self, service):
+        await write_cycle_summary(
+            service,
+            self._PROJECT_ID,
+            _stage_report(agent_outcome=StageAgentOutcome.zero_output_timeout, llm_calls=0),
+            'run-wedged',
+            stage=self._STAGE,
+            recon_pool='stage2_cycle_summary',
+            trim_source='stage2_cycle_summary_trim',
+            cap=2,
+        )
+
+        result = await self._presence(service, 'run-wedged')
+
+        assert result.get('present') is True
+        assert result.get('agent_outcome') == 'zero_output_timeout'
+
+    @pytest.mark.asyncio
+    async def test_legacy_row_without_the_key_is_unrecorded(self, service):
+        await self._upsert_raw_payload(service, 'run-legacy', {'stage': self._STAGE, 'llm_calls': 0})
+
+        result = await self._presence(service, 'run-legacy')
+
+        assert result.get('present') is True
+        assert 'agent_outcome' in result
+        assert result['agent_outcome'] is None
+
+    @pytest.mark.asyncio
+    async def test_corrupt_value_degrades_to_unrecorded(self, service):
+        await self._upsert_raw_payload(
+            service, 'run-corrupt', {'stage': self._STAGE, 'agent_outcome': 'not-a-real-outcome'},
+        )
+
+        result = await self._presence(service, 'run-corrupt')
+
+        assert result.get('present') is True
+        assert 'agent_outcome' in result
+        assert result['agent_outcome'] is None
+
+    @pytest.mark.asyncio
+    async def test_absent_row_carries_no_outcome(self, service):
+        result = await self._presence(service, 'run-never-written')
+
+        assert result.get('present') is False
+        assert result.get('ledger_available') is True
+        assert 'agent_outcome' in result
+        assert result['agent_outcome'] is None
+
+    @pytest.mark.asyncio
+    async def test_unwired_ledger_carries_no_outcome(self, mock_config):
+        service = MemoryService(mock_config)
+
+        result = await self._presence(service, 'run-anything')
+
+        assert result.get('ledger_available') is False
+        assert 'agent_outcome' in result
+        assert result['agent_outcome'] is None
