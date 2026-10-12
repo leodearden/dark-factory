@@ -31,7 +31,7 @@ Required sections, in order. Measurements from the quality doc's `Do not steer b
      metrics_snapshot: {path: plans/quality-metrics/<run_id>.json, diffed_against: <path | none>}
      key_implementation: <shared/src/shared/finding_key.py | skills/hotspot-survey/scripts/findings_artefact.py>
    ```
-   A prior report that predates the contract (no `as_of_sha`) is stale by definition and is listed in `inputs_consumed` as `legacy:<path>`. Prose after the block may expand any of these; nothing in the prose contradicts the block. The prose closes with the **read coverage** table — one row per seat: files read fully, indexed, read partially (`read_coverage.partial`, with lines read verbatim), lines read — so a reader can see what was *not* read.
+   A prior report that predates the contract (no `as_of_sha`) is stale by definition and is listed in `inputs_consumed` as `legacy:<path>`. Prose after the block may expand any of these; nothing in the prose contradicts the block. The prose closes with the **read coverage** table — one row per seat: files read fully and how many of them for the first time (not under `files_read_fully` or `partial` in the previous `/review-all` record; SKILL.md Phase 1 §Rotation), indexed, read partially (`read_coverage.partial`, with lines read verbatim), lines read against `planned_lines` — so a reader can see what was *not* read.
 2. **`## Metrics snapshot`** — a report, never a gate, rendered from the committed `plans/quality-metrics/<run_id>.json` (its home; `extra.metrics_snapshot` names it): per area, the §What to measure instruments — cognitive complexity read as the pair (max per function, module total) for the top files, fan-in/fan-out, reach-back imports, deferred imports and how many close a cycle, cycles, hidden cycles and typing cycles, re-export shims, distinct test patch targets into privates, prose share, files over the soft ceiling and the alarm; the whole-repo totals; and a `delta vs since` column diffed against the one previous snapshot nearest `since`, named in the section (same instrument, same rule — say the rule). Line counts appear as the read-budget figure they are, with the doc's caveat cited, never as a ranking.
 3. **`## Instrument freshness`** — table: instrument, latest run id, its `as_of_sha`, commits since (`git rev-list --count`), verdict (`fresh` / `stale → re-run as <run_id>` / `stale → not re-run, why`), open findings consumed.
 4. **`## Area × heuristic view`** — the synthesis `matrix`: rows are areas, columns the primary tags that have findings; each cell lists keys best payoff first with severity and verdict glyphs. Standing findings are shown in a separate row style and never ranked. One ranking rule, stated once above the table.
@@ -63,7 +63,7 @@ The Phase 5 digest of the workflow result, with keys minted; the markdown above 
   "prior_verdicts": [ {canonical, key, sub_area?, status, checked, gone_verdict?} ],
   "unchecked": [ {canonical, key, seat, sub_area?, why} ],
   "h14_measurements": [ ... as emitted ... ],
-  "read_coverage": [ {seat, files_read_fully, files_indexed, partial: [{path, lines_read_verbatim, how}], lines_read} ],
+  "read_coverage": [ {seat, files_read_fully, read_fully_first_time, files_indexed, partial: [{path, lines_read_verbatim, how}], lines_read, planned_lines} ],
   "short_ids": [ {id, canonical} ],
   "synthesis": { matrix, streams, invariant_candidates, contradictions, exonerations, method, unresolved_ids },
   "critic": { join_errors, verdict, notes, synthesis_revised },
