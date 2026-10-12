@@ -15,7 +15,7 @@ from __future__ import annotations
 import inspect
 import logging
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from uuid import uuid4
@@ -209,3 +209,122 @@ class TestNamesATarget:
         param = inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD)
 
         assert common.names_a_target(param) is expected
+
+
+def _report(
+    evaluate: Callable[[list[str]], int], capsys: pytest.CaptureFixture[str],
+) -> tuple[int, list[str]]:
+    """``(rc, stdout lines)`` of one ``report_fail_closed`` run."""
+    rc = common.report_fail_closed(evaluate)
+    return rc, capsys.readouterr().out.splitlines()
+
+
+def _probe_logger() -> logging.Logger:
+    return logging.getLogger(common.PROBE_LOGGER_NAME)
+
+
+class TestReportFailClosed:
+    def test_a_verdict_is_written_as_reported(
+        self, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        def evaluate(out: list[str]) -> int:
+            out.extend(['line one', 'line two'])
+            return common.EXIT_OK
+
+        rc = common.report_fail_closed(evaluate)
+
+        assert rc == common.EXIT_OK
+        assert capsys.readouterr().out == 'line one\nline two\n'
+
+    def test_an_unverifiable_invariant_fails_closed(
+        self, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        def evaluate(out: list[str]) -> int:
+            raise common.Unverifiable('why')
+
+        rc, lines = _report(evaluate, capsys)
+
+        assert rc == common.EXIT_FAIL
+        assert 'FAIL  UNVERIFIABLE: why' in lines
+        assert any('Failing closed' in line for line in lines)
+
+    @pytest.mark.parametrize(
+        ('escape', 'named'),
+        [(SystemExit(0), 'SystemExit'), (KeyboardInterrupt(), 'KeyboardInterrupt')],
+        ids=['system-exit-0', 'ctrl-c'],
+    )
+    def test_an_escape_from_the_evaluation_fails_closed(
+        self,
+        escape: BaseException,
+        named: str,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # SystemExit(0) out of the ref's code once exited 0 having printed
+        # nothing, which the gate read as PASS.
+        def evaluate(out: list[str]) -> int:
+            raise escape
+
+        rc, lines = _report(evaluate, capsys)
+
+        assert rc == common.EXIT_FAIL
+        verdicts = [line for line in lines if line.startswith('FAIL  UNVERIFIABLE')]
+        assert verdicts, lines
+        assert named in '\n'.join(lines)
+
+    def test_warnings_come_last_prefixed_and_once_each(
+        self, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        def evaluate(out: list[str]) -> int:
+            _probe_logger().warning('w1')
+            _probe_logger().warning('w1')
+            _probe_logger().warning('w2')
+            _probe_logger().info('quiet')
+            out.append('body')
+            return common.EXIT_OK
+
+        _, lines = _report(evaluate, capsys)
+
+        assert lines[-3:] == ['body', 'WARN  w1', 'WARN  w2']
+        assert not any('quiet' in line for line in lines)
+
+    def test_warnings_follow_an_unverifiable_verdict(
+        self, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        def evaluate(out: list[str]) -> int:
+            _probe_logger().warning('w1')
+            raise common.Unverifiable('why')
+
+        _, lines = _report(evaluate, capsys)
+
+        assert lines[-1] == 'WARN  w1'
+        assert lines.index('FAIL  UNVERIFIABLE: why') < lines.index('WARN  w1')
+
+    def test_the_collector_lives_exactly_one_run(
+        self, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        handlers_before = list(_probe_logger().handlers)
+        propagate_before = _probe_logger().propagate
+
+        _report(lambda out: common.EXIT_OK, capsys)
+        _probe_logger().warning('between')
+        _, lines = _report(lambda out: common.EXIT_OK, capsys)
+
+        assert not any('between' in line for line in lines)
+        assert _probe_logger().handlers == handlers_before
+        assert _probe_logger().propagate is propagate_before
+
+    def test_a_non_fatal_import_failure_reaches_the_report(
+        self,
+        tmp_path: Path,
+        package: str,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        name = f'{package}.mod'
+
+        def evaluate(out: list[str]) -> int:
+            common.import_from_tree(name, tmp_path, mode=_NON_FATAL)
+            return common.EXIT_OK
+
+        _, lines = _report(evaluate, capsys)
+
+        assert any(line.startswith('WARN  ') and name in line for line in lines), lines
