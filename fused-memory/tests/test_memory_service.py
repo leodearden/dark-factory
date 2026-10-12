@@ -19,6 +19,7 @@ from fused_memory.services.memory_service import (
     ReferentRepairStats,
     _is_rate_limit_or_quota_error,
     _serialize_temporal,
+    metadata_row_text,
 )
 from fused_memory.utils.referent_verification import ReferentStats
 
@@ -11662,6 +11663,37 @@ class TestGetMemoryById:
 
         with pytest.raises(TimeoutError):
             await service.get_memory_by_id(project_id='dark_factory', memory_id='u')
+
+
+class TestMetadataRowText:
+    """metadata_row_text: the text of one get_memories_by_metadata row.
+
+    Rows take the real scroll shape ``{'id', 'created_at', 'metadata'}`` of
+    backends/mem0_client.py::Mem0Backend._normalise_point, where ``metadata``
+    is the full payload.
+    """
+
+    def test_reads_the_text_from_the_payload_under_metadata(self):
+        row = {
+            'id': 'u',
+            'created_at': '2026-01-01T00:00:00+00:00',
+            'metadata': {'data': 'the text', 'topic': 't', 'created_at': '2026-01-01T00:00:00+00:00'},
+        }
+
+        assert metadata_row_text(row) == 'the text'
+
+    def test_a_top_level_content_key_is_not_the_rows_text(self):
+        row = {'id': 'u', 'content': 'stray', 'created_at': None, 'metadata': {'topic': 't'}}
+
+        assert metadata_row_text(row) == ''
+
+    @pytest.mark.parametrize(
+        'row',
+        [{'id': 'u'}, {'id': 'u', 'metadata': None}, {'id': 'u', 'metadata': 'not-a-dict'}],
+        ids=['no-metadata-key', 'metadata-none', 'metadata-not-a-dict'],
+    )
+    def test_a_row_without_a_payload_dict_reads_as_empty(self, row):
+        assert metadata_row_text(row) == ''
 
 
 class _FakePointStore:
