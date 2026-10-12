@@ -8,6 +8,7 @@ module only reads them from a root's ``tasks.db`` and decides ok versus blind.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -24,6 +25,7 @@ from dashboard.data.claimant_invariants import (
     read_claimant_candidates,
 )
 from dashboard.data.mcp_fanout import project_label
+from dashboard.data.recurrence_gauge import ChainEntry, classify_chains, read_chain_rows
 
 _COUNT_SQL = 'SELECT COUNT(*) FROM tasks'
 
@@ -42,6 +44,7 @@ class RootInvariants:
     error: str | None
     terminal_tier: TerminalTier | None
     hygiene_tier: HygieneTier | None
+    chains: tuple[ChainEntry, ...] | None
 
     def __post_init__(self) -> None:
         problem = _blind_problem(self) if self.status is ScanStatus.BLIND else _ok_problem(self)
@@ -58,6 +61,7 @@ class RootInvariants:
             'measured_at': self.measured_at.isoformat(),
             'terminal_tier': None if self.terminal_tier is None else self.terminal_tier.to_wire(),
             'hygiene_tier': None if self.hygiene_tier is None else self.hygiene_tier.to_wire(),
+            'chains': None if self.chains is None else [chain.to_wire() for chain in self.chains],
         }
 
 
@@ -70,6 +74,8 @@ def _blind_problem(record: RootInvariants) -> str | None:
         return 'terminal_tier must be None: a blind root makes no count claim'
     if record.hygiene_tier is not None:
         return 'hygiene_tier must be None: a blind root makes no count claim'
+    if record.chains is not None:
+        return 'chains must be None: a blind root makes no chain claim'
     return None
 
 
@@ -82,6 +88,8 @@ def _ok_problem(record: RootInvariants) -> str | None:
         return 'terminal_tier must be present'
     if record.hygiene_tier is None:
         return 'hygiene_tier must be present'
+    if record.chains is None:
+        return 'chains must be present'
     return None
 
 
@@ -94,6 +102,7 @@ def _blind(root: Path, now: datetime, error: str, rows_scanned: int | None = Non
         error=error,
         terminal_tier=None,
         hygiene_tier=None,
+        chains=None,
     )
 
 
@@ -114,6 +123,7 @@ async def scan_root_invariants(
     conn: aiosqlite.Connection | None,
     *,
     now: datetime,
+    pending_escalations: Mapping[str, tuple[str, ...]] | None,
     ttl: timedelta = DEFAULT_CLAIMANT_HEARTBEAT_TTL,
 ) -> RootInvariants:
     """Census one root. Never raises for a failed read: that root alone reports blind.
@@ -121,17 +131,21 @@ async def scan_root_invariants(
     The failure need not be a sqlite or OS error; aiosqlite raises ``ValueError`` on
     a pooled connection closed under the scan. A caller fanning out over the
     roster therefore never loses the other roots' records to one root's failure.
+
+    *pending_escalations* maps a task id to its pending escalation ids; None is unknown.
     """
     if conn is None:
         return _blind(root, now, _unopened_reason(db_path))
     try:
         rows_scanned = await _read_row_count(conn)
         candidates = await read_claimant_candidates(conn)
+        chain_rows = await read_chain_rows(conn)
     except Exception as exc:
         return _blind(root, now, f'{type(exc).__name__}: {exc}')
     if rows_scanned == 0:
         return _blind(root, now, 'scanned 0 rows: nothing scanned is not clean', rows_scanned=0)
     terminal, hygiene = classify_candidates(candidates, now=now, ttl=ttl)
+    chains = classify_chains(chain_rows, now=now, pending_escalations=pending_escalations)
     return RootInvariants(
         root=root,
         status=ScanStatus.OK,
@@ -140,4 +154,5 @@ async def scan_root_invariants(
         error=None,
         terminal_tier=terminal,
         hygiene_tier=hygiene,
+        chains=chains,
     )

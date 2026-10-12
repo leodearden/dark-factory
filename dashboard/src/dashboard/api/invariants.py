@@ -35,7 +35,7 @@ async def api_invariants(request: Request) -> JSONResponse:
     conns = [await pool.get(db_path) for db_path in db_paths]
     records = await asyncio.gather(
         *(
-            scan_root_invariants(root, db_path, conn, now=now)
+            scan_root_invariants(root, db_path, conn, now=now, pending_escalations=None)
             for root, db_path, conn in zip(roots, db_paths, conns, strict=True)
         )
     )
