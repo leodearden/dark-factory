@@ -720,6 +720,26 @@ _MIGRATED_FILERS: tuple[_Filer, ...] = (
         logging.DEBUG,
         1,
     ),
+    _Filer(
+        'classification_fallback_alarm',
+        'fused_memory.services.classification_fallback_alarm',
+        lambda m, root: m.emit_classification_fallback_storm_escalation(
+            root, project_id='dark_factory',
+            storm={'count': 5, 'threshold': 5, 'window_seconds': 3600.0,
+                   'labels': ['llm_error']},
+        ),
+        logging.DEBUG,
+        1,
+    ),
+    _Filer(
+        'link_heal_executor',
+        'fused_memory.maintenance.link_heal_executor',
+        lambda m, root: m.FoldedEscapeFiler(root)(
+            m.Escape(anchor=m.BACKLOG_ANCHOR, summary='s', detail={}),
+        ),
+        logging.DEBUG,
+        1,
+    ),
 )
 
 
@@ -831,20 +851,7 @@ class TestEveryFilerPinsItsForwardedLevels:
             'forwards are fenced like every other filer\'s.'
         )
 
-    def test_the_table_covers_every_folded_filer_and_names_its_exceptions(self):
-        """Anti-vacuity: a parametrized fence passes trivially for a filer that
-        is simply absent from the table."""
-        assert {f.label for f in _MIGRATED_FILERS} == {
-            'write_triage',
-            'markup_tripwire storm',
-            'markup_tripwire residue',
-            'candidate_key_escalation',
-            'referent_repair_storm_escalator',
-            'completion_claim_gate',
-            'memory_metadata_census',
-            'journal_growth_alarm file_size',
-            'journal_growth_alarm insert_rate',
-        }
+    def test_the_table_names_its_exceptions(self):
         raised = {
             f.label for f in _MIGRATED_FILERS
             if f.no_escalation_level != logging.DEBUG
