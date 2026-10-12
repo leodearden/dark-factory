@@ -236,12 +236,12 @@ class TestConflictingDeclarationsAreRejected:
         """
         content = 'dark_factory:2500 blocks task 2500 here'
         block = entities_gate(
-            [{'kind': 'task', 'id': 3129}], content=content, group_id='reify',
+            [{'kind': 'task', 'id': 2501}], content=content, group_id='reify',
         )
 
         assert isinstance(block, dict), f'the ambiguous scan did not reject: {block!r}'
         assert block['error_type'] == 'DeclaredReferentConflictRejected', f'{block!r}'
-        assert block['conflicts'] == ['Task 3129'], f'{block!r}'
+        assert block['conflicts'] == ['Task 2501'], f'{block!r}'
         assert block['content_referents'], (
             f'the content side must never be empty beside a conflict: {block!r}'
         )
@@ -298,21 +298,21 @@ class TestConflictingDeclarationsAreRejected:
     def test_a_foreign_declaration_the_prose_contradicts_is_spelled_foreign(self):
         """The declared side spelled foreign, and choice 2's other half.
 
-        The prose DOES name that project ('reify:3129'), so the foreign
-        declaration's narrowed bucket is non-empty and its silence argument no
-        longer applies — 'reify:132' is contradicted.  Pins that a foreign
-        referent reaches the agent as 'reify:132' and never as 'Task 132',
-        which is the spelling the graph uses and the one leaf zeta emits.
+        The prose DOES name that project ('reify:3129'), and names a near-miss
+        of the declared number inside it — 'reify:3128' is contradicted.  Pins
+        that a foreign referent reaches the agent as 'reify:3128' and never as
+        'Task 3128', which is the spelling the graph uses and the one leaf zeta
+        emits.
         """
         block = entities_gate(
-            [{'kind': 'task', 'id': 132, 'project_id': 'reify'}],
+            [{'kind': 'task', 'id': 3128, 'project_id': 'reify'}],
             content='mirrors reify:3129',
             group_id=GROUP,
         )
 
         assert isinstance(block, dict), f'the foreign conflict did not reject: {block!r}'
-        assert block['declared'] == ['reify:132'], f'{block!r}'
-        assert block['conflicts'] == ['reify:132'], f'{block!r}'
+        assert block['declared'] == ['reify:3128'], f'{block!r}'
+        assert block['conflicts'] == ['reify:3128'], f'{block!r}'
         assert block['content_referents'] == ['reify:3129'], f'{block!r}'
 
     def test_a_foreign_declaration_the_prose_never_mentions_does_not_conflict(self):
@@ -354,6 +354,59 @@ class TestConflictingDeclarationsAreRejected:
         ) is None
 
 
+class TestHonestMixedDeclarationsAreAccepted:
+    """Task 6059's repro table: a declared task the scanner cannot see, beside
+    a task it can.  Every row was rejected before the conflict rule judged the
+    scanner's silence per REFERENT; only a genuine near-miss typo still is."""
+
+    @pytest.mark.parametrize(
+        'content,declared,group_id',
+        [
+            ('Merged task-173-fillet-fix; closes the loop.', [173], 'reify'),
+            ('Merged task-173-fillet-fix after task 170 landed.', [173], 'reify'),
+            ('gate 184 passed; task 190 unblocked.', [184, 190], 'reify'),
+            ('branch task/173 merged; task 5 noted', [173], 'reify'),
+            ('Tasks 5949/5849 both landed.', [5849], GROUP),
+            ('tasks 3659 and 3500 overlap', [3659, 3500], GROUP),
+            ('Tasks 4754 and 4755 closed the lease gap', [4754, 4755], GROUP),
+            ('via carrier 6033, task 6035 landed', [6033, 6035], GROUP),
+            ('task 6181 executor and the 6182 β sitting', [6181, 6182], GROUP),
+            ('(task 6182) renamed 3626 → 6326 (6188)', [6182, 6326, 6188], GROUP),
+            ('matched the live plan exactly: 15+4 detaches', [6182], GROUP),
+        ],
+        ids=[
+            'slug-alone',
+            'slug-beside-task-170',
+            'gate-184',
+            'branch-name',
+            'slash-list',
+            'and-list',
+            'consecutive-siblings',
+            'carrier',
+            'sighting-a',
+            'sighting-b',
+            'sighting-c',
+        ],
+    )
+    def test_the_row_is_accepted(self, content, declared, group_id):
+        assert entities_gate(
+            [{'kind': 'task', 'id': number} for number in declared],
+            content=content,
+            group_id=group_id,
+        ) is None
+
+    def test_a_near_miss_typo_beside_an_unscannable_slug_still_blocks(self):
+        block = entities_gate(
+            [{'kind': 'task', 'id': 3129}],
+            content='Merged task-173-fillet-fix after task 3127 landed.',
+            group_id=GROUP,
+        )
+
+        assert isinstance(block, dict), f'the near-miss typo was not caught: {block!r}'
+        assert block['error_type'] == 'DeclaredReferentConflictRejected', f'{block!r}'
+        assert block['conflicts'] == ['Task 3129'], f'{block!r}'
+
+
 class TestTheGateStaysPermissiveWhileTheProducerNarrows:
     """The gate acquires no project registry (task 5262 workstream B).
 
@@ -375,7 +428,7 @@ class TestTheGateStaysPermissiveWhileTheProducerNarrows:
         would drop it, empty the content side, and let a contradicted
         declaration through."""
         block = entities_gate(
-            [{'kind': 'task', 'id': 3129}],
+            [{'kind': 'task', 'id': 132}],
             content='mirrors evil_proj:132',
             group_id=GROUP,
             agent_id='claude-interactive',
@@ -383,7 +436,7 @@ class TestTheGateStaysPermissiveWhileTheProducerNarrows:
 
         assert isinstance(block, dict), f'the junk-qualified conflict was not caught: {block!r}'
         assert block['error_type'] == 'DeclaredReferentConflictRejected', f'{block!r}'
-        assert block['conflicts'] == ['Task 3129'], f'{block!r}'
+        assert block['conflicts'] == ['Task 132'], f'{block!r}'
         assert block['content_referents'] == ['evil_proj:132'], f'{block!r}'
 
 

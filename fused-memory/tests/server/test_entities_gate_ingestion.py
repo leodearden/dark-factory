@@ -420,7 +420,7 @@ class TestAddEpisodeEntitiesGate:
             server,
             content=_COMPLETION_CONTENT,
             agent_id='recon-stage-task_knowledge_sync',
-            entities=_CONFLICTING,
+            entities=[{'kind': 'task', 'id': 5253}],
         )
 
         assert result.get('error_type') == 'DeclaredReferentConflictRejected', f'{result!r}'
