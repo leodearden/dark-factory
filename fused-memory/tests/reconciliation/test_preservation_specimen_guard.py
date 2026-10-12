@@ -31,6 +31,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 
 from fused_memory.models.reconciliation import (
     ReconciliationRun,
@@ -40,6 +41,7 @@ from fused_memory.models.reconciliation import (
     StageReport,
 )
 from fused_memory.reconciliation import preservation_specimen_guard
+from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.preservation_specimen_guard import (
     CANDIDATE_TASK_IDS_STAT,
     CATEGORY_PRESERVATION_SPECIMEN_STORM,
@@ -58,6 +60,8 @@ from fused_memory.reconciliation.preservation_specimen_guard import (
     maybe_escalate_preservation_suppression_storm,
     preservation_mem0_filters,
 )
+from fused_memory.reconciliation.stats_verifier import verify_and_rewrite_stats
+from fused_memory.services.write_journal import WriteJournal
 
 # ── Live corroboration strings, copied verbatim from the base branch ─────────
 # Re-verify at any time:
@@ -2086,6 +2090,77 @@ class TestUnresolvedCorroborationPersistence:
         )
 
         assert escalated == [UNRESOLVED_CORROBORATION_SUBJECT]
+
+
+class TestObservationSurvivesTheRealJournal:
+    """The observation stats survive the path a past pass's report actually takes.
+
+    Every other persistence test hands the guard ready-made runs.  This one
+    writes them the way the harness does — ``verify_and_rewrite_stats`` then
+    ``update_run_stage_reports`` — and lets the guard read them back through
+    ``get_recent_runs``, so a serializer or verifier change that drops the two
+    list stats breaks here rather than silently disabling the disclosure.
+    """
+
+    @pytest_asyncio.fixture
+    async def journal(self, tmp_path):
+        journal = ReconciliationJournal(tmp_path / 'recon')
+        await journal.initialize()
+        yield journal
+        await journal.close()
+
+    @pytest_asyncio.fixture
+    async def write_journal(self, tmp_path):
+        write_journal = WriteJournal(tmp_path / 'wj')
+        await write_journal.initialize()
+        yield write_journal
+        await write_journal.close()
+
+    @staticmethod
+    async def _persist_pass(journal, write_journal, run_id, result, *, minutes_ago):
+        at = datetime.now(UTC) - timedelta(minutes=minutes_ago)
+        await journal.start_run(ReconciliationRun(
+            id=run_id, project_id=PROJECT, run_type=RunType.full,
+            trigger_reason='test', started_at=at,
+        ))
+        stage_reports: dict[str, StageReport | dict] = {
+            _STAGE_KEY: StageReport(
+                stage=StageId.memory_consolidator, started_at=at, completed_at=at,
+                stats={
+                    CANDIDATE_TASK_IDS_STAT: list(result.candidate_task_ids),
+                    UNRESOLVED_TASK_IDS_STAT: list(result.unresolved_task_ids),
+                },
+            ),
+        }
+        await verify_and_rewrite_stats(run_id, stage_reports, write_journal)
+        await journal.update_run_stage_reports(run_id, stage_reports)
+
+    @pytest.mark.asyncio
+    async def test_persisted_passes_bring_a_task_to_the_threshold(
+        self, journal, write_journal, tmp_path,
+    ):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'escalations')
+        stranded = _unresolved_result('3105', candidates=('4102',))
+        for n in range(1, UNRESOLVED_CORROBORATION_STREAK_THRESHOLD):
+            await self._persist_pass(
+                journal, write_journal, f'prior-{n}', stranded, minutes_ago=10 * n,
+            )
+        await journal.start_run(ReconciliationRun(
+            id='current', project_id=PROJECT, run_type=RunType.full,
+            trigger_reason='test', started_at=datetime.now(UTC),
+        ))
+
+        escalated = await maybe_escalate_preservation_suppression_storm(
+            queue, PROJECT, 'current', stranded, journal=journal, stage_key=_STAGE_KEY,
+        )
+
+        assert escalated == [UNRESOLVED_CORROBORATION_SUBJECT]
+        (pending,) = queue.get_by_task(
+            UNRESOLVED_CORROBORATION_SUBJECT, status='pending', level=1,
+        )
+        assert f'3105 ({UNRESOLVED_CORROBORATION_STREAK_THRESHOLD} passes)' in pending.detail
 
 
 class TestCompositeFlagTaskIds:
