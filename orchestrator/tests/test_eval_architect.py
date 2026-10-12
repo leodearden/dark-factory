@@ -670,7 +670,7 @@ class TestScorePlanStructure:
 # instruments (task 3410)
 #
 # score_plan_structure and judge_plan_quality reduce onto the SAME axis
-# (EvalMetrics.plan_quality), so — exactly as is_scorable_plan (below) is the
+# (EvalMetrics.plan_quality), so — exactly as plan_predicates.is_scorable_plan is the
 # ONE scorability predicate both instruments call — clamp_unit_score is the
 # ONE range/rounding contract both instruments call. Pinning it directly here
 # is the anti-drift anchor: a future edit to either instrument cannot drift
@@ -1374,7 +1374,8 @@ class TestJudgePlanQualityRefusesAnUnjudgeableArtifact:
         is what pins the floor as a refusal value rather than a universal
         substitute.
         """
-        from orchestrator.evals.judge import is_scorable_plan, score_plan_structure
+        from orchestrator.evals.judge import score_plan_structure
+        from orchestrator.evals.plan_predicates import is_scorable_plan
 
         caplog.set_level(logging.WARNING, logger='orchestrator.evals.judge')
         assert is_scorable_plan(plan)
@@ -2995,8 +2996,10 @@ class TestSteplessPlanIsNeverJudged:
         produced_a_plan against a copy of run_architect_eval's derivation living
         in this file, and would stay green while the two surfaces diverged.
         """
-        from orchestrator.evals.judge import is_scorable_plan
-        from orchestrator.evals.metrics import produced_a_plan
+        from orchestrator.evals.plan_predicates import (
+            is_scorable_plan,
+            produced_a_plan,
+        )
 
         _, mocks = await _run_architect_eval_hermetic(
             self._cfg(),

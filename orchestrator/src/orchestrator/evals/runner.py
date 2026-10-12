@@ -58,6 +58,7 @@ from .metrics import (
     resolve_cost_usd,
     resolve_terminal_kind,
 )
+from .plan_predicates import is_scorable_plan
 from .profile import apply_eval_profile
 from .replay_frame import REPLAY_FRAME_ID, ReplayFramedBriefingAssembler
 from .results import CellName, EvalResult, ResultStore
@@ -834,7 +835,7 @@ async def run_architect_eval(
     ground truth since ζ fixtures frequently carry ``plan: null``), degrading to
     the deterministic :func:`score_plan_structure` floor on ANY judge failure.
     The judge is reached only for a plan that is
-    :func:`~orchestrator.evals.judge.is_scorable_plan` (task 3302), and the
+    :func:`~orchestrator.evals.plan_predicates.is_scorable_plan` (task 3302), and the
     judge REFUSES such an artifact itself (task 3303) — defense in depth around
     one predicate. Left ungated, an LLM judge returns a confident nonzero score
     for the very shape ``score_plan_structure`` short-circuits to 0.0,
@@ -858,7 +859,7 @@ async def run_architect_eval(
       asked; the outcome is a property of the schedule or of our configuration,
       not of the candidate. "No scorable plan" covers both an absent artifact
       and the header-only stub ``create_plan`` writes with zero steps — see
-      :func:`~orchestrator.evals.judge.is_scorable_plan`.
+      :func:`~orchestrator.evals.plan_predicates.is_scorable_plan`.
     - **Harness error** (worktree/config/briefing/artifact-read raised) →
       TAINTED, for the same reason: charging our own crash to the candidate
       would be a fabricated score.
@@ -941,7 +942,6 @@ async def run_architect_eval(
     from orchestrator.artifacts import TaskArtifacts
     from orchestrator.evals import snapshots
     from orchestrator.evals.judge import (
-        is_scorable_plan,
         judge_plan_quality,
         score_plan_structure,
     )
@@ -1415,7 +1415,7 @@ async def run_architect_eval(
         # score_plan_structure short-circuits a stepless artifact to 0.0, and an
         # LLM opinion of that artifact would write a cell whose own plan_steps=0
         # CONTRADICTS its score — the shape the report-layer floor
-        # (metrics.produced_a_plan, task 3302) has to defend the existing corpus
+        # (plan_predicates.produced_a_plan, task 3302) has to defend the existing corpus
         # against.
         #
         # judge_plan_quality now refuses such an artifact ITSELF and returns the

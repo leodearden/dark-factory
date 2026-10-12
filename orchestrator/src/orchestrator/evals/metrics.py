@@ -35,6 +35,8 @@ from shared.invocation_outcome import (
 # module-level import is safe.
 from orchestrator.agents.invoke import _FALLBACK_PRICE, _rate
 
+from .plan_predicates import is_scorable_plan
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -335,53 +337,10 @@ class EvalMetrics:
         return asdict(self)
 
 
-def produced_a_plan(metrics: dict[str, Any]) -> bool:
-    """THE plan-production predicate: did this architect actually emit a plan?
-
-    Reads the PERSISTED ``plan_steps`` field above and nothing else. This is the
-    metrics-dict twin of :func:`orchestrator.evals.judge.is_scorable_plan`, which
-    asks the same question of the plan ARTIFACT — the form the report layer can
-    never use, because by report time it holds only a persisted metrics dict.
-    ``run_architect_eval`` derives ``plan_steps`` from the identical
-    ``len(plan.get('steps') or [])``, so the two derivations are INTENDED to
-    be identical, and
-    ``test_eval_architect.py::TestSteplessPlanIsNeverJudged.test_persisted_metrics_agree_with_the_artifact_level_twin``
-    pins that end-to-end through the real runner — so this claim is
-    falsifiable if ``run_architect_eval``'s derivation ever changes, rather
-    than left to coincidence (the drift hazard
-    ``report._has_plan_quality_score`` was written to close).
-
-    **Why not ``plan_quality > 0``** (the rule this replaces everywhere, task
-    3302): the two plan scorers disagreed exactly on a stepless artifact.
-    :func:`judge.score_plan_structure` returns ``0.0`` for one as a deliberate
-    ANTI-FABRICATION guard; the LLM plan judge used to have no such guard and
-    could score the same artifact nonzero (Graphiti episode e2066ec6) — closed
-    at the instrument by task 3303, which gave ``judge_plan_quality`` the same
-    floor. Regardless of which scorer produced it, a nonzero ``plan_quality``
-    is not evidence a plan exists, and a zero one is not evidence it does not
-    — the number is the thing being decided, not the evidence for it.
-
-    **Why not ``outcome == 'done'``** (task 2863 AMENDMENT §1): done-without-a-plan
-    and blocked-with-a-good-plan cells both occur, so the workflow outcome
-    answers a different question.
-
-    Two in-repo surfaces already got this right and this predicate makes the
-    pipeline agree with them rather than contradict them:
-    ``scripts/eval_bootstrap_smoke.sh`` gates its smoke on ``metrics.plan_steps
-    > 0 & outcome == 'done'``, and ``plans/eval-architect-effort-verdict-2026-07-27.md``
-    hand-computed the campaign's ``planRate`` / ``meanPQ_all`` from
-    ``plan_steps > 0`` because the pipeline's own ranking could not be used.
-
-    Pure: no I/O, no mutation. Tolerates a missing key and an explicit ``None``
-    (the empty shape ``len(... or [])`` guards) — both mean "no plan".
-    """
-    return int(metrics.get('plan_steps') or 0) > 0
-
-
 def terminal_kind_of(metrics: dict[str, Any]) -> str | None:
     """THE consumer accessor for :attr:`EvalMetrics.terminal_kind` (task 4760).
 
-    Sibling of :func:`produced_a_plan` above: both read ONE persisted field off
+    Sibling of ``plan_predicates.produced_a_plan``: both read ONE persisted field off
     a metrics dict and nothing else, and both exist so the report layer and the
     campaign driver consult the same expression rather than two bare ``.get``
     calls that a later change has to keep in sync.
@@ -477,12 +436,6 @@ def resolve_terminal_kind(
     plan-then-decline cell persists BOTH facts and a downstream reader can
     bucket it either way. See :attr:`EvalMetrics.terminal_kind`.
     """
-    # judge.py imports THIS module lazily (inside judge_plan_quality), so a
-    # module-level import here would turn a deliberate one-way function
-    # coupling into a real cycle. Same reason band_for_cell imports
-    # produced_a_plan function-locally.
-    from orchestrator.evals.judge import is_scorable_plan  # noqa: PLC0415
-
     # Built in DECLINE_KINDS order, so every fallback below (`[0]`, and the
     # first-match scan) applies the fixed precedence rather than dict order.
     present = [kind for kind in DECLINE_KINDS if declines.get(kind)]

@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from itertools import combinations
 from pathlib import Path
-from typing import Any, TypeGuard
+from typing import Any
 
 from orchestrator.agents.invoke import invoke_agent
 
@@ -23,6 +23,7 @@ from .elo import (
     next_matchup,
     record_match,
 )
+from .plan_predicates import is_scorable_plan, plan_confirmed
 from .snapshots import get_diff
 
 logger = logging.getLogger(__name__)
@@ -268,16 +269,6 @@ def _plan_reuse_items_present(plan: dict) -> bool:
     return bool(plan.get('reuse'))
 
 
-def _plan_confirmed(plan: dict) -> bool:
-    """True when the plan carries the ``_finalized_at`` completeness marker.
-
-    ``confirm_plan`` (and ``artifacts.stamp_plan_provenance``) stamp
-    ``_finalized_at`` once the architect finalizes a complete plan, so its
-    presence is the code-observable "confirmed" signal.
-    """
-    return bool(plan.get('_finalized_at'))
-
-
 # Code-owned structural rubric. Each criterion is
 # ``{name, weight, description}`` and ``name`` dispatches through this closed
 # detector registry (a pure predicate over the produced plan dict). The
@@ -291,7 +282,7 @@ _PLAN_QUALITY_DETECTORS: dict[str, Callable[[dict], bool]] = {
     'files_declared': _plan_files_declared,
     'design_decisions_present': _plan_design_decisions_present,
     'reuse_items_present': _plan_reuse_items_present,
-    'plan_confirmed': _plan_confirmed,
+    'plan_confirmed': plan_confirmed,
 }
 
 PLAN_QUALITY_RUBRIC: dict[str, Any] = {
@@ -318,42 +309,13 @@ PLAN_QUALITY_RUBRIC: dict[str, Any] = {
 }
 
 
-def is_scorable_plan(plan: object) -> TypeGuard[dict]:
-    """THE single test for "does this artifact carry content worth scoring?".
-
-    A plan with no steps is not a plan — whether it is absent (``None``), empty
-    (``{}``), not a dict at all, or the header-only stub ``create_plan`` writes
-    on the architect's FIRST plan-tools call (``plan_tools._create_plan``: a
-    TRUTHY dict with ``task_id`` / ``title`` / ``analysis`` / ``files`` and
-    ``steps: []``).
-
-    Deliberately shared by :func:`score_plan_structure`'s ``0.0``
-    short-circuit and by ``run_architect_eval``'s cap-taint predicate. Those
-    were once two independent tests — raw dict truthiness in the runner versus
-    ``not plan.get('steps')`` here — and they disagreed exactly on the
-    header-only stub, so a session cap landing right after ``create_plan`` left
-    the cell UNtainted and then floored it to a fabricated ``0.0``. Making both
-    call sites literally this function makes that drift structurally impossible.
-
-    Note this is a different question from the ``has_steps`` RUBRIC criterion
-    (:func:`_plan_has_steps`), which is scored per-plan against a real plan; do
-    not conflate the two roles.
-
-    Typed as a ``TypeGuard`` (a plain ``bool`` at runtime) so it also carries
-    the ``isinstance`` narrowing the inline guard it replaced used to give
-    :func:`score_plan_structure`.
-    """
-    return isinstance(plan, dict) and bool(plan.get('steps'))
-
-
 def clamp_unit_score(score: float) -> float:
     """THE output-range contract shared by the two plan-quality instruments.
 
     :func:`score_plan_structure` and :func:`judge_plan_quality` are a
     two-instrument pair reduced onto ONE axis (``EvalMetrics.plan_quality``) —
-    exactly the shape :func:`is_scorable_plan` (above) already solved for
-    scorability. That function's docstring records the rule: "making both call
-    sites literally this function makes that drift structurally impossible."
+    exactly the shape ``plan_predicates.is_scorable_plan`` already solved for
+    scorability by making every call site literally that one function.
     The range invariant gets the same treatment within THIS pair — the ONE
     named contract both plan-quality instruments call, rather than a copied
     expression the two can silently drift apart on the next time either is
@@ -392,8 +354,8 @@ def clamp_unit_score(score: float) -> float:
     pre-checks with its own ``math.isfinite`` guard and degrades gracefully to
     the ``None`` sentinel (with a WARNING) before ever reaching here, so in
     practice this raise is a defense-in-depth backstop for a future second
-    caller that forgets to — the same class of gap :func:`is_scorable_plan`'s
-    docstring warns a second caller could otherwise silently re-open. This
+    caller that forgets to — the same class of gap a second caller re-opens
+    by skipping ``plan_predicates.is_scorable_plan``. This
     function's contract is finite-in, ``[0, 1]``/4dp-out, ``ValueError`` on
     anything else.
     """

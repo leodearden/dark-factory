@@ -729,11 +729,11 @@ conservative or the insertion point is wrong. Debug before expanding.
 `select_survivors`, `compute_composite`, `blend_composite`,
 `build_composite_report`, `build_plan_quality_report` — needs to know whether
 an architect actually produced a plan, that is the question it asks, via
-`metrics.produced_a_plan(metrics_dict)`.
+`plan_predicates.produced_a_plan(metrics_dict)`.
 
 **Why not `plan_quality > 0`.** The two plan scorers *disagreed* exactly on a
 stepless artifact. `judge.score_plan_structure` returns `0.0` for one as a
-deliberate anti-fabrication guard (through `judge.is_scorable_plan`, which also
+deliberate anti-fabrication guard (through `plan_predicates.is_scorable_plan`, which also
 catches the truthy header-only stub `create_plan` writes); the LLM plan judge
 had no such guard and scored the same artifact confidently. Observed in the
 2026-07-29 corpus cell
@@ -751,6 +751,20 @@ Recorded in Graphiti episode `e2066ec6` (edges `23d9c24f` / `8092af24`).
 
 **Why not `outcome == 'done'`.** Done-without-a-plan and blocked-with-a-good-plan
 cells both occur — task 2863 AMENDMENT §1.
+
+**One artifact predicate, two persisted twins (task 3118).** The artifact-level
+question is `plan_predicates.is_scorable_plan(plan)`: a dict carrying at least
+one step. The runner's cap-taint decision and the floor's `0.0` short-circuit
+were once two independent tests — raw dict truthiness in the runner, `not
+plan.get('steps')` in the floor — and they disagreed exactly on the truthy
+header-only stub `create_plan` writes, so a session cap landing right after
+that first plan-tools call left the cell untainted and then floored it to a
+fabricated `0.0`. Both call sites (and the plan judge's own refusal) are now
+literally that one function. `produced_a_plan` is its twin over the persisted
+`plan_steps`, which `run_architect_eval` derives with the identical
+`len(plan.get('steps') or [])`;
+`test_eval_architect.py::TestSteplessPlanIsNeverJudged.test_persisted_metrics_agree_with_the_artifact_level_twin`
+pins the equivalence end-to-end through the real runner.
 
 **Two failure causes, two treatments, two counts, neither silent:**
 
@@ -968,7 +982,7 @@ persisted on `metrics.py::EvalMetrics.terminal_kind`, read back through
 
 | Value | Meaning |
 |---|---|
-| `planned` | A scorable plan (`judge.is_scorable_plan`) was the terminal statement |
+| `planned` | A scorable plan (`plan_predicates.is_scorable_plan`) was the terminal statement |
 | `already_done` | `plan_tools::report_task_already_done` — the work already landed |
 | `blocking_dependency` | `plan_tools::report_blocking_dependency` — something else must land first |
 | `false_premise` | `plan_tools::report_false_premise` — the task's premise does not hold |

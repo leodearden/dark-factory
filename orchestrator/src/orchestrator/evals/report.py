@@ -22,9 +22,9 @@ from .metrics import (
     DECLINE_KINDS,
     _rate,
     blend_composite,
-    produced_a_plan,
     terminal_kind_of,
 )
+from .plan_predicates import produced_a_plan
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -548,7 +548,7 @@ def build_composite_report(
 
     THE PLAN-PRODUCTION INVARIANT (task 3302): the θ score of every admitted cell
     comes from :func:`_plan_quality_score`, so a cell whose architect ran fine
-    but produced NO PLAN (``not metrics.produced_a_plan`` — ``plan_steps == 0``)
+    but produced NO PLAN (``not plan_predicates.produced_a_plan`` — ``plan_steps == 0``)
     is FLOORED to ``0.0`` rather than reported at whatever the LLM plan judge
     said, and is counted as ``plan_quality_no_plan``. A no-plan cell is also
     barred from SETTING its ``(fixture, 'plan_only')`` cost/latency baseline
@@ -1540,7 +1540,7 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
     nothing" can never read as "it scored nothing".
 
     ITS COUNTERPART (task 3302): a cell whose architect ran fine but produced NO
-    PLAN (``not metrics.produced_a_plan``) is the opposite case — a genuine
+    PLAN (``not plan_predicates.produced_a_plan``) is the opposite case — a genuine
     content measurement — so it is FLOORED to ``0.0`` by
     :func:`_plan_quality_score`, KEPT in the mean, and counted separately as
     ``no_plan``. Two causes, two treatments, two counts, neither silent:

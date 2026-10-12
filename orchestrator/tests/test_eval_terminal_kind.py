@@ -142,7 +142,7 @@ class TestResolveTerminalKind:
         pytest.param(_create_plan_stub(), id='create_plan-header-only-stub'),
     ])
     def test_no_scorable_plan_and_no_decline_is_none(self, plan):
-        """The plan side consults judge.is_scorable_plan, NOT raw truthiness.
+        """The plan side consults plan_predicates.is_scorable_plan, NOT raw truthiness.
 
         The header-only ``create_plan`` stub is a TRUTHY dict, so a truthiness
         test would score it ``'planned'`` — the exact trap that made ``tainted``
