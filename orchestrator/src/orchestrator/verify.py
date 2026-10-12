@@ -19,7 +19,7 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from collections import Counter, OrderedDict
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field, is_dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -46,6 +46,13 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 # flake_ledger depends only on shared.sqlite_sync_base, so there is no cycle.
 from orchestrator.flake_ledger import FlakeCallSite, FlakeSuppression, FlakeVerdict
 from orchestrator.main_tip_sweep_cadence import SweepSeedMode
+from orchestrator.verify_admission_gate import (
+    AdmissionGrant,
+    AdmissionPlan,
+    AdmissionPolicy,
+    AdmissionRequest,
+    gate_for,
+)
 from orchestrator.verify_categories import (
     ARCHIVE_DENY_LIST as _ARCHIVE_DENY_LIST,  # noqa: F401 — re-exported for external consumers
 )
@@ -6380,12 +6387,52 @@ def _admission_executor() -> concurrent.futures.ThreadPoolExecutor:
     return _admission_executor_singleton
 
 
-@contextlib.asynccontextmanager
-async def _admission_slot(role: str, config: OrchestratorConfig):
-    """Async CM around T1's ``shared.verify_admission.acquire_task_slot``.
+def _admission_policy(config: OrchestratorConfig) -> AdmissionPolicy:
+    """The admission gate's policy as *config* states it now (read at each grant)."""
+    return AdmissionPolicy(
+        slots=config.verify_admission_task_slots,
+        order=config.verify_admission_order,
+        promote_after_secs=config.verify_admission_background_promote_secs,
+    )
 
-    Callers gate only a verify's test leg; WHICH roles that gate actually
-    acquires for is T1's ``is_gated_role`` to decide, never re-derived here.
+
+@contextlib.asynccontextmanager
+async def _admission_slot(
+    role: str, config: OrchestratorConfig, request: AdmissionRequest | None,
+) -> AsyncIterator[AdmissionGrant | None]:
+    """Admit one verify test leg: the in-process gate decides whose turn it is
+    (task 5628, plans/verify-admission-fifo-prd.md), then ``_flock_slot`` takes
+    the cross-process flock slot.
+
+    Yields the gate's grant with the flock's answer stamped on as
+    ``slot_held``. Only an admitted waiter polls the flock, so the admission
+    executor holds at most ``verify_admission_task_slots`` pollers, plus any
+    cancelled leg's thread still finishing its poll. Callers gate only a
+    verify's test leg; WHICH roles are gated is T1's ``is_gated_role`` to
+    decide, never re-derived here. An ungated role yields None and never
+    touches the gate or the executor (task 5424).
+    """
+    if not is_gated_role(role):
+        async with _flock_slot(role, config):
+            yield None
+        return
+    if request is None:
+        raise ValueError(
+            f'a gated verify role reaches the admission gate only with an AdmissionRequest: '
+            f'role={role!r} came without one',
+        )
+    gate = gate_for(Path(config.verify_admission_slots_dir))
+    async with (
+        gate.admit(request, lambda: _admission_policy(config)) as grant,
+        _flock_slot(role, config) as held,
+    ):
+        yield replace(grant, slot_held=held)
+
+
+@contextlib.asynccontextmanager
+async def _flock_slot(role: str, config: OrchestratorConfig) -> AsyncIterator[bool]:
+    """Async CM around T1's ``shared.verify_admission.acquire_task_slot``;
+    yields whether a slot is held.
 
     Gated role — the mkdir (T1 never creates ``slots_dir`` itself, and fails
     open when it is absent) and the blocking, potentially-unbounded
@@ -6419,6 +6466,7 @@ async def _admission_slot(role: str, config: OrchestratorConfig):
     slots_dir = Path(config.verify_admission_slots_dir)
     n = config.verify_admission_task_slots
     cm = None
+    held = False
     try:
         # Constructing the CM runs none of acquire_task_slot's body (it is a
         # @contextlib.contextmanager generator function); only __enter__ does,
@@ -6432,7 +6480,7 @@ async def _admission_slot(role: str, config: OrchestratorConfig):
             )
             enter_future = loop.run_in_executor(executor, cm.__enter__)
             try:
-                await asyncio.shield(enter_future)
+                held = await asyncio.shield(enter_future)
             except asyncio.CancelledError:
                 def _release_if_acquired(fut: 'asyncio.Future[bool]') -> None:
                     if cm is None or fut.cancelled() or fut.exception() is not None:
@@ -6442,11 +6490,12 @@ async def _admission_slot(role: str, config: OrchestratorConfig):
                 enter_future.add_done_callback(_release_if_acquired)
                 raise
         else:
-            cm.__enter__()
+            held = cm.__enter__()
     except OSError:
         cm = None
+        held = False
     try:
-        yield
+        yield held
     finally:
         if cm is not None:
             with contextlib.suppress(OSError):
@@ -6594,8 +6643,14 @@ async def run_verification(
     archive_root: Path | None = None,
     role: Literal['merge', 'task', 'background'] = 'task',
     segment_chained_test: bool = False,
+    admission_request: AdmissionRequest | None = None,
 ) -> VerifyResult:
     """Run test suite, linter, and type checker. Return structured result.
+
+    *admission_request* places the gated test leg in the admission gate's
+    order (task 5628). A caller verifying several modules as one plan passes
+    each module its plan's request; when it is None a gated role gets a plan
+    of its own, stamped once here so every retry keeps its arrival.
 
     *segment_chained_test* (task 3338 / esc-3062-2) opts the TEST leg into
     per-segment execution: when the configured command is an `&&` chain
@@ -6661,6 +6716,15 @@ async def run_verification(
         type_cmd = config.type_check_command
 
     module_prefix = module_config.prefix if module_config is not None else None
+    if admission_request is not None and admission_request.role != role:
+        raise ValueError(
+            f'an admission request must carry its verify role: request role='
+            f'{admission_request.role!r}, verify role={role!r}',
+        )
+    if admission_request is None and is_gated_role(role):
+        admission_request = AdmissionPlan.begin(role=role, task_id=task_id).request(
+            module=module_prefix, scope_kind=None,
+        )
 
     # Task μ (verify-scope-inversion-prd.md): under role=='merge' AND
     # merge_verify_breadth=='full', inject --junitxml into the test leg (see
@@ -6884,7 +6948,10 @@ async def run_verification(
             if prefix:
                 cmd = f'{shlex.join(prefix)} /bin/bash -c {shlex.quote(cmd)}'
         slot_requested = time.monotonic()
-        async with (_admission_slot(role, config) if admission else contextlib.nullcontext()):
+        async with (
+            _admission_slot(role, config, admission_request) if admission
+            else contextlib.nullcontext()
+        ) as grant:
             # The queueing half of the leg, which `load_start` below excludes.
             slot_wait_secs = time.monotonic() - slot_requested if slot_gated else None
             started_at = datetime.now(UTC).isoformat()
@@ -7079,6 +7146,7 @@ async def run_verification(
             # to no command's duration.
             elapsed = time.monotonic() - t0
             load_end = _load_sample()
+        held_secs = time.monotonic() - t0
         # Mis-resolved interpreter (task 3367 / esc-3359-1): make the condition
         # LEGIBLE at the point it is observed. Classification alone routes the
         # merge lane correctly (ENV_TRANSIENT -> a loud infra_issue hold) but
@@ -7176,6 +7244,7 @@ async def run_verification(
             # return through this single construction.
             load={'start': load_start, 'end': load_end, 'xdist': xdist},
             slot_wait_secs=slot_wait_secs,
+            admission=None if grant is None else {**grant.to_dict(), 'held_secs': held_secs},
         )
 
     # Cold-verify shared-venv pre-provision (task 2997, esc-2913-3): populate
@@ -7191,6 +7260,7 @@ async def run_verification(
             worktree, config, verify_env=verify_env, timeout=timeout,
         )
 
+    test_runs: list[CheckRun] = []
     retries = 0
     while True:
         # attempt_id is the persistence ID handed in by the caller (or None for
@@ -7233,6 +7303,7 @@ async def run_verification(
                 await _run_or_skip_timed(type_cmd, label='type', current_attempt=current_attempt_id),
             ])
 
+        test_runs.append(attempt.test)
         if attempt.passed or not attempt.pure_timeout_failure or retries >= max_retries:
             break
 
@@ -7326,6 +7397,7 @@ async def run_verification(
         new_test = await _run_or_skip_timed(
             recovered_test_cmd, label='test', current_attempt=current_attempt_id,
         )
+        test_runs.append(new_test)
 
         # Recompute pure-timeout consistency for the recovery run via a fresh
         # VerifyAttempt: lint/type are unchanged from the first pass (only
@@ -7540,6 +7612,7 @@ async def run_verification(
         skipped_test_ids=skipped_test_ids,
         failing_test_ids_by_module=failing_test_ids_by_module,
         failing_leg_categories=failing_leg_categories,
+        admission_legs=_admission_legs(test_runs),
     )
 
     # Mark the worktree warm whenever the build completed (no pure timeout),
@@ -7575,6 +7648,15 @@ async def run_verification(
             else:
                 logger.info('Verification failed: %s%s', summary, detail_tail)
     return result
+
+
+def _admission_legs(test_runs: Iterable[CheckRun]) -> list[dict] | None:
+    """One plan-event leg per admitted test run: its admission record plus rc and timed_out."""
+    return [
+        {**run.admission, 'rc': run.rc, 'timed_out': run.timed_out}
+        for run in test_runs
+        if run.admission is not None
+    ] or None
 
 
 def _aggregate_failing_ids_by_module(
