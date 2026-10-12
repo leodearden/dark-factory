@@ -2980,16 +2980,20 @@ def _implementer_result(
 def _cap_tainted_result(
     task_id: str = 'df_task_3118',
     config_name: str = 'architect-sonnet-high',
-    invocation_error: str | None = None,
+    cause: UnmeasuredCause = UnmeasuredCause.CAP_HIT,
+    reason: str = _CAP_TEXT,
 ):
     """An architect cell whose invocation was refused — NOT a measurement.
 
-    ``invocation_error`` defaults to the campaign cap payload; pass a different
-    stage-prefixed marker (e.g. ``'architect:model_not_found: ...'``) to build a
-    cell excluded for a PERMANENT rather than a transient cause.
+    Defaults to the campaign cap payload; pass a different *cause* (e.g.
+    ``UnmeasuredCause.MODEL_NOT_FOUND``) to build a cell excluded for a
+    PERMANENT rather than a transient cause.
     """
     from orchestrator.evals.results import EvalResult
 
+    record = Unmeasured(
+        MeasurementStage.ARCHITECT, cause, reason, cost_usd=0.0,
+    ).to_record()
     return EvalResult(
         task_id=task_id,
         config_name=config_name,
@@ -2998,9 +3002,7 @@ def _cap_tainted_result(
             'role_under_test': 'architect',
             'plan_quality': None,
             'cap_tainted': True,
-            'invocation_error': (
-                invocation_error or f'architect:cap_hit: {_CAP_TEXT}'
-            ),
+            'invocation_errors': [record],
             'composite_score': 0.0,
         },
         worktree_path='/tmp/wt-arch-capped',
@@ -3083,7 +3085,7 @@ class TestPlanQualityReport:
     # fabricated zero, which would penalise whichever candidate happened to be
     # scheduled inside a cap window.
 
-    def test_rows_carry_cap_tainted_and_invocation_error(self):
+    def test_rows_carry_cap_tainted_and_invocation_errors(self):
         from orchestrator.evals.report import build_plan_quality_report
 
         report = build_plan_quality_report(
@@ -3093,12 +3095,15 @@ class TestPlanQualityReport:
 
         capped = by_task['df_task_3118']
         assert capped['cap_tainted'] is True
-        assert capped['invocation_error'].startswith('architect:')
+        assert capped['invocation_errors'] == [
+            {'stage': 'architect', 'cause': 'cap_hit', 'reason': _CAP_TEXT},
+        ]
+        assert 'invocation_error' not in capped
         assert capped['plan_quality'] is None
 
         # Legacy results, whose metrics predate both keys, read back default-safe.
         assert by_task['df_task_2605']['cap_tainted'] is False
-        assert by_task['df_task_2605']['invocation_error'] is None
+        assert by_task['df_task_2605']['invocation_errors'] is None
         assert by_task['df_task_1993']['cap_tainted'] is False
 
     def test_per_config_mean_excludes_cap_tainted_cells(self):
@@ -3338,16 +3343,14 @@ class TestPlanQualityReport:
             _cap_tainted_result(task_id='t2', config_name='a'),
             _cap_tainted_result(
                 task_id='t3', config_name='b',
-                invocation_error='architect:model_not_found: no such model',
+                cause=UnmeasuredCause.MODEL_NOT_FOUND, reason='no such model',
             ),
             # An end-to-end pin (reviewer: test-coverage) that a server_error
-            # marker survives the FULL report pipeline — not just
-            # detect_invocation_error's unit-level token — and lands in its
-            # own cap_excluded_by_cause bucket rather than being folded into
-            # 'unknown' by a marker-shape change.
+            # record survives the FULL report pipeline and lands in its own
+            # cap_excluded_by_cause bucket.
             _cap_tainted_result(
                 task_id='t4', config_name='b',
-                invocation_error='architect:server_error: HTTP 529',
+                cause=UnmeasuredCause.SERVER_ERROR, reason='HTTP 529',
             ),
         ])
         assert report['cap_excluded'] == 4
@@ -3357,17 +3360,35 @@ class TestPlanQualityReport:
         # Key-sorted, so the dict renders byte-deterministically.
         causes = list(report['cap_excluded_by_cause'])
         assert causes == sorted(causes)
+        # Every bucket is a typed cause — no free-text or 'unknown' key.
+        assert set(report['cap_excluded_by_cause']) <= {
+            c.value for c in UnmeasuredCause
+        }
 
-    def test_unparseable_marker_buckets_as_unknown_not_a_real_cause(self):
-        # A mis-shaped marker must show up as its own bucket rather than being
-        # silently folded into a real cause.
+    def test_tainted_row_without_a_record_raises_naming_the_cell(self):
+        # A tainted cell always carries a record: the producer writes one and
+        # the loader supplies one for legacy cells. A row without one bypassed
+        # ResultStore.load_all, and bucketing it would invent a cause.
         from orchestrator.evals.report import build_plan_quality_report
 
-        report = build_plan_quality_report([
-            _cap_tainted_result(task_id='t1', config_name='a',
-                                invocation_error='architect:'),
-        ])
-        assert report['cap_excluded_by_cause'] == {'unknown': 1}
+        capped = _cap_tainted_result(task_id='t1', config_name='a')
+        capped.metrics['invocation_errors'] = None
+
+        with pytest.raises(ValueError) as excinfo:
+            build_plan_quality_report([capped])
+        message = str(excinfo.value)
+        assert 't1 x a' in message
+        assert 'invocation_errors' in message
+
+    def test_format_invocation_errors_renders_records(self):
+        from orchestrator.evals.report import format_invocation_errors
+
+        assert format_invocation_errors(None) is None
+        assert format_invocation_errors([]) is None
+        assert format_invocation_errors([
+            {'stage': 'architect', 'cause': 'timeout', 'reason': 'r1'},
+            {'stage': 'judge', 'cause': 'raised', 'reason': 'r2'},
+        ]) == 'architect:timeout: r1; judge:raised: r2'
 
     def test_all_cells_tainted_yields_null_mean_never_zero(self):
         from orchestrator.evals.report import build_plan_quality_report
@@ -3436,7 +3457,12 @@ class TestPlanQualityReport:
         # Explicit exclusion marker, WITH its reason — never a score...
         assert 'excluded' in capped_line
         assert '0.0000' not in capped_line
-        assert 'cap_hit' in capped_line
+        assert f'architect:cap_hit: {_CAP_TEXT}' in capped_line
+        # ...while a healthy architect row's invocation_error column is '-'.
+        healthy_line = next(
+            ln for ln in table.splitlines() if 'df_task_2605' in ln
+        )
+        assert healthy_line.split()[-1] == '-'
         # ...and visibly distinct from the '-' null sentinel a non-architect row
         # uses, so "not an architect run" cannot be confused with "architect run
         # we could not measure".
@@ -3462,7 +3488,7 @@ class TestPlanQualityReport:
         )
         assert '1' in summary and '3' in summary
         # ...with the CAUSE named, not a bare count.
-        assert 'cap_hit' in summary
+        assert 'cap_hit: 1' in summary
 
         mean_line = _mean_section_line(table, cfg)
         assert '0.8000' in mean_line   # the EXCLUDING mean, not 0.5333
@@ -3479,7 +3505,7 @@ class TestPlanQualityReport:
         table = format_plan_quality_table(build_plan_quality_report([
             _cap_tainted_result(
                 task_id='t1', config_name='dead-cfg',
-                invocation_error='architect:model_not_found: no such model',
+                cause=UnmeasuredCause.MODEL_NOT_FOUND, reason='no such model',
             ),
         ]))
         summary = next(
@@ -3519,6 +3545,67 @@ class TestPlanQualityReport:
             build_plan_quality_report(list(reversed(results)))
         )
         assert a == b
+
+
+class TestLegacyAndProducedUnmeasuredCellsReportAlike:
+    """B3 (PRD §6): one reader for a pre-6734 cell and a freshly produced one.
+
+    A cell persisted with the legacy ``invocation_error`` string and a cell the
+    real producer writes today both load through ``ResultStore.load_all`` and
+    land in the same typed cause bucket, rendered by the same formatter.
+    """
+
+    @pytest.mark.asyncio
+    async def test_both_cells_bucket_and_render_as_cap_exhausted(self, tmp_path):
+        from shared.cli_invoke import AllAccountsCappedException
+
+        from orchestrator.evals.configs import EvalConfig
+        from orchestrator.evals.report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        store = ResultStore(tmp_path)
+        legacy = {
+            'task_id': 'legacy_task',
+            'config_name': 'architect-sonnet-high',
+            'outcome': 'blocked',
+            'metrics': {
+                'role_under_test': 'architect',
+                'plan_quality': None,
+                'cap_tainted': True,
+                'invocation_error': (
+                    'architect:cap_exhausted: all accounts capped after 3 retries'
+                ),
+            },
+            'worktree_path': '/tmp/wt-legacy',
+            'wall_clock_ms': 0,
+            'run_id': 'legacy01',
+            'trial': 1,
+        }
+        (tmp_path / 'legacy_task__architect-sonnet-high__legacy01.json').write_text(
+            json.dumps(legacy)
+        )
+        cfg = EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+        await _run_architect_eval_hermetic(
+            cfg,
+            produced_plan={},
+            patch_cap_retry=True,
+            invoke_side_effect=AllAccountsCappedException(3, 10.0, 'x'),
+            store=store,
+        )
+
+        cells = store.load_all()
+        assert len(cells) == 2
+        report = build_plan_quality_report(cells)
+        assert report['cap_excluded_by_cause'] == {'cap_exhausted': 2}
+        table = format_plan_quality_table(report)
+        rendered = [
+            ln for ln in table.splitlines() if 'architect:cap_exhausted: ' in ln
+        ]
+        assert len(rendered) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -3673,14 +3760,15 @@ class TestCliArchitectDispatch:
     def test_cap_tainted_cell_echo_names_the_taint(self, capsys):
         # An operator watching the run must see the infra refusal LIVE, not a
         # bare `plan_quality=None` that reads like a scoring quirk.
-        marker = f'architect:cap_hit: {_CAP_TEXT}'
         out, _, _ = _dispatch_single_eval(
             self._arch_cfg(), capsys,
             arch_metrics={
                 'role_under_test': 'architect',
                 'plan_quality': None,
                 'cap_tainted': True,
-                'invocation_error': marker,
+                'invocation_errors': [
+                    {'stage': 'architect', 'cause': 'cap_hit', 'reason': _CAP_TEXT},
+                ],
             },
         )
         # Scoped to the PER-CELL echo line ('plan_quality=' with the '='), not
@@ -3690,29 +3778,32 @@ class TestCliArchitectDispatch:
         echo_line = next(
             ln for ln in out.splitlines() if 'plan_quality=' in ln
         )
-        # Cause-neutral label + the marker naming the ACTUAL cause: a permanent
+        # Cause-neutral label + the record naming the ACTUAL cause: a permanent
         # config error must not read as a transient cap window.
         assert 'unmeasurable' in echo_line
-        assert marker in echo_line
+        assert f'architect:cap_hit: {_CAP_TEXT}' in echo_line
 
     def test_model_not_found_echo_does_not_read_as_a_cap_window(self, capsys):
         # The same taint flag covers a PERMANENT candidate-configuration error.
         # An operator must not be told to "rerun after the cap resets" for a
         # model that does not exist (reviewer: design-coherence).
-        marker = 'architect:model_not_found: no such model gpt-9'
         out, _, _ = _dispatch_single_eval(
             self._arch_cfg(), capsys,
             arch_metrics={
                 'role_under_test': 'architect',
                 'plan_quality': None,
                 'cap_tainted': True,
-                'invocation_error': marker,
+                'invocation_errors': [{
+                    'stage': 'architect', 'cause': 'model_not_found',
+                    'reason': 'no such model gpt-9',
+                }],
             },
         )
         echo_line = next(
             ln for ln in out.splitlines() if 'plan_quality=' in ln
         )
-        assert 'model_not_found' in echo_line
+        assert 'unmeasurable' in echo_line
+        assert 'architect:model_not_found: no such model gpt-9' in echo_line
         assert 'cap' not in echo_line.lower()
 
     def test_implementer_config_still_routes_to_run_eval(self, capsys):
