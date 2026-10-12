@@ -1,9 +1,9 @@
 """Builders shared by the eval_write_triage_* test modules. Not collected.
 
 A builder lives here only when more than one of those modules uses it; one a
-single module uses stays in that module. A builder that needs a script loads
-it by path under the script's file stem, the key the scripts load each other
-under, so it shares their module objects.
+single module uses stays in that module. The script loaders are such builders:
+each loads its script by path under the script's file stem, the key the
+scripts load each other under, so a test shares their module objects.
 """
 from __future__ import annotations
 
@@ -24,13 +24,32 @@ ALIASES_PATH = (
 
 
 @functools.cache
-def _scoring() -> types.ModuleType:
+def scoring_mod() -> types.ModuleType:
     return load_script_module(SCRIPTS / 'eval_write_triage_scoring.py', 'eval_write_triage_scoring')
 
 
 @functools.cache
-def _cases_mod() -> types.ModuleType:
+def cases_mod() -> types.ModuleType:
     return load_script_module(SCRIPTS / 'eval_write_triage_cases.py', 'eval_write_triage_cases')
+
+
+@functools.cache
+def live_judge_mod() -> types.ModuleType:
+    return load_script_module(
+        SCRIPTS / 'eval_write_triage_live_judge.py', 'eval_write_triage_live_judge',
+    )
+
+
+@functools.cache
+def cli_mod() -> types.ModuleType:
+    return load_script_module(SCRIPTS / 'eval_write_triage_judge.py', 'eval_write_triage_judge')
+
+
+@functools.cache
+def wording_mod() -> types.ModuleType:
+    return load_script_module(
+        SCRIPTS / 'write_triage_judge_wording.py', 'write_triage_judge_wording',
+    )
 
 
 def committed_records() -> list[dict]:
@@ -85,6 +104,11 @@ def corpus() -> list[dict]:
     ]
 
 
+def one_cluster_corpus() -> list[dict]:
+    """`corpus()`'s c2 alone: its control has no other cluster to draw from."""
+    return [r for r in corpus() if r['cluster_id'] == 'c2-canon']
+
+
 PROVENANCE = {
     'fixture_path': 'tests/fixtures/write_triage_calibration.jsonl',
     'judge_provider': 'openai',
@@ -128,6 +152,34 @@ def live(
     }
 
 
+def scored(rows) -> list[tuple[str, float]]:
+    """Each row's id beside the cosine of the query that retrieved it."""
+    return [(row['memory_id'], row['metadata']['store_score']) for row in rows]
+
+
+def crossed_retrieved_plan():
+    """Two duplicates retrieving the same two records at opposite cosines.
+
+    Returns the retrieved plan and the slates it was built from. A row
+    carries ITS query's cosine, so a row borrowed from the other case's
+    retrieval is told apart by :func:`scored`.
+    """
+    records = [
+        rec('canon', 'canon', 'canonical'),
+        rec('dup-a', 'canon', 'duplicate'),
+        rec('dup-b', 'canon', 'duplicate'),
+    ]
+    slates = [
+        slate('dup-a', candidates=[live('canon', store_score=0.80),
+                                   live('other', store_score=0.70)],
+              band_winner_id='canon', band=OUTCOME_JUDGE),
+        slate('dup-b', candidates=[live('other', store_score=0.85),
+                                   live('canon', store_score=0.75)],
+              band_winner_id='other', band=OUTCOME_JUDGE),
+    ]
+    return cases_mod().plan_from_slates(records, slates, provenance={}), slates
+
+
 ALIASES = {'old-canon': 'new-canon'}
 
 
@@ -139,9 +191,9 @@ def aliased_row(candidates, band_winner_id, answer=None) -> dict:
     ]
     retrieved = slate('dup', candidates=candidates, band_winner_id=band_winner_id,
                       band=OUTCOME_JUDGE, canonical_present=False)
-    plan = _cases_mod().plan_from_slates(records, [retrieved], provenance={}, aliases=ALIASES)
-    return _scoring().case_row(
+    plan = cases_mod().plan_from_slates(records, [retrieved], provenance={}, aliases=ALIASES)
+    return scoring_mod().case_row(
         0, plan.cases[0],
-        answer or _scoring().JudgeAnswer(outcome=OUTCOME_AMENDED, verdict=OUTCOME_AMENDED),
+        answer or scoring_mod().JudgeAnswer(outcome=OUTCOME_AMENDED, verdict=OUTCOME_AMENDED),
         plan.candidate_records[0], plan.fixture_by_id,
     )

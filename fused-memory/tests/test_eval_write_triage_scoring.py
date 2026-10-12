@@ -8,19 +8,17 @@ is loaded under its own file stem. No test asserts an accuracy floor (D10).
 """
 from __future__ import annotations
 
-import functools
 import json
 import os
 import re
-import types
-from pathlib import Path
 
 import pytest
 from _eval_write_triage_fixtures import PROVENANCE as _PROVENANCE
 from _eval_write_triage_fixtures import aliased_row as _aliased_row
+from _eval_write_triage_fixtures import cases_mod as _cases_mod
 from _eval_write_triage_fixtures import corpus as _corpus
 from _eval_write_triage_fixtures import live as _live
-from _fm_helpers import load_script_module
+from _eval_write_triage_fixtures import scoring_mod as _scoring
 
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
@@ -30,19 +28,6 @@ from fused_memory.server.write_triage import (
     OUTCOME_STORED,
     TRIAGE_OUTCOMES,
 )
-
-SCRIPTS = Path(__file__).parent.parent / 'scripts'
-
-
-@functools.cache
-def _scoring() -> types.ModuleType:
-    return load_script_module(SCRIPTS / 'eval_write_triage_scoring.py', 'eval_write_triage_scoring')
-
-
-@functools.cache
-def _cases_mod() -> types.ModuleType:
-    return load_script_module(SCRIPTS / 'eval_write_triage_cases.py', 'eval_write_triage_cases')
-
 
 # ---------------------------------------------------------------------------
 # score_cases

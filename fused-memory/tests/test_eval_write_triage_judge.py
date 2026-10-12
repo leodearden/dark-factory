@@ -4,8 +4,8 @@ PRD ``docs/prds/memory-write-path-convergence.md`` §9 leaf γ, decision D10.
 
 Structure mirrors ``test_calibrate_write_triage.py``: each script is loaded by
 path through importlib (``scripts/`` is not an importable package), under its
-file stem, and each loader is invoked LAZILY so a test loads only the scripts
-it exercises.
+file stem, by the loaders in ``_eval_write_triage_fixtures.py``, and each
+loader is invoked LAZILY so a test loads only the scripts it exercises.
 
 Every test in this file is free of ``OPENAI_API_KEY``, network and Qdrant —
 the judge is injected as a plain callable, exactly as ``run_calibration``
@@ -20,7 +20,6 @@ and traceability — never about whether a number is large enough.
 """
 from __future__ import annotations
 
-import functools
 import hashlib
 import json
 import logging
@@ -34,11 +33,18 @@ from _eval_write_triage_fixtures import ALIASES as _ALIASES
 from _eval_write_triage_fixtures import ALIASES_PATH, FIXTURE_PATH
 from _eval_write_triage_fixtures import PROVENANCE as _PROVENANCE
 from _eval_write_triage_fixtures import aliased_row as _aliased_row
+from _eval_write_triage_fixtures import cases_mod as _cases_mod
+from _eval_write_triage_fixtures import cli_mod as _mod
 from _eval_write_triage_fixtures import corpus as _corpus
+from _eval_write_triage_fixtures import crossed_retrieved_plan as _crossed_retrieved_plan
 from _eval_write_triage_fixtures import live as _live
+from _eval_write_triage_fixtures import live_judge_mod as _live_judge
+from _eval_write_triage_fixtures import one_cluster_corpus as _one_cluster_corpus
 from _eval_write_triage_fixtures import rec as _rec
+from _eval_write_triage_fixtures import scored as _scored
+from _eval_write_triage_fixtures import scoring_mod as _scoring
 from _eval_write_triage_fixtures import slate as _slate
-from _fm_helpers import load_script_module
+from _eval_write_triage_fixtures import wording_mod as _wording
 
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
@@ -49,45 +55,6 @@ from fused_memory.server.write_triage import (
 )
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'eval_write_triage_judge.py'
-
-
-def _load_module(path: Path, mod_name: str) -> types.ModuleType:
-    """Load a ``scripts/`` file by path, registered in ``sys.modules``.
-
-    Registration is required for reflection-based decorators, which resolve
-    ``sys.modules.get(cls.__module__)``. Same loader as
-    ``test_calibrate_write_triage.py``.
-    """
-    return load_script_module(path, mod_name=mod_name)
-
-
-@functools.cache
-def _mod() -> types.ModuleType:
-    return _load_module(SCRIPT_PATH, 'eval_write_triage_judge')
-
-
-@functools.cache
-def _scoring() -> types.ModuleType:
-    return _load_module(SCRIPT_PATH.parent / 'eval_write_triage_scoring.py', 'eval_write_triage_scoring')
-
-
-@functools.cache
-def _cases_mod() -> types.ModuleType:
-    return _load_module(SCRIPT_PATH.parent / 'eval_write_triage_cases.py', 'eval_write_triage_cases')
-
-
-@functools.cache
-def _live_judge() -> types.ModuleType:
-    return _load_module(
-        SCRIPT_PATH.parent / 'eval_write_triage_live_judge.py', 'eval_write_triage_live_judge',
-    )
-
-
-@functools.cache
-def _wording() -> types.ModuleType:
-    return _load_module(
-        SCRIPT_PATH.parent / 'write_triage_judge_wording.py', 'write_triage_judge_wording',
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1234,149 +1201,32 @@ class TestTheAttachTargetIsTheJudgedCandidate:
         assert [row['judged_candidate_id'] for row in rows] == ['c1-canon', 'zz']
 
 
-class TestPlanFromSlates:
-    """The retrieved mode's case construction, with the live edge stubbed."""
+class TestRunJudgeEvalOverABuiltPlan:
+    """`run_judge_eval` over plans built by eval_write_triage_cases.py.
 
-    @staticmethod
-    def _records() -> list[dict]:
-        return [
-            _rec('c1-canon', 'c1-canon', 'canonical'),
-            _rec('c1-dup-1', 'c1-canon', 'duplicate'),
-            _rec('c2-distinct', 'c2-canon', 'distinct'),
-        ]
-
-    @staticmethod
-    def _slates() -> list:
-        return [
-            _slate('c1-dup-1', candidates=[_live('c1-canon'), _live('zz')],
-                   band_winner_id='c1-canon', band=OUTCOME_JUDGE),
-            _slate('c2-distinct', candidates=[_live('zz')],
-                   band_winner_id='zz', band=OUTCOME_RESTATED,
-                   canonical_present=False),
-        ]
-
-    def _plan(self, **overrides):
-        return _cases_mod().plan_from_slates(
-            self._records(), self._slates(), provenance=overrides or {'t_low': 0.5},
-        )
-
-    def test_one_case_per_non_canonical_record_and_no_control(self) -> None:
-        plan = self._plan()
-        assert [c['memory_id'] for c in plan.cases] == ['c1-dup-1', 'c2-distinct']
-        assert not [
-            c for c in plan.cases
-            if c['expected_class'] == _scoring().CLASS_DISTRACTOR
-        ]
-
-    def test_the_expected_class_stays_the_curator_label(self) -> None:
-        plan = self._plan()
-        assert [c['expected_class'] for c in plan.cases] == ['duplicate', 'distinct']
-
-    def test_the_band_and_its_winner_come_from_the_retrieval(self) -> None:
-        plan = self._plan()
-        judged, deterministic = plan.cases
-        assert judged['band'] == OUTCOME_JUDGE
-        assert judged['band_winner_id'] == 'c1-canon'
-        assert deterministic['band'] == OUTCOME_RESTATED
-        assert deterministic['band_winner_id'] == 'zz'
-
-    def test_a_record_whose_canonical_is_gone_stays_in_the_population(self) -> None:
-        """They are production reality, so dropping them would flatter the run."""
-        plan = self._plan()
-        assert plan.cases[1]['canonical_present'] is False
-        assert len(plan.cases) == 2
-
-    def test_the_plan_discloses_its_own_mode(self) -> None:
-        assert self._plan().provenance['slate_mode'] == _scoring().SLATE_RETRIEVED
-        assert _cases_mod().seeded_plan(
-            _corpus(), distractors=2,
-        ).provenance['slate_mode'] == _scoring().SLATE_SEEDED
-
-    def test_a_slate_count_mismatch_raises(self) -> None:
-        with pytest.raises(ValueError, match='positional'):
-            _cases_mod().plan_from_slates(self._records(), [], provenance={})
+    How a plan is built, and which plans are refused, is
+    test_eval_write_triage_cases.py's subject. These pin what the runner does
+    with one.
+    """
 
     def test_a_retrieved_run_publishes_no_distractor_count(self, tmp_path: Path) -> None:
         """Distractors are the seeded construction's; a retrieved slate draws none."""
+        plan, _ = _crossed_retrieved_plan()
         report = _mod().run_judge_eval(
-            plan=self._plan(), judge_fn=_fake_judge(),
+            plan=plan, judge_fn=_fake_judge(),
             report_path=tmp_path / 'report.json', provenance={},
         )
         provenance = report['provenance']
         assert (provenance['candidate_count'], provenance['distractor_count']) == (2, None)
 
-    def test_a_hoisted_child_counts_as_the_canonical_on_the_slate(self) -> None:
-        """`_canonical_id_of` hoists a sighting to its parent, so a slate
-        holding only the CHILD still shows the model the match."""
-        slates = [
-            _slate('c1-dup-1', candidates=[_live('child', canonical_id='c1-canon')],
-                   band_winner_id='c1-canon', band=OUTCOME_JUDGE),
-            _slate('c2-distinct', candidates=[_live('zz')],
-                   band_winner_id='zz', band=OUTCOME_JUDGE),
-        ]
-        plan = _cases_mod().plan_from_slates(self._records(), slates, provenance={})
-        row = _scoring().case_row(
-            1, plan.cases[0], _scoring().JudgeAnswer(outcome=OUTCOME_AMENDED),
-            plan.candidate_records[0], plan.fixture_by_id,
-        )
-        assert row['canonical_in_slate'] is True
-
-    def test_every_case_carries_its_clusters_alias(self) -> None:
-        plan = _cases_mod().plan_from_slates(
-            self._records(), self._slates(), provenance={},
-            aliases={'c1-canon': 'c1-new'},
-        )
-        assert [c['canonical_alias_id'] for c in plan.cases] == ['c1-new', None]
-
-    def test_without_aliases_no_case_carries_one(self) -> None:
-        assert [c['canonical_alias_id'] for c in self._plan().cases] == [None, None]
-
-    def test_a_seeded_case_carries_its_clusters_alias_too(self) -> None:
-        plan = _cases_mod().seeded_plan(_corpus(), distractors=2, aliases={'c1-canon': 'c1-new'})
-        for case in plan.cases:
-            expected = 'c1-new' if case['cluster_id'] == 'c1-canon' else None
-            assert case['canonical_alias_id'] == expected, case['memory_id']
-        assert _scoring().CLASS_DISTRACTOR in {
-            c['expected_class'] for c in plan.cases if c['canonical_alias_id']
-        }, 'the control case of an aliased cluster carries the alias too'
-
-
-class TestEachCaseIsShownItsOwnRetrieval:
-    """A retrieved row carries ITS query's cosine, so rows are never pooled.
-
-    `judge_write` re-sorts every slate by that cosine (`select_judge_candidates`),
-    so a row borrowed from another case's retrieval hands this case's prompt an
-    order that another query produced. Two duplicates retrieving the same two
-    records at opposite cosines make the borrowing observable.
-    """
-
-    @staticmethod
-    def _plan():
-        records = [
-            _rec('canon', 'canon', 'canonical'),
-            _rec('dup-a', 'canon', 'duplicate'),
-            _rec('dup-b', 'canon', 'duplicate'),
-        ]
-        slates = [
-            _slate('dup-a', candidates=[_live('canon', store_score=0.80),
-                                        _live('other', store_score=0.70)],
-                   band_winner_id='canon', band=OUTCOME_JUDGE),
-            _slate('dup-b', candidates=[_live('other', store_score=0.85),
-                                        _live('canon', store_score=0.75)],
-                   band_winner_id='other', band=OUTCOME_JUDGE),
-        ]
-        return _cases_mod().plan_from_slates(records, slates, provenance={}), slates
-
-    @staticmethod
-    def _scored(rows) -> list[tuple[str, float]]:
-        return [(row['memory_id'], row['metadata']['store_score']) for row in rows]
-
     def test_each_case_is_handed_its_own_rows(self, tmp_path: Path) -> None:
-        plan, _ = self._plan()
+        """`judge_write` re-sorts a slate by its rows' cosines, so a row pooled
+        from another case's retrieval would hand this prompt that query's order."""
+        plan, _ = _crossed_retrieved_plan()
         handed: list[list[tuple[str, float]]] = []
 
         def judge_fn(case, candidates):
-            handed.append(self._scored(candidates))
+            handed.append(_scored(candidates))
             return OUTCOME_AMENDED
 
         _mod().run_judge_eval(
@@ -1388,92 +1238,13 @@ class TestEachCaseIsShownItsOwnRetrieval:
             [('other', 0.85), ('canon', 0.75)],
         ]
 
-    def test_the_plan_resolves_each_case_to_its_own_slate(self) -> None:
-        plan, slates = self._plan()
-        for case, rows, slate in zip(plan.cases, plan.candidate_records, slates, strict=True):
-            assert [row['memory_id'] for row in rows] == case['candidates']
-            assert self._scored(rows) == self._scored(slate.candidates)
-
-        corpus = _corpus()
-        fixture_record = {record['memory_id']: record for record in corpus}
-        seeded = _cases_mod().seeded_plan(corpus, distractors=2)
-        for case, rows in zip(seeded.cases, seeded.candidate_records, strict=True):
-            assert [row['memory_id'] for row in rows] == case['candidates']
-            assert list(rows) == [fixture_record[cid] for cid in case['candidates']]
-
-    def test_records_that_do_not_resolve_the_slates_are_refused(self) -> None:
-        plan, _ = self._plan()
-
-        def rebuilt(candidate_records):
-            return _cases_mod().EvalPlan(
-                cases=plan.cases, candidate_records=candidate_records,
-                fixture_by_id=plan.fixture_by_id,
-                record_count=plan.record_count, provenance=plan.provenance,
-            )
-
-        with pytest.raises(ValueError, match='dup-b') as excinfo:
-            rebuilt((plan.candidate_records[0], plan.candidate_records[0]))
-        assert 'dup-a' not in str(excinfo.value), 'only the unresolved case is named'
-        with pytest.raises(ValueError):
-            rebuilt(plan.candidate_records[:1])
-
-
-class TestAJudgeBandCaseIsNeverShownAnEmptySlate:
-    """Task 5277 A3: a verdict nobody gave must not be scored.
-
-    `judge_write` answers an empty slate `stored` with no provider call, and
-    `stored` is exactly what the distractor control accepts, so an eval that
-    routed such a case to the judge would count a correct answer the model
-    never produced. `EvalPlan` refuses the case where the plan is built:
-    before any spend, and before the cases file is opened.
-    """
-
-    @staticmethod
-    def _one_cluster() -> list[dict]:
-        """`_corpus()`'s c2 alone: its control has no other cluster to draw from."""
-        return [r for r in _corpus() if r['cluster_id'] == 'c2-canon']
-
-    @staticmethod
-    def _retrieved(*slates):
-        records = [
-            _rec('canon', 'canon', 'canonical'),
-            *(_rec(slate.memory_id, 'canon', 'duplicate') for slate in slates),
-        ]
-        return _cases_mod().plan_from_slates(records, list(slates), provenance={})
-
-    def test_a_single_cluster_seeded_plan_is_refused_naming_its_control(self) -> None:
-        with pytest.raises(ValueError, match='c2-distinct') as excinfo:
-            _cases_mod().seeded_plan(self._one_cluster(), distractors=4)
-        assert 'c2-dup-1' not in str(excinfo.value), 'only the empty slate is named'
-
     def test_the_judge_is_never_asked_and_nothing_is_written(self, tmp_path: Path) -> None:
+        """Task 5277 A3: a judge-band case with an empty slate is refused before any spend."""
         judge = _fake_judge()
         with pytest.raises(ValueError):
-            _run(tmp_path, judge=judge, corpus=self._one_cluster(), distractors=4)
+            _run(tmp_path, judge=judge, corpus=_one_cluster_corpus(), distractors=4)
         assert judge.calls == []
         assert list(tmp_path.iterdir()) == []
-
-    def test_every_offending_case_is_named(self) -> None:
-        with pytest.raises(ValueError) as excinfo:
-            self._retrieved(
-                _slate('empty-one', candidates=[], band_winner_id=None, band=OUTCOME_JUDGE),
-                _slate('empty-two', candidates=[], band_winner_id=None, band=OUTCOME_JUDGE),
-            )
-        message = str(excinfo.value)
-        assert 'empty-one' in message and 'empty-two' in message, message
-
-    def test_a_judge_band_with_one_candidate_is_accepted(self) -> None:
-        plan = self._retrieved(_slate(
-            'd1', candidates=[_live('canon')], band_winner_id='canon', band=OUTCOME_JUDGE,
-        ))
-        assert [c['candidates'] for c in plan.cases] == [['canon']]
-
-    def test_a_stored_band_with_an_empty_slate_is_accepted(self) -> None:
-        """Production's own novel or degraded path, answered with no judge at all."""
-        plan = self._retrieved(_slate(
-            'd1', candidates=[], band_winner_id=None, band=OUTCOME_STORED, similarity=None,
-        ))
-        assert [c['candidates'] for c in plan.cases] == [[]]
 
 
 class TestApplyFieldChars:
@@ -1538,9 +1309,8 @@ class TestScoreAttachmentsKeepsItsContractPath:
         assert _mod().score_attachments is _scoring().score_attachments
 
 
-#: Loads each named ``scripts/`` module by path under its stem, in order, and
-#: prints the ``scripts/`` stems in ``sys.modules`` after each load, one JSON
-#: list per line.
+#: Loads ONE ``scripts/`` module by path under its stem and prints the
+#: ``scripts/`` stems then in ``sys.modules``, as one JSON list.
 _LAYERING_PROBE = """
 import importlib.util
 import json
@@ -1549,42 +1319,43 @@ from pathlib import Path
 
 scripts = Path('scripts')
 stems = {path.stem for path in scripts.glob('*.py')}
-for stem in sys.argv[1:]:
-    spec = importlib.util.spec_from_file_location(stem, scripts / f'{stem}.py')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[stem] = module
-    spec.loader.exec_module(module)
-    print(json.dumps(sorted(stems & set(sys.modules))))
+stem = sys.argv[1]
+spec = importlib.util.spec_from_file_location(stem, scripts / f'{stem}.py')
+module = importlib.util.module_from_spec(spec)
+sys.modules[stem] = module
+spec.loader.exec_module(module)
+print(json.dumps(sorted(stems & set(sys.modules))))
 """
+
+_SCORING_CLOSURE = frozenset({'eval_write_triage_scoring', 'calibrate_write_triage'})
 
 
 class TestTheEvalScriptsImportOnlyDownward:
-    """Each eval module loads only the modules beneath it, never the CLI or a sibling.
+    """Each eval module loads exactly what lies beneath it: never the CLI, never a sibling.
 
-    The loads go by path, so no linter sees an upward one. One fresh
-    interpreter loads the modules bottom-up and reports which ``scripts/``
-    modules each load brought in. The CLI is not loaded: it may load everything.
+    The loads go by path, so no linter sees an upward or sideways one. Each
+    module is loaded in its OWN fresh interpreter, so a sibling cannot hide
+    behind a ``sys.modules`` entry an earlier load left, and the ``scripts/``
+    modules it brings in must equal its downward closure. The CLI is not
+    loaded: it may load everything.
     """
 
-    LOADS = (
-        ('eval_write_triage_scoring', {'calibrate_write_triage', 'eval_write_triage_scoring'}),
-        ('eval_write_triage_live_judge', {'eval_write_triage_live_judge'}),
-        ('eval_write_triage_cases', {'eval_write_triage_cases'}),
-    )
-
-    def test_each_load_brings_in_only_what_lies_beneath_it(self) -> None:
+    @pytest.mark.parametrize(('stem', 'closure'), [
+        ('eval_write_triage_scoring', _SCORING_CLOSURE),
+        ('eval_write_triage_cases', _SCORING_CLOSURE | {'eval_write_triage_cases'}),
+        ('eval_write_triage_live_judge', _SCORING_CLOSURE | {'eval_write_triage_live_judge'}),
+    ])
+    def test_a_module_loads_exactly_its_downward_closure(
+        self, stem: str, closure: frozenset[str],
+    ) -> None:
         result = subprocess.run(
-            [sys.executable, '-c', _LAYERING_PROBE, *(stem for stem, _ in self.LOADS)],
+            [sys.executable, '-c', _LAYERING_PROBE, stem],
             cwd=SCRIPT_PATH.parent.parent, capture_output=True, text=True, check=False,
             timeout=120,
         )
         assert result.returncode == 0, result.stderr
-        snapshots = [set(json.loads(line)) for line in result.stdout.splitlines()]
-        assert len(snapshots) == len(self.LOADS), result.stdout
-        expected: set[str] = set()
-        for (stem, adds), loaded in zip(self.LOADS, snapshots, strict=True):
-            expected |= adds
-            assert loaded == expected, (
-                f'loading {stem} also loaded {sorted(loaded - expected)} '
-                f'and not {sorted(expected - loaded)}'
-            )
+        loaded = set(json.loads(result.stdout))
+        assert loaded == closure, (
+            f'loading {stem} also loaded {sorted(loaded - closure)} '
+            f'and not {sorted(closure - loaded)}'
+        )

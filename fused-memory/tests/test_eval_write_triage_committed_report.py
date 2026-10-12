@@ -12,24 +12,12 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
-import types
 from pathlib import Path
 
 import pytest
 from _eval_write_triage_fixtures import ALIASES_PATH, FIXTURE_PATH, committed_records
-from _fm_helpers import load_script_module
-
-SCRIPTS = Path(__file__).parent.parent / 'scripts'
-
-
-@functools.cache
-def _mod() -> types.ModuleType:
-    return load_script_module(SCRIPTS / 'eval_write_triage_judge.py', 'eval_write_triage_judge')
-
-
-@functools.cache
-def _scoring() -> types.ModuleType:
-    return load_script_module(SCRIPTS / 'eval_write_triage_scoring.py', 'eval_write_triage_scoring')
+from _eval_write_triage_fixtures import cli_mod as _mod
+from _eval_write_triage_fixtures import scoring_mod as _scoring
 
 
 @pytest.fixture(scope='module')

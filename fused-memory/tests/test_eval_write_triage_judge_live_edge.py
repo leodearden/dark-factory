@@ -20,7 +20,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _fm_helpers import load_script_module
+from _eval_write_triage_fixtures import cases_mod as _cases_mod
+from _eval_write_triage_fixtures import cli_mod as _mod
+from _eval_write_triage_fixtures import live_judge_mod as _live_judge
+from _eval_write_triage_fixtures import rec as _rec
+from _eval_write_triage_fixtures import wording_mod as _wording
 from _write_triage_store_fake import FakeMemoryService
 
 from fused_memory.models.enums import SourceStore
@@ -38,8 +42,6 @@ from fused_memory.server.write_triage_judge import (
 )
 from fused_memory.services.memory_service import SearchResults
 
-SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'eval_write_triage_judge.py'
-
 #: The committed curator-labelled corpus the seeded eval runs over.
 SEEDED_FIXTURE = Path(__file__).parent / 'fixtures' / 'write_triage_calibration.jsonl'
 
@@ -55,27 +57,6 @@ _USAGE_ROW = {'prompt_tokens': 321, 'completion_tokens': 7, 'total_tokens': 328}
 
 T_HIGH = 0.9
 T_LOW = 0.5
-
-
-def _mod() -> types.ModuleType:
-    return load_script_module(SCRIPT_PATH, 'eval_write_triage_judge')
-
-
-def _cases_mod() -> types.ModuleType:
-    return load_script_module(SCRIPT_PATH.parent / 'eval_write_triage_cases.py', 'eval_write_triage_cases')
-
-
-def _live_judge() -> types.ModuleType:
-    return load_script_module(
-        SCRIPT_PATH.parent / 'eval_write_triage_live_judge.py', 'eval_write_triage_live_judge',
-    )
-
-
-def _rec(memory_id: str, cluster_id: str, label: str) -> dict:
-    return {
-        'memory_id': memory_id, 'content': f'content of {memory_id}',
-        'category': 'procedural_knowledge', 'cluster_id': cluster_id, 'label': label,
-    }
 
 
 #: Three clusters, grouped in file order as the committed fixture is. In this
@@ -467,12 +448,6 @@ class TestTheRetrievedCli:
         assert (row['attach_target_cluster_id'], row['attach_target_label']) == (
             'b-canon', 'duplicate',
         )
-
-
-def _wording() -> types.ModuleType:
-    return load_script_module(
-        SCRIPT_PATH.parent / 'write_triage_judge_wording.py', 'write_triage_judge_wording',
-    )
 
 
 class TestTheWordingCli:

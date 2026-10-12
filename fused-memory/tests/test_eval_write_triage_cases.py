@@ -1,4 +1,4 @@
-"""Tests for eval_write_triage_cases.py — the cases a seeded run asks, and their slates.
+"""Tests for eval_write_triage_cases.py — the cases a run asks, their slates, and the plan.
 
 PRD ``docs/prds/memory-write-path-convergence.md`` §9 leaf γ, decision D10.
 
@@ -14,14 +14,22 @@ import types
 from pathlib import Path
 
 import pytest
+from _eval_write_triage_fixtures import cases_mod as _cases_mod
 from _eval_write_triage_fixtures import committed_records
 from _eval_write_triage_fixtures import corpus as _corpus
+from _eval_write_triage_fixtures import crossed_retrieved_plan as _crossed_retrieved_plan
+from _eval_write_triage_fixtures import live as _live
+from _eval_write_triage_fixtures import one_cluster_corpus as _one_cluster_corpus
 from _eval_write_triage_fixtures import rec as _rec
+from _eval_write_triage_fixtures import scored as _scored
+from _eval_write_triage_fixtures import scoring_mod as _scoring
+from _eval_write_triage_fixtures import slate as _slate
 from _fm_helpers import load_script_module
 
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
+    OUTCOME_JUDGE,
     OUTCOME_RESTATED,
     OUTCOME_STORED,
     TRIAGE_OUTCOMES,
@@ -29,16 +37,6 @@ from fused_memory.server.write_triage import (
 
 SCRIPTS = Path(__file__).parent.parent / 'scripts'
 CALIBRATE_PATH = SCRIPTS / 'calibrate_write_triage.py'
-
-
-@functools.cache
-def _scoring() -> types.ModuleType:
-    return load_script_module(SCRIPTS / 'eval_write_triage_scoring.py', 'eval_write_triage_scoring')
-
-
-@functools.cache
-def _cases_mod() -> types.ModuleType:
-    return load_script_module(SCRIPTS / 'eval_write_triage_cases.py', 'eval_write_triage_cases')
 
 
 @functools.cache
@@ -457,3 +455,190 @@ class TestBuildJudgeCases:
             _calib().LABEL_PSEUDO_CONTRADICTION,
             _scoring().CLASS_DISTRACTOR,
         )
+
+
+# ---------------------------------------------------------------------------
+# plan_from_slates, seeded_plan and EvalPlan
+# ---------------------------------------------------------------------------
+
+class TestPlanFromSlates:
+    """The retrieved mode's case construction, with the live edge stubbed."""
+
+    @staticmethod
+    def _records() -> list[dict]:
+        return [
+            _rec('c1-canon', 'c1-canon', 'canonical'),
+            _rec('c1-dup-1', 'c1-canon', 'duplicate'),
+            _rec('c2-distinct', 'c2-canon', 'distinct'),
+        ]
+
+    @staticmethod
+    def _slates() -> list:
+        return [
+            _slate('c1-dup-1', candidates=[_live('c1-canon'), _live('zz')],
+                   band_winner_id='c1-canon', band=OUTCOME_JUDGE),
+            _slate('c2-distinct', candidates=[_live('zz')],
+                   band_winner_id='zz', band=OUTCOME_RESTATED,
+                   canonical_present=False),
+        ]
+
+    def _plan(self, **overrides):
+        return _cases_mod().plan_from_slates(
+            self._records(), self._slates(), provenance=overrides or {'t_low': 0.5},
+        )
+
+    def test_one_case_per_non_canonical_record_and_no_control(self) -> None:
+        plan = self._plan()
+        assert [c['memory_id'] for c in plan.cases] == ['c1-dup-1', 'c2-distinct']
+        assert not [
+            c for c in plan.cases
+            if c['expected_class'] == _scoring().CLASS_DISTRACTOR
+        ]
+
+    def test_the_expected_class_stays_the_curator_label(self) -> None:
+        plan = self._plan()
+        assert [c['expected_class'] for c in plan.cases] == ['duplicate', 'distinct']
+
+    def test_the_band_and_its_winner_come_from_the_retrieval(self) -> None:
+        plan = self._plan()
+        judged, deterministic = plan.cases
+        assert judged['band'] == OUTCOME_JUDGE
+        assert judged['band_winner_id'] == 'c1-canon'
+        assert deterministic['band'] == OUTCOME_RESTATED
+        assert deterministic['band_winner_id'] == 'zz'
+
+    def test_a_record_whose_canonical_is_gone_stays_in_the_population(self) -> None:
+        """They are production reality, so dropping them would flatter the run."""
+        plan = self._plan()
+        assert plan.cases[1]['canonical_present'] is False
+        assert len(plan.cases) == 2
+
+    def test_the_plan_discloses_its_own_mode(self) -> None:
+        assert self._plan().provenance['slate_mode'] == _scoring().SLATE_RETRIEVED
+        assert _cases_mod().seeded_plan(
+            _corpus(), distractors=2,
+        ).provenance['slate_mode'] == _scoring().SLATE_SEEDED
+
+    def test_a_slate_count_mismatch_raises(self) -> None:
+        with pytest.raises(ValueError, match='positional'):
+            _cases_mod().plan_from_slates(self._records(), [], provenance={})
+
+    def test_a_hoisted_child_counts_as_the_canonical_on_the_slate(self) -> None:
+        """`_canonical_id_of` hoists a sighting to its parent, so a slate
+        holding only the CHILD still shows the model the match."""
+        slates = [
+            _slate('c1-dup-1', candidates=[_live('child', canonical_id='c1-canon')],
+                   band_winner_id='c1-canon', band=OUTCOME_JUDGE),
+            _slate('c2-distinct', candidates=[_live('zz')],
+                   band_winner_id='zz', band=OUTCOME_JUDGE),
+        ]
+        plan = _cases_mod().plan_from_slates(self._records(), slates, provenance={})
+        row = _scoring().case_row(
+            1, plan.cases[0], _scoring().JudgeAnswer(outcome=OUTCOME_AMENDED),
+            plan.candidate_records[0], plan.fixture_by_id,
+        )
+        assert row['canonical_in_slate'] is True
+
+    def test_every_case_carries_its_clusters_alias(self) -> None:
+        plan = _cases_mod().plan_from_slates(
+            self._records(), self._slates(), provenance={},
+            aliases={'c1-canon': 'c1-new'},
+        )
+        assert [c['canonical_alias_id'] for c in plan.cases] == ['c1-new', None]
+
+    def test_without_aliases_no_case_carries_one(self) -> None:
+        assert [c['canonical_alias_id'] for c in self._plan().cases] == [None, None]
+
+    def test_a_seeded_case_carries_its_clusters_alias_too(self) -> None:
+        plan = _cases_mod().seeded_plan(_corpus(), distractors=2, aliases={'c1-canon': 'c1-new'})
+        for case in plan.cases:
+            expected = 'c1-new' if case['cluster_id'] == 'c1-canon' else None
+            assert case['canonical_alias_id'] == expected, case['memory_id']
+        assert _scoring().CLASS_DISTRACTOR in {
+            c['expected_class'] for c in plan.cases if c['canonical_alias_id']
+        }, 'the control case of an aliased cluster carries the alias too'
+
+
+class TestEachCaseIsShownItsOwnRetrieval:
+    """A retrieved row carries ITS query's cosine, so rows are never pooled.
+
+    `judge_write` re-sorts every slate by that cosine (`select_judge_candidates`),
+    so a row borrowed from another case's retrieval hands this case's prompt an
+    order that another query produced. Two duplicates retrieving the same two
+    records at opposite cosines make the borrowing observable.
+    """
+
+    def test_the_plan_resolves_each_case_to_its_own_slate(self) -> None:
+        plan, slates = _crossed_retrieved_plan()
+        for case, rows, slate in zip(plan.cases, plan.candidate_records, slates, strict=True):
+            assert [row['memory_id'] for row in rows] == case['candidates']
+            assert _scored(rows) == _scored(slate.candidates)
+
+        corpus = _corpus()
+        fixture_record = {record['memory_id']: record for record in corpus}
+        seeded = _cases_mod().seeded_plan(corpus, distractors=2)
+        for case, rows in zip(seeded.cases, seeded.candidate_records, strict=True):
+            assert [row['memory_id'] for row in rows] == case['candidates']
+            assert list(rows) == [fixture_record[cid] for cid in case['candidates']]
+
+    def test_records_that_do_not_resolve_the_slates_are_refused(self) -> None:
+        plan, _ = _crossed_retrieved_plan()
+
+        def rebuilt(candidate_records):
+            return _cases_mod().EvalPlan(
+                cases=plan.cases, candidate_records=candidate_records,
+                fixture_by_id=plan.fixture_by_id,
+                record_count=plan.record_count, provenance=plan.provenance,
+            )
+
+        with pytest.raises(ValueError, match='dup-b') as excinfo:
+            rebuilt((plan.candidate_records[0], plan.candidate_records[0]))
+        assert 'dup-a' not in str(excinfo.value), 'only the unresolved case is named'
+        with pytest.raises(ValueError):
+            rebuilt(plan.candidate_records[:1])
+
+
+class TestAJudgeBandCaseIsNeverShownAnEmptySlate:
+    """Task 5277 A3: a verdict nobody gave must not be scored.
+
+    `judge_write` answers an empty slate `stored` with no provider call, and
+    `stored` is exactly what the distractor control accepts, so an eval that
+    routed such a case to the judge would count a correct answer the model
+    never produced. `EvalPlan` refuses the case where the plan is built:
+    before any spend, and before the cases file is opened.
+    """
+
+    @staticmethod
+    def _retrieved(*slates):
+        records = [
+            _rec('canon', 'canon', 'canonical'),
+            *(_rec(slate.memory_id, 'canon', 'duplicate') for slate in slates),
+        ]
+        return _cases_mod().plan_from_slates(records, list(slates), provenance={})
+
+    def test_a_single_cluster_seeded_plan_is_refused_naming_its_control(self) -> None:
+        with pytest.raises(ValueError, match='c2-distinct') as excinfo:
+            _cases_mod().seeded_plan(_one_cluster_corpus(), distractors=4)
+        assert 'c2-dup-1' not in str(excinfo.value), 'only the empty slate is named'
+
+    def test_every_offending_case_is_named(self) -> None:
+        with pytest.raises(ValueError) as excinfo:
+            self._retrieved(
+                _slate('empty-one', candidates=[], band_winner_id=None, band=OUTCOME_JUDGE),
+                _slate('empty-two', candidates=[], band_winner_id=None, band=OUTCOME_JUDGE),
+            )
+        message = str(excinfo.value)
+        assert 'empty-one' in message and 'empty-two' in message, message
+
+    def test_a_judge_band_with_one_candidate_is_accepted(self) -> None:
+        plan = self._retrieved(_slate(
+            'd1', candidates=[_live('canon')], band_winner_id='canon', band=OUTCOME_JUDGE,
+        ))
+        assert [c['candidates'] for c in plan.cases] == [['canon']]
+
+    def test_a_stored_band_with_an_empty_slate_is_accepted(self) -> None:
+        """Production's own novel or degraded path, answered with no judge at all."""
+        plan = self._retrieved(_slate(
+            'd1', candidates=[], band_winner_id=None, band=OUTCOME_STORED, similarity=None,
+        ))
+        assert [c['candidates'] for c in plan.cases] == [[]]
