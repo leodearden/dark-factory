@@ -145,7 +145,7 @@ _ESCALATION_TOOLS = [
     'mcp__escalation__escalate_blocker',
 ]
 
-# Task 5721: spliced into ESCALATION_LADDER_CORE right after the escalate_blocker bullet.
+# Spliced into ESCALATION_LADDER_CORE so every escalating role, steward included, reads it.
 RESERVED_BOUND_ROUTING_RULE = """
 **A bound reserved to a human makes the ruling blocking, even when the finding is not.**
 If your remedy must cross a bound whose own text reserves the change to a human

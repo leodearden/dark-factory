@@ -37,7 +37,8 @@ in its module docstring), every assertion here is a containment /
 non-containment / identity check against a NAMED constant — never a string
 literal pinned to a constant's prose. A prose pin "passes on prose reworded to
 say the opposite and fails on a legitimate tightening" and only taxes future
-prompt edits; it has no correctness content in either direction.
+prompt edits; it has no correctness content in either direction. The
+``RESERVED_BOUND_ROUTING_RULE`` checks (task 5721) are this ordinary shape.
 
 Task 5368 adds containment checks for `escalation.models`' filer-facing action
 tokens, and they are NOT that banned shape even though what they search is
@@ -48,8 +49,6 @@ here therefore survives any rewording of the surrounding sentence and fails
 only when the prompt and the emitted value genuinely disagree -- which is a
 real defect, not a prompt-edit tax. That is also why they are imported rather
 than spelled: a literal would carry no coupling to the emission site at all.
-
-Task 5721 pins the presence of `RESERVED_BOUND_ROUTING_RULE` the same way.
 """
 
 from __future__ import annotations
