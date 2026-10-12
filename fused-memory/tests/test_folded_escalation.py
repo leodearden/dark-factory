@@ -21,7 +21,9 @@ helper would be a behaviour change, not a refactor.
 
 from __future__ import annotations
 
+import ast
 import importlib
+import importlib.util
 import json
 import logging
 from collections.abc import Callable
@@ -30,7 +32,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import pytest
-from _ast_guard import imported_names_from, parse_python_module
+from _ast_guard import parse_python_module
 from shared.project_layout import escalation_queue_dir
 
 from fused_memory.middleware import _folded_escalation
@@ -380,21 +382,15 @@ class TestNeverRaises:
 
         assert _emit(tmp_path) is None
 
-    def test_without_the_escalation_package_it_no_ops(self, tmp_path, monkeypatch, caplog):
-        """The minimal-env path: logged, nothing filed, `None` returned. Every
-        caller must behave identically whether or not the optional `escalation`
-        workspace package is installed."""
+    def test_without_the_escalation_package_it_no_ops(self, tmp_path, monkeypatch):
+        """The minimal-env path: nothing filed, `None` returned. Every caller
+        must behave identically whether or not the optional `escalation`
+        workspace package is installed. The line it logs is pinned by
+        TestTheEmittedLevels."""
         monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', False)
 
-        with caplog.at_level('DEBUG'):
-            result = _emit(tmp_path)
-
-        assert result is None
+        assert _emit(tmp_path) is None
         assert not (tmp_path / 'data' / 'escalations').exists()
-        assert any(r.levelno == logging.WARNING for r in caplog.records), (
-            'a no-op alarm must still say so, at WARNING — see '
-            'TestTheEmittedLevels for why a lost alarm is never quieter'
-        )
 
     def test_a_none_project_root_returns_none_quietly(self, tmp_path, caplog):
         """`write_triage` takes `project_root: str | None`; None means there is
@@ -719,26 +715,47 @@ _MIGRATED_FILERS: tuple[_Filer, ...] = (
 #: never an inherited venv's editable install of some other checkout.
 _SRC_ROOT = Path(__file__).parents[1] / 'src' / 'fused_memory'
 
+_HELPER_MODULE = _folded_escalation.__name__
+
+
+def _imported_targets(tree: ast.AST, package: str) -> set[str]:
+    """The absolute dotted name of everything an import under *tree* binds.
+
+    `import a.b` yields `a.b`, `from a import b` yields `a.b`, and a relative
+    `from .a import b` inside package `p` yields `p.a.b`, resolved by the
+    import system's own `importlib.util.resolve_name`.
+    """
+    targets: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            targets.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            source = importlib.util.resolve_name(
+                '.' * node.level + (node.module or ''), package,
+            )
+            targets.update(f'{source}.{alias.name}' for alias in node.names)
+    return targets
+
+
+def _imports_the_helper(tree: ast.AST, package: str) -> bool:
+    """Whether *tree* imports the helper's module or anything from it, in any
+    spelling: so a caller cannot leave the table by how it writes the import."""
+    return any(
+        target == _HELPER_MODULE or target.startswith(f'{_HELPER_MODULE}.')
+        for target in _imported_targets(tree, package)
+    )
+
 
 def _modules_that_call_the_helper() -> set[str]:
     """The dotted name of every production module that imports the helper.
 
     Over PARSED imports, so prose that merely names the helper cannot count.
-    Importing the `_folded_escalation` module itself counts too, so a caller
-    cannot leave the table by spelling the call `_folded_escalation.file_...`.
     """
     found: set[str] = set()
     for path in sorted(_SRC_ROOT.rglob('*.py')):
-        tree = parse_python_module(path)
-        imports_the_helper = 'file_folded_escalation' in imported_names_from(
-            tree, 'fused_memory.middleware._folded_escalation',
-        )
-        imports_its_module = '_folded_escalation' in imported_names_from(
-            tree, 'fused_memory.middleware',
-        )
-        if imports_the_helper or imports_its_module:
-            dotted = path.relative_to(_SRC_ROOT.parent).with_suffix('')
-            found.add(dotted.as_posix().replace('/', '.'))
+        package = path.parent.relative_to(_SRC_ROOT.parent).as_posix().replace('/', '.')
+        if _imports_the_helper(parse_python_module(path), package):
+            found.add(package if path.stem == '__init__' else f'{package}.{path.stem}')
     return found
 
 
@@ -828,6 +845,28 @@ class TestEveryFilerPinsItsLevels:
             'A new pending-anchor-fold filer must get a row, so the levels it '
             'forwards are fenced like every other filer\'s.'
         )
+
+    @pytest.mark.parametrize(('source', 'package'), [
+        ('from fused_memory.middleware._folded_escalation import file_folded_escalation',
+         'fused_memory.server'),
+        ('from fused_memory.middleware import _folded_escalation', 'fused_memory.server'),
+        ('import fused_memory.middleware._folded_escalation', 'fused_memory.server'),
+        ('import fused_memory.middleware._folded_escalation as fe', 'fused_memory.server'),
+        ('from ._folded_escalation import file_folded_escalation', 'fused_memory.middleware'),
+        ('from . import _folded_escalation', 'fused_memory.middleware'),
+        ('from ..middleware._folded_escalation import file_folded_escalation',
+         'fused_memory.services'),
+    ])
+    def test_the_census_counts_every_import_spelling(self, source, package):
+        assert _imports_the_helper(ast.parse(source), package)
+
+    @pytest.mark.parametrize(('source', 'package'), [
+        ('from fused_memory.middleware import candidate_key_escalation', 'fused_memory.server'),
+        ('from ._folded_escalation_neighbour import x', 'fused_memory.middleware'),
+        ('from .middleware import _folded_escalation', 'fused_memory.services'),
+    ])
+    def test_the_census_ignores_a_lookalike(self, source, package):
+        assert not _imports_the_helper(ast.parse(source), package)
 
     def test_the_table_names_its_exceptions(self):
         not_l1 = {
