@@ -85,10 +85,8 @@ from dashboard.data.mcp_fanout import project_label
 from dashboard.data.task_runtime import fetch_task_runtime
 from dashboard.data.task_snapshot import (
     SnapshotFailure,
-    SnapshotHealth,
     TaskSnapshot,
     acquire_snapshot,
-    classify,
     unmeasured_snapshot,
     withhold_rows,
 )
@@ -1184,45 +1182,3 @@ async def collect_census_snapshots(
         config, _share, now=effective_now, deadline=deadline,
     )
     return {project_label(root): snapshot for root, _rows, snapshot in served}
-
-
-async def collect_active_tasks(
-    client: httpx.AsyncClient,
-    config: DashboardConfig,
-    *,
-    now: datetime | None = None,
-) -> tuple[list[dict], list[str]]:
-    """Collect active tasks across all known projects.
-
-    Returns ``(active_tasks, offline_projects)`` where *offline_projects* is
-    the list of project labels whose read DEMONSTRABLY failed.  The handler
-    turns a non-empty *offline_projects* into ``offline: True`` on the
-    dashboard payload.
-
-    The labels are DERIVED from each root's unit through
-    ``task_snapshot.classify``, not carried alongside it: there is one place
-    that decides what "offline" means, and this narrower contract reads it
-    rather than restating it.
-
-    *now* is forwarded to ``collect_tasks_with_counts`` so every row's
-    ``started`` derives from a single shared instant; see that function's
-    docstring for details. Defaults to the live clock.
-
-    Lock state is surfaced via the scheduler endpoint — see
-    /api/v2/dashboard/scheduler.
-
-    The whole-handler budget applies here too, but a DEGRADED root is absorbed
-    rather than forwarded: this narrower two-element contract has nowhere to
-    put it, and a degraded project is emphatically NOT offline, so
-    reclassifying it into *offline_projects* would be a lie.  It is still
-    logged at WARNING by ``collect_tasks_with_counts``.  Callers that need to
-    distinguish "unknown" from "reachable and empty" — or that want the census
-    at all — must use ``collect_tasks_with_counts`` directly and read the
-    units.
-    """
-    active, snapshots = await collect_tasks_with_counts(client, config, now=now)
-    offline = [
-        label for label, snapshot in snapshots.items()
-        if classify(snapshot) is SnapshotHealth.OFFLINE
-    ]
-    return active, offline
