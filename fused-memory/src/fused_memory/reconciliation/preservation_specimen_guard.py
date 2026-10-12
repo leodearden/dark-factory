@@ -79,7 +79,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -382,12 +382,40 @@ class PreservationSuppressionResult:
       policy in :func:`filter_preservation_specimen_flags`), and this field is
       what stops that keep from being byte-identical to a clean "no citation
       exists" (INV-11).
+    - ``candidate_task_ids`` — tasks this pass looked up; a task's absence
+      means this pass says nothing about it.  Always a superset of
+      ``unresolved_task_ids``.
     """
 
     kept_flags: list[dict[str, Any]]
     suppressed_by_task: dict[str, int]
     citations_by_task: dict[str, str]
     unresolved_task_ids: tuple[str, ...]
+    candidate_task_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        outside = _unresolved_outside_candidates(
+            self.candidate_task_ids, self.unresolved_task_ids,
+        )
+        if outside:
+            raise ValueError(
+                'PreservationSuppressionResult: unresolved_task_ids must be a subset '
+                f'of candidate_task_ids (unresolved ⊆ candidates); offending ids '
+                f'{list(outside)} are not in candidates {list(self.candidate_task_ids)}'
+            )
+
+
+def _unresolved_outside_candidates(
+    candidates: Iterable[str], unresolved: Iterable[str],
+) -> tuple[str, ...]:
+    """The ids in *unresolved* that are not in *candidates*, in order.
+
+    The single definition of the ``unresolved ⊆ candidates`` invariant, enforced
+    both when a result is built and when a past pass's observation is read back.
+    Pure, sync, no I/O.
+    """
+    candidate_set = set(candidates)
+    return tuple(t for t in unresolved if t not in candidate_set)
 
 
 #: Canonical Graphiti entity label for a task.  ``get_entity`` TRIES this shape
@@ -798,7 +826,7 @@ async def filter_preservation_specimen_flags(
     if not candidates:
         return PreservationSuppressionResult(
             kept_flags=batch, suppressed_by_task={}, citations_by_task={},
-            unresolved_task_ids=(),
+            unresolved_task_ids=(), candidate_task_ids=(),
         )
 
     verdicts: dict[str, _Corroboration] = {}
@@ -880,6 +908,7 @@ async def filter_preservation_specimen_flags(
         suppressed_by_task=suppressed_by_task,
         citations_by_task=citations_by_task,
         unresolved_task_ids=tuple(t for t in unresolved if t in kept_task_ids),
+        candidate_task_ids=tuple(candidates),
     )
 
 
