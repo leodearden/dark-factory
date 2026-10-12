@@ -1019,7 +1019,7 @@ def test_merge_correction_unknown_entry_id_is_skipped_and_counted():
 @pytest.mark.parametrize("action", ["delete", "remove"])
 def test_merge_skips_a_correction_removal_action(action):
     """A removal-shaped correction is skipped whole, exactly as
-    `_reject_deletion_directive` already treats `matches`."""
+    `_deletion_directive` already treats `matches`."""
     record = _correction_record()
     record["corrections"][0]["action"] = action
 
@@ -1125,6 +1125,19 @@ def test_merge_skips_a_match_delete_action():
     skipped = _skipped_as_deletion(record)
 
     assert "match carries a removal action: 'delete'" in skipped.reason
+
+
+def test_a_never_delete_breach_by_the_merger_itself_fails_the_batch(monkeypatch):
+    """Only a deletion directive is the record's fault. The never-delete
+    post-condition guards the merger, so its breach is a merger bug: it fails
+    the batch rather than being filed as a skipped deletion."""
+    def breached(before, after):
+        raise mod.NeverDeleteError("entries dropped from codebook: ['entry-a']")
+
+    monkeypatch.setattr(mod, "assert_no_deletion", breached)
+
+    with pytest.raises(mod.NeverDeleteError, match="entries dropped"):
+        _merge_one(_codebook_with_entry_a(), _match_record())
 
 
 def test_assert_no_deletion_raises_when_entry_missing():
@@ -1729,7 +1742,7 @@ class TestMainCLI:
         good = json.loads(records_path.read_text(encoding="utf-8"))
 
         bad = _match_record()
-        bad["matches"][0]["action"] = "delete"  # trips _reject_deletion_directive
+        bad["matches"][0]["action"] = "delete"  # trips _deletion_directive
 
         # A second good record under a DIFFERENT session, so it is not
         # deduped away by the session-keyed idempotency guard — its arrival

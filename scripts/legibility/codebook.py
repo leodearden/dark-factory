@@ -19,9 +19,8 @@ import os
 import re
 import sys
 import tempfile
-from collections import Counter
 from collections.abc import Callable, Collection, Iterable, Mapping
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
@@ -73,7 +72,7 @@ HEADER = """\
 # version 2. MERGER-OWNED FILE: written solely by scripts/legibility/codebook.py
 # (plans/confusion-reduction-prd.md §7.1/§7.3). Append-only, never hand-edited:
 # entries are never deleted (retire via status: retired); sightings/candidates
-# are appended by the deterministic merger's apply_coding_record(). Hand edits
+# are appended by the deterministic merger's apply_coding_records(). Hand edits
 # will be normalized/overwritten on the next merge.
 """
 
@@ -86,10 +85,9 @@ _REMOVAL_ACTIONS = {"delete", "remove"}
 
 
 class NeverDeleteError(Exception):
-    """Raised when a coding record carries a deletion-shaped directive, or
-    when a merge result would drop a codebook entry or shrink an entry's
-    sighting history. The confusion codebook is append-only (PRD §6/§8.3):
-    entries are retired via status='retired', never removed."""
+    """Raised when a codebook write would drop an entry or a candidate, or
+    shrink one's sighting history. The confusion codebook is append-only (PRD
+    §6/§8.3): entries are retired via status='retired', never removed."""
 
 # ---------------------------------------------------------------------------
 # v2 schema (structural). Strict on v2-relevant fields; permissive on v1
@@ -503,28 +501,25 @@ def _build_sighting(payload: dict, *, session: str, date: str, project: str) -> 
     return sighting
 
 
-def _reject_deletion_directive(record: dict) -> None:
-    """Raise NeverDeleteError if `record` is deletion-shaped: a top-level
+def _deletion_directive(record: object) -> str | None:
+    """Why `record` is deletion-shaped, or None when it is not: a top-level
     delete/remove/retract/drop key, or a match/correction carrying a
-    delete/remove action. Called before _apply_coding_record touches anything."""
+    delete/remove action."""
     if not isinstance(record, dict):
-        return
+        return None
     for key in _REMOVAL_KEYS:
         if key in record:
-            raise NeverDeleteError(
-                f"coding record carries a removal directive: top-level {key!r} key"
-            )
+            return f"coding record carries a removal directive: top-level {key!r} key"
     for match in record.get("matches", []) or []:
         if isinstance(match, dict) and match.get("action") in _REMOVAL_ACTIONS:
-            raise NeverDeleteError(
-                f"coding record match carries a removal action: {match.get('action')!r}"
-            )
+            return f"coding record match carries a removal action: {match.get('action')!r}"
     for correction in record.get("corrections", []) or []:
         if isinstance(correction, dict) and correction.get("action") in _REMOVAL_ACTIONS:
-            raise NeverDeleteError(
+            return (
                 "coding record correction carries a removal action: "
                 f"{correction.get('action')!r}"
             )
+    return None
 
 
 def assert_no_deletion(before: dict, after: dict) -> None:
@@ -765,52 +760,58 @@ def apply_coding_records(
 ) -> MergeResult:
     """Merge a batch of §7.3 coding records into a copy of *codebook*.
 
-    Never mutates or aliases *codebook* and never raises NeverDeleteError: a
-    deletion-shaped record lands in `skipped_deletions` and one failing
-    `validate_coding_record` in `invalid_records`, each skipped whole while the
-    rest of the batch merges. Raises ValueError for a non-dict *codebook*.
+    Never mutates or aliases *codebook*. A deletion-shaped record lands in
+    `skipped_deletions` and one failing `validate_coding_record` in
+    `invalid_records`, each skipped whole, before it can touch the copy, while
+    the rest of the batch merges.
+
+    Raises ValueError for a non-dict *codebook*. Raises NeverDeleteError only
+    when `assert_no_deletion()`, the construction-independent safety net run
+    over the whole merge, finds a dropped entry or sighting: that is a merger
+    bug, never a property of a record.
     """
     if not isinstance(codebook, dict):
         raise ValueError(
             "apply_coding_records: expected a dict-shaped codebook, got "
             f"{type(codebook).__name__} (empty or malformed YAML file?)"
         )
-    merge = MergeResult(codebook=copy.deepcopy(codebook))
+    merged = copy.deepcopy(codebook)
+    counts, slugs = MergeCounts(), SlugTally()
+    merged_records: list[dict] = []
+    skipped_deletions: list[SkippedRecord] = []
+    invalid_records: list[SkippedRecord] = []
     for index, record in enumerate(records):
-        merge = _merge_next(merge, index, record, invariant_slugs)
-    return merge
-
-
-def _merge_next(
-    merge: MergeResult, index: int, record: dict, invariant_slugs: Collection[str]
-) -> MergeResult:
-    try:
-        _reject_deletion_directive(record)
+        directive = _deletion_directive(record)
+        if directive is not None:
+            skipped_deletions.append(SkippedRecord.of(index, record, directive))
+            continue
         errors = validate_coding_record(record)
         if errors:
-            skipped = SkippedRecord.of(index, record, "; ".join(errors))
-            return replace(merge, invalid_records=(*merge.invalid_records, skipped))
-        codebook, counts, slugs = _apply_coding_record(
-            merge.codebook, record, invariant_slugs=invariant_slugs
+            invalid_records.append(SkippedRecord.of(index, record, "; ".join(errors)))
+            continue
+        record_counts, record_slugs = _apply_coding_record(
+            merged, record, invariant_slugs=invariant_slugs
         )
-    except NeverDeleteError as exc:
-        skipped = SkippedRecord.of(index, record, str(exc))
-        return replace(merge, skipped_deletions=(*merge.skipped_deletions, skipped))
-    return replace(
-        merge,
-        codebook=codebook,
-        counts=merge.counts.plus(counts),
-        merged_records=(*merge.merged_records, record),
-        invariant_slugs=merge.invariant_slugs.plus(slugs),
+        counts, slugs = counts.plus(record_counts), slugs.plus(record_slugs)
+        merged_records.append(record)
+    assert_no_deletion(codebook, merged)
+    return MergeResult(
+        codebook=merged,
+        counts=counts,
+        merged_records=tuple(merged_records),
+        skipped_deletions=tuple(skipped_deletions),
+        invalid_records=tuple(invalid_records),
+        invariant_slugs=slugs,
     )
 
 
 def _apply_coding_record(
     codebook: dict, record: dict, *, invariant_slugs: Collection[str]
-) -> tuple[dict, MergeCounts, SlugTally]:
-    """Apply one §7.3 coding record to a copy of a v2 codebook. Sole-writer
-    merge. Precondition: *record* is valid and not deletion-shaped; the batch,
-    `apply_coding_records`, checks both first.
+) -> tuple[MergeCounts, SlugTally]:
+    """Apply one §7.3 coding record to a v2 codebook, in place. Sole-writer
+    merge. Preconditions: *codebook* is the batch's own copy, and *record* is
+    valid and not deletion-shaped; the batch, `apply_coding_records`, ensures
+    all three.
 
     Three ops: `matches` (append a sighting to an existing entry),
     `candidates` (file a novel cause for the census to adjudicate), and
@@ -818,8 +819,7 @@ def _apply_coding_record(
     the order corrections → matches → candidates (see the correction-handling
     paragraph for why corrections go first).
 
-    Operates on a deep copy — never mutates `codebook` in place. Returns the
-    merged copy, what each op did, and the record's `SlugTally`.
+    Returns what each op did and the record's `SlugTally`.
 
     The record is first screened by `screen_invariant_slugs()` against
     *invariant_slugs*, the observed project's declared vocabulary: an
@@ -896,20 +896,16 @@ def _apply_coding_record(
     rather than by manufacturing a byte-identical-title pending record —
     which is precisely how rejected `cand-20260722-28` reappeared as
     pending `cand-20260724-2` in the live registry.
-
-    Never-delete: `assert_no_deletion()` runs as a construction-independent
-    safety net just before returning; its NeverDeleteError makes the batch
-    skip the record.
     """
-    counts: Counter[str] = Counter()
+    matched = candidates_applied = candidate_disposition_conflicts = 0
+    corrections_applied = correction_skipped = skipped_unknown_entry = 0
     record, slugs = screen_invariant_slugs(record, invariant_slugs)
-    result = copy.deepcopy(codebook)
 
     session = record["session"]
     date = record["date"]
     project = record["project"]
 
-    entries_by_id = {e["id"]: e for e in result.get("entries", [])}
+    entries_by_id = {e["id"]: e for e in codebook.get("entries", [])}
 
     # Entries that ALREADY carried this session before this record was applied.
     # Everything below deduplicates on (session, entry), so this set is what
@@ -931,7 +927,7 @@ def _apply_coding_record(
         entry_id = correction.get("entry_id")
         entry = entries_by_id.get(entry_id)
         if entry is None:
-            counts["skipped_unknown_entry"] += 1
+            skipped_unknown_entry += 1
             continue
         sightings = entry.setdefault("sightings", [])
         if session in {s.get("session") for s in sightings}:
@@ -940,7 +936,7 @@ def _apply_coding_record(
                 # this record's one sighting slot, so this one's field writes
                 # cannot land. Silently dropping a framing withdrawal is the
                 # one outcome this op must never have.
-                counts["correction_skipped"] += 1
+                correction_skipped += 1
                 logger.warning(
                     "codebook: correction for entry %r dropped — session %r was "
                     "already recorded on that entry by an earlier op in the SAME "
@@ -958,21 +954,21 @@ def _apply_coding_record(
         sightings.append(
             _build_sighting(correction, session=session, date=date, project=project)
         )
-        counts["corrections_applied"] += 1
+        corrections_applied += 1
 
     for match in record.get("matches", []) or []:
         entry = entries_by_id.get(match.get("entry_id"))
         if entry is None:
-            counts["skipped_unknown_entry"] += 1
+            skipped_unknown_entry += 1
             continue
         sightings = entry.setdefault("sightings", [])
         existing_sessions = {s.get("session") for s in sightings}
         if session in existing_sessions:
             continue
         sightings.append(_build_sighting(match, session=session, date=date, project=project))
-        counts["matched"] += 1
+        matched += 1
 
-    candidates = result.setdefault("candidates", [])
+    candidates = codebook.setdefault("candidates", [])
     date_prefix = f"cand-{date.replace('-', '')}-"
 
     for candidate_payload in record.get("candidates", []) or []:
@@ -992,7 +988,7 @@ def _apply_coding_record(
         )
         if pending_match is not None:
             pending_match.setdefault("sightings", []).append(sighting)
-            counts["candidates_applied"] += 1
+            candidates_applied += 1
         elif same_title:
             # Every same-title candidate is already adjudicated (rejected/
             # promoted). Fabricating a fresh pending twin here would silently
@@ -1021,7 +1017,7 @@ def _apply_coding_record(
                 entry_sightings = promoted_entry.setdefault("sightings", [])
                 if session not in {s.get("session") for s in entry_sightings}:
                     entry_sightings.append(sighting)
-                    counts["matched"] += 1
+                    matched += 1
             else:
                 # Rejected, or promoted with a `promoted_to` that names no
                 # existing entry (hand-edited/pre-promote_candidate record).
@@ -1032,7 +1028,7 @@ def _apply_coding_record(
                 # added) is the deterministic tie-break when more than one
                 # adjudicated record shares a title.
                 same_title[-1].setdefault("sightings", []).append(sighting)
-                counts["candidate_disposition_conflicts"] += 1
+                candidate_disposition_conflicts += 1
         else:
             n = 1 + sum(
                 1 for c in candidates if str(c.get("id", "")).startswith(date_prefix)
@@ -1048,10 +1044,16 @@ def _apply_coding_record(
                     "sightings": [sighting],
                 }
             )
-            counts["candidates_applied"] += 1
+            candidates_applied += 1
 
-    assert_no_deletion(codebook, result)
-    return result, MergeCounts(**counts), slugs
+    return MergeCounts(
+        matched=matched,
+        candidates_applied=candidates_applied,
+        candidate_disposition_conflicts=candidate_disposition_conflicts,
+        corrections_applied=corrections_applied,
+        correction_skipped=correction_skipped,
+        skipped_unknown_entry=skipped_unknown_entry,
+    ), slugs
 
 
 def validate_coding_record(record: dict) -> list[str]:
