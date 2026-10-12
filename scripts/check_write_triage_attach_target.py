@@ -108,9 +108,9 @@ _FILLERS: tuple[Any, ...] = (None, (), '')
 _NONCE_IDS = ('probe-nonce-alpha-9f13', 'probe-nonce-beta-4c07')
 
 #: Emitted INSTEAD of a bare WARN when a pass rests on a parameter's NAME.
-#: A warning alone mitigates nothing here and the comment above says why: on
-#: a PASS the gate exits 0, DeterministicRunner files no escalation, and the
-#: gate's stdout is forwarded nowhere, so no operator reads it. This is a
+#: A warning alone mitigates nothing here: on a PASS the gate exits 0,
+#: DeterministicRunner files no escalation, and the gate's stdout is
+#: forwarded nowhere, so no operator reads it. This is a
 #: distinct channel a machine can act on -- the gate greps for it (as
 #: PROBE_PENDING_MARKER) and reports item 1 as satisfied-pending-eyeball, in
 #: the report's TAIL where truncation cannot reach it. Pinned from both ends
