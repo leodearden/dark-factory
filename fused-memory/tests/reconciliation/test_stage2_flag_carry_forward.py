@@ -212,6 +212,21 @@ def _marker(marker_id: str, content: str, run_id: object, *, created_at: str = _
     )
 
 
+def _count_metadata_writes(memory_service) -> None:
+    """Answer ``count_memories_by_metadata`` from the metadata ``add_memory`` has written."""
+    written: list[dict] = []
+
+    async def add_memory(*_args, **kwargs):
+        written.append(dict(kwargs.get('metadata') or {}))
+        return {'memory_ids': []}
+
+    async def count_memories_by_metadata(*, filters, **_scope):
+        return sum(all(meta.get(k) == v for k, v in filters.items()) for meta in written)
+
+    memory_service.add_memory = AsyncMock(side_effect=add_memory)
+    memory_service.count_memories_by_metadata = AsyncMock(side_effect=count_memories_by_metadata)
+
+
 class TestStage2CarriesForwardMarkers:
     @pytest.fixture
     def memory_service(self, ledger_store):
@@ -225,7 +240,14 @@ class TestStage2CarriesForwardMarkers:
     async def _seed(self, ledger_store, run_id: str, outcome: StageAgentOutcome, *, minute: int):
         await _seed_row(ledger_store, run_id, outcome, minute=minute, project_id=_PROJECT)
 
-    async def _run(self, memory_service, markers: list) -> tuple[StageReport, str]:
+    async def _run(
+        self,
+        memory_service,
+        markers: list,
+        *,
+        run_id: str = 'run-now',
+        outcome: StageAgentOutcome = StageAgentOutcome.completed,
+    ) -> tuple[StageReport, str]:
         memory_service.search.return_value = markers
         taskmaster = AsyncMock()
         taskmaster.get_tasks.return_value = {'tasks': []}
@@ -240,7 +262,8 @@ class TestStage2CarriesForwardMarkers:
             scope=ProjectScope(ProjectId(_PROJECT), ProjectRoot('/tmp/test')),
         )
         cli = AsyncMock(return_value=StageResult(
-            success=True,
+            success=outcome is StageAgentOutcome.completed,
+            declared_outcome=outcome,
             report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
             llm_calls=1, tokens_used=0, cost_usd=0.0,
             model='test-model',
@@ -248,7 +271,7 @@ class TestStage2CarriesForwardMarkers:
         with patch('fused_memory.reconciliation.stages.base.run_stage_via_cli', new=cli):
             report = await stage.run(
                 events=[], watermark=Watermark(project_id=_PROJECT),
-                prior_reports=[], run_id='run-now',
+                prior_reports=[], run_id=run_id,
             )
         return report, cli.call_args.kwargs['payload']
 
@@ -336,3 +359,36 @@ class TestStage2CarriesForwardMarkers:
         assert 'IN-WINDOW-FLAG' in payload
         assert report.stats['rescued_in_window_markers'] == 1
         assert report.stats['stage2_markers_carried_forward'] == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('run_id', [None, ''], ids=['none', 'empty'])
+    async def test_a_marker_without_a_run_id_is_never_carried(
+        self, memory_service, ledger_store, run_id,
+    ):
+        await self._seed(ledger_store, 'run-dead', StageAgentOutcome.zero_output_timeout, minute=0)
+
+        report, payload = await self._run(memory_service, [
+            _marker('m-no-run', 'NO-RUN-ID-FLAG', run_id, created_at=_T0.isoformat()),
+        ])
+
+        assert 'NO-RUN-ID-FLAG' not in payload
+        assert report.stats['stale_missing_run_id_markers'] == 1
+        assert report.stats['stage2_markers_carried_forward'] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_marker_carried_through_dead_runs_escalates_on_its_third_rendering(
+        self, memory_service,
+    ):
+        _count_metadata_writes(memory_service)
+        marker = _marker('m-1', 'FLAG-relayed-by-run-1', 'run-1')
+        dead = StageAgentOutcome.zero_output_timeout
+
+        await self._run(memory_service, [marker], run_id='run-1', outcome=dead)
+        report_2, payload_2 = await self._run(memory_service, [marker], run_id='run-2', outcome=dead)
+        report_3, payload_3 = await self._run(memory_service, [marker], run_id='run-3')
+
+        assert report_2.stats['stage2_markers_carried_forward'] == 1
+        assert 'Stale Flags Requiring Escalation' not in payload_2
+        assert report_3.stats['stage2_markers_carried_forward'] == 1
+        assert "flag_id='m-1'" in payload_3
+        assert 'cycle_count=3' in payload_3

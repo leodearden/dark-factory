@@ -186,6 +186,10 @@ After deploy, the grace in those lines should read `grace=450.0s`.
 - **Flag carry-forward.** Closed by task 5984 (§6): Stage 2 renders markers from the
   trailing streak of runs whose Stage 2 agent did not complete
   (`summary_pool.py::trailing_incomplete_agent_run_ids`), counted in
-  `stats.stage2_markers_carried_forward`.
+  `stats.stage2_markers_carried_forward`. Two limits bound the carry. The marker GC
+  (`task_knowledge_sync.py::_sweep_stale_mem0_flag_for_stage2_markers`) still reaps a carried
+  marker once it is over 7 days old and its task is terminal, or over 30 days old if it cites no
+  task. And a run leaves the streak when its 30-day `cycle_summary` row expires. Past either
+  limit, the flag is lost as it was before.
 - **The shared watchdog.** Task 3326 owns its semantics: a load-aware two-regime grace, and
   truthful kill attribution. `shared/src/shared/cli_invoke.py`'s 120s default is unchanged here.
