@@ -87,7 +87,6 @@ def _wording() -> types.ModuleType:
 # The runner
 # ---------------------------------------------------------------------------
 
-
 def _fake_judge(answer: str = OUTCOME_RESTATED):
     """A judge_fn that always answers *answer*, recording every call.
 
@@ -666,7 +665,6 @@ class TestADotMdReportPathIsRejectedAtArgumentTime:
 # The committed artifact
 # ---------------------------------------------------------------------------
 
-
 class TestGuardCommittedReport:
     """A run that did not measure must not publish itself as the measurement.
 
@@ -881,7 +879,6 @@ class TestABareDryRunCannotReachTheCommittedArtifact:
 # ---------------------------------------------------------------------------
 # Option C: the per-case dump, the field-width override, the retrieved slate
 # ---------------------------------------------------------------------------
-
 
 class TestTheCasesDump:
     """Per-case evidence, written as it is bought."""
@@ -1526,7 +1523,6 @@ class TestApplyFieldChars:
 # ---------------------------------------------------------------------------
 # The split: one contract path, and imports that point downward only
 # ---------------------------------------------------------------------------
-
 
 class TestScoreAttachmentsKeepsItsContractPath:
     """PRD C2' and task 5807 call it at eval_write_triage_judge.py::score_attachments."""

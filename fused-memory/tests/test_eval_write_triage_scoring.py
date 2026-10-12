@@ -48,7 +48,6 @@ def _cases_mod() -> types.ModuleType:
 # score_cases
 # ---------------------------------------------------------------------------
 
-
 def _cases(*specs: tuple[str, str]) -> list[dict]:
     """Hand-built cases: ``(memory_id, expected_class)`` pairs.
 
@@ -245,7 +244,6 @@ class TestScoreCases:
 # ---------------------------------------------------------------------------
 # Report assembly and rendering
 # ---------------------------------------------------------------------------
-
 
 def _inserted_span(longer: str, shorter: str) -> str:
     """The one contiguous span *longer* inserts into *shorter*.
@@ -671,7 +669,6 @@ class TestRenderMarkdown:
 # ---------------------------------------------------------------------------
 # One case's answer, and where it attached
 # ---------------------------------------------------------------------------
-
 
 class TestAJudgeAnswerNamesOnlyAnAttach:
     """`JudgeAnswer.candidate_id` obeys the rule production's judge contract enforces."""

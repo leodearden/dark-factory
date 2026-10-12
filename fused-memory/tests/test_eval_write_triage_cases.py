@@ -66,7 +66,6 @@ def _by_class(cases: list[dict], expected_class: str) -> list[dict]:
 # _rotated
 # ---------------------------------------------------------------------------
 
-
 class TestRotated:
     """The draw itself, tested directly — which is how `--limit` got away.
 
@@ -137,7 +136,6 @@ class TestRotated:
 # ---------------------------------------------------------------------------
 # build_judge_cases
 # ---------------------------------------------------------------------------
-
 
 class TestBuildJudgeCases:
     """Ground truth derived from alpha's labels — never invented here.
