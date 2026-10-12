@@ -2,10 +2,11 @@
 runner (task eta, plans/confusion-reduction-prd.md §5.7, contract §7,
 decisions 4/5/6/9, boundary test §8.7).
 
-Import the target module as `import census as mod`, resolved via
-scripts/tests/conftest.py's sys.path insertion (both scripts/ and
-scripts/legibility/ are on sys.path; no package __init__ needed) — mirrors
-test_legibility_coder.py's import style.
+Import the target module and every legibility sibling in the package form,
+`from legibility import census as mod` (scripts/tests/conftest.py puts
+scripts/ on sys.path). census.py reaches its siblings the same way, so a
+class this file builds or catches is the very class census.py uses: a bare
+`import codebook` would load a second copy of the module.
 
 Every LLM / MCP / git side effect (invoke, verify_fn, synthesize_fn,
 submit_fn, escalate_fn, status_fetcher, commit, batch_source) is ALWAYS a
@@ -24,11 +25,6 @@ import subprocess
 from datetime import UTC, datetime, time, timedelta
 from typing import Any
 
-import census as mod
-import codebook
-import coder
-import digest as digest_mod
-import filing_policy
 import pytest
 import yaml
 from legibility import (
@@ -38,6 +34,9 @@ from legibility import (
     census_trigger,
     census_window,
     check_census_report,
+    codebook,
+    coder,
+    filing_policy,
     finding_area,
     invariants,
     session_ledger,
@@ -46,6 +45,9 @@ from legibility import (
     unlanded,
     verdict,
 )
+from legibility import census as mod
+from legibility import config as config_mod
+from legibility import digest as digest_mod
 from quality_doc_texts import code_quality
 from shared.cap_markers import (
     BLOCKING_BANNER_MARKERS,
@@ -53,8 +55,6 @@ from shared.cap_markers import (
     REAL_CLI_CAP_MESSAGES,
 )
 from shared.finding_key import finding_key
-
-import config as config_mod
 
 
 @pytest.fixture(autouse=True)
@@ -1008,9 +1008,10 @@ def test_ticket_id_from_submit_result_rejects_unusable_ticket_values():
 
 # ---------------------------------------------------------------------------
 # amend: _novel_clusters() dedup-by-title + titleless-candidate skip.
-# codebook.apply_coding_record groups new candidates BY TITLE (codebook.py:
-# 494), so verification must operate on the same set of resolvable titles --
-# a second cluster for an already-seen title can never resolve to a second
+# codebook.apply_coding_records groups new candidates BY TITLE
+# (codebook.py::_apply_coding_record), so verification must operate on the
+# same set of resolvable titles -- a second cluster for an already-seen title
+# can never resolve to a second
 # "pending" candidate id in _find_pending_candidate_id, wasting a Sonnet
 # verify call and diverging the matrix from the codebook
 # (reviewer_comprehensive finding #3).
@@ -1050,7 +1051,7 @@ def test_novel_clusters_deduplicates_candidates_sharing_a_title():
 
     assert len(clusters) == 1, (
         "a second candidate sharing an already-seen title must not spend a "
-        "second verify slot -- apply_coding_record would collapse it into "
+        "second verify slot -- apply_coding_records would collapse it into "
         "the same pending codebook candidate as the first"
     )
     assert clusters[0]["title"] == "Silent no-op subagent contract"
@@ -1066,7 +1067,7 @@ def test_novel_clusters_skips_titleless_candidates():
     clusters = mod._novel_clusters(records)
 
     assert clusters == [], (
-        "apply_coding_record requires a title to key its merge on -- a "
+        "apply_coding_records requires a title to key its merge on -- a "
         "titleless candidate must be skipped, mirroring that requirement"
     )
 
@@ -2752,13 +2753,13 @@ def _make_fake_synthesize_fn(text="Fable synthesis prose."):
 
 
 def _make_fake_commit():
-    """Fake best-effort git `commit(paths=, message=)` seam. Records every
-    call's kwargs in `.calls`."""
+    """Fake git `commit(paths=, message=) -> unlanded.CommitResult` seam that
+    always lands. Records every call's kwargs in `.calls`."""
     calls = []
 
     def fake_commit(**kwargs):
         calls.append(kwargs)
-        return None
+        return unlanded.CommitResult(ok=True, sha="f" * 40, stderr="", attempts=1)
 
     fake_commit.calls = calls
     return fake_commit
@@ -2992,17 +2993,18 @@ def test_run_census_rejects_a_report_path_outside_project_root_before_any_spend(
 # scripts/legibility/unlanded.py's module docstring states).
 # ---------------------------------------------------------------------------
 
-_REFUSAL = "git commit failed: cited-test-path gate: tests/moved_test.rs does not exist"
+_REFUSAL = "cited-test-path gate: tests/moved_test.rs does not exist"
 
 
 def _make_refused_commit():
-    """Fake `commit(paths=, message=)` seam that records its kwargs and then
-    raises exactly as census.py::_build_default_commit does on a refusal."""
+    """Fake `commit(paths=, message=)` seam that records its kwargs and refuses
+    as a hook-refused unlanded.commit_only does: it returns a not-ok
+    CommitResult after one attempt, and never raises."""
     calls = []
 
     def refused_commit(**kwargs):
         calls.append(kwargs)
-        raise RuntimeError(_REFUSAL)
+        return unlanded.CommitResult(ok=False, sha=None, stderr=_REFUSAL, attempts=1)
 
     refused_commit.calls = calls
     return refused_commit
@@ -3020,7 +3022,9 @@ def _make_fake_roll_back(rollback):
     return fake_roll_back
 
 
-def _unlanded_kwargs(tmp_path, **overrides):
+def _mined_run_kwargs(tmp_path, **overrides):
+    """A run that mines one duplicate and one novel cluster, verifies the
+    novel one and files a ticket for it; *overrides* supply its commit."""
     return _run_census_kwargs(
         tmp_path,
         invoke=_make_fake_invoke(_happy_invoke_response),
@@ -3032,9 +3036,12 @@ def _unlanded_kwargs(tmp_path, **overrides):
         synthesize_fn=_make_fake_synthesize_fn(),
         submit_fn=_make_fake_submit_fn(),
         escalate_fn=_make_fake_escalate_fn(),
-        commit=_make_refused_commit(),
         **overrides,
     )
+
+
+def _unlanded_kwargs(tmp_path, **overrides):
+    return _mined_run_kwargs(tmp_path, commit=_make_refused_commit(), **overrides)
 
 
 def test_run_census_unlanded_commit_rolls_back_every_written_path_and_escalates(tmp_path):
@@ -3056,6 +3063,7 @@ def test_run_census_unlanded_commit_rolls_back_every_written_path_and_escalates(
     call = kwargs["escalate_fn"].calls[0]
     detail = call["detail"]
     assert "cited-test-path gate" in detail
+    assert "after 1 attempt(s)" in detail
     assert str(rollback.quarantine_dir) in detail
     assert "tkt_1" in detail
     assert "census-state" in call["summary"] + detail
@@ -3093,7 +3101,10 @@ def _git(repo, *args):
     ).stdout
 
 
-def test_run_census_never_advances_census_state_when_the_commit_does_not_land(tmp_path):
+def _census_repo(tmp_path):
+    """A real git repo whose codebook and census-state (last census
+    2026-06-01) are committed, so a census run writes its report and record
+    as NEW files beside them. Returns the run_census path overrides."""
     repo = tmp_path / "repo"
     legibility_dir = repo / "docs" / "legibility"
     legibility_dir.mkdir(parents=True)
@@ -3114,15 +3125,24 @@ def test_run_census_never_advances_census_state_when_the_commit_does_not_land(tm
     )
     _git(repo, "add", ".")
     _git(repo, "commit", "-q", "-m", "initial")
-    report_path = repo / "plans" / "confusion-census-2026-07-14.md"
+    return repo, {
+        "codebook_path": codebook_path,
+        "census_state_path": census_state_path,
+        "report_path": repo / "plans" / "confusion-census-2026-07-14.md",
+    }
+
+
+def test_run_census_never_advances_census_state_when_the_commit_does_not_land(tmp_path):
+    repo, paths = _census_repo(tmp_path)
+    codebook_path = paths["codebook_path"]
+    census_state_path = paths["census_state_path"]
+    report_path = paths["report_path"]
     kwargs = _unlanded_kwargs(
         repo,
         roll_back=functools.partial(
             unlanded.roll_back, repo, project_id="dark_factory", label="census-2026-07-14",
         ),
-        codebook_path=codebook_path,
-        census_state_path=census_state_path,
-        report_path=report_path,
+        **paths,
     )
 
     outcome = mod.run_census(**kwargs)
@@ -3146,13 +3166,100 @@ def test_run_census_never_advances_census_state_when_the_commit_does_not_land(tm
     assert (quarantine_dir / "plans" / "confusion-census-2026-07-14.md").exists()
 
 
+def test_run_census_lands_through_a_transient_index_lock(tmp_path):
+    """Boundary row 4: an index.lock held across the census commit's first two
+    attempts delays the landing; it does not roll the run back. A census always
+    commits NEW report and record files, the shape whose scoped add must
+    outlast the lock too."""
+    repo, paths = _census_repo(tmp_path)
+    landings = []
+
+    def contended_commit(*, paths, message):
+        lock = repo / ".git" / "index.lock"
+        lock.touch()
+        backoffs = []
+
+        def release_on_second_backoff(seconds):
+            backoffs.append(seconds)
+            if len(backoffs) == 2:
+                lock.unlink()
+
+        landing = unlanded.commit_only(repo, paths, message, sleep=release_on_second_backoff)
+        landings.append(landing)
+        return landing
+
+    outcome = mod.run_census(**_mined_run_kwargs(
+        repo, commit=contended_commit, roll_back=_poison("roll_back"), **paths,
+    ))
+
+    assert outcome.status == "done"
+    assert [landing.attempts for landing in landings] == [3]
+    assert _git(repo, "status", "--porcelain") == b""
+    head_state = json.loads(_git(repo, "show", "HEAD:docs/legibility/census-state.json"))
+    assert head_state["last_census_at"] == "2026-07-14"
+    assert _git(repo, "ls-files", "--", "plans/confusion-census-2026-07-14.md") != b""
+
+
+# ---------------------------------------------------------------------------
+# task 6742 boundary row 3: a deletion-shaped mining record is skipped and
+# named; the census still persists and lands the rest of its run.
+# ---------------------------------------------------------------------------
+
+def _match_or_delete_entry_a(prompt, model):
+    """Mining reply: the "please-delete" digest asks to delete entry-a, every
+    other prompt (the headroom probe included) plainly matches it."""
+    match = {"entry_id": "entry-a", "origin_phase": "implement", "manifested_phase": "merge"}
+    if "please-delete" in prompt:
+        match["action"] = "delete"
+    return json.dumps({"matches": [match], "candidates": []})
+
+
+def test_run_census_skips_a_deletion_shaped_mining_record_and_lands_the_rest(
+    tmp_path, caplog,
+):
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_match_or_delete_entry_a),
+        batch_source=[[
+            _hand_digest("sess-delete", "please-delete entry-a"),
+            _hand_digest("sess-match", "the same confusion again"),
+        ]],
+        verify_fn=_make_fake_verify_fn(),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        commit=_make_fake_commit(),
+    )
+
+    with caplog.at_level(logging.INFO):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    [skipped] = outcome.skipped_deletions
+    assert skipped.session == "sess-delete"
+    assert "removal action" in skipped.reason
+    assert kwargs["report_path"].exists()
+    state = json.loads(kwargs["census_state_path"].read_text(encoding="utf-8"))
+    assert state["last_census_at"] == "2026-07-14"
+    [entry] = codebook.load(kwargs["codebook_path"])["entries"]
+    assert [s["session"] for s in entry["sightings"]] == ["sess-match"]
+    assert len(kwargs["commit"].calls) == 1
+    naming = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "sess-delete" in r.getMessage()
+    ]
+    assert len(naming) == 1, [r.getMessage() for r in naming]
+    assert any(
+        "merge: " in r.getMessage() and "deletion_directive=1" in r.getMessage()
+        for r in caplog.records if r.levelno == logging.INFO
+    )
+
+
 # ---------------------------------------------------------------------------
 # task 5279 W2: a REJECT verdict that resolves to no pending candidate must
 # name itself.
 #
 # Post-4144 `_find_pending_candidate_id` returning None is a NORMAL outcome:
 # when a re-mined title's only same-title candidate is already adjudicated,
-# `codebook.apply_coding_record` deliberately declines to fabricate a pending
+# `codebook.apply_coding_records` deliberately declines to fabricate a pending
 # twin (codebook.py:429-455 -- fabricating one is how rejected
 # cand-20260722-28 came back as pending cand-20260724-2 in the live codebook).
 # The prior verdict standing is CORRECT. The defect is the silence: the
@@ -3882,6 +3989,34 @@ def test_main_done_line_names_unresolved_verdicts_only_when_non_zero(
     # Byte-identical to the line minus the clause -- not merely "the substring
     # is absent", which a reworded line would also satisfy.
     assert quiet == noisy.replace(" unresolved_verdicts=3", "")
+
+
+def test_main_done_line_names_skipped_deletions_only_when_there_were_some(
+    tmp_path, monkeypatch, capsys,
+):
+    _census_project(tmp_path)
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+    skipped = codebook.SkippedRecord(
+        index=1, session="sess-delete",
+        reason="coding record match carries a removal action: 'delete'",
+    )
+
+    def _run_main(skipped_deletions):
+        monkeypatch.setattr(mod, "run_census", _make_fake_main_run_census(
+            outcome=mod.CensusOutcome(
+                status="done", report_path="plans/confusion-census-2026-01-02.md",
+                filed_ticket_ids=["tkt_1234"], stop_reason="exhausted",
+                skipped_deletions=skipped_deletions,
+            ),
+        ))
+        assert mod.main(["--project-root", str(tmp_path), "--force"]) == 0
+        return capsys.readouterr().out
+
+    noisy = _run_main((skipped,))
+    assert "skipped_deletions=1" in noisy
+
+    quiet = _run_main(())
+    assert quiet == noisy.replace(" skipped_deletions=1", "")
 
 
 # ---------------------------------------------------------------------------
@@ -7946,7 +8081,7 @@ def test_run_census_report_stays_silent_when_a_cluster_verifies(tmp_path):
 # — dropping a verify verdict the census PAID FOR with no log and no counter.
 # Post-4144 that None is a NORMAL outcome, not a defensive impossibility: for
 # a re-mined title whose only same-title candidate is already adjudicated,
-# `apply_coding_record` correctly declines to fabricate a pending twin (that
+# `apply_coding_records` correctly declines to fabricate a pending twin (that
 # fabrication is how rejected cand-20260722-28 came back as pending
 # cand-20260724-2 in the live codebook). The standing prior verdict is the
 # right outcome; the SILENCE is the defect.
@@ -8050,7 +8185,7 @@ def test_run_census_clean_run_emits_no_unresolved_verdict_warning(tmp_path, capl
 # nothing states either tally once at the end of the run, where an operator
 # reading a journal sees the whole picture rather than one line per cluster.
 # The same already-rejected-same-title fixture drives BOTH signals: it is
-# exactly the case apply_coding_record counts as a disposition conflict.
+# exactly the case apply_coding_records counts as a disposition conflict.
 # ---------------------------------------------------------------------------
 
 def test_run_census_run_summary_names_unresolved_verdicts_and_disposition_conflicts(

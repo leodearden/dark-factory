@@ -1,18 +1,21 @@
-"""Tests for scripts/legibility/unlanded.py — putting back a legibility write
-whose commit did not land.
+"""Tests for scripts/legibility/unlanded.py — landing a legibility write with
+one bounded scoped commit, and putting it back when that commit does not land.
 
-Every test runs against a REAL tmp git repo, because the behaviour under test
-is what git does to the index and the worktree. The conftest autouse fixture
-``_isolate_legibility_trickle_state`` already points the legibility state
-root, and therefore the quarantine, at a per-test tmp dir.
+Most tests run against a REAL tmp git repo, because the behaviour under test
+is what git does to the index and the worktree; the retry-count tests drive
+``commit_only`` through its ``runner`` seam instead. The conftest autouse
+fixture ``_isolate_legibility_trickle_state`` already points the legibility
+state root, and therefore the quarantine, at a per-test tmp dir.
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 import subprocess
 import time
 from pathlib import Path
 
+import pytest
 from legibility import trickle_state, unlanded
 
 _CODEBOOK = 'docs/legibility/confusion-codebook.yaml'
@@ -214,3 +217,238 @@ def test_describe_names_the_quarantine_and_the_restored_paths(tmp_path):
     assert str(rb.quarantine_dir) in description
     assert _CODEBOOK in description
     assert _CENSUS_STATE in description
+
+
+# ---------------------------------------------------------------------------
+# commit_only — the one scoped committer the trickle and the census land with
+# ---------------------------------------------------------------------------
+
+_REPORT = 'plans/confusion-census-2026-07-14.md'
+
+
+def _no_sleep(seconds: float) -> None:
+    pass
+
+
+def _lock_released_on_second_backoff(repo: Path):
+    """Hold *repo*'s index.lock now, and return the ``sleep`` seam that
+    releases it on its 2nd call: attempts 1 and 2 meet the lock, attempt 3
+    does not."""
+    lock = repo / '.git' / 'index.lock'
+    lock.touch()
+    backoffs: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        backoffs.append(seconds)
+        if len(backoffs) == 2:
+            lock.unlink()
+
+    return lock, sleep
+
+
+def _committed_paths(repo: Path) -> set[str]:
+    return set(_git(repo, 'show', '--name-only', '--format=', 'HEAD').split())
+
+
+def _completed(args, returncode: int, *, stdout: str = '', stderr: str = ''):
+    return subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr=stderr)
+
+
+def test_commit_only_commits_only_the_named_path(tmp_path):
+    repo = _repo(tmp_path)
+    (repo / _CODEBOOK).write_bytes(b'version: 2\nentries: []\ncandidates: []\n')
+    (repo / 'scratch.txt').write_text('unrelated wip\n')
+
+    result = unlanded.commit_only(repo, [_CODEBOOK], 'legibility: nightly sightings')
+
+    assert result.ok is True
+    assert result.sha == _git(repo, 'rev-parse', 'HEAD').strip()
+    assert result.attempts == 1
+    assert _committed_paths(repo) == {_CODEBOOK}
+    assert _porcelain(repo, 'scratch.txt') == '?? scratch.txt\n'
+
+
+def test_commit_only_reports_a_no_op_without_retrying(tmp_path):
+    repo = _repo(tmp_path)
+    head = _git(repo, 'rev-parse', 'HEAD')
+
+    result = unlanded.commit_only(repo, [_CODEBOOK], 'legibility: no-op', sleep=_no_sleep)
+
+    assert result.ok is False
+    assert result.sha is None
+    assert result.attempts == 1
+    assert 'nothing' in result.stderr
+    assert _git(repo, 'rev-parse', 'HEAD') == head
+
+
+def test_commit_only_retries_a_ref_lock_then_lands(tmp_path):
+    commits = []
+
+    def runner(args, **kwargs):
+        if 'commit' in args:
+            commits.append(args)
+            if len(commits) < 3:
+                return _completed(args, 1, stderr='fatal: cannot lock ref ...')
+            return _completed(args, 0)
+        if 'rev-parse' in args:
+            return _completed(args, 0, stdout='deadbeef\n')
+        raise AssertionError(f'unexpected git invocation: {args}')
+
+    result = unlanded.commit_only(tmp_path, [_CODEBOOK], 'msg', runner=runner, sleep=_no_sleep)
+
+    assert (result.ok, result.sha, result.attempts) == (True, 'deadbeef', 3)
+    assert len(commits) == 3
+
+
+def test_commit_only_gives_up_on_a_persistent_lock_after_its_bound(tmp_path):
+    """INV-4 storm escape: a lock that never clears costs a bounded number of
+    attempts, with one backoff between each pair."""
+    backoffs: list[float] = []
+
+    def runner(args, **kwargs):
+        if 'commit' in args:
+            return _completed(args, 128, stderr="fatal: Unable to create '.git/index.lock'")
+        raise AssertionError(f'unexpected git invocation: {args}')
+
+    result = unlanded.commit_only(
+        tmp_path, [_CODEBOOK], 'msg', runner=runner, sleep=backoffs.append,
+    )
+
+    assert result.ok is False
+    assert result.attempts == unlanded.COMMIT_ATTEMPTS == 5
+    assert backoffs == [unlanded.COMMIT_BACKOFF_SECONDS] * (unlanded.COMMIT_ATTEMPTS - 1)
+    assert 'index.lock' in result.stderr
+
+
+def test_commit_only_never_stashes(tmp_path):
+    repo = _repo(tmp_path)
+    (repo / _CODEBOOK).write_bytes(_REFUSED)
+    (repo / 'plans').mkdir()
+    (repo / _REPORT).write_text('# report\n')
+    calls = []
+
+    def spy(args, **kwargs):
+        calls.append(args)
+        return subprocess.run(args, **kwargs)
+
+    result = unlanded.commit_only(repo, [_CODEBOOK, _REPORT], 'msg', runner=spy)
+
+    assert result.ok is True
+    assert calls
+    assert not any('stash' in call for call in calls)
+
+
+def test_commit_only_outlasts_an_index_lock_on_a_tracked_path(tmp_path):
+    repo = _repo(tmp_path)
+    (repo / _CODEBOOK).write_bytes(_REFUSED)
+    lock, sleep = _lock_released_on_second_backoff(repo)
+
+    result = unlanded.commit_only(repo, [_CODEBOOK], 'legibility trickle', sleep=sleep)
+
+    assert (result.ok, result.attempts) == (True, 3)
+    assert not lock.exists()
+    assert _head_bytes(repo, _CODEBOOK) == _REFUSED
+    assert _porcelain(repo) == ''
+
+
+def test_commit_only_outlasts_an_index_lock_on_a_new_path(tmp_path):
+    """The census shape: every census commits a NEW dated report beside a
+    tracked file. Under the lock, git rejects the unknown pathspec before it
+    reaches the lock, and the scoped add that makes the path known fails on the
+    lock; both must be retried, not taken as final."""
+    repo = _repo(tmp_path)
+    (repo / _CENSUS_STATE).write_bytes(b'{"last_census_at": "2026-07-14"}\n')
+    (repo / 'plans').mkdir()
+    (repo / _REPORT).write_text('# report\n')
+    lock, sleep = _lock_released_on_second_backoff(repo)
+
+    result = unlanded.commit_only(
+        repo, [_CENSUS_STATE, _REPORT], 'legibility census 2026-07-14', sleep=sleep,
+    )
+
+    assert (result.ok, result.attempts) == (True, 3)
+    assert not lock.exists()
+    assert _committed_paths(repo) == {_CENSUS_STATE, _REPORT}
+    assert _porcelain(repo) == ''
+
+
+def test_commit_only_lands_a_new_path_within_one_attempt(tmp_path):
+    repo = _repo(tmp_path)
+    (repo / 'plans').mkdir()
+    (repo / _REPORT).write_text('# report\n')
+
+    result = unlanded.commit_only(repo, [_REPORT], 'msg', sleep=_no_sleep)
+
+    assert (result.ok, result.attempts) == (True, 1)
+    assert _committed_paths(repo) == {_REPORT}
+
+
+def test_commit_only_reports_git_that_cannot_be_launched(tmp_path):
+    def runner(args, **kwargs):
+        raise FileNotFoundError(2, 'No such file or directory', 'git')
+
+    result = unlanded.commit_only(tmp_path, [_CODEBOOK], 'msg', runner=runner, sleep=_no_sleep)
+
+    assert (result.ok, result.sha, result.attempts) == (False, None, 1)
+    assert 'No such file or directory' in result.stderr
+
+
+def test_commit_only_reports_a_refusing_pre_commit_hook_without_retrying(tmp_path):
+    repo = _repo(tmp_path)
+    _install_pre_commit_hook(tmp_path, repo, 'echo "cited-test-path gate: refused"\nexit 1')
+    (repo / _CODEBOOK).write_bytes(_REFUSED)
+    head = _git(repo, 'rev-parse', 'HEAD')
+
+    result = unlanded.commit_only(repo, [_CODEBOOK], 'msg', sleep=_no_sleep)
+
+    assert (result.ok, result.attempts) == (False, 1)
+    assert 'cited-test-path gate' in result.stderr
+    assert _git(repo, 'rev-parse', 'HEAD') == head
+
+
+def _install_pre_commit_hook(tmp_path: Path, repo: Path, script: str) -> None:
+    hooks = tmp_path / 'hooks'
+    hooks.mkdir()
+    hook = hooks / 'pre-commit'
+    hook.write_text(f'#!/bin/sh\n{script}\n')
+    hook.chmod(0o755)
+    _git(repo, 'config', 'core.hooksPath', str(hooks))
+
+
+def test_commit_only_reports_both_streams_of_a_failed_commit(tmp_path):
+    """git routes hook output to stderr and its own no-op verdict to stdout; the
+    diagnostic an operator is escalated must carry both."""
+    repo = _repo(tmp_path)
+    _install_pre_commit_hook(tmp_path, repo, 'echo "pyright: 3 warnings" >&2\nexit 0')
+
+    result = unlanded.commit_only(repo, [_CODEBOOK], 'legibility: no-op', sleep=_no_sleep)
+
+    assert (result.ok, result.attempts) == (False, 1)
+    assert 'pyright: 3 warnings' in result.stderr
+    assert 'nothing to commit' in result.stderr
+
+
+def test_commit_only_does_not_retry_a_hook_refusal_that_mentions_creating(tmp_path):
+    """Only git's own lock failure is contention. A hook refusal is final even
+    when its text happens to say "unable to create": every retry re-runs the
+    whole hook."""
+    repo = _repo(tmp_path)
+    _install_pre_commit_hook(
+        tmp_path, repo, 'echo "error: unable to create the coverage report"\nexit 1',
+    )
+    (repo / _CODEBOOK).write_bytes(_REFUSED)
+    backoffs: list[float] = []
+
+    result = unlanded.commit_only(repo, [_CODEBOOK], 'msg', sleep=backoffs.append)
+
+    assert (result.ok, result.attempts) == (False, 1)
+    assert backoffs == []
+    assert 'unable to create the coverage report' in result.stderr
+
+
+@pytest.mark.parametrize('field', ['ok', 'sha', 'stderr', 'attempts'])
+def test_a_commit_result_is_frozen(field):
+    result = unlanded.CommitResult(ok=True, sha='f' * 40, stderr='', attempts=1)
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        setattr(result, field, None)

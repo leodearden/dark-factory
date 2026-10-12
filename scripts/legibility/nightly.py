@@ -26,7 +26,6 @@ import logging
 import os
 import subprocess
 import sys
-import time
 import traceback
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -308,23 +307,9 @@ def build_digests(
 
 
 # ---------------------------------------------------------------------------
-# git helpers — docs-only commit of the codebook, ref-lock retry, never stash
+# git status — did tonight's dump change the codebook? (The commit itself is
+# unlanded.commit_only.)
 # ---------------------------------------------------------------------------
-
-_LOCK_ERROR_PATTERNS: tuple[str, ...] = (
-    'cannot lock ref',
-    'index.lock',
-    'another git process',
-    'unable to create',
-)
-"""Case-insensitive stderr substrings identifying a transient git ref/index
-lock contention (the merge worker/hooks racing for the lock in the shared
-main checkout) -- worth retrying. Any other failure (e.g. "nothing to
-commit") is NOT retried."""
-
-_DEFAULT_COMMIT_RETRIES = 5
-_DEFAULT_COMMIT_BACKOFF_SECS = 0.2
-
 
 def _git_status_changed(repo: Path | str, relpath: Path | str, *, runner=None) -> bool:
     """True iff ``git status --porcelain -- relpath`` reports a change.
@@ -339,93 +324,6 @@ def _git_status_changed(repo: Path | str, relpath: Path | str, *, runner=None) -
         capture_output=True, text=True,
     )
     return bool((result.stdout or '').strip())
-
-
-@dataclass
-class GitCommitResult:
-    """Outcome of :func:`_git_commit_docs_only`.
-
-    ``ok=False`` (never a raised exception) on any failure -- including
-    exhausted ref-lock retries or a genuine no-op (nothing to commit) --
-    so the caller (:func:`run_nightly`) can escalate rather than crash.
-    """
-
-    ok: bool
-    sha: str | None = None
-    stderr: str = ''
-    attempts: int = 0
-
-
-def _git_commit_docs_only(
-    repo: Path | str,
-    paths: Sequence[Path | str],
-    message: str,
-    *,
-    runner=None,
-    retries: int = _DEFAULT_COMMIT_RETRIES,
-    backoff: float = _DEFAULT_COMMIT_BACKOFF_SECS,
-) -> GitCommitResult:
-    """Commit ONLY *paths* (``git commit --only <paths> -m message``) in
-    *repo* -- never any other dirty/staged path, and NEVER ``git stash``
-    (CLAUDE.md's machine-operated-main-checkout rules).
-
-    Retries up to *retries* attempts when the commit's stderr matches a
-    known transient ref/index-lock pattern (:data:`_LOCK_ERROR_PATTERNS`);
-    any other failure (e.g. a genuine no-op, "nothing to commit") fails
-    immediately without retrying. On success, resolves the new commit sha
-    via a follow-up ``git rev-parse HEAD`` (through the same *runner*).
-    Returns ``ok=False`` (never raises) after the final failed attempt.
-
-    A path git has never seen before (e.g. a freshly onboarded project's
-    first-ever ``codebook.dump()``) makes ``--only`` fail outright with
-    "pathspec ... did not match any file(s) known to git" -- git refuses
-    to commit an unknown path this way even though it exists on disk. On
-    that specific error (and only that one, and only once), this runs a
-    scoped ``git add -- <paths>`` and retries the commit -- ``--only``
-    still disregards any OTHER staged path per its own semantics, so this
-    can't smuggle in unrelated changes; it only makes *paths* itself
-    eligible to be named.
-    """
-    run = runner if runner is not None else subprocess.run
-    str_paths = [str(p) for p in paths]
-
-    stderr = ''
-    added = False
-    for attempt in range(1, retries + 1):
-        result = run(
-            ['git', '-C', str(repo), 'commit', '--only', *str_paths, '-m', message],
-            capture_output=True, text=True,
-        )
-        if result.returncode == 0:
-            sha_result = run(
-                ['git', '-C', str(repo), 'rev-parse', 'HEAD'],
-                capture_output=True, text=True,
-            )
-            sha = (sha_result.stdout or '').strip() or None
-            return GitCommitResult(ok=True, sha=sha, stderr='', attempts=attempt)
-
-        stderr = result.stderr or ''
-
-        if not added and 'did not match any file' in stderr.lower():
-            added = True
-            run(
-                ['git', '-C', str(repo), 'add', '--', *str_paths],
-                capture_output=True, text=True,
-            )
-            if attempt < retries:
-                continue
-            return GitCommitResult(ok=False, sha=None, stderr=stderr, attempts=attempt)
-
-        is_lock_error = any(
-            pattern in stderr.lower() for pattern in _LOCK_ERROR_PATTERNS
-        )
-        if is_lock_error and attempt < retries:
-            if backoff:
-                time.sleep(backoff)
-            continue
-        return GitCommitResult(ok=False, sha=None, stderr=stderr, attempts=attempt)
-
-    return GitCommitResult(ok=False, sha=None, stderr=stderr, attempts=retries)
 
 
 # ---------------------------------------------------------------------------
@@ -806,11 +704,9 @@ class NightlyResult:
     ``exit_code`` is the authoritative pass/fail signal for the systemd
     ExecStart / CLI caller: 0 on success (including a genuine no-change
     night), non-zero on a fail-loud trigger (PRD decision 8, layered on by
-    later steps). ``applied`` is the total number of codebook mutations
-    (matched sightings + applied candidates + recurrence sightings appended
-    to an already-adjudicated candidate) across every coding record
-    this run merged -- 0 on a dedup-only or empty-coding night, which is
-    exactly what gates the dump/commit below, giving a re-run its
+    later steps). ``applied`` is the night's codebook mutation count,
+    ``codebook.MergeCounts.mutations`` -- 0 on a dedup-only or empty-coding
+    night, which is exactly what gates the dump/commit, giving a re-run its
     idempotency for free (PRD §6.7/§8.8).
     """
 
@@ -954,20 +850,20 @@ def _ledger_coded_sessions(
     return _LedgerWrite(written=written, failed=0, error=None)
 
 
-def _report_invariant_slugs(
+def _report_merge(
     cfg: LegibilityConfig,
     target_date: date,
-    tally: codebook.SlugTally,
+    merge: codebook.MergeResult,
     invariant_slugs: Sequence[str],
 ) -> None:
-    """Journal what the merger kept and dropped of the night's
-    ``invariant_violated`` values, and warn once naming the dropped ones."""
+    """Journal the night's one merge line, and warn once naming the
+    ``invariant_violated`` values the merger dropped."""
     logger.info(
-        'legibility trickle: project=%s date=%s invariant slugs: %d valid, %d rejected',
-        cfg.project_id, target_date.isoformat(), tally.valid, len(tally.rejected),
+        'legibility trickle: project=%s date=%s merge: %s',
+        cfg.project_id, target_date.isoformat(), merge.summary(),
     )
     codebook.warn_unknown_invariant_slugs(
-        tally, invariant_slugs, run=_trickle_run_ref(cfg, target_date),
+        merge.invariant_slugs, invariant_slugs, run=_trickle_run_ref(cfg, target_date),
     )
 
 
@@ -1461,14 +1357,14 @@ def _run_configured_nightly(
     try:
         if projects_root is None:
             projects_root = DEFAULT_PROJECTS_ROOT
-        commit_fn = committer if committer is not None else _git_commit_docs_only
+        commit_fn = committer if committer is not None else unlanded.commit_only
         # Task 4148. The systemd path is `nightly.py run --project-id %i` ->
         # main() -> run_nightly, and main() never built a fetcher -- so
         # `status_fetcher=None` reached `compute_tasks_landed` on every real run
         # and hit its `status_fetcher is None` arm (census_trigger.py:735-739;
         # journal 2026-08-10/11/12), leaving condition (b) tasks-landed unable to
         # fire at all. Every OTHER seam here already resolves None to its real
-        # implementation (committer -> _git_commit_docs_only above, recorder ->
+        # implementation (committer -> unlanded.commit_only above, recorder ->
         # trickle_state.record_run, poster -> _default_poster); status_fetcher
         # alone resolved to nothing, and that asymmetry is how three prior repairs
         # of this same code (2953's 406 fix, 3291's baseline fix, 4085's fail-safe
@@ -1562,7 +1458,7 @@ def _run_configured_nightly(
             # letting a bare FileNotFoundError escape -- this module's
             # contract is a clean fail-loud escalation or a graceful default,
             # never an uncaught traceback. codebook.dump() below (and
-            # _git_commit_docs_only's own never-tracked-path handling) takes
+            # unlanded.commit_only's own never-tracked-path handling) takes
             # it from there once/if this run's coding actually applies
             # something.
             logger.info(
@@ -1628,62 +1524,10 @@ def _run_configured_nightly(
             )
             return result
 
-        applied = 0
-        conflicts = 0
-        slug_tally = codebook.SlugTally()
-        deletion_skipped: list[str] = []
-        merged_records = []
-        for record in run.records:
-            try:
-                cb, stats = codebook.apply_coding_record(
-                    cb, record, invariant_slugs=invariant_slugs,
-                )
-            except codebook.NeverDeleteError as exc:
-                # One deletion-shaped coder record must not cost the whole
-                # night's merge: apply_coding_record raises before it deep-
-                # copies, so `cb` is untouched, but this loop's dump/commit are
-                # BELOW it -- an escaping exception discarded every
-                # already-merged record AND escaped run_nightly entirely
-                # (main() calls it bare, so it surfaced as an uncaught
-                # traceback with no escalation). Skip the record, collect it,
-                # keep the batch going. Non-fatal but loud: exit_code stays 0,
-                # the same shape census.py uses for its mass-rejection signal.
-                # The escalation itself is posted ONCE after the loop -- see
-                # below.
-                detail = f"session={record.get('session')}: {exc}"
-                logger.warning(
-                    'legibility trickle: coding record carries a deletion '
-                    'directive; record skipped (%s)', detail,
-                )
-                deletion_skipped.append(detail)
-                continue
-            merged_records.append(record)
-            conflicts += stats['candidate_disposition_conflicts']
-            slug_tally = slug_tally.plus(stats['invariant_slugs'])
-            # A conflict-appended sighting IS a codebook mutation (a
-            # recurrence appended to an already-adjudicated candidate), so it
-            # must count toward the dump/commit gate below -- otherwise a
-            # night whose ONLY effect is conflict sightings ends with
-            # applied == 0, `if applied > 0` skips dump(), and the merged `cb`
-            # is discarded as a "no-change night", destroying the exact signal
-            # the elif-branch exists to preserve. An applied correction is the
-            # same shape: it rewrites an entry's framing in place, and losing
-            # it to a "no-change night" is the failure the op exists to
-            # prevent.
-            applied += (
-                stats['matched']
-                + stats['candidates_applied']
-                + stats['candidate_disposition_conflicts']
-                + stats['corrections_applied']
-            )
-
-        _report_invariant_slugs(cfg, target_date, slug_tally, invariant_slugs)
-        if conflicts:
-            logger.info(
-                'legibility trickle: %d candidate sighting(s) appended to an '
-                'already-adjudicated record; disposition left to the census',
-                conflicts,
-            )
+        merge = codebook.apply_coding_records(cb, run.records, invariant_slugs=invariant_slugs)
+        cb = merge.codebook
+        applied = merge.counts.mutations
+        _report_merge(cfg, target_date, merge, invariant_slugs)
 
         # ONE escalation for the whole night, not one per record -- mirroring
         # the extractor-crash and coder-storm triggers above, which both
@@ -1696,9 +1540,9 @@ def _run_configured_nightly(
         # cannot be lost to an early return.
         deletion_escalated = False
         deletion_reason: str | None = None
-        if deletion_skipped:
+        if merge.skipped_deletions:
             deletion_reason = (
-                f'legibility trickle: {len(deletion_skipped)} coding record(s) '
+                f'legibility trickle: {len(merge.skipped_deletions)} coding record(s) '
                 f'carried a deletion directive; skipped'
             )
             # WARNING, not the ERROR default: this branch leaves
@@ -1706,8 +1550,9 @@ def _run_configured_nightly(
             # census.py uses for its mass-rejection signal), so it must not
             # land in `journalctl -p err`.
             deletion_escalated = post_escalation(
-                cfg, deletion_reason, '; '.join(deletion_skipped), poster=poster,
-                level=logging.WARNING,
+                cfg, deletion_reason,
+                '; '.join(skipped.describe() for skipped in merge.skipped_deletions),
+                poster=poster, level=logging.WARNING,
             )
 
         validation_errors = codebook.validate(cb)
@@ -1735,7 +1580,7 @@ def _run_configured_nightly(
             return result
 
         commit_made = False
-        if applied > 0:
+        if merge.mutated:
             codebook.dump(cb, codebook_path)
             if _git_status_changed(cfg.project_root, _CODEBOOK_RELPATH):
                 message = f'legibility: nightly trickle sightings for {target_date.isoformat()}'
@@ -1778,7 +1623,7 @@ def _run_configured_nightly(
 
         # Before the census step: it may launch the census synchronously, and
         # that census must skip what this night coded.
-        ledger = _ledger_coded_sessions(cfg, merged_records, target_date, now)
+        ledger = _ledger_coded_sessions(cfg, merge.merged_records, target_date, now)
         ledger_reason = (
             f'legibility trickle: {ledger.failed} coded session(s) not ledgered, '
             f'the next census re-mines them ({ledger.error})'

@@ -146,11 +146,12 @@ fi
 # `git stash` (refs/stash is ONE ref shared by every worktree and the merge
 # worker's advance path also consumes it -- incident 13674d3c68).
 #
-# Same seam and same fallback as scripts/legibility/census.py's
-# _build_default_commit, which already commits docs/legibility/census-state.json
-# from the 03:00 job, and scripts/legibility/nightly.py::_git_commit_docs_only:
-# a path git has never tracked makes `--only` fail with "did not match any
-# file", which is retried once after a scoped `git add -- <paths>`.
+# Same untracked-path fallback as scripts/legibility/unlanded.py::commit_only,
+# the one scoped committer both legibility jobs use (the 03:00 census commits
+# docs/legibility/census-state.json through it): a path git has never tracked
+# makes `--only` fail with "did not match any file", so the commit is retried
+# once after a scoped `git add -- <paths>`. Unlike commit_only, this wrapper
+# does not retry an index.lock contention.
 #
 # BEST-EFFORT, LIKE BOTH OTHER HALVES: the outcome is narrated and never
 # propagated (see the always-exit-0 oneshot rationale in the header), and it
