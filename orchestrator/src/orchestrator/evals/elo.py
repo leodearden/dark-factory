@@ -28,6 +28,9 @@ K_FACTOR = 32.0
 MAX_PER_PAIR = 3
 INDISTINGUISHABLE_THRESHOLD = 50.0
 
+PAIRWISE_RESULT: dict[str, float] = {'A': 1.0, 'B': 0.0, 'tie': 0.5}
+"""Each pairwise winner and the score it gives config A: the winner vocabulary."""
+
 
 @dataclass
 class TaskPool:
