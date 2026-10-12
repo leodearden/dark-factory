@@ -1080,9 +1080,9 @@ class TestUIConfigWriteDebounce:
             try:
                 # Stand in for a slow 10k-session scan still running. The
                 # flag is documented main-thread-only, and this file already
-                # drives _poll_registry/_apply_scan/_next_scan_seq directly,
-                # so setting it beats parking a real worker thread that a
-                # failed assertion could leave wedged.
+                # drives _poll_registry directly, so setting it beats parking
+                # a real worker thread that a failed assertion could leave
+                # wedged.
                 app._scan_in_flight = True
                 app._poll_registry()
                 await pilot.pause()
@@ -4196,12 +4196,12 @@ class TestNonBlockingPoll:
         # A large poll_interval keeps on_mount's own set_interval timer from
         # firing (and launching a second, uncontrolled worker) during this
         # test -- the only scan driven here is the explicit
-        # _scan_registry_worker() call below.
+        # _poll_registry() call below.
         app = CockpitApp(fleet_root=tmp_path, poll_interval=60, scanner=scanner)
         async with app.run_test() as pilot:
             await pilot.pause()  # on_mount's synchronous scan: call #1, non-blocking
 
-            app._scan_registry_worker(app._next_scan_seq())
+            app._poll_registry()
             while not scanner.started.is_set():
                 await asyncio.sleep(0.01)
 
@@ -4239,7 +4239,7 @@ class TestThreadedScanReachesUI:
 
         # A large poll_interval keeps on_mount's own set_interval timer from
         # firing a second, uncontrolled worker mid-test -- the only scan
-        # driven here is the explicit _scan_registry_worker() call below.
+        # driven here is the explicit _poll_registry() call below.
         app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
         async with app.run_test() as pilot:
             await pilot.pause()
@@ -4254,8 +4254,8 @@ class TestThreadedScanReachesUI:
             # so the "unchanged" assertion below isn't vacuously true.
             assert any(path.startswith('sessions/') for path in before)
 
-            worker = app._scan_registry_worker(app._next_scan_seq())
-            await worker.wait()
+            app._poll_registry()
+            await app.workers.wait_for_complete()
             await pilot.pause()
 
             # proves the off-thread -> call_from_thread(_apply_scan)
