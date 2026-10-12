@@ -1354,6 +1354,7 @@ def _run_single_eval(
     from orchestrator.evals.configs import EVAL_CONFIGS, get_config_by_name
     from orchestrator.evals.report import (
         build_plan_quality_report,
+        format_invocation_errors,
         format_plan_quality_table,
     )
     from orchestrator.evals.runner import (
@@ -1405,7 +1406,8 @@ def _run_single_eval(
                     # error must not read to the operator as a transient cap window.
                     # The marker that follows always names the actual cause.
                     taint = (
-                        f' unmeasurable: {result.metrics.get("invocation_error")}'
+                        ' unmeasurable: '
+                        f'{format_invocation_errors(result.metrics.get("invocation_errors"))}'
                         if result.metrics.get('cap_tainted') else ''
                     )
                     # `steps=` is echoed BESIDE the score (task 3302) because it is
