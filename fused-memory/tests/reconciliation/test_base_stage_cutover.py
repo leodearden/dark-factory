@@ -12,9 +12,9 @@ import pytest
 from shared.jcodemunch_launch import JCODEMUNCH_COMMAND, JCODEMUNCH_ENV
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import StageId, Watermark
+from fused_memory.models.reconciliation import StageAgentOutcome, StageId, Watermark
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
-from fused_memory.reconciliation.cli_stage_runner import STAGE_REPORT_SCHEMA
+from fused_memory.reconciliation.cli_stage_runner import STAGE_REPORT_SCHEMA, StageResult
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 from reconciliation.consolidator_fixtures import make_consolidator
@@ -294,6 +294,56 @@ class TestReconStateFallbackToEmpty:
 
         assert report.started_at is not None
         assert report.completed_at is not None
+
+
+class TestAgentOutcomeStamped:
+    """BaseStage.run stamps the stage agent's outcome onto its StageReport (task 5982)."""
+
+    @staticmethod
+    async def _run_with(stage_result: StageResult):
+        stage = _make_stage(recon_report_state=_FakeReconState(assembled_report=None))
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=stage_result),
+        ):
+            return await stage.run(
+                [], Watermark(project_id='test_project'), [], run_id='run-outcome',
+            )
+
+    @pytest.mark.asyncio
+    async def test_startup_wedge_kill_reaches_the_report(self):
+        report = await self._run_with(StageResult(
+            report={},
+            success=False,
+            declared_outcome=StageAgentOutcome.zero_output_timeout,
+            error='Agent produced no output',
+        ))
+
+        assert report.agent_outcome is StageAgentOutcome.zero_output_timeout
+        assert report.llm_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_successful_agent_reports_completed(self):
+        report = await self._run_with(StageResult(report={}, success=True))
+
+        assert report.agent_outcome is StageAgentOutcome.completed
+
+    @pytest.mark.asyncio
+    async def test_start_report_short_circuit_reports_not_launched(self):
+        class _BrokenState(_FakeReconState):
+            def start_report(self, run_id, stage, project_id):
+                raise RuntimeError('start_report exploded')
+
+        stage = _make_stage(recon_report_state=_BrokenState(assembled_report=None))
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=StageResult(report={}, success=True)),
+        ):
+            report = await stage.run(
+                [], Watermark(project_id='test_project'), [], run_id='run-not-launched',
+            )
+
+        assert report.agent_outcome is StageAgentOutcome.not_launched
 
 
 class TestHarnessForwardsReconState:

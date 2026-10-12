@@ -81,6 +81,7 @@ from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
     ReconciliationEvent,
+    StageAgentOutcome,
 )
 from fused_memory.models.scope import Scope
 from fused_memory.reconciliation.flag_record_contract import (
@@ -8655,6 +8656,14 @@ class MemoryService:
         may still emit findings; it only skips its own per-cycle summary
         write, by design (task 2652) — from a genuine Stage 1 write failure.
 
+        ``agent_outcome`` (task 5982) is the row's ``StageAgentOutcome`` value
+        as stamped by ``write_cycle_summary``, or ``None`` for an absent,
+        unwired, legacy or corrupt row. A present row whose outcome is not
+        ``'completed'`` records a stage agent that did not run to completion
+        (e.g. ``'zero_output_timeout'``: killed by the startup-wedge watchdog
+        before its first turn) — not a clean zero-work cycle. See
+        plans/recon-stage-startup-wedge-rca-2026-09-27.md.
+
         **Typed absence (task 3731).** ``present=False`` on its own conflates
         four unrelated situations, only ONE of which is a defect:
 
@@ -8739,6 +8748,7 @@ class MemoryService:
                 'run_id': run_id,
                 'stage': stage,
                 'remediation': None,
+                'agent_outcome': None,
                 'reason': 'ledger_unavailable',
                 'expected': None,
                 'run_lookup_available': journal is not None,
@@ -8760,6 +8770,7 @@ class MemoryService:
             run_id=run_id,
         )
         remediation: bool | None = None
+        agent_outcome: str | None = None
         if record is not None:
             # Guard ONLY this parse — not the get_by_identity read above — so
             # a malformed payload degrades to remediation=None rather than
@@ -8779,6 +8790,11 @@ class MemoryService:
             # be trusted as a suppression signal for Stage 3 (task 2652
             # amendment).
             remediation = raw_remediation if isinstance(raw_remediation, bool) else None
+            raw_outcome = payload.get('agent_outcome') if isinstance(payload, dict) else None
+            try:
+                agent_outcome = StageAgentOutcome(raw_outcome).value
+            except ValueError:
+                agent_outcome = None
 
         reason, expected, run_status = await self._classify_summary_absence(
             journal,
@@ -8795,6 +8811,7 @@ class MemoryService:
             'run_id': run_id,
             'stage': stage,
             'remediation': remediation,
+            'agent_outcome': agent_outcome,
             'reason': reason,
             'expected': expected,
             'run_lookup_available': journal is not None,

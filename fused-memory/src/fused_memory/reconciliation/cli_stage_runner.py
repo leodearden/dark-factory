@@ -6,13 +6,18 @@ import json
 import logging
 import shutil
 import time
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Any
 
-from shared.cli_invoke import AgentResult, AllAccountsCappedException, invoke_with_cap_retry
+from shared.cli_invoke import (
+    AgentResult,
+    AllAccountsCappedException,
+    invoke_with_cap_retry,
+    is_zero_output_timeout,
+)
 
-from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES
+from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES, StageAgentOutcome
 from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
 from fused_memory.reconciliation.sandbox_guard import (
     RemediationSandboxUnavailable,
@@ -500,9 +505,13 @@ STAGE3_REPORT_SCHEMA: dict[str, Any] = {
 }
 
 
-@dataclass
+@dataclass(frozen=True)
 class StageResult:
-    """Result from a single CLI stage invocation."""
+    """Result from a single CLI stage invocation.
+
+    ``outcome`` is ``declared_outcome`` when one is given, else derived from
+    ``success``; only a successful agent is ever ``completed``.
+    """
 
     report: dict = field(default_factory=dict)
     llm_calls: int = 0
@@ -512,6 +521,28 @@ class StageResult:
     model: str = ''
     success: bool = False
     error: str = ''
+    declared_outcome: InitVar[StageAgentOutcome | None] = None
+    outcome: StageAgentOutcome = field(init=False)
+
+    def __post_init__(self, declared_outcome: StageAgentOutcome | None) -> None:
+        derived = StageAgentOutcome.completed if self.success else StageAgentOutcome.failed
+        outcome = derived if declared_outcome is None else declared_outcome
+        if (outcome is StageAgentOutcome.completed) != self.success:
+            raise ValueError(
+                f'StageResult outcome={outcome.value!r} contradicts '
+                f'success={self.success}: only a successful agent is completed.'
+            )
+        object.__setattr__(self, 'outcome', outcome)
+
+
+def _classify_agent_outcome(agent_result: AgentResult) -> StageAgentOutcome:
+    if agent_result.success:
+        return StageAgentOutcome.completed
+    if is_zero_output_timeout(agent_result):
+        return StageAgentOutcome.zero_output_timeout
+    if agent_result.timed_out:
+        return StageAgentOutcome.timed_out
+    return StageAgentOutcome.failed
 
 
 def recon_config_base_dir(data_dir: Path) -> Path:
@@ -763,6 +794,7 @@ async def run_stage_via_cli(
                 error=str(exc),
                 duration_ms=duration_ms,
                 model=effective_model,
+                declared_outcome=StageAgentOutcome.not_launched,
             )
 
     try:
@@ -780,6 +812,7 @@ async def run_stage_via_cli(
             output_schema=output_schema,  # PRD γ: pass None straight through when caller opts out
             permission_mode='bypassPermissions',
             timeout_seconds=float(config.stage_timeout_seconds),
+            startup_grace_secs=config.stage_startup_grace_secs,
             cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
             sandbox_wrap=sandbox_wrap,
             session_id=session_id,
@@ -799,6 +832,7 @@ async def run_stage_via_cli(
             error=str(e),
             duration_ms=duration_ms,
             model=effective_model,
+            declared_outcome=StageAgentOutcome.failed,
         )
 
     duration_ms = int(time.monotonic() * 1000) - start_ms
@@ -815,6 +849,7 @@ async def run_stage_via_cli(
         model=effective_model,
         success=agent_result.success,
         error='' if agent_result.success else (agent_result.output or 'Agent failed'),
+        declared_outcome=_classify_agent_outcome(agent_result),
     )
 
 

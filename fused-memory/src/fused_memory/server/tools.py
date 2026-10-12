@@ -4590,12 +4590,16 @@ def create_mcp_server(
 
         Return shape: ``{'present': bool, 'ledger_available': bool,
         'project_id': str, 'run_id': str, 'stage': str, 'remediation':
-        bool | None, 'reason': str, 'expected': bool | None,
-        'run_lookup_available': bool, 'run_status': str | None}``. When the
-        ledger is not wired (``ledger_available: False``), ``present`` is
-        always ``False`` and MUST be treated as inconclusive, not a definitive
-        absence — mirrors ``write_cycle_summary`` returning ``False`` when
-        unwired.
+        bool | None, 'agent_outcome': str | None, 'reason': str, 'expected':
+        bool | None, 'run_lookup_available': bool, 'run_status': str | None}``.
+        When the ledger is not wired (``ledger_available: False``),
+        ``present`` is always ``False`` and MUST be treated as inconclusive,
+        not a definitive absence — mirrors ``write_cycle_summary`` returning
+        ``False`` when unwired.
+
+        A present row whose ``agent_outcome`` is not ``'completed'`` records a
+        stage agent that died or was never launched — not a healthy zero-work
+        cycle. ``agent_outcome: None`` means unrecorded.
 
         ``present: False`` alone does NOT mean a summary was lost — it
         conflates four unrelated situations, and ``reason`` names which one:
