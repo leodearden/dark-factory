@@ -497,9 +497,10 @@ class TestBareIdPresent:
     flag, which is the conservative direction for a report a human
     adjudicates by hand.
 
-    It exists because two of the shared scanner's documented blind spots —
-    '#4262' and 'task-1836' — would otherwise make an endpoint that IS named
-    in the fact look unnamed, which is a false positive.
+    It exists because the shared scanner's documented bare-hash blind spot,
+    '#4262', would otherwise make an endpoint that IS named in the fact look
+    unnamed, which is a false positive. Its other original target,
+    'task-1836', has been seen by the scanner since task 6059.
     """
 
     def test_the_bare_hash_spelling_is_seen(self) -> None:

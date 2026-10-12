@@ -279,9 +279,12 @@ _QUALIFIED_NODE_NAME_PATTERN = re.compile(
 _TASK_VOCABULARY_QUALIFIER = re.compile(r'(sub_?)?tasks?')
 
 # An UNANCHORED mention of a task number in prose — the scan-side twin of
-# _TASK_NODE_NAME_PATTERN, sharing its separator alternation so every spelling
-# the anchored parser accepts ('task 5', 'task #5', 'Task: 5') is also seen
-# here. This ONE pattern replaces BOTH of cross_project_refs' pre-3667
+# _TASK_NODE_NAME_PATTERN. Its separator alternation is a strict SUPERSET of
+# the anchored parser's, so every spelling that parser accepts ('task 5',
+# 'task #5', 'Task: 5') is still seen here. The glued '-'/'/' separators are
+# deliberately NOT added to the anchored parser: it drives node RENAMING, and an
+# entity named 'task-173' was never measured as a task node.
+# This ONE pattern replaces BOTH of cross_project_refs' pre-3667
 # _BARE_TASK_MENTION_PATTERN and _BARE_TASK_COLON_PATTERN, which differed only
 # in their separator; keeping them apart would leave two vocabulary copies
 # inside the very module that exists to eliminate copies (INV-5).
@@ -321,6 +324,18 @@ _TASK_VOCABULARY_QUALIFIER = re.compile(r'(sub_?)?tasks?')
 #   means fewer contests, which means MORE confident splits on prose that
 #   pre-3667 refused. A false positive here only ever adds ambiguity, which the
 #   consumer refuses; a false negative lets destructive surgery proceed.
+# - The '[-/]' branch sees the fleet's own hyphen-slug ('task-173-fillet-fix')
+#   and branch-name ('task/173') spellings, which resolved decision 8 never
+#   listed as blind (task 6059). It is UNPADDED, exactly one character, so it
+#   can never span whitespace or a line break, and the shared lookbehind still
+#   refuses 'sub-task-5' and 'reify-task-12'. MEASURED 2026-10-12 with this
+#   branch alone, '(?<![\w:-])[Tt][Aa][Ss][Kk][Ss]?[-/]([0-9]+)(?!\d)', over
+#   every `git ls-files` path outside docs/entities-omission-advice-repair/
+#   (5,391 matches) and over `git log --all --format=%B` (6,936 matches): the
+#   only captures naming no task are 4 letter-suffixed ids ('task-202a',
+#   'task-202b', 'task-606b', 'tasks/1h'). A '/'- or '.'-glued match
+#   ('refs/heads/task/3719', 'plans/task-6021-...', 'main..task/4369') still
+#   names that task.
 # - The word 'tasks?' is interpolated from the SAME _TASK_WORD constant this
 #   pattern shares with _TASK_NODE_NAME_PATTERN — explicit ASCII case classes,
 #   NOT 'tasks?' plus re.IGNORECASE, for the reason recorded there:
@@ -344,7 +359,7 @@ _TASK_VOCABULARY_QUALIFIER = re.compile(r'(sub_?)?tasks?')
 #   TestTaskWordIsAsciiOnly so a future revert cannot silently restore the
 #   phantom contest.
 _LOCAL_MENTION_PATTERN = re.compile(
-    r'(?<![\w:-])' + _TASK_WORD + r'(?:[ \t]*[#:][ \t]*|\s+)([0-9]+)(?!\d)'
+    r'(?<![\w:-])' + _TASK_WORD + r'(?:[ \t]*[#:][ \t]*|\s+|[-/])([0-9]+)(?!\d)'
 )
 
 # A project-qualified task reference: '<qualifier>:<digits>'. Moved VERBATIM
@@ -670,7 +685,14 @@ def scan_content(
 
     KNOWN BLIND SPOTS, so no reader assumes completeness: a node named with
     bare digits ('1251'), a reference made by task TITLE rather than number,
-    and Greek-letter or codename aliases are all invisible here by design.
+    and Greek-letter or codename aliases are all invisible here by design. So
+    are list continuations ('tasks 3659 and 3500' and 'Tasks 5949/5849' see
+    only the first number), non-task vocabulary ('gate 184', 'carrier 6033')
+    and the bare hash '#4262'. Recall widening for list forms is deliberately
+    NOT done: no precision measurement backs it. The declared-referent gate
+    does not reject over these blind spots, because a declared number the
+    content writes as a digit run is exempt from its typo axis (see
+    ``referent_resolution._conflicting_referents``, choice 5).
     A task number written in NON-ASCII digits ('task \u0663', 'reify:\u0663') is
     likewise invisible, and so is a MIXED run ('task 12\u0663', which yields
     nothing rather than a truncated 'Task 12') — the deliberate, negligible
