@@ -260,11 +260,28 @@ class TestVerifyAdmissionWatchPass:
         assert beat['data']['oldest']['task_id'] == 'W'
 
     @pytest.mark.asyncio
-    async def test_pass_without_an_event_store_is_a_noop(self, tmp_path: Path) -> None:
+    async def test_pass_without_an_event_store_leaves_the_alarm_for_a_later_one(
+        self, tmp_path: Path,
+    ) -> None:
         slots_dir = tmp_path / 'slots'
+        alarm_secs = 0.01
         h = Harness(OrchestratorConfig(
             project_root=tmp_path, verify_admission_slots_dir=str(slots_dir),
+            verify_admission_wait_alarm_secs=alarm_secs,
         ))
-        h.event_store = None
+        store = EventStore(tmp_path / 'runs.db', run_id='t')
 
-        await self._with_one_queued_waiter(slots_dir, h._run_verify_admission_watch_pass)
+        async def pass_without_then_with_a_store() -> None:
+            async with asyncio.timeout(5):
+                while (gate_for(slots_dir).snapshot().oldest_wait_secs or 0.0) < alarm_secs:
+                    await asyncio.sleep(0.005)
+            h.event_store = None
+            await h._run_verify_admission_watch_pass()
+            h.event_store = store
+            await h._run_verify_admission_watch_pass()
+
+        await self._with_one_queued_waiter(slots_dir, pass_without_then_with_a_store)
+
+        assert len(store.fetch_events_by_type(EventType.verify_admission_heartbeat)) == 1
+        [aged] = store.fetch_events_by_type(EventType.verify_admission_wait_aged)
+        assert aged['data']['waiter']['task_id'] == 'W'
