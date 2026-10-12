@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import sqlite3
+from collections.abc import Collection, Mapping
 from pathlib import Path
 from types import MappingProxyType
 
@@ -420,8 +422,14 @@ class TestRunTickAdmitsEachGroupAgainstItself:
 
 
 # ---------------------------------------------------------------------------
-# Task 3592 step-17: __main__'s third independent degrade point
+# __main__.main: one degrade handler per group of an injected table
 # ---------------------------------------------------------------------------
+
+FAKE_SAMPLES: dict[GroupName, Samples] = {
+    GroupName.PSI: FAKE_PSI,
+    GroupName.PROCESS: FAKE_PROCESS_METRICS,
+    GroupName.LOAD: FAKE_LOAD_METRICS,
+}
 
 
 def _metrics_written(db_path: Path) -> set[SampleKey]:
@@ -434,100 +442,105 @@ def _metrics_written(db_path: Path) -> set[SampleKey]:
         conn.close()
 
 
-def _run_main(monkeypatch, tmp_path: Path, **raising: bool):
-    """Drive sampler.__main__.main with each collector optionally raising."""
+def _table(
+    *,
+    samples: Mapping[GroupName, Samples] = FAKE_SAMPLES,
+    raising: Collection[GroupName] = (),
+) -> tuple[MetricGroup, ...]:
+    """METRIC_GROUPS with each collector replaced by a fake returning *samples* or raising."""
+
+    def collector(name: GroupName):
+        def collect() -> Samples:
+            if name in raising:
+                raise RuntimeError(f'{name} is down')
+            return samples[name]
+        return collect
+
+    return tuple(
+        dataclasses.replace(group, collect=collector(group.name)) for group in METRIC_GROUPS
+    )
+
+
+def _run_main(monkeypatch, tmp_path: Path, table: tuple[MetricGroup, ...]) -> Path:
+    """Drive sampler.__main__.main over *table*, rooted at *tmp_path*."""
     import sampler.__main__ as entry
 
     monkeypatch.setenv('DARK_FACTORY_ROOT', str(tmp_path))
-
-    def collector(name: str, value: dict[SampleKey, float]):
-        def collect(**_kwargs):
-            if raising.get(name):
-                raise RuntimeError(f'{name} is down')
-            return value
-        return collect
-
-    monkeypatch.setattr(entry, 'collect_psi', collector('psi', FAKE_PSI))
-    monkeypatch.setattr(
-        entry, 'collect_process_metrics', collector('process', FAKE_PROCESS_METRICS)
-    )
-    monkeypatch.setattr(
-        entry, 'collect_load_metrics', collector('load', FAKE_LOAD_METRICS)
-    )
-    entry.main()
+    entry.main(groups=table)
     return tmp_path / 'data/load-samples.db'
 
 
-class TestMainDegradesEachGroupIndependently:
-    """Three collection groups, three loud degrade points, no shared fate.
+def _tick_lines(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith('tick ')]
 
-    The groups read unrelated kernel surfaces — /proc/pressure, the psutil
-    process scan, and /proc/stat + cgroupfs — so one failing must not discard
-    another's rows. Each falls back to {} so run_tick writes ZERO rows for it,
-    which is the shape that makes a fabricated healthy 0.0 impossible.
+
+def _errors(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+class TestMainDegradesEachGroupIndependently:
+    """One loud degrade point per group, no shared fate.
+
+    The groups read unrelated kernel surfaces, so one failing must not discard
+    another's rows. A failing group falls back to {} so run_tick writes ZERO
+    rows for it, which is the shape that makes a fabricated healthy 0.0
+    impossible.
     """
 
-    def test_all_three_groups_written_when_healthy(self, monkeypatch, tmp_path: Path):
-        db_path = _run_main(monkeypatch, tmp_path)
+    def test_every_group_is_written_when_healthy(self, monkeypatch, tmp_path: Path):
+        written = _metrics_written(_run_main(monkeypatch, tmp_path, _table()))
 
-        written = _metrics_written(db_path)
-        assert set(FAKE_PSI) <= written
-        assert set(FAKE_PROCESS_METRICS) <= written
-        assert set(FAKE_LOAD_METRICS) <= written
+        for samples in FAKE_SAMPLES.values():
+            assert set(samples) <= written
 
-    def test_load_failure_keeps_psi_and_process_rows(self, monkeypatch, tmp_path: Path, caplog):
+    @pytest.mark.parametrize('down', list(GroupName))
+    def test_a_failing_group_keeps_the_other_groups_rows(
+        self, monkeypatch, tmp_path: Path, caplog, down: GroupName
+    ):
         with caplog.at_level(logging.ERROR):
-            db_path = _run_main(monkeypatch, tmp_path, load=True)
+            db_path = _run_main(monkeypatch, tmp_path, _table(raising={down}))
 
         written = _metrics_written(db_path)
-        assert set(FAKE_PSI) <= written
-        assert set(FAKE_PROCESS_METRICS) <= written
-        assert not [m for m in written if m.metric.startswith(('runqueue', 'own_'))], (
-            'a failed load group must write zero rows, not a 0.0-valued one'
+        for name, samples in FAKE_SAMPLES.items():
+            if name is not down:
+                assert set(samples) <= written, name
+        assert not [key for key in written if _GROUPS[down].admits(key)], (
+            f'a failed {down} group must write zero rows, not a 0.0-valued one'
         )
-        messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
-        assert any('load' in m.lower() for m in messages), messages
+        assert any(str(down) in message for message in _errors(caplog)), _errors(caplog)
 
-    def test_process_failure_keeps_load_rows(self, monkeypatch, tmp_path: Path, caplog):
-        with caplog.at_level(logging.ERROR):
-            db_path = _run_main(monkeypatch, tmp_path, process=True)
-
-        written = _metrics_written(db_path)
-        assert set(FAKE_LOAD_METRICS) <= written
-        assert set(FAKE_PSI) <= written
-        assert not set(FAKE_PROCESS_METRICS) & written
-
-    def test_psi_failure_keeps_load_rows(self, monkeypatch, tmp_path: Path, caplog):
-        with caplog.at_level(logging.ERROR):
-            db_path = _run_main(monkeypatch, tmp_path, psi=True)
-
-        written = _metrics_written(db_path)
-        assert set(FAKE_LOAD_METRICS) <= written
-        assert set(FAKE_PROCESS_METRICS) <= written
-        assert not set(FAKE_PSI) & written
-
-    def test_a_failing_group_does_not_abort_the_tick(self, monkeypatch, tmp_path: Path):
+    def test_two_failing_groups_still_write_the_third(self, monkeypatch, tmp_path: Path):
         """Only store-construction failure justifies a non-zero exit."""
-        db_path = _run_main(monkeypatch, tmp_path, load=True, process=True)
+        table = _table(raising={GroupName.LOAD, GroupName.PROCESS})
 
-        assert set(FAKE_PSI) <= _metrics_written(db_path)
+        assert set(FAKE_PSI) <= _metrics_written(_run_main(monkeypatch, tmp_path, table))
+
+    def test_an_unadmitted_key_drops_only_its_group(self, monkeypatch, tmp_path: Path, caplog):
+        bad = {**FAKE_SAMPLES, GroupName.LOAD: {**FAKE_LOAD_METRICS, SampleKey('runqueu_ratio'): 1.0}}
+
+        with caplog.at_level(logging.ERROR):
+            db_path = _run_main(monkeypatch, tmp_path, _table(samples=bad))
+
+        assert _metrics_written(db_path) == set(FAKE_PSI) | set(FAKE_PROCESS_METRICS)
+        (error,) = _errors(caplog)
+        assert 'load' in error
+        assert 'runqueu_ratio' in error
 
     def test_a_healthy_tick_also_drives_the_vacuum_gate(
         self, monkeypatch, tmp_path: Path
     ):
         """``main()`` is the SOLE caller of maybe_vacuum, so it is the only guard.
 
-        ``sampler.sampler``'s module docstring records the split deliberately:
         run_tick enforces retention, and the compaction is wired one level up
-        in ``__main__.main`` — which means deleting the call here leaves
-        nothing red and a 30-day corpus that is never compacted again.
+        in ``__main__.main``, so deleting the call there would leave nothing
+        red and a 30-day corpus that is never compacted again.
 
         The stamp is read back against the TICK's own ts rather than merely
         asserted present: ``__main__`` reads the clock once and hands the same
         ``now`` to run_tick and maybe_vacuum, so the two agreeing is what says
         the vacuum gate ran as part of THIS tick.
         """
-        db_path = _run_main(monkeypatch, tmp_path)
+        db_path = _run_main(monkeypatch, tmp_path, _table())
 
         from sampler.store import LoadSampleStore
 
@@ -545,19 +558,46 @@ class TestMainDegradesEachGroupIndependently:
         )
         assert store.should_vacuum(tick_ts + 86400) is True
 
-    def test_the_tick_log_line_reports_the_load_group(self, monkeypatch, tmp_path: Path, caplog):
-        """An operator watching journalctl must be able to see the new group."""
-        with caplog.at_level(logging.INFO):
-            _run_main(monkeypatch, tmp_path)
+    def test_main_runs_the_live_table_by_default(self):
+        """The systemd ExecStart path calls main() with no argument."""
+        import inspect
 
-        tick_lines = [
-            r.getMessage() for r in caplog.records if r.getMessage().startswith('tick ')
-        ]
-        assert tick_lines, [r.getMessage() for r in caplog.records]
-        assert any('runqueue_ratio' in line for line in tick_lines), tick_lines
-        # The journal renders key labels, not NamedTuple reprs.
-        assert any(f'own_cpu_some10:{REIFY}' in line for line in tick_lines), tick_lines
-        assert not [line for line in tick_lines if 'SampleKey(' in line], tick_lines
+        import sampler.__main__ as entry
+
+        assert inspect.signature(entry.main).parameters['groups'].default is METRIC_GROUPS
+
+
+class TestTheTickLogLine:
+    """An operator watching journalctl sees every group the table names."""
+
+    def test_it_names_exactly_the_tables_groups(self, monkeypatch, tmp_path: Path, caplog):
+        table = _table()[:2]
+
+        with caplog.at_level(logging.INFO):
+            _run_main(monkeypatch, tmp_path, table)
+
+        (line,) = _tick_lines(caplog)
+        for group in table:
+            assert f'{group.name}=' in line, line
+        assert f'{GroupName.LOAD}=' not in line, line
+
+    def test_it_renders_key_labels(self, monkeypatch, tmp_path: Path, caplog):
+        with caplog.at_level(logging.INFO):
+            _run_main(monkeypatch, tmp_path, _table())
+
+        (line,) = _tick_lines(caplog)
+        assert 'runqueue_ratio' in line
+        assert f'own_cpu_some10:{REIFY}' in line
+        assert 'SampleKey(' not in line
+
+    def test_a_dropped_group_shows_as_dropped(self, monkeypatch, tmp_path: Path, caplog):
+        bad = {**FAKE_SAMPLES, GroupName.LOAD: {SampleKey('runqueu_ratio'): 1.0}}
+
+        with caplog.at_level(logging.INFO):
+            _run_main(monkeypatch, tmp_path, _table(samples=bad))
+
+        (line,) = _tick_lines(caplog)
+        assert f'{GroupName.LOAD}=dropped' in line, line
 
 
 # ---------------------------------------------------------------------------
