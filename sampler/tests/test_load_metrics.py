@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import NamedTuple
 
 import pytest
@@ -321,190 +321,257 @@ class TestCollectPsi:
 
 
 # ---------------------------------------------------------------------------
-# Step-3 tests: count_occt_queue_depth, count_verify_concurrency, sum_verify_rss
+# The process collector: classify once from proc.info, read memory only for
+# verify trees
 # ---------------------------------------------------------------------------
 
 
 class FakeProc:
-    """Lightweight process stub exposing the attributes the impl reads."""
+    """A psutil.Process stand-in whose classification can come only from ``info``.
+
+    ``cmdline()`` raises, so any re-read of the command line fails loudly.
+    ``memory_info()`` and ``children()`` raise *memory_error* and
+    *children_error* when those are given.
+    """
 
     def __init__(
         self,
         pid: int,
-        name: str = 'bash',
         cmdline: list[str] | None = None,
         rss: int = 0,
         children: list[FakeProc] | None = None,
+        memory_error: BaseException | None = None,
+        children_error: BaseException | None = None,
     ):
         self.pid = pid
-        self._name = name
-        self._cmdline = cmdline if cmdline is not None else []
+        self.info = {'pid': pid, 'cmdline': cmdline}
         self._rss = rss
         self._children = children if children is not None else []
-
-    def name(self) -> str:
-        return self._name
+        self._memory_error = memory_error
+        self._children_error = children_error
 
     def cmdline(self) -> list[str]:
-        return self._cmdline
+        raise AssertionError('classification must read proc.info')
 
     def memory_info(self):
-        class _MI:
-            def __init__(self, rss):
-                self.rss = rss
-        return _MI(self._rss)
+        if self._memory_error is not None:
+            raise self._memory_error
+        return SimpleNamespace(rss=self._rss)
 
     def children(self, recursive: bool = False) -> list[FakeProc]:
-        if recursive:
-            result = []
-            for ch in self._children:
-                result.append(ch)
-                result.extend(ch.children(recursive=True))
-            return result
-        return list(self._children)
+        if self._children_error is not None:
+            raise self._children_error
+        if not recursive:
+            return list(self._children)
+        result = []
+        for child in self._children:
+            result.append(child)
+            result.extend(child.children(recursive=True))
+        return result
+
+
+def _never_read_memory(pid: int) -> FakeProc:
+    """A non-verify process: reading its memory is the bug under test."""
+    return FakeProc(
+        pid, ['python', 'app.py'], memory_error=AssertionError('memory read off a verify tree')
+    )
+
+
+class TestClassifyProcess:
+    @pytest.mark.parametrize(
+        'cmdline',
+        [
+            ['bash', 'cargo-test-occt-gated'],
+            ['/bin/bash', 'reify/scripts/cargo-test-occt-gated.sh'],
+            ['bash', './scripts/cargo-test-occt-gated.sh', 'cargo', 'test'],
+        ],
+    )
+    def test_an_occt_gated_command_line_is_occt(self, cmdline):
+        from sampler.metrics import ProcessRecord, classify_process
+
+        assert classify_process({'pid': 7, 'cmdline': cmdline}) == ProcessRecord(7, True, False)
+
+    @pytest.mark.parametrize('argv0', ['verify.sh', '/usr/local/bin/verify.sh'])
+    def test_an_argv0_basename_of_verify_sh_is_verify(self, argv0):
+        from sampler.metrics import ProcessRecord, classify_process
+
+        record = classify_process({'pid': 8, 'cmdline': [argv0, 'arg1']})
+
+        assert record == ProcessRecord(8, False, True)
+
+    def test_verify_sh_as_an_argument_is_not_verify(self):
+        from sampler.metrics import classify_process
+
+        assert not classify_process({'pid': 9, 'cmdline': ['bash', 'verify.sh']}).is_verify
+
+    @pytest.mark.parametrize('cmdline', [None, [], ['python', 'script.py']])
+    def test_an_unreadable_empty_or_unrelated_command_line_is_neither(self, cmdline):
+        """``None`` is what psutil puts in ``info`` for an AccessDenied attribute."""
+        from sampler.metrics import ProcessRecord, classify_process
+
+        assert classify_process({'pid': 10, 'cmdline': cmdline}) == ProcessRecord(10, False, False)
+
+    def test_a_record_is_frozen(self):
+        import dataclasses
+
+        from sampler.metrics import classify_process
+
+        record = classify_process({'pid': 11, 'cmdline': ['verify.sh']})
+        field = 'is_verify'
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(record, field, False)
 
 
 class TestCountOcctQueueDepth:
-    def test_counts_only_occt_processes_waiting_on_semaphore(self):
-        """Processes matching cargo-test-occt-gated bash without fd/9 are counted."""
-        from sampler.metrics import count_occt_queue_depth
+    """An occt process is *waiting* while its /proc/<pid>/fd/9 does not exist."""
 
-        procs = [
-            FakeProc(1, 'bash', ['bash', 'cargo-test-occt-gated']),   # waiting (fd9 absent)
-            FakeProc(2, 'bash', ['bash', 'cargo-test-occt-gated']),   # has fd9 → not waiting
-            FakeProc(3, 'bash', ['bash', 'cargo-test-occt-gated']),   # waiting
-            FakeProc(4, 'python', ['python', 'something']),            # not occt
+    def test_counts_only_occt_processes_waiting_on_the_semaphore(self):
+        from sampler.metrics import ProcessRecord, count_occt_queue_depth
+
+        records = [
+            ProcessRecord(1, True, False),
+            ProcessRecord(2, True, False),
+            ProcessRecord(3, True, False),
+            ProcessRecord(4, False, False),
         ]
-        fd9_has = {2}  # pid 2 has fd/9
 
-        def fd9_exists(pid: int) -> bool:
-            return pid in fd9_has
+        assert count_occt_queue_depth(records, lambda pid: pid == 2) == 2
 
-        result = count_occt_queue_depth(procs, fd9_exists)
-        assert result == 2
+    def test_non_occt_records_are_ignored(self):
+        from sampler.metrics import ProcessRecord, count_occt_queue_depth
 
-    def test_non_matching_processes_ignored(self):
-        from sampler.metrics import count_occt_queue_depth
+        records = [ProcessRecord(10, False, False), ProcessRecord(11, False, True)]
 
-        procs = [
-            FakeProc(10, 'python', ['python', 'script.py']),
-            FakeProc(11, 'bash', ['bash', 'other-script']),
-        ]
-        result = count_occt_queue_depth(procs, lambda pid: False)
-        assert result == 0
+        assert count_occt_queue_depth(records, lambda _pid: False) == 0
 
     def test_all_waiting(self):
-        from sampler.metrics import count_occt_queue_depth
+        from sampler.metrics import ProcessRecord, count_occt_queue_depth
 
-        procs = [
-            FakeProc(i, 'bash', ['bash', 'cargo-test-occt-gated']) for i in range(5)
-        ]
-        result = count_occt_queue_depth(procs, lambda pid: False)
-        assert result == 5
+        records = [ProcessRecord(i, True, False) for i in range(5)]
 
-    def test_all_have_fd9_so_none_counted(self):
-        from sampler.metrics import count_occt_queue_depth
+        assert count_occt_queue_depth(records, lambda _pid: False) == 5
 
-        procs = [
-            FakeProc(i, 'bash', ['bash', 'cargo-test-occt-gated']) for i in range(3)
-        ]
-        result = count_occt_queue_depth(procs, lambda pid: True)
-        assert result == 0
+    def test_all_holding_fd9_so_none_counted(self):
+        from sampler.metrics import ProcessRecord, count_occt_queue_depth
 
-    def test_realistic_path_with_extension_counted(self):
-        """The real script is invoked with its .sh path — must be recognised.
+        records = [ProcessRecord(i, True, False) for i in range(3)]
 
-        Realistic invocation: ['/bin/bash', 'reify/scripts/cargo-test-occt-gated.sh']
-        The bare-token form ['bash', 'cargo-test-occt-gated'] was the only fixture
-        used in prior tests, giving false confidence.  This test proves the
-        path-with-extension form is also counted.
-
-        Current _is_occt_gated uses list membership ('cargo-test-occt-gated' in cmdline),
-        which requires an element to equal the bare token exactly.
-        'reify/scripts/cargo-test-occt-gated.sh' != 'cargo-test-occt-gated', so count==0
-        and this test FAILS against the current impl (confirming the RED phase).
-        """
-        from sampler.metrics import count_occt_queue_depth
-
-        procs = [
-            # Realistic form: bash running the script by its full relative path
-            FakeProc(1, 'bash', ['/bin/bash', 'reify/scripts/cargo-test-occt-gated.sh']),
-            # Another common form: bash + path with leading ./
-            FakeProc(2, 'bash', ['bash', './scripts/cargo-test-occt-gated.sh', 'cargo', 'test']),
-            # Unrelated process — must NOT be counted
-            FakeProc(3, 'python', ['python', 'unrelated']),
-        ]
-        result = count_occt_queue_depth(procs, lambda _pid: False)
-        # pids 1 and 2 match (path contains 'cargo-test-occt-gated'), pid 3 does not
-        assert result == 2
+        assert count_occt_queue_depth(records, lambda _pid: True) == 0
 
 
 class TestCountVerifyConcurrency:
-    def test_counts_verify_sh_argv0(self):
-        from sampler.metrics import count_verify_concurrency
+    def test_counts_verify_records(self):
+        from sampler.metrics import ProcessRecord, count_verify_concurrency
 
-        procs = [
-            FakeProc(1, 'bash', ['verify.sh', 'arg1']),              # matches
-            FakeProc(2, 'bash', ['/usr/local/bin/verify.sh', 'x']),  # basename matches
-            FakeProc(3, 'bash', ['bash', 'verify.sh']),               # verify.sh NOT argv[0]
-            FakeProc(4, 'python', ['python', 'app.py']),
+        records = [
+            ProcessRecord(1, False, True),
+            ProcessRecord(2, False, True),
+            ProcessRecord(3, True, False),
+            ProcessRecord(4, False, False),
         ]
-        result = count_verify_concurrency(procs)
-        assert result == 2
 
-    def test_no_verify_processes(self):
-        from sampler.metrics import count_verify_concurrency
+        assert count_verify_concurrency(records) == 2
 
-        procs = [FakeProc(1, 'python', ['python', 'main.py'])]
-        result = count_verify_concurrency(procs)
-        assert result == 0
+    def test_no_verify_records(self):
+        from sampler.metrics import ProcessRecord, count_verify_concurrency
 
-    def test_empty_cmdline_skipped(self):
-        from sampler.metrics import count_verify_concurrency
-
-        procs = [FakeProc(1, 'bash', [])]
-        result = count_verify_concurrency(procs)
-        assert result == 0
+        assert count_verify_concurrency([ProcessRecord(1, False, False)]) == 0
 
 
 class TestSumVerifyRss:
-    def test_sums_process_and_children_rss(self):
+    """Takes only the verify roots, and is the only reader of their trees' memory."""
+
+    def test_sums_each_root_and_its_children(self):
         from sampler.metrics import sum_verify_rss
 
-        child1 = FakeProc(101, 'bash', [], rss=512)
-        child2 = FakeProc(102, 'bash', [], rss=256)
-        parent = FakeProc(100, 'bash', ['verify.sh'], rss=1024, children=[child1, child2])
-        other = FakeProc(200, 'python', ['python'], rss=9999)
+        parent = FakeProc(
+            100, ['verify.sh'], rss=1024,
+            children=[FakeProc(101, rss=512), FakeProc(102, rss=256)],
+        )
 
-        result = sum_verify_rss([parent, other])
-        # parent (1024) + child1 (512) + child2 (256) = 1792
-        assert result == 1792
+        assert sum_verify_rss([parent]) == 1024 + 512 + 256
 
-    def test_dedupes_shared_pids(self):
-        """If a child appears in multiple process trees, count its RSS only once."""
+    def test_a_pid_shared_between_trees_is_counted_once(self):
         from sampler.metrics import sum_verify_rss
 
-        shared_child = FakeProc(999, 'bash', [], rss=100)
-        parent1 = FakeProc(1, 'bash', ['verify.sh'], rss=200, children=[shared_child])
-        parent2 = FakeProc(2, 'bash', ['verify.sh'], rss=300, children=[shared_child])
+        shared_child = FakeProc(999, rss=100)
+        parent1 = FakeProc(1, ['verify.sh'], rss=200, children=[shared_child])
+        parent2 = FakeProc(2, ['verify.sh'], rss=300, children=[shared_child])
 
-        result = sum_verify_rss([parent1, parent2])
-        # parent1 (200) + parent2 (300) + shared_child counted once (100) = 600
-        assert result == 600
+        assert sum_verify_rss([parent1, parent2]) == 200 + 300 + 100
 
-    def test_no_verify_processes_returns_zero(self):
+    def test_no_roots_sum_to_zero(self):
         from sampler.metrics import sum_verify_rss
 
-        procs = [FakeProc(1, 'python', ['python'], rss=1000)]
-        result = sum_verify_rss(procs)
-        assert result == 0
+        assert sum_verify_rss([]) == 0
 
-    def test_verify_without_children(self):
+    def test_a_root_without_children(self):
         from sampler.metrics import sum_verify_rss
 
-        proc = FakeProc(1, 'bash', ['verify.sh'], rss=4096)
-        result = sum_verify_rss([proc])
-        assert result == 4096
+        assert sum_verify_rss([FakeProc(1, ['verify.sh'], rss=4096)]) == 4096
+
+    def test_a_child_that_vanished_is_skipped_and_the_rest_summed(self):
+        import psutil
+
+        from sampler.metrics import sum_verify_rss
+
+        gone = FakeProc(101, memory_error=psutil.NoSuchProcess(101))
+        parent = FakeProc(100, ['verify.sh'], rss=1024, children=[gone, FakeProc(102, rss=256)])
+
+        assert sum_verify_rss([parent]) == 1024 + 256
+
+    def test_a_root_whose_children_are_denied_counts_alone(self):
+        import psutil
+
+        from sampler.metrics import sum_verify_rss
+
+        root = FakeProc(100, ['verify.sh'], rss=1024, children_error=psutil.AccessDenied(100))
+
+        assert sum_verify_rss([root]) == 1024
+
+    def test_a_programming_error_propagates(self):
+        from sampler.metrics import sum_verify_rss
+
+        root = FakeProc(100, ['verify.sh'], memory_error=RuntimeError('not a psutil error'))
+
+        with pytest.raises(RuntimeError, match='not a psutil error'):
+            sum_verify_rss([root])
+
+
+class TestCollectProcessMetrics:
+    def test_the_scan_requests_only_pid_and_cmdline(self):
+        from sampler.metrics import collect_process_metrics
+
+        requested: list[list[str]] = []
+
+        def proc_iter(attrs):
+            requested.append(list(attrs))
+            return iter(())
+
+        collect_process_metrics(proc_iter=proc_iter, fd9_exists=lambda _pid: False)
+
+        assert requested == [['pid', 'cmdline']]
+
+    def test_a_mixed_population(self):
+        from sampler.metrics import collect_process_metrics
+
+        procs = [
+            FakeProc(1, ['bash', 'cargo-test-occt-gated'], memory_error=AssertionError('occt')),
+            FakeProc(2, ['bash', 'cargo-test-occt-gated'], memory_error=AssertionError('occt')),
+            FakeProc(3, ['verify.sh'], rss=1000, children=[FakeProc(30, rss=500)]),
+            FakeProc(4, ['/repo/verify.sh', '--fast'], rss=200),
+            _never_read_memory(5),
+        ]
+
+        result = collect_process_metrics(
+            proc_iter=lambda _attrs: iter(procs), fd9_exists=lambda pid: pid == 2
+        )
+
+        assert result == {
+            SampleKey('occt_queue_depth'): 1.0,
+            SampleKey('verify_concurrency'): 2.0,
+            SampleKey('verify_rss_total_bytes'): 1700.0,
+        }
 
 
 # ---------------------------------------------------------------------------
