@@ -1122,22 +1122,39 @@ class TestCollectLoadMetricsOwnPressure:
 
 
 # ---------------------------------------------------------------------------
-# Task 3592 step-7: PRD §6.4 / boundary row 11 — sampler-to-gate vocabulary parity
+# Sampler-to-gate vocabulary parity: the table's arms against shared.psi's
 # ---------------------------------------------------------------------------
 
 
+def _emitted_by_group(tmp_path):
+    """What each live group's own collector emits over this module's fixtures."""
+    from sampler.metrics import GroupName, collect_process_metrics, collect_psi
+
+    pressure = {'cpu': PSI_CPU_TEXT, 'memory': PSI_MEM_TEXT, 'io': PSI_IO_TEXT}
+    return {
+        GroupName.PSI: set(collect_psi(read=lambda name: pressure[name])),
+        GroupName.PROCESS: set(collect_process_metrics(
+            proc_iter=lambda _attrs: iter(()), fd9_exists=lambda _pid: False
+        )),
+        GroupName.LOAD: set(_collect(live_topology(tmp_path))),
+    }
+
+
+def _is_emitted(spec, emitted: set[SampleKey]) -> bool:
+    if spec.per_leaf:
+        return any(key.metric == spec.name and key.leaf for key in emitted)
+    return spec.key() in emitted
+
+
 class TestArmMetricStemParity:
-    """Every gate ARM has a recorded sampler stem, and every stem is emitted.
+    """Every gate arm is recorded by a table metric, and every such metric is emitted.
 
-    The gate decides on arms; the sampler records metrics; ε1/ε2 calibrate one
-    against the other. If those two vocabularies drift the calibration
-    silently measures the wrong thing, so the correspondence gets an explicit
-    home (sampler.metrics.ARM_METRIC_STEMS) and this test.
-
-    The arm side is read from the LIVE artifact, shared.psi._ARMS, not from a
-    transcribed list (INV-10) — a private name deliberately, because it IS the
-    saturation truth table and a copy of it here would be the drift this test
-    exists to catch.
+    The gate decides on arms; the sampler records metrics; the calibration
+    gates (tasks 5219/5220) read one against the other. The metric side is the
+    table's projection, sampler.metrics.ARM_METRICS. The arm side is read from
+    the live artifact, shared.psi._ARMS: a private name deliberately, because
+    it IS the saturation truth table and a copy of it here would be the drift
+    this test exists to catch.
     """
 
     @staticmethod
@@ -1146,55 +1163,51 @@ class TestArmMetricStemParity:
 
         return {arm.field for arm in _ARMS}
 
-    def test_every_arm_has_a_stem(self):
-        from sampler.metrics import ARM_METRIC_STEMS
+    def test_every_arm_is_recorded_by_a_table_metric(self):
+        from sampler.metrics import ARM_METRICS
 
-        missing = self._arm_fields() - set(ARM_METRIC_STEMS)
+        missing = self._arm_fields() - set(ARM_METRICS)
         assert not missing, (
-            f'shared.psi._ARMS has arms the sampler records no metric for: {missing}. '
-            'Add them to sampler.metrics.ARM_METRIC_STEMS and emit them, or the '
-            'gate will hold on a signal the calibration corpus cannot see.'
+            f'shared.psi._ARMS has arms no MetricSpec records: {sorted(missing)}. '
+            'Give the recording spec in sampler.metrics.METRIC_GROUPS that arm, or '
+            'the gate will hold on a signal the calibration corpus cannot see.'
         )
 
-    def test_no_stem_is_orphaned(self):
-        from sampler.metrics import ARM_METRIC_STEMS
+    def test_no_table_arm_is_orphaned(self):
+        from sampler.metrics import ARM_METRICS
 
-        orphans = set(ARM_METRIC_STEMS) - self._arm_fields()
+        orphans = set(ARM_METRICS) - self._arm_fields()
         assert not orphans, (
-            f'ARM_METRIC_STEMS names keys that are not arms of shared.psi._ARMS: '
-            f'{orphans}. The mapping must not grow a dead key.'
+            f'sampler.metrics.METRIC_GROUPS names arms that shared.psi._ARMS does not '
+            f'have: {sorted(orphans)}.'
         )
 
-    def test_psi_stems_are_actually_emitted_by_collect_psi(self):
-        from sampler.metrics import ARM_METRIC_STEMS, collect_psi
+    def test_every_arm_metric_is_emitted_by_its_own_groups_collector(self, tmp_path):
+        from sampler.metrics import ARM_METRICS, METRIC_GROUPS
 
-        mapping = {'cpu': PSI_CPU_TEXT, 'memory': PSI_MEM_TEXT, 'io': PSI_IO_TEXT}
-        emitted = {k.metric for k in collect_psi(read=lambda name: mapping[name]) if k.leaf is None}
+        emitted = _emitted_by_group(tmp_path)
+        for arm, spec in ARM_METRICS.items():
+            (group,) = [g for g in METRIC_GROUPS if spec in g.metrics]
+            assert _is_emitted(spec, emitted[group.name]), (
+                f'arm {arm!r} is recorded as {spec.name!r} in the {group.name} group, '
+                f'whose collector does not emit it; emitted: {sorted(emitted[group.name])}'
+            )
 
-        psi_stems = {
-            stem for stem in ARM_METRIC_STEMS.values() if stem.startswith('psi_')
-        }
-        assert psi_stems, 'expected the four host-PSI arms to map to psi_* stems'
-        assert psi_stems <= emitted, f'psi stems not emitted: {psi_stems - emitted}'
+    def test_every_readability_metric_is_emitted_by_the_same_collector(self, tmp_path):
+        from sampler.metrics import METRIC_GROUPS
 
-    def test_runqueue_stem_is_emitted_as_an_exact_key(self, tmp_path):
-        from sampler.metrics import ARM_METRIC_STEMS
-
-        tree = live_topology(tmp_path)
-        emitted = {k.metric for k in _collect(tree) if k.leaf is None}
-
-        assert ARM_METRIC_STEMS['runqueue_ratio'] in emitted
-
-    def test_own_cpu_metric_is_emitted_per_leaf(self, tmp_path):
-        from sampler.metrics import ARM_METRIC_STEMS
-
-        tree = live_topology(tmp_path)
-        emitted = set(_collect(tree))
-
-        stem = ARM_METRIC_STEMS['own_cpu_some_avg10']
-        assert any(k.metric == stem and k.leaf for k in emitted), (
-            f'no emitted key records {stem!r} for a leaf; emitted: {sorted(emitted)}'
-        )
+        emitted = _emitted_by_group(tmp_path)
+        readable = [
+            (group, spec) for group in METRIC_GROUPS for spec in group.metrics
+            if spec.readability is not None
+        ]
+        assert readable, 'no spec declares a readability metric'
+        for group, spec in readable:
+            assert spec.readability is not None
+            assert _is_emitted(spec.readability, emitted[group.name]), (
+                f'{spec.name!r} declares readability {spec.readability.name!r}, which the '
+                f'{group.name} collector does not emit; emitted: {sorted(emitted[group.name])}'
+            )
 
 # ---------------------------------------------------------------------------
 # Task 3592 step-25: the arm-table LOCKSTEP guard (decision 7)
