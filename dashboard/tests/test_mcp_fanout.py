@@ -784,9 +784,9 @@ class TestFanoutLabel:
     def test_label_is_composed_from_the_single_project_label_definition(self):
         """``fanout_label`` must delegate the basename rule, not re-derive it.
 
-        ``project_label`` is the one definition ``active_tasks._project_label``
-        and ``redux_api._project_label`` are meant to collapse onto; a future
-        edit that inlines the rule here again would silently re-fork it.
+        ``project_label`` is the one definition every dashboard module labels
+        projects with; a future edit that inlines the rule here again would
+        silently re-fork it.
         """
         from pathlib import Path
 
@@ -795,56 +795,11 @@ class TestFanoutLabel:
         for root in ('/home/leo/src/dark-factory', '/a/b/', '/', Path('/srv/proj-a')):
             assert fanout_label('fetch_tasks', root) == f'fetch_tasks[{project_label(root)}]'
 
-    def test_all_three_project_label_definitions_agree(self):
-        """The three ``_project_label``/``project_label`` copies are ONE rule.
-
-        This test is what replaces the by-hand promise the three docstrings
-        used to make (``project_label``: "must be kept string-identical by
-        hand"; ``fanout_label``: "deliberately string-identical to ..."). A
-        hand-kept promise had already drifted twice by the time it was
-        measured, so the identity is pinned executably here instead.
-
-        The table covers each helper's whole declared input domain, and each
-        root is given BOTH as ``str`` and as ``Path`` because the helpers
-        disagreed about which they accepted. Agreement is asserted per
-        SPELLING, not across the two: ``Path('')`` normalises to ``'.'``
-        before any helper sees it, so the str and Path forms of ``''``
-        legitimately differ.
-        """
-        from pathlib import Path
-
-        from dashboard.data.active_tasks import _project_label as active_label
-        from dashboard.data.mcp_fanout import fanout_label, project_label
-        from dashboard.data.redux_api import _project_label as redux_label
-
-        roots = (
-            '/home/leo/src/dark-factory',
-            '/srv/team-a/app',
-            '/a/b/',
-            '/a/b//',
-            'a/b/.',
-            '/',
-            '',
-        )
-        for root_str in roots:
-            for root in (root_str, Path(root_str)):
-                expected = project_label(root)
-                assert active_label(root) == expected, (
-                    f'active_tasks._project_label({root!r}) forked the rule'
-                )
-                assert redux_label(root) == expected, (
-                    f'redux_api._project_label({root!r}) forked the rule'
-                )
-                assert fanout_label('fetch_tasks', root) == f'fetch_tasks[{expected}]', (
-                    'the throttle key and the project chip must be the same '
-                    'string by the same helper'
-                )
-
     def test_same_basename_roots_share_a_label_by_design(self):
         """Discrimination is by basename, so same-named roots still collapse.
 
         Documented, inherited behaviour rather than an oversight: scheduler's
-        ``label_to_root`` and redux_api's per-project payload already key on the
+        per-label joins and redux_api's per-project payload already key on the
         same basename, so diverging to full paths here alone would make this one
         log label inconsistent with every other project label the UI renders.
         Pinned so the assumption is executable, not only prose in the docstring.

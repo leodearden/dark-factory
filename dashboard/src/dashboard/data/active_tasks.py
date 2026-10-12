@@ -324,13 +324,6 @@ _TASKS_ROOT_CONCURRENCY = 4
 _LIVE_PRD_EXEMPTION_WARN_THRESHOLD = 200
 
 
-# An alias, not a wrapper: a wrapper re-declares the signature and the
-# docstring, which is exactly how this copy drifted from its definition site
-# (it was annotated ``root: Path`` and raised AttributeError on the ``str``
-# its two peers accepted). See ``mcp_fanout.project_label``.
-_project_label = project_label
-
-
 def _all_project_roots(config: DashboardConfig) -> list[Path]:
     """All known project roots, deduped, primary first."""
     seen: set[Path] = {config.project_root}
@@ -804,7 +797,7 @@ async def _shape_one_project(
     degrade to an honest ``None`` via :func:`_runtime_fields`, distinct from
     the task-tree ``offline`` return value above.
     """
-    project = _project_label(project_root)
+    project = project_label(project_root)
     # Resolve the reference instant ONCE per build pass — never per row — so
     # every row's ``started`` and ``stranded`` verdict share one instant.
     effective_now = resolve_now(now)
@@ -1172,7 +1165,7 @@ async def collect_tasks_with_counts(
         that produced it, which is the only identity that is unique (see the
         re-assembly below).
         """
-        label = _project_label(root)
+        label = project_label(root)
         async with slots:
             # AFTER admission, deliberately: a root that queued for a slot has
             # already spent part of the whole-handler budget, and handing it a
@@ -1252,7 +1245,7 @@ async def collect_tasks_with_counts(
     # assembly code, a CancelledError) must still propagate rather than be
     # silently converted into a result object.
     results = await asyncio.gather(*(_one(root) for root in admission_order))
-    # Keyed by ROOT, never by label. `_project_label` is the directory
+    # Keyed by ROOT, never by label. `project_label` is the directory
     # BASENAME, so two configured roots can share one (``/a/proj`` and
     # ``/b/proj``) — and a label-keyed dict collapses them, which would extend
     # the survivor's rows into `all_active` TWICE (duplicate `_task_uid`s, the
@@ -1265,7 +1258,7 @@ async def collect_tasks_with_counts(
     # This is the only place the shared accumulators are written.
     for root in roots:
         result = by_root[root]
-        label = _project_label(root)
+        label = project_label(root)
         if result.get('degraded'):
             degraded_projects.append(label)
             continue
@@ -1421,6 +1414,6 @@ async def collect_done_counts(
         # Skip offline markers (dict with 'offline' key).
         if isinstance(result, dict) and result.get('offline'):
             continue
-        label = _project_label(root)
+        label = project_label(root)
         counts[label] = sum(1 for s in result.values() if s == 'done')
     return counts

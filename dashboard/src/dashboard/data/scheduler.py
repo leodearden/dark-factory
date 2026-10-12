@@ -75,12 +75,8 @@ import httpx
 from shared.locking import files_to_modules, modules_conflict
 
 from dashboard.config import DashboardConfig
-from dashboard.data.active_tasks import (
-    _all_project_roots,
-    _project_label,
-    collect_tasks_with_counts,
-)
-from dashboard.data.mcp_fanout import TTLCache, fanout_label, first_success
+from dashboard.data.active_tasks import _all_project_roots, collect_tasks_with_counts
+from dashboard.data.mcp_fanout import TTLCache, fanout_label, first_success, project_label
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.utils import resolve_now
 
@@ -695,11 +691,6 @@ async def collect_scheduler_state(
     share a basename.  Making them root-unique means changing the wire label
     vocabulary across ``redux_api`` and six JSX consumers — filed as ticket
     ``tkt_0RTY9RTA8NJ7RDAQ5SY7PRM11T``, not attempted here.
-
-    Do NOT "fix" that residue by making the label rule set-aware: it would
-    fork ``mcp_fanout.project_label``'s single-root signature and break the
-    throttle-key identity pinned by
-    ``tests/test_mcp_fanout.py::test_all_three_project_label_definitions_agree``.
     """
     effective_now = resolve_now(now)
     since = effective_now - timedelta(hours=1)
@@ -719,7 +710,7 @@ async def collect_scheduler_state(
     # Determine which project roots still need querying
     roots_to_query = [
         root for root in _all_project_roots(config)
-        if _project_label(root) not in offline_projects
+        if project_label(root) not in offline_projects
     ]
 
     async def _one_project(root) -> tuple[dict | None, list[dict], list[dict]]:
@@ -757,7 +748,7 @@ async def collect_scheduler_state(
         ROOT, which is the stronger identity (two configured roots can share
         one basename).
         """
-        label = _project_label(root)
+        label = project_label(root)
 
         async def _fetch_events(
             url: str, event_types: list[str], limit: int, kind: str,
@@ -820,7 +811,7 @@ async def collect_scheduler_state(
             config.fused_memory_urls,
             _call,
             # String-identical to the former f'get_scheduler_state[{label}]' —
-            # fanout_label's basename form IS _project_label's. Routed through
+            # fanout_label's basename form IS project_label's. Routed through
             # the helper so all four fan-out sites share one definition of the
             # per-project-root throttle-key convention (see its docstring).
             log_label=fanout_label('get_scheduler_state', root),
@@ -864,7 +855,7 @@ async def collect_scheduler_state(
             )
             continue
         snapshot, skip_events, recovery_events = result
-        label = _project_label(root)
+        label = project_label(root)
 
         # None snapshot means every URL failed (offline); {} means online-but-empty.
         if snapshot is None:

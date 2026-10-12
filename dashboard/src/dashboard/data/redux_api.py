@@ -27,10 +27,7 @@ from dashboard.data.utils import resolve_now
 # ---------------------------------------------------------------------------
 
 
-# An alias, not a wrapper: a wrapper re-declares the signature and the
-# docstring, which is exactly how this copy drifted from its definition site
-# (its string-splitting rule returned '.' for 'a/b/.' where the pathlib rule
-# returns 'b'). See ``mcp_fanout.project_label``.
+# Re-export for api/merge_queue.py only; retired by tkt_0RVQ10333E2BHNR3JNYXV20R9V.
 _project_label = project_label
 
 
@@ -66,8 +63,8 @@ def shape_orchestrators(
         orch_entry: dict = {
             'pid': primary_pid,
             'pids': list(pids),
-            'label': o.get('label') or _project_label(project_root),
-            'project': _project_label(project_root),
+            'label': o.get('label') or project_label(project_root),
+            'project': project_label(project_root),
             'project_root': str(project_root),
             'running': bool(o.get('running')),
             'started': o.get('started') or '',
@@ -88,7 +85,7 @@ def shape_orchestrators(
         if root in seen:
             continue
         seen.add(root)
-        name = _project_label(root)
+        name = project_label(root)
         out_projects.append({
             'id': name,
             'name': name,
@@ -447,7 +444,7 @@ def shape_merge_queue(
     out: dict[str, dict] = {}
     for pid, data in per_project.items():
         spark = sparks.get(pid) or _EMPTY_SERIES
-        label = _project_label(pid)
+        label = project_label(pid)
         out[label] = {
             'depth': dict(data.get('depth_timeseries') or {'labels': [], 'values': []}),
             'outcomes': _shape_outcomes(data.get('outcomes')),
@@ -540,7 +537,7 @@ def shape_costs(
         models_list = list(models)
         sums = _sum_models(models_list)
         by_project_list.append({
-            'project': _project_label(pid),
+            'project': project_label(pid),
             'total': round(sum(sums.values()), 4),
             **{k: round(v, 4) for k, v in sums.items()},
         })
@@ -831,7 +828,7 @@ def shape_performance(
     for pid in project_ids:
         hist = histograms.get(pid) or {}
         h = history.get(pid) or {}
-        out[_project_label(pid)] = {
+        out[project_label(pid)] = {
             'paths': [dict(e) for e in (paths.get(pid) or [])],
             'escalation': dict(escalations.get(pid) or {}),
             'hist_outer': dict(hist.get('outer') or {'labels': [], 'values': []}),
@@ -943,7 +940,7 @@ def shape_burndown(
         forecast = compute_forecast_confidence(series)
         completion = compute_window_completion(series)
         parity = compute_parity_alarm(series)
-        by_project[_project_label(pid)] = {
+        by_project[project_label(pid)] = {
             'labels': labels,
             **{k: list(filled.get(k) or []) for k in _BURNDOWN_KEYS},
             **forecast,
