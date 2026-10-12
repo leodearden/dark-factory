@@ -476,8 +476,9 @@ class TestTransportErrorFamilyIsContained:
             httpx.ReadError('connection reset by peer'),
             httpx.RemoteProtocolError('server disconnected without response'),
             httpx.WriteError('broken pipe'),
+            OSError('network is unreachable'),
         ],
-        ids=['read_error', 'remote_protocol_error', 'write_error'],
+        ids=['read_error', 'remote_protocol_error', 'write_error', 'os_error'],
     )
     async def test_transport_error_degrades_only_that_project(self, exc):
         from dashboard.data.task_runtime import fetch_task_runtime
