@@ -237,6 +237,7 @@ class TestSummarizeGraphitiQueueHealth:
             f"expected a WARNING on {_LOGGER!r} for present-but-non-dict dead_by_operation"
         )
 
-    def test_non_dict_stats_yields_empty_breakdown(self):
+    @pytest.mark.parametrize("bad_stats", [None, "oops", [1, 2, 3]])
+    def test_non_dict_stats_yields_empty_breakdown(self, bad_stats):
         """The 'dead_by_operation' key is always present, whatever the input."""
-        assert summarize_graphiti_queue_health(None)['dead_by_operation'] == {}
+        assert summarize_graphiti_queue_health(bad_stats)['dead_by_operation'] == {}
