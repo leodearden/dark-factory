@@ -3431,7 +3431,7 @@ def test_format_outcome_echo_truth_table(provenance, expected_contains):
 
 
 def test_format_outcome_echo_truncates_long_note():
-    """``_truncate_clean(note, max_note_chars)`` caps the echoed note at 500
+    """``utils/clip_disclosure.py::fit_at_word`` caps the echoed note at 500
     chars, and in the note+commit branch the cap is applied to the note
     BEFORE the ``" (commit <sha>)"`` suffix is appended -- so the suffix must
     still appear, intact, after a note longer than the cap.
@@ -3880,7 +3880,7 @@ async def test_on_task_done_first_transition_echoes_provenance_not_description(
 # `details` was previously hard-cut with a raw `details[:500]` slice -- the
 # same naive-character-count bug fixed in _format_outcome_echo's note
 # branches. This pins the legacy fallback to the same clean, word-boundary
-# truncation contract (_truncate_clean).
+# truncation contract (utils/clip_disclosure.py::fit_at_word).
 
 
 @pytest.mark.asyncio
@@ -3939,7 +3939,8 @@ async def test_on_task_done_legacy_details_fallback_skips_non_str_details(
     reconciler, mock_memory_service, mock_taskmaster,
 ):
     """A non-str `details` (e.g. a list slipping through task metadata) must
-    not crash _truncate_clean's len()/slicing/.isspace() chain. Mirroring
+    not crash fit_at_word's len()/slicing/.isspace() chain (see
+    utils/clip_disclosure.py::fit_at_word). Mirroring
     _format_outcome_echo's isinstance guard on `note`, the fallback simply
     omits the Details section instead of propagating a TypeError."""
     mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])

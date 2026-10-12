@@ -56,6 +56,23 @@ def elide_text(value: object, cap: int, *, field: str) -> TextClip:
     return _clip(value, cap, field=field, marked=True)
 
 
+def fit_at_word(text: str, limit: int) -> str:
+    """Cut to at most ``limit`` chars ending in '…', for bounded text a mid-token cut would garble.
+
+    The cut backs up to the last word boundary unless that would keep half the budget or less.
+    """
+    if len(text) <= limit:
+        return text
+    budget = limit - 1
+    window = text[:budget]
+    last_ws = next(
+        (i for i in range(len(window) - 1, -1, -1) if window[i].isspace()),
+        -1,
+    )
+    head = text[:last_ws] if last_ws > budget // 2 else text[:budget]
+    return head.rstrip() + '…'
+
+
 def truncation_fields(*facts: TruncationFact | None) -> dict[str, list[dict[str, Any]]]:
     """The facts present, as plain dicts under ``TRUNCATION_FACTS_KEY`` for a dict channel; ``{}`` when none."""
     present = [asdict(fact) for fact in facts if fact is not None]
