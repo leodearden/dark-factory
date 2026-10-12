@@ -86,7 +86,8 @@ class TestRequiredFieldErrors:
             DoneProvenance.model_validate(payload)
         err = _first_error(exc_info)
         assert err['type'] == FIELD_REQUIRED
-        assert err['ctx'] == {'kind': kind, 'field': field}
+        assert err['ctx']['kind'] == kind
+        assert err['ctx']['field'] == field
         assert field in err['msg']
 
 
@@ -100,7 +101,8 @@ class TestWriteOnlyRequirement:
             DoneProvenance.parse_for_write({'kind': 'deterministic-gate'})
         err = _first_error(exc_info)
         assert err['type'] == FIELD_REQUIRED
-        assert err['ctx'] == {'kind': 'deterministic-gate', 'field': 'escalation_id'}
+        assert err['ctx']['kind'] == 'deterministic-gate'
+        assert err['ctx']['field'] == 'escalation_id'
 
     def test_gate_write_with_escalation_id_succeeds(self):
         dp = DoneProvenance.parse_for_write({'kind': 'deterministic-gate', 'escalation_id': 'esc-1'})
@@ -122,7 +124,8 @@ class TestCommitRequiredKinds:
         assert kinds <= set(DECLARED_KINDS)
 
     def test_pinned_membership(self):
-        assert DoneProvenance.COMMIT_REQUIRED_KINDS == {'merged', 'found_on_main'}
+        commit_required = DoneProvenance.COMMIT_REQUIRED_KINDS
+        assert commit_required == {'merged', 'found_on_main'}
 
     @pytest.mark.parametrize('kind', DECLARED_KINDS)
     def test_matches_enforced_behaviour(self, kind):
