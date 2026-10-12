@@ -81,7 +81,7 @@ import asyncio
 import logging
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeGuard
 
 from fused_memory.reconciliation.flag_shape import contains_any_casefolded
 from fused_memory.reconciliation.flag_task_ids import task_id_components
@@ -943,7 +943,7 @@ class _CorroborationObservation:
     unresolved: frozenset[str]
 
 
-def _is_str_list(value: Any) -> bool:
+def _is_str_list(value: Any) -> TypeGuard[list[str]]:
     return isinstance(value, list) and all(isinstance(item, str) for item in value)
 
 
@@ -1078,19 +1078,21 @@ async def maybe_escalate_preservation_suppression_storm(
     package is unavailable, and any per-subject failure is logged on *log* and
     excluded.  Returns the subjects that received a NEW record this cycle.
     """
-    if file_or_fold_l1 is None:
+    file_l1 = file_or_fold_l1
+    if file_l1 is None:
         return []
     storms = _file_storm_records(
-        escalation_queue, project_id, run_id, result, threshold=threshold, log=log,
+        file_l1, escalation_queue, project_id, run_id, result, threshold=threshold, log=log,
     )
     unresolved = await _file_unresolved_record(
-        escalation_queue, project_id, run_id, result,
+        file_l1, escalation_queue, project_id, run_id, result,
         journal=journal, stage_key=stage_key, streak_threshold=streak_threshold, log=log,
     )
     return storms + unresolved
 
 
 def _file_storm_records(
+    file_l1: Callable[..., bool],
     escalation_queue: Any,
     project_id: str,
     run_id: str,
@@ -1105,7 +1107,7 @@ def _file_storm_records(
         if count <= threshold:
             continue
         citation = result.citations_by_task.get(task_id, 'unknown')
-        filed = file_or_fold_l1(
+        filed = file_l1(
             escalation_queue,
             project_id=project_id,
             subject=task_id,
@@ -1133,6 +1135,7 @@ def _file_storm_records(
 
 
 async def _file_unresolved_record(
+    file_l1: Callable[..., bool],
     escalation_queue: Any,
     project_id: str,
     run_id: str,
@@ -1162,7 +1165,7 @@ async def _file_unresolved_record(
             project_id, run_id, streaks, streak_threshold,
         )
         return []
-    filed = file_or_fold_l1(
+    filed = file_l1(
         escalation_queue,
         project_id=project_id,
         subject=UNRESOLVED_CORROBORATION_SUBJECT,

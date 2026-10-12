@@ -58,6 +58,8 @@ from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
     sweep_orphaned_recon_escalations,
 )
 from fused_memory.reconciliation.preservation_specimen_guard import (
+    CANDIDATE_TASK_IDS_STAT,
+    UNRESOLVED_TASK_IDS_STAT,
     filter_preservation_specimen_flags,
     maybe_escalate_preservation_suppression_storm,
 )
@@ -397,18 +399,25 @@ class MemoryConsolidator(BaseStage):
         # for task 3105 failed to stop the recurrence for exactly that reason: the
         # recurrences that continued after it was widened were remediation runs.
         # This is the placement verify_cited_memories already uses to cover both
-        # passes, for the same reason.
+        # passes, for the same reason.  The guard's storm escape and unresolved-
+        # corroboration disclosure sit here too: each escape covers exactly the
+        # pass classes its filter runs on.  Hook A's filter, and so its escape,
+        # is full-cycle-only; this guard runs on both passes, so both of its
+        # disclosures do.  A recurrence seen by a full cycle and its remediation
+        # pass folds into one pending record.
         #
-        # Both stats are pre-inited here, above the return, so neither key is ever
+        # Every stat is pre-inited here, above the return, so no key is ever
         # conditionally absent from a remediation report (the always-present
         # convention the three pre-inits above follow).
         #
         # Best-effort: a guard failure must never abort the stage or leave
         # items_flagged partially mutated, so items_flagged is reassigned only on
-        # success and the stats stay at their pre-inited 0.
+        # success, the stats stay at their pre-inited empties, and nothing files.
         report.stats['preservation_specimen_suppressed'] = 0
         report.stats['preservation_specimen_unresolved'] = 0
         report.stats['preservation_specimen_citations'] = {}
+        report.stats[CANDIDATE_TASK_IDS_STAT] = []
+        report.stats[UNRESOLVED_TASK_IDS_STAT] = []
         preservation_result = None
         try:
             preservation_result = await filter_preservation_specimen_flags(
@@ -426,6 +435,8 @@ class MemoryConsolidator(BaseStage):
             report.stats['preservation_specimen_unresolved'] = len(
                 preservation_result.unresolved_task_ids
             )
+            report.stats[CANDIDATE_TASK_IDS_STAT] = list(preservation_result.candidate_task_ids)
+            report.stats[UNRESOLVED_TASK_IDS_STAT] = list(preservation_result.unresolved_task_ids)
             # The evidence travels with the number.  A count alone is the
             # anonymous drop citations_by_task exists to prevent: the storm
             # escape only names a citation above its threshold, so in normal
@@ -448,6 +459,15 @@ class MemoryConsolidator(BaseStage):
                 'preservation-specimen guard failed for project %s (best-effort — '
                 'passing %d flag(s) through unfiltered this cycle)',
                 self.project_id, len(report.items_flagged or []),
+            )
+        if self._escalation_queue is not None and preservation_result is not None:
+            await maybe_escalate_preservation_suppression_storm(
+                escalation_queue=self._escalation_queue,
+                project_id=self.project_id,
+                run_id=run_id,
+                result=preservation_result,
+                journal=self.journal,
+                stage_key=self.stage_id.value,
             )
 
         # Live-workflow citation guard (task 4874): annotate, never drop, a finding
@@ -476,23 +496,6 @@ class MemoryConsolidator(BaseStage):
         # Skip dedup for remediation passes
         if self.remediation_findings is not None:
             return report
-
-        # Per-cycle "storm escape" for the guard above (INV-4), and its
-        # unreadable-corroboration disclosure.  Full-cycle only, mirroring the
-        # Hook A storm call below; skipped when no escalation queue is wired
-        # (nothing would consume the escalation).
-        #
-        # Deliberately NOT inside the ``if report.items_flagged:`` block below:
-        # a storm is precisely the cycle in which the guard may have suppressed
-        # EVERY flag, which would leave that block unentered and the storm
-        # unreported — the one cycle it most needs filing.
-        if self._escalation_queue is not None and preservation_result is not None:
-            await maybe_escalate_preservation_suppression_storm(
-                escalation_queue=self._escalation_queue,
-                project_id=self.project_id,
-                run_id=run_id,
-                result=preservation_result,
-            )
 
         # ── Resolved human-curator-gate sweep (task 3084) ──────────────────────
         # Flag open ``operational_mode == 'gate'`` tasks for which the reify
