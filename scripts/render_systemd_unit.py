@@ -140,13 +140,13 @@ def render_template(template_text: str, *, repo_root: str, uv_path: str) -> str:
 class UnitRenderSpec:
     """Everything about rendering ONE unit that is not shared by both.
 
-    The preservation core (``render_template`` / ``preserved_values`` /
-    ``_environment_token`` / ``apply_preserved`` / ``render_unit``) is
-    unit-neutral: it is parameterised by ``names``, and --template/--output are
-    CLI flags. What is unit-specific is the log tag and the policy family whose
-    host-local ENV_POLICY rows are the preserve set (why each row is so:
-    plans/review-all-s25-scripts-instruments-prd.md D5). Adding a third unit is
-    therefore a registry entry, not a fork.
+    The preservation mechanism (``render_template`` / ``preserved_values`` /
+    ``_environment_token`` / ``apply_preserved``) is unit-neutral: it is
+    parameterised by ``names``, which ``render_unit`` reads off a spec, and
+    --template/--output are CLI flags. What is unit-specific is the log tag and
+    the policy family whose host-local ENV_POLICY rows are the preserve set (why
+    each row is so: plans/review-all-s25-scripts-instruments-prd.md D5). Adding
+    a third unit is therefore a registry entry, not a fork.
 
     FROZEN: a spec mutated per invocation would make "which names does this host
     preserve?" depend on argument-parsing order.
@@ -385,7 +385,8 @@ def render_unit(
     repo_root: str,
     uv_path: str,
     installed_text: str = "",
-    names: "tuple[str, ...] | list[str]" = UNITS[_DEFAULT_UNIT].host_local_environment,
+    spec: UnitRenderSpec = UNITS[_DEFAULT_UNIT],
+    preserve: bool = True,
 ) -> "tuple[str, dict[str, str], dict[str, str]]":
     """Render *template_text*, then put this host's local values back.
 
@@ -395,17 +396,22 @@ def render_unit(
     rather than merely doing it.
 
     *installed_text* is the unit ALREADY on the host (``""`` on a greenfield
-    one). Only names in *names* are read from it; everything else in the output
-    comes from the freshly rendered template. That asymmetry is the design:
-    DASHBOARD_PROJECT_ROOT is on the parity checker's DIVERGENCE_ALLOWLIST too,
-    but it is a RENDERED value that must equal the same copy's
-    WorkingDirectory=, so preserving it would pin the data root at the previous
-    checkout. Each name's policy: systemd_unit_parity.py::ENV_POLICY.
+    one). Only *spec*'s ``host_local_environment`` is read from it; everything
+    else in the output comes from the freshly rendered template. That asymmetry
+    is the design: DASHBOARD_PROJECT_ROOT is on the parity checker's
+    DIVERGENCE_ALLOWLIST too, but it is a RENDERED value that must equal the
+    same copy's WorkingDirectory=, so preserving it would pin the data root at
+    the previous checkout. Each name's policy: systemd_unit_parity.py::ENV_POLICY.
+
+    ``preserve=False`` empties the preserve SET rather than merely reading
+    nothing, so the names are not then reported as absent from an installed
+    unit nobody read (``main``'s --no-preserve).
 
     PURE TEXT — no filesystem access at all. ``main`` owns the reading and the
     atomic write, so the entire preservation contract stays testable without
     touching a unit dir, which is the rule every sibling suite states.
     """
+    names = spec.host_local_environment if preserve else ()
     rendered = render_template(template_text, repo_root=repo_root, uv_path=uv_path)
     preserved, skipped = preserved_values(installed_text, names)
     return apply_preserved(rendered, preserved), preserved, skipped
@@ -542,12 +548,7 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     # The installed side. An absent --output is the greenfield case, not an
     # error: there is simply nothing to preserve.
     installed_text = ""
-    names: tuple[str, ...] = spec.host_local_environment
     if args.no_preserve:
-        # Not merely "read nothing": the preserve SET is emptied too, so the
-        # names do not then get reported as absent-from-the-installed-unit,
-        # which would be a true sentence about a file this run never read.
-        names = ()
         _log(
             f"--no-preserve: rendering the template as-is; no host-local "
             f"Environment= values were read from {output_path}",
@@ -576,7 +577,8 @@ def main(argv: "Sequence[str] | None" = None) -> int:
             repo_root=args.repo_root,
             uv_path=args.uv_path,
             installed_text=installed_text,
-            names=names,
+            spec=spec,
+            preserve=not args.no_preserve,
         )
     except ValueError as exc:
         _log(f"FAILED: {exc}", stream=sys.stderr, log_tag=log_tag)

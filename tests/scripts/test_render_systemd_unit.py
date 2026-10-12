@@ -328,10 +328,7 @@ def _installed_with_nine_roots(repo_root="/home/leo/src/dark-factory"):
     Built by rendering rather than hand-written, so the fixture cannot drift
     into a shape the real installer would never produce.
     """
-    text = _rendered(repo_root)
-    single = f"Environment={_KNOWN_ROOTS}={repo_root}"
-    assert single in text, f"fixture anchor {single!r} not found in the rendered template"
-    return text.replace(single, f"Environment={_KNOWN_ROOTS}={NINE_ROOTS}")
+    return _with_env_value(_rendered(repo_root), _KNOWN_ROOTS, NINE_ROOTS)
 
 
 def test_preserved_values_reads_the_host_local_value_off_the_installed_unit():
@@ -988,6 +985,12 @@ def _env_line(text, name):
     return matches[0]
 
 
+def _with_env_value(text, name, value):
+    """*text* with its one ``Environment=<name>=`` line set to *value*."""
+    line = f"Environment={name}={_env_line(text, name)}"
+    return text.replace(line, f"Environment={name}={value}")
+
+
 def _directive(text, key):
     prefix = f"{key}="
     matches = [
@@ -1120,16 +1123,16 @@ def test_render_unit_greenfield_installs_the_single_root_default():
 
 
 def test_render_unit_defaults_its_preserve_set_to_the_policy_constant():
-    """The default preserve set is the dashboard spec's, not an empty tuple.
+    """A call naming no spec preserves the dashboard spec's host-local values.
 
-    A default of () would make every call site that omits `names` silently
-    preserve nothing — the clobber back, opt-in.
+    A default preserving nothing would make every call site that omits `spec`
+    silently drop them — the clobber back, opt-in.
     """
     explicit, _p, _s = _render_unit(
         repo_root=_NEW_ROOT,
         uv_path=_NEW_UV,
         installed_text=_installed_with_nine_roots(_OLD_ROOT),
-        names=_units()[_DASHBOARD].host_local_environment,
+        spec=_units()[_DASHBOARD],
     )
     defaulted, _p2, _s2 = _reinstall_over_a_configured_host()
 
@@ -1360,6 +1363,9 @@ def test_main_no_preserve_ignores_the_installed_values(tmp_path, capsys):
     assert NINE_ROOTS not in text
     report = capsys.readouterr().out
     assert "--no-preserve" in report, report
+    assert f"[{_skip_codes()[0]}]" not in report, (
+        "--no-preserve reported a name absent from a unit it never read"
+    )
 
 
 def test_main_preserves_the_output_files_mode(tmp_path, capsys):
@@ -1435,16 +1441,6 @@ def test_main_removes_its_temp_file_when_the_write_fails(tmp_path, capsys, monke
     assert captured.err.count(_TAG) == len(captured.err.strip().splitlines())
 
 
-def _with_env_value(text, name, value):
-    """*text* with its one ``Environment=<name>=`` line set to *value*."""
-    prefix = f"Environment={name}="
-    lines = text.splitlines(keepends=True)
-    matches = [i for i, line in enumerate(lines) if line.strip().startswith(prefix)]
-    assert len(matches) == 1, f"expected one {prefix!r} line, found {len(matches)}"
-    lines[matches[0]] = f"{prefix}{value}\n"
-    return "".join(lines)
-
-
 def _without_env(text, name):
     prefix = f"Environment={name}="
     return "".join(
@@ -1471,15 +1467,7 @@ def test_a_host_local_row_is_preserved_by_the_renderer_and_allowlisted_by_the_ga
         installed = tmp_path / name / "installed" / "dark-factory-dashboard.service"
         installed.parent.mkdir(parents=True)
         installed.write_text(
-            _with_env_value(
-                _render_template(
-                    TEMPLATE_PATH.read_text(encoding="utf-8"),
-                    repo_root=HARDCODED_SERVICE_REPO_ROOT,
-                    uv_path=HARDCODED_SERVICE_UV_PATH,
-                ),
-                name,
-                NINE_ROOTS,
-            ),
+            _with_env_value(_rendered(HARDCODED_SERVICE_REPO_ROOT), name, NINE_ROOTS),
             encoding="utf-8",
         )
         gate = [
@@ -1501,10 +1489,7 @@ def test_a_host_local_row_is_preserved_by_the_renderer_and_allowlisted_by_the_ga
         parity_out = capsys.readouterr().out
 
         assert rendered == 0
-        assert systemd_unit_parity.environment_map(
-            systemd_unit_parity.parse_unit_directives(written),
-            systemd_unit_parity.SERVICE_SECTION,
-        )[name] == NINE_ROOTS
+        assert _env(written)[name] == NINE_ROOTS
         assert verdict == systemd_unit_parity.ParityExit.PARITY, parity_out
         assert "[ok] parity" in parity_out
 
@@ -1558,10 +1543,7 @@ def _fm_installed_with_nine_roots(repo_root=_OLD_ROOT):
     shape is under test, and a hand-made fixture can drift into a shape the real
     installer would never produce.
     """
-    text = _fm_rendered(repo_root)
-    single = f"Environment={_KNOWN_ROOTS}={repo_root}"
-    assert single in text, f"fixture anchor {single!r} not found in the rendered template"
-    return text.replace(single, f"Environment={_KNOWN_ROOTS}={NINE_ROOTS}")
+    return _with_env_value(_fm_rendered(repo_root), _KNOWN_ROOTS, NINE_ROOTS)
 
 
 def _fm_cli(tmp_path, *, output_text=None, repo_root=_NEW_ROOT, unit="fused-memory"):
