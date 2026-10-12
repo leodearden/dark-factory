@@ -422,13 +422,14 @@ def render_marker_lifecycle_section() -> str:
         '(not Stage 3 remediation, not the LLM) deletes them early.\n\n'
         'Every marker write MUST include `metadata.run_id=<current_run_id>`. '
         '`run_id` is minted fresh per run and is never persisted across cycles: '
-        'the Mem0 marker channel is intentionally single-cycle. Any marker whose '
-        'run_id does not match the current cycle — including one left over from '
-        'a prior cycle whose consumer crashed before processing it — is '
-        'unconditionally swept by Python and never reaches the LLM; it is not '
-        'retried. The `flagged_items` structured-output field is the durable '
-        'delivery channel that survives this sweep — the marker is only a '
-        'same-cycle relay.'
+        'the Mem0 marker channel is intentionally single-cycle. One exception '
+        'concerns delivery, not run_id: a `flag_for_stage2` marker relayed by a '
+        'run whose Stage 2 agent did not complete is carried forward to the next '
+        'Stage 2 until a Stage 2 agent completes. Any other marker whose run_id '
+        'does not match the current cycle is swept by Python and never reaches '
+        'the LLM. The `flagged_items` structured-output field is the durable '
+        'delivery channel that survives this sweep; apart from that '
+        'carry-forward, the marker is only a same-cycle relay.'
     )
 
 
