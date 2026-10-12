@@ -15,6 +15,7 @@ from click.testing import CliRunner
 from shared.cli_invoke import AgentResult
 
 from orchestrator.config import default_price_table
+from orchestrator.evals.measurement import MeasurementStage, Unmeasured, UnmeasuredCause
 from orchestrator.evals.reviewer_trial.__main__ import _select_original_corpus, cli
 from orchestrator.evals.reviewer_trial.corpus import (
     CorpusDiff,
@@ -465,3 +466,114 @@ class TestCampaignUnmeasured:
         assert rerun.exit_code == 0, f'{rerun.output}\n{rerun.exception!r}'
         assert sum('REFUSED_MARKER' in p for p in prompts) == 2
         assert sum('OK_MARKER' in p for p in prompts) == 1
+
+
+def _unmeasured_score(variant: str, diff_id: str, cost_usd: float = 2.0,
+                      match_cost_usd: float = 0.31) -> ScoringResult:
+    return ScoringResult(
+        variant_name=variant, diff_id=diff_id, cost_usd=cost_usd, match_cost_usd=match_cost_usd,
+        unmeasured=Unmeasured(
+            MeasurementStage.MATCHER, UnmeasuredCause.CAP_HIT, 'session limit', cost_usd=match_cost_usd,
+        ),
+    )
+
+
+class TestCorpusSanityUnmeasured:
+    """corpus-sanity reduces its own scores: an unmeasured cell is excluded and fails the run."""
+
+    def _invoke(self, tmp_path: Path, scores: list[ScoringResult]):
+        manifest = CorpusManifest(diffs=[
+            CorpusDiff(diff_id=s.diff_id, language='python', source='synthetic',
+                       diff_text='', description=s.diff_id, ground_truth=[])
+            for s in scores
+        ])
+        panel_results = [
+            PanelRunResult(variant_name='baseline', diff_id=s.diff_id, total_cost_usd=s.cost_usd)
+            for s in scores
+        ]
+        with (
+            patch('orchestrator.evals.reviewer_trial.__main__._load_corpus', return_value=manifest),
+            patch('orchestrator.evals.reviewer_trial.runner.run_trial',
+                  new_callable=AsyncMock, return_value=panel_results),
+            patch('orchestrator.evals.reviewer_trial.scorer.score_panel_run',
+                  new_callable=AsyncMock, side_effect=scores),
+        ):
+            return CliRunner().invoke(cli, ['corpus-sanity', '--report-dir', str(tmp_path)])
+
+    def test_an_unmeasured_cell_is_excluded_from_the_aggregates_and_fails_the_run(
+        self, tmp_path: Path,
+    ) -> None:
+        measured = ScoringResult(
+            variant_name='baseline', diff_id='d1', cost_usd=1.0, match_cost_usd=0.3,
+            recall=0.8, precision=0.8, f1=0.8, blocking_recall=0.8,
+        )
+
+        result = self._invoke(tmp_path, [measured, _unmeasured_score('baseline', 'd2')])
+
+        assert result.exit_code == 1, f'{result.output}\n{result.exception!r}'
+        lines = result.output.splitlines()
+        row = next(line for line in lines if line.startswith('d2 '))
+        assert 'UNMEASURED' in row and '0.000' not in row, row
+        assert '$  2.31' in row, row
+        assert not any('d2' in line and 'recall=0.000' in line for line in lines)
+        mean_line = next(line for line in lines if 'Mean recall (synthetic):' in line)
+        assert '0.800' in mean_line, mean_line
+        assert '  - d2' not in result.output
+        assert 'Unmeasured: 1' in result.output
+
+    def test_nothing_measured_prints_n_a_and_fails_both_thresholds(self, tmp_path: Path) -> None:
+        result = self._invoke(
+            tmp_path, [_unmeasured_score('baseline', 'd1'), _unmeasured_score('baseline', 'd2')],
+        )
+
+        assert result.exit_code == 1, f'{result.output}\n{result.exception!r}'
+        mean_line = next(line for line in result.output.splitlines() if 'Mean recall (synthetic):' in line)
+        assert 'n/a' in mean_line, mean_line
+        assert result.output.count('[FAIL]') == 2, result.output
+
+
+class TestRefreshUnmeasured:
+    def test_an_unmeasured_cell_prints_unmeasured_and_is_counted_in_the_leaderboard(
+        self, tmp_path: Path,
+    ) -> None:
+        manifest = CorpusManifest(diffs=[
+            CorpusDiff(diff_id='syn_1', language='python', source='synthetic',
+                       diff_text='diff1', description='s1', ground_truth=[]),
+            CorpusDiff(diff_id='rw_1', language='typescript', source='real_world',
+                       diff_text='diff2', description='rw1', ground_truth=[]),
+        ])
+        panel_results = [
+            PanelRunResult(variant_name=v.name, diff_id=d, total_cost_usd=1.0)
+            for v in REVIEWER_REFRESH_VARIANTS for d in ('syn_1', 'rw_1')
+        ]
+
+        async def fake_score_panel_run(panel_result: PanelRunResult, diff: CorpusDiff) -> ScoringResult:
+            if (panel_result.variant_name, panel_result.diff_id) == ('variant_cross_family', 'syn_1'):
+                return _unmeasured_score('variant_cross_family', 'syn_1')
+            return ScoringResult(
+                variant_name=panel_result.variant_name, diff_id=panel_result.diff_id,
+                recall=0.5, precision=0.5, f1=0.5, blocking_recall=0.5, cost_usd=1.0,
+            )
+
+        with (
+            patch('orchestrator.evals.reviewer_trial.__main__._load_corpus', return_value=manifest),
+            patch('orchestrator.evals.reviewer_trial.runner.run_trial',
+                  new_callable=AsyncMock, return_value=panel_results),
+            patch('orchestrator.evals.reviewer_trial.scorer.score_panel_run',
+                  new_callable=AsyncMock, side_effect=fake_score_panel_run),
+        ):
+            result = CliRunner().invoke(cli, ['refresh', '--report-dir', str(tmp_path)])
+
+        assert result.exit_code == 0, f'{result.output}\n{result.exception!r}'
+        cell = next(
+            line for line in result.output.splitlines()
+            if 'variant_cross_family' in line and ' x syn_1' in line
+        )
+        assert 'UNMEASURED' in cell and 'matcher:cap_hit' in cell, cell
+        assert 'F1=0.000' not in cell, cell
+        md = (tmp_path / 'refresh_report.md').read_text().splitlines()
+        header = next(line for line in md if line.startswith('| Rank |'))
+        row = next(line for line in md if line.startswith('|') and '| variant_cross_family |' in line)
+        columns = [c.strip() for c in header.strip('|').split('|')]
+        cells = [c.strip() for c in row.strip('|').split('|')]
+        assert cells[columns.index('Unmeasured')] == '1'
