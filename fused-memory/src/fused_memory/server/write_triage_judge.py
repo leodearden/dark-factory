@@ -769,6 +769,20 @@ def resolve_judge_reasoning_effort(memory_service: Any) -> str | None:
     return None
 
 
+def resolve_judge_api_url(memory_service: Any) -> str | None:
+    """The judge's own endpoint, or None meaning INHERIT the provider's api_url.
+
+    A blank or non-string value inherits, for the same reason
+    :func:`_provider_credentials` refuses to forward a blank credential: an
+    empty ``base_url`` fails every call and reads as a judge outage rather
+    than as the cleared leaf it is.
+    """
+    value = _judge_attr(memory_service, 'judge_api_url')
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
 # --- the LLM call ------------------------------------------------------------
 
 #: Output cap for the two answer-only arms (anthropic, and a chat-only compat
@@ -806,6 +820,12 @@ def _provider_credentials(memory_service: Any, provider: str) -> _ProviderCreden
     in config.yaml). Reading the config section is for a deployment that pins a
     key or points at an OpenAI-compatible local endpoint.
 
+    ``base_url`` is ``write_triage.judge_api_url`` when set, else
+    ``llm.providers.<provider>.api_url``. The override is judge-only, so the
+    main LLM arm is unaffected; the ``api_key`` still comes from the provider
+    section (a judge-scoped key is task ν's, not this leaf's), and so does
+    ``serves_responses_api`` below.
+
     ``serves_responses_api`` is the deployment's existing declaration of what
     the configured OpenAI endpoint speaks — ``llm.client_class``, the same
     declaration ``backends/graphiti_client.py`` builds its client from, where
@@ -823,7 +843,7 @@ def _provider_credentials(memory_service: Any, provider: str) -> _ProviderCreden
     api_key = getattr(section, 'api_key', None)
     if isinstance(api_key, str) and api_key:
         client_kwargs['api_key'] = api_key
-    api_url = getattr(section, 'api_url', None)
+    api_url = resolve_judge_api_url(memory_service) or getattr(section, 'api_url', None)
     if isinstance(api_url, str) and api_url:
         client_kwargs['base_url'] = api_url
     serves_responses_api = (
