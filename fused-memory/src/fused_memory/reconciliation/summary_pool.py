@@ -514,6 +514,8 @@ async def write_cycle_summary(
             ``completed_at``, ``items_flagged``, ``stats``, ``llm_calls``, and
             ``tokens_used`` are serialized into ``payload_json`` verbatim (the
             authoritative copy of what this cycle did).
+            ``agent_outcome`` is serialized as its ``StageAgentOutcome`` value,
+            or ``None`` when unrecorded.
         run_id: Current reconciliation run identifier (identity key).
         stage: The ``stage`` metadata tag value identifying this stage (e.g.
             ``'memory_consolidator'``, ``'task_knowledge_sync'``) — stored as
@@ -576,6 +578,9 @@ async def write_cycle_summary(
             'llm_calls': report.llm_calls,
             'tokens_used': report.tokens_used,
             'remediation': remediation,
+            'agent_outcome': (
+                report.agent_outcome.value if report.agent_outcome is not None else None
+            ),
         }
         if ledger is not None:
             record = ReconLedgerRecord(
@@ -682,5 +687,6 @@ def _build_cycle_summary_mirror_content(run_id: str, stage: str, payload: dict) 
     return (
         f'Stage {stage} cycle summary for run_id: {run_id} — '
         f'{payload["items_flagged_count"]} item(s) flagged, '
-        f'{payload["llm_calls"]} llm_call(s), {payload["tokens_used"]} token(s) used.'
+        f'{payload["llm_calls"]} llm_call(s), {payload["tokens_used"]} token(s) used. '
+        f'Agent outcome: {payload["agent_outcome"] or "unrecorded"}.'
     )
