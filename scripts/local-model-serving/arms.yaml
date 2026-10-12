@@ -86,9 +86,7 @@ arms:
     # Confirmed on the 13:50Z slate run at reasoning: off -- 39 tokens,
     # `entities: []`, FAIL extraction_missed_entities, 0 of 4.
     #
-    # Whether the EVAL crosses reasoning modes as a factor is zeta's separate
-    # call (task 3719); this field only states the mode alpha certified in, and
-    # the report row records it so nothing is inherited invisibly.
+    # zeta (3719) ruled: `on`, not crossed (preregistration doc §Reasoning mode).
     reasoning: 'on'
     # Load-bearing, not decorative: _vllm_argv emits it only when reasoning is
     # `on`, and lms_manifest REFUSES reasoning: on without it -- because without
@@ -268,8 +266,8 @@ arms:
     #   off -> 236-276 tokens, 2.3-2.9 s
     #   on  -> 1807 tokens (84% thought), 16.5-17.2 s
     # So on this arm reasoning costs 6.4x the wall clock and buys nothing
-    # measurable. `off` restores the model author's own default; zeta (3719)
-    # owns whether it stays there.
+    # measurable. `off` restores the model author's own default.
+    # zeta (3719) ruled: `off`, not crossed (preregistration doc §Reasoning mode).
     reasoning: 'off'
     est_vram_gib: 14.5
     max_model_len: 16384

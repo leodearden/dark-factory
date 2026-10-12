@@ -111,3 +111,13 @@ Machine-readable twin: `inv12-exceptions-owned-or-ratified-prd.capability-manife
 - Planted-branch red is produced by γ1's guard test on the real tree — the
   rejection mechanism is γ1's scenario 1, observed to fire on fixtures before θ
   runs it live. PASS.
+
+## Structural lint adjudication (task 6036)
+
+`scripts/audit_delivered_checks.py` lists task **5599** (α)
+`inv12-heading-defines-the-slug`, grep ``^## INV-12 `exceptions-owned-or-ratified` ``
+in `docs/legibility/design-invariants.md`, under STRUCTURAL as
+`vacuous_present_comment_only`. It does so only because the lint's comment
+markers (`shared/src/shared/delivered_check_polarity.py::_COMMENT_MARKERS`) read
+a leading markdown `#` as a comment. The heading IS the capability, so the
+descriptor is correct and was deliberately left unchanged.

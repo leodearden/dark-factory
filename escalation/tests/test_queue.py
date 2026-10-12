@@ -17,7 +17,12 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
-from _scan_race_helpers import relocating_read_text, unreadable_read_text
+from _scan_race_helpers import (
+    deleting_read_text,
+    pruning_read_text,
+    relocating_read_text,
+    unreadable_read_text,
+)
 
 from escalation.classify import effective_benign
 from escalation.models import Escalation
@@ -41,6 +46,10 @@ from escalation.queue import (
 #: absent, which ``citation_sha=None`` would otherwise read as "use the
 #: default sha" (amendment pass, task 4499).
 _UNSET: Any = object()
+
+
+#: The info-L0 disposition classes (plans/info-l0-disposition-router-prd.md D14).
+_INFO_L0_DISPOSITION_CLASSES = ('addressed', 'observation-consumed', 'converted', 'status-info')
 
 
 def _make_escalation(esc_id: str, task_id: str = '1', status: str = 'pending', level: int = 0) -> Escalation:
@@ -648,35 +657,25 @@ class TestGetWithDuplicateArchiveCandidates:
 class TestGetByTaskFindsRecordsWhoseStemDoesNotEncodeTaskId:
     """get_by_task must find a record whose FILENAME does not encode its task_id.
 
-    WHY THIS EXISTS — do not "optimise" it away.  ``make_id``'s argument is an
-    id-NAMESPACE key, not a task_id: it names the durable counter ``esc-{key}.seq``
-    and the id stem ``esc-{key}-{n}``, and nothing more.  Five production sites
-    diverge deliberately — ``curator_escalator.py`` x3 (``make_id('curator')``
-    with ``task_id='task-curator'``) and ``ticket_janitor.py`` x2
-    (``make_id('ticket-janitor')``, same task_id) — so ``'task-curator'`` alone
-    carries three stem families in the live corpus (``esc-curator-*`` 31,
-    ``esc-ticket-janitor-*`` 6, ``esc-task-curator-*`` 13).
-
-    The false identity "for every record file, ``stem.startswith(
-    f'esc-{record.task_id}-')``" is therefore FALSE (42 of 2,972 corpus records
-    violate it), and believing it cost TWO design cycles: task 3999's 2026-08-11
-    amendment and ``plans/resume-charter-loss-remediation-prd.md``, both
-    withdrawn 2026-08-20 under ruling esc-3999-2.  ``get_by_task`` is correct
-    precisely BECAUSE it globs the unscoped ``esc-*.json`` and filters on the
-    STORED ``task_id`` FIELD.
+    ``make_id``'s argument is an id-namespace key, not a task_id, so a record's
+    stem need not start with ``esc-{task_id}-``.  The production sites that
+    diverge, and the design history, live in
+    ``escalation/queue.py::EscalationQueue.make_id``.
 
     THE BOUNDARY THIS TEST DRAWS: it forbids scoping ``get_by_task``'s glob to
-    ``f'esc-{task_id}-*.json'``.  That change was already rejected on its own
-    merits in esc-3999-2 — a measured 15x on a path costing 20-90 CPU-seconds/day
-    over a corpus the 30-day pruner already bounds, weighed against a
-    silent-record-loss failure mode and the erosion of contract D11
-    (``index_drift_detector.py``, task 3709, which put an opaque dedup key in the
-    task_id slot precisely BECAUSE get_by_task filters on the stored field).
+    ``f'esc-{task_id}-*.json'``, in whole or for some class of task id (ruling
+    esc-3999-2).  ``get_by_task`` must glob the unscoped ``esc-*.json`` and
+    filter on the STORED ``task_id`` field.
 
-    This test is GREEN on arrival — it characterises existing correct behaviour —
-    so its honest RED is a MUTATION check: swap both globs to the scoped form and
-    it must go red.  That check was run and recorded in this commit.
+    GREEN on arrival — it characterises existing correct behaviour — so its
+    honest RED is a MUTATION check: swap both globs to the scoped form and every
+    case must go red.
     """
+
+    DIVERGENT_SPECIMENS = [
+        pytest.param('esc-curator-1', 'task-curator', id='synthetic-anchor-task-id'),
+        pytest.param('esc-ticket-janitor-1', '2859', id='real-numeric-task-id'),
+    ]
 
     def _esc(self, esc_id: str, task_id: str) -> Escalation:
         return Escalation(
@@ -688,34 +687,38 @@ class TestGetByTaskFindsRecordsWhoseStemDoesNotEncodeTaskId:
             summary='curator surfaced a ticket',
         )
 
-    def test_pending_divergent_stem_is_found_by_stored_task_id(self, tmp_path: Path):
-        """Both live stem families for one task_id come back from get_by_task."""
+    @pytest.mark.parametrize(('divergent_id', 'task_id'), DIVERGENT_SPECIMENS)
+    def test_pending_divergent_stem_is_found_by_stored_task_id(
+        self, tmp_path: Path, divergent_id: str, task_id: str,
+    ):
+        """Both stem families for one task_id come back from get_by_task."""
         queue = EscalationQueue(tmp_path / 'queue')
-        # The divergent specimen: stem says 'curator', the record says 'task-curator'.
-        queue.submit(self._esc('esc-curator-1', 'task-curator'))
-        # The SAME task_id under the other live stem family, for contrast.
-        queue.submit(self._esc('esc-task-curator-1', 'task-curator'))
+        matching_id = f'esc-{task_id}-1'
+        queue.submit(self._esc(divergent_id, task_id))
+        queue.submit(self._esc(matching_id, task_id))
 
-        results = queue.get_by_task('task-curator')
+        results = queue.get_by_task(task_id)
 
-        assert {e.id for e in results} == {'esc-curator-1', 'esc-task-curator-1'}, (
+        assert {e.id for e in results} == {divergent_id, matching_id}, (
             'get_by_task filters on the STORED task_id field, not on the '
             f'filename: got {sorted(e.id for e in results)}'
         )
 
-    def test_archived_divergent_stem_is_still_found(self, tmp_path: Path):
+    @pytest.mark.parametrize(('divergent_id', 'task_id'), DIVERGENT_SPECIMENS)
+    def test_archived_divergent_stem_is_still_found(
+        self, tmp_path: Path, divergent_id: str, task_id: str,
+    ):
         """The archive tier must not lose the divergent record either."""
         queue = EscalationQueue(tmp_path / 'queue')
-        queue.submit(self._esc('esc-curator-1', 'task-curator'))
-        queue.submit(self._esc('esc-task-curator-1', 'task-curator'))
-        queue.resolve('esc-curator-1', 'handled')
+        queue.submit(self._esc(divergent_id, task_id))
+        queue.submit(self._esc(f'esc-{task_id}-1', task_id))
+        queue.resolve(divergent_id, 'handled')
 
-        # It has moved out of the queue root and into archive/YYYY-MM-DD/.
-        assert not (queue.queue_dir / 'esc-curator-1.json').exists()
+        assert not (queue.queue_dir / f'{divergent_id}.json').exists()
 
-        results = queue.get_by_task('task-curator')
+        results = queue.get_by_task(task_id)
 
-        assert 'esc-curator-1' in {e.id for e in results}, (
+        assert divergent_id in {e.id for e in results}, (
             'an ARCHIVED divergent-stem record must still be found by its stored '
             f'task_id: got {sorted(e.id for e in results)}'
         )
@@ -980,6 +983,19 @@ class TestSubmitResolved:
         assert result.resolution_class == 'benign', (
             f"Expected resolution_class='benign', got: {result.resolution_class!r}"
         )
+
+    @pytest.mark.parametrize('cls', _INFO_L0_DISPOSITION_CLASSES)
+    def test_submit_resolved_accepts_info_l0_disposition_class(self, tmp_path: Path, cls: str):
+        """submit_resolved(..., resolution_class=<info-L0 disposition class>) stamps and
+        round-trips (plans/info-l0-disposition-router-prd.md D14)."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-1-1')
+
+        queue.submit_resolved(esc, 'text', resolved_by='info-l0-router', resolution_class=cls)
+
+        result = queue.get('esc-1-1')
+        assert result is not None
+        assert result.resolution_class == cls
 
     def test_submit_resolved_defaults_resolution_class_per_resolved_by(self, tmp_path: Path):
         """submit_resolved(..., resolved_by=<reaper-sweep resolver>, no explicit class)
@@ -2031,14 +2047,8 @@ class TestGetRetriesRelocationBetweenLocateAndRead:
         queue.submit(_make_escalation('esc-1-1', task_id='1'))
 
         doomed = queue.queue_dir / 'esc-1-1.json'
-        original_read_text = Path.read_text
 
-        def deleting_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
-            if self == doomed and doomed.exists():
-                doomed.unlink()
-            return original_read_text(self, *args, **kwargs)
-
-        with patch.object(Path, 'read_text', deleting_read_text):
+        with patch.object(Path, 'read_text', deleting_read_text(doomed)):
             result = queue.get('esc-1-1')
 
         assert result is None
@@ -2177,14 +2187,8 @@ class TestGetByTaskRecoversRecordRelocatedMidScan:
         queue.submit(_make_escalation('esc-4176-2', task_id='4176', status='resolved'))
 
         doomed = queue.queue_dir / 'esc-4176-2.json'
-        original_read_text = Path.read_text
 
-        def deleting_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
-            if self == doomed and doomed.exists():
-                doomed.unlink()
-            return original_read_text(self, *args, **kwargs)
-
-        with patch.object(Path, 'read_text', deleting_read_text):
+        with patch.object(Path, 'read_text', deleting_read_text(doomed)):
             results = queue.get_by_task('4176', status=None)
 
         assert [e.id for e in results] == ['esc-4176-1'], (
@@ -2238,6 +2242,51 @@ class TestGetByTaskRecoversRecordRelocatedMidScan:
         assert any('re-glob after vanish' in r.getMessage() for r in warnings), (
             f'Expected a WARNING naming the re-glob-after-vanish context; got: '
             f'{[r.getMessage() for r in warnings]}'
+        )
+
+
+class TestGetByTaskLeavesAnArchiveTierVanishUnrecovered:
+    """The other side of the mid-scan recovery gate in
+    ``queue.py::EscalationQueue.get_by_task``: only a ROOT-tier vanish is
+    re-located.
+    """
+
+    def test_an_archive_copy_pruned_mid_scan_costs_no_extra_archive_walk(
+        self, tmp_path: Path,
+    ):
+        """An archive copy rmtree'd mid-scan, as ``archive.prune_archive``
+        does, is dropped without raising, and the scan walks the archive no
+        more often than the same scan run undisturbed.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-4176-2', task_id='4176'))
+        queue.resolve('esc-4176-2', 'resolved before the scan')
+        (archive_copy,) = (queue.queue_dir / 'archive').rglob('esc-4176-2.json')
+
+        with patch.object(Path, 'rglob', autospec=True, side_effect=Path.rglob) as undisturbed:
+            queue.get_by_task('4176', status=None)
+        with (
+            patch.object(Path, 'read_text', pruning_read_text(archive_copy)),
+            patch.object(Path, 'rglob', autospec=True, side_effect=Path.rglob) as disturbed,
+        ):
+            results = queue.get_by_task('4176', status=None)
+
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected only the surviving record after the archive copy was '
+            f'pruned mid-scan (no raise), got {[e.id for e in results]}'
+        )
+        assert not archive_copy.parent.exists(), (
+            f'Expected the interposition to have pruned {archive_copy.parent}; '
+            f'without that the walk count below is vacuous'
+        )
+        assert undisturbed.call_count > 0, (
+            'Expected the spy to observe the undisturbed scan walking the archive; '
+            'without that the walk count below is vacuous'
+        )
+        assert disturbed.call_count == undisturbed.call_count, (
+            f'Expected no extra archive walk for an archive-tier vanish; undisturbed '
+            f'walks {undisturbed.call_args_list}, disturbed walks {disturbed.call_args_list}'
         )
 
 
@@ -5449,6 +5498,21 @@ class TestResolveResolutionClassExplicit:
         cls, provenance = effective_benign(updated)
         assert (cls, provenance) == ('moot-terminal-subject', 'stamped')
         assert cls not in ('benign', 'actionable')
+
+    @pytest.mark.parametrize('cls', _INFO_L0_DISPOSITION_CLASSES)
+    def test_resolve_accepts_info_l0_disposition_class(self, tmp_path: Path, cls: str):
+        """resolve(..., resolution_class=<info-L0 disposition class>) persists the stamp,
+        and effective_benign reads it back verbatim as a stamped class
+        (plans/info-l0-disposition-router-prd.md D14)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        queue.resolve('esc-1-1', 'text', resolved_by='info-l0-router', resolution_class=cls)
+
+        record = queue.get('esc-1-1')
+        assert record is not None
+        assert record.resolution_class == cls
+        assert effective_benign(record) == (cls, 'stamped')
 
 
 class TestResolveResolutionClassDefaults:

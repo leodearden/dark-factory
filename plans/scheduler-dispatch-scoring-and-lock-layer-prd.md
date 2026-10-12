@@ -104,7 +104,9 @@ invisible in the event stream.
 - **62% of DF's and 82% of reify's `reservation_installed` events are no-ops** — every
   requested module was already blocked by a same-or-higher-tier foreign park (INV-3
   install blocking), yet the event fires and `has_parks` stays False, so the attempt
-  re-fires every tick. The fairness mechanism live-locks against itself.
+  re-fires every tick. The fairness mechanism live-locks against itself. Task 5308
+  changed both the emission and the `has_parks` guard behind the re-fire; read historical
+  series against `CHANGELOG.md` rather than under the new meaning.
 - **Only one hold predictor works.** Log2-space R² on a 70/30 time-ordered split:
   global median −0.22 / tier median −0.36 / tier+width −0.31, versus **module-history
   median (last 10 holds on the task's modules) 0.26 (DF) and 0.68 (reify)**. Static task
@@ -374,7 +376,7 @@ watchdog.
 
 | class | example | auto-pin? |
 |---|---|---|
-| never top-scored | 3534 — rank 32/294, zero skips, four days undispatched | **yes**, this is what the pin is for |
+| never top-scored | 3534 — rank 32/294, zero skips, four days undispatched | **yes**, this is what the pin is for. Since task 6040 a pin that is lock-blocked also earns a pin reservation |
 | parked behind a live holder | 3248 — 16h parked, 9 of 10 modules free, one held by 3455 | **no**, provably inert |
 
 The second row is measured, not argued: during the 2026-08-06/07 outage
@@ -517,6 +519,15 @@ Each row faces **both** sides of a seam. Rows 1–3 face the fused-memory ↔ or
 | **Lexicographic CPM buckets (S3)** | `floor(log2(1+D))` lets 3585 (D=1, age 211) displace 3090 (D=0, age **706**) on a bucket boundary. Within-tier starvation exposure rises to 706, the worst of any variant, and aging is structurally defeated — the same failure class as today's saturation with the polarity flipped. |
 | **Flat continuity credit ≥ cpm max** | Inverts the fix: 115/291 candidates carry prior-dispatch history, and 3534 drops to rank 35–40, worse than baseline. |
 | **Detecting continuity from dispatch-event history** | The events DB has both false positives (orphan releases, 3563-class stuck locks) and false negatives (173/294 candidates have no events at all, ever). |
+
+**Annotation (task 6040) on the "Below-rank-1 park INSTALLATION" row.** Task 6040
+adds a BOUNDED exception to that row. It is not a reversal: only the head eligible
+lock-blocked pin(s) reserve, capped by `pin_reservation_max_active` (default 1). That
+is the EASY-backfill head reservation, and it avoids each harm measured above. A single
+operator-chosen reservation cannot gridlock with itself, its idle cost is one task's
+footprint, and C7 backfill borrows through it exactly as through a fairness park. It
+never preempts a held lock, so the preemption row above stands unchanged. See
+`orchestrator/src/orchestrator/pin_reservation.py`.
 
 ## 8. Pre-conditions and substrate verification (G3)
 

@@ -235,7 +235,7 @@ def _mresult(
     self-contradictory shape this task removes.
     """
     from orchestrator.evals.metrics import EvalMetrics
-    from orchestrator.evals.runner import EvalResult
+    from orchestrator.evals.results import EvalResult
 
     m = EvalMetrics(
         tests_pass=tests_pass,

@@ -1,19 +1,8 @@
 """Tests for scripts/audit_model_admission.py.
 
 Hermetic: every test runs against a synthetic runs.db materialised into
-tmp_path, never against the 181 MB live store the script defaults to.
-
-The schema below is a VERBATIM copy of the three tables the audit reads,
-captured with
-
-    sqlite3 data/orchestrator/runs.db ".schema events invocations account_events"
-
-Copied rather than imported because scripts/tests/ is collected by
-`uv run --project shared pytest` and imports NO first-party package — the
-comment on dark-factory-orchestrator.yaml::test_command says so in as many
-words — so the orchestrator's own event store, which owns this DDL, is out of
-reach here. Re-capture with that command
-rather than hand-editing if the writer's schema moves.
+tmp_path by the ``runs_db`` / ``runs_db_path`` fixtures in conftest.py, never
+against the 181 MB live store the script defaults to.
 """
 import argparse
 import json
@@ -23,189 +12,6 @@ from datetime import UTC, datetime, timedelta
 
 import audit_model_admission
 import pytest
-
-RUNS_DB_SCHEMA = """
-CREATE TABLE events (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp   TEXT    NOT NULL,
-    run_id      TEXT    NOT NULL,
-    task_id     TEXT,
-    event_type  TEXT    NOT NULL,
-    phase       TEXT,
-    role        TEXT,
-    data        TEXT    DEFAULT '{}',
-    cost_usd    REAL,
-    duration_ms INTEGER
-);
-CREATE TABLE invocations (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id              TEXT NOT NULL,
-    task_id             TEXT,
-    project_id          TEXT NOT NULL,
-    account_name        TEXT NOT NULL,
-    model               TEXT NOT NULL,
-    role                TEXT NOT NULL,
-    cost_usd            REAL NOT NULL DEFAULT 0.0,
-    input_tokens        INTEGER,
-    output_tokens       INTEGER,
-    cache_read_tokens   INTEGER,
-    cache_create_tokens INTEGER,
-    duration_ms         INTEGER NOT NULL DEFAULT 0,
-    capped              INTEGER NOT NULL DEFAULT 0,
-    started_at          TEXT NOT NULL,
-    completed_at        TEXT NOT NULL
-);
-CREATE TABLE account_events (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    account_name TEXT NOT NULL,
-    event_type   TEXT NOT NULL,
-    project_id   TEXT,
-    run_id       TEXT,
-    details      TEXT,
-    created_at   TEXT NOT NULL
-);
-"""
-
-
-@pytest.fixture
-def runs_db_path(tmp_path):
-    """Path to a fresh, empty runs.db carrying :data:`RUNS_DB_SCHEMA`."""
-    path = tmp_path / 'runs.db'
-    conn = sqlite3.connect(path)
-    try:
-        conn.executescript(RUNS_DB_SCHEMA)
-        conn.commit()
-    finally:
-        conn.close()
-    return path
-
-
-@pytest.fixture
-def runs_db(runs_db_path):
-    """A WRITABLE connection on :func:`runs_db_path`, for seeding scenarios.
-
-    The audit's scan functions take an open connection, so a test normally
-    seeds through this fixture and hands the same connection straight to the
-    function under test. Tests that exercise the read-only connection factory
-    or the CLI take ``runs_db_path`` instead — both name the same file.
-    """
-    conn = sqlite3.connect(runs_db_path)
-    try:
-        yield conn
-    finally:
-        conn.close()
-
-
-def _payload(value):
-    """JSON-encode a dict/list payload; pass a str or None through VERBATIM.
-
-    The pass-through is what lets a test seed a deliberately malformed payload
-    — the live store holds an ``account_events.details`` of the bare string
-    ``'Escalation watcher (auto)'`` — so the audit's tolerant-parse paths are
-    exercised against the real shape rather than a hypothetical one. Same
-    convention as ``make_tasks_db``'s ``metadata`` handling in conftest.py.
-    """
-    if value is None or isinstance(value, str):
-        return value
-    return json.dumps(value)
-
-
-def _event(
-    conn,
-    timestamp,
-    event_type,
-    *,
-    run_id='run-1',
-    task_id=None,
-    phase=None,
-    role=None,
-    data=None,
-    cost_usd=None,
-    duration_ms=None,
-):
-    """Insert one `events` row, stating its payload as a dict rather than JSON text."""
-    conn.execute(
-        'INSERT INTO events (timestamp, run_id, task_id, event_type, phase, role, '
-        'data, cost_usd, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        (
-            timestamp,
-            run_id,
-            task_id,
-            event_type,
-            phase,
-            role,
-            _payload({} if data is None else data),
-            cost_usd,
-            duration_ms,
-        ),
-    )
-    conn.commit()
-
-
-def _invocation(
-    conn,
-    *,
-    model,
-    role,
-    started_at,
-    completed_at,
-    run_id='run-1',
-    task_id=None,
-    project_id='dark_factory',
-    account_name='max-a',
-    cost_usd=0.0,
-    input_tokens=None,
-    output_tokens=None,
-    cache_read_tokens=None,
-    cache_create_tokens=None,
-    duration_ms=0,
-    capped=0,
-):
-    """Insert one `invocations` row."""
-    conn.execute(
-        'INSERT INTO invocations (run_id, task_id, project_id, account_name, model, role, '
-        'cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_create_tokens, '
-        'duration_ms, capped, started_at, completed_at) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        (
-            run_id,
-            task_id,
-            project_id,
-            account_name,
-            model,
-            role,
-            cost_usd,
-            input_tokens,
-            output_tokens,
-            cache_read_tokens,
-            cache_create_tokens,
-            duration_ms,
-            capped,
-            started_at,
-            completed_at,
-        ),
-    )
-    conn.commit()
-
-
-def _account_event(
-    conn,
-    *,
-    account_name,
-    event_type,
-    created_at,
-    details=None,
-    project_id='dark_factory',
-    run_id='run-1',
-):
-    """Insert one `account_events` row; *details* follows :func:`_payload`."""
-    conn.execute(
-        'INSERT INTO account_events (account_name, event_type, project_id, run_id, '
-        'details, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-        (account_name, event_type, project_id, run_id, _payload(details), created_at),
-    )
-    conn.commit()
-
 
 # --- scan_routing_decisions: the resolver-decision surface (checks 1 and 3) ---
 
@@ -226,6 +32,7 @@ def _routing_payload(
     rule_id=None,
     rejected=(),
     routing_tier=0,
+    max_turns=100,
 ):
     """The exact 11-key `routing_decision` payload the producer emits.
 
@@ -239,7 +46,7 @@ def _routing_payload(
         'model': model,
         'effort': 'max',
         'budget_usd': 8.0,
-        'max_turns': 100,
+        'max_turns': max_turns,
         'source_layer': source_layer,
         'rule_id': rule_id,
         'rejected': list(rejected),
@@ -250,8 +57,8 @@ def _routing_payload(
 
 
 def test_config_layer_selection_is_reported_with_its_source_layer(runs_db):
-    _event(
-        runs_db, _at(hours=2), 'routing_decision', task_id='4377', role='merger',
+    runs_db.seed_event(
+        _at(hours=2), 'routing_decision', task_id='4377', role='merger',
         data=_routing_payload(role='merger', model=FABLE),
     )
 
@@ -269,8 +76,8 @@ def test_config_layer_selection_is_reported_with_its_source_layer(runs_db):
 
 def test_policy_rule_selection_carries_the_rule_id_and_routing_tier(runs_db):
     """Check 3: "did rule steward-retry-fable match?" is answerable only from these two."""
-    _event(
-        runs_db, _at(days=1), 'routing_decision', task_id='4211', role='steward',
+    runs_db.seed_event(
+        _at(days=1), 'routing_decision', task_id='4211', role='steward',
         data=_routing_payload(
             role='steward', model=FABLE, source_layer='policy_rule',
             rule_id='steward-retry-fable', routing_tier=1,
@@ -290,8 +97,8 @@ def test_a_rejection_on_a_decision_that_resolved_elsewhere_is_still_reported(run
     Filtering to rows where the target was selected would therefore miss every
     rejection there is — which is the whole of check 1.
     """
-    _event(
-        runs_db, _at(hours=3), 'routing_decision', task_id='4500', role='implementer',
+    runs_db.seed_event(
+        _at(hours=3), 'routing_decision', task_id='4500', role='implementer',
         data=_routing_payload(
             role='implementer', model='opus', source_layer='role_default',
             rejected=['config:model-not-in-allowlist'],
@@ -317,8 +124,8 @@ def test_a_rejection_on_a_decision_that_resolved_elsewhere_is_still_reported(run
     ],
 )
 def test_each_known_rejection_reason_is_recognised_behind_its_layer_prefix(runs_db, entry):
-    _event(
-        runs_db, _at(hours=4), 'routing_decision', task_id='4501', role='merger',
+    runs_db.seed_event(
+        _at(hours=4), 'routing_decision', task_id='4501', role='merger',
         data=_routing_payload(role='merger', model='opus', rejected=[entry]),
     )
 
@@ -334,8 +141,8 @@ def test_model_not_in_ladder_is_not_a_model_rejection(runs_db):
     against the ladder, BEFORE any model is validated — so it is not evidence
     that a model was attempted and refused.
     """
-    _event(
-        runs_db, _at(hours=5), 'routing_decision', task_id='4502', role='debugger',
+    runs_db.seed_event(
+        _at(hours=5), 'routing_decision', task_id='4502', role='debugger',
         data=_routing_payload(
             role='debugger', model='opus', rejected=['policy_rule:model-not-in-ladder'],
         ),
@@ -347,12 +154,12 @@ def test_model_not_in_ladder_is_not_a_model_rejection(runs_db):
 
 
 def test_decisions_before_since_are_excluded_from_both_halves(runs_db):
-    _event(
-        runs_db, _at(hours=-1), 'routing_decision', task_id='4300', role='merger',
+    runs_db.seed_event(
+        _at(hours=-1), 'routing_decision', task_id='4300', role='merger',
         data=_routing_payload(role='merger', model=FABLE),
     )
-    _event(
-        runs_db, _at(hours=-1), 'routing_decision', task_id='4301', role='merger',
+    runs_db.seed_event(
+        _at(hours=-1), 'routing_decision', task_id='4301', role='merger',
         data=_routing_payload(
             role='merger', model='opus', rejected=['config:model-not-in-allowlist'],
         ),
@@ -375,9 +182,9 @@ def test_an_empty_table_yields_empty_halves_rather_than_raising(runs_db):
 def test_a_malformed_payload_is_skipped_and_counted_rather_than_raised(runs_db):
     """A 181 MB live store must not be abortable by one bad row — but a
     dropped row has to stay visible, so it is counted rather than swallowed."""
-    _event(runs_db, _at(hours=6), 'routing_decision', task_id='4503', data='not json{')
-    _event(
-        runs_db, _at(hours=7), 'routing_decision', task_id='4504', role='merger',
+    runs_db.seed_event(_at(hours=6), 'routing_decision', task_id='4503', data='not json{')
+    runs_db.seed_event(
+        _at(hours=7), 'routing_decision', task_id='4504', role='merger',
         data=_routing_payload(role='merger', model=FABLE),
     )
 
@@ -429,21 +236,21 @@ def _merge_finalized_payload(*, branch, state, merge_sha=None, reason=None, gene
 
 def _fable_merger_run(conn, *, task_id, turns=45, duration_ms=120_000, cost_usd=6.08):
     """Seed one Fable merger invocation plus its matching invocation_end."""
-    _invocation(
-        conn, model=FABLE, role='merger', task_id=task_id, account_name='max-b',
+    conn.seed_invocation(
+        model=FABLE, role='merger', task_id=task_id, account_name='max-b',
         cost_usd=cost_usd, duration_ms=duration_ms,
         started_at=_at(hours=2), completed_at=_at(hours=2, minutes=2),
     )
-    _event(
-        conn, _at(hours=2, minutes=2), 'invocation_end', task_id=task_id, role='merger',
+    conn.seed_event(
+        _at(hours=2, minutes=2), 'invocation_end', task_id=task_id, role='merger',
         data=_invocation_end_payload(turns=turns, model=FABLE),
     )
 
 
 def test_a_fable_merger_run_reports_its_turns_and_the_merge_it_resolved(runs_db):
     _fable_merger_run(runs_db, task_id='4377')
-    _event(
-        runs_db, _at(hours=2, minutes=30), 'merge_finalized', task_id='4377',
+    runs_db.seed_event(
+        _at(hours=2, minutes=30), 'merge_finalized', task_id='4377',
         data=_merge_finalized_payload(branch='4377', state='done', merge_sha='d411f107'),
     )
 
@@ -466,15 +273,15 @@ def test_the_last_merge_finalized_wins_not_the_first(runs_db):
     done. Reading the first merge_finalized would report the Fable merger as
     having failed to resolve the merge, which is a different claim entirely."""
     _fable_merger_run(runs_db, task_id='4377')
-    _event(
-        runs_db, _at(hours=3), 'merge_finalized', task_id='4377',
+    runs_db.seed_event(
+        _at(hours=3), 'merge_finalized', task_id='4377',
         data=_merge_finalized_payload(
             branch='4377', state='blocked',
             reason='Post-merge verification failed: pytest exited 1', generation=1,
         ),
     )
-    _event(
-        runs_db, _at(hours=20), 'merge_finalized', task_id='4377',
+    runs_db.seed_event(
+        _at(hours=20), 'merge_finalized', task_id='4377',
         data=_merge_finalized_payload(
             branch='4377', state='done', merge_sha='d411f107', generation=3,
         ),
@@ -500,18 +307,18 @@ def test_a_later_merger_on_another_model_does_not_lend_its_success_to_this_run(r
     be unsupportable. The window closes at the next merger run's start.
     """
     _fable_merger_run(runs_db, task_id='4377')
-    _event(
-        runs_db, _at(hours=3), 'merge_finalized', task_id='4377',
+    runs_db.seed_event(
+        _at(hours=3), 'merge_finalized', task_id='4377',
         data=_merge_finalized_payload(
             branch='4377', state='blocked', reason='merge conflict', generation=1,
         ),
     )
-    _invocation(  # a merger on another model picks the task up and lands it
-        runs_db, model='opus', role='merger', task_id='4377',
+    runs_db.seed_invocation(  # a merger on another model picks the task up and lands it
+        model='opus', role='merger', task_id='4377',
         started_at=_at(hours=4), completed_at=_at(hours=4, minutes=30),
     )
-    _event(
-        runs_db, _at(hours=4, minutes=20), 'merge_finalized', task_id='4377',
+    runs_db.seed_event(
+        _at(hours=4, minutes=20), 'merge_finalized', task_id='4377',
         data=_merge_finalized_payload(
             branch='4377', state='done', merge_sha='d411f107', generation=2,
         ),
@@ -529,8 +336,8 @@ def test_a_later_merger_on_another_model_does_not_lend_its_success_to_this_run(r
 def test_a_merge_finalized_before_the_run_started_is_not_attributed_to_it(runs_db):
     """The window is bounded below as well: an earlier merger run's outcome
     belongs to that run, not to the next one to touch the same task."""
-    _event(
-        runs_db, _at(hours=1), 'merge_finalized', task_id='4377',
+    runs_db.seed_event(
+        _at(hours=1), 'merge_finalized', task_id='4377',
         data=_merge_finalized_payload(branch='4377', state='blocked', reason='earlier'),
     )
     _fable_merger_run(runs_db, task_id='4377')  # starts at +2h
@@ -541,8 +348,8 @@ def test_a_merge_finalized_before_the_run_started_is_not_attributed_to_it(runs_d
 
 
 def test_an_invocation_with_no_matching_end_event_reports_turns_none(runs_db):
-    _invocation(
-        runs_db, model=FABLE, role='merger', task_id='4900', duration_ms=5_000,
+    runs_db.seed_invocation(
+        model=FABLE, role='merger', task_id='4900', duration_ms=5_000,
         started_at=_at(hours=4), completed_at=_at(hours=4, minutes=1),
     )
 
@@ -565,8 +372,8 @@ def test_an_invocation_with_no_matching_end_event_reports_turns_none(runs_db):
 def test_the_flat_ceiling_flag_is_at_or_above_and_unknown_without_a_limit(
     runs_db, role, duration_ms, expected
 ):
-    _invocation(
-        runs_db, model=FABLE, role=role, task_id='4901', duration_ms=duration_ms,
+    runs_db.seed_invocation(
+        model=FABLE, role=role, task_id='4901', duration_ms=duration_ms,
         started_at=_at(hours=5), completed_at=_at(hours=5, minutes=10),
     )
 
@@ -598,8 +405,8 @@ def test_the_killed_at_timeout_signal_is_read_from_the_end_event_not_inferred(ru
 def test_a_zero_cost_row_survives_to_the_output(runs_db):
     """The milestone task names "$0 cost rows for Fable" as an escalation
     trigger, so a falsy cost must not be filtered out anywhere on the path."""
-    _invocation(
-        runs_db, model=FABLE, role='merger', task_id='4902', cost_usd=0.0,
+    runs_db.seed_invocation(
+        model=FABLE, role='merger', task_id='4902', cost_usd=0.0,
         duration_ms=1_000, started_at=_at(hours=6), completed_at=_at(hours=6, minutes=1),
     )
 
@@ -609,16 +416,16 @@ def test_a_zero_cost_row_survives_to_the_output(runs_db):
 
 
 def test_rows_before_since_and_rows_on_other_models_are_excluded(runs_db):
-    _invocation(
-        runs_db, model=FABLE, role='merger', task_id='4300',
+    runs_db.seed_invocation(
+        model=FABLE, role='merger', task_id='4300',
         started_at=_at(hours=-3), completed_at=_at(hours=-2),
     )
-    _invocation(
-        runs_db, model='opus', role='merger', task_id='4903',
+    runs_db.seed_invocation(
+        model='opus', role='merger', task_id='4903',
         started_at=_at(hours=7), completed_at=_at(hours=8),
     )
-    _invocation(
-        runs_db, model=FABLE, role='merger', task_id='4904',
+    runs_db.seed_invocation(
+        model=FABLE, role='merger', task_id='4904',
         started_at=_at(hours=7), completed_at=_at(hours=8),
     )
 
@@ -631,8 +438,8 @@ def test_rows_before_since_and_rows_on_other_models_are_excluded(runs_db):
 
 
 def test_a_cap_hit_scoped_to_the_model_is_reported_with_its_account_and_reason(runs_db):
-    _account_event(
-        runs_db, account_name='max-b', event_type='cap_hit', created_at=_at(hours=8),
+    runs_db.seed_account_event(
+        account_name='max-b', event_type='cap_hit', created_at=_at(hours=8),
         details={'reason': "You've hit your limit", 'scope': FABLE},
     )
 
@@ -645,8 +452,8 @@ def test_a_cap_hit_scoped_to_the_model_is_reported_with_its_account_and_reason(r
 
 
 def test_a_cap_hit_scoped_to_another_model_is_neither_scoped_nor_unscoped_here(runs_db):
-    _account_event(
-        runs_db, account_name='max-b', event_type='cap_hit', created_at=_at(hours=8),
+    runs_db.seed_account_event(
+        account_name='max-b', event_type='cap_hit', created_at=_at(hours=8),
         details={'reason': 'limit', 'scope': 'claude-fable-5'},
     )
 
@@ -660,8 +467,8 @@ def test_an_account_level_cap_hit_is_counted_rather_than_dropped(runs_db):
     """The failure mode check 4 exists for is a Fable cap that marked the WHOLE
     account because the restart-tier scoped_cap_models leaf had not taken effect
     yet. Dropping scope-less rows would make exactly that case invisible."""
-    _account_event(
-        runs_db, account_name='max-a', event_type='cap_hit', created_at=_at(hours=9),
+    runs_db.seed_account_event(
+        account_name='max-a', event_type='cap_hit', created_at=_at(hours=9),
         details={'reason': "You're out of extra usage"},
     )
 
@@ -673,8 +480,8 @@ def test_an_account_level_cap_hit_is_counted_rather_than_dropped(runs_db):
 
 def test_a_bare_non_json_details_string_is_tolerated_as_unscoped(runs_db):
     """The live table holds details='Escalation watcher (auto)'."""
-    _account_event(
-        runs_db, account_name='max-a', event_type='cap_hit', created_at=_at(hours=10),
+    runs_db.seed_account_event(
+        account_name='max-a', event_type='cap_hit', created_at=_at(hours=10),
         details='Escalation watcher (auto)',
     )
 
@@ -685,12 +492,12 @@ def test_a_bare_non_json_details_string_is_tolerated_as_unscoped(runs_db):
 
 
 def test_cap_hits_before_since_are_excluded(runs_db):
-    _account_event(
-        runs_db, account_name='max-b', event_type='cap_hit', created_at=_at(hours=-5),
+    runs_db.seed_account_event(
+        account_name='max-b', event_type='cap_hit', created_at=_at(hours=-5),
         details={'reason': 'limit', 'scope': FABLE},
     )
-    _account_event(
-        runs_db, account_name='max-a', event_type='cap_hit', created_at=_at(hours=-5),
+    runs_db.seed_account_event(
+        account_name='max-a', event_type='cap_hit', created_at=_at(hours=-5),
         details={'reason': 'limit'},
     )
 
@@ -704,16 +511,16 @@ def test_restarts_are_windowed_ordered_and_name_the_service_that_restarted(runs_
     """WHICH service restarted is the whole question: usage_cap.scoped_cap_models
     is restart-tier on the ORCHESTRATOR, so a dashboard or fused-memory restart
     is not evidence that the leaf took effect."""
-    _event(
-        runs_db, _at(hours=-2), 'service_restart',
+    runs_db.seed_event(
+        _at(hours=-2), 'service_restart',
         data={'service': 'dashboard', 'reason': 'post_merge_dashboard_code_change'},
     )
-    _event(
-        runs_db, _at(hours=12), 'service_restart',
+    runs_db.seed_event(
+        _at(hours=12), 'service_restart',
         data={'service': 'orchestrator', 'reason': 'fleet_redeploy'},
     )
-    _event(
-        runs_db, _at(hours=5), 'service_restart',
+    runs_db.seed_event(
+        _at(hours=5), 'service_restart',
         data={'service': 'fused-memory', 'reason': 'post_merge_fused_memory_code_change'},
     )
 
@@ -736,8 +543,8 @@ def test_restarts_are_found_even_though_live_rows_carry_a_task_id(runs_db):
     that triggered it. Reading these grouped by task and taking the untagged
     bucket reports zero restarts against real data while passing against a
     fixture that leaves task_id NULL."""
-    _event(
-        runs_db, _at(hours=3), 'service_restart', task_id='4319',
+    runs_db.seed_event(
+        _at(hours=3), 'service_restart', task_id='4319',
         data={'service': 'fused-memory', 'reason': 'post_merge_fused_memory_code_change'},
     )
 
@@ -757,16 +564,16 @@ def _spend(runs_db, *, model=FABLE, ceiling_usd: float | None = 150.0):
 
 
 def test_the_spend_window_is_half_open_at_the_start_and_the_end(runs_db):
-    _invocation(
-        runs_db, model=FABLE, role='merger', task_id='a', cost_usd=6.08,
+    runs_db.seed_invocation(
+        model=FABLE, role='merger', task_id='a', cost_usd=6.08,
         started_at=_at(), completed_at=_at(),  # exactly at window_start: INCLUDED
     )
-    _invocation(
-        runs_db, model=FABLE, role='steward', task_id='b', cost_usd=3.86,
+    runs_db.seed_invocation(
+        model=FABLE, role='steward', task_id='b', cost_usd=3.86,
         started_at=_at(hours=12), completed_at=_at(hours=12),
     )
-    _invocation(
-        runs_db, model=FABLE, role='merger', task_id='c', cost_usd=99.0,
+    runs_db.seed_invocation(
+        model=FABLE, role='merger', task_id='c', cost_usd=99.0,
         started_at=_at(hours=24), completed_at=_at(hours=24),  # at window_end: EXCLUDED
     )
 
@@ -789,8 +596,8 @@ def test_an_absent_ceiling_reads_as_unknown_not_as_a_zero_ceiling(runs_db):
     """A 0.0 default would make ANY spend at all — even zero — compute as
     at/over ceiling with negative headroom, which renders identically to a real
     breach on the one column a reader is meant to treat as an alarm."""
-    _invocation(
-        runs_db, model=FABLE, role='merger', task_id='a', cost_usd=6.08,
+    runs_db.seed_invocation(
+        model=FABLE, role='merger', task_id='a', cost_usd=6.08,
         started_at=_at(hours=1), completed_at=_at(hours=1),
     )
 
@@ -807,8 +614,8 @@ def test_an_absent_ceiling_reads_as_unknown_not_as_a_zero_ceiling(runs_db):
     [(150.0, True), (149.99, False)],
 )
 def test_the_ceiling_flag_is_at_or_above_not_strictly_above(runs_db, cost_usd, expected):
-    _invocation(
-        runs_db, model=FABLE, role='merger', task_id='a', cost_usd=cost_usd,
+    runs_db.seed_invocation(
+        model=FABLE, role='merger', task_id='a', cost_usd=cost_usd,
         started_at=_at(hours=1), completed_at=_at(hours=1),
     )
 
@@ -819,16 +626,16 @@ def test_the_ceiling_flag_is_at_or_above_not_strictly_above(runs_db, cost_usd, e
 
 
 def test_observed_roles_within_the_allowlist_leave_unexpected_empty(runs_db):
-    _invocation(
-        runs_db, model=FABLE, role='merger', task_id='a', cost_usd=6.08,
+    runs_db.seed_invocation(
+        model=FABLE, role='merger', task_id='a', cost_usd=6.08,
         started_at=_at(hours=1), completed_at=_at(hours=1),
     )
-    _invocation(
-        runs_db, model=FABLE, role='steward', task_id='b', cost_usd=1.93,
+    runs_db.seed_invocation(
+        model=FABLE, role='steward', task_id='b', cost_usd=1.93,
         started_at=_at(hours=2), completed_at=_at(hours=2),
     )
-    _invocation(
-        runs_db, model=FABLE, role='steward', task_id='c', cost_usd=1.93,
+    runs_db.seed_invocation(
+        model=FABLE, role='steward', task_id='c', cost_usd=1.93,
         started_at=_at(hours=3), completed_at=_at(hours=3),
     )
 
@@ -848,8 +655,8 @@ def test_a_role_outside_the_allowlist_is_named_in_unexpected_roles(runs_db):
     "DELIBERATE DEVIATION from P4-06's 'ladder top = fable'" comment — the one
     guarding routing.ladder — exists to prevent: the ladder was left unchanged
     so a "+1" retry-tier-up cannot route an implementer to Fable."""
-    _invocation(
-        runs_db, model=FABLE, role='implementer', task_id='a', cost_usd=4.0,
+    runs_db.seed_invocation(
+        model=FABLE, role='implementer', task_id='a', cost_usd=4.0,
         started_at=_at(hours=1), completed_at=_at(hours=1),
     )
 
@@ -863,8 +670,8 @@ def test_a_role_outside_the_allowlist_is_named_in_unexpected_roles(runs_db):
 def test_an_expected_role_with_no_runs_is_a_visible_zero_not_a_missing_line(runs_db):
     """"The merger never ran on Fable at all" is the loudest possible check-6
     finding, and an omitted row would render it as silence."""
-    _invocation(
-        runs_db, model=FABLE, role='steward', task_id='b', cost_usd=1.93,
+    runs_db.seed_invocation(
+        model=FABLE, role='steward', task_id='b', cost_usd=1.93,
         started_at=_at(hours=2), completed_at=_at(hours=2),
     )
 
@@ -887,28 +694,28 @@ def live_shaped_db(runs_db):
     One config-layer Fable merger dispatch that ran 45 turns and resolved a
     merge, and one policy-rule Fable steward dispatch at routing tier 1.
     """
-    _event(
-        runs_db, _at(hours=2), 'routing_decision', task_id='4377', role='merger',
+    runs_db.seed_event(
+        _at(hours=2), 'routing_decision', task_id='4377', role='merger',
         data=_routing_payload(role='merger', model=FABLE),
     )
-    _event(
-        runs_db, _at(days=1), 'routing_decision', task_id='4211', role='steward',
+    runs_db.seed_event(
+        _at(days=1), 'routing_decision', task_id='4211', role='steward',
         data=_routing_payload(
             role='steward', model=FABLE, source_layer='policy_rule',
             rule_id='steward-retry-fable', routing_tier=1,
         ),
     )
     _fable_merger_run(runs_db, task_id='4377')
-    _event(
-        runs_db, _at(hours=2, minutes=30), 'merge_finalized', task_id='4377',
+    runs_db.seed_event(
+        _at(hours=2, minutes=30), 'merge_finalized', task_id='4377',
         data=_merge_finalized_payload(branch='4377', state='done', merge_sha='d411f107'),
     )
-    _invocation(
-        runs_db, model=FABLE, role='steward', task_id='4211', cost_usd=3.86,
+    runs_db.seed_invocation(
+        model=FABLE, role='steward', task_id='4211', cost_usd=3.86,
         duration_ms=90_000, started_at=_at(hours=19), completed_at=_at(hours=20),
     )
-    _event(
-        runs_db, _at(hours=3), 'service_restart', task_id='4319',
+    runs_db.seed_event(
+        _at(hours=3), 'service_restart', task_id='4319',
         data={'service': 'orchestrator', 'reason': 'fleet_redeploy'},
     )
     return runs_db
@@ -954,6 +761,9 @@ def test_render_json_round_trips_to_one_key_per_section(live_shaped_db):
     }
     assert payload['meta']['model'] == FABLE
     assert payload['invocations'][0]['turns'] == 45
+    assert {'subtype', 'escalation_id', 'routing_tier', 'dispatch_max_turns'} <= set(
+        payload['invocations'][0]
+    )
 
 
 def _tier_section(result):
@@ -968,14 +778,14 @@ def test_a_tier_escalation_that_never_happened_does_not_render_as_one(runs_db):
     is seeded: audit() is a pure read, so ordering the seeding is what keeps the
     two cases independent without needing two databases.
     """
-    _event(
-        runs_db, _at(hours=2), 'routing_decision', task_id='4377', role='merger',
+    runs_db.seed_event(
+        _at(hours=2), 'routing_decision', task_id='4377', role='merger',
         data=_routing_payload(role='merger', model=FABLE),
     )
     never = _audit(runs_db)
 
-    _event(
-        runs_db, _at(days=1), 'routing_decision', task_id='4211', role='steward',
+    runs_db.seed_event(
+        _at(days=1), 'routing_decision', task_id='4211', role='steward',
         data=_routing_payload(
             role='steward', model=FABLE, source_layer='policy_rule',
             rule_id='steward-retry-fable', routing_tier=1,
@@ -1057,7 +867,7 @@ def test_a_naive_since_is_read_as_utc_not_as_host_local_time(host_tz_is_not_utc)
     """The store is UTC throughout and these values are used directly as SQL
     comparands, so shifting a hand-typed bound by the host's offset would move
     the whole window silently."""
-    parsed = audit_model_admission._parse_moment('2026-09-12T06:43:16')
+    parsed = audit_model_admission.parse_moment('2026-09-12T06:43:16')
 
     assert parsed.isoformat() == '2026-09-12T06:43:16+00:00'
     assert parsed == APPLY
@@ -1066,7 +876,7 @@ def test_a_naive_since_is_read_as_utc_not_as_host_local_time(host_tz_is_not_utc)
 def test_an_offset_bearing_since_is_converted_to_the_same_utc_instant():
     """The apply commit is stamped +01:00; the report's --since is its UTC
     equivalent, and both spellings must resolve to one instant."""
-    parsed = audit_model_admission._parse_moment('2026-09-12T07:43:16+01:00')
+    parsed = audit_model_admission.parse_moment('2026-09-12T07:43:16+01:00')
 
     assert parsed.isoformat() == '2026-09-12T06:43:16+00:00'
     assert parsed.utcoffset() == timedelta(0)
@@ -1075,7 +885,7 @@ def test_an_offset_bearing_since_is_converted_to_the_same_utc_instant():
 @pytest.mark.parametrize('spec', ['yesterday', '2026-13-01T00:00:00', ''])
 def test_a_junk_since_is_rejected_by_the_argument_parser(spec):
     with pytest.raises(argparse.ArgumentTypeError):
-        audit_model_admission._parse_moment(spec)
+        audit_model_admission.parse_moment(spec)
 
 
 @pytest.mark.parametrize(
@@ -1126,7 +936,7 @@ def test_main_leaves_the_store_byte_for_byte_unchanged(runs_db_path, live_shaped
 
 
 def test_the_connection_factory_refuses_a_write(runs_db_path):
-    conn = audit_model_admission._connect_ro(runs_db_path)
+    conn = audit_model_admission.connect_ro(runs_db_path)
     try:
         with pytest.raises(sqlite3.OperationalError):
             conn.execute(
@@ -1134,3 +944,344 @@ def test_the_connection_factory_refuses_a_write(runs_db_path):
             )
     finally:
         conn.close()
+
+
+# --- until: every scan's HALF-OPEN upper bound, for a reproducible re-run ---
+
+UNTIL = APPLY + timedelta(hours=12)
+
+
+def test_routing_decisions_at_or_after_until_are_excluded_from_both_halves(runs_db):
+    for hours, task_id in ((11, '4600'), (12, '4601'), (13, '4602')):
+        runs_db.seed_event(
+            _at(hours=hours), 'routing_decision', task_id=task_id, role='merger',
+            data=_routing_payload(role='merger', model=FABLE),
+        )
+        runs_db.seed_event(
+            _at(hours=hours), 'routing_decision', task_id=task_id, role='implementer',
+            data=_routing_payload(
+                role='implementer', model='opus', rejected=['config:model-not-in-allowlist'],
+            ),
+        )
+
+    bounded = audit_model_admission.scan_routing_decisions(
+        runs_db, model=FABLE, since=APPLY, until=UNTIL,
+    )
+    open_ended = audit_model_admission.scan_routing_decisions(
+        runs_db, model=FABLE, since=APPLY, until=None,
+    )
+
+    assert [s.task_id for s in bounded.selections] == ['4600']
+    assert [r.task_id for r in bounded.rejections] == ['4600']
+    assert [s.task_id for s in open_ended.selections] == ['4600', '4601', '4602']
+    assert [r.task_id for r in open_ended.rejections] == ['4600', '4601', '4602']
+
+
+def test_a_run_completed_at_or_after_until_is_excluded(runs_db):
+    for hours, task_id in ((11, 'a'), (12, 'b'), (13, 'c')):
+        runs_db.seed_invocation(
+            model=FABLE, role='merger', task_id=task_id,
+            started_at=_at(hours=hours - 1), completed_at=_at(hours=hours),
+        )
+
+    rows = audit_model_admission.scan_invocations(
+        runs_db, model=FABLE, since=APPLY, until=UNTIL,
+    )
+
+    assert [r.task_id for r in rows] == ['a']
+
+
+def test_a_merge_finalized_at_or_after_until_is_not_attributed(runs_db):
+    """A re-run on a later day must reproduce the same table: the merge that
+    lands after the window closes is not this window's outcome."""
+    _fable_merger_run(runs_db, task_id='4377')  # completes at +2h02
+    runs_db.seed_event(
+        _at(hours=12), 'merge_finalized', task_id='4377',
+        data=_merge_finalized_payload(branch='4377', state='done', merge_sha='d411f107'),
+    )
+
+    bounded = audit_model_admission.scan_invocations(
+        runs_db, model=FABLE, since=APPLY, until=UNTIL,
+    )
+    open_ended = audit_model_admission.scan_invocations(runs_db, model=FABLE, since=APPLY)
+
+    assert bounded[0].merge_outcome is None
+    assert open_ended[0].merge_outcome is not None
+    assert open_ended[0].merge_outcome.state == 'done'
+
+
+def test_cap_hits_and_restarts_at_or_after_until_are_excluded(runs_db):
+    for hours, account in ((11, 'max-b'), (12, 'max-c')):
+        runs_db.seed_account_event(
+            account_name=account, event_type='cap_hit', created_at=_at(hours=hours),
+            details={'reason': 'limit', 'scope': FABLE},
+        )
+        runs_db.seed_account_event(
+            account_name=account, event_type='cap_hit', created_at=_at(hours=hours),
+            details={'reason': 'limit'},
+        )
+    runs_db.seed_event(
+        _at(hours=11), 'service_restart',
+        data={'service': 'orchestrator', 'reason': 'fleet_redeploy'},
+    )
+    runs_db.seed_event(
+        _at(hours=12), 'service_restart',
+        data={'service': 'dashboard', 'reason': 'post_merge_dashboard_code_change'},
+    )
+
+    scan = audit_model_admission.scan_scoped_cap(runs_db, model=FABLE, since=APPLY, until=UNTIL)
+
+    assert [h.account_name for h in scan.scoped_hits] == ['max-b']
+    assert scan.unscoped_cap_hit_count == 1
+    assert [r.service for r in scan.restarts] == ['orchestrator']
+
+
+def test_roles_on_model_does_not_count_runs_completed_at_or_after_until(runs_db):
+    for hours, role in ((11, 'merger'), (12, 'steward'), (13, 'implementer')):
+        runs_db.seed_invocation(
+            model=FABLE, role=role, task_id=role, cost_usd=1.0,
+            started_at=_at(hours=hours - 1), completed_at=_at(hours=hours),
+        )
+
+    containment = audit_model_admission.roles_on_model(
+        runs_db, model=FABLE, since=APPLY, until=UNTIL, expected_roles=('merger', 'steward'),
+    )
+
+    assert [(r.role, r.count) for r in containment.by_role] == [('merger', 1), ('steward', 0)]
+    assert containment.unexpected_roles == ()
+
+
+def test_audit_threads_until_into_every_scan(live_shaped_db):
+    """live_shaped_db's steward decision (+1d) and run (+20h) both fall after
+    a +10h bound; its merger decision, run and restart all fall before it."""
+    until = APPLY + timedelta(hours=10)
+    live_shaped_db.seed_account_event(
+        account_name='max-e', event_type='cap_hit', created_at=_at(hours=11),
+        details={'reason': 'limit', 'scope': FABLE},
+    )
+
+    result = _audit(live_shaped_db, until=until)
+
+    assert result.until == until.isoformat()
+    assert [s.role for s in result.routing.selections] == ['merger']
+    assert [r.role for r in result.invocations] == ['merger']
+    assert result.scoped_cap.scoped_hits == ()
+    assert [r.service for r in result.scoped_cap.restarts] == ['orchestrator']
+    assert [(u.role, u.count) for u in result.containment.by_role] == [
+        ('merger', 1), ('steward', 0),
+    ]
+    assert f'until {until.isoformat()}' in audit_model_admission.render_markdown(result)
+
+
+def test_main_until_ends_the_spend_window_and_is_carried_in_meta(
+    runs_db_path, live_shaped_db, capsys
+):
+    until = APPLY + timedelta(hours=10)
+
+    audit_model_admission.main([
+        '--model', FABLE, '--expect-roles', 'merger,steward',
+        '--since', APPLY.isoformat(), '--until', until.isoformat(), '--window', '24h',
+        '--runs-db', str(runs_db_path), '--format', 'json',
+    ])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['meta']['until'] == until.isoformat()
+    assert payload['spend']['window_end'] == until.isoformat()
+    assert payload['spend']['window_start'] == (until - timedelta(hours=24)).isoformat()
+    assert [r['role'] for r in payload['invocations']] == ['merger']
+
+
+def test_main_without_until_still_ends_the_spend_window_now(
+    runs_db_path, live_shaped_db, capsys
+):
+    audit_model_admission.main([
+        '--model', FABLE, '--expect-roles', 'merger,steward',
+        '--since', APPLY.isoformat(), '--window', '24h',
+        '--runs-db', str(runs_db_path), '--format', 'json',
+    ])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['meta']['until'] is None
+    latest_seeded = APPLY + timedelta(days=1)  # the steward routing decision
+    assert datetime.fromisoformat(payload['spend']['window_end']) >= latest_seeded
+
+
+# --- InvocationRecord: kill subtype, linked escalation, dispatch tier and cap ---
+
+
+def _run_with_end(conn, *, role, task_id, started_at, completed_at, end=None, model=FABLE):
+    """Seed one run plus its invocation_end; *end* overrides payload keys."""
+    conn.seed_invocation(
+        model=model, role=role, task_id=task_id,
+        started_at=started_at, completed_at=completed_at,
+    )
+    conn.seed_event(
+        completed_at, 'invocation_end', task_id=task_id, role=role,
+        data={**_invocation_end_payload(turns=12, model=model), **(end or {})},
+    )
+
+
+def _decision(conn, timestamp, *, task_id, role, routing_tier=0, max_turns=100, model=FABLE):
+    conn.seed_event(
+        timestamp, 'routing_decision', task_id=task_id, role=role,
+        data=_routing_payload(
+            role=role, model=model, routing_tier=routing_tier, max_turns=max_turns,
+        ),
+    )
+
+
+def _only_run(conn, **kwargs):
+    rows = audit_model_admission.scan_invocations(conn, model=FABLE, since=APPLY, **kwargs)
+    assert len(rows) == 1
+    return rows[0]
+
+
+def test_a_turn_cap_kill_reports_the_end_events_subtype(runs_db):
+    _run_with_end(
+        runs_db, role='merger', task_id='4377',
+        started_at=_at(hours=2), completed_at=_at(hours=3),
+        end={'success': False, 'subtype': 'error_max_turns'},
+    )
+
+    run = _only_run(runs_db)
+
+    assert run.subtype == 'error_max_turns'
+    assert run.escalation_id is None  # a merger's end event names no escalation
+
+
+def test_a_steward_run_reports_the_escalation_its_end_event_names(runs_db):
+    _run_with_end(
+        runs_db, role='steward', task_id='4377',
+        started_at=_at(hours=2), completed_at=_at(hours=3),
+        end={'escalation_id': 'esc-4377-10'},
+    )
+
+    assert _only_run(runs_db).escalation_id == 'esc-4377-10'
+
+
+def test_a_run_with_no_end_event_and_no_decision_reports_none_for_all_four(runs_db):
+    runs_db.seed_invocation(
+        model=FABLE, role='steward', task_id='4377',
+        started_at=_at(hours=2), completed_at=_at(hours=3),
+    )
+
+    run = _only_run(runs_db)
+
+    assert (run.subtype, run.escalation_id, run.routing_tier, run.dispatch_max_turns) == (
+        None, None, None, None,
+    )
+
+
+def test_a_steward_run_takes_tier_and_cap_from_its_last_decision_before_dispatch(runs_db):
+    """The steward's decision is recorded BEFORE dispatch
+    (routing_dispatch.py::resolve_and_record_route), so the last one at or
+    before started_at is the run's own."""
+    _decision(runs_db, _at(hours=1), task_id='4377', role='steward', routing_tier=0,
+              max_turns=50)
+    _decision(runs_db, _at(hours=2), task_id='4377', role='steward', routing_tier=1,
+              max_turns=80)
+    _run_with_end(
+        runs_db, role='steward', task_id='4377',
+        started_at=_at(hours=2, milliseconds=10), completed_at=_at(hours=3),
+    )
+
+    run = _only_run(runs_db)
+
+    assert (run.routing_tier, run.dispatch_max_turns) == (1, 80)
+
+
+@pytest.mark.parametrize(
+    ('offset', 'role'),
+    [
+        ({'hours': 2, 'seconds': 5}, 'steward'),  # stamped after the run started
+        ({'hours': 1}, 'merger'),                  # same task, another role
+    ],
+)
+def test_a_decision_that_is_not_the_steward_runs_own_is_not_used(runs_db, offset, role):
+    _decision(runs_db, _at(**offset), task_id='4377', role=role, routing_tier=1)
+    _run_with_end(
+        runs_db, role='steward', task_id='4377',
+        started_at=_at(hours=2), completed_at=_at(hours=3),
+    )
+
+    run = _only_run(runs_db)
+
+    assert (run.routing_tier, run.dispatch_max_turns) == (None, None)
+
+
+def test_a_run_just_inside_since_finds_its_decision_stamped_before_since(runs_db):
+    """The decision load is bounded by the matched runs, never by *since*."""
+    _decision(runs_db, _at(seconds=-2), task_id='4377', role='steward', routing_tier=2,
+              max_turns=100)
+    _run_with_end(
+        runs_db, role='steward', task_id='4377',
+        started_at=_at(seconds=-1), completed_at=_at(minutes=3),
+    )
+
+    run = _only_run(runs_db)
+
+    assert (run.routing_tier, run.dispatch_max_turns) == (2, 100)
+
+
+def test_a_merger_run_takes_its_decision_recorded_just_after_completion(runs_db):
+    """The merger's decision is recorded AFTER the run completes
+    (workflow.py::TaskWorkflow._invoke emits it after invocation_end).
+    The last decision before its start belongs to the PREVIOUS merger run
+    on the task — here an opus run at the pre-D4 cap of 50."""
+    _decision(runs_db, _at(hours=1), task_id='4259', role='merger', model='opus',
+              routing_tier=0, max_turns=50)
+    _run_with_end(
+        runs_db, role='merger', task_id='4259',
+        started_at=_at(hours=2), completed_at=_at(hours=2, minutes=13),
+    )
+    _decision(runs_db, _at(hours=2, minutes=13, milliseconds=10), task_id='4259',
+              role='merger', routing_tier=1, max_turns=100)
+
+    run = _only_run(runs_db)
+
+    assert (run.routing_tier, run.dispatch_max_turns) == (1, 100)
+
+
+def test_a_merger_run_without_its_own_decision_does_not_borrow_an_earlier_one(runs_db):
+    _decision(runs_db, _at(hours=1), task_id='4259', role='merger', model='opus',
+              max_turns=50)
+    _run_with_end(
+        runs_db, role='merger', task_id='4259',
+        started_at=_at(hours=2), completed_at=_at(hours=2, minutes=13),
+    )
+
+    run = _only_run(runs_db)
+
+    assert (run.routing_tier, run.dispatch_max_turns) == (None, None)
+
+
+def test_a_merger_decision_recorded_just_after_until_is_still_joined(runs_db):
+    """Like invocation_end, the post-completion decision is the run's OWN
+    record, so bounding its load by *until* would drop it."""
+    completed = UNTIL - timedelta(milliseconds=5)
+    _run_with_end(
+        runs_db, role='merger', task_id='4259',
+        started_at=_at(hours=11), completed_at=completed.isoformat(),
+    )
+    _decision(runs_db, (completed + timedelta(milliseconds=15)).isoformat(),
+              task_id='4259', role='merger', max_turns=100)
+
+    run = _only_run(runs_db, until=UNTIL)
+
+    assert run.dispatch_max_turns == 100
+
+
+def test_the_invocations_section_renders_tier_and_subtype(runs_db):
+    _run_with_end(
+        runs_db, role='merger', task_id='4377',
+        started_at=_at(hours=2), completed_at=_at(hours=3),
+        end={'success': False, 'subtype': 'error_max_turns'},
+    )
+    _decision(runs_db, _at(hours=3, milliseconds=10), task_id='4377', role='merger',
+              routing_tier=1)
+
+    body = audit_model_admission.render_markdown(_audit(runs_db))
+
+    section = body.split('### 2.')[1].split('### 3.')[0]
+    assert '| tier | subtype |' in section
+    assert '| 1 | error_max_turns |' in section

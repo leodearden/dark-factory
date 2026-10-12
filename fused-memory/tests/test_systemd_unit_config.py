@@ -150,3 +150,104 @@ class TestWatchdogSecContract:
             "out-of-band by the operator.\n"
             f"Current [Service] directives: {service_directives}"
         )
+
+
+# ---------------------------------------------------------------------------
+# PATH contract — task 4448
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("unit_path,label", [
+    (
+        Path(__file__).resolve().parent.parent / "fused-memory.service.example-systemd-config",
+        "fused-memory.service.example-systemd-config",
+    ),
+    (
+        Path(__file__).resolve().parent.parent.parent / "scripts" / "fused-memory.service.template",
+        "scripts/fused-memory.service.template",
+    ),
+])
+class TestServicePathPinned:
+    """Guard that Environment=PATH= is pinned in both committed unit files.
+
+    THE INCIDENT (2026-08-13→08-18). The unit set no PATH, so it inherited
+    whatever PATH the systemd user manager happened to hold at the time it was
+    started. On an instance whose manager env lacked ``~/.local/bin``, the
+    ``claude`` CLI did not resolve, every curator LLM call raised
+    FileNotFoundError, and the fleet-wide task-dedupe function was down for
+    >=80h with no signal — only a WARNING in a journal that rolls in ~5 days.
+
+    Pinning PATH here is the belt to the braces of resolving argv[0] explicitly
+    (shared.cli_invoke::resolve_claude_binary): with both in place, the failure
+    needs the binary to be genuinely absent rather than merely unreachable.
+
+    Section-aware parse prevents a commented/misplaced line from false-greening.
+    """
+
+    EXPECTED_PREFIX = "Environment=PATH="
+    EXPECTED_ENTRY = "%h/.local/bin"
+
+    def test_path_pinned_in_service_section(self, unit_path: Path, label: str) -> None:
+        """[Service] must pin PATH, and that PATH must carry %h/.local/bin."""
+        sections = _parse_systemd_unit(unit_path)
+        assert "Service" in sections, f"[Service] section not found in {label}"
+        service_directives = sections["Service"]
+        path_lines = [d for d in service_directives if d.startswith(self.EXPECTED_PREFIX)]
+        assert path_lines, (
+            f"No '{self.EXPECTED_PREFIX}' directive found in the [Service] section "
+            f"of {label}. Without it the unit inherits the systemd user manager's "
+            "PATH, which is how the curator lost the `claude` binary for >=80h on "
+            "2026-08-13→08-18.\n"
+            f"Current [Service] directives: {service_directives}"
+        )
+        assert any(self.EXPECTED_ENTRY in line for line in path_lines), (
+            f"The pinned PATH in {label} does not contain '{self.EXPECTED_ENTRY}', "
+            "which is where the claude CLI installs. Use the %h specifier rather "
+            "than a hardcoded home directory so the template stays host-portable "
+            "and byte-identical to the rendered unit.\n"
+            f"Found: {path_lines}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Socket activation — the port survives service restarts
+# ---------------------------------------------------------------------------
+
+_FM_DIR = Path(__file__).resolve().parent.parent
+_SOCKET_UNIT = _FM_DIR.parent / "scripts" / "fused-memory.socket.template"
+_SERVICE_UNITS = [
+    _FM_DIR / "fused-memory.service.example-systemd-config",
+    _FM_DIR.parent / "scripts" / "fused-memory.service.template",
+]
+
+
+class TestSocketActivation:
+    """fused-memory.socket must hold exactly the port the server is configured for,
+    and every committed service unit must depend on it."""
+
+    def test_socket_listens_on_the_configured_endpoints(self, monkeypatch) -> None:
+        from fused_memory.config.schema import FusedMemoryConfig
+
+        monkeypatch.setenv("CONFIG_PATH", str(_FM_DIR / "config" / "config.yaml"))
+        monkeypatch.delenv("RECON_ESCALATION_PORT", raising=False)
+        config = FusedMemoryConfig()
+        recon = config.reconciliation
+        assert _parse_systemd_unit(_SOCKET_UNIT)["Socket"] == [
+            f"ListenStream={config.server.host}:{config.server.port}",
+            f"ListenStream={recon.escalation_host}:{recon.escalation_port}",
+        ]
+
+    @pytest.mark.parametrize("unit_path", _SERVICE_UNITS, ids=lambda p: p.name)
+    def test_service_wants_and_orders_after_the_socket(self, unit_path: Path) -> None:
+        sections = _parse_systemd_unit(unit_path)
+        unit = sections["Unit"]
+        assert "Wants=fused-memory.socket" in unit
+        after = [d for d in unit if d.startswith("After=")]
+        assert any("fused-memory.socket" in d.split("=", 1)[1].split() for d in after)
+        assert "Also=fused-memory.socket" in sections["Install"]
+
+    @pytest.mark.parametrize("unit_path", _SERVICE_UNITS, ids=lambda p: p.name)
+    def test_a_deliberate_stop_also_stops_the_socket(self, unit_path: Path) -> None:
+        service = _parse_systemd_unit(unit_path)["Service"]
+        hooks = [d for d in service if d.startswith("ExecStopPost=")]
+        assert len(hooks) == 1
+        assert hooks[0].endswith("/scripts/stop-socket-unless-restarting.sh %n")

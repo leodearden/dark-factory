@@ -2,7 +2,7 @@
 //
 // Rendered by scripts/gen_dashboard_task_vocab.py from the Python vocabulary:
 // shared/src/shared/task_statuses.py (members) and
-// dashboard/src/dashboard/data/census.py (views, tones).
+// dashboard/src/dashboard/data/census.py (views, tones, series keys).
 //
 // Regenerate with:
 //   python3 scripts/gen_dashboard_task_vocab.py \
@@ -51,10 +51,21 @@ const TASK_VOCAB_API = {
     "blocked": "bad",
     "deferred": "fg3",
     "review": "info",
-    "merge-deferred": "warn",
+    "merge-deferred": "accent2",
     "infra-hold": "stranded",
     "done": "ok",
-    "cancelled": "fg3"
+    "cancelled": "fg2"
+  },
+  "SERIES_KEYS": {
+    "pending": "pending",
+    "in-progress": "in_progress",
+    "blocked": "blocked",
+    "deferred": "deferred",
+    "review": "review",
+    "merge-deferred": "merge_deferred",
+    "infra-hold": "infra_hold",
+    "done": "done",
+    "cancelled": "cancelled"
   }
 };
 

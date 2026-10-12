@@ -55,7 +55,6 @@ NOTHING here writes to, or asserts the content of, the real
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -69,6 +68,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # docstring exists to prevent.
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
+
+from nested_pytest_session import binding_conftest, run_nested_pytest  # noqa: E402
 
 import df_pytest_isolation  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
@@ -712,11 +713,6 @@ class TestBothFixturesAreLiveInThisRun:
 # defect under guard.
 # ---------------------------------------------------------------------------
 
-# Minimal ini so the nested run's rootdir is the tmp tree and NOT this repo:
-# without it pytest walks up looking for an inifile and would inherit this repo's
-# addopts (`--import-mode=importlib -m 'not smoke ...'`).
-_NESTED_INI = '[pytest]\n'
-
 # The name a leaked fixture heartbeat would carry. Built with the real builder,
 # so a change to SYNTHETIC_UNIT_PREFIX moves the nested harness with it.
 _NESTED_HEARTBEAT = f'{synthetic_unit("nested")}.json'
@@ -746,12 +742,7 @@ def _nested_conftest_source(*, preexisting: bool) -> str:
         if preexisting
         else ''
     )
-    return f"""\
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
+    return binding_conftest(_GUARD_NAME, setup=f"""\
 import df_pytest_isolation
 
 # Repoint the guard at THIS tmp tree before binding it. The fixture reads the
@@ -760,8 +751,7 @@ import df_pytest_isolation
 df_pytest_isolation.LIVE_FLEET_DIR = Path(__file__).resolve().parent / 'fleet'
 df_pytest_isolation.LIVE_FLEET_DIR.mkdir(parents=True, exist_ok=True)
 {seed}
-from df_pytest_isolation import {_GUARD_NAME}  # noqa: F401
-"""
+""")
 
 
 
@@ -802,15 +792,10 @@ def _nested_run(
         f"{'leaking' if leaks else 'clean'}"
         f"{'-seeded' if preexisting else ''}"
     )
-    root.mkdir()
-    shutil.copy2(Path(df_pytest_isolation.__file__), root / 'df_pytest_isolation.py')
-    (root / 'pytest.ini').write_text(_NESTED_INI)
-    (root / 'conftest.py').write_text(_nested_conftest_source(preexisting=preexisting))
-    (root / 'test_forgetful.py').write_text(_nested_test_source(leaks=leaks))
-    return subprocess.run(
-        [sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', str(root)],
-        cwd=root, capture_output=True, text=True, timeout=300,
-    )
+    return run_nested_pytest(root, {
+        'conftest.py': _nested_conftest_source(preexisting=preexisting),
+        'test_forgetful.py': _nested_test_source(leaks=leaks),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -887,21 +872,19 @@ def _nested_adoption_run(root: Path) -> subprocess.CompletedProcess[str]:
     comparing the two roots' recorded paths discriminates either way; it is
     here because it costs one file and reproduces the original report exactly.
     """
-    for sub in ('root_a', 'root_b'):
-        (root / sub).mkdir(parents=True)
-        (root / sub / 'conftest.py').write_text(_ADOPTION_CONFTEST)
-    shutil.copy2(Path(df_pytest_isolation.__file__), root / 'df_pytest_isolation.py')
-    (root / 'pytest.ini').write_text(_NESTED_INI)
-    (root / 'root_a' / 'test_a_first.py').write_text(_adoption_test_source('a-first'))
-    (root / 'root_b' / 'test_b_only.py').write_text(_adoption_test_source('b-only'))
-    (root / 'root_a' / 'test_a_second.py').write_text(_adoption_test_source('a-second'))
-    return subprocess.run(
-        [
-            sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider',
+    return run_nested_pytest(
+        root,
+        {
+            'root_a/conftest.py': _ADOPTION_CONFTEST,
+            'root_b/conftest.py': _ADOPTION_CONFTEST,
+            'root_a/test_a_first.py': _adoption_test_source('a-first'),
+            'root_b/test_b_only.py': _adoption_test_source('b-only'),
+            'root_a/test_a_second.py': _adoption_test_source('a-second'),
+        },
+        targets=(
             'root_a/test_a_first.py', 'root_b/test_b_only.py',
             'root_a/test_a_second.py',
-        ],
-        cwd=root, capture_output=True, text=True, timeout=300,
+        ),
     )
 
 

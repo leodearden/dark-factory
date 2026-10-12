@@ -809,13 +809,19 @@ class TestEscapeLatchKey:
 
 
 @contextlib.contextmanager
-def _probe_unmeasurable(times: int | None):
+def _probe_unmeasurable(times: int | None, hold_first: threading.Event | None = None):
     """Make the probe report UNMEASURABLE for the first *times* calls.
 
     *times* ``None`` means every call.  After the quota the patch DELEGATES to
     the live helper — the same delegate-don't-replace shape as ``probe_spy`` —
     so the record the assertions read afterwards is a genuine measurement of
     the real geometry, not a fixture's idea of one.
+
+    *hold_first*, when given, parks the FIRST call on its worker thread until
+    the event is set.  That lets a test keep one probe provably in flight while
+    it drives other legs, instead of relying on how the event loop happens to
+    interleave ``asyncio.gather`` with ``asyncio.to_thread`` (which differs
+    between CPython patch releases).
 
     Stands in for the probe's three real None paths: ruff momentarily
     unavailable, the probe subprocess timing out, or its output no longer
@@ -826,6 +832,8 @@ def _probe_unmeasurable(times: int | None):
 
     def flaky(worktree, target=None):
         calls.append(Path(worktree))
+        if hold_first is not None and len(calls) == 1:
+            hold_first.wait(timeout=30)
         if times is None or len(calls) <= times:
             return None
         return real(worktree, target)
@@ -989,14 +997,25 @@ class TestLatchDedupesUnderCONCURRENTLintLegs:
         parent, worktree, _target = geometry
         _write_project(worktree, 'wtproj', declares_ruff=False)
 
+        release_first_probe = threading.Event()
         with (
             caplog.at_level(logging.DEBUG, logger='orchestrator.verify'),
             # One unmeasurable round of 3, then the live helper answers.
-            _probe_unmeasurable(1) as calls,
+            _probe_unmeasurable(1, hold_first=release_first_probe) as calls,
         ):
-            await asyncio.gather(*(
-                verify._report_ruff_config_escape(worktree) for _ in range(3)
-            ))
+            # Force the interleaving the round exists for: two legs reach the
+            # latch while the first leg's probe is provably still in flight.
+            winner = asyncio.create_task(verify._report_ruff_config_escape(worktree))
+            try:
+                async with asyncio.timeout(30):
+                    while not calls:
+                        await asyncio.sleep(0.001)
+                await asyncio.gather(*(
+                    verify._report_ruff_config_escape(worktree) for _ in range(2)
+                ))
+            finally:
+                release_first_probe.set()
+            await winner
             assert _escape_records(caplog) == [], 'reported without measuring'
             assert len(calls) == 1, f'the reservation did not hold: {calls}'
 

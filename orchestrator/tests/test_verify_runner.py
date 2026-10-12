@@ -3,6 +3,8 @@
 import asyncio
 import dataclasses
 import json
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1793,7 +1795,6 @@ class TestDispatchStampsFlakeSuppressionRunner:
         from orchestrator import flake_recorder
         from orchestrator.verify_runner import VerifyRunnerPool
 
-        flake_recorder._merge_flake_suppression_streak = 0
         remote = self._runner(
             'remote-lab-1', is_local=False,
             result=self._result_with(_make_suppression(runner='local')),
@@ -1810,7 +1811,6 @@ class TestDispatchStampsFlakeSuppressionRunner:
         record.assert_not_called()
         # The pre-existing merge_verify telemetry is unaffected; nothing else is emitted.
         assert emitted == [EventType.merge_verify]
-        assert flake_recorder._merge_flake_suppression_streak == 0
 
 # ---------------------------------------------------------------------------
 # retry_scope_event_fields — merge_verify event honesty (task 2837, PRD D5)
@@ -2506,7 +2506,7 @@ class TestRunMergeVerifyOnWorktree:
             'host/gone': ModuleConfig(prefix='host/gone', test_command='STALE_HOST_TEST_2'),
         }
         caller_config._module_configs = host_modules
-        original_dict = caller_config._module_configs
+        original_dict = caller_config.module_configs_or_empty
         original_items = dict(host_modules)
 
         spec = MergeVerifySpec(
@@ -2527,15 +2527,15 @@ class TestRunMergeVerifyOnWorktree:
             run_scoped=run_scoped, run_unscoped=run_unscoped,
         )
 
-        assert caller_config._module_configs is original_dict, (
+        assert caller_config.module_configs_or_empty is original_dict, (
             'the caller\'s registry dict object must be untouched — the copy\'s '
             '_module_configs starts out as the SAME dict object, so an in-place '
             'mutation of the COPY reaches through that shared value and '
             'corrupts the caller\'s config'
         )
-        assert caller_config._module_configs == original_items, (
+        assert caller_config.module_configs_or_empty == original_items, (
             f'the caller\'s registry contents must be unchanged; got '
-            f'{set(caller_config._module_configs)!r}'
+            f'{set(caller_config.module_configs_or_empty)!r}'
         )
         # Sanity: the copy really did receive the spec's set, so the identity
         # assertion above is not passing vacuously against a no-op fix.
@@ -3164,8 +3164,8 @@ class TestRemoteRunnerHappyPath:
 class TestRemoteRunnerTransportVsTimeout:
     """Invariant 5: RunnerUnavailable ↔ transport failure only; VerifyResult returned for any verdict."""
 
-    def _make_runner(self, responses, *, raise_on=None):
-        """Build a RemoteRunner with a fake `run` that returns successive responses.
+    def _make_runner_and_calls(self, responses, *, raise_on=None):
+        """Return (runner, calls_list) where calls_list records each run() argv.
 
         ``responses`` is a list of (rc, stdout, stderr) tuples.
         ``raise_on`` is an optional exception to raise on the Nth call (0-indexed dict).
@@ -3189,17 +3189,16 @@ class TestRemoteRunnerTransportVsTimeout:
             run=fake_run,
             id_factory=lambda: 'req-id',
         )
-        runner._calls = calls
-        return runner
+        return runner, calls
 
     async def test_raises_runner_unavailable_on_push_failure(self):
         """git push rc!=0 → RunnerUnavailable; ssh is never called."""
         from orchestrator.verify_runner import RunnerUnavailable
-        runner = self._make_runner([(1, '', 'push error'), (0, '', '')])
+        runner, calls = self._make_runner_and_calls([(1, '', 'push error'), (0, '', '')])
         with pytest.raises(RunnerUnavailable):
             await runner.run_merge_verify('abc123', _make_spec())
         # ssh must NOT have been attempted
-        assert not any(a[0] == 'ssh' for a in runner._calls)
+        assert not any(a[0] == 'ssh' for a in calls)
 
     async def test_raises_runner_unavailable_on_ssh_nonzero(self):
         """ssh rc!=0 (e.g. 255 connection refused) → RunnerUnavailable.
@@ -3213,21 +3212,21 @@ class TestRemoteRunnerTransportVsTimeout:
         keepalive flags are actually present on every ssh site).
         """
         from orchestrator.verify_runner import RunnerUnavailable
-        runner = self._make_runner([(0, '', ''), (255, '', 'ssh: connect to host laptop.local port 22')])
+        runner, _ = self._make_runner_and_calls([(0, '', ''), (255, '', 'ssh: connect to host laptop.local port 22')])
         with pytest.raises(RunnerUnavailable):
             await runner.run_merge_verify('abc123', _make_spec())
 
     async def test_raises_runner_unavailable_on_empty_stdout(self):
         """ssh rc=0 but stdout is empty → RunnerUnavailable (unparseable)."""
         from orchestrator.verify_runner import RunnerUnavailable
-        runner = self._make_runner([(0, '', ''), (0, '', '')])
+        runner, _ = self._make_runner_and_calls([(0, '', ''), (0, '', '')])
         with pytest.raises(RunnerUnavailable):
             await runner.run_merge_verify('abc123', _make_spec())
 
     async def test_raises_runner_unavailable_on_non_json_stdout(self):
         """ssh rc=0 but stdout is non-JSON → RunnerUnavailable."""
         from orchestrator.verify_runner import RunnerUnavailable
-        runner = self._make_runner([(0, '', ''), (0, 'not valid json!!!', '')])
+        runner, _ = self._make_runner_and_calls([(0, '', ''), (0, 'not valid json!!!', '')])
         with pytest.raises(RunnerUnavailable):
             await runner.run_merge_verify('abc123', _make_spec())
 
@@ -3240,18 +3239,18 @@ class TestRemoteRunnerTransportVsTimeout:
         """
         from orchestrator.verify_runner import RunnerUnavailable
         # Valid JSON dict but unrecognised keys — triggers TypeError in result_from_json
-        runner = self._make_runner([(0, '', ''), (0, '{"unexpected": 1}', '')])
+        runner, _ = self._make_runner_and_calls([(0, '', ''), (0, '{"unexpected": 1}', '')])
         with pytest.raises(RunnerUnavailable):
             await runner.run_merge_verify('abc123', _make_spec())
         # JSON list — also a TypeError because ** unpacking requires a mapping
-        runner2 = self._make_runner([(0, '', ''), (0, '[1, 2, 3]', '')])
+        runner2, _ = self._make_runner_and_calls([(0, '', ''), (0, '[1, 2, 3]', '')])
         with pytest.raises(RunnerUnavailable):
             await runner2.run_merge_verify('abc123', _make_spec())
 
     async def test_raises_runner_unavailable_when_run_raises_oserror(self):
         """An OSError from the subprocess runner → RunnerUnavailable."""
         from orchestrator.verify_runner import RunnerUnavailable
-        runner = self._make_runner([], raise_on={0: FileNotFoundError('git not found')})
+        runner, _ = self._make_runner_and_calls([], raise_on={0: FileNotFoundError('git not found')})
         with pytest.raises(RunnerUnavailable):
             await runner.run_merge_verify('abc123', _make_spec())
 
@@ -3265,7 +3264,7 @@ class TestRemoteRunnerTransportVsTimeout:
             summary='timed out',
             timed_out=True,
         )
-        runner = self._make_runner([(0, '', ''), (0, result_to_json(timed_out_result), '')])
+        runner, _ = self._make_runner_and_calls([(0, '', ''), (0, result_to_json(timed_out_result), '')])
         result = await runner.run_merge_verify('abc123', _make_spec())
         assert result.timed_out is True
         assert result == timed_out_result
@@ -3280,7 +3279,7 @@ class TestRemoteRunnerTransportVsTimeout:
             summary='2 failures',
             category='test_failure',
         )
-        runner = self._make_runner([(0, '', ''), (0, result_to_json(fail_result), '')])
+        runner, _ = self._make_runner_and_calls([(0, '', ''), (0, result_to_json(fail_result), '')])
         result = await runner.run_merge_verify('abc123', _make_spec())
         assert result.passed is False
         assert result == fail_result
@@ -3296,10 +3295,9 @@ class TestRemoteRunnerRefCleanup:
     """The pushed ref is deleted best-effort on return (PRD open-Q4)."""
 
     def _make_tracking_runner(self, responses_by_argv_prefix):
-        """Build a RemoteRunner whose fake `run` logs all calls.
+        """Return (runner, calls_list) where calls_list records each run() argv.
 
         ``responses_by_argv_prefix`` maps an argv[0] to (rc, stdout, stderr).
-        The fake always records every call in `runner._calls`.
         """
         calls = []
 
@@ -3323,14 +3321,15 @@ class TestRemoteRunnerRefCleanup:
             run=fake_run,
             id_factory=lambda: 'cleanup-id',
         )
-        runner._calls = calls
-        return runner
+        return runner, calls
 
     async def test_delete_called_after_success(self):
         """After a successful run, the pushed ref is deleted via git push --delete."""
-        runner = self._make_tracking_runner({'git': (0, '', ''), 'ssh': (0, result_to_json(_make_pass_result()), '')})
+        runner, calls = self._make_tracking_runner(
+            {'git': (0, '', ''), 'ssh': (0, result_to_json(_make_pass_result()), '')}
+        )
         await runner.run_merge_verify('abc123', _make_spec())
-        delete_calls = [c for c in runner._calls if c[:2] == ['git', 'push'] and '--delete' in c]
+        delete_calls = [c for c in calls if c[:2] == ['git', 'push'] and '--delete' in c]
         assert len(delete_calls) == 1
         assert 'refs/merge-verify/cleanup-id' in delete_calls[0]
 
@@ -3338,8 +3337,10 @@ class TestRemoteRunnerRefCleanup:
         """When ssh fails (→ RunnerUnavailable), the ref is still deleted (cleanup in finally)."""
         from orchestrator.verify_runner import RunnerUnavailable
 
+        calls = []
+
         async def fake_run(argv, *, cwd=None):
-            runner._calls.append(argv[:])
+            calls.append(argv[:])
             if argv[:2] == ['git', 'push'] and '--delete' in argv:
                 return (0, '', '')
             if argv[0] == 'git':
@@ -3354,10 +3355,9 @@ class TestRemoteRunnerRefCleanup:
             run=fake_run,
             id_factory=lambda: 'cleanup-id',
         )
-        runner._calls = []
         with pytest.raises(RunnerUnavailable):
             await runner.run_merge_verify('abc123', _make_spec())
-        delete_calls = [c for c in runner._calls if c[:2] == ['git', 'push'] and '--delete' in c]
+        delete_calls = [c for c in calls if c[:2] == ['git', 'push'] and '--delete' in c]
         assert len(delete_calls) == 1
 
     async def test_no_delete_when_push_failed(self):
@@ -5575,15 +5575,8 @@ class TestRemoteRunnerRequestId:
         rid_idx = parsed.index('--request-id')
         assert rid_idx > cfg_idx, '--request-id must come after --config'
 
-    async def test_inflight_request_id_cleared_after_return(self):
-        """_inflight_request_id is None after run_merge_verify returns."""
-        runner, _ = self._make_runner_and_calls()
-        assert runner._inflight_request_id is None
-        await runner.run_merge_verify('abc123', _make_spec())
-        assert runner._inflight_request_id is None
-
-    async def test_inflight_request_id_cleared_after_exception(self):
-        """_inflight_request_id is cleared in the finally even on RunnerUnavailable."""
+    async def test_dispatch_not_in_flight_after_exception(self):
+        """The dispatch is no longer in flight after RunnerUnavailable (cleared in the finally)."""
         from orchestrator.verify_runner import RunnerUnavailable
 
         calls = []
@@ -5605,7 +5598,7 @@ class TestRemoteRunnerRequestId:
         with pytest.raises(RunnerUnavailable):
             await runner.run_merge_verify('abc123', _make_spec())
 
-        assert runner._inflight_request_id is None
+        assert runner.dispatch_in_flight is False
 
     async def test_dispatch_in_flight_false_before_and_after_return(self):
         """dispatch_in_flight is False before run_merge_verify and False again after it returns."""
@@ -5649,7 +5642,8 @@ class TestRemoteRunnerRequestId:
 class TestRemoteRunnerCancelVerify:
     """cancel_verify() issues ssh cancel-verify; probe_clean() issues ssh pgrep."""
 
-    def _make_runner(self, *, config_path=None, cancel_rc=0, probe_rc=1):
+    def _make_runner_and_calls(self, *, config_path=None, cancel_rc=0, probe_rc=1):
+        """Return (runner, calls_list) where calls_list records each run() argv."""
         calls = []
 
         async def fake_run(argv, *, cwd=None):
@@ -5669,26 +5663,25 @@ class TestRemoteRunnerCancelVerify:
             run=fake_run,
             id_factory=lambda: 'req-42',
         )
-        runner._calls = calls
-        return runner
+        return runner, calls
 
     async def test_cancel_verify_no_inflight_returns_zero_no_ssh(self):
         """cancel_verify() with _inflight_request_id=None returns 0 without issuing ssh."""
-        runner = self._make_runner()
+        runner, calls = self._make_runner_and_calls()
         rc = await runner.cancel_verify()
         assert rc == 0
-        ssh_calls = [c for c in runner._calls if c[0] == 'ssh']
+        ssh_calls = [c for c in calls if c[0] == 'ssh']
         assert len(ssh_calls) == 0
 
     async def test_cancel_verify_issues_correct_argv(self):
         """cancel_verify() issues ssh BatchMode/ConnectTimeout cancel-verify --request-id."""
         import shlex as _shlex
 
-        runner = self._make_runner(cancel_rc=0)
+        runner, calls = self._make_runner_and_calls(cancel_rc=0)
         runner._inflight_request_id = 'req-42'
         await runner.cancel_verify()
 
-        ssh_calls = [c for c in runner._calls if c[0] == 'ssh']
+        ssh_calls = [c for c in calls if c[0] == 'ssh']
         assert len(ssh_calls) == 1
         argv = ssh_calls[0]
 
@@ -5705,11 +5698,11 @@ class TestRemoteRunnerCancelVerify:
         """cancel_verify() appends --config <path> when config_path is set."""
         import shlex as _shlex
 
-        runner = self._make_runner(config_path='/etc/orch.yaml', cancel_rc=0)
+        runner, calls = self._make_runner_and_calls(config_path='/etc/orch.yaml', cancel_rc=0)
         runner._inflight_request_id = 'req-42'
         await runner.cancel_verify()
 
-        ssh_calls = [c for c in runner._calls if c[0] == 'ssh']
+        ssh_calls = [c for c in calls if c[0] == 'ssh']
         remote_cmd = ssh_calls[0][-1]
         parsed = _shlex.split(remote_cmd)
         cfg_idx = parsed.index('--config')
@@ -5717,18 +5710,18 @@ class TestRemoteRunnerCancelVerify:
 
     async def test_cancel_verify_returns_ssh_rc(self):
         """cancel_verify() returns the ssh return code."""
-        runner = self._make_runner(cancel_rc=1)
+        runner, calls = self._make_runner_and_calls(cancel_rc=1)
         runner._inflight_request_id = 'req-42'
         rc = await runner.cancel_verify()
         assert rc == 1
 
     async def test_probe_clean_true_when_pgrep_rc_is_1(self):
         """probe_clean() issues ssh pgrep -f verify-merge; rc==1 (no match) → True."""
-        runner = self._make_runner(probe_rc=1)
+        runner, calls = self._make_runner_and_calls(probe_rc=1)
         result = await runner.probe_clean()
         assert result is True
 
-        ssh_calls = [c for c in runner._calls if c[0] == 'ssh']
+        ssh_calls = [c for c in calls if c[0] == 'ssh']
         assert len(ssh_calls) == 1
         remote_cmd = ssh_calls[0][-1]
         assert 'pgrep' in remote_cmd
@@ -5736,13 +5729,13 @@ class TestRemoteRunnerCancelVerify:
 
     async def test_probe_clean_false_when_pgrep_rc_is_0(self):
         """probe_clean() rc==0 (process running) → False."""
-        runner = self._make_runner(probe_rc=0)
+        runner, calls = self._make_runner_and_calls(probe_rc=0)
         result = await runner.probe_clean()
         assert result is False
 
     async def test_probe_clean_false_when_pgrep_rc_is_2(self):
         """probe_clean() rc>=2 (error) → False (conservative: stay parked)."""
-        runner = self._make_runner(probe_rc=2)
+        runner, _ = self._make_runner_and_calls(probe_rc=2)
         result = await runner.probe_clean()
         assert result is False
 
@@ -7679,6 +7672,85 @@ class TestRemoteRunnerSyncWorkspaceSafety:
         assert REMOTE_LIVENESS_CMD == _EXPECTED_LIVENESS_CMD
 
 
+async def _stale_uv_sync_cmd(df_remote: str) -> str:
+    """The single remote ``uv sync`` command a stale-checkout sync issues."""
+    runner, calls, store = _make_sync_runner(
+        df_remote=df_remote, local_head='NEW', remote_head='OLD', post_sync_head='NEW',
+    )
+    out = await runner.sync_if_stale(event_store=store, task_id='t1')
+    assert out.synced is True
+    uv_cmds = [c for c in _ssh_cmds(calls) if 'uv sync' in c]
+    assert len(uv_cmds) == 1, f'expected exactly one uv sync, got {uv_cmds!r}'
+    return uv_cmds[0]
+
+
+def _run_remote_cmd_like_sshd(cmd: str, *, home: Path, sysbin: Path) -> int:
+    """Run *cmd* as a non-login ssh shell would: only *sysbin* on PATH, no rc files."""
+    bash = shutil.which('bash') or '/bin/bash'
+    proc = subprocess.run(
+        ['env', '-i', f'PATH={sysbin}', f'HOME={home}', bash, '-c', cmd],
+        capture_output=True, text=True,
+    )
+    return proc.returncode
+
+
+def _write_executable(path: Path, body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+    path.chmod(0o755)
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerSyncFindsUvOnNonLoginShell:
+    """The INV-2 sync's ``uv`` must resolve under a plain ssh shell.
+
+    ``ssh host 'cd … && uv sync --all-packages'`` runs non-login and
+    non-interactive, so PATH is sshd's default and ``~/.bashrc`` returns at its
+    interactive guard before adding ``~/.local/bin`` — where the standalone uv
+    installer puts the binary.
+    """
+
+    async def test_uv_sync_command_puts_local_bin_on_path_before_uv(self):
+        from orchestrator.verify_runner import REMOTE_TOOL_PATH_PRELUDE
+
+        cmd = await _stale_uv_sync_cmd('/remote/df')
+        assert REMOTE_TOOL_PATH_PRELUDE in cmd, cmd
+        assert cmd.index(REMOTE_TOOL_PATH_PRELUDE) < cmd.index('uv sync'), (
+            f'the PATH prelude must precede the uv invocation it serves; got {cmd!r}'
+        )
+        assert '$HOME/.local/bin' in cmd, cmd
+        # $HOME expands on the REMOTE side only if it is not shell-quoted away.
+        assert "'$HOME" not in cmd and "'PATH=" not in cmd, (
+            f'the prelude must not be passed through shlex.quote; got {cmd!r}'
+        )
+
+    async def test_uv_sync_command_resolves_a_home_local_bin_uv_under_bare_path(
+        self, tmp_path: Path,
+    ):
+        """Behavioural: under a bare PATH the built command finds
+        ``$HOME/.local/bin/uv``, which must itself still see the inherited PATH;
+        the SAME command against a HOME with no uv fails exactly as the field did."""
+        sysbin = tmp_path / 'sysbin'
+        _write_executable(sysbin / 'inherited-tool', '#!/bin/sh\nexit 0\n')
+        home = tmp_path / 'home'
+        _write_executable(
+            home / '.local' / 'bin' / 'uv',
+            '#!/bin/sh\n'
+            '[ "$1 $2" = "sync --all-packages" ] || exit 3\n'
+            'inherited-tool || exit 4\n',
+        )
+        home_without_uv = tmp_path / 'home-without-uv'
+        home_without_uv.mkdir()
+        df_remote = tmp_path / 'df'
+        df_remote.mkdir()
+
+        cmd = await _stale_uv_sync_cmd(str(df_remote))
+        assert _run_remote_cmd_like_sshd(cmd, home=home, sysbin=sysbin) == 0, cmd
+        assert _run_remote_cmd_like_sshd(cmd, home=home_without_uv, sysbin=sysbin) == 127, (
+            'the control must fail as the un-preluded sync did in the field (rc=127)'
+        )
+
+
 # ---------------------------------------------------------------------------
 # INV-2 (task 2884): run_merge_verify Step-0 mirror-semantics project-main push
 # ---------------------------------------------------------------------------
@@ -7800,11 +7872,23 @@ class TestRemoteRunnerMainPushMirror:
 # ---------------------------------------------------------------------------
 
 
-def _pool_fake_remote(name='laptop', *, sync_outcome, result=None) -> Any:
-    """A REAL RemoteRunner (so isinstance(selected, RemoteRunner) holds) with
-    sync_if_stale + run_merge_verify replaced by instance stubs.
+@dataclasses.dataclass
+class _PoolRemoteCalls:
+    """What a fake remote's stubbed sync_if_stale / run_merge_verify were handed."""
 
-    Records the event_store/task_id each stub was called with.
+    sync_seen: dict[str, Any] | None = None
+    rmv_calls: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+
+
+def _pool_fake_remote(
+    name='laptop', *, sync_outcome, result=None,
+) -> tuple[Any, _PoolRemoteCalls]:
+    """Return (runner, calls) for a REAL RemoteRunner (so isinstance(selected,
+    RemoteRunner) holds) with sync_if_stale + run_merge_verify replaced by
+    instance stubs.
+
+    The record of what each stub was handed lives in the returned *calls* —
+    the stubs close over it, so nothing is attached to the runner itself.
     """
     async def _noop_run(argv, *, cwd=None):
         return (0, '', '')
@@ -7812,23 +7896,22 @@ def _pool_fake_remote(name='laptop', *, sync_outcome, result=None) -> Any:
     r = RemoteRunner(
         name=name, ssh_host='h', git_remote='origin', cwd='/repo', run=_noop_run,
     )
-    r._sync_seen = None  # type: ignore[attr-defined]
-    r._rmv_calls = []  # type: ignore[attr-defined]
+    calls = _PoolRemoteCalls()
     _res = result if result is not None else VerifyResult(
         passed=True, test_output='', lint_output='', type_output='', summary='remote-ok',
     )
 
     async def _sync(*, event_store=None, task_id=None):
-        r._sync_seen = {'event_store': event_store, 'task_id': task_id}  # type: ignore[attr-defined]
+        calls.sync_seen = {'event_store': event_store, 'task_id': task_id}
         return sync_outcome
 
     async def _rmv(merge_sha, spec, *, task_id=None, archive_root=None, event_store=None):
-        r._rmv_calls.append({'event_store': event_store, 'task_id': task_id})  # type: ignore[attr-defined]
+        calls.rmv_calls.append({'event_store': event_store, 'task_id': task_id})
         return _res
 
     r.sync_if_stale = _sync  # type: ignore[assignment]
     r.run_merge_verify = _rmv  # type: ignore[assignment]
-    return r
+    return r, calls
 
 
 class _PoolFakeLocal:
@@ -7858,7 +7941,7 @@ class TestVerifyRunnerPoolContractCurrency:
         """(a) [remote, local], sync ok -> REMOTE runs, not quarantined, sync got the store."""
         from orchestrator.verify_runner import SyncOutcome, VerifyRunnerPool
 
-        remote = _pool_fake_remote(sync_outcome=SyncOutcome(configured=True, ok=True))
+        remote, remote_calls = _pool_fake_remote(sync_outcome=SyncOutcome(configured=True, ok=True))
         local = _PoolFakeLocal()
         store = _RecordingEventStore()
         pool = VerifyRunnerPool([remote, local], event_store=store, task_id='t9')
@@ -7871,14 +7954,14 @@ class TestVerifyRunnerPoolContractCurrency:
         assert pool.is_quarantined('laptop') is False
         assert local.calls == []
         # sync_if_stale received the pool's event_store + task_id
-        assert remote._sync_seen == {'event_store': store, 'task_id': 't9'}
+        assert remote_calls.sync_seen == {'event_store': store, 'task_id': 't9'}
 
     async def test_two_runner_sync_fail_benches_remote_and_falls_back_local(self):
         """(b) sync configured=True/ok=False -> quarantine remote AND dispatch local;
         remote.run_merge_verify NEVER called."""
         from orchestrator.verify_runner import SyncOutcome, VerifyRunnerPool
 
-        remote = _pool_fake_remote(sync_outcome=SyncOutcome(configured=True, ok=False))
+        remote, remote_calls = _pool_fake_remote(sync_outcome=SyncOutcome(configured=True, ok=False))
         local = _PoolFakeLocal()
         store = _RecordingEventStore()
         pool = VerifyRunnerPool([remote, local], event_store=store, task_id='t1')
@@ -7887,7 +7970,7 @@ class TestVerifyRunnerPoolContractCurrency:
 
         assert result.summary == 'local-ok'
         assert pool.is_quarantined('laptop') is True
-        assert remote._rmv_calls == []  # remote verdict never taken
+        assert remote_calls.rmv_calls == []  # remote verdict never taken
         assert len(local.calls) == 1
         mv = store.events_of(EventType.merge_verify)
         assert mv and mv[0]['runner'] == 'local'
@@ -7900,20 +7983,20 @@ class TestVerifyRunnerPoolContractCurrency:
             VerifyRunnerPool,
         )
 
-        remote = _pool_fake_remote(sync_outcome=SyncOutcome(configured=True, ok=False))
+        remote, remote_calls = _pool_fake_remote(sync_outcome=SyncOutcome(configured=True, ok=False))
         store = _RecordingEventStore()
         pool = VerifyRunnerPool([remote], event_store=store, task_id='t1')
 
         with pytest.raises(RunnerUnavailable):
             await pool.dispatch('abc123', _make_spec())
         assert pool.is_quarantined('laptop') is True
-        assert remote._rmv_calls == []
+        assert remote_calls.rmv_calls == []
 
     async def test_sync_not_configured_dispatches_remote_no_quarantine(self):
         """(d) sync configured=False -> byte-identical: remote dispatched, not benched."""
         from orchestrator.verify_runner import SyncOutcome, VerifyRunnerPool
 
-        remote = _pool_fake_remote(sync_outcome=SyncOutcome(configured=False, ok=True))
+        remote, remote_calls = _pool_fake_remote(sync_outcome=SyncOutcome(configured=False, ok=True))
         local = _PoolFakeLocal()
         store = _RecordingEventStore()
         pool = VerifyRunnerPool([remote, local], event_store=store, task_id='t1')
@@ -7928,14 +8011,14 @@ class TestVerifyRunnerPoolContractCurrency:
         """(e) happy path threads event_store=pool._event_store into run_merge_verify."""
         from orchestrator.verify_runner import SyncOutcome, VerifyRunnerPool
 
-        remote = _pool_fake_remote(sync_outcome=SyncOutcome(configured=True, ok=True))
+        remote, remote_calls = _pool_fake_remote(sync_outcome=SyncOutcome(configured=True, ok=True))
         store = _RecordingEventStore()
         pool = VerifyRunnerPool([remote], event_store=store, task_id='t1')
 
         await pool.dispatch('abc123', _make_spec())
 
-        assert len(remote._rmv_calls) == 1
-        assert remote._rmv_calls[0]['event_store'] is store
+        assert len(remote_calls.rmv_calls) == 1
+        assert remote_calls.rmv_calls[0]['event_store'] is store
 
     async def test_multi_remote_first_fail_tries_second_remote_before_local(self):
         """[remote_a(fail), remote_b(ok), local]: the fail-closed bench re-selects
@@ -7943,8 +8026,8 @@ class TestVerifyRunnerPoolContractCurrency:
         never burdened (multi-remote pools no longer fall straight to local)."""
         from orchestrator.verify_runner import SyncOutcome, VerifyRunnerPool
 
-        remote_a = _pool_fake_remote(name='a', sync_outcome=SyncOutcome(configured=True, ok=False))
-        remote_b = _pool_fake_remote(name='b', sync_outcome=SyncOutcome(configured=True, ok=True))
+        remote_a, calls_a = _pool_fake_remote(name='a', sync_outcome=SyncOutcome(configured=True, ok=False))
+        remote_b, calls_b = _pool_fake_remote(name='b', sync_outcome=SyncOutcome(configured=True, ok=True))
         local = _PoolFakeLocal()
         store = _RecordingEventStore()
         pool = VerifyRunnerPool([remote_a, remote_b, local], event_store=store, task_id='t1')
@@ -7954,8 +8037,8 @@ class TestVerifyRunnerPoolContractCurrency:
         assert result.summary == 'remote-ok'
         assert pool.is_quarantined('a') is True
         assert pool.is_quarantined('b') is False
-        assert remote_a._rmv_calls == []       # benched remote verdict never taken
-        assert len(remote_b._rmv_calls) == 1   # second remote served
+        assert calls_a.rmv_calls == []       # benched remote verdict never taken
+        assert len(calls_b.rmv_calls) == 1   # second remote served
         assert local.calls == []               # local anchor untouched
         mv = store.events_of(EventType.merge_verify)
         assert mv and mv[0]['runner'] == 'b'
@@ -7965,8 +8048,8 @@ class TestVerifyRunnerPoolContractCurrency:
         local trust anchor serves."""
         from orchestrator.verify_runner import SyncOutcome, VerifyRunnerPool
 
-        remote_a = _pool_fake_remote(name='a', sync_outcome=SyncOutcome(configured=True, ok=False))
-        remote_b = _pool_fake_remote(name='b', sync_outcome=SyncOutcome(configured=True, ok=False))
+        remote_a, calls_a = _pool_fake_remote(name='a', sync_outcome=SyncOutcome(configured=True, ok=False))
+        remote_b, calls_b = _pool_fake_remote(name='b', sync_outcome=SyncOutcome(configured=True, ok=False))
         local = _PoolFakeLocal()
         store = _RecordingEventStore()
         pool = VerifyRunnerPool([remote_a, remote_b, local], event_store=store, task_id='t1')
@@ -7976,8 +8059,8 @@ class TestVerifyRunnerPoolContractCurrency:
         assert result.summary == 'local-ok'
         assert pool.is_quarantined('a') is True
         assert pool.is_quarantined('b') is True
-        assert remote_a._rmv_calls == []
-        assert remote_b._rmv_calls == []
+        assert calls_a.rmv_calls == []
+        assert calls_b.rmv_calls == []
         assert len(local.calls) == 1
         mv = store.events_of(EventType.merge_verify)
         assert mv and mv[0]['runner'] == 'local'
@@ -7991,8 +8074,8 @@ class TestVerifyRunnerPoolContractCurrency:
             VerifyRunnerPool,
         )
 
-        remote_a = _pool_fake_remote(name='a', sync_outcome=SyncOutcome(configured=True, ok=False))
-        remote_b = _pool_fake_remote(name='b', sync_outcome=SyncOutcome(configured=True, ok=False))
+        remote_a, calls_a = _pool_fake_remote(name='a', sync_outcome=SyncOutcome(configured=True, ok=False))
+        remote_b, calls_b = _pool_fake_remote(name='b', sync_outcome=SyncOutcome(configured=True, ok=False))
         store = _RecordingEventStore()
         pool = VerifyRunnerPool([remote_a, remote_b], event_store=store, task_id='t1')
 
@@ -8000,5 +8083,5 @@ class TestVerifyRunnerPoolContractCurrency:
             await pool.dispatch('abc123', _make_spec())
         assert pool.is_quarantined('a') is True
         assert pool.is_quarantined('b') is True
-        assert remote_a._rmv_calls == []
-        assert remote_b._rmv_calls == []
+        assert calls_a.rmv_calls == []
+        assert calls_b.rmv_calls == []

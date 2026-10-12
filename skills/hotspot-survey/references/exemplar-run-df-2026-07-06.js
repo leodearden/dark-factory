@@ -1,3 +1,4 @@
+// PRE-CONTRACT: predates docs/quality-findings-contract.md (no keys, tags, severity or refresh mode) — adapt orchestration.md, not this.
 // EXEMPLAR — verbatim workflow script from the proven dark-factory run (2026-07-06,
 // session d1235f32-4830-4c28-8877-8ee89e87ae0e, run wf_195b1a6d-573: 28 agents,
 // 2.54M subagent tokens, 64 min, 75 findings -> plans/bug-hotspot-survey-2026-07-06.md).

@@ -44,8 +44,10 @@ fixtures prove it still fires.
 
 from __future__ import annotations
 
+import ast
 import re
 import textwrap
+from collections.abc import Sequence
 from pathlib import Path
 from typing import NamedTuple
 
@@ -61,10 +63,11 @@ from loop_blocking_scan import (
     METHOD_PRIMITIVES,
     LoopBlockingSite,
     find_loop_blocking_sites,
+    find_loop_blocking_sites_in_trees,
     site_key,
 )
 from silent_fallthrough_scan import (
-    iter_first_party_files,
+    ParsedFile,
     reconcile_against_allowlist,
 )
 
@@ -411,7 +414,7 @@ class TestCallerSideEnumeration:
         ``make_commit_probe.probe`` and ``_verify_task``'s ``probe``
         parameter), and it was blessed in the ledger as a real defect.  The
         genuine site next door -- ``_claim_commit_presence ->
-        make_commit_probe`` -- is unaffected and still reported.
+        make_commit_probe`` -- was unaffected and still reported.
         """
         sources = {
             'pkg/mod.py': _module(
@@ -696,6 +699,77 @@ class TestScannerHygiene:
         assert [f.qualname for f in findings] == ['b']
 
 
+def _trees(sources: dict[str, str]) -> dict[str, ast.Module]:
+    return {relpath: ast.parse(source, filename=relpath) for relpath, source in sources.items()}
+
+
+#: A caller in one module reaching a blocking helper defined in another.
+_CROSS_MODULE_SOURCES = {
+    'pkg/registry.py': _module(_HELPER_DEF),
+    'pkg/caller.py': _module(
+        """
+        async def b(path):
+            from pkg.registry import load_registry
+
+            return load_registry(path)
+        """,
+    ),
+}
+
+_CLEAN_SOURCES = {
+    'pkg/mod.py': _module(
+        """
+        async def a(text):
+            return text.split(',')
+        """,
+    ),
+}
+
+#: Task 5099's async-consumption shape: an awaited read_text is an async API,
+#: a bare one in a sibling coroutine is a finding.
+_ASYNC_CONSUMPTION_SOURCES = {
+    'pkg/mod.py': _module(
+        """
+        async def a(apath):
+            return await apath.read_text()
+        """,
+        """
+        async def d(path):
+            return path.read_text()
+        """,
+    ),
+}
+
+
+class TestTreesEntryPoint:
+    """``find_loop_blocking_sites_in_trees`` is what the gate calls on the shared ASTs.
+
+    ``find_loop_blocking_sites`` parses and delegates to it, so the two must
+    agree exactly on every mapping.
+    """
+
+    @pytest.mark.parametrize(
+        ('sources', 'expected'),
+        [
+            (_CROSS_MODULE_SOURCES, [('pkg/caller.py', 'b', 'load_registry')]),
+            (_CLEAN_SOURCES, []),
+            (_ASYNC_CONSUMPTION_SOURCES, [('pkg/mod.py', 'd', 'read_text')]),
+        ],
+        ids=['cross-module', 'clean', 'async-consumption'],
+    )
+    def test_matches_the_source_entry_point_exactly(self, sources, expected):
+        from_trees = find_loop_blocking_sites_in_trees(_trees(sources))
+        assert from_trees == find_loop_blocking_sites(sources)
+        assert [(f.filename, f.qualname, f.callee) for f in from_trees] == expected
+
+    def test_an_unparseable_module_left_out_of_the_trees_contributes_nothing(self):
+        """Mirrors the source entry point's SyntaxError skip."""
+        sources = {**_CROSS_MODULE_SOURCES, 'pkg/broken.py': 'def ( oops\n'}
+        assert find_loop_blocking_sites_in_trees(_trees(_CROSS_MODULE_SOURCES)) == (
+            find_loop_blocking_sites(sources)
+        )
+
+
 # --------------------------------------------------------------------------- #
 # The primitive table (task 4484 gap B)
 # --------------------------------------------------------------------------- #
@@ -726,7 +800,41 @@ _PRIMITIVE_CASES = [
     ('socket.create_connection', "return socket.create_connection(('h', 1))",
      'socket.create_connection'),
     ('os.system', "return os.system('ls')", 'os.system'),
+    # -- task 5099: the directory-walk / metadata methods, matched by name
+    ('Path.mkdir', 'return payload.mkdir()', 'mkdir'),
+    ('Path.rmdir', 'return payload.rmdir()', 'rmdir'),
+    ('Path.touch', 'return payload.touch()', 'touch'),
+    ('Path.unlink', 'return payload.unlink()', 'unlink'),
+    ('Path.rename', "return payload.rename('x')", 'rename'),
+    ('Path.exists', 'return payload.exists()', 'exists'),
+    ('Path.is_file', 'return payload.is_file()', 'is_file'),
+    ('Path.is_dir', 'return payload.is_dir()', 'is_dir'),
+    ('Path.stat', 'return payload.stat()', 'stat'),
+    ('Path.iterdir', 'return list(payload.iterdir())', 'iterdir'),
+    ('Path.glob', "return list(payload.glob('*'))", 'glob'),
+    ('Path.rglob', "return list(payload.rglob('*'))", 'rglob'),
+    ('Path.open', 'return payload.open()', 'open'),
+    # -- task 5099: their os / glob spellings, receiver-pinned.  A dotted match
+    # is checked before the method match, so os.stat reports 'os.stat'.
+    ('os.makedirs', 'return os.makedirs(payload)', 'os.makedirs'),
+    ('os.mkdir', 'return os.mkdir(payload)', 'os.mkdir'),
+    ('os.rmdir', 'return os.rmdir(payload)', 'os.rmdir'),
+    ('os.remove', 'return os.remove(payload)', 'os.remove'),
+    ('os.unlink', 'return os.unlink(payload)', 'os.unlink'),
+    ('os.rename', "return os.rename(payload, 'x')", 'os.rename'),
+    ('os.replace', "return os.replace(payload, 'x')", 'os.replace'),
+    ('os.stat', 'return os.stat(payload)', 'os.stat'),
+    ('os.scandir', 'return list(os.scandir(payload))', 'os.scandir'),
+    ('os.path.exists', 'return os.path.exists(payload)', 'os.path.exists'),
+    ('os.path.isfile', 'return os.path.isfile(payload)', 'os.path.isfile'),
+    ('os.path.isdir', 'return os.path.isdir(payload)', 'os.path.isdir'),
+    ('glob.glob', 'return glob.glob(payload)', 'glob.glob'),
 ]
+
+_PRIMITIVE_CASE_IMPORTS = (
+    'import fcntl\nimport glob\nimport os\nimport socket\nimport subprocess\n'
+    'import time\n\nimport yaml'
+)
 
 
 class TestPrimitiveTable:
@@ -741,7 +849,7 @@ class TestPrimitiveTable:
         """Each INV-8 primitive is blocking when a coroutine reaches it without a hop."""
         sources = {
             'pkg/mod.py': _module(
-                'import fcntl\nimport os\nimport socket\nimport subprocess\nimport time\n\nimport yaml',
+                _PRIMITIVE_CASE_IMPORTS,
                 f'def helper(payload):\n    {body}',
                 """
                 async def caller(payload):
@@ -775,7 +883,7 @@ class TestPrimitiveTable:
         """
         sources = {
             'pkg/mod.py': _module(
-                'import fcntl\nimport os\nimport socket\nimport subprocess\nimport time\n\nimport yaml',
+                _PRIMITIVE_CASE_IMPORTS,
                 f'async def caller(payload):\n    {body}',
             )
         }
@@ -912,6 +1020,130 @@ class TestPrimitiveTable:
 
         assert find_loop_blocking_sites(sources) == []
 
+    def test_a_method_call_consumed_asynchronously_is_not_a_filesystem_primitive(self):
+        """An awaited / async-with / async-for method call is an async API.
+
+        The names here are placeholders: the rule is about the CONSTRUCT.  A
+        method primitive is matched by attribute name alone, receiver
+        unresolved, and a sync pathlib method never returns an awaitable, an
+        async context manager or an async iterator -- so a call one of those
+        constructs consumes is some other API (anyio.Path, aiofiles, an async
+        store's ``open()``), which is exactly what an INV-8 fix switches to.
+        """
+        consumed = {
+            'await operand': """
+                async def a(apath):
+                    return await apath.read_text()
+                """,
+            'async-with context expression': """
+                async def b(remote):
+                    async with remote.read_bytes() as fh:
+                        return fh
+                """,
+            'async-for iterable': """
+                async def c(remote):
+                    async for chunk in remote.read_bytes():
+                        return chunk
+                """,
+        }
+        for shape, body in consumed.items():
+            findings = find_loop_blocking_sites({'pkg/mod.py': _module(body)})
+            assert findings == [], (
+                f'a method call consumed as the {shape} is an async API, not a '
+                f'sync filesystem primitive; got '
+                f'{[(f.qualname, f.primitive) for f in findings]}'
+            )
+
+        bare = find_loop_blocking_sites({'pkg/mod.py': _module(
+            """
+            async def d(path):
+                return path.read_text()
+            """,
+        )})
+        assert [(f.qualname, f.primitive) for f in bare] == [('d', 'read_text')]
+
+        argument_of_awaited = find_loop_blocking_sites({'pkg/mod.py': _module(
+            """
+            async def e(writer, path):
+                await writer.send(path.read_text())
+            """,
+        )})
+        assert [(f.qualname, f.primitive) for f in argument_of_awaited] == [
+            ('e', 'read_text')
+        ], (
+            'only the call that IS the await operand is excluded; an argument '
+            'of an awaited call still evaluates on the loop thread'
+        )
+
+    def test_names_shared_with_builtin_types_are_not_primitives(self):
+        """``replace`` / ``remove`` / ``walk`` stay out of the method table.
+
+        Matching by attribute name alone, they are ``str.replace``,
+        ``list.remove`` and ``ast.walk`` far more often than a filesystem
+        call, and every string edit in the tree would become a merge-blocking
+        row.  Their filesystem spellings are matched only receiver-pinned:
+        ``os.replace``, ``os.remove``, ``os.walk``.
+        """
+        sources = {
+            'pkg/mod.py': _module(
+                'import ast',
+                """
+                async def caller(name, items, x, tree):
+                    name.replace('-', '_')
+                    items.remove(x)
+                    return list(ast.walk(tree))
+                """,
+            )
+        }
+
+        findings = find_loop_blocking_sites(sources)
+
+        assert findings == [], (
+            'str.replace / list.remove / ast.walk must not match a method '
+            f'primitive; got {[(f.qualname, f.primitive) for f in findings]}'
+        )
+
+    def test_async_file_apis_sharing_a_primitive_name_are_not_findings(self):
+        """The live shapes the async-consumption rule exists for, once 'open' exists.
+
+        ``await cost_store.open()`` is server/main.py::_setup_curator_usage_gate's
+        async CostStore open -- the false positive widening the table exposed.
+        ``aiofiles.open`` and anyio's ``iterdir`` are the canonical INV-8 fix;
+        flagging them would be a false RED on correctly fixed code.
+        """
+        async_apis = {
+            'awaited store open': """
+                async def a(cost_store):
+                    await cost_store.open()
+                """,
+            'aiofiles open': """
+                async def b(p):
+                    async with aiofiles.open(p) as fh:
+                        return await fh.read()
+                """,
+            'anyio iterdir': """
+                async def c(apath):
+                    async for child in apath.iterdir():
+                        return child
+                """,
+        }
+        for shape, body in async_apis.items():
+            findings = find_loop_blocking_sites(
+                {'pkg/mod.py': _module('import aiofiles', body)}
+            )
+            assert findings == [], (
+                f'{shape} is an async API, not a sync filesystem call; got '
+                f'{[(f.qualname, f.primitive) for f in findings]}'
+            )
+
+        control = find_loop_blocking_sites({'pkg/mod.py': _module(
+            """
+            async def d(store):
+                return store.open()
+            """,
+        )})
+        assert [(f.qualname, f.primitive) for f in control] == [('d', 'open')]
+
     def test_asyncio_siblings_are_excluded_wholesale(self):
         """Neither ``asyncio.*`` nor ``anyio.*`` may be read as blocking."""
         for dotted in DOTTED_PRIMITIVES:
@@ -955,25 +1187,25 @@ class TestPrimitiveTable:
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Task 4484's charter is "re-run the enumeration caller-side across
-# fused-memory", so the finding set is scoped to that package.
-# iter_first_party_files yields all SEVEN scope roots; orchestrator/src is also
-# heavily async and would balloon the baseline past anything a reviewer can
-# read, turning the ratchet into a merge blocker for unrelated work. Widening
-# is a deliberate follow-on decision with merge-lane consequences, not a
-# side effect of this audit.
+# fused-memory", so the finding set is scoped to that package. The shared
+# first-party tree spans every scope root in silent_fallthrough_scan's
+# SCOPE_ROOTS; orchestrator/src is also heavily async and would balloon the
+# baseline past anything a reviewer can read, turning the ratchet into a merge
+# blocker for unrelated work. Widening is a deliberate follow-on decision with
+# merge-lane consequences, not a side effect of this audit.
 #
-# The scope is applied by FILTERING that generator's output, never by handing
-# it a narrower root: it validates repo_root against sentinel dirs
-# ('shared/src', 'orchestrator/src') and RAISES rather than yielding a
-# vacuously empty scan. Passing 'fused-memory/src' as the root would trip that
-# sentinel, and relaxing the sentinel to accommodate us would delete the
-# loud-failure property its existing consumers rely on.
+# The scope is applied by FILTERING the shared first-party tree, never by
+# handing the provider a narrower root: the provider requires every
+# SCOPE_ROOTS entry under the root it is handed and RAISES rather than
+# yielding a vacuously empty or narrower scan, so passing 'fused-memory/src'
+# as the root would raise. Relaxing that check to accommodate us would delete
+# the loud-failure property its existing consumers rely on.
 _SCOPE_PREFIX = 'fused-memory/src/'
 
-# How many out-of-scope first-party files the scope-filter test may read before
+# How many out-of-scope first-party files the scope-filter test may scan before
 # giving up. It stops at the FIRST file that yields a finding (the 4th, at the
 # task 4484 amendment pass); the cap only bounds the pathological case, so the
-# gate cannot become slow because the other six scope roots got clean.
+# gate cannot become slow because the other scope roots got clean.
 _OUT_OF_SCOPE_PROBE_CAP = 80
 
 
@@ -984,16 +1216,44 @@ class _TreeScan(NamedTuple):
     findings: list[LoopBlockingSite]
 
 
+def _build_tree_scan(records: Sequence[ParsedFile]) -> _TreeScan:
+    """Scan the ``_SCOPE_PREFIX`` records of the shared first-party tree.
+
+    Every in-scope module is in the mapping handed to the scanner, so
+    cross-module resolution sees the whole package. The trees are walked, never
+    re-read or re-parsed.
+    """
+    in_scope = [record for record in records if record.relpath.startswith(_SCOPE_PREFIX)]
+    trees = {record.relpath: record.tree for record in in_scope if record.tree is not None}
+    return _TreeScan(
+        scanned_files=len(in_scope), findings=find_loop_blocking_sites_in_trees(trees)
+    )
+
+
 @pytest.fixture(scope='session')
-def tree_scan() -> _TreeScan:
-    """Enumerate, read and scan ``fused-memory/src`` once per test session."""
-    sources: dict[str, str] = {}
-    for path in iter_first_party_files(_REPO_ROOT):
-        rel = path.relative_to(_REPO_ROOT).as_posix()
-        if not rel.startswith(_SCOPE_PREFIX):
-            continue
-        sources[rel] = path.read_text(encoding='utf-8', errors='replace')
-    return _TreeScan(scanned_files=len(sources), findings=find_loop_blocking_sites(sources))
+def tree_scan(first_party_tree: tuple[ParsedFile, ...]) -> _TreeScan:
+    """Scan ``fused-memory/src`` once per test session, off the shared tree."""
+    return _build_tree_scan(first_party_tree)
+
+
+class TestSweepUsesTheSharedTree:
+    """The sweep walks the session's shared ASTs and does no I/O of its own."""
+
+    def test_the_sweep_reads_nothing_and_parses_nothing(self, first_party_tree, monkeypatch):
+        """Scoped by ``monkeypatch.context()``: pytest's own failure report calls
+        ``ast.parse``, so the patch must be gone before a failure is rendered."""
+
+        def no_parse(*_args, **_kwargs):
+            raise AssertionError('ast.parse called: the sweep re-parsed a file')
+
+        def no_read(*_args, **_kwargs):
+            raise AssertionError('pathlib.Path.read_text called: the sweep re-read a file')
+
+        with monkeypatch.context() as patched:
+            patched.setattr(ast, 'parse', no_parse)
+            patched.setattr(Path, 'read_text', no_read)
+            scan = _build_tree_scan(first_party_tree)
+        assert scan.findings, 'the patched sweep walked nothing, so it proved nothing about I/O'
 
 
 class TestSweepIsNotVacuous:
@@ -1022,36 +1282,35 @@ class TestSweepIsNotVacuous:
             f'synthetic fixtures above before believing the tree got clean.'
         )
 
-    def test_the_prefix_filter_is_what_keeps_the_ledger_scoped(self, tree_scan):
+    def test_the_prefix_filter_is_what_keeps_the_ledger_scoped(
+        self, tree_scan, first_party_tree
+    ):
         """Out-of-scope first-party files DO yield findings; the filter excludes them.
 
         Asserting that no finding in ``tree_scan`` lies outside
-        ``_SCOPE_PREFIX`` would test nothing: the fixture only inserts a path
-        into ``sources`` when it starts with that prefix, so the property holds
-        by construction one function above the assertion.
+        ``_SCOPE_PREFIX`` would test nothing: ``_build_tree_scan`` only keeps a
+        record whose relpath starts with that prefix, so the property holds by
+        construction one function above the assertion.
 
         This scans out-of-scope files INDEPENDENTLY (bounded, one file at a
         time, stopping at the first that yields anything -- ~4 files and well
         under a second in practice) and then checks those keys are absent from
-        the ledger sweep.  Delete the prefix filter from the fixture and this
-        goes red, which is what the earlier version could not do.
+        the ledger sweep.  Delete the prefix filter from ``_build_tree_scan``
+        and this goes red, which is what the earlier version could not do.
         """
         probe: list[LoopBlockingSite] = []
         scanned = 0
-        for path in iter_first_party_files(_REPO_ROOT):
-            rel = path.relative_to(_REPO_ROOT).as_posix()
-            if rel.startswith(_SCOPE_PREFIX):
+        for record in first_party_tree:
+            if record.relpath.startswith(_SCOPE_PREFIX) or record.tree is None:
                 continue
             scanned += 1
-            probe.extend(find_loop_blocking_sites(
-                {rel: path.read_text(encoding='utf-8', errors='replace')}
-            ))
+            probe.extend(find_loop_blocking_sites_in_trees({record.relpath: record.tree}))
             if probe or scanned >= _OUT_OF_SCOPE_PROBE_CAP:
                 break
 
         assert probe, (
             f'no out-of-scope finding in the first {scanned} first-party files '
-            f'outside {_SCOPE_PREFIX} -- either the other six scope roots got '
+            f'outside {_SCOPE_PREFIX} -- either the other scope roots got '
             f'clean (measured: 123 findings across 294 files at the task 4484 '
             f'amendment pass) or the sweep is broken. Without one, this test '
             f'cannot show the filter is doing anything.'
@@ -1067,62 +1326,65 @@ class TestSweepIsNotVacuous:
         )
 
 
-class TestKnownSiteFloor:
-    """The four ``task_curator.py`` sites task 4484 confirmed by hand."""
+class TestScanHelperStaysInGateScope:
+    """The extracted archive scan must stay where this sweep can still see it.
 
-    # (qualname, callee) pairs, all in
-    # fused-memory/src/fused_memory/middleware/task_curator.py.
-    _CURATOR = 'fused-memory/src/fused_memory/middleware/task_curator.py'
+    Task 5550 moved the escalation-archive walk out of
+    ``reconciliation/harness.py`` into
+    ``fused_memory/reconciliation/escalation_archive.py``, and the ten
+    ``_escalate`` rows in the ledger survive only because the scanner can
+    follow ``_escalate -> _finding_recently_resolved -> ... -> read_text``
+    across that module boundary.  It can do so ONLY because the new module
+    sits under ``_SCOPE_PREFIX``: cross-module resolution sees nothing outside
+    the sweep's ``sources``.
 
-    # No in-flight task removes these two, so they are asserted unconditionally.
-    # Both are `async def _maybe_*` guards lazily loading a YAML registry off
-    # disk on the loop thread -- the same shape as their two siblings below,
-    # and NEITHER had a task filed before task 4484 found them.
-    _UNFILED = {
-        ('TaskCurator._maybe_blocklist_drop', 'load_blocklist'),
-        ('TaskCurator._maybe_route_deterministic', 'load_operational_registry'),
-    }
+    Relocating the helper into the ``escalation`` package -- its otherwise
+    natural home, right next to ``iter_all_escalation_paths`` -- would
+    therefore take that reach out of view entirely.  Nothing would break
+    loudly: the ten rows would go stale, ``test_no_stale_blessings`` would
+    demand their deletion as fixed, and the ledger would quietly lose coverage
+    of a defect (task 5270's) that nobody had fixed.  Moving blocking code out
+    of a guard's field of view is precisely the failure this guard exists to
+    catch, so the constraint is asserted rather than left in a comment.
 
-    # Task 4201 owns these two; when it lands they disappear, which must NOT
-    # turn this gate red.  Hence a subset check, never an equality.
-    _FILED_4201 = {
-        ('TaskCurator._maybe_premise_refuted_drop', 'load_premise_registry'),
-        ('TaskCurator._maybe_premise_refuted_drop', 'premise_refuted_entry'),
-    }
+    Asserted on ``(qualname, callee)`` pairs -- never a hash or a count -- so
+    that task 5270 legitimately removing these sites cannot turn the gate red
+    on success.
+    """
 
-    def _curator_sites(self, tree_scan):
+    _HARNESS = 'fused-memory/src/fused_memory/reconciliation/harness.py'
+
+    def _escalate_sites(self, tree_scan):
         return {
             (f.qualname, f.callee)
             for f in tree_scan.findings
-            if f.filename == self._CURATOR
+            if f.filename == self._HARNESS and f.callee == '_escalate'
         }
 
-    def test_unfiled_curator_sites_are_found(self, tree_scan):
-        """The two previously-UNFILED sites must be found by the live sweep.
+    def test_escalate_still_reaches_a_blocking_primitive(self, tree_scan):
+        """At least one coroutine must still reach a primitive via ``_escalate``."""
+        found = self._escalate_sites(tree_scan)
 
-        These are the ones that make task 4484's case: task 3778's census read
-        ``task_curator.py``'s neighbourhood as covered, task 4091 fixed one
-        sibling and task 4201 filed two more, and these two still had no task
-        at all.  A caller-side sweep names all four at once.
-        """
-        found = self._curator_sites(tree_scan)
-
-        assert found >= self._UNFILED, (
-            f'missing {sorted(self._UNFILED - found)} from {sorted(found)} -- '
-            f'the caller-side property regressed, or the sites were fixed '
-            f'without updating this floor.'
+        assert found, (
+            'no coroutine in reconciliation/harness.py is reported as reaching a '
+            'blocking primitive through _escalate. TWO VERY DIFFERENT CAUSES: if '
+            'task 5270 landed and offloaded _escalate, DELETE this floor entry '
+            'with it. If the reach vanished for any OTHER reason, the archive '
+            'scan helper has been moved out of _SCOPE_PREFIX (fused-memory/src/) '
+            '-- most likely into the escalation package next to '
+            'iter_all_escalation_paths -- the scanner can no longer follow into '
+            "it, and the ledger's ten _escalate rows are now lying about a "
+            'defect that is still live.'
         )
 
-    def test_surviving_4201_sites_are_still_dispositioned_filed(self, tree_scan):
-        """Whichever of 4201's sites remain must still be blessed as ``filed``.
+    def test_surviving_escalate_sites_are_still_dispositioned_filed(self, tree_scan):
+        """Whichever ``_escalate`` sites remain must still be blessed ``filed``.
 
-        A subset check is right -- when 4201 lands its sites disappear and this
-        gate must not go red -- but ``remaining <= found`` on an intersection is
-        a tautology and asserts nothing.  The falsifiable property is the one
-        that actually matters while 4201 is in flight: a site 4201 owns must
-        keep a ledger row saying so, rather than being quietly re-blessed as
-        ``accepted`` (a permanent waiver for a defect somebody is fixing) or
-        losing its row.
+        Same falsifiable property as the 4201 floor above: a site an in-flight
+        task owns must keep a row saying so, rather than being re-blessed as
+        ``accepted`` -- a permanent waiver for a defect somebody is fixing.
+        Task 5550 memoised their archive walk per run but left every miss
+        blocking, so they stay ``filed`` and stay 5270's.
         """
         filed_keys = {
             (relpath, qualname, content_hash)
@@ -1132,15 +1394,15 @@ class TestKnownSiteFloor:
 
         surviving = [
             f for f in tree_scan.findings
-            if f.filename == self._CURATOR and (f.qualname, f.callee) in self._FILED_4201
+            if f.filename == self._HARNESS and f.callee == '_escalate'
         ]
         undispositioned = sorted(
             (f.qualname, f.callee) for f in surviving if site_key(f) not in filed_keys
         )
 
         assert undispositioned == [], (
-            f'task 4201 owns {undispositioned}, but the ledger no longer carries '
-            f'a "filed" row for them. If 4201 landed, DELETE the rows (and this '
+            f'task 5270 owns {undispositioned}, but the ledger no longer carries '
+            f'a "filed" row for them. If 5270 landed, DELETE the rows (and this '
             f'floor entry); do not downgrade them to "accepted", which turns a '
             f'defect someone is fixing into a permanent waiver.'
         )

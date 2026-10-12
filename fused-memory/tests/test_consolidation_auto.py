@@ -743,6 +743,9 @@ class TestMemberHazards:
         The incumbent of THIS topic is in the same fixture and must NOT be
         reported under this code — it is stripped, not refused, and that
         distinction is the whole of rung 3.
+
+        A foreign canonical's detail already names its topic, so also reporting
+        it under ``member_different_topic`` would state the same fact twice.
         """
         members = _members(
             _member('m1'),
@@ -757,6 +760,7 @@ class TestMemberHazards:
         assert [r.ids for r in reasons] == [('x1',)]
         assert 'some-other-topic' in reasons[0].detail
         assert TOPIC in reasons[0].detail
+        assert AutoReasonCode.member_different_topic not in _codes(verdict)
 
     def test_member_stamped_with_a_different_topic_fails(self):
         """The admitted set is `topic in (None, T)` — anything else is a refusal.

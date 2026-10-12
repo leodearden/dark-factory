@@ -702,6 +702,19 @@ assert "G6c: stderr warns of invalid integer (env-var path)" \
 assert "G6c: gc-script NOT invoked (usage error precedes exec)" \
     bash -c '[ ! -f "$1" ] || [ ! -s "$1" ]' _ "$G6_GC_LOG"
 
+# G6d-f: leading-zero (octal-misread) and overflowing magnitudes are rejected.
+# 08 would error out of $(( )) leaving the variable unset, 010 would silently
+# mean 8, and 9223372036854775807 would wrap negative on the 1024^3 multiply.
+for G6_BAD in 08 010 9223372036854775807; do
+    GC_LOG="$G6_GC_LOG" run_sweep --mount "$G6_MOUNT" --gc-script "$G6_GC_STUB" --critical-free-gib "$G6_BAD"
+
+    assert "G6d: --critical-free-gib $G6_BAD exits 2" test "$RC" -eq 2
+    assert "G6d: --critical-free-gib $G6_BAD stderr warns of invalid integer" \
+        bash -c 'printf "%s\n" "$1" | grep -qi "valid integer"' _ "$ERR_OUT"
+    assert "G6d: --critical-free-gib $G6_BAD gc-script NOT invoked" \
+        bash -c '[ ! -f "$1" ] || [ ! -s "$1" ]' _ "$G6_GC_LOG"
+done
+
 # ── G7: df succeeds (exit 0) but reports unparseable avail bytes ─────────────
 # Distinct code path from G3 (which covers a non-zero df EXIT CODE): here df
 # exits 0 but its second line fails the `^[0-9]+$` numeric guard

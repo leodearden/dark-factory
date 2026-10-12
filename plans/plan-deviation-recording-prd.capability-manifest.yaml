@@ -254,11 +254,11 @@ tasks:
       (ruling 8)
     verdict: PASS
     delivered_check:
-      kind: grep
-      pattern: second such escalation on the same task
-      paths:
-      - skills/escalation-watcher/SKILL.md
-      expect: present
+      kind: manual
+      reason: no-regression property of watcher prose (the per-task limit already stands
+        in skills/escalation-watcher/SKILL.md and must survive δ's Limits edit, per PRD
+        D11), so a grep for it passes before δ lands and gates nothing; verified at δ's
+        review. Retired from grep by task 6036.
   - name: rate-rise-fires-flat-does-not
     binding: rejection-mechanism — positive and negative control fixtures observe
       exactly one blocking escalate_info on the synthetic task id vs none

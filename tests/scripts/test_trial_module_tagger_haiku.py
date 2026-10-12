@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 
 import pytest
-import trial_module_tagger_haiku as mod  # pyright: ignore[reportMissingImports]
+import trial_module_tagger_haiku as mod
 
 from orchestrator import module_tagger_prompt
 

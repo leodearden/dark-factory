@@ -29,11 +29,8 @@ from _merge_lane_fakes import drive_merge
 from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.merge_queue import (
-    DROPPED_PLAN_TARGETS_REASON_PREFIX,
-    POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
-    MergeOutcome,
-)
+from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+from orchestrator.merge_queue import DROPPED_PLAN_TARGETS_REASON_PREFIX, MergeOutcome
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 

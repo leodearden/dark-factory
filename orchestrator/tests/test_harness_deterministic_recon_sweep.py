@@ -1338,7 +1338,9 @@ class TestGenericStrandedBlockedReaperSkipsDeterministic:
 # an assumption.  These tests must therefore NOT assert that only one fires.
 # ---------------------------------------------------------------------------
 
-def _pinning_esc(esc_id: str = 'esc-pin-1', *, task_id: str = 'tid-pinned') -> Escalation:
+def _pinning_esc(
+    esc_id: str = 'esc-pin-1', *, task_id: str = 'tid-pinned', level: int = 1,
+) -> Escalation:
     """A REAL pending record — the shape ``get_by_task`` actually returns."""
     return Escalation(
         id=esc_id,
@@ -1347,7 +1349,7 @@ def _pinning_esc(esc_id: str = 'esc-pin-1', *, task_id: str = 'tid-pinned') -> E
         severity='blocking',
         category='infra_issue',
         summary=f'{esc_id} summary',
-        level=1,
+        level=level,
         timestamp='2026-07-01T00:00:00+00:00',
     )
 
@@ -1848,9 +1850,11 @@ def _streak_recon_harness(tmp_path: Path) -> tuple[Harness, _FakeClock]:
     return h, clock
 
 
-def _hold(h: Harness, tid: str = 'tid-pinned', esc_id: str = 'esc-pin-1') -> Escalation:
+def _hold(
+    h: Harness, tid: str = 'tid-pinned', esc_id: str = 'esc-pin-1', *, level: int = 1,
+) -> Escalation:
     """Put a REAL pending record on *tid*, so the sweep's dedup skips it."""
-    esc = _pinning_esc(esc_id, task_id=tid)
+    esc = _pinning_esc(esc_id, task_id=tid, level=level)
     h._escalation_queue.submit(esc)  # type: ignore[union-attr]
     return esc
 
@@ -1895,6 +1899,23 @@ class TestDeterministicReconStreakRelease:
         alarms = _sentinel_alarms(h)
         assert len(alarms) == 1, f'expected one sentinel alarm, got {alarms}'
         assert alarms[0].level == 1
+
+    @pytest.mark.asyncio
+    async def test_a_hold_pinned_only_by_an_l2_files_no_alarm(self, tmp_path: Path) -> None:
+        """Task 4541 RC#1 at the deploy site, over live ``Escalation`` rows.
+
+        ``test_a_sustained_hold_files_one_alarm`` is the counter-signal: the
+        same hold at the level-1 default still alarms.
+        """
+        h, clock = _streak_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        # Source C reads task statuses for every pending L2; keep it inert.
+        h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
+        _hold(h, level=2)
+
+        await _recon_passes(h, clock, 6)
+
+        assert _sentinel_alarms(h) == []
 
     @pytest.mark.asyncio
     async def test_the_next_pass_after_the_hold_clears_resolves_the_alarm(
@@ -1980,6 +2001,68 @@ class TestDeterministicReconStreakRelease:
         # itself contributed no record of its own to the subject.
         real = h._escalation_queue.get_by_task('tid-pinned', status='pending')  # type: ignore[union-attr]
         assert [e.category for e in real] == ['stranded_blocked']
+
+    @staticmethod
+    def _wrap(h: Harness, alarm_id: str, *, task_id: str, category: str) -> Escalation:
+        """Hand-mint the L2 an auto-watcher promote of *alarm_id* would produce."""
+        wrapper = Escalation(
+            id=f'esc-wrap-{task_id}', task_id=task_id,
+            agent_role='escalation-watcher-auto', severity='blocking',
+            category=category, summary='veto streak wrapper', level=2,
+            members=[alarm_id],
+        )
+        h._escalation_queue.submit(wrapper)  # type: ignore[union-attr]
+        return wrapper
+
+    @pytest.mark.asyncio
+    async def test_a_sentinel_id_wrapper_stands_down_with_its_alarm(
+        self, tmp_path: Path,
+    ) -> None:
+        """Task 4541 RC#2, steady state: the wrapper is judged by MEMBERSHIP."""
+        h, clock = _streak_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        held = _hold(h)
+        await _recon_passes(h, clock, 3)
+        (alarm,) = _sentinel_alarms(h)
+        wrapper = self._wrap(
+            h, alarm.id, task_id=f'{RECOVERY_VETO_STREAK_SENTINEL_PREFIX}tid-pinned',
+            category='design_concern',
+        )
+
+        h._escalation_queue.resolve(held.id, 'unblocked')  # type: ignore[union-attr]
+        clock.advance(_RECON_INTERVAL)
+        await h._run_deterministic_recon_sweep()
+
+        queue = h._escalation_queue
+        assert queue.get(alarm.id).status != 'pending'  # type: ignore[union-attr]
+        assert queue.get(wrapper.id).status != 'pending'  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_a_real_id_wrapper_is_discharged_when_the_task_leaves_the_sweep(
+        self, tmp_path: Path,
+    ) -> None:
+        """Task 4541 RC#2, the esc-5469-11 legacy shape.
+
+        A blocking L2 on the REAL id is itself a pin on that task, so resolving
+        the original hold cannot end the veto: the wrapper holds it instead.
+        This hold ends the other way the release is built for — the task
+        leaves the candidate set (it went done or was cancelled).
+        """
+        h, clock = _streak_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        held = _hold(h)
+        await _recon_passes(h, clock, 3)
+        (alarm,) = _sentinel_alarms(h)
+        wrapper = self._wrap(h, alarm.id, task_id='tid-pinned', category='risk_identified')
+
+        h._escalation_queue.resolve(held.id, 'unblocked')  # type: ignore[union-attr]
+        h.scheduler.get_tasks = AsyncMock(return_value=[])
+        clock.advance(_RECON_INTERVAL)
+        await h._run_deterministic_recon_sweep()
+
+        queue = h._escalation_queue
+        assert queue.get(alarm.id).status != 'pending'  # type: ignore[union-attr]
+        assert queue.get(wrapper.id).status != 'pending'  # type: ignore[union-attr]
 
 
 class TestDeterministicReconStreakReleaseIsSiteScoped:

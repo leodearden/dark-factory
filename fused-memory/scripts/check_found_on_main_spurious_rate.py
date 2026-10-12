@@ -87,15 +87,15 @@ the predicate convention; stdout is human/log triage plus one machine
   - Exit 2: ``--since`` could not be parsed — a caller usage error, kept
     on its own code so it is never mistaken for "offenders found" (1) by
     a caller branching on exit code alone.
-  - Exit 3: the project task store does not exist — ``--project-root``
-    names a path with no ``.taskmaster/tasks/tasks.db`` (a task worktree,
-    typically). Reserved because ``SqliteTaskBackend.get_tasks``
-    auto-creates that db and returns ``{"tasks": []}`` for ANY
-    ``project_root`` without raising, so the alternative is 0 tasks, 0
-    offenders and exit 0: a false all-clear on a check whose exit 0 means
-    "check passed". See
-    ``fused_memory/utils/target_store_preflight.py`` — the normative copy
-    of the policy, the measurement behind it, and the remedy.
+  - Exit 3: the project task store does not exist or holds no tasks —
+    ``--project-root`` names a path with no populated
+    ``.taskmaster/tasks/tasks.db`` (a task worktree, typically). Reserved
+    because ``SqliteTaskBackend.get_tasks`` auto-creates that db and returns
+    ``{"tasks": []}`` for ANY ``project_root`` without raising, so the
+    alternative is 0 tasks, 0 offenders and exit 0: a false all-clear on a
+    check whose exit 0 means "check passed". See
+    ``fused_memory/utils/target_store_preflight.py`` — the normative copy of
+    the policy, the measurement behind it, and the remedy.
 
     Not folded into 1, unlike the unconfigured-backend case that shares
     that rung: ``parse_since``'s ValueError is raised where main() can see
@@ -192,7 +192,7 @@ from shared.task_metadata import parse_metadata
 
 from fused_memory.utils.target_store_preflight import (
     TargetStoreMissing,
-    assert_task_store_exists,
+    assert_task_store_populated,
 )
 
 logger = logging.getLogger('check_found_on_main_spurious_rate')
@@ -497,7 +497,7 @@ async def _run(args: argparse.Namespace, since: datetime) -> int:
     # rather than in main() so programmatic callers inherit the guard;
     # main() owns mapping the refusal onto exit 3 (module docstring
     # "Contract"), exactly as it already does for parse_since -> 2.
-    assert_task_store_exists(
+    assert_task_store_populated(
         args.project_root, operation='check_found_on_main_spurious_rate',
     )
 

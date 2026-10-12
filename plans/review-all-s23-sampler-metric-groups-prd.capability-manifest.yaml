@@ -1,0 +1,113 @@
+prd: plans/review-all-s23-sampler-metric-groups-prd.md
+schema_version: 1
+tasks:
+  - label: "α"
+    task_id: 6772
+    title: "Sampler store: leaf as a column, public schema with additive migration, one connection seam"
+    note: "Closes fk-ab2c587ff5a9 and fk-d207683eef5a; lands the store.py half of fk-fcefc2576467/fk-3e77aa904a0a and the schema half of fk-895f269d7bb5, which β closes."
+    capabilities:
+      - name: "leaf-column-additive-migration"
+        binding: "capability→producer (α) — RunStore feature-detect idiom mirrored; migration measured 43 s on a copy of the live corpus"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "ADD COLUMN leaf"
+          paths: ["sampler/src/sampler/store.py"]
+          expect: present
+      - name: "stem-leaf-parser-removed-from-admission"
+        binding: "anti-inversion — sampler.sampler::_matches_a_stem deleted once keys carry the leaf"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_matches_a_stem"
+          paths: ["sampler/src/"]
+          expect: absent
+      - name: "calibration-glob-fetch-removed"
+        binding: "anti-inversion — scripts/load-threshold-calibration.py reads by metric and keys series by leaf"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "metric GLOB \\?"
+          paths: ["scripts/load-threshold-calibration.py"]
+          expect: absent
+      - name: "dashboard-schema-copy-removed"
+        binding: "anti-inversion — dashboard imports sampler.store.SCHEMA"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "LOAD_SAMPLES_SCHEMA"
+          paths: ["dashboard/src/"]
+          expect: absent
+      - name: "dashboard-declares-sampler-dependency"
+        binding: "capability→producer (α) — dashboard/pyproject.toml workspace dependency"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "dark-factory-load-sampler"
+          paths: ["dashboard/pyproject.toml"]
+          expect: present
+      - name: "live-corpus-migrated-by-real-tick"
+        binding: "INV-13 producer proof — the timer-fired sampler writes leaf rows to data/load-samples.db after merge"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "live DB read after merge (no ':' in metric; distinct leaf count equals live leaf count); not a tree property"
+  - label: "β"
+    task_id: 6773
+    title: "One MetricGroup table, its projections, and INV-14 sampler-vocabulary-one-table"
+    note: "Closes fk-e86a10b9e217, fk-37f494b26355, fk-be1621618dee, fk-fcefc2576467, fk-895f269d7bb5, fk-3e77aa904a0a. Depends on α and on S25's scripts/_checkout.py leaf (id wired at phase B)."
+    capabilities:
+      - name: "metric-groups-table-exists"
+        binding: "capability→producer (β) — sampler.metrics.METRIC_GROUPS"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "METRIC_GROUPS"
+          paths: ["sampler/src/sampler/metrics.py"]
+          expect: present
+      - name: "hand-kept-arm-table-removed"
+        binding: "anti-inversion — ARM_METRICS derived from the table replaces ARM_METRIC_STEMS"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "ARM_METRIC_STEMS"
+          paths: ["sampler/src/", "scripts/"]
+          expect: absent
+      - name: "admission-asserts-replaced"
+        binding: "anti-inversion — per-group explicit check (D4)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "assert not unexpected_"
+          paths: ["sampler/src/"]
+          expect: absent
+      - name: "calibration-lockstep-reconciler-removed"
+        binding: "anti-inversion — the script derives its selectors, so the lockstep test goes"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "TestCalibrationScriptArmTableLockstep"
+          paths: ["sampler/tests/"]
+          expect: absent
+      - name: "calibration-binds-checkout-for-system-python"
+        binding: "producer:task-6758 (S25 γ, scripts/_checkout.py binding every workspace member's src incl. sampler/src; its B1 asserts sampler.__file__) — upstream of β, dependency wired at decompose 2026-10-11"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_checkout"
+          paths: ["scripts/load-threshold-calibration.py"]
+          expect: present
+      - name: "invariant-registered"
+        binding: "capability→producer (β) — four-site lockstep edit guarded by scripts/tests/test_design_invariants_consistency.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "sampler-vocabulary-one-table"
+          paths: ["docs/legibility/design-invariants.md"]
+          expect: present
+      - name: "vocabulary-guard-rejects-a-stray-literal"
+        binding: "rejection-mechanism — produced by β; its fixture-module test observes the flag firing"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "rejection quality is judged by the guard's own fixture tests, not a grep"

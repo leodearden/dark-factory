@@ -136,10 +136,9 @@ tasks:
       closure-staleness sweep, retired by task 5247.
     verdict: PASS
     delivered_check:
-      kind: grep
-      pattern: reclaim-orphaned-worktrees-predicate
+      kind: path
       paths:
-      - scripts/
+      - scripts/reclaim-orphaned-worktrees-predicate.sh
       expect: present
   - name: link-to-successor-e2e
     binding: DAG-direction — mint (r2) and category (r3) produced upstream; the task

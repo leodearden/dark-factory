@@ -708,7 +708,7 @@ class TestB6ReportAtomicity:
 # shared seam rather than by importing orchestrator.steward (shared/ must
 # not import orchestrator/ -- see this task's plan design_decisions). A
 # cap-hit resume that then wedges (zero-output timeout on the resumed
-# session) triggers the rebuild_prompt(True) fresh-session fallback and
+# session) triggers a fresh-session fallback on the rebuilt prompt and
 # clears the wedged resume_session_id rather than perpetuating it (consumer
 # side); the loop terminates bounded, and the gate is left consistent
 # afterward (producer side).
@@ -745,10 +745,11 @@ class TestB7StewardWedgeGuardInherited:
 
         gate = make_boundary_gate(['acct-0', 'acct-1'])
         cli = scripted_cli(cap_result, wedge_result, ok_result)
-        rebuild_calls: list[bool] = []
+        builds = 0
 
-        async def rebuild_prompt(session_lost: bool) -> str:
-            rebuild_calls.append(session_lost)
+        async def rebuild_prompt() -> str:
+            nonlocal builds
+            builds += 1
             return 'rebuilt fresh prompt'
 
         with patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock):
@@ -763,10 +764,11 @@ class TestB7StewardWedgeGuardInherited:
 
         # Consumer side: the fresh-session fallback fired exactly once, the
         # wedged session was never re-resumed, and the loop terminated
-        # bounded with the eventual success.
+        # bounded with the eventual success.  The builder is consulted once
+        # per re-dispatch: the resume discards its build, the fallback sends it.
         assert result.success is True
         assert len(cli.calls) == 3
-        assert rebuild_calls == [True]
+        assert builds == 2
         assert cli.calls[1].get('resume_session_id') == 'sess-cap-123'
         assert cli.calls[2].get('resume_session_id') is None
         assert cli.calls[2]['prompt'] == 'rebuilt fresh prompt'

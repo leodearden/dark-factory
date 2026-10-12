@@ -1,7 +1,8 @@
-"""Escalation resolution classification helpers.
+"""Escalation classification helpers.
 
-Single site (INV-5) for two related but distinct classification concerns
-described in plans/escalation-lifecycle-dashboard-prd.md Contract Seam 1:
+Single site (INV-5) for three related but distinct classification concerns.
+The first two are described in plans/escalation-lifecycle-dashboard-prd.md
+Contract Seam 1; the third in plans/info-l0-disposition-router-prd.md D8:
 
 - ``classify_resolver_tier`` — maps a ``resolved_by`` attribution string to a
   coarse resolver *tier* (human / cascade / auto-watcher / steward /
@@ -11,13 +12,18 @@ described in plans/escalation-lifecycle-dashboard-prd.md Contract Seam 1:
   turns a resolved/dismissed ``Escalation`` record into a
   ``(class, provenance)`` pair, so aggregators can report the stamped-vs-
   inferred split.
+- ``info_l0_mechanical_class`` — which mechanical info-L0 class a record
+  belongs to, if any: a registered filer role (``INFO_L0_MECHANICAL_ROLES``)
+  or the discriminated done-step-commit orphan (``is_done_step_commit_orphan``).
 
-Both helpers are pure functions with no I/O — callers (queue.py, server.py,
+All helpers are pure functions with no I/O — callers (queue.py, server.py,
 and future dashboard aggregators) import them rather than re-deriving the
 same resolver membership or benign/actionable logic independently.
 """
 
 from __future__ import annotations
+
+from collections.abc import Set as AbstractSet
 
 from escalation.models import Escalation
 
@@ -110,3 +116,52 @@ def default_resolution_class_for_resolver(resolved_by: str | None) -> str | None
     caller passes an explicit ``resolution_class``.
     """
     return 'benign' if classify_resolver_tier(resolved_by) == 'reaper-sweep' else None
+
+
+# The orchestrator filer roles whose info-severity L0s are mechanical notices,
+# closed per class as status-info (plans/info-l0-disposition-router-prd.md D8).
+# Fail-loud rule: a role missing here routes to the curator leg, never to a
+# silent status-info close, so a filer that renames its role degrades loudly.
+INFO_L0_MECHANICAL_ROLES: frozenset[str] = frozenset({
+    'orchestrator-starvation-watchdog',
+    'orchestrator-merge-skew-tripwire',
+    'orchestrator-no-landings-breaker',
+    'orchestrator-warm-base-hard-down',
+    'orchestrator-verify-host-monitor',
+    'orchestrator-offline-lane',
+})
+
+DONE_STEP_COMMIT_ORPHAN_CLASS = 'done-step-commit-orphan'
+
+
+def is_done_step_commit_orphan(esc: Escalation) -> bool:
+    """Return True iff *esc* is the done-step-commit orphan class filed by
+    ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._escalate_unreconciled_done_step``.
+
+    Task 2725: this is the sole, stable, machine-readable discriminator for
+    the one orphan-L0 class that is a false positive when its subject task
+    was requeue-rebased — the step's recorded ``commit`` SHA is a
+    pre-rebase intermediate no longer reachable from main, but the step's
+    content landed on main under a new SHA via the merge.
+    ``suggested_action='verify_wip_reconciliation'`` is set only by that
+    one filing site (grep-confirmed sole occurrence repo-wide), so matching
+    on it (plus ``agent_role``/``category``) is robust to summary-wording
+    changes, unlike a fragile summary-substring match.
+    """
+    return (
+        esc.agent_role == 'orchestrator'
+        and esc.category == 'infra_issue'
+        and esc.suggested_action == 'verify_wip_reconciliation'
+    )
+
+
+def info_l0_mechanical_class(
+    record: Escalation,
+    mechanical_roles: AbstractSet[str] = INFO_L0_MECHANICAL_ROLES,
+) -> str | None:
+    """The status-info class key for *record* (the D8 status-info leg), or None."""
+    if record.agent_role in mechanical_roles:
+        return record.agent_role
+    if is_done_step_commit_orphan(record):
+        return DONE_STEP_COMMIT_ORPHAN_CLASS
+    return None

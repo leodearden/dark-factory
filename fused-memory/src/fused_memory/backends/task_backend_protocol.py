@@ -129,6 +129,7 @@ class TaskBackendProtocol(Protocol):
         *,
         claimant_run_id: str | None = None,
         heartbeat_at: str | None = None,
+        pending_since_now: str | None = None,
     ) -> SetTaskStatusResult | StatusWriteNotPersistedResult:
         """Update ``status``, optionally stamping the claimant columns.
 
@@ -137,6 +138,13 @@ class TaskBackendProtocol(Protocol):
         (a sentinel default leaves the column untouched); the protocol exposes
         them as ``None``-defaulted so callers may supply them and backends stay
         assignable to this shape.
+
+        ``pending_since_now`` supplies the clock for the ``metadata.pending_since``
+        stamp (task 3816); ``None`` means the backend reads its own clock. A
+        string is used verbatim and must be shaped like
+        ``fused_memory/backends/sqlite_task_backend.py::task_timestamp_now``,
+        never a ``datetime.isoformat()`` string. It supplies only the clock:
+        whether a stamp is owed is still the backend's transition table.
 
         Returns :class:`StatusWriteNotPersistedResult` instead of a fabricated
         success (task 2649) when a post-write read-back shows the status
@@ -206,7 +214,12 @@ class TaskBackendProtocol(Protocol):
         * ``metadata_mode='additive'`` — recursive list union+dedup,
           scalar/type-collision OLD-wins.  Required by list-append callers.
         * ``metadata_mode='replace'`` — whole-blob overwrite.  Bypasses the
-          corrupt-blob guard; the sanctioned repair path.
+          corrupt-blob guard; the sanctioned repair path.  It is the ONLY mode
+          that can retire a key ('merge'/'additive' have no deletion
+          sentinel).  It is usable on done/merged tasks provided the payload
+          carries the stored ``metadata.done_provenance`` verbatim: adding,
+          changing or dropping it is rejected with
+          ``DoneProvenanceWriteAuthorityError`` (see the MUST below).
         * ``append=True`` (legacy shim) → 'additive'.  A bare ``append=False``
           (no ``metadata_mode``) on a metadata write is **rejected** — it used
           to silently 'replace' and wiped a live in-progress task (the task-2180
@@ -253,6 +266,16 @@ class TaskBackendProtocol(Protocol):
         phantom-done, and done-provenance gates.  Accepting ``status`` here
         would silently bypass all three.
 
+        **Implementations MUST NOT let update_task add, change or remove
+        ``metadata.done_provenance``** — ``set_task_status`` is its only
+        sanctioned writer, for the same reason.  In every mode except
+        ``'replace'``, reject a payload carrying the key unconditionally, before
+        the row lookup (``DoneProvenanceWriteAuthorityError``).  Under
+        ``'replace'``, compare against the STORED value read in the same
+        transaction as the write: admit the payload only when the key's presence
+        and JSON value match the stored row exactly, and refuse a payload
+        carrying the key when the stored blob does not parse.
+
         The ``status`` param is kept in the signature as a **reject-trap**: it
         preserves the ``status=None`` passthrough that ``server/tools.py`` and
         ``task_interceptor.py`` forward via ``**kwargs``, and it makes the
@@ -282,6 +305,16 @@ class TaskBackendProtocol(Protocol):
         project_root: str,
         tag: str | None = None,
     ) -> DependencyResult: ...
+
+    async def get_dependency_edges(
+        self, project_root: str, tag: str | None = None
+    ) -> dict[int, list[int]]:
+        """Return ``{task_id: [depends_on, ...]}`` — the dependency edge set alone.
+
+        Lists are sorted ascending, and a task with no dependencies is ABSENT
+        from the map rather than present with an empty list.
+        """
+        ...
 
     async def validate_dependencies(
         self, project_root: str, tag: str | None = None

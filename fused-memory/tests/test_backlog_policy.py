@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 from _fm_helpers import pydantic_spec, submit_and_resolve
+from shared.project_layout import escalation_queue_dir
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.reconciliation import backlog_policy
@@ -82,6 +83,16 @@ async def _seed_buffered(event_buffer: EventBuffer, project_id: str, n: int) -> 
             payload={'seed': True},
         )
         await event_buffer.push(event)
+
+
+def _pending_records(esc_dir: Path) -> dict[str, dict]:
+    """Every pending record in ``esc_dir``, keyed by id."""
+    out = {}
+    for path in sorted(esc_dir.glob('esc-*.json')):
+        body = json.loads(path.read_text(encoding='utf-8'))
+        if body.get('status') == 'pending':
+            out[body['id']] = body
+    return out
 
 
 # ── BacklogPolicy.check ───────────────────────────────────────────────────
@@ -173,6 +184,23 @@ async def test_escalation_when_over_threshold_and_orchestrator_live(
 
 
 @pytest.mark.asyncio
+async def test_escalation_lands_in_the_layout_escalation_queue_when_relocated(
+    event_buffer, tmp_path, escalation_queue_relocation,
+):
+    await _seed_buffered(event_buffer, 'proj', n=12)
+    project_root = tmp_path / 'proj_root'
+    project_root.mkdir()
+    policy = BacklogPolicy(event_buffer, _StubQueue(), lambda _: True, hard_limit=10)
+
+    verdict = await policy.check('proj', project_root=str(project_root))
+
+    assert verdict.escalation_path is not None
+    assert Path(verdict.escalation_path).parent == escalation_queue_dir(project_root)
+    assert Path(verdict.escalation_path).exists()
+    assert not (project_root / escalation_queue_relocation.legacy_relpath).exists()
+
+
+@pytest.mark.asyncio
 async def test_rate_limit_prevents_spam(event_buffer, tmp_path):
     """Two triggers inside the rate window → one file only."""
     await _seed_buffered(event_buffer, 'proj', n=12)
@@ -256,9 +284,10 @@ async def test_second_window_folds_into_the_one_pending_record(
     # being dropped by the rate limit.
     assert child_id != body['id']
 
-    # The four policy-only keys survive the fold: neither Escalation.to_json()
-    # (submit) nor from_json -> _rewrite (attach_dedupe_child) round-trips
-    # them, so both branches must re-merge.
+    # The record's identity survives the fold: project_id as a dataclass
+    # field, the policy-only keys because both branches re-merge them —
+    # neither Escalation.to_json() (submit) nor from_json -> _rewrite
+    # (attach_dedupe_child) round-trips them.
     assert body['project_id'] == 'proj'
     assert body['error_type'] == 'ReconciliationBacklogExceeded'
     assert body['backlog'] == 12
@@ -1108,6 +1137,29 @@ def _persisted_record(esc_dir: Path, esc_id: str) -> dict:
     return json.loads(archived[-1].read_text(encoding='utf-8'))
 
 
+def _write_pending_halt_record(esc_dir: Path, esc_id: str, *, project_id: str) -> None:
+    """Write a pending judge-halt record for *project_id* straight into *esc_dir*."""
+    (esc_dir / f'{esc_id}.json').write_text(
+        json.dumps({
+            'id': esc_id,
+            'task_id': None,
+            'agent_role': 'fused-memory',
+            'severity': 'blocking',
+            'category': 'infra_issue',
+            'summary': f'Reconciliation HALTED for {project_id}',
+            'detail': f'halt belonging to {project_id}',
+            'suggested_action': 'inspect_judge_halt',
+            'timestamp': '2026-07-28T00:00:00+00:00',
+            'status': 'pending',
+            'level': 1,
+            'workflow_state': 'infra',
+            'project_id': project_id,
+            'error_type': 'ReconciliationJudgeHalted',
+        }, indent=2),
+        encoding='utf-8',
+    )
+
+
 class TestOnJudgeUnhalt:
     """Clearing a halt must close the escalation the halt opened.
 
@@ -1140,25 +1192,7 @@ class TestOnJudgeUnhalt:
 
         esc_dir = project_root / 'data' / 'escalations'
         other_id = 'esc-reconciliation-halt-other-project'
-        (esc_dir / f'{other_id}.json').write_text(
-            json.dumps({
-                'id': other_id,
-                'task_id': None,
-                'agent_role': 'fused-memory',
-                'severity': 'blocking',
-                'category': 'infra_issue',
-                'summary': 'Reconciliation HALTED for other',
-                'detail': 'halt belonging to a DIFFERENT project',
-                'suggested_action': 'inspect_judge_halt',
-                'timestamp': '2026-07-28T00:00:00+00:00',
-                'status': 'pending',
-                'level': 1,
-                'workflow_state': 'infra',
-                'project_id': 'other',
-                'error_type': 'ReconciliationJudgeHalted',
-            }, indent=2),
-            encoding='utf-8',
-        )
+        _write_pending_halt_record(esc_dir, other_id, project_id='other')
         return policy, esc_dir, halt_id, backlog_id, other_id
 
     @pytest.mark.asyncio
@@ -1191,8 +1225,8 @@ class TestOnJudgeUnhalt:
 
         # The CLOSED record must still identify its project and fault kind.
         # resolve() persists Escalation.to_json(), and from_dict keeps only
-        # dataclass fields, so without a re-merge these four policy-owned keys
-        # are destroyed on close — and the forensic query that diagnosed this
+        # dataclass fields, so without a re-merge the policy-owned keys are
+        # destroyed on close — and the forensic query that diagnosed this
         # incident ('which escalation files carry ReconciliationJudgeHalted')
         # stops working against every auto-closed record.
         persisted = _persisted_record(esc_dir, halt_id)
@@ -1280,6 +1314,21 @@ class TestOnJudgeUnhalt:
         )
         assert 'nope' in text
 
+    @pytest.mark.asyncio
+    async def test_closes_the_halt_in_the_layout_escalation_queue_when_relocated(
+        self, event_buffer, tmp_path, escalation_queue_relocation,
+    ):
+        project_root = tmp_path / 'proj_root'
+        esc_dir = escalation_queue_dir(project_root)
+        esc_dir.mkdir(parents=True)
+        halt_id = 'esc-reconciliation-halt-proj-seeded'
+        _write_pending_halt_record(esc_dir, halt_id, project_id='proj')
+        policy = BacklogPolicy(event_buffer, _StubQueue(), lambda _: True)
+        policy.register_project_root('proj', str(project_root))
+
+        assert await policy.on_judge_unhalt('proj') == [halt_id]
+        assert not (project_root / escalation_queue_relocation.legacy_relpath).exists()
+
 
 # ── Fold isolation: what the fingerprint must keep apart ──────────────────
 
@@ -1298,16 +1347,6 @@ class TestFoldIsolation:
     Driven entirely through the public surface: no test reaches into
     ``_maybe_write_escalation``.
     """
-
-    @staticmethod
-    def _pending(esc_dir: Path) -> dict[str, dict]:
-        """Every pending record in ``esc_dir``, keyed by id."""
-        out = {}
-        for path in sorted(esc_dir.glob('esc-*.json')):
-            body = json.loads(path.read_text(encoding='utf-8'))
-            if body.get('status') == 'pending':
-                out[body['id']] = body
-        return out
 
     @pytest.mark.asyncio
     async def test_judge_halt_does_not_fold_into_a_pending_backlog_parent(
@@ -1342,7 +1381,7 @@ class TestFoldIsolation:
         assert halt_verdict.escalation_path != backlog_verdict.escalation_path
 
         esc_dir = project_root / 'data' / 'escalations'
-        pending = self._pending(esc_dir)
+        pending = _pending_records(esc_dir)
         assert len(pending) == 2, sorted(pending)
 
         backlog_ids = [i for i in pending if i.startswith('esc-reconciliation-backlog-')]
@@ -1386,16 +1425,8 @@ class TestFoldIsolation:
             rate_limit_seconds=900.0,
             time_provider=now,
         )
-        # The 1s offsets are LOAD-BEARING, not cosmetic. The escalation id is
-        # derived from ``kind`` and the clock alone (``_ESC_ID_PREFIXES`` +
-        # isoformat), with nothing project-scoped in it, so two projects
-        # escalating at the SAME clock reading mint the same id and the second
-        # submit overwrites the first at the same path. That id collision
-        # predates this fold mechanism (it is byte-identical at base
-        # 63a2984c65) and is unreachable in production, where ``time.time()``
-        # resolves to microseconds; a frozen test clock is what makes it
-        # certain. Offsetting keeps this test measuring FOLD isolation instead
-        # of that collision — see the follow-up filed for the id scheme.
+        # The 1s offsets keep this test measuring fold isolation alone; same-tick
+        # id scoping is pinned separately by ``TestEscalationIdScoping``.
         await policy.check('proj_a', project_root=str(shared_root))
         clock['now'] += 1.0
         await policy.check('proj_b', project_root=str(shared_root))
@@ -1406,7 +1437,7 @@ class TestFoldIsolation:
         assert v_a.escalation_path != v_b.escalation_path
 
         esc_dir = shared_root / 'data' / 'escalations'
-        pending = self._pending(esc_dir)
+        pending = _pending_records(esc_dir)
         assert len(pending) == 2, sorted(pending)
         by_project = {body['project_id']: body for body in pending.values()}
         assert set(by_project) == {'proj_a', 'proj_b'}
@@ -1468,7 +1499,7 @@ class TestFoldIsolation:
         assert verdict.escalation_path is not None
         assert Path(verdict.escalation_path).name != foreign_path.name
 
-        pending = self._pending(esc_dir)
+        pending = _pending_records(esc_dir)
         assert len(pending) == 2, sorted(pending)
         own = [i for i in pending if i.startswith('esc-reconciliation-backlog-')]
         assert len(own) == 1, sorted(pending)
@@ -1478,12 +1509,101 @@ class TestFoldIsolation:
         assert pending[foreign_id].get('dedupe_count', 0) == 0
 
 
+class TestEscalationIdScoping:
+    """Two projects sharing one escalation directory and escalating on the
+    same clock reading keep separate records, because the id is project-scoped.
+    """
+
+    @staticmethod
+    def _frozen_policy(event_buffer: EventBuffer, clock: dict) -> BacklogPolicy:
+        return BacklogPolicy(
+            event_buffer,
+            _StubQueue(),
+            lambda _: True,
+            hard_limit=10,
+            rate_limit_seconds=900.0,
+            time_provider=lambda: clock['now'],
+        )
+
+    @pytest.mark.asyncio
+    async def test_two_projects_on_one_frozen_tick_keep_separate_records(
+        self, event_buffer, tmp_path,
+    ):
+        await _seed_buffered(event_buffer, 'proj_a', n=12)
+        await _seed_buffered(event_buffer, 'proj_b', n=12)
+        shared_root = tmp_path / 'shared_root'
+        shared_root.mkdir()
+        clock = {'now': 1_000_000.0}
+        policy = self._frozen_policy(event_buffer, clock)
+
+        first_a = await policy.check('proj_a', project_root=str(shared_root))
+        first_b = await policy.check('proj_b', project_root=str(shared_root))
+        assert first_a.escalation_path is not None
+        assert first_b.escalation_path is not None
+        assert first_a.escalation_path != first_b.escalation_path
+
+        esc_dir = shared_root / 'data' / 'escalations'
+        pending = _pending_records(esc_dir)
+        assert len(pending) == 2, sorted(pending)
+        by_project = {body['project_id']: body for body in pending.values()}
+        assert set(by_project) == {'proj_a', 'proj_b'}
+        assert (
+            by_project['proj_a']['dedupe_fingerprint']
+            != by_project['proj_b']['dedupe_fingerprint']
+        )
+        for project_id, verdict in (('proj_a', first_a), ('proj_b', first_b)):
+            assert verdict.escalation_path is not None
+            record = by_project[project_id]
+            assert Path(verdict.escalation_path).stem == record['id']
+            assert record['dedupe_count'] == 0
+            assert project_id in record['id']
+
+        clock['now'] += 901.0
+        second_a = await policy.check('proj_a', project_root=str(shared_root))
+        second_b = await policy.check('proj_b', project_root=str(shared_root))
+
+        pending = _pending_records(esc_dir)
+        assert len(pending) == 2, sorted(pending)
+        by_project = {body['project_id']: body for body in pending.values()}
+        assert by_project['proj_a']['dedupe_count'] == 1
+        assert by_project['proj_b']['dedupe_count'] == 1
+        assert second_a.escalation_path == first_a.escalation_path
+        assert second_b.escalation_path == first_b.escalation_path
+
+    @pytest.mark.asyncio
+    async def test_project_ids_differing_only_in_path_unsafe_characters_never_collide(
+        self, event_buffer, tmp_path,
+    ):
+        await _seed_buffered(event_buffer, 'team/a', n=12)
+        await _seed_buffered(event_buffer, 'team_a', n=12)
+        shared_root = tmp_path / 'shared_root'
+        shared_root.mkdir()
+        clock = {'now': 1_000_000.0}
+        policy = self._frozen_policy(event_buffer, clock)
+
+        slashed = await policy.check('team/a', project_root=str(shared_root))
+        underscored = await policy.check('team_a', project_root=str(shared_root))
+        assert slashed.escalation_path is not None
+        assert underscored.escalation_path is not None
+        assert slashed.escalation_path != underscored.escalation_path
+
+        esc_dir = shared_root / 'data' / 'escalations'
+        assert Path(slashed.escalation_path).parent == esc_dir
+        assert Path(underscored.escalation_path).parent == esc_dir
+
+        pending = _pending_records(esc_dir)
+        assert len(pending) == 2, sorted(pending)
+        assert {body['project_id'] for body in pending.values()} == {
+            'team/a', 'team_a',
+        }
+
+
 class TestPolicyKeyCoupling:
     """``_POLICY_ONLY_KEYS`` must describe what the write path actually stamps.
 
     The constant is consumed by the close path and the write path, and nothing
     about the language couples the two: before ``_policy_keys`` the write path
-    repeated the four names in a literal, so adding a fifth key would have
+    repeated the names in a literal, so adding a key would have
     restored it on close while never stamping it on write — leaving a key that
     exists only on archived records. These pin both halves of the coupling.
     """
@@ -1512,16 +1632,15 @@ class TestDegradedFilingPaths:
     """What the policy REPORTS when a record is filed but cannot be stamped.
 
     Filing is two phases — ``submit_or_dedupe`` then the policy-key merge — so
-    a record can exist on disk while carrying none of the keys that make it
-    attributable. ``queue.submit`` persists ``Escalation.to_json()`` and
+    a record can exist on disk while carrying none of the keys that attribute
+    it to a fault kind. ``queue.submit`` persists ``Escalation.to_json()`` and
     ``attach_dedupe_child`` re-hydrates through ``Escalation.from_json``, so
     BOTH phases strip them and only the merge puts them back.
 
-    A record in that state cannot be auto-closed: ``on_judge_unhalt`` skips
-    every candidate whose ``project_id`` does not match. So the verdict must
-    report NO path — ``harness._notify_judge_halt`` claims its per-process halt
-    sentinel only on a non-None ``escalation_path``, and claiming it on an
-    unattributable record retires the retry that would have rescued it.
+    So the verdict must report NO path — ``harness._notify_judge_halt`` claims
+    its per-process halt sentinel only on a non-None ``escalation_path``, and
+    claiming it on such a record retires the retry whose merge would restore
+    the keys.
     """
 
     @staticmethod
@@ -1579,18 +1698,25 @@ class TestDegradedFilingPaths:
         assert verdict.escalation_path is None
         assert 'could not stamp' in caplog.text
 
+        # What queue.submit actually persisted: the constructor's fields only.
+        [filed] = (project_root / 'data' / 'escalations').glob(
+            'esc-reconciliation-backlog-*.json',
+        )
+        record = json.loads(filed.read_text(encoding='utf-8'))
+        assert record['project_id'] == 'proj'
+        assert 'error_type' not in record
+
     @pytest.mark.asyncio
     async def test_a_fold_whose_merge_fails_also_reports_no_path(
         self, event_buffer, tmp_path, monkeypatch, caplog,
     ):
         """The fold branch degrades the SAME way, because it breaks the same way.
 
-        Measured on this branch: ``attach_dedupe_child`` re-hydrates through
-        ``Escalation.from_json``, so a fold strips the four policy keys its
-        parent's own first merge put there. A fold whose merge then fails
-        leaves exactly the unattributable record a failed first write leaves —
-        so reporting the parent's path here would claim the halt sentinel on a
-        record nothing can ever close.
+        ``attach_dedupe_child`` re-hydrates through ``Escalation.from_json``,
+        so a fold strips the policy keys its parent's own first merge put
+        there. A fold whose merge then fails leaves exactly the record a failed
+        first write leaves — so reporting the parent's path here would claim
+        the halt sentinel on a record missing its fault kind.
         """
         await _seed_buffered(event_buffer, 'proj', n=12)
         project_root = tmp_path / 'proj_root'
@@ -1626,8 +1752,10 @@ class TestDegradedFilingPaths:
             Path(first.escalation_path).read_text(encoding='utf-8'),
         )
         assert parent['dedupe_count'] == 1
-        # And the record really is unattributable, which is why no path is named.
-        assert 'project_id' not in parent
+        # And the record really lacks its fault kind, which is why no path is
+        # named — while its project, a dataclass field, survives.
+        assert parent['project_id'] == 'proj'
+        assert 'error_type' not in parent
 
     @pytest.mark.asyncio
     async def test_a_closed_halt_is_never_a_fold_parent_for_the_next_one(
@@ -1661,7 +1789,7 @@ class TestDegradedFilingPaths:
         assert second_id != first_id
 
         esc_dir = project_root / 'data' / 'escalations'
-        pending = TestFoldIsolation._pending(esc_dir)
+        pending = _pending_records(esc_dir)
         assert list(pending) == [second_id], sorted(pending)
         # A NEW incident, counted from zero — not a child of the closed one.
         assert pending[second_id]['dedupe_count'] == 0

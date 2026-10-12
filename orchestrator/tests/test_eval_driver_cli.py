@@ -25,7 +25,7 @@ from orchestrator.cli import main
 from orchestrator.config import OrchestratorConfig
 from orchestrator.evals import configs as configs_module
 from orchestrator.evals.report import build_composite_report
-from orchestrator.evals.runner import EvalResult
+from orchestrator.evals.results import EvalResult
 
 
 def _mk_result(

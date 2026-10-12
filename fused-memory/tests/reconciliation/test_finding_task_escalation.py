@@ -7,12 +7,17 @@ on plain dicts with no harness, no journal, no event buffer and no tmp_path.
 
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass
+
 import pytest
 
 from fused_memory.reconciliation.finding_task_escalation import (
     FINDING_TASK_ESCALATION_CATEGORY,
     build_finding_task_escalation_kwargs,
+    is_routable_task_id,
     resolve_finding_task_target,
+    routed_record_covers_finding,
 )
 
 
@@ -212,6 +217,51 @@ class TestResolveFindingTaskTargetPrecedence:
         assert resolve_finding_task_target(finding, 'dark_factory') == '4458'
 
 
+class TestRoutableTaskIdShape:
+    """Only an id that is safe as a queue key is routed.
+
+    The target id becomes part of a filename (`EscalationQueue.make_id` and
+    `submit`), so a separator, a cross-project ref, whitespace or a control
+    character must never reach the filer.
+    """
+
+    @pytest.mark.parametrize('task_id', ['4458', '4458.2', '1-2', 'abc_12', 'A9'])
+    def test_conservative_id_shapes_are_routable(self, task_id):
+        assert is_routable_task_id(task_id) is True
+
+    @pytest.mark.parametrize(
+        'task_id',
+        [
+            '', '../x', '../../4458', 'a/b', 'proj/4458', '..\\x', 'a\\b',
+            '.', '..', '-4458',
+            'reify:4458',
+            '44 58', '4458\n', '44\x0058',
+        ],
+    )
+    def test_unsafe_id_shapes_are_not_routable(self, task_id):
+        assert is_routable_task_id(task_id) is False
+
+    @pytest.mark.parametrize('task_id', ['../x', '../../4458', 'a/b', 'proj/4458', 'reify:4458'])
+    def test_bare_task_id_with_an_unsafe_shape_is_not_routed(self, task_id):
+        assert resolve_finding_task_target({'task_id': task_id}, 'dark_factory') is None
+
+    def test_unsafe_bare_id_falls_through_to_citations(self):
+        finding = {
+            'task_id': '../x',
+            'cited_tasks': [_citation('dark_factory', '4458')],
+        }
+        assert resolve_finding_task_target(finding, 'dark_factory') == '4458'
+
+    def test_unsafe_citation_does_not_block_a_later_good_one(self):
+        finding = {
+            'cited_tasks': [
+                _citation('dark_factory', 'a/b'),
+                _citation('dark_factory', '4458'),
+            ],
+        }
+        assert resolve_finding_task_target(finding, 'dark_factory') == '4458'
+
+
 def _finding_with_task() -> dict:
     """A realistic actionable Stage-3 finding naming a task id."""
     return {
@@ -235,6 +285,7 @@ class TestBuildFindingTaskEscalationKwargs:
             'project_id': 'dark_factory',
             'run_id': 'abcdef0123456789',
             'persistence': 4,
+            'finding_fingerprint': 'fp-a',
         }
         kwargs.update(over)
         return build_finding_task_escalation_kwargs(finding or _finding_with_task(), **kwargs)
@@ -292,6 +343,7 @@ class TestBuildFindingTaskEscalationKwargs:
         assert detail['project_id'] == 'dark_factory'
         assert detail['persistence'] == 4
         assert detail['cited_tasks'] == finding['cited_tasks']
+        assert detail['finding_fingerprint'] == 'fp-a'
 
     def test_detail_survives_non_json_serialisable_finding_values(self):
         import json
@@ -327,13 +379,12 @@ class TestBuildFindingTaskEscalationKwargs:
         assert 'id' not in self._build()
 
     def test_dedupe_fingerprint_is_not_set(self):
-        # Nothing on the orchestrator queue folds on a fingerprint for this
-        # category; cross-cycle dedupe is the filer's own (level, category)
-        # pending-scan in `harness.py::_file_finding_task_escalation` -- NOT
-        # `has_open_l1`, which is level-1-only and would see nothing at all
-        # for these deliberately level-0 records.  Setting a fingerprint here
-        # risks unintended folding if a future submit_or_dedupe config ever
-        # names the category.
+        # The finding's identity rides in `detail`, not here: promotion by
+        # `orchestrator/harness.py::Harness._reap_orphan_l0_escalations` builds
+        # a NEW record and does not copy `dedupe_fingerprint`, so this field
+        # cannot carry identity across L0 -> L1.  Setting it would also risk
+        # unintended folding if a future submit_or_dedupe config ever names
+        # the category.
         payload = self._build()
         assert 'dedupe_fingerprint' not in payload
 
@@ -355,6 +406,70 @@ class TestBuildFindingTaskEscalationKwargs:
 
         payload = build_finding_task_escalation_kwargs(
             {}, task_id='4458', project_id='dark_factory', run_id='r', persistence=4,
+            finding_fingerprint='fp-a',
         )
         assert payload['task_id'] == '4458'
         json.loads(payload['detail'])
+
+
+_REAPER_DETAIL_SUFFIX = '\n\n[note] originating worktree may be reaped; branch=task/4458'
+
+
+@dataclass
+class _PendingRecord:
+    category: str
+    level: int
+    detail: str
+
+
+def _record(fp: str | None = 'fp-a', **over) -> _PendingRecord:
+    """A pending routed record as `get_by_task` hands it to the coverage check."""
+    payload = build_finding_task_escalation_kwargs(
+        _finding_with_task(),
+        task_id='4458',
+        project_id='dark_factory',
+        run_id='r',
+        persistence=4,
+        finding_fingerprint=fp or '',
+    )
+    fields = {k: payload[k] for k in ('category', 'level', 'detail')}
+    fields.update(over)
+    return _PendingRecord(**fields)
+
+
+class TestRoutedRecordCoversFinding:
+    """Which pending record on a task absorbs a new routed finding."""
+
+    def test_level_zero_record_covers_the_same_finding(self):
+        assert routed_record_covers_finding(_record('fp-a'), 'fp-a') is True
+
+    def test_level_zero_record_does_not_cover_a_distinct_finding(self):
+        assert routed_record_covers_finding(_record('fp-a'), 'fp-b') is False
+
+    @pytest.mark.parametrize('fingerprint', ['fp-a', 'fp-b', ''])
+    def test_legacy_record_without_a_fingerprint_never_folds(self, fingerprint):
+        legacy = _record(detail=json.dumps({'finding_id': 'f-1'}))
+        assert routed_record_covers_finding(legacy, fingerprint) is False
+
+    @pytest.mark.parametrize(
+        'detail', ['', 'not json', '[]', json.dumps({'finding_fingerprint': 5})],
+    )
+    def test_unreadable_fingerprint_never_folds(self, detail):
+        assert routed_record_covers_finding(_record(detail=detail), 'fp-a') is False
+
+    def test_empty_query_fingerprint_never_matches_an_empty_stored_one(self):
+        assert routed_record_covers_finding(_record(''), '') is False
+
+    @pytest.mark.parametrize('fingerprint', ['fp-a', 'fp-b'])
+    def test_promoted_record_covers_every_finding(self, fingerprint):
+        promoted = _record('fp-a', level=1)
+        promoted.detail += _REAPER_DETAIL_SUFFIX
+        assert routed_record_covers_finding(promoted, fingerprint) is True
+
+    def test_level_two_record_covers_every_finding(self):
+        assert routed_record_covers_finding(_record('fp-a', level=2), 'fp-b') is True
+
+    @pytest.mark.parametrize('level', [0, 1])
+    def test_other_category_never_folds(self, level):
+        other = _record('fp-a', category='risk_identified', level=level)
+        assert routed_record_covers_finding(other, 'fp-a') is False

@@ -30,10 +30,10 @@ TOP_LEVEL_BINDING_RE = re.compile(
 )
 
 
-def test_payload_has_exactly_the_four_contract_keys() -> None:
-    """The generated vocabulary is closed: MEMBERS, VIEWS, SUB_VIEWS, TONES."""
+def test_payload_has_exactly_the_five_contract_keys() -> None:
+    """The generated vocabulary is closed: MEMBERS, VIEWS, SUB_VIEWS, TONES, SERIES_KEYS."""
     payload = gen_dashboard_task_vocab.task_vocab_payload()
-    assert set(payload) == {"MEMBERS", "VIEWS", "SUB_VIEWS", "TONES"}
+    assert set(payload) == {"MEMBERS", "VIEWS", "SUB_VIEWS", "TONES", "SERIES_KEYS"}
 
 
 def test_payload_members_are_the_statuses_in_declaration_order() -> None:
@@ -59,6 +59,15 @@ def test_payload_tones_derive_from_the_census_constant() -> None:
     """One tone per status, keyed by the plain status string."""
     payload = gen_dashboard_task_vocab.task_vocab_payload()
     assert payload["TONES"] == {member.value: census.TONES[member] for member in TaskStatus}
+
+
+def test_payload_series_keys_derive_from_the_census_constant() -> None:
+    """One burndown series key per status, keyed by the plain status string, in MEMBERS order."""
+    payload = gen_dashboard_task_vocab.task_vocab_payload()
+    series_keys = payload["SERIES_KEYS"]
+    assert series_keys == {member.value: census.SERIES_KEYS[member] for member in TaskStatus}
+    assert isinstance(series_keys, dict)
+    assert list(series_keys) == payload["MEMBERS"]
 
 
 def test_payload_is_json_serialisable() -> None:

@@ -24,7 +24,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-import orchestrator.merge_queue as merge_queue
 import orchestrator.suffix_graph as suffix_graph
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -181,27 +180,6 @@ class TestModuleSurface:
 
 
 # ── step-1: merge_queue shim re-export identity ────────────────────────────────
-
-
-class TestShimReExportIdentity:
-    """orchestrator.merge_queue re-exports the three names via a top-level
-    shim; identity (not just equality) must hold so isinstance checks and
-    monkeypatches keep working across both import paths.
-
-    RED until step-2 GREEN adds the shim import and deletes the local defs.
-    """
-
-    def test_suffix_conflict_graph_identity(self):
-        assert merge_queue.SuffixConflictGraph is suffix_graph.SuffixConflictGraph
-
-    def test_empty_suffix_conflict_graph_identity(self):
-        assert (
-            merge_queue.EMPTY_SUFFIX_CONFLICT_GRAPH
-            is suffix_graph.EMPTY_SUFFIX_CONFLICT_GRAPH
-        )
-
-    def test_suffix_conflict_tracker_identity(self):
-        assert merge_queue.SuffixConflictTracker is suffix_graph.SuffixConflictTracker
 
 
 # ── step-1: module logger name ─────────────────────────────────────────────────

@@ -2,156 +2,66 @@
 
 This phase answers: **does the software actually run and do what it claims?**
 
-Everything here is mechanical and parallelisable. Spawn Sonnet sub-agents for the heavy lifting, then compile results yourself.
+Everything here is mechanical and parallelisable: one sonnet seat (low effort) per command group, the coordinator compiles. It always covers the whole run scope, in incremental mode too, and it runs in the pinned tree built from `as_of_sha` (SKILL.md "Pin the run").
+
+Phase 1 produces the report's `phase1` block, not findings (`references/run-record.md`). A failing test on main is operational breakage (contract §4), handled in Phase 3 Step 2.
 
 ## Step 1: Run the full test suite
 
-Determine the test command for the target scope:
-- Check orchestrator config for `test_command` and any per-subproject overrides (e.g., `fused-memory/orchestrator.yaml`)
-- Default: `pytest` at the project root
-- If scoped to a subproject: `uv run --project {subproject} pytest`
+Use the project's configured commands, top-level keys of `<project_root>/dark-factory-orchestrator.yaml`:
 
-Run the full suite — not task-scoped. The point is to catch failures that per-task verification missed.
+- `test_command` — the whole suite, as the merge gate runs it.
+- Scoped (`--scope <area>` or `--focused`): run the configured command's segment for that member. If you must construct one, `uv run --directory <member> pytest tests/` — `--directory`, never `--project`: `--project` leaves cwd at the root, so pyright reads the root config instead of the member's (false GREEN; dark-factory's briefing records the measurement under its `uv run --directory` convention).
+- No configured command: `pytest` at the root, and say so in `phase1`.
 
-### Parse results
+Run the full suite, not task-scoped: the point is what per-task verification missed.
 
-Classify each failure:
+### Classify each failure
 
-| Classification | How to determine | Action |
-|---------------|------------------|--------|
-| **New failure** | Not in known failures list (from memory or briefing) | Flag as finding, severity: high |
-| **Known flake** | Search memory for "flaky test" + test name | Note as known, severity: info |
-| **Pre-existing** | Failure exists on main before recent changes | Note as pre-existing, severity: warning |
-| **Integration vs unit** | Check test file path (tests/integration/, tests/unit/, tests/e2e/) | Tag accordingly |
+| Classification | How to determine |
+|---------------|------------------|
+| **New** | Not a known flake, and it fails at `as_of_sha` but passed at `since`; with `since: none`, every failure that is not a known flake |
+| **Known flake** | Memory search "flaky test {name}", or the project's flake ledger, names it |
+| **Pre-existing** | Fails at `since` too — check the previous report's `phase1.failures`, or re-run that one test at `since` |
 
-To distinguish new from pre-existing: if the test file hasn't been modified recently (`git log --since="2 weeks" -- {test_file}`), it's likely pre-existing.
-
-### Capture output
-
-For each failure, capture:
-- Test name and file path
-- Error message and traceback (truncated to relevant portion)
-- Classification (new/known/pre-existing)
-- Affected module(s)
+For each failure capture: test id, member, the first relevant error line, classification, affected modules. Phase 3 looks up its owner.
 
 ## Step 2: Lint and type-check
 
-Run both across the full project scope:
+Run `lint_command` and `type_check_command` as configured. Scoped: the member's segment, or `uv run --directory <member> ruff check .` and the member's configured type checker from that directory (cwd is load-bearing for pyright's config).
 
-```bash
-# Lint
-ruff check {scope_path} --output-format json
+A gate that is clean at the merge lane should be clean here; anything it reports is either drift between the configured command and what the gate runs, or a red main. Record both cases; do not triage individual lint codes.
 
-# Type-check (per-subproject if scoped)
-uv run --project {subproject} pyright --outputjson
-```
+## Step 3: Smoke checks (requires briefing)
 
-### Classify results
+No briefing: skip, and say so.
 
-For lint and type-check issues, distinguish new from pre-existing:
-- Check `git diff main --name-only` to see which files were recently changed
-- Issues in recently changed files → likely new → severity: warning
-- Issues in untouched files → pre-existing → severity: info
+For each subproject in scope, turn its `what_working_means` lines into concrete checks from the code (server starts and answers its health route, CLI parses `--help`, a unit's timer is active). For each:
 
-Don't waste time on pre-existing issues unless they're in modules covered by the current review scope.
+1. **Setup** if the check needs it.
+2. **Execute** and evaluate: exit code, JSON field, stdout substring or regex.
+3. **Teardown** regardless of outcome.
+4. **Record** the command as constructed, pass/fail, and a diagnosis on failure.
 
-## Step 3: Smoke tests (requires briefing)
-
-If no review briefing exists, skip this step entirely.
-
-For each smoke test in the briefing:
-
-1. **Setup** (if specified): run the setup command
-2. **Execute**: run the test command
-3. **Evaluate**: check against the `expect` condition:
-   - `exit 0` → check exit code
-   - `json_field: key = value` → parse JSON output and check field
-   - `contains: text` → check stdout contains text
-   - `regex: pattern` → match against stdout
-4. **Teardown** (if specified): run cleanup regardless of pass/fail
-5. **Record**: pass/fail, stdout, stderr, diagnosis for failures
+A check against a running service exercises what is deployed, not the pinned tree; say which in the record.
 
 ### Failure diagnosis
 
-For smoke test failures, attempt basic diagnosis:
-- Exit code 1 with `ModuleNotFoundError` → missing dependency
-- Exit code 1 with `ImportError` → broken import chain
-- Connection refused → service not running
+- `ModuleNotFoundError` → missing dependency, or the wrong venv (ask the interpreter, never guess a path)
+- `ImportError` → broken import chain
+- Connection refused → service not running (a live-service check is not a code failure)
 - `FileNotFoundError` → missing config or data file
 - Timeout → service hanging on startup
 
-Include the diagnosis in the report — it saves time in Phase 3 triage.
+## Step 4: Write the `phase1` block
 
-## Step 4: Compile Phase 1 report
-
-Write a structured JSON report to `review/reports/phase1-{timestamp}.json`:
-
-```json
-{
-  "phase": 1,
-  "timestamp": "2026-03-24T14:30:00Z",
-  "scope": "full | subproject-name | focused:mod1,mod2",
-  "test_results": {
-    "total": 142,
-    "passed": 139,
-    "failed": 3,
-    "failures": [
-      {
-        "test": "test_round_trip_mem0",
-        "file": "tests/integration/test_round_trip.py",
-        "error": "AssertionError: search returned 0 results",
-        "classification": "new",
-        "severity": "high",
-        "modules": ["fused_memory/mem0_client.py", "fused_memory/mcp_tools.py"]
-      }
-    ]
-  },
-  "lint_results": {
-    "total_issues": 5,
-    "new_issues": 2,
-    "issues": [
-      {
-        "file": "fused_memory/classifier.py",
-        "line": 47,
-        "code": "E501",
-        "message": "Line too long",
-        "classification": "new",
-        "severity": "warning"
-      }
-    ]
-  },
-  "typecheck_results": {
-    "total_errors": 0,
-    "new_errors": 0,
-    "errors": []
-  },
-  "smoke_tests": {
-    "total": 5,
-    "passed": 4,
-    "results": [
-      {
-        "name": "Health endpoint responds",
-        "passed": false,
-        "stdout": "",
-        "stderr": "Connection refused",
-        "diagnosis": "Server not running — smoke test requires fused-memory server on port 8002",
-        "severity": "warning"
-      }
-    ]
-  }
-}
-```
-
-## Display summary
-
-After compiling the report, show the user a concise summary:
+Shape: `references/run-record.md` §"Phase 1 block". Then show:
 
 ```markdown
 ### Phase 1: Integration Verification
-- Test suite: 139/142 passed (2 new failures, 1 known flake)
-- Lint: 2 new issues (E501, E712 in classifier.py)
-- Type-check: clean
-- Smoke tests: 4/5 passed — FAILED: "Health endpoint" (server not running)
+- Test suite: 7387/7389 passed (1 new failure, 1 known flake)
+- Lint: clean · Type-check: clean
+- Smoke: 6/7 — FAILED: dashboard health (service not running)
 ```
 
-If there are blocking failures (widespread test failures, nothing compiles), flag this clearly — the user may want to fix before proceeding to Phase 2.
+Flag blocking failures clearly (nothing imports, most of a member red): the user may want to stop before Phase 2.

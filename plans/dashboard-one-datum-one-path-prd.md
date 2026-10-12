@@ -66,6 +66,30 @@ reviewer):
 | terminal window (400 done/cancelled rows) | — | — | 2.25 s / 9.4 MB |
 | whole tree (`orchestrator.py`, `burndown.py`, `app.py::_load_task_cards`, `merge_queue.py::load_task_titles`) | 3.4 s / 29 MB | 3.65 s / 30 MB | — |
 | `GET /api/v2/dashboard/tasks` today | | | 6.8 s / 16.4 MB |
+| `GET /api/v2/dashboard/tasks` after ι (task 5598, 2026-10-04) | | | 3.65–4.17 s / 3.08 MB |
+
+**After ι (task 5598, 2026-10-04, 22:43–22:45 UTC).** Method: the real
+`api/tasks.py::api_tasks` handler was called with a duck-typed `Request` over
+`DashboardConfig.from_env()` (the service's nine roots, live fused-memory at
+`localhost:8002`) and a new `httpx.AsyncClient`. Each run was a fresh process, so
+MCP sessions and every cache started cold, and timing was `perf_counter` from an
+uncommitted ad-hoc probe.
+
+- **Cold render, 3 runs:** 4.17 s, 3.65 s and 4.11 s, each serving 3.08 MB.
+- **Per-root health:** in every run all nine roots classified OK, census and rows
+  both `fresh`. `TASKS_OFFLINE` was false, so no root trailed in any run.
+- **Warm:** a second call in the same process took 1.54 s, 3.77 s and 0.99 s. The
+  15 s snapshot unit answers both reads, so what remains is the per-request tail:
+  the runtime probe, row shaping and the external-dep read.
+- **Terminal window:** in a further fresh process, `?terminal=dark-factory` took
+  4.25 s and 3.38 MB in all. The window alone took 0.77 s for 400 rows (0.32 MB),
+  served `lower_bound` as the newest 400 of 4682 terminal rows.
+- **Against the 2026-09-18 baseline (6.8 s / 16.4 MB):** the cold render is
+  39–46 % faster and its payload 81 % smaller. The baseline acquisition was
+  0.38 s + 2.49 s + 2.25 s and included terminal rows. The default render no
+  longer reads terminal rows; one root's window, read on request, now costs
+  0.77 s, where the nine-root window cost 2.25 s / 9.4 MB.
+- **Next lever for task 4795:** field projection on `get_tasks` (task 4390).
 
 The whole-tree fetches are the heavy calls and this PRD removes all four from the
 request path. The compact map is cheap **but not immune**: the dashboard journal for
@@ -133,9 +157,10 @@ pointing at ι (a dependency edge on a `deferred` task would be inert). Task
 3. **Named views.** The partition of `TaskStatus` is three views: `in_flight` =
    in-progress + blocked + merge-deferred + review + infra-hold; `backlog` = pending
    + deferred; `terminal` = done + cancelled. `running` = in-progress is a **sub-view**
-   of `in_flight`, always rendered with its superset ("25 running of 43 in-flight"),
-   and is the only number an operator compares against `max_concurrent_tasks`. A
-   test asserts the three views partition `TaskStatus` and `running ⊆ in_flight`.
+   of `in_flight`, always rendered with its superset ("25 running of 43 in-flight").
+   `max_concurrent_tasks` is compared against the rows' live count, not `running`
+   (decision 9). A test asserts the three views partition `TaskStatus` and
+   `running ⊆ in_flight`.
    **Amendment vs the first draft**: `infra-hold` moved from `backlog` to `in_flight`
    on the reviewer's evidence — it is entered from in-progress via
    `orchestrator/src/orchestrator/workflow.py::_mark_blocked(block_status='infra-hold')`
@@ -147,7 +172,7 @@ pointing at ι (a dependency edge on a `deferred` task would be inert). Task
    renders `dashboard/src/dashboard/static/redux/task_vocab.js` (members, view
    membership, display tones) from `shared.task_statuses`; the parity test lives in
    root `tests/scripts/` beside the existing generator precedent
-   (`scripts/render_dashboard_unit.py` + `tests/scripts/test_dashboard_service_template.py`),
+   (`scripts/render_systemd_unit.py` + `tests/scripts/test_dashboard_service_template.py`),
    where `scripts/` is on `sys.path` by design. Rejected: the hand-maintained-twin
    pattern of `recon_status.js` (kept there as landed) and views-only.
 5. **The task snapshot is one acquisition unit.** `dashboard/data/task_snapshot.py`
@@ -242,6 +267,10 @@ pointing at ι (a dependency edge on a `deferred` task would be inert). Task
 8. **PRD box `n/m done` is a `lower_bound` datum** over the fetched rows, rendered as
    `≥ n/m`, until a per-PRD server census exists (out of scope: the status map carries
    no PRD field).
+   *Superseded 2026-10-09 by `plans/dashboard-prd-lanes-prd.md` (§4.2, §4.4). A lineage
+   index over every task attributes each task to a PRD at read time, and
+   `GET /api/v2/dashboard/prds` serves exact per-PRD `done/total` (task 6583, γ1). The PRD
+   boxes are deleted (task 6585, δ).*
 9. **Burndown**: the sampler consumes the snapshot unit from decision 5; a failed cycle
    writes a row with `state='gap'` and `reason`; all nine members are stored — the
    three columns that do not exist today (`review`, `merge_deferred`, `infra_hold`)
@@ -253,9 +282,11 @@ pointing at ι (a dependency edge on a `deferred` task would be inert). Task
    split and a new `in_progress_rows` column come from the rows and carry the rows'
    `as_of`, so `_SPLIT_KEYS`' invariant is restated as `live + stranded ==
    in_progress_rows`, not `== in_progress`. `running` everywhere is the census's
-   in-progress; the task-3543 parity alarm compares the rows-derived
-   `in_progress_live` against the cap, as it does today, and the two numbers sit in
-   one row with their skew visible. `redux_api.py::shape_burndown` builds the aggregate by
+   in-progress; the task-3543 parity alarm and the sampler's cap-breach WARNING
+   compare the rows-derived `in_progress_live` against the cap (a stranded row holds
+   no scheduler slot, so counting it would alarm on a strand pile-up rather than
+   over-dispatch), and the two numbers sit in one row with their skew visible.
+   `redux_api.py::shape_burndown` builds the aggregate by
    carrying each project's last **measured** row forward with its age, and emits
    per-project `as_of`, `state`. `burndown.py::compute_parity_alarm`,
    `redux_api.py::_aggregate_parity` and `compute_forecast_confidence` evaluate
@@ -387,7 +418,7 @@ pointing at ι (a dependency edge on a `deferred` task would be inert). Task
 | `scheduler_utils.jsx::lockChipState`, `scheduler_heatmap.jsx::cellStateFor`, `tabs.jsx::LocksCell` | present |
 | `data.js::applyKey` + `__loaded` marker; `DEFAULT_POLL_DEPS` | present — the registry extension point |
 | node `--test` harness in the merge gate | `dashboard/tests/test_graph_layout_js.py::test_graph_layout_js_suite_passes` (subprocess + TAP count), collected by `cd dashboard && uv run pytest tests/` |
-| generator + parity-test precedent | `scripts/render_dashboard_unit.py` + `tests/scripts/test_dashboard_service_template.py::test_template_renders_to_hardcoded_file` |
+| generator + parity-test precedent | `scripts/render_systemd_unit.py` + `tests/scripts/test_dashboard_service_template.py::test_template_renders_to_hardcoded_file` |
 | AST guard precedent with exemption apparatus | `dashboard/tests/test_clock_discipline.py::find_clock_violations` |
 | root `.venv` carries every workspace member | `CLAUDE.md` § Locating installed code |
 
@@ -478,7 +509,9 @@ TaskSnapshot = {
 
 ### The generated vocabulary (`static/redux/task_vocab.js`, classic script)
 
-Exports `window.DF_TASK_VOCAB = {MEMBERS, VIEWS, SUB_VIEWS, TONES}`. Regenerated by
+Exports `window.DF_TASK_VOCAB = {MEMBERS, VIEWS, SUB_VIEWS, TONES, SERIES_KEYS}`
+(`SERIES_KEYS` added 2026-09-27, task 5592: the Status mix bands read each member's
+burndown series by it). Regenerated by
 `scripts/gen_dashboard_task_vocab.py`; `tests/scripts/test_dashboard_task_vocab.py`
 regenerates to a temp file and asserts byte equality with the committed file.
 
@@ -526,6 +559,28 @@ fact, not the registry's. Datum-kinded keys default to an `unknown` Datum with r
 | 13 | Snapshot unit survives a transient | status-map read raises `ReadTimeout` once after a good unit | `/tasks` serves the previous unit with `census.state="stale"`, reason "ReadTimeout"; the next good read returns it to `fresh` |
 | 14 | Old paths gone | repository state | AST access-path check passes; `collect_done_counts`, `task_status_counts.js` and its four pins, `dailyDeltas`, `_STATUS_MAP`, `orchestrator.py` summary, request-path whole-tree fetches absent |
 | 15 | Cold render over nine roots — **recorded, not gated** | caches cleared, all nine roots reachable | handler time, payload size and per-root state recorded in ι's completion note against the 2026-09-18 baseline (6.8 s / 16.4 MB; cold acquisition 0.38 s + 2.49 s + terminal 2.25 s); 4795 depends on ι and decides the next lever from this |
+
+**Sketch #14 as gated by ι (task 5598, 2026-10-05).** The old-path census in
+`dashboard/tests/test_datum_access_paths.py` checks three kinds of path: served
+assets (each answers 404 and is not loaded by the parsed `index.html`),
+window-level exports of served scripts, and route wire keys. It does not check
+Python identifiers or function-local client names. The AST access-path check in
+the same file enforces the absence of request-path whole-tree fetches.
+`collect_done_counts`, `_STATUS_MAP` and `dailyDeltas` were deleted by their
+producing leaves and have no name guard.
+
+**The `/healthz` probe reads the whole tree (task 5598, 2026-10-05).** Decision
+17's exemption stays an unnarrowed `fetch_tasks`, the 3.4 s / 29 MB read that
+decision 20 costs. It is paid at most once per 30 s grace lapse, and only while
+something calls `/healthz`. Nothing calls it on a schedule: the watchdog probes
+the shallow `/api/health`, and `scripts/restart-dashboard.sh` calls `/healthz`
+only to wait for readiness after a restart. Two cheaper reads were weighed.
+`fetch_tasks(statuses=[])` never reaches SQL, because fused-memory's
+`sqlite_task_backend.py::_get_tasks_internal` returns before opening a
+connection, so it would not traverse the path the probe exists to test. A
+one-row `fetch_task_page` would cut the transfer but not the server read,
+because `get_tasks` builds the whole list and slices it in memory. At this call
+rate neither earns a change to decision 17.
 
 ## Decomposition plan
 
@@ -593,8 +648,11 @@ and a miss cap); δ2's signal reworded as fixture-driven. META answered yes.
 ## Out of scope
 
 - A per-PRD server census (needs a PRD field on the status map — a fused-memory
-  change); PRD boxes stay `lower_bound`.
-- Field projection on `get_tasks` (task 4390; 4795's remaining lever).
+  change); PRD boxes stay `lower_bound`. *Superseded 2026-10-09: delivered by
+  `plans/dashboard-prd-lanes-prd.md` task 6583 (γ1), with no status-map change.*
+- Field projection on `get_tasks` (task 4390; 4795's remaining lever). *2026-10-09: the
+  projection part is delivered by task 6581 (`plans/dashboard-prd-lanes-prd.md` α), and
+  4390 depends on it.*
 - Regenerating `recon_status.js` from `journal.py` (5320's runtime unknown bucket
   already catches drift).
 - Dashboard supervision/watchdog and endpoint-freshness thresholds

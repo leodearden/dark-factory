@@ -607,6 +607,99 @@ def vector_index_properties(record) -> list[str]:
     ]
 
 
+#: The one status value that means an index is SERVING.  MEASURED live: the
+#: not-ready value is ``'[Indexing] N/M: UNDER CONSTRUCTION'`` — an N/M progress
+#: counter that VARIES read to read.  Readiness is therefore tested on the READY
+#: side, by exact equality with this sentinel, and NEVER as a substring test on
+#: the not-ready side: a not-ready-side predicate would have to anticipate every
+#: status string FalkorDB might ever emit and would read an unrecognised future
+#: one as ready — failing open on precisely the case the barrier exists for.
+INDEX_STATUS_OPERATIONAL = 'OPERATIONAL'
+
+
+class IndexCatalogUnsettledError(RuntimeError):
+    """The FalkorDB index catalog did not settle within a caller's budget.
+
+    Raised by :meth:`GraphitiBackend.drop_vector_indices` when a record is still
+    not ``OPERATIONAL`` once its settle budget expires, before anything has been
+    dropped.  Failing closed is the point: an under-construction read can
+    UNDER-report vector indices, and dropping against an index state that was
+    never determined would leave stale fixed-dimension indices behind while the
+    operator believes the rebuild was clean — the silent-fail-soft class
+    ``ensure_indices`` likewise refuses for provisioning (INV-4).
+
+    A DISTINCT type, mirroring the ``IndexHeaderError``-vs-timeout split
+    ``tests/_fm_helpers`` makes: "the catalog never settled" and "a DROP
+    statement was rejected" call for different operator actions.  NOT a
+    :class:`TimeoutError`, which is an :class:`OSError` subclass on py3.11+ and
+    would be swept up by network/driver error handlers.  NOT a
+    :class:`ValueError`, so a handler scoped to the :class:`IndexHeaderShapeError`
+    / :class:`IndexRecordShapeError` family — a SHAPE surprise, not a timing
+    one — never catches it.
+    """
+
+
+def unsettled_index_statuses(records) -> list[tuple[object, object]]:
+    """Return the ``(label, status)`` of every record that is not yet OPERATIONAL.
+
+    The pure predicate behind the settle barrier
+    :meth:`GraphitiBackend.drop_vector_indices` puts in front of its catalog
+    read.  That docstring is the account of the rebuild window this exists to
+    detect: a stale ``OPERATIONAL`` row beside its ``'[Indexing] N/M: UNDER
+    CONSTRUCTION'`` replacement.  An empty result means the catalog is SETTLED
+    and safe to act on.
+
+    An EMPTY catalog counts as SETTLED.  This diverges DELIBERATELY from
+    ``tests/_fm_helpers.await_index_operational``, which treats an empty
+    ``result_set`` as NOT ready.  That is correct for its callers — a fixture
+    that just issued CREATE and sees nothing is looking at a create that has not
+    registered — and wrong here, because an index-free graph is a legitimate
+    production steady state, and a drop on one must return immediately rather
+    than block the full budget and then raise :class:`IndexCatalogUnsettledError`
+    about a graph that was never in trouble.  That divergence is why the two do
+    not share a predicate.
+
+    A record with NO ``'status'`` key RAISES rather than counting as unsettled:
+    a missing key means ``list_indices`` stopped resolving the column, and
+    reporting a shape change as a settle timeout would misdiagnose it.  A status
+    that is present but is anything other than :data:`INDEX_STATUS_OPERATIONAL`
+    — an unrecognised string, ``None``, a non-string — is reported as unsettled
+    with its value exactly as found: an unrecognised status must never read as
+    ready.
+
+    Deliberately NOT routed through :func:`_iter_record_properties`: that walks
+    per-PROPERTY and this is a per-RECORD predicate, so reusing it would fan one
+    row out per property and re-report the same status N times.
+
+    Args:
+        records: ``GraphitiBackend.list_indices()`` records, each a mapping with
+            at least ``label`` and ``status``.
+
+    Returns:
+        ``(label, status)`` for every not-``OPERATIONAL`` record, in record
+        order, each value as the record carried it — so neither is guaranteed
+        to be a string.  Empty when the catalog is settled, including when it
+        is empty.
+
+    Raises:
+        IndexRecordShapeError: A record carries no ``'status'`` key.
+    """
+    unsettled: list[tuple[object, object]] = []
+    for record in records:
+        if 'status' not in record:
+            raise IndexRecordShapeError(
+                f'CALL db.indexes() record for label '
+                f'{record.get("label")!r} has no \'status\' key, so its '
+                'readiness cannot be determined. list_indices() must resolve '
+                'the status column; refusing to treat an undetermined index '
+                f'state as settled. Record: {record!r}'
+            )
+        status = record['status']
+        if status != INDEX_STATUS_OPERATIONAL:
+            unsettled.append((record.get('label'), status))
+    return unsettled
+
+
 def normalize_index_records(records) -> set[IndexSpec]:
     """Union :func:`normalize_index_record` over an iterable of records.
 

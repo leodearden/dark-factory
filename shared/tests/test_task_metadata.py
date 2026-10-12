@@ -2099,6 +2099,26 @@ class TestParseMetadataFailurePolicy:
             f'Expected no unknown_key warning for merge_lane; got: {offending}'
         )
 
+    def test_claimant_exception_metadata_key_is_blessed(self):
+        """``claimant_exception`` is a permanent machine stamp written on every
+        explicit-claimant terminal write (docs/prds/claimant-invariant-detection.md
+        D-5), so it must not census-warn on read.
+        """
+        stamp = {
+            'claimant_run_id': 'run/s/pid=1',
+            'target_status': 'done',
+            'agent_id': 'a',
+            'tag': None,
+            'stamped_at': '2026-10-04T00:00:00+00:00',
+        }
+        _, warnings = parse_metadata({'claimant_exception': stamp}, direction='read')
+        offending = [
+            w for w in warnings if w.code == 'unknown_key' and w.field == 'claimant_exception'
+        ]
+        assert offending == [], (
+            f'Expected no unknown_key warning for claimant_exception; got: {offending}'
+        )
+
     def test_cross_repo_metadata_keys_are_blessed(self):
         """The cross-repo deliverable marker must not census-warn (task 3004).
 

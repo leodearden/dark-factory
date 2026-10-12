@@ -110,6 +110,7 @@ from _workflow_helpers import (
     _build_workflow,
     _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see its docstring
     _init_repo,
+    fixed_prompt,
     wire_metadata_backend,
 )
 from escalation.models import Escalation
@@ -651,9 +652,9 @@ class TestByteEquivalenceThroughTheRig:
             'crates/alpha/src/lib.rs', 'crates/beta/src/lib.rs', 'crates/gamma/src/lib.rs',
         ]
 
-        await workflow._invoke(IMPLEMENTER, 'impl prompt', git_repo)
-        await workflow._invoke(DEBUGGER, 'debug prompt', git_repo)
-        await workflow._invoke(ARCHITECT, 'arch prompt', git_repo)
+        await workflow._invoke(IMPLEMENTER, fixed_prompt('impl prompt'), git_repo)
+        await workflow._invoke(DEBUGGER, fixed_prompt('debug prompt'), git_repo)
+        await workflow._invoke(ARCHITECT, fixed_prompt('arch prompt'), git_repo)
 
         assert stub.calls[0]['model'] == 'opus'  # implementer, upgraded
         assert stub.calls[1]['model'] == 'opus'  # debugger, upgraded
@@ -1415,7 +1416,7 @@ class TestSimpleTaskModelReloadReachesTheSeam:
             fake_verify=False,
         )
 
-        await workflow._invoke(SIMPLE_TASK, 'simple task prompt', tmp_path)
+        await workflow._invoke(SIMPLE_TASK, fixed_prompt('simple task prompt'), tmp_path)
 
         assert recorder.route_by_role['simple_task']['model'] == (
             _PINNED_SIMPLE_TASK_RELOAD_MODEL
@@ -1523,7 +1524,7 @@ class TestUnknownRuleKeyRejectedPriorRulesStillRoute:
         workflow.plan = {'steps': [{'id': f's{i}', 'status': 'pending'} for i in range(12)]}
         workflow.modules = ['lib']
 
-        await workflow._invoke(IMPLEMENTER, 'impl prompt', git_repo)
+        await workflow._invoke(IMPLEMENTER, fixed_prompt('impl prompt'), git_repo)
 
         assert stub.calls[-1]['model'] == 'opus'
         impl_data = [
@@ -1802,7 +1803,7 @@ class TestRollupRendersRigProducedRows:
             workflow1.modules = ['lib']
             monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub1.invoke_agent)
 
-            await workflow1._invoke(IMPLEMENTER, 'impl prompt', git_repo)
+            await workflow1._invoke(IMPLEMENTER, fixed_prompt('impl prompt'), git_repo)
             # Confirms the premise (no policy rule fires for this tiny plan)
             # rather than silently asserting the wrong cell below.
             assert stub1.calls[-1]['model'] == stock_config.models.implementer
@@ -1828,7 +1829,7 @@ class TestRollupRendersRigProducedRows:
             workflow2.modules = ['lib']
             monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub2.invoke_agent)
 
-            await workflow2._invoke(IMPLEMENTER, 'impl prompt', git_repo)
+            await workflow2._invoke(IMPLEMENTER, fixed_prompt('impl prompt'), git_repo)
             assert stub2.calls[-1]['model'] == 'haiku'
 
             # A role that emitted invocation_end but was never routed through

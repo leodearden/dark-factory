@@ -56,6 +56,35 @@ NEAR_MISS_ENV_NAMES = (
     'FOO__TASKMASTER',
 )
 
+#: Every path leaf the tracked config interpolates, each as a reader paired
+#: with an id.  The reader is a callable rather than a dotted string the test
+#: would have to split, so it cannot drift from the config it names.
+INTERPOLATED_PATH_LEAVES = (
+    pytest.param(lambda config: config.taskmaster.project_root, id='taskmaster.project_root'),
+    pytest.param(
+        lambda config: config.reconciliation.explore_codebase_root,
+        id='reconciliation.explore_codebase_root',
+    ),
+    pytest.param(lambda config: config.queue.data_dir, id='queue.data_dir'),
+    pytest.param(lambda config: config.reconciliation.data_dir, id='reconciliation.data_dir'),
+    pytest.param(
+        lambda config: config.reconciliation.escalation_queue_dir,
+        id='reconciliation.escalation_queue_dir',
+    ),
+)
+
+#: Each YAML interpolation variable paired with one leaf it drives, as ONE
+#: ``(name, reader)`` value per case: a fixture's ``params`` binds a single
+#: name, so a two-value ``pytest.param`` would not fit both consumers.
+INTERPOLATION_VAR_LEAVES = (
+    pytest.param(('PROJECT_ROOT', lambda config: config.taskmaster.project_root), id='project-root'),
+    pytest.param(('QUEUE_DATA_DIR', lambda config: config.queue.data_dir), id='queue-data-dir'),
+    pytest.param(
+        ('RECONCILIATION_DATA_DIR', lambda config: config.reconciliation.data_dir),
+        id='reconciliation-data-dir',
+    ),
+)
+
 
 def test_config_resolution_is_independent_of_the_process_cwd(monkeypatch, tmp_path):
     """The same commit must resolve the same config LAYERS from any CWD.
@@ -66,12 +95,10 @@ def test_config_resolution_is_independent_of_the_process_cwd(monkeypatch, tmp_pa
     The full `model_dump()` comparison then catches every other field that
     would silently drop to a code default alongside it.
 
-    READ THE EQUALITY AS WRITTEN: equal dumps are STRING equality, not
-    semantic equality.  The tracked config's path leaves are relative, so
-    `taskmaster.project_root` is the literal `'.'` on both sides of the chdir
-    — equal, while denoting two different directories.  That residual is real
-    and is NOT closed here; the next test states it outright rather than
-    leaving this one to be misread as covering it.
+    The equal dumps are semantic equality too, not just string equality: the
+    path leaves are absolute paths under this test's `tmp_path`, so no leaf is
+    a relative string denoting whichever CWD resolves it.  The next test
+    states that per leaf.
     """
     before_chdir = FusedMemoryConfig()
 
@@ -83,43 +110,77 @@ def test_config_resolution_is_independent_of_the_process_cwd(monkeypatch, tmp_pa
     assert after_chdir.model_dump() == before_chdir.model_dump()
 
 
-def test_the_pin_leaves_relative_path_leaves_denoting_the_launching_cwd(monkeypatch, tmp_path):
-    """The accepted residual, stated executably: same string, different directory.
+@pytest.mark.parametrize('read_leaf', INTERPOLATED_PATH_LEAVES)
+def test_the_pin_anchors_every_path_leaf_in_the_tests_tmp_path(
+    read_leaf, monkeypatch, tmp_path, tmp_path_factory
+):
+    """Every interpolated path leaf is one absolute directory inside this test's tmp.
 
-    `conftest.py::_isolate_fm_config` pins the config FILE by absolute path,
-    which is what makes resolution CWD-independent — but the file it pins
-    carries `${PROJECT_ROOT:.}` and `${QUEUE_DATA_DIR:./data/queue}`, so a
-    test that RESOLVES one of those leaves still gets a directory that depends
-    on where pytest was launched.  The orchestrator's fixture closes this half
-    by pinning `ORCH_PROJECT_ROOT` at `tmp_path`; doing the same here would
-    change the value every currently-green test reads, so it is recorded in
-    `plans/fused-memory-config-cwd-leak-rca-2026-09-13.md` and filed as a
-    follow-up rather than done under this task's zero-collateral decision.
-
-    This test exists so the residual cannot be mistaken for fixed.  When the
-    follow-up lands, the second assertion is the one meant to fail: invert it
-    rather than deleting it.
+    Task 5444 asserted the residual (same string, different directory); task
+    5481 pinned the interpolation variables and inverted it.
 
     `.resolve()` on the before-value is taken BEFORE the chdir on purpose — a
     relative path resolves against the CWD *at the moment it is resolved*, so
     resolving both afterwards compares the new CWD with itself and the test
-    passes vacuously whatever the fixture does.  It did exactly that on the
-    first draft.
+    passes vacuously whatever the fixture does.  The chdir target is a SIBLING
+    of `tmp_path`, not `tmp_path` itself, so a regressed `'.'` resolved after
+    it can never land on the pinned root by coincidence.
     """
-    before_chdir = FusedMemoryConfig().taskmaster
-    assert before_chdir is not None
-    before_resolved = Path(before_chdir.project_root).resolve()
+    before_chdir = FusedMemoryConfig()
+    assert before_chdir.taskmaster is not None
+    assert Path(read_leaf(before_chdir)).is_absolute()
+    before_resolved = Path(read_leaf(before_chdir)).resolve()
 
-    monkeypatch.chdir(tmp_path)
-    after_chdir = FusedMemoryConfig().taskmaster
-    assert after_chdir is not None
+    monkeypatch.chdir(tmp_path_factory.mktemp('elsewhere'))
+    after_chdir = FusedMemoryConfig()
+    assert after_chdir.taskmaster is not None
 
-    assert after_chdir.project_root == before_chdir.project_root
-    assert Path(after_chdir.project_root).resolve() != before_resolved
+    assert Path(read_leaf(after_chdir)).resolve() == before_resolved
+    assert before_resolved.is_relative_to(tmp_path.resolve())
+
+
+@pytest.mark.parametrize('interpolation', INTERPOLATION_VAR_LEAVES)
+def test_the_pin_lays_out_tmp_path_as_the_tracked_config_does(interpolation, monkeypatch, tmp_path):
+    """Each pinned variable sits where the YAML's own ``${VAR:default}`` puts it.
+
+    ``fused-memory/config/config.yaml`` is the home of that layout and
+    ``conftest.py::_isolate_fm_config`` mirrors it under ``tmp_path``.  Read
+    with the pin removed, the leaf is the YAML default, relative to the CWD;
+    read with it, the same relative path under ``tmp_path``.  A default edited
+    in one place and not the other fails here instead of drifting silently.
+    """
+    name, read_leaf = interpolation
+    pinned = Path(read_leaf(FusedMemoryConfig())).relative_to(tmp_path)
+
+    monkeypatch.delenv(name)
+    unpinned = FusedMemoryConfig()
+
+    assert unpinned.taskmaster is not None
+    assert Path(read_leaf(unpinned)) == pinned
+
+
+@pytest.mark.parametrize('interpolation', INTERPOLATION_VAR_LEAVES)
+def test_a_test_local_interpolation_override_still_reaches_the_config(
+    interpolation, monkeypatch, tmp_path
+):
+    """A test-body setenv of an interpolation variable still beats the pin.
+
+    This is the escape hatch that rules out pinning pydantic's nested names
+    (``TASKMASTER__PROJECT_ROOT`` and friends) instead: the env layer outranks
+    the YAML, so such a pin would override this test's own value.
+    """
+    name, read_leaf = interpolation
+    mine = str(tmp_path / 'mine')
+    monkeypatch.setenv(name, mine)
+
+    config = FusedMemoryConfig()
+
+    assert config.taskmaster is not None
+    assert read_leaf(config) == mine
 
 
 class TestAmbientInterpolationCannotRedirectTheConfig:
-    """The half of the leaf story that IS closed: the inherited redirect.
+    """The inherited redirect: an ambient interpolation variable cannot reach a leaf.
 
     ``${PROJECT_ROOT:.}``, ``${QUEUE_DATA_DIR:...}`` and
     ``${RECONCILIATION_DATA_DIR:...}`` are interpolated by the YAML loader, not
@@ -135,42 +196,36 @@ class TestAmbientInterpolationCannotRedirectTheConfig:
     Planting AMBIENTLY is the whole point, exactly as in
     ``TestAmbientEnvCannotRewriteTheConfig``.  A value set in a test BODY still
     reaches the config, because the interpolation reads ``os.environ`` when
-    ``FusedMemoryConfig()`` is constructed — the fixture removes what pytest
-    INHERITED and deliberately leaves a test's own override working.  An
-    earlier draft of this asserted the opposite and failed, which is the
-    sharper statement of the boundary than any docstring.
+    ``FusedMemoryConfig()`` is constructed — the fixture OVERWRITES what pytest
+    INHERITED with this test's tmp layout and deliberately leaves a test's own
+    override working, which
+    ``test_a_test_local_interpolation_override_still_reaches_the_config``
+    pins.
     """
 
-    @pytest.fixture(
-        scope='class',
-        autouse=True,
-        params=[
-            ('PROJECT_ROOT', lambda config: config.taskmaster.project_root),
-            ('QUEUE_DATA_DIR', lambda config: config.queue.data_dir),
-            ('RECONCILIATION_DATA_DIR', lambda config: config.reconciliation.data_dir),
-        ],
-        ids=['project-root', 'queue-data-dir', 'reconciliation-data-dir'],
-    )
+    @pytest.fixture(scope='class', autouse=True, params=INTERPOLATION_VAR_LEAVES)
     def redirected_leaf(self, request):
-        """Plant one interpolation variable ambiently; hand back its leaf reader.
-
-        The reader travels WITH the name as a callable rather than as a dotted
-        string the test would have to split: the pairing is the point of the
-        case, and a parsed string would be one more thing that can drift from
-        the config it names.
-        """
+        """Plant one interpolation variable ambiently; hand back its leaf reader."""
         name, read_leaf = request.param
         ambient = pytest.MonkeyPatch()
         ambient.setenv(name, PWNED)
         yield read_leaf
         ambient.undo()
 
-    def test_an_inherited_interpolation_var_cannot_redirect_the_config(self, redirected_leaf):
-        """The planted directory must not reach the leaf it interpolates into."""
+    def test_an_inherited_interpolation_var_cannot_redirect_the_config(
+        self, redirected_leaf, tmp_path
+    ):
+        """The planted directory must not reach the leaf; this test's tmp does.
+
+        The second assertion is the stronger one: it also fails if the leaf
+        falls back to the YAML's relative default, which ``!= PWNED`` would
+        pass.
+        """
         config = FusedMemoryConfig()
 
         assert config.taskmaster is not None
         assert redirected_leaf(config) != PWNED
+        assert Path(redirected_leaf(config)).is_relative_to(tmp_path)
 
 
 def test_code_default_config_yields_pure_code_defaults(code_default_config):

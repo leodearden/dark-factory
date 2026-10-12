@@ -416,7 +416,7 @@ class TestBuildEvalScheduler:
 
     @pytest.mark.asyncio
     async def test_handle_blast_radius_expansion_returns_true(self):
-        """handle_blast_radius_expansion returns True without raising.
+        """handle_blast_radius_expansion reports the refinement applied without raising.
 
         This is the end-to-end sanity check: DI + lock-preinstall means the
         production code path for plan refinement works in eval mode.  The test
@@ -435,11 +435,11 @@ class TestBuildEvalScheduler:
             ['some_module'],
             ['some_module', 'other_module'],
         )
-        assert result is True
+        assert result.applied is True
 
     @pytest.mark.asyncio
     async def test_handle_blast_radius_expansion_contended_returns_false(self):
-        """handle_blast_radius_expansion returns False when lock is contended.
+        """handle_blast_radius_expansion reports NOT applied when lock is contended.
 
         The interesting path: a different task already holds ``other_module``
         at max capacity (default limit = 1), so ``try_acquire_additional``
@@ -463,6 +463,6 @@ class TestBuildEvalScheduler:
             ['some_module'],
             ['some_module', 'other_module'],  # other_module is now contended
         )
-        # Expansion fails → method returns False and resets task to pending.
-        assert result is False
+        # Expansion fails → result is not applied and the task resets to pending.
+        assert result.applied is False
         assert stub._statuses.get('task-99') == 'pending'

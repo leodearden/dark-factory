@@ -1,18 +1,12 @@
 """Tests for promoting the ε=1890 verify-base guard into two_layer_invariants (I5, task 1999).
 
 Covers:
-  step-01 RED — _verify_base_frozen_tip_violations() composed into
-                two_layer_invariants(): a frozen entry whose base_sha is not
-                the expected frozen-tip base produces a violation, verified
-                structurally (via a direct call to the helper, then asserting
-                two_layer_invariants() and snapshot()['two_layer_invariants']
-                compose that same output) rather than by matching violation
-                message wording — the two checks are intentionally worded
-                distinctly (see merge_queue.py docstrings) but that wording is
-                cosmetic and free to change without breaking these tests. A
-                HEALTHY multi-entry chained frozen prefix produces NO such
-                violation (guards against a naive "every entry == newest tip"
-                implementation).
+  step-01 RED — the verify-base sub-check composed into two_layer_invariants():
+                a frozen entry whose base_sha is not the expected frozen-tip
+                base produces a violation on that PUBLIC surface and on
+                snapshot()['two_layer_invariants']. A HEALTHY multi-entry
+                chained frozen prefix produces NO such violation (guards
+                against a naive "every entry == newest tip" implementation).
   3206 step-3  — the PRD §5.3 RE-MERGE CARVE-OUT applies to this surface too:
                 a frozen entry carrying `remerge_recovery=True` produces no
                 verify-base⊄frozen-tip violation, the carve-out is
@@ -32,6 +26,13 @@ and §10). The step-7 pins are expected to pass immediately; their purpose is
 to make a future SILENT flip to enforcement impossible — each fails the moment
 the guard changes control flow. If they go red, re-derive the evidence in PRD
 §5.3 before "fixing" them.
+
+HOW THIS MODULE OBSERVES (task 5026). Sub-check (iii) is selected out of the
+composed public surface by its own distinct marker (:data:`_VERIFY_BASE_MARKER`)
+rather than by calling the per-entry helper behind it, and the §5.3 main-SHA
+cache is read back through its only consumer (:func:`_cached_main_sha_violations`)
+rather than off the field. Production commits to both of those surfaces in
+merge_queue.py's own docstrings; neither is incidental prose.
 
 See _warn_if_verify_base_not_frozen_tip (merge_queue.py) for the log-only
 dispatch-time guard this promotes to snapshot granularity, and
@@ -204,6 +205,95 @@ def _make_inflight_entry(
     )
 
 
+# ── The §5.3 verify-base sub-check, read through its PUBLIC surface ──────────
+#
+# two_layer_invariants() composes three sub-checks plus the inherited
+# base-chain walk, and sub-check (iii) — the ε=1890 verify-base⊄frozen-tip
+# promotion — is the one this module is about.  Production words it distinctly
+# from check_frozen_prefix_invariant's 'frozen-prefix base-chain broken …' for
+# exactly this reason: its docstring commits sub-check (iii) to standing "as
+# its own named verify-frontier assertion target".  So the marker below is a
+# contract this module is entitled to rely on, not incidental prose — the
+# per-entry chained-base predicate is reachable publicly and needs no reach
+# into _verify_base_frozen_tip_violations().
+_VERIFY_BASE_MARKER = 'verify-base⊄frozen-tip'
+
+
+def _verify_base_violations(worker: SpeculativeMergeWorker, main_sha: str) -> list[str]:
+    """Return only sub-check (iii)'s violations from the public composed surface."""
+    return [v for v in worker.two_layer_invariants(main_sha) if _VERIFY_BASE_MARKER in v]
+
+
+def _install_frozen_head(
+    worker: SpeculativeMergeWorker, config: OrchestratorConfig, git_repo: Path,
+    *, task_id: str, base_sha: str, merge_commit: str,
+) -> SpeculativeItem:
+    """Register a frozen head entry on *worker* and return its item.
+
+    Registered at FINALIZING — a qualifying phase, so `_frozen_inflight_entries()`
+    counts it and it takes part in the `_frozen_base_chain` walk both §5.3
+    surfaces share.  The file's single in-flight-state seed: there is no public
+    constructor for in-flight state (the residual named for task 5446).
+    """
+    _, head_item = _make_fake_item(
+        task_id, base_sha=base_sha, merge_commit=merge_commit,
+        config=config, git_repo=git_repo,
+    )
+    worker._register_item(
+        _make_inflight_entry(head_item, verifying=True),
+        initial=ItemLifecycleState.FINALIZING,
+    )
+    return head_item
+
+
+def _stranded_finalize_head(
+    worker: SpeculativeMergeWorker, config: OrchestratorConfig, git_repo: Path,
+    *, dead_commit: str,
+) -> SpeculativeItem:
+    """Install a stranded (phantom) finalize head whose merge_commit is dead.
+
+    Reproduces the measured 2026-08-08 shape (the task-3082 class): an entry
+    registered at FINALIZING but NOT present in `_inflight` is exactly what
+    `_finalizing_head_entry()` returns, and `_entry_phase` reports
+    'finalizing', so `frozen_prefix_tip(main)` returns *dead_commit* instead of
+    the live main tip.
+    """
+    head_item = _install_frozen_head(
+        worker, config, git_repo,
+        task_id='t-phantom', base_sha='some-older-main', merge_commit=dead_commit,
+    )
+    assert worker.frozen_prefix_tip('LIVEMAIN') == dead_commit, (
+        'fixture precondition: the phantom head must poison frozen_prefix_tip'
+    )
+    return head_item
+
+
+# ── Reading the §5.3 main-SHA cache back through its only public consumer ────
+#
+# snapshot()['two_layer_invariants'] composes sub-check (iii) against the
+# CACHED main SHA (merge_queue.py's `self._last_known_main_sha or 'unknown'`),
+# never against an argument — so a frozen head whose base is a SHA under no
+# test's control puts the cached value, verbatim, in the expected-base half of
+# the violation.  That makes the cache's exact value assertable without
+# reading the field.  Install the probe AFTER the code path under test: it is
+# a pure state write, so it cannot perturb what it measures.
+_PROBE_BASE = 'PROBE-BASE-NEVER-A-MAIN-SHA'
+
+
+def _cached_main_sha_violations(
+    worker: SpeculativeMergeWorker, config: OrchestratorConfig, git_repo: Path,
+) -> list[str]:
+    """Return the probe head's verify-base violation(s), which name the cached SHA."""
+    _install_frozen_head(
+        worker, config, git_repo,
+        task_id='t-cache-probe', base_sha=_PROBE_BASE, merge_commit='c-probe',
+    )
+    return [
+        v for v in worker.snapshot()['two_layer_invariants']
+        if _VERIFY_BASE_MARKER in v
+    ]
+
+
 # ── step-01 RED: _verify_base_frozen_tip_violations() composed into two_layer_invariants ──
 
 
@@ -220,15 +310,17 @@ class TestVerifyBaseFrozenTipPromotion:
     ) -> None:
         """A frozen head entry whose base_sha is NOT main_sha → dedicated verify-base violation.
 
-        Asserts a STRUCTURAL signal that the new sub-check fired — calling
-        :meth:`_verify_base_frozen_tip_violations` directly — rather than
-        inferring it from violation-message wording (regex-matching prose is
-        fragile: it breaks on a legitimate reword and would pass even if the
-        wrong check produced the matching words). :meth:`two_layer_invariants`
-        and ``snapshot()['two_layer_invariants']`` (which reads
-        _last_known_main_sha, per λ=1895's real-main-not-frozen-tip
-        convention) are each checked to COMPOSE that same helper output
-        verbatim, proving the wiring rather than the wording.
+        Read through :meth:`two_layer_invariants` selected on sub-check
+        (iii)'s own marker (see :data:`_VERIFY_BASE_MARKER`), so the assertion
+        names the composed public surface the operator dashboard reads rather
+        than reaching for the per-entry helper behind it.  Selecting on the
+        marker cannot confuse sub-check (iii) with the inherited base-chain
+        walk: production words the two distinctly on purpose, and
+        check_frozen_prefix_invariant's 'frozen-prefix base-chain broken …'
+        shares no substring with it.  ``snapshot()['two_layer_invariants']``
+        is checked separately because it composes against the CACHED main SHA
+        (λ=1895's real-main-not-frozen-tip convention), not against an
+        argument.
         """
         worker = _make_worker(git_ops)
         main_sha = 'M0'
@@ -239,31 +331,20 @@ class TestVerifyBaseFrozenTipPromotion:
         worker._inflight.append(_make_inflight_entry(item, verifying=True))
         rid = item.request.request_id
 
-        # Structural signal: call the dedicated helper directly instead of
-        # grepping combined output for wording that "looks like" the new check.
-        direct_violations = worker._verify_base_frozen_tip_violations(main_sha)
-        assert direct_violations, (
-            f'expected _verify_base_frozen_tip_violations() to flag {rid!r} directly, '
-            f'got: {direct_violations}'
+        violations = _verify_base_violations(worker, main_sha)
+        assert violations, (
+            f'expected two_layer_invariants() to flag {rid!r} with a verify-base '
+            f'sub-check (iii) violation, got: {worker.two_layer_invariants(main_sha)}'
         )
-        assert all(rid in v for v in direct_violations), (
-            f'expected every violation to name {rid!r}, got: {direct_violations}'
-        )
-
-        # two_layer_invariants() must compose the helper's own output verbatim —
-        # a behavioral proof that sub-check (iii) is wired in, independent of
-        # whatever wording either check happens to use.
-        violations = worker.two_layer_invariants(main_sha)
-        assert all(v in violations for v in direct_violations), (
-            f'expected two_layer_invariants() to include every violation returned by '
-            f'_verify_base_frozen_tip_violations(), got: {violations}'
+        assert all(rid in v for v in violations), (
+            f'expected every violation to name {rid!r}, got: {violations}'
         )
 
         # snapshot()['two_layer_invariants'] must surface the same violation(s) —
-        # set _last_known_main_sha so snapshot() computes against real main.
+        # set the cached main SHA so snapshot() computes against real main.
         worker._last_known_main_sha = main_sha
         snap_violations = worker.snapshot()['two_layer_invariants']
-        assert all(v in snap_violations for v in direct_violations), (
+        assert all(v in snap_violations for v in violations), (
             f'expected snapshot()["two_layer_invariants"] to surface the same '
             f'verify-base violation(s), got: {snap_violations}'
         )
@@ -291,13 +372,9 @@ class TestVerifyBaseFrozenTipPromotion:
         worker._inflight.append(_make_inflight_entry(item_0, verifying=True))
         worker._inflight.append(_make_inflight_entry(item_1, verifying=True))
 
-        # Direct call isolates the dedicated helper from the other two
-        # sub-checks composed into two_layer_invariants() below.
-        assert worker._verify_base_frozen_tip_violations(main_sha) == [], (
-            'expected _verify_base_frozen_tip_violations() to report no violations '
-            'for a healthy chained frozen prefix'
-        )
-
+        # The whole composed surface must be clean, which subsumes sub-check
+        # (iii) being clean — a naive "every entry == newest tip" implementation
+        # would put entry0's violation in here.
         violations = worker.two_layer_invariants(main_sha)
         assert violations == [], (
             f'expected a healthy chained frozen prefix to have no violations, got: {violations}'
@@ -313,16 +390,16 @@ class TestRemergeCarveOutAtSnapshotSurface:
 
     §5.3 has TWO surfaces: the dispatch-time guard
     (:meth:`_warn_if_verify_base_not_frozen_tip`) and this snapshot-granularity
-    promotion (:meth:`_verify_base_frozen_tip_violations`, task 1999 I5).  The
-    PRD §5.3 re-merge carve-out is a property of the RULE, not of one surface,
-    so BOTH must apply it — otherwise a recovery re-merge is silent at dispatch
-    but still reported as a violation in the health snapshot.  That is exactly
-    the silent-disagreement failure `_verify_base_frozen_tip_violations`' own
-    docstring says the shared `_frozen_base_chain` generator exists to prevent.
+    promotion composed into two_layer_invariants() as sub-check (iii) (task
+    1999 I5).  The PRD §5.3 re-merge carve-out is a property of the RULE, not
+    of one surface, so BOTH must apply it — otherwise a recovery re-merge is
+    silent at dispatch but still reported as a violation in the health
+    snapshot.  That is exactly the silent-disagreement failure the shared
+    `_frozen_base_chain` generator exists to prevent.
 
-    Asserted STRUCTURALLY (helper call + composition into two_layer_invariants /
-    snapshot), per this module's established convention — never by matching
-    violation prose, which the two surfaces intentionally word differently.
+    Asserted on BOTH composed surfaces — two_layer_invariants(main_sha) and
+    snapshot()['two_layer_invariants'] — selected by sub-check (iii)'s own
+    marker, per this module's established convention.
 
     RED until step-4 GREEN skips marked entries at violation-emission time.
     """
@@ -345,24 +422,18 @@ class TestRemergeCarveOutAtSnapshotSurface:
         item = _mark_recovery(item)
         worker._inflight.append(_make_inflight_entry(item, verifying=True))
 
-        assert worker._verify_base_frozen_tip_violations(main_sha) == [], (
+        rid = item.request.request_id
+        assert _verify_base_violations(worker, main_sha) == [], (
             '§5.3 re-merge carve-out (task 3206): a recovery entry must not '
             'produce a verify-base⊄frozen-tip violation'
         )
 
-        # …and it must be absent from BOTH composed surfaces, not merely from
-        # the helper (a carve-out applied only in the helper but re-derived
-        # elsewhere would still leak into the health snapshot).
-        rid = item.request.request_id
-        violations = worker.two_layer_invariants(main_sha)
-        assert not [v for v in violations if 'verify-base' in v and rid in v], (
-            f'expected no verify-base violation for the recovery entry in '
-            f'two_layer_invariants(), got: {violations}'
-        )
-
+        # …and it must be absent from the SNAPSHOT surface too, not merely
+        # from the argument-taking one (a carve-out that the snapshot path
+        # re-derived for itself would still leak into operator health).
         worker._last_known_main_sha = main_sha
         snap_violations = worker.snapshot()['two_layer_invariants']
-        assert not [v for v in snap_violations if 'verify-base' in v and rid in v], (
+        assert not [v for v in snap_violations if _VERIFY_BASE_MARKER in v and rid in v], (
             f'expected no verify-base violation for the recovery entry in '
             f'snapshot()["two_layer_invariants"], got: {snap_violations}'
         )
@@ -383,14 +454,12 @@ class TestRemergeCarveOutAtSnapshotSurface:
         worker._inflight.append(_make_inflight_entry(item, verifying=True))
         rid = item.request.request_id
 
-        direct = worker._verify_base_frozen_tip_violations(main_sha)
-        assert len(direct) == 1, (
+        fired = _verify_base_violations(worker, main_sha)
+        assert len(fired) == 1, (
             f'expected exactly 1 verify-base violation for an unmarked stale '
-            f'entry, got: {direct}'
+            f'entry, got: {fired}'
         )
-        assert rid in direct[0], f'violation must name {rid!r}, got: {direct[0]!r}'
-
-        assert all(v in worker.two_layer_invariants(main_sha) for v in direct)
+        assert rid in fired[0], f'violation must name {rid!r}, got: {fired[0]!r}'
 
     async def test_recovery_entry_still_advances_the_chain_for_successors(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
@@ -421,7 +490,7 @@ class TestRemergeCarveOutAtSnapshotSurface:
         worker._inflight.append(_make_inflight_entry(item_0, verifying=True))
         worker._inflight.append(_make_inflight_entry(item_1, verifying=True))
 
-        assert worker._verify_base_frozen_tip_violations(main_sha) == [], (
+        assert _verify_base_violations(worker, main_sha) == [], (
             'recovery entry suppressed, healthy successor clean — a chain '
             'corrupted by filtering the recovery entry OUT of the walk would '
             'falsely flag the successor'
@@ -450,9 +519,8 @@ class TestRemergeCarveOutAtSnapshotSurface:
         to WARN and the snapshot surface's decision to report a VIOLATION must
         agree: both fire for the unmarked case, both stay silent for the
         marked one.  This is the explicit anti-drift assertion the
-        `_verify_base_frozen_tip_violations` docstring says the shared-generator
-        design exists to protect — a carve-out landed on only one surface
-        passes that surface's own tests but fails here.
+        shared-generator design exists to protect — a carve-out landed on only
+        one surface passes that surface's own tests but fails here.
         """
         import logging
 
@@ -468,7 +536,7 @@ class TestRemergeCarveOutAtSnapshotSurface:
 
             # Snapshot surface: the entry IS the frozen head, expected == main.
             worker._inflight.append(_make_inflight_entry(item, verifying=True))
-            snapshot_fired = bool(worker._verify_base_frozen_tip_violations(main_sha))
+            snapshot_fired = bool(_verify_base_violations(worker, main_sha))
 
             # Dispatch surface: same item, same main, evaluated as the
             # candidate against an EMPTY frozen prefix (so frozen_prefix_tip
@@ -509,10 +577,10 @@ def _fake_local_allocator() -> MagicMock:
 
 @pytest.mark.asyncio
 class TestDispatchRefreshesLastKnownMainSha:
-    """The ε=1890 §5.3 dispatch guard in `_dispatch_item` must refresh
-    `worker._last_known_main_sha` from its own already-fetched fresh
-    `get_main_sha()` result, so `snapshot()['two_layer_invariants']` never
-    lags the live dispatch guard's view of main (task 2357 DEFECT 2).
+    """The ε=1890 §5.3 dispatch guard in `_dispatch_item` must refresh the
+    cached main SHA from its own already-fetched fresh `get_main_sha()`
+    result, so `snapshot()['two_layer_invariants']` never lags the live
+    dispatch guard's view of main (task 2357 DEFECT 2).
 
     RED until the GREEN step adds the one-line cache write inside the
     guard's try-block (merge_queue.py `_dispatch_item`, ~10291-10295).
@@ -521,10 +589,17 @@ class TestDispatchRefreshesLastKnownMainSha:
     async def test_dispatch_refreshes_last_known_main_sha(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
-        """A dispatch's fresh get_main_sha() must update worker._last_known_main_sha."""
-        worker = _make_worker(git_ops)
+        """A dispatch's fresh get_main_sha() must refresh the §5.3 main-SHA cache.
+
+        The refreshed value is read back through the cache's only consumer —
+        see :func:`_cached_main_sha_violations` — so the assertion names the
+        fresh SHA exactly, not merely "no longer stale" (which the companion
+        test below covers from the other direction).
+        """
         old_main = 'OLD00000'
         new_main = 'NEW11111'
+        git_ops.get_main_sha = AsyncMock(return_value=new_main)  # type: ignore[method-assign]
+        worker = _make_worker(git_ops)
         worker._last_known_main_sha = old_main
 
         # Non-speculative item whose base_sha == new_main so Mechanism 2's
@@ -535,7 +610,6 @@ class TestDispatchRefreshesLastKnownMainSha:
         )
         assert isinstance(item, RealMergeItem)  # narrow union arm for item.merge_wt (pyright)
 
-        worker._git_ops.get_main_sha = AsyncMock(return_value=new_main)  # type: ignore[method-assign]
         worker._host_allocator = _fake_local_allocator()
         worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
@@ -544,9 +618,10 @@ class TestDispatchRefreshesLastKnownMainSha:
         entry = await worker._dispatch_item(item)
 
         assert entry is not None, 'dispatch should succeed with a free local slot'
-        assert worker._last_known_main_sha == new_main, (
-            f'expected _dispatch_item to refresh _last_known_main_sha to the fresh '
-            f'ε=1890 guard SHA {new_main!r}, got {worker._last_known_main_sha!r}'
+        cached = _cached_main_sha_violations(worker, config, git_repo)
+        assert len(cached) == 1 and new_main in cached[0] and old_main not in cached[0], (
+            f'expected _dispatch_item to refresh the §5.3 cache to the fresh '
+            f'ε=1890 guard SHA {new_main!r}, got: {cached}'
         )
 
     async def test_dispatch_refresh_closes_snapshot_false_positive(
@@ -557,9 +632,10 @@ class TestDispatchRefreshesLastKnownMainSha:
         guard's refresh closes it afterward — with the merger otherwise
         idle (no recompute_suffix_conflict_graph call anywhere in this test).
         """
-        worker = _make_worker(git_ops)
         old_main = 'OLD00000'
         new_main = 'NEW11111'
+        git_ops.get_main_sha = AsyncMock(return_value=new_main)  # type: ignore[method-assign]
+        worker = _make_worker(git_ops)
         worker._last_known_main_sha = old_main
 
         # A healthy frozen head already in _inflight, based on new_main.
@@ -579,7 +655,6 @@ class TestDispatchRefreshesLastKnownMainSha:
             config=config, git_repo=git_repo,
         )
         assert isinstance(item, RealMergeItem)  # narrow union arm for item.merge_wt (pyright)
-        worker._git_ops.get_main_sha = AsyncMock(return_value=new_main)  # type: ignore[method-assign]
         worker._host_allocator = _fake_local_allocator()
         worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
@@ -599,12 +674,18 @@ class TestDispatchRefreshesLastKnownMainSha:
     async def test_dispatch_fail_open_leaves_cache_unchanged(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
-        """A transient get_main_sha() error at the guard must leave
-        _last_known_main_sha untouched — fail-open, never overwrite a good
-        cache with a bad read — while dispatch still succeeds.
+        """A transient get_main_sha() error at the guard must leave the §5.3
+        main-SHA cache untouched — fail-open, never overwrite a good cache
+        with a bad read — while dispatch still succeeds.
         """
-        worker = _make_worker(git_ops)
         old_main = 'OLD00000'
+        # First call = Mechanism 2 staleness check (succeeds); second call =
+        # the ε=1890 guard's own fetch (fails) — isolates the fail-open
+        # behaviour to the guard's try/except without disturbing Mechanism 2.
+        git_ops.get_main_sha = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[old_main, RuntimeError('simulated transient git error')]
+        )
+        worker = _make_worker(git_ops)
         worker._last_known_main_sha = old_main
 
         # base_sha == old_main so Mechanism 2's staleness check (which fires
@@ -614,12 +695,6 @@ class TestDispatchRefreshesLastKnownMainSha:
             config=config, git_repo=git_repo,
         )
         assert isinstance(item, RealMergeItem)  # narrow union arm for item.merge_wt (pyright)
-        # First call = Mechanism 2 staleness check (succeeds); second call =
-        # the ε=1890 guard's own fetch (fails) — isolates the fail-open
-        # behaviour to the guard's try/except without disturbing Mechanism 2.
-        worker._git_ops.get_main_sha = AsyncMock(  # type: ignore[method-assign]
-            side_effect=[old_main, RuntimeError('simulated transient git error')]
-        )
         worker._host_allocator = _fake_local_allocator()
         worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
@@ -628,8 +703,10 @@ class TestDispatchRefreshesLastKnownMainSha:
         entry = await worker._dispatch_item(item)
 
         assert entry is not None, 'dispatch must still succeed despite the guard error'
-        assert worker._last_known_main_sha == old_main, (
-            'a get_main_sha() error at the guard must leave the cache unchanged (fail-open)'
+        cached = _cached_main_sha_violations(worker, config, git_repo)
+        assert len(cached) == 1 and old_main in cached[0], (
+            f'a get_main_sha() error at the guard must leave the cache unchanged '
+            f'at {old_main!r} (fail-open), got: {cached}'
         )
 
 
@@ -652,9 +729,8 @@ class TestNoOverCorrectionRegressionLock:
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
         """A frozen head whose base_sha is NOT a FRESH main_sha still trips
-        both _verify_base_frozen_tip_violations() and two_layer_invariants()
-        — proving the refresh corrects the cached SHA rather than blinding
-        the check itself.
+        two_layer_invariants()' verify-base sub-check — proving the refresh
+        corrects the cached SHA rather than blinding the check itself.
         """
         worker = _make_worker(git_ops)
         fresh_main = 'FRESH-MAIN-001'
@@ -666,19 +742,14 @@ class TestNoOverCorrectionRegressionLock:
         worker._inflight.append(_make_inflight_entry(item, verifying=True))
         rid = item.request.request_id
 
-        direct_violations = worker._verify_base_frozen_tip_violations(fresh_main)
-        assert direct_violations, (
+        violations = _verify_base_violations(worker, fresh_main)
+        assert violations, (
             f'expected genuine drift (base_sha != fresh main_sha) to still be '
-            f'flagged by _verify_base_frozen_tip_violations(), got: {direct_violations}'
+            f'flagged against a FRESH main_sha, got: '
+            f'{worker.two_layer_invariants(fresh_main)}'
         )
-        assert all(rid in v for v in direct_violations), (
-            f'expected every violation to name {rid!r}, got: {direct_violations}'
-        )
-
-        violations = worker.two_layer_invariants(fresh_main)
-        assert all(v in violations for v in direct_violations), (
-            f'expected two_layer_invariants() to still compose the genuine-drift '
-            f'violation(s) against a FRESH main_sha, got: {violations}'
+        assert all(rid in v for v in violations), (
+            f'expected every violation to name {rid!r}, got: {violations}'
         )
 
     async def test_healthy_chained_stack_with_fresh_cache_is_clean(
@@ -749,30 +820,6 @@ class TestAdvisoryContractRegressionPins:
     PRD §5.3 first.
     """
 
-    async def _stranded_finalize_head(
-        self, worker: SpeculativeMergeWorker, config: OrchestratorConfig,
-        git_repo: Path, *, dead_commit: str,
-    ) -> SpeculativeItem:
-        """Install a stranded (phantom) finalize head whose merge_commit is dead.
-
-        Reproduces the measured 2026-08-08 shape (the task-3082 class): an
-        entry registered at FINALIZING but NOT present in `_inflight` is
-        exactly what `_finalizing_head_entry()` returns, and `_entry_phase`
-        reports 'finalizing' — a qualifying phase — so
-        `_frozen_inflight_entries()` counts it and `frozen_prefix_tip(main)`
-        returns *dead_commit* instead of the live main tip.
-        """
-        _, head_item = _make_fake_item(
-            't-phantom', base_sha='some-older-main', merge_commit=dead_commit,
-            config=config, git_repo=git_repo,
-        )
-        head_entry = _make_inflight_entry(head_item, verifying=True)
-        worker._register_item(head_entry, initial=ItemLifecycleState.FINALIZING)
-        assert worker.frozen_prefix_tip('LIVEMAIN') == dead_commit, (
-            'fixture precondition: the phantom head must poison frozen_prefix_tip'
-        )
-        return head_item
-
     async def test_phantom_frozen_tip_does_not_block_dispatch(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
@@ -793,9 +840,10 @@ class TestAdvisoryContractRegressionPins:
         enforcement both would have been REFUSED; this test is what makes that
         regression loud.
         """
-        worker = _make_worker(git_ops)
         live_main = 'LIVEMAIN'
-        await self._stranded_finalize_head(
+        git_ops.get_main_sha = AsyncMock(return_value=live_main)  # type: ignore[method-assign]
+        worker = _make_worker(git_ops)
+        _stranded_finalize_head(
             worker, config, git_repo, dead_commit='DEADPHANTOM',
         )
 
@@ -807,7 +855,6 @@ class TestAdvisoryContractRegressionPins:
         )
         assert isinstance(item, RealMergeItem)  # narrow for item.merge_wt (pyright)
 
-        worker._git_ops.get_main_sha = AsyncMock(return_value=live_main)  # type: ignore[method-assign]
         allocator = _fake_local_allocator()
         worker._host_allocator = allocator
         worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
@@ -840,9 +887,10 @@ class TestAdvisoryContractRegressionPins:
         """
         import logging
 
-        worker = _make_worker(git_ops)
         live_main = 'LIVEMAIN'
-        await self._stranded_finalize_head(
+        git_ops.get_main_sha = AsyncMock(return_value=live_main)  # type: ignore[method-assign]
+        worker = _make_worker(git_ops)
+        _stranded_finalize_head(
             worker, config, git_repo, dead_commit='DEADPHANTOM',
         )
 
@@ -851,7 +899,6 @@ class TestAdvisoryContractRegressionPins:
             config=config, git_repo=git_repo,
         )
         assert isinstance(item, RealMergeItem)
-        worker._git_ops.get_main_sha = AsyncMock(return_value=live_main)  # type: ignore[method-assign]
         worker._host_allocator = _fake_local_allocator()
         worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
@@ -884,9 +931,10 @@ class TestAdvisoryContractRegressionPins:
         both halves — the lease is acquired and NOT released/cancelled, and it
         is handed to the returned entry rather than dropped on the floor.
         """
-        worker = _make_worker(git_ops)
         live_main = 'LIVEMAIN'
-        await self._stranded_finalize_head(
+        git_ops.get_main_sha = AsyncMock(return_value=live_main)  # type: ignore[method-assign]
+        worker = _make_worker(git_ops)
+        _stranded_finalize_head(
             worker, config, git_repo, dead_commit='DEADPHANTOM',
         )
 
@@ -895,7 +943,6 @@ class TestAdvisoryContractRegressionPins:
             config=config, git_repo=git_repo,
         )
         assert isinstance(item, RealMergeItem)
-        worker._git_ops.get_main_sha = AsyncMock(return_value=live_main)  # type: ignore[method-assign]
         allocator = _fake_local_allocator()
         worker._host_allocator = allocator
         worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
@@ -929,15 +976,15 @@ class TestAdvisoryContractRegressionPins:
         """
         import logging
 
-        worker = _make_worker(git_ops)
         live_main = 'LIVEMAIN'
+        git_ops.get_main_sha = AsyncMock(return_value=live_main)  # type: ignore[method-assign]
+        worker = _make_worker(git_ops)
 
         _, item = _make_fake_item(
             't-healthy', base_sha=live_main, merge_commit='c-healthy',
             config=config, git_repo=git_repo,
         )
         assert isinstance(item, RealMergeItem)
-        worker._git_ops.get_main_sha = AsyncMock(return_value=live_main)  # type: ignore[method-assign]
         worker._host_allocator = _fake_local_allocator()
         worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)

@@ -36,7 +36,7 @@ import pytest
 from _orch_helpers import assert_isolated_git_repo
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import GitOps, WorktreeInfo, _run
+from orchestrator.git_ops import GitOps, SeedLaneLock, WorktreeInfo, _run
 
 # ---------------------------------------------------------------------------
 # Local fixtures / helpers (see module docstring for the local-copy convention)
@@ -287,14 +287,16 @@ def _install_selective_seed_failure(
     hostile: set[Path] = set() if fail_lanes is None else set(fail_lanes)
     pick_first = fail_lanes is None
 
-    async def _seed(lane_dir: Path, mode: str, *, take_lane_lock: bool = True) -> int:
+    async def _seed(
+        lane_dir: Path, mode: str, *, lane_lock: SeedLaneLock = SeedLaneLock.TAKE,
+    ) -> int:
         lane = Path(lane_dir)
         seen.append(lane)
         if pick_first and not hostile:
             hostile.add(lane)
         if lane in hostile:
             return failing_rc
-        return await real_seed(lane_dir, mode, take_lane_lock=take_lane_lock)
+        return await real_seed(lane_dir, mode, lane_lock=lane_lock)
 
     git_ops._seed_warm_lane = _seed  # type: ignore[method-assign]
     return seen
@@ -504,7 +506,9 @@ class TestStealRetriesAnotherLane:
         seen: list[Path] = []
         hostile: set[Path] = set()
 
-        async def _seed(lane_dir, mode, *, take_lane_lock: bool = True) -> int:
+        async def _seed(
+            lane_dir, mode, *, lane_lock: SeedLaneLock = SeedLaneLock.TAKE,
+        ) -> int:
             lane = Path(lane_dir)
             seen.append(lane)
             if not hostile and lane != free_lane:
@@ -516,7 +520,7 @@ class TestStealRetriesAnotherLane:
                 return 1
             if lane in hostile:
                 return 1
-            return await real_seed(lane_dir, mode, take_lane_lock=take_lane_lock)
+            return await real_seed(lane_dir, mode, lane_lock=lane_lock)
 
         git_ops._seed_warm_lane = _seed  # type: ignore[method-assign]
 

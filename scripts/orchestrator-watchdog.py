@@ -2,17 +2,29 @@
 """Orchestrator escalation-MCP watchdog.
 
 For each enabled orchestrator (dark-factory + reify): probes its escalation-MCP
-TCP port via ``ss``, and performs a three-phase ``systemctl --user stop`` →
-``reset-failed`` → ``start`` if the port is not listening. The probe-fails →
-restart path covers BOTH failure modes:
+TCP port via ``ss``, and revives it via ``systemctl --user reset-failed`` →
+``restart --no-block`` on either of two dead signals — the port is not
+listening, or (under systemd socket activation) the port
+IS listening but the unit's own ActiveState says it is dead. Either signal
+covers BOTH failure modes:
 
   * **Wedged** (alive-but-hung): the unit is active but the port stopped
     answering — systemd Restart= won't fire. The watchdog forces a restart.
   * **Dead-but-enabled** (e.g. a boot-race dependency-cancel that systemd
     never retries, or a unit that gave up after exhausting StartLimitBurst):
-    the unit is inactive, the port isn't listening, ``stop`` is a no-op, and
-    ``reset-failed`` + ``start`` revives it. This is what self-heals the
-    2026-05-27 powercut failure mode.
+    the unit is inactive. Pre-socket-activation this always meant the port
+    wasn't listening either; under socket activation each unit's escalation
+    port is held by a systemd ``.socket`` unit independent of the service, so
+    a dead-but-enabled unit's port can still read LISTEN — see
+    ``UNIT_DEAD_ACTIVE_STATES`` / ``_unit_active_state()``. Either way
+    ``reset-failed`` + ``restart --no-block`` revives it. This is what
+    self-heals the 2026-05-27 powercut failure mode.
+
+restart_unit() deliberately never calls ``systemctl stop``: each socket-
+activated unit's ``ExecStopPost`` hook closes its socket only when the unit
+has a genuine ``stop`` job, so a watchdog-issued stop would sever every open
+MCP connection through the ~50s restart takes to come back — see
+restart_unit()'s own docstring.
 
 Disabled units are skipped — disabling is explicit operator intent. Runs as a
 oneshot systemd service on a 60-second timer.
@@ -25,12 +37,19 @@ backstop for the event-driven restart coordinator
 read-only doctor mode that prints a per-unit staleness table and performs
 no mutating systemctl calls.
 
+Each tick also runs scripts/check_dashboard_unit_parity.py, read-only and at
+most hourly (unit_parity_pass()), and logs a WARNING when the checker reports
+the installed dashboard units drifted, overridden by a drop-in, or missing a
+committed counterpart.
+
 Invoked by scripts/orchestrator-watchdog.service (launched via
 scripts/orchestrator-watchdog.timer).
 """
 
 import contextlib
+import enum
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -211,6 +230,54 @@ FLEET_DEPLOY_CLOCK_PATH = os.environ.get(
     os.path.join(REPO_DIR, "data", "orchestrator", "last_redeploy_orchestrator.json"),
 )
 
+# Path to the IN-FLIGHT LEASE (task 4755), sibling of the clock above and
+# deliberately NOT the same file: the clock says "a sweep FINISHED and
+# verified", the lease says "a sweep is RUNNING RIGHT NOW". The clock alone
+# cannot express the second, because restart-all-orchestrators.sh stamps it
+# only on its verified-fresh exit-0 path (I2), so for the whole ~80-minute
+# duration of a --drain sweep every other tier sees a clock that is 8h stale
+# and concludes nothing is happening. Written by that script at sweep start,
+# removed on every catchable exit path.
+#
+# Mirrors orchestrator.service_restart.FLEET_LEASE_RELPATH. FOUR copies of this
+# literal exist — that module, this file, restart-all-orchestrators.sh
+# (LEASE_FILE) and df_pytest_isolation.py — because none of those four can
+# import any of the others (this script is stdlib-only; df_pytest_isolation is
+# stdlib+pytest only; the third is bash). They are pinned equal by
+# tests/scripts/test_orchestrator_watchdog.py::test_fleet_lease_path_matches_across_tiers.
+# Env-overridable so tests can point every tier at a tmp file without touching
+# real data/.
+FLEET_LEASE_PATH = os.environ.get(
+    "ORCH_FLEET_LEASE",
+    os.path.join(REPO_DIR, "data", "orchestrator", "fleet_redeploy_lease.json"),
+)
+
+# How long a lease may go unrefreshed before every reader treats it as expired,
+# whatever its pid says. DERIVED from the drain knobs rather than guessed, so a
+# reviewer can re-check it: the common long --drain sweep (task 5371) waits
+# out the whole ORCH_DRAIN_VERIFY_MAX_WAIT_SECS verify-wait cap (11400s, counted
+# once from Stage A) + 7 x (RESTART_VERIFY_TIMEOUT 30 + RESTART_VERIFY_GRACE_SECS
+# 120) + 7 x ORCH_DRAIN_UNKNOWN_GRACE_SECS (120s) = 11400 + 1050 + 840 =
+# 13290s ~= 3.7h; each unit left on the legacy merge-idle gate (pre-5371 code,
+# or a refused request) can add its 600s busy grace on top, so it is not a
+# worst case. 14400 clears the common case with ~8% headroom while staying far below
+# the 8h ORCH_RESTART_MIN_INTERVAL_SECS, and that inequality is the whole
+# point: a leaked lease can therefore delay at most ONE redeploy window and can
+# never wedge the fleet indefinitely — the same reasoning that makes the pid
+# test alone insufficient. A sweep that overruns the bound loses the lease
+# mid-sweep and degrades to exactly the pre-4755 collision; that is bounded and
+# deliberate, never a new failure.
+#
+# Mirrors OrchestratorConfig.orchestrator_restart_lease_max_age_secs (this
+# stdlib script cannot import it), pinned by
+# tests/scripts/test_orchestrator_watchdog.py::test_fleet_lease_max_age_matches_config_default.
+# Uses the module's env-with-default try/except idiom: a typo'd env var must
+# not crash the oneshot watchdog.
+try:
+    FLEET_LEASE_MAX_AGE_SECS = int(os.environ["ORCH_FLEET_LEASE_MAX_AGE_SECS"])
+except (KeyError, ValueError):
+    FLEET_LEASE_MAX_AGE_SECS = 14400
+
 # staleness_pass() is a stateless oneshot: every ~60s timer tick
 # (orchestrator-watchdog.timer's OnUnitActiveSec=60) is a FRESH process (see
 # module docstring), so there is no cross-tick memory to log the fleet-deploy
@@ -261,10 +328,14 @@ except (KeyError, ValueError):
 # ORCH_RESTART_MIN_INTERVAL_SECS, kept deliberately independent so fm's redeploy
 # cadence never couples to the orchestrator fleet's.
 
-# Paths whose newest commit defines "fresh" for the fm staleness pass. Includes
-# shared/src/ because fused-memory imports shared.* (e.g. shared.task_metadata),
-# so a shared change can alter fm's behavior and must count toward fm staleness.
-FM_WATCHED_PATHS = ["fused-memory/src/", "shared/src/"]
+# Paths whose newest commit defines "fresh" for the fm staleness pass: the src/
+# of fused-memory and of every workspace member the fm process loads, directly
+# or through another member (shared.*; escalation.queue and escalation.server;
+# orchestrator.* via fused_memory/reconciliation/sandbox_guard.py and
+# escalation.server's lazy imports). A change to any of them can alter fm's
+# behaviour. Derived and enforced by
+# tests/scripts/test_fm_watched_paths_import_closure.py.
+FM_WATCHED_PATHS = ["fused-memory/src/", "shared/src/", "escalation/src/", "orchestrator/src/"]
 
 # fused-memory's OWN deploy-clock file — a DIFFERENT file than the orchestrator
 # fleet clock (FLEET_DEPLOY_CLOCK_PATH), so an orchestrator fleet redeploy never
@@ -409,6 +480,62 @@ FM_LIVENESS_RESTART_CLOCK_PATH = os.environ.get(
 )
 
 
+# --- dashboard unit-parity backstop (task 4883) ---
+# scripts/check_dashboard_unit_parity.py used to run only when an operator ran
+# setup-host.sh, so an installed dashboard unit could drift for weeks with
+# nothing reporting it. unit_parity_pass() runs it read-only on this tick
+# instead: this unit executes the script FROM THE REPO CHECKOUT on an
+# already-armed timer, so the gate is live on merge with no install action.
+DASHBOARD_PARITY_SCRIPT = os.path.join(REPO_DIR, "scripts", "check_dashboard_unit_parity.py")
+# Every line the checker prints carries this tag (its LOG_TAG), so without it the
+# checker did not report, whatever its exit code says — the rule
+# scripts/setup-host.sh::_parity_verdict applies.
+DASHBOARD_PARITY_TAG = "[dashboard_unit_parity]"
+
+# The parity check's OWN clock, independent of every deploy and restart clock
+# above, so a redeploy never resets the parity cadence and a parity check
+# never moves a deploy gate. Not a deploy clock: df_pytest_isolation.py does
+# not protect it. Env-overridable so tests can point it at a tmp file.
+UNIT_PARITY_CLOCK_PATH = os.environ.get(
+    "ORCH_UNIT_PARITY_CLOCK",
+    os.path.join(REPO_DIR, "data", "orchestrator", "last_unit_parity_check.json"),
+)
+
+# Cost is not the constraint (stdlib-only, reads six files); journal legibility
+# is. Ungated, a drifted host would log ~1440 near-identical WARNINGs a day.
+# <=0 disables the throttle. Env-with-fallback: a typo must not crash the oneshot.
+try:
+    UNIT_PARITY_MIN_INTERVAL_SECS = int(os.environ["ORCH_UNIT_PARITY_MIN_INTERVAL_SECS"])
+except (KeyError, ValueError):
+    UNIT_PARITY_MIN_INTERVAL_SECS = 3600
+
+UNIT_PARITY_TIMEOUT_SECS = 30
+
+
+class UnitParityVerdict(enum.StrEnum):
+    """What unit_parity_verdict() concluded; its value is the --report row's word.
+
+    DRIFT is the checker's exit 1, which covers three findings its report tags
+    apart: [drift], [override] (a drop-in) and [vanished] (a committed unit).
+    """
+
+    PARITY = "parity"
+    DRIFT = "drift"
+    ABSENT = "absent"
+    UNKNOWN = "unknown"
+
+
+# The checker's documented exit codes, believed only once DASHBOARD_PARITY_TAG
+# shows it reported: exit 2 is also python3's can't-open-file and argparse's
+# usage-error status, and an uncaught traceback exits 1. Any other code is
+# not a parity claim and reads as UNKNOWN.
+UNIT_PARITY_VERDICTS: dict[int, UnitParityVerdict] = {
+    0: UnitParityVerdict.PARITY,
+    1: UnitParityVerdict.DRIFT,
+    2: UnitParityVerdict.ABSENT,
+}
+
+
 def log(msg: str) -> None:
     """Write *msg* to the systemd journal tagged as ``orchestrator-watchdog``.
 
@@ -448,14 +575,18 @@ def log(msg: str) -> None:
     except (OSError, subprocess.SubprocessError) as exc:
         # systemd-cat missing/unexecutable (OSError) or wedged past the bound
         # (TimeoutExpired, a SubprocessError) — still emit, just via stderr.
-        # The fallback is itself best-effort: writing to stderr raises on a
-        # broken pipe or a full/failing journal socket, and that OSError
-        # would otherwise escape log() and abort a caller's tick (see the
-        # never-raises contract in the docstring). Both journal routes are
-        # gone at this point, so there is nothing left to report WITH —
-        # dropping the message is the only remaining option, and it is
-        # strictly better than dropping the rest of the tick with it.
-        with contextlib.suppress(OSError):
+        # The fallback print is guarded BROADLY BY DESIGN, like
+        # _JournalLog.warning below: both journal routes are already gone by
+        # the time it runs, so there is nothing left to report WITH, and
+        # dropping the message beats dropping the rest of the tick with it
+        # (see the never-raises contract in the docstring). Enumerating what
+        # a degraded stderr can raise would close instances rather than the
+        # class that contract promises — a broken pipe or a full/failing
+        # journal socket raise OSError, a CLOSED stream raises ValueError,
+        # and the message is formatted INSIDE the guard. Bug-surfacing lives
+        # in the narrow OUTER clause above, which stays narrow and is pinned
+        # by test_log_swallows_only_os_and_subprocess_errors.
+        with contextlib.suppress(Exception):
             print(
                 f"orchestrator-watchdog: {msg} [systemd-cat unusable: {exc!r}]",
                 file=sys.stderr,
@@ -625,8 +756,15 @@ def _fused_memory_liveness_verdict() -> str:
     _print_fused_memory_liveness()'s recon-busy column.
 
     The port probe runs first and short-circuits before the (up to 15s)
-    /alive fetch, so a fully-dead unit is classified quickly without waiting
-    on probe_health()'s timeout.
+    /alive fetch. 'port-down' does NOT mean "the process is gone" — under
+    systemd socket activation (fused-memory.socket holds port 8002) the
+    socket stays bound across a crash awaiting
+    auto-restart or a mid-``restart`` gap; ExecStopPost closes it only for a
+    genuine ``stop``/disable job. So 'port-down' means the SOCKET is down —
+    a deliberate stop, a disable, or (pre-socket-activation hosts) the
+    process never having bound the port at all — and a crashed-but-
+    restarting process is instead classified 'wedged' by the /alive fetch
+    below, once the queued connection fails to get an answer in time.
     """
     if not probe_port(FUSED_MEMORY_PORT):
         return "port-down"
@@ -636,41 +774,56 @@ def _fused_memory_liveness_verdict() -> str:
 
 
 def restart_unit(unit: str) -> None:
-    """Three-phase restart: stop → reset-failed → start *unit* via ``systemctl --user``.
+    """Revive *unit* via ``systemctl --user reset-failed`` then ``restart --no-block``.
 
-    - ``stop`` allows systemd's TimeoutStopSec=30 to escalate SIGTERM→SIGKILL
-      gracefully so in-flight work gets a 30-second grace period; we never
-      invoke ``systemctl kill`` directly.
-    - ``reset-failed`` clears the StartLimit state (StartLimitBurst / start-limit-hit)
-      so the subsequent start is not a silent no-op on a rate-limited unit.
-    - ``start`` re-launches the unit.
+    NEVER STOPS THE UNIT. Each service unit gets
+    an ``ExecStopPost`` hook that stops ITS SOCKET whenever the unit has a
+    ``stop`` job — a deliberate operator stop or disable — but leaves the
+    socket bound across a ``restart`` job or a crash awaiting auto-restart.
+    So a watchdog-issued ``stop`` would close the listening socket on every
+    revive, and every open MCP client would see refused connections for the
+    ~50s the restart takes, instead of the queued-but-silent gap socket
+    activation exists to avoid. A prior stop→reset-failed→start sequence
+    (task 4131 era) is retired for exactly this reason.
 
-    An explicit timeout of 45s (comfortably above TimeoutStopSec=30) prevents
-    the oneshot watchdog from hanging indefinitely if systemctl blocks.
-    TimeoutExpired is caught and logged; the remaining phases still execute.
+    - ``reset-failed <unit> <unit-with-.socket-for-.service>`` clears the
+      StartLimit state (StartLimitBurst / start-limit-hit) on BOTH the
+      service and its socket-activation sibling, so a rate-limited unit is
+      not a silent no-op on the restart below. It also runs, and still
+      matters, against a unit that is not currently failed — it resets the
+      start-rate-limit counter regardless of current state. A project whose
+      *unit* has no matching ``.socket`` unit just makes that half of the
+      call exit non-zero (``check=False``), which is fine.
+    - ``restart --no-block`` re-launches *unit* without waiting for it to
+      finish starting. A blocking ``restart`` on a ``Type=notify`` unit can
+      take 45s+ to return, which is most of this oneshot watchdog's own 60s
+      tick; ``--no-block`` returns as soon as the job is QUEUED. Callers must
+      not assume *unit* has finished restarting when this function returns —
+      they only log "restart issued", never "restart complete".
+
+    Each phase is independently bounded (reset-failed 10s, restart 45s) so a
+    wedged systemctl invocation cannot hang the oneshot watchdog.
+    ``subprocess.TimeoutExpired`` is caught and logged, never raised, and the
+    restart phase still runs after a reset-failed timeout.
     """
+    socket_unit = unit.replace(".service", ".socket")
     try:
         subprocess.run(
-            ["systemctl", "--user", "stop", unit], check=False, timeout=45
+            ["systemctl", "--user", "reset-failed", unit, socket_unit],
+            check=False,
+            timeout=10,
         )
     except subprocess.TimeoutExpired:
-        log(f"systemctl stop {unit} timed out after 45s")
-
-    # Always run reset-failed regardless of stop outcome so a rate-limited unit
-    # (StartLimitBurst exhausted) can be recovered even after the timeout path.
-    try:
-        subprocess.run(
-            ["systemctl", "--user", "reset-failed", unit], check=False, timeout=10
-        )
-    except subprocess.TimeoutExpired:
-        log(f"systemctl reset-failed {unit} timed out after 10s")
+        log(f"systemctl reset-failed {unit} {socket_unit} timed out after 10s")
 
     try:
         subprocess.run(
-            ["systemctl", "--user", "start", unit], check=False, timeout=45
+            ["systemctl", "--user", "restart", "--no-block", unit],
+            check=False,
+            timeout=45,
         )
     except subprocess.TimeoutExpired:
-        log(f"systemctl start {unit} timed out after 45s")
+        log(f"systemctl restart --no-block {unit} timed out after 45s")
 
 
 def _unit_start_elapsed_secs(unit: str) -> float | None:
@@ -1010,7 +1163,7 @@ def _newest_fm_watched_commit_epoch() -> int | None:
     """Return the newest committer epoch touching FM_WATCHED_PATHS on HEAD, or None.
 
     fm sibling of _newest_watched_commit_epoch, identical body but diffing
-    FM_WATCHED_PATHS (fused-memory/src/ + shared/src/) instead of WATCHED_PATHS.
+    FM_WATCHED_PATHS instead of WATCHED_PATHS.
     fused_memory_staleness_pass() (task 2714) compares this against
     fused-memory.service's ActiveEnterTimestamp to detect a merged-but-
     undeployed fm change.
@@ -1059,7 +1212,7 @@ def _atomic_write_json(path: str, payload: dict) -> bool:
     """Atomically write *payload* as JSON to *path*; return True iff it landed.
 
     The shared write primitive behind every piece of persisted watchdog state
-    (fm deploy clock, fm liveness streak, fm liveness restart clock) — extracted
+    (every clock, and the fm liveness streak) — extracted
     in task 3764 so the mkdir/mktemp/write/rename dance is defined ONCE rather
     than copy-pasted per state file. Python analogue of
     restart-all-orchestrators.sh's stamp_fleet_deploy_clock: mkdir -p, mktemp a
@@ -1147,8 +1300,8 @@ def _read_clock_epoch(path: str, label: str) -> float | None:
 
     The shared CLOCK-layer read primitive, one level above _read_json_state
     (which owns the missing/corrupt/non-object branches) — extracted so the
-    three watchdog clocks cannot drift apart in their fail-open contracts.
-    All three write and read the same ``{ts, iso, source, pytest_session}``
+    watchdog's clocks cannot drift apart in their fail-open contracts.
+    Every one writes and reads the same ``{ts, iso, source, pytest_session}``
     schema that restart-all-orchestrators.sh's ``stamp_fleet_deploy_clock`` and
     ``StaleServiceRestartCoordinator._load_last_fire_wall`` agree on, so a
     single ``float(ts)`` extraction serves every tier. The two provenance keys
@@ -1186,8 +1339,8 @@ def _stamp_clock(path: str) -> bool:
     not have to decode a bare number, plus the two provenance keys below.
 
     SCHEMA {ts, iso, source, pytest_session} (task 4823; ts/iso predate it).
-    The two provenance keys are ADDITIVE and inert to every reader — all three
-    extract `ts` and nothing else — and what they are FOR is stated once, in
+    The two provenance keys are ADDITIVE and inert to every reader — each
+    extracts `ts` and nothing else — and what they are FOR is stated once, in
     df_pytest_isolation.py::deploy_clock_change_report. The one contract this
     writer must hold on its own: `pytest_session` is ALWAYS present, empty
     included, because empty is the positive statement "no pytest session was an
@@ -1209,10 +1362,9 @@ def _stamp_clock(path: str) -> bool:
     merely their convenience) must inspect that value and say so at their own
     call site — see _stamp_fm_liveness_restart_clock.
 
-    All three clocks this serves (fleet-adjacent, fm deploy, fm liveness
-    restart) get the fields uniformly. The liveness clock is not one of the
-    guarded paths, but a schema that diverged between siblings is exactly the
-    drift these mirrors exist to prevent.
+    Every clock this serves gets the fields uniformly, whether or not it is
+    one of the guarded paths: a schema that diverged between siblings is
+    exactly the drift these mirrors exist to prevent.
     """
     now = time.time()
     return _atomic_write_json(
@@ -1229,13 +1381,13 @@ def _stamp_clock(path: str) -> bool:
 def _within_min_interval(secs: int, read_epoch: Callable[[], float | None]) -> bool:
     """Return True iff *read_epoch*'s clock is newer than *secs* seconds ago.
 
-    The shared min-interval GATE, extracted so all three caps share one
-    definition of "too soon" rather than three copies that could drift.
+    The shared min-interval GATE, extracted so every cap shares one
+    definition of "too soon" rather than a copy each that could drift.
 
     Takes the clock READER rather than a path on purpose: each cap's named
-    reader (_read_last_fleet_deploy_epoch, _read_last_fm_deploy_epoch,
-    _read_last_fm_liveness_restart_epoch) stays the single seam the tests
-    substitute at, so a wrapper can never silently bypass its own reader.
+    reader (_read_last_fleet_deploy_epoch and its siblings) stays the single
+    seam the tests substitute at, so a wrapper can never silently bypass its
+    own reader.
 
     Two fail directions, both toward LETTING the caller act:
       - *secs* <= 0 disables the cap outright, and the clock is not even read
@@ -1285,6 +1437,140 @@ def _within_fleet_deploy_min_interval() -> bool:
     """
     return _within_min_interval(
         ORCH_RESTART_MIN_INTERVAL_SECS, _read_last_fleet_deploy_epoch
+    )
+
+
+def _pid_alive(pid) -> bool:
+    """Return True iff *pid* names a live process.
+
+    A deliberate COPY of
+    orchestrator/src/orchestrator/session_registry.py::_pid_alive, contract
+    preserved verbatim. The copy is FORCED, not a second opinion: this script
+    is a stdlib-only systemd oneshot that imports no first-party package — the
+    same constraint that forces the FLEET_LEASE_PATH literal above.
+
+    - Anything that is not a positive int (including bool, which IS an int in
+      Python) returns False WITHOUT reaching os.kill. That is a hazard guard,
+      not defensiveness: os.kill(0, 0) signals the CALLER'S ENTIRE process
+      group and os.kill(-N, 0) a foreign group, so a corrupt or zero pid read
+      off disk must be rejected before the syscall rather than by catching its
+      exception. session_registry.resolve_session_pid documents the same trap.
+    - os.kill(pid, 0) succeeding -> alive; ProcessLookupError -> dead;
+      PermissionError -> alive (visible but unsignalable); other OSError, or
+      an OverflowError from a pid too large for the platform's C pid_t ->
+      treated as dead. The too-large case is the one input this predicate
+      lets REACH the syscall and still answers False for: unlike pid 0 or a
+      negative one, it carries no signalling hazard, and the platform's own
+      refusal is the answer.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, OverflowError):
+        return False
+
+
+def _read_fleet_lease() -> dict | None:
+    """Return the in-flight fleet-redeploy lease body at FLEET_LEASE_PATH, or None.
+
+    The LEASE-layer read primitive, one level above _read_json_state (which
+    owns the missing/corrupt/non-object branches), so the lease inherits one
+    fail-open contract shared with the clocks rather than introducing another.
+    A MISSING file is the normal "no sweep running" case and is
+    deliberately SILENT — logging it would spam the journal every 60s tick;
+    corrupt/unreadable/non-object IS logged and swallowed.
+
+    Returns the RAW body, liveness unevaluated, so report() can distinguish
+    WHY a lease is not live (pid dead vs. past the bound) — a distinction
+    _live_fleet_lease below deliberately collapses.
+
+    Reads FLEET_LEASE_PATH at CALL time, not at def time, so tests that
+    monkeypatch the module global still work — the same requirement
+    _read_last_fleet_deploy_epoch states.
+    """
+    return _read_json_state(FLEET_LEASE_PATH)
+
+
+def _fleet_lease_age_secs(lease: dict) -> float | None:
+    """Wall-clock age of *lease* in seconds, or None when its started_ts is unusable.
+
+    THE single place a lease's age is derived, for _live_fleet_lease,
+    _describe_lease and _format_fleet_lease alike. Two independent parses of
+    one field are how the gate and --report came to disagree about the same
+    lease in the first place (heuristic 11).
+
+    Unusable means missing, non-numeric, OR non-finite. json.loads accepts
+    bare NaN / Infinity / -Infinity and hands back a float, so float() lets
+    them straight through and they then DEFEAT the bound rather than failing
+    it: every comparison against NaN is False, and an Infinity started_ts
+    gives an age of -inf, which is under any bound. A lease whose age cannot
+    be computed has no age, and saying so once here is what keeps every reader
+    of it in agreement.
+    """
+    try:
+        age = time.time() - float(lease["started_ts"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return age if math.isfinite(age) else None
+
+
+def _live_fleet_lease() -> dict | None:
+    """Return the lease body iff a fleet sweep is genuinely in flight, else None.
+
+    LIVE requires BOTH tests, and they fail in opposite directions so neither
+    alone suffices. Age alone would let a lease left behind by a SIGKILLed
+    sweep suppress every redeploy for the full bound — the exact hole the
+    stamp-on-verified-success clock (I2) exists to close, which a naive lease
+    would reintroduce. Pid alone would be defeated by pid reuse, where an
+    unrelated process inherits the number and the lease becomes immortal.
+    Requiring both means a crashed sweep costs at most ONE delayed window.
+
+    Any unusable pid or started_ts yields None: a lease that cannot be
+    evaluated must fail toward RELEASING, never toward holding the fleet. A
+    FUTURE-dated lease (negative age) is released for that same reason, and the
+    asymmetry is the one the bound itself rests on — honouring a negative age
+    makes the lease immortal, since no bound can expire it, while releasing it
+    costs at most one collision. Note the deliberate divergence from the repo's
+    OTHER lease (session_registry.LEASE_HEARTBEAT_TTL), which fails toward
+    KEEPING the lease — that one protects a holder against eviction, this one
+    suppresses fleet redeploys.
+
+    The AGE is tested before the pid deliberately: it is the cheaper test, and
+    it means a nonsense lease never reaches os.kill at all.
+
+    Both module globals are read INSIDE the body (not defaulted at def time)
+    so tests that monkeypatch them still work.
+    """
+    lease = _read_fleet_lease()
+    if lease is None:
+        return None
+    age = _fleet_lease_age_secs(lease)
+    if age is None or age < 0.0 or age >= FLEET_LEASE_MAX_AGE_SECS:
+        return None
+    if not _pid_alive(lease.get("pid")):
+        return None
+    return lease
+
+
+def _describe_lease(lease: dict) -> str:
+    """Render *lease* for a human: ``pid N, unit U, age Xs``.
+
+    Every tier that suppresses an action because of a lease says so in the
+    journal, and each needs the SAME three facts — they are exactly what
+    distinguishes a genuinely held lease from a leftover one without opening
+    the file. Rendering them in one place keeps those lines readable as a set.
+    """
+    age = _fleet_lease_age_secs(lease)
+    return (
+        f"pid {lease.get('pid')}, "
+        f"unit {lease.get('current_unit') or '-'}, "
+        f"age {'unknown' if age is None else f'{age:.0f}s'}"
     )
 
 
@@ -1663,8 +1949,166 @@ def _record_fm_liveness_failure(
     return count
 
 
+def _read_last_unit_parity_epoch() -> float | None:
+    """Return the last dashboard unit-parity check epoch, or None.
+
+    Thin named reader over _read_clock_epoch, like its fleet and fm siblings,
+    so this stays the seam tests substitute at. Fail-open: None means the
+    check is due.
+    """
+    return _read_clock_epoch(UNIT_PARITY_CLOCK_PATH, "unit-parity clock")
+
+
+def _within_unit_parity_min_interval() -> bool:
+    """Return True iff the last parity check is newer than UNIT_PARITY_MIN_INTERVAL_SECS."""
+    return _within_min_interval(UNIT_PARITY_MIN_INTERVAL_SECS, _read_last_unit_parity_epoch)
+
+
+def unit_parity_verdict() -> tuple[UnitParityVerdict, str]:
+    """Run the dashboard unit-parity checker; return ``(verdict, report)``.
+
+    *verdict* is PARITY / DRIFT / ABSENT (the checker's own exit codes 0/1/2,
+    see UNIT_PARITY_VERDICTS) or UNKNOWN when the checker could not run, ran
+    but produced no DASHBOARD_PARITY_TAG report of its own, or exited with
+    anything else. The tag is checked FIRST, as
+    scripts/setup-host.sh::_parity_verdict does. *report* is the checker's
+    combined stdout and stderr — how an operator learns WHICH finding it
+    made, or why the checker did not report.
+
+    ``--installed-dir`` is deliberately not passed: the checker's own default
+    is the one setup-host.sh gates against, and re-deriving it here would be a
+    second copy of it.
+
+    Read-only, and never raises — same contract as probe_port and log(): a
+    tooling failure in an observational check must not abort the tick.
+    """
+    try:
+        result = subprocess.run(
+            [sys.executable, DASHBOARD_PARITY_SCRIPT, "--repo-root", REPO_DIR],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=UNIT_PARITY_TIMEOUT_SECS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return UnitParityVerdict.UNKNOWN, f"{type(exc).__name__}: {exc}"
+    report = "\n".join(
+        part.strip() for part in (result.stdout, result.stderr) if part and part.strip()
+    )
+    if DASHBOARD_PARITY_TAG not in report:
+        return UnitParityVerdict.UNKNOWN, (
+            f"checker produced no {DASHBOARD_PARITY_TAG} report "
+            f"(exit {result.returncode}): {report or 'no output'}"
+        )
+    verdict = UNIT_PARITY_VERDICTS.get(result.returncode)
+    if verdict is None:
+        return UnitParityVerdict.UNKNOWN, f"checker exited {result.returncode}: {report}"
+    return verdict, report
+
+
+def unit_parity_pass() -> None:
+    """Report dashboard unit drift to the journal, at most once per min-interval.
+
+    Purely observational and read-only: it runs the checker and logs, and
+    never installs, reloads or restarts anything — there is no --fix by
+    design (see the checker's module docstring).
+
+    The clock is stamped on ATTEMPT, before the checker runs, so a
+    persistently broken checker is retried hourly rather than on every tick.
+    Only DRIFT is a WARNING. ABSENT is silent: the dashboard units are not
+    installed on this host, which setup-host.sh already treats as benign. A
+    checker that could not run gets one plain line, so a broken gate stays
+    distinguishable from a green one.
+
+    Never raises: an unexpected failure is logged so it cannot abort the tick.
+    """
+    try:
+        if _within_unit_parity_min_interval():
+            return
+        _stamp_clock(UNIT_PARITY_CLOCK_PATH)
+        verdict, report = unit_parity_verdict()
+        if verdict == UnitParityVerdict.DRIFT:
+            log(
+                "WARNING: dashboard unit parity: directive drift, a drop-in "
+                "override, or a vanished committed unit — the checker's "
+                f"[drift] / [override] / [vanished] report says which:\n{report}"
+            )
+        elif verdict == UnitParityVerdict.UNKNOWN:
+            log(f"dashboard unit parity: checker could not run, parity unknown: {report}")
+    except Exception as exc:  # noqa: BLE001
+        log(f"dashboard unit parity pass error: {exc!r}")
+
+
+def _unit_active_state(unit: str) -> str | None:
+    """Return *unit*'s systemd ActiveState, or None on any probe failure.
+
+    Queries ``systemctl --user show -p ActiveState --value <unit>`` — the
+    signal main() needs under socket activation (module docstring): each
+    service's escalation port is held by an independent systemd ``.socket``
+    unit, so it can stay LISTEN-ing across a dead service and probe_port()
+    alone can no longer tell a dead-but-enabled unit from a live one merely
+    holding its socket.
+
+    Fails SAFE like probe_port(): a missing systemctl, a timeout, a non-zero
+    exit, or blank output all return None. Every caller must read None as
+    "not dead" — a tooling hiccup here must never manufacture a restart.
+    """
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", "-p", "ActiveState", "--value", unit],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    state = result.stdout.strip()
+    return state or None
+
+
+# ActiveState values under which an enabled unit counts as dead even while its
+# escalation port still listens (systemd socket activation — module
+# docstring). Deliberately NOT derived from UNIT_IN_FLIGHT_ACTIVE_STATES /
+# _unit_is_active: that pair answers a different question ("is a TRANSIENT
+# registration unit still in flight") and its vocabulary reads "deactivating"
+# as NOT in-flight (task 4131's own parametrization pins this negative) — the
+# wrong direction here, since a unit mid-stop (an orchestrator's stop can take
+# up to 90s) must NOT be revived out from under itself. This set instead names
+# the dead states directly; every other ActiveState — "active", "activating",
+# "deactivating", "reloading", anything unrecognised, and None — is "not dead"
+# by omission, which is what keeps every transitional state safe without
+# having to enumerate them.
+UNIT_DEAD_ACTIVE_STATES = frozenset({"inactive", "failed"})
+
+
 def main() -> None:
-    """Probe each watched port; restart the unit if the port is not listening."""
+    """Probe each watched unit; restart it on either of two dead signals.
+
+    ``probe_port`` reads LISTEN False — the original signal: a wedged-but-
+    active unit, or a dead-but-enabled one whose port was never (re)bound.
+
+    Under systemd socket activation an escalation port is held by its own
+    ``.socket`` unit independent of the service, so it can keep reading
+    LISTEN across a dead service (module docstring) — probe_port() alone can
+    no longer prove liveness. ``_unit_active_state()`` is therefore consulted
+    whenever the port IS up: an ActiveState of ``inactive`` or ``failed``
+    (``UNIT_DEAD_ACTIVE_STATES``) revives the unit exactly as a down port
+    would. A transitional ActiveState — ``active``, ``activating``,
+    ``deactivating``, ``reloading`` — is never treated as dead: a unit
+    mid-restart (an orchestrator stop can take up to 90s) is not dead, it is
+    working.
+
+    Either signal takes the same revive path — restart_unit()'s
+    reset-failed + restart --no-block — gated by the same is_unit_enabled /
+    STARTUP_GRACE_SECS / in-flight-fleet-lease checks, and the log line names
+    which signal fired.
+
+    One exception, scoped to ONE unit (task 4755): the unit an in-flight fleet
+    sweep is currently restarting is skipped, because a unit mid-restart is
+    indistinguishable from a dead one to either probe.
+    """
     for port, unit in WATCHED:
         try:
             if not is_unit_enabled(unit):
@@ -1677,13 +2121,54 @@ def main() -> None:
                     f"skipping probe (grace window {STARTUP_GRACE_SECS}s)"
                 )
                 continue
-            if not probe_port(port):
-                # Covers both wedged-active and dead-enabled (boot-race
-                # cancelled, or StartLimit-exhausted): restart_unit's
-                # stop+reset-failed+start sequence revives either case.
-                log(f"{unit} escalation port {port} not listening; restarting")
-                restart_unit(unit)
-                log(f"{unit} restart issued")
+
+            port_up = probe_port(port)
+            if port_up:
+                # Socket activation keeps the port LISTEN-ing across a dead
+                # service, so a live port no longer proves a live process —
+                # ask systemd directly. This runs on every healthy tick (the
+                # cost socket activation adds); the lease read below stays
+                # lazy regardless.
+                state = _unit_active_state(unit)
+                if state not in UNIT_DEAD_ACTIVE_STATES:
+                    continue
+                reason = (
+                    f"ActiveState={state!r} while escalation port {port} "
+                    "still listens (socket activation)"
+                )
+            else:
+                # A down port means this unit is wedged, dead — or being
+                # restarted right now by an in-flight fleet sweep, which the
+                # probe cannot tell apart from the other two precisely BECAUSE
+                # the sweep is restarting it. Measured: the probe cancelled the
+                # sweep's own restart jobs ("Job for ... canceled"), twice
+                # escalating to code=killed status=9/KILL.
+                reason = f"escalation port {port} not listening"
+
+            # The lease read is LAZY — it happens only HERE, after a dead
+            # signal has already fired, so an all-healthy tick (the
+            # overwhelmingly common case) costs zero extra I/O, and the
+            # read is maximally fresh at the decision point.
+            #
+            # Scoped to current_unit and nothing else: I5 (liveness stays
+            # uncapped, non-clock-gated and non-stamping — brokenness is
+            # not a scheduled deploy) must survive for every OTHER unit. A
+            # blanket liveness disable for the ~80 minutes of a sweep would
+            # leave a genuinely wedged unit unattended for over an hour.
+            lease = _live_fleet_lease()
+            if lease is not None and lease.get("current_unit") == unit:
+                log(
+                    f"{unit} {reason}, but an "
+                    f"in-flight fleet redeploy (lease {_describe_lease(lease)}) "
+                    "is restarting this unit; skipping the liveness restart"
+                )
+                continue
+            # Covers wedged-active, dead-enabled (boot-race cancelled, or
+            # StartLimit-exhausted), and dead-but-socket-held: restart_unit's
+            # reset-failed + restart --no-block sequence revives every case.
+            log(f"{unit} {reason}; restarting")
+            restart_unit(unit)
+            log(f"{unit} restart issued")
         except Exception as exc:  # noqa: BLE001
             log(f"watchdog error for {unit} (port {port}): {exc}")
 
@@ -1746,8 +2231,10 @@ def fused_memory_liveness_pass() -> None:
         a 503 means alive, since a degraded backing store is not something a
         restart fixes;
       - _fused_memory_liveness_verdict()'s port-probe short-circuit, so a
-        fully-dead unit is still classified without waiting on the up-to-15s
-        /alive fetch;
+        socket that is actually down (a deliberate stop/disable, or a
+        pre-socket-activation host) is still classified without waiting on
+        the up-to-15s /alive fetch — see that function's own docstring for
+        why 'port-down' no longer implies the process itself is gone;
       - the is_unit_enabled and STARTUP_GRACE_SECS gates above, which still
         return before any streak read or write (operator intent and a
         not-yet-bound port are neither failure evidence nor recovery);
@@ -2074,17 +2561,35 @@ def staleness_pass() -> None:
     event-driven coordinator" is true AT THE WINDOW BOUNDARY for the first
     time.
 
-    SCOPE: this orders the two TIERS at each clock-open only. It does NOT
-    address the backstop colliding with its OWN in-flight sweep (a tick whose
-    min-interval check passed before an in-flight --drain stamped the clock),
-    which needs in-flight state and is task 4755.
+    In-flight lease (task 4755): a THIRD clock-layer gate, checked after the
+    head start and still ahead of the commit-grace gate. The two gates above
+    order this tier against the OTHER tier at each window boundary; neither
+    can see THIS tier's own in-flight sweep, because the clock they read is
+    stamped only when a sweep FINISHES and verifies (I2). For the ~80 minutes
+    a --drain sweep takes, every gate above therefore sees an 8h-stale clock
+    and concludes nothing is happening — measured: the backstop delegated a
+    second redeploy into its own running sweep. restart-all-orchestrators.sh
+    now writes a lease for the duration, and this gate honours it. A lease is
+    live only while its pid is alive AND it is under FLEET_LEASE_MAX_AGE_SECS,
+    so a SIGKILLed sweep costs at most one delayed window rather than wedging
+    the fleet — see scripts/orchestrator-watchdog.py::_live_fleet_lease.
+
+    That gate and the min-interval cap are BOTH re-evaluated a second time
+    immediately before delegating (task 4755), because the unit probes between
+    the two points take multi-second wall clock — see the comment at that call
+    site for the measured width of the window and why the second read is not
+    rate-limited.
 
     Delegation (task 2396): once ANY eligible unit is found stale, the
     per-unit loop below no longer restarts it directly — instead the whole
     fleet-wide restart is delegated ONCE, after the loop, to
     _delegate_fleet_restart(). restart_unit() remains used ONLY by main()
     (liveness stays uncapped, non-clock-gated, and non-stamping — I5:
-    brokenness is not a scheduled deploy).
+    brokenness is not a scheduled deploy). Task 4755 added the single
+    exception, and it is deliberately as narrow as one: main() skips the
+    liveness restart of the ONE unit a live lease names as current_unit,
+    because a unit mid-restart is indistinguishable from a wedged one to a
+    port probe. Every other unit, and every other tick, is unchanged.
     """
     if _within_fleet_deploy_min_interval():
         # Bucket on wall-clock time (not elapsed-since-deploy) — see
@@ -2110,6 +2615,19 @@ def staleness_pass() -> None:
             log(
                 f"skip: holding the {STALENESS_GRACE_SECS}s coordinator head start "
                 "since the fleet-deploy min-interval opened"
+            )
+        return
+
+    lease = _live_fleet_lease()
+    if lease is not None:
+        # Same bucket idiom again. The skip line names the pid, the unit and
+        # the age because those are exactly what distinguishes a HELD lease
+        # from a stale one in the journal — an operator asking "why didn't the
+        # backstop fire?" must not have to hand-read JSON to find out.
+        if time.time() % SKIP_LOG_INTERVAL_SECS < 120:
+            log(
+                "skip: a fleet redeploy is already in flight "
+                f"(lease {_describe_lease(lease)})"
             )
         return
 
@@ -2154,6 +2672,33 @@ def staleness_pass() -> None:
             log(f"staleness probe error for {unit}: {exc}")
 
     if stale_found:
+        # READ-THEN-ACT (task 4755). The gates at the top of this pass were
+        # evaluated BEFORE a `git log` (_newest_watched_commit_epoch) and,
+        # per unit, an is_unit_enabled plus TWO `systemctl show` calls — a
+        # multi-second window, entered once every 60s. Both facts they read
+        # are written by OTHER processes at moments this pass does not
+        # control: the coordinator can fire, and a sweep can stamp the clock,
+        # at any point inside it. Re-evaluating here costs one small JSON read
+        # each on the rare ticks that actually reach a delegation, and makes
+        # the decision current as of the instant it is acted on.
+        #
+        # NOT rate-limited, unlike the top-of-pass skip lines: this path is
+        # reached only when a stale unit was genuinely found, so it is rare
+        # and highly actionable — and a race we declined to take is exactly
+        # the evidence an operator needs to explain a missing redeploy.
+        if _within_fleet_deploy_min_interval():
+            log(
+                "skip: the fleet-deploy clock was stamped while this pass was "
+                "probing units; another tier got there first"
+            )
+            return
+        lease = _live_fleet_lease()
+        if lease is not None:
+            log(
+                "skip: a fleet redeploy started while this pass was probing "
+                f"units (lease {_describe_lease(lease)})"
+            )
+            return
         log("delegating fleet-wide staleness redeploy to restart-all-orchestrators.sh --drain")
         _delegate_fleet_restart()
 
@@ -2195,10 +2740,19 @@ def fused_memory_staleness_pass() -> None:
     an orchestrator fleet redeploy does not open or reset fm's head-start
     window and vice-versa.
 
-    SCOPE: this orders the two TIERS at each clock-open only. It does NOT
-    address the backstop colliding with its OWN in-flight sweep (a tick whose
-    min-interval check passed before an in-flight redeploy stamped the clock),
-    which needs in-flight state and is task 4755.
+    SCOPE, and a RESIDUAL the orchestrator tier no longer has: this orders the
+    two TIERS at each clock-open only. It does NOT address the fm backstop
+    colliding with its OWN in-flight sweep (a tick whose min-interval check
+    passed before an in-flight redeploy stamped the clock), because fm has no
+    in-flight state. Task 4755 added a lease for the ORCHESTRATOR fleet only,
+    written by restart-all-orchestrators.sh and read by staleness_pass above;
+    this tier is a genuinely separate fleet — its own unit, its own
+    restart-fused-memory.sh, its own clock (deliberately never shared in
+    either direction, see the FM_DEPLOY_CLOCK_PATH module comment) and its own
+    transient unit name — so gating it on the orchestrator fleet's lease would
+    be exactly the cross-fleet coupling that two-clock design forbids, and no
+    writer ever creates a lease for fm anyway. Closing this needs an fm lease
+    of its own, on 4755's four-tier-mirror-plus-drift-test template.
 
     Stateless (I6): staleness is recomputed from live systemd + git each tick,
     so a successful restart (from this pass or the fm coordinator) advances
@@ -2274,6 +2828,53 @@ def _format_epoch(epoch: int | None) -> str:
     if epoch is None:
         return "unknown"
     return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(epoch))
+
+
+def _format_fleet_lease() -> str:
+    """Render the in-flight fleet-redeploy lease for ``--report``, in one line.
+
+    Reads via _read_fleet_lease, NOT _live_fleet_lease, deliberately: the
+    latter collapses every not-live reason into None, and the not-live reasons
+    call for DIFFERENT operator actions. A dead holder means a sweep crashed
+    with its work unfinished; an overrun one means the sweep is probably still
+    running and merely past the bound; a future-dated one means a clock
+    stepped, and no sweep is implicated at all. An operator must be able to
+    tell which without opening the file — that is the whole reason the lease
+    is surfaced at all.
+
+    Distinguishing WHY is this function's purpose, but agreeing with
+    _live_fleet_lease about WHETHER is its contract: both derive the age from
+    _fleet_lease_age_secs and test it in the same order, so a lease the gate
+    treats as expired can never be rendered here as live.
+
+    Strictly read-only, like every other --report field (I7/I8): this never
+    creates, rewrites or removes the lease. The producer's lease_release is an
+    ``rm -f``, so doctor mode must be visibly not that.
+    """
+    lease = _read_fleet_lease()
+    if lease is None:
+        # _read_fleet_lease cannot distinguish absent from corrupt (both are
+        # None by its fail-open contract), so ask the filesystem directly.
+        return "none" if not os.path.exists(FLEET_LEASE_PATH) else "unreadable"
+    age = _fleet_lease_age_secs(lease)
+    if age is None:
+        return "unreadable"
+    pid = lease.get("pid")
+    # Arm order mirrors _live_fleet_lease's test order, which is what keeps
+    # the two from ever disagreeing about whether a lease is live.
+    if age < 0.0:
+        return f"future-dated (pid {pid}, stamped {-age / 60:.0f}m ahead of this clock)"
+    if not _pid_alive(pid):
+        return f"stale (pid {pid} not running, age {age / 60:.0f}m)"
+    if age >= FLEET_LEASE_MAX_AGE_SECS:
+        return (
+            f"expired (pid {pid}, age {age / 3600:.1f}h > "
+            f"{FLEET_LEASE_MAX_AGE_SECS / 3600:.1f}h bound)"
+        )
+    return (
+        f"live (pid {pid}, unit {lease.get('current_unit') or '-'}, "
+        f"age {age / 60:.0f}m)"
+    )
 
 
 def _render_age_hours(epoch: float | None) -> str:
@@ -2384,8 +2985,20 @@ def report() -> int:
     defers on; idle proceeds immediately and stale/absent proceed after the
     gate's short unknown-grace.
 
-    Read-only: report() never writes the fleet-deploy clock file and issues
-    zero mutating systemctl calls (I8).
+    FLEET-LEASE is a single fleet-wide LINE printed above the table (task
+    4755), not an eighth column: the lease is one fact about the whole fleet,
+    so a column would repeat it on every row for no gain — DEPLOY-AGE already
+    pays that cost and is the reason not to add a second. It renders six
+    distinguishable states — none / live / stale (holder not running) /
+    expired (past FLEET_LEASE_MAX_AGE_SECS) / future-dated (stamped ahead of
+    this clock) / unreadable — because the not-live reasons call for different
+    operator actions. It is the only way to see, without hand-reading JSON,
+    why the backstop and the coordinator are both declining to redeploy.
+
+    Read-only: report() never writes the fleet-deploy clock file, never
+    creates, rewrites or removes the in-flight lease, and issues zero mutating
+    systemctl calls (I8). The lease clause is explicit because the producer's
+    lease_release is an ``rm -f``: doctor mode must be visibly not that.
     """
     commit_epoch = _newest_watched_commit_epoch()
     units = _enumerate_running_units()
@@ -2399,6 +3012,7 @@ def report() -> int:
         "head-start / commit-grace restraint gates staleness_pass() applies "
         "before actually restarting a unit."
     )
+    print(f"FLEET-LEASE: {_format_fleet_lease()}")
     print(
         f"{'UNIT':<50} {'START':<24} {'NEWEST WATCHED COMMIT':<24} {'VERDICT':<10} "
         f"{'DEPLOY-AGE':<12} {'MERGE-IDLE':<12} WOULD-DEFER"
@@ -2551,6 +3165,33 @@ def _print_fused_memory_liveness() -> None:
     )
 
 
+def _print_unit_parity() -> None:
+    """Print the dashboard unit-parity row for ``--report``.
+
+    The operator's right-now view of the check unit_parity_pass() runs hourly.
+    NOT clock-gated — an operator asking now wants an answer now — and it
+    writes no clock, so running --report never shifts the timer path's
+    cadence.
+
+    On DRIFT the checker's own tagged report follows the row, naming the
+    finding without a second command; on UNKNOWN the reason the checker could
+    not run follows it instead.
+
+    Informational only, like the fm row: never alters report()'s exit code.
+    An unexpected failure degrades the verdict to a logged UNKNOWN rather
+    than crashing --report after report() has already computed its exit code.
+    """
+    try:
+        verdict, detail = unit_parity_verdict()
+    except Exception as exc:  # noqa: BLE001
+        log(f"watchdog error printing the dashboard unit parity row: {exc}")
+        verdict, detail = UnitParityVerdict.UNKNOWN, ""
+    checker = os.path.relpath(DASHBOARD_PARITY_SCRIPT, REPO_DIR)
+    print(f"dashboard unit parity: {verdict} | CHECKER: {checker}")
+    if verdict in (UnitParityVerdict.DRIFT, UnitParityVerdict.UNKNOWN) and detail:
+        print(detail)
+
+
 def _cli(argv: list[str] | None = None) -> int:
     """Dispatch the CLI: ``--stamp-fm-deploy-clock`` / ``--report`` / timer path.
 
@@ -2562,21 +3203,24 @@ def _cli(argv: list[str] | None = None) -> int:
     restart-fused-memory.sh exit-0 (task 2714).
 
     If ``--report`` is present, runs the read-only report() followed by the
-    read-only _print_fused_memory_liveness() (B4) and returns report()'s OWN
-    exit code (0 = all fresh, 1 = at least one stale unit) — the fm row is
-    informational only and never alters this exit code. main(),
-    fused_memory_liveness_pass(), staleness_pass(), and
-    fused_memory_staleness_pass() are NOT invoked under --report, so this path
-    never mutates systemd state (I7 at the CLI boundary): the fm staleness
-    backstop runs on the timer path only.
+    read-only _print_fused_memory_liveness() (B4) and _print_unit_parity()
+    rows, and returns report()'s OWN exit code (0 = all fresh, 1 = at least
+    one stale unit) — both rows are informational only and never alter this
+    exit code. main(), fused_memory_liveness_pass(), staleness_pass(),
+    fused_memory_staleness_pass() and unit_parity_pass() are NOT invoked under
+    --report, so this path never mutates systemd state or stamps a clock (I7
+    at the CLI boundary): the fm staleness backstop and the hourly parity
+    check run on the timer path only.
 
     Otherwise runs the timer path: the liveness passes first (main() =
     orchestrator liveness, then fused_memory_liveness_pass() = fm liveness),
     then the scheduled clock-gated deploys (staleness_pass() = orchestrator
-    fleet, then fused_memory_staleness_pass() = fm backstop, task 2714), and
+    fleet, then fused_memory_staleness_pass() = fm backstop, task 2714), then
+    unit_parity_pass() (the dashboard unit-parity check, task 4883), and
     returns 0 — grouping immediate brokenness-revives ahead of scheduled
-    deploys (I5). Unknown flags are not treated as an error — they fall through
-    to the timer path.
+    deploys (I5). The parity pass runs LAST on the same argument: it is purely
+    observational and must never delay a revive. Unknown flags are not treated
+    as an error — they fall through to the timer path.
     """
     argv = sys.argv[1:] if argv is None else argv
     if "--stamp-fm-deploy-clock" in argv:
@@ -2589,11 +3233,13 @@ def _cli(argv: list[str] | None = None) -> int:
     if "--report" in argv:
         rc = report()
         _print_fused_memory_liveness()
+        _print_unit_parity()
         return rc
     main()
     fused_memory_liveness_pass()
     staleness_pass()
     fused_memory_staleness_pass()
+    unit_parity_pass()
     return 0
 
 

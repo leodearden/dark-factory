@@ -150,12 +150,9 @@ import copy  # noqa: E402
 
 import pytest  # noqa: E402
 
-# --- lease-dir isolation (task 4775, prerequisite pre-1) -------------------
-#
-# Defined once in the sibling module so five importers cannot drift apart;
-# its docstring says why redirecting the directory is a hard boundary rather
-# than a convenience.  Autouse applies to every test in THIS module.
-from _fm_lease_dir_fixture import lease_dir_fixture  # noqa: E402,F401
+# Lease-dir isolation (task 4775), autouse for every test in this module:
+# see _fm_helpers.py::lease_dir_fixture.
+from _fm_helpers import lease_dir_fixture  # noqa: E402,F401
 
 
 def _rec(record_id, *, topic: str | None = 't', canonical=False, kind=None,
@@ -3265,12 +3262,12 @@ class TestTheProductionTrafficSharesAreTheMeasuredOnes:
 
         assert report['production_queries']['templates']
 
-    def test_all_four_briefing_templates_are_carried(self):
+    def test_the_committed_pre_3659_report_carries_the_four_retired_templates(self):
         harvest = _harvest_mod()
         report = _committed_selection_json()
 
         carried = {t['template'] for t in report['production_queries']['templates']}
-        assert carried == {*harvest.LITERAL_TEMPLATES, harvest.TASK_TEMPLATE}
+        assert carried == {*harvest.RETIRED_LITERAL_TEMPLATES, harvest.RETIRED_TASK_TEMPLATE}
 
     def test_every_share_matches_the_committed_sample_exactly(self):
         """Not "close to": the report copies the fixture, so any drift means

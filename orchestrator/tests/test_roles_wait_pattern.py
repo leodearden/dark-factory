@@ -15,6 +15,13 @@ file pins that STRUCTURALLY rather than editorially: ``BACKGROUND_WAIT_GUIDANCE`
 is the single splice unit, and it is asserted to contain both halves, so no
 future prompt refactor can splice one without the other.
 
+The unit now composes a THIRD half, ``EXTERNAL_KILL_GUIDANCE`` (task 5519,
+legibility census): how to read the exit code a wait returned. The founding
+sighting was a full pytest run that came back ``[exit 137]`` with no output
+far short of its own timeout, and an agent with no way to tell "my timeout
+fired" from "something external killed my process". It is the same concern as
+waiting, so it is pinned by the same contract rather than a module of its own.
+
 Turn prompts whose role already carries the full block inject the short
 ``WAIT_PATTERN_REMINDER`` pointer instead, so no session receives the same
 block twice; the tests below pin the pointer, and the half of its soundness
@@ -56,11 +63,11 @@ vs-hardcoded role-set comparison, the count and index bookkeeping — lives in
 per invariant, each delegating its body to that helper while keeping its own
 docstring and its own remediation prose. That module's docstring is the
 authoritative account of what the shared shape does and does not absorb — most
-of it is NOT restated here. This file's own ``capability`` predicate is
-``'Bash' in role.allowed_tools`` (see the comment on
-``_BACKGROUND_CAPABLE_ROLES`` below); it deliberately differs from the
-sibling's, and ``SpliceContract``'s class docstring explains why both are
-correct for their own constant.
+of it is NOT restated here. This file's carrier set is the shared
+``BASH_CAPABLE_UNPINNED_ROLES``, but its own ``capability`` predicate is
+``'Bash' in role.allowed_tools`` (see the comment above ``_CONTRACT`` below); it
+deliberately differs from the sibling's, and ``SpliceContract``'s class
+docstring explains why both are correct for their own constant.
 """
 
 from __future__ import annotations
@@ -70,33 +77,23 @@ from unittest.mock import patch
 
 import pytest
 import yaml
-from _role_splice_contract import SpliceContract, assert_brace_free, assert_nonempty
+from _role_splice_contract import (
+    BASH_CAPABLE_UNPINNED_ROLES,
+    SpliceContract,
+    assert_brace_free,
+    assert_nonempty,
+)
 
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.roles import (
     BACKGROUND_TASK_WARNING,
     BACKGROUND_WAIT_GUIDANCE,
+    EXTERNAL_KILL_GUIDANCE,
     ROLES,
     WAIT_PATTERN_GUIDANCE,
     WAIT_PATTERN_REMINDER,
 )
 from orchestrator.config import OrchestratorConfig
-
-# A role can encounter background work iff it holds the UNQUALIFIED ``'Bash'``
-# tool — i.e. it can launch a build, a full test suite, or a long verification
-# run. ``reviewer_comprehensive`` and ``judge`` hold only ``'Bash(git:*)'``
-# (read-only git, no long-running command is reachable) and are deliberately
-# excluded: the whole block would be dead weight in every one of their
-# sessions.
-_BACKGROUND_CAPABLE_ROLES = frozenset({
-    'architect',
-    'implementer',
-    'debugger',
-    'merger',
-    'steward',
-    'deep_reviewer',
-    'simple_task',
-})
 
 # Secondary, deliberately LOOSE bound on how much identity paragraph may
 # precede the block. The real invariant is the structural one below (the
@@ -106,6 +103,16 @@ _BACKGROUND_CAPABLE_ROLES = frozenset({
 # headroom and will not fire merely because someone added a sentence.
 _UP_FRONT_CHAR_BUDGET = 1500
 
+# A role can encounter background work iff it holds the UNQUALIFIED ``'Bash'``
+# tool — i.e. it can launch a build, a full test suite, or a long verification
+# run. ``reviewer_comprehensive`` and ``judge`` hold only ``'Bash(git:*)'``
+# (read-only git, no long-running command is reachable) and are deliberately
+# excluded: the whole block would be dead weight in every one of their
+# sessions. The contract checks the shared set against this file's own
+# ``'Bash' in role.allowed_tools`` predicate, so a PromptSpec-backed role gaining
+# ``Bash`` fires this tripwire, a wait-specific signal the shared predicate
+# would hide.
+#
 # The splice contract for this constant: what is spliced, into which roles, and
 # the capability that justifies it. ``all_roles`` is omitted, so it binds the
 # real ``ROLES``. The structural ``\n## `` landmark the placement check compares
@@ -114,8 +121,8 @@ _UP_FRONT_CHAR_BUDGET = 1500
 _CONTRACT = SpliceContract(
     constant_name='BACKGROUND_WAIT_GUIDANCE',
     constant=BACKGROUND_WAIT_GUIDANCE,
-    roles=_BACKGROUND_CAPABLE_ROLES,
-    role_set_name='_BACKGROUND_CAPABLE_ROLES',
+    roles=BASH_CAPABLE_UNPINNED_ROLES,
+    role_set_name='BASH_CAPABLE_UNPINNED_ROLES (in _role_splice_contract.py)',
     capability=lambda role: 'Bash' in role.allowed_tools,
     capability_description='the unqualified `Bash` tool',
 )
@@ -126,7 +133,7 @@ def test_wait_pattern_guidance_is_nonempty() -> None:
 
     Mirrors ``test_roles_background_warning.py::test_background_warning_is_nonempty``
     for the sibling constant. NOT redundant with the containment tests, though it
-    reads that way: ``test_combined_guidance_composes_both_rules`` asserts
+    reads that way: ``test_combined_guidance_composes_every_rule`` asserts
     ``WAIT_PATTERN_GUIDANCE in BACKGROUND_WAIT_GUIDANCE``, and the empty string is
     a substring of every string, so that assertion holds vacuously if this
     constant is ever emptied. Nor does the up-front placement check cover it:
@@ -213,8 +220,10 @@ def test_session_idle_bound_config_drift_tripwire() -> None:
     # ``timeout_seconds`` but NEITHER ``working_idle_secs`` nor
     # ``absolute_cap_secs``, so ``cli_invoke``'s ``extension_engaged`` never
     # latches and it falls to the ``else`` arm — a FLAT ``elapsed >=
-    # timeout_seconds`` measured from watchdog start, which no ``BashOutput``
-    # poll resets. So this, not ``working_idle_secs``, is the bound the steward
+    # timeout_seconds`` measured from watchdog start. NOTHING the agent does
+    # resets that clock, because the bound is wall clock rather than idle time
+    # — not a poll, not a read of a background task's output, not any tool call
+    # at all. So this, not ``working_idle_secs``, is the bound the steward
     # bullet in WAIT_PATTERN_GUIDANCE is sized against, and it is the tightest
     # real ceiling among the spliced roles precisely because it has no idle
     # slack to reclaim.
@@ -231,17 +240,22 @@ def test_session_idle_bound_config_drift_tripwire() -> None:
     )
 
 
-def test_combined_guidance_composes_both_rules() -> None:
-    """``BACKGROUND_WAIT_GUIDANCE`` carries BOTH halves of the contract.
+def test_combined_guidance_composes_every_rule() -> None:
+    """``BACKGROUND_WAIT_GUIDANCE`` carries EVERY half of the contract.
 
     This is the structural enforcement of the task's MUST-COMPOSE mandate: the
     splice unit cannot carry the wait-pattern rule without also carrying task
-    2761's don't-end-your-turn-on-a-background-command rule.
+    2761's don't-end-your-turn-on-a-background-command rule, nor either without
+    task 5519's reading of the exit code a wait returns. Losing that third half
+    leaves an agent that knows how to wait but cannot read what the wait
+    returned, so it misreports an external kill as a failing or hanging suite —
+    the census-5519 defect itself.
     """
     _CONTRACT.assert_composes(
         [
             ('BACKGROUND_TASK_WARNING', BACKGROUND_TASK_WARNING),
             ('WAIT_PATTERN_GUIDANCE', WAIT_PATTERN_GUIDANCE),
+            ('EXTERNAL_KILL_GUIDANCE', EXTERNAL_KILL_GUIDANCE),
         ],
         remedy=(
             'Losing BACKGROUND_TASK_WARNING leaves an agent told only how to wait, '
@@ -249,14 +263,18 @@ def test_combined_guidance_composes_both_rules() -> None:
             'command pending — it simply trades one footgun for the other. Losing '
             'WAIT_PATTERN_GUIDANCE leaves an agent told only what not to do, with '
             'no sanctioned wait pattern, so it improvises a busy-loop or a blocked '
-            'sleep chain instead — the exact census-R3 defect this constant fixes.'
+            'sleep chain instead — the exact census-R3 defect this constant fixes. '
+            'Losing EXTERNAL_KILL_GUIDANCE leaves an agent that can wait but cannot '
+            'read the exit code the wait returned, so it reports an external '
+            'SIGKILL (exit 137 far short of its budget) as a failing or hanging '
+            'suite — the census-5519 defect.'
         ),
     )
 
 
 @pytest.mark.parametrize(
     'name',
-    ['WAIT_PATTERN_GUIDANCE', 'WAIT_PATTERN_REMINDER'],
+    ['WAIT_PATTERN_GUIDANCE', 'EXTERNAL_KILL_GUIDANCE', 'WAIT_PATTERN_REMINDER'],
 )
 def test_wait_pattern_constants_have_no_literal_braces(name: str) -> None:
     """No literal ``{``/``}`` — same invariant ``BACKGROUND_TASK_WARNING`` holds.
@@ -265,14 +283,16 @@ def test_wait_pattern_constants_have_no_literal_braces(name: str) -> None:
     editor about which constants may contain braces. ``WAIT_PATTERN_REMINDER``
     genuinely must stay brace-free: ``briefing.py`` interpolates it into
     ``build_amender_prompt``'s f-string, where a literal brace raises at format
-    time or silently mangles the rendered prompt. ``WAIT_PATTERN_GUIDANCE``
-    reaches role prompts only via plain ``+`` concatenation, which is brace-safe
-    by construction — role prompts are deliberately NOT f-strings precisely
-    because they contain literal braces. It is held brace-free defensively, so
-    it stays interpolation-safe if a future splice site needs it.
+    time or silently mangles the rendered prompt. ``WAIT_PATTERN_GUIDANCE`` and
+    ``EXTERNAL_KILL_GUIDANCE`` sit on the other, DEFENSIVE side: both reach role
+    prompts only via plain ``+`` concatenation, which is brace-safe by
+    construction — role prompts are deliberately NOT f-strings precisely
+    because they contain literal braces. They are held brace-free so they stay
+    interpolation-safe if a future splice site needs them.
     """
     value = {
         'WAIT_PATTERN_GUIDANCE': WAIT_PATTERN_GUIDANCE,
+        'EXTERNAL_KILL_GUIDANCE': EXTERNAL_KILL_GUIDANCE,
         'WAIT_PATTERN_REMINDER': WAIT_PATTERN_REMINDER,
     }[name]
 
@@ -281,9 +301,9 @@ def test_wait_pattern_constants_have_no_literal_braces(name: str) -> None:
         value,
         remedy=(
             'WAIT_PATTERN_REMINDER is interpolated into build_amender_prompt in '
-            'briefing.py, and WAIT_PATTERN_GUIDANCE is held brace-free so it stays '
-            'safe at any future interpolating splice site — remove the brace or the '
-            'prompt breaks at runtime.'
+            'briefing.py, and WAIT_PATTERN_GUIDANCE / EXTERNAL_KILL_GUIDANCE are '
+            'held brace-free so they stay safe at any future interpolating splice '
+            'site — remove the brace or the prompt breaks at runtime.'
         ),
     )
 
@@ -297,10 +317,14 @@ def test_background_capable_role_set_matches_bash_capability() -> None:
     """
     _CONTRACT.assert_role_set_matches_capability(
         remedy=(
-            'A newly Bash-capable role must be added to _BACKGROUND_CAPABLE_ROLES '
-            'AND given BACKGROUND_WAIT_GUIDANCE up front in its system_prompt; if '
-            'it is genuinely exempt, justify the exclusion in the comment above '
-            'the set.'
+            'This tripwire deliberately compares the shared set against unqualified '
+            '`Bash` ALONE, whether or not a role is PromptSpec-backed, so it is wider '
+            'than the predicate the set is named for. A newly Bash-capable role '
+            'needs BACKGROUND_WAIT_GUIDANCE up front. If '
+            'its system_prompt is literal, add it to BASH_CAPABLE_UNPINNED_ROLES '
+            'and the preamble carries the block. If it is PromptSpec-backed, the '
+            "shared set no longer describes this block's carriers: declare a "
+            'wait-specific set here, and justify any exclusion in its comment.'
         ),
     )
 
@@ -330,7 +354,27 @@ def test_excluded_roles_do_not_carry_combined_guidance() -> None:
             'These roles cannot launch a long-running command, so the block is '
             'dead weight in every one of their sessions. Either remove the splice, '
             'or — if the role genuinely gained the capability — grant it `Bash` and '
-            'add it to _BACKGROUND_CAPABLE_ROLES.'
+            'add it to BASH_CAPABLE_UNPINNED_ROLES.'
+        ),
+    )
+
+
+def test_external_kill_guidance_does_not_reach_non_background_roles() -> None:
+    """The negative half again, scoped to ``EXTERNAL_KILL_GUIDANCE`` alone.
+
+    Not a duplicate of ``test_excluded_roles_do_not_carry_combined_guidance``:
+    that asserts the WHOLE unit absent, so a standalone splice of just this half
+    into an excluded role's hand-built chain (JUDGE's, say) would leave it green
+    and ship silently.
+    """
+    _CONTRACT.assert_no_other_role_carries(
+        constant=EXTERNAL_KILL_GUIDANCE,
+        constant_name='EXTERNAL_KILL_GUIDANCE',
+        remedy=(
+            'The excluded roles hold only `Bash(git:*)`: they cannot launch a '
+            'long-running command, so they can never observe an external kill of '
+            'one, and the block is dead weight in every one of their sessions. '
+            'Remove the splice.'
         ),
     )
 
@@ -340,13 +384,15 @@ def test_combined_guidance_appears_exactly_once_per_role() -> None:
 
     Catches a stale tail splice left behind beside the new up-front one, which
     would silently double the whole block in every session of that role. The
-    ``BACKGROUND_TASK_WARNING`` count is checked separately because the combined
-    unit CONTAINS it: a leftover bare ``+ BACKGROUND_TASK_WARNING`` tail would
-    push that count to 2 while the combined count stayed at 1.
+    ``BACKGROUND_TASK_WARNING`` and ``EXTERNAL_KILL_GUIDANCE`` counts are each
+    checked separately because the combined unit CONTAINS them: a leftover bare
+    ``+ BACKGROUND_TASK_WARNING`` tail, or an ``+ EXTERNAL_KILL_GUIDANCE``
+    appended to ``_BASH_CAPABLE_ROLE_PREAMBLE`` as well, would push that half's
+    count to 2 while the combined count stayed at 1.
 
-    The two counts were one combined ``{role: {const: count}}`` payload before
-    task 4405 and are now two per-constant assertions, so a failure names the
-    specific constant whose count is wrong instead of printing both. Both keep
+    The counts were one combined ``{role: {const: count}}`` payload before task
+    4405 and are now per-constant assertions, so a failure names the specific
+    constant whose count is wrong instead of printing all of them. All keep
     ``absent_ok=False``: a count of 0 IS an offender here, unlike the sibling
     module's ``test_guidance_appears_exactly_once_per_role``.
     """
@@ -363,6 +409,17 @@ def test_combined_guidance_appears_exactly_once_per_role() -> None:
             'A count of 2 for BACKGROUND_TASK_WARNING means a stale tail '
             '`+ BACKGROUND_TASK_WARNING` survives beside the up-front '
             'BACKGROUND_WAIT_GUIDANCE — delete the tail, it is now redundant.'
+        ),
+    )
+    _CONTRACT.assert_spliced_exactly_once(
+        constant=EXTERNAL_KILL_GUIDANCE,
+        constant_name='EXTERNAL_KILL_GUIDANCE',
+        remedy=(
+            'A count of 2 for EXTERNAL_KILL_GUIDANCE means a stale standalone '
+            '`+ EXTERNAL_KILL_GUIDANCE` survives beside the composed '
+            'BACKGROUND_WAIT_GUIDANCE (e.g. appended to the tail of '
+            '_BASH_CAPABLE_ROLE_PREAMBLE as well), doubling the block in every '
+            'session of that role — delete it, the composed unit already carries it.'
         ),
     )
 
@@ -453,7 +510,7 @@ async def test_amender_prompt_reinforces_the_wait_rules(
     # The IMPLEMENTER-carries-BACKGROUND_TASK_WARNING precondition this relies
     # on is covered by test_roles_background_warning.py::
     # test_implementer_system_prompt_carries_warning, and transitively by
-    # test_amender_reminder_cannot_dangle + test_combined_guidance_composes_both_rules
+    # test_amender_reminder_cannot_dangle + test_combined_guidance_composes_every_rule
     # above — not re-asserted here (task 3747 review).
     with patch.object(
         BriefingAssembler, '_get_memory_context', return_value='# Context\n\n_stub_',

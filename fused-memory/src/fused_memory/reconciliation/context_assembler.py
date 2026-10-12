@@ -28,6 +28,7 @@ from fused_memory.services.read_telemetry import (
     summarize_search_results,
 )
 from fused_memory.utils.async_utils import gather_collect
+from fused_memory.utils.clip_disclosure import elide_text
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -42,10 +43,19 @@ logger = logging.getLogger(__name__)
 #: returned (SPOT).
 _HINT_SEARCH_LIMIT = 3
 
+#: How many leading memory_hints queries a reconciliation run executes.
+#: audit_trail_rotation.py never sheds this prefix.
+HINT_QUERIES_EXECUTED = 3
+
 #: `write_ops.source` for a memory_hints execution. A distinct value from the
 #: MCP boundary's 'mcp_tool' so a consumer can tell a reconciliation-originated
 #: read from an agent-originated one without re-deriving it from `operation`.
 _HINT_JOURNAL_SOURCE = 'reconciliation_hint'
+
+#: Per-item render caps. Budget-relevant: ContextItem derives token_estimate from
+#: the clipped text, so raising either spends token_budget that buys whole events.
+_TASK_DESC_CHARS = 300
+_MEMORY_BODY_CHARS = 500
 
 
 def estimate_tokens(text: str) -> int:
@@ -60,7 +70,7 @@ def format_event(event: ReconciliationEvent) -> str:
 
 def _format_memory_result(result) -> str:
     """Format a MemoryResult into a context line."""
-    content = (result.content or '')[:500]
+    content = elide_text(result.content, _MEMORY_BODY_CHARS, field='content').text
     source = result.source_store.value if result.source_store else '?'
     cat = result.category.value if result.category else '?'
     return f'- [{result.id}] ({source}/{cat}): {content}'
@@ -80,7 +90,7 @@ def _format_task(task: dict, *, display_id: str | None = None) -> str:
     title = task.get('title', '?')
     status = task.get('status', '?')
     deps = task.get('dependencies', [])
-    desc = (task.get('description') or '')[:300]
+    desc = elide_text(task.get('description'), _TASK_DESC_CHARS, field='description').text
     hints = task.get('metadata', {}).get('memory_hints', '')
     parts = [f'- [task:{tid}] ({status}) {title} deps={deps}']
     if desc:
@@ -196,6 +206,7 @@ class ContextAssembler:
             total_tokens=used,
             events_remaining=events_remaining,
             effective_watermark=effective_wm,
+            token_budget=budget,
         )
 
     def _compute_effective_watermark(
@@ -314,7 +325,7 @@ class ContextAssembler:
         journal = getattr(self.memory, 'write_journal', None)
         _hint_exc_logged = False
         _hint_journal_exc_logged = False
-        for query in queries[:3]:  # cap hint queries
+        for query in queries[:HINT_QUERIES_EXECUTED]:
             try:
                 results = await self.memory.search(
                     query=query,

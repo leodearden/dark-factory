@@ -92,6 +92,10 @@ class TestExtractOpenGateTaskIds:
     dicts.  Restricting to ``active_tasks`` excludes done/cancelled gates for
     free.  The match is deliberately value-sensitive and exact, mirroring
     ``TaskInterceptor._is_gate_metadata``.
+
+    The traversal contract (malformed shapes, id coercion, sort/dedup, empty
+    input) is pinned once in ``test_task_metadata_selection.py``; this class
+    pins only the predicate.
     """
 
     def test_selects_only_operational_mode_gate_tasks(self):
@@ -138,57 +142,27 @@ class TestExtractOpenGateTaskIds:
             f'(mirroring TaskInterceptor._is_gate_metadata), got {result!r}'
         )
 
-    def test_skips_non_dict_metadata_without_raising(self):
-        """A str/list/None metadata value is skipped, not fed to .get()."""
+    def test_always_escalates_without_gate_mode_is_not_selected(self):
+        """always_escalates=True alone is NOT a curator gate here — the selector must not be widened.
+
+        The sweep's evidence is a ``curator_gate_{id}`` Mem0 entry, which only
+        exists for ``operational_mode == 'gate'`` tasks; selecting an
+        ``always_escalates``-only task would spend one Qdrant count to learn
+        nothing.  ``gate_owned_finding_phrasing.extract_human_gated_task_ids``
+        is the selector that does match this shape.
+        """
         tree = FilteredTaskTree(active_tasks=[
-            {'id': 1, 'metadata': 'operational_mode=gate'},
-            {'id': 2, 'metadata': ['gate']},
-            {'id': 3, 'metadata': None},
-            {'id': 4, 'metadata': {'operational_mode': 'gate'}},
+            {'id': 652, 'status': 'blocked', 'metadata': {'always_escalates': True}},
+            {'id': 653, 'metadata': {'operational_mode': 'llm', 'always_escalates': True}},
         ])
 
         result = extract_open_gate_task_ids(tree.active_tasks)
 
-        assert result == ['4'], (
-            f'non-dict metadata must be skipped without raising, got {result!r}'
+        assert result == [], (
+            'extract_open_gate_task_ids must NOT be widened to always_escalates: '
+            'curator_gate_{id} keys exist only for mode-gated tasks, so its '
+            f'documented contract selects on operational_mode alone; got {result!r}'
         )
-
-    def test_skips_non_dict_tasks_and_none_ids(self):
-        """A non-dict element, and a gate task whose id is None, contribute nothing."""
-        tree = FilteredTaskTree(active_tasks=[
-            'not-a-dict',  # type: ignore[list-item]
-            None,  # type: ignore[list-item]
-            {'id': None, 'metadata': {'operational_mode': 'gate'}},
-            {'metadata': {'operational_mode': 'gate'}},
-            {'id': 12, 'metadata': {'operational_mode': 'gate'}},
-        ])
-
-        result = extract_open_gate_task_ids(tree.active_tasks)
-
-        assert result == ['12'], (
-            'non-dict tasks and gates with a missing/None id must be skipped — a '
-            f'spurious id would query the wrong source key; got {result!r}'
-        )
-
-    def test_coerces_int_ids_and_returns_sorted_deduped(self):
-        """int ids coerce to str; the result is sorted and deduped."""
-        tree = FilteredTaskTree(active_tasks=[
-            {'id': 5563, 'metadata': {'operational_mode': 'gate'}},
-            {'id': '5561', 'metadata': {'operational_mode': 'gate'}},
-            {'id': 5561, 'metadata': {'operational_mode': 'gate'}},
-        ])
-
-        result = extract_open_gate_task_ids(tree.active_tasks)
-
-        assert result == ['5561', '5563'], (
-            'int and str spellings of one id must collapse, and the result must '
-            f'be sorted; got {result!r}'
-        )
-
-    def test_empty_input_returns_empty_list(self):
-        """No active tasks -> []."""
-        assert extract_open_gate_task_ids(FilteredTaskTree().active_tasks) == []
-        assert extract_open_gate_task_ids([]) == []
 
 
 class TestBuildGateResolutionFlag:

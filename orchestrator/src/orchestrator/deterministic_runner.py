@@ -338,6 +338,19 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
    downstream (``_format_outcome_echo``, task 3286) — the same constraint
    section 2's predicate subsection documents, so both note-writing sites in
    this module read consistently.
+
+   BOTH gate closes cite the resolving ``milestone_gate`` record through
+   ``done_provenance.escalation_id`` (task 5241, PRD C5): the curator close
+   since task 3341, the PLAIN pure-gate close as of 5241, via the one shared
+   rule in ``_cite_gate_escalation_id``. The two notes still differ — that
+   discriminator is deliberate and load-bearing — but neither close is
+   uncitable any more, and fused-memory now REFUSES a
+   ``kind='deterministic-gate'`` blob that names no record. Ordering note for
+   a fleet redeploy: a unit still carrying pre-5241 code has its pure-gate
+   closes refused until it restarts. The failure is self-healing — the gate
+   task simply stays blocked and re-resolves on the next dispatch — and no
+   state is lost, which is why the PRD ratifies landing the two halves
+   together.
 """
 
 from __future__ import annotations
@@ -354,6 +367,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from shared.before_done_paths import BeforeDonePaths, resolve_before_done_paths
 from shared.proc_group import unsafe_pgid_reason
 from shared.task_metadata import (
     HUMAN_CURATOR_ADJUDICATED_AT_KEY,
@@ -598,7 +612,7 @@ def _script_timeout_budget_line(exc: ScriptTimeout, subject: str) -> str:
     )
 
 
-def _survivor_processes_line(script: str) -> str:
+def _survivor_processes_line(script: Path) -> str:
     """The actionable sentence for a teardown that left the script's children
     alive — printed by BOTH deploy arms whenever the whole-group kill was not
     the signal dispatched (task 4252 reviewer finding).
@@ -618,7 +632,7 @@ def _survivor_processes_line(script: str) -> str:
     )
 
 
-def _script_timeout_fact_lines(exc: ScriptTimeout, *, script: str) -> list[str]:
+def _script_timeout_fact_lines(exc: ScriptTimeout, *, script: Path) -> list[str]:
     """The FACT sentences both DEPLOY arms print for a ``ScriptTimeout``.
 
     Shared so the two deploy branches cannot come to say different things
@@ -641,9 +655,10 @@ def _script_timeout_fact_lines(exc: ScriptTimeout, *, script: str) -> list[str]:
         exc: the timeout, carrying the three measured facts these sentences
             are built from — budget, the script's own exit code if it had
             one, and which signal the teardown dispatched.
-        script: ``before_done['script']``, the search key the survivor
-            sentence hands the operator when that teardown left the script's
-            children running.  Not on ``exc``: it is the deploy's own
+        script: the absolute path the runner executed
+            (``DeterministicRunner._before_done_paths``), the search key the
+            survivor sentence hands the operator when that teardown left the
+            script's children running.  Not on ``exc``: it is the deploy's own
             configuration, not something the timeout measured.
     """
     group_killed = exc.teardown is ProcessTeardown.GROUP_KILLED
@@ -827,24 +842,23 @@ RECURRENCE_KEY: str = 'recurrence'
 _PROJECT_ROOT_PLACEHOLDER: str = '<project_root>'
 
 
-def _snippet_project_root(scheduler) -> str:
-    """Return the configured project_root for the operator runbook snippet.
+def _configured_project_root(scheduler) -> Path | None:
+    """Return the scheduler's configured project_root, or None if unusable.
 
-    Falls back to a VISIBLE placeholder rather than raising or interpolating a
-    repr.  ``scheduler`` is duck-typed here — ``Harness._run_deterministic_slot``
-    builds the runner "with only the minimal dependencies needed" — and
-    ``_file_curator_adjudication_missing_and_block``'s contract is that a
-    durable on-disk safety escalation is filed no matter what.  The attribute
-    chain is read while formatting the detail string, i.e. BEFORE
-    ``escalation_queue.submit()``, so an ``AttributeError`` there does not just
-    skip the BLOCK — it loses the escalation entirely and propagates, exactly
-    what that method's docstring forbids.
+    ``scheduler`` is duck-typed here — ``Harness._run_deterministic_slot``
+    builds the runner "with only the minimal dependencies needed" — so the
+    attribute chain must never raise.  That matters most to
+    ``_file_curator_adjudication_missing_and_block``, whose contract is that a
+    durable on-disk safety escalation is filed no matter what: the chain is
+    read while formatting the detail string, i.e. BEFORE
+    ``escalation_queue.submit()``, so an ``AttributeError`` there would not
+    just skip the BLOCK — it would lose the escalation entirely and propagate.
 
     Accepts the value ONLY when it is a non-empty ``str``/``Path`` that is not
-    the literal ``'None'``, so a test double's Mock attribute cannot reach an
-    operator as ``<MagicMock id=...>``.  The ``'None'`` rejection mirrors the
-    scheduler's own project_root guard, which defends against a value that
-    bypassed pydantic validation.
+    the literal ``'None'``, so a test double's Mock attribute reaches neither
+    an operator (as ``<MagicMock id=...>``) nor a filesystem path.  The
+    ``'None'`` rejection mirrors the scheduler's own project_root guard, which defends
+    against a value that bypassed pydantic validation.
 
     Deliberately no broad ``except Exception``: the two ``getattr`` defaults
     plus the isinstance/non-empty check are the entire failure surface.
@@ -853,8 +867,14 @@ def _snippet_project_root(scheduler) -> str:
     if isinstance(root, (str, Path)):
         text = str(root).strip()
         if text and text != 'None':
-            return text
-    return _PROJECT_ROOT_PLACEHOLDER
+            return Path(text)
+    return None
+
+
+def _snippet_project_root(scheduler) -> str:
+    """The configured project_root for the runbook snippet, else a visible placeholder."""
+    root = _configured_project_root(scheduler)
+    return str(root) if root is not None else _PROJECT_ROOT_PLACEHOLDER
 
 # Length bound applied to the externally-supplied `human_curator_adjudicated_at`
 # value when it is interpolated into the curator-gate `done_provenance.note`.
@@ -916,6 +936,43 @@ def _build_done_provenance(kind: str, **fields: object) -> dict:
     validation happens at runtime, in the model itself.
     """
     return DoneProvenance(kind=kind, **fields).model_dump(exclude_none=True)  # type: ignore[arg-type]
+
+
+def _cite_gate_escalation_id(own_records: list) -> str | None:
+    """Pick the escalation a `deterministic-gate` close should CITE.
+
+    Cite the GATE record — NOT merely the newest own-role one (reviewer
+    amendment, task 3341).  The standard curator remediation round-trip
+    leaves TWO own-role records behind:
+      (A) the original `milestone_gate`, resolved WITHOUT a stamp — the
+          record that proves rung one, and
+      (B) the `curator_adjudication_missing` re-ask the guard filed,
+          resolved once the human finally stamped.
+    ``escalation_id`` is rung-ONE evidence, and both the module docstring and
+    docs/task-authoring.md promise it names the gate record.  Taking the
+    newest own record would cite (B), the re-ask — the one record that proves
+    nothing about the gate — quietly mis-aiming the audit trail this citation
+    exists to sharpen.  So filter to the gate category first and take the
+    newest of those; fall back to the newest own record only when no
+    gate-category record survives (e.g. a gate filed under an older
+    category), and return ``None`` for an empty list (an empty list must
+    never be indexed; ``_build_done_provenance``'s ``exclude_none=True`` then
+    simply drops the key).
+
+    BOTH gate arms call this — the curator close and, since task 5241, the
+    pure-gate close.  The rule must not exist twice: its whole value is being
+    uniform, and a second copy would strand this rationale on one of them.
+    Neither arm can actually reach the ``None`` return: both run only after
+    the zero-record strand branch has re-filed the gate and returned BLOCKED.
+
+    Pinned by test_curator_gate_remediation_round_trip_cites_the_gate_record
+    and test_pure_gate_resume_cites_the_gate_record_not_the_newest.
+    """
+    gate_records = [e for e in own_records if e.category == 'milestone_gate']
+    citable = gate_records or own_records
+    if not citable:
+        return None
+    return sorted(citable, key=lambda e: e.timestamp)[-1].id
 
 
 # The payload budget.  Sits safely inside the 500-char `max_note_chars` cap
@@ -1333,6 +1390,17 @@ class DeterministicRunner:
         """
         return os.environ.get('ORCH_UNIT', '')
 
+    def _before_done_paths(self, before_done: dict) -> BeforeDonePaths:
+        root = _configured_project_root(self.scheduler)
+        if root is None:
+            root = Path.cwd()
+            logger.warning(
+                'DeterministicRunner: scheduler carries no configured project_root — '
+                'resolving before_done paths against the process cwd %s',
+                root,
+            )
+        return resolve_before_done_paths(before_done, root.resolve())
+
     async def _default_schedule_detached_restart(
         self,
         before_done: dict,
@@ -1391,20 +1459,10 @@ class DeterministicRunner:
             fails (tail carries the error detail).
         """
         target_unit = before_done.get('target_unit', 'unknown')
-        script = before_done['script']
         args = before_done.get('args') or []
-
-        # The transient unit runs under the systemd --user manager, which does
-        # NOT inherit the orchestrator's own working directory — it defaults to
-        # $HOME.  A relative deploy `script` would therefore fail to be found
-        # (exit 127) once the unit fires.  Resolve an explicit cwd from
-        # before_done['cwd'] when the caller supplied one; otherwise fall back
-        # to this process's own os.getcwd(), which is project_root because the
-        # orchestrator's own systemd unit pins WorkingDirectory=project_root.
-        # RestartPlan.__post_init__ absolutizes a relative `script` against
-        # this `cwd` (RP-3), byte-identical to this method's prior inline
-        # absolutization.
-        cwd = before_done.get('cwd') or os.getcwd()
+        # docs/task-authoring.md §5: paths resolve against the configured
+        # project_root (shared/src/shared/before_done_paths.py).
+        paths = self._before_done_paths(before_done)
 
         esc_summary = summary or (
             f'Self-restart fire-time failure: {target_unit}'
@@ -1483,9 +1541,9 @@ class DeterministicRunner:
         )
 
         plan = RestartPlan(
-            script=Path(script),
+            script=paths.script,
             args=list(args),
-            cwd=Path(cwd),
+            cwd=paths.cwd,
             target_unit=transient_unit,
             own_unit=transient_unit,
             on_failure_escalation=escalation_spec,
@@ -1623,18 +1681,17 @@ class DeterministicRunner:
                 script's OWN exit code when the teardown found the direct child
                 already exited.
         """
-        script = before_done['script']
+        paths = self._before_done_paths(before_done)
         args = before_done.get('args') or []
         # Merge over os.environ so the child sees a full environment (PATH, HOME,
         # XDG_RUNTIME_DIR …).  An empty / absent env dict means full inherit.
         env = {**os.environ, **before_done['env']} if before_done.get('env') else None
-        cwd = before_done.get('cwd') or None
         timeout_secs = before_done.get('timeout_secs', 60)
 
         proc = await asyncio.create_subprocess_exec(
-            script, *args,
+            str(paths.script), *args,
             env=env,
-            cwd=cwd,
+            cwd=paths.cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
@@ -3214,7 +3271,9 @@ class DeterministicRunner:
             inner_timeout_detail = '\n'.join([
                 description,
                 note,
-                *_script_timeout_fact_lines(exc, script=before_done['script']),
+                *_script_timeout_fact_lines(
+                    exc, script=self._before_done_paths(before_done).script,
+                ),
                 'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
             ])
             return await self._file_infra_issue_and_block(
@@ -3527,34 +3586,6 @@ class DeterministicRunner:
                         if len(_raw_stamp) <= _CURATOR_STAMP_NOTE_MAX_CHARS
                         else _raw_stamp[:_CURATOR_STAMP_NOTE_MAX_CHARS] + '…'
                     )
-                    # Cite the GATE record — NOT merely the newest own-role one
-                    # (reviewer amendment).  The standard remediation round-trip
-                    # this very guard creates leaves TWO own-role records behind:
-                    #   (A) the original `milestone_gate`, resolved WITHOUT a
-                    #       stamp — the record that proves rung one, and
-                    #   (B) the `curator_adjudication_missing` re-ask this guard
-                    #       filed, resolved once the human finally stamped.
-                    # `escalation_id` is rung-ONE evidence, and both the module
-                    # docstring and docs/task-authoring.md promise it names the
-                    # gate record.  Taking the newest own record would cite (B),
-                    # the re-ask — the one record that proves nothing about the
-                    # gate — quietly mis-aiming the audit trail this whole change
-                    # exists to sharpen.  So filter to the gate category first
-                    # and take the newest of those; fall back to the newest own
-                    # record only when no gate-category record survives (e.g. a
-                    # gate filed under an older category), and to omitting the
-                    # key when `own_records` is empty (unreachable — the strand
-                    # branch already returned — but an empty list must never be
-                    # indexed; `exclude_none=True` then simply drops the key).
-                    # Pinned by test_curator_gate_remediation_round_trip_cites_the_gate_record.
-                    _gate_records = [
-                        e for e in own_records if e.category == 'milestone_gate'
-                    ]
-                    _citable = _gate_records or own_records
-                    _gate_esc_id = (
-                        sorted(_citable, key=lambda e: e.timestamp)[-1].id
-                        if _citable else None
-                    )
                     await self.scheduler.set_task_status(
                         task_id,
                         'done',
@@ -3564,7 +3595,7 @@ class DeterministicRunner:
                                 'human curator gate: per-entry content '
                                 f'adjudication confirmed at {_stamp_for_note}'
                             ),
-                            escalation_id=_gate_esc_id,
+                            escalation_id=_cite_gate_escalation_id(own_records),
                         ),
                     )
                 else:
@@ -3572,12 +3603,19 @@ class DeterministicRunner:
                     # deploy/unit/pid evidence — stamp a dedicated gate-kind
                     # provenance so the done write passes require_done_provenance
                     # without lying about a deploy having happened (task 2331).
+                    #
+                    # The gate record is cited through the SAME rule the curator
+                    # arm uses (task 5241): `escalation_id` is now REQUIRED for
+                    # this kind server-side, and this arm is reached only with a
+                    # non-empty `own_records` — the zero-record case re-files the
+                    # gate and returns BLOCKED above, never arriving here.
                     await self.scheduler.set_task_status(
                         task_id,
                         'done',
                         done_provenance=_build_done_provenance(
                             'deterministic-gate',
                             note='pure gate resolved',
+                            escalation_id=_cite_gate_escalation_id(own_records),
                         ),
                     )
                 return WorkflowOutcome.DONE
@@ -4318,10 +4356,11 @@ class DeterministicRunner:
                     baseline_main_pid=baseline.get('MainPID', 0),
                     inspect_timeout_secs=self._inspect_timeout_secs,
                 )
+                paths = self._before_done_paths(before_done)
                 plan = RestartPlan(
-                    script=Path(before_done['script']),
+                    script=paths.script,
                     args=list(before_done.get('args') or []),
-                    cwd=Path(before_done.get('cwd') or os.getcwd()).resolve(),
+                    cwd=paths.cwd,
                     target_unit=target_unit,
                     # own_unit must be truthy and provably non-self here (this
                     # branch is only reached when the runner's OWN self_target
@@ -4375,7 +4414,7 @@ class DeterministicRunner:
                     inner_timeout_detail = '\n'.join([
                         description,
                         f'Target unit: {target_unit}',
-                        *_script_timeout_fact_lines(exc, script=before_done['script']),
+                        *_script_timeout_fact_lines(exc, script=paths.script),
                         'The post-deploy fresh-PID verify never ran, so the unit state '
                         'after the timeout is unobserved — check it out-of-band (e.g. '
                         'systemctl --user status) before resolving.',

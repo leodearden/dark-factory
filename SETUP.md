@@ -59,11 +59,11 @@ The script is idempotent (safe to re-run) and self-reports each step with
 3. **`uv sync`** across the Python subprojects (`shared`, `escalation`, `fused-memory`, `orchestrator`, `dashboard`), in dependency order.
 4. **fused-memory systemd unit** — renders `scripts/fused-memory.service.template` into `~/.config/systemd/user/fused-memory.service` (substituting your real repo path and `uv` binary path), enables it, and starts it only if `fused-memory/.env` already exists (see §4 — you'll usually run this once before secrets exist, then `systemctl --user restart fused-memory` after writing them).
 5. **Orchestrator systemd units + watchdog** — see the **Known gap** callout immediately below; this step is the one you must edit for your own project set.
-6. **jCodeMunch** and **7. skim** — optional personal productivity tooling (AST-based code retrieval and context compression) the repo's original maintainer uses. Safe to let run; skip/ignore if you don't want them — nothing else in this repo depends on them.
-8. **Dashboard systemd units** — renders and enables `dark-factory-dashboard` + its watchdog timer (installed, not started — see §7).
-9. **Claude Code skill symlinks** — wires the in-repo `skills/` into your Claude Code install. Covered in full in §8 below.
-10. **Git hooks** — runs `hooks/setup.sh`, which points `core.hooksPath` at `hooks/` (pre-commit, pre-merge-commit).
-11. **Manual steps reminder** — printed only, for migrating data from another host (`export-data.sh`/`import-data.sh`); irrelevant on a genuinely fresh install.
+6. **jCodeMunch** — optional personal productivity tooling (AST-based code retrieval) the repo's original maintainer uses. Safe to let run; skip/ignore if you don't want it — nothing else in this repo depends on it. Step 6 also installs the version-pinned `jcodemunch-mcp` launcher with `uv tool install` (the pin lives in `shared/src/shared/jcodemunch_launch.py`) and registers it in your user-level Claude config, so uv's tool bin dir (`uv tool dir --bin`) must be on your PATH.
+7. **Dashboard systemd units** — renders and enables `dark-factory-dashboard` + its watchdog timer (installed, not started — see §7).
+8. **Claude Code skill symlinks** — wires the in-repo `skills/` into your Claude Code install. Covered in full in §8 below.
+9. **Git hooks** — runs `hooks/setup.sh`, which points `core.hooksPath` at `hooks/` (pre-commit, pre-merge-commit).
+10. **Manual steps reminder** — printed only, for migrating data from another host (`export-data.sh`/`import-data.sh`); irrelevant on a genuinely fresh install.
 12. **Health checks** — re-probes FalkorDB, Qdrant, fused-memory, and jCodeMunch, plus a parity check between your installed fused-memory unit and its template.
 
 ### Known gap: step 5 hardcodes the maintainer's other projects
@@ -282,8 +282,8 @@ completes one of them fully:
 2. **`~/.claude/skills/<name>/` symlinks** — the newer, self-contained Skill
    directory mechanism (a `SKILL.md` plus `references/`/`scripts/` living
    together in one folder, matched as a directory rather than a single
-   file). `setup-host.sh` wires exactly three this way: `factory-init`,
-   `prd`, `hotspot-survey`.
+   file). `setup-host.sh` wires exactly four this way: `factory-init`,
+   `prd`, `hotspot-survey`, `review-all`.
 
 Both are idempotent `ln -sfn` symlinks back into this repo's `skills/`
 directory, so a `git pull` here is picked up immediately — no re-run needed
@@ -298,7 +298,7 @@ Confirm the wiring landed:
 
 ```bash
 ls -la ~/.claude/commands/ | grep -E 'orchestrate|review|unblock|reflect|merge-queue'
-ls -la ~/.claude/skills/ | grep -E 'factory-init|prd|hotspot-survey'
+ls -la ~/.claude/skills/ | grep -E 'factory-init|prd|hotspot-survey|review-all'
 ```
 
 ## 9. Onboard your first project — `/factory-init`
@@ -494,7 +494,7 @@ requirement for a working install — skip this section unless you need it.
   remote checkout has checked out, and git refuses to accept a push to a
   checked-out branch by default. The `RemoteRunner(main_branch=...)`
   argument is always populated from `git.main_branch` in production —
-  `merge_queue.py::_build_verify_runners` is the sole production site that
+  `merge_lane/drift.py::_build_remote_runners` is the sole production site that
   constructs a `RemoteRunner`, and it always passes
   `main_branch=config.git.main_branch` — so this push, and therefore the
   `updateInstead` requirement, is not optional. `RemoteRunner`'s
@@ -707,7 +707,7 @@ reuse is worth having at all:
 
    It is worth being precise about what does **not** back you up here,
    because the name suggests otherwise. There is a fail-closed config-time
-   guard, `merge_liveness.py::enforce_persistent_worktree_serial_lane`,
+   guard, `merge_lane/liveness.py::enforce_persistent_worktree_serial_lane`,
    which raises `PersistentWorktreeConfigError` when the per-host worst
    case `ceil(merge_ahead_bound / num_hosts)` exceeds `1` (PRD §A
    invariant 4) — but at its only production call site
@@ -762,7 +762,7 @@ throughput-and-paging basis rather than a corruption one.
    documented and implemented as **one slot per host**
    (`self._slots[name] = _SLOT_FREE`; `acquire_remote` requires
    `_SLOT_FREE`), and both the merge worker and the drift detective
-   (`merge_drift.py`'s `acquire_local`/`acquire_remote`) dispatch through
+   (`merge_lane/drift.py`'s `acquire_local`/`acquire_remote`) dispatch through
    that same worker-lifetime allocator instance. So at `K=2`, ordinary
    allocator-mediated concurrency cannot by itself put two dark_factory
    verifies on the laptop together — a runtime "by construction"

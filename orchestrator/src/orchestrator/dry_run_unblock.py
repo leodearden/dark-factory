@@ -169,14 +169,18 @@ char clips the block `detail` already suffers — but bounded, so one oversized
 task record cannot crowd out the rest of the prompt.
 """
 
+_TASK_UNAVAILABLE_STATE = '**Task record:** unavailable'
+
 _TASK_UNAVAILABLE_MARKER = (
-    '**Task record:** unavailable — the task fetch failed, so this '
+    f'{_TASK_UNAVAILABLE_STATE} — the task fetch failed, so this '
     'investigation is running WITHOUT the task\'s title, description, details '
     'or declared file scope. Judge scope creep conservatively.'
 )
 
+_TASK_EMPTY_STATE = '**Task record:** fetched but empty'
+
 _TASK_EMPTY_MARKER = (
-    '**Task record:** fetched but empty — the task carries no title, '
+    f'{_TASK_EMPTY_STATE} — the task carries no title, '
     'description, details or declared file scope, so this investigation is '
     'running WITHOUT them. Judge scope creep conservatively.'
 )
@@ -219,7 +223,11 @@ def _task_context(task: dict[str, Any] | None) -> _TaskContext:
     serving a different purpose, and the two have already diverged exactly
     where the purposes do — ``**Declared files:**`` here against ``**Files:**``
     there, because this reader is asked to judge a fix against the scope the
-    architect DECLARED.  Nothing keeps the two aligned and nothing needs to.
+    architect DECLARED.  Nothing needs to keep the two aligned.  What DOES need
+    to stay aligned is these labels and state phrases against
+    ``skills/unblock-auto/SKILL.md``, which tells the investigator how to read
+    them; that is guarded by
+    ``orchestrator/tests/test_dry_run_unblock.py::TestSkillPromptExplainsEveryTaskBlockState``.
 
     ``metadata.files`` IS included here even though ``build_architect_prompt``
     passes ``include_files=False`` to omit it.  Anti-anchoring applies to

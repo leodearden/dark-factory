@@ -127,6 +127,20 @@ AGENT_ID = 'recon-stage-task_knowledge_sync'
 # ---------------------------------------------------------------------------
 
 
+def _async_detector(result: bool):
+    """Async stand-in for the now-coroutine ``is_workflow_live_for_task``.
+
+    Task 3778 made the live-workflow detector's git probes async (they await
+    ``shared.git_async.run_git``), so ``recon_write_policy.check`` awaits this
+    seam. A sync ``lambda *a, **k: <bool>`` fake would still be called, but
+    awaiting its bool return raises — every patch of this name must be async.
+    """
+    async def _fake(*args, **kwargs):
+        return result
+
+    return _fake
+
+
 @pytest_asyncio.fixture
 async def ledger(tmp_path):
     """Real, initialized ReconLedgerStore on a per-test tmp_path SQLite DB."""
@@ -774,7 +788,7 @@ class TestInterceptorReconWritePolicy:
 
     async def _drive_p2_live_workflow_reject(self, interceptor, taskmaster, monkeypatch) -> dict:
         monkeypatch.setattr(
-            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: True,
+            recon_write_policy, 'is_workflow_live_for_task', _async_detector(True),
         )
         return await interceptor.set_task_status(
             self._TASK_ID, 'in-progress', '/project', agent_id=AGENT_ID,
@@ -782,7 +796,7 @@ class TestInterceptorReconWritePolicy:
 
     async def _drive_p2_non_recon(self, interceptor, taskmaster, monkeypatch) -> None:
         monkeypatch.setattr(
-            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: True,
+            recon_write_policy, 'is_workflow_live_for_task', _async_detector(True),
         )
         await interceptor.set_task_status(self._TASK_ID, 'in-progress', '/project', agent_id=None)
 
@@ -897,9 +911,7 @@ class TestDeterministicCycleSummary:
     (test_summary_pool.py::TestWriteCycleSummaryMirrorAndTrim) and is out of
     scope here. Per Rule 5 (and plan.json's design decision), this class
     deliberately has NO grep-source / import-introspection assertion that
-    the retired nonce/verify/repair/reconstruct machinery is gone — a
-    repo-wide ``retry_nonce`` grep would falsely hit residual prompt prose
-    in ``prompts/stage2.py`` owned by a downstream task.
+    the retired nonce/verify/repair/reconstruct machinery is gone.
     """
 
     _PROJECT = 'proj-d1-cycle-summary'

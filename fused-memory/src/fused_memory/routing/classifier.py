@@ -7,7 +7,7 @@ import re
 from openai import AsyncOpenAI
 
 from fused_memory.config.schema import FusedMemoryConfig
-from fused_memory.models.enums import MemoryCategory
+from fused_memory.models.enums import ClassificationFallback, MemoryCategory
 from fused_memory.models.memory import ClassificationResult
 from fused_memory.routing.json_extract import extract_json
 
@@ -59,9 +59,11 @@ Respond as JSON:
 class WriteClassifier:
     """Classifies content into a MemoryCategory for write routing."""
 
-    def __init__(self, config: FusedMemoryConfig):
+    def __init__(
+        self, config: FusedMemoryConfig, *, openai_client: AsyncOpenAI | None = None,
+    ):
         self.config = config
-        self._openai_client: AsyncOpenAI | None = None
+        self._openai_client: AsyncOpenAI | None = openai_client
 
     def _get_openai_client(self) -> AsyncOpenAI:
         if self._openai_client is None:
@@ -91,6 +93,7 @@ class WriteClassifier:
             primary=MemoryCategory.observations_and_summaries,
             confidence=0.3,
             reasoning='No confident classification; defaulting to observations',
+            fallback=ClassificationFallback.no_confident_match,
         )
 
     def _heuristic_classify(self, content: str) -> ClassificationResult | None:
@@ -148,6 +151,7 @@ class WriteClassifier:
                     primary=MemoryCategory.observations_and_summaries,
                     confidence=0.4,
                     reasoning='LLM returned non-JSON response',
+                    fallback=ClassificationFallback.llm_no_json,
                 )
 
             data = json.loads(json_str)
@@ -168,4 +172,5 @@ class WriteClassifier:
                 primary=MemoryCategory.observations_and_summaries,
                 confidence=0.3,
                 reasoning=f'LLM classification error: {e}',
+                fallback=ClassificationFallback.llm_error,
             )

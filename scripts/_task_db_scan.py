@@ -12,15 +12,19 @@ This module is NOT a CLI in its own right — the leading underscore marks it as
 importable-by-sibling-scripts only. It hosts three tiers:
 
 * **Tier 1, discovery** (``_DEFAULT_PROJECT_ROOTS``, :func:`tasks_db_path`,
-  :func:`resolve_project_roots`, :func:`discover_project_roots`,
-  :func:`discover_db_paths`) — adopted by ALL FOUR sweep scripts, plus
-  ``census_tagger_debris.py`` (task 4525). :func:`connect_ro`, with
+  :func:`decode_metadata`, :func:`resolve_project_roots`,
+  :func:`discover_project_roots`, :func:`discover_db_paths`) — adopted by ALL
+  FOUR sweep scripts, plus ``census_tagger_debris.py`` (task 4525).
+  :func:`decode_metadata` is the exception to "adopted by all four": it is
+  used only by the two AUDIT scripts (task 4782), which are the only ones
+  that decode a ``metadata`` column at all. :func:`connect_ro`, with
   :class:`TaskDbUnreadable` and :class:`TaskDbProblem`, is the same tier's
   "…and OPEN it" half (task 5330): Tier 1 owned the path and nothing owned the
   open, so ~10 call sites spell it themselves and none turns a wrong path into
-  an actionable message. Its callers are the forensic readers of ONE named
-  store; the sweep scripts keep their own opens because a sweep over many
-  projects wants the opposite policy — skip an unreadable store silently.
+  an actionable message. Both kinds of reader open through it. A forensic
+  reader of ONE named store lets the refusal surface; the sweep tiers below
+  catch it through :data:`UNREADABLE_STORE_ERRORS` and warn-and-skip that one
+  store. Discovery still drops a MISSING store silently, before any open.
 * **Tier 2, leak-scanner CLI plumbing** (:func:`sweep_databases`,
   :func:`run_scan_cli`, :func:`add_db_discovery_args`,
   :data:`NO_DB_RESOLVED_MESSAGE`, :func:`format_json`, :func:`truncate`,
@@ -64,11 +68,12 @@ for why the audit spelling does not port to Tier 2 and vice versa.
 THE THIRD COPY OF THE TIER-3 SKELETON, AND WHY IT STAYS OUT (task 3817).
 ``repair_wiped_metadata_files.py`` — the WRITE counterpart to
 ``audit_wiped_metadata_files.py`` — keeps its own ``EXIT_*`` ladder and its own
-per-root ``sqlite3.Error`` loop inside ``main_async`` instead of adopting
+per-root skip loop inside ``main_async`` instead of adopting
 :func:`run_audit_cli`. That is a decision, not an oversight. It reaches Tier 1
 discovery only second-hand, through the ``discover_project_roots`` re-export in
-``audit_wiped_metadata_files.py``, and holds NO direct import of this module at
-all. Four things Tier 3 cannot express, each measured in the source:
+``audit_wiped_metadata_files.py``. Its ONE direct import from this module is
+:data:`UNREADABLE_STORE_ERRORS`, so its per-root loop skips exactly what this
+tier skips. Four things Tier 3 cannot express, each measured in the source:
 
 1. ``main_async`` is ``async`` and awaits ``repair_project`` (itself
    ``async def``), while :func:`run_audit_cli` and :func:`sweep_project_roots`
@@ -146,6 +151,28 @@ def tasks_db_path(project_root: str) -> Path:
     return Path(project_root) / ".taskmaster" / "tasks" / "tasks.db"
 
 
+def decode_metadata(raw: object) -> dict:
+    """Decode a raw tasks.db ``metadata`` blob into a dict, degrading to ``{}``.
+
+    Promoted from a copy verbatim-duplicated across
+    ``audit_combine_gate_marker_loss.py`` and ``audit_manifest_descriptor_drift.py``
+    (task 4782, closing the code-reuse finding from the task 4545 amendment
+    pass). Degrades for NULL, an empty string, malformed JSON, or a payload
+    that decodes to anything other than a dict (a list, a bare scalar,
+    ``null``). A corrupt metadata blob is data to be skipped, never a reason
+    to abort a sweep over thousands of tasks.
+    """
+    if not raw or not isinstance(raw, (str, bytes)):
+        return {}
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return payload
+
+
 class TaskDbProblem(Enum):
     """Why :func:`connect_ro` refused a path — the discriminator to branch on.
 
@@ -212,16 +239,21 @@ class TaskDbUnreadable(Exception):
     Carries the resolved :attr:`path` and a :class:`TaskDbProblem`
     :attr:`reason` as fields; the formatted message is for the human only.
 
-    Deliberately NOT a ``sqlite3.Error`` subclass. This module's sweep tiers
-    catch that to skip an unreadable store SILENTLY, which is the right policy
-    for a sweep over many projects and the exact opposite of what a reader
-    interrogating one named store needs.
+    Deliberately NOT a ``sqlite3.Error`` subclass, so a one-store reader's
+    broad ``except sqlite3.Error`` cannot swallow the refusal. This module's
+    sweep tiers skip it on purpose instead, by naming it explicitly in
+    :data:`UNREADABLE_STORE_ERRORS`.
     """
 
     def __init__(self, path: Path, reason: TaskDbProblem) -> None:
         self.path = path
         self.reason = reason
         super().__init__(f"{path}: {_REFUSAL_REMEDY[reason]}")
+
+
+# What a multi-store sweep treats as ONE unreadable store, to warn about and
+# skip: a sqlite failure, or a connect_ro refusal.
+UNREADABLE_STORE_ERRORS: tuple[type[Exception], ...] = (sqlite3.Error, TaskDbUnreadable)
 
 
 def connect_ro(path: str | Path) -> sqlite3.Connection:
@@ -245,10 +277,10 @@ def connect_ro(path: str | Path) -> sqlite3.Connection:
     be re-resolved against a different cwd by a subprocess or a later chdir —
     the ``unable to open database file`` shape of the same confusion.
 
-    This is the single home for an idiom spelled at ~10 other sites. Migrating
-    them is deliberately a separate change: each is a sweep that drops an
-    unreadable store SILENTLY on purpose, so adopting this refusal needs a
-    judgement call per site rather than a rename.
+    This is the single home for the read-only tasks.db open. The sweep scripts
+    adopt it too: their tiers catch the refusal through
+    :data:`UNREADABLE_STORE_ERRORS` and warn-and-skip that one store. A reader
+    that cannot import this module keeps its own open and says so at the site.
     """
     resolved = Path(path).resolve()
     if not resolved.exists():
@@ -462,9 +494,10 @@ def sweep_databases(
     A single unreadable database (e.g. a stale/corrupt file, or a transient
     "database is locked"/"file is not a database" condition) does not abort the
     sweep: it is logged to stderr and skipped so every other resolvable
-    database is still scanned and reported. Only ``sqlite3.Error`` is caught —
-    any other exception propagates, so a real bug in *scan_fn* surfaces instead
-    of being silently downgraded to "unreadable database".
+    database is still scanned and reported. Only
+    :data:`UNREADABLE_STORE_ERRORS` is caught — any other exception propagates,
+    so a real bug in *scan_fn* surfaces instead of being silently downgraded to
+    "unreadable database".
 
     Writes the per-database warnings during the loop and the aggregate
     "results below are incomplete" warning after it, so a caller printing its
@@ -475,7 +508,7 @@ def sweep_databases(
     for db_path in db_paths:
         try:
             matches.extend(scan_fn(db_path))
-        except sqlite3.Error as exc:
+        except UNREADABLE_STORE_ERRORS as exc:
             print(f"warning: skipping unreadable database {db_path}: {exc}", file=sys.stderr)
             unreadable.append(db_path)
 
@@ -593,7 +626,8 @@ def sweep_project_roots(
     """Run *audit_fn* over every root in *roots*, returning (audits, unreadable).
 
     CONTRACT — :func:`run_audit_cli`'s exit-3 gate depends on it: *audit_fn*
-    returns EXACTLY ONE audit object per root, or raises ``sqlite3.Error``.
+    returns EXACTLY ONE audit object per root, or raises one of
+    :data:`UNREADABLE_STORE_ERRORS`.
     Under that contract ``len(audits) + len(unreadable) == len(roots)`` always
     holds, so "no audits but some unreadable" is precisely "every root failed".
     An *audit_fn* that instead returned None to "skip" a root would break that
@@ -603,9 +637,9 @@ def sweep_project_roots(
     A single unreadable project (e.g. a corrupt/locked tasks.db, or a transient
     "database is locked"/"file is not a database" condition) does not abort the
     sweep: it is logged to stderr and skipped so every other resolvable project
-    is still audited and reported. Only ``sqlite3.Error`` is caught — any other
-    exception propagates, so a real bug in *audit_fn* surfaces instead of being
-    silently downgraded to "unreadable project".
+    is still audited and reported. Only :data:`UNREADABLE_STORE_ERRORS` is
+    caught — any other exception propagates, so a real bug in *audit_fn*
+    surfaces instead of being silently downgraded to "unreadable project".
 
     Writes the per-project warnings during the loop and the aggregate "results
     below are incomplete" warning after it, so a caller printing its report
@@ -620,7 +654,7 @@ def sweep_project_roots(
     for root in roots:
         try:
             audits.append(audit_fn(root))
-        except sqlite3.Error as exc:
+        except UNREADABLE_STORE_ERRORS as exc:
             print(f"warning: skipping unreadable project {root}: {exc}", file=sys.stderr)
             unreadable.append(root)
 

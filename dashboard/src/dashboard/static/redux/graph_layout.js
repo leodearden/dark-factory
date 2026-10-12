@@ -13,9 +13,9 @@
 //
 // This is the live layout source for TaskGraph: index.html loads this file
 // (classic script, before the Babel JSX tags) so `window.DF_GRAPH_LAYOUT` is
-// defined before tab_tasks.jsx executes its top-level
-// `const { computeTiers, partitionComponents, orderRows } = window.DF_GRAPH_LAYOUT;`
-// destructure. tab_tasks.jsx has no inline copy of any of these functions —
+// defined before tab_tasks.jsx destructures its layout functions from
+// `window.DF_GRAPH_LAYOUT` at top level. tab_tasks.jsx has no inline copy of
+// any of these functions —
 // this module is their sole implementation.
 //
 // MODULE-UNIQUE TOP-LEVEL NAMES. Every classic (non-module) <script> tag on
@@ -383,9 +383,74 @@ function focusSubset(tasks, selectedId) {
   return tasks.filter(t => nb.has(t.id));
 }
 
+// ── The per-group focus view: the rendered array AND its count, together ──
+// Returns `{shown, shownCount, focused, emptiedByFocus}` where `shownCount`
+// is `shown.length` BY CONSTRUCTION, so a caller that renders `shown` and
+// displays `shownCount` cannot show a count for an array it did not render.
+//
+// That guarantee is the whole point. Focus state in the Tasks tab is GLOBAL
+// (one focusMode/focusAnchorId for the whole tab) while narrowing is applied
+// PER PROJECT GROUP, so before this existed tab_tasks.jsx fed each group body
+// `focusSubset(filtered, focusAnchorId)` while its header counted the
+// PRE-focus `filtered` — two expressions that were supposed to agree and did
+// not. In the all-projects view every non-anchor group therefore rendered an
+// empty graph under an "N/N shown" header. Returning the count alongside the
+// array makes the agreement structural instead of maintained by discipline.
+//
+// `focused` reproduces the caller's old `focusMode && selectedId != null`
+// guard verbatim: re-clicking a selected node clears only `selectedId`, and
+// without that term the subset would narrow against a stale `focusAnchorId`
+// for one render. There is deliberately no `focusAnchorId != null` term —
+// `focusSubset(list, null)` is already a passthrough, so it would flip
+// `focused` without changing `shown` or `emptiedByFocus`.
+//
+// `emptiedByFocus` requires a non-empty input so a group the STATUS FILTER
+// already emptied is not blamed on focus — "no tasks match the current
+// filter" is the true statement there. Note it is NOT equivalent to "this is
+// not the anchor's project": computeNeighborhood's descendants walk adds
+// cross-project dependents of the anchor even when the anchor itself is
+// absent from `tasks`, so such a group renders a real partial graph.
+//
+// Tolerates a null/undefined `tasks` and a missing options object: the
+// per-project header renders before task data has necessarily arrived, and a
+// throw there would blank the whole Tasks tab.
+function focusGroupView(tasks, options) {
+  const opts = options || {};
+  const list = tasks || [];
+  const focused = !!(opts.focusMode && opts.selectedId != null);
+  const shown = focused ? focusSubset(list, opts.focusAnchorId) : list;
+  return {
+    shown,
+    shownCount: shown.length,
+    focused,
+    emptiedByFocus: focused && list.length > 0 && shown.length === 0,
+  };
+}
+
+// ── Content key for a memo over this module's layout functions ──
+// Covers exactly what they read: input order, id, status and deps[].id. If any
+// of them starts reading another field, add that field here.
+function layoutSignature(tasks) {
+  return JSON.stringify(tasks.map(t => [t.id, t.status, (t.deps || []).map(d => d.id)]));
+}
+
+// ── TaskGraph's whole layout: ordered component blocks + singletons, as ids ──
+// Tiers are computed once over the full list: a weakly-connected component has
+// no edges to other components, so per-component tiers equal global tiers. The
+// result holds ids only, so a caller may cache it on layoutSignature and
+// resolve the ids against its current task objects.
+function taskGraphLayout(tasks) {
+  const tiers = computeTiers(tasks);
+  const { components, singletons } = partitionComponents(tasks);
+  return {
+    blocks: components.map(c => orderRows(c, tiers).map(row => row.map(t => t.id))),
+    singletons: singletons.map(t => t.id),
+  };
+}
+
 // Named GRAPH_LAYOUT_API, never a bare `API` — see the module-unique-const
 // convention in this file's header comment.
-const GRAPH_LAYOUT_API = { computeTiers, partitionComponents, orderRows, countCrossings, computeNeighborhood, focusSubset };
+const GRAPH_LAYOUT_API = { computeTiers, partitionComponents, orderRows, countCrossings, computeNeighborhood, focusSubset, focusGroupView, layoutSignature, taskGraphLayout };
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = GRAPH_LAYOUT_API;

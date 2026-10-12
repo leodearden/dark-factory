@@ -12,11 +12,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from _review_fixtures import review_aggregation, review_issue
 from shared import safe_io
 
 from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
     ArtifactWriteError,
+    ReviewAggregation,
     TaskArtifacts,
     _normalize_plan,
 )
@@ -789,10 +791,6 @@ class TestAgentSession:
         artifacts.clear_agent_session()  # must not raise
         artifacts.clear_agent_session()  # still idempotent
 
-    def test_read_returns_none_on_corrupt_json(self, artifacts: TaskArtifacts):
-        (artifacts.root / 'agent_session.json').write_text('{not valid json')
-        assert artifacts.read_agent_session() is None
-
     def test_write_persists_resume_count(self, artifacts: TaskArtifacts):
         artifacts.write_agent_session(
             'sess-r', 'implementer', 'now', task_id='t-7', resume_count=3,
@@ -876,8 +874,7 @@ class TestEmittedStepEscalations:
     process-local, so an orchestrator restart re-files every prior pair.  These
     emitted ``(step_id, stale_commit)`` keys are persisted to
     ``reconcile_state.json`` in the meta-root and hydrated on the next run so a
-    restarted workflow files at most genuinely-new pairs.  This mirrors the
-    ``TestAgentSession`` read/write/corrupt-fail-safe structure.
+    restarted workflow files at most genuinely-new pairs.
     """
 
     def test_read_returns_empty_set_when_missing(self, artifacts: TaskArtifacts):
@@ -915,12 +912,6 @@ class TestEmittedStepEscalations:
             ('step-2', 'def456'),
         }
 
-    def test_read_returns_empty_set_on_corrupt_json(self, artifacts: TaskArtifacts):
-        # Fail-safe: unreadable JSON reads as an empty set (mirrors
-        # ``test_read_returns_none_on_corrupt_json`` for the agent-session sidecar).
-        (artifacts.root / 'reconcile_state.json').write_text('{not valid json')
-        assert artifacts.read_emitted_step_escalations() == set()
-
     def test_survives_restart_new_instance_same_root(
         self, artifacts: TaskArtifacts, worktree: Path
     ):
@@ -951,10 +942,6 @@ class TestVerdicts:
 
     def test_read_returns_none_when_missing(self, artifacts: TaskArtifacts):
         assert artifacts.read_verdict('missing') is None
-
-    def test_read_returns_none_on_corrupt_json(self, artifacts: TaskArtifacts):
-        (artifacts.root / 'verdicts' / 'judge.json').write_text('{not valid json')
-        assert artifacts.read_verdict('judge') is None
 
     def test_clear_removes_file(self, artifacts: TaskArtifacts):
         envelope = {
@@ -990,6 +977,70 @@ class TestVerdicts:
     def test_clear_verdict_rejects_unsafe_role(self, artifacts: TaskArtifacts, bad_role):
         with pytest.raises(ValueError, match='invalid verdict role'):
             artifacts.clear_verdict(bad_role)
+
+
+class TestJsonSidecarReadersFailSafe:
+    """Every JSON-sidecar reader shares one fail-safe posture: a corrupt
+    sidecar reads as that reader's fallback value and logs a warning."""
+
+    @pytest.mark.parametrize(
+        ('name', 'read', 'expected'),
+        [
+            pytest.param(
+                'metadata.json',
+                lambda ta: ta.read_created_at(),
+                None,
+                id='created_at',
+            ),
+            pytest.param(
+                'review_state.json',
+                lambda ta: ta.read_review_state(),
+                {'amendment_rounds_total': 0, 'review_cycles_total': 0, 'verdicts': {}},
+                id='review_state',
+            ),
+            pytest.param(
+                'agent_session.json',
+                lambda ta: ta.read_agent_session(),
+                None,
+                id='agent_session',
+            ),
+            pytest.param(
+                'reconcile_state.json',
+                lambda ta: ta.read_emitted_step_escalations(),
+                set(),
+                id='reconcile_state',
+            ),
+            pytest.param(
+                'verdicts/judge.json',
+                lambda ta: ta.read_verdict('judge'),
+                None,
+                id='verdict',
+            ),
+        ],
+    )
+    @pytest.mark.parametrize(
+        'payload',
+        [
+            pytest.param(b'\xff\xfe{"x": 1}', id='undecodable'),
+            pytest.param(b'{not valid json', id='malformed'),
+            pytest.param(b'[1]', id='non_object'),
+        ],
+    )
+    def test_corrupt_sidecar_reads_as_fail_safe_value(
+        self, artifacts: TaskArtifacts, caplog, name, read, expected, payload
+    ):
+        (artifacts.root / name).write_bytes(payload)
+
+        with caplog.at_level('WARNING'):
+            assert read(artifacts) == expected
+
+        basename = Path(name).name
+        assert any(
+            record.name == 'orchestrator.artifacts'
+            and record.levelname == 'WARNING'
+            and basename in record.getMessage()
+            for record in caplog.records
+        )
 
 
 class TestReviews:
@@ -1069,6 +1120,36 @@ class TestReviews:
         assert 'missing_test' in text
         assert 'No test for empty input' in text
         assert 'c.py:10' in text
+
+    @staticmethod
+    def _aggregation(suggestion_tags: list[str]) -> ReviewAggregation:
+        return review_aggregation(
+            [review_issue('blocker', 'blocking')],
+            [review_issue(tag) for tag in suggestion_tags],
+        )
+
+    def test_format_for_escalation_inlines_every_suggestion(self):
+        agg = self._aggregation(['alpha', 'beta'])
+        text = agg.format_for_escalation()
+        for suggestion in agg.suggestions:
+            for key in ('location', 'category', 'description', 'suggested_fix'):
+                assert suggestion[key] in text
+        blocking_at = text.index('# Review Feedback — Blocking Issues')
+        assert text.index('# Review Feedback — Suggestions') > blocking_at
+
+    def test_format_for_escalation_begins_with_the_replan_rendering(self):
+        agg = self._aggregation(['alpha', 'beta'])
+        assert agg.format_for_escalation().startswith(agg.format_for_replan())
+
+    def test_format_for_escalation_without_suggestions_equals_replan(self):
+        agg = self._aggregation([])
+        assert agg.format_for_escalation() == agg.format_for_replan()
+
+    def test_format_for_replan_stays_blocking_only(self):
+        agg = self._aggregation(['alpha', 'beta'])
+        text = agg.format_for_replan()
+        for suggestion in agg.suggestions:
+            assert suggestion['description'] not in text
 
     def test_aggregate_reviews_error_filtered(self, artifacts: TaskArtifacts):
         artifacts.write_review('reviewer1', {
@@ -1930,13 +2011,10 @@ class TestReviewVerdictCache:
         assert rec['verdict'] == 'PASS'
         assert rec['suggestions_routed'] is False
 
-    def test_corrupt_review_state_is_fail_safe(self, artifacts: TaskArtifacts):
+    def test_get_cached_verdict_on_corrupt_review_state_returns_none(
+        self, artifacts: TaskArtifacts
+    ):
         (artifacts.root / 'review_state.json').write_text('{not valid json')
-        assert artifacts.read_review_state() == {
-            'amendment_rounds_total': 0,
-            'review_cycles_total': 0,
-            'verdicts': {},
-        }
         assert artifacts.get_cached_verdict('tree_abc') is None
 
     def test_reviewer_fingerprint_round_trips(self, artifacts: TaskArtifacts):
@@ -2163,203 +2241,6 @@ class TestEnsureLanePlanSymlink:
         # Still a regular file — no symlink, no self-reference.
         assert lane_plan.is_file()
         assert not lane_plan.is_symlink()
-
-
-class TestWriteMarkupResidue:
-    """`write_markup_residue` — the residue channel verdict-tools CAN reach.
-
-    ``create_server`` already holds a ``TaskArtifacts``, which is a file-backed
-    store rooted at ``self.root`` (``<worktree>/.task``, or the
-    ``.task-meta/<lane>`` root when one is supplied). ``.task/`` is gitignored,
-    so writing there cannot contaminate a task's diff or its verify.
-
-    This is the only surviving copy of a payload an agent could not re-emit, so
-    every row below is about NOT losing it (PRD C2 L187 / INV-7).
-    """
-
-    #: The keys the middleware's residue record actually supplies —
-    #: ``_refuse_unrepairable`` builds exactly this shape.
-    RESIDUE_KEYS = (
-        'error_type', 'category', 'owner', 'level', 'tool', 'field',
-        'matched_pattern', 'agent_id', 'project', 'summary', 'suggested_action',
-    )
-
-    @staticmethod
-    def _record(raw_value: str) -> dict:
-        return {
-            'error_type': 'mcp_markup_unrepairable',
-            'category': 'mcp_markup_residue',
-            'owner': 'l2-escalation-watcher',
-            'level': 2,
-            'tool': 'submit_review_verdict',
-            'field': 'summary',
-            'matched_pattern': '</invoke>',
-            'agent_id': 'claude-task-3690-reviewer',
-            'project': 'dark_factory',
-            'raw_value': raw_value,
-            'summary': 'Unrepairable MCP envelope markup in submit_review_verdict.summary',
-            'suggested_action': 'Recover the raw_value for the caller if still needed.',
-        }
-
-    def test_returns_a_lookup_able_id(self, artifacts: TaskArtifacts):
-        """(a) The return is the FILENAME, and a file of that name exists.
-
-        The id has to be something an operator can act on — that is the whole
-        reason the refusal payload carries one.
-        """
-        residue_id = artifacts.write_markup_residue(self._record('leaked'))
-
-        assert isinstance(residue_id, str)
-        assert residue_id.startswith('markup_residue-')
-        assert residue_id.endswith('.json')
-        assert (artifacts.root / residue_id).is_file()
-
-    def test_the_payload_survives_in_full_and_verbatim(self, artifacts: TaskArtifacts):
-        """(b) Not truncated, not excerpted.
-
-        Deliberately unlike ``build_markup_block``'s 200-char excerpt: that is
-        a diagnostic sitting beside a payload the caller still holds, this is
-        the only surviving copy.
-        """
-        raw = ('x' * 5000) + '\n</invoke>\n<parameter name="issues">[{"a": 1}]'
-        record = self._record(raw)
-
-        residue_id = artifacts.write_markup_residue(record)
-
-        assert residue_id is not None
-        stored = json.loads((artifacts.root / residue_id).read_text())
-        assert stored['raw_value'] == raw
-        assert len(stored['raw_value']) == len(raw)
-        for key in self.RESIDUE_KEYS:
-            assert stored[key] == record[key], f'{key} did not survive the write'
-
-    def test_a_second_refusal_does_not_overwrite_the_first(
-        self, artifacts: TaskArtifacts
-    ):
-        """(c) A fixed filename would make the second leak destroy the first
-        leak's evidence — the exact destruction this method exists to prevent.
-        """
-        first = artifacts.write_markup_residue(self._record('FIRST payload'))
-        second = artifacts.write_markup_residue(self._record('SECOND payload'))
-
-        assert first is not None and second is not None
-        assert first != second
-        assert json.loads((artifacts.root / first).read_text())['raw_value'] == (
-            'FIRST payload'
-        )
-        assert json.loads((artifacts.root / second).read_text())['raw_value'] == (
-            'SECOND payload'
-        )
-        assert len(sorted(artifacts.root.glob('markup_residue-*.json'))) == 2
-
-    def test_numbering_is_collision_tolerant(self, artifacts: TaskArtifacts):
-        """(d) A fresh subprocess starts its counter from zero.
-
-        verdict-tools runs as a fresh stdio subprocess per invocation, so
-        deriving the next index by SCANNING the directory rather than from
-        in-process state is what makes this hold.
-        """
-        one = artifacts.root / 'markup_residue-1.json'
-        two = artifacts.root / 'markup_residue-2.json'
-        one.write_text('{"raw_value": "from a previous process"}\n')
-        two.write_text('{"raw_value": "from another previous process"}\n')
-        before = (one.read_text(), two.read_text())
-
-        residue_id = artifacts.write_markup_residue(self._record('THIRD payload'))
-
-        assert residue_id is not None
-        assert (artifacts.root / residue_id) not in (one, two)
-        assert (artifacts.root / residue_id).is_file()
-        assert (one.read_text(), two.read_text()) == before, (
-            'a pre-existing residue file was clobbered'
-        )
-
-    def test_a_vanished_root_is_tolerated_not_raised(self, tmp_path: Path):
-        """(e) It runs on a path whose outcome is ALREADY decided.
-
-        Per ``_call_sink``'s never-raises contract a storage failure must cost
-        the operator a heads-up, not turn a clean refusal into an opaque crash.
-        And the return must not name a file that does not exist — ``None`` is
-        correct, because the conditional hint then tells the caller the truth
-        automatically.
-        """
-        import shutil
-
-        worktree = tmp_path / 'gone-residue'
-        worktree.mkdir()
-        ta = TaskArtifacts(worktree)
-        ta.init('task-r', 'gone', 'desc')
-        shutil.rmtree(worktree)
-        assert not ta.root.is_dir()
-
-        residue_id = ta.write_markup_residue(self._record('lost payload'))
-
-        assert residue_id is None
-        assert not ta.root.exists()
-
-    def test_two_concurrent_writers_do_not_clobber_each_other(
-        self, tmp_path: Path
-    ):
-        """(f) A reviewer PANEL races on one root, and both payloads survive.
-
-        REVIEW SUGGESTION 4. Only ``verdicts/<role>.json`` is per-role — the
-        residue files sit directly on the SHARED ``self.root``, and several
-        verdict-tools subprocesses run against it at once. A serialization leak
-        is by nature bursty and correlated across panel members, so "two
-        refusals at the same moment" is the expected case, not the exotic one.
-
-        Scan-then-write leaves a TOCTOU window that the ``while ... exists()``
-        advance re-checks but does not close: two writers that both scan before
-        either writes both compute the same index, and the second write
-        silently overwrites the first — destroying exactly the only-surviving
-        copy this method exists to preserve.
-
-        The interleaving is forced rather than threaded, so the test measures
-        the window instead of racing for it: the first writer is suspended at
-        the moment it hands off to ``_write_json`` (i.e. after it has chosen its
-        name) and the second writer runs to completion inside that gap.
-        """
-        first = TaskArtifacts(tmp_path / 'panel')
-        first.init('task-r', 'panel', 'desc')
-        second = TaskArtifacts(tmp_path / 'panel')
-
-        original = TaskArtifacts._write_json
-        interleaved = []
-
-        def suspend_and_let_the_other_finish(self, path, data):
-            # Fire ONCE, and only for the first writer: the nested call must
-            # reach the real writer or nothing is ever written.
-            if not interleaved:
-                interleaved.append(path.name)
-                second.write_markup_residue(
-                    TestWriteMarkupResidue._record('SECOND payload')
-                )
-            return original(self, path, data)
-
-        monkeypatch = pytest.MonkeyPatch()
-        try:
-            monkeypatch.setattr(
-                TaskArtifacts, '_write_json', suspend_and_let_the_other_finish
-            )
-            first_id = first.write_markup_residue(self._record('FIRST payload'))
-        finally:
-            monkeypatch.undo()
-
-        assert interleaved, 'the interleaving hook never fired'
-
-        files = sorted(first.root.glob('markup_residue-*.json'))
-        assert len(files) == 2, (
-            f'two concurrent writers must produce two files, found '
-            f'{[p.name for p in files]}'
-        )
-        payloads = {json.loads(p.read_text())['raw_value'] for p in files}
-        assert payloads == {'FIRST payload', 'SECOND payload'}
-        # And the id handed back names the caller's OWN record, not the one
-        # that happened to land last.
-        assert first_id is not None
-        assert json.loads(
-            (first.root / first_id).read_text()
-        )['raw_value'] == 'FIRST payload'
 
 
 # ---------------------------------------------------------------------------

@@ -86,9 +86,8 @@ def _no_predecessor_interlock():
     """Disable ``_merger_loop``'s train/predecessor interlock for a scenario.
 
     ``SpeculativeMergeWorker._await_unadvanced_predecessor`` parks a dequeued
-    train until the previous merge commit has been CAS-advanced, because a
-    train — unlike a single — maps a lost CAS straight to ``blocked`` +
-    ``train_derailed`` with no reverify/retry path.
+    train until the previous merge commit has been CAS-advanced, to spare the
+    train a re-verify of its tip rebased onto the predecessor's landing.
 
     Scenarios 2 and 3 freeze their solo INSIDE run_merge_verify and hold it
     there while asserting; that is a state the production pipeline never

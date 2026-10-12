@@ -42,7 +42,6 @@ import df_pytest_isolation
 import pytest
 from df_pytest_isolation import (
     PROTECTED_DEPLOY_CLOCK_ENV_VARS,
-    PROTECTED_DEPLOY_CLOCK_RELPATHS,
     deploy_clock_guard_roots,
 )
 
@@ -72,10 +71,16 @@ def test_every_protected_clock_env_var_is_redirected_away_from_the_live_checkout
     own basetemp proves the fixture actually ran here.
     """
     basetemp = tmp_path_factory.getbasetemp().resolve()
+    # Built from the ENV-VAR table, not from the narrower change-detected
+    # PROTECTED_DEPLOY_CLOCK_RELPATHS tuple: the in-flight lease is
+    # redirect-only (task 4755 review fix), so it is absent from that tuple,
+    # and deriving from it here would silently stop covering ORCH_FLEET_LEASE
+    # — the one var whose redirect this test exists to prove points away from
+    # production.
     live_paths = {
         (root / relpath).resolve()
         for root in deploy_clock_guard_roots(_REPO_ROOT)
-        for relpath in PROTECTED_DEPLOY_CLOCK_RELPATHS
+        for relpath in PROTECTED_DEPLOY_CLOCK_ENV_VARS
     }
     for relpath, env_var in PROTECTED_DEPLOY_CLOCK_ENV_VARS.items():
         value = os.environ.get(env_var)

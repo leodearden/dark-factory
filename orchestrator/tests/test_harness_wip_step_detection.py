@@ -252,7 +252,7 @@ class TestDetectTipWipCommits:
         wip_sha = await git_ops.commit(wt, 'chore: save WIP before requeue rebase')
         assert wip_sha, 'Setup: expected a real commit to be made'
 
-        result = await workflow._detect_tip_wip_commits()
+        result = await workflow._detect_tip_wip_commits(workflow.plan)
 
         assert result == [
             {'sha': wip_sha, 'subject': 'chore: save WIP before requeue rebase'},
@@ -268,7 +268,7 @@ class TestDetectTipWipCommits:
         (wt / 'real.txt').write_text('real work\n')
         await git_ops.commit(wt, 'feat: GREEN — real implementation')
 
-        result = await workflow._detect_tip_wip_commits()
+        result = await workflow._detect_tip_wip_commits(workflow.plan)
 
         assert result == []
 
@@ -285,13 +285,13 @@ class TestDetectTipWipCommits:
         wip_sha = await git_ops.commit(wt, 'chore: save WIP before requeue rebase')
         assert wip_sha
 
-        workflow.plan = {
+        plan = {
             'task_id': '42',
             'prerequisites': [],
             'steps': [{'id': 'step-1', 'status': 'done', 'commit': wip_sha}],
         }
 
-        result = await workflow._detect_tip_wip_commits()
+        result = await workflow._detect_tip_wip_commits(plan)
 
         assert result == []
 
@@ -316,13 +316,13 @@ class TestDetectTipWipCommits:
         wip_sha = await git_ops.commit(wt, 'chore: save WIP before requeue rebase')
         assert wip_sha
 
-        workflow.plan = {
+        plan = {
             'task_id': '42',
             'prerequisites': [],
             'steps': [{'id': 'step-1', 'status': 'done', 'commit': wip_sha[:12]}],
         }
 
-        result = await workflow._detect_tip_wip_commits()
+        result = await workflow._detect_tip_wip_commits(plan)
 
         assert result == []
 
@@ -338,7 +338,7 @@ class TestDetectTipWipCommits:
         (wt / 'real.txt').write_text('real work\n')
         await git_ops.commit(wt, 'feat: GREEN — real implementation')
 
-        result = await workflow._detect_tip_wip_commits()
+        result = await workflow._detect_tip_wip_commits(workflow.plan)
 
         assert result == []
 
@@ -367,7 +367,7 @@ class TestDetectTipWipCommits:
         )
         assert wip1_sha and wip2_sha
 
-        result = await workflow._detect_tip_wip_commits()
+        result = await workflow._detect_tip_wip_commits(workflow.plan)
 
         assert result == [
             {'sha': wip2_sha, 'subject': 'chore: save WIP before inter-iteration rebase'},
@@ -394,7 +394,7 @@ class TestDetectTipWipCommits:
             side_effect=RuntimeError('boom'),
         )
 
-        result = await workflow._detect_tip_wip_commits()
+        result = await workflow._detect_tip_wip_commits(workflow.plan)
 
         assert result == []
 
@@ -404,7 +404,7 @@ class TestDetectTipWipCommits:
         artifacts.update_base_commit(wt_info.base_commit)
         workflow.worktree = None
 
-        result = await workflow._detect_tip_wip_commits()
+        result = await workflow._detect_tip_wip_commits(workflow.plan)
 
         assert result == []
 
@@ -414,7 +414,7 @@ class TestDetectTipWipCommits:
         artifacts.update_base_commit(wt_info.base_commit)
         workflow.git_ops = None  # type: ignore[assignment]
 
-        result = await workflow._detect_tip_wip_commits()
+        result = await workflow._detect_tip_wip_commits(workflow.plan)
 
         assert result == []
 
@@ -436,7 +436,7 @@ class TestDetectTipWipCommits:
         workflow.artifacts = artifacts
         workflow.plan = {'task_id': '42', 'steps': [], 'prerequisites': []}
 
-        result = await workflow._detect_tip_wip_commits()
+        result = await workflow._detect_tip_wip_commits(workflow.plan)
 
         assert result == []
 
@@ -523,6 +523,91 @@ class TestBuildImplementerPromptWipNotice:
         assert 'Verify Before Re-Implementing' not in prompt
 
 
+def _wip_section(prompt: str) -> str:
+    assert '## Already-Committed WIP' in prompt
+    after_heading = prompt.split('## Already-Committed WIP', 1)[1]
+    return after_heading.split('# Session Startup Protocol', 1)[0]
+
+
+_OUTCOME_LABELS = (
+    '**Carried by an earlier, non-WIP commit:**',
+    '**Carried by a WIP commit above:**',
+    '**Only partly carried, or not carried:**',
+)
+
+
+def _outcome_branches(section: str) -> list[str]:
+    for label in _OUTCOME_LABELS:
+        assert label in section, f'outcome branch {label} is missing'
+    starts = [section.index(label) for label in _OUTCOME_LABELS]
+    assert starts == sorted(starts), 'outcome branches are out of order'
+    return [section[s:e] for s, e in zip(starts, [*starts[1:], len(section)], strict=True)]
+
+
+@pytest.mark.asyncio
+class TestWipSectionStepAttribution:
+    """A step's ``commit`` names the commit whose diff carries the step's change.
+
+    Several steps citing one WIP safety-commit is truthful when its diff
+    carries each of them. Passing tests do not identify the carrying commit:
+    they pass just the same when the step's own commit sits below the WIP run.
+    An empty per-step commit is no fix either, because its sha passes the
+    unbacked-step check while carrying none of the step's change.
+    """
+
+    async def _render_wip_section(self, briefing: BriefingAssembler, plan: dict) -> str:
+        prompt = await briefing.build_implementer_prompt(
+            plan, context='', wip_notice=[
+                {'sha': 'abcdef1234567890', 'subject': 'chore: save WIP before inter-iteration rebase'},
+            ],
+        )
+        return _wip_section(prompt)
+
+    async def test_each_outcome_cites_the_commit_that_carries_the_step(
+        self, briefing: BriefingAssembler, minimal_plan: dict,
+    ):
+        section = await self._render_wip_section(briefing, minimal_plan)
+        earlier, wip, partial = _outcome_branches(section)
+
+        assert "mark_step_done(step_id, <that commit's sha>)" in earlier, (
+            'passing tests alone cite the WIP sha for a step whose own commit sits '
+            'below the WIP run (docs/legibility/confusion-codebook.yaml cand-20260918-15)'
+        )
+        assert 'mark_step_done(step_id, <that WIP sha>)' in wip, (
+            'a step carried by the WIP commit loses its sanctioned citation'
+        )
+        assert 'Several steps citing one WIP sha is correct' in wip, (
+            'agents improvise splitting or empty commits when sharing one WIP sha is not sanctioned'
+        )
+        assert 'cite that new commit' in partial, (
+            'a half-done step would be cited at a WIP sha that does not carry its whole change'
+        )
+
+    async def test_carrying_commit_is_searched_only_on_this_branch(
+        self, tmp_path: Path, minimal_plan: dict,
+    ):
+        trunk_briefing = BriefingAssembler(
+            OrchestratorConfig(project_root=tmp_path, git=GitConfig(main_branch='trunk')),
+        )
+
+        section = await self._render_wip_section(trunk_briefing, minimal_plan)
+
+        assert 'git log --oneline trunk..HEAD -- ' in section, (
+            'an unscoped log can surface a main-branch commit, which the '
+            'unbacked-step check rejects because it is not in base..HEAD'
+        )
+
+    async def test_walk_covers_every_pending_step(
+        self, briefing: BriefingAssembler, minimal_plan: dict,
+    ):
+        section = await self._render_wip_section(briefing, minimal_plan)
+
+        assert 'walk the pending steps in plan order' in section, (
+            'TaskWorkflow._detect_tip_wip_commits hides a WIP sha once any done step '
+            'cites it, so this notice may be the only sighting'
+        )
+
+
 # ---------------------------------------------------------------------------
 # task-2279 RED: mandatory git status/diff pre-flight always renders,
 # independent of wip_notice — covers the broader "uncommitted, never
@@ -597,7 +682,8 @@ class TestExecuteIterationsForwardsWipNotice:
         artifacts.stamp_plan_provenance(workflow.session_id)
         workflow.plan = artifacts.read_plan()
 
-        def _mark_step_done_side_effect(*args, **kwargs):
+        async def _mark_step_done_side_effect(_role, build_prompt, *args, **kwargs):
+            await build_prompt()
             artifacts.update_step_status('step-1', 'done', 'impl-commit-sha')
             return AgentResult(success=True, output='')
 

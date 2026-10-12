@@ -65,6 +65,8 @@ B7, never on the category string itself.
   (`check_transcript_persistence.py` via uv, unit never installed) — substrate
   PASS. Re-verified first-hand after task 5247 retired the originally-named
   seed.
-- Delivery: grep `reclaim-orphaned-worktrees-predicate` in `scripts/` (0 today).
+- Delivery: `kind: path` on `scripts/reclaim-orphaned-worktrees-predicate.sh`
+  (absent today), repaired by task 6036 from a content grep for that name, which
+  could go green only if some file happened to mention it.
 - End-to-end link→successor demonstration (B10): `manual` — the task IS the
   integration gate; its signal is the product-read-path chain evidence.

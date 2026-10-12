@@ -97,6 +97,14 @@ scheduler evaluator (see `docs/task-authoring.md` §"delivered_checks");
 milestone/pure-gate presets (`docs/task-authoring.md` §5–6);
 `scripts/member-chain-sweep.py` (landed today).
 
+> **Correction (task 4886, 2026-10-04).** "Sole `updated_at` writer" was
+> true at `863970f336` and has been stale since `3b76e1d579` (task 4132,
+> 2026-09-01), which made `queue.py::EscalationQueue.attach_dedupe_child`
+> bump it unconditionally on every dedupe fold. Leaf α adds a third
+> writer, `queue.py::EscalationQueue.amend`. The one enumeration of
+> `updated_at` writers now lives in `queue.py::EscalationQueue.stamp_triage`'s
+> docstring.
+
 ## Cross-PRD relationship
 
 | Seam | Other PRD / owner | Direction | Resolution |
@@ -128,8 +136,16 @@ No intra-batch dependencies — four independent leaves.
 
 ## Open questions (surfaced but not decided in this session)
 
-1. **β's response field name** (`sideways`, `related_pending`, …).
-   Suggested: `related_pending`. Decide during β.
+1. ~~**β's response field name** (`sideways`, `related_pending`, …).
+   Suggested: `related_pending`. Decide during β.~~
+   **RESOLVED (leaf β, task 4886, 2026-10-04).** The field is
+   `related_pending`, named identically in code, tests and the
+   `resolve_issue` docstring. Each entry is `{id, category, severity,
+   level, same_task, shared_member}` — authoritative shape
+   `escalation/src/escalation/related_pending.py::RelatedPendingEntry`.
+   Report-only (nothing closes or changes); pending-only, so `[]` means
+   "no pending twins"; the key is ABSENT, never `[]`, when the census
+   could not be computed (absent means unknown).
 2. **δ's premise field shape** — `{stated: str, as_of: date}` vs reusing
    the `evidence` observation shape. Suggested: the former, minimal.
    Decide during δ.

@@ -46,6 +46,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
+from _resolution_merges import resolution_merge
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, _run
@@ -248,7 +249,7 @@ class TestDropGuardRenameAwareness:
             )
 
             result = await _check_plan_targets_in_tree(
-                merge_result.merge_commit, wt, git_ops, main_sha,
+                merge_result.merge_commit, git_ops, main_sha,
                 task_id='drop-rename',
             )
             assert result.dropped == [], (
@@ -277,7 +278,7 @@ class TestDropGuardRenameAwareness:
         shows a ``D`` that ``-M`` cannot pair with any ``R``.
         """
         await _commit_base_module(git_ops)
-        wt, _task_head = await _branch_modifies_the_module(
+        _wt, task_head = await _branch_modifies_the_module(
             git_ops, 'drop-genuine',
         )
 
@@ -290,10 +291,14 @@ class TestDropGuardRenameAwareness:
         )
         main_sha = await git_ops.get_main_sha()
 
-        # Synthetic merge commit = main's tip: a resolution that took main's
-        # deletion and discarded the branch's edit entirely.
+        # The resolution kept main's tree: it took main's deletion and
+        # discarded the branch's edit entirely.
+        merge_sha = await resolution_merge(
+            git_ops.project_root, main_sha=main_sha,
+            branch_tip=task_head, kept_tree_of=main_sha,
+        )
         result = await _check_plan_targets_in_tree(
-            main_sha, wt, git_ops, main_sha, task_id='drop-genuine',
+            merge_sha, git_ops, main_sha, task_id='drop-genuine',
         )
         assert result.dropped == ['pkg/a.py'], (
             f'a genuine delete with no pairable rename must still be '
@@ -329,7 +334,7 @@ class TestDropGuardRenameAwareness:
                 logging.WARNING, logger='orchestrator.merge_queue',
             ):
                 result = await _check_plan_targets_in_tree(
-                    merge_result.merge_commit, wt, git_ops, main_sha,
+                    merge_result.merge_commit, git_ops, main_sha,
                     task_id='drop-rename-failopen',
                 )
 
@@ -399,7 +404,7 @@ class TestDropGuardSuppressionIsContentVerified:
     ):
         """A pairable rename that LOST the branch's edit is a real drop."""
         await _commit_base_module(git_ops)
-        wt, task_head = await _branch_modifies_the_module(
+        _wt, task_head = await _branch_modifies_the_module(
             git_ops, 'drop-discarded',
         )
         await _main_relocates_and_edits(git_ops)
@@ -444,7 +449,7 @@ class TestDropGuardSuppressionIsContentVerified:
         ), f'expected a pairable rename; got {ns_out!r}'
 
         result = await _check_plan_targets_in_tree(
-            merge_sha, wt, git_ops, main_sha, task_id='drop-discarded',
+            merge_sha, git_ops, main_sha, task_id='drop-discarded',
         )
         assert result.dropped == ['pkg/a.py'], (
             f'a relocation that discarded the branch edit is a real drop; '
@@ -466,7 +471,7 @@ class TestDropGuardSuppressionIsContentVerified:
         construction cannot introduce a false block relative to main.
         """
         await _commit_base_module(git_ops)
-        wt, task_head = await _branch_modifies_the_module(
+        _wt, task_head = await _branch_modifies_the_module(
             git_ops, 'drop-probe-error',
         )
         await _main_relocates_and_edits(git_ops)
@@ -482,7 +487,7 @@ class TestDropGuardSuppressionIsContentVerified:
             logging.WARNING, logger='orchestrator.merge_queue',
         ):
             result = await _check_plan_targets_in_tree(
-                merge_sha, wt, git_ops, main_sha, task_id='drop-probe-error',
+                merge_sha, git_ops, main_sha, task_id='drop-probe-error',
             )
 
         assert result.dropped == ['pkg/a.py'], (
@@ -584,7 +589,7 @@ class TestDropGuardBinaryRename:
             )
 
             result = await _check_plan_targets_in_tree(
-                merge_result.merge_commit, wt, git_ops, main_sha,
+                merge_result.merge_commit, git_ops, main_sha,
                 task_id='drop-bin',
             )
             assert result.dropped == [], (
@@ -665,7 +670,7 @@ class TestDropGuardBinaryRename:
         ), f'expected a pairable rename; got {ns_out!r}'
 
         result = await _check_plan_targets_in_tree(
-            merge_sha, wt, git_ops, main_sha, task_id='drop-bin-lost',
+            merge_sha, git_ops, main_sha, task_id='drop-bin-lost',
         )
         assert result.dropped == ['pkg/a.bin'], (
             f'a relocation that discarded the branch bytes is a real drop; '

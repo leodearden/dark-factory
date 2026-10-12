@@ -1,7 +1,8 @@
-"""The merge lane's façade and ports (PRD ``plans/merge-lane-quality-prd.md`` tasks ζ1 and β).
+"""The merge lane's façade and ports (PRD ``plans/merge-lane-quality-prd.md`` tasks ζ1, β and ζ2).
 
-The façade is pinned by what it exports and by importing cleanly from
-either side of its cycle with ``orchestrator.merge_queue``. The ports are
+The façade is pinned by what it exports, by importing cleanly in either
+order with the pre-package module names, and by each of those names being
+the very module object its package submodule is. The ports are
 pinned by driving a real ``MergeLane`` over a real git repository with the
 fakes from ``_merge_lane_fakes`` injected: the injected verifier decides
 whether a branch lands, and the injected clock is the one the worker ages
@@ -17,7 +18,13 @@ import time
 from pathlib import Path
 
 import pytest
-from _merge_lane_fakes import FakeClock, FakeVerifier, fails
+from _merge_lane_fakes import (
+    FakeClock,
+    FakeVerifier,
+    fails,
+    lane_scene_config,
+    main_health_probe_spawned,
+)
 from _orch_helpers import make_placeholder_future, wait_responsive
 
 import orchestrator.merge_lane as merge_lane
@@ -33,7 +40,7 @@ from orchestrator.merge_lane import (
     QueuedBranch,
 )
 from orchestrator.merge_lane.ports import escalation_port
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.worker import (
     PRODUCTION_CLOCK,
     SpeculativeMergeWorker,
     _resolve_dispatch_time_merge_base,
@@ -68,6 +75,28 @@ def test_a_name_outside_the_facade_is_an_attribute_error() -> None:
         _ = merge_lane.not_an_export
 
 
+#: Pre-package module name -> the package submodule it now names (task 5037
+#: migrates their importers and deletes the alias files).
+PRE_PACKAGE_ALIASES = {
+    'orchestrator.merge_queue': 'orchestrator.merge_lane.worker',
+    'orchestrator.merge_gates': 'orchestrator.merge_lane.gates',
+    'orchestrator.merge_types': 'orchestrator.merge_lane.types',
+    'orchestrator.merge_shadow': 'orchestrator.merge_lane.shadow',
+    'orchestrator.merge_liveness': 'orchestrator.merge_lane.liveness',
+    'orchestrator.merge_disposition': 'orchestrator.merge_lane.disposition',
+    'orchestrator.merge_queue_store': 'orchestrator.merge_lane.queue_store',
+    'orchestrator.merge_completion': 'orchestrator.merge_lane.completion',
+    'orchestrator.merge_drift': 'orchestrator.merge_lane.drift',
+    'orchestrator.merge_speculation_controller': (
+        'orchestrator.merge_lane.speculation_controller'
+    ),
+    'orchestrator.merge_request_ledger': 'orchestrator.merge_lane.request_ledger',
+    'orchestrator.merge_skew_tripwire': 'orchestrator.merge_lane.skew_tripwire',
+    'orchestrator.landing_evidence': 'orchestrator.merge_lane.landing_evidence',
+    'orchestrator.landed_outbox': 'orchestrator.merge_lane.landed_outbox',
+}
+
+
 @pytest.mark.parametrize(
     'first, second',
     [
@@ -75,7 +104,7 @@ def test_a_name_outside_the_facade_is_an_attribute_error() -> None:
         ('orchestrator.merge_lane', 'orchestrator.merge_queue'),
     ],
 )
-def test_facade_imports_cleanly_from_either_side_of_its_cycle(
+def test_facade_imports_cleanly_in_either_order_with_the_pre_package_name(
     first: str, second: str,
 ) -> None:
     program = (
@@ -83,6 +112,25 @@ def test_facade_imports_cleanly_from_either_side_of_its_cycle(
         'from orchestrator.merge_lane import MergeLane; '
         'from orchestrator.merge_queue import SpeculativeMergeWorker; '
         'assert MergeLane is SpeculativeMergeWorker'
+    )
+    completed = subprocess.run(
+        [sys.executable, '-c', program], capture_output=True, text=True, timeout=120,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize('alias, submodule', sorted(PRE_PACKAGE_ALIASES.items()))
+@pytest.mark.parametrize('alias_first', [True, False])
+def test_each_pre_package_name_is_its_submodule(
+    alias: str, submodule: str, alias_first: bool,
+) -> None:
+    """One module object under two names, so an import, a string-path patch
+    and the module's own global lookups all meet at a single binding."""
+    order = (alias, submodule) if alias_first else (submodule, alias)
+    program = (
+        'import importlib, sys; '
+        f'[importlib.import_module(name) for name in {order!r}]; '
+        f'assert sys.modules[{alias!r}] is sys.modules[{submodule!r}]'
     )
     completed = subprocess.run(
         [sys.executable, '-c', program], capture_output=True, text=True, timeout=120,
@@ -164,7 +212,7 @@ def git_ops(git_config: GitConfig, tmp_path: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_ops: GitOps, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_ops.project_root, git=git_config)
+    return lane_scene_config(git_ops.project_root, git_config)
 
 
 async def _branch_with_file(git_ops: GitOps, branch: str, filename: str) -> Path:
@@ -214,6 +262,7 @@ async def test_the_injected_verifier_decides_whether_a_branch_lands(
         await queue.put(red)
         red_outcome = await wait_responsive(red.result, label='red merge outcome')
         assert red_outcome.status == 'blocked', red_outcome
+        assert not main_health_probe_spawned(red_outcome), red_outcome.reason
         assert 'fake red: 1 test failed' in red_outcome.reason
         assert await _main_tip(git_ops) == before
 

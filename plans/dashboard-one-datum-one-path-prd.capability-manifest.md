@@ -33,7 +33,7 @@ Machine-readable twin: `plans/dashboard-one-datum-one-path-prd.capability-manife
 |---|---|---|---|
 | Closed nine-member vocabulary with derived `ACTIVE`/`TERMINAL` | capability→producer (wired) | `shared/src/shared/task_statuses.py::TaskStatus`, `::ACTIVE = frozenset(TaskStatus) - TERMINAL`; dashboard depends on `dark-factory-shared` (`dashboard/pyproject.toml`) and four dashboard tests already import `shared.*` | PASS |
 | Three-view partition + `running` sub-view is arithmetically consistent | field-population | `in_flight` (5) + `backlog` (2) + `terminal` (2) = 9 members, disjoint; `running = {IN_PROGRESS} ⊆ in_flight`; wire splits `views`/`sub_views` so `sum(views) == total` | PASS (built+bound by α) |
-| Generator + parity-test precedent in root `tests/scripts/` | capability→producer (wired) | `scripts/render_dashboard_unit.py` + `tests/scripts/test_dashboard_service_template.py::test_template_renders_to_hardcoded_file`; `scripts/` on `sys.path` there | PASS |
+| Generator + parity-test precedent in root `tests/scripts/` | capability→producer (wired) | `scripts/render_systemd_unit.py` + `tests/scripts/test_dashboard_service_template.py::test_template_renders_to_hardcoded_file`; `scripts/` on `sys.path` there | PASS |
 | Classic-script load order + window-global uniqueness | capability→producer (wired) | `static/redux/index.html` classic `<script>` tags before Babel; `tests/js/classic_script_scope.test.mjs::EXPECTED_WINDOW_GLOBALS` enumerates globals — α adds `DF_TASK_VOCAB` there | PASS |
 
 ## α2 — Extract handlers + the two loops from `app.py` *(intermediate → β)*

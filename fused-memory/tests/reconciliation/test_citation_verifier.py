@@ -10,7 +10,9 @@ plan for the full three-way contract (keep / drop+mark / keep+mark).
 
 from __future__ import annotations
 
+import copy
 import json
+import logging
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call
 
@@ -18,15 +20,21 @@ import pytest
 
 from fused_memory.models.reconciliation import StageId
 from fused_memory.reconciliation.citation_verifier import (
+    MAX_PROSE_IDS_PER_SCAN,
+    PROSE_CITATION_FIELDS,
     STAGE_STAT_PREFIX,
     X_CITATION_TOMBSTONE_KEY,
+    _known_non_mem0_ids,
     build_citation_tombstone,
     find_citation_occurrences,
     find_live_citation_occurrences,
+    find_prose_uuids,
     is_concrete_memory_id,
+    make_memory_resolver,
     repoint_metadata,
     repoint_task_citations,
     repoint_tombstone_chain,
+    scan_prose_citations,
     verify_cited_memories,
 )
 
@@ -1422,3 +1430,1026 @@ class TestTombstoneLedgerIsNotACitation:
         assert not any(
             p.startswith(X_CITATION_TOMBSTONE_KEY) for p in tombstones[1]['paths']
         )
+
+
+# --------------------------------------------------------------------------- #
+# Prose citation scanning (task 4818)
+# --------------------------------------------------------------------------- #
+
+# The near-miss specimen pair from the incident this task closes. Recon Stage-2
+# run ``ab330f59-7335-4962-b9a8-e2fdaa96d3e9`` emitted Stage-1 finding
+# ``0490e20e-cce2-4e68-a2ce-80f3b31987a1``, whose prose named a FABRICATED
+# memory id that escaped into gate task 4423's description and needed a
+# hand-written hygiene note so a reader would not chase it.
+#
+# The two ids share a 26-character common prefix (`5197cac6-9a7c-4682-b4dc-8b`)
+# and diverge only inside the final 12-hex group. Both pass ``is_full_uuid``.
+# That is exactly what a prefix/loose/truncating matcher collapses into ONE
+# key — and collapsing them is the difference between warning about the
+# fabrication and warning about the real memory.
+_SPECIMEN_FABRICATED = '5197cac6-9a7c-4682-b4dc-8b17bf10a3f0'
+_SPECIMEN_REAL = '5197cac6-9a7c-4682-b4dc-8b77b5f48689'
+
+
+class TestFindProseUuids:
+    """``find_prose_uuids`` locates UUID-shaped substrings in a finding's free
+    text (``PROSE_CITATION_FIELDS``), returning an insertion-ordered
+    ``{lowercase_uuid: [field, ...]}`` map. Pure: never mutates, never raises."""
+
+    def test_near_miss_specimen_pair_yields_two_distinct_full_ids(self):
+        """THE load-bearing regression: the fabricated and real specimen ids
+        share a 26-char prefix and must come back as TWO separate full 36-char
+        keys, byte-identical to the input."""
+        finding = {
+            'description': (
+                f'Memory {_SPECIMEN_FABRICATED} contradicts the canonical entry '
+                f'{_SPECIMEN_REAL} recorded during the earlier sweep.'
+            ),
+            'suggested_action': 'no ids here',
+        }
+
+        found = find_prose_uuids(finding)
+
+        assert set(found) == {_SPECIMEN_FABRICATED, _SPECIMEN_REAL}
+        # Each key is the FULL 36-char id, not a shared prefix or a truncation.
+        for key in found:
+            assert len(key) == 36
+        assert found[_SPECIMEN_FABRICATED] == ['description']
+        assert found[_SPECIMEN_REAL] == ['description']
+
+    def test_suggested_action_is_scanned_too(self):
+        """A uuid present ONLY in suggested_action is found — both prose fields
+        reach a human reader, so both are in scope."""
+        finding = {
+            'description': 'nothing cited here',
+            'suggested_action': f'Delete {_SPECIMEN_FABRICATED} from the cluster.',
+        }
+
+        assert find_prose_uuids(finding) == {_SPECIMEN_FABRICATED: ['suggested_action']}
+
+    def test_id_in_both_fields_yields_one_key_listing_both_fields(self):
+        """One id, one key — with both field names in PROSE_CITATION_FIELDS order."""
+        finding = {
+            'description': f'see {_SPECIMEN_REAL}',
+            'suggested_action': f'repoint {_SPECIMEN_REAL} then re-run',
+        }
+
+        found = find_prose_uuids(finding)
+
+        assert list(found) == [_SPECIMEN_REAL]
+        assert found[_SPECIMEN_REAL] == list(PROSE_CITATION_FIELDS)
+
+    @pytest.mark.parametrize(
+        'prose',
+        [
+            f'a{_SPECIMEN_REAL}',        # leading hex digit
+            f'{_SPECIMEN_REAL}a',        # trailing hex digit
+            _SPECIMEN_REAL[:-1],         # 35 chars
+            _SPECIMEN_REAL + '9',        # 37 chars
+            _SPECIMEN_REAL.replace('-', ''),  # 32-char undashed hex run
+        ],
+        ids=['leading-hex', 'trailing-hex', '35-char', '37-char', 'undashed-32'],
+    )
+    def test_boundary_rejection(self, prose):
+        """Hex lookarounds (not ``\\b``) reject an id embedded in a longer hex
+        run, and the canonical 36-char dashed shape rejects near-shapes."""
+        assert find_prose_uuids({'description': prose}) == {}
+
+    def test_non_hex_adjacent_prefix_is_accepted(self):
+        """``run-<uuid>.`` still yields the uuid: a dash and a period are not
+        hex, so they do not extend the run."""
+        finding = {'description': f'during run-{_SPECIMEN_REAL}.'}
+
+        assert find_prose_uuids(finding) == {_SPECIMEN_REAL: ['description']}
+
+    def test_uppercase_rendering_is_normalised_to_lowercase(self):
+        """Casing is a rendering choice, not a different identifier
+        (``is_full_uuid``'s docstring). Mem0 point ids render lowercase, so
+        lowercasing can only avoid a false phantom, never create one."""
+        finding = {'description': f'MEMORY {_SPECIMEN_REAL.upper()} is stale'}
+
+        assert find_prose_uuids(finding) == {_SPECIMEN_REAL: ['description']}
+
+    def test_non_prose_fields_are_never_scanned(self):
+        """``finding_id``/``task_id``/``cited_memories`` are uuid-bearing but are
+        NOT prose: the structured half owns cited_memories, and the identity
+        fields are not claims a reader would chase."""
+        finding = {
+            'finding_id': '0490e20e-cce2-4e68-a2ce-80f3b31987a1',
+            'task_id': 'ab330f59-7335-4962-b9a8-e2fdaa96d3e9',
+            'cited_memories': [{'memory_id': _SPECIMEN_REAL, 'store': 'mem0'}],
+            'description': 'clean prose',
+            'suggested_action': 'clean prose',
+        }
+
+        assert find_prose_uuids(finding) == {}
+
+    @pytest.mark.parametrize(
+        'finding',
+        [
+            None,
+            'a bare string',
+            12345,
+            {},
+            {'description': None, 'suggested_action': None},
+            {'description': 7, 'suggested_action': ['a', 'list']},
+        ],
+        ids=['none', 'str', 'int', 'empty-dict', 'none-fields', 'wrong-typed-fields'],
+    )
+    def test_degenerate_input_never_raises(self, finding):
+        """Malformed input degrades to ``{}`` rather than raising mid-scan."""
+        assert find_prose_uuids(finding) == {}
+
+    def test_is_pure_and_never_mutates_the_finding(self):
+        """Deep-compare against a pre-call copy: the scanner is a read."""
+        finding = {
+            'description': f'{_SPECIMEN_FABRICATED} and {_SPECIMEN_REAL}',
+            'suggested_action': f'drop {_SPECIMEN_FABRICATED}',
+            'cited_memories': [{'memory_id': _SPECIMEN_REAL, 'store': 'mem0'}],
+        }
+        before = copy.deepcopy(finding)
+
+        find_prose_uuids(finding)
+
+        assert finding == before
+
+
+def _prose_service(*, record=None, tombstone=None, get_raises=None) -> AsyncMock:
+    """AsyncMock exposing BOTH halves of the three-way contract.
+
+    In-process the contract is split across two service methods, not one:
+    ``get_memory_by_id`` returns a record / ``None`` / raises, and the
+    tombstone lives on the sibling ``get_mem0_deletion_tombstone`` (task 3041,
+    which deliberately left ``get_memory_by_id``'s ``None``-on-miss contract
+    untouched precisely because this module branches on ``is None``).
+    """
+    service = AsyncMock()
+    if get_raises is not None:
+        service.get_memory_by_id = AsyncMock(side_effect=get_raises)
+    else:
+        service.get_memory_by_id = AsyncMock(return_value=record)
+    service.get_mem0_deletion_tombstone = AsyncMock(return_value=tombstone)
+    return service
+
+
+class _NoTombstoneService:
+    """A memory_service with NO ``get_mem0_deletion_tombstone`` attribute at
+    all. A bare ``AsyncMock`` auto-creates the attribute, so it cannot model
+    this wiring gap."""
+
+    async def get_memory_by_id(self, project_id, memory_id):
+        return None
+
+
+class TestScanProseCitationsBranches:
+    """``scan_prose_citations`` splits every prose id FOUR ways and warns on
+    exactly one of them (task 4818).
+
+    found -> verified · absent+tombstone -> tombstoned (benign) ·
+    absent+NO tombstone -> phantom (WARN) · raised -> inconclusive.
+    """
+
+    @pytest.mark.asyncio
+    async def test_found_counts_verified_and_never_probes_the_tombstone(self, caplog):
+        """A resolving id is verified, silently — and the tombstone probe is
+        GUARDED to the miss branch, mirroring ``server/tools.py``'s
+        ``get_memory_by_id``, where the probe never runs on the hit branch."""
+        finding = {'description': f'see {_SPECIMEN_REAL}'}
+        service = _prose_service(record={'id': _SPECIMEN_REAL, 'content': 'x', 'metadata': {}})
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations([finding], service, 'test_project')
+
+        assert stats['stage1_prose_citations_verified'] == 1
+        assert stats['stage1_prose_phantom_citations'] == 0
+        assert caplog.records == []
+        service.get_mem0_deletion_tombstone.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_absent_with_tombstone_is_benign_and_never_warns(self, caplog):
+        """A DELIBERATELY deleted memory is not a fabrication.
+
+        This is the case a two-way found/not-found check gets wrong, and
+        getting the three-way split right is the whole point of the task: a
+        tombstone is provenance that names a dead id, so every GC'd memory
+        would otherwise read as a phantom."""
+        finding = {'description': f'see {_SPECIMEN_REAL}'}
+        service = _prose_service(
+            record=None,
+            tombstone={'deleter': 'memory_consolidator', 'deleting_run_id': 'run-x'},
+        )
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations([finding], service, 'test_project')
+
+        assert stats['stage1_prose_citations_tombstoned'] == 1
+        assert stats['stage1_prose_phantom_citations'] == 0
+        assert stats['stage1_prose_citations_verified'] == 0
+        assert caplog.records == []
+
+    @pytest.mark.asyncio
+    async def test_absent_without_tombstone_is_a_phantom_and_warns_once(self, caplog):
+        """The FABRICATED branch — the only one that warns."""
+        finding = {
+            'finding_id': '0490e20e-cce2-4e68-a2ce-80f3b31987a1',
+            'description': f'see {_SPECIMEN_FABRICATED}',
+        }
+        service = _prose_service(record=None, tombstone=None)
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations(
+                [finding], service, 'test_project', run_id='run-4818',
+            )
+
+        assert stats['stage1_prose_phantom_citations'] == 1
+        assert stats['stage1_prose_citations_tombstoned'] == 0
+
+        assert len(caplog.records) == 1
+        rec = caplog.records[0]
+        blob = f'{rec.getMessage()} {rec.__dict__}'
+        # The warning must be actionable on its own: which id, in which
+        # finding, in which prose field, from which run.
+        assert _SPECIMEN_FABRICATED in blob
+        assert '0490e20e-cce2-4e68-a2ce-80f3b31987a1' in blob
+        assert 'description' in blob
+        assert 'run-4818' in blob
+
+    @pytest.mark.asyncio
+    async def test_backend_error_is_inconclusive_never_fabricated(self, caplog):
+        """A raised point read is 'unknown', not 'absent'. It must never be
+        reported as a fabrication, and must never propagate — the stage must
+        not crash on a check error."""
+        finding = {'description': f'see {_SPECIMEN_FABRICATED}'}
+        service = _prose_service(get_raises=TimeoutError('qdrant timeout'))
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations([finding], service, 'test_project')
+
+        assert stats['stage1_prose_citation_verification_errors'] == 1
+        assert stats['stage1_prose_phantom_citations'] == 0
+        for rec in caplog.records:
+            assert 'phantom' not in rec.getMessage().lower()
+
+    @pytest.mark.asyncio
+    async def test_backend_error_is_logged_with_its_error_type(self, caplog):
+        """The sick-backend branch is LOUD, not an anonymous counter.
+
+        Its sibling inconclusive branch logs and cites its ``reason``, and
+        ``verify_cited_memories`` records the same fault as a
+        ``verification_error`` marker carrying ``error_type``. Warn-only cannot
+        append a marker, so this log line is the ONLY place ``error_type``
+        survives — and the assertion above ('phantom' absent from every record)
+        passes vacuously if nothing is logged at all, which is exactly the
+        silence this pins shut (reviewer finding, task 4818 amendment pass)."""
+        finding = {
+            'finding_id': '0490e20e-cce2-4e68-a2ce-80f3b31987a1',
+            'description': f'see {_SPECIMEN_FABRICATED}',
+        }
+        service = _prose_service(get_raises=TimeoutError('qdrant timeout'))
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations(
+                [finding], service, 'test_project', run_id='run-sick',
+            )
+
+        assert stats['stage1_prose_citation_verification_errors'] == 1
+        assert len(caplog.records) == 1
+        rec = caplog.records[0]
+        blob = f'{rec.getMessage()} {rec.__dict__}'
+        # Actionable on its own: which id, in which finding/field, from which
+        # run — and WHAT went wrong, which is the part the counter cannot say.
+        assert 'TimeoutError' in blob
+        assert _SPECIMEN_FABRICATED in blob
+        assert '0490e20e-cce2-4e68-a2ce-80f3b31987a1' in blob
+        assert 'description' in blob
+        assert 'run-sick' in blob
+        assert 'phantom' not in rec.getMessage().lower()
+
+    @pytest.mark.asyncio
+    async def test_specimen_pair_warns_on_the_fabricated_id_only(self, caplog):
+        """End-to-end near-miss regression: one description naming BOTH
+        specimen ids, where the real one resolves and the fabricated one is a
+        genuine miss. The two are distinguished purely because each is
+        resolved VERBATIM AND IN FULL."""
+        finding = {
+            'finding_id': '0490e20e-cce2-4e68-a2ce-80f3b31987a1',
+            'description': (
+                f'Memory {_SPECIMEN_FABRICATED} contradicts canonical entry '
+                f'{_SPECIMEN_REAL}.'
+            ),
+        }
+
+        async def _get(project_id, memory_id):
+            if memory_id == _SPECIMEN_REAL:
+                return {'id': memory_id, 'content': 'x', 'metadata': {}}
+            return None
+
+        service = AsyncMock()
+        service.get_memory_by_id = AsyncMock(side_effect=_get)
+        service.get_mem0_deletion_tombstone = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations([finding], service, 'test_project')
+
+        assert stats['stage1_prose_phantom_citations'] == 1
+        assert stats['stage1_prose_citations_verified'] == 1
+
+        assert len(caplog.records) == 1
+        blob = f'{caplog.records[0].getMessage()} {caplog.records[0].__dict__}'
+        assert _SPECIMEN_FABRICATED in blob
+        # The REAL id must appear nowhere in the warning: naming it would
+        # discredit a legitimate memory in the operator's log.
+        assert _SPECIMEN_REAL not in blob
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'findings',
+        [
+            [],
+            [{'description': 'no ids at all', 'suggested_action': 'none here'}],
+            [{'finding_id': 'f1'}],
+        ],
+        ids=['empty', 'no-uuids', 'no-prose-fields'],
+    )
+    async def test_all_four_keys_always_present_even_at_zero(self, findings):
+        """Explicit-zero convention, inherited verbatim from
+        ``verify_cited_memories``' always-present triple: a consumer merging
+        this into ``report.stats`` never needs a ``.get(..., 0)`` fallback."""
+        service = _prose_service(record=None, tombstone=None)
+
+        stats = await scan_prose_citations(findings, service, 'test_project')
+
+        assert stats == {
+            'stage1_prose_citations_verified': 0,
+            'stage1_prose_citations_tombstoned': 0,
+            'stage1_prose_phantom_citations': 0,
+            'stage1_prose_citation_verification_errors': 0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_never_mutates_a_finding_on_the_fabricated_branch(self):
+        """WARN-ONLY reaches all the way down: no drop, no rewrite, and in
+        particular NO ``citation_failures`` marker — that key belongs to the
+        structured half (task 2979) and the two must stay separate."""
+        finding = {
+            'finding_id': '0490e20e-cce2-4e68-a2ce-80f3b31987a1',
+            'description': f'see {_SPECIMEN_FABRICATED}',
+            'suggested_action': f'drop {_SPECIMEN_FABRICATED}',
+            'cited_memories': [{'memory_id': _SPECIMEN_REAL, 'store': 'mem0'}],
+        }
+        before = copy.deepcopy(finding)
+        service = _prose_service(record=None, tombstone=None)
+
+        stats = await scan_prose_citations([finding], service, 'test_project')
+
+        assert stats['stage1_prose_phantom_citations'] == 1
+        assert finding == before
+        assert 'citation_failures' not in finding
+
+
+class TestScanProseCitationsSafety:
+    """The tombstone probe is the SOLE discriminator between the fabricated
+    branch and a deliberate reap, so a probe that is unavailable or broken must
+    degrade to INCONCLUSIVE — never to a phantom (task 4818)."""
+
+    @pytest.mark.asyncio
+    async def test_tombstone_reader_absent_degrades_to_inconclusive(self, caplog):
+        """A memory_service with NO ``get_mem0_deletion_tombstone`` attribute at
+        all — a wiring failure, not a data condition.
+
+        ``spec=`` is required: a bare ``AsyncMock`` auto-creates the attribute
+        and would silently pass a two-way implementation."""
+        service = _NoTombstoneService()
+        finding = {'finding_id': 'f1', 'description': f'see {_SPECIMEN_FABRICATED}'}
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations([finding], service, 'test_project')
+
+        assert stats['stage1_prose_citation_verification_errors'] == 1
+        assert stats['stage1_prose_phantom_citations'] == 0
+        assert len(caplog.records) == 1
+        msg = caplog.records[0].getMessage().lower()
+        # Loud, not silent (the repo's loud-over-silent norm) — but it must not
+        # claim fabrication, which the probe never established.
+        assert 'phantom' not in msg
+        assert 'tombstone' in msg
+
+    @pytest.mark.asyncio
+    async def test_tombstone_reader_raising_degrades_to_inconclusive(self, caplog):
+        """Deliberate ASYMMETRY with ``server/tools.py::get_memory_by_id``,
+        which degrades a raising probe to "no tombstone".
+
+        There the probe only ADDS information to an already-correct
+        ``found: False``, so degrading it loses detail but tells no untruth —
+        its own comment says a tombstone failure "can never convert a correct
+        found:False into an error". HERE the tombstone is the only thing
+        separating a benign deliberate deletion from a fabrication, so the same
+        degradation would manufacture a FALSE phantom out of every GC'd memory.
+        The collapse must be unreachable even through a broken store."""
+        service = _prose_service(record=None)
+        service.get_mem0_deletion_tombstone = AsyncMock(
+            side_effect=RuntimeError('ledger locked'),
+        )
+        finding = {'finding_id': 'f1', 'description': f'see {_SPECIMEN_FABRICATED}'}
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations([finding], service, 'test_project')
+
+        assert stats['stage1_prose_citation_verification_errors'] == 1
+        assert stats['stage1_prose_phantom_citations'] == 0
+        assert len(caplog.records) == 1
+        assert 'phantom' not in caplog.records[0].getMessage().lower()
+
+    @pytest.mark.asyncio
+    async def test_unwired_ledger_degrades_to_inconclusive(self, caplog):
+        """USABILITY, not merely PRESENCE — the branch that makes the guarantee
+        hold against the REAL collaborator (reviewer finding, task 4818
+        amendment pass).
+
+        ``MemoryService.get_mem0_deletion_tombstone`` is "fail-safe
+        throughout": it NEVER raises, and returns ``None`` when no ledger is
+        wired (``recon_ledger_enabled=False``, a supported production config).
+        So on such a deployment a probe-PRESENT check would see a well-behaved
+        reader answering ``None`` for every id on earth and read each of those
+        as "no tombstone" — turning every ordinary miss into a fabricated
+        phantom, i.e. the exact two-way collapse the two tests above make
+        unreachable only for the wiring failures they model. Mirroring the
+        reader's own ``getattr(self, 'recon_ledger', None)`` guard is what
+        closes it."""
+        service = _prose_service(record=None, tombstone=None)
+        service.recon_ledger = None
+        finding = {'finding_id': 'f1', 'description': f'see {_SPECIMEN_FABRICATED}'}
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations([finding], service, 'test_project')
+
+        assert stats['stage1_prose_citation_verification_errors'] == 1
+        assert stats['stage1_prose_phantom_citations'] == 0
+        assert len(caplog.records) == 1
+        assert 'phantom' not in caplog.records[0].getMessage().lower()
+
+    @pytest.mark.asyncio
+    async def test_wired_ledger_still_reaches_the_fabricated_branch(self, caplog):
+        """The usability guard must not swallow the branch it protects: with a
+        ledger WIRED, a readable "no tombstone" is still a phantom."""
+        service = _prose_service(record=None, tombstone=None)
+        service.recon_ledger = object()
+        finding = {'finding_id': 'f1', 'description': f'see {_SPECIMEN_FABRICATED}'}
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations([finding], service, 'test_project')
+
+        assert stats['stage1_prose_phantom_citations'] == 1
+        assert stats['stage1_prose_citation_verification_errors'] == 0
+        assert 'phantom' in caplog.records[0].getMessage().lower()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'reason', ['ledger_unavailable', 'reader_unavailable'],
+    )
+    async def test_wiring_gap_warns_once_per_scan_not_per_id(self, caplog, reason):
+        """A missing reader or an unwired ledger is a fact about how THIS scan
+        is wired, not about any id, so it warns once per scan. On a
+        ``recon_ledger_enabled=False`` deployment a per-id warning would be one
+        identical line per prose miss. The counters still count every pair."""
+        if reason == 'ledger_unavailable':
+            service: Any = _prose_service(record=None, tombstone=None)
+            service.recon_ledger = None
+        else:
+            service = _NoTombstoneService()
+        third = '0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d'
+        findings = [
+            {
+                'finding_id': 'f1',
+                'description': f'{_SPECIMEN_FABRICATED} and {_SPECIMEN_REAL}',
+            },
+            {'finding_id': 'f2', 'description': f'{_SPECIMEN_FABRICATED} and {third}'},
+        ]
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations(
+                findings, service, 'test_project', run_id='run-unwired',
+            )
+
+            assert stats['stage1_prose_citation_verification_errors'] == 4
+            assert stats['stage1_prose_phantom_citations'] == 0
+            assert len(caplog.records) == 1
+            msg = caplog.records[0].getMessage()
+            assert 'tombstone' in msg.lower()
+            assert reason in msg
+            assert 'run-unwired' in msg
+            assert 'stage1' in msg
+            assert 'phantom' not in msg.lower()
+
+            # Once per SCAN, not once per process: a later run on the same
+            # deployment must still surface the gap.
+            await scan_prose_citations(
+                findings, service, 'test_project', run_id='run-unwired',
+            )
+            assert len(caplog.records) == 2
+
+    @pytest.mark.asyncio
+    async def test_raising_reader_still_warns_per_id(self, caplog):
+        """A raising read is a per-READ fault carrying its own exception type,
+        not a wiring fact, so it must not collapse into the once-per-scan
+        wiring warning."""
+        service = _prose_service(record=None)
+        service.get_mem0_deletion_tombstone = AsyncMock(
+            side_effect=RuntimeError('ledger locked'),
+        )
+        finding = {
+            'finding_id': 'f1',
+            'description': f'{_SPECIMEN_FABRICATED} and {_SPECIMEN_REAL}',
+        }
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations([finding], service, 'test_project')
+
+        assert stats['stage1_prose_citation_verification_errors'] == 2
+        assert stats['stage1_prose_phantom_citations'] == 0
+        assert len(caplog.records) == 2
+        named = [
+            [m for m in (_SPECIMEN_FABRICATED, _SPECIMEN_REAL) if m in r.getMessage()]
+            for r in caplog.records
+        ]
+        assert sorted(named) == sorted([[_SPECIMEN_FABRICATED], [_SPECIMEN_REAL]])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'stage_id',
+        [StageId.memory_consolidator, StageId.task_knowledge_sync, StageId.integrity_check],
+    )
+    async def test_stat_prefix_renames_every_prose_counter(self, stage_id):
+        """Routed through the SAME ``STAGE_STAT_PREFIX`` machinery task 2979
+        introduced, so Stages 1-3 all get the prose scan and a future stage
+        inherits it for the same reason it inherits the structured one."""
+        prefix = STAGE_STAT_PREFIX[stage_id]
+        service = _prose_service(record=None, tombstone=None)
+        finding = {'finding_id': 'f1', 'description': f'see {_SPECIMEN_FABRICATED}'}
+
+        stats = await scan_prose_citations(
+            [finding], service, 'test_project', stat_prefix=prefix,
+        )
+
+        assert set(stats) == {
+            f'{prefix}_prose_citations_verified',
+            f'{prefix}_prose_citations_tombstoned',
+            f'{prefix}_prose_phantom_citations',
+            f'{prefix}_prose_citation_verification_errors',
+        }
+        assert stats[f'{prefix}_prose_phantom_citations'] == 1
+
+    @pytest.mark.asyncio
+    async def test_default_stat_prefix_is_stage1(self):
+        """Omitting stat_prefix keeps the Stage-1 spelling byte-identical."""
+        service = _prose_service(record=None, tombstone=None)
+
+        stats = await scan_prose_citations([], service, 'test_project')
+
+        assert set(stats) == {
+            'stage1_prose_citations_verified',
+            'stage1_prose_citations_tombstoned',
+            'stage1_prose_phantom_citations',
+            'stage1_prose_citation_verification_errors',
+        }
+
+    @pytest.mark.asyncio
+    async def test_repeated_phantom_costs_one_lookup_but_counts_per_finding(self, caplog):
+        """Counters count FINDINGS, not lookups — the same distinction
+        ``verify_cited_memories``' docstring already draws. Both the point read
+        AND the tombstone probe are memoised per call."""
+        findings = [
+            {'finding_id': f'f{i}', 'description': f'see {_SPECIMEN_FABRICATED}'}
+            for i in range(3)
+        ]
+        service = _prose_service(record=None, tombstone=None)
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations(findings, service, 'test_project')
+
+        assert stats['stage1_prose_phantom_citations'] == 3
+        assert service.get_memory_by_id.await_count == 1
+        assert service.get_mem0_deletion_tombstone.await_count == 1
+        assert len(caplog.records) == 3
+
+    @pytest.mark.asyncio
+    async def test_malformed_findings_are_skipped_not_raised(self):
+        """Matching ``repoint_task_citations``' ``if not isinstance(...): continue``
+        skip: one bad entry degrades rather than aborting the whole scan."""
+        real_finding = {'finding_id': 'f1', 'description': f'see {_SPECIMEN_FABRICATED}'}
+        service = _prose_service(record=None, tombstone=None)
+
+        # These entries intentionally violate the declared ``list[dict[str, Any]]``.
+        # That violation is precisely what the runtime isinstance skip exists to
+        # survive, so the OFF-CONTRACT cases are hoisted into an ``Any``-annotated
+        # local rather than the production signature being widened to admit them.
+        findings: list[Any] = [None, 'a bare string', 42, real_finding]
+
+        stats = await scan_prose_citations(findings, service, 'test_project')
+
+        assert stats['stage1_prose_phantom_citations'] == 1
+        assert stats['stage1_prose_citations_verified'] == 0
+
+    @pytest.mark.asyncio
+    async def test_lookup_is_scoped_to_the_supplied_project_id(self):
+        """Positional ``(project_id, memory_id)``, matching the existing
+        ``assert_has_awaits([call('test_project', 'A')])`` convention."""
+        finding = {'finding_id': 'f1', 'description': f'see {_SPECIMEN_FABRICATED}'}
+        service = _prose_service(record=None, tombstone=None)
+
+        await scan_prose_citations([finding], service, 'other_project')
+
+        service.get_memory_by_id.assert_has_awaits(
+            [call('other_project', _SPECIMEN_FABRICATED)],
+        )
+        service.get_mem0_deletion_tombstone.assert_has_awaits(
+            [call('other_project', _SPECIMEN_FABRICATED)],
+        )
+
+
+class TestScanProseCitationsKnownNonMem0Ids:
+    """Ids the finding has ALREADY declared are not Mem0 point ids are skipped
+    before the point read, so the two halves of the invariant cannot disagree
+    about the same id on the same finding (reviewer finding, task 4818
+    amendment pass).
+
+    ``verify_cited_memories`` deliberately declines to judge a ``store !=
+    'mem0'`` citation because a Mem0 point read "would return not-found for
+    EVERY graphiti citation and false-flag legitimate graph evidence as a
+    phantom". Recon findings routinely name the same graphiti edge/entity uuid
+    in both ``cited_memories`` and the prose — so without this the structured
+    half would decline to judge it while the prose half called it fabricated.
+    """
+
+    @pytest.mark.asyncio
+    async def test_graphiti_citation_named_in_prose_is_never_a_phantom(self, caplog):
+        """The headline case: one id, cited as ``store='graphiti'`` AND named in
+        the description. Neither half judges it, and no read is even issued."""
+        edge_uuid = '5197cac6-9a7c-4682-b4dc-8b17bf10a3f0'
+        finding = {
+            'finding_id': 'f-graph',
+            'description': f'Edge {edge_uuid} contradicts the cluster.',
+            'cited_memories': [{'memory_id': edge_uuid, 'store': 'graphiti'}],
+        }
+        service = _prose_service(record=None, tombstone=None)
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations([finding], service, 'test_project')
+
+        assert stats['stage1_prose_phantom_citations'] == 0
+        assert stats['stage1_prose_citation_verification_errors'] == 0
+        assert stats['stage1_prose_citations_verified'] == 0
+        assert caplog.records == []
+        # Skipped BEFORE the read, not after: a bounded false-positive
+        # reduction should also cost nothing on the critical path.
+        service.get_memory_by_id.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_mem0_citation_named_in_prose_is_still_scanned(self, caplog):
+        """The exclusion is scoped to NON-mem0 stores. A mem0-store citation
+        also named in the prose is a real, separate prose claim — this is the
+        interaction ``BaseStage.run()``'s ordering comment turns on, and
+        excluding it would silently delete half the counter's purpose."""
+        finding = {
+            'finding_id': 'f-mem0',
+            'description': f'Memory {_SPECIMEN_FABRICATED} is stale.',
+            'cited_memories': [{'memory_id': _SPECIMEN_FABRICATED, 'store': 'mem0'}],
+        }
+        service = _prose_service(record=None, tombstone=None)
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations([finding], service, 'test_project')
+
+        assert stats['stage1_prose_phantom_citations'] == 1
+        assert len(caplog.records) == 1
+
+    @pytest.mark.asyncio
+    async def test_own_identity_and_run_id_quoted_in_prose_are_skipped(self, caplog):
+        """``find_prose_uuids`` already refuses to SCAN the identity fields, but
+        a description that quotes its own finding id — or the run in flight, as
+        4818's own charter does with Stage-2 run ``ab330f59`` — reaches the
+        scan anyway. Neither is a citation."""
+        finding_id = '0490e20e-cce2-4e68-a2ce-80f3b31987a1'
+        task_uuid = '11111111-2222-3333-4444-555555555555'
+        run_uuid = 'ab330f59-1111-4222-8333-444444444444'
+        finding = {
+            'finding_id': finding_id,
+            'task_id': task_uuid,
+            'description': (
+                f'Finding {finding_id} on task {task_uuid} from run {run_uuid} '
+                f'also names {_SPECIMEN_FABRICATED}.'
+            ),
+        }
+        service = _prose_service(record=None, tombstone=None)
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations(
+                [finding], service, 'test_project', run_id=run_uuid,
+            )
+
+        # Exactly ONE of the four ids is a candidate citation.
+        assert stats['stage1_prose_phantom_citations'] == 1
+        assert len(caplog.records) == 1
+        assert _SPECIMEN_FABRICATED in caplog.records[0].getMessage()
+        service.get_memory_by_id.assert_awaited_once_with(
+            'test_project', _SPECIMEN_FABRICATED,
+        )
+
+    @pytest.mark.asyncio
+    async def test_exclusions_are_per_finding_not_global(self):
+        """An id excluded by finding A's graphiti citation is still judged when
+        finding B names it with no such declaration — the counter-evidence is
+        the FINDING's, not the report's."""
+        shared = _SPECIMEN_FABRICATED
+        findings = [
+            {
+                'finding_id': 'f-a',
+                'description': f'Edge {shared}.',
+                'cited_memories': [{'memory_id': shared, 'store': 'graphiti'}],
+            },
+            {'finding_id': 'f-b', 'description': f'Memory {shared}.'},
+        ]
+        service = _prose_service(record=None, tombstone=None)
+
+        stats = await scan_prose_citations(findings, service, 'test_project')
+
+        assert stats['stage1_prose_phantom_citations'] == 1
+
+    @pytest.mark.parametrize(
+        'finding',
+        [
+            None,
+            'a bare string',
+            {'cited_memories': 'not-a-list'},
+            {'cited_memories': [None, 42, {}, {'store': 'graphiti'}]},
+            {'finding_id': None, 'task_id': 42},
+            # Truthy NON-ITERABLES. The cases above were all either falsy
+            # (rescued by ``or []``) or iterable (a str iterates harmlessly
+            # into chars that fail the isinstance-dict check), so none of them
+            # exercised the ``for`` statement's own type requirement. These do:
+            # before the task-4818 amendment-pass fix each raised TypeError out
+            # of this helper, breaking the "total" half of its contract.
+            {'cited_memories': 5},
+            {'cited_memories': True},
+            {'cited_memories': object()},
+        ],
+    )
+    def test_helper_is_total_on_malformed_input(self, finding):
+        """Pure and total, matching ``find_prose_uuids``: a malformed finding
+        yields no exclusions rather than aborting a scan mid-report."""
+        assert _known_non_mem0_ids(finding) == set()
+
+    def test_helper_lowercases_every_class(self):
+        """Normalised to the same lowercase key ``find_prose_uuids`` emits —
+        casing is a rendering choice, not a different identifier — so an
+        uppercase rendering in either place still matches."""
+        upper = _SPECIMEN_REAL.upper()
+        finding = {
+            'finding_id': '0490E20E-CCE2-4E68-A2CE-80F3B31987A1',
+            'cited_memories': [{'memory_id': upper, 'store': 'graphiti'}],
+        }
+
+        excluded = _known_non_mem0_ids(finding, run_id='AB330F59-1111-4222-8333-444444444444')
+
+        assert excluded == {
+            _SPECIMEN_REAL,
+            '0490e20e-cce2-4e68-a2ce-80f3b31987a1',
+            'ab330f59-1111-4222-8333-444444444444',
+        }
+
+
+class TestSharedResolverAndProseCeiling:
+    """Both passes accept an injected ``resolve=`` so ONE memo can span the
+    whole report, and the prose pass caps its unbounded fan-out (reviewer
+    finding, task 4818 amendment pass)."""
+
+    @staticmethod
+    def _uuid(n: int) -> str:
+        return f'{n:08x}-0000-4000-8000-000000000000'
+
+    @pytest.mark.asyncio
+    async def test_injected_resolver_is_used_by_both_passes(self):
+        """The point read goes through the SUPPLIED resolver, so a caller
+        sharing one instance across both halves gets one memo, not two."""
+        calls: list[Any] = []
+
+        async def _fake_resolve(memory_id):
+            calls.append(memory_id)
+            return ('found', None)
+
+        service = _prose_service(record=None, tombstone=None)
+        structured = [
+            {
+                'finding_id': 'f1',
+                'cited_memories': [{'memory_id': _SPECIMEN_REAL, 'store': 'mem0'}],
+            },
+        ]
+        prose = [{'finding_id': 'f2', 'description': f'see {_SPECIMEN_REAL}'}]
+
+        s1 = await verify_cited_memories(
+            structured, service, 'test_project', resolve=_fake_resolve,
+        )
+        s2 = await scan_prose_citations(
+            prose, service, 'test_project', resolve=_fake_resolve,
+        )
+
+        assert s1['stage1_citations_verified'] == 1
+        assert s2['stage1_prose_citations_verified'] == 1
+        assert calls == [_SPECIMEN_REAL, _SPECIMEN_REAL]
+        # The injected resolver REPLACES the private one — neither pass reached
+        # around it to the service.
+        service.get_memory_by_id.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_one_shared_resolver_costs_one_read_across_both_halves(self):
+        """The point of sharing the INSTANCE and not just the factory: an id
+        both structurally cited and named in the prose of the same report is
+        read ONCE, so the two passes also cannot straddle a concurrent delete
+        and return contradictory verdicts for it."""
+        service = _prose_service(record=None, tombstone=None)
+        shared_resolve = make_memory_resolver(service, 'test_project')
+        findings = [
+            {
+                'finding_id': 'f1',
+                'description': f'Memory {_SPECIMEN_FABRICATED} is stale.',
+                'cited_memories': [{'memory_id': _SPECIMEN_FABRICATED, 'store': 'mem0'}],
+            },
+        ]
+
+        s1 = await verify_cited_memories(
+            findings, service, 'test_project', resolve=shared_resolve,
+        )
+        s2 = await scan_prose_citations(
+            findings, service, 'test_project', resolve=shared_resolve,
+        )
+
+        assert s1['stage1_phantom_citations_dropped'] == 1
+        assert s2['stage1_prose_phantom_citations'] == 1
+        service.get_memory_by_id.assert_awaited_once_with(
+            'test_project', _SPECIMEN_FABRICATED,
+        )
+
+    @pytest.mark.asyncio
+    async def test_memo_merges_casings_of_a_canonical_uuid(self):
+        """Casing cannot name a different Qdrant point (pinned live by
+        ``tests/test_mem0_qdrant_integration.py::TestUuidPointIdCasing``), so
+        two casings of one canonical uuid share one read and one verdict. The
+        backend still receives the caller's own spelling."""
+        service = _prose_service(record=None, tombstone=None)
+        resolve = make_memory_resolver(service, 'test_project')
+
+        first = await resolve(_SPECIMEN_FABRICATED.upper())
+        second = await resolve(_SPECIMEN_FABRICATED)
+
+        assert first == second == ('missing', None)
+        service.get_memory_by_id.assert_awaited_once_with(
+            'test_project', _SPECIMEN_FABRICATED.upper(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_memo_keys_non_canonical_ids_verbatim(self):
+        """The casing equivalence the memo relies on is established only for
+        the canonical dashed shape, so every other spelling and every non-str
+        value keeps a verdict of its own."""
+        service = _prose_service(record=None, tombstone=None)
+        resolve = make_memory_resolver(service, 'test_project')
+
+        await resolve('A')
+        await resolve('a')
+        assert service.get_memory_by_id.await_count == 2
+
+        await resolve('urn:uuid:' + _SPECIMEN_REAL)
+        await resolve('URN:UUID:' + _SPECIMEN_REAL)
+        assert service.get_memory_by_id.await_count == 4
+
+        assert await resolve(7) == ('missing', None)
+        assert service.get_memory_by_id.await_count == 5
+        assert await resolve(7) == ('missing', None)
+        assert service.get_memory_by_id.await_count == 5
+
+    @pytest.mark.asyncio
+    async def test_mixed_case_structured_citation_and_prose_mention_cost_one_read(self):
+        """``find_prose_uuids`` lowercases what it finds, while a structured
+        citation keeps the model's casing. One shared resolver must still read
+        the id once, so the two passes cannot reach two verdicts for it."""
+        upper = _SPECIMEN_FABRICATED.upper()
+        service = _prose_service(record=None, tombstone=None)
+        shared_resolve = make_memory_resolver(service, 'test_project')
+        findings = [
+            {
+                'finding_id': 'f1',
+                'description': f'Memory {upper} is stale.',
+                'cited_memories': [{'memory_id': upper, 'store': 'mem0'}],
+            },
+        ]
+
+        s1 = await verify_cited_memories(
+            findings, service, 'test_project', resolve=shared_resolve,
+        )
+        s2 = await scan_prose_citations(
+            findings, service, 'test_project', resolve=shared_resolve,
+        )
+
+        assert s1['stage1_phantom_citations_dropped'] == 1
+        assert s2['stage1_prose_phantom_citations'] == 1
+        assert service.get_memory_by_id.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_default_resolve_none_still_builds_a_private_resolver(self):
+        """Omitting ``resolve`` keeps every standalone caller on the original
+        behaviour — the parameter is an optimisation, not a new requirement."""
+        service = _prose_service(record=None, tombstone=None)
+        finding = {'finding_id': 'f1', 'description': f'see {_SPECIMEN_FABRICATED}'}
+
+        stats = await scan_prose_citations([finding], service, 'test_project')
+
+        assert stats['stage1_prose_phantom_citations'] == 1
+        service.get_memory_by_id.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_distinct_prose_ids_are_capped_per_scan(self, caplog):
+        """A description naming more distinct uuids than the ceiling must not
+        stall report assembly with unbounded serial point reads for a WARN-ONLY
+        diagnostic. Unlike the structured pass, whose fan-out is bounded by the
+        model-emitted citation list, this one is driven by arbitrary free
+        text."""
+        over = MAX_PROSE_IDS_PER_SCAN + 3
+        ids = [self._uuid(n) for n in range(over)]
+        finding = {'finding_id': 'f-flood', 'description': ' '.join(ids)}
+        service = _prose_service(record=None, tombstone=None)
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations(
+                [finding], service, 'test_project', run_id='run-flood',
+            )
+
+        # Exactly the ceiling is resolved; the remainder is INCONCLUSIVE, never
+        # phantom — declining to look establishes nothing either way.
+        assert service.get_memory_by_id.await_count == MAX_PROSE_IDS_PER_SCAN
+        assert stats['stage1_prose_phantom_citations'] == MAX_PROSE_IDS_PER_SCAN
+        assert stats['stage1_prose_citation_verification_errors'] == 3
+        # ...and the four counters still account for every distinct pair.
+        assert sum(stats.values()) == over
+
+        capped = [r for r in caplog.records if 'scan_capped' in r.getMessage()]
+        assert len(capped) == 1, 'the ceiling must be logged ONCE per scan, not per id'
+        assert 'run-flood' in capped[0].getMessage()
+        # One run carries one scan per stage, so the line must say WHICH
+        # stage's scan met the ceiling.
+        assert 'stage1' in capped[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_a_report_under_the_ceiling_is_untouched(self):
+        """The ceiling is a backstop, not a throttle on ordinary reports."""
+        ids = [self._uuid(n) for n in range(5)]
+        findings = [{'finding_id': f'f{i}', 'description': u} for i, u in enumerate(ids)]
+        service = _prose_service(record=None, tombstone=None)
+
+        stats = await scan_prose_citations(findings, service, 'test_project')
+
+        assert stats['stage1_prose_phantom_citations'] == 5
+        assert stats['stage1_prose_citation_verification_errors'] == 0
+
+    @pytest.mark.asyncio
+    async def test_ceiling_counts_distinct_ids_not_pairs(self):
+        """A repeat of an ALREADY-resolved id is free (the memo answers it), so
+        it must not consume ceiling budget — the ceiling bounds reads, and the
+        counters keep counting per-finding CLAIMS."""
+        ids = [self._uuid(n) for n in range(MAX_PROSE_IDS_PER_SCAN)]
+        blob = ' '.join(ids)
+        findings = [
+            {'finding_id': 'f-a', 'description': blob},
+            {'finding_id': 'f-b', 'description': blob},
+        ]
+        service = _prose_service(record=None, tombstone=None)
+
+        stats = await scan_prose_citations(findings, service, 'test_project')
+
+        assert service.get_memory_by_id.await_count == MAX_PROSE_IDS_PER_SCAN
+        assert stats['stage1_prose_phantom_citations'] == 2 * MAX_PROSE_IDS_PER_SCAN
+        assert stats['stage1_prose_citation_verification_errors'] == 0
+
+    @pytest.mark.asyncio
+    async def test_ceiling_is_per_scan_not_per_run(self):
+        """The budget belongs to one ``scan_prose_citations`` call, even when
+        the resolver is shared: ``BaseStage.run()`` hands each stage its own
+        scan over one run-scoped resolver, and each scan gets a full fresh
+        ceiling. Making the budget run-wide would need a rename, not a silent
+        change."""
+        service = _prose_service(record=None, tombstone=None)
+        shared_resolve = make_memory_resolver(service, 'test_project')
+        first = [self._uuid(n) for n in range(MAX_PROSE_IDS_PER_SCAN)]
+        second = [
+            self._uuid(n)
+            for n in range(MAX_PROSE_IDS_PER_SCAN, 2 * MAX_PROSE_IDS_PER_SCAN)
+        ]
+
+        for ids in (first, second):
+            stats = await scan_prose_citations(
+                [{'finding_id': 'f-scan', 'description': ' '.join(ids)}],
+                service, 'test_project', resolve=shared_resolve,
+            )
+            assert stats['stage1_prose_citation_verification_errors'] == 0
+            assert stats['stage1_prose_phantom_citations'] == MAX_PROSE_IDS_PER_SCAN
+
+        assert service.get_memory_by_id.await_count == 2 * MAX_PROSE_IDS_PER_SCAN

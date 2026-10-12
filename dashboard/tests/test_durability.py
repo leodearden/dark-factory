@@ -23,13 +23,19 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
 import pytest
-from _dashboard_helpers import apply_isolated_env, live_aiosqlite_worker_threads
+from _dashboard_helpers import (
+    apply_isolated_env,
+    drive_loop_until,
+    drive_metrics_loop,
+    live_aiosqlite_worker_threads,
+    yielding_noop_sleep,
+)
 from fastapi import FastAPI
 from shared.async_sqlite_base import CheckpointResult
 
 from dashboard.app import lifespan
 from dashboard.config import DashboardConfig
-from dashboard.loops import _burndown_loop, _BurndownStore, _metrics_loop, _MetricsStore
+from dashboard.loops import _burndown_loop, _BurndownStore, _MetricsStore
 
 # ---------------------------------------------------------------------------
 # Step-1: burndown store pragma triad
@@ -181,35 +187,18 @@ async def test_burndown_loop_invokes_periodic_checkpoint(tmp_path: Path):
         return CheckpointResult(0, 0, 0)
 
     checkpoint_mock = AsyncMock(side_effect=_checkpoint_side_effect)
-    store.checkpoint = checkpoint_mock  # type: ignore[method-assign]
+    store.checkpoint = checkpoint_mock
 
     # Build a minimal config (no network needed — collect_snapshot is patched).
     config = DashboardConfig(project_root=tmp_path)
 
-    # _sleep_to_aligned_tick must yield to the event loop so checkpoint_called.set()
-    # (scheduled via loop.call_soon inside asyncio.Event.set) is processed between
-    # iterations.  A plain AsyncMock(return_value=None) never suspends, creating a
-    # tight synchronous loop that starves asyncio.wait_for of event-loop cycles.
-    async def _noop_sleep(*a: object, **kw: object) -> None:
-        await asyncio.sleep(0)
-
     try:
         with (
             patch('dashboard.loops.collect_snapshot', new=AsyncMock(return_value=None)),
-            patch('dashboard.loops._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
+            patch('dashboard.loops._sleep_to_aligned_tick', new=yielding_noop_sleep),
             patch('dashboard.loops._CHECKPOINT_INTERVAL_SECONDS', 0),
         ):
-            task = asyncio.create_task(
-                _burndown_loop(store, config, MagicMock())
-            )
-            try:
-                # Wait until store.checkpoint() is actually called — this is racefree
-                # because the event is set inside the checkpoint mock itself.
-                await asyncio.wait_for(checkpoint_called.wait(), timeout=2.0)
-            finally:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+            await drive_loop_until(_burndown_loop(store, config, MagicMock()), checkpoint_called)
     finally:
         await store.close()
 
@@ -239,7 +228,7 @@ async def test_burndown_loop_checkpoint_respects_interval_gate(tmp_path: Path):
         checkpoint_count += 1
         return CheckpointResult(0, 0, 0)
 
-    store.checkpoint = AsyncMock(side_effect=_counting_checkpoint)  # type: ignore[method-assign]
+    store.checkpoint = AsyncMock(side_effect=_counting_checkpoint)
 
     config = DashboardConfig(project_root=tmp_path)
 
@@ -253,25 +242,20 @@ async def test_burndown_loop_checkpoint_respects_interval_gate(tmp_path: Path):
         if collect_calls >= 6:  # 1 initial + 5 in-loop body
             many_iters_done.set()
 
-    async def _noop_sleep(*a: object, **kw: object) -> None:
-        await asyncio.sleep(0)
-
     try:
         with (
             patch('dashboard.loops.collect_snapshot', new=AsyncMock(side_effect=_counting_collect)),
-            patch('dashboard.loops._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
+            patch('dashboard.loops._sleep_to_aligned_tick', new=yielding_noop_sleep),
             patch('dashboard.loops._CHECKPOINT_INTERVAL_SECONDS', 3600),
         ):
-            task = asyncio.create_task(_burndown_loop(store, config, MagicMock()))
-            try:
-                await asyncio.wait_for(many_iters_done.wait(), timeout=2.0)
-            finally:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+            await drive_loop_until(_burndown_loop(store, config, MagicMock()), many_iters_done)
     finally:
         await store.close()
 
+    assert many_iters_done.is_set(), (
+        f'_burndown_loop completed only {collect_calls} collect cycles (need 6) - '
+        f'checkpoint_count <= 1 below would hold vacuously'
+    )
     # With 3600s interval and 5 in-loop iterations completing in milliseconds,
     # checkpoint fires at most once (first iteration where monotonic() >> 3600s),
     # then the gate suppresses it for the remainder of the test.
@@ -293,12 +277,9 @@ async def test_metrics_loop_invokes_periodic_checkpoint(tmp_path: Path):
     Drives _metrics_loop directly (no lifespan), patches _CHECKPOINT_INTERVAL_SECONDS
     to 0 so the checkpoint fires on the first loop body iteration. Waits on the
     checkpoint mock's own asyncio.Event so the assertion is racefree: the event is
-    set inside store.checkpoint, meaning the checkpoint has actually fired before we
-    cancel the task.
+    set inside store.checkpoint, meaning the checkpoint has actually fired before
+    the loop is cancelled.
     """
-    store = _MetricsStore(tmp_path / 'metrics.db', busy_timeout_ms=5000)
-    await store.open()
-
     # Replace checkpoint with an AsyncMock that sets an event when called.
     checkpoint_called = asyncio.Event()
 
@@ -307,7 +288,6 @@ async def test_metrics_loop_invokes_periodic_checkpoint(tmp_path: Path):
         return CheckpointResult(0, 0, 0)
 
     checkpoint_mock = AsyncMock(side_effect=_checkpoint_side_effect)
-    store.checkpoint = checkpoint_mock  # type: ignore[method-assign]
 
     # Minimal app-state stub — pool.get() returns None because collect_metrics_snapshot
     # is patched and never inspects the connections it receives.
@@ -319,40 +299,16 @@ async def test_metrics_loop_invokes_periodic_checkpoint(tmp_path: Path):
     mock_app.state.db = mock_pool
     mock_app.state.http_client = MagicMock()
 
-    # _sleep_to_aligned_tick must yield to the event loop so checkpoint_called.set()
-    # (scheduled via loop.call_soon inside asyncio.Event.set) is processed between
-    # iterations.  A plain AsyncMock(return_value=None) never suspends, creating a
-    # tight synchronous loop that starves asyncio.wait_for of event-loop cycles.
-    async def _noop_sleep(*a: object, **kw: object) -> None:
-        await asyncio.sleep(0)
-
-    try:
-        with (
-            patch(
-                'dashboard.loops.collect_metrics_snapshot',
-                new=AsyncMock(return_value=None),
-            ),
-            patch('dashboard.loops._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
-            patch('dashboard.loops._CHECKPOINT_INTERVAL_SECONDS', 0),
-        ):
-            task = asyncio.create_task(
-                _metrics_loop(
-                    store,
-                    mock_app,
-                    pool=mock_pool,
-                    http_client=mock_app.state.http_client,
-                )
+    async with _MetricsStore(tmp_path / 'metrics.db', busy_timeout_ms=5000) as store:
+        store.checkpoint = checkpoint_mock
+        with patch('dashboard.loops._CHECKPOINT_INTERVAL_SECONDS', 0):
+            await drive_metrics_loop(
+                store,
+                mock_app,
+                pool=mock_pool,
+                http_client=mock_app.state.http_client,
+                until=checkpoint_called,
             )
-            try:
-                # Wait until store.checkpoint() is actually called — this is racefree
-                # because the event is set inside the checkpoint mock itself.
-                await asyncio.wait_for(checkpoint_called.wait(), timeout=2.0)
-            finally:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-    finally:
-        await store.close()
 
     assert checkpoint_mock.called, (
         '_metrics_loop did not call store.checkpoint() — periodic checkpoint not yet implemented'
@@ -367,17 +323,12 @@ async def test_metrics_loop_checkpoint_respects_interval_gate(tmp_path: Path):
     Runs with _CHECKPOINT_INTERVAL_SECONDS=3600 for several iterations and asserts
     checkpoint is called at most once, verifying the interval gate works correctly.
     """
-    store = _MetricsStore(tmp_path / 'metrics_gate.db', busy_timeout_ms=5000)
-    await store.open()
-
     checkpoint_count = 0
 
     async def _counting_checkpoint(*args: object, **kwargs: object) -> CheckpointResult:
         nonlocal checkpoint_count
         checkpoint_count += 1
         return CheckpointResult(0, 0, 0)
-
-    store.checkpoint = AsyncMock(side_effect=_counting_checkpoint)  # type: ignore[method-assign]
 
     config = DashboardConfig(project_root=tmp_path)
     mock_pool = MagicMock()
@@ -390,41 +341,28 @@ async def test_metrics_loop_checkpoint_respects_interval_gate(tmp_path: Path):
     collect_calls = 0
     many_iters_done = asyncio.Event()
 
-    async def _counting_collect(*a: object, **kw: object) -> None:
+    def _count(_kwargs: dict[str, object]) -> None:
         nonlocal collect_calls
         collect_calls += 1
         if collect_calls >= 6:  # 1 initial + 5 in-loop body
             many_iters_done.set()
 
-    async def _noop_sleep(*a: object, **kw: object) -> None:
-        await asyncio.sleep(0)
-
-    try:
-        with (
-            patch(
-                'dashboard.loops.collect_metrics_snapshot',
-                new=AsyncMock(side_effect=_counting_collect),
-            ),
-            patch('dashboard.loops._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
-            patch('dashboard.loops._CHECKPOINT_INTERVAL_SECONDS', 3600),
-        ):
-            task = asyncio.create_task(
-                _metrics_loop(
-                    store,
-                    mock_app,
-                    pool=mock_pool,
-                    http_client=mock_app.state.http_client,
-                )
+    async with _MetricsStore(tmp_path / 'metrics_gate.db', busy_timeout_ms=5000) as store:
+        store.checkpoint = AsyncMock(side_effect=_counting_checkpoint)
+        with patch('dashboard.loops._CHECKPOINT_INTERVAL_SECONDS', 3600):
+            await drive_metrics_loop(
+                store,
+                mock_app,
+                pool=mock_pool,
+                http_client=mock_app.state.http_client,
+                until=many_iters_done,
+                on_collect=_count,
             )
-            try:
-                await asyncio.wait_for(many_iters_done.wait(), timeout=2.0)
-            finally:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-    finally:
-        await store.close()
 
+    assert many_iters_done.is_set(), (
+        f'_metrics_loop completed only {collect_calls} collect cycles (need 6) - '
+        f'checkpoint_count <= 1 below would hold vacuously'
+    )
     # With 3600s interval and 5 in-loop iterations completing in milliseconds,
     # checkpoint fires at most once (first iteration where monotonic() >> 3600s),
     # then the gate suppresses it for the remainder of the test.

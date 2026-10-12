@@ -31,6 +31,7 @@ from orchestrator.git_ops import GitOps, _run
 from orchestrator.verify_cancel import (
     lane_lock_path,
     read_lock_holder_pgid,
+    remove_lock_holder_pgid,
     write_lock_holder_pgid,
 )
 from orchestrator.warm_lane_pool import WarmLanePool
@@ -644,8 +645,11 @@ class TestMergeVerifyLeaseParametrizedLane:
         — a non-blocking flock re-acquire on that path raises BlockingIOError
         — WHILE lane_lock_path(persistent_merge_worktree_path) stays FREE
         (acquirable), proving it locked the GIVEN lane and not the hardcoded
-        persistent lane. The GLOBAL holder-pgid rendezvous
-        (read_lock_holder_pgid(worktree_base)) is still recorded, unchanged.
+        persistent lane. As of task 4189 the GLOBAL holder-pgid rendezvous
+        (read_lock_holder_pgid(worktree_base)) is NOT recorded for an
+        ephemeral lane — see TestEphemeralLaneLeaseLeavesGlobalRendezvousUntouched
+        below for why (the cold-shadow GC defer and the remove-side stomp).
+        The task-2873 lane-parametrization pins here are unchanged.
         """
         git_ops = _git_ops(tmp_path)
         # An ephemeral speculation lane (the incident's _merge-<hash> shape).
@@ -677,13 +681,16 @@ class TestMergeVerifyLeaseParametrizedLane:
             finally:
                 os.close(fd_persist)
 
-            # The global holder-pgid rendezvous stays keyed to worktree_base.
-            assert read_lock_holder_pgid(git_ops.worktree_base) == os.getpgrp(), (
-                'the GLOBAL holder-pgid must still be recorded even for an '
+            # The GLOBAL holder-pgid rendezvous is left untouched: it is
+            # keyed to worktree_base and consumed only by PERSISTENT-lane
+            # actors, so an ephemeral lane must not record it (task 4189).
+            assert read_lock_holder_pgid(git_ops.worktree_base) is None, (
+                'the GLOBAL holder-pgid must NOT be recorded for an '
                 'ephemeral-lane lease'
             )
 
-        # Released on exit — holder-pgid cleared, flock dropped.
+        # Released on exit — flock dropped; the global rendezvous was never
+        # written, and so is still absent.
         assert read_lock_holder_pgid(git_ops.worktree_base) is None
 
     async def test_default_lane_dir_still_locks_persistent(self, tmp_path: Path):
@@ -702,3 +709,249 @@ class TestMergeVerifyLeaseParametrizedLane:
             finally:
                 os.close(fd)
             assert read_lock_holder_pgid(git_ops.worktree_base) == os.getpgrp()
+
+
+# ---------------------------------------------------------------------------
+# task 4189, step-1 — merge_verify_lease writes/removes the GLOBAL holder-pgid
+# rendezvous ONLY for the PERSISTENT merge lane; an EPHEMERAL lane_dir keeps
+# the flock (and the fail-closed contended raise) but never touches the
+# single fixed-key global.
+#
+# Incident: task 2873 parametrized the flocked INODE but deliberately left the
+# rendezvous keyed to the GLOBAL worktree_base, justified as "a safe
+# over-approximation" — an argument that contemplated only the SHORT DF-2822
+# cross-check and only the DEFER direction. Two consequences it missed:
+#   (1) _run_warm_lane_gc_reclaim defers (127) unconditionally while the
+#       rendezvous names a live pgid and does NOT exclude self, so an
+#       hours-long cold-shadow verify on an ephemeral lane (merge_shadow.py)
+#       blocked warm-lane reclaim for its WHOLE window — while touching
+#       nothing in the pool the reclaim would reset.
+#   (2) The key is not refcounted and has no owner check (last writer wins,
+#       first remover wins). Shadow compares run as background asyncio tasks
+#       alongside the next merge's PERSISTENT-lane verify, so whichever lease
+#       exits FIRST stripped the other's LIVE rendezvous — the exact
+#       remove-side stomp task_verify_lease's docstring already cites as its
+#       own reason for being flock-only.
+#
+# (a), (b) and (e) below are RED before step-2's fix; (c), (d), (f) and (g)
+# are controls that must be GREEN both before and after it — (d) in
+# particular discriminates against a wrong `lane_dir is None`-only fix,
+# because the DF-2822 cross-check passes the PERSISTENT lane explicitly, and
+# (g) pins the REFUSAL path (the flock and the fail-closed contended raise an
+# ephemeral lane still gets) against a future refactor that hoisted the
+# rendezvous remove out of the lease's finally.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestEphemeralLaneLeaseLeavesGlobalRendezvousUntouched:
+    """merge_verify_lease(lane_dir=<ephemeral>) takes the lane flock ONLY —
+    it neither writes nor removes the global holder-pgid (task 4189)."""
+
+    async def test_ephemeral_lane_lease_never_writes_the_global_rendezvous(
+        self, tmp_path: Path,
+    ):
+        """(a) An ephemeral ``_merge-<hash>`` lane lease must leave the global
+        rendezvous ABSENT for its whole window, so the persistent-lane actors
+        that consult it (``_run_warm_lane_gc_reclaim``,
+        ``reset_persistent_merge_worktree``) see no lease they should defer to.
+        """
+        git_ops = _git_ops(tmp_path)
+        ephemeral_wt = git_ops.worktree_base / '_merge-98c756bc'
+        lane_lock_path(ephemeral_wt).parent.mkdir(parents=True, exist_ok=True)
+
+        assert read_lock_holder_pgid(git_ops.worktree_base) is None, 'sanity: clean start'
+
+        async with git_ops.merge_verify_lease(lane_dir=ephemeral_wt):
+            assert read_lock_holder_pgid(git_ops.worktree_base) is None, (
+                'an EPHEMERAL-lane lease must NOT write the single fixed-key '
+                'global holder-pgid rendezvous'
+            )
+            assert git_ops._merge_verify_lease_active() is False, (
+                'the predicate persistent-lane actors gate on must report no '
+                'lease while only an ephemeral lane is leased'
+            )
+
+        assert read_lock_holder_pgid(git_ops.worktree_base) is None
+
+    async def test_ephemeral_lane_lease_exit_does_not_strip_a_live_holders_rendezvous(
+        self, tmp_path: Path,
+    ):
+        """(b) Remove-side stomp: a CONCURRENT persistent-lane verify's live
+        rendezvous (stood in for here by a pre-written holder-pgid) must
+        SURVIVE an ephemeral-lane lease's exit. The key is not refcounted and
+        has no owner check, so before the fix the first lease to exit cleared
+        the other's live hold.
+        """
+        git_ops = _git_ops(tmp_path)
+        ephemeral_wt = git_ops.worktree_base / '_merge-98c756bc'
+        lane_lock_path(ephemeral_wt).parent.mkdir(parents=True, exist_ok=True)
+
+        # Stand-in for the concurrent persistent-lane verify's live lease.
+        write_lock_holder_pgid(git_ops.worktree_base, os.getpgrp())
+        try:
+            async with git_ops.merge_verify_lease(lane_dir=ephemeral_wt):
+                pass
+
+            assert read_lock_holder_pgid(git_ops.worktree_base) == os.getpgrp(), (
+                "an ephemeral-lane lease's exit must not strip a foreign "
+                "holder's LIVE rendezvous — that is the shadow-compare vs "
+                'next-merge remove-side stomp'
+            )
+        finally:
+            remove_lock_holder_pgid(git_ops.worktree_base)
+
+    async def test_ephemeral_lane_lease_still_holds_the_lane_flock(
+        self, tmp_path: Path,
+    ):
+        """(c) CONTROL: dropping the rendezvous must NOT weaken the flock —
+        the primary cross-process serialization the shadow/drift/cross-check
+        sites' fail-closed ``'skipped_lease_held'`` contract rests on.
+        """
+        git_ops = _git_ops(tmp_path)
+        ephemeral_wt = git_ops.worktree_base / '_merge-98c756bc'
+        ephemeral_lock = lane_lock_path(ephemeral_wt)
+        ephemeral_lock.parent.mkdir(parents=True, exist_ok=True)
+
+        async with git_ops.merge_verify_lease(lane_dir=ephemeral_wt):
+            fd = os.open(ephemeral_lock, os.O_RDWR | os.O_CREAT)
+            try:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+
+    async def test_explicitly_passed_persistent_lane_still_writes_the_rendezvous(
+        self, tmp_path: Path,
+    ):
+        """(d) CONTROL: the DF-2822 cross-check passes ``lane_dir=merge_wt``
+        EXPLICITLY, and that is the PERSISTENT lane whenever the merge ran
+        there. Gating on ``lane_dir is None`` instead of on the resolved PATH
+        would silently stop recording the rendezvous for a genuine
+        persistent-lane verify — re-opening the warm-lane clobber the lease
+        exists to prevent. Byte-identical to the no-arg lease.
+        """
+        git_ops = _git_ops(tmp_path)
+        persistent_lock = lane_lock_path(git_ops.persistent_merge_worktree_path)
+        persistent_lock.parent.mkdir(parents=True, exist_ok=True)
+
+        async with git_ops.merge_verify_lease(
+            lane_dir=git_ops.persistent_merge_worktree_path,
+        ):
+            assert read_lock_holder_pgid(git_ops.worktree_base) == os.getpgrp(), (
+                'an EXPLICITLY passed persistent lane must record the global '
+                'rendezvous exactly as the no-arg lease does'
+            )
+            assert git_ops._merge_verify_lease_active() is True
+
+        assert read_lock_holder_pgid(git_ops.worktree_base) is None
+
+    async def test_ephemeral_lane_contended_raise_leaves_a_live_rendezvous_intact(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """(g) The docstring's OTHER half: an ephemeral lane still gets the
+        flock AND the fail-closed contended raise — and that REFUSAL path must
+        not touch the global rendezvous either.
+
+        ``test_contended_flock_raises_and_records_no_lease`` covers the
+        contended raise only on the default (persistent) lane, where clearing
+        the rendezvous would be harmless because we never wrote it. On an
+        EPHEMERAL lane the file may belong to a LIVE concurrent
+        persistent-lane verify (stood in for here by a pre-written
+        holder-pgid, as in (b)). A refactor that hoisted the remove out of the
+        ``finally`` into a broader cleanup path would silently strip that
+        foreign holder's rendezvous on the refusal path, and nothing else in
+        this suite would fail.
+        """
+        from orchestrator.git_ops import MergeVerifyLeaseContended  # noqa: PLC0415
+
+        git_ops = _git_ops(tmp_path)
+        ephemeral_wt = git_ops.worktree_base / '_merge-98c756bc'
+        lane_lock_path(ephemeral_wt).parent.mkdir(parents=True, exist_ok=True)
+
+        # Stand-in for the concurrent persistent-lane verify's live lease.
+        write_lock_holder_pgid(git_ops.worktree_base, os.getpgrp())
+        # Same seam the persistent-lane contention test uses: simulate
+        # acquire_merge_verify_flock's bounded-wait TIMEOUT (-> None).
+        monkeypatch.setattr(
+            'orchestrator.git_ops.acquire_merge_verify_flock',
+            lambda *a, **k: None,
+        )
+        try:
+            entered = False
+            with pytest.raises(MergeVerifyLeaseContended):
+                async with git_ops.merge_verify_lease(lane_dir=ephemeral_wt):
+                    entered = True  # body must never run
+
+            assert not entered, (
+                'an ephemeral lane must keep the fail-closed contended '
+                'contract — the body may not run without the flock'
+            )
+            assert read_lock_holder_pgid(git_ops.worktree_base) == os.getpgrp(), (
+                'the REFUSAL path must leave a live foreign rendezvous intact, '
+                'exactly as the acquire-and-release path does'
+            )
+        finally:
+            remove_lock_holder_pgid(git_ops.worktree_base)
+
+
+@pytest.mark.asyncio
+class TestGcReclaimIgnoresEphemeralLaneLeases:
+    """_run_warm_lane_gc_reclaim defers to a PERSISTENT-lane lease only — an
+    ephemeral speculation lane is not a lane the reclaim resets (task 4189).
+
+    Setup mirrors TestGcReclaimDefersOnMergeVerifyLease exactly
+    (``mark_pool_storage_present()`` + a size-1 ``WarmLanePool`` + the
+    ``warm-lane-gc.sh`` stub) so a skip here is attributable ONLY to the
+    lease, never to the BUG-2 pool-storage sentinel gate.
+    """
+
+    async def test_reclaim_proceeds_while_an_ephemeral_lane_lease_is_held(
+        self, tmp_path: Path,
+    ):
+        """(e) The hours-long cold-shadow window (merge_shadow.py) must no
+        longer block warm-lane reclaim: an ephemeral-lane lease records no
+        rendezvous, so the reclaim's lease gate does not fire."""
+        git_ops = _git_ops(tmp_path)
+        git_ops.mark_pool_storage_present()
+        git_ops.warm_lane_pool = WarmLanePool(worktree_base=git_ops.worktree_base, size=1)
+        script = _write_warm_lane_gc_stub(git_ops.project_root)
+        ephemeral_wt = git_ops.worktree_base / '_merge-98c756bc'
+        lane_lock_path(ephemeral_wt).parent.mkdir(parents=True, exist_ok=True)
+
+        mock_run = AsyncMock(return_value=(0, '', ''))
+        async with git_ops.merge_verify_lease(lane_dir=ephemeral_wt):
+            with patch('orchestrator.git_ops._run', mock_run):
+                rc = await git_ops._run_warm_lane_gc_reclaim()
+
+        assert rc == 0, (
+            f'an EPHEMERAL-lane lease must not defer the warm-lane reclaim, got {rc}'
+        )
+        mock_run.assert_awaited_once_with(
+            [str(script), 'reclaim', '--mount', str(git_ops.worktree_base)],
+            cwd=git_ops.project_root,
+        )
+
+    async def test_reclaim_still_defers_while_a_persistent_lane_lease_is_held(
+        self, tmp_path: Path,
+    ):
+        """(f) CONTROL: the reclaim's defer-to-a-real-merge-verify guard
+        (including our OWN persistent-lane lease) is preserved."""
+        git_ops = _git_ops(tmp_path)
+        git_ops.mark_pool_storage_present()
+        git_ops.warm_lane_pool = WarmLanePool(worktree_base=git_ops.worktree_base, size=1)
+        _write_warm_lane_gc_stub(git_ops.project_root)
+        lane_lock_path(git_ops.persistent_merge_worktree_path).parent.mkdir(
+            parents=True, exist_ok=True,
+        )
+
+        mock_run = AsyncMock(return_value=(0, '', ''))
+        async with git_ops.merge_verify_lease():
+            with patch('orchestrator.git_ops._run', mock_run):
+                rc = await git_ops._run_warm_lane_gc_reclaim()
+
+        assert rc == 127, (
+            f'expected fail-soft defer sentinel while a PERSISTENT-lane lease '
+            f'is held, got {rc}'
+        )
+        mock_run.assert_not_awaited()

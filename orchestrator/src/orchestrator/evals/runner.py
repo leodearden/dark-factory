@@ -9,7 +9,6 @@ import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -19,6 +18,7 @@ from shared.cli_invoke import (
     AllAccountsCappedException,
     invoke_with_cap_retry,
 )
+from shared.eval_lane import is_eval_fixture_task_id
 from shared.usage_gate import UsageGate
 
 from orchestrator.agents.briefing import BriefingAssembler
@@ -59,11 +59,12 @@ from .metrics import (
     resolve_terminal_kind,
 )
 from .profile import apply_eval_profile
+from .replay_frame import REPLAY_FRAME_ID, ReplayFramedBriefingAssembler
+from .results import CellName, EvalResult, ResultStore
 from .snapshots import create_eval_worktree, read_python_pin
 
 logger = logging.getLogger(__name__)
 
-RESULTS_DIR = Path(__file__).parent / 'results'
 
 # Cap-wait patience for the architect eval invoke (eval-revival φ).
 #
@@ -93,8 +94,8 @@ RESULTS_DIR = Path(__file__).parent / 'results'
 #
 #   NOR IS RESTART A CHEAP ESCAPE. `run_ofat_stage` — the path campaign drivers
 #   use — has NO skip-existing guard (that is `run_eval_matrix`'s
-#   `_result_exists` check, a different function). Cells persist individually
-#   via `save_result`, so a kill loses no data, but a relaunch RE-RUNS and
+#   `ResultStore.exists` check, a different function). Cells persist individually
+#   via `ResultStore.save`, so a kill loses no data, but a relaunch RE-RUNS and
 #   RE-SPENDS them unless the operator hand-restricts `--tasks-dir`.
 #
 # 48 h is sized to the observed account regime, not to a round number: 1-3
@@ -257,12 +258,9 @@ async def campaign_usage_gate(
 ) -> AsyncIterator[UsageGate | None]:
     """Own ONE account-failover gate for a whole eval campaign (task 4427).
 
-    A campaign is any loop that runs several cells in ONE process: the four
-    methodology stages here (:func:`run_ofat_stage` / :func:`run_matrix_stage` /
-    :func:`run_confirm_stage` / :func:`run_eval_matrix`, each expanding
-    ``fixtures × candidates × trials``) and ``cli._run_single_eval``'s config
-    loop. Each of those needs build-once + tear-down-exactly-once, and five
-    hand-rolled copies is precisely the shape :func:`_build_eval_usage_gate`
+    A campaign is any loop that runs several cells in ONE process, and each
+    one needs build-once + tear-down-exactly-once. A hand-rolled copy of that
+    lifecycle per campaign is precisely the shape :func:`_build_eval_usage_gate`
     itself was extracted to avoid, so the lifecycle lives here in one place.
 
     WHY ``base_config`` IS THE RIGHT THING TO BUILD FROM.
@@ -338,23 +336,6 @@ async def campaign_usage_gate(
                 )
 
 
-@dataclass
-class EvalResult:
-    """Result of one (task, config) eval run."""
-
-    task_id: str
-    config_name: str
-    outcome: str
-    metrics: dict[str, Any]
-    worktree_path: str
-    wall_clock_ms: int = 0
-    run_id: str = ''
-    trial: int = 1
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
 def _find_repo_root(start: Path) -> Path:
     """Walk up from *start* to find the directory containing ``.git``."""
     current = start.resolve().parent if start.is_file() else start.resolve()
@@ -372,9 +353,21 @@ def load_task(task_path: Path) -> dict:
     machines.  If the path in the JSON starts with ``$REPO_ROOT`` it is
     expanded; if the hardcoded absolute path does not exist the discovered
     repository root is used instead.
+
+    Raises ``ValueError`` when the fixture's ``id`` is not an eval fixture id.
     """
     with open(task_path) as f:
         task = json.load(f)
+
+    task_id = task.get('id')
+    if not is_eval_fixture_task_id(task_id):
+        raise ValueError(
+            f'eval fixture {task_path}: id {task_id!r} is not an eval fixture id '
+            '(<repo>_task_<n>[_<suffix>] or shadow_<task_id>_<cell_id>). Eval-lane '
+            'escalation containment (shared/src/shared/eval_lane.py) recognises '
+            'eval provenance by this grammar; an off-grammar id would let this '
+            "fixture's escalations reach the production human L2 queue."
+        )
 
     repo_root = _find_repo_root(task_path)
     raw_root = task.get('project_root', '')
@@ -596,8 +589,12 @@ async def run_eval(
     judge_config: EvalConfig | None = None,
     *,
     usage_gate: InjectedGate = _GATE_UNSET,
+    store: ResultStore | None = None,
 ) -> EvalResult:
     """Run one (task, config) pair through PLAN→EXECUTE→VERIFY→REVIEW.
+
+    The cell persists into *store*; ``None`` persists into
+    :meth:`ResultStore.packaged`.
 
     When *worktree_path* is provided, the eval reuses an existing worktree
     instead of creating a fresh one.  The relocated
@@ -645,6 +642,7 @@ async def run_eval(
             project_root, task_id, task['pre_task_commit'],
             setup_commands=task.get('setup_commands'),
         )
+    address = CellName(task_id, result_label, run_id)
 
     # 2. Build orchestrator config for this eval
     orch_config = build_eval_orch_config(
@@ -741,18 +739,18 @@ async def run_eval(
             metrics_dict['role_under_test'] = 'judge'
 
         result = EvalResult(
-            task_id=task_id,
-            config_name=result_label,
+            task_id=address.task_id,
+            config_name=address.config_name,
             outcome=outcome.value if isinstance(outcome, WorkflowOutcome) else str(outcome),
             metrics=metrics_dict,
             worktree_path=str(worktree),
             wall_clock_ms=wall_clock_ms,
-            run_id=run_id,
+            run_id=address.run_id,
             trial=trial,
         )
 
         # 8. Persist result
-        save_result(result)
+        (store or ResultStore.packaged()).save(result)
 
         logger.info(
             f'Eval complete: {task_id} × {config.name} → {result.outcome} '
@@ -815,6 +813,7 @@ async def run_architect_eval(
     memory_endpoint: str | None = None,
     *,
     usage_gate: InjectedGate = _GATE_UNSET,
+    store: ResultStore | None = None,
 ) -> EvalResult:
     """Run ONE architect eval: invoke the architect LIVE and score its plan (θ).
 
@@ -826,7 +825,8 @@ async def run_architect_eval(
     (implementer/debugger/reviewer/verify) is FROZEN (decision 8: noise
     isolation + token savings). The architect runs with THIS candidate's
     model/backend/effort/env_overrides, not the hardcoded opus-high the
-    implementer path pins.
+    implementer path pins. Its prompt ends with the replay frame, and the cell
+    is stamped ``replay_frame`` (docs/eval-replay-frame.md).
 
     The produced plan is scored two ways: :func:`judge_plan_quality` (the LLM
     judge, against the REAL landed reference diff
@@ -888,8 +888,8 @@ async def run_architect_eval(
       (prefixed ``judge:``) but does NOT taint: the structural floor is still
       derived from a real produced plan.
 
-    The result carries ``role_under_test='architect'`` and is persisted via
-    :func:`save_result`.
+    The result carries ``role_under_test='architect'`` and is persisted into
+    *store* (``None`` persists into :meth:`ResultStore.packaged`).
 
     Cost accounting (eval-revival υ): the cell's ``cost_usd`` is the TOTAL
     spend of producing and scoring the plan — the architect invocation plus
@@ -936,7 +936,6 @@ async def run_architect_eval(
     its ambiguity direction. The artifacts are read in the ``finally`` block
     below, which is the last moment they exist.
     """
-    from orchestrator.agents.briefing import BriefingAssembler
     from orchestrator.agents.invoke import invoke_agent
     from orchestrator.agents.roles import ARCHITECT
     from orchestrator.artifacts import TaskArtifacts
@@ -961,6 +960,7 @@ async def run_architect_eval(
     worktree, run_id = await snapshots.create_eval_worktree(
         project_root, task_id, pre, setup_commands=task.get('setup_commands'),
     )
+    address = CellName(task_id, config.name, run_id)
 
     plan: dict = {}
     # Pre-initialised for the same reason ``artifacts``/``usage_gate`` below
@@ -1086,7 +1086,7 @@ async def run_architect_eval(
 
         # 4. Build the architect prompt and invoke the architect LIVE with THIS
         #    candidate's model/backend/effort/env_overrides.
-        briefing = BriefingAssembler(orch_config)
+        briefing = ReplayFramedBriefingAssembler(orch_config, base_commit=pre)
         prompt = await briefing.build_architect_prompt(task_def, worktree=worktree)
         # Wire plan-tools MCP via the SAME production seam real dispatch uses
         # (workflow._invoke): relocated meta_root + direct-interpreter launch.
@@ -1578,6 +1578,7 @@ async def run_architect_eval(
         # correct refusal, reported ALONGSIDE plan_steps rather than folded into
         # it, so both facts survive on a plan-then-decline cell.
         terminal_kind=terminal_kind,
+        replay_frame=REPLAY_FRAME_ID,
         # NO test signal exists for a plan-only cell (task 3099): this path
         # freezes implementer/debugger/reviewer/verify, so verification never
         # runs. ``None`` is the documented "unknown" sentinel; the dataclass
@@ -1649,16 +1650,16 @@ async def run_architect_eval(
         judged_without_reference=judged_without_reference,
     )
     result_obj = EvalResult(
-        task_id=task_id,
-        config_name=config.name,
+        task_id=address.task_id,
+        config_name=address.config_name,
         outcome=outcome,
         metrics=metrics.to_dict(),
         worktree_path=str(worktree),
         wall_clock_ms=wall_clock_ms,
-        run_id=run_id,
+        run_id=address.run_id,
         trial=trial,
     )
-    save_result(result_obj)
+    (store or ResultStore.packaged()).save(result_obj)
     logger.info(
         f'Architect eval complete: {task_id} × {config.name} → '
         f'plan_quality={plan_quality} ({wall_clock_ms / 1000:.1f}s, '
@@ -1687,6 +1688,7 @@ async def run_end_to_end(
     memory_endpoint: str | None = None,
     *,
     usage_gate: InjectedGate = _GATE_UNSET,
+    store: ResultStore | None = None,
 ) -> EvalResult:
     """Run ONE both-live end-to-end eval: architect LIVE feeding implementer LIVE.
 
@@ -1702,7 +1704,10 @@ async def run_end_to_end(
 
     The result's ``config_name`` encodes the ``(architect, implementer)`` combo
     and its metrics carry ``role_under_test='end_to_end'``. Mirrors run_eval's
-    timeout / exception handling and persists via :func:`save_result`.
+    timeout / exception handling and persists into *store* (``None`` persists
+    into :meth:`ResultStore.packaged`). Its
+    architect is briefed in the replay frame, and the cell is stamped
+    ``replay_frame`` (docs/eval-replay-frame.md).
     """
     task = load_task(task_path)
     task_id = task['id']
@@ -1719,6 +1724,7 @@ async def run_end_to_end(
         project_root, task_id, task['pre_task_commit'],
         setup_commands=task.get('setup_commands'),
     )
+    address = CellName(task_id, config_name, run_id)
 
     # 2. Both-live orch config: architect derived from arch_config, implementer
     #    from impl_config.
@@ -1740,7 +1746,11 @@ async def run_end_to_end(
     # 4. Workflow dependencies (mirrors run_eval).
     git_ops = GitOps(orch_config.git, orch_config.project_root)
     scheduler, _ = _build_eval_scheduler(orch_config, task_id, list(modules))
-    briefing = BriefingAssembler(orch_config)
+    # TaskWorkflow's PLAN phase briefs the live architect through this; see
+    # docs/eval-replay-frame.md.
+    briefing = ReplayFramedBriefingAssembler(
+        orch_config, base_commit=task['pre_task_commit'],
+    )
     mcp = _EvalMcpStub(orch_config.fused_memory.url)
 
     # Owned only when the caller supplied nothing — see :data:`InjectedGate`.
@@ -1791,18 +1801,19 @@ async def run_end_to_end(
             logger.warning(f'Metric collection failed: {e}')
             metrics_dict = {}
         metrics_dict['role_under_test'] = 'end_to_end'
+        metrics_dict['replay_frame'] = REPLAY_FRAME_ID
 
         result = EvalResult(
-            task_id=task_id,
-            config_name=config_name,
+            task_id=address.task_id,
+            config_name=address.config_name,
             outcome=outcome.value if isinstance(outcome, WorkflowOutcome) else str(outcome),
             metrics=metrics_dict,
             worktree_path=str(worktree),
             wall_clock_ms=wall_clock_ms,
-            run_id=run_id,
+            run_id=address.run_id,
             trial=trial,
         )
-        save_result(result)
+        (store or ResultStore.packaged()).save(result)
         logger.info(
             f'End-to-end eval complete: {task_id} × {config_name} → {result.outcome} '
             f'({wall_clock_ms / 1000:.1f}s)'
@@ -1861,8 +1872,14 @@ async def run_eval_matrix(
     trials: int = 1,
     force: bool = False,
     timeout_override: int | None = None,
+    *,
+    store: ResultStore | None = None,
 ) -> list[EvalResult]:
     """Run all (task, config, trial) combinations with bounded concurrency.
+
+    A (task, config) pair *store* already holds is skipped unless *force*;
+    every cell run persists into *store* (``None`` means
+    :meth:`ResultStore.packaged`).
 
     Raises:
         asyncio.CancelledError: if any individual eval coroutine raises
@@ -1871,6 +1888,7 @@ async def run_eval_matrix(
             sibling tasks, await their cleanup, and re-raise.
     """
     configs = configs or EVAL_CONFIGS
+    store = store or ResultStore.packaged()
 
     async with campaign_usage_gate(base_config) as gate:
         # ONE gate for the whole matrix (task 4427) — see campaign_usage_gate
@@ -1897,14 +1915,14 @@ async def run_eval_matrix(
             task_path: Path, config: EvalConfig, trial: int,
         ) -> EvalResult | None:
             task = load_task(task_path)
-            if not force and _result_exists(task['id'], config.name):
+            if not force and store.exists(task['id'], config.name):
                 logger.info(f'Skipping existing: {task["id"]} × {config.name}')
                 return None
             async with sem:
                 return await run_eval(
                     task_path, config, base_config,
                     trial=trial, timeout_override=timeout_override,
-                    usage_gate=gate,
+                    usage_gate=gate, store=store,
                 )
 
         # Design decision: use asyncio.wait(FIRST_COMPLETED) monitor loop instead of
@@ -2206,38 +2224,6 @@ def _resume_plan_from_worktree(worktree: Path, task: dict) -> dict | None:
     return task.get('plan')
 
 
-def _result_exists(task_id: str, config_name: str) -> bool:
-    """Check if any result already exists for this (task, config) pair."""
-    if not RESULTS_DIR.exists():
-        return False
-    return any(RESULTS_DIR.glob(f'{task_id}__{config_name}__*.json'))
-
-
-def save_result(result: EvalResult) -> Path:
-    """Write eval result JSON to results directory."""
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    filename = f'{result.task_id}__{result.config_name}__{result.run_id}.json'
-    path = RESULTS_DIR / filename
-    with open(path, 'w') as f:
-        json.dump(result.to_dict(), f, indent=2)
-    logger.info(f'Saved result: {path}')
-    return path
-
-
-def load_results() -> list[EvalResult]:
-    """Load all existing eval results from the results directory."""
-    results = []
-    if not RESULTS_DIR.exists():
-        return results
-    for path in sorted(RESULTS_DIR.glob('*.json')):
-        with open(path) as f:
-            data = json.load(f)
-        # Filter to known fields so old results with extra/missing keys load
-        known = {f.name for f in EvalResult.__dataclass_fields__.values()}
-        results.append(EvalResult(**{k: v for k, v in data.items() if k in known}))
-    return results
-
-
 # ---------------------------------------------------------------------------
 # Stubs and helpers for eval mode (no real MCP HTTP connection needed)
 # ---------------------------------------------------------------------------
@@ -2389,7 +2375,7 @@ class _RecordingMemoryHandler(BaseHTTPRequestHandler):
     Records every fused-memory ``tools/call`` write on the owning server's
     shared ``writes`` list and replies with a benign JSON-RPC success envelope
     (mirroring ``_StubMcpSession._envelope``). Any POST path is accepted — the
-    workflow write path targets ``{url}/mcp/`` but ``BaseHTTPRequestHandler``
+    workflow write path targets ``{url}/mcp`` but ``BaseHTTPRequestHandler``
     routes every POST here regardless of path.
     """
 
@@ -2452,7 +2438,7 @@ class RecordingMemorySink:
 
     A real loopback HTTP endpoint (stdlib ``http.server``) that receives the
     raw httpx POSTs the workflow's ``_write_*_to_memory`` methods send to
-    ``{self.mcp.url}/mcp/``, records each fused-memory ``tools/call`` write as
+    ``{self.mcp.url}/mcp``, records each fused-memory ``tools/call`` write as
     ``(tool_name, arguments)`` on :attr:`writes`, and replies with a benign
     JSON-RPC success envelope (mirroring ``_StubMcpSession._envelope`` so any
     caller that parses the reply stays happy).

@@ -8,8 +8,8 @@ respective ``_run_subprocess``. Both paths now route through the shared
 ``shared/src/shared/cli_invoke.py::build_claude_argv`` helper (task 2465
 dedup), so this test is a standing regression guard against the two
 forks drifting apart again, not a pending RED. ``schema_with_wildcard_deny``
-is the sharpest case: it exercises the CLI-2.1.168 StructuredOutput
-deny-list expansion, which a re-forked
+is the sharpest case: it exercises the StructuredOutput-preserving
+``'*'`` → ``--tools ''`` substitution, which a re-forked
 ``orchestrator/src/orchestrator/agents/invoke.py::_invoke_claude_with_sandbox``
 path would be most likely to miss.
 """
@@ -101,7 +101,7 @@ CASES: dict[str, dict[str, Any]] = {
         'session_id': None,
     },
     # The drift-exposing case: output_schema + disallowed_tools=['*'] must
-    # trigger the CLI-2.1.168 deny-list expansion on BOTH paths.
+    # trigger the ``'*'`` → ``--tools ''`` substitution on BOTH paths.
     'schema_with_wildcard_deny': {
         'model': 'opus',
         'max_turns': 20,

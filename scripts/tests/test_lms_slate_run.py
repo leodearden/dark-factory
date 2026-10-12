@@ -1268,16 +1268,19 @@ def test_the_refusal_keys_on_vintage_and_never_on_completeness(
 
 
 # ---------------------------------------------------------------------------
-# a manifest carrying TBD placeholders is refused UP FRONT
+# a manifest carrying TBD placeholders is SWEPT, not refused (task 4992)
 #
-# Measured on this branch, not assumed.  `lms_ctl start` refuses a placeholder
-# before touching the card (exit 4), and `lms_healthcheck --arm <placeholder>`
-# cannot cover it either: `run_healthcheck` reads the VRAM baseline for every
-# arm BEFORE probing, the only writer of a baseline is `lms_ctl start`, so with
-# no start it raises StaleBaselineError -> exit 8 and writes NO file.  The
-# PLACEHOLDER_ARM refusal row therefore never reaches disk, and `merge_reports`
-# refuses without a row for every manifest arm.  So the slate is unassemblable
-# either way -- and the only thing the driver can improve is WHEN it says so.
+# This driver used to refuse such a slate up front, because it genuinely was
+# unassemblable: `lms_healthcheck --arm <placeholder>` read a VRAM baseline for
+# every arm BEFORE probing, the only writer of a baseline is `lms_ctl start`,
+# and `lms_ctl.preflight` refuses a placeholder before the card is touched --
+# so the healthcheck exited 8 having written nothing, the PLACEHOLDER_ARM row
+# never reached disk, and `merge_reports` refused a set that did not cover the
+# manifest.  `run_healthcheck` no longer reads a baseline it cannot have, so
+# the row IS produced and the slate assembles RED BUT COMPLETE.  What the
+# driver still must not do is START one: that is a guaranteed exit-4 refusal,
+# and a recorded `start` failure `continue`s past the one stage that produces
+# this arm's row.
 # ---------------------------------------------------------------------------
 
 
@@ -1288,64 +1291,98 @@ def one_placeholder(monkeypatch):
     return manifest
 
 
-def test_a_placeholder_manifest_is_refused_before_the_card_is_touched(
+def test_a_placeholder_arm_is_healthchecked_without_being_started(
     tmp_path, one_placeholder,
 ):
-    """Not after ~30 minutes of sweeping the other arms for an artifact that
-    could never have been written: this is decidable from the manifest alone,
-    before anything starts."""
+    """The healthcheck alone -- no start, no wait-ready, no stop.
+
+    `lms_ctl.preflight` refuses a placeholder as its FIRST check (exit 4), so
+    starting one is a guaranteed refusal that `sweep_arms` would record and
+    then `continue` past the healthcheck on; and there is no unit to wait for
+    or to stop, because nothing was ever started.  The healthcheck is what
+    produces the PLACEHOLDER_ARM row that COVERS this arm in the merge.
+    """
     runner = _FakeRunner()
 
+    lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    assert runner.stages() == [
+        ('ctl', 'stop-all', None),
+        ('ctl', 'start', 'arm-one'),
+        ('ctl', 'wait-ready', 'arm-one'),
+        ('healthcheck', 'arm-one'),
+        ('ctl', 'stop', 'arm-one'),
+        ('healthcheck', 'tbd-arm'),
+        ('merge',),
+    ]
+
+
+def test_a_placeholder_part_is_handed_to_the_merge(tmp_path, one_placeholder):
+    """The coverage claim, at driver level.
+
+    `merge_reports` refuses a set that does not cover the manifest, so without
+    this part one unresolved PRD Open Question makes every other arm's
+    measurement unpublishable.
+    """
+    parts_dir = tmp_path / 'parts'
+    runner = _FakeRunner(writes={
+        ('healthcheck', arm_id): _one_row_report(arm_id).model_dump_json()
+        for arm_id in ('arm-one', 'tbd-arm')
+    })
+
+    lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=runner)
+
+    merge_argv = next(a for a in runner.calls if '--merge' in a)
+    assert str(lms_slate_run.part_path(parts_dir, 'tbd-arm')) in merge_argv
+
+
+#: What the real tools do to a placeholder arm, scripted onto the fake runner:
+#: `lms_ctl start` refuses it (exit 4, `lms_ctl.preflight`'s first check) and
+#: `lms_healthcheck --arm` exits 1, because the PLACEHOLDER_ARM row it writes
+#: is a FAIL.  Both codes at once are what makes the ordering observable: a
+#: sweep that starts the arm records the START failure and never reaches the
+#: healthcheck, so the two outcomes cannot be confused for one another.
+_PLACEHOLDER_REALITY = {
+    ('ctl', 'start', 'tbd-arm'): 4,
+    ('healthcheck', 'tbd-arm'): 1,
+}
+
+
+def test_a_failing_placeholder_healthcheck_makes_the_slate_red_but_complete(
+    tmp_path, one_placeholder,
+):
+    """The whole point of the change: RED and COMPLETE beats unassemblable.
+
+    The failure recorded must be the HEALTHCHECK's, not a `start` refusal --
+    a recorded `start` failure `continue`s past the one stage that produces
+    this arm's row, which is how the arm goes missing from the merge entirely.
+    """
+    failures = lms_slate_run.sweep_arms(
+        tmp_path / 'parts', runner=_FakeRunner(codes=_PLACEHOLDER_REALITY),
+    )
+
+    assert ('tbd-arm', 'healthcheck', 1) in failures
+    assert [f for f in failures if f[:2] == ('tbd-arm', 'start')] == []
+
+
+def test_a_red_placeholder_slate_still_returns_non_zero(tmp_path, one_placeholder):
+    """Complete is not the same as green: the FAIL row must reach the caller."""
     code = lms_slate_run.run_slate(
-        tmp_path / 'parts', tmp_path / 'out.json', runner=runner,
+        tmp_path / 'parts', tmp_path / 'out.json',
+        runner=_FakeRunner(codes=_PLACEHOLDER_REALITY),
     )
 
     assert code != 0
-    assert runner.calls == []
-
-
-def test_the_placeholder_refusal_names_the_arms_and_the_reason(
-    tmp_path, one_placeholder, capsys,
-):
-    lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json',
-                            runner=_FakeRunner())
-
-    err = capsys.readouterr().err
-    assert 'tbd-arm' in err
-    assert 'arms.yaml' in err
-
-
-def test_the_placeholder_refusal_writes_no_artifact(tmp_path, one_placeholder):
-    """It returns BEFORE the merge -- the one thing that does.  A merge here
-    could only refuse on coverage, and refusing twice explains once."""
-    output = tmp_path / 'out.json'
-
-    lms_slate_run.run_slate(tmp_path / 'parts', output, runner=_FakeRunner())
-
-    assert not output.exists()
-
-
-def test_the_refusal_exit_code_is_the_one_lms_ctl_uses_for_a_bad_manifest():
-    """Pinned to the sibling CLI's vocabulary rather than a fresh literal: a
-    placeholder slate is a manifest problem, and the tools an operator runs
-    side by side should not spell that two different ways."""
-    import lms_ctl
-
-    assert lms_slate_run.EXIT_MANIFEST_ERROR == lms_ctl.EXIT_MANIFEST_ERROR
 
 
 def test_a_manifest_without_placeholders_sweeps_normally(tmp_path, two_arms):
-    """The guard must not fire on the ordinary case -- all seven arms in
-    `arms.yaml` are non-placeholder today."""
+    """The placeholder branch must not disturb the ordinary case -- all seven
+    arms in `arms.yaml` are non-placeholder today."""
     runner = _FakeRunner()
 
     lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
 
     assert ('ctl', 'start', 'arm-one') in runner.stages()
-
-
-def test_placeholder_arm_ids_reads_the_manifest(one_placeholder):
-    assert lms_slate_run.placeholder_arm_ids() == ['tbd-arm']
 
 
 def test_the_committed_manifest_carries_no_placeholder_today():

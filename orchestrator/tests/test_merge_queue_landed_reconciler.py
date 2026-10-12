@@ -596,7 +596,7 @@ class TestReconcileLandedRowDeliveredChecksGuard:
         with patch(_MQ_GATE_TARGET, AsyncMock(return_value=_mq_block('failed'))):
             disposition = await reconcile_landed_row(
                 row, git_ops=git_ops, scheduler=scheduler, outbox=outbox,
-                main_sha='MAIN', project_root='/tmp/proj',
+                main_sha='MAIN', project_root=tmp_path / 'proj',
                 check_timeout_secs=7.5,
             )
 
@@ -616,7 +616,7 @@ class TestReconcileLandedRowDeliveredChecksGuard:
         with patch(_MQ_GATE_TARGET, AsyncMock(return_value=None)):
             disposition = await reconcile_landed_row(
                 row, git_ops=git_ops, scheduler=scheduler, outbox=outbox,
-                main_sha='MAIN', project_root='/tmp/proj',
+                main_sha='MAIN', project_root=tmp_path / 'proj',
                 check_timeout_secs=7.5,
             )
 
@@ -658,7 +658,7 @@ class TestReconcileLandedRowDeliveredChecksGuard:
         with patch(_MQ_GATE_TARGET, AsyncMock(return_value=_mq_block(reason))):
             disposition = await reconcile_landed_row(
                 row, git_ops=git_ops, scheduler=scheduler, outbox=outbox,
-                main_sha='MAIN', project_root='/tmp/proj',
+                main_sha='MAIN', project_root=tmp_path / 'proj',
                 check_timeout_secs=7.5,
             )
 
@@ -688,7 +688,7 @@ class TestReconcileLandedRowDeliveredChecksGuard:
         with patch(_MQ_GATE_TARGET, guard):
             disposition = await reconcile_landed_row(
                 row, git_ops=git_ops, scheduler=scheduler, outbox=outbox,
-                main_sha='MAIN', project_root='/tmp/proj',
+                main_sha='MAIN', project_root=tmp_path / 'proj',
                 check_timeout_secs=7.5, delivered_checks_enabled=False,
             )
 
@@ -714,7 +714,7 @@ class TestReconcileLandedRowDeliveredChecksGuard:
 
         disposition = await reconcile_landed_row(
             row, git_ops=git_ops, scheduler=scheduler, outbox=outbox,
-            main_sha='MAIN', project_root='/tmp/proj',
+            main_sha='MAIN', project_root=tmp_path / 'proj',
             check_timeout_secs=7.5, delivered_checks_enabled=False,
         )
 
@@ -729,7 +729,7 @@ class TestReconcileLandedRowDeliveredChecksGuard:
 
         disposition = await reconcile_landed_row(
             row, git_ops=git_ops, scheduler=scheduler, outbox=outbox,
-            main_sha='MAIN', project_root='/tmp/proj',
+            main_sha='MAIN', project_root=tmp_path / 'proj',
             check_timeout_secs=7.5, delivered_checks_enabled=False,
         )
 
@@ -752,7 +752,7 @@ class TestReconcileLandedRowDeliveredChecksGuard:
         with patch(_MQ_GATE_TARGET, guard):
             await reconcile_landed_row(
                 row, git_ops=git_ops, scheduler=scheduler, outbox=outbox,
-                main_sha='MAIN', project_root='/tmp/proj',
+                main_sha='MAIN', project_root=tmp_path / 'proj',
                 check_timeout_secs=7.5,
             )
 
@@ -763,7 +763,7 @@ class TestReconcileLandedRowDeliveredChecksGuard:
         assert guard.await_args.args[1] == meta
         assert guard.await_args.kwargs['main_sha'] == 'MAIN'
         assert guard.await_args.kwargs['site'] == 'landed-reconcile-rc2'
-        assert guard.await_args.kwargs['project_root'] == '/tmp/proj'
+        assert guard.await_args.kwargs['project_root'] == tmp_path / 'proj'
         assert guard.await_args.kwargs['check_timeout_secs'] == 7.5
         git_ops.get_main_sha.assert_not_called()
 
@@ -783,7 +783,7 @@ class TestReconcileLandedRowDeliveredChecksGuard:
 
         disposition = await reconcile_landed_row(
             row, git_ops=git_ops, scheduler=scheduler, outbox=outbox,
-            main_sha='MAIN', project_root='/tmp/proj', check_timeout_secs=7.5,
+            main_sha='MAIN', project_root=tmp_path / 'proj', check_timeout_secs=7.5,
         )
 
         assert disposition == 'delivered_checks_withheld'
@@ -801,7 +801,7 @@ class TestReconcileLandedRowDeliveredChecksGuard:
         with patch(_MQ_GATE_TARGET, guard):
             disposition = await reconcile_landed_row(
                 row, git_ops=git_ops, scheduler=scheduler, outbox=outbox,
-                main_sha='MAIN', project_root='/tmp/proj',
+                main_sha='MAIN', project_root=tmp_path / 'proj',
                 check_timeout_secs=7.5,
             )
 
@@ -817,7 +817,7 @@ class TestReconcileLandedRowDeliveredChecksGuard:
         with patch(_MQ_GATE_TARGET, guard):
             disposition = await reconcile_landed_row(
                 row, git_ops=git_ops, scheduler=scheduler, outbox=outbox,
-                main_sha='MAIN', project_root='/tmp/proj',
+                main_sha='MAIN', project_root=tmp_path / 'proj',
                 check_timeout_secs=7.5,
             )
 
@@ -836,7 +836,7 @@ class TestReconcileLandedRowDeliveredChecksGuard:
             disposition = await reconcile_landed_row(
                 row, git_ops=git_ops, scheduler=scheduler, outbox=outbox,
                 main_sha='MAIN', provenance_conflict_sink=sink,
-                project_root='/tmp/proj', check_timeout_secs=7.5,
+                project_root=tmp_path / 'proj', check_timeout_secs=7.5,
             )
 
         assert disposition == 'stale_conflict'
@@ -857,7 +857,7 @@ class TestReconcileLandedRowDeliveredChecksGuard:
             disposition = await reconcile_landed_row(
                 row, git_ops=git_ops, scheduler=scheduler, outbox=outbox,
                 main_sha='MAIN', provenance_conflict_sink=sink,
-                project_root='/tmp/proj', check_timeout_secs=7.5,
+                project_root=tmp_path / 'proj', check_timeout_secs=7.5,
             )
 
         assert disposition == 'stale_conflict'
@@ -874,7 +874,7 @@ class TestReconcileLandedRowDeliveredChecksGuard:
         with patch(_MQ_GATE_TARGET, AsyncMock(return_value=_mq_block('failed'))):
             report = await reconcile_landed_outbox(
                 outbox, git_ops, scheduler,
-                project_root='/tmp/proj', check_timeout_secs=7.5,
+                project_root=tmp_path / 'proj', check_timeout_secs=7.5,
             )
 
         assert report['delivered_checks_withheld'] == 1

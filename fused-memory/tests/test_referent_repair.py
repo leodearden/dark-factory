@@ -43,6 +43,7 @@ from fused_memory.backends.graphiti_client import (
     AmbiguousEntityError,
     EdgeNotFoundError,
 )
+from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.services.memory_service import (
     REFERENT_REPAIR_OUTCOMES,
     MemoryService,
@@ -2572,7 +2573,9 @@ class TestTheStormGateProjectRoot:
             'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 1,
         )
         service.set_known_projects({})
-        service.config.taskmaster.project_root = '/tmp/server-cwd-trap'
+        # Plant the whole section so the trap doesn't depend on whatever
+        # `taskmaster` section the test config happens to carry.
+        service.config.taskmaster = TaskmasterConfig(project_root='/tmp/server-cwd-trap')
 
         await service._repair_episode_referents(
             _stats(_finding()), group_id='dark_factory',

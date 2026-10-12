@@ -21,6 +21,7 @@ named item_keys and exact counts on seeded fixtures.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import functools
 import types
 from pathlib import Path
@@ -51,6 +52,7 @@ class TestPinnedVocabulary:
         m = _mod()
         assert m.METRIC_SUPERSEDED_STILL_SURFACING == 'superseded-still-surfacing'
         assert m.METRIC_DANGLING_POINTERS == 'dangling-pointers'
+        assert m.METRIC_DANGLING_POINTERS_UNATTRIBUTED == 'dangling-pointers-unattributed'
         assert m.METRIC_SUCCESSOR_POINTER_PRESENT == 'successor-pointer-present'
         assert m.METRIC_TASK_TERMINAL_STALENESS == 'task-terminal-staleness'
 
@@ -71,6 +73,10 @@ UUID_C = 'c3d4e5f6-2222-4b3c-9d4e-5f6071829304'
 def _record(record_id: str = 'rec-1', content: str = 'a memory', **metadata) -> dict:
     """The ``{'id', 'content', 'metadata'}`` shape the fetch band normalises to."""
     return {'id': record_id, 'content': content, 'metadata': dict(metadata)}
+
+
+def _item_keys(items) -> list[str]:
+    return [item.item_key for item in items]
 
 
 class TestPointerTargets:
@@ -189,6 +195,113 @@ class TestPointerTargets:
         ]
 
 
+class TestByDesignAttribution:
+    """Which ``supersedes`` edges a known reaper deletes the target of BY DESIGN.
+
+    PRD D11: attribution is read off the CITING record's metadata, and only a
+    ``supersedes`` edge is attributable — both reapers delete exactly what they
+    name there and nothing else, so a canonical's dangling ``corrects`` target
+    is real damage and must stay in the alarmed population.
+    """
+
+    def test_the_attribution_vocabulary_is_pinned(self):
+        m = _mod()
+        assert m.REAPER_CONSOLIDATION == 'consolidation'
+        assert m.REAPER_STATUS_CORRECTION == 'status_correction'
+        assert m.UNATTRIBUTED == 'unattributed'
+        # The partition sentinel is a row key, never a reaper.
+        assert m.UNATTRIBUTED not in m.BY_DESIGN_REAPERS
+
+    def test_the_status_correction_writer_is_recognised_by_its_kind(self):
+        """Through the WRITER's constant, so a rename cannot split the two."""
+        from fused_memory.reconciliation.harness import (  # noqa: PLC0415
+            PROJECT_STATUS_CORRECTION_KIND,
+        )
+
+        m = _mod()
+        assert m.by_design_reaper({'kind': PROJECT_STATUS_CORRECTION_KIND}) == (
+            m.REAPER_STATUS_CORRECTION
+        )
+
+    def test_a_consolidation_canonical_is_recognised_whoever_called_the_op(self):
+        m = _mod()
+        assert m.by_design_reaper({'canonical': True, 'topic': 't'}) == m.REAPER_CONSOLIDATION
+
+    def test_a_legacy_hand_rolled_stage_1_fold_is_recognised_by_agent_id(self):
+        m = _mod()
+        assert m.by_design_reaper({'agent_id': 'recon-stage-memory_consolidator'}) == (
+            m.REAPER_CONSOLIDATION
+        )
+
+    def test_the_more_specific_writer_wins_deterministically(self):
+        m = _mod()
+        both = {'kind': 'project_status_correction', 'canonical': True, 'topic': 't'}
+        assert m.by_design_reaper(both) == m.REAPER_STATUS_CORRECTION
+
+    @pytest.mark.parametrize('metadata', [
+        {},
+        # The EXACT consolidator spelling, never the stage prefix: other
+        # stages write memories and are not reapers.
+        {'agent_id': 'recon-stage-task_knowledge_sync'},
+        # `is True`, the vocabulary validator's own idiom — never truthiness.
+        {'canonical': 1},
+        {'canonical': 'true'},
+        {'kind': None},
+        {'agent_id': 42},
+    ])
+    def test_anything_else_is_not_a_reaper(self, metadata):
+        m = _mod()
+        assert m.by_design_reaper(metadata) is None
+
+    @pytest.mark.parametrize('metadata', [None, ['kind', 'project_status_correction']])
+    def test_a_non_mapping_is_not_a_reaper_and_never_raises(self, metadata):
+        m = _mod()
+        assert m.by_design_reaper(metadata) is None
+
+    def test_only_the_supersedes_edges_of_a_reaper_signed_record_are_attributed(self):
+        m = _mod()
+        refs = m.pointer_targets(_record(
+            'rec-1', supersedes=[UUID_A, UUID_B], corrects=UUID_C, canonical=True, topic='t',
+        ))
+        by_key = {(ref.key, ref.target): ref.reaped_by for ref in refs}
+        assert by_key == {
+            ('supersedes', UUID_A): m.REAPER_CONSOLIDATION,
+            ('supersedes', UUID_B): m.REAPER_CONSOLIDATION,
+            # A reaper deletes only what it names in `supersedes`.
+            ('corrects', UUID_C): None,
+        }
+
+    def test_a_plain_record_attributes_nothing(self):
+        m = _mod()
+        refs = m.pointer_targets(_record(supersedes=[UUID_A], parent_id=UUID_B, corrects=UUID_C))
+        assert [ref.reaped_by for ref in refs] == [None, None, None]
+
+    def test_ordering_stays_deterministic_for_a_reaper_signed_record(self):
+        m = _mod()
+        refs = m.pointer_targets(_record(
+            corrects=UUID_C, parent_id=UUID_B, supersedes=UUID_A, canonical=True, topic='t',
+        ))
+        reordered = m.pointer_targets(_record(
+            supersedes=UUID_A, corrects=UUID_C, parent_id=UUID_B, topic='t', canonical=True,
+        ))
+        assert refs == reordered
+
+    def test_attribution_never_moves_the_stored_tripwire_key(self):
+        """The item_key is persisted in alpha's grandfather set, so an edge
+        that loses its reaper signature re-enters the tripwire under the key
+        the same unsigned edge always had."""
+        m = _mod()
+        (attributed,) = m.pointer_targets(_record(
+            'rec-1', 'canonical words', supersedes=UUID_A, canonical=True,
+        ))
+        (plain,) = m.pointer_targets(_record('rec-1', 'canonical words', supersedes=UUID_A))
+        assert attributed.reaped_by == m.REAPER_CONSOLIDATION
+        unsigned = dataclasses.replace(attributed, reaped_by=None)
+        assert _item_keys(m.successor_pointer_items([unsigned], {})) == (
+            _item_keys(m.successor_pointer_items([plain], {}))
+        )
+
+
 class TestDanglingCensus:
     """Resolved vs unresolved, per key, with the unresolved targets NAMED."""
 
@@ -250,7 +363,74 @@ class TestDanglingCensus:
         assert census.resolved == 0
         assert census.unresolved == 0
         assert census.by_key == {}
+        assert census.by_reaper == {}
         assert census.unresolved_refs == []
+
+    @staticmethod
+    def _three_writer_refs():
+        """One status correction, one canonical, one plain record.
+
+        Each carries one resolved (UUID_A) and one unresolved supersedes
+        target; the canonical also carries an unresolved ``corrects`` edge.
+        """
+        m = _mod()
+        return [
+            *m.pointer_targets(_record(
+                'rec-status', 'status words', supersedes=[UUID_A, UUID_B],
+                kind='project_status_correction',
+            )),
+            *m.pointer_targets(_record(
+                'rec-canonical', 'canonical words', supersedes=[UUID_A, UUID_B],
+                corrects=UUID_C, canonical=True, topic='t',
+            )),
+            *m.pointer_targets(_record(
+                'rec-plain', 'plain words', supersedes=[UUID_A, UUID_C],
+            )),
+        ]
+
+    def test_the_reaper_cut_is_a_partition_of_the_same_edges(self):
+        m = _mod()
+        census = m.dangling_census(self._three_writer_refs(), {UUID_A: True})
+        for field_name, total in (
+            ('examined', census.examined),
+            ('resolved', census.resolved),
+            ('unresolved', census.unresolved),
+        ):
+            assert sum(row[field_name] for row in census.by_reaper.values()) == total
+        for row in census.by_reaper.values():
+            assert set(row) == {'examined', 'resolved', 'unresolved'}
+
+    def test_attribution_is_per_edge_so_a_canonicals_corrects_edge_is_unattributed(self):
+        m = _mod()
+        census = m.dangling_census(self._three_writer_refs(), {UUID_A: True})
+        assert census.by_reaper == {
+            m.REAPER_STATUS_CORRECTION: {'examined': 2, 'resolved': 1, 'unresolved': 1},
+            m.REAPER_CONSOLIDATION: {'examined': 2, 'resolved': 1, 'unresolved': 1},
+            # The plain record's two supersedes edges PLUS the canonical's
+            # corrects edge: a reaper deletes only what it names in supersedes.
+            m.UNATTRIBUTED: {'examined': 3, 'resolved': 1, 'unresolved': 2},
+        }
+
+    def test_an_absent_reaper_gets_no_fabricated_zero_row(self):
+        m = _mod()
+        refs = m.pointer_targets(_record(
+            'rec-canonical', supersedes=UUID_A, canonical=True, topic='t',
+        ))
+        census = m.dangling_census(refs, {UUID_A: True})
+        assert set(census.by_reaper) == {m.REAPER_CONSOLIDATION}
+        assert m.REAPER_STATUS_CORRECTION not in census.by_reaper
+        assert m.UNATTRIBUTED not in census.by_reaper
+
+    def test_a_by_design_target_missing_from_the_map_is_unresolved_in_its_row(self):
+        """Never a silent 'assume fine' per slice either."""
+        m = _mod()
+        refs = m.pointer_targets(_record(
+            'rec-status', supersedes=UUID_A, kind='project_status_correction',
+        ))
+        census = m.dangling_census(refs, {})
+        assert census.by_reaper == {
+            m.REAPER_STATUS_CORRECTION: {'examined': 1, 'resolved': 0, 'unresolved': 1},
+        }
 
 
 class TestSuccessorPointerItems:
@@ -429,6 +609,102 @@ class TestSuccessorPointerItems:
             m._tripwire_item_key(refs[1]): True,
         }
         assert [r.source_id for r in m.unkeyable_successor_refs(refs)] == ['rec-3']
+
+    @staticmethod
+    def _mixed_attribution_refs():
+        """A canonical (supersedes one gone and one live target, plus a
+        corrects edge), a status correction, and one plain successor."""
+        m = _mod()
+        return [
+            *m.pointer_targets(_record(
+                'rec-canonical', 'canonical words', supersedes=[UUID_A, UUID_B],
+                corrects=UUID_C, canonical=True, topic='t',
+            )),
+            *m.pointer_targets(_record(
+                'rec-status', 'status words', supersedes=UUID_A,
+                kind='project_status_correction',
+            )),
+            *m.pointer_targets(_record('rec-plain', 'plain words', supersedes=UUID_A)),
+        ]
+
+    def test_a_by_design_edge_mints_no_tripwire_item(self):
+        """Otherwise every reaper action is a brand-new alarm.
+
+        alpha's rule (a) alarms on any failing item absent from the grandfather
+        set, and nothing joins that set after the first run
+        (``shared/src/shared/memory_eval_limits.py::evaluate_tripwire``). Item
+        keys are content hashes, so every new canonical, and every diverged
+        status-correction record (new content, hence a new item_key), would
+        be a brand-new failing item — an alarm on every run a reaper acted.
+        """
+        m = _mod()
+        refs = self._mixed_attribution_refs()
+        items = m.successor_pointer_items(refs, {UUID_B: True})
+        plain = [ref for ref in refs if ref.source_id == 'rec-plain']
+        assert _item_keys(items) == _item_keys(m.successor_pointer_items(plain, {}))
+        assert [item.passed for item in items] == [False]
+
+    def test_the_exclusion_is_by_attribution_not_by_resolution(self):
+        """A by-design edge can never newly break or be fixed: nothing to grade."""
+        m = _mod()
+        refs = m.pointer_targets(_record(
+            'rec-canonical', 'canonical words', supersedes=UUID_B, canonical=True,
+        ))
+        assert m.successor_pointer_items(refs, {UUID_B: True}) == []
+
+    def test_the_excluded_edges_are_named_in_ref_order(self):
+        m = _mod()
+        refs = self._mixed_attribution_refs()
+        excluded = m.by_design_successor_refs(refs)
+        assert [(ref.source_id, ref.key, ref.target) for ref in excluded] == [
+            ('rec-canonical', 'supersedes', UUID_A),
+            ('rec-canonical', 'supersedes', UUID_B),
+            ('rec-status', 'supersedes', UUID_A),
+        ]
+        # A canonical's corrects edge is never by design.
+        assert all(ref.key == 'supersedes' for ref in excluded)
+
+    def test_naming_the_excluded_edges_never_hashes_a_ref(self):
+        """The unhashable-ref hazard ``_is_unkeyable_successor`` records."""
+        m = _mod()
+        refs = [
+            *m.pointer_targets(_record(
+                'rec-canonical', 'canonical words', supersedes=[{'id': UUID_A}],
+                canonical=True,
+            )),
+            *m.pointer_targets(_record('rec-plain', 'plain words', supersedes=[{'id': UUID_B}])),
+        ]
+        assert [ref.source_id for ref in m.by_design_successor_refs(refs)] == ['rec-canonical']
+        items = m.successor_pointer_items(refs, {})
+        assert _item_keys(items) == _item_keys(m.successor_pointer_items(refs[1:], {}))
+
+    def test_a_fully_reaped_corpus_omits_the_tripwire_and_names_the_gap(self):
+        """Never read as a clean structural check: the schema rejects an empty
+        tripwire, and the absence is named."""
+        m = _mod()
+        refs = [
+            *m.pointer_targets(_record(
+                'rec-canonical', 'canonical words', supersedes=UUID_A, canonical=True,
+            )),
+            *m.pointer_targets(_record(
+                'rec-status', 'status words', supersedes=UUID_B,
+                kind='project_status_correction',
+            )),
+        ]
+        assert m.successor_pointer_items(refs, {UUID_B: True}) == []
+        series = m.build_series(**_inputs_over(refs, {UUID_B: True}))
+        assert m.METRIC_SUCCESSOR_POINTER_PRESENT not in _ids(series)
+        assert m.METRIC_SUCCESSOR_POINTER_PRESENT in m.metric_families_not_measured(series)
+
+    def test_the_surviving_item_keys_do_not_move(self):
+        """The keys are persisted in alpha's grandfather set, so by-design
+        edges beside an unattributed one must not move its key."""
+        m = _mod()
+        refs = self._mixed_attribution_refs()
+        unattributed = [ref for ref in refs if ref.reaped_by is None]
+        assert _item_keys(m.successor_pointer_items(refs, {})) == (
+            _item_keys(m.successor_pointer_items(unattributed, {}))
+        )
 
 
 class TestSupersededSurfacing:
@@ -676,6 +952,72 @@ def _full_inputs():
     }
 
 
+def _attributed_refs():
+    """One reaper-signed unresolved supersedes edge, one unattributed resolved
+    edge and one unattributed unresolved edge.
+
+    A SIBLING of :func:`_full_refs`, never a widening of it: that fixture's
+    single-citation, plain-record numbers are load-bearing for
+    ``TestBuildSeries``.
+    """
+    m = _mod()
+    return [
+        *m.pointer_targets(_record(
+            'rec-canonical', 'canonical words', supersedes=UUID_A, canonical=True, topic='t',
+        )),
+        *m.pointer_targets(_record('rec-1', 'successor one', supersedes=UUID_B)),
+        *m.pointer_targets(_record('rec-2', 'a correction', corrects=UUID_C)),
+    ]
+
+
+def _inputs_over(refs, resolution):
+    """:func:`_full_inputs`'s shape over *refs*, with the other families held fixed."""
+    m = _mod()
+    return {
+        'census': m.dangling_census(refs, resolution),
+        'tripwire_items': m.successor_pointer_items(refs, resolution),
+        'surfacing': m.superseded_surfacing([(UUID_A, UUID_B)], [UUID_B, UUID_A]),
+        'staleness': m.terminal_staleness(
+            [_record('rec-3', 'Task 4802 status=in-progress')], {'4802': 'done'},
+        ),
+        'corpus_counts': {},
+        'project_id': 'dark_factory',
+        'stamp': STAMP,
+        'refs': refs,
+    }
+
+
+def _attributed_inputs():
+    return _inputs_over(_attributed_refs(), {UUID_B: True, UUID_C: False})
+
+
+UUID_D = 'd4e5f607-3333-4c4d-8e5f-607182930415'
+
+
+def _four_cause_refs():
+    """Four supersedes edges, one per cause that can keep family (1) from a pair.
+
+    (i) by design, target live; (ii) by design, target gone; (iii)
+    unattributed, target gone; (iv) unattributed and unsearchable (blank
+    successor content), target gone. Resolve with :data:`FOUR_CAUSE_RESOLUTION`.
+    """
+    m = _mod()
+    return [
+        *m.pointer_targets(_record(
+            'rec-canon-live', 'canonical words', supersedes=UUID_A, canonical=True, topic='t',
+        )),
+        *m.pointer_targets(_record(
+            'rec-status-gone', 'status words', supersedes=UUID_B,
+            kind='project_status_correction',
+        )),
+        *m.pointer_targets(_record('rec-plain-gone', 'plain words', supersedes=UUID_C)),
+        *m.pointer_targets(_record('rec-blank', '', supersedes=UUID_D)),
+    ]
+
+
+FOUR_CAUSE_RESOLUTION = {UUID_A: True, UUID_B: False, UUID_C: False, UUID_D: False}
+
+
 def _ids(series) -> set[str]:
     return {metric.metric_id for metric in series.metrics}
 
@@ -699,16 +1041,20 @@ class TestBuildSeries:
         assert series.run_stamp == STAMP
         assert series.corpus.project_id == 'dark_factory'
 
-    def test_it_emits_exactly_the_four_metrics_this_leaf_owns(self):
+    def test_it_emits_exactly_the_five_metrics_this_leaf_owns(self):
+        """``_full_inputs`` has only plain records, so it carries unattributed
+        exposure and every family is present."""
         m = _mod()
         series = m.build_series(**_full_inputs())
         assert _ids(series) == set(m.pinned_metric_ids())
         assert _ids(series) == {
             'superseded-still-surfacing',
             'dangling-pointers',
+            'dangling-pointers-unattributed',
             'successor-pointer-present',
             'task-terminal-staleness',
         }
+        assert [x.metric_id for x in series.metrics] == list(m.pinned_metric_ids())
 
     def test_it_never_emits_beta_metrics(self):
         series = _mod().build_series(**_full_inputs())
@@ -721,13 +1067,19 @@ class TestBuildSeries:
         m = _mod()
         series = m.build_series(**_full_inputs())
         for metric_id in (
-            'superseded-still-surfacing', 'dangling-pointers', 'task-terminal-staleness',
+            'superseded-still-surfacing', 'dangling-pointers-unattributed',
+            'task-terminal-staleness',
         ):
             metric = _metric(series, metric_id)
             assert metric.kind == 'count'
             assert metric.direction == 'higher_is_worse'
             assert metric.denominator is None
             assert metric.items is None
+        total = _metric(series, 'dangling-pointers')
+        assert total.kind == 'scalar'
+        assert total.direction is None
+        assert total.denominator is None
+        assert total.items is None
         tripwire = _metric(series, 'successor-pointer-present')
         assert tripwire.kind == 'tripwire'
         assert tripwire.direction is None
@@ -747,6 +1099,12 @@ class TestBuildSeries:
         dangling = _metric(series, 'dangling-pointers')
         assert dangling.value == inputs['census'].unresolved
         assert dangling.n == inputs['census'].examined
+        # Every edge in the fixture is plain, so the alarmed count carries the
+        # same population as the total here.
+        unattributed = _metric(series, 'dangling-pointers-unattributed')
+        assert unattributed.value == inputs['census'].by_reaper[m.UNATTRIBUTED]['unresolved']
+        assert unattributed.n == inputs['census'].by_reaper[m.UNATTRIBUTED]['examined']
+        assert unattributed.n == inputs['census'].examined
         surfacing = _metric(series, 'superseded-still-surfacing')
         assert surfacing.value == inputs['surfacing'].still_surfacing
         assert surfacing.n == inputs['surfacing'].pairs_comparable
@@ -821,12 +1179,17 @@ class TestBuildSeries:
             'surfacing_queries_degraded',
             'surfacing_search_depth',
             'task_terminal_entry_task_pairs',
+            'successor_edges_by_design',
+            'surfacing_edges_predecessor_gone',
             'pointers_supersedes_examined',
             'pointers_supersedes_resolved',
             'pointers_supersedes_unresolved',
             'pointers_corrects_examined',
             'pointers_corrects_resolved',
             'pointers_corrects_unresolved',
+            'pointers_by_reaper_unattributed_examined',
+            'pointers_by_reaper_unattributed_resolved',
+            'pointers_by_reaper_unattributed_unresolved',
         }
 
         census = inputs['census']
@@ -845,9 +1208,18 @@ class TestBuildSeries:
         assert counts['surfacing_queries_degraded'] == len(inputs['surfacing'].degraded)
         assert counts['surfacing_search_depth'] == m.SURFACING_SEARCH_DEPTH
         assert counts['task_terminal_entry_task_pairs'] == len(inputs['staleness'].records)
+        assert counts['successor_edges_by_design'] == len(
+            m.by_design_successor_refs(_full_refs()),
+        )
+        assert counts['surfacing_edges_predecessor_gone'] == len(
+            m.predecessor_gone_supersedes_refs(census.unresolved_refs),
+        )
         for key, row in census.by_key.items():
             for field_name, value in row.items():
                 assert counts[f'pointers_{key}_{field_name}'] == value
+        for bucket, row in census.by_reaper.items():
+            for field_name, value in row.items():
+                assert counts[f'pointers_by_reaper_{bucket}_{field_name}'] == value
 
     def test_the_surfacing_search_depth_rides_in_the_artifact(self):
         """The retrieval depth SETS family 1's denominator, so it is a narrowing.
@@ -997,8 +1369,12 @@ class TestBuildSeries:
         m = _mod()
         inputs = _multi_cited_inputs()
         counts = m.build_series(**inputs).corpus.counts
+        # The per-KEY rows only: the per-reaper rows are a second cut of the
+        # same edges, and summing both would count every edge twice.
         examined = sum(
-            value for key, value in counts.items() if key.endswith('_examined')
+            counts[f'pointers_{key}_examined']
+            for key in m.POINTER_KEYS
+            if f'pointers_{key}_examined' in counts
         )
         assert examined == inputs['census'].examined
         assert counts['pointer_targets_unique_reads'] <= examined
@@ -1011,6 +1387,74 @@ class TestBuildSeries:
         with pytest.raises(ValueError, match='collides'):
             m.build_series(**inputs)
 
+    @pytest.mark.parametrize('key', [
+        'successor_edges_by_design',
+        'surfacing_edges_predecessor_gone',
+        'pointers_by_reaper_unattributed_examined',
+    ])
+    def test_the_collision_guard_covers_the_attribution_disclosures(self, key):
+        m = _mod()
+        inputs = _full_inputs()
+        inputs['corpus_counts'] = {key: 999}
+        with pytest.raises(ValueError, match='collides'):
+            m.build_series(**inputs)
+
+    def test_the_reaper_partition_rides_in_the_artifact_lazily(self):
+        m = _mod()
+        refs = _four_cause_refs()
+        counts = m.build_series(**_inputs_over(refs, FOUR_CAUSE_RESOLUTION)).corpus.counts
+        census = m.dangling_census(refs, FOUR_CAUSE_RESOLUTION)
+        reaper_rows = {key for key in counts if key.startswith('pointers_by_reaper_')}
+        assert reaper_rows == {
+            f'pointers_by_reaper_{bucket}_{field_name}'
+            for bucket in (m.REAPER_CONSOLIDATION, m.REAPER_STATUS_CORRECTION, m.UNATTRIBUTED)
+            for field_name in ('examined', 'resolved', 'unresolved')
+        }
+        assert counts['pointers_by_reaper_consolidation_unresolved'] == 0
+        assert counts['pointers_by_reaper_status_correction_unresolved'] == 1
+        assert counts['pointers_by_reaper_unattributed_examined'] == 2
+        # An absent bucket contributes no row: _full_inputs has no reaper at all.
+        full = m.build_series(**_full_inputs()).corpus.counts
+        assert not any(key.startswith('pointers_by_reaper_consolidation_') for key in full)
+        # Disjoint from the per-key rows: no pointer key is `by_reaper`.
+        assert 'by_reaper' not in m.POINTER_KEYS
+        per_key_rows = {
+            f'pointers_{key}_{field_name}'
+            for key in census.by_key
+            for field_name in ('examined', 'resolved', 'unresolved')
+        }
+        assert per_key_rows.isdisjoint(reaper_rows)
+
+    def test_the_reaper_partition_reconstructs_the_total(self):
+        """Nothing that was visible became invisible."""
+        m = _mod()
+        series = m.build_series(**_inputs_over(_four_cause_refs(), FOUR_CAUSE_RESOLUTION))
+        counts = series.corpus.counts
+        reaper_examined = sum(
+            value for key, value in counts.items()
+            if key.startswith('pointers_by_reaper_') and key.endswith('_examined')
+        )
+        assert reaper_examined == _metric(series, m.METRIC_DANGLING_POINTERS).n
+
+    def test_the_tripwire_and_family_1_narrowings_are_separate_causes(self):
+        """Three rows, three causes; none is a second name for another."""
+        m = _mod()
+        refs = _four_cause_refs()
+        counts = m.build_series(**_inputs_over(refs, FOUR_CAUSE_RESOLUTION)).corpus.counts
+        # (i) and (ii): excluded from the tripwire by attribution.
+        assert counts['successor_edges_by_design'] == 2
+        assert counts['successor_edges_by_design'] == len(m.by_design_successor_refs(refs))
+        # (ii) and (iii): searched, but the predecessor is gone, so the pair
+        # can never be comparable (PRD D12).
+        assert counts['surfacing_edges_predecessor_gone'] == 2
+        # (iv): never searched at all.
+        assert counts['surfacing_edges_unsearchable'] == 1
+
+    def test_the_attribution_narrowings_are_emitted_as_zero_when_none(self):
+        counts = _mod().build_series(**_full_inputs()).corpus.counts
+        assert counts['successor_edges_by_design'] == 0
+        assert counts['surfacing_edges_predecessor_gone'] == 0
+
     def test_the_series_round_trips_and_passes_the_real_validator(self):
         import json  # noqa: PLC0415
 
@@ -1021,6 +1465,100 @@ class TestBuildSeries:
         )
 
         series = _mod().build_series(**_full_inputs())
+        validate_metric_series(series)
+        assert parse_metric_series(json.loads(serialize_metric_series(series))) == series
+
+
+class TestDanglingMetricSplit:
+    """PRD D11: the total is recorded; only the unattributed population alarms.
+
+    At corpus scale 90 of 92 supersedes edges dangle by design (task 3211's
+    re-measure), so the total tracks reaping ACTIVITY. It keeps its id and its
+    population and becomes a scalar — recorded, trended, never alarmed — while
+    a new count over the edges no reaper deletes carries E4's alarm.
+    """
+
+    def test_the_new_metric_id_is_spelled_exactly(self):
+        m = _mod()
+        assert m.METRIC_DANGLING_POINTERS_UNATTRIBUTED == 'dangling-pointers-unattributed'
+        # alpha's scoped_grandfather_key separator must never appear in an id.
+        assert '::' not in m.METRIC_DANGLING_POINTERS_UNATTRIBUTED
+
+    def test_the_total_is_a_scalar_over_the_unchanged_population(self):
+        m = _mod()
+        inputs = _attributed_inputs()
+        total = _metric(m.build_series(**inputs), m.METRIC_DANGLING_POINTERS)
+        assert total.kind == 'scalar'
+        assert total.direction is None
+        assert total.value == inputs['census'].unresolved
+        assert total.n == inputs['census'].examined
+
+    def test_the_unattributed_count_is_the_alarmed_population(self):
+        m = _mod()
+        inputs = _attributed_inputs()
+        unattributed = _metric(
+            m.build_series(**inputs), m.METRIC_DANGLING_POINTERS_UNATTRIBUTED,
+        )
+        row = inputs['census'].by_reaper[m.UNATTRIBUTED]
+        assert unattributed.kind == 'count'
+        assert unattributed.direction == 'higher_is_worse'
+        assert unattributed.value == row['unresolved']
+        assert unattributed.n == row['examined']
+        assert unattributed.details_path == f'report-{STAMP}.txt'
+        # The fixture is not vacuous: the reaper-signed edge is in the total
+        # and out of the alarmed count.
+        assert unattributed.n < inputs['census'].examined
+
+    def test_a_fully_reaped_corpus_records_the_total_and_names_the_gap(self):
+        """The live 97.8% shape, taken to its limit.
+
+        Zero unattributed exposure means ABSENT, never a 0/0 datapoint (D1),
+        and the absence is named rather than left to read as health.
+        """
+        m = _mod()
+        refs = [
+            *m.pointer_targets(_record(
+                'rec-canonical', 'canonical words', supersedes=[UUID_A, UUID_B],
+                canonical=True, topic='t',
+            )),
+            *m.pointer_targets(_record(
+                'rec-status', 'status words', supersedes=UUID_C,
+                kind='project_status_correction',
+            )),
+        ]
+        series = m.build_series(**_inputs_over(refs, {}))
+        assert _metric(series, m.METRIC_DANGLING_POINTERS).value > 0
+        assert m.METRIC_DANGLING_POINTERS_UNATTRIBUTED not in _ids(series)
+        assert m.METRIC_DANGLING_POINTERS_UNATTRIBUTED in m.metric_families_not_measured(series)
+
+    def test_the_alarm_eligible_metric_count_does_not_move(self):
+        """alpha's own eligibility predicate (``evaluate_series``: ``kind != 'scalar'``).
+
+        The scalar replaces the count one-for-one, so the derived alpha — budget
+        over runs times alarmed metrics — is unmoved.
+        """
+        series = _mod().build_series(**_full_inputs())
+        assert len([x for x in series.metrics if x.kind != 'scalar']) == 4
+
+    def test_the_pinned_ids_carry_the_new_family_after_the_total(self):
+        assert _mod().pinned_metric_ids() == (
+            'superseded-still-surfacing',
+            'dangling-pointers',
+            'dangling-pointers-unattributed',
+            'successor-pointer-present',
+            'task-terminal-staleness',
+        )
+
+    def test_the_split_series_passes_the_real_validator_and_round_trips(self):
+        import json  # noqa: PLC0415
+
+        from shared.memory_eval_metrics import (  # noqa: PLC0415
+            parse_metric_series,
+            serialize_metric_series,
+            validate_metric_series,
+        )
+
+        series = _mod().build_series(**_attributed_inputs())
         validate_metric_series(series)
         assert parse_metric_series(json.loads(serialize_metric_series(series))) == series
 
@@ -1131,6 +1669,41 @@ class TestFetchPointerRecords:
                 source_content='the successor text',
             ),
         ]
+
+    async def test_reaper_signatures_survive_the_fetch_from_the_raw_payload(self):
+        """The RAW scroll payload keeps ``agent_id`` at top level; mem0's
+        processed ``get`` shape promotes it out of ``metadata``
+        (``fused_memory/backends/mem0_client.py``, ``promoted_payload_keys``).
+        A fetch switched to that shape would silently turn every legacy
+        fold's edges into alarms."""
+        m = _mod()
+        raw = [
+            _raw_point('m-legacy-fold', {
+                'data': 'legacy fold', 'agent_id': 'recon-stage-memory_consolidator',
+                'supersedes': [UUID_A],
+            }),
+            _raw_point('m-canonical', {
+                'data': 'canonical', 'canonical': True, 'topic': 't', 'supersedes': [UUID_B],
+            }),
+            _raw_point('m-status', {
+                'data': 'status', 'kind': 'project_status_correction', 'supersedes': UUID_C,
+            }),
+        ]
+        memory = _mock_memory(scroll_return=raw)
+
+        records, _stats = await m.fetch_pointer_records(
+            memory, 'dark_factory', categories=('procedural_knowledge',), scan_limit=10,
+        )
+
+        attribution = {
+            ref.source_id: ref.reaped_by
+            for record in records for ref in m.pointer_targets(record)
+        }
+        assert attribution == {
+            'm-legacy-fold': m.REAPER_CONSOLIDATION,
+            'm-canonical': m.REAPER_CONSOLIDATION,
+            'm-status': m.REAPER_STATUS_CORRECTION,
+        }
 
     async def test_a_firing_cap_is_disclosed_per_category(self):
         m = _mod()
@@ -2067,10 +2640,13 @@ class TestArtifactEmission:
         series = load_metric_series(metrics_path)
         assert series.eval_id == 'e4-staleness-sweep'
         assert series.run_stamp == STAMP
-        # Every family measurable from this seeded corpus is measured.
+        # Every family measurable from this seeded corpus is measured. The
+        # seeded records carry no reaper signature, so the unattributed count
+        # has exposure too.
         assert _ids(series) == {
             'superseded-still-surfacing',
             'dangling-pointers',
+            'dangling-pointers-unattributed',
             'successor-pointer-present',
             'task-terminal-staleness',
         }
@@ -2550,6 +3126,138 @@ class TestReport:
         # A bare count tells an operator that something dangles but not which
         # pointer to go and look at.
         assert UUID_C in sections['dangling_pointers'].text
+
+
+def _gone_target(index: int) -> str:
+    """A distinct well-formed memory id that no resolution map carries."""
+    return f'00000000-0000-4000-8000-{index:012d}'
+
+
+def _canonical_refs(count: int, *, prefix: str = 'rec-reaped') -> list:
+    """*count* consolidation canonicals, each superseding its own gone target."""
+    m = _mod()
+    return [
+        ref
+        for index in range(count)
+        for ref in m.pointer_targets(_record(
+            f'{prefix}-{index:03d}', f'canonical words {index}',
+            supersedes=_gone_target(index), canonical=True, topic='t',
+        ))
+    ]
+
+
+def _report_over(refs, resolution, *, surfacing=None):
+    """``build_series`` and the PURE ``sweep_report_sections`` over one input set."""
+    m = _mod()
+    inputs = _inputs_over(refs, resolution)
+    if surfacing is not None:
+        inputs['surfacing'] = surfacing
+    series = m.build_series(**inputs)
+    sections = m.sweep_report_sections(
+        series,
+        census=inputs['census'],
+        tripwire_items=inputs['tripwire_items'],
+        surfacing=inputs['surfacing'],
+        staleness=inputs['staleness'],
+        scan_stats={'procedural_knowledge': {'scanned': 3, 'truncated': 0}},
+        terminal_join=m.TerminalTaskJoin(statuses={}),
+        refs=refs,
+    )
+    return series, {section.key: section for section in sections}
+
+
+def _lines_carrying_number(text: str, number: int) -> list[str]:
+    """The lines of *text* on which *number* stands as a token of its own.
+
+    A token, not a substring: every memory id is full of digits, so a bare
+    ``str(number) in text`` would pass on an id and prove nothing.
+    """
+    return [
+        line for line in text.splitlines()
+        if str(number) in (token.strip(':(),;') for token in line.split())
+    ]
+
+
+class TestAttributionInReport:
+    """The human report cannot bury real damage under by-design noise (PRD D11).
+
+    At corpus scale nearly every unresolved pointer is a reaped supersedes
+    target, so a report that named unresolved edges in scan order would spend
+    its whole ``MAX_NAMED_PER_SECTION`` budget on deliberate deletions and
+    elide the one edge an operator actually has to fix. Keyed on section keys,
+    ids and constants, never on English wording.
+    """
+
+    def test_an_unattributed_edge_is_named_ahead_of_by_design_ones(self):
+        m = _mod()
+        refs = [
+            *_canonical_refs(m.MAX_NAMED_PER_SECTION + 5),
+            *m.pointer_targets(_record('rec-real-damage', 'plain words', supersedes=UUID_C)),
+        ]
+        _, sections = _report_over(refs, {})
+        assert 'rec-real-damage' in sections['dangling_pointers'].text
+
+    def test_every_attribution_bucket_is_named_in_the_census_section(self):
+        m = _mod()
+        refs = _four_cause_refs()
+        census = m.dangling_census(refs, FOUR_CAUSE_RESOLUTION)
+        _, sections = _report_over(refs, FOUR_CAUSE_RESOLUTION)
+        assert set(census.by_reaper) == {
+            m.REAPER_CONSOLIDATION, m.REAPER_STATUS_CORRECTION, m.UNATTRIBUTED,
+        }
+        for bucket in census.by_reaper:
+            assert bucket in sections['dangling_pointers'].text
+
+    def test_a_fully_reaped_corpus_names_both_gaps(self):
+        """Absence is a named gap, never a clean result."""
+        m = _mod()
+        refs = [
+            *_canonical_refs(2),
+            *m.pointer_targets(_record(
+                'rec-status', 'status words', supersedes=UUID_C,
+                kind='project_status_correction',
+            )),
+        ]
+        series, sections = _report_over(refs, {})
+        assert not any(ref.reaped_by is None for ref in refs)
+        assert m.METRIC_DANGLING_POINTERS_UNATTRIBUTED not in _ids(series)
+        not_measured = sections['not_measured'].text
+        assert m.METRIC_DANGLING_POINTERS_UNATTRIBUTED in not_measured
+        assert m.METRIC_SUCCESSOR_POINTER_PRESENT in not_measured
+
+    def test_the_predecessor_gone_count_sits_beside_family_1s_denominator(self):
+        """PRD D12: a small ``pairs_comparable`` must carry its stated cause.
+
+        Seven searched supersedes edges whose predecessor is gone, against four
+        comparable pairs and the default depth of ten — so seven is a number
+        no other line of the section can be carrying.
+        """
+        m = _mod()
+        refs = [
+            *_canonical_refs(5),
+            *m.pointer_targets(_record('rec-plain-1', 'plain one', supersedes=UUID_A)),
+            *m.pointer_targets(_record('rec-plain-2', 'plain two', supersedes=UUID_B)),
+        ]
+        surfacing = m.SurfacingObservation(
+            pairs_comparable=4, still_surfacing=0, records=(), inversions=(),
+        )
+        series, sections = _report_over(refs, {}, surfacing=surfacing)
+        gone = series.corpus.counts['surfacing_edges_predecessor_gone']
+        assert gone == 7
+        text = sections['superseded_surfacing'].text
+        assert len(_lines_carrying_number(text, gone)) == 1
+        assert _lines_carrying_number(text, surfacing.pairs_comparable)
+
+    def test_the_tripwire_section_counts_the_edges_it_excludes_by_design(self):
+        m = _mod()
+        refs = [
+            *_canonical_refs(6),
+            *m.pointer_targets(_record('rec-plain', 'plain words', supersedes=UUID_C)),
+        ]
+        series, sections = _report_over(refs, {})
+        by_design = series.corpus.counts['successor_edges_by_design']
+        assert by_design == 6
+        assert len(_lines_carrying_number(sections['successor_pointer_tripwire'].text, by_design)) == 1
 
 
 # ---------------------------------------------------------------------------

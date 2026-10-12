@@ -1,7 +1,8 @@
 """The two wall-clock-aligned background samplers and the stores they own.
 
-The dashboard writes its own history: ``_burndown_loop`` snapshots task
-counts and ``_metrics_loop`` snapshots orchestrator/queue metrics, each on
+The dashboard writes its own history: ``_burndown_loop`` writes one value
+or gap row per project from the task snapshot unit, and ``_metrics_loop``
+snapshots orchestrator/queue metrics, each on
 a fixed interval aligned to the wall clock so samples from separate
 processes land on the same tick boundaries. Both own a writable WAL-mode
 SQLite store, downsample old rows on a slower cadence, and checkpoint
@@ -126,7 +127,13 @@ async def _burndown_loop(
     config: DashboardConfig,
     client: httpx.AsyncClient,
 ) -> None:
-    """Periodically snapshot task status counts into the burndown DB."""
+    """Each tick, write one value-or-gap row per discovered project.
+
+    Delegates to ``collect_snapshot``, which reads each project through
+    ``dashboard/src/dashboard/data/task_snapshot.py::acquire_snapshot`` — the
+    same cached unit ``/api/v2/dashboard/tasks`` serves — and never the whole
+    task tree.
+    """
     conn = store.connection
     try:
         await collect_snapshot(conn, config, client)

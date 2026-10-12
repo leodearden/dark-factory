@@ -618,6 +618,34 @@ def check_config(config_path: Path | None):
     sys.exit(1)
 
 
+def _hand_exit_to_fired_watchdog(
+    fired: threading.Event | None, thread: threading.Thread | None,
+) -> None:
+    """If the stdin watchdog has fired, block on it; it owns verify-merge's exit.
+
+    A fired watchdog has already tree-killed the build and is mid-way through
+    its own SIGTERM -> grace_secs sleep -> SIGKILL escalation (see
+    fire_watchdog_kill), so never print a (misleading) VerifyResult for a
+    build we just killed out from under ourselves. Block on the watchdog
+    thread instead of exiting immediately: a bare sys.exit(1) begins
+    interpreter shutdown right away, and since the watchdog thread is a
+    daemon thread, shutdown does not wait for it -- it can be torn down
+    mid-sleep, before the SIGKILL escalation that exists specifically to reap
+    start_new_session grandchildren (cargo/rustc) that survived SIGTERM.
+    Joining lets fire_watchdog_kill's own unconditional os._exit(1) be the
+    authoritative exit once the full escalation has run to completion.
+
+    The watchdog's SIGTERM routinely makes _run() RAISE rather than return
+    (e.g. it kills ``git worktree add``, rc=-15), so verify_merge calls this
+    from its ``finally``: every exit path must hand off, not just a return.
+    """
+    if fired is None or not fired.is_set():
+        return
+    if thread is not None:
+        thread.join()
+    sys.exit(1)
+
+
 @main.command('verify-merge')
 @click.option('--sha', required=True, help='Merge commit SHA to verify (must be present in the local repo)')
 @click.option('--spec', 'spec_json', required=True, help='MergeVerifySpec as a JSON string (from RemoteRunner dispatch)')
@@ -912,23 +940,7 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
         # Always remove the pgid file so cancel-verify knows this run is done.
         if pgf is not None:
             remove_pgid_file(pgf)
-
-    if watchdog_fired is not None and watchdog_fired.is_set():
-        # The watchdog already tree-killed the build and is mid-way through
-        # its own SIGTERM -> grace_secs sleep -> SIGKILL escalation (see
-        # fire_watchdog_kill) -- never print a (misleading) VerifyResult for
-        # a build we just killed out from under ourselves. Block on the
-        # watchdog thread itself here instead of exiting immediately: a bare
-        # sys.exit(1) begins interpreter shutdown right away, and since the
-        # watchdog thread is a daemon thread, shutdown does not wait for it --
-        # it can be torn down mid-sleep, before the SIGKILL escalation that
-        # exists specifically to reap start_new_session grandchildren
-        # (cargo/rustc) that survived SIGTERM. Joining lets
-        # fire_watchdog_kill's own unconditional os._exit(1) be the
-        # authoritative exit once the full escalation has run to completion.
-        if watchdog_thread is not None:
-            watchdog_thread.join()
-        sys.exit(1)  # pragma: no cover - fire_watchdog_kill os._exit()s first
+        _hand_exit_to_fired_watchdog(watchdog_fired, watchdog_thread)
 
     click.echo(result_to_json(result))
 
@@ -1722,7 +1734,8 @@ def _run_judge_cmd(max_rounds: int = 50, reset: bool = False):
     from orchestrator.evals.elo import JudgeState, TaskPool, load_state, save_state
     from orchestrator.evals.judge import run_elo_tournament
     from orchestrator.evals.report import build_report, format_markdown, save_report
-    from orchestrator.evals.runner import load_results, load_task
+    from orchestrator.evals.results import ResultStore
+    from orchestrator.evals.runner import load_task
     from orchestrator.evals.snapshots import get_diff_between_commits
 
     # Load or reset state
@@ -1734,7 +1747,7 @@ def _run_judge_cmd(max_rounds: int = 50, reset: bool = False):
         if state.per_task:
             click.echo(f'Resuming from existing state ({len(state.per_task)} tasks)')
 
-    results = load_results()
+    results = ResultStore.packaged().load_all()
     if not results:
         click.echo('No existing results found in evals/results/', err=True)
         sys.exit(1)
@@ -1841,9 +1854,10 @@ def _run_compare_cmd(
         compare_models,
         format_comparison_markdown,
     )
-    from orchestrator.evals.runner import load_results, load_task
+    from orchestrator.evals.results import ResultStore
+    from orchestrator.evals.runner import load_task
 
-    results = load_results()
+    results = ResultStore.packaged().load_all()
     if not results:
         click.echo('No existing results found in evals/results/', err=True)
         sys.exit(1)
@@ -1933,12 +1947,13 @@ def _run_plan_only(task_path: Path | None, base_config):
         sys.exit(1)
 
     async def _run():
-        from orchestrator.agents.briefing import BriefingAssembler
         from orchestrator.agents.invoke import invoke_agent
         from orchestrator.agents.roles import ARCHITECT
         from orchestrator.artifacts import TaskArtifacts
-
-        briefing = BriefingAssembler(base_config)
+        from orchestrator.evals.replay_frame import (
+            REPLAY_FRAME_ID,
+            ReplayFramedBriefingAssembler,
+        )
 
         for tp in task_paths:
             task = load_task(tp)
@@ -1969,6 +1984,9 @@ def _run_plan_only(task_path: Path | None, base_config):
 
                 # Build architect prompt
                 task_def = task.get('task_definition', {})
+                briefing = ReplayFramedBriefingAssembler(
+                    base_config, base_commit=task['pre_task_commit'],
+                )
                 prompt = await briefing.build_architect_prompt(task_def, worktree=worktree)
 
                 # Invoke architect (opus-high, always Claude)
@@ -1997,6 +2015,7 @@ def _run_plan_only(task_path: Path | None, base_config):
 
                 # Save plan into task JSON
                 task['plan'] = plan
+                task['plan_replay_frame'] = REPLAY_FRAME_ID
                 with open(tp, 'w') as f:
                     json.dump(task, f, indent=2)
                     f.write('\n')

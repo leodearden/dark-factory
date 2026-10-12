@@ -28,16 +28,17 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from _merge_lane_fakes import FakeVerifier
+from _merge_lane_fakes import FakeVerifier, lane_scene_config, main_health_probe_spawned
 from _orch_helpers import MERGE_RESULT_TIMEOUT
 from test_merge_queue_concurrent_verify import (
+    _fake_verify_result,
     _gated_runner,
     _inject_two_host_allocator,
     _make_branch_with_file,
     _make_request,
 )
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import MergeLane
 
@@ -295,11 +296,7 @@ class TestPrefetchLookaheadAndAttachConservation:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True)
 
         gate_b_release = asyncio.Event()
         gate_b_entered = asyncio.Event()
@@ -307,7 +304,7 @@ class TestPrefetchLookaheadAndAttachConservation:
             gate_b_release, gate_b_entered, passed=True, name='pc-attach-laptop',
         )
 
-        config = OrchestratorConfig(project_root=git_ops.project_root, git=git_config)
+        config = lane_scene_config(git_ops.project_root, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/pc-attach-a', 'pc_attach_a.py', 'a = 1\n',
         )
@@ -374,17 +371,13 @@ class TestFallbackConservation:
         K = 2
 
         async def _passing_local(*args: Any, **kwargs: Any) -> MagicMock:
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True)
 
         gate_b_prerelease = asyncio.Event()
         gate_b_prerelease.set()
         fake_remote = _gated_runner(gate_b_prerelease, passed=True, name='pc-fallback-laptop')
 
-        config = OrchestratorConfig(project_root=git_ops.project_root, git=git_config)
+        config = lane_scene_config(git_ops.project_root, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/pc-fallback-a', 'pc_fallback_a.py', 'a = 1\n',
         )
@@ -453,17 +446,11 @@ class TestCascadeRemergeConservation:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
-                    passed=False, summary='tests failed', test_output='FAIL',
-                    lint_output='', type_output='', category='',
-                    timed_out=False, verify_skipped=False,
+                return _fake_verify_result(
+                    passed=False, summary='tests failed', test_output='FAIL', category='',
                 )
             # B's re-verify after the cascade remerges it: passes.
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True)
 
         gate_b_release = asyncio.Event()
         gate_b_entered = asyncio.Event()
@@ -471,7 +458,7 @@ class TestCascadeRemergeConservation:
             gate_b_release, gate_b_entered, passed=True, name='pc-cascade-laptop',
         )
 
-        config = OrchestratorConfig(project_root=git_ops.project_root, git=git_config)
+        config = lane_scene_config(git_ops.project_root, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/pc-cascade-a', 'pc_cascade_a.py', 'a = 1\n',
         )
@@ -514,6 +501,7 @@ class TestCascadeRemergeConservation:
         outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
 
         assert outcome_a.status != 'done', f'A must NOT land; got {outcome_a!r}'
+        assert not main_health_probe_spawned(outcome_a), outcome_a.reason
         assert outcome_b.status == 'done', (
             f'B must land after cascade + remerge + re-verify; got {outcome_b!r}'
         )
@@ -555,17 +543,13 @@ class TestShutdownRetainedPermitConservation:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True)
 
         gate_b_prerelease = asyncio.Event()
         gate_b_prerelease.set()
         fake_remote = _gated_runner(gate_b_prerelease, passed=True, name='pc-shutdown-laptop')
 
-        config = OrchestratorConfig(project_root=git_ops.project_root, git=git_config)
+        config = lane_scene_config(git_ops.project_root, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/pc-shutdown-a', 'pc_shutdown_a.py', 'a = 1\n',
         )
@@ -638,11 +622,7 @@ class TestLedgerLiveEmptiesAfterTransferRelease:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True)
 
         gate_b_release = asyncio.Event()
         gate_b_entered = asyncio.Event()
@@ -650,7 +630,7 @@ class TestLedgerLiveEmptiesAfterTransferRelease:
             gate_b_release, gate_b_entered, passed=True, name='pc-live-empties-laptop',
         )
 
-        config = OrchestratorConfig(project_root=git_ops.project_root, git=git_config)
+        config = lane_scene_config(git_ops.project_root, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/pc-live-a', 'pc_live_a.py', 'a = 1\n',
         )
@@ -770,13 +750,9 @@ class TestEarlyContinueTerminalTransferClearsSpecBase:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True)
 
-        config = OrchestratorConfig(project_root=git_ops.project_root, git=git_config)
+        config = lane_scene_config(git_ops.project_root, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/pc-term-a', 'pc_term_a.py', 'a = 1\n',
         )

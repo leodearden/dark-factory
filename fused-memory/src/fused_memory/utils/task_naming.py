@@ -146,8 +146,9 @@ def group_task_node_families(nodes: Iterable[_NodeT]) -> dict[Referent, list[_No
     Order is preserved twice over, and the second one is load-bearing rather
     than incidental: families appear in first-seen order, and WITHIN a family
     the nodes keep their input order, so the backend's survivor-first ordering
-    (most valid edges, then oldest, then uuid) reaches the normalizer intact
-    and ``members[0]`` is still the merge survivor.
+    (highest provenance_rank — valid RELATES_TO plus Episodic MENTIONS — then
+    oldest, then uuid) reaches the normalizer intact and ``members[0]`` is still
+    the merge survivor.
 
     A node with a missing, empty or non-task ``'name'`` is skipped rather than
     raising: this runs on a best-effort post-commit path where one malformed

@@ -15,6 +15,7 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
@@ -490,20 +491,9 @@ class TestWarmLanePoolCensusClassification:
 # ===========================================================================
 
 
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def wl_git_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    repo = seed_repo(tmp_path / 'repo')
     # Task 2061: pre-create the DEFAULT derived warm-lane base
     # (<repo>/.worktrees/_merge-verify/target, non-empty) so the
     # acquire_warm_lane pre-acquire base-health gate sees WarmBaseHealth.OK
@@ -5290,7 +5280,7 @@ class TestAcquireSpecLaneReseedTrashHardening:
          → git reset --hard + git clean -xfd [-e ...] runs here
 
     A no-op scripts/seed-warm-lane.sh must be committed to wl_git_repo before
-    the first acquire so _seed_warm_lane(lane, '--reset-in-place') returns 0.
+    the first acquire so _seed_warm_lane(lane, '--fresh-checkout') returns 0.
     """
 
     async def test_acquire_spec_lane_excludes_reseed_trash(self, wl_git_repo: Path):

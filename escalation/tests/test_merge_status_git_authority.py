@@ -8,7 +8,7 @@ Isolated from test_server.py because:
 
 Shared patterns from the existing test suite:
 - Cross-package import guard (mirrors test_server.py lines 30-54)
-- _call_merge_status helper (mirrors test_server.py line 2825)
+- call_merge_status / call_merge_request from _merge_tool_calls
 - _stub_git_ops: returns SimpleNamespace with AsyncMock methods for unit tests
 - Real-git fixtures (git_repo/_init_repo/orch_config/git_ops) modeled on
   test_workflow_status_on_resume.py:47-80 and test_git_ops.py
@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock
 from unittest.mock import call as mock_call
 
 import pytest
+from _merge_tool_calls import call_merge_request, call_merge_status
 
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -48,27 +49,6 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-async def _call_merge_status(server, **kwargs) -> dict:
-    """Invoke the merge_status MCP tool (async tool)."""
-    tool = await server.get_tool('merge_status')
-    return await tool.fn(**kwargs)
-
-
-async def _call_merge_request(server, **kwargs) -> dict:
-    """Invoke the merge_request MCP tool (async tool).
-
-    Mirrors ``_call_merge_status`` above, and
-    ``test_server_chokepoint.py::_call_merge_request``.  The ``server``
-    parameter is deliberately left untyped: ``get_tool`` is declared to
-    return ``Tool | None`` and ``Tool`` exposes no ``.fn``, so invoking a
-    precisely-typed server's tool trips pyright at every call site.  Funnelling
-    the invocation through one untyped-seam helper keeps that concession in a
-    single place instead of scattering per-call suppressions.
-    """
-    tool = await server.get_tool('merge_request')
-    return await tool.fn(**kwargs)
 
 
 def _stub_git_ops(**overrides) -> types.SimpleNamespace:
@@ -290,7 +270,7 @@ class TestMergeStatusGitAuthority:
         # NO event_store — durable tiers miss, so Tier-3.5 must fire
         server = create_server(esc_queue, harness=stub_harness, orch_config=config)
 
-        result = await _call_merge_status(server, task_id='123')
+        result = await call_merge_status(server, task_id='123')
 
         assert result.get('state') == 'done', f'Expected state=done, got: {result}'
         assert result.get('kind') == 'found_on_main', f'Expected kind=found_on_main, got: {result}'
@@ -339,7 +319,7 @@ class TestMergeStatusGitAuthority:
         config = _make_config(tmp_path)
         server = create_server(esc_queue, harness=stub_harness, orch_config=config)
 
-        result = await _call_merge_status(server, task_id='456')
+        result = await call_merge_status(server, task_id='456')
 
         assert result.get('state') == 'done', f'Expected state=done, got: {result}'
         assert result.get('kind') == 'found_on_main', f'Expected kind=found_on_main, got: {result}'
@@ -376,7 +356,7 @@ class TestMergeStatusGitAuthority:
         stub_git = _stub_git_ops(resolve_branch_sha=rsb)
         server = await self._make_server_with_git_ops(tmp_path, stub_git)
 
-        result = await _call_merge_status(server, task_id='T')
+        result = await call_merge_status(server, task_id='T')
 
         assert result.get('state') == 'unknown', f'Expected unknown, got: {result}'
         assert 'hint' in result, f'Expected hint key in unknown response: {result}'
@@ -391,7 +371,7 @@ class TestMergeStatusGitAuthority:
         stub_git = _stub_git_ops(resolve_branch_sha=rsb, is_ancestor=ia)
         server = await self._make_server_with_git_ops(tmp_path, stub_git)
 
-        result = await _call_merge_status(server, task_id='T')
+        result = await call_merge_status(server, task_id='T')
 
         assert result.get('state') == 'unknown', f'Expected unknown, got: {result}'
         assert 'hint' in result, f'Expected hint key in unknown response: {result}'
@@ -412,7 +392,7 @@ class TestMergeStatusGitAuthority:
                                   find_merge_marker=fmm)
         server = await self._make_server_with_git_ops(tmp_path, stub_git)
 
-        result = await _call_merge_status(server, task_id='T-pending')
+        result = await call_merge_status(server, task_id='T-pending')
 
         assert result.get('state') == 'unknown', (
             f'Branch not on main must stay unknown, got: {result}'
@@ -437,7 +417,7 @@ class TestMergeStatusGitAuthority:
         # No orch_config passed — Tier-3.5 must be skipped
         server = create_server(esc_queue, harness=stub_harness)
 
-        result = await _call_merge_status(server, task_id='T-noconfig')
+        result = await call_merge_status(server, task_id='T-noconfig')
 
         assert result.get('state') == 'unknown', (
             f'No orch_config must yield unknown, got: {result}'
@@ -461,7 +441,7 @@ class TestMergeStatusGitAuthority:
         )
         server = create_server(esc_queue, harness=stub_harness, orch_config=config)
 
-        result = await _call_merge_status(server, task_id='T-nogit')
+        result = await call_merge_status(server, task_id='T-nogit')
 
         assert result.get('state') == 'unknown', (
             f'No git_ops must yield unknown, got: {result}'
@@ -493,7 +473,7 @@ class TestMergeStatusGitAuthority:
         )
         server = await self._make_server_with_git_ops(tmp_path, stub_git)
 
-        result = await _call_merge_status(server, task_id='same-as-main')
+        result = await call_merge_status(server, task_id='same-as-main')
 
         assert result.get('state') == 'unknown', (
             f'Branch at main HEAD must return unknown (not false-positive done): {result}'
@@ -536,7 +516,7 @@ class TestMergeStatusGitAuthority:
             esc_queue, harness=stub_harness, orch_config=_make_config(tmp_path),
         )
 
-        result = await _call_merge_status(server, task_id='3024')
+        result = await call_merge_status(server, task_id='3024')
 
         assert result.get('state') == 'unknown', (
             f'Degenerate branch must NOT resolve as done, got: {result}'
@@ -577,7 +557,7 @@ class TestMergeStatusGitAuthority:
             esc_queue, harness=stub_harness, orch_config=_make_config(tmp_path),
         )
 
-        result = await _call_merge_status(server, task_id='5493')
+        result = await call_merge_status(server, task_id='5493')
 
         assert result.get('state') == 'unknown', (
             f'Degenerate branch must stay unknown even with a citation on '
@@ -609,7 +589,7 @@ class TestMergeStatusGitAuthority:
             esc_queue, harness=stub_harness, orch_config=_make_config(tmp_path),
         )
 
-        result = await _call_merge_status(server, branch='task/3024')
+        result = await call_merge_status(server, branch='task/3024')
 
         assert result.get('state') == 'unknown', (
             f'Degenerate branch via branch= form must be unknown, got: {result}'
@@ -673,7 +653,7 @@ class TestMergeStatusGitAuthority:
             metadata={'branch_base_sha': 'b' * 40},   # != tip → non-degenerate
         )
 
-        result = await _call_merge_status(server, task_id='3031')
+        result = await call_merge_status(server, task_id='3031')
 
         assert result.get('state') == 'unknown', (
             f'Uncited ancestor branch must be unknown, got: {result}'
@@ -697,7 +677,7 @@ class TestMergeStatusGitAuthority:
             metadata={'branch_base_sha': 'b' * 40},
         )
 
-        result = await _call_merge_status(server, task_id='900')
+        result = await call_merge_status(server, task_id='900')
 
         assert result.get('state') == 'done', f'Expected done, got: {result}'
         assert result.get('kind') == 'found_on_main', f'Expected found_on_main: {result}'
@@ -715,7 +695,7 @@ class TestMergeStatusGitAuthority:
             metadata={'branch_base_sha': 'b' * 40},
         )
 
-        result = await _call_merge_status(server, task_id='901')
+        result = await call_merge_status(server, task_id='901')
 
         assert result.get('state') == 'unknown', (
             f'A citation whose effect is absent at main HEAD must be unknown, '
@@ -730,7 +710,7 @@ class TestMergeStatusGitAuthority:
             tmp_path, '902', tip='a' * 40, citation=None, metadata={},
         )
 
-        result = await _call_merge_status(server, task_id='902')
+        result = await call_merge_status(server, task_id='902')
 
         assert result.get('state') == 'unknown', (
             f'No branch_base_sha and no citation must be unknown, got: {result}'
@@ -751,7 +731,7 @@ class TestMergeStatusGitAuthority:
             metadata={},
         )
 
-        result = await _call_merge_status(server, task_id='903')
+        result = await call_merge_status(server, task_id='903')
 
         assert result.get('state') == 'done', f'Expected done, got: {result}'
         assert result.get('merge_sha') == citation, (
@@ -775,7 +755,7 @@ class TestMergeStatusGitAuthority:
             commit_citation_pattern='',
         )
 
-        result = await _call_merge_status(server, task_id='904')
+        result = await call_merge_status(server, task_id='904')
 
         assert result.get('state') == 'done', (
             f'Citation-disabled projects must keep pre-fix behaviour, got: {result}'
@@ -796,7 +776,7 @@ class TestMergeStatusGitAuthority:
             commit_citation_pattern=None,
         )
 
-        await _call_merge_status(server, task_id='905')
+        await call_merge_status(server, task_id='905')
 
         stub_git.find_task_citation_commit.assert_awaited_once_with(
             '905', pattern_template=None,
@@ -821,7 +801,7 @@ class TestMergeStatusGitAuthority:
             get_task_raises=True,
         )
 
-        result = await _call_merge_status(server, task_id='906')
+        result = await call_merge_status(server, task_id='906')
 
         assert isinstance(result, dict), 'merge_status must not raise'
         assert result.get('state') == expected_state, (
@@ -873,7 +853,7 @@ class TestMergeStatusGitAuthority:
             metadata={'branch_base_sha': 'b' * 40},
         )
 
-        result = await _call_merge_status(server, task_id='800')
+        result = await call_merge_status(server, task_id='800')
 
         assert result.get('state') == 'unknown', (
             f'A marker predating branch_base_sha must be unknown, got: {result}'
@@ -890,7 +870,7 @@ class TestMergeStatusGitAuthority:
             effect_present=True, metadata={'branch_base_sha': 'b' * 40},
         )
 
-        result = await _call_merge_status(server, task_id='801')
+        result = await call_merge_status(server, task_id='801')
 
         assert result.get('state') == 'done', f'Expected done, got: {result}'
         assert result.get('kind') == 'found_on_main', f'Expected found_on_main: {result}'
@@ -919,7 +899,7 @@ class TestMergeStatusGitAuthority:
             effect_present=True, metadata=metadata,
         )
 
-        result = await _call_merge_status(server, task_id='802')
+        result = await call_merge_status(server, task_id='802')
 
         assert result.get('state') == 'done', (
             f'An unusable branch_base_sha must skip the veto, got: {result}'
@@ -941,7 +921,7 @@ class TestMergeStatusGitAuthority:
             effect_present=False, metadata={'branch_base_sha': 'b' * 40},
         )
 
-        result = await _call_merge_status(server, task_id='803')
+        result = await call_merge_status(server, task_id='803')
 
         assert result.get('state') == 'unknown', (
             f'A marker whose effect is absent at main HEAD must be unknown, '
@@ -973,7 +953,7 @@ class TestMergeStatusGitAuthority:
             metadata={'branch_base_sha': 'b' * 40, 'delivered_checks': declared},
         )
 
-        await _call_merge_status(server, task_id='4498')
+        await call_merge_status(server, task_id='4498')
 
         assert len(calls) == 1, (
             f'Expected exactly one validate_landing_evidence call, got: {calls}'
@@ -1000,7 +980,7 @@ class TestMergeStatusGitAuthority:
             metadata=None,   # no .scheduler at all → metadata fetch yields {}
         )
 
-        await _call_merge_status(server, task_id='4499')
+        await call_merge_status(server, task_id='4499')
 
         assert len(calls) == 1, (
             f'Expected exactly one validate_landing_evidence call, got: {calls}'
@@ -1025,7 +1005,7 @@ class TestMergeStatusGitAuthority:
             metadata={'branch_base_sha': 'b' * 40, 'delivered_checks': declared},
         )
 
-        await _call_merge_status(server, task_id='4498')
+        await call_merge_status(server, task_id='4498')
 
         assert len(calls) == 1, (
             f'Expected exactly one validate_landing_evidence call, got: {calls}'
@@ -1049,7 +1029,7 @@ class TestMergeStatusGitAuthority:
             metadata=None,   # no .scheduler at all → metadata fetch yields {}
         )
 
-        await _call_merge_status(server, task_id='4499')
+        await call_merge_status(server, task_id='4499')
 
         assert len(calls) == 1, (
             f'Expected exactly one validate_landing_evidence call, got: {calls}'
@@ -1136,7 +1116,7 @@ class TestMergeStatusGitAuthorityIntegration:
         server = create_server(esc_queue, harness=stub_harness, orch_config=orch_config)
 
         # --- Step 5 & 6: call merge_status and assert ---
-        result = await _call_merge_status(server, task_id=tid)
+        result = await call_merge_status(server, task_id=tid)
 
         assert result.get('state') == 'done', (
             f'Expected done/found_on_main after 4352 shape, got: {result}'
@@ -1209,7 +1189,7 @@ class TestMergeStatusGitAuthorityIntegration:
             esc_queue, harness=stub_harness, orch_config=orch_config,
         )
 
-        result = await _call_merge_status(server, task_id=tid)
+        result = await call_merge_status(server, task_id=tid)
 
         assert result.get('state') == 'unknown', (
             f'A branch parked on an old main commit must return unknown, '
@@ -1286,7 +1266,7 @@ class TestMergeStatusGitAuthorityIntegration:
             esc_queue, harness=stub_harness, orch_config=orch_config,
         )
 
-        result = await _call_merge_status(server, task_id=tid)
+        result = await call_merge_status(server, task_id=tid)
 
         assert result.get('state') == 'unknown', (
             f'A re-seeded, uncited ancestor branch must return unknown, '
@@ -1360,7 +1340,7 @@ class TestMergeStatusGitAuthorityIntegration:
         server = create_server(esc_queue, harness=stub_harness, orch_config=orch_config)
 
         # --- Steps 6 & 7: call merge_status and assert merge_sha == merge_commit ---
-        result = await _call_merge_status(server, task_id=tid)
+        result = await call_merge_status(server, task_id=tid)
 
         assert result.get('state') == 'done', (
             f'Expected done/found_on_main for live branch on main, got: {result}'
@@ -1475,7 +1455,7 @@ class TestMergeStatusGitAuthorityIntegration:
         esc_queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(esc_queue, harness=stub_harness, orch_config=orch_config)
 
-        result = await _call_merge_status(server, task_id=tid)
+        result = await call_merge_status(server, task_id=tid)
 
         assert result.get('state') == 'done', (
             f'A landed-then-EXTENDED task must now read as done — the survival '
@@ -1544,7 +1524,7 @@ async def _run_merge_request_fast_path(
         harness=harness,
         merge_inflight_registry=InFlightMergeRegistry(),
     )
-    return await _call_merge_request(
+    return await call_merge_request(
         server,
         task_id=task_id, branch=branch,
         worktree=str(tmp_path / 'wt'), description='', wait_secs=5,

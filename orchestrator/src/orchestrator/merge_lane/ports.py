@@ -26,9 +26,8 @@ from escalation.models import Escalation
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps
-from orchestrator.merge_gates import PostMergePyrightResult
-from orchestrator.merge_lane.types import DiskGuardOutcome, EscalationRecord
-from orchestrator.merge_types import MergeRequest
+from orchestrator.merge_lane.gates import PostMergePyrightResult
+from orchestrator.merge_lane.types import DiskGuardOutcome, EscalationRecord, MergeRequest
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import VerifyResult
 
@@ -165,6 +164,17 @@ class EscalationPort(Protocol):
     def file(self, record: EscalationRecord) -> str | None:
         """File *record*; returns the escalation id, or ``None`` when nothing was filed."""
         ...
+
+
+class ContainmentPredicate(Protocol):
+    """Whether every commit of *head* is already in *upstream* by patch-id.
+
+    False whenever that cannot be established, so a guard that skips only on
+    True fails open into a merge. Production implementation:
+    ``orchestrator/src/orchestrator/merge_lane/landing_evidence.py::patch_content_contained``.
+    """
+
+    async def __call__(self, head: str, upstream: str, git_ops: GitOps, /) -> bool: ...
 
 
 @dataclasses.dataclass(frozen=True)

@@ -58,6 +58,7 @@ from datetime import UTC, datetime, timedelta
 import aiosqlite
 import pytest
 import pytest_asyncio
+from shared.async_sqlite_base import CheckpointResult
 
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -408,13 +409,13 @@ async def test_event_buffer_checkpoint_and_push_do_not_lock_each_other_out(event
 
 @pytest.mark.asyncio
 async def test_checkpoint_on_an_uninitialized_event_buffer_is_a_non_event():
-    """An EventBuffer that was never initialized reports (-1, -1, -1), not a raise.
+    """An EventBuffer that was never initialized answers the sentinel, not a raise.
 
     server/main.py's checkpoint cycle unpacks the result and logs raises
     separately, so turning this into an exception would report a checkpoint
     failure on every tick of a Taskmaster-disabled deployment.
     """
-    assert await EventBuffer().checkpoint() == (-1, -1, -1)
+    assert await EventBuffer().checkpoint() == CheckpointResult.unavailable()
 
 
 @pytest_asyncio.fixture
@@ -504,32 +505,25 @@ async def test_a_cancelled_write_does_not_discard_a_concurrent_one(ledger):
 
 
 @pytest.mark.asyncio
-async def test_the_post_close_checkpoint_contract_of_each_store(journal, event_buffer, ledger):
-    """Post-close, ``checkpoint()`` raises for two of the three stores, not the third.
+async def test_every_recon_store_answers_unavailable_after_close(journal, event_buffer, ledger):
+    """After ``close()``, each recon store's ``checkpoint()`` answers the sentinel.
 
-    ``server/main.py``'s checkpoint cycle runs on a timer against stores whose
-    shutdown it does not own, so a tick landing after ``close()`` is a real
-    production path rather than a hypothetical.  The three stores answer it
-    differently: EventBuffer short-circuits a missing connection to the
-    ``(-1, -1, -1)`` its callers already had, while the journal and the ledger
-    raise 'not initialized' from ``_require_access()``.
-
-    The split is deliberate — preserving each store's existing caller contract is
-    what kept ``server/main.py`` edit-free through this migration — but it is
-    exactly the kind of near-uniform invariant that drifts unwatched, and the
-    only other post-close coverage is the never-initialized EventBuffer above.
-    Pinned here so whoever unifies the two contracts (task 5562) changes it
-    deliberately and sees both halves at once.
+    ``server/main.py::_run_checkpoint_cycle`` runs on a timer against stores
+    whose shutdown it does not own, so a tick landing after ``close()`` is an
+    expected race, not a fault. Every fused-memory AtomicConnection store answers
+    it with ``CheckpointResult.unavailable()`` and never raises; these are the
+    three that share ``reconciliation.db``.
     """
     await journal.close()
     await event_buffer.close()
     await ledger.close()
 
-    assert await event_buffer.checkpoint() == (-1, -1, -1), (
-        'EventBuffer must keep answering the sentinel after close: the checkpoint '
-        'cycle unpacks the result and logs raises separately'
-    )
-    with pytest.raises(RuntimeError, match='not initialized'):
-        await journal.checkpoint()
-    with pytest.raises(RuntimeError, match='not initialized'):
-        await ledger.checkpoint()
+    for name, store in (
+        ('ReconciliationJournal', journal),
+        ('EventBuffer', event_buffer),
+        ('ReconLedgerStore', ledger),
+    ):
+        assert await store.checkpoint() == CheckpointResult.unavailable(), (
+            f'{name}.checkpoint() after close must answer the sentinel: the '
+            'checkpoint cycle does not own its shutdown'
+        )

@@ -14,6 +14,7 @@ always loses to an existing ``config.prices`` entry).
 import logging
 import os
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 from orchestrator.config import default_price_table
 
@@ -303,10 +304,6 @@ EVAL_CONFIGS = [
     EvalConfig('claude-opus-high', 'claude', 'opus', 'high'),
     EvalConfig('claude-opus-max', 'claude', 'opus', 'max'),
     EvalConfig('claude-sonnet-max', 'claude', 'sonnet', 'max'),
-    EvalConfig('codex-gpt54-xhigh', 'codex', 'gpt-5.4', 'xhigh'),
-    EvalConfig('codex-gpt54mini-xhigh', 'codex', 'gpt-5.4-mini', 'xhigh'),
-    EvalConfig('gemini-31-pro-high', 'gemini', 'gemini-3.1-pro-preview', 'high'),
-    EvalConfig('gemini-3-flash-high', 'gemini', 'gemini-3-flash-preview', 'high'),
     # Self-hosted vLLM backends (Task 453: spread into single canonical list)
     *VLLM_EVAL_CONFIGS,
 ]
@@ -606,15 +603,24 @@ def matrix_pairs(
 # to the one role under test (runner.py's run_eval / run_architect_eval), so
 # no runner.py change is needed here.
 
-# Official Anthropic-format base URLs (public; safe to commit). Z.AI/GLM and
-# DeepSeek match the literal already load-bearing in task 2460's
-# test_workflow_e2e.py / this PRD's reuse notes; MiniMax and Moonshot/Kimi are
-# this module's own best-effort literal (operator-adjustable, like the
-# GPU/quantization choices in VLLM_EVAL_CONFIGS above).
-GLM_BASE_URL = 'https://api.z.ai/api/anthropic'
+# Official Anthropic-format base URLs (public; safe to commit). DeepSeek
+# matches the literal already load-bearing in task 2460's test_workflow_e2e.py
+# / this PRD's reuse notes; MiniMax and Moonshot/Kimi are this module's own
+# best-effort literal (operator-adjustable, like the GPU/quantization choices
+# in VLLM_EVAL_CONFIGS above).
 DEEPSEEK_BASE_URL = 'https://api.deepseek.com/anthropic'
 MINIMAX_BASE_URL = 'https://api.minimax.io/anthropic'
 KIMI_BASE_URL = 'https://api.moonshot.ai/anthropic'
+
+# Z.ai GLM access is a GLM Coding Plan (Leo, 2026-09-11), and a Coding Plan key
+# answers ONLY on the Plan's two coding endpoints: GLM_BASE_URL, the Anthropic
+# protocol the claude-harness bundles drive, and ZAI_CODING_BASE_URL, the
+# OpenAI protocol asserted at startup by
+# orchestrator/src/orchestrator/evals/zai_probe.py::require_zai_coding_endpoint
+# and used by the ZCode arm (task 5399). The general /api/paas/v4 errors with
+# a Coding Plan key, so it is deliberately not a constant.
+GLM_BASE_URL = 'https://api.z.ai/api/anthropic'
+ZAI_CODING_BASE_URL = 'https://api.z.ai/api/coding/paas/v4'
 
 # Per-provider ANTHROPIC_AUTH_TOKEN source env var name. Never a secret
 # literal in source — the value itself is read from the operator's
@@ -627,8 +633,9 @@ KIMI_AUTH_TOKEN_ENV = 'MOONSHOT_API_KEY'
 # Provider model ids, used verbatim as the Claude Code ``model`` value AND
 # (see CANDIDATE_ENDPOINT_PRICES below) as the price-table key — the two MUST
 # stay in lockstep or resolve_cost_usd falls back to 'unpriced_proxy'.
-MINIMAX_MODEL = 'MiniMax-M2.5'
-GLM_MODEL = 'glm-5.2'
+MINIMAX_MODEL = 'MiniMax-M3'
+GLM_MODEL = 'glm-5.3'
+GLM_FLASH_MODEL = 'glm-5.3-flash'
 DEEPSEEK_MODEL = 'deepseek-v4'
 KIMI_MODEL = 'kimi-latest'
 
@@ -668,17 +675,18 @@ def _claude_endpoint_config(
 
 
 def claude_endpoint_candidates() -> list[EvalConfig]:
-    """Incumbents (native cloud Opus/Sonnet) + the four non-incumbent bundles.
+    """Incumbents (native cloud Opus/Sonnet) + the five non-incumbent bundles.
 
     Each non-incumbent bundle is a (harness, model) candidate — Claude Code
-    driving MiniMax M2.5 / GLM-5.2 / DeepSeek V4 / Kimi via their official
-    Anthropic-format endpoint (PRD C5). ADDITIVE to :func:`ofat_candidates`:
+    driving MiniMax M3 / GLM-5.3 / GLM-5.3-Flash / DeepSeek V4 / Kimi via
+    their official Anthropic-format endpoint (PRD C5). ADDITIVE to
+    :func:`ofat_candidates`:
     the non-incumbent bundles are NOT added there, since its implementer
     subset asserts every cloud incumbent carries no proxy ``env_overrides``
     (test_eval_driver_configs.py) — this is a separate, additive selector for
     Phase-4 candidate screening.
 
-    A function, not a module-level list: the four non-incumbent bundles are
+    A function, not a module-level list: the non-incumbent bundles are
     (re)built on every call via :func:`_claude_endpoint_config`, so each reads
     its provider's AUTH_TOKEN env var fresh rather than caching a stale/empty
     value from import time.
@@ -686,11 +694,15 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
     return [
         *_cloud_implementer_incumbents(),
         _claude_endpoint_config(
-            'minimax-m2.5-endpoint', MINIMAX_MODEL,
+            'minimax-m3-endpoint', MINIMAX_MODEL,
             base_url=MINIMAX_BASE_URL, auth_token_env=MINIMAX_AUTH_TOKEN_ENV,
         ),
         _claude_endpoint_config(
-            'glm-5.2-endpoint', GLM_MODEL,
+            'glm-5.3-endpoint', GLM_MODEL,
+            base_url=GLM_BASE_URL, auth_token_env=GLM_AUTH_TOKEN_ENV,
+        ),
+        _claude_endpoint_config(
+            'glm-5.3-flash-endpoint', GLM_FLASH_MODEL,
             base_url=GLM_BASE_URL, auth_token_env=GLM_AUTH_TOKEN_ENV,
         ),
         _claude_endpoint_config(
@@ -704,16 +716,43 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
     ]
 
 
-# Best-effort public list rates (USD per 1M tokens) as of filing —
-# operator-tunable; update alongside provider pricing changes. Keyed EXACTLY
+class CostBasis(StrEnum):
+    """How an arm is billed: the closed cost-basis vocabulary of live-shadow PRD decision 16."""
+
+    METERED = 'metered'
+    SUBSCRIPTION = 'subscription'
+
+
+@dataclass(frozen=True)
+class CandidateEndpointPrice:
+    """One candidate model's list rates (USD per 1M tokens) and how it is billed."""
+
+    input_per_1m: float
+    output_per_1m: float
+    cost_basis: CostBasis
+
+    @property
+    def imputed(self) -> bool:
+        """The dollar figure is a list price modelled onto a credit-metered arm,
+        not a measured cost."""
+        return self.cost_basis is CostBasis.SUBSCRIPTION
+
+
+# List rates from the 2026-09-10 live market check (task 5384). Keyed EXACTLY
 # by the *_MODEL constants above so collect_metrics (which keys cost on
 # config.models.implementer == EvalConfig.model) resolves cost_source ==
 # 'price_table' for a ν candidate rather than falling back to 'unpriced_proxy'.
-CANDIDATE_ENDPOINT_PRICES: dict[str, dict[str, float]] = {
-    MINIMAX_MODEL: {'input_per_1m': 0.30, 'output_per_1m': 1.20},
-    GLM_MODEL: {'input_per_1m': 0.60, 'output_per_1m': 2.20},
-    DEEPSEEK_MODEL: {'input_per_1m': 0.28, 'output_per_1m': 0.42},
-    KIMI_MODEL: {'input_per_1m': 0.60, 'output_per_1m': 2.50},
+# GLM access is a GLM Coding Plan, so both GLM rows are SUBSCRIPTION: imputed.
+CANDIDATE_ENDPOINT_PRICES: dict[str, CandidateEndpointPrice] = {
+    # MiniMax's NATIVE list price; resellers (OpenRouter: 0.23/0.96) are
+    # deliberately not used.
+    MINIMAX_MODEL: CandidateEndpointPrice(0.30, 1.20, CostBasis.METERED),
+    GLM_MODEL: CandidateEndpointPrice(1.40, 4.40, CostBasis.SUBSCRIPTION),
+    # LIST price. The 50% promo (0.075/0.25) expired 2026-09-09 24:00 UTC+8;
+    # aggregator pages still quote it.
+    GLM_FLASH_MODEL: CandidateEndpointPrice(0.15, 0.50, CostBasis.SUBSCRIPTION),
+    DEEPSEEK_MODEL: CandidateEndpointPrice(0.28, 0.42, CostBasis.METERED),
+    KIMI_MODEL: CandidateEndpointPrice(0.60, 2.50, CostBasis.METERED),
 }
 
 
@@ -727,32 +766,44 @@ def claude_endpoint_price_table() -> dict[str, dict[str, float]]:
     carries a proxied ``ANTHROPIC_BASE_URL``, so operators no longer need to
     seed it manually — an existing ``config.prices`` entry still wins on
     conflict, so a manual seed remains a valid override.
+
+    Rates only: this projection feeds ``PriceEntry``. The cost-basis tag is
+    carried by ``CANDIDATE_ENDPOINT_PRICES`` itself, not by this table.
     """
-    return {**default_price_table(), **CANDIDATE_ENDPOINT_PRICES}
+    return {
+        **default_price_table(),
+        **{
+            model: {'input_per_1m': p.input_per_1m, 'output_per_1m': p.output_per_1m}
+            for model, p in CANDIDATE_ENDPOINT_PRICES.items()
+        },
+    }
 
 
 # ===== Codex + pi candidate bundles (eval-revival ξ) =====
 #
-# Two additive Phase-4 candidates, resolved by name via get_config_by_name —
+# Additive Phase-4 candidates, resolved by name via get_config_by_name —
 # mirrors ν's claude_endpoint_candidates() pattern above: NOT injected into
 # EVAL_CONFIGS/ofat_candidates (opt-in candidates; injecting them would
 # dispatch an evaluate-only backend in every default `--matrix` run and
 # perturb the OFAT incumbent floor).
 #
-#   - codex + GPT-5.6 "Sol": Rust implementer, evaluate-only (RUST CAUTION,
-#     PRD decision 14 — Claude leads the only Rust-bearing public
-#     benchmarks and open-model Rust evidence is thin, so no architect-role
-#     variant and no production wiring).
+#   - codex: a three-arm price/capability ladder (Astra / Sol / Terra), effort
+#     held at 'xhigh' on every arm so only the model varies.
 #   - pi + Sonnet: harness-isolating control — same model+effort as the
 #     claude-sonnet-max incumbent, only the backend varies, isolating
 #     harness effect from model effect.
 
-# Operator-adjustable best-effort literal (the GPT-5.6 "Sol" snapshot
-# codename), matching this file's MINIMAX_MODEL/GPU-literal convention: the
-# exact codex `--model` string is environment-specific and unverifiable from
-# this repo, so tests assert against this named constant rather than a
-# brittle inline string.
-CODEX_RUST_MODEL = 'gpt-5.6'
+# Codex model ids from the 2026-09-10 live market check (task 5384); list
+# prices live in config.py::_DEFAULT_PRICES.
+#   - Astra needs Codex CLI 0.153.0 or newer; reasoning effort high/xhigh/max.
+#   - Sol is the Rust implementer, evaluate-only (RUST CAUTION, PRD decision
+#     14 — Claude leads the only Rust-bearing public benchmarks and open-model
+#     Rust evidence is thin, so no architect-role variant and no production
+#     wiring). Its rate is promotional through at least 2026-11-21.
+#   - Terra is the mid-price control.
+CODEX_ASTRA_MODEL = 'gpt-6-astra'
+CODEX_SOL_MODEL = 'gpt-5.6-sol'
+CODEX_TERRA_MODEL = 'gpt-5.6-terra'
 
 # Mirrors the claude-sonnet-max incumbent's model literal EXACTLY so the pi
 # vs claude delta attributes cleanly to harness effect rather than a model
@@ -763,14 +814,20 @@ PI_CONTROL_MODEL = 'sonnet'
 
 
 def codex_pi_candidates() -> list[EvalConfig]:
-    """The two ξ candidate bundles: codex Rust implementer + pi Sonnet control.
+    """The ξ candidate bundles: the three-arm codex slate + the pi Sonnet control.
 
     ADDITIVE, mirroring claude_endpoint_candidates() above: resolved by name
     via get_config_by_name, never added to EVAL_CONFIGS/ofat_candidates.
     """
     return [
         EvalConfig(
-            'codex-gpt5.6-sol', 'codex', CODEX_RUST_MODEL, 'xhigh', role='implementer',
+            'codex-gpt6-astra', 'codex', CODEX_ASTRA_MODEL, 'xhigh', role='implementer',
+        ),
+        EvalConfig(
+            'codex-gpt5.6-sol', 'codex', CODEX_SOL_MODEL, 'xhigh', role='implementer',
+        ),
+        EvalConfig(
+            'codex-gpt5.6-terra', 'codex', CODEX_TERRA_MODEL, 'xhigh', role='implementer',
         ),
         # effort 'max' matches the claude-sonnet-max incumbent exactly (and is
         # a valid _pi_thinking level) — model+effort held constant, backend

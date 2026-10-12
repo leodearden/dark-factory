@@ -20,6 +20,7 @@ from escalation.models import (
     LateResolution,
     TrainState,
     max_severity,
+    normalised_severity,
 )
 
 
@@ -41,6 +42,23 @@ class TestBornAtL2Severities:
     def test_constant_contains_exactly_critical_and_urgent(self):
         """BORN_AT_L2_SEVERITIES contains exactly {'critical', 'urgent'} — no extras."""
         assert frozenset({'critical', 'urgent'}) == BORN_AT_L2_SEVERITIES
+
+
+class TestNormalisedSeverity:
+    """The one severity normalisation every severity classifier compares against."""
+
+    @pytest.mark.parametrize(
+        ('raw', 'expected'),
+        [
+            ('info', 'info'),
+            (' Info ', 'info'),
+            ('BLOCKING', 'blocking'),
+            ('', ''),
+            (None, ''),
+        ],
+    )
+    def test_folds_case_whitespace_and_null(self, raw: str | None, expected: str):
+        assert normalised_severity(raw) == expected
 
 
 class TestEscalationLevelDefault:
@@ -602,7 +620,8 @@ class TestEscalationResolutionClass:
 
     def test_resolution_classes_contains_exactly_the_legal_values(self):
         """RESOLUTION_CLASSES contains exactly {'benign', 'actionable',
-        'moot-terminal-subject', 'stale-strand'} — no extras.
+        'moot-terminal-subject', 'stale-strand', 'addressed', 'observation-consumed',
+        'converted', 'status-info'} — no extras.
 
         'moot-terminal-subject' is the distinct, non-benign stamp the task-2724
         revalidation sweep writes.
@@ -613,9 +632,15 @@ class TestEscalationResolutionClass:
         ``>= strand_age_secs`` when the orchestrator restarted.  It EXTENDS the
         task-2724 vocabulary rather than forking a second scheme, so a 20h
         strand and a 90s restart artifact stop reading identically.
+
+        'addressed', 'observation-consumed', 'converted' and 'status-info' are
+        the info-L0 disposition classes of plans/info-l0-disposition-router-prd.md D14.
         """
         assert (
-            frozenset({'benign', 'actionable', 'moot-terminal-subject', 'stale-strand'})
+            frozenset({
+                'benign', 'actionable', 'moot-terminal-subject', 'stale-strand',
+                'addressed', 'observation-consumed', 'converted', 'status-info',
+            })
             == RESOLUTION_CLASSES
         )
         assert 'moot-terminal-subject' in RESOLUTION_CLASSES
@@ -1992,3 +2017,94 @@ class TestDeclaredPinMarker:
 
         assert not hasattr(restored, 'not_a_real_field')
         assert restored.pin_declared_by == []
+
+
+class TestEscalationProjectId:
+    """`project_id` — the SUBJECT project of a record on a cross-project queue (task 4951).
+
+    These tests pin the FIELD's storage/round-trip behaviour only; which
+    producers stamp it and how the reader prefers it are pinned at those
+    producers' and that reader's own tests.
+    """
+
+    def _make_base_esc(self, **overrides) -> Escalation:
+        return Escalation(
+            id='esc-4951-1',
+            task_id='4951',
+            agent_role='implementer',
+            severity='blocking',
+            category='risk_identified',
+            summary='test escalation for project_id',
+            **overrides,
+        )
+
+    # --- (a) default is None ---
+
+    def test_project_id_default_is_none(self):
+        """Escalation constructed without project_id has project_id=None (unstamped)."""
+        assert self._make_base_esc().project_id is None
+
+    # --- (b) round-trip to_dict / from_dict ---
+
+    def test_project_id_round_trip_via_to_dict_from_dict(self):
+        """project_id='dark_factory' is preserved through to_dict() / from_dict()."""
+        esc = self._make_base_esc(project_id='dark_factory')
+        restored = Escalation.from_dict(esc.to_dict())
+        assert restored.project_id == 'dark_factory'
+
+    # --- (c) round-trip to_json / from_json ---
+
+    def test_project_id_round_trip_via_to_json_from_json(self):
+        """project_id='reify' is preserved through to_json() / from_json().
+
+        A DIFFERENT value from the to_dict case above, so an implementation
+        hardcoding one constant cannot satisfy both round-trips.
+        """
+        esc = self._make_base_esc(project_id='reify')
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.project_id == 'reify'
+
+    # --- (d) appears in serialised JSON ---
+
+    def test_project_id_appears_in_to_json_output(self):
+        """project_id is serialised (not silently dropped) when set."""
+        esc = self._make_base_esc(project_id='autopilot_video')
+        payload = json.loads(esc.to_json())
+        assert 'project_id' in payload
+        assert payload['project_id'] == 'autopilot_video'
+
+    # --- (e) legacy JSON backward compat (zero-migration) ---
+
+    def test_from_json_legacy_json_omits_project_id(self):
+        """from_json() on JSON without the project_id key returns None — zero migration."""
+        old_dict = {
+            'id': 'esc-task-1-0001',
+            'task_id': 'task-1',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'legacy escalation without project_id',
+            'detail': '',
+            'suggested_action': '',
+            'timestamp': '2026-01-01T00:00:00+00:00',
+            'status': 'pending',
+            'resolution': None,
+            'worktree': None,
+            'workflow_state': None,
+            'level': 0,
+            'resolved_at': None,
+            'resolved_by': None,
+            'resolution_turns': None,
+            'dedupe_count': 0,
+            'dedupe_children': [],
+            'dedupe_fingerprint': None,
+            'members': [],
+            'root_cause': '',
+            'options': [],
+            'train_state': None,
+            # NOTE: project_id is intentionally absent
+        }
+        restored = Escalation.from_json(json.dumps(old_dict))
+        assert restored.project_id is None, (
+            f'Expected project_id=None for legacy JSON, got {restored.project_id!r}'
+        )

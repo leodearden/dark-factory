@@ -184,9 +184,10 @@ class TestTopicSlugNamespaceIsShared:
     copy fail mechanically rather than by review.
 
     The thing to watch for when editing ``derive_topic_slug`` is a *second
-    anchored slug validator*.  The fold itself legitimately needs a
-    character-class pattern to collapse runs of punctuation, so ``re`` is
-    not forbidden here — what must not appear is a local pattern that
+    anchored slug validator*.  The fold legitimately needs a character-class
+    pattern to collapse runs of punctuation — but since task 4878 that
+    pattern lives in ε beside the fold, and this script imports ``re`` for
+    nothing at all.  What must not appear here is a local pattern that
     decides whether a slug is VALID, because that is the copy free to
     drift from ε while every test still passes.  Validity is settled by
     calling ``is_valid_topic_slug``; the identity assertions below prove
@@ -198,6 +199,18 @@ class TestTopicSlugNamespaceIsShared:
 
     def test_cap_is_the_same_object(self):
         assert _mod.TOPIC_SLUG_MAX_LEN is topic_slug_module.TOPIC_SLUG_MAX_LEN
+
+    def test_fold_is_the_same_object(self):
+        """The fold moved to ε (task 4878); this script must IMPORT it.
+
+        ``scripts/normalize_topic_slugs.py`` folds the same way over the
+        whole corpus.  Two copies of a fold that decides what a record's
+        topic BECOMES is exactly the drift the identity pins above exist
+        to catch, so the fold gets the same treatment as the constants:
+        an inlined re-definition here fails by design rather than by
+        review.
+        """
+        assert _mod.derive_topic_slug is topic_slug_module.derive_topic_slug
 
 
 # ===========================================================================

@@ -150,6 +150,23 @@ def test_load_combine_targets_metadata_keys_are_a_tuple(make_tasks_db):
 # malformed shape is skipped, and the well-formed combine row alongside it
 # still comes back. Asserted row-by-row rather than as one loop so a
 # regression names the exact shape that broke.
+#
+# THE RAW-VALUE DECODE MATRIX (None / "" / malformed JSON / a JSON list / a
+# JSON scalar all degrading to {}) MOVED to
+# scripts/tests/test_task_db_scan.py's decode_metadata tests as of task 4782,
+# which promoted _decode_metadata into scripts/_task_db_scan.py as a shared
+# Tier 1 helper. What stays here is what is genuinely THIS function's own
+# behaviour: the curator_action filter applied AFTER decoding — plus exactly
+# ONE retained decode case, the NULL row, kept deliberately as the
+# sqlite-ROUNDTRIP canary.
+#
+# WHY THAT ONE STAYS. The moved matrix asserts decode_metadata against PYTHON
+# values, so nothing over there would catch a pre-decode access on the raw
+# COLUMN — a `metadata.strip()` or a length check growing inside
+# load_combine_targets — raising AttributeError on a real NULL row mid-sweep.
+# NULL is the most common metadata shape in the live store, being exactly what
+# the curator-combine wipe this script audits produces, so it is the one case
+# worth paying a sqlite roundtrip for.
 # ---------------------------------------------------------------------------
 
 # `make_tasks_db` defaults to the name 'tasks.db' inside a single tmp_path, so
@@ -172,26 +189,9 @@ def _survives_alongside(make_tasks_db, bad_metadata):
 
 
 def test_load_combine_targets_skips_null_metadata(make_tasks_db):
+    """The sqlite-roundtrip canary (see the matrix note above): a NULL column,
+    not a Python None handed straight to decode_metadata."""
     assert _survives_alongside(make_tasks_db, None) == {("master", 2)}
-
-
-def test_load_combine_targets_skips_empty_string_metadata(make_tasks_db):
-    assert _survives_alongside(make_tasks_db, "") == {("master", 2)}
-
-
-def test_load_combine_targets_skips_invalid_json_metadata(make_tasks_db):
-    assert _survives_alongside(make_tasks_db, "{not json at all") == {("master", 2)}
-
-
-def test_load_combine_targets_skips_json_list_metadata(make_tasks_db):
-    assert _survives_alongside(make_tasks_db, '["curator_action"]') == {("master", 2)}
-
-
-def test_load_combine_targets_skips_json_scalar_metadata(make_tasks_db):
-    """A bare JSON scalar decodes fine but is not a dict — skipped, not raised."""
-    assert _survives_alongside(make_tasks_db, '"combine"') == {("master", 2)}
-    assert _survives_alongside(make_tasks_db, "17") == {("master", 2)}
-    assert _survives_alongside(make_tasks_db, "null") == {("master", 2)}
 
 
 def test_load_combine_targets_skips_dict_without_curator_action(make_tasks_db):
@@ -470,6 +470,7 @@ def test_load_ticket_expectations_absent_db_returns_empty(tmp_path):
 
 _GREP_CHECK = {"kind": "grep", "pattern": "def foo", "paths": ["a.py"], "expect": "present"}
 _SCRIPT_CHECK = {"kind": "script", "script": "scripts/x.sh", "timeout_secs": 30}
+_PATH_CHECK = {"kind": "path", "expect": "present", "paths": ["orchestrator/tests/t.py"]}
 _MANUAL_CHECK = {"kind": "manual", "reason": "needs a human eye"}
 
 
@@ -514,15 +515,16 @@ def test_build_manifest_index_maps_task_id_to_expectation(tmp_path):
     assert expectation.delivered_check_names == ("cap-one",)
 
 
-def test_build_manifest_index_keeps_grep_AND_script_drops_only_manual(tmp_path):
-    """THE MECHANICAL-KINDS RULE, corrected against the real stamping site.
+def test_build_manifest_index_keeps_every_mechanical_kind_drops_only_manual(tmp_path):
+    """THE MECHANICAL-KINDS RULE, read off the schema rather than restated.
 
-    fused-memory/src/fused_memory/server/manifest_stamping.py:311 reads
-    `if check is None or check.kind not in ('grep', 'script'): continue` — so
-    BOTH grep and script are copied into metadata.delivered_checks and only
-    'manual' is dropped. A grep-only filter would silently under-count the
-    expected entries and yield FALSE NEGATIVES on exactly the highest-severity
-    class, so the rule is pinned here with all three kinds on one task.
+    ``manifest_stamping``'s copy filter admits every
+    ``DeliveredCheckMeta`` kind and drops only ``'manual'``, so this sweep
+    must count grep, script AND path capabilities as expected entries. A
+    narrower filter here would silently UNDER-COUNT and yield FALSE
+    NEGATIVES on exactly the severity class this script exists to detect —
+    a lost mark-done gate — which is why the rule is pinned with every kind
+    on one task.
     """
     _write_manifest(tmp_path, "plans/b-prd.capability-manifest.yaml", {
         "prd": "plans/b-prd.md",
@@ -530,6 +532,7 @@ def test_build_manifest_index_keeps_grep_AND_script_drops_only_manual(tmp_path):
         "tasks": [{"label": "ε", "task_id": 3319, "capabilities": [
             _capability("cap-grep", _GREP_CHECK),
             _capability("cap-script", _SCRIPT_CHECK),
+            _capability("cap-path", _PATH_CHECK),
             _capability("cap-manual", _MANUAL_CHECK),
             _capability("cap-no-check", None),
         ]}],
@@ -537,7 +540,28 @@ def test_build_manifest_index_keeps_grep_AND_script_drops_only_manual(tmp_path):
 
     names = build_manifest_index(str(tmp_path))["3319"].delivered_check_names
 
-    assert names == ("cap-grep", "cap-script")
+    assert names == ("cap-grep", "cap-script", "cap-path")
+
+
+def test_build_manifest_index_counts_a_path_only_capability(tmp_path):
+    """A capability gated SOLELY by a path check still contributes its name.
+
+    Isolating it from the mixed-kind case above: if the sweep only ever saw
+    'path' next to a grep it recognised, an off-by-one in the filter could
+    still leave a path-only task counted as having NO expected entries —
+    i.e. no gate to lose, the false negative in its purest form.
+    """
+    _write_manifest(tmp_path, "plans/p-prd.capability-manifest.yaml", {
+        "prd": "plans/p-prd.md",
+        "schema_version": 1,
+        "tasks": [{"label": "ζ", "task_id": 4743, "capabilities": [
+            _capability("cap-path-only", _PATH_CHECK),
+        ]}],
+    })
+
+    expectation = build_manifest_index(str(tmp_path))["4743"]
+
+    assert expectation.delivered_check_names == ("cap-path-only",)
 
 
 def test_build_manifest_index_globs_both_plans_and_docs_prds(tmp_path):

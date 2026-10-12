@@ -1039,7 +1039,7 @@ is **not** the same at the two sites:
 
 At the harness site the only degeneracy-specific backstop is the independent
 `_branch_is_degenerate(branch, metadata)` disjunct, and it is **fail-open**:
-`orchestrator/src/orchestrator/landing_evidence.py::branch_is_degenerate`
+`orchestrator/src/orchestrator/merge_lane/landing_evidence.py::branch_is_degenerate`
 returns `False` whenever `metadata['branch_base_sha']` is absent or is not a
 40-hex sha. The `validate_landing_evidence` call below it does not bound this
 error either — it checks that the candidate commit's effect survives at main

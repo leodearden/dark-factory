@@ -496,6 +496,15 @@ members of the pre-condition branch list.
    "tests": {...}}`. Decide in α.
 4. **Mutation ratchet.** Whether ε's report becomes a ratchet measure and at what
    granularity. Decide after ε lands, outside this batch.
+   [Ruled 2026-10-05 (Leo), after ε landed:
+   - **Granularity:** mutation measures exclude logger calls. The fence is an
+     anchored `do_not_mutate_patterns` in `[tool.mutmut]` (task 6374).
+   - **Measure unsampled where the run fits.**
+   - **Every measurement files tasks for its live-code survivors.** Task 6327 is
+     the standing owner of that filing for the post-split modules.
+
+   Rationale and numbers: `plans/merge-lane-quality-prd.mutation-baseline.md`.
+   Whether a ratchet exists at all is still open.]
 5. **`_merge_queue_harness.py`** (test helper): fold into `_merge_lane_fakes.py` or
    keep. Decide in β.
 6. **Order of θ–ξ** if a task's extraction turns out to need another's module first.

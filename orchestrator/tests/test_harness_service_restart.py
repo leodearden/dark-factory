@@ -18,6 +18,7 @@ Asserts:
 from __future__ import annotations
 
 import logging
+import shlex
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -29,6 +30,7 @@ from escalation.queue import EscalationQueue
 from orchestrator.harness import Harness
 from orchestrator.service_restart import (
     FLEET_DEPLOY_CLOCK_RELPATH,
+    FLEET_LEASE_RELPATH,
     StaleServiceRestartCoordinator,
 )
 
@@ -54,7 +56,7 @@ def harness(tmp_path: Path, mock_orch_config):
     mock_orch_config.fused_memory_restart_watch_prefixes = ['fused-memory/src/']
     mock_orch_config.fused_memory_restart_script = 'scripts/restart-fused-memory.sh'
     # Force-fire escape (task 2817). Mirrors the real Config default (15 min).
-    # Unlike dashboard (a leaf that fires promptly on the busy path and keeps
+    # Unlike dashboard (a leaf that fires while agents dispatch and keeps
     # the 0.0 default), the fused-memory builder now wires this in so a pending
     # restart still fires under chronic fleet saturation once its owed-age
     # crosses the bound — spec_set returns a real float (not a child MagicMock).
@@ -85,6 +87,11 @@ def harness(tmp_path: Path, mock_orch_config):
     # this (as merge_phase_grace_secs) — the fused-memory/dashboard builders
     # keep the 0.0 default (no hold, byte-identical behaviour).
     mock_orch_config.orchestrator_restart_merge_phase_grace_secs = 600.0
+    # In-flight fleet-redeploy lease max-age (task 4755). Mirrors the real
+    # Config default (2h). Only the orchestrator's own coordinator receives a
+    # lease_path at all — the fused-memory/dashboard builders pass neither, so
+    # their gate stays disabled and their behaviour byte-identical.
+    mock_orch_config.orchestrator_restart_lease_max_age_secs = 7200.0
 
     with patch('orchestrator.harness.McpLifecycle'), \
          patch('orchestrator.harness.Scheduler'), \
@@ -228,7 +235,7 @@ class TestStartMergeWorkerBuildsCoordinatorList:
         """_start_merge_worker populates _service_restart_coordinators with fused+dashboard+orchestrator."""
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker'), \
              patch('asyncio.create_task'), \
-             patch('orchestrator.merge_queue.check_merge_liveness_margin'):
+             patch('orchestrator.merge_lane.liveness.check_merge_liveness_margin'):
             await harness._start_merge_worker()
 
         assert isinstance(harness._service_restart_coordinators, list)
@@ -250,7 +257,7 @@ class TestStartMergeWorkerBuildsCoordinatorList:
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
              patch('asyncio.create_task') as mock_ct, \
              patch(
-                 'orchestrator.merge_queue.check_merge_liveness_margin',
+                 'orchestrator.merge_lane.liveness.check_merge_liveness_margin',
                  side_effect=RuntimeError('liveness boom'),
              ), \
              caplog.at_level(logging.WARNING):
@@ -420,7 +427,7 @@ class TestStartMergeWorkerOnMergeLandedWiring:
         """
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
              patch('asyncio.create_task'), \
-             patch('orchestrator.merge_queue.check_merge_liveness_margin'):
+             patch('orchestrator.merge_lane.liveness.check_merge_liveness_margin'):
             await harness._start_merge_worker()
 
         call_kwargs = mock_smw.call_args.kwargs
@@ -428,29 +435,26 @@ class TestStartMergeWorkerOnMergeLandedWiring:
 
 
 # ---------------------------------------------------------------------------
-# (g) Busy-branch no-double-fire: _maybe_restart_stale_service(agents_idle=False)
+# (g) Agents dispatching: _maybe_restart_stale_service(agents_idle=False)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-class TestMaybeRestartStaleServiceBusyPath:
-    """Verify busy-path (agents_idle=False) behavior with real coordinator instances.
+class TestMaybeRestartStaleServiceWhileAgentsDispatch:
+    """agents_idle=False behaviour with real coordinator instances.
 
-    The run() busy-wait branch calls _maybe_restart_stale_service(agents_idle=False)
-    on every tick.  These tests confirm:
+    The stale-service-restart service polls with agents_idle=False whenever a
+    slot or review task is live.  These tests confirm:
     - A dashboard coordinator (require_idle=False) fires exactly once after being
       armed; the second call is a no-op (pending was cleared on first fire).
-    - A fused-memory coordinator (require_idle=True) never fires on the busy path.
+    - A fused-memory coordinator (require_idle=True) never fires politely
+      while agents dispatch.
     """
 
-    async def test_dashboard_coordinator_fires_at_most_once_across_busy_ticks(
+    async def test_dashboard_coordinator_fires_at_most_once_across_polls(
         self, harness: Harness
     ):
-        """Calling _maybe_restart_stale_service(agents_idle=False) twice fires at most once.
-
-        This models two consecutive busy-wait ticks, confirming the no-double-fire
-        invariant documented in the busy-branch comment.
-        """
+        """Calling _maybe_restart_stale_service(agents_idle=False) twice fires at most once."""
         executor = AsyncMock()
         current_time: list[float] = [0.0]
 
@@ -471,27 +475,22 @@ class TestMaybeRestartStaleServiceBusyPath:
         await dashboard_coord.note_merge('task-leaf', 'base', 'head', prefetched_diff=['dashboard/src/app.py'])
         assert dashboard_coord.is_pending is True
 
-        # First busy tick: coordinator fires and clears pending
+        # First poll: coordinator fires and clears pending
         current_time[0] = 1.0
         first = await harness._maybe_restart_stale_service(agents_idle=False)
         assert first is True
         executor.assert_awaited_once()
         assert dashboard_coord.is_pending is False
 
-        # Second busy tick (consecutive): pending already cleared — must NOT double-fire
+        # Second poll: pending already cleared — must NOT double-fire
         second = await harness._maybe_restart_stale_service(agents_idle=False)
         assert second is False
         executor.assert_awaited_once()  # still exactly one call total
 
-    async def test_fused_memory_coordinator_never_fires_on_busy_path(
+    async def test_fused_memory_coordinator_never_fires_while_agents_dispatch(
         self, harness: Harness
     ):
-        """require_idle=True coordinator is a no-op when agents_idle=False.
-
-        Confirms that fused-memory stays reserved for the idle branch even when
-        _maybe_restart_stale_service is called with agents_idle=False on the
-        busy-wait path.
-        """
+        """require_idle=True coordinator is a no-op when agents_idle=False."""
         executor = AsyncMock()
         current_time: list[float] = [0.0]
 
@@ -504,42 +503,35 @@ class TestMaybeRestartStaleServiceBusyPath:
             restart_executor=executor,
             clock=lambda: current_time[0],
             service_name='fused-memory',
-            require_idle=True,  # idle-only — must not fire on busy path
+            require_idle=True,  # idle-only — must not fire while agents dispatch
         )
         harness._service_restart_coordinators = [fused_coord]
 
         await fused_coord.note_merge('task-1', 'base', 'head', prefetched_diff=['fused-memory/src/server.py'])
         assert fused_coord.is_pending is True
 
-        # Multiple busy ticks: fused-memory must never fire
+        # Several polls: fused-memory must never fire
         current_time[0] = 1.0
         for _ in range(3):
             result = await harness._maybe_restart_stale_service(agents_idle=False)
             assert result is False
 
         executor.assert_not_awaited()
-        assert fused_coord.is_pending is True  # still pending — waiting for the idle branch
+        assert fused_coord.is_pending is True  # still pending — waiting for agents_idle
 
     async def test_fused_memory_builder_coordinator_force_fires_under_saturation(
         self, harness: Harness
     ):
-        """The REAL builder's fused-memory coordinator force-fires on the busy
-        path once its owed-age crosses force_fire_after_secs (task 2817).
+        """The REAL builder's fused-memory coordinator force-fires with
+        agents_idle=False once its owed-age crosses force_fire_after_secs
+        (task 2817).
 
         Force-fire-enabled counterpart of
-        test_fused_memory_coordinator_never_fires_on_busy_path above: same
-        agents_idle=False driver, but built via the REAL
-        _build_service_restart_coordinator so it proves the builder WIRING (not
-        a hand-constructed coordinator). Under chronic fleet saturation the
-        run-loop idle branch never runs, so without the escape the armed
-        restart would starve forever (the operator-pain signal esc-2814-1).
-        With the builder wiring force_fire_after_secs=900.0, a pending restart
-        owed >= 900s fires even with agents_idle=False.
-
-        RED until step-4 wires the builder: today the builder passes no
-        force_fire_after_secs, so _force_fire_after_secs stays 0.0 (disabled)
-        and the coordinator never fires on the busy path — the final
-        `is True` / assert_awaited_once assertions fail.
+        test_fused_memory_coordinator_never_fires_while_agents_dispatch above,
+        built via the REAL _build_service_restart_coordinator so it proves the
+        builder WIRING. Under chronic fleet saturation agents_idle may never be
+        True, so without the escape the armed restart would starve forever
+        (esc-2814-1).
         """
         current_time: list[float] = [0.0]
         executor = AsyncMock()
@@ -559,8 +551,8 @@ class TestMaybeRestartStaleServiceBusyPath:
         )
         assert coord.is_pending is True
 
-        # Owed-age 899s < 900s bound: require_idle=True still defers on the busy
-        # path (agents_idle=False) — force-fire not yet armed.
+        # Owed-age 899s < 900s bound: require_idle=True still defers while
+        # agents dispatch — force-fire not yet armed.
         current_time[0] = 899.0
         assert await harness._maybe_restart_stale_service(agents_idle=False) is False
         executor.assert_not_awaited()
@@ -854,8 +846,8 @@ class TestBuildOrchestratorRestartCoordinator:
     def test_fused_memory_coordinator_force_fire_matches_config(self, harness: Harness):
         """fused-memory now gets the config's force-fire bound (900.0) — task 2817.
 
-        Unlike the dashboard (a leaf service that fires promptly on the busy
-        path and needs no escape — see test_dashboard_coordinator_has_no_force_fire
+        Unlike the dashboard (a leaf service that fires while agents dispatch
+        and needs no escape — see test_dashboard_coordinator_has_no_force_fire
         below), the fused-memory coordinator is require_idle=True and would
         starve under chronic saturation, so its builder wires
         force_fire_after_secs from config. Mirrors
@@ -910,6 +902,61 @@ class TestBuildOrchestratorRestartCoordinator:
 
         expected = Path(harness.config.project_root) / FLEET_DEPLOY_CLOCK_RELPATH
         assert coord._state_path == expected
+
+    # -- in-flight fleet-redeploy lease (task 4755) ------------------------
+    #
+    # The lease is the ONE gate on this coordinator that reads disk at gate
+    # time, which is why the wiring is pinned rather than left to the
+    # builder: _load_last_fire_wall runs once at construction, so without a
+    # lease_path nothing a sweep writes during this process's lifetime is
+    # observable at all, and the coordinator redeploys the fleet on top of
+    # its own in-flight sweep (measured 2026-08-24/25).
+
+    def test_lease_path_value_preserved_via_fleet_lease_relpath(self, harness: Harness):
+        """lease_path is project_root / FLEET_LEASE_RELPATH, from the constant.
+
+        Same shape as the state_path pin above, and for the same reason: the
+        literal exists in four places that cannot import each other, so the
+        builder must derive this one from the shared constant rather than
+        spelling it again.
+        """
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        expected = Path(harness.config.project_root) / FLEET_LEASE_RELPATH
+        assert coord._lease_path == expected
+
+    def test_lease_max_age_matches_config(self, harness: Harness):
+        """The max-age bound comes from config, not from the class default.
+
+        The bound is DERIVED from the drain busy-grace, so an operator who
+        changes that grace needs one knob to change here too; a coordinator
+        silently holding the code default would ignore them.
+        """
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        assert coord._lease_max_age_secs == (
+            harness.config.orchestrator_restart_lease_max_age_secs
+        )
+
+    def test_fused_memory_coordinator_has_no_lease_path(self, harness: Harness):
+        """fused-memory is untouched: no lease_path => no gate.
+
+        Its sweeps are driven by scripts/restart-fused-memory.sh, a
+        deliberately separate fleet with its own clock and its own transient
+        unit name, and this task's lease is written only by
+        restart-all-orchestrators.sh. Gating it on the ORCHESTRATOR fleet's
+        lease would be a cross-fleet coupling the two-independent-clocks
+        design forbids.
+        """
+        coord = harness._build_service_restart_coordinator()
+
+        assert coord._lease_path is None
+
+    def test_dashboard_coordinator_has_no_lease_path(self, harness: Harness):
+        """dashboard is untouched: no lease_path => no gate."""
+        coord = harness._build_dashboard_restart_coordinator()
+
+        assert coord._lease_path is None
 
 
 # ---------------------------------------------------------------------------
@@ -989,7 +1036,7 @@ class TestOrchestratorCoordinatorEndToEnd:
 
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
              patch('asyncio.create_task'), \
-             patch('orchestrator.merge_queue.check_merge_liveness_margin'):
+             patch('orchestrator.merge_lane.liveness.check_merge_liveness_margin'):
             await harness._start_merge_worker()
 
         # Drained pipeline: no in-flight/verifying merge, empty queue.
@@ -1023,7 +1070,9 @@ class TestOrchestratorCoordinatorEndToEnd:
         assert pos_args[0] == 'systemd-run'
         assert '--on-active=10' in pos_args
         assert '--unit=orch-selfrestart-on-merge-0.service' in pos_args
-        assert expected_script in pos_args
+        # task 5371: the script runs drained; with an argument, the payload is
+        # one shell command line.
+        assert pos_args[-3:] == ('/bin/sh', '-c', shlex.join([expected_script, '--drain']))
         assert orch_coord.is_pending is False
 
         # Second merge + fire: the executor closure's itertools counter must
@@ -1051,7 +1100,7 @@ class TestOrchestratorCoordinatorEndToEnd:
 
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
              patch('asyncio.create_task'), \
-             patch('orchestrator.merge_queue.check_merge_liveness_margin'):
+             patch('orchestrator.merge_lane.liveness.check_merge_liveness_margin'):
             await harness._start_merge_worker()
 
         mock_smw.return_value.snapshot.return_value = {'depth': 1}  # in-flight — NOT drained
@@ -1078,7 +1127,7 @@ class TestOrchestratorCoordinatorEndToEnd:
         """With orchestrator_restart_on_merge_enabled=False (fixture default), it never arms."""
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker'), \
              patch('asyncio.create_task'), \
-             patch('orchestrator.merge_queue.check_merge_liveness_margin'):
+             patch('orchestrator.merge_lane.liveness.check_merge_liveness_margin'):
             await harness._start_merge_worker()
 
         orch_coord = harness._service_restart_coordinators[2]

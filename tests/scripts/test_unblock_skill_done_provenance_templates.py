@@ -583,7 +583,9 @@ _JOIN_RE = re.compile(
     r"|[ \t]*\n[ \t]+(?:#[ \t]*)?"  # rule 2: indented soft-wrap
 )
 
-# A git invocation that EMITS a commit SHA: an explicit `--format=%H`, or a
+# A git invocation that EMITS a commit SHA: an explicit `--format=%H` — bare,
+# or quoted with further placeholders after the hash, as the subject-selecting
+# `--format='%H%x09%s' | awk ...` form the runbooks now share is — or a
 # `git rev-list` (which prints SHAs by default). Bounded repetition, and
 # `` ` ``/newline excluded, so a match can never run away across the flattened
 # document and swallow unrelated text into "the command".
@@ -594,9 +596,40 @@ _JOIN_RE = re.compile(
 # as "unscoped". A zero-argument `git rev-list` derives nothing (it is an error
 # at the shell); only an invocation carrying arguments can be scoped or not.
 _SHA_DERIVATION_RE = re.compile(
-    r"git\s+(?:log|rev-list|rev-parse)\b[^`\n]{0,400}?--format=%H"
+    r"git\s+(?:log|rev-list|rev-parse)\b[^`\n]{0,400}?--format=['\"]?%H"
     r"|git\s+rev-list\b[ \t]+[^`\n|;]{0,200}"
 )
+
+# The shared runbooks bind the marker subject once — `S="Merge task/<TASK_ID>
+# into main"` — and search with `--grep="$S"`, so the task argument is not on
+# the command's own line. A reference is resolved from the NEAREST binding of
+# that name within a bounded window on either side of the command (the fenced
+# form binds on the line above; the inline-prose form states the binding just
+# after). An unresolved reference is left verbatim, so a `$S` with no binding
+# in reach is judged UNSCOPED — indirection cannot smuggle a search past the
+# guard.
+_SHELL_VAR_REF_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
+_BINDING_WINDOW_CHARS = 400
+
+
+def _shell_binding_re(name: str) -> re.Pattern[str]:
+    return re.compile(rf"(?<![\w$]){re.escape(name)}=([\"'])([^\"'`\n]{{0,120}})\1")
+
+
+def _resolve_shell_bindings(flat: str, start: int, end: int, command: str) -> str:
+    """*command* with each `$NAME` replaced by its nearest bound literal."""
+    lo = max(0, start - _BINDING_WINDOW_CHARS)
+    window = flat[lo : end + _BINDING_WINDOW_CHARS]
+
+    def nearest_value(ref: re.Match[str]) -> str:
+        bindings = list(_shell_binding_re(ref.group(1)).finditer(window))
+        if not bindings:
+            return ref.group(0)
+        anchor = start - lo
+        closest = min(bindings, key=lambda b: abs(b.start() - anchor))
+        return closest.group(2)
+
+    return _SHELL_VAR_REF_RE.sub(nearest_value, command)
 
 # The two forms that make a derivation THIS task's. Either the exact-subject
 # merge-marker search (`--grep=` carrying the `task/<...>` subject placeholder,
@@ -606,14 +639,16 @@ _SCOPED_GREP_RE = re.compile(r"--grep=[\"']?[^\"'`]{0,80}?task/<[A-Za-z0-9_]+>")
 _TASK_REV_RANGE_RE = re.compile(r"task/<[A-Za-z0-9_]+>\.\.\w+")
 
 # Used ONLY by the coverage cross-check below, never by the extractor.
-_FORMAT_ANCHOR_RE = re.compile(r"--format=%H")
+_FORMAT_ANCHOR_RE = re.compile(r"--format=['\"]?%H")
 
 _REQUIRED_SCOPING = (
     "A provenance SHA source must name THIS task. Use either the exact-subject "
     'merge-marker search — `git log main --fixed-strings --grep="Merge '
-    'task/<TASK_ID> into main" --max-count=1 --format=%H` — or an ancestry-path '
-    "range — `git rev-list --ancestry-path --merges task/<TASK_ID>..main | tail "
-    "-1`. An unscoped `git log --format=%H -1 main` takes no task argument: it "
+    "task/<TASK_ID> into main\" --format='%H%x09%s'` with its subject-selecting "
+    '`awk`, where a `$S` bound to that subject nearby counts as the argument — or '
+    "an ancestry-path range — `git rev-list --topo-order --ancestry-path --merges "
+    "task/<TASK_ID>..main | tail -1`. An unscoped `git log --format=%H -1 main` "
+    "takes no task argument: it "
     "yields main's CURRENT HEAD, which is this task's merge commit only when "
     "this task's merge is the newest commit on main. The server's only backstop "
     "(`git merge-base --is-ancestor <sha> main`) passes for every recent commit "
@@ -669,6 +704,10 @@ def _sha_derivations(text: str, *, source: str) -> list[ShaDerivation]:
     emitting token actually is, and so the anchor cross-check below lines up
     with it exactly.
 
+    ``command`` is recorded with shell variable references resolved from the
+    nearest binding in reach (see `_resolve_shell_bindings`), so both the
+    scoping verdict and a failure message speak of the EFFECTIVE command.
+
     A derivation on a `_NEGATIVE_MARKER` line is skipped. THAT ESCAPE IS
     LOAD-BEARING HERE, not a nicety: the runbook states the forbidden
     `git log --format=%H -1 main` verbatim so an agent can recognise it, and
@@ -690,7 +729,7 @@ def _sha_derivations(text: str, *, source: str) -> list[ShaDerivation]:
             ShaDerivation(
                 source=source,
                 line=text.count("\n", 0, end) + 1,
-                command=m.group(0).strip(),
+                command=_resolve_shell_bindings(flat, m.start(), m.end(), m.group(0)).strip(),
                 start=start,
                 end=end,
             )
@@ -813,6 +852,46 @@ def test_derivation_scan_accepts_the_exact_subject_marker_search() -> None:
     )
     assert len(found) == 1
     assert _is_task_scoped(found[0].command)
+
+
+def test_derivation_scan_resolves_a_subject_bound_on_the_line_above() -> None:
+    """The shared runbooks' fenced form: bind `S` once, search with `$S`.
+
+    The task argument lives in the binding, not on the command's line, and the
+    SHA-emitting token is the quoted `--format='%H%x09%s'`. Both must be seen,
+    or the guard falls silent on exactly the form the docs now share.
+    """
+    found = _fixture_derivations(
+        "```bash\n"
+        'S="Merge task/<TASK_ID> into main"\n'
+        "git log main --fixed-strings --grep=\"$S\" --format='%H%x09%s' \\\n"
+        "  | awk -F'\\t' -v s=\"$S\" '$2==s && !seen {print $1; seen=1}'\n"
+        "```\n"
+    )
+    assert len(found) == 1
+    assert '--grep="Merge task/<TASK_ID> into main"' in found[0].command
+    assert _is_task_scoped(found[0].command)
+
+
+def test_derivation_scan_resolves_a_subject_bound_after_an_inline_command() -> None:
+    """The inline-prose form states the binding AFTER the command."""
+    found = _fixture_derivations(
+        "re-derive with `git log main --fixed-strings --grep=\"$S\" "
+        "--format='%H%x09%s' | awk -F'\\t' -v s=\"$S\" '$2==s {print $1}'` with "
+        '`S="Merge task/<TASK_ID> into main"`, which yields only a subject match.\n'
+    )
+    assert len(found) == 1
+    assert _is_task_scoped(found[0].command)
+
+
+def test_derivation_scan_leaves_an_unbound_reference_unscoped() -> None:
+    """Indirection is not a loophole: `$S` with no binding in reach is unscoped."""
+    found = _fixture_derivations(
+        "Run `git log main --fixed-strings --grep=\"$S\" --format='%H%x09%s'`.\n"
+    )
+    assert len(found) == 1
+    assert '"$S"' in found[0].command
+    assert not _is_task_scoped(found[0].command)
 
 
 def test_derivation_scan_accepts_an_ancestry_path_rev_range() -> None:

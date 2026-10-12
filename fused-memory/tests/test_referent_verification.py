@@ -3705,7 +3705,7 @@ class TestResolvableFindingsAreJournalledDurably:
         cap = _warn_cap()
         journal = await _wired_journal(service, tmp_path)
         commits = 0
-        db = journal._require_db()
+        db = journal._require_access().connection
         real_commit = db.commit
 
         async def _counting_commit():

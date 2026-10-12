@@ -30,11 +30,24 @@ from the merge lane too — see the same warning at
 from __future__ import annotations
 
 import functools
+import shutil
+import subprocess
 import types
+from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from _fm_helpers import load_script_module
+from _fm_helpers import _init_git_repo, load_script_module
+from shared.briefing_queries import (
+    CONVENTIONS_AREA,
+    CONVENTIONS_GENERIC,
+    QUERY_SPECS,
+    TASK_SEMANTIC,
+    BriefingQuerySpec,
+    BriefingScope,
+    queries_for,
+)
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'harvest_production_queries.py'
@@ -124,27 +137,38 @@ CREATE TABLE write_ops (
 )
 """
 
-OVERVIEW = 'project overview architecture goals'
-CONVENTIONS = 'coding conventions and project norms'
-DECISIONS = 'recent decisions and rationale'
-TASK_TEMPLATE = 'task {task_id} context and related decisions'
+# The four briefing queries task 3659 retired, hand-spelled on purpose: their
+# source is gone, so this is the independent oracle for the historical branch.
+RETIRED_OVERVIEW = 'project overview architecture goals'
+RETIRED_CONVENTIONS = 'coding conventions and project norms'
+RETIRED_DECISIONS = 'recent decisions and rationale'
+RETIRED_TASK_TEMPLATE = 'task {task_id} context and related decisions'
+RETIRED_TEMPLATES = frozenset(
+    {RETIRED_OVERVIEW, RETIRED_CONVENTIONS, RETIRED_DECISIONS, RETIRED_TASK_TEMPLATE}
+)
+
+
+JOURNAL_START = datetime(2026, 8, 12, tzinfo=UTC)
+
+JournalRow = tuple[str, str, str] | tuple[str, str, str, str]
+"""(operation, kind, params[, created_at]); created_at defaults to JOURNAL_START."""
 
 
 def _build_journal(
     path: Path,
-    rows: list[tuple[str, str, str]],
+    rows: Sequence[JournalRow],
 ) -> Path:
-    """Write a synthetic journal at `path`. Rows are (operation, kind, params)."""
+    """Write a synthetic journal at `path`."""
     import sqlite3  # noqa: PLC0415
 
     con = sqlite3.connect(str(path))
     try:
         con.execute(WRITE_OPS_DDL)
-        for i, (operation, kind, params) in enumerate(rows):
+        for i, (operation, kind, params, *at) in enumerate(rows):
             con.execute(
                 'INSERT INTO write_ops (id, operation, kind, params, created_at)'
                 ' VALUES (?, ?, ?, ?, ?)',
-                (f'op-{i:06d}', operation, kind, params, '2026-08-12T00:00:00Z'),
+                (f'op-{i:06d}', operation, kind, params, at[0] if at else _seconds_in(0)),
             )
         con.commit()
     finally:
@@ -152,15 +176,34 @@ def _build_journal(
     return path
 
 
-def _search_rows(text: str, n: int, *, limit: int = 5) -> list[tuple[str, str, str]]:
+def _search_rows(
+    text: str, n: int, *, limit: int = 5, caller: str | None = None
+) -> list[tuple[str, str, str]]:
+    """`n` search ops, journalled with `caller_agent_id` when `caller` is set."""
     import json  # noqa: PLC0415
 
-    params = json.dumps({'query': text, 'limit': limit})
-    return [('search', 'read', params)] * n
+    params: dict[str, object] = {'query': text, 'limit': limit}
+    if caller is not None:
+        params['caller_agent_id'] = caller
+    return [('search', 'read', json.dumps(params))] * n
+
+
+def _seconds_in(seconds: float) -> str:
+    """The journal's `created_at` spelling for `seconds` after JOURNAL_START."""
+    return (JOURNAL_START + timedelta(seconds=seconds)).isoformat()
+
+
+def _at(seconds: float, rows: list[tuple[str, str, str]]) -> list[JournalRow]:
+    """`rows`, journalled `seconds` after JOURNAL_START."""
+    return [(*row, _seconds_in(seconds)) for row in rows]
 
 
 def _standard_journal(tmp_path: Path) -> Path:
-    """A journal whose shares are hand-computable.
+    return _build_journal(tmp_path / 'journal.db', _standard_rows())
+
+
+def _standard_rows() -> list[tuple[str, str, str]]:
+    """Retired-era traffic whose shares are hand-computable.
 
     200 search ops total:
       overview      60  -> 30%
@@ -171,17 +214,17 @@ def _standard_journal(tmp_path: Path) -> Path:
     Plus 25 non-search ops that must be ignored entirely.
     """
     rows: list[tuple[str, str, str]] = []
-    rows += _search_rows(OVERVIEW, 60)
-    rows += _search_rows(CONVENTIONS, 40)
-    rows += _search_rows(DECISIONS, 20)
+    rows += _search_rows(RETIRED_OVERVIEW, 60)
+    rows += _search_rows(RETIRED_CONVENTIONS, 40)
+    rows += _search_rows(RETIRED_DECISIONS, 20)
     for task_id in ('4004', '3560', '3111', '3.1'):
-        rows += _search_rows(TASK_TEMPLATE.format(task_id=task_id), 10)
+        rows += _search_rows(RETIRED_TASK_TEMPLATE.format(task_id=task_id), 10)
     for i in range(40):
         rows += _search_rows(f'one off question number {i:02d}', 1)
     # Noise that must never be counted.
     rows += [('add_memory', 'write', '{"content": "not a query"}')] * 20
     rows += [('get_task', 'read', '{"task_id": "4004"}')] * 5
-    return _build_journal(tmp_path / 'journal.db', rows)
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +360,7 @@ class TestHarvestSelectsOnlySearchOps:
         self, tmp_path
     ):
         mod = _mod()
-        rows = _search_rows(OVERVIEW, 10)
+        rows = _search_rows(RETIRED_OVERVIEW, 10)
         rows += [('search', 'read', '{"limit": 5}')] * 7 # no `query` key
         rows += [('search', 'read', 'not json at all')] * 3
         db = _build_journal(tmp_path / 'j.db', rows)
@@ -327,34 +370,40 @@ class TestHarvestSelectsOnlySearchOps:
 
     def test_query_text_is_parsed_out_of_the_params_json(self, tmp_path):
         mod = _mod()
-        db = _build_journal(tmp_path / 'j.db', _search_rows(OVERVIEW, 3))
+        db = _build_journal(tmp_path / 'j.db', _search_rows(RETIRED_OVERVIEW, 3))
         result = mod.harvest(db)
-        assert [t.text for t in result.templates if t.observed_count] == [OVERVIEW]
+        assert [t.text for t in result.templates if t.observed_count] == [RETIRED_OVERVIEW]
 
 
-class TestTemplateClassification:
-    """The four briefing-assembler templates, three literal and one parameterized."""
+def _retired_family(result) -> list:
+    return [
+        t for t in result.templates if t.match == 'parameterized' and t.era == 'retired'
+    ]
+
+
+class TestRetiredTemplateClassification:
+    """The retired branch: three literals and one parameterized family."""
 
     def test_the_three_literals_are_classified(self, tmp_path):
         mod = _mod()
         result = mod.harvest(_standard_journal(tmp_path))
         by_text = {t.text: t for t in result.templates}
-        assert by_text[OVERVIEW].observed_count == 60
-        assert by_text[CONVENTIONS].observed_count == 40
-        assert by_text[DECISIONS].observed_count == 20
-        for text in (OVERVIEW, CONVENTIONS, DECISIONS):
+        assert by_text[RETIRED_OVERVIEW].observed_count == 60
+        assert by_text[RETIRED_CONVENTIONS].observed_count == 40
+        assert by_text[RETIRED_DECISIONS].observed_count == 20
+        for text in (RETIRED_OVERVIEW, RETIRED_CONVENTIONS, RETIRED_DECISIONS):
             assert by_text[text].match == 'literal'
 
     def test_the_task_family_is_matched_as_a_template_not_a_literal(self, tmp_path):
         mod = _mod()
         result = mod.harvest(_standard_journal(tmp_path))
-        family = [t for t in result.templates if t.match == 'parameterized']
-        assert len(family) == 1, 'exactly one parameterized family'
+        family = _retired_family(result)
+        assert len(family) == 1, 'exactly one retired parameterized family'
         fam = family[0]
         # All four distinct task ids collapse into ONE class.
         assert fam.observed_count == 40
         assert fam.distinct_instances == 4
-        assert fam.template == TASK_TEMPLATE
+        assert fam.template == RETIRED_TASK_TEMPLATE
 
     def test_a_parameterized_instance_is_not_counted_in_the_long_tail(self, tmp_path):
         mod = _mod()
@@ -364,14 +413,390 @@ class TestTemplateClassification:
 
     def test_a_near_miss_does_not_join_the_family(self, tmp_path):
         mod = _mod()
-        rows = _search_rows(TASK_TEMPLATE.format(task_id='4004'), 5)
+        rows = _search_rows(RETIRED_TASK_TEMPLATE.format(task_id='4004'), 5)
         rows += _search_rows('task context and related decisions', 5) # no id
         rows += _search_rows('task 4004 context and related choices', 5) # wrong tail
         db = _build_journal(tmp_path / 'j.db', rows)
         result = mod.harvest(db)
-        fam = next(t for t in result.templates if t.match == 'parameterized')
+        (fam,) = _retired_family(result)
         assert fam.observed_count == 5
         assert result.tail_count == 10
+
+
+class TestTheRetiredBranchIsExplicit:
+    """Every retired class says so, in the result, the rows and the sidecar."""
+
+    def test_every_retired_template_class_is_tagged_retired(self, tmp_path):
+        mod = _mod()
+        result = mod.harvest(_standard_journal(tmp_path))
+        retired = [t for t in result.templates if t.template in RETIRED_TEMPLATES]
+        assert {t.template for t in retired} == RETIRED_TEMPLATES
+        assert all(t.era == 'retired' for t in retired)
+
+    def test_every_retired_briefing_row_carries_its_era(self, tmp_path):
+        mod = _mod()
+        rows = mod.harvest(_standard_journal(tmp_path), tail_sample=3).rows
+        briefing = [r for r in rows if r['source'] == 'briefing_template']
+        assert {r['template'] for r in briefing} == RETIRED_TEMPLATES
+        assert all(r['era'] == 'retired' for r in briefing)
+
+    def test_every_provenance_template_entry_carries_an_era(self, tmp_path):
+        mod = _mod()
+        prov = mod.harvest(_standard_journal(tmp_path)).provenance()
+        assert prov['templates']
+        assert all('era' in entry for entry in prov['templates'])
+
+
+# Scopes with declared files, so each fires the area-scoped conventions query
+# and a distinct area. Journal rows are rendered from these through
+# `queries_for`, never hand-copied, so a reworded template keeps these honest.
+AREA_SCOPES = (
+    BriefingScope(
+        task_id='5502',
+        title='Re-point the production-query harvester',
+        files=('fused-memory/scripts/harvest_production_queries.py',),
+    ),
+    BriefingScope(
+        task_id='4856',
+        title='Re-key the memory-eval registry',
+        files=('fused-memory/tests/fixtures/memory_eval_topic_registry.json',),
+    ),
+    BriefingScope(
+        task_id='3659',
+        title='Rescope the briefing memory block',
+        files=('orchestrator/src/orchestrator/agents/briefing.py',),
+    ),
+)
+
+
+def _rendered(spec: BriefingQuerySpec, scope: BriefingScope) -> str:
+    """The query `queries_for(scope)` fires for `spec`."""
+    fired = {fired_spec.slug: text for fired_spec, text in queries_for(scope)}
+    return fired[spec.slug]
+
+
+def _class_for(result, template: str):
+    (cls,) = [t for t in result.templates if t.template == template]
+    return cls
+
+
+class TestCurrentTemplatesAreRenderedFromSource:
+    """The current classes come from `shared.briefing_queries`, not a copy."""
+
+    def test_the_generic_conventions_query_is_a_current_literal(self, tmp_path):
+        mod = _mod()
+        ((_, generic),) = queries_for(BriefingScope())
+        db = _build_journal(tmp_path / 'j.db', _search_rows(generic, 7))
+        result = mod.harvest(db)
+        cls = _class_for(result, CONVENTIONS_GENERIC.text)
+        assert (cls.match, cls.era) == ('literal', 'current')
+        assert cls.observed_count == 7
+        assert result.tail_count == 0
+
+    def test_area_queries_for_different_scopes_collapse_into_one_class(self, tmp_path):
+        mod = _mod()
+        rows: list[tuple[str, str, str]] = []
+        for n, scope in enumerate(AREA_SCOPES, start=1):
+            rows += _search_rows(_rendered(CONVENTIONS_AREA, scope), n)
+        db = _build_journal(tmp_path / 'j.db', rows)
+        result = mod.harvest(db)
+        cls = _class_for(result, CONVENTIONS_AREA.text)
+        assert (cls.match, cls.era) == ('parameterized', 'current')
+        assert cls.distinct_instances == 3
+        assert cls.observed_count == 6
+        assert result.tail_count == 0
+
+    def test_near_misses_of_the_area_query_stay_tail(self, tmp_path):
+        mod = _mod()
+        rendered = _rendered(CONVENTIONS_AREA, AREA_SCOPES[0])
+        near_misses = (
+            'conventions and gotchas',
+            'coding conventions and gotchas for x',
+            f'{rendered}, and what changed there since August?',
+        )
+        rows = _search_rows(rendered, 2)
+        for text in near_misses:
+            rows += _search_rows(text, 1)
+        db = _build_journal(tmp_path / 'j.db', rows)
+        result = mod.harvest(db)
+        assert _class_for(result, CONVENTIONS_AREA.text).observed_count == 2
+        assert result.tail_count == len(near_misses)
+
+    def test_an_area_of_only_template_words_still_anchors_its_task_query(self, tmp_path):
+        """The renderer drops repeated words, so such an area renders as nothing."""
+        mod = _mod()
+        scope = BriefingScope(task_id='77', title='Conventions and gotchas')
+        assert _rendered(CONVENTIONS_AREA, scope) == 'conventions and gotchas for'
+        rows = _briefing_rows(scope, caller=IMPLEMENTER)
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+        assert _class_for(result, CONVENTIONS_AREA.text).observed_count == 1
+        assert _companion(result).observed_count == 1
+        assert result.tail_count == 0
+
+    def test_a_mixed_era_journal_counts_each_class_once_in_its_own_era(self, tmp_path):
+        """200 retired-era ops plus 20 generic and 30 area ops: 250 in all."""
+        mod = _mod()
+        ((_, generic),) = queries_for(BriefingScope())
+        rows = _standard_rows() + _search_rows(generic, 20)
+        for scope in AREA_SCOPES:
+            rows += _search_rows(_rendered(CONVENTIONS_AREA, scope), 10)
+        db = _build_journal(tmp_path / 'j.db', rows)
+        result = mod.harvest(db)
+
+        counts = {(t.template, t.era): t.observed_count for t in result.templates}
+        assert counts[(RETIRED_OVERVIEW, 'retired')] == 60
+        assert counts[(RETIRED_CONVENTIONS, 'retired')] == 40
+        assert counts[(RETIRED_DECISIONS, 'retired')] == 20
+        assert counts[(RETIRED_TASK_TEMPLATE, 'retired')] == 40
+        assert counts[(CONVENTIONS_GENERIC.text, 'current')] == 20
+        assert counts[(CONVENTIONS_AREA.text, 'current')] == 30
+        assert len(counts) == len(result.templates), 'each template is one class'
+
+        assert result.family_share == 0.84  # (160 + 50) / 250
+        assert result.literal_share == 0.56  # (120 + 20) / 250
+        assert result.tail_share == 0.16
+        total = sum(t.traffic_share for t in result.templates) + result.tail_share
+        assert abs(total - 1.0) < 1e-9
+
+    def test_an_unobserved_class_emits_no_row_and_reports_its_template(self, tmp_path):
+        mod = _mod()
+        ((_, generic),) = queries_for(BriefingScope())
+        rows = _search_rows(generic, 5)
+        rows += _search_rows(_rendered(CONVENTIONS_AREA, AREA_SCOPES[0]), 5)
+        db = _build_journal(tmp_path / 'j.db', rows)
+        result = mod.harvest(db)
+
+        briefing = [r for r in result.rows if r['source'] == 'briefing_template']
+        assert {r['template'] for r in briefing} == {
+            CONVENTIONS_GENERIC.text, CONVENTIONS_AREA.text,
+        }
+        assert all(r['era'] == 'current' for r in briefing)
+        unobserved = [t for t in result.templates if t.observed_count == 0]
+        assert {t.template for t in unobserved} >= RETIRED_TEMPLATES
+        assert all(t.text == t.template for t in unobserved)
+
+    def test_the_scoring_window_equals_every_spec_limit(self):
+        """Drift in the source's limit forces a decision about the window."""
+        mod = _mod()
+        assert {spec.limit for spec in QUERY_SPECS} == {mod.BRIEFING_SEARCH_LIMIT}
+
+    def test_an_anchorless_spec_without_a_companion_anchor_is_refused(self):
+        mod = _mod()
+        free_text = BriefingQuerySpec(
+            slug='free-text', section_title='X', text='{title} {area}'
+        )
+        with pytest.raises(mod.UnmatchableTemplateError) as exc:
+            mod.build_current_classes((free_text,), companion_anchors={})
+        assert isinstance(exc.value, mod.HarvestError)
+        assert 'free-text' in str(exc.value)
+        assert '{title} {area}' in str(exc.value)
+
+    @pytest.mark.parametrize(
+        'anchors',
+        [
+            {TASK_SEMANTIC.slug: 'no-such-spec'},
+            {TASK_SEMANTIC.slug: CONVENTIONS_AREA.slug, CONVENTIONS_AREA.slug: TASK_SEMANTIC.slug},
+        ],
+        ids=['unknown-anchor', 'anchor-is-a-companion'],
+    )
+    def test_a_companion_needs_a_pattern_matched_anchor(self, anchors):
+        mod = _mod()
+        with pytest.raises(mod.UnmatchableTemplateError, match=TASK_SEMANTIC.slug):
+            mod.build_current_classes(QUERY_SPECS, companion_anchors=anchors)
+
+
+IMPLEMENTER = 'claude-task-5502-implementer'
+
+
+def _briefing_rows(
+    scope: BriefingScope, *, caller: str | None, limit: int = 5
+) -> list[tuple[str, str, str]]:
+    """One dispatch's briefing searches, in the order `queries_for` fires them."""
+    rows: list[tuple[str, str, str]] = []
+    for _, text in queries_for(scope):
+        rows += _search_rows(text, 1, limit=limit, caller=caller)
+    return rows
+
+
+def _query_of(row: tuple[str, str, str]) -> str:
+    import json  # noqa: PLC0415
+
+    return json.loads(row[2])['query']
+
+
+def _companion(result):
+    return _class_for(result, TASK_SEMANTIC.text)
+
+
+class TestTheTaskChannelIsPairedByCaller:
+    """'{title} {area}' has no literal anchor, so it is recognised by pairing.
+
+    It is the next unmatched search from the caller whose area-scoped
+    conventions query came just before it.
+    """
+
+    def test_the_task_query_after_its_area_query_is_the_companion(self, tmp_path):
+        mod = _mod()
+        rows = _briefing_rows(AREA_SCOPES[0], caller=IMPLEMENTER)
+        assert [_query_of(r) for r in rows] == [
+            _rendered(CONVENTIONS_AREA, AREA_SCOPES[0]),
+            _rendered(TASK_SEMANTIC, AREA_SCOPES[0]),
+        ]
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+        companion = _companion(result)
+        assert (companion.match, companion.era) == ('companion', 'current')
+        assert companion.observed_count == 1
+        assert companion.text == _rendered(TASK_SEMANTIC, AREA_SCOPES[0])
+        assert result.tail_count == 0
+
+    def test_a_task_query_with_no_preceding_area_query_stays_tail(self, tmp_path):
+        mod = _mod()
+        task_query = _rendered(TASK_SEMANTIC, AREA_SCOPES[0])
+        rows = _search_rows(task_query, 1, caller=IMPLEMENTER)
+        rows += _search_rows(task_query, 1)
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+        assert _companion(result).observed_count == 0
+        assert result.tail_count == 2
+
+    def test_an_area_query_with_no_caller_anchors_nothing(self, tmp_path):
+        mod = _mod()
+        rows = _search_rows(_rendered(CONVENTIONS_AREA, AREA_SCOPES[0]), 1)
+        rows += _search_rows(_rendered(TASK_SEMANTIC, AREA_SCOPES[0]), 1)
+        rows += _search_rows(_rendered(TASK_SEMANTIC, AREA_SCOPES[0]), 1, caller=IMPLEMENTER)
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+        assert _class_for(result, CONVENTIONS_AREA.text).observed_count == 1
+        assert _companion(result).observed_count == 0
+        assert result.tail_count == 2
+
+    def test_interleaved_dispatches_under_one_caller_each_pair(self, tmp_path):
+        """Parallel reviewers share one caller id, so their pairs interleave."""
+        mod = _mod()
+        reviewer = 'claude-task-7-reviewer'
+        a, b = AREA_SCOPES[0], AREA_SCOPES[1]
+        rows = _search_rows(_rendered(CONVENTIONS_AREA, a), 1, caller=reviewer)
+        rows += _search_rows(_rendered(CONVENTIONS_AREA, b), 1, caller=reviewer)
+        rows += _search_rows(_rendered(TASK_SEMANTIC, a), 1, caller=reviewer)
+        rows += _search_rows(_rendered(TASK_SEMANTIC, b), 1, caller=reviewer)
+        rows += _search_rows('how does the merge lane park a lock', 1, caller=reviewer)
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+        assert _companion(result).observed_count == 2
+        assert _companion(result).distinct_instances == 2
+        assert result.tail_count == 1
+
+    def test_each_area_query_pairs_exactly_one_later_search(self, tmp_path):
+        mod = _mod()
+        rows = _briefing_rows(AREA_SCOPES[0], caller=IMPLEMENTER)
+        rows += _search_rows('an own search', 1, caller=IMPLEMENTER)
+        rows += _search_rows('another own search', 1, caller=IMPLEMENTER)
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+        assert _companion(result).observed_count == 1
+        assert result.tail_count == 2
+
+    def test_another_callers_search_does_not_consume_the_anchor(self, tmp_path):
+        mod = _mod()
+        other = 'claude-task-9-debugger'
+        rows = _search_rows(_rendered(CONVENTIONS_AREA, AREA_SCOPES[0]), 1, caller=IMPLEMENTER)
+        rows += _search_rows('a search of somebody else', 1, caller=other)
+        rows += _search_rows(_rendered(TASK_SEMANTIC, AREA_SCOPES[0]), 1, caller=IMPLEMENTER)
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+        assert _companion(result).observed_count == 1
+        tail = [r for r in result.rows if r['source'] == 'production_tail']
+        assert [r['text'] for r in tail] == ['a search of somebody else']
+
+    def test_an_orphaned_area_query_does_not_claim_a_much_later_search(self, tmp_path):
+        """An area query whose task query was never journalled pairs with nothing."""
+        mod = _mod()
+        area = _rendered(CONVENTIONS_AREA, AREA_SCOPES[0])
+        rows = [
+            *_at(0, _search_rows(area, 1, caller=IMPLEMENTER)),
+            *_at(3600, _search_rows('an own search an hour later', 1, caller=IMPLEMENTER)),
+        ]
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+        assert _companion(result).observed_count == 0
+        assert result.tail_count == 1
+
+    def test_a_retried_dispatch_pairs_its_own_area_query_not_an_orphan(self, tmp_path):
+        """The orphan expires, so the agent's own search after the retry stays tail."""
+        mod = _mod()
+        area = _rendered(CONVENTIONS_AREA, AREA_SCOPES[0])
+        rows = [
+            *_at(0, _search_rows(area, 1, caller=IMPLEMENTER)),
+            *_at(600, _briefing_rows(AREA_SCOPES[0], caller=IMPLEMENTER)),
+            *_at(605, _search_rows('an own search', 1, caller=IMPLEMENTER)),
+        ]
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+        assert _companion(result).observed_count == 1
+        tail = [r['text'] for r in result.rows if r['source'] == 'production_tail']
+        assert tail == ['an own search']
+
+    @pytest.mark.parametrize(
+        ('delay_of', 'paired'),
+        [
+            (lambda window: 0, 1),
+            (lambda window: window, 1),
+            (lambda window: window + 1, 0),
+        ],
+        ids=['at-once', 'at-the-window', 'past-the-window'],
+    )
+    def test_a_task_query_is_paired_only_inside_the_window(
+        self, tmp_path, delay_of, paired
+    ):
+        mod = _mod()
+        delay = delay_of(mod.COMPANION_WINDOW.total_seconds())
+        area, task = _briefing_rows(AREA_SCOPES[0], caller=IMPLEMENTER)
+        rows = [*_at(0, [area]), *_at(delay, [task])]
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+        assert _companion(result).observed_count == paired
+        assert result.tail_count == 1 - paired
+
+    @pytest.mark.parametrize(
+        'unreadable', ['not a time', '2026-08-12T00:00:01'], ids=['garbage', 'no-zone']
+    )
+    @pytest.mark.parametrize('side', [0, 1], ids=['anchor', 'companion'])
+    def test_an_op_without_a_readable_time_is_counted_but_never_paired(
+        self, tmp_path, unreadable, side
+    ):
+        mod = _mod()
+        area, task = _briefing_rows(AREA_SCOPES[0], caller=IMPLEMENTER)
+        times = [_seconds_in(0), _seconds_in(1)]
+        times[side] = unreadable
+        rows = [(*area, times[0]), (*task, times[1])]
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+        assert result.total_search_ops == 2
+        assert _class_for(result, CONVENTIONS_AREA.text).observed_count == 1
+        assert _companion(result).observed_count == 0
+        assert result.tail_count == 1
+
+    def test_limits_are_measured_from_the_ops_each_side_counted(self, tmp_path):
+        """The same text paired at 5 and re-run by the agent at 20 splits cleanly."""
+        mod = _mod()
+        task_query = _rendered(TASK_SEMANTIC, AREA_SCOPES[0])
+        rows = _briefing_rows(AREA_SCOPES[0], caller=IMPLEMENTER, limit=5)
+        rows += _search_rows(task_query, 1, limit=20, caller=IMPLEMENTER)
+        rows += _search_rows('an own search', 1, limit=20, caller=IMPLEMENTER)
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+
+        assert _companion(result).observed_limits == {'5': 1}
+        tail = {r['text']: r for r in result.rows if r['source'] == 'production_tail'}
+        assert tail[task_query]['observed_limits'] == {'20': 1}
+        assert tail[task_query]['observed_limit'] == 20
+        assert tail['an own search']['observed_limit'] == 20
+
+    def test_every_spec_in_the_source_is_fired_and_classified(self, tmp_path):
+        """A spec added to shared that the harvester cannot classify fails here."""
+        mod = _mod()
+        scopes = (*AREA_SCOPES, BriefingScope())
+        fired = {spec.slug for scope in scopes for spec, _ in queries_for(scope)}
+        assert fired == {spec.slug for spec in QUERY_SPECS}
+
+        rows: list[tuple[str, str, str]] = []
+        for scope in scopes:
+            rows += _briefing_rows(scope, caller=IMPLEMENTER)
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+        assert result.tail_count == 0
+        observed = {t.template for t in result.templates if t.observed_count}
+        assert observed == {spec.text for spec in QUERY_SPECS}
+
 
 
 class TestTrafficShares:
@@ -381,9 +806,9 @@ class TestTrafficShares:
         mod = _mod()
         result = mod.harvest(_standard_journal(tmp_path))
         by_text = {t.text: t.traffic_share for t in result.templates}
-        assert by_text[OVERVIEW] == 0.30
-        assert by_text[CONVENTIONS] == 0.20
-        assert by_text[DECISIONS] == 0.10
+        assert by_text[RETIRED_OVERVIEW] == 0.30
+        assert by_text[RETIRED_CONVENTIONS] == 0.20
+        assert by_text[RETIRED_DECISIONS] == 0.10
 
     def test_the_three_literals_and_the_family_are_reported_separately(self, tmp_path):
         mod = _mod()
@@ -426,7 +851,7 @@ class TestDeterministicTailSample:
 
     def test_the_frequency_led_portion_is_seed_independent(self, tmp_path):
         mod = _mod()
-        rows = _search_rows(OVERVIEW, 10)
+        rows = _search_rows(RETIRED_OVERVIEW, 10)
         # A tail with an unambiguous frequency order.
         for i in range(20):
             rows += _search_rows(f'tail query {i:02d}', 20 - i)
@@ -509,7 +934,7 @@ class TestFixtureRowShape:
         selection gate reads.
         """
         mod = _mod()
-        rows = _search_rows(OVERVIEW, 10)
+        rows = _search_rows(RETIRED_OVERVIEW, 10)
         rows += _search_rows('a tail query some other caller fires', 7, limit=20)
         db = _build_journal(tmp_path / 'j.db', rows)
         harvested = mod.harvest(db, tail_sample=3).rows
@@ -526,7 +951,7 @@ class TestFixtureRowShape:
         value takes it from the measurement and owns that choice explicitly.
         """
         mod = _mod()
-        rows = _search_rows(OVERVIEW, 10)
+        rows = _search_rows(RETIRED_OVERVIEW, 10)
         rows += _search_rows('mixed limit tail query', 6, limit=10)
         rows += _search_rows('mixed limit tail query', 2, limit=50)
         db = _build_journal(tmp_path / 'j.db', rows)
@@ -539,7 +964,7 @@ class TestFixtureRowShape:
     def test_the_sidecar_reports_the_scored_limit_as_a_choice(self, tmp_path):
         """The scoring window is named a choice and sits beside the readings."""
         mod = _mod()
-        rows = _search_rows(OVERVIEW, 10)
+        rows = _search_rows(RETIRED_OVERVIEW, 10)
         rows += _search_rows('a tail query', 4, limit=30)
         db = _build_journal(tmp_path / 'j.db', rows)
         prov = mod.harvest(db, tail_sample=3).provenance()
@@ -554,7 +979,7 @@ class TestFixtureRowShape:
         import json  # noqa: PLC0415
 
         mod = _mod()
-        rows = _search_rows(OVERVIEW, 10)
+        rows = _search_rows(RETIRED_OVERVIEW, 10)
         rows += [('search', 'read', json.dumps({'query': 'no limit recorded'}))] * 3
         db = _build_journal(tmp_path / 'j.db', rows)
         tail = [r for r in mod.harvest(db, tail_sample=3).rows
@@ -575,7 +1000,7 @@ class TestPinnedTail:
 
     def test_a_pin_holds_the_tail_query_set_fixed(self, tmp_path):
         mod = _mod()
-        rows = _search_rows(OVERVIEW, 10)
+        rows = _search_rows(RETIRED_OVERVIEW, 10)
         rows += _search_rows('pinned tail query', 4, limit=10)
         rows += _search_rows('newly arrived tail query', 9, limit=8)
         db = _build_journal(tmp_path / 'j.db', rows)
@@ -589,7 +1014,7 @@ class TestPinnedTail:
     def test_pinning_to_a_query_the_journal_lacks_raises(self, tmp_path):
         """Emitting a pinned row with no observations would fabricate it."""
         mod = _mod()
-        db = _build_journal(tmp_path / 'j.db', _search_rows(OVERVIEW, 10))
+        db = _build_journal(tmp_path / 'j.db', _search_rows(RETIRED_OVERVIEW, 10))
         with pytest.raises(mod.EmptyHarvestError, match='pinned tail'):
             mod.harvest(db, pin_tail_texts=['a query nobody ever ran'])
 
@@ -690,57 +1115,107 @@ class TestReadOnlyAccess:
         assert hashlib.sha256(db.read_bytes()).hexdigest() == before
 
 
-class TestTheJournalPathIsRepoRelative:
+_CHECKOUT_COPY_MOD_NAME = 'harvest_production_queries__checkout_copy'
+
+
+def _seed_checkout_with_harvest_copy(base: Path) -> tuple[Path, Path]:
+    """A main checkout with the script committed, plus a `.worktrees/lane`.
+
+    Mirrors production's `<main>/.worktrees/<id>` layout, so a copy of the
+    script loaded from either checkout decides its anchor exactly as the
+    real file would.  Returns resolved `(main, lane)`.
+    """
+    main = base / 'repo'
+    scripts = main / 'fused-memory' / 'scripts'
+    scripts.mkdir(parents=True)
+    shutil.copy2(SCRIPT_PATH, scripts / SCRIPT_PATH.name)
+    _init_git_repo(main)
+    lane = main / '.worktrees' / 'lane'
+    subprocess.run(
+        ['git', '-C', str(main), 'worktree', 'add', '-q', '-b', 'lane', str(lane)],
+        check=True,
+    )
+    return main.resolve(), lane.resolve()
+
+
+def _load_copy_in(checkout: Path) -> types.ModuleType:
+    """Load the copy of the script living in *checkout*.
+
+    Never under the real module's key: that would replace the real module
+    in `sys.modules` and break `TestTheScriptIsLoadedOnceNotReExecuted`.
+    """
+    copy = checkout / 'fused-memory' / 'scripts' / SCRIPT_PATH.name
+    return load_script_module(copy, mod_name=_CHECKOUT_COPY_MOD_NAME)
+
+
+def _journal_under_data_of(main: Path, tmp_path: Path) -> Path:
+    target = main / 'data' / 'reconciliation' / 'write_journal.db'
+    target.parent.mkdir(parents=True)
+    return _standard_journal(tmp_path).rename(target)
+
+
+class TestTheJournalPathIsAnchoredOnTheMainCheckout:
     """A published artifact must not name somebody's home directory.
 
-    An absolute checkout path is neither reproducible nor readable by anyone
-    else, and it leaks the worktree the run happened in -- the rule
-    `fused-memory/scripts/bake_off_storage_shape.py::fixture_digests`
-    already states.
-
-    Both tests patch `mod._REPO_ROOT`, a module global `_repo_relative` reads
-    at call time, so the property is pinned without depending on the
-    filesystem layout the suite happens to run under.
+    The journal is untracked runtime data under the MAIN checkout's
+    gitignored `/data/`, so a harvest run from a `.worktrees/<id>` lane must
+    still record it relative to the main checkout.
     """
 
-    def test_a_journal_under_the_repo_root_is_recorded_repo_relative(
-        self, tmp_path, monkeypatch
+    def test_a_harvest_run_from_a_worktree_lane_records_the_journal_relative_to_the_main_checkout(
+        self, tmp_path
     ):
-        mod = _mod()
-        db = _standard_journal(tmp_path)
-        # Move it under a `data/` subdir so the relative value has structure.
-        nested = tmp_path / 'data'
-        nested.mkdir()
-        db = db.rename(nested / 'j.db')
-        # Resolve BOTH sides: `_repo_relative` resolves its input, so an
-        # unresolved anchor would spuriously fail behind a symlinked tmpdir.
-        monkeypatch.setattr(mod, '_REPO_ROOT', tmp_path.resolve())
+        main, lane = _seed_checkout_with_harvest_copy(tmp_path)
+        journal = _journal_under_data_of(main, tmp_path)
 
-        result = mod.harvest(db, tail_sample=5)
+        result = _load_copy_in(lane).harvest(journal, tail_sample=5)
 
-        assert result.journal_path == 'data/j.db'
-        assert not Path(result.journal_path).is_absolute()
+        assert result.journal_path == 'data/reconciliation/write_journal.db'
         # The sidecar is what actually gets published, so pin it too.
-        assert result.provenance()['journal_path'] == 'data/j.db'
+        assert result.provenance()['journal_path'] == result.journal_path
 
-    def test_a_journal_genuinely_outside_the_repo_root_stays_absolute(
-        self, tmp_path, monkeypatch
+    def test_a_harvest_run_from_the_main_checkout_records_the_journal_repo_relative(
+        self, tmp_path
     ):
+        main, _lane = _seed_checkout_with_harvest_copy(tmp_path)
+        journal = _journal_under_data_of(main, tmp_path)
+
+        result = _load_copy_in(main).harvest(journal, tail_sample=5)
+
+        assert result.journal_path == 'data/reconciliation/write_journal.db'
+        assert result.provenance()['journal_path'] == result.journal_path
+
+    def test_a_journal_genuinely_outside_the_repo_stays_absolute(self, tmp_path):
         """The fallback is ABSOLUTE, not a bare filename.
 
-        This is the regression guard against over-relativizing: a journal
-        parked outside the tree is genuinely checkout-independent and must
-        stay identifiable.  It distinguishes the census-shaped helper (which
-        this uses) from the bake-off one, whose fallback is `resolved.name`.
+        The regression guard against over-relativizing: a journal parked
+        outside the tree is genuinely checkout-independent and must stay
+        identifiable.
         """
-        mod = _mod()
-        db = _standard_journal(tmp_path)
-        monkeypatch.setattr(mod, '_REPO_ROOT', (tmp_path / 'somewhere_else').resolve())
+        _main, lane = _seed_checkout_with_harvest_copy(tmp_path)
+        journal = _standard_journal(tmp_path)
 
-        result = mod.harvest(db, tail_sample=5)
+        result = _load_copy_in(lane).harvest(journal, tail_sample=5)
 
         assert Path(result.journal_path).is_absolute()
         assert Path(result.journal_path).name == 'journal.db'
+
+    def test_a_copy_outside_any_git_checkout_anchors_on_its_own_location(
+        self, tmp_path, monkeypatch
+    ):
+        # Stop git's discovery at tmp_path, so the case holds even if the
+        # suite's basetemp ever lands inside some checkout.
+        monkeypatch.setenv('GIT_CEILING_DIRECTORIES', str(tmp_path.resolve()))
+        plain = tmp_path / 'plain'
+        scripts = plain / 'fused-memory' / 'scripts'
+        scripts.mkdir(parents=True)
+        shutil.copy2(SCRIPT_PATH, scripts / SCRIPT_PATH.name)
+        (plain / 'data').mkdir()
+        journal = _standard_journal(tmp_path).rename(plain / 'data' / 'j.db')
+
+        result = _load_copy_in(plain).harvest(journal, tail_sample=5)
+
+        assert result.journal_path == 'data/j.db'
 
 
 class TestTheCommittedArtifactsCarryNoAbsolutePath:

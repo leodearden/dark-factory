@@ -41,6 +41,7 @@ SCRIPT_PATH = (
 GATE_BACKLOG = 'reconciliation_stale_gate_backlog'
 HUMAN_OPERATOR = 'reconciliation_stale_human_operator'
 DARK_ROOT = '/srv/dark-factory'
+REIFY_ROOT = '/srv/reify'
 PROJECT_ROOTS = {'dark_factory': DARK_ROOT}
 
 
@@ -123,19 +124,20 @@ def seeded_queue(tmp_path):
     return queue, tmp_path, records
 
 
+DARK_STORE = {
+    'master': {
+        '650': 'done',
+        '651': 'blocked',
+        '653': 'cancelled',
+        '654': 'done',
+        '656': 'done',
+    },
+}
+
+
 @pytest.fixture
 def taskmaster():
-    return _make_taskmaster({
-        DARK_ROOT: {
-            'master': {
-                '650': 'done',
-                '651': 'blocked',
-                '653': 'cancelled',
-                '654': 'done',
-                '656': 'done',
-            },
-        },
-    })
+    return _make_taskmaster({DARK_ROOT: DARK_STORE})
 
 
 def _resolution_note_of(queue: EscalationQueue, esc_id: str) -> str:
@@ -388,22 +390,31 @@ class TestDeriveOrphanedReconEscalations:
 
     @pytest.mark.asyncio
     async def test_the_script_and_the_in_cycle_sweep_agree_record_for_record(
-        self, seeded_queue, taskmaster,
+        self, seeded_queue,
     ):
         """ONE derivation, two channels: the counts and the selected set must match.
 
         Stage 1 flags and this script closes, so a drift between them hands
         the sole closer a set the in-cycle finding never named.  Sharing only
         the leaf predicates did not prevent that — the composition that
-        produces the counts is what has to be shared.
+        produces the counts is what has to be shared.  A cycle flags only its
+        own project's share of the reap set, so a reapable reify record is
+        seeded to put the agreement across that boundary.
         """
-        _, queue_dir, _ = seeded_queue
+        queue, queue_dir, _ = seeded_queue
+        foreign = _submit(queue, '5944', project_id='reify')
+        roots = {**PROJECT_ROOTS, 'reify': REIFY_ROOT}
+        taskmaster = _make_taskmaster({
+            DARK_ROOT: DARK_STORE,
+            REIFY_ROOT: {'master': {'5944': 'cancelled'}},
+        })
 
         report = await _mod.run(
-            queue_dir=queue_dir, project_roots=PROJECT_ROOTS, taskmaster=taskmaster,
+            queue_dir=queue_dir, project_roots=roots, taskmaster=taskmaster,
         )
         stats = await sweep_orphaned_recon_escalations(
-            EscalationQueue(queue_dir), taskmaster, PROJECT_ROOTS,
+            EscalationQueue(queue_dir), taskmaster, roots,
+            running_project_id='dark_factory',
         )
 
         for key in (
@@ -413,11 +424,53 @@ class TestDeriveOrphanedReconEscalations:
             assert report[key] == stats[key], (
                 f'{key}: {report[key]} via the script, {stats[key]} in-cycle'
             )
-        assert len(stats['flags']) == len(report['reapable_ids'])
-        for esc_id in report['reapable_ids']:
+        assert foreign.id in report['reapable_ids'], 'the script reaps the fleet'
+        assert not any(foreign.id in f['description'] for f in stats['flags']), (
+            "dark_factory's cycle flagged reify's orphan"
+        )
+        own_project_reapable = set(report['reapable_ids']) - {foreign.id}
+        assert own_project_reapable, 'the seeded queue must exercise the agreement'
+        assert len(stats['flags']) == len(own_project_reapable)
+        for esc_id in own_project_reapable:
             assert sum(esc_id in f['description'] for f in stats['flags']) == 1, (
                 f'{esc_id} is reapable by the script but named by no in-cycle flag'
             )
+
+    @pytest.mark.asyncio
+    async def test_a_cycle_flags_only_its_own_project_while_the_script_reaps_the_fleet(
+        self, tmp_path,
+    ):
+        """THE TASK-5813 ACCEPTANCE: flags are per-project, the reap is fleet-wide.
+
+        dark_factory's cycle must not flag reify's orphan under a bare numeric
+        id, yet still count it; and the operator script, which is the only
+        channel that reaches an orphan whose project never runs a cycle, must
+        still close both.
+        """
+        queue = EscalationQueue(tmp_path)
+        _submit(queue, '650')
+        _submit(queue, '5944', project_id='reify')
+        roots = {'dark_factory': DARK_ROOT, 'reify': REIFY_ROOT}
+        taskmaster = _make_taskmaster({
+            DARK_ROOT: {'master': {'650': 'done'}},
+            REIFY_ROOT: {'master': {'5944': 'cancelled'}},
+        })
+
+        stats = await sweep_orphaned_recon_escalations(
+            EscalationQueue(tmp_path), taskmaster, roots,
+            running_project_id='dark_factory',
+        )
+
+        assert [f['task_id'] for f in stats['flags']] == ['650']
+        assert stats['terminal'] == 2, 'both orphans still count in the stats'
+
+        report = await _mod.run(
+            queue_dir=tmp_path, project_roots=roots, apply=True, taskmaster=taskmaster,
+        )
+
+        assert set(report['reapable_ids']) == {'esc-650-1', 'esc-5944-1'}
+        assert report['reaped'] == 2
+        assert EscalationQueue(tmp_path).get_pending() == []
 
     @pytest.mark.asyncio
     async def test_apply_is_idempotent(self, seeded_queue, taskmaster):
@@ -469,7 +522,7 @@ class TestDeriveOrphanedReconEscalations:
 
 
 class TestMissingQueueDirRefusal:
-    """The task-4319 preflight: a queue dir that does not exist is REFUSED.
+    """The task-4319 preflight: a queue dir that is missing or empty is REFUSED.
 
     ``EscalationQueue.__init__`` mkdirs its ``queue_dir``, so without the guard
     a mis-targeted ``--queue-dir`` -- or the RELATIVE default run from anywhere
@@ -477,7 +530,7 @@ class TestMissingQueueDirRefusal:
     ``"scanned": 0, "reaped": 0`` and exits 0: a false all-clear
     indistinguishable from a clean one.
 
-    Every OTHER class in this file passes an EXISTING ``tmp_path``, so the
+    Every OTHER class in this file passes a SEEDED ``tmp_path``, so the
     guard is a verified no-op for them.  If one of them breaks, that is a
     signal the guard was placed wrongly -- not a licence to weaken it.
     """
@@ -524,17 +577,19 @@ class TestMissingQueueDirRefusal:
             )
 
     @pytest.mark.asyncio
-    async def test_an_existing_queue_dir_passes_the_guard(self, tmp_path, taskmaster):
-        """The guard requires neither absoluteness nor a non-empty queue."""
-        report = await _mod.run(
-            queue_dir=tmp_path, project_roots=PROJECT_ROOTS, taskmaster=taskmaster,
-        )
+    async def test_an_empty_existing_queue_dir_is_refused(self, tmp_path, taskmaster):
+        """An empty queue dir is refused before the scan (task 5468).
 
-        assert report['scanned'] == 0
-        assert report['reaped'] == 0
+        The predicate is pinned in test_target_store_preflight.py::TestQueueDirArm.
+        """
+        with pytest.raises(TargetStoreMissing):
+            await _mod.run(
+                queue_dir=tmp_path, project_roots=PROJECT_ROOTS, taskmaster=taskmaster,
+            )
 
+    @pytest.mark.parametrize('create_empty_dir', [False, True], ids=['missing', 'empty'])
     def test_main_reports_the_refusal_as_a_nonzero_exit_not_a_traceback(
-        self, tmp_path, capsys,
+        self, tmp_path, capsys, create_empty_dir,
     ):
         """A refusal routed through the normal report path would exit 0.
 
@@ -545,11 +600,14 @@ class TestMissingQueueDirRefusal:
         """
         import sys as _sys  # noqa: PLC0415
 
-        missing = tmp_path / 'data' / 'reconciliation' / 'escalations'
+        target = tmp_path / 'data' / 'reconciliation' / 'escalations'
+        if create_empty_dir:
+            target.mkdir(parents=True)
+        before = sorted(tmp_path.rglob('*'))
         old_argv = _sys.argv
         try:
             _sys.argv = [
-                'derive_orphaned_recon_escalations.py', '--queue-dir', str(missing),
+                'derive_orphaned_recon_escalations.py', '--queue-dir', str(target),
             ]
             code = _mod.main()
         finally:
@@ -558,10 +616,10 @@ class TestMissingQueueDirRefusal:
         assert code == _mod.EXIT_QUEUE_DIR_MISSING
         assert code != 0
         captured = capsys.readouterr()
-        assert str(missing) in captured.err
+        assert str(target) in captured.err
         assert 'Traceback' not in captured.err
         assert captured.out == '', 'a refusal must not print a report to stdout'
-        assert not missing.exists()
+        assert sorted(tmp_path.rglob('*')) == before, 'a refusal must create nothing'
 
 
 class TestMainExitCodes:

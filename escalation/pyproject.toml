@@ -71,15 +71,10 @@ orchestrator = { workspace = true }
 # 5408's `-n auto --dist loadgroup` then made it false on its face.
 # WHAT SURVIVES IS A MEASUREMENT: the addopts block below records this suite
 # green under those exact flags, signal unchanged.
-# NOT flipped to `thread`, deliberately, and the argument for why that flip is a
-# real trade rather than a free upgrade is NOT restated here — it lives once in
-# fused-memory/pyproject.toml's own `timeout_method` block, which records the
-# opposite experience ("signal proved unreliable under pytest-xdist workers in
-# practice") together with the mechanism (pytest-timeout's thread handler ends in
-# `os._exit(1)`, killing the whole xdist worker; near end-of-suite the controller
-# can deadlock waiting for a completion signal that never arrives). Changing it
-# on no measurement, inside a config-only task, would be unmeasured scope creep;
-# the open question is filed as residue 2 of task 5470.
+# DECIDED ON MEASUREMENT (task 5470): signal is KEPT. Under the pinned
+# pytest-xdist, worker tests run on the worker's main thread, so a signal
+# timeout fails the one test and the worker survives. The signal-vs-thread
+# trade and that evidence live once, in tests/scripts/test_timeout_method_policy.py.
 timeout = 540
 timeout_method = "signal"
 

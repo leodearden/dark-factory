@@ -78,6 +78,7 @@ from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import _all_project_roots, collect_tasks_with_counts
 from dashboard.data.mcp_fanout import TTLCache, fanout_label, first_success, project_label
 from dashboard.data.memory import mcp_tool_call
+from dashboard.data.task_snapshot import SnapshotHealth, classify
 from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
@@ -406,8 +407,8 @@ def _stranded_park_rows(
 
     Args:
         park_stacks:   ``{module_key: [entry, ...]}`` from the scheduler
-                       snapshot.  Each stack entry has ``owner``, ``rank``,
-                       ``shadowed``, and ``installed_at`` fields.
+                       snapshot; entry fields are owned by
+                       ``orchestrator/src/orchestrator/scheduler.py::ModuleLockTable.snapshot_park_stacks``.
         live_task_ids: Set of task_ids present in the active-tasks snapshot
                        (``{r['task_id'] for r in rows}``).  Owners in this
                        set are live and are skipped.
@@ -425,7 +426,7 @@ def _stranded_park_rows(
           park_state={'modules': sorted(mods), 'installed_at': str},
           lock_set=sorted(mods), age_seconds=int.
     """
-    # Build {owner: {'mods': [module, ...], 'installed_at': str}} across all stacks.
+    # Build {owner: {'mods': {module, ...}, 'installed_at': str}} across all stacks.
     owner_data: dict[str, dict] = {}
     for mod, stack in (park_stacks or {}).items():
         for entry in stack:
@@ -433,8 +434,8 @@ def _stranded_park_rows(
             if not owner:
                 continue
             if owner not in owner_data:
-                owner_data[owner] = {'mods': [], 'installed_at': ''}
-            owner_data[owner]['mods'].append(mod)
+                owner_data[owner] = {'mods': set(), 'installed_at': ''}
+            owner_data[owner]['mods'].add(mod)
             # Keep first non-empty installed_at encountered across all modules.
             if not owner_data[owner]['installed_at']:
                 ia = entry.get('installed_at') or ''
@@ -684,11 +685,14 @@ async def collect_scheduler_state(
     since = effective_now - timedelta(hours=1)
 
     # Fetch active tasks (for lock sets and titles).
-    (
-        all_active, active_offline, _done_counts, degraded_projects, _count_unknown,
-    ) = await collect_tasks_with_counts(client, config, now=effective_now)
-
-    offline_projects: list[str] = list(active_offline)
+    all_active, snapshots = await collect_tasks_with_counts(client, config, now=effective_now)
+    health = {label: classify(snapshot) for label, snapshot in snapshots.items()}
+    offline_projects: list[str] = [
+        label for label, h in health.items() if h is SnapshotHealth.OFFLINE
+    ]
+    degraded_projects: list[str] = [
+        label for label, h in health.items() if h is SnapshotHealth.DEGRADED
+    ]
 
     # Determine which project roots still need querying
     roots_to_query = [

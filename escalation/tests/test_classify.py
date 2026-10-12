@@ -6,11 +6,16 @@ effective-benign predicate, and the per-path benign default helper
 from __future__ import annotations
 
 import pytest
+from _info_l0_records import done_step_tripwire, info_l0_note, info_scope_divergence
 
 from escalation.classify import (
+    DONE_STEP_COMMIT_ORPHAN_CLASS,
+    INFO_L0_MECHANICAL_ROLES,
     classify_resolver_tier,
     default_resolution_class_for_resolver,
     effective_benign,
+    info_l0_mechanical_class,
+    is_done_step_commit_orphan,
 )
 from escalation.models import Escalation
 
@@ -193,3 +198,69 @@ class TestDefaultResolutionClassForResolver:
     def test_random_role_defaults_none(self):
         """resolved_by='random-role' (other-auto tier) defaults to None."""
         assert default_resolution_class_for_resolver('random-role') is None
+
+
+# ---------------------------------------------------------------------------
+# Mechanical info-L0 classes (plans/info-l0-disposition-router-prd.md D8)
+# ---------------------------------------------------------------------------
+
+class TestInfoL0MechanicalRoles:
+    def test_bare_orchestrator_role_is_not_registered(self):
+        """The bare 'orchestrator' role also files blocking work, so it may
+        only match through a discriminator, never by role alone."""
+        assert 'orchestrator' not in INFO_L0_MECHANICAL_ROLES
+
+    def test_done_step_class_key_is_not_a_registered_role(self):
+        """The aggregate sentinel is keyed per class key, so the discriminated
+        class must not collide with a role-keyed one."""
+        assert DONE_STEP_COMMIT_ORPHAN_CLASS not in INFO_L0_MECHANICAL_ROLES
+
+
+class TestIsDoneStepCommitOrphan:
+    def test_matches_the_done_step_tripwire_shape(self):
+        assert is_done_step_commit_orphan(done_step_tripwire()) is True
+
+    @pytest.mark.parametrize(
+        ('field', 'value'),
+        [
+            ('agent_role', 'implementer'),
+            ('category', 'design_concern'),
+            ('suggested_action', 'investigate_and_retry'),
+        ],
+    )
+    def test_any_one_differing_field_does_not_match(self, field: str, value: str):
+        esc = done_step_tripwire()
+        setattr(esc, field, value)
+        assert is_done_step_commit_orphan(esc) is False
+
+
+class TestInfoL0MechanicalClass:
+    @pytest.mark.parametrize('role', sorted(INFO_L0_MECHANICAL_ROLES))
+    def test_registered_role_is_its_own_class(self, role: str):
+        assert info_l0_mechanical_class(info_l0_note(agent_role=role)) == role
+
+    def test_done_step_tripwire_is_the_done_step_class(self):
+        assert info_l0_mechanical_class(done_step_tripwire()) == DONE_STEP_COMMIT_ORPHAN_CLASS
+
+    def test_agent_note_is_not_mechanical(self):
+        assert info_l0_mechanical_class(info_l0_note()) is None
+
+    def test_unregistered_orchestrator_role_is_not_mechanical(self):
+        record = info_l0_note(agent_role='orchestrator-some-new-monitor')
+        assert info_l0_mechanical_class(record) is None
+
+    def test_injected_registry_is_honoured(self):
+        record = info_l0_note(agent_role='orchestrator-starvation-watchdog')
+        assert info_l0_mechanical_class(record, frozenset()) is None
+
+    def test_scope_divergence_shape_is_not_mechanical(self):
+        """There is deliberately no scope-divergence class (esc-5221-3).
+
+        Its only filer,
+        orchestrator/src/orchestrator/workflow.py::TaskWorkflow._escalate_scope_invariant_violation,
+        files severity='blocking' by design (plans/task-escalation-state-graph-prd.md
+        D11), so the blocking reaper arm keeps it.  An INFO record of that shape
+        is therefore unexpected and must fall to the curator leg (D8 fail-loud)
+        rather than close silently as status-info.
+        """
+        assert info_l0_mechanical_class(info_scope_divergence()) is None

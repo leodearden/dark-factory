@@ -64,7 +64,7 @@
 # would exit 4 with "unrecognized arguments: -n". The single place that defines
 # this verify leg is this test_command, so this is the SPOT. Both halves are
 # gated by tests/scripts/test_merge_gate_parallelism_config.py::
-# test_scripts_leg_carries_the_parallel_flags_on_its_test_command and
+# test_non_member_legs_carry_the_parallel_flags_on_their_test_command and
 # ::test_root_addopts_never_leaks_the_parallel_flags.
 # `auto` rather than a literal, and `--dist loadgroup` rather than xdist's
 # default: both arguments are written once, in the guard that enforces them —

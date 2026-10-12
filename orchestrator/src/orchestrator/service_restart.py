@@ -13,20 +13,20 @@ This guarantees:
 - The restart script runs detached / fire-and-forget so it never blocks the
   orchestrator event loop.
 
-Two instances are used in production:
+The harness polls ``maybe_restart`` on its own cadence, independent of the
+dispatch loop (``Harness._run_stale_service_restart_pass``), passing
+``agents_idle`` from live state.  Three instances are used in production:
 
-* **fused-memory** (``service_name='fused-memory'``, ``require_idle=True``):
-  prefers the run-loop's idle quiet-window (no dispatched agents), but
-  additionally force-fires on the busy-wait branch once a pending restart is
-  owed past ``force_fire_after_secs`` (wired from
-  ``config.fused_memory_restart_force_fire_after_secs``, task 2817) — the
-  anti-starvation backstop for chronic fleet saturation, where the idle branch
-  never runs and an armed restart would otherwise starve forever.
+* **fused-memory** (``require_idle=True``): prefers a quiet window with no
+  live agents, and force-fires once a pending restart is owed past
+  ``force_fire_after_secs`` (``config.fused_memory_restart_force_fire_after_secs``,
+  task 2817), so chronic fleet saturation cannot starve it.
   Script: ``scripts/restart-fused-memory.sh --drain``.
 
-* **dashboard** (``service_name='dashboard'``, ``require_idle=False``):
-  leaf service — fires even while agents are dispatching (promptly on the
-  busy-wait branch).  Script: ``scripts/restart-dashboard.sh`` (no drain).
+* **dashboard** (``require_idle=False``): leaf service — fires even while
+  agents are dispatching.  Script: ``scripts/restart-dashboard.sh`` (no drain).
+
+* **orchestrator** itself — see ``Harness._build_orchestrator_restart_coordinator``.
 """
 
 from __future__ import annotations
@@ -56,6 +56,7 @@ from __future__ import annotations
 import asyncio  # noqa: F401
 import json
 import logging
+import math
 import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -69,6 +70,13 @@ if TYPE_CHECKING:
 
 from orchestrator.event_store import EventType
 from orchestrator.proc_supervision import RestartDisposition, RestartPlan
+
+# IMPORTED, not copied (heuristic 11): session_registry._pid_alive already
+# encodes the pid contract lease_is_live needs, down to rejecting pid <= 0
+# before os.kill. Safe by inspection — session_registry imports nothing from
+# the orchestrator package, so there is no cycle — and it also spares this
+# module an `os` import it does not otherwise need.
+from orchestrator.session_registry import _pid_alive
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +95,29 @@ logger = logging.getLogger(__name__)
 # mirror of this literal value — guarded by drift/consistency tests so the
 # three copies cannot silently diverge.
 FLEET_DEPLOY_CLOCK_RELPATH = 'data/orchestrator/last_redeploy_orchestrator.json'
+
+# Relative path (from project_root) of the IN-FLIGHT fleet-redeploy lease
+# (task 4755). The clock above records when a sweep last FINISHED, which says
+# nothing while one is still running; this file is written by
+# restart-all-orchestrators.sh for exactly as long as its sweep lasts, and
+# removed on every exit path a shell can catch.
+#
+# Same import constraint as the clock, so the same mirroring: FOUR copies of
+# this literal — here, scripts/orchestrator-watchdog.py's FLEET_LEASE_PATH,
+# the bash script's LEASE_FILE, and df_pytest_isolation.FLEET_LEASE_RELPATH
+# (which the suite-wide deploy-state guard derives its watched relpath, its
+# redirect and its failure message from) — pinned against each other by
+# tests/scripts/test_orchestrator_watchdog.py::
+# test_fleet_lease_path_matches_across_tiers.
+FLEET_LEASE_RELPATH = 'data/orchestrator/fleet_redeploy_lease.json'
+
+# How old a lease may be before its readers stop believing it. The default of
+# orchestrator.config's orchestrator_restart_lease_max_age_secs, where its
+# derivation from the worst legitimate --drain sweep lives (task 5371: the
+# verify-wait cap made that ~13,300s, so 4h). A lease leaked by a SIGKILLed
+# sweep (whose EXIT trap cannot run, by construction) therefore delays at most
+# ONE redeploy window and can never wedge the fleet.
+DEFAULT_FLEET_LEASE_MAX_AGE_SECS = 14400.0
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +146,96 @@ def diff_touches_watched_paths(
             if path == prefix or path.startswith(boundary):
                 return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# In-flight fleet-redeploy lease reader (task 4755)
+# ---------------------------------------------------------------------------
+
+def lease_is_live(path: Path | None, *, now: float, max_age_secs: float) -> bool:
+    """Whether a fleet-redeploy sweep is holding the lease at *path* right now.
+
+    Liveness requires BOTH that the recorded pid is still running AND that the
+    lease is younger than *max_age_secs*, and neither half is redundant.
+    Dropping the age check would let one SIGKILLed sweep wedge every redeploy
+    tier indefinitely, since SIGKILL is uncatchable and the producer's EXIT
+    trap cannot run; dropping the pid check would make a crashed sweep hold
+    the fleet for the whole bound rather than until it died.
+
+    FAIL-OPEN throughout: a missing, corrupt, unreadable or nonsensical lease
+    reads as "no sweep in flight" and never raises. Same direction as
+    ``_load_last_fire_wall`` below and ``merge_phase_hold``, and deliberately
+    the opposite of ``restart_precondition``'s fail-safe/defer — a file nobody
+    can read must never be able to stop the fleet redeploying. The same
+    asymmetry as ``_load_last_fire_wall`` applies to logging: an ABSENT lease
+    is the ordinary no-sweep-running case and is silent, while a present but
+    unusable one logs, because it means something is wrong with a file that
+    should not be there in that state.
+
+    A FUTURE-dated lease is released for the same reason, and the asymmetry is
+    the one the max-age bound itself rests on: honouring a negative age makes
+    the lease immortal, because no bound can ever expire it, while releasing it
+    costs at most one collision — exactly pre-4755 behaviour. A backwards clock
+    step is the cheap failure; a wedged fleet is not.
+
+    The pid predicate is ``session_registry._pid_alive``, IMPORTED rather than
+    re-implemented (heuristic 11): it already encodes the required contract,
+    including rejecting ``pid <= 0`` BEFORE ``os.kill`` — ``os.kill(0, 0)``
+    signals the caller's whole process group. The type checks here are this
+    function's own share of that contract, because JSON can hand us a string
+    or a bool where that predicate expects an int. The watchdog's fourth copy
+    of the same predicate is FORCED by its stdlib-only constraint, not a
+    second opinion.
+    """
+    if path is None:
+        return False
+    try:
+        raw = json.loads(path.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            'ignoring unreadable/corrupt fleet-redeploy lease at %s: %s', path, exc,
+        )
+        return False
+    if not isinstance(raw, dict):
+        logger.warning(
+            'ignoring fleet-redeploy lease at %s: body is %s, not an object',
+            path,
+            type(raw).__name__,
+        )
+        return False
+    pid = raw.get('pid')
+    started_ts = raw.get('started_ts')
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or not isinstance(started_ts, (int, float))
+        or isinstance(started_ts, bool)
+        # json.loads accepts bare NaN/Infinity/-Infinity and hands back a
+        # float, so a non-finite timestamp passes every check above and then
+        # DEFEATS the bound rather than failing it: every comparison against
+        # NaN is False. Same guard block, same WARNING, so the one invariant
+        # ("this lease's age is usable") is enforced at one site.
+        or not math.isfinite(started_ts)
+    ):
+        logger.warning(
+            'ignoring fleet-redeploy lease at %s: unusable pid/started_ts in %r',
+            path,
+            raw,
+        )
+        return False
+    age = now - started_ts
+    if age < 0.0:
+        logger.warning(
+            'ignoring fleet-redeploy lease at %s: stamped %.0fs in the future',
+            path,
+            -age,
+        )
+        return False
+    if age >= max_age_secs:
+        return False
+    return _pid_alive(pid)
 
 
 # ---------------------------------------------------------------------------
@@ -342,13 +463,21 @@ class StaleServiceRestartCoordinator:
         the script stamps that file only AFTER every unit — including this
         one, restarted last — verifies fresh, a freshly-restarted process
         can construct and re-seed BEFORE that post-restart stamp lands,
-        transiently seeding from the prior (stale or absent) value. Worst
-        case this relaxes this coordinator's OWN ``min_interval_secs`` cap
-        by one extra fire across that single restart — bounded, and the
-        same "a lost timestamp merely relaxes the cap once" tolerance
-        already accepted below for persist failures. Callers that need a
-        hard cross-restart rate limit should treat the watchdog's
-        independent clock gate (``ORCH_RESTART_MIN_INTERVAL_SECS`` in
+        transiently seeding from the prior (stale or absent) value, which
+        relaxes this coordinator's OWN ``min_interval_secs`` cap.
+
+        This used to be described as costing "one extra fire across that
+        single restart — bounded". MEASURED 2026-08-24/25, and it is not:
+        the re-seed recurred on EVERY cycle while a permanently-busy unit
+        kept each sweep running for ~81m, producing three dark_factory runs
+        of 1.26h/0.92h/1.33h that together spent $146.39, landed zero tasks
+        and soft-cancelled 14 workflows. The race is now additionally
+        covered by ``lease_path`` below: while a sweep holds its in-flight
+        lease this coordinator stands down regardless of what its re-seeded
+        clock says, so a re-seed can no longer turn into a redeploy on top
+        of the running sweep. Callers that need a hard cross-restart rate
+        limit should still treat the watchdog's independent clock gate
+        (``ORCH_RESTART_MIN_INTERVAL_SECS`` in
         scripts/orchestrator-watchdog.py), not this in-memory cap, as
         authoritative.
     force_fire_after_secs:
@@ -367,6 +496,31 @@ class StaleServiceRestartCoordinator:
         orchestrator's own self-redeploy coordinator, whose polite path
         (``require_idle=True``) can otherwise starve indefinitely under
         chronic fleet saturation.
+    lease_path:
+        Path of the in-flight fleet-redeploy lease (task 4755), normally
+        ``project_root / FLEET_LEASE_RELPATH``. While
+        ``restart-all-orchestrators.sh`` is mid-sweep it holds that file;
+        ``maybe_restart`` then defers — on the polite AND the force-fire
+        path, and without clearing pending — so this coordinator cannot
+        redeploy the fleet on top of a sweep that is still restarting it.
+
+        THE ONLY gate here that reads disk at gate time, and necessarily so:
+        ``_load_last_fire_wall`` runs once, in ``__init__``, so the clock
+        alone can never reveal a sweep that started after this process did.
+        The clock records when a sweep FINISHED; the lease is the only state
+        that says one is running NOW.
+
+        ``None`` (the default, and the fused-memory / dashboard instances'
+        value) disables the gate entirely, leaving both paths
+        byte-identical. A missing, corrupt or expired lease is fail-OPEN —
+        see ``lease_is_live``.
+    lease_max_age_secs:
+        How old a lease may be before ``maybe_restart`` stops believing it
+        (default ``DEFAULT_FLEET_LEASE_MAX_AGE_SECS``, whose derivation is
+        at that constant). Not belt-and-braces: SIGKILL is uncatchable, so a
+        killed sweep's EXIT trap cannot remove its lease, and without this
+        bound one such sweep would wedge every redeploy tier until an
+        operator noticed by hand.
     """
 
     def __init__(
@@ -393,6 +547,8 @@ class StaleServiceRestartCoordinator:
         force_fire_after_secs: float = 0.0,
         merge_phase_hold: Callable[[], bool] | None = None,
         merge_phase_grace_secs: float = 0.0,
+        lease_path: Path | None = None,
+        lease_max_age_secs: float = DEFAULT_FLEET_LEASE_MAX_AGE_SECS,
     ) -> None:
         self._git_ops = git_ops
         self._event_store = event_store
@@ -455,6 +611,16 @@ class StaleServiceRestartCoordinator:
         # raising hold is fail-open (proceed to fire) — see maybe_restart.
         self._merge_phase_hold = merge_phase_hold
         self._merge_phase_grace_secs = merge_phase_grace_secs
+        # In-flight fleet-redeploy lease (task 4755). When set, maybe_restart
+        # stands down for as long as a sweep is holding it — on BOTH the
+        # polite and the force-fire paths. None (the default, and the
+        # fused-memory / dashboard instances' value) => byte-identical prior
+        # behaviour, no gate. This is the ONE gate in this class that reads
+        # disk at gate time, and it has to: _load_last_fire_wall runs once, in
+        # this constructor, so nothing a sweep writes during this process's
+        # lifetime is otherwise observable.
+        self._lease_path = lease_path
+        self._lease_max_age_secs = lease_max_age_secs
 
         # State
         self._pending: bool = False
@@ -557,16 +723,19 @@ class StaleServiceRestartCoordinator:
         Conditions: enabled AND pending AND (agents_idle AND debounce elapsed
         AND (no restart_precondition OR restart_precondition() is truthy))
         OR the force-fire escape (see below). In both cases the min_interval
-        wall-clock cap is still enforced afterward.
+        wall-clock cap and then the in-flight fleet-redeploy lease gate
+        (``lease_path``) are still enforced afterward — the lease last, so
+        the disk read happens only on a call that would otherwise fire, and
+        on both paths, since a sweep in flight is a reason to stand down
+        however the fire was reached.
 
         Force-fire escape (fleet-redeploy PRD task delta): once a pending
         restart's owed-age (``clock() - _first_pending_monotonic``) reaches
         ``force_fire_after_secs`` (disabled when ``0.0``), the agents_idle
         gate, the debounce, and the restart_precondition preference are all
         bypassed — but the min_interval cap below is NEVER bypassed. This
-        exists so the polite path (which requires ``agents_idle=True``, only
-        reachable from the run-loop's idle branch) cannot starve a pending
-        restart indefinitely under chronic fleet saturation.
+        exists so the polite path (which requires ``agents_idle=True``) cannot
+        starve a pending restart indefinitely under chronic fleet saturation.
 
         This class does NOT itself provide an interrupt-safety net for
         whatever ``restart_precondition`` was standing in for (e.g. a
@@ -684,6 +853,30 @@ class StaleServiceRestartCoordinator:
                     self._min_interval_secs,
                 )
                 return False
+
+        # In-flight fleet-redeploy lease (task 4755). Sited HERE — after the
+        # in-memory min-interval cap, before the executor — for two reasons.
+        # It must gate BOTH the polite and the force-fire paths, and the
+        # force-fire one is the half the measured 2026-08-24/25 incident
+        # actually took ("pending restart owed 17300s"), which is exactly the
+        # half merge_phase_hold does not reach. And the cheap in-memory cap
+        # runs first, so the disk read happens only on calls that would
+        # otherwise have fired.
+        #
+        # Defers WITHOUT clearing pending and without touching the owed-age
+        # anchor, identical to the cap above: the restart fires on the first
+        # tick after the sweep finishes rather than waiting to be re-armed.
+        if self._lease_path is not None and lease_is_live(
+            self._lease_path,
+            now=self._wall_clock(),
+            max_age_secs=self._lease_max_age_secs,
+        ):
+            logger.info(
+                f'{self._service_name} skip redeploy: a fleet-redeploy sweep is'
+                ' already in flight (lease at %s); pending retained.',
+                self._lease_path,
+            )
+            return False
 
         # Snapshot trigger metadata before clearing
         trigger_task_ids = list(self._trigger_task_ids)

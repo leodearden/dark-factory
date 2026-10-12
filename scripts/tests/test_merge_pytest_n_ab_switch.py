@@ -1,12 +1,12 @@
 """Tests for merge-pytest-n-ab-switch.sh — drives the real script via
-subprocess against a REAL loopback MCP server on an ephemeral port (the
-`_FakeMcpServer` idiom that task 5247 later retired, extended to the
-STATEFUL escalation server's measured behaviour) and a REAL temp git repo
-holding a temp dark-factory-orchestrator.yaml (the
-test_deploy_w11_lane_lifecycle.py idiom), so step 1's YAML editor, step 2's
-commit idempotency and step 4's assertion are exercised in COMPOSITION —
+subprocess against a REAL loopback stateful escalation MCP on an ephemeral
+port and a REAL temp git repo holding a temp dark-factory-orchestrator.yaml
+(the test_deploy_w11_lane_lifecycle.py idiom), so step 1's YAML editor, step
+2's commit idempotency and step 4's assertion are exercised in COMPOSITION —
 which is where the crash-resume defect lives: file already at the value ->
-nothing to commit -> the reload reports no verify_env change.
+nothing to commit -> the reload reports no verify_env change. The server, its
+transport-fault catalogue and the temp-repo helpers live in
+config_reload_script_fakes, which owns the measured wire model.
 
 The reload travels over a real socket on purpose. A faked `curl` can only
 ever return what the test author already believes the wire looks like, so it
@@ -19,227 +19,33 @@ one the test itself owns, bound to an ephemeral port.
 from __future__ import annotations
 
 import json
-import os
-import shutil
-import socket
 import subprocess
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import types
 from pathlib import Path
 
 import pytest
+from config_reload_script_fakes import (
+    TRANSPORT_FAULTS,
+    ClosedPort,
+    FakeEscalationMcp,
+    commit_config,
+    git,
+    head,
+    init_repo,
+    path_python3_shimmed_to,
+    path_python3_that_cannot_run,
+    reload_report,
+    system_python_without_the_transport,
+    venvless_checkout_copy,
+)
 
 SCRIPT = Path(__file__).parent.parent / "merge-pytest-n-ab-switch.sh"
 KEY = "PYTEST_XDIST_AUTO_NUM_WORKERS"
 
 
-def _sse_frame(payload):
-    """One `event: message` SSE frame -- how the escalation MCP frames every
-    `tools/call` reply."""
-    return f"event: message\ndata: {json.dumps(payload)}\n\n"
-
-
-# ---------------------------------------------------------------------------
-# The stateful escalation MCP, for real, on an ephemeral port
-# ---------------------------------------------------------------------------
-
-class _FakeEscalationMcp:
-    """A real HTTP server speaking the STATEFUL streamable-HTTP protocol the
-    escalation MCP really speaks, answering `reload_config` with *report*.
-
-    Modelled on the `_FakeMcpServer` fixture that task 5247 later retired,
-    and extended with the two behaviours that fixture has no
-    reason to model, its target (fused-memory :8002) being STATELESS: the 400
-    rejection of a session-less request, and `text/event-stream` framing of
-    the `tools/call` reply. Every behaviour below was measured live against
-    the dark-factory escalation MCP at 127.0.0.1:8102 on 2026-09-12:
-
-      * any request but `initialize` without an `mcp-session-id` header -> 400
-        carrying the server's own "Missing session ID" envelope;
-      * `initialize` -> 200 plus an `mcp-session-id` RESPONSE header;
-      * `notifications/initialized` -> 202 with no body at all;
-      * `tools/call` -> 200 `text/event-stream`, SSE-framed;
-      * `DELETE` (session termination) -> 200.
-
-    `received` records every (verb, headers, payload) seen, so a test asserts
-    the script really handshook — and really released the session — rather
-    than merely exited 0.
-
-    `initialize_reply` / `tool_call_reply` each override one step of that
-    exchange with a literal (status, headers, body) triple, which is how the
-    transport-fault cases below are built without restating the handshake.
-    """
-
-    SESSION_ID = "sess-5379-fake"
-
-    MISSING_SESSION_REPLY = (
-        400,
-        {"Content-Type": "application/json"},
-        json.dumps({
-            "jsonrpc": "2.0",
-            "id": "server-error",
-            "error": {"code": -32600, "message": "Bad Request: Missing session ID"},
-        }),
-    )
-
-    def __init__(self, report=None, *, initialize_reply=None, tool_call_reply=None):
-        self.report = report
-        self.initialize_reply = initialize_reply
-        self.tool_call_reply = tool_call_reply
-        self.received = []
-        outer = self
-
-        class Handler(BaseHTTPRequestHandler):
-            protocol_version = "HTTP/1.1"
-
-            def do_POST(self):
-                length = int(self.headers.get("Content-Length") or 0)
-                raw = self.rfile.read(length) if length else b""
-                try:
-                    payload = json.loads(raw) if raw else {}
-                except json.JSONDecodeError:
-                    payload = {"_raw": raw.decode()}
-                outer.received.append((self.command, dict(self.headers), payload))
-                self._reply(*outer._respond(self.headers, payload))
-
-            def do_DELETE(self):
-                outer.received.append((self.command, dict(self.headers), {}))
-                self._reply(200, {}, "")
-
-            def _reply(self, status, headers, body):
-                data = body.encode()
-                self.send_response(status)
-                for name, value in headers.items():
-                    self.send_header(name, value)
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                if data:
-                    self.wfile.write(data)
-
-            def log_message(self, *args):
-                pass
-
-        self._httpd = HTTPServer(("127.0.0.1", 0), Handler)
-        self.port = self._httpd.server_port
-
-    def _respond(self, headers, payload):
-        """(status, headers, body) for one request."""
-        method = payload.get("method")
-        if method != "initialize" and not headers.get("mcp-session-id"):
-            return self.MISSING_SESSION_REPLY
-        if method == "initialize":
-            return self.initialize_reply or (
-                200,
-                {"Content-Type": "application/json",
-                 "mcp-session-id": self.SESSION_ID},
-                json.dumps({"jsonrpc": "2.0", "id": payload.get("id"),
-                            "result": {"protocolVersion": "2024-11-05"}}),
-            )
-        if method == "notifications/initialized":
-            return (202, {}, "")
-        return self.tool_call_reply or (
-            200,
-            {"Content-Type": "text/event-stream"},
-            _sse_frame({"jsonrpc": "2.0", "id": payload.get("id"),
-                        "result": {"structuredContent": self.report}}),
-        )
-
-    def __enter__(self):
-        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
-        self._thread.start()
-        return self
-
-    def __exit__(self, *exc):
-        self._httpd.shutdown()
-        self._httpd.server_close()
-        self._thread.join(timeout=5)
-
-
-def _rpc_methods(server):
-    """The JSON-RPC methods the server saw, in order (a DELETE carries none)."""
-    return [payload["method"] for _, _, payload in server.received if payload.get("method")]
-
-
-def _called_tools(server):
-    """The tool names every `tools/call` the server saw asked for."""
-    return [
-        (payload.get("params") or {}).get("name")
-        for _, _, payload in server.received
-        if payload.get("method") == "tools/call"
-    ]
-
-
-def _delete_count(server):
-    """How many session-terminating DELETEs the server saw.
-
-    Read by the wire test rather than left to census_trigger's own suite: the
-    server this script talks to is the long-lived escalation process, and a
-    session it never releases stays in `StreamableHTTPSessionManager`'s
-    registry with a live anyio task behind it, one per run.
-    """
-    return sum(1 for verb, _, _ in server.received if verb == "DELETE")
-
-
-def _report(**overrides):
-    """A reload report in orchestrator/src/orchestrator/harness.py::
-    reload_config's return shape, every field defaulted so each test states
-    only what it varies.
-
-    `unchanged` defaults to an INT count because that is what is really on
-    the wire (config.py::ConfigDiff declares `unchanged: int`) -- it carries
-    no key names, which is why absence from `applied` is the only converged
-    signal there is.
-    """
-    report = {
-        "reloaded": True,
-        "config_path": None,
-        "applied": {},
-        "restart_required": {},
-        "unchanged": 37,
-        "error": None,
-    }
-    report.update(overrides)
-    return report
-
-
 # ---------------------------------------------------------------------------
 # Real temp git repo holding a temp dark-factory-orchestrator.yaml
 # ---------------------------------------------------------------------------
-
-def _git(repo, *args):
-    """Run a git command against *repo*, raising loudly on failure -- test
-    setup must never silently produce a repo that doesn't match the spec."""
-    subprocess.run(
-        ["git", "-C", str(repo), *args],
-        check=True, capture_output=True, text=True,
-    )
-
-
-def _init_repo(tmp_path):
-    """An empty real git repo at <tmp_path>/repo, ready to commit into.
-
-    A real repo (rather than a faked `git`) makes both halves of step 2
-    faithful -- the `git rev-parse --show-toplevel` resolution and the
-    "nothing to commit" idempotent path this bug lives on -- with no fake to
-    drift.
-    """
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-q", "-b", "main")
-    _git(repo, "config", "user.email", "test@example.com")
-    _git(repo, "config", "user.name", "Test")
-    return repo
-
-
-def _commit_config(repo, text):
-    """Write *text* as *repo*'s dark-factory-orchestrator.yaml and commit it,
-    so the tree the script sees is clean. Returns the yaml path."""
-    config = repo / "dark-factory-orchestrator.yaml"
-    config.write_text(text)
-    _git(repo, "add", "dark-factory-orchestrator.yaml")
-    _git(repo, "commit", "-q", "-m", "seed")
-    return config
-
 
 def _make_repo(tmp_path, verify_env_value, *, marker=False):
     """A committed temp repo whose config's top-level `verify_env:` block pins
@@ -254,8 +60,8 @@ def _make_repo(tmp_path, verify_env_value, *, marker=False):
         f'  # A/B arm: {KEY} set to "{verify_env_value}" at '
         "2026-09-10T12:42:14Z by scripts/merge-pytest-n-ab-switch.sh\n"
     )
-    return _commit_config(
-        _init_repo(tmp_path),
+    return commit_config(
+        init_repo(tmp_path),
         "project_root: /nowhere\n"
         "max_concurrent_tasks: 3\n"
         "\n"
@@ -279,7 +85,7 @@ def _run(server, config_path, value, *, script=SCRIPT, env=None, cwd=None, flags
 
     *script* and *env* are the seams the interpreter-resolution tests need: a
     COPY of the script in a checkout with no venv, and a PATH whose `python3`
-    cannot import the transport. *cwd* is the seam the relative-config_path
+    lacks the transport or cannot run at all. *cwd* is the seam the relative-config_path
     case needs (the client cwd is what a relative path is resolved against),
     and *flags* carries `--dry-run`.
     """
@@ -290,18 +96,19 @@ def _run(server, config_path, value, *, script=SCRIPT, env=None, cwd=None, flags
     )
 
 
-def _head(repo):
-    return subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
-
-
 def _verdict(proc):
     """Parse the script's last non-empty stdout line as the JSON verdict."""
     lines = [line for line in proc.stdout.splitlines() if line.strip()]
     assert lines, f"no stdout at all; rc={proc.returncode} stderr={proc.stderr}"
     return json.loads(lines[-1])
+
+
+def _failure(proc):
+    """The failure tag of a run that must have failed, read from its verdict."""
+    assert proc.returncode != 0, f"stdout={proc.stdout} stderr={proc.stderr}"
+    verdict = _verdict(proc)
+    assert "outcome" not in verdict, verdict
+    return verdict["failure"]
 
 
 # ---------------------------------------------------------------------------
@@ -313,15 +120,15 @@ def test_flip_reports_outcome_applied_and_commits(tmp_path):
     touching only that file, and reports `outcome: applied`."""
     config = _make_repo(tmp_path, "16")
     repo = config.parent
-    before = _head(repo)
+    before = head(repo)
 
-    with _FakeEscalationMcp(_report(
+    with FakeEscalationMcp(reload_report(
         reloaded=True,
         config_path=str(config),
         applied={"verify_env": {"old": {KEY: "16"}, "new": {KEY: "8"}}},
     )) as server:
         proc = _run(server, config, "8")
-        methods = _rpc_methods(server)
+        methods = server.rpc_methods()
 
     assert proc.returncode == 0, f"stdout={proc.stdout} stderr={proc.stderr}"
     verdict = _verdict(proc)
@@ -332,15 +139,9 @@ def test_flip_reports_outcome_applied_and_commits(tmp_path):
         f"the script never handshook; the server saw {methods}"
     )
 
-    landed = subprocess.run(
-        ["git", "-C", str(repo), "rev-list", f"{before}..HEAD"],
-        check=True, capture_output=True, text=True,
-    ).stdout.split()
+    landed = git(repo, "rev-list", f"{before}..HEAD").split()
     assert len(landed) == 1, f"expected exactly one new commit, got {landed}"
-    touched = subprocess.run(
-        ["git", "-C", str(repo), "show", "--name-only", "--format=", "HEAD"],
-        check=True, capture_output=True, text=True,
-    ).stdout.split()
+    touched = git(repo, "show", "--name-only", "--format=", "HEAD").split()
     assert touched == ["dark-factory-orchestrator.yaml"]
     assert f'{KEY}: "8"' in config.read_text()
 
@@ -362,10 +163,10 @@ def test_converged_resume_exits_zero_when_reload_reports_no_verify_env_change(tm
     """
     config = _make_repo(tmp_path, "8", marker=True)
     repo = config.parent
-    before_head = _head(repo)
+    before_head = head(repo)
     before_bytes = config.read_bytes()
 
-    with _FakeEscalationMcp(_report(
+    with FakeEscalationMcp(reload_report(
         reloaded=True,
         error=None,
         config_path=str(config),
@@ -374,13 +175,13 @@ def test_converged_resume_exits_zero_when_reload_reports_no_verify_env_change(tm
         proc = _run(server, config, "8")
 
     assert proc.returncode == 0, f"stdout={proc.stdout} stderr={proc.stderr}"
-    assert "applied.verify_env does not carry" not in proc.stderr
     verdict = _verdict(proc)
+    assert "failure" not in verdict, verdict
     assert verdict["outcome"] == "already_converged"
     assert verdict["switched_to"] == "8"
     assert verdict["commit"] == "already-at-8"
 
-    assert _head(repo) == before_head, "a converged re-run must commit nothing"
+    assert head(repo) == before_head, "a converged re-run must commit nothing"
     assert config.read_bytes() == before_bytes, (
         "the idempotent rewrite must restore the prior A/B marker byte for "
         "byte, not stack a fresh one"
@@ -407,15 +208,15 @@ def test_converged_resume_over_the_real_stateful_transport(tmp_path):
     """
     config = _make_repo(tmp_path, "8", marker=True)
 
-    with _FakeEscalationMcp(_report(
+    with FakeEscalationMcp(reload_report(
         reloaded=True,
         config_path=str(config),
         applied={"max_turns.architect": {"old": 40, "new": 60}},
     )) as server:
         proc = _run(server, config, "8")
-        methods = _rpc_methods(server)
-        tools = _called_tools(server)
-        deletes = _delete_count(server)
+        methods = server.rpc_methods()
+        tools = server.called_tools()
+        deletes = server.delete_count()
 
     assert proc.returncode == 0, f"stdout={proc.stdout} stderr={proc.stderr}"
     assert _verdict(proc)["outcome"] == "already_converged"
@@ -430,9 +231,9 @@ def test_converged_resume_over_the_real_stateful_transport(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Step 1's own two exits, both of which end the run before the orchestrator is
-# ever contacted: the rehearsal, and the refusal to edit a config it cannot
-# find a verify_env block in.
+# Exits that end the run before the orchestrator is ever contacted: the
+# rehearsal, the refusal of a port no socket can reach, and step 1's refusal
+# to edit a config it cannot find a verify_env block in.
 # ---------------------------------------------------------------------------
 
 def test_dry_run_neither_commits_nor_reloads(tmp_path):
@@ -444,10 +245,10 @@ def test_dry_run_neither_commits_nor_reloads(tmp_path):
     """
     config = _make_repo(tmp_path, "16")
     repo = config.parent
-    before_head = _head(repo)
+    before_head = head(repo)
     before_bytes = config.read_bytes()
 
-    with _FakeEscalationMcp(_report(config_path=str(config))) as server:
+    with FakeEscalationMcp(reload_report(config_path=str(config))) as server:
         proc = _run(server, config, "8", flags=("--dry-run",))
         received = list(server.received)
 
@@ -456,7 +257,7 @@ def test_dry_run_neither_commits_nor_reloads(tmp_path):
     assert f'+  {KEY}: "8"' in proc.stdout, (
         f"a rehearsal that shows no diff rehearses nothing: {proc.stdout}"
     )
-    assert _head(repo) == before_head, "a rehearsal must not commit"
+    assert head(repo) == before_head, "a rehearsal must not commit"
     assert config.read_bytes() == before_bytes, "a rehearsal must not edit in place"
     assert received == [], f"a rehearsal must not reach the orchestrator: {received}"
 
@@ -466,22 +267,37 @@ def test_a_config_with_no_verify_env_block_is_refused_before_the_commit(tmp_path
     refuses rather than inventing one -- and refuses BEFORE the commit, so a
     config it cannot safely edit leaves no trace in git either.
     """
-    repo = _init_repo(tmp_path)
-    config = _commit_config(
+    repo = init_repo(tmp_path)
+    config = commit_config(
         repo, "project_root: /nowhere\nreview:\n  enabled: true\n"
     )
-    before_head = _head(repo)
+    before_head = head(repo)
     before_bytes = config.read_bytes()
 
-    with _FakeEscalationMcp(_report(config_path=str(config))) as server:
+    with FakeEscalationMcp(reload_report(config_path=str(config))) as server:
         proc = _run(server, config, "8")
         received = list(server.received)
 
-    assert proc.returncode != 0, f"stdout={proc.stdout}"
-    assert "refusing to invent one" in proc.stderr, f"stderr={proc.stderr}"
-    assert _head(repo) == before_head, "the refusal must precede the commit"
+    assert _failure(proc) == "config_edit_refused"
+    assert head(repo) == before_head, "the refusal must precede the commit"
     assert config.read_bytes() == before_bytes
     assert received == [], f"a refused edit must not reload anything: {received}"
+
+
+@pytest.mark.parametrize("bad_port", ["0", "65536", "99999"])
+def test_an_unconnectable_port_is_refused_before_the_commit(tmp_path, bad_port):
+    """A port outside 1-65535 can never deliver the reload, so it is refused
+    before a value that could never be hot-applied is committed."""
+    config = _make_repo(tmp_path, "16")
+    repo = config.parent
+    before_head = head(repo)
+    before_bytes = config.read_bytes()
+
+    proc = _run(types.SimpleNamespace(port=bad_port), config, "8")
+
+    assert _failure(proc) == "invalid_port"
+    assert head(repo) == before_head, "the refusal must precede the commit"
+    assert config.read_bytes() == before_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -492,16 +308,18 @@ def test_a_config_with_no_verify_env_block_is_refused_before_the_commit(tmp_path
 # and by a reload of a different orchestrator entirely (the port is a
 # caller-supplied argument, so a wrong one reaches another project's MCP).
 # This is a DEPLOY gate -- blessing an undeployed arm is worse than the
-# over-strict assertion the converged branch removes.
+# over-strict assertion the converged branch removes. A PRESENT verify_env
+# carrying our value is no stronger about OUR file: another orchestrator with
+# its own pending change to the same value reports exactly that, so the same
+# corroborators gate the flip.
 #
-# Each case pins the SPECIFIC diagnostic it is about, not merely a non-zero
-# exit: a transport rejection also exits non-zero, and a bare `returncode !=
-# 0` would let one stand in for all four and pass for the wrong reason.
+# Each case pins the failure TAG it is about, not merely a non-zero exit: a
+# transport rejection also exits non-zero, and a bare `returncode != 0` would
+# let one stand in for all four and pass for the wrong reason.
 # ---------------------------------------------------------------------------
 
-def _converged_verdict_lines(proc):
-    """Every stdout line that parses as a verdict claiming convergence."""
-    claims = []
+def _verdict_lines(proc):
+    """(line, verdict) for every stdout line that parses as a JSON object."""
     for line in proc.stdout.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -510,40 +328,51 @@ def _converged_verdict_lines(proc):
             parsed = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(parsed, dict) and parsed.get("outcome") == "already_converged":
-            claims.append(line)
-    return claims
+        if isinstance(parsed, dict):
+            yield line, parsed
+
+
+def _converged_verdict_lines(proc):
+    """Every stdout line that parses as a verdict claiming convergence."""
+    return [
+        line for line, verdict in _verdict_lines(proc)
+        if verdict.get("outcome") == "already_converged"
+    ]
+
+
+def _outcome_verdict_lines(proc):
+    """Every stdout line that parses as a verdict claiming any success outcome."""
+    return [line for line, verdict in _verdict_lines(proc) if "outcome" in verdict]
+
+
+def _other_projects_config(tmp_path):
+    """Another project's dark-factory-orchestrator.yaml, outside this repo."""
+    other = tmp_path / "other-project" / "dark-factory-orchestrator.yaml"
+    other.parent.mkdir()
+    other.write_text(f'verify_env:\n  {KEY}: "2"\n')
+    return other
 
 
 # id -> (builder taking (this repo's config, another project's config) and
-# returning a reload report with verify_env ABSENT from `applied`, the stderr
-# marker naming why that absence is not convergence).
-_UNCORROBORATED_ABSENCE = {
-    # Control: the existing error branch already rejects this one, so a green
-    # here proves the group's harness really drives the script.
-    "reload_failed_loudly": (
-        lambda config, other: _report(
-            reloaded=False, error="load_config: while parsing a block mapping",
-            config_path=str(config),
-        ),
-        "reload_config error",
-    ),
+# returning reload-report fields that fail to show THIS config file was
+# re-read and committed, the failure tag naming which corroborator is missing).
+# Shared by the converged and flip shapes, which must hold the reload to the
+# same corroborators.
+_CORROBORATOR_BREACHES = {
     # apply_reload rolled every leaf back, so the live config is untouched.
     "reload_failed_silently": (
-        lambda config, other: _report(
-            reloaded=False, error=None, config_path=str(config),
-        ),
-        "did not commit it",
+        lambda config, other: {"reloaded": False, "error": None, "config_path": str(config)},
+        "reload_not_committed",
     ),
     # We reloaded something that is not the file we just edited, so its
     # verify_env says nothing about ours.
     "different_config_file": (
-        lambda config, other: _report(reloaded=True, config_path=str(other)),
-        "re-read a different file",
+        lambda config, other: {"reloaded": True, "config_path": str(other)},
+        "different_config_file",
     ),
     "no_config_path": (
-        lambda config, other: _report(reloaded=True, config_path=None),
-        "re-read a different file",
+        lambda config, other: {"reloaded": True, "config_path": None},
+        "different_config_file",
     ),
     # A RELATIVE config_path is the reporting orchestrator's own
     # ORCH_CONFIG_PATH, resolved by ITS cwd -- resolving it against ours makes
@@ -551,49 +380,83 @@ _UNCORROBORATED_ABSENCE = {
     # runs from the config's checkout, which is exactly how it is run (and how
     # this group runs it below). Uncomparable, therefore not corroborating.
     "relative_config_path": (
-        lambda config, other: _report(
-            reloaded=True, config_path="dark-factory-orchestrator.yaml",
-        ),
-        "re-read a different file",
+        lambda config, other: {"reloaded": True, "config_path": "dark-factory-orchestrator.yaml"},
+        "different_config_file",
     ),
+}
+
+# The converged shape's cases: every corroborator breach, plus two that only
+# an ABSENT verify_env can carry.
+_UNCORROBORATED_ABSENCE = {
+    # Control: the existing error branch already rejects this one, so a green
+    # here proves the group's harness really drives the script.
+    "reload_failed_loudly": (
+        lambda config, other: {
+            "reloaded": False, "error": "load_config: while parsing a block mapping",
+            "config_path": str(config),
+        },
+        "reload_error",
+    ),
+    **_CORROBORATOR_BREACHES,
     # verify_env DID change, but was bucketed as restart-required instead of
     # hot-applied, so the arm is committed and NOT live -- and it is absent
     # from `applied` exactly like a converged one. Latent while verify_env
     # stays in RELOADABLE_FIELDS; a fail-open the moment it does not.
     "verify_env_is_restart_required": (
-        lambda config, other: _report(
-            reloaded=True, config_path=str(config),
-            restart_required={"verify_env": {"old": {KEY: "16"}, "new": {KEY: "8"}}},
-        ),
-        "restart-required, not hot-applied",
+        lambda config, other: {
+            "reloaded": True, "config_path": str(config),
+            "restart_required": {"verify_env": {"old": {KEY: "16"}, "new": {KEY: "8"}}},
+        },
+        "restart_required",
     ),
 }
 
 
 @pytest.mark.parametrize(
-    ("build_report", "diagnostic"),
+    ("report_fields", "failure"),
     list(_UNCORROBORATED_ABSENCE.values()),
     ids=list(_UNCORROBORATED_ABSENCE),
 )
-def test_uncorroborated_absence_is_not_convergence(tmp_path, build_report, diagnostic):
+def test_uncorroborated_absence_is_not_convergence(tmp_path, report_fields, failure):
     """An absent verify_env that is NOT corroborated by a committed reload of
     THIS config file must fail, naming which corroborator was missing."""
     config = _make_repo(tmp_path, "8", marker=True)
-    other = tmp_path / "other-project" / "dark-factory-orchestrator.yaml"
-    other.parent.mkdir()
-    other.write_text(f'verify_env:\n  {KEY}: "2"\n')
+    other = _other_projects_config(tmp_path)
 
-    with _FakeEscalationMcp(build_report(config, other)) as server:
+    with FakeEscalationMcp(reload_report(**report_fields(config, other))) as server:
         # From the config's own checkout, as an operator runs it -- and the
         # only cwd from which a relative reported config_path could realpath
         # onto ours and falsely corroborate.
         proc = _run(server, config, "8", cwd=config.parent)
 
-    assert proc.returncode != 0, (
-        f"an uncorroborated absence was read as success: stdout={proc.stdout}"
-    )
+    assert _failure(proc) == failure
     assert not _converged_verdict_lines(proc)
-    assert diagnostic in proc.stderr, f"stderr={proc.stderr}"
+
+
+@pytest.mark.parametrize(
+    ("report_fields", "failure"),
+    list(_CORROBORATOR_BREACHES.values()),
+    ids=list(_CORROBORATOR_BREACHES),
+)
+def test_a_flip_reported_by_an_uncorroborated_reload_is_not_applied(
+    tmp_path, report_fields, failure,
+):
+    """A verify_env flip to our value that is NOT corroborated by a committed
+    reload of THIS config file must fail too. The flip commit has landed, by
+    design, so the failure verdict names it."""
+    config = _make_repo(tmp_path, "16")
+    repo = config.parent
+    other = _other_projects_config(tmp_path)
+
+    with FakeEscalationMcp(reload_report(
+        **report_fields(config, other),
+        applied={"verify_env": {"old": {KEY: "16"}, "new": {KEY: "8"}}},
+    )) as server:
+        proc = _run(server, config, "8", cwd=config.parent)
+
+    assert _failure(proc) == failure
+    assert not _outcome_verdict_lines(proc)
+    assert _verdict(proc)["commit"] == head(repo, short=True)
 
 
 def test_applied_verify_env_carrying_a_different_value_still_fails(tmp_path):
@@ -601,15 +464,14 @@ def test_applied_verify_env_carrying_a_different_value_still_fails(tmp_path):
     other value is a contradiction, never convergence."""
     config = _make_repo(tmp_path, "8", marker=True)
 
-    with _FakeEscalationMcp(_report(
+    with FakeEscalationMcp(reload_report(
         reloaded=True,
         config_path=str(config),
         applied={"verify_env": {"old": {KEY: "8"}, "new": {KEY: "16"}}},
     )) as server:
         proc = _run(server, config, "8")
 
-    assert proc.returncode != 0, f"stdout={proc.stdout}"
-    assert "applied.verify_env does not carry" in proc.stderr
+    assert _failure(proc) == "value_mismatch"
     assert not _converged_verdict_lines(proc)
 
 
@@ -621,105 +483,45 @@ def test_applied_verify_env_carrying_a_different_value_still_fails(tmp_path):
 # should have failed -- it was that it failed while naming the WRONG cause:
 # every session-less POST got a 400 before any tool ran, and the script
 # reported `reloaded=None` and blamed an in-orchestrator rollback for it.
+#
+# The fault cases start from a config already at the value, so nothing is
+# committed and the transport fault is the only failure source; the flip-path
+# case at the end of this group owns the committed sha.
 # ---------------------------------------------------------------------------
 
-TRANSPORT_MARKER = "reload_config never reached the tool"
-
-_INITIALIZE_WITHOUT_A_SESSION = (
-    200,
-    {"Content-Type": "application/json"},
-    json.dumps({"jsonrpc": "2.0", "id": 1,
-                "result": {"protocolVersion": "2024-11-05"}}),
-)
-
-_ENVELOPE_LEVEL_ERROR = (
-    200,
-    {"Content-Type": "text/event-stream"},
-    _sse_frame({"jsonrpc": "2.0", "id": 1,
-                "error": {"code": -32602, "message": "Unknown tool: reload_config"}}),
-)
-
-_TOOL_IS_ERROR = (
-    200,
-    {"Content-Type": "text/event-stream"},
-    _sse_frame({"jsonrpc": "2.0", "id": 1, "result": {
-        "isError": True,
-        "content": [{"type": "text", "text": "ToolError: reload_config failed"}],
-    }}),
-)
-
-_TRANSPORT_FAULTS = {
-    # The shape a raw single-shot POST hits against the live server today --
-    # the direct regression test for the defect.
-    "always_400": {"initialize_reply": _FakeEscalationMcp.MISSING_SESSION_REPLY},
-    # census_trigger raises a RuntimeError naming this; the script must
-    # surface it rather than swallow it.
-    "initialize_assigns_no_session": {"initialize_reply": _INITIALIZE_WITHOUT_A_SESSION},
-    # The request reached the server but never a tool.
-    "envelope_level_error": {"tool_call_reply": _ENVELOPE_LEVEL_ERROR},
-    # FastMCP's shape for a raised ToolError: the tool ran and failed.
-    "tool_is_error": {"tool_call_reply": _TOOL_IS_ERROR},
-}
-
-
-class _ClosedPort:
-    """A port with nothing listening on it, for the dead-socket case.
-
-    Bound and released, so it is free -- and the script's connect is the only
-    thing racing for it. Carries the same `port` attribute `_run` reads from a
-    real server, so the no-server case is driven by the same helper.
-    """
-
-    def __init__(self):
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            self.port = probe.getsockname()[1]
-
-
 def _assert_failed_closed_on_the_transport(proc):
-    """The one verdict every transport fault must reach: a loud failure that
-    names the TRANSPORT, and never the in-orchestrator rollback it is not."""
-    assert proc.returncode != 0, f"a transport fault was read as success: {proc.stdout}"
+    """The one verdict every transport fault must reach: a failure that names
+    the TRANSPORT, and never the in-orchestrator rollback it is not."""
+    assert _failure(proc) == "no_reload_report"
     assert not _converged_verdict_lines(proc)
-    assert TRANSPORT_MARKER in proc.stderr, f"stderr={proc.stderr}"
-    assert "rolls every leaf back" not in proc.stderr, (
-        f"a request that never ran a tool was blamed on a rollback: {proc.stderr}"
-    )
-    assert "reloaded=None" not in proc.stderr, f"stderr={proc.stderr}"
 
 
 @pytest.mark.parametrize(
-    "fault", list(_TRANSPORT_FAULTS.values()), ids=list(_TRANSPORT_FAULTS)
+    "fault", list(TRANSPORT_FAULTS.values()), ids=list(TRANSPORT_FAULTS)
 )
 def test_a_reload_that_never_reached_the_tool_fails_closed(tmp_path, fault):
     """Every way the transport can refuse to deliver reload_config."""
     config = _make_repo(tmp_path, "8", marker=True)
-    repo = config.parent
-    before_head = _head(repo)
 
-    with _FakeEscalationMcp(_report(config_path=str(config)), **fault) as server:
+    with FakeEscalationMcp(reload_report(config_path=str(config)), **fault) as server:
         proc = _run(server, config, "8")
 
     _assert_failed_closed_on_the_transport(proc)
-    assert _head(repo) == before_head, "a failed reload must not land a commit"
 
 
 def test_a_dead_socket_fails_closed(tmp_path):
     """Nothing listening at all -- httpx's own transport exception, which is
     neither of the two census_trigger raises and must fail the same way."""
     config = _make_repo(tmp_path, "8", marker=True)
-    repo = config.parent
-    before_head = _head(repo)
 
-    proc = _run(_ClosedPort(), config, "8")
+    proc = _run(ClosedPort(), config, "8")
 
     _assert_failed_closed_on_the_transport(proc)
-    assert _head(repo) == before_head, "a failed reload must not land a commit"
 
 
 def test_the_transport_diagnostic_keeps_the_committed_shas_remedy(tmp_path):
-    """On the FLIP path the commit HAS landed, so the operator needs to know
-    which sha carries the value and that a restart will pick it up.
+    """On the FLIP path the commit HAS landed, so both the failure verdict and
+    the operator's diagnostic name the sha that carries the value.
 
     That is what the deleted `curl ... || die "... (committed as ${SHA}; the
     value lands at the next restart)"` carried; losing it when curl went away
@@ -728,22 +530,19 @@ def test_the_transport_diagnostic_keeps_the_committed_shas_remedy(tmp_path):
     config = _make_repo(tmp_path, "16")
     repo = config.parent
 
-    with _FakeEscalationMcp(
-        initialize_reply=_FakeEscalationMcp.MISSING_SESSION_REPLY,
+    with FakeEscalationMcp(
+        initialize_reply=FakeEscalationMcp.MISSING_SESSION_REPLY,
     ) as server:
         proc = _run(server, config, "8")
 
     _assert_failed_closed_on_the_transport(proc)
-    sha = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
+    sha = head(repo, short=True)
+    assert _verdict(proc)["commit"] == sha
     assert sha in proc.stderr, f"stderr={proc.stderr}"
-    assert "lands at the next restart" in proc.stderr, f"stderr={proc.stderr}"
 
 
 # ---------------------------------------------------------------------------
-# Which interpreter runs the reload
+# Which interpreter runs the script's python steps
 #
 # The transport is not stdlib: it needs httpx, plus pydantic via
 # census_trigger's module-level `legibility.config` import. Measured here on
@@ -752,60 +551,26 @@ def test_the_transport_diagnostic_keeps_the_committed_shas_remedy(tmp_path):
 # reload step that inherits whatever `python3` the caller's shell offers is a
 # deploy gate an operator cannot reach from a login shell -- the same
 # unreachable-gate outcome as the transport defect above, with a different
-# cause.
+# cause. Step 1's editor shares the reload's resolved interpreter, so neither
+# step reaches PATH's `python3` while the checkout venv exists.
 # ---------------------------------------------------------------------------
 
-SYSTEM_PYTHON = "/usr/bin/python3"
 CHECKOUT_VENV_PYTHON = SCRIPT.parent.parent / ".venv" / "bin" / "python3"
 
 
-def _system_python_without_the_transport():
-    """The system interpreter, or a skip reason if it cannot play the part.
+def test_no_step_runs_under_path_python3_when_the_checkout_venv_exists(tmp_path):
+    """PATH's `python3` cannot run at all; the flip still lands.
 
-    An interpreter that CAN import the transport would make both tests below
-    pass while proving nothing, so the premise is checked rather than assumed.
+    That can only pass if BOTH the YAML edit and the reload resolved the
+    SCRIPT's own checkout venv rather than inheriting PATH.
     """
-    if not os.path.exists(SYSTEM_PYTHON):
-        return None, f"{SYSTEM_PYTHON} is absent"
-    probe = subprocess.run(
-        [SYSTEM_PYTHON, "-c", "import httpx, pydantic"],
-        capture_output=True, text=True,
-    )
-    if probe.returncode == 0:
-        return None, f"{SYSTEM_PYTHON} can import the transport, so it proves nothing"
-    return SYSTEM_PYTHON, ""
-
-
-def _path_python3_shimmed_to(tmp_path, interpreter):
-    """An env whose PATH `python3` is *interpreter*."""
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    shim = bin_dir / "python3"
-    shim.write_text(f'#!/bin/sh\nexec {interpreter} "$@"\n')
-    shim.chmod(0o755)
-    env = dict(os.environ)
-    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
-    return env
-
-
-def test_the_reload_ignores_a_path_python3_that_cannot_import_the_transport(tmp_path):
-    """PATH's `python3` cannot import the transport; the flip still lands.
-
-    That can only happen if the reload step resolved the SCRIPT's own
-    checkout venv rather than inheriting PATH. Step 1's YAML editor is
-    stdlib-only and keeps working under the shim, so this isolates the reload
-    interpreter specifically.
-    """
-    system_python, why = _system_python_without_the_transport()
-    if system_python is None:
-        pytest.skip(why)
     if not CHECKOUT_VENV_PYTHON.exists():
         pytest.skip(f"{CHECKOUT_VENV_PYTHON} is absent (an un-synced worktree)")
 
     config = _make_repo(tmp_path, "16")
-    env = _path_python3_shimmed_to(tmp_path, system_python)
+    env = path_python3_that_cannot_run(tmp_path)
 
-    with _FakeEscalationMcp(_report(
+    with FakeEscalationMcp(reload_report(
         config_path=str(config),
         applied={"verify_env": {"old": {KEY: "16"}, "new": {KEY: "8"}}},
     )) as server:
@@ -818,32 +583,27 @@ def test_the_reload_ignores_a_path_python3_that_cannot_import_the_transport(tmp_
 def test_an_interpreter_without_the_transport_fails_loud_with_a_remedy(tmp_path):
     """No venv to fall back on: fail naming the interpreter and the remedy.
 
-    The script is copied into a checkout carrying the real `scripts/legibility`
-    but NO `.venv`, so the bare-`python3` fallback leg is taken and the
-    interpreter is the only thing that differs from the passing case above. A
-    raw ImportError traceback would leave an operator with no next step.
+    The script is copied into a checkout carrying its real reload step but NO
+    `.venv`, so the bare-`python3` fallback leg is taken. A raw ImportError
+    traceback would leave an operator with no next step.
     """
-    system_python, why = _system_python_without_the_transport()
+    system_python, why = system_python_without_the_transport()
     if system_python is None:
         pytest.skip(why)
 
-    scripts_dir = tmp_path / "checkout" / "scripts"
-    scripts_dir.mkdir(parents=True)
-    shutil.copy2(SCRIPT, scripts_dir / SCRIPT.name)
-    (scripts_dir / "legibility").symlink_to(SCRIPT.parent / "legibility")
+    script = venvless_checkout_copy(tmp_path, SCRIPT)
 
     config = _make_repo(tmp_path, "8", marker=True)
-    env = _path_python3_shimmed_to(tmp_path, system_python)
+    env = path_python3_shimmed_to(tmp_path, system_python)
     tried = subprocess.run(
         [system_python, "-c", "import sys; print(sys.executable)"],
         check=True, capture_output=True, text=True,
     ).stdout.strip()
 
-    with _FakeEscalationMcp(_report(config_path=str(config))) as server:
+    with FakeEscalationMcp(reload_report(config_path=str(config))) as server:
         proc = _run(server, config, "8",
-                    script=scripts_dir / SCRIPT.name, env=env)
+                    script=script, env=env)
 
-    assert proc.returncode != 0, f"stdout={proc.stdout}"
+    assert _failure(proc) == "transport_not_importable"
     assert not _converged_verdict_lines(proc)
     assert tried in proc.stderr, f"stderr={proc.stderr}"
-    assert "uv run --project shared" in proc.stderr, f"stderr={proc.stderr}"

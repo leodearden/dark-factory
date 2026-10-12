@@ -185,15 +185,22 @@ carrying a FAIL row, so the slate is covered, the merge succeeds, and
 artifact**. That is the intended outcome (a red slate is a measurement), but do
 not read a red sweep as one that cannot have touched the committed file.
 
-**A manifest carrying TBD placeholder arms cannot be swept**, and the driver
-refuses up front rather than discovering it 30 minutes in. Neither half of the
-slate works for such an arm: `lms_ctl start` refuses a placeholder (exit 4),
-and `lms_healthcheck --arm` cannot cover it either — the report needs the VRAM
-baseline that only `lms_ctl start` writes, so it exits 8 having written
-nothing — while the merge requires a row for every manifest arm. A hand-run
-`lms_healthcheck --all` hits the same wall. Resolve the PRD open question that
-owns the arm, or drop it from `arms.yaml`, before running the slate. All seven
-arms are non-placeholder today.
+**A manifest carrying TBD placeholder arms IS swept**, without starting
+anything. The driver goes straight to `lms_healthcheck --arm` for such an arm —
+no `start`, no `wait-ready`, no `stop`, because `lms_ctl start` refuses a
+placeholder before it touches the card and there is no unit to wait for or to
+release. The healthcheck emits a `placeholder_arm` FAIL row and makes no VRAM
+claim: nothing was loaded, so that row's footprint is 0. The slate therefore
+assembles **red but complete** — `verification/health-report.json` is
+overwritten and the run exits non-zero — exactly like the "came up and failed
+its probe" case above. Resolving the PRD open question that owns the arm is
+still what turns the row green, but an unresolved one no longer makes every
+other arm's measurement unpublishable.
+
+`lms_ctl start`, `lms_serve` and `lms_fetch_weights` do still refuse a
+placeholder rather than 404ing on a literal `TBD` model id; it is the
+healthcheck alone that reports on one, which is its job. All seven arms are
+non-placeholder today.
 
 ### One arm at a time
 

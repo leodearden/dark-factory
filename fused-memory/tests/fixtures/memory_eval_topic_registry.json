@@ -264,6 +264,172 @@
       "topic": "boolean-operand-consumption-edges"
     },
     {
+      "briefing_scopes": [
+        {
+          "files": [
+            "shared/src/shared/briefing_queries.py",
+            "orchestrator/src/orchestrator/agents/briefing.py"
+          ],
+          "task_id": "3659",
+          "title": "Briefing memory rescope: shared query templates, scoped task-derived queries, distilled render, loud degradation"
+        },
+        {
+          "task_id": "3659",
+          "title": "Briefing memory rescope: shared query templates, scoped task-derived queries, distilled render, loud degradation"
+        }
+      ],
+      "canonical": {
+        "content_hash": "b33f9f8f2460c253",
+        "content_prefix": "GOTCHA (dark-factory, measured task 3659, 2026-09-14): renaming a markdown heading that BriefingAssembler renders silently degrades scripts/legibility/digest.py",
+        "last_known_id": "291042ae-efa7-4b31-9d4c-cb6d326eb37e"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "HARNESS_BRIEFING_SUBHEADINGS",
+            "KEEP the old one"
+          ],
+          "query": "what happens to the legibility digest when a briefing heading is renamed"
+        }
+      ],
+      "derived_from": "briefing_query",
+      "members": [],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "conventions and gotchas for shared orchestrator briefing agents queries"
+        },
+        {
+          "held_out": false,
+          "text": "conventions and gotchas for briefing memory rescope shared query templates scoped task"
+        },
+        {
+          "held_out": true,
+          "text": "pitfalls when editing how the orchestrator assembles an agent briefing prompt"
+        }
+      ],
+      "project_id": "dark_factory",
+      "provenance": {
+        "source": "hand-adjudicated live read-only search 2026-09-30",
+        "templates": "shared/src/shared/briefing_queries.py"
+      },
+      "search_scope": {
+        "categories": [
+          "preferences_and_norms",
+          "procedural_knowledge"
+        ],
+        "stores": [
+          "mem0"
+        ]
+      },
+      "supersedes_pairs": [],
+      "topic": "briefing-conventions-area"
+    },
+    {
+      "briefing_scopes": [
+        {}
+      ],
+      "canonical": {
+        "content_hash": "c1d4ea8041628de4",
+        "content_prefix": "`ruff format` IS NOT ADOPTED IN THIS REPO, DELIBERATELY. Only `ruff check` gates. This is a settled DECISION (task 3441), not an oversight to be fixed. CONSEQUE",
+        "last_known_id": "a1792a9a-b15e-4c27-b905-77a739267000"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "ruff format",
+            "NOT ADOPTED"
+          ],
+          "query": "is ruff format enforced in this repository"
+        }
+      ],
+      "derived_from": "briefing_query",
+      "members": [],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "conventions, norms and gotchas for working in this repository"
+        },
+        {
+          "held_out": true,
+          "text": "which house rules apply to every change in this codebase"
+        },
+        {
+          "held_out": true,
+          "text": "what repo-wide working habits should an agent know before editing anything here"
+        }
+      ],
+      "project_id": "dark_factory",
+      "provenance": {
+        "source": "hand-adjudicated live read-only search 2026-09-30",
+        "templates": "shared/src/shared/briefing_queries.py"
+      },
+      "search_scope": {
+        "categories": [
+          "preferences_and_norms",
+          "procedural_knowledge"
+        ],
+        "stores": [
+          "mem0"
+        ]
+      },
+      "supersedes_pairs": [],
+      "topic": "briefing-conventions-generic"
+    },
+    {
+      "briefing_scopes": [
+        {
+          "files": [
+            "shared/src/shared/briefing_queries.py",
+            "orchestrator/src/orchestrator/agents/briefing.py"
+          ],
+          "task_id": "3659",
+          "title": "Briefing memory rescope: shared query templates, scoped task-derived queries, distilled render, loud degradation"
+        },
+        {
+          "task_id": "3659",
+          "title": "Briefing memory rescope: shared query templates, scoped task-derived queries, distilled render, loud degradation"
+        }
+      ],
+      "canonical": {
+        "content_hash": "2dde0a968c0de55a",
+        "content_prefix": "Task 3659 (PRD docs/prds/memory-briefing-and-fusion.md lane beta) landed on branch task/3659: the dispatched-agent briefing's memory block was rescoped end to e",
+        "last_known_id": "5fae4719-75ed-47a4-9a1c-5d2b7485b6c2"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "project overview architecture goals",
+            "retired outright"
+          ],
+          "query": "which briefing memory queries were retired by the rescope"
+        }
+      ],
+      "derived_from": "briefing_query",
+      "members": [],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "Briefing memory rescope: shared query templates, scoped task-derived queries, distilled render, loud degradation orchestrator agents"
+        },
+        {
+          "held_out": false,
+          "text": "Briefing memory rescope: shared query templates, scoped task-derived queries, distilled render, loud degradation task"
+        },
+        {
+          "held_out": true,
+          "text": "what did reworking the memory context handed to dispatched agents actually change"
+        }
+      ],
+      "project_id": "dark_factory",
+      "provenance": {
+        "source": "hand-adjudicated live read-only search 2026-09-30",
+        "templates": "shared/src/shared/briefing_queries.py"
+      },
+      "supersedes_pairs": [],
+      "topic": "briefing-task-semantic"
+    },
+    {
       "canonical": {
         "content_hash": "e00ace75f9301bf8",
         "content_prefix": "Reify has NO rustfmt gate: no rustfmt.toml exists, `git grep 'cargo fmt'` returns nothing tracked, and NEITHER `scripts/verify.sh` NOR `hooks/pre-commit` invoke",
@@ -742,52 +908,6 @@
         }
       ],
       "topic": "eval-worktree-venv-shadowing"
-    },
-    {
-      "canonical": {
-        "content_hash": "d51e363e79ff2b8e",
-        "content_prefix": "NORM (documented in `skills/prd/references/gates.md` as of commit 703e0a95ea, 2026-07-25): the /prd G7 de",
-        "last_known_id": "4060dbdc-2896-4cac-aa8c-ebaa4b68d146"
-      },
-      "claim_queries": [
-        {
-          "needles": [
-            "NORM",
-            "G7"
-          ],
-          "query": "what is the /prd G7 design-invariant gate"
-        }
-      ],
-      "derived_from": "briefing_query",
-      "members": [],
-      "phrasings": [
-        {
-          "held_out": false,
-          "text": "project overview architecture goals"
-        },
-        {
-          "held_out": false,
-          "text": "coding conventions and project norms"
-        },
-        {
-          "held_out": false,
-          "text": "recent decisions and rationale"
-        },
-        {
-          "held_out": false,
-          "text": "task 3111 context and related decisions"
-        },
-        {
-          "held_out": true,
-          "text": "what rules govern how a design is signed off here"
-        }
-      ],
-      "project_id": "dark_factory",
-      "provenance": {
-        "source": "qdrant payload scroll, read-only, 2026-07-30"
-      },
-      "supersedes_pairs": [],
-      "topic": "g7-design-invariants"
     },
     {
       "canonical": {

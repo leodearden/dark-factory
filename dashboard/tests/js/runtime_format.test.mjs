@@ -198,7 +198,8 @@ test('rtProbe: an ABSENT status reads as ok, matching rtProbeSummary', () => {
 
 // ---------------------------------------------------------------------------
 // rtProbeSummary — aggregates task rows into the Tasks-tab banner. Derived
-// frontend-side from ACTIVE_TASKS rows (deliberately not a new payload key).
+// frontend-side from the snapshot rows, task_snapshot.js::snapshotRowsOver
+// (deliberately not a new payload key).
 // ---------------------------------------------------------------------------
 
 const row = (project, runtime_status) => ({ project, runtime_status });

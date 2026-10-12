@@ -46,10 +46,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, assert_never, runtime_checkable
 
 from orchestrator import flake_ledger, verify
-from orchestrator.config import ModuleConfig
+from orchestrator.config import ModuleConfig, VerifyHostPolicy
 from orchestrator.verify import VerifyResult, _archive_merge_verify_logs
 from orchestrator.verify_cancel import (
     HEARTBEAT_INTERVAL_SECS,
@@ -81,6 +81,7 @@ __all__ = [
     # INV-2 (task 2884) — contract-currency auto-sync at dispatch
     "SyncOutcome",
     "REMOTE_LIVENESS_CMD",
+    "REMOTE_TOOL_PATH_PRELUDE",
     "resolve_local_df_checkout",
     "build_merge_verify_spec",
     "_module_config_from_command",
@@ -610,7 +611,7 @@ async def run_merge_verify_on_worktree(
         from orchestrator.verify import run_scoped_verification  # type: ignore[attr-defined]
         run_scoped = run_scoped_verification
     if run_unscoped is None:
-        from orchestrator.merge_queue import _run_unscoped_typechecks  # type: ignore[attr-defined]
+        from orchestrator.merge_lane.worker import _run_unscoped_typechecks
         run_unscoped = _run_unscoped_typechecks
 
     # module_configs is reconstructed from spec.verify_commands (which carries
@@ -1029,6 +1030,11 @@ _SSH_BASE_OPTS = [
 # git, or a worktree — so the probe is side-effect-free and cheap.
 REMOTE_LIVENESS_CMD = 'orchestrator verify-merge --help'
 
+# A plain (non-login) ssh shell gets sshd's default PATH, which omits the uv
+# installer's ~/.local/bin (and its older ~/.cargo/bin).  $HOME expands on the
+# REMOTE side, so this is never passed through shlex.quote.
+REMOTE_TOOL_PATH_PRELUDE = 'PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"'
+
 
 def _sanitize_runner_name(name: str) -> str:
     """Sanitize a runner name for filesystem use in archive filenames.
@@ -1403,7 +1409,9 @@ class RemoteRunner:
         bb834dd42a).  Different AND the remote does not match origin ⇒ emit
         ``runner_stale`` and, serialised on the per-runner lock and only when NO
         verify is in flight (never ``git pull`` under a live verify), run ``git
-        pull --ff-only`` + ``uv sync --all-packages`` on the remote DF checkout,
+        pull --ff-only`` + ``uv sync --all-packages`` on the remote DF checkout
+        (prefixed with ``REMOTE_TOOL_PATH_PRELUDE`` so the non-login ssh shell
+        finds ``uv``),
         then ASSERT the checkout is still runnable via ``REMOTE_LIVENESS_CMD``
         over ssh, emitting ``runner_synced`` (kind='df_checkout') on success.
 
@@ -1549,7 +1557,8 @@ class RemoteRunner:
                 # uses in dark-factory-orchestrator.yaml.
                 uv_rc, _, uv_err = await self._run(
                     ['ssh', *_SSH_BASE_OPTS, self._ssh_host,
-                     f'cd {shlex.quote(df_remote)} && uv sync --all-packages'],
+                     f'cd {shlex.quote(df_remote)} && '
+                     f'{REMOTE_TOOL_PATH_PRELUDE} uv sync --all-packages'],
                 )
                 if uv_rc != 0:
                     return SyncOutcome(
@@ -3283,7 +3292,7 @@ def delta_from_json(s: str) -> ColdWarmVerifyDelta:
 
 
 # ---------------------------------------------------------------------------
-# β: HostLease + HostAllocator — per-host slots, prefer-local-when-free, cancel-aware release
+# β: HostLease + HostAllocator — per-host slots, config-selected order (verify_host_policy), cancel-aware release
 # ---------------------------------------------------------------------------
 
 # Slot state constants
@@ -3322,7 +3331,7 @@ class HostLease:
 
 
 class HostAllocator:
-    """Worker-lifetime host allocator: one slot per host, prefer-local-when-free.
+    """Worker-lifetime host allocator: one slot per host, config-selected order.
 
     Cross-ref (task 2565): the main-health probe
     (:func:`~orchestrator.verify.verify_failure_is_preexisting_on_main`) is
@@ -3331,10 +3340,25 @@ class HostAllocator:
     work never occupies a slot here and a host's occupancy in this allocator
     never reflects a main-health probe running.
 
-    Selection policy (β decision 1): prefer local as the trust anchor; remotes
-    take overflow only when local is busy.  This inverts VerifyRunnerPool's
-    shipped prefer-remote offload policy — the allocator engages local for
-    single-item serial windows (β) and lets γ push overflow to remotes.
+    Selection policy: chosen by ``OrchestratorConfig.verify_host_policy`` and
+    supplied to :meth:`acquire` per call (task 5097 / PRD task C′).
+    ``'prefer_local'`` — the default, and β decision 1's original order — takes
+    local as the trust anchor and lets remotes take overflow only when local is
+    busy.  ``'prefer_remote'`` inverts it, so a free remote absorbs verify load
+    instead of idling while the lane serialises on local.
+
+    The policy is NEVER captured on the allocator.  ``_ensure_host_allocator``
+    caches one allocator for the worker's whole lifetime, so a captured policy
+    could not change without a process restart; reading it per call is what
+    makes the green-tier ``RELOADABLE_FIELDS`` registration real — a flip lands
+    on the NEXT dispatch and cannot split an in-flight merge.
+
+    The trust-anchor caveat that goes with ``'prefer_remote'`` is stated once,
+    on ``config.py::OrchestratorConfig.verify_host_policy``.  This class sets
+    no cadence.
+
+    Unaffected by the policy: the leaseless main-health probe (above),
+    quarantine, PARKED, cancel-aware release, and ``free_host_count``.
 
     Slot states
     -----------
@@ -3379,9 +3403,15 @@ class HostAllocator:
         """All managed host names in declaration order (local first, then remotes)."""
         return list(self._slots.keys())
 
+    def _is_acquirable(self, name: str) -> bool:
+        """FREE, and for a remote also not quarantined (local is the trust anchor)."""
+        if self._slots[name] != _SLOT_FREE:
+            return False
+        return name == self._local_name or name not in self._quarantine
+
     def free_host_count(self) -> int:
-        """Number of FREE slots."""
-        return sum(1 for s in self._slots.values() if s == _SLOT_FREE)
+        """Number of slots :meth:`acquire` could hand out right now."""
+        return sum(1 for name in self._slots if self._is_acquirable(name))
 
     def is_busy(self, name: str) -> bool:
         """True when the slot for *name* is BUSY or PARKED (not FREE)."""
@@ -3389,7 +3419,7 @@ class HostAllocator:
 
     def acquire_local(self, factory: Any) -> HostLease | None:
         """Try to acquire the local slot.  Returns None if the slot is not FREE."""
-        if self._slots[self._local_name] == _SLOT_FREE:
+        if self._is_acquirable(self._local_name):
             runner = factory()
             self._slots[self._local_name] = _SLOT_BUSY
             return HostLease(name=self._local_name, runner=runner, is_local=True)
@@ -3398,22 +3428,35 @@ class HostAllocator:
     def acquire_remote(self) -> HostLease | None:
         """Acquire the first FREE, non-quarantined, non-PARKED remote slot."""
         for name, runner in self._remote_runners.items():
-            if self._slots[name] == _SLOT_FREE and name not in self._quarantine:
+            if self._is_acquirable(name):
                 self._slots[name] = _SLOT_BUSY
                 return HostLease(name=name, runner=runner, is_local=False)
         return None
 
-    async def acquire(self, local_factory: Any) -> HostLease | None:
-        """Acquire a host slot, preferring local.
+    async def acquire(
+        self, local_factory: Any, *, policy: VerifyHostPolicy,
+    ) -> HostLease | None:
+        """Acquire a host slot in the order *policy* asks for.
 
-        Policy (β decision 1): prefer local when free; overflow to first
-        available remote (not quarantined, not PARKED); return None when all
-        slots are BUSY/PARKED.
+        'prefer_local' takes local when free and overflows to the first
+        eligible remote; 'prefer_remote' takes the first eligible remote and
+        falls back to local.  Either way, None means nothing was eligible.
+
+        Eligibility is NOT re-checked here: acquire_remote() already demands a
+        FREE, non-quarantined, non-PARKED slot, so a busy, quarantined or
+        PARKED remote falls through to local on its own.
         """
-        local = self.acquire_local(local_factory)
-        if local is not None:
-            return local
-        return self.acquire_remote()
+        match policy:
+            case 'prefer_local':
+                local = self.acquire_local(local_factory)
+                return local if local is not None else self.acquire_remote()
+            case 'prefer_remote':
+                remote = self.acquire_remote()
+                if remote is not None:
+                    return remote
+                return self.acquire_local(local_factory)
+            case _:
+                assert_never(policy)
 
     async def release(self, lease: HostLease) -> None:
         """Release a held slot back to FREE.  Idempotent."""

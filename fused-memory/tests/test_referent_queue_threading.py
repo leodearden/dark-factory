@@ -1524,6 +1524,13 @@ class TestReplayFromStoreStampsReferents:
         assert json.loads(json.dumps(item['payload'])) == item['payload']
 
 
+async def _completed_count_is(queue, expected: int) -> bool:
+    """The executor bumps the referent counters BEFORE the queue commits the
+    row as 'completed', so a counter barrier alone cannot order that read."""
+    stats = await queue.get_stats()
+    return stats['counts'].get('completed') == expected
+
+
 class TestReferentsSurviveTheRealQueue:
     """End-to-end over a REAL DurableWriteQueue on a tmp_path SQLite file.
 
@@ -1568,8 +1575,10 @@ class TestReferentsSurviveTheRealQueue:
             message='the derived bucket never incremented',
         )
         assert service.graphiti.add_episode.call_count == 1
-        stats = await real_queue.get_stats()
-        assert stats['counts'].get('completed') == 1
+        await poll_until(
+            lambda: _completed_count_is(real_queue, 1),
+            message="the row never reached 'completed'",
+        )
 
     @pytest.mark.asyncio
     async def test_an_old_format_row_still_executes_end_to_end(
@@ -1589,8 +1598,10 @@ class TestReferentsSurviveTheRealQueue:
         )
         counts = service.referent_source_counts()
         assert counts['derived'] == 0
-        stats = await real_queue.get_stats()
-        assert stats['counts'].get('completed') == 1
+        await poll_until(
+            lambda: _completed_count_is(real_queue, 1),
+            message="the row never reached 'completed'",
+        )
 
     @pytest.mark.asyncio
     async def test_a_flagged_ambiguity_still_vetoes_the_repair_after_the_round_trip(

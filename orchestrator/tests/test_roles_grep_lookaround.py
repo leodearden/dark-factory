@@ -41,10 +41,13 @@ from __future__ import annotations
 
 import pytest
 from _role_splice_contract import (
+    BASH_CAPABLE_UNPINNED_ROLES,
     MARKDOWN_HEADING,
     SpliceContract,
     assert_brace_free,
     assert_nonempty,
+    bash_capable_unpinned,
+    bash_capable_unpinned_contract,
 )
 
 from orchestrator.agents.roles import (
@@ -185,23 +188,10 @@ def test_the_two_recourse_halves_are_distinct():
     )
 
 
-#: Roles holding UNQUALIFIED `Bash`, so the `command grep -rP` escape hatch is
-#: a command they can actually run.
-#: Capability: `role.prompt_spec is None and 'Bash' in role.allowed_tools`.
-_BASH_CAPABLE_UNPINNED_ROLES = frozenset({
-    'architect',
-    'debugger',
-    'deep_reviewer',
-    'implementer',
-    'merger',
-    'simple_task',
-    'steward',
-})
-
 #: Roles whose `Bash` grant is narrower than unqualified (`judge` holds
 #: `Bash(git:*)`), so prescribing `grep -P` would walk them into a permission
 #: denial rather than a result — they get the restructure-only variant.
-#: Capability: `role.prompt_spec is None and 'Bash' not in role.allowed_tools`.
+#: Capability: `role.prompt_spec is None and not bash_capable_unpinned(role)`.
 _READ_ONLY_UNPINNED_ROLES = frozenset({'judge'})
 
 #: The union, derived rather than hand-maintained a third time: every role with
@@ -214,23 +204,20 @@ _READ_ONLY_UNPINNED_ROLES = frozenset({'judge'})
 #: `test_roles_tool_call_rejection.py::_UNPINNED_PROMPT_ROLES` already documents,
 #: and closing it means splicing into the frozen reviewer template and bumping
 #: `_REVIEWER_PROMPT_HARNESS_VERSION`, deliberately not done here.
-_ALL_UNPINNED_ROLES = _BASH_CAPABLE_UNPINNED_ROLES | _READ_ONLY_UNPINNED_ROLES
+_ALL_UNPINNED_ROLES = BASH_CAPABLE_UNPINNED_ROLES | _READ_ONLY_UNPINNED_ROLES
 
 _CONTRACTS = {
-    'GREP_LOOKAROUND_GUIDANCE': SpliceContract(
-        constant_name='GREP_LOOKAROUND_GUIDANCE',
-        constant=GREP_LOOKAROUND_GUIDANCE,
-        roles=_BASH_CAPABLE_UNPINNED_ROLES,
-        role_set_name='_BASH_CAPABLE_UNPINNED_ROLES',
-        capability=lambda role: role.prompt_spec is None and 'Bash' in role.allowed_tools,
-        capability_description='a literal system_prompt and unqualified `Bash`',
+    # Unqualified `Bash`, so the `command grep -rP` escape hatch is a command
+    # these roles can actually run.
+    'GREP_LOOKAROUND_GUIDANCE': bash_capable_unpinned_contract(
+        'GREP_LOOKAROUND_GUIDANCE', GREP_LOOKAROUND_GUIDANCE
     ),
     'GREP_LOOKAROUND_GUIDANCE_READ_ONLY': SpliceContract(
         constant_name='GREP_LOOKAROUND_GUIDANCE_READ_ONLY',
         constant=GREP_LOOKAROUND_GUIDANCE_READ_ONLY,
         roles=_READ_ONLY_UNPINNED_ROLES,
         role_set_name='_READ_ONLY_UNPINNED_ROLES',
-        capability=lambda role: role.prompt_spec is None and 'Bash' not in role.allowed_tools,
+        capability=lambda role: role.prompt_spec is None and not bash_capable_unpinned(role),
         capability_description='a literal system_prompt but no unqualified `Bash`',
     ),
 }
@@ -251,7 +238,7 @@ _SHARED_HALF_CONTRACT = SpliceContract(
     constant_name='_GREP_ENGINE_LIMITS',
     constant=_GREP_ENGINE_LIMITS,
     roles=_ALL_UNPINNED_ROLES,
-    role_set_name='_BASH_CAPABLE_UNPINNED_ROLES | _READ_ONLY_UNPINNED_ROLES',
+    role_set_name='BASH_CAPABLE_UNPINNED_ROLES | _READ_ONLY_UNPINNED_ROLES',
     capability=lambda role: role.prompt_spec is None,
     capability_description='a literal (non-PromptSpec) system_prompt',
 )
@@ -273,7 +260,7 @@ def test_role_set_matches_its_bash_capability(name):
     _CONTRACTS[name].assert_role_set_matches_capability(
         remedy=(
             "A role's `Bash` grant changed, or a role was added. Move it between "
-            '_BASH_CAPABLE_UNPINNED_ROLES and _READ_ONLY_UNPINNED_ROLES and give '
+            'BASH_CAPABLE_UNPINNED_ROLES and _READ_ONLY_UNPINNED_ROLES and give '
             'it the matching variant: the read-only variant exists precisely so '
             'no role is told to run a command its grant would refuse.'
         ),
@@ -334,7 +321,7 @@ def test_no_role_outside_the_set_carries_that_variant(name):
     _CONTRACTS[name].assert_no_other_role_carries(
         remedy=(
             'If the variants were swapped, swap them back. If a role genuinely '
-            'changed `Bash` grant, move it between _BASH_CAPABLE_UNPINNED_ROLES '
+            'changed `Bash` grant, move it between BASH_CAPABLE_UNPINNED_ROLES '
             'and _READ_ONLY_UNPINNED_ROLES. `reviewer_comprehensive` takes '
             'neither variant: a PromptSpec-backed role may silently drop a '
             'splice at runtime, and closing that gap needs a '
@@ -421,7 +408,7 @@ def test_the_limitation_reaches_every_unpinned_role():
         remedy=(
             'A role gained or lost a literal system_prompt, so the two variant '
             'sets no longer partition the unpinned roles. Add it to whichever of '
-            '_BASH_CAPABLE_UNPINNED_ROLES / _READ_ONLY_UNPINNED_ROLES its `Bash` '
+            'BASH_CAPABLE_UNPINNED_ROLES / _READ_ONLY_UNPINNED_ROLES its `Bash` '
             'grant selects — leaving it in neither silently denies it the '
             'limitation while every per-variant test stays green.'
         ),

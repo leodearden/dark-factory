@@ -1,7 +1,8 @@
 """Tests for Harness._write_merge_heartbeat (task 2395, α of the fleet-redeploy PRD).
 
 Every orchestrator unit writes a tiny JSON heartbeat to a fleet-common
-directory (see ``orchestrator.fleet_heartbeat``) on each run-loop tick.
+directory (see ``orchestrator.fleet_heartbeat``) from its merge-heartbeat
+background service, whatever the dispatch loop is doing (task 5344).
 This method gathers the live state — ORCH_UNIT, ``_merge_pipeline_idle()``
 (the authoritative drain-gate truth source, task 1973 U2), and the
 ``queue_empty``/``depth`` diagnostics — and delegates the on-disk contract
@@ -78,6 +79,8 @@ class TestWriteMergeHeartbeat:
             'depth': 0,
             'queue_empty': True,
             'ts_epoch': payload['ts_epoch'],
+            'drain': None,
+            'verifies_in_flight': [],
         }
         assert isinstance(payload['ts_epoch'], float)
 

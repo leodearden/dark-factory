@@ -2,10 +2,12 @@
 """Audit the blast radius of the curator-combine ``metadata`` wipe.
 
 READ-ONLY / REPORT-ONLY: this module and its CLI never mutate a task record,
-a ticket record, or a manifest file. Every database connection it opens is a
-read-only SQLite URI (``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``),
-so the sweep is structurally incapable of writing to the live WAL databases
-the running orchestrator holds open. Manifest YAML on disk is only ever read.
+a ticket record, or a manifest file. Every database connection it opens is
+read-only: the task store goes through ``_task_db_scan.py::connect_ro``, and
+tickets.db through a read-only SQLite URI
+(``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``), so the sweep is
+structurally incapable of writing to the live WAL databases the running
+orchestrator holds open. Manifest YAML on disk is only ever read.
 There is no ``--apply`` flag and no MCP client is ever constructed.
 REMEDIATION IS A SEPARATE, REVIEWED FOLLOW-UP — backfilling a lost key from
 this report is never done by this script (the audit/repair split of tasks
@@ -80,6 +82,8 @@ from _task_db_scan import (
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
+    connect_ro,
+    decode_metadata,
     format_coverage_block,
     format_kv_line,
     run_audit_cli,
@@ -97,7 +101,10 @@ _SHARED_SRC = Path(__file__).resolve().parent.parent / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
 
-from shared.capability_manifest import load_capability_manifest  # noqa: E402
+from shared.capability_manifest import (  # noqa: E402
+    MECHANICAL_CHECK_KINDS,
+    load_capability_manifest,
+)
 
 # The curator verdict this audit is about. The sibling verdict is 'create',
 # which files a NEW task and wipes nothing.
@@ -123,26 +130,6 @@ class CombineTarget(NamedTuple):
     metadata_keys: tuple[str, ...]
 
 
-def _decode_metadata(raw: object) -> dict:
-    """Decode a raw ``metadata`` blob into a dict, degrading to ``{}``.
-
-    Mirrors :func:`audit_wiped_metadata_files._decode_files`. Degrades for
-    NULL, an empty string, malformed JSON, or a payload that decodes to
-    anything other than a dict (a list, a bare scalar, ``null``). A corrupt
-    metadata blob is data to be skipped, never a reason to abort a sweep over
-    thousands of tasks.
-    """
-    if not raw or not isinstance(raw, (str, bytes)):
-        return {}
-    try:
-        payload = json.loads(raw)
-    except (ValueError, TypeError):
-        return {}
-    if not isinstance(payload, dict):
-        return {}
-    return payload
-
-
 def load_combine_targets(tasks_db_path: str) -> dict[tuple[str, int], CombineTarget]:
     """Load every curator-combined task from *tasks_db_path*, keyed by ``(tag, id)``.
 
@@ -154,18 +141,16 @@ def load_combine_targets(tasks_db_path: str) -> dict[tuple[str, int], CombineTar
     ``master`` tag, but the schema permits the same numeric id under two tags
     and collapsing them would silently merge two distinct tasks.
 
-    Opens the database via a read-only URI (``mode=ro``) so the load is
-    structurally incapable of mutating live task records even while
-    fused-memory holds the same file open in WAL mode. Closed in a
-    ``try/finally`` and never a ``with`` block — a sqlite3 ``with`` is a
-    TRANSACTION, not a close.
+    Opens through ``_task_db_scan.py::connect_ro`` (read-only; see there for
+    refusals). Closed in a ``try/finally`` and never a ``with`` block — a
+    sqlite3 ``with`` is a TRANSACTION, not a close.
     """
     targets: dict[tuple[str, int], CombineTarget] = {}
-    conn = sqlite3.connect(f"file:{tasks_db_path}?mode=ro", uri=True)
+    conn = connect_ro(tasks_db_path)
     try:
         cursor = conn.execute("SELECT tag, id, status, metadata FROM tasks")
         for tag, task_id, status, metadata in cursor:
-            payload = _decode_metadata(metadata)
+            payload = decode_metadata(metadata)
             if payload.get("curator_action") != CURATOR_ACTION_COMBINE:
                 continue
             targets[(tag, task_id)] = CombineTarget(
@@ -253,7 +238,7 @@ def load_ticket_expectations(tickets_db_path: str, project_id: str) -> dict[str,
         for task_id, candidate_json in cursor:
             if task_id is None:
                 continue
-            candidate = _decode_metadata(candidate_json)
+            candidate = decode_metadata(candidate_json)
             metadata = candidate.get("metadata")
             if not isinstance(metadata, dict):
                 continue
@@ -288,17 +273,6 @@ _MANIFEST_GLOBS = (
     ("plans", "*.capability-manifest.yaml"),
     ("docs/prds", "*.capability-manifest.yaml"),
 )
-
-# The delivered_check kinds that commit_planning actually copies into
-# metadata.delivered_checks. THE REAL RULE, read off the stamping site:
-# fused-memory/src/fused_memory/server/manifest_stamping.py:311 is
-# `if check is None or check.kind not in ('grep', 'script'): continue`, i.e.
-# BOTH mechanical kinds are copied and only 'manual' is dropped (corroborated
-# by DeliveredCheckMeta.kind: Literal['grep', 'script']). A grep-only filter
-# here would under-count the expected entries and produce FALSE NEGATIVES on
-# the one severity class that removes a mark-done gate.
-MECHANICAL_CHECK_KINDS = ("grep", "script")
-
 
 class ManifestExpectation(NamedTuple):
     """What a capability manifest says a task's metadata should carry.
@@ -376,6 +350,11 @@ def build_manifest_index(
                 cap.name
                 for cap in task.capabilities
                 if cap.delivered_check is not None
+                # MECHANICAL_CHECK_KINDS is DERIVED from
+                # DeliveredCheckMeta's own kind Literal, so this sweep and
+                # commit_planning's copy filter cannot disagree about what
+                # "mechanical" means. Undercounting here would produce FALSE
+                # NEGATIVES on the one severity class this script detects.
                 and cap.delivered_check.kind in MECHANICAL_CHECK_KINDS
             )
             existing = index.get(key)
@@ -1168,7 +1147,8 @@ def _build_parser() -> argparse.ArgumentParser:
 def _audit_root(root: str, args: argparse.Namespace) -> ProjectAudit:
     """Audit ONE project root under the (possibly overridden) project_id.
 
-    Raises ``sqlite3.Error`` for an unreadable project, which is what
+    Raises one of ``_task_db_scan.py::UNREADABLE_STORE_ERRORS`` for an
+    unreadable project, which is what
     :func:`_task_db_scan.sweep_project_roots` turns into a warn-and-skip; every
     other exception propagates. Returns exactly one audit, per that function's
     one-audit-per-root contract.

@@ -170,7 +170,8 @@ class FusedMemoryClient:
             'Accept': 'application/json, text/event-stream',
             'mcp-session-id': self._session_id or '',
         }
-        resp = await self._client.post(f'{self._url}/mcp/', json=payload, headers=headers)
+        from shared.mcp_post import mcp_endpoint_url  # local: E402-safe
+        resp = await self._client.post(mcp_endpoint_url(self._url), json=payload, headers=headers)
         resp.raise_for_status()
         # 202 Accepted (notifications) returns no body.
         if resp.status_code == 202 or not resp.content:

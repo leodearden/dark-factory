@@ -80,13 +80,37 @@ _FAKE_SYSTEMCTL = textwrap.dedent("""\
     done
     verb="${args[0]:-}"
 
+    # Mid-sweep lease observation (task 4755). This fake runs as a descendant
+    # of the sweep, so it is the only vantage point from which the in-flight
+    # lease can be seen WHILE it is held; the test process only ever sees the
+    # before and the after, and "the file is absent afterwards" is equally
+    # true of a script that never wrote one.
+    LEASE_LOG="${FAKE_SYSTEMCTL_LEASE_LOG:-}"
+    LEASE_PATH="${ORCH_FLEET_LEASE:-}"
+    if [[ -n "$LEASE_LOG" && -n "$LEASE_PATH" && -f "$LEASE_PATH" ]]; then
+        printf '%s\\t%s\\n' "$verb" "$(tr -d '\\n' < "$LEASE_PATH")" >> "$LEASE_LOG"
+    fi
+
     case "$verb" in
         list-units)
-            echo "${UNIT_NAME} loaded active running Orchestrator"
+            # FAKE_SYSTEMCTL_NO_UNITS (task 4755) reports an EMPTY fleet, the
+            # one input that reaches the script's early "nothing to restart"
+            # exit-0 -- an exit path that must still release the lease even
+            # though it never stamps the clock.
+            if [[ "${FAKE_SYSTEMCTL_NO_UNITS:-0}" != "1" ]]; then
+                echo "${UNIT_NAME} loaded active running Orchestrator"
+            fi
             ;;
         restart)
             touch "$MARKER"
             rm -f "$COUNTER"
+            # FAKE_SYSTEMCTL_LEASE_SWAP (task 4755) stands in for a SECOND
+            # sweep that started while this one was mid-flight and took the
+            # lease for itself. Written from here because "mid-flight" is the
+            # only moment at which it is a hand-over rather than litter.
+            if [[ -n "${FAKE_SYSTEMCTL_LEASE_SWAP:-}" && -n "$LEASE_PATH" ]]; then
+                printf '%s' "$FAKE_SYSTEMCTL_LEASE_SWAP" > "$LEASE_PATH"
+            fi
             ;;
         show)
             is_fresh=0
@@ -139,6 +163,10 @@ def _run_script(
     verify_timeout: str = "2",
     verify_grace: str = "1",
     fresh_after_calls: str | None = None,
+    lease_file: Path | None = None,
+    lease_swap: dict | None = None,
+    no_units: bool = False,
+    extra_args: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess[bytes]:
     bin_dir = tmp_path / "bin"
     _make_fake_systemctl(bin_dir)
@@ -166,9 +194,20 @@ def _run_script(
     env["RESTART_VERIFY_GRACE_SECS"] = verify_grace
     if fresh_after_calls is not None:
         env["FAKE_SYSTEMCTL_FRESH_AFTER_CALLS"] = fresh_after_calls
+    # Per-test, always (task 4755). The session-wide redirect in
+    # df_pytest_isolation keeps a forgetful spawner off the LIVE lease path,
+    # but it is ONE path shared by the whole session -- a test that asserts on
+    # lease contents must own its own file, exactly as the clock tests above do.
+    if lease_file is not None:
+        env["ORCH_FLEET_LEASE"] = str(lease_file)
+        env["FAKE_SYSTEMCTL_LEASE_LOG"] = str(_lease_log_path(tmp_path))
+    if lease_swap is not None:
+        env["FAKE_SYSTEMCTL_LEASE_SWAP"] = json.dumps(lease_swap)
+    if no_units:
+        env["FAKE_SYSTEMCTL_NO_UNITS"] = "1"
 
     return subprocess.run(
-        [str(SCRIPT)],
+        [str(SCRIPT), *extra_args],
         env=env,
         capture_output=True,
         timeout=30,
@@ -391,4 +430,230 @@ def test_the_stamp_is_still_well_formed_json_for_a_hostile_token(
         "a non-empty ambient token sanitised down to the empty string, which "
         "the guard reads as a POSITIVE 'no pytest session wrote this' and "
         f"forgives; got {stamped!r}"
+    )
+
+
+
+# ---------------------------------------------------------------------------
+# The in-flight fleet-redeploy lease (task 4755), EXIT-PATH lifecycle.
+#
+# The lease's whole value to its three readers -- the watchdog's staleness
+# backstop, the merge-landed coordinator, and the watchdog's liveness probe --
+# is that its ABSENCE is trustworthy: each stands down while it is there, so a
+# lease that outlives its sweep suppresses every redeploy tier for up to the
+# reader-side max-age bound.
+#
+# Every test here asserts the PAIR -- held mid-sweep, gone afterwards -- and
+# never the second half alone. "The file is absent afterwards" is equally true
+# of a script that never wrote one, so an absence-only test is green against
+# the very code it is meant to be RED against. The mid-sweep half comes from
+# the fake systemctl's lease log, which is written from inside the sweep.
+#
+# Paired with the clock assertions above rather than kept in the --drain suite,
+# because the two files are written by the same exit paths in a FIXED order --
+# clock first and only on verified success (I2), lease second and always --
+# and that ordering is only visible when both are asserted on one run.
+# ---------------------------------------------------------------------------
+
+
+def _lease_log_path(tmp_path: Path) -> Path:
+    return tmp_path / "lease_observations.log"
+
+
+def _lease_observations(tmp_path: Path) -> list[tuple[str, dict]]:
+    """Every (verb, lease body) the fake systemctl saw on disk, in call order."""
+    log = _lease_log_path(tmp_path)
+    if not log.exists():
+        return []
+    observations = []
+    for line in log.read_text().splitlines():
+        verb, _, body = line.partition("\t")
+        observations.append((verb, json.loads(body)))
+    return observations
+
+
+def _assert_held_mid_sweep(tmp_path: Path, result) -> list[tuple[str, dict]]:
+    """The sweep must have been holding a lease of its own while it ran."""
+    observations = _lease_observations(tmp_path)
+    assert observations, (
+        f"no systemctl call observed a lease on disk -- the sweep must hold one "
+        f"for its whole run, or nothing below distinguishes 'released' from "
+        f"'never acquired'. stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    for verb, lease in observations:
+        assert set(lease) == {"pid", "started_ts", "current_unit"}, (
+            f"lease body seen at `{verb}` must carry exactly "
+            f"pid/started_ts/current_unit; got {lease!r}"
+        )
+        assert isinstance(lease["pid"], int) and lease["pid"] > 0, (
+            f"lease seen at `{verb}` must name a positive pid; got {lease!r}"
+        )
+    return observations
+
+
+def test_verified_fresh_exit_stamps_the_clock_and_then_releases_the_lease(
+    tmp_path: Path,
+) -> None:
+    """HAPPY PATH: lease held throughout, clock stamped, lease gone.
+
+    The ordering is automatic and easy to misread, which is why it is pinned:
+    stamp_fleet_deploy_clock runs, then `exit 0`, and only then does the EXIT
+    trap release. Inverting it -- releasing before stamping -- would open a
+    window in which no lease is held and no clock has been stamped yet, i.e.
+    precisely the gap the two mechanisms exist between them to close.
+    """
+    clock_file = tmp_path / "last_redeploy_orchestrator.json"
+    lease_file = tmp_path / "fleet_redeploy_lease.json"
+
+    result = _run_script(
+        tmp_path, scenario="fresh", clock_file=clock_file, lease_file=lease_file,
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    _assert_held_mid_sweep(tmp_path, result)
+    assert clock_file.exists(), "the verified-fresh path must still stamp the clock"
+    assert not lease_file.exists(), (
+        f"the lease must be released on exit-0; it still holds "
+        f"{lease_file.read_text()!r}"
+    )
+
+
+def test_failed_verify_exit_releases_the_lease_and_leaves_the_clock_alone(
+    tmp_path: Path,
+) -> None:
+    """I2 UNCHANGED, lease still released: the two fail in opposite directions.
+
+    A failed sweep must NOT stamp the clock -- stamping would silence the
+    backstop for a full min-interval after a restart that never verified --
+    and must nonetheless release the lease, because there is no longer a sweep
+    in flight for anyone to stand down for. Asserting both on one run is what
+    stops a later "release next to the stamp" tidy-up from coupling them.
+    """
+    clock_file = tmp_path / "last_redeploy_orchestrator.json"
+    lease_file = tmp_path / "fleet_redeploy_lease.json"
+    sentinel = '{"ts": 1.0}'
+    clock_file.write_text(sentinel)
+
+    result = _run_script(
+        tmp_path, scenario="stale", clock_file=clock_file, lease_file=lease_file,
+    )
+
+    assert result.returncode == 1, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    _assert_held_mid_sweep(tmp_path, result)
+    assert clock_file.read_text() == sentinel, "I2: a failed verify must not stamp"
+    assert not lease_file.exists(), (
+        f"the lease must be released on the verify-failure exit-1; it still "
+        f"holds {lease_file.read_text()!r}"
+    )
+
+
+def test_no_running_units_exit_releases_the_lease(tmp_path: Path) -> None:
+    """The early "nothing to restart" exit-0 must release too.
+
+    Reached before the unit loop and before the stamp, so it is the path a
+    hand-placed `lease_release` next to the other two would most plausibly
+    miss -- and the sweep it ends did hold a lease for its whole (very short)
+    life, which the single `list-units` observation proves.
+    """
+    clock_file = tmp_path / "last_redeploy_orchestrator.json"
+    lease_file = tmp_path / "fleet_redeploy_lease.json"
+
+    result = _run_script(
+        tmp_path, scenario="fresh", clock_file=clock_file, lease_file=lease_file,
+        no_units=True,
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert b"nothing to restart" in result.stdout, (
+        f"expected the early no-units exit; got stdout={result.stdout!r}"
+    )
+    observations = _assert_held_mid_sweep(tmp_path, result)
+    assert [verb for verb, _ in observations] == ["list-units"], (
+        f"the only call on this path is the enumeration, and it must already "
+        f"see the lease -- acquisition precedes enumeration; got {observations!r}"
+    )
+    assert not clock_file.exists(), (
+        "I2: an empty fleet is not a verified redeploy and must not stamp"
+    )
+    assert not lease_file.exists(), (
+        f"the lease must be released on the no-units exit-0; it still holds "
+        f"{lease_file.read_text()!r}"
+    )
+
+
+def test_unexpected_argument_exit_writes_no_lease_at_all(tmp_path: Path) -> None:
+    """A rejected argument must not even ACQUIRE -- acquisition follows parsing.
+
+    A REGRESSION PIN, not a RED test, and deliberately so: "never acquired"
+    and "acquired then released" are indistinguishable from out here, and both
+    are indistinguishable from today's no-lease-at-all script. What it guards
+    is the ORDER, which a concurrent reader CAN tell apart -- it would see a
+    live lease for a sweep that never ran. The order itself is pinned
+    structurally by scripts/tests/test_restart_all_orchestrators.py::
+    test_every_exit_after_acquisition_is_covered_by_the_release_trap; this is
+    the behavioural half of that pair.
+    """
+    clock_file = tmp_path / "last_redeploy_orchestrator.json"
+    lease_file = tmp_path / "fleet_redeploy_lease.json"
+
+    result = _run_script(
+        tmp_path, scenario="fresh", clock_file=clock_file, lease_file=lease_file,
+        extra_args=("--no-such-flag",),
+    )
+
+    assert result.returncode == 1, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert b"unexpected argument" in result.stderr, (
+        f"expected the argument rejection; got stderr={result.stderr!r}"
+    )
+    assert not lease_file.exists(), (
+        f"a rejected argument must leave no lease behind; got "
+        f"{lease_file.read_text()!r}"
+    )
+
+
+def test_release_refuses_to_delete_a_lease_recorded_under_another_pid(
+    tmp_path: Path,
+) -> None:
+    """A sweep must release only its OWN lease, never whoever holds it now.
+
+    THE OVERLAP THIS CLOSES, which is why the task exists: the fixed
+    transient-unit-name guard stops the staleness backstop running two sweeps
+    at once, but the merge-landed coordinator uses a DIFFERENT transient unit
+    name and is not covered by it. With an unconditional `rm -f` in the EXIT
+    trap, the shorter of two overlapping sweeps deletes the longer one's lease
+    on its way out -- re-arming all three readers while units are still being
+    restarted, which is exactly the collision being prevented.
+
+    The hand-over is staged mid-sweep rather than pre-seeded, because
+    acquisition is unconditional: a lease seeded BEFORE the run is clobbered by
+    this sweep's own `lease_acquire` and so proves nothing about the release.
+    os.getpid() is a live pid that is definitively not the script's, so the
+    handed-over lease also stays LIVE by the readers' pid-alive test.
+    """
+    clock_file = tmp_path / "last_redeploy_orchestrator.json"
+    lease_file = tmp_path / "fleet_redeploy_lease.json"
+    successor = {
+        "pid": os.getpid(),
+        "started_ts": 1.0,
+        "current_unit": "orchestrator-fake-successor.service",
+    }
+
+    result = _run_script(
+        tmp_path, scenario="fresh", clock_file=clock_file, lease_file=lease_file,
+        lease_swap=successor,
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    observations = _assert_held_mid_sweep(tmp_path, result)
+    own_pids = {lease["pid"] for _, lease in observations} - {successor["pid"]}
+    assert own_pids, (
+        f"this sweep must have held its OWN lease before the hand-over, or the "
+        f"survival below is vacuous; got {observations!r}"
+    )
+    assert lease_file.exists(), (
+        "the successor's lease must survive this sweep's release"
+    )
+    assert json.loads(lease_file.read_text()) == successor, (
+        f"the successor's lease must be byte-equal to what it wrote; got "
+        f"{lease_file.read_text()!r}"
     )

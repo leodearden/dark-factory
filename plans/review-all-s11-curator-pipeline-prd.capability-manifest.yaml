@@ -1,0 +1,244 @@
+# Machine-readable twin of review-all-s11-curator-pipeline-prd.capability-manifest.md
+# task_id values stay null until commit_planning stamps them (phase B).
+prd: plans/review-all-s11-curator-pipeline-prd.md
+schema_version: 1
+tasks:
+  - label: "α"
+    task_id: 6703
+    title: "Extract the curator vocabulary into middleware/curator_types.py"
+    capabilities:
+      - name: "curator-types-module-exists"
+        binding: "capability→producer — built by α (new leaf module)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          expect: present
+          paths: ["fused-memory/src/fused_memory/middleware/curator_types.py"]
+      - name: "driver-no-longer-defines-the-vocabulary"
+        binding: "grep task_curator.py — the five classes are defined there on main; α moves them"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class (CandidateTask|CuratorDecision|CuratorFailureError|PreparedCandidate|RewrittenTask)\\b"
+          paths: ["fused-memory/src/fused_memory/middleware/task_curator.py"]
+          expect: absent
+      - name: "former-scc-members-do-not-import-the-driver"
+        binding: "grep — guards/escalator/ZOT sweep import task_curator on main (TYPE_CHECKING or module level)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "from fused_memory\\.middleware\\.task_curator import"
+          paths:
+            - "fused-memory/src/fused_memory/middleware/cancelled_premise_blocklist.py"
+            - "fused-memory/src/fused_memory/middleware/operational_ask_registry.py"
+            - "fused-memory/src/fused_memory/middleware/recon_code_fix_premise_guard.py"
+            - "fused-memory/src/fused_memory/middleware/path_scope_guard.py"
+            - "fused-memory/src/fused_memory/middleware/curator_escalator.py"
+            - "fused-memory/src/fused_memory/middleware/curator_zot_duplicate_sweep.py"
+          expect: absent
+      - name: "registry-guard-imports-hoisted"
+        binding: "grep task_curator.py — three function-local guard imports on main (inside _maybe_* methods)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^ {8,}from fused_memory\\.middleware\\.(cancelled_premise_blocklist|recon_code_fix_premise_guard|operational_ask_registry) import"
+          paths: ["fused-memory/src/fused_memory/middleware/task_curator.py"]
+          expect: absent
+      - name: "normalize-title-mirror-deleted"
+        binding: "grep candidate_key.py — private mirror _normalize_title on main; α makes it the public single home"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def _normalize_title\\("
+          paths: ["fused-memory/src/fused_memory/middleware/candidate_key.py"]
+          expect: absent
+      - name: "leaf-imports-nothing-heavy"
+        binding: "fixture — α's test_curator_types_leaf.py spawns python -I and inspects sys.modules"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          expect: present
+          paths: ["fused-memory/tests/test_curator_types_leaf.py"]
+  - label: "β"
+    task_id: 6704
+    title: "Delete the dead single-ticket worker path and _intra_batch_key"
+    capabilities:
+      - name: "dead-symbols-absent"
+        binding: "grep fused-memory/src — the four defs exist on main with zero src callers (git grep, ae3047ec3a)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def (_process_add_ticket|_process_add_tickets_batch|_merged_audit_metadata|_intra_batch_key)\\("
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "stale-mirror-site-docstring-corrected"
+        binding: "grep triage.py — names TaskCurator._intra_batch_key on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_intra_batch_key"
+          paths: ["orchestrator/src/orchestrator/agents/triage.py", "fused-memory/src/fused_memory/middleware/candidate_key.py"]
+          expect: absent
+      - name: "behaviour-retargeted-to-public-seams"
+        binding: "real TicketStore fixtures exist in fused-memory/tests/test_ticket_worker.py; submit_task/resolve_ticket are TaskInterceptor public methods"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "test-retargeting quality is a review judgement, not a grep"
+  - label: "γ"
+    task_id: 6705
+    title: "resolve_ticket reports an open ticket as open (typed ticket-status vocabulary)"
+    capabilities:
+      - name: "ticket-status-enum"
+        binding: "capability→producer — built by γ in ticket_store.py (owner of ticket rows); awaiting_curation member from 4513 (upstream)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class TicketStatus\\("
+          paths: ["fused-memory/src/fused_memory/middleware/ticket_store.py"]
+          expect: present
+      - name: "no-synthetic-failed-timeout"
+        binding: "grep task_interceptor.py — _resolve_ticket_raw returns {'status': 'failed', 'reason': 'timeout'} on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "'reason': 'timeout'"
+          paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py"]
+          expect: absent
+      - name: "open-reason-emitted"
+        binding: "capability→producer — γ emits reason wait_timeout"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "wait_timeout"
+          paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py", "fused-memory/src/fused_memory/middleware/ticket_store.py"]
+          expect: present
+      - name: "dead-orchestrator-quote-deleted"
+        binding: "grep roles.py — submit_resolve_instructions defined on main, no production renderer since bfd19a296c"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def submit_resolve_instructions\\("
+          paths: ["orchestrator/src/orchestrator/agents/roles.py"]
+          expect: absent
+      - name: "canonical-caller-doc-states-open-rule"
+        binding: "grep skills/_shared/ticket-failure-handling.md — no open-status section on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "wait_timeout"
+          paths: ["skills/_shared/ticket-failure-handling.md"]
+          expect: present
+      - name: "vocabulary-parity-fixture"
+        binding: "fixture — γ's test_resolve_ticket_vocabulary.py mirrors TicketStatus against each quoting site (B5)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          expect: present
+          paths: ["fused-memory/tests/test_resolve_ticket_vocabulary.py"]
+      - name: "open-hold-bounded"
+        binding: "TicketJanitor worker-dead reap (ticket_janitor.py) + startup server_restart sweep (TicketStore) on main; awaiting_curation backlog escalation from 4513 (upstream)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "INV-7 bound is an argument over existing reapers, pinned by B1-B4 behaviourally"
+  - label: "δ"
+    task_id: 6706
+    title: "One candidate-section renderer, one LLM invoker, one failure mapper"
+    capabilities:
+      - name: "batch-invoke-twin-deleted"
+        binding: "grep task_curator.py — _call_llm_batch defined on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def _call_llm_batch\\("
+          paths: ["fused-memory/src/fused_memory/middleware/task_curator.py"]
+          expect: absent
+      - name: "batch-section-twin-deleted"
+        binding: "grep task_curator.py — _build_batch_section defined on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _build_batch_section\\("
+          paths: ["fused-memory/src/fused_memory/middleware/task_curator.py"]
+          expect: absent
+      - name: "one-curator-wildcard-site"
+        binding: "grep shared/tests/test_wildcard_mcp_scoping_gate.py — _KNOWN_SITES names TaskCurator._call_llm and _call_llm_batch on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "TaskCurator\\._invoke_curator"
+          paths: ["shared/tests/test_wildcard_mcp_scoping_gate.py"]
+          expect: present
+      - name: "invoker-constructor-seam"
+        binding: "invoke_with_cap_retry is the shared CLI invoker task_curator already calls (shared.cli_invoke); δ injects it"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "seam shape is reviewed; B8 exercises it"
+  - label: "ε"
+    task_id: 6707
+    title: "One curation pipeline for every batch size"
+    capabilities:
+      - name: "pipeline-renamed-and-single"
+        binding: "capability→producer — ε introduces TaskCurator.curate_prepared (absent on main)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def curate_prepared\\("
+          paths: ["fused-memory/src/fused_memory/middleware/task_curator.py"]
+          expect: present
+      - name: "batch-pipeline-twin-deleted"
+        binding: "grep fused-memory/src — curate_batch_prepared defined and called on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "curate_batch_prepared"
+          paths: ["fused-memory/src/fused_memory/middleware/task_curator.py", "fused-memory/src/fused_memory/middleware/task_interceptor.py"]
+          expect: absent
+      - name: "exact-match-runs-in-batches"
+        binding: "TaskCurator._pre_llm_exact_match + note_created (called from _dispatch_ticket_decision's create path) exist on main; today only curate() calls the former"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behavioural (B6), asserted by ε's submit_task/resolve_ticket test"
+      - name: "outage-paths-from-4513"
+        binding: "producer:task-4513 (upstream) — awaiting_curation, internal defer, curator_action='uncurated'"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "external producer; its own delivered behaviour is 4513's"
+  - label: "ζ"
+    task_id: 6708
+    title: "Bound the curator's corpus and R4 reads; surface failed corpus streams"
+    capabilities:
+      - name: "corpus-read-filtered"
+        binding: "TaskBackendProtocol.get_tasks(statuses=) + shared.task_statuses.ACTIVE exist on main; _build_corpus calls get_tasks(project_root) unfiltered on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "await self\\._taskmaster\\.get_tasks\\(project_root\\)"
+          paths: ["fused-memory/src/fused_memory/middleware/task_curator.py"]
+          expect: absent
+      - name: "r4-uses-metadata-lookup"
+        binding: "producer:task-6385 (upstream) — TaskBackendProtocol.find_tasks_by_metadata; ζ queries key='suggestion_hash'"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "key=['\"]suggestion_hash['\"]"
+          paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py"]
+          expect: present
+      - name: "unavailable-streams-census"
+        binding: "capability→producer — ζ adds PoolWithheld.unavailable_streams in α's curator_types.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "unavailable_streams"
+          paths: ["fused-memory/src/fused_memory/middleware/curator_types.py"]
+          expect: present
+      - name: "dependency-stream-substrate"
+        binding: "TaskBackendProtocol.get_dependency_edges and get_statuses_raw(ids=) exist on main"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "substrate existence verified at authoring; usage pinned by B9"

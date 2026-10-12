@@ -28,14 +28,9 @@ import dataclasses
 from typing import Any
 from unittest.mock import MagicMock
 
-from test_merge_queue_concurrent_verify import _make_request
-
-from orchestrator.config import OrchestratorConfig
-from orchestrator.git_ops import GitOps, MergeResult
 from orchestrator.merge_queue import (
     InflightEntry,
     MergeOutcome,
-    RealMergeItem,
     SpeculativeMergeWorker,
 )
 from orchestrator.verify_runner import HostAllocator
@@ -81,7 +76,7 @@ def _drive_fill(worker: SpeculativeMergeWorker, allocator: HostAllocator) -> _Fi
 
     async def _fake_dispatch_item(item: Any) -> InflightEntry | None:
         drive.dispatched.append(item)
-        lease = await allocator.acquire(lambda: MagicMock())
+        lease = await allocator.acquire(lambda: MagicMock(), policy='prefer_local')
         if lease is None:
             return None
         # Signal only after the lease is confirmed held, not merely
@@ -183,26 +178,3 @@ async def _teardown_fill_drive(
         pending = worker._pending_verifier_get
         pending.cancel()
         await asyncio.gather(pending, return_exceptions=True)
-
-
-def _make_real_item(
-    git_ops: GitOps,
-    config: OrchestratorConfig,
-    task_id: str,
-    base_sha: str,
-) -> RealMergeItem:
-    """Build a dispatch-ready RealMergeItem over a fresh MergeRequest.
-
-    Field shape copied from TestStopDrainsInflight
-    (test_merge_queue_concurrent_verify.py:3131-3144) -- the established
-    direct-construction pattern for loop-driving tests.
-    """
-    req = _make_request(task_id, f'task/{task_id}', git_ops.project_root, config)
-    wt = git_ops.project_root / '.worktrees' / task_id
-    return RealMergeItem(
-        request=req,
-        merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt),
-        merge_wt=wt,
-        base_sha=base_sha,
-        speculative=False,
-    )

@@ -66,8 +66,8 @@ class TestHarnessKFromConfig:
              patch.object(h, '_build_service_restart_coordinator',
                           return_value=MagicMock()), \
              patch('asyncio.create_task', return_value=MagicMock()), \
-             patch('orchestrator.merge_queue.enforce_merge_liveness_margin') as mock_liveness, \
-             patch('orchestrator.merge_queue.enforce_persistent_worktree_serial_lane') as mock_serial:
+             patch('orchestrator.merge_lane.liveness.enforce_merge_liveness_margin') as mock_liveness, \
+             patch('orchestrator.merge_lane.liveness.enforce_persistent_worktree_serial_lane') as mock_serial:
 
             mock_smw = MagicMock()
             mock_smw.run = AsyncMock(return_value=None)

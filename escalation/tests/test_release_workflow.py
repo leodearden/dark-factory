@@ -529,7 +529,7 @@ async def test_release_workflow_real_slot_exit_parks_blocked(
     h._merge_inflight_registry = None  # type: ignore[assignment]
     h.cost_store = None  # type: ignore[assignment]
 
-    # _collect_done_reports / _apply_retry_cap
+    # _collect_slot_report / _apply_retry_cap
     h._run_store = None  # type: ignore[assignment]
     h._run_id = None  # type: ignore[assignment]
     h.review_checkpoint = None  # type: ignore[assignment]
