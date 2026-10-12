@@ -30,12 +30,18 @@ from fused_memory.utils.referent_resolution import (
     REFERENT_SOURCES,
     ReferentResolution,
     _conflicting_referents,
+    _declared_referents,
     resolve_referents,
 )
 from fused_memory.utils.validation import InputValidationError
 
 #: The group every derived-path test scans in, unless it needs a foreign one.
 GROUP = 'dark_factory'
+
+#: Spelled as escapes, mirroring tests/test_canonical_labels.py: U+212A renders
+#: as an ordinary 'K', so a literal-character fixture would be unreviewable.
+LATIN_SMALL_LETTER_LONG_S = 'ſ'  # str.lower() does NOT fold this onto 's'
+KELVIN_SIGN = 'K'  # str.lower() DOES fold this onto 'k'
 
 
 class TestReferentSourcesVocabulary:
@@ -1074,6 +1080,26 @@ class TestMalformedDeclarationIsRejectedLoudly:
                 metadata={'task_id': 3668},
                 content='Fixed the bug in Task 3127.',
                 group_id=GROUP,
+            )
+
+    @pytest.mark.parametrize(
+        'lookalike_project_id',
+        ['ta' + LATIN_SMALL_LETTER_LONG_S + 'k', 'tas' + KELVIN_SIGN],
+        ids=['long-s-spelling', 'kelvin-sign-spelling'],
+    )
+    def test_a_unicode_lookalike_of_the_task_vocabulary_is_rejected_loudly(
+        self, lookalike_project_id
+    ):
+        """canonical_labels.py's module docstring GUARANTEES the ASCII
+        task-vocabulary rule for the declared path through
+        ``validate_project_id``'s ASCII-only allowlist (long s, which
+        ``str.lower()`` does not fold) and through the vocabulary guard
+        (Kelvin sign, which it does). Pins the loud rejection, not which
+        guard fires, so reordering or dropping either cannot mint a foreign
+        ``'taſk:2500'`` node unnoticed."""
+        with pytest.raises(InputValidationError):
+            _declared_referents(
+                [{'id': 2500, 'project_id': lookalike_project_id}], group_id=GROUP
             )
 
     @pytest.mark.parametrize(
