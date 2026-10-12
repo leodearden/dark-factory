@@ -42,33 +42,17 @@ function rowTouchesModule(row, module) {
   return (row.lock_set || []).includes(module.path)
 }
 
-// Does this module earn a column?
-//
-// Three disjuncts, and only the first is obvious. `contention` counts rows
-// whose lock_set includes the path — LIVE WAITERS — which leaves it blind to
-// two states the grid exists to show, so each gets a rescue clause:
-//
-//   park_stack — scheduler.py injects an entry for every park-stack key even
-//   with no live waiters (contention: 0), so a fully-stranded module still
-//   gets one.  A bare `contention > 1` would hide exactly the stranded parks
-//   the Scheduler tab's red banner and ParkStacksSection already single out.
-//
-//   holder — the holder is counted only if the holding task is itself among
-//   the composed rows.  When it is not (a stale `current_holders` entry whose
-//   task has left active_tasks, the same staleness `_stranded_park_rows`
-//   compensates for), one genuinely-blocked waiter scores contention 1 and
-//   dropping the column would take that waiter's red 'lock-taken' cell
-//   with it.  Still requiring a waiter keeps a merely-held, uncontended
-//   module out: one coloured cell is not contention.
-//
-// Neither rescue can crowd the contended columns out of the cap below: the
-// server sorts by `(-contention, path)`, so every `contention > 1` module
-// precedes both of these in the prefix the slice takes.
+// A stranded lock is one no live task can release: a park with a dead owner
+// anywhere in its stack, or a holder that has left the active task set while
+// a waiter still queues behind it. Both facts come from the server
+// (has_dead_park, holder_live); `=== false` keeps unknown liveness inert.
+function lockIsStranded(module) {
+  return !!module.has_dead_park
+    || (!!module.holder && module.holder_live === false && (module.contention || 0) > 0)
+}
+
 function moduleEarnsColumn(module) {
-  const contention = module.contention || 0
-  return contention > 1
-    || (module.park_stack || []).length > 0
-    || (!!module.holder && contention > 0)
+  return (module.contention || 0) > 1 || lockIsStranded(module)
 }
 
 // Choose the rows and columns the heatmap will actually render.
