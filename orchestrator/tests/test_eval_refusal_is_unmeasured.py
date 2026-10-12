@@ -17,8 +17,14 @@ from orchestrator.evals.measurement import (
     UnmeasuredCause,
 )
 from orchestrator.evals.reviewer_trial import campaign, scorer
-from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, GroundTruthIssue
+from orchestrator.evals.reviewer_trial.corpus import (
+    CorpusDiff,
+    CorpusManifest,
+    GroundTruthIssue,
+)
+from orchestrator.evals.reviewer_trial.report import build_trial_report
 from orchestrator.evals.reviewer_trial.runner import PanelRunResult
+from orchestrator.evals.reviewer_trial.variants import ReviewerSpec, VariantConfig
 
 pytestmark = pytest.mark.asyncio
 
@@ -124,3 +130,34 @@ async def test_summarize_campaign_counts_the_refusal_and_keeps_every_mean(
     for counted, clean in zip(with_refusal, without_refusal, strict=True):
         assert replace(counted, unmeasured=0, unmeasured_cost_usd=0.0) == clean
     assert next(a for a in with_refusal if a.name == 'v1').unmeasured == 1
+
+
+async def test_build_trial_report_counts_the_refusal_and_keeps_every_mean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(scorer, 'invoke_agent', _refuse)
+    run, diff = _refused_panel_cell()
+    refused = await scorer.score_panel_run(run, diff)
+    other = CorpusDiff(
+        diff_id='d2', language='python', source='synthetic', diff_text='diff',
+        description='d', ground_truth=[],
+    )
+    corpus = CorpusManifest(diffs=[diff, other])
+    variants = [
+        VariantConfig(name=name, description=name, reviewers=[
+            ReviewerSpec(name='r1', model='sonnet', specialization='Testing.'),
+        ])
+        for name in ('v1', 'v2')
+    ]
+    measured = [
+        _measured_score(variant, d, f1)
+        for variant, f1 in (('v1', 0.7), ('v2', 0.4)) for d in ('d1', 'd2')
+    ]
+
+    clean = build_trial_report(measured, variants, corpus)
+    counted = build_trial_report([*measured, refused], variants, corpus)
+
+    clean_v1 = next(s for s in clean.summaries if s.name == 'v1')
+    counted_v1 = next(s for s in counted.summaries if s.name == 'v1')
+    assert replace(counted_v1, unmeasured=0, unmeasured_cost_usd=0.0) == clean_v1
+    assert counted_v1.unmeasured == 1
