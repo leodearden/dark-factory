@@ -708,10 +708,9 @@ class TestClassifyAgentClass:
         because a watcher's identity reaches its own session only as one
         (``resolved_by=orchestrator-escalation-watcher-auto``). The price
         is this case: an interactive main-checkout session that Reads a
-        module quoting the markers is restratified by the quote. Telling a
-        session's own markers from foreign material it reads is task
-        5785's, which already names a session restratified by a Read of
-        digest.py."""
+        module quoting the markers is restratified by the quote. Only an
+        instrument session's own opening prompt is told apart from foreign
+        material it carries; a Read never is."""
         assert _classify(*_READ_OF_MARKER_SOURCE) is AgentClass.ORCHESTRATED_TASK
 
     def test_records_are_read_once_in_order_from_any_iterable(self):

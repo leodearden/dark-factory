@@ -196,8 +196,13 @@ extended to the other members: it was justified by forensics on the
 briefing shape specifically, and a newly-sighted injector earns one only
 on its own evidence."""
 
+TRICKLE_CODER_PROMPT_OPENER: str = 'you are the trickle coder for the dark-factory agent-confusion codebook'
+"""The lowercase opening of scripts/legibility/coder.py::build_prompt,
+restated rather than imported for the same layering reason as
+:data:`CODER_JUDGMENT_KEYS`."""
+
 HARNESS_PROMPT_MARKERS: tuple[str, ...] = (
-    'you are the trickle coder for the dark-factory agent-confusion codebook',
+    TRICKLE_CODER_PROMPT_OPENER,
     'your previous run was interrupted by a usage limit',
     'you were interrupted by an orchestrator restart',
     'handle this escalation, then call `resolve_issue` with a summary',

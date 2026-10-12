@@ -18,7 +18,11 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from legibility.reingestion import has_non_human_origin, is_reingested_content
+from legibility.reingestion import (
+    TRICKLE_CODER_PROMPT_OPENER,
+    has_non_human_origin,
+    is_reingested_content,
+)
 
 
 class SignalClass(StrEnum):
@@ -556,6 +560,11 @@ AGENT_CLASS_MARKERS: tuple[AgentMarker, ...] = (
 
 _MARKER_LITERALS = frozenset(literal for marker in AGENT_CLASS_MARKERS for literal in marker.literals)
 
+INSTRUMENT_PROMPT_OPENERS: tuple[str, ...] = (TRICKLE_CODER_PROMPT_OPENER,)
+"""Lowercase openings of the prompts the legibility pipeline sends its own
+model calls. A session whose first primary user turn opens with one is
+LEGIBILITY_INSTRUMENT; the same text anywhere else is foreign material."""
+
 
 def is_primary_user_turn(record: Mapping[str, Any]) -> bool:
     """A user turn of the session itself: not a sidechain, not an isMeta injection."""
@@ -576,6 +585,12 @@ def _marked_class(sighted: AbstractSet[str]) -> AgentClass | None:
         (marker.agent_class for marker in AGENT_CLASS_MARKERS if marker.matches(sighted)),
         None,
     )
+
+
+def _first_turn_class(text: str) -> AgentClass | None:
+    if text.lstrip().lower().startswith(INSTRUMENT_PROMPT_OPENERS):
+        return AgentClass.LEGIBILITY_INSTRUMENT
+    return _marked_class(_sighted(text, _MARKER_LITERALS))
 
 
 @dataclass(frozen=True)
@@ -612,7 +627,7 @@ class AgentClassEvidence:
             evidence = replace(
                 evidence,
                 first_turn_text=text,
-                first_turn_class=_marked_class(_sighted(text, _MARKER_LITERALS)),
+                first_turn_class=_first_turn_class(text),
             )
         unsighted = _MARKER_LITERALS - evidence.carrier_literals
         if evidence.in_worktree or evidence.first_turn_class is not None or not unsighted:
@@ -627,8 +642,10 @@ class AgentClassEvidence:
         """The session's agent class.
 
         In order: no records is UNKNOWN; a worktree encoded dir is
-        ORCHESTRATED_TASK; then the marker table over the raw first user
-        turn, then over every raw carrier. The carriers are read unfiltered
+        ORCHESTRATED_TASK; then a first user turn opening with an
+        INSTRUMENT_PROMPT_OPENERS entry is LEGIBILITY_INSTRUMENT; then the
+        marker table over the raw first user turn, then over every raw
+        carrier. The carriers are read unfiltered
         on purpose: the class is decided BY injected markers, which the
         dialogue filter exists to drop. No marker is INTERACTIVE.
         """
