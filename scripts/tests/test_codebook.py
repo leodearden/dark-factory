@@ -332,7 +332,7 @@ def test_migrate_v1_to_v2_maps_yaml_boolean_true_status_to_open():
 
 
 def test_migrate_v1_to_v2_drops_stale_updated_field():
-    """Amendment: under the sole-writer design, dump()/apply_coding_record()
+    """Amendment: under the sole-writer design, dump()/apply_coding_records()
     never stamp the top-level `updated` field, so retaining it would freeze
     at the migration date and mislead readers as sightings accumulate.
     migrate_v1_to_v2 drops it rather than retaining or re-stamping it (a
@@ -441,8 +441,12 @@ def test_validate_coding_record_invariant_violated_accepts_null():
 
 
 # ---------------------------------------------------------------------------
-# step-9: RED (§8.2 idempotency, match path) — apply_coding_record()
+# step-9: RED (§8.2 idempotency, match path) — apply_coding_records()
 # ---------------------------------------------------------------------------
+
+def _merge_one(codebook: dict, record: Any, slugs: tuple[str, ...] = _NO_SLUGS):
+    return mod.apply_coding_records(codebook, [record], invariant_slugs=slugs)
+
 
 def _codebook_with_entry_a() -> dict:
     codebook = _minimal_v2()
@@ -467,13 +471,13 @@ def _match_record(entry_id="entry-a", session="sess-1", date="2026-07-14"):
     }
 
 
-def test_apply_coding_record_appends_one_sighting():
+def test_merge_appends_one_sighting():
     codebook = _codebook_with_entry_a()
     record = _match_record()
 
-    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
+    merge = _merge_one(codebook, record)
 
-    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    entry = next(e for e in merge.codebook["entries"] if e["id"] == "entry-a")
     assert entry["sightings"] == [
         {
             "date": "2026-07-14",
@@ -483,45 +487,45 @@ def test_apply_coding_record_appends_one_sighting():
             "manifested_phase": "merge",
         }
     ]
-    assert mod.validate(result) == []
+    assert mod.validate(merge.codebook) == []
 
 
-def test_apply_coding_record_match_is_idempotent_on_session_and_entry():
+def test_merge_match_is_idempotent_on_session_and_entry():
     codebook = _codebook_with_entry_a()
     record = _match_record()
 
-    once, _ = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
-    twice, _ = mod.apply_coding_record(once, record, invariant_slugs=_NO_SLUGS)
+    once = _merge_one(codebook, record).codebook
+    twice = _merge_one(once, record).codebook
 
     entry = next(e for e in twice["entries"] if e["id"] == "entry-a")
     assert len(entry["sightings"]) == 1
     assert mod.validate(twice) == []
 
 
-def test_apply_coding_record_unknown_entry_id_is_skipped_and_counted():
+def test_merge_unknown_entry_id_is_skipped_and_counted():
     codebook = _codebook_with_entry_a()
     record = _match_record(entry_id="entry-zzz")
 
-    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
+    merge = _merge_one(codebook, record)
 
-    assert len(result["entries"]) == 1  # no entry fabricated
-    assert result["entries"][0]["sightings"] == []
-    assert stats["skipped_unknown_entry"] == 1
-    assert mod.validate(result) == []
+    assert len(merge.codebook["entries"]) == 1  # no entry fabricated
+    assert merge.codebook["entries"][0]["sightings"] == []
+    assert merge.counts.skipped_unknown_entry == 1
+    assert mod.validate(merge.codebook) == []
 
 
-def test_apply_coding_record_does_not_mutate_input():
+def test_merge_does_not_mutate_input():
     codebook = _codebook_with_entry_a()
     original = copy.deepcopy(codebook)
     record = _match_record()
 
-    mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
+    _merge_one(codebook, record)
 
     assert codebook == original
 
 
 # ---------------------------------------------------------------------------
-# step-11: RED (§8.3 candidate append) — apply_coding_record() candidates
+# step-11: RED (§8.3 candidate append) — apply_coding_records() candidates
 # ---------------------------------------------------------------------------
 
 def _candidate_record(title="novel shape", session="sess-1", date="2026-07-14"):
@@ -543,43 +547,43 @@ def _candidate_record(title="novel shape", session="sess-1", date="2026-07-14"):
     }
 
 
-def test_apply_coding_record_appends_one_candidate():
+def test_merge_appends_one_candidate():
     codebook = _codebook_with_entry_a()
     record = _candidate_record()
 
-    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
+    merge = _merge_one(codebook, record)
 
-    assert len(result["candidates"]) == 1
-    candidate = result["candidates"][0]
+    assert len(merge.codebook["candidates"]) == 1
+    candidate = merge.codebook["candidates"][0]
     assert candidate["id"] == "cand-20260714-1"
     assert candidate["first_seen"] == "2026-07-14"
     assert candidate["disposition"] == "pending"
     assert candidate["title"] == "novel shape"
     assert len(candidate["sightings"]) == 1
     assert candidate["sightings"][0]["session"] == "sess-1"
-    assert stats["candidates_applied"] == 1
-    assert mod.validate(result) == []
+    assert merge.counts.candidates_applied == 1
+    assert mod.validate(merge.codebook) == []
 
 
-def test_apply_coding_record_candidate_is_idempotent_on_session_and_title():
+def test_merge_candidate_is_idempotent_on_session_and_title():
     codebook = _codebook_with_entry_a()
     record = _candidate_record()
 
-    once, _ = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
-    twice, _ = mod.apply_coding_record(once, record, invariant_slugs=_NO_SLUGS)
+    once = _merge_one(codebook, record).codebook
+    twice = _merge_one(once, record).codebook
 
     assert len(twice["candidates"]) == 1
     assert len(twice["candidates"][0]["sightings"]) == 1
     assert mod.validate(twice) == []
 
 
-def test_apply_coding_record_different_candidate_same_day_increments_id():
+def test_merge_different_candidate_same_day_increments_id():
     codebook = _codebook_with_entry_a()
     record_a = _candidate_record(title="novel shape")
-    once, _ = mod.apply_coding_record(codebook, record_a, invariant_slugs=_NO_SLUGS)
+    once = _merge_one(codebook, record_a).codebook
 
     record_b = _candidate_record(title="a different shape")
-    twice, _ = mod.apply_coding_record(once, record_b, invariant_slugs=_NO_SLUGS)
+    twice = _merge_one(once, record_b).codebook
 
     assert len(twice["candidates"]) == 2
     ids = {c["title"]: c["id"] for c in twice["candidates"]}
@@ -623,25 +627,25 @@ def _codebook_with_adjudicated_candidate(disposition: str) -> dict:
     return codebook
 
 
-def test_apply_coding_record_does_not_resurrect_rejected_candidate():
+def test_merge_does_not_resurrect_rejected_candidate():
     codebook = _codebook_with_adjudicated_candidate("rejected")
     record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
 
-    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
+    merge = _merge_one(codebook, record)
 
-    assert len(result["candidates"]) == 1  # NO pending twin fabricated
-    candidate = result["candidates"][0]
+    assert len(merge.codebook["candidates"]) == 1  # NO pending twin fabricated
+    candidate = merge.codebook["candidates"][0]
     assert candidate["id"] == "cand-20260722-28"
     assert candidate["disposition"] == "rejected"  # census verdict untouched
     # recurrence signal preserved, append-only
     assert len(candidate["sightings"]) == 2
     assert candidate["sightings"][1]["session"] == "sess-new"
-    assert stats["candidate_disposition_conflicts"] == 1
-    assert stats["candidates_applied"] == 0
-    assert mod.validate(result) == []
+    assert merge.counts.candidate_disposition_conflicts == 1
+    assert merge.counts.candidates_applied == 0
+    assert mod.validate(merge.codebook) == []
 
 
-def test_apply_coding_record_does_not_duplicate_promoted_candidate():
+def test_merge_does_not_duplicate_promoted_candidate():
     """The FALLBACK half of the promoted case: this fixture's candidate is
     stamped `promoted` but carries no `promoted_to` (a hand-edited or
     pre-`promote_candidate` record), so there is no entry to route the
@@ -650,20 +654,20 @@ def test_apply_coding_record_does_not_duplicate_promoted_candidate():
     codebook = _codebook_with_adjudicated_candidate("promoted")
     record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
 
-    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
+    merge = _merge_one(codebook, record)
 
-    assert len(result["candidates"]) == 1
-    candidate = result["candidates"][0]
+    assert len(merge.codebook["candidates"]) == 1
+    candidate = merge.codebook["candidates"][0]
     assert candidate["id"] == "cand-20260722-28"
     assert candidate["disposition"] == "promoted"  # census verdict untouched
     assert len(candidate["sightings"]) == 2
     assert candidate["sightings"][1]["session"] == "sess-new"
-    assert stats["candidate_disposition_conflicts"] == 1
-    assert stats["candidates_applied"] == 0
-    assert mod.validate(result) == []
+    assert merge.counts.candidate_disposition_conflicts == 1
+    assert merge.counts.candidates_applied == 0
+    assert mod.validate(merge.codebook) == []
 
 
-def test_apply_coding_record_routes_promoted_recurrence_to_its_entry():
+def test_merge_routes_promoted_recurrence_to_its_entry():
     """A promoted candidate's `sightings` list is a DEAD field for new
     signal: `census.promote_candidate` deep-copies it into the new entry
     once, at promotion time, and nothing re-reads it afterwards (the matrix
@@ -675,23 +679,23 @@ def test_apply_coding_record_routes_promoted_recurrence_to_its_entry():
     codebook["candidates"][0]["promoted_to"] = "entry-a"
     record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
 
-    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
+    merge = _merge_one(codebook, record)
 
-    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    entry = next(e for e in merge.codebook["entries"] if e["id"] == "entry-a")
     assert [s["session"] for s in entry["sightings"]] == ["sess-new"]
-    assert stats["matched"] == 1
-    assert stats["candidate_disposition_conflicts"] == 0
-    assert stats["candidates_applied"] == 0
+    assert merge.counts.matched == 1
+    assert merge.counts.candidate_disposition_conflicts == 0
+    assert merge.counts.candidates_applied == 0
 
     # The candidate itself is untouched — verdict AND sightings; no twin.
-    assert len(result["candidates"]) == 1
-    candidate = result["candidates"][0]
+    assert len(merge.codebook["candidates"]) == 1
+    candidate = merge.codebook["candidates"][0]
     assert candidate["disposition"] == "promoted"
     assert len(candidate["sightings"]) == 1
-    assert mod.validate(result) == []
+    assert mod.validate(merge.codebook) == []
 
 
-def test_apply_coding_record_promoted_recurrence_dedupes_on_the_entry():
+def test_merge_promoted_recurrence_dedupes_on_the_entry():
     """Session-level dedup on the ENTRY, mirroring the match path: a record
     that both matches the entry directly and re-mines the promoted title
     appends exactly one sighting, not two."""
@@ -702,18 +706,18 @@ def test_apply_coding_record_promoted_recurrence_dedupes_on_the_entry():
         {"entry_id": "entry-a", "origin_phase": "implement", "manifested_phase": "merge"}
     ]
 
-    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
+    merge = _merge_one(codebook, record)
 
-    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    entry = next(e for e in merge.codebook["entries"] if e["id"] == "entry-a")
     assert [s["session"] for s in entry["sightings"]] == ["sess-new"]
-    assert stats["matched"] == 1  # the match path's append; the candidate re-sighting deduped
-    assert stats["candidate_disposition_conflicts"] == 0
-    assert stats["candidates_applied"] == 0
-    assert len(result["candidates"][0]["sightings"]) == 1
-    assert mod.validate(result) == []
+    assert merge.counts.matched == 1  # the match path's append; the candidate re-sighting deduped
+    assert merge.counts.candidate_disposition_conflicts == 0
+    assert merge.counts.candidates_applied == 0
+    assert len(merge.codebook["candidates"][0]["sightings"]) == 1
+    assert mod.validate(merge.codebook) == []
 
 
-def test_apply_coding_record_promoted_with_dangling_promoted_to_falls_back():
+def test_merge_promoted_with_dangling_promoted_to_falls_back():
     """`promoted_to` naming an entry that does not exist must NOT silently
     drop the recurrence: fall back to the candidate append + conflict
     counter (the merger never fabricates an entry — only the census does)."""
@@ -721,36 +725,36 @@ def test_apply_coding_record_promoted_with_dangling_promoted_to_falls_back():
     codebook["candidates"][0]["promoted_to"] = "entry-that-was-never-created"
     record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
 
-    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
+    merge = _merge_one(codebook, record)
 
-    assert len(result["entries"]) == 1  # no entry fabricated
-    assert result["entries"][0]["sightings"] == []
-    candidate = result["candidates"][0]
+    assert len(merge.codebook["entries"]) == 1  # no entry fabricated
+    assert merge.codebook["entries"][0]["sightings"] == []
+    candidate = merge.codebook["candidates"][0]
     assert len(candidate["sightings"]) == 2
     assert candidate["sightings"][1]["session"] == "sess-new"
-    assert stats["matched"] == 0
-    assert stats["candidate_disposition_conflicts"] == 1
-    assert mod.validate(result) == []
+    assert merge.counts.matched == 0
+    assert merge.counts.candidate_disposition_conflicts == 1
+    assert mod.validate(merge.codebook) == []
 
 
-def test_apply_coding_record_adjudicated_conflict_is_idempotent():
+def test_merge_adjudicated_conflict_is_idempotent():
     """The pre-existing `already_seen` guard already spans every
     disposition, so re-applying the same record appends nothing and reports
     no fresh conflict."""
     codebook = _codebook_with_adjudicated_candidate("rejected")
     record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
 
-    once, first_stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
-    twice, second_stats = mod.apply_coding_record(once, record, invariant_slugs=_NO_SLUGS)
+    once = _merge_one(codebook, record)
+    twice = _merge_one(once.codebook, record)
 
-    assert len(twice["candidates"]) == 1
-    assert len(twice["candidates"][0]["sightings"]) == 2  # unchanged by the 2nd apply
-    assert first_stats["candidate_disposition_conflicts"] == 1
-    assert second_stats["candidate_disposition_conflicts"] == 0
-    assert mod.validate(twice) == []
+    assert len(twice.codebook["candidates"]) == 1
+    assert len(twice.codebook["candidates"][0]["sightings"]) == 2  # unchanged by the 2nd apply
+    assert once.counts.candidate_disposition_conflicts == 1
+    assert twice.counts.candidate_disposition_conflicts == 0
+    assert mod.validate(twice.codebook) == []
 
 
-def test_apply_coding_record_still_creates_pending_for_a_genuinely_new_title():
+def test_merge_still_creates_pending_for_a_genuinely_new_title():
     """Regression guard: the new conflict branch must not swallow genuinely
     novel titles — only an ALREADY-SEEN title takes it."""
     codebook = _codebook_with_adjudicated_candidate("rejected")
@@ -758,19 +762,19 @@ def test_apply_coding_record_still_creates_pending_for_a_genuinely_new_title():
         title="a different shape", session="sess-new", date="2026-07-24"
     )
 
-    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
+    merge = _merge_one(codebook, record)
 
-    assert len(result["candidates"]) == 2
-    fresh = next(c for c in result["candidates"] if c["title"] == "a different shape")
+    assert len(merge.codebook["candidates"]) == 2
+    fresh = next(c for c in merge.codebook["candidates"] if c["title"] == "a different shape")
     assert fresh["disposition"] == "pending"
     assert fresh["id"] == "cand-20260724-1"
-    assert stats["candidates_applied"] == 1
-    assert stats["candidate_disposition_conflicts"] == 0
-    assert mod.validate(result) == []
+    assert merge.counts.candidates_applied == 1
+    assert merge.counts.candidate_disposition_conflicts == 0
+    assert mod.validate(merge.codebook) == []
 
 
 # ---------------------------------------------------------------------------
-# task 5198: RED — apply_coding_record() `corrections`, the third op.
+# task 5198: RED — apply_coding_records() `corrections`, the third op.
 #
 # A sighting is an immutable dated observation, so both existing ops are pure
 # appends. An entry's title/cause is instead the CURRENT best explanation of a
@@ -779,19 +783,17 @@ def test_apply_coding_record_still_creates_pending_for_a_genuinely_new_title():
 # so a refuted framing can only be withdrawn by rewriting it there.
 # ---------------------------------------------------------------------------
 
-# apply_coding_record()'s full stats contract with every counter at rest: what
-# the sole writer reports when it changed nothing. Shared with the live-corpus
-# re-apply no-op pins below so the contract is declared once.
-_NO_CHANGES = {
-    "matched": 0,
-    "skipped_unknown_entry": 0,
-    "candidates_applied": 0,
-    "candidate_disposition_conflicts": 0,
-    "corrections_applied": 0,
-    "correction_skipped": 0,
-    "record_invalid": False,
-    "invariant_slugs": mod.SlugTally(),
-}
+def _report(merge) -> tuple:
+    """Everything a MergeResult reports besides its codebook, compared whole so
+    the no-op pins below cannot miss a report field."""
+    return (merge.counts, merge.invariant_slugs, merge.skipped_deletions, merge.invalid_records)
+
+
+def _clean_report(**counts: int) -> tuple:
+    """The `_report` of a merge that skipped nothing and counted only *counts*.
+    With no *counts* it is what the sole writer reports when it changed nothing,
+    shared with the live-corpus re-apply no-op pins below."""
+    return (mod.MergeCounts(**counts), mod.SlugTally(), (), ())
 
 
 def _correction_record(entry_id="entry-a", session="sess-correction", date="2026-07-14"):
@@ -816,7 +818,7 @@ def _correction_record(entry_id="entry-a", session="sess-correction", date="2026
     }
 
 
-def test_apply_coding_record_correction_rewrites_only_the_named_fields():
+def test_merge_correction_rewrites_only_the_named_fields():
     """Writes title/cause/status, leaves every other entry field alone, and
     appends exactly one sighting built from the record header + the
     correction's own phase stamps and note."""
@@ -825,9 +827,9 @@ def test_apply_coding_record_correction_rewrites_only_the_named_fields():
     record = _correction_record()
     correction = record["corrections"][0]
 
-    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
+    merge = _merge_one(codebook, record)
 
-    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    entry = next(e for e in merge.codebook["entries"] if e["id"] == "entry-a")
     assert entry["title"] == correction["title"]
     assert entry["cause"] == correction["cause"]
     assert entry["status"] == correction["status"]
@@ -849,11 +851,11 @@ def test_apply_coding_record_correction_rewrites_only_the_named_fields():
             "note": correction["note"],
         }
     ]
-    assert stats == {**_NO_CHANGES, "corrections_applied": 1}
-    assert mod.validate(result) == []
+    assert _report(merge) == _clean_report(corrections_applied=1)
+    assert mod.validate(merge.codebook) == []
 
 
-def test_apply_coding_record_correction_never_deletes_and_does_not_mutate_input():
+def test_merge_correction_never_deletes_and_does_not_mutate_input():
     """Prior sightings survive a field rewrite, the new one lands after them,
     and the input codebook is not touched (deep-copy semantics, as both
     existing ops guarantee)."""
@@ -869,7 +871,7 @@ def test_apply_coding_record_correction_never_deletes_and_does_not_mutate_input(
     ]
     original = copy.deepcopy(codebook)
 
-    result, _ = mod.apply_coding_record(codebook, _correction_record(), invariant_slugs=_NO_SLUGS)
+    result = _merge_one(codebook, _correction_record()).codebook
 
     entry = next(e for e in result["entries"] if e["id"] == "entry-a")
     assert [s["session"] for s in entry["sightings"]] == [
@@ -880,7 +882,7 @@ def test_apply_coding_record_correction_never_deletes_and_does_not_mutate_input(
     assert codebook == original
 
 
-def test_apply_coding_record_correction_re_apply_is_a_no_op(caplog):
+def test_merge_correction_re_apply_is_a_no_op(caplog):
     """The whole correction — field writes AND provenance sighting — is gated
     by the one `session` dedup the match path already uses, so `apply` re-run
     over the same file (nightly, or to resolve a rebase) changes nothing."""
@@ -888,11 +890,11 @@ def test_apply_coding_record_correction_re_apply_is_a_no_op(caplog):
     record = _correction_record()
 
     with caplog.at_level(logging.WARNING, logger="legibility.codebook"):
-        once, _ = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
-        twice, stats = mod.apply_coding_record(once, record, invariant_slugs=_NO_SLUGS)
+        once = _merge_one(codebook, record).codebook
+        twice = _merge_one(once, record)
 
-    assert stats == _NO_CHANGES
-    assert twice == once
+    assert _report(twice) == _clean_report()
+    assert twice.codebook == once
     # SILENT by design, and that is the whole point of the distinction: an
     # already-merged record is the dedup doing its job. `correction_skipped`
     # and its WARNING are reserved for the sibling-op collision below, where
@@ -916,7 +918,7 @@ def _match_and_correction_record(entry_id="entry-a"):
     return record
 
 
-def test_apply_coding_record_correction_outranks_a_sibling_match_on_one_entry():
+def test_merge_correction_outranks_a_sibling_match_on_one_entry():
     """Both ops write at most one sighting per (session, entry), so a record
     carrying both for one entry can land only one — and it must be the
     correction: a match's sighting is one interchangeable observation, while
@@ -925,16 +927,16 @@ def test_apply_coding_record_correction_outranks_a_sibling_match_on_one_entry():
     record = _match_and_correction_record()
     correction = record["corrections"][0]
 
-    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
+    merge = _merge_one(codebook, record)
 
-    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    entry = next(e for e in merge.codebook["entries"] if e["id"] == "entry-a")
     assert entry["title"] == correction["title"]
     assert [s["note"] for s in entry["sightings"]] == [correction["note"]]
-    assert stats == {**_NO_CHANGES, "corrections_applied": 1}
-    assert mod.validate(result) == []
+    assert _report(merge) == _clean_report(corrections_applied=1)
+    assert mod.validate(merge.codebook) == []
 
 
-def test_apply_coding_record_colliding_correction_is_counted_and_logged(caplog):
+def test_merge_colliding_correction_is_counted_and_logged(caplog):
     """Two corrections for one entry in one record collide on that same single
     slot. The loser cannot land — but it must not be dropped SILENTLY, since a
     vanished framing withdrawal is indistinguishable from a successful one in
@@ -946,16 +948,16 @@ def test_apply_coding_record_colliding_correction_is_counted_and_logged(caplog):
     record["corrections"].append(loser)
 
     with caplog.at_level(logging.WARNING, logger="legibility.codebook"):
-        result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
+        merge = _merge_one(codebook, record)
 
-    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    entry = next(e for e in merge.codebook["entries"] if e["id"] == "entry-a")
     assert entry["title"] == record["corrections"][0]["title"]
-    assert stats == {**_NO_CHANGES, "corrections_applied": 1, "correction_skipped": 1}
+    assert _report(merge) == _clean_report(corrections_applied=1, correction_skipped=1)
 
     assert len(caplog.records) == 1
     message = caplog.records[0].getMessage()
     assert "entry-a" in message and record["session"] in message
-    assert mod.validate(result) == []
+    assert mod.validate(merge.codebook) == []
 
 
 # The never-clear guard's input grid. ("status", "empty") is absent by
@@ -972,7 +974,7 @@ _UNSUPPLIED_FIELD_SPELLINGS = [
 
 
 @pytest.mark.parametrize(("field", "spelling"), _UNSUPPLIED_FIELD_SPELLINGS)
-def test_apply_coding_record_correction_never_clears_a_field(field, spelling):
+def test_merge_correction_never_clears_a_field(field, spelling):
     """The never-delete boundary of the one op allowed to overwrite instead of
     append: a field the correction does not actually supply — spelled `""` or
     left out — keeps its pre-correction value, while the fields it does supply
@@ -990,43 +992,40 @@ def test_apply_coding_record_correction_never_clears_a_field(field, spelling):
     else:
         del correction[field]
 
-    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
+    merge = _merge_one(codebook, record)
 
-    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    entry = next(e for e in merge.codebook["entries"] if e["id"] == "entry-a")
     assert entry[field] == before[field]
     for still_supplied in {"title", "cause", "status"} - {field}:
         assert entry[still_supplied] == correction[still_supplied]
     assert [s["note"] for s in entry["sightings"]] == [correction["note"]]
-    assert stats == {**_NO_CHANGES, "corrections_applied": 1}
-    assert mod.validate(result) == []
+    assert _report(merge) == _clean_report(corrections_applied=1)
+    assert mod.validate(merge.codebook) == []
 
 
-def test_apply_coding_record_correction_unknown_entry_id_is_skipped_and_counted():
+def test_merge_correction_unknown_entry_id_is_skipped_and_counted():
     """Mirrors the match path: only the census creates entries, so an
     unresolvable entry_id is counted, never fabricated."""
     codebook = _codebook_with_entry_a()
     record = _correction_record(entry_id="entry-zzz")
 
-    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
+    merge = _merge_one(codebook, record)
 
-    assert result["entries"] == _codebook_with_entry_a()["entries"]
-    assert stats == {**_NO_CHANGES, "skipped_unknown_entry": 1}
-    assert mod.validate(result) == []
+    assert merge.codebook["entries"] == _codebook_with_entry_a()["entries"]
+    assert _report(merge) == _clean_report(skipped_unknown_entry=1)
+    assert mod.validate(merge.codebook) == []
 
 
 @pytest.mark.parametrize("action", ["delete", "remove"])
-def test_apply_coding_record_raises_on_correction_removal_action(action):
-    """A removal-shaped correction is rejected before the codebook is copied,
-    exactly as `_reject_deletion_directive` already treats `matches`."""
-    codebook = _codebook_with_entry_a()
-    original = copy.deepcopy(codebook)
+def test_merge_skips_a_correction_removal_action(action):
+    """A removal-shaped correction is skipped whole, exactly as
+    `_reject_deletion_directive` already treats `matches`."""
     record = _correction_record()
     record["corrections"][0]["action"] = action
 
-    with pytest.raises(mod.NeverDeleteError):
-        mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
+    skipped = _skipped_as_deletion(record)
 
-    assert codebook == original
+    assert f"correction carries a removal action: {action!r}" in skipped.reason
 
 
 def _correction_with_out_of_enum_status():
@@ -1068,7 +1067,7 @@ def _correction_with_an_empty_status():
         _correction_with_an_empty_status,
     ],
 )
-def test_apply_coding_record_invalid_correction_is_skipped_whole(build_record):
+def test_merge_invalid_correction_is_skipped_whole(build_record):
     """An entry's framing may never change without an audit trail, and never
     into a status outside STATUSES. Every such failure is caught by
     `validate_coding_record`, which skips the record WHOLE — no partial field
@@ -1079,39 +1078,53 @@ def test_apply_coding_record_invalid_correction_is_skipped_whole(build_record):
 
     assert mod.validate_coding_record(record) != []
 
-    result, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
+    merge = _merge_one(codebook, record)
 
-    assert stats == {**_NO_CHANGES, "record_invalid": True}
-    assert result == original
+    assert merge.counts == mod.MergeCounts()
+    assert [(s.index, s.session) for s in merge.invalid_records] == [(0, record["session"])]
+    assert merge.skipped_deletions == merge.merged_records == ()
+    assert merge.codebook == original
 
 
 # ---------------------------------------------------------------------------
 # step-13: RED (§8.3 never-delete) — NeverDeleteError + assert_no_deletion
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("key", ["delete", "remove", "retract"])
-def test_apply_coding_record_raises_on_top_level_removal_directive(key):
+def _skipped_as_deletion(record: dict):
+    """Merge deletion-shaped *record* alone and hand back its SkippedRecord,
+    after pinning that the batch neither raised, merged it, nor changed (or
+    mutated) the codebook."""
     codebook = _codebook_with_entry_a()
     original = copy.deepcopy(codebook)
+
+    merge = _merge_one(codebook, record)
+
+    [skipped] = merge.skipped_deletions
+    assert (skipped.index, skipped.session) == (0, record["session"])
+    assert merge.merged_records == merge.invalid_records == ()
+    assert merge.counts == mod.MergeCounts()
+    assert merge.codebook == original
+    assert codebook == original
+    return skipped
+
+
+@pytest.mark.parametrize("key", ["delete", "remove", "retract", "drop"])
+def test_merge_skips_a_top_level_removal_directive(key):
     record = _match_record()
     record[key] = ["entry-a"]
 
-    with pytest.raises(mod.NeverDeleteError):
-        mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
+    skipped = _skipped_as_deletion(record)
 
-    assert codebook == original  # input untouched
+    assert f"removal directive: top-level {key!r} key" in skipped.reason
 
 
-def test_apply_coding_record_raises_on_match_delete_action():
-    codebook = _codebook_with_entry_a()
-    original = copy.deepcopy(codebook)
+def test_merge_skips_a_match_delete_action():
     record = _match_record()
     record["matches"][0]["action"] = "delete"
 
-    with pytest.raises(mod.NeverDeleteError):
-        mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
+    skipped = _skipped_as_deletion(record)
 
-    assert codebook == original
+    assert "match carries a removal action: 'delete'" in skipped.reason
 
 
 def test_assert_no_deletion_raises_when_entry_missing():
@@ -1274,33 +1287,29 @@ def _sighting_on(holder: dict, session: str) -> dict:
 
 
 def test_a_known_slug_persists_and_an_unknown_one_is_stored_as_absent():
-    result, stats = mod.apply_coding_record(
-        _codebook_with_entry_a(), _slugged_record(), invariant_slugs=_KNOWN_SLUGS
-    )
+    merge = _merge_one(_codebook_with_entry_a(), _slugged_record(), _KNOWN_SLUGS)
 
-    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    entry = next(e for e in merge.codebook["entries"] if e["id"] == "entry-a")
     assert _sighting_on(entry, "sess-1")["invariant_violated"] == "known-slug"
-    candidate = next(c for c in result["candidates"] if c["title"] == "novel shape")
+    candidate = next(c for c in merge.codebook["candidates"] if c["title"] == "novel shape")
     assert "invariant_violated" not in _sighting_on(candidate, "sess-1")
-    assert stats["invariant_slugs"] == mod.SlugTally(
+    assert merge.invariant_slugs == mod.SlugTally(
         valid=1, rejected=("free text not a slug",)
     )
-    assert mod.validate(result) == []
+    assert mod.validate(merge.codebook) == []
 
 
 def test_a_correction_with_an_unknown_slug_lands_without_it():
     record = _correction_record()
     record["corrections"][0]["invariant_violated"] = "not-a-declared-slug"
 
-    result, stats = mod.apply_coding_record(
-        _codebook_with_entry_a(), record, invariant_slugs=_KNOWN_SLUGS
-    )
+    merge = _merge_one(_codebook_with_entry_a(), record, _KNOWN_SLUGS)
 
-    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    entry = next(e for e in merge.codebook["entries"] if e["id"] == "entry-a")
     assert entry["title"] == record["corrections"][0]["title"]
     assert "invariant_violated" not in _sighting_on(entry, "sess-correction")
-    assert stats["corrections_applied"] == 1
-    assert stats["invariant_slugs"].rejected == ("not-a-declared-slug",)
+    assert merge.counts.corrections_applied == 1
+    assert merge.invariant_slugs.rejected == ("not-a-declared-slug",)
 
 
 @pytest.mark.parametrize("value", [None, "", "<absent>"])
@@ -1311,21 +1320,17 @@ def test_an_empty_slug_is_neither_valid_nor_rejected(value):
     else:
         record["matches"][0]["invariant_violated"] = value
 
-    _, stats = mod.apply_coding_record(
-        _codebook_with_entry_a(), record, invariant_slugs=_KNOWN_SLUGS
-    )
+    merge = _merge_one(_codebook_with_entry_a(), record, _KNOWN_SLUGS)
 
-    assert stats["invariant_slugs"] == mod.SlugTally()
+    assert merge.invariant_slugs == mod.SlugTally()
 
 
 def test_a_project_without_slugs_rejects_every_value():
-    result, stats = mod.apply_coding_record(
-        _codebook_with_entry_a(), _slugged_record(), invariant_slugs=()
-    )
+    merge = _merge_one(_codebook_with_entry_a(), _slugged_record(), ())
 
-    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    entry = next(e for e in merge.codebook["entries"] if e["id"] == "entry-a")
     assert "invariant_violated" not in _sighting_on(entry, "sess-1")
-    assert stats["invariant_slugs"] == mod.SlugTally(
+    assert merge.invariant_slugs == mod.SlugTally(
         valid=0, rejected=("known-slug", "free text not a slug")
     )
 
@@ -1334,7 +1339,7 @@ def test_the_slug_screen_does_not_mutate_the_record():
     record = _slugged_record()
     original = copy.deepcopy(record)
 
-    mod.apply_coding_record(_codebook_with_entry_a(), record, invariant_slugs=())
+    _merge_one(_codebook_with_entry_a(), record, ())
 
     assert record == original
 
@@ -1410,7 +1415,7 @@ def test_no_unknown_slugs_means_no_warning(caplog):
 
 
 # ---------------------------------------------------------------------------
-# amendment: migrate_v1_to_v2()/apply_coding_record() fail loudly with a
+# amendment: migrate_v1_to_v2()/apply_coding_records() fail loudly with a
 # clear ValueError on a non-dict codebook (e.g. an empty or malformed YAML
 # file loads via yaml.safe_load as None), instead of an AttributeError deep
 # in the mutation logic — mirrors validate()'s isinstance guard.
@@ -1431,9 +1436,166 @@ def test_migrate_v1_to_v2_raises_on_non_dict_codebook():
         mod.migrate_v1_to_v2(_NOT_A_CODEBOOK)
 
 
-def test_apply_coding_record_raises_on_non_dict_codebook():
+def test_merge_raises_on_non_dict_codebook():
     with pytest.raises(ValueError):
-        mod.apply_coding_record(_NOT_A_CODEBOOK, _match_record(), invariant_slugs=_NO_SLUGS)
+        _merge_one(_NOT_A_CODEBOOK, _match_record())
+
+
+# ---------------------------------------------------------------------------
+# task 6742: one MergeResult for every batch (nightly, census, CLI). A bad
+# record is skipped and named; it never costs the rest of the batch.
+# ---------------------------------------------------------------------------
+
+def _deletion_shaped_record(session: str) -> dict:
+    record = _match_record(session=session)
+    record["matches"][0]["action"] = "delete"
+    return record
+
+
+def _schema_invalid_record(session: str) -> dict:
+    record = _match_record(session=session)
+    del record["agent_class"]
+    return record
+
+
+def test_a_deletion_shaped_record_is_skipped_and_the_rest_of_the_batch_lands():
+    good_1 = _match_record(session="sess-1")
+    good_3 = _match_record(session="sess-3")
+    batch = [good_1, _deletion_shaped_record("sess-2"), good_3]
+
+    merge = mod.apply_coding_records(_codebook_with_entry_a(), batch, invariant_slugs=_NO_SLUGS)
+
+    [skipped] = merge.skipped_deletions
+    assert (skipped.index, skipped.session) == (1, "sess-2")
+    assert "removal action" in skipped.reason
+    assert skipped.describe() == f"session=sess-2: {skipped.reason}"
+    entry = next(e for e in merge.codebook["entries"] if e["id"] == "entry-a")
+    assert [s["session"] for s in entry["sightings"]] == ["sess-1", "sess-3"]
+    assert len(merge.merged_records) == 2
+    assert all(m is g for m, g in zip(merge.merged_records, (good_1, good_3), strict=True))
+    assert merge.counts == mod.MergeCounts(matched=2)
+
+
+def test_a_schema_invalid_record_is_named_and_not_applied():
+    invalid = _schema_invalid_record("sess-bad")
+
+    merge = _merge_one(_codebook_with_entry_a(), invalid)
+
+    [skipped] = merge.invalid_records
+    assert (skipped.index, skipped.session) == (0, "sess-bad")
+    assert "'agent_class' is a required property" in skipped.reason
+    assert merge.merged_records == merge.skipped_deletions == ()
+    assert merge.codebook == _codebook_with_entry_a()
+
+
+def test_a_non_dict_record_is_an_invalid_record_without_a_session():
+    merge = _merge_one(_codebook_with_entry_a(), ["not", "a", "record"])
+
+    [skipped] = merge.invalid_records
+    assert (skipped.index, skipped.session) == (0, None)
+    assert skipped.reason
+    assert merge.merged_records == ()
+
+
+def test_the_batch_never_mutates_or_aliases_its_input_codebook():
+    codebook = _codebook_with_entry_a()
+    original = copy.deepcopy(codebook)
+
+    _ = mod.apply_coding_records(
+        codebook,
+        [_match_record(), _deletion_shaped_record("sess-2"), _correction_record()],
+        invariant_slugs=_NO_SLUGS,
+    )
+    empty = mod.apply_coding_records(codebook, [], invariant_slugs=_NO_SLUGS)
+
+    assert codebook == original
+    assert empty.codebook == codebook
+    assert empty.codebook is not codebook
+    assert empty.codebook["entries"] is not codebook["entries"]
+
+
+def test_counts_and_slug_tallies_are_summed_across_the_batch():
+    declared = _match_record(session="sess-1")
+    declared["matches"][0]["invariant_violated"] = "known-slug"
+    undeclared = _match_record(session="sess-2")
+    undeclared["matches"][0]["invariant_violated"] = "x"
+
+    merge = mod.apply_coding_records(
+        _codebook_with_entry_a(), [declared, undeclared], invariant_slugs=_KNOWN_SLUGS
+    )
+
+    assert merge.counts == mod.MergeCounts(matched=2)
+    assert merge.invariant_slugs == mod.SlugTally(valid=1, rejected=("x",))
+
+
+def _adjudicated_title_case() -> tuple[dict, dict]:
+    return (
+        _codebook_with_adjudicated_candidate("rejected"),
+        _candidate_record(title="novel shape", session="sess-new", date="2026-07-24"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("build_case", "count"),
+    [
+        pytest.param(lambda: (_codebook_with_entry_a(), _match_record()), "matched", id="match"),
+        pytest.param(
+            lambda: (_codebook_with_entry_a(), _candidate_record()),
+            "candidates_applied",
+            id="new-candidate",
+        ),
+        pytest.param(
+            _adjudicated_title_case, "candidate_disposition_conflicts", id="adjudicated-title"
+        ),
+        pytest.param(
+            lambda: (_codebook_with_entry_a(), _correction_record()),
+            "corrections_applied",
+            id="correction",
+        ),
+    ],
+)
+def test_every_mutating_op_marks_the_merge_mutated_and_its_re_apply_does_not(
+    build_case, count
+):
+    """Task 6357's rule, now held once by the merger: each of the four ops that
+    writes the codebook is a mutation, so a night whose only effect is one of
+    them still dumps and commits."""
+    codebook, record = build_case()
+
+    first = _merge_one(codebook, record)
+    again = _merge_one(first.codebook, record)
+
+    assert first.counts == mod.MergeCounts(**{count: 1})
+    assert first.counts.mutations == 1
+    assert first.mutated is True
+    assert again.counts == mod.MergeCounts()
+    assert again.mutated is False
+
+
+def test_an_unknown_entry_match_does_not_mark_the_merge_mutated():
+    merge = _merge_one(_codebook_with_entry_a(), _match_record(entry_id="entry-zzz"))
+
+    assert merge.counts == mod.MergeCounts(skipped_unknown_entry=1)
+    assert merge.mutated is False
+
+
+def test_the_summary_is_one_line_naming_every_report_field():
+    undeclared = _match_record(session="sess-1")
+    undeclared["matches"][0]["invariant_violated"] = "x"
+    batch = [undeclared, _deletion_shaped_record("sess-2"), _schema_invalid_record("sess-3")]
+
+    summary = mod.apply_coding_records(
+        _codebook_with_entry_a(), batch, invariant_slugs=_KNOWN_SLUGS
+    ).summary()
+
+    assert "\n" not in summary
+    assert {
+        "matched=1",
+        "deletion_directive=1",
+        "record_invalid=1",
+        "candidate_disposition_conflicts=0",
+        "invariant_slugs_rejected=1",
+    } <= set(summary.split())
 
 
 # ---------------------------------------------------------------------------
@@ -1537,7 +1699,7 @@ class TestMainCLI:
         """A single malformed JSONL line must not raise/abort the whole
         batch (amendment: json.loads() used to be unguarded, so one bad
         emitted record lost the entire nightly/trickle merge instead of
-        just itself — mirrors apply_coding_record()'s skip-whole-record
+        just itself — mirrors apply_coding_records()'s skip-whole-record
         semantics, but at the line-parsing boundary)."""
         codebook_path, records_path = self._write_apply_fixtures(tmp_path)
         good_line = records_path.read_text(encoding="utf-8")
@@ -1688,7 +1850,7 @@ class TestMainCLI:
 
     def test_apply_empty_codebook_file_fails_loudly_instead_of_crashing(self, tmp_path, capsys):
         """Same guard, via the apply subcommand: an empty codebook file
-        must not crash apply_coding_record() with an unhandled exception."""
+        must not crash apply_coding_records() with an unhandled exception."""
         path = tmp_path / "codebook.yaml"
         path.write_text("", encoding="utf-8")
         records_path = tmp_path / "records.jsonl"
@@ -1834,7 +1996,7 @@ def test_live_codebook_has_no_pending_twin_of_an_adjudicated_candidate():
 # the comparison lands once rather than once per guard.
 # ---------------------------------------------------------------------------
 
-# What apply_coding_record copies verbatim from a match/candidate/correction
+# What apply_coding_records copies verbatim from a match/candidate/correction
 # payload into the sighting it appends. The optional three are emitted only
 # when truthy, so a payload that omits one is compared as omitting it.
 _SIGHTING_PAYLOAD_FIELDS = (
@@ -1996,10 +2158,10 @@ def _assert_correction_absorbed(
     )
 
     # (5) NO-OP — the committed YAML is exactly what the sole writer produces.
-    _, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
-    assert stats == _NO_CHANGES, (
+    merge = _merge_one(codebook, record)
+    assert _report(merge) == _clean_report(), (
         f"re-applying session {session!r} changed something — the committed "
-        f"codebook has not fully absorbed the record: {stats}"
+        f"codebook has not fully absorbed the record: {merge.summary()}"
     )
 
     return record, correction, entry
@@ -2129,10 +2291,12 @@ def test_live_codebook_carries_the_task_4892_corrections():
     # (4) NO-OP — the record is already fully absorbed, so re-running the sole
     #     writer over it appends nothing.
     for record in records:
-        codebook, stats = mod.apply_coding_record(codebook, record, invariant_slugs=_NO_SLUGS)
-        assert stats == _NO_CHANGES, (
+        merge = _merge_one(codebook, record)
+        codebook = merge.codebook
+        assert _report(merge) == _clean_report(), (
             f"re-applying session {record.get('session')!r} appended something — "
-            f"its sightings are not already absorbed by the live codebook: {stats}"
+            f"its sightings are not already absorbed by the live codebook: "
+            f"{merge.summary()}"
         )
 
 
