@@ -69,6 +69,7 @@ from fused_memory.models.enums import (
     ClassificationFallback,
     MemoryCategory,
     SourceStore,
+    routes_to_graphiti,
 )
 from fused_memory.models.memory import (
     AddEpisodeResponse,
@@ -6770,16 +6771,14 @@ class MemoryService:
         make, and needs a second counting site — it is not a thing this method
         can fix by moving one call.
 
-        The tool-boundary ``entities_gate`` is category-INDEPENDENT and does
-        run on this path (pinned by
-        ``tests/server/test_entities_gate_ingestion.py::...
-        test_the_gate_is_category_independent``), so a CONFLICTING declaration
-        on a Mem0-primary write is still rejected even though an agreeing one
-        would have been inert. That asymmetry is intended: the gate polices
-        whether the caller's stated referents match its own prose, which is a
-        fact about the caller and not about routing. It costs nothing an
-        undeclaring caller pays — absence is never rejected, so an agent that
-        omits ``entities`` (``/reflect`` as shipped) cannot lose a write here.
+        The tool-boundary ``entities_gate`` shape-checks every declaration but
+        conflict-checks only one that will be RECORDED: an explicit
+        Mem0-primary category without ``dual_write`` discards the declaration
+        here, so a conflict verdict could only cost a false rejection (pinned
+        by
+        ``tests/server/test_entities_gate_ingestion.py::TestAddMemoryEntitiesGate::test_a_mem0_primary_write_is_never_conflict_rejected``).
+        Both sides read :func:`~fused_memory.models.enums.routes_to_graphiti`,
+        so they cannot disagree about which writes record it.
 
         Deliberately UNVALIDATED here: gamma's ``_declared_referents`` owns the
         TOTAL ``InputValidationError`` contract, and a direct service caller
@@ -6866,9 +6865,7 @@ class MemoryService:
             find_canonical=self.get_memories_by_metadata,
         )
 
-        write_graphiti = (
-            resolved_category in GRAPHITI_PRIMARY or dual_write
-        )
+        write_graphiti = routes_to_graphiti(resolved_category, dual_write=dual_write)
         # `write_mem0` is computed above, hoisted to feed the validation
         # seam's `reaches_mem0`. See the comment at that call site.
 
