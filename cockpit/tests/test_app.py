@@ -271,7 +271,9 @@ class _HoldingDecisionsReader:
 
 
 @contextlib.asynccontextmanager
-async def _poll_held_after_its_read(app, reader: _HoldingDecisionsReader):
+async def _poll_held_after_its_read(
+    app, reader: _HoldingDecisionsReader, *, reach_timeout_secs: float = 5.0
+):
     """Run one real poll tick whose worker *reader* holds after its registry read.
 
     Leaving the block releases the worker and waits for it, so the held poll has
@@ -281,8 +283,10 @@ async def _poll_held_after_its_read(app, reader: _HoldingDecisionsReader):
     """
     app._poll_registry()
     try:
-        while not reader.held.is_set():
-            await asyncio.sleep(0.01)
+        reached = await asyncio.to_thread(reader.held.wait, reach_timeout_secs)
+        assert reached, (
+            f'the poll worker never reached its decisions read within {reach_timeout_secs}s'
+        )
         yield
     finally:
         reader.release()
@@ -4453,8 +4457,7 @@ class TestInFlightScanCannotUndoAKeypressWrite:
     predates it, can land AFTER it. Each replay holds a REAL poll worker
     after its registry read (_HoldingDecisionsReader), interleaves the
     keypress, then lets the worker land through the real call_from_thread
-    hand-off. poll_interval=60 means no live tick can heal a regression
-    first, and no freshness-protocol detail appears in the test.
+    hand-off.
     """
 
     @pytest.mark.timeout(10)

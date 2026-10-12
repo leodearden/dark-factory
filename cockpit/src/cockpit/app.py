@@ -55,6 +55,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import Protocol
 
 from orchestrator.session_registry import (
     DecisionRecord,
@@ -179,6 +180,18 @@ def _decisions_snapshot(decisions: list[DecisionRecord]) -> dict[str, tuple]:
     }
 
 
+class DecisionsReader(Protocol):
+    """CockpitApp's `decisions_reader` seam, the decision-side twin of SessionScannerProtocol.
+
+    Contract, as registry_reader.scan_decisions (the default) keeps it: read-only,
+    and every returned DecisionRecord.project is already canonicalized.
+    """
+
+    def __call__(self, root: Path | str | None) -> list[DecisionRecord]:
+        """Return every readable DecisionRecord under the fleet *root*."""
+        ...
+
+
 class DetailOwner(StrEnum):
     """Which table's cursor last claimed the detail pane.
 
@@ -237,7 +250,7 @@ class CockpitApp(App):
         fleet_root: Path | str | None = None,
         poll_interval: float = 1.5,
         scanner: SessionScannerProtocol | None = None,
-        decisions_reader: Callable[[Path | str | None], list[DecisionRecord]] | None = None,
+        decisions_reader: DecisionsReader | None = None,
         now_fn: Callable[[], datetime] | None = None,
         backend: FocusArrangeBackend | None = None,
         spawn_runner: Callable[[list[str]], None] | None = None,
