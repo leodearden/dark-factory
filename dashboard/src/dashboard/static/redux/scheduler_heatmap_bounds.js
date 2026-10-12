@@ -35,7 +35,7 @@ const MAX_RESCUED_COLS = 10
 //
 // THE SINGLE SOURCE of that rule. scheduler_heatmap.jsx's cellStateFor
 // delegates here for its first two branches, and row selection below reaches
-// it through modulesByPath. Were the axis filter to restate the rule instead,
+// it through rowTouchesAnyIndexed. Were the axis filter to restate the rule instead,
 // it could drop a row whose cells the renderer would have coloured.
 //
 // Modules are keyed by `(project, path)` on the server, so a path match is not
