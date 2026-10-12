@@ -19,13 +19,11 @@ from typing import TYPE_CHECKING, Any
 # module-level import is safe.
 from orchestrator.agents.invoke import _FALLBACK_PRICE, _rate
 
-from .measurement import MeasurementStage, classify_unmeasured
+from .measurement import UnmeasuredRecord
 from .plan_predicates import is_scorable_plan
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-
-    from shared.cli_invoke import AgentResult
 
     # TYPE_CHECKING only, deliberately: this module must not gain a RUNTIME
     # import of orchestrator.artifacts. read_decline_artifacts below reaches
@@ -108,8 +106,8 @@ class EvalMetrics:
     # refused-with-a-plan, or an unscorable plan — judge_invocations reads 0)
     # or RAISED after being asked (judge_invocations ALSO reads 0 there,
     # because whether ``invoke_agent`` was ever reached before the raise
-    # isn't determinable from the runner — but ``invocation_error`` then
-    # names ``judge:raised: ...``, so the cell is legible as "judge raised,
+    # isn't determinable from the runner — but ``invocation_errors`` then
+    # carries a judge/raised record, so the cell is legible as "judge raised,
     # spend unknown", not silently byte-indistinguishable from a skip).
     judge_invocations: int = 0
     judge_cost_usd: float = 0.0
@@ -168,8 +166,8 @@ class EvalMetrics:
     # below: (1) not an architect run at all (``role_under_test != 'architect'``,
     # ``cap_tainted`` False), or (2) an architect run we could NOT measure
     # because the invocation was refused at the transport layer — a 429 cap hit
-    # or auth failure — which carries ``cap_tainted=True`` and a stage-prefixed
-    # ``invocation_error`` (task 3118). A scoring FAILURE is still never a cause:
+    # or auth failure — which carries ``cap_tainted=True`` and an architect
+    # ``invocation_errors`` record (task 3118). A scoring FAILURE is still never a cause:
     # it degrades to the structural floor, not to None.
     plan_quality: float | None = None
 
@@ -180,51 +178,13 @@ class EvalMetrics:
     # ``'architect'``.
     role_under_test: str | None = None
 
-    # Infra-failure markers (task 3118) — the pair that keeps a TRANSPORT-layer
-    # refusal from being read as a CONTENT-domain score.
-    #
-    # ``invocation_error`` records WHAT happened: a stage-prefixed marker for an
-    # infra failure observed while producing this cell, e.g.
-    # ``"architect:cap_hit: You've hit your session limit · resets 8pm"``,
-    # ``"architect:model_not_found: ..."``, ``"architect:wedge: ..."``,
-    # ``"architect:server_error: HTTP 529"`` or ``"judge:api_error: HTTP
-    # 429"``. ``None`` means no infra failure was observed — including for an
-    # ordinary content failure (an architect that ran fine and simply
-    # produced a bad/absent plan), which must keep scoring on content.
-    #
-    # ``cap_tainted`` is the SCORING DECISION derived from it: this cell is not
-    # a content measurement at all, so the plan_quality aggregates EXCLUDE it
-    # rather than average in a fabricated zero (which would penalise whichever
-    # candidate happened to be scheduled inside a cap window). Scope note
-    # (REVISED by task 3099): the plan_quality surfaces exclude, and so do
-    # ``build_composite_report``'s composite/quality pools for a PLAN-ONLY
-    # trial. Those pools used to COUNT a tainted trial, on the grounds that they
-    # measured the implementer-path gates — which a tainted architect cell
-    # reports as an honest failure, not a fabricated score. That no longer holds
-    # now that a plan-only composite is DERIVED from plan_quality: a fabricated
-    # 0.0 would land in exactly the number ``select_survivors`` ranks on. The
-    # ``trials`` denominator still counts every trial (the sample is never
-    # silently shrunk) and ``plan_quality_cap_excluded`` reports the skips.
-    #
-    # NAME vs SCOPE (reviewer: design-coherence): the field name is ``cap_``
-    # because the campaign that motivated it was a session-cap window, but the
-    # set of causes is broader — any refusal that left NO model content to score
-    # (cap hit, auth failure, model-not-found, zero-output wedge, harness
-    # error). A cap hit is SCHEDULE-attributable (rerun later); a model-not-found
-    # is a PERMANENT config error. Those must not read alike, so the CAUSE is
-    # always carried in ``invocation_error`` and the report surfaces break the
-    # exclusion count out by cause rather than reporting a bare "cap" total.
-    #
-    # ``cap_tainted`` is kept as an explicit boolean — not inferred from
-    # ``plan_quality is None`` — for the same reason ``adversarial`` is kept
-    # distinct from ``recovery_score``: a null score would otherwise be ambiguous
-    # between "not an architect run" and "architect run we could not measure".
-    # This is the same null-gating discipline ``_is_false_green`` /
-    # ``_is_null_work`` already apply to ``tests_pass``, applied to the cap path.
-    #
-    # Both defaults are safe, so results persisted before these fields existed
-    # read back unchanged (no marker, not tainted).
-    invocation_error: str | None = None
+    # Infra-failure markers (tasks 3118, 6734). ``invocation_errors`` holds one
+    # typed record per stage that produced no measurement; ``None`` means none was
+    # observed, including an ordinary content failure, which keeps scoring.
+    # ``cap_tainted`` is the scoring decision: no model content exists, so every
+    # aggregate EXCLUDES the cell. docs/plan-scoring-and-judge.md, "Unmeasured
+    # cells: typed causes (task 6734)".
+    invocation_errors: list[UnmeasuredRecord] | None = None
     cap_tainted: bool = False
 
     # The third member of that family (eval-revival σ, task 3628) — a VALIDITY
@@ -276,7 +236,7 @@ class EvalMetrics:
     #   ``'none'``                  neither a scorable plan nor any decline
     #                               artifact — the genuine "could not plan"
     #                               outcome, or an infra failure (read
-    #                               ``invocation_error`` / ``cap_tainted`` to
+    #                               ``invocation_errors`` / ``cap_tainted`` to
     #                               tell those two apart).
     #
     # A DECLINE IS NOT A FAILURE. ``plan_steps``, ``produced_a_plan`` and the
@@ -453,9 +413,8 @@ def read_decline_artifacts(
     not be read. A complete key set means a consumer never has to distinguish
     "not reported" from "not asked".
 
-    PER-KIND DEGRADATION, following ``runner._verdict_cost_usd``'s precedent: an
-    unreadable field costs exactly ONE field's visibility, never the whole eval
-    cell. Each reader is called inside its own ``try/except Exception`` that
+    PER-KIND DEGRADATION: an unreadable field costs exactly ONE field's
+    visibility, never the whole eval cell. Each reader is called inside its own ``try/except Exception`` that
     logs a warning naming the kind, so a corrupt ``already_done.json`` still
     lets the other four report. EVERY route to ``None``-for-an-unreadable-kind
     logs — the raise, the missing reader, and a file whose JSON parses but is
@@ -540,14 +499,6 @@ def _is_null_work(m: EvalMetrics) -> bool:
         and m.files_changed == 0
         and m.cost_usd > 0
     )
-
-
-def detect_invocation_error(
-    result: AgentResult | None, *, backend: str = 'claude',
-) -> str | None:
-    """Transitional string form of :func:`measurement.classify_unmeasured`."""
-    u = classify_unmeasured(result, stage=MeasurementStage.ARCHITECT, backend=backend) if result is not None else None
-    return f'{u.cause.value}: {u.reason}' if u else None
 
 
 def compute_composite(m: EvalMetrics) -> float:
