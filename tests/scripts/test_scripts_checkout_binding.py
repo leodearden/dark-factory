@@ -104,10 +104,13 @@ def test_binding_beats_a_decoy_the_environment_resolves(tmp_path: Path, bound: b
         assert _lies_under(sampler_file, tmp_path / _DECOY), sampler_file
 
 
+_MEMBERS_ONE_WITHOUT_SRC = '[tool.uv.workspace]\nmembers = ["shared", "no-src", "sampler"]\n'
+
+
 def test_member_src_is_the_declared_members_with_a_src_in_order_and_prefixes_sys_path(
     tmp_path: Path,
 ) -> None:
-    checkout = _layout(tmp_path)
+    checkout = _layout(tmp_path, pyproject=_MEMBERS_ONE_WITHOUT_SRC)
     proc = _run_probe(
         checkout,
         'import json, sys\n'
@@ -121,7 +124,7 @@ def test_member_src_is_the_declared_members_with_a_src_in_order_and_prefixes_sys
     reported = json.loads(proc.stdout)
     root = checkout.resolve()
     assert reported['root'] == str(root)
-    assert reported['member_src'] == [str(root / 'sampler' / 'src'), str(root / 'shared' / 'src')]
+    assert reported['member_src'] == [str(root / 'shared' / 'src'), str(root / 'sampler' / 'src')]
     assert reported['prefix'] == reported['member_src']
 
 
@@ -147,6 +150,8 @@ _UNBINDABLE_PYPROJECTS = {
     'empty-members': '[tool.uv.workspace]\nmembers = []\n',
     'members-not-a-list': '[tool.uv.workspace]\nmembers = "shared"\n',
     'glob-member': '[tool.uv.workspace]\nmembers = ["pkgs/*", "shared"]\n',
+    'non-string-member': '[tool.uv.workspace]\nmembers = ["shared", 1]\n',
+    'empty-string-member': '[tool.uv.workspace]\nmembers = ["shared", ""]\n',
 }
 
 _REPORT_BINDING_FAILURE = (

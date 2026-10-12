@@ -1053,7 +1053,7 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
         assert 'absent from both parents' in result.stdout
 
 
-#: The five real files a miniature repo needs before its hooks mean anything.
+#: The real files a miniature repo needs before its hooks mean anything.
 #: Copied VERBATIM rather than restated: if someone renames the auditor or drops
 #: the project-checks section, the copied hook stops refusing and these go red.
 _WIRED_FILES = (
