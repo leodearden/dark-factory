@@ -1741,20 +1741,57 @@ class TestMainCLI:
             "\n".join(json.dumps(r) for r in (good, bad, good_2)) + "\n",
             encoding="utf-8",
         )
+        expected = mod.apply_coding_records(
+            mod.load(codebook_path), [good, bad, good_2], invariant_slugs=()
+        )
 
         ret = mod.main(["apply", "--project-root", str(tmp_path), str(codebook_path), str(records_path)])
         captured = capsys.readouterr()
 
         assert ret == 0
-        assert str(records_path) in captured.err
-        assert ":2:" in captured.err  # the offending line number
-        assert "deletion directive" in captured.err
-        assert "deletion_directive=1" in captured.out
+        [applied] = [line for line in captured.out.splitlines() if line.startswith("applied: ")]
+        assert expected.summary() in applied
+        assert "malformed_json=0" in applied
+        [skipped] = expected.skipped_deletions
+        assert [
+            line
+            for line in captured.err.splitlines()
+            if line.startswith(f"{records_path}:2:") and "deletion directive" in line
+            and skipped.describe() in line
+        ]
 
         reloaded = mod.load(codebook_path)
         entry = next(e for e in reloaded["entries"] if e["id"] == "entry-a")
         assert {s["session"] for s in entry["sightings"]} == {"sess-1", "sess-2"}
         assert mod.validate(reloaded) == []
+
+    def test_apply_names_a_schema_invalid_record_without_aborting_batch(
+        self, tmp_path, capsys
+    ):
+        """A record the validator rejects is skipped whole, and the operator is
+        told which line and why rather than only seeing a counter move."""
+        codebook_path, records_path = self._write_apply_fixtures(tmp_path)
+        good = json.loads(records_path.read_text(encoding="utf-8"))
+        invalid = _schema_invalid_record("sess-bad")
+        records_path.write_text(
+            "\n".join(json.dumps(r) for r in (good, invalid)) + "\n", encoding="utf-8"
+        )
+
+        ret = mod.main(["apply", "--project-root", str(tmp_path), str(codebook_path), str(records_path)])
+        captured = capsys.readouterr()
+
+        assert ret == 0
+        assert "record_invalid=1" in captured.out
+        assert [
+            line
+            for line in captured.err.splitlines()
+            if line.startswith(f"{records_path}:2:") and "invalid" in line
+            and "session=sess-bad" in line
+            and "'agent_class' is a required property" in line
+        ]
+        reloaded = mod.load(codebook_path)
+        entry = next(e for e in reloaded["entries"] if e["id"] == "entry-a")
+        assert [s["session"] for s in entry["sightings"]] == ["sess-1"]
 
     def test_apply_summary_reports_candidate_disposition_conflicts(self, tmp_path, capsys):
         """A recurrence sighting appended to an already-adjudicated candidate
