@@ -49,8 +49,10 @@ mining sightings/candidates merge through the EXISTING
 ``codebook.apply_coding_record``. Census-only lifecycle transitions
 (promote/reject/retire) are deterministic in-memory transforms in this
 module, persisted via ``codebook.dump()`` after ``codebook.validate()``
-and ``codebook.assert_no_deletion()`` confirm the write is safe.
-``codebook.py`` itself is NOT modified.
+and ``codebook.assert_no_deletion()`` confirm the write is safe. The
+contract finding fields those transforms stamp (finding identity, run
+history) are defined in ``codebook.py``'s schema and minted by
+``census_findings.py``.
 """
 from __future__ import annotations
 
@@ -109,10 +111,12 @@ import codebook  # noqa: E402
 import coder  # noqa: E402
 import filing_policy  # noqa: E402
 from legibility import (  # noqa: E402
+    census_findings,
     census_identity,
     census_trigger,
     census_window,
     digest,
+    finding_area,
     invariants,
     session_ledger,
     session_runner,
@@ -823,6 +827,7 @@ def build_task_payloads(
     *,
     project_root: str,
     project_id: str,
+    run_id: str,
     harness: filing_policy.ProjectRef | None = None,
 ) -> list[dict]:
     """Map each verified cluster to one curator-path ``submit_task`` kwarg
@@ -838,6 +843,13 @@ def build_task_payloads(
     ``metadata.x_fix_surface``, and ``metadata.origin_project_id`` always names
     the observed project.
 
+    Every payload names its run under ``metadata.x_finding_run``, and a cluster
+    carrying a ``finding`` identity names its key under
+    ``metadata.x_finding_key`` (quality-findings contract §8);
+    ``x_supersedes_task`` arrives with the dedup protocol's step 1c
+    (plans/census-incremental-prd.md L4). ``priority`` is the cluster's
+    severity (contract §4).
+
     ``title`` and ``description`` pass through
     ``shared.toolcall_markup::escape_envelope_literals`` because cluster
     evidence may QUOTE tool-call envelope literals, which the boundary
@@ -850,7 +862,14 @@ def build_task_payloads(
     payloads = []
     for cluster in clusters:
         target = filing_policy.resolve_target(cluster, observed=observed, harness=harness)
-        metadata: dict = {"source": "legibility_census", "origin_project_id": project_id}
+        metadata: dict = {
+            "source": "legibility_census",
+            "origin_project_id": project_id,
+            "x_finding_run": run_id,
+        }
+        finding = cluster.get("finding")
+        if finding is not None:
+            metadata["x_finding_key"] = finding.key
         if target.fix_surface:
             metadata["x_fix_surface"] = [
                 {"component": match.component, "evidence": match.evidence}
@@ -865,7 +884,7 @@ def build_task_payloads(
                     _cluster_description(cluster, observed_project_id=project_id)
                 ),
                 "task_kind": "normal",
-                "priority": cluster.get("priority", "medium"),
+                "priority": cluster.get("severity", verdict_mod.DEFAULT_SEVERITY),
                 "metadata": metadata,
             }
         )
@@ -894,8 +913,7 @@ def _ticket_id_from_submit_result(result) -> str | None:
 # ---------------------------------------------------------------------------
 # promote_candidate / reject_candidate / retire_entry / mark_entry_filed —
 # census-only codebook lifecycle transforms (PRD decision 1: deterministic, in-memory,
-# reuse gamma's validator + never-delete assertion + sole-writer dump;
-# codebook.py itself is NOT modified)
+# reuse gamma's validator + never-delete assertion + sole-writer dump)
 # ---------------------------------------------------------------------------
 
 def _find_by_id(items: list[dict], item_id: str, *, kind: str) -> dict:
@@ -905,7 +923,10 @@ def _find_by_id(items: list[dict], item_id: str, *, kind: str) -> dict:
     raise ValueError(f"{kind}: no id {item_id!r} found")
 
 
-def promote_candidate(cb: dict, cand_id: str, entry_fields: dict) -> dict:
+def promote_candidate(
+    cb: dict, cand_id: str, entry_fields: dict, *,
+    finding: census_findings.FindingIdentity | None = None,
+) -> dict:
     """Promote candidate *cand_id* in *cb* to a new codebook entry.
 
     Returns a NEW codebook (a ``copy.deepcopy`` of *cb*, never mutated in
@@ -916,15 +937,20 @@ def promote_candidate(cb: dict, cand_id: str, entry_fields: dict) -> dict:
     candidate's OWN sightings (the candidate is the source of truth for
     what was actually observed, not *entry_fields*). The candidate itself
     is stamped ``disposition="promoted"`` and ``promoted_to`` naming the
-    new entry id -- RETAINED, never removed (PRD decision 3).
+    new entry id -- RETAINED, never removed (PRD decision 3). A *finding*
+    identity is stamped on the candidate (``census_findings.stamped``), and
+    the entry carries the stamped candidate's identity and supersedes chain
+    (``census_findings.carried_identity``).
     ``codebook.assert_no_deletion`` is run against the pre-transform *cb*
     before returning, as a construction-independent safety net.
     """
     result = copy.deepcopy(cb)
     candidate = _find_by_id(result.get("candidates") or [], cand_id, kind="promote_candidate")
+    if finding is not None:
+        candidate.update(census_findings.stamped(candidate, finding))
 
     new_entry_id = entry_fields["id"]
-    entry = dict(entry_fields)
+    entry = {**entry_fields, **census_findings.carried_identity(candidate)}
     entry["sightings"] = copy.deepcopy(candidate.get("sightings") or [])
     result.setdefault("entries", []).append(entry)
 
@@ -935,12 +961,16 @@ def promote_candidate(cb: dict, cand_id: str, entry_fields: dict) -> dict:
     return result
 
 
-def reject_candidate(cb: dict, cand_id: str) -> dict:
+def reject_candidate(
+    cb: dict, cand_id: str, *, finding: census_findings.FindingIdentity | None = None,
+) -> dict:
     """Reject candidate *cand_id* in *cb*: stamps ``disposition="rejected"``
-    in place on a deep copy, RETAINED (never removed). Returns a NEW
-    codebook; *cb* is never mutated."""
+    (and a *finding* identity, when given) in place on a deep copy, RETAINED
+    (never removed). Returns a NEW codebook; *cb* is never mutated."""
     result = copy.deepcopy(cb)
     candidate = _find_by_id(result.get("candidates") or [], cand_id, kind="reject_candidate")
+    if finding is not None:
+        candidate.update(census_findings.stamped(candidate, finding))
     candidate["disposition"] = "rejected"
 
     codebook.assert_no_deletion(cb, result)
@@ -1145,6 +1175,7 @@ SECTION_VERIFICATION = "verification"
 SECTION_UNRESOLVED_VERDICTS = "unresolved-verdicts"
 SECTION_MATRIX = "matrix"
 SECTION_SYNTHESIS = "synthesis"
+SECTION_FINDINGS = "findings"
 SECTION_FILED_TASKS = "filed-tasks"
 SECTION_WITHHELD = "withheld-clusters"
 SECTION_COST = "cost"
@@ -1320,10 +1351,14 @@ def build_census_record(
     mass_rejection: MassRejection | None = None,
     withheld: tuple[filing_policy.WithheldCluster, ...] = (),
     cross_project_tickets: tuple[CrossProjectTicket, ...] = (),
+    findings: Sequence[Mapping[str, Any]] = (),
+    area_map: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The run's JSON record: everything :func:`census_report_sections`
     renders, as plain JSON-safe values. The mining records themselves are
-    not carried; the codebook holds what they merged."""
+    not carried; the codebook holds what they merged. *findings* are the
+    contract §1 rows (``census_findings.FindingRow.to_record``) and
+    *area_map* the ``finding_area.AreaMap.to_record`` that keyed them."""
     return {
         "record_version": CENSUS_RECORD_VERSION,
         "run_id": method["run_id"],
@@ -1345,6 +1380,8 @@ def build_census_record(
         "cross_project_tickets": [asdict(ticket) for ticket in cross_project_tickets],
         "dry_run": _optional_asdict(dry_run),
         "withheld": [asdict(cluster) for cluster in withheld],
+        "findings": [dict(row) for row in findings],
+        "area_map": None if area_map is None else dict(area_map),
         "cost_note": cost_note,
     }
 
@@ -1553,6 +1590,8 @@ def census_report_sections(record: Mapping[str, Any]) -> tuple[ReportSection, ..
         SECTION_SYNTHESIS,
         ["## Synthesis", "", SYNTHESIS_NOT_APPLIED_NOTICE, "", record["synthesis_md"]],
     )
+
+    emit(SECTION_FINDINGS, census_findings.report_lines(record))
 
     filed_tasks = ["", "## Filed Tasks", ""]
     if dry_run is not None:
@@ -1782,21 +1821,30 @@ _RELEASABLE_ENTRY_STATUSES = frozenset({"open", "partially"})
 retired confusion needs no ticket."""
 
 
+def _entry_text(cb: dict, entry: Mapping[str, Any], field: str) -> str | None:
+    """*entry*'s *field* (``cause`` or ``area``): its own when a correction has
+    written it, else that of the candidate it was promoted from."""
+    return entry.get(field) or (_promoted_from(cb, entry["id"]) or {}).get(field)
+
+
 def _entry_cluster(cb: dict, entry: dict) -> dict:
-    """A fileable cluster rebuilt from codebook *entry*. Its cause and area are
-    the entry's own when a correction has written them, else those of the
-    candidate it was promoted from."""
-    source = _promoted_from(cb, entry["id"]) or {}
+    """A fileable cluster rebuilt from codebook *entry*, by :func:`_entry_text`;
+    its severity and finding identity are the entry's own."""
     sightings = list(entry.get("sightings") or [])
-    return _cluster_record(
+    cluster = _cluster_record(
         title=entry["title"],
-        cause=entry.get("cause") or source.get("cause"),
-        area=entry.get("area") or source.get("area"),
+        cause=_entry_text(cb, entry, "cause"),
+        area=_entry_text(cb, entry, "area"),
         origin_phase=entry["origin_phase"],
         manifested_phase=entry["manifested_phase"],
         evidence=[s["evidence_quote"] for s in sightings if s.get("evidence_quote")],
         sightings=sightings,
     )
+    return {
+        **cluster,
+        "severity": entry["severity"],
+        "finding": census_findings.FindingIdentity.from_record(entry),
+    }
 
 
 @dataclass(frozen=True)
@@ -1849,6 +1897,19 @@ def _promoted_from(cb: dict, entry_id: str) -> dict | None:
         if candidate.get("promoted_to") == entry_id:
             return candidate
     return None
+
+
+def _with_finding(cluster: dict, area_map: finding_area.AreaMap) -> dict:
+    """*cluster* carrying the finding identity and severity its Verdict gives;
+    a cluster without a Verdict is returned as it is."""
+    found = cluster.get("verdict")
+    if not isinstance(found, verdict_mod.Verdict):
+        return cluster
+    return {
+        **cluster,
+        "finding": census_findings.identity_of(found, area_map),
+        "severity": found.severity,
+    }
 
 
 def _find_adjudicated_candidate(cb: dict, title: str | None) -> dict | None:
@@ -2439,7 +2500,10 @@ def run_census(
     promoted entry takes the cluster Verdict's severity and severity_reason,
     and a verified cluster *verify_fn* returned without a Verdict gets the
     verdict parser's defaults) and ``retire_entry`` for any entry ids
-    *verify_fn* reports fixed -> ``codebook.validate`` (raises and aborts BEFORE
+    *verify_fn* reports fixed; contract finding keys are stamped at promotion
+    and at a verdict-bearing rejection (``census_findings``, areas from
+    ``finding_area.load_area_map``), and every entry sighted this run has the
+    run appended to its ``last_seen_runs`` -> ``codebook.validate`` (raises and aborts BEFORE
     anything is written, on an invalid merge) -> the singleton filing gate
     (``_split_fileable``: a verified cluster files only with an in-tree
     remediation or a recurrence, counted in the merged codebook; a withheld
@@ -2630,6 +2694,9 @@ def run_census(
     )
 
     invariant_slugs = invariants.read_slugs(project_root)
+    area_map = finding_area.load_area_map(project_root)
+    for note in area_map.notes:
+        logger.warning("census: finding area map: %s", note)
     mining_result = mine_to_saturation(
         batch_source,
         codebook_dict,
@@ -2779,6 +2846,8 @@ def run_census(
             logger.warning("census: mass-rejection escalation failed (best-effort): %s", exc)
 
     synthesis_md = synthesize_fn(verified, model=config.models.census_synthesis)
+    verified = [_with_finding(cluster, area_map) for cluster in verified]
+    rejected = [_with_finding(cluster, area_map) for cluster in rejected]
 
     verified_sightings = [s for cluster in verified for s in (cluster.get("sightings") or [])]
     matrix_md = render_matrix(compute_matrix(verified_sightings))
@@ -2809,6 +2878,8 @@ def run_census(
     # sightings into its entry, and _sighting_counts_by_title dedups by session.
     fileable, held_back = _split_fileable(verified, updated_codebook)
     marked_withheld: list[filing_policy.WithheldCluster] = []
+    promoted: list[census_findings.Adjudication] = []
+    refuted: list[census_findings.Adjudication] = []
 
     for cluster in verified:
         cand_id = _find_pending_candidate_id(updated_codebook, cluster.get("title"))
@@ -2841,12 +2912,16 @@ def run_census(
             "status": "open",
             "origin_phase": cluster.get("origin_phase") or "unknown",
             "manifested_phase": cluster.get("manifested_phase") or "unknown",
+            **census_findings.first_sighting_fields(run_id),
         }
         held = held_back.get(cluster.get("title"))
         if held is not None:
             entry_fields[ENTRY_FILING_KEY] = ENTRY_FILING_WITHHELD
             marked_withheld.append(held)
-        updated_codebook = promote_candidate(updated_codebook, cand_id, entry_fields)
+        updated_codebook = promote_candidate(
+            updated_codebook, cand_id, entry_fields, finding=cluster["finding"],
+        )
+        promoted.append(census_findings.Adjudication(entry_fields["id"], found, cluster.get("cause")))
 
     withheld = tuple(marked_withheld)
     if withheld:
@@ -2874,10 +2949,20 @@ def run_census(
                 contradicting_disposition="promoted",
             ))
             continue
-        updated_codebook = reject_candidate(updated_codebook, cand_id)
+        updated_codebook = reject_candidate(
+            updated_codebook, cand_id, finding=cluster.get("finding"),
+        )
+        if cluster.get("finding") is not None:
+            refuted.append(census_findings.Adjudication(cand_id, cluster["verdict"], cluster.get("cause")))
 
     for entry_id in fixed_entry_ids:
         updated_codebook = retire_entry(updated_codebook, entry_id)
+
+    updated_codebook, sighted = census_findings.mark_seen(
+        updated_codebook,
+        run_id=run_id,
+        sessions={record["session"] for record in mining_result.records if record.get("session")},
+    )
 
     _report_dropped_verdicts(
         dropped_verdicts, disposition_conflicts=disposition_conflicts,
@@ -2902,7 +2987,8 @@ def run_census(
     filing_queue = _filing_queue(fileable, updated_codebook)
     task_payloads = build_task_payloads(
         [pending.cluster for pending in filing_queue],
-        project_root=project_root, project_id=project_id, harness=harness_project,
+        project_root=project_root, project_id=project_id, run_id=run_id,
+        harness=harness_project,
     )
     filed_ticket_ids = []
     cross_project_tickets: list[CrossProjectTicket] = []
@@ -3047,6 +3133,18 @@ def run_census(
         mass_rejection=mass_rejection,
         withheld=withheld,
         cross_project_tickets=tuple(cross_project_tickets),
+        findings=[
+            row.to_record()
+            for row in census_findings.finding_rows(
+                updated_codebook,
+                promoted=promoted,
+                refuted=refuted,
+                sighted=sighted,
+                run_id=run_id,
+                cause_of=functools.partial(_entry_text, updated_codebook, field="cause"),
+            )
+        ],
+        area_map=area_map.to_record(),
     )
     # The record is written FIRST and the report rendered from that very text,
     # so the markdown can only ever say what the record holds. Both precede

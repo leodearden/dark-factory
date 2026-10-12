@@ -19,6 +19,7 @@ import contextlib
 import functools
 import json
 import logging
+import re
 import subprocess
 from datetime import UTC, datetime, time, timedelta
 from typing import Any
@@ -32,10 +33,12 @@ import pytest
 import yaml
 from legibility import (
     account_pool,
+    census_findings,
     census_identity,
     census_trigger,
     census_window,
     check_census_report,
+    finding_area,
     invariants,
     session_ledger,
     session_runner,
@@ -49,6 +52,7 @@ from shared.cap_markers import (
     REAL_CLI_CAP_HIT_MESSAGES,
     REAL_CLI_CAP_MESSAGES,
 )
+from shared.finding_key import finding_key
 
 import config as config_mod
 
@@ -727,10 +731,14 @@ def _verified_cluster(**overrides):
     return cluster
 
 
+_PAYLOAD_RUN_ID = "census-dark_factory-20260714"
+
+
 def test_build_task_payloads_one_payload_per_cluster_curator_path():
     clusters = [_verified_cluster(title="Cluster A"), _verified_cluster(title="Cluster B")]
     payloads = mod.build_task_payloads(
         clusters, project_root="/home/leo/src/some-project", project_id="some_project",
+        run_id=_PAYLOAD_RUN_ID,
     )
 
     assert len(payloads) == 2
@@ -746,14 +754,18 @@ def test_build_task_payloads_title_and_description_sourced_from_cluster():
     cluster = _verified_cluster(
         title="A specific novel cause", summary="A precise factual summary of what happened.",
     )
-    payloads = mod.build_task_payloads([cluster], project_root="/root", project_id="proj")
+    payloads = mod.build_task_payloads(
+        [cluster], project_root="/root", project_id="proj", run_id=_PAYLOAD_RUN_ID,
+    )
     assert "A specific novel cause" in payloads[0]["title"]
     assert "A precise factual summary of what happened." in payloads[0]["description"]
 
 
 def test_build_task_payloads_description_has_no_prose_routing_intent():
     clusters = [_verified_cluster()]
-    payloads = mod.build_task_payloads(clusters, project_root="/root", project_id="proj")
+    payloads = mod.build_task_payloads(
+        clusters, project_root="/root", project_id="proj", run_id=_PAYLOAD_RUN_ID,
+    )
     description = payloads[0]["description"].lower()
     for banned_phrase in ("file this into", "route to", "planning_mode"):
         assert banned_phrase not in description
@@ -769,6 +781,7 @@ def test_build_task_payloads_harness_rooted_cause_can_target_dark_factory():
     ]
     payloads = mod.build_task_payloads(
         clusters, project_root="/home/leo/src/hosted-project", project_id="hosted_project",
+        run_id=_PAYLOAD_RUN_ID,
     )
     assert payloads[0]["project_root"] == "/home/leo/src/dark-factory"
 
@@ -786,6 +799,7 @@ def test_build_task_payloads_partial_target_override_falls_back_to_own_project()
     ]
     payloads = mod.build_task_payloads(
         only_root, project_root="/home/leo/src/hosted-project", project_id="hosted_project",
+        run_id=_PAYLOAD_RUN_ID,
     )
     assert payloads[0]["project_root"] == "/home/leo/src/hosted-project", (
         "a lone target_project_root override must be ignored, never mixed with the "
@@ -796,6 +810,7 @@ def test_build_task_payloads_partial_target_override_falls_back_to_own_project()
     only_id = [_verified_cluster(title="Only id override", target_project_id="dark_factory")]
     payloads = mod.build_task_payloads(
         only_id, project_root="/home/leo/src/hosted-project", project_id="hosted_project",
+        run_id=_PAYLOAD_RUN_ID,
     )
     assert payloads[0]["project_root"] == "/home/leo/src/hosted-project", (
         "a lone target_project_id override must be ignored, never mixed with the "
@@ -842,6 +857,7 @@ _REIFY_7909_SHAPED = _verified_cluster(
 def _reify_payloads(clusters, *, harness: filing_policy.ProjectRef | None = _HARNESS):
     return mod.build_task_payloads(
         clusters, project_root=_REIFY_ROOT, project_id="reify", harness=harness,
+        run_id=_PAYLOAD_RUN_ID,
     )
 
 
@@ -885,8 +901,60 @@ def test_remediated_payload_stays_observed_and_describes_the_remediation():
 
 def test_build_task_payloads_without_harness_targets_the_observed_project():
     clusters = [param.values[0] for param in _MISFILED_INTO_REIFY]
-    payloads = mod.build_task_payloads(clusters, project_root=_REIFY_ROOT, project_id="reify")
+    payloads = mod.build_task_payloads(
+        clusters, project_root=_REIFY_ROOT, project_id="reify", run_id=_PAYLOAD_RUN_ID,
+    )
     assert [payload["project_root"] for payload in payloads] == [_REIFY_ROOT] * len(clusters)
+
+
+# ---------------------------------------------------------------------------
+# task 6402 step-9: RED — payload metadata names the run and the finding key
+# (contract §8), and priority is the cluster's severity (contract §4).
+# ---------------------------------------------------------------------------
+
+def _keyed_cluster(**overrides):
+    identity = census_findings.FindingIdentity.mint(
+        "orchestrator", "orchestrator/x.py::f", ("h13", verdict.KIND_TAG),
+    )
+    return _verified_cluster(finding=identity, **overrides)
+
+
+def _single_payload(cluster):
+    [payload] = mod.build_task_payloads(
+        [cluster], project_root="/root", project_id="proj", run_id=_PAYLOAD_RUN_ID,
+    )
+    return payload
+
+
+def test_build_task_payloads_names_the_run_on_every_payload():
+    payloads = mod.build_task_payloads(
+        [_verified_cluster(), _keyed_cluster()], project_root="/root", project_id="proj",
+        run_id=_PAYLOAD_RUN_ID,
+    )
+    for payload in payloads:
+        assert payload["metadata"]["x_finding_run"] == _PAYLOAD_RUN_ID
+        assert payload["metadata"]["source"] == "legibility_census"
+        assert payload["metadata"]["origin_project_id"] == "proj"
+
+
+def test_build_task_payloads_names_a_keyed_clusters_finding_key():
+    cluster = _keyed_cluster()
+    assert _single_payload(cluster)["metadata"]["x_finding_key"] == cluster["finding"].key
+
+
+def test_build_task_payloads_omits_the_finding_key_of_an_unkeyed_cluster():
+    assert "x_finding_key" not in _single_payload(_verified_cluster())["metadata"]
+
+
+@pytest.mark.parametrize("severity", ["high", "low"])
+def test_build_task_payloads_priority_is_the_clusters_severity(severity):
+    assert _single_payload(_verified_cluster(severity=severity))["priority"] == severity
+
+
+def test_build_task_payloads_priority_defaults_to_the_default_severity():
+    cluster = _verified_cluster()
+    del cluster["severity"]
+    assert _single_payload(cluster)["priority"] == verdict.DEFAULT_SEVERITY
 
 
 # ---------------------------------------------------------------------------
@@ -1071,6 +1139,57 @@ def test_promote_candidate_appends_entry_and_stamps_disposition():
     # never mutates the input codebook
     assert before["candidates"][0]["disposition"] == "pending"
     assert len(before["entries"]) == 1
+
+
+_PROMOTION_ENTRY_FIELDS = {
+    "id": "new-entry-a",
+    "title": "A novel confusion shape",
+    "severity": "medium",
+    "status": "open",
+    "origin_phase": "implement",
+    "manifested_phase": "verify",
+}
+
+
+def _promotion_identity(anchor: str, primary_tag: str = "h13") -> census_findings.FindingIdentity:
+    return census_findings.FindingIdentity.mint("orchestrator", anchor, (primary_tag, verdict.KIND_TAG))
+
+
+def _promoted_pair(cb: dict, finding: census_findings.FindingIdentity) -> tuple[dict, dict]:
+    result = mod.promote_candidate(cb, "cand-20260714-1", dict(_PROMOTION_ENTRY_FIELDS), finding=finding)
+    assert codebook.validate(result) == []
+    return result["candidates"][0], next(e for e in result["entries"] if e["id"] == "new-entry-a")
+
+
+def _identity_and_supersedes(record: dict) -> dict:
+    return {field: record[field] for field in (*codebook.FINDING_IDENTITY_FIELDS, "supersedes")}
+
+
+def test_a_promoted_entry_carries_its_unkeyed_candidates_new_identity():
+    finding = _promotion_identity("orchestrator/x.py::f")
+    candidate, entry = _promoted_pair(_codebook_with_candidate(), finding)
+    assert _identity_and_supersedes(entry) == {**finding.to_fields(), "supersedes": []}
+    assert candidate["finding_key"] == entry["finding_key"]
+
+
+def test_a_promoted_entry_keeps_the_key_its_candidate_already_stands_on():
+    cb = _codebook_with_candidate()
+    standing = _promotion_identity("orchestrator/x.py::f", primary_tag="h13")
+    cb["candidates"][0].update(standing.to_fields())
+    candidate, entry = _promoted_pair(cb, _promotion_identity("orchestrator/x.py::f", primary_tag="h4"))
+    assert entry["finding_key"] == candidate["finding_key"] == standing.key
+    assert _identity_and_supersedes(entry) == _identity_and_supersedes({**candidate, "supersedes": []})
+
+
+def test_a_promoted_entry_carries_the_supersedes_chain_its_moved_candidate_records():
+    cb = _codebook_with_candidate()
+    prior = finding_key("orchestrator", "orchestrator/x.py::older", "h13")
+    standing = _promotion_identity("orchestrator/x.py::old_name")
+    cb["candidates"][0].update({**standing.to_fields(), "supersedes": [prior]})
+    moved = _promotion_identity("orchestrator/x.py::new_name")
+    candidate, entry = _promoted_pair(cb, moved)
+    assert entry["finding_key"] == candidate["finding_key"] == moved.key
+    assert entry["supersedes"] == candidate["supersedes"] == [prior, standing.key]
 
 
 def test_reject_candidate_stamps_disposition_retained():
@@ -1302,6 +1421,7 @@ def test_render_report_carries_each_piece_in_its_own_section():
         mod.SECTION_SATURATION,
         mod.SECTION_MATRIX,
         mod.SECTION_SYNTHESIS,
+        mod.SECTION_FINDINGS,
         mod.SECTION_FILED_TASKS,
         mod.SECTION_COST,
     ]
@@ -1441,6 +1561,10 @@ matrix
 _The census does not parse this section: nothing proposed in it has been applied to the codebook._
 
 prose
+
+## Findings
+
+_no findings touched this run._
 
 ## Filed Tasks
 
@@ -1926,8 +2050,56 @@ def _sample_dropped_verdicts() -> tuple:
     )
 
 
+_FINDING_ANCHOR = "orchestrator/x.py::f"
+_FINDING_VERDICT = verdict.Verdict(
+    verified=True,
+    reason="the verifier saw it",
+    anchor=_FINDING_ANCHOR,
+    tags=("h13", verdict.KIND_TAG),
+    severity="high",
+    severity_reason="r",
+    route=verdict.Route.MECHANICAL,
+    remediation=verdict.Remediation("orchestrator/x.py", "fix it"),
+)
+_FINDING_AREA_MAP = finding_area.AreaMap(
+    briefing=finding_area.BRIEFING_RELPATH,
+    members=("orchestrator",),
+    overlay=None,
+    rules=(),
+    notes=(),
+)
+
+
+def _sample_finding_entry() -> dict:
+    identity = census_findings.FindingIdentity.mint(
+        "orchestrator", _FINDING_ANCHOR, ("h13", verdict.KIND_TAG),
+    )
+    return {
+        "id": "entry-cand-20260714-1",
+        "title": "A keyed finding",
+        "severity": "high",
+        "status": "open",
+        "origin_phase": "implement",
+        "manifested_phase": "verify",
+        "sightings": [],
+        **identity.to_fields(),
+        **census_findings.first_sighting_fields(_PAYLOAD_RUN_ID),
+    }
+
+
+def _sample_finding_record(*, cause: str = "the cause", observed: bool = False) -> dict:
+    entry = _sample_finding_entry()
+    if observed:
+        return census_findings.observed_row(entry, cause).to_record()
+    return census_findings.confirmed_row(entry, _FINDING_VERDICT, cause=cause).to_record()
+
+
 _REPORT_FLAG_CASES: dict[str, dict[str, Any]] = {
     "flagless": {},
+    "findings": {
+        "findings": (_sample_finding_record(),),
+        "area_map": _FINDING_AREA_MAP.to_record(),
+    },
     "forced": {"force": True},
     "capped": {"mining_result": _capped_mining_result(stop_reason="capped", max_batches=2)},
     "verify_capped": {"verify_coverage": mod.VerifyCoverage(novel=5, offered=2, cap=2)},
@@ -1976,6 +2148,86 @@ def test_render_report_renders_from_the_json_record_alone(case):
     parsed = json.loads(json.dumps(record))
 
     assert mod.render_report(parsed) == mod.render_report(record)
+
+
+# ---------------------------------------------------------------------------
+# task 6402 step-9: RED — the record's contract §1 findings rows and the area
+# map that keyed them, rendered as ## Findings on every report.
+# ---------------------------------------------------------------------------
+
+def _findings_text(**overrides) -> str:
+    return _section_text(_sections(**overrides), mod.SECTION_FINDINGS)
+
+
+def _table_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line.startswith("|")]
+
+
+def _cells(line: str) -> list[str]:
+    return [cell.strip() for cell in re.split(r"(?<!\\)\|", line.strip())[1:-1]]
+
+
+def test_build_census_record_carries_findings_and_the_area_map():
+    finding = _sample_finding_record()
+    record = _census_record(findings=(finding,), area_map=_FINDING_AREA_MAP.to_record())
+    assert record["findings"] == [finding]
+    assert record["area_map"] == _FINDING_AREA_MAP.to_record()
+    assert check_census_report.check_findings(record) == []
+
+
+def test_build_census_record_defaults_to_no_findings_and_no_area_map():
+    record = _census_record()
+    assert record["findings"] == []
+    assert record["area_map"] is None
+
+
+@pytest.mark.parametrize("case", sorted(_REPORT_FLAG_CASES))
+def test_findings_renders_on_every_report_between_synthesis_and_filed_tasks(case):
+    sections = _sections(**_REPORT_FLAG_CASES[case])
+    keys = [section.key for section in sections]
+    assert keys.index(mod.SECTION_SYNTHESIS) < keys.index(mod.SECTION_FINDINGS)
+    assert keys.index(mod.SECTION_FINDINGS) < keys.index(mod.SECTION_FILED_TASKS)
+    assert "## Findings" in _section(sections, mod.SECTION_FINDINGS).lines
+
+
+def test_findings_table_names_every_oracle_field_and_the_row():
+    finding = _sample_finding_record()
+    text = _findings_text(findings=(finding,), area_map=_FINDING_AREA_MAP.to_record())
+    header, *rest = _table_lines(text)
+    assert _cells(header) == ["id", *check_census_report.FINDING_FIELDS]
+    rows = [line for line in rest if finding["key"] in line]
+    assert len(rows) == 1
+    assert finding["anchor"] in rows[0]
+    assert len(_cells(rows[0])) == len(_cells(header))
+
+
+def test_findings_section_names_the_area_maps_degradation(tmp_path):
+    area_map = finding_area.load_area_map(tmp_path)
+    assert area_map.briefing is None and area_map.notes
+    text = _findings_text(area_map=area_map.to_record())
+    for note in area_map.notes:
+        assert note in text
+
+
+@pytest.mark.parametrize("unverified", [1, 2])
+def test_findings_section_counts_the_unverified_rows(unverified):
+    observed = tuple(_sample_finding_record(observed=True) for _ in range(unverified))
+    text = _findings_text(findings=(*observed, _sample_finding_record()))
+    bullets = [line for line in text.splitlines() if line.startswith("- ")]
+    assert [line for line in bullets if line.startswith(f"- {unverified} re-observed finding(s)")]
+
+
+def test_findings_section_has_no_unverified_bullet_without_unverified_rows():
+    text = _findings_text(findings=(_sample_finding_record(),))
+    assert "re-observed" not in text
+
+
+def test_a_pipe_in_a_statement_does_not_break_the_findings_table():
+    plain = _findings_text(findings=(_sample_finding_record(cause="a plain cause"),))
+    piped = _findings_text(findings=(_sample_finding_record(cause="a | piped\ncause"),))
+    assert len(piped.splitlines()) == len(plain.splitlines())
+    header, row = _table_lines(piped)[0], _table_lines(piped)[-1]
+    assert len(_cells(row)) == len(_cells(header))
 
 
 def test_build_census_record_carries_identity_and_method():
@@ -2152,6 +2404,7 @@ def test_census_report_sections_flagless_key_set_and_order():
         mod.SECTION_SATURATION,
         mod.SECTION_MATRIX,
         mod.SECTION_SYNTHESIS,
+        mod.SECTION_FINDINGS,
         mod.SECTION_FILED_TASKS,
         mod.SECTION_COST,
     ]
@@ -4733,12 +4986,19 @@ def test_run_census_dry_run_does_not_clobber_an_existing_payload_file(tmp_path, 
     # (b) this run's payloads landed on the numbered sibling, in
     # build_task_payloads' own shape
     assert sibling_path.exists()
+    area_map = finding_area.load_area_map(tmp_path)
     verified = [
-        c for c in fake_verify_fn.calls[0]["result"]["verified"]
+        {
+            **c,
+            "finding": census_findings.identity_of(c["verdict"], area_map),
+            "severity": c["verdict"].severity,
+        }
+        for c in fake_verify_fn.calls[0]["result"]["verified"]
         if c.get("title") == "Silent no-op subagent contract"
     ]
     expected = mod.build_task_payloads(
         verified, project_root=str(tmp_path), project_id="dark_factory",
+        run_id=kwargs["run_id"],
     )
     assert expected, "guard: the scenario must actually produce a payload"
     assert json.loads(sibling_path.read_text(encoding="utf-8")) == expected
@@ -8729,3 +8989,296 @@ def test_run_census_counts_a_rejected_candidates_sightings_as_recurrence(tmp_pat
     [filed] = second["submit_fn"].calls
     assert filed["title"] == f"[legibility census] {_GATED_TITLE}"
     assert outcome.withheld == ()
+
+
+# ---------------------------------------------------------------------------
+# task 6402 step-11: RED — run_census stamps contract finding keys at
+# promotion and rejection, appends last_seen_runs on every sighted entry, files
+# with the key and the severity, and reports the §1 rows (PRD §4.8 row 5).
+# ---------------------------------------------------------------------------
+
+_ROW5_ANCHOR = "orchestrator/x.py::f"
+_ROW5_KEY = finding_key("orchestrator", _ROW5_ANCHOR, "h13")
+_ROW5_FIELDS = {
+    "finding_key": _ROW5_KEY,
+    "finding_area": "orchestrator",
+    "finding_anchor": _ROW5_ANCHOR,
+    "finding_tags": ["h13", verdict.KIND_TAG],
+}
+
+
+def _write_briefing(root) -> None:
+    (root / "review").mkdir(parents=True, exist_ok=True)
+    (root / "review" / "briefing.yaml").write_text(
+        "subprojects:\n  orchestrator: {}\n  shared: {}\n", encoding="utf-8",
+    )
+    (root / "orchestrator").mkdir(exist_ok=True)
+    (root / "orchestrator" / "x.py").write_text("def f():\n    pass\n", encoding="utf-8")
+
+
+def _keyed_verdict(*, verified=True, tags=("h13", verdict.KIND_TAG), severity="high"):
+    return verdict.Verdict(
+        verified=verified,
+        reason="the verifier read orchestrator/x.py",
+        anchor=_ROW5_ANCHOR,
+        tags=tags,
+        severity=severity,
+        severity_reason="r",
+        route=verdict.Route.MECHANICAL if verified else verdict.Route.STRUCTURAL,
+        remediation=verdict.Remediation("orchestrator/x.py", "fix it") if verified else None,
+    )
+
+
+def _keyed_verify_fn(*, rejected_verdict=None):
+    """Verifies _PROMOTED_TITLE with the row-5 Verdict; rejects every other
+    title, carrying *rejected_verdict* when one is given."""
+    def verify_fn(clusters, *, model):
+        verified = [
+            {**c, "verdict": _keyed_verdict()} for c in clusters if c.get("title") == _PROMOTED_TITLE
+        ]
+        rejected = [
+            c if rejected_verdict is None else {**c, "verdict": rejected_verdict}
+            for c in clusters
+            if c.get("title") != _PROMOTED_TITLE
+        ]
+        return {"verified": verified, "rejected": rejected, "fixed": []}
+
+    return verify_fn
+
+
+def _run_record(kwargs) -> dict:
+    return json.loads(kwargs["report_path"].with_suffix(".json").read_text(encoding="utf-8"))
+
+
+def _findings_of_report(kwargs) -> str:
+    report = kwargs["report_path"].read_text(encoding="utf-8")
+    assert "Findings" in check_census_report.level2_titles(report)
+    return report.split("\n## Findings\n", 1)[1].split("\n## ", 1)[0]
+
+
+def _promoted_candidate_of(kwargs, entry_id) -> dict:
+    persisted = codebook.load(kwargs["codebook_path"])
+    [candidate] = [c for c in persisted["candidates"] if c.get("promoted_to") == entry_id]
+    return candidate
+
+
+def test_run_census_row5_verdict_key_ticket(tmp_path):
+    _write_briefing(tmp_path)
+    kwargs = _promotion_kwargs(tmp_path, verify_fn=_keyed_verify_fn())
+    run_id = kwargs["run_id"]
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    entry = _persisted_promoted_entry(kwargs)
+    assert {field: entry[field] for field in _ROW5_FIELDS} == _ROW5_FIELDS
+    assert entry["first_seen_run"] == run_id
+    assert entry["last_seen_runs"] == [run_id]
+    assert entry["supersedes"] == []
+    candidate = _promoted_candidate_of(kwargs, entry["id"])
+    assert {field: candidate[field] for field in _ROW5_FIELDS} == _ROW5_FIELDS
+
+    [payload] = kwargs["submit_fn"].calls
+    assert payload["metadata"]["x_finding_key"] == _ROW5_KEY
+    assert payload["metadata"]["x_finding_run"] == run_id
+    assert payload["priority"] == "high"
+
+    record = _run_record(kwargs)
+    [row] = record["findings"]
+    assert row["key"] == _ROW5_KEY
+    assert row["verdict"] == "confirmed"
+    assert row["disposition"] == "open"
+    assert row["first_seen"] == run_id
+    assert row["area"] == "orchestrator"
+    assert check_census_report.check_findings(record) == []
+    assert _ROW5_KEY in _findings_of_report(kwargs)
+
+
+def _rejection_kwargs(tmp_path, *, rejected_verdict):
+    _write_briefing(tmp_path)
+    return _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[_happy_batch("b0")],
+        verify_fn=_keyed_verify_fn(rejected_verdict=rejected_verdict),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        commit=_make_fake_commit(),
+    )
+
+
+def _rejected_candidate(kwargs) -> dict:
+    persisted = codebook.load(kwargs["codebook_path"])
+    [candidate] = [c for c in persisted["candidates"] if c["title"] == "Spurious pattern"]
+    return candidate
+
+
+def test_run_census_stamps_a_rejected_cluster_that_carries_a_verdict(tmp_path):
+    refuting = _keyed_verdict(verified=False, tags=("h4", verdict.KIND_TAG), severity="low")
+    kwargs = _rejection_kwargs(tmp_path, rejected_verdict=refuting)
+
+    mod.run_census(**kwargs)
+
+    candidate = _rejected_candidate(kwargs)
+    assert candidate["disposition"] == "rejected"
+    assert candidate["finding_key"] == finding_key("orchestrator", _ROW5_ANCHOR, "h4")
+    assert candidate["finding_area"] == "orchestrator"
+    assert candidate["finding_anchor"] == _ROW5_ANCHOR
+    assert candidate["finding_tags"] == ["h4", verdict.KIND_TAG]
+    refuted = [row for row in _run_record(kwargs)["findings"] if row["verdict"] == "refuted"]
+    assert [row["id"] for row in refuted] == [candidate["id"]]
+    assert refuted[0]["severity"] == "low"
+
+
+def test_run_census_leaves_a_verdictless_rejection_unkeyed_and_unreported(tmp_path):
+    kwargs = _rejection_kwargs(tmp_path, rejected_verdict=None)
+
+    mod.run_census(**kwargs)
+
+    candidate = _rejected_candidate(kwargs)
+    assert candidate["disposition"] == "rejected"
+    assert not any(field in candidate for field in _ROW5_FIELDS)
+    assert [row["verdict"] for row in _run_record(kwargs)["findings"]] == ["confirmed"]
+
+
+_SIGHTED_OLD_RUN = "census-dark_factory-20260701"
+
+
+def _sighting_codebook() -> dict:
+    cb = _minimal_v2_codebook()
+    keyed = census_findings.stamped(
+        {
+            "id": "entry-keyed",
+            "title": "A keyed confusion",
+            "severity": "medium",
+            "status": "open",
+            "origin_phase": "implement",
+            "manifested_phase": "verify",
+            "sightings": [],
+        },
+        census_findings.FindingIdentity.mint("orchestrator", _ROW5_ANCHOR, ("h13", verdict.KIND_TAG)),
+    )
+    cb["entries"].append({**keyed, **census_findings.first_sighting_fields(_SIGHTED_OLD_RUN)})
+    cb["entries"].append(
+        {
+            "id": "entry-legacy",
+            "title": "A legacy confusion",
+            "severity": "low",
+            "status": "open",
+            "origin_phase": "implement",
+            "manifested_phase": "verify",
+            "sightings": [],
+        }
+    )
+    return cb
+
+
+def _sighting_kwargs(tmp_path, cb):
+    def response_fn(prompt, model):
+        if "re-sighted" in prompt:
+            return json.dumps(_record(matches=[{"entry_id": "entry-keyed"}, {"entry_id": "entry-legacy"}]))
+        return json.dumps(_record())
+
+    return _run_census_kwargs(
+        tmp_path,
+        codebook_dict=cb,
+        invoke=_make_fake_invoke(response_fn),
+        batch_source=[[_hand_digest("s2-re-sighted", "both confusions again")]],
+        verify_fn=_make_fake_verify_fn(),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        commit=_make_fake_commit(),
+    )
+
+
+def test_run_census_appends_the_run_to_every_sighted_entry(tmp_path):
+    _write_briefing(tmp_path)
+    cb = _sighting_codebook()
+    kwargs = _sighting_kwargs(tmp_path, cb)
+    run_id = kwargs["run_id"]
+
+    mod.run_census(**kwargs)
+
+    persisted = {entry["id"]: entry for entry in codebook.load(kwargs["codebook_path"])["entries"]}
+    assert persisted["entry-keyed"]["last_seen_runs"] == [_SIGHTED_OLD_RUN, run_id]
+    assert persisted["entry-legacy"]["last_seen_runs"] == [run_id]
+    assert persisted["entry-a"] == cb["entries"][0]
+
+    rows = _run_record(kwargs)["findings"]
+    assert [(row["id"], row["verdict"], row["first_seen"]) for row in rows] == [
+        ("entry-keyed", "unverified", _SIGHTED_OLD_RUN),
+    ]
+    assert "unverified" in _findings_of_report(kwargs)
+
+
+def _with_entry_severity(codebook_path, entry_id, severity) -> dict:
+    cb = codebook.load(codebook_path)
+    for entry in cb["entries"]:
+        if entry["id"] == entry_id:
+            entry["severity"] = severity
+    return cb
+
+
+def test_run_census_files_a_released_keyed_entry_with_its_severity_and_key(tmp_path):
+    first = _withheld_first_run(tmp_path)
+    entry_id = _withheld_entry_id(first)
+    entry = _persisted_entry(first["codebook_path"], _GATED_TITLE)
+    assert census_findings.FindingIdentity.from_record(entry) is not None
+    second = _recurrence_kwargs(
+        tmp_path, first, reply=_matches_reply,
+        codebook_dict=_with_entry_severity(first["codebook_path"], entry_id, "high"),
+    )
+
+    mod.run_census(**second)
+
+    [filed] = second["submit_fn"].calls
+    assert filed["priority"] == "high"
+    assert filed["metadata"]["x_finding_key"] == entry["finding_key"]
+    assert filed["metadata"]["x_finding_run"] == second["run_id"]
+
+
+def test_run_census_files_a_released_legacy_entry_without_a_key(tmp_path):
+    cb = _codebook_with_withheld_entry()
+    withheld = cb["entries"][1]
+    withheld["severity"] = "low"
+    withheld["sightings"] = [
+        {
+            "date": "2026-07-01",
+            "project": "dark_factory",
+            "session": "s0-earlier",
+            "origin_phase": "implement",
+            "manifested_phase": "verify",
+        }
+    ]
+
+    def response_fn(prompt, model):
+        if "recurrence" in prompt:
+            return json.dumps(_matches_reply("entry-withheld"))
+        return json.dumps(_record())
+
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        codebook_dict=cb,
+        invoke=_make_fake_invoke(response_fn),
+        batch_source=[[_hand_digest("s2-recurrence", "the same confusion again")]],
+        verify_fn=_make_fake_verify_fn(remediation=None),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        commit=_make_fake_commit(),
+    )
+
+    mod.run_census(**kwargs)
+
+    [filed] = kwargs["submit_fn"].calls
+    assert filed["priority"] == "low"
+    assert "x_finding_key" not in filed["metadata"]
+    assert filed["metadata"]["x_finding_run"] == kwargs["run_id"]
+
+
+def test_run_census_without_a_briefing_keys_everything_to_repo_and_says_so(tmp_path):
+    kwargs = _promotion_kwargs(tmp_path, verify_fn=_keyed_verify_fn())
+
+    mod.run_census(**kwargs)
+
+    assert _persisted_promoted_entry(kwargs)["finding_area"] == "repo"
+    assert finding_area.BRIEFING_RELPATH in _findings_of_report(kwargs)

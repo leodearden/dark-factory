@@ -19,7 +19,7 @@ import os
 import re
 import sys
 import tempfile
-from collections.abc import Collection
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,7 +31,14 @@ import yaml
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from legibility import invariants  # noqa: E402
+# Bind `shared` to this checkout, as coder.py::_SHARED_SRC does, so a worktree
+# run validates keys against its own shared.finding_key. No module-level
+# assignment precedes the imports below, so they need no E402 suppression.
+if (_SHARED_SRC := str(Path(__file__).resolve().parents[2] / "shared" / "src")) not in sys.path:
+    sys.path.insert(0, _SHARED_SRC)
+
+from legibility import finding_area, invariants
+from shared.finding_key import KEY_PATTERN, is_finding_key
 
 logger = logging.getLogger("legibility.codebook")
 
@@ -53,7 +60,7 @@ PHASES = [
     "unknown",
 ]
 
-STATUSES = ["open", "partially", "fixed", "retired", "mined-unverified"]
+STATUSES = ["open", "partially", "fixed", "retired", "mined-unverified", "accepted"]
 
 DISPOSITIONS = ["pending", "promoted", "rejected"]
 
@@ -107,6 +114,27 @@ _SIGHTING_SCHEMA = {
     "required": ["date", "project", "session", "origin_phase", "manifested_phase"],
 }
 
+# Contract run history and ticket fields (plans/census-incremental-prd.md C1;
+# docs/quality-findings-contract.md §1, §2, §8). The finding identity fields
+# are checked by finding_identity_errors, not by these schemas.
+_FINDING_KEY_SCHEMA = {"type": "string", "pattern": KEY_PATTERN}
+
+_RUN_ID_SCHEMA = {"type": "string", "minLength": 1}
+
+_FILED_TICKET_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "ticket": {"type": ["string", "null"]},
+        "project_root": {"type": "string"},
+        "run_id": _RUN_ID_SCHEMA,
+        "finding_key": _FINDING_KEY_SCHEMA,
+        "task_id": {"type": ["integer", "null"]},
+        "resolution": {"enum": ["created", "combined", "refused", "failed", "existing", None]},
+        "step": {"enum": ["key", "semantic", "curator"]},
+    },
+    "required": ["ticket", "project_root", "run_id", "finding_key", "task_id", "resolution", "step"],
+}
+
 _ENTRY_SCHEMA = {
     "type": "object",
     "properties": {
@@ -117,6 +145,13 @@ _ENTRY_SCHEMA = {
         "origin_phase": {"enum": PHASES},
         "manifested_phase": {"enum": PHASES},
         "sightings": {"type": "array", "items": _SIGHTING_SCHEMA},
+        "severity_reason": {"type": "string"},
+        "first_seen_run": _RUN_ID_SCHEMA,
+        "last_seen_runs": {"type": "array", "items": _RUN_ID_SCHEMA},
+        "supersedes": {"type": "array", "items": _FINDING_KEY_SCHEMA},
+        "filed_tickets": {"type": "array", "items": _FILED_TICKET_SCHEMA},
+        "fixed_at_sha": {"type": "string", "pattern": r"^[0-9a-f]{7,40}$"},
+        "accepted_by": {"type": "integer"},
     },
     "required": [
         "id",
@@ -137,6 +172,16 @@ _CANDIDATE_SCHEMA = {
         "first_seen": {"type": "string"},
         "disposition": {"enum": DISPOSITIONS},
         "sightings": {"type": "array", "items": _SIGHTING_SCHEMA},
+        "attached_by": {
+            "type": "object",
+            "properties": {
+                "method": {"enum": ["session", "title", "key", "similarity"]},
+                "score": {"type": "number"},
+                "run_id": _RUN_ID_SCHEMA,
+            },
+            "required": ["method", "run_id"],
+        },
+        "adjudicated_with": {"type": "string", "pattern": _CANDIDATE_ID_RE.pattern},
     },
     "required": ["id", "title", "first_seen", "disposition", "sightings"],
 }
@@ -231,6 +276,8 @@ def _type_matches(value, type_spec) -> bool:
         "object": lambda v: isinstance(v, dict),
         "array": lambda v: isinstance(v, list),
         "string": lambda v: isinstance(v, str),
+        "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+        "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
         "null": lambda v: v is None,
     }
     return any(checks[t](value) for t in types if t in checks)
@@ -239,7 +286,7 @@ def _type_matches(value, type_spec) -> bool:
 def _validate_node(instance, schema: dict, path: list[str]) -> list[str]:
     """Minimal recursive validator for the small JSON-Schema subset this
     module's schemas use (type/properties/required/items/enum/const/
-    minLength).
+    minLength/minItems/pattern).
 
     Not a general-purpose JSON-Schema implementation: the `jsonschema` PyPI
     package is NOT available in this module's actual verify environment
@@ -276,6 +323,16 @@ def _validate_node(instance, schema: dict, path: list[str]) -> list[str]:
         )
         return errors
 
+    pattern = schema.get("pattern")
+    if pattern is not None and isinstance(instance, str) and not re.search(pattern, instance):
+        errors.append(f"{loc}: {instance!r} does not match the pattern {pattern!r}")
+        return errors
+
+    min_items = schema.get("minItems")
+    if min_items is not None and isinstance(instance, list) and len(instance) < min_items:
+        errors.append(f"{loc}: {instance!r} has fewer than the required minItems {min_items}")
+        return errors
+
     if "properties" in schema and isinstance(instance, dict):
         for required in schema.get("required", []):
             if required not in instance:
@@ -295,16 +352,94 @@ def _schema_errors(instance: dict, schema: dict) -> list[str]:
     return _validate_node(instance, schema, [])
 
 
+FINDING_IDENTITY_FIELDS = ("finding_key", "finding_area", "finding_anchor", "finding_tags")
+
+
+@dataclass(frozen=True)
+class FindingIdentityError:
+    field: str
+    problem: str
+
+    def at(self, location: str) -> str:
+        return f"{location}/{self.field}: {self.problem}"
+
+
+def finding_identity_errors(record: Mapping[str, object]) -> list[FindingIdentityError]:
+    """The finding identity a codebook record carries (contract §1, §2):
+    either none of FINDING_IDENTITY_FIELDS, or all four, holding a §2 key, a
+    plain area key, a §1 anchor and a non-empty list of §1 tags.
+
+    The one statement of that invariant: validate() applies it to every
+    entry and candidate, and census_findings.FindingIdentity to itself.
+    """
+    # verdict owns the §1 anchor and tag vocabulary and imports this module.
+    from legibility import verdict
+
+    present = [field for field in FINDING_IDENTITY_FIELDS if field in record]
+    missing = [field for field in FINDING_IDENTITY_FIELDS if field not in record]
+    if not present:
+        return []
+    if missing:
+        return [
+            FindingIdentityError(
+                field,
+                f"is missing beside {', '.join(present)}: a finding identity is all four fields or none",
+            )
+            for field in missing
+        ]
+    checks: tuple[tuple[str, Callable[[object], bool], str], ...] = (
+        ("finding_key", is_finding_key, "a finding key fk-<12 hex>"),
+        (
+            "finding_area",
+            lambda value: isinstance(value, str) and re.fullmatch(finding_area.AREA_KEY_PATTERN, value) is not None,
+            "a plain area key",
+        ),
+        (
+            "finding_anchor",
+            lambda value: isinstance(value, str) and verdict.is_anchor(value),
+            "a contract §1 anchor: slug:<kebab> or a repo-relative path[::symbol] with no line pin",
+        ),
+        (
+            "finding_tags",
+            lambda value: isinstance(value, (list, tuple))
+            and bool(value)
+            and all(isinstance(tag, str) and verdict.is_finding_tag(tag) for tag in value),
+            "a non-empty list of contract §1 tags",
+        ),
+    )
+    return [
+        FindingIdentityError(field, f"{record[field]!r} is not {expected}")
+        for field, holds, expected in checks
+        if not holds(record[field])
+    ]
+
+
+def _finding_identity_errors_at(records: object, path: str) -> list[str]:
+    if not isinstance(records, list):
+        return []
+    return [
+        error.at(f"{path}/{index}")
+        for index, record in enumerate(records)
+        if isinstance(record, dict)
+        for error in finding_identity_errors(record)
+    ]
+
+
 def validate(codebook: dict) -> list[str]:
     """Structural + semantic validation of a v2 codebook.
 
     Returns a list of human-readable error strings; an empty list means the
     codebook is valid. Strict on v2-relevant fields (version, entry
     id/title/severity/status, origin_phase/manifested_phase enums, sighting
-    shape, candidate id regex + disposition); permissive on v1 free-form
-    fields (validate() never rejects on their presence, absence, or type).
+    shape, candidate id regex + disposition, the optional C1 finding fields,
+    finding_identity_errors, accepted ⇒ accepted_by); permissive on v1
+    free-form fields (validate() never rejects on their presence, absence,
+    or type).
     """
     errors = _schema_errors(codebook, V2_SCHEMA)
+    if isinstance(codebook, dict):
+        errors.extend(_finding_identity_errors_at(codebook.get("entries"), "entries"))
+        errors.extend(_finding_identity_errors_at(codebook.get("candidates"), "candidates"))
 
     entries = codebook.get("entries", []) if isinstance(codebook, dict) else []
     if isinstance(entries, list):
@@ -319,6 +454,8 @@ def validate(codebook: dict) -> list[str]:
                 errors.append(f"duplicate entry id: {entry_id!r}")
             else:
                 seen_ids.add(entry_id)
+            if entry.get("status") == "accepted" and "accepted_by" not in entry:
+                errors.append(f"entry {entry_id!r}: status 'accepted' requires accepted_by (contract §7)")
 
     candidates = codebook.get("candidates", []) if isinstance(codebook, dict) else []
     if isinstance(candidates, list):
