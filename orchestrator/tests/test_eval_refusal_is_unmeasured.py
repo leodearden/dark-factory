@@ -65,10 +65,20 @@ async def _plan_judge(monkeypatch: pytest.MonkeyPatch) -> object:
     return await judge.judge_plan_quality(plan, 'diff', {'id': 't'})
 
 
+async def _pairwise_judge(monkeypatch: pytest.MonkeyPatch) -> object:
+    monkeypatch.setattr(judge, 'invoke_agent', _refuse)
+    verdict = await judge.run_judge(
+        {'config_name': 'A', 'diff': 'diff A'}, {'config_name': 'B', 'diff': 'diff B'},
+        {'id': 't', 'pre_task_commit': 'BASE'},
+    )
+    return verdict.unmeasured
+
+
 # A new scoring site → add a ROW.
 _SITES = [
     pytest.param(_matcher, MeasurementStage.MATCHER, id='matcher'),
     pytest.param(_plan_judge, MeasurementStage.JUDGE, id='plan-judge'),
+    pytest.param(_pairwise_judge, MeasurementStage.PAIRWISE_JUDGE, id='pairwise-judge'),
 ]
 
 

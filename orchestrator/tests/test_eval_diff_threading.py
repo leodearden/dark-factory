@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from shared.cli_invoke import AgentResult
 
 from orchestrator.evals.compare import _assess_task
 from orchestrator.evals.judge import run_judge
@@ -39,12 +40,14 @@ def test_run_judge_threads_pre_task_commit(
         recorded.append((worktree_path, base_commit))
         return 'SENTINEL'
 
-    async def fake_invoke_agent(**kwargs: object) -> SimpleNamespace:
-        return SimpleNamespace(
+    async def fake_invoke_agent(**kwargs: object) -> AgentResult:
+        return AgentResult(
+            success=True,
             structured_output={
                 'winner': 'A', 'confidence': 0.9, 'reasoning': 'r',
             },
             output='{"winner": "A", "confidence": 0.9, "reasoning": "r"}',
+            cost_usd=0.0,
         )
 
     monkeypatch.setattr('orchestrator.evals.judge.get_diff', rec)
