@@ -420,7 +420,8 @@ def code_digest(
     via codebook.validate_coding_record.
 
     Never-fabricate contract: unparseable/malformed digest frontmatter, an
-    invocation error, a usage/auth CAP, unparseable LLM output, or a
+    invocation error, a usage/auth CAP, unparseable LLM output, a reply
+    missing a key build_prompt prescribes, or a
     schema-invalid assembled record all come back as ``ok=False`` with
     ``record=None`` and ``reason`` set — never partially applied, never
     fabricated. The cap case additionally sets ``capped=True``: it is the
@@ -499,12 +500,22 @@ def code_digest(
             )
         return CodingResult(ok=False, record=None, reason=str(exc), session=session)
 
+    missing = [key for key in _PRESCRIBED_REPLY if key not in judgment]
+    if missing:
+        return CodingResult(
+            ok=False, record=None, session=session,
+            reason=(
+                f"coder reply lacks the prescribed key(s) {missing}; "
+                f"it carried {sorted(judgment)}"
+            ),
+        )
+
     record = {
         "session": session,
         "date": meta.get("date"),
         "project": project,
         "agent_class": meta.get("agent_class"),
-        **{key: judgment.get(key) or [] for key in _PRESCRIBED_REPLY},
+        **{key: judgment[key] for key in _PRESCRIBED_REPLY},
     }
 
     errors = codebook_mod.validate_coding_record(record)
