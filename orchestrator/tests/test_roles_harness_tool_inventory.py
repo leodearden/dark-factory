@@ -17,27 +17,30 @@ prohibition.
 
 WHAT IS SCANNED -- two surfaces, and BOTH are required.
   (a) every role's `system_prompt` in `ROLES`;
-  (b) every module-level `str` constant in `roles.py` whose NAME matches
-      `_?[A-Z][A-Z0-9_]*`, reached by introspection over `vars(roles)`.
+  (b) every module-level `str` constant in `roles.py` and
+      `harness_guidance.py` (`_PROMPT_MODULES`) whose NAME matches
+      `_?[A-Z][A-Z0-9_]*`, reached by introspection over each module's `vars()`.
 Surface (a) alone is a false green, measured: `WAIT_PATTERN_REMINDER`
 carried `BashOutput` and appears in NO role system_prompt -- `briefing.py`
 interpolates it into `build_amender_prompt` only -- so a system-prompt-only
 scan reports green while the defect survives at the exact failure site the
 reminder exists to cover. The optional leading underscore in the constant
-pattern is required too: roles.py holds a family of PRIVATE prompt constants
+pattern is required too: the two modules hold a family of PRIVATE prompt constants
 (`_GREP_ENGINE_LIMITS`, `_TOOL_CALL_REJECTION_KNOWN_SHAPES`,
 `_SCOPE_BOUNDARY_FACTS`, `_MEMORY_INSTRUCTIONS`, the `_REVIEWER_*_TEMPLATE`s)
 that a pattern anchored at `[A-Z]` would skip. Introspection rather than a
-hand-listed import set means a prompt constant added later is covered the day
-it is added, with no second place to remember.
+hand-listed import set means a prompt constant added later to a listed module
+is covered the day it is added, with no second place to remember;
+`test_scan_reaches_the_turn_prompt_only_constant` fails if the witness's home
+module drops out of `_PROMPT_MODULES`.
 
 COMMENTS ARE NOT SCANNED, and that is deliberate rather than an accepted
-gap. roles.py's `_GREP_ENGINE_LIMITS` comment cites `BashOutput` CORRECTLY,
-as the cautionary precedent for naming a tool that is not there (task 5331).
-A scan over roles.py's source TEXT would fail on that correct comment and
-pressure a future editor into deleting the citation -- the guard would attack
-the documentation of the very defect it polices. Scanning constant VALUES
-gets the comment/prompt distinction right for free, with no exclusion list.
+gap. A comment may correctly name a phantom tool, as the cautionary precedent
+for naming a tool that is not there. A scan over source TEXT would fail on
+that correct comment and pressure a future editor into deleting the citation
+-- the guard would attack the documentation of the very defect it polices.
+Scanning constant VALUES gets the comment/prompt distinction right for free,
+with no exclusion list.
 
 THE MAINTENANCE CONTRACT. `HARNESS_TOOLS` is hand-maintained from live
 measurement; extend it when a prompt legitimately names a newly-shipped tool,
@@ -62,8 +65,9 @@ file path, and `ToolSearch` as the way to discover the current termination
 tool. The hole has little left to bite on.
 
 WHAT THIS DOES NOT COVER, deliberately:
-  * prompt text assembled outside roles.py -- `briefing.py`'s f-strings, the
-    `skills/` sources -- since the scan reads roles.py's own constants;
+  * prompt text assembled outside those two modules -- `briefing.py`'s
+    f-strings, the `skills/` sources -- since the scan reads only their
+    module-level constants;
   * comments, per the paragraph above;
   * a tool named in PLAIN PROSE. Only backtick spans are scanned, so "poll it
     with BashOutput" escapes. Dropping the backtick requirement is not the fix
@@ -71,8 +75,8 @@ WHAT THIS DOES NOT COVER, deliberately:
     KNOWN HOLE above is not the only hole, and reading it as exhaustive is
     what would let this one through unnoticed;
   * tool GRANTS. Unlike its MCP sibling this guard asserts EXISTENCE only,
-    and the reason is measured and recorded in roles.py's own TOOL
-    AVAILABILITY comment: `--allowed-tools` is a PERMISSION allowlist, not a
+    and the reason is measured and recorded in the MEASURED REACHABLE comment
+    below: `--allowed-tools` is a PERMISSION allowlist, not a
     tool-registry filter, so built-ins stay present and callable whether or
     not a role lists them. An MCP tool missing from `allowed_tools` really is
     a permission denial, which is why the sibling checks grants; a built-in
@@ -142,13 +146,14 @@ HARNESS_TOOLS = frozenset({
 })
 
 # THE SINGLE HOME OF THE TOOL-REGISTRY MEASUREMENT.  The query, its dates and
-# the census figure live HERE and are cited from everywhere else -- roles.py's
-# retraction, this module's docstring, `_failure_message`, cli_invoke.py's
+# the census figure live HERE and are cited from everywhere else -- this
+# module's docstring, `_failure_message`, cli_invoke.py's
 # `_BACKGROUND_REAP_TOOLS`, test_cli_invoke_background.py.  An earlier revision
 # hand-copied them to six sites and two had already drifted apart in shape, the
-# same failure roles.py records for its size figures ("Prose copies do not move
-# when the string they describe does").  Do NOT restate a date, the query or the
-# census figure elsewhere -- cite this comment instead.
+# same failure test_roles_wait_pattern.py's docstring records for its size
+# figures: a prose copy does not move when the string it describes does.  Do
+# NOT restate a date, the query or the census figure elsewhere -- cite this
+# comment instead.
 #
 # THE QUERY, from a live dispatched session:
 #     ToolSearch("select:BashOutput,KillShell,KillBash,TaskOutput,TaskStop,Monitor")
@@ -175,6 +180,15 @@ MEASURED_ABSENT_TOOLS = frozenset({
     'KillShell',
     'TaskOutput',
 })
+
+# MEASURED REACHABLE, 2026-08-05 -- why this guard checks existence, never
+# grants.  A dispatched implementer whose cmdline was exactly
+# `--allowed-tools Read Edit Write Bash Glob Grep mcp__...` had `ToolSearch` and
+# `ScheduleWakeup` live in its tool list, and a `ToolSearch` select query
+# returned deferred tools' schemas.  So `--allowed-tools` is a PERMISSION
+# allowlist, not a registry filter: a built-in stays callable whether or not a
+# role lists it.  Never trim a built-in from a prompt because a role's
+# allowed_tools omits it.
 
 # Backticked CamelCase words the prompts legitimately use that name no tool.
 # Because the scan takes the LEADING identifier of a span (below), this holds
@@ -252,7 +266,7 @@ def _failure_message(where: str, unknown: list[str]) -> str:
             'reachable next step and will improvise a forbidden poll loop. Name a tool '
             'that exists, and do NOT reach for another poll-tool name: what agents are '
             'told to do instead is stated once, in '
-            'orchestrator/src/orchestrator/agents/roles.py::WAIT_PATTERN_GUIDANCE.',
+            'orchestrator/src/orchestrator/agents/harness_guidance.py::WAIT_PATTERN_GUIDANCE.',
         )
     if unrecognised:
         lines.append(
@@ -326,7 +340,7 @@ def test_role_prompt_names_no_phantom_harness_tool(role_key: str) -> None:
 
 @pytest.mark.parametrize('const_name', [name for name, _ in _prompt_constants()])
 def test_prompt_constant_names_no_phantom_harness_tool(const_name: str) -> None:
-    """Same invariant over roles.py's prompt constants, spliced or not.
+    """Same invariant over the scanned modules' prompt constants, spliced or not.
 
     The surface that catches what the system_prompt scan cannot:
     WAIT_PATTERN_REMINDER reaches an agent only through briefing.py's

@@ -26,6 +26,14 @@ named `MISSING_REQUIRED_PARAMETER_REJECTION` and composes into
 `TOOL_CALL_REJECTION_GUIDANCE` alongside the original two-shape text above;
 this module now anchors two census findings under one splice unit.
 
+No shape bullet is redundant with a neighbour. The syntax bullet and the
+invented-parameter bullet prescribe opposite fixes: re-emit the call from
+scratch, versus consult the schema rather than re-emit.
+`WAIT_PATTERN_GUIDANCE`'s `Monitor` bullet names the invented-parameter shape
+for one deferred tool only. `judge` is in the carrier set deliberately, not by
+default: it holds `Read` on a tight turn budget, so it can hit the rejection
+and cannot spare the turn a misread costs.
+
 Its real effect is on model behaviour and is not unit-testable, but silent
 removal during a prompt refactor is a genuine regression — the repo
 sanctions exactly this kind of "mandated token present in each role prompt"
