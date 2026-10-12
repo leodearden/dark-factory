@@ -237,6 +237,97 @@ deleted past 30 days, then oldest-first until the tree is under 500MB
 (`verify.py::_prune_archive`). `flaky-ledger.jsonl` sits one level up, in
 `data/verify-logs/` itself, and is deliberately outside that sweep.
 
+### Reading a task-verify admission wait
+
+Before a gated verify leg (role `task`, a task's own verify, or role
+`background`, the main-tip sweep and the review checkpoint) takes its
+cross-process flock slot in `shared.verify_admission`, it queues in an
+in-process admission gate (`orchestrator/src/orchestrator/verify_admission_gate.py`).
+The gate decides whose turn it is. The flock stays behind it as the
+cross-process safety net. Merge verifies are ungated and touch neither. Design
+and contract: `plans/verify-admission-fifo-prd.md`.
+
+**The knobs.** All three are green-tier through `reload_config`:
+
+| Knob | Default | Meaning |
+|------|---------|---------|
+| `verify_admission_order` | `unordered` | `unordered`: the turn goes to a random waiter, as the flock's poll race did before the gate. `arrival`: the lowest (role class, plan arrival, leg sequence), so task legs go before background legs. A verify call's legs, retries included, share one arrival stamp. |
+| `verify_admission_background_promote_secs` | `7200` | A background waiter queued this long ranks with the task class but keeps its original arrival: it never overtakes a task that arrived before it, and later tasks stop overtaking it. |
+| `verify_admission_wait_alarm_secs` | `43200` | The waiter age that raises `verify_admission_wait_aged`. |
+
+The order and the slot count (`verify_admission_task_slots`) apply from the
+next grant, the promotion age from the next ranking, and the alarm age from the
+next watch tick.
+
+**The events.** They are written to `<project_root>/data/orchestrator/runs.db`,
+table `events`, keyed by `event_type`, with the payload as JSON in `data`. The
+authoritative payload shapes are the comments on these `EventType` members in
+`orchestrator/src/orchestrator/event_store.py`:
+
+- `verify_admission_plan`: one row per gated verify call that returned. A call
+  that raised or was cancelled writes none. `task_id` and `role` are also
+  columns. Payload: `plan_id`, `task_id`, `role`, `order`, `plan_arrival_at`,
+  `completed_at`, and `legs`, one per admitted test leg (retries and
+  env-recovery re-runs included), each with `module`, `scope_kind`, `order`,
+  `arrived_at`, `granted_at`, `waited_secs` (time queued in the gate),
+  `depth_at_arrival`, `slot_held`, `held_secs` (time holding the turn), `rc`
+  and `timed_out`.
+- `verify_admission_heartbeat`: written by the harness `verify-admission-watch`
+  service every 300s, and only while a waiter is queued. Payload: `depth`,
+  `oldest_wait_secs`, `oldest` {`task_id`, `module`, `role`, `plan_id`},
+  `holders` [{`task_id`, `module`, `role`, `held_secs`}] and `order`.
+- `verify_admission_wait_aged`: written by the same watch when the oldest
+  waiter past the alarm age first appears, and again only when that waiter
+  changes. Payload: `waiter` {`task_id`, `module`, `role`, `plan_id`,
+  `wait_secs`}, `aged_count`, `alarm_secs`. It only reports the age; nothing
+  times a wait out.
+
+**Reading a task stuck in `phase=verify`.** Start with the latest heartbeats:
+
+```bash
+sqlite3 data/orchestrator/runs.db <<'SQL'
+SELECT timestamp,
+       json_extract(data, '$.depth')                              AS depth,
+       json_extract(data, '$.oldest.task_id')                     AS oldest_task,
+       round(json_extract(data, '$.oldest_wait_secs') / 3600, 1)  AS oldest_h,
+       json_extract(data, '$.holders')                            AS holders,
+       json_extract(data, '$.order')                              AS "order"
+FROM events
+WHERE event_type = 'verify_admission_heartbeat'
+ORDER BY id DESC LIMIT 5;
+SQL
+```
+
+- `depth` is how many legs are queued, `oldest` is the longest waiter, and
+  `holders` shows who has the turns now and for how long. A task listed among
+  the holders is running, not waiting. On a running orchestrator, no heartbeat
+  newer than about 300s means nothing is queued.
+- `verify_admission_wait_aged` names the oldest waiter that has passed the
+  alarm age.
+- After the verify returns, its `verify_admission_plan` legs show each leg's
+  `waited_secs` and `held_secs`. `slot_held = false` means the flock failed
+  open, so that leg ran without cross-process gating. `order` records which
+  ordering admitted it:
+
+```bash
+sqlite3 data/orchestrator/runs.db <<'SQL'
+SELECT e.timestamp,
+       json_extract(leg.value, '$.module')       AS module,
+       json_extract(leg.value, '$.waited_secs')  AS waited_secs,
+       json_extract(leg.value, '$.held_secs')    AS held_secs,
+       json_extract(leg.value, '$.slot_held')    AS slot_held,
+       json_extract(leg.value, '$.order')        AS "order"
+FROM events AS e, json_each(e.data, '$.legs') AS leg
+WHERE e.event_type = 'verify_admission_plan' AND e.task_id = '<task_id>'
+ORDER BY e.id DESC;
+SQL
+```
+
+**Measuring the ordering.** Split the rows by each event's `order` field, never
+by date: a reload can flip the order at any moment, and a plan whose legs ran
+under both orders records `order` as null. Arrival order targets the tail of
+the wait (p90 and max), not the mean wait or the throughput.
+
 ### Reading the merge-lane throughput baseline
 
 ```bash
