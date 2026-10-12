@@ -90,22 +90,15 @@ class TestFactReferents:
             "Ruling 6164's HALF 2 was described in task 6164.", GRAPH
         ) == frozenset({_task('6164')})
 
-    def test_the_hyphen_spelling_is_a_documented_blind_spot(self) -> None:
-        """'task-1836' is NOT seen, and this script may not patch around it.
-
-        ``canonical_labels._LOCAL_MENTION_PATTERN`` requires whitespace, '#'
-        or ':' as the separator, so the hyphen spelling is invisible by
-        design. Widening it is an edit to canonical_labels at its single
-        site — which would also change the LIVE write-time guard's behaviour
-        — and is out of scope here. The detector absorbs the recall loss
-        through ``bare_id_present`` instead (see TestBareIdPresent), which
-        mints no referent and can only SUPPRESS a flag.
-        """
+    def test_the_hyphen_spelling_is_seen(self) -> None:
+        """'task-1836' is seen: the shared scanner learned the slug spelling
+        in task 6059. ``bare_id_present`` remains the backstop for the bare
+        hash '#4262' (see TestBareIdPresent)."""
         assert fact_referents(
             'Task 1841 found the real SIGHUP bug that '
             "task-1836's timeout widening had masked.",
             GRAPH,
-        ) == frozenset({_task('1841')})
+        ) == frozenset({_task('1841'), _task('1836')})
 
     def test_a_fact_naming_no_task_yields_nothing(self) -> None:
         assert (
