@@ -937,6 +937,35 @@ class EventType(StrEnum):
     # verdict='violation' rows with mode='log' before flipping enforce on.
     workflow_exit_contract = 'workflow_exit_contract'
 
+    # Task-verify admission gate (task 5628; plans/verify-admission-fifo-prd.md).
+    # Every payload carries `order`, so before/after a policy flip is read from
+    # the rows themselves, never from dates. Wall-clock ISO times only.
+    #
+    # verify_admission_plan — one row per gated verify plan that returned
+    #   (verify.py::run_scoped_verification / run_full_verification); a plan
+    #   that raised or was cancelled emits none. task_id and role are also
+    #   first-class columns; phase 'verify'. Payload:
+    #   {plan_id, task_id, role,
+    #    order,             # the legs' common order; null if a reload changed it mid-plan
+    #    plan_arrival_at, completed_at,
+    #    legs: [{plan_id, module, scope_kind, order, arrived_at, granted_at,
+    #            waited_secs, depth_at_arrival,
+    #            slot_held,     # false = the flock failed open; the leg was not cross-process gated
+    #            held_secs, rc, timed_out}]}
+    verify_admission_plan = 'verify_admission_plan'
+    # verify_admission_heartbeat — from the harness watch
+    #   (verify_admission_watch.py::AdmissionWatch), once per tick and only
+    #   while any waiter is queued. Payload:
+    #   {depth, oldest_wait_secs, oldest: {task_id, module, role, plan_id},
+    #    holders: [{task_id, module, role, held_secs}], order}
+    verify_admission_heartbeat = 'verify_admission_heartbeat'
+    # verify_admission_wait_aged — from the same watch, when the oldest waiter
+    #   past the alarm age first appears, and again only when that waiter's
+    #   identity changes: one fact per change, never one per waiter per tick
+    #   (INV-4). Age surfacing only; nothing times out. Payload:
+    #   {waiter: {task_id, module, role, plan_id, wait_secs}, aged_count, alarm_secs}
+    verify_admission_wait_aged = 'verify_admission_wait_aged'
+
 
 class _MergeFinalizedKey(Enum):
     """The field a merge_finalized read matches on; each value is its fixed SQL predicate."""

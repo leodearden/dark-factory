@@ -4082,6 +4082,11 @@ class CheckRun:
     # off, a lint/type leg, or an ungated role such as merge), never 0.0.
     # LAST field, for the rule ``segments`` and ``load`` state above.
     slot_wait_secs: 'float | None' = None
+    # The admission turn this check's slot wait ended in (task 5628): the
+    # gate grant's ``AdmissionGrant.to_dict()`` plus ``held_secs``. ``None``
+    # when it competed for no slot, on the terms ``slot_wait_secs`` states.
+    # JSON-native for the reason stated on ``load``. LAST field, as above.
+    admission: 'dict | None' = None
 
     @classmethod
     def skipped(cls, label: str) -> 'CheckRun':
@@ -4099,9 +4104,9 @@ class CheckRun:
     def to_dict(self) -> dict:
         """Serialise to the runs-dict schema consumed by ``_persist_attempt_logs``/
         ``_build_summary_payload``/``_verify_duration_secs``/``_archive_merge_verify_logs``
-        (all take ``list[dict]``) — the exact 10-key shape (label/cmd/rc/output/
-        timed_out/started_at/duration_secs/segments/load/slot_wait_secs), 7 of
-        which were previously hand-built inline in ``run_verification``.
+        (all take ``list[dict]``) — the exact 11-key shape (label/cmd/rc/output/
+        timed_out/started_at/duration_secs/segments/load/slot_wait_secs/admission),
+        7 of which were previously hand-built inline in ``run_verification``.
 
         ``started_at`` is normalised via ``or ''``: a skipped check's
         ``None`` serialises as ``''``, matching the pre-refactor
@@ -4120,8 +4125,9 @@ class CheckRun:
         historical ones, and "absent" vs "null" is the distinction that tells
         it whether a run predates load stamping or merely went unstamped.
 
-        ``slot_wait_secs`` (task 5671) is emitted unconditionally too: absent
-        means the run predates it, ``None`` means it queued for no slot.
+        ``slot_wait_secs`` (task 5671) and ``admission`` (task 5628) are
+        emitted unconditionally too: absent means the run predates them,
+        ``None`` means it queued for no slot.
         """
         return {
             'label': self.label,
@@ -4134,6 +4140,7 @@ class CheckRun:
             'segments': self.segments,
             'load': self.load,
             'slot_wait_secs': self.slot_wait_secs,
+            'admission': self.admission,
         }
 
 
@@ -4376,6 +4383,12 @@ class VerifyResult:
     # compare=False a failing CLI verify that produced an `unconfirmable` observation
     # would break test_cli test_verify_merge_cli_wrapper_transparency.
     flake_suppression: FlakeSuppression | None = field(default=None, compare=False)
+    # Task 5628: one record per gated test-leg admission, retries and the
+    # env-recovery rerun included — each a test CheckRun's ``admission`` plus
+    # its ``rc`` and ``timed_out``. None = no gated leg ran. JSON-native for the
+    # generic codec; compare=False because the stamps are wall clock, as for
+    # ``duration_secs``.
+    admission_legs: list[dict] | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         mismatch = _module_attribution_mismatch(
@@ -7710,6 +7723,7 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         skipped_test_ids=skipped_test_ids,
         failing_test_ids_by_module=failing_test_ids_by_module,
         failing_leg_categories=failing_leg_categories,
+        admission_legs=[leg for r in results for leg in (r.admission_legs or ())] or None,
     )
 
 
