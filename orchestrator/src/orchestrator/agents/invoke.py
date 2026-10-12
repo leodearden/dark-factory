@@ -37,6 +37,8 @@ from shared.cli_invoke import (  # noqa: F401
 # Process-group termination helper for subprocess tree cleanup
 from shared.proc_group import terminate_process_group
 
+from orchestrator.agents.sandbox_git_config import sandbox_git_config_env
+
 # MCP startup-timeout injection (bounded drop-on-fail for all projects)
 from orchestrator.mcp_lifecycle import apply_mcp_startup_env
 
@@ -259,8 +261,13 @@ async def _invoke_claude_with_sandbox(
     # drop-on-fail; reify esc-4415-232).  BASH_CWD_RESET_ENV_VAR: the Bash cwd
     # reset described at its definition above.  Both sub-paths below consume
     # env_overrides, so this single transform is project-agnostic and cannot
-    # miss a dispatch site.  setdefault lets explicit caller values win.
+    # miss a dispatch site.  setdefault lets explicit caller values win.  A
+    # requested sandbox also appends sandbox_git_config_env (rerere off).
     env_overrides = apply_bash_cwd_reset_env(apply_mcp_startup_env(env_overrides))
+    if sandbox_modules is not None:
+        env_overrides = {
+            **env_overrides, **sandbox_git_config_env({**os.environ, **env_overrides}),
+        }
 
     # For sandboxed invocations we need to build the command ourselves
     # and use the lower-level shared primitives
@@ -424,6 +431,8 @@ async def _invoke_codex(
 
         # Strip OPENAI_API_KEY if using OAuth
         env = dict(os.environ)
+        if sandbox_modules is not None:
+            env.update(sandbox_git_config_env(env))
 
         result = await _run_subprocess_local(
             cmd, cwd, env, 'codex', model, max_budget_usd, timeout_seconds,
@@ -603,6 +612,8 @@ async def _invoke_gemini(
             cmd = wrap_command(cmd, cwd, sandbox_modules, writable_extras=sandbox_extras)
 
         env = dict(os.environ)
+        if sandbox_modules is not None:
+            env.update(sandbox_git_config_env(env))
 
         result = await _run_subprocess_local(cmd, cwd, env, 'gemini', model, max_budget_usd, timeout_seconds)
         return _parse_gemini_output(result, model, prices)
@@ -1072,6 +1083,8 @@ async def _invoke_pi(
             env['ANTHROPIC_OAUTH_TOKEN'] = oauth_token
         if env_overrides:
             env.update(env_overrides)
+        if sandbox_modules is not None:
+            env.update(sandbox_git_config_env(env))
 
         result = await _run_subprocess_local(cmd, cwd, env, 'pi', model, max_budget_usd, timeout_seconds)
         return _parse_pi_output(result, model, prices)
