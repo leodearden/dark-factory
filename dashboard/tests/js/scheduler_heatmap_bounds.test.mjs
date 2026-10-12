@@ -38,13 +38,14 @@ import bounds from '../../src/dashboard/static/redux/scheduler_heatmap_bounds.js
 const {
   boundHeatmapAxes,
   rowTouchesModule,
+  describeHeatmapCap,
   MAX_HEATMAP_ROWS,
   MAX_HEATMAP_COLS,
   MAX_RESCUED_COLS,
 } = bounds;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/scheduler_heatmap_bounds.js';
-const EXPECTED_FUNCTION_NAMES = ['boundHeatmapAxes', 'rowTouchesModule'];
+const EXPECTED_FUNCTION_NAMES = ['boundHeatmapAxes', 'rowTouchesModule', 'describeHeatmapCap'];
 const EXPECTED_CAP_NAMES = ['MAX_HEATMAP_ROWS', 'MAX_HEATMAP_COLS', 'MAX_RESCUED_COLS'];
 const EXPECTED_EXPORT_NAMES = [...EXPECTED_FUNCTION_NAMES, ...EXPECTED_CAP_NAMES];
 
@@ -822,4 +823,72 @@ test('BOUND: on a live-shaped snapshot every rescued column has a rendered row t
       `rescued column ${module.path} renders blank`,
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// CAPTION — what a truncated grid tells the user it is not showing
+// ---------------------------------------------------------------------------
+//
+// 'the rendered columns stay in server order: the contended head, then the
+// rescued tail' (above) is what makes 'the N most contended' and 'then' true;
+// these tests pin the copy against the counts the selection reports.
+
+const STRANDED_SUFFIX = 'stranded (dead park owner or departed holder)';
+
+test('describeHeatmapCap is null when neither axis was truncated', () => {
+  const out = boundHeatmapAxes({
+    rows: [makeRow('T-1', ['src/a/hot.py'])],
+    modules: COLUMN_FIXTURE.slice(0, 2),
+  });
+
+  assert.equal(describeHeatmapCap(out), null);
+});
+
+test('with no rescued columns the caption keeps its most-contended claim', () => {
+  realisticFixture = realisticFixture
+    || makeFixture({ nRows: LIVE_ROWS, nModules: LIVE_MODULES, dense: false });
+  const out = boundHeatmapAxes(realisticFixture);
+
+  assert.equal(out.modulesRescued, 0);
+  assert.equal(
+    describeHeatmapCap(out),
+    `Showing ${out.rows.length} of ${LIVE_ROWS} tasks and the ${MAX_HEATMAP_COLS} ` +
+      `most contended of ${LIVE_MODULES} modules.`,
+  );
+});
+
+test('with rescued columns the superlative covers the head only, and the stranded tail is named', () => {
+  realisticFixture = realisticFixture
+    || makeFixture({ nRows: LIVE_ROWS, nModules: LIVE_MODULES, dense: false });
+  const out = boundHeatmapAxes({ rows: realisticFixture.rows, modules: getLiveShapedModules() });
+
+  assert.equal(
+    describeHeatmapCap(out),
+    `Showing ${out.rows.length} of ${out.rowsTotal} tasks and the ${MAX_HEATMAP_COLS - 2} ` +
+      `most contended of ${out.modulesTotal} modules, then 2 ${STRANDED_SUFFIX}.`,
+  );
+});
+
+test('with no contended columns at all the caption does not claim a contention ranking', () => {
+  // A state the component really renders: it falls back to the empty state
+  // only when rows OR columns are empty, and here both have one entry.
+  const out = boundHeatmapAxes({
+    modules: [
+      makeModule('src/a/a.py', 1),
+      makeModule('src/b/b.py', 0),
+      strandedPark('src/e/stranded.py'),
+    ],
+    rows: [makeRow('T-dead', ['src/e/stranded.py'], {
+      park_state: { modules: ['src/e/stranded.py'] },
+      stranded: true,
+    })],
+  });
+
+  assert.equal(out.rows.length, 1);
+  assert.equal(out.modules.length, 1);
+  assert.equal(out.modulesTruncated, true);
+  assert.equal(
+    describeHeatmapCap(out),
+    `Showing 1 of 1 tasks and 1 of 3 modules, all ${STRANDED_SUFFIX}.`,
+  );
 });
