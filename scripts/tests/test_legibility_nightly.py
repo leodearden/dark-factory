@@ -658,8 +658,9 @@ def test_build_digests_isolates_extractor_crash(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# step-7/8: git helpers (_git_status_changed, _git_commit_docs_only) --
-# against a REAL tmp `git init` repo, plus a fake-runner ref-lock retry test.
+# step-7/8: _git_status_changed, nightly's did-the-dump-change gate, against a
+# REAL tmp `git init` repo. The commit itself is unlanded.commit_only, tested
+# in scripts/tests/test_legibility_unlanded.py.
 # ---------------------------------------------------------------------------
 
 _CODEBOOK_RELPATH = Path('docs') / 'legibility' / 'confusion-codebook.yaml'
@@ -689,95 +690,6 @@ def test_git_status_changed_detects_dirty_codebook(tmp_path):
     )
 
     assert nightly._git_status_changed(repo, _CODEBOOK_RELPATH) is True
-
-
-def test_git_commit_docs_only_commits_only_that_path(tmp_path):
-    repo = _init_repo(tmp_path)
-    (repo / _CODEBOOK_RELPATH).write_text(
-        'version: 2\nentries: []\ncandidates: []\n', encoding='utf-8',
-    )
-    (repo / 'scratch.txt').write_text('unrelated wip\n', encoding='utf-8')
-
-    result = nightly._git_commit_docs_only(repo, [_CODEBOOK_RELPATH], 'legibility: nightly sightings')
-
-    assert result.ok is True
-    assert result.sha
-
-    status = subprocess.run(
-        ['git', 'status', '--porcelain'], cwd=repo, check=True, capture_output=True, text=True,
-    ).stdout
-    assert 'scratch.txt' in status
-    assert 'confusion-codebook.yaml' not in status
-
-    shown = subprocess.run(
-        ['git', 'show', '--stat', '--format=', 'HEAD'],
-        cwd=repo, check=True, capture_output=True, text=True,
-    ).stdout
-    assert 'confusion-codebook.yaml' in shown
-    assert 'scratch.txt' not in shown
-
-
-def test_git_commit_docs_only_noop_returns_not_ok(tmp_path):
-    repo = _init_repo(tmp_path)
-
-    result = nightly._git_commit_docs_only(repo, [_CODEBOOK_RELPATH], 'legibility: no-op')
-
-    assert result.ok is False
-
-
-def test_git_commit_docs_only_retries_on_ref_lock_then_succeeds(tmp_path):
-    calls = {'commit_attempts': 0}
-
-    def fake_runner(args, **kwargs):
-        if 'commit' in args:
-            calls['commit_attempts'] += 1
-            if calls['commit_attempts'] < 3:
-                return subprocess.CompletedProcess(args, 1, stdout='', stderr='fatal: cannot lock ref ...')
-            return subprocess.CompletedProcess(args, 0, stdout='', stderr='')
-        if 'rev-parse' in args:
-            return subprocess.CompletedProcess(args, 0, stdout='deadbeef\n', stderr='')
-        raise AssertionError(f'unexpected git invocation: {args}')
-
-    result = nightly._git_commit_docs_only(
-        tmp_path, [_CODEBOOK_RELPATH], 'msg', runner=fake_runner, retries=5, backoff=0,
-    )
-
-    assert result.ok is True
-    assert result.sha == 'deadbeef'
-    assert calls['commit_attempts'] == 3
-
-
-def test_git_commit_docs_only_gives_up_on_persistent_lock_error(tmp_path):
-    def fake_runner(args, **kwargs):
-        if 'commit' in args:
-            return subprocess.CompletedProcess(args, 1, stdout='', stderr='fatal: cannot lock ref ...')
-        raise AssertionError(f'unexpected git invocation: {args}')
-
-    result = nightly._git_commit_docs_only(
-        tmp_path, [_CODEBOOK_RELPATH], 'msg', runner=fake_runner, retries=3, backoff=0,
-    )
-
-    assert result.ok is False
-
-
-def test_git_commit_docs_only_never_invokes_stash(tmp_path, monkeypatch):
-    calls = []
-    real_run = subprocess.run
-
-    def spy_run(args, **kwargs):
-        calls.append(args)
-        return real_run(args, **kwargs)
-
-    monkeypatch.setattr(nightly.subprocess, 'run', spy_run)
-
-    repo = _init_repo(tmp_path)
-    (repo / _CODEBOOK_RELPATH).write_text(
-        'version: 2\nentries: []\ncandidates: []\n', encoding='utf-8',
-    )
-
-    nightly._git_commit_docs_only(repo, [_CODEBOOK_RELPATH], 'msg')
-
-    assert not any('stash' in call for call in calls)
 
 
 # ---------------------------------------------------------------------------
@@ -1600,7 +1512,7 @@ def test_run_nightly_launches_the_census_with_the_configs_trickle_caps(
 # fail-safe arm logged "tasks-landed: no status_fetcher configured" instead of
 # a delta: condition (b) could not fire AT ALL. Every OTHER seam in
 # run_nightly already resolves None to its real implementation (committer ->
-# _git_commit_docs_only, recorder -> trickle_state.record_run, poster ->
+# unlanded.commit_only, recorder -> trickle_state.record_run, poster ->
 # _default_poster); status_fetcher alone resolved to nothing, which is how
 # three prior repairs of this exact code (2953, 3291, 4085) each left the
 # wiring loop open.
@@ -2770,9 +2682,9 @@ def test_run_nightly_fail_loud_on_coder_storm(tmp_path):
 
 def _failing_committer(repo, paths, message):
     """A fake committer simulating a persistent ref-lock/commit failure --
-    mirrors _git_commit_docs_only's own ok=False-after-final-attempt
+    mirrors unlanded.commit_only's own ok=False-after-final-attempt
     contract without touching a real repo."""
-    return nightly.GitCommitResult(
+    return unlanded.CommitResult(
         ok=False, sha=None, stderr='fatal: cannot lock ref (simulated)', attempts=5,
     )
 
@@ -2831,6 +2743,37 @@ def test_run_nightly_fail_loud_on_commit_failure(tmp_path):
     quarantine_dir = _assert_refused_dump_rolled_back(repo, head_bytes, result)
     assert 'cannot lock ref (simulated)' in arguments['detail']
     assert str(quarantine_dir) in arguments['detail']
+
+
+def test_run_nightly_lands_through_a_transient_index_lock(tmp_path):
+    """Boundary row 4: an index.lock held across the commit's first two
+    attempts delays the night's commit; it does not roll the night back."""
+    landings = []
+
+    def contended_committer(repo, paths, message):
+        lock = Path(repo) / '.git' / 'index.lock'
+        lock.touch()
+        backoffs = []
+
+        def release_on_second_backoff(seconds):
+            backoffs.append(seconds)
+            if len(backoffs) == 2:
+                lock.unlink()
+
+        landing = unlanded.commit_only(repo, paths, message, sleep=release_on_second_backoff)
+        landings.append((landing, lock.exists()))
+        return landing
+
+    result, repo = _run_e2e_nightly(tmp_path, committer=contended_committer)
+
+    assert result.exit_code == 0
+    assert result.commit_made is True
+    assert result.rollback is None
+    [(landing, lock_still_held)] = landings
+    assert landing.attempts == 3
+    assert lock_still_held is False
+    [entry] = [e for e in _committed_codebook(repo)['entries'] if e['id'] == 'known-cause']
+    assert [s['session'] for s in entry['sightings']] == ['session-1']
 
 
 def _assert_refused_dump_rolled_back(repo: Path, head_bytes: bytes, result) -> Path:
@@ -2946,7 +2889,8 @@ def _fake_invoke_deletion_directive(prompt: str, model: str) -> str:
     })
 
 
-def test_run_nightly_skips_deletion_directive_record_without_crashing(tmp_path):
+def test_run_nightly_skips_deletion_directive_record_without_crashing(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='legibility.nightly')
     work_cwd = str(tmp_path / 'work')
     repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
 
@@ -2981,6 +2925,8 @@ def test_run_nightly_skips_deletion_directive_record_without_crashing(tmp_path):
     assert result.exit_code == 0
     assert result.applied == 0
     assert result.coder_status == 'ok'
+    [merge_line] = [m for m in _messages(caplog, logging.INFO) if 'merge: ' in m]
+    assert {'deletion_directive=1', 'matched=0'} <= set(merge_line.split())
 
     assert len(escalation_calls) == 1
     _url, envelope = escalation_calls[0]
@@ -3316,19 +3262,15 @@ def test_run_nightly_persists_a_corrections_only_night(tmp_path, monkeypatch):
         session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
     )
 
-    real_apply = codebook.apply_coding_record
+    real_apply = codebook.apply_coding_records
+    correction = {'entry_id': 'known-cause', 'note': 'framing refuted', 'title': 'Corrected Cause'}
 
-    def apply_with_correction(cb, record, **kwargs):
-        return real_apply(cb, {
-            **record,
-            'corrections': [{
-                'entry_id': 'known-cause',
-                'note': 'framing refuted',
-                'title': 'Corrected Cause',
-            }],
-        }, **kwargs)
+    def apply_with_correction(cb, records, **kwargs):
+        return real_apply(
+            cb, [{**record, 'corrections': [correction]} for record in records], **kwargs,
+        )
 
-    monkeypatch.setattr(nightly.codebook, 'apply_coding_record', apply_with_correction)
+    monkeypatch.setattr(nightly.codebook, 'apply_coding_records', apply_with_correction)
 
     result = nightly.run_nightly(
         config_path=config_path,
@@ -5384,7 +5326,7 @@ class TestRunNightlyInvariantSlugs:
 
         assert result.exit_code == 0
         assert any(
-            'invariant slugs: 0 valid, 0 rejected' in m
+            'merge: ' in m and 'invariant_slugs_valid=0 invariant_slugs_rejected=0' in m
             for m in _messages(caplog, logging.INFO)
         )
 
@@ -5407,7 +5349,7 @@ class TestRunNightlyInvariantSlugs:
         [candidate] = [c for c in committed['candidates'] if c['title'] == 'novel']
         assert ['invariant_violated' in s for s in candidate['sightings']] == [False]
         assert any(
-            'invariant slugs: 1 valid, 1 rejected' in m
+            'merge: ' in m and 'invariant_slugs_valid=1 invariant_slugs_rejected=1' in m
             for m in _messages(caplog, logging.INFO)
         )
         naming_it = [m for m in _messages(caplog, logging.WARNING) if 'made-up-free-text' in m]
