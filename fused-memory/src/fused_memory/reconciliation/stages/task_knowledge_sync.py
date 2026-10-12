@@ -78,6 +78,7 @@ from fused_memory.reconciliation.standing_decision_writer import (
     expire_entity_standing_decision,
 )
 from fused_memory.reconciliation.summary_pool import (
+    trailing_incomplete_agent_run_ids,
     write_cycle_summary,
 )
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
@@ -658,9 +659,10 @@ class Stage2FlagPartition(NamedTuple):
         stale_mismatched_run_id_ids: ``id`` strings for records whose
             ``metadata.run_id`` is present and truthy but does not match the
             current ``run_id`` AND whose ``created_at`` is out of the run
-            window.  These are normal prior-cycle residue, excluded from what
-            is rendered to the Stage 2 LLM and reaped the same way (see
-            ``stale_missing_run_id_ids`` above).
+            window, excluding ``carried_forward_ids``.  These are normal
+            prior-cycle residue, excluded from what is rendered to the Stage 2
+            LLM and reaped the same way (see ``stale_missing_run_id_ids``
+            above).
         rescued_ids: ``id`` strings for markers rescued by the run-window guard
             (a subset of ``current``).  Non-empty indicates Stage 1 producer
             drift within the CURRENT cycle — the LLM omitted or mis-stamped
@@ -669,12 +671,18 @@ class Stage2FlagPartition(NamedTuple):
             exclusively by the two rescue branches inside
             :func:`_query_stage2_flags`; this is the single source of truth for
             the rescued count (task-1381).
+        carried_forward_ids: ``id`` strings for prior-run markers routed to
+            ``current`` because their run's Stage 2 agent did not complete and
+            none has completed since (a subset of ``current``).  The single
+            source for the ``stage2_markers_carried_forward`` stat (task 5984;
+            see plans/recon-stage-startup-wedge-rca-2026-09-27.md).
     """
 
     current: list[dict]
     stale_missing_run_id_ids: list[str]
     stale_mismatched_run_id_ids: list[str]
     rescued_ids: list[str]
+    carried_forward_ids: tuple[str, ...] = ()
 
     @property
     def stale_all_ids(self) -> list[str]:
@@ -687,6 +695,8 @@ async def _query_stage2_flags(
     project_id: str,
     current_run_id: str,
     run_window_start: datetime | None = None,
+    *,
+    carry_forward_run_ids: Collection[str] = frozenset(),
 ) -> Stage2FlagPartition:
     """Query Mem0 for active Stage-2-destined flags and partition by run_id.
 
@@ -695,7 +705,7 @@ async def _query_stage2_flags(
     alias and is not checked here; see task-1139 reviewer note on dead code).
     Any other memories are discarded.
 
-    Results are partitioned into four groups:
+    Results are partitioned into five groups:
 
     * **current** — full dict records whose ``metadata.run_id`` is present,
       non-empty, and matches ``current_run_id`` after ``str()`` coercion.
@@ -717,6 +727,10 @@ async def _query_stage2_flags(
       the run-window guard; see :attr:`Stage2FlagPartition.rescued_ids` for
       full semantics.  This is the single source of truth for the rescued
       count (task-1381).
+    * **carried_forward_ids** — subset of **current** containing out-of-window
+      markers whose string ``run_id`` is in *carry_forward_run_ids* (runs whose
+      Stage 2 agent did not complete; task 5984).  The run-window rescue takes
+      precedence, so each marker counts as rescued, carried or stale, never two.
 
     Both stale buckets are excluded from what is rendered to the Stage 2 LLM;
     residue is reaped by the in-cycle Mem0 age-GC sweep
@@ -792,6 +806,7 @@ async def _query_stage2_flags(
     stale_missing_run_id_ids: list[str] = []
     stale_mismatched_run_id_ids: list[str] = []
     rescued_ids: list[str] = []
+    carried: list[str] = []
 
     def _rescue(flag: dict, rid: str) -> None:
         """Route a rescued marker to current and record its id.
@@ -872,6 +887,9 @@ async def _query_stage2_flags(
                     extra={'project_id': project_id, 'current_run_id': run_id_str, 'marker_id': r.id},
                 )
                 _rescue(flag_dict, r.id)
+            elif isinstance(_rid_val, str) and _rid_val in carry_forward_run_ids:
+                current_flags.append(flag_dict)
+                carried.append(r.id)
             else:
                 if run_window_start is not None and (
                     not _created_at_val or not isinstance(_created_at_val, str)
@@ -896,7 +914,13 @@ async def _query_stage2_flags(
                 'current_run_id': run_id_str,
             },
         )
-    return Stage2FlagPartition(current_flags, stale_missing_run_id_ids, stale_mismatched_run_id_ids, rescued_ids)
+    return Stage2FlagPartition(
+        current_flags,
+        stale_missing_run_id_ids,
+        stale_mismatched_run_id_ids,
+        rescued_ids,
+        tuple(carried),
+    )
 
 
 def _query_recon_report_findings(
@@ -3664,6 +3688,10 @@ class TaskKnowledgeSync(BaseStage):
     # class).
     _rescued_in_window_markers: int = 0
 
+    # Count of prior-run markers carried forward because their run's Stage 2
+    # agent did not complete (task 5984); same reset-then-inject pattern.
+    _markers_carried_forward: int = 0
+
     # Count of systemic_pattern findings polled from the recon_report channel
     # (task-1966) that were newly APPENDED to combined_flags in the current
     # assemble_payload() call — i.e. survived compute_flag_signature dedup
@@ -3720,6 +3748,7 @@ class TaskKnowledgeSync(BaseStage):
         # (mirrors _current_run_id overwrite pattern).
         self._stale_missing_run_id_markers = 0
         self._rescued_in_window_markers = 0
+        self._markers_carried_forward = 0
         self._recon_report_systemic_polled = 0
         # Reset BEFORE super().run() (task-2047 Gap 2) so a run whose
         # assemble_payload call is skipped or short-circuited can never forward
@@ -3747,6 +3776,7 @@ class TaskKnowledgeSync(BaseStage):
         # swept), but the count is observable here for operator diagnostics.
         # Explicit zero so downstream consumers never need .get(..., 0) fallbacks.
         report.stats['rescued_in_window_markers'] = self._rescued_in_window_markers
+        report.stats['stage2_markers_carried_forward'] = self._markers_carried_forward
         # --- recon_report systemic_pattern channel poll stat (task-1966) ---
         # Explicit zero so downstream consumers never need .get(..., 0) fallbacks.
         report.stats['stage2_recon_report_systemic_polled'] = self._recon_report_systemic_polled
@@ -4471,7 +4501,7 @@ class TaskKnowledgeSync(BaseStage):
 
         # FIX A — merge Mem0 active-query flags into the flagged section.
         # _query_stage2_flags is best-effort: search failures yield ([], [], [], []) internally.
-        # Returns a Stage2FlagPartition with four fields:
+        # Returns a Stage2FlagPartition with five fields:
         #   .current          — markers whose run_id matches the current run, OR whose
         #                       Mem0 created_at is within the run window (task-1369 guard)
         #   .stale_missing_run_id_ids  — prior-cycle markers with absent/empty run_id
@@ -4479,6 +4509,8 @@ class TaskKnowledgeSync(BaseStage):
         #   .rescued_ids      — ids of markers rescued by the run-window guard (subset of
         #                       .current); single source of truth for the rescued count
         #                       (task-1381, replaces the re-derivation over active_flags)
+        #   .carried_forward_ids — prior-run markers kept in .current because their run's
+        #                       Stage 2 agent did not complete (task 5984)
         # Both stale buckets contain only genuine prior-cycle residue (in-window same-
         # cycle markers are rescued to .current by the run-window guard) and are simply
         # excluded from `current` below, so they are never rendered to the LLM. They are
@@ -4519,9 +4551,15 @@ class TaskKnowledgeSync(BaseStage):
         # returned a non-datetime started_at, which disables the run-window guard
         # and falls those helpers back to their window-agnostic behaviour.
         self._run_window_start = run_window_start
+        carry_forward_run_ids = await trailing_incomplete_agent_run_ids(
+            getattr(self.memory, 'recon_ledger', None),
+            self.project_id,
+            self.stage_id.value,
+        )
         partition = await _query_stage2_flags(
             self.memory, self.project_id, run_id_for_markers,
             run_window_start=run_window_start,
+            carry_forward_run_ids=carry_forward_run_ids,
         )
         active_flags = partition.current
         self._stale_missing_run_id_markers = len(partition.stale_missing_run_id_ids)
@@ -4531,6 +4569,17 @@ class TaskKnowledgeSync(BaseStage):
         # the partition predicate here, so any future change to the guard logic
         # automatically flows through to this counter without drift.
         self._rescued_in_window_markers = len(partition.rescued_ids)
+        self._markers_carried_forward = len(partition.carried_forward_ids)
+        if self._markers_carried_forward:
+            logger.info(
+                'reconciliation.stage2_markers_carried_forward',
+                extra={
+                    'project_id': self.project_id,
+                    'run_id': run_id_for_markers,
+                    'count': self._markers_carried_forward,
+                    'origin_run_ids': sorted(carry_forward_run_ids),
+                },
+            )
 
         surviving = active_flags  # active-query path is pass-through (no scope filter)
 
@@ -4544,7 +4593,7 @@ class TaskKnowledgeSync(BaseStage):
         # single GC pass (:func:`_gc_recon_markers`, called from run()) on its
         # TTL/terminal-task schedule rather than an immediate same-cycle
         # delete.  FIX D therefore only fires on Stage 1 re-flags surviving
-        # within the current run_id.
+        # within the current run_id, and on carried-forward markers (task 5984).
         surviving_ids = [f['id'] for f in surviving]
 
         persistence_counts = await _track_flag_persistence(
