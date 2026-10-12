@@ -1483,6 +1483,7 @@ def _prior_run(
     unresolved=(),
     stats=None,
     stage_reports: dict[str, StageReport | dict] | None = None,
+    run_type=RunType.full,
 ):
     """A REAL past ReconciliationRun whose Stage-1 report records one observation.
 
@@ -1507,13 +1508,24 @@ def _prior_run(
     return ReconciliationRun(
         id=run_id,
         project_id=PROJECT,
-        run_type=RunType.full,
+        run_type=run_type,
         trigger_reason='test',
         started_at=at,
         completed_at=at,
         stage_reports=stage_reports,
         status=RunStatus.completed,
     )
+
+
+def _targeted_runs(count, *, prefix, minutes_ago):
+    """*count* targeted runs, which carry no Stage-1 report, as the live journal holds them."""
+    return [
+        _prior_run(
+            f'{prefix}-targeted-{n}', minutes_ago=minutes_ago, stage_reports={},
+            run_type=RunType.targeted,
+        )
+        for n in range(count)
+    ]
 
 
 def _unresolved_passes(*task_ids, count, start=1):
@@ -2032,6 +2044,56 @@ class TestUnresolvedCorroborationPersistence:
         )
 
         assert escalated == [UNRESOLVED_CORROBORATION_SUBJECT]
+
+    @pytest.mark.asyncio
+    async def test_a_streak_survives_bursts_of_targeted_runs_between_its_passes(self, queue):
+        """The history window counts runs of every type, and most are targeted.
+
+        13 targeted runs between passes is twice the live dark_factory mean
+        (731 targeted to 112 full runs, 14 days to 2026-10-12).
+        """
+        history: list[ReconciliationRun] = []
+        for n in range(1, self._K):
+            history += _targeted_runs(13, prefix=f'gap-{n}', minutes_ago=10 * n - 5)
+            history.append(_prior_run(f'prior-{n}', unresolved=['3105'], minutes_ago=10 * n))
+
+        escalated = await self._escalate(
+            queue, _unresolved_result('3105'), _StubJournal(history),
+        )
+
+        assert escalated == [UNRESOLVED_CORROBORATION_SUBJECT]
+
+    @pytest.mark.asyncio
+    async def test_a_window_crowded_out_by_targeted_runs_is_reported(self, queue):
+        """Too few Stage-1 passes to measure a streak must not pass for a clean answer."""
+        history = [
+            *_targeted_runs(1000, prefix='flood', minutes_ago=1),
+            *_history_reaching_threshold('3105'),
+        ]
+
+        with caplog_at_warning() as records:
+            escalated = await self._escalate(
+                queue, _unresolved_result('3105'), _StubJournal(history),
+            )
+
+        assert escalated == []
+        assert any(
+            PROJECT in message and 'not measurable' in message for message in records
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('history', [
+        pytest.param([], id='journal-shorter-than-the-window'),
+        pytest.param(
+            [*_history_reaching_threshold('4102'), *_targeted_runs(1000, prefix='old', minutes_ago=60)],
+            id='window-holds-enough-stage1-passes',
+        ),
+    ])
+    async def test_a_measurable_window_is_not_reported(self, queue, history):
+        with caplog_at_warning() as records:
+            await self._escalate(queue, _unresolved_result('3105'), _StubJournal(history))
+
+        assert not any('not measurable' in message for message in records)
 
     @pytest.mark.asyncio
     async def test_a_malformed_observation_never_counts_toward_the_streak(self, queue):

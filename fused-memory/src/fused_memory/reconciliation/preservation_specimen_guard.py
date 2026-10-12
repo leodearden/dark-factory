@@ -57,7 +57,8 @@ LEAF CONTRACT.  This module imports only from
 ``investigation_outcome`` mem0 kind), ``flag_task_ids`` (the shared flag
 task-id splitter), ``flag_shape`` (the leaf ``contains_any_casefolded``
 matcher), ``services.memory_service`` (for the canonical raw-payload content
-extractor) and, optionally, ``escalation.dedupe.file_or_fold_l1``.  It reaches
+extractor), type-only ``models.reconciliation`` (the journal run shape) and,
+optionally, ``escalation.dedupe.file_or_fold_l1``.  It reaches
 nothing in ``stages/``, ``middleware/`` or ``prompts/``; the consolidator
 calls in, passing the journal its persistence check reads.  It performs detection only — it drops flags, never writes tasks or
 memories.
@@ -81,7 +82,7 @@ import asyncio
 import logging
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from typing import Any, TypeGuard
+from typing import TYPE_CHECKING, Any, Protocol, TypeGuard
 
 from fused_memory.reconciliation.flag_shape import contains_any_casefolded
 from fused_memory.reconciliation.flag_task_ids import task_id_components
@@ -95,6 +96,9 @@ from fused_memory.reconciliation.standing_decision_constants import (
 # which is why guessing one is wrong, and a second copy of the order would be
 # one more place for the two to drift (INV-5).
 from fused_memory.services.memory_service import _mem0_content
+
+if TYPE_CHECKING:
+    from fused_memory.models.reconciliation import ReconciliationRun, StageReport
 
 # Optional escalation dependency: the reconciliation package must import
 # cleanly where the escalation package is not installed, and
@@ -121,6 +125,7 @@ __all__ = [
     'UNRESOLVED_TASK_IDS_STAT',
     'GRAPHITI_TASK_ENTITY_TEMPLATE',
     'PreservationSuppressionResult',
+    'RunHistory',
     'cites_preservation',
     'filter_preservation_specimen_flags',
     'flag_asserts_stranded',
@@ -265,8 +270,12 @@ UNRESOLVED_CORROBORATION_STREAK_THRESHOLD: int = 3
 CANDIDATE_TASK_IDS_STAT: str = 'preservation_specimen_candidate_task_ids'
 UNRESOLVED_TASK_IDS_STAT: str = 'preservation_specimen_unresolved_task_ids'
 
-#: Floor on how many past runs the persistence check reads.
-_UNRESOLVED_HISTORY_MIN_RUNS: int = 20
+#: Past runs the persistence check reads per pass of the streak threshold.  The
+#: window counts runs of every type, and most carry no Stage-1 report: the live
+#: dark_factory journal held 7.5 runs per full cycle over the 14 days to
+#: 2026-10-12 (112 full, 731 targeted).  Twice that, so a burst of targeted runs
+#: does not crowd a streak's earlier passes out of the window.
+_HISTORY_RUNS_PER_STREAK_PASS: int = 15
 
 #: Finding-category components of the two records' dedupe fingerprints — the
 #: second axis of ``compute_content_fingerprint``.  Distinct values are what
@@ -953,7 +962,9 @@ def _is_str_list(value: Any) -> TypeGuard[list[str]]:
     return isinstance(value, list) and all(isinstance(item, str) for item in value)
 
 
-def _observation_from_stage_report(report: Any) -> _CorroborationObservation | None:
+def _observation_from_stage_report(
+    report: StageReport | dict[str, Any] | None,
+) -> _CorroborationObservation | None:
     """The observation a past Stage-1 report recorded, or ``None`` if it recorded none.
 
     Reads ``.stats`` from a ``StageReport`` or ``['stats']`` from the plain dict
@@ -965,7 +976,9 @@ def _observation_from_stage_report(report: Any) -> _CorroborationObservation | N
     Total over malformed input — every value here comes off a journal row.
     Pure, sync, no I/O.
     """
-    stats = report.get('stats') if isinstance(report, dict) else getattr(report, 'stats', None)
+    if report is None:
+        return None
+    stats = report.get('stats') if isinstance(report, dict) else report.stats
     if not isinstance(stats, dict):
         return None
     candidates = stats.get(CANDIDATE_TASK_IDS_STAT)
@@ -977,8 +990,16 @@ def _observation_from_stage_report(report: Any) -> _CorroborationObservation | N
     return _CorroborationObservation(frozenset(candidates), frozenset(unresolved))
 
 
+class RunHistory(Protocol):
+    """The one reconciliation-journal read the persistence check makes."""
+
+    async def get_recent_runs(
+        self, project_id: str, limit: int = ...,
+    ) -> list[ReconciliationRun]: ...
+
+
 async def _prior_observations(
-    journal: Any,
+    journal: RunHistory,
     project_id: str,
     run_id: str,
     stage_key: str,
@@ -986,11 +1007,12 @@ async def _prior_observations(
     limit: int,
     log: logging.Logger,
 ) -> list[_CorroborationObservation | None]:
-    """Past passes' observations, most-recent-first, excluding the run *run_id*.
+    """One entry per run read, in ``get_recent_runs``' most-recent-first order.
 
-    Keeps ``journal.get_recent_runs``' own most-recent-first order.  A read
-    that fails logs a WARNING and returns ``[]``, as does a result that is not
-    a list: missing history can only under-count a streak, never fabricate one.
+    The run *run_id* is this pass, not history, so it contributes ``None`` like
+    any run without an observation; ``len`` is therefore the number of runs
+    read.  A read that fails logs a WARNING and returns ``[]``: missing history
+    can only under-count a streak, never fabricate one.
     ``asyncio.CancelledError``/``KeyboardInterrupt``/``SystemExit`` propagate.
     """
     try:
@@ -1005,16 +1027,10 @@ async def _prior_observations(
             project_id, run_id, exc_info=True,
         )
         return []
-    if not isinstance(runs, list):
-        return []
-    observations: list[_CorroborationObservation | None] = []
-    for run in runs:
-        if getattr(run, 'id', None) == run_id:
-            continue
-        reports = getattr(run, 'stage_reports', None)
-        report = reports.get(stage_key) if isinstance(reports, dict) else None
-        observations.append(_observation_from_stage_report(report))
-    return observations
+    return [
+        None if run.id == run_id else _observation_from_stage_report(run.stage_reports.get(stage_key))
+        for run in runs
+    ]
 
 
 def _unresolved_streaks(
@@ -1050,7 +1066,7 @@ async def maybe_escalate_preservation_suppression_storm(
     run_id: str,
     result: PreservationSuppressionResult,
     *,
-    journal: Any,
+    journal: RunHistory,
     stage_key: str,
     threshold: int = PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
     streak_threshold: int = UNRESOLVED_CORROBORATION_STREAK_THRESHOLD,
@@ -1147,21 +1163,32 @@ async def _file_unresolved_record(
     run_id: str,
     result: PreservationSuppressionResult,
     *,
-    journal: Any,
+    journal: RunHistory,
     stage_key: str,
     streak_threshold: int,
     log: logging.Logger,
 ) -> list[str]:
     """File or fold the unresolved-corroboration record once some task's blindness persists.
 
-    Reads no history at all when this pass left nothing unresolved.
+    Reads no history at all when this pass left nothing unresolved, and logs a
+    WARNING when a full history window holds too few Stage-1 passes to measure
+    a streak, rather than letting that blindness read as a short streak.
     """
     if not result.unresolved_task_ids:
         return []
+    window = _HISTORY_RUNS_PER_STREAK_PASS * streak_threshold
     prior = await _prior_observations(
-        journal, project_id, run_id, stage_key,
-        limit=max(_UNRESOLVED_HISTORY_MIN_RUNS, 4 * streak_threshold), log=log,
+        journal, project_id, run_id, stage_key, limit=window, log=log,
     )
+    observed_passes = sum(observation is not None for observation in prior)
+    if len(prior) >= window and observed_passes < streak_threshold - 1:
+        log.warning(
+            'preservation_specimen_guard: the last %d run(s) in project %s hold %d '
+            'Stage-1 observation(s), fewer than the %d a %d-pass streak needs — '
+            'unresolved-corroboration persistence is not measurable this pass (run %s)',
+            window, project_id, observed_passes, streak_threshold - 1,
+            streak_threshold, run_id,
+        )
     streaks = _unresolved_streaks(result.unresolved_task_ids, prior)
     persistent = {task_id: n for task_id, n in streaks.items() if n >= streak_threshold}
     if not persistent:
