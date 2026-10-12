@@ -14,6 +14,7 @@ test_ui_config.py.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import shutil
 import threading
 from datetime import UTC, datetime, timedelta
@@ -236,6 +237,56 @@ class _BlockingScanner:
 
     def release(self) -> None:
         self._release.set()
+
+
+class _HoldingDecisionsReader:
+    """A decisions_reader that reads the real registry, then holds any OFF-main-thread
+    caller until release().
+
+    That caller is a poll worker, held after its whole registry read, because
+    _scan_registry reads sessions before decisions. Main-thread reads (mount's
+    refresh_registry, a keypress's re-read) pass through, because holding one would
+    deadlock the event loop the pilot runs on. After release() every read passes
+    through.
+    """
+
+    def __init__(self) -> None:
+        self.held = threading.Event()
+        self._release = threading.Event()
+        self.held_result: list[sr.DecisionRecord] = []
+
+    def __call__(self, root):
+        from cockpit.registry_reader import scan_decisions
+
+        decisions = scan_decisions(root)
+        off_main_thread = threading.current_thread() is not threading.main_thread()
+        if off_main_thread and not self._release.is_set():
+            self.held_result = decisions
+            self.held.set()
+            self._release.wait()
+        return decisions
+
+    def release(self) -> None:
+        self._release.set()
+
+
+@contextlib.asynccontextmanager
+async def _poll_held_after_its_read(app, reader: _HoldingDecisionsReader):
+    """Run one real poll tick whose worker *reader* holds after its registry read.
+
+    Leaving the block releases the worker and waits for it, so the held poll has
+    landed through the real call_from_thread hand-off: call_from_thread blocks the
+    worker until _apply_scan has run on the loop. The release sits in a finally, so
+    a failing assertion inside the block never leaves the worker parked.
+    """
+    app._poll_registry()
+    try:
+        while not reader.held.is_set():
+            await asyncio.sleep(0.01)
+        yield
+    finally:
+        reader.release()
+        await app.workers.wait_for_complete()
 
 
 class TestInitialRender:
@@ -4355,87 +4406,42 @@ class TestScanBackpressure:
             assert scanner.calls == 3
 
 
-class TestStaleScanSequenceGuard:
-    """esc-2517-1 (task 2517 verify) / task 2606: a stale threaded-poll scan
-    result must never regress the view below whatever a fresher scan already
-    applied. The real hazard is a call_from_thread hand-off landing out of
-    order -- a genuine thread race, and thus inherently timing-dependent to
-    reproduce with real poll ticks (see TestPollRefresh's docstring, which
-    hits the identical hazard and, for the same reason, drives
-    refresh_registry() directly instead of racing the poll timer). This test
-    pins the guard deterministically at the _apply_scan seam instead, with
-    hand-chosen sequence numbers standing in for "which scan read the
-    registry first".
+class TestALatePollCannotRegressAFresherScan:
+    """esc-2517-1 / task 2606: a poll worker's call_from_thread hand-off that lands
+    after a fresher scan must not regress the view, replayed through a real held
+    worker. The last phase also proves the worker carries its own scan's freshness
+    across the thread boundary.
     """
 
     @pytest.mark.timeout(10)
-    async def test_stale_scan_result_is_ignored_by_apply_scan(self, tmp_path):
+    async def test_a_poll_landing_after_a_fresher_scan_is_dropped_and_the_next_poll_applies(
+        self, tmp_path
+    ):
         from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
 
-        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+        sr.write_record(_make_record(session_slug='r-1'), root=tmp_path)
+        reader = _HoldingDecisionsReader()
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60, decisions_reader=reader)
         async with app.run_test() as pilot:
             await pilot.pause()
             table = app.query_one(SessionTable)
+            assert table.row_count == 1
 
-            # FRESH: seq 100 applies cleanly.
-            fresh = [
-                _make_record(session_slug='fresh-1', status=sr.Status.RUNNING),
-                _make_record(session_slug='fresh-2', status=sr.Status.RUNNING),
-            ]
-            app._apply_scan(fresh, [], 100)
+            async with _poll_held_after_its_read(app, reader):
+                sr.write_record(_make_record(session_slug='r-2'), root=tmp_path)
+                app.refresh_registry()
+                await pilot.pause()
+                assert table.row_count == 2
+
             await pilot.pause()
-            assert table.row_count == 2
+            assert table.row_count == 2, 'the late poll regressed the view'
 
-            # STALE: seq 50 (< the 100 high-water mark) read the registry
-            # earlier and must be dropped -- not clobber fresh's 2 rows back
-            # down to 1.
-            stale = [_make_record(session_slug='stale-1', status=sr.Status.RUNNING)]
-            app._apply_scan(stale, [], 50)
+            sr.write_record(_make_record(session_slug='r-3'), root=tmp_path)
+            app._poll_registry()
+            await app.workers.wait_for_complete()
             await pilot.pause()
-            assert table.row_count == 2
-
-            # NEWER: seq 101 (> the 100 high-water mark) still applies --
-            # the guard blocks only stale results, never freezes the view.
-            newer = [
-                _make_record(session_slug='newer-1', status=sr.Status.RUNNING),
-                _make_record(session_slug='newer-2', status=sr.Status.RUNNING),
-                _make_record(session_slug='newer-3', status=sr.Status.RUNNING),
-            ]
-            app._apply_scan(newer, [], 101)
-            await pilot.pause()
-            assert table.row_count == 3
-
-    @pytest.mark.timeout(10)
-    async def test_scan_registry_worker_forwards_its_seq_to_apply_scan(self, tmp_path, monkeypatch):
-        """The seam test above proves _apply_scan's own drop/keep logic given
-        hand-picked seqs, but never exercises the real
-        _scan_registry_worker -> _call_from_thread_fail_soft(_apply_scan)
-        hand-off that carries *seq* across the thread boundary in
-        production. Patches _apply_scan with a spy and drives the worker
-        directly, closing that gap: proves the sequence number
-        _next_scan_seq() issues before launching the worker is the exact
-        same value that reaches _apply_scan on the far side of the
-        call_from_thread hand-off -- i.e. that the plumbing forwards seq
-        unchanged, not just that the seam's guard behaves given some seq.
-        """
-        from cockpit.app import CockpitApp
-
-        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
-        async with app.run_test() as pilot:
-            await pilot.pause()  # on_mount's synchronous initial scan
-
-            recorded_seqs = []
-            monkeypatch.setattr(
-                app, '_apply_scan', lambda records, decisions, seq: recorded_seqs.append(seq)
-            )
-
-            issued = app._next_scan_seq()
-            worker = app._scan_registry_worker(issued)
-            await worker.wait()
-            await pilot.pause()
-
-            assert recorded_seqs == [issued]
+            assert table.row_count == 3, 'the stale guard froze the view'
 
 
 class TestInFlightScanCannotUndoAKeypressWrite:
@@ -4444,13 +4450,11 @@ class TestInFlightScanCannotUndoAKeypressWrite:
 
     _apply_boost and action_drop write a decision and then re-read
     decisions, but a poll scan issued BEFORE that write, whose registry read
-    predates it, can land AFTER it. As in TestStaleScanSequenceGuard, the
-    poll pipeline's two halves are driven by hand, because racing the real
-    timer is what made the original test flaky: _next_scan_seq() plus
-    _scan_registry() stand in for _poll_registry issuing a seq and its worker
-    reading the registry, and _apply_scan(records, decisions, seq) stands in
-    for the late call_from_thread hand-off. poll_interval=60 keeps a real
-    tick from landing mid-test.
+    predates it, can land AFTER it. Each replay holds a REAL poll worker
+    after its registry read (_HoldingDecisionsReader), interleaves the
+    keypress, then lets the worker land through the real call_from_thread
+    hand-off. poll_interval=60 means no live tick can heal a regression
+    first, and no freshness-protocol detail appears in the test.
     """
 
     @pytest.mark.timeout(10)
@@ -4478,12 +4482,14 @@ class TestInFlightScanCannotUndoAKeypressWrite:
             assert sr.write_decision(d, root=tmp_path)
 
         fixed_now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
+        reader = _HoldingDecisionsReader()
         app = CockpitApp(
             fleet_root=tmp_path,
             backend=FakeBackend(),
             poll_interval=60,
             now_fn=lambda: fixed_now,
             priorities=Priorities.default(),
+            decisions_reader=reader,
         )
         async with app.run_test() as pilot:
             await pilot.pause()
@@ -4491,15 +4497,12 @@ class TestInFlightScanCannotUndoAKeypressWrite:
             queue.move_cursor(row=queue.get_row_index('decision:dec-b'))
             await pilot.pause()
 
-            in_flight_seq = app._next_scan_seq()
-            records, decisions = app._scan_registry()
-            assert {d.id: d.manual_boost for d in decisions}['dec-b'] == 0
+            async with _poll_held_after_its_read(app, reader):
+                assert {d.id: d.manual_boost for d in reader.held_result}['dec-b'] == 0
+                await pilot.press('b')
+                await pilot.pause()
+                assert queue.get_row_index('decision:dec-b') < queue.get_row_index('decision:dec-a')
 
-            await pilot.press('b')
-            await pilot.pause()
-            assert queue.get_row_index('decision:dec-b') < queue.get_row_index('decision:dec-a')
-
-            app._apply_scan(records, decisions, in_flight_seq)
             await pilot.pause()
             assert queue.get_row_index('decision:dec-b') < queue.get_row_index('decision:dec-a'), (
                 "the late scan reverted the keypress's persisted boost in the view"
@@ -4530,25 +4533,25 @@ class TestInFlightScanCannotUndoAKeypressWrite:
         for d in (first, second):
             assert sr.write_decision(d, root=tmp_path)
 
-        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60)
+        reader = _HoldingDecisionsReader()
+        app = CockpitApp(
+            fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60, decisions_reader=reader
+        )
         async with app.run_test() as pilot:
             await pilot.pause()
             queue = app.query_one(DecisionQueue)
             queue.move_cursor(row=queue.get_row_index('decision:dec-1'))
             await pilot.pause()
 
-            in_flight_seq = app._next_scan_seq()
-            records, decisions = app._scan_registry()
-            assert {d.id: d.state for d in decisions} == {
-                'dec-1': sr.DecisionState.OPEN,
-                'dec-2': sr.DecisionState.OPEN,
-            }
+            async with _poll_held_after_its_read(app, reader):
+                assert {d.id: d.state for d in reader.held_result} == {
+                    'dec-1': sr.DecisionState.OPEN,
+                    'dec-2': sr.DecisionState.OPEN,
+                }
+                await pilot.press('x')
+                await pilot.pause()
+                assert queue.row_count == 1
 
-            await pilot.press('x')
-            await pilot.pause()
-            assert queue.row_count == 1
-
-            app._apply_scan(records, decisions, in_flight_seq)
             await pilot.pause()
             assert queue.row_count == 1, 'the late scan resurrected the dropped decision'
             with pytest.raises(RowDoesNotExist):
@@ -4586,12 +4589,14 @@ class TestInFlightScanCannotUndoAKeypressWrite:
             assert sr.write_decision(d, root=tmp_path)
 
         fixed_now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
+        reader = _HoldingDecisionsReader()
         app = CockpitApp(
             fleet_root=tmp_path,
             backend=FakeBackend(),
             poll_interval=60,
             now_fn=lambda: fixed_now,
             priorities=Priorities.default(),
+            decisions_reader=reader,
         )
         async with app.run_test() as pilot:
             await pilot.pause()
@@ -4601,15 +4606,11 @@ class TestInFlightScanCannotUndoAKeypressWrite:
             await pilot.pause()
 
             sr.write_record(_make_record(session_slug='running-1'), root=tmp_path)
-            in_flight_seq = app._next_scan_seq()
-            records, decisions = app._scan_registry()
-            assert [r.session_slug for r in records] == ['running-1']
+            async with _poll_held_after_its_read(app, reader):
+                await pilot.press('b')
+                await pilot.pause()
+                assert table.row_count == 0
 
-            await pilot.press('b')
-            await pilot.pause()
-            assert table.row_count == 0
-
-            app._apply_scan(records, decisions, in_flight_seq)
             await pilot.pause()
             assert table.row_count == 1, "the keypress's re-read voided the scan's sessions"
             assert queue.get_row_index('decision:dec-b') < queue.get_row_index('decision:dec-a'), (
