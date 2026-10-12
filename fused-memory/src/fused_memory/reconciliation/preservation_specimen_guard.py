@@ -87,6 +87,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -177,9 +178,8 @@ STRANDED_FLAG_TOKEN_FAMILY: tuple[str, ...] = ('strand',)
 #: Second, orthogonal channel: what the finding ASKS FOR.  A flag_type nobody
 #: has seen yet still makes the stranded claim if its suggested action is to
 #: move the task out of ``in-progress``.  Matched as a CONJUNCTION with
-#: :data:`STRANDED_ACTION_TARGET_FAMILY` across the action fields — each half
-#: alone is far too common ("reset the priority override", "the task is
-#: in-progress") to gate a drop.
+#: :data:`STRANDED_ACTION_TARGET_FAMILY` — each half alone is far too common
+#: ("reset the priority override", "the task is in-progress") to gate a drop.
 STRANDED_ACTION_VERB_FAMILY: tuple[str, ...] = (
     'reset',
     'redispatch',
@@ -199,6 +199,14 @@ STRANDED_ACTION_TARGET_FAMILY: tuple[str, ...] = ('in-progress', 'in progress')
 #: ``suggested_action`` terse, so the verb and the target may sit in
 #: different fields.
 _STRANDED_ACTION_FIELDS: tuple[str, ...] = ('suggested_action', 'description')
+
+#: A :data:`STRANDED_ACTION_VERB_FAMILY` verb whose object is the task itself —
+#: "reset task 3105", "redispatch the task" — and not something the task owns
+#: ("reset the task's priority override").
+_RESET_AIMED_AT_THE_TASK: re.Pattern[str] = re.compile(
+    r'\b(?:' + '|'.join(map(re.escape, STRANDED_ACTION_VERB_FAMILY)) + r")\s+(?:the\s+)?tasks?\b(?!['’])",
+    re.IGNORECASE,
+)
 
 #: The key a KEPT mixed-composite flag's copy carries: ``{component: citation}``
 #: for each component of its task_id that corroborated as a preserved specimen.
@@ -299,11 +307,13 @@ def flag_asserts_stranded(flag: Any) -> bool:
     1. **Vocabulary** — ``flag['flag_type']`` contains a
        :data:`STRANDED_FLAG_TOKEN_FAMILY` stem.  Catches the namings already
        observed, and any future one built on the same word.
-    2. **Requested action** — the flag's action prose, ``suggested_action``
-       and ``description`` TOGETHER, contains BOTH a
-       :data:`STRANDED_ACTION_VERB_FAMILY` verb and a
-       :data:`STRANDED_ACTION_TARGET_FAMILY` status, in either field.  Real
-       findings state the status in ``description`` and ask for the reset in
+    2. **Requested action** — the flag asks to move the task out of
+       ``in-progress``: ONE of ``suggested_action``/``description`` holds both
+       a :data:`STRANDED_ACTION_VERB_FAMILY` verb and a
+       :data:`STRANDED_ACTION_TARGET_FAMILY` status, or the status sits in
+       either field and a verb aimed at the task itself
+       (:data:`_RESET_AIMED_AT_THE_TASK`) in either.  The second form is how
+       real findings read: the status in ``description``, "reset task 3105" in
        ``suggested_action``.  Catches a naming built on a different word
        entirely, which the vocabulary channel must eventually miss because
        ``flag_type`` is free-form LLM output.
@@ -311,8 +321,11 @@ def flag_asserts_stranded(flag: Any) -> bool:
     The conjunction in channel 2 is load-bearing.  ``'reset'`` alone matches
     ``stale_priority_override``'s perfectly reasonable "reset the priority
     override back to its default"; ``'in-progress'`` alone matches any finding
-    that merely mentions a task's status.  Requiring both keeps the channel
-    inside the class it is named for.
+    that merely mentions a task's status, and a preserved specimen is
+    permanently in-progress, so its unrelated findings mention that status
+    often.  That is why a verb pairs with a status in the OTHER field only when
+    the task is its object.  Requiring both keeps the channel inside the class
+    it is named for.
 
     This is the discriminator that BOUNDS the guard: a preserved task's genuine,
     unrelated findings still reach Stage 2 because they answer False here.
@@ -327,20 +340,26 @@ def flag_asserts_stranded(flag: Any) -> bool:
         return False
     if contains_any_casefolded(flag.get('flag_type'), STRANDED_FLAG_TOKEN_FAMILY):
         return True
-    return (
-        _action_prose_contains(flag, STRANDED_ACTION_VERB_FAMILY)
-        and _action_prose_contains(flag, STRANDED_ACTION_TARGET_FAMILY)
-    )
+    return _requests_reset_out_of_in_progress(flag)
 
 
-def _action_prose_contains(flag: dict[str, Any], family: tuple[str, ...]) -> bool:
-    """Return True iff any :data:`_STRANDED_ACTION_FIELDS` field contains a *family* member.
+def _requests_reset_out_of_in_progress(flag: dict[str, Any]) -> bool:
+    """Channel 2 of :func:`flag_asserts_stranded`, whose docstring states the rule.
 
-    Checked per field rather than over the fields joined, so a match can never
-    straddle the boundary between two of them.  Total over non-``str`` values.
-    Pure, sync, no I/O.
+    Each field is read on its own rather than joined, so no match can straddle
+    the boundary between two of them.  Total over non-``str`` values.  Pure,
+    sync, no I/O.
     """
-    return any(contains_any_casefolded(flag.get(field), family) for field in _STRANDED_ACTION_FIELDS)
+    texts = [text for field in _STRANDED_ACTION_FIELDS if isinstance(text := flag.get(field), str)]
+    in_one_field = any(
+        contains_any_casefolded(text, STRANDED_ACTION_VERB_FAMILY)
+        and contains_any_casefolded(text, STRANDED_ACTION_TARGET_FAMILY)
+        for text in texts
+    )
+    across_fields = any(
+        contains_any_casefolded(text, STRANDED_ACTION_TARGET_FAMILY) for text in texts
+    ) and any(_RESET_AIMED_AT_THE_TASK.search(text) for text in texts)
+    return in_one_field or across_fields
 
 
 def _is_usable_task_id(component: str) -> bool:

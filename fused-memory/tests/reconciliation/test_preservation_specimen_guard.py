@@ -265,11 +265,32 @@ class TestFlagAssertsStranded:
             'reverse_split': {
                 'task_id': '3105',
                 'flag_type': flag_type,
-                'description': 'Task 3105 should be reset; nothing is driving it.',
+                'description': 'Nothing has driven task 3105 for nine days; redispatch the task.',
                 'suggested_action': 'Move task 3105 out of in-progress.',
             },
         }[shape]
         assert flag_asserts_stranded(flag) is True
+
+    @pytest.mark.parametrize(
+        'suggested_action',
+        [
+            'Reset the priority override back to its default.',
+            "Reset the task's priority override back to its default.",
+        ],
+    )
+    def test_a_reset_aimed_elsewhere_does_not_pair_with_a_status_mention(self, suggested_action):
+        """Across fields, the verb pairs with the status only when it resets the task.
+
+        A preserved specimen is permanently in-progress, so its unrelated
+        findings state that status routinely.
+        """
+        flag = {
+            'task_id': '3105',
+            'flag_type': 'stale_priority_override',
+            'description': 'Task 3105 is in-progress and carries a 30-day-old priority override.',
+            'suggested_action': suggested_action,
+        }
+        assert flag_asserts_stranded(flag) is False
 
     def test_a_status_mention_without_a_reset_verb_does_not_match(self):
         """The verb half stays required when the match spans both fields."""
