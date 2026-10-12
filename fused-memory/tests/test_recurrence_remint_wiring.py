@@ -16,6 +16,7 @@ import pathlib
 import pytest
 import pytest_asyncio
 from _ast_guard import calls_named, parse_python_module
+from _fm_helpers import poll_until
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig
@@ -64,8 +65,7 @@ async def test_the_started_sweep_visits_every_root_and_cancels_cleanly(backend, 
 
     assert task is not None
     assert task.get_name() == 'recurrence_remint_sweep'
-    # noqa: wall-clock-deadline — wait_responsive is importable only under orchestrator/tests
-    await asyncio.wait_for(remint.swept_all.wait(), timeout=5)
+    await poll_until(remint.swept_all.is_set)
     assert remint.seen[:2] == roots
     task.cancel()
     with pytest.raises(asyncio.CancelledError):

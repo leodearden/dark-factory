@@ -29,10 +29,6 @@ from fused_memory.config.schema import (  # noqa: E402
     DedupOutageDetectorConfig,
     FusedMemoryConfig,
 )
-from fused_memory.middleware.recurrence_mint import (  # noqa: E402
-    REMINT_SWEEP_INTERVAL_SECS,
-    run_remint_sweep_loop,
-)
 from fused_memory.reconciliation.audit_trail_rotation import (  # noqa: E402
     memory_service_archive,
 )
@@ -1651,6 +1647,11 @@ def _start_remint_sweep(
     crash between the done write and the mint. Without a task backend there
     is no chain to repair, so nothing is spawned.
     """
+    from fused_memory.middleware.recurrence_mint import (
+        REMINT_SWEEP_INTERVAL_SECS,
+        run_remint_sweep_loop,
+    )
+
     if task_backend is None:
         logger.info('  Recurrence re-mint sweep: disabled (no task backend)')
         return None

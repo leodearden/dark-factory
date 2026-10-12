@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
+from _fm_helpers import poll_until
 
 from fused_memory.backends import sqlite_task_backend
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
@@ -506,8 +507,7 @@ async def test_cancelled_request_still_mints_the_successor(gated_backend, event_
     interceptor = TaskInterceptor(gated_backend, None, event_buffer)
     pid = await _seed_carrier(interceptor, gated_backend, root)
     request = asyncio.create_task(interceptor.set_task_status(pid, 'done', root))
-    # noqa: wall-clock-deadline — wait_responsive is importable only under orchestrator/tests
-    await asyncio.wait_for(gated_backend.mint_entered.wait(), timeout=5)
+    await poll_until(gated_backend.mint_entered.is_set)
 
     request.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -529,8 +529,7 @@ async def test_cancelled_mint_logs_the_failure_and_reraises(
     mint = asyncio.create_task(mint_successor(
         gated_backend, write_lock=asyncio.Lock(), predecessor_id=pid, project_root=root, tag=None,
     ))
-    # noqa: wall-clock-deadline — wait_responsive is importable only under orchestrator/tests
-    await asyncio.wait_for(gated_backend.mint_entered.wait(), timeout=5)
+    await poll_until(gated_backend.mint_entered.is_set)
 
     with caplog.at_level(logging.ERROR, logger=MINT_LOGGER):
         mint.cancel()
@@ -850,8 +849,7 @@ async def _run_loop_until_swept(
     loop = asyncio.create_task(
         run_remint_sweep_loop(remint, project_roots, interval_secs=interval_secs),
     )
-    # noqa: wall-clock-deadline — wait_responsive is importable only under orchestrator/tests
-    await asyncio.wait_for(remint.swept_enough.wait(), timeout=5)
+    await poll_until(remint.swept_enough.is_set)
     loop.cancel()
     with pytest.raises(asyncio.CancelledError):
         await loop
