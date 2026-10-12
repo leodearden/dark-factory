@@ -35,6 +35,7 @@ from shared.defects import (
 )
 from shared.project_id import normalize_project_id
 from shared.project_layout import tasks_db
+from shared.sqlite_column_migration import add_column_if_missing
 from shared.task_metadata import (
     _WHOLE_METADATA_FIELD,
     SchemaWarning,
@@ -499,9 +500,10 @@ async def _migrate_v1_to_v2(conn: aiosqlite.Connection) -> None:
     """v1 -> v2 (task 2182, PRD plans/task-status-authority-prd.md C4/D4):
     add the ``claimant_run_id`` / ``heartbeat_at`` columns.
 
-    Feature-detects each column via ``PRAGMA table_info`` and
-    ``ALTER TABLE ADD COLUMN``s whichever is missing (idempotent -- a fresh DB
-    created by ``_SCHEMA_SQL`` already has both, so neither ALTER fires), then
+    Adds whichever column is missing via
+    ``shared/src/shared/sqlite_column_migration.py::add_column_if_missing``
+    (idempotent -- a fresh DB created by ``_SCHEMA_SQL`` already has both, so
+    neither ALTER fires), then
     stamps ``user_version = 2``. Reached only after the v0->v1 step, so
     ``parent_id`` is already gone by the time this runs.
 
@@ -511,12 +513,8 @@ async def _migrate_v1_to_v2(conn: aiosqlite.Connection) -> None:
     (the common case) would silently keep missing columns forever if this step
     only stamped the version without also running the ALTERs.
     """
-    info_rows = await (await conn.execute('PRAGMA table_info(tasks)')).fetchall()
-    col_names = {r[1] for r in info_rows}
-    if 'claimant_run_id' not in col_names:
-        await conn.execute('ALTER TABLE tasks ADD COLUMN claimant_run_id TEXT')
-    if 'heartbeat_at' not in col_names:
-        await conn.execute('ALTER TABLE tasks ADD COLUMN heartbeat_at TEXT')
+    await add_column_if_missing(conn, 'tasks', 'claimant_run_id', 'TEXT')
+    await add_column_if_missing(conn, 'tasks', 'heartbeat_at', 'TEXT')
     await conn.execute('PRAGMA user_version = 2')
     await conn.commit()
 
@@ -537,10 +535,7 @@ async def _migrate_v2_to_v3(conn: aiosqlite.Connection) -> None:
     creates an index: the UNIQUE index is task A2's job, gated on this audit
     coming back clean.
     """
-    info_rows = await (await conn.execute('PRAGMA table_info(tasks)')).fetchall()
-    col_names = {r[1] for r in info_rows}
-    if 'candidate_key' not in col_names:
-        await conn.execute('ALTER TABLE tasks ADD COLUMN candidate_key TEXT')
+    await add_column_if_missing(conn, 'tasks', 'candidate_key', 'TEXT')
 
     cursor = await conn.execute(
         "SELECT tag, id, title, metadata FROM tasks WHERE status != 'cancelled'",
