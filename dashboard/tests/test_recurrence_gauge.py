@@ -8,12 +8,16 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
+from _tasks_db_fixture import task_row, write_tasks_db
 from shared.task_statuses import TaskStatus
 
+from dashboard.data.db import DbPool
 from dashboard.data.recurrence_gauge import ChainEntry, ChainState, chain_state, classify_chains
+from dashboard.data.root_invariants import scan_root_invariants
 
 NOW = datetime(2026, 10, 12, 12, 0, tzinfo=UTC)
 HOUR = timedelta(hours=1)
@@ -244,3 +248,59 @@ def test_an_entry_without_a_fire_time_or_escalation_lookup_on_the_wire():
     assert wire['state'] == 'overdue'
     assert wire['at'] is None
     assert wire['pending_escalation_ids'] is None
+
+
+def _db_path(root: Path) -> Path:
+    return root / '.taskmaster' / 'tasks' / 'tasks.db'
+
+
+def _row(task: dict[str, Any]) -> dict[str, Any]:
+    return task_row(task['id'], task['status'], tag=task['tag'], metadata=task['metadata'])
+
+
+async def _scan_root(root: Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    db_path = write_tasks_db(_db_path(root), rows)
+    pool = DbPool()
+    try:
+        conn = await pool.get(db_path)
+        record = await scan_root_invariants(root, db_path, conn, now=NOW, pending_escalations={})
+    finally:
+        await pool.close_all()
+    return record.to_wire()
+
+
+async def test_an_ok_root_lists_its_chains_with_their_states(tmp_path):
+    rows = [
+        _row(link(1, 'pending', NOW + HOUR, key='future-job')),
+        _row(link(2, 'pending', NOW - 3 * HOUR, key='late-job')),
+        _row(link(3, 'done', key='crashed-mint')),
+        task_row(4, 'pending'),
+    ]
+    wire = await _scan_root(tmp_path / 'proj', rows)
+    assert wire['status'] == 'ok'
+    assert [(c['key'], c['state'], c['link_id']) for c in wire['chains']] == [
+        ('crashed-mint', 'broken', 3),
+        ('future-job', 'scheduled', 1),
+        ('late-job', 'overdue', 2),
+    ]
+    assert all(c['pending_escalation_ids'] == [] for c in wire['chains'])
+
+
+async def test_a_root_with_no_chain_carriers_measures_none(tmp_path):
+    wire = await _scan_root(tmp_path / 'proj', [task_row(1, 'pending'), task_row(2, 'done')])
+    assert wire['status'] == 'ok'
+    assert wire['chains'] == []
+
+
+async def test_metadata_that_only_mentions_recurrence_is_not_a_chain(tmp_path):
+    row = task_row(1, 'done', metadata={'note': 'add recurrence later', 'recurrence_key': 'x'})
+    wire = await _scan_root(tmp_path / 'proj', [row])
+    assert wire['chains'] == []
+
+
+async def test_an_unopened_root_makes_no_chain_claim(tmp_path):
+    root = tmp_path / 'proj'
+    record = await scan_root_invariants(
+        root, _db_path(root), None, now=NOW, pending_escalations={}
+    )
+    assert record.to_wire()['chains'] is None
