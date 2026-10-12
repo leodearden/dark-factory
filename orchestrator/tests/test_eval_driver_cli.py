@@ -40,11 +40,11 @@ def _mk_result(
     plan_quality: float | None = None,
     plan_steps: int | None = None,
     cap_tainted: bool = False,
-    invocation_error: str | None = None,
+    invocation_errors: list[dict[str, str]] | None = None,
 ) -> EvalResult:
     """A canned PASSING EvalResult carrying the C4 metrics the report reads.
 
-    ``plan_quality`` / ``cap_tainted`` / ``invocation_error`` mirror the
+    ``plan_quality`` / ``cap_tainted`` / ``invocation_errors`` mirror the
     PLAN-ONLY architect shape ``run_architect_eval`` writes (task 3099): a
     plan-only cell runs no test, so it carries ``tests_pass=None`` and its
     quality in ``plan_quality``.
@@ -73,7 +73,7 @@ def _mk_result(
             'plan_quality': plan_quality,
             'plan_steps': plan_steps,
             'cap_tainted': cap_tainted,
-            'invocation_error': invocation_error,
+            'invocation_errors': invocation_errors,
         },
         worktree_path='/tmp/eval-wt',
         wall_clock_ms=dur_ms,
@@ -310,7 +310,10 @@ def _arch_ofat_results():
                    tests_pass=None, cost=0.3, dur_ms=60_000),
         _mk_result('arch-fable-high', role='architect', plan_quality=None,
                    tests_pass=None, cost=0.0, dur_ms=0, cap_tainted=True,
-                   invocation_error='architect:model_not_found: no such model'),
+                   invocation_errors=[{
+                       'stage': 'architect', 'cause': 'model_not_found',
+                       'reason': 'no such model',
+                   }]),
         _mk_result('impl-opus-high', role='implementer'),
     ]
 

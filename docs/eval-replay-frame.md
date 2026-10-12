@@ -99,7 +99,7 @@ Production dispatch never constructs the subclass, so it can never be framed.
 The stamp names the REGIME the harness ran the cell under. It is written on
 every `run_architect_eval` and `run_end_to_end` cell, including harness-error,
 cap-tainted and collect-metrics-failed cells; whether the prompt was delivered
-is what `cap_tainted` and `invocation_error` say.
+is what `cap_tainted` and `invocation_errors` say.
 
 A readout that mixes framed and unframed cells must split on this field. Bump
 `REPLAY_FRAME_ID` whenever the block text changes materially, so one id always
@@ -142,7 +142,7 @@ One live framed cell is recorded. It ran from an unsandboxed session, because
 - `plan_steps`: 7
 - `plan_quality`: 0.82
 - `cost_usd`: 2.5042058 (architect only; the judge's 1.2203746 is reported separately)
-- `invocation_error`: `None`
+- `invocation_errors`: `None`
 
 The architect planned against a base that is the first parent of the task's
 own landing merge, `97059b1dd8`. §1 names this fixture as tranche 1's decline
