@@ -85,9 +85,13 @@ from fused_memory.middleware.pre_done_hook import run_hook as _run_hook
 from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
 from fused_memory.middleware.recurrence_mint import (
     RECURRENCE_MINT_SOURCE,
+    MintOutcome,
     MintOutcomeKind,
+    MintTrigger,
+    broken_chains,
     mint_successor,
     mints_successor,
+    remint_broken_chain,
 )
 from fused_memory.middleware.scope_violation_escalator import ScopeViolationEscalator
 from fused_memory.middleware.soft_scope_signals import (
@@ -1883,17 +1887,52 @@ class TaskInterceptor:
             tag=tag,
         )
         if outcome.kind is MintOutcomeKind.MINTED:
-            event = self._make_event(
-                EventType.task_created,
-                project_root,
-                {
-                    'operation': 'add_task',
-                    'task_id': outcome.successor_id,
-                    'source': RECURRENCE_MINT_SOURCE,
-                    'minted_from': task_id,
-                },
+            await self._journal_minted_successor(
+                successor_id=outcome.successor_id,
+                predecessor_id=task_id,
+                project_root=project_root,
+                trigger=MintTrigger.DONE_WRITE,
             )
-            await self._journal(event)
+
+    async def remint_broken_recurrence_chains(self, project_root: str) -> tuple[MintOutcome, ...]:
+        """Mint the missing successor of every chain ``recurrence_mint.broken_chains`` finds."""
+        tm = await self._ensure_taskmaster()
+        write_lock = self._write_lock(resolve_project_id(project_root))
+        outcomes: list[MintOutcome] = []
+        for chain in await broken_chains(tm, project_root):
+            outcome = await remint_broken_chain(
+                tm, write_lock=write_lock, chain=chain, project_root=project_root,
+            )
+            if outcome.kind is MintOutcomeKind.MINTED:
+                await self._journal_minted_successor(
+                    successor_id=outcome.successor_id,
+                    predecessor_id=chain.link_id,
+                    project_root=project_root,
+                    trigger=MintTrigger.REMINT_SWEEP,
+                )
+            outcomes.append(outcome)
+        return tuple(outcomes)
+
+    async def _journal_minted_successor(
+        self,
+        *,
+        successor_id: str | None,
+        predecessor_id: str,
+        project_root: str,
+        trigger: MintTrigger,
+    ) -> None:
+        event = self._make_event(
+            EventType.task_created,
+            project_root,
+            {
+                'operation': 'add_task',
+                'task_id': successor_id,
+                'source': RECURRENCE_MINT_SOURCE,
+                'minted_from': predecessor_id,
+                'trigger': trigger.value,
+            },
+        )
+        await self._journal(event)
 
     # ── Claimant-only writes (no status-FSM gate) ───────────────────────
 

@@ -104,6 +104,10 @@ atomic with the status write — the crash window between them leaves a chain wh
 surfaces. Mint failure is fail-soft: it never fails the status write, logs a structured ERROR,
 and leaves the same gauge-visible broken state (INV-4: the standing gauge enumeration is the
 escape, not a silent suppressor).
+*(Amended, task 6572 — Leo's 2026-10-09 ruling on esc-4681-3, option D: a re-mint sweep at
+fused-memory startup and hourly mints the successor of every chain whose current link is done,
+so the broken state is repaired as well as surfaced by R-D5's gauge; current link defined once
+in shared/src/shared/recurrence_chains.py::current_links.)*
 
 **Idempotence/dedup**: before minting, the hook checks for an existing non-terminal link with
 the same `recurrence.key`; if one exists, it skips (protects against replayed transitions and
@@ -170,6 +174,10 @@ submit with a structured error.
 exists afterwards for that `key` (minted, or pre-existing non-terminal → skip). On `cancelled`:
 none is minted. On any non-terminal status: none. The mint never fails the status write; a mint
 failure logs structured ERROR and leaves the broken state visible per C-4.
+*(Amended, task 6572 — Leo's 2026-10-09 ruling on esc-4681-3, option D: a re-mint sweep at
+fused-memory startup and hourly mints the successor of every chain whose current link is done,
+so the broken state is repaired as well as surfaced by R-D5's gauge; current link defined once
+in shared/src/shared/recurrence_chains.py::current_links.)*
 
 **C-3 (successor shape).** Copies title/description/`before_done`/`recurrence.{key,
 interval_secs}`; `milestone.at = terminal_time + interval_secs`; `recurrence.minted_from =

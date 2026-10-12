@@ -1222,13 +1222,27 @@ same-files successor would be refused as a duplicate of its own predecessor
 (`fused-memory/src/fused_memory/middleware/recurrence_mint.py::_successor_title`).
 `cancelled` ends the chain, and an existing non-terminal link with the same
 `key` suppresses the mint. A mint failure never fails the status write: it
-logs `recurrence_mint_failed:` and leaves the link `done` with no successor,
-the *broken* state the chain-state gauge (a separate PRD task, not yet live)
-will surface. A request cancelled after its `done` write committed does not
-abandon the mint, which runs on to completion; a mint that is itself cancelled
-logs that same line. A link completed inside the same wall-clock second as its
-predecessor would give its successor its own run label, so that mint fails
-the same way.
+logs `recurrence_mint_failed:`. A request cancelled after its `done` write
+committed does not abandon the mint, which runs on to completion; a mint that
+is itself cancelled logs that same line. A link completed inside the same
+wall-clock second as its predecessor would give its successor its own run
+label, so that mint fails the same way.
+
+A failed mint, or a crash between the `done` write and the mint, leaves the
+chain *broken*: its current link is `done` and no live link exists
+(`shared/src/shared/recurrence_chains.py::current_links` is the one
+definition of a chain's current link). It stays broken until fused-memory's
+re-mint sweep
+(`fused-memory/src/fused_memory/middleware/recurrence_mint.py::run_remint_sweep_loop`)
+repairs it. The sweep runs at startup and then hourly. Under the write lock it
+re-reads each chain it found and leaves alone one that is no longer broken,
+then mints through the same C-2-checked path, so a re-run never double-mints
+and a chain ended since the sweep looked stays ended. It anchors the
+successor's `at` on the predecessor's stored terminal time. Each repair logs a
+`recurrence_remint:` WARNING and journals a `task_created` event with
+`trigger='remint_sweep'`. A chain that still cannot be minted, such as the
+same-second run-label collision or a carrier that no longer verifies, logs
+`recurrence_mint_failed:` on every sweep.
 
 ---
 
