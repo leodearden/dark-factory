@@ -254,29 +254,50 @@ _POLICY_RATIONALE: Final = "plans/review-all-s25-scripts-instruments-prd.md D5"
 
 
 class UnitFamily(enum.Enum):
-    """A unit whose Environment= policy ENV_POLICY declares."""
+    """A unit whose Environment= policy ENV_POLICY declares.
+
+    The renderer reads every family's host_local column. Each family's checker
+    reads one more column, and the two properties below say which.
+    """
 
     DASHBOARD = "dashboard"
     FUSED_MEMORY = "fused-memory"
+
+    @property
+    def checker_compares_cross_copy(self) -> bool:
+        """Its checker value-compares the copies, so EnvPolicy.compared_cross_copy applies."""
+        return self is UnitFamily.DASHBOARD
+
+    @property
+    def checker_requires_values(self) -> bool:
+        """Its checker requires Environment= lines verbatim, so EnvPolicy.required_value applies."""
+        return self is UnitFamily.FUSED_MEMORY
 
 
 @dataclasses.dataclass(frozen=True)
 class EnvPolicy:
     """How one unit family treats one Environment= variable. Why each row is so: PRD D5.
 
-    - host_local: the renderer preserves the installed value across a re-render.
-    - compared_cross_copy: the dashboard checker value-compares the committed and
-      installed copies; False puts the name on its DIVERGENCE_ALLOWLIST.
-    - required_value: the fused-memory checker requires ``Environment=NAME=VALUE``
-      verbatim and --fix appends it; None means not required.
+    - host_local, read for every family: the renderer preserves the installed
+      value across a re-render.
+    - compared_cross_copy, read where ``checker_compares_cross_copy``: the
+      dashboard checker value-compares the committed and installed copies;
+      False puts the name on its DIVERGENCE_ALLOWLIST.
+    - required_value, read where ``checker_requires_values``: the fused-memory
+      checker requires ``Environment=NAME=VALUE`` verbatim and --fix appends
+      it; None means not required.
+
+    The defaults are the policy of a name with no row. A column its family's
+    reader ignores must keep its default, so a setting that does nothing
+    cannot be written.
     """
 
     unit_family: UnitFamily
     name: str
     _: dataclasses.KW_ONLY
-    host_local: bool
-    compared_cross_copy: bool
-    required_value: str | None
+    host_local: bool = False
+    compared_cross_copy: bool = True
+    required_value: str | None = None
 
     def __post_init__(self) -> None:
         violation = self._violation()
@@ -297,13 +318,27 @@ class EnvPolicy:
                 f"required_value={self.required_value!r} spans lines, so it cannot be "
                 "written as one Environment= line"
             )
+        if not self.compared_cross_copy and not self.unit_family.checker_compares_cross_copy:
+            return (
+                "compared_cross_copy=False on a family whose checker compares no values "
+                "across copies, so the setting would do nothing"
+            )
+        if self.required_value is not None and not self.unit_family.checker_requires_values:
+            return (
+                f"required_value={self.required_value!r} on a family whose checker "
+                "requires no Environment= lines, so the setting would do nothing"
+            )
         if self.host_local and self.required_value is not None:
             return (
                 f"host_local=True with required_value={self.required_value!r} (B5): the "
                 "fused-memory checker's --fix would append a last-wins line after the "
                 f"last [{SERVICE_SECTION}] line, clobbering the value the renderer preserved"
             )
-        if self.host_local and self.compared_cross_copy:
+        if (
+            self.host_local
+            and self.compared_cross_copy
+            and self.unit_family.checker_compares_cross_copy
+        ):
             return (
                 "host_local=True with compared_cross_copy=True: the dashboard checker "
                 "would value-compare a value the renderer deliberately keeps divergent, "
@@ -316,8 +351,8 @@ class EnvPolicy:
 class EnvPolicyTable:
     """The policy rows and their projections, one per consumer.
 
-    A name with no row takes the default: not preserved, value-compared across
-    copies, not required.
+    A name with no row has the policy of ``EnvPolicy(family, name)``, a row that
+    sets no column.
     """
 
     rows: tuple[EnvPolicy, ...]
@@ -360,39 +395,18 @@ ENV_POLICY: Final = EnvPolicyTable(
             "DASHBOARD_KNOWN_PROJECT_ROOTS",
             host_local=True,
             compared_cross_copy=False,
-            required_value=None,
         ),
-        EnvPolicy(
-            UnitFamily.DASHBOARD,
-            "DASHBOARD_PROJECT_ROOT",
-            host_local=False,
-            compared_cross_copy=False,
-            required_value=None,
-        ),
-        EnvPolicy(
-            UnitFamily.FUSED_MEMORY,
-            "MEM0_TELEMETRY",
-            host_local=False,
-            compared_cross_copy=True,
-            required_value="false",
-        ),
+        EnvPolicy(UnitFamily.DASHBOARD, "DASHBOARD_PROJECT_ROOT", compared_cross_copy=False),
+        EnvPolicy(UnitFamily.FUSED_MEMORY, "MEM0_TELEMETRY", required_value="false"),
         EnvPolicy(
             UnitFamily.FUSED_MEMORY,
             "PATH",
-            host_local=False,
-            compared_cross_copy=True,
             required_value=(
                 "%h/.local/bin:%h/bin:%h/.cargo/bin:"
                 "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
             ),
         ),
-        EnvPolicy(
-            UnitFamily.FUSED_MEMORY,
-            "DASHBOARD_KNOWN_PROJECT_ROOTS",
-            host_local=True,
-            compared_cross_copy=False,
-            required_value=None,
-        ),
+        EnvPolicy(UnitFamily.FUSED_MEMORY, "DASHBOARD_KNOWN_PROJECT_ROOTS", host_local=True),
     )
 )
 

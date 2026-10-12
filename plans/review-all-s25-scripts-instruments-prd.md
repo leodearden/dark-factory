@@ -234,10 +234,13 @@ Six workstreams, each owning the files it touches:
 
 ### D5 policy rows
 
-The rows live in `scripts/systemd_unit_parity.py::ENV_POLICY`. A name with no row takes the default
-policy: not preserved, value-compared across copies, not required. Each row is what it is for these
-reasons, which used to live in the allowlist's value strings and the renderer's and fused-memory
-checker's comments.
+The rows live in `scripts/systemd_unit_parity.py::ENV_POLICY`. Each column has one reader. The
+renderer reads `host_local` for both families, the dashboard checker reads `compared_cross_copy` for
+dashboard rows, and the fused-memory checker reads `required_value` for fused-memory rows. A row
+states only the columns it changes from their defaults, and a name with no row takes the defaults:
+not preserved, value-compared across copies, not required. Each row is what it is for these reasons,
+which used to live in the allowlist's value strings and the renderer's and fused-memory checker's
+comments.
 
 **dashboard `DASHBOARD_KNOWN_PROJECT_ROOTS`: host-local, not compared.** This is the gate's declared
 hole. Cost/burndown aggregation roots beyond this repo are a local setting: the committed unit's own
@@ -255,7 +258,7 @@ one copy, against that copy's `WorkingDirectory=`
 `__REPO_ROOT__`, so preserving it would pin the data root at the previous checkout while
 `WorkingDirectory=` moved to the new one, which is exactly the intra-copy drift that check reports.
 
-**fused-memory `DASHBOARD_KNOWN_PROJECT_ROOTS`: host-local, not compared, not required.** On this
+**fused-memory `DASHBOARD_KNOWN_PROJECT_ROOTS`: host-local, not required.** On this
 unit the variable is `fused_memory/models/scope.py`'s `KNOWN_PROJECT_ROOTS_ENV`, and reconciliation
 raises `UnknownProjectError` for a project outside the set. Collapsing it therefore de-registers
 every other project from reconciliation (task 4796). The fused-memory checker cannot see that
@@ -280,10 +283,13 @@ import.
   preserved value, and the checker exits 0.
   `tests/scripts/test_check_fused_memory_unit_parity.py::test_a_required_known_project_roots_line_would_reclobber`
   demonstrates the clobber.
-- `host_local` with `compared_cross_copy`. The dashboard checker would value-compare a value the
-  renderer deliberately keeps divergent, so the gate would be red on every configured host. This
-  rule is what makes "the renderer's preserve set is a subset of the allowlist" hold by
-  construction.
+- `host_local` with `compared_cross_copy` on a dashboard row. The dashboard checker would
+  value-compare a value the renderer deliberately keeps divergent, so the gate would be red on every
+  configured host. This rule is what makes "the renderer's dashboard preserve set is a subset of the
+  allowlist" hold by construction.
+- A column changed from its default on a family whose checker never reads it: `required_value` on a
+  dashboard row, or `compared_cross_copy=False` on a fused-memory row. The setting would do nothing,
+  and nothing would notice an author flipping it.
 
 ## Contracts (B+H)
 
