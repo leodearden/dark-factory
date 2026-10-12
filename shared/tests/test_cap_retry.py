@@ -2513,9 +2513,10 @@ class TestCancelledErrorReleaseProbeSlot:
 class TestCapRetryUnattributedCapHit:
     """Heuristic cap fires but _handle_cap_detected returns False (token unresolvable).
 
-    In this scenario, unattributed_cap is set True (skip_confirm was renamed to
-    unattributed_cap to better reflect its broader semantics). on_agent_complete
-    must NOT be called and cost_store.save_invocation must record capped=True.
+    In this scenario, report() settles the slot with the synthetic CapHit, so the
+    slot's one-verdict rule turns the completion confirm into a no-op.
+    on_agent_complete must NOT be called and cost_store.save_invocation must
+    record capped=True for this returned attempt.
     """
 
     def _make_heuristic_result(self) -> AgentResult:
