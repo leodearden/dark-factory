@@ -30,7 +30,6 @@ from fused_memory.utils.referent_resolution import (
     REFERENT_SOURCES,
     ReferentResolution,
     _conflicting_referents,
-    _declared_referents,
     resolve_referents,
 )
 from fused_memory.utils.validation import InputValidationError
@@ -40,8 +39,8 @@ GROUP = 'dark_factory'
 
 #: Spelled as escapes, mirroring tests/test_canonical_labels.py: U+212A renders
 #: as an ordinary 'K', so a literal-character fixture would be unreviewable.
-LATIN_SMALL_LETTER_LONG_S = 'ſ'  # str.lower() does NOT fold this onto 's'
-KELVIN_SIGN = 'K'  # str.lower() DOES fold this onto 'k'
+LATIN_SMALL_LETTER_LONG_S = '\u017f'
+KELVIN_SIGN = '\u212a'
 
 
 class TestReferentSourcesVocabulary:
@@ -1098,8 +1097,11 @@ class TestMalformedDeclarationIsRejectedLoudly:
         guard fires, so reordering or dropping either cannot mint a foreign
         ``'taſk:2500'`` node unnoticed."""
         with pytest.raises(InputValidationError):
-            _declared_referents(
-                [{'id': 2500, 'project_id': lookalike_project_id}], group_id=GROUP
+            resolve_referents(
+                declared=[{'kind': 'task', 'id': 2500, 'project_id': lookalike_project_id}],
+                metadata={},
+                content='',
+                group_id=GROUP,
             )
 
     @pytest.mark.parametrize(
