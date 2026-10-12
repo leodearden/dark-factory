@@ -1106,14 +1106,10 @@ def shape_scheduler(
       the point: zero and unknown must not collapse, or a dead orchestrator
       renders as a quiet one.
 
-    ``degraded_projects`` is projected as its OWN pair —
-    ``degraded``/``degraded_projects``, spelled exactly like
-    ``offline``/``offline_projects`` and ``paused``/``paused_projects`` so the
-    UI reads one idiom — and is deliberately NOT an addition to
-    ``offline_projects``.  The two facts send an operator to different places:
-    offline means the read demonstrably FAILED (fused-memory is unreachable),
-    degraded means the whole-handler budget expired and the project's state is
-    simply UNKNOWN.  Merging them reads a healthy fused-memory as a dead one.
+    ``degraded_projects`` is its own ``degraded``/``degraded_projects`` pair,
+    never folded into ``offline_projects``: offline means the read FAILED,
+    degraded means the project's state is UNKNOWN (see the ``scheduler``
+    module docstring).
 
     ``recovery_events`` and ``degraded_projects`` are required keywords: a new
     collector element must be threaded through here deliberately, and until it

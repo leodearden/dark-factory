@@ -511,18 +511,9 @@ async def test_collect_scheduler_state_surfaces_degraded_projects_distinctly(
 ):
     """A budget-expired project is DEGRADED, never folded into offline.
 
-    The two facts mean different things and send an operator to different
-    places: offline means the read demonstrably FAILED (fused-memory is
-    unreachable — go restart it); degraded means the whole-handler budget
-    expired before this project was read, so its state is simply UNKNOWN and
-    nothing was proven down. Merging degraded into ``offline_projects`` would
-    send an operator to restart a healthy fused-memory, which is why this test
-    asserts the SEPARATION and not merely the presence of the new element.
-
-    ``collect_tasks_with_counts`` already computes the marker; the defect is
-    that ``collect_scheduler_state`` read it through ``collect_active_tasks``,
-    whose narrower two-element contract absorbs it (see that function's
-    docstring, which names this call as the escape hatch).
+    Offline means the read FAILED; degraded means the project's state is
+    UNKNOWN.  The test asserts the SEPARATION, not merely the presence of the
+    new element.
     """
     from unittest.mock import AsyncMock, patch
 
@@ -957,17 +948,9 @@ def test_shape_scheduler_envelope():
 def test_shape_scheduler_projects_degraded_separately_from_offline():
     """``degraded`` reaches the wire as its OWN pair, never folded into offline.
 
-    Mirrors the ``offline``/``offline_projects`` and ``paused``/``paused_projects``
-    spelling so the UI reads one idiom, and pins that neither list ever contains
-    the other's member: offline means the read demonstrably FAILED, degraded
-    means the budget expired and the project's state is UNKNOWN.
-
-    The missing-keyword arm pins the same required-keyword contract
-    ``shape_scheduler``'s own docstring states for ``recovery_events`` — "a new
-    collector element must be threaded through here deliberately, and until it
-    is the mismatch is a loud TypeError rather than a field that silently never
-    reaches the UI".  That silent-drop class is exactly what this workstream
-    exists to close, so it is pinned rather than assumed.
+    The missing-keyword arm pins ``shape_scheduler``'s required-keyword
+    contract: an unthreaded collector element is a loud ``TypeError``, not a
+    field that silently never reaches the UI.
     """
     import pytest
 
@@ -3479,20 +3462,10 @@ async def test_two_same_basename_roots_each_keep_their_own_snapshot(
 ):
     """``/x/proj`` and ``/y/proj`` each keep their OWN per-root snapshot.
 
-    THE DEFECT THIS PINS.  ``label_to_root = {_project_label(r): r for r in
-    roots_to_query}`` is a label-keyed dict, so two roots sharing a basename
-    collapse and only the LAST survives.  The gather still produces BOTH
-    results, and the re-join hands root b to both of them — so root a's pin
-    entry, park stacks and paused state are emitted carrying root b's
-    ``project_root``.  The React drawer's override POSTs then target the wrong
-    project, and root a's own state "vanishes" from the operator's view with
-    no warning.  Observed before the fix as
-    ``{('1', str(b)), ('2', str(b))}`` — root a's pin entry under root b's
-    identity.
-
-    No task rows are returned: this test is about the per-root SNAPSHOT join,
-    and empty rows keep the still-label-keyed row filter out of the picture
-    (that residue is a wire-vocabulary change, filed separately).
+    A label-keyed join would emit one root's pin entry under the other's
+    ``project_root``, and the React drawer's override POSTs would then target
+    the wrong project.  No task rows are returned: the row filter is still
+    label-keyed, and this test is about the per-root SNAPSHOT join only.
     """
     from unittest.mock import AsyncMock, patch
 

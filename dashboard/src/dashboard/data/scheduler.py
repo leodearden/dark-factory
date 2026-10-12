@@ -669,38 +669,21 @@ async def collect_scheduler_state(
                           means the project answered and had no sweeps; ABSENT
                           means offline (see module docstring).
         degraded_projects: Project labels whose state is UNKNOWN because the
-                          whole-handler budget expired before they were read.
-                          Offline means the read demonstrably FAILED; degraded
-                          means nothing was proven.  They must never be merged
-                          (see module docstring).  A degraded project's park
-                          stacks are withheld from ``rows`` and ``modules``:
-                          with no task rows, no owner's liveness is known.
+                          whole-handler budget expired before they were read;
+                          never merged into ``offline_projects`` (see module
+                          docstring).  Their park stacks are withheld from
+                          ``rows`` and ``modules``: with no task rows, no
+                          owner's liveness is known.
 
-    TWO SAME-BASENAME ROOTS: what is fixed here, and what is not.  Each
-    per-project result is paired to its OWN root by POSITION, so the per-root
-    snapshot join — pin queue, park stacks, paused state, ``project_root``
-    tagging — is correct for ``/x/proj`` and ``/y/proj`` simultaneously.
-
-    The remaining joins are NOT, and the residue is disclosed rather than
-    inherited silently.  Rows arriving from ``collect_tasks_with_counts`` are
-    tagged with the basename label UPSTREAM and carry no root at all
-    (``_task_uid`` is ``f'{label}/T-{id}'``, the React tab's map key), so the
-    ``project_active`` row filter, the ``roots_to_query`` offline filter, the
-    ``{label}/{tid}`` sparkline key, the ``recovery_events`` key and module
-    contention's ``(project, path)`` key all still collapse two roots that
-    share a basename.  Making them root-unique means changing the wire label
-    vocabulary across ``redux_api`` and six JSX consumers — filed as ticket
-    ``tkt_0RTY9RTA8NJ7RDAQ5SY7PRM11T``, not attempted here.
+    Snapshot data is joined to its root by position, so two roots sharing a
+    basename keep their own pin queue, park stacks and ``project_root``; the
+    label-keyed outputs (task rows, sparkline and recovery keys, module
+    contention) still collapse them.
     """
     effective_now = resolve_now(now)
     since = effective_now - timedelta(hours=1)
 
-    # Fetch active tasks (for lock sets and titles).  Read through
-    # collect_tasks_with_counts rather than the narrower collect_active_tasks
-    # wrapper: this is the escape hatch that wrapper's own docstring names for
-    # callers that must distinguish "state unknown" from "reachable and empty".
-    # Drop-in — the wrapper already delegated here with these same defaults, so
-    # the MCP traffic, the shared `now` and the per-project budget are unchanged.
+    # Fetch active tasks (for lock sets and titles).
     (
         all_active, active_offline, _done_counts, degraded_projects, _count_unknown,
     ) = await collect_tasks_with_counts(client, config, now=effective_now)
@@ -742,11 +725,6 @@ async def collect_scheduler_state(
         the ``None`` sentinel lets the caller distinguish *offline* from
         *online-but-empty* so a legitimately quiescent project is never
         misclassified as offline.
-
-        The label is computed here for this function's own truncation WARNING
-        and is deliberately NOT carried out: the caller already holds the
-        ROOT, which is the stronger identity (two configured roots can share
-        one basename).
         """
         label = project_label(root)
 
@@ -839,15 +817,7 @@ async def collect_scheduler_state(
     # present-with-[] means "read succeeded, no sweeps", absent means offline.
     all_recovery_events: dict[str, list[dict]] = {}
 
-    # Paired by POSITION, never by label. `asyncio.gather` returns results in
-    # ARGUMENT order, which is what makes this pairing total and 1:1;
-    # `strict=True` asserts it rather than trusting it. The label is the
-    # directory BASENAME, so two configured roots can share one (``/a/proj``
-    # and ``/b/proj``) and a label-keyed join collapses them — emitting one
-    # root's snapshot, pin queue and park stacks under the OTHER root's
-    # `project_root`, which the React drawer then POSTs overrides against.
-    # Same idiom, for the same reason, as
-    # ``active_tasks.collect_tasks_with_counts``'s `by_root` pairing.
+    # Paired by position: two roots may share a basename.
     for root, result in zip(roots_to_query, per_project_results, strict=True):
         if isinstance(result, BaseException):
             logger.warning(
