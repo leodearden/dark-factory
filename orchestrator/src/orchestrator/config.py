@@ -40,6 +40,7 @@ from orchestrator.config_census_ignore import (  # noqa: F401 (re-exported for t
     parse_census_ignore_entries,
 )
 from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
+from orchestrator.verify_admission_gate import AdmissionOrder
 
 logger = logging.getLogger(__name__)
 
@@ -3770,6 +3771,15 @@ class OrchestratorConfig(BaseSettings):
     # load/reload instead of silently reaching pytest-xdist and failing the
     # whole test leg at verify time.
     verify_admission_pytest_n: str = Field(default='auto')
+    # The in-process admission gate in front of that flock slot (task 5628;
+    # plans/verify-admission-fifo-prd.md). The code default 'unordered' keeps
+    # today's random winner; a project flips to 'arrival' in its yaml. Promote
+    # is the gate age at which a background waiter ranks with task verifies,
+    # keeping its own arrival stamp. The alarm age sits above today's p90 wait
+    # (about 11h), so it is not a standing alarm.
+    verify_admission_order: AdmissionOrder = Field(default='unordered')
+    verify_admission_background_promote_secs: float = Field(default=7200.0, gt=0)
+    verify_admission_wait_alarm_secs: float = Field(default=43200.0, gt=0)
 
     # Steward lifecycle
     steward_lifetime_budget: float = Field(default=12.0)
@@ -6055,7 +6065,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # Verify admission control (task 2390 T2; task 2394 T6 adds the
         # seventh, `_pytest_n`) — all seven knobs are green-tier: an operator
         # can retune slot counts / nice tiers / the -n cap / toggle the gate
-        # without a process restart.
+        # without a process restart. The admission gate's knobs (task 5628)
+        # are read at each grant (slots/order/promote) or each watch tick
+        # (alarm), so a reload applies to the next grant or tick.
         'verify_admission_enabled',
         'verify_admission_task_slots',
         'verify_admission_slots_dir',
@@ -6063,6 +6075,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'verify_admission_nice_task',
         'verify_admission_nice_background',
         'verify_admission_pytest_n',
+        'verify_admission_order',
+        'verify_admission_background_promote_secs',
+        'verify_admission_wait_alarm_secs',
         # Per-role verify scope CPUWeight (task 5205): read at each verify scope
         # spawn (verify.py::_resolve_scope_cpu_weight), so a reload applies from
         # the next spawn; a scope already running keeps the weight it started with.
