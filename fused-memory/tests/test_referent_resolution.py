@@ -1089,13 +1089,14 @@ class TestMalformedDeclarationIsRejectedLoudly:
     def test_a_unicode_lookalike_of_the_task_vocabulary_is_rejected_loudly(
         self, lookalike_project_id
     ):
-        """canonical_labels.py's module docstring GUARANTEES the ASCII
-        task-vocabulary rule for the declared path through
-        ``validate_project_id``'s ASCII-only allowlist (long s, which
-        ``str.lower()`` does not fold) and through the vocabulary guard
-        (Kelvin sign, which it does). Pins the loud rejection, not which
-        guard fires, so reordering or dropping either cannot mint a foreign
-        ``'taſk:2500'`` node unnoticed."""
+        """The declared path never mints a foreign node for a Unicode
+        lookalike of task vocabulary. ``str.lower()`` does not fold the long
+        s, so the long-s spelling reaches the vocabulary guard unrecognised,
+        and only ``validate_project_id``'s ASCII allowlist stops it.
+        ``str.lower()`` does fold the Kelvin sign, so the Kelvin spelling
+        passes the allowlist as ``'task'``, and the vocabulary guard stops
+        it. Pins the loud rejection, not which guard fires, so dropping
+        either guard fails here."""
         with pytest.raises(InputValidationError):
             resolve_referents(
                 declared=[{'kind': 'task', 'id': 2500, 'project_id': lookalike_project_id}],
