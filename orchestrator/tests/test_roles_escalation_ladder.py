@@ -48,6 +48,8 @@ here therefore survives any rewording of the surrounding sentence and fails
 only when the prompt and the emitted value genuinely disagree -- which is a
 real defect, not a prompt-edit tax. That is also why they are imported rather
 than spelled: a literal would carry no coupling to the emission site at all.
+
+Task 5721 pins the presence of `RESERVED_BOUND_ROUTING_RULE` the same way.
 """
 
 from __future__ import annotations
@@ -59,6 +61,7 @@ from orchestrator.agents.roles import (
     _ESCALATION_TOOLS,
     ESCALATION_LADDER_CORE,
     NON_STEWARD_LEVEL_GATE,
+    RESERVED_BOUND_ROUTING_RULE,
     ROLES,
 )
 
@@ -308,4 +311,26 @@ def test_every_escalating_role_reads_both_filer_action_tokens() -> None:
         f'filer action tokens: {offenders}. Every role that can file a blocker '
         'receives the `action` key in its response and must be told how to read '
         'both of its values.'
+    )
+
+
+def test_reserved_bound_rule_lives_in_the_ladder_core() -> None:
+    """The rule has one home: the mechanics half, which the steward reads too."""
+    assert RESERVED_BOUND_ROUTING_RULE.strip(), 'RESERVED_BOUND_ROUTING_RULE is empty'
+    assert RESERVED_BOUND_ROUTING_RULE in ESCALATION_LADDER_CORE, (
+        'RESERVED_BOUND_ROUTING_RULE is not spliced into ESCALATION_LADDER_CORE. '
+        'Splice it into the core -- not NON_STEWARD_LEVEL_GATE, which the steward '
+        'never reads, and not per role.'
+    )
+
+
+def test_every_escalating_role_reads_the_reserved_bound_rule() -> None:
+    """Derived coverage over the composed prompts each escalating role receives."""
+    offenders = sorted(
+        name for name in _L1_FILER_ROLES + _NON_STEWARD_ESCALATING_ROLES
+        if RESERVED_BOUND_ROUTING_RULE not in ROLES[name].system_prompt
+    )
+    assert offenders == [], (
+        f'Escalating role(s) whose composed system_prompt is missing '
+        f'RESERVED_BOUND_ROUTING_RULE: {offenders}.'
     )
