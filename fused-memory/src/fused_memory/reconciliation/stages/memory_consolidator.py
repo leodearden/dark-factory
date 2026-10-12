@@ -384,35 +384,15 @@ class MemoryConsolidator(BaseStage):
         report.stats['entity_standing_decision_suppressed'] = 0
         report.stats['entity_standing_decision_max_suppression_streak'] = 0
 
-        # ── Preservation-specimen corroboration guard (task 4223) ──────────────
-        # Decline stranded/reset recommendations for tasks whose odd state is
-        # DOCUMENTED as deliberate — a preserved validation specimen.  Task 3105
-        # is in-progress with a null claimant and a null heartbeat on purpose,
-        # and this finding twice became an operator-gate task asking for it to be
-        # reset (tasks 5080 and 5104, the second born-at-L2 critical); both were
-        # declined by hand.
+        # ── Preservation-specimen corroboration guard (tasks 4223, 5464) ───────
+        # Wired ABOVE the remediation early-return, together with both of its
+        # disclosures, because it must run on remediation passes too. Why:
+        # fused-memory/src/fused_memory/reconciliation/preservation_specimen_guard.py
+        # (module docstring). Pinned by
+        # tests/test_stages.py::TestMemoryConsolidatorPreservationSpecimenGuard.
         #
-        # Placement is the whole point, and it is NOT beside Hook A below.  The
-        # remediation early-return three lines down sits ABOVE the entire filter
-        # chain, so anything wired next to filter_entity_standing_decisions is
-        # unreachable on a remediation pass — and a BLANKET stage1_flag_suppression
-        # for task 3105 failed to stop the recurrence for exactly that reason: the
-        # recurrences that continued after it was widened were remediation runs.
-        # This is the placement verify_cited_memories already uses to cover both
-        # passes, for the same reason.  The guard's storm escape and unresolved-
-        # corroboration disclosure sit here too: each escape covers exactly the
-        # pass classes its filter runs on.  Hook A's filter, and so its escape,
-        # is full-cycle-only; this guard runs on both passes, so both of its
-        # disclosures do.  A recurrence seen by a full cycle and its remediation
-        # pass folds into one pending record.
-        #
-        # Every stat is pre-inited here, above the return, so no key is ever
-        # conditionally absent from a remediation report (the always-present
-        # convention the three pre-inits above follow).
-        #
-        # Best-effort: a guard failure must never abort the stage or leave
-        # items_flagged partially mutated, so items_flagged is reassigned only on
-        # success, the stats stay at their pre-inited empties, and nothing files.
+        # Best-effort: a guard failure leaves items_flagged untouched, the
+        # always-present stats at their pre-inited empties, and nothing filed.
         report.stats['preservation_specimen_suppressed'] = 0
         report.stats['preservation_specimen_unresolved'] = 0
         report.stats['preservation_specimen_citations'] = {}
