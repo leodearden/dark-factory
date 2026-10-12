@@ -207,12 +207,12 @@ class TestMergeStatusCleanMissEmitsNoRecord:
     async def test_no_record_anywhere_returns_no_record_member(self, tmp_path: Path) -> None:
         """A clean miss is pinned to the POLL partitions, not the cancel one.
 
-        ``POLL_STOP_STATES`` and ``CANCEL_STATES`` hold the same members, so
-        pinning this to ``CANCEL_STATES`` could not fail.  That equality is
-        incidental (``shared/src/shared/merge_state.py::CANCEL_STATES``): they are
-        the stop sets of two different call sites, and a poll assertion checked
-        against the cancel vocabulary would silently start checking the wrong
-        contract the moment the two diverge.
+        ``POLL_STOP_STATES`` and ``CANCEL_STATES`` are separate contracts, the
+        stop sets of two different call sites, and they now differ:
+        ``CANCEL_STATES`` also holds the live states
+        (``shared/src/shared/merge_state.py::CANCEL_STATES``).  A poll assertion
+        checked against the cancel vocabulary would be checking the wrong
+        contract.
 
         ``EPISTEMIC_STATES`` is the tighter of the two claims and is asserted as
         well: every tier missed, so what the server reports is a state of
@@ -309,6 +309,16 @@ class TestMergeCancelEmitsCancelStates:
         _assert_is_member(result['state'], CANCEL_STATES, 'merge_cancel durable hit')
         # superseded is precisely the member DEFECT 1's docstring omitted.
         assert result['state'] == MergeState.superseded
+
+    async def test_no_waiter_live_hit_returns_live_member(self, tmp_path: Path) -> None:
+        server = _server(
+            tmp_path, types.SimpleNamespace(_merge_worker=_live_worker('verifying'))
+        )
+        result = await call_merge_cancel(server, request_id='mr-live')
+
+        assert result['cancelled'] is False
+        _assert_is_member(result['state'], CANCEL_STATES, 'merge_cancel no-waiter live hit')
+        assert result['state'] == MergeState.verifying
 
     async def test_pending_waiter_returns_abandoned_member(self, tmp_path: Path) -> None:
         server = self._queue_server(tmp_path)

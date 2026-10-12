@@ -266,7 +266,7 @@ class TestPollPartitions:
         assert TERMINAL_STATES | EPISTEMIC_STATES == POLL_STOP_STATES
 
     def test_cancel_states(self):
-        assert TERMINAL_STATES | EPISTEMIC_STATES == CANCEL_STATES
+        assert OUTCOME_STATES | EPISTEMIC_STATES == CANCEL_STATES
 
 
 class TestMergeReason:

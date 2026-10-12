@@ -121,7 +121,9 @@ def _live_worker(*entries: dict[str, Any]) -> types.SimpleNamespace:
     return types.SimpleNamespace(snapshot=lambda: {'entries': list(entries)})
 
 
-def _live_entry(request_id: str, *, state: str = 'queued') -> dict[str, Any]:
+def _live_entry(
+    request_id: str, *, state: str = 'queued', waiter_alive: bool = True,
+) -> dict[str, Any]:
     return {
         'request_id': request_id,
         'branch': _BRANCH,
@@ -129,6 +131,7 @@ def _live_entry(request_id: str, *, state: str = 'queued') -> dict[str, Any]:
         'state': state,
         'position': 0,
         'enqueued_at': 1_700_000_100.0,
+        'waiter_alive': waiter_alive,
     }
 
 
@@ -517,3 +520,43 @@ class TestMergeCancelDurableResolution:
         response = await self._cancel(_server(tmp_path, current, journal=journal), 'mr-x')
 
         assert response['state'] is MergeState.unknown
+
+    async def test_a_live_waiterless_request_reports_its_live_state(
+        self, tmp_path: Path
+    ) -> None:
+        _, current = _event_stores(tmp_path)
+        server = _server(
+            tmp_path,
+            current,
+            worker=_live_worker(_live_entry('mr-live', state='verifying')),
+            journal=_journal(tmp_path, _journal_entry('mr-live')),
+        )
+
+        response = await self._cancel(server, 'mr-live')
+
+        assert response['state'] is not MergeState.journaled
+        assert response['state'] is MergeState.verifying
+
+
+class TestLiveTier:
+    async def test_a_cancelled_snapshot_entry_is_not_live(self, tmp_path: Path) -> None:
+        """A worker entry whose waiter was cancelled has no live outcome left.
+
+        The merge_cancel half passes before the fix, because merge_cancel does
+        not consult live yet. It guards the change that makes it do so: without
+        the cancelled-entry filter, a double-cancel would read state 'queued'.
+        """
+        _, current = _event_stores(tmp_path)
+        _finalize(current, request_id='mr-c', state='abandoned')
+        server = _server(
+            tmp_path, current, worker=_live_worker(_live_entry('mr-c', waiter_alive=False)),
+        )
+
+        polled = await _poll(server, request_id='mr-c')
+        cancelled = await call_merge_cancel(server, request_id='mr-c')
+
+        assert polled['state'] is MergeState.abandoned
+        assert polled['source'] == 'event_store'
+        assert cancelled['cancelled'] is False
+        assert cancelled['state'] == 'abandoned'
+        assert cancelled['reason'] == 'Request already finalized; cannot cancel.'
