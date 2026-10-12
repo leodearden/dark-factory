@@ -269,6 +269,18 @@ def _mem0_content(payload: dict) -> str:
     return ''
 
 
+def metadata_row_text(row: Mapping[str, Any]) -> str:
+    """The text of one ``get_memories_by_metadata`` row, or ``''``.
+
+    That row is ``{'id', 'created_at', 'metadata'}``
+    (``backends/mem0_client.py::Mem0Backend._normalise_point``) with no
+    top-level text key: the text lives only inside the ``metadata`` payload,
+    where :func:`_mem0_content` owns the key order.
+    """
+    payload = row.get('metadata')
+    return _mem0_content(payload) if isinstance(payload, dict) else ''
+
+
 def _mem0_category(meta: dict) -> MemoryCategory | None:
     """The MemoryCategory a raw Mem0 payload declares, or ``None``.
 
