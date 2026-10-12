@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, replace
 from typing import Any
 
 import pytest
-from _eval_refusal import REFUSAL_COST_USD, refused_agent_result
+from _eval_refusal import REFUSAL_COST_USD, answered, refused_agent_result
 from shared.cli_invoke import AgentResult
 
 from orchestrator.evals import judge
+from orchestrator.evals.elo import DEFAULT_RATING, TaskPool
 from orchestrator.evals.measurement import (
     MeasurementStage,
     Unmeasured,
@@ -171,3 +173,26 @@ async def test_build_trial_report_counts_the_refusal_and_keeps_every_mean(
     counted_v1 = next(s for s in counted.summaries if s.name == 'v1')
     assert replace(counted_v1, unmeasured=0, unmeasured_cost_usd=0.0) == clean_v1
     assert counted_v1.unmeasured == 1
+
+
+async def test_elo_tournament_counts_the_refusal_and_leaves_every_rating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contenders = [{'config_name': name, 'diff': f'diff {name}'} for name in ('A', 'B')]
+    task = {'id': 't', 'pre_task_commit': 'BASE'}
+    pool = TaskPool()
+
+    async def a_wins(**_kwargs: Any) -> AgentResult:
+        return answered({'winner': 'A', 'confidence': 0.9, 'reasoning': 'r'})
+
+    monkeypatch.setattr(judge, 'invoke_agent', a_wins)
+    await judge.run_elo_tournament(contenders, task, pool, max_rounds=2)
+    prior = copy.deepcopy(pool.to_dict())
+    assert pool.matches and set(pool.ratings.values()) != {DEFAULT_RATING}
+
+    monkeypatch.setattr(judge, 'invoke_agent', _refuse)
+    tally = await judge.run_elo_tournament(contenders, task, pool)
+
+    assert pool.to_dict() == prior
+    assert tally.unmeasured > 0
+    assert tally.judged == 0

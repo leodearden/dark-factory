@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
 import random
@@ -9,10 +10,17 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import pytest
-from _eval_refusal import answered
+from _eval_refusal import answered, refused_agent_result
 from shared.cli_invoke import AgentResult
 
-from orchestrator.evals import judge
+from orchestrator.evals import elo, judge
+from orchestrator.evals.elo import (
+    DEFAULT_RATING,
+    MAX_PER_PAIR,
+    TaskPool,
+    next_matchup,
+    record_match,
+)
 from orchestrator.evals.judge import JudgeVerdict, run_judge
 from orchestrator.evals.measurement import (
     MeasurementStage,
@@ -119,3 +127,117 @@ def test_a_measured_verdict_must_name_its_winner_and_an_unmeasured_one_must_not(
     verdict: Any = JudgeVerdict('t', 'A', 'B', winner='tie', confidence=0.5, reasoning='r')
     with pytest.raises(dataclasses.FrozenInstanceError):
         verdict.winner = 'A'
+
+
+# ── The Elo tournament: an unmeasured verdict moves no rating and no count ──
+
+_TIE = answered({'winner': 'tie', 'confidence': 0.5, 'reasoning': 'even'})
+
+
+def _scripted(first: list[AgentResult], then: AgentResult, calls: list[str]):
+    queue = list(first)
+
+    async def fake(**kwargs: Any) -> AgentResult:
+        calls.append(str(kwargs['prompt']))
+        return queue.pop(0) if queue else then
+
+    return fake
+
+
+def _contenders(*names: str) -> list[dict]:
+    return [_contender(name) for name in names]
+
+
+@pytest.mark.asyncio
+async def test_every_refused_call_leaves_the_pool_untouched_and_is_bounded_per_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(judge, 'invoke_agent', _scripted([], refused_agent_result(), calls))
+    pool = TaskPool()
+
+    tally = await judge.run_elo_tournament(_contenders('A', 'B', 'C'), _TASK, pool, max_rounds=50)
+
+    bound = elo.MAX_UNMEASURED_PER_PAIR
+    assert tally == judge.TournamentTally(judged=0, unmeasured=bound * 3)
+    assert set(pool.ratings.values()) == {DEFAULT_RATING}
+    assert pool.matches == []
+    assert pool.pair_counts == {}
+    assert len(calls) == bound * 3
+
+
+@pytest.mark.asyncio
+async def test_an_unmeasured_verdict_does_not_count_toward_max_per_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(judge, 'invoke_agent', _scripted([refused_agent_result()], _TIE, calls))
+    pool = TaskPool()
+
+    tally = await judge.run_elo_tournament(_contenders('A', 'B'), _TASK, pool)
+
+    assert tally == judge.TournamentTally(judged=MAX_PER_PAIR, unmeasured=1)
+    assert pool.pair_counts == {'A|B': MAX_PER_PAIR}
+    assert len(pool.matches) == MAX_PER_PAIR
+
+
+@pytest.mark.asyncio
+async def test_max_unmeasured_per_pair_is_a_parameter(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(judge, 'invoke_agent', _scripted([], refused_agent_result(), calls))
+
+    await judge.run_elo_tournament(
+        _contenders('A', 'B', 'C'), _TASK, TaskPool(), max_unmeasured_per_pair=1,
+    )
+
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_unmeasured_calls_spend_the_round_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(judge, 'invoke_agent', _scripted([], refused_agent_result(), calls))
+
+    tally = await judge.run_elo_tournament(_contenders('A', 'B', 'C'), _TASK, TaskPool(), max_rounds=2)
+
+    assert len(calls) == 2
+    assert tally.unmeasured == 2
+
+
+@pytest.mark.asyncio
+async def test_a_pair_with_a_missing_contender_is_skipped_without_a_fabricated_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(judge, 'invoke_agent', _scripted([], _TIE, calls))
+    pool = TaskPool(ratings={'C': DEFAULT_RATING})
+
+    tally = await judge.run_elo_tournament(_contenders('A', 'B'), _TASK, pool)
+
+    assert tally.judged == MAX_PER_PAIR
+    assert pool.pair_counts == {'A|B': MAX_PER_PAIR}
+    assert 'A|C' not in pool.pair_counts and 'B|C' not in pool.pair_counts
+
+
+def test_next_matchup_skips_the_given_pairs() -> None:
+    pool = TaskPool(ratings={'A': 1500.0, 'B': 1510.0, 'C': 1600.0})
+
+    assert next_matchup(pool) == ('A', 'B')
+    assert next_matchup(pool, skip={'A|B'}) == ('B', 'C')
+    assert next_matchup(pool, skip={'A|B', 'A|C', 'B|C'}) is None
+
+
+def test_record_match_rejects_an_unknown_winner() -> None:
+    pool = TaskPool(ratings={'A': 1500.0, 'B': 1500.0})
+    before = copy.deepcopy(pool.to_dict())
+
+    with pytest.raises(ValueError) as rejected:
+        record_match(pool, 'A', 'B', 'C', 0.5, 'r')
+
+    assert "'C'" in str(rejected.value)
+    assert all(winner in str(rejected.value) for winner in ('A', 'B', 'tie'))
+    assert pool.to_dict() == before
+
+
+def test_max_unmeasured_per_pair_defaults_to_two() -> None:
+    assert elo.MAX_UNMEASURED_PER_PAIR == 2
