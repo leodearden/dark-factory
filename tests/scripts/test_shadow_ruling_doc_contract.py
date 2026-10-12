@@ -456,6 +456,22 @@ def test_the_shadow_section_quotes_a_runnable_weekly_count_command():
 # ---------------------------------------------------------------------------
 
 
+def test_marked_span_refuses_a_span_that_wraps_nothing():
+    """A marker pair left wrapping nothing is the ablation both homes guard against.
+
+    The malformed-marker shapes are the shared helper's contract, pinned once in
+    `test_verify_command_invariants.py`; this pins that the wrapper threads this
+    guard's slug and *source* into it.
+    """
+    text = "<!-- scope-not-delivered:begin extraction contract -->\n\n<!-- scope-not-delivered:end -->\n"
+    with pytest.raises(AssertionError) as excinfo:
+        _marked_span(text, "probe.md")
+
+    message = str(excinfo.value)
+    assert "scope-not-delivered" in message
+    assert "probe.md" in message
+
+
 @pytest.fixture
 def documented_closure_forms() -> frozenset[str]:
     """The closure forms `docs/escalation-standing-policy.md` currently names.
