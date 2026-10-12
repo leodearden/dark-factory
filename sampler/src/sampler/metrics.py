@@ -57,7 +57,6 @@ __all__ = [
     'ARM_METRICS',
     'exact_metric_names',
     'TICK_CLOCK',
-    'ARM_METRIC_STEMS',
 ]
 
 class SampleKey(NamedTuple):
@@ -184,46 +183,6 @@ _OWN_CPU_SOME10 = MetricSpec(
     'own_cpu_some10', per_leaf=True, arm='own_cpu_some_avg10', readability=_OWN_READ_OK
 )
 
-
-ARM_METRIC_STEMS = {
-    'mem_full_avg10': 'psi_mem_full_avg10',
-    'mem_some_avg10': 'psi_mem_some_avg10',
-    'io_some_avg10': 'psi_io_some_avg10',
-    'cpu_some_avg10': 'psi_cpu_some_avg10',
-    'runqueue_ratio': 'runqueue_ratio',
-    'own_cpu_some_avg10': 'own_cpu_some10',
-}
-"""Gate ARM name -> the sampler metric recording that arm.
-
-PRD ``plans/load-throttle-harmonisation-prd.md`` §6.4, boundary row 11. The
-gate decides on arms (``shared.psi._ARMS``, whose field names are also the
-``psi_admission`` config leaves and the ``tripping_metric`` vocabulary); this
-module records metrics; ε1/ε2 calibrate one against the other. Those are two
-vocabularies for one set of signals, so the correspondence needs a single
-home (heuristic 11) — this one — and a reconciler, which is
-``TestArmMetricStemParity`` in sampler/tests/test_load_metrics.py. That test
-enumerates ``_ARMS`` itself rather than a copy, asserts BOTH directions so
-the mapping can neither miss an arm nor keep a dead key, and asserts each
-stem is actually emitted.
-
-NO PRODUCTION CODE READS THIS TABLE, and that is its point rather than an
-oversight: it is a DECLARATION, and its readers are the reconcilers — the
-parity test above, and the calibration script's own copy which that test
-checks against this one. Stated here so a later agent weighing its deletion
-does not have to infer the purpose from an empty grep.
-
-The stems are NOT mechanically derivable from the arm names, which is exactly
-why this is an explicit table and not a rule: the four host arms gain a
-``psi_`` prefix, ``own_cpu_some_avg10`` records as ``own_cpu_some10``
-(``avg10`` against ``10``), and ``runqueue_ratio`` maps to itself. Neither
-the identity nor a systematic rewrite covers all three.
-
-``own_cpu_some10`` is a PER-LEAF metric: it is recorded once per discovered
-cgroup leaf, with the leaf as data in ``SampleKey.leaf``.
-``scripts/load-threshold-calibration.py`` carries the same correspondence by
-necessity — it runs under the system python3 and cannot import this module —
-and a lockstep test reconciles the two.
-"""
 
 # The cgroup v2 mountpoint: a default for the injected ``cgroup_root`` seam,
 # which every test overrides. shared.psi holds the same literal privately for

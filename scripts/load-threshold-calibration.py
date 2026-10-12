@@ -10,19 +10,15 @@ per-candidate-threshold hold fractions and hold streaks against D11; drift
 between this project's ``psi_admission`` block and reify's; and which yaml
 leaves merely restate the shipped code default.
 
-STDLIB ONLY, plus ``yaml`` imported lazily inside the drift check. This is
-measured, not stylistic. The live orchestrator runs under ``uv run --frozen
---project orchestrator``, yet its /proc/<pid>/environ carries no VIRTUAL_ENV
-and no venv bin on PATH; ``deterministic_runner.py`` launches a
-``before_done`` script with ``create_subprocess_exec(script, *args)`` —
-straight through the shebang with that env inherited. So at gate time
-``#!/usr/bin/env python3`` resolves to /usr/bin/python3 (3.12.3), which HAS
-yaml but NOT ``shared``, ``sampler`` or ``orchestrator``. A top-level
-first-party import would crash the gate on import fourteen days after this
-lands, in a born-at-L2 escalation path, with no earlier signal. Keeping yaml
-lazy additionally makes the module stdlib-importable, so any test in any
-subproject can load it by path, and a missing PyYAML becomes a NAMED
-degradation instead of an import crash.
+Stdlib plus this checkout's ``sampler.metrics``, bound through
+scripts/_checkout.py. The gate's interpreter has no venv: the live
+orchestrator's /proc/<pid>/environ carries no VIRTUAL_ENV and no venv bin on
+PATH, and ``deterministic_runner.py`` launches a ``before_done`` script with
+``create_subprocess_exec(script, *args)``, straight through the shebang, so
+``#!/usr/bin/env python3`` resolves to /usr/bin/python3. The binding needs
+none, and ``sampler.metrics`` imports psutil lazily. This script never imports
+``sampler.store``, which needs aiosqlite. ``yaml`` stays lazy inside the drift
+check, so a missing PyYAML is a NAMED degradation instead of an import crash.
 
 ALWAYS EXITS 0 when it completed an analysis. Every degradation — corpus
 missing or empty, peer config absent/unreadable/unparseable, either side
@@ -61,6 +57,9 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple, TypedDict
+
+import _checkout as _checkout
+from sampler.metrics import ARM_METRICS, TICK_CLOCK, MetricSpec
 
 # The PEER checkout, and so the one path here that must NOT follow
 # $DARK_FACTORY_ROOT: the whole point of the comparison is that it lives in a
@@ -118,41 +117,35 @@ class ArmSpec(NamedTuple):
 _PRESSURE_LADDER = (10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0)
 _PRESSURE_UNIT = '% of wall time stalled (PSI avg10)'
 
-# The corpus's TICK CLOCK: the one metric ``collect_load_metrics`` writes on
-# every tick it completes, readable or not — an unreadable /proc/stat is a 0.0
-# row, never a missing one. Each leaf's ``own_read_ok`` comes out of that same
-# call but only for the leaves discovered that tick, so a leaf's own row count
-# is not the tick count; this metric's is. Public because the lockstep test in
-# sampler/tests/test_load_metrics.py asserts the sampler really does emit it on
-# every completed tick, which is the whole of what makes it a clock.
-TICK_METRIC = 'runqueue_read_ok'
-
-# Arm name -> its ArmSpec. The `selector` half is duplicated from
-# sampler.metrics.ARM_METRIC_STEMS BY NECESSITY: that module cannot be
-# imported here, because at gate time this script runs under the system
-# python3 (see the stdlib-only note above). The reconciler is the named
-# lockstep test in sampler/tests/test_load_metrics.py, which loads this file by
-# path and asserts the two agree in both directions — so do NOT
-# "de-duplicate" this with an import, which would crash the gate.
-ARM_METRIC_SELECTORS = {
-    'mem_full_avg10': ArmSpec(
-        'psi_mem_full_avg10', _PRESSURE_LADDER, _PRESSURE_UNIT, None),
-    'mem_some_avg10': ArmSpec(
-        'psi_mem_some_avg10', _PRESSURE_LADDER, _PRESSURE_UNIT, None),
-    'io_some_avg10': ArmSpec(
-        'psi_io_some_avg10', _PRESSURE_LADDER, _PRESSURE_UNIT, None),
-    'cpu_some_avg10': ArmSpec(
-        'psi_cpu_some_avg10', _PRESSURE_LADDER, _PRESSURE_UNIT, None),
+# This script's own fact about each gate arm: the thresholds to evaluate it at,
+# and the unit they are in. The metric recording the arm, and its readability
+# metric, are sampler.metrics.ARM_METRICS's.
+_ARM_SCALES: dict[str, tuple[tuple[float, ...], str]] = {
+    'mem_full_avg10': (_PRESSURE_LADDER, _PRESSURE_UNIT),
+    'mem_some_avg10': (_PRESSURE_LADDER, _PRESSURE_UNIT),
+    'io_some_avg10': (_PRESSURE_LADDER, _PRESSURE_UNIT),
+    'cpu_some_avg10': (_PRESSURE_LADDER, _PRESSURE_UNIT),
     # A RATIO, not a percentage: procs_running / len(sched_getaffinity(0)).
     # 1.0 is "as many runnable threads as CPUs"; 4.0 is PRD D9's provisional.
-    'runqueue_ratio': ArmSpec(
-        'runqueue_ratio',
+    'runqueue_ratio': (
         (1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0),
-        'runnable threads per CPU (ratio)', TICK_METRIC),
-    # Recorded per cgroup leaf — one series per leaf, never pooled.
-    'own_cpu_some_avg10': ArmSpec(
-        'own_cpu_some10', _PRESSURE_LADDER, _PRESSURE_UNIT, 'own_read_ok'),
+        'runnable threads per CPU (ratio)',
+    ),
+    'own_cpu_some_avg10': (_PRESSURE_LADDER, _PRESSURE_UNIT),
 }
+
+# Every coverage row's denominator: see sampler.metrics.TICK_CLOCK.
+TICK_METRIC = TICK_CLOCK.name
+
+
+def _arm_spec(arm: str, spec: MetricSpec) -> ArmSpec:
+    """*arm*'s ArmSpec; an arm in the table with no scale here fails at load."""
+    ladder, unit = _ARM_SCALES[arm]
+    readability = spec.readability.name if spec.readability is not None else None
+    return ArmSpec(spec.name, ladder, unit, readability)
+
+
+ARM_METRIC_SELECTORS = {arm: _arm_spec(arm, spec) for arm, spec in ARM_METRICS.items()}
 
 
 def pct(xs: list[float], p: float) -> float:
@@ -175,7 +168,7 @@ def pct(xs: list[float], p: float) -> float:
 
     SHARED ORIGIN, and it cannot currently be shared as code: this is a copy of
     ``scripts/merge-pytest-n-ab-analysis.py::pct``, which has the un-fixed
-    tie-break. Both files must run under the system python3 with stdlib only,
+    tie-break. Both files must run under the system python3 with no venv,
     and ``scripts/`` is not a package, so there is no module for them to import
     from and no reconciler test to write against one. Change this and the other
     one drifts silently -- read them together.
@@ -516,11 +509,9 @@ def load_psi_admission_block(path: Path, side: str) -> tuple[dict | None, list[s
     escalation, and "reify's yaml was missing" must arrive as a sentence in the
     report rather than as a crash.
 
-    ``yaml`` is imported HERE rather than at module scope. At gate time this
-    script runs under the system python3, which happens to have PyYAML — but
-    the module must stay stdlib-importable so any subproject's test can load
-    it by path, and so a missing PyYAML degrades by name instead of crashing
-    on import.
+    ``yaml`` is imported HERE rather than at module scope, so a missing
+    PyYAML degrades by name instead of crashing on import: the gate's system
+    python3 happens to have it, and a bare interpreter does not.
 
     An ABSENT block returns ``None``, never ``{}``: "this project has not
     configured psi_admission" and "it configured an empty block" are different
