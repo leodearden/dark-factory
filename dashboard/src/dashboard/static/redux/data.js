@@ -62,6 +62,7 @@ function endpointsFor(win) {
     '/api/v2/dashboard/tasks':                        { 'TASKS_OFFLINE': PLAIN, 'TASKS_OFFLINE_PROJECTS': PLAIN,
                                                         'TASKS_DEGRADED_PROJECTS': PLAIN, 'TASKS_COUNT_UNKNOWN_PROJECTS': PLAIN, 'TASKS_PROJECT_COUNT': PLAIN,
                                                         'TASKS_SNAPSHOT': PLAIN },
+    '/api/v2/dashboard/invariants':                   { 'INVARIANTS': PLAIN },
     '/api/v2/dashboard/memory':                       { 'MEMORY_STATUS': PLAIN },
     '/api/v2/dashboard/memory-graphs':                { 'MEMORY_OPS': PLAIN },
     '/api/v2/dashboard/recon':                        { 'RECON_STATE': PLAIN, 'AGENTS': PLAIN },
@@ -171,6 +172,9 @@ window.DF_DATA = {
   //   Rows carry no description/details: the Task Detail pane fetches those
   //   for the selected task only, via ON_DEMAND_KEYS.taskProse.
   TASKS_SNAPSHOT: {},
+  // INVARIANTS: one claimant-invariant record per known root (E-1). Seeded
+  //   EMPTY so a project with no record renders no chip: unknown is not clean.
+  INVARIANTS: [],
   PERFORMANCE: {},
   // performance_cards.js::cardsListing answers a missing Datum, so no zero is seeded.
   PERFORMANCE_LISTING: null,
