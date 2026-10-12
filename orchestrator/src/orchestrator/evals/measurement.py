@@ -7,12 +7,16 @@ record shape: docs/plan-scoring-and-judge.md, "Unmeasured cells: typed causes
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import logging
 import math
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Generic, TypedDict, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypedDict, TypeVar
 
+from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
 from shared.invocation_outcome import (
     OK,
     AuthFailed,
@@ -25,6 +29,7 @@ from shared.invocation_outcome import (
 
 if TYPE_CHECKING:
     from shared.cli_invoke import AgentResult
+    from shared.usage_gate import UsageGate
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +165,9 @@ def classify_unmeasured(
     if refusal is None:
         return None
     cause, reason = refusal
-    return Unmeasured(stage, cause, reason, cost_usd=coerce_cost_usd(result.cost_usd))
+    return Unmeasured(
+        stage, cause, reason, cost_usd=coerce_cost_usd(result.cost_usd),
+    )
 
 
 def _transport_refusal(
@@ -182,3 +189,72 @@ def _transport_refusal(
     if isinstance(outcome, ZeroOutputWedge):
         return UnmeasuredCause.WEDGE, 'zero-output timeout (no transcript turns)'
     return None
+
+
+def json_answer(result: AgentResult) -> dict[str, Any]:
+    """The JSON object *result* answered: ``structured_output``, else its output text.
+
+    Raises ``ValueError`` (``json.JSONDecodeError`` included) when there is none.
+    """
+    payload = result.structured_output or json.loads(result.output)
+    if not isinstance(payload, dict):
+        raise ValueError(f'answer is not a JSON object but {type(payload).__name__}')
+    return payload
+
+
+async def measured_call(
+    invoke: Callable[..., Awaitable[AgentResult]],
+    parse: Callable[[AgentResult], T],
+    *,
+    stage: MeasurementStage,
+    backend: str,
+    usage_gate: UsageGate | None = None,
+    label: str | None = None,
+    **invoke_kwargs: Any,
+) -> Scored[T] | Unmeasured:
+    """Invoke, classify and parse one LLM call.
+
+    ``Scored`` iff *parse* returned; otherwise ``Unmeasured`` naming why — a
+    transport refusal, cap patience exhausted, or an answer *parse* rejected
+    with ``ValueError``/``TypeError``/``KeyError``. Never fabricates a value.
+    ``cost_usd`` is the spend summed over every attempt. With *usage_gate* the
+    call runs through ``invoke_with_cap_retry``, which injects each account's
+    credentials into *invoke_kwargs*. Any other exception propagates.
+    """
+    name = label or str(stage)
+    spent = 0.0
+
+    async def _attempt(**dispatch: Any) -> AgentResult:
+        nonlocal spent
+        attempt = await invoke(**dispatch)
+        spent += coerce_cost_usd(attempt.cost_usd)
+        return attempt
+
+    try:
+        if usage_gate is None:
+            result = await _attempt(backend=backend, **invoke_kwargs)
+        else:
+            result = await invoke_with_cap_retry(
+                usage_gate, name, invoke_fn=_attempt, backend=backend,
+                **invoke_kwargs,
+            )
+    except AllAccountsCappedException as e:
+        logger.warning(f'{name}: unmeasured, cap patience exhausted: {e}')
+        return Unmeasured(
+            stage, UnmeasuredCause.CAP_EXHAUSTED, clip_reason(str(e)), cost_usd=spent,
+        )
+
+    refused = classify_unmeasured(result, stage=stage, backend=backend)
+    if refused is not None:
+        logger.warning(
+            f'{name}: unmeasured, refused at the transport layer: '
+            f'{refused.cause}: {refused.reason}'
+        )
+        return dataclasses.replace(refused, cost_usd=spent)
+    try:
+        value = parse(result)
+    except (ValueError, TypeError, KeyError) as e:
+        reason = exception_reason(e)
+        logger.warning(f'{name}: unmeasured, unparseable answer: {reason}')
+        return Unmeasured(stage, UnmeasuredCause.UNPARSEABLE, reason, cost_usd=spent)
+    return Scored(value, cost_usd=spent)
