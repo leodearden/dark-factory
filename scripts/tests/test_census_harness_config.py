@@ -14,10 +14,9 @@ from __future__ import annotations
 
 import subprocess
 
-import census as mod
+from legibility import census as mod
 from legibility import census_trigger, filing_policy, session_runner
-
-import config as config_mod
+from legibility import config as config_mod
 
 
 def _write_legibility_yaml(config_path, *, project_id="target_project", project_root=None):

@@ -30,10 +30,9 @@ from __future__ import annotations
 import json
 from typing import Any
 
-import census as mod
+from legibility import census as mod
+from legibility import config as config_mod
 from legibility import unlanded
-
-import config as config_mod
 
 _DATE = "2026-08-03"
 

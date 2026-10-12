@@ -16,8 +16,8 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-import census as mod
 import pytest
+from legibility import census as mod
 from legibility import (
     census_identity,
     census_window,
