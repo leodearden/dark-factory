@@ -115,3 +115,14 @@ def test_other_live_statuses_follow_the_fire_time_rule(status, at, expected):
 @pytest.mark.parametrize('at', [NOW + HOUR, NOW - 48 * HOUR])
 def test_every_status_resolves_to_exactly_one_state(status, at):
     assert isinstance(chain_state(link(1, str(status), at), now=NOW), ChainState)
+
+
+@pytest.mark.parametrize(
+    ('at', 'interval_secs', 'expected'),
+    [
+        ('9999-12-31T23:59:59+00:00', 3600, ChainState.SCHEDULED),
+        (NOW - 25 * HOUR, 10**20, ChainState.OVERDUE),
+    ],
+)
+def test_extreme_fire_times_and_intervals_still_resolve(at, interval_secs, expected):
+    assert chain_state(link(1, 'pending', at, interval_secs=interval_secs), now=NOW) is expected
