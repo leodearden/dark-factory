@@ -535,6 +535,12 @@ entries:
     origin_phase: merge
     manifested_phase: verify
     note: Task 5415's scoped verify failed on test_every_enumeration_site_is_pinned, a failure inherited from red main (review report e0c394a7d9). The task was charged for a pre-existing break, and the preexisting-main-break routing did not engage on the resumed run, so the task re-escalated twice. The main break was introduced by a commit merged to main, and the failure surfaced in the task's verify loop.
+  - date: '2026-10-11'
+    project: dark_factory
+    session: ac81c860-a866-47c2-ab4d-aff578bd907c
+    origin_phase: verify
+    manifested_phase: verify
+    note: The block reason charges test_quality_metrics_snapshot and test_source_measures failures to task 5602 while asserting they are preexisting on main. The digest does not show whether that was checked, so the attribution is unverified. Matches the pattern of task-level verify charging pre-existing failures to an innocent task.
 - id: unverified-task-premises
   title: 'Tasks filed and dispatched on unverified premises: recon-invented code models, dep ''done'' ≠ capability delivered, phantom found_on_main dones'
   severity: high
@@ -1116,6 +1122,12 @@ entries:
     manifested_phase: architect
     invariant_violated: corroborate-before-acting
     note: The offline-lane refile (6th for this node) was filed on a false premise. The named integration test passes 3/3 at HEAD, and the suspect range is a single docs-only commit that cannot have caused a regression. The architect had to re-run and disprove the premise before reporting the task unactionable.
+  - date: '2026-10-11'
+    project: dark_factory
+    session: 8135c2bd-45dc-4291-800b-b7acd546ee70
+    origin_phase: unknown
+    manifested_phase: architect
+    note: 'Architect blocked task 6782 as unactionable: the named test passed 3 of 3 runs at HEAD and the suspect range touches no import or execution path. The digest calls this the 7th refile naming the same node, so the task was filed on a false premise that was never checked against the tree. The filing phase is not shown in the digest, so origin is unknown.'
 - id: warm-lane-cache-incoherence
   title: Warm-lane warmth transfer and shared caches violate source coherence; no disk GC — phantom compile errors and recurring ENOSPC
   severity: high
@@ -3256,6 +3268,13 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Self-correction at turn 64 flags an OPERATIONS.md paragraph claiming a deploy task 'is not filed yet' while task 4556 still tracks it, so the doc's verdict was stale and contradicted by later state. The session's phase and the doc's authoring phase are not evidenced in the digest.
+  - date: '2026-10-11'
+    project: dark_factory
+    session: 9a9dc435-a6a8-4e5d-8664-abe0bcaedc8d
+    origin_phase: unknown
+    manifested_phase: unknown
+    invariant_violated: corroborate-before-acting
+    note: The agent's analysis doc asserted that a calibration run without --project-id would silently calibrate 'reify'. An earlier amendment kept that warning. At turn 73 the agent found the script actually aborts loudly and guards against it, and flagged the stale verdict for removal. The phase is not supported by the digest, so both phases are unknown.
 - id: entry-cand-20260721-1
   title: Deferred MCP tool called before ToolSearch discovery guesses params and fails validation
   severity: medium
@@ -3614,6 +3633,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: A tool call in the resumed session returned 'No such file or directory' for .task/iterations.jsonl, which the resume path assumed always exists. The Not Found signal records the failure without showing which phase the resume belonged to, so both phases are unknown.
+  - date: '2026-10-11'
+    project: dark_factory
+    session: a63c73d1-2305-464f-867b-4932fcd649be
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Agent runs `tail -c 3000 .task/iterations.jsonl` and the file is absent, so the assumption that .task/iterations.jsonl exists is contradicted. The session is not a resume-after-escalation, so this is a weaker match on trigger context.
 - id: entry-cand-20260718-1
   title: Reconciliation stage cost telemetry (tokens_used) always zero despite nonzero llm_calls
   severity: medium
@@ -10879,6 +10904,24 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: The 'User Corrections' bucket holds a machine-generated verify block report and log listing, not user corrective feedback. This is the digest-pipeline mislabel pattern for pasted non-corrective report content. Phase is unknown because the mislabel is in the digest tooling, not the agent.
+  - date: '2026-10-11'
+    project: dark_factory
+    session: 18486da0-5dd2-4b28-924b-b955cd4c8f3c
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Close but not exact: the ''User Corrections'' bucket captures a pasted /team and /prd slash-command prompt block (command-message/command-args plus result.md instructions) as if it were user correction, with no corrective content. This is the non-corrective-pasted-content pattern, but the source is an injected command prompt rather than report or log output.'
+  - date: '2026-10-11'
+    project: dark_factory
+    session: 51721209-e093-4cb5-b41c-909306d7e835
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'The ''User Corrections'' bucket captured a non-corrective block: a spawn-brief /team command-args dispatch prompt (turn 7), not feedback from the user. Same digest-extraction mislabel family. Phase not supportable from the digest.'
+  - date: '2026-10-11'
+    project: dark_factory
+    session: 1d397bd2-f4ac-467d-9c5e-c06663717ec9
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The 'User Corrections' bucket holds a pasted verify/block report (Block reason, Failure Cause, Verify Logs, Test Failures) while signal_counts are zero except not_found=2. That matches the known pattern of the digest capturing non-corrective report/log content. Phase is not supportable from the digest.
 - id: entry-cand-20260728-1
   title: Digest pipeline mislabels an ordinary task's injected '# Context' project-briefing block as a 'User Correction'
   severity: medium
@@ -12431,6 +12474,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: The digest has score 15.0 and populated correction buckets, yet every signal_counts field reads 0 (tool_error, self_correct, not_found, df_guard, interrupt, designed_outcome).
+  - date: '2026-10-11'
+    project: dark_factory
+    session: 39fcffa5-5cea-4b85-905b-4b61129a600d
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest header shows score 5.0 while every signal_counts field reads 0, and the only bucket content is an injected review-adjudication prompt filed under User Corrections. The score is not supported by the evidence shown.
 - id: entry-cand-20260729-4
   title: Bash cwd persists across turns, causing relative-path git commit --only pathspec failures on PRD doc commits
   severity: medium
@@ -17267,6 +17316,67 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: signal_counts.not_found=3 with 'no such file or directory' at turns 22 and 23 in an orchestrated worktree task, with no other diagnostic signal.
+  - date: '2026-10-11'
+    project: dark_factory
+    session: 49258657-8b8a-4a04-9ef8-b88e4848d6b6
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated worktree session shows repeated 'no such file or directory' and 'command not found' not_found signals (26 total), with the worktree missing .venv and the /tmp base path, and no other diagnostic signal in the digest. The phase is not determinable from the digest.
+  - date: '2026-10-11'
+    project: dark_factory
+    session: 9e72650d-7814-44f8-b89b-ce8dc20b7cd3
+    origin_phase: unknown
+    manifested_phase: implement
+    note: Orchestrated-task session in a .worktrees/6715 checkout shows repeated not-found signals (7 total, including 'no such file or directory' at turns 38 and 585, plus five 'does not exist' results) with no other diagnostic signal. Edits to tests/ in the worktree support the implement phase. The digest does not show what caused the missing paths, so origin is unknown.
+  - date: '2026-10-11'
+    project: dark_factory
+    session: 1e837710-c891-4d96-b5b4-ceb067b86ad8
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated worktree task (cwd .worktrees/6740) logs 15 not_found hits (repeated 'no such file or directory', 'command not found', 'does not exist') with no user turns and no other diagnostic signal. The phase cannot be determined from the digest.
+  - date: '2026-10-11'
+    project: dark_factory
+    session: 6738fbff-0b51-4254-8a4c-59481d92f3fb
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated worktree task (cwd under .worktrees/6716) logged five not_found hits (ModuleNotFoundError and 'does not exist') with every other signal counter at zero and no diagnostic text beyond the terse labels. The digest does not show which phase the hits came from, so both phases are unknown.
+  - date: '2026-10-11'
+    project: dark_factory
+    session: 3050976e-afac-4553-bae4-60b7fadcbb72
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated worktree task (cwd .worktrees/6756) logged 5 not_found signals (no such file or directory x3, does not exist, modulenotfounderror) with all other signal counts at zero and no other diagnostic signal. Matches the entry's described pattern. Phase cannot be determined from the digest.
+  - date: '2026-10-11'
+    project: dark_factory
+    session: 25e6eb98-9f01-4455-b9b5-a3af90952172
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated worktree task (cwd .worktrees/3226) logs 8 not_found hits ('does not exist', 'no such file or directory') across the session with no path or cause shown in the digest, matching the recurring-not-found pattern this entry describes.
+  - date: '2026-10-11'
+    project: dark_factory
+    session: f8f978fd-c4d9-4607-9c68-8e2585df7661
+    origin_phase: unknown
+    manifested_phase: unknown
+    invariant_violated: structured-facts-at-failure
+    note: Orchestrated worktree session (cwd .worktrees/5628) repeatedly hits 'no such file or directory' for .task/plan.json (not_found x4, tool_error x1) with no other diagnostic signal. The digest does not show which phase created or expected that file, so phases are unknown.
+  - date: '2026-10-11'
+    project: dark_factory
+    session: a63c73d1-2305-464f-867b-4932fcd649be
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated worktree task (task 3226) hits 'no such file or directory' (not_found=1, turn 24) with no further diagnostic context in the digest. Only one occurrence is visible, so this is a partial match.
+  - date: '2026-10-11'
+    project: dark_factory
+    session: ac81c860-a866-47c2-ab4d-aff578bd907c
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated worktree task shows three not_found signals ('no such file or directory' at turns 22 and 23, 'modulenotfounderror' at turn 44). The digest does not show the surrounding context, so the phase is unknown.
+  - date: '2026-10-11'
+    project: dark_factory
+    session: c0bc9d72-bf5f-4773-ac07-df0dcdb254db
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: signal_counts.not_found=2 with bare 'no such file or directory' at turns 22 and 46 in an orchestrated worktree task (/.worktrees/6453), with no accompanying diagnostic in the digest. The digest does not show which phase produced these failures.
 - id: entry-cand-20260809-16
   title: Agent falls back to a whole-filesystem `find /` to locate an installed package's source, timing out the Bash call
   severity: medium
@@ -33627,3 +33737,55 @@ candidates:
     origin_phase: ops
     manifested_phase: architect
     evidence_quote: harness.py::_action_teardown(action='restart') clears merge_retry_pending and deterministic gate stamps, sets the task to pending and kills the workflow. It does NOT touch the task worktree, its branch, or .task-meta/<id>/plan.json (also .task/plan.json inside the worktree).
+- id: cand-20261011-1
+  title: Decompose workflow ran its critic on unpatched drafts, so review verdicts applied to a stale artifact
+  cause: The critic step in the decompose workflow ran before existing patches were applied to the drafts, so its review targeted an outdated artifact. The agent's ordering was the proximate error, and nothing in the workflow enforced that patches land before critique.
+  area: decompose workflow / review ordering
+  first_seen: '2026-10-11'
+  disposition: pending
+  sightings:
+  - date: '2026-10-11'
+    project: dark_factory
+    session: 18486da0-5dd2-4b28-924b-b955cd4c8f3c
+    origin_phase: decompose
+    manifested_phase: review
+    evidence_quote: '"The critic is running on the unpatched drafts": ... Ideally the critic would always run on the most up-to-date draft available, including the patches that already exist.'
+- id: cand-20261011-2
+  title: Scripted patch to capability manifest YAML produced unparseable output, detected only at downstream load
+  cause: A patch script rewrote the capability manifest YAML and reported success ('manifest patched') without validating the result. The malformed YAML surfaced only when load_capability_manifest parsed it, so the error appeared far from the write that caused it.
+  area: capability manifest patching / YAML integrity
+  first_seen: '2026-10-11'
+  disposition: pending
+  sightings:
+  - date: '2026-10-11'
+    project: dark_factory
+    session: 18486da0-5dd2-4b28-924b-b955cd4c8f3c
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: "manifest patched\nTraceback (most recent call last):\n  File \"<stdin>\", line 4, in <module>\n  File \"/home/leo/src/dark-factory/shared/src/shared/capability_manifest.py\", line 433, in load_capability_manifest\n    data = yaml.safe_load(fh)"
+- id: cand-20261011-3
+  title: Worktree directory removed under a live session leaves the shell cwd dangling, so later commands fail with getcwd errors
+  cause: The agent's working directory was deleted while the session was still running. Later Bash calls fail with 'error retrieving current directory' instead of a clear diagnosis, so the agent sees generic no-such-file failures and cannot tell that the worktree itself is gone.
+  area: worktree/harness lifecycle
+  first_seen: '2026-10-11'
+  disposition: pending
+  sightings:
+  - date: '2026-10-11'
+    project: dark_factory
+    session: 25e6eb98-9f01-4455-b9b5-a3af90952172
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'pwd: error retrieving current directory: getcwd: cannot access parent directories: No such file or directory'
+- id: cand-20261011-4
+  title: Write-triage fail-open on judge AuthenticationError surfaces as an unrelated post-merge test failure
+  cause: 'When the write-triage judge call raises AuthenticationError, the pipeline logs a WARNING and stores the write without triage (fail-open). The test then asserts on a result it did not expect (''routed'': ''stored''), so the merge verify reports two new failing tests. The root cause, a failed judge call, is only in the captured log and the block reason does not name it, so the next agent has to read a long traceback to find it.'
+  area: fused-memory write triage / merge verification
+  first_seen: '2026-10-11'
+  disposition: pending
+  sightings:
+  - date: '2026-10-11'
+    project: dark_factory
+    session: 0b1fd1ab-fe5a-4aab-9d76-b222e39091e4
+    origin_phase: unknown
+    manifested_phase: verify
+    evidence_quote: 'WARNING  fused_memory.server.write_triage:write_triage.py:1008 write_triage fail-open at stage=judge project=dark_factory exc=AuthenticationError — write stored WITHOUT triage (contract C1: never block a write)'
