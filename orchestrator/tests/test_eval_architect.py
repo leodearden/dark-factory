@@ -111,8 +111,7 @@ def _stub_with_steps(steps) -> dict:
 
 # Every artifact shape that carries NO model content to derive a score from —
 # absent, empty, not-a-dict, or the header-only stub in either empty spelling.
-# Shared by the is_scorable_plan tests and the anti-drift parity assertion, so
-# the two can never be extended out of step with each other.
+# The predicate's own tests live in test_eval_plan_predicates.py.
 _UNSCORABLE_PLAN_SHAPES = [
     {},
     None,
@@ -701,53 +700,6 @@ class TestClampUnitScore:
 
         # Exact — verified by execution, not a tuned tolerance.
         assert clamp_unit_score(0.123456789) == 0.1235
-
-
-# ---------------------------------------------------------------------------
-# is_scorable_plan — THE single "does this artifact carry model content?" test
-# (3118 step-19/20)
-#
-# Extracted because the taint decision and the structural floor's 0.0
-# short-circuit were two INDEPENDENT tests that DISAGREED: run_architect_eval
-# used raw dict truthiness (`not plan`) while score_plan_structure used
-# `not plan.get('steps')`. `_create_plan` persists a TRUTHY header-only dict
-# with zero steps, so a cap landing right after the architect's first
-# plan-tools call fell straight into the gap — untainted, then floored to a
-# fabricated 0.0, the exact defect this task exists to remove.
-#
-# Both call sites now share this one function, so the parity below is
-# structural, not a convention someone has to remember.
-# ---------------------------------------------------------------------------
-
-class TestIsScorablePlan:
-    @pytest.mark.parametrize('plan', _UNSCORABLE_PLAN_SHAPES)
-    def test_shapes_without_steps_are_not_scorable(self, plan):
-        from orchestrator.evals.judge import is_scorable_plan
-
-        assert is_scorable_plan(plan) is False
-
-    def test_a_plan_with_steps_is_scorable(self):
-        from orchestrator.evals.judge import is_scorable_plan
-
-        assert is_scorable_plan(_well_formed_plan()) is True
-        # Even a poor plan is SCORABLE — the predicate asks "is there content to
-        # measure?", never "is the content good?". A bad plan must keep earning
-        # its low score rather than being laundered into an exclusion.
-        assert is_scorable_plan(_degenerate_plan()) is True
-
-    @pytest.mark.parametrize('plan', _UNSCORABLE_PLAN_SHAPES)
-    def test_rejected_shapes_are_exactly_the_structural_floor_zero(self, plan):
-        """ANTI-DRIFT: the predicate and the floor's short-circuit must agree.
-
-        The blocking defect was two "is this a real plan?" tests disagreeing.
-        Every shape the predicate rejects must be a shape the floor scores 0.0
-        by short-circuit — so a cell can never be left untainted while the floor
-        simultaneously refuses to derive a content score for it.
-        """
-        from orchestrator.evals.judge import is_scorable_plan, score_plan_structure
-
-        assert is_scorable_plan(plan) is False
-        assert score_plan_structure(plan) == 0.0
 
 
 # ---------------------------------------------------------------------------
