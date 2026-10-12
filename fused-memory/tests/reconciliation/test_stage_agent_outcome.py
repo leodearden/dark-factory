@@ -7,13 +7,14 @@ nothing. See plans/recon-stage-startup-wedge-rca-2026-09-27.md.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from shared.cli_invoke import AgentResult
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import StageAgentOutcome
+from fused_memory.models.reconciliation import StageAgentOutcome, StageId, StageReport
 from fused_memory.reconciliation.cli_stage_runner import StageResult, run_stage_via_cli
 from fused_memory.reconciliation.sandbox_guard import RemediationSandboxUnavailable
 
@@ -117,3 +118,32 @@ class TestStageResultOutcomeInvariant:
     def test_failure_with_the_completed_outcome_is_rejected(self):
         with pytest.raises(ValueError):
             StageResult(success=False, outcome=StageAgentOutcome.completed)
+
+
+def _stage_report(**overrides) -> StageReport:
+    fields: dict = {
+        'stage': StageId.task_knowledge_sync,
+        'started_at': datetime(2026, 9, 27, 0, 31, 35, tzinfo=UTC),
+        'completed_at': datetime(2026, 9, 27, 0, 33, 37, tzinfo=UTC),
+    }
+    fields.update(overrides)
+    return StageReport(**fields)
+
+
+class TestStageReportAgentOutcomeField:
+    def test_omitted_outcome_is_unrecorded_not_completed(self):
+        assert _stage_report().agent_outcome is None
+
+    def test_outcome_survives_the_journal_round_trip(self):
+        report = _stage_report(agent_outcome=StageAgentOutcome.zero_output_timeout)
+
+        rebuilt = StageReport(**report.model_dump(mode='json'))
+
+        assert rebuilt == report
+        assert rebuilt.agent_outcome is StageAgentOutcome.zero_output_timeout
+
+    def test_legacy_journal_row_without_the_key_rebuilds_unrecorded(self):
+        legacy = _stage_report().model_dump(mode='json')
+        legacy.pop('agent_outcome', None)
+
+        assert StageReport(**legacy).agent_outcome is None
