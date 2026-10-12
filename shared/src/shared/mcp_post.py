@@ -354,9 +354,11 @@ async def call_mcp_tool(
     call.
 
     Returns ``None``, always with a warning, when no reply dict arrived: any
-    failure :func:`check_mcp_post_response` reports, a ``result.isError``
-    answer, or a text block that is not a JSON object.  Propagates a transport
-    exception from ``client.post``, as :func:`post_mcp_tool_call` does.
+    failure :func:`check_mcp_post_response` reports, or any shape
+    ``parse_tool_result`` refuses — a ``result.isError`` answer
+    (``EnvelopeShape.IS_ERROR``) or a text block that is not a JSON object.
+    Propagates a transport exception from ``client.post``, as
+    :func:`post_mcp_tool_call` does.
     """
     resp = await _send_tool_call(
         client, base_url, tool, arguments,
@@ -368,12 +370,6 @@ async def call_mcp_tool(
         body = decode_mcp_response_body(resp)
     except ValueError as exc:
         logger.warning('MCP tool reply could not be decoded [%s]: %s', context, exc)
-        return None
-    result = body.get('result') if isinstance(body, dict) else None
-    if isinstance(result, dict) and result.get('isError'):
-        logger.warning(
-            'MCP tool call returned isError [%s]: %s', context, str(result)[:200],
-        )
         return None
     reply, err = parse_tool_result(body, None, dict)
     return None if err is not None else reply
