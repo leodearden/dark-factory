@@ -29,7 +29,7 @@ from .metrics import (
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from .runner import EvalResult
+    from .results import EvalResult
 
 logger = logging.getLogger(__name__)
 

@@ -60,7 +60,7 @@ def _cell(
     ``drop_metrics=_PRE_SIGMA``. Do not pass the same key in both.
     """
     from orchestrator.evals.metrics import EvalMetrics
-    from orchestrator.evals.runner import EvalResult
+    from orchestrator.evals.results import EvalResult
 
     m = EvalMetrics(
         plan_quality=plan_quality,
@@ -1011,9 +1011,9 @@ def test_rendering_is_deterministic():
 def campaign_seam(monkeypatch):
     """Patch every live seam so ``--run`` is exercised at ZERO spend.
 
-    Three patches, each closing a different way a test could reach the real
-    world: ``run_ofat_stage`` (the fan-out that would spawn architect runs),
-    ``save_result`` (which writes into the packaged results dir), and
+    Two patches, each closing a different way a test could reach the real
+    world: ``run_ofat_stage`` (the fan-out that would spawn architect runs, and
+    whose executors persist into the packaged results dir), and
     ``load_config`` (which would demand a real config / OAuth).
 
     A fourth is a TRIPWIRE rather than a stub: ``ofat_candidates`` fails the
@@ -1026,7 +1026,7 @@ def campaign_seam(monkeypatch):
     from orchestrator.evals import configs as eval_configs
     from orchestrator.evals import runner as eval_runner
 
-    calls = {'ofat': [], 'saved': []}
+    calls = {'ofat': []}
 
     async def _recorder(task_paths, candidates, base_config=None, **kwargs):
         calls['ofat'].append({
@@ -1052,7 +1052,6 @@ def campaign_seam(monkeypatch):
         )
 
     monkeypatch.setattr(eval_runner, 'run_ofat_stage', _recorder)
-    monkeypatch.setattr(eval_runner, 'save_result', lambda r: calls['saved'].append(r))
     monkeypatch.setattr(orch_config, 'load_config', lambda *a, **k: object())
     monkeypatch.setattr(eval_configs, 'ofat_candidates', _tripwire)
     return calls
@@ -1124,19 +1123,6 @@ def test_run_summarizes_the_returned_cells(tmp_path, campaign_seam, capsys):
     assert {c['task_id'] for c in loaded['cells']} == {'alpha', 'beta'}
     assert loaded['candidates'][0]['config_name'] == 'architect-opus-max'
     assert loaded['candidates'][0]['n'] == 2
-
-
-def test_run_persists_each_cell(tmp_path, campaign_seam):
-    """Every returned cell is persisted, so a later --results-dir can re-read it."""
-    d = _make_fixture_dir(tmp_path, ['alpha', 'beta'])
-
-    mod.main([
-        '--run', '--tasks-dir', str(d),
-        '--candidate', 'architect-opus-max', '--trials', '2',
-    ])
-
-    assert len(campaign_seam['saved']) == 4
-    assert {r.task_id for r in campaign_seam['saved']} == {'alpha', 'beta'}
 
 
 def test_results_dir_reanalyzes_persisted_cells(tmp_path, capsys):
@@ -1511,8 +1497,8 @@ def test_the_rendered_fraction_quotes_one_population():
 
 # ===== step 17: --results-dir must not silently absorb out-of-campaign cells =====
 #
-# Not hypothetical. ``save_result`` (runner.py:1370) writes into the SHARED
-# packaged ``RESULTS_DIR = Path(__file__).parent / 'results'`` (runner.py:50),
+# Not hypothetical. The eval executors persist into the SHARED packaged dir
+# (``orchestrator/src/orchestrator/evals/results.py::ResultStore.packaged``),
 # and the main checkout's copy already holds 586 persisted cells — 51 of them v1
 # ``architect-fable-high`` runs over the incumbent-biased standing corpus (e.g.
 # ``df_task_12__architect-fable-high__*.json``). The documented round-trip

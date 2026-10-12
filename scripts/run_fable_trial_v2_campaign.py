@@ -932,12 +932,15 @@ def _run_campaign(
     config_path: Path | None,
     timeout: int | None,
 ) -> list[Any]:
-    """Drive the campaign LIVE over ``run_ofat_stage`` and persist every cell.
+    """Drive the campaign LIVE over ``run_ofat_stage``.
 
     THE single real-API-spend seam, and deliberately not unit-tested end to end
     — the ``run_judge_ofat_pilot.py`` precedent. Its WIRING is covered instead by
-    tests that monkeypatch ``run_ofat_stage`` / ``save_result`` / ``load_config``
-    and assert exactly what this function hands over.
+    tests that monkeypatch ``run_ofat_stage`` / ``load_config`` and assert
+    exactly what this function hands over. Every executor persists its own cell
+    into the shared packaged dir
+    (``orchestrator/src/orchestrator/evals/results.py::ResultStore.packaged``),
+    so a later ``--results-dir`` can re-read it.
 
     ``run_ofat_stage``'s architect branch already routes every ``role ==
     'architect'`` candidate to ``run_architect_eval`` and handles trials,
@@ -957,20 +960,17 @@ def _run_campaign(
     import asyncio
 
     from orchestrator.config import ConfigRequiredError, load_config
-    from orchestrator.evals.runner import run_ofat_stage, save_result
+    from orchestrator.evals.runner import run_ofat_stage
 
     try:
         base_config = load_config(config_path)
     except ConfigRequiredError as e:
         raise SystemExit(f'Error: {e} (pass --config or set ORCH_CONFIG_PATH)') from e
 
-    results = asyncio.run(run_ofat_stage(
+    return asyncio.run(run_ofat_stage(
         fixture_paths, candidates, base_config,
         max_parallel=max_parallel, trials=trials, timeout_override=timeout,
     ))
-    for result in results:
-        save_result(result)
-    return results
 
 
 def filter_campaign_results(
@@ -981,9 +981,10 @@ def filter_campaign_results(
     A cell is kept iff its ``config_name`` is one of *candidate_names* AND its
     ``task_id`` is one of *fixture_stems*.
 
-    WHY THIS IS MANDATORY, not defensive tidiness. ``save_result`` persists into
-    the SHARED packaged ``orchestrator/src/orchestrator/evals/results/``
-    (``runner.py:50``), alongside every eval that has ever run — 586 cells in the
+    WHY THIS IS MANDATORY, not defensive tidiness. The executors persist into
+    the SHARED packaged dir
+    (``orchestrator/src/orchestrator/evals/results.py::ResultStore.packaged``),
+    alongside every eval that has ever run — 586 cells in the
     main checkout today, 51 of them v1 ``architect-fable-high`` runs over the
     incumbent-success-biased standing corpus that the v2 screen exists to
     escape. The documented round-trip (``--run`` persists, a later
@@ -1049,8 +1050,8 @@ def _load_campaign_results(
             f'  Selected candidates: {", ".join(sorted(candidate_names))}\n'
             f'  Fixture pool: {", ".join(sorted(fixture_stems))}\n'
             '  This usually means the dir predates this campaign or belongs to another '
-            'one — note that save_result writes into the SHARED packaged evals/results/ '
-            'dir alongside every eval that has ever run. Reporting over an empty pool '
+            'one — note that the eval executors persist into the SHARED packaged '
+            'evals/results/ dir alongside every eval that has ever run. Reporting over an empty pool '
             'would give "we measured nothing" the same shape as a real result.'
         )
     return kept, filtered

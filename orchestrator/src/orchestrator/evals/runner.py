@@ -9,7 +9,6 @@ import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -61,11 +60,11 @@ from .metrics import (
 )
 from .profile import apply_eval_profile
 from .replay_frame import REPLAY_FRAME_ID, ReplayFramedBriefingAssembler
+from .results import CellName, EvalResult, ResultStore
 from .snapshots import create_eval_worktree, read_python_pin
 
 logger = logging.getLogger(__name__)
 
-RESULTS_DIR = Path(__file__).parent / 'results'
 
 # Cap-wait patience for the architect eval invoke (eval-revival φ).
 #
@@ -95,8 +94,8 @@ RESULTS_DIR = Path(__file__).parent / 'results'
 #
 #   NOR IS RESTART A CHEAP ESCAPE. `run_ofat_stage` — the path campaign drivers
 #   use — has NO skip-existing guard (that is `run_eval_matrix`'s
-#   `_result_exists` check, a different function). Cells persist individually
-#   via `save_result`, so a kill loses no data, but a relaunch RE-RUNS and
+#   `ResultStore.exists` check, a different function). Cells persist individually
+#   via `ResultStore.save`, so a kill loses no data, but a relaunch RE-RUNS and
 #   RE-SPENDS them unless the operator hand-restricts `--tasks-dir`.
 #
 # 48 h is sized to the observed account regime, not to a round number: 1-3
@@ -335,23 +334,6 @@ async def campaign_usage_gate(
                     '(the campaign is already complete)',
                     exc_info=True,
                 )
-
-
-@dataclass
-class EvalResult:
-    """Result of one (task, config) eval run."""
-
-    task_id: str
-    config_name: str
-    outcome: str
-    metrics: dict[str, Any]
-    worktree_path: str
-    wall_clock_ms: int = 0
-    run_id: str = ''
-    trial: int = 1
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
 
 
 def _find_repo_root(start: Path) -> Path:
@@ -607,8 +589,12 @@ async def run_eval(
     judge_config: EvalConfig | None = None,
     *,
     usage_gate: InjectedGate = _GATE_UNSET,
+    store: ResultStore | None = None,
 ) -> EvalResult:
     """Run one (task, config) pair through PLAN→EXECUTE→VERIFY→REVIEW.
+
+    The cell persists into *store*; ``None`` persists into
+    :meth:`ResultStore.packaged`.
 
     When *worktree_path* is provided, the eval reuses an existing worktree
     instead of creating a fresh one.  The relocated
@@ -656,6 +642,7 @@ async def run_eval(
             project_root, task_id, task['pre_task_commit'],
             setup_commands=task.get('setup_commands'),
         )
+    address = CellName(task_id, result_label, run_id)
 
     # 2. Build orchestrator config for this eval
     orch_config = build_eval_orch_config(
@@ -752,18 +739,18 @@ async def run_eval(
             metrics_dict['role_under_test'] = 'judge'
 
         result = EvalResult(
-            task_id=task_id,
-            config_name=result_label,
+            task_id=address.task_id,
+            config_name=address.config_name,
             outcome=outcome.value if isinstance(outcome, WorkflowOutcome) else str(outcome),
             metrics=metrics_dict,
             worktree_path=str(worktree),
             wall_clock_ms=wall_clock_ms,
-            run_id=run_id,
+            run_id=address.run_id,
             trial=trial,
         )
 
         # 8. Persist result
-        save_result(result)
+        (store or ResultStore.packaged()).save(result)
 
         logger.info(
             f'Eval complete: {task_id} × {config.name} → {result.outcome} '
@@ -826,6 +813,7 @@ async def run_architect_eval(
     memory_endpoint: str | None = None,
     *,
     usage_gate: InjectedGate = _GATE_UNSET,
+    store: ResultStore | None = None,
 ) -> EvalResult:
     """Run ONE architect eval: invoke the architect LIVE and score its plan (θ).
 
@@ -900,8 +888,8 @@ async def run_architect_eval(
       (prefixed ``judge:``) but does NOT taint: the structural floor is still
       derived from a real produced plan.
 
-    The result carries ``role_under_test='architect'`` and is persisted via
-    :func:`save_result`.
+    The result carries ``role_under_test='architect'`` and is persisted into
+    *store* (``None`` persists into :meth:`ResultStore.packaged`).
 
     Cost accounting (eval-revival υ): the cell's ``cost_usd`` is the TOTAL
     spend of producing and scoring the plan — the architect invocation plus
@@ -972,6 +960,7 @@ async def run_architect_eval(
     worktree, run_id = await snapshots.create_eval_worktree(
         project_root, task_id, pre, setup_commands=task.get('setup_commands'),
     )
+    address = CellName(task_id, config.name, run_id)
 
     plan: dict = {}
     # Pre-initialised for the same reason ``artifacts``/``usage_gate`` below
@@ -1661,16 +1650,16 @@ async def run_architect_eval(
         judged_without_reference=judged_without_reference,
     )
     result_obj = EvalResult(
-        task_id=task_id,
-        config_name=config.name,
+        task_id=address.task_id,
+        config_name=address.config_name,
         outcome=outcome,
         metrics=metrics.to_dict(),
         worktree_path=str(worktree),
         wall_clock_ms=wall_clock_ms,
-        run_id=run_id,
+        run_id=address.run_id,
         trial=trial,
     )
-    save_result(result_obj)
+    (store or ResultStore.packaged()).save(result_obj)
     logger.info(
         f'Architect eval complete: {task_id} × {config.name} → '
         f'plan_quality={plan_quality} ({wall_clock_ms / 1000:.1f}s, '
@@ -1699,6 +1688,7 @@ async def run_end_to_end(
     memory_endpoint: str | None = None,
     *,
     usage_gate: InjectedGate = _GATE_UNSET,
+    store: ResultStore | None = None,
 ) -> EvalResult:
     """Run ONE both-live end-to-end eval: architect LIVE feeding implementer LIVE.
 
@@ -1714,7 +1704,8 @@ async def run_end_to_end(
 
     The result's ``config_name`` encodes the ``(architect, implementer)`` combo
     and its metrics carry ``role_under_test='end_to_end'``. Mirrors run_eval's
-    timeout / exception handling and persists via :func:`save_result`. Its
+    timeout / exception handling and persists into *store* (``None`` persists
+    into :meth:`ResultStore.packaged`). Its
     architect is briefed in the replay frame, and the cell is stamped
     ``replay_frame`` (docs/eval-replay-frame.md).
     """
@@ -1733,6 +1724,7 @@ async def run_end_to_end(
         project_root, task_id, task['pre_task_commit'],
         setup_commands=task.get('setup_commands'),
     )
+    address = CellName(task_id, config_name, run_id)
 
     # 2. Both-live orch config: architect derived from arch_config, implementer
     #    from impl_config.
@@ -1812,16 +1804,16 @@ async def run_end_to_end(
         metrics_dict['replay_frame'] = REPLAY_FRAME_ID
 
         result = EvalResult(
-            task_id=task_id,
-            config_name=config_name,
+            task_id=address.task_id,
+            config_name=address.config_name,
             outcome=outcome.value if isinstance(outcome, WorkflowOutcome) else str(outcome),
             metrics=metrics_dict,
             worktree_path=str(worktree),
             wall_clock_ms=wall_clock_ms,
-            run_id=run_id,
+            run_id=address.run_id,
             trial=trial,
         )
-        save_result(result)
+        (store or ResultStore.packaged()).save(result)
         logger.info(
             f'End-to-end eval complete: {task_id} × {config_name} → {result.outcome} '
             f'({wall_clock_ms / 1000:.1f}s)'
@@ -1880,8 +1872,14 @@ async def run_eval_matrix(
     trials: int = 1,
     force: bool = False,
     timeout_override: int | None = None,
+    *,
+    store: ResultStore | None = None,
 ) -> list[EvalResult]:
     """Run all (task, config, trial) combinations with bounded concurrency.
+
+    A (task, config) pair *store* already holds is skipped unless *force*;
+    every cell run persists into *store* (``None`` means
+    :meth:`ResultStore.packaged`).
 
     Raises:
         asyncio.CancelledError: if any individual eval coroutine raises
@@ -1890,6 +1888,7 @@ async def run_eval_matrix(
             sibling tasks, await their cleanup, and re-raise.
     """
     configs = configs or EVAL_CONFIGS
+    store = store or ResultStore.packaged()
 
     async with campaign_usage_gate(base_config) as gate:
         # ONE gate for the whole matrix (task 4427) — see campaign_usage_gate
@@ -1916,14 +1915,14 @@ async def run_eval_matrix(
             task_path: Path, config: EvalConfig, trial: int,
         ) -> EvalResult | None:
             task = load_task(task_path)
-            if not force and _result_exists(task['id'], config.name):
+            if not force and store.exists(task['id'], config.name):
                 logger.info(f'Skipping existing: {task["id"]} × {config.name}')
                 return None
             async with sem:
                 return await run_eval(
                     task_path, config, base_config,
                     trial=trial, timeout_override=timeout_override,
-                    usage_gate=gate,
+                    usage_gate=gate, store=store,
                 )
 
         # Design decision: use asyncio.wait(FIRST_COMPLETED) monitor loop instead of
@@ -2223,38 +2222,6 @@ def _resume_plan_from_worktree(worktree: Path, task: dict) -> dict | None:
         return initial_plan
     logger.info('No existing plan in worktree — using task JSON plan')
     return task.get('plan')
-
-
-def _result_exists(task_id: str, config_name: str) -> bool:
-    """Check if any result already exists for this (task, config) pair."""
-    if not RESULTS_DIR.exists():
-        return False
-    return any(RESULTS_DIR.glob(f'{task_id}__{config_name}__*.json'))
-
-
-def save_result(result: EvalResult) -> Path:
-    """Write eval result JSON to results directory."""
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    filename = f'{result.task_id}__{result.config_name}__{result.run_id}.json'
-    path = RESULTS_DIR / filename
-    with open(path, 'w') as f:
-        json.dump(result.to_dict(), f, indent=2)
-    logger.info(f'Saved result: {path}')
-    return path
-
-
-def load_results() -> list[EvalResult]:
-    """Load all existing eval results from the results directory."""
-    results = []
-    if not RESULTS_DIR.exists():
-        return results
-    for path in sorted(RESULTS_DIR.glob('*.json')):
-        with open(path) as f:
-            data = json.load(f)
-        # Filter to known fields so old results with extra/missing keys load
-        known = {f.name for f in EvalResult.__dataclass_fields__.values()}
-        results.append(EvalResult(**{k: v for k, v in data.items() if k in known}))
-    return results
 
 
 # ---------------------------------------------------------------------------
