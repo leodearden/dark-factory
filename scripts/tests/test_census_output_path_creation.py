@@ -31,6 +31,7 @@ import json
 from typing import Any
 
 import census as mod
+from legibility import unlanded
 
 import config as config_mod
 
@@ -80,7 +81,7 @@ def _run_census_kwargs(root, **overrides) -> dict[str, Any]:
         submit_fn=lambda payload: {"task_id": "t1"},
         escalate_fn=lambda **kw: None,
         status_fetcher=lambda: {"statuses": {}},
-        commit=lambda **kw: None,
+        commit=lambda **kw: unlanded.CommitResult(ok=True, sha="f" * 40, stderr="", attempts=1),
         roll_back=_never_roll_back,
         codebook_dict=_minimal_v2_codebook(),
         config=config_mod.LegibilityConfig(
