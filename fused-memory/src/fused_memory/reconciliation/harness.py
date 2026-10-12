@@ -4894,9 +4894,8 @@ class ReconciliationHarness:
         The filter runs BEFORE the ``if items:`` fall-through, so a run whose
         every finding was retired behaves exactly like a run that flagged
         nothing: an older completed run still gets its turn, and no empty
-        "Prior Stage 3 Findings" section is rendered.  ``_finding_is_superseded``
-        reads the key with ``.get``, so it is fail-open — a finding dict that
-        never carried the key is unaffected.
+        "Prior Stage 3 Findings" section is rendered.  A finding dict that never
+        carried the key is unaffected.
         """
         try:
             recent = await self.journal.get_recent_runs(project_id, limit=3)
@@ -4930,11 +4929,9 @@ class ReconciliationHarness:
         count.  Counted per-run — duplicates within one run's items_flagged do not count
         twice.
 
-        A row its own run superseded (``_finding_is_superseded``) does not match: that
-        run retired the claim, so the row is a record of it, not an occurrence.  This is
-        the rule the forward feed (``_get_prior_s3_findings``) and both actionable
-        partitions already apply.  The check is per row, so a standing copy beside a
-        retired one still counts the run.  Pinned by
+        A row its own run superseded (``_finding_is_superseded``) is a record of the
+        claim, not an occurrence, so it is skipped before it is fingerprinted.  The skip
+        is per row: a standing copy beside a retired one still counts the run.  Pinned by
         ``tests/test_harness.py::test_superseded_prior_occurrences_do_not_push_a_finding_to_escalation``.
 
         The default lookback is ``max(5, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD)`` so
@@ -4979,11 +4976,13 @@ class ReconciliationHarness:
                 # Count this run once if any item matches the target fingerprint
                 for item in items:
                     try:
+                        if _finding_is_superseded(item):
+                            continue
                         fp = _recon_finding_fingerprint(_RECON_INTEGRITY_ISSUE_CATEGORY, item)
                     except Exception:
                         any_item_fp_failed = True
                         continue
-                    if fp == target_fp and not _finding_is_superseded(item):
+                    if fp == target_fp:
                         count += 1
                         break  # one match per run is enough
             if any_item_fp_failed:

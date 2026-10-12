@@ -15048,29 +15048,6 @@ class TestFindingIsLiveActionable:
         ) is True
 
 
-class TestFindingIsSuperseded:
-    """_finding_is_superseded is the supersession half of
-    _finding_is_live_actionable: True only for a claim a later finding of the
-    same run retired.
-    """
-
-    def test_a_retired_finding_is_superseded(self):
-        from fused_memory.reconciliation.harness import _finding_is_superseded
-
-        assert _finding_is_superseded(_make_superseded_finding()) is True
-
-    def test_a_none_superseded_by_is_not_superseded(self):
-        """get_assembled_report always projects the key; None means the claim stands."""
-        from fused_memory.reconciliation.harness import _finding_is_superseded
-
-        assert _finding_is_superseded({'actionable': True, 'superseded_by': None}) is False
-
-    def test_a_missing_superseded_by_is_not_superseded(self):
-        from fused_memory.reconciliation.harness import _finding_is_superseded
-
-        assert _finding_is_superseded({}) is False
-
-
 def _drop_records(caplog, message):
     return [r for r in caplog.records if r.getMessage() == message]
 
@@ -15345,13 +15322,11 @@ def _persistent_unresolved_summaries(esc_queue) -> list[str]:
     ]
 
 
-@pytest.mark.asyncio
-async def test_superseded_prior_occurrences_do_not_push_a_finding_to_escalation(
-    journal, event_buffer, mock_memory_service, tmp_path, caplog,
+async def _cycle_flagging_after_prior_runs(
+    journal, event_buffer, mock_memory_service, tmp_path, live: dict, prior_items: list[dict],
 ):
-    """Prior runs that filed F and then retired it are not occurrences of F, so
-    only this cycle's parent and remediation runs count: persistence 2, below
-    the threshold, suppressed rather than escalated."""
+    """Persist THRESHOLD - 2 completed runs carrying *prior_items*, then run one
+    cycle whose S3 flags *live*; return the escalation queue it files into."""
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
     from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
@@ -15359,22 +15334,63 @@ async def test_superseded_prior_occurrences_do_not_push_a_finding_to_escalation(
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
     harness._escalation_queue = esc_queue
-    live = _make_s3_findings()[0]
     for _ in range(_INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2):
-        await _persist_parent_run(journal, 'test-project', _retired_occurrence_of(live))
+        await _persist_parent_run(journal, 'test-project', prior_items)
 
     await event_buffer.push(_make_event())
     _mock_stage_run(harness.stages[0])
     _mock_stage_run(harness.stages[1])
     _mock_stage_run(harness.stages[2], items_flagged=[live])
 
-    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
-        await harness.run_full_cycle('test-project', 'buffer_size:1')
+    await harness.run_full_cycle('test-project', 'buffer_size:1')
+    return esc_queue
 
+
+def _assert_suppressed_at_this_cycles_own_two_runs(esc_queue, caplog) -> None:
     assert _persistent_unresolved_summaries(esc_queue) == []
     suppressed = _drop_records(caplog, 'reconciliation.unresolved_after_remediation_suppressed')
     assert suppressed, 'expected the below-threshold finding to be suppressed'
     assert suppressed[0].__dict__.get('persistence') == 2
+
+
+@pytest.mark.asyncio
+async def test_superseded_prior_occurrences_do_not_push_a_finding_to_escalation(
+    journal, event_buffer, mock_memory_service, tmp_path, caplog,
+):
+    """Prior runs that filed F and then retired it are not occurrences of F, so
+    only this cycle's parent and remediation runs count: persistence 2, below
+    the threshold, suppressed rather than escalated."""
+    live = _make_s3_findings()[0]
+
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        esc_queue = await _cycle_flagging_after_prior_runs(
+            journal, event_buffer, mock_memory_service, tmp_path,
+            live, _retired_occurrence_of(live),
+        )
+
+    _assert_suppressed_at_this_cycles_own_two_runs(esc_queue, caplog)
+
+
+@pytest.mark.asyncio
+async def test_an_unfingerprintable_superseded_row_does_not_degrade_the_count(
+    journal, event_buffer, mock_memory_service, tmp_path, caplog,
+):
+    """A retired row can never count, so a malformed one (its ``affected_ids``
+    cannot be iterated, so fingerprinting it raises) must not trip the degraded
+    fail-toward-escalate count either."""
+    live = _make_s3_findings()[0]
+    malformed_retired = {
+        **live, 'affected_ids': 7, 'actionable': False, 'superseded_by': _SUPERSEDER_FID,
+    }
+
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        esc_queue = await _cycle_flagging_after_prior_runs(
+            journal, event_buffer, mock_memory_service, tmp_path,
+            live, [malformed_retired],
+        )
+
+    assert not _drop_records(caplog, 'reconciliation.persistence_item_fingerprint_failed')
+    _assert_suppressed_at_this_cycles_own_two_runs(esc_queue, caplog)
 
 
 @pytest.mark.asyncio
@@ -15390,27 +15406,13 @@ async def test_a_standing_copy_beside_a_retired_one_still_counts(
     would silence every recon_integrity_issue escalation, because
     get_assembled_report always projects the key.
     """
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
-
     from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
     live = _make_s3_findings()[0]
-    for _ in range(_INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2):
-        await _persist_parent_run(
-            journal,
-            'test-project',
-            _retired_occurrence_of(live) + [{**live, 'superseded_by': None}],
-        )
-
-    await event_buffer.push(_make_event())
-    _mock_stage_run(harness.stages[0])
-    _mock_stage_run(harness.stages[1])
-    _mock_stage_run(harness.stages[2], items_flagged=[live])
-
-    await harness.run_full_cycle('test-project', 'buffer_size:1')
+    esc_queue = await _cycle_flagging_after_prior_runs(
+        journal, event_buffer, mock_memory_service, tmp_path,
+        live, _retired_occurrence_of(live) + [{**live, 'superseded_by': None}],
+    )
 
     summaries = _persistent_unresolved_summaries(esc_queue)
     assert len(summaries) == 1, summaries
