@@ -528,6 +528,10 @@ class TestLandlockSandboxedConflictedMerge:
             extras = [str(p) for p in write_set.writable_paths()]
 
             self._assert_rr_cache_denied(main, worktree, fake_home, extras)
+            assert _scaffold_git(worktree, 'config', '--get', 'rerere.enabled').strip() == 'true', (
+                'premise broken: git already reads rerere off in the env invoke_agent '
+                'inherits, so this test cannot observe invoke_agent turning it off'
+            )
 
             result = await invoke_agent(
                 prompt='resolve', system_prompt='s', cwd=worktree, model='opus',

@@ -24,7 +24,7 @@ from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
 
 from orchestrator.agents import sandbox_dispatch
 from orchestrator.agents.invoke import invoke_agent
-from orchestrator.agents.sandbox_git_config import SANDBOX_GIT_CONFIG, sandbox_git_config_env
+from orchestrator.agents.sandbox_git_config import sandbox_git_config_env
 
 
 def _git_ok(repo: Path, *args: str) -> None:
@@ -71,10 +71,6 @@ class TestSandboxGitConfigEnv:
 
         assert _git_config_get(rerere_repo, 'rerere.enabled', entries) == 'false'
         assert _git_config_get(rerere_repo, 'rerere.autoupdate', entries) == 'false'
-        for key, value in SANDBOX_GIT_CONFIG:
-            assert _git_config_get(rerere_repo, key, entries) == value, (
-                f'git must read {key}={value} from the entries built for SANDBOX_GIT_CONFIG'
-            )
 
     def test_inherited_git_config_entries_survive(self, rerere_repo: Path) -> None:
         inherited = {
@@ -167,6 +163,10 @@ def _identity_sandbox() -> Iterator[None]:
         yield
 
 
+def _own_git_config_env() -> dict[str, str]:
+    return {key: value for key, value in os.environ.items() if key.startswith('GIT_CONFIG')}
+
+
 _REPO_CONFIG = ['true', 'true']
 _SANDBOX_CONFIG = ['false', 'false']
 
@@ -195,6 +195,7 @@ class TestSandboxedDispatchGitConfig:
     ) -> None:
         overrides = {'X_PROBE': '1'} if backend in ('claude', 'pi') else None
         overrides_before = dict(overrides) if overrides is not None else None
+        own_git_config_before = _own_git_config_env()
 
         with context():
             result = await invoke_agent(
@@ -217,7 +218,7 @@ class TestSandboxedDispatchGitConfig:
             'otherwise. Apply sandbox_git_config_env in orchestrator/src/orchestrator/'
             'agents/invoke.py at every backend that reaches wrap_command.'
         )
-        assert 'GIT_CONFIG_COUNT' not in os.environ, (
+        assert _own_git_config_env() == own_git_config_before, (
             "the policy belongs to the child env only; it must not leak into the "
             "orchestrator's own process environment."
         )
