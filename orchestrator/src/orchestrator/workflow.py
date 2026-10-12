@@ -3864,6 +3864,8 @@ class TaskWorkflow:
                         # re-verify (the implement-phase site is covered
                         # separately by TestTaskLaneVerifyHoldsLease).
                         role='task',
+                        task_id=self.task_id,
+                        event_store=self.event_store,
                     )
                 if not verify.passed:
                     if verify.timed_out:
@@ -9980,6 +9982,7 @@ class TaskWorkflow:
                         archive_root=self.config.project_root / 'data' / 'verify-logs',
                         force_workspace=self._train is not None,
                         role='task',
+                        event_store=self.event_store,
                     )
             except VerifyInfraError as exc:
                 last_infra_exc = exc

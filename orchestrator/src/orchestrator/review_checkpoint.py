@@ -192,7 +192,10 @@ class ReviewCheckpoint:
 
         # Phase 1: mechanical verification
         logger.info('Review [%s]: Phase 1 — running full verification', review_id)
-        phase1 = await run_full_verification(self.config.project_root, self.config)
+        # A periodic project-wide review of the main checkout, not a task's verify: it queues as background.
+        phase1 = await run_full_verification(
+            self.config.project_root, self.config, role='background', event_store=self.event_store,
+        )
         logger.info('Review [%s]: Phase 1 complete — %s', review_id, phase1.summary)
 
         # Load review briefing

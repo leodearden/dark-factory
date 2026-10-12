@@ -108,7 +108,6 @@ def _workflow_on_mock_config(event_store: _RecordingEventStore) -> TaskWorkflow:
     workflow.worktree = Path('/tmp/fake-worktree-5628')
     workflow.artifacts = MagicMock()
     workflow.artifacts.read_iteration_log = MagicMock(return_value=([], []))
-    workflow._mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)  # type: ignore[method-assign]
     return workflow
 
 
@@ -147,7 +146,6 @@ def _workflow_on_real_lane(tmp_path: Path, event_store: _RecordingEventStore) ->
     artifacts.init('42', 'X', 'desc', base_commit='base-sha')
     workflow.artifacts = artifacts
     workflow.plan = {'task_id': '42', 'steps': []}
-    workflow._check_escalations = MagicMock(return_value=[])  # type: ignore[method-assign]
     return workflow
 
 
@@ -161,9 +159,6 @@ def _sweep_harness(event_store: _RecordingEventStore) -> Harness:
     harness.config = OrchestratorConfig()
     harness.git_ops = MagicMock()
     harness.git_ops.get_main_sha = AsyncMock(return_value='b' * 40)
-    harness._escalation_queue = MagicMock()
-    harness._escalation_queue.make_id = MagicMock(return_value='esc-sweep-1')
-    harness._escalation_queue.has_open_l1 = MagicMock(return_value=False)
     harness._last_swept_main_sha = None
     harness._run_store = None
     harness._main_sweep_cold_control = None
