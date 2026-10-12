@@ -14,7 +14,6 @@ import asyncio
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from shared.cli_invoke import AgentResult
@@ -87,8 +86,9 @@ def test_assess_task_threads_pre_task_commit(
         recorded.append((worktree_path, base_commit))
         return 'SENTINEL'
 
-    async def fake_invoke_agent(**kwargs: object) -> SimpleNamespace:
-        return SimpleNamespace(
+    async def fake_invoke_agent(**kwargs: object) -> AgentResult:
+        return AgentResult(
+            success=True,
             structured_output={
                 'winner': 'A',
                 'confidence': 0.9,
@@ -100,6 +100,7 @@ def test_assess_task_threads_pre_task_commit(
                 'circumstances': '',
             },
             output='{}',
+            cost_usd=0.0,
         )
 
     monkeypatch.setattr('orchestrator.evals.compare.get_diff', rec)
@@ -163,9 +164,10 @@ def test_assess_task_missing_base_skips_get_diff_loudly(
 
     captured_prompts: list[str] = []
 
-    async def fake_invoke_agent(**kwargs: object) -> SimpleNamespace:
+    async def fake_invoke_agent(**kwargs: object) -> AgentResult:
         captured_prompts.append(str(kwargs.get('prompt', '')))
-        return SimpleNamespace(
+        return AgentResult(
+            success=True,
             structured_output={
                 'winner': 'tie',
                 'confidence': 0.0,
@@ -177,6 +179,7 @@ def test_assess_task_missing_base_skips_get_diff_loudly(
                 'circumstances': '',
             },
             output='{}',
+            cost_usd=0.0,
         )
 
     monkeypatch.setattr('orchestrator.evals.compare.get_diff', rec)

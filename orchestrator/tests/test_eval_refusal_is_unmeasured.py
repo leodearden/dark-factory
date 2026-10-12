@@ -5,19 +5,22 @@ from __future__ import annotations
 import copy
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, replace
+from pathlib import Path
 from typing import Any
 
 import pytest
 from _eval_refusal import REFUSAL_COST_USD, answered, refused_agent_result
 from shared.cli_invoke import AgentResult
 
-from orchestrator.evals import judge
+from orchestrator.evals import compare, judge
+from orchestrator.evals.compare import ASSESSOR_SCHEMA, ComparisonReport
 from orchestrator.evals.elo import DEFAULT_RATING, TaskPool
 from orchestrator.evals.measurement import (
     MeasurementStage,
     Unmeasured,
     UnmeasuredCause,
 )
+from orchestrator.evals.results import EvalResult
 from orchestrator.evals.reviewer_trial import campaign, scorer
 from orchestrator.evals.reviewer_trial.corpus import (
     CorpusDiff,
@@ -76,11 +79,54 @@ async def _pairwise_judge(monkeypatch: pytest.MonkeyPatch) -> object:
     return verdict.unmeasured
 
 
+_A_WINS_ASSESSMENT = {
+    'winner': 'A', 'confidence': 0.8, 'summary': 's',
+    'strengths_a': [], 'weaknesses_a': [], 'strengths_b': [], 'weaknesses_b': [],
+    'circumstances': '',
+}
+
+
+async def _compare(
+    monkeypatch: pytest.MonkeyPatch,
+    task_ids: list[str],
+    invoke: Callable[..., Awaitable[AgentResult]],
+) -> ComparisonReport:
+    monkeypatch.setattr(compare, 'invoke_agent', invoke)
+    results = [
+        EvalResult(
+            task_id=task_id, config_name=config, outcome='done',
+            metrics={'composite_score': score},
+            worktree_path=str(Path('/nonexistent-6736') / task_id / config),
+        )
+        for task_id in task_ids
+        for config, score in (('cfgA', 0.9), ('cfgB', 0.6))
+    ]
+    tasks = {task_id: {'id': task_id, 'name': f'Task {task_id}'} for task_id in task_ids}
+    return await compare.compare_models(results, ['cfgA'], ['cfgB'], tasks)
+
+
+async def _assessor(monkeypatch: pytest.MonkeyPatch) -> object:
+    report = await _compare(monkeypatch, ['t1'], _refuse)
+    return report.assessments[0].unmeasured
+
+
+async def _synthesizer(monkeypatch: pytest.MonkeyPatch) -> object:
+    async def assessor_answers(**kwargs: Any) -> AgentResult:
+        if kwargs['output_schema'] is ASSESSOR_SCHEMA:
+            return answered(_A_WINS_ASSESSMENT)
+        return refused_agent_result()
+
+    report = await _compare(monkeypatch, ['t1'], assessor_answers)
+    return report.synthesis
+
+
 # A new scoring site → add a ROW.
 _SITES = [
     pytest.param(_matcher, MeasurementStage.MATCHER, id='matcher'),
     pytest.param(_plan_judge, MeasurementStage.JUDGE, id='plan-judge'),
     pytest.param(_pairwise_judge, MeasurementStage.PAIRWISE_JUDGE, id='pairwise-judge'),
+    pytest.param(_assessor, MeasurementStage.ASSESSOR, id='assessor'),
+    pytest.param(_synthesizer, MeasurementStage.SYNTHESIZER, id='synthesizer'),
 ]
 
 
@@ -196,3 +242,31 @@ async def test_elo_tournament_counts_the_refusal_and_leaves_every_rating(
     assert pool.to_dict() == prior
     assert tally.unmeasured > 0
     assert tally.judged == 0
+
+
+async def test_compare_models_counts_the_refusal_and_keeps_every_mean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def t2_answers(t2: AgentResult) -> Callable[..., Awaitable[AgentResult]]:
+        async def invoke(**kwargs: Any) -> AgentResult:
+            if kwargs['output_schema'] is not ASSESSOR_SCHEMA:
+                return answered({
+                    'overall_winner': 'A', 'executive_summary': '',
+                    'circumstantial_analysis': '', 'cost_quality_tradeoff': '',
+                    'workflow_recommendations': '',
+                })
+            if '**Task t2**' in str(kwargs['prompt']):
+                return t2
+            return answered(_A_WINS_ASSESSMENT)
+
+        return invoke
+
+    refused = await _compare(monkeypatch, ['t1', 't2'], t2_answers(refused_agent_result()))
+    tied = await _compare(
+        monkeypatch, ['t1', 't2'], t2_answers(answered(_A_WINS_ASSESSMENT | {'winner': 'tie'})),
+    )
+    absent = await _compare(monkeypatch, ['t1'], t2_answers(refused_agent_result()))
+
+    assert refused.unmeasured == 1
+    assert (refused.wins_a, refused.wins_b, refused.ties) == (absent.wins_a, absent.wins_b, absent.ties)
+    assert (refused.avg_score_a, refused.avg_score_b) == (tied.avg_score_a, tied.avg_score_b)
