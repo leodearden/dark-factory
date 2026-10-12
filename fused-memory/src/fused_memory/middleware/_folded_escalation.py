@@ -31,8 +31,9 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from shared.project_layout import escalation_queue_dir
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
@@ -45,8 +46,6 @@ try:
     HAS_ESCALATION = True
 except ImportError:  # pragma: no cover — exercised only in minimal envs
     HAS_ESCALATION = False
-
-_QUEUE_DIRNAME: str = 'data/escalations'
 
 
 def _suffix(context: str) -> str:
@@ -125,7 +124,7 @@ def file_folded_escalation(
         return None
 
     try:
-        queue = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
+        queue = EscalationQueue(escalation_queue_dir(project_root))
     except Exception:
         # Constructing the queue creates its directory; a read-only or missing
         # project_root must not turn an alarm into a crash on a write path.

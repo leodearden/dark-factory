@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 from _fm_helpers import pydantic_spec, submit_and_resolve
+from shared.project_layout import escalation_queue_dir
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.reconciliation import backlog_policy
@@ -180,6 +181,23 @@ async def test_escalation_when_over_threshold_and_orchestrator_live(
     assert body['project_id'] == 'proj'
     assert body['workflow_state'] == 'infra'
     assert body['category'] == 'infra_issue'
+
+
+@pytest.mark.asyncio
+async def test_escalation_lands_in_the_layout_escalation_queue_when_relocated(
+    event_buffer, tmp_path, escalation_queue_relocation,
+):
+    await _seed_buffered(event_buffer, 'proj', n=12)
+    project_root = tmp_path / 'proj_root'
+    project_root.mkdir()
+    policy = BacklogPolicy(event_buffer, _StubQueue(), lambda _: True, hard_limit=10)
+
+    verdict = await policy.check('proj', project_root=str(project_root))
+
+    assert verdict.escalation_path is not None
+    assert Path(verdict.escalation_path).parent == escalation_queue_dir(project_root)
+    assert Path(verdict.escalation_path).exists()
+    assert not (project_root / escalation_queue_relocation.legacy_relpath).exists()
 
 
 @pytest.mark.asyncio
@@ -1119,6 +1137,29 @@ def _persisted_record(esc_dir: Path, esc_id: str) -> dict:
     return json.loads(archived[-1].read_text(encoding='utf-8'))
 
 
+def _write_pending_halt_record(esc_dir: Path, esc_id: str, *, project_id: str) -> None:
+    """Write a pending judge-halt record for *project_id* straight into *esc_dir*."""
+    (esc_dir / f'{esc_id}.json').write_text(
+        json.dumps({
+            'id': esc_id,
+            'task_id': None,
+            'agent_role': 'fused-memory',
+            'severity': 'blocking',
+            'category': 'infra_issue',
+            'summary': f'Reconciliation HALTED for {project_id}',
+            'detail': f'halt belonging to {project_id}',
+            'suggested_action': 'inspect_judge_halt',
+            'timestamp': '2026-07-28T00:00:00+00:00',
+            'status': 'pending',
+            'level': 1,
+            'workflow_state': 'infra',
+            'project_id': project_id,
+            'error_type': 'ReconciliationJudgeHalted',
+        }, indent=2),
+        encoding='utf-8',
+    )
+
+
 class TestOnJudgeUnhalt:
     """Clearing a halt must close the escalation the halt opened.
 
@@ -1151,25 +1192,7 @@ class TestOnJudgeUnhalt:
 
         esc_dir = project_root / 'data' / 'escalations'
         other_id = 'esc-reconciliation-halt-other-project'
-        (esc_dir / f'{other_id}.json').write_text(
-            json.dumps({
-                'id': other_id,
-                'task_id': None,
-                'agent_role': 'fused-memory',
-                'severity': 'blocking',
-                'category': 'infra_issue',
-                'summary': 'Reconciliation HALTED for other',
-                'detail': 'halt belonging to a DIFFERENT project',
-                'suggested_action': 'inspect_judge_halt',
-                'timestamp': '2026-07-28T00:00:00+00:00',
-                'status': 'pending',
-                'level': 1,
-                'workflow_state': 'infra',
-                'project_id': 'other',
-                'error_type': 'ReconciliationJudgeHalted',
-            }, indent=2),
-            encoding='utf-8',
-        )
+        _write_pending_halt_record(esc_dir, other_id, project_id='other')
         return policy, esc_dir, halt_id, backlog_id, other_id
 
     @pytest.mark.asyncio
@@ -1290,6 +1313,21 @@ class TestOnJudgeUnhalt:
             r.getMessage() for r in caplog.records if r.name == logger_name
         )
         assert 'nope' in text
+
+    @pytest.mark.asyncio
+    async def test_closes_the_halt_in_the_layout_escalation_queue_when_relocated(
+        self, event_buffer, tmp_path, escalation_queue_relocation,
+    ):
+        project_root = tmp_path / 'proj_root'
+        esc_dir = escalation_queue_dir(project_root)
+        esc_dir.mkdir(parents=True)
+        halt_id = 'esc-reconciliation-halt-proj-seeded'
+        _write_pending_halt_record(esc_dir, halt_id, project_id='proj')
+        policy = BacklogPolicy(event_buffer, _StubQueue(), lambda _: True)
+        policy.register_project_root('proj', str(project_root))
+
+        assert await policy.on_judge_unhalt('proj') == [halt_id]
+        assert not (project_root / escalation_queue_relocation.legacy_relpath).exists()
 
 
 # ── Fold isolation: what the fingerprint must keep apart ──────────────────

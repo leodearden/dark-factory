@@ -140,8 +140,9 @@ _DEFAULT_TEMPLATE = _SCRIPT_DIR / "fused-memory.service.template"
 # which is the join: it goes red exactly when the renderer stops preserving
 # what scope.py still reads.
 #
-# Those guards read scope.py with `ast` rather than importing it, and that is
-# MEASURED, not stylistic: fused_memory is not installed in the
+# The constant's value lives in shared/src/shared/project_layout.py, which
+# scope.py imports. Those guards read scope.py with `ast` rather than importing
+# it, and that is MEASURED, not stylistic: fused_memory is not installed in the
 # `uv run --project shared` environment tests/scripts/ runs under
 # (scripts/orchestrator.yaml's test_command), so `import fused_memory` raises
 # ModuleNotFoundError. "Simplifying" the source read into an import turns the

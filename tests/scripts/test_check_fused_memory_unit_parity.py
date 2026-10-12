@@ -1602,39 +1602,49 @@ def test_a_required_known_project_roots_line_would_reclobber():
 # reason, and the hazard is wide open again with a passing test over it. So the
 # invariant is pinned from BOTH ends.
 #
-# READ BY `ast`, NOT BY IMPORT, and that is measured rather than stylistic:
-# `uv run --project shared python -c 'import fused_memory'` raises
-# ModuleNotFoundError. tests/scripts/ runs under `--project shared`
-# (scripts/orchestrator.yaml's test_command, whose own comment records that
-# neither target directory is a workspace member), and that environment
-# installs no fused_memory. An import-based guard would fail at COLLECTION with
-# an error bearing no resemblance to the invariant under test.
+# The VALUE lives in shared/src/shared/project_layout.py::KNOWN_PROJECT_ROOTS_ENV
+# (task 6715), which scope.py imports. shared IS installed in the
+# `uv run --project shared` environment tests/scripts/ runs under, so the value
+# is read by import. scope.py is still read by `ast`, NOT by import, and that is
+# measured rather than stylistic: `uv run --project shared python -c 'import
+# fused_memory'` raises ModuleNotFoundError (scripts/orchestrator.yaml's
+# test_command), so an import-based guard would fail at COLLECTION with an
+# error bearing no resemblance to the invariant under test.
 
 _SCOPE_PATH = (
     REPO_ROOT / "fused-memory" / "src" / "fused_memory" / "models" / "scope.py"
 )
 
 
-def _scope_known_project_roots_env() -> str | None:
-    """Return the literal of scope.py's ``KNOWN_PROJECT_ROOTS_ENV: str = ...``.
-
-    A SOURCE read, never an import — see the section comment above for the
-    measurement that forces it. Returns None if the annotated assignment is not
-    found or is not a plain string literal, which callers must treat as a
-    FAILURE rather than as "nothing to check": a rename or a refactor into a
-    computed value has to fail loudly here, not yield None and pass vacuously.
-    That vacuity is the exact failure mode this guard exists to close.
-    """
+def _scope_imports_known_project_roots_env_from_shared() -> bool:
+    """Whether scope.py binds ``KNOWN_PROJECT_ROOTS_ENV`` from ``shared.project_layout``."""
     tree = ast.parse(_SCOPE_PATH.read_text(encoding="utf-8"))
-    for node in tree.body:
-        if not isinstance(node, ast.AnnAssign):
-            continue
-        target = node.target
-        if not isinstance(target, ast.Name) or target.id != "KNOWN_PROJECT_ROOTS_ENV":
-            continue
-        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
-            return node.value.value
+    return any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "shared.project_layout"
+        and any(
+            alias.name == "KNOWN_PROJECT_ROOTS_ENV" and alias.asname is None
+            for alias in node.names
+        )
+        for node in tree.body
+    )
+
+
+def _scope_known_project_roots_env() -> str | None:
+    """The env-var name scope.py reads as reconciliation's project-root scope.
+
+    Returns None unless scope.py still imports ``KNOWN_PROJECT_ROOTS_ENV`` from
+    ``shared.project_layout`` and that is a non-empty str. Callers must treat
+    None as a FAILURE rather than as "nothing to check": a rename or a move has
+    to fail loudly here, not pass vacuously. That vacuity is the exact failure
+    mode this guard exists to close.
+    """
+    if not _scope_imports_known_project_roots_env_from_shared():
         return None
+    from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV
+
+    if isinstance(KNOWN_PROJECT_ROOTS_ENV, str) and KNOWN_PROJECT_ROOTS_ENV:
+        return KNOWN_PROJECT_ROOTS_ENV
     return None
 
 
@@ -1648,12 +1658,12 @@ def test_scope_known_project_roots_env_is_readable_from_source():
     """
     name = _scope_known_project_roots_env()
     assert isinstance(name, str) and name, (
-        f"Could not read KNOWN_PROJECT_ROOTS_ENV as a string literal from "
-        f"{_SCOPE_PATH}. It was renamed, moved, or made computed. Without it "
-        "the two guards below silently stop checking anything — repair the "
-        "read rather than deleting them, and do NOT switch to importing "
-        "fused_memory: it is not installed in the `uv run --project shared` "
-        "environment this suite runs under."
+        f"{_SCOPE_PATH} no longer imports KNOWN_PROJECT_ROOTS_ENV from "
+        "shared.project_layout, or that constant is no longer a non-empty str. "
+        "Without it the two guards below silently stop checking anything — "
+        "repair the read rather than deleting them, and do NOT switch to "
+        "importing fused_memory: it is not installed in the "
+        "`uv run --project shared` environment this suite runs under."
     )
 
 

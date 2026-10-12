@@ -20,6 +20,7 @@ from uuid import uuid4
 
 from shared.cli_invoke import AllAccountsCappedException, read_transcript_records
 from shared.config_dir import TaskConfigDir
+from shared.project_layout import escalation_queue_dir
 from shared.storm_counter import StormCounter
 from shared.usage_gate import UsageGate
 
@@ -252,13 +253,6 @@ _DEAD_OWNER_STORM_FINDING: dict[str, Any] = {
 # escalates within a watchable window (≈ 10–180 minutes depending on cycle
 # duration), long enough to filter transient findings.
 _INTEGRITY_FINDING_RECURRENCE_THRESHOLD = 4
-
-# Task 4821: the per-project ORCHESTRATOR escalation queue, relative to a
-# project_root.  DISTINCT from the recon queue (`config.escalation_queue_dir`,
-# drained by the port-8103 watcher) that `_escalate` writes to.  Same spelling
-# and same convention as `targeted.py::_ESCALATION_QUEUE_DIRNAME`,
-# `scope_violation_escalator.py` and `ticket_janitor.py`.
-_ORCHESTRATOR_ESCALATION_QUEUE_DIRNAME = 'data/escalations'
 
 # Task 3049 amendment: hard ceiling on the EFFECTIVE value of
 # config.max_backlog_remediation_deferrals, derived from the threshold above so
@@ -3062,8 +3056,9 @@ class ReconciliationHarness:
             # exist_ok=True)`, so building it earlier would create a spurious
             # `data/escalations` directory under a project that never files
             # (targeted.py defers construction for exactly this reason).
+            # The per-project ORCHESTRATOR queue, not the recon queue `_escalate` writes to.
             queue = EscalationQueue(  # type: ignore[possibly-undefined]
-                Path(project_root) / _ORCHESTRATOR_ESCALATION_QUEUE_DIRNAME
+                escalation_queue_dir(project_root)
             )
             fingerprint = _recon_finding_fingerprint(_RECON_INTEGRITY_ISSUE_CATEGORY, finding)
             # Cross-cycle dedupe: the fold policy is

@@ -14,6 +14,7 @@ import pytest
 import pytest_asyncio
 from qdrant_client.http.exceptions import UnexpectedResponse
 from shared.config_dir import TaskConfigDir
+from shared.project_layout import escalation_queue_dir
 from shared.testing import make_gate_mock
 
 from fused_memory.models.reconciliation import (
@@ -21989,15 +21990,6 @@ def _orch_finding(**over) -> dict:
     return finding
 
 
-def _orch_queue_dir(root):
-    """The per-project ORCHESTRATOR escalation queue dir under *root*.
-
-    Distinct from the RECON queue (`config.escalation_queue_dir`, drained by the
-    port-8103 watcher) that `_escalate` writes to — see the A7b scope note.
-    """
-    return root / 'data' / 'escalations'
-
-
 def _wire_orchestrator_queue(harness, tmp_path, monkeypatch, *, live=True):
     """Point 'test-project' at *tmp_path* and force the orchestrator-liveness gate."""
     import fused_memory.reconciliation.harness as _h
@@ -22005,7 +21997,7 @@ def _wire_orchestrator_queue(harness, tmp_path, monkeypatch, *, live=True):
     harness._known_projects = dict(harness._known_projects)
     harness._known_projects['test-project'] = str(tmp_path)
     monkeypatch.setattr(_h, 'is_orchestrator_live_for', lambda _root: live)
-    return _orch_queue_dir(tmp_path)
+    return escalation_queue_dir(tmp_path)
 
 
 def _wire_remediation_tree(harness, task_ids):
@@ -22147,6 +22139,23 @@ def test_file_finding_task_escalation_lands_a_record_on_the_real_task(
     assert detail['run_id'] == 'abcdef0123456789'
     assert detail['project_id'] == 'test-project'
     assert detail['persistence'] == 4
+
+
+def test_file_finding_task_escalation_files_into_the_layout_escalation_queue_when_relocated(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+    escalation_queue_relocation,
+):
+    from escalation.queue import EscalationQueue
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    esc_id = harness._file_finding_task_escalation(
+        'test-project', 'abcdef0123456789', _orch_finding(), 4,
+    )
+
+    assert [e.id for e in EscalationQueue(queue_dir).get_pending()] == [esc_id]
+    assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
 
 
 def test_routed_record_is_invisible_to_the_orchestrator_l1_guards(
@@ -22537,7 +22546,7 @@ def test_unregistered_project_files_nothing(
     assert harness._file_finding_task_escalation(
         'never-registered', 'run-1', _orch_finding(), 4,
     ) is None
-    assert not _orch_queue_dir(tmp_path).exists()
+    assert not escalation_queue_dir(tmp_path).exists()
 
 
 @pytest.mark.parametrize(
@@ -22567,7 +22576,7 @@ def test_unroutable_target_files_nothing_and_touches_no_queue_directory(
     )
 
     assert result is None
-    assert not _orch_queue_dir(tmp_path).exists()
+    assert not escalation_queue_dir(tmp_path).exists()
     assert list(tmp_path.rglob('esc-*')) == []
 
 
