@@ -5,7 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from capability_manifest_twins import md_twin_path, unmentioned_labels
+from capability_manifest_twins import check_md_twin, md_twin_path, unmentioned_labels
+from pydantic import ValidationError
 
 
 class TestMdTwinPath:
@@ -79,3 +80,63 @@ class TestUnmentionedLabels:
 
     def test_a_greek_letter_label_is_not_satisfied_by_its_ascii_name(self):
         assert unmentioned_labels(['α'], '## alpha — x') == ('α',)
+
+
+def _sidecar_yaml(*labels: str, extra_capability_key: str = '') -> str:
+    blocks = ''.join(
+        f'  - label: {label}\n'
+        '    capabilities:\n'
+        f'      - name: cap-{index}\n'
+        '        binding: a binding\n'
+        '        verdict: PASS\n'
+        f'{extra_capability_key}'
+        for index, label in enumerate(labels)
+    )
+    return f'prd: plans/x-prd.md\nschema_version: 1\ntasks:\n{blocks}'
+
+
+def _write_pair(repo_root: Path, sidecar_text: str, md_text: str | None) -> Path:
+    sidecar = repo_root / 'plans' / 'x-prd.capability-manifest.yaml'
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_text(sidecar_text, encoding='utf-8')
+    if md_text is not None:
+        sidecar.with_suffix('.md').write_text(md_text, encoding='utf-8')
+    return sidecar
+
+
+class TestCheckMdTwin:
+    def test_a_twin_mentioning_every_label_passes(self, tmp_path):
+        md = '## α — first\n\n| Γ1 | cap-1 | PASS |\n'
+        sidecar = _write_pair(tmp_path, _sidecar_yaml('α', 'gamma1'), md)
+        assert check_md_twin(sidecar, tmp_path) is None
+
+    def test_a_missing_twin_names_both_repo_relative_paths(self, tmp_path):
+        sidecar = _write_pair(tmp_path, _sidecar_yaml('α'), None)
+        message = check_md_twin(sidecar, tmp_path)
+        assert message is not None
+        assert 'plans/x-prd.capability-manifest.yaml' in message
+        assert 'plans/x-prd.capability-manifest.md' in message
+        assert str(tmp_path) not in message
+
+    def test_drift_names_the_twin_and_only_the_unmentioned_labels(self, tmp_path):
+        md = '## α — first\n\n### γ — register on four servers\n'
+        sidecar = _write_pair(tmp_path, _sidecar_yaml('α', 'γ1', 'γ2', 'γ3'), md)
+        message = check_md_twin(sidecar, tmp_path)
+        assert message is not None
+        assert 'plans/x-prd.capability-manifest.md' in message
+        for label in ('γ1', 'γ2', 'γ3'):
+            assert label in message
+        assert "'α'" not in message
+
+    @pytest.mark.parametrize('md_text', [None, '## α — first\n\nno γ1 here\n'])
+    def test_a_failure_message_is_one_line(self, tmp_path, md_text):
+        sidecar = _write_pair(tmp_path, _sidecar_yaml('α', 'γ2'), md_text)
+        message = check_md_twin(sidecar, tmp_path)
+        assert message is not None
+        assert '\n' not in message
+
+    def test_a_schema_invalid_sidecar_propagates_instead_of_reporting_twin_drift(self, tmp_path):
+        invalid = _sidecar_yaml('α', extra_capability_key='        verdcit: PASS\n')
+        sidecar = _write_pair(tmp_path, invalid, '## α — first\n')
+        with pytest.raises(ValidationError):
+            check_md_twin(sidecar, tmp_path)
