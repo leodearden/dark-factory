@@ -74,68 +74,81 @@ function selectHeatmapColumns(allModules) {
   return { mostContended: contended.slice(0, headLen), rescued: rescuedPast(headLen) }
 }
 
+// Index columns by path so a row is scanned against its own lock_set rather
+// than against every column: O(rows x lock_set) probes (~13k on the live
+// snapshot) instead of O(rows x modules) (~12.9M). A path can carry more than
+// one module when two projects share it, which is why the value is a list and
+// why the project rule still has to run per hit.
+function heatmapModulesByPath(modules) {
+  const modulesByPath = new Map()
+  for (const module of modules) {
+    const atPath = modulesByPath.get(module.path)
+    if (atPath) atPath.push(module)
+    else modulesByPath.set(module.path, [module])
+  }
+  return modulesByPath
+}
+
+// Deliberately reaches the exported predicate rather than reimplementing it
+// against the index — the index accelerates the lookup and carries no copy
+// of the membership rule.
+function rowTouchesAnyIndexed(row, modulesByPath) {
+  for (const path of (row.lock_set || [])) {
+    for (const module of modulesByPath.get(path) || []) {
+      if (rowTouchesModule(row, module)) return true
+    }
+  }
+  return false
+}
+
+// A parked row is kept whatever its columns do — it is what the Scheduler
+// tab's stranded-parks banner is pointing at — and it is taken FIRST,
+// because a carve-out that only survives the filter does not survive this
+// function.  `shape_scheduler` appends the synthetic stranded-park rows
+// after every project's ordinary rows, so on a list the size of the live
+// snapshot a positional prefix fills up long before it reaches them and
+// drops precisely the rows the carve-out was written to keep.  A row waiting
+// on a rescued column comes next: it is blocked on a stranded lock, as stuck
+// as a parked one, and without it the rescued column renders blank.  That
+// tier is bounded by MAX_RESCUED_COLS columns, each no more contended than
+// the head's minimum (15 rows on the live snapshot).
+//
+// Ordinary rows therefore yield to parked ones when the cap binds.  That
+// trade is one-sided in practice (the live snapshot has 7 parked rows
+// against 2,991) and is the right way round when it is not: a row is on
+// this tab to be diagnosed, and a parked one is already stuck.
+function selectHeatmapRows(allRows, keptModules, rescued) {
+  const keptByPath = heatmapModulesByPath(keptModules)
+  const rescuedByPath = heatmapModulesByPath(rescued)
+  const parkedRows = []
+  const waitingRows = []
+  const touchingRows = []
+  for (const row of allRows) {
+    if (((row.park_state || {}).modules || []).length > 0) parkedRows.push(row)
+    else if (rowTouchesAnyIndexed(row, rescuedByPath)) waitingRows.push(row)
+    else if (rowTouchesAnyIndexed(row, keptByPath)) touchingRows.push(row)
+  }
+  return parkedRows.concat(waitingRows, touchingRows).slice(0, MAX_HEATMAP_ROWS)
+}
+
 // Choose the rows and columns the heatmap will actually render.
 //
 // Returns the selected axes alongside the INPUT totals and a per-axis
 // truncation flag, so the caller can tell the user how much it is not showing.
+//
+// The server's `(-contention, path)` sort is inherited rather than re-derived:
+// the head is a prefix of the contended modules in that order, i.e. the most
+// contended ones, and every rescued module lies after the head in it, so
+// head-then-tail is still server order.  Columns are chosen BEFORE rows so
+// rows are chosen against the columns that will actually render — a row
+// touching only a column past the cap would otherwise survive it and render
+// as 60 blank cells.
 function boundHeatmapAxes({ rows, modules }) {
   const allRows = rows || []
   const allModules = modules || []
-
-  // The server's `(-contention, path)` sort is inherited rather than
-  // re-derived: the head is a prefix of the contended modules in that order,
-  // i.e. the most contended ones, and every rescued module lies after the
-  // head in it, so head-then-tail is still server order.
-  //
-  // Columns are chosen BEFORE row selection so rows are chosen against the
-  // columns that will actually render — a row touching only a column past the
-  // cap would otherwise survive it and render as 60 blank cells.
   const { mostContended, rescued } = selectHeatmapColumns(allModules)
   const keptModules = mostContended.concat(rescued)
-
-  // Index the surviving columns by path so a row is scanned against its own
-  // lock_set rather than against every column: O(rows x lock_set) probes
-  // (~13k on the live snapshot) instead of O(rows x modules) (~12.9M). A path
-  // can carry more than one module when two projects share it, which is why
-  // the value is a list and why the project rule still has to run per hit.
-  const keptModulesByPath = new Map()
-  for (const module of keptModules) {
-    const atPath = keptModulesByPath.get(module.path)
-    if (atPath) atPath.push(module)
-    else keptModulesByPath.set(module.path, [module])
-  }
-
-  // Deliberately reaches the exported predicate rather than reimplementing it
-  // against the index — the index accelerates the lookup and carries no copy
-  // of the membership rule.
-  function touchesAnyKeptModule(row) {
-    for (const path of (row.lock_set || [])) {
-      for (const module of keptModulesByPath.get(path) || []) {
-        if (rowTouchesModule(row, module)) return true
-      }
-    }
-    return false
-  }
-
-  // A parked row is kept whatever its columns do — it is what the Scheduler
-  // tab's stranded-parks banner is pointing at — and it is taken FIRST,
-  // because a carve-out that only survives the filter does not survive this
-  // function.  `shape_scheduler` appends the synthetic stranded-park rows
-  // after every project's ordinary rows, so on a list the size of the live
-  // snapshot a positional prefix fills up long before it reaches them and
-  // drops precisely the rows the carve-out was written to keep.
-  //
-  // Ordinary rows therefore yield to parked ones when the cap binds.  That
-  // trade is one-sided in practice (the live snapshot has 7 parked rows
-  // against 2,991) and is the right way round when it is not: a row is on
-  // this tab to be diagnosed, and a parked one is already stuck.
-  const parkedRows = []
-  const touchingRows = []
-  for (const row of allRows) {
-    if (((row.park_state || {}).modules || []).length > 0) parkedRows.push(row)
-    else if (touchesAnyKeptModule(row)) touchingRows.push(row)
-  }
-  const keptRows = parkedRows.concat(touchingRows).slice(0, MAX_HEATMAP_ROWS)
+  const keptRows = selectHeatmapRows(allRows, keptModules, rescued)
 
   return {
     rows: keptRows,
