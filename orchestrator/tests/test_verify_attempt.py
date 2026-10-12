@@ -120,21 +120,28 @@ class TestCheckRun:
             'admission': None,
         }
 
-    def test_to_dict_passes_the_admission_record_through(self):
-        """Task 5628: the admission turn the test leg's slot wait ended in."""
+    def test_to_dict_serialises_the_admitted_leg(self):
+        """Task 5628: the admitted leg the test leg's slot wait ended in."""
         from orchestrator.verify import CheckRun  # noqa: PLC0415
+        from orchestrator.verify_admission_record import AdmissionLeg  # noqa: PLC0415
 
-        admission = {
-            'plan_id': 'p', 'module': 'pkg', 'scope_kind': None, 'order': 'arrival',
-            'arrived_at': '2026-10-12T00:00:00+00:00', 'granted_at': '2026-10-12T00:00:01+00:00',
-            'waited_secs': 1.0, 'depth_at_arrival': 0, 'slot_held': True, 'held_secs': 2.5,
-        }
+        leg = AdmissionLeg(
+            plan_id='p', module='pkg', scope_kind=None, order='arrival',
+            arrived_at='2026-10-12T00:00:00+00:00', granted_at='2026-10-12T00:00:01+00:00',
+            waited_secs=1.0, depth_at_arrival=0, slot_held=True,
+            flock_wait_secs=0.5, held_secs=2.5, rc=0, timed_out=False,
+        )
         run = CheckRun(
             label='test', cmd='uv run pytest', rc=0, output='', timed_out=False,
-            started_at='ts', duration_secs=2.0, admission=admission,
+            started_at='ts', duration_secs=2.0, admission=leg,
         )
 
-        assert run.to_dict()['admission'] == admission
+        assert run.to_dict()['admission'] == {
+            'plan_id': 'p', 'module': 'pkg', 'scope_kind': None, 'order': 'arrival',
+            'arrived_at': '2026-10-12T00:00:00+00:00', 'granted_at': '2026-10-12T00:00:01+00:00',
+            'waited_secs': 1.0, 'depth_at_arrival': 0, 'slot_held': True,
+            'flock_wait_secs': 0.5, 'held_secs': 2.5, 'rc': 0, 'timed_out': False,
+        }
 
 
 class TestCheckRunSegments:

@@ -3,18 +3,19 @@
 The record carriers (the test CheckRun's ``admission``, VerifyResult's
 ``admission_legs`` and the three EventTypes), then the gate composed with the
 REAL flock and real subprocess commands through ``run_verification``,
-``run_scoped_verification`` and ``run_full_verification``.
+``run_scoped_verification`` and ``run_full_verification``, and the plan row
+each records.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import dataclasses
 import os
 import shlex
 import sys
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -28,12 +29,15 @@ from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.verify import (
+    VerifyInfraError,
     VerifyResult,
     run_full_verification,
     run_scoped_verification,
     run_verification,
 )
 from orchestrator.verify_admission_gate import gate_for
+from orchestrator.verify_admission_record import AdmissionLeg
+from orchestrator.verify_runner import result_from_json, result_to_json
 
 _BLOCK_SRC = (
     'import os, sys, time\n'
@@ -59,6 +63,14 @@ def _config(tmp_path: Path, **overrides: Any) -> OrchestratorConfig:
 
 def _sleep_cmd(secs: float = 0.05) -> str:
     return f'{shlex.quote(sys.executable)} -c "import time; time.sleep({secs})"'
+
+
+def _worker_crash_cmd(tmp_path: Path) -> str:
+    """A test command whose output is a bare xdist worker crash, which verify
+    raises as a VerifyInfraError for the workflow's infra retry."""
+    script = tmp_path / 'crash.py'
+    script.write_text("print('[gw0] node down: Not properly terminated')\nraise SystemExit(1)\n")
+    return shlex.join([sys.executable, str(script)])
 
 
 class _Blocker:
@@ -124,12 +136,12 @@ async def _assert_no_slot_leaked(slots_dir: Path) -> None:
     await asyncio.sleep(0.3)
     await _until(lambda: _slot_free_now(slots_dir))
 
-_LEG = {
-    'plan_id': 'p', 'module': 'pkg', 'scope_kind': None, 'order': 'arrival',
-    'arrived_at': '2026-10-12T00:00:00+00:00', 'granted_at': '2026-10-12T00:00:01+00:00',
-    'waited_secs': 1.0, 'depth_at_arrival': 0, 'slot_held': True, 'held_secs': 2.5,
-    'rc': 0, 'timed_out': False,
-}
+_LEG = AdmissionLeg(
+    plan_id='p', module='pkg', scope_kind=None, order='arrival',
+    arrived_at='2026-10-12T00:00:00+00:00', granted_at='2026-10-12T00:00:01+00:00',
+    waited_secs=1.0, depth_at_arrival=0, slot_held=True, flock_wait_secs=0.5, held_secs=2.5,
+    rc=0, timed_out=False,
+)
 
 
 def _result(**overrides) -> VerifyResult:
@@ -144,12 +156,12 @@ class TestRecordCarriers:
         assert _result().admission_legs is None
 
     def test_admission_legs_do_not_take_part_in_equality(self):
-        assert _result(admission_legs=[_LEG]) == _result(admission_legs=None)
+        assert _result(admission_legs=(_LEG,)) == _result(admission_legs=None)
 
-    def test_admission_legs_round_trip_through_the_wire_codec(self):
-        result = _result(admission_legs=[_LEG, {**_LEG, 'module': 'other'}])
+    def test_admission_legs_round_trip_through_the_wire_codec_as_records(self):
+        result = _result(admission_legs=(_LEG, replace(_LEG, module='other')))
 
-        decoded = VerifyResult(**dataclasses.asdict(result))
+        decoded = result_from_json(result_to_json(result))
 
         assert decoded.admission_legs == result.admission_legs
 
@@ -176,12 +188,12 @@ class TestRunVerificationAdmission:
         assert result.passed
         assert result.admission_legs is not None
         [leg] = result.admission_legs
-        assert leg['module'] == 'pkg'
-        assert leg['slot_held'] is True
-        assert (leg['rc'], leg['timed_out']) == (0, False)
-        assert leg['held_secs'] > 0
-        assert leg['order'] == 'unordered'
-        assert leg['plan_id']
+        assert leg.module == 'pkg'
+        assert leg.slot_held is True
+        assert (leg.rc, leg.timed_out) == (0, False)
+        assert leg.held_secs > 0
+        assert leg.order == 'unordered'
+        assert leg.plan_id
 
     @pytest.mark.skipif(os.geteuid() == 0, reason='root ignores directory permissions')
     async def test_an_unusable_slots_dir_fails_open_and_says_so(self, tmp_path):
@@ -200,7 +212,7 @@ class TestRunVerificationAdmission:
         assert result.passed
         assert result.admission_legs is not None
         [leg] = result.admission_legs
-        assert leg['slot_held'] is False
+        assert leg.slot_held is False
 
     async def test_a_merge_verify_never_touches_the_gate(self, tmp_path):
         config = _config(tmp_path)
@@ -284,6 +296,27 @@ class TestRunVerificationAdmission:
         assert result.passed
         await _assert_no_slot_leaked(slots_dir)
 
+    async def test_a_legs_flock_wait_is_inside_its_held_turn(self, tmp_path):
+        config = _config(tmp_path)
+        slots_dir = Path(config.verify_admission_slots_dir)
+        slots_dir.mkdir()
+
+        with contextlib.ExitStack() as external:
+            assert external.enter_context(
+                acquire_task_slot('task', slots_dir=slots_dir, n=1, wait=False),
+            ) is True
+            run = asyncio.create_task(run_verification(
+                _worktree(tmp_path, 'wt'), config, _module('pkg', _sleep_cmd()), task_id='f',
+            ))
+            await _until(lambda: _holders(slots_dir) == ['pkg'], watching=run)
+            await asyncio.sleep(0.5)
+        async with asyncio.timeout(30):
+            result = await run
+
+        assert result.admission_legs is not None
+        [leg] = result.admission_legs
+        assert leg.waited_secs < 0.5 <= leg.flock_wait_secs < leg.held_secs
+
     async def test_a_timeout_retry_is_a_second_leg_of_the_same_plan(self, tmp_path):
         config = _config(
             tmp_path, verify_command_timeout_secs=1, verify_cold_command_timeout_secs=1,
@@ -298,8 +331,8 @@ class TestRunVerificationAdmission:
         assert result.timed_out
         assert result.admission_legs is not None
         assert len(result.admission_legs) == 2
-        assert all(leg['timed_out'] for leg in result.admission_legs)
-        assert len({leg['plan_id'] for leg in result.admission_legs}) == 1
+        assert all(leg.timed_out for leg in result.admission_legs)
+        assert len({leg.plan_id for leg in result.admission_legs}) == 1
 
 
 def _plan_rows(store: EventStore) -> list[dict]:
@@ -336,7 +369,9 @@ class TestPlanEvent:
         assert row['task_id'] == '11'
         data = row['data']
         assert (data['role'], data['order'], data['task_id']) == ('task', 'arrival', '11')
-        assert data['legs'] == result.admission_legs
+        assert result.admission_legs is not None
+        assert data['legs'] == [leg.to_dict() for leg in result.admission_legs]
+        assert data['outcome'] == 'returned'
         assert {leg['plan_id'] for leg in data['legs']} == {data['plan_id']}
         assert {leg['module'] for leg in data['legs']} == {'a', 'b'}
         first, second = sorted(data['legs'], key=lambda leg: _at(leg['granted_at']))
@@ -363,6 +398,26 @@ class TestPlanEvent:
         assert result.passed
         assert result.admission_legs is None
         assert _plan_rows(store) == []
+
+    @pytest.mark.parametrize(('overrides', 'rows'), [({}, 1), ({'verify_admission_enabled': False}, 0)])
+    async def test_a_plan_that_raises_records_that_its_admission_went_unmeasured(
+        self, tmp_path, overrides, rows,
+    ):
+        store = EventStore(tmp_path / 'runs.db', run_id='t')
+
+        with pytest.raises(VerifyInfraError):
+            async with asyncio.timeout(30):
+                await run_scoped_verification(
+                    _worktree(tmp_path, 'wt'), _config(tmp_path, **overrides),
+                    [_module('a', _worker_crash_cmd(tmp_path))],
+                    task_files=[], task_id='14', role='task', event_store=store,
+                )
+
+        assert len(_plan_rows(store)) == rows
+        for row in _plan_rows(store):
+            assert row['task_id'] == '14'
+            data = row['data']
+            assert (data['outcome'], data['legs'], data['order']) == ('raised', [], None)
 
     async def test_a_plan_without_an_event_store_still_records_its_legs(self, tmp_path):
         async with asyncio.timeout(30):
@@ -404,7 +459,7 @@ class TestPlanEvent:
         assert p_result.admission_legs is not None and q_result.admission_legs is not None
         assert len(p_result.admission_legs) == 6
         [q_leg] = q_result.admission_legs
-        assert max(_at(leg['granted_at']) for leg in p_result.admission_legs) < _at(q_leg['granted_at'])
+        assert max(_at(leg.granted_at) for leg in p_result.admission_legs) < _at(q_leg.granted_at)
 
     async def test_a_file_scoped_leg_records_its_scope_kind(self, tmp_path):
         worktree = _worktree(tmp_path, 'wt')
@@ -420,7 +475,7 @@ class TestPlanEvent:
 
         assert result.admission_legs is not None
         [leg] = result.admission_legs
-        assert leg['scope_kind'] == 'file_scoped'
+        assert leg.scope_kind == 'file_scoped'
 
     async def test_a_background_full_verification_emits_its_plan(self, tmp_path):
         config = _config(tmp_path)

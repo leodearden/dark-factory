@@ -941,17 +941,16 @@ class EventType(StrEnum):
     # Every payload carries `order`, so before/after a policy flip is read from
     # the rows themselves, never from dates. Wall-clock ISO times only.
     #
-    # verify_admission_plan — one row per gated verify plan that returned
-    #   (verify.py::run_scoped_verification / run_full_verification); a plan
-    #   that raised or was cancelled emits none. task_id and role are also
-    #   first-class columns; phase 'verify'. Payload:
+    # verify_admission_plan — one row per gated verify plan
+    #   (verify.py::run_scoped_verification / run_full_verification) that
+    #   returned with an admitted leg, or that raised while admission was on;
+    #   a cancelled plan emits none. task_id and role are also first-class
+    #   columns; phase 'verify'. Payload:
     #   {plan_id, task_id, role,
-    #    order,             # the legs' common order; null if a reload changed it mid-plan
+    #    outcome,           # 'returned' | 'raised'; a raised plan's legs never came back: []
+    #    order,             # the legs' common order; null if a reload changed it mid-plan, or no legs
     #    plan_arrival_at, completed_at,
-    #    legs: [{plan_id, module, scope_kind, order, arrived_at, granted_at,
-    #            waited_secs, depth_at_arrival,
-    #            slot_held,     # false = the flock failed open; the leg was not cross-process gated
-    #            held_secs, rc, timed_out}]}
+    #    legs: [verify_admission_record.py::AdmissionLeg.to_dict()]}
     verify_admission_plan = 'verify_admission_plan'
     # verify_admission_heartbeat — from the harness watch
     #   (verify_admission_watch.py::AdmissionWatch), once per tick and only

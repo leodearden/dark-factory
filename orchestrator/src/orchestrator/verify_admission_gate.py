@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal, get_args
+from typing import Literal, get_args
 
 from shared.verify_admission import is_gated_role
 
@@ -119,25 +119,15 @@ class AdmissionGrant:
     order: AdmissionOrder
     arrived_at: datetime
     granted_at: datetime
+    granted: float
+    """Monotonic twin of ``granted_at``. A turn is held from here, which is
+    what ``HolderView.held_secs`` measures."""
     waited_secs: float
     depth_at_arrival: int
     slot_held: bool = False
     """Whether the cross-process flock slot is held. The gate never acquires the
     flock, so a grant straight from ``admit`` carries False and
     ``verify.py::_admission_slot`` replaces it with the flock's answer."""
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            'plan_id': self.request.plan_id,
-            'module': self.request.module,
-            'scope_kind': self.request.scope_kind,
-            'order': self.order,
-            'arrived_at': self.arrived_at.isoformat(),
-            'granted_at': self.granted_at.isoformat(),
-            'waited_secs': self.waited_secs,
-            'depth_at_arrival': self.depth_at_arrival,
-            'slot_held': self.slot_held,
-        }
 
 
 @dataclass(frozen=True)
@@ -226,6 +216,7 @@ class AdmissionGate:
                 order=turn.order,
                 arrived_at=waiter.arrived_at,
                 granted_at=turn.granted_at,
+                granted=turn.granted,
                 waited_secs=turn.granted - waiter.arrival,
                 depth_at_arrival=waiter.depth_at_arrival,
             )
