@@ -8,14 +8,11 @@ from pathlib import Path
 
 import aiosqlite
 import pytest
+from sampler.metrics import METRIC_GROUPS, GroupName
 from sampler.store import SCHEMA
 
-from dashboard.data.load import (
-    KNOWN_METRICS,
-    PROCESS_METRICS,
-    PSI_METRICS,
-    get_load_metrics,
-)
+import dashboard.data.load as load_module
+from dashboard.data.load import KNOWN_METRICS, get_load_metrics
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -193,37 +190,30 @@ def test_load_samples_db_property_points_to_canonical_path(tmp_path: Path) -> No
 
 
 # ---------------------------------------------------------------------------
-# Tests: schema and metric drift guard
+# Tests: the served metrics are a projection of the sampler's table
 # ---------------------------------------------------------------------------
 
 
-def test_dashboard_metric_sets_match_what_the_sampler_collectors_emit() -> None:
-    """PSI_METRICS and PROCESS_METRICS stay aligned with the sampler's collectors."""
-    import sampler.metrics as sampler_metrics_mod
-
-    # --- PSI metric names ---
-    # collect_psi only needs a callable reader; no filesystem or kernel access.
-    stub_psi_text = 'some avg10=0.0\nfull avg10=0.0'
-    sampler_psi_keys = frozenset(
-        k.metric for k in sampler_metrics_mod.collect_psi(read=lambda _name: stub_psi_text)
-    )
-    assert sampler_psi_keys == PSI_METRICS, (
-        f'PSI metric mismatch — sampler emits {sorted(sampler_psi_keys)}, '
-        f'dashboard PSI_METRICS has {sorted(PSI_METRICS)}'
+def test_known_metrics_are_the_exact_names_of_the_served_groups() -> None:
+    """The dashboard decides which groups it serves; the table names their metrics."""
+    served = {GroupName.PSI, GroupName.PROCESS}
+    served_names = sorted(
+        name for group in METRIC_GROUPS if group.name in served for name in group.exact
     )
 
-    # --- Process metric names ---
-    process_keys = frozenset(
-        k.metric
-        for k in sampler_metrics_mod.collect_process_metrics(
-            proc_iter=lambda *_a, **_kw: [],
-            fd9_exists=lambda _pid: False,
-        )
-    )
-    assert process_keys == PROCESS_METRICS, (
-        f'Process metric mismatch — sampler emits {sorted(process_keys)}, '
-        f'dashboard PROCESS_METRICS has {sorted(PROCESS_METRICS)}'
-    )
+    assert tuple(served_names) == KNOWN_METRICS
+
+
+def test_no_load_group_metric_is_served() -> None:
+    """Per-leaf rows are not served, and neither is the load group's host level."""
+    (load,) = [group for group in METRIC_GROUPS if group.name is GroupName.LOAD]
+
+    assert not (load.exact | load.per_leaf) & set(KNOWN_METRICS)
+
+
+@pytest.mark.parametrize('name', ['PSI_METRICS', 'PROCESS_METRICS'])
+def test_the_module_keeps_no_hand_spelled_metric_set(name: str) -> None:
+    assert not hasattr(load_module, name)
 
 
 # ---------------------------------------------------------------------------
