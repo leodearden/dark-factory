@@ -6001,6 +6001,12 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # count that drifts reads as a checked claim and is not one — the check is
     # test_config.py::TestSessionResumeConfig::test_leaves_in_reloadable_fields.
     _submodel_leaf_paths('session_resume', SessionResumeConfig),
+    # Dispatch-score sub-budgets (task 3819, PRD D8) — same whole-submodel
+    # idiom.  Green-tier because a scoring retune used to cost a fleet restart,
+    # which is why the old age_alpha / cpm_beta constants were never tuned.
+    # I-1 / I-3 still bind a reload through apply_reload's whole-config
+    # re-validation.
+    _submodel_leaf_paths('scoring', ScoringConfig),
     # Unknown-config-key census escape hatch (task 2989) — same whole-submodel
     # idiom.  Green-tier ON PURPOSE: the born-at-L2 this census files tells the
     # operator to add a path to config_key_census.ignore and hot-reload, and a
