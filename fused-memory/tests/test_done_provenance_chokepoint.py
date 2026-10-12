@@ -9,6 +9,7 @@ self-correcting kind remedies the model cannot know.
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import get_args
 from unittest.mock import AsyncMock
 
@@ -226,9 +227,14 @@ class TestAcceptedWritesRecordTheProjection:
         assert _persisted_provenance(taskmaster) == {'kind': 'merged', 'commit': sha}
 
     @pytest.mark.asyncio
-    async def test_caller_stamped_at_of_any_type_is_replaced(self, interceptor, taskmaster, repo):
+    @pytest.mark.parametrize(
+        'supplied', [1754179200, '2020-01-01T00:00:00+00:00'], ids=['epoch-int', 'stale-iso'],
+    )
+    async def test_caller_stamped_at_of_any_type_is_replaced(
+        self, interceptor, taskmaster, repo, supplied,
+    ):
         project_root, sha = repo
-        supplied = 1754179200
+        called_at = datetime.now(UTC)
         result = await _mark_done(
             interceptor,
             project_root,
@@ -238,4 +244,4 @@ class TestAcceptedWritesRecordTheProjection:
         assert 'error' not in result, result
         stamped_at = _persisted_provenance(taskmaster)['stamped_at']
         assert isinstance(stamped_at, str)
-        assert stamped_at != str(supplied)
+        assert datetime.fromisoformat(stamped_at) >= called_at

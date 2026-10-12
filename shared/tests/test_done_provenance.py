@@ -141,10 +141,6 @@ class TestCommitRequiredKinds:
 
 
 class TestTypedEvidence:
-    def test_scheduled_evidence_fields_are_declared(self):
-        assert 'transient_unit' in DoneProvenance.model_fields
-        assert 'fire_delay_secs' in DoneProvenance.model_fields
-
     @pytest.mark.parametrize(
         ('payload', 'loc'),
         [

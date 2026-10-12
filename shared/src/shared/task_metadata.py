@@ -304,6 +304,13 @@ class DoneProvenance(BaseModel):
     A blank or whitespace-only string field reads as absent, so "commit is
     required" means the same thing at read time and at the write chokepoint.
 
+    ``COMMIT_REQUIRED_KINDS`` also stands for "the ancestor-checked commit is
+    the evidence that this task's work landed on main": the phantom-done skip
+    in ``fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._apply_status_transition``
+    and ``fused-memory/src/fused_memory/middleware/task_interceptor.py::_check_reopen_freshness``
+    read it that way. A kind that requires a commit meaning anything else must
+    split that set first.
+
     ``stamped_at`` (task 3576) is the dedicated stamp-*write* timestamp
     (ISO-8601 UTC) for ``kind='found_on_main'``. It is written SERVER-SIDE
     by fused-memory's ``_validate_done_provenance`` chokepoint and is never
