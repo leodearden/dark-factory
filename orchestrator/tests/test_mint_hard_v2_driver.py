@@ -31,8 +31,15 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _load_driver() -> ModuleType:
-    """Import ``scripts/mint_hard_v2_fixtures.py`` by path (not a package)."""
-    path = REPO_ROOT / 'scripts' / 'mint_hard_v2_fixtures.py'
+    """Import ``scripts/mint_hard_v2_fixtures.py`` by path (not a package).
+
+    ``scripts/`` goes on sys.path first because the driver binds this checkout
+    with ``import _checkout``, a sibling it resolves by bare name.
+    """
+    scripts = REPO_ROOT / 'scripts'
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    path = scripts / 'mint_hard_v2_fixtures.py'
     spec = importlib.util.spec_from_file_location('mint_hard_v2_fixtures', path)
     assert spec is not None and spec.loader is not None, f'no import spec for {path}'
     module = importlib.util.module_from_spec(spec)

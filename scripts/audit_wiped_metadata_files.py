@@ -55,6 +55,7 @@ from _task_db_scan import (
     format_coverage_block,
     format_kv_line,
     run_audit_cli,
+    runs_db_path,
     tasks_db_path,
 )
 
@@ -557,14 +558,6 @@ class ProjectAudit(NamedTuple):
     project_root: str
     candidates: list[WipeCandidate]
     coverage: AuditCoverage
-
-
-def runs_db_path(project_root: str) -> Path:
-    """``<root>/data/orchestrator/runs.db`` (harness.py:1877; no config key).
-
-    NOTE: runs.db lives in the MAIN checkout, not in a task worktree.
-    """
-    return Path(project_root) / "data" / "orchestrator" / "runs.db"
 
 
 def worktree_base_path(project_root: str) -> Path:

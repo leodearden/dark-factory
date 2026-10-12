@@ -72,7 +72,7 @@ from collections.abc import Collection, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
-# Tier 1 — the ONE tasks.db locator. Tier 3 — the warn-and-continue per-root
+# Tier 1 — the ONE tasks.db and runs.db locators. Tier 3 — the warn-and-continue per-root
 # loop and the shared no-root message. run_audit_cli is deliberately NOT
 # adopted; the exit-ladder block near main() records why.
 # discover_project_roots comes second-hand through the audit's documented
@@ -80,6 +80,7 @@ from typing import NamedTuple
 from _task_db_scan import (
     NO_PROJECT_ROOT_RESOLVED_MESSAGE,
     connect_ro,
+    runs_db_path,
     sweep_project_roots,
     tasks_db_path,
 )
@@ -100,7 +101,6 @@ from audit_wiped_metadata_files import (
     classify_wipe_signature,
     discover_project_roots,
     load_merge_signatures,
-    runs_db_path,
 )
 
 # The terminal allowlist is IMPORTED, never re-spelled. The census exists to
@@ -784,7 +784,7 @@ def census_project(project_root: str) -> ProjectCensus:
         conn.close()
     stamped = load_stamped_records(str(tasks_db))
 
-    # runs_db_path is IMPORTED from the audit, which already resolves
+    # runs_db_path is IMPORTED from _task_db_scan, which resolves
     # <root>/data/orchestrator/runs.db. That is how the 0-byte data/runs.db
     # decoy task 4525 warns about is avoided — by reuse, not by a new constant
     # this module would have to keep correct on its own.

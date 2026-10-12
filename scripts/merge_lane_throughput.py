@@ -40,6 +40,9 @@ from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
+import _checkout as _checkout
+from shared.project_layout import runs_db
+
 # `<N>d`, N a positive integer.  Anchored: '14' and '14x' must both be
 # rejected rather than silently truncated to 14 days.
 _RELATIVE_RE = re.compile(r'^(\d+)d$')
@@ -1242,14 +1245,8 @@ _ALWAYS_ON_SECTIONS = (
 
 
 def resolve_runs_db(root: str | Path) -> Path:
-    """``<root>/data/orchestrator/runs.db`` — the orchestrator event store.
-
-    That layout is fixed by `harness.py` and carries no config key, so it is
-    spelled here rather than read from `dark-factory-orchestrator.yaml`; the
-    same literal appears in `scripts/audit_wiped_metadata_files.py`,
-    `scripts/mint_hard_v2_fixtures.py` and `scripts/query-events.sh`.
-    """
-    return Path(root) / 'data' / 'orchestrator' / 'runs.db'
+    """``<root>/data/orchestrator/runs.db`` — the orchestrator event store."""
+    return runs_db(root)
 
 
 def resolve_project_roots(values: Sequence[str] | None) -> list[Path]:

@@ -53,6 +53,10 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import _checkout as _checkout
+
+from shared import project_layout
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # The three source checkouts, keyed by the census project id. Both databases
@@ -280,18 +284,6 @@ class BaselineUnresolved(RuntimeError):
     would surface as an opaque failure deep inside the runner instead of here,
     at the point where the cause is known.
     """
-
-
-def _runs_db(project_root: Path | str) -> Path:
-    """Return the orchestrator runs db inside *project_root*.
-
-    ONE spelling of the layout, shared by every caller (the census, the
-    duration stats, the ceilings guard's error message and the redrive
-    resolver), so relocating the db is a one-line change here rather than a
-    hunt through four literals — the same single-derivation discipline
-    ``_merge_subject_patterns`` applies to the landing-merge subjects.
-    """
-    return Path(project_root) / 'data' / 'orchestrator' / 'runs.db'
 
 
 def connect_ro(db_path: Path | str) -> sqlite3.Connection:
@@ -664,12 +656,12 @@ def enrich_from_task_db(
 
 def collect_candidates(project: str, root: Path) -> list[Candidate]:
     """Census + enrich + resolve merge/baseline for one source checkout."""
-    runs_db = _runs_db(root)
+    runs_db = project_layout.runs_db(root)
     candidates = [
         Candidate(task_id=tid, project=project, project_root=str(root))
         for tid in census_task_ids(runs_db)
     ]
-    enrich_from_task_db(candidates, root / '.taskmaster' / 'tasks' / 'tasks.db')
+    enrich_from_task_db(candidates, project_layout.tasks_db(root))
     for cand in candidates:
         cand.merge_sha = find_merge_sha(root, cand.task_id)
         ts = first_architect_invocation_ts(runs_db, cand.task_id)
@@ -709,7 +701,7 @@ def run_census(strict: bool = True) -> int:
             return 2
         cands = collect_candidates(project, root)
         counts[project] = len(cands)
-        durations.extend(census_durations_ms(_runs_db(root)))
+        durations.extend(census_durations_ms(project_layout.runs_db(root)))
         all_candidates.extend(cands)
 
     header = (f'{"project":<14}{"task":<7}{"status":<12}{"brief":>6}  '
@@ -857,7 +849,7 @@ def _build_ceilings() -> dict:
     all_max_ms = 0
     all_n = 0
     for root_str in SOURCE_CHECKOUTS.values():
-        runs_db = _runs_db(root_str)
+        runs_db = project_layout.runs_db(root_str)
         census_ms.extend(census_durations_ms(runs_db))
         root_max_ms, root_n = _all_architect_duration_stats(runs_db)
         all_max_ms = max(all_max_ms, root_max_ms)
@@ -880,7 +872,7 @@ def _build_ceilings() -> dict:
             f'{observed_max} min over n={len(minutes)} census invocation(s), '
             f'all-architect max {all_max} min over n={all_n} invocation(s). '
             f'Expected populated events.duration_ms in '
-            f'{[str(_runs_db(r)) for r in SOURCE_CHECKOUTS.values()]}. '
+            f'{[str(project_layout.runs_db(r)) for r in SOURCE_CHECKOUTS.values()]}. '
             f'Refusing to emit a ceilings block whose headroom cannot be '
             f'computed: the threshold would then be a guess, which is exactly '
             f'what this derivation exists to prevent.'
@@ -1395,7 +1387,7 @@ def _production_redrive_resolver(row_project_root: str, task_id: str):
     """The real resolver: the dual-spelling matcher plus the baseline ladder."""
     merge_sha = find_merge_sha(row_project_root, task_id)
     ts = first_architect_invocation_ts(
-        _runs_db(row_project_root), task_id,
+        project_layout.runs_db(row_project_root), task_id,
     )
     baseline_sha, baseline_source = resolve_baseline(
         row_project_root, task_id, ts,
@@ -2086,7 +2078,8 @@ async def _run_mint(sampled_at: str, seed: int) -> int:
             Candidate(task_id=r['task_id'], project=project, project_root=str(root))
             for r in rows
         ]
-        enrich_from_task_db(cands, root / '.taskmaster' / 'tasks' / 'tasks.db')
+        task_store = project_layout.tasks_db(root)
+        enrich_from_task_db(cands, task_store)
         for row, cand in zip(rows, cands, strict=True):
             # The enrichment degrades to a stub (unreadable db, id absent from
             # the tasks table, blanked columns) rather than raising. Minting
@@ -2097,7 +2090,7 @@ async def _run_mint(sampled_at: str, seed: int) -> int:
                 raise RuntimeError(
                     f'_run_mint: include row {project}/{row["task_id"]} '
                     f'resolved to an empty title/description from '
-                    f'{root}/.taskmaster/tasks/tasks.db (title={cand.title!r}, '
+                    f'{task_store} (title={cand.title!r}, '
                     f'brief_chars={cand.brief_chars}). Refusing to mint a '
                     f'fixture with no brief; re-run --census to see whether '
                     f'the task id still resolves in that db.'
