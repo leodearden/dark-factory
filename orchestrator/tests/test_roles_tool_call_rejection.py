@@ -56,7 +56,7 @@ from __future__ import annotations
 import pytest
 from _role_splice_contract import SpliceContract, assert_brace_free, assert_nonempty
 
-from orchestrator.agents.roles import (
+from orchestrator.agents.harness_guidance import (
     _TOOL_CALL_REJECTION_KNOWN_SHAPES,
     BACKGROUND_WAIT_GUIDANCE,
     MISSING_REQUIRED_PARAMETER_REJECTION,

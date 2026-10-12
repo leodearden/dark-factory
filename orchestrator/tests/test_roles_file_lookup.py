@@ -24,12 +24,11 @@ from _role_splice_contract import (
 )
 
 from orchestrator.agents.file_lookup_guidance import FILE_LOOKUP_GUIDANCE
-from orchestrator.agents.roles import (
+from orchestrator.agents.harness_guidance import (
     GREP_LOOKAROUND_GUIDANCE,
     GREP_LOOKAROUND_GUIDANCE_READ_ONLY,
-    ROLES,
-    AgentRole,
 )
+from orchestrator.agents.roles import ROLES, AgentRole
 
 #: Every role with a literal system_prompt, derived from ROLES.
 _UNPINNED_ROLES = frozenset(name for name, role in ROLES.items() if role.prompt_spec is None)

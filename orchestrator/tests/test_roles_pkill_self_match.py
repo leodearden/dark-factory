@@ -10,8 +10,8 @@ from __future__ import annotations
 
 from _role_splice_contract import PreambleTailBlock, PreambleTailContractTests
 
+from orchestrator.agents.harness_guidance import BACKGROUND_WAIT_GUIDANCE
 from orchestrator.agents.pkill_guidance import PKILL_SELF_MATCH_GUIDANCE
-from orchestrator.agents.roles import BACKGROUND_WAIT_GUIDANCE
 
 
 class TestPkillSelfMatchSplice(PreambleTailContractTests):

@@ -62,7 +62,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import ClassVar
 
-from orchestrator.agents.roles import GREP_LOOKAROUND_GUIDANCE, ROLES, AgentRole
+from orchestrator.agents.harness_guidance import GREP_LOOKAROUND_GUIDANCE
+from orchestrator.agents.roles import ROLES, AgentRole
 
 # A splice unit opens with its own ``\n## `` heading, so "spliced between the
 # identity paragraph and the role's first real section" is exactly "its heading

@@ -40,11 +40,11 @@ from __future__ import annotations
 
 from _role_splice_contract import assert_opens_own_section
 
-from orchestrator.agents.roles import (
+from orchestrator.agents.harness_guidance import (
     ERROR_REMEDY_HINT_GUIDANCE,
-    ROLES,
     TOOL_CALL_REJECTION_GUIDANCE,
 )
+from orchestrator.agents.roles import ROLES
 
 
 def test_error_remedy_hint_guidance_is_nonempty() -> None:

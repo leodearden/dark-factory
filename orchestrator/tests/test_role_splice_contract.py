@@ -46,7 +46,8 @@ from _role_splice_contract import (
 )
 from shared.prompt_artifact import PromptSpec
 
-from orchestrator.agents.roles import GREP_LOOKAROUND_GUIDANCE, ROLES, AgentRole
+from orchestrator.agents.harness_guidance import GREP_LOOKAROUND_GUIDANCE
+from orchestrator.agents.roles import ROLES, AgentRole
 
 # Synthetic remedy prose. The helper must render the caller's remedy into every
 # failure message: the consumers' remediation sentences ARE the diagnostic value

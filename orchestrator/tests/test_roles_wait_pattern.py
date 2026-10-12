@@ -85,14 +85,14 @@ from _role_splice_contract import (
 )
 
 from orchestrator.agents.briefing import BriefingAssembler
-from orchestrator.agents.roles import (
+from orchestrator.agents.harness_guidance import (
     BACKGROUND_TASK_WARNING,
     BACKGROUND_WAIT_GUIDANCE,
     EXTERNAL_KILL_GUIDANCE,
-    ROLES,
     WAIT_PATTERN_GUIDANCE,
     WAIT_PATTERN_REMINDER,
 )
+from orchestrator.agents.roles import ROLES
 from orchestrator.config import OrchestratorConfig
 
 # Secondary, deliberately LOOSE bound on how much identity paragraph may

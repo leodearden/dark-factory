@@ -88,6 +88,7 @@ import re
 
 import pytest
 
+from orchestrator.agents import harness_guidance as harness_guidance_module
 from orchestrator.agents import roles as roles_module
 from orchestrator.agents.roles import ROLES
 
@@ -201,6 +202,9 @@ _BACKTICKED = re.compile(r'`([A-Za-z][A-Za-z0-9_]*)[^`]*`')
 # docstring on why the leading underscore is not optional.
 _PROMPT_CONSTANT_NAME = re.compile(r'^_?[A-Z][A-Z0-9_]*$')
 
+# The modules whose namespaces scan surface (b) introspects.
+_PROMPT_MODULES = (roles_module, harness_guidance_module)
+
 
 def _is_camel_case(token: str) -> bool:
     """A leading capital plus at least one lowercase letter.
@@ -212,12 +216,18 @@ def _is_camel_case(token: str) -> bool:
 
 
 def _prompt_constants() -> list[tuple[str, str]]:
-    """Every module-level string constant in roles.py, by introspection."""
-    return sorted(
-        (name, value)
-        for name, value in vars(roles_module).items()
+    """Every module-level string constant in `_PROMPT_MODULES`, by introspection.
+
+    Keyed by name: a constant one listed module imports from another is the
+    same object in both namespaces, and is scanned once.
+    """
+    constants = {
+        name: value
+        for module in _PROMPT_MODULES
+        for name, value in vars(module).items()
         if _PROMPT_CONSTANT_NAME.match(name) and isinstance(value, str)
-    )
+    }
+    return sorted(constants.items())
 
 
 def _unknown_tool_tokens(text: str) -> list[str]:
@@ -285,6 +295,22 @@ def test_detector_detects() -> None:
     assert _unknown_tool_tokens('prefix it `Hypothesis:` so a reviewer can tell') == []
 
 
+def test_scan_reaches_the_turn_prompt_only_constant() -> None:
+    """The scan surface still holds this module's false-green witness.
+
+    WAIT_PATTERN_REMINDER reaches agents only through briefing.py and is in no
+    role system_prompt, so scan surface (b) is its only cover. Dropping its
+    home module from `_PROMPT_MODULES` would silently un-scan it; this test
+    fails first. It is the detector-coverage twin of `test_detector_detects`,
+    not a prose pin.
+    """
+    scanned = {name for name, _ in _prompt_constants()}
+    assert 'WAIT_PATTERN_REMINDER' in scanned, (
+        'WAIT_PATTERN_REMINDER is no longer among the scanned prompt constants. '
+        'Add the module that defines it to _PROMPT_MODULES.'
+    )
+
+
 @pytest.mark.parametrize('role_key', sorted(ROLES))
 def test_role_prompt_names_no_phantom_harness_tool(role_key: str) -> None:
     """Every built-in tool a role's system_prompt prescribes must exist.
@@ -307,5 +333,5 @@ def test_prompt_constant_names_no_phantom_harness_tool(const_name: str) -> None:
     build_amender_prompt, so it is absent from every role's system_prompt
     while still being prompt text an agent is expected to act on.
     """
-    unknown = _unknown_tool_tokens(getattr(roles_module, const_name))
-    assert not unknown, _failure_message(f'roles.{const_name}', unknown)
+    unknown = _unknown_tool_tokens(dict(_prompt_constants())[const_name])
+    assert not unknown, _failure_message(const_name, unknown)

@@ -22,12 +22,12 @@ from _role_splice_contract import (
     bash_capable_unpinned_contract,
 )
 
-from orchestrator.agents.path_not_found_guidance import PATH_NOT_FOUND_GUIDANCE
-from orchestrator.agents.roles import (
+from orchestrator.agents.harness_guidance import (
     GREP_LOOKAROUND_GUIDANCE,
     GREP_LOOKAROUND_GUIDANCE_READ_ONLY,
-    ROLES,
 )
+from orchestrator.agents.path_not_found_guidance import PATH_NOT_FOUND_GUIDANCE
+from orchestrator.agents.roles import ROLES
 
 #: Every role with a literal system_prompt, derived from ROLES.
 _UNPINNED_ROLES = frozenset(name for name, role in ROLES.items() if role.prompt_spec is None)

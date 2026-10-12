@@ -50,7 +50,7 @@ from _role_splice_contract import (
     bash_capable_unpinned_contract,
 )
 
-from orchestrator.agents.roles import (
+from orchestrator.agents.harness_guidance import (
     _GREP_ENGINE_LIMITS,
     _GREP_PCRE_BASH_RECOURSE,
     _GREP_PCRE_READ_ONLY_RECOURSE,
