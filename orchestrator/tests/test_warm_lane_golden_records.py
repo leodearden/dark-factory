@@ -7,15 +7,18 @@ leaf L5, Companion D5; ruled Q4 a). Each test regenerates one record through its
 real producer and asserts byte equality with the checked-in golden:
 
 - ``lane-state.json``: ``orchestrator/src/orchestrator/lane_lifecycle.py::LaneRecord.to_json``
-  for one fixed record;
+  for one fixed pinned (ASSIGNED) record with every optional field set;
+- ``lane-state-released.json``: the same serialiser for one fixed RELEASED
+  record with every optional field left null, the free-lane shape;
 - ``lane-states.json``: the values of
-  ``orchestrator/src/orchestrator/lane_lifecycle.py::LaneState``, in enum order;
+  ``orchestrator/src/orchestrator/lane_lifecycle.py::LaneState``, in enum order,
+  framed by this module as an indent-2 JSON list with a trailing newline;
 - ``plan.json``: the bytes ``orchestrator/src/orchestrator/mcp/plan_tools.py::create_server``'s
   tools persist through ``orchestrator/src/orchestrator/artifacts.py::TaskArtifacts``.
 
 Refresh procedure. Never hand-edit a golden. When a deliberate serialiser change
 turns this module red, copy the produced bytes named in the failure message over
-the golden. Then copy all three files byte-for-byte into reify's
+the golden. Then copy every golden byte-for-byte into reify's
 ``tests/infra/fixtures/warm_lane_golden/`` and bump reify's
 ``tests/infra/fixtures/warm_lane_golden/PROVENANCE.md``.
 """
@@ -41,6 +44,11 @@ GOLDEN_LANE_RECORD = LaneRecord(
     branch='task/4242',
     seeded_from_sha='0123456789abcdef0123456789abcdef01234567',
     updated_at='2026-10-12T08:15:30.123456+00:00',
+)
+
+GOLDEN_RELEASED_LANE_RECORD = LaneRecord(
+    state=LaneState.RELEASED,
+    updated_at='2026-10-12T09:45:00.654321+00:00',
 )
 
 GOLDEN_PLAN_ANALYSIS = 'Fixed analysis for the golden plan record.'
@@ -85,8 +93,8 @@ def _assert_matches_golden(name: str, produced: bytes, scratch: Path) -> None:
     pytest.fail(
         f'{verdict}: {golden_path}\n'
         f'produced bytes: {produced_path}\n'
-        f'refresh: cp {produced_path} {golden_path}, then copy all three '
-        f'goldens into reify tests/infra/fixtures/warm_lane_golden/ and bump '
+        f'refresh: cp {produced_path} {golden_path}, then copy every '
+        f'golden into reify tests/infra/fixtures/warm_lane_golden/ and bump '
         f'its PROVENANCE.md (see this module docstring)'
     )
 
@@ -105,6 +113,11 @@ async def _produce_plan_bytes(worktree: Path) -> bytes:
 def test_lane_state_golden_is_lane_record_to_json(tmp_path):
     produced = GOLDEN_LANE_RECORD.to_json().encode('utf-8')
     _assert_matches_golden('lane-state.json', produced, tmp_path / 'produced')
+
+
+def test_released_lane_state_golden_is_null_field_lane_record_to_json(tmp_path):
+    produced = GOLDEN_RELEASED_LANE_RECORD.to_json().encode('utf-8')
+    _assert_matches_golden('lane-state-released.json', produced, tmp_path / 'produced')
 
 
 def test_lane_states_golden_lists_every_lane_state_member(tmp_path):

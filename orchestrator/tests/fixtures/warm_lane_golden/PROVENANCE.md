@@ -12,6 +12,7 @@ byte-for-byte copy in `tests/infra/fixtures/warm_lane_golden/`.
 
 | File | Producing code site | Pinning test | Consumer |
 |---|---|---|---|
-| `lane-state.json` | `orchestrator/src/orchestrator/lane_lifecycle.py::LaneRecord.to_json` | `orchestrator/tests/test_warm_lane_golden_records.py` | reify `tests/infra/fixtures/warm_lane_golden/`, driven by reify `tests/infra/test_warm_lane_audit.sh` |
-| `lane-states.json` | `orchestrator/src/orchestrator/lane_lifecycle.py::LaneState` | `orchestrator/tests/test_warm_lane_golden_records.py` | reify `tests/infra/fixtures/warm_lane_golden/`, driven by reify `tests/infra/test_warm_lane_audit.sh` |
+| `lane-state.json` | `orchestrator/src/orchestrator/lane_lifecycle.py::LaneRecord.to_json` (ASSIGNED, every field set) | `orchestrator/tests/test_warm_lane_golden_records.py` | reify `tests/infra/fixtures/warm_lane_golden/`, driven by reify `tests/infra/test_warm_lane_audit.sh` |
+| `lane-state-released.json` | `orchestrator/src/orchestrator/lane_lifecycle.py::LaneRecord.to_json` (RELEASED, optional fields null) | `orchestrator/tests/test_warm_lane_golden_records.py` | reify `tests/infra/fixtures/warm_lane_golden/`, driven by reify `tests/infra/test_warm_lane_audit.sh` |
+| `lane-states.json` | member values of `orchestrator/src/orchestrator/lane_lifecycle.py::LaneState`, in enum order; the JSON-list framing is the pinning test's, as no production code writes this file | `orchestrator/tests/test_warm_lane_golden_records.py` | reify `tests/infra/fixtures/warm_lane_golden/`, driven by reify `tests/infra/test_warm_lane_audit.sh` |
 | `plan.json` | `orchestrator/src/orchestrator/mcp/plan_tools.py::create_server` through `orchestrator/src/orchestrator/artifacts.py::TaskArtifacts` | `orchestrator/tests/test_warm_lane_golden_records.py` | reify `tests/infra/fixtures/warm_lane_golden/`, driven by reify `tests/infra/test_warm_lane_audit.sh` |
