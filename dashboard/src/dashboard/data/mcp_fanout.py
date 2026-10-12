@@ -202,9 +202,11 @@ _REAP_UNWIND_TIMEOUT_SECONDS = 5.0
 #     dict, an empty/malformed result) that ``call`` raises to signal
 #     fall-through. :class:`PreformattedFanoutError` subclasses it.
 #
-# ``task_runtime`` and ``merge_halt`` carry their own near-copies with
-# ``OSError`` added. They are outside task 4958's file lock and deliberately
-# left alone; folding them in is a separate change.
+# ``merge_halt`` extends this tuple with ``OSError`` at its own site
+# (merge_halt.py::_PROBE_FAILURE_EXCEPTIONS) rather than widening it here.
+# task_runtime.py::_probe_one deliberately does not use it: its ordered
+# deadline/unreachable split (task 3517) is a fault-domain taxonomy that one
+# flat tuple cannot express.
 FANOUT_FAILURE_EXCEPTIONS: tuple[type[Exception], ...] = (
     httpx.ConnectError,
     httpx.TimeoutException,
