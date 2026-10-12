@@ -2482,6 +2482,90 @@ class TestRunRequiresACompleteGateCensus:
         assert 'gate_census_incomplete' in _mod.SKIP_BUCKETS
 
 
+def _bucket_section(rendered: str, bucket: str) -> str:
+    """The body of one ``### bucket: N`` skip section, up to the next heading."""
+    _, heading, tail = rendered.partition(f'\n### {bucket}: ')
+    assert heading, f'no ### {bucket} section in the markdown'
+    return tail.split('\n', 1)[1].split('\n### ')[0]
+
+
+def _real_skip_entry(reason: str) -> dict:
+    """One skip entry of *reason*, made by the real pure producer that files it."""
+    producers = {
+        'topic_unfoldable': lambda: _mod.plan_renames(
+            [_rec('m1', '!!!')], project_id='dark_factory')[1],
+        'record_without_id': lambda: _mod.plan_renames(
+            [_rec('', 'a_b')], project_id='dark_factory')[1],
+        'slug_collision': lambda: _mod.plan_renames(
+            [_rec('m1', 'dup_topic'), _rec('m2', 'dup-topic')],
+            project_id='dark_factory')[1],
+        'canonical_collision': lambda: _mod.plan_renames(
+            [
+                _rec('legacy-canon', 'foo_bar', canonical=True),
+                _rec('legacy-member', 'foo_bar'),
+                _rec('incumbent-canon', 'foo-bar', canonical=True),
+            ],
+            project_id='dark_factory')[1],
+        'gate_ambiguous': lambda: _mod.pair_gate_blocks(
+            [_mod.Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')],
+            [_gate_task('7011', 'shared_gate'), _gate_task('7718', 'shared_gate')])[1],
+        'orphan_gate_topic': lambda: _mod.pair_gate_blocks(
+            [], [_gate_task('4774', 'ghost_topic', project_root='/repo')])[1],
+    }
+    (entry,) = _by_reason(producers[reason](), reason)
+    return entry
+
+
+class TestMarkdownHidesNoSkipField:
+    """A skip line shows every field its producer put on the entry.
+
+    The markdown is what an operator resolves the refusal buckets from by
+    hand; a field the producer carries but the line drops is an id they have
+    to go and dig out of the JSON.
+    """
+
+    def test_a_canonical_collision_line_names_both_canonical_id_lists(self):
+        entries = _by_reason(
+            _mod.plan_renames(
+                [
+                    _rec('legacy-canon', 'foo_bar', canonical=True),
+                    _rec('legacy-member', 'foo_bar'),
+                    _rec('incumbent-canon', 'foo-bar', canonical=True),
+                ],
+                project_id='dark_factory',
+            )[1],
+            'canonical_collision',
+        )
+
+        section = _bucket_section(
+            _mod.render_markdown({'apply': False, 'skips': {'canonical_collision': entries}}),
+            'canonical_collision',
+        )
+
+        assert "old_canonical_ids=['legacy-canon']" in section
+        assert "new_canonical_ids=['incumbent-canon']" in section
+        assert 'colliding_count=2' in section
+
+    @pytest.mark.parametrize('reason', [
+        'topic_unfoldable',
+        'record_without_id',
+        'slug_collision',
+        'canonical_collision',
+        'gate_ambiguous',
+        'orphan_gate_topic',
+    ])
+    def test_every_field_of_a_real_skip_entry_reaches_the_markdown(self, reason):
+        entry = _real_skip_entry(reason)
+
+        section = _bucket_section(
+            _mod.render_markdown({'apply': False, 'skips': {reason: [entry]}}), reason)
+
+        for key, value in entry.items():
+            if key == 'reason' or value is None:
+                continue
+            assert f'{key}={value!r}' in section, key
+
+
 class TestReportRenderAndCli:
     """The artifacts, the grade and the argument surface."""
 
