@@ -391,10 +391,9 @@ class TestNeverRaises:
 
         assert result is None
         assert not (tmp_path / 'data' / 'escalations').exists()
-        assert any(r.levelno == logging.DEBUG for r in caplog.records), (
-            'a no-op alarm must still say so, at the helper DEFAULT level — '
-            'see TestTheEmittedLevelIsACallerConcern for why that default is '
-            'DEBUG and how a caller opts out of it'
+        assert any(r.levelno == logging.WARNING for r in caplog.records), (
+            'a no-op alarm must still say so, at WARNING — see '
+            'TestTheEmittedLevels for why a lost alarm is never quieter'
         )
 
     def test_a_none_project_root_returns_none_quietly(self, tmp_path, caplog):
@@ -504,7 +503,7 @@ class TestFoldHookAndLogging:
         )
 
 
-class TestTheEmittedLevelIsACallerConcern:
+class TestTheEmittedLevels:
     """A never-raise alarm path is exactly where a silent level downgrade is
     most costly, because the ONLY symptom is absence of output.
 
@@ -516,9 +515,9 @@ class TestTheEmittedLevelIsACallerConcern:
     same silence this module's own docstring argues against, one layer down.
 
     So the levels are PINNED rather than left to whatever `logger.<method>`
-    the body happens to call. The package-unavailable arm defaults to DEBUG
-    and a caller may raise it; the fold arm defaults to INFO and a caller
-    replaces it wholesale via `on_fold`.
+    the body happens to call. The fold arm defaults to INFO and a caller
+    replaces it wholesale via `on_fold`; the package-unavailable arm is
+    ALWAYS WARNING, with no override.
 
     Asserted on `levelno` against the `logging.*` constants, never on
     `levelname` strings: a level is an ordered numeric fact, and comparing its
@@ -526,36 +525,24 @@ class TestTheEmittedLevelIsACallerConcern:
     (heuristic 12).
     """
 
-    def test_the_package_unavailable_arm_defaults_to_debug(
+    def test_the_package_unavailable_arm_logs_at_warning(
         self, tmp_path, monkeypatch, caplog,
     ):
-        """Six of the seven migrated filers treat an absent optional
-        `escalation` package as a DEBUG detail, so that is the default — NOT a
-        judgement that DEBUG is the right house level for a lost alarm."""
+        """A caller reaches this arm only after deciding an alarm fires, so it
+        records a LOST alarm. The fused-memory server logs at INFO
+        (`fused-memory/src/fused_memory/server/main.py`, `logging.basicConfig`),
+        so DEBUG here printed nothing; and `escalation` is only a dev-group
+        dependency, so a `--no-dev` deploy loses it for every filer at once.
+        `orchestrator/src/orchestrator/mcp/markup_sink.py::open_escalation_channel`
+        logs the same condition at WARNING. The volume is bounded: callers
+        reach the helper only on a breach, and the storm callers rate-limit
+        their breaches per window."""
         monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', False)
 
         with caplog.at_level(logging.DEBUG):
             assert _emit(tmp_path) is None
 
-        assert [r.levelno for r in caplog.records] == [logging.DEBUG]
-
-    def test_a_caller_can_raise_the_package_unavailable_arm(
-        self, tmp_path, monkeypatch, caplog,
-    ):
-        """`referent_repair_storm_escalator` treats a missing package as a LOST
-        ALARM rather than a detail: a repair storm is a sustained scanner or
-        resolver regression, so in an env without the optional package the
-        DEBUG default emits nothing at all at the default threshold."""
-        monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', False)
-
-        with caplog.at_level(logging.DEBUG):
-            result = _emit(tmp_path, no_escalation_level=logging.WARNING)
-
         assert [r.levelno for r in caplog.records] == [logging.WARNING]
-        assert result is None, 'raising the level must not change the verdict'
-        assert not (tmp_path / 'data' / 'escalations').exists(), (
-            'raising the level must not start filing where the package is gone'
-        )
 
     @_needs_escalation
     def test_the_default_fold_arm_is_info(self, tmp_path, caplog):
@@ -577,14 +564,13 @@ class _Filer(NamedTuple):
     """One migrated filer: where its spy goes, how to fire it, what it forwards."""
 
     label: str
-    #: Dotted path of the filer's OWN module. The spy is installed HERE, not on
+    #: Dotted path of the filer's OWN module, which is also the name of the
+    #: logger it logs on. The spy is installed HERE, not on
     #: `_folded_escalation`, because that is where the name the filer body
     #: resolves actually lives — patching the helper's home would prove nothing
     #: about what this caller forwards.
     module: str
     fire: Callable[[Any, str], object]
-    #: The level this filer's package-unavailable arm must be emitted at.
-    no_escalation_level: int
     #: The escalation level the filed record must be born at.
     escalation_level: int
 
@@ -626,15 +612,16 @@ def _unverified_claim(module: Any, project_root: str) -> object:
     )
 
 
-#: THE SINGLE POINT OF TRUTH (heuristic 11) for the two levels each migrated
-#: filer forwards: the log level of its package-unavailable arm, and the
-#: escalation level its record is born at.
+#: THE SINGLE POINT OF TRUTH (heuristic 11) for the escalation level each
+#: migrated filer's record is born at.
 #:
-#: Both are silent when they drift — a log line that drops below threshold and
-#: a record that waits for the orphan-L0 reaper both look like "nothing to
-#: report" — so they are fenced here rather than left implicit in seven call
-#: sites. Changing what a filer forwards means editing this table, which is the
-#: point: it cannot land unnoticed.
+#: That level is silent when it drifts — a record that waits for the orphan-L0
+#: reaper looks like "nothing to report" — so it is fenced here rather than
+#: left implicit in every call site. Changing what a filer forwards means
+#: editing this table, which is the point: it cannot land unnoticed. The
+#: lost-alarm log level is the same for every row, and
+#: `test_a_lost_alarm_is_logged_at_warning_on_the_filers_own_logger` pins it
+#: by firing each row for real.
 _MIGRATED_FILERS: tuple[_Filer, ...] = (
     _Filer(
         'write_triage',
@@ -642,21 +629,18 @@ _MIGRATED_FILERS: tuple[_Filer, ...] = (
         lambda m, root: m.emit_triage_fail_open_storm_escalation(
             root, {'count': 5, 'window_seconds': 60},
         ),
-        logging.DEBUG,
         1,
     ),
     _Filer(
         'markup_tripwire storm',
         'fused_memory.server.markup_tripwire',
         _storm,
-        logging.DEBUG,
         1,
     ),
     _Filer(
         'markup_tripwire residue',
         'fused_memory.server.markup_tripwire',
         _residue,
-        logging.DEBUG,
         # The residue record's own `level`, falling back to L2: it holds a
         # payload only a human can repair.
         2,
@@ -669,13 +653,8 @@ _MIGRATED_FILERS: tuple[_Filer, ...] = (
             [{'tag': 't', 'candidate_key': 'k', 'task_ids': ['1', '2'],
               'count': 2, 'reason': 'mixed_status'}],
         ),
-        logging.DEBUG,
         1,
     ),
-    # THE ONE LOG-LEVEL EXCEPTION. A repair storm is a sustained
-    # scanner/resolver regression against a measured ~0.22% base rate, so an
-    # env without the optional `escalation` package emitting nothing at the
-    # default threshold is a LOST ALARM, not a detail.
     _Filer(
         'referent_repair_storm_escalator',
         'fused_memory.middleware.referent_repair_storm_escalator',
@@ -683,14 +662,12 @@ _MIGRATED_FILERS: tuple[_Filer, ...] = (
             root, project_id='dark_factory', streak=10, threshold=10,
             repairs=1, records=[],
         ),
-        logging.WARNING,
         1,
     ),
     _Filer(
         'completion_claim_gate',
         'fused_memory.services.completion_claim_gate',
         _unverified_claim,
-        logging.DEBUG,
         # L0, the Escalation model's default, which this filer has always been
         # born at. Whether an 'info' record under a synthetic anchor should be
         # born at L1 like its siblings is a design question, not a refactor's.
@@ -703,21 +680,18 @@ _MIGRATED_FILERS: tuple[_Filer, ...] = (
             root, project_id='dark_factory', agent_id='claude-x',
             keys=['weird_key'],
         ),
-        logging.DEBUG,
         1,
     ),
     _Filer(
         'journal_growth_alarm file_size',
         'fused_memory.services.journal_growth_alarm',
         _journal_growth('FILE_SIZE'),
-        logging.DEBUG,
         1,
     ),
     _Filer(
         'journal_growth_alarm insert_rate',
         'fused_memory.services.journal_growth_alarm',
         _journal_growth('INSERT_RATE'),
-        logging.DEBUG,
         1,
     ),
     _Filer(
@@ -728,7 +702,6 @@ _MIGRATED_FILERS: tuple[_Filer, ...] = (
             storm={'count': 5, 'threshold': 5, 'window_seconds': 3600.0,
                    'labels': ['llm_error']},
         ),
-        logging.DEBUG,
         1,
     ),
     _Filer(
@@ -737,7 +710,6 @@ _MIGRATED_FILERS: tuple[_Filer, ...] = (
         lambda m, root: m.FoldedEscapeFiler(root)(
             m.Escape(anchor=m.BACKLOG_ANCHOR, summary='s', detail={}),
         ),
-        logging.DEBUG,
         1,
     ),
 )
@@ -786,34 +758,40 @@ def _forwarded_kwargs(filer: _Filer, tmp_path, monkeypatch) -> dict:
     return seen
 
 
-class TestEveryFilerPinsItsForwardedLevels:
+class TestEveryFilerPinsItsLevels:
     """The house levels, their exceptions, and a fence against a new answer.
 
-    Deliberately NOT decorated with `_needs_escalation`: the spy replaces
-    `file_folded_escalation` outright, so no queue is ever built — and a level
-    regression that only fails where the escalation package happens to be
-    installed is an alarm switched off exactly where nobody is looking.
+    Deliberately NOT decorated with `_needs_escalation`: the lost-alarm check
+    runs the package-unavailable arm and the escalation-level check replaces
+    `file_folded_escalation` with a spy, so no queue is ever built — and a
+    level regression that only fails where the escalation package happens to
+    be installed is an alarm switched off exactly where nobody is looking.
 
-    Each forwarded value is read with `.get` and the helper's own default, so
-    a row passes whether the caller omits the keyword or passes it explicitly:
-    the property under test is the EFFECTIVE level, not the call spelling.
+    The forwarded escalation level is read with `.get` and the helper's own
+    default, so a row passes whether the caller omits the keyword or passes it
+    explicitly: the property under test is the EFFECTIVE level, not the call
+    spelling.
     """
 
     @pytest.mark.parametrize(
         'filer', _MIGRATED_FILERS, ids=[f.label for f in _MIGRATED_FILERS],
     )
-    def test_the_forwarded_no_escalation_level_matches_the_table(
-        self, filer, tmp_path, monkeypatch,
+    def test_a_lost_alarm_is_logged_at_warning_on_the_filers_own_logger(
+        self, filer, tmp_path, monkeypatch, caplog,
     ):
-        seen = _forwarded_kwargs(filer, tmp_path, monkeypatch)
+        monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', False)
+        module = importlib.import_module(filer.module)
 
-        forwarded = seen.get('no_escalation_level', logging.DEBUG)
-        assert forwarded == filer.no_escalation_level, (
-            f'{filer.label} forwards no_escalation_level={forwarded!r}, table '
-            f'says {filer.no_escalation_level!r}. If the change is deliberate, '
-            'edit the table and say why in the row; if not, a never-raise alarm '
-            'just changed how loudly it fails, and the only symptom would have '
-            'been absence of output.'
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            assert filer.fire(module, str(tmp_path)) is None
+
+        records = [(r.name, r.levelno) for r in caplog.records]
+        assert records == [(filer.module, logging.WARNING)], (
+            f'{filer.label} logged {records!r} for a lost alarm. Every filer '
+            'logs on its own `__name__` logger, and a lost alarm below WARNING '
+            "prints nothing at the fused-memory server's INFO threshold — see "
+            'TestTheEmittedLevels.'
         )
 
     @pytest.mark.parametrize(
@@ -852,15 +830,6 @@ class TestEveryFilerPinsItsForwardedLevels:
         )
 
     def test_the_table_names_its_exceptions(self):
-        raised = {
-            f.label for f in _MIGRATED_FILERS
-            if f.no_escalation_level != logging.DEBUG
-        }
-        assert raised == {'referent_repair_storm_escalator'}, (
-            'DEBUG is the house level and referent_repair is its ONE deliberate '
-            f'exception; {raised!r} says a second answer arrived without the '
-            'house-level question being settled'
-        )
         not_l1 = {
             f.label: f.escalation_level for f in _MIGRATED_FILERS
             if f.escalation_level != 1
