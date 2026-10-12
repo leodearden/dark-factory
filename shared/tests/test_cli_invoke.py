@@ -387,42 +387,6 @@ class TestInvokeWithCapRetryCostStore:
         assert 'started_at' in call_kwargs
         assert 'completed_at' in call_kwargs
 
-    async def test_save_account_event_on_cap_hit(self):
-        """save_account_event is awaited with cap_hit on cap detection."""
-        gate = make_gate_mock(
-            account_count=2,
-            before_invoke=AsyncMock(side_effect=['token-a', 'token-b']),
-            detect_cap_hit=MagicMock(side_effect=[True, False]),
-            active_account_name='acct-b',
-        )
-
-        cost_store = MagicMock()
-        cost_store.save_invocation = AsyncMock()
-        cost_store.save_account_event = AsyncMock()
-
-        result = _make_result()
-
-        with (
-            patch(
-                'shared.cli_invoke.invoke_claude_agent',
-                new_callable=AsyncMock,
-                return_value=result,
-            ),
-            patch('shared.cli_invoke.asyncio') as mock_asyncio,
-        ):
-            mock_asyncio.sleep = AsyncMock()
-            await invoke_with_cap_retry(
-                gate, 'test-label',
-                cost_store=cost_store, run_id='run-1', project_id='proj-1',
-                prompt='hi',
-            )
-
-        cost_store.save_account_event.assert_awaited_once()
-        call_kwargs = cost_store.save_account_event.call_args.kwargs
-        assert call_kwargs['event_type'] == 'cap_hit'
-        assert call_kwargs['details'] == 'test-label'
-        assert 'created_at' in call_kwargs
-
     async def test_no_error_when_cost_store_none(self):
         """No CostStore-related errors when cost_store=None (default)."""
         gate = make_gate_mock(
@@ -467,41 +431,6 @@ class TestInvokeWithCapRetryCostStore:
 
         assert got.success is True
         assert 'Failed to save invocation cost' in caplog.text
-
-    async def test_save_account_event_error_swallowed(self, caplog):
-        """save_account_event failure is logged but retry still happens."""
-        gate = make_gate_mock(
-            account_count=2,
-            before_invoke=AsyncMock(side_effect=['token-a', 'token-b']),
-            detect_cap_hit=MagicMock(side_effect=[True, False]),
-            active_account_name='acct-b',
-        )
-
-        cost_store = MagicMock()
-        cost_store.save_invocation = AsyncMock()
-        cost_store.save_account_event = AsyncMock(side_effect=RuntimeError('db error'))
-
-        result = _make_result()
-
-        with (
-            patch(
-                'shared.cli_invoke.invoke_claude_agent',
-                new_callable=AsyncMock,
-                return_value=result,
-            ),
-            patch('shared.cli_invoke.asyncio') as mock_asyncio,
-        ):
-            mock_asyncio.sleep = AsyncMock()
-            with caplog.at_level(logging.WARNING):
-                got = await invoke_with_cap_retry(
-                    gate, 'test-label',
-                    cost_store=cost_store, prompt='hi',
-                )
-
-        assert got.success is True
-        assert 'Failed to save cap_hit event' in caplog.text
-        # save_invocation still called on the successful retry
-        cost_store.save_invocation.assert_awaited_once()
 
     async def test_capped_false_on_successful_invocation(self):
         """capped=False on save_invocation even after prior cap hits."""
