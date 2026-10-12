@@ -699,6 +699,32 @@ class TestSamplerReingestedContentParity:
         assert {name: digested[name] for name in _TEXT_CLASSES} == dict.fromkeys(_TEXT_CLASSES, 0)
 
 
+class TestLegibilityInstrumentStratum:
+    def test_an_instrument_session_with_signal_is_sampled_in_its_own_stratum(self, tmp_path):
+        encoded = tmp_path / '-home-leo-src-dark-factory'
+        encoded.mkdir()
+        coder_prompt = coder.build_prompt(
+            digest_text='- (turn 1) ok', codebook_index='', invariant_slugs=(),
+        )
+        sessions = [
+            _session_on_disk(encoded, 'coder-run', [_user_turn(coder_prompt), _tool_error_record()]),
+            _session_on_disk(encoded, 'interactive-run', [_clean_record(0), _not_found_record()]),
+        ]
+        config = config_mod.LegibilityConfig(
+            project_id='dark_factory',
+            project_root='/home/leo/src/dark-factory',
+            escalation_port=8103,
+            cwd_prefixes=['/home/leo/src/dark-factory'],
+            budgets=config_mod.Budgets(max_daily_digest_bytes=405_000),
+            sampling=config_mod.Sampling(top_fraction=0.12, per_stratum_min=2),
+        )
+
+        scored = [mod.score_session(session) for session in sessions]
+        result = mod.stratified_sample(scored, config)
+
+        assert result.per_stratum_counts == {'legibility-instrument': 1, 'interactive': 1}
+
+
 def _scored(session_id, stratum, counts, first_turn_text, size_bytes=1000):
     session = inventory.SessionRecord(
         path=Path(f'/root/-home-leo-src-dark-factory/{session_id}.jsonl'),
