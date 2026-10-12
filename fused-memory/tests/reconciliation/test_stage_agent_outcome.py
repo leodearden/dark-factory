@@ -8,6 +8,7 @@ nothing. See plans/recon-stage-startup-wedge-rca-2026-09-27.md.
 from __future__ import annotations
 
 import json
+from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -24,31 +25,24 @@ from fused_memory.models.reconciliation import (
     Watermark,
 )
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
-from fused_memory.reconciliation.cli_stage_runner import StageResult, run_stage_via_cli
+from fused_memory.reconciliation.cli_stage_runner import StageResult
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 from fused_memory.reconciliation.sandbox_guard import RemediationSandboxUnavailable
 from fused_memory.reconciliation.stages.task_knowledge_sync import IntegrityCheck
 from fused_memory.reconciliation.summary_pool import write_cycle_summary
 from fused_memory.services.memory_service import MemoryService
+from reconciliation.stubbed_stage_cli import (
+    INVOKE_WITH_CAP_RETRY,
+    run_stage,
+    run_stage_answered_by,
+)
 
-_INVOKE = 'fused_memory.reconciliation.cli_stage_runner.invoke_with_cap_retry'
 _RESOLVE_SANDBOX = 'fused_memory.reconciliation.cli_stage_runner.resolve_recon_sandbox_wrap'
 
 
-async def _run_stage(config: ReconciliationConfig, tmp_path) -> StageResult:
-    return await run_stage_via_cli(
-        system_prompt='sys',
-        payload='pay',
-        disallowed_tools=[],
-        config=config,
-        mcp_config={'mcpServers': {}},
-        cwd=tmp_path,
-    )
-
-
 async def _outcome_of(agent_result: AgentResult, tmp_path) -> StageResult:
-    with patch(_INVOKE, AsyncMock(return_value=agent_result)):
-        return await _run_stage(ReconciliationConfig(sandbox_recon_agents=False), tmp_path)
+    result, _ = await run_stage_answered_by(agent_result, tmp_path)
+    return result
 
 
 class TestRunStageViaCliClassifiesOutcome:
@@ -93,8 +87,8 @@ class TestRunStageViaCliClassifiesOutcome:
 
     @pytest.mark.asyncio
     async def test_raising_invocation_is_failed(self, tmp_path):
-        with patch(_INVOKE, AsyncMock(side_effect=RuntimeError('spawn exploded'))):
-            result = await _run_stage(
+        with patch(INVOKE_WITH_CAP_RETRY, AsyncMock(side_effect=RuntimeError('spawn exploded'))):
+            result = await run_stage(
                 ReconciliationConfig(sandbox_recon_agents=False), tmp_path,
             )
 
@@ -105,10 +99,10 @@ class TestRunStageViaCliClassifiesOutcome:
     async def test_sandbox_fail_closed_is_not_launched(self, tmp_path):
         mock_invoke = AsyncMock(return_value=AgentResult(success=True, output=''))
 
-        with patch(_INVOKE, mock_invoke), patch(
+        with patch(INVOKE_WITH_CAP_RETRY, mock_invoke), patch(
             _RESOLVE_SANDBOX, side_effect=RemediationSandboxUnavailable('no sandbox'),
         ):
-            result = await _run_stage(
+            result = await run_stage(
                 ReconciliationConfig(sandbox_recon_agents=True), tmp_path,
             )
 
@@ -126,11 +120,23 @@ class TestStageResultOutcomeInvariant:
 
     def test_success_with_a_failure_outcome_is_rejected(self):
         with pytest.raises(ValueError):
-            StageResult(success=True, outcome=StageAgentOutcome.zero_output_timeout)
+            StageResult(success=True, declared_outcome=StageAgentOutcome.zero_output_timeout)
 
     def test_failure_with_the_completed_outcome_is_rejected(self):
         with pytest.raises(ValueError):
-            StageResult(success=False, outcome=StageAgentOutcome.completed)
+            StageResult(success=False, declared_outcome=StageAgentOutcome.completed)
+
+    @pytest.mark.parametrize(
+        ('attribute', 'value'),
+        [('success', True), ('outcome', StageAgentOutcome.completed)],
+    )
+    def test_neither_half_of_the_invariant_can_be_reassigned(self, attribute, value):
+        result = StageResult(
+            success=False, declared_outcome=StageAgentOutcome.zero_output_timeout,
+        )
+
+        with pytest.raises(FrozenInstanceError):
+            setattr(result, attribute, value)
 
 
 def _stage_report(**overrides) -> StageReport:

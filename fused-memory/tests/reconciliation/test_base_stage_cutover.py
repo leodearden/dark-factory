@@ -315,7 +315,7 @@ class TestAgentOutcomeStamped:
         report = await self._run_with(StageResult(
             report={},
             success=False,
-            outcome=StageAgentOutcome.zero_output_timeout,
+            declared_outcome=StageAgentOutcome.zero_output_timeout,
             error='Agent produced no output',
         ))
 

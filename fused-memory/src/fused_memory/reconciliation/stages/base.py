@@ -358,12 +358,13 @@ class BaseStage:
         # PRD γ: read assembled report from in-process state (overrides stage_result.report).
         # Falls back to stage_result.report when recon_report_state is not configured
         # (back-compat path for non-recon stages) or when start_report degraded to None.
+        report_data = stage_result.report
         if _active_rrs is not None:
             assembled = _active_rrs.get_assembled_report(
                 run_id, self.stage_id.value
             )
             if assembled is not None:
-                stage_result.report = assembled
+                report_data = assembled
             else:
                 # Agent crashed / timed out before calling recon_report.complete.
                 # Substitute empty assembled dict — matches today's malformed-JSON outcome.
@@ -372,12 +373,12 @@ class BaseStage:
                     '(agent may have crashed before calling recon_report.complete)',
                     self.stage_id.value, run_id,
                 )
-                stage_result.report = {'summary': '', 'stats': {}, 'flagged_items': []}
+                report_data = {'summary': '', 'stats': {}, 'flagged_items': []}
 
         # Schema consistency (reviewer finding schema_consistency): warn when a
         # flagged item lacks both dedup keys — compute_flag_signature will return
         # None for these findings, silently bypassing cross-run recurrence tracking.
-        for _item in stage_result.report.get('flagged_items', []):
+        for _item in report_data.get('flagged_items', []):
             if not _item.get('task_id') and not _item.get('cited_tasks'):
                 logger.warning(
                     'Stage %s run_id=%s: finding lacks task_id and cited_tasks — '
@@ -386,7 +387,6 @@ class BaseStage:
                     _item.get('description', '<no description>'),
                 )
 
-        report_data = stage_result.report
         _flagged = report_data.get('flagged_items', [])
         _stats = report_data.get('stats', {})
 

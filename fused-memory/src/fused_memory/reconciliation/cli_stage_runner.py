@@ -6,7 +6,7 @@ import json
 import logging
 import shutil
 import time
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Any
 
@@ -505,9 +505,13 @@ STAGE3_REPORT_SCHEMA: dict[str, Any] = {
 }
 
 
-@dataclass
+@dataclass(frozen=True)
 class StageResult:
-    """Result from a single CLI stage invocation."""
+    """Result from a single CLI stage invocation.
+
+    ``outcome`` is ``declared_outcome`` when one is given, else derived from
+    ``success``; only a successful agent is ever ``completed``.
+    """
 
     report: dict = field(default_factory=dict)
     llm_calls: int = 0
@@ -517,18 +521,18 @@ class StageResult:
     model: str = ''
     success: bool = False
     error: str = ''
-    outcome: StageAgentOutcome | None = None
+    declared_outcome: InitVar[StageAgentOutcome | None] = None
+    outcome: StageAgentOutcome = field(init=False)
 
-    def __post_init__(self) -> None:
-        if self.outcome is None:
-            self.outcome = (
-                StageAgentOutcome.completed if self.success else StageAgentOutcome.failed
-            )
-        elif (self.outcome is StageAgentOutcome.completed) != self.success:
+    def __post_init__(self, declared_outcome: StageAgentOutcome | None) -> None:
+        derived = StageAgentOutcome.completed if self.success else StageAgentOutcome.failed
+        outcome = derived if declared_outcome is None else declared_outcome
+        if (outcome is StageAgentOutcome.completed) != self.success:
             raise ValueError(
-                f'StageResult.outcome={self.outcome.value!r} contradicts '
+                f'StageResult outcome={outcome.value!r} contradicts '
                 f'success={self.success}: only a successful agent is completed.'
             )
+        object.__setattr__(self, 'outcome', outcome)
 
 
 def _classify_agent_outcome(agent_result: AgentResult) -> StageAgentOutcome:
@@ -790,7 +794,7 @@ async def run_stage_via_cli(
                 error=str(exc),
                 duration_ms=duration_ms,
                 model=effective_model,
-                outcome=StageAgentOutcome.not_launched,
+                declared_outcome=StageAgentOutcome.not_launched,
             )
 
     try:
@@ -828,7 +832,7 @@ async def run_stage_via_cli(
             error=str(e),
             duration_ms=duration_ms,
             model=effective_model,
-            outcome=StageAgentOutcome.failed,
+            declared_outcome=StageAgentOutcome.failed,
         )
 
     duration_ms = int(time.monotonic() * 1000) - start_ms
@@ -845,7 +849,7 @@ async def run_stage_via_cli(
         model=effective_model,
         success=agent_result.success,
         error='' if agent_result.success else (agent_result.output or 'Agent failed'),
-        outcome=_classify_agent_outcome(agent_result),
+        declared_outcome=_classify_agent_outcome(agent_result),
     )
 
 
