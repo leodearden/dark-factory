@@ -220,10 +220,21 @@ taskmaster:
 # So the pass also runs every prune_interval_seconds: 1800 s x a 30 s deadline
 # = 48 passes/day, about 3.7M rows/day at the p25 rate with no credit taken for
 # restarts. That covers peak accrual (1.13M/day) plus a ~7-day drain of the
-# backlog (2.02M/day). The other bounds are unchanged: no pass ever reached
-# the row budget, and a longer deadline would lengthen every startup, which
+# backlog (2.02M/day). The row budget and deadline are unchanged: no pass ever
+# reached the budget, and a longer deadline would lengthen every startup, which
 # prunes before READY. Once drained, each pass removes ~20k rows (985k / 48)
 # in ~7-8 s, finishes inside the deadline and logs no WARNING.
+#
+# SERVING COST, which sets prune_batch_size. The periodic pass runs while
+# serving, and every journalled tool call (~11.4/s at 985k rows/day) queues on
+# the journal's connection lock behind the batch in flight, so one batch is the
+# longest any of them waits: prune_batch_size / rows/s. At 5,000 rows that was
+# 1.7 s at the median rate, 2.0 s at p25 and 5.5 s at the minimum; at 500 it is
+# 0.17 s, 0.20 s and 0.55 s. The price is one more synchronous=FULL commit
+# (~1-5 ms) per 500 rows, 1-3% of a pass. Every rate above was measured while
+# each batch re-walked all kept search rows, which
+# WriteJournal.prune_write_ops no longer repeats, so these figures are
+# conservative.
 #
 # Each partial pass logs a WARNING naming the horizons still behind AND the
 # rows/sec it achieved. If periodic WARNINGs persist about a week after deploy,
@@ -235,7 +246,7 @@ write_journal:
   read_retention_days: ${WRITE_JOURNAL_READ_RETENTION_DAYS:30}
   search_retention_days: ${WRITE_JOURNAL_SEARCH_RETENTION_DAYS:365}
   write_retention_days: ${WRITE_JOURNAL_WRITE_RETENTION_DAYS:730}
-  prune_batch_size: ${WRITE_JOURNAL_PRUNE_BATCH_SIZE:5000}
+  prune_batch_size: ${WRITE_JOURNAL_PRUNE_BATCH_SIZE:500}
   prune_max_rows_per_run: ${WRITE_JOURNAL_PRUNE_MAX_ROWS:500000}
   prune_max_seconds: ${WRITE_JOURNAL_PRUNE_MAX_SECONDS:30}
   prune_interval_seconds: ${WRITE_JOURNAL_PRUNE_INTERVAL_SECONDS:1800}

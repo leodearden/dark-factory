@@ -4164,7 +4164,7 @@ class TestWriteJournalConfig:
         assert section.read_retention_days == 30.0
         assert section.search_retention_days == 365.0
         assert section.write_retention_days == 730.0
-        assert section.prune_batch_size == 5000
+        assert section.prune_batch_size == 500
         assert section.prune_max_rows_per_run == 500_000
         assert section.prune_max_seconds == 30.0
         assert section.prune_interval_seconds == 1800.0
@@ -4216,7 +4216,7 @@ class TestWriteJournalConfig:
         assert section.prune_interval_seconds == 600.0
         # Unmentioned leaves keep their defaults rather than being clobbered.
         assert section.write_retention_days == 730.0
-        assert section.prune_batch_size == 5000
+        assert section.prune_batch_size == 500
 
 
 class TestWriteJournalGrowthAlarmConfig:

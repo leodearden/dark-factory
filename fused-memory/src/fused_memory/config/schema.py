@@ -472,8 +472,10 @@ class WriteJournalConfig(BaseModel):
     #: volume, so a long horizon costs essentially nothing.
     write_retention_days: float = Field(default=730.0, gt=0)
     #: Rows deleted per transaction. Each batch commits separately so the
-    #: write lock is released between batches.
-    prune_batch_size: int = Field(default=5000, gt=0)
+    #: write lock is released between batches, which makes one batch the
+    #: longest a journalled tool call waits behind a periodic pass; sized for
+    #: that in the ``write_journal`` block of ``fused-memory/config/config.yaml``.
+    prune_batch_size: int = Field(default=500, gt=0)
     #: Ceiling on one sweep. A backlog drains over successive passes and each
     #: partial run says so at WARNING.
     prune_max_rows_per_run: int = Field(default=500_000, gt=0)
