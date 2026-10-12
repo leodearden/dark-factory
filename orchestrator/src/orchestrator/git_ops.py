@@ -77,7 +77,10 @@ from shared.transcript_archive import archive_before_delete
 from orchestrator import branch_stack, rebase_recovery
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.branch_stack import (
+    PreStackTip,
     StackBaseLedger,
+    TipRestore,
+    TipRestoreOutcome,
     UnstackOutcome,
     UnstackResult,
     base_owners,
@@ -346,9 +349,13 @@ class TrainStackResult:
     ejected:   member ids that conflicted during stacking and were dropped;
                their branches are left clean (rebase aborted) so they can
                merge solo.
+    pre_stack_tips: one entry per stacked survivor (never the anchor, which
+               is not rebased): the tip it had immediately before stacking,
+               so a train that does not land can hand it back.
     """
     survivors: list[str]
     ejected: list[str]
+    pre_stack_tips: tuple[PreStackTip, ...] = ()
 
 
 # Default commit-citation pattern for ``find_task_citation_commit``.
@@ -10100,7 +10107,9 @@ class GitOps:
         records of branches that no longer exist are pruned.
         A member is always stacked from its own delta: before the rebase it
         is un-stacked from any earlier unlanded base, and a member that
-        cannot be un-stacked is ejected.
+        cannot be un-stacked is ejected.  Its tip is then read as its restore
+        point (``pre_stack_tips``); a member whose tip cannot be read is
+        ejected, so no member is stacked without one.
 
         On a rebase conflict the member is added to *ejected*; the last-good
         predecessor is NOT advanced, so the next member re-links onto the last
@@ -10114,7 +10123,7 @@ class GitOps:
             member_ids: Ordered list of member task ids, anchor first.
 
         Returns:
-            TrainStackResult(survivors, ejected).
+            TrainStackResult(survivors, ejected, pre_stack_tips).
         """
         if not member_ids:
             return TrainStackResult(survivors=[], ejected=[])
@@ -10123,6 +10132,7 @@ class GitOps:
         anchor_id = member_ids[0]
         survivors: list[str] = [anchor_id]
         ejected: list[str] = []
+        pre_stack_tips: list[PreStackTip] = []
         last_good_id = anchor_id
 
         for member_id in member_ids[1:]:
@@ -10138,23 +10148,28 @@ class GitOps:
 
             onto_branch = f'{self.config.branch_prefix}{last_good_id}'
             member_branch = f'{self.config.branch_prefix}{member_id}'
-            success = await self._stack_member(wt_path, member_branch, onto_branch)
-            if success:
+            pre_stack_sha = await self._stack_member(wt_path, member_branch, onto_branch)
+            if pre_stack_sha is not None:
                 survivors.append(member_id)
+                pre_stack_tips.append(PreStackTip(member_id=member_id, sha=pre_stack_sha))
                 last_good_id = member_id
             else:
                 ejected.append(member_id)
                 # Do not advance last_good_id.
 
-        return TrainStackResult(survivors=survivors, ejected=ejected)
+        return TrainStackResult(
+            survivors=survivors, ejected=ejected, pre_stack_tips=tuple(pre_stack_tips),
+        )
 
     async def _stack_member(
         self, wt_path: Path, member_branch: str, onto_branch: str,
-    ) -> bool:
+    ) -> str | None:
         """Stack *member_branch* onto *onto_branch* from its own delta.
 
-        Returns False when the member must be ejected: it could not be
-        un-stacked from an earlier unlanded base, or the rebase conflicted.
+        Returns the member's tip from immediately before the rebase, its
+        restore point, or None when the member must be ejected: it could not
+        be un-stacked from an earlier unlanded base, its tip could not be
+        read, or the rebase conflicted.
         """
         earlier = await self.unstack_from_unlanded_base(member_branch)
         if earlier.stops_merge:
@@ -10162,9 +10177,17 @@ class GitOps:
                 'stack_train_branches: ejecting %s — %s',
                 member_branch, earlier.merge_block_reason(),
             )
-            return False
+            return None
+        pre_stack_sha = await self.resolve_branch_sha(member_branch)
+        if pre_stack_sha is None:
+            logger.warning(
+                'stack_train_branches: ejecting %s — its tip did not resolve, '
+                'so it would have no restore point',
+                member_branch,
+            )
+            return None
         if not await self.rebase_onto_main(wt_path, onto=onto_branch):
-            return False
+            return None
         base_sha = await self.resolve_branch_sha(onto_branch)
         if base_sha is None:
             logger.warning(
@@ -10172,9 +10195,9 @@ class GitOps:
                 'onto it; no stack base recorded',
                 onto_branch, member_branch,
             )
-            return True
+            return pre_stack_sha
         await self._stack_ledger().record(member_branch, base_sha)
-        return True
+        return pre_stack_sha
 
     def _stack_ledger(self) -> StackBaseLedger:
         return StackBaseLedger(self.project_root, _run)
@@ -10220,6 +10243,70 @@ class GitOps:
                 main_branch=self.config.main_branch,
                 base=base,
                 detail=str(exc),
+            )
+
+    async def restore_pre_stack_tip(self, tip: PreStackTip) -> TipRestore:
+        """Put a stacked member's branch back on the tip it had before stacking.
+
+        A compare-and-swap on the tip observed here: ``git update-ref`` moves
+        the branch only if nothing moved it since, then the worktree holding
+        it, if any, is reset to it, and the branch's stack-base record is
+        forgotten, since it no longer carries that base.  Moves nothing when
+        the branch is gone (MISSING), already there (UNCHANGED), on main
+        (LANDED), checked out with uncommitted changes (DIRTY), or moved by
+        someone else, or lost its worktree, while this looked (MOVED).
+        Never raises.
+        """
+        branch = f'{self.config.branch_prefix}{tip.member_id}'
+        try:
+            return await self._swap_back_to(branch, tip.sha)
+        except WorktreeMissing as exc:
+            return TipRestore(
+                outcome=TipRestoreOutcome.MOVED, branch=branch,
+                pre_stack_sha=tip.sha, found_sha=None, detail=str(exc),
+            )
+
+    async def _swap_back_to(self, branch: str, pre_stack_sha: str) -> TipRestore:
+        verdict = functools.partial(TipRestore, branch=branch, pre_stack_sha=pre_stack_sha)
+        found = await self.resolve_branch_sha(branch)
+        if found is None:
+            return verdict(outcome=TipRestoreOutcome.MISSING, found_sha=None)
+        verdict = functools.partial(verdict, found_sha=found)
+        if found == pre_stack_sha:
+            return verdict(outcome=TipRestoreOutcome.UNCHANGED)
+        if await self.is_ancestor(found, self.config.main_branch):
+            return verdict(outcome=TipRestoreOutcome.LANDED)
+        wt = await self._worktree_holding_branch(branch)
+        verdict = functools.partial(verdict, worktree=wt)
+        if wt is not None and await self.has_uncommitted_work(wt):
+            return verdict(
+                outcome=TipRestoreOutcome.DIRTY,
+                detail=f'worktree {wt} has uncommitted changes',
+            )
+        rc, _, err = await _run(
+            ['git', 'update-ref', f'refs/heads/{branch}', pre_stack_sha, found],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            return verdict(outcome=TipRestoreOutcome.MOVED, detail=' '.join(err.split()))
+        if wt is not None:
+            await self._reset_to_restored_tip(wt, branch, pre_stack_sha)
+        await self._stack_ledger().forget(branch)
+        return verdict(outcome=TipRestoreOutcome.RESTORED)
+
+    async def _reset_to_restored_tip(self, wt: Path, branch: str, sha: str) -> None:
+        """Bring *wt*'s index and files to *branch*'s restored tip, which its
+        HEAD already names.  A failure leaves the ref restored, which is what
+        the lane reads, and is logged with its remedy."""
+        try:
+            rc, _, err = await _run(['git', 'reset', '--hard'], cwd=wt)
+        except WorktreeMissing:
+            return
+        if rc != 0:
+            logger.error(
+                'Restored %s to its pre-stack tip %s, but resetting its '
+                'worktree failed: %s. Remedy: git -C %s reset --hard %s',
+                branch, sha, ' '.join(err.split()), wt, sha,
             )
 
     async def _unstack_recorded(
