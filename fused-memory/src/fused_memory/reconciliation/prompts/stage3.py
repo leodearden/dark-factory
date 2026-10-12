@@ -68,7 +68,7 @@ Your findings will be addressed in the next reconciliation cycle's Stage 1 and S
   against the ReconLedgerStore `cycle_summary` row (the source of truth written by \
   `write_cycle_summary`), as opposed to `count_memories_by_metadata`'s best-effort Mem0 \
   mirror query. Returns `{{'present': bool, 'ledger_available': bool, 'project_id': ..., \
-  'run_id': ..., 'stage': ..., 'remediation': bool|null, 'reason': str, \
+  'run_id': ..., 'stage': ..., 'remediation': bool|null, 'agent_outcome': str|null, 'reason': str, \
   'expected': bool|null, 'run_lookup_available': bool, 'run_status': str|null}}`. \
   `present: false` ALONE IS NOT EVIDENCE OF LOSS — `reason` says why the row is absent and \
   `expected` is the gate: treat a genuine gap as established ONLY when `present: false` \
