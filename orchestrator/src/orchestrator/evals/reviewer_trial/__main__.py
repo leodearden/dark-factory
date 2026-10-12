@@ -30,6 +30,7 @@ import click
 
 if TYPE_CHECKING:
     from .corpus import CorpusManifest
+    from .scorer import ScoringResult
 
 _PKG_DIR = Path(__file__).parent
 _CORPUS_PATH = _PKG_DIR / 'corpus' / 'manifest.json'
@@ -47,6 +48,20 @@ def _print_check(passed: bool, message: str) -> bool:
     tag = click.style('[PASS]', fg='green') if passed else click.style('[FAIL]', fg='red')
     click.echo(f'{tag} {message}')
     return passed
+
+
+def _metrics_text(f1: float, blocking_recall: float, cost_usd: float) -> str:
+    return f'F1={f1:.3f} BR={blocking_recall:.3f} ${cost_usd:.2f}'
+
+
+def _cell_text(score: ScoringResult) -> str:
+    """One scored cell for a progress line: its metrics and spend, or why it has none."""
+    if score.unmeasured is None:
+        return _metrics_text(score.f1, score.blocking_recall, score.total_cost_usd)
+    from orchestrator.evals.report import format_invocation_errors
+
+    why = format_invocation_errors([score.unmeasured.to_record()])
+    return f'UNMEASURED {why} ${score.total_cost_usd:.2f}'
 
 
 async def _load_or_run_panel(variant, diff, stagger_secs: float = 2.0):
@@ -1186,15 +1201,19 @@ def campaign(
                     score_path = score_dir / f'{result.variant_name}__{result.diff_id}.json'
                     if score_path.exists():
                         rec = json.loads(score_path.read_text())
+                        cell = _metrics_text(
+                            rec['f1'], rec['blocking_recall'],
+                            rec['cost_usd'] + rec.get('match_cost_usd', 0.0),
+                        )
                     else:
-                        rec = asdict(await score_panel_run(result, diff))
-                        score_path.write_text(json.dumps(rec, indent=2))
+                        score = await score_panel_run(result, diff, usage_gate=usage_gate)
+                        rec = asdict(score)
+                        if score.unmeasured is None:
+                            score_path.write_text(json.dumps(rec, indent=2))
+                        cell = _cell_text(score)
                     rec['trial'] = trial
                     records.append(rec)
-                    click.echo(
-                        f'  {result.variant_name:22s} x {result.diff_id:<28s} '
-                        f'F1={rec["f1"]:.3f} BR={rec["blocking_recall"]:.3f} ${rec["cost_usd"]:.2f}'
-                    )
+                    click.echo(f'  {result.variant_name:22s} x {result.diff_id:<28s} {cell}')
 
             arms_out, decisions = reduce.summarize_campaign(records, incumbent, blocking_gt)
             md = reduce.format_markdown(arms_out, decisions)
@@ -1204,7 +1223,8 @@ def campaign(
             )
             click.echo()
             click.echo(md)
-            click.echo(f'\nTotal campaign cost (panels + matcher): ${sum(a.total_cost_usd for a in arms_out):.2f}')
+            spent = sum(a.total_cost_usd + a.unmeasured_cost_usd for a in arms_out)
+            click.echo(f'\nTotal campaign cost (panels + matcher): ${spent:.2f}')
             click.echo(f'Report saved to: {results_dir / "campaign_report.md"}')
             return 0
 
