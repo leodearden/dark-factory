@@ -47,9 +47,9 @@ from .configs import (
     claude_endpoint_price_table,
     matrix_pairs,
 )
+from .measurement import coerce_cost_usd
 from .metrics import (
     EvalMetrics,
-    coerce_cost_usd,
     collect_metrics,
     compose_cost_source,
     detect_invocation_error,
@@ -798,7 +798,7 @@ def _verdict_cost_usd(verdict: object) -> float:
     NaN/Infinity/negative guard (amendment, reviewer robustness: a judge
     answering a non-finite or negative cost would otherwise poison
     ``arch_cost_usd + judge_cost_usd`` and every downstream report.py mean) —
-    is delegated to :func:`~orchestrator.evals.metrics.coerce_cost_usd`, the
+    is delegated to :func:`~orchestrator.evals.measurement.coerce_cost_usd`, the
     SAME helper the judge's own producer-side return paths use, so the two
     sides of this contract cannot drift apart.
     """

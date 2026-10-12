@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import math
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -24,8 +25,8 @@ from shared.invocation_outcome import (
 from orchestrator.evals.measurement import (
     MeasurementStage,
     Scored,
-    UnmeasuredCause,
     Unmeasured,
+    UnmeasuredCause,
     classify_unmeasured,
     clip_reason,
     coerce_cost_usd,
@@ -118,22 +119,26 @@ class TestOutcomeInvariants:
         assert all(type(v) is str for v in record.values())
 
     def test_unmeasured_is_frozen(self):
-        u = Unmeasured(MeasurementStage.JUDGE, UnmeasuredCause.RAISED, 'r', cost_usd=0.0)
+        u: Any = Unmeasured(
+            MeasurementStage.JUDGE, UnmeasuredCause.RAISED, 'r', cost_usd=0.0,
+        )
         with pytest.raises(dataclasses.FrozenInstanceError):
-            u.reason = 'other'  # type: ignore[misc]
+            u.reason = 'other'
 
     def test_scored_is_frozen(self):
-        s = Scored(1, cost_usd=0.0)
+        s: Any = Scored(1, cost_usd=0.0)
         with pytest.raises(dataclasses.FrozenInstanceError):
-            s.value = 2  # type: ignore[misc]
+            s.value = 2
 
     def test_bare_string_stage_is_rejected_naming_field_and_value(self):
+        bare_stage: Any = 'architect'
         with pytest.raises(TypeError, match=r"stage.*'architect'"):
-            Unmeasured('architect', UnmeasuredCause.CAP_HIT, 'r', cost_usd=0.0)  # type: ignore[arg-type]
+            Unmeasured(bare_stage, UnmeasuredCause.CAP_HIT, 'r', cost_usd=0.0)
 
     def test_bare_string_cause_is_rejected_naming_field_and_value(self):
+        bare_cause: Any = 'cap_hit'
         with pytest.raises(TypeError, match=r"cause.*'cap_hit'"):
-            Unmeasured(MeasurementStage.ARCHITECT, 'cap_hit', 'r', cost_usd=0.0)  # type: ignore[arg-type]
+            Unmeasured(MeasurementStage.ARCHITECT, bare_cause, 'r', cost_usd=0.0)
 
     @pytest.mark.parametrize('bad', [float('nan'), -1.0, float('inf')])
     def test_scored_rejects_non_finite_or_negative_spend(self, bad):

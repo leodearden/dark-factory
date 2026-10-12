@@ -23,6 +23,7 @@ from .elo import (
     next_matchup,
     record_match,
 )
+from .measurement import coerce_cost_usd
 from .plan_predicates import is_scorable_plan, plan_confirmed
 from .snapshots import get_diff
 
@@ -447,7 +448,7 @@ class PlanQualityVerdict:
     # ``run_architect_eval`` reads this to fold the judge's spend into the
     # cell's own ``cost_usd`` (metrics.py's documented judge_cost_usd-is-a-
     # SUBSET-of-cost_usd contract). Every POST-invoke construction site below
-    # coerces via ``metrics.coerce_cost_usd`` before assigning here, so
+    # coerces via ``measurement.coerce_cost_usd`` before assigning here, so
     # DECLARED type and ACTUAL runtime type agree even under a test double —
     # a direct dataclass construction (like this default, or the legacy
     # 3-arg call sites) is the only way this field can hold anything the
@@ -540,7 +541,7 @@ async def judge_plan_quality(
     PRE-invoke unjudgeable-artifact refusal above, which returns before
     ``invoke_agent`` is ever called, reports ``0.0``. Each of those four
     POST-invoke sites coerces ``result.cost_usd`` through
-    :func:`~orchestrator.evals.metrics.coerce_cost_usd` (amendment,
+    :func:`~orchestrator.evals.measurement.coerce_cost_usd` (amendment,
     reviewer design-coherence) before it rides the verdict, so the
     dataclass's declared ``float`` type is actually true at every
     construction site — not just enforced by whichever caller happens to
@@ -649,12 +650,10 @@ Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.
     # Was the JUDGE ITSELF refused at the transport layer? Checked BEFORE the
     # parse block, because a 429 body is not JSON and would otherwise land in
     # the parse-failure fallback — making an infra refusal indistinguishable
-    # from a judge that answered badly. Local import: keeps judge.py's
-    # module-level import surface unchanged (and there is no cycle either way —
-    # metrics.py does not import judge). coerce_cost_usd is the SAME producer-
-    # side coercion used at every POST-invoke return below (amendment,
-    # reviewer design-coherence) — see its docstring in metrics.py.
-    from .metrics import coerce_cost_usd, detect_invocation_error
+    # from a judge that answered badly. coerce_cost_usd is the SAME producer-
+    # side coercion used at every POST-invoke return below — see its
+    # docstring in measurement.py.
+    from .metrics import detect_invocation_error
 
     invocation_error = detect_invocation_error(result)
     if invocation_error:
@@ -740,7 +739,7 @@ Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.
         plan_quality=plan_quality,
         per_criterion=verdict.get('per_criterion', {}) or {},
         reasoning=verdict.get('reasoning', ''),
-        # Coerced at the producer via the shared metrics.coerce_cost_usd
+        # Coerced at the producer via the shared measurement.coerce_cost_usd
         # helper (amendment, reviewer design-coherence): isinstance-gated,
         # so a bare MagicMock — as the pre-existing judge tests construct,
         # without setting cost_usd — degrades to 0.0 instead of leaking a

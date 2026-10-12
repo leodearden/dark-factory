@@ -4,27 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import re
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-
-# The W4 cap/error classification seam (task 3118). Module-level import is safe
-# for the same reason agents.invoke above is: shared.invocation_outcome reaches
-# only shared.cli_invoke and has no import back into orchestrator, so there is
-# no cycle. detect_invocation_error below delegates to it rather than forking
-# its cap/auth string tables into the eval layer.
-from shared.invocation_outcome import (
-    OK,
-    AuthFailed,
-    CapHit,
-    ModelNotFound,
-    ServerError,
-    ZeroOutputWedge,
-    classify_invocation,
-)
 
 # Cost primitives (the USD/1M fallback rate + the PriceEntry-or-dict accessor)
 # have a SINGLE home in agents.invoke (task 2459); this module re-exports them
@@ -35,6 +19,7 @@ from shared.invocation_outcome import (
 # module-level import is safe.
 from orchestrator.agents.invoke import _FALLBACK_PRICE, _rate
 
+from .measurement import MeasurementStage, classify_unmeasured
 from .plan_predicates import is_scorable_plan
 
 if TYPE_CHECKING:
@@ -557,92 +542,12 @@ def _is_null_work(m: EvalMetrics) -> bool:
     )
 
 
-# Cap/auth reasons are free-form CLI text; clip them so the marker stays a
-# single short line in result JSON and in the report tables.
-_MARKER_REASON_CHARS = 80
-
-
 def detect_invocation_error(
     result: AgentResult | None, *, backend: str = 'claude',
 ) -> str | None:
-    """Name the TRANSPORT-layer refusal behind a failed invocation, if any.
-
-    The third infra-failure guard alongside :func:`_is_false_green` /
-    :func:`_is_null_work`, and the input to the ``cap_tainted`` scoring
-    decision: it answers "did we ever actually get to ask the model?" so a CLI
-    429 stops being scored as if the model had answered badly.
-
-    Classification is DELEGATED to
-    :func:`shared.invocation_outcome.classify_invocation` rather than
-    re-matching 429/cap strings here — that seam already owns the cap/auth/
-    model-not-found tables (under a drift guard) and short-circuits ``OK`` on
-    ``result.success``, which is what stops a healthy run whose OUTPUT merely
-    quotes a cap string from being falsely tainted. Forking those tables into
-    the eval layer would reproduce exactly the false-positive class they were
-    built to prevent.
-
-    The explicit ``api_error_status == 429`` fallback is still required: 429 is
-    deliberately EXCLUDED from the ``AuthFailed`` variant (it normally carries a
-    cap-message body that the cap-TEXT tier recognises), so a BODY-LESS 429
-    would otherwise fall through to ``Failure(unclassified)`` and go unmarked.
-    It is checked BEFORE the wedge tier so a 429 that also timed out with zero
-    turns is reported as the 429 it is, not as a generic wedge.
-
-    ``ServerError`` (HTTP 5xx, including 529 Overloaded) is marked too: the
-    provider refused, so the model never answered and the cell is unmeasurable
-    for the same reason a 429 is. It is attributed ABOVE the wedge tier because
-    a SIGTERM-flushed 5xx on a watchdog-killed CLI is a PROVIDER outage, not a
-    local wedge — the 2026-07-29 incident this tier exists for. This arm also
-    REPAIRS a silent regression: before ``classify_invocation`` grew the
-    ``ServerError`` tier, a timed-out flushed 5xx reached this ladder as a
-    ``ZeroOutputWedge`` and was marked; once that tier was ranked above the
-    wedge upstream, the same case silently fell through to ``None`` until this
-    arm was added.
-
-    ``ZeroOutputWedge`` is marked too (reviewer: robustness): a full-timeout
-    invocation with zero transcript turns produced no model answer at all, so it
-    is unmeasurable for exactly the reason a 429 is, and scoring it 0.0 would
-    reintroduce the fabricated zero this helper exists to remove.
-
-    Returns ``None`` — deliberately, not a marker — for ``result is None``, for
-    a successful invocation, and for every remaining variant (``NearCap``, which
-    is a WARNING that did not block this invocation; ``CliLocalError``, which is
-    explicitly not a cap; ``Failure(unclassified)``). An ORDINARY content failure
-    (an architect that really ran and simply produced a bad or absent plan) is a
-    genuine reliability signal that must keep scoring on content; laundering it
-    into an exclusion would hide it.
-
-    Pure: no I/O, no LLM, no mutation. Raising is left to the caller to guard
-    (``run_architect_eval`` wraps the call) so a classifier bug degrades that
-    one cell rather than being silently swallowed everywhere.
-    """
-    if result is None:
-        return None
-
-    outcome = classify_invocation(result, strict_confirm=True, backend=backend)
-    if isinstance(outcome, CapHit):
-        return f'cap_hit: {outcome.reason[:_MARKER_REASON_CHARS]}'
-    if isinstance(outcome, AuthFailed):
-        return f'auth_failed: HTTP {outcome.status}'
-    if isinstance(outcome, ModelNotFound):
-        return f'model_not_found: {outcome.reason[:_MARKER_REASON_CHARS]}'
-    if isinstance(outcome, OK):
-        # Preserve classify_invocation's OK short-circuit through the fallback
-        # below: a successful invocation is never an infra refusal.
-        return None
-    if getattr(result, 'api_error_status', None) == 429:
-        return 'api_error: HTTP 429'
-    # ServerError sits BELOW the 429 fallback, because a 5xx is never a 429
-    # and 429-body semantics must not move; it sits ABOVE the wedge branch so
-    # this ladder's order tracks classify_invocation's own CapHit/NearCap >
-    # ServerError > ZeroOutputWedge precedence (shared/src/shared/
-    # invocation_outcome.py:398, :523) — a SIGTERM-flushed 5xx on a
-    # watchdog-killed CLI is a provider outage, not a local wedge.
-    if isinstance(outcome, ServerError):
-        return f'server_error: HTTP {outcome.status}'
-    if isinstance(outcome, ZeroOutputWedge):
-        return 'wedge: zero-output timeout (no transcript turns)'
-    return None
+    """Transitional string form of :func:`measurement.classify_unmeasured`."""
+    u = classify_unmeasured(result, stage=MeasurementStage.ARCHITECT, backend=backend) if result is not None else None
+    return f'{u.cause.value}: {u.reason}' if u else None
 
 
 def compute_composite(m: EvalMetrics) -> float:
@@ -868,7 +773,7 @@ def compose_cost_source(primary: str, *, secondary_cost_usd: float) -> str:
     - *secondary_cost_usd* ``<= 0`` — no second component entered the sum, so
       the label describes the primary alone. This is every judge-SKIPPED
       architect branch (tainted, refused-with-a-plan, unscorable plan), plus
-      the defensive negative case: :func:`coerce_cost_usd` already floors a
+      the defensive negative case: :func:`~orchestrator.evals.measurement.coerce_cost_usd` already floors a
       nonsense figure to ``0.0`` upstream, and spend that did not happen must
       never MANUFACTURE a ``'mixed'`` label.
     - the two sources AGREE — that source. Today's architect cell is a native
@@ -897,62 +802,6 @@ def compose_cost_source(primary: str, *, secondary_cost_usd: float) -> str:
     if secondary_cost_usd <= 0.0:
         return primary
     return primary if primary == 'cli' else 'mixed'
-
-
-def coerce_cost_usd(value: object) -> float:
-    """Safely coerce an untrusted ``cost_usd``-shaped *value* to a valid,
-    non-negative float, defaulting to ``0.0`` for anything that is not one.
-
-    Amendment (eval-revival υ, reviewer robustness + design-coherence): the
-    ONE shared home for the "is this actually a usable dollar figure?"
-    check, used at BOTH the plan judge's producer boundary
-    (:class:`~orchestrator.evals.judge.PlanQualityVerdict` construction, all
-    four POST-invoke return paths) and the architect runner's defensive read
-    (``runner._verdict_cost_usd``) — so a Mock, ``None``, NaN, Infinity, or
-    negative value degrades to ``0.0`` in exactly ONE place rather than two
-    independently maintained checks that could drift apart. This closes the
-    gap where the dataclass declared ``cost_usd: float`` but only the
-    RUNNER's read enforced it — a second future consumer (a backfill
-    script, ``prompt_opt``, ``verdict.to_dict()`` persisted anywhere) reading
-    the verdict directly would otherwise inherit an untrusted value with no
-    guard, the same "the instrument's coherence rests on its ONE caller
-    remembering" shape task 3303 already closed for the scorability gate.
-
-    isinstance-gated rather than a bare ``float(value or 0.0)`` coercion:
-    ``unittest.mock.MagicMock`` configures ``__float__`` to return ``1.0`` by
-    default, so a naive ``float()`` call would silently FABRICATE a dollar
-    figure for any test double that never set the attribute (verified: a
-    bare ``MagicMock()``'s ``float()`` returns ``1.0`` without raising) —
-    the opposite of loud-over-silent-degradation, and worse than the status
-    quo it would replace. ``isinstance`` correctly recognizes an
-    unconfigured Mock (or ``None``, or any other non-numeric placeholder) as
-    "not a real number" and returns the honest ``0.0`` default instead. This
-    is also why the ~20 pre-existing judge tests that construct a bare
-    ``MagicMock`` invoke result and never set ``cost_usd`` need no changes:
-    they now read back ``cost_usd=0.0`` instead of a raw ``Mock`` instance,
-    and none of them asserted on the field's value either way.
-
-    A numeric-but-nonsense value (NaN, +/-Infinity, negative) is caught too
-    — any of them would otherwise poison every downstream sum
-    (``EvalMetrics.cost_usd = arch_cost_usd + judge_cost_usd``) and mean
-    (report.py's per-config cost aggregation), and ``json.dump`` emits bare
-    ``NaN``/``Infinity`` tokens that strict JSON consumers reject on the
-    persisted result file. Logged, per the loud-over-silent norm — the
-    caller still gets a usable ``0.0`` back, but an operator can see that an
-    invocation answered with a nonsense cost rather than the figure quietly
-    vanishing into a plausible-looking zero.
-    """
-    if not isinstance(value, (int, float)):
-        return 0.0
-    v = float(value)
-    if not math.isfinite(v) or v < 0.0:
-        logger.warning(
-            f'cost_usd coercion received a non-finite or negative value '
-            f'({v!r}) — degraded to 0.0 rather than poisoning a downstream '
-            f'sum/mean or persisting invalid JSON.'
-        )
-        return 0.0
-    return v
 
 
 async def collect_metrics(
