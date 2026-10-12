@@ -260,7 +260,7 @@ UNRESOLVED_CORROBORATION_SUBJECT: str = 'preservation_specimen_guard'
 UNRESOLVED_CORROBORATION_STREAK_THRESHOLD: int = 3
 
 #: ``StageReport.stats`` keys under which every Stage-1 pass records what it
-#: observed: the tasks it looked up, and the subset it could not corroborate.
+#: observed: its ``candidate_task_ids`` and ``unresolved_task_ids``.
 #: Later passes read them back from the journal to measure persistence.
 CANDIDATE_TASK_IDS_STAT: str = 'preservation_specimen_candidate_task_ids'
 UNRESOLVED_TASK_IDS_STAT: str = 'preservation_specimen_unresolved_task_ids'
@@ -402,8 +402,11 @@ class PreservationSuppressionResult:
       policy in :func:`filter_preservation_specimen_flags`), and this field is
       what stops that keep from being byte-identical to a clean "no citation
       exists" (INV-11).
-    - ``candidate_task_ids`` — tasks this pass looked up; a task's absence
-      means this pass says nothing about it.  Always a superset of
+    - ``candidate_task_ids`` — tasks this pass has an observation of: each
+      answered by a read, or left in ``unresolved_task_ids``.  A task is absent
+      when no stranded flag named it, or when its read failed but a
+      corroborated sibling suppressed every flag naming it — either way this
+      pass says nothing about it.  Always a superset of
       ``unresolved_task_ids``.
     """
 
@@ -922,13 +925,16 @@ async def filter_preservation_specimen_flags(
     # Disclose a degraded verdict only for a task that is actually LEFT
     # UNPROTECTED by it — one whose flags were kept.  A component whose read
     # failed alongside a sibling that DID corroborate changed no outcome, and
-    # reporting it would raise a false alarm about an unprotected specimen.
+    # reporting it would raise a false alarm about an unprotected specimen; nor
+    # is it a candidate, since this pass learned nothing about it.
+    unprotected = tuple(t for t in unresolved if t in kept_task_ids)
+    unobserved = set(unresolved).difference(unprotected)
     return PreservationSuppressionResult(
         kept_flags=kept,
         suppressed_by_task=suppressed_by_task,
         citations_by_task=citations_by_task,
-        unresolved_task_ids=tuple(t for t in unresolved if t in kept_task_ids),
-        candidate_task_ids=tuple(candidates),
+        unresolved_task_ids=unprotected,
+        candidate_task_ids=tuple(t for t in candidates if t not in unobserved),
     )
 
 
@@ -937,7 +943,7 @@ async def filter_preservation_specimen_flags(
 
 @dataclass(frozen=True)
 class _CorroborationObservation:
-    """What one past Stage-1 pass recorded: tasks looked up, and those left unresolved."""
+    """What one past Stage-1 pass recorded: tasks it observed, and those left unresolved."""
 
     candidates: frozenset[str]
     unresolved: frozenset[str]
@@ -1017,8 +1023,8 @@ def _unresolved_streaks(
 ) -> dict[str, int]:
     """``{task_id: streak}`` for each task in *unresolved*, counting this pass as 1.
 
-    Walks *prior* most-recent-first.  A pass with no observation, or one that
-    did not look the task up, says nothing about it and is skipped; a pass
+    Walks *prior* most-recent-first.  A pass with no observation, or none of
+    the task, says nothing about it and is skipped; a pass
     that left it unresolved extends the streak; a pass that resolved it ends
     the walk.  Pure, sync, no I/O.
     """

@@ -1330,11 +1330,25 @@ class TestDegradedCorroborationReads:
         assert preservation_specimen_guard._is_degraded_entity_result(entity) is False
 
 
+def _memory_corroborating_3105_failing_for(task_id):
+    """Task 3105 corroborates through Mem0; *task_id*'s Mem0 read times out."""
+    def _scroll(project_id, filters):
+        if filters['task_id'] == task_id:
+            raise TimeoutError('down')
+        return {'3105': [LIVE_MEM0_ROW]}.get(filters['task_id'], [])
+
+    memory_service = MagicMock()
+    memory_service.get_memories_by_metadata = AsyncMock(side_effect=_scroll)
+    memory_service.get_entity = AsyncMock(return_value={'nodes': [], 'edges': []})
+    return memory_service
+
+
 class TestCandidateTaskIds:
-    """The result records which tasks the pass looked up at all.
+    """The result records which tasks the pass has an observation of.
 
     A later pass reads this to tell "this task was flagged and resolved" apart
-    from "this task was not flagged", which ``unresolved_task_ids`` alone cannot.
+    from "this pass says nothing about this task", which
+    ``unresolved_task_ids`` alone cannot.
     """
 
     @pytest.mark.asyncio
@@ -1366,6 +1380,22 @@ class TestCandidateTaskIds:
         assert result.candidate_task_ids == ()
         assert memory_service.get_memories_by_metadata.await_count == 0
         assert memory_service.get_entity.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_a_failed_read_hidden_by_a_corroborated_sibling_is_not_a_candidate(self):
+        """5080's read failed and no flag naming it was kept: this pass learned nothing.
+
+        Recording it as a candidate would read back as "flagged and resolved",
+        resetting a streak the pass holds no evidence about.
+        """
+        result = await filter_preservation_specimen_flags(
+            memory_service=_memory_corroborating_3105_failing_for('5080'),
+            project_id=PROJECT,
+            flags=[_stranded_flag(task_id='3105,5080')],
+        )
+
+        assert result.candidate_task_ids == ('3105',)
+        assert result.unresolved_task_ids == ()
 
     @pytest.mark.asyncio
     async def test_unresolved_ids_are_always_candidates_on_a_degraded_pass(self):
@@ -1981,6 +2011,29 @@ class TestUnresolvedCorroborationPersistence:
         assert escalated == [UNRESOLVED_CORROBORATION_SUBJECT]
 
     @pytest.mark.asyncio
+    async def test_a_failed_read_behind_a_corroborated_sibling_does_not_reset_it(self, queue):
+        """A lost read only bridges a gap, even when a sibling's citation hid the flag."""
+        hidden = await filter_preservation_specimen_flags(
+            memory_service=_memory_corroborating_3105_failing_for('5080'),
+            project_id=PROJECT,
+            flags=[_stranded_flag(task_id='3105,5080')],
+        )
+        history = [
+            *_unresolved_passes('5080', count=1, start=1),
+            _prior_run(
+                'hidden-by-sibling', minutes_ago=20,
+                candidates=hidden.candidate_task_ids, unresolved=hidden.unresolved_task_ids,
+            ),
+            *_unresolved_passes('5080', count=self._K - 2, start=3),
+        ]
+
+        escalated = await self._escalate(
+            queue, _unresolved_result('5080'), _StubJournal(history),
+        )
+
+        assert escalated == [UNRESOLVED_CORROBORATION_SUBJECT]
+
+    @pytest.mark.asyncio
     async def test_a_malformed_observation_never_counts_toward_the_streak(self, queue):
         """A missing or garbled observation can delay a filing, never cause one."""
         history = [
@@ -2341,17 +2394,8 @@ class TestCompositeFlagTaskIds:
         The citation WAS resolved, so the task is not unresolved — degradation
         is only disclosed when it actually changed the verdict.
         """
-        def _scroll(project_id, filters):
-            if filters['task_id'] == '5080':
-                raise TimeoutError('down')
-            return {'3105': [LIVE_MEM0_ROW]}.get(filters['task_id'], [])
-
-        memory_service = MagicMock()
-        memory_service.get_memories_by_metadata = AsyncMock(side_effect=_scroll)
-        memory_service.get_entity = AsyncMock(return_value={'nodes': [], 'edges': []})
-
         result = await filter_preservation_specimen_flags(
-            memory_service=memory_service,
+            memory_service=_memory_corroborating_3105_failing_for('5080'),
             project_id=PROJECT,
             flags=[_stranded_flag(task_id='3105,5080')],
         )
