@@ -1498,3 +1498,55 @@ def test_coder_runs_standalone_and_takes_a_project_root():
 
     assert completed.returncode == 0, completed.stderr
     assert "--project-root" in completed.stdout
+
+
+# ---------------------------------------------------------------------------
+# task 5791: the reply build_prompt prescribes is the reply code_digest reads.
+# ---------------------------------------------------------------------------
+
+
+def _prescribed_reply():
+    prompt = mod.build_prompt("digest text", "codebook index", invariant_slugs=_NO_SLUGS)
+    [line] = [line for line in prompt.splitlines() if line.startswith("{")]
+    return json.loads(line)
+
+
+def _filled(field, value):
+    if value != "...":
+        return value
+    if field == "entry_id":
+        return "one-shot-subagent-contract"
+    if field.endswith("_phase"):
+        return "unknown"
+    return f"populated {field}"
+
+
+def test_a_reply_shaped_as_the_prompt_prescribes_reaches_the_merger():
+    reply = {
+        key: [{field: _filled(field, value) for field, value in item.items()} for item in items]
+        for key, items in _prescribed_reply().items()
+    }
+    populated = [
+        value
+        for items in reply.values()
+        for item in items
+        for value in item.values()
+        if isinstance(value, str) and value.startswith("populated ")
+    ]
+
+    result = mod.code_digest(
+        _hand_digest(_SESSION_ID, "marker"), _tiny_codebook(), project="dark_factory",
+        invariant_slugs=_NO_SLUGS, invoke=lambda prompt, model: json.dumps(reply),
+    )
+
+    assert result.ok, result.reason
+    assert result.record is not None
+    merged, stats = codebook_mod.apply_coding_record(
+        _tiny_codebook(), result.record, invariant_slugs=(),
+    )
+    assert stats["record_invalid"] is False
+    assert stats["matched"] == 1
+    assert stats["candidates_applied"] == 1
+    merged_text = json.dumps(merged)
+    assert populated
+    assert [value for value in populated if value not in merged_text] == []
