@@ -1433,8 +1433,10 @@ _UUID_MEANS_LOAD = (
 # second method. A test importing these constants can enforce the invariant; two
 # docstrings promising each other cannot. The ordering itself is defined once, by
 # _PROVENANCE_RANK_KEYS below: the Cypher ORDER BY and the Python _survivor_first
-# are both renderings of it, and tests/test_write_time_identity.py's live class
-# checks that they agree on a real server.
+# are both renderings of it. The default test run checks the Python sort against
+# openCypher's ORDER BY semantics; only `-m integration` runs
+# tests/test_write_time_identity.py::TestEnumerateRankedEntityNodesLiveFalkorDB,
+# which checks the two agree on a real server.
 _PROVENANCE_RANK_CLAUSE = (
     'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL '
     'WITH n, count(DISTINCT e) AS edge_count '
@@ -1465,19 +1467,50 @@ _PROVENANCE_RANK_ORDER = 'ORDER BY ' + ', '.join(
 )
 
 
+class SurvivorRankTypeError(TypeError):
+    """A survivor-rank column whose non-NULL values mix types Python cannot
+    order against each other, although Cypher's ORDER BY would.
+
+    ``column`` and ``value_types`` (sorted type names) are required keyword
+    arguments, carried as fields for the reason ``AmbiguousEntityError``
+    carries its own.
+    """
+
+    def __init__(self, *, column: str, value_types: Iterable[str]) -> None:
+        self.column = column
+        self.value_types = tuple(sorted(value_types))
+        super().__init__(
+            f'cannot rank rows survivor-first by {column!r}: its non-NULL values '
+            f'mix the types {list(self.value_types)}'
+        )
+
+
 def _survivor_first(rows: list[dict]) -> list[dict]:
     """Return *rows* in ``_PROVENANCE_RANK_ORDER``'s order, survivor first.
 
     One stable pass per key, least significant first. NULL sorts as the
     largest value, openCypher's rule and FalkorDB's (measured 2026-10-12): last
     under ASC, first under DESC.
+
+    Raises:
+        SurvivorRankTypeError: a key column mixes non-NULL value types.
     """
     ordered = list(rows)
     for key in reversed(_PROVENANCE_RANK_KEYS):
-        ordered.sort(
-            key=lambda row, column=key.column: (row[column] is None, row[column]),
-            reverse=key.descending,
-        )
+        try:
+            ordered.sort(
+                key=lambda row, column=key.column: (row[column] is None, row[column]),
+                reverse=key.descending,
+            )
+        except TypeError as exc:
+            raise SurvivorRankTypeError(
+                column=key.column,
+                value_types={
+                    type(row[key.column]).__name__
+                    for row in ordered
+                    if row[key.column] is not None
+                },
+            ) from exc
     return ordered
 
 

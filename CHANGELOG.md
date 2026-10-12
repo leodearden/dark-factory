@@ -532,11 +532,18 @@ its two reads is gone.
   `total_unconfirmed` and per-graph `unconfirmed`, and the summary line loses its
   `unconfirmed=` token. This supersedes the "two reads disagreeing" paragraph of
   the task-5264 entry above.
-- `nodes_scanned` now counts same-group nodes only.
+- `nodes_scanned` now counts same-group nodes only. A node whose `group_id`
+  property names another project (task 2115's leak) is out of the census's
+  scope and is counted nowhere in its output. The deleted `unconfirmed` count
+  was the census's only trace of such a node. A separate read-only leak
+  detector is proposed as follow-up ticket `tkt_0RVQ5JNVSFM3WGVERS1Q2BEHZ0`.
 - The survivor ordering is now one structured spec in `graphiti_client.py`,
   `_PROVENANCE_RANK_KEYS`, rendered both as the shared Cypher `ORDER BY`
-  (unchanged text) and as the Python sort. A live-FalkorDB test checks that the
-  two agree.
+  (unchanged text) and as the Python sort. A unit test checks the Python sort
+  against openCypher's `ORDER BY` semantics. A live-FalkorDB test, run only
+  with `-m integration`, checks that the two agree on a real server. A rank
+  column whose non-NULL values mix types that Python cannot compare fails that
+  graph with `SurvivorRankTypeError`, which names the column and the types.
 
 #### Store preflight refuses an existing-but-empty target, not just a missing one (task 5468)
 

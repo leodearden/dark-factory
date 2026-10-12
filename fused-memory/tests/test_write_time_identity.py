@@ -20,6 +20,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
+import itertools
+import random
 import uuid
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
@@ -42,6 +45,7 @@ from fused_memory.backends.graphiti_client import (
     _PROVENANCE_RANK_ORDER,
     AmbiguousEntityError,
     GraphitiBackend,
+    SurvivorRankTypeError,
     _MultiTenantFalkorDriver,
 )
 from fused_memory.utils.task_naming import task_node_referent
@@ -1031,6 +1035,26 @@ def _ranked_dict(row: list) -> dict:
     return dict(zip(keys, row, strict=True))
 
 
+def _null_largest(x, y) -> int:
+    if x == y:
+        return 0
+    if x is None:
+        return 1
+    if y is None:
+        return -1
+    return -1 if x < y else 1
+
+
+def _cypher_order_by(a: dict, b: dict) -> int:
+    """`ORDER BY provenance_rank DESC, n.created_at ASC, n.uuid ASC` as openCypher
+    reads it: one key at a time, NULL comparing larger than any value."""
+    return (
+        -_null_largest(a['provenance_rank'], b['provenance_rank'])
+        or _null_largest(a['created_at'], b['created_at'])
+        or _null_largest(a['uuid'], b['uuid'])
+    )
+
+
 def _page_and_census_cypher(graph: MagicMock) -> tuple[str, str]:
     cyphers = [extract_cypher(c) for c in graph.ro_query.call_args_list]
     (census,) = {c for c in cyphers if c.rstrip().endswith('RETURN count(*)')}
@@ -1156,12 +1180,48 @@ class TestEnumerateRankedEntityNodes:
 
         graph.query.assert_not_awaited()
 
-    def test_the_shared_survivor_order_clause_is_unchanged(self):
-        """Both destructive rankers embed this text verbatim; the Python sorter
-        must be a second rendering of it, never a reason to change it."""
-        assert _PROVENANCE_RANK_ORDER == (
-            'ORDER BY provenance_rank DESC, n.created_at ASC, n.uuid ASC'
-        )
+    @pytest.mark.asyncio
+    async def test_survivor_order_is_cyphers_order_by_over_null_and_tied_keys(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """Every combination of tied rank, tied and NULL created_at, twice over,
+        with uuids assigned independently of both — against the comparator
+        spelled straight from the ORDER BY the destructive rankers emit."""
+        combos = list(itertools.product(
+            (0, 3, 5), (None, '2026-01-01T00:00:00Z', '2026-02-01T00:00:00Z'), (1, 2),
+        ))
+        random.Random(5662).shuffle(combos)
+        rows = [
+            {
+                'uuid': f'u{i:02d}', 'name': f'Task {i}', 'created_at': created_at,
+                'edge_count': rank, 'mentions_count': 0, 'provenance_rank': rank,
+            }
+            for i, (rank, created_at, _copy) in enumerate(combos)
+        ]
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([list(row.values()) for row in rows])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        ranked, _ = await backend.enumerate_ranked_entity_nodes(group_id='home', page_size=4)
+
+        assert ranked == sorted(rows, key=functools.cmp_to_key(_cypher_order_by))
+
+    @pytest.mark.asyncio
+    async def test_a_rank_column_mixing_value_types_fails_naming_column_and_types(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([
+            ['a', 'Task 1', '2026-01-01T00:00:00Z', 1, 0, 1],
+            ['b', 'Task 2', 1767225600, 1, 0, 1],
+        ])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        with pytest.raises(SurvivorRankTypeError) as raised:
+            await backend.enumerate_ranked_entity_nodes(group_id='home')
+
+        assert raised.value.column == 'created_at'
+        assert raised.value.value_types == ('int', 'str')
 
 
 @pytest_asyncio.fixture
