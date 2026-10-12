@@ -2935,6 +2935,19 @@ class TestARcOneWithoutAVerdictIsUnverifiable:
         assert _PROBE_COMMON.stem in proc.stdout, proc.stdout
         assert 'FAIL  item 1  the judge path does NOT bind' not in proc.stdout, proc.stdout
 
+    def test_a_missing_probe_helper_fails_item_5_unverifiable(self, tmp_path):
+        """Item 5's twin. Item 1 fails the same way on this repo, so the module
+        name is looked for in item 5's own block, not anywhere in stdout."""
+        repo = self._repo(tmp_path)
+        (repo / 'scripts' / _PROBE_COMMON.name).unlink()
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert f'{_ITEM5_FAIL}  {_UNVERIFIABLE}' in proc.stdout, proc.stdout
+        assert _PROBE_COMMON.stem in _item5_note(proc.stdout), proc.stdout
+        assert 'FAIL  item 5  the judge-bound candidate is NOT consumed' not in proc.stdout, (
+            proc.stdout
+        )
+
     def test_a_real_not_held_verdict_still_reads_as_one(self, tmp_path):
         """The control: the new arm must not swallow a verdict the probe made."""
         repo = _make_gate_repo(
