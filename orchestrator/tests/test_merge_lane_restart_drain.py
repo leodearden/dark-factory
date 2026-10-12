@@ -77,6 +77,7 @@ async def _request(scene: _Scene, name: str, *, lane: str = 'normal') -> MergeRe
         config=scene.config,
         result=asyncio.get_running_loop().create_future(),
         lane='high' if lane == 'high' else 'normal',
+        awaited_by_workflow=True,
     )
 
 

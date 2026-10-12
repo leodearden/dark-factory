@@ -104,6 +104,8 @@ def _make_request(
     branch: str,
     worktree: Path,
     config: OrchestratorConfig,
+    *,
+    awaited_by_workflow: bool = False,
 ) -> MergeRequest:
     """Build a MergeRequest with a fresh Future for the running event loop.
 
@@ -120,6 +122,7 @@ def _make_request(
         config=config,
         result=asyncio.get_running_loop().create_future(),
         lane='normal',
+        awaited_by_workflow=awaited_by_workflow,
     )
 
 
@@ -2585,9 +2588,9 @@ class TestCoalesceSupersededRetiresRegistry:
             git_ops, queue, train_callback_factory=_stub_train_callback_factory,
         )
 
-        req1 = _make_request('kc1', 'kc1', wt1, coalesce_cfg)
-        req2 = _make_request('kc2', 'kc2', wt2, coalesce_cfg)
-        req3 = _make_request('kc3', 'kc3', wt3, coalesce_cfg)
+        req1 = _make_request('kc1', 'kc1', wt1, coalesce_cfg, awaited_by_workflow=True)
+        req2 = _make_request('kc2', 'kc2', wt2, coalesce_cfg, awaited_by_workflow=True)
+        req3 = _make_request('kc3', 'kc3', wt3, coalesce_cfg, awaited_by_workflow=True)
         for req in (req1, req2, req3):
             worker._register_item(req, initial=ItemLifecycleState.LANE_BUFFERED)
         worker._lane_buffers['normal'].extend([req1, req2, req3])
