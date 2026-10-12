@@ -201,7 +201,7 @@ from fused_memory.services.consolidation_ops import (
     patch_memory_metadata,
     read_topic_closure,
 )
-from fused_memory.services.memory_service import MemoryService
+from fused_memory.services.memory_service import MemoryService, metadata_row_text
 from fused_memory.services.read_telemetry import (
     fallback_search_summary,
     summarize_search_query,
@@ -6602,7 +6602,7 @@ def create_mcp_server(
         if topic_cluster_store is not None:
             member_rows = closure.members if isinstance(closure.members, list) else []
             member_texts = [
-                row.get('content')
+                metadata_row_text(row)
                 for row in member_rows
                 if isinstance(row, dict) and row.get('id') != canonical_id
             ]
