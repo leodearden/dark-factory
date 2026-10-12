@@ -2240,6 +2240,11 @@ WORKER_DEATH_SUMMARY_MARKER = 'session aborted after worker death'
 _NO_VERDICT_SUMMARY_MARKERS = (SIGNAL_KILL_SUMMARY_MARKER, WORKER_DEATH_SUMMARY_MARKER)
 
 
+def is_no_verdict_summary(summary: str) -> bool:
+    """True when *summary* carries a no-verdict note — a signal-killed leg or an xdist-truncated session — so it records no verdict on the code."""
+    return any(marker in summary for marker in _NO_VERDICT_SUMMARY_MARKERS)
+
+
 def _killed_leg_note(label: str, rc: int, duration: float | None) -> str:
     """Describe a leg that was terminated by an external signal.
 
