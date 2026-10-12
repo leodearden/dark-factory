@@ -19,8 +19,8 @@ import os
 import re
 import sys
 import tempfile
-from collections.abc import Callable, Collection, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Collection, Iterable, Mapping
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 
 import yaml
@@ -616,6 +616,85 @@ class SlugTally:
         )
 
 
+@dataclass(frozen=True)
+class MergeCounts:
+    """What merged coding records did, op by op. The field names are the keys
+    of the `codebook.py apply` summary line."""
+
+    matched: int = 0
+    candidates_applied: int = 0
+    candidate_disposition_conflicts: int = 0
+    corrections_applied: int = 0
+    correction_skipped: int = 0
+    skipped_unknown_entry: int = 0
+
+    def plus(self, other: MergeCounts) -> MergeCounts:
+        return MergeCounts(
+            **{f.name: getattr(self, f.name) + getattr(other, f.name) for f in fields(self)}
+        )
+
+    @property
+    def mutations(self) -> int:
+        """The ops that wrote the codebook: every appended sighting (a recurrence
+        on an adjudicated title included) and every correction."""
+        return (
+            self.matched
+            + self.candidates_applied
+            + self.candidate_disposition_conflicts
+            + self.corrections_applied
+        )
+
+
+@dataclass(frozen=True)
+class SkippedRecord:
+    """A record a merge left out whole: its position in the batch, its
+    session when it has one, and why."""
+
+    index: int
+    session: str | None
+    reason: str
+
+    @classmethod
+    def of(cls, index: int, record: object, reason: str) -> SkippedRecord:
+        session = record.get("session") if isinstance(record, dict) else None
+        return cls(index=index, session=session if isinstance(session, str) else None, reason=reason)
+
+    def describe(self) -> str:
+        return f"session={self.session}: {self.reason}"
+
+
+@dataclass(frozen=True)
+class MergeResult:
+    """One batch merged by `apply_coding_records`.
+
+    `merged_records` are the records that went through the merge, in batch
+    order, an already-absorbed re-apply included; `skipped_deletions` and
+    `invalid_records` are the ones left out; `counts` and `invariant_slugs` sum
+    over the merged ones.
+    """
+
+    codebook: dict
+    counts: MergeCounts = MergeCounts()
+    merged_records: tuple[dict, ...] = ()
+    skipped_deletions: tuple[SkippedRecord, ...] = ()
+    invalid_records: tuple[SkippedRecord, ...] = ()
+    invariant_slugs: SlugTally = SlugTally()
+
+    @property
+    def mutated(self) -> bool:
+        return self.counts.mutations > 0
+
+    def summary(self) -> str:
+        values = {f.name: getattr(self.counts, f.name) for f in fields(self.counts)}
+        values.update(
+            record_invalid=len(self.invalid_records),
+            deletion_directive=len(self.skipped_deletions),
+            invariant_slugs_valid=self.invariant_slugs.valid,
+            invariant_slugs_rejected=len(self.invariant_slugs.rejected),
+        )
+        return " ".join(f"{key}={value}" for key, value in values.items())
+
+
 def screen_invariant_slugs(
     record: dict, invariant_slugs: Collection[str]
 ) -> tuple[dict, SlugTally]:
@@ -676,6 +755,51 @@ def warn_unknown_invariant_slugs(
         "codebook: run %s stored %d invariant_violated value(s) as absent "
         "because they name no declared invariant slug: %s; declared slugs: %s",
         run, len(tally.rejected), _bounded_rejected_slugs(tally.rejected), declared,
+    )
+
+
+def apply_coding_records(
+    codebook: dict, records: Iterable[dict], *, invariant_slugs: Collection[str]
+) -> MergeResult:
+    """Merge a batch of §7.3 coding records into a copy of *codebook*.
+
+    Never mutates or aliases *codebook* and never raises NeverDeleteError: a
+    deletion-shaped record lands in `skipped_deletions` and one failing
+    `validate_coding_record` in `invalid_records`, each skipped whole while the
+    rest of the batch merges. Raises ValueError for a non-dict *codebook*.
+    """
+    if not isinstance(codebook, dict):
+        raise ValueError(
+            "apply_coding_records: expected a dict-shaped codebook, got "
+            f"{type(codebook).__name__} (empty or malformed YAML file?)"
+        )
+    merge = MergeResult(codebook=copy.deepcopy(codebook))
+    for index, record in enumerate(records):
+        merge = _merge_next(merge, index, record, invariant_slugs)
+    return merge
+
+
+def _merge_next(
+    merge: MergeResult, index: int, record: dict, invariant_slugs: Collection[str]
+) -> MergeResult:
+    try:
+        codebook, stats = apply_coding_record(
+            merge.codebook, record, invariant_slugs=invariant_slugs
+        )
+    except NeverDeleteError as exc:
+        skipped = SkippedRecord.of(index, record, str(exc))
+        return replace(merge, skipped_deletions=(*merge.skipped_deletions, skipped))
+    if stats["record_invalid"]:
+        reason = "; ".join(validate_coding_record(record))
+        skipped = SkippedRecord.of(index, record, reason)
+        return replace(merge, invalid_records=(*merge.invalid_records, skipped))
+    counts = MergeCounts(**{f.name: stats[f.name] for f in fields(MergeCounts)})
+    return replace(
+        merge,
+        codebook=codebook,
+        counts=merge.counts.plus(counts),
+        merged_records=(*merge.merged_records, record),
+        invariant_slugs=merge.invariant_slugs.plus(stats["invariant_slugs"]),
     )
 
 
