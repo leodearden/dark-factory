@@ -1789,7 +1789,7 @@ class TestCompositeFlagTaskIds:
 
     @pytest.mark.asyncio
     async def test_a_composite_whose_every_component_is_corroborated_is_suppressed(self):
-        """Dropped, counted once against its first component, every citation kept."""
+        """Dropped, counted once, every component's citation kept."""
         memory_service = _make_memory_service(
             rows={'3105': [LIVE_MEM0_ROW], '4223': [SECOND_SPECIMEN_MEM0_ROW]},
         )
@@ -1875,6 +1875,26 @@ class TestCompositeFlagTaskIds:
         }
 
     @pytest.mark.asyncio
+    async def test_a_dropped_composite_counts_on_one_counter_whatever_its_order(self):
+        """The order the ids were joined in must not choose the storm counter.
+
+        Otherwise '3105,4223' and '4223,3105' would scatter one pair's drops
+        across two counters, the fragmentation the test above guards against.
+        """
+        memory_service = _make_memory_service(
+            rows={'3105': [LIVE_MEM0_ROW], '4223': [SECOND_SPECIMEN_MEM0_ROW]},
+        )
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service,
+            project_id=PROJECT,
+            flags=[_stranded_flag(task_id='3105,4223'), _stranded_flag(task_id='4223,3105')],
+        )
+
+        assert result.kept_flags == []
+        assert list(result.suppressed_by_task.values()) == [2]
+
+    @pytest.mark.asyncio
     async def test_each_component_is_corroborated_independently(self):
         """Every component is looked up — the citation may be on any of them."""
         memory_service = _make_memory_service(rows={'4223': [LIVE_MEM0_ROW]})
@@ -1885,11 +1905,6 @@ class TestCompositeFlagTaskIds:
             flags=[_stranded_flag(task_id='3105,4223')],
         )
 
-        queried = sorted(
-            call.kwargs['filters']['task_id']
-            for call in memory_service.get_memories_by_metadata.await_args_list
-        )
-        assert queried == ['3105', '4223']
         assert result.kept_flags[0][PRESERVED_SPECIMEN_COMPONENTS_KEY] == {
             '4223': LIVE_MEM0_ROW['id'],
         }

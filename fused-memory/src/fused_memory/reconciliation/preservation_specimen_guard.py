@@ -415,8 +415,10 @@ class PreservationSuppressionResult:
       as an annotated COPY (the module docstring's COMPOSITE TASK IDS); every
       other kept flag is the input object itself.
     - ``suppressed_by_task`` — ``{task_id: count}`` of flags dropped, each
-      counted ONCE, against its first component, so its ``values()`` sum is
-      the per-cycle ``preservation_specimen_suppressed`` stat.  It drives the
+      counted ONCE, so its ``values()`` sum is the per-cycle
+      ``preservation_specimen_suppressed`` stat.  A composite counts against
+      its least component in string order, never the first-written one, so
+      every ordering of the same ids lands on one counter.  It drives the
       storm escape.
     - ``citations_by_task`` — ``{task_id: citation_ref}``, the Mem0 memory id or
       Graphiti uuid of every component citation a drop relied on.  A drop is never
@@ -906,8 +908,8 @@ async def filter_preservation_specimen_flags(
                 flag.get('flag_type'), flag.get('task_id'), project_id, citations,
             )
         else:
-            first = task_ids[0]
-            suppressed_by_task[first] = suppressed_by_task.get(first, 0) + 1
+            counted_against = min(task_ids)
+            suppressed_by_task[counted_against] = suppressed_by_task.get(counted_against, 0) + 1
             citations_by_task.update(citations)
             log.info(
                 'preservation_specimen_guard: suppressed flag_type=%r (task_id=%r) in '
