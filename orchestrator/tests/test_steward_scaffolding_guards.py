@@ -1100,6 +1100,15 @@ _ADJUDICATED_TMP_PROJECT_ROOT_LITERALS: dict[str, _Adjudicated] = {
             'family'
         ),
     ),
+    'test_verify_admission_call_sites.py': _Adjudicated(
+        sites=1,
+        reason=(
+            'same ReviewCheckpoint `/tmp/pytest`-guard family as '
+            'test_review_checkpoint_cap.py: its review-checkpoint call-site '
+            'spy builds a real ReviewCheckpoint, whose _run_review refuses any '
+            'tmp_path project_root (task 5628, esc-5628-1)'
+        ),
+    ),
 }
 
 

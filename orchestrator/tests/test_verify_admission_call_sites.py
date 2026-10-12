@@ -15,7 +15,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _orch_helpers import (
     MOCK_WORKFLOW_PROJECT_ROOT,
-    _init_harness_state_for_test,
     pydantic_spec,
     stamp_stock_routing_config,
 )
@@ -153,16 +152,10 @@ class _StopMergePhase(Exception):
     """Raised by the merge-phase re-verify spy to unwind before the merge submit."""
 
 
-def _sweep_harness(event_store: _RecordingEventStore) -> Harness:
-    harness = Harness.__new__(Harness)
-    _init_harness_state_for_test(harness)
-    harness.config = OrchestratorConfig()
+def _sweep_harness(tmp_path: Path, event_store: _RecordingEventStore) -> Harness:
+    harness = Harness(OrchestratorConfig(project_root=tmp_path))
     harness.git_ops = MagicMock()
     harness.git_ops.get_main_sha = AsyncMock(return_value='b' * 40)
-    harness._last_swept_main_sha = None
-    harness._run_store = None
-    harness._main_sweep_cold_control = None
-    harness._close_superseded_main_sweep_escalations = AsyncMock()  # type: ignore[method-assign]
     harness.event_store = event_store  # type: ignore[assignment]
     return harness
 
@@ -206,9 +199,7 @@ async def test_post_rebase_reverify_carries_task_id_and_event_store(tmp_path, mo
     store = _RecordingEventStore()
     workflow = _workflow_on_real_lane(tmp_path, store)
     workflow._maybe_defer_as_train_member = AsyncMock(return_value=None)  # type: ignore[method-assign]
-    workflow._enter_phase = MagicMock()  # type: ignore[method-assign]
     workflow._check_scope_invariant = AsyncMock(return_value=None)  # type: ignore[method-assign]
-    workflow._recover_before_merge = AsyncMock(return_value=None)  # type: ignore[method-assign]
     workflow.git_ops.get_main_sha = AsyncMock(return_value='mainsha')  # type: ignore[method-assign]
     workflow.git_ops.rebase_onto_main = AsyncMock(return_value=True)  # type: ignore[method-assign]
     verify = AsyncMock(side_effect=_StopMergePhase)
@@ -226,9 +217,9 @@ async def test_post_rebase_reverify_carries_task_id_and_event_store(tmp_path, mo
 
 
 @pytest.mark.asyncio
-async def test_main_tip_sweep_records_on_the_harness_event_store():
+async def test_main_tip_sweep_records_on_the_harness_event_store(tmp_path):
     store = _RecordingEventStore()
-    harness = _sweep_harness(store)
+    harness = _sweep_harness(tmp_path, store)
 
     async def _passing_sweep(config, git_ops, *, main_sha, **kwargs):
         return (main_sha, _PASSED)
