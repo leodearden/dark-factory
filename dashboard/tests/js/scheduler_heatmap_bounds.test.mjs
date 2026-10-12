@@ -158,6 +158,31 @@ const COLUMN_FIXTURE = [
   makeModule('src/d/idle.py', 0),
 ];
 
+// scheduler.py::_module_contention_counts's sort, reproduced so a fixture
+// arrives in the order the client really receives.
+function serverSorted(modules) {
+  return modules.slice().sort((a, b) =>
+    (b.contention - a.contention) || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+}
+
+// The two stranded-lock shapes a column is rescued for (lockIsStranded).
+function strandedPark(path) {
+  return makeModule(path, 0, {
+    parked_by: 'T-dead',
+    parked_owner_live: false,
+    park_stack: [{ owner: 'T-dead', live: false }],
+    has_dead_park: true,
+  });
+}
+
+function departedHolder(path, contention) {
+  return makeModule(path, contention, {
+    holder: 'T-gone',
+    holder_project: 'dark_factory',
+    holder_live: false,
+  });
+}
+
 test('column selection keeps contended modules and drops uncontended ones', () => {
   // `contention` counts LIVE WAITERS. A module held by exactly one task has no
   // contention to show — it is a column of one coloured cell and 59 blanks,
@@ -433,10 +458,11 @@ test('row selection keeps a parked row even when it touches no surviving module'
 test('row selection puts parked rows FIRST and keeps the rest in server order', () => {
   // The row axis's only ordering guarantee, stated executably — the column
   // axis has had one since `column selection preserves the input order`, and
-  // the "showing N of M" caption in scheduler_heatmap.jsx is written against
-  // this. Note what is NOT claimed: nothing orders rows by contention, which
-  // is why the caption's most-contended superlative sits on the COLUMN axis
-  // alone. Parked first is what makes the carve-out survive the cap (below).
+  // the "showing N of M" caption is written against this. Note what is NOT
+  // claimed: nothing orders rows by contention, which is why the caption's
+  // most-contended superlative sits on the COLUMN axis alone. Parked first is
+  // what makes the carve-out survive the cap (below); the rest follow the
+  // tier of rows waiting on a rescued column, empty in this fixture.
   const rows = [
     makeRow('T-1', ['src/a/hot.py']),
     makeRow('T-2', ['src/b/warm.py']),
@@ -446,6 +472,20 @@ test('row selection puts parked rows FIRST and keeps the rest in server order', 
   const out = boundHeatmapAxes({ rows, modules: COLUMN_FIXTURE });
 
   assert.deepEqual(out.rows.map(r => r.task_id), ['T-parked', 'T-1', 'T-2', 'T-3']);
+});
+
+test('row selection: parked rows first, then rows waiting on a rescued column, then the rest in server order', () => {
+  // A row blocked on a stranded lock is as stuck as a parked one.
+  const modules = serverSorted([...COLUMN_FIXTURE, departedHolder('src/k/ghost.py', 1)]);
+  const rows = [
+    makeRow('T-1', ['src/a/hot.py']),
+    makeRow('T-blocked', ['src/k/ghost.py']),
+    makeRow('T-parked', ['src/c/solo.py'], { park_state: { modules: ['src/c/solo.py'] } }),
+    makeRow('T-2', ['src/b/warm.py']),
+  ];
+  const out = boundHeatmapAxes({ rows, modules });
+
+  assert.deepEqual(out.rows.map(r => r.task_id), ['T-parked', 'T-blocked', 'T-1', 'T-2']);
 });
 
 test('row selection drops a row that reaches a surviving module only across projects', () => {
@@ -633,30 +673,6 @@ test('BOUND: a parked row survives the cap even when ordinary rows would fill it
 // modules the head did not reach — the column-axis twin of 'BOUND: a parked
 // row survives the cap even when ordinary rows would fill it'.
 
-// scheduler.py::_module_contention_counts's sort, reproduced so a fixture
-// arrives in the order the client really receives.
-function serverSorted(modules) {
-  return modules.slice().sort((a, b) =>
-    (b.contention - a.contention) || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-}
-
-function strandedPark(path) {
-  return makeModule(path, 0, {
-    parked_by: 'T-dead',
-    parked_owner_live: false,
-    park_stack: [{ owner: 'T-dead', live: false }],
-    has_dead_park: true,
-  });
-}
-
-function departedHolder(path, contention) {
-  return makeModule(path, contention, {
-    holder: 'T-gone',
-    holder_project: 'dark_factory',
-    holder_live: false,
-  });
-}
-
 const STRANDED_PARK_PATH = 'src/stranded/park.py';
 const DEPARTED_HOLDER_PATH = 'src/stranded/ghost.py';
 
@@ -767,4 +783,43 @@ test('rescued columns never take more than MAX_RESCUED_COLS slots', () => {
   assert.equal(out.modulesRescued, MAX_RESCUED_COLS);
   assert.equal(out.modules.length, MAX_HEATMAP_COLS);
   assert.deepEqual(out.modules.slice(0, headLen), contended.slice(0, headLen));
+});
+
+test('BOUND: a row waiting on a rescued column survives the row cap', () => {
+  // Without this the rescued column renders as 60 blank cells: on the live
+  // 2026-10-12 payload only 1 of 5 rescued columns had a coloured cell, its
+  // waiters sitting ~2,208th of 2,223 touching rows.
+  const ordinary = Array.from({ length: MAX_HEATMAP_ROWS + 5 }, (_, i) =>
+    makeRow(`T-ord-${i}`, ['src/wide/mod0.py']),
+  );
+  const out = boundHeatmapAxes({
+    rows: [...ordinary, makeRow('T-blocked', ['src/k/ghost.py'])],
+    modules: [...contendedColumns(MAX_HEATMAP_COLS + 5), departedHolder('src/k/ghost.py', 1)],
+  });
+
+  assert.equal(out.rows.length, MAX_HEATMAP_ROWS, 'the cap still binds');
+  assert.ok(out.rows.map(r => r.task_id).includes('T-blocked'));
+});
+
+test('BOUND: on a live-shaped snapshot every rescued column has a rendered row that colours it', () => {
+  realisticFixture = realisticFixture
+    || makeFixture({ nRows: LIVE_ROWS, nModules: LIVE_MODULES, dense: false });
+  const rows = [
+    ...realisticFixture.rows,
+    makeRow('T-dead', [STRANDED_PARK_PATH], {
+      park_state: { modules: [STRANDED_PARK_PATH] },
+      stranded: true,
+    }),
+    makeRow('T-wait-1', [DEPARTED_HOLDER_PATH]),
+    makeRow('T-wait-2', [DEPARTED_HOLDER_PATH]),
+  ];
+  const out = boundHeatmapAxes({ rows, modules: getLiveShapedModules() });
+
+  assert.equal(out.modulesRescued, 2);
+  for (const module of out.modules.slice(-out.modulesRescued)) {
+    assert.ok(
+      out.rows.some(row => rowTouchesModule(row, module)),
+      `rescued column ${module.path} renders blank`,
+    );
+  }
 });
