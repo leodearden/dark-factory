@@ -1902,6 +1902,57 @@ class TestDecisionProjectIsCanonicalAtEveryReadSite:
             assert [d.project for d in app._decisions] == ['dark_factory']
 
 
+class TestInjectedDecisionsReaderIsEveryDecisionRead:
+    @pytest.mark.timeout(10)
+    async def test_a_decision_the_reader_hides_stays_hidden_after_a_keypress_re_read(
+        self, tmp_path
+    ):
+        """The decisions_reader kwarg is the app's only source of decisions, at the mount
+        scan and at a keypress's post-write re-read alike. A read site that bypassed it
+        would let a test fake see one registry while the app showed another."""
+        from textual.widgets.data_table import RowDoesNotExist
+
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.registry_reader import scan_decisions
+
+        for decision_id in ('dec-shown', 'dec-hidden'):
+            assert sr.write_decision(
+                sr.DecisionRecord(
+                    id=decision_id,
+                    project='df',
+                    text=f'{decision_id}?',
+                    filed_at='2026-07-07T00:00:00+00:00',
+                ),
+                root=tmp_path,
+            )
+
+        def reader(root):
+            return [d for d in scan_decisions(root) if d.id != 'dec-hidden']
+
+        app = CockpitApp(
+            fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60, decisions_reader=reader
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 1
+            with pytest.raises(RowDoesNotExist):
+                queue.get_row_index('decision:dec-hidden')
+
+            queue.move_cursor(row=queue.get_row_index('decision:dec-shown'))
+            await pilot.pause()
+            await pilot.press('b')
+            await pilot.pause()
+
+            persisted = {d.id: d for d in sr.list_decisions(root=tmp_path)}
+            assert persisted['dec-shown'].manual_boost == 1
+            assert queue.row_count == 1
+            with pytest.raises(RowDoesNotExist):
+                queue.get_row_index('decision:dec-hidden')
+
+
 class TestDroppedOverlayExpiresWithTheAsk:
     @pytest.mark.timeout(10)
     async def test_dropped_session_key_does_not_suppress_a_later_unrelated_ask(self, tmp_path):
