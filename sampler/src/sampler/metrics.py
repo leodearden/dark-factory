@@ -17,7 +17,6 @@ script moves the pipe to another FD.
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import os
 from collections.abc import Callable, Collection, Iterable, Mapping
@@ -45,6 +44,8 @@ __all__ = [
     'MetricGroup',
     'parse_pressure_file',
     'collect_psi',
+    'ProcessRecord',
+    'classify_process',
     'count_occt_queue_depth',
     'count_verify_concurrency',
     'sum_verify_rss',
@@ -401,72 +402,65 @@ def _read_leaf_some_avg10(pressure_path: Path) -> float | None:
     return parsed['some_avg10']
 
 
-def _is_occt_gated(proc: Any) -> bool:
-    """Return True if proc is a bash process running cargo-test-occt-gated."""
-    try:
-        cmdline = proc.cmdline()
-    except Exception:
-        return False
-    return any('cargo-test-occt-gated' in part for part in cmdline)
+@dataclass(frozen=True)
+class ProcessRecord:
+    """What the process metrics need to know about one process, decided once."""
+
+    pid: int
+    is_occt: bool
+    is_verify: bool
+
+
+def classify_process(info: Mapping[str, Any]) -> ProcessRecord:
+    """Classify one process from its ``proc.info``.
+
+    An unreadable command line is ``None`` there (psutil's value for an
+    AccessDenied attribute) and classifies as neither.
+    """
+    cmdline = info.get('cmdline') or []
+    return ProcessRecord(
+        pid=info['pid'],
+        is_occt=any('cargo-test-occt-gated' in part for part in cmdline),
+        is_verify=bool(cmdline) and os.path.basename(cmdline[0]) == 'verify.sh',
+    )
 
 
 def count_occt_queue_depth(
-    procs: Iterable[Any],
+    records: Iterable[ProcessRecord],
     fd9_exists: Callable[[int], bool],
 ) -> int:
-    """Count ``cargo-test-occt-gated`` bash processes waiting on the semaphore.
+    """Count the occt processes still waiting on the semaphore (see the FD-9 heuristic)."""
+    return sum(1 for record in records if record.is_occt and not fd9_exists(record.pid))
 
-    A process is *waiting* when its /proc/<pid>/fd/9 symlink does not exist
-    (see FD-9 heuristic in the module docstring).
+
+def count_verify_concurrency(records: Iterable[ProcessRecord]) -> int:
+    return sum(1 for record in records if record.is_verify)
+
+
+def sum_verify_rss(verify_roots: Iterable[Any]) -> int:
+    """Sum RSS (bytes) over the verify roots and their descendants, each pid once.
+
+    ``children(recursive=True)`` already returns every descendant in one flat
+    pass, so no child is recursed into. A process that vanished or is denied
+    (``psutil.Error``) is skipped; any other error propagates.
     """
-    count = 0
-    for proc in procs:
-        if _is_occt_gated(proc) and not fd9_exists(proc.pid):
-            count += 1
-    return count
+    import psutil
 
-
-def _is_verify_sh(proc: Any) -> bool:
-    """Return True if proc's argv[0] basename is 'verify.sh'."""
-    try:
-        cmdline = proc.cmdline()
-    except Exception:
-        return False
-    if not cmdline:
-        return False
-    return os.path.basename(cmdline[0]) == 'verify.sh'
-
-
-def count_verify_concurrency(procs: Iterable[Any]) -> int:
-    """Count processes whose argv[0] basename is 'verify.sh'."""
-    return sum(1 for p in procs if _is_verify_sh(p))
-
-
-def sum_verify_rss(procs: Iterable[Any]) -> int:
-    """Sum RSS (bytes) over all verify.sh processes and their child trees.
-
-    Shared PIDs are de-duplicated so each process's RSS is counted only once.
-    For each verify.sh root, ``children(recursive=True)`` is called once to
-    obtain the full descendant list in a single flat pass.  This avoids the
-    exponential revisiting that a per-child recursive call produces:
-    ``children(recursive=True)`` already returns all descendants, so recursing
-    into each returned child would visit a node at depth N up to 2^N times.
-    """
     seen_pids: set[int] = set()
     total = 0
-    for proc in procs:
-        if not _is_verify_sh(proc):
-            continue
+    for root in verify_roots:
         try:
-            subtree = [proc] + proc.children(recursive=True)
-        except Exception:
-            subtree = [proc]
-        for p in subtree:
-            if p.pid in seen_pids:
+            tree = [root, *root.children(recursive=True)]
+        except psutil.Error:
+            tree = [root]
+        for proc in tree:
+            if proc.pid in seen_pids:
                 continue
-            seen_pids.add(p.pid)
-            with contextlib.suppress(Exception):
-                total += p.memory_info().rss
+            seen_pids.add(proc.pid)
+            try:
+                total += proc.memory_info().rss
+            except psutil.Error:
+                continue
     return total
 
 
@@ -476,32 +470,25 @@ def _default_fd9_exists(pid: int) -> bool:
 
 def collect_process_metrics(
     *,
-    proc_iter: Any = None,
+    proc_iter: Callable[[list[str]], Iterable[Any]] | None = None,
     fd9_exists: Callable[[int], bool] = _default_fd9_exists,
 ) -> Samples:
-    """Materialise the live process list and return the 3 non-PSI metrics.
+    """Return the process group's metrics from one process scan.
 
-    Returns:
-        The host-level keys occt_queue_depth, verify_concurrency and
-        verify_rss_total_bytes.
-
-    Per-process psutil.NoSuchProcess / AccessDenied are silently skipped.
+    The scan requests only ``pid`` and ``cmdline``, each process is classified
+    once from ``proc.info``, and memory is read only for verify trees. A
+    per-process ``psutil.Error`` is skipped there; anything else, a failed
+    scan included, propagates to ``sampler.__main__``'s per-group handler.
     """
     import psutil
 
-    if proc_iter is None:
-        proc_iter = psutil.process_iter
-
-    procs = list(proc_iter(['pid', 'name', 'cmdline', 'memory_info']))
-
-    # No separate cmdline() probe loop: _is_occt_gated and _is_verify_sh each
-    # have their own try/except that silently skips processes that died or are
-    # access-denied between listing and inspection.  A separate p.cmdline()
-    # probe here would add a redundant OS call per process on the 5s hot path.
+    procs = list((proc_iter or psutil.process_iter)(['pid', 'cmdline']))
+    records = [classify_process(proc.info) for proc in procs]
+    verify_roots = [proc for proc, record in zip(procs, records, strict=True) if record.is_verify]
     return {
-        _OCCT_QUEUE_DEPTH.key(): float(count_occt_queue_depth(procs, fd9_exists)),
-        _VERIFY_CONCURRENCY.key(): float(count_verify_concurrency(procs)),
-        _VERIFY_RSS_TOTAL_BYTES.key(): float(sum_verify_rss(procs)),
+        _OCCT_QUEUE_DEPTH.key(): float(count_occt_queue_depth(records, fd9_exists)),
+        _VERIFY_CONCURRENCY.key(): float(count_verify_concurrency(records)),
+        _VERIFY_RSS_TOTAL_BYTES.key(): float(sum_verify_rss(verify_roots)),
     }
 
 
