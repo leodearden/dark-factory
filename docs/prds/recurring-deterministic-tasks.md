@@ -297,6 +297,12 @@ path; the gauge computation is per-root, ms-scale, in the dashboard.
 
 1. **Overdue grace window size** (how far past `at` before `overdue`). Suggested: one full
    `interval_secs`, capped at 24h. Decide during r4.
+   **Resolved in r4 (task 4679):** grace = min(interval_secs, 24h); the 24h cap when the
+   link's recurrence does not validate. A current link that is neither blocked nor terminal
+   (in-progress, deferred, infra-hold, …) is read by its fire time like pending; one whose
+   dated `at` cannot be read is overdue, because the scheduler withholds a malformed
+   milestone indefinitely. Served by
+   `dashboard/src/dashboard/data/recurrence_gauge.py::chain_state`.
 2. **Whether the minted successor copies `metadata.files`** (lock-set inheritance).
    **Resolved in r2 (task 4866): yes, verbatim** — same job, same locks.
 3. **Seed cadences for r6's two chains.** Suggested: 24h both, matching their documented timer
