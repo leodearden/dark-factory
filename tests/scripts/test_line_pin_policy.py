@@ -73,6 +73,7 @@ from __future__ import annotations
 import pathlib
 import re
 
+import pytest
 import yaml
 from orchestrator.config import _discover_module_configs
 
@@ -182,6 +183,58 @@ def _hook_invocation_lines() -> list[tuple[pathlib.Path, int, str]]:
             if line.strip() and not line.lstrip().startswith("#")
         ]
     return lines
+
+
+def test_marked_body_returns_the_policy_prose_without_the_opening_comment() -> None:
+    text = (
+        "Section prose above.\n"
+        "<!-- line-pin-policy:begin mirrored in CLAUDE.md; guarded by\n"
+        "tests/scripts/test_line_pin_policy.py -->\n"
+        "Bare `file.py:NNN` pins are tolerated drift, not debt.\n"
+        "<!-- line-pin-policy:end -->\n"
+    )
+    assert (
+        _marked_body(text, "CONTRIBUTING.md")
+        == "Bare `file.py:NNN` pins are tolerated drift, not debt."
+    )
+
+
+def test_marked_body_reads_a_comment_only_span_as_absence() -> None:
+    """A marker pair wrapping only a comment is the silent deletion (a)/(b) catch.
+
+    It passes the shared helper's non-blank check, so this guard's own comment
+    strip is what must turn it into ``""``.
+    """
+    text = (
+        "<!-- line-pin-policy:begin mirrored in CONTRIBUTING.md -->\n"
+        "<!-- placeholder: prose moved elsewhere -->\n"
+        "<!-- line-pin-policy:end -->\n"
+    )
+    assert _marked_body(text, "CLAUDE.md") == ""
+
+
+@pytest.mark.parametrize(
+    ("text", "case"),
+    [
+        (
+            "<!-- line-pin-policy:begin -->\nBare pins are tolerated drift.\n",
+            "end marker missing",
+        ),
+        (
+            "<!-- line-pin-policy:begin -->\n   \n<!-- line-pin-policy:end -->\n",
+            "blank body",
+        ),
+    ],
+)
+def test_marked_body_raises_naming_the_document_on_a_malformed_span(
+    text: str, case: str
+) -> None:
+    with pytest.raises(AssertionError) as excinfo:
+        _marked_body(text, "CLAUDE.md")
+
+    message = str(excinfo.value)
+    assert "line-pin-policy" in message, case
+    assert "CLAUDE.md" in message, case
 
 
 def test_policy_is_documented_in_contributing() -> None:
