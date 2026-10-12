@@ -50,6 +50,14 @@ def _print_check(passed: bool, message: str) -> bool:
     return passed
 
 
+def _mean_or_none(values: list[float]) -> float | None:
+    return sum(values) / len(values) if values else None
+
+
+def _fmt_mean(value: float | None) -> str:
+    return 'n/a' if value is None else f'{value:.3f}'
+
+
 def _metrics_text(f1: float, blocking_recall: float, cost_usd: float) -> str:
     return f'F1={f1:.3f} BR={blocking_recall:.3f} ${cost_usd:.2f}'
 
@@ -314,6 +322,9 @@ def calibrate(diff_ids: str, stagger: float) -> None:
             # Score
             click.echo('\n  Scoring with haiku...')
             score = await score_panel_run(result, diff)
+            if score.unmeasured is not None:
+                click.echo(f'  Scorer: {_cell_text(score)}')
+                continue
 
             # Display ground truth
             click.echo(f'\n{click.style("Ground Truth", bold=True)} ({len(diff.ground_truth)} issues):')
@@ -397,7 +408,7 @@ def corpus_sanity(max_parallel: int, stagger: float, report_dir: Path | None) ->
                 continue
             score = await score_panel_run(result, diff)
             scores.append(score)
-            click.echo(f'  {result.diff_id}: recall={score.recall:.3f} blocking_recall={score.blocking_recall:.3f} F1={score.f1:.3f}')
+            click.echo(f'  {result.diff_id}: {_cell_text(score)}')
 
         # Build report
         report = build_trial_report(scores, [VARIANT_BASELINE], corpus)
@@ -413,35 +424,41 @@ def corpus_sanity(max_parallel: int, stagger: float, report_dir: Path | None) ->
         synthetic_recalls: list[float] = []
         synthetic_blocking_recalls: list[float] = []
         zero_recall_diffs: list[str] = []
+        measured = [s for s in scores if s.unmeasured is None]
+        unmeasured = [s for s in scores if s.unmeasured is not None]
 
         for score in sorted(scores, key=lambda s: s.diff_id):
             diff = corpus.get_diff(score.diff_id)
             lang = diff.language[:5] if diff else '?'
             source = diff.source if diff else '?'
+            metric_columns = (
+                f'{score.recall:>7.3f} {score.blocking_recall:>7.3f} {score.f1:>7.3f}'
+                if score.unmeasured is None else f'{"UNMEASURED":>23s}'
+            )
             click.echo(
                 f'{score.diff_id:<26s} {lang:<5s} {source:<10s} '
-                f'{score.recall:>7.3f} {score.blocking_recall:>7.3f} {score.f1:>7.3f} '
-                f'${score.total_cost_usd:>6.2f}'
+                f'{metric_columns} ${score.total_cost_usd:>6.2f}'
             )
+            if score.unmeasured is not None:
+                continue
             if diff and diff.source == 'synthetic':
                 synthetic_recalls.append(score.recall)
                 synthetic_blocking_recalls.append(score.blocking_recall)
             if score.recall == 0.0:
                 zero_recall_diffs.append(score.diff_id)
 
-        # Aggregate metrics
-        mean_recall = sum(synthetic_recalls) / len(synthetic_recalls) if synthetic_recalls else 0.0
-        mean_blocking = sum(synthetic_blocking_recalls) / len(synthetic_blocking_recalls) if synthetic_blocking_recalls else 0.0
-        all_recalls = [s.recall for s in scores]
-        all_f1s = [s.f1 for s in scores]
+        # Aggregate metrics, over measured cells only
+        mean_recall = _mean_or_none(synthetic_recalls)
+        mean_blocking = _mean_or_none(synthetic_blocking_recalls)
         total_cost = sum(s.total_cost_usd for s in scores)
 
         click.echo()
         click.echo(click.style('Aggregate Metrics:', bold=True))
-        click.echo(f'  Mean recall (synthetic):          {mean_recall:.3f}')
-        click.echo(f'  Mean blocking recall (synthetic):  {mean_blocking:.3f}')
-        click.echo(f'  Mean recall (all):                 {sum(all_recalls) / len(all_recalls):.3f}' if all_recalls else '')
-        click.echo(f'  Mean F1 (all):                     {sum(all_f1s) / len(all_f1s):.3f}' if all_f1s else '')
+        click.echo(f'  Mean recall (synthetic):          {_fmt_mean(mean_recall)}')
+        click.echo(f'  Mean blocking recall (synthetic):  {_fmt_mean(mean_blocking)}')
+        click.echo(f'  Mean recall (all):                 {_fmt_mean(_mean_or_none([s.recall for s in measured]))}')
+        click.echo(f'  Mean F1 (all):                     {_fmt_mean(_mean_or_none([s.f1 for s in measured]))}')
+        click.echo(f'  Unmeasured: {len(unmeasured)} (excluded from every mean)')
         click.echo(f'  Total cost:                        ${total_cost:.2f}')
 
         # Threshold checks
@@ -449,9 +466,15 @@ def corpus_sanity(max_parallel: int, stagger: float, report_dir: Path | None) ->
         checks_passed = 0
         total_checks = 2
 
-        if _print_check(mean_recall > 0.6, f'Mean recall (synthetic) = {mean_recall:.3f} > 0.6'):
+        if _print_check(
+            mean_recall is not None and mean_recall > 0.6,
+            f'Mean recall (synthetic) = {_fmt_mean(mean_recall)} > 0.6',
+        ):
             checks_passed += 1
-        if _print_check(mean_blocking > 0.5, f'Mean blocking recall (synthetic) = {mean_blocking:.3f} > 0.5'):
+        if _print_check(
+            mean_blocking is not None and mean_blocking > 0.5,
+            f'Mean blocking recall (synthetic) = {_fmt_mean(mean_blocking)} > 0.5',
+        ):
             checks_passed += 1
 
         if zero_recall_diffs:
@@ -460,10 +483,18 @@ def corpus_sanity(max_parallel: int, stagger: float, report_dir: Path | None) ->
             for d in zero_recall_diffs:
                 click.echo(f'  - {d}')
 
+        if unmeasured:
+            click.echo()
+            click.echo(click.style(
+                f'Sanity run incomplete: {len(unmeasured)} cell(s) unmeasured — rerun to measure them.',
+                fg='red',
+            ))
+
         click.echo()
         color = 'green' if checks_passed == total_checks else 'red'
         click.echo(click.style(f'Result: {checks_passed}/{total_checks} thresholds met', fg=color, bold=True))
-        return 0 if checks_passed == total_checks and not zero_recall_diffs else 1
+        complete = checks_passed == total_checks and not zero_recall_diffs and not unmeasured
+        return 0 if complete else 1
 
     try:
         sys.exit(asyncio.run(_run()))
@@ -953,7 +984,7 @@ def full_trial(max_parallel: int, stagger: float, report_dir: Path | None) -> No
                 continue
             score = await score_panel_run(result, diff)
             scores.append(score)
-            click.echo(f'  {result.variant_name:15s} x {result.diff_id:<25s} F1={score.f1:.3f} BR={score.blocking_recall:.3f}')
+            click.echo(f'  {result.variant_name:15s} x {result.diff_id:<25s} {_cell_text(score)}')
 
         # Build and save report
         report = build_trial_report(scores, ALL_VARIANTS, corpus)
@@ -1016,7 +1047,7 @@ def effort_sweep(max_parallel: int, stagger: float) -> None:
                 continue
             score = await score_panel_run(result, diff)
             scores.append(score)
-            click.echo(f'  {result.variant_name:18s} x {result.diff_id:<25s} F1={score.f1:.3f} BR={score.blocking_recall:.3f}')
+            click.echo(f'  {result.variant_name:18s} x {result.diff_id:<25s} {_cell_text(score)}')
 
         report = build_trial_report(scores, EFFORT_SWEEP_VARIANTS, corpus)
         report_path = save_report(report, _RESULTS_DIR / 'effort_sweep_report')
@@ -1089,10 +1120,7 @@ def refresh_trial(max_parallel: int, stagger: float, report_dir: Path | None) ->
                 continue
             score = await score_panel_run(result, diff)
             scores.append(score)
-            click.echo(
-                f'  {result.variant_name:20s} x {result.diff_id:<25s} '
-                f'F1={score.f1:.3f} BR={score.blocking_recall:.3f}'
-            )
+            click.echo(f'  {result.variant_name:20s} x {result.diff_id:<25s} {_cell_text(score)}')
 
         # Build and save report
         report = build_trial_report(scores, REVIEWER_REFRESH_VARIANTS, corpus)
