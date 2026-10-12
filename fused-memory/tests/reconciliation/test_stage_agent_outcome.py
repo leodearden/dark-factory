@@ -243,8 +243,10 @@ class TestPresenceReportsAgentOutcome:
         )
 
     async def _upsert_raw_payload(self, service: MemoryService, run_id: str, payload: dict):
+        ledger = service.recon_ledger
+        assert ledger is not None
         now = datetime.now(UTC)
-        await service.recon_ledger.upsert(ReconLedgerRecord(
+        await ledger.upsert(ReconLedgerRecord(
             project_id=self._PROJECT_ID,
             record_kind='cycle_summary',
             task_id='',

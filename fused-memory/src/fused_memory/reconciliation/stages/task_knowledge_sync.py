@@ -5113,6 +5113,7 @@ def _format_report(report: StageReport | None) -> str:
         f'Stage: {report.stage.value}\n'
         f'Duration: {duration:.1f}s | LLM calls: {report.llm_calls} | '
         f'Tokens: {report.tokens_used}\n'
+        f'Agent outcome: {report.agent_outcome or "unrecorded"}\n'
         f'Stats: {json.dumps(report.stats, default=str)}\n'
         f'Items flagged: {len(report.items_flagged)}'
     )
