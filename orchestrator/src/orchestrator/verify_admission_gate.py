@@ -15,9 +15,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import itertools
+import random
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -198,10 +199,39 @@ class AdmissionGate:
         self._holding: dict[int, _Waiter] = {}
         self._seq = itertools.count()
 
-    def admit(
+    @contextlib.asynccontextmanager
+    async def admit(
         self, request: AdmissionRequest, policy: Callable[[], AdmissionPolicy],
-    ) -> contextlib.AbstractAsyncContextManager[AdmissionGrant]:
-        raise NotImplementedError
+    ) -> AsyncIterator[AdmissionGrant]:
+        """Wait for this request's turn, then hold it for the body of the ``async with``.
+
+        *policy* is read at every dispatch, so a reloaded slot count or order
+        applies to the very next grant.
+        """
+        role_class(request.role)
+        waiter = _Waiter(
+            request=request,
+            seq=next(self._seq),
+            arrival=time.monotonic(),
+            arrived_at=datetime.now(UTC),
+            depth_at_arrival=len(self._queued),
+            turn=asyncio.get_running_loop().create_future(),
+        )
+        self._queued[waiter.seq] = waiter
+        self._dispatch(policy())
+        turn = await waiter.turn
+        try:
+            yield AdmissionGrant(
+                request=request,
+                order=turn.order,
+                arrived_at=waiter.arrived_at,
+                granted_at=turn.granted_at,
+                waited_secs=turn.granted - waiter.arrival,
+                depth_at_arrival=waiter.depth_at_arrival,
+            )
+        finally:
+            self._holding.pop(waiter.seq, None)
+            self._dispatch(policy())
 
     def snapshot(self) -> AdmissionSnapshot:
         now = time.monotonic()
@@ -214,6 +244,29 @@ class AdmissionGate:
             for w in sorted(self._holding.values(), key=lambda w: w.seq)
         )
         return AdmissionSnapshot(waiters=waiters, holders=holders)
+
+    def _dispatch(self, policy: AdmissionPolicy) -> None:
+        while self._queued and len(self._holding) < policy.slots:
+            waiter = self._pick(policy)
+            del self._queued[waiter.seq]
+            if waiter.turn.done():
+                continue
+            self._holding[waiter.seq] = waiter
+            waiter.turn.set_result(
+                _Turn(order=policy.order, granted=time.monotonic(), granted_at=datetime.now(UTC)),
+            )
+
+    def _pick(self, policy: AdmissionPolicy) -> _Waiter:
+        if policy.order == 'unordered':
+            return random.choice(list(self._queued.values()))
+        now = time.monotonic()
+
+        def arrival_key(waiter: _Waiter) -> tuple[int, float, int]:
+            promoted = now - waiter.arrival >= policy.promote_after_secs
+            effective_class = 0 if promoted else role_class(waiter.request.role)
+            return (effective_class, waiter.request.plan_arrival, waiter.seq)
+
+        return min(self._queued.values(), key=arrival_key)
 
 
 _GATES: dict[Path, AdmissionGate] = {}
