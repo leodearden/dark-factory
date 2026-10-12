@@ -1503,7 +1503,8 @@ class ReconciliationHarness:
 
         Uses DurableWriteQueue.get_stats(group_id=project_id) to classify the
         queue state via summarize_graphiti_queue_health.  When dead_count > 0,
-        emits a WARNING-level log — this is the observable signal for the silent
+        emits a WARNING-level log carrying per-operation attribution
+        (dead_by_operation) — this is the observable signal for the silent
         drop that add_memory's success=True at enqueue time hides.
 
         Args:
@@ -1527,6 +1528,7 @@ class ReconciliationHarness:
                         'dead_count': health['dead_count'],
                         'pending_count': health['pending_count'],
                         'oldest_pending_age_seconds': health['oldest_pending_age_seconds'],
+                        'dead_by_operation': health['dead_by_operation'],
                     },
                 )
             return health
