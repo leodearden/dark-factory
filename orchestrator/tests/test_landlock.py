@@ -470,3 +470,159 @@ class TestLandlockClaudeHomeNarrowing:
 
         # Acceptance: redirected in-worktree transcript writes still work.
         assert 'transcript_ok' in result.stdout, result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Test 7: an agent concludes a conflicted merge inside the sandbox (task 5844)
+# ---------------------------------------------------------------------------
+
+_CONFLICT_BASE = '1\n2\n3\n'
+_CONFLICT_RESOLVED = '1\nRESOLVED\n3\n'
+_AGENT_SUCCESS_JSON = json.dumps({
+    'result': 'ok', 'is_error': False, 'subtype': 'success', 'cost_usd': 0.0,
+    'duration_ms': 1, 'num_turns': 1, 'session_id': 's',
+})
+
+
+def _scaffold_git(cwd: Path, *args: str) -> str:
+    proc = subprocess.run(
+        ['git', *args], cwd=str(cwd), capture_output=True, text=True, timeout=30,
+        env={**os.environ, 'GIT_CEILING_DIRECTORIES': str(cwd.resolve().parent)},
+    )
+    assert proc.returncode == 0, f'git {" ".join(args)} failed: {proc.stderr}'
+    return proc.stdout
+
+
+@pytest.mark.skipif(_skip_landlock(), reason=_LANDLOCK_SKIP_REASON)
+@pytest.mark.skipif(_skip_var_tmp(), reason=_VAR_TMP_SKIP_REASON)
+class TestLandlockSandboxedConflictedMerge:
+    """A sandboxed agent resolves a NEW merge conflict and commits it cleanly.
+
+    The common dir's rr-cache is read-only to the sandbox, so under half-on
+    rerere the concluding commit died rc 139 and left MERGE_RR.lock plus a
+    dangling MERGE_RR record behind. Real production chain: compute_write_set
+    -> invoke_agent -> wrap_command -> build_landlock_command.
+    """
+
+    @pytest.mark.asyncio
+    async def test_agent_commits_conflicted_merge_without_rerere_debris(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from orchestrator.agents import sandbox_dispatch
+        from orchestrator.agents.invoke import invoke_agent
+        from orchestrator.agents.write_set import compute_write_set
+        from orchestrator.rebase_recovery import scan_merge_rr
+
+        # /var/tmp, never /tmp: landlock_exec blanket-grants /tmp, which would
+        # make rr-cache writable and this test vacuous.
+        base = Path(tempfile.mkdtemp(prefix='landlock-rerere-', dir='/var/tmp'))
+        try:
+            name = 'wt'
+            main, worktree, fake_home = self._scaffold(base, name)
+            monkeypatch.setenv('PATH', f'{base / "bin"}{os.pathsep}{os.environ.get("PATH", "")}')
+            monkeypatch.setenv('HOME', str(fake_home))
+            for var in ('DF_AGENT_CPU_NICE', 'DF_AGENT_CPU_GOVERN'):
+                monkeypatch.delenv(var, raising=False)
+            sandbox_dispatch.set_backend('landlock')
+            write_set = compute_write_set(worktree, home=fake_home)
+            extras = [str(p) for p in write_set.writable_paths()]
+
+            self._assert_rr_cache_denied(main, worktree, fake_home, extras)
+
+            result = await invoke_agent(
+                prompt='resolve', system_prompt='s', cwd=worktree, model='opus',
+                max_turns=1, max_budget_usd=0.01, timeout_seconds=60,
+                sandbox_modules=[], sandbox_extras=extras,
+            )
+
+            assert result.success, f'fake claude dispatch did not succeed: {result!r}'
+            rcs = dict(
+                item.split('=') for item in (worktree / '.task' / 'merge-rcs').read_text().split()
+            )
+            assert rcs['merge'] == '1', (
+                f'the merge must stop on a NEW conflict, or this test is vacuous: {rcs}'
+            )
+            assert rcs['add'] == '0', rcs
+            assert rcs['commit'] == '0', (
+                f'the concluding commit must succeed inside the sandbox: {rcs}'
+            )
+            admin = main / '.git' / 'worktrees' / name
+            assert not (admin / 'MERGE_RR.lock').exists(), 'stale MERGE_RR.lock left behind'
+            # A 0-byte MERGE_RR from the unsandboxed setup commit is legitimate;
+            # the defect is a RECORD.
+            assert scan_merge_rr(git_dir=admin, common_dir=main / '.git').records == ()
+            parents = _scaffold_git(worktree, 'rev-list', '--parents', '-n1', 'HEAD').split()
+            assert len(parents) == 3, f'expected a two-parent merge commit, got {parents}'
+            assert (worktree / 'f.txt').read_text() == _CONFLICT_RESOLVED
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    @staticmethod
+    def _scaffold(base: Path, name: str) -> tuple[Path, Path, Path]:
+        main = base / 'main'
+        main.mkdir()
+        _scaffold_git(main, 'init', '-q', '-b', 'main')
+        for key, value in (
+            ('user.email', 'landlock-rerere@test.invalid'),
+            ('user.name', 'Landlock Rerere Test'),
+            ('commit.gpgsign', 'false'),
+            ('rerere.enabled', 'true'),
+            ('rerere.autoupdate', 'true'),
+            ('gc.auto', '0'),
+            ('maintenance.auto', 'false'),
+        ):
+            _scaffold_git(main, 'config', key, value)
+        (main / 'f.txt').write_text(_CONFLICT_BASE)
+        _scaffold_git(main, 'add', 'f.txt')
+        _scaffold_git(main, 'commit', '-qm', 'base')
+
+        worktree = base / name
+        _scaffold_git(main, 'worktree', 'add', '-q', '-b', f'task/{name}', str(worktree), 'main')
+        (main / 'f.txt').write_text('1\nMAIN\n3\n')
+        _scaffold_git(main, 'commit', '-qam', 'main edit')
+        (worktree / 'f.txt').write_text('1\nTASK\n3\n')
+        _scaffold_git(worktree, 'commit', '-qam', 'task edit')
+
+        (base / '.task-meta' / name).mkdir(parents=True)
+        fake_home = base / 'home'
+        (fake_home / '.cache' / 'uv').mkdir(parents=True)
+        (fake_home / '.claude' / 'fleet').mkdir(parents=True)
+
+        bin_dir = base / 'bin'
+        bin_dir.mkdir()
+        agent = bin_dir / 'claude'
+        agent.write_text(
+            '#!/bin/sh\n'
+            'cat >/dev/null\n'
+            'git merge --no-ff main >/dev/null 2>&1; m=$?\n'
+            "printf '1\\nRESOLVED\\n3\\n' > f.txt\n"
+            'git add f.txt; a=$?\n'
+            'git commit --no-edit >/dev/null 2>&1; c=$?\n'
+            'mkdir -p .task\n'
+            'printf "merge=%s add=%s commit=%s\\n" "$m" "$a" "$c" > .task/merge-rcs\n'
+            f"printf '%s\\n' '{_AGENT_SUCCESS_JSON}'\n"
+        )
+        agent.chmod(0o755)
+        return main, worktree, fake_home
+
+    @staticmethod
+    def _assert_rr_cache_denied(
+        main: Path, worktree: Path, fake_home: Path, extras: list[str],
+    ) -> None:
+        """Premise guard: rr-cache really is read-only to this sandbox.
+
+        rr-cache is created OUTSIDE the sandbox first, so the denial below is a
+        landlock EACCES rather than ENOENT.
+        """
+        rr_cache = main / '.git' / 'rr-cache'
+        rr_cache.mkdir(exist_ok=True)
+        probe = rr_cache / 'premise-probe'
+        guard = subprocess.run(
+            build_landlock_command(['mkdir', str(probe)], worktree, [], writable_extras=extras),
+            env={**os.environ, 'HOME': str(fake_home)},
+            capture_output=True, text=True, timeout=15,
+        )
+        assert guard.returncode != 0 and not probe.exists(), (
+            'premise broken: the sandbox could write rr-cache, so this test cannot '
+            f'observe the half-on rerere defect (rc={guard.returncode}, stderr={guard.stderr})'
+        )
