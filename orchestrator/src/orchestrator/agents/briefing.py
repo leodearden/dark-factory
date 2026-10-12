@@ -10,8 +10,8 @@ from pathlib import Path
 
 from shared.briefing_queries import BriefingScope
 
+from orchestrator.agents.harness_guidance import WAIT_PATTERN_REMINDER
 from orchestrator.agents.memory_recall import MemoryRecall
-from orchestrator.agents.roles import WAIT_PATTERN_REMINDER
 from orchestrator.config import OrchestratorConfig
 
 logger = logging.getLogger(__name__)
