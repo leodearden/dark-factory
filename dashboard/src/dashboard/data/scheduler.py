@@ -24,6 +24,8 @@ Shape contract (returned by collect_scheduler_state):
     modules: list[dict]  — one per unique module path that appears in any lock set:
         path        str
         holder      str | None   task_id of in-flight holder, or None
+        holder_live bool | None  True/False iff a holder exists and the live set
+                                 is known; None otherwise (unknown, never departed)
         contention  int          count of tasks whose lock_set includes this path
         sorted by contention desc, ties broken alphabetically by path
 
@@ -269,9 +271,12 @@ def _module_contention_counts(
                          ``park_stacks`` is also ``None``.
 
     Returns:
-        ``[{path, holder, contention, project, holder_project,
+        ``[{path, holder, contention, project, holder_project, holder_live,
             parked_by, parked_by_project, parked_owner_live, park_stack}, ...]``
         sorted by contention descending, ties broken alphabetically by path.
+
+        holder_live  bool | None  True/False iff a holder exists and
+                     *live_task_ids* was supplied
 
         New additive fields (inert when *park_stacks* is ``None``):
           parked_by        str | None  active-top park owner (stack[-1]) if any
@@ -319,6 +324,11 @@ def _module_contention_counts(
             (tid for mod, tid in current_holders.items() if modules_conflict(mod, path)),
             None,
         )
+        holder_live = (
+            (holder in live_task_ids)
+            if (holder is not None and live_task_ids is not None)
+            else None
+        )
         # Resolve the matching park stack via the same hierarchical prefix rule
         # so park and holder resolution stay consistent across sub-depth keys.
         stack = next(
@@ -352,6 +362,9 @@ def _module_contention_counts(
             # the holder task_id since taskmaster ids are project-scoped.
             'project': project,
             'holder_project': project if holder else None,
+            # The holder's liveness against the same live_task_ids that sets
+            # parked_owner_live; None when unknown.
+            'holder_live': holder_live,
             # Park ownership — additive fields; inert when park_stacks is None.
             'parked_by': parked_by,
             'parked_by_project': parked_by_project,
@@ -1020,6 +1033,7 @@ def _merge_module_lists(
                 # used to look up sparklines and joined row metadata.
                 if m.get('holder_project'):
                     merged[key]['holder_project'] = m['holder_project']
+                merged[key]['holder_live'] = m.get('holder_live')
         else:
             merged[key] = dict(m)
     return sorted(merged.values(), key=lambda m: (-m['contention'], m['path']))
