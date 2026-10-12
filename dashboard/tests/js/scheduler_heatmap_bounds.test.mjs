@@ -40,11 +40,12 @@ const {
   rowTouchesModule,
   MAX_HEATMAP_ROWS,
   MAX_HEATMAP_COLS,
+  MAX_RESCUED_COLS,
 } = bounds;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/scheduler_heatmap_bounds.js';
 const EXPECTED_FUNCTION_NAMES = ['boundHeatmapAxes', 'rowTouchesModule'];
-const EXPECTED_CAP_NAMES = ['MAX_HEATMAP_ROWS', 'MAX_HEATMAP_COLS'];
+const EXPECTED_CAP_NAMES = ['MAX_HEATMAP_ROWS', 'MAX_HEATMAP_COLS', 'MAX_RESCUED_COLS'];
 const EXPECTED_EXPORT_NAMES = [...EXPECTED_FUNCTION_NAMES, ...EXPECTED_CAP_NAMES];
 
 test('default-imported module exposes the axis-selection surface', () => {
@@ -60,6 +61,10 @@ test('the caps are positive integers', () => {
     assert.ok(Number.isInteger(value), `bounds.${name} should be an integer, got ${value}`);
     assert.ok(value > 0, `bounds.${name} should be positive, got ${value}`);
   }
+  assert.ok(
+    MAX_RESCUED_COLS < MAX_HEATMAP_COLS,
+    'the stranded-lock rescue can never take the whole grid',
+  );
 });
 
 test('module also assigns window.DF_SCHED_HEATMAP_BOUNDS (browser dual-export)', () => {
@@ -104,12 +109,16 @@ test('boundHeatmapAxes returns the full axis-selection shape', () => {
 
   assert.deepEqual(
     Object.keys(out).sort(),
-    ['modules', 'modulesTotal', 'modulesTruncated', 'rows', 'rowsTotal', 'rowsTruncated'],
+    [
+      'modules', 'modulesRescued', 'modulesTotal', 'modulesTruncated',
+      'rows', 'rowsTotal', 'rowsTruncated',
+    ],
   );
   assert.ok(Array.isArray(out.rows));
   assert.ok(Array.isArray(out.modules));
   assert.equal(typeof out.rowsTotal, 'number');
   assert.equal(typeof out.modulesTotal, 'number');
+  assert.equal(typeof out.modulesRescued, 'number');
   assert.equal(typeof out.rowsTruncated, 'boolean');
   assert.equal(typeof out.modulesTruncated, 'boolean');
 });
@@ -611,4 +620,151 @@ test('BOUND: a parked row survives the cap even when ordinary rows would fill it
     'the parked row must survive the cap — it is what the stranded-parks ' +
       'banner points at, and it arrives last in server order',
   );
+});
+
+// ---------------------------------------------------------------------------
+// COLUMN BUDGET — stranded locks reach the rendered set at cap scale
+// ---------------------------------------------------------------------------
+//
+// The server sorts modules `(-contention, path)`, so a stranded lock (a dead
+// park at contention 0, a departed holder with a handful of waiters) sorts to
+// the tail, and a positional prefix of 60 never reaches it at live scale. The
+// columns are therefore a contended HEAD plus a rescued TAIL of stranded
+// modules the head did not reach — the column-axis twin of 'BOUND: a parked
+// row survives the cap even when ordinary rows would fill it'.
+
+// scheduler.py::_module_contention_counts's sort, reproduced so a fixture
+// arrives in the order the client really receives.
+function serverSorted(modules) {
+  return modules.slice().sort((a, b) =>
+    (b.contention - a.contention) || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+}
+
+function strandedPark(path) {
+  return makeModule(path, 0, {
+    parked_by: 'T-dead',
+    parked_owner_live: false,
+    park_stack: [{ owner: 'T-dead', live: false }],
+    has_dead_park: true,
+  });
+}
+
+function departedHolder(path, contention) {
+  return makeModule(path, contention, {
+    holder: 'T-gone',
+    holder_project: 'dark_factory',
+    holder_live: false,
+  });
+}
+
+const STRANDED_PARK_PATH = 'src/stranded/park.py';
+const DEPARTED_HOLDER_PATH = 'src/stranded/ghost.py';
+
+// The task's measured shape: makeFixture's realistic distribution (1,845
+// contended of 4,302, the head bottoming out at contention 6) plus one of
+// each carve-out, server-sorted.
+let liveShapedModules = null;
+function getLiveShapedModules() {
+  liveShapedModules = liveShapedModules || serverSorted([
+    ...makeFixture({ nRows: LIVE_ROWS, nModules: LIVE_MODULES, dense: false }).modules,
+    strandedPark(STRANDED_PARK_PATH),
+    departedHolder(DEPARTED_HOLDER_PATH, 1),
+  ]);
+  return liveShapedModules;
+}
+
+function contendedColumns(count) {
+  return Array.from({ length: count }, (_, i) => makeModule(`src/wide/mod${i}.py`, 5));
+}
+
+test('BOUND: a stranded-park column survives the cap even when contended columns would fill it', () => {
+  const out = boundHeatmapAxes({
+    rows: [],
+    modules: [...contendedColumns(MAX_HEATMAP_COLS + 5), strandedPark(STRANDED_PARK_PATH)],
+  });
+
+  assert.equal(out.modules.length, MAX_HEATMAP_COLS, 'the cap still binds');
+  assert.ok(out.modules.map(m => m.path).includes(STRANDED_PARK_PATH));
+  assert.equal(out.modulesRescued, 1);
+});
+
+test('BOUND: a departed-holder column survives the cap even when contended columns would fill it', () => {
+  const out = boundHeatmapAxes({
+    rows: [],
+    modules: [...contendedColumns(MAX_HEATMAP_COLS + 5), departedHolder(DEPARTED_HOLDER_PATH, 1)],
+  });
+
+  assert.equal(out.modules.length, MAX_HEATMAP_COLS, 'the cap still binds');
+  assert.ok(out.modules.map(m => m.path).includes(DEPARTED_HOLDER_PATH));
+  assert.equal(out.modulesRescued, 1);
+});
+
+test('BOUND: both carve-outs reach the rendered set on a live-shaped snapshot', () => {
+  const out = boundHeatmapAxes({ rows: [], modules: getLiveShapedModules() });
+  const paths = out.modules.map(m => m.path);
+
+  assert.ok(paths.includes(STRANDED_PARK_PATH), 'the dead park must render');
+  assert.ok(paths.includes(DEPARTED_HOLDER_PATH), 'the departed holder must render');
+  assert.ok(out.modules.length <= MAX_HEATMAP_COLS);
+  assert.equal(out.modulesRescued, 2);
+});
+
+test('the rendered columns stay in server order: the contended head, then the rescued tail', () => {
+  // The property the caption's 'the N most contended ..., then R stranded'
+  // rests on.
+  const input = getLiveShapedModules();
+  const out = boundHeatmapAxes({ rows: [], modules: input });
+  const inputIndex = new Map(input.map((m, i) => [m, i]));
+  const indices = out.modules.map(m => inputIndex.get(m));
+
+  for (let i = 1; i < indices.length; i++) {
+    assert.ok(indices[i] > indices[i - 1], `column ${i} breaks server order`);
+  }
+  const headLen = out.modules.length - out.modulesRescued;
+  assert.deepEqual(
+    out.modules.slice(headLen).map(m => m.path).sort(),
+    [DEPARTED_HOLDER_PATH, STRANDED_PARK_PATH].sort(),
+  );
+  assert.deepEqual(
+    out.modules.slice(0, headLen),
+    input.filter(m => m.contention > 1).slice(0, headLen),
+  );
+});
+
+test('a stranded module already inside the contended head takes no reserved slot', () => {
+  const input = [departedHolder(DEPARTED_HOLDER_PATH, 99), ...contendedColumns(65)];
+  const out = boundHeatmapAxes({ rows: [], modules: input });
+
+  assert.deepEqual(out.modules, input.slice(0, MAX_HEATMAP_COLS));
+  assert.equal(out.modulesRescued, 0);
+});
+
+test('a stranded module at the edge of the head is not squeezed out by a rescue behind it', () => {
+  // Reserving the dead park's slot shrinks the head to 59, which pushes the
+  // departed holder at index 59 out of it, which needs a slot of its own: the
+  // head length is a fixed point (58 here), and a one-pass greedy drops the
+  // index-59 module.
+  const input = Array.from({ length: 70 }, (_, i) =>
+    makeModule(`src/edge/mod${String(i).padStart(2, '0')}.py`, 200 - i));
+  input[59] = departedHolder(DEPARTED_HOLDER_PATH, 200 - 59);
+  input.push(strandedPark(STRANDED_PARK_PATH));
+  const out = boundHeatmapAxes({ rows: [], modules: input });
+  const paths = out.modules.map(m => m.path);
+
+  assert.ok(paths.includes(DEPARTED_HOLDER_PATH), 'the edge module must not be squeezed out');
+  assert.ok(paths.includes(STRANDED_PARK_PATH));
+  assert.equal(out.modules.length, MAX_HEATMAP_COLS);
+  assert.equal(out.modulesRescued, 2);
+});
+
+test('rescued columns never take more than MAX_RESCUED_COLS slots', () => {
+  const contended = contendedColumns(70);
+  const parks = Array.from({ length: MAX_RESCUED_COLS + 5 }, (_, i) =>
+    strandedPark(`src/stranded/park${String(i).padStart(2, '0')}.py`));
+  const out = boundHeatmapAxes({ rows: [], modules: [...contended, ...parks] });
+  const headLen = MAX_HEATMAP_COLS - MAX_RESCUED_COLS;
+
+  assert.equal(out.modulesRescued, MAX_RESCUED_COLS);
+  assert.equal(out.modules.length, MAX_HEATMAP_COLS);
+  assert.deepEqual(out.modules.slice(0, headLen), contended.slice(0, headLen));
 });
