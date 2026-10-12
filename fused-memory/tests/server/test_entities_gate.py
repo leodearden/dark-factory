@@ -407,6 +407,31 @@ class TestHonestMixedDeclarationsAreAccepted:
         assert block['conflicts'] == ['Task 3129'], f'{block!r}'
 
 
+class TestADiscardedDeclarationIsShapeCheckedOnly:
+    """A declaration the write will not record can buy no attribution, so it
+    is never conflict-rejected; a malformed one is still a wiring bug."""
+
+    def test_a_conflicting_declaration_is_accepted(self):
+        assert entities_gate(
+            [{'id': 3129}], content=_CITES_3127, group_id=GROUP, declaration_recorded=False,
+        ) is None
+
+    @pytest.mark.parametrize('declared', _MALFORMED_SHAPES)
+    def test_a_malformed_declaration_still_blocks(self, declared):
+        block = entities_gate(
+            declared, content=_CITES_3127, group_id=GROUP, declaration_recorded=False,
+        )
+
+        assert isinstance(block, dict), f'expected a block, got {block!r}'
+        assert block['error_type'] == 'ValidationError', f'{block!r}'
+
+    def test_the_default_is_the_strict_direction(self):
+        block = entities_gate([{'id': 3129}], content=_CITES_3127, group_id=GROUP)
+
+        assert isinstance(block, dict), f'expected a block, got {block!r}'
+        assert block['error_type'] == 'DeclaredReferentConflictRejected', f'{block!r}'
+
+
 class TestTheGateStaysPermissiveWhileTheProducerNarrows:
     """The gate acquires no project registry (task 5262 workstream B).
 
