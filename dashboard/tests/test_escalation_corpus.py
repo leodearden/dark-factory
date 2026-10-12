@@ -334,6 +334,17 @@ class TestPendingEscalationIds:
 
         assert pending_escalation_ids(_fresh(walk_corpus((queue,))), queue.id) is None
 
+    def test_an_unreadable_archived_file_leaves_the_live_queue_known(self, tmp_path):
+        queue_dir = tmp_path / 'escalations'
+        _write(queue_dir, _record('esc-7-1', task_id='7'))
+        corrupt = _write(queue_dir, _record('esc-8-1', task_id='8'), archived=True)
+        corrupt.write_text('{not json')
+        queue = _queue(queue_dir)
+
+        ids = pending_escalation_ids(_fresh(walk_corpus((queue,))), queue.id)
+
+        assert ids == {'7': ('esc-7-1',)}
+
     def test_an_unread_corpus_is_unknown(self, tmp_path):
         unread = unknown_datum('the escalation corpus was not read', CORPUS_FRESHNESS_BOUND_SECONDS)
 

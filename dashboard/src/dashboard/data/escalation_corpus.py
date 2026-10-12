@@ -287,10 +287,21 @@ def views_over(
     }
 
 
+def _live_queue_fully_read(scan: QueueScan) -> bool:
+    """Whether every file at *scan*'s queue root was read; the archive holds no live escalation."""
+    return scan.reached and not any(
+        unreadable.location is Location.ROOT for unreadable in scan.unreadable
+    )
+
+
 def pending_escalation_ids(
     corpus_datum: Datum[EscalationCorpus], queue_id: str,
 ) -> Mapping[str, tuple[str, ...]] | None:
-    """Each task id's pending live-queue escalation ids; None when that queue was not fully read."""
+    """Each task id's pending live-queue escalation ids; None when that queue root was not fully read.
+
+    A queue directory that was not found is unknown even for a project that has
+    never escalated: an absent directory reads the same as an unmounted one.
+    """
     corpus = corpus_datum.value
     if corpus is None:
         return None
@@ -298,7 +309,7 @@ def pending_escalation_ids(
         scan = corpus.scan(queue_id)
     except KeyError:
         return None
-    if scan.partial_causes():
+    if not _live_queue_fully_read(scan):
         return None
     by_task: dict[str, list[str]] = {}
     for record in scan.records:
