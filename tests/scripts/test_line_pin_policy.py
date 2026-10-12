@@ -211,28 +211,20 @@ def test_marked_body_reads_a_comment_only_span_as_absence() -> None:
     assert _marked_body(text, "CLAUDE.md") == ""
 
 
-@pytest.mark.parametrize(
-    ("text", "case"),
-    [
-        (
-            "<!-- line-pin-policy:begin -->\nBare pins are tolerated drift.\n",
-            "end marker missing",
-        ),
-        (
-            "<!-- line-pin-policy:begin -->\n   \n<!-- line-pin-policy:end -->\n",
-            "blank body",
-        ),
-    ],
-)
-def test_marked_body_raises_naming_the_document_on_a_malformed_span(
-    text: str, case: str
-) -> None:
+def test_marked_body_raises_naming_the_document_on_a_blank_span() -> None:
+    """A marker pair left wrapping only whitespace raises, naming slug and document.
+
+    The malformed-marker shapes are the shared helper's contract, pinned once in
+    `test_verify_command_invariants.py`; this pins that the wrapper threads this
+    guard's slug and *source* into it.
+    """
+    text = "<!-- line-pin-policy:begin -->\n   \n<!-- line-pin-policy:end -->\n"
     with pytest.raises(AssertionError) as excinfo:
         _marked_body(text, "CLAUDE.md")
 
     message = str(excinfo.value)
-    assert "line-pin-policy" in message, case
-    assert "CLAUDE.md" in message, case
+    assert "line-pin-policy" in message
+    assert "CLAUDE.md" in message
 
 
 def test_policy_is_documented_in_contributing() -> None:

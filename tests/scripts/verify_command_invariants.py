@@ -10,7 +10,7 @@ in a second hand-written copy for exactly the reason the five command-parsing
 copies below did, and the same rule applies to both. Everything in the WHY IT
 EXISTS and IMPORT ME sections is written about the command helpers, but is meant
 about this module. Since task 5769 it also holds :func:`marked_body`, the
-slug-keyed form of that extraction two documentation-policy guards share.
+slug-keyed form of that extraction.
 
 WHY IT EXISTS. A trio of command-parsing helpers — pick the ``&&`` segment that
 invokes the checker, extract that checker's positional targets, decide whether a
@@ -606,10 +606,8 @@ def marked_body(text: str, *, slug: str, source: str, label: str, task: str) -> 
     its own prose; the body starts where that comment closes. Every malformed
     shape raises through :func:`marked_span`: an unterminated opener and
     inverted markers both leave no pattern match, and a blank body fails its
-    non-blank assertion. Comment-stripping and whitespace policy stay with the
-    caller — ``tests/scripts/test_line_pin_policy.py::_marked_body`` strips
-    comments, ``tests/scripts/test_shadow_ruling_doc_contract.py::_marked_span``
-    does not.
+    non-blank assertion. The body is returned verbatim: comment and whitespace
+    policy belong to the caller.
     """
     return marked_span(
         text,
