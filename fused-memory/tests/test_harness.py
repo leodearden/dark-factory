@@ -15048,6 +15048,29 @@ class TestFindingIsLiveActionable:
         ) is True
 
 
+class TestFindingIsSuperseded:
+    """_finding_is_superseded is the supersession half of
+    _finding_is_live_actionable: True only for a claim a later finding of the
+    same run retired.
+    """
+
+    def test_a_retired_finding_is_superseded(self):
+        from fused_memory.reconciliation.harness import _finding_is_superseded
+
+        assert _finding_is_superseded(_make_superseded_finding()) is True
+
+    def test_a_none_superseded_by_is_not_superseded(self):
+        """get_assembled_report always projects the key; None means the claim stands."""
+        from fused_memory.reconciliation.harness import _finding_is_superseded
+
+        assert _finding_is_superseded({'actionable': True, 'superseded_by': None}) is False
+
+    def test_a_missing_superseded_by_is_not_superseded(self):
+        from fused_memory.reconciliation.harness import _finding_is_superseded
+
+        assert _finding_is_superseded({}) is False
+
+
 def _drop_records(caplog, message):
     return [r for r in caplog.records if r.getMessage() == message]
 
