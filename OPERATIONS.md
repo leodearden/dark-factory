@@ -260,27 +260,21 @@ next grant, the promotion age from the next ranking, and the alarm age from the
 next watch tick.
 
 **The events.** They are written to `<project_root>/data/orchestrator/runs.db`,
-table `events`, keyed by `event_type`, with the payload as JSON in `data`. The
-authoritative payload shapes are the comments on these `EventType` members in
-`orchestrator/src/orchestrator/event_store.py`:
+table `events`, keyed by `event_type`, with the payload as JSON in `data`. Each
+payload shape is stated once, in the comment on its `EventType` member in
+`orchestrator/src/orchestrator/event_store.py`, and a plan's legs are
+`orchestrator/src/orchestrator/verify_admission_record.py::AdmissionLeg`:
 
-- `verify_admission_plan`: one row per gated verify call that returned. A call
-  that raised or was cancelled writes none. `task_id` and `role` are also
-  columns. Payload: `plan_id`, `task_id`, `role`, `order`, `plan_arrival_at`,
-  `completed_at`, and `legs`, one per admitted test leg (retries and
-  env-recovery re-runs included), each with `module`, `scope_kind`, `order`,
-  `arrived_at`, `granted_at`, `waited_secs` (time queued in the gate),
-  `depth_at_arrival`, `slot_held`, `held_secs` (time holding the turn), `rc`
-  and `timed_out`.
+- `verify_admission_plan`: one row per gated verify call, written when it
+  returns with an admitted leg (`outcome` `returned`), or when it raises while
+  admission is on (`outcome` `raised`). A cancelled call writes none. `legs`
+  holds one entry per admitted test leg, retries and env-recovery re-runs
+  included.
 - `verify_admission_heartbeat`: written by the harness `verify-admission-watch`
-  service every 300s, and only while a waiter is queued. Payload: `depth`,
-  `oldest_wait_secs`, `oldest` {`task_id`, `module`, `role`, `plan_id`},
-  `holders` [{`task_id`, `module`, `role`, `held_secs`}] and `order`.
+  service every 300s, and only while a waiter is queued.
 - `verify_admission_wait_aged`: written by the same watch when the oldest
   waiter past the alarm age first appears, and again only when that waiter
-  changes. Payload: `waiter` {`task_id`, `module`, `role`, `plan_id`,
-  `wait_secs`}, `aged_count`, `alarm_secs`. It only reports the age; nothing
-  times a wait out.
+  changes. It only reports the age; nothing times a wait out.
 
 **Reading a task stuck in `phase=verify`.** Start with the latest heartbeats:
 
@@ -304,29 +298,40 @@ SQL
   newer than about 300s means nothing is queued.
 - `verify_admission_wait_aged` names the oldest waiter that has passed the
   alarm age.
-- After the verify returns, its `verify_admission_plan` legs show each leg's
-  `waited_secs` and `held_secs`. `slot_held = false` means the flock failed
-  open, so that leg ran without cross-process gating. `order` records which
-  ordering admitted it:
+- After the verify returns, its `verify_admission_plan` legs split each
+  leg's wait in two. `waited_secs` is the time queued in this process's gate.
+  `flock_wait_secs` is the time from the gate's grant until the cross-process
+  flock slot was held, so a slot held by another process shows up there.
+  `held_secs` runs from the grant until the turn was handed back, the flock
+  wait included. `slot_held = false` means the flock failed open, so that leg
+  ran without cross-process gating. `order` records which ordering admitted
+  it:
 
 ```bash
 sqlite3 data/orchestrator/runs.db <<'SQL'
 SELECT e.timestamp,
-       json_extract(leg.value, '$.module')       AS module,
-       json_extract(leg.value, '$.waited_secs')  AS waited_secs,
-       json_extract(leg.value, '$.held_secs')    AS held_secs,
-       json_extract(leg.value, '$.slot_held')    AS slot_held,
-       json_extract(leg.value, '$.order')        AS "order"
+       json_extract(leg.value, '$.module')           AS module,
+       json_extract(leg.value, '$.waited_secs')      AS waited_secs,
+       json_extract(leg.value, '$.flock_wait_secs')  AS flock_wait_secs,
+       json_extract(leg.value, '$.held_secs')        AS held_secs,
+       json_extract(leg.value, '$.slot_held')        AS slot_held,
+       json_extract(leg.value, '$.order')            AS "order"
 FROM events AS e, json_each(e.data, '$.legs') AS leg
 WHERE e.event_type = 'verify_admission_plan' AND e.task_id = '<task_id>'
 ORDER BY e.id DESC;
 SQL
 ```
 
+A call that raised, typically a `VerifyInfraError` that the workflow then
+retries as a new call, writes a row with `outcome` `raised` and no legs. Its
+wait is not measured, and this leg query shows nothing for it.
+
 **Measuring the ordering.** Split the rows by each event's `order` field, never
 by date: a reload can flip the order at any moment, and a plan whose legs ran
 under both orders records `order` as null. Arrival order targets the tail of
-the wait (p90 and max), not the mean wait or the throughput.
+the wait (p90 and max), not the mean wait or the throughput. Leg statistics
+leave out every raised call, so count the `outcome` `raised` rows in the same
+window before treating a p90 or a max as complete.
 
 ### Reading the merge-lane throughput baseline
 
