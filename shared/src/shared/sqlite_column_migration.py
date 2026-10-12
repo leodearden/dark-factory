@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import aiosqlite
 
-__all__ = ['add_column_if_missing']
+__all__ = ['add_column_if_missing', 'add_column_if_missing_sync']
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,10 @@ def _alter_sql(table: str, column: str, column_ddl: str) -> str:
 
 async def _column_present(db: aiosqlite.Connection, table: str, column: str) -> bool:
     return bool(await db.execute_fetchall(_COLUMN_PRESENT_SQL, (table, column)))
+
+
+def _column_present_sync(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    return conn.execute(_COLUMN_PRESENT_SQL, (table, column)).fetchone() is not None
 
 
 async def add_column_if_missing(
@@ -66,6 +70,23 @@ async def add_column_if_missing(
         await db.execute(statement)
     except sqlite3.OperationalError:
         if not await _column_present(db, table, column):
+            raise
+        logger.debug('%s.%s was added concurrently by another connection', table, column)
+        return False
+    return True
+
+
+def add_column_if_missing_sync(
+    conn: sqlite3.Connection, table: str, column: str, column_ddl: str
+) -> bool:
+    """Synchronous twin of :func:`add_column_if_missing`; same contract."""
+    statement = _alter_sql(table, column, column_ddl)
+    if _column_present_sync(conn, table, column):
+        return False
+    try:
+        conn.execute(statement)
+    except sqlite3.OperationalError:
+        if not _column_present_sync(conn, table, column):
             raise
         logger.debug('%s.%s was added concurrently by another connection', table, column)
         return False
