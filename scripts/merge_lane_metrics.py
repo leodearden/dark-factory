@@ -94,6 +94,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+import _checkout as _checkout
 import source_measures
 
 from shared import safe_io

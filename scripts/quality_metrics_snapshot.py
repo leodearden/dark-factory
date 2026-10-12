@@ -24,6 +24,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol, TypeGuard
 
+import _checkout as _checkout
 import source_measures
 
 from shared import safe_io
