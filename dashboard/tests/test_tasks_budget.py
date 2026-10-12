@@ -30,7 +30,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from dashboard.data import active_tasks, task_snapshot, tasks
+from dashboard.data import active_tasks, mcp_fanout, task_snapshot, tasks
 
 # The tightest real caller of /api/v2/dashboard/tasks is the dashboard's own
 # poll loop, whose fetch wrapper aborts at DEFAULT_TIMEOUT_MS. Parsed out of
@@ -186,4 +186,33 @@ def test_tasks_budget_is_structurally_deliverable() -> None:
         f'whole-handler budget {total}s is smaller than one project\'s '
         f'{per_project}s — no root could ever complete, so every render '
         'would be all-degraded regardless of concurrency or rotation'
+    )
+
+
+def test_snapshot_lock_acquire_bound_is_unreachable_on_the_tasks_path() -> None:
+    """The Tasks path's per-root deadline must fire before TTLCache's lock bound.
+
+    The coupling is described in the reachability comment above
+    ``mcp_fanout._LOCK_ACQUIRE_TIMEOUT_SECONDS``; this pins it.
+    """
+    lock_bound = mcp_fanout._LOCK_ACQUIRE_TIMEOUT_SECONDS
+    per_project = active_tasks._TASKS_PER_PROJECT_BUDGET
+
+    assert lock_bound > per_project, (
+        f'mcp_fanout._LOCK_ACQUIRE_TIMEOUT_SECONDS ({lock_bound}s) is not '
+        'strictly above active_tasks._TASKS_PER_PROJECT_BUDGET '
+        f'({per_project}s). The inequality is DELIBERATE: '
+        'collect_tasks_with_counts (via '
+        'active_tasks._serve_roots_within_budget) runs each root under '
+        'asyncio.wait_for(..., min(remaining, _TASKS_PER_PROJECT_BUDGET)) '
+        "around the snapshot unit's TTLCache.get_or_refresh, so while it "
+        'holds a caller queued on that per-key lock is cancelled before the '
+        f'{lock_bound}s acquire bound could fire, and a wedge on the Tasks '
+        "path surfaces as the snapshot unit's stale/unknown state, never as "
+        'a lock bypass. This failing means a change to one of the two '
+        'constants made the bound REACHABLE on the Tasks path: re-read '
+        'the reachability paragraph above '
+        'mcp_fanout._LOCK_ACQUIRE_TIMEOUT_SECONDS and update it deliberately. '
+        'Do NOT restore the inequality by retuning either constant just to '
+        'pass this test.'
     )
