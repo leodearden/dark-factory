@@ -21,6 +21,8 @@ from shared.task_metadata import Milestone, Recurrence
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TaskStatus
 
+from dashboard.data.escalation_corpus import PendingEscalations
+
 OVERDUE_GRACE_CAP = timedelta(hours=24)
 _OVERDUE_GRACE_CAP_SECS = int(OVERDUE_GRACE_CAP.total_seconds())
 # A necessary-condition prefilter: every chain link carries metadata.recurrence.
@@ -119,7 +121,7 @@ def _entry(
     link: Mapping[str, Any],
     *,
     now: datetime,
-    pending_escalations: Mapping[str, tuple[str, ...]] | None,
+    pending_escalations: PendingEscalations | None,
 ) -> ChainEntry:
     return ChainEntry(
         tag=tag,
@@ -129,7 +131,7 @@ def _entry(
         link_status=link['status'],
         at=_raw_fire_time(link['metadata']),
         pending_escalation_ids=(
-            None if pending_escalations is None else pending_escalations.get(str(link['id']), ())
+            None if pending_escalations is None else pending_escalations.pinning(tag, link['id'])
         ),
     )
 
@@ -138,7 +140,7 @@ def classify_chains(
     rows: Iterable[Mapping[str, Any]],
     *,
     now: datetime,
-    pending_escalations: Mapping[str, tuple[str, ...]] | None,
+    pending_escalations: PendingEscalations | None,
 ) -> tuple[ChainEntry, ...]:
     """One entry per (tag, chain key), sorted; *pending_escalations* None means unknown."""
     links_by_tag: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)

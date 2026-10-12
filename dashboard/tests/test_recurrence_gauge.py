@@ -14,8 +14,10 @@ from typing import Any
 import pytest
 from _tasks_db_fixture import task_row, write_tasks_db
 from shared.task_statuses import TaskStatus
+from shared.task_tags import DEFAULT_TAG
 
 from dashboard.data.db import DbPool
+from dashboard.data.escalation_corpus import PendingEscalations
 from dashboard.data.recurrence_gauge import ChainEntry, ChainState, chain_state, classify_chains
 from dashboard.data.root_invariants import scan_root_invariants
 
@@ -214,11 +216,23 @@ def test_each_entry_names_its_links_pending_escalations():
     entries = _classify(
         link(4, 'blocked', key='failing-job'),
         link(8, 'pending', key='nightly-job'),
-        pending_escalations={'4': ('esc-4-1',)},
+        pending_escalations=PendingEscalations({'4': ('esc-4-1',)}),
     )
     assert {entry.key: entry.pending_escalation_ids for entry in entries} == {
         'failing-job': ('esc-4-1',),
         'nightly-job': (),
+    }
+
+
+def test_a_chain_outside_the_queue_tag_has_an_unknown_pinning_escalation():
+    entries = _classify(
+        link(4, 'blocked', tag='feature'),
+        link(4, 'blocked', tag=DEFAULT_TAG),
+        pending_escalations=PendingEscalations({'4': ('esc-4-1',)}),
+    )
+    assert {entry.tag: entry.pending_escalation_ids for entry in entries} == {
+        'feature': None,
+        DEFAULT_TAG: ('esc-4-1',),
     }
 
 
@@ -229,7 +243,9 @@ def test_an_unknown_escalation_lookup_is_none_on_every_entry():
 
 def test_an_entry_on_the_wire():
     at = NOW - 3 * HOUR
-    (entry,) = _classify(link(4, 'blocked', at), pending_escalations={'4': ('esc-4-1',)})
+    (entry,) = _classify(
+        link(4, 'blocked', at), pending_escalations=PendingEscalations({'4': ('esc-4-1',)})
+    )
     assert entry.to_wire() == {
         'tag': 'master',
         'key': 'nightly-job',
@@ -263,7 +279,9 @@ async def _scan_root(root: Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
     pool = DbPool()
     try:
         conn = await pool.get(db_path)
-        record = await scan_root_invariants(root, db_path, conn, now=NOW, pending_escalations={})
+        record = await scan_root_invariants(
+            root, db_path, conn, now=NOW, pending_escalations=PendingEscalations({})
+        )
     finally:
         await pool.close_all()
     return record.to_wire()
@@ -301,6 +319,6 @@ async def test_metadata_that_only_mentions_recurrence_is_not_a_chain(tmp_path):
 async def test_an_unopened_root_makes_no_chain_claim(tmp_path):
     root = tmp_path / 'proj'
     record = await scan_root_invariants(
-        root, _db_path(root), None, now=NOW, pending_escalations={}
+        root, _db_path(root), None, now=NOW, pending_escalations=PendingEscalations({})
     )
     assert record.to_wire()['chains'] is None

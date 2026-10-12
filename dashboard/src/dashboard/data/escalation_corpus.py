@@ -34,9 +34,11 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import MappingProxyType
 
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths
+from shared.task_tags import DEFAULT_TAG
 
 from dashboard.config import DashboardConfig
 from dashboard.data.datum import Datum, DatumState, unknown_datum
@@ -287,6 +289,23 @@ def views_over(
     }
 
 
+@dataclass(frozen=True, slots=True)
+class PendingEscalations:
+    """One orchestrator queue's pending live escalations, by the id of the task each names.
+
+    An orchestrator names no tag when it reads its tasks, so every task its queue
+    names is in the task store's default tag; of any other tag the queue knows nothing.
+    """
+
+    by_task_id: Mapping[str, tuple[str, ...]]
+
+    def pinning(self, tag: str, task_id: int | str) -> tuple[str, ...] | None:
+        """The ids of the pending escalations naming *tag*/*task_id*; None outside the queue's tag."""
+        if tag != DEFAULT_TAG:
+            return None
+        return self.by_task_id.get(str(task_id), ())
+
+
 def _live_queue_fully_read(scan: QueueScan) -> bool:
     """Whether every file at *scan*'s queue root was read; the archive holds no live escalation."""
     return scan.reached and not any(
@@ -296,8 +315,8 @@ def _live_queue_fully_read(scan: QueueScan) -> bool:
 
 def pending_escalation_ids(
     corpus_datum: Datum[EscalationCorpus], queue_id: str,
-) -> Mapping[str, tuple[str, ...]] | None:
-    """Each task id's pending live-queue escalation ids; None when that queue root was not fully read.
+) -> PendingEscalations | None:
+    """The queue's pending live escalations by task; None when that queue root was not fully read.
 
     A queue directory that was not found is unknown even for a project that has
     never escalated: an absent directory reads the same as an unmounted one.
@@ -315,4 +334,6 @@ def pending_escalation_ids(
     for record in scan.records:
         if EscalationView.QUEUE_PENDING.admits(record):
             by_task.setdefault(record.escalation.task_id, []).append(record.escalation.id)
-    return {task_id: tuple(sorted(ids)) for task_id, ids in by_task.items()}
+    return PendingEscalations(
+        MappingProxyType({task_id: tuple(sorted(ids)) for task_id, ids in by_task.items()})
+    )

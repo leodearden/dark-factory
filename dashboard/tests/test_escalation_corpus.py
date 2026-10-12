@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 from escalation.models import Escalation
+from shared.task_tags import DEFAULT_TAG
 
 import dashboard.data.escalation_corpus as escalation_corpus
 from dashboard.config import DashboardConfig
@@ -29,6 +30,7 @@ from dashboard.data.escalation_corpus import (
     EscalationCorpus,
     EscalationView,
     Location,
+    PendingEscalations,
     QueueKind,
     QueueRef,
     acquire_corpus,
@@ -308,7 +310,19 @@ class TestPendingEscalationIds:
 
         ids = pending_escalation_ids(_fresh(walk_corpus((queue,))), queue.id)
 
-        assert ids == {'7': ('esc-7-1', 'esc-7-2'), '9': ('esc-9-1',)}
+        assert ids == PendingEscalations({'7': ('esc-7-1', 'esc-7-2'), '9': ('esc-9-1',)})
+
+    def test_the_queue_names_only_tasks_of_the_default_tag(self, tmp_path):
+        queue_dir = tmp_path / 'escalations'
+        _write(queue_dir, _record('esc-7-1', task_id='7'))
+        queue = _queue(queue_dir)
+
+        ids = pending_escalation_ids(_fresh(walk_corpus((queue,))), queue.id)
+
+        assert ids is not None
+        assert ids.pinning(DEFAULT_TAG, 7) == ('esc-7-1',)
+        assert ids.pinning(DEFAULT_TAG, 8) == ()
+        assert ids.pinning('feature', 7) is None
 
     def test_resolved_and_archived_records_are_not_in_the_live_queue_view(self, tmp_path):
         queue_dir = tmp_path / 'escalations'
@@ -319,7 +333,7 @@ class TestPendingEscalationIds:
 
         ids = pending_escalation_ids(_fresh(walk_corpus((queue,))), queue.id)
 
-        assert ids == {'7': ('esc-7-1',)}
+        assert ids == PendingEscalations({'7': ('esc-7-1',)})
 
     def test_an_unreached_queue_is_unknown(self, tmp_path):
         queue = _queue(tmp_path / 'never-escalated')
@@ -343,7 +357,7 @@ class TestPendingEscalationIds:
 
         ids = pending_escalation_ids(_fresh(walk_corpus((queue,))), queue.id)
 
-        assert ids == {'7': ('esc-7-1',)}
+        assert ids == PendingEscalations({'7': ('esc-7-1',)})
 
     def test_an_unread_corpus_is_unknown(self, tmp_path):
         unread = unknown_datum('the escalation corpus was not read', CORPUS_FRESHNESS_BOUND_SECONDS)
@@ -361,7 +375,7 @@ class TestPendingEscalationIds:
 
         ids = pending_escalation_ids(_fresh(walk_corpus((first, second))), first.id)
 
-        assert ids == {'7': ('esc-7-1',)}
+        assert ids == PendingEscalations({'7': ('esc-7-1',)})
 
     def test_a_queue_the_corpus_does_not_carry_is_unknown(self, tmp_path):
         queue_dir = tmp_path / 'escalations'

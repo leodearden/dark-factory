@@ -8,7 +8,6 @@ module only reads them from a root's ``tasks.db`` and decides ok versus blind.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -24,6 +23,7 @@ from dashboard.data.claimant_invariants import (
     classify_candidates,
     read_claimant_candidates,
 )
+from dashboard.data.escalation_corpus import PendingEscalations
 from dashboard.data.mcp_fanout import project_label
 from dashboard.data.recurrence_gauge import ChainEntry, classify_chains, read_chain_rows
 
@@ -123,7 +123,7 @@ async def scan_root_invariants(
     conn: aiosqlite.Connection | None,
     *,
     now: datetime,
-    pending_escalations: Mapping[str, tuple[str, ...]] | None,
+    pending_escalations: PendingEscalations | None,
     ttl: timedelta = DEFAULT_CLAIMANT_HEARTBEAT_TTL,
 ) -> RootInvariants:
     """Census one root. Never raises for a failed read: that root alone reports blind.
@@ -132,7 +132,7 @@ async def scan_root_invariants(
     a pooled connection closed under the scan. A caller fanning out over the
     roster therefore never loses the other roots' records to one root's failure.
 
-    *pending_escalations* maps a task id to its pending escalation ids; None is unknown.
+    *pending_escalations* is the root's escalation queue read by task; None is unknown.
     """
     if conn is None:
         return _blind(root, now, _unopened_reason(db_path))
