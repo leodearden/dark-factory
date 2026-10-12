@@ -24,6 +24,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _fm_helpers import load_script_module
+from shared.cli_boundary import EXIT_STDOUT_FAILED, run_cli
+from shared.testing_streams import closed_pipe_stdout
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'repair_recon_citation.py'
 
@@ -535,3 +537,42 @@ class TestMainStartupFailures:
         outcome = json.loads(capsys.readouterr().out)
         assert 'status' not in outcome
         assert _mod.exit_code_for(outcome) == 1
+
+
+def _error_lines(stderr: str) -> list[str]:
+    """Only the ``error:`` lines: logging may or may not reach stderr under
+    pytest's root handlers, so the whole stream is not a stable count."""
+    return [line for line in stderr.splitlines() if line.startswith('error: ')]
+
+
+@pytest.mark.parametrize('buffering', [None, 1], ids=['deferred', 'in-band'])
+class TestALateStdoutFailureNamesTheCommittedRepair:
+    """The outcome is printed AFTER --apply committed the repair it reports.
+    A stdout failure there must say the repair landed: the exit status alone
+    says only that the run could not complete."""
+
+    def test_an_applied_repair_is_named(self, monkeypatch, wiring, capsys, buffering):
+        TestMain._patch_repair(monkeypatch, return_value={'status': 'repaired'})
+        monkeypatch.setattr(sys, 'argv', ['repair_recon_citation', *_REQUIRED, '--apply'])
+
+        with closed_pipe_stdout(monkeypatch, buffering=buffering, quiet_close=True):
+            code = run_cli(_mod.main)
+        monkeypatch.undo()
+
+        assert code == EXIT_STDOUT_FAILED
+        errors = _error_lines(capsys.readouterr().err)
+        assert len(errors) == 1
+        assert errors[0].endswith('(--apply already committed the repair)')
+
+    def test_a_dry_run_claims_no_repair(self, monkeypatch, wiring, capsys, buffering):
+        TestMain._patch_repair(monkeypatch, return_value={'status': 'dry_run'})
+        monkeypatch.setattr(sys, 'argv', ['repair_recon_citation', *_REQUIRED])
+
+        with closed_pipe_stdout(monkeypatch, buffering=buffering, quiet_close=True):
+            code = run_cli(_mod.main)
+        monkeypatch.undo()
+
+        assert code == EXIT_STDOUT_FAILED
+        errors = _error_lines(capsys.readouterr().err)
+        assert len(errors) == 1
+        assert '(' not in errors[0]
