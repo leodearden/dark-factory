@@ -7,6 +7,7 @@ Covers:
   4. Write-once: backend has value, in-memory is stale → adopt backend, no re-stamp (step-7/8).
   5. Persistence failure is non-fatal (step-9/10).
   6. _submit_to_merge_queue threads merge_first_enqueued_at onto the MergeRequest (step-11/12).
+  7. _submit_to_merge_queue marks its MergeRequest awaited_by_workflow (task 4953).
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _merge_lane_fakes import drive_merge
+from _merge_lane_fakes import DrivenMerge, drive_merge
 from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
@@ -321,6 +322,37 @@ async def test_persistence_failure_is_non_fatal():
 # ---------------------------------------------------------------------------
 
 
+async def _drive_submission(f: _Fixture, worktree: Path) -> DrivenMerge:
+    """Run the REAL _submit_to_merge_queue for task '99' and play the merger.
+
+    A REAL queue, so the REAL register_and_enqueue_merge_request runs and the
+    request a test reads is the one the production path actually enqueued --
+    not one handed to a substitute. Nothing is draining the queue, so the
+    submit parks on its result until drive_merge takes the enqueued request
+    off it, resolves it, and lets the submit finish.
+    """
+    wf = f.wf
+    wf.worktree = worktree
+    wf.worktree.mkdir(parents=True, exist_ok=True)
+    merge_queue: asyncio.Queue = asyncio.Queue()
+    wf.merge_queue = merge_queue
+    wf.merge_inflight_registry = None  # skip attach branch
+    wf.plan = {'files': []}
+    wf._module_configs = []
+    # task-1923: _submit_to_merge_queue now calls rebind_branch_to_head
+    # (belt-and-braces rebind before enqueue); must be AsyncMock for await.
+    wf.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)
+
+    driven = await drive_merge(
+        wf._submit_to_merge_queue('99', pre_rebased=False),
+        merge_queue,
+        MergeOutcome('blocked', reason='generic'),
+    )
+
+    assert merge_queue.empty(), 'exactly one request must be enqueued'
+    return driven
+
+
 @pytest.mark.asyncio
 async def test_submit_to_merge_queue_threads_first_enqueued_at_onto_request(
     tmp_path: Path,
@@ -337,31 +369,21 @@ async def test_submit_to_merge_queue_threads_first_enqueued_at_onto_request(
         metadata={'retry_ledger': {'merge_first_enqueued_at': str(111.0)}},
         get_task_metadata={'retry_ledger': {'merge_first_enqueued_at': str(111.0)}},
     )
-    wf = f.wf
-    wf.worktree = tmp_path / 'wt'
-    wf.worktree.mkdir(parents=True, exist_ok=True)
-    # A REAL queue, so the REAL register_and_enqueue_merge_request runs and
-    # the request this test reads is the one the production path actually
-    # enqueued -- not one handed to a substitute.
-    merge_queue: asyncio.Queue = asyncio.Queue()
-    wf.merge_queue = merge_queue
-    wf.merge_inflight_registry = None  # skip attach branch
-    wf.plan = {'files': []}
-    wf._module_configs = []
-    # task-1923: _submit_to_merge_queue now calls rebind_branch_to_head
-    # (belt-and-braces rebind before enqueue); must be AsyncMock for await.
-    wf.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)
 
-    # Nothing is draining the queue, so the submit parks on its result until
-    # this test plays the merger: drive_merge takes the enqueued request off
-    # the real queue, resolves it, and lets the submit finish.
-    driven = await drive_merge(
-        wf._submit_to_merge_queue('99', pre_rebased=False),
-        merge_queue,
-        MergeOutcome('blocked', reason='generic'),
-    )
+    driven = await _drive_submission(f, tmp_path / 'wt')
 
-    assert merge_queue.empty(), 'exactly one request must be enqueued'
     assert driven.request.merge_first_enqueued_at == 111.0
     # Write-once fast-path: no persist call
     f.update_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_submit_to_merge_queue_marks_its_request_workflow_awaited(tmp_path: Path):
+    """The workflow parks its task merge-deferred on a 'superseded' outcome, so
+    its request is the one kind the coalescing pass may absorb (task 4953).
+
+    If this site forgot the flag, coalescing would silently stop for everyone.
+    """
+    driven = await _drive_submission(_make(), tmp_path / 'wt')
+
+    assert driven.request.awaited_by_workflow is True
