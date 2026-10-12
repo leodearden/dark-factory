@@ -53,6 +53,8 @@ Pure throughout: no I/O, no side effects, no task writes.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from fused_memory.reconciliation.curator_gate_resolution_sweep import (
     GATE_RESOLUTION_FLAG_TYPE,
 )
@@ -164,7 +166,7 @@ def render_gate_owned_action_norm() -> str:
     )
 
 
-def extract_human_gated_task_ids(tasks):
+def extract_human_gated_task_ids(tasks: Iterable[object]) -> list[str]:
     """Return sorted, deduped str ids of human-gate-owned tasks.
 
     A task qualifies when it is a ``dict`` with a ``dict`` ``metadata``

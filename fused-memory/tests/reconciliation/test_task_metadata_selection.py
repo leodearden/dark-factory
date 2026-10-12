@@ -7,13 +7,14 @@ they pass, so the traversal contract (malformed shapes skipped, ``str`` id
 coercion, sorted dedup, empty input) is pinned once, here.
 
 Rows mixing in non-``dict`` elements are passed as plain lists: the helper
-takes ``Iterable[object]``, so such an element is in-contract for it, whereas
-``FilteredTaskTree.active_tasks`` is declared ``list[dict]``.
+and both selectors take ``Iterable[object]``, so such an element is
+in-contract for them, whereas ``FilteredTaskTree.active_tasks`` is declared
+``list[dict]``.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 import pytest
@@ -22,6 +23,22 @@ from fused_memory.reconciliation.curator_gate_resolution_sweep import extract_op
 from fused_memory.reconciliation.gate_owned_finding_phrasing import extract_human_gated_task_ids
 from fused_memory.reconciliation.task_filter import FilteredTaskTree
 from fused_memory.reconciliation.task_metadata_selection import select_task_ids_by_metadata
+
+#: Skipped before the predicate is consulted: the task or its metadata is not a dict.
+_ROWS_WITHOUT_DICT_METADATA: tuple[object, ...] = (
+    'not-a-dict',
+    None,
+    {'id': 1, 'metadata': 'operational_mode=gate'},
+    {'id': 2, 'metadata': ['gate']},
+    {'id': 3, 'metadata': None},
+    {'id': 4},
+)
+
+#: Skipped after the predicate matches: the id is ``None`` or absent.
+_GATE_ROWS_WITHOUT_ID: tuple[object, ...] = (
+    {'id': None, 'metadata': {'operational_mode': 'gate'}},
+    {'metadata': {'operational_mode': 'gate'}},
+)
 
 
 class TestSelectTaskIdsByMetadata:
@@ -50,16 +67,7 @@ class TestSelectTaskIdsByMetadata:
             return True
 
         select_task_ids_by_metadata(
-            [
-                'not-a-dict',
-                None,
-                {'id': 1, 'metadata': 'str'},
-                {'id': 2, 'metadata': ['x']},
-                {'id': 3, 'metadata': None},
-                {'id': 4},
-                {'id': 5, 'metadata': m5},
-            ],
-            record,
+            [*_ROWS_WITHOUT_DICT_METADATA, {'id': 5, 'metadata': m5}], record,
         )
 
         assert len(recorded) == 1 and recorded[0] is m5, (
@@ -72,14 +80,8 @@ class TestSelectTaskIdsByMetadata:
         """Non-dict elements, non-dict/absent metadata and missing/None ids contribute nothing."""
         result = select_task_ids_by_metadata(
             [
-                'not-a-dict',
-                None,
-                {'id': 1, 'metadata': 'operational_mode=gate'},
-                {'id': 2, 'metadata': ['gate']},
-                {'id': 3, 'metadata': None},
-                {'id': 4},
-                {'id': None, 'metadata': {'operational_mode': 'gate'}},
-                {'metadata': {'operational_mode': 'gate'}},
+                *_ROWS_WITHOUT_DICT_METADATA,
+                *_GATE_ROWS_WITHOUT_ID,
                 {'id': 12, 'metadata': {'operational_mode': 'gate'}},
             ],
             lambda m: True,
@@ -111,27 +113,6 @@ class TestSelectTaskIdsByMetadata:
         assert select_task_ids_by_metadata([], lambda m: True) == []
 
 
-def _gate_rows_with_malformed_shapes() -> list[dict]:
-    """Malformed shapes plus valid rows that BOTH gate predicates match.
-
-    Every valid row carries ``operational_mode == 'gate'``, so the two
-    selectors must return the same ids from it.
-    """
-    return FilteredTaskTree(active_tasks=[
-        'not-a-dict',  # type: ignore[list-item]
-        None,  # type: ignore[list-item]
-        {'id': 1, 'metadata': 'operational_mode=gate'},
-        {'id': 2, 'metadata': ['gate']},
-        {'id': 3, 'metadata': None},
-        {'id': 4},
-        {'id': None, 'metadata': {'operational_mode': 'gate'}},
-        {'metadata': {'operational_mode': 'gate'}},
-        {'id': 5563, 'metadata': {'operational_mode': 'gate'}},
-        {'id': '5561', 'metadata': {'operational_mode': 'gate'}},
-        {'id': 5561, 'metadata': {'operational_mode': 'gate'}},
-    ]).active_tasks
-
-
 _GATE_SELECTORS = pytest.mark.parametrize(
     'selector',
     [extract_open_gate_task_ids, extract_human_gated_task_ids],
@@ -149,10 +130,20 @@ class TestGateSelectorsShareTheTraversal:
 
     @_GATE_SELECTORS
     def test_skips_malformed_shapes_and_returns_sorted_deduped_str_ids(
-        self, selector: Callable[[list[dict]], list[str]],
+        self, selector: Callable[[Iterable[object]], list[str]],
     ):
-        """Malformed shapes contribute nothing; int and str ids collapse; the result is sorted."""
-        result = selector(_gate_rows_with_malformed_shapes())
+        """Malformed shapes contribute nothing; int and str ids collapse; the result is sorted.
+
+        Every well-formed row carries ``operational_mode == 'gate'``, which
+        BOTH predicates match, so the two selectors must return the same ids.
+        """
+        result = selector([
+            *_ROWS_WITHOUT_DICT_METADATA,
+            *_GATE_ROWS_WITHOUT_ID,
+            {'id': 5563, 'metadata': {'operational_mode': 'gate'}},
+            {'id': '5561', 'metadata': {'operational_mode': 'gate'}},
+            {'id': 5561, 'metadata': {'operational_mode': 'gate'}},
+        ])
 
         assert result == ['5561', '5563'], (
             'malformed elements must be skipped without raising, int and str '
@@ -162,7 +153,7 @@ class TestGateSelectorsShareTheTraversal:
 
     @_GATE_SELECTORS
     def test_empty_input_returns_empty_list(
-        self, selector: Callable[[list[dict]], list[str]],
+        self, selector: Callable[[Iterable[object]], list[str]],
     ):
         """No active tasks -> []."""
         assert selector(FilteredTaskTree().active_tasks) == []

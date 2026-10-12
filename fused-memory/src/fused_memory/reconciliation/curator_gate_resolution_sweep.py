@@ -85,6 +85,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Iterable
 
 from fused_memory.reconciliation.task_metadata_selection import select_task_ids_by_metadata
 
@@ -124,7 +125,7 @@ def curator_gate_source(task_id) -> str:
     return CURATOR_GATE_SOURCE_TEMPLATE.format(task_id=str(task_id))
 
 
-def extract_open_gate_task_ids(tasks: list[dict]) -> list[str]:
+def extract_open_gate_task_ids(tasks: Iterable[object]) -> list[str]:
     """Return sorted, deduped str ids of open human-curator gate tasks.
 
     A task qualifies when ALL hold:
