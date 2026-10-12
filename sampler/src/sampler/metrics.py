@@ -2,9 +2,9 @@
 
 Purpose
 -------
-Collect the host-load metrics of one tick and return them as a flat dict of
-``{metric_name: float}``. The count is NOT fixed: it is 11 plus two per
-discovered cgroup leaf (25 on this host today, where seven leaves are
+Collect the host-load metrics of one tick and return them as a ``Samples``
+mapping of ``SampleKey`` to value. The count is NOT fixed: it is 11 plus two
+per discovered cgroup leaf (25 on this host today, where seven leaves are
 present).
 
 PSI metrics (6) — kernel-windowed, no re-windowing, NULL DB windows:
@@ -16,7 +16,8 @@ Process metrics (3) — carry trailing window_mean/window_max in the DB:
 Load metrics (2 + 2 per cgroup leaf) — also carry trailing windows
 (PRD ``plans/load-throttle-harmonisation-prd.md`` §6.4):
     runqueue_ratio, runqueue_read_ok,
-    own_cpu_some10:<leaf>, own_read_ok:<leaf>
+    own_cpu_some10 and own_read_ok, one key per discovered leaf with the leaf
+    in its own field
 
 Design decisions
 ----------------
@@ -41,9 +42,9 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from shared.psi import (
     RunqueueReading,
@@ -56,6 +57,8 @@ from shared.psi import (
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    'SampleKey',
+    'Samples',
     'parse_pressure_file',
     'collect_psi',
     'count_occt_queue_depth',
@@ -67,6 +70,24 @@ __all__ = [
     'ARM_METRIC_STEMS',
 ]
 
+class SampleKey(NamedTuple):
+    """One recorded series: a metric, and the cgroup leaf it is about.
+
+    ``leaf`` is ``None`` for a host-level metric. A per-leaf metric is
+    recorded once per discovered leaf, and the leaf is opaque data.
+    """
+
+    metric: str
+    leaf: str | None = None
+
+    def label(self) -> str:
+        """Display rendering only, ``metric`` or ``metric:leaf``; nothing parses it."""
+        return self.metric if self.leaf is None else f'{self.metric}:{self.leaf}'
+
+
+Samples = Mapping[SampleKey, float]
+
+
 ARM_METRIC_STEMS = {
     'mem_full_avg10': 'psi_mem_full_avg10',
     'mem_some_avg10': 'psi_mem_some_avg10',
@@ -75,7 +96,7 @@ ARM_METRIC_STEMS = {
     'runqueue_ratio': 'runqueue_ratio',
     'own_cpu_some_avg10': 'own_cpu_some10',
 }
-"""Gate ARM name -> the sampler metric name (or ':' stem) recording that arm.
+"""Gate ARM name -> the sampler metric recording that arm.
 
 PRD ``plans/load-throttle-harmonisation-prd.md`` §6.4, boundary row 11. The
 gate decides on arms (``shared.psi._ARMS``, whose field names are also the
@@ -100,9 +121,8 @@ why this is an explicit table and not a rule: the four host arms gain a
 (``avg10`` against ``10``), and ``runqueue_ratio`` maps to itself. Neither
 the identity nor a systematic rewrite covers all three.
 
-Two of the six values are ':' STEMS rather than whole metric names —
-``own_cpu_some10`` is emitted as ``own_cpu_some10:<cgroup-leaf>``, one row
-per discovered leaf (PRD open question 1, resolved as the stem spelling).
+``own_cpu_some10`` is a PER-LEAF metric: it is recorded once per discovered
+cgroup leaf, with the leaf as data in ``SampleKey.leaf``.
 ``scripts/load-threshold-calibration.py`` carries the same correspondence by
 necessity — it runs under the system python3 and cannot import this module —
 and a lockstep test reconciles the two.
@@ -197,7 +217,7 @@ def discover_pressure_cgroups(
 def collect_psi(
     *,
     read: Callable[[str], str] = read_pressure,
-) -> dict[str, float]:
+) -> Samples:
     """Return the 6 PSI avg10 values keyed as psi_{cpu,mem,io}_{some,full}_avg10.
 
     Args:
@@ -209,7 +229,7 @@ def collect_psi(
         ('memory', 'mem'),
         ('io', 'io'),
     ]
-    out: dict[str, float] = {}
+    out: dict[SampleKey, float] = {}
     for file_name, key_prefix in sources:
         text = read(file_name)
         parsed = parse_pressure_file(text)
@@ -221,8 +241,8 @@ def collect_psi(
                 len(text),
             )
             continue
-        out[f'psi_{key_prefix}_some_avg10'] = parsed['some_avg10']
-        out[f'psi_{key_prefix}_full_avg10'] = parsed['full_avg10']
+        out[SampleKey(f'psi_{key_prefix}_some_avg10')] = parsed['some_avg10']
+        out[SampleKey(f'psi_{key_prefix}_full_avg10')] = parsed['full_avg10']
     return out
 
 
@@ -237,7 +257,7 @@ def collect_load_metrics(
     own_cgroup_path: str | None = None,
     proc_cgroup_path: str | Path | None = None,
     cgroup_root: Path = _CGROUP_ROOT,
-) -> dict[str, float]:
+) -> Samples:
     """Return the runqueue and per-cgroup own-pressure metrics for one tick.
 
     PRD ``plans/load-throttle-harmonisation-prd.md`` §6.4. Shaped exactly like
@@ -272,9 +292,9 @@ def collect_load_metrics(
         cgroup_root: Where the unified hierarchy is mounted.
     """
     runqueue = read_runqueue()
-    out: dict[str, float] = {'runqueue_read_ok': float(runqueue.read_ok)}
+    out: dict[SampleKey, float] = {SampleKey('runqueue_read_ok'): float(runqueue.read_ok)}
     if runqueue.read_ok:
-        out['runqueue_ratio'] = float(runqueue.ratio)
+        out[SampleKey('runqueue_ratio')] = float(runqueue.ratio)
 
     if own_cgroup_path is None:
         seam = {} if proc_cgroup_path is None else {'proc_cgroup_path': proc_cgroup_path}
@@ -293,8 +313,8 @@ def collect_load_metrics(
         # manager) -> debug. An anchor that resolved but enumerated nothing is a
         # surprise worth a warning: we are in a user manager and it holds
         # neither a df-*.slice nor an orchestrator-*.service. Either way the
-        # corpus stays the channel that matters -- absent own_read_ok:<leaf>
-        # rows make the condition countable without reading the journal.
+        # corpus stays the channel that matters -- absent own_read_ok rows make
+        # the condition countable without reading the journal.
         #
         # The surviving warning branch is per-tick too, and that was weighed
         # rather than overlooked. It is a SEVERITY signal, not new volume:
@@ -318,9 +338,9 @@ def collect_load_metrics(
         )
     for leaf_name, pressure_path in leaves:
         some_avg10 = _read_leaf_some_avg10(pressure_path)
-        out[f'own_read_ok:{leaf_name}'] = float(some_avg10 is not None)
+        out[SampleKey('own_read_ok', leaf_name)] = float(some_avg10 is not None)
         if some_avg10 is not None:
-            out[f'own_cpu_some10:{leaf_name}'] = some_avg10
+            out[SampleKey('own_cpu_some10', leaf_name)] = some_avg10
     return out
 
 
@@ -429,12 +449,12 @@ def collect_process_metrics(
     *,
     proc_iter: Any = None,
     fd9_exists: Callable[[int], bool] = _default_fd9_exists,
-) -> dict[str, float]:
+) -> Samples:
     """Materialise the live process list and return the 3 non-PSI metrics.
 
     Returns:
-        {'occt_queue_depth': float, 'verify_concurrency': float,
-         'verify_rss_total_bytes': float}
+        The host-level keys occt_queue_depth, verify_concurrency and
+        verify_rss_total_bytes.
 
     Per-process psutil.NoSuchProcess / AccessDenied are silently skipped.
     """
@@ -450,7 +470,7 @@ def collect_process_metrics(
     # access-denied between listing and inspection.  A separate p.cmdline()
     # probe here would add a redundant OS call per process on the 5s hot path.
     return {
-        'occt_queue_depth': float(count_occt_queue_depth(procs, fd9_exists)),
-        'verify_concurrency': float(count_verify_concurrency(procs)),
-        'verify_rss_total_bytes': float(sum_verify_rss(procs)),
+        SampleKey('occt_queue_depth'): float(count_occt_queue_depth(procs, fd9_exists)),
+        SampleKey('verify_concurrency'): float(count_verify_concurrency(procs)),
+        SampleKey('verify_rss_total_bytes'): float(sum_verify_rss(procs)),
     }

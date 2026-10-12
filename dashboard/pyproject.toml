@@ -37,17 +37,19 @@ dependencies = [
     "anyio>=4.0",
     "escalation>=0.1",
     "dark-factory-shared",
+    "dark-factory-load-sampler",
 ]
 
 [tool.uv.sources]
 escalation = { workspace = true }
 dark-factory-shared = { workspace = true }
+dark-factory-load-sampler = { workspace = true }
 
 [tool.pyright]
 include = ["src", "tests"]
 # ".." LAST (mirrors tests/conftest.py's sys.path.append): resolves the repo-root
 # df_pytest_isolation module without letting project dirs shadow their own src/.
-extraPaths = ["src", "../shared/src", "../escalation/src", ".."]
+extraPaths = ["src", "../shared/src", "../escalation/src", "../sampler/src", ".."]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 reportUnnecessaryTypeIgnoreComment = "error"
