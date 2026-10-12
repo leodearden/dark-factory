@@ -138,6 +138,7 @@ from pathlib import Path
 from escalation.dedupe import gate_backlog_fingerprint_key
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue, escalation_id_lock
+from shared.cli_boundary import reset_stdout_failure_state
 
 from fused_memory.reconciliation.stage1_stall_detector import (
     STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS,
@@ -629,6 +630,14 @@ def main(argv: list[str] | None = None) -> int:
     resolved or a cycle rewrote the record) and the third is self-healing on a
     re-run, whereas drift means the rewrite itself is unsafe.
     """
+    report: dict | None = None
+
+    def _applied_rewrites() -> str | None:
+        if report is None or report['dry_run']:
+            return None
+        return f"--apply already rewrote {report['rewritten']} record(s)"
+
+    reset_stdout_failure_state(detail=_applied_rewrites)
     logging.basicConfig(level=logging.INFO, format='%(levelname)s %(name)s %(message)s')
 
     parser = argparse.ArgumentParser(
