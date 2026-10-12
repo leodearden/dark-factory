@@ -80,7 +80,7 @@ from escalation.server_instructions import ESCALATION_SERVER_INSTRUCTIONS
 from escalation.store_identity import StoreIdentity
 
 if TYPE_CHECKING:
-    from orchestrator.merge_lane.queue_store import (  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.queue_store import (
         MergeQueueStore,
         PersistedMergeRequest,
     )
@@ -409,7 +409,7 @@ def _get_merge_journal(harness: Any | None) -> MergeQueueStore | None:
     if harness is None:
         return None
     try:
-        from orchestrator.merge_lane.queue_store import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.queue_store import (
             MergeQueueStore,
         )
     except ImportError:

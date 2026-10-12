@@ -48,7 +48,6 @@ try:
         GitConfig,
         OrchestratorConfig,
     )
-    from orchestrator.event_store import EventStore, EventType  # type: ignore[reportMissingImports]
     from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
         InFlightMergeRegistry,
     )
@@ -58,8 +57,6 @@ except ImportError:
     _ORCHESTRATOR_AVAILABLE = False
     GitConfig: Any = None  # type: ignore[assignment,misc]
     OrchestratorConfig: Any = None  # type: ignore[assignment,misc]
-    EventStore: Any = None  # type: ignore[assignment,misc]
-    EventType: Any = None  # type: ignore[assignment,misc]
     InFlightMergeRegistry: Any = None  # type: ignore[assignment,misc]
     MergeOutcome: Any = None  # type: ignore[assignment,misc]
 
@@ -93,6 +90,8 @@ def _finalized_store(tmp_path: Path, raw_state: str, request_id: str = 'mr-final
     Hand the returned instance to ``create_server`` so the row is the server's
     own run.
     """
+    from orchestrator.event_store import EventStore, EventType
+
     event_store = EventStore(tmp_path / 'runs.db', 'run-wiring')
     event_store.emit(
         EventType.merge_finalized,

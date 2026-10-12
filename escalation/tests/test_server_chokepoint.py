@@ -2009,7 +2009,7 @@ class TestMergeCancel:
         merge_cancel('mr-finalized') must return {cancelled: False, state: 'done', reason:
         <non-empty>} — not an epistemic state.  merge_cancel('mr-never') returns 'no_record'.
         """
-        from orchestrator.event_store import (  # type: ignore[reportMissingImports]
+        from orchestrator.event_store import (
             EventStore,
             EventType,
         )
@@ -2060,11 +2060,11 @@ class TestMergeCancel:
         'mr-finalized' has a 'conflict' merge_finalized row in the server's own
         run and a disagreeing 'done' ring record; 'mr-never' is in neither.
         """
-        from orchestrator.event_store import (  # type: ignore[reportMissingImports]
+        from orchestrator.event_store import (
             EventStore,
             EventType,
         )
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_queue import (
             TerminalOutcomeRecord,
             TerminalOutcomeRetention,
         )
@@ -2453,8 +2453,8 @@ class TestBoundaryTableMcpSurface:
         """
         import time
 
-        from orchestrator.event_store import EventStore  # type: ignore[reportMissingImports]
-        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+        from orchestrator.event_store import EventStore
+        from orchestrator.merge_queue import MergeOutcome
 
         worker = _FakeMergeWorker()
         event_store = EventStore(db_path=tmp_path / 'events-sc4.db', run_id='sc4')
@@ -2676,7 +2676,7 @@ class TestBoundaryTableMcpSurface:
         test_bounded_wait_disconnect_does_not_cancel_entry with new-session
         merge_status cross-check.
         """
-        from orchestrator.event_store import EventStore  # type: ignore[reportMissingImports]
+        from orchestrator.event_store import EventStore
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             InFlightMergeRegistry,  # type: ignore[reportMissingImports]
             MergeOutcome,

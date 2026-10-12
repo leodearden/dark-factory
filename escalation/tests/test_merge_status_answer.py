@@ -401,5 +401,6 @@ class TestWithLastOutcome:
             MergeState.no_record, reason=MergeReason.never_submitted, request_id=None,
         )
 
+        field = 'state'
         with pytest.raises(dataclasses.FrozenInstanceError):
-            answer.state = MergeState.done  # type: ignore[misc]
+            setattr(answer, field, MergeState.done)

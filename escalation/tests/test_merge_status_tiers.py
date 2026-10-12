@@ -22,12 +22,12 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from _merge_tool_calls import call_merge_cancel, call_merge_status
-from orchestrator.config import (  # type: ignore[reportMissingImports]
+from orchestrator.config import (
     GitConfig,
     OrchestratorConfig,
 )
-from orchestrator.event_store import EventStore, EventType  # type: ignore[reportMissingImports]
-from orchestrator.merge_lane.queue_store import (  # type: ignore[reportMissingImports]
+from orchestrator.event_store import EventStore, EventType
+from orchestrator.merge_lane.queue_store import (
     MergeQueueStore,
 )
 from shared.merge_state import CANCEL_STATES, OUTCOME_STATES, MergeReason, MergeState
