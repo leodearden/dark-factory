@@ -22,13 +22,15 @@ In-process pytest resolution is handled by ``scripts/tests/conftest.py``.
 """
 from __future__ import annotations
 
+import contextlib
 import enum
 import importlib
 import inspect
 import logging
 import re
 import sys
-from collections.abc import Iterable
+import traceback
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal, overload
@@ -44,6 +46,71 @@ logger = logging.getLogger(PROBE_LOGGER_NAME)
 
 class Unverifiable(Exception):
     """The invariant could not be evaluated. Fails closed, never passes."""
+
+
+_FAILING_CLOSED = '      Failing closed — an unverifiable invariant is not a satisfied one.'
+
+
+def report_fail_closed(evaluate: Callable[[list[str]], int]) -> int:
+    """Run *evaluate* into a report on stdout and return its exit code.
+
+    *evaluate* appends the report's lines to the list it is handed and returns
+    ``EXIT_OK`` or ``EXIT_FAIL``. Everything after argparse belongs here, so
+    the two probes cannot drift on how a crash or a warning is reported.
+
+    NOTHING ESCAPES. Any ``BaseException`` is an UNVERIFIABLE verdict: a probe
+    executes the ref's own code, and a ``SystemExit(0)`` out of it once exited
+    0 having printed nothing, which the gate read as PASS and authorised the
+    flip on. ``KeyboardInterrupt`` too: an interrupted run is unverifiable,
+    never anything else.
+
+    WARNINGS go LAST, so they survive a tail-truncated report, and on STDOUT,
+    the one channel the gate always reads. It quotes stderr only as a bounded
+    tail where stdout carried no verdict, so propagation is off for the run: a
+    copy on stderr would only compete for that tail.
+    """
+    out: list[str] = []
+    with _collected_warnings() as warnings:
+        try:
+            rc = evaluate(out)
+        except Unverifiable as exc:
+            out.append(f'FAIL  UNVERIFIABLE: {exc}')
+            out.append(_FAILING_CLOSED)
+            rc = EXIT_FAIL
+        except BaseException as exc:
+            out.append(
+                f'FAIL  UNVERIFIABLE: the probe raised {exc!r} while evaluating '
+                'the invariant.',
+            )
+            out.append(_FAILING_CLOSED)
+            out.extend('      ' + line for line in traceback.format_exc().splitlines())
+            rc = EXIT_FAIL
+    out.extend(f'WARN  {message}' for message in dict.fromkeys(warnings))
+    sys.stdout.write('\n'.join(out) + '\n')
+    return rc
+
+
+class _Collector(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
+@contextlib.contextmanager
+def _collected_warnings() -> Iterator[list[str]]:
+    """The probe logger's WARNING+ messages, collected for the block only."""
+    collector = _Collector()
+    propagate = logger.propagate
+    logger.addHandler(collector)
+    logger.propagate = False
+    try:
+        yield collector.messages
+    finally:
+        logger.removeHandler(collector)
+        logger.propagate = propagate
 
 
 class Candidate:
