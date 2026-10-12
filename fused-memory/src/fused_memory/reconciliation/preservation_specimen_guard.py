@@ -26,7 +26,7 @@ this module is shaped around:
    whole filter chain, so nothing wired beside ``filter_entity_standing_decisions``
    runs on a remediation pass — and the recurrences that continued after the
    widening were remediation runs.  This guard is therefore wired ABOVE that
-   early-return.
+   early-return, and so are both of its disclosures.
 2. ``flag_type`` is free-form LLM output.  This ONE false positive has already
    worn at least three distinct namings — ``task_stranded_no_claimant``,
    ``task_stranded_no_claimant_heartbeat``, ``stranded_merge_phase_liveness``.
@@ -59,7 +59,7 @@ task-id splitter), ``flag_shape`` (the leaf ``contains_any_casefolded``
 matcher), ``services.memory_service`` (for the canonical raw-payload content
 extractor) and, optionally, ``escalation.dedupe.file_or_fold_l1``.  It reaches
 nothing in ``stages/``, ``middleware/`` or ``prompts/``; the consolidator
-calls in.  It performs detection only — it drops flags, never writes tasks or
+calls in, passing the journal its persistence check reads.  It performs detection only — it drops flags, never writes tasks or
 memories.
 
 WHAT "DISTINCTIVE" MEANS HERE, AND WHY IT IS CHECKED.  Both token families are
@@ -79,7 +79,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -107,6 +107,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    'CANDIDATE_TASK_IDS_STAT',
     'CATEGORY_PRESERVATION_SPECIMEN_STORM',
     'MEM0_KIND_INVESTIGATION_OUTCOME',
     'PRESERVATION_CORROBORATION_BUDGET_SECONDS',
@@ -115,7 +116,9 @@ __all__ = [
     'STRANDED_ACTION_TARGET_FAMILY',
     'STRANDED_ACTION_VERB_FAMILY',
     'STRANDED_FLAG_TOKEN_FAMILY',
+    'UNRESOLVED_CORROBORATION_STREAK_THRESHOLD',
     'UNRESOLVED_CORROBORATION_SUBJECT',
+    'UNRESOLVED_TASK_IDS_STAT',
     'GRAPHITI_TASK_ENTITY_TEMPLATE',
     'PreservationSuppressionResult',
     'cites_preservation',
@@ -247,6 +250,23 @@ CATEGORY_PRESERVATION_SPECIMEN_STORM: str = 'reconciliation_preservation_specime
 #: it findable via ``get_by_task`` and folding into a single parent across
 #: cycles, with the affected task ids carried in the detail.
 UNRESOLVED_CORROBORATION_SUBJECT: str = 'preservation_specimen_guard'
+
+#: Consecutive Stage-1 passes that must flag a task and leave it uncorroborated
+#: before the unresolved-corroboration record files.  Three, so a spike covering
+#: one full cycle plus its remediation pass — two passes minutes apart — cannot
+#: file alone.  Same value as
+#: ``standing_decision_constants.SUPPRESSION_STREAK_THRESHOLD_CYCLES``, and, like
+#: the storm threshold, deliberately not imported: the gates are independent.
+UNRESOLVED_CORROBORATION_STREAK_THRESHOLD: int = 3
+
+#: ``StageReport.stats`` keys under which every Stage-1 pass records what it
+#: observed: the tasks it looked up, and the subset it could not corroborate.
+#: Later passes read them back from the journal to measure persistence.
+CANDIDATE_TASK_IDS_STAT: str = 'preservation_specimen_candidate_task_ids'
+UNRESOLVED_TASK_IDS_STAT: str = 'preservation_specimen_unresolved_task_ids'
+
+#: Floor on how many past runs the persistence check reads.
+_UNRESOLVED_HISTORY_MIN_RUNS: int = 20
 
 #: Finding-category components of the two records' dedupe fingerprints — the
 #: second axis of ``compute_content_fingerprint``.  Distinct values are what
@@ -800,9 +820,9 @@ async def filter_preservation_specimen_flags(
     false positive the rotation has absorbed since August.  But a BARE fail-open
     would make "corroboration unreadable" byte-identical to "no citation
     exists", and the destructive recommendation would then flow on unremarked;
-    disclosing the unresolved tasks in the result (surfaced as a stat and
-    reported through the storm escape) is what keeps the degradation visible at
-    the point of consumption.  A per-task failure costs that task's verdict
+    disclosing the unresolved tasks in the result (published as stats every
+    pass, and escalated once a task's blindness persists across passes) is what
+    keeps the degradation visible at the point of consumption.  A per-task failure costs that task's verdict
     only, never the batch.
 
     Returns a :class:`PreservationSuppressionResult`; the caller assigns
@@ -912,6 +932,109 @@ async def filter_preservation_specimen_flags(
     )
 
 
+# ── Persistence of unresolved corroboration ─────────────────────────────────
+
+
+@dataclass(frozen=True)
+class _CorroborationObservation:
+    """What one past Stage-1 pass recorded: tasks looked up, and those left unresolved."""
+
+    candidates: frozenset[str]
+    unresolved: frozenset[str]
+
+
+def _is_str_list(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _observation_from_stage_report(report: Any) -> _CorroborationObservation | None:
+    """The observation a past Stage-1 report recorded, or ``None`` if it recorded none.
+
+    Reads ``.stats`` from a ``StageReport`` or ``['stats']`` from the plain dict
+    the journal keeps for a report it could not parse.  ``None`` unless both
+    stats are lists of ``str`` that satisfy ``unresolved ⊆ candidates`` — a
+    pre-change row, an error report or a garbled one says nothing about any
+    task.
+
+    Total over malformed input — every value here comes off a journal row.
+    Pure, sync, no I/O.
+    """
+    stats = report.get('stats') if isinstance(report, dict) else getattr(report, 'stats', None)
+    if not isinstance(stats, dict):
+        return None
+    candidates = stats.get(CANDIDATE_TASK_IDS_STAT)
+    unresolved = stats.get(UNRESOLVED_TASK_IDS_STAT)
+    if not (_is_str_list(candidates) and _is_str_list(unresolved)):
+        return None
+    if _unresolved_outside_candidates(candidates, unresolved):
+        return None
+    return _CorroborationObservation(frozenset(candidates), frozenset(unresolved))
+
+
+async def _prior_observations(
+    journal: Any,
+    project_id: str,
+    run_id: str,
+    stage_key: str,
+    *,
+    limit: int,
+    log: logging.Logger,
+) -> list[_CorroborationObservation | None]:
+    """Past passes' observations, most-recent-first, excluding the run *run_id*.
+
+    Keeps ``journal.get_recent_runs``' own most-recent-first order.  A read
+    that fails logs a WARNING and returns ``[]``, as does a result that is not
+    a list: missing history can only under-count a streak, never fabricate one.
+    ``asyncio.CancelledError``/``KeyboardInterrupt``/``SystemExit`` propagate.
+    """
+    try:
+        runs = await journal.get_recent_runs(project_id, limit=limit)
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        log.warning(
+            'preservation_specimen_guard: could not read reconciliation history for '
+            'project %s (run %s) — unresolved-corroboration persistence not measured '
+            'this pass',
+            project_id, run_id, exc_info=True,
+        )
+        return []
+    if not isinstance(runs, list):
+        return []
+    observations: list[_CorroborationObservation | None] = []
+    for run in runs:
+        if getattr(run, 'id', None) == run_id:
+            continue
+        reports = getattr(run, 'stage_reports', None)
+        report = reports.get(stage_key) if isinstance(reports, dict) else None
+        observations.append(_observation_from_stage_report(report))
+    return observations
+
+
+def _unresolved_streaks(
+    unresolved: Sequence[str],
+    prior: Sequence[_CorroborationObservation | None],
+) -> dict[str, int]:
+    """``{task_id: streak}`` for each task in *unresolved*, counting this pass as 1.
+
+    Walks *prior* most-recent-first.  A pass with no observation, or one that
+    did not look the task up, says nothing about it and is skipped; a pass
+    that left it unresolved extends the streak; a pass that resolved it ends
+    the walk.  Pure, sync, no I/O.
+    """
+    streaks: dict[str, int] = {}
+    for task_id in unresolved:
+        streak = 1
+        for observation in prior:
+            if observation is None or task_id not in observation.candidates:
+                continue
+            if task_id not in observation.unresolved:
+                break
+            streak += 1
+        streaks[task_id] = streak
+    return streaks
+
+
 # ── Storm escape (INV-4) ─────────────────────────────────────────────────────
 
 
@@ -921,7 +1044,10 @@ async def maybe_escalate_preservation_suppression_storm(
     run_id: str,
     result: PreservationSuppressionResult,
     *,
+    journal: Any,
+    stage_key: str,
     threshold: int = PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
+    streak_threshold: int = UNRESOLVED_CORROBORATION_STREAK_THRESHOLD,
     log: logging.Logger = logger,
 ) -> list[str]:
     """File (or fold) the two L1 records that keep this guard audible (INV-4).
@@ -932,12 +1058,14 @@ async def maybe_escalate_preservation_suppression_storm(
        one cycle is a signal it is over-broad or stale, and the guard's whole
        job is dropping findings, so this is the escape that stops it doing so
        unaccountably.
-    2. **Unresolved corroboration** — one record for the cycle when
-       ``result.unresolved_task_ids`` is non-empty (a channel read failed, or
-       the cycle's corroboration budget ran out first).  The guard fails OPEN, so a
-       subsystem whose reads are all failing otherwise degrades in total
-       silence: every stranded recommendation flows on, the suppressed stat
-       reads 0, and nothing distinguishes that from a healthy quiet cycle.
+    2. **Unresolved corroboration** — one record once some task has been left
+       uncorroborated on at least *streak_threshold* consecutive Stage-1 passes
+       that flagged it, measured from *journal*'s past *stage_key* reports.
+       The guard fails OPEN, so a subsystem whose reads keep failing otherwise
+       degrades in total silence: every stranded recommendation flows on, the
+       suppressed stat reads 0, and nothing distinguishes that from a healthy
+       quiet cycle.  A single unresolved pass is disclosed by the per-pass
+       stats and the log, not here.
 
     Each is filed or folded through ``escalation/dedupe.py::file_or_fold_l1``,
     NOT gated on ``has_open_l1`` (task 3522): Stage 1 re-evaluates every cycle,
@@ -952,9 +1080,27 @@ async def maybe_escalate_preservation_suppression_storm(
     """
     if file_or_fold_l1 is None:
         return []
+    storms = _file_storm_records(
+        escalation_queue, project_id, run_id, result, threshold=threshold, log=log,
+    )
+    unresolved = await _file_unresolved_record(
+        escalation_queue, project_id, run_id, result,
+        journal=journal, stage_key=stage_key, streak_threshold=streak_threshold, log=log,
+    )
+    return storms + unresolved
 
+
+def _file_storm_records(
+    escalation_queue: Any,
+    project_id: str,
+    run_id: str,
+    result: PreservationSuppressionResult,
+    *,
+    threshold: int,
+    log: logging.Logger,
+) -> list[str]:
+    """File or fold one storm record per task suppressed more than *threshold* times."""
     escalated: list[str] = []
-
     for task_id, count in result.suppressed_by_task.items():
         if count <= threshold:
             continue
@@ -983,35 +1129,66 @@ async def maybe_escalate_preservation_suppression_storm(
         )
         if filed:
             escalated.append(task_id)
-
-    if result.unresolved_task_ids:
-        unresolved = ', '.join(result.unresolved_task_ids)
-        filed = file_or_fold_l1(
-            escalation_queue,
-            project_id=project_id,
-            subject=UNRESOLVED_CORROBORATION_SUBJECT,
-            category=CATEGORY_PRESERVATION_SPECIMEN_STORM,
-            finding_category=_UNRESOLVED_FINDING_CATEGORY,
-            agent_role=_AGENT_ROLE,
-            summary=(
-                f'Preservation corroboration unresolved for '
-                f'{len(result.unresolved_task_ids)} task(s) this cycle — stranded '
-                f'findings are flowing through unfiltered'
-            ),
-            detail='\n'.join([
-                f'project_id: {project_id}',
-                f'run_id: {run_id}',
-                f'unresolved_task_ids: {unresolved}',
-                'The guard fails OPEN on the drop, so these tasks\' flags were '
-                'KEPT. That is correct, but it means a preserved specimen is '
-                'currently unprotected: check Qdrant/FalkorDB health and the '
-                'WARNING log lines from this module, which name either the '
-                'failing channel or an exhausted per-cycle corroboration budget.',
-            ]),
-            log=log,
-            log_label=_LOG_LABEL,
-        )
-        if filed:
-            escalated.append(UNRESOLVED_CORROBORATION_SUBJECT)
-
     return escalated
+
+
+async def _file_unresolved_record(
+    escalation_queue: Any,
+    project_id: str,
+    run_id: str,
+    result: PreservationSuppressionResult,
+    *,
+    journal: Any,
+    stage_key: str,
+    streak_threshold: int,
+    log: logging.Logger,
+) -> list[str]:
+    """File or fold the unresolved-corroboration record once some task's blindness persists.
+
+    Reads no history at all when this pass left nothing unresolved.
+    """
+    if not result.unresolved_task_ids:
+        return []
+    prior = await _prior_observations(
+        journal, project_id, run_id, stage_key,
+        limit=max(_UNRESOLVED_HISTORY_MIN_RUNS, 4 * streak_threshold), log=log,
+    )
+    streaks = _unresolved_streaks(result.unresolved_task_ids, prior)
+    persistent = {task_id: n for task_id, n in streaks.items() if n >= streak_threshold}
+    if not persistent:
+        log.info(
+            'preservation_specimen_guard: corroboration unresolved in project %s '
+            '(run %s) with streaks %s, below the %d-pass threshold — not escalated',
+            project_id, run_id, streaks, streak_threshold,
+        )
+        return []
+    filed = file_or_fold_l1(
+        escalation_queue,
+        project_id=project_id,
+        subject=UNRESOLVED_CORROBORATION_SUBJECT,
+        category=CATEGORY_PRESERVATION_SPECIMEN_STORM,
+        finding_category=_UNRESOLVED_FINDING_CATEGORY,
+        agent_role=_AGENT_ROLE,
+        summary=(
+            f'Preservation corroboration unresolved for {len(persistent)} task(s) '
+            f'across >= {streak_threshold} consecutive Stage-1 passes — stranded '
+            f'findings are flowing through unfiltered'
+        ),
+        detail='\n'.join([
+            f'project_id: {project_id}',
+            f'run_id: {run_id}',
+            'persistent_unresolved: ' + ', '.join(
+                f'{task_id} ({n} passes)' for task_id, n in persistent.items()
+            ),
+            f'unresolved_this_pass: {", ".join(result.unresolved_task_ids)}',
+            f'streak_threshold: {streak_threshold}',
+            'The guard fails OPEN on the drop, so these tasks\' flags were '
+            'KEPT. That is correct, but it means a preserved specimen is '
+            'currently unprotected: check Qdrant/FalkorDB health and the '
+            'WARNING log lines from this module, which name either the '
+            'failing channel or an exhausted per-cycle corroboration budget.',
+        ]),
+        log=log,
+        log_label=_LOG_LABEL,
+    )
+    return [UNRESOLVED_CORROBORATION_SUBJECT] if filed else []
