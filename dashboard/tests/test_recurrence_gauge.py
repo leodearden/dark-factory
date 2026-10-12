@@ -322,3 +322,41 @@ async def test_an_unopened_root_makes_no_chain_claim(tmp_path):
         root, _db_path(root), None, now=NOW, pending_escalations=PendingEscalations({})
     )
     assert record.to_wire()['chains'] is None
+
+
+async def test_an_unchanged_database_is_scanned_once_and_classified_at_each_now(tmp_path):
+    root = tmp_path / 'proj'
+    db_path = write_tasks_db(_db_path(root), [_row(link(1, 'pending', NOW + HOUR))])
+    pool = DbPool()
+    try:
+        conn = await pool.get(db_path)
+        assert conn is not None
+        statements: list[str] = []
+        await conn.set_trace_callback(statements.append)
+        first = await scan_root_invariants(root, db_path, conn, now=NOW, pending_escalations=None)
+        later = await scan_root_invariants(
+            root, db_path, conn, now=NOW + 3 * HOUR, pending_escalations=None
+        )
+    finally:
+        await pool.close_all()
+    assert [chain.state for chain in first.chains or ()] == [ChainState.SCHEDULED]
+    assert [chain.state for chain in later.chains or ()] == [ChainState.OVERDUE]
+    assert sum('recurrence' in sql for sql in statements) == 1
+
+
+async def test_a_commit_from_another_connection_reaches_the_next_scan(tmp_path):
+    root = tmp_path / 'proj'
+    db_path = write_tasks_db(_db_path(root), [_row(link(1, 'pending', key='old-job'))])
+    pool = DbPool()
+    try:
+        conn = await pool.get(db_path)
+        first = await scan_root_invariants(root, db_path, conn, now=NOW, pending_escalations=None)
+        write_tasks_db(db_path, [_row(link(2, 'done', key='new-job'))])
+        second = await scan_root_invariants(root, db_path, conn, now=NOW, pending_escalations=None)
+    finally:
+        await pool.close_all()
+    assert _states(first.chains or ()) == [('master', 'old-job', ChainState.SCHEDULED, 1)]
+    assert _states(second.chains or ()) == [
+        ('master', 'new-job', ChainState.BROKEN, 2),
+        ('master', 'old-job', ChainState.SCHEDULED, 1),
+    ]

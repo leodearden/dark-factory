@@ -8,11 +8,13 @@ sweep repairs.
 
 from __future__ import annotations
 
+import weakref
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any
 
 import aiosqlite
@@ -32,6 +34,7 @@ _CHAIN_ROWS_SQL = (
     "SELECT tag, id, status, metadata FROM tasks WHERE metadata LIKE '%recurrence%' "
     'ORDER BY tag, id'
 )
+_DATA_VERSION_SQL = 'PRAGMA data_version'
 
 
 class ChainState(StrEnum):
@@ -154,5 +157,30 @@ def classify_chains(
     return tuple(sorted(entries, key=lambda entry: (entry.tag, entry.key)))
 
 
-async def read_chain_rows(conn: aiosqlite.Connection) -> list[dict[str, Any]]:
-    return [dict(row) for row in await conn.execute_fetchall(_CHAIN_ROWS_SQL)]
+@dataclass(frozen=True)
+class _ChainRowsRead:
+    data_version: int
+    rows: tuple[Mapping[str, Any], ...]
+
+
+_last_read_by_conn: weakref.WeakKeyDictionary[aiosqlite.Connection, _ChainRowsRead] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+async def read_chain_rows(conn: aiosqlite.Connection) -> tuple[Mapping[str, Any], ...]:
+    """Every row that may be a chain link, rescanned only after another connection commits.
+
+    The scan reads every metadata cell, so *conn*'s last scan is served again
+    while ``PRAGMA data_version`` says no other connection has committed since.
+    """
+    (version_row,) = await conn.execute_fetchall(_DATA_VERSION_SQL)
+    data_version = version_row[0]
+    last = _last_read_by_conn.get(conn)
+    if last is not None and last.data_version == data_version:
+        return last.rows
+    rows = tuple(
+        MappingProxyType(dict(row)) for row in await conn.execute_fetchall(_CHAIN_ROWS_SQL)
+    )
+    _last_read_by_conn[conn] = _ChainRowsRead(data_version, rows)
+    return rows
