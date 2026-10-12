@@ -8,19 +8,105 @@ behind the autouse ``_neutralize_verify_admission`` seam, so no marker is needed
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
+import itertools
+from collections.abc import Callable
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
-from shared.verify_admission import is_gated_role
+from shared.verify_admission import acquire_task_slot, is_gated_role
 
 from orchestrator.verify_admission_gate import (
     ROLE_CLASSES,
+    AdmissionGrant,
+    AdmissionOrder,
     AdmissionPlan,
     AdmissionPolicy,
     AdmissionRequest,
     gate_for,
 )
+
+
+async def _until(
+    predicate: Callable[[], bool], *, watching: asyncio.Task | None = None, timeout: float = 5.0,
+) -> None:
+    """Poll *predicate* under a deadline, surfacing *watching*'s own failure if it ends first."""
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            if watching is not None and watching.done():
+                watching.result()
+                raise AssertionError('the leg finished before reaching the awaited state')
+            await asyncio.sleep(0.005)
+
+
+def _request(label: str, role: str = 'task') -> AdmissionRequest:
+    return AdmissionPlan.begin(role=role, task_id=label).request(module=label, scope_kind=None)
+
+
+class _Legs:
+    """Admitted legs on one gate. Each granted body takes the REAL flock without
+    waiting, asserts it got a slot, records its turn, then parks until released."""
+
+    def __init__(self, slots_dir: Path, policy: AdmissionPolicy) -> None:
+        self.gate = gate_for(slots_dir)
+        self.slots_dir = slots_dir
+        self.policy = policy
+        self.granted: list[str] = []
+        self.grants: dict[str, AdmissionGrant] = {}
+        self.tasks: dict[str, asyncio.Task] = {}
+        self._release: dict[str, asyncio.Event] = {}
+
+    def read_policy(self) -> AdmissionPolicy:
+        return self.policy
+
+    def start(self, label: str, request: AdmissionRequest, *, hold: bool = False) -> asyncio.Task:
+        release = asyncio.Event()
+        if not hold:
+            release.set()
+        self._release[label] = release
+        task = asyncio.create_task(self._leg(label, request, release))
+        self.tasks[label] = task
+        return task
+
+    async def _leg(self, label: str, request: AdmissionRequest, release: asyncio.Event) -> None:
+        async with self.gate.admit(request, self.read_policy) as grant:
+            with acquire_task_slot(
+                request.role, slots_dir=self.slots_dir, n=self.policy.slots, wait=False,
+            ) as held:
+                assert held is True, f'{label}: granted a turn the flock had no slot for'
+                self.granted.append(label)
+                self.grants[label] = grant
+                await release.wait()
+
+    async def hold(self, label: str, request: AdmissionRequest | None = None) -> asyncio.Task:
+        task = self.start(label, request or _request(label), hold=True)
+        await _until(lambda: label in self.granted, watching=task)
+        return task
+
+    async def queue(
+        self, label: str, request: AdmissionRequest | None = None, *, hold: bool = False,
+    ) -> asyncio.Task:
+        depth = self.gate.snapshot().depth
+        task = self.start(label, request or _request(label), hold=hold)
+        await _until(lambda: self.gate.snapshot().depth == depth + 1, watching=task)
+        return task
+
+    def release(self, label: str) -> None:
+        self._release[label].set()
+
+    async def finish(self) -> None:
+        for release in self._release.values():
+            release.set()
+        async with asyncio.timeout(5):
+            await asyncio.gather(*self.tasks.values())
+
+
+def _policy(
+    *, slots: int = 1, order: AdmissionOrder = 'arrival', promote_after_secs: float = 7200.0,
+) -> AdmissionPolicy:
+    return AdmissionPolicy(slots=slots, order=order, promote_after_secs=promote_after_secs)
 
 
 class TestRoleClasses:
@@ -110,3 +196,145 @@ class TestFreshSnapshot:
 
         with pytest.raises(dataclasses.FrozenInstanceError):
             snap.waiters = ()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@pytest.mark.asyncio
+class TestArrivalOrder:
+    async def test_same_class_plans_are_granted_in_arrival_order(self, tmp_path):
+        legs = _Legs(tmp_path, _policy())
+        await legs.hold('H')
+        for label in ('A', 'B', 'C'):
+            await legs.queue(label)
+
+        legs.release('H')
+        await legs.finish()
+
+        assert legs.granted == ['H', 'A', 'B', 'C']
+
+    async def test_the_plan_stamp_not_the_gate_arrival_orders_same_class_legs(self, tmp_path):
+        legs = _Legs(tmp_path, _policy())
+        requests = {label: _request(label) for label in ('A', 'B', 'C')}
+        await legs.hold('H')
+        for label in ('C', 'A', 'B'):
+            await legs.queue(label, requests[label])
+
+        legs.release('H')
+        await legs.finish()
+
+        assert legs.granted == ['H', 'A', 'B', 'C']
+
+    async def test_unordered_grants_every_permutation(self, tmp_path):
+        seen: set[tuple[str, ...]] = set()
+        all_orders = set(itertools.permutations('ABC'))
+        for trial in range(400):
+            slots_dir = tmp_path / str(trial)
+            slots_dir.mkdir()
+            legs = _Legs(slots_dir, _policy(order='unordered'))
+            await legs.hold('H')
+            for label in ('A', 'B', 'C'):
+                await legs.queue(label)
+            legs.release('H')
+            await legs.finish()
+            seen.add(tuple(legs.granted[1:]))
+            if seen == all_orders and trial >= 59:
+                break
+
+        assert seen == all_orders
+
+    async def test_a_task_plan_is_granted_before_an_earlier_background_plan(self, tmp_path):
+        legs = _Legs(tmp_path, _policy())
+        background = _request('G', role='background')
+        task = _request('T')
+        await legs.hold('H')
+        await legs.queue('G', background)
+        await legs.queue('T', task)
+
+        legs.release('H')
+        await legs.finish()
+
+        assert legs.granted == ['H', 'T', 'G']
+
+    @pytest.mark.parametrize(
+        ('promote_after_secs', 'expected'),
+        [(0.2, ['H', 'T1', 'G', 'T2']), (3600.0, ['H', 'T1', 'T2', 'G'])],
+    )
+    async def test_an_aged_background_waiter_ranks_with_tasks_on_its_own_stamp(
+        self, tmp_path, promote_after_secs, expected,
+    ):
+        legs = _Legs(tmp_path, _policy(promote_after_secs=promote_after_secs))
+        await legs.hold('H')
+        await legs.queue('T1')
+        await legs.queue('G', _request('G', role='background'))
+        await asyncio.sleep(0.3)
+        await legs.queue('T2')
+
+        legs.release('H')
+        await legs.finish()
+
+        assert legs.granted == expected
+
+
+@pytest.mark.asyncio
+class TestGrantFacts:
+    async def test_a_free_slot_grants_at_once(self, tmp_path):
+        legs = _Legs(tmp_path, _policy())
+
+        await legs.hold('H')
+
+        grant = legs.grants['H']
+        assert legs.gate.snapshot().depth == 0
+        assert grant.depth_at_arrival == 0
+        assert 0 <= grant.waited_secs < 1.0
+        await legs.finish()
+
+    @pytest.mark.parametrize('order', ['arrival', 'unordered'])
+    async def test_a_waiter_grant_records_its_queue_and_wait(self, tmp_path, order):
+        legs = _Legs(tmp_path, _policy(order=order))
+        await legs.hold('H')
+        for label in ('A', 'B', 'C'):
+            await legs.queue(label)
+
+        legs.release('H')
+        await legs.finish()
+
+        for depth, label in enumerate(('A', 'B', 'C')):
+            grant = legs.grants[label]
+            assert grant.depth_at_arrival == depth
+            assert grant.waited_secs > 0
+            assert grant.granted_at >= grant.arrived_at
+            assert grant.order == order
+            assert grant.slot_held is False
+            assert grant.request.module == label
+
+
+@pytest.mark.asyncio
+class TestPolicyIsReadAtEachGrant:
+    async def test_raising_slots_admits_a_second_holder_at_the_next_grant(self, tmp_path):
+        legs = _Legs(tmp_path, _policy(slots=1))
+        await legs.hold('H')
+        await legs.queue('A', hold=True)
+        await legs.queue('B', hold=True)
+
+        legs.policy = _policy(slots=2)
+        legs.release('H')
+        await _until(lambda: len(legs.gate.snapshot().holders) == 2)
+
+        assert {h.request.module for h in legs.gate.snapshot().holders} == {'A', 'B'}
+        await legs.finish()
+
+    async def test_switching_to_arrival_order_applies_to_the_next_grant(self, tmp_path):
+        legs = _Legs(tmp_path, _policy(order='unordered'))
+        await legs.hold('H')
+        for label in ('A', 'B', 'C'):
+            await legs.queue(label, hold=True)
+
+        legs.release('H')
+        await _until(lambda: len(legs.granted) == 2)
+        first = legs.granted[1]
+        legs.policy = _policy(order='arrival')
+        legs.release(first)
+        await legs.finish()
+
+        assert legs.granted[2:] == sorted({'A', 'B', 'C'} - {first})
+        assert legs.grants[first].order == 'unordered'
+        assert {legs.grants[label].order for label in legs.granted[2:]} == {'arrival'}
