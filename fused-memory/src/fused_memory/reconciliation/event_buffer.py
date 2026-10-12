@@ -15,6 +15,7 @@ from shared.async_sqlite_base import (
     apply_full_durability_pragmas,
     connect_daemon,
 )
+from shared.sqlite_column_migration import add_column_if_missing
 
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -166,40 +167,17 @@ class EventBuffer:
         logger.info(f'EventBuffer initialized (db={self._db_path}, instance={self.instance_id})')
 
     async def _migrate(self) -> None:
-        """Add new columns to pre-existing DBs (idempotent).
+        """Add new columns to pre-existing DBs.
 
-        Each ALTER TABLE is:
-        * Guarded by a PRAGMA table_info check so we only run it when the column
-          is missing.
-        * Wrapped in try/except to survive the narrow race where two processes both
-          call initialize() on the same file concurrently — SQLite's ALTER TABLE
-          has no IF NOT EXISTS syntax, so the second writer would otherwise fail
-          with 'duplicate column name'.
+        Idempotence and the concurrent-init race are owned by
+        ``shared/src/shared/sqlite_column_migration.py::add_column_if_missing``.
         """
-        access = self._require_access()
-        columns = {
-            row['name'] for row in await access.read_all('PRAGMA table_info(deferred_writes)')
-        }
-        eb_columns = {
-            row['name'] for row in await access.read_all('PRAGMA table_info(event_buffer)')
-        }
-
-        # One write unit for every DDL statement below: the PRAGMA probes above
-        # already ran as their own accesses, so nothing here nests.
-        async with access.write() as db:
+        async with self._require_access().write() as db:
             # Add drained_by_run_id if missing — attributes a drained row to the run
             # that drained it (task 2711 / E7) so restore_drained() can be scoped to
             # a single run instead of unconditionally restoring the whole project.
-            if 'drained_by_run_id' not in eb_columns:
-                try:
-                    await db.execute('ALTER TABLE event_buffer ADD COLUMN drained_by_run_id TEXT')
-                    logger.info(
-                        'EventBuffer: migrated event_buffer — added drained_by_run_id column'
-                    )
-                except Exception as exc:
-                    if 'duplicate column name' not in str(exc).lower():
-                        raise
-                    logger.debug('EventBuffer: drained_by_run_id already exists (concurrent init)')
+            if await add_column_if_missing(db, 'event_buffer', 'drained_by_run_id', 'TEXT'):
+                logger.info('EventBuffer: migrated event_buffer — added drained_by_run_id column')
 
             # Drop the now-redundant single-column project index.  idx_dw_project_claimed
             # (project_id, claimed_at) is a strict superset; keeping both wastes write
@@ -207,33 +185,18 @@ class EventBuffer:
             # had idx_dw_project.
             await db.execute('DROP INDEX IF EXISTS idx_dw_project')
 
-            # Add claimed_at if missing.
-            if 'claimed_at' not in columns:
-                try:
-                    await db.execute('ALTER TABLE deferred_writes ADD COLUMN claimed_at TEXT')
-                    await db.execute(
-                        'CREATE INDEX IF NOT EXISTS idx_dw_project_claimed'
-                        ' ON deferred_writes(project_id, claimed_at)'
-                    )
-                    logger.info('EventBuffer: migrated deferred_writes — added claimed_at column')
-                except Exception as exc:
-                    if 'duplicate column name' not in str(exc).lower():
-                        raise
-                    logger.debug('EventBuffer: claimed_at already exists (concurrent init)')
+            if await add_column_if_missing(db, 'deferred_writes', 'claimed_at', 'TEXT'):
+                await db.execute(
+                    'CREATE INDEX IF NOT EXISTS idx_dw_project_claimed'
+                    ' ON deferred_writes(project_id, claimed_at)'
+                )
+                logger.info('EventBuffer: migrated deferred_writes — added claimed_at column')
 
             # Add attempt_count if missing — tracks poison-pill detection across restarts.
-            if 'attempt_count' not in columns:
-                try:
-                    await db.execute(
-                        'ALTER TABLE deferred_writes'
-                        ' ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0'
-                    )
-                    logger.info('EventBuffer: migrated deferred_writes — added attempt_count column')
-                except Exception as exc:
-                    if 'duplicate column name' not in str(exc).lower():
-                        raise
-                    logger.debug('EventBuffer: attempt_count already exists (concurrent init)')
-
+            if await add_column_if_missing(
+                db, 'deferred_writes', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0'
+            ):
+                logger.info('EventBuffer: migrated deferred_writes — added attempt_count column')
 
     def _require_access(self) -> AtomicConnection:
         if self._access is None:
