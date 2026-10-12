@@ -89,12 +89,10 @@ from fused_memory.reconciliation.standing_decision_constants import (
     MEM0_KIND_INVESTIGATION_OUTCOME,
 )
 
-# The canonical ``data`` -> ``memory`` -> ``content`` raw-payload key fallback.
-# IMPORTED rather than re-spelled, exactly as ``server/grouped_read.py`` does:
-# a scroll payload and a search item do not put the text under the same key,
-# which is why guessing one is wrong, and a second copy of the order would be
-# one more place for the two to drift (INV-5).
-from fused_memory.services.memory_service import _mem0_content
+# The scroll-row text reader, IMPORTED rather than re-spelled: it owns the
+# canonical raw-payload key fallback through ``_mem0_content``, and a second
+# copy would be one more place for the two to drift (INV-5).
+from fused_memory.services.memory_service import metadata_row_text
 
 # Optional escalation dependency: the reconciliation package must import
 # cleanly where the escalation package is not installed, and
@@ -440,18 +438,6 @@ def preservation_mem0_filters(task_id: str) -> dict[str, Any]:
     return {'kind': MEM0_KIND_INVESTIGATION_OUTCOME, 'task_id': task_id, 'actionable': False}
 
 
-def _mem0_row_text(row: dict[str, Any]) -> str:
-    """The human-readable prose of one ``get_memories_by_metadata`` row.
-
-    That reader returns ``{'id', 'created_at', 'metadata'}`` where ``metadata``
-    is the FULL raw Qdrant payload, so the text is wherever
-    :func:`~fused_memory.services.memory_service._mem0_content` says it is —
-    ``data``, then ``memory``, then ``content``.  Pure, sync, no I/O.
-    """
-    payload = row.get('metadata')
-    return _mem0_content(payload) if isinstance(payload, dict) else ''
-
-
 def _first_citation(
     rows: Any,
     text_of: Callable[[dict[str, Any]], Any],
@@ -679,7 +665,7 @@ async def _corroborate_preservation(
         )
         degraded = True
     else:
-        citation = _first_citation(rows, _mem0_row_text, 'id')
+        citation = _first_citation(rows, metadata_row_text, 'id')
         if citation is not None:
             return _Corroboration(citation=citation, degraded=False)
 
