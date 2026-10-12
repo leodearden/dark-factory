@@ -3117,7 +3117,7 @@ def test_run_nightly_records_a_reason_when_the_escalation_post_fails(tmp_path):
 
 # ---------------------------------------------------------------------------
 # step-9/10: a conflict-only night must PERSIST its recurrence sighting.
-# apply_coding_record's adjudicated-title branch appends the sighting but
+# apply_coding_records's adjudicated-title branch appends the sighting but
 # bumps neither `matched` nor `candidates_applied` -- so a night whose ONLY
 # merge effect is a conflict append would end with applied == 0, skip the
 # `if applied > 0` dump gate, and drop the mutated codebook on the floor.
@@ -3159,7 +3159,7 @@ def test_run_nightly_persists_a_disposition_conflict_sighting(tmp_path):
     # before the run (otherwise _git_status_changed would report true for an
     # unrelated reason and the commit assertion would pass vacuously). The
     # seeded sighting carries session 'session-old' -- NOT 'session-1' -- so
-    # apply_coding_record's `already_seen` guard does not short-circuit the
+    # apply_coding_records's `already_seen` guard does not short-circuit the
     # conflict branch, and the later "sightings grew 1 -> 2" assertion
     # unambiguously proves an APPEND rather than a create.
     codebook_path = repo / 'docs' / 'legibility' / 'confusion-codebook.yaml'

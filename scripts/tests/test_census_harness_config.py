@@ -15,8 +15,7 @@ from __future__ import annotations
 import subprocess
 
 import census as mod
-import filing_policy
-from legibility import census_trigger, session_runner
+from legibility import census_trigger, filing_policy, session_runner
 
 import config as config_mod
 

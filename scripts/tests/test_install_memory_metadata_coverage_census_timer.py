@@ -744,10 +744,10 @@ def test_wrapper_runs_both_halves_under_uv_so_fused_memory_imports_resolve(
 # append that the merge worker's advance path resets away takes that night's
 # row with it -- permanently, and with no error anywhere.
 #
-# Precedent for committing rather than not: scripts/legibility/census.py's
-# _build_default_commit already commits docs/legibility/census-state.json from
-# the 03:00 job, and scripts/legibility/nightly.py::_git_commit_docs_only does
-# the same, both via scoped `git commit --only`.
+# Precedent for committing rather than not: both legibility jobs commit
+# through scripts/legibility/unlanded.py::commit_only, a scoped
+# `git commit --only` (the 03:00 census commits docs/legibility/census-state.json
+# with it).
 
 _ARTIFACTS = (
     'plans/memory-metadata-census-report.json',

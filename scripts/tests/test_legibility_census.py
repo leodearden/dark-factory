@@ -1008,9 +1008,10 @@ def test_ticket_id_from_submit_result_rejects_unusable_ticket_values():
 
 # ---------------------------------------------------------------------------
 # amend: _novel_clusters() dedup-by-title + titleless-candidate skip.
-# codebook.apply_coding_record groups new candidates BY TITLE (codebook.py:
-# 494), so verification must operate on the same set of resolvable titles --
-# a second cluster for an already-seen title can never resolve to a second
+# codebook.apply_coding_records groups new candidates BY TITLE
+# (codebook.py::_apply_coding_record), so verification must operate on the
+# same set of resolvable titles -- a second cluster for an already-seen title
+# can never resolve to a second
 # "pending" candidate id in _find_pending_candidate_id, wasting a Sonnet
 # verify call and diverging the matrix from the codebook
 # (reviewer_comprehensive finding #3).
@@ -1050,7 +1051,7 @@ def test_novel_clusters_deduplicates_candidates_sharing_a_title():
 
     assert len(clusters) == 1, (
         "a second candidate sharing an already-seen title must not spend a "
-        "second verify slot -- apply_coding_record would collapse it into "
+        "second verify slot -- apply_coding_records would collapse it into "
         "the same pending codebook candidate as the first"
     )
     assert clusters[0]["title"] == "Silent no-op subagent contract"
@@ -1066,7 +1067,7 @@ def test_novel_clusters_skips_titleless_candidates():
     clusters = mod._novel_clusters(records)
 
     assert clusters == [], (
-        "apply_coding_record requires a title to key its merge on -- a "
+        "apply_coding_records requires a title to key its merge on -- a "
         "titleless candidate must be skipped, mirroring that requirement"
     )
 
@@ -3258,7 +3259,7 @@ def test_run_census_skips_a_deletion_shaped_mining_record_and_lands_the_rest(
 #
 # Post-4144 `_find_pending_candidate_id` returning None is a NORMAL outcome:
 # when a re-mined title's only same-title candidate is already adjudicated,
-# `codebook.apply_coding_record` deliberately declines to fabricate a pending
+# `codebook.apply_coding_records` deliberately declines to fabricate a pending
 # twin (codebook.py:429-455 -- fabricating one is how rejected
 # cand-20260722-28 came back as pending cand-20260724-2 in the live codebook).
 # The prior verdict standing is CORRECT. The defect is the silence: the
@@ -8080,7 +8081,7 @@ def test_run_census_report_stays_silent_when_a_cluster_verifies(tmp_path):
 # — dropping a verify verdict the census PAID FOR with no log and no counter.
 # Post-4144 that None is a NORMAL outcome, not a defensive impossibility: for
 # a re-mined title whose only same-title candidate is already adjudicated,
-# `apply_coding_record` correctly declines to fabricate a pending twin (that
+# `apply_coding_records` correctly declines to fabricate a pending twin (that
 # fabrication is how rejected cand-20260722-28 came back as pending
 # cand-20260724-2 in the live codebook). The standing prior verdict is the
 # right outcome; the SILENCE is the defect.
@@ -8184,7 +8185,7 @@ def test_run_census_clean_run_emits_no_unresolved_verdict_warning(tmp_path, capl
 # nothing states either tally once at the end of the run, where an operator
 # reading a journal sees the whole picture rather than one line per cluster.
 # The same already-rejected-same-title fixture drives BOTH signals: it is
-# exactly the case apply_coding_record counts as a disposition conflict.
+# exactly the case apply_coding_records counts as a disposition conflict.
 # ---------------------------------------------------------------------------
 
 def test_run_census_run_summary_names_unresolved_verdicts_and_disposition_conflicts(

@@ -5,7 +5,7 @@ See plans/confusion-reduction-prd.md §7.1 (codebook v2 contract) and §7.3
 (coding record contract). Per PRD decision 1, this module is the SOLE
 WRITER of `docs/legibility/confusion-codebook.yaml`: the LLM trickle coder
 and census miner never edit the YAML directly — they emit coding records
-(§7.3) that this module's `apply_coding_record()` merges in idempotently,
+(§7.3) that this module's `apply_coding_records()` merges in idempotently,
 append-only, never-delete.
 """
 from __future__ import annotations
@@ -19,6 +19,7 @@ import os
 import re
 import sys
 import tempfile
+from collections import Counter
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
@@ -78,7 +79,7 @@ HEADER = """\
 
 # Removal-directive markers a §7.3 coding record must never carry (PRD §8.3
 # never-delete). Presence of any top-level key, or any match op with one of
-# these actions, is rejected outright by apply_coding_record() before it
+# these actions, is rejected outright by apply_coding_records() before it
 # mutates anything.
 _REMOVAL_KEYS = {"delete", "remove", "retract", "drop"}
 _REMOVAL_ACTIONS = {"delete", "remove"}
@@ -107,7 +108,7 @@ _SIGHTING_SCHEMA = {
         "manifested_phase": {"enum": PHASES},
         # A free string here, so validate() keeps the legacy free-text values
         # valid. New writes are screened against the project's invariant
-        # slugs by screen_invariant_slugs inside apply_coding_record.
+        # slugs by screen_invariant_slugs inside _apply_coding_record.
         "invariant_violated": {"type": ["string", "null"]},
         "note": {"type": "string"},
         "evidence_quote": {"type": "string"},
@@ -505,7 +506,7 @@ def _build_sighting(payload: dict, *, session: str, date: str, project: str) -> 
 def _reject_deletion_directive(record: dict) -> None:
     """Raise NeverDeleteError if `record` is deletion-shaped: a top-level
     delete/remove/retract/drop key, or a match/correction carrying a
-    delete/remove action. Called before apply_coding_record touches anything."""
+    delete/remove action. Called before _apply_coding_record touches anything."""
     if not isinstance(record, dict):
         return
     for key in _REMOVAL_KEYS:
@@ -784,30 +785,32 @@ def _merge_next(
     merge: MergeResult, index: int, record: dict, invariant_slugs: Collection[str]
 ) -> MergeResult:
     try:
-        codebook, stats = apply_coding_record(
+        _reject_deletion_directive(record)
+        errors = validate_coding_record(record)
+        if errors:
+            skipped = SkippedRecord.of(index, record, "; ".join(errors))
+            return replace(merge, invalid_records=(*merge.invalid_records, skipped))
+        codebook, counts, slugs = _apply_coding_record(
             merge.codebook, record, invariant_slugs=invariant_slugs
         )
     except NeverDeleteError as exc:
         skipped = SkippedRecord.of(index, record, str(exc))
         return replace(merge, skipped_deletions=(*merge.skipped_deletions, skipped))
-    if stats["record_invalid"]:
-        reason = "; ".join(validate_coding_record(record))
-        skipped = SkippedRecord.of(index, record, reason)
-        return replace(merge, invalid_records=(*merge.invalid_records, skipped))
-    counts = MergeCounts(**{f.name: stats[f.name] for f in fields(MergeCounts)})
     return replace(
         merge,
         codebook=codebook,
         counts=merge.counts.plus(counts),
         merged_records=(*merge.merged_records, record),
-        invariant_slugs=merge.invariant_slugs.plus(stats["invariant_slugs"]),
+        invariant_slugs=merge.invariant_slugs.plus(slugs),
     )
 
 
-def apply_coding_record(
+def _apply_coding_record(
     codebook: dict, record: dict, *, invariant_slugs: Collection[str]
-) -> tuple[dict, dict]:
-    """Apply one §7.3 coding record to a v2 codebook. Sole-writer merge.
+) -> tuple[dict, MergeCounts, SlugTally]:
+    """Apply one §7.3 coding record to a copy of a v2 codebook. Sole-writer
+    merge. Precondition: *record* is valid and not deletion-shaped; the batch,
+    `apply_coding_records`, checks both first.
 
     Three ops: `matches` (append a sighting to an existing entry),
     `candidates` (file a novel cause for the census to adjudicate), and
@@ -815,22 +818,14 @@ def apply_coding_record(
     the order corrections → matches → candidates (see the correction-handling
     paragraph for why corrections go first).
 
-    Operates on a deep copy — never mutates `codebook` in place. Returns
-    `(new_codebook, stats)` where stats has keys `matched`,
-    `skipped_unknown_entry`, `candidates_applied`,
-    `candidate_disposition_conflicts`, `corrections_applied`,
-    `correction_skipped`, `record_invalid`, `invariant_slugs`.
+    Operates on a deep copy — never mutates `codebook` in place. Returns the
+    merged copy, what each op did, and the record's `SlugTally`.
 
-    A record that fails `validate_coding_record()` is skipped WHOLE (never
-    partially applied): the input codebook comes back unchanged (deep
-    copy) and `stats['record_invalid']` is True.
-
-    A valid record is then screened by `screen_invariant_slugs()` against
+    The record is first screened by `screen_invariant_slugs()` against
     *invariant_slugs*, the observed project's declared vocabulary: an
     `invariant_violated` value that is not one of them is stored as absent
-    rather than failing the record, and `stats['invariant_slugs']` is the
-    record's `SlugTally`. Emitting the run's one WARNING is the caller's job
-    (`warn_unknown_invariant_slugs()`).
+    rather than failing the record. Emitting the run's one WARNING is the
+    caller's job (`warn_unknown_invariant_slugs()`).
 
     Match handling: an entry_id that doesn't resolve to an existing entry
     is counted as skipped and never fabricated into a new entry — only the
@@ -902,44 +897,13 @@ def apply_coding_record(
     which is precisely how rejected `cand-20260722-28` reappeared as
     pending `cand-20260724-2` in the live registry.
 
-    Never-delete: a deletion-shaped `record` (top-level delete/remove/
-    retract/drop key, or a match with a delete/remove action) raises
-    NeverDeleteError immediately, before `codebook` is even copied.
-    `assert_no_deletion()` is also run as a construction-independent
-    safety net just before returning.
-
-    Raises ValueError if `codebook` is not a dict (e.g. an empty or
-    malformed YAML file loads via yaml.safe_load as None, or as some
-    non-mapping) — mirrors validate()'s isinstance guard so malformed
-    input fails loudly with a clear message before any mutation, rather
-    than an AttributeError deep in the merge logic below.
+    Never-delete: `assert_no_deletion()` runs as a construction-independent
+    safety net just before returning; its NeverDeleteError makes the batch
+    skip the record.
     """
-    if not isinstance(codebook, dict):
-        raise ValueError(
-            "apply_coding_record: expected a dict-shaped codebook, got "
-            f"{type(codebook).__name__} (empty or malformed YAML file?)"
-        )
-    _reject_deletion_directive(record)
-
-    stats = {
-        "matched": 0,
-        "skipped_unknown_entry": 0,
-        "candidates_applied": 0,
-        "candidate_disposition_conflicts": 0,
-        "corrections_applied": 0,
-        "correction_skipped": 0,
-        "record_invalid": False,
-        "invariant_slugs": SlugTally(),
-    }
-
+    counts: Counter[str] = Counter()
+    record, slugs = screen_invariant_slugs(record, invariant_slugs)
     result = copy.deepcopy(codebook)
-
-    record_errors = validate_coding_record(record)
-    if record_errors:
-        stats["record_invalid"] = True
-        assert_no_deletion(codebook, result)
-        return result, stats
-    record, stats["invariant_slugs"] = screen_invariant_slugs(record, invariant_slugs)
 
     session = record["session"]
     date = record["date"]
@@ -967,7 +931,7 @@ def apply_coding_record(
         entry_id = correction.get("entry_id")
         entry = entries_by_id.get(entry_id)
         if entry is None:
-            stats["skipped_unknown_entry"] += 1
+            counts["skipped_unknown_entry"] += 1
             continue
         sightings = entry.setdefault("sightings", [])
         if session in {s.get("session") for s in sightings}:
@@ -976,7 +940,7 @@ def apply_coding_record(
                 # this record's one sighting slot, so this one's field writes
                 # cannot land. Silently dropping a framing withdrawal is the
                 # one outcome this op must never have.
-                stats["correction_skipped"] += 1
+                counts["correction_skipped"] += 1
                 logger.warning(
                     "codebook: correction for entry %r dropped — session %r was "
                     "already recorded on that entry by an earlier op in the SAME "
@@ -994,19 +958,19 @@ def apply_coding_record(
         sightings.append(
             _build_sighting(correction, session=session, date=date, project=project)
         )
-        stats["corrections_applied"] += 1
+        counts["corrections_applied"] += 1
 
     for match in record.get("matches", []) or []:
         entry = entries_by_id.get(match.get("entry_id"))
         if entry is None:
-            stats["skipped_unknown_entry"] += 1
+            counts["skipped_unknown_entry"] += 1
             continue
         sightings = entry.setdefault("sightings", [])
         existing_sessions = {s.get("session") for s in sightings}
         if session in existing_sessions:
             continue
         sightings.append(_build_sighting(match, session=session, date=date, project=project))
-        stats["matched"] += 1
+        counts["matched"] += 1
 
     candidates = result.setdefault("candidates", [])
     date_prefix = f"cand-{date.replace('-', '')}-"
@@ -1028,7 +992,7 @@ def apply_coding_record(
         )
         if pending_match is not None:
             pending_match.setdefault("sightings", []).append(sighting)
-            stats["candidates_applied"] += 1
+            counts["candidates_applied"] += 1
         elif same_title:
             # Every same-title candidate is already adjudicated (rejected/
             # promoted). Fabricating a fresh pending twin here would silently
@@ -1057,18 +1021,18 @@ def apply_coding_record(
                 entry_sightings = promoted_entry.setdefault("sightings", [])
                 if session not in {s.get("session") for s in entry_sightings}:
                     entry_sightings.append(sighting)
-                    stats["matched"] += 1
+                    counts["matched"] += 1
             else:
                 # Rejected, or promoted with a `promoted_to` that names no
                 # existing entry (hand-edited/pre-promote_candidate record).
                 # The merger never fabricates an entry -- only the census
                 # does -- so the sighting lands on the candidate so the
                 # signal is not lost, and the conflict is surfaced via
-                # stats. `same_title[-1]` (last in list order = most recently
+                # counts. `same_title[-1]` (last in list order = most recently
                 # added) is the deterministic tie-break when more than one
                 # adjudicated record shares a title.
                 same_title[-1].setdefault("sightings", []).append(sighting)
-                stats["candidate_disposition_conflicts"] += 1
+                counts["candidate_disposition_conflicts"] += 1
         else:
             n = 1 + sum(
                 1 for c in candidates if str(c.get("id", "")).startswith(date_prefix)
@@ -1084,10 +1048,10 @@ def apply_coding_record(
                     "sightings": [sighting],
                 }
             )
-            stats["candidates_applied"] += 1
+            counts["candidates_applied"] += 1
 
     assert_no_deletion(codebook, result)
-    return result, stats
+    return result, MergeCounts(**counts), slugs
 
 
 def validate_coding_record(record: dict) -> list[str]:
@@ -1096,7 +1060,7 @@ def validate_coding_record(record: dict) -> list[str]:
     Returns a list of human-readable error strings; an empty list means the
     record is valid. Required: session/date/project/agent_class (strings).
     matches/candidates are optional lists; invariant_violated accepts null
-    or any string here. An unknown slug is not an error: apply_coding_record
+    or any string here. An unknown slug is not an error: apply_coding_records
     stores it as absent through screen_invariant_slugs.
     """
     return _schema_errors(record, CODING_RECORD_SCHEMA)
@@ -1169,7 +1133,7 @@ def migrate_v1_to_v2(codebook: dict) -> dict:
     is retained verbatim; entry order is preserved. Top-level candidates
     defaults to [] (only if absent). The top-level `updated` field (if
     present) is DROPPED rather than retained or re-stamped: under the
-    sole-writer design dump()/apply_coding_record() never touch it, so a
+    sole-writer design dump()/apply_coding_records() never touch it, so a
     retained value would freeze at the migration date and mislead readers
     as sightings accumulate, while a mutable timestamp would break dump()'s
     byte-stable no-change-night guarantee (PRD §6.7). Output passes
