@@ -2,8 +2,9 @@
 """What counts as a correct judge verdict, how a run's answers are scored, and how the report reads.
 
 PRD ``docs/prds/memory-write-path-convergence.md`` §9 leaf γ, decision D10.
-Pure: no file, network, store or LLM I/O. ``eval_write_triage_cases.py`` and
-``eval_write_triage_judge.py`` import it, and it imports neither of them.
+Pure: no file, network, store or LLM I/O. ``eval_write_triage_cases.py``,
+``eval_write_triage_live_judge.py`` and ``eval_write_triage_judge.py`` import
+it, and it imports none of them.
 Alpha's label vocabulary is IMPORTED from ``calibrate_write_triage`` rather
 than re-spelled (INV-5).
 
