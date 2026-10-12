@@ -69,7 +69,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
-import shared.project_layout  # noqa: E402
 from _fm_helpers import (  # noqa: E402
     _leaked_async_httpx_clients,
     _warn_if_drain_closed_a_foreign_client,
@@ -340,6 +339,8 @@ class EscalationQueueRelocation:
 @pytest.fixture
 def escalation_queue_relocation(monkeypatch) -> EscalationQueueRelocation:
     """Simulate an operator relocating the escalation queue in its one home."""
+    import shared.project_layout
+
     relocation = EscalationQueueRelocation(
         legacy_relpath=shared.project_layout.ESCALATION_QUEUE_RELPATH,
         relocated_relpath='data/relocated-escalations',

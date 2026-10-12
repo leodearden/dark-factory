@@ -22145,7 +22145,7 @@ def test_file_finding_task_escalation_files_into_the_layout_escalation_queue_whe
     journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
     escalation_queue_relocation,
 ):
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
