@@ -162,7 +162,7 @@ class TestVerifyAdmissionOrderingKnobs:
 
     def test_an_unknown_order_is_rejected(self):
         with pytest.raises(ValidationError):
-            OrchestratorConfig(verify_admission_order='fifo')
+            OrchestratorConfig(verify_admission_order='fifo')  # type: ignore[arg-type]
 
     def test_arrival_order_is_accepted(self):
         assert OrchestratorConfig(verify_admission_order='arrival').verify_admission_order == 'arrival'
@@ -178,8 +178,9 @@ class TestVerifyAdmissionOrderingKnobs:
     @pytest.mark.parametrize(
         'field', ['verify_admission_background_promote_secs', 'verify_admission_wait_alarm_secs'],
     )
-    def test_a_positive_fractional_age_is_accepted(self, field):
-        assert getattr(OrchestratorConfig(**{field: 1.5}), field) == 1.5
+    @pytest.mark.parametrize('good_value', [1.5])
+    def test_a_positive_fractional_age_is_accepted(self, field, good_value):
+        assert getattr(OrchestratorConfig(**{field: good_value}), field) == good_value
 
     def test_apply_reload_applies_all_three_in_place(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
