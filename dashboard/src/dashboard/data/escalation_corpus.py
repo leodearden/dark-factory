@@ -285,3 +285,23 @@ def views_over(
         )
         for view in EscalationView
     }
+
+
+def pending_escalation_ids(
+    corpus_datum: Datum[EscalationCorpus], queue_id: str,
+) -> Mapping[str, tuple[str, ...]] | None:
+    """Each task id's pending live-queue escalation ids; None when that queue was not fully read."""
+    corpus = corpus_datum.value
+    if corpus is None:
+        return None
+    try:
+        scan = corpus.scan(queue_id)
+    except KeyError:
+        return None
+    if scan.partial_causes():
+        return None
+    by_task: dict[str, list[str]] = {}
+    for record in scan.records:
+        if EscalationView.QUEUE_PENDING.admits(record):
+            by_task.setdefault(record.escalation.task_id, []).append(record.escalation.id)
+    return {task_id: tuple(sorted(ids)) for task_id, ids in by_task.items()}
