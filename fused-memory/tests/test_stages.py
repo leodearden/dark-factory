@@ -7679,7 +7679,7 @@ class TestQueryStage2Flags:
         assert isinstance(partition, Stage2FlagPartition)
         assert len(partition) == 5
         assert partition.rescued_ids == []
-        assert partition.carried_forward_ids == ()
+        assert partition.carried_forward_ids == []
 
     @pytest.mark.asyncio
     async def test_rescued_ids_field_collects_window_guard_rescued_marker_ids(self):
@@ -11634,7 +11634,7 @@ class TestAssemblePayloadRunWindowStart:
 
         async def capture_query(*args, **kwargs):
             captured_kwargs.update(kwargs)
-            return Stage2FlagPartition([], [], [], [])
+            return Stage2FlagPartition([], [], [], [], [])
 
         with (
             patch(
@@ -11676,7 +11676,7 @@ class TestAssemblePayloadRunWindowStart:
 
         async def capture_query(*args, **kwargs):
             captured_kwargs.update(kwargs)
-            return Stage2FlagPartition([], [], [], [])
+            return Stage2FlagPartition([], [], [], [], [])
 
         with (
             patch(
@@ -11718,7 +11718,7 @@ class TestAssemblePayloadRunWindowStart:
 
         async def capture_query(*args, **kwargs):
             captured_kwargs.update(kwargs)
-            return Stage2FlagPartition([], [], [], [])
+            return Stage2FlagPartition([], [], [], [], [])
 
         with (
             patch(
@@ -11780,7 +11780,7 @@ class TestAssemblePayloadRunWindowStart:
 
         async def capture_query(*args, **kwargs):
             captured_kwargs.update(kwargs)
-            return Stage2FlagPartition([], [], [], [])
+            return Stage2FlagPartition([], [], [], [], [])
 
         with (
             patch(
@@ -11978,6 +11978,7 @@ class TestRescuedInWindowMarkersStat:
             stale_missing_run_id_ids=[],
             stale_mismatched_run_id_ids=[],
             rescued_ids=['rescued-1'],  # only 1, even though both flags have non-matching run_id
+            carried_forward_ids=[],
         )
 
         with (

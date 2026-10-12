@@ -682,7 +682,7 @@ class Stage2FlagPartition(NamedTuple):
     stale_missing_run_id_ids: list[str]
     stale_mismatched_run_id_ids: list[str]
     rescued_ids: list[str]
-    carried_forward_ids: tuple[str, ...] = ()
+    carried_forward_ids: list[str]
 
     @property
     def stale_all_ids(self) -> list[str]:
@@ -768,7 +768,7 @@ async def _query_stage2_flags(
         carries the top-N risk — see follow-up task for a proper
         ``scroll_by_metadata`` API on Mem0Backend.
 
-    Returns ``([], [], [], [])`` on search failure (best-effort; logs WARNING).
+    Returns ``([], [], [], [], [])`` on search failure (best-effort; logs WARNING).
     """
     try:
         results = await memory_service.search(
@@ -791,7 +791,7 @@ async def _query_stage2_flags(
             'skipping active-query path this cycle',
             extra={'project_id': project_id},
         )
-        return Stage2FlagPartition([], [], [], [])
+        return Stage2FlagPartition([], [], [], [], [])
 
     if len(results) == 100:
         logger.warning(
@@ -806,7 +806,7 @@ async def _query_stage2_flags(
     stale_missing_run_id_ids: list[str] = []
     stale_mismatched_run_id_ids: list[str] = []
     rescued_ids: list[str] = []
-    carried: list[str] = []
+    carried_forward_ids: list[str] = []
 
     def _rescue(flag: dict, rid: str) -> None:
         """Route a rescued marker to current and record its id.
@@ -889,7 +889,7 @@ async def _query_stage2_flags(
                 _rescue(flag_dict, r.id)
             elif isinstance(_rid_val, str) and _rid_val in carry_forward_run_ids:
                 current_flags.append(flag_dict)
-                carried.append(r.id)
+                carried_forward_ids.append(r.id)
             else:
                 if run_window_start is not None and (
                     not _created_at_val or not isinstance(_created_at_val, str)
@@ -919,7 +919,7 @@ async def _query_stage2_flags(
         stale_missing_run_id_ids,
         stale_mismatched_run_id_ids,
         rescued_ids,
-        tuple(carried),
+        carried_forward_ids,
     )
 
 
@@ -3450,7 +3450,9 @@ async def _track_flag_persistence(
     TTL/terminal-task schedule, not by an immediate per-cycle delete.  The
     counter therefore no longer observes Stage 2 delete failures from
     previous cycles; it only counts Stage 1 re-flags that survive within the
-    current cycle's ``run_id``.
+    current cycle's ``run_id``, plus markers carried forward from a run whose
+    Stage 2 agent did not complete (task 5984), which gain one count per
+    Stage 2 run they are rendered to.
     """
     if not flag_ids:
         return {}
@@ -4500,7 +4502,7 @@ class TaskKnowledgeSync(BaseStage):
                 )
 
         # FIX A — merge Mem0 active-query flags into the flagged section.
-        # _query_stage2_flags is best-effort: search failures yield ([], [], [], []) internally.
+        # _query_stage2_flags is best-effort: search failures yield ([], [], [], [], []) internally.
         # Returns a Stage2FlagPartition with five fields:
         #   .current          — markers whose run_id matches the current run, OR whose
         #                       Mem0 created_at is within the run window (task-1369 guard)
@@ -4577,7 +4579,7 @@ class TaskKnowledgeSync(BaseStage):
                     'project_id': self.project_id,
                     'run_id': run_id_for_markers,
                     'count': self._markers_carried_forward,
-                    'origin_run_ids': sorted(carry_forward_run_ids),
+                    'owed_run_ids': sorted(carry_forward_run_ids),
                 },
             )
 
