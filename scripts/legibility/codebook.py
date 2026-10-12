@@ -22,6 +22,7 @@ import tempfile
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -1239,39 +1240,32 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _read_jsonl(path: str) -> tuple[list[tuple[int, Any]], int]:
+    """The (line number, value) of each non-blank line of *path*, and how many
+    lines were not JSON. Each of those is named on stderr and skipped."""
+    parsed: list[tuple[int, Any]] = []
+    malformed = 0
+    with open(path, encoding="utf-8") as f:
+        for lineno, raw_line in enumerate(f, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                parsed.append((lineno, json.loads(line)))
+            except json.JSONDecodeError as exc:
+                print(f"{path}:{lineno}: malformed JSON, skipping: {exc}", file=sys.stderr)
+                malformed += 1
+    return parsed, malformed
+
+
 def _cmd_apply(args: argparse.Namespace) -> int:
-    """Merge a JSONL batch of §7.3 coding records into a v2 codebook.
+    """Merge a JSONL batch of §7.3 coding records into a v2 codebook file.
 
-    Per-record failures are skipped-and-counted, never fatal to the batch:
-    a malformed JSON line (`malformed_json`), a record that fails
-    `validate_coding_record()` (`record_invalid`, skipped whole inside
-    `apply_coding_record`), and a deletion-shaped record
-    (`deletion_directive`, rejected by `_reject_deletion_directive` before
-    the codebook is even copied). Each prints a `path:lineno:` line to
-    stderr and increments its counter in the stdout summary; the return
-    value stays 0 so a batch that did land its other work is not
-    misreported after a successful `dump()`. Only a codebook that fails
-    `validate()` after the merge returns 1, leaving the file untouched.
-
-    `candidate_disposition_conflicts` counts a DIFFERENT thing and is not a
-    fourth failure mode: not a skipped record, but a successfully-merged
-    recurrence sighting appended to an already-adjudicated candidate, whose
-    disposition is left to the census. It covers the rejected case and the
-    promoted-with-no-resolvable-`promoted_to` case only — a promoted title's
-    recurrence is routed onto the entry it was promoted to and counted in
-    `matched` instead (see `apply_coding_record`).
-
-    `correction_skipped` is a fifth thing again: a well-formed correction
-    whose field writes could not land because a sibling correction in the
-    same record already claimed that entry's one sighting slot for this
-    session. It is reported here and as a WARNING (never silently dropped),
-    but the batch keeps going and the return value stays 0 — the record is
-    valid, it just says the same thing twice.
-
-    `invariant_slugs_valid`/`invariant_slugs_rejected` count the
-    `invariant_violated` values screened against the slugs declared under
-    `--project-root`; a rejected value is stored as absent and the batch
-    logs one WARNING naming them.
+    A malformed JSON line, a deletion-shaped record and a schema-invalid record
+    are each skipped, named on stderr by `path:lineno:`, and counted on the
+    stdout `applied:` line; the rest of the batch still lands. Returns 1,
+    leaving the file untouched, only for a non-dict codebook or a merged
+    codebook that fails `validate()`.
     """
     invariant_slugs = invariants.read_slugs(args.project_root)
     codebook = load(args.codebook)
@@ -1282,89 +1276,30 @@ def _cmd_apply(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    totals = {
-        "matched": 0,
-        "skipped_unknown_entry": 0,
-        "candidates_applied": 0,
-        "candidate_disposition_conflicts": 0,
-        "corrections_applied": 0,
-        "correction_skipped": 0,
-        "record_invalid": 0,
-        "malformed_json": 0,
-        "deletion_directive": 0,
-    }
-    slug_tally = SlugTally()
+    parsed, malformed = _read_jsonl(args.records)
+    merge = apply_coding_records(
+        codebook, [record for _, record in parsed], invariant_slugs=invariant_slugs
+    )
+    for label, skips in (
+        ("deletion directive rejected", merge.skipped_deletions),
+        ("invalid coding record", merge.invalid_records),
+    ):
+        for skipped in skips:
+            lineno = parsed[skipped.index][0]
+            print(
+                f"{args.records}:{lineno}: {label}, skipping: {skipped.describe()}",
+                file=sys.stderr,
+            )
+    warn_unknown_invariant_slugs(merge.invariant_slugs, invariant_slugs, run=f"apply {args.records}")
 
-    with open(args.records, encoding="utf-8") as f:
-        for lineno, raw_line in enumerate(f, start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as exc:
-                # Mirror apply_coding_record()'s skip-whole semantics for an
-                # invalid record: one malformed JSONL line is dropped and
-                # counted, never aborts the rest of the nightly/trickle
-                # batch (a JSON parse error happens before a record can
-                # ever reach apply_coding_record()'s own validation skip).
-                print(
-                    f"{args.records}:{lineno}: malformed JSON, skipping: {exc}",
-                    file=sys.stderr,
-                )
-                totals["malformed_json"] += 1
-                continue
-            try:
-                codebook, stats = apply_coding_record(
-                    codebook, record, invariant_slugs=invariant_slugs
-                )
-            except NeverDeleteError as exc:
-                # Mirror the malformed-JSON sibling above: one deletion-shaped
-                # record is dropped and counted, never aborts the rest of the
-                # nightly/trickle batch (dump() is after this loop, so an
-                # escaping exception discarded every already-applied in-memory
-                # record). apply_coding_record raises before it even
-                # deep-copies, so `codebook` is provably untouched by the bad
-                # record.
-                print(
-                    f"{args.records}:{lineno}: deletion directive rejected, skipping: {exc}",
-                    file=sys.stderr,
-                )
-                totals["deletion_directive"] += 1
-                continue
-            totals["matched"] += stats["matched"]
-            totals["skipped_unknown_entry"] += stats["skipped_unknown_entry"]
-            totals["candidates_applied"] += stats["candidates_applied"]
-            totals["candidate_disposition_conflicts"] += stats[
-                "candidate_disposition_conflicts"
-            ]
-            totals["corrections_applied"] += stats["corrections_applied"]
-            totals["correction_skipped"] += stats["correction_skipped"]
-            totals["record_invalid"] += int(stats["record_invalid"])
-            slug_tally = slug_tally.plus(stats["invariant_slugs"])
-
-    warn_unknown_invariant_slugs(slug_tally, invariant_slugs, run=f"apply {args.records}")
-    totals["invariant_slugs_valid"] = slug_tally.valid
-    totals["invariant_slugs_rejected"] = len(slug_tally.rejected)
-
-    errors = validate(codebook)
+    errors = validate(merge.codebook)
     if errors:
         for error in errors:
             print(error, file=sys.stderr)
         return 1
 
-    dump(codebook, args.codebook)
-    print(
-        "applied: matched={matched} candidates_applied={candidates_applied} "
-        "candidate_disposition_conflicts={candidate_disposition_conflicts} "
-        "corrections_applied={corrections_applied} "
-        "correction_skipped={correction_skipped} "
-        "skipped_unknown_entry={skipped_unknown_entry} "
-        "record_invalid={record_invalid} malformed_json={malformed_json} "
-        "deletion_directive={deletion_directive} "
-        "invariant_slugs_valid={invariant_slugs_valid} "
-        "invariant_slugs_rejected={invariant_slugs_rejected}".format(**totals)
-    )
+    dump(merge.codebook, args.codebook)
+    print(f"applied: {merge.summary()} malformed_json={malformed}")
     return 0
 
 
