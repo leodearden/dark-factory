@@ -259,9 +259,12 @@ class ParityRun:            # what a checker hands the driver
     tool: str               # report prefix, e.g. 'orchestrator_unit_parity'
     units: Sequence[UnitRef]          # name, repo path, installed path
     compare: Callable[[UnitRef, str, str], list[Drift]]
-    probes: Sequence[Probe] = ()      # extra per-unit verdict classes (lms)
-    remedy: RemedyText                # report tails per bucket
-def run_parity(run: ParityRun, *, out: TextIO) -> int: ...   # 0 parity, 1 absent/override-only, 2 drift
+    report: ReportText                # per-bucket BlockText wording; only drift is required
+    probes: Sequence[Probe] = ()      # extra per-unit verdict classes (lms): Probe.run -> ProbeOutcome
+    print_verdicts: bool = False      # orchestrator's `verdict <unit> <kinds>` lines
+def run_parity(run: ParityRun, *, out: TextIO) -> ParityExit: ...
+# ParityExit: 0 parity, 1 drift or could-not-verify (vanished/unreadable/override/probe/zero compared),
+# 2 not-installed only
 ABSENT: Final = '<absent>'           # public; _ABSENT retired
 ```
 Invariants:

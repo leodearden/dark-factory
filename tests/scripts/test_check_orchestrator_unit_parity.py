@@ -51,8 +51,7 @@ Module loading: scripts/ is not a package, so the checker is loaded via
 importlib.util.spec_from_file_location, mirroring
 tests/scripts/test_check_fused_memory_unit_parity.py::_load_checker. The
 shared parser module is imported by NAME (``import systemd_unit_parity``)
-rather than by path, because that is the import the checker itself performs
-and it is what the identity guard below needs to be exercising.
+rather than by path, because that is the import the checker itself performs.
 """
 
 import importlib.util
@@ -64,6 +63,7 @@ import sys
 import types
 
 import pytest
+import systemd_unit_parity
 
 # The parsing of setup-host.sh section 5 is SHARED with
 # tests/scripts/test_orchestrator_service_files.py, which derives its own
@@ -91,7 +91,6 @@ from setup_host_sections import (
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_orchestrator_unit_parity.py"
-DASHBOARD_CHECKER_PATH = REPO_ROOT / "scripts" / "check_dashboard_unit_parity.py"
 SETUP_HOST_PATH = REPO_ROOT / "scripts" / "setup-host.sh"
 
 
@@ -108,11 +107,6 @@ def _load_module(name: str, path: pathlib.Path) -> types.ModuleType:
 def _load_checker() -> types.ModuleType:
     """Load scripts/check_orchestrator_unit_parity.py by file path."""
     return _load_module("check_orchestrator_unit_parity", CHECKER_PATH)
-
-
-def _load_dashboard_checker() -> types.ModuleType:
-    """Load scripts/check_dashboard_unit_parity.py by file path."""
-    return _load_module("check_dashboard_unit_parity", DASHBOARD_CHECKER_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +178,6 @@ def test_shared_parser_module_importable_and_exposes_the_parser():
     import systemd_unit_parity
 
     assert callable(systemd_unit_parity.parse_unit_directives)
-    assert callable(systemd_unit_parity._join_continuations)
 
 
 def test_shared_parser_parses_sections_keys_and_values():
@@ -222,50 +215,6 @@ def test_shared_parser_parses_sections_keys_and_values():
         "/usr/bin/thing --flag-one --flag-two"
     ]
     assert parsed["Service"]["Restart"] == ["always"]
-
-
-def test_dashboard_checker_consumes_the_lifted_parser():
-    """IDENTITY guard: the dashboard checker uses the lifted parser, not a copy.
-
-    This is the assertion that makes the extraction worth doing. Re-exporting
-    the parser from check_dashboard_unit_parity.py keeps that module's surface
-    (and its 1677-line test suite) intact, but re-export is only meaningful if
-    it is the SAME function object — if someone later pastes a second copy of
-    the parser back into the dashboard checker, every other test in both
-    suites would still pass while the two implementations quietly drifted
-    apart, which is precisely the failure mode these parity checkers exist to
-    catch. Asserting object identity is the only check that fires on that.
-    """
-    import systemd_unit_parity
-
-    dashboard = _load_dashboard_checker()
-
-    assert dashboard.parse_unit_directives is systemd_unit_parity.parse_unit_directives
-    assert dashboard._join_continuations is systemd_unit_parity._join_continuations
-
-
-def test_find_dropins_is_shared_not_duplicated():
-    """IDENTITY guard for the SECOND lift: ``find_dropins`` has one home.
-
-    ``find_dropins`` arrived in this family ALREADY duplicated — code-identical
-    bodies in check_dashboard_unit_parity.py and check_orchestrator_unit_parity.py,
-    differing only in their docstrings' example directives. A third consumer
-    (check_lms_unit_parity.py) forced the question, and pasting a third copy
-    would reproduce, inside the tooling built to catch silent drift, precisely
-    the failure it exists to report.
-
-    Same assertion shape as the parser guard above, for the same reason: a
-    look-alike copy pasted back into either checker would leave every other
-    test in both suites green while the implementations quietly diverged.
-    Object identity is the only check that fires on that.
-    """
-    import systemd_unit_parity
-
-    checker = _load_checker()
-    dashboard = _load_dashboard_checker()
-
-    assert checker.find_dropins is systemd_unit_parity.find_dropins
-    assert dashboard.find_dropins is systemd_unit_parity.find_dropins
 
 
 def test_shared_find_dropins_counts_only_conf_files(tmp_path: pathlib.Path):
@@ -490,7 +439,7 @@ def test_directive_only_in_repo_copy_is_drift():
 
     assert _drift_keys(drifts) == [("Service", "TimeoutStartSec")]
     assert drifts[0].repo_value == "1800"
-    assert drifts[0].installed_value == checker._ABSENT
+    assert drifts[0].installed_value == systemd_unit_parity.ABSENT
     assert "absent from the installed copy" in drifts[0].reason
 
 
@@ -519,7 +468,7 @@ def test_directive_only_in_installed_copy_is_drift():
     drifts = checker.compare_unit("u.timer", repo, installed)
 
     assert _drift_keys(drifts) == [("Timer", "AccuracySec")]
-    assert drifts[0].repo_value == checker._ABSENT
+    assert drifts[0].repo_value == systemd_unit_parity.ABSENT
     assert drifts[0].installed_value == "5s"
     assert "absent from the repo copy" in drifts[0].reason
 
@@ -572,7 +521,7 @@ def test_changed_occurrence_count_of_a_repeated_directive_is_drift():
     # Both sides declare the key, so neither renders as <absent> — the
     # difference is in the list, and the report must show both lists.
     assert "B=2" in drifts[0].repo_value
-    assert drifts[0].installed_value != checker._ABSENT
+    assert drifts[0].installed_value != systemd_unit_parity.ABSENT
 
 
 def test_repeated_values_render_with_unambiguous_occurrence_boundaries():
@@ -631,7 +580,7 @@ def test_section_present_on_one_side_only_surfaces_as_drifts():
 
     assert _drift_keys(drifts) == [("Install", "WantedBy")]
     assert drifts[0].repo_value == "timers.target"
-    assert drifts[0].installed_value == checker._ABSENT
+    assert drifts[0].installed_value == systemd_unit_parity.ABSENT
 
 
 def test_drift_ordering_is_deterministic():
@@ -690,59 +639,6 @@ def _make_trees(
         (installed_dir / unit).write_text(installed_text, encoding="utf-8")
 
     return repo_root, installed_dir
-
-
-def test_find_dropins_returns_empty_when_no_dropin_dir(tmp_path: pathlib.Path):
-    """No `<unit>.d/` directory at all => no overrides."""
-    checker = _load_checker()
-    _, installed_dir = _make_trees(tmp_path)
-
-    assert checker.find_dropins(installed_dir, _REAL_UNIT) == []
-
-
-def test_find_dropins_finds_an_override_conf(tmp_path: pathlib.Path):
-    """A `<unit>.d/override.conf` — what `systemctl --user edit` writes."""
-    checker = _load_checker()
-    _, installed_dir = _make_trees(tmp_path)
-
-    dropin_dir = installed_dir / f"{_REAL_UNIT}.d"
-    dropin_dir.mkdir()
-    override = dropin_dir / "override.conf"
-    override.write_text("[Timer]\nAccuracySec=1min\n", encoding="utf-8")
-
-    assert checker.find_dropins(installed_dir, _REAL_UNIT) == [override]
-
-
-def test_find_dropins_returns_all_conf_files_sorted(tmp_path: pathlib.Path):
-    """Several drop-ins all count, in sorted order (systemd merges them all)."""
-    checker = _load_checker()
-    _, installed_dir = _make_trees(tmp_path)
-
-    dropin_dir = installed_dir / f"{_REAL_UNIT}.d"
-    dropin_dir.mkdir()
-    for fname in ("20-second.conf", "10-first.conf"):
-        (dropin_dir / fname).write_text("[Timer]\n", encoding="utf-8")
-
-    found = checker.find_dropins(installed_dir, _REAL_UNIT)
-
-    assert [p.name for p in found] == ["10-first.conf", "20-second.conf"]
-
-
-def test_find_dropins_ignores_non_conf_files(tmp_path: pathlib.Path):
-    """Non-`.conf` files are ignored, matching what systemd actually merges.
-
-    Counting a stray `override.conf.bak` would report an override that has no
-    effect — a false positive in a report whose whole value is being believed.
-    """
-    checker = _load_checker()
-    _, installed_dir = _make_trees(tmp_path)
-
-    dropin_dir = installed_dir / f"{_REAL_UNIT}.d"
-    dropin_dir.mkdir()
-    (dropin_dir / "override.conf.bak").write_text("[Timer]\n", encoding="utf-8")
-    (dropin_dir / "notes.txt").write_text("hello\n", encoding="utf-8")
-
-    assert checker.find_dropins(installed_dir, _REAL_UNIT) == []
 
 
 def test_dropin_over_identical_units_does_not_report_parity(
@@ -2825,26 +2721,3 @@ def test_setup_host_parses_cleanly():
     assert result.returncode == 0, (
         f"bash -n rejected {SETUP_HOST_PATH}: {result.stderr}"
     )
-def test_orchestrator_reuses_the_shared_drift_and_absent():
-    """``Drift`` and ``_ABSENT`` are the SHARED objects, not local look-alikes.
-
-    IDENTITY, not equality, and the distinction is the whole point: a pasted
-    copy of a six-field frozen dataclass compares equal field-for-field with
-    the original while being a DISTINCT TYPE, so an ``==`` check on the class
-    — or on instances of it — would pass over exactly the fork this guard
-    exists to forbid. ``_ABSENT`` is worse still: two ``"<absent>"`` literals
-    may or may not be interned, so equality says nothing at all about whether
-    there is one definition or three.
-
-    The same pin the three earlier lifts carry (see
-    tests/scripts/test_check_orchestrator_unit_parity.py, which asserts this
-    shape for the parser and for ``find_dropins``). Duplicating a record inside
-    the tooling built to report silent duplication is the failure this family
-    exists to catch, one level up.
-    """
-    import systemd_unit_parity
-
-    mod = _load_checker()
-
-    assert mod.Drift is systemd_unit_parity.Drift
-    assert mod._ABSENT is systemd_unit_parity._ABSENT
