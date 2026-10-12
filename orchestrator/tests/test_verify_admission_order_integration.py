@@ -15,15 +15,24 @@ import os
 import shlex
 import sys
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from shared.verify_admission import acquire_task_slot
 
-from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.event_store import EventType
-from orchestrator.verify import VerifyResult, run_verification
+from orchestrator import verify as verify_module
+from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
+from orchestrator.event_store import EventStore, EventType
+from orchestrator.git_ops import GitOps
+from orchestrator.verify import (
+    VerifyResult,
+    run_full_verification,
+    run_scoped_verification,
+    run_verification,
+)
 from orchestrator.verify_admission_gate import gate_for
 
 _BLOCK_SRC = (
@@ -291,3 +300,174 @@ class TestRunVerificationAdmission:
         assert len(result.admission_legs) == 2
         assert all(leg['timed_out'] for leg in result.admission_legs)
         assert len({leg['plan_id'] for leg in result.admission_legs}) == 1
+
+
+def _plan_rows(store: EventStore) -> list[dict]:
+    return store.fetch_events_by_type(EventType.verify_admission_plan)
+
+
+def _at(stamp: str) -> datetime:
+    return datetime.fromisoformat(stamp)
+
+
+@pytest.mark.real_verify_admission
+@pytest.mark.usefixtures('code_default_config')
+@pytest.mark.asyncio
+class TestPlanEvent:
+    async def test_a_task_plan_emits_one_row_whose_legs_are_its_grants(self, tmp_path):
+        config = _config(tmp_path, verify_admission_order='arrival')
+        store = EventStore(tmp_path / 'runs.db', run_id='t')
+        gate = gate_for(Path(config.verify_admission_slots_dir))
+        blocker = _Blocker(tmp_path, 'both')
+        plan = asyncio.create_task(run_scoped_verification(
+            _worktree(tmp_path, 'wt'), config,
+            [_module('a', blocker.cmd), _module('b', blocker.cmd)],
+            task_files=[], task_id='11', role='task', event_store=store,
+        ))
+        try:
+            await _until(lambda: gate.snapshot().depth == 1, watching=plan)
+        finally:
+            blocker.release()
+        async with asyncio.timeout(30):
+            result = await plan
+
+        assert result.passed
+        [row] = _plan_rows(store)
+        assert row['task_id'] == '11'
+        data = row['data']
+        assert (data['role'], data['order'], data['task_id']) == ('task', 'arrival', '11')
+        assert data['legs'] == result.admission_legs
+        assert {leg['plan_id'] for leg in data['legs']} == {data['plan_id']}
+        assert {leg['module'] for leg in data['legs']} == {'a', 'b'}
+        first, second = sorted(data['legs'], key=lambda leg: _at(leg['granted_at']))
+        assert (first['depth_at_arrival'], second['depth_at_arrival']) == (0, 0)
+        assert second['waited_secs'] > 0
+        assert all(leg['slot_held'] and leg['held_secs'] > 0 for leg in data['legs'])
+        assert all(_at(data['plan_arrival_at']) <= _at(leg['arrived_at']) for leg in data['legs'])
+        assert _at(data['completed_at']) >= max(_at(leg['granted_at']) for leg in data['legs'])
+
+    @pytest.mark.parametrize(
+        ('role', 'overrides'),
+        [('merge', {}), ('task', {'verify_admission_enabled': False})],
+    )
+    async def test_a_plan_with_no_gated_leg_emits_no_row(self, tmp_path, role, overrides):
+        config = _config(tmp_path, **overrides)
+        store = EventStore(tmp_path / 'runs.db', run_id='t')
+
+        async with asyncio.timeout(30):
+            result = await run_scoped_verification(
+                _worktree(tmp_path, 'wt'), config, [_module('a', _sleep_cmd())],
+                task_files=[], task_id='12', role=role, event_store=store,
+            )
+
+        assert result.passed
+        assert result.admission_legs is None
+        assert _plan_rows(store) == []
+
+    async def test_a_plan_without_an_event_store_still_records_its_legs(self, tmp_path):
+        async with asyncio.timeout(30):
+            result = await run_scoped_verification(
+                _worktree(tmp_path, 'wt'), _config(tmp_path), [_module('a', _sleep_cmd())],
+                task_files=[], task_id='13', role='task', event_store=None,
+            )
+
+        assert result.passed
+        assert result.admission_legs is not None
+        assert len(result.admission_legs) == 1
+
+    async def test_a_plans_later_legs_keep_its_place_ahead_of_a_later_plan(self, tmp_path):
+        config = _config(tmp_path, verify_admission_order='arrival', max_concurrent_module_verifies=4)
+        gate = gate_for(Path(config.verify_admission_slots_dir))
+        blocker = _Blocker(tmp_path, 'all')
+        p_modules = [_module(f'p{i}', blocker.cmd) for i in range(1, 7)]
+
+        p = asyncio.create_task(run_scoped_verification(
+            _worktree(tmp_path, 'wt-p'), config, p_modules, task_files=[], task_id='P', role='task',
+        ))
+        q: asyncio.Task | None = None
+        try:
+            await _until(
+                lambda: (len(gate.snapshot().holders), gate.snapshot().depth) == (1, 3), watching=p,
+            )
+            q = asyncio.create_task(run_scoped_verification(
+                _worktree(tmp_path, 'wt-q'), config, [_module('q', blocker.cmd)],
+                task_files=[], task_id='Q', role='task',
+            ))
+            await _until(lambda: gate.snapshot().depth == 4, watching=q)
+        finally:
+            blocker.release()
+        assert q is not None
+        async with asyncio.timeout(60):
+            p_result, q_result = await asyncio.gather(p, q)
+
+        assert p_result.passed and q_result.passed
+        assert p_result.admission_legs is not None and q_result.admission_legs is not None
+        assert len(p_result.admission_legs) == 6
+        [q_leg] = q_result.admission_legs
+        assert max(_at(leg['granted_at']) for leg in p_result.admission_legs) < _at(q_leg['granted_at'])
+
+    async def test_a_file_scoped_leg_records_its_scope_kind(self, tmp_path):
+        worktree = _worktree(tmp_path, 'wt')
+        (worktree / 'pkg').mkdir()
+        (worktree / 'pkg' / 'test_one.py').write_text('def test_ok():\n    pass\n')
+        pytest_cmd = f'{shlex.quote(sys.executable)} -m pytest -q -p no:cacheprovider'
+
+        async with asyncio.timeout(60):
+            result = await run_scoped_verification(
+                worktree, _config(tmp_path), [_module('pkg', pytest_cmd)],
+                task_files=['pkg/test_one.py'], task_id='sk', role='task',
+            )
+
+        assert result.admission_legs is not None
+        [leg] = result.admission_legs
+        assert leg['scope_kind'] == 'file_scoped'
+
+    async def test_a_background_full_verification_emits_its_plan(self, tmp_path):
+        config = _config(tmp_path)
+        config._module_configs = {
+            'a': _module('a', _sleep_cmd()), 'b': _module('b', _sleep_cmd()),
+        }
+        store = EventStore(tmp_path / 'runs.db', run_id='t')
+
+        async with asyncio.timeout(30):
+            result = await run_full_verification(
+                tmp_path, config, role='background', event_store=store,
+            )
+
+        assert result.passed
+        [row] = _plan_rows(store)
+        assert row['data']['role'] == 'background'
+        assert row['data']['task_id'] is None
+        assert {leg['module'] for leg in row['data']['legs']} == {'a', 'b'}
+
+    async def test_the_main_tip_sweep_hands_its_event_store_on(self, tmp_path):
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            max_concurrent_tasks=1,
+            git=GitConfig(
+                main_branch='main', branch_prefix='task/', remote='origin', worktree_dir='.worktrees',
+            ),
+        )
+        git_ops = GitOps(config.git, tmp_path)
+        git_ops.get_main_sha = AsyncMock(return_value='a' * 40)  # type: ignore[method-assign]
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        store = EventStore(tmp_path / 'runs.db', run_id='t')
+        seen: list[dict] = []
+
+        async def fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        async def fake_full_verification(project_root, cfg, **kwargs):
+            seen.append(kwargs)
+            return VerifyResult(
+                passed=True, test_output='', lint_output='', type_output='', summary='ok',
+            )
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=fake_run),
+            patch.object(verify_module, 'run_full_verification', side_effect=fake_full_verification),
+        ):
+            await verify_module.run_main_tip_sweep(config, git_ops, event_store=store)
+
+        assert seen
+        assert all(kwargs['event_store'] is store for kwargs in seen)
