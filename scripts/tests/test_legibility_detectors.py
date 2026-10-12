@@ -571,15 +571,16 @@ _READ_OF_MARKER_SOURCE = (
 
 
 class TestAgentClassVocabulary:
-    def test_agent_classes_are_the_five_strata_plus_unknown(self):
+    def test_agent_classes_are_the_strata_plus_unknown(self):
         assert [c.value for c in AgentClass] == [
             'recon', 'curator-classifier', 'watcher', 'orchestrated-task', 'interactive',
-            'unknown',
+            'legibility-instrument', 'unknown',
         ]
 
-    def test_the_sampler_strata_are_the_five_in_order(self):
+    def test_the_sampler_strata_are_every_class_but_unknown(self):
         assert sampling.STRATA == (
             'recon', 'curator-classifier', 'watcher', 'orchestrated-task', 'interactive',
+            'legibility-instrument',
         )
 
 
