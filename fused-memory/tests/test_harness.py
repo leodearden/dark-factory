@@ -20015,6 +20015,76 @@ class TestFullCycleWiringDiagnostics:
         )
 
     @pytest.mark.asyncio
+    async def test_run_full_cycle_attributes_dead_writes_by_operation(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+        caplog,
+    ):
+        """Dead writes are attributed per operation in Stage 1 and the unhealthy WARNING.
+
+        Task 5478: the queue-health record carries get_stats' dead_by_operation into
+        Stage 1 (and so report.stats), and the 'reconciliation.graphiti_queue_unhealthy'
+        warning keeps its bare-token message while its extra carries the breakdown.
+        """
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        assert harness.taskmaster is not None
+        harness.taskmaster.get_tasks = AsyncMock(
+            return_value={'tasks': [{'id': 1, 'status': 'done'}]}
+        )
+        harness.taskmaster.get_statuses_fresh = AsyncMock(return_value={'1': 'done'})
+
+        dead_by_operation = {'add_episode': 2, 'add_memory_graphiti': 1}
+        durable_queue_mock = AsyncMock()
+        durable_queue_mock.get_stats = AsyncMock(
+            return_value={
+                'counts': {'dead': 3, 'pending': 1},
+                'oldest_pending_age_seconds': 5.0,
+                'dead_by_operation': dict(dead_by_operation),
+            }
+        )
+        harness.memory.durable_queue = durable_queue_mock
+
+        captured: dict = {}
+
+        async def capture_queue_health(stage):
+            captured['graphiti_queue_health'] = stage.graphiti_queue_health
+
+        for stage in harness.stages:
+            if isinstance(stage, MemoryConsolidator):
+                _mock_stage_run(stage, before_return=capture_queue_health)
+            else:
+                _mock_stage_run(stage)
+
+        harness_logger = 'fused_memory.reconciliation.harness'
+        with caplog.at_level(logging.WARNING, logger=harness_logger):
+            await harness.run_full_cycle(
+                'test-project',
+                'attribution-test',
+                events=[_make_event()],
+            )
+
+        gqh = captured.get('graphiti_queue_health')
+        assert gqh is not None, 'MemoryConsolidator.run() never saw a graphiti_queue_health'
+        assert gqh.get('dead_by_operation') == dead_by_operation
+
+        unhealthy = [
+            r for r in caplog.records
+            if r.name == harness_logger
+            and r.getMessage() == 'reconciliation.graphiti_queue_unhealthy'
+        ]
+        assert len(unhealthy) == 1, (
+            f'expected exactly one bare-token unhealthy warning, got {unhealthy!r}'
+        )
+        assert getattr(unhealthy[0], 'dead_by_operation', None) == dead_by_operation, (
+            'the unhealthy warning extra must carry dead_by_operation'
+        )
+
+    @pytest.mark.asyncio
     async def test_run_full_cycle_threads_status_correction_reconciliation_into_stage1(
         self,
         journal,
