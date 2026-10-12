@@ -89,6 +89,9 @@ WHAT THIS DOES NOT COVER, deliberately:
 from __future__ import annotations
 
 import re
+import types
+from collections.abc import Iterable
+from typing import NamedTuple
 
 import pytest
 
@@ -216,8 +219,19 @@ _BACKTICKED = re.compile(r'`([A-Za-z][A-Za-z0-9_]*)[^`]*`')
 # docstring on why the leading underscore is not optional.
 _PROMPT_CONSTANT_NAME = re.compile(r'^_?[A-Z][A-Z0-9_]*$')
 
-# The modules whose namespaces scan surface (b) introspects.
-_PROMPT_MODULES = (roles_module, harness_guidance_module)
+# The modules whose namespaces scan surface (b) introspects, lowest layer
+# first, so a constant roles.py imports is reported under harness_guidance.
+_PROMPT_MODULES = (harness_guidance_module, roles_module)
+
+
+class _PromptConstant(NamedTuple):
+    module: str
+    name: str
+    text: str
+
+    @property
+    def where(self) -> str:
+        return f'{self.module}.{self.name}'
 
 
 def _is_camel_case(token: str) -> bool:
@@ -229,19 +243,26 @@ def _is_camel_case(token: str) -> bool:
     return token[0].isupper() and any(char.islower() for char in token)
 
 
-def _prompt_constants() -> list[tuple[str, str]]:
-    """Every module-level string constant in `_PROMPT_MODULES`, by introspection.
+def _prompt_constants(modules: Iterable[types.ModuleType]) -> list[_PromptConstant]:
+    """Every module-level string constant in `modules`, by introspection.
 
-    Keyed by name: a constant one listed module imports from another is the
-    same object in both namespaces, and is scanned once.
+    One entry per distinct binding of a name to an object: an import is the
+    same object under the same name, so it is scanned once, under the first
+    module that binds it; a shadowing value is another object, so it is
+    scanned too.
     """
-    constants = {
-        name: value
-        for module in _PROMPT_MODULES
-        for name, value in vars(module).items()
-        if _PROMPT_CONSTANT_NAME.match(name) and isinstance(value, str)
-    }
-    return sorted(constants.items())
+    first_binding: dict[tuple[str, int], _PromptConstant] = {}
+    for module in modules:
+        module_name = module.__name__.rpartition('.')[2]
+        for name, value in vars(module).items():
+            if _PROMPT_CONSTANT_NAME.match(name) and isinstance(value, str):
+                first_binding.setdefault(
+                    (name, id(value)), _PromptConstant(module_name, name, value),
+                )
+    return sorted(first_binding.values())
+
+
+_SCANNED_CONSTANTS = _prompt_constants(_PROMPT_MODULES)
 
 
 def _unknown_tool_tokens(text: str) -> list[str]:
@@ -309,6 +330,29 @@ def test_detector_detects() -> None:
     assert _unknown_tool_tokens('prefix it `Hypothesis:` so a reviewer can tell') == []
 
 
+def test_scan_keeps_a_shadowed_name_and_folds_an_import() -> None:
+    """Two listed modules binding one name to different text are both scanned.
+
+    Keyed by name alone, the later module's value would silently replace the
+    earlier one's and the earlier text would never be scanned -- the
+    false-green shape this module exists to rule out. An import binds the
+    same object under the same name, so it is scanned once, under the first
+    module listed. Fixtures are synthetic modules, so this pins no prompt.
+    """
+    lower = types.ModuleType('pkg.lower')
+    upper = types.ModuleType('pkg.upper')
+    lower.SHARED = 'imported text'
+    lower.SHADOWED = 'lower text'
+    upper.SHARED = lower.SHARED
+    upper.SHADOWED = 'upper text'
+
+    assert _prompt_constants((lower, upper)) == [
+        _PromptConstant('lower', 'SHADOWED', 'lower text'),
+        _PromptConstant('lower', 'SHARED', 'imported text'),
+        _PromptConstant('upper', 'SHADOWED', 'upper text'),
+    ]
+
+
 def test_scan_reaches_the_turn_prompt_only_constant() -> None:
     """The scan surface still holds this module's false-green witness.
 
@@ -318,7 +362,7 @@ def test_scan_reaches_the_turn_prompt_only_constant() -> None:
     fails first. It is the detector-coverage twin of `test_detector_detects`,
     not a prose pin.
     """
-    scanned = {name for name, _ in _prompt_constants()}
+    scanned = {constant.name for constant in _SCANNED_CONSTANTS}
     assert 'WAIT_PATTERN_REMINDER' in scanned, (
         'WAIT_PATTERN_REMINDER is no longer among the scanned prompt constants. '
         'Add the module that defines it to _PROMPT_MODULES.'
@@ -338,8 +382,10 @@ def test_role_prompt_names_no_phantom_harness_tool(role_key: str) -> None:
     assert not unknown, _failure_message(f"{role_key}'s system_prompt", unknown)
 
 
-@pytest.mark.parametrize('const_name', [name for name, _ in _prompt_constants()])
-def test_prompt_constant_names_no_phantom_harness_tool(const_name: str) -> None:
+@pytest.mark.parametrize(
+    'constant', _SCANNED_CONSTANTS, ids=lambda constant: constant.where,
+)
+def test_prompt_constant_names_no_phantom_harness_tool(constant: _PromptConstant) -> None:
     """Same invariant over the scanned modules' prompt constants, spliced or not.
 
     The surface that catches what the system_prompt scan cannot:
@@ -347,5 +393,5 @@ def test_prompt_constant_names_no_phantom_harness_tool(const_name: str) -> None:
     build_amender_prompt, so it is absent from every role's system_prompt
     while still being prompt text an agent is expected to act on.
     """
-    unknown = _unknown_tool_tokens(dict(_prompt_constants())[const_name])
-    assert not unknown, _failure_message(const_name, unknown)
+    unknown = _unknown_tool_tokens(constant.text)
+    assert not unknown, _failure_message(constant.where, unknown)
