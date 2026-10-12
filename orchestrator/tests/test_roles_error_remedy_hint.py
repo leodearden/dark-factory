@@ -38,18 +38,13 @@ wording, never a byte-size figure.
 
 from __future__ import annotations
 
+from _role_splice_contract import assert_opens_own_section
+
 from orchestrator.agents.roles import (
     ERROR_REMEDY_HINT_GUIDANCE,
     ROLES,
     TOOL_CALL_REJECTION_GUIDANCE,
 )
-
-# `ERROR_REMEDY_HINT_GUIDANCE` opens with its own `\n## ` heading — reused
-# here as a structural landmark, not any particular heading's text, so
-# renaming a section in roles.py cannot silently turn this check into a
-# no-op. Mirrors `test_roles_tool_call_rejection.py`'s own
-# `_MARKDOWN_HEADING` and `test_roles_wait_pattern.py`'s before it.
-_MARKDOWN_HEADING = '\n## '
 
 
 def test_error_remedy_hint_guidance_is_nonempty() -> None:
@@ -80,11 +75,13 @@ def test_guidance_opens_with_its_own_markdown_heading() -> None:
     rather than reading as an unheaded continuation of whatever precedes
     it.
     """
-    assert ERROR_REMEDY_HINT_GUIDANCE.startswith(_MARKDOWN_HEADING), (
-        f'ERROR_REMEDY_HINT_GUIDANCE does not open with {_MARKDOWN_HEADING!r}. '
-        'The constant must carry its own markdown heading so it reads as '
-        'its own section wherever it is spliced, not an unheaded '
-        'continuation of the block before it.'
+    assert_opens_own_section(
+        'ERROR_REMEDY_HINT_GUIDANCE',
+        ERROR_REMEDY_HINT_GUIDANCE,
+        remedy=(
+            'The constant must carry its own markdown heading to sit as its own '
+            'section immediately after TOOL_CALL_REJECTION_GUIDANCE.'
+        ),
     )
 
 

@@ -13,7 +13,7 @@ import re
 from pathlib import Path
 
 import pytest
-from _role_splice_contract import MARKDOWN_HEADING, assert_brace_free, assert_nonempty
+from _role_splice_contract import assert_brace_free, assert_nonempty, assert_opens_own_section
 
 from orchestrator.agents.code_quality import NORMATIVE_DOC, guidance, render, section
 
@@ -111,7 +111,10 @@ class TestRender:
 
     def test_opens_its_own_section_and_ends_with_exactly_one_newline(self):
         rendered = render(_doc(_SECTIONS))
-        assert rendered.startswith('\n## ')
+        assert_opens_own_section(
+            'render()', rendered,
+            remedy='render() must open the block with its title heading.',
+        )
         assert rendered.endswith('\n')
         assert not rendered.endswith('\n\n')
 
@@ -215,7 +218,13 @@ class TestRenderedGuidanceShape:
         )
 
     def test_opens_its_own_section_and_ends_with_exactly_one_newline(self, block):
-        assert block.startswith(MARKDOWN_HEADING)
+        assert_opens_own_section(
+            'guidance()', block,
+            remedy=(
+                'render() must open the block with its title heading: the block '
+                'is spliced into role prompts.'
+            ),
+        )
         assert block.endswith('\n')
         assert not block.endswith('\n\n')
 

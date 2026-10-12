@@ -40,6 +40,7 @@ from _role_splice_contract import (
     SpliceContract,
     assert_brace_free,
     assert_nonempty,
+    assert_opens_own_section,
     bash_capable_unpinned,
     bash_capable_unpinned_contract,
 )
@@ -98,6 +99,36 @@ def test_assert_brace_free_fires_for_a_literal_brace(value: str) -> None:
     """
     with pytest.raises(AssertionError) as excinfo:
         assert_brace_free('SOME_CONSTANT', value, remedy=_REMEDY)
+
+    message = str(excinfo.value)
+    assert 'SOME_CONSTANT' in message
+    assert _REMEDY in message
+
+
+def test_assert_opens_own_section_passes_for_a_value_opening_its_own_section() -> None:
+    """A conforming value returns None, so the helper is not unconditionally loud."""
+    assert assert_opens_own_section('SOME_CONSTANT', _SPLICE, remedy=_REMEDY) is None
+
+
+@pytest.mark.parametrize(
+    'value',
+    [
+        'A paragraph with no heading at all.\n',
+        '## Heading\n\nBody.\n',
+        '\n### Sub-heading\n\nBody.\n',
+        'A lead-in paragraph.\n## Heading\n\nBody.\n',
+    ],
+    ids=['unheaded', 'heading-without-leading-newline', 'level-three-heading', 'heading-not-first'],
+)
+def test_assert_opens_own_section_fires_for_a_value_without_its_own_heading(value: str) -> None:
+    """Each case is a distinct way a block fails to own its section.
+
+    The near misses rule out looser checks: ``lstrip().startswith('## ')`` would
+    pass a heading with no leading newline, ``startswith('\\n##')`` a ``###``
+    sub-heading, and ``MARKDOWN_HEADING in value`` a heading that is not first.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        assert_opens_own_section('SOME_CONSTANT', value, remedy=_REMEDY)
 
     message = str(excinfo.value)
     assert 'SOME_CONSTANT' in message

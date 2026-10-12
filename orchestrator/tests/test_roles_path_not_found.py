@@ -15,10 +15,10 @@ from dataclasses import replace
 
 from _role_splice_contract import (
     BASH_CAPABLE_UNPINNED_ROLES,
-    MARKDOWN_HEADING,
     SpliceContract,
     assert_brace_free,
     assert_nonempty,
+    assert_opens_own_section,
     bash_capable_unpinned_contract,
 )
 
@@ -69,10 +69,10 @@ def test_guidance_is_brace_free():
 
 def test_guidance_opens_its_own_section():
     """The block opens with its own ``\\n## `` heading."""
-    assert PATH_NOT_FOUND_GUIDANCE.startswith(MARKDOWN_HEADING), (
-        'PATH_NOT_FOUND_GUIDANCE does not start with MARKDOWN_HEADING, so where '
-        'it is spliced it would read as an unheaded continuation of whichever '
-        'block precedes it. Give it a leading blank line and a `## ` heading.'
+    assert_opens_own_section(
+        'PATH_NOT_FOUND_GUIDANCE',
+        PATH_NOT_FOUND_GUIDANCE,
+        remedy='Give it a leading blank line and a `## ` heading.',
     )
 
 
