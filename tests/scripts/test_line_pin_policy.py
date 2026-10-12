@@ -74,6 +74,7 @@ import pathlib
 import re
 
 import pytest
+import verify_command_invariants as vci
 import yaml
 from orchestrator.config import _discover_module_configs
 
@@ -84,15 +85,11 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 CONTRIBUTING_PATH = REPO_ROOT / "CONTRIBUTING.md"
 CLAUDE_MD_PATH = REPO_ROOT / "CLAUDE.md"
 
-# The marker pair delimiting the policy prose in both files. Chosen to match the
-# existing `lint-command-mirror:begin/end` idiom in CONTRIBUTING.md rather than
-# inventing a second convention.
-#
-# Matched as `<!-- line-pin-policy:begin`, NOT as a whole comment: both homes
-# carry explanatory prose inside the opening marker comment itself, and pinning
-# the closing `-->` would forbid that.
-_MARKER_BEGIN = "<!-- line-pin-policy:begin"
-_MARKER_END = "<!-- line-pin-policy:end -->"
+# The slug of the marker pair delimiting the policy prose in both files. Chosen
+# to match the existing `lint-command-mirror:begin/end` idiom in CONTRIBUTING.md
+# rather than inventing a second convention. The begin/end spelling it derives
+# lives in `tests/scripts/verify_command_invariants.py::marked_body`.
+_MARKER_SLUG = "line-pin-policy"
 
 # The three command keys that can invoke a checker during verify / pre-commit.
 # Same set as test_ruff_format_policy.py — the places an enforcement leg can be
@@ -143,27 +140,28 @@ _ADOPTION_REMEDY = (
 )
 
 
-def _marked_body(path: pathlib.Path) -> str:
-    """Return the prose between the policy markers in *path*.
+def _marked_body(text: str, source: str) -> str:
+    """The policy prose between the ``line-pin-policy`` markers in *text*.
 
-    Fails the caller's assertion (rather than raising) on every shape that would
-    make the guard vacuous: markers missing, duplicated, or inverted. Returning
-    an empty string for "present but empty" is the point — a marker pair left
-    wrapping nothing is exactly the silent-deletion failure (a) and (b) exist to
-    catch, and it must read as absence, not as presence.
+    A missing, duplicated, inverted or unterminated marker, and a blank span,
+    RAISE from the shared helper, naming the marker, *source* and the task. A
+    span wrapping only an HTML comment survives that helper; the comment strip
+    here is what makes it read as absence (``""``), so the caller's
+    ``assert body`` fails. That silent deletion is what (a) and (b) exist to
+    catch.
     """
-    text = path.read_text(encoding="utf-8")
-    if text.count(_MARKER_BEGIN) != 1 or text.count(_MARKER_END) != 1:
-        return ""
-    start = text.index(_MARKER_BEGIN)
-    end = text.index(_MARKER_END)
-    if end <= start:
-        return ""
-    # Drop the opening marker comment itself — it carries pointer prose in both
-    # homes, which would otherwise satisfy a non-emptiness check on its own.
-    body = text[start:end]
-    body = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
-    return body.strip()
+    span = vci.marked_body(
+        text,
+        slug=_MARKER_SLUG,
+        source=source,
+        label="the bare-`file.py:NNN` tolerated-drift policy prose (esc-3815-7)",
+        task="3815",
+    )
+    return re.sub(r"<!--.*?-->", "", span, flags=re.DOTALL).strip()
+
+
+def _policy_body(path: pathlib.Path) -> str:
+    return _marked_body(path.read_text(encoding="utf-8"), str(path.relative_to(REPO_ROOT)))
 
 
 def _hook_invocation_lines() -> list[tuple[pathlib.Path, int, str]]:
@@ -243,13 +241,13 @@ def test_policy_is_documented_in_contributing() -> None:
     This is the human-facing home and the one CLAUDE.md points at. Deleting it
     while leaving the CLAUDE.md mirror in place would leave a pointer to nothing.
     """
-    body = _marked_body(CONTRIBUTING_PATH)
+    body = _policy_body(CONTRIBUTING_PATH)
     assert body, (
-        f"{CONTRIBUTING_PATH.relative_to(REPO_ROOT)} no longer carries exactly one "
-        f"well-formed `{_MARKER_BEGIN} ... {_MARKER_END}` block with prose in it "
-        f"(esc-3815-7). The bare-`file.py:NNN` tolerated-drift policy lives there "
-        f"and is mirrored in {CLAUDE_MD_PATH.name}. If you are reversing the "
-        f"policy, update both files and this test together."
+        f"the `{_MARKER_SLUG}` marker block in "
+        f"{CONTRIBUTING_PATH.relative_to(REPO_ROOT)} wraps no prose (esc-3815-7). "
+        f"The bare-`file.py:NNN` tolerated-drift policy lives there and is "
+        f"mirrored in {CLAUDE_MD_PATH.name}. If you are reversing the policy, "
+        f"update both files and this test together."
     )
 
 
@@ -262,11 +260,11 @@ def test_policy_is_mirrored_in_claude_md() -> None:
     stop. A policy surviving only in CONTRIBUTING.md would keep the humans
     informed and change nothing about the task lane.
     """
-    body = _marked_body(CLAUDE_MD_PATH)
+    body = _policy_body(CLAUDE_MD_PATH)
     assert body, (
-        f"{CLAUDE_MD_PATH.relative_to(REPO_ROOT)} no longer carries exactly one "
-        f"well-formed `{_MARKER_BEGIN} ... {_MARKER_END}` block with prose in it "
-        f"(esc-3815-7). This mirror is what reaches a dispatched agent; "
+        f"the `{_MARKER_SLUG}` marker block in "
+        f"{CLAUDE_MD_PATH.relative_to(REPO_ROOT)} wraps no prose (esc-3815-7). "
+        f"This mirror is what reaches a dispatched agent; "
         f"{CONTRIBUTING_PATH.name} section 2 is the normative copy. Update both "
         f"and this test together."
     )
