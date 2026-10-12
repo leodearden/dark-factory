@@ -495,13 +495,16 @@ def record_hits(record: Mapping[str, Any]) -> RecordHits:
 
 
 class AgentClass(StrEnum):
-    """The sampler's five strata, plus UNKNOWN for an empty transcript."""
+    """The sampler's strata, plus UNKNOWN for an empty transcript.
+    LEGIBILITY_INSTRUMENT is a session the legibility pipeline ran for
+    itself, not a factory agent."""
 
     RECON = 'recon'
     CURATOR_CLASSIFIER = 'curator-classifier'
     WATCHER = 'watcher'
     ORCHESTRATED_TASK = 'orchestrated-task'
     INTERACTIVE = 'interactive'
+    LEGIBILITY_INSTRUMENT = 'legibility-instrument'
     UNKNOWN = 'unknown'
 
 
