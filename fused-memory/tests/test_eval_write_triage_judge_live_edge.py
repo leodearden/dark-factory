@@ -61,6 +61,10 @@ def _mod() -> types.ModuleType:
     return load_script_module(SCRIPT_PATH, 'eval_write_triage_judge')
 
 
+def _cases_mod() -> types.ModuleType:
+    return load_script_module(SCRIPT_PATH.parent / 'eval_write_triage_cases.py', 'eval_write_triage_cases')
+
+
 def _rec(memory_id: str, cluster_id: str, label: str) -> dict:
     return {
         'memory_id': memory_id, 'content': f'content of {memory_id}',
@@ -138,7 +142,7 @@ class TestTheSeededLiveEdge:
 
     @staticmethod
     def _plan():
-        return _mod().seeded_plan(list(_CORPUS), distractors=2)
+        return _cases_mod().seeded_plan(list(_CORPUS), distractors=2)
 
     def test_every_case_is_one_completion_naming_its_slate_in_order(
         self, tmp_path: Path,
@@ -226,7 +230,7 @@ class TestTheDefaultModelsSeededVerdictsAreUnchanged:
 
     def test_both_arms_send_the_same_bytes_and_read_the_same_verdicts(self) -> None:
         mod = _mod()
-        plan = mod.seeded_plan(mod.load_fixture(SEEDED_FIXTURE), distractors=4)
+        plan = _cases_mod().seeded_plan(mod.load_fixture(SEEDED_FIXTURE), distractors=4)
         chat_config = _judge_config()
         chat_config.llm.client_class = 'openai_generic'
         verdicts: dict[str, list] = {}
@@ -291,7 +295,7 @@ def _shipped_plan(records: list[dict], rows_by_query: dict[str, list[MemoryResul
     slates = retrieval.retrieved_slates(
         labelled, retrievals, t_high=T_HIGH, t_low=T_LOW, judge_candidate_count=5,
     )
-    return _mod().plan_from_slates(records, slates, provenance={})
+    return _cases_mod().plan_from_slates(records, slates, provenance={})
 
 
 class TestTheRetrievedLiveEdge:
