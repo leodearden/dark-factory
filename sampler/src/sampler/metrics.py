@@ -1,40 +1,18 @@
-"""Load-sampler metrics collection — pure parsers + thin I/O shells.
+"""The sampler's metric groups: what each collects, what it is called, how it is windowed.
 
-Purpose
--------
-Collect the host-load metrics of one tick and return them as a ``Samples``
-mapping of ``SampleKey`` to value. The count is NOT fixed: it is 11 plus two
-per discovered cgroup leaf (25 on this host today, where seven leaves are
-present).
+``METRIC_GROUPS``, at the bottom of this module, is the metric vocabulary:
+every name, its group, its gate arm and its readability metric are declared
+there once, and every other spelling is a projection of it. The collectors
+above it are pure over their injected seams, with the live readers as
+defaults.
 
-PSI metrics (6) — kernel-windowed, no re-windowing, NULL DB windows:
-    psi_{cpu,mem,io}_{some,full}_avg10
-
-Process metrics (3) — carry trailing window_mean/window_max in the DB:
-    occt_queue_depth, verify_concurrency, verify_rss_total_bytes
-
-Load metrics (2 + 2 per cgroup leaf) — also carry trailing windows
-(PRD ``plans/load-throttle-harmonisation-prd.md`` §6.4):
-    runqueue_ratio, runqueue_read_ok,
-    own_cpu_some10 and own_read_ok, one key per discovered leaf with the leaf
-    in its own field
-
-Design decisions
-----------------
-* Pure parsers (parse_pressure_file, count_occt_queue_depth, count_verify_concurrency,
-  sum_verify_rss) accept injected data so they are fully deterministic / unit-testable.
-* Thin I/O shells (collect_psi default read, collect_process_metrics psutil calls)
-  are validated only by the live integration signal (systemctl + sqlite query).
-* PSI is kernel-windowed — we parse avg10 only, never re-window.
-
-FD-9 heuristic (PRD open question Q3)
---------------------------------------
-``occt_queue_depth`` counts bash processes matching ``cargo-test-occt-gated``
-whose ``/proc/<pid>/fd/9`` symlink does NOT exist.  File-descriptor 9 is the
-jobserver read-end of the semaphore pipe opened by the OCCT gate script; its
-absence signals the process is still waiting to acquire the semaphore.
-This is an implementation-detail heuristic that may break if the gate script is
-refactored to use a different FD number.
+FD-9 heuristic
+--------------
+``occt_queue_depth`` counts processes running ``cargo-test-occt-gated`` whose
+``/proc/<pid>/fd/9`` symlink does NOT exist. FD 9 is the read end of the
+semaphore pipe the OCCT gate script opens, so its absence means the process
+is still waiting to acquire the semaphore. The heuristic breaks if the gate
+script moves the pipe to another FD.
 """
 
 from __future__ import annotations
@@ -42,8 +20,11 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, NamedTuple
 
 from shared.psi import (
@@ -59,6 +40,9 @@ logger = logging.getLogger(__name__)
 __all__ = [
     'SampleKey',
     'Samples',
+    'GroupName',
+    'MetricSpec',
+    'MetricGroup',
     'parse_pressure_file',
     'collect_psi',
     'count_occt_queue_depth',
@@ -67,6 +51,11 @@ __all__ = [
     'collect_process_metrics',
     'discover_pressure_cgroups',
     'collect_load_metrics',
+    'METRIC_GROUPS',
+    'arm_metrics',
+    'ARM_METRICS',
+    'exact_metric_names',
+    'TICK_CLOCK',
     'ARM_METRIC_STEMS',
 ]
 
@@ -86,6 +75,113 @@ class SampleKey(NamedTuple):
 
 
 Samples = Mapping[SampleKey, float]
+
+
+class GroupName(StrEnum):
+    """The collection groups: each fails, is admitted and is windowed as a unit."""
+
+    PSI = 'psi'
+    PROCESS = 'process'
+    LOAD = 'load'
+
+
+@dataclass(frozen=True)
+class MetricSpec:
+    """One recorded metric, and the facts every projection of the table reads.
+
+    A ``per_leaf`` metric is recorded once per discovered cgroup leaf, with
+    the leaf in ``SampleKey.leaf``. ``arm`` is the shared.psi gate arm this
+    metric records, if any. ``readability`` is the metric recording whether
+    this one could be read, if any; it is per-leaf exactly when this one is.
+    """
+
+    name: str
+    per_leaf: bool = False
+    arm: str | None = None
+    readability: MetricSpec | None = None
+
+    def __post_init__(self) -> None:
+        if not self.name or ':' in self.name:
+            raise ValueError(
+                f"a metric name must be non-empty and contain no ':'; got {self.name!r}"
+            )
+        if self.readability is not None and self.readability.per_leaf != self.per_leaf:
+            raise ValueError(
+                'a readability metric must share its metric\'s per_leaf: '
+                f'{self.name!r} has per_leaf={self.per_leaf}, its readability '
+                f'{self.readability.name!r} has per_leaf={self.readability.per_leaf}'
+            )
+
+    def key(self, leaf: str | None = None) -> SampleKey:
+        return SampleKey(self.name, leaf)
+
+
+@dataclass(frozen=True)
+class MetricGroup:
+    """Metrics collected by one collector, admitted and windowed together.
+
+    ``collect`` is the live zero-argument collector. ``windowed`` is False when
+    the source is already windowed (PSI avg10), so its rows carry NULL window
+    columns.
+    """
+
+    name: GroupName
+    collect: Callable[[], Samples]
+    metrics: tuple[MetricSpec, ...]
+    windowed: bool
+
+    def __post_init__(self) -> None:
+        names = [spec.name for spec in self.metrics]
+        repeated = sorted({name for name in names if names.count(name) > 1})
+        if repeated:
+            raise ValueError(
+                f'metric names must be unique within a group: {self.name} repeats {repeated}'
+            )
+        foreign = [
+            f'{spec.name!r} reads {spec.readability.name!r}'
+            for spec in self.metrics
+            if spec.readability is not None and spec.readability not in self.metrics
+        ]
+        if foreign:
+            raise ValueError(
+                f'a readability metric must belong to the same group: in {self.name}, '
+                f'{"; ".join(foreign)}, which the group does not declare'
+            )
+
+    @property
+    def exact(self) -> frozenset[str]:
+        return frozenset(spec.name for spec in self.metrics if not spec.per_leaf)
+
+    @property
+    def per_leaf(self) -> frozenset[str]:
+        return frozenset(spec.name for spec in self.metrics if spec.per_leaf)
+
+    def admits(self, key: SampleKey) -> bool:
+        """A host-level key by exact name with no leaf; a per-leaf key with a non-empty leaf."""
+        return (key.metric in self.exact and key.leaf is None) or (
+            key.metric in self.per_leaf and bool(key.leaf)
+        )
+
+
+_PSI_CPU_SOME = MetricSpec('psi_cpu_some_avg10', arm='cpu_some_avg10')
+_PSI_CPU_FULL = MetricSpec('psi_cpu_full_avg10')
+_PSI_MEM_SOME = MetricSpec('psi_mem_some_avg10', arm='mem_some_avg10')
+_PSI_MEM_FULL = MetricSpec('psi_mem_full_avg10', arm='mem_full_avg10')
+_PSI_IO_SOME = MetricSpec('psi_io_some_avg10', arm='io_some_avg10')
+_PSI_IO_FULL = MetricSpec('psi_io_full_avg10')
+
+_OCCT_QUEUE_DEPTH = MetricSpec('occt_queue_depth')
+_VERIFY_CONCURRENCY = MetricSpec('verify_concurrency')
+_VERIFY_RSS_TOTAL_BYTES = MetricSpec('verify_rss_total_bytes')
+
+_RUNQUEUE_READ_OK = MetricSpec('runqueue_read_ok')
+_RUNQUEUE_RATIO = MetricSpec(
+    'runqueue_ratio', arm='runqueue_ratio', readability=_RUNQUEUE_READ_OK
+)
+_OWN_READ_OK = MetricSpec('own_read_ok', per_leaf=True)
+_OWN_CPU_SOME10 = MetricSpec(
+    'own_cpu_some10', per_leaf=True, arm='own_cpu_some_avg10', readability=_OWN_READ_OK
+)
 
 
 ARM_METRIC_STEMS = {
@@ -128,13 +224,9 @@ necessity — it runs under the system python3 and cannot import this module —
 and a lockstep test reconciles the two.
 """
 
-# The cgroup v2 unified-hierarchy mountpoint. A DEFAULT for the injected
-# ``cgroup_root`` seam, in the same shape as ``_default_fd9_exists`` below —
-# not a second source of truth: every caller that cares injects its own, and
-# every test does. shared.psi holds the same literal privately for its own
-# defaults and exposes no public constant to borrow (it is α's file, out of
-# this task's scope), so the two defaults coexist rather than one importing a
-# private from the other.
+# The cgroup v2 mountpoint: a default for the injected ``cgroup_root`` seam,
+# which every test overrides. shared.psi holds the same literal privately for
+# its own defaults and exports no constant to share.
 _CGROUP_ROOT = Path('/sys/fs/cgroup')
 
 _USER_MANAGER_PREFIX = 'user@'
@@ -147,8 +239,8 @@ def _anchor_segments(own_cgroup_path: str) -> list[str] | None:
 
     ``None`` when there is no such segment — i.e. nothing to anchor at, which
     is not an error: a sampler running outside a systemd user manager (or one
-    handed α's ``OwnCgroup('', None)`` failure value) simply has no per-slice
-    neighbourhood to enumerate.
+    handed shared.psi's ``OwnCgroup('', None)`` failure value) simply has no
+    per-slice neighbourhood to enumerate.
     """
     segments = own_cgroup_path.split('/')
     for depth, segment in enumerate(segments, start=1):
@@ -164,33 +256,21 @@ def discover_pressure_cgroups(
 ) -> list[tuple[str, Path]]:
     """Return sorted ``(leaf_name, cpu_pressure_path)`` for the sibling cgroups.
 
-    PRD ``plans/load-throttle-harmonisation-prd.md`` §6.4: one row per
-    ``df-*.slice`` present, ELSE one per ``orchestrator-*.service``. The
-    fallback is not a theoretical branch — measured on this host on
-    2026-09-13 there are ZERO ``df-*.slice`` (task 3394 has not landed) and
-    seven ``orchestrator-*.service`` leaves, so the ELSE arm is the one
-    actually running today.
+    One per ``df-*.slice`` present, else one per ``orchestrator-*.service``
+    (``plans/load-throttle-harmonisation-prd.md`` §6.4); the fallback covers a
+    host without task 3394's df slices.
 
-    The search is ANCHORED at the ``user@<uid>.service`` segment of
-    *own_cgroup_path* rather than walking down from *cgroup_root*, for two
-    reasons. Cost: measured here, ``rglob('orchestrator-*.service')`` from the
-    cgroup root takes 32.7 ms and an ``os.walk`` capped at depth 6 takes
-    19.9 ms, against 0.30 ms for the anchored glob — and this runs every 5 s,
-    so an unanchored sweep would spend 0.6% of every tick walking cgroupfs for
-    a result that changes only when a unit starts. Correctness: another user
-    manager's slices are not ours, and an unanchored search would report them
-    under our own metric names.
+    The search is anchored at the ``user@<uid>.service`` segment of
+    *own_cgroup_path* rather than walking down from *cgroup_root*: another
+    user manager's slices are not ours, and on a 5 s cadence the anchored
+    glob is far cheaper than a cgroupfs walk (timings: commit "feat(6773):
+    one MetricGroup table in sampler.metrics"). The path comes from
+    ``shared.psi.resolve_own_cgroup``, so there is no second /proc/self/cgroup
+    reader.
 
-    The anchor costs no new /proc/self/cgroup reader: α's
-    ``shared.psi.resolve_own_cgroup(None)`` already parses the ``0::`` line
-    and returns that kernel path, and this takes the segments up to and
-    including the ``user@`` one (INV-5 — reuse the reader, add no second
-    parser).
-
-    Never raises. Any failure — an unanchorable path, a cgroup_root that does
-    not exist, a permission error mid-glob — returns ``[]``, which the caller
-    reads as "no leaves discovered" and reports as such (see
-    ``collect_load_metrics``); it never synthesises a leaf name.
+    Never raises. Any failure (an unanchorable path, a missing cgroup_root, a
+    permission error mid-glob) returns ``[]``, which ``collect_load_metrics``
+    reports as "no leaves discovered"; it never synthesises a leaf name.
     """
     segments = _anchor_segments(own_cgroup_path)
     if segments is None:
@@ -205,32 +285,31 @@ def discover_pressure_cgroups(
         return []
     return [(leaf.name, leaf / 'cpu.pressure') for leaf in leaves]
 
-# ---------------------------------------------------------------------------
-# PSI helpers — parse_pressure_file/read_pressure are re-homed to shared.psi
-# (DA-D9: reuse, do not reimplement) and re-exported below so this module's
-# public API is unchanged. See shared/src/shared/psi.py for the
-# implementation and TestParserRehomedToShared in this module's test suite
-# for the anti-drift object-identity guard.
-# ---------------------------------------------------------------------------
+# parse_pressure_file is shared.psi's, re-exported so this module's public API
+# is unchanged; TestParserRehomedToShared pins the identity.
+
+_PSI_SOURCES: tuple[tuple[str, MetricSpec, MetricSpec], ...] = (
+    ('cpu', _PSI_CPU_SOME, _PSI_CPU_FULL),
+    ('memory', _PSI_MEM_SOME, _PSI_MEM_FULL),
+    ('io', _PSI_IO_SOME, _PSI_IO_FULL),
+)
+"""(pressure-file name, its ``some`` spec, its ``full`` spec)."""
 
 
 def collect_psi(
     *,
     read: Callable[[str], str] = read_pressure,
 ) -> Samples:
-    """Return the 6 PSI avg10 values keyed as psi_{cpu,mem,io}_{some,full}_avg10.
+    """Return the some/full avg10 of each pressure file, keyed by its PSI spec.
+
+    A file that does not parse contributes no rows, never a fabricated 0.0.
 
     Args:
-        read: Callable mapping pressure-file name ('cpu'|'memory'|'io') to text.
-              Defaults to reading /proc/pressure/* from the live kernel.
+        read: Maps a pressure-file name to its text. Defaults to reading
+              /proc/pressure/* from the live kernel.
     """
-    sources = [
-        ('cpu', 'cpu'),
-        ('memory', 'mem'),
-        ('io', 'io'),
-    ]
     out: dict[SampleKey, float] = {}
-    for file_name, key_prefix in sources:
+    for file_name, some, full in _PSI_SOURCES:
         text = read(file_name)
         parsed = parse_pressure_file(text)
         if parsed is None:
@@ -241,14 +320,9 @@ def collect_psi(
                 len(text),
             )
             continue
-        out[SampleKey(f'psi_{key_prefix}_some_avg10')] = parsed['some_avg10']
-        out[SampleKey(f'psi_{key_prefix}_full_avg10')] = parsed['full_avg10']
+        out[some.key()] = parsed['some_avg10']
+        out[full.key()] = parsed['full_avg10']
     return out
-
-
-# ---------------------------------------------------------------------------
-# Process-metric counters (pure, take injected process iterables)
-# ---------------------------------------------------------------------------
 
 
 def collect_load_metrics(
@@ -260,41 +334,31 @@ def collect_load_metrics(
 ) -> Samples:
     """Return the runqueue and per-cgroup own-pressure metrics for one tick.
 
-    PRD ``plans/load-throttle-harmonisation-prd.md`` §6.4. Shaped exactly like
-    ``collect_psi``: pure over its injected seams, with the live defaults as a
-    thin shell.
+    ``runqueue_read_ok`` (``TICK_CLOCK``) is emitted on every call as 1.0/0.0,
+    and ``runqueue_ratio`` only when the read succeeded. shared.psi degrades an
+    unreadable /proc/stat to ``RunqueueReading(0.0, False)``, a fail-open value
+    rather than a reading, so persisting that 0.0 as a ratio would write a
+    fabricated "completely idle host" row (the defect task 1817 fixed here).
+    Readability is a metric rather than a log line so that the calibration
+    gates (tasks 5219/5220) can count how often the runqueue arm was readable.
 
-    Runqueue (PRD detail A). ``runqueue_read_ok`` is emitted on EVERY tick as
-    1.0/0.0, and ``runqueue_ratio`` only when the read succeeded. It is a
-    metric of its own rather than a log line because after D1
-    ``runqueue_ratio`` is the sole LIVE CPU arm: β's recorded G7 waiver on
-    storm-escape-required rests on being able to count how often that arm was
-    readable at all, and a log line is not countable from the corpus ε1/ε2
-    calibrate against. α degrades an unreadable /proc/stat to
-    ``RunqueueReading(0.0, False)`` — a fail-open VALUE, not a reading — so
-    persisting that 0.0 as a ratio would write a fabricated "completely idle
-    host" row, re-introducing the defect task 1817 fixed in this module.
+    Each discovered leaf gets an ``own_read_ok`` row, plus ``own_cpu_some10``
+    when its pressure file read. No leaf discovered means no own rows, logged
+    at DEBUG when there is no user-manager anchor at all (a dev box, a
+    container) and at WARNING when an anchor resolved but held no leaf.
 
     Args:
-        read_runqueue: α's ``read_runqueue_ratio`` by default; no /proc/stat
-            reader is written here (INV-5).
-        own_cgroup_path: The sampler's own ``0::`` kernel path. ``None`` asks
-            α's ``resolve_own_cgroup`` for the live one, so there is no second
-            /proc/self/cgroup reader either. That ``None`` is the branch every
-            real tick takes, since ``__main__`` calls this with no arguments.
-        proc_cgroup_path: Where to read that ``0::`` line FROM, forwarded to α
-            unchanged. Only consulted when ``own_cgroup_path`` is ``None``,
-            which is the only branch that resolves anything. ``None`` here
-            leaves the argument out of α's call rather than spelling
-            ``/proc/self/cgroup`` a second time, so the live path keeps its
-            single home in α (heuristic 11) and the live resolution keeps its
-            existing cache key.
+        read_runqueue: shared.psi's ``read_runqueue_ratio`` by default.
+        own_cgroup_path: The sampler's own ``0::`` kernel path. ``None``, which
+            every live tick passes, asks ``shared.psi.resolve_own_cgroup``.
+        proc_cgroup_path: Where that resolution reads the ``0::`` line from,
+            forwarded unchanged; ``None`` leaves shared.psi's default in place.
         cgroup_root: Where the unified hierarchy is mounted.
     """
     runqueue = read_runqueue()
-    out: dict[SampleKey, float] = {SampleKey('runqueue_read_ok'): float(runqueue.read_ok)}
+    out: dict[SampleKey, float] = {_RUNQUEUE_READ_OK.key(): float(runqueue.read_ok)}
     if runqueue.read_ok:
-        out[SampleKey('runqueue_ratio')] = float(runqueue.ratio)
+        out[_RUNQUEUE_RATIO.key()] = float(runqueue.ratio)
 
     if own_cgroup_path is None:
         seam = {} if proc_cgroup_path is None else {'proc_cgroup_path': proc_cgroup_path}
@@ -305,31 +369,6 @@ def collect_load_metrics(
         own_cgroup_path=own_cgroup_path, cgroup_root=cgroup_root
     )
     if not leaves:
-        # Severity by CAUSE, because this fires on a 5 s oneshot: an
-        # unconditional warning here is 17,280 journal lines a day for a steady
-        # condition, which buries the per-tick logger.exception lines the three
-        # degrade handlers exist to surface. No anchor at all is STRUCTURAL and
-        # expected (a dev box, a container, any sampler outside a systemd user
-        # manager) -> debug. An anchor that resolved but enumerated nothing is a
-        # surprise worth a warning: we are in a user manager and it holds
-        # neither a df-*.slice nor an orchestrator-*.service. Either way the
-        # corpus stays the channel that matters -- absent own_read_ok rows make
-        # the condition countable without reading the journal.
-        #
-        # The surviving warning branch is per-tick too, and that was weighed
-        # rather than overlooked. It is a SEVERITY signal, not new volume:
-        # __main__ already writes one INFO `tick ...` line per tick, so the
-        # journal carries 17,280 sampler lines a day on every host regardless,
-        # and what this branch adds is a line an operator's `-p warning` filter
-        # can see. De-duplicating it across ticks is what would cost: the unit
-        # is Type=oneshot, so each tick is a FRESH PROCESS and a module-level
-        # "already warned" memo would reset every 5 s. The only cross-tick
-        # state on this host is the store's meta table, and reaching it from
-        # here would hand a pure collector a store handle and invert the
-        # module dependency (heuristic 7) to quieten a log line. On a host
-        # where this branch is steady it is steady BECAUSE the sampler is
-        # collecting nothing useful there, which is worth saying loudly once
-        # per tick rather than never.
         say = logger.debug if _anchor_segments(own_cgroup_path) is None else logger.warning
         say(
             'no pressure cgroups discovered under the anchor derived from %r; '
@@ -338,24 +377,19 @@ def collect_load_metrics(
         )
     for leaf_name, pressure_path in leaves:
         some_avg10 = _read_leaf_some_avg10(pressure_path)
-        out[SampleKey('own_read_ok', leaf_name)] = float(some_avg10 is not None)
+        out[_OWN_READ_OK.key(leaf_name)] = float(some_avg10 is not None)
         if some_avg10 is not None:
-            out[SampleKey('own_cpu_some10', leaf_name)] = some_avg10
+            out[_OWN_CPU_SOME10.key(leaf_name)] = some_avg10
     return out
 
 
 def _read_leaf_some_avg10(pressure_path: Path) -> float | None:
     """Return one cgroup's ``some avg10``, or ``None`` if it could not be read.
 
-    A cgroup cpu.pressure has the same some/full avg10 shape as
-    /proc/pressure/cpu, so the text goes straight to α's
-    ``parse_pressure_file`` and no second parser is written (INV-5). That
-    parser's ``None`` already means "unparseable", so an unreadable file is
-    collapsed onto the SAME sentinel and the two failure modes share one exit
-    — the shape α's own ``read_own_cgroup_pressure`` uses.
-
-    ``read_own_cgroup_pressure`` itself is deliberately not reused: it reads
-    the READING PROCESS's own cgroup, and this reads every sibling leaf.
+    The text goes to shared.psi's ``parse_pressure_file``, whose ``None``
+    already means "unparseable", so an unreadable file collapses onto the same
+    sentinel. shared.psi's ``read_own_cgroup_pressure`` is not reused: it reads
+    the calling process's own cgroup, and this reads every sibling leaf.
     """
     try:
         parsed = parse_pressure_file(pressure_path.read_text())
@@ -436,11 +470,6 @@ def sum_verify_rss(procs: Iterable[Any]) -> int:
     return total
 
 
-# ---------------------------------------------------------------------------
-# Thin I/O shell — not unit-tested, validated by live integration signal
-# ---------------------------------------------------------------------------
-
-
 def _default_fd9_exists(pid: int) -> bool:
     return os.path.lexists(f'/proc/{pid}/fd/9')
 
@@ -470,7 +499,84 @@ def collect_process_metrics(
     # access-denied between listing and inspection.  A separate p.cmdline()
     # probe here would add a redundant OS call per process on the 5s hot path.
     return {
-        SampleKey('occt_queue_depth'): float(count_occt_queue_depth(procs, fd9_exists)),
-        SampleKey('verify_concurrency'): float(count_verify_concurrency(procs)),
-        SampleKey('verify_rss_total_bytes'): float(sum_verify_rss(procs)),
+        _OCCT_QUEUE_DEPTH.key(): float(count_occt_queue_depth(procs, fd9_exists)),
+        _VERIFY_CONCURRENCY.key(): float(count_verify_concurrency(procs)),
+        _VERIFY_RSS_TOTAL_BYTES.key(): float(sum_verify_rss(procs)),
     }
+
+
+def _metric_table(*groups: MetricGroup) -> tuple[MetricGroup, ...]:
+    group_names = [group.name for group in groups]
+    metric_names = [spec.name for group in groups for spec in group.metrics]
+    repeated = sorted(
+        {str(name) for name in group_names if group_names.count(name) > 1}
+        | {name for name in metric_names if metric_names.count(name) > 1}
+    )
+    if repeated:
+        raise ValueError(
+            f'group and metric names must be unique across the table; repeated: {repeated}'
+        )
+    return groups
+
+
+METRIC_GROUPS: tuple[MetricGroup, ...] = _metric_table(
+    MetricGroup(
+        GroupName.PSI,
+        collect=collect_psi,
+        metrics=(
+            _PSI_CPU_SOME, _PSI_CPU_FULL,
+            _PSI_MEM_SOME, _PSI_MEM_FULL,
+            _PSI_IO_SOME, _PSI_IO_FULL,
+        ),
+        windowed=False,
+    ),
+    MetricGroup(
+        GroupName.PROCESS,
+        collect=collect_process_metrics,
+        metrics=(_OCCT_QUEUE_DEPTH, _VERIFY_CONCURRENCY, _VERIFY_RSS_TOTAL_BYTES),
+        windowed=True,
+    ),
+    MetricGroup(
+        GroupName.LOAD,
+        collect=collect_load_metrics,
+        metrics=(_RUNQUEUE_RATIO, _RUNQUEUE_READ_OK, _OWN_CPU_SOME10, _OWN_READ_OK),
+        windowed=True,
+    ),
+)
+"""The sampler's one metric table, in collection order.
+
+A complete tick writes one row per exact name of every group, plus one row
+per per-leaf name for each cgroup leaf discovered that tick.
+"""
+
+
+def arm_metrics(groups: Iterable[MetricGroup]) -> Mapping[str, MetricSpec]:
+    """Map each gate arm to the one spec recording it; a spec without an arm adds nothing."""
+    arms: dict[str, MetricSpec] = {}
+    for group in groups:
+        for spec in group.metrics:
+            if spec.arm is None:
+                continue
+            if spec.arm in arms:
+                raise ValueError(
+                    f'a gate arm is recorded by one metric: {spec.arm!r} is claimed by '
+                    f'{arms[spec.arm].name!r} and {spec.name!r}'
+                )
+            arms[spec.arm] = spec
+    return MappingProxyType(arms)
+
+
+ARM_METRICS: Mapping[str, MetricSpec] = arm_metrics(METRIC_GROUPS)
+
+
+def exact_metric_names(
+    groups: Iterable[MetricGroup], names: Collection[GroupName]
+) -> tuple[str, ...]:
+    """The sorted exact (host-level) metric names of the groups named in *names*."""
+    return tuple(sorted(
+        metric for group in groups if group.name in names for metric in group.exact
+    ))
+
+
+TICK_CLOCK: MetricSpec = _RUNQUEUE_READ_OK
+"""Written on every completed load collection, readable or not."""
