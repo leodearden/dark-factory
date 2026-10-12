@@ -14,14 +14,9 @@ from typing import Any
 import pytest
 from _tasks_db_fixture import task_row, write_tasks_db
 
-from dashboard.data.claimant_invariants import (
-    HygieneTier,
-    RootInvariants,
-    ScanStatus,
-    TerminalTier,
-    scan_root_invariants,
-)
+from dashboard.data.claimant_invariants import HygieneTier, TerminalTier
 from dashboard.data.db import DbPool
+from dashboard.data.root_invariants import RootInvariants, ScanStatus, scan_root_invariants
 
 NOW = datetime(2026, 10, 10, 12, 0, tzinfo=UTC)
 FRESH = (NOW - timedelta(minutes=1)).isoformat()
