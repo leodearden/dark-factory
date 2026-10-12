@@ -36,6 +36,21 @@ class StageId(StrEnum):
     integrity_check = 'integrity_check'
 
 
+class StageAgentOutcome(StrEnum):
+    """What happened to a reconciliation stage's CLI agent."""
+
+    completed = 'completed'
+    """The CLI agent returned success."""
+    zero_output_timeout = 'zero_output_timeout'
+    """Killed before any assistant turn (``shared.cli_invoke.is_zero_output_timeout``)."""
+    timed_out = 'timed_out'
+    """Killed by a timeout after doing work, or with unknown progress."""
+    failed = 'failed'
+    """The agent exited unsuccessfully, or its invocation raised."""
+    not_launched = 'not_launched'
+    """The agent was never spawned."""
+
+
 class ReconciliationEvent(BaseModel):
     """Individual event in the buffer."""
 

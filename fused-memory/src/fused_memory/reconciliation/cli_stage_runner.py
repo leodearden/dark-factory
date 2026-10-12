@@ -10,9 +10,14 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Any
 
-from shared.cli_invoke import AgentResult, AllAccountsCappedException, invoke_with_cap_retry
+from shared.cli_invoke import (
+    AgentResult,
+    AllAccountsCappedException,
+    invoke_with_cap_retry,
+    is_zero_output_timeout,
+)
 
-from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES
+from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES, StageAgentOutcome
 from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
 from fused_memory.reconciliation.sandbox_guard import (
     RemediationSandboxUnavailable,
@@ -512,6 +517,28 @@ class StageResult:
     model: str = ''
     success: bool = False
     error: str = ''
+    outcome: StageAgentOutcome | None = None
+
+    def __post_init__(self) -> None:
+        if self.outcome is None:
+            self.outcome = (
+                StageAgentOutcome.completed if self.success else StageAgentOutcome.failed
+            )
+        elif (self.outcome is StageAgentOutcome.completed) != self.success:
+            raise ValueError(
+                f'StageResult.outcome={self.outcome.value!r} contradicts '
+                f'success={self.success}: only a successful agent is completed.'
+            )
+
+
+def _classify_agent_outcome(agent_result: AgentResult) -> StageAgentOutcome:
+    if agent_result.success:
+        return StageAgentOutcome.completed
+    if is_zero_output_timeout(agent_result):
+        return StageAgentOutcome.zero_output_timeout
+    if agent_result.timed_out:
+        return StageAgentOutcome.timed_out
+    return StageAgentOutcome.failed
 
 
 def recon_config_base_dir(data_dir: Path) -> Path:
@@ -763,6 +790,7 @@ async def run_stage_via_cli(
                 error=str(exc),
                 duration_ms=duration_ms,
                 model=effective_model,
+                outcome=StageAgentOutcome.not_launched,
             )
 
     try:
@@ -800,6 +828,7 @@ async def run_stage_via_cli(
             error=str(e),
             duration_ms=duration_ms,
             model=effective_model,
+            outcome=StageAgentOutcome.failed,
         )
 
     duration_ms = int(time.monotonic() * 1000) - start_ms
@@ -816,6 +845,7 @@ async def run_stage_via_cli(
         model=effective_model,
         success=agent_result.success,
         error='' if agent_result.success else (agent_result.output or 'Agent failed'),
+        outcome=_classify_agent_outcome(agent_result),
     )
 
 
