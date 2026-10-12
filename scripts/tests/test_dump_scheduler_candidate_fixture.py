@@ -6,9 +6,8 @@ import json
 import sqlite3
 from datetime import datetime
 
-import pytest
-
 import dump_scheduler_candidate_fixture as dump
+import pytest
 from orchestrator.scheduler import Scheduler
 
 ANCHOR = '2026-10-01T12:00:00.000Z'
