@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from dataclasses import asdict, replace
 from typing import Any
 
 import pytest
@@ -15,7 +16,7 @@ from orchestrator.evals.measurement import (
     Unmeasured,
     UnmeasuredCause,
 )
-from orchestrator.evals.reviewer_trial import scorer
+from orchestrator.evals.reviewer_trial import campaign, scorer
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, GroundTruthIssue
 from orchestrator.evals.reviewer_trial.runner import PanelRunResult
 
@@ -95,3 +96,31 @@ async def test_score_panel_run_carries_the_matchers_refusal(
     assert score.unmatched_gt == []
     assert score.cost_usd == run.total_cost_usd
     assert score.match_cost_usd == REFUSAL_COST_USD
+
+
+def _measured_score(variant: str, diff: str, f1: float) -> scorer.ScoringResult:
+    return scorer.ScoringResult(
+        variant_name=variant, diff_id=diff, recall=f1, precision=f1, f1=f1,
+        blocking_recall=f1, cost_usd=1.0, match_cost_usd=0.05, wall_clock_ms=100,
+    )
+
+
+async def test_summarize_campaign_counts_the_refusal_and_keeps_every_mean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(scorer, 'invoke_agent', _refuse)
+    run, diff = _refused_panel_cell()
+    refused = asdict(await scorer.score_panel_run(run, diff)) | {'trial': 1}
+    measured = [
+        asdict(_measured_score(variant, d, f1)) | {'trial': t}
+        for variant, f1 in (('inc', 0.5), ('v1', 0.7))
+        for d in ('d1', 'd2') for t in (1, 2, 3)
+    ]
+    blocking = {'d1': {'gt1'}, 'd2': set()}
+
+    without_refusal, _ = campaign.summarize_campaign(measured, 'inc', blocking)
+    with_refusal, _ = campaign.summarize_campaign([*measured, refused], 'inc', blocking)
+
+    for counted, clean in zip(with_refusal, without_refusal, strict=True):
+        assert replace(counted, unmeasured=0, unmeasured_cost_usd=0.0) == clean
+    assert next(a for a in with_refusal if a.name == 'v1').unmeasured == 1

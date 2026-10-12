@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from orchestrator.evals.reviewer_trial import campaign
@@ -67,3 +69,88 @@ def test_summary_costs_and_decisions_and_markdown() -> None:
 def test_missing_incumbent_is_an_error() -> None:
     with pytest.raises(ValueError):
         campaign.summarize_campaign([_rec('arm', 'd1', 1, [], [], 0.1)], 'inc', BLOCKING_GT)
+
+
+def _unmeasured_rec(variant: str, diff: str, trial: int, cost: float = 1.0,
+                    match_cost: float = 0.31) -> dict:
+    """The ``asdict`` shape of a ScoringResult whose matcher did not measure."""
+    return _rec(variant, diff, trial, [], [], f1=0.0, cost=cost) | {
+        'unmeasured': {'stage': 'matcher', 'cause': 'cap_hit', 'reason': 'r', 'cost_usd': match_cost},
+        'match_cost_usd': match_cost,
+    }
+
+
+def _measured_campaign() -> list[dict]:
+    inc = [_rec('inc', d, t, [('g1', 'blocking')], [], 0.5, cost=2.0) for d in ('d1', 'd2') for t in (1, 2, 3)]
+    arm = [_rec('arm', d, t, [('g1', 'blocking'), ('g2', 'blocking')], ['blocking'], 0.6, cost=4.0)
+           for d in ('d1', 'd2') for t in (1, 2, 3)]
+    return inc + arm
+
+
+def test_an_unmeasured_record_changes_no_arm_figure_but_its_counts() -> None:
+    without_refusal, _ = campaign.summarize_campaign(_measured_campaign(), 'inc', BLOCKING_GT)
+    with_refusal, _ = campaign.summarize_campaign(
+        [*_measured_campaign(), _unmeasured_rec('arm', 'd1', 1)], 'inc', BLOCKING_GT,
+    )
+
+    for refused, clean in zip(with_refusal, without_refusal, strict=True):
+        assert replace(refused, unmeasured=0, unmeasured_cost_usd=0.0) == clean
+    by = {a.name: a for a in with_refusal}
+    assert by['arm'].unmeasured == 1
+    assert by['arm'].unmeasured_cost_usd == pytest.approx(1.31)
+    assert by['inc'].unmeasured == 0
+
+
+def test_an_unmeasured_incumbent_cell_drops_that_pair_from_the_paired_comparison_and_complement() -> None:
+    records = [r for r in _measured_campaign() if not (r['variant_name'] == 'inc' and (r['trial'], r['diff_id']) == (1, 'd1'))]
+    records.append(_unmeasured_rec('inc', 'd1', 1))
+
+    arms, _ = campaign.summarize_campaign(records, 'inc', BLOCKING_GT)
+
+    arm = next(a for a in arms if a.name == 'arm')
+    assert arm.paired_vs_incumbent[0] == {'trial': 1, 'wins': 1, 'losses': 0, 'ties': 0, 'mean_delta': pytest.approx(0.1)}
+    assert (arm.complement_count, arm.incumbent_matched) == (5, 5)
+
+
+def test_an_arm_with_nothing_measured_reports_none_never_zero() -> None:
+    inc = [_rec('inc', d, t, [('g1', 'blocking')], [], 0.5) for d in ('d1', 'd2') for t in (1, 2, 3)]
+    refused = [_unmeasured_rec('arm', d, t) for d in ('d1', 'd2') for t in (1, 2, 3)]
+
+    arms, decisions = campaign.summarize_campaign(inc + refused, 'inc', BLOCKING_GT)
+
+    arm = next(a for a in arms if a.name == 'arm')
+    assert arm.mean_f1 is None
+    assert arm.mean_recall is None
+    assert arm.mean_precision is None
+    assert arm.mean_blocking_recall is None
+    assert arm.blocking_precision is None
+    assert arm.cost_per_review is None
+    assert arm.reviews == 0
+    assert arm.trials == 0
+    assert arm.f1_by_trial == []
+    assert arm.unmeasured == len(refused)
+    assert decisions.strict_f1_improvement['arm'] is False
+    assert 'n/a' in campaign.format_markdown(arms, decisions)
+
+
+def test_a_record_without_the_unmeasured_key_is_measured() -> None:
+    pre_gamma = [_rec('inc', 'd1', t, [], [], 0.5) for t in (1, 2, 3)]
+    assert all('unmeasured' not in r for r in pre_gamma)
+
+    arms, _ = campaign.summarize_campaign(pre_gamma, 'inc', BLOCKING_GT)
+
+    assert arms[0].mean_f1 == pytest.approx(0.5)
+    assert arms[0].reviews == 3
+    assert arms[0].unmeasured == 0
+
+
+def test_markdown_names_each_arms_unmeasured_count() -> None:
+    arms, decisions = campaign.summarize_campaign(
+        [*_measured_campaign(), _unmeasured_rec('arm', 'd1', 1)], 'inc', BLOCKING_GT,
+    )
+
+    md = campaign.format_markdown(arms, decisions)
+
+    assert '`arm` unmeasured: 1' in md
+    assert '`inc` unmeasured: 0' in md
+    assert '| unmeasured |' in md.splitlines()[0]
