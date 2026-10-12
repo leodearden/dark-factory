@@ -82,6 +82,7 @@ from escalation.store_identity import StoreIdentity
 if TYPE_CHECKING:
     from orchestrator.merge_lane.queue_store import (  # type: ignore[reportMissingImports]
         MergeQueueStore,
+        PersistedMergeRequest,
     )
 
 logger = logging.getLogger(__name__)
@@ -4996,7 +4997,7 @@ def create_server(
             git_ops, key.landing_key, orch_config=orch_config, harness=harness,
         )
 
-    def _journal_entry(key: _PollKey) -> Any | None:
+    def _journal_entry(key: _PollKey) -> PersistedMergeRequest | None:
         journal = _get_merge_journal(harness)
         if journal is None:
             return None
