@@ -15,7 +15,8 @@
    against the 12,867,282 measured on the 2026-09-20 live snapshot.
 
    Exports: window.DF_SCHED_HEATMAP_BOUNDS =
-     { boundHeatmapAxes, rowTouchesModule, MAX_HEATMAP_ROWS, MAX_HEATMAP_COLS }
+     { boundHeatmapAxes, rowTouchesModule,
+       MAX_HEATMAP_ROWS, MAX_HEATMAP_COLS, MAX_RESCUED_COLS }
 */
 
 // The cell bound is the PRODUCT of these two and is deliberately not given a
@@ -23,6 +24,10 @@
 // number these already determine, with no caller of its own to serve.
 const MAX_HEATMAP_ROWS = 60
 const MAX_HEATMAP_COLS = 60
+// At most this many of MAX_HEATMAP_COLS go to stranded locks the contention
+// cut would hide, so the head always keeps >= 50 columns; the 2026-10-12 live
+// snapshot had 5.
+const MAX_RESCUED_COLS = 10
 
 // Does this task row contend for this lock module — i.e. would its cell be
 // anything but blank?
@@ -51,8 +56,22 @@ function lockIsStranded(module) {
     || (!!module.holder && module.holder_live === false && (module.contention || 0) > 0)
 }
 
-function moduleEarnsColumn(module) {
-  return (module.contention || 0) > 1 || lockIsStranded(module)
+// The columns: a contended HEAD (a prefix of the contention > 1 modules in
+// server order) plus a rescued TAIL (stranded modules the head did not reach).
+// A slot is reserved only when a stranded module falls outside the head.
+function selectHeatmapColumns(allModules) {
+  const contended = allModules.filter(m => (m.contention || 0) > 1)
+  const stranded = allModules.filter(lockIsStranded)
+  const rankOf = new Map(contended.map((m, i) => [m, i]))
+  const rescuedPast = headLen => stranded
+    .filter(m => !(rankOf.has(m) && rankOf.get(m) < headLen))
+    .slice(0, MAX_RESCUED_COLS)
+  let headLen = Math.min(contended.length, MAX_HEATMAP_COLS)
+  // Shrinking the head can push a stranded module out of it, so the length
+  // is a fixed point; it settles within MAX_RESCUED_COLS steps, because at
+  // MAX_HEATMAP_COLS - MAX_RESCUED_COLS the sum is always within budget.
+  while (headLen + rescuedPast(headLen).length > MAX_HEATMAP_COLS) headLen--
+  return { mostContended: contended.slice(0, headLen), rescued: rescuedPast(headLen) }
 }
 
 // Choose the rows and columns the heatmap will actually render.
@@ -63,14 +82,16 @@ function boundHeatmapAxes({ rows, modules }) {
   const allRows = rows || []
   const allModules = modules || []
 
-  // `filter` and `slice` both preserve relative order, so the server's
-  // `(-contention, path)` sort is inherited rather than re-derived: the
-  // surviving columns are a PREFIX of it, i.e. the most contended ones.
+  // The server's `(-contention, path)` sort is inherited rather than
+  // re-derived: the head is a prefix of the contended modules in that order,
+  // i.e. the most contended ones, and every rescued module lies after the
+  // head in it, so head-then-tail is still server order.
   //
-  // The slice lands BEFORE row selection so rows are chosen against the
+  // Columns are chosen BEFORE row selection so rows are chosen against the
   // columns that will actually render — a row touching only a column past the
   // cap would otherwise survive it and render as 60 blank cells.
-  const keptModules = allModules.filter(moduleEarnsColumn).slice(0, MAX_HEATMAP_COLS)
+  const { mostContended, rescued } = selectHeatmapColumns(allModules)
+  const keptModules = mostContended.concat(rescued)
 
   // Index the surviving columns by path so a row is scanned against its own
   // lock_set rather than against every column: O(rows x lock_set) probes
@@ -121,6 +142,7 @@ function boundHeatmapAxes({ rows, modules }) {
     modules: keptModules,
     rowsTotal: allRows.length,
     modulesTotal: allModules.length,
+    modulesRescued: rescued.length,
     rowsTruncated: keptRows.length < allRows.length,
     modulesTruncated: keptModules.length < allModules.length,
   }
@@ -131,6 +153,7 @@ const SCHEDULER_HEATMAP_BOUNDS_API = {
   rowTouchesModule,
   MAX_HEATMAP_ROWS,
   MAX_HEATMAP_COLS,
+  MAX_RESCUED_COLS,
 }
 
 if (typeof module !== 'undefined' && module.exports) {
