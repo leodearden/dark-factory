@@ -48,6 +48,7 @@ transcription, not yet a verified single source of truth.
 from __future__ import annotations
 
 import re
+from bisect import bisect_left
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -923,24 +924,59 @@ class Violation:
     detail: str
 
 
-# Tempered-dot gap that refuses to cross a negation cue (not/never/n't)
-# OR a clause terminator (./;) between a rule's subject and verb — used in
-# place of a bare `[^.]*` wildcard so:
+# Positions the gaps of the marker rule may not span — the gap between its
+# subject and verb, and between its verb and marker — so that:
 #   (a) a CORRECTLY negated statement (e.g. "Stage 3 remediation does NOT
-#       delete the flag marker") does not match as a false-premise
-#       violation. premise_lint exists to flag FALSE premises; a true
-#       statement of the invariant — even phrased as a negation — is not
-#       one, and matching it anyway would be a false positive that rejects
-#       a correct task description once wired at task ξ.
-#   (b) the gap does not span across unrelated clauses in a multi-clause
-#       field. Without the `.`/`;` exclusion, a benign description like
-#       "Stage 3 processes the flag_for_stage2 marker; GC later deletes
-#       the marker on terminal task" would spuriously match ("Stage 3" ...
-#       "deletes" ... "marker") even though the sentence never asserts the
-#       false premise — the "Stage 3" and "deletes" clauses are unrelated.
-#       Stopping the gap at a clause terminator keeps subject/verb/object
-#       matches confined to a single clause.
-_GAP_NO_NEGATION = r"(?:(?!\bnot\b|\bnever\b|n['’]t\b|[.;]).)*"
+#       delete the flag marker") does not match. premise_lint exists to flag
+#       FALSE premises; a true statement of the invariant, even phrased as a
+#       negation, is not one, and matching it would reject a correct task.
+#   (b) a match stays inside one clause. Without the terminators, "Stage 3
+#       processes the flag_for_stage2 marker; GC later deletes the marker on
+#       terminal task" would match "Stage 3" ... "deletes" ... "marker"
+#       across two unrelated clauses.
+# A newline is a terminator, but one INSIDE a subject or marker name
+# ("Stage\n3", "flag\nmarker") does not end the clause: only gaps are checked.
+# Zero-width, so every stop is found, however close together.
+_GAP_STOP = re.compile(r"(?=\bnot\b|\bnever\b|n['’]t\b|[.;\n])", re.IGNORECASE)
+
+_NON_GC_DELETER = re.compile(r'stage\s*3|remediation|the\s+llm', re.IGNORECASE)
+_DELETION_VERB = re.compile(
+    r'\b(?:deletes?|removes?|clears?|purges?)\b', re.IGNORECASE
+)
+_MARKER_NOUN = re.compile(
+    r'\b(?:flag_for_stage2|flag\s+marker|stage1_flag_marker|marker)\b',
+    re.IGNORECASE,
+)
+
+
+# One pass per pattern, then a gap [a, b) is clean iff a and b fall in the
+# same clause, numbered by the stops before them. One pattern spanning both
+# gaps re-scanned the clause per subject and per verb: cubic in its length.
+def _asserts_non_gc_marker_deletion(text: str) -> bool:
+    stops = [stop.start() for stop in _GAP_STOP.finditer(text)]
+
+    def clause_of(position: int) -> int:
+        return bisect_left(stops, position)
+
+    first_deleter_end: dict[int, int] = {}
+    for deleter in _NON_GC_DELETER.finditer(text):
+        first_deleter_end.setdefault(clause_of(deleter.end()), deleter.end())
+    last_marker_start = {
+        clause_of(marker.start()): marker.start()
+        for marker in _MARKER_NOUN.finditer(text)
+    }
+    for verb in _DELETION_VERB.finditer(text):
+        deleter_end = first_deleter_end.get(clause_of(verb.start()))
+        marker_start = last_marker_start.get(clause_of(verb.end()))
+        if (
+            deleter_end is not None
+            and deleter_end <= verb.start()
+            and marker_start is not None
+            and marker_start >= verb.end()
+        ):
+            return True
+    return False
+
 
 # What a clearance claim must be ABOUT for the probe rules below to fire.
 # Without it, an unrelated task reporting "the flaky test did not reproduce"
@@ -1134,13 +1170,7 @@ _PREMISE_RULES: tuple[tuple[Callable[[str], object], str, str], ...] = (
         ),
     ),
     (
-        re.compile(
-            r'(?:stage\s*3|remediation|the\s+llm)' + _GAP_NO_NEGATION
-            + r'\b(?:deletes?|removes?|clears?|purges?)\b'
-            + _GAP_NO_NEGATION + r'\b(?:flag_for_stage2|flag\s+marker|'
-            r'stage1_flag_marker|marker)\b',
-            re.IGNORECASE,
-        ).search,
+        _asserts_non_gc_marker_deletion,
         'markers_deleted_only_by_gc',
         (
             'Per-task markers (stage1_flag_marker, flag_for_stage2, '
