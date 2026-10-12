@@ -41,7 +41,7 @@ One executor, two plan sources, one deferred sweep.
 - **δ** builds the adjudicator (the rater question through the Claude CLI) as the second plan source, plus an evaluation over rated pairs; **δm** runs it on the 359 rated links; **Γ_A** decides whether it is fit to drive the sweep.
 - After the flip: **φ** proves the flag is really on; **ε** builds the nightly sweep and **η** installs it in report mode; **ζ** re-scores the adjudicator on λ's triage pairs; **θ**, a week after install, decides whether the sweep may write; **ξ** switches it on.
 
-Healing changes placement and label only. It never re-parents to a new target, never deletes a record, never decides who is right in a contest, and never touches a child that already carries `x_contested`.
+Healing changes placement and label only. It never re-parents to a new target, never deletes a record, never decides who is right in a contest, and never touches a child that already carries a hand-declared `x_contested` (H1 amendment 2026-10-12).
 
 ## 4. Contracts (H)
 
@@ -54,7 +54,7 @@ Healing changes placement and label only. It never re-parents to a new target, n
 | record / basis | verdict | action |
 |---|---|---|
 | corpus row with `rated_text_matches_live: false` | any | none — `stale_rating` |
-| `x_contested` truthy | any | none — `contested_reported` |
+| `x_contested` truthy, hand-declared (no `x_contested_by_triage: true`) | any | none — `contested_reported` |
 | parent absent (an id read in the child's project returns `None`) | — | detach (`basis_source = deterministic`) |
 | parent found only in another known project's collection | — | none — `cross_project_reported` |
 | parent itself carries `parent_id` (chain) | — | none — `chain_reported` |
@@ -73,12 +73,14 @@ Healing changes placement and label only. It never re-parents to a new target, n
 
 A "parent absent" is a `None` from an id read, never an exception: a timeout or transport error fails the action, it never detaches.
 
-**Writes.** Each action is exactly one call, through the running server's `update_memory` tool over `shared/mcp_post.py::post_mcp_tool_call`, with `agent_id = link-heal-<run8>` (8 hex) and `_causation_id = <run_id>`, so `server/mem0_update_authz.py::resolve_mem0_update_authorization` and the write journal apply unchanged. A detach is delete-only: `metadata_delete_keys=['parent_id']` plus `'kind'` when the kind is in CHILD_KINDS (an agent-invented kind such as `correction` or `extension` stays; it is census-only under `memory_metadata.enforce_kind_registry: false`) — the `delete_payload` route. A relabel, flag or completion is patch-only (`metadata_patch={'kind': …, 'x_contested': True}` as the row says) — the `set_payload` route. A patch and a delete are never combined in one call (that is `MemoryService.update_memory`'s read-modify-overwrite route), and `None` is never patched (`parent_id: None` stores a null). A reply carrying `error_type` is a `failed` write. The journal `reason` is a pointer under 200 characters: `link-heal r=<run8> a=<action> prev_parent=<uuid> prev_kind=<k>`. A run that cannot reach the server refuses to start (INV-11).
+*Amendment (task 6533, 2026-10-12; flip-readiness PRD §12 D21).* Row 2 protects hand-declared contests only. A contest stamped by write triage's judge carries `x_contested_by_triage: true` (`memory_metadata.py::TRIAGE_CONTESTED_METADATA_KEY`); only `add_memory`'s contested attach writes it, and a caller-supplied value is discarded. Such a contest is adjudicated like any other link but healed by detach only (D4): a detach removes `x_contested` and the marker along with `parent_id`/`kind`, and undo restores them; its relabel, flag and completion rows report `no_action`. Contests the judge stamped between the flip (2026-10-11, task 3169) and this amendment carry no marker, so they stay protected as hand-declared. Signal: in one run, a triage-stamped contest counts under `adjudicated`, and a hand-declared contested child counts under `contested_reported`.
+
+**Writes.** Each action is exactly one call, through the running server's `update_memory` tool over `shared/mcp_post.py::post_mcp_tool_call`, with `agent_id = link-heal-<run8>` (8 hex) and `_causation_id = <run_id>`, so `server/mem0_update_authz.py::resolve_mem0_update_authorization` and the write journal apply unchanged. A detach is delete-only: `metadata_delete_keys=['parent_id']` plus `'kind'` when the kind is in CHILD_KINDS (an agent-invented kind such as `correction` or `extension` stays; it is census-only under `memory_metadata.enforce_kind_registry: false`), and, on a triage-stamped contest, `x_contested` and `x_contested_by_triage` (H1 amendment 2026-10-12) — the `delete_payload` route. A relabel, flag or completion is patch-only (`metadata_patch={'kind': …, 'x_contested': True}` as the row says) — the `set_payload` route. A patch and a delete are never combined in one call (that is `MemoryService.update_memory`'s read-modify-overwrite route), and `None` is never patched (`parent_id: None` stores a null). A reply carrying `error_type` is a `failed` write. The journal `reason` is a pointer under 200 characters: `link-heal r=<run8> a=<action> prev_parent=<uuid> prev_kind=<k>`. A run that cannot reach the server refuses to start (INV-11).
 
 **Authorization.** `mem0_update.metadata_patch_allowed_agent_prefixes` gains `link-heal-` beside the schema defaults `recon-stage-` and `curator-` (the block is commented out in `config/config.yaml` today; α writes it with all three). The config comment names this PRD and task α (INV-12).
 
 **Corroborate before, verify after (INV-3).** Immediately before each write the executor re-reads the child, and the parent where the row needs it, from the live store — never from the corpus or the ledger. It requires:
-- the child exists, and its `parent_id`, `kind` and `x_contested` equal the plan's pre-image;
+- the child exists, and its `parent_id`, `kind`, `x_contested` and `x_contested_by_triage` equal the plan's pre-image;
 - the sha256 of its full stored text equals the basis's `child_sha256`;
 - the parent exists with text hash `parent_sha256`, except for a dangling detach, where the parent must still be absent;
 - for a half-link completion, the record still has no children (`count_memories_by_metadata({'parent_id': id}) == 0`).
@@ -159,6 +161,7 @@ All rows run in-process against the fused-memory test harness that already exerc
 | stale pre-image | child text edited after rating | `skipped_stale` naming `child_sha256`; no write |
 | folded since rated | child re-parented to C | `skipped_stale` naming `parent_id` |
 | contested child rated RELATED | `x_contested` true | no write; `contested_reported` +1 |
+| triage-stamped contested child rated RELATED | `x_contested` and `x_contested_by_triage` true | detach drops `parent_id`, `kind`, `x_contested` and the marker; `adjudicated` +1 |
 | dangling parent | parent deleted | detach without a verdict; `basis_source = deterministic` |
 | parent read times out | id read raises | `failed`, never a detach |
 | cap drains oldest first | 40 planned, cap 25 | 25 oldest applied; 15 `skipped_cap`; next run applies them |
@@ -183,7 +186,7 @@ All rows run in-process against the fused-memory test harness that already exerc
 - **D3 CORRECTS ⇒ contested** (Leo, 2026-10-01). The rater brief's CORRECTS is word for word the 09-30 definition of `contested`, and the write-time contract already turns a contradicting write into an amendment flagged `x_contested` (`tools.py::add_memory`).
   - Healing gives every belongs-rated CORRECTS child that state (109 today).
   - This is detection, not adjudication: nothing decides whether parent or child is right.
-  - A child that already carries `x_contested` is never touched; one rated misfile is reported, not detached.
+  - A child that already carries a hand-declared `x_contested` is never touched; one rated misfile is reported, not detached (H1 amendment 2026-10-12).
   - The contested consumers (χ 6150's briefing render; 5277 A2) are unchanged and see a larger population.
   - The adjudicator's CORRECTS agreement is gated before the sweep may flag.
 - **D4 No re-parenting.** A detached child is never wrong, only unconsolidated. Re-placing it would need a target chosen by something shown to tell subjects apart, but cosine is inverted (AUC 0.25) and the judge places at the same rate it misfiles at. The `update_memory` re-parent path checks only liveness. `t_high` (0.887) was calibrated for "same fact" on write-time slates, not for re-homing a child. A detached child is a standalone record, which recon Stage 1 may later stamp as a topic peer under Option C. No third grouping mechanism is added.
