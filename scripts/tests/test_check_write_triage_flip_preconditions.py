@@ -1763,6 +1763,7 @@ def _run_gate(
     *,
     ref: str,
     probe_py: str | None = None,
+    probe5_py: str | None = None,
     resolve_interpreter: bool = False,
 ):
     """Execute the gate script DIRECTLY, as DeterministicRunner does.
@@ -1777,6 +1778,7 @@ def _run_gate(
     full_env['WRITE_TRIAGE_GATE_REF'] = ref
     if resolve_interpreter:
         assert probe_py is None, 'resolve_interpreter and probe_py are exclusive'
+        assert probe5_py is None, 'resolve_interpreter and probe5_py are exclusive'
         full_env.pop('CHECK_WRITE_TRIAGE_ATTACH_TARGET_PY', None)
         full_env.pop('CHECK_WRITE_TRIAGE_ATTACH_CONSUMPTION_PY', None)
     else:
@@ -1786,7 +1788,7 @@ def _run_gate(
         # item-1 report. Pointing item 5 at it would measure item 1's stub
         # under item 5's marker, so item 5 would fail for a reason that has
         # nothing to do with the triage module the repo carries.
-        full_env['CHECK_WRITE_TRIAGE_ATTACH_CONSUMPTION_PY'] = sys.executable
+        full_env['CHECK_WRITE_TRIAGE_ATTACH_CONSUMPTION_PY'] = probe5_py or sys.executable
     return subprocess.run(
         [str(script)],
         capture_output=True,
@@ -2852,3 +2854,103 @@ class TestItemFiveNamesTheBranchThatSatisfiedIt:
         note = _item5_note(proc.stdout)
         assert _BRANCH_JUDGE_TARGET in note, proc.stdout
         assert note in proc.stdout[-_ESCALATION_DETAIL_CHARS:], proc.stdout
+
+
+#: What a probe that died before it could report leaves behind: a traceback on
+#: stderr and nothing on stdout. A missing or broken
+#: scripts/_write_triage_probe_common.py, which both probes import, is the
+#: realistic carrier.
+_CRASH_BEFORE_REPORT = 'crash-before-report: No module named _write_triage_probe_common'
+
+
+def _write_crash_before_report_stub(path: Path) -> Path:
+    """A stand-in probe interpreter that exits 1 having reported nothing."""
+    path.write_text(
+        '#!/bin/sh\n'
+        f"printf '%s\\n' {shlex.quote(_CRASH_BEFORE_REPORT)} >&2\n"
+        'exit 1\n',
+    )
+    path.chmod(0o755)
+    return path
+
+
+class TestARcOneWithoutAVerdictIsUnverifiable:
+    """Exit 1 is a NOT-held verdict only when the report carries one.
+
+    Both probes start every not-held and every unverifiable verdict line with
+    the gate's PROBE_FAIL_PREFIX. A probe that dies before it can report -- a
+    missing or broken shared helper, or a crash of the probe itself -- exits 1
+    too, through Python's own traceback, with an EMPTY stdout. Read as a
+    verdict, that told the operator the judge path does NOT bind (or the
+    candidate is NOT consumed) on a run that measured nothing, and dropped the
+    traceback naming the real cause. The rc-1 twin of the rc-0-without-a-PASS
+    lock: a report that claims no verdict is not one.
+    """
+
+    def _repo(self, tmp_path: Path) -> Path:
+        return _make_gate_repo(
+            tmp_path, judge='by_id', triage=_TRIAGE_CONSUMES, eval_src='fixed',
+        )
+
+    def test_item_1_dying_before_its_report_is_unverifiable(self, tmp_path):
+        repo = self._repo(tmp_path)
+        stub = _write_crash_before_report_stub(tmp_path / 'crashing-probe')
+        proc = _run_gate(
+            repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF, probe_py=str(stub),
+        )
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert 'FAIL  item 1  UNVERIFIABLE' in proc.stdout, proc.stdout
+        assert 'exited 1 without reporting a verdict' in proc.stdout, proc.stdout
+        assert 'does NOT bind' not in proc.stdout, proc.stdout
+        assert _CRASH_BEFORE_REPORT in proc.stdout, proc.stdout
+
+    def test_item_5_dying_before_its_report_is_unverifiable(self, tmp_path):
+        repo = self._repo(tmp_path)
+        stub = _write_crash_before_report_stub(tmp_path / 'crashing-probe5')
+        proc = _run_gate(
+            repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF, probe5_py=str(stub),
+        )
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert f'{_ITEM5_FAIL}  {_UNVERIFIABLE}' in proc.stdout, proc.stdout
+        assert 'exited 1 without reporting a verdict' in proc.stdout, proc.stdout
+        assert 'NOT consumed by the attach' not in proc.stdout, proc.stdout
+        assert _CRASH_BEFORE_REPORT in proc.stdout, proc.stdout
+        assert 'PASS  item 1' in proc.stdout, proc.stdout
+
+    def test_a_real_not_held_verdict_still_reads_as_one(self, tmp_path):
+        """The control: the new arm must not swallow a verdict the probe made."""
+        repo = _make_gate_repo(
+            tmp_path, judge='flat', triage=_TRIAGE_CONSUMES, eval_src='fixed',
+        )
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert 'FAIL  item 1  the judge path does NOT bind' in proc.stdout, proc.stdout
+        assert 'exited 1 without reporting a verdict' not in proc.stdout, proc.stdout
+
+    @pytest.mark.parametrize('variant', ['flat', 'missing'], ids=['not-held', 'unverifiable'])
+    def test_item_1s_every_exit_1_carries_the_gates_fail_prefix(self, tmp_path, variant):
+        """Pinned from both ends, like the PASS marker: a drift here would turn
+        every real item-1 verdict into a misdiagnosed UNVERIFIABLE."""
+        prefix = _gate_marker('PROBE_FAIL_PREFIX')
+        proc = _run_probe(_write_fake_judge(tmp_path / 'src', variant=variant))
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert any(line.startswith(prefix) for line in proc.stdout.splitlines()), (
+            f'the gate reads exit 1 as a verdict only under {prefix!r}:\n{proc.stdout}'
+        )
+
+    @pytest.mark.parametrize(
+        'variant', ['band_top1', 'missing'], ids=['not-held', 'unverifiable'],
+    )
+    def test_item_5s_every_exit_1_carries_the_gates_fail_prefix(self, tmp_path, variant):
+        prefix = _gate_marker('PROBE_FAIL_PREFIX')
+        src_root = write_fake_triage(tmp_path / 'src', variant=variant)
+        proc = subprocess.run(
+            [sys.executable, str(_PROBE5), '--src-root', str(src_root)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert any(line.startswith(prefix) for line in proc.stdout.splitlines()), (
+            f'the gate reads exit 1 as a verdict only under {prefix!r}:\n{proc.stdout}'
+        )
