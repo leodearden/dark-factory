@@ -886,7 +886,7 @@ def test_the_untracked_retry_is_reached_only_because_the_plain_commit_fails(
 # the retry predicate's SIGPIPE misread deterministically rather than at its
 # natural ~0.6%-under-load rate.
 #
-# Mirrors tests/scripts/test_setup_host_probe_pipelines.py::BULK_BYTES
+# Mirrors tests/scripts/shell_sections.py::SIGPIPE_BULK_BYTES
 # (task 4204): that file's 30-trials-per-size measurement records 65536 as
 # FLAKY at 26/30 while 262144 and above are 30/30. Do NOT lower this -- a
 # too-small pad does not make the test flaky, it silently weakens its power to
