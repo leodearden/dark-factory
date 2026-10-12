@@ -108,6 +108,9 @@ import tempfile
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import _checkout as _checkout
+from shared.project_layout import escalation_queue_dir
+
 # shared/src bootstrap. Same idiom and same precedence argument as
 # scripts/scan_task_toolcall_leaks.py:113-115 and
 # scripts/repair_wiped_metadata_files.py:67-73: resolve it from __file__ and
@@ -201,9 +204,6 @@ LANE_ESCALATIONS = 'escalations'
 #: ``.worktrees/<id>`` check instead.
 LANE_PLANS = 'plans'
 
-#: Where the escalations lane is rooted, relative to the repo root.
-_ESCALATIONS_DIR = ('data', 'escalations')
-
 #: Plan artifacts in the DURABLE per-lane store at
 #: ``.worktrees/.task-meta/*/plan.json``. Same rules as :data:`LANE_PLANS` and
 #: gated by the same live-lane check — the difference is REACH, not policy.
@@ -275,7 +275,7 @@ def discover_targets(root: Path | str) -> list[Target]:
     root_path = Path(root)
     targets: list[Target] = []
 
-    escalations_dir = root_path.joinpath(*_ESCALATIONS_DIR)
+    escalations_dir = escalation_queue_dir(root_path)
     if escalations_dir.is_dir():
         for path in escalations_dir.rglob('*.json'):
             if not path.is_file():
@@ -467,7 +467,7 @@ def resolve_write_target(target: Target, root: Path | str) -> ResolvedTarget | R
         return Refusal(path=target.path, lane=target.lane, reason=REASON_NEVER_TOUCH)
 
     if target.lane == LANE_ESCALATIONS:
-        lane_root = Path(os.path.realpath(root_real.joinpath(*_ESCALATIONS_DIR)))
+        lane_root = Path(os.path.realpath(escalation_queue_dir(root_real)))
         if not resolved.is_relative_to(lane_root):
             return Refusal(
                 path=target.path,
