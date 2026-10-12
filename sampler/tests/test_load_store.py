@@ -145,6 +145,8 @@ CREATE TABLE IF NOT EXISTS meta (
 
 _LegacyRow = tuple[int, str, float, float | None, float | None]
 
+_LEAF_INDEXES = ['idx_samples_metric_leaf_ts', 'idx_samples_metric_ts_leaf']
+
 
 def _legacy_store(db_path: Path, rows: list[_LegacyRow]) -> None:
     conn = sqlite3.connect(str(db_path))
@@ -177,6 +179,45 @@ def _all_rows(db_path: Path) -> list[tuple]:
         return conn.execute('SELECT * FROM samples ORDER BY rowid').fetchall()
     finally:
         conn.close()
+
+
+def _seed(db_path: Path, key: SampleKey, timestamps: range) -> None:
+    """One row of *key* per timestamp, written in one transaction."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executemany(
+            'INSERT INTO samples (ts, metric, leaf, value) VALUES (?, ?, ?, ?)',
+            [(ts, key.metric, key.leaf, 1.0) for ts in timestamps],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _window_read_cost(db_path: Path, key: SampleKey) -> int:
+    """SQLite VM progress callbacks that one ``trailing_window`` read of *key* runs.
+
+    Counted on the connections the store opens through its ``connect`` seam,
+    from the read alone: construction's schema statements are not counted.
+    """
+    from sampler.store import LoadSampleStore, connect_durably
+
+    steps = 0
+
+    def step() -> int:
+        nonlocal steps
+        steps += 1
+        return 0
+
+    def counting(path: Path, *, autocommit: bool = False) -> sqlite3.Connection:
+        conn = connect_durably(path, autocommit=autocommit)
+        conn.set_progress_handler(step, 1)
+        return conn
+
+    store = LoadSampleStore(db_path, connect=counting)
+    steps = 0
+    store.trailing_window(key, 1.0)
+    return steps
 
 
 # ---------------------------------------------------------------------------
@@ -213,23 +254,35 @@ class TestLoadSampleStoreSchema:
             'ts', 'metric', 'value', 'window_mean', 'window_max', 'leaf'
         ]
 
-    def test_the_single_index_is_metric_ts_leaf(self, tmp_path: Path):
+    def test_the_indexes_are_metric_ts_leaf_and_a_per_leaf_metric_leaf_ts(
+        self, tmp_path: Path
+    ):
         from sampler.store import LoadSampleStore
 
         db_path = tmp_path / 'load-samples.db'
         LoadSampleStore(db_path)
 
         _columns, indexes = _shape(db_path)
-        assert indexes == ['idx_samples_metric_ts_leaf']
+        assert indexes == _LEAF_INDEXES
         conn = sqlite3.connect(str(db_path))
         try:
-            indexed = [
-                row[2]
-                for row in conn.execute("PRAGMA index_info('idx_samples_metric_ts_leaf')")
-            ]
+            indexed = {
+                name: [row[2] for row in conn.execute(f"PRAGMA index_info('{name}')")]
+                for name in indexes
+            }
+            partial = {
+                row[1]: bool(row[4]) for row in conn.execute('PRAGMA index_list(samples)')
+            }
         finally:
             conn.close()
-        assert indexed == ['metric', 'ts', 'leaf']
+        assert indexed == {
+            'idx_samples_metric_leaf_ts': ['metric', 'leaf', 'ts'],
+            'idx_samples_metric_ts_leaf': ['metric', 'ts', 'leaf'],
+        }
+        assert partial == {
+            'idx_samples_metric_leaf_ts': True,
+            'idx_samples_metric_ts_leaf': False,
+        }
 
     def test_SCHEMA_on_a_blank_file_has_the_shape_the_store_creates(self, tmp_path: Path):
         """Every consumer fixture builds from ``SCHEMA``, so it must BE the store's DDL."""
@@ -379,7 +432,7 @@ class TestLeafMigration:
         assert still_encoded == 0
         assert _shape(legacy) == _shape(fresh), (
             'a migrated file must be indistinguishable in shape from a fresh one, '
-            'idx_samples_metric_ts dropped and idx_samples_metric_ts_leaf built'
+            'idx_samples_metric_ts dropped and both leaf indexes built'
         )
 
     def test_reopening_is_a_no_op_in_every_starting_state(self, tmp_path: Path):
@@ -442,7 +495,7 @@ class TestLeafMigration:
 
         columns, indexes = _shape(legacy)
         assert columns[-1][1] == 'leaf', 'the next construction did not retry the migration'
-        assert indexes == ['idx_samples_metric_ts_leaf']
+        assert indexes == _LEAF_INDEXES
 
 
 # ---------------------------------------------------------------------------
@@ -554,6 +607,38 @@ class TestTrailingWindow:
         assert windows['a'] == (pytest.approx(sum(own_a) / 60), max(own_a))
         assert windows['b'] == (pytest.approx(sum(own_b) / 60), max(own_b))
         assert windows['a'] == expected_a
+
+    @pytest.mark.parametrize(
+        ('sparse', 'busy', 'sparse_history'),
+        [
+            (SampleKey('own_cpu_some10', 'new.service'), SampleKey('own_cpu_some10', 'busy.service'), range(0)),
+            (SampleKey('own_cpu_some10', 'back.service'), SampleKey('own_cpu_some10', 'busy.service'), range(3)),
+            (RUNQ, VERIFY, range(3)),
+        ],
+        ids=['a-leaf-with-no-rows', 'a-leaf-with-fewer-rows-than-a-window', 'a-host-level-metric'],
+    )
+    def test_a_sparse_keys_window_read_does_not_walk_a_busy_neighbours_history(
+        self, tmp_path: Path, sparse: SampleKey, busy: SampleKey, sparse_history: range
+    ):
+        """A key new to the corpus, or back after a gap, pays for its own rows only.
+
+        The busy neighbour's rows are all NEWER than the sparse key's, so a read
+        that walks the metric newest-first and filters by leaf would cross
+        every one of a sibling leaf's rows before giving up; a read that seeks
+        its own (metric, leaf) does not. Ten times the neighbour's history must
+        therefore cost the same.
+        """
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        LoadSampleStore(db_path)
+        _seed(db_path, sparse, sparse_history)
+        _seed(db_path, busy, range(1_000, 2_000))
+        shallow = _window_read_cost(db_path, sparse)
+
+        _seed(db_path, busy, range(2_000, 12_000))
+
+        assert _window_read_cost(db_path, sparse) == shallow
 
 
 # ---------------------------------------------------------------------------
@@ -839,9 +924,9 @@ class TestThirtyDayRetention:
 class TestCleanupIsIntervalGated:
     """Why this gate exists, pinned so it cannot be "simplified" away.
 
-    The retention DELETE cannot use idx_samples_metric_ts_leaf(metric, ts,
-    leaf) — a leading-column index does not serve a bare-ts predicate — so
-    every call is a full table SCAN. Measured at 2.5M rows, a NO-OP cleanup (nothing
+    The retention DELETE cannot use either index — both lead with metric, and a
+    leading-column index does not serve a bare-ts predicate — so every call is
+    a full table SCAN. Measured at 2.5M rows, a NO-OP cleanup (nothing
     old enough to delete) costs 106.7 ms; extrapolated to the 12.96M-row
     30-day steady state that is ~550 ms every 5 s, forever, to delete nothing.
 
@@ -876,29 +961,6 @@ class TestCleanupIsIntervalGated:
 
         assert 'SCAN samples' in plan, plan
         assert 'USING INDEX' not in plan, plan
-
-    def test_trailing_windows_query_is_index_backed(self, tmp_path: Path):
-        """The counterpart: a per-(metric, leaf) window read IS served by the index."""
-        from sampler.store import LoadSampleStore
-
-        db_path = tmp_path / 'db.sqlite'
-        LoadSampleStore(db_path)
-
-        conn = sqlite3.connect(str(db_path))
-        try:
-            plan = ' '.join(
-                str(row[3])
-                for row in conn.execute(
-                    'EXPLAIN QUERY PLAN SELECT value FROM samples'
-                    ' WHERE metric = ? AND leaf IS ? ORDER BY ts DESC LIMIT ?',
-                    ('own_cpu_some10', 'a.service', 59),
-                ).fetchall()
-            )
-        finally:
-            conn.close()
-
-        assert 'USING INDEX idx_samples_metric_ts_leaf' in plan, plan
-        assert 'TEMP B-TREE' not in plan, plan
 
     def test_virgin_store_is_due_and_running_prunes_and_stamps(self, tmp_path: Path):
         from sampler.store import LoadSampleStore

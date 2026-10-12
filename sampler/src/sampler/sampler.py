@@ -154,9 +154,8 @@ def run_tick(
     #    window reads this buys per tick (16 on this host) are write-only
     #    today, and NO consumer is scheduled — say so rather than implying one.
     #    Kept windowed regardless, for two reasons that survive having no
-    #    reader. Each read is the indexed `SEARCH samples USING INDEX
-    #    idx_samples_metric_ts_leaf (metric=?)` that
-    #    sampler/tests/test_load_store.py::TestCleanupIsIntervalGated::test_trailing_windows_query_is_index_backed
+    #    reader. Each read seeks its own (metric, leaf), as
+    #    sampler/tests/test_load_store.py::TestTrailingWindow::test_a_sparse_keys_window_read_does_not_walk_a_busy_neighbours_history
     #    pins, so the saving on offer is ~nothing; and
     #    routing one GROUP to the unwindowed path would give the store a
     #    second axis of variability (window mode AND provenance) where it

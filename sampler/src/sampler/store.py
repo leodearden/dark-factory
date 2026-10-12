@@ -7,7 +7,9 @@ Schema
 samples(ts, metric, value, window_mean, window_max, leaf)
     One row per metric per tick. ``leaf`` is the cgroup leaf a per-leaf metric
     was read at, NULL for a host-level metric, and is the last column.
-    idx_samples_metric_ts_leaf ON samples(metric, ts, leaf) is the only index.
+    idx_samples_metric_ts_leaf ON samples(metric, ts, leaf) serves every read
+    by metric. idx_samples_metric_leaf_ts ON samples(metric, leaf, ts), partial
+    on ``leaf IS NOT NULL``, serves the per-leaf trailing window.
 
 meta(key, value)
     Two independent clocks: last_cleanup_ts for the retention gate and
@@ -17,8 +19,8 @@ Migration
 ---------
 A file written before the ``leaf`` column existed is migrated when the store
 is built: additive and feature-detected, the column is added and every legacy
-``metric:leaf`` row is split into its two columns in one transaction
-(``_migrate``).
+``metric:leaf`` row is split into its two columns, and the indexes are swapped,
+in one transaction (``_migrate``).
 
 Connections
 -----------
@@ -41,7 +43,8 @@ Trailing window
 ---------------
 A windowed metric's ``window_mean``/``window_max`` cover its current value and
 the most recent stored rows of the same (metric, leaf). The window is read
-from the DB because every tick is a process of its own.
+from the DB because every tick is a process of its own. A read seeks its own
+(metric, leaf), so a leaf with little history costs no more than a busy one.
 """
 
 from __future__ import annotations
@@ -79,9 +82,13 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """
 
-_INDEX_DDL = 'CREATE INDEX IF NOT EXISTS idx_samples_metric_ts_leaf ON samples (metric, ts, leaf)'
+_INDEXES_DDL = (
+    'CREATE INDEX IF NOT EXISTS idx_samples_metric_ts_leaf ON samples (metric, ts, leaf)',
+    'CREATE INDEX IF NOT EXISTS idx_samples_metric_leaf_ts ON samples (metric, leaf, ts)'
+    ' WHERE leaf IS NOT NULL',
+)
 
-SCHEMA: str = f'{_TABLES_DDL}\n{_INDEX_DDL};\n'
+SCHEMA: str = '\n'.join([_TABLES_DDL, *(f'{ddl};' for ddl in _INDEXES_DDL)]) + '\n'
 
 # The right-hand sides read the row's OLD metric, so one statement splits it.
 _SPLIT_LEGACY_KEYS_SQL = (
@@ -105,6 +112,17 @@ _INSERT_SQL = (
     ' VALUES (?, ?, ?, ?, ?, ?)'
 )
 
+_HOST_WINDOW_SQL = (
+    'SELECT value FROM samples WHERE metric = ? AND leaf IS NULL ORDER BY ts DESC LIMIT ?'
+)
+
+# ``leaf = ?``, never ``leaf IS ?``: only ``=`` proves the partial index's
+# ``leaf IS NOT NULL``, and without that index the read walks every newer row of
+# every other leaf of the metric.
+_LEAF_WINDOW_SQL = (
+    'SELECT value FROM samples WHERE metric = ? AND leaf = ? ORDER BY ts DESC LIMIT ?'
+)
+
 
 class Connect(Protocol):
     def __call__(self, db_path: Path, *, autocommit: bool = False) -> sqlite3.Connection: ...
@@ -122,11 +140,16 @@ def connect_durably(db_path: Path, *, autocommit: bool = False) -> sqlite3.Conne
     return conn
 
 
+def _create_indexes(conn: sqlite3.Connection) -> None:
+    for ddl in _INDEXES_DDL:
+        conn.execute(ddl)
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """Give a pre-leaf ``samples`` its ``leaf`` column, in ONE transaction.
 
     The ADD COLUMN, the split of every legacy ``metric:leaf`` row, and the
-    swap to the leaf index commit together or roll back together, so a
+    swap to the leaf indexes commit together or roll back together, so a
     failure leaves the file exactly as it was and the next construction
     retries. The feature-detect runs under the write lock, so a concurrent
     construction waits, then reads ``leaf`` present and does nothing.
@@ -143,7 +166,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
             return
         conn.execute('ALTER TABLE samples ADD COLUMN leaf TEXT')
         split = conn.execute(_SPLIT_LEGACY_KEYS_SQL).rowcount
-        conn.execute(_INDEX_DDL)
+        _create_indexes(conn)
         conn.execute('DROP INDEX IF EXISTS idx_samples_metric_ts')
         conn.commit()
     except BaseException:
@@ -171,14 +194,14 @@ class LoadSampleStore:
     def _ensure_schema(self) -> None:
         """Bring a fresh, pre-leaf or current file to ``SCHEMA``'s shape.
 
-        Tables, then the migration, then the index: running ``SCHEMA`` whole on
-        a pre-leaf file would fail, because its index names the ``leaf`` column
+        Tables, then the migration, then the indexes: running ``SCHEMA`` whole on
+        a pre-leaf file would fail, because its indexes name the ``leaf`` column
         the migration has not added yet.
         """
         with contextlib.closing(self._connect()) as conn:
             conn.executescript(_TABLES_DDL)
             _migrate(conn)
-            conn.execute(_INDEX_DDL)
+            _create_indexes(conn)
             conn.commit()
 
     # ------------------------------------------------------------------
@@ -268,13 +291,10 @@ class LoadSampleStore:
         whatever wall-clock those rows do, outages included. It is scoped to
         one (metric, leaf), so no two leaves ever share a window.
         """
-        rows = conn.execute(
-            'SELECT value FROM samples'
-            ' WHERE metric = ? AND leaf IS ?'
-            ' ORDER BY ts DESC'
-            ' LIMIT ?',
-            (key.metric, key.leaf, window - 1),
-        ).fetchall()
+        if key.leaf is None:
+            rows = conn.execute(_HOST_WINDOW_SQL, (key.metric, window - 1)).fetchall()
+        else:
+            rows = conn.execute(_LEAF_WINDOW_SQL, (key.metric, key.leaf, window - 1)).fetchall()
         values = [current_value] + [r[0] for r in rows]
         return statistics.fmean(values), max(values)
 
