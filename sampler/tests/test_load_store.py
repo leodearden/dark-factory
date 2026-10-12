@@ -209,8 +209,8 @@ def _window_read_cost(db_path: Path, key: SampleKey) -> int:
         steps += 1
         return 0
 
-    def counting(path: Path, *, autocommit: bool = False) -> sqlite3.Connection:
-        conn = connect_durably(path, autocommit=autocommit)
+    def counting(db_path: Path, *, autocommit: bool = False) -> sqlite3.Connection:
+        conn = connect_durably(db_path, autocommit=autocommit)
         conn.set_progress_handler(step, 1)
         return conn
 
