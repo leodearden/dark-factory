@@ -75,7 +75,7 @@ class TestCheckRun:
         d = run.to_dict()
         assert set(d) == {
             'label', 'cmd', 'rc', 'output', 'timed_out', 'started_at', 'duration_secs',
-            'segments', 'load', 'slot_wait_secs',
+            'segments', 'load', 'slot_wait_secs', 'admission',
         }
 
     def test_to_dict_started_at_passthrough_when_not_none(self):
@@ -117,7 +117,24 @@ class TestCheckRun:
             'segments': None,
             'load': None,
             'slot_wait_secs': None,
+            'admission': None,
         }
+
+    def test_to_dict_passes_the_admission_record_through(self):
+        """Task 5628: the admission turn the test leg's slot wait ended in."""
+        from orchestrator.verify import CheckRun  # noqa: PLC0415
+
+        admission = {
+            'plan_id': 'p', 'module': 'pkg', 'scope_kind': None, 'order': 'arrival',
+            'arrived_at': '2026-10-12T00:00:00+00:00', 'granted_at': '2026-10-12T00:00:01+00:00',
+            'waited_secs': 1.0, 'depth_at_arrival': 0, 'slot_held': True, 'held_secs': 2.5,
+        }
+        run = CheckRun(
+            label='test', cmd='uv run pytest', rc=0, output='', timed_out=False,
+            started_at='ts', duration_secs=2.0, admission=admission,
+        )
+
+        assert run.to_dict()['admission'] == admission
 
 
 class TestCheckRunSegments:
