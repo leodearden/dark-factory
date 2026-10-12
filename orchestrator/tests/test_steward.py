@@ -2621,8 +2621,8 @@ class TestPreTriageSuggestionsPath:
         assert 'verdict-tools' in call_kwargs['mcp_config']['mcpServers']
         assert 'output_schema' not in call_kwargs
 
-    async def test_pre_triage_uses_project_root_as_cwd(self, steward):
-        """_pre_triage_suggestions passes config.project_root (not worktree) as cwd."""
+    async def test_pre_triage_uses_worktree_as_cwd(self, steward):
+        """_pre_triage_suggestions runs in the task worktree, never the main checkout."""
         esc = self._esc_with_suggestions(12)
         # Patches invoke_agent at definition site — invoke_with_cap_retry delegates to it
         # via module-level reference, so patching here intercepts calls through the wrapper.
@@ -2631,8 +2631,65 @@ class TestPreTriageSuggestionsPath:
             await steward._pre_triage_suggestions(esc)
 
         call_kwargs = mock_invoke.call_args.kwargs
-        assert call_kwargs['cwd'] == steward.config.project_root
-        assert call_kwargs['cwd'] != steward.worktree
+        assert call_kwargs['cwd'] == steward.worktree
+        assert call_kwargs['cwd'] != steward.config.project_root
+
+    async def test_pre_triage_skipped_when_lifetime_budget_near_exhausted(
+        self, steward, mock_config,
+    ):
+        """A near-exhausted instance falls back to inline triage without invoking."""
+        mock_config.steward_lifetime_budget = 12.0
+        steward.metrics.total_cost_usd = 11.5
+        esc = self._esc_with_suggestions(12)
+
+        with patch('orchestrator.steward.invoke_agent',
+                   new_callable=AsyncMock, return_value=_make_result()) as mock_invoke:
+            result = await steward._pre_triage_suggestions(esc)
+
+        mock_invoke.assert_not_called()
+        assert result is esc
+        assert steward.metrics.total_cost_usd == pytest.approx(11.5)
+
+    async def test_main_invocation_budget_positive_after_near_exhausted_skip(
+        self, steward, mock_config,
+    ):
+        """Skipped triage leaves the main --max-budget-usd at the positive remainder."""
+        mock_config.steward_lifetime_budget = 12.0
+        mock_config.budgets.steward = 5.0
+        steward.metrics.total_cost_usd = 11.5
+        esc = self._esc_with_suggestions(12)
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='fixed',
+        )
+
+        with patch('orchestrator.steward.invoke_agent',
+                   new_callable=AsyncMock, return_value=_make_result()) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        mock_invoke.assert_called_once()
+        assert mock_invoke.call_args.kwargs['max_budget_usd'] == pytest.approx(0.5)
+
+    async def test_pre_triage_budget_never_exceeds_remaining(self, steward, mock_config):
+        mock_config.steward_lifetime_budget = 12.0
+        steward.metrics.total_cost_usd = 6.0
+        esc = self._esc_with_suggestions(12)
+
+        with patch('orchestrator.steward.invoke_agent',
+                   new_callable=AsyncMock, return_value=_make_result()) as mock_invoke:
+            await steward._pre_triage_suggestions(esc)
+
+        assert 0 < mock_invoke.call_args.kwargs['max_budget_usd'] <= 6.0
+
+    async def test_second_handle_of_same_escalation_does_not_retriage(self, steward):
+        """Re-handling the same L0 reuses the cached pre-triage outcome."""
+        esc = self._esc_with_suggestions(12)
+        with patch('orchestrator.steward.invoke_agent',
+                   new_callable=AsyncMock, return_value=_make_result()) as mock_invoke:
+            first = await steward._pre_triage_suggestions(esc)
+            second = await steward._pre_triage_suggestions(esc)
+
+        assert mock_invoke.call_count == 1
+        assert second is first
 
     async def test_handle_escalation_strips_hash_prefix_for_threshold(
         self, steward,

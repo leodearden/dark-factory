@@ -195,6 +195,11 @@ class TaskSteward:
             ),
             ttl=_STEWARD_GUARD_TTL,
         )
+        # Paid-for pre-triage outcome per escalation id (task 5821): every
+        # re-handle of the same L0 (timeout / empty-output re-queue) would
+        # otherwise pay for triage again.  Holds the fallback (original)
+        # escalation too when triage ran and produced no usable verdict.
+        self._pretriaged: dict[str, Escalation] = {}
         # Escalations a steward has permanently given up on — TERMINAL for this
         # TASK, never re-handled (task 3170, fix B).  Before this existed
         # nothing recorded that a cap had already fired, so ANY early return
@@ -940,8 +945,15 @@ class TaskSteward:
 
         Returns the escalation with its detail field replaced by pre-triaged
         markdown.  If triage fails, returns the original escalation unchanged
-        so the steward falls back to inline triage.
+        so the steward falls back to inline triage.  Also falls back (without
+        invoking) when the remaining lifetime budget cannot cover the triage
+        budget with headroom left for the main invocation.  The outcome of a
+        triage that actually ran is cached per escalation id.
         """
+        cached = self._pretriaged.get(escalation.id)
+        if cached is not None:
+            return cached
+
         from orchestrator.agents.triage import (
             TRIAGE,
             build_triage_prompt,
@@ -1016,6 +1028,17 @@ class TaskSteward:
             event_store=self.event_store,
             cost_store=self.cost_store,
         )
+        remaining = self.config.steward_lifetime_budget - self.metrics.total_cost_usd
+        if remaining <= decision.budget_usd:
+            # Strict: a triage spending its full cap must still leave a
+            # positive remainder for the main invocation's --max-budget-usd.
+            logger.warning(
+                'Steward for task %s: pre-triage skipped — remaining lifetime '
+                'budget $%.2f does not cover triage budget $%.2f, falling '
+                'back to inline triage',
+                self.task_id, remaining, decision.budget_usd,
+            )
+            return escalation
         try:
             result = await invoke_with_cap_retry(
                 self.usage_gate,
@@ -1026,10 +1049,10 @@ class TaskSteward:
                 invoke_fn=self._invoke_agent_counted,
                 prompt=prompt,
                 system_prompt=TRIAGE.system_prompt,
-                cwd=self.config.project_root,
+                cwd=self.worktree,
                 model=decision.model,
                 max_turns=decision.max_turns,
-                max_budget_usd=decision.budget_usd,
+                max_budget_usd=min(decision.budget_usd, remaining),
                 allowed_tools=TRIAGE.allowed_tools,
                 mcp_config=mcp_config,
                 effort=decision.effort,
@@ -1071,6 +1094,7 @@ class TaskSteward:
                 f'Steward for task {self.task_id}: pre-triage failed, '
                 f'falling back to inline triage'
             )
+            self._pretriaged[escalation.id] = escalation
             return escalation
 
         new_detail = format_pretriaged_detail(
@@ -1080,7 +1104,7 @@ class TaskSteward:
         # Return a modified copy — don't mutate the queue's version
         from escalation.models import Escalation as EscModel
 
-        return EscModel(
+        pretriaged = EscModel(
             **{
                 **escalation.to_dict(),
                 'detail': new_detail,
@@ -1091,6 +1115,8 @@ class TaskSteward:
                 ),
             },
         )
+        self._pretriaged[escalation.id] = pretriaged
+        return pretriaged
 
     # ------------------------------------------------------------------
     # Give-up without an L1 hand-off (task-2060 resume-plan branches)
