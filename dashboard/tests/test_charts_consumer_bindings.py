@@ -13,7 +13,7 @@ a ``const { ... } = window.DF_CHARTS`` destructure.  The others use:
 
   - a NAMESPACE binding (``const C = window.DF_CHARTS;`` —
     esc_flow_diagram.jsx, tab_escalation_analytics.jsx, tab_escalations.jsx)
-  - a single MEMBER read (``const SP_SHELL = window.DF_CHARTS.Sparkline;`` —
+  - a single MEMBER read (``const PIP_AGE_STYLE = window.DF_CHARTS.DATUM_AGE_STYLE;`` —
     shell.jsx)
 
 Do NOT widen the regex to swallow those.  Widening is actively wrong, not just
