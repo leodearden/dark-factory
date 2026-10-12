@@ -1506,15 +1506,23 @@ def _exclusion_cause(row: dict[str, Any]) -> UnmeasuredCause:
     Architect records precede judge ones and a judge-only failure never
     taints, so the first record is the one that drove the exclusion.
     """
+    cell = f'{row["task_id"]} x {row["config_name"]}'
     records = row['invocation_errors']
     if not records:
         raise ValueError(
-            f'{row["task_id"]} x {row["config_name"]}: a cap_tainted cell must '
-            f'carry at least one invocation_errors record naming why it was '
-            f'not measured, and this one carries none. Load cells through '
-            f'ResultStore.load_all, which supplies the record for pre-6734 cells.'
+            f'{cell}: a cap_tainted cell must carry at least one '
+            f'invocation_errors record naming why it was not measured, and '
+            f'this one carries none. Load cells through ResultStore.load_all, '
+            f'which supplies the record for pre-6734 cells.'
         )
-    return UnmeasuredCause(records[0]['cause'])
+    cause = records[0]['cause']
+    try:
+        return UnmeasuredCause(cause)
+    except ValueError:
+        raise ValueError(
+            f'{cell}: invocation_errors[0] names cause {cause!r}, which is not '
+            f'an UnmeasuredCause ({", ".join(c.value for c in UnmeasuredCause)}).'
+        ) from None
 
 
 def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:

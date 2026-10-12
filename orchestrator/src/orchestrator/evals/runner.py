@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import threading
@@ -1169,9 +1170,11 @@ async def run_architect_eval(
         # read. Guarded so a classifier bug degrades to an unmarked cell rather
         # than nuking the whole run.
         try:
-            arch_unmeasured = classify_unmeasured(
+            refused = classify_unmeasured(
                 result, stage=MeasurementStage.ARCHITECT, backend=config.backend,
             )
+            if refused is not None:
+                arch_unmeasured = dataclasses.replace(refused, cost_usd=arch_cost_usd)
             arch_unmeasurable = arch_unmeasured is not None
         except Exception:
             logger.warning(

@@ -194,7 +194,8 @@ def _transport_refusal(
 def json_answer(result: AgentResult) -> dict[str, Any]:
     """The JSON object *result* answered: ``structured_output``, else its output text.
 
-    Raises ``ValueError`` (``json.JSONDecodeError`` included) when there is none.
+    Raises ``ValueError`` (``json.JSONDecodeError`` included) when there is none,
+    or ``TypeError`` when the output text is not a string.
     """
     payload = result.structured_output or json.loads(result.output)
     if not isinstance(payload, dict):

@@ -3380,6 +3380,22 @@ class TestPlanQualityReport:
         assert 't1 x a' in message
         assert 'invocation_errors' in message
 
+    def test_tainted_row_with_an_unknown_cause_raises_naming_the_cell(self):
+        # A hand-edited or newer-producer record must not abort the report
+        # with a bare enum ValueError that leaves the bad file unnamed.
+        from orchestrator.evals.report import build_plan_quality_report
+
+        capped = _cap_tainted_result(task_id='t1', config_name='a')
+        capped.metrics['invocation_errors'] = [
+            {'stage': 'architect', 'cause': 'not_a_cause', 'reason': 'r'},
+        ]
+
+        with pytest.raises(ValueError) as excinfo:
+            build_plan_quality_report([capped])
+        message = str(excinfo.value)
+        assert 't1 x a' in message
+        assert 'not_a_cause' in message
+
     def test_format_invocation_errors_renders_records(self):
         from orchestrator.evals.report import format_invocation_errors
 
