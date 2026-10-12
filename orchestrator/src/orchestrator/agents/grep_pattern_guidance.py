@@ -1,9 +1,8 @@
 """Role-prompt guidance: a search pattern is parsed by the shell, then by the regex engine.
 
-`orchestrator/src/orchestrator/agents/roles.py::_BASH_CAPABLE_ROLE_PREAMBLE`
+`orchestrator/src/orchestrator/agents/harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE`
 splices `GREP_PATTERN_ESCAPING_GUIDANCE` into every role holding unqualified
-`Bash`. It is a leaf module, imported downward by roles.py, only so that
-already oversized file does not grow further.
+`Bash`. It is a leaf module, imported downward by harness_guidance.py.
 
 A character meant literally can be syntax to the shell (backticks and `$`
 inside double quotes) or to the regex engine (an unescaped paren), and either

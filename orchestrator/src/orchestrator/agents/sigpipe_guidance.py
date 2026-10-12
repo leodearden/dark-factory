@@ -1,9 +1,8 @@
 """Role-prompt guidance: under `pipefail`, a pipe reader that quits early turns success into exit 141.
 
-`orchestrator/src/orchestrator/agents/roles.py::_BASH_CAPABLE_ROLE_PREAMBLE`
+`orchestrator/src/orchestrator/agents/harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE`
 splices `SIGPIPE_UNDER_PIPEFAIL_GUIDANCE` into every role holding unqualified
-`Bash`. It is a leaf module, imported downward by roles.py, only so that
-already oversized file does not grow further.
+`Bash`. It is a leaf module, imported downward by harness_guidance.py.
 
 With `pipefail` on, `head`, `grep -q` or `grep -m` closing the pipe SIGPIPEs a
 producer that is still writing, and the pipeline's 141 then reads like a

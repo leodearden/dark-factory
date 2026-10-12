@@ -1,9 +1,8 @@
 """Role-prompt guidance: `pkill -f` and `pgrep -f` match the `Bash` wrapper shell.
 
-`orchestrator/src/orchestrator/agents/roles.py::_BASH_CAPABLE_ROLE_PREAMBLE`
+`orchestrator/src/orchestrator/agents/harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE`
 splices `PKILL_SELF_MATCH_GUIDANCE` into every role holding unqualified `Bash`.
-It is a leaf module, imported downward by roles.py, only so that already
-oversized file does not grow further.
+It is a leaf module, imported downward by harness_guidance.py.
 
 Every `Bash` call runs in a `/bin/bash -c` wrapper whose argv carries the
 command text, so a `-f` pattern typed into the command matches that wrapper.

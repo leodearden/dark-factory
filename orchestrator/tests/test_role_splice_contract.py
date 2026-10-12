@@ -18,9 +18,9 @@ violating one. A helper that only ever passes is indistinguishable from a
 helper that does nothing.
 
 Everything under test here is driven by SYNTHETIC fixtures — string literals
-and synthetic ``AgentRole`` mappings — never by a real prompt constant from
-``roles.py``, except ``GREP_LOOKAROUND_GUIDANCE``, imported only as the opaque
-landmark the preamble-tail order check anchors on and never asserted on. This
+and synthetic ``AgentRole`` mappings — never by a real prompt constant, except
+``GREP_LOOKAROUND_GUIDANCE`` from ``harness_guidance.py``, imported only as the
+opaque landmark the preamble-tail order check anchors on and never asserted on. This
 file tests the HELPER; whether the real prompts satisfy the contract is the
 consumer modules' job, and duplicating that here would recreate the very clone
 this task is closing.
