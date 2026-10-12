@@ -1019,7 +1019,7 @@ async def test_collect_tasks_with_counts_excludes_done_rows(tmp_path, monkeypatc
 
     done_rows = [t for t in active if t['status'] == 'done']
     assert done_rows == [], (
-        'Default collect_tasks_with_counts must NOT return done rows — '
+        'collect_tasks_with_counts must NOT return done rows — '
         'scheduler.py must not receive done tasks'
     )
 
