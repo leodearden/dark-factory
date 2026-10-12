@@ -49,6 +49,7 @@ from fused_memory.maintenance.link_heal_store import (
     ToolCaller,
     text_sha256,
 )
+from fused_memory.memory_metadata import TRIAGE_CONTESTED_METADATA_KEY
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.models.scope import Scope
@@ -283,6 +284,7 @@ class LinkHealHarness:
         parent_text: str | None = PARENT_TEXT,
         project: str = DF,
         contested: bool = False,
+        contested_by_triage: bool = False,
     ) -> None:
         """A child linked to a parent; ``parent_text=None`` seeds no parent."""
         if parent_text is not None:
@@ -292,6 +294,8 @@ class LinkHealHarness:
             meta['kind'] = kind
         if contested:
             meta[CONTESTED_METADATA_KEY] = True
+        if contested_by_triage:
+            meta[TRIAGE_CONTESTED_METADATA_KEY] = True
         self.seed(project, child, child_text, **meta)
 
     def journal_rows(self, kind: str = 'write') -> list[dict[str, Any]]:

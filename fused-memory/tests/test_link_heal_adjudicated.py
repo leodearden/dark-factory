@@ -28,6 +28,7 @@ from _link_heal_harness import (
     FakeAdjudicator,
     LinkHealHarness,
     RecordingFiler,
+    assert_store_invariants,
     build_harness,
     corpus_basis,
     run_corpus_apply,
@@ -51,7 +52,13 @@ from fused_memory.maintenance.link_heal_executor import (
 )
 from fused_memory.maintenance.link_heal_ledger import ActionState, LinkHealLedger, RunSource
 from fused_memory.maintenance.link_heal_store import text_sha256
-from fused_memory.server.grouped_read import AMENDMENT_KIND, SIGHTING_KIND
+from fused_memory.memory_metadata import TRIAGE_CONTESTED_METADATA_KEY
+from fused_memory.server.grouped_read import (
+    AMENDMENT_KIND,
+    CONTESTED_METADATA_KEY,
+    PARENT_ID_KEY,
+    SIGHTING_KIND,
+)
 
 LIMITS = RunLimits(
     max_actions_per_run=25, backlog_multiplier=5, write_failure_streak=3,
@@ -457,6 +464,75 @@ class TestHealsPlannedOnReusedVerdictsMeetTheSameCeilings:
         (escape,) = filer.escapes
         assert escape.anchor == MISFILE_SHARE_ANCHOR
         assert (escape.detail['n'], escape.detail['count']) == (30, 12)
+
+
+class TestATriageStampedContestIsAdjudicated:
+    """H1 row 2 amendment (task 6533): a contest triage stamped is sent; a hand-declared one is not.
+
+    CHILD is the triage-stamped contest; its sibling under the same parent is a
+    hand-declared one. One verdict is far below
+    ``link_heal_executor.SHARE_ESCAPE_MIN_PAIRS``, so no share ceiling refuses
+    the apply.
+    """
+
+    HAND_DECLARED = _id('bbbbbbbb', 1)
+
+    def _seed(self, harness: LinkHealHarness) -> None:
+        harness.seed_link(contested=True, contested_by_triage=True)
+        harness.seed_link(child=self.HAND_DECLARED, parent_text=None, contested=True)
+
+    @pytest.mark.asyncio
+    async def test_only_the_triage_stamped_contest_is_sent_and_it_counts_as_adjudicated(
+        self, harness, ledger, tmp_path,
+    ):
+        self._seed(harness)
+        fake = always(Verdict.RELATED)
+
+        report = await adjudicated_plan(harness, ledger, fake, tmp_path / 'p.json')
+
+        assert fake.pairs == [
+            LinkPair(key=f'{DF}:{CHILD}', child_text=CHILD_TEXT, parent_text=PARENT_TEXT),
+        ]
+        counts = report.counts
+        assert counts.adjudicated == 1
+        assert counts.contested_reported == 1
+        assert dict(counts.planned_by_action) == {HealAction.DETACH.value: 1}
+
+    @pytest.mark.asyncio
+    async def test_applying_the_detach_drops_the_contest_with_the_link_and_leaves_the_hand_declared_one(
+        self, harness, ledger, tmp_path,
+    ):
+        self._seed(harness)
+        await adjudicated_plan(harness, ledger, always(Verdict.RELATED), tmp_path / 'p.json')
+
+        report = await adjudicated_apply(harness, ledger, RecordingFiler())
+
+        assert report.counts.applied == 1
+        detached = harness.mem0.payload(DF, CHILD)
+        for key in (PARENT_ID_KEY, 'kind', CONTESTED_METADATA_KEY, TRIAGE_CONTESTED_METADATA_KEY):
+            assert key not in detached, (key, detached)
+        kept = harness.mem0.payload(DF, self.HAND_DECLARED)
+        assert kept[PARENT_ID_KEY] == PARENT
+        assert kept['kind'] == AMENDMENT_KIND
+        assert kept[CONTESTED_METADATA_KEY] is True
+        (journal_row,) = harness.journal_rows()
+        assert journal_row['params']['metadata_delete_keys'] == [
+            PARENT_ID_KEY, 'kind', CONTESTED_METADATA_KEY, TRIAGE_CONTESTED_METADATA_KEY,
+        ]
+        assert_store_invariants(harness)
+
+    @pytest.mark.asyncio
+    async def test_an_agreeing_verdict_on_a_triage_contest_plans_nothing(
+        self, harness, ledger, tmp_path,
+    ):
+        self._seed(harness)
+
+        report = await adjudicated_plan(harness, ledger, always(Verdict.EXTENDS), tmp_path / 'p.json')
+
+        assert report.counts.adjudicated == 1
+        assert report.counts.planned == 0
+        assert report.counts.no_action == 1
+        assert harness.mem0.write_count == 0
 
 
 class TestEveryExecutorAnchorHasARoute:

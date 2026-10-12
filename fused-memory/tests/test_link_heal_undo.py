@@ -36,6 +36,7 @@ from fused_memory.maintenance.link_heal_ledger import (
     RunSource,
     UnknownRun,
 )
+from fused_memory.memory_metadata import TRIAGE_CONTESTED_METADATA_KEY
 from fused_memory.server.grouped_read import (
     AMENDMENT_KIND,
     CONTESTED_METADATA_KEY,
@@ -188,6 +189,28 @@ class TestUndoADetach:
 
         assert report.counts.applied == 1
         assert link_keys(harness) == {PARENT_ID_KEY: PARENT, 'kind': AMENDMENT_KIND}
+
+
+class TestUndoATriageContestDetach:
+    @pytest.mark.asyncio
+    async def test_one_patch_only_write_restores_the_link_the_flag_and_its_marker(
+        self, harness, ledger, tmp_path,
+    ):
+        harness.seed_link(contested=True, contested_by_triage=True)
+        _plan, applied = await plan_and_apply(harness, ledger, tmp_path, corpus_basis('RELATED'))
+
+        await undo(harness, ledger, applied.run_id)
+
+        restored = {
+            PARENT_ID_KEY: PARENT,
+            'kind': AMENDMENT_KIND,
+            CONTESTED_METADATA_KEY: True,
+            TRIAGE_CONTESTED_METADATA_KEY: True,
+        }
+        assert link_keys(harness) == restored
+        undo_params = harness.journal_rows()[-1]['params']
+        assert undo_params['metadata_patch'] == restored
+        assert 'metadata_delete_keys' not in undo_params
 
 
 class TestUndoRefusesARunWithNothingApplied:
