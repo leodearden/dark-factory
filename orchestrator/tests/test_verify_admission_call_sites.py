@@ -3,18 +3,23 @@
 A gated verify records its admission wait as a ``verify_admission_plan`` row only
 when its caller passes an event store, and the periodic review checkpoint queues
 behind task verifies only when it says it is a background verify
-(plans/verify-admission-fifo-prd.md, resolved design decisions 4 and 5).
+(plans/verify-admission-fifo-prd.md, resolved design decisions 4 and 5). The
+implement-phase verify runs end to end, through the real verify and flock, onto
+a real event store (PRD scenario 11).
 """
 from __future__ import annotations
 
+import asyncio
+import shlex
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import yaml
 from _orch_helpers import (
-    MOCK_WORKFLOW_PROJECT_ROOT,
     pydantic_spec,
     stamp_stock_routing_config,
 )
@@ -23,7 +28,8 @@ from shared.cli_invoke import AllAccountsCappedException
 
 from orchestrator import verify as verify_module
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig, load_config
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import Harness
 from orchestrator.review_checkpoint import ReviewCheckpoint
@@ -61,65 +67,45 @@ def _review_checkpoint(event_store: _RecordingEventStore) -> ReviewCheckpoint:
     return checkpoint
 
 
-def _workflow_on_mock_config(event_store: _RecordingEventStore) -> TaskWorkflow:
-    task_id = '5628'
-    assignment = MagicMock()
-    assignment.task_id = task_id
-    assignment.task = {'id': task_id, 'title': 'T', 'description': '', 'metadata': {}}
-    assignment.modules = ['mod_a']
-
-    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-    config.fused_memory.project_id = 'dark_factory'
-    config.fused_memory.url = 'http://localhost:8002'
-    config.lock_depth = 2
-    config.steward_completion_timeout = 300.0
-    config.project_root = MOCK_WORKFLOW_PROJECT_ROOT
-    config.max_consecutive_infra_resumes = 3
-    config.verify_infra_retry_max_attempts = 3
-    config.verify_infra_retry_backoff_secs = 0.01
-    config.verify_infra_retry_max_backoff_secs = 0.1
-    config.max_verify_attempts = 5
-    config.max_failure_signature_repeat = 3
-    config.max_opaque_timeout_attempts = 3
-    config.rebase_before_verify = False
-    config.escalate_preexisting_main_break = False
-
-    scheduler = MagicMock()
-    scheduler.update_task = AsyncMock(return_value=True)
-    scheduler.set_task_status = AsyncMock()
-    scheduler.get_status = AsyncMock(return_value='in-progress')
-    scheduler.get_task = AsyncMock(return_value={'id': task_id, 'metadata': {}})
-    git_ops = MagicMock()
-    git_ops.get_main_sha = AsyncMock(return_value='SHA-A')
-    queue = MagicMock()
-    queue.get_by_task = MagicMock(return_value=[])
-
-    workflow = TaskWorkflow(
-        assignment=assignment,
-        config=config,
-        git_ops=git_ops,
-        scheduler=scheduler,
-        briefing=MagicMock(),
-        mcp=MagicMock(),
-        escalation_queue=queue,
-        event_store=event_store,  # type: ignore[arg-type]
-    )
-    workflow.worktree = Path('/tmp/fake-worktree-5628')
-    workflow.artifacts = MagicMock()
-    workflow.artifacts.read_iteration_log = MagicMock(return_value=([], []))
-    return workflow
+_LANE_GIT = {
+    'main_branch': 'main', 'branch_prefix': 'task/', 'remote': 'origin',
+    'worktree_dir': '.worktrees', 'push_after_advance': False,
+}
 
 
-def _workflow_on_real_lane(tmp_path: Path, event_store: _RecordingEventStore) -> TaskWorkflow:
+def _lane_config(tmp_path: Path) -> OrchestratorConfig:
     project_root = tmp_path / 'project'
     project_root.mkdir()
-    config = OrchestratorConfig(
-        project_root=project_root,
-        git=GitConfig(
-            main_branch='main', branch_prefix='task/', remote='origin',
-            worktree_dir='.worktrees', push_after_advance=False,
-        ),
-    )
+    return OrchestratorConfig(project_root=project_root, git=GitConfig(**_LANE_GIT))
+
+
+def _gated_lane_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> OrchestratorConfig:
+    """A project whose one module, ``lib``, has a passing test command, loaded the
+    way the orchestrator loads it, with verify admission on in a tmp slots dir.
+    The project root is *tmp_path*, where conftest's ORCH_PROJECT_ROOT pins it."""
+    project_root = tmp_path
+    (project_root / 'lib').mkdir()
+    sleep = f'{shlex.quote(sys.executable)} -c "import time; time.sleep(0.05)"'
+    (project_root / 'lib' / 'orchestrator.yaml').write_text(yaml.safe_dump({
+        'test_command': sleep, 'lint_command': None, 'type_check_command': None,
+    }))
+    config_path = project_root / 'dark-factory-orchestrator.yaml'
+    config_path.write_text(yaml.safe_dump({
+        'project_root': str(project_root),
+        'git': _LANE_GIT,
+        'rebase_before_verify': False,
+        'verify_admission_slots_dir': str(tmp_path / 'slots'),
+        'verify_admission_nice_task': 'nice -n 10',
+        'verify_admission_nice_background': 'nice -n 10',
+        'verify_clock_stop_enabled': False,
+    }))
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(config_path))
+    return load_config(config_path)
+
+
+def _workflow_on_real_lane(
+    config: OrchestratorConfig, event_store: EventStore | _RecordingEventStore,
+) -> TaskWorkflow:
     git_ops = GitOps(config.git, config.project_root)
     worktree = git_ops.worktree_base / '42'
     worktree.mkdir(parents=True)
@@ -179,25 +165,31 @@ async def test_review_checkpoint_verifies_as_background_on_its_event_store(monke
     assert kwargs['event_store'] is store
 
 
+@pytest.mark.real_verify_admission
+@pytest.mark.usefixtures('code_default_config')
 @pytest.mark.asyncio
-async def test_implement_phase_verify_carries_task_id_and_event_store():
-    store = _RecordingEventStore()
-    workflow = _workflow_on_mock_config(store)
-    verify = AsyncMock(return_value=_PASSED)
+async def test_implement_phase_verify_records_one_admission_plan_for_its_task(
+    tmp_path, monkeypatch,
+):
+    store = EventStore(tmp_path / 'runs.db', run_id='t')
+    workflow = _workflow_on_real_lane(_gated_lane_config(tmp_path, monkeypatch), store)
 
-    with patch('orchestrator.workflow.run_scoped_verification', verify):
+    async with asyncio.timeout(60):
         outcome = await workflow._verify_debugfix_loop()
 
     assert outcome == WorkflowOutcome.DONE
-    kwargs = _awaited_kwargs(verify)
-    assert kwargs['event_store'] is store
-    assert kwargs['task_id'] == workflow.task_id
+    [row] = store.fetch_events_by_type(EventType.verify_admission_plan)
+    assert row['task_id'] == workflow.task_id
+    data = row['data']
+    assert (data['outcome'], data['role'], data['task_id']) == ('returned', 'task', workflow.task_id)
+    [leg] = data['legs']
+    assert (leg['module'], leg['slot_held'], leg['rc']) == ('lib', True, 0)
 
 
 @pytest.mark.asyncio
 async def test_post_rebase_reverify_carries_task_id_and_event_store(tmp_path, monkeypatch):
     store = _RecordingEventStore()
-    workflow = _workflow_on_real_lane(tmp_path, store)
+    workflow = _workflow_on_real_lane(_lane_config(tmp_path), store)
     workflow._maybe_defer_as_train_member = AsyncMock(return_value=None)  # type: ignore[method-assign]
     workflow._check_scope_invariant = AsyncMock(return_value=None)  # type: ignore[method-assign]
     workflow.git_ops.get_main_sha = AsyncMock(return_value='mainsha')  # type: ignore[method-assign]
