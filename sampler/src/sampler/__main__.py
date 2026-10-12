@@ -28,6 +28,8 @@ import time
 from pathlib import Path
 
 from sampler.metrics import (
+    METRIC_GROUPS,
+    GroupName,
     collect_load_metrics,
     collect_process_metrics,
     collect_psi,
@@ -95,7 +97,12 @@ def main() -> None:
         logger.exception('Failed to collect load metrics; writing the other groups only')
         load_metrics = {}
 
-    run_tick(store, now, psi=psi, process_metrics=process_metrics, load_metrics=load_metrics)
+    groups = {group.name: group for group in METRIC_GROUPS}
+    run_tick(store, now, {
+        groups[GroupName.PSI]: psi,
+        groups[GroupName.PROCESS]: process_metrics,
+        groups[GroupName.LOAD]: load_metrics,
+    })
     store.maybe_vacuum(now)
 
     logger.info(
