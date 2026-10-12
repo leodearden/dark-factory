@@ -9,13 +9,17 @@ The classifier cases are the ones that pinned the retired
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import math
+from collections.abc import Awaitable, Callable
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from shared.cli_invoke import AgentResult
+from _orch_helpers import build_usage_gate
+from shared.cli_invoke import AgentResult, AllAccountsCappedException
+from shared.config_models import AccountConfig
 from shared.invocation_outcome import (
     NON_CAP_CLI_ERROR_MARKERS,
     CliLocalError,
@@ -31,6 +35,8 @@ from orchestrator.evals.measurement import (
     clip_reason,
     coerce_cost_usd,
     exception_reason,
+    json_answer,
+    measured_call,
 )
 
 # The exact payload the Claude CLI emitted during the 2026-07-27 architect-effort
@@ -302,3 +308,184 @@ class TestClassifyUnmeasured:
             cost_usd=0.9, duration_ms=30_000, turns=6, api_error_status=529,
         )
         assert _classify(near_with_5xx) is None
+
+
+def _answer(output: str, *, cost_usd: float = 0.0, structured_output: Any = None) -> AgentResult:
+    return AgentResult(
+        success=True, output=output, cost_usd=cost_usd, duration_ms=1000,
+        turns=1, structured_output=structured_output,
+    )
+
+
+def _recording_invoke(
+    *results: AgentResult | BaseException,
+) -> tuple[Callable[..., Awaitable[AgentResult]], list[dict[str, Any]]]:
+    """An invoke function answering *results* in order and recording its kwargs."""
+    pending = list(results)
+    calls: list[dict[str, Any]] = []
+
+    async def invoke(**kwargs: Any) -> AgentResult:
+        calls.append(kwargs)
+        answer = pending.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    return invoke, calls
+
+
+def _never_parse(result: AgentResult) -> Any:
+    raise AssertionError('parse must not run on a refused invocation')
+
+
+def _raising_parse(exc: BaseException) -> Callable[[AgentResult], Any]:
+    def parse(result: AgentResult) -> Any:
+        raise exc
+
+    return parse
+
+
+class TestJsonAnswer:
+    def test_structured_output_is_returned_as_is_and_preferred(self):
+        payload = {'x': 1}
+
+        assert json_answer(_answer('{"y": 0}', structured_output=payload)) is payload
+
+    @pytest.mark.parametrize('empty', [None, {}])
+    def test_empty_structured_output_falls_back_to_the_output_text(self, empty):
+        assert json_answer(_answer('{"y": 0}', structured_output=empty)) == {'y': 0}
+
+    def test_invalid_json_is_a_value_error(self):
+        with pytest.raises(json.JSONDecodeError):
+            json_answer(_answer('not json'))
+
+    @pytest.mark.parametrize('output', ['[1, 2]', '"text"'])
+    def test_a_non_object_payload_is_a_value_error(self, output):
+        with pytest.raises(ValueError, match='JSON object'):
+            json_answer(_answer(output))
+
+
+@pytest.mark.asyncio
+class TestMeasuredCall:
+    async def test_ungated_success_is_scored_with_its_spend(self):
+        invoke, calls = _recording_invoke(_answer('{"x": 1}', cost_usd=0.4))
+
+        outcome = await measured_call(
+            invoke, json_answer, stage=MeasurementStage.JUDGE, backend='claude',
+            prompt='P', model='opus',
+        )
+
+        assert outcome == Scored(value={'x': 1}, cost_usd=0.4)
+        assert len(calls) == 1
+        assert calls[0]['prompt'] == 'P'
+        assert calls[0]['model'] == 'opus'
+        assert calls[0]['backend'] == 'claude'
+
+    async def test_transport_refusal_is_unmeasured_and_never_parsed(self):
+        invoke, _ = _recording_invoke(_cap_agent_result(cost_usd=0.3))
+
+        outcome = await measured_call(
+            invoke, _never_parse, stage=MeasurementStage.JUDGE, backend='claude',
+            prompt='P',
+        )
+
+        assert isinstance(outcome, Unmeasured)
+        assert outcome.stage is MeasurementStage.JUDGE
+        assert outcome.cause is UnmeasuredCause.CAP_HIT
+        assert outcome.cost_usd == 0.3
+
+    async def test_unparseable_answer_is_unmeasured_with_one_warning(self, caplog):
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.measurement')
+        invoke, _ = _recording_invoke(_answer('not json', cost_usd=0.7))
+
+        outcome = await measured_call(
+            invoke, json_answer, stage=MeasurementStage.JUDGE, backend='claude',
+            label='Plan judge for df_task_7', prompt='P',
+        )
+
+        assert isinstance(outcome, Unmeasured)
+        assert outcome.cause is UnmeasuredCause.UNPARSEABLE
+        assert outcome.cost_usd == 0.7
+        assert 'JSONDecodeError' in outcome.reason
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert 'Plan judge for df_task_7' in warnings[0].getMessage()
+
+    @pytest.mark.parametrize('exc', [ValueError('non-finite'), KeyError('plan_quality')])
+    async def test_a_parse_rejection_is_unparseable(self, exc):
+        invoke, _ = _recording_invoke(_answer('{}', cost_usd=0.1))
+
+        outcome = await measured_call(
+            invoke, _raising_parse(exc), stage=MeasurementStage.JUDGE,
+            backend='claude', prompt='P',
+        )
+
+        assert isinstance(outcome, Unmeasured)
+        assert outcome.cause is UnmeasuredCause.UNPARSEABLE
+
+    async def test_a_parse_programming_error_propagates(self):
+        invoke, _ = _recording_invoke(_answer('{}'))
+
+        with pytest.raises(RuntimeError, match='bug'):
+            await measured_call(
+                invoke, _raising_parse(RuntimeError('bug')),
+                stage=MeasurementStage.JUDGE, backend='claude', prompt='P',
+            )
+
+    async def test_healthy_result_quoting_cap_text_is_scored(self):
+        invoke, _ = _recording_invoke(_answer(f'the CLI printed: {_CAP_TEXT}'))
+
+        outcome = await measured_call(
+            invoke, lambda result: result.output, stage=MeasurementStage.JUDGE,
+            backend='claude', prompt='P',
+        )
+
+        assert outcome == Scored(value=f'the CLI printed: {_CAP_TEXT}', cost_usd=0.0)
+
+    async def test_an_invoke_error_propagates_unchanged(self):
+        boom = RuntimeError('transport exploded')
+        invoke, _ = _recording_invoke(boom)
+
+        with pytest.raises(RuntimeError) as exc:
+            await measured_call(
+                invoke, json_answer, stage=MeasurementStage.JUDGE,
+                backend='claude', prompt='P',
+            )
+        assert exc.value is boom
+
+    async def test_cap_patience_exhausted_is_unmeasured(self):
+        invoke, _ = _recording_invoke(AllAccountsCappedException(3, 10.0, 'x'))
+
+        outcome = await measured_call(
+            invoke, _never_parse, stage=MeasurementStage.JUDGE, backend='claude',
+            prompt='P',
+        )
+
+        assert isinstance(outcome, Unmeasured)
+        assert outcome.cause is UnmeasuredCause.CAP_EXHAUSTED
+        assert outcome.cost_usd == 0.0
+
+    async def test_gated_failover_banks_spend_per_attempt(self):
+        gate = build_usage_gate(
+            [
+                AccountConfig(name='max-a', oauth_token_env='CLAUDE_OAUTH_A'),
+                AccountConfig(name='max-b', oauth_token_env='CLAUDE_OAUTH_B'),
+            ],
+            ['tok-a', 'tok-b'],
+        )
+        invoke, calls = _recording_invoke(
+            _cap_agent_result(cost_usd=0.2), _answer('{"x": 2}', cost_usd=0.5),
+        )
+
+        with patch('shared.cli_invoke.asyncio.sleep', AsyncMock()):
+            outcome = await measured_call(
+                invoke, json_answer, stage=MeasurementStage.JUDGE,
+                backend='claude', usage_gate=gate, prompt='P',
+            )
+
+        assert isinstance(outcome, Scored)
+        assert outcome.value == {'x': 2}
+        assert outcome.cost_usd == pytest.approx(0.7)
+        assert len(calls) == 2
+        assert calls[1]['oauth_token'] == 'tok-b'
+        assert calls[1]['prompt'] == 'P'
