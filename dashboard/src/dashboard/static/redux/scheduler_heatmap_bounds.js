@@ -1,5 +1,6 @@
 /* scheduler_heatmap_bounds.js — axis selection for the Scheduler contention
-   heatmap: which task rows and which lock modules are worth rendering.
+   heatmap: which task rows and which lock modules are worth rendering, and the
+   caption that tells the user what that selection left out.
 
    Pure and React-free by design, so it runs under `node --test` against a
    fixture at production scale (dashboard/tests/js/scheduler_heatmap_bounds.test.mjs).
@@ -15,7 +16,7 @@
    against the 12,867,282 measured on the 2026-09-20 live snapshot.
 
    Exports: window.DF_SCHED_HEATMAP_BOUNDS =
-     { boundHeatmapAxes, rowTouchesModule,
+     { boundHeatmapAxes, rowTouchesModule, describeHeatmapCap,
        MAX_HEATMAP_ROWS, MAX_HEATMAP_COLS, MAX_RESCUED_COLS }
 */
 
@@ -161,9 +162,26 @@ function boundHeatmapAxes({ rows, modules }) {
   }
 }
 
+// The truncation caption for a boundHeatmapAxes result, or null when nothing
+// was cut. The copy lives beside the selection because each claim in it —
+// 'most contended' for the head, 'then' for the tail's position — is a
+// property of selectHeatmapColumns, and the two must change together.
+function describeHeatmapCap(bounded) {
+  if (!bounded.rowsTruncated && !bounded.modulesTruncated) return null
+  const tasks = `Showing ${bounded.rows.length} of ${bounded.rowsTotal} tasks`
+  const contended = bounded.modules.length - bounded.modulesRescued
+  const rescued = bounded.modulesRescued
+  const of = `of ${bounded.modulesTotal} modules`
+  const stranded = 'stranded (dead park owner or departed holder)'
+  if (rescued === 0) return `${tasks} and the ${contended} most contended ${of}.`
+  if (contended === 0) return `${tasks} and ${rescued} ${of}, all ${stranded}.`
+  return `${tasks} and the ${contended} most contended ${of}, then ${rescued} ${stranded}.`
+}
+
 const SCHEDULER_HEATMAP_BOUNDS_API = {
   boundHeatmapAxes,
   rowTouchesModule,
+  describeHeatmapCap,
   MAX_HEATMAP_ROWS,
   MAX_HEATMAP_COLS,
   MAX_RESCUED_COLS,
