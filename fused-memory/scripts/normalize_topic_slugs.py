@@ -1851,17 +1851,8 @@ async def run(
 DEFAULT_JSON_OUT = str(_REPO_ROOT / 'plans' / 'topic-slug-normalization-report.json')
 DEFAULT_MD_OUT = str(_REPO_ROOT / 'plans' / 'topic-slug-normalization-report.md')
 
-#: The skip keys worth printing inline, in reading order.  A whitelist rather
-#: than a dump: rows that land in error buckets carry a whole ``response``
-#: envelope, which would bury the fields that identify the record.
-_SKIP_DETAIL_KEYS: tuple[str, ...] = (
-    'project_id', 'project_root', 'category', 'memory_id', 'memory_ids',
-    'gate_task_id', 'gate_task_ids', 'topic', 'raw_topic', 'old_topic',
-    'new_topic', 'gate_topic', 'legacy_topic', 'existing_topic',
-    'target_topic', 'source_topics', 'canonical_memory_ids', 'incumbent_ids',
-    'record_count', 'residue_count', 'expected', 'scrolled', 'recount',
-    'delta', 'half', 'error', 'error_type', 'undo_failures', 'note',
-)
+#: Keys a skip line leaves out.  The bucket heading already names the reason.
+_SKIP_LINE_OMITTED_KEYS: frozenset[str] = frozenset({'reason'})
 
 
 def render_json(report: dict) -> str:
@@ -1877,10 +1868,13 @@ def render_json(report: dict) -> str:
 
 
 def _render_skip_entry(entry: dict) -> str:
+    # The producer's dict is the single point of truth for which fields an
+    # entry carries, in reading order.  A drift in the omitted set can only
+    # SHOW a field, never hide one.
     parts = [
-        f'{key}={entry[key]!r}'
-        for key in _SKIP_DETAIL_KEYS
-        if entry.get(key) is not None
+        f'{key}={value!r}'
+        for key, value in entry.items()
+        if key not in _SKIP_LINE_OMITTED_KEYS and value is not None
     ]
     # An entry the renderer does not recognise is exactly the one worth
     # showing verbatim, rather than as a bare bullet.
