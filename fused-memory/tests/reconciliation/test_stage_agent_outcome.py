@@ -7,16 +7,21 @@ nothing. See plans/recon-stage-startup-wedge-rca-2026-09-27.md.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import pytest_asyncio
 from shared.cli_invoke import AgentResult
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import StageAgentOutcome, StageId, StageReport
 from fused_memory.reconciliation.cli_stage_runner import StageResult, run_stage_via_cli
+from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
 from fused_memory.reconciliation.sandbox_guard import RemediationSandboxUnavailable
+from fused_memory.reconciliation.summary_pool import write_cycle_summary
 
 _INVOKE = 'fused_memory.reconciliation.cli_stage_runner.invoke_with_cap_retry'
 _RESOLVE_SANDBOX = 'fused_memory.reconciliation.cli_stage_runner.resolve_recon_sandbox_wrap'
@@ -147,3 +152,63 @@ class TestStageReportAgentOutcomeField:
         legacy.pop('agent_outcome', None)
 
         assert StageReport(**legacy).agent_outcome is None
+
+
+class TestCycleSummaryRecordsAgentOutcome:
+    @pytest_asyncio.fixture
+    async def ledger_store(self, tmp_path):
+        store = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await store.initialize()
+        yield store
+        await store.close()
+
+    @staticmethod
+    async def _write(ledger_store, report: StageReport):
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = ledger_store
+        memory_service.add_system_record = AsyncMock(
+            return_value=SimpleNamespace(memory_ids=['m1']),
+        )
+        await write_cycle_summary(
+            memory_service,
+            'dark_factory',
+            report,
+            'run-outcome',
+            stage='task_knowledge_sync',
+            recon_pool='stage2_cycle_summary',
+            trim_source='stage2_cycle_summary_trim',
+            cap=2,
+        )
+        record = await ledger_store.get_by_identity(
+            'dark_factory', 'cycle_summary',
+            flag_type='task_knowledge_sync', run_id='run-outcome',
+        )
+        assert record is not None
+        return json.loads(record.payload_json), memory_service.add_system_record.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_startup_wedge_kill_is_named_in_ledger_and_mirror(self, ledger_store):
+        payload, mirror = await self._write(ledger_store, _stage_report(
+            agent_outcome=StageAgentOutcome.zero_output_timeout, llm_calls=0, items_flagged=[],
+        ))
+
+        assert payload['agent_outcome'] == 'zero_output_timeout'
+        assert 'Agent outcome: zero_output_timeout' in mirror['content']
+        assert '0 item(s) flagged, 0 llm_call(s)' in mirror['content']
+        assert 'agent_outcome' not in mirror['metadata']
+
+    @pytest.mark.asyncio
+    async def test_completed_agent_is_named_completed(self, ledger_store):
+        payload, mirror = await self._write(
+            ledger_store, _stage_report(agent_outcome=StageAgentOutcome.completed),
+        )
+
+        assert payload['agent_outcome'] == 'completed'
+        assert 'Agent outcome: completed' in mirror['content']
+
+    @pytest.mark.asyncio
+    async def test_unknown_outcome_is_rendered_unrecorded(self, ledger_store):
+        payload, mirror = await self._write(ledger_store, _stage_report())
+
+        assert payload['agent_outcome'] is None
+        assert 'Agent outcome: unrecorded' in mirror['content']
