@@ -551,6 +551,56 @@ async def test_collect_scheduler_state_surfaces_degraded_projects_distinctly(
     assert 'slow-proj' not in offline_projects
 
 
+async def test_degraded_project_parks_are_never_reported_stranded(
+    dummy_client, dummy_config
+):
+    """A degraded project's park owners have UNKNOWN liveness, not dead.
+
+    Its task read never finished, so it contributes no active rows and its
+    live set is empty by omission, not by measurement.  Reading that empty set
+    as "every park owner is dead" would surface each one as a stranded
+    eviction candidate.  The snapshot facts that need no liveness verdict
+    (here, the pin queue) must still reach the payload.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from dashboard.data.scheduler import collect_scheduler_state
+
+    project = dummy_config.project_root.name
+    iso = '2026-01-01T10:00:00+00:00'
+    snapshot = _scheduler_snapshot(
+        park_stacks={
+            'mpark': [{'owner': '7', 'rank': 1, 'shadowed': False, 'installed_at': iso}],
+        },
+        pin_queue=[{'task_id': '7', 'order': 0}],
+    )
+
+    async def _mcp(client, url, tool, args):
+        if tool == 'get_scheduler_state':
+            return snapshot
+        return []
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', AsyncMock(side_effect=_mcp)),
+        patch(
+            'dashboard.data.scheduler.collect_tasks_with_counts',
+            AsyncMock(return_value=([], [], {}, [project], [])),
+        ),
+    ):
+        rows, modules, pin_queue, _events, _offline, _paused, _recovery, degraded = \
+            await collect_scheduler_state(dummy_client, dummy_config)
+
+    assert degraded == [project]
+    assert [r for r in rows if r.get('stranded')] == [], (
+        'a park owner whose liveness was never read must not be called stranded'
+    )
+    assert [
+        m for m in modules
+        if m.get('has_dead_park') or (m.get('parked_by') and not m.get('parked_owner_live'))
+    ] == [], 'no module may raise the stranded-parks banner for a degraded project'
+    assert [p['task_id'] for p in pin_queue] == ['7']
+
+
 # ---------------------------------------------------------------------------
 # task-2218 step-3: guard the first_success + whole-pair-retry + None-sentinel
 # contract that the upcoming _one_project -> first_success conversion must

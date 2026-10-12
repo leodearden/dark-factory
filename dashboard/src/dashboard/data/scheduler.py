@@ -676,7 +676,9 @@ async def collect_scheduler_state(
                           whole-handler budget expired before they were read.
                           Offline means the read demonstrably FAILED; degraded
                           means nothing was proven.  They must never be merged
-                          (see module docstring).
+                          (see module docstring).  A degraded project's park
+                          stacks are withheld from ``rows`` and ``modules``:
+                          with no task rows, no owner's liveness is known.
 
     TWO SAME-BASENAME ROOTS: what is fixed here, and what is not.  Each
     per-project result is paired to its OWN root by POSITION, so the per-root
@@ -913,7 +915,12 @@ async def collect_scheduler_state(
         live_task_ids: set[str] = {r['task_id'] for r in rows}
         # park_stacks: dict[module → list[entry]] from the snapshot (β pass-through).
         # None-safe: pre-upgrade snapshots lacking the key degrade to empty dict.
-        park_stacks: dict = snapshot.get('park_stacks') or {}
+        # A degraded project's live set is empty because its task read never
+        # finished, so every park verdict drawn from it would be a guess.
+        park_stacks: dict = (
+            {} if label in degraded_projects
+            else snapshot.get('park_stacks') or {}
+        )
 
         # Module contention from composed rows + snapshot holders.
         # Tag each module with the owning `project` so _merge_module_lists can
