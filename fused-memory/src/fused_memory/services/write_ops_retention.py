@@ -24,12 +24,9 @@ async def prune_write_ops_pass(journal: WriteJournal, config: WriteJournalConfig
 
 
 async def run_periodic_write_ops_prune(journal: WriteJournal, config: WriteJournalConfig) -> None:
-    """Run a pass every ``config.prune_interval_seconds``, sleeping first; returns on cancel."""
+    """Run a pass every ``config.prune_interval_seconds``, sleeping first, until cancelled."""
     while True:
-        try:
-            await asyncio.sleep(config.prune_interval_seconds)
-        except asyncio.CancelledError:
-            return
+        await asyncio.sleep(config.prune_interval_seconds)
         try:
             await prune_write_ops_pass(journal, config)
         except Exception:

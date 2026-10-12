@@ -19,10 +19,11 @@ import json
 import logging
 import time
 import uuid as uuid_mod
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import MappingProxyType
 
 import aiosqlite
 from shared.async_sqlite_base import (
@@ -290,12 +291,26 @@ CREATE TABLE IF NOT EXISTS referent_findings (
 CREATE INDEX IF NOT EXISTS idx_rf_group_time ON referent_findings(group_id, created_at);
 """
 
-#: Rows ``prune_write_ops`` ages out on its read horizon; parameter: the cutoff timestamp.
-READ_HORIZON_PREDICATE = "kind = 'read' AND operation <> 'search' AND created_at < ?"
-#: Its search horizon; every search producer journals kind='read', so this seeks idx_wo_kind_time.
-SEARCH_HORIZON_PREDICATE = "kind = 'read' AND operation = 'search' AND created_at < ?"
-#: Its write horizon; parameter: the cutoff timestamp.
-WRITE_HORIZON_PREDICATE = "kind = 'write' AND created_at < ?"
+
+def _prune_batch_sql(horizon_rows: str) -> str:
+    return (
+        'DELETE FROM write_ops WHERE id IN ('
+        'SELECT id FROM write_ops INDEXED BY idx_wo_kind_time '
+        f'WHERE {horizon_rows} AND created_at >= ? AND created_at < ? '
+        'ORDER BY created_at LIMIT ?) RETURNING created_at'
+    )
+
+
+#: One batch of ``WriteJournal.prune_write_ops`` per retention horizon, in the
+#: order it drains them: delete the oldest ``LIMIT`` rows of the horizon created
+#: in ``[resume_from, cutoff)`` and return their ``created_at``. Parameters:
+#: ``(resume_from, cutoff, limit)``. Each range-seeks idx_wo_kind_time, and
+#: INDEXED BY pins it, so a missing index errors instead of scanning.
+WRITE_OPS_PRUNE_BATCH_SQL: Mapping[str, str] = MappingProxyType({
+    'read': _prune_batch_sql("kind = 'read' AND operation <> 'search'"),
+    'search': _prune_batch_sql("kind = 'read' AND operation = 'search'"),
+    'write': _prune_batch_sql("kind = 'write'"),
+})
 
 #: Parameters: ``(since_iso_timestamp, limit)``.
 OPERATOR_TELEMETRY_QUERY = """
@@ -367,6 +382,7 @@ class WriteJournal:
         self.data_dir = Path(data_dir)
         self._access: AtomicConnection | None = None
         self._dropped: collections.Counter[str] = collections.Counter()
+        self._pruned_below: dict[str, str] = {}
 
     @property
     def db_path(self) -> Path:
@@ -537,7 +553,18 @@ class WriteJournal:
         that is really just the writer. Such a row also carries
         ``params['done_provenance_kind']`` and lands for a REFUSED write too,
         with ``success=0`` and the refusal in ``error``.
+
+        A ``search`` IS ALWAYS STORED AS ``kind='read'``, because the search
+        retention horizon of :meth:`prune_write_ops` selects on that pair; any
+        other ``kind`` passed with it is logged and overridden.
         """
+        if operation == 'search' and kind != 'read':
+            logger.warning(
+                "write_op %s: operation='search' journalled with kind=%r; stored as "
+                "kind='read', the kind the search retention horizon selects",
+                write_op_id, kind,
+            )
+            kind = 'read'
         try:
             async with self._require_access().write() as db:
                 await db.execute(
@@ -1185,12 +1212,26 @@ class WriteJournal:
         the per-connection lock and SQLite's write lock are released between
         batches and serving writes interleave. That matters most for the
         periodic pass, which runs while serving: a journalled tool call waits on
-        the connection lock for at most one batch, never a whole pass. The sweep
-        stops on whichever bound comes first. ``max_rows`` is only a PROXY for
-        the risk; ``max_seconds`` bounds it directly, because rows-per-second is
-        not knowable in advance — it depends on page-cache warmth and on six
-        index b-trees per delete. The deadline is checked BETWEEN batches, never
-        mid-batch.
+        the connection lock for at most one batch, never a whole pass, and
+        ``batch_size`` is sized for that wait in ``fused-memory/config/config.yaml``.
+        The sweep stops on whichever bound comes first. ``max_rows`` is only a
+        PROXY for the risk; ``max_seconds`` bounds it directly, because
+        rows-per-second is not knowable in advance — it depends on page-cache
+        warmth and on six index b-trees per delete. The deadline is checked
+        BETWEEN batches, never mid-batch.
+
+        EACH HORIZON RESUMES WHERE ITS LAST BATCH STOPPED. ``operation`` is not
+        in idx_wo_kind_time, so the read horizon tests ``operation <> 'search'``
+        with a table-row lookup per index entry, and its range holds every kept
+        search row older than the oldest expired read. A batch started from the
+        bottom walks all of them before deleting anything: measured 2026-10-12 on
+        the live journal, 430,040 rows took 9.4 s cold and 0.4-0.6 s warm in one
+        statement the deadline cannot interrupt, against 2 ms from a resume
+        point. ``_pruned_below`` keeps, per horizon, the ``created_at`` below
+        which every matching row is already deleted. It stays true because every
+        ``write_ops`` writer stamps ``created_at`` with the current time, so no
+        row lands behind it. It lives as long as the process, so only the first
+        batch after a start pays the walk, and that runs before READY.
 
         WHAT NET PROGRESS REQUIRES, stated so the claim is checkable rather than
         hopeful: rows removed per day (passes per day x rows per pass) must
@@ -1215,13 +1256,11 @@ class WriteJournal:
         space needs an offline ``VACUUM``, a full-file rewrite requiring as much
         scratch again, which is categorically not a startup operation.
         """
-        # All three horizons range-seek idx_wo_kind_time (kind, created_at);
-        # INDEXED BY pins it, so a missing index errors instead of scanning.
-        horizons = (
-            ('read', READ_HORIZON_PREDICATE, read_older_than_days),
-            ('search', SEARCH_HORIZON_PREDICATE, search_older_than_days),
-            ('write', WRITE_HORIZON_PREDICATE, write_older_than_days),
-        )
+        older_than_days = {
+            'read': read_older_than_days,
+            'search': search_older_than_days,
+            'write': write_older_than_days,
+        }
         try:
             deadline = _monotonic() + max_seconds
             total = 0
@@ -1229,31 +1268,33 @@ class WriteJournal:
             halted = ''
             backlog: list[str] = []
 
-            for label, predicate, older_than_days in horizons:
+            for label, batch_sql in WRITE_OPS_PRUNE_BATCH_SQL.items():
                 if halted:
                     # Never attempted under this run's bounds — unknown, so
                     # reported as a backlog rather than assumed drained.
                     backlog.append(label)
                     continue
-                cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
+                cutoff = (
+                    datetime.now(UTC) - timedelta(days=older_than_days[label])
+                ).isoformat()
                 while True:
                     limit = min(batch_size, max_rows - total)
                     if limit <= 0:
                         halted = 'row budget'
                         backlog.append(label)
                         break
+                    resume_from = self._pruned_below.get(label, '')
                     async with self._require_access().write() as db:
-                        cursor = await db.execute(
-                            f'DELETE FROM write_ops WHERE id IN '
-                            f'(SELECT id FROM write_ops INDEXED BY idx_wo_kind_time '
-                            f'WHERE {predicate} LIMIT ?)',
-                            (cutoff, limit),
-                        )
-                        removed = max(cursor.rowcount, 0)
+                        deleted = list(await db.execute_fetchall(
+                            batch_sql, (resume_from, cutoff, limit)
+                        ))
+                    removed = len(deleted)
                     total += removed
                     by_horizon[label] = by_horizon.get(label, 0) + removed
                     if removed < limit:
+                        self._pruned_below[label] = cutoff
                         break  # a short batch means this horizon is drained
+                    self._pruned_below[label] = max(row[0] for row in deleted)
                     if total >= max_rows:
                         halted = 'row budget'
                         backlog.append(label)

@@ -11,19 +11,16 @@ import pytest
 import pytest_asyncio
 
 from fused_memory.config.schema import WriteJournalConfig
-from fused_memory.services import write_ops_retention
-from fused_memory.services.write_journal import (
-    READ_HORIZON_PREDICATE,
-    SEARCH_HORIZON_PREDICATE,
-    WRITE_HORIZON_PREDICATE,
-    WriteJournal,
-)
+from fused_memory.services import write_journal, write_ops_retention
+from fused_memory.services.write_journal import WRITE_OPS_PRUNE_BATCH_SQL, WriteJournal
 from fused_memory.services.write_ops_retention import (
     prune_write_ops_pass,
     run_periodic_write_ops_prune,
 )
 
-_KIND_TIME_SEEK = 'SEARCH write_ops USING INDEX idx_wo_kind_time (kind=? AND created_at<?)'
+_KIND_TIME_RANGE_SEEK = (
+    'SEARCH write_ops USING INDEX idx_wo_kind_time (kind=? AND created_at>? AND created_at<?)'
+)
 
 
 @pytest_asyncio.fixture
@@ -34,24 +31,22 @@ async def journal(tmp_path):
     await j.close()
 
 
-@pytest.mark.parametrize(
-    'predicate',
-    [READ_HORIZON_PREDICATE, SEARCH_HORIZON_PREDICATE, WRITE_HORIZON_PREDICATE],
-    ids=['read', 'search', 'write'],
-)
+@pytest.mark.parametrize('horizon', list(WRITE_OPS_PRUNE_BATCH_SQL))
 @pytest.mark.asyncio
-async def test_every_horizon_is_an_index_seek(journal, predicate):
+async def test_every_prune_batch_seeks_between_its_resume_point_and_cutoff(journal, horizon):
     with contextlib.closing(sqlite3.connect(journal.db_path)) as conn:
         plan = conn.execute(
-            'EXPLAIN QUERY PLAN SELECT id FROM write_ops INDEXED BY idx_wo_kind_time '
-            f'WHERE {predicate} LIMIT ?',
-            ('2026-01-01T00:00:00+00:00', 1),
+            f'EXPLAIN QUERY PLAN {WRITE_OPS_PRUNE_BATCH_SQL[horizon]}',
+            ('2026-01-01T00:00:00+00:00', '2026-02-01T00:00:00+00:00', 1),
         ).fetchall()
     details = [row[3] for row in plan]
-    assert _KIND_TIME_SEEK in details, (
-        f'{predicate!r} plans as {details}, not a (kind, created_at) range seek. '
-        'A SCAN here is the 22 s single-statement lock hold measured on the live '
-        'journal, which the between-batches deadline cannot interrupt.'
+    assert _KIND_TIME_RANGE_SEEK in details, (
+        f'the {horizon} batch plans as {details}. Unless the (kind, created_at) '
+        'seek is bounded on both sides, a batch re-walks every row an earlier batch '
+        'passed over, which measured 9.4 s cold in one statement on the live journal.'
+    )
+    assert not any('TEMP B-TREE' in detail for detail in details), (
+        f'the {horizon} batch sorts instead of reading created_at order off the index'
     )
 
 
@@ -102,6 +97,81 @@ async def test_pass_takes_its_row_budget_from_the_config(journal):
     assert len(_surviving_ids(journal)) == 1
 
 
+@pytest.mark.asyncio
+async def test_the_next_pass_resumes_a_backlog_the_row_budget_left(journal):
+    config = WriteJournalConfig(
+        read_retention_days=10, prune_max_rows_per_run=2, prune_batch_size=1
+    )
+    for _ in range(4):
+        await _seed(journal, operation='get_task', kind='read', age_days=20)
+
+    assert await prune_write_ops_pass(journal, config) == 2
+    assert await prune_write_ops_pass(journal, config) == 2
+    assert not _surviving_ids(journal), 'a pass resumed past rows its budget left behind'
+
+
+@pytest.mark.asyncio
+async def test_each_horizon_resumes_where_the_last_pass_drained_it(journal):
+    config = WriteJournalConfig(read_retention_days=10)
+    await _seed(journal, operation='get_task', kind='read', age_days=20)
+    assert await prune_write_ops_pass(journal, config) == 1
+
+    behind = await _seed(journal, operation='get_task', kind='read', age_days=30)
+
+    assert await prune_write_ops_pass(journal, config) == 0, (
+        'the second pass re-walked the range the first one drained; on the live '
+        'journal that range holds every kept search row, 9.4 s cold in one statement'
+    )
+    assert behind in _surviving_ids(journal)
+
+    restarted = WriteJournal(journal.data_dir)
+    await restarted.initialize()
+    try:
+        assert await prune_write_ops_pass(restarted, config) == 1, (
+            'a restarted journal must walk each horizon once from its oldest row'
+        )
+    finally:
+        await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_a_pass_without_the_kind_time_index_fails_loudly_instead_of_scanning(
+    journal, caplog
+):
+    aged = await _seed(journal, operation='get_task', kind='read', age_days=60)
+    with contextlib.closing(sqlite3.connect(journal.db_path)) as conn:
+        conn.execute('DROP INDEX idx_wo_kind_time')
+
+    with caplog.at_level(logging.ERROR, logger=write_journal.__name__):
+        deleted = await prune_write_ops_pass(journal, WriteJournalConfig())
+
+    assert deleted == 0 and aged in _surviving_ids(journal), (
+        'the prune deleted without idx_wo_kind_time, so it scanned the table'
+    )
+    assert any(
+        record.levelno == logging.ERROR and 'idx_wo_kind_time' in record.getMessage()
+        for record in caplog.records
+    ), 'the missing index must be named at ERROR'
+
+
+@pytest.mark.asyncio
+async def test_a_search_is_journalled_as_a_read_whatever_kind_it_is_given(journal, caplog):
+    config = WriteJournalConfig(read_retention_days=10, search_retention_days=15)
+
+    with caplog.at_level(logging.WARNING, logger=write_journal.__name__):
+        mislabelled = await _seed(journal, operation='search', kind='write', age_days=20)
+
+    assert await prune_write_ops_pass(journal, config) == 1, (
+        'a search journalled as kind=write escaped the 15-day search horizon and '
+        'would be kept until the 730-day write horizon'
+    )
+    assert mislabelled not in _surviving_ids(journal)
+    assert any(
+        mislabelled in record.getMessage() and "kind='write'" in record.getMessage()
+        for record in caplog.records
+    ), 'the override must name the write_op and the kind it was given'
+
+
 class _RecordingJournal(WriteJournal):
     """Records each prune pass's bounds instead of touching a database."""
 
@@ -143,7 +213,8 @@ class _RecordingJournal(WriteJournal):
 
 async def _cancel(task: asyncio.Task) -> None:
     task.cancel()
-    await task
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
 
 
 @pytest.mark.asyncio
@@ -160,7 +231,7 @@ async def test_loop_sleeps_before_its_first_pass(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_loop_runs_a_pass_per_interval_and_cancels_cleanly(tmp_path):
+async def test_loop_runs_a_pass_per_interval_until_cancelled(tmp_path):
     fake = _RecordingJournal(tmp_path)
     config = WriteJournalConfig(prune_interval_seconds=0.01)
     task = asyncio.create_task(run_periodic_write_ops_prune(fake, config))
@@ -168,7 +239,7 @@ async def test_loop_runs_a_pass_per_interval_and_cancels_cleanly(tmp_path):
     await asyncio.wait_for(fake.wait_for_passes(2), timeout=2.0)
     await _cancel(task)
 
-    assert task.done() and not task.cancelled(), 'a cancelled loop must return normally'
+    assert task.cancelled(), 'the loop must end cancelled, not swallow the cancel'
     expected = {
         'read_older_than_days': config.read_retention_days,
         'search_older_than_days': config.search_retention_days,
