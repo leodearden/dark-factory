@@ -27,8 +27,6 @@ from orchestrator.evals.measurement import (
 )
 from orchestrator.evals.results import EvalResult
 
-pytestmark = pytest.mark.asyncio
-
 _SYNTHESIS = {
     'overall_winner': 'A',
     'executive_summary': 'EXECUTIVE_TEXT',
@@ -98,6 +96,7 @@ def _assessment_for(report: ComparisonReport, task_id: str) -> TaskAssessment:
     return next(a for a in report.assessments if a.task_id == task_id)
 
 
+@pytest.mark.asyncio
 async def test_an_unparseable_assessment_is_unmeasured_and_counted_beside_wins_and_ties(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -120,6 +119,7 @@ async def test_an_unparseable_assessment_is_unmeasured_and_counted_beside_wins_a
     _assessment('C'),
     {k: v for k, v in _assessment('A').items() if k != 'confidence'},
 ], ids=['no-winner', 'unknown-winner', 'no-confidence'])
+@pytest.mark.asyncio
 async def test_an_assessment_without_a_valid_winner_is_unparseable(
     payload: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -134,6 +134,7 @@ async def test_an_assessment_without_a_valid_winner_is_unparseable(
     assert (report.wins_a, report.wins_b, report.ties, report.unmeasured) == (0, 0, 0, 1)
 
 
+@pytest.mark.asyncio
 async def test_the_synthesizer_sees_only_measured_assessments(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -147,6 +148,7 @@ async def test_the_synthesizer_sees_only_measured_assessments(
     assert 'Wins: A=1, B=0, Ties=0' in prompt
 
 
+@pytest.mark.asyncio
 async def test_an_unparseable_synthesis_is_unmeasured_not_an_overall_tie(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -159,6 +161,7 @@ async def test_an_unparseable_synthesis_is_unmeasured_not_an_overall_tie(
     assert report.synthesis.cause is UnmeasuredCause.UNPARSEABLE
 
 
+@pytest.mark.asyncio
 async def test_a_measured_synthesis_is_carried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -169,6 +172,7 @@ async def test_a_measured_synthesis_is_carried(
     assert report.synthesis == Synthesis(**_SYNTHESIS)
 
 
+@pytest.mark.asyncio
 async def test_no_measured_assessment_means_no_synthesis_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -195,9 +199,9 @@ def test_a_measured_assessment_must_name_its_winner_and_an_unmeasured_one_must_n
     assert 'cap_hit' in str(winner_and_unmeasured.value)
     assert 'winner=None' in str(neither.value)
     assert 'unmeasured=None' in str(neither.value)
-    measured = TaskAssessment('t', 't', winner='tie', confidence=0.5, summary='s')
+    measured: Any = TaskAssessment('t', 't', winner='tie', confidence=0.5, summary='s')
     with pytest.raises(dataclasses.FrozenInstanceError):
-        measured.winner = 'A'  # type: ignore[misc]
+        measured.winner = 'A'
 
 
 def _heading(markdown: str, task_id: str) -> str:
@@ -210,6 +214,7 @@ def _overview_row(markdown: str, label: str) -> list[str]:
     )
 
 
+@pytest.mark.asyncio
 async def test_markdown_counts_and_heads_an_unmeasured_assessment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -225,6 +230,7 @@ async def test_markdown_counts_and_heads_an_unmeasured_assessment(
     assert 'Winner:' in _heading(markdown, 't1')
 
 
+@pytest.mark.asyncio
 async def test_markdown_states_an_unmeasured_synthesis(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -238,6 +244,7 @@ async def test_markdown_states_an_unmeasured_synthesis(
     assert '## Executive Summary' not in markdown
 
 
+@pytest.mark.asyncio
 async def test_markdown_renders_a_measured_synthesis(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
