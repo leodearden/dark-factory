@@ -26,9 +26,11 @@ import json
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, NamedTuple
 
 import pytest
+from _ast_guard import imported_names_from, parse_python_module
 from shared.project_layout import escalation_queue_dir
 
 from fused_memory.middleware import _folded_escalation
@@ -721,6 +723,33 @@ _MIGRATED_FILERS: tuple[_Filer, ...] = (
 )
 
 
+#: Test-file-relative, so the census always reads the tree this test lives in,
+#: never an inherited venv's editable install of some other checkout.
+_SRC_ROOT = Path(__file__).parents[1] / 'src' / 'fused_memory'
+
+
+def _modules_that_call_the_helper() -> set[str]:
+    """The dotted name of every production module that imports the helper.
+
+    Over PARSED imports, so prose that merely names the helper cannot count.
+    Importing the `_folded_escalation` module itself counts too, so a caller
+    cannot leave the table by spelling the call `_folded_escalation.file_...`.
+    """
+    found: set[str] = set()
+    for path in sorted(_SRC_ROOT.rglob('*.py')):
+        tree = parse_python_module(path)
+        imports_the_helper = 'file_folded_escalation' in imported_names_from(
+            tree, 'fused_memory.middleware._folded_escalation',
+        )
+        imports_its_module = '_folded_escalation' in imported_names_from(
+            tree, 'fused_memory.middleware',
+        )
+        if imports_the_helper or imports_its_module:
+            dotted = path.relative_to(_SRC_ROOT.parent).with_suffix('')
+            found.add(dotted.as_posix().replace('/', '.'))
+    return found
+
+
 def _forwarded_kwargs(filer: _Filer, tmp_path, monkeypatch) -> dict:
     """Fire *filer* against a spy and return what it forwarded to the helper."""
     module = importlib.import_module(filer.module)
@@ -782,6 +811,24 @@ class TestEveryFilerPinsItsForwardedLevels:
             'has no steward and waits for the orphan-L0 reaper; an L1 record '
             'reaches the escalation watcher at once. If the change is '
             'deliberate, edit the table and say why in the row.'
+        )
+
+    def test_the_table_covers_every_module_that_calls_the_helper(self):
+        """Anti-vacuity: a parametrized fence passes trivially for a filer that
+        is simply absent from the table, so the table is checked against the
+        source tree rather than against a second hand-written copy of itself."""
+        found = _modules_that_call_the_helper()
+        assert 'fused_memory.server.write_triage' in found, (
+            f'the census found {sorted(found)!r}; it is reading the wrong tree '
+            'or the import shape changed, and would pass vacuously'
+        )
+
+        tabled = {f.module for f in _MIGRATED_FILERS}
+        assert found == tabled, (
+            f'missing from _MIGRATED_FILERS: {sorted(found - tabled)!r}; in the '
+            f'table but no longer calling the helper: {sorted(tabled - found)!r}. '
+            'A new pending-anchor-fold filer must get a row, so the levels it '
+            'forwards are fenced like every other filer\'s.'
         )
 
     def test_the_table_covers_every_folded_filer_and_names_its_exceptions(self):
