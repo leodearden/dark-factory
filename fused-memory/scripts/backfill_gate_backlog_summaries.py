@@ -84,8 +84,9 @@ script (task 4314).
 5. Re-run the dry run once more.  ``legacy_total`` must now be 0 — the
    idempotence check.
 
-Exit codes: ``0`` success, ``1`` unusable ``--queue-dir``, ``2`` argparse usage
-error, ``3`` at least one record skipped for fingerprint drift.
+Exit codes: ``0`` success, ``1`` unusable ``--queue-dir`` or a failed stdout,
+``2`` argparse usage error, ``3`` at least one record skipped for fingerprint
+drift.
 
 The rewrite is safe to run while reconciliation is live: every record is
 mutated under its own ``escalation_id_lock``, so a concurrent Stage-1 fold is
@@ -125,7 +126,6 @@ Safety properties
 
 from __future__ import annotations
 
-import argparse
 import copy
 import json
 import logging
@@ -138,7 +138,7 @@ from pathlib import Path
 from escalation.dedupe import gate_backlog_fingerprint_key
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue, escalation_id_lock
-from shared.cli_boundary import reset_stdout_failure_state
+from shared.cli_boundary import LoudArgumentParser, reset_stdout_failure_state, run_cli
 
 from fused_memory.reconciliation.stage1_stall_detector import (
     STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS,
@@ -614,7 +614,10 @@ EXIT_BAD_QUEUE_DIR = 1
 EXIT_FINGERPRINT_DRIFT = 3
 """``main`` exit codes.  ``2`` is deliberately unused: argparse already exits 2
 on a usage error, and an operator reading ``$?`` must be able to tell a
-mistyped flag from a record whose fold identity would move."""
+mistyped flag from a record whose fold identity would move.
+
+Exit 1 is also what a failed stdout exits with: ``EXIT_BAD_QUEUE_DIR`` agrees
+with ``shared.cli_boundary.EXIT_STDOUT_FAILED``."""
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -640,7 +643,7 @@ def main(argv: list[str] | None = None) -> int:
     reset_stdout_failure_state(detail=_applied_rewrites)
     logging.basicConfig(level=logging.INFO, format='%(levelname)s %(name)s %(message)s')
 
-    parser = argparse.ArgumentParser(
+    parser = LoudArgumentParser(
         description=(
             'Backfill: re-anchor legacy (pre-3520) reconciliation_stale_gate_backlog '
             'summaries onto the absolute `since <ISO>` form.'
@@ -688,4 +691,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(run_cli(main))

@@ -72,6 +72,7 @@ _SRC = Path(__file__).resolve().parent.parent / 'src'
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from shared.cli_boundary import LoudArgumentParser, run_cli  # noqa: E402
 from shared.task_statuses import TaskStatus  # noqa: E402
 
 from fused_memory.backends.graphiti_client import PagedRead  # noqa: E402
@@ -487,8 +488,8 @@ def _parse_project(value: str) -> tuple[str, str]:
     return graph, root
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+def _build_parser() -> LoudArgumentParser:
+    parser = LoudArgumentParser(
         description='Measure the stale status-snapshot sweep over the live corpus (read-only).',
     )
     parser.add_argument(
@@ -583,4 +584,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(run_cli(main))

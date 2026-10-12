@@ -40,12 +40,13 @@ Usage
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import json
 import logging
 import sys
 from typing import Any
+
+from shared.cli_boundary import LoudArgumentParser, run_cli
 
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.utils.validation import is_path_shaped_name
@@ -254,7 +255,7 @@ def main() -> int:
         level=logging.INFO,
         format='%(asctime)s %(name)s %(levelname)s %(message)s',
     )
-    parser = argparse.ArgumentParser(
+    parser = LoudArgumentParser(
         description=(
             'Read-only diagnostic: reproduce/scope cross-graph node '
             'duplication and GRAPH.LIST normalization collisions.'
@@ -302,4 +303,4 @@ def main() -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(run_cli(main))
