@@ -1148,19 +1148,20 @@ class WriteJournal:
 
         Same fire-and-forget contract as ``prune_mem0_intents`` — logs loudly,
         never raises, returns the count deleted, returns 0 when uninitialised.
-        Intended to run once at startup.
+        Runs at startup and every ``prune_interval_seconds``
+        (``services/write_ops_retention.py``).
 
         EVERY BOUND IS REQUIRED, with no default here. The six numbers have a
         single home — ``config/schema.py::WriteJournalConfig`` — and the sole
-        production caller (``server/main.py``) already passes all six from it.
-        A second copy as signature defaults would be a copy nothing reads, kept
-        equal to the first only by a drift-guard test; requiring the arguments
-        deletes the copy instead of policing it.
+        production caller, ``services/write_ops_retention.py::prune_write_ops_pass``,
+        passes all six from it. A second copy as signature defaults would be a
+        copy nothing reads, kept equal to the first only by a drift-guard test;
+        requiring the arguments deletes the copy instead of policing it.
 
         THREE HORIZONS, because the rows are not interchangeable. Measured
         2026-09-11 over a never-pruned 157-day span: non-search READS are
         34,669,782 rows (97.9% of the table — ``get_task``, ``get_tasks``,
-        ``get_statuses``, ``get_external_statuses``, ~220,800/day) and have no
+        ``get_statuses``, ``get_external_statuses``) and have no
         downstream consumer, so 30 days is generous incident-forensics headroom.
         SEARCH reads are the opposite in both directions: only 481,447 rows
         (1.36%, ~3,066/day), and they are the SOLE data source for leaf eta's
@@ -1182,30 +1183,23 @@ class WriteJournal:
         errors. A multi-minute startup DELETE would therefore corrupt the very
         telemetry it is pruning. Each batch is its own ``write()`` unit, so both
         the per-connection lock and SQLite's write lock are released between
-        batches and serving writes interleave, and the sweep stops on
-        whichever bound comes first. ``max_rows`` is only a PROXY for the risk;
-        ``max_seconds`` bounds it directly, because rows-per-second is not
-        knowable in advance — it depends on page-cache warmth and on six index
-        b-trees per delete. The deadline is checked BETWEEN batches, never
+        batches and serving writes interleave. That matters most for the
+        periodic pass, which runs while serving: a journalled tool call waits on
+        the connection lock for at most one batch, never a whole pass. The sweep
+        stops on whichever bound comes first. ``max_rows`` is only a PROXY for
+        the risk; ``max_seconds`` bounds it directly, because rows-per-second is
+        not knowable in advance — it depends on page-cache warmth and on six
+        index b-trees per delete. The deadline is checked BETWEEN batches, never
         mid-batch.
 
-        WHAT "DRAINS OVER SUCCESSIVE RESTARTS" REQUIRES, stated so the claim is
-        checkable rather than hopeful. Non-search reads accrue at ~220,800/day,
-        so a sweep only makes net progress if it removes more than
-        220,800/(redeploys per day) rows — at an ASSUMED 1-3 fleet redeploys per
-        day that is ~74,000-220,800 rows per run, i.e. ~2,500-7,400 rows/sec
-        against the stock 30 s deadline. The accrual rate is measured; the
-        redeploy cadence is an estimate, not a pinned figure (see OPERATIONS.md
-        §"Fleet redeploy & watchdog"), so treat the required rate as an order of
-        magnitude and the LOGGED rate below as the real answer. Below that the backlog never clears
-        while the WARNING fires forever and reads as normal, so the achieved
-        rate is MEASURED and logged (rows and rows/sec) on every partial sweep
-        rather than assumed. If the first production run comes in under it, the
-        two ways out are raising ``prune_max_seconds`` (a config leaf, restart
-        to apply) for the drain phase, or a one-off operator-run bulk delete
-        against a stopped server, where no startup grace applies. A first run
-        against the current backlog legitimately needs many restarts either way,
-        which the WARNING discloses rather than hides.
+        WHAT NET PROGRESS REQUIRES, stated so the claim is checkable rather than
+        hopeful: rows removed per day (passes per day x rows per pass) must
+        exceed the non-search reads inserted per day. Below that the backlog
+        never clears while the WARNING fires on every pass and reads as normal.
+        The dated measurement of both sides, and the interval chosen from it,
+        live in the ``write_journal`` block of ``fused-memory/config/config.yaml``
+        (2026-10-11); the rows and rows/sec logged on every partial pass are the
+        live answer.
 
         ``terminal_status='dead'`` rows are NOT exempted, unlike the dead-letters
         ``prune_mem0_intents`` deliberately preserves: a dead ``write_ops`` row
@@ -1213,14 +1207,13 @@ class WriteJournal:
         age is the only thing that should decide its fate.
 
         THIS BOUNDS GROWTH; IT DOES NOT RECLAIM DISK. Measured on the live
-        journal: ``PRAGMA auto_vacuum`` is 0 (NONE) and ``freelist_count`` is 0.
-        With auto-vacuum off a DELETE returns pages to SQLite's freelist for
-        REUSE by later inserts; it does not return them to the filesystem, so
-        ``ls -lh`` still reports ~16 GB after a fully successful prune — and the
-        freed pages are exactly what absorbs the new per-result search detail in
-        place. Reclaiming the space needs an offline ``VACUUM``, a full-file
-        rewrite requiring another ~16 GB of scratch, which is categorically not
-        a startup operation.
+        journal: ``PRAGMA auto_vacuum`` is 0 (NONE). With auto-vacuum off a
+        DELETE returns pages to SQLite's freelist for REUSE by later inserts; it
+        does not return them to the filesystem, so ``ls -lh`` reports the same
+        size after a fully successful prune — and the freed pages are exactly
+        what absorbs the new per-result search detail in place. Reclaiming the
+        space needs an offline ``VACUUM``, a full-file rewrite requiring as much
+        scratch again, which is categorically not a startup operation.
         """
         # All three horizons range-seek idx_wo_kind_time (kind, created_at);
         # INDEXED BY pins it, so a missing index errors instead of scanning.
@@ -1280,18 +1273,14 @@ class WriteJournal:
                     write_older_than_days, by_horizon.get('write', 0),
                 )
             if halted:
-                # The achieved rate is the ONLY thing that says whether "drains
-                # over successive restarts" is true on this disk: reads accrue
-                # at ~220,800/day, so a sweep sustaining less than
-                # ~2,500-7,400 rows/sec (at 1-3 redeploys/day) never catches up
-                # and this WARNING would otherwise repeat forever looking normal.
+                # The achieved rate is the ONLY thing that says whether the
+                # passes keep up on this disk; see the net-progress rule above.
                 elapsed = max(_monotonic() - (deadline - max_seconds), 1e-9)
                 logger.warning(
                     'write_ops prune stopped early on the %s after %d rows in %.1fs '
-                    '(%.0f rows/sec; ~2500-7400 rows/sec is needed to beat the '
-                    '~220,800 reads/day accrual at 1-3 redeploys/day); horizons '
-                    'still holding a backlog: %s. The table drains over successive '
-                    'restarts only while that rate holds.',
+                    '(%.0f rows/sec); horizons still holding a backlog: %s. Compare '
+                    'that rate with the sizing basis in the write_journal block of '
+                    'fused-memory/config/config.yaml.',
                     halted, total, elapsed, total / elapsed, ', '.join(backlog),
                 )
             return total

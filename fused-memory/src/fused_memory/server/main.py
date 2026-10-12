@@ -614,9 +614,10 @@ async def run_server():
     # watchdog's 120 s startup grace (STARTUP_GRACE_SECS in
     # scripts/orchestrator-watchdog.py) while silently dropping journal rows —
     # log_write_op swallows its own errors and busy_timeout is only 5000 ms — so
-    # it would corrupt the very telemetry it is pruning. A first run against the
-    # current backlog will legitimately need many restarts to drain, which the
-    # prune discloses at WARNING rather than hiding. Fire-and-forget.
+    # it would corrupt the very telemetry it is pruning. The periodic loop
+    # started below now carries the drain, not successive restarts; this pass
+    # catches up after downtime, and every partial pass discloses its backlog at
+    # WARNING. Fire-and-forget.
     _write_ops_pruned = await prune_write_ops_pass(write_journal, config.write_journal)
     if _write_ops_pruned:
         logger.info(
