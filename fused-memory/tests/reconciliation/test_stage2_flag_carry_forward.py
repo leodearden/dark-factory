@@ -10,13 +10,22 @@ import json
 import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
 
-from fused_memory.models.reconciliation import StageAgentOutcome, StageId, StageReport
+from fused_memory.config.schema import ReconciliationConfig
+from fused_memory.models.reconciliation import (
+    StageAgentOutcome,
+    StageId,
+    StageReport,
+    Watermark,
+)
+from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
+from fused_memory.reconciliation.cli_stage_runner import StageResult
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
+from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
 from fused_memory.reconciliation.summary_pool import (
     trailing_incomplete_agent_run_ids,
     write_cycle_summary,
@@ -181,3 +190,149 @@ class TestTrailingIncompleteAgentRunIds:
     @pytest.mark.asyncio
     async def test_an_empty_ledger_owes_nothing(self, ledger_store):
         assert await _streak(ledger_store) == frozenset()
+
+
+_PROJECT = 'reify'
+_T_RUN = datetime(2026, 10, 12, 10, 0, 0, tzinfo=UTC)
+_BEFORE_RUN = (_T0 + timedelta(minutes=30)).isoformat()
+_INSIDE_RUN_WINDOW = (_T_RUN + timedelta(seconds=1)).isoformat()
+
+
+def _marker(marker_id: str, content: str, run_id: object, *, created_at: str = _BEFORE_RUN):
+    return SimpleNamespace(
+        id=marker_id,
+        content=content,
+        metadata={
+            'flag_for_stage2': True,
+            'task_id': '7',
+            'flag_type': 'stale_status',
+            'run_id': run_id,
+        },
+        created_at=created_at,
+    )
+
+
+class TestStage2CarriesForwardMarkers:
+    @pytest.fixture
+    def memory_service(self, ledger_store):
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 0
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        memory_service.add_memory.return_value = {'memory_ids': []}
+        memory_service.recon_ledger = ledger_store
+        return memory_service
+
+    async def _seed(self, ledger_store, run_id: str, outcome: StageAgentOutcome, *, minute: int):
+        await _seed_row(ledger_store, run_id, outcome, minute=minute, project_id=_PROJECT)
+
+    async def _run(self, memory_service, markers: list) -> tuple[StageReport, str]:
+        memory_service.search.return_value = markers
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.return_value = {'tasks': []}
+        journal = AsyncMock()
+        journal.get_run = AsyncMock(return_value=SimpleNamespace(started_at=_T_RUN))
+        stage = TaskKnowledgeSync(
+            StageId.task_knowledge_sync,
+            memory_service,
+            taskmaster,
+            journal,
+            ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test'),
+            scope=ProjectScope(ProjectId(_PROJECT), ProjectRoot('/tmp/test')),
+        )
+        cli = AsyncMock(return_value=StageResult(
+            success=True,
+            report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
+            llm_calls=1, tokens_used=0, cost_usd=0.0,
+            model='test-model',
+        ))
+        with patch('fused_memory.reconciliation.stages.base.run_stage_via_cli', new=cli):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id=_PROJECT),
+                prior_reports=[], run_id='run-now',
+            )
+        return report, cli.call_args.kwargs['payload']
+
+    @pytest.mark.asyncio
+    async def test_marker_from_a_run_whose_agent_died_is_carried_forward(
+        self, memory_service, ledger_store,
+    ):
+        await self._seed(ledger_store, 'run-ok', StageAgentOutcome.completed, minute=0)
+        await self._seed(ledger_store, 'run-dead', StageAgentOutcome.zero_output_timeout, minute=1)
+
+        report, payload = await self._run(memory_service, [
+            _marker('m-dead', 'CARRIED-FLAG-from-run-dead', 'run-dead'),
+        ])
+
+        assert 'CARRIED-FLAG-from-run-dead' in payload
+        assert report.stats['stage2_markers_carried_forward'] == 1
+        row = await ledger_store.get_by_identity(
+            _PROJECT, 'cycle_summary', flag_type=_STAGE2, run_id='run-now',
+        )
+        assert row is not None
+        assert json.loads(row.payload_json)['stats']['stage2_markers_carried_forward'] == 1
+
+    @pytest.mark.asyncio
+    async def test_marker_from_a_completed_run_is_not_carried(self, memory_service, ledger_store):
+        await self._seed(ledger_store, 'run-ok', StageAgentOutcome.completed, minute=0)
+
+        report, payload = await self._run(memory_service, [
+            _marker('m-ok', 'SETTLED-FLAG-from-run-ok', 'run-ok'),
+        ])
+
+        assert 'SETTLED-FLAG-from-run-ok' not in payload
+        assert 'stage2_markers_carried_forward' in report.stats
+        assert report.stats['stage2_markers_carried_forward'] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_later_completed_agent_stops_the_carry(self, memory_service, ledger_store):
+        await self._seed(ledger_store, 'run-dead', StageAgentOutcome.zero_output_timeout, minute=0)
+        await self._seed(ledger_store, 'run-later', StageAgentOutcome.completed, minute=1)
+
+        report, payload = await self._run(memory_service, [
+            _marker('m-dead', 'ALREADY-SHOWN-FLAG-from-run-dead', 'run-dead'),
+        ])
+
+        assert 'ALREADY-SHOWN-FLAG-from-run-dead' not in payload
+        assert report.stats['stage2_markers_carried_forward'] == 0
+
+    @pytest.mark.asyncio
+    async def test_marker_from_a_run_with_no_cycle_summary_is_not_carried(
+        self, memory_service, ledger_store,
+    ):
+        await self._seed(ledger_store, 'run-dead', StageAgentOutcome.zero_output_timeout, minute=0)
+
+        report, payload = await self._run(memory_service, [
+            _marker('m-ghost', 'UNATTRIBUTED-FLAG-from-run-ghost', 'run-ghost'),
+        ])
+
+        assert 'UNATTRIBUTED-FLAG-from-run-ghost' not in payload
+        assert report.stats['stage2_markers_carried_forward'] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_non_string_run_id_is_neither_carried_nor_fatal(
+        self, memory_service, ledger_store,
+    ):
+        await self._seed(ledger_store, 'run-dead', StageAgentOutcome.zero_output_timeout, minute=0)
+
+        report, payload = await self._run(memory_service, [
+            _marker('m-dead', 'CARRIED-FLAG-from-run-dead', 'run-dead'),
+            _marker('m-list', 'LIST-RUN-ID-FLAG', ['run-dead']),
+        ])
+
+        assert 'CARRIED-FLAG-from-run-dead' in payload
+        assert 'LIST-RUN-ID-FLAG' not in payload
+        assert report.stats['stage2_markers_carried_forward'] == 1
+
+    @pytest.mark.asyncio
+    async def test_an_in_window_marker_counts_once_as_rescued(self, memory_service, ledger_store):
+        await self._seed(ledger_store, 'run-dead', StageAgentOutcome.zero_output_timeout, minute=0)
+
+        report, payload = await self._run(memory_service, [
+            _marker(
+                'm-in-window', 'IN-WINDOW-FLAG', 'run-dead', created_at=_INSIDE_RUN_WINDOW,
+            ),
+        ])
+
+        assert 'IN-WINDOW-FLAG' in payload
+        assert report.stats['rescued_in_window_markers'] == 1
+        assert report.stats['stage2_markers_carried_forward'] == 0
