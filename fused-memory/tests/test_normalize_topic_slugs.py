@@ -190,6 +190,17 @@ class TestPlanRenames:
         assert renames == []
         assert _by_reason(skips, 'topic_unfoldable')[0]['topic'] == 42
 
+    def test_an_unfoldable_entry_names_the_value_type(self):
+        """In markdown, ``topic=42`` and ``topic='42'`` differ only by quote marks."""
+        _, skips = _mod.plan_renames(
+            [_rec('m1', '!!!'), _rec('m2', 42), _rec('m3', ['a'])],
+            project_id='dark_factory',
+        )
+        assert [
+            (s['memory_id'], s['topic'], s['topic_type'])
+            for s in _by_reason(skips, 'topic_unfoldable')
+        ] == [('m1', '!!!', 'str'), ('m2', 42, 'int'), ('m3', ['a'], 'list')]
+
     def test_many_records_sharing_one_legacy_slug_each_get_a_rename(self):
         """One legacy VALUE can sit on many records; each needs its own write.
 
@@ -494,6 +505,13 @@ class TestCollisionOutcomesFailTheRun:
         assert 'canonical_collision' in _mod.SKIP_BUCKETS
 
 
+class TestUnfoldableOutcomeFailsTheRun:
+    """An unfoldable value is hand work, so it exits 1 like a collision."""
+
+    def test_topic_unfoldable_is_an_error_outcome(self):
+        assert 'topic_unfoldable' in _mod.ERROR_OUTCOMES
+
+
 # ===========================================================================
 # enumerate_topic_bearing — the corpus boundary
 # ===========================================================================
@@ -662,6 +680,35 @@ class TestEnumerateTopicBearing:
         assert result['records'][0]['metadata'] == {
             'topic': 'legacy_topic', 'canonical': True,
         }
+
+    @pytest.mark.asyncio
+    async def test_a_present_topic_that_is_not_a_slug_string_is_retained(self):
+        """A present topic the slug rule rejects reaches the planner, whatever its type.
+
+        Dropping it here is how a non-str or empty topic vanished from the
+        report: the planner already files one as ``topic_unfoldable``, but
+        only if it is handed the record.
+        """
+        category = _mod.census_categories()[0]
+        backend = _backend({category: [
+            _rec('i1', 42),
+            _rec('l1', ['a', 'b'], canonical=True),
+            _rec('d1', {'k': 'v'}),
+            _rec('e1', ''),
+            _rec('ok', 'good-topic'),
+            _rec('none'),
+        ]})
+
+        result = await _mod.enumerate_topic_bearing(
+            _service_with(backend), 'dark_factory', categories=[category],
+        )
+
+        assert [(r['id'], r['metadata']['topic']) for r in result['records']] == [
+            ('i1', 42), ('l1', ['a', 'b']), ('d1', {'k': 'v'}), ('e1', ''),
+        ]
+        assert 'good-topic' in result['occupied_topics']
+        assert all(isinstance(topic, str) for topic in result['occupied_topics'])
+        assert result['canonical_ids_by_topic'] == {}
 
     @pytest.mark.asyncio
     async def test_each_cell_is_bracketed_by_a_count_before_and_after(self):
@@ -2564,6 +2611,38 @@ class TestMarkdownHidesNoSkipField:
             if key == 'reason' or value is None:
                 continue
             assert f'{key}={value!r}' in section, key
+
+
+class TestNonSlugTopicsReachTheReport:
+    """A list, int or empty topic is reported as unfoldable, never dropped."""
+
+    @pytest.mark.asyncio
+    async def test_a_non_slug_topic_is_listed_counted_and_fails_the_run(self):
+        service, _corpus = _run_service({'dark_factory': [
+            _crec('n1', ['a', 'b']),
+            _crec('n2', 42),
+            _crec('n3', ''),
+            _crec('m1', 'legacy_topic'),
+        ]})
+
+        report = await run_sweep(service, projects=('dark_factory',), apply=False)
+
+        unfoldable = report['skips']['topic_unfoldable']
+        assert [(e['memory_id'], e['topic_type']) for e in unfoldable] == [
+            ('n1', 'list'), ('n2', 'int'), ('n3', 'str'),
+        ]
+        rendered_json = json.loads(_mod.render_json(report))['skips']['topic_unfoldable']
+        assert [(e['topic'], e['topic_type']) for e in rendered_json] == [
+            (['a', 'b'], 'list'), (42, 'int'), ('', 'str'),
+        ]
+        section = _bucket_section(_mod.render_markdown(report), 'topic_unfoldable')
+        assert "memory_id='n1'" in section
+        assert "topic_type='list'" in section
+        assert 'topic=42' in section
+        assert report['candidate_count'] == 4
+        assert report['baseline_delta']['measured_by_project'] == {'dark_factory': 4}
+        assert report['outcomes']['topic_unfoldable'] == 3
+        assert resolve_exit(report) == 1
 
 
 class TestReportRenderAndCli:
