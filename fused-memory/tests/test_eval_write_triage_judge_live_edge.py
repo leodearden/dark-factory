@@ -1,9 +1,9 @@
-"""Tests for eval_write_triage_judge.py's live edge and CLI.
+"""Tests for eval_write_triage_live_judge.py, and for the CLI driven end to end.
 
-The script's pure core is `test_eval_write_triage_judge.py`'s subject. This
-module is the other partition: `build_judge_fn` and `build_retrieved_judge_fn`
-driving the SHIPPED `judge_write` -> `_call_llm` -> openai SDK chain, and
-`main()` driven through `sys.argv`. The SDK is a fake async-context client
+The subject is the live edge: `build_judge_fn` and `build_retrieved_judge_fn`
+in eval_write_triage_live_judge.py driving the SHIPPED `judge_write` ->
+`_call_llm` -> openai SDK chain, plus eval_write_triage_judge.py's `main()`
+driven through `sys.argv`. The SDK is a fake async-context client
 patched in at `openai.AsyncOpenAI`, as `tests/server/test_write_triage_judge.py`
 does, and every CLI run is a `--dry-run` on a synthetic fixture, so nothing
 here needs a key, a network or Qdrant.
@@ -63,6 +63,12 @@ def _mod() -> types.ModuleType:
 
 def _cases_mod() -> types.ModuleType:
     return load_script_module(SCRIPT_PATH.parent / 'eval_write_triage_cases.py', 'eval_write_triage_cases')
+
+
+def _live_judge() -> types.ModuleType:
+    return load_script_module(
+        SCRIPT_PATH.parent / 'eval_write_triage_live_judge.py', 'eval_write_triage_live_judge',
+    )
 
 
 def _rec(memory_id: str, cluster_id: str, label: str) -> dict:
@@ -151,7 +157,7 @@ class TestTheSeededLiveEdge:
         client = _openai('amends')
         with patch('openai.AsyncOpenAI', return_value=client):
             _mod().run_judge_eval(
-                plan=plan, judge_fn=_mod().build_judge_fn(_judge_config()),
+                plan=plan, judge_fn=_live_judge().build_judge_fn(_judge_config()),
                 report_path=tmp_path / 'r.json', provenance={},
             )
         create = client.responses.create
@@ -162,7 +168,7 @@ class TestTheSeededLiveEdge:
         plan = self._plan()
         case = plan.cases[0]
         with patch('openai.AsyncOpenAI', return_value=_openai('amends')):
-            answer = _mod().build_judge_fn(_judge_config())(case, _resolved(plan, 0))
+            answer = _live_judge().build_judge_fn(_judge_config())(case, _resolved(plan, 0))
         assert (answer.outcome, answer.verdict) == (JUDGE_VERDICTS['amends'],) * 2
         assert answer.candidate_id == case['candidates'][0]
 
@@ -170,7 +176,7 @@ class TestTheSeededLiveEdge:
         plan = self._plan()
         case = plan.cases[0]
         with patch('openai.AsyncOpenAI', return_value=_openai('restates')):
-            answer = _mod().build_judge_fn(_judge_config())(case, _resolved(plan, 0))
+            answer = _live_judge().build_judge_fn(_judge_config())(case, _resolved(plan, 0))
         assert answer.usage == _USAGE_ROW
 
     def test_a_run_with_no_reported_usage_is_unpriced(self) -> None:
@@ -178,7 +184,7 @@ class TestTheSeededLiveEdge:
         plan = self._plan()
         case = plan.cases[0]
         with patch('openai.AsyncOpenAI', return_value=_openai('restates', billed=None)):
-            answer = _mod().build_judge_fn(_judge_config())(case, _resolved(plan, 0))
+            answer = _live_judge().build_judge_fn(_judge_config())(case, _resolved(plan, 0))
         assert answer.usage is None
 
 
@@ -237,7 +243,7 @@ class TestTheDefaultModelsSeededVerdictsAreUnchanged:
         clients: dict[str, MagicMock] = {}
         for arm, config in (('responses', _judge_config()), ('chat', chat_config)):
             client = _answering_both_apis()
-            judge_fn = mod.build_judge_fn(config)
+            judge_fn = _live_judge().build_judge_fn(config)
             with patch('openai.AsyncOpenAI', return_value=client):
                 answers = [
                     judge_fn(case, _resolved(plan, index))
@@ -322,7 +328,7 @@ class TestTheRetrievedLiveEdge:
         assert case['band'] == band, 'precondition: the shipped bands routed it'
         client = _openai('amends')
         with patch('openai.AsyncOpenAI', return_value=client):
-            answer = _mod().build_retrieved_judge_fn(_judge_config())(case, candidates)
+            answer = _live_judge().build_retrieved_judge_fn(_judge_config())(case, candidates)
         assert (answer.outcome, answer.verdict) == (band, None)
         assert answer.candidate_id is None
         client.responses.create.assert_not_awaited()
@@ -332,7 +338,7 @@ class TestTheRetrievedLiveEdge:
         assert case['band'] == OUTCOME_JUDGE, 'precondition: the shipped bands routed it'
         client = _openai('amends')
         with patch('openai.AsyncOpenAI', return_value=client):
-            answer = _mod().build_retrieved_judge_fn(_judge_config())(case, candidates)
+            answer = _live_judge().build_retrieved_judge_fn(_judge_config())(case, candidates)
         assert client.responses.create.await_count == 1
         assert (answer.outcome, answer.verdict) == (JUDGE_VERDICTS['amends'],) * 2
 
@@ -345,14 +351,14 @@ class TestTheRetrievedLiveEdge:
         assert case['band'] == OUTCOME_JUDGE, 'precondition: the shipped bands routed it'
         assert case['candidates'] == ['canon', 'other'], 'precondition: the retrieval order'
         with patch('openai.AsyncOpenAI', return_value=_openai('amends', named=1)):
-            answer = _mod().build_retrieved_judge_fn(_judge_config())(case, _resolved(plan, 0))
+            answer = _live_judge().build_retrieved_judge_fn(_judge_config())(case, _resolved(plan, 0))
         assert (answer.outcome, answer.candidate_id) == (OUTCOME_AMENDED, 'other')
 
     def test_a_distinct_verdict_names_no_candidate(self) -> None:
         case, candidates = self._case(0.7)
         assert case['band'] == OUTCOME_JUDGE, 'precondition: the shipped bands routed it'
         with patch('openai.AsyncOpenAI', return_value=_openai('distinct')):
-            answer = _mod().build_retrieved_judge_fn(_judge_config())(case, candidates)
+            answer = _live_judge().build_retrieved_judge_fn(_judge_config())(case, candidates)
         assert (answer.outcome, answer.candidate_id) == (OUTCOME_STORED, None)
 
 
@@ -386,7 +392,7 @@ class TestEachPromptRendersItsOwnRetrieval:
         client = _openai('amends')
         with patch('openai.AsyncOpenAI', return_value=client):
             _mod().run_judge_eval(
-                plan=plan, judge_fn=_mod().build_retrieved_judge_fn(_judge_config()),
+                plan=plan, judge_fn=_live_judge().build_retrieved_judge_fn(_judge_config()),
                 report_path=tmp_path / 'r.json', provenance={},
             )
         assert _prompt_ids(client.responses.create) == [

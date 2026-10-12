@@ -77,6 +77,13 @@ def _cases_mod() -> types.ModuleType:
 
 
 @functools.cache
+def _live_judge() -> types.ModuleType:
+    return _load_module(
+        SCRIPT_PATH.parent / 'eval_write_triage_live_judge.py', 'eval_write_triage_live_judge',
+    )
+
+
+@functools.cache
 def _wording() -> types.ModuleType:
     return _load_module(
         SCRIPT_PATH.parent / 'write_triage_judge_wording.py', 'write_triage_judge_wording',
@@ -1498,7 +1505,7 @@ class TestApplyFieldChars:
         assert _mod().apply_field_chars(config, 0) == 0
         width = self._resolved(config)
         assert width >= len(text)
-        assert _mod()._elision_flags(text, slate, width) == (False, {'a': False})
+        assert _live_judge()._elision_flags(text, slate, width) == (False, {'a': False})
 
     def test_a_negative_width_is_refused_rather_than_recorded(self) -> None:
         """The resolver would fall back to the default, so provenance would lie."""
@@ -1517,7 +1524,7 @@ class TestApplyFieldChars:
     def test_the_elision_flags_follow_the_width(self) -> None:
         long_text = 'y' * 5_000
         slate = [types.SimpleNamespace(id='a', content=long_text)]
-        assert _mod()._elision_flags(long_text, slate, 1_200) == (True, {'a': True})
+        assert _live_judge()._elision_flags(long_text, slate, 1_200) == (True, {'a': True})
 
 
 # ---------------------------------------------------------------------------
@@ -1561,6 +1568,7 @@ class TestTheEvalScriptsImportOnlyDownward:
 
     LOADS = (
         ('eval_write_triage_scoring', {'calibrate_write_triage', 'eval_write_triage_scoring'}),
+        ('eval_write_triage_live_judge', {'eval_write_triage_live_judge'}),
         ('eval_write_triage_cases', {'eval_write_triage_cases'}),
     )
 
