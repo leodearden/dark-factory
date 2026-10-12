@@ -1442,7 +1442,13 @@ class _StubJournal:
 
 
 def _prior_run(
-    run_id, *, minutes_ago, candidates=(), unresolved=(), stats=None, stage_reports=None,
+    run_id,
+    *,
+    minutes_ago,
+    candidates=(),
+    unresolved=(),
+    stats=None,
+    stage_reports: dict[str, StageReport | dict] | None = None,
 ):
     """A REAL past ReconciliationRun whose Stage-1 report records one observation.
 
@@ -1942,7 +1948,7 @@ class TestUnresolvedCorroborationPersistence:
     @pytest.mark.asyncio
     async def test_passes_that_say_nothing_about_the_task_are_skipped(self, queue):
         """Interleaved passes need not re-flag the task, so they must not reset it."""
-        integrity_only = {
+        integrity_only: dict[str, StageReport | dict] = {
             StageId.integrity_check.value: StageReport(
                 stage=StageId.integrity_check,
                 started_at=datetime.now(UTC),
