@@ -503,9 +503,8 @@ async def _migrate_v1_to_v2(conn: aiosqlite.Connection) -> None:
     Adds whichever column is missing via
     ``shared/src/shared/sqlite_column_migration.py::add_column_if_missing``
     (idempotent -- a fresh DB created by ``_SCHEMA_SQL`` already has both, so
-    neither ALTER fires), then
-    stamps ``user_version = 2``. Reached only after the v0->v1 step, so
-    ``parent_id`` is already gone by the time this runs.
+    neither ALTER fires), then stamps ``user_version = 2``. Reached only after
+    the v0->v1 step, so ``parent_id`` is already gone by the time this runs.
 
     IMPORTANT: never short-circuit to "parent_id absent -> just stamp the
     version". ``_SCHEMA_SQL`` uses ``CREATE TABLE IF NOT EXISTS`` and never
