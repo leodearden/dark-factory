@@ -16,7 +16,10 @@ from typing import Any
 import aiosqlite
 import pytest
 
-from shared.sqlite_column_migration import add_column_if_missing
+from shared.sqlite_column_migration import (
+    add_column_if_missing,
+    add_column_if_missing_sync,
+)
 
 _BAD_IDENTIFIERS = ['t; DROP TABLE t', 'c d', '']
 
@@ -170,6 +173,124 @@ class TestAddColumnIfMissingAsync:
         async with aiosqlite.connect(path, factory=recording) as db:
             with pytest.raises(ValueError, match=r'^column\b') as excinfo:
                 await add_column_if_missing(db, 't', bad, 'TEXT')
+
+        assert repr(bad) in str(excinfo.value)
+        assert seen == []
+        assert _columns(path) == ['a']
+
+
+class TestAddColumnIfMissingSync:
+    def test_fresh_add_returns_true_and_applies_ddl_tail(self, tmp_path: Path) -> None:
+        path = tmp_path / 'fresh.db'
+        _create_table(path)
+
+        conn = sqlite3.connect(path)
+        try:
+            added = add_column_if_missing_sync(conn, 't', 'c', 'INTEGER NOT NULL DEFAULT 7')
+            conn.commit()
+            rows = conn.execute('SELECT c FROM t').fetchall()
+        finally:
+            conn.close()
+
+        assert added is True
+        assert _columns(path) == ['a', 'c']
+        assert rows == [(7,)]
+
+    def test_present_column_returns_false_without_alter(self, tmp_path: Path) -> None:
+        path = tmp_path / 'present.db'
+        _create_table(path)
+        conn = sqlite3.connect(path)
+        try:
+            add_column_if_missing_sync(conn, 't', 'c', 'TEXT')
+            conn.commit()
+        finally:
+            conn.close()
+
+        recording, seen = _recording_factory()
+        conn = sqlite3.connect(path, factory=recording)
+        try:
+            added = add_column_if_missing_sync(conn, 't', 'c', 'TEXT')
+        finally:
+            conn.close()
+
+        assert added is False
+        assert _columns(path).count('c') == 1
+        assert not [sql for sql in seen if sql.lstrip().upper().startswith('ALTER')]
+
+    def test_concurrent_adder_is_tolerated(self, tmp_path: Path) -> None:
+        path = tmp_path / 'race.db'
+        _create_table(path)
+        racing = _racing_factory(path, 'ALTER TABLE t ADD COLUMN c TEXT')
+
+        conn = sqlite3.connect(path, factory=racing)
+        try:
+            added = add_column_if_missing_sync(conn, 't', 'c', 'TEXT')
+        finally:
+            conn.close()
+
+        assert added is False
+        assert _columns(path).count('c') == 1
+
+    def test_missing_table_propagates(self, tmp_path: Path) -> None:
+        path = tmp_path / 'missing.db'
+        _create_table(path)
+
+        conn = sqlite3.connect(path)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match='no such table'):
+                add_column_if_missing_sync(conn, 'missing', 'c', 'TEXT')
+        finally:
+            conn.close()
+
+    def test_locked_database_propagates(self, tmp_path: Path) -> None:
+        path = tmp_path / 'locked.db'
+        _create_table(path)
+        release = _holding_write_lock(path)
+        try:
+            conn = sqlite3.connect(path, timeout=0)
+            try:
+                with pytest.raises(sqlite3.OperationalError, match='database is locked'):
+                    add_column_if_missing_sync(conn, 't', 'c', 'TEXT')
+            finally:
+                conn.close()
+        finally:
+            release()
+
+        assert 'c' not in _columns(path)
+
+    @pytest.mark.parametrize('bad', _BAD_IDENTIFIERS)
+    def test_non_identifier_table_is_rejected_before_any_sql(
+        self, tmp_path: Path, bad: str
+    ) -> None:
+        path = tmp_path / 'bad_table.db'
+        _create_table(path)
+        recording, seen = _recording_factory()
+
+        conn = sqlite3.connect(path, factory=recording)
+        try:
+            with pytest.raises(ValueError, match=r'^table\b') as excinfo:
+                add_column_if_missing_sync(conn, bad, 'c', 'TEXT')
+        finally:
+            conn.close()
+
+        assert repr(bad) in str(excinfo.value)
+        assert seen == []
+        assert _columns(path) == ['a']
+
+    @pytest.mark.parametrize('bad', _BAD_IDENTIFIERS)
+    def test_non_identifier_column_is_rejected_before_any_sql(
+        self, tmp_path: Path, bad: str
+    ) -> None:
+        path = tmp_path / 'bad_column.db'
+        _create_table(path)
+        recording, seen = _recording_factory()
+
+        conn = sqlite3.connect(path, factory=recording)
+        try:
+            with pytest.raises(ValueError, match=r'^column\b') as excinfo:
+                add_column_if_missing_sync(conn, 't', bad, 'TEXT')
+        finally:
+            conn.close()
 
         assert repr(bad) in str(excinfo.value)
         assert seen == []
