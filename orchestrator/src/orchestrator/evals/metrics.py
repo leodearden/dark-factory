@@ -414,9 +414,9 @@ def read_decline_artifacts(
     "not reported" from "not asked".
 
     PER-KIND DEGRADATION: an unreadable field costs exactly ONE field's
-    visibility, never the whole eval cell. Each reader is called inside its own ``try/except Exception`` that
-    logs a warning naming the kind, so a corrupt ``already_done.json`` still
-    lets the other four report. EVERY route to ``None``-for-an-unreadable-kind
+    visibility, never the whole eval cell. Each reader is called inside its own
+    ``try/except Exception`` that logs a warning naming the kind, so a corrupt
+    ``already_done.json`` still lets the other four report. EVERY route to ``None``-for-an-unreadable-kind
     logs — the raise, the missing reader, and a file whose JSON parses but is
     not an OBJECT (``[]``, ``"x"``, ``3``), which no ``except`` would catch.
     Only a kind the architect never reported goes quiet, because that ``None``

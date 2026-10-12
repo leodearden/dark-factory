@@ -445,8 +445,7 @@ class TestReadDeclineArtifacts:
             self, eval_artifacts, caplog):
         """A decline read must NEVER raise into ``run_architect_eval``'s
         ``finally``, where it would turn a scored cell into a lost one — so an
-        unreadable artifact costs exactly ONE kind's visibility (the
-        ``runner._verdict_cost_usd`` precedent), not the cell.
+        unreadable artifact costs exactly ONE kind's visibility, not the cell.
         """
         import logging
 

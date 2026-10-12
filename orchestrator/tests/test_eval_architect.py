@@ -498,10 +498,11 @@ def _scored_verdict(outcome) -> PlanQualityVerdict:
     return outcome.value
 
 
-def _assert_judge_unparseable(outcome) -> None:
+def _assert_judge_unparseable(outcome) -> Unmeasured:
     assert isinstance(outcome, Unmeasured), outcome
     assert outcome.stage is MeasurementStage.JUDGE
     assert outcome.cause is UnmeasuredCause.UNPARSEABLE
+    return outcome
 
 
 def _measurement_warnings(caplog) -> list[str]:
@@ -799,8 +800,8 @@ class TestJudgePlanQuality:
         # this — never a fabricated pool-best 1.0 laundered into a number a
         # downstream mean could be poisoned by. A nonsense answer is a CONTENT
         # failure, never the 3118 infra-refusal exclusion shape.
-        _assert_judge_unparseable(outcome)
-        assert repr(raw) in outcome.reason
+        unmeasured = _assert_judge_unparseable(outcome)
+        assert repr(raw) in unmeasured.reason
 
         warnings = _measurement_warnings(caplog)
         assert len(warnings) == 1
