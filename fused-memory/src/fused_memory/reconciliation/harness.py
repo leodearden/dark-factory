@@ -4930,6 +4930,13 @@ class ReconciliationHarness:
         count.  Counted per-run — duplicates within one run's items_flagged do not count
         twice.
 
+        A row its own run superseded (``_finding_is_superseded``) does not match: that
+        run retired the claim, so the row is a record of it, not an occurrence.  This is
+        the rule the forward feed (``_get_prior_s3_findings``) and both actionable
+        partitions already apply.  The check is per row, so a standing copy beside a
+        retired one still counts the run.  Pinned by
+        ``tests/test_harness.py::test_superseded_prior_occurrences_do_not_push_a_finding_to_escalation``.
+
         The default lookback is ``max(5, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD)`` so
         that raising the threshold never silently caps the count below the gate value.
 
@@ -4976,7 +4983,7 @@ class ReconciliationHarness:
                     except Exception:
                         any_item_fp_failed = True
                         continue
-                    if fp == target_fp:
+                    if fp == target_fp and not _finding_is_superseded(item):
                         count += 1
                         break  # one match per run is enough
             if any_item_fp_failed:
