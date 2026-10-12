@@ -1,0 +1,313 @@
+"""The one MCP client every package uses.
+
+:class:`McpSession` serves long-lived async processes: a Streamable-HTTP
+session with the ``initialize`` handshake, transport retries on a schedule the
+caller injects, and one ``client_op_id`` per logical call to a mutating task
+tool. ``clientInfo.name`` is injected too: it is the identity fused-memory
+records for the caller. Every failure the client itself detects is one type,
+:class:`McpCallError`, whose :class:`McpFailureKind` says what failed.
+Endpoint, headers and body decoding come from :mod:`shared.mcp_post`.
+
+Not re-exported from ``shared/__init__.py``; import ``shared.mcp_session``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import enum
+import json
+import logging
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+import httpx
+
+from shared.mcp_idempotency import maybe_inject_client_op_id
+from shared.mcp_post import MCP_POST_HEADERS, decode_mcp_response_body, mcp_endpoint_url
+
+__all__ = [
+    'MCP_PROTOCOL_VERSION',
+    'McpCallError',
+    'McpFailureKind',
+    'McpSession',
+    'is_timeout_failure',
+]
+
+logger = logging.getLogger(__name__)
+
+MCP_PROTOCOL_VERSION = '2025-03-26'
+
+
+class McpFailureKind(enum.StrEnum):
+    TRANSPORT = 'TRANSPORT'
+    """No usable HTTP answer: connection or timeout after retries, or a redirect loop."""
+
+    HTTP_STATUS = 'HTTP_STATUS'
+    """A non-2xx answer."""
+
+    UNDECODABLE = 'UNDECODABLE'
+    """The body is neither JSON nor SSE-framed JSON, an empty answer included."""
+
+    JSON_RPC_ERROR = 'JSON_RPC_ERROR'
+    """The JSON-RPC body carries an ``error`` member."""
+
+    TOOL_ERROR = 'TOOL_ERROR'
+    """``result.isError`` is set."""
+
+    REPLY_SHAPE = 'REPLY_SHAPE'
+    """The result is not a usable tool payload."""
+
+
+class McpCallError(RuntimeError):
+    """The one failure type of the MCP client; ``kind`` says what failed.
+
+    The transport exception, when there is one, is chained as ``__cause__``.
+    """
+
+    def __init__(self, kind: McpFailureKind, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.status = status
+
+
+def _initialize_params(client_name: str) -> dict[str, Any]:
+    return {
+        'protocolVersion': MCP_PROTOCOL_VERSION,
+        'capabilities': {},
+        'clientInfo': {'name': client_name, 'version': '0.1.0'},
+    }
+
+
+def _request_headers(session_id: str | None) -> dict[str, str]:
+    headers = dict(MCP_POST_HEADERS)
+    if session_id:
+        headers['Mcp-Session-Id'] = session_id
+    return headers
+
+
+# A gateway answer means the server is restarting or overloaded, so the same
+# request is worth sending again.
+_RETRYABLE_STATUS = frozenset({502, 503, 504})
+
+# Exceptions treated as transient for retry purposes.
+#
+# httpx.NetworkError is the parent of ConnectError, ReadError, WriteError and
+# CloseError — cover them all so mid-transfer drops on a 6MB response also
+# retry instead of blowing up the caller.  We also include bare OSError
+# because httpx's map_httpcore_exceptions() only re-wraps exceptions it
+# recognises from httpcore; low-level asyncio/anyio socket failures can
+# occasionally surface as raw OSError (including FileNotFoundError, which
+# stringifies to the unhelpful "[Errno 2] No such file or directory" with
+# no filename).  Retrying these lets the client recover transparently and,
+# if it keeps failing, the wrapping McpCallError preserves the type name
+# so the top-level catch-all logs something diagnostic.
+_RETRYABLE_EXCEPTIONS: tuple[type[Exception], ...] = (
+    httpx.ConnectError,
+    httpx.RemoteProtocolError,
+    httpx.TimeoutException,
+    httpx.NetworkError,
+    OSError,
+)
+
+_TIMEOUT_EXCEPTIONS: tuple[type[BaseException], ...] = (TimeoutError, httpx.TimeoutException)
+_CAUSE_CHAIN_LIMIT = 20
+
+
+def is_timeout_failure(exc: BaseException) -> bool:
+    """Was *exc* caused, at any depth, by something timing out?
+
+    Inverts the wrap performed below: ``McpSession`` retries
+    ``httpx.TimeoutException`` along with the rest of
+    ``_RETRYABLE_EXCEPTIONS`` and, on exhaustion, re-raises a plain
+    ``McpCallError(...) from last_exc``. That erases the timeout from the
+    exception's TYPE while preserving it as ``__cause__`` — so a caller
+    holding the raised error cannot tell a service that is alive and slow
+    from one that is unreachable by an ``isinstance`` check, only by
+    unwrapping. This is that unwrap, and it lives here, beside the wrap it
+    inverts, so the pairing has one home (SPOT) and callers such as
+    ``agents/briefing.py`` need know nothing of httpx's exception taxonomy.
+
+    ``asyncio.TimeoutError`` is an alias of the builtin from 3.11 on, so
+    naming ``TimeoutError`` covers both. The walk is bounded and
+    cycle-guarded: ``__cause__`` is writable, so a chain can be circular,
+    and a diagnostic predicate must never be the thing that hangs a caller.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    for _ in range(_CAUSE_CHAIN_LIMIT):
+        if current is None or id(current) in seen:
+            return False
+        if isinstance(current, _TIMEOUT_EXCEPTIONS):
+            return True
+        seen.add(id(current))
+        current = current.__cause__
+    return False
+
+
+def _detached(params: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """A copy the session may annotate (``client_op_id``) without writing to the caller's dict."""
+    if params is None:
+        return None
+    copied = dict(params)
+    arguments = copied.get('arguments')
+    if isinstance(arguments, Mapping):
+        copied['arguments'] = dict(arguments)
+    return copied
+
+
+def _decoded(method: str, resp: httpx.Response) -> Any:
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise McpCallError(
+            McpFailureKind.HTTP_STATUS,
+            f'MCP {method} answered HTTP {resp.status_code}: {resp.text[:200]}',
+            status=resp.status_code,
+        ) from exc
+    try:
+        return decode_mcp_response_body(resp)
+    except ValueError as exc:
+        raise McpCallError(
+            McpFailureKind.UNDECODABLE, f'MCP {method} answer could not be decoded: {exc}',
+        ) from exc
+
+
+class McpSession:
+    """An MCP Streamable-HTTP session for a long-lived async process.
+
+    *retry_backoffs* is the sleep before each retry of a transient failure, so
+    ``len(retry_backoffs) + 1`` attempts are made; the default ``()`` makes one.
+    ``call_tool`` returns the JSON-RPC body as the server sent it, a JSON-RPC
+    error or ``result.isError`` reply included: reading the tool's verdict is
+    ``shared.mcp_envelope.parse_tool_result``'s job.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        client_name: str,
+        retry_backoffs: Sequence[float] = (),
+    ) -> None:
+        self.base_url = base_url.rstrip('/')
+        self.mcp_endpoint = mcp_endpoint_url(self.base_url)
+        self._client_name = client_name
+        self._retry_backoffs = tuple(retry_backoffs)
+        self._session_id: str | None = None
+        self._initialized = False
+        self._request_id = 0
+
+    async def initialize(self) -> None:
+        """Run the ``initialize`` + ``notifications/initialized`` handshake, once."""
+        if self._initialized:
+            return
+        result = await self._request('initialize', _initialize_params(self._client_name))
+        logger.debug('MCP initialize response: %s', json.dumps(result)[:200])
+        await self._notify('notifications/initialized')
+        self._initialized = True
+        logger.info('MCP session initialized (session_id=%s)', self._session_id)
+
+    async def call(
+        self,
+        method: str,
+        params: Mapping[str, Any] | None = None,
+        *,
+        timeout: float = 30,
+    ) -> dict:
+        """Send one JSON-RPC request, initializing the session first if needed."""
+        await self.initialize()
+        return await self._request(method, _detached(params), timeout=timeout)
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: Mapping[str, Any],
+        timeout: float = 30,
+    ) -> dict:
+        """Call the MCP tool *name* and return the JSON-RPC body."""
+        return await self.call('tools/call', {'name': name, 'arguments': arguments}, timeout=timeout)
+
+    def _next_id(self) -> int:
+        self._request_id += 1
+        return self._request_id
+
+    async def _request(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float = 30,
+    ) -> dict:
+        payload: dict[str, Any] = {'jsonrpc': '2.0', 'id': self._next_id(), 'method': method}
+        if params is not None:
+            payload['params'] = params
+        # Once per logical call, before the retry loop, so every retry posts
+        # the same key (payload holds params by reference).
+        maybe_inject_client_op_id(method, params)
+        resp = await self._send(method, payload, timeout=timeout, retry_statuses=_RETRYABLE_STATUS)
+        result = _decoded(method, resp)
+        session_id = resp.headers.get('mcp-session-id')
+        if session_id:
+            self._session_id = session_id
+        return result
+
+    async def _notify(self, method: str) -> None:
+        payload = {'jsonrpc': '2.0', 'method': method}
+        resp = await self._send(
+            f'notify {method}', payload, timeout=10, retry_statuses=frozenset(),
+        )
+        if resp.status_code not in (200, 202, 204):
+            logger.warning(
+                'Notification %s returned %d: %s', method, resp.status_code, resp.text[:200],
+            )
+
+    async def _send(
+        self,
+        label: str,
+        payload: dict[str, Any],
+        *,
+        timeout: float,
+        retry_statuses: frozenset[int],
+    ) -> httpx.Response:
+        """POST *payload*, retrying transient failures on the injected schedule."""
+        attempts = len(self._retry_backoffs) + 1
+        last_exc: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                resp = await self._post_once(payload, timeout)
+            except _RETRYABLE_EXCEPTIONS as exc:
+                last_exc = exc
+            except httpx.HTTPError as exc:
+                raise McpCallError(
+                    McpFailureKind.TRANSPORT, f'MCP {label} failed: {type(exc).__name__}: {exc}',
+                ) from exc
+            else:
+                if resp.status_code not in retry_statuses:
+                    return resp
+                last_exc = httpx.HTTPStatusError(
+                    f'{resp.status_code}', request=resp.request, response=resp,
+                )
+            self._drop_session(label, attempt, attempts, last_exc)
+            if attempt < len(self._retry_backoffs):
+                await asyncio.sleep(self._retry_backoffs[attempt])
+        raise McpCallError(
+            McpFailureKind.TRANSPORT,
+            f'MCP {label} failed after {attempts} attempts: {type(last_exc).__name__}: {last_exc}',
+        ) from last_exc
+
+    async def _post_once(self, payload: dict[str, Any], timeout: float) -> httpx.Response:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            return await client.post(
+                self.mcp_endpoint,
+                json=payload,
+                headers=_request_headers(self._session_id),
+                timeout=timeout,
+            )
+
+    def _drop_session(self, label: str, attempt: int, attempts: int, exc: Exception) -> None:
+        logger.warning(
+            'MCP %s transient failure (attempt %d/%d): %s: %s',
+            label, attempt + 1, attempts, type(exc).__name__, exc,
+        )
+        self._session_id = None
+        self._initialized = False

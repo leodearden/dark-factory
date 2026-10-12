@@ -121,9 +121,11 @@ class TestRequestRetry:
         assert transport.posted_methods()[2:] == ['tools/call', 'tools/call']
 
     async def test_no_retry_on_400(self):
-        with _scripted([*_handshake(), _response(status_code=400)]) as transport:
-            with pytest.raises(McpCallError) as excinfo:
-                await _session((1.0, 2.0)).call_tool('t', {})
+        with (
+            _scripted([*_handshake(), _response(status_code=400)]) as transport,
+            pytest.raises(McpCallError) as excinfo,
+        ):
+            await _session((1.0, 2.0)).call_tool('t', {})
 
         assert excinfo.value.kind is McpFailureKind.HTTP_STATUS
         assert excinfo.value.status == 400
@@ -132,9 +134,11 @@ class TestRequestRetry:
 
     async def test_exhausts_retries(self):
         fixed = (0.01, 0.01)
-        with _scripted(httpx.ConnectError('Connection refused')) as transport:
-            with pytest.raises(McpCallError) as excinfo:
-                await _session(fixed).call_tool('t', {})
+        with (
+            _scripted(httpx.ConnectError('Connection refused')) as transport,
+            pytest.raises(McpCallError) as excinfo,
+        ):
+            await _session(fixed).call_tool('t', {})
 
         err = excinfo.value
         assert transport.client.post.call_count == len(fixed) + 1
@@ -191,9 +195,8 @@ class TestRequestRetry:
     async def test_exhausted_failure_names_the_cause_type(self, cause, type_name):
         """str(cause) is empty or misleading, so the wrap must carry the type name."""
         fixed = (0.01, 0.01)
-        with _scripted(cause) as transport:
-            with pytest.raises(McpCallError) as excinfo:
-                await _session(fixed).call_tool('t', {})
+        with _scripted(cause) as transport, pytest.raises(McpCallError) as excinfo:
+            await _session(fixed).call_tool('t', {})
 
         assert transport.client.post.call_count == len(fixed) + 1
         assert type_name in str(excinfo.value)
@@ -205,9 +208,8 @@ class TestTimeoutCausePredicate:
 
     async def _drive(self, cause: Exception) -> McpCallError:
         """The error a session really raises for *cause*, not an imitation of it."""
-        with _scripted(cause):
-            with pytest.raises(McpCallError) as excinfo:
-                await _session((0.01, 0.01)).call_tool('t', {})
+        with _scripted(cause), pytest.raises(McpCallError) as excinfo:
+            await _session((0.01, 0.01)).call_tool('t', {})
         return excinfo.value
 
     async def test_a_real_exhausted_read_timeout_is_a_timeout(self):
@@ -346,9 +348,11 @@ class TestInjectedRetrySchedule:
         assert [c.args[0] for c in transport.sleep.call_args_list] == list(self.FIXED)
 
     async def test_request_exhausts_the_schedule(self):
-        with _scripted(httpx.ConnectError('refused')) as transport:
-            with pytest.raises(McpCallError) as excinfo:
-                await _session(self.FIXED).call_tool('t', {})
+        with (
+            _scripted(httpx.ConnectError('refused')) as transport,
+            pytest.raises(McpCallError) as excinfo,
+        ):
+            await _session(self.FIXED).call_tool('t', {})
 
         assert transport.client.post.call_count == 5
         assert '5 attempts' in str(excinfo.value)
@@ -362,9 +366,11 @@ class TestInjectedRetrySchedule:
         assert [c.args[0] for c in transport.sleep.call_args_list] == list(self.FIXED)
 
     async def test_the_default_schedule_is_a_single_attempt(self):
-        with _scripted(httpx.ConnectError('refused')) as transport:
-            with pytest.raises(McpCallError) as excinfo:
-                await McpSession(BASE_URL, client_name='test-client').call_tool('t', {})
+        with (
+            _scripted(httpx.ConnectError('refused')) as transport,
+            pytest.raises(McpCallError) as excinfo,
+        ):
+            await McpSession(BASE_URL, client_name='test-client').call_tool('t', {})
 
         assert excinfo.value.kind is McpFailureKind.TRANSPORT
         assert transport.client.post.call_count == 1
@@ -437,8 +443,10 @@ class TestAgainstStubServer:
         assert body['result'] == {'tools': []}
 
     async def test_an_undecodable_body_is_a_typed_failure(self):
-        with StubMcpServer(stateful=False, answer=StubAnswer.NON_JSON_BODY) as server:
-            with pytest.raises(McpCallError) as excinfo:
-                await McpSession(server.url, client_name='c').call_tool('update_task', {})
+        with (
+            StubMcpServer(stateful=False, answer=StubAnswer.NON_JSON_BODY) as server,
+            pytest.raises(McpCallError) as excinfo,
+        ):
+            await McpSession(server.url, client_name='c').call_tool('update_task', {})
 
         assert excinfo.value.kind is McpFailureKind.UNDECODABLE
