@@ -161,7 +161,7 @@ test('column selection keeps contended modules and drops uncontended ones', () =
   );
 });
 
-test('a fully-stranded module survives at contention 0 when it has a park stack', () => {
+test('a fully-stranded module survives at contention 0 when its park has a dead owner', () => {
   // NOT a nicety — scheduler.py:237 deliberately injects an entry for every
   // park-stack key "even if it has no live waiters (contention: 0), so a fully
   // stranded module still gets a module entry". A bare `contention > 1` filter
@@ -182,17 +182,19 @@ test('a fully-stranded module survives at contention 0 when it has a park stack'
   );
 });
 
-test('a held module keeps its column at contention 1 when its holder is not a row', () => {
+test('a held module keeps its column at contention 1 when its holder has departed (holder_live false)', () => {
   // `contention` counts rows whose lock_set includes the path, so the holder
   // is counted only if the holding task is itself among the composed rows.
   // When it is not — a stale `current_holders` entry whose task has left
-  // active_tasks — one genuinely-blocked waiter scores contention 1, and a
-  // bare `contention > 1` filter would drop the column along with that
-  // waiter's red 'lock-taken' cell. cellStateFor still classifies that
-  // state, so the column has something to show.
+  // active_tasks, which the server reports as `holder_live: false` — one
+  // genuinely-blocked waiter scores contention 1, and a bare
+  // `contention > 1` filter would drop the column along with that waiter's
+  // red 'lock-taken' cell. cellStateFor still classifies that state, so the
+  // column has something to show.
   const held = makeModule('src/g/held.py', 1, {
     holder: 'T-gone',
     holder_project: 'dark_factory',
+    holder_live: false,
   });
   const out = boundHeatmapAxes({ rows: [], modules: [...COLUMN_FIXTURE, held] });
 
@@ -213,6 +215,66 @@ test('a held module with NO live waiter earns nothing — one cell is not conten
   });
 
   assert.deepEqual(out.modules, []);
+});
+
+test('a held module whose holder is LIVE earns nothing at contention 1 — the one row counted is the holder itself', () => {
+  // Contention cannot tell the holder from a waiter: a live holder is a row
+  // whose own lock_set holds the path, so it scores 1 with nobody waiting.
+  // On the 2026-10-12 live snapshot 203 of the 204 held contention-1 modules
+  // were this shape; rescuing them would bury the one departed holder.
+  const out = boundHeatmapAxes({
+    rows: [],
+    modules: [makeModule('src/i/self.py', 1, {
+      holder: 'T-1',
+      holder_project: 'dark_factory',
+      holder_live: true,
+    })],
+  });
+
+  assert.deepEqual(out.modules, []);
+});
+
+test('a held module of UNKNOWN holder liveness earns nothing at contention 1', () => {
+  // Unknown never rescues: an older payload or a mock without holder_live
+  // must not flood the grid with every held module.
+  const out = boundHeatmapAxes({
+    rows: [],
+    modules: [makeModule('src/i/unknown.py', 1, { holder: 'T-1', holder_project: 'dark_factory' })],
+  });
+
+  assert.deepEqual(out.modules, []);
+});
+
+test('a live park earns no column of its own at contention 1 — only a dead owner rescues', () => {
+  // 99 modules on the 2026-10-12 live snapshot carried a park stack, every
+  // owner live. ParkStacksSection lists each of them; on the grid, one
+  // coloured cell is not contention.
+  const out = boundHeatmapAxes({
+    rows: [],
+    modules: [makeModule('src/j/livepark.py', 1, {
+      parked_by: 'T-5',
+      parked_owner_live: true,
+      park_stack: [{ owner: 'T-5', live: true }],
+      has_dead_park: false,
+    })],
+  });
+
+  assert.deepEqual(out.modules, []);
+});
+
+test('a live-top park with a dead SHADOWED owner is stranded too', () => {
+  // has_dead_park is the server's definition of stranded — any dead entry in
+  // the stack, not just the active top — and the stranded-parks banner reads
+  // it. Narrowing to parked_owner_live would miss this module.
+  const shadowed = makeModule('src/j/shadowed.py', 0, {
+    parked_by: 'T-5',
+    parked_owner_live: true,
+    park_stack: [{ owner: 'T-ghost', live: false }, { owner: 'T-5', live: true }],
+    has_dead_park: true,
+  });
+  const out = boundHeatmapAxes({ rows: [], modules: [shadowed] });
+
+  assert.deepEqual(out.modules.map(m => m.path), ['src/j/shadowed.py']);
 });
 
 test('column selection preserves the input order, inheriting the server sort', () => {
