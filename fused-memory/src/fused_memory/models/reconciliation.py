@@ -124,6 +124,9 @@ class StageReport(BaseModel):
     stats: dict = Field(default_factory=dict)
     llm_calls: int = 0
     tokens_used: int = 0
+    # None = unrecorded (legacy journal rows, harness-synthesized reports); never
+    # read it as completed.
+    agent_outcome: StageAgentOutcome | None = None
 
 
 class RunType(StrEnum):

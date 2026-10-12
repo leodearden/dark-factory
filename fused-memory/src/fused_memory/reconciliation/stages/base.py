@@ -19,6 +19,7 @@ from shared.safe_io import load_json_or_warn
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
+    StageAgentOutcome,
     StageId,
     StageReport,
     Watermark,
@@ -262,6 +263,7 @@ class BaseStage:
                 },
                 llm_calls=0,
                 tokens_used=0,
+                agent_outcome=StageAgentOutcome.not_launched,
             )
 
         # When recon_report_state is active, drop the output_schema requirement —
@@ -516,6 +518,7 @@ class BaseStage:
             stats=_stats,
             llm_calls=stage_result.llm_calls,
             tokens_used=stage_result.tokens_used,
+            agent_outcome=stage_result.outcome,
         )
 
         duration = (completed - started).total_seconds()
@@ -529,13 +532,15 @@ class BaseStage:
                 'cost_usd': stage_result.cost_usd,
                 'llm_calls': stage_result.llm_calls,
                 'success': stage_result.success,
+                'agent_outcome': stage_result.outcome,
                 'error': stage_result.error or None,
             },
         )
 
         if not stage_result.success:
             logger.error(
-                f'Stage {self.stage_id.value} failed: {stage_result.error}'
+                f'Stage {self.stage_id.value} failed '
+                f'(agent outcome: {stage_result.outcome}): {stage_result.error}'
             )
 
         return stage_report
