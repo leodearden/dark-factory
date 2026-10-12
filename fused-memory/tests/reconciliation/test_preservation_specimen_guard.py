@@ -1315,6 +1315,73 @@ class TestDegradedCorroborationReads:
         assert preservation_specimen_guard._is_degraded_entity_result(entity) is False
 
 
+class TestCandidateTaskIds:
+    """The result records which tasks the pass looked up at all.
+
+    A later pass reads this to tell "this task was flagged and resolved" apart
+    from "this task was not flagged", which ``unresolved_task_ids`` alone cannot.
+    """
+
+    @pytest.mark.asyncio
+    async def test_candidates_are_the_decomposed_stranded_task_ids(self):
+        memory_service = _make_memory_service()
+        flags = [
+            _stranded_flag(task_id='3105,4223'),
+            _stranded_flag(task_id='9999'),
+            {'task_id': '4102', 'flag_type': 'oversized_entity'},
+        ]
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=flags,
+        )
+
+        assert result.candidate_task_ids == ('3105', '4223', '9999')
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'flags', [[], None, [{'task_id': '4102', 'flag_type': 'oversized_entity'}]],
+    )
+    async def test_no_stranded_flag_means_no_candidates_and_no_reads(self, flags):
+        memory_service = _make_memory_service()
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=flags,
+        )
+
+        assert result.candidate_task_ids == ()
+        assert memory_service.get_memories_by_metadata.await_count == 0
+        assert memory_service.get_entity.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_unresolved_ids_are_always_candidates_on_a_degraded_pass(self):
+        memory_service = _make_memory_service(
+            mem0_error=TimeoutError('down'), entity_error=RuntimeError('also down'),
+        )
+        flags = [_stranded_flag(task_id='3105,4223'), _stranded_flag(task_id='9999')]
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=flags,
+        )
+
+        assert result.unresolved_task_ids
+        assert set(result.unresolved_task_ids) <= set(result.candidate_task_ids)
+
+    def test_an_unresolved_id_outside_the_candidates_is_refused(self):
+        with pytest.raises(ValueError) as excinfo:
+            PreservationSuppressionResult(
+                kept_flags=[],
+                suppressed_by_task={},
+                citations_by_task={},
+                unresolved_task_ids=('3105',),
+                candidate_task_ids=(),
+            )
+
+        message = str(excinfo.value)
+        assert 'unresolved_task_ids' in message
+        assert 'candidate_task_ids' in message
+        assert '3105' in message
+
+
 def _suppression_result(count=None, *, extra=None, unresolved=()):
     """A PreservationSuppressionResult with task 3105 suppressed *count* times."""
     if count is None:
@@ -1326,6 +1393,7 @@ def _suppression_result(count=None, *, extra=None, unresolved=()):
         suppressed_by_task=by_task,
         citations_by_task={t: 'a8fd36a8-46db-4ca8-a21c-554c38a918ee' for t in by_task},
         unresolved_task_ids=tuple(unresolved),
+        candidate_task_ids=tuple(sorted(set(by_task) | set(unresolved))),
     )
 
 
@@ -1593,7 +1661,7 @@ class TestMaybeEscalatePreservationSuppressionStorm:
         """No storm, no unresolved reads — no record."""
         escalated = await maybe_escalate_preservation_suppression_storm(
             queue, PROJECT, self._RUN,
-            PreservationSuppressionResult([], {}, {}, ()),
+            PreservationSuppressionResult([], {}, {}, (), ()),
         )
         assert escalated == []
 
