@@ -6,18 +6,28 @@ cost (match_cost_usd), not just the reviewer-panel cost (cost_usd).
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from _eval_refusal import answered, refused_agent_result
 from click.testing import CliRunner
+from shared.cli_invoke import AgentResult
 
 from orchestrator.config import default_price_table
 from orchestrator.evals.reviewer_trial.__main__ import _select_original_corpus, cli
-from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, CorpusManifest
+from orchestrator.evals.reviewer_trial.corpus import (
+    CorpusDiff,
+    CorpusManifest,
+    GroundTruthIssue,
+)
 from orchestrator.evals.reviewer_trial.mining import AuditReport
 from orchestrator.evals.reviewer_trial.runner import PanelRunResult
 from orchestrator.evals.reviewer_trial.scorer import ScoringResult
-from orchestrator.evals.reviewer_trial.variants import REVIEWER_REFRESH_VARIANTS
+from orchestrator.evals.reviewer_trial.variants import (
+    FABLE_EVIDENCE_VARIANTS,
+    REVIEWER_REFRESH_VARIANTS,
+)
 
 
 class TestSelectOriginalCorpus:
@@ -371,3 +381,87 @@ class TestRefreshCommand:
         assert '$3.00' in leaderboard, f'Expected cross_family cost $3.00 (2 diffs x $1.50).\n{leaderboard}'
         assert '$4.00' in leaderboard, f'Expected variant_a cost $4.00 (2 diffs x $2.00).\n{leaderboard}'
 
+
+
+_ARM = FABLE_EVIDENCE_VARIANTS[0].name
+_ISSUE = {'location': 'a.py:1', 'category': 'bug', 'severity': 'blocking', 'description': 'x'}
+
+
+def _gt(gt_id: str) -> GroundTruthIssue:
+    return GroundTruthIssue(
+        id=gt_id, location='a.py:1', category='bug', severity='blocking',
+        description='a bug', mutation_type='logic',
+    )
+
+
+class TestCampaignUnmeasured:
+    """A refused matcher cell is counted, never averaged as a zero, and never cached."""
+
+    def _invoke(self, tmp_path: Path, prompts: list[str]):
+        manifest = CorpusManifest(diffs=[
+            CorpusDiff(diff_id='d_ok', language='python', source='synthetic',
+                       diff_text='OK_MARKER', description='ok', ground_truth=[_gt('ok_1')]),
+            CorpusDiff(diff_id='d_refused', language='python', source='synthetic',
+                       diff_text='REFUSED_MARKER', description='refused', ground_truth=[_gt('ref_1')]),
+        ])
+        panel_results = [
+            PanelRunResult(
+                variant_name=_ARM, diff_id=diff_id, total_cost_usd=cost, wall_clock_ms=100,
+                reviews={'r1': {'verdict': 'NEEDS_CHANGES', 'issues': [_ISSUE]}},
+            )
+            for diff_id, cost in (('d_ok', 1.0), ('d_refused', 2.0))
+        ]
+
+        async def matcher(**kwargs: object) -> AgentResult:
+            prompt = str(kwargs['prompt'])
+            prompts.append(prompt)
+            if 'REFUSED_MARKER' in prompt:
+                return refused_agent_result()
+            return answered({'matches': [{
+                'reviewer_issue_index': 0, 'ground_truth_id': 'ok_1',
+                'confidence': 0.9, 'reasoning': 'r',
+            }]}, cost_usd=0.1)
+
+        with (
+            patch('orchestrator.evals.reviewer_trial.__main__._load_corpus', return_value=manifest),
+            patch('orchestrator.evals.reviewer_trial.runner.run_trial',
+                  new_callable=AsyncMock, return_value=panel_results),
+            patch('orchestrator.evals.reviewer_trial.scorer.invoke_agent', matcher),
+        ):
+            return CliRunner().invoke(cli, [
+                'campaign', '--results-dir', str(tmp_path / 'camp'), '--trials', '1',
+                '--split', 'all', '--no-pool', '--arms', _ARM,
+            ])
+
+    def test_a_refused_matcher_cell_is_counted_excluded_and_not_cached(self, tmp_path: Path) -> None:
+        prompts: list[str] = []
+
+        result = self._invoke(tmp_path, prompts)
+
+        assert result.exit_code == 0, f'{result.output}\n{result.exception!r}'
+        assert f'`{_ARM}` unmeasured: 1' in result.output
+        refused_line = next(line for line in result.output.splitlines() if 'd_refused' in line)
+        assert 'UNMEASURED' in refused_line and 'matcher:cap_hit' in refused_line, refused_line
+        report = json.loads((tmp_path / 'camp' / 'campaign_report.json').read_text())
+        arm = next(a for a in report['arms'] if a['name'] == _ARM)
+        assert arm['unmeasured'] == 1
+        assert arm['reviews'] == 1
+        assert arm['mean_f1'] == 1.0
+        scores = tmp_path / 'camp' / 'trial-1' / 'scores'
+        assert (scores / f'{_ARM}__d_ok.json').exists()
+        assert not (scores / f'{_ARM}__d_refused.json').exists()
+        total_line = next(
+            line for line in result.output.splitlines()
+            if line.startswith('Total campaign cost (panels + matcher)')
+        )
+        assert '$3.41' in total_line, total_line  # 1.0 + 0.1 measured, 2.0 + 0.31 refused
+
+    def test_a_rerun_re_measures_the_refused_cell(self, tmp_path: Path) -> None:
+        prompts: list[str] = []
+
+        self._invoke(tmp_path, prompts)
+        rerun = self._invoke(tmp_path, prompts)
+
+        assert rerun.exit_code == 0, f'{rerun.output}\n{rerun.exception!r}'
+        assert sum('REFUSED_MARKER' in p for p in prompts) == 2
+        assert sum('OK_MARKER' in p for p in prompts) == 1
