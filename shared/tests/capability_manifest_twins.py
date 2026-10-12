@@ -1,0 +1,47 @@
+"""Which of a capability-manifest sidecar's task labels its human-readable .md twin never mentions.
+
+Pinned by ``shared/tests/test_capability_manifest_twins.py``. A label is mentioned when the
+twin contains it as a token bounded by the label alphabet ``[\\w′-]``, verbatim or, for an
+ASCII Greek name with optional digits (``gamma1``), as its Greek letter in either case.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Iterable
+from pathlib import Path
+
+_GREEK_NAMES = (
+    'alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta', 'eta', 'theta',
+    'iota', 'kappa', 'lambda', 'mu', 'nu', 'xi', 'omicron', 'pi',
+    'rho', 'sigma', 'tau', 'upsilon', 'phi', 'chi', 'psi', 'omega',
+)
+_GREEK_LETTER_BY_NAME = dict(zip(_GREEK_NAMES, 'αβγδεζηθικλμνξοπρστυφχψω', strict=True))
+_TRANSLITERATED_LABEL = re.compile('(' + '|'.join(_GREEK_NAMES) + r')(\d*)')
+_LABEL_CHAR = r'[\w′-]'
+
+
+def md_twin_path(sidecar: Path) -> Path:
+    return sidecar.with_suffix('.md')
+
+
+def _label_spellings(label: str) -> frozenset[str]:
+    match = _TRANSLITERATED_LABEL.fullmatch(label)
+    if match is None:
+        return frozenset({label})
+    letter = _GREEK_LETTER_BY_NAME[match.group(1)]
+    digits = match.group(2)
+    return frozenset({label, letter + digits, letter.upper() + digits})
+
+
+def _occurs_as_token(spelling: str, text: str) -> bool:
+    pattern = f'(?<!{_LABEL_CHAR}){re.escape(spelling)}(?!{_LABEL_CHAR})'
+    return re.search(pattern, text) is not None
+
+
+def unmentioned_labels(labels: Iterable[str], md_text: str) -> tuple[str, ...]:
+    return tuple(
+        label
+        for label in labels
+        if not any(_occurs_as_token(s, md_text) for s in _label_spellings(label))
+    )
