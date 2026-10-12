@@ -6,6 +6,7 @@ from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 import pytest
+from redis.exceptions import ResponseError
 
 from arm_harness._fakes import PROTECTED_GRAPHS
 from fused_memory.arm_harness import graph_copy
@@ -40,12 +41,14 @@ class FakeGraph:
         nodes: Mapping[str, dict[str, Any]] | None = None,
         edges: Mapping[str, dict[str, Any]] | None = None,
         lossy: frozenset[str] = frozenset(),
+        copy_errors: Sequence[Exception] = (),
     ) -> None:
         self.name = name
         self.client = client
         self.nodes = {uuid: dict(props) for uuid, props in (nodes or {}).items()}
         self.edges = {uuid: dict(props) for uuid, props in (edges or {}).items()}
         self.lossy = lossy
+        self.copy_errors = list(copy_errors)
         self.queries: list[tuple[str, str, dict[str, Any] | None]] = []
 
     def _entities(self) -> dict[str, dict[str, Any]]:
@@ -104,6 +107,8 @@ class FakeGraph:
 
     async def copy(self, clone: str) -> None:
         self.client.calls.append(('copy', self.name, clone))
+        if self.copy_errors:
+            raise self.copy_errors.pop(0)
         self.client.graphs[clone] = FakeGraph(
             clone, client=self.client, nodes=copy.deepcopy(self.nodes),
             edges=copy.deepcopy(self.edges),
@@ -124,7 +129,13 @@ class FakeGraphClient:
         return self.graphs[name]
 
 
-def _reference_graph(client: FakeGraphClient, *, entities: int = 5, facts: int = 3) -> FakeGraph:
+def _reference_graph(
+    client: FakeGraphClient,
+    *,
+    entities: int = 5,
+    facts: int = 3,
+    copy_errors: Sequence[Exception] = (),
+) -> FakeGraph:
     nodes = {
         f'n{i}': {'labels': ['Entity'], 'name': f'entity\n{i}', 'group_id': REFERENCE,
                   'name_embedding': INCUMBENT_VECTOR}
@@ -137,7 +148,9 @@ def _reference_graph(client: FakeGraphClient, *, entities: int = 5, facts: int =
         for i in range(facts)
     }
     edges['m0'] = {'type': 'MENTIONS', 'group_id': REFERENCE}
-    graph = FakeGraph(REFERENCE, client=client, nodes=nodes, edges=edges)
+    graph = FakeGraph(
+        REFERENCE, client=client, nodes=nodes, edges=edges, copy_errors=copy_errors
+    )
     client.graphs[REFERENCE] = graph
     return graph
 
@@ -167,6 +180,22 @@ class FakeEmbedder:
             embed_seconds=self.seconds,
             failures=tuple((key, 'RuntimeError') for key, _ in items if key in self.failing),
         )
+
+
+class RecordingSleep:
+    def __init__(self) -> None:
+        self.waits: list[float] = []
+
+    async def __call__(self, seconds: float) -> None:
+        self.waits.append(seconds)
+
+
+def _fork_refusal() -> ResponseError:
+    return ResponseError(graph_copy.COPY_FORK_REFUSAL)
+
+
+def _copy_calls(client: FakeGraphClient) -> list[tuple[str, ...]]:
+    return [call for call in client.calls if call[0] == 'copy']
 
 
 class StepClock:
@@ -234,6 +263,76 @@ async def test_copy_reference_graph_guards_both_names_before_any_call(protected,
 
     assert caught.value.checkpoint is GuardCheckpoint.GRAPH_COPY
     assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_copy_reference_graph_retries_a_fork_refusal_until_the_copy_lands():
+    client = FakeGraphClient()
+    reference = _reference_graph(client, copy_errors=[_fork_refusal(), _fork_refusal()])
+    sleep = RecordingSleep()
+
+    await copy_reference_graph(client, REFERENCE, TARGET, sleep=sleep)
+
+    assert client.graphs[TARGET].nodes == reference.nodes
+    assert client.graphs[TARGET].edges == reference.edges
+    assert _copy_calls(client) == [('copy', REFERENCE, TARGET)] * 3
+    assert sleep.waits == [graph_copy.COPY_RETRY_INTERVAL_S] * 2
+
+
+@pytest.mark.asyncio
+async def test_copy_reference_graph_retries_a_fork_refusal_that_carries_a_reason():
+    client = FakeGraphClient()
+    refusal = ResponseError(f'{graph_copy.COPY_FORK_REFUSAL}: File exists')
+    reference = _reference_graph(client, copy_errors=[refusal])
+    sleep = RecordingSleep()
+
+    await copy_reference_graph(client, REFERENCE, TARGET, sleep=sleep)
+
+    assert client.graphs[TARGET].nodes == reference.nodes
+    assert _copy_calls(client) == [('copy', REFERENCE, TARGET)] * 2
+    assert sleep.waits == [graph_copy.COPY_RETRY_INTERVAL_S]
+
+
+@pytest.mark.asyncio
+async def test_copy_reference_graph_does_not_retry_any_other_server_error():
+    client = FakeGraphClient()
+    error = ResponseError('some other server error')
+    _reference_graph(client, copy_errors=[error])
+    sleep = RecordingSleep()
+
+    with pytest.raises(ResponseError, match='some other') as caught:
+        await copy_reference_graph(client, REFERENCE, TARGET, sleep=sleep)
+
+    assert caught.value is error
+    assert _copy_calls(client) == [('copy', REFERENCE, TARGET)]
+    assert sleep.waits == []
+    assert TARGET not in client.graphs
+
+
+@pytest.mark.asyncio
+async def test_copy_reference_graph_gives_up_after_its_attempts_naming_the_refusal():
+    client = FakeGraphClient()
+    refusals = [_fork_refusal() for _ in range(graph_copy.COPY_ATTEMPTS)]
+    _reference_graph(client, copy_errors=refusals)
+    sleep = RecordingSleep()
+
+    with pytest.raises(graph_copy.GraphCopyRefused) as caught:
+        await copy_reference_graph(client, REFERENCE, TARGET, sleep=sleep)
+
+    refused = caught.value
+    assert (refused.reference, refused.target, refused.attempts) == (
+        REFERENCE, TARGET, graph_copy.COPY_ATTEMPTS)
+    assert refused.waited_s == (graph_copy.COPY_ATTEMPTS - 1) * graph_copy.COPY_RETRY_INTERVAL_S
+    assert refused.reply == graph_copy.COPY_FORK_REFUSAL
+    message = str(refused)
+    assert REFERENCE in message
+    assert TARGET in message
+    assert f'{graph_copy.COPY_ATTEMPTS} times' in message
+    assert graph_copy.COPY_FORK_REFUSAL in message
+    assert refused.__cause__ is refusals[-1]
+    assert len(_copy_calls(client)) == graph_copy.COPY_ATTEMPTS
+    assert sleep.waits == [graph_copy.COPY_RETRY_INTERVAL_S] * (graph_copy.COPY_ATTEMPTS - 1)
+    assert TARGET not in client.graphs
 
 
 # --- group id ---------------------------------------------------------------------------
