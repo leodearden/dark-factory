@@ -49,38 +49,30 @@ import argparse
 import ast
 import asyncio
 import contextlib
-import importlib
 import inspect
 import logging
-import re
-import sys
 import textwrap
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, NamedTuple
 
-EXIT_OK = 0
-EXIT_FAIL = 1
+from _write_triage_probe_common import (
+    EXIT_FAIL,
+    EXIT_OK,
+    PROBE_LOGGER_NAME,
+    Candidate,
+    ImportMode,
+    Unverifiable,
+    import_from_tree,
+    names_a_target,
+    parent_key,
+    report_fail_closed,
+    require,
+    usable_parameters,
+)
 
-logger = logging.getLogger(__name__)
-
-_WARN_PREFIX = 'WARN  '
-
-
-class _WarnCollector(logging.Handler):
-    """Divert the probe's own warnings into the END of its stdout report.
-
-    The gate drops stderr, and a report read through a tail keeps only its end.
-    """
-
-    def __init__(self, sink: list[str]) -> None:
-        super().__init__(level=logging.WARNING)
-        self._sink = sink
-
-    def emit(self, record: logging.LogRecord) -> None:
-        self._sink.append(_WARN_PREFIX + record.getMessage())
-
+logger = logging.getLogger(PROBE_LOGGER_NAME)
 
 _MODULE_NAME = 'fused_memory.server.write_triage'
 
@@ -119,11 +111,6 @@ _JUDGE_MODULE_NAME = 'fused_memory.server.write_triage_judge'
 _JUDGE_TARGET_BRANCH = 'judge-target branch'
 _BUILDER_NAME = 'build_judge_prompt'
 _WRITER_NAME = 'judge_write'
-
-#: A parameter NAME that reads as designating the attach target: item 1's
-#: ``_TARGET_NAME_RE`` in scripts/check_write_triage_attach_target.py, copied
-#: word for word until the two probes share a helper module.
-_TARGET_NAME_RE = re.compile(r'attach|target|candidate_id', re.IGNORECASE)
 
 #: The attribute a judge-side attach target is read off the decision through,
 #: and the kwarg the triage module hands its judge that decision under.
@@ -171,28 +158,6 @@ _BRANCH_JUDGE_TARGET = _Branch(
 )
 
 
-class _Unverifiable(Exception):
-    """The invariant could not be evaluated. Fails closed, never passes."""
-
-
-class _Candidate:
-    """A duck-typed ``MemoryResult`` stand-in: ``.id``/``.content``/``.metadata``.
-
-    That is all ``_cosine_of`` and ``_canonical_id_of`` read, and it avoids
-    importing ``MemoryResult``, whose deps a bare extracted tree may lack.
-    """
-
-    __slots__ = ('content', 'id', 'metadata')
-
-    def __init__(self, ident: str, content: str, metadata: dict[str, Any]) -> None:
-        self.id = ident
-        self.content = content
-        self.metadata = metadata
-
-    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
-        return f'<candidate {self.id}>'
-
-
 class _SearchResults(list):
     """``MemoryService.SearchResults`` stand-in: a list that carries degradation.
 
@@ -224,10 +189,10 @@ class _Service:
         return self._results
 
 
-def _fixture_results(parent_key: str, child_kind: str) -> _SearchResults:
+def _fixture_results(parent_field: str, child_kind: str) -> _SearchResults:
     """Six ordinary results plus the top-scoring evidence child of a hoisted parent."""
     results = _SearchResults(
-        _Candidate(
+        Candidate(
             f'm{i}',
             f'ordinary candidate {i}',
             {'store_score': _TOP_SCORE - (i * _SCORE_STEP)},
@@ -235,86 +200,17 @@ def _fixture_results(parent_key: str, child_kind: str) -> _SearchResults:
         for i in range(_ORDINARY_COUNT)
     )
     results.append(
-        _Candidate(
+        Candidate(
             _CHILD_ID,
             'the child record that carries the evidence for the hoisted parent',
             {
                 'store_score': _CHILD_SCORE,
                 'kind': child_kind,
-                parent_key: _CANONICAL_ID,
+                parent_field: _CANONICAL_ID,
             },
         ),
     )
     return results
-
-
-def _is_inside(path: Path, root: Path) -> bool:
-    """Is *path* under *root*, comparing PATH COMPONENTS rather than characters?"""
-    try:
-        return path.resolve().is_relative_to(root.resolve())
-    except (OSError, ValueError):
-        # An unresolvable path is not demonstrably inside the root, and this
-        # gate fails closed.
-        return False
-
-
-def _import_triage(src_root: Path, extra_paths: list[Path]) -> Any:
-    """Import the triage module out of *src_root*, shadowing any installed copy.
-
-    *extra_paths* are first-party trees the module imports that ``--src-root``
-    lacks (``shared/src``). They go on ``sys.path`` before *src_root*, so
-    *src_root* ends up first.
-    """
-    if not src_root.is_dir():
-        raise _Unverifiable(f'--src-root is not a directory: {src_root}')
-    for extra in extra_paths:
-        sys.path.insert(0, str(extra))
-    sys.path.insert(0, str(src_root))
-    try:
-        module = importlib.import_module(_MODULE_NAME)
-    except Exception as exc:  # noqa: BLE001 - any import failure is unverifiable
-        raise _Unverifiable(
-            f'cannot import {_MODULE_NAME} from {src_root}: {exc!r}',
-        ) from exc
-    origin = getattr(module, '__file__', None)
-    # Path containment, not a string prefix: a sibling `<root>-installed`
-    # extends the root's name without being inside it.
-    if origin is None or not _is_inside(Path(origin), src_root):
-        raise _Unverifiable(
-            f'{_MODULE_NAME} resolved to {origin!r}, which is outside --src-root '
-            f'{src_root} — the probe would be testing the wrong tree',
-        )
-    return module
-
-
-def _import_judge_if_present(src_root: Path) -> Any | None:
-    """The ref's judge module, or None. NON-FATAL, unlike :func:`_import_triage`.
-
-    A tree with no importable judge module leaves the judge-target branch
-    unsatisfied, so it keeps the verdict its triage module earns rather than
-    becoming UNVERIFIABLE. ``BaseException`` for :func:`main`'s reason: a
-    ``SystemExit`` out of the ref's module body would otherwise end the probe.
-    *src_root* is already on ``sys.path`` (:func:`_import_triage`).
-    """
-    try:
-        module = importlib.import_module(_JUDGE_MODULE_NAME)
-    except BaseException as exc:  # noqa: BLE001 - see the docstring; never fatal
-        logger.warning(
-            '%s is not importable from %s, so the judge-target branch is '
-            'unsatisfied: %r', _JUDGE_MODULE_NAME, src_root, exc,
-        )
-        return None
-    origin = getattr(module, '__file__', None)
-    if origin is None or not _is_inside(Path(origin), src_root):
-        return None
-    return module
-
-
-def _require(module: Any, name: str) -> Any:
-    attr = getattr(module, name, None)
-    if attr is None:
-        raise _Unverifiable(f'{_MODULE_NAME} exposes no {name}')
-    return attr
 
 
 def _child_kind(module: Any) -> str:
@@ -328,11 +224,6 @@ def _child_kind(module: Any) -> str:
         if isinstance(kind, str) and kind:
             return kind
     return 'sighting'
-
-
-def _parent_key(module: Any) -> str:
-    key = getattr(module, 'PARENT_ID_KEY', None)
-    return key if isinstance(key, str) and key else 'parent_id'
 
 
 def _attach_id_for(module: Any, candidate: Any) -> Any:
@@ -353,7 +244,7 @@ def _attach_id_for(module: Any, candidate: Any) -> Any:
             return resolved
     meta = getattr(candidate, 'metadata', None) or {}
     if meta.get('kind') == _child_kind(module):
-        parent_id = meta.get(_parent_key(module))
+        parent_id = meta.get(parent_key(module))
         if isinstance(parent_id, str) and parent_id:
             return parent_id
     return getattr(candidate, 'id', None)
@@ -449,9 +340,9 @@ def _decision_shape_error(decision: Any) -> str | None:
 
 def _drive(module: Any, judge: _FakeJudge) -> _Run:
     """Execute ``triage_write`` once against the fixture slate."""
-    triage_write = _require(module, 'triage_write')
+    triage_write = require(module, 'triage_write')
     counter, read_fail_opens = _make_counter(module)
-    results = _fixture_results(_parent_key(module), _child_kind(module))
+    results = _fixture_results(parent_key(module), _child_kind(module))
     service = _Service(results)
 
     def failed(reason: str) -> _Run:
@@ -559,15 +450,15 @@ def _measure(module: Any) -> tuple[_Run, list[Any], Any]:
     judge = _FakeJudge(_ATTACH_OUTCOME)
     run = _drive(module, judge)
     if run.error is not None:
-        raise _Unverifiable(run.error)
+        raise Unverifiable(run.error)
     if run.fail_opens:
-        raise _Unverifiable(
+        raise Unverifiable(
             f'the module recorded {run.fail_opens} fail-open(s) on a plain, '
             f'valid {_ATTACH_OUTCOME!r} verdict, so this run measures a '
             'degraded write path rather than what the attach consumes',
         )
     if not run.calls:
-        raise _Unverifiable(
+        raise Unverifiable(
             'the judge slot was never reached — the fixture slate did not route '
             'to the judge band, so nothing here can measure what the attach '
             'consumes',
@@ -666,20 +557,6 @@ class _Fed(NamedTuple):
     matched: bool
 
 
-def _usable_parameters(fn: Any) -> list[Any]:
-    """*fn*'s parameters that can be supplied by position or by keyword."""
-    try:
-        params = list(inspect.signature(fn).parameters.values())
-    except (TypeError, ValueError):
-        return []
-    kinds = (
-        inspect.Parameter.POSITIONAL_ONLY,
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        inspect.Parameter.KEYWORD_ONLY,
-    )
-    return [p for p in params if p.kind in kinds]
-
-
 def _target_parameter_names(fn: Any) -> list[str]:
     """Names beyond the first two (the entry and the slate) that read as a target.
 
@@ -687,9 +564,7 @@ def _target_parameter_names(fn: Any) -> list[str]:
     mechanism, so ``(content, candidates, *, verdict_words=None,
     attach_target_id=None)`` still has one.
     """
-    return [
-        p.name for p in _usable_parameters(fn)[2:] if _TARGET_NAME_RE.search(p.name)
-    ]
+    return [p.name for p in usable_parameters(fn)[2:] if names_a_target(p)]
 
 
 def _judge_decision(module: Any, canonical_id: str) -> Any:
@@ -722,7 +597,7 @@ def _drive_judge_write(writer: Any, decision: Any, slate: list[Any]) -> None:
     this probe's fake service has told it nothing either way — which is what
     :func:`_statically_fed_target` then covers. ``SystemExit`` is the ref's
     too. ``KeyboardInterrupt`` is the operator's, and is let through to
-    :func:`main`, which fails closed on it.
+    ``report_fail_closed``, which fails closed on it.
     """
     service = _Service(_SearchResults())
     with contextlib.suppress(Exception, SystemExit, asyncio.CancelledError):
@@ -1034,9 +909,13 @@ def _probe(src_root: Path, extra_paths: list[Path], out: list[str]) -> int:
     out.append(
         f'write_triage attach-consumption probe — src-root={src_root}',
     )
-    module = _import_triage(src_root, extra_paths)
+    module = import_from_tree(
+        _MODULE_NAME, src_root, mode=ImportMode.FATAL, extra_paths=extra_paths,
+    )
     out.append(f'triage module: {getattr(module, "__file__", "<unknown>")}')
-    judge_module = _import_judge_if_present(src_root)
+    judge_module = import_from_tree(
+        _JUDGE_MODULE_NAME, src_root, mode=ImportMode.NON_FATAL,
+    )
 
     measured, slate, band_canonical = _measure(module)
     slate_ids = [candidate.id for candidate in slate]
@@ -1061,7 +940,7 @@ def _probe(src_root: Path, extra_paths: list[Path], out: list[str]) -> int:
         # UNVERIFIABLE, never PASS. With fewer than two candidates that are
         # distinguishable from the band's own canonical there is nothing here
         # that could tell a correct fix from a hard-coded position.
-        raise _Unverifiable(
+        raise Unverifiable(
             f'the slate {slate_ids!r} carries fewer than two candidates that '
             f'are their own canonical id and distinguishable from the band '
             f'canonical {band_canonical!r}, so no swap is possible and nothing '
@@ -1113,48 +992,14 @@ def main(argv: list[str] | None = None) -> int:
             'Repeatable.'
         ),
     )
-    # Outside the try below: a usage error is the invocation's defect, not the
-    # ref's, and keeps argparse's own exit code.
+    # Outside report_fail_closed: a usage error is the invocation's defect, not
+    # the ref's, and keeps argparse's own exit code.
     args = parser.parse_args(argv)
-
-    out: list[str] = []
-    warnings: list[str] = []
-    # The collector is the ONLY destination: otherwise logging's lastResort
-    # handler duplicates each record to stderr, which the gate drops.
-    logger.addHandler(_WarnCollector(warnings))
-    logger.propagate = False
-
-    try:
-        rc = _probe(
-            Path(args.src_root),
-            [Path(p) for p in args.extra_path],
-            out,
-        )
-    except _Unverifiable as exc:
-        out.append(f'FAIL  UNVERIFIABLE: {exc}')
-        out.append(
-            '      Failing closed — an unverifiable invariant is not a satisfied one.',
-        )
-        rc = EXIT_FAIL
-    except BaseException as exc:  # noqa: BLE001 - see below; nothing may escape
-        # BaseException, not Exception: a SystemExit(0) out of the ref's own
-        # code would otherwise exit 0 having printed nothing, a PASS to any
-        # caller that trusts rc alone. Pinned by
-        # scripts/tests/test_check_write_triage_attach_consumption.py::TestFailsClosed.
-        out.append(
-            f'FAIL  UNVERIFIABLE: the probe raised {exc!r} while evaluating the '
-            'invariant',
-        )
-        out.append(
-            '      Failing closed — an unverifiable invariant is not a satisfied one.',
-        )
-        rc = EXIT_FAIL
-
-    # LAST, and deduplicated: every run builds its own counter, so one degraded
-    # measurement would otherwise repeat once per run.
-    out.extend(dict.fromkeys(warnings))
-    sys.stdout.write('\n'.join(out) + '\n')
-    return rc
+    return report_fail_closed(
+        lambda out: _probe(
+            Path(args.src_root), [Path(p) for p in args.extra_path], out,
+        ),
+    )
 
 
 if __name__ == '__main__':
