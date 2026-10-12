@@ -4938,7 +4938,8 @@ def create_server(
         try:
             matches = [
                 e for e in worker.snapshot().get('entries', [])
-                if key.matches(e.get('request_id'), e.get('branch'), e.get('task_id'))
+                if e.get('waiter_alive', True)
+                and key.matches(e.get('request_id'), e.get('branch'), e.get('task_id'))
             ]
             if not matches:
                 return None
@@ -5060,12 +5061,11 @@ def create_server(
             MergeState.no_record, reason(MergeReason.never_submitted), key.request_id,
         )
 
-    async def _resolve(key: _PollKey, *, consult_live: bool) -> MergeStatusAnswer:
-        """Walk the tiers, live first only if *consult_live*; the first probe that raises ends it as unknown."""
+    async def _resolve(key: _PollKey) -> MergeStatusAnswer:
+        """Walk the tiers, live first; the first probe that raises ends it as unknown."""
         history = _durable_history(key)
         try:
-            live = _live_answer(key) if consult_live else None
-            answer = live or await _walk_durable(key, history)
+            answer = _live_answer(key) or await _walk_durable(key, history)
         except _ProbeFailed as failure:
             answer = failure.answer_for(key)
         last_outcome = LastOutcome.from_row(history.row) if history is not None else None
@@ -5103,7 +5103,7 @@ def create_server(
             return {'error': 'At least one of request_id, branch, or task_id is required'}
 
         key = _PollKey(request_id=request_id, branch=branch, task_id=task_id)
-        return (await _resolve(key, consult_live=True)).to_response()
+        return (await _resolve(key)).to_response()
 
     # ── merge_cancel — explicit cancellation via waiter-future cancel (PRD β2 / task 1632) ──
 
@@ -5115,9 +5115,13 @@ def create_server(
         returned by merge_request).  Returns a dict with three fields:
 
             cancelled (bool)  — True only when a pending waiter was successfully cancelled.
-            state     (str)   — Coarse terminal state; always a member of
-                                ``shared.merge_state.MergeState``.
+            state     (str)   — A ``shared.merge_state.MergeState`` member, except
+                                that the live branch relays merge_status's live
+                                state verbatim, including its deliberate
+                                forward-compatible passthrough of an unmapped worker
+                                state (escalation/src/escalation/server.py::_map_live_state).
                                 merge-state-vocab:begin partition=CANCEL_STATES
+                                'queued' | 'verifying' | 'gate' | 'finalizing' |
                                 'done' | 'conflict' | 'blocked' | 'abandoned' | 'superseded' |
                                 'no_record' | 'stale_record' | 'journaled' | 'unknown'
                                 merge-state-vocab:end
@@ -5132,13 +5136,16 @@ def create_server(
         merge_status_answer.py invariant on path 1, which surfaces as a tool
         error naming it — a server defect, never a cancel outcome):
           1. Waiter absent from _waiters (finalized+popped, never submitted, server
-             restarted, or a coalesced id): resolve the request_id through merge_status's
-             durable walk (current run → journal → prior runs → no_record; git needs a
-             branch, so it is skipped).  A current-run outcome returns that state with
-             'Request already finalized; cannot cancel.'; an epistemic answer returns its
-             state with the reason's hint.  Coalesced submissions (in_flight / attached
-             paths in merge_request) do not register a separate waiter — use the
-             in-flight request_id (inflight_task_id / merge_status) to cancel.
+             restarted, a coalesced id, or a request this server never held): resolve
+             the request_id through merge_status's walk (live → current run → journal →
+             prior runs → no_record; git needs a branch, so it is skipped).  A live hit
+             means the worker holds the request but this server has no waiter for it:
+             cancelled False with the live state, not cancellable here.  A current-run
+             outcome returns that state with 'Request already finalized; cannot
+             cancel.'; an epistemic answer returns its state with the reason's hint.
+             Coalesced submissions (in_flight / attached paths in merge_request) do
+             not register a separate waiter — use the in-flight request_id
+             (inflight_task_id / merge_status) to cancel.
           2. Waiter present, future already cancelled (idempotent double-cancel):
              {cancelled: False, state: 'abandoned', reason: ...}.
           3. Waiter present, future resolved-but-not-cancelled (mid-finalize window, i.e.
@@ -5165,7 +5172,8 @@ def create_server(
         work item at its next checkpoint via the cancel→worker CancelledError seam.
         Because retirement yields the loop (the C1 removal is awaited), the
         merge_request _waiters.pop done-callback fires during the first cancel, so an
-        immediate double-cancel finds rec=None and resolves via the current-run tier.
+        immediate double-cancel finds rec=None and resolves via the current-run tier:
+        the live tier ignores the worker's cancelled (waiter_alive False) entry.
 
         The tool is async so that future mutation runs on the event loop (not a FastMCP
         threadpool worker — PRD Open Q4 off-loop lesson).  The lookup → cancel sequence
@@ -5175,20 +5183,33 @@ def create_server(
         rec = _waiters.get(request_id)
 
         if rec is None:
-            answer = await _resolve(_PollKey(request_id=request_id), consult_live=False)
-            if answer.reason is None:
+            answer = await _resolve(_PollKey(request_id=request_id))
+            if answer.reason is not None:
                 return {
                     'cancelled': False,
                     'state': answer.state,
-                    'reason': 'Request already finalized; cannot cancel.',
+                    'reason': (
+                        f'No in-flight waiter for request_id {request_id!r}: '
+                        + hint_for(answer.reason)
+                    ),
+                }
+            if answer.source is MergeStatusSource.live:
+                return {
+                    'cancelled': False,
+                    'state': answer.state,
+                    'reason': (
+                        f'Request {request_id!r} is in the live merge queue, but this '
+                        'server holds no waiter for it, so it cannot be cancelled '
+                        "here: merge_cancel only cancels requests submitted through "
+                        "this server's merge_request that are still awaiting an "
+                        'outcome (for example, a workflow-enqueued or startup-'
+                        'recovered request has no such waiter).'
+                    ),
                 }
             return {
                 'cancelled': False,
                 'state': answer.state,
-                'reason': (
-                    f'No in-flight waiter for request_id {request_id!r}: '
-                    + hint_for(answer.reason)
-                ),
+                'reason': 'Request already finalized; cannot cancel.',
             }
 
         if rec.future.cancelled():

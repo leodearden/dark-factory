@@ -157,14 +157,13 @@ POLL_STOP_STATES = TERMINAL_STATES | EPISTEMIC_STATES
 
 #: Exactly what ``merge_cancel``'s ``state`` field can be.
 #:
-#: Its equality with POLL_STOP_STATES is INCIDENTAL, not a shared definition —
-#: these are two facts with two homes, and they answer different questions
-#: ("what can merge_cancel report" vs "what may a poll loop stop on").  Every
-#: epistemic state is here because merge_cancel's no-live-waiter miss path
-#: reuses merge_status's durable resolution, which can end in any of them.  Do
-#: not collapse the two into one constant — a policy change to either would
-#: then silently mutate the other's pinned prose span.
-CANCEL_STATES = TERMINAL_STATES | EPISTEMIC_STATES
+#: merge_cancel's no-waiter path resolves through merge_status's walk, live
+#: tier first, so it can end in any state.  A live state means the worker owns
+#: the request but this server holds no waiter for it, so it cannot be
+#: cancelled here.  This and POLL_STOP_STATES are two facts with two homes
+#: ("what can merge_cancel report" vs "what may a poll loop stop on"); do not
+#: collapse them into one constant.
+CANCEL_STATES = OUTCOME_STATES | EPISTEMIC_STATES
 
 
 class MergeReason(enum.StrEnum):

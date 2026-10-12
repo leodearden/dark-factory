@@ -73,10 +73,11 @@ _HINTS: Mapping[MergeReason, str] = types.MappingProxyType({
         'work is still not on main.'
     ),
     MergeReason.journaled_not_live: (
-        'The durable merge journal holds this request but the live worker does '
-        'not: the orchestrator is between restart and recovery, and startup '
-        'recovery re-enqueues journaled requests. Do not resubmit; the queue '
-        'still owns this request.'
+        'The durable merge journal holds this request, but the live worker '
+        'snapshot does not show it. Possibly no merge worker is reachable from '
+        'this server, or the request is between journal and queue, for example '
+        'awaiting startup recovery. Do not resubmit; the journal still owns this '
+        'request.'
     ),
     MergeReason.coalesce_train_id: (
         'This id names a coalesced train and has no outcome row of its own; '
