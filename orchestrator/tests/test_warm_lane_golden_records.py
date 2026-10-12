@@ -24,8 +24,11 @@ import json
 from pathlib import Path
 
 import pytest
+from fastmcp import Client
 
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.lane_lifecycle import LaneRecord, LaneState
+from orchestrator.mcp import plan_markup_stamp, plan_tools
 
 GOLDEN_DIR = Path(__file__).parent / 'fixtures' / 'warm_lane_golden'
 
@@ -39,6 +42,35 @@ GOLDEN_LANE_RECORD = LaneRecord(
     seeded_from_sha='0123456789abcdef0123456789abcdef01234567',
     updated_at='2026-10-12T08:15:30.123456+00:00',
 )
+
+GOLDEN_PLAN_ANALYSIS = 'Fixed analysis for the golden plan record.'
+GOLDEN_PLAN_FILES = ['orchestrator/src/example.py', 'orchestrator/tests/test_example.py']
+PREREQ_COMMIT = 'a1' * 20
+STEP_COMMIT = 'b2' * 20
+
+GOLDEN_PLAN_CALLS: list[tuple[str, dict[str, object]]] = [
+    (
+        'create_plan',
+        {
+            'task_id': GOLDEN_TASK_ID,
+            'title': GOLDEN_LANE_RECORD.title,
+            'analysis': GOLDEN_PLAN_ANALYSIS,
+            'files': GOLDEN_PLAN_FILES,
+        },
+    ),
+    ('add_prerequisite', {'prereq_id': 'pre-1', 'description': 'Set up the example fixture.'}),
+    ('add_plan_step', {'step_id': 'step-1', 'step_type': 'test', 'description': 'RED: pin the example.'}),
+    ('add_plan_step', {'step_id': 'step-2', 'step_type': 'impl', 'description': 'GREEN: implement the example.'}),
+    ('mark_step_done', {'step_id': 'pre-1', 'commit_sha': PREREQ_COMMIT}),
+    ('mark_step_done', {'step_id': 'step-1', 'commit_sha': STEP_COMMIT}),
+]
+
+
+@pytest.fixture(autouse=True)
+def _clear_pending_refusals():
+    plan_markup_stamp.clear_pending()
+    yield
+    plan_markup_stamp.clear_pending()
 
 
 def _assert_matches_golden(name: str, produced: bytes, scratch: Path) -> None:
@@ -59,6 +91,17 @@ def _assert_matches_golden(name: str, produced: bytes, scratch: Path) -> None:
     )
 
 
+async def _produce_plan_bytes(worktree: Path) -> bytes:
+    worktree.mkdir()
+    artifacts = TaskArtifacts(worktree)
+    server = plan_tools.create_server(artifacts)
+    async with Client(server) as client:
+        for tool, arguments in GOLDEN_PLAN_CALLS:
+            result = await client.call_tool(tool, arguments)
+            assert result.data['status'] == 'ok', f'{tool} refused: {result.data!r}'
+    return (artifacts.root / 'plan.json').read_bytes()
+
+
 def test_lane_state_golden_is_lane_record_to_json(tmp_path):
     produced = GOLDEN_LANE_RECORD.to_json().encode('utf-8')
     _assert_matches_golden('lane-state.json', produced, tmp_path / 'produced')
@@ -67,3 +110,9 @@ def test_lane_state_golden_is_lane_record_to_json(tmp_path):
 def test_lane_states_golden_lists_every_lane_state_member(tmp_path):
     produced = (json.dumps([member.value for member in LaneState], indent=2) + '\n').encode('utf-8')
     _assert_matches_golden('lane-states.json', produced, tmp_path / 'produced')
+
+
+@pytest.mark.asyncio
+async def test_plan_golden_is_plan_tools_writer_output(tmp_path):
+    produced = await _produce_plan_bytes(tmp_path / 'lane')
+    _assert_matches_golden('plan.json', produced, tmp_path / 'produced')
