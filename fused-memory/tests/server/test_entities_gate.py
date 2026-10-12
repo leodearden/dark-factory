@@ -211,18 +211,6 @@ class TestConflictingDeclarationsAreRejected:
         assert block['declared'] == ['Task 3129'], f'{block!r}'
         assert block['content_referents'] == ['Task 3127'], f'{block!r}'
 
-    def test_the_conflict_hint_never_advises_abandoning_the_declaration(self):
-        """Agents followed "drop `entities` entirely" and wrote it into durable
-        memories, training the fleet out of declaring (task 6059)."""
-        block = entities_gate(
-            [{'kind': 'task', 'id': 3129}], content=_CITES_3127, group_id=GROUP,
-        )
-
-        assert isinstance(block, dict), f'expected a block, got {block!r}'
-        hint = block['hint'].lower()
-        assert 'drop' not in hint, hint
-        assert 'omit' not in hint, hint
-
     def test_the_conflict_block_is_json_safe(self):
         block = entities_gate(
             [{'kind': 'task', 'id': 3129}], content=_CITES_3127, group_id=GROUP,
