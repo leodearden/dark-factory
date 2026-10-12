@@ -17,8 +17,8 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from dashboard.config import DashboardConfig
-from dashboard.data.claimant_invariants import scan_root_invariants
 from dashboard.data.db import DbPool
+from dashboard.data.root_invariants import scan_root_invariants
 from dashboard.project_dbs import TASKS_DB_REL_PATH, project_roots
 
 router = APIRouter()
