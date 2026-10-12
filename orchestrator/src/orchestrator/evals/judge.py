@@ -8,6 +8,7 @@ import logging
 import math
 import random
 import re
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from itertools import combinations
@@ -19,7 +20,7 @@ from shared.cli_invoke import no_mcp_servers_config
 from orchestrator.agents.invoke import invoke_agent
 
 from .elo import (
-    MAX_PER_PAIR,
+    MAX_UNMEASURED_PER_PAIR,
     PAIRWISE_RESULT,
     TaskPool,
     _pair_key,
@@ -235,15 +236,28 @@ async def run_tournament(
     return verdicts
 
 
+@dataclass(frozen=True)
+class TournamentTally:
+    """Judge calls that scored and calls that did not measure; both spent the round budget."""
+
+    judged: int
+    unmeasured: int
+
+
 async def run_elo_tournament(
     result_dicts: list[dict],
     task: dict,
     pool: TaskPool,
     max_rounds: int = 50,
-) -> int:
+    *,
+    max_unmeasured_per_pair: int = MAX_UNMEASURED_PER_PAIR,
+) -> TournamentTally:
     """Run Elo-based matchup selection until budget exhausted or all pairs maxed.
 
-    Mutates *pool* in place.  Returns the number of judge calls made.
+    Mutates *pool* in place with measured verdicts only: an unmeasured one
+    moves no rating and no pair count. A pair is unschedulable for this run
+    once it has *max_unmeasured_per_pair* unmeasured verdicts, or when either
+    contender has no result; neither is persisted, so a later run re-measures.
     """
     # Seed any new configs into the pool
     for r in result_dicts:
@@ -252,19 +266,21 @@ async def run_elo_tournament(
     # Build lookup: config_name → result dict
     by_config: dict[str, dict] = {r['config_name']: r for r in result_dicts}
 
-    rounds_used = 0
-    while rounds_used < max_rounds:
-        matchup = next_matchup(pool)
+    unschedulable: set[str] = set()
+    unmeasured_by_pair: Counter[str] = Counter()
+    judged = unmeasured = 0
+    while judged + unmeasured < max_rounds:
+        matchup = next_matchup(pool, skip=unschedulable)
         if matchup is None:
             logger.info('All pairs maxed out, stopping')
             break
 
         config_a, config_b = matchup
+        key = _pair_key(config_a, config_b)
 
         # Skip if either config has no result available (e.g. worktree deleted)
         if config_a not in by_config or config_b not in by_config:
-            key = _pair_key(config_a, config_b)
-            pool.pair_counts[key] = MAX_PER_PAIR  # avoid infinite loop
+            unschedulable.add(key)
             continue
 
         logger.info(
@@ -273,14 +289,24 @@ async def run_elo_tournament(
         )
 
         verdict = await run_judge(by_config[config_a], by_config[config_b], task)
-        if verdict.winner is not None:
-            record_match(
-                pool, config_a, config_b,
-                verdict.winner, verdict.confidence, verdict.reasoning,
-            )
-        rounds_used += 1
+        if verdict.winner is None:
+            unmeasured += 1
+            unmeasured_by_pair[key] += 1
+            if unmeasured_by_pair[key] >= max_unmeasured_per_pair:
+                unschedulable.add(key)
+                logger.warning(
+                    f'Elo pair {key} retired for this run after '
+                    f'{unmeasured_by_pair[key]} unmeasured verdicts'
+                )
+            continue
 
-    return rounds_used
+        record_match(
+            pool, config_a, config_b,
+            verdict.winner, verdict.confidence, verdict.reasoning,
+        )
+        judged += 1
+
+    return TournamentTally(judged=judged, unmeasured=unmeasured)
 
 
 # ---------------------------------------------------------------------------
