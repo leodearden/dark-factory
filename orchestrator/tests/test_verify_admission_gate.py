@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import itertools
+import logging
 from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
@@ -39,6 +40,12 @@ async def _until(
                 watching.result()
                 raise AssertionError('the leg finished before reaching the awaited state')
             await asyncio.sleep(0.005)
+
+
+async def _expect_cancelled(task: asyncio.Task) -> None:
+    with pytest.raises(asyncio.CancelledError):
+        async with asyncio.timeout(5):
+            await task
 
 
 def _request(label: str, role: str = 'task') -> AdmissionRequest:
@@ -95,6 +102,9 @@ class _Legs:
 
     def release(self, label: str) -> None:
         self._release[label].set()
+
+    def forget(self, label: str) -> asyncio.Task:
+        return self.tasks.pop(label)
 
     async def finish(self) -> None:
         for release in self._release.values():
@@ -338,3 +348,98 @@ class TestPolicyIsReadAtEachGrant:
         assert legs.granted[2:] == sorted({'A', 'B', 'C'} - {first})
         assert legs.grants[first].order == 'unordered'
         assert {legs.grants[label].order for label in legs.granted[2:]} == {'arrival'}
+
+
+def _loop_callback_errors(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if 'Exception in callback' in r.getMessage()
+        or 'InvalidStateError' in r.getMessage()
+        or (r.exc_info is not None and isinstance(r.exc_info[1], asyncio.InvalidStateError))
+    ]
+
+
+@pytest.mark.asyncio
+class TestCancellation:
+    async def test_a_waiter_cancelled_in_the_queue_leaves_it(self, tmp_path):
+        legs = _Legs(tmp_path, _policy())
+        await legs.hold('H')
+        await legs.queue('A')
+        await legs.queue('B')
+
+        await _expect_cancelled(_cancel(legs.forget('A')))
+
+        assert [w.request.module for w in legs.gate.snapshot().waiters] == ['B']
+        legs.release('H')
+        await legs.finish()
+        assert legs.granted == ['H', 'B']
+        assert legs.gate.snapshot().depth == 0
+        assert legs.gate.snapshot().holders == ()
+
+    @pytest.mark.parametrize('release_first', [True, False])
+    async def test_a_cancel_racing_its_grant_leaks_no_holder(self, tmp_path, caplog, release_first):
+        caplog.set_level(logging.WARNING)
+        legs = _Legs(tmp_path, _policy())
+        holder = legs.gate.admit(_request('H'), legs.read_policy)
+        await holder.__aenter__()
+        await legs.queue('A')
+        waiter = legs.forget('A')
+
+        if release_first:
+            await holder.__aexit__(None, None, None)
+            waiter.cancel()
+        else:
+            waiter.cancel()
+            await holder.__aexit__(None, None, None)
+        await _expect_cancelled(waiter)
+
+        assert legs.gate.snapshot().holders == ()
+        assert legs.gate.snapshot().depth == 0
+        async with asyncio.timeout(1):
+            async with legs.gate.admit(_request('N'), legs.read_policy) as grant:
+                assert grant.depth_at_arrival == 0
+        assert _loop_callback_errors(caplog) == []
+
+    async def test_a_body_that_raises_hands_its_turn_on(self, tmp_path):
+        legs = _Legs(tmp_path, _policy())
+        fail = asyncio.Event()
+
+        async def failing_holder() -> None:
+            async with legs.gate.admit(_request('H'), legs.read_policy):
+                await fail.wait()
+                raise RuntimeError('the admitted body failed')
+
+        holder = asyncio.create_task(failing_holder())
+        await _until(lambda: len(legs.gate.snapshot().holders) == 1, watching=holder)
+        await legs.queue('A')
+
+        fail.set()
+        with pytest.raises(RuntimeError, match='the admitted body failed'):
+            async with asyncio.timeout(5):
+                await holder
+        await legs.finish()
+
+        assert legs.granted == ['A']
+        assert legs.gate.snapshot().holders == ()
+
+    async def test_dispatch_skips_a_cancelled_waiter_it_reaches_first(self, tmp_path):
+        legs = _Legs(tmp_path, _policy())
+        holder = legs.gate.admit(_request('H'), legs.read_policy)
+        await holder.__aenter__()
+        await legs.queue('A')
+        await legs.queue('B')
+
+        cancelled = legs.forget('A')
+        cancelled.cancel()
+        await holder.__aexit__(None, None, None)
+        await _expect_cancelled(cancelled)
+        await legs.finish()
+
+        assert legs.granted == ['B']
+        assert legs.gate.snapshot().depth == 0
+        assert legs.gate.snapshot().holders == ()
+
+
+def _cancel(task: asyncio.Task) -> asyncio.Task:
+    task.cancel()
+    return task
