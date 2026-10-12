@@ -17,10 +17,17 @@ import pytest_asyncio
 from shared.cli_invoke import AgentResult
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import StageAgentOutcome, StageId, StageReport
+from fused_memory.models.reconciliation import (
+    StageAgentOutcome,
+    StageId,
+    StageReport,
+    Watermark,
+)
+from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.cli_stage_runner import StageResult, run_stage_via_cli
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 from fused_memory.reconciliation.sandbox_guard import RemediationSandboxUnavailable
+from fused_memory.reconciliation.stages.task_knowledge_sync import IntegrityCheck
 from fused_memory.reconciliation.summary_pool import write_cycle_summary
 from fused_memory.services.memory_service import MemoryService
 
@@ -307,3 +314,54 @@ class TestPresenceReportsAgentOutcome:
         assert result.get('ledger_available') is False
         assert 'agent_outcome' in result
         assert result['agent_outcome'] is None
+
+
+def _payload_section(payload: str, header: str) -> str:
+    _, _, after_header = payload.partition(f'{header}\n')
+    section, _, _ = after_header.partition('\n### ')
+    return section
+
+
+class TestStage3PayloadNamesAgentOutcome:
+    @staticmethod
+    def _integrity_check() -> IntegrityCheck:
+        return IntegrityCheck(
+            StageId.integrity_check,
+            memory_service=AsyncMock(),
+            taskmaster=AsyncMock(),
+            journal=AsyncMock(),
+            config=ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test'),
+            scope=ProjectScope(ProjectId('test_project'), ProjectRoot('/tmp/test')),
+        )
+
+    async def _payload(self, prior_reports: list[StageReport]) -> str:
+        return await self._integrity_check().assemble_payload(
+            [], Watermark(project_id='test_project'), prior_reports=prior_reports,
+        )
+
+    @pytest.mark.asyncio
+    async def test_each_prior_stage_section_names_its_agent_outcome(self):
+        stage1 = _stage_report(
+            stage=StageId.memory_consolidator,
+            agent_outcome=StageAgentOutcome.completed,
+            llm_calls=4,
+        )
+        stage2 = _stage_report(
+            agent_outcome=StageAgentOutcome.zero_output_timeout, llm_calls=0,
+        )
+
+        payload = await self._payload([stage1, stage2])
+
+        assert 'Agent outcome: completed' in _payload_section(payload, '### Stage 1 Report')
+        assert 'Agent outcome: zero_output_timeout' in _payload_section(
+            payload, '### Stage 2 Report',
+        )
+
+    @pytest.mark.asyncio
+    async def test_unrecorded_outcome_is_named_unrecorded(self):
+        stage1 = _stage_report(stage=StageId.memory_consolidator)
+        stage2 = _stage_report(agent_outcome=StageAgentOutcome.completed)
+
+        payload = await self._payload([stage1, stage2])
+
+        assert 'Agent outcome: unrecorded' in _payload_section(payload, '### Stage 1 Report')
