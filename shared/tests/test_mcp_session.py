@@ -203,7 +203,7 @@ class TestRequestRetry:
         assert excinfo.value.__cause__ is cause
 
 
-class TestTimeoutCausePredicate:
+class TestIsTimeoutFailure:
     """``is_timeout_failure`` recovers the timeout fact the exhausted-retry wrap erases."""
 
     async def _drive(self, cause: Exception) -> McpCallError:

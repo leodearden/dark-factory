@@ -1045,10 +1045,10 @@ class TestFailureClassification:
 
     @staticmethod
     def _exhausted(cause: Exception) -> RuntimeError:
-        """The wrap ``McpSession._raw_call`` raises on retry exhaustion.
+        """The wrap ``shared.mcp_session.McpSession.call`` raises on retry exhaustion.
 
         The shape itself is pinned against the real retry loop in
-        ``test_mcp_retry.py::TestTimeoutCausePredicate``.
+        ``shared/tests/test_mcp_session.py::TestIsTimeoutFailure``.
         """
         err = RuntimeError(
             f'MCP tools/call failed after 3 attempts: {type(cause).__name__}: {cause}'

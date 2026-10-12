@@ -1926,7 +1926,7 @@ def _report_regression(row: DebtRow, hook: Callable[[DebtRow], None] | None) -> 
 # How long, in seconds, the owner read that closes a cycle may take.  A healthy
 # `get_task` answers in well under a second, but `mcp_call` retries through a
 # fused-memory restart for ~120s
-# (`orchestrator/src/orchestrator/mcp_lifecycle.py::McpSession._retry_backoffs`).
+# (the `retry_backoffs` `orchestrator/src/orchestrator/mcp_lifecycle.py::fm_session` injects).
 _RESOLVE_BUDGET_SECS = 10.0
 
 

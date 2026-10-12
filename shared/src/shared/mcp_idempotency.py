@@ -1,5 +1,5 @@
-"""Client-op-id idempotency helper shared by the orchestrator and dashboard
-``McpSession`` twins (task 2712 / task 2766).
+"""Client-op-id idempotency helper shared by ``shared.mcp_session.McpSession``
+and the dashboard's ``McpSession`` twin (task 2712 / task 2766).
 
 Both twins post JSON-RPC ``tools/call`` requests to a fused-memory MCP
 Streamable HTTP endpoint and want the same handful of mutating task tools to
@@ -11,9 +11,10 @@ verbatim — in ``orchestrator/src/orchestrator/mcp_lifecycle.py`` and
 frozenset and injection helper into one place so the two copies cannot drift.
 
 Caveat (unchanged by this hoist): the two call sites differ in what surrounds
-this helper. The orchestrator's ``_raw_call`` calls
+this helper. ``shared.mcp_session.McpSession`` calls
 ``maybe_inject_client_op_id`` ONCE before its transport retry loop, so every
-retry of a logical call reuses the same key. The dashboard's ``_raw_call`` has
+retry of a logical call reuses the same key; ``SyncMcpSession`` does not inject,
+because it has no retry loop. The dashboard's ``_raw_call`` has
 no transport retry loop, so each invocation generates a fresh key when none is
 supplied — see the dashboard twin's docstring for the full caveat. Only the
 frozenset + injection helper are de-duplicated here; each call site's

@@ -58,9 +58,10 @@ The ingredients stay public — :data:`MCP_POST_HEADERS`,
 :func:`decode_mcp_response_body` — for a caller that genuinely needs a
 non-``tools/call`` request or a hand-built envelope.
 
-``orchestrator.mcp_lifecycle.McpSession`` (the session-handshake transport)
-consumes :data:`MCP_POST_HEADERS`, :func:`mcp_endpoint_url` and
-:func:`decode_mcp_response_body`, so the orchestrator holds no copy of them.
+``shared.mcp_session``'s ``McpSession`` and ``SyncMcpSession`` (the
+session-handshake transports) consume :data:`MCP_POST_HEADERS`,
+:func:`mcp_endpoint_url` and :func:`decode_mcp_response_body`, so neither
+holds a copy of them.
 
 ONE TWIN REMAINS.  ``dashboard/src/dashboard/data/memory.py`` still carries
 its own ``MCP_HEADERS``, ``_parse_mcp_response`` and ``_parse_sse_response``.
@@ -135,9 +136,9 @@ def mcp_endpoint_url(base_url: str) -> str:
 
     The ``rstrip('/')`` is load-bearing, not cosmetic — a configured base that
     already ends in ``/`` would otherwise produce ``…//mcp``, which is a
-    different path than the server mounts.  ``McpSession.__init__``
-    (``orchestrator/src/orchestrator/mcp_lifecycle.py``) builds its endpoint
-    with this function.
+    different path than the server mounts.  ``McpSession`` and
+    ``SyncMcpSession`` (``shared/src/shared/mcp_session.py``) build their
+    endpoint with this function.
 
     >>> mcp_endpoint_url('http://127.0.0.1:8002')
     'http://127.0.0.1:8002/mcp'

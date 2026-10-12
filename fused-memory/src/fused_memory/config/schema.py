@@ -2151,8 +2151,10 @@ class ReconciliationConfig(BaseModel):
             'Resolved-caller prefixes permitted to record a `deterministic-*` '
             'done provenance (PRD C5). The orchestrator sends no agent_id, so '
             'server/tools.py::_resolve_identity falls back to the '
-            'clientInfo.name that server/mcp_lifecycle.py::McpSession.initialize '
-            "advertises — the literal 'orchestrator', which is why that is the "
+            'clientInfo.name the orchestrator advertises '
+            '(orchestrator/src/orchestrator/mcp_lifecycle.py::ORCHESTRATOR_MCP_IDENTITY, '
+            'sent by shared/src/shared/mcp_session.py::McpSession.initialize) '
+            "— the literal 'orchestrator', which is why that is the "
             'sole default. DENY-ON-MISSING is the consumer contract: a caller '
             'matching no prefix is refused, and an EMPTY list denies every '
             'caller (the live kill switch for the provenance kind). The '

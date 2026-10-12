@@ -414,8 +414,8 @@ logger = logging.getLogger(__name__)
 #
 # The cross-unit blocking deploy may restart the very service backing the
 # orchestrator's own fused-memory/MCP connection (e.g. task 2059), severing
-# it for the duration of a `--drain` restart.  `McpSession._raw_call`
-# (mcp_lifecycle.py) opens a fresh httpx.AsyncClient and re-inits the session
+# it for the duration of a `--drain` restart.  `shared.mcp_session.McpSession.call`
+# opens a fresh httpx.AsyncClient and re-inits the session
 # on any transient failure, so the NEXT call auto-reconnects — a successful
 # write IS the reconnection proof.  The post-deploy verify+writeback retry
 # budget (``DeterministicRunner._writeback_backoffs``) sizes off the shared
@@ -2498,7 +2498,7 @@ class DeterministicRunner:
         Task 2066: the cross-unit deploy script may restart the very service
         backing the orchestrator's own fused-memory/MCP connection (e.g. task
         2059), severing it for the duration of a ``--drain`` restart.  Because
-        ``McpSession._raw_call`` auto-reconnects on the next call after any
+        ``shared.mcp_session.McpSession.call`` auto-reconnects on the next call after any
         transient failure, a plain patient retry — not an explicit reconnect —
         is sufficient: a successful write IS the reconnection proof.
 
