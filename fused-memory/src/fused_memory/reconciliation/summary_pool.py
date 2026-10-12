@@ -705,7 +705,7 @@ async def trailing_incomplete_agent_run_ids(
     if ledger is None:
         return frozenset()
     try:
-        rows = await ledger.list_by_kind(project_id, 'cycle_summary', 'active')
+        rows = await ledger.list_by_kind(project_id, _KIND_CYCLE_SUMMARY, 'active')
     except Exception:
         logger.warning(
             'reconciliation.trailing_incomplete_agent_run_ids: '
@@ -720,16 +720,19 @@ async def trailing_incomplete_agent_run_ids(
     for row in reversed(rows):
         if row.flag_type != stage:
             continue
-        outcome = _recorded_agent_outcome(row)
+        outcome = decode_cycle_summary_agent_outcome(row)
         if outcome is None or outcome is StageAgentOutcome.completed:
             break
         owed.add(row.run_id)
     return frozenset(owed)
 
 
-def _recorded_agent_outcome(record: ReconLedgerRecord) -> StageAgentOutcome | None:
-    """Decode *record*'s ``agent_outcome`` with the tolerance of
-    ``services/memory_service.py::MemoryService.get_cycle_summary_presence``."""
+def decode_cycle_summary_agent_outcome(record: ReconLedgerRecord) -> StageAgentOutcome | None:
+    """Decode the ``agent_outcome`` that :func:`write_cycle_summary` stamped on *record*.
+
+    ``None`` means unrecorded: a legacy row without the key, an explicit
+    ``None``, an unknown value, or a payload that does not decode to a JSON object.
+    """
     try:
         payload = json.loads(record.payload_json)
     except (TypeError, ValueError):
