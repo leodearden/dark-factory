@@ -7,6 +7,7 @@ layout and ladder rather than any checker's prose. The checkers' own output is
 pinned separately, byte for byte, by test_unit_parity_cli_contract.py.
 """
 
+import importlib.util
 import io
 import os
 import pathlib
@@ -444,3 +445,149 @@ def test_emit_block_renders_header_entries_then_each_tail_line():
         "[t] [tag] T1",
         "[t] [tag] T2",
     ]
+
+
+# ---------------------------------------------------------------------------
+# The Environment= policy table
+# ---------------------------------------------------------------------------
+
+
+def _policy(name="X", *, family=None, host_local=False, compared=True, required_value=None):
+    return parity.EnvPolicy(
+        family if family is not None else parity.UnitFamily.FUSED_MEMORY,
+        name,
+        host_local=host_local,
+        compared_cross_copy=compared,
+        required_value=required_value,
+    )
+
+
+def test_a_host_local_row_that_is_also_required_is_rejected_naming_row_and_fields():
+    with pytest.raises(ValueError) as excinfo:
+        _policy("X", host_local=True, compared=False, required_value="v")
+
+    message = str(excinfo.value)
+    assert parity.UnitFamily.FUSED_MEMORY.value in message
+    assert "'X'" in message
+    assert "host_local" in message
+    assert "required_value" in message
+
+
+def test_a_host_local_row_whose_value_is_compared_cross_copy_is_rejected_naming_the_row():
+    with pytest.raises(ValueError) as excinfo:
+        _policy("X", host_local=True, compared=True)
+
+    message = str(excinfo.value)
+    assert parity.UnitFamily.FUSED_MEMORY.value in message
+    assert "'X'" in message
+    assert "compared_cross_copy" in message
+
+
+@pytest.mark.parametrize("name", ["", "A=B", "A B", "A\tB", "A\nB"])
+def test_a_name_that_cannot_be_an_environment_variable_is_rejected(name):
+    with pytest.raises(ValueError, match="name"):
+        _policy(name)
+
+
+def test_a_required_value_spanning_lines_is_rejected():
+    with pytest.raises(ValueError, match="required_value"):
+        _policy("X", required_value="a\nb")
+
+
+def test_a_table_declaring_one_family_and_name_twice_is_rejected_naming_it():
+    first = _policy("DUP", compared=True)
+    second = _policy("DUP", compared=False)
+
+    with pytest.raises(ValueError) as excinfo:
+        parity.EnvPolicyTable((first, second))
+
+    message = str(excinfo.value)
+    assert parity.UnitFamily.FUSED_MEMORY.value in message
+    assert "'DUP'" in message
+
+
+def test_one_name_in_two_families_is_two_rows():
+    table = parity.EnvPolicyTable(
+        (
+            _policy("SAME", family=parity.UnitFamily.DASHBOARD),
+            _policy("SAME", family=parity.UnitFamily.FUSED_MEMORY),
+        )
+    )
+
+    assert len(table.rows) == 2
+
+
+def _synthetic_table() -> "parity.EnvPolicyTable":
+    dash, fused = parity.UnitFamily.DASHBOARD, parity.UnitFamily.FUSED_MEMORY
+    return parity.EnvPolicyTable(
+        (
+            _policy("D_LOCAL_B", family=dash, host_local=True, compared=False),
+            _policy("F_REQUIRED_B", family=fused, required_value="2"),
+            _policy("D_BLESSED", family=dash, compared=False),
+            _policy("F_LOCAL", family=fused, host_local=True, compared=False),
+            _policy("D_LOCAL_A", family=dash, host_local=True, compared=False),
+            _policy("F_REQUIRED_A", family=fused, required_value="a b=c"),
+            _policy("D_COMPARED", family=dash, compared=True),
+        )
+    )
+
+
+def test_host_local_names_are_that_familys_in_table_order():
+    table = _synthetic_table()
+
+    assert table.host_local_names(parity.UnitFamily.DASHBOARD) == ("D_LOCAL_B", "D_LOCAL_A")
+    assert table.host_local_names(parity.UnitFamily.FUSED_MEMORY) == ("F_LOCAL",)
+
+
+def test_divergence_allowlist_is_the_familys_names_not_compared_cross_copy():
+    table = _synthetic_table()
+
+    allowlist = table.divergence_allowlist(parity.UnitFamily.DASHBOARD)
+
+    assert isinstance(allowlist, frozenset)
+    assert allowlist == frozenset({"D_LOCAL_B", "D_BLESSED", "D_LOCAL_A"})
+    assert table.divergence_allowlist(parity.UnitFamily.FUSED_MEMORY) == frozenset({"F_LOCAL"})
+
+
+def test_required_directives_are_the_familys_required_rows_as_environment_lines():
+    table = _synthetic_table()
+
+    assert table.required_directives(parity.UnitFamily.FUSED_MEMORY) == (
+        "Environment=F_REQUIRED_B=2",
+        "Environment=F_REQUIRED_A=a b=c",
+    )
+    assert table.required_directives(parity.UnitFamily.DASHBOARD) == ()
+
+
+_B5_ROW = (
+    "\nENV_POLICY = EnvPolicyTable((*ENV_POLICY.rows, EnvPolicy(UnitFamily.FUSED_MEMORY, "
+    '"B5_PROBE", host_local=True, compared_cross_copy=False, required_value="x")))\n'
+)
+
+
+def _exec_copy(tmp_path: pathlib.Path, appended: str) -> None:
+    tmp_path.mkdir()
+    copy = tmp_path / "envpolicy_b5.py"
+    copy.write_text(pathlib.Path(parity.__file__).read_text(encoding="utf-8") + appended)
+    spec = importlib.util.spec_from_file_location("envpolicy_b5", copy)
+    assert spec is not None and spec.loader is not None
+    spec.loader.exec_module(importlib.util.module_from_spec(spec))
+
+
+def test_a_module_declaring_a_required_host_local_row_fails_at_import(tmp_path):
+    _exec_copy(tmp_path / "control", "")
+
+    with pytest.raises(ValueError, match="B5_PROBE"):
+        _exec_copy(tmp_path / "b5", _B5_ROW)
+
+
+def test_every_familys_preserved_names_are_on_its_divergence_allowlist():
+    for family in parity.UnitFamily:
+        preserved = parity.ENV_POLICY.host_local_names(family)
+
+        assert preserved, family
+        assert set(preserved) <= parity.ENV_POLICY.divergence_allowlist(family), family
+
+
+def test_the_live_table_requires_fused_memory_environment_lines():
+    assert parity.ENV_POLICY.required_directives(parity.UnitFamily.FUSED_MEMORY)
