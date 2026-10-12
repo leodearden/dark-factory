@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 
 import pytest
 
@@ -17,6 +18,7 @@ from shared.mcp_envelope import (
     EnvelopeShape,
     parse_tool_result,
     resolver_failed,
+    write_failure_reason,
 )
 
 # ---------------------------------------------------------------------------
@@ -24,7 +26,7 @@ from shared.mcp_envelope import (
 # ---------------------------------------------------------------------------
 
 
-def _env(payload_obj):
+def _env(payload_obj) -> dict[str, Any]:
     """Build a minimal MCP tool-result envelope around *payload_obj*."""
     return {
         "result": {
@@ -35,7 +37,7 @@ def _env(payload_obj):
     }
 
 
-def _is_error_env(**extra):
+def _is_error_env(**extra) -> dict[str, Any]:
     """An isError reply whose text block would otherwise read as a success."""
     return {
         "result": {
@@ -566,31 +568,26 @@ _WRITE_REPLIES = [
 
 
 class TestWriteFailureReason:
-    @pytest.fixture
-    def write_failure_reason(self):
-        from shared.mcp_envelope import write_failure_reason
-
-        return write_failure_reason
-
     @pytest.mark.parametrize("reply,is_failure", _WRITE_REPLIES, ids=repr)
-    def test_truth_table(self, write_failure_reason, reply, is_failure):
+    def test_truth_table(self, reply, is_failure):
         reason = write_failure_reason(reply)
         assert (reason is not None) == is_failure
         if is_failure:
             assert isinstance(reason, str) and reason
 
-    def test_error_reason_names_the_error_type_and_text(self, write_failure_reason):
+    def test_error_reason_names_the_error_type_and_text(self):
         reason = write_failure_reason(
             {"error": "backlog is 900 deep", "error_type": "ReconciliationBacklogExceeded"}
         )
+        assert reason is not None
         assert "ReconciliationBacklogExceeded" in reason
         assert "backlog is 900 deep" in reason
 
     @pytest.mark.parametrize("reply", [None, "ok", [], 42], ids=repr)
-    def test_non_dict_reason_names_the_type(self, write_failure_reason, reply):
-        assert type(reply).__name__ in write_failure_reason(reply)
+    def test_non_dict_reason_names_the_type(self, reply):
+        assert type(reply).__name__ in str(write_failure_reason(reply))
 
-    def test_empty_reply_is_never_success(self, write_failure_reason):
+    def test_empty_reply_is_never_success(self):
         reason = write_failure_reason({})
         assert reason is not None
         assert "no positive write signal" in reason

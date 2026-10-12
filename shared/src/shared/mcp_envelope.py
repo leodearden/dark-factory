@@ -10,6 +10,7 @@ Public API::
     from shared.mcp_envelope import (
         parse_tool_result,
         resolver_failed,
+        write_failure_reason,
         EnvelopeParseError,
         EnvelopeShape,
     )
@@ -29,6 +30,7 @@ from typing import Any
 __all__ = [
     'parse_tool_result',
     'resolver_failed',
+    'write_failure_reason',
     'EnvelopeParseError',
     'EnvelopeShape',
 ]
@@ -263,3 +265,35 @@ def resolver_failed(value: Any, err: Exception | None) -> bool:
         (anything, <err>) → True    # error present → wait/escalate
     """
     return err is not None or not value
+
+
+# ---------------------------------------------------------------------------
+# write_failure_reason
+# ---------------------------------------------------------------------------
+
+
+def _clip(value: Any) -> str:
+    return repr(value)[:200]
+
+
+def write_failure_reason(reply: object) -> str | None:
+    """Return why *reply* is not a successful write, or ``None`` iff it is one.
+
+    *reply* is the tool's own reply — ``parse_tool_result(body, None, dict)``'s
+    value — never the JSON-RPC envelope.  ``@mcp_tool_errors`` turns every
+    server-side exception into an ordinary reply, so a rejection arrives here
+    as a dict.  ``success`` defaults to True because ``update_task`` answers
+    with the updated record, which carries no ``success`` key.
+    """
+    if not isinstance(reply, dict):
+        return f'server reply was not a dict: {type(reply).__name__}: {_clip(reply)}'
+    if not reply:
+        return 'server reply was empty ({}) — it carries no positive write signal'
+    if reply.get('error'):
+        error_type = reply.get('error_type')
+        named = f'{error_type}: ' if error_type else ''
+        return f'server returned an error: {named}{reply["error"]}'
+    if not reply.get('success', True):
+        detail = reply.get('error_type') or reply.get('message') or _clip(reply)
+        return f'server reported failure: {detail}'
+    return None
