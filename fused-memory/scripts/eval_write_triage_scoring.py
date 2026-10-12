@@ -49,6 +49,7 @@ contradiction detector was validated in both directions.
 from __future__ import annotations
 
 import importlib.util
+import sys
 import types
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -69,8 +70,6 @@ _CALIBRATE_PATH = Path(__file__).resolve().parent / 'calibrate_write_triage.py'
 
 def _load_script(path: Path, mod_name: str) -> types.ModuleType:
     """Load a ``scripts/`` sibling by path, cached in ``sys.modules``."""
-    import sys  # noqa: PLC0415
-
     cached = sys.modules.get(mod_name)
     if cached is not None:
         return cached

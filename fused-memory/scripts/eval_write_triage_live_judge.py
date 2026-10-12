@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import sys
 import types
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -36,8 +37,6 @@ _SCRIPTS = Path(__file__).resolve().parent
 
 def _load_script(path: Path, mod_name: str) -> types.ModuleType:
     """Load a ``scripts/`` sibling by path, cached in ``sys.modules``."""
-    import sys  # noqa: PLC0415
-
     cached = sys.modules.get(mod_name)
     if cached is not None:
         return cached

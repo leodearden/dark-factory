@@ -49,6 +49,7 @@ import contextlib
 import importlib.util
 import json
 import logging
+import sys
 import types
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
@@ -73,8 +74,6 @@ _DEFAULT_REPORT_PATH = str(
 
 def _load_script(path: Path, mod_name: str) -> types.ModuleType:
     """Load a ``scripts/`` sibling by path, cached in ``sys.modules``."""
-    import sys  # noqa: PLC0415
-
     cached = sys.modules.get(mod_name)
     if cached is not None:
         return cached
@@ -463,8 +462,6 @@ def apply_field_chars(config: Any, requested: int | None) -> int:
     A negative width is refused: the resolver would silently read the default
     instead, so the provenance would record a width the judge never used.
     """
-    import sys  # noqa: PLC0415
-
     from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
         resolve_judge_field_chars,
     )
