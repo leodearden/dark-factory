@@ -273,7 +273,9 @@ def usable_parameters(fn: Any) -> list[inspect.Parameter]:
 #: merely interpolates the band canonical into a header line is an ordinary
 #: prompt-legibility change binding no verdict to any candidate, and it PASSED,
 #: authorising the production ``write_triage.enabled`` flip on a change that
-#: establishes nothing.
+#: establishes nothing. A WARN on that pass mitigated nothing: on a PASS the
+#: gate exits 0, files no escalation and forwards its stdout nowhere, so no
+#: operator ever reads it.
 #:
 #: Only ``attach``/``target``/``candidate_id`` survive — spellings that can
 #: name the attach target and little else. The cost of narrowing is bounded: a

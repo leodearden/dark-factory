@@ -67,8 +67,9 @@ _ECHO_FORGIVEN = 'ACCEPTED ON AN ECHOED, TARGET-NAMED PARAMETER'
 #: The machine-detectable channel for a name-assisted pass. A WARN alone is
 #: no mitigation: on a PASS the gate exits 0, DeterministicRunner files no
 #: escalation and the gate's stdout is forwarded nowhere, so no operator ever
-#: reads it — verbatim the argument _TARGET_NAME_RE's own comment uses to
-#: reject the `canonical` false PASS.
+#: reads it — verbatim the argument
+#: _write_triage_probe_common.py::TARGET_NAME_RE's own comment uses to reject
+#: the `canonical` false PASS.
 _PENDING = 'PASS-NEEDS-CONFIRMATION'
 _GATE_PENDING = 'ITEM 1 NEEDS CONFIRMATION'
 _BARE_STR = 'returns a bare str'
@@ -543,7 +544,8 @@ def parse_judge_verdict(raw, candidates=None):
     # canonical is interpolated into a header line; nothing binds any verdict to
     # any candidate, the candidate list stays flat and undifferentiated, and
     # parse_judge_verdict still returns a bare str. Reviewer-reported false
-    # PASS: `canonical` was in _TARGET_NAME_RE, so the echo control was forgiven
+    # PASS: `canonical` was in the target-name regex (now
+    # _write_triage_probe_common.py::TARGET_NAME_RE), so the echo control was forgiven
     # and the probe printed "option (b): satisfied ... via 'canonical_id'" and
     # exited 0 -- authorising the production flip on a change that establishes
     # nothing.
@@ -1163,7 +1165,7 @@ class TestProbeCannotPassByExiting:
     whose stated EXIT-CODE CONTRACT is that an invariant which could not be
     verified is not a satisfied one.
 
-    _import_judge already caught BaseException for precisely this reason, so
+    The judge import already caught BaseException for precisely this reason, so
     the convention existed and was simply not applied at the outer arm. Both
     halves are pinned here: the probe must fail closed, AND the gate must not
     take rc==0 on faith from a report that never claimed a PASS.
@@ -1948,8 +1950,8 @@ class TestFlipPreconditionsScript:
         target-NAMED, and on a PASS the gate exits 0, DeterministicRunner files
         no escalation, and the gate's stdout is forwarded nowhere. The
         `_echo_forgiven_note` WARN therefore mitigated nothing — which is
-        verbatim the argument `_TARGET_NAME_RE`'s comment uses to reject the
-        `canonical` false PASS. Give it a machine-detectable channel instead.
+        verbatim the argument `_write_triage_probe_common.py::TARGET_NAME_RE`'s
+        comment uses to reject the `canonical` false PASS. Give it a machine-detectable channel instead.
         """
         repo = _make_gate_repo(
             tmp_path,
