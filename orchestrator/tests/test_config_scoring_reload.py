@@ -16,9 +16,11 @@ from orchestrator.config import (
     CONTINUITY_CREDIT,
     CPM_BUDGET,
     CPM_D_CAP,
+    RELOADABLE_FIELDS,
     TIER_WIDTH,
     OrchestratorConfig,
     ScoringConfig,
+    apply_reload,
 )
 
 
@@ -108,3 +110,59 @@ class TestContinuityBelowCpmInvariant:
 def test_a_d_cap_below_one_is_rejected(bad_cap):
     with pytest.raises(ValidationError, match='cpm_d_cap'):
         ScoringConfig(cpm_d_cap=bad_cap)
+
+
+class TestScoringReloadDisposition:
+    """D8: every scoring knob is green-tier, so a retune costs a reload, not a fleet restart."""
+
+    @pytest.fixture(autouse=True)
+    def _no_config_file(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+
+    @pytest.mark.parametrize('leaf', list(ScoringConfig.model_fields))
+    def test_every_leaf_is_reloadable(self, leaf):
+        assert f'scoring.{leaf}' in RELOADABLE_FIELDS
+
+    def test_legacy_formula_knobs_stay_restart_tier(self):
+        assert 'age_alpha' not in RELOADABLE_FIELDS
+        assert 'cpm_beta' not in RELOADABLE_FIELDS
+
+    def test_a_retune_applies_in_place_to_held_references(self):
+        live = OrchestratorConfig()
+        held = live.scoring
+        fresh = OrchestratorConfig(
+            scoring=ScoringConfig(age_half_secs=86400.0, new_scoring_min_anchor_coverage=0.75),
+        )
+
+        report = apply_reload(live, fresh)
+
+        assert report['reloaded'] is True
+        for path in ('scoring.age_half_secs', 'scoring.new_scoring_min_anchor_coverage'):
+            assert path in report['applied']
+            assert path not in report['restart_required']
+        assert live.scoring is held
+        assert held.age_half_secs == 86400.0
+        assert held.new_scoring_min_anchor_coverage == 0.75
+
+    def test_a_budget_move_applies_though_one_leaf_order_is_transiently_over_the_tier(self):
+        live = OrchestratorConfig()
+        fresh = OrchestratorConfig(scoring=ScoringConfig(cpm_budget=400.0, age_budget=400.0))
+        cpm_first = fresh.scoring.cpm_budget + live.scoring.age_budget + live.scoring.continuity_credit
+        assert cpm_first > TIER_WIDTH - 1
+
+        report = apply_reload(live, fresh)
+
+        assert report['reloaded'] is True, report['error']
+        assert (live.scoring.cpm_budget, live.scoring.age_budget) == (400.0, 400.0)
+
+    def test_a_reload_crossing_the_tier_is_rejected_and_rolled_back(self):
+        live = OrchestratorConfig()
+        fresh = OrchestratorConfig()
+        object.__setattr__(fresh.scoring, 'age_budget', 900.0)
+
+        report = apply_reload(live, fresh)
+
+        assert report['reloaded'] is False
+        assert 'age_budget' in report['error']
+        assert live.scoring.age_budget == AGE_BUDGET
