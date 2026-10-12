@@ -45,18 +45,16 @@ from fused_memory.utils.validation import InputValidationError
 
 logger = logging.getLogger(__name__)
 
-#: Remediation for a declaration the content contradicts.  Names BOTH
-#: legitimate remedies, and says explicitly that omitting the parameter is
-#: always safe — an agent that reads "your referents were rejected" and cannot
-#: tell whether silence is also rejected will start guessing, and a guessed
-#: declaration is the misattribution this PRD exists to prevent.
+#: Remediation for a declaration the content contradicts.  Both remedies KEEP
+#: the declaration: a hint that offered removing it trained agents out of the
+#: feature, and they recorded that advice as durable memories (task 6059).
 _ENTITIES_CONFLICT_HINT = (
-    'The referents you declared in `entities` are contradicted by your own '
-    'content (see conflicts/content_referents). Either correct `entities` to '
-    'name what the content is actually about, or drop `entities` entirely and '
-    'let the content scan derive the set for you. This gate rejects only a '
-    'CONFLICT, never an absence: omitting `entities` — or passing [] to record '
-    'that you considered referents and none applied — always succeeds.'
+    'Your content contradicts a referent you declared in `entities` (see '
+    'conflicts/content_referents): it names a task one typo away from a '
+    'declared id, or names the declared number under a different project. '
+    'If the declared id is wrong, correct it in `entities`. If it is right, '
+    'spell that task as `task NNN` in the content so the scan can corroborate '
+    'it. Keep declaring: `entities` is how a write states what it is about.'
 )
 
 

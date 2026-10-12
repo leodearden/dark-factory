@@ -3261,9 +3261,12 @@ def create_mcp_server(
         declaration your own content CONTRADICTS is rejected
         (error_type=DeclaredReferentConflictRejected) and the episode is not
         ingested — the block names both what you declared and what the content
-        actually cites. Only a conflict is ever rejected: omitting `entities`,
-        or passing [] to record that you considered referents and none applied,
-        always succeeds.
+        actually cites. A conflict is a near-miss typo (the content names a
+        task one edit away from a declared id and writes the declared number
+        nowhere) or the declared number under another project. Fix the id if
+        it is wrong; if it is right, write `task NNN` in the content. Only a
+        conflict is ever rejected: an absent declaration, or [] (you
+        considered referents and none applied), never is.
 
         Args:
             content: Raw text, conversation, or JSON to ingest
@@ -3300,13 +3303,14 @@ def create_mcp_server(
                 is NOT "all entities": extraction legitimately derives entities
                 no caller could predict, and this parameter names only the
                 referents the episode is ABOUT. A declaration the content
-                contradicts is REJECTED
+                contradicts — a near-miss typo of a declared task number, or
+                that number under another project — is REJECTED
                 (error_type=DeclaredReferentConflictRejected) and nothing is
-                ingested. ANY wrong shape — a bare string, a single un-wrapped
-                dict, a bad entry inside the list — is rejected as a
-                ValidationError whose message carries the accepted entry shape,
-                so you never have to guess the remedy. Absence is never
-                rejected, so omitting this always succeeds.
+                ingested; fix the id, or write `task NNN` in the content. ANY
+                wrong shape — a bare string, a single un-wrapped dict, a bad
+                entry inside the list — is rejected as a ValidationError whose
+                message carries the accepted entry shape, so you never have to
+                guess the remedy. Absence is never rejected.
                 One asymmetry against add_memory, and it is a tier below this
                 parameter: add_episode persists no metadata, so there is no
                 metadata['task_id'] fallback here — a declaration overrides
@@ -3590,9 +3594,12 @@ def create_mcp_server(
         all. A declaration your own content CONTRADICTS is rejected
         (error_type=DeclaredReferentConflictRejected) and the write does not
         happen — the block names both what you declared and what the content
-        actually cites. Only a conflict is ever rejected: omitting `entities`,
-        or passing [] to record that you considered referents and none applied,
-        always succeeds.
+        actually cites. A conflict is a near-miss typo (the content names a
+        task one edit away from a declared id and writes the declared number
+        nowhere) or the declared number under another project. Fix the id if
+        it is wrong; if it is right, write `task NNN` in the content. Only a
+        conflict is ever rejected: an absent declaration, or [] (you
+        considered referents and none applied), never is.
 
         A declaration is RECORDED only on a write that reaches Graphiti — an
         entities_and_relations, temporal_facts or decisions_and_rationale
@@ -3662,13 +3669,15 @@ def create_mcp_server(
                       extraction pipeline legitimately derives entities no caller
                       could predict, and this parameter names only the referents
                       the memory is ABOUT. A declaration the content contradicts
-                      is REJECTED (error_type=DeclaredReferentConflictRejected)
-                      and nothing is written. ANY wrong shape — a bare string,
+                      — a near-miss typo of a declared task number, or that
+                      number under another project — is REJECTED
+                      (error_type=DeclaredReferentConflictRejected) and nothing
+                      is written; fix the id, or write `task NNN` in the
+                      content. ANY wrong shape — a bare string,
                       a single un-wrapped dict, a bad entry inside the list — is
                       rejected as a ValidationError whose message carries the
                       accepted entry shape, so you never have to guess the
-                      remedy. Absence is never rejected, so omitting this
-                      parameter always succeeds. RECORDED only on a write that
+                      remedy. Absence is never rejected. RECORDED only on a write that
                       reaches Graphiti (a GRAPHITI_PRIMARY category, or
                       dual_write=True); on an explicit Mem0-primary category
                       without dual_write it is shape-checked, then discarded,

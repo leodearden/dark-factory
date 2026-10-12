@@ -107,8 +107,10 @@ def render_referent_declaration_guidance() -> str:
         'never considered them, and they are inferred from metadata or the content; '
         '`[]` records that you considered them and none apply; a list declares them. '
         f'{_DECLARED_REFERENT_HINT}\n'
-        'Omitting `entities` always succeeds. A declaration that your own content '
-        'contradicts is REJECTED, so declare only what the content is actually about:\n'
+        'The gate rejects only a declaration your own content contradicts: a '
+        'near-miss typo of a declared task number, or that number under another '
+        'project. If the id is wrong, fix it; if it is right, write `task NNN` in '
+        'the content so the scan can corroborate it. For example:\n'
         '`add_memory(content="Task 3127\'s retry loop swallows the timeout", '
         "category=..., project_id=..., agent_id=..., entities=[{'kind': 'task', 'id': 3127}])`"
     )
