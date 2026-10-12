@@ -165,6 +165,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from shared.cli_boundary import reset_stdout_failure_state
+
 from fused_memory.reconciliation import citation_repair
 
 logger = logging.getLogger(__name__)
@@ -344,6 +346,14 @@ def report(outcome: dict[str, Any]) -> int:
 
 def main() -> int:
     """CLI entry point."""
+    outcome: dict[str, Any] | None = None
+
+    def _committed_repair() -> str | None:
+        if outcome is not None and outcome.get('status') == 'repaired':
+            return '--apply already committed the repair'
+        return None
+
+    reset_stdout_failure_state(detail=_committed_repair)
     logging.basicConfig(
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
     )
@@ -351,6 +361,7 @@ def main() -> int:
     args = build_parser().parse_args()
 
     async def _run_live() -> int:
+        nonlocal outcome
         from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
         from fused_memory.reconciliation.journal import (  # noqa: PLC0415
             ReconciliationJournal,
