@@ -339,8 +339,22 @@ def build_report(
     return Report(measured_at=measured_at, projects=tuple(projects), triage_note=triage_note)
 
 
+EXIT_RUN_FAILED = 1
+"""The run did not produce a complete canonical report: an enumeration was
+incomplete so only the ``.incomplete`` sidecars were written, the artifact
+pair could not be written, or stdout failed.
+
+Agrees with ``shared.cli_boundary.EXIT_STDOUT_FAILED``.
+"""
+
+EXIT_BAD_INPUT = 2
+"""Nothing can be measured until the input is fixed: a ``--project`` root
+holds no populated task store, or ``--triage-note`` could not be read.
+Argparse's own usage error also exits 2."""
+
+
 def exit_code(report: Report) -> int:
-    return 0 if report.complete else 1
+    return 0 if report.complete else EXIT_RUN_FAILED
 
 
 def _project_payload(project: ProjectMeasurement) -> dict[str, Any]:
@@ -497,6 +511,13 @@ async def _main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     args = _build_parser().parse_args(argv)
     projects: list[tuple[str, str]] = args.projects or [('dark_factory', str(_REPO_ROOT))]
+    try:
+        # Only the note read is converted; see
+        # shared/src/shared/cli_boundary.py::run_cli.
+        triage_note = args.triage_note.read_text() if args.triage_note else None
+    except OSError as exc:
+        logger.error('cannot read --triage-note %s: %s', args.triage_note, exc)
+        return EXIT_BAD_INPUT
 
     from datetime import UTC, datetime  # noqa: PLC0415
 
@@ -509,7 +530,7 @@ async def _main(argv: list[str] | None = None) -> int:
             assert_task_store_populated(root, operation='measure_stale_status_snapshot_sweep')
         except TargetStoreMissing as refusal:
             logger.error('%s', refusal)
-            return 2
+            return EXIT_BAD_INPUT
 
     measured_at = datetime.now(UTC).isoformat()
     config = FusedMemoryConfig()
@@ -537,9 +558,16 @@ async def _main(argv: list[str] | None = None) -> int:
         await tasks.close()
         await graphiti.close()
 
-    triage_note = args.triage_note.read_text() if args.triage_note else None
     report = build_report(measured, measured_at=measured_at, triage_note=triage_note)
-    written = write_artifacts(report, args.json_out, args.md_out)
+    try:
+        # Only the artifact write is converted; see
+        # shared/src/shared/cli_boundary.py::run_cli.
+        written = write_artifacts(report, args.json_out, args.md_out)
+    except OSError as exc:
+        logger.error(
+            'cannot write the report artifacts (%s, %s): %s', args.json_out, args.md_out, exc,
+        )
+        return EXIT_RUN_FAILED
     logger.info('complete=%s written=%s', report.complete, [str(p) for p in written])
     for project in report.projects:
         if not project.complete:
