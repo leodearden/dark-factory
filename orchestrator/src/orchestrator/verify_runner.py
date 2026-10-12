@@ -7,9 +7,9 @@ that serialises/deserialises them as byte-identical JSON documents.
 Public API
 ----------
 Dataclasses (frozen):
-  VerifyCommand          — one module's command-bearing fields (mirrors ModuleConfig)
   UnscopedTypecheckSpec  — _run_unscoped_typechecks gate inputs
   MergeVerifySpec        — full pre-advance merge-verify bundle (PRD §A contract)
+  (both carry orchestrator.verify_spec_shared.VerifyCommand, one per module)
 
 Wire codec (module-level functions):
   spec_to_json(spec)     -> str   — canonical JSON for the spec document
@@ -21,7 +21,8 @@ Wire codec (module-level functions):
 
 Byte-identity guarantee (PRD Invariant 1)
 -----------------------------------------
-All JSON is emitted with ``json.dumps(sort_keys=True, ensure_ascii=False)``.
+All JSON is emitted with ``verify_spec_shared.canonical_json``
+(``json.dumps(sort_keys=True, ensure_ascii=False)``).
 This canonicalises dict key order so that:
   - ``to_json(from_json(s)) == s``  (re-serialisation is identical)
   - The same object always serialises to the same bytes regardless of dict
@@ -58,13 +59,19 @@ from orchestrator.verify_cancel import (
     start_stdin_heartbeat,
 )
 from orchestrator.verify_categories import FailureCategory, _assert_sentinels_disjoint
+from orchestrator.verify_spec_shared import (
+    VerifyCommand,
+    apply_spec_to_host_config,
+    canonical_json,
+    global_verify_command_for,
+    module_config_from_command,
+)
 
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
     from orchestrator.event_store import EventStore
 
 __all__ = [
-    "VerifyCommand",
     "UnscopedTypecheckSpec",
     "MergeVerifySpec",
     "spec_to_json",
@@ -189,43 +196,6 @@ def make_flock_contention_result(
         category=FLOCK_CONTENTION_CATEGORY,
         contention={'host': host, 'holder_pgid': holder_pgid, 'waiter_pgid': waiter_pgid},
     )
-
-
-# ---------------------------------------------------------------------------
-# VerifyCommand
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class VerifyCommand:
-    """Frozen projection of a (scoped) ModuleConfig's command-bearing fields.
-
-    Mirrors ``ModuleConfig.prefix`` + the three command fields.  Timeouts and
-    environment variables live at ``MergeVerifySpec`` level (shared across the
-    bundle), so they are NOT duplicated here.
-    """
-
-    prefix: str
-    test_command: str | None = None
-    lint_command: str | None = None
-    type_check_command: str | None = None
-
-    def to_dict(self) -> dict:
-        return {
-            "prefix": self.prefix,
-            "test_command": self.test_command,
-            "lint_command": self.lint_command,
-            "type_check_command": self.type_check_command,
-        }
-
-    @classmethod
-    def from_dict(cls, d: dict) -> VerifyCommand:
-        return cls(
-            prefix=d["prefix"],
-            test_command=d.get("test_command"),
-            lint_command=d.get("lint_command"),
-            type_check_command=d.get("type_check_command"),
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -470,15 +440,7 @@ def build_merge_verify_spec(
     forward-compat with γ/δ (the remote runner consumes it over the wire).
     LocalRunner does not use it to drive execution — it uses the live objects.
     """
-    verify_commands = tuple(
-        VerifyCommand(
-            prefix=mc.prefix,
-            test_command=mc.test_command,
-            lint_command=mc.lint_command,
-            type_check_command=mc.type_check_command,
-        )
-        for mc in module_configs
-    )
+    verify_commands = tuple(VerifyCommand.from_module_config(mc) for mc in module_configs)
     unscoped_commands = tuple(
         VerifyCommand(prefix=mc.prefix, type_check_command=mc.type_check_command)
         for mc in module_configs
@@ -493,22 +455,6 @@ def build_merge_verify_spec(
             else 0.0
         )
     )
-    # INV-1, task 2883 — a zero-module-config project (reify) ships verify_commands=(),
-    # so the remote would reconstruct module_configs=[] and fall back to its own
-    # (possibly stale) config globals — the fidelity hole behind 966f23a6. Ship the
-    # dispatching side's LIVE global full-gate commands so the remote runs the SAME
-    # gate. Only sourced when the scope resolves to zero modules AND a global command
-    # exists; a non-empty module_configs leaves it None (verify_commands drive the gate).
-    global_verify_command: VerifyCommand | None = None
-    if not verify_commands and (
-        config.test_command or config.lint_command or config.type_check_command
-    ):
-        global_verify_command = VerifyCommand(
-            prefix='',
-            test_command=config.test_command,
-            lint_command=config.lint_command,
-            type_check_command=config.type_check_command,
-        )
     return MergeVerifySpec(
         verify_commands=verify_commands,
         unscoped_typecheck=UnscopedTypecheckSpec(commands=unscoped_commands, block_on_timeout=True),
@@ -524,7 +470,7 @@ def build_merge_verify_spec(
         # boundary; the remote host applies these over its own (laptop) config.
         merge_verify_workspace=config.merge_verify_workspace,
         merge_verify_breadth=config.merge_verify_breadth,
-        global_verify_command=global_verify_command,
+        global_verify_command=global_verify_command_for(config, verify_commands),
     )
 
 
@@ -555,15 +501,10 @@ def _module_config_from_command(vc: VerifyCommand, spec: MergeVerifySpec) -> Mod
     returning 0.0 and triggering an immediate asyncio.wait_for(..., timeout=0.0)
     TimeoutError.  Positive cold timeouts map verbatim.
     """
-    return ModuleConfig(
-        prefix=vc.prefix,
-        test_command=vc.test_command,
-        lint_command=vc.lint_command,
-        type_check_command=vc.type_check_command,
-        verify_env=dict(spec.verify_env),
-        verify_cold_command_timeout_secs=(
-            spec.cold_timeout_secs if spec.cold_timeout_secs > 0 else None
-        ),
+    return module_config_from_command(
+        vc,
+        verify_env=spec.verify_env,
+        cold_timeout_secs=spec.cold_timeout_secs if spec.cold_timeout_secs > 0 else None,
     )
 
 
@@ -625,145 +566,18 @@ async def run_merge_verify_on_worktree(
     module_configs = [_module_config_from_command(vc, spec) for vc in spec.verify_commands]
     task_files = tuple(spec.task_files) if spec.task_files is not None else None
 
-    # Fix (a), task 2822 — the SPEC is the single source of truth for the
-    # merge-deciding profile. Override the reconstructed (remote) config's
-    # profile from the spec so the remote runs the IDENTICAL scope/profile as
-    # the dispatching merge gate; the laptop's own --config can no longer narrow
-    # it. The local path is unaffected — its config already equals the spec's
-    # source, so this is a value-preserving no-op there. (pydantic v2 model_copy;
-    # values originate from a validated config via build_merge_verify_spec.)
-    config_update: dict[str, Any] = {
-        'merge_verify_workspace': spec.merge_verify_workspace,
-        'merge_verify_breadth': spec.merge_verify_breadth,
-    }
-    # Task 5496 — the spec's verify_env is APPLIED ONTO the reconstructed remote
-    # config: the spec wins on conflict, host keys absent from the spec are
-    # preserved. Without this the zero-module-config path (spec.verify_commands
-    # == (), e.g. reify) reconstructs no ModuleConfig at all, so spec.verify_env
-    # has NO consumer and the remote decides the merge under its own config's
-    # test-selection env — the task-2822 false-green class, since these keys
-    # select which tests run.
-    #
-    # Neither of the two simpler rules works. 'Ignore' (the pre-fix behaviour) is
-    # the defect. 'Replace' (dict(spec.verify_env)) would drop the host's own
-    # local necessities, which are by construction absent from any
-    # dispatcher-built spec: a remote runner is dispatched against its OWN
-    # --config, and a narrower verify-only host widens its per-host-measured
-    # timeout budgets there — values the dispatching workstation never measured
-    # and cannot ship, which 'replace' would silently narrow back to the
-    # workstation's. The spec is dispatcher-shaped and the host config is
-    # host-shaped; only a merge carries both.
-    #
-    # This is not a NEW rule: orchestrator/src/orchestrator/verify.py::_resolve_verify_env
-    # already computes exactly {**config.verify_env, **module_config.verify_env}
-    # on the per-module path. The merge here is therefore byte-identical there —
-    # _resolve_verify_env re-applies the same spec env from ModuleConfig.verify_env
-    # on top of it ({**{**H, **S}, **S} == {**H, **S}) — and the change simply
-    # makes the ONE existing rule uniform across both paths.
-    #
-    # Spelling constraints:
-    #  - A FRESH dict, never config.verify_env.update(...). model_copy carries
-    #    the field's VALUE over unchanged, so the copy's mapping can be the SAME
-    #    dict object as the caller's — the same hazard the task-4536 registry
-    #    comment below spells out. An in-place write would corrupt the config
-    #    cli.py loaded from disk and may still use.
-    #  - Reads effective_verify_env, the PROPERTY, mirroring the producer
-    #    (build_merge_verify_spec above) so the wire round-trip is symmetric;
-    #    writes the verify_env FIELD, because the property is read-only and
-    #    _resolve_verify_env — the sole builder of the executed env — reads the
-    #    field.
-    #  - UNCONDITIONAL. An empty spec env means "the dispatcher has no verify
-    #    env", which under this rule already leaves every host key intact, so a
-    #    guard would buy a branch with no behavioural difference.
-    config_update['verify_env'] = {**config.effective_verify_env, **spec.verify_env}
-    # INV-1, task 2883 — a zero-module-config spec ships the dispatching side's
-    # global full-gate commands; apply them onto the reconstructed remote config
-    # so the remote runs the SAME gate as local (the module_configs=[] Site-2
-    # scoping path is preserved; only the global commands it reads are overridden).
-    # None (the common per-module merge) leaves the config's globals untouched.
-    if spec.global_verify_command is not None:
-        config_update['test_command'] = spec.global_verify_command.test_command
-        config_update['lint_command'] = spec.global_verify_command.lint_command
-        config_update['type_check_command'] = spec.global_verify_command.type_check_command
-    config = config.model_copy(update=config_update)
-    # Task 4536 — the spec is authoritative for the module SET too, not just
-    # the profile above. `module_configs` (reconstructed from the wire spec a
-    # few lines up) is the DISPATCHER's set, already widened at the
-    # merge-request boundary by merge_queue._merge_boundary_module_configs
-    # before build_merge_verify_spec projected it. But
-    # `config.module_configs_or_empty` is still the REMOTE host's
-    # _discover_module_configs(config.project_root) walk, and
-    # verify_plan.effective_merge_module_configs PREFERS that registry over the
-    # passed list under merge_verify_breadth='full'. Without this line a
-    # stale/divergent/narrower remote checkout silently decides the merge: it
-    # both DROPS modules the spec named (the task-2822 false-green class — the
-    # verdict vouches for modules no gate ever ran on) and INJECTS modules the
-    # spec never named (a red attributable to a subproject the dispatching side
-    # never scoped).
-    #
-    # This makes effective_merge_module_configs' OWN documented INV-5 ordering
-    # invariant true on the remote leg: its docstring already claims the wire
-    # spec "(and hence the remote's reconstruction of it in
-    # verify_runner.run_merge_verify_on_worktree)" receives the identical set BY
-    # CONSTRUCTION. Before this line that parenthetical was aspirational.
-    #
-    # It is the natural extension of fix (a): the spec is the single source of
-    # truth for the merge-deciding profile, and the module SET is part of that
-    # profile — alongside merge_verify_workspace/merge_verify_breadth (task
-    # 2822) and the global commands (INV-1, task 2883).
-    #
-    # No conditional is needed to protect the genuinely LOCAL merge path:
-    # run_merge_verify_on_worktree is reached only from cli.py's `verify-merge`
-    # subcommand (the remote/CLI host entry), while the local path constructs
-    # LocalRunner directly in merge_queue.py — so host discovery survives there
-    # by construction.
-    #
-    # KNOWN CONSEQUENCE — reverse-dependency widening degrades to a no-op on
-    # this leg under merge_verify_breadth='scoped' (amendment, review
-    # suggestion 1). verify._reverse_dependency_module_configs (task 2607)
-    # resolves a triggered dependent's BASE ModuleConfig out of this same
-    # registry. At breadth='scoped' the installed registry is exactly the
-    # spec's set, which is exactly the set already in that call's
-    # `already_scoped` — so any dependent it would widen to is by construction
-    # absent from the registry and the lookup returns None. Previously the
-    # remote host's own walk supplied it. This is a deliberate, narrow trade:
-    # a dispatcher-authoritative registry is worth strictly more than a
-    # widening resolved from a checkout the dispatcher never vouched for (and
-    # the pre-4536 alternative was to widen using the HOST's command, which is
-    # the very infidelity this install closes). It is latent, not live —
-    # _REVERSE_TEST_DEPENDENTS maps only orchestrator→escalation; dark_factory
-    # runs breadth='full', where escalation is always already_scoped and the
-    # widening is a no-op regardless; reify registers no 'orchestrator'
-    # prefix. The real fix is to resolve the widening at the DISPATCHING
-    # boundary (beside merge_queue._merge_boundary_module_configs) so widened
-    # dependents ride the wire spec — out of scope here (merge_queue.py is not
-    # locked by this task); filed as a follow-up. The skip is no longer
-    # silent: verify._reverse_dependency_module_configs logs a warning naming
-    # the unresolvable dependent.
-    #
-    # Spelling constraints (all verified against the installed pydantic):
-    #  - DIRECT private-attribute assignment, never an entry in `config_update`.
-    #    `_module_configs` is a PrivateAttr, not a model field, so
-    #    model_copy(update=...) would write it into instance __dict__ while
-    #    __pydantic_private__ kept the stale value — it would read back only via
-    #    __dict__ shadowing, a later normal write would be silently swallowed,
-    #    and the shadow would propagate into further copies. Direct assignment
-    #    is the repo-wide blessed idiom (see config.load_config).
-    #  - REBIND the whole dict, never mutate in place. model_copy rebuilds the
-    #    __pydantic_private__ MAPPING as a fresh dict (BaseModel.__copy__), so
-    #    a rebind here cannot reach back into the source — but it carries the
-    #    VALUES over unchanged, which means the copy's `_module_configs` is
-    #    initially the SAME dict object as the caller's. Rebinding is therefore
-    #    safe; an in-place .clear()/.update() would reach through that shared
-    #    value and corrupt the CALLER's config registry — the object cli.py
-    #    loaded from disk and may still use. Pinned by
-    #    test_verify_runner.test_caller_config_registry_is_not_mutated.
-    #  - UNCONDITIONAL, including `{}` for a zero-module spec. `{}` is the
-    #    documented "discovery ran and found no subprojects" value (distinct
-    #    from the None "never ran" sentinel) — exactly the claim a zero-module
-    #    spec makes, and what routes it to the INV-1 global gate instead of the
-    #    remote host's own modules.
-    config._module_configs = {mc.prefix: mc for mc in module_configs}
+    # Fix (a), task 2822 — the merge-deciding profile rides the spec, so the
+    # host's own --config can no longer narrow it.
+    config = apply_spec_to_host_config(
+        config,
+        verify_env=spec.verify_env,
+        global_verify_command=spec.global_verify_command,
+        module_configs=module_configs,
+        field_overrides={
+            'merge_verify_workspace': spec.merge_verify_workspace,
+            'merge_verify_breadth': spec.merge_verify_breadth,
+        },
+    )
 
     runner = LocalRunner(
         merge_wt,
@@ -2500,7 +2314,7 @@ class VerifyRunnerPool:
 
 def spec_to_json(spec: MergeVerifySpec) -> str:
     """Serialise a MergeVerifySpec to canonical JSON (sort_keys=True)."""
-    return json.dumps(spec.to_dict(), sort_keys=True, ensure_ascii=False)
+    return canonical_json(spec.to_dict())
 
 
 def spec_from_json(s: str) -> MergeVerifySpec:
@@ -2510,7 +2324,7 @@ def spec_from_json(s: str) -> MergeVerifySpec:
 
 def result_to_json(vr: VerifyResult) -> str:
     """Serialise a VerifyResult to canonical JSON (sort_keys=True)."""
-    return json.dumps(result_to_dict(vr), sort_keys=True, ensure_ascii=False)
+    return canonical_json(result_to_dict(vr))
 
 
 def result_from_json(s: str) -> VerifyResult:
@@ -2564,7 +2378,7 @@ class EnvFingerprint:
 
 def fingerprint_to_json(fp: EnvFingerprint) -> str:
     """Serialise an EnvFingerprint to canonical JSON (sort_keys=True, ensure_ascii=False)."""
-    return json.dumps(fp.to_dict(), sort_keys=True, ensure_ascii=False)
+    return canonical_json(fp.to_dict())
 
 
 def fingerprint_from_json(s: str) -> EnvFingerprint:
@@ -2754,7 +2568,7 @@ class VerdictParityReport:
 
 def parity_report_to_json(report: VerdictParityReport) -> str:
     """Serialise a VerdictParityReport to canonical JSON."""
-    return json.dumps(report.to_dict(), sort_keys=True, ensure_ascii=False)
+    return canonical_json(report.to_dict())
 
 
 def parity_report_from_json(s: str) -> VerdictParityReport:
@@ -3283,7 +3097,7 @@ class ColdWarmVerifyDelta:
 
 def delta_to_json(d: ColdWarmVerifyDelta) -> str:
     """Serialize a ColdWarmVerifyDelta to a byte-canonical JSON string (sort_keys=True)."""
-    return json.dumps(d.to_dict(), sort_keys=True, ensure_ascii=False)
+    return canonical_json(d.to_dict())
 
 
 def delta_from_json(s: str) -> ColdWarmVerifyDelta:
