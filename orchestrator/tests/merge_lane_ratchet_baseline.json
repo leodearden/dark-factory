@@ -1190,6 +1190,7 @@
     "orchestrator/tests/test_warm_base_coherence.py": {"patch_targets": [], "private_reads": 3},
     "orchestrator/tests/test_warm_lane_abort_teardown.py": {"patch_targets": [], "private_reads": 11},
     "orchestrator/tests/test_warm_lane_disk_guard.py": {"patch_targets": [], "private_reads": 4},
+    "orchestrator/tests/test_warm_lane_golden_records.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_warm_lane_integration_gate.py": {"patch_targets": [], "private_reads": 1},
     "orchestrator/tests/test_warm_lane_pool.py": {"patch_targets": [], "private_reads": 63},
     "orchestrator/tests/test_warm_lane_reseed_verify.py": {"patch_targets": [], "private_reads": 8},
