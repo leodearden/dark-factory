@@ -104,6 +104,7 @@ from shared.config_dir import (  # noqa: E402
     sweep_stale_pid_dirs,
     sweep_stale_pid_dirs_once,
 )
+from shared.proc_group import read_stat_fields  # noqa: E402
 
 MODES = ('healthy', 'build_wedge', 'uv_wedge', 'mcp_wedge', 'replay')
 
@@ -746,12 +747,8 @@ def sample_proc(pid: int | None) -> dict:
     if not proc.exists():
         return out
     out['alive'] = True
-    try:
-        stat = (proc / 'stat').read_text()
-        # comm may contain spaces/parens — split on the LAST ') ' per proc(5).
-        out['state'] = stat.rsplit(') ', 1)[1].split()[0]
-    except (OSError, IndexError):
-        pass
+    fields = read_stat_fields(proc, skip_malformed=True)
+    out['state'] = None if fields is None else fields.state
     with contextlib.suppress(OSError):
         out['comm'] = (proc / 'comm').read_text().strip()
     try:

@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import os
 import subprocess
 import time
 import uuid
@@ -25,6 +24,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from shared.proc_group import read_stat_fields
 
 from orchestrator import verify
 from orchestrator.config import OrchestratorConfig
@@ -262,26 +262,13 @@ def _pid_alive(pid: int) -> bool:
     A SIGKILL'd sleeper whose parent (this pytest process, via Popen) has not
     yet ``wait()``ed becomes a ZOMBIE — still in the process table, so a bare
     ``os.kill(pid, 0)`` probe would wrongly report it alive. Read the proc
-    state and treat 'Z' as dead so the reap assertion reflects real liveness.
+    state and treat a terminated one as dead so the reap assertion reflects
+    real liveness.
     """
     if pid <= 0:
         return False
-    try:
-        stat = Path(f'/proc/{pid}/stat').read_text()
-        # Format: "pid (comm) state ..."; comm may contain spaces/parens, so
-        # split past the final ') ' before reading the state field.
-        state = stat.rsplit(') ', 1)[1].split(' ', 1)[0]
-        return state != 'Z'
-    except (ProcessLookupError, FileNotFoundError):
-        return False
-    except Exception:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        return True
+    fields = read_stat_fields(Path(f'/proc/{pid}'), skip_malformed=False)
+    return fields is not None and not fields.terminated
 
 
 def _launch_scope(unit: str) -> subprocess.Popen:

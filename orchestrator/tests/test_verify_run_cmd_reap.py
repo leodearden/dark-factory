@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pytest
+from shared.proc_group import read_stat_fields
 
 from orchestrator.verify import _run_cmd
 
@@ -32,12 +33,8 @@ _LEAKER = (
 
 
 def _running(pid: int) -> bool:
-    try:
-        proc_stat = Path(f'/proc/{pid}/stat').read_text()
-    except (FileNotFoundError, ProcessLookupError):
-        return False
-    state = proc_stat.rsplit(')', 1)[1].split()[0]
-    return state not in ('Z', 'X')
+    fields = read_stat_fields(Path(f'/proc/{pid}'), skip_malformed=False)
+    return fields is not None and not fields.terminated
 
 
 async def _wait_all_dead(pids: list[int], timeout: float = 10.0) -> bool:
