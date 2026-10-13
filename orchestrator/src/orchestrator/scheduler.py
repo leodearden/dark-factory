@@ -10,7 +10,7 @@ import math
 import random
 import re
 import time
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Callable, Iterable, Iterator, MutableSet, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -51,7 +51,7 @@ from orchestrator.mcp_lifecycle import ORCHESTRATOR_MCP_IDENTITY, mcp_call, tool
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
-from orchestrator.pending_age import read_pending_age
+from orchestrator.pending_age import AnchorReading, AnchorStatus, read_pending_age
 from orchestrator.pin_reservation import (
     Blocker,
     BlockerKind,
@@ -163,6 +163,28 @@ _BACKFILL_OVERSTAY_MIN_GRANTS: int = 8
 _BACKFILL_OUTCOME_WINDOW: int = 64
 # Dedup key, mirroring _FM_READ_STORM_SENTINEL: one open L1 per episode.
 _BACKFILL_OVERSTAY_SENTINEL: str = '__backfill_overstay_rate__'
+
+# Dispatch-scoring storm escapes (task 3819, PRD INV-4 / D12).  Two disjoint
+# signals, each one deduped L1 per episode:
+# (a) consecutive ticks scored on the legacy formula because anchor coverage
+#     sat below the arming threshold.  12 is the fm-read-storm precedent: it
+#     clears a routine fused-memory restart yet catches a fleet stuck on the
+#     legacy formula.
+_ANCHOR_COVERAGE_LOW_ESCALATION_THRESHOLD: int = 12
+_ANCHOR_COVERAGE_LOW_SENTINEL: str = '__anchor_coverage_low__'
+# (b) the share of ARMED-tick candidates scored at age 0 because their anchor
+#     was absent or unparseable — the blind spot (a) cannot see.  0.02 is 10x
+#     the 0.2% residual measured live on 2026-10-12 (three tasks stripped by
+#     task 4302) and well under the 10% the arming gate already tolerates.
+_ANCHORLESS_RATE_THRESHOLD: float = 0.02
+# No rate is believed below this many sampled candidates.
+_ANCHORLESS_MIN_SAMPLES: int = 500
+# Rolling window of per-candidate samples, so a fix decays the rate instead
+# of a lifetime ratio re-filing after the operator acted.  Above the floor.
+_ANCHORLESS_WINDOW: int = 4096
+_ANCHORLESS_SENTINEL: str = '__anchorless_rate__'
+# How many affected task ids an escalation detail names.
+_ANCHORLESS_IDS_SHOWN: int = 10
 
 # Sentinel distinguishing "caller omitted this claimant kwarg" (default,
 # leave the wire argument absent) from "caller explicitly passed None"
@@ -1072,6 +1094,12 @@ class _BackfillScanCache:
 
     parks: dict[str, dict] | None = None
     delays: dict[str, float] = field(default_factory=dict)
+
+
+def _anchorless_ids(candidates: list[dict], readings: list[AnchorReading]) -> list[str]:
+    """The first few candidate ids whose anchor was unusable, for an escalation detail."""
+    ids = [str(t.get('id', '')) for t, r in zip(candidates, readings, strict=True) if not r.covered]
+    return ids[:_ANCHORLESS_IDS_SHOWN]
 
 
 def _numeric_id(task_id: str) -> float:
@@ -2429,6 +2457,9 @@ class Scheduler:
         # Bumped and zeroed only by _note_anchor_coverage; an idle tick never
         # scores, so it leaves the streak alone.
         self._anchor_coverage_low_streak: int = 0
+        # Anchor statuses of candidates scored on ARMED ticks only — the
+        # sample behind the anchorless-rate escape (_note_anchorless_rate).
+        self._armed_anchor_statuses: deque[AnchorStatus] = deque(maxlen=_ANCHORLESS_WINDOW)
         # --- Startup gate (task 2235, W10-α) ---
         # False until finish_startup() is called.  acquire_next() asserts
         # this — a runtime check for the "startup reconcile sweeps run
@@ -7902,17 +7933,20 @@ class Scheduler:
             task_id=pin.task_id, task=pin.task, modules=modules
         ))
 
-    def _note_anchor_coverage(self, covered: int, total: int) -> bool:
-        """Decide whether this tick is armed for C2, and record an unarmed one.
+    def _note_anchor_coverage(self, candidates: list[dict], readings: list[AnchorReading]) -> bool:
+        """Decide whether this tick is armed for C2, and account for it.
 
         The coverage only chooses WHICH formula runs; it is never a score term
-        (PRD I-5).  An unarmed tick extends the streak and emits
-        ``scoring_anchor_coverage_low``; an armed tick ends the streak.
+        (PRD I-5).  An unarmed tick extends the streak, emits
+        ``scoring_anchor_coverage_low`` and may file escape (a); an armed tick
+        ends the streak and feeds escape (b)'s anchorless-rate window.
         """
-        coverage = covered / total
+        covered = sum(r.covered for r in readings)
+        coverage = covered / len(readings)
         threshold = self.config.scoring.new_scoring_min_anchor_coverage
         if coverage >= threshold:
             self._anchor_coverage_low_streak = 0
+            self._note_anchorless_rate(candidates, readings)
             return True
         self._anchor_coverage_low_streak += 1
         if self.event_store:
@@ -7922,12 +7956,111 @@ class Scheduler:
                 data={
                     'coverage': coverage,
                     'threshold': threshold,
-                    'candidates': total,
+                    'candidates': len(readings),
                     'with_anchor': covered,
                     'consecutive_ticks': self._anchor_coverage_low_streak,
                 },
             )
+        if self._anchor_coverage_low_streak >= _ANCHOR_COVERAGE_LOW_ESCALATION_THRESHOLD:
+            self._file_anchor_coverage_low_escalation(coverage, threshold, _anchorless_ids(candidates, readings))
         return False
+
+    def _note_anchorless_rate(self, candidates: list[dict], readings: list[AnchorReading]) -> None:
+        """Sample an armed tick into the window and file escape (b) on a sustained rate."""
+        self._armed_anchor_statuses.extend(r.status for r in readings)
+        sampled = len(self._armed_anchor_statuses)
+        if sampled < _ANCHORLESS_MIN_SAMPLES:
+            return
+        counts = Counter(self._armed_anchor_statuses)
+        absent, malformed = counts[AnchorStatus.ABSENT], counts[AnchorStatus.MALFORMED]
+        rate = (absent + malformed) / sampled
+        if rate >= _ANCHORLESS_RATE_THRESHOLD:
+            self._file_anchorless_rate_escalation(
+                absent, malformed, sampled, rate, _anchorless_ids(candidates, readings),
+            )
+
+    def _file_anchor_coverage_low_escalation(self, coverage: float, threshold: float, ids: list[str]) -> None:
+        streak = self._anchor_coverage_low_streak
+        self._file_scoring_l1(
+            _ANCHOR_COVERAGE_LOW_SENTINEL,
+            category='infra_issue',
+            summary=(
+                f'Dispatch scored on the legacy formula for {streak} consecutive ticks: '
+                f'pending_since anchor coverage {coverage:.1%} < {threshold:.1%}'
+            ),
+            detail=(
+                f'For {streak} consecutive dispatch ticks only {coverage:.1%} of the '
+                f'candidates carried a parseable metadata.pending_since, below '
+                f'scoring.new_scoring_min_anchor_coverage ({threshold:.1%}), so every '
+                f'such tick scored on the legacy formula (PRD D12, I-6).  Anchorless '
+                f'candidates on the latest tick include: {", ".join(ids)}.\n\n'
+                f'The anchor is written by fused-memory: stamp_pending_since on every '
+                f'* -> pending landing, plus the one-shot v4 -> v5 back-fill (task 3816, '
+                f'fused_memory/backends/sqlite_task_backend.py).  Resolve by running a '
+                f'fused-memory that carries that code, or by re-stamping the stripped '
+                f'tasks: an already-pending task is stamped only by a fresh * -> pending '
+                f'landing.  The streak clears itself on the first armed tick.'
+            ),
+            suggested_action='restore_pending_since_anchors',
+        )
+
+    def _file_anchorless_rate_escalation(
+        self, absent: int, malformed: int, sampled: int, rate: float, ids: list[str],
+    ) -> None:
+        self._file_scoring_l1(
+            _ANCHORLESS_SENTINEL,
+            category='risk_identified',
+            summary=(
+                f'{rate:.1%} of armed-tick dispatch candidates scored at age 0 for want '
+                f'of a usable pending_since anchor'
+            ),
+            detail=(
+                f'{absent + malformed} of the last {sampled} candidates scored on armed '
+                f'ticks ({rate:.1%}, threshold {_ANCHORLESS_RATE_THRESHOLD:.1%}) had no '
+                f'usable metadata.pending_since and so scored at age 0: {absent} ABSENT '
+                f'(the key is missing, as after a whole-blob metadata replace), '
+                f'{malformed} MALFORMED (unparseable).  Affected candidates on the latest '
+                f'tick include: {", ".join(ids)}.\n\n'
+                f'The anchor is written by fused-memory stamp_pending_since on every '
+                f'* -> pending landing (task 3816); an already-pending task is re-stamped '
+                f'only by a fresh * -> pending landing.  Find the writer that drops or '
+                f'garbles the key.  The rate is measured over a rolling window of '
+                f'{_ANCHORLESS_WINDOW} samples, so it decays once the anchors are restored.'
+            ),
+            suggested_action='find_the_writer_dropping_pending_since',
+        )
+
+    def _file_scoring_l1(
+        self, sentinel: str, *, category: str, summary: str, detail: str, suggested_action: str,
+    ) -> None:
+        """File one deduped L1 for a dispatch-scoring storm escape; never raises.
+
+        The fm-read-storm filer's shape: a missing queue (bare-Scheduler unit
+        tests) is a warning, ``has_open_l1`` keeps one open L1 per episode, and
+        any failure is swallowed so filing can never abort a dispatch tick.
+        """
+        if self.escalation_queue is None:
+            logger.warning('%s — no escalation_queue is wired, not filing', summary)
+            return
+        try:
+            if self.escalation_queue.has_open_l1(sentinel):
+                return
+            from escalation.models import Escalation
+            esc = Escalation(
+                id=self.escalation_queue.make_id(sentinel),
+                task_id=sentinel,
+                agent_role='orchestrator-scheduler',
+                severity='blocking',
+                category=category,
+                summary=summary[:200],
+                detail=detail,
+                suggested_action=suggested_action,
+                level=1,
+            )
+            self.escalation_queue.submit(esc)
+            logger.warning('Filed L1 dispatch-scoring escalation %s', esc.id)
+        except Exception:
+            logger.warning('Failed to file dispatch-scoring escalation %s', sentinel, exc_info=True)
 
     def _score_candidates(self, ctx: TickContext) -> list[tuple[float, str, dict, str]]:
         """Score every candidate of the tick, best first, as ``(score, task_id, task, tier)``.
@@ -7943,7 +8076,7 @@ class Scheduler:
         """
         now = self._wall_now()
         readings = [read_pending_age(t, now) for t in ctx.candidates]
-        armed = self._note_anchor_coverage(sum(r.covered for r in readings), len(ctx.candidates))
+        armed = self._note_anchor_coverage(ctx.candidates, readings)
 
         scored: list[tuple[float, str, dict, str]] = []
         for t, reading in zip(ctx.candidates, readings, strict=True):
