@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _dashboard_helpers import node_path
 
 from dashboard.api.burndown import _BURNDOWN_WINDOWS
 from dashboard.api.window import ServedWindow, _parse_window, with_window
@@ -1001,23 +1002,6 @@ def _terminal_get_tasks(calls):
     return [call for call in calls if call['tool'] == 'get_tasks']
 
 
-def _node():
-    """The ``node`` binary: a skip locally, a FAILURE under CI.
-
-    The ``test_chip_label_disambiguation.py::_node`` idiom — CI carries node,
-    so its absence there is a toolchain regression, not an optional extra.
-    """
-    import os
-    import shutil
-
-    path = shutil.which('node')
-    if not path:
-        if os.environ.get('CI'):
-            pytest.fail('node is required in CI but not found on PATH')
-        pytest.skip('node not available')
-    return path
-
-
 # The REAL client's on-demand path, run over a body handed in on stdin. The
 # three scripts load in index.html's order because each destructures the one
 # before it at module scope, and `document` stays undefined on purpose: data.js
@@ -1050,7 +1034,7 @@ def _request_on_demand(body, project):
 
     redux = Path(__file__).parent.parent / 'src' / 'dashboard' / 'static' / 'redux'
     result = subprocess.run(
-        [_node(), '-e', _ON_DEMAND_CLIENT, str(redux), project],
+        [node_path(), '-e', _ON_DEMAND_CLIENT, str(redux), project],
         input=json.dumps(body), capture_output=True, text=True, timeout=60,
     )
     assert result.returncode == 0, (
