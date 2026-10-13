@@ -20,7 +20,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import os
+import shutil
 import sqlite3
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -29,6 +33,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _fm_helpers import load_script_module
+from shared.project_id import project_id_for_root
+from shared.project_layout import default_project_root
 
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.reconciliation.consolidation_gate import (
@@ -397,3 +403,89 @@ class TestLoadTaskMetadataSurfacesTheRefusal:
             con.close()
 
         assert mod.load_task_metadata(str(tmp_path), '1', 'master') == '{"k": 1}'
+
+
+def _metadata_args(*extra: str) -> argparse.Namespace:
+    return mod.build_parser().parse_args(['--metadata-json', '{}', *extra])
+
+
+class TestProjectArgsResolveAtUse:
+    """--project-root defaults to the MAIN checkout and --project-id to that
+    root's id; parsing leaves both None so they resolve at use (task 6713).
+
+    The worktree probe sits here rather than in
+    scripts/tests/test_scripts_default_root.py because importing this script
+    needs fused_memory, which only this venv installs.
+    """
+
+    def test_parsing_leaves_both_for_main_to_resolve(self):
+        args = _metadata_args()
+        assert (args.project_root, args.project_id) == (None, None)
+
+    def test_the_default_root_is_the_main_checkout(self):
+        args = mod.resolve_project_args(_metadata_args())
+        root = default_project_root()
+        assert (args.project_root, args.project_id) == (str(root), project_id_for_root(root))
+
+    def test_the_project_id_follows_an_explicit_project_root(self):
+        args = mod.resolve_project_args(_metadata_args('--project-root', '/x/y/Know-Live'))
+        assert (args.project_root, args.project_id) == ('/x/y/Know-Live', 'know_live')
+
+    def test_an_explicit_project_id_wins(self):
+        args = mod.resolve_project_args(
+            _metadata_args('--project-root', '/x/y/Know-Live', '--project-id', 'reify')
+        )
+        assert args.project_id == 'reify'
+
+    def test_a_copy_in_a_linked_worktree_defaults_to_the_main_checkout(self, tmp_path):
+        main = tmp_path / 'Dark-Factory'
+        tree = _linked_worktree_copy(main)
+        source = (
+            'import json\n'
+            'import check_consolidation_closure as m\n'
+            "args = m.resolve_project_args(m.build_parser().parse_args(['--metadata-json', '{}']))\n"
+            'print(json.dumps([m.default_project_root_arg(), args.project_root, args.project_id]))'
+        )
+        proc = subprocess.run(
+            [sys.executable, '-s', '-c', source],
+            cwd=tree / 'scripts',
+            env=_probe_env(),
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+        assert proc.returncode == 0, f'probe exited {proc.returncode}\n{proc.stderr}'
+        assert json.loads(proc.stdout) == [str(main), str(main), 'dark_factory']
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(['git', '-C', str(cwd), *args], check=True, capture_output=True)
+
+
+def _linked_worktree_copy(main: Path) -> Path:
+    """A temp main repo plus a linked worktree holding this checkout's scripts and shared."""
+    subprocess.run(['git', 'init', '-q', '-b', 'main', str(main)], check=True, capture_output=True)
+    _git(main, 'config', 'user.email', 'closure-default-root@example.com')
+    _git(main, 'config', 'user.name', 'Closure Default Root Test')
+    _git(main, 'config', 'commit.gpgsign', 'false')
+    _git(main, 'commit', '-q', '--allow-empty', '--no-verify', '-m', 'seed')
+    tree = main / '.worktrees' / 'w'
+    _git(main, 'worktree', 'add', '-q', str(tree), '-b', 'w')
+    shutil.copy2(_ROOT / 'pyproject.toml', tree / 'pyproject.toml')
+    (tree / 'scripts').mkdir()
+    for script in (_ROOT / 'scripts').glob('*.py'):
+        shutil.copy2(script, tree / 'scripts' / script.name)
+    shutil.copytree(
+        _ROOT / 'shared' / 'src' / 'shared',
+        tree / 'shared' / 'src' / 'shared',
+        ignore=shutil.ignore_patterns('__pycache__'),
+    )
+    return tree
+
+
+def _probe_env() -> dict[str, str]:
+    dropped = {'PYTHONPATH', 'PYTHONSAFEPATH', 'VIRTUAL_ENV'}
+    env = {key: value for key, value in os.environ.items() if key not in dropped}
+    env['PYTHONNOUSERSITE'] = '1'
+    return env
