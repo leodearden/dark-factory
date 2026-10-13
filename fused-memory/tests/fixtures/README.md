@@ -488,7 +488,7 @@ below. Per entry:
 
 | field | meaning |
 |---|---|
-| `topic` | Stable slug. **This is a persisted key** — the tripwire item key is `t-<topic>`, which the grandfather set stores. Renaming one silently re-releases a grandfathered item. |
+| `topic` | Stable slug. **This is a persisted key** — the tripwire item key is `t-<topic>`, which the grandfather set stores. Renaming one silently re-releases a grandfathered item. Slugs must be unique after the `normalize_topic` fold (lowercased, `_` read as `-`), so two entries spelling one topic with `-` and `_` are a load failure. |
 | `project_id` | `dark_factory` or `reify` — which corpus to probe. |
 | `derived_from` | Provenance tag: `curator_gate`, `census_topic`, `topic_guard_cluster`, `briefing_query`, `hand`. Lets a later run tell which entries auto-derivation has taken over from hand-authoring. |
 | `canonical.content_hash` | `content_key()` of the expected entry — sha256 of whitespace-normalised content, `hexdigest()[:16]`. The **primary** matcher. |
@@ -563,12 +563,19 @@ narrowing nobody can see reads downstream as "there was nothing there".
 
 | key | meaning |
 |---|---|
-| `curator_gate_clusters` / `census_topics_emitted` / `topic_guard_clusters` | Candidates derivation produced, per source. |
+| `curator_gate_clusters` / `census_topics_emitted` / `topic_guard_clusters` | Candidates derivation KEPT, per source, after slug collisions were dropped. |
 | `census_topics_skipped_singleton` | Census topics with `count <= 1`. A one-entry topic answers "is the canonical in the top k" by that entry's mere existence — presence, not retrieval. |
 | `curator_clusters_without_canonical` | Calibration clusters carrying no `canonical`-labelled row, so no entry could be built. |
 | `census_rows_malformed_value` / `census_rows_malformed_count` | Census rows whose `value` / `count` was the wrong shape. Counted **separately** from the singleton skip: a malformed row is a broken census, a singleton is a healthy one — folding them together reports a schema break as a corpus property. |
-| `slug_collisions_dropped` | Candidates whose slug collided with one already emitted. |
+| `slug_collisions_dropped` | Candidates dropped because their slug names a topic already kept, compared with `normalize_topic` (lowercased, `_` read as `-`), so `architect_report_…` and `architect-report-…` are one topic. The richer source wins: `curator_gate` > `topic_guard_cluster` > `census_topic`. Between two census spellings, the census's count-descending order keeps the more-used one. The three per-source counts plus this one account for every candidate derivation generated. |
 | `derived_candidates_not_carried` | Candidates derivation emitted that this fixture does **not** contain. Mostly census topics whose canonical `content_hash` is unknown offline (derivation leaves it empty) and which no operator has resolved against a live read-only scroll yet. |
+
+`--derive-registry` refuses a census whose `grand_total.topic.entries` table
+is absent or not object/list-shaped, or which is not decodable JSON: it exits
+2 naming the census path and prints nothing. An EMPTY table is a healthy
+census of a corpus with no topic values, and derives zero census candidates.
+The two are told apart because both read zero in every census counter, as the
+2026-08-31 stub `{"baseline": true}` did.
 
 Regenerate the derivation half with `--derive-registry` and merge; the flag
 prints and never overwrites, because the hand-authored held-out phrasings
