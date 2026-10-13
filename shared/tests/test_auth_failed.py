@@ -15,7 +15,8 @@ import ast
 import asyncio
 import logging
 import os
-from collections.abc import Sequence
+from collections import Counter
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple
@@ -687,6 +688,12 @@ def _leasable_names(gate: UsageGate) -> list[str]:
     return seen
 
 
+async def _until(predicate: Callable[[], bool], *, timeout: float = 5.0) -> None:
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(0.01)
+
+
 class TestAuthFailedAccountNames:
     """``auth_failed_account_names`` lets a loop-less caller (the legibility
     trickle, task 5947) tell an all-auth-failed pool, which never clears on its
@@ -1107,6 +1114,65 @@ class TestSighupKeepsUnverifiedTokensBlocked:
 
             assert gate.is_paused is False
             assert gate.paused_reason == ''
+        finally:
+            await gate.shutdown()
+
+    async def test_a_failed_sighup_probe_leaves_the_accounts_reprobe_loop_running(self):
+        """After a failed SIGHUP probe the account's own re-probe loop is its
+        only automatic way back, so SIGHUP must neither reset nor cancel it.
+        """
+        gate = _make_gate(_ROSTER, auth_reprobe_secs=1)
+        try:
+            with patch('shared.usage_gate.load_dotenv'):
+                _settle_only(gate, 'acct-2', _ORG_DISABLED)
+                gate._run_probe = AsyncMock(return_value=False)
+                await gate._on_sighup_async()
+                assert gate.auth_failed_account_names == ('acct-2',)
+
+                gate._run_probe = AsyncMock(return_value=True)
+                await _until(lambda: gate.auth_failed_account_names == ())
+
+            assert 'acct-2' in _leasable_names(gate)
+        finally:
+            await gate.shutdown()
+
+    async def test_a_sighup_during_the_loops_probe_waits_for_it_to_finish(self):
+        """Overlapping probes of one account would count a single host fault
+        twice toward the spawn-fault latch. SIGHUP's probe queues behind the
+        loop's instead of overlapping it, and still runs once it is free.
+        """
+        gate = _make_gate(_ROSTER, auth_reprobe_secs=1)
+        calls: Counter[str] = Counter()
+        running: Counter[str] = Counter()
+        peak: Counter[str] = Counter()
+        release = asyncio.Event()
+
+        async def held_probe(acct: AccountState) -> bool:
+            calls[acct.name] += 1
+            running[acct.name] += 1
+            peak[acct.name] = max(peak[acct.name], running[acct.name])
+            try:
+                await release.wait()
+            finally:
+                running[acct.name] -= 1
+            return False
+
+        try:
+            with patch('shared.usage_gate.load_dotenv'):
+                _settle_only(gate, 'acct-2', _ORG_DISABLED)
+                gate._run_probe = held_probe
+                await _until(lambda: running['acct-2'] == 1)
+
+                sighup = asyncio.create_task(gate._on_sighup_async())
+                await _until(lambda: running['acct-1'] == running['acct-3'] == 1)
+                assert peak['acct-2'] == 1
+
+                release.set()
+                await sighup
+
+            assert calls['acct-2'] == 2
+            assert peak['acct-2'] == 1
+            assert gate.auth_failed_account_names == ('acct-2',)
         finally:
             await gate.shutdown()
 
