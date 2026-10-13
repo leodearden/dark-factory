@@ -1087,7 +1087,11 @@ class TestDedupOutageDetector:
         body = escalations[0]
         assert body['category'] == 'infra_issue'
         assert body['agent_role'] == 'fused-memory/ticket-janitor'
-        assert body['task_id'] == ticket_janitor._ANCHOR_TASK_ID
+        assert body['task_id'] == 'task-curator', (
+            "OPERATIONS.md §'Is the curator deduping, or just creating?' tells "
+            'operators this record files under task id task-curator; changing '
+            'the curator bucket id is a contract change, not a rename'
+        )
         assert body['level'] == 1
         assert body['severity'] == 'blocking'
         assert pid in body['summary']

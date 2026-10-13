@@ -1100,20 +1100,48 @@ class TestEveryRouteFilesUnderItsAnchor:
     @pytest.mark.parametrize(
         ('method_name', 'kwargs'),
         [
-            (
+            pytest.param(
                 'report_failure',
                 dict(justification='max_turns exhausted', candidate_title='T'),
+                id='failure',
             ),
-            (
+            pytest.param(
+                'report_failure',
+                dict(
+                    justification='denied', candidate_title='T',
+                    schema_tool_denied=True,
+                ),
+                id='schema-tool-denied',
+            ),
+            pytest.param(
+                'report_failure',
+                dict(
+                    justification='ZOT', candidate_title='T',
+                    zero_output_timeout=True, timed_out=True,
+                    duration_ms=181_966, transcript_turns=0, tools_used=(),
+                ),
+                id='zero-output-timeout',
+            ),
+            pytest.param(
+                'report_zot_duplicate',
+                dict(
+                    finding=_FINDING, candidate_title='T',
+                    zot_escalation_id='esc-curator-41', stamped=True,
+                ),
+                id='zot-duplicate',
+            ),
+            pytest.param(
                 'report_consecutive_degraded',
                 dict(
                     streak=5, threshold=5, last_justification='j',
                     candidate_title='T',
                 ),
+                id='consecutive-degraded',
             ),
-            (
+            pytest.param(
                 'report_backend_binary_unresolvable',
                 dict(binary_spec='claude', search_path='/usr/bin'),
+                id='backend-binary-unresolvable',
             ),
         ],
     )
