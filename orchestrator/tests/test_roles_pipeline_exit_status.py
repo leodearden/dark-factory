@@ -18,6 +18,7 @@ from orchestrator.agents.pipeline_status_guidance import (
     PIPELINE_LAST_STAGE_STATUS,
     SIGPIPE_UNDER_PIPEFAIL,
 )
+from orchestrator.agents.roles import EXTERNAL_KILL_GUIDANCE
 
 _HALVES = [
     ('PIPELINE_LAST_STAGE_STATUS', PIPELINE_LAST_STAGE_STATUS),
@@ -80,6 +81,25 @@ class TestPipelineExitStatusSplice(PreambleTailContractTests):
                 'splice is missing from that role; a count of 2 means a stale '
                 f'bare `+ {name}` term, for example one re-added by a merge '
                 'resolution, survives beside it. Delete the bare term.'
+            ),
+        )
+
+    def test_block_lands_after_the_kill_guidance_that_points_to_it(self) -> None:
+        """`EXTERNAL_KILL_GUIDANCE` defers the masked-status rule to this block "below".
+
+        This block is the single home of that rule (heuristic 11), so the pointer
+        dangles in any carrier where the block is missing or precedes the kill
+        guidance.
+        """
+        self.block.contract.assert_lands_after(
+            follows=EXTERNAL_KILL_GUIDANCE,
+            follows_name='EXTERNAL_KILL_GUIDANCE',
+            remedy=(
+                'EXTERNAL_KILL_GUIDANCE no longer states what a pipe does to the '
+                'exit code; it points to this block below it. Keep '
+                'PIPELINE_EXIT_STATUS_GUIDANCE after BACKGROUND_WAIT_GUIDANCE in '
+                'roles.py::_BASH_CAPABLE_ROLE_PREAMBLE, or restore the rule to the '
+                'kill guidance before moving this block.'
             ),
         )
 

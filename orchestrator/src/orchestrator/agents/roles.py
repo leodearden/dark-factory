@@ -714,12 +714,11 @@ A killed run says NOTHING about the code under test: it is neither failing nor
 hanging. Never report it as a test failure or a hang. Say it was killed
 externally, and quote the raw code.
 
-Do NOT pipe a long run into `| tail`, `| head` or `| grep`. Bash here runs
-without `pipefail`, so a pipeline reports its LAST stage's status and the real
-exit code is thrown away. A kill that takes the process group also takes
-whatever was buffered in the pipe, leaving a code and no output. Redirect to a
-file and `Read` the file: a killed run then still leaves its partial output
-on disk.
+Do NOT pipe a long run into `| tail`, `| head` or `| grep`. A kill that takes
+the process group also takes whatever was buffered in the pipe, leaving a code
+and no output. Redirect to a file and `Read` the file: a killed run then still
+leaves its partial output on disk. For what a pipe does to the exit code
+itself, see the pipeline exit-status section below.
 
 To diagnose a 137, re-run it once, on ONE line:
 
@@ -762,9 +761,9 @@ BACKGROUND_WAIT_GUIDANCE = (
 # that for ~8% of the block's bytes.
 #
 # THE ONLY SIZE FIGURES IN THIS FEATURE LIVE HERE.  Measured on this revision:
-# BACKGROUND_WAIT_GUIDANCE 10022 B (= BACKGROUND_TASK_WARNING 1193 +
-# WAIT_PATTERN_GUIDANCE 6411 + EXTERNAL_KILL_GUIDANCE 2418),
-# WAIT_PATTERN_REMINDER 766 B -> 766/10022 = 7.6%.
+# BACKGROUND_WAIT_GUIDANCE 9992 B (= BACKGROUND_TASK_WARNING 1193 +
+# WAIT_PATTERN_GUIDANCE 6411 + EXTERNAL_KILL_GUIDANCE 2388),
+# WAIT_PATTERN_REMINDER 766 B -> 766/9992 = 7.7%.
 # Re-derive rather than trust these after any edit to the strings:
 #   python -c "from orchestrator.agents.roles import *; \
 #              print(len(BACKGROUND_WAIT_GUIDANCE), len(WAIT_PATTERN_REMINDER))"
