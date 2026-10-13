@@ -82,14 +82,7 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # to stop. _iter_leaves yields the list WHOLE, so it reloads atomically: a
     # half-applied prefix list would admit a caller no operator ever wrote.
     'reconciliation.deterministic_provenance_allowed_agent_prefixes',
-    # Recon transcript archival (task 3972). Both are read LIVE through
-    # reconciliation/cli_stage_runner.py::recon_archive_root, per stage
-    # (BaseStage.run via self.config) and per GC (the harness via self.config),
-    # off the shared config.reconciliation submodel instance -- never captured
-    # at construction; test_reconciliation_submodel_identity_preserved pins
-    # that identity. Registration is load-bearing: `enabled` is the operator's
-    # only remedy for a broken archive root, and a restart-only kill switch is
-    # no kill switch.
+    # Recon transcript archival (task 3972); why green: the schema descriptions.
     'reconciliation.transcript_archive_enabled',
     'reconciliation.transcript_archive_root',
     # Write-triage band thresholds (task 3130). Written by

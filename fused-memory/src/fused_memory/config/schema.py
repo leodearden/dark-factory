@@ -1616,7 +1616,9 @@ class ReconciliationConfig(BaseModel):
             'Archive each recon stage CLI transcript before its per-run config '
             'dir is destroyed (task 3972). The operator kill switch, and the '
             'only remedy if the archive root breaks: fused-memory installs no '
-            'archival-failure storm consumer. Green-tier for that reason.'
+            'archival-failure storm consumer. Green-tier for that reason; both '
+            'archive leaves are read live per stage and per GC through '
+            'reconciliation/cli_stage_runner.py::recon_archive_root.'
         ),
     )
     transcript_archive_root: str = Field(
@@ -1625,8 +1627,7 @@ class ReconciliationConfig(BaseModel):
             'Archive root, resolved against explore_codebase_root (NOT data_dir). '
             "The default deliberately equals the orchestrator's archive root, "
             "which docs/legibility/legibility.yaml's agent_transcript_roots "
-            'already mines. Rationale: '
-            'reconciliation/cli_stage_runner.py::recon_archive_root.'
+            'already mines.'
         ),
     )
 
