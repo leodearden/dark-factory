@@ -24,9 +24,19 @@ Nothing here skips: a missing git, bash or skill file fails.
 """
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 import textwrap
+from dataclasses import dataclass
+from pathlib import Path
 from typing import NamedTuple
+
+import pytest
+from git_listing import listed_files
+from shared.merge_subject import format_merge_subject
+
+REPO_ROOT = Path(__file__).parents[2]
 
 COUNTEREXAMPLE_MARKER = 'marker-search-guard: counterexample'
 
@@ -165,3 +175,177 @@ def test_marker_search_extractor_reads_every_snippet_shape() -> None:
         MarkerSearch('skills/synthetic.md', 5, _SYNTHETIC_FENCED_SHELL),
         MarkerSearch('skills/synthetic.md', 11, _SYNTHETIC_INLINE_SHELL),
     ]
+
+
+FIXTURE_TASK_ID = '7001'
+_FIXTURE_BRANCH = f'task/{FIXTURE_TASK_ID}'
+_MARKER_SUBJECT = format_merge_subject(_FIXTURE_BRANCH, 'main')
+_HAND_MERGE_SUBJECT = f"Merge branch '{_FIXTURE_BRANCH}'"
+_FIXTURE_IDENTITY = (
+    '-c', 'user.name=Marker Search Guard',
+    '-c', 'user.email=marker-search-guard@example.invalid',
+    '-c', 'commit.gpgsign=false',
+)
+_PLACEHOLDER = re.compile(r'<[A-Za-z]+[-_](?:ID|id)>')
+_SHA = re.compile(r'\b[0-9a-f]{40}\b')
+
+
+def _skill_marker_searches() -> list[MarkerSearch]:
+    return [
+        search
+        for path in listed_files(REPO_ROOT, 'skills/*.md')
+        for search in marker_searches(
+            path.read_text(encoding='utf-8'), source=path.relative_to(REPO_ROOT).as_posix(),
+        )
+    ]
+
+
+_LIVE_MARKER_SEARCHES = _skill_marker_searches()
+
+
+def _search_id(search: MarkerSearch) -> str:
+    return f'{search.source}:{search.line}'
+
+
+@dataclass(frozen=True)
+class ShadowedHistory:
+    root: Path
+    genuine: frozenset[str]
+    shadow: str
+
+
+def _isolated_git_env(root: Path) -> dict[str, str]:
+    env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    env['GIT_CONFIG_GLOBAL'] = os.devnull
+    env['GIT_CONFIG_NOSYSTEM'] = '1'
+    env['GIT_CEILING_DIRECTORIES'] = str(root.parent.resolve())
+    return env
+
+
+def _fixture_git(root: Path, *args: str) -> str:
+    proc = subprocess.run(
+        ['git', *_FIXTURE_IDENTITY, *args],
+        cwd=root, env=_isolated_git_env(root), capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode == 0, (
+        f'building the fixture history: {proc.args} failed in {root} with '
+        f'rc={proc.returncode}; stderr: {proc.stderr!r}'
+    )
+    return proc.stdout.strip()
+
+
+def _commit_file(root: Path, name: str, *messages: str) -> str:
+    (root / name).write_text(f'{messages[0]}\n', encoding='utf-8')
+    _fixture_git(root, 'add', name)
+    _fixture_git(root, 'commit', *(arg for message in messages for arg in ('-m', message)))
+    return _fixture_git(root, 'rev-parse', 'HEAD')
+
+
+def _merge_into_main(root: Path, subject: str) -> str:
+    _fixture_git(root, 'checkout', '-q', 'main')
+    _fixture_git(root, 'merge', '--no-ff', '-m', subject, _FIXTURE_BRANCH)
+    return _fixture_git(root, 'rev-parse', 'HEAD')
+
+
+@pytest.fixture(scope='module')
+def shadowed_history(tmp_path_factory: pytest.TempPathFactory) -> ShadowedHistory:
+    root = tmp_path_factory.mktemp('shadowed-history') / 'repo'
+    root.mkdir()
+    _fixture_git(root, 'init', '-q', '-b', 'main')
+    assert (root / '.git').is_dir(), f'git init did not make {root} a repository root'
+    _commit_file(root, 'README', 'initial commit')
+    _fixture_git(root, 'checkout', '-q', '-b', _FIXTURE_BRANCH)
+    _commit_file(root, 'work-1', 'task work, part one')
+    _fixture_git(root, 'checkout', '-q', 'main')
+    _commit_file(root, 'main-1', 'main moves on')
+    orchestrator_marker = _merge_into_main(root, _MARKER_SUBJECT)
+    _fixture_git(root, 'checkout', '-q', _FIXTURE_BRANCH)
+    _commit_file(root, 'work-2', 'task work, part two')
+    hand_merge = _merge_into_main(root, _HAND_MERGE_SUBJECT)
+    shadow = _commit_file(
+        root, 'docs',
+        'docs: explain the marker search',
+        f'A marker search for "{_MARKER_SUBJECT}" or "{_HAND_MERGE_SUBJECT}" '
+        'also matches this body.',
+    )
+    return ShadowedHistory(root, frozenset({orchestrator_marker, hand_merge}), shadow)
+
+
+def _snippet_env(history: ShadowedHistory) -> dict[str, str]:
+    return {**_isolated_git_env(history.root), 'S': _MARKER_SUBJECT}
+
+
+def _resolve_placeholders(shell: str) -> str:
+    return _PLACEHOLDER.sub(FIXTURE_TASK_ID, shell)
+
+
+def _violated_condition(
+    history: ShadowedHistory, returncode: int, printed: set[str],
+) -> str | None:
+    if returncode != 0:
+        return f'the snippet exited rc={returncode} instead of running cleanly'
+    if not printed:
+        return 'the snippet printed no commit sha: the genuine marker behind a newer body match was lost'
+    if history.shadow in printed:
+        return (
+            f'the snippet printed {history.shadow}, a non-merge commit that only '
+            'quotes the subject in its body'
+        )
+    if not printed <= history.genuine:
+        return f'the snippet printed {sorted(printed - history.genuine)}, which are not genuine markers'
+    return None
+
+
+def _selection_defect(history: ShadowedHistory, search: MarkerSearch) -> str | None:
+    shell = _resolve_placeholders(search.shell)
+    proc = subprocess.run(
+        ['bash', '--noprofile', '--norc', '-c', shell],
+        cwd=history.root, env=_snippet_env(history),
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    defect = _violated_condition(history, proc.returncode, set(_SHA.findall(proc.stdout)))
+    if defect is None:
+        return None
+    return (
+        f'{_search_id(search)}: a merge-marker search must select the newest commit whose '
+        f'SUBJECT is the marker, but {defect}.\n'
+        f'genuine markers: {sorted(history.genuine)}\n'
+        f'shell (placeholders resolved to {FIXTURE_TASK_ID}, S={_MARKER_SUBJECT!r}):\n{shell}\n'
+        f'rc={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
+    )
+
+
+def _with_max_count(search: MarkerSearch) -> MarkerSearch:
+    mutant = _FIXED_STRINGS_FLAG.sub(
+        lambda flag: f'{flag.group(0)} --max-count=1', search.shell, count=1,
+    )
+    return search._replace(shell=mutant)
+
+
+def test_skills_present_marker_searches() -> None:
+    assert _LIVE_MARKER_SEARCHES, (
+        'no merge-marker search (a code snippet with --grep and a fixed-strings flag) '
+        'was found in skills/**/*.md, so the parametrised guards below collected '
+        'nothing and would pass without running a single snippet'
+    )
+
+
+@pytest.mark.parametrize('search', _LIVE_MARKER_SEARCHES, ids=_search_id)
+def test_documented_marker_search_selects_the_subject_match(
+    shadowed_history: ShadowedHistory, search: MarkerSearch,
+) -> None:
+    defect = _selection_defect(shadowed_history, search)
+    assert defect is None, defect
+
+
+@pytest.mark.parametrize('search', _LIVE_MARKER_SEARCHES, ids=_search_id)
+def test_max_count_reintroduction_is_caught(
+    shadowed_history: ShadowedHistory, search: MarkerSearch,
+) -> None:
+    mutant = _with_max_count(search)
+    assert _selection_defect(shadowed_history, mutant) is not None, (
+        f'{_search_id(search)} with --max-count=1 injected still selected the genuine '
+        'marker: the fixture history does not shadow this snippet\'s subject, so the '
+        'guard could not go red for it. Extend shadowed_history to cover it.\n'
+        f'mutant:\n{mutant.shell}'
+    )
