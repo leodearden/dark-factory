@@ -2135,8 +2135,7 @@ class TestStage1CycleSummaryRemediationBackstop:
         remediation driver. The finally-block backstop must still fire and
         stamp the breadcrumb even though _run_remediation_pass completes
         normally instead of raising, and even though this except branch
-        builds a differently-shaped `_error` record (`'deferred': True`, no
-        `error_type` of a raising exception)."""
+        writes the deferral variant of the `_error` record (`'deferred': True`)."""
         import json
 
         from shared.cli_invoke import AllAccountsCappedException
