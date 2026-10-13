@@ -77,9 +77,11 @@ THE SIGNAL-BINDING CHECK (task 6582). A sidecar's ``signal_leaves`` names the
 blocks whose task status the dashboard reads as the PRD's signal
 (plans/dashboard-prd-lanes-prd.md §4.7, §5.2). A STALE SIGNAL BINDING is a
 signal leaf whose locally bound task is missing from this store, or whose own
-``prd_path`` is not this sidecar's ``prd``, so the dashboard's mark for that PRD
-would read another task's status. Every such row makes a run dirty; what one
-means and how it is fixed is stated once, in ``_SIGNAL_BINDING_CAVEAT``.
+``prd_path`` is not this sidecar's ``prd``. Every such row makes a run dirty;
+what one means and how it is fixed is stated once, in
+``_SIGNAL_BINDING_CAVEAT``. How many leaves were named and how many could be
+checked is in the coverage block, so a run with no signal leaves to check
+never reads as one whose leaves all agreed.
 """
 from __future__ import annotations
 
@@ -536,6 +538,13 @@ class AuditCoverage(NamedTuple):
     first is a stamper no-op that numbers in the hundreds live, and would bury
     the rows the report exists to show. The second's sidecar is already named in
     ``manifest_parse_failure_details``.
+
+    THE SIGNAL-BINDING CHECK STATES ITS OWN DENOMINATOR, because zero stale
+    rows reads the same whether every leaf agreed or no sidecar names one.
+    ``signal_leaves_named`` counts every label in a swept sidecar's
+    ``signal_leaves``; ``signal_leaves_checked`` counts those bound by a local
+    ``task_id``, the only ones that can become a ``StaleSignalBinding``. An
+    unbound or ``external_task_id`` leaf is named but not checked.
     """
 
     manifests_swept: int
@@ -556,6 +565,8 @@ class AuditCoverage(NamedTuple):
     tasks_bound_to_a_declared_label: int = 0
     tasks_without_a_tracked_sidecar: int = 0
     tasks_on_an_unparseable_sidecar: int = 0
+    signal_leaves_named: int = 0
+    signal_leaves_checked: int = 0
 
 
 class UnboundLabel(NamedTuple):
@@ -599,8 +610,8 @@ class UnboundLabel(NamedTuple):
 
 
 class StaleSignalBinding(NamedTuple):
-    """A signal leaf whose bound task the dashboard cannot trust
-    (plans/dashboard-prd-lanes-prd.md §4.7, §5.2).
+    """A signal leaf whose locally bound task is missing from this store or
+    carries another ``prd_path`` (plans/dashboard-prd-lanes-prd.md §5.2).
 
     ``reason`` says which: ``'task_missing'`` (no row for ``task_id`` in this
     store, so ``task_prd`` is None) or ``'prd_mismatch'`` (the task's own
@@ -616,32 +627,42 @@ class StaleSignalBinding(NamedTuple):
     task_prd: str | None
 
 
-def _stale_signal_bindings(
-    relpath: str, doc: CapabilityManifestDoc, scan: TaskStoreScan
-) -> list[StaleSignalBinding]:
-    """Every signal leaf of *doc* whose locally bound task is missing from
-    *scan* or belongs to another PRD, in the sidecar's ``signal_leaves`` order.
+def _locally_bound_signal_leaves(doc: CapabilityManifestDoc) -> list[tuple[str, int]]:
+    """``(label, task_id)`` for each signal leaf of *doc* bound by a local
+    ``task_id``, in ``signal_leaves`` order: the leaves the signal-binding check
+    can test. An unbound leaf, or one bound by ``external_task_id``, has no
+    local task and is not among them."""
+    task_ids = {task.label: task.task_id for task in doc.tasks}
+    return [
+        (label, task_id)
+        for label in doc.signal_leaves or ()
+        if (task_id := task_ids[label]) is not None
+    ]
 
-    An unbound leaf, or one bound by ``external_task_id``, has no local task to
-    check and is never a row. PRD values compare by exact string: measured
-    2026-10-10, no live mismatch is a spelling-only near-miss.
+
+def _stale_signal_bindings(
+    relpath: str, sidecar_prd: str, bound_leaves: list[tuple[str, int]],
+    scan: TaskStoreScan,
+) -> list[StaleSignalBinding]:
+    """Every one of *bound_leaves* whose task is missing from *scan* or whose
+    ``prd_path`` is not *sidecar_prd*, in the order given.
+
+    The task's PRD is its raw ``prd_path`` compared by exact string: ``prd``
+    and ``prd_ref`` are not read, and no ``#anchor`` or ``§section`` suffix is
+    stripped.
     """
-    blocks = {task.label: task for task in doc.tasks}
     rows: list[StaleSignalBinding] = []
-    for label in doc.signal_leaves or ():
-        task_id = blocks[label].task_id
-        if task_id is None:
-            continue
+    for label, task_id in bound_leaves:
         if task_id not in scan.row_ids:
             reason, task_prd = "task_missing", None
         else:
             task_prd = scan.prd_paths.get(task_id)
-            if task_prd == doc.prd:
+            if task_prd == sidecar_prd:
                 continue
             reason = "prd_mismatch"
         rows.append(StaleSignalBinding(
             manifest=relpath, label=label, task_id=task_id, reason=reason,
-            sidecar_prd=doc.prd, task_prd=task_prd,
+            sidecar_prd=sidecar_prd, task_prd=task_prd,
         ))
     return rows
 
@@ -840,6 +861,8 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
     declared_by_manifest: dict[str, tuple[str, ...]] = {}
     unparseable_manifests: set[str] = set()
     stale_signal_bindings: list[StaleSignalBinding] = []
+    signal_leaves_named = 0
+    signal_leaves_checked = 0
 
     # Resolved ONCE per root, ahead of the sweep: this is what makes
     # "external" checkable rather than taken on the block's word. Guarded and
@@ -868,7 +891,11 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
 
         manifests_swept += 1
         declared_by_manifest[relpath] = tuple(task.label for task in doc.tasks)
-        stale_signal_bindings.extend(_stale_signal_bindings(relpath, doc, scan))
+        bound_signal_leaves = _locally_bound_signal_leaves(doc)
+        signal_leaves_named += len(doc.signal_leaves or ())
+        signal_leaves_checked += len(bound_signal_leaves)
+        stale_signal_bindings.extend(
+            _stale_signal_bindings(relpath, doc.prd, bound_signal_leaves, scan))
         for task in doc.tasks:
             if task.external_task_id is not None:
                 # ANOTHER project's registry, so absent from THIS project's
@@ -1027,6 +1054,8 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
             tasks_bound_to_a_declared_label=label_bindings.tasks_bound_to_a_declared_label,
             tasks_without_a_tracked_sidecar=label_bindings.tasks_without_a_tracked_sidecar,
             tasks_on_an_unparseable_sidecar=label_bindings.tasks_on_an_unparseable_sidecar,
+            signal_leaves_named=signal_leaves_named,
+            signal_leaves_checked=signal_leaves_checked,
         ),
     )
 
@@ -1067,11 +1096,11 @@ _UNBOUND_CAVEAT = (
 
 _SIGNAL_BINDING_CAVEAT = (
     "  STALE SIGNAL BINDINGS (a row is a signal leaf, named in the sidecar's "
-    "signal_leaves, whose bound task is missing from this store or whose own "
-    "prd_path is not this sidecar's prd, so the dashboard's signal mark for "
-    "that PRD reads unknown. Unbound and external_task_id leaves are not "
-    "checked. Fixing a row is a separate, reviewed edit: re-bind the block's "
-    "task_id, or drop the label from signal_leaves):"
+    "signal_leaves, whose locally bound task is missing from this store or "
+    "whose own prd_path is not this sidecar's prd. Unbound and "
+    "external_task_id leaves are not checked. Fixing a row is a separate, "
+    "reviewed edit: re-bind the block's task_id, set the task's prd_path, or "
+    "drop the label from signal_leaves):"
 )
 
 # Printed ABOVE a git-discovery-failed project's rows, because a reader must
@@ -1200,6 +1229,9 @@ def _format_coverage(coverage: AuditCoverage) -> list[str]:
             ("tasks bound to a declared label:", coverage.tasks_bound_to_a_declared_label),
             ("tasks with no tracked sidecar:", coverage.tasks_without_a_tracked_sidecar),
             ("tasks on an unparseable sidecar:", coverage.tasks_on_an_unparseable_sidecar),
+            # The signal-binding check's denominator; see AuditCoverage.
+            ("signal leaves named:", coverage.signal_leaves_named),
+            ("signal leaves checked:", coverage.signal_leaves_checked),
         ],
         details=(*coverage.manifest_parse_failure_details, *coverage.uncomparable_details),
     )

@@ -1527,8 +1527,8 @@ def test_live_and_historical_rows_share_one_list(tmp_path, make_tasks_db):
 # A sidecar's `signal_leaves` names the block(s) whose task status the
 # dashboard reads as the PRD's signal (plans/dashboard-prd-lanes-prd.md §4.7,
 # §5.2). A signal leaf bound to a task this store lacks, or to a task whose own
-# prd_path is another PRD, would make that mark read a stranger's status — so it
-# is reported, as a StaleSignalBinding row, never mixed into the other lists.
+# prd_path is another PRD, is reported as a StaleSignalBinding row, never mixed
+# into the other lists.
 # ---------------------------------------------------------------------------
 
 _SIGNAL_SIDECAR = "plans/x-prd.capability-manifest.yaml"
@@ -1596,14 +1596,17 @@ def test_scan_collects_each_rows_prd_path(make_tasks_db):
 
 def test_a_signal_label_bound_to_another_prds_task_is_reported(tmp_path, make_tasks_db):
     """THE ROW-6 SCENARIO, and nothing else moves: the drift findings and every
-    coverage counter equal those of the same project with no signal_leaves."""
+    coverage counter but the signal check's own two equal those of the same
+    project with no signal_leaves."""
     audit = audit_project(str(_row6_project(tmp_path, make_tasks_db)))
     unsignalled = audit_project(str(_row6_project(
         tmp_path, make_tasks_db, name="unsignalled", signal_leaves=False)))
 
     assert audit.stale_signal_bindings == [_ROW6]
     assert audit.findings == []
-    assert audit.coverage == unsignalled.coverage
+    assert (audit.coverage.signal_leaves_named, audit.coverage.signal_leaves_checked) == (1, 1)
+    assert audit.coverage == unsignalled.coverage._replace(
+        signal_leaves_named=1, signal_leaves_checked=1)
 
 
 def test_a_signal_label_bound_to_a_task_missing_from_the_store_is_reported(
@@ -1650,7 +1653,7 @@ def test_an_agreeing_signal_binding_is_no_row(tmp_path, make_tasks_db):
 def test_unbound_and_external_signal_leaves_are_no_row(tmp_path, make_tasks_db, external):
     """Nothing LOCAL to check: an unbound leaf binds no task yet, and an external
     one names another registry, which plans/dashboard-prd-lanes-prd.md §10
-    leaves unresolved."""
+    leaves unresolved. Such a leaf is NAMED but not CHECKED."""
     root = _make_project(
         tmp_path, make_tasks_db,
         tasks=[_prd_row(7, "plans/x-prd.md")],
@@ -1658,24 +1661,50 @@ def test_unbound_and_external_signal_leaves_are_no_row(tmp_path, make_tasks_db, 
             "plans/x-prd.md", [("α", 7), ("ζ", None)], ["ζ"], external=external))],
     )
 
-    assert audit_project(str(root)).stale_signal_bindings == []
+    audit = audit_project(str(root))
+
+    assert audit.stale_signal_bindings == []
+    assert (audit.coverage.signal_leaves_named, audit.coverage.signal_leaves_checked) == (1, 0)
 
 
 def test_a_sidecar_without_signal_leaves_yields_no_row(tmp_path, make_tasks_db):
     root = _row6_project(tmp_path, make_tasks_db, signal_leaves=False)
 
-    assert audit_project(str(root)).stale_signal_bindings == []
+    audit = audit_project(str(root))
+
+    assert audit.stale_signal_bindings == []
+    assert (audit.coverage.signal_leaves_named, audit.coverage.signal_leaves_checked) == (0, 0)
 
 
-def _signal_line(row):
-    return format_kv_line([
-        ("manifest", row.manifest),
-        ("label", row.label),
-        ("task_id", row.task_id),
-        ("reason", row.reason),
-        ("sidecar_prd", row.sidecar_prd),
-        ("task_prd", row.task_prd),
-    ])
+def test_signal_leaf_counters_sum_across_sidecars(tmp_path, make_tasks_db):
+    """Every named leaf is counted, and every locally bound one is checked,
+    whether or not it turns out stale."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_prd_row(7, "plans/x-prd.md"), _prd_row(8, "plans/other-prd.md"),
+               _prd_row(9, "plans/y-prd.md")],
+        manifests=[
+            (_SIGNAL_SIDECAR, _signalling(
+                "plans/x-prd.md", [("α", 7), ("ζ", 8), ("η", None)], ["α", "ζ", "η"])),
+            ("plans/y-prd.capability-manifest.yaml", _signalling(
+                "plans/y-prd.md", [("β", 9)], ["β"])),
+        ],
+    )
+
+    audit = audit_project(str(root))
+
+    assert [row.label for row in audit.stale_signal_bindings] == ["ζ"]
+    assert (audit.coverage.signal_leaves_named, audit.coverage.signal_leaves_checked) == (4, 3)
+
+
+def _row6_lines(text, label="ζ"):
+    """The lines of *text* naming every value boundary row 6 requires the
+    report to name (label, task and both PRD values), spelled as literals so
+    they are checked independently of the formatter."""
+    fields = (f"manifest={_SIGNAL_SIDECAR}", f"label={label}", "task_id=8",
+              "reason=prd_mismatch", "sidecar_prd=plans/x-prd.md",
+              "task_prd=plans/other-prd.md")
+    return [line for line in text.splitlines() if all(field in line for field in fields)]
 
 
 def test_report_names_the_stale_signal_binding_under_its_own_section(
@@ -1684,17 +1713,30 @@ def test_report_names_the_stale_signal_binding_under_its_own_section(
 
     assert "  -- stale signal bindings (1) --" in report.splitlines()
     assert _SIGNAL_BINDING_CAVEAT in report
-    assert _signal_line(_ROW6) in report.splitlines()
+    assert len(_row6_lines(report)) == 1
 
 
 def test_the_signal_binding_section_prints_even_when_empty(tmp_path, make_tasks_db):
-    """Looked and found none, as opposed to never looked."""
+    """Looked and found none, as opposed to never looked — and the coverage
+    block says how many leaves there were to look at."""
     root = _row6_project(tmp_path, make_tasks_db, signal_leaves=False)
 
     report = format_report([audit_project(str(root))])
+    lines = report.splitlines()
 
-    assert "  -- stale signal bindings (0) --" in report.splitlines()
+    assert "  -- stale signal bindings (0) --" in lines
     assert _SIGNAL_BINDING_CAVEAT in report
+    assert "    signal leaves named:                0" in lines
+    assert "    signal leaves checked:              0" in lines
+
+
+def test_coverage_block_counts_the_signal_leaves_as_aligned_rows(
+        tmp_path, make_tasks_db):
+    report = format_report([audit_project(str(_row6_project(tmp_path, make_tasks_db)))])
+    lines = report.splitlines()
+
+    assert "    signal leaves named:                1" in lines
+    assert "    signal leaves checked:              1" in lines
 
 
 def test_format_json_carries_stale_signal_bindings_and_their_caveat(
@@ -1708,6 +1750,8 @@ def test_format_json_carries_stale_signal_bindings_and_their_caveat(
          "reason": "prd_mismatch", "sidecar_prd": "plans/x-prd.md",
          "task_prd": "plans/other-prd.md"},
     ]
+    assert project["coverage"]["signal_leaves_named"] == 1
+    assert project["coverage"]["signal_leaves_checked"] == 1
     assert payload["stale_signal_bindings_caveat"] == _SIGNAL_BINDING_CAVEAT
 
 
@@ -1725,7 +1769,7 @@ def test_main_exit_1_when_a_stale_signal_binding_is_the_only_issue(
     result = _run_cli("--project-root", str(root))
 
     assert result.returncode == EXIT_DRIFT, result.stdout
-    assert _signal_line(_ROW6._replace(label="zeta")) in result.stdout.splitlines()
+    assert len(_row6_lines(result.stdout, label="zeta")) == 1
 
 
 # ---------------------------------------------------------------------------
