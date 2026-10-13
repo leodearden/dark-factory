@@ -10346,7 +10346,7 @@ class GitOps:
             rc, _, err = await _run(['git', 'reset', '--hard'], cwd=wt)
         except WorktreeMissing:
             return ''
-        return '' if rc == 0 else ' '.join(err.split()) or f'exit {rc}'
+        return '' if rc == 0 else (' '.join(err.split()) or f'exit {rc}')
 
     async def _swap_ref_forward(self, ref: str, pre: str, found: str, why: str) -> str:
         """Put *ref* back from *pre* on *found*, where its worktree still is."""
