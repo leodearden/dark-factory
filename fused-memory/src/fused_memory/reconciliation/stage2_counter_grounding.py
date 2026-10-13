@@ -8,6 +8,7 @@ import math
 from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, TypeAlias
 
 from fused_memory.middleware.task_creation_journal import CreationOutcomes
@@ -307,6 +308,16 @@ def _combined_evidence(
     return _creation_records_evidence(stats, project_id, 'combined', journal.combined)
 
 
+def _hints_updated_evidence(
+    stats: Mapping[str, Any], project_id: str | None, journal: CreationOutcomes,
+) -> CounterEvidence:
+    claims = hints_update_claims(stats.get('task_hints_updated_records'), project_id)
+    return CounterEvidence(
+        journaled=frozenset(),
+        claims={key: partial(hints_claim_confirmed, claim) for key, claim in claims.items()},
+    )
+
+
 @dataclass(frozen=True)
 class _GroundedCounter:
     counter: str
@@ -317,6 +328,7 @@ class _GroundedCounter:
 _GROUNDED_COUNTERS: tuple[_GroundedCounter, ...] = (
     _GroundedCounter('tasks_created', 'task_created_records', _created_evidence),
     _GroundedCounter('tasks_combined', 'task_combined_records', _combined_evidence),
+    _GroundedCounter('tasks_hints_updated', 'task_hints_updated_records', _hints_updated_evidence),
 )
 
 _NO_JOURNAL = CreationOutcomes(created=frozenset(), combined=frozenset())
