@@ -2761,11 +2761,13 @@ supersedes `data/afk-digest.md`, which was last written 2026-08-19.
    under `--permission-mode dontAsk`, with an allowlist and an explicit
    denylist of every apply verb, both in `nightly_prepare.py`, reading no
    settings file (`--setting-sources ''`), and its
-   environment sets `SITTING_NIGHTLY_CONFINED`, under which
-   `prepare_sitting.py` refuses anything but `brief` and `record` of a file
-   inside the inbox into `data/sitting/` (never stdin or another path), and
-   refuses `--apply-closes` and `--ledger`. The confinement is enforced in
-   code, not in the allowlist. Its only MCP
+   environment sets `SITTING_NIGHTLY_CONFINED` to the run's inbox. The CLI
+   allow rule plus the absence of settings files confine the agent's own
+   file writes to that inbox. `prepare_sitting.py` confines in code what
+   `record` reads (a `.json` file directly in that inbox, never stdin or
+   another path, so never an earlier night's batch) and where it writes
+   (the default store in `data/sitting/`), and refuses everything but `brief`
+   and `record`, including `--apply-closes` and `--ledger`. Its only MCP
    servers are the `escalation` and `fused-memory` blocks of the checkout's
    `.mcp.json`, passed with `--strict-mcp-config`, so its reads never depend
    on the project config being approved for a headless run, and playwright
@@ -2813,12 +2815,13 @@ systemctl --user list-timers return-brief.timer
 
 - `prepare=1` means the Fable run failed, timed out, hit a usage limit or
   recorded nothing; its log line carries both stream tails, or, for a run
-  that recorded nothing, the counts of what the inbox offered. That is
+  that recorded nothing, the counts of what the inbox offered and could not decode. That is
   routine, not an incident:
   the page is still written, and items the run did not reach show as
   `awaiting preparation`. The page's header says how fresh the preparation
   is. A run that finished well logs `nightly_prepare: done (... recorded=<n>
-  of <m>, permission_denials=<d>)`.
+  of <m>, undecodable=<u>, permission_denials=<d>)`; a high `undecodable`
+  means the agent's entries failed validation even though some were recorded.
 - `prepare=2` is a configuration error, such as no `claude` on the unit's
   PATH.
 - `brief=` other than 0 means the page was not written. That is the one
