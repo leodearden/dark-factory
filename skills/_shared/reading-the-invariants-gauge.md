@@ -13,8 +13,8 @@ Each skill owns two things itself: which roots it covers, and where its findings
 
 ## The read
 
-The dashboard serves the gauge at `http://127.0.0.1:8080` (OPERATIONS.md §"Dashboard"). The body
-is about 23 KB (measured 2026-10-12), so never print it whole. Read this digest instead:
+The dashboard serves the gauge at `http://127.0.0.1:8080` (OPERATIONS.md §"Dashboard"). Never
+print the body whole: it carries every root's violation rows. Read this digest instead:
 
 ```bash
 out=$(mktemp /tmp/invariants.XXXXXX.json)
@@ -105,8 +105,7 @@ it there. Two edge cases:
 
 ## Triage only what changed
 
-The gauge re-reports standing residue every cycle. On 2026-10-12 that was 77 and 43 unledgered
-rows on two roots, plus two blind roots. Each finding has an identity:
+The gauge re-reports standing residue every cycle. Each finding has an identity:
 
 - blind: (root)
 - terminal: (root, `tag#task_id`), one per unledgered row
@@ -158,11 +157,11 @@ journalctl --user -u fused-memory --since -65min --no-pager -o cat \
   --grep 'predecessor=<link_id> key=|recurrence_remint_sweep_failed'
 ```
 
-Give it a Bash `timeout` of at least 180000. It measured 45s and 65s on 2026-10-12/13, because
-the unit logs about 2k lines a minute, and a window of hours outran a 120s timeout. The 65-minute
-window always spans at least one attempt: the done-write mint or a sweep. Exit 1 means no matching
-line, which is an answer, not a failure. These lines carry no journald priority, so `-p err` finds
-nothing.
+Give it a Bash `timeout` of at least 180000 and keep the window at 65 minutes: `--grep` reads every
+line the unit logged in the window, and the unit is busy enough that a window of hours outruns the
+timeout. The 65-minute window always spans at least one attempt: the done-write mint or a sweep.
+Exit 1 means no matching line, which is an answer, not a failure. These lines carry no journald
+priority, so `-p err` finds nothing.
 
 - A `recurrence_mint_failed: predecessor=<link_id> ... reason=` line names the reason.
 - No line at all is itself evidence that no attempt ran. Was fused-memory restarted, or is the
