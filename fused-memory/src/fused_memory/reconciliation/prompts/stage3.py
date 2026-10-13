@@ -395,6 +395,13 @@ routing (`submit_task` called with another project's `project_root`). An origin-
 check cannot see that. Real incident: run 709de018 — the task genuinely existed in \
 another project, and the false phantom conclusion drove a wasteful duplicate re-file.
 
+Two Stage 2 stats settle most of these questions before any lookup. \
+`task_created_records_journaled` counts creations the framework journaled code-side \
+as the curator decided them — cross-project filings included — so it corroborates a \
+`tasks_created` count by itself; never flag a count it covers as phantom. \
+`tasks_combined` counts candidates the curator folded into an EXISTING task: they \
+mint no new task id, so never read a `tasks_combined` count as phantom creations.
+
 Before flagging a self-reported `tasks_created` count phantom:
 1. Look for any signal identifying a candidate OTHER project + task_id for the created \
 task — e.g. a `cross_project_routing` finding from this or a prior cycle, or a task \

@@ -1,35 +1,27 @@
-"""Wiring tests for the Task-Creation Accounting prompt contract (task 3046).
+"""Wiring tests for the Stage 2 task-accounting prompt contract (tasks 3046, 4873).
 
-Stage 2 self-reports ``tasks_created`` as a bare LLM counter with no code-side
-ground truth: ``submit_task``/``resolve_ticket`` are not journaled (see
-``fused_memory.middleware.task_interceptor.TaskInterceptor._journal_around``,
-which wraps only ``set_task_status``/``update_task``/``remove_tasks``/
-``add_dependency``/``remove_dependency``), so ``derive_stage_stats`` cannot
-recompute it and ``stats_verifier`` leaves it untouched (it is not in
-``_COMPUTED_STAT_KEYS``). Run 507bc25b filed task 3045 via the Proactive Task
-Sample / cross-project-routing surface yet Stage 2 self-reported
-``tasks_created: 0`` — the increment mandate (``## Verifying Task
-Operations``, ``prompts/stage2.py``) never declared the counter
-path-agnostic, and (unlike the flag counters) had no action-record ground
-truth analogous to ``flag_deleted_records``.
+Stage 2 self-reports ``tasks_created``, ``tasks_combined`` and
+``tasks_hints_updated``; ``derive_stage_stats`` does not recompute them.
+Run 507bc25b filed task 3045 yet self-reported ``tasks_created: 0``. The
+framework now grounds these counters in the code-side creation journal
+(``middleware.task_creation_journal``, keyed on the ``_causation_id`` in
+``submit_task`` metadata) and in the ``task_created_records`` /
+``task_hints_updated_records`` action records the prompt asks for.
 
-This module pins the WIRING of the fix's shared renderer,
-``render_task_creation_accounting_section()`` (``recon_self_model.py``) —
-exactly once per assembled Stage 2 prompt, on both
-``build_stage2_system_prompt`` branches, never colliding with the
-``'## Available Tools'`` injection sentinel or the ``mcp__recon-report__``
-run_id drift guard (``test_recon_report_guidance_drift.py``) — and the
-machine-readable contract tokens the Python side actually reads
-(``tasks_created``, ``task_created_records``, the
-``"action": "task_created"`` record shape). Per the
-``test_recon_gate_closure_guidance.py`` house rule, prose wording beyond
-those tokens is intentionally NOT pinned here.
+This module pins the WIRING of the shared renderers
+``render_task_creation_accounting_section()`` and
+``render_task_hints_update_accounting_section()`` (``recon_self_model.py``) —
+each exactly once per assembled Stage 2 prompt, on both
+``build_stage2_system_prompt`` branches — and the machine-readable contract
+tokens the Python side reads (``tasks_created``, ``tasks_combined``,
+``task_created_records``, ``task_hints_updated_records`` and the two
+``"action"`` record shapes). Per the ``test_recon_gate_closure_guidance.py``
+house rule, prose wording beyond those tokens is intentionally NOT pinned.
 
-It also pins the code-side layer: the pure ``stage2_counter_grounding.coerce_count``
-helper, and the deterministic upward-only repair
-``TaskKnowledgeSync._apply_post_flight_guards`` performs when the
-self-reported ``tasks_created`` undercounts the ``task_created_records``
-ground truth — the exact shape of the run-507bc25b regression.
+It also pins the code-side layer: ``stage2_counter_grounding.coerce_count``
+and the upward-only repair ``TaskKnowledgeSync._apply_post_flight_guards``
+performs when the self-reported ``tasks_created`` undercounts its confirmed
+evidence — the exact shape of the run-507bc25b regression.
 """
 
 from __future__ import annotations

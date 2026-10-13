@@ -17,30 +17,22 @@ self-report cannot inflate any of them. ``edges_updated`` additionally gates
 on a server-side readback (``stage_stats._count_update_edge``) — precisely
 the confirmed-action-only standard, already met.
 
-**Purely self-reported counters — no journal ground truth.**
-``submit_task``/``resolve_ticket`` are not journaled
-(``TaskInterceptor._journal_around`` wraps only ``set_task_status`` /
-``update_task`` / ``remove_tasks`` / ``add_dependency`` /
-``remove_dependency``), so nothing recomputes these:
+**Task counters — grounded by ``stage2_counter_grounding`` (task 4873).**
+``derive_stage_stats`` does not recompute these; instead
+``TaskKnowledgeSync._apply_post_flight_guards`` repairs each one UPWARD to
+its confirmed evidence:
 
-1. ``tasks_created`` — repaired UPWARD from ``task_created_records`` by
-   ``TaskKnowledgeSync._apply_post_flight_guards`` (task 3046). That record
-   list was itself pure LLM self-report and was never corroborated, so a
-   hallucinated record could inflate the counter with no external check.
-   **This is the defect task 3051 closes**: each record's
-   ``(project_id, task_id)`` key is now resolved to that project's own root
-   via ``known_projects`` and confirmed with ``taskmaster.get_task`` +
-   ``flag_dedup.confirm_task_present`` before it may raise the counter.
-   That proves the task EXISTS in that project, not that this cycle created
-   it, so it closes the fabricated-id hole only; binding a record to this
-   run's own creation is task 4873's scope.
-2. ``tasks_hints_updated`` — the only other purely self-reported counter in
-   the proactive / cross-project filing path. ``prompts/stage2.py`` already
-   mandates a confirmed-action-only rule for it (re-read via ``get_task``,
-   increment only when the returned ``memory_hints`` is a SUPERSET), so it
-   meets the standard at the prompt layer; it lacks an action-record list and
-   framework corroboration, which is a prompt-contract expansion filed as
-   task 4018 (now in task 4873's scope) rather than absorbed here.
+1. ``tasks_created`` / ``tasks_combined`` — evidence is this run's creation
+   journal (``middleware.task_creation_journal``: one row per curator outcome,
+   written by ``TaskInterceptor`` against the ``_causation_id`` in
+   ``submit_task`` metadata, trusted as code truth) united with the
+   ``task_created_records`` claims of status ``created`` / ``combined``, each
+   claim confirmed with ``taskmaster.get_task`` in its own project's root
+   (task 3051). A journal row also binds the task to this run; a confirmed
+   record proves only that the task exists.
+2. ``tasks_hints_updated`` — evidence is the ``task_hints_updated_records``
+   claims, each confirmed when the re-read task's ``memory_hints`` are a
+   SUPERSET of the recorded entries (task 4018).
 3. ``stage1_mem0_flags_processed`` / ``stage1_analytical_findings_processed``
    — flag-processing counters outside the task-filing path. The clamps that
    once checked them were removed by tasks 2229/2230 (W5-mu);
@@ -56,7 +48,7 @@ because the repair is upward-only, dropping an uncorroborated record merely
 leaves the self-reported value alone — it never lowers a counter, never
 raises, never aborts the stage. A configuration that cannot corroborate at
 all is made loud rather than silent (WARNING + explicit
-``task_created_records_uncorroborated`` / ``_unresolvable`` stats).
+``<prefix>_uncorroborated`` / ``_unresolvable`` stats).
 
 Per the ``test_recon_gate_closure_guidance.py`` house rule, prompt prose is
 intentionally NOT pinned here — only machine-readable contract tokens and
