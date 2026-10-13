@@ -7,12 +7,14 @@ token comes from ``shared.uuid_prefix`` (C1) and every answer from the
 ``unique`` tokens are expanded; ``ambiguous`` ones are reported by record and
 left byte-identical, ``none`` ones are counted and left alone.
 
-Run it one project per sitting, dry run first (the default), then one lane at
-a time::
+Run it from the checkout root, one project per sitting, dry run first (the
+default), then one lane at a time::
 
     uv run --project fused-memory python scripts/sweep_uuid_prefixes.py \\
+        --config fused-memory/config/config.yaml \\
         --project <id> [--project-root <checkout>] [--lane all]
     uv run --project fused-memory python scripts/sweep_uuid_prefixes.py \\
+        --config fused-memory/config/config.yaml \\
         --project <id> [--project-root <checkout>] --apply --lane <lane>
 
 A second ``--apply`` of the same lane must report ``0 expandable remaining``
@@ -20,10 +22,12 @@ and exit 0.
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import contextlib
 import difflib
 import json
+import os
 import sys
 import time
 from collections import Counter
@@ -32,22 +36,17 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, NamedTuple, Protocol, TypeVar
 
+import _checkout as _checkout
 import httpx
-
-# Bind `shared` and `fused_memory` to THIS checkout: the editable installs are
-# ordinary .pth entries, so sys.path order decides which copy a worktree run
-# imports. Bare calls, so the imports below need no E402 suppression.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'fused-memory' / 'src'))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'shared' / 'src'))
-
 import sweep_toolcall_markup as markup_sweep
 from _task_db_scan import UNREADABLE_STORE_ERRORS, connect_ro, decode_metadata, tasks_db_path
-from fused_memory.models.scope import Scope
+from fused_memory.models.scope import Scope, build_known_projects_map, resolve_project_id_for_root
 from migrate_metadata_modules_to_files import (
     DEFAULT_SERVER,
     FusedMemoryClient,
     write_failure_reason,
 )
+from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV
 from shared.uuid_prefix import PrefixToken, find_prefix_tokens, substitute_all
 from shared.uuid_prefix_guard import PrefixResolver, Resolution, ResolverUnavailable
 
@@ -901,3 +900,199 @@ LANES: Mapping[str, Lane] = MappingProxyType({
         ),
     )
 })
+
+
+# ---------------------------------------------------------------------------
+# Production stores, and the CLI that composes everything.
+# ---------------------------------------------------------------------------
+
+_CHECKOUT_ROOT = Path(__file__).resolve().parent.parent
+
+
+class LiveStores(NamedTuple):
+    resolve: PrefixResolver
+    mem0: Mem0Corpus
+
+
+class StoresOpener(Protocol):
+    def __call__(
+        self, config_path: str | None, *, mem0_apply: bool
+    ) -> contextlib.AbstractAsyncContextManager[LiveStores]: ...
+
+
+@contextlib.asynccontextmanager
+async def open_live_stores(config_path: str | None, *, mem0_apply: bool) -> AsyncIterator[LiveStores]:
+    """An initialized ``MemoryService``'s resolver and mem0 corpus, closed on the way out.
+
+    The imports are deferred because they pull graphiti_core, which the
+    scripts test environment does not install; nothing else here needs them.
+    The store-mutation preflight runs before ``initialize`` when mem0 writes
+    are requested, so a process that cannot write the store never starts.
+    """
+    from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.services.id_resolver import IdResolver
+    from fused_memory.services.memory_service import MemoryService
+    from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
+
+    if config_path is not None:
+        os.environ['CONFIG_PATH'] = config_path
+    if mem0_apply:
+        assert_store_mutation_allowed(operation='sweep_uuid_prefixes --apply --lane mem0')
+    memory = MemoryService(FusedMemoryConfig())
+    try:
+        await memory.initialize()
+        yield LiveStores(
+            resolve=IdResolver.for_memory_service(memory).resolve_prefix,
+            mem0=ServiceMem0Corpus(memory),
+        )
+    finally:
+        await memory.close()
+
+
+def _positive_rate(text: str) -> float:
+    try:
+        rate = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'not a number: {text!r}') from None
+    if not rate > 0:
+        raise argparse.ArgumentTypeError(f'must be more than 0 writes per second, got {text}')
+    return rate
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description='Expand stored truncated-uuid citations to full ids (PRD C6).'
+    )
+    parser.add_argument(
+        '--project', required=True, help='the project whose stores are swept and resolved against'
+    )
+    parser.add_argument(
+        '--project-root', help='the checkout holding the project tasks.db and data/escalations'
+    )
+    parser.add_argument('--lane', choices=(*LANES, 'all'), default='all')
+    parser.add_argument(
+        '--apply',
+        action='store_true',
+        help='write the expansions; without it the run is a dry run that prints diffs',
+    )
+    parser.add_argument(
+        '--rate',
+        type=_positive_rate,
+        default=DEFAULT_RATE,
+        help=f'writes per second in every lane (default {DEFAULT_RATE})',
+    )
+    parser.add_argument(
+        '--json', action='store_true', help='print one JSON document instead of diffs and summaries'
+    )
+    parser.add_argument('--config', help='fused-memory config file; sets CONFIG_PATH')
+    parser.add_argument(
+        '--server-url', help=f'fused-memory MCP server for task writes (default {DEFAULT_SERVER})'
+    )
+    return parser
+
+
+def _selected_lanes(choice: str) -> tuple[str, ...]:
+    return tuple(LANES) if choice == 'all' else (choice,)
+
+
+def resolve_scope(args: argparse.Namespace, parser: argparse.ArgumentParser) -> SweepScope:
+    """The canonical project and its checkout, or a usage error naming the remedy."""
+    try:
+        project_id = Scope(project_id=args.project).project_id
+    except ValueError as exc:
+        parser.error(f'--project {args.project!r} is not a project id: {exc}')
+    root = _project_root(args.project_root, project_id, parser)
+    needing = [name for name in _selected_lanes(args.lane) if LANES[name].needs_root]
+    if root is None and needing:
+        parser.error(
+            f'lanes {needing} read files under a project root, and none is known for '
+            f'{project_id!r}: pass --project-root, or list the checkout in {KNOWN_PROJECT_ROOTS_ENV}'
+        )
+    return SweepScope(project_id=project_id, project_root=root)
+
+
+def _project_root(
+    given: str | None, project_id: str, parser: argparse.ArgumentParser
+) -> Path | None:
+    if given is None:
+        known = build_known_projects_map(str(_CHECKOUT_ROOT)).get(project_id)
+        return None if known is None else Path(known)
+    root = Path(given).resolve()
+    declared = resolve_project_id_for_root(root)
+    if declared != project_id:
+        parser.error(
+            f'--project-root {root} belongs to project {declared!r}, not --project {project_id!r}'
+        )
+    return root
+
+
+def render_report(report: LaneReport) -> list[str]:
+    """The operator's text view of one lane: a summary line, then one line per site."""
+    lines = [
+        f'lane={report.lane} project={report.project_id} scanned={report.scanned} '
+        f'expandable={report.expandable} expanded={report.expanded} '
+        f'ambiguous={len(report.ambiguous)} untouched={report.untouched} '
+        f'unwritable={len(report.unwritable)} refused={sum(report.refused.values())} '
+        f'failed={len(report.failures)}'
+    ]
+    lines += [f'refused: {reason} {count}' for reason, count in sorted(report.refused.items())]
+    lines += [
+        f'ambiguous: {site.record} {format_path(site.path)} {site.token} '
+        f"candidates={','.join(site.candidates)}"
+        for site in report.ambiguous
+    ]
+    lines += [
+        f'unwritable: {site.record} {format_path(site.path)} {site.token}'
+        for site in report.unwritable
+    ]
+    lines += [f'failed: {failure.key} {failure.reason}: {failure.error}' for failure in report.failures]
+    if report.aborted is not None:
+        lines.append(f'aborted: store={report.aborted}')
+    lines.append(f'{report.lane}: {report.remaining} expandable remaining')
+    return lines
+
+
+async def _sweep_with_stores(
+    args: argparse.Namespace,
+    scope: SweepScope,
+    open_stores: StoresOpener,
+    open_task_client: TaskClientOpener,
+) -> tuple[tuple[LaneReport, ...], tuple[str, ...]]:
+    lanes = _selected_lanes(args.lane)
+    mem0_apply = args.apply and LANE_MEM0 in lanes
+    async with open_stores(args.config, mem0_apply=mem0_apply) as stores:
+        return await run_sweep(
+            scope,
+            lanes=lanes,
+            apply=args.apply,
+            resolve=stores.resolve,
+            mem0=stores.mem0,
+            open_task_client=open_task_client,
+            server_url=args.server_url,
+            rate=args.rate,
+        )
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    open_stores: StoresOpener = open_live_stores,
+    open_task_client: TaskClientOpener = open_live_task_client,
+) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    scope = resolve_scope(args, parser)
+    reports, diffs = asyncio.run(_sweep_with_stores(args, scope, open_stores, open_task_client))
+    code = exit_code(reports)
+    if args.json:
+        print(json.dumps({'lanes': [report.as_dict() for report in reports], 'exit_code': code}))
+        return code
+    for diff in diffs:
+        print(diff)
+    for report in reports:
+        print('\n'.join(render_report(report)))
+    return code
+
+
+if __name__ == '__main__':
+    sys.exit(main())
