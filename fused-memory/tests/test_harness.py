@@ -6221,6 +6221,39 @@ async def test_remediation_pass_cancellation_terminalises_row_as_failed(
 
 
 @pytest.mark.asyncio
+async def test_run_full_cycle_cancellation_records_traceback_and_sqlite_classification(
+    journal, event_buffer, mock_memory_service,
+):
+    """A full cycle cancelled with resume off records the same failure evidence
+    as the remediation pass, so a consumer can index the sqlite keys on any
+    failed row."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.config.resume_after_restart = False
+    await event_buffer.push(_make_event())
+    stage_entered = asyncio.Event()
+    harness.stages[0].run = _stalling_stage_run(stage_entered)
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    outer_task = asyncio.create_task(harness.run_full_cycle('test-project', 'buffer_size:1'))
+    await _cancel_once_entered(outer_task, stage_entered)
+    with pytest.raises(asyncio.CancelledError):
+        await outer_task
+
+    [row] = await journal.get_recent_runs('test-project', limit=1)
+    assert row.run_type == 'full'
+    assert row.status == 'failed'
+    err = row.stage_reports['_error']
+    assert err['error_type'] == 'CancelledError'
+    assert err['error_message'] == 'Run cancelled (timeout or external cancellation)'
+    assert err['failed_stage'] == 'memory_consolidator'
+    assert err['traceback'], 'the failure record must carry the traceback'
+    assert 'CancelledError' in err['traceback']
+    assert err['sqlite_errorname'] is None
+    assert err['sqlite_errorcode'] is None
+
+
+@pytest.mark.asyncio
 async def test_remediation_pass_cancellation_cleanup_failure_still_propagates_cancel(
     journal, event_buffer, mock_memory_service, caplog,
 ):
