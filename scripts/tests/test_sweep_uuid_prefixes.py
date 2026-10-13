@@ -8,6 +8,7 @@ the tasks store is a seeded sqlite file, and the resolver, the mem0 corpus and
 the MCP task client are injected fakes.
 """
 import asyncio
+import contextlib
 import copy
 import itertools
 import json
@@ -23,6 +24,7 @@ import pytest
 # checkout.
 import sweep_toolcall_markup as markup_sweep
 import sweep_uuid_prefixes as sweep
+from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV
 from shared.uuid_prefix import PrefixToken
 from shared.uuid_prefix_guard import Candidate, Resolution, ResolverUnavailable
 
@@ -1033,3 +1035,143 @@ class TestServiceMem0Corpus:
         assert reports[0].aborted == 'mem0'
         assert service.updates == []
         assert sweep.exit_code(reports) == sweep.EXIT_STORE_UNAVAILABLE
+
+
+# ---------------------------------------------------------------------------
+# The CLI.
+# ---------------------------------------------------------------------------
+
+
+class FakeStores:
+    """An injected ``open_stores``: yields the fakes and records how it was opened."""
+
+    def __init__(self, *, resolver=None, corpus=None):
+        self.resolver = resolver if resolver is not None else FakeResolver()
+        self.corpus = corpus if corpus is not None else mem0_corpus()
+        self.opened: list[tuple[str | None, bool]] = []
+
+    @contextlib.asynccontextmanager
+    async def open(self, config_path, *, mem0_apply):
+        self.opened.append((config_path, mem0_apply))
+        yield sweep.LiveStores(resolve=self.resolver, mem0=self.corpus)
+
+
+def unexpected_task_client(server_url):
+    raise AssertionError('the task client was opened')
+
+
+@pytest.fixture
+def cli_root(tmp_path, make_tasks_db):
+    root = tmp_path / PROJECT
+    build_escalations(root)
+    build_tasks(make_tasks_db, root)
+    return root
+
+
+def cli(argv, stores, *, open_task_client=unexpected_task_client):
+    return sweep.main(argv, open_stores=stores.open, open_task_client=open_task_client)
+
+
+def scoped(root, *argv):
+    return [*argv, '--project', PROJECT, '--project-root', str(root)]
+
+
+class TestMain:
+    def test_the_default_run_is_a_dry_run_over_every_lane(self, cli_root, capsys):
+        stores = FakeStores()
+        before = bytes_under(cli_root)
+
+        code = cli(scoped(cli_root, '--lane', 'all'), stores)
+
+        assert code == markup_sweep.EXIT_REPAIRABLE_REMAINS
+        assert bytes_under(cli_root) == before
+        assert stores.corpus.amends == []
+        assert stores.opened == [(None, False)]
+        out = capsys.readouterr().out
+        for lane in ('mem0', 'tasks', 'escalations'):
+            assert f'--- {lane} ' in out
+        lines = out.splitlines()
+        for lane, remaining in (('mem0', 3), ('tasks', 4), ('escalations', 2)):
+            (summary,) = [line for line in lines if line.startswith(f'lane={lane} ')]
+            for field in (f'project={PROJECT}', f'expandable={remaining}', 'ambiguous=1', 'untouched='):
+                assert field in summary
+            assert f'{lane}: {remaining} expandable remaining' in lines
+
+    def test_apply_then_rerun_reaches_clean(self, cli_root, capsys):
+        stores = FakeStores()
+
+        assert cli(scoped(cli_root, '--apply', '--lane', 'escalations'), stores) == 0
+        capsys.readouterr()
+        code = cli(scoped(cli_root, '--lane', 'escalations'), stores)
+
+        assert code == markup_sweep.EXIT_CLEAN
+        assert 'escalations: 0 expandable remaining' in capsys.readouterr().out.splitlines()
+
+    def test_only_a_mem0_apply_asks_for_mem0_writes(self, cli_root):
+        stores = FakeStores()
+
+        cli(scoped(cli_root, '--apply', '--lane', 'escalations'), stores)
+        cli(scoped(cli_root, '--apply', '--lane', 'mem0'), stores)
+
+        assert [mem0_apply for _, mem0_apply in stores.opened] == [False, True]
+
+    def test_a_root_of_another_project_is_a_usage_error(self, cli_root, capsys):
+        stores = FakeStores()
+
+        with pytest.raises(SystemExit) as exited:
+            cli(['--project', 'other', '--project-root', str(cli_root)], stores)
+
+        assert exited.value.code == 2
+        err = capsys.readouterr().err
+        assert 'other' in err
+        assert PROJECT in err
+        assert stores.opened == []
+
+    def test_a_root_needing_lane_without_a_root_is_a_usage_error(self, monkeypatch, capsys):
+        monkeypatch.delenv(KNOWN_PROJECT_ROOTS_ENV, raising=False)
+        stores = FakeStores()
+
+        with pytest.raises(SystemExit) as exited:
+            cli(['--lane', 'tasks', '--project', 'nowhere'], stores)
+
+        assert exited.value.code == 2
+        assert '--project-root' in capsys.readouterr().err
+        assert stores.opened == []
+
+    def test_the_mem0_lane_needs_no_root(self, monkeypatch):
+        monkeypatch.delenv(KNOWN_PROJECT_ROOTS_ENV, raising=False)
+        stores = FakeStores()
+
+        cli(['--lane', 'mem0', '--project', 'nowhere'], stores)
+
+        assert stores.opened == [(None, False)]
+
+    @pytest.mark.parametrize('rate', ['0', '-1', 'fast'])
+    def test_a_rate_that_is_not_positive_is_a_usage_error(self, cli_root, rate):
+        stores = FakeStores()
+
+        with pytest.raises(SystemExit) as exited:
+            cli(scoped(cli_root, '--rate', rate), stores)
+
+        assert exited.value.code == 2
+        assert stores.opened == []
+
+    def test_json_mode_prints_one_document_and_no_diffs(self, cli_root, capsys):
+        code = cli(scoped(cli_root, '--lane', 'escalations', '--json'), FakeStores())
+
+        document = json.loads(capsys.readouterr().out)
+        assert document['exit_code'] == code == markup_sweep.EXIT_REPAIRABLE_REMAINS
+        (lane,) = document['lanes']
+        assert (lane['lane'], lane['expandable'], lane['remaining']) == ('escalations', 2, 2)
+        assert lane['ambiguous'] == [
+            {'record': ESC_2_KEY, 'path': ['detail'], 'token': AMBIG, 'candidates': [AMBIG_A, AMBIG_B]}
+        ]
+        assert lane['failures'] == []
+
+    def test_an_unreachable_store_exits_store_unavailable_and_names_it(self, cli_root, capsys):
+        stores = FakeStores(resolver=FakeResolver(unavailable={UNIQUE: 'mem0'}))
+
+        code = cli(scoped(cli_root, '--lane', 'escalations'), stores)
+
+        assert code == sweep.EXIT_STORE_UNAVAILABLE
+        assert 'aborted: store=mem0' in capsys.readouterr().out.splitlines()
