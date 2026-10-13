@@ -73,6 +73,21 @@ def _warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
     return [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
+def _seed_sibling_record(tmp_path: Path, host: int) -> None:
+    """Point the host pid's sessions-by-pid entry at a record the host owns."""
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug='sibling-hosted-record',
+            status=sr.Status.RUNNING,
+            claude_session_id='claude-session-uuid',
+            claude_owner_pid=host,
+        ),
+        root=tmp_path,
+    )
+    sr.write_session_pointer(host, 'sibling-hosted-record', root=tmp_path)
+    assert sr.resolve_session_slug_for_pid(host, root=tmp_path) == 'sibling-hosted-record'
+
+
 # --- resolution layer --------------------------------------------------------
 
 
@@ -139,17 +154,7 @@ def test_a_hosted_claim_records_pid_zero_and_a_session_scoped_slug(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     host = shared_host_pid
-    sr.write_record(
-        sr.SessionRecord(
-            session_slug='sibling-hosted-record',
-            status=sr.Status.RUNNING,
-            claude_session_id='claude-session-uuid',
-            claude_owner_pid=host,
-        ),
-        root=tmp_path,
-    )
-    sr.write_session_pointer(host, 'sibling-hosted-record', root=tmp_path)
-    assert sr.resolve_session_slug_for_pid(host, root=tmp_path) == 'sibling-hosted-record'
+    _seed_sibling_record(tmp_path, host)
     _hosted_env(monkeypatch, tmp_path, pid=host, session_id='sess-a')
 
     lines = _cli(capsys, 'lease-claim', '--name', _NAME)
@@ -353,3 +358,19 @@ def test_a_running_non_host_holder_is_never_stale(tmp_path: Path) -> None:
     assert sr.lease_status(_NAME, root=tmp_path).reclaimable is False
     assert sr.reap_stale_leases(root=tmp_path) == []
     assert lease.is_file()
+
+
+def test_resolve_own_record_slug_is_none_for_a_shared_host(
+    shared_host_pid: int, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The host's pointer is last-writer-wins across every hosted session.
+
+    So it may name a SIBLING's record, and a DecisionRecord must read unlinked
+    rather than be mis-attributed.
+    """
+    _seed_sibling_record(tmp_path, shared_host_pid)
+    caplog.set_level(logging.DEBUG)
+    env = {'CLAUDE_PID': str(shared_host_pid), 'CLAUDE_CODE_SESSION_ID': 'sess-a'}
+
+    assert sr.resolve_own_record_slug(env, root=tmp_path) is None
+    assert _warnings(caplog) == []
