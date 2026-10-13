@@ -459,6 +459,56 @@ class TestProjectArgsResolveAtUse:
         scrolled = self._scrolled_projects('--project-root', '/x/y/Know-Live', '--project-id', 'reify')
         assert scrolled == ['reify']
 
+    def test_a_relative_project_root_derives_the_id_of_the_directory_it_names(self, tmp_path, monkeypatch):
+        project = tmp_path / 'Know-Live'
+        (project / 'sub').mkdir(parents=True)
+        monkeypatch.chdir(project)
+        assert self._scrolled_projects('--project-root', '.') == ['know_live']
+        monkeypatch.chdir(project / 'sub')
+        assert self._scrolled_projects('--project-root', '..') == ['know_live']
+
+    def test_a_project_root_with_no_basename_is_could_not_check(self, capsys):
+        memory = FakeMemory()
+        args = mod.build_parser().parse_args(
+            ['--metadata-json', json.dumps(_gate_blob()), '--project-root', '/']
+        )
+        rc = asyncio.run(mod.run(args, memory=memory))
+        assert rc == mod.EXIT_USAGE
+        assert capsys.readouterr().out.startswith('COULD NOT CHECK')
+        assert memory.counted_projects == []
+
+    def test_a_project_root_with_no_basename_is_could_not_check_in_json(self, capsys):
+        memory = FakeMemory()
+        args = mod.build_parser().parse_args(
+            ['--metadata-json', json.dumps(_gate_blob()), '--project-root', '/', '--json']
+        )
+        rc = asyncio.run(mod.run(args, memory=memory))
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == mod.EXIT_USAGE
+        assert payload['checked'] is False
+        assert payload['exit_code'] == mod.EXIT_USAGE
+        assert memory.counted_projects == []
+
+    @pytest.mark.parametrize(
+        'argv',
+        [['--task-id', '1'], ['--metadata-json', json.dumps(_gate_blob())]],
+        ids=['store-read', 'id-derivation'],
+    )
+    def test_a_copy_outside_any_checkout_is_could_not_check(self, tmp_path, argv):
+        loose = _LINKED_WORKTREE_COPY.checkout_copy(tmp_path / 'loose', _ROOT)
+        proc = subprocess.run(
+            [sys.executable, '-s', str(loose / 'scripts' / 'check_consolidation_closure.py'), *argv],
+            cwd=tmp_path,
+            env=_LINKED_WORKTREE_COPY.probe_env(),
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+        assert proc.returncode == mod.EXIT_USAGE, f'exited {proc.returncode}\n{proc.stderr}'
+        assert 'COULD NOT CHECK' in proc.stdout
+        assert 'no git checkout encloses' in proc.stdout
+
     def test_a_copy_in_a_linked_worktree_reads_the_main_checkouts_task_store(self, tmp_path):
         """The copy's worktree holds no task store, so reaching the scroll at
         all means task 1 was read from the main checkout's."""

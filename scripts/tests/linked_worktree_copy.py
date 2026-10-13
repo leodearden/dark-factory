@@ -25,16 +25,25 @@ def linked_worktree_copy(main: Path, checkout: Path) -> Path:
     _git(main, 'commit', '-q', '--allow-empty', '--no-verify', '-m', 'seed')
     tree = main / '.worktrees' / 'w'
     _git(main, 'worktree', 'add', '-q', str(tree), '-b', 'w')
-    shutil.copy2(checkout / 'pyproject.toml', tree / 'pyproject.toml')
-    (tree / 'scripts').mkdir()
+    return checkout_copy(tree, checkout)
+
+
+def checkout_copy(dest: Path, checkout: Path) -> Path:
+    """Copy *checkout*'s pyproject.toml, top-level scripts and shared into *dest*; return *dest*.
+
+    Called alone, it places the same copy outside any checkout, where no default root can be derived.
+    """
+    dest.mkdir(exist_ok=True)
+    shutil.copy2(checkout / 'pyproject.toml', dest / 'pyproject.toml')
+    (dest / 'scripts').mkdir()
     for script in (checkout / 'scripts').glob('*.py'):
-        shutil.copy2(script, tree / 'scripts' / script.name)
+        shutil.copy2(script, dest / 'scripts' / script.name)
     shutil.copytree(
         checkout / 'shared' / 'src' / 'shared',
-        tree / 'shared' / 'src' / 'shared',
+        dest / 'shared' / 'src' / 'shared',
         ignore=shutil.ignore_patterns('__pycache__'),
     )
-    return tree
+    return dest
 
 
 def probe_env() -> dict[str, str]:
