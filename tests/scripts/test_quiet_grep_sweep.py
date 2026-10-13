@@ -36,6 +36,7 @@ _SWEPT_SCRIPTS = tuple(
         "scripts/run_eval_matrix.sh",
         "orchestrator/scripts/warm-lane/provision-warm-lane-fs.sh",
         "orchestrator/scripts/warm-lane/thin-warm-lane.sh",
+        "orchestrator/scripts/warm-lane/warm-lane-disk-guard.sh",
     )
 )
 
