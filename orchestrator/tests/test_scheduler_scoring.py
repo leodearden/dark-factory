@@ -7,8 +7,9 @@ import inspect
 import json
 import math
 from collections import Counter
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -268,3 +269,57 @@ class TestRow4NonSaturation:
                 if expected != scores[candidate['id']]:
                     moved.append((candidate['id'], expected, scores[candidate['id']]))
         assert not moved, f'(id, expected, full-set score) for scores that depend on the candidate set: {moved[:20]}'
+
+
+NOW = datetime(2026, 10, 12, 12, 0, 0, tzinfo=UTC)
+SHARED_ANCHOR = '2026-10-10T08:00:00.000Z'
+
+
+def _task(task_id: str, *, priority: str = 'medium', pending_since: str | None = SHARED_ANCHOR) -> dict:
+    metadata: dict = {'files': [f'mod{task_id}']}
+    if pending_since is not None:
+        metadata['pending_since'] = pending_since
+    return {'id': task_id, 'title': f'Task {task_id}', 'status': 'pending', 'priority': priority,
+            'dependencies': [], 'metadata': metadata}
+
+
+def _frozen_scheduler(now: datetime = NOW, **config) -> Scheduler:
+    scheduler = Scheduler(OrchestratorConfig(max_per_module=1, max_concurrent_tasks=20, **config),
+                          wall_time_source=lambda: now)
+    scheduler.finish_startup()
+    return scheduler
+
+
+async def _dispatch_order(tasks: list[dict]) -> list[str]:
+    scheduler = _frozen_scheduler()
+    scheduler.get_tasks = AsyncMock(return_value=tasks)
+    order = []
+    for _ in tasks:
+        assignment = await scheduler.acquire_next()
+        assert assignment is not None, f'nothing dispatched after {order}'
+        order.append(assignment.task_id)
+    return order
+
+
+class TestNumericTieBreak:
+    """I-4 / D7: at equal scores, the older (numerically smaller) id dispatches first."""
+
+    @pytest.mark.asyncio
+    async def test_equal_scores_dispatch_in_numeric_id_order(self):
+        assert await _dispatch_order([_task('30'), _task('4'), _task('200')]) == ['4', '30', '200']
+
+    @pytest.mark.asyncio
+    async def test_a_four_digit_id_dispatches_before_a_five_digit_one(self):
+        assert await _dispatch_order([_task('10000'), _task('9999')]) == ['9999', '10000']
+
+    @pytest.mark.asyncio
+    async def test_non_numeric_ids_follow_every_numeric_id_in_string_order(self):
+        tasks = [_task('zeta'), _task('12'), _task('alpha'), _task('3')]
+
+        assert await _dispatch_order(tasks) == ['3', '12', 'alpha', 'zeta']
+
+    @pytest.mark.asyncio
+    async def test_score_still_dominates_the_tie_break(self):
+        tasks = [_task('5', priority='medium'), _task('500', priority='high')]
+
+        assert await _dispatch_order(tasks) == ['500', '5']
