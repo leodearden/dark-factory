@@ -1077,6 +1077,39 @@ class TestSighupKeepsUnverifiedTokensBlocked:
         finally:
             await gate.shutdown()
 
+    async def test_a_pool_left_all_auth_failed_stays_paused_with_its_reason(self):
+        gate = _make_gate(_ROSTER)
+        try:
+            for name in _ROSTER:
+                _settle_only(gate, name, _ORG_DISABLED)
+            reason = gate.paused_reason
+            assert gate.is_paused
+            assert reason
+            gate._run_probe = AsyncMock(return_value=False)
+
+            with patch('shared.usage_gate.load_dotenv'):
+                await gate._on_sighup_async()
+
+            assert gate.is_paused is True
+            assert gate.paused_reason == reason
+        finally:
+            await gate.shutdown()
+
+    async def test_a_sighup_that_reopens_the_pool_clears_the_reason(self):
+        gate = _make_gate(_ROSTER)
+        try:
+            for name in _ROSTER:
+                _settle_only(gate, name, _ORG_DISABLED)
+            gate._run_probe = AsyncMock(return_value=True)
+
+            with patch('shared.usage_gate.load_dotenv'):
+                await gate._on_sighup_async()
+
+            assert gate.is_paused is False
+            assert gate.paused_reason == ''
+        finally:
+            await gate.shutdown()
+
 
 @pytest.mark.asyncio
 class TestSighupClearsAllBlockedState:
