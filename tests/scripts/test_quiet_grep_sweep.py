@@ -40,6 +40,7 @@ _SWEPT_SCRIPTS = tuple(
         "orchestrator/scripts/warm-lane/warm-lane-gc-sweep.sh",
         "orchestrator/scripts/warm-lane/warm-lane-gc.sh",
         "orchestrator/scripts/warm-lane/warm-lane-audit.sh",
+        "orchestrator/scripts/warm-lane/warm-lane-degenerate-ref-check.sh",
     )
 )
 
