@@ -12,8 +12,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from escalation.models import Escalation
+from escalation.queue import EscalationQueue
 
 import orchestrator
+import orchestrator.scheduler as scheduler_module
 from orchestrator.config import (
     PRIORITY_TIERS,
     TIER_BASE,
@@ -432,3 +435,137 @@ class TestRow9AnchorCoverageGate:
         await low_tick()
 
         assert [e['consecutive_ticks'] for e in _low_coverage_events(store)] == [1, 2, 3, 1]
+
+
+def test_the_storm_escape_constants_are_what_the_measurements_support():
+    """Pinned with the reasoning: code properties, not config leaves (the _BACKFILL_OVERSTAY_* precedent).
+
+    The streak matches the fm-read-storm threshold: it clears a routine
+    fused-memory restart yet catches a fleet stuck on the legacy formula.  The
+    rate is 10x the 0.2% anchorless residual measured live on 2026-10-12 and
+    well under the 10% the arming gate already tolerates; the floor keeps a
+    handful of rows from claiming a rate, and the window lets a fix decay it.
+    """
+    assert scheduler_module._ANCHOR_COVERAGE_LOW_ESCALATION_THRESHOLD == scheduler_module._FM_READ_FAILURE_ESCALATION_THRESHOLD == 12
+    assert pytest.approx(0.02) == scheduler_module._ANCHORLESS_RATE_THRESHOLD
+    assert scheduler_module._ANCHORLESS_MIN_SAMPLES == 500
+    assert scheduler_module._ANCHORLESS_WINDOW == 4096
+    assert scheduler_module._ANCHORLESS_WINDOW > scheduler_module._ANCHORLESS_MIN_SAMPLES
+    assert len({scheduler_module._ANCHOR_COVERAGE_LOW_SENTINEL, scheduler_module._ANCHORLESS_SENTINEL}) == 2
+
+
+class _DownQueue(EscalationQueue):
+    def submit(self, escalation: Escalation) -> str:
+        raise RuntimeError('escalation queue is down')
+
+
+def _mixed(*, anchored: int, absent: int = 0, malformed: int = 0, first_id: int = 1) -> list[dict]:
+    kinds = [SHARED_ANCHOR] * anchored + [None] * absent + ['not-a-date'] * malformed
+    return [_task(str(first_id + i), pending_since=anchor) for i, anchor in enumerate(kinds)]
+
+
+def _ctx(tasks: list[dict]) -> TickContext:
+    return _tick(tasks, {t['id']: 0 for t in tasks}, max(int(t['id']) for t in tasks))
+
+
+def _run(scheduler: Scheduler, tasks: list[dict], ticks: int) -> None:
+    ctx = _ctx(tasks)
+    for _ in range(ticks):
+        assert scheduler._score_candidates(ctx)
+
+
+def _filed(queue: EscalationQueue, sentinel: str) -> list[Escalation]:
+    return [e for e in queue.get_pending() if e.task_id == sentinel]
+
+
+class TestStormEscapes:
+    """INV-4: a persistent anchor outage reaches a human once, through the escalation queue."""
+
+    @pytest.fixture
+    def queue(self, tmp_path) -> EscalationQueue:
+        return EscalationQueue(tmp_path / 'esc')
+
+    @pytest.fixture
+    def scheduler(self, queue) -> Scheduler:
+        scheduler = _frozen_scheduler()
+        scheduler.escalation_queue = queue
+        return scheduler
+
+    def test_a_persistent_unarmed_streak_files_one_l1(self, scheduler, queue):
+        tasks = _mixed(anchored=2, absent=3)
+
+        _run(scheduler, tasks, scheduler_module._ANCHOR_COVERAGE_LOW_ESCALATION_THRESHOLD - 1)
+        assert queue.get_pending() == []
+
+        _run(scheduler, tasks, 1)
+        [esc] = queue.get_pending()
+        assert (esc.task_id, esc.agent_role, esc.severity, esc.level, esc.category) == (
+            scheduler_module._ANCHOR_COVERAGE_LOW_SENTINEL, 'orchestrator-scheduler', 'blocking', 1, 'infra_issue')
+        for fact in ('40.0%', '90.0%', f'{scheduler_module._ANCHOR_COVERAGE_LOW_ESCALATION_THRESHOLD} consecutive', '3', '4', '5', 'stamp_pending_since'):
+            assert fact in esc.detail, fact
+
+        _run(scheduler, tasks, 5)
+        assert len(queue.get_pending()) == 1
+
+    def test_an_armed_tick_ends_the_streak(self, scheduler, queue):
+        low, healthy = _mixed(anchored=2, absent=3), _mixed(anchored=5)
+
+        _run(scheduler, low, scheduler_module._ANCHOR_COVERAGE_LOW_ESCALATION_THRESHOLD - 1)
+        _run(scheduler, healthy, 1)
+        _run(scheduler, low, scheduler_module._ANCHOR_COVERAGE_LOW_ESCALATION_THRESHOLD - 1)
+
+        assert queue.get_pending() == []
+
+    def test_a_persistent_anchorless_minority_on_armed_ticks_files_one_l1(self, scheduler, queue):
+        tasks = _mixed(anchored=95, absent=3, malformed=2)
+        floor_ticks = scheduler_module._ANCHORLESS_MIN_SAMPLES // len(tasks)
+
+        _run(scheduler, tasks, floor_ticks - 1)
+        assert queue.get_pending() == []
+
+        _run(scheduler, tasks, 1)
+        [esc] = queue.get_pending()
+        assert (esc.task_id, esc.level, esc.category) == (scheduler_module._ANCHORLESS_SENTINEL, 1, 'risk_identified')
+        for fact in ('15 ABSENT', '10 MALFORMED', '5.0%', '500', '96', '99'):
+            assert fact in esc.detail, fact
+
+        _run(scheduler, tasks, 5)
+        assert len(queue.get_pending()) == 1
+
+    def test_no_rate_is_claimed_below_the_sample_floor(self, scheduler, queue):
+        _run(scheduler, _mixed(anchored=9, absent=1), 40)
+
+        assert queue.get_pending() == []
+
+    def test_the_measured_live_residual_never_files(self, scheduler, queue):
+        _run(scheduler, _mixed(anchored=998, absent=1, malformed=1), 10)
+
+        assert queue.get_pending() == []
+
+    def test_an_unarmed_outage_files_only_the_streak_escape(self, scheduler, queue):
+        _run(scheduler, _mixed(anchored=50, absent=50), scheduler_module._ANCHOR_COVERAGE_LOW_ESCALATION_THRESHOLD + 3)
+
+        assert [e.task_id for e in queue.get_pending()] == [scheduler_module._ANCHOR_COVERAGE_LOW_SENTINEL]
+
+    def test_clean_ticks_bring_the_rate_back_under_the_threshold(self, scheduler, queue):
+        _run(scheduler, _mixed(anchored=95, absent=5), 5)
+        [esc] = _filed(queue, scheduler_module._ANCHORLESS_SENTINEL)
+
+        _run(scheduler, _mixed(anchored=100), 8)
+        queue.resolve(esc.id, 'anchors re-stamped')
+        _run(scheduler, _mixed(anchored=100), 3)
+
+        assert _filed(queue, scheduler_module._ANCHORLESS_SENTINEL) == []
+
+    def test_without_a_queue_both_escapes_are_no_ops(self):
+        scheduler = _frozen_scheduler()
+
+        _run(scheduler, _mixed(anchored=2, absent=3), scheduler_module._ANCHOR_COVERAGE_LOW_ESCALATION_THRESHOLD + 1)
+        _run(scheduler, _mixed(anchored=95, absent=5), 6)
+
+    def test_a_failing_submit_never_aborts_scoring(self, tmp_path):
+        scheduler = _frozen_scheduler()
+        scheduler.escalation_queue = _DownQueue(tmp_path / 'esc')
+
+        _run(scheduler, _mixed(anchored=2, absent=3), scheduler_module._ANCHOR_COVERAGE_LOW_ESCALATION_THRESHOLD + 1)
+        _run(scheduler, _mixed(anchored=95, absent=5), 6)
