@@ -49,6 +49,7 @@ from fused_memory.reconciliation.prompts.stage2 import (
 )
 from fused_memory.reconciliation.recon_self_model import (
     render_task_creation_accounting_section,
+    render_task_hints_update_accounting_section,
 )
 from fused_memory.reconciliation.stage2_counter_grounding import coerce_count
 from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
@@ -83,7 +84,8 @@ class TestTaskCreationAccountingWiring:
             'render_task_creation_accounting_section() verbatim, exactly once.'
         )
 
-    def test_assembled_prompt_carries_machine_readable_contract_tokens(self):
+    @pytest.mark.parametrize('project_id', ['dark_factory', 'autopilot_video'])
+    def test_assembled_prompt_carries_machine_readable_contract_tokens(self, project_id: str):
         """The Python side reads tasks_created / task_created_records / the
         "action": "task_created" record shape — pin those tokens, not prose.
 
@@ -96,11 +98,37 @@ class TestTaskCreationAccountingWiring:
         which scans this exact assembled prompt for run_id=-less call
         examples. No need to re-pin either as a standalone negative-substring
         check here (task-3046 amendment)."""
-        built = build_stage2_system_prompt('dark_factory')
+        built = build_stage2_system_prompt(project_id)
 
         assert 'tasks_created' in built
         assert 'task_created_records' in built
         assert '"action": "task_created"' in built
+        assert 'tasks_combined' in built
+        assert 'task_hints_updated_records' in built
+        assert '"action": "task_hints_updated"' in built
+
+
+class TestHintsUpdateAccountingWiring:
+    """render_task_hints_update_accounting_section() is wired into Stage 2
+    exactly once (task 4018)."""
+
+    def test_embedded_verbatim_exactly_once_in_stage2_prompt(self):
+        section = render_task_hints_update_accounting_section()
+
+        assert STAGE2_SYSTEM_PROMPT.count(section) == 1, (
+            'STAGE2_SYSTEM_PROMPT must interpolate '
+            'render_task_hints_update_accounting_section() verbatim, exactly once.'
+        )
+
+    @pytest.mark.parametrize('project_id', ['dark_factory', 'autopilot_video'])
+    def test_survives_build_stage2_system_prompt(self, project_id: str):
+        section = render_task_hints_update_accounting_section()
+        built = build_stage2_system_prompt(project_id)
+
+        assert built.count(section) == 1, (
+            f'build_stage2_system_prompt({project_id!r}) must carry '
+            'render_task_hints_update_accounting_section() verbatim, exactly once.'
+        )
 
 
 class TestCoerceCount:
