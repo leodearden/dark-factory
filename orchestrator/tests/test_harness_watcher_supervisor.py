@@ -3222,13 +3222,22 @@ def _fenced_code_blocks(text: str) -> list[str]:
 
 
 def _skill_section(text: str, heading: str) -> str:
-    """The `heading` line up to (not including) the next line starting '### '."""
+    """`heading` up to the next heading of the same or a shallower level,
+    ignoring lines inside ``` fences."""
     lines = text.splitlines()
+    if heading not in lines:
+        raise AssertionError(f'SKILL.md has no heading line {heading!r}')
     start = lines.index(heading)
-    end = next(
-        (i for i in range(start + 1, len(lines)) if lines[i].startswith('### ')),
-        len(lines),
-    )
+    level = len(heading) - len(heading.lstrip('#'))
+    boundary = re.compile(rf'#{{1,{level}}} ')
+    in_fence = False
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        if lines[i].lstrip().startswith('```'):
+            in_fence = not in_fence
+        elif not in_fence and boundary.match(lines[i]):
+            end = i
+            break
     return '\n'.join(lines[start:end])
 
 
@@ -3487,6 +3496,41 @@ class TestWatcherConvertToTrackedWork:
             'escalation/src/escalation/server.py::resolve_issue rejects a '
             'resolution_class outside escalation.models.RESOLUTION_CLASSES, '
             f'so these templates fail at runtime: {unknown}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3726: cleanup_needed files the cleanup instead of claiming tracking
+# ---------------------------------------------------------------------------
+
+_CLEANUP_HEADING = '#### `cleanup_needed`'
+
+
+class TestWatcherCleanupNeededFilesWork:
+    """The cleanup_needed handler files through the Convert disposition.
+
+    Its old close claimed the cleanup was "tracked in digest", but no
+    component reads the rotation's digest, so nothing tracked it.
+    """
+
+    def test_cleanup_routes_through_the_convert_disposition(self) -> None:
+        section = _skill_section(_watcher_skill_text(), _CLEANUP_HEADING)
+        assert '](#convert-to-tracked-work-file-and-resolve)' in section, (
+            'the cleanup_needed handler must link the Convert to tracked work '
+            'section, the one home of the submit/resolve filing procedure'
+        )
+
+    def test_cleanup_close_is_stamped_converted(self) -> None:
+        section = _skill_section(_watcher_skill_text(), _CLEANUP_HEADING)
+        classes = [
+            cls
+            for block in _fenced_code_blocks(section)
+            if 'resolve_issue(' in block
+            for cls in re.findall(_RESOLUTION_CLASS_LITERAL, block)
+        ]
+        assert classes and set(classes) == {'converted'}, (
+            'a cleanup_needed close cites the task filed for the cleanup, so '
+            f"it is resolution_class 'converted'; found {classes}"
         )
 
 
