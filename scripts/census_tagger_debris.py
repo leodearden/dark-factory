@@ -772,7 +772,7 @@ def census_project(project_root: str) -> ProjectCensus:
     equality. Returning a partial census here would silently re-open the false
     green exit 3 closes.
     """
-    project_id = project_id_for_root(project_root)
+    project_id = project_id_for_root(Path(project_root).resolve())
     tasks_db = tasks_db_path(project_root)
 
     conn = connect_ro(tasks_db)

@@ -520,13 +520,14 @@ def resolve_project_id(project_root: str, override: str | None = None) -> str:
     """Derive the tickets.db ``project_id`` for *project_root*.
 
     ``/home/leo/src/dark-factory`` -> ``dark_factory``: the one project-id rule,
-    ``shared.project_id.project_id_for_root``, over the directory name.
+    ``shared.project_id.project_id_for_root``, over the directory
+    *project_root* names, resolved, so ``.`` is the cwd's id.
     *override* wins outright when supplied, which is the escape hatch for a
     project whose directory name does not match its id.
     """
     if override:
         return override
-    return project_id_for_root(project_root)
+    return project_id_for_root(Path(project_root).resolve())
 
 
 def _distinct_ticket_project_ids(tickets_db_path: str) -> set[str]:
