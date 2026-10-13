@@ -236,9 +236,9 @@ def run(settings: Settings, *, gate: Any = None) -> int:
     return _judge(completed, settings, _measure(inbox, store_path, held_before))
 
 
-def main(argv: Sequence[str] | None = None, *, gate: Any = None) -> int:
+def main(argv: Sequence[str] | None = None, *, gate: Any = None, root: Path = _REPO_ROOT) -> int:
     args = _parser().parse_args(argv)
-    settings = Settings(args.claude_bin, args.model, args.budget_usd, args.timeout_secs, args.max_turns, args.mcp_json, _REPO_ROOT)
+    settings = Settings(args.claude_bin, args.model, args.budget_usd, args.timeout_secs, args.max_turns, args.mcp_json, root)
     try:
         return run(settings, gate=gate)
     except Exception as exc:

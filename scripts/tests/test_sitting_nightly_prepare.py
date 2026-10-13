@@ -188,13 +188,6 @@ def _run(fake: FakeClaude, *, gate=None, **overrides) -> int:
     return mod.run(settings, gate=gate if gate is not None else _live_gate())
 
 
-@pytest.fixture
-def checkout_at_tmp(tmp_path, monkeypatch) -> Path:
-    """``main`` works in the module's checkout; this points that at ``tmp_path`` so no real ``data/`` is written."""
-    monkeypatch.setattr(mod, '_REPO_ROOT', tmp_path)
-    return tmp_path
-
-
 def _flag_values(argv: list[str], flag: str) -> list[str]:
     values = argv[argv.index(flag) + 1:]
     return values[:next((i for i, value in enumerate(values) if value.startswith('--')), len(values))]
@@ -271,14 +264,14 @@ def test_the_child_runs_in_the_root_it_was_given(tmp_path):
     assert Path(fake.only_call()['cwd']).resolve() == tmp_path.resolve()
 
 
-def test_main_works_in_the_modules_checkout_and_forwards_the_cli_flags(checkout_at_tmp):
-    fake = _fake_claude(checkout_at_tmp)
+def test_main_works_in_the_root_it_is_given_and_forwards_the_cli_flags(tmp_path):
+    fake = _fake_claude(tmp_path)
 
-    rc = mod.main(['--claude-bin', str(fake.bin), '--model', 'opus', '--max-turns', '17'], gate=_live_gate())
+    rc = mod.main(['--claude-bin', str(fake.bin), '--model', 'opus', '--max-turns', '17'], gate=_live_gate(), root=tmp_path)
 
     call = fake.only_call()
     assert rc == mod.EXIT_OK
-    assert Path(call['cwd']).resolve() == checkout_at_tmp.resolve()
+    assert Path(call['cwd']).resolve() == tmp_path.resolve()
     assert call['argv'][call['argv'].index('--model') + 1] == 'opus'
     assert call['argv'][call['argv'].index('--max-turns') + 1] == '17'
 
@@ -573,10 +566,10 @@ def test_the_entry_point_runs_standalone_without_the_test_sys_path(tmp_path):
     assert 'no-such-claude' in proc.stderr
 
 
-def test_main_never_raises(checkout_at_tmp, capsys):
-    fake = _fake_claude(checkout_at_tmp)
+def test_main_never_raises(tmp_path, capsys):
+    fake = _fake_claude(tmp_path)
 
-    rc = mod.main(['--claude-bin', str(fake.bin)], gate=ExplodingGate())
+    rc = mod.main(['--claude-bin', str(fake.bin)], gate=ExplodingGate(), root=tmp_path)
 
     assert rc == mod.EXIT_FAILED
     assert 'roster unreadable: simulated' in capsys.readouterr().err
