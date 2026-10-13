@@ -347,14 +347,14 @@ class TestReconConfigDirHelpers:
         cfg = TaskConfigDir(task_id=run_id, base_dir=recon_config_base_dir(tmp_path))
         assert cfg.path.exists()
 
-        gc_run_config_dir(tmp_path, run_id)
+        gc_run_config_dir(tmp_path, run_id, archive_root=None)
         assert not cfg.path.exists()
 
     def test_gc_is_noop_when_absent(self, tmp_path):
         from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir
 
         # No dir created — GC must be a silent no-op (ignore_errors), never raise.
-        gc_run_config_dir(tmp_path, 'never-created')
+        gc_run_config_dir(tmp_path, 'never-created', archive_root=None)
 
     def test_run_config_dir_path_matches_task_config_dir_path(self, tmp_path):
         """The pure derivation names exactly the dir ``TaskConfigDir`` builds."""
@@ -461,7 +461,7 @@ class TestReconConfigDirHelpers:
         doomed.mkdir(parents=True)
 
         monkeypatch.chdir(tmp_path)
-        gc_run_config_dir(Path('data/reconciliation'), 'r1')
+        gc_run_config_dir(Path('data/reconciliation'), 'r1', archive_root=None)
 
         assert not doomed.exists(), (
             f'GC must remove the cwd-anchored dir the creator built; {doomed} '
@@ -683,6 +683,63 @@ class TestReconArchiveRoot:
 
         assert isinstance(recon_archive_root(cfg), Path)
 
+    def _announced(self, caplog, cfg):
+        import logging
+
+        from fused_memory.reconciliation.cli_stage_runner import (
+            announce_recon_archive_root,
+        )
+
+        with caplog.at_level(logging.INFO, logger=self.LOGGER):
+            announce_recon_archive_root(cfg)
+        return [
+            (r.levelno, r.getMessage())
+            for r in caplog.records if r.name == self.LOGGER
+        ]
+
+    def test_announce_logs_an_absolute_root_at_info(self, tmp_path, caplog):
+        import logging
+
+        from fused_memory.config.schema import ReconciliationConfig
+
+        cfg = ReconciliationConfig(explore_codebase_root=str(tmp_path))
+        root = tmp_path / 'data' / 'orchestrator' / 'agent-transcripts'
+
+        assert self._announced(caplog, cfg) == [
+            (logging.INFO, f'recon transcript archive root: {root}'),
+        ]
+        assert list(tmp_path.iterdir()) == []
+
+    def test_announce_warns_with_the_cwd_resolution_of_a_relative_root(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The shipped ``${PROJECT_ROOT:.}`` with PROJECT_ROOT unset."""
+        import logging
+
+        from fused_memory.config.schema import ReconciliationConfig
+
+        monkeypatch.chdir(tmp_path)
+        cfg = ReconciliationConfig(explore_codebase_root='.')
+
+        [(level, message)] = self._announced(caplog, cfg)
+
+        assert level == logging.WARNING
+        assert str(tmp_path / 'data' / 'orchestrator' / 'agent-transcripts') in message
+        assert list(tmp_path.iterdir()) == []
+
+    def test_announce_reports_disabled(self, tmp_path, caplog):
+        import logging
+
+        from fused_memory.config.schema import ReconciliationConfig
+
+        cfg = ReconciliationConfig(
+            explore_codebase_root=str(tmp_path), transcript_archive_enabled=False,
+        )
+
+        assert self._announced(caplog, cfg) == [
+            (logging.INFO, 'recon transcript archival: disabled'),
+        ]
+
 
 class TestGcArchivesBeforeDelete:
     """gc_run_config_dir moves a run's transcripts into the archive before it
@@ -750,10 +807,22 @@ class TestGcArchivesBeforeDelete:
         data_dir, config_dir, _ = self._plant(tmp_path)
         archive_root = tmp_path / 'archive'
 
-        gc_run_config_dir(data_dir, self.RUN_ID)
+        gc_run_config_dir(data_dir, self.RUN_ID, archive_root=None)
 
         assert not config_dir.exists()
         assert not archive_root.exists()
+
+    def test_archive_root_is_a_required_keyword(self):
+        """A default would silently pick the non-archiving rmtree for a caller
+        that forgot it; every caller must say which branch it means."""
+        import inspect
+
+        from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir
+
+        param = inspect.signature(gc_run_config_dir).parameters['archive_root']
+
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+        assert param.default is inspect.Parameter.empty
 
     def test_is_still_a_noop_when_the_dir_is_absent(self, tmp_path):
         from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir

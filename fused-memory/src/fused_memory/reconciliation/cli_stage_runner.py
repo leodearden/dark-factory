@@ -715,12 +715,11 @@ def recon_archive_root(config: ReconciliationConfig) -> Path | None:
     (INV-5): a layout with one home in read and write but several in
     composition can still drift.
 
-    Anchored at ``explore_codebase_root``, NOT
-    ``ReconciliationHarness._project_root``. ``ReconciliationConfig`` is a
-    sibling of ``TaskmasterConfig`` and carries no project_root of its own;
-    ``_project_root`` is ``''`` whenever ``config.taskmaster is None`` (the
-    schema default); and ``BaseStage`` holds only this submodel. Anchoring on
-    ``_project_root`` would force a second anchor for one layout.
+    Anchored at ``explore_codebase_root``, the cwd every recon stage runs in.
+    That makes it ONE root for every project_id this server reconciles: recon
+    is dark-factory's own agent work whatever project's memory it touches, so
+    its transcripts are mined as dark-factory's. A relative anchor resolves
+    against the process cwd; ``announce_recon_archive_root`` says so at start.
 
     ``resolve_archive_root`` is deliberately not total. A malformed config
     (e.g. a reload that lands a non-path root) disables archival with one
@@ -745,8 +744,31 @@ def recon_archive_root(config: ReconciliationConfig) -> Path | None:
         return None
 
 
+def announce_recon_archive_root(config: ReconciliationConfig) -> None:
+    """Log, once at harness start, where recon transcripts will be archived.
+
+    A relative root WARNs with its absolute resolution: it lands under the
+    process cwd, which ``docs/legibility/legibility.yaml``'s
+    ``agent_transcript_roots`` reach only when that cwd is the repo root.
+    """
+    archive_root = recon_archive_root(config)
+    if archive_root is None:
+        logger.info('recon transcript archival: disabled')
+    elif archive_root.is_absolute():
+        logger.info('recon transcript archive root: %s', archive_root)
+    else:
+        logger.warning(
+            'recon transcript archive root %s is relative '
+            '(explore_codebase_root=%r) and resolves against the process cwd '
+            'to %s; set PROJECT_ROOT so the legibility miner finds it',
+            archive_root,
+            config.explore_codebase_root,
+            Path.cwd() / archive_root,
+        )
+
+
 def gc_run_config_dir(
-    data_dir: Path, run_id: str, *, archive_root: Path | None = None,
+    data_dir: Path, run_id: str, *, archive_root: Path | None,
 ) -> None:
     """Remove a run's per-run recon CLI config dir, if present (task 2744).
 
@@ -758,9 +780,8 @@ def gc_run_config_dir(
     one scheduled after it (task 3619's shape): ``archive_before_delete`` moves
     each transcript into the archive and unlinks it only once the durable copy
     exists, holding any it cannot archive. ``archive_root=None`` is the
-    DISABLED / unresolvable-config branch (see ``recon_archive_root``), not a
-    convenience default — every production caller passes the resolver's
-    result — and keeps the plain rmtree.
+    DISABLED branch (``recon_archive_root`` returned None) and keeps the plain
+    rmtree. The keyword is required so every caller states which it means.
 
     SYNCHRONOUS by contract and never raises: callers must not wrap it in
     ``asyncio.to_thread``, since an ``await`` is a cancellation point and a

@@ -48,6 +48,7 @@ from fused_memory.models.scope import (
 from fused_memory.reconciliation.active_runs import ActiveRunRegistry
 from fused_memory.reconciliation.backlog_policy import BacklogPolicy
 from fused_memory.reconciliation.cli_stage_runner import (
+    announce_recon_archive_root,
     gc_run_config_dir,
     recon_archive_root,
     run_config_dir_path,
@@ -3121,6 +3122,7 @@ class ReconciliationHarness:
         """Startup prologue: readiness wait, gate and judge init, escalation
         server, then the one-shot recovery passes."""
         logger.info('Reconciliation harness background loop started')
+        announce_recon_archive_root(self.config)
         # Reviewer finding race_condition: wait for the recon-report server to be
         # accepting connections before the first stage subprocess is launched.  This
         # encodes the ordering invariant in code rather than relying on comment-only
