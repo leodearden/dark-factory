@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -38,8 +39,6 @@ APPLY_VERBS = (
     'mcp__fused-memory__add_dependency',
     'mcp__fused-memory__submit_task',
     'mcp__fused-memory__add_memory',
-    'Edit',
-    'Write',
     'NotebookEdit',
 )
 
@@ -49,7 +48,20 @@ from pathlib import Path
 
 spec = json.loads(Path({spec!r}).read_text())
 argv = sys.argv[1:]
+root = Path(spec['root'])
+inboxes = sorted((root / 'data' / 'sitting' / 'inbox').iterdir())
+assert len(inboxes) == 1, inboxes
+inbox = inboxes[0]
+for name, content in spec['batches'].items():
+    (inbox / name).write_text(content if isinstance(content, str) else json.dumps(content))
+store_file = root / 'data' / 'sitting' / 'preparation.json'
+if spec['recorded']:
+    held = json.loads(store_file.read_text())['preparations'] if store_file.exists() else []
+    for name in spec['recorded']:
+        held.extend(spec['batches'][name])
+    store_file.write_text(json.dumps({{'preparations': held}}))
 record = {{
+    'inbox': str(inbox),
     'argv': sys.argv,
     'stdin': sys.stdin.read(),
     'cwd': os.getcwd(),
@@ -77,10 +89,15 @@ sys.exit(spec['exit_code'])
 
 @dataclass
 class FakeClaude:
-    """A recording stand-in for the CLI: one JSON line per invocation in ``calls_file``."""
+    """A recording stand-in for the CLI: one JSON line per invocation in ``calls_file``.
+
+    It acts like an agent working in ``root``: it writes ``batches`` into the run's inbox and
+    records the named ones into the preparation store, before it answers.
+    """
 
     bin: Path
     calls_file: Path
+    root: Path
 
     def calls(self) -> list[dict]:
         if not self.calls_file.exists():
@@ -93,8 +110,26 @@ class FakeClaude:
         return calls[0]
 
 
+def _prep_payload(number: int) -> dict:
+    return {
+        'item': ['decision', f'dec-{number}'],
+        'question': f'Keep the nightly cap on dec-{number}?',
+        'options': [
+            {'label': 'A', 'text': 'keep it', 'ramification': 'the cap stays'},
+            {'label': 'B', 'text': 'lift it', 'ramification': 'the cap goes'},
+        ],
+        'recommendation': {'option': 'A', 'evidence_chain': 'the last three nights stayed under it'},
+        'on_apply': 'the cap is kept',
+        'prepared_at': '2026-10-13T05:40:00+00:00',
+        'prepared_by': 'nightly-fable',
+    }
+
+
 def _fake_claude(tmp_path: Path, *, stdout: str = OK_RESULT, stderr: str = '', exit_code: int = 0,
-                 sleep: float = 0.0) -> FakeClaude:
+                 sleep: float = 0.0, batches: dict | None = None, recorded: tuple[str, ...] | None = None) -> FakeClaude:
+    """By default the fake is a productive agent: one batch of one preparation, written and recorded."""
+    if batches is None:
+        batches, recorded = {'batch-01.json': [_prep_payload(1)]}, ('batch-01.json',)
     bin_dir = tmp_path / 'bin'
     bin_dir.mkdir(exist_ok=True)
     calls_file = tmp_path / 'claude-calls.jsonl'
@@ -102,11 +137,12 @@ def _fake_claude(tmp_path: Path, *, stdout: str = OK_RESULT, stderr: str = '', e
     spec_file.write_text(json.dumps({
         'record': str(calls_file), 'stdout': stdout, 'stderr': stderr,
         'exit_code': exit_code, 'sleep': sleep, 'env_keys': list(ENV_KEYS),
+        'root': str(tmp_path), 'batches': batches, 'recorded': list(recorded or ()),
     }))
     fake = bin_dir / 'claude'
     fake.write_text(_FAKE_CLAUDE_SRC.format(python=sys.executable, spec=str(spec_file)))
     fake.chmod(0o755)
-    return FakeClaude(fake, calls_file)
+    return FakeClaude(fake, calls_file, tmp_path)
 
 
 @dataclass
@@ -142,7 +178,13 @@ def _live_gate() -> FakeGate:
 
 
 def _main(fake: FakeClaude, *extra: str, gate=None) -> int:
-    return mod.main(['--claude-bin', str(fake.bin), *extra], gate=gate if gate is not None else _live_gate())
+    return mod.main(['--claude-bin', str(fake.bin), '--root', str(fake.root), *extra],
+                    gate=gate if gate is not None else _live_gate())
+
+
+def _flag_values(argv: list[str], flag: str) -> list[str]:
+    values = argv[argv.index(flag) + 1:]
+    return values[:next((i for i, value in enumerate(values) if value.startswith('--')), len(values))]
 
 
 def _sysprompt_path(call: dict) -> Path:
@@ -166,7 +208,7 @@ def test_argv_is_exactly_the_shared_builders_with_the_defaults(tmp_path):
         system_prompt=call['sysprompt'],
         max_turns=mod.DEFAULT_MAX_TURNS,
         permission_mode='dontAsk',
-        allowed_tools=list(mod.NIGHTLY_ALLOWED_TOOLS),
+        allowed_tools=list(mod.nightly_allowed_tools(Path(call['inbox']))),
         disallowed_tools=list(mod.NIGHTLY_DENIED_TOOLS),
         mcp_config=call['mcp_config'],
         output_schema=None,
@@ -174,6 +216,7 @@ def test_argv_is_exactly_the_shared_builders_with_the_defaults(tmp_path):
         resume_session_id=None,
         session_id=None,
         strict_mcp_config=True,
+        setting_sources=[],
     )
     for path in temp_files:
         Path(path).unlink(missing_ok=True)
@@ -202,17 +245,52 @@ def test_the_prompt_goes_on_stdin_not_argv(tmp_path):
     _main(fake)
 
     call = fake.only_call()
-    assert call['stdin'] == mod.NIGHTLY_PROMPT
-    assert not any(mod.NIGHTLY_PROMPT in arg for arg in call['argv']), 'the prompt must not ride the argv'
+    assert call['stdin'].strip()
+    assert not any(call['stdin'] in arg for arg in call['argv']), 'the prompt must not ride the argv'
 
 
-def test_the_child_runs_in_this_checkout(tmp_path):
-    """``claude -p`` scopes its tools to its cwd, and the prepare command's path is repo-relative."""
+def test_the_child_runs_in_the_root_it_was_given(tmp_path):
+    """``claude -p`` scopes its tools to its cwd, and the prepare command's path is root-relative."""
     fake = _fake_claude(tmp_path)
 
     _main(fake)
 
-    assert Path(fake.only_call()['cwd']).resolve() == REPO_ROOT
+    assert Path(fake.only_call()['cwd']).resolve() == tmp_path.resolve()
+
+
+def test_the_root_defaults_to_this_checkout():
+    assert mod._parser().parse_args([]).root == REPO_ROOT
+
+
+def test_each_run_gets_a_fresh_inbox_under_the_root_and_the_prompt_names_it(tmp_path):
+    fake = _fake_claude(tmp_path)
+
+    assert _main(fake) == mod.EXIT_OK
+
+    call = fake.only_call()
+    inbox = Path(call['inbox'])
+    assert inbox.parent == tmp_path.resolve() / 'data' / 'sitting' / 'inbox'
+    assert re.fullmatch(r'\d{8}T\d{6}Z', inbox.name)
+    assert inbox.is_dir()
+    assert f'{inbox}/' in call['stdin']
+    assert f'--from {inbox.relative_to(tmp_path.resolve())}/' in call['stdin']
+
+
+def test_the_child_reads_no_settings_file_and_may_write_only_its_inbox(tmp_path):
+    fake = _fake_claude(tmp_path)
+
+    assert _main(fake) == mod.EXIT_OK
+
+    argv = fake.only_call()['argv']
+    assert argv[argv.index('--setting-sources') + 1] == ''
+    allowed = _flag_values(argv, '--allowed-tools')
+    inbox = fake.only_call()['inbox']
+    assert [tool for tool in allowed if tool.startswith('Edit')] == [f'Edit(/{inbox}/**)']
+    assert f'Bash({mod.PREPARE_COMMAND} record --from:*)' in allowed
+    assert not any('record --from -' in tool for tool in allowed)
+    denied = _flag_values(argv, '--disallowed-tools')
+    assert 'Edit' not in denied and 'Write' not in denied
+    assert 'NotebookEdit' in denied
 
 
 @pytest.mark.parametrize(
@@ -241,8 +319,8 @@ def test_builder_temp_files_are_unlinked_after_the_run(tmp_path, spec, extra):
 # ---------------------------------------------------------------------------
 
 
-def test_allow_and_deny_lists_are_disjoint():
-    assert not set(mod.NIGHTLY_ALLOWED_TOOLS) & set(mod.NIGHTLY_DENIED_TOOLS)
+def test_allow_and_deny_lists_are_disjoint(tmp_path):
+    assert not set(mod.nightly_allowed_tools(tmp_path)) & set(mod.NIGHTLY_DENIED_TOOLS)
 
 
 @pytest.mark.parametrize('verb', APPLY_VERBS)
@@ -255,20 +333,19 @@ def test_the_only_bash_allowed_is_git_show_git_log_and_the_two_prepare_subcomman
 
     _main(fake)
 
-    argv = fake.only_call()['argv']
-    allowed = argv[argv.index('--allowed-tools') + 1:]
+    allowed = _flag_values(fake.only_call()['argv'], '--allowed-tools')
     bash = [tool for tool in allowed if tool.startswith('Bash')]
     assert sorted(bash) == sorted([
         'Bash(git show:*)',
         'Bash(git log:*)',
         f'Bash({mod.PREPARE_COMMAND} brief --json:*)',
-        f'Bash({mod.PREPARE_COMMAND} record --from -:*)',
+        f'Bash({mod.PREPARE_COMMAND} record --from:*)',
     ])
     assert mod.PREPARE_COMMAND.endswith(' scripts/sitting/prepare_sitting.py')
 
 
 def test_every_allowed_mcp_tool_is_a_read():
-    reads = [tool.rsplit('__', 1)[1] for tool in mod.NIGHTLY_ALLOWED_TOOLS if tool.startswith('mcp__')]
+    reads = [tool.rsplit('__', 1)[1] for tool in mod.NIGHTLY_READ_TOOLS if tool.startswith('mcp__')]
 
     assert reads, 'the run should be able to read escalations and tasks through MCP'
     assert all(verb.startswith(('get_', 'search')) for verb in reads), reads
@@ -288,7 +365,7 @@ def test_the_mcp_servers_are_exactly_the_checkouts_escalation_and_fused_memory_b
 
 
 def test_every_allowed_or_denied_mcp_tool_names_a_configured_server():
-    tools = [tool for tool in (*mod.NIGHTLY_ALLOWED_TOOLS, *mod.NIGHTLY_DENIED_TOOLS) if tool.startswith('mcp__')]
+    tools = [tool for tool in (*mod.NIGHTLY_READ_TOOLS, *mod.NIGHTLY_DENIED_TOOLS) if tool.startswith('mcp__')]
 
     assert {tool.split('__')[1] for tool in tools} == set(mod.NIGHTLY_MCP_SERVERS)
 
@@ -524,3 +601,108 @@ def test_no_store_is_written_and_only_the_fake_is_spawned(tmp_path, monkeypatch)
     assert _snapshot(queue, decisions) == before
     assert not list(queue.parent.rglob('*.lock')) and not list(decisions.rglob('*.lock'))
     assert [argv[0] for argv in spawned] == [str(fake.bin)]
+
+
+# ---------------------------------------------------------------------------
+# 6. The outcome is what the inbox offered and the store holds, not the agent's say-so.
+# ---------------------------------------------------------------------------
+
+
+def test_two_recorded_preparations_are_ok_and_the_done_line_counts_them(tmp_path, capsys):
+    batches = {'batch-01.json': [_prep_payload(1)], 'batch-02.json': [_prep_payload(2)]}
+    stdout = json.dumps({'type': 'result', 'is_error': False, 'result': 'recorded 2 of 2', 'num_turns': 9,
+                         'total_cost_usd': 1.5, 'permission_denials': [{'tool_name': 'Bash'}] * 3})
+    fake = _fake_claude(tmp_path, stdout=stdout, batches=batches, recorded=tuple(batches))
+
+    assert _main(fake) == mod.EXIT_OK
+
+    done = next(line for line in capsys.readouterr().out.splitlines() if 'done' in line)
+    assert 'recorded=2 of 2' in done and 'permission_denials=3' in done and 'turns=9' in done
+
+
+def test_a_success_that_recorded_nothing_fails(tmp_path, capsys):
+    fake = _fake_claude(tmp_path, batches={})
+
+    assert _main(fake) == mod.EXIT_FAILED
+
+    err = capsys.readouterr().err
+    assert 'recorded nothing' in err and '0 item key(s) offered' in err
+
+
+def test_an_inbox_file_the_store_does_not_hold_fails(tmp_path, capsys):
+    fake = _fake_claude(tmp_path, batches={'batch-01.json': [_prep_payload(1)]}, recorded=())
+
+    assert _main(fake) == mod.EXIT_FAILED
+
+    assert '1 item key(s) offered' in capsys.readouterr().err
+
+
+def test_the_store_holding_a_different_preparation_for_the_key_is_not_a_record(tmp_path, capsys):
+    other = {**_prep_payload(1), 'question': 'Lift the nightly cap on dec-1?'}
+    store = tmp_path / 'data' / 'sitting' / 'preparation.json'
+    store.parent.mkdir(parents=True)
+    store.write_text(json.dumps({'preparations': [other]}))
+    fake = _fake_claude(tmp_path, batches={'batch-01.json': [_prep_payload(1)]}, recorded=())
+
+    assert _main(fake) == mod.EXIT_FAILED
+
+    assert 'recorded nothing' in capsys.readouterr().err
+
+
+def test_a_key_offered_twice_is_recorded_when_the_store_holds_either_offer(tmp_path, capsys):
+    other = {**_prep_payload(1), 'question': 'Lift the nightly cap on dec-1?'}
+    fake = _fake_claude(tmp_path, batches={'batch-01.json': [_prep_payload(1)], 'batch-02.json': [other]},
+                        recorded=('batch-02.json',))
+
+    assert _main(fake) == mod.EXIT_OK
+
+    assert 'recorded=1 of 1' in capsys.readouterr().out
+
+
+def test_undecodable_inbox_content_is_counted_and_never_raises(tmp_path, capsys):
+    fake = _fake_claude(tmp_path, batches={'batch-01.json': [{'item': 'not-a-key'}], 'torn.json': '{"item": ['})
+
+    assert _main(fake) == mod.EXIT_FAILED
+
+    err = capsys.readouterr().err
+    assert '0 item key(s) offered' in err and '2 undecodable' in err
+
+
+def test_a_decodable_entry_beside_an_undecodable_one_still_counts(tmp_path, capsys):
+    fake = _fake_claude(tmp_path, batches={'batch-01.json': [_prep_payload(1)], 'draft.json': [{'item': 'not-a-key'}]},
+                        recorded=('batch-01.json',))
+
+    assert _main(fake) == mod.EXIT_OK
+
+    assert 'recorded=1 of 1' in capsys.readouterr().out
+
+
+def test_a_corrupt_store_counts_zero_recorded(tmp_path, capsys):
+    fake = _fake_claude(tmp_path, batches={'batch-01.json': [_prep_payload(1)]}, recorded=())
+    store = tmp_path / 'data' / 'sitting' / 'preparation.json'
+    store.parent.mkdir(parents=True)
+    store.write_text('{not json')
+
+    assert _main(fake) == mod.EXIT_FAILED
+
+    err = capsys.readouterr().err
+    assert 'unreadable' in err and 'recorded nothing' in err
+
+
+def test_a_timeout_after_a_partial_record_still_counts_what_was_recorded(tmp_path, capsys):
+    batches = {'batch-01.json': [_prep_payload(1)], 'batch-02.json': [_prep_payload(2)]}
+    fake = _fake_claude(tmp_path, batches=batches, recorded=('batch-01.json',), sleep=30.0)
+
+    assert _main(fake, '--timeout-secs', TIMEOUT_SECS) == mod.EXIT_FAILED
+
+    line = next(line for line in capsys.readouterr().err.splitlines() if 'timed out' in line)
+    assert 'recorded=1' in line
+
+
+def test_a_non_zero_exit_states_how_much_was_recorded(tmp_path, capsys):
+    fake = _fake_claude(tmp_path, exit_code=3, stderr='boom')
+
+    assert _main(fake) == mod.EXIT_FAILED
+
+    line = next(line for line in capsys.readouterr().err.splitlines() if 'exited 3' in line)
+    assert 'recorded=1' in line
