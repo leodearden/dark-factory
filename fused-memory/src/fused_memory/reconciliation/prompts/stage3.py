@@ -155,12 +155,9 @@ Never recommend adding a project to the `ReconSnapshotWriteRejected` guard \
 exception list on this evidence. That contradicts Snapshot Discipline and is the \
 wrong fix.
 
-Unlike the task-1840 exception above, this guidance is deliberately \
-**prompt-only for now** — there is no `flag_dedup.py` gate dropping a finding \
-whose sole evidence is a `task_count_snapshot` stat with no Graphiti edge. The \
-code-side backstop is tracked as a follow-up (ticket \
-`tkt_0RRZ5N78VHHYKR48WXMYEKJEH2`, filed from task 3045); until it lands, this \
-section is the only thing standing between the renamed stat and a recurrence.
+A code-side gate (`filter_snapshot_stat_edge_findings` in `flag_dedup.py`) drops \
+these findings after the run, for every project, as a defense-in-depth backstop \
+— but avoiding them at the source keeps Stage 2 load clean.
 
 ## Contamination-Ceiling Retirement Exception (task 2818/2826)
 

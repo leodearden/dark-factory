@@ -373,6 +373,10 @@ from fused_memory.reconciliation.standing_decision_constants import (
     GROUNDS_TOKEN_FAMILIES,
     STATE_ACTIVE,
 )
+from fused_memory.reconciliation.task_count_snapshot_cadence import (
+    SNAPSHOT_PRUNED_STAT_KEY,
+    SNAPSHOT_WRITTEN_STAT_KEY,
+)
 from fused_memory.utils.async_utils import gather_collect
 
 logger = logging.getLogger(__name__)
@@ -5376,6 +5380,54 @@ def filter_contamination_ceiling_findings(
                 project_id,
             )
             # do NOT append — flag is dropped
+        else:
+            kept.append(flag)
+
+    return kept
+
+
+#: Stage 2's Mem0-only snapshot stats, taken from their defining module so a
+#: stat rename moves this gate with it instead of silently disabling it.
+_MEM0_SNAPSHOT_STAT_KEYS: tuple[str, ...] = (
+    SNAPSHOT_WRITTEN_STAT_KEY,
+    SNAPSHOT_PRUNED_STAT_KEY,
+)
+
+#: Wordings a Stage-3 finding uses for a Graphiti temporal_facts edge.
+_GRAPHITI_TEMPORAL_EDGE_MARKERS: tuple[str, ...] = (
+    'temporal_fact',
+    'temporal fact',
+    'graphiti edge',
+    'graphiti temporal',
+)
+
+
+def filter_snapshot_stat_edge_findings(
+    flags: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop Stage-3 findings that pair a snapshot stat with a Graphiti edge.
+
+    Per Snapshot Discipline a task-count snapshot is never persisted as a
+    Graphiti ``temporal_facts`` edge, for ANY project, so a finding reading a
+    Mem0-only snapshot stat as evidence of a missing or rejected edge is a
+    false positive (task 3487).  A flag is dropped iff its ``description`` +
+    ``suggested_action`` text names one of :data:`_MEM0_SNAPSHOT_STAT_KEYS`
+    AND one of :data:`_GRAPHITI_TEMPORAL_EDGE_MARKERS` (case-insensitive);
+    everything else passes through (fail-open), with a ``logger.debug`` line
+    per drop.
+    """
+    kept: list[dict[str, Any]] = []
+    for flag in flags:
+        text = f"{flag.get('description') or ''} {flag.get('suggested_action') or ''}"
+        if contains_any_casefolded(text, _MEM0_SNAPSHOT_STAT_KEYS) and contains_any_casefolded(
+            text, _GRAPHITI_TEMPORAL_EDGE_MARKERS,
+        ):
+            logger.debug(
+                'filter_snapshot_stat_edge_findings: dropping %s finding for task_id=%s '
+                '(snapshot stats are Mem0-only; no Graphiti edge is ever written)',
+                flag.get('category'),
+                flag.get('task_id'),
+            )
         else:
             kept.append(flag)
 

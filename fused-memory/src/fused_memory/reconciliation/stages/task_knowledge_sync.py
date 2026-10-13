@@ -48,6 +48,7 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_blocked_snapshot_findings,
     filter_contamination_ceiling_findings,
     filter_false_phantom_task_creation_flags,
+    filter_snapshot_stat_edge_findings,
 )
 from fused_memory.reconciliation.flag_record_contract import STAGE1_FLAG_MARKER_KIND
 from fused_memory.reconciliation.live_workflow_section import (
@@ -4596,7 +4597,11 @@ class IntegrityCheck(BaseStage):
            missing or stale, for projects whose ceiling is retired-by-design
            (e.g. autopilot_video; task 2818/2826).  Records
            report.stats['contamination_ceiling_findings_dropped'] = before - after.
-        4. Calls record_task_dump_spot_check() to record a non-destructive
+        4. Applies filter_snapshot_stat_edge_findings() to drop findings that
+           read a Mem0-only task-count snapshot stat as evidence of a missing
+           Graphiti temporal_facts edge, for every project (task 3487).  Records
+           report.stats['snapshot_stat_edge_findings_dropped'] = before - after.
+        5. Calls record_task_dump_spot_check() to record a non-destructive
            observability stat when the cached task tree contains contamination
            signals.
 
@@ -4653,6 +4658,15 @@ class IntegrityCheck(BaseStage):
             )
         else:
             report.stats['contamination_ceiling_findings_dropped'] = 0
+
+        # Layer 3 (finding-side) gate for snapshot-stat/missing-edge false
+        # positives (task 3487): project-agnostic, since no project ever
+        # persists a task-count snapshot as a Graphiti edge.
+        _before = len(report.items_flagged)
+        report.items_flagged = filter_snapshot_stat_edge_findings(report.items_flagged)
+        report.stats['snapshot_stat_edge_findings_dropped'] = (
+            _before - len(report.items_flagged)
+        )
 
         self.record_task_dump_spot_check(report)
         return report
