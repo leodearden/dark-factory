@@ -3493,9 +3493,8 @@ def default_lease_slug(
 LEASE_HEARTBEAT_TTL = timedelta(hours=2)
 """How long a lease survives with a dead holder pid and no fresh heartbeat
 (mtime touch) before it is stale-reapable. Mirrors NON_TERMINAL_HEARTBEAT_TTL's
-role for session records: staleness requires BOTH a dead holder pid AND an
-aged heartbeat (see claim_lease/reap_stale_leases) -- a live holder is never
-reaped regardless of heartbeat age.
+role for session records: staleness requires BOTH an aged heartbeat AND a
+holder pid that cannot vouch for the lease -- see _lease_is_stale.
 
 VALUE DERIVATION (task 2796 THREAD 1, RE-DERIVED by task 3994). The value is
 unchanged at 7200s; its BASIS is not, because task 2796's basis is now false
@@ -3510,7 +3509,8 @@ check. Task 3994's ``resolve_session_pid`` restores a real, long-lived
 session pid, so that premise no longer holds.
 
 CURRENT BASIS (3994): with the pid guard actually live, a LIVE holder is
-never reaped regardless of heartbeat age, so this TTL now bounds only ONE
+never reaped regardless of heartbeat age (a shared ``claude agents`` host pid
+excepted, see _lease_is_stale), so this TTL now bounds only ONE
 thing -- crash recovery for a genuinely-dead holder. It nonetheless stays at
 2h rather than dropping back toward the old 5min, for two reasons:
 (a) resolve_session_pid still degrades -- to pid 0, which `_pid_alive`
@@ -3868,6 +3868,16 @@ def _read_lease_holder_state(
     return holder, _pid_alive(holder.pid), age_secs
 
 
+def _lease_is_stale(holder: LeaseHolder | None, *, holder_alive: bool, age_secs: float) -> bool:
+    """Whether a lease is reapable: heartbeat past LEASE_HEARTBEAT_TTL and no pid vouching for it.
+
+    A running shared-host pid cannot vouch for its session (see _is_shared_session_host).
+    """
+    if age_secs <= LEASE_HEARTBEAT_TTL.total_seconds():
+        return False
+    return holder is None or not holder_alive or _is_shared_session_host(holder.pid)
+
+
 def claim_lease(
     name: str,
     *,
@@ -3882,9 +3892,8 @@ def claim_lease(
     exclusive-create idiom as ``ArtifactStore.lock_plan`` (artifacts.py) --
     so the first caller to create the ``.lease`` file wins outright. When the
     lease is already held, the existing holder's liveness (_pid_alive) and
-    heartbeat age (file mtime) are checked: if BOTH the holder is dead AND
-    the heartbeat is older than LEASE_HEARTBEAT_TTL, the stale lease is
-    reaped and the claim retried once; otherwise the existing holder is
+    heartbeat age (file mtime) are checked: if _lease_is_stale, the stale
+    lease is reaped and the claim retried once; otherwise the existing holder is
     reported under *policy* (STAND_DOWN/WARN_AND_PROCEED) and the on-disk
     body is never touched (no clobbering). *now* is injectable for
     deterministic tests; defaults to the real UTC clock.
@@ -3902,7 +3911,7 @@ def claim_lease(
         return _acquired_claim(name, holder, root)
 
     existing_holder, holder_alive, age_secs = _read_lease_holder_state(path, now=now)
-    is_stale = (not holder_alive) and age_secs > LEASE_HEARTBEAT_TTL.total_seconds()
+    is_stale = _lease_is_stale(existing_holder, holder_alive=holder_alive, age_secs=age_secs)
 
     if is_stale:
         # Re-verify staleness immediately before unlinking: a competitor
@@ -3913,7 +3922,7 @@ def claim_lease(
         # it must NOT be unlinked, or we would clobber the competitor's
         # brand-new, live lease and silently violate single-owner-per-role.
         existing_holder, holder_alive, age_secs = _read_lease_holder_state(path, now=now)
-        is_stale = (not holder_alive) and age_secs > LEASE_HEARTBEAT_TTL.total_seconds()
+        is_stale = _lease_is_stale(existing_holder, holder_alive=holder_alive, age_secs=age_secs)
 
     if is_stale:
         path.unlink(missing_ok=True)
@@ -3926,8 +3935,8 @@ def claim_lease(
             existing_holder, holder_alive, age_secs = _read_lease_holder_state(path, now=now)
         else:
             # Reaped-and-reclaimed a stale lease. The displaced holder was
-            # SUPPOSED to be dead (dead pid AND heartbeat aged past
-            # LEASE_HEARTBEAT_TTL), but this is exactly the path that -- with a
+            # SUPPOSED to be gone (_lease_is_stale), but this is exactly the
+            # path that -- with a
             # mis-tuned TTL -- once let a duplicate steal a live-but-quiet
             # watcher's lease (task 2796, THREAD 1). Emit a structured, greppable
             # WARNING naming the displaced holder (slug + pid), the observed
@@ -4130,9 +4139,8 @@ class LeaseStatus:
         lease file's mtime (None when absent) -- the FRESHNESS axis.
     heartbeat_age_secs: seconds since that heartbeat.
     reclaimable: True iff a contender could legitimately reap this lease --
-        i.e. exactly claim_lease/reap_stale_leases' own staleness predicate
-        (a dead holder pid AND a heartbeat strictly past LEASE_HEARTBEAT_TTL).
-        A live holder is never reclaimable, however quiet it has been.
+        i.e. exactly claim_lease/reap_stale_leases' own staleness predicate,
+        _lease_is_stale.
     holder_record_slug: the body's ``record_slug``, or None when it is blank
         or the lease is not 'held'.
     holder_record_state: the holder's registry record (see
@@ -4174,8 +4182,8 @@ def lease_status(
     the SAME reader claim_lease decides on -- and ``heartbeat_ts`` is derived
     from the age that reader returns rather than from a second stat(), so
     there is exactly one clock and the display cannot disagree with the
-    decision. Likewise *reclaimable* restates claim_lease's own staleness
-    predicate rather than paraphrasing it.
+    decision. Likewise *reclaimable* is claim_lease's own staleness
+    predicate, _lease_is_stale.
 
     READ-ONLY and fail-soft: never mutates the lease (an inspection that
     bumped the mtime would keep a dead holder's lease unreapable), never
@@ -4207,10 +4215,7 @@ def lease_status(
         holder_pid_alive=holder_alive,
         heartbeat_ts=(now - timedelta(seconds=age_secs)).isoformat(),
         heartbeat_age_secs=age_secs,
-        # Deliberately claim_lease's `is_stale`, verbatim: staleness needs
-        # BOTH a dead pid AND an aged heartbeat. Restating it any other way
-        # would re-create the two-clocks-disagreeing failure this fixes.
-        reclaimable=(not holder_alive) and age_secs > LEASE_HEARTBEAT_TTL.total_seconds(),
+        reclaimable=_lease_is_stale(holder, holder_alive=holder_alive, age_secs=age_secs),
         holder_record_slug=(holder.record_slug or None) if holder is not None else None,
         holder_record_state=holder_record_state(holder, root=root),
     )
@@ -4224,8 +4229,8 @@ class ReapedLease:
     lease_name: the lease's identity, derived from the filename itself
         (the stem of *path*) -- never from the body, so a corrupt/missing
         body is still reapable.
-    reason: why it was reaped -- ``'stale_pid'`` (holder pid dead and the
-        heartbeat is older than LEASE_HEARTBEAT_TTL) or ``'corrupt'`` (body
+    reason: why it was reaped -- ``'stale_pid'`` (a parseable body that
+        _lease_is_stale judges stale) or ``'corrupt'`` (body
         missing/unparseable and older than LEASE_HEARTBEAT_TTL).
     """
 
@@ -4250,11 +4255,11 @@ def reap_stale_leases(
     Rules (first match wins):
     - lease body unreadable (missing or corrupt) and age >
       LEASE_HEARTBEAT_TTL -> reaped, reason='corrupt'.
-    - holder pid is dead and age > LEASE_HEARTBEAT_TTL -> reaped,
+    - a parseable body that _lease_is_stale judges stale -> reaped,
       reason='stale_pid'.
-    - otherwise -> kept -- in particular a LIVE holder is never reaped,
-      regardless of heartbeat age (mirrors reap_stale_records' non-terminal
-      live-pid rule).
+    - otherwise -> kept -- in particular a LIVE holder pid that can vouch
+      for its session is never reaped, regardless of heartbeat age (mirrors
+      reap_stale_records' non-terminal live-pid rule).
 
     *now* is injectable for deterministic tests; defaults to the real UTC
     clock.
@@ -4275,14 +4280,17 @@ def reap_stale_leases(
         except OSError:
             continue  # vanished mid-sweep (e.g. concurrent reap) -- skip it
         age_secs = (now - datetime.fromtimestamp(mtime, tz=UTC)).total_seconds()
-        stale = age_secs > LEASE_HEARTBEAT_TTL.total_seconds()
 
         try:
             holder = LeaseHolder.from_json(lease_path.read_text(encoding='utf-8'))
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-            reason = 'corrupt' if stale else None
-        else:
-            reason = 'stale_pid' if (not _pid_alive(holder.pid)) and stale else None
+            holder = None
+        stale = _lease_is_stale(
+            holder,
+            holder_alive=holder is not None and _pid_alive(holder.pid),
+            age_secs=age_secs,
+        )
+        reason = None if not stale else ('corrupt' if holder is None else 'stale_pid')
 
         if reason is not None:
             try:
