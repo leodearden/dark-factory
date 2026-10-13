@@ -161,19 +161,18 @@ class TestAddMemoryEntitiesGate:
         """The declaration on this write is discarded, so a conflict verdict
         could only cost a false rejection (task 6059).
 
-        Only observations_and_summaries hits no dup guard, so only it can
-        assert the write itself; on the other two an unspecced AsyncMock
-        drives the guards, and only the missing conflict verdict is pinned.
+        `search` answers no hits, so the procedural near-duplicate guard finds
+        nothing to block on and every category must reach the write.
         """
         mock_service = AsyncMock()
+        mock_service.search.return_value = []
         _pass_through(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await _call(server, category=category, dual_write=False, entities=_CONFLICTING)
 
-        assert result.get('error_type') != 'DeclaredReferentConflictRejected', f'{result!r}'
-        if category == 'observations_and_summaries':
-            mock_service.add_memory.assert_called_once()
+        assert 'error' not in result, f'{result!r}'
+        mock_service.add_memory.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_dual_write_still_rejects(self):

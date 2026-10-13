@@ -60,7 +60,6 @@ from __future__ import annotations
 
 from collections.abc import Collection
 from dataclasses import dataclass
-from itertools import groupby
 from typing import Literal, get_args
 
 from fused_memory.utils.canonical_labels import (
@@ -290,11 +289,21 @@ def local_referent(referent: Referent, *, group_id: str) -> Referent:
     return referent
 
 
-def _written_numbers(content: str) -> frozenset[str]:
-    """Every maximal run of ASCII digits *content* writes, scannable or not."""
-    return frozenset(
-        ''.join(run) for is_digit, run in groupby(content, key=_is_task_number) if is_digit
-    )
+_ASCII_DIGITS = frozenset('0123456789')
+
+
+def _writes_number(content: str, number: str) -> bool:
+    """Whether *content* writes *number* as a maximal run of ASCII digits, scannable or not."""
+    start = content.find(number)
+    while start != -1:
+        end = start + len(number)
+        if (
+            content[start - 1:start] not in _ASCII_DIGITS
+            and content[end:end + 1] not in _ASCII_DIGITS
+        ):
+            return True
+        start = content.find(number, start + 1)
+    return False
 
 
 def _one_typo_apart(declared: str, scanned: str) -> bool:
@@ -316,16 +325,18 @@ def _one_typo_apart(declared: str, scanned: str) -> bool:
     )
 
 
-def _contradicts(declared: Referent, scanned: Referent, *, written: frozenset[str]) -> bool:
+def _contradicts(declared: Referent, scanned: Referent, *, content: str) -> bool:
     """Whether *scanned* is positive evidence against an unnamed *declared*.
 
     PROJECT axis: the same number, which within one kind bucket means another
-    project's task. TYPO axis: a one-edit near-miss, unless the content itself
-    writes the declared number somewhere in *written*.
+    project's task. TYPO axis: a one-edit near-miss, unless *content* itself
+    writes the declared number somewhere.
     """
     if scanned.number == declared.number:
         return True
-    return declared.number not in written and _one_typo_apart(declared.number, scanned.number)
+    return _one_typo_apart(declared.number, scanned.number) and not _writes_number(
+        content, declared.number
+    )
 
 
 def _conflicting_referents(
@@ -371,14 +382,13 @@ def _conflicting_referents(
        names an AMBIGUOUS referent counts as RESOLVING the ambiguity rather
        than contradicting it — the single most useful thing a declaration can
        do.
-    4. Silence is uninformative PER REFERENT: a declared referent the scan did
-       not name conflicts only on positive evidence. This is the load-bearing
-       consequence of resolved decision 8: the scanner cannot see bare-digit
-       node names, title-only references, Greek-letter aliases, list
-       continuations or non-task vocabulary, and it is exactly as blind to a
-       referent beside a scannable task as it is alone. Read per KIND, its
-       silence rejected 'Merged task-173-fillet-fix after task 170 landed.'
-       declaring 173, purely because Task 170 was visible.
+    4. Silence is uninformative PER REFERENT, never per kind: a declared
+       referent the scan did not name conflicts only on positive evidence.
+       This is the load-bearing consequence of resolved decision 8: the
+       scanner cannot see bare-digit node names, title-only references,
+       Greek-letter aliases, list continuations or non-task vocabulary, and it
+       is exactly as blind to a referent beside a scannable task as it is
+       alone.
     5. Two evidence axes (:func:`_contradicts`). PROJECT: a scanned referent
        carries the declared number under another project. TYPO: a scanned
        number is one Damerau edit from the declared one AND the declared
@@ -413,7 +423,6 @@ def _conflicting_referents(
     scan_by_kind: dict[str, set[Referent]] = {}
     for referent in scan.refs + scan.ambiguous:
         scan_by_kind.setdefault(referent.kind, set()).add(referent)
-    written = _written_numbers(content)
 
     conflicts: list[Referent] = []
     seen: set[Referent] = set()
@@ -425,7 +434,7 @@ def _conflicting_referents(
             # (project_id == '') deliberately keeps the whole-kind bucket.
             scanned = {ref for ref in scanned if ref.project_id == referent.project_id}
         if referent in scanned or not any(
-            _contradicts(referent, ref, written=written) for ref in scanned
+            _contradicts(referent, ref, content=content) for ref in scanned
         ):
             continue
         if referent in seen:

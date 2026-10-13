@@ -1575,6 +1575,7 @@ class TestSilenceIsUninformativePerReferent:
             ('matched the live plan exactly: 15+4 detaches', [6182], GROUP),
             (_CITES_3127, [2500], GROUP),
             ('Fixed the bug in Task 3127; 3129 tests pass.', [3129], GROUP),
+            ('Task 3127 broke 31290; 3129 fixed it.', [3129], GROUP),
             (_SIGHTING_E + ' (task 6186)', [6185, 6186, 6182], GROUP),
         ],
         ids=[
@@ -1591,6 +1592,7 @@ class TestSilenceIsUninformativePerReferent:
             'sighting-c-foreign-qualified-noise',
             'an-unrelated-number',
             'the-prose-wrote-the-declared-number',
+            'written-after-an-embedded-occurrence',
             'sighting-e-remedied-by-spelling-the-task',
         ],
     )
@@ -1609,11 +1611,12 @@ class TestSilenceIsUninformativePerReferent:
 
     @pytest.mark.parametrize(
         'declared',
-        ['3129', '3172', '312', '31277'],
+        ['3129', '3172', '312', '127', '31277'],
         ids=[
             'substitution',
             'adjacent-transposition',
-            'deletion-a-substring-is-not-a-written-run',
+            'deletion-a-prefix-is-not-a-written-run',
+            'deletion-a-suffix-is-not-a-written-run',
             'insertion',
         ],
     )

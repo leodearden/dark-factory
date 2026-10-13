@@ -324,18 +324,10 @@ _TASK_VOCABULARY_QUALIFIER = re.compile(r'(sub_?)?tasks?')
 #   means fewer contests, which means MORE confident splits on prose that
 #   pre-3667 refused. A false positive here only ever adds ambiguity, which the
 #   consumer refuses; a false negative lets destructive surgery proceed.
-# - The '[-/]' branch sees the fleet's own hyphen-slug ('task-173-fillet-fix')
-#   and branch-name ('task/173') spellings, which resolved decision 8 never
-#   listed as blind (task 6059). It is UNPADDED, exactly one character, so it
-#   can never span whitespace or a line break, and the shared lookbehind still
-#   refuses 'sub-task-5' and 'reify-task-12'. MEASURED 2026-10-12 with this
-#   branch alone, '(?<![\w:-])[Tt][Aa][Ss][Kk][Ss]?[-/]([0-9]+)(?!\d)', over
-#   every `git ls-files` path outside docs/entities-omission-advice-repair/
-#   (5,391 matches) and over `git log --all --format=%B` (6,936 matches): the
-#   only captures naming no task are 4 letter-suffixed ids ('task-202a',
-#   'task-202b', 'task-606b', 'tasks/1h'). A '/'- or '.'-glued match
-#   ('refs/heads/task/3719', 'plans/task-6021-...', 'main..task/4369') still
-#   names that task.
+# - The '[-/]' branch sees the hyphen-slug ('task-173-fillet-fix') and
+#   branch-name ('task/173') spellings. It is UNPADDED, exactly one character,
+#   so it can never span whitespace or a line break, and the shared lookbehind
+#   still refuses the sub-task forms 'sub-task-5' and 'reify-task-12'.
 # - The word 'tasks?' is interpolated from the SAME _TASK_WORD constant this
 #   pattern shares with _TASK_NODE_NAME_PATTERN — explicit ASCII case classes,
 #   NOT 'tasks?' plus re.IGNORECASE, for the reason recorded there:
