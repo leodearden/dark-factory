@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import csv
-import inspect
 import json
 import math
 from collections import Counter
@@ -168,11 +167,13 @@ class TestSubBudgetFormula:
 
         assert all(lo < hi for lo, hi in zip(bonuses, bonuses[1:], strict=False)), bonuses
 
-    def test_only_the_tier_can_be_passed_positionally(self, scheduler):
-        parameters = inspect.signature(scheduler._compute_score).parameters
-
-        positional = [name for name, p in parameters.items() if p.kind is not inspect.Parameter.KEYWORD_ONLY]
-        assert positional == ['tier']
+    @pytest.mark.parametrize('positional_args', [
+        ('medium', 3600.0, 0, False),
+        ('medium', 5, 2),
+    ])
+    def test_a_positional_age_or_count_is_rejected(self, scheduler, positional_args):
+        with pytest.raises(TypeError):
+            scheduler._compute_score(*positional_args)
 
 
 class TestLegacyFormula:
