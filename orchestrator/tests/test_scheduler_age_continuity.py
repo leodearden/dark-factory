@@ -124,10 +124,12 @@ class TestAResetIsAppliedOnce:
         assert [(r['task_id'], r['data']) for r in rows] == [('100', {'anchor': 1000})]
 
     async def test_a_mass_return_writes_each_age_guard_once(self, monkeypatch):
+        """'2999' stays away, so its mark keeps the owed file non-empty and
+        the consumption is a write rather than the empty store's unlink."""
         returning = [_task(str(tid)) for tid in range(2000, 2050)]
         holder = _task('3000', 'in-progress')
         scheduler = _scheduler()
-        await _tick(scheduler, [*returning, holder])
+        await _tick(scheduler, [*returning, _task('2999'), holder])
         await _tick(scheduler, [holder])
 
         writes: list[Path] = []

@@ -47,7 +47,7 @@ from orchestrator.config import (
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.fm_retry import fm_retry_backoffs
-from orchestrator.guard_state import PersistentSet, guard_path
+from orchestrator.guard_state import PersistentMap, PersistentSet, guard_path
 from orchestrator.hold_history import HoldHistory
 from orchestrator.mcp_lifecycle import ORCHESTRATOR_MCP_IDENTITY, mcp_call, tool_error_text
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
@@ -2399,11 +2399,16 @@ class Scheduler:
         # in the active fetch.  A reset is owed only once the task has left
         # that fetch; the rule is D3 in
         # plans/scheduler-dispatch-scoring-and-lock-layer-prd.md.  The owed
-        # mark is restart-durable (task 5352) and is NOT the state snapshot,
-        # which is a write-only observability artifact.
+        # mark and the applied reset's anchor are restart-durable (task 5352),
+        # and are NOT the state snapshot, which is a write-only observability
+        # artifact.
         self._pending_anchor: dict[str, int] = {}
         self._age_reset_owed: MutableSet[str] = PersistentSet(
             guard_path(self._project_root, 'scheduler_age_reset_owed.json'),
+            ttl=_RESURRECTION_GUARD_TTL,
+        )
+        self._age_reset_anchors: PersistentMap = PersistentMap(
+            guard_path(self._project_root, 'scheduler_age_reset_anchors.json'),
             ttl=_RESURRECTION_GUARD_TTL,
         )
         # Effective-priority cache: populated at the end of each acquire_next tick
@@ -5833,22 +5838,28 @@ class Scheduler:
         ``plans/scheduler-dispatch-scoring-and-lock-layer-prd.md``: only a
         task that left the active population and came back has its wait reset.
 
-        - A task's first sighting, whatever its active status, anchors it:
-          to *max_id* if a reset is owed, else to its own numeric id (so a
-          genuinely-old task carries its accumulated age), else to *max_id*.
+        - A task's first sighting, whatever its active status, anchors it.
+          If a reset is owed, the anchor is *max_id*: the reset is applied,
+          its mark consumed and its anchor recorded.  Otherwise it is the
+          anchor an earlier reset recorded, else the task's own
+          numeric id (so a genuinely-old task carries its accumulated age),
+          else *max_id*.
         - An active status never drops the anchor, so a requeue, an unblock
           or an undefer keeps the task's wait.
         - A terminal status drops the anchor and marks a reset as owed, as
           :meth:`_phase_stale_sweep` does for a task that left the fetch.
 
-        The marks survive a restart (task 5352) and are recorded in one batch
-        after the loop, because a tick observing N departures would otherwise
+        So a resurrection resets age ONCE rather than once per fleet
+        redeploy: every later start restores the recorded anchor.  Marks and
+        anchors are written in one batch per guard file after the loop,
+        because a tick observing N departures or returns would otherwise
         perform N writes of an N-entry file.  Batching is safe by
         construction: a task has exactly one status, so the branch that
         WRITES a mark (terminal) and the branch that READS one (active) are
         mutually exclusive within a single call.
         """
         departed: set[str] = set()
+        resets: dict[str, int] = {}
         for t in tasks:
             tid = str(t.get('id', ''))
             if not tid:
@@ -5858,15 +5869,37 @@ class Scheduler:
                 self._pending_anchor.pop(tid, None)
                 if status:
                     departed.add(tid)
-            elif tid not in self._pending_anchor:
-                self._pending_anchor[tid] = self._first_sight_anchor(tid, max_id)
+                continue
+            if tid in self._pending_anchor:
+                continue
+            if tid in self._age_reset_owed:
+                resets[tid] = max_id
+                self._pending_anchor[tid] = max_id
+            else:
+                self._pending_anchor[tid] = self._restored_or_own_anchor(tid, max_id)
+        self._apply_age_resets(resets)
         self._age_reset_owed |= departed
 
-    def _first_sight_anchor(self, tid: str, max_id: int) -> int:
-        """The anchor for a task this process has not anchored yet."""
-        if tid in self._age_reset_owed or not tid.isdecimal():
-            return max_id
-        return int(tid)
+    def _restored_or_own_anchor(self, tid: str, max_id: int) -> int:
+        """The anchor of a task owed no reset: the one an earlier reset
+        recorded, else its own numeric id, else *max_id*.  A recorded
+        value that is not a plain int is ignored (guard_state is fail-open)."""
+        recorded = self._age_reset_anchors.get(tid)
+        if isinstance(recorded, int) and not isinstance(recorded, bool):
+            return recorded
+        return int(tid) if tid.isdecimal() else max_id
+
+    def _apply_age_resets(self, resets: dict[str, int]) -> None:
+        """Consume each applied reset's mark and record its anchor, one write
+        per guard file, then journal each reset (INV-11)."""
+        self._age_reset_owed -= set(resets)
+        self._age_reset_anchors.put_many(resets)
+        if not self.event_store:
+            return
+        for tid, anchor in resets.items():
+            self.event_store.emit(
+                EventType.age_anchor_reset, task_id=tid, data={'anchor': anchor},
+            )
 
     def _compute_score_legacy(
         self,
