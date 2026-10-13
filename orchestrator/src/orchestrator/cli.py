@@ -1354,6 +1354,7 @@ def _run_single_eval(
     from orchestrator.evals.configs import EVAL_CONFIGS, get_config_by_name
     from orchestrator.evals.report import (
         build_plan_quality_report,
+        format_invocation_errors,
         format_plan_quality_table,
     )
     from orchestrator.evals.runner import (
@@ -1405,7 +1406,8 @@ def _run_single_eval(
                     # error must not read to the operator as a transient cap window.
                     # The marker that follows always names the actual cause.
                     taint = (
-                        f' unmeasurable: {result.metrics.get("invocation_error")}'
+                        ' unmeasurable: '
+                        f'{format_invocation_errors(result.metrics.get("invocation_errors"))}'
                         if result.metrics.get('cap_tainted') else ''
                     )
                     # `steps=` is echoed BESIDE the score (task 3302) because it is
@@ -1734,7 +1736,8 @@ def _run_judge_cmd(max_rounds: int = 50, reset: bool = False):
     from orchestrator.evals.elo import JudgeState, TaskPool, load_state, save_state
     from orchestrator.evals.judge import run_elo_tournament
     from orchestrator.evals.report import build_report, format_markdown, save_report
-    from orchestrator.evals.runner import load_results, load_task
+    from orchestrator.evals.results import ResultStore
+    from orchestrator.evals.runner import load_task
     from orchestrator.evals.snapshots import get_diff_between_commits
 
     # Load or reset state
@@ -1746,7 +1749,7 @@ def _run_judge_cmd(max_rounds: int = 50, reset: bool = False):
         if state.per_task:
             click.echo(f'Resuming from existing state ({len(state.per_task)} tasks)')
 
-    results = load_results()
+    results = ResultStore.packaged().load_all()
     if not results:
         click.echo('No existing results found in evals/results/', err=True)
         sys.exit(1)
@@ -1853,9 +1856,10 @@ def _run_compare_cmd(
         compare_models,
         format_comparison_markdown,
     )
-    from orchestrator.evals.runner import load_results, load_task
+    from orchestrator.evals.results import ResultStore
+    from orchestrator.evals.runner import load_task
 
-    results = load_results()
+    results = ResultStore.packaged().load_all()
     if not results:
         click.echo('No existing results found in evals/results/', err=True)
         sys.exit(1)

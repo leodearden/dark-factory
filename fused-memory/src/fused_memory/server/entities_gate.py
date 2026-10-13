@@ -38,6 +38,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from fused_memory.server.guard_excerpt import excerpt_fields
 from fused_memory.utils.canonical_labels import scan_content
 from fused_memory.utils.referent_resolution import ReferentSet, resolve_referents
 from fused_memory.utils.validation import InputValidationError
@@ -214,7 +215,7 @@ def build_entities_malformed_block(
         'error': str(exc),
         'error_type': 'ValidationError',
         'agent_id': agent_id,
-        'content_excerpt': content[:200],
+        **excerpt_fields(content_excerpt=content),
     }
 
 
@@ -252,7 +253,7 @@ def build_entities_conflict_block(
         'error': 'declared_referent_conflict',
         'error_type': 'DeclaredReferentConflictRejected',
         'agent_id': agent_id,
-        'content_excerpt': content[:200],
+        **excerpt_fields(content_excerpt=content),
         'declared': _node_names(declared),
         'conflicts': _node_names(conflicts),
         'content_referents': _node_names(content_referents),

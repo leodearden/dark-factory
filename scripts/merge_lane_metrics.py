@@ -94,6 +94,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+import _checkout as _checkout
 import source_measures
 
 from shared import safe_io
@@ -1322,13 +1323,13 @@ def render_ledger(ledger: dict) -> str:
     ``LEDGER_README`` and any inbound one dropped, so a round trip is a no-op
     rather than a churned file.
 
-    Plain ``json.dumps(indent=2)`` rather than the baseline's hand-rolled
-    one-line-per-entry writer. That writer exists for one stated reason -- ten
-    parallel PRD gamma branches each editing different per-path measures would
-    conflict inside indent=2's six-line-per-path hunks. An append-only file
-    gaining one entry per authorizing task has no such shape, so inheriting the
-    custom writer would cargo-cult a constraint that does not apply and cost
-    legibility for it.
+    Plain ``json.dumps(indent=2)``: the baseline's one-line-per-entry writer
+    would buy nothing here. It makes edits at DIFFERENT positions disjoint
+    hunks, but two concurrent authorizations both append at the tail of
+    ``raises``, which conflicts under any line layout. The conflict is loud;
+    a merge commit's resolution of it is audited in pre-commit by
+    ``ledger_merged_entries``, and a rebase's is the residual ``RAISE_REMEDY``
+    names.
     """
     body = {key: value for key, value in ledger.items() if key != '_README'}
     return json.dumps({'_README': LEDGER_README, **body}, indent=2) + '\n'

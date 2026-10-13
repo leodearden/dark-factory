@@ -51,14 +51,15 @@ class DbPool:
     Both sets are fixed once at startup (``DashboardConfig.from_env`` reads
     ``DASHBOARD_KNOWN_PROJECT_ROOTS``; ``__post_init__`` resolves them; they
     are never mutated at runtime).  The ``rel-path`` values are fixed literals
-    (``data/orchestrator/runs.db``, ``data/burndown/burndown.db``) plus the
-    six fixed ``@property`` paths on ``DashboardConfig``.  The ``@property``
+    (``data/orchestrator/runs.db``, ``data/burndown/burndown.db``,
+    ``.taskmaster/tasks/tasks.db`` — ``project_dbs.py::TASKS_DB_REL_PATH``)
+    plus the six fixed ``@property`` paths on ``DashboardConfig``.  The ``@property``
     paths (``reconciliation_db``, ``tickets_db``, ``metrics_db``,
     ``write_journal_db``, etc.) are called only with ``config.project_root``,
     never with each root in ``known_project_roots``, so they contribute a
     flat ``+6`` rather than a per-root multiplier.  Therefore::
 
-        |_open_locks| ≤ (1 + len(known_project_roots)) × 2 + 6
+        |_open_locks| ≤ (1 + len(known_project_roots)) × 3 + 6
 
     Per-path lock entries are retained for the process lifetime (cleared only
     in :meth:`close_all`) — this is *intentional*: evicting an entry while

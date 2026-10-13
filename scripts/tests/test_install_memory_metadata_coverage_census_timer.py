@@ -744,10 +744,10 @@ def test_wrapper_runs_both_halves_under_uv_so_fused_memory_imports_resolve(
 # append that the merge worker's advance path resets away takes that night's
 # row with it -- permanently, and with no error anywhere.
 #
-# Precedent for committing rather than not: scripts/legibility/census.py's
-# _build_default_commit already commits docs/legibility/census-state.json from
-# the 03:00 job, and scripts/legibility/nightly.py::_git_commit_docs_only does
-# the same, both via scoped `git commit --only`.
+# Precedent for committing rather than not: both legibility jobs commit
+# through scripts/legibility/unlanded.py::commit_only, a scoped
+# `git commit --only` (the 03:00 census commits docs/legibility/census-state.json
+# with it).
 
 _ARTIFACTS = (
     'plans/memory-metadata-census-report.json',
@@ -886,7 +886,7 @@ def test_the_untracked_retry_is_reached_only_because_the_plain_commit_fails(
 # the retry predicate's SIGPIPE misread deterministically rather than at its
 # natural ~0.6%-under-load rate.
 #
-# Mirrors tests/scripts/test_setup_host_probe_pipelines.py::BULK_BYTES
+# Mirrors tests/scripts/shell_sections.py::SIGPIPE_BULK_BYTES
 # (task 4204): that file's 30-trials-per-size measurement records 65536 as
 # FLAKY at 26/30 while 262144 and above are 30/30. Do NOT lower this -- a
 # too-small pad does not make the test flaky, it silently weakens its power to

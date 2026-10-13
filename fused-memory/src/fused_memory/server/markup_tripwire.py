@@ -55,6 +55,8 @@ import ast
 import logging
 from typing import Any
 
+from shared.mcp_markup_middleware import MARKUP_RECURRENCE_ROUTING
+
 # markup_override_requested / strip_markup_override are RE-EXPORTS, not local
 # callers: server/tools.py imports both from this module (the write-path guards
 # call them, this module only defines the flag they key on). The noqa is the
@@ -395,17 +397,17 @@ def emit_markup_storm_escalation(
         'later burst with a different outcome is visible.',
         '',
         'DF task 3083 delivered the root cause and the Qdrant payload '
-        'text-match read tool, but it is DONE and CLOSED to appends — nothing '
-        'reads what is attached there, and its metadata is APPEND-ONLY: a key '
+        'text-match read tool, but nothing reads what is attached there, and '
+        'its metadata is APPEND-ONLY: a key '
         'can be added or overwritten, but none can be removed or renamed, '
         'because deletion needs metadata_mode=replace and any faithful replace '
         'payload carries done_provenance, which the write-authority floor '
-        'refuses. Its successor plans/toolcall-markup-containment-prd.md '
-        'owns the live blast-radius, deterministic-repair and retro-sweep work. '
+        'refuses. Its successor PRD owns the live blast-radius, '
+        'deterministic-repair and retro-sweep work in its open leaves. '
         "Attach the agent_id, tool, param and matched pattern from the guard's "
         "own log lines — grep 'markup_guard_storm' for this burst and 'markup "
-        "guard:' for each individual call — against that PRD's open leaves, "
-        'not against 3083.',
+        "guard:' for each individual call — when you "
+        f'{MARKUP_RECURRENCE_ROUTING}.',
     ])
 
     return file_folded_escalation(
@@ -436,9 +438,7 @@ def emit_markup_storm_escalation(
             'crossing_agent_id, crossing_subject_task_id and '
             'crossing_subject_agent_role for the call that crossed the '
             'threshold, and callers for every distinct caller seen in the '
-            'window — then report it against '
-            'plans/toolcall-markup-containment-prd.md — DF task '
-            '3083 is done and closed to appends. The guard also logs each '
+            f'window — then {MARKUP_RECURRENCE_ROUTING}. The guard also logs each '
             "event (grep 'markup_guard_storm' for the burst and 'markup "
             "guard:' for the individual calls), but treat that as OPTIONAL "
             'corroboration: a per-agent stdio server\'s stderr is consumed '
@@ -508,9 +508,8 @@ def emit_markup_residue_escalation(
         '',
         'The caller was told its payload is preserved here, so this record is '
         'the only surviving copy: recover it for the caller if it is still '
-        'needed, then chase the harness serialization leak that produced it. '
-        'Report the recurrence against plans/toolcall-markup-containment-prd.md '
-        '(DF 3083 is done and closed to appends, so not against 3083).',
+        'needed, then chase the harness serialization leak that produced it '
+        f'and {MARKUP_RECURRENCE_ROUTING}.',
         '',
         'raw_value (VERBATIM, the caller\'s own bytes):',
         str(raw_value),

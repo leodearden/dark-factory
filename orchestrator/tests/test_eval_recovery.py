@@ -22,6 +22,7 @@ import pytest
 
 from orchestrator.evals import runner
 from orchestrator.evals.metrics import EvalMetrics, collect_metrics
+from orchestrator.evals.results import EvalResult
 from orchestrator.evals.scoring import (
     _RECOVERY_DETECTORS,
     compute_recovery_score,
@@ -612,8 +613,8 @@ class TestAdversarialFixtures:
 # row is owned by λ).
 # ---------------------------------------------------------------------------
 
-def _adv_result() -> runner.EvalResult:
-    return runner.EvalResult(
+def _adv_result() -> EvalResult:
+    return EvalResult(
         task_id='df_task_2430_adv_plan',
         config_name='opus-high',
         outcome='done',
@@ -622,9 +623,9 @@ def _adv_result() -> runner.EvalResult:
     )
 
 
-def _ordinary_result() -> runner.EvalResult:
+def _ordinary_result() -> EvalResult:
     # No recovery_score key at all → the null sentinel path.
-    return runner.EvalResult(
+    return EvalResult(
         task_id='df_task_1993',
         config_name='opus-high',
         outcome='done',
@@ -633,11 +634,11 @@ def _ordinary_result() -> runner.EvalResult:
     )
 
 
-def _failed_adv_result() -> runner.EvalResult:
+def _failed_adv_result() -> EvalResult:
     # An adversarial run whose recovery scoring FAILED: collect_metrics stamped
     # the explicit adversarial flag (True) but the guard left recovery_score
     # None. The report must key on the explicit flag, not the null score.
-    return runner.EvalResult(
+    return EvalResult(
         task_id='df_task_2339_adv_verify',
         config_name='opus-high',
         outcome='done',
@@ -730,7 +731,7 @@ class TestRecoveryReport:
         # the model recovered on none of its criteria) is still adversarial.
         from orchestrator.evals.report import build_recovery_report
 
-        scored_zero = runner.EvalResult(
+        scored_zero = EvalResult(
             task_id='df_task_2284_adv_regression',
             config_name='opus-high',
             outcome='done',

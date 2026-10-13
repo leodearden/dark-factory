@@ -729,11 +729,11 @@ conservative or the insertion point is wrong. Debug before expanding.
 `select_survivors`, `compute_composite`, `blend_composite`,
 `build_composite_report`, `build_plan_quality_report` — needs to know whether
 an architect actually produced a plan, that is the question it asks, via
-`metrics.produced_a_plan(metrics_dict)`.
+`plan_predicates.produced_a_plan(metrics_dict)`.
 
 **Why not `plan_quality > 0`.** The two plan scorers *disagreed* exactly on a
 stepless artifact. `judge.score_plan_structure` returns `0.0` for one as a
-deliberate anti-fabrication guard (through `judge.is_scorable_plan`, which also
+deliberate anti-fabrication guard (through `plan_predicates.is_scorable_plan`, which also
 catches the truthy header-only stub `create_plan` writes); the LLM plan judge
 had no such guard and scored the same artifact confidently. Observed in the
 2026-07-29 corpus cell
@@ -751,6 +751,20 @@ Recorded in Graphiti episode `e2066ec6` (edges `23d9c24f` / `8092af24`).
 
 **Why not `outcome == 'done'`.** Done-without-a-plan and blocked-with-a-good-plan
 cells both occur — task 2863 AMENDMENT §1.
+
+**One artifact predicate, two persisted twins (task 3118).** The artifact-level
+question is `plan_predicates.is_scorable_plan(plan)`: a dict carrying at least
+one step. The runner's cap-taint decision and the floor's `0.0` short-circuit
+were once two independent tests — raw dict truthiness in the runner, `not
+plan.get('steps')` in the floor — and they disagreed exactly on the truthy
+header-only stub `create_plan` writes, so a session cap landing right after
+that first plan-tools call left the cell untainted and then floored it to a
+fabricated `0.0`. Both call sites (and the plan judge's own refusal) are now
+literally that one function. `produced_a_plan` is its twin over the persisted
+`plan_steps`, which `run_architect_eval` derives with the identical
+`len(plan.get('steps') or [])`;
+`test_eval_architect.py::TestSteplessPlanIsNeverJudged.test_persisted_metrics_agree_with_the_artifact_level_twin`
+pins the equivalence end-to-end through the real runner.
 
 **Two failure causes, two treatments, two counts, neither silent:**
 
@@ -924,14 +938,14 @@ Three details are load-bearing:
   hardcoded `0.0`. A literal would be a third independent statement of what an
   unjudgeable artifact is worth, free to diverge if the floor's semantics ever
   change. Deriving it is what lets the test assert the identity
-  `verdict.plan_quality == score_plan_structure(plan)` rather than a magic
-  number.
-- **`0.0`, not the `None` sentinel.** `None` means "no judgement available,
-  degrade to the floor" — the parse-failure / transport-refusal signal.  A
-  stepless plan from a healthy architect is a definite content verdict worth
-  `0.0`, so `invocation_error` stays `None` too; conflating the two would
-  collapse the content-failure / infra-failure distinction tasks 3118 and 3302
-  both turn on.
+  `outcome.value.plan_quality == score_plan_structure(plan)` rather than a
+  magic number.
+- **`Scored` at `0.0`, not `Unmeasured`.** `Unmeasured` means "no judgement
+  available, degrade to the floor": a transport refusal or an unparseable
+  answer. A stepless plan from a healthy architect is a definite content
+  verdict worth `0.0`, so no `invocation_errors` record is written either;
+  conflating the two would collapse the content-failure / infra-failure
+  distinction tasks 3118 and 3302 both turn on.
 - **The refusal is logged at WARNING.** Reaching it means a caller did not gate.
   It cannot double-log through the normal path (the runner's gate
   short-circuits first), so the record stays rare and means exactly one thing.
@@ -955,6 +969,107 @@ got it right:** `scripts/eval_bootstrap_smoke.sh` gates its smoke on
 `planRate` / `meanPQ_all` ("scores a no-plan cell as 0") from `plan_steps > 0`
 because the pipeline's own ranking could not be used.
 
+### Unmeasured cells: typed causes (task 6734)
+
+Code: `orchestrator/src/orchestrator/evals/measurement.py` (`UnmeasuredCause`,
+`classify_unmeasured`, `measured_call`), persisted on
+`metrics.py::EvalMetrics.invocation_errors`, mapped from legacy cells by
+`results.py::_invocation_errors_from_marker`, rendered by
+`report.py::format_invocation_errors`.
+
+An LLM invocation behind an eval cell either produced a measurement (`Scored`)
+or did not (`Unmeasured`, naming its stage, cause, reason and spend). The cell
+persists one record per stage that went unmeasured, architect first:
+
+```json
+"invocation_errors": [
+  {"stage": "architect", "cause": "cap_hit", "reason": "You've hit your session limit · resets 8pm"}
+]
+```
+
+`None` means no infra failure was observed. That includes an ordinary content
+failure, an architect that ran fine and produced a bad or absent plan, which is
+a genuine reliability signal and keeps scoring on content.
+
+**Why each transport tier is unmeasurable.** `classify_unmeasured` delegates to
+`shared.invocation_outcome.classify_invocation(strict_confirm=True)` rather than
+re-matching cap strings in the eval layer: that seam owns the cap, auth and
+model-not-found tables under a drift guard, and its `OK` short-circuit is what
+stops a healthy run whose output merely quotes a cap message from being
+tainted. The ladder, in order:
+
+- `cap_hit`, `auth_failed`, `model_not_found`: refused before the model answered.
+- An `OK` outcome is never a refusal.
+- `api_error`: a body-less HTTP 429. 429 is excluded from `AuthFailed` because it
+  normally carries a cap body; without this arm a body-less one would go
+  unmarked. It precedes the wedge tier, so a 429 that also timed out with zero
+  turns is reported as the 429 it is.
+- `server_error`: HTTP 5xx, 529 Overloaded included. The provider refused. It
+  ranks above the wedge tier because a SIGTERM-flushed 5xx on a watchdog-killed
+  CLI is a provider outage, not a local wedge (the 2026-07-29 incident).
+- `wedge`: a full timeout with zero transcript turns produced no answer at all;
+  scoring it `0.0` would be the fabricated zero this exists to remove.
+- Anything else (`NearCap`, `CliLocalError`, an unclassified failure) is not a
+  refusal.
+
+The runner adds the causes no `AgentResult` can show: `timeout`,
+`cap_exhausted` (every account stayed capped past the eval's cap-wait patience),
+and `harness_error` (our own crash: worktree, config, briefing or artifact read
+raised). The plan judge adds `raised` and `unparseable` (a non-JSON, null or
+non-finite answer).
+
+**Recorded vs tainted.** `invocation_errors` records what happened;
+`cap_tainted` is the scoring decision. A tainted cell has no model content at
+all, so the plan_quality aggregates and a plan-only trial's composite and
+quality pools EXCLUDE it and count the exclusion (`plan_quality_cap_excluded`,
+`cap_excluded`), rather than averaging in a fabricated zero that would penalise
+whichever candidate happened to run inside a cap window. The `trials`
+denominator still counts every trial. The two deliberately diverge:
+
+- A timeout is recorded but not tainted. The candidate was asked and did not
+  finish inside the operator's budget, which is candidate-attributable;
+  excluding it would let a slow candidate dodge the penalty its rivals paid.
+- A transport refusal that still left a plan with steps is recorded but not
+  tainted: the structural floor is a genuine content score.
+- A judge-only failure is recorded (stage `judge`) and never taints.
+
+`cap_tainted` stays an explicit boolean rather than being inferred from
+`plan_quality is None`, because a null score alone is ambiguous between "not an
+architect run" and "an architect run we could not measure" — the null-gating
+discipline `_is_false_green` and `_is_null_work` already apply to `tests_pass`.
+
+**Spend.** Every outcome carries the spend of the invocation behind it, summed
+over every attempt: `measured_call` banks each attempt itself, because
+`invoke_with_cap_retry` returns only the last result. A refused or unparseable
+call still burned tokens, so it reports them; only a path that never invoked
+(the unjudgeable-artifact floor above) reports `0.0`. `Scored` and `Unmeasured`
+reject a non-finite or negative cost at construction, and producers coerce
+through `measurement.py::coerce_cost_usd`, which is `isinstance`-gated because a
+bare `MagicMock`'s `float()` is `1.0` and would fabricate spend. A judge that
+raises leaves `judge_invocations` and `judge_cost_usd` at zero, since whether it
+was ever reached is unknowable, but its `raised` record keeps the cell from
+reading as judge-free. The judge's spend is a subset of the cell's `cost_usd`,
+never an addend.
+
+**Causes are not interchangeable.** The flag is named for the session cap that
+motivated it, but its causes range from transient and schedule-attributable
+(`cap_hit`, `cap_exhausted`: rerun later) to permanent configuration errors
+(`model_not_found`, `auth_failed`: this candidate can never run). So the report
+breaks `cap_excluded_by_cause` out by `UnmeasuredCause` value, keyed by the
+cell's FIRST record (architect precedes judge, and a judge-only failure never
+taints), and the per-cell `excluded` marker stays cause-neutral beside the
+rendered records. A tainted row carrying no record raises, naming the cell.
+
+**Legacy cells (PRD §7 D3).** Cells written before task 6734 carry one string,
+`invocation_error`, such as `architect:cap_exhausted: …`.
+`ResultStore.load_all` maps it once, at load, to a single record: the first
+`;`-separated marker gives the stage and cause, and the reason is everything
+after the string's first two `:` with exactly one leading space removed, so
+`format_invocation_errors` reproduces the original string byte for byte. An
+unrecognised stage or cause loads as `(architect, legacy_unclassified, <raw
+string>)`, and a tainted legacy cell with no string gets `(architect,
+legacy_unclassified, '')`. A live run never produces `legacy_unclassified`.
+
 ### Terminal outcome (`terminal_kind`, task 4760)
 
 The three counts above all describe the *quality* axis. This one describes what
@@ -968,7 +1083,7 @@ persisted on `metrics.py::EvalMetrics.terminal_kind`, read back through
 
 | Value | Meaning |
 |---|---|
-| `planned` | A scorable plan (`judge.is_scorable_plan`) was the terminal statement |
+| `planned` | A scorable plan (`plan_predicates.is_scorable_plan`) was the terminal statement |
 | `already_done` | `plan_tools::report_task_already_done` — the work already landed |
 | `blocking_dependency` | `plan_tools::report_blocking_dependency` — something else must land first |
 | `false_premise` | `plan_tools::report_false_premise` — the task's premise does not hold |

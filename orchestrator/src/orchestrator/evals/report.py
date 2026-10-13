@@ -18,18 +18,20 @@ from .elo import (
     TaskPool,
     _pair_key,
 )
+from .measurement import UnmeasuredCause
 from .metrics import (
     DECLINE_KINDS,
     _rate,
     blend_composite,
-    produced_a_plan,
     terminal_kind_of,
 )
+from .plan_predicates import produced_a_plan
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
-    from .runner import EvalResult
+    from .measurement import UnmeasuredRecord
+    from .results import EvalResult
 
 logger = logging.getLogger(__name__)
 
@@ -548,7 +550,7 @@ def build_composite_report(
 
     THE PLAN-PRODUCTION INVARIANT (task 3302): the θ score of every admitted cell
     comes from :func:`_plan_quality_score`, so a cell whose architect ran fine
-    but produced NO PLAN (``not metrics.produced_a_plan`` — ``plan_steps == 0``)
+    but produced NO PLAN (``not plan_predicates.produced_a_plan`` — ``plan_steps == 0``)
     is FLOORED to ``0.0`` rather than reported at whatever the LLM plan judge
     said, and is counted as ``plan_quality_no_plan``. A no-plan cell is also
     barred from SETTING its ``(fixture, 'plan_only')`` cost/latency baseline
@@ -1482,36 +1484,45 @@ _PLAN_QUALITY_MEAN_COLUMNS = (
 # model-not-found, server error (5xx), zero-output wedge, harness error — and a
 # PERMANENT config error ("this candidate can never run") must not render as a
 # TRANSIENT one ("rerun after the cap window"). The cause is always carried in
-# the adjacent ``invocation_error`` column and broken out by cause in the
-# summary line, so the marker itself stays cause-neutral rather than asserting
-# a cap.
+# the adjacent ``invocation_error`` column (the rendered ``invocation_errors``
+# records) and broken out by cause in the summary line, so the marker itself
+# stays cause-neutral rather than asserting a cap.
 _CAP_EXCLUDED_CELL = 'excluded'
 _PLAN_QUALITY_MEAN_HEADER = 'plan_quality by config:'
 
 
-def _taint_cause(marker: str | None) -> str:
-    """Reduce a stage-prefixed ``invocation_error`` to its bare CAUSE key.
+def format_invocation_errors(
+    records: Sequence[UnmeasuredRecord] | None,
+) -> str | None:
+    """*records* on one line as ``stage:cause: reason``, ``'; '``-joined; ``None`` if none."""
+    if not records:
+        return None
+    return '; '.join(f"{r['stage']}:{r['cause']}: {r['reason']}" for r in records)
 
-    ``"architect:cap_hit: You've hit your session limit · resets 8pm"`` →
-    ``"cap_hit"``; ``"architect:model_not_found: ..."`` → ``"model_not_found"``.
-    Pure string surgery on the marker ``run_architect_eval`` builds — the eval
-    layer deliberately does not re-derive the cause from the AgentResult, which
-    is long gone by report time.
 
-    Falls back to ``'unknown'`` for an absent or unparseable marker rather than
-    guessing, so a mis-shaped marker shows up as its own bucket instead of being
-    silently folded into a real cause.
+def _exclusion_cause(row: dict[str, Any]) -> UnmeasuredCause:
+    """Why a cap-tainted *row* was excluded: its first record's cause.
+
+    Architect records precede judge ones and a judge-only failure never
+    taints, so the first record is the one that drove the exclusion.
     """
-    if not marker:
-        return 'unknown'
-    # Only the FIRST stage marker is used: the join order is architect-then-
-    # judge, and a judge-only refusal never taints, so the leading marker is
-    # always the one that drove the exclusion.
-    first = marker.split(';')[0].strip()
-    _stage, sep, rest = first.partition(':')
-    if not sep:
-        return first or 'unknown'
-    return rest.strip().partition(':')[0].strip() or 'unknown'
+    cell = f'{row["task_id"]} x {row["config_name"]}'
+    records = row['invocation_errors']
+    if not records:
+        raise ValueError(
+            f'{cell}: a cap_tainted cell must carry at least one '
+            f'invocation_errors record naming why it was not measured, and '
+            f'this one carries none. Load cells through ResultStore.load_all, '
+            f'which supplies the record for pre-6734 cells.'
+        )
+    cause = records[0]['cause']
+    try:
+        return UnmeasuredCause(cause)
+    except ValueError:
+        raise ValueError(
+            f'{cell}: invocation_errors[0] names cause {cause!r}, which is not '
+            f'an UnmeasuredCause ({", ".join(c.value for c in UnmeasuredCause)}).'
+        ) from None
 
 
 def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
@@ -1527,7 +1538,7 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
     surface is deterministic.
 
     Rows additionally carry the task-3118 infra markers ``cap_tainted`` /
-    ``invocation_error`` (likewise default-safe: ``False`` / ``None`` for
+    ``invocation_errors`` (likewise default-safe: ``False`` / ``None`` for
     metrics predating them), and the report gains a per-config aggregate over
     ARCHITECT rows plus a report-level ``cap_excluded`` total.
 
@@ -1540,7 +1551,7 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
     nothing" can never read as "it scored nothing".
 
     ITS COUNTERPART (task 3302): a cell whose architect ran fine but produced NO
-    PLAN (``not metrics.produced_a_plan``) is the opposite case — a genuine
+    PLAN (``not plan_predicates.produced_a_plan``) is the opposite case — a genuine
     content measurement — so it is FLOORED to ``0.0`` by
     :func:`_plan_quality_score`, KEPT in the mean, and counted separately as
     ``no_plan``. Two causes, two treatments, two counts, neither silent:
@@ -1628,7 +1639,7 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
             # count the adjacent plan_quality was — or was not — scored over.
             'plan_steps': result.metrics.get('plan_steps'),
             'cap_tainted': bool(result.metrics.get('cap_tainted')),
-            'invocation_error': result.metrics.get('invocation_error'),
+            'invocation_errors': result.metrics.get('invocation_errors'),
             # The σ validity marker (task 3628) — read through THE shared
             # accessor, NOT like cap_tainted above. cap_tainted's absence
             # genuinely means "no infra failure was recorded"; this field's
@@ -1682,7 +1693,7 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
     judged_blind: dict[str, int] = defaultdict(int)
     judged_blind_unmeasured: dict[str, int] = defaultdict(int)
     totals: dict[str, int] = defaultdict(int)
-    by_cause: dict[str, int] = defaultdict(int)
+    by_cause: dict[UnmeasuredCause, int] = defaultdict(int)
     # The task-4760 decline split. Four counters, all over the SAME admitted
     # pool ``scored`` / ``no_plan`` / ``judged_blind`` are over.
     declined: dict[str, int] = defaultdict(int)
@@ -1698,7 +1709,7 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
         totals[cfg] += 1
         if row['cap_tainted']:
             excluded[cfg] += 1
-            by_cause[_taint_cause(row['invocation_error'])] += 1
+            by_cause[_exclusion_cause(row)] += 1
         elif row['scored_plan_quality'] is not None:
             # Subscript, not ``.get``: the answer was computed from the metrics
             # dict when the row was built, so a dropped key must raise here
@@ -1809,7 +1820,7 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
         'rows': rows,
         'configs': configs,
         'cap_excluded': sum(excluded.values()),
-        'cap_excluded_by_cause': {c: by_cause[c] for c in sorted(by_cause)},
+        'cap_excluded_by_cause': {c.value: by_cause[c] for c in sorted(by_cause)},
         # Report-level decline totals (task 4760), summed from the very same
         # per-config counters above so the two surfaces cannot drift. No
         # absence rule of their own: unlike ``judged_without_reference``, an
@@ -1907,9 +1918,10 @@ def format_plan_quality_table(report: dict[str, Any]) -> str:
 
     A ``plan_quality`` column shows the populated float (4 dp) for architect rows
     and ``-`` (the null sentinel) for non-architect rows; ``role_under_test``
-    and ``invocation_error`` render ``-`` when ``None``. A CAP-TAINTED row shows
-    the explicit ``excluded`` marker in place of a score, alongside the
-    ``invocation_error`` that caused it — an infra failure must never render as
+    and ``invocation_error`` (the :func:`format_invocation_errors` rendering of
+    the row's records) render ``-`` when ``None``. A CAP-TAINTED row shows the
+    explicit ``excluded`` marker in place of a score, alongside the records
+    that caused it — an infra failure must never render as
     ``0.0000``, and must stay distinguishable from the ``-`` a non-architect row
     uses.
 
@@ -1940,7 +1952,9 @@ def format_plan_quality_table(report: dict[str, Any]) -> str:
             'config_name': str(r['config_name']),
             'role_under_test': _text_cell(r['role_under_test']),
             'plan_quality': _score_cell(r),
-            'invocation_error': _text_cell(r.get('invocation_error')),
+            'invocation_error': _text_cell(
+                format_invocation_errors(r.get('invocation_errors'))
+            ),
         }
         for r in rows
     ]

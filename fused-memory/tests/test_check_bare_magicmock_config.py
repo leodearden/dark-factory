@@ -1286,6 +1286,55 @@ class TestFusedMemoryTestsDirectoryClean:
         )
 
 
+# Each repo-wide scan sweeps all seven packages' tests/; 61.52s x 8 = 492.16, rounded up to a
+# whole minute. Family rationale: orchestrator/tests/_orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
+MAGICMOCK_REPO_SCAN_TEST_TIMEOUT = 540
+
+# Worst root-bound wall clock of these scans under real load, task 5442; corpus is plans/pytest-per-test-timeout-measurement-2026-09-17.md.
+_REPO_SCAN_MEASURED_UNDER_LOAD_WORST_CASE = 61.52
+# Canonical home is orchestrator/tests/_orch_helpers.py::UNDER_LOAD_HEADROOM_FACTOR; fused-memory's tests cannot import orchestrator's test helpers.
+_UNDER_LOAD_HEADROOM_FACTOR = 8
+
+
+def _timeout_seconds(marker: pytest.Mark | None) -> float | None:
+    """The ceiling a pytest-timeout marker sets, in either spelling pytest-timeout accepts."""
+    if marker is None:
+        return None
+    value = marker.kwargs.get('timeout', marker.args[0] if marker.args else None)
+    return None if value is None else float(value)
+
+
+def test_only_the_repo_wide_scans_run_under_their_own_ceiling(request):
+    """The scan classes' items resolve the repo-scan ceiling; this module's unit tests do not.
+
+    Reads get_closest_marker on the collected items, which is what pytest-timeout
+    reads. Family rationale: orchestrator/tests/_orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
+    """
+    scan_classes = (TestAllScannedTestDirsClean, TestWallClockDeadlineBaselineIntegrity)
+    scan_items = [item for item in request.session.items if getattr(item, 'cls', None) in scan_classes]
+    if not scan_items:
+        pytest.skip('no repo-wide scan item is selected in this session')
+    ini_default = float(request.config.getini('timeout'))
+    measured_need = _REPO_SCAN_MEASURED_UNDER_LOAD_WORST_CASE * _UNDER_LOAD_HEADROOM_FACTOR
+    required = max(measured_need, ini_default)
+    ceilings = {item.nodeid: _timeout_seconds(item.get_closest_marker('timeout')) for item in scan_items}
+    short = {nodeid: ceiling for nodeid, ceiling in ceilings.items() if ceiling is None or ceiling < required}
+    assert short == {}, (
+        f'repo-wide scan items resolve a timeout below {required}s, the larger of the measured '
+        f'{_REPO_SCAN_MEASURED_UNDER_LOAD_WORST_CASE}s x headroom {_UNDER_LOAD_HEADROOM_FACTOR} '
+        f'and the {ini_default}s ini default (None = no mark): {short}. Bind '
+        '@pytest.mark.timeout(MAGICMOCK_REPO_SCAN_TEST_TIMEOUT) on the scan class; a closer mark '
+        'on a scan test REPLACES it.'
+    )
+    own = _timeout_seconds(request.node.get_closest_marker('timeout'))
+    assert own is None or own <= ini_default, (
+        f"this module's unit tests resolve a {own}s timeout mark, above the {ini_default}s ini "
+        'default. A mark overrides verify\'s CLI --timeout too, so a hang in any of them would '
+        'surface that much later; bind the repo-scan ceiling on the scan classes only.'
+    )
+
+
+@pytest.mark.timeout(MAGICMOCK_REPO_SCAN_TEST_TIMEOUT)
 class TestAllScannedTestDirsClean:
     """Non-regression gate for all nine call sites: every scanned tests/ dir stays clean.
 
@@ -2218,6 +2267,7 @@ class TestDebtBaselineIsolation:
         assert 'mock_orch_config' in violations[0].message
 
 
+@pytest.mark.timeout(MAGICMOCK_REPO_SCAN_TEST_TIMEOUT)
 class TestWallClockDeadlineBaselineIntegrity:
     """The Rule C baseline is a MEASUREMENT of the real repo, not a list of literals.
 

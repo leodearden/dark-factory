@@ -14,7 +14,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, TypeGuard, TypeVar
@@ -2281,6 +2281,19 @@ async def invoke_claude_agent(
     )
 
 
+@dataclass(frozen=True)
+class _DispatchedAttempt:
+    """What the cost row records about one dispatched attempt.
+
+    Built fresh at each dispatch, so after the retry loop it describes the
+    attempt whose result is returned: no field can outlive its attempt.
+    """
+
+    started_at: str
+    completed_at: str
+    unattributed_cap: bool = False
+
+
 async def invoke_with_cap_retry(
     usage_gate: UsageGate | None,
     label: str,
@@ -2400,8 +2413,10 @@ async def invoke_with_cap_retry(
     *label* identifies the caller in log messages (e.g. "Module tagging",
     "Task 7 [implementer]").
 
-    When *cost_store* is provided, successful invocations are recorded via
-    ``save_invocation()`` and cap-hit events via ``save_account_event()``.
+    When *cost_store* is provided, invocations are recorded via
+    ``save_invocation()`` only.  Account events belong to the gate, which
+    writes them to its own cost store, so give the gate the same store
+    (``shared/src/shared/usage_gate.py::UsageGate._write_cost_event``).
 
     All keyword arguments are forwarded to ``invoke_claude_agent()``.  When a
     custom *invoke_fn* is supplied, it additionally receives *backend*
@@ -2522,10 +2537,6 @@ async def invoke_with_cap_retry(
             last_cap_wait_log_at = now
 
     account_name = ''
-    unattributed_cap = False  # True when heuristic fires but token is unresolvable;
-    # controls: (1) skip confirm, (2) mark capped=True in cost_store
-    started_at = ''
-    completed_at = ''
     # Loop-local, stamped onto the RETURNED result at the single exit below
     # (task 3578).  Must live out here rather than on any individual result:
     # the retry loop rebinds `result` on every pass, so a count written to the
@@ -2591,11 +2602,7 @@ async def invoke_with_cap_retry(
                 config_dir=config_dir.path if config_dir else None,
             )
             dispatches += 1
-            completed_at = datetime.now(UTC).isoformat()
-            # Re-stamped per attempt (above), so started_at/completed_at always
-            # describe the attempt actually RETURNED — leaving the discarded
-            # attempt's stamps in place would write a silently false window
-            # into the cost_store invocations row.
+            attempt = _DispatchedAttempt(started_at, datetime.now(UTC).isoformat())
             if not _should_retry_cli_input_rejected(result, cli_input_rejected_retries):
                 break
             cli_input_rejected_retries += 1
@@ -2653,7 +2660,7 @@ async def invoke_with_cap_retry(
                     config_dir=config_dir.path if config_dir else None,
                 )
                 dispatches += 1
-                completed_at = datetime.now(UTC).isoformat()
+                attempt = _DispatchedAttempt(started_at, datetime.now(UTC).isoformat())
 
                 # Lazy (function-local) import: invocation_outcome.py imports
                 # shared.cli_invoke at module top (for is_zero_output_timeout),
@@ -2716,8 +2723,7 @@ async def invoke_with_cap_retry(
                         f'{account_name} ({outcome.reason}) — terminal, no '
                         f'cross-account failover',
                     )
-                    if not unattributed_cap:
-                        slot.confirm(result.cost_usd)
+                    slot.confirm(result.cost_usd)
                     break
 
                 # Pre-turn CLI REJECTION (task 3143 / esc-3118-1): the prompt
@@ -2757,8 +2763,7 @@ async def invoke_with_cap_retry(
                 # the ACCOUNT failed.
                 if _should_retry_cli_input_rejected(result, cli_input_rejected_retries):
                     cli_input_rejected_retries += 1
-                    if not unattributed_cap:
-                        slot.confirm(result.cost_usd)
+                    slot.confirm(result.cost_usd)
                     logger.warning(
                         f'{label}: CLI rejected the invocation before any model turn '
                         f'(no prompt reached the CLI) on account {account_name} — '
@@ -2816,18 +2821,6 @@ async def invoke_with_cap_retry(
                     )
 
                     acct_name = usage_gate.active_account_name
-                    if cost_store:
-                        try:
-                            await cost_store.save_account_event(
-                                account_name=account_name,
-                                event_type='cap_hit',
-                                project_id=project_id or None,
-                                run_id=run_id or None,
-                                details=label,
-                                created_at=datetime.now(UTC).isoformat(),
-                            )
-                        except Exception:
-                            logger.warning('Failed to save cap_hit event', exc_info=True)
 
                     # ------------------------------------------------------------------
                     # MEASURED 2026-08-01 (task 3454, claude CLI 2.1.220), and
@@ -3097,7 +3090,7 @@ async def invoke_with_cap_retry(
                                 f'{label}: heuristic cap suspected but no account could be marked '
                                 f'(token unresolved) — treating as normal failure',
                             )
-                            unattributed_cap = True
+                            attempt = replace(attempt, unattributed_cap=True)
                         else:
                             consecutive_cap_hits += 1
                             full_cycles = (consecutive_cap_hits - 1) // num_accounts
@@ -3169,8 +3162,7 @@ async def invoke_with_cap_retry(
                         f'cross-account failover; returning result to caller for '
                         f'transient requeue',
                     )
-                    if not unattributed_cap:
-                        slot.confirm(result.cost_usd)
+                    slot.confirm(result.cost_usd)
                     break
 
                 # Progress-timeout guard (reify-4827, task 2360 fix #2): a
@@ -3193,8 +3185,7 @@ async def invoke_with_cap_retry(
                         f'caller for γ re-resume instead of discarding into '
                         f'a fresh retry',
                     )
-                    if not unattributed_cap:
-                        slot.confirm(result.cost_usd)
+                    slot.confirm(result.cost_usd)
                     break
 
                 # Non-cap-hit failure while resuming → fall back to fresh invocation.
@@ -3225,8 +3216,7 @@ async def invoke_with_cap_retry(
                     _reset_for_fresh_retry(invoke_kwargs, original_prompt)
                     continue  # __aexit__ releases probe slot
 
-                if not unattributed_cap:
-                    slot.confirm(result.cost_usd)
+                slot.confirm(result.cost_usd)
                 break
 
     if retry_aborted:
@@ -3246,7 +3236,7 @@ async def invoke_with_cap_retry(
         max_turns=invoke_kwargs.get('max_turns'),
         backend=backend,
     )
-    capped_reason = CapReason.ACCOUNT if unattributed_cap else ceiling_reason
+    capped_reason = CapReason.ACCOUNT if attempt.unattributed_cap else ceiling_reason
     if cost_store:
         try:
             await cost_store.save_invocation(
@@ -3265,8 +3255,8 @@ async def invoke_with_cap_retry(
                 capped=capped_reason is not None,
                 capped_reason=capped_reason,
                 model_id=result.model_id,
-                started_at=started_at,
-                completed_at=completed_at,
+                started_at=attempt.started_at,
+                completed_at=attempt.completed_at,
             )
         except Exception:
             logger.warning('Failed to save invocation cost', exc_info=True)

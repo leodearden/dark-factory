@@ -37,17 +37,19 @@ dependencies = [
     "anyio>=4.0",
     "escalation>=0.1",
     "dark-factory-shared",
+    "dark-factory-load-sampler",
 ]
 
 [tool.uv.sources]
 escalation = { workspace = true }
 dark-factory-shared = { workspace = true }
+dark-factory-load-sampler = { workspace = true }
 
 [tool.pyright]
 include = ["src", "tests"]
 # ".." LAST (mirrors tests/conftest.py's sys.path.append): resolves the repo-root
 # df_pytest_isolation module without letting project dirs shadow their own src/.
-extraPaths = ["src", "../shared/src", "../escalation/src", ".."]
+extraPaths = ["src", "../shared/src", "../escalation/src", "../sampler/src", ".."]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 reportUnnecessaryTypeIgnoreComment = "error"
@@ -103,15 +105,14 @@ addopts = "-n auto --dist loadgroup"
 # local/agent invocations (`cd dashboard && uv run pytest tests/`, the form
 # CONTRIBUTING.md and the 3216 incident used) — and since task 5442 raised the
 # ini past 300, those two budgets now DIFFER rather than coincide.
-# Raised 60→300 on 2026-09-12 and 300→540 on 2026-09-17; see
-# shared/pyproject.toml for the full rationale (the cap is WALL-CLOCK, so a
+# See shared/pyproject.toml for the full rationale (the cap is WALL-CLOCK, so a
 # healthy test starved of CPU on a loaded 32-core host trips it, and in the
 # xdist packages that reds a SHIFTING VICTIM rather than the starved test).
-# 540 is DERIVED FROM MEASUREMENT (task 5442) — worst unmarked per-test wall
-# clock under real fleet load x the 8x headroom factor — and no longer
-# judgement-picked; see
+# 420 is DERIVED FROM MEASUREMENT — worst unmarked per-test wall clock under
+# real fleet load x the 8x headroom factor — and no longer judgement-picked;
+# the measurement and the value's history are in
 # plans/pytest-per-test-timeout-measurement-2026-09-17.md.
-timeout = 540
+timeout = 420
 # signal is KEPT under xdist (task 5408), and the premise this comment used to
 # give for it — "dashboard runs no pytest-xdist, so signal is safe" — is
 # corrected rather than softened, because it is false twice over. It was

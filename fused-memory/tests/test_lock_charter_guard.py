@@ -93,6 +93,10 @@ _LCG_LOGGER = 'fused_memory.middleware.lock_charter_guard'
 #   REIFY_ROOT — or when REIFY_ROOT names a path that has no guard script, in
 #   which case the skip NAMES that path.  Run this in any environment that has
 #   both repos checked out side-by-side.
+#
+# Out of suite: `scripts/check_lock_charter_drift.py` (task 3226) runs the same
+#   cross-repo comparison explicitly, without the full suite — three exit codes,
+#   no skip state, so an absent or unrunnable sibling reports as loudly as drift.
 # ---------------------------------------------------------------------------
 
 # The canonical α/γ vector — update this list AND FILE_EXTENSIONS together.

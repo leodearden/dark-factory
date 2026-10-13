@@ -32,6 +32,7 @@ from fused_memory.maintenance.link_heal_ledger import (
     ActionRow,
     ActionState,
     LinkHealLedger,
+    NothingToUndo,
     RunSource,
     UnknownRun,
 )
@@ -71,7 +72,8 @@ async def plan_and_apply(
 
 async def undo(harness: LinkHealHarness, ledger: LinkHealLedger, run_ref: str) -> RunReport:
     return await run_undo(
-        ledger.resolve_run(run_ref), store=harness.store(), ledger=ledger, limits=DEFAULT_LIMITS,
+        ledger.undo_target(ledger.resolve_run(run_ref)),
+        store=harness.store(), ledger=ledger, limits=DEFAULT_LIMITS,
     )
 
 
@@ -151,14 +153,18 @@ class TestUndoADetach:
         assert child['metadata'][PARENT_ID_KEY] == PARENT
 
     @pytest.mark.asyncio
-    async def test_undoing_the_same_run_again_writes_nothing(self, harness, ledger, tmp_path):
+    async def test_undoing_the_same_run_again_is_refused_and_writes_nothing(
+        self, harness, ledger, tmp_path,
+    ):
         _plan, applied, _first = await self._undone(harness, ledger, tmp_path)
         writes_before = harness.mem0.write_count
+        runs_before = len(ledger.recent_runs(100))
 
-        again = await undo(harness, ledger, applied.run_id)
+        with pytest.raises(NothingToUndo, match='no heal still applied'):
+            await undo(harness, ledger, applied.run_id)
 
         assert harness.mem0.write_count == writes_before
-        assert again.counts.applied == 0
+        assert len(ledger.recent_runs(100)) == runs_before
 
     @pytest.mark.asyncio
     async def test_a_re_plan_does_not_propose_the_undone_detach(self, harness, ledger, tmp_path):
@@ -182,6 +188,40 @@ class TestUndoADetach:
 
         assert report.counts.applied == 1
         assert link_keys(harness) == {PARENT_ID_KEY: PARENT, 'kind': AMENDMENT_KIND}
+
+
+class TestUndoRefusesARunWithNothingApplied:
+    @pytest.mark.asyncio
+    async def test_the_plan_runs_id_is_refused_before_any_run_row(
+        self, harness, ledger, tmp_path,
+    ):
+        harness.seed_link()
+        planned, _applied = await plan_and_apply(
+            harness, ledger, tmp_path, corpus_basis('RELATED'),
+        )
+        writes_before = harness.mem0.write_count
+        runs_before = len(ledger.recent_runs(100))
+
+        with pytest.raises(NothingToUndo, match='plan run'):
+            await undo(harness, ledger, planned.run_id)
+
+        assert len(ledger.recent_runs(100)) == runs_before
+        assert harness.mem0.write_count == writes_before
+        assert the_heal(ledger, planned).state is ActionState.APPLIED
+
+    @pytest.mark.asyncio
+    async def test_an_undo_runs_id_is_refused(self, harness, ledger, tmp_path):
+        harness.seed_link()
+        _planned, applied = await plan_and_apply(
+            harness, ledger, tmp_path, corpus_basis('RELATED'),
+        )
+        report = await undo(harness, ledger, applied.run_id)
+        runs_before = len(ledger.recent_runs(100))
+
+        with pytest.raises(NothingToUndo, match='undo run'):
+            await undo(harness, ledger, report.run_id)
+
+        assert len(ledger.recent_runs(100)) == runs_before
 
 
 class TestUndoARelabelAndFlag:

@@ -28,6 +28,7 @@ Subprocesses therefore get a generous ``timeout=`` rather than a clock guard.
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from collections.abc import Mapping
@@ -1052,18 +1053,25 @@ def test_a_missing_shared_import_is_exit_two_and_never_exit_one(tmp_path: Path):
     reserves for a FINDING.  A gate that reported a broken environment as an
     INV-12 breach would send an agent to fix code that was never the problem.
 
-    The scanner's whole ``inline_suppression*.py`` family is copied into
-    ``tmp_path``: its sibling strata resolve from ``sys.path[0]``, which is the
-    copied entry script's own directory, so copying that script alone would fail
-    its first sibling import with an unrelated exit 1.  The ``<repo>/shared/src``
-    its bootstrap resolves from ``__file__`` does not exist there either, and the
-    run gets ``-S`` because the workspace member is editable-installed in the
-    venv and ``PYTHONPATH`` alone cannot hide it.  A generous subprocess
-    ``timeout`` rather than any wall-clock assertion, per this module's docstring.
+    The run uses a checkout-shaped copy: the scanner's whole
+    ``inline_suppression*.py`` family and ``_checkout.py`` under
+    ``tmp_path/scripts``, and the root pyproject.toml at ``tmp_path``.  The
+    sibling strata resolve from ``sys.path[0]``, which is the copied entry
+    script's own directory, so copying that script alone would fail its first
+    sibling import with an unrelated exit 1.  No member ``src/`` exists in the
+    copy, so ``_checkout`` binds nothing and the ``<repo>/shared/src`` the
+    bootstrap resolves from ``__file__`` is absent too.  The run gets ``-S``
+    because the workspace member is editable-installed in the venv and
+    ``PYTHONPATH`` alone cannot hide it.  A generous subprocess ``timeout``
+    rather than any wall-clock assertion, per this module's docstring.
     """
-    for source in sorted((REPO_ROOT / 'scripts').glob('inline_suppression*.py')):
-        (tmp_path / source.name).write_text(source.read_text(encoding='utf-8'), encoding='utf-8')
-    copied = tmp_path / SCRIPT.name
+    scripts_dir = tmp_path / 'scripts'
+    scripts_dir.mkdir()
+    family = sorted((REPO_ROOT / 'scripts').glob('inline_suppression*.py'))
+    for source in (*family, REPO_ROOT / 'scripts' / '_checkout.py'):
+        shutil.copy2(source, scripts_dir / source.name)
+    shutil.copy2(REPO_ROOT / 'pyproject.toml', tmp_path / 'pyproject.toml')
+    copied = scripts_dir / SCRIPT.name
 
     completed = _run_script(
         ['--check', '--root', str(tmp_path), '--baseline', str(tmp_path / _BASELINE_NAME)],

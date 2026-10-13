@@ -1,37 +1,37 @@
 {
   "quality": {
-    "attaches": 553,
+    "attaches": 427,
     "unclear_attaches": 0,
-    "misfiles": 168,
-    "misfile_rate_of_attaches": 0.3038,
+    "misfiles": 84,
+    "misfile_rate_of_attaches": 0.1967,
     "misfile_rate_wilson95": [
-      0.2669,
-      0.3434
+      0.1618,
+      0.2371
     ],
-    "duplicates_placed": 385,
-    "contradictions_attached": 63,
-    "contradictions_contested": 43,
-    "contradiction_recall": 0.6825,
-    "agreeing_attaches": 322,
-    "agreeing_contested": 19,
-    "false_contested_rate": 0.059,
-    "true_links": 466,
-    "true_links_answered_distinct": 21,
-    "true_links_answered_distinct_rate": 0.0451,
-    "contested_decision_errors": 51,
-    "parse_failures": 3,
+    "duplicates_placed": 343,
+    "contradictions_attached": 74,
+    "contradictions_contested": 72,
+    "contradiction_recall": 0.973,
+    "agreeing_attaches": 269,
+    "agreeing_contested": 35,
+    "false_contested_rate": 0.1301,
+    "true_links": 469,
+    "true_links_answered_distinct": 86,
+    "true_links_answered_distinct_rate": 0.1834,
+    "contested_decision_errors": 74,
+    "parse_failures": 0,
     "unrated_pairs": 0,
     "unrated_pair_ids": []
   },
   "selection": {
     "judge_provider": "openai",
-    "judge_model": "gpt-5.6-terra",
-    "judge_reasoning_effort": "none",
+    "judge_model": "gpt-6.1-sol",
+    "judge_reasoning_effort": "low",
     "judge_candidate_count": 5,
     "wording": "shipped",
     "field_chars": 4000,
-    "p95_judge_seconds": 2.052,
-    "cost_per_write_usd": 0.006056
+    "p95_judge_seconds": 4.57,
+    "cost_per_write_usd": 0.006086
   },
   "population": {
     "n_writes": 1517,
@@ -43,12 +43,89 @@
     "frozen_at": "2026-10-05T10:01:34.841370+00:00",
     "snapshot_sha256": "55398cd73c9a355d05f9454a2e1cca9e7da760bd89df141b2f6b5b8f28293e38"
   },
+  "comparative": {
+    "n_writes": 484,
+    "placeable_writes": 306,
+    "contradiction_writes": 88,
+    "placeable_attaches": 279,
+    "wrong_sibling_misfiles": 22,
+    "wrong_sibling_rate_placeable": 0.0789,
+    "wrong_sibling_rate_wilson95": [
+      0.0526,
+      0.1165
+    ],
+    "no_known_home_attaches": 57,
+    "unclear_attaches": 0,
+    "outcomes": {
+      "status_quo": {
+        "attach_belongs": 0,
+        "contradiction_flagged": 0,
+        "placeable_left_flat": 306,
+        "contradiction_unflagged": 88,
+        "misfile_attach": 0,
+        "contested_misfile": 0,
+        "false_contested": 0
+      },
+      "arm": {
+        "attach_belongs": 161,
+        "contradiction_flagged": 64,
+        "placeable_left_flat": 27,
+        "contradiction_unflagged": 24,
+        "misfile_attach": 46,
+        "contested_misfile": 33,
+        "false_contested": 30
+      }
+    },
+    "harm_weights": {
+      "contested_misfile": 3,
+      "false_contested": 2,
+      "contradiction_unflagged": 2,
+      "misfile_attach": 1,
+      "placeable_left_flat": 0.5
+    },
+    "harm_total": {
+      "status_quo": 329.0,
+      "arm": 266.5
+    },
+    "harm_delta_vs_status_quo": -62.5,
+    "harm_delta_bootstrap95": [
+      -118.5,
+      -6.5
+    ],
+    "bootstrap": {
+      "resamples": 10000,
+      "seed": 6532,
+      "unit": "production-judged write"
+    }
+  },
+  "comparative_rules": {
+    "n_writes": "production-judged writes: judge-band rows whose recon_marker and declares_attach_keys are both false",
+    "placeable_writes": "production-judged writes with at least one pair resolved AGREEING or CORRECTS whose target predates the write (strictly earlier created_at; an undated record is never earlier)",
+    "contradiction_writes": "production-judged writes with at least one pair resolved CORRECTS whose target predates the write",
+    "placeable_attaches": "attaches of placeable writes whose pair resolved AGREEING, CORRECTS or MISFILE",
+    "wrong_sibling_misfiles": "attaches of placeable writes whose pair resolved MISFILE: the write had an earlier home and the arm filed it under another record",
+    "wrong_sibling_rate_placeable": "wrong_sibling_misfiles / placeable_attaches; None when placeable_attaches is 0",
+    "wrong_sibling_rate_wilson95": "Wilson 95% interval (z = 1.96) on wrong_sibling_misfiles of placeable_attaches; None when placeable_attaches is 0",
+    "no_known_home_attaches": "attaches whose pair resolved AGREEING, CORRECTS or MISFILE, of writes that are not placeable",
+    "unclear_attaches": "attaches whose pair resolved UNCLEAR; outside every other figure and every outcome cell",
+    "outcomes": "per regime, the production-judged writes in each cell; one write may fall in two cells. status_quo stores every write flat; arm is what this arm did",
+    "harm_weights": "the weight of each outcome cell, as passed to the scorer; a cell left out weighs 0 (PRD §12 D20, provisional)",
+    "harm_total": "per regime, the sum over cells of harm_weights[cell] x outcomes[regime][cell]; None when n_writes is 0",
+    "harm_delta_vs_status_quo": "harm_total.arm - harm_total.status_quo, on the same writes; at most 0 means no more harm than storing every write flat; None when n_writes is 0",
+    "harm_delta_bootstrap95": "paired bootstrap 95% interval of harm_delta_vs_status_quo, reported and not gated: each production-judged write contributes its arm harm minus its status-quo harm; the writes, ordered by memory_id, are resampled with replacement bootstrap.resamples times from random.Random(bootstrap.seed), and the interval is the nearest-rank 2.5th and 97.5th percentiles of the resampled sums; None when n_writes is 0",
+    "bootstrap": "the settings harm_delta_bootstrap95 was computed with",
+    "attach_belongs": "attached, not filed contested, pair resolved AGREEING",
+    "contradiction_flagged": "filed contested, pair resolved CORRECTS",
+    "placeable_left_flat": "a placeable write stored flat",
+    "contradiction_unflagged": "a contradiction write that was not filed contested against a target resolved CORRECTS, whatever else the regime did with it",
+    "misfile_attach": "attached, not filed contested, pair resolved MISFILE",
+    "contested_misfile": "filed contested, pair resolved MISFILE",
+    "false_contested": "filed contested, pair resolved AGREEING"
+  },
   "provenance": {
-    "arm": "gpt-5.6-terra:none@5",
+    "arm": "gpt-6.1-sol:low@5",
     "reference_arm": "gpt-4o-mini@5",
-    "meets_every_bound": false,
-    "failed_bounds": [
-      "best:quality.misfile_rate_of_attaches <= 0.08"
-    ]
+    "meets_every_bound": true,
+    "failed_bounds": []
   }
 }

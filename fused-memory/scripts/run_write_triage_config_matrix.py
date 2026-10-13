@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
-"""Score every π judge arm with ι and name the configuration Γ3 is asked about.
+"""Score every π2 judge arm with ι and name the configuration Γ3 is asked about.
 
-Task 5807 (μ), plans/write-triage-flip-readiness-prd.md §11 C2''. π
-(``run_write_triage_population_arms.py``) ran each judge arm over one frozen
-population and published ``calibration/write_triage_population.json``. λ rated
-every pair any arm's judge named (``calibration/write_triage_pair_verdicts.jsonl``).
+Task 5807 (μ), plans/write-triage-flip-readiness-prd.md §11 C2'', rerun on
+write-time slates by task 6532 (§12.3 C2‴). π2
+(``run_write_triage_population_arms.py``) ran each judge arm over the
+write-time slates of one frozen population and published
+``calibration/write_triage_population_write_time.json``. λ and λ2 rated every
+pair any arm's judge named (``calibration/write_triage_pair_verdicts.jsonl``).
 This module scores every arm with ι (``score_write_triage_pairs.py::score_pairs``,
-the one definition of the flip metrics), measures it against Γ3's bounds with
-Γ3's own predicate, and picks the winner.
+the one definition of the flip metrics), against the status quo on the same
+writes, measures it against Γ3's bounds with Γ3's own predicate, and picks the
+winner.
 
 Inputs
 ------
-- The π population artifact, whose ``arms`` rows name each arm's settings and
-  its gitignored case file (``cases_path``, ``cases_sha256``).
+- π2's write-time population artifact, whose ``arms`` rows name each arm's
+  settings and its gitignored case file (``cases_path``, ``cases_sha256``),
+  and whose population block pins the frozen snapshot (``snapshot_path``,
+  ``snapshot_sha256``).
 - The λ verdict corpus.
-- The checkout whose ``data/`` holds π's case files (``--data-root``).
+- The checkout whose ``data/`` holds π2's case files and the snapshot
+  (``--data-root``); the snapshot gives every record's instant.
 - Γ3's bounds, each ``--require PATH OP VALUE`` as task 5808's before_done
   args spell them, without the ``best`` report handle.
 - The shipped judge configuration, resolved from the live fused-memory config.
@@ -22,24 +28,27 @@ Inputs
 Outputs
 -------
 - ``calibration/write_triage_config_matrix.json``: one row per π arm with ι's
-  blocks and the bound checks, the arms no route reached, the wording
-  attribution and the winner.
+  blocks and the bound checks, ι's comparative rules once, the arms no route
+  reached, the wording attribution and the winner.
 - ``calibration/write_triage_best_config.json``: the winner's doc, the one Γ3
   reads.
 
 Usage
 -----
-Run from ``fused-memory/``, with one ``--require`` per ``--require best …``
-of task 5808's metadata.before_done.args (two are shown)::
+Run from ``fused-memory/``. The full set of bounds and their thresholds is
+task 5808's metadata.before_done.args: pass one ``--require`` per
+``--require best …`` there, without the ``best`` handle. Two of them, for
+illustration::
 
     uv run python scripts/run_write_triage_config_matrix.py \\
         --data-root /home/leo/src/dark-factory \\
-        --require quality.misfile_rate_of_attaches '<=' 0.08 \\
-        --require quality.unrated_pairs '<=' 0
+        --require comparative.harm_delta_vs_status_quo '<=' 0 \\
+        --require population.n_judge_band '>=' 300
 
-An unrated or tied pair, an arm file that differs from what π published, or
-a population artifact that lacks a key μ reads exits 1 with the reason on
-stderr and writes neither artifact. A failure writing them exits 1 too.
+An unrated or tied pair, an arm file or snapshot that differs from what π2
+published, or a population artifact that lacks a key μ reads exits 1 with the
+reason on stderr and writes neither artifact. A failure writing them exits 1
+too.
 """
 from __future__ import annotations
 
@@ -52,6 +61,7 @@ import sys
 import types
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime
 from itertools import chain
 from pathlib import Path
 from types import MappingProxyType
@@ -94,15 +104,28 @@ def _load_script(path: Path, mod_name: str) -> types.ModuleType:
 
 _scorer = _load_script(_SCRIPTS / 'score_write_triage_pairs.py', 'score_write_triage_pairs')
 _wording = _load_script(_SCRIPTS / 'write_triage_judge_wording.py', 'write_triage_judge_wording')
+_freeze = _load_script(
+    _SCRIPTS / 'freeze_write_triage_population.py', 'freeze_write_triage_population',
+)
+_arms = _load_script(
+    _SCRIPTS / 'run_write_triage_population_arms.py', 'run_write_triage_population_arms',
+)
 _gate = _load_script(
     _REPO_ROOT / 'scripts' / 'check_write_triage_readiness_gate.py',
     'check_write_triage_readiness_gate',
 )
 
-POPULATION_KEYS: tuple[str, ...] = (
-    'n_writes', 'n_judge_band', 'projects', 'frozen_at', 'snapshot_sha256',
-)
-"""The C2'' subset of π's population block that μ's artifacts carry."""
+_C2_SOURCE_KEYS: Mapping[str, str] = MappingProxyType({
+    'n_writes': 'n_writes',
+    'n_judge_band': 'n_judge_band_write_time',
+    'projects': 'projects',
+    'frozen_at': 'frozen_at',
+    'snapshot_sha256': 'snapshot_sha256',
+})
+"""Each population key μ's artifacts carry, and the key of π2's population block it is read from."""
+
+POPULATION_KEYS: tuple[str, ...] = tuple(_C2_SOURCE_KEYS)
+"""The C2'' population keys μ's artifacts carry, read from π2's write-time population block."""
 
 
 class MatrixInputError(ValueError):
@@ -167,7 +190,7 @@ class PiArm:
 
 @dataclass(frozen=True)
 class Population:
-    """π's published population: its population block and its arms, in π's order."""
+    """π2's published population: its population block and its arms, in π2's order."""
 
     block: Mapping[str, Any]
     arms: tuple[PiArm, ...]
@@ -184,7 +207,15 @@ class Population:
             raise MatrixInputError(
                 f'the population artifact is not shaped as π publishes it: {malformed}'
             ) from None
-        absent = [key for key in POPULATION_KEYS if key not in block]
+        slates = block.get('slates')
+        if slates != _arms.Slates.WRITE_TIME:
+            raise MatrixInputError(
+                'μ scores write-time slates (PRD §12 D19); this artifact\'s population.slates'
+                f' is {slates!r}, not {_arms.Slates.WRITE_TIME.value!r}'
+            )
+        absent = [
+            key for key in (*_C2_SOURCE_KEYS.values(), 'snapshot_path') if key not in block
+        ]
         if absent:
             raise MatrixInputError(f'the population artifact\'s population block lacks {absent}')
         names = [arm.name for arm in arms]
@@ -198,7 +229,7 @@ class Population:
         return [arm.name for arm in self.arms]
 
     def c2_block(self) -> dict[str, Any]:
-        return {key: self.block[key] for key in POPULATION_KEYS}
+        return {key: self.block[source] for key, source in _C2_SOURCE_KEYS.items()}
 
 
 def _pi_arm(index: int, row: Mapping[str, Any]) -> PiArm:
@@ -237,6 +268,7 @@ def _read_arm(arm: PiArm, population: Population, data_root: Path) -> list[dict[
     rows = _read_jsonl(path)
     _refuse_foreign_rows(arm, path, rows, 'arm', arm.name)
     _refuse_foreign_rows(arm, path, rows, 'snapshot_sha256', population.block['snapshot_sha256'])
+    _refuse_foreign_rows(arm, path, rows, 'slates', _arms.Slates.WRITE_TIME.value)
     return rows
 
 
@@ -248,6 +280,24 @@ def _refuse_foreign_rows(
         raise MatrixInputError(
             f'arm {arm.name}: {path} holds rows whose {key} is {foreign}, not {expected!r}'
         )
+
+
+def read_record_created_at(population: Population, data_root: Path) -> dict[str, datetime]:
+    """Every record's instant, from the snapshot the population pins and nothing else."""
+    path = Path(data_root) / population.block['snapshot_path']
+    try:
+        snapshot, actual = _freeze.load_snapshot(path)
+    except FileNotFoundError as missing:
+        raise MatrixInputError(
+            f'{missing.filename} does not exist; pass the checkout holding π2\'s data/'
+            ' (e.g. the main checkout) as --data-root'
+        ) from None
+    pinned = population.block['snapshot_sha256']
+    if actual != pinned:
+        raise MatrixInputError(
+            f'{path} has sha256 {actual}, but the population pins snapshot_sha256 {pinned}'
+        )
+    return _freeze.record_created_at(snapshot)
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -305,8 +355,8 @@ SKIPPED_ARMS: tuple[SkippedArm, ...] = (
 
 WINNER_RULE = (
     'fewest failed bounds (scripts/check_write_triage_readiness_gate.py::check_require),'
-    ' so an arm meeting every bound beats every arm that does not; then fewest'
-    ' quality.contested_decision_errors; then lower selection.cost_per_write_usd;'
+    ' so an arm meeting every bound beats every arm that does not; then lowest'
+    ' comparative.harm_delta_vs_status_quo; then lower selection.cost_per_write_usd;'
     ' then arm name'
 )
 
@@ -318,10 +368,13 @@ def build_matrix(
     *,
     shipped: ArmSettings,
     bounds: Sequence[Bound],
+    created_at: Mapping[str, datetime],
 ) -> dict[str, Any]:
-    """Score every π arm with ι, check it against *bounds*, and name the winner.
+    """Score every π2 arm with ι, check it against *bounds*, and name the winner.
 
-    Every arm is paired against the π arm whose settings are *shipped*. An arm
+    Every arm is paired against the π2 arm whose settings are *shipped*, and
+    compared with the status quo on the same writes using *created_at*
+    (:func:`read_record_created_at`) and ι's default harm weights. An arm
     meets a bound exactly when Γ3's ``check_require`` passes on the arm's
     :func:`candidate_doc`, so the winner's best_config passes Γ3 exactly when
     it met every bound here.
@@ -336,6 +389,7 @@ def build_matrix(
     _refuse_scored_and_skipped(population)
     scores = _scorer.score_pairs(
         chain.from_iterable(cases_by_arm.values()), verdicts, reference_arm=reference.name,
+        created_at=created_at,
     )
     _refuse_judge_band_drift(population, scores['arms'])
     block = population.c2_block()
@@ -350,6 +404,7 @@ def build_matrix(
         'population': block,
         'verdict_corpus': scores['verdict_corpus'],
         'list_prices': scores['list_prices'],
+        'comparative_rules': scores['comparative_rules'],
         'arms': scored + [skipped.row() for skipped in SKIPPED_ARMS],
         'wording_attribution': _wording_attribution(population, cases_by_arm, verdicts),
         'selection_rule': {
@@ -363,13 +418,19 @@ def build_matrix(
 
 def candidate_doc(row: Mapping[str, Any], population: Mapping[str, Any]) -> dict[str, Any]:
     """The doc Γ3 reads for one scored arm; the one builder of it."""
-    return {'quality': row['quality'], 'selection': row['selection'], 'population': population}
+    return {
+        'quality': row['quality'],
+        'selection': row['selection'],
+        'population': population,
+        'comparative': row['comparative'],
+    }
 
 
 def best_config(matrix: Mapping[str, Any]) -> dict[str, Any]:
-    """The winner's :func:`candidate_doc`, the doc its bounds were checked on, plus provenance.
+    """The winner's :func:`candidate_doc`, the doc its bounds were checked on, plus context.
 
-    Γ3 reads ``quality``, ``selection`` and ``population``; ``provenance``
+    Γ3 reads ``quality``, ``selection``, ``population`` and ``comparative``;
+    ``comparative_rules`` defines every comparative figure, and ``provenance``
     names the arm and the bounds it failed, which are the checks Γ3 will fail.
     """
     winners = [
@@ -380,6 +441,7 @@ def best_config(matrix: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError(f'the matrix winner {matrix["winner"]!r} names no single scored arm')
     [row] = winners
     return candidate_doc(row, matrix['population']) | {
+        'comparative_rules': matrix['comparative_rules'],
         'provenance': {
             'arm': row['arm'],
             'reference_arm': matrix['reference_arm'],
@@ -403,11 +465,12 @@ def select_winner(rows: Sequence[Mapping[str, Any]]) -> tuple[str, bool]:
     return winner['arm'], not winner['bounds']['met']
 
 
-def _rank(row: Mapping[str, Any]) -> tuple[int, int, float, str]:
+def _rank(row: Mapping[str, Any]) -> tuple[int, float, float, str]:
+    delta = row['comparative']['harm_delta_vs_status_quo']
     cost = row['selection']['cost_per_write_usd']
     return (
         len(_failed_bounds(row)),
-        row['quality']['contested_decision_errors'],
+        math.inf if delta is None else delta,
         math.inf if cost is None else cost,
         row['arm'],
     )
@@ -475,7 +538,7 @@ def _paired_against(
 
 
 def _refuse_judge_band_drift(population: Population, scored: Mapping[str, Any]) -> None:
-    published = population.block['n_judge_band']
+    published = population.c2_block()['n_judge_band']
     for arm in population.arms:
         held = scored[arm.name]['population']['n_judge_band']
         if held != published:
@@ -511,6 +574,7 @@ def _scored_row(arm: PiArm, iota: Mapping[str, Any]) -> dict[str, Any]:
         'quality': iota['quality'],
         'runtime': runtime,
         'paired_vs_reference': iota['paired_vs_reference'],
+        'comparative': iota['comparative'],
     }
 
 
@@ -526,8 +590,9 @@ def _build_parser() -> LoudArgumentParser:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        '--population', type=Path, default=_CALIBRATION / 'write_triage_population.json',
-        help="π's published population artifact",
+        '--population', type=Path,
+        default=_CALIBRATION / 'write_triage_population_write_time.json',
+        help="π2's published write-time population artifact",
     )
     parser.add_argument(
         '--verdicts', type=Path, default=_CALIBRATION / 'write_triage_pair_verdicts.jsonl',
@@ -535,7 +600,8 @@ def _build_parser() -> LoudArgumentParser:
     )
     parser.add_argument(
         '--data-root', type=Path, required=True,
-        help="the checkout whose gitignored data/ holds π's arm files, e.g. the main checkout",
+        help="the checkout whose gitignored data/ holds π2's arm files and snapshot,"
+             ' e.g. the main checkout',
     )
     parser.add_argument(
         '--require', action='append', nargs=3, required=True,
@@ -558,6 +624,7 @@ def _compute(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
         _read_jsonl(args.verdicts),
         shipped=shipped_settings(types.SimpleNamespace(config=FusedMemoryConfig())),
         bounds=[Bound(*spec) for spec in args.require],
+        created_at=read_record_created_at(population, args.data_root),
     ) | {'inputs': _inputs(args.population, args.verdicts)}
     return matrix, best_config(matrix)
 

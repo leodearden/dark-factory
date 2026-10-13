@@ -582,6 +582,17 @@ def _caller_label(
 #: condition an operator triages differently.
 MARKUP_BOUNDARY_STORM_CATEGORY = 'mcp_markup_boundary_storm'
 
+#: Where an operator takes a recurrence of the envelope-markup leak: the live
+#: PRD, never DF 3083, which is done and closed to appends. Interpolated by
+#: this module's storm ERROR line and by the storm and residue text of
+#: fused-memory's markup_guard and markup_tripwire and orchestrator's
+#: markup_sink. The escalation server's filers still keep their own copy
+#: (task 6732).
+MARKUP_RECURRENCE_ROUTING = (
+    'report the recurrence against plans/toolcall-markup-containment-prd.md '
+    '(DF 3083 is done and closed to appends, so not against 3083)'
+)
+
 #: Surfaced on the FORWARDED call, whose caller is NOT bounced and would
 #: otherwise have no way to learn that its arguments were altered.
 _FORWARD_HINT = (
@@ -610,13 +621,8 @@ _UNRECOVERED_HINT = (
 #: ``_ESCALATION_OWNER``, which is the queue owner a residue record names.
 _OWNER = 'markup guard'
 
-#: Where the storm ERROR line routes an operator: the live PRD, never DF 3083,
-#: which is done and closed to appends (task 4467).
-_STORM_LOG_ADVICE = (
-    'the serialization leak is ACTIVE (report the recurrence against '
-    'plans/toolcall-markup-containment-prd.md — DF 3083 is done and closed to '
-    'appends, so not against 3083)'
-)
+#: The storm ERROR line's advice, derived from MARKUP_RECURRENCE_ROUTING.
+_STORM_LOG_ADVICE = f'the serialization leak is ACTIVE; {MARKUP_RECURRENCE_ROUTING}'
 
 
 class RepairPolicy(enum.StrEnum):

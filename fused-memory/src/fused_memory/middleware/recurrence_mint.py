@@ -4,7 +4,8 @@ docs/prds/recurring-deterministic-tasks.md R-D2/R-D3: completing a carrier
 link ``done`` mints exactly one pending successor (C-3), never while another
 non-terminal link of the same chain exists (C-2), firing ``interval_secs``
 after the predecessor's persisted terminal time (C-6). A mint failure is
-logged and never fails the status write that triggered it.
+logged, never fails the status write that triggered it, and is repaired by
+the re-mint sweep.
 """
 
 from __future__ import annotations
@@ -12,34 +13,44 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
+from shared.recurrence_chains import current_links, recurrence_key
 from shared.task_metadata import Recurrence
 from shared.task_statuses import ACTIVE, TaskStatus
 
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.middleware.deterministic_task_guard import deterministic_task_error
+from fused_memory.models.scope import is_phantom_project_root
 
 __all__ = [
     'RECURRENCE_MINT_SOURCE',
+    'REMINT_SWEEP_INTERVAL_SECS',
+    'BrokenChain',
     'MintOutcome',
     'MintOutcomeKind',
+    'MintTrigger',
+    'broken_chains',
     'mint_successor',
     'mints_successor',
+    'remint_broken_chain',
+    'run_remint_sweep_loop',
 ]
 
 logger = logging.getLogger(__name__)
 
 RECURRENCE_MINT_SOURCE = 'recurrence-mint'
+REMINT_SWEEP_INTERVAL_SECS: float = 3600.0
 
 
 class MintOutcomeKind(StrEnum):
     MINTED = 'minted'
     SKIPPED_EXISTING_LINK = 'skipped_existing_link'
+    SKIPPED_NOT_BROKEN = 'skipped_not_broken'
     FAILED = 'failed'
 
 
@@ -48,6 +59,20 @@ class MintOutcome:
     kind: MintOutcomeKind
     successor_id: str | None = None
     detail: str | None = None
+
+
+class MintTrigger(StrEnum):
+    DONE_WRITE = 'done_write'
+    REMINT_SWEEP = 'remint_sweep'
+
+
+@dataclass(frozen=True)
+class BrokenChain:
+    """A chain whose current link *link_id* is done, with no live link of *key* in *tag*."""
+
+    key: str
+    tag: str
+    link_id: str
 
 
 @dataclass(frozen=True)
@@ -64,18 +89,17 @@ def _metadata_of(task: object) -> Mapping[str, Any]:
     return metadata if isinstance(metadata, Mapping) else {}
 
 
-def _recurrence_of(task: object) -> Mapping[str, Any]:
-    recurrence = _metadata_of(task).get('recurrence')
-    return recurrence if isinstance(recurrence, Mapping) else {}
-
-
 def mints_successor(new_status: str, predecessor: object) -> bool:
     """True iff writing *new_status* onto *predecessor* must mint the chain's next link.
 
-    Only ``done`` on a recurrence carrier qualifies: ``cancelled`` ends the
-    chain and a non-terminal status leaves it alone (C-2).
+    Only ``done`` on a chain link qualifies: ``cancelled`` ends the chain and
+    a non-terminal status leaves it alone (C-2).
     """
-    return new_status == TaskStatus.DONE and bool(_recurrence_of(predecessor))
+    return (
+        new_status == TaskStatus.DONE
+        and isinstance(predecessor, Mapping)
+        and recurrence_key(predecessor) is not None
+    )
 
 
 def _run_label(at: str) -> str:
@@ -127,7 +151,7 @@ async def _existing_link_id(
 ) -> str | None:
     active = await tm.get_tasks(project_root, tag, statuses=sorted(s.value for s in ACTIVE))
     for task in active['tasks']:
-        if _recurrence_of(task).get('key') == key:
+        if recurrence_key(task) == key:
             return str(task['id'])
     return None
 
@@ -137,7 +161,7 @@ def _failed(
 ) -> MintOutcome:
     logger.error(
         'recurrence_mint_failed: predecessor=%s key=%s reason=%s',
-        predecessor_id, _recurrence_of(predecessor).get('key'), reason, exc_info=exc_info,
+        predecessor_id, recurrence_key(predecessor), reason, exc_info=exc_info,
     )
     return MintOutcome(MintOutcomeKind.FAILED, detail=reason)
 
@@ -197,9 +221,31 @@ async def mint_successor(
     ``recurrence_mint_failed:`` ERROR line; cancellation logs that same line
     and is re-raised.
     """
+    return await _locked_mint(
+        tm,
+        write_lock=write_lock,
+        predecessor_id=predecessor_id,
+        project_root=project_root,
+        tag=tag,
+        precheck=None,
+    )
+
+
+async def _locked_mint(
+    tm: TaskBackendProtocol,
+    *,
+    write_lock: asyncio.Lock,
+    predecessor_id: str,
+    project_root: str,
+    tag: str | None,
+    precheck: Callable[[], Awaitable[MintOutcome | None]] | None,
+) -> MintOutcome:
+    """:func:`mint_successor`, first running *precheck* under the lock; its outcome skips the mint."""
     predecessor: Mapping[str, Any] = {}
     try:
         async with write_lock:
+            if precheck is not None and (skipped := await precheck()) is not None:
+                return skipped
             predecessor = await tm.get_task(predecessor_id, project_root, tag)
             return await _mint(
                 tm,
@@ -213,3 +259,89 @@ async def mint_successor(
         raise
     except Exception as exc:
         return _failed(predecessor_id, predecessor, f'{type(exc).__name__}: {exc}', exc_info=True)
+
+
+async def broken_chains(tm: TaskBackendProtocol, project_root: str) -> tuple[BrokenChain, ...]:
+    """Every chain in *project_root*, across all tags, whose current link is done.
+
+    A done current link means its mint failed or never ran (a crash between
+    the done write and the mint). Read-only and lock-free: each repair
+    re-reads its chain under the write lock.
+    """
+    broken: list[BrokenChain] = []
+    for tag in await tm.list_tags(project_root):
+        broken.extend(await _broken_chains_in_tag(tm, project_root, tag))
+    return tuple(broken)
+
+
+async def _broken_chains_in_tag(
+    tm: TaskBackendProtocol, project_root: str, tag: str,
+) -> list[BrokenChain]:
+    rows = (await tm.get_tasks(project_root, tag))['tasks']
+    return [
+        BrokenChain(key=key, tag=tag, link_id=str(link['id']))
+        for key, link in current_links(rows).items()
+        if link['status'] == TaskStatus.DONE
+    ]
+
+
+async def _skip_unless_still_broken(
+    tm: TaskBackendProtocol, chain: BrokenChain, project_root: str,
+) -> MintOutcome | None:
+    if chain in await _broken_chains_in_tag(tm, project_root, chain.tag):
+        return None
+    logger.info(
+        'recurrence_remint_skipped: predecessor=%s key=%s reason=no_longer_broken',
+        chain.link_id, chain.key,
+    )
+    return MintOutcome(MintOutcomeKind.SKIPPED_NOT_BROKEN)
+
+
+async def remint_broken_chain(
+    tm: TaskBackendProtocol,
+    *,
+    write_lock: asyncio.Lock,
+    chain: BrokenChain,
+    project_root: str,
+) -> MintOutcome:
+    """Mint *chain*'s missing successor if it is still broken under *write_lock*, logging each repair.
+
+    *chain* came from a lock-free read, so its tag is read again under the
+    lock: a link reopened, renewed or superseded since then is left alone.
+    """
+    outcome = await _locked_mint(
+        tm,
+        write_lock=write_lock,
+        predecessor_id=chain.link_id,
+        project_root=project_root,
+        tag=chain.tag,
+        precheck=lambda: _skip_unless_still_broken(tm, chain, project_root),
+    )
+    if outcome.kind is MintOutcomeKind.MINTED:
+        logger.warning(
+            'recurrence_remint: predecessor=%s key=%s successor=%s project_root=%s tag=%s',
+            chain.link_id, chain.key, outcome.successor_id, project_root, chain.tag,
+        )
+    return outcome
+
+
+async def run_remint_sweep_loop(
+    remint: Callable[[str], Awaitable[object]],
+    project_roots: Iterable[str],
+    *,
+    interval_secs: float = REMINT_SWEEP_INTERVAL_SECS,
+) -> None:
+    """Sweep every non-phantom root at once, then every *interval_secs*, until cancelled.
+
+    A phantom root is skipped because reading it would create its task store.
+    """
+    roots = tuple(project_roots)
+    while True:
+        for root in roots:
+            if await asyncio.to_thread(is_phantom_project_root, root):
+                continue
+            try:
+                await remint(root)
+            except Exception:
+                logger.exception('recurrence_remint_sweep_failed: project_root=%s', root)
+        await asyncio.sleep(interval_secs)

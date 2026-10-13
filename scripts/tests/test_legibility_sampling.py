@@ -1,22 +1,31 @@
 """Tests for scripts/legibility/sampling.py — zero-LLM signal scorer +
 stratified budget sampler (PRD §5.2 point 2, contract §7.4, boundary test §8.4).
 
-Self-contained: does not import task α's ``digest.py``. Imported as
-``from legibility import sampling`` (PEP-420 namespace package; see
-test_legibility_config.py's module docstring for the import mechanics).
+Imports ``digest.py`` for the sampler-vs-digest parity pins over the
+classifiers the two share. Imported as ``from legibility import sampling``
+(PEP-420 namespace package; see test_legibility_config.py's module docstring
+for the import mechanics).
 """
 from __future__ import annotations
 
 import dataclasses
 import json
 import textwrap
+import weakref
 from datetime import date as dt_date
 from pathlib import Path
 
 import pytest
-from legibility import coder, digest, inventory
+from legibility import coder, detectors, digest, inventory
 from legibility import config as config_mod
 from legibility import sampling as mod
+from legibility.detectors import AgentClass, SignalClass
+from legibility_carrier_fixtures import (
+    PROSE_QUOTING_THE_SCHEMA,
+    briefing_text,
+    coder_judgment,
+    json_fenced,
+)
 
 MAIN_CWD = '/home/leo/src/dark-factory'
 
@@ -68,19 +77,16 @@ def _self_correct_record() -> dict:
 
 
 def _df_guard_record() -> dict:
-    # mcp__plan-tools__report_false_premise is a real dark_factory guard
-    # tool (orchestrator/src/orchestrator/mcp/plan_tools.py) — a structural
-    # tool_use.name match, not a text/substring guess.
     return {
-        'type': 'assistant',
+        'type': 'user',
         'timestamp': '2026-07-13T10:03:00.000Z',
         'message': {
             'content': [
                 {
-                    'type': 'tool_use',
-                    'id': 'tu1',
-                    'name': 'mcp__plan-tools__report_false_premise',
-                    'input': {'task_id': '2573', 'reason': 'premise invalid'},
+                    'type': 'tool_result',
+                    'tool_use_id': 'tu1',
+                    'is_error': False,
+                    'content': 'BLOCKED: merge gate refused',
                 },
             ]
         },
@@ -119,28 +125,28 @@ class TestScoreSignalsAllClasses:
         )
 
     def test_tool_error(self, tmp_path):
-        assert mod.score_signals(self._build(tmp_path)).tool_error == 1
+        assert mod.score_signals(self._build(tmp_path))[SignalClass.TOOL_ERROR] == 1
 
     def test_not_found(self, tmp_path):
-        assert mod.score_signals(self._build(tmp_path)).not_found == 1
+        assert mod.score_signals(self._build(tmp_path))[SignalClass.NOT_FOUND] == 1
 
     def test_self_correct(self, tmp_path):
-        assert mod.score_signals(self._build(tmp_path)).self_correct == 1
+        assert mod.score_signals(self._build(tmp_path))[SignalClass.SELF_CORRECT] == 1
 
     def test_df_guard(self, tmp_path):
-        assert mod.score_signals(self._build(tmp_path)).df_guard == 1
+        assert mod.score_signals(self._build(tmp_path))[SignalClass.DF_GUARD] == 1
 
     def test_interrupt(self, tmp_path):
-        assert mod.score_signals(self._build(tmp_path)).interrupt == 1
+        assert mod.score_signals(self._build(tmp_path))[SignalClass.INTERRUPT] == 1
 
     def test_total_signal_is_sum_of_classes(self, tmp_path):
         counts = mod.score_signals(self._build(tmp_path))
         assert counts.total_signal == (
-            counts.tool_error
-            + counts.not_found
-            + counts.self_correct
-            + counts.df_guard
-            + counts.interrupt
+            counts[SignalClass.TOOL_ERROR]
+            + counts[SignalClass.NOT_FOUND]
+            + counts[SignalClass.SELF_CORRECT]
+            + counts[SignalClass.DF_GUARD]
+            + counts[SignalClass.INTERRUPT]
         )
         assert counts.total_signal == 5
 
@@ -201,8 +207,8 @@ class TestSamplerDesignedOutcomeParity:
 
         counts = mod.score_signals(path)
 
-        assert counts.tool_error == 0
-        assert counts.designed_outcome == 13
+        assert counts[SignalClass.TOOL_ERROR] == 0
+        assert counts[SignalClass.DESIGNED_OUTCOME] == 13
 
     def test_genuine_failure_still_increments_tool_error(self, tmp_path):
         path = _write_transcript(
@@ -212,8 +218,8 @@ class TestSamplerDesignedOutcomeParity:
 
         counts = mod.score_signals(path)
 
-        assert counts.tool_error == 1
-        assert counts.designed_outcome == 3
+        assert counts[SignalClass.TOOL_ERROR] == 1
+        assert counts[SignalClass.DESIGNED_OUTCOME] == 3
 
     def test_total_signal_excludes_designed_outcome(self, tmp_path):
         # total_signal is the sampler's RANKING scale over the five scored
@@ -227,8 +233,8 @@ class TestSamplerDesignedOutcomeParity:
         base_counts = mod.score_signals(base)
         noisy_counts = mod.score_signals(noisy)
 
-        assert noisy_counts.designed_outcome == 9
-        assert base_counts.designed_outcome == 0
+        assert noisy_counts[SignalClass.DESIGNED_OUTCOME] == 9
+        assert base_counts[SignalClass.DESIGNED_OUTCOME] == 0
         assert noisy_counts.total_signal == base_counts.total_signal == 1
 
     def test_ceiling_only_session_is_dropped_before_digest_time(self):
@@ -240,8 +246,8 @@ class TestSamplerDesignedOutcomeParity:
         # scope of the claim is exactly what a reader would otherwise
         # over-read.
         records = [
-            _scored('ceilings-only', 'watcher', mod.SignalCounts(designed_outcome=13), 'poll'),
-            _scored('real-signal', 'watcher', mod.SignalCounts(tool_error=1), 'boom'),
+            _scored('ceilings-only', 'watcher', mod.SignalCounts.of(designed_outcome=13), 'poll'),
+            _scored('real-signal', 'watcher', mod.SignalCounts.of(tool_error=1), 'boom'),
         ]
         config = config_mod.LegibilityConfig(
             project_id='dark_factory',
@@ -270,8 +276,8 @@ class TestSamplerDesignedOutcomeParity:
 
         counts = mod.score_signals(path)
 
-        assert counts.tool_error == 1
-        assert counts.designed_outcome == 0
+        assert counts[SignalClass.TOOL_ERROR] == 1
+        assert counts[SignalClass.DESIGNED_OUTCOME] == 0
         assert counts.total_signal == 1
 
     def test_sampler_and_digest_agree_on_the_same_records(self, tmp_path):
@@ -287,8 +293,39 @@ class TestSamplerDesignedOutcomeParity:
         sampled = mod.score_signals(path)
         digested = digest.signal_counts(records)
 
-        assert sampled.tool_error == digested['tool_error'] == 1
-        assert sampled.designed_outcome == digested['designed_outcome'] == 3
+        assert sampled[SignalClass.TOOL_ERROR] == digested['tool_error'] == 1
+        assert sampled[SignalClass.DESIGNED_OUTCOME] == digested['designed_outcome'] == 3
+
+
+class TestSignalCounts:
+    def test_every_class_absent_from_the_mapping_counts_zero(self):
+        counts = mod.SignalCounts({SignalClass.NOT_FOUND: 2})
+
+        assert dict(counts) == {**dict.fromkeys(SignalClass, 0), SignalClass.NOT_FOUND: 2}
+
+    def test_a_key_that_is_not_a_signal_class_is_rejected(self):
+        with pytest.raises(TypeError, match='tool_error'):
+            mod.SignalCounts(json.loads('{"tool_error": 1}'))
+
+    def test_the_counts_do_not_follow_the_callers_mapping(self):
+        source = {SignalClass.TOOL_ERROR: 1}
+        counts = mod.SignalCounts(source)
+
+        source[SignalClass.TOOL_ERROR] = 9
+
+        assert counts[SignalClass.TOOL_ERROR] == 1
+
+    def test_of_names_classes_by_value(self):
+        assert mod.SignalCounts.of(tool_error=1) == mod.SignalCounts({SignalClass.TOOL_ERROR: 1})
+
+    def test_of_rejects_an_unknown_class_name_naming_the_vocabulary(self):
+        with pytest.raises(ValueError, match='bogus') as raised:
+            mod.SignalCounts.of(bogus=1)
+
+        assert all(signal.value in str(raised.value) for signal in SignalClass)
+
+    def test_of_with_no_names_maps_every_class_to_zero(self):
+        assert dict(mod.SignalCounts.of()) == dict.fromkeys(SignalClass, 0)
 
 
 class TestScoreSignalsClean:
@@ -296,83 +333,15 @@ class TestScoreSignalsClean:
         path = _write_transcript(tmp_path / 'clean.jsonl', [_clean_record(i) for i in range(3)])
         counts = mod.score_signals(path)
         assert counts.total_signal == 0
-        assert counts.tool_error == 0
-        assert counts.not_found == 0
-        assert counts.self_correct == 0
-        assert counts.df_guard == 0
-        assert counts.interrupt == 0
+        assert counts[SignalClass.TOOL_ERROR] == 0
+        assert counts[SignalClass.NOT_FOUND] == 0
+        assert counts[SignalClass.SELF_CORRECT] == 0
+        assert counts[SignalClass.DF_GUARD] == 0
+        assert counts[SignalClass.INTERRUPT] == 0
 
 
 def _user_turn(text: str) -> dict:
     return {'type': 'user', 'isSidechain': False, 'message': {'content': text}}
-
-
-class TestClassifyAgentClass:
-    """classify_agent_class(record, path) maps to the 5 strata. *record* is
-    the session's already-located first non-sidechain, non-meta user turn
-    (or None); *path*'s PARENT DIRECTORY NAME is the encoded dir — its
-    shape is checked first, before any content marker.
-    """
-
-    MAIN_DIR_PATH = Path('/root/-home-leo-src-dark-factory/sess.jsonl')
-
-    def test_worktrees_encoded_dir_is_orchestrated_task(self):
-        path = Path('/root/-home-leo-src-dark-factory--worktrees-2573/sess.jsonl')
-        assert mod.classify_agent_class(_user_turn('anything'), path) == 'orchestrated-task'
-
-    def test_claude_worktrees_variant_is_orchestrated_task(self):
-        path = Path('/root/-home-leo-src-dark-factory--claude-worktrees-fix-foo/sess.jsonl')
-        assert mod.classify_agent_class(_user_turn('anything'), path) == 'orchestrated-task'
-
-    def test_reify_warm_lane_worktree_is_orchestrated_task(self):
-        # Faithful encoding of /home/leo/src/reify/.warm-lanes/worktrees/5187
-        # (encode_cwd maps '/', '.' and '_' all to '-'), embedding the
-        # '-warm-lanes-worktrees-' substring (task 2612).
-        path = Path('/root/-home-leo-src-reify--warm-lanes-worktrees-5187/sess.jsonl')
-        assert mod.classify_agent_class(_user_turn('anything'), path) == 'orchestrated-task'
-
-    def test_reify_build_worktree_is_orchestrated_task(self):
-        # Embeds the '-reify-build-worktrees-' substring (task 2612).
-        path = Path('/root/-home-leo-src-reify-build-worktrees-abc/sess.jsonl')
-        assert mod.classify_agent_class(_user_turn('anything'), path) == 'orchestrated-task'
-
-    def test_reconciliation_run_header_is_recon(self):
-        text = '## Reconciliation Run\nStage 1: sync\n'
-        assert mod.classify_agent_class(_user_turn(text), self.MAIN_DIR_PATH) == 'recon'
-
-    def test_stage_2_task_knowledge_sync_header_is_recon(self):
-        # Real marker observed in ~/.claude/projects transcripts (task 2573 premise research).
-        text = '## Stage 2: Task-Knowledge Sync\n## Project: know_live\n'
-        assert mod.classify_agent_class(_user_turn(text), self.MAIN_DIR_PATH) == 'recon'
-
-    def test_memory_consolidator_marker_is_recon(self):
-        text = 'Invoking memory_consolidator for this pass.'
-        assert mod.classify_agent_class(_user_turn(text), self.MAIN_DIR_PATH) == 'recon'
-
-    def test_recon_escalation_watcher_marker_is_watcher(self):
-        # skills/recon-escalation-watcher is a real dark_factory skill.
-        text = '<command-name>recon-escalation-watcher</command-name>'
-        assert mod.classify_agent_class(_user_turn(text), self.MAIN_DIR_PATH) == 'watcher'
-
-    def test_curator_classifier_marker_is_curator_classifier(self):
-        # Verbatim opening of TRIAGE_SYSTEM_PROMPT
-        # (orchestrator/src/orchestrator/agents/triage.py:131).
-        text = 'You are a review suggestion classifier. You receive a numbered list...'
-        assert mod.classify_agent_class(_user_turn(text), self.MAIN_DIR_PATH) == 'curator-classifier'
-
-    def test_main_dir_freeform_human_turn_is_interactive(self):
-        text = 'Can you help me fix this bug in the parser?'
-        assert mod.classify_agent_class(_user_turn(text), self.MAIN_DIR_PATH) == 'interactive'
-
-    def test_none_record_defaults_to_interactive(self):
-        assert mod.classify_agent_class(None, self.MAIN_DIR_PATH) == 'interactive'
-
-    def test_worktree_shape_wins_over_content_markers(self):
-        # Encoded-dir shape is checked FIRST — even a recon-marker turn in
-        # a worktree dir classifies as orchestrated-task, not recon.
-        path = Path('/root/-home-leo-src-dark-factory--worktrees-2573/sess.jsonl')
-        text = '## Reconciliation Run\n'
-        assert mod.classify_agent_class(_user_turn(text), path) == 'orchestrated-task'
 
 
 def _queue_operation_record() -> dict:
@@ -381,6 +350,10 @@ def _queue_operation_record() -> dict:
 
 def _with_session(record: dict, session_id: str, *, cwd: str = MAIN_CWD) -> dict:
     return {**record, 'sessionId': session_id, 'cwd': cwd}
+
+
+class _WeakRecord(dict):
+    """A transcript record a test can hold a weak reference to."""
 
 
 class TestScanTranscript:
@@ -401,8 +374,8 @@ class TestScanTranscript:
         scan = mod.scan_transcript(path)
         assert scan.counts == mod.score_signals(path)
         assert scan.counts.total_signal > 0
-        assert scan.first_turn is not None
-        assert scan.first_turn['message']['content'] == 'Please do the thing #0.'
+        assert scan.first_turn_text == 'Please do the thing #0.'
+        assert scan.agent_class is AgentClass.INTERACTIVE
 
     def test_scan_is_frozen(self, tmp_path):
         scan = mod.scan_transcript(self._signal_transcript(tmp_path))
@@ -420,7 +393,7 @@ class TestScanTranscript:
         sidechain = {**_with_session(_clean_record(0), 'parent-sess'), 'isSidechain': True}
         path = _write_transcript(tmp_path / 'agent-a1b2.jsonl', [sidechain])
         scan = mod.scan_transcript(path)
-        assert scan.first_turn is None
+        assert scan.first_turn_text == ''
         assert scan.session_id == 'parent-sess'
 
     @pytest.mark.parametrize('sidechain', [False, True])
@@ -434,10 +407,42 @@ class TestScanTranscript:
         frontmatter = coder.parse_frontmatter(digest.build_digest(path))
         assert mod.scan_transcript(path).session_id == frontmatter['session']
 
+    def test_no_earlier_record_is_still_held_when_the_next_is_read(self, tmp_path, monkeypatch):
+        records = [
+            _with_session(_clean_record(0), 'sess-stream'),
+            _tool_error_record(),
+            _not_found_record(),
+            _self_correct_record(),
+        ]
+        still_held: list[int] = []
+
+        def streamed(_path):
+            refs: list[weakref.ref] = []
+            for record in records:
+                still_held.append(sum(ref() is not None for ref in refs[:-1]))
+                refs.append(weakref.ref(fresh := _WeakRecord(record)))
+                yield fresh
+                del fresh
+
+        monkeypatch.setattr(mod, 'iter_json_lines', streamed)
+        scan = mod.scan_transcript(tmp_path / 'sess-stream.jsonl')
+
+        assert still_held == [0] * len(records)
+        assert scan.counts == mod.SignalCounts.of(tool_error=1, not_found=1, self_correct=1)
+        assert scan.first_turn_text == 'Please do the thing #0.'
+
+    def test_a_read_failing_midway_degrades_to_an_empty_scan(self, tmp_path):
+        path = _write_transcript(tmp_path / 's.jsonl', [_tool_error_record(), _not_found_record()])
+        with path.open('ab') as f:
+            f.write(b'\xff\xfe not utf-8\n')
+
+        assert mod.scan_transcript(path) == mod.scan_transcript(tmp_path / 'missing.jsonl')
+
     def test_unreadable_path_degrades_to_an_empty_scan(self, tmp_path):
         scan = mod.scan_transcript(tmp_path / 'missing.jsonl')
-        assert scan.counts == mod.SignalCounts()
-        assert scan.first_turn is None
+        assert scan.counts == mod.SignalCounts.of()
+        assert scan.agent_class is AgentClass.UNKNOWN
+        assert scan.first_turn_text == ''
         assert scan.session_id is None
 
 
@@ -494,14 +499,204 @@ class TestScoreSession:
 
         scan = mod.scan_transcript(path)
         assert scored.session is session
-        assert scored.stratum == mod.classify_agent_class(scan.first_turn, path)
+        assert scored.stratum == scan.agent_class
         assert scored.stratum == 'orchestrated-task'
         assert scored.counts == scan.counts
         assert scored.first_turn_text == 'Please do the thing #3.'
         assert scored.session_id == 'sess-1'
 
     def test_scored_record_session_id_defaults_to_none(self):
-        assert _scored('s', 'interactive', mod.SignalCounts(), '').session_id is None
+        assert _scored('s', 'interactive', mod.SignalCounts.of(), '').session_id is None
+
+
+# ---------------------------------------------------------------------------
+# Re-ingested and non-human carriers (task 5693): the sampler's TEXT classes
+# ask digest's one carrier predicate, so a session whose only signal is
+# quoted machine content or harness material is not ranked on it.
+# ---------------------------------------------------------------------------
+
+_TEXT_CLASSES = (
+    SignalClass.SELF_CORRECT, SignalClass.NOT_FOUND, SignalClass.DF_GUARD, SignalClass.INTERRUPT,
+)
+
+_SIGNAL_LITERALS = (
+    "that's wrong",
+    'No such file or directory',
+    'done_gate_missing_files',
+    '[Request interrupted by user]',
+)
+_LITERAL_LINE = ' / '.join(_SIGNAL_LITERALS)
+"""One carrier quoting a hit for every sampler text class."""
+
+_GENUINE_SELF_CORRECTION = "That's wrong: the lease was stale."
+
+
+def _origin_stamped(record: dict, kind: str) -> dict:
+    return {**record, 'origin': {'kind': kind}}
+
+
+def _assistant_texts(*texts: str) -> dict:
+    return {
+        'type': 'assistant',
+        'message': {'content': [{'type': 'text', 'text': text} for text in texts]},
+    }
+
+
+def _tool_result_block(content: str, *, is_error: bool = False) -> dict:
+    return {'type': 'tool_result', 'tool_use_id': 'tu-r', 'is_error': is_error, 'content': content}
+
+
+def _user_blocks(*blocks: dict) -> dict:
+    return {'type': 'user', 'isSidechain': False, 'message': {'content': list(blocks)}}
+
+
+def _trickle_coder_prompt_turn() -> dict:
+    digest_text = '\n'.join(
+        f'- (turn {turn}) {literal}' for turn, literal in enumerate(_SIGNAL_LITERALS)
+    )
+    return _user_turn(
+        coder.build_prompt(digest_text=digest_text, codebook_index='', invariant_slugs=())
+    )
+
+
+def _stamped_tool_result_record() -> dict:
+    return _origin_stamped(
+        _user_blocks(_tool_result_block(
+            'BLOCKED: merge gate refused the branch\ncat: x: No such file or directory'
+        )),
+        'task-notification',
+    )
+
+
+def _text_class_counts(tmp_path: Path, records: list[dict]) -> dict[SignalClass, int]:
+    counts = dict(mod.score_signals(_write_transcript(tmp_path / 's.jsonl', records)))
+    return {name: counts[name] for name in _TEXT_CLASSES}
+
+
+def _session_on_disk(encoded: Path, name: str, records: list[dict]) -> inventory.SessionRecord:
+    path = _write_transcript(encoded / f'{name}.jsonl', records)
+    return inventory.SessionRecord(
+        path=path, encoded_dir=encoded.name, cwd=MAIN_CWD,
+        date=dt_date(2026, 7, 13), size_bytes=path.stat().st_size,
+    )
+
+
+class TestReingestedContentIsNotScored:
+    @pytest.mark.parametrize('records', [
+        pytest.param([_assistant_texts(coder_judgment(_LITERAL_LINE))], id='coder_judgment'),
+        pytest.param([_assistant_texts(json_fenced(coder_judgment(_LITERAL_LINE)))], id='json_fenced_coder_judgment'),
+        pytest.param([_trickle_coder_prompt_turn()], id='trickle_coder_prompt'),
+        pytest.param([_user_turn(briefing_text(_LITERAL_LINE))], id='briefing'),
+        pytest.param(
+            [_origin_stamped(_user_turn(_LITERAL_LINE), 'task-notification')],
+            id='non_human_origin_text',
+        ),
+        pytest.param([_stamped_tool_result_record()], id='non_human_origin_tool_result'),
+    ])
+    def test_a_non_dialogue_carrier_scores_no_text_class(self, tmp_path, records):
+        assert _text_class_counts(tmp_path, records) == dict.fromkeys(_TEXT_CLASSES, 0)
+
+    def test_a_trickle_coder_session_is_dropped_as_zero_signal(self, tmp_path):
+        encoded = tmp_path / '-home-leo-src-dark-factory'
+        encoded.mkdir()
+        sessions = [
+            _session_on_disk(encoded, 'coder-run', [
+                _trickle_coder_prompt_turn(), _assistant_texts(coder_judgment(_LITERAL_LINE)),
+            ]),
+            _session_on_disk(encoded, 'real-signal', [_clean_record(0), _not_found_record()]),
+        ]
+        config = config_mod.LegibilityConfig(
+            project_id='dark_factory',
+            project_root='/home/leo/src/dark-factory',
+            escalation_port=8103,
+            cwd_prefixes=['/home/leo/src/dark-factory'],
+            budgets=config_mod.Budgets(max_daily_digest_bytes=405_000),
+            sampling=config_mod.Sampling(top_fraction=0.12, per_stratum_min=2),
+        )
+
+        scored = [mod.score_session(session) for session in sessions]
+        result = mod.stratified_sample(scored, config)
+
+        assert scored[0].counts.total_signal == 0
+        assert result.zero_signal_dropped == 1
+        assert {r.path.stem for r in result.selected} == {'real-signal'}
+
+    def test_prose_quoting_the_schema_inline_still_self_corrects(self, tmp_path):
+        records = [_assistant_texts(PROSE_QUOTING_THE_SCHEMA)]
+
+        assert _text_class_counts(tmp_path, records)[SignalClass.SELF_CORRECT] == 1
+
+    def test_a_coder_judgment_block_does_not_mask_a_sibling_self_correction(self, tmp_path):
+        records = [_assistant_texts(coder_judgment(_LITERAL_LINE), _GENUINE_SELF_CORRECTION)]
+
+        assert _text_class_counts(tmp_path, records)[SignalClass.SELF_CORRECT] == 1
+
+    def test_a_coder_judgment_tool_result_does_not_mask_a_sibling_not_found(self, tmp_path):
+        records = [_user_blocks(
+            _tool_result_block(coder_judgment(note='the module was not found')),
+            _tool_result_block('cat: x: No such file or directory'),
+        )]
+
+        assert _text_class_counts(tmp_path, records)[SignalClass.NOT_FOUND] == 1
+
+    def test_human_origin_keeps_every_text_class(self, tmp_path):
+        records = [
+            _origin_stamped(_user_turn(_LITERAL_LINE), 'human'),
+            _origin_stamped(
+                _user_blocks(_tool_result_block('cat: x: No such file or directory')), 'human',
+            ),
+            _assistant_texts(_GENUINE_SELF_CORRECTION),
+        ]
+
+        assert _text_class_counts(tmp_path, records) == dict.fromkeys(_TEXT_CLASSES, 1)
+
+    def test_a_structural_error_in_a_non_human_record_still_counts(self, tmp_path):
+        records = [_origin_stamped(
+            _user_blocks(_tool_result_block('DARK_FACTORY_ROOT unset, exit code 2', is_error=True)),
+            'task-notification',
+        )]
+        path = _write_transcript(tmp_path / 's.jsonl', records)
+
+        assert mod.score_signals(path)[SignalClass.TOOL_ERROR] == digest.signal_counts(records)['tool_error'] == 1
+
+
+class TestSamplerReingestedContentParity:
+    """The anti-drift pin for the carrier predicate the sampler shares with
+    the digest, in the shape of TestSamplerDesignedOutcomeParity: one
+    contaminated session, two scanners, the same text-class counts."""
+
+    def test_sampler_and_digest_agree_on_a_contaminated_session(self, tmp_path):
+        records = [
+            _trickle_coder_prompt_turn(),
+            _assistant_texts(coder_judgment(_LITERAL_LINE)),
+            _origin_stamped(_user_turn(_LITERAL_LINE), 'task-notification'),
+            _stamped_tool_result_record(),
+            _assistant_texts(_GENUINE_SELF_CORRECTION),
+            _user_blocks(_tool_result_block('cat: x: No such file or directory')),
+            _user_blocks(_tool_result_block('error: done_gate_missing_files')),
+            _user_turn('[Request interrupted by user for tool use]'),
+        ]
+        path = _write_transcript(tmp_path / 'parity.jsonl', records)
+
+        sampled = dict(mod.score_signals(path))
+        digested = digest.signal_counts(records)
+
+        assert {name: sampled[name] for name in _TEXT_CLASSES} == dict.fromkeys(_TEXT_CLASSES, 1)
+        assert {name: digested[name] for name in _TEXT_CLASSES} == dict.fromkeys(_TEXT_CLASSES, 1)
+
+    def test_a_briefing_split_across_text_blocks_is_judged_as_one_turn(self, tmp_path):
+        briefing = briefing_text(_LITERAL_LINE)
+        split = briefing.index('## Agent Identity')
+        head, tail = briefing[:split], briefing[split:]
+        record = _user_blocks({'type': 'text', 'text': head}, {'type': 'text', 'text': tail})
+        path = _write_transcript(tmp_path / 'split.jsonl', [record])
+
+        sampled = dict(mod.score_signals(path))
+        digested = digest.signal_counts([record])
+
+        assert detectors.is_non_dialogue_carrier(record, head) is False
+        assert {name: sampled[name] for name in _TEXT_CLASSES} == dict.fromkeys(_TEXT_CLASSES, 0)
+        assert {name: digested[name] for name in _TEXT_CLASSES} == dict.fromkeys(_TEXT_CLASSES, 0)
 
 
 def _scored(session_id, stratum, counts, first_turn_text, size_bytes=1000):
@@ -513,7 +708,7 @@ def _scored(session_id, stratum, counts, first_turn_text, size_bytes=1000):
         size_bytes=size_bytes,
     )
     return mod.ScoredRecord(
-        session=session, stratum=stratum, counts=counts, first_turn_text=first_turn_text
+        session=session, stratum=AgentClass(stratum), counts=counts, first_turn_text=first_turn_text
     )
 
 
@@ -524,22 +719,22 @@ class TestShapeFingerprint:
     same classes night after night even when exact counts drift."""
 
     def test_clones_share_a_fingerprint(self):
-        a = _scored('a', 'recon', mod.SignalCounts(tool_error=1), '## Reconciliation Run\nDate: 2026-07-10\n')
-        b = _scored('b', 'recon', mod.SignalCounts(tool_error=3), '## Reconciliation Run\nDate: 2026-07-12\n')
+        a = _scored('a', 'recon', mod.SignalCounts.of(tool_error=1), '## Reconciliation Run\nDate: 2026-07-10\n')
+        b = _scored('b', 'recon', mod.SignalCounts.of(tool_error=3), '## Reconciliation Run\nDate: 2026-07-12\n')
         assert mod.shape_fingerprint(a) == mod.shape_fingerprint(b)
 
     def test_distinct_content_differs(self):
-        a = _scored('a', 'recon', mod.SignalCounts(tool_error=1), '## Reconciliation Run\nDate: 2026-07-10\n')
+        a = _scored('a', 'recon', mod.SignalCounts.of(tool_error=1), '## Reconciliation Run\nDate: 2026-07-10\n')
         distinct = _scored(
             'distinct', 'recon',
-            mod.SignalCounts(self_correct=1, not_found=1),
+            mod.SignalCounts.of(self_correct=1, not_found=1),
             'A completely different opening about something else entirely.',
         )
         assert mod.shape_fingerprint(a) != mod.shape_fingerprint(distinct)
 
     def test_different_stratum_differs_even_with_same_text_and_shape(self):
-        a = _scored('a', 'recon', mod.SignalCounts(tool_error=1), 'same text')
-        b = _scored('b', 'watcher', mod.SignalCounts(tool_error=1), 'same text')
+        a = _scored('a', 'recon', mod.SignalCounts.of(tool_error=1), 'same text')
+        b = _scored('b', 'watcher', mod.SignalCounts.of(tool_error=1), 'same text')
         assert mod.shape_fingerprint(a) != mod.shape_fingerprint(b)
 
 
@@ -550,20 +745,20 @@ class TestDedupeShapes:
 
     def _build(self):
         clone_low = _scored(
-            'recon-a', 'recon', mod.SignalCounts(tool_error=1),
+            'recon-a', 'recon', mod.SignalCounts.of(tool_error=1),
             '## Reconciliation Run\nDate: 2026-07-10\n',
         )
         clone_mid = _scored(
-            'recon-b', 'recon', mod.SignalCounts(tool_error=2),
+            'recon-b', 'recon', mod.SignalCounts.of(tool_error=2),
             '## Reconciliation Run\nDate: 2026-07-11\n',
         )
         clone_high = _scored(
-            'recon-c', 'recon', mod.SignalCounts(tool_error=3),
+            'recon-c', 'recon', mod.SignalCounts.of(tool_error=3),
             '## Reconciliation Run\nDate: 2026-07-12\n',
         )
         distinct = _scored(
             'recon-distinct', 'recon',
-            mod.SignalCounts(self_correct=1, not_found=1),
+            mod.SignalCounts.of(self_correct=1, not_found=1),
             'A completely different opening about something else entirely.',
         )
         return [clone_low, clone_mid, clone_high, distinct]
@@ -642,21 +837,21 @@ class TestSampleResultAccounting:
         """
         return [
             _scored(
-                'recon-clone-a', 'recon', mod.SignalCounts(tool_error=3),
+                'recon-clone-a', 'recon', mod.SignalCounts.of(tool_error=3),
                 '## Reconciliation Run\nDate: 2026-07-10\n', 200_000,
             ),
             _scored(
-                'recon-clone-b', 'recon', mod.SignalCounts(tool_error=2),
+                'recon-clone-b', 'recon', mod.SignalCounts.of(tool_error=2),
                 '## Reconciliation Run\nDate: 2026-07-11\n', 200_000,
             ),
             _scored(
-                'recon-distinct', 'recon', mod.SignalCounts(self_correct=1, not_found=4),
+                'recon-distinct', 'recon', mod.SignalCounts.of(self_correct=1, not_found=4),
                 'A completely different opening about something else entirely.', 200_000,
             ),
-            _scored('quiet-a', 'interactive', mod.SignalCounts(), 'nothing went wrong here', 1_000),
-            _scored('quiet-b', 'interactive', mod.SignalCounts(), 'all green, no surprises', 1_000),
-            _scored('human-a', 'interactive', mod.SignalCounts(tool_error=9), 'human turn one', 1_000),
-            _scored('human-b', 'interactive', mod.SignalCounts(not_found=8), 'human turn two', 1_000),
+            _scored('quiet-a', 'interactive', mod.SignalCounts.of(), 'nothing went wrong here', 1_000),
+            _scored('quiet-b', 'interactive', mod.SignalCounts.of(), 'all green, no surprises', 1_000),
+            _scored('human-a', 'interactive', mod.SignalCounts.of(tool_error=9), 'human turn one', 1_000),
+            _scored('human-b', 'interactive', mod.SignalCounts.of(not_found=8), 'human turn two', 1_000),
         ]
 
     def _build_narrowed_records(self):
@@ -684,7 +879,7 @@ class TestSampleResultAccounting:
         return [
             _scored(
                 f'distinct-{index:02d}', 'interactive',
-                mod.SignalCounts(tool_error=index),
+                mod.SignalCounts.of(tool_error=index),
                 f'{opener} is behaving oddly and I need help working out why.',
                 1_000,
             )
@@ -872,25 +1067,25 @@ class TestStratifiedSampleBoundary:
 
     def _build_records(self):
         records = [
-            _scored('recon-huge-1', 'recon', mod.SignalCounts(tool_error=500), 'recon run A', 200_000),
-            _scored('recon-huge-2', 'recon', mod.SignalCounts(tool_error=600), 'recon run B', 200_000),
-            _scored('recon-mid-1', 'recon', mod.SignalCounts(tool_error=25), 'recon mid run 1', 5_000),
-            _scored('recon-mid-2', 'recon', mod.SignalCounts(tool_error=27), 'recon mid run 2', 5_000),
-            _scored('recon-mid-3', 'recon', mod.SignalCounts(tool_error=29), 'recon mid run 3', 5_000),
+            _scored('recon-huge-1', 'recon', mod.SignalCounts.of(tool_error=500), 'recon run A', 200_000),
+            _scored('recon-huge-2', 'recon', mod.SignalCounts.of(tool_error=600), 'recon run B', 200_000),
+            _scored('recon-mid-1', 'recon', mod.SignalCounts.of(tool_error=25), 'recon mid run 1', 5_000),
+            _scored('recon-mid-2', 'recon', mod.SignalCounts.of(tool_error=27), 'recon mid run 2', 5_000),
+            _scored('recon-mid-3', 'recon', mod.SignalCounts.of(tool_error=29), 'recon mid run 3', 5_000),
         ]
         for i in range(12):
             records.append(
-                _scored(f'recon-zero-{i}', 'recon', mod.SignalCounts(), f'recon zero {i}', 500)
+                _scored(f'recon-zero-{i}', 'recon', mod.SignalCounts.of(), f'recon zero {i}', 500)
             )
         for i, score in enumerate((5, 6, 7, 8)):
             records.append(
                 _scored(
-                    f'watcher-clone-{i}', 'watcher', mod.SignalCounts(tool_error=score),
+                    f'watcher-clone-{i}', 'watcher', mod.SignalCounts.of(tool_error=score),
                     'watcher polling cycle', 2_000,
                 )
             )
-        records.append(_scored('interactive-1', 'interactive', mod.SignalCounts(tool_error=3), 'human turn A', 800))
-        records.append(_scored('interactive-2', 'interactive', mod.SignalCounts(tool_error=4), 'human turn B', 900))
+        records.append(_scored('interactive-1', 'interactive', mod.SignalCounts.of(tool_error=3), 'human turn A', 800))
+        records.append(_scored('interactive-2', 'interactive', mod.SignalCounts.of(tool_error=4), 'human turn B', 900))
         return records
 
     def _config(self):
@@ -996,11 +1191,11 @@ class TestStratifiedSampleReserveExceedsBudget:
     def _build_records(self):
         return [
             # "recon" floor: expensive (200_000 bytes each -> 400_000 total).
-            _scored('recon-1', 'recon', mod.SignalCounts(tool_error=10), 'recon a', 200_000),
-            _scored('recon-2', 'recon', mod.SignalCounts(tool_error=9), 'recon b', 200_000),
+            _scored('recon-1', 'recon', mod.SignalCounts.of(tool_error=10), 'recon a', 200_000),
+            _scored('recon-2', 'recon', mod.SignalCounts.of(tool_error=9), 'recon b', 200_000),
             # "interactive" floor: cheap (1_000 bytes each -> 2_000 total).
-            _scored('interactive-1', 'interactive', mod.SignalCounts(tool_error=2), 'human a', 1_000),
-            _scored('interactive-2', 'interactive', mod.SignalCounts(tool_error=1), 'human b', 1_000),
+            _scored('interactive-1', 'interactive', mod.SignalCounts.of(tool_error=2), 'human a', 1_000),
+            _scored('interactive-2', 'interactive', mod.SignalCounts.of(tool_error=1), 'human b', 1_000),
         ]
 
     def test_total_never_exceeds_budget_even_when_floors_alone_would(self):
@@ -1058,7 +1253,7 @@ class TestStratifiedSampleRealWorldSizes:
         return [
             _scored(
                 f'orch-{name}', 'orchestrated-task',
-                mod.SignalCounts(tool_error=score),
+                mod.SignalCounts.of(tool_error=score),
                 f'orchestrated task session {name}',
                 6_000_000,
             )
@@ -1070,7 +1265,7 @@ class TestStratifiedSampleRealWorldSizes:
         for name, score in zip(('one', 'two', 'three'), (18, 14, 11), strict=True):
             records.append(
                 _scored(
-                    f'recon-{name}', 'recon', mod.SignalCounts(not_found=score),
+                    f'recon-{name}', 'recon', mod.SignalCounts.of(not_found=score),
                     f'reconciliation run {name}', 4_500_000,
                 )
             )
@@ -1139,10 +1334,10 @@ class TestStratifiedSampleCostSeam:
     def _build_records(self):
         """Four candidates across two strata, each 6MB of raw transcript."""
         return [
-            _scored('recon-a', 'recon', mod.SignalCounts(tool_error=9), 'recon alpha opening', 6_000_000),
-            _scored('recon-b', 'recon', mod.SignalCounts(not_found=8), 'recon beta opening', 6_000_000),
-            _scored('interactive-a', 'interactive', mod.SignalCounts(tool_error=5), 'human turn one', 6_000_000),
-            _scored('interactive-b', 'interactive', mod.SignalCounts(self_correct=4), 'human turn two', 6_000_000),
+            _scored('recon-a', 'recon', mod.SignalCounts.of(tool_error=9), 'recon alpha opening', 6_000_000),
+            _scored('recon-b', 'recon', mod.SignalCounts.of(not_found=8), 'recon beta opening', 6_000_000),
+            _scored('interactive-a', 'interactive', mod.SignalCounts.of(tool_error=5), 'human turn one', 6_000_000),
+            _scored('interactive-b', 'interactive', mod.SignalCounts.of(self_correct=4), 'human turn two', 6_000_000),
         ]
 
     def _build_records_with_noise(self):
@@ -1150,17 +1345,17 @@ class TestStratifiedSampleCostSeam:
         that ``dedupe_shapes`` collapses — records that must never be costed."""
         records = self._build_records()
         records.append(
-            _scored('recon-zero', 'recon', mod.SignalCounts(), 'recon zero opening', 6_000_000)
+            _scored('recon-zero', 'recon', mod.SignalCounts.of(), 'recon zero opening', 6_000_000)
         )
         records.append(
             _scored(
-                'recon-clone-1', 'recon', mod.SignalCounts(tool_error=1),
+                'recon-clone-1', 'recon', mod.SignalCounts.of(tool_error=1),
                 'recon clone cycle 2026-07-10', 6_000_000,
             )
         )
         records.append(
             _scored(
-                'recon-clone-2', 'recon', mod.SignalCounts(tool_error=2),
+                'recon-clone-2', 'recon', mod.SignalCounts.of(tool_error=2),
                 'recon clone cycle 2026-07-11', 6_000_000,
             )
         )
@@ -1245,7 +1440,7 @@ class TestDigestByteCostFn:
 
     def _record(self, size_bytes=6_000_000):
         return _scored(
-            'cost-sess', 'orchestrated-task', mod.SignalCounts(tool_error=7),
+            'cost-sess', 'orchestrated-task', mod.SignalCounts.of(tool_error=7),
             'orchestrated task session alpha', size_bytes,
         )
 
@@ -1390,11 +1585,11 @@ class TestDigestByteCostFn:
 
         records = [
             # Higher score -> reserved first, and it eats the whole budget.
-            _scored('ok-1', 'interactive', mod.SignalCounts(tool_error=9),
+            _scored('ok-1', 'interactive', mod.SignalCounts.of(tool_error=9),
                     'healthy session alpha', 900),
             # Lower score -> reaches the budget phase in the leftover fill,
             # where the strict greedy halt is unforgiving of an over-charge.
-            _scored('boom', 'interactive', mod.SignalCounts(tool_error=8),
+            _scored('boom', 'interactive', mod.SignalCounts.of(tool_error=8),
                     'failing session beta', 900),
         ]
         cfg = config_mod.LegibilityConfig(
@@ -1435,8 +1630,8 @@ class TestDigestByteCostFn:
             date=dt_date(2026, 7, 13), size_bytes=path.stat().st_size,
         )
         record = mod.ScoredRecord(
-            session=session, stratum='interactive',
-            counts=mod.SignalCounts(tool_error=1), first_turn_text='Please help with the thing',
+            session=session, stratum=AgentClass.INTERACTIVE,
+            counts=mod.SignalCounts.of(tool_error=1), first_turn_text='Please help with the thing',
         )
 
         expected = len(
@@ -1478,8 +1673,8 @@ class TestDigestByteCostFn:
 class TestRenderManifest:
     def test_emits_one_json_object_per_line(self):
         records = [
-            _scored('sess-a', 'recon', mod.SignalCounts(tool_error=5), 'text', 1000),
-            _scored('sess-b', 'watcher', mod.SignalCounts(tool_error=3), 'text', 2000),
+            _scored('sess-a', 'recon', mod.SignalCounts.of(tool_error=5), 'text', 1000),
+            _scored('sess-b', 'watcher', mod.SignalCounts.of(tool_error=3), 'text', 2000),
         ]
         lines = mod.render_manifest(records).splitlines()
         assert len(lines) == 2
@@ -1693,8 +1888,8 @@ class TestFormatSampleSummaryLine:
         wrong attribute is caught (an all-zeros fixture would not be)."""
         return mod.SampleResult(
             selected=[
-                _scored('sess-a', 'recon', mod.SignalCounts(tool_error=5), 'text a'),
-                _scored('sess-b', 'interactive', mod.SignalCounts(not_found=3), 'text b'),
+                _scored('sess-a', 'recon', mod.SignalCounts.of(tool_error=5), 'text a'),
+                _scored('sess-b', 'interactive', mod.SignalCounts.of(not_found=3), 'text b'),
             ],
             per_stratum_counts={'recon': 1, 'interactive': 1},
             zero_signal_dropped=3,

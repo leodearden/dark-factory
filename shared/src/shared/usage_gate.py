@@ -509,8 +509,9 @@ class InvokeSlot:
 
     Guarantees that ``release_probe_slot`` is called on any exit path
     (``break``, ``continue``, ``return``, exception) unless the slot was
-    explicitly settled by :meth:`detect_cap_hit` (returning True) or
-    :meth:`confirm`.
+    explicitly settled by :meth:`detect_cap_hit` (returning True),
+    :meth:`report` or :meth:`confirm`. The first of those settles the slot's
+    one verdict; a later :meth:`confirm` is a no-op.
 
     Use via :meth:`UsageGate.invoke_slot`::
 
@@ -593,7 +594,19 @@ class InvokeSlot:
         return hit
 
     def confirm(self, cost_usd: float = 0.0) -> None:
-        """Mark invocation successful; clears probe state and accumulates cost."""
+        """Mark invocation successful; clears probe state and accumulates cost.
+
+        A slot carries one verdict: on a slot that :meth:`report` or a positive
+        :meth:`detect_cap_hit` already settled, this is a no-op that touches
+        neither the account nor the session cost, so a completion arm may
+        confirm unconditionally. The dropped cost is logged at DEBUG.
+        """
+        if self._settled:
+            logger.debug(
+                f'Account {self.account_name}: confirm on an already-settled '
+                f'slot — one verdict per slot, dropping cost ${cost_usd:.4f}',
+            )
+            return
         self._gate.confirm_account_ok(self.token)
         self._gate.on_agent_complete(cost_usd)
         self._settled = True
@@ -627,8 +640,10 @@ class InvokeSlot:
         transition logic of its own:
 
         - OK -> ``confirm_account_ok`` (PROBE_IN_FLIGHT -> AVAILABLE; clears
-          ``near_cap``). Does not accumulate cost — ``OK`` carries none; cost
-          stays a caller concern (``confirm()`` / ``on_agent_complete``).
+          ``near_cap``). Adds no session cost — ``OK`` carries none — and,
+          like every arm, settles the slot, so a later :meth:`confirm` is a
+          no-op. A caller with a cost to accumulate calls
+          ``confirm(cost_usd)`` *instead of* reporting ``OK``.
         - CapHit -> ``_handle_cap_detected`` (-> CAPPED), forwarding
           ``self.scope`` (PRD task β), then ``release_probe_slot``: a scoped
           cap attributes to only this account's model-scope and takes no phase

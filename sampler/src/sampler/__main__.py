@@ -101,9 +101,9 @@ def main() -> None:
     logger.info(
         'tick ts=%d psi=%s process=%s load=%s',
         now,
-        {k: f'{v:.2f}' for k, v in psi.items()},
-        {k: f'{v:.0f}' for k, v in process_metrics.items()},
-        {k: f'{v:.2f}' for k, v in load_metrics.items()},
+        {k.label(): f'{v:.2f}' for k, v in psi.items()},
+        {k.label(): f'{v:.0f}' for k, v in process_metrics.items()},
+        {k.label(): f'{v:.2f}' for k, v in load_metrics.items()},
     )
 
 

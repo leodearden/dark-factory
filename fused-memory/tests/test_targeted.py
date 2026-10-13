@@ -12,6 +12,7 @@ import pytest_asyncio
 from _flag_for_stage2_pool_fake import LiveFlagPool
 from _fm_helpers import complete_paged_read, make_8df8_scenario, pydantic_spec
 from _git_root_helper import make_git_root
+from shared.project_layout import escalation_queue_dir
 
 from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
 from fused_memory.models.enums import SourceStore
@@ -2839,6 +2840,22 @@ class TestSweepCancelledDescendants:
 
         mock_interceptor.set_task_status.assert_not_awaited()
         mock_interceptor.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_escalate_files_into_the_layout_escalation_queue_when_relocated(
+        self, wired_reconciler, mock_taskmaster, monkeypatch, tmp_path,
+        escalation_queue_relocation,
+    ):
+        self._orchestrator_live(monkeypatch)
+        mock_taskmaster.get_tasks = AsyncMock(return_value=self._block_branch_tasks())
+
+        result = await self._sweep_cancelled_parent(wired_reconciler, tmp_path)
+
+        escalated = self._descendant_actions(result, 'descendant_escalated')
+        filed = sorted(escalation_queue_dir(tmp_path).glob('esc-*.json'))
+        assert [p.stem for p in filed] == [a.get('escalation_id') for a in escalated]
+        assert len(filed) == 1
+        assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('stage,raised', [
@@ -5772,6 +5789,39 @@ async def test_unblock_dependent_failure_does_not_strand_siblings(
 # ── task-4903: escalation-pin veto ──────────────────────────────────────────
 
 
+def _seed_open_escalation_pinning_task_2(project_root: str) -> str:
+    """Submit a real pending escalation pinning task '2' into the layout queue."""
+    from escalation.models import Escalation
+    from escalation.queue import EscalationQueue
+
+    queue = EscalationQueue(escalation_queue_dir(project_root))
+    return queue.submit(Escalation(
+        id=queue.make_id('2'),
+        task_id='2',
+        agent_role='harness',
+        severity='blocking',
+        category='dependency_discovered',
+        summary='Task 2 blocked pending external dependency',
+        detail='blocked pending review',
+        suggested_action='wait',
+        level=1,
+    ))
+
+
+async def _unblock_sweep_over_blocked_task_2(
+    wired_reconciler, mock_taskmaster, project_root: str,
+) -> dict:
+    """Complete task '1' with task '2' blocked on it, driving the dependent-unblock sweep."""
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+    return await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=project_root,
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+
 @pytest.mark.asyncio
 async def test_unblock_dependent_vetoed_by_open_escalation(
     wired_reconciler, mock_taskmaster, tmp_path,
@@ -5791,32 +5841,11 @@ async def test_unblock_dependent_vetoed_by_open_escalation(
     targeted.py:1441-1454), so the on-disk shape is production-real rather
     than a hand-rolled JSON blob.
     """
-    from escalation.models import Escalation
-    from escalation.queue import EscalationQueue
-
     project_root = str(tmp_path)
-    queue = EscalationQueue(Path(project_root) / 'data/escalations')
-    esc = Escalation(
-        id=queue.make_id('2'),
-        task_id='2',
-        agent_role='harness',
-        severity='blocking',
-        category='dependency_discovered',
-        summary='Task 2 blocked pending external dependency',
-        detail='blocked pending review',
-        suggested_action='wait',
-        level=1,
-    )
-    esc_id = queue.submit(esc)
+    esc_id = _seed_open_escalation_pinning_task_2(project_root)
 
-    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
-        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
-    ))
-
-    result = await wired_reconciler.reconcile_task(
-        task_id='1', transition='done', project_id='test-project',
-        project_root=project_root,
-        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    result = await _unblock_sweep_over_blocked_task_2(
+        wired_reconciler, mock_taskmaster, project_root,
     )
 
     actions = _dep_actions_for(result, '2')
@@ -5831,6 +5860,22 @@ async def test_unblock_dependent_vetoed_by_open_escalation(
         f'Expected escalation_ids to name the pinning escalation, got: {actions[0]!r}'
     )
     wired_reconciler.task_interceptor.set_task_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_vetoed_by_open_escalation_in_relocated_layout_queue(
+    wired_reconciler, mock_taskmaster, tmp_path, escalation_queue_relocation,
+):
+    esc_id = _seed_open_escalation_pinning_task_2(str(tmp_path))
+
+    result = await _unblock_sweep_over_blocked_task_2(
+        wired_reconciler, mock_taskmaster, str(tmp_path),
+    )
+
+    [action] = _dep_actions_for(result, '2')
+    assert action.get('reason') == 'escalation_pinned', action
+    assert action.get('escalation_ids') == [esc_id], action
+    assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
 
 
 @pytest.mark.asyncio
@@ -7060,6 +7105,19 @@ def _contradicted_result(**overrides) -> VerificationResult:
 
 class TestContradictedEscalation:
     """A contradicted verdict files an L1 escalation; no other verdict does."""
+
+    @pytest.mark.asyncio
+    async def test_contradicted_files_into_the_layout_escalation_queue_when_relocated(
+        self, reconciler, tmp_path, escalation_queue_relocation,
+    ):
+        from escalation.queue import EscalationQueue
+
+        reconciler.verifier.verify = AsyncMock(return_value=_contradicted_result())
+
+        await _run_done_transition(reconciler, project_root=str(tmp_path))
+
+        assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
+        assert len(EscalationQueue(escalation_queue_dir(tmp_path)).get_pending()) == 1
 
     @pytest.mark.asyncio
     async def test_contradicted_files_an_l1_escalation_with_pointers(

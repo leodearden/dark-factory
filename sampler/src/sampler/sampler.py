@@ -13,15 +13,15 @@ Tick responsibilities
    measurement, and for why a half-written tick must never reach the corpus.
 2. Call cleanup_old to enforce the retention policy.
 
-Metric-name guard
------------------
-The per-tick metric count is NOT fixed. The load group emits one
-``own_cpu_some10:<leaf>`` and one ``own_read_ok:<leaf>`` row per cgroup leaf
-discovered at collection time, so its names cannot be enumerated in advance
-and no frozenset can admit them. ``unexpected_metric_names`` therefore
-validates a name against an exact-name set OR a registered STEM with a
-non-empty tail; the PSI and process groups register no stem, which leaves
-their strictness exactly where it is.
+Key guard
+---------
+The per-tick key count is NOT fixed. The load group emits one
+``own_cpu_some10`` and one ``own_read_ok`` key per cgroup leaf discovered at
+collection time, so its keys cannot be enumerated in advance.
+``unexpected_keys`` therefore admits a host-level key by its exact metric
+name with no leaf, and a per-leaf key by a registered per-leaf metric with a
+non-empty leaf. The PSI and process groups register no per-leaf metric, which
+leaves their strictness exactly where it is.
 
 Note: maybe_vacuum is NOT called here — it is called from ``__main__.main()``
 after run_tick completes, to keep concerns separated.
@@ -31,40 +31,37 @@ from __future__ import annotations
 
 from collections.abc import Collection
 
+from sampler.metrics import SampleKey, Samples
 from sampler.store import LoadSampleStore
 
-__all__ = ['run_tick', 'unexpected_metric_names']
+__all__ = ['run_tick', 'unexpected_keys']
 
 
-def unexpected_metric_names(
-    names: Collection[str],
+def unexpected_keys(
+    keys: Collection[SampleKey],
     *,
     exact: frozenset[str],
-    stems: frozenset[str],
-) -> set[str]:
-    """Return the names matching neither an *exact* name nor a *stem* with a tail.
+    per_leaf: frozenset[str],
+) -> set[SampleKey]:
+    """Return the keys that are neither an *exact* host-level key nor a *per_leaf* one.
 
-    A name matches a stem when it splits on its FIRST ':' into a registered
-    stem and a NON-EMPTY tail. Both halves of that are load-bearing: a bare
-    stem is not itself a metric (nothing emits one, and admitting it would let
-    a collector that failed to append a leaf name write an anonymous row), and
-    an empty tail names no cgroup, so it would be per-leaf evidence about
-    nothing.
+    A host-level key names an *exact* metric and carries no leaf. A per-leaf
+    key names a *per_leaf* metric and carries a NON-EMPTY leaf: without one it
+    would be per-leaf evidence about no cgroup, written by a collector that
+    failed to attach the leaf. The leaf itself is opaque data.
 
-    An EMPTY *stems* set degenerates to plain exact-set membership. That is
+    An EMPTY *per_leaf* set degenerates to plain exact-set membership. That is
     how the PSI and process groups keep exactly the strictness they have
-    today: neither has a dynamic component, so a typo there must still fail.
+    today: neither has a per-leaf metric, so a typo there must still fail.
     """
     return {
-        name
-        for name in names
-        if name not in exact and not _matches_a_stem(name, stems)
+        key
+        for key in keys
+        if not (
+            (key.metric in exact and key.leaf is None)
+            or (key.metric in per_leaf and bool(key.leaf))
+        )
     }
-
-
-def _matches_a_stem(name: str, stems: frozenset[str]) -> bool:
-    stem, separator, tail = name.partition(':')
-    return bool(separator) and bool(tail) and stem in stems
 
 # PSI metric names that carry NULL windows (kernel-windowed already)
 _PSI_METRICS = frozenset([
@@ -88,25 +85,25 @@ _LOAD_METRICS = frozenset([
     'runqueue_read_ok',
 ])
 
-# One row per DISCOVERED cgroup leaf, so the tail is not knowable here — see
+# One key per DISCOVERED cgroup leaf, so the leaves are not knowable here — see
 # sampler.metrics.discover_pressure_cgroups.
-_LOAD_STEMS = frozenset([
+_LOAD_PER_LEAF = frozenset([
     'own_cpu_some10',
     'own_read_ok',
 ])
 
-# The PSI and process groups have no dynamic component, so they register no
-# stem and the guard stays exactly as strict as it is today.
-_NO_STEMS: frozenset[str] = frozenset()
+# The PSI and process groups have no per-leaf metric, so the guard stays
+# exactly as strict as it is today.
+_NO_PER_LEAF: frozenset[str] = frozenset()
 
 
 def run_tick(
     store: LoadSampleStore,
     now: int,
     *,
-    psi: dict[str, float],
-    process_metrics: dict[str, float],
-    load_metrics: dict[str, float],
+    psi: Samples,
+    process_metrics: Samples,
+    load_metrics: Samples,
 ) -> None:
     """Write one tick's worth of samples to the store.
 
@@ -118,7 +115,7 @@ def run_tick(
                          verify_concurrency, verify_rss_total_bytes).
         load_metrics:    Dict of the runqueue and per-cgroup own-pressure
                          values (runqueue_ratio, runqueue_read_ok, and one
-                         own_cpu_some10:<leaf> + own_read_ok:<leaf> pair per
+                         own_cpu_some10 + own_read_ok pair keyed by each
                          cgroup leaf discovered this tick).
 
     Each group is passed separately, and a degraded one arrives as ``{}``.
@@ -131,35 +128,35 @@ def run_tick(
     # persist without matching any consumer. A PARTIAL dict is always legal —
     # a collection group that degrades hands us {} (see __main__.py's
     # degrade-and-continue handling), so only unrecognised names are an error.
-    unexpected_psi = unexpected_metric_names(psi, exact=_PSI_METRICS, stems=_NO_STEMS)
+    unexpected_psi = unexpected_keys(psi, exact=_PSI_METRICS, per_leaf=_NO_PER_LEAF)
     assert not unexpected_psi, f'unexpected PSI keys: {unexpected_psi}'
-    unexpected_process = unexpected_metric_names(
-        process_metrics, exact=_PROCESS_METRICS, stems=_NO_STEMS
+    unexpected_process = unexpected_keys(
+        process_metrics, exact=_PROCESS_METRICS, per_leaf=_NO_PER_LEAF
     )
     assert not unexpected_process, f'unexpected process metric keys: {unexpected_process}'
-    unexpected_load = unexpected_metric_names(
-        load_metrics, exact=_LOAD_METRICS, stems=_LOAD_STEMS
+    unexpected_load = unexpected_keys(
+        load_metrics, exact=_LOAD_METRICS, per_leaf=_LOAD_PER_LEAF
     )
     assert not unexpected_load, f'unexpected load metric keys: {unexpected_load}'
 
     # 1. Write the whole tick in one transaction. PSI rows carry NULL windows
     #    (already kernel-windowed); the process and load groups share the
     #    sampler-windowed path, because their write MODE is the same and they
-    #    differ along exactly one axis — the stem set their names are validated
-    #    against, above.
+    #    differ along exactly one axis — the per-leaf set their keys are
+    #    validated against, above.
     #
     #    The load group's window columns are RECORDED AHEAD OF A CONSUMER, and
     #    that is stated here so a reader does not have to grep for one: the
     #    dashboard reads window_mean/window_max only for the 9 names in
     #    dashboard/src/dashboard/data/load.py::KNOWN_METRICS, and
-    #    scripts/load-threshold-calibration.py::_fetch selects (metric, ts,
-    #    value) and computes its own windows. So the ~2 + 2-per-cgroup-leaf
+    #    scripts/load-threshold-calibration.py::_fetch reads (leaf, ts, value)
+    #    by metric and computes its own windows. So the ~2 + 2-per-cgroup-leaf
     #    window reads this buys per tick (16 on this host) are write-only
     #    today, and NO consumer is scheduled — say so rather than implying one.
     #    Kept windowed regardless, for two reasons that survive having no
-    #    reader. Each read is the indexed `SEARCH samples USING INDEX
-    #    idx_samples_metric_ts (metric=?)` that LoadSampleStore.cleanup_old's
-    #    docstring measured at ~0 ms, so the saving on offer is ~nothing; and
+    #    reader. Each read seeks its own (metric, leaf), as
+    #    sampler/tests/test_load_store.py::TestTrailingWindow::test_a_sparse_keys_window_read_does_not_walk_a_busy_neighbours_history
+    #    pins, so the saving on offer is ~nothing; and
     #    routing one GROUP to the unwindowed path would give the store a
     #    second axis of variability (window mode AND provenance) where it
     #    deliberately has one. Nothing is lost either way if that is revisited:

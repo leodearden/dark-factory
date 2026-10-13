@@ -23,11 +23,16 @@ import sys
 from pathlib import Path
 
 import pytest
+from _fused_memory_tool_surface import (
+    denied_fused_memory_tool_names,
+    fused_memory_tool_names_mentioned,
+)
 
 from fused_memory import memory_metadata
 from fused_memory.middleware.deterministic_task_guard import deterministic_task_error
 from fused_memory.middleware.execution_class_guard import execution_class_error
 from fused_memory.reconciliation import consolidation_gate
+from fused_memory.reconciliation.cli_stage_runner import STAGE1_DISALLOWED, STAGE2_DISALLOWED
 from fused_memory.reconciliation.consolidation_gate import (
     GATE_METADATA_KEY,
     ClosureVerdict,
@@ -55,10 +60,16 @@ class TestRenderEndStateBrief:
         assert 'metadata.topic' in brief
         assert 'metadata.canonical' in brief
 
-    def test_points_at_the_landed_op(self):
-        """The brief and the executable op cannot prescribe different end states."""
-        brief = render_end_state_brief()
-        assert 'consolidate_memories' in brief
+    def test_names_no_tool_a_rendering_stage_is_denied(self):
+        """The brief renders into both the Stage 1 and the Stage 2 prompt.
+
+        A tool named here that either stage is denied is an instruction that
+        stage cannot follow, and cannot see why.
+        """
+        named = fused_memory_tool_names_mentioned(render_end_state_brief())
+        denied = denied_fused_memory_tool_names(STAGE1_DISALLOWED, STAGE2_DISALLOWED)
+
+        assert not named & denied
 
     def test_public_surface_is_exported(self):
         assert 'render_end_state_brief' in consolidation_gate.__all__

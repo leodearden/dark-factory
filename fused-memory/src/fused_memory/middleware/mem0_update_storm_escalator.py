@@ -57,8 +57,9 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from pathlib import Path
 from typing import TYPE_CHECKING
+
+from shared.project_layout import escalation_queue_dir
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
@@ -82,22 +83,8 @@ except ImportError:  # pragma: no cover — exercised only in minimal envs
 logger = logging.getLogger(__name__)
 
 
-_QUEUE_DIRNAME: str = 'data/escalations'
+# Not a ``middleware/_folded_escalation`` filer — see that module's docstring.
 
-# NOT A MEMBER of ``middleware/_folded_escalation``'s family, deliberately
-# (task 4854). That helper is the one home for the PENDING-ANCHOR-FOLD filer
-# skeleton — ``queue.get_by_task(anchor, status='pending')`` plus a never-raise
-# submit — which seven filers carried verbatim. This module does not carry it:
-# it dedupes on ``compute_content_fingerprint`` + ``DedupeConfig`` through
-# ``escalation.dedupe.submit_or_dedupe`` over a CACHED per-project queue.
-# Migrating it would replace content-fingerprint dedupe with pending-anchor
-# dedupe, which is a behaviour regression rather than a refactor. Do not
-# "finish the job" by folding this in.
-#
-# The anchor below is still swept by
-# ``tests/test_folded_escalation.py::TestNoTwoFilersShareAnAnchor``: this module
-# writes to the SAME queue, so it can squat an anchor even though it is not a
-# member.
 # Anchor task_id used by ``EscalationQueue.make_id`` so the resulting escalation
 # ids (e.g. ``esc-mem0-update-storm-3``) are greppable and distinct from the
 # path-guard's ``task-path-guard`` and the migration's ``candidate-key-migration``
@@ -157,7 +144,7 @@ class Mem0UpdateStormEscalator:
             return None
         q = self._queues.get(project_root)
         if q is None:
-            q = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
+            q = EscalationQueue(escalation_queue_dir(project_root))
             self._queues[project_root] = q
         return q
 

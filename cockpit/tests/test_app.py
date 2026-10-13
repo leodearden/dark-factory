@@ -1516,8 +1516,7 @@ class TestEnterFocus:
     async def test_enter_focuses_the_highlighted_row_not_row_zero(self, tmp_path):
         """Explicit-action focus (PRD §6.2/§9 C5b): pressing Enter on the
         DecisionQueue focuses the HIGHLIGHTED row's resolved target -- never
-        whatever happens to sit at row 0 -- and records that item's key in
-        the app's in-memory "handling" set. This is the ONLY place a focus()
+        whatever happens to sit at row 0. This is the ONLY place a focus()
         call may originate from (see TestSignalDontMove for the refresh
         path's complementary "never focus" half of the same invariant).
         """
@@ -1564,7 +1563,6 @@ class TestEnterFocus:
             await pilot.pause()
 
             assert backend.focus_calls == [DisplayTarget(kind='wm', wm_title='awaiting-b title')]
-            assert target_key in app._handling
 
     @pytest.mark.timeout(10)
     async def test_enter_on_unresolvable_target_is_fail_soft(self, tmp_path):
@@ -1676,143 +1674,6 @@ class TestEnterFocus:
             assert backend.focus_calls == [
                 DisplayTarget(kind='wm', wm_title='escalation-watcher df')
             ]
-
-
-class TestHandlingExpiresWithTheAsk:
-    @pytest.mark.timeout(10)
-    async def test_handling_flag_does_not_stick_past_the_ask_it_was_set_for(self, tmp_path):
-        """self._handling is an in-memory 'already acted on' marker keyed by
-        QueueItem.key (PRD §9 C5b). For a SESSION-backed row the key is
-        stable for the session's whole lifetime, so once Enter marks it
-        handling, it must be cleared again once that ask resolves (the
-        session leaves the queue) -- otherwise a brand new question from
-        the SAME session would silently inherit a stale "already handled"
-        flag left over from a completely different, earlier ask.
-        """
-        from cockpit.app import CockpitApp
-        from cockpit.backends import FakeBackend
-
-        display = sr.Display(kind='wm', wm_title='handling title')
-        awaiting = _make_record(
-            session_slug='handling-1',
-            status=sr.Status.AWAITING_INPUT,
-            display=display,
-            question=sr.Question(text='First ask?', asked_at='2026-07-07T00:00:00+00:00'),
-        )
-        sr.write_record(awaiting, root=tmp_path)
-
-        backend = FakeBackend()
-        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
-        async with app.run_test() as pilot:
-            await pilot.pause()
-
-            key = 'session:handling-1'
-            await pilot.press('enter')
-            await pilot.pause()
-            assert key in app._handling
-
-            # The ask resolves -- the session leaves the queue entirely.
-            idle = _make_record(session_slug='handling-1', status=sr.Status.IDLE, display=display)
-            sr.write_record(idle, root=tmp_path)
-            app.refresh_registry()
-            await pilot.pause()
-
-            assert key not in app._handling
-
-            # A brand new question from the SAME session must not inherit
-            # the stale handling flag left by the earlier, resolved ask.
-            second_ask = _make_record(
-                session_slug='handling-1',
-                status=sr.Status.AWAITING_INPUT,
-                display=display,
-                question=sr.Question(text='Second ask?', asked_at='2026-07-08T00:00:00+00:00'),
-            )
-            sr.write_record(second_ask, root=tmp_path)
-            app.refresh_registry()
-            await pilot.pause()
-
-            assert app._queue_items_by_key[key].handling is False
-
-    @pytest.mark.timeout(10)
-    async def test_handling_expires_on_a_same_session_reask_without_a_status_change(self, tmp_path):
-        """Queue exit (above) is only one way an ask ends. self._handling is
-        a slug-stable in-memory "already acted on" marker, so it must also
-        expire when the ask is REPLACED while the key never leaves the queue.
-
-        Reachability: orchestrator/src/orchestrator/session_hooks.py::run_notification
-        writes status=AWAITING_INPUT plus a fresh Question on every
-        Notification hook, with no required intervening Stop hook (->
-        IDLE), so AWAITING_INPUT(Q1) -> AWAITING_INPUT(Q2) is a real
-        transition that never removes 'session:<slug>' from the queue.
-
-        The re-ask below deliberately repeats the question text verbatim --
-        the common production shape, for the reasons
-        test_dropped_session_key_expires_on_a_reask_with_identical_text
-        sets out (session_hooks._extract_question copies the hook message
-        into `text` and stamps a fresh `asked_at`). That puts the WHOLE
-        diff on registry_reader.build_snapshot's asked_at field, so this
-        also proves the wake-up trigger is strong enough for the prune to
-        run at all.
-        """
-        from cockpit.app import CockpitApp
-        from cockpit.backends import FakeBackend
-
-        display = sr.Display(kind='wm', wm_title='reask title')
-        first_ask = _make_record(
-            session_slug='reask-1',
-            status=sr.Status.AWAITING_INPUT,
-            display=display,
-            question=sr.Question(text='Continue?', asked_at='2026-07-07T00:00:00+00:00'),
-        )
-        sr.write_record(first_ask, root=tmp_path)
-
-        backend = FakeBackend()
-        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
-        async with app.run_test() as pilot:
-            await pilot.pause()
-
-            key = 'session:reask-1'
-
-            # (a) Enter marks the row acknowledged.
-            await pilot.press('enter')
-            await pilot.pause()
-            assert key in app._handling
-
-            # (b) GUARD: a LIVE mark must survive an unrelated rebuild. This
-            # is the only clause that fails if action_focus_selected never
-            # records the ask identity -- without it every Enter's mark
-            # would evaporate on the next rebuild instead of on the re-ask.
-            other = _make_record(
-                session_slug='other-1',
-                status=sr.Status.AWAITING_INPUT,
-                display=sr.Display(kind='wm', wm_title='other title'),
-                question=sr.Question(text='Unrelated ask?', asked_at='2026-07-07T01:00:00+00:00'),
-            )
-            sr.write_record(other, root=tmp_path)
-            app.refresh_registry()
-            await pilot.pause()
-
-            assert key in app._handling
-            assert app._queue_items_by_key[key].handling is True
-
-            # (c) The re-ask: still AWAITING_INPUT, same canned text, only a
-            # fresh asked_at. A genuinely new ask must not inherit the mark.
-            second_ask = _make_record(
-                session_slug='reask-1',
-                status=sr.Status.AWAITING_INPUT,
-                display=display,
-                question=sr.Question(text='Continue?', asked_at='2026-07-08T00:00:00+00:00'),
-            )
-            sr.write_record(second_ask, root=tmp_path)
-            app.refresh_registry()
-            await pilot.pause()
-
-            assert key not in app._handling
-            assert app._queue_items_by_key[key].handling is False
-
-            # (d) The identity side-table is garbage-collected with the
-            # mark, rather than becoming the next leak.
-            assert app._overlay_asks == {}
 
 
 class TestBoostReordersAndPersists:
@@ -2052,11 +1913,11 @@ class TestDroppedOverlayExpiresWithTheAsk:
         suppressed for the cockpit's whole process lifetime, and the
         operator never learns an agent is blocked on them.
 
-        The prune deliberately CANNOT copy self._handling's
-        `&= self._queue_items_by_key.keys()` predicate: a dropped item is by
-        construction absent from the rebuilt queue, so queue membership
-        would clear every drop on the very rebuild action_drop itself
-        triggers. Clause (b) below is the standing guard against that
+        The prune deliberately CANNOT use queue membership
+        (`&= self._queue_items_by_key.keys()`) as its predicate: a dropped
+        item is by construction absent from the rebuilt queue, so queue
+        membership would clear every drop on the very rebuild action_drop
+        itself triggers. Clause (b) below is the standing guard against that
         mistake -- a live drop must survive an unrelated rebuild.
         """
         from cockpit.app import CockpitApp

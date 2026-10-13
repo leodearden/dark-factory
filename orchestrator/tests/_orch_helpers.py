@@ -17,6 +17,7 @@ import logging
 import os
 import threading
 import time
+import types
 import weakref
 from collections import deque
 from collections.abc import Awaitable, Callable, Sequence
@@ -113,7 +114,13 @@ def wire_scheduler_liveness_mock(scheduler_mock: MagicMock) -> None:
     state, so tests may still freely reassign ``scheduler_mock._dispatched``
     (a plain set) or ``scheduler_mock.lock_table`` (use :func:`mock_lock_table`)
     and have the accessors reflect it.
+
+    It also pins ``is_paused=False`` / ``pause_reason=None`` (task 5311): a
+    bare MagicMock attribute is truthy, so every re-pend would otherwise read
+    as landing in a paused scheduler.
     """
+    scheduler_mock.is_paused = False
+    scheduler_mock.pause_reason = None
     scheduler_mock._dispatched = set()
     scheduler_mock.lock_table = mock_lock_table()
     scheduler_mock._workflow_cancel_at = {}
@@ -141,13 +148,31 @@ def wire_scheduler_liveness_mock(scheduler_mock: MagicMock) -> None:
     )
 
 
+def wire_clear_claim_then_set_status(scheduler_mock: MagicMock) -> None:
+    """Bind the REAL ``Scheduler.clear_claim_then_set_status`` onto a MagicMock Scheduler.
+
+    On a bare ``MagicMock()`` the method auto-mocks to a non-awaitable. Binding
+    the real one (rather than a forwarding fake) keeps one definition of the
+    clear-then-flip order, and routes both writes to the mock's own
+    ``set_task_claimant`` / ``set_task_status``, so existing assertions on
+    those still hold. The import is function-local to keep importing this
+    module free of ``orchestrator.scheduler`` (collection cost, not a cycle).
+    """
+    from orchestrator.scheduler import Scheduler
+
+    if not isinstance(scheduler_mock.set_task_claimant, AsyncMock):
+        scheduler_mock.set_task_claimant = AsyncMock()
+    scheduler_mock.clear_claim_then_set_status = types.MethodType(
+        Scheduler.clear_claim_then_set_status, scheduler_mock,
+    )
+
+
 # task 3492/4215: the pyproject-configured default per-test timeout ceiling
 # that every heavy test in this suite must clear.  MIRROR of
-# `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml
-# (currently 540, raised from 60 on 2026-09-12 and from 300 on 2026-09-17 --
-# see that setting's comment, shared/pyproject.toml for the canonical
-# rationale, and plans/pytest-per-test-timeout-measurement-2026-09-17.md for
-# the measurement the current value is derived from).  It was a bare
+# `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml -- see
+# that setting's comment, shared/pyproject.toml for the canonical rationale,
+# and plans/pytest-per-test-timeout-measurement-2026-09-17.md for the
+# measurement the value is derived from and its history.  It was a bare
 # literal in
 # test_merge_queue_concurrent_verify.py, whose own comment admitted the
 # defect -- "it is still a literal and CAN drift if that setting changes
@@ -156,7 +181,7 @@ def wire_scheduler_liveness_mock(scheduler_mock: MagicMock) -> None:
 # test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants reads the real
 # pyproject with `tomllib` at runtime and fails if the two disagree.  Do NOT
 # add a second copy -- import this one.
-PYPROJECT_DEFAULT_TIMEOUT = 540
+PYPROJECT_DEFAULT_TIMEOUT = 420
 
 # task 4215: per-test ceiling for the family of guard tests that sweep the
 # WHOLE tree -- `rglob('*.py')` over ~500 files, `ast.parse` on each -- and so
@@ -222,8 +247,10 @@ PYPROJECT_DEFAULT_TIMEOUT = 540
 # encodes that independence; it has since been re-anchored, but its role is
 # unchanged.
 #
-# 300 -> 540 on 2026-09-17 (task 5442): the never-narrow rule below forces it,
-# since the ini default moved to 540, and 540 also clears the family's own 420.
+# It sits above both the floor and PYPROJECT_DEFAULT_TIMEOUT, and neither binds
+# it: the never-narrow rule below asks only `>=`.  Why it sits above its floor
+# is value history, recorded in
+# plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 #
 # Deliberately NOT taken from HEAVY_BARRIER_TEST_TIMEOUT: that one bounds a
 # different hazard, sized by merge-barrier waits, and an AST sweep performs
@@ -590,7 +617,7 @@ DEEP_GATE_SCENE_BUDGET = SpawnBudget(
 # TestDeepLandingSceneBudget:
 #   * `>= VERIFY_CLI_PER_TEST_TIMEOUT` (300) -- 1080 is far above it, so the
 #     marker loosens under the budget verify's CLI passes and cannot invert;
-#   * `>= PYPROJECT_DEFAULT_TIMEOUT` (540) -- the never-narrow rule this file
+#   * `>= PYPROJECT_DEFAULT_TIMEOUT` (420) -- the never-narrow rule this file
 #     states a few constants above, at WHOLE_TREE_SCAN_TEST_TIMEOUT: a mark
 #     meant as a FLOOR must never fall below the ambient ini default, or it
 #     starts narrowing its own module.  Until 2026-09-17 these first two were
@@ -599,7 +626,7 @@ DEEP_GATE_SCENE_BUDGET = SpawnBudget(
 #     300, so a value can now clear the verify edge while narrowing the
 #     ambient one.  That is not hypothetical -- the same commit recorded its
 #     own casualty, HEAVY_BARRIER_TEST_TIMEOUT, left at 300 below the default
-#     it used to equal until task 5572 re-derived it to 540.  1080 clears 540
+#     it used to equal until task 5572 re-derived it to 540.  1080 clears 420
 #     today, so this pin changes
 #     nothing now; it exists so a future re-derivation landing somewhere like
 #     360 cannot satisfy the verify edge and reproduce that gap in silence;

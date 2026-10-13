@@ -33,6 +33,7 @@ from shared.asyncio_tasks import abandon_task, track_task
 
 from dashboard.api import burndown as api_burndown_routes
 from dashboard.api import escalations as api_escalations_routes
+from dashboard.api import invariants as api_invariants_routes
 from dashboard.api import memory as api_memory_routes
 from dashboard.api import merge_queue as api_merge_queue_routes
 from dashboard.api import orchestrators as api_orchestrators_routes
@@ -421,6 +422,7 @@ app.include_router(api_memory_routes.router)
 app.include_router(api_orchestrators_routes.router)
 app.include_router(api_escalations_routes.router)
 app.include_router(api_task_prose_routes.router)
+app.include_router(api_invariants_routes.router)
 
 
 # ---------------------------------------------------------------------------
@@ -1313,6 +1315,7 @@ async def api_scheduler(request: Request) -> JSONResponse:
         offline_projects,
         paused_projects,
         recovery_events,
+        degraded_projects,
     ), snapshot_at = await get_scheduler_snapshot(http_client, config)
     return JSONResponse(
         redux_api.shape_scheduler(
@@ -1321,6 +1324,7 @@ async def api_scheduler(request: Request) -> JSONResponse:
             pin_queue=pin_queue,
             events_by_task=events_by_task,
             offline_projects=offline_projects,
+            degraded_projects=degraded_projects,
             paused_projects=paused_projects,
             recovery_events=recovery_events,
             snapshot_at=snapshot_at,

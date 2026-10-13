@@ -1162,7 +1162,7 @@ class TestDeepLandingSceneBudget:
         and, in the same breath, recorded a LATENT GAP where it had not been
         applied -- ``HEAVY_BARRIER_TEST_TIMEOUT`` stayed at 300, below the
         default it used to equal, until task 5572 closed it by re-deriving the
-        constant to 540.  1080 clears 540 today, so this pin
+        constant to 540.  1080 clears 420 today, so this pin
         changes no number; it exists so a future re-derivation cannot land
         somewhere like 360 that satisfies the verify edge while silently
         reproducing that gap.

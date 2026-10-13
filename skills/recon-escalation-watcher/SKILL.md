@@ -189,37 +189,10 @@ lease held by recon-watcher-df-1348600 (pid 1348600 is not running, but its hear
 A fresh heartbeat means you **stand down** even when the pid reads as not running: staleness needs
 BOTH a dead pid AND a heartbeat past the TTL.
 
-**A detached `recon-watch/loop.sh` tree on this queue is not a second closer (task 5876).** A
-process probe may show a `scripts/watcher-rearm.sh --queue-dir …/data/reconciliation/escalations`
-you did not start, with its `escalation.watcher` python child, under an ancestor
-`/bin/bash …/.claude/recon-watch/loop.sh`. That is a host-local helper **not tracked in this
-repo**; its own header is the only other statement of this contract. It is a detached re-arm loop,
-reparented away from any Claude session so it survives the harness background-task reaper, and it
-outlives the session that launched it — so a fresh watcher session routinely finds it already
-running. It only arms the watcher and journals fires under `~/.claude/recon-watch/` (`history.log`,
-`fired-*.json`). Its tree holds no `claude` process: it never calls `resolve_issue` and closes
-nothing. Two read-only inotify watchers on one queue are harmless redundancy — each fire is
-observed twice (once by your watcher, once journaled by the loop), and there is still exactly one
-closer.
-
-It **deliberately never heartbeats, claims or releases** the `recon-watcher-<project>` lease. A
-lease becomes reclaimable only when BOTH its holder pid is dead AND its heartbeat is past
-`orchestrator/src/orchestrator/session_registry.py::LEASE_HEARTBEAT_TTL`. A detached process that
-kept heartbeating after its owning session died would pin that lease at `holder_liveness=orphaned`
-indefinitely: every later watcher would take the orphaned stand-down above, and the 8103 queue
-would have no closer. So:
-- **A stale or reapable lease at startup while loop.sh runs is this contract working** — not a
-  fault, and nothing to report. `lease-reap`, then `lease-claim`, exactly as above.
-- **The heartbeat is yours alone.** The loop will never keep your lease alive — not even if you
-  read fires from its journal instead of re-arming your own watcher — so heartbeat every Main Loop
-  cycle regardless.
-- **Only the lease verdict says whether a second closer exists** (`lease-claim`'s `decision=` /
-  `holder_liveness=`), never the process table: a watcher tree with no `claude` process in it
-  cannot close anything.
-- **Do not stop or kill it.** You did not start it, so "Process safety" (under "Starting the
-  watcher") forbids it.
-- **Its `history.log` is corroboration only** — e.g. repeated re-fires of one id reveal a pending
-  record missing from the exclude file. The drain (`get_pending_escalations`) stays authoritative.
+**A leftover `loop.sh` never touches this lease (task 5885).** A `scripts/watcher-rearm.sh` tree
+under a `~/.claude/recon-watch/loop.sh` ancestor never claims, heartbeats or releases
+`recon-watcher-<project>`, so it changes no lease verdict; see "One watcher: the session's own"
+under "Starting the watcher".
 
 **Heartbeat + release.** Touch the lease every Main Loop cycle (see "Starting the watcher" below),
 and release it when the session ends. Both verbs act **only for the holder** — a mismatched slug is
@@ -258,7 +231,11 @@ show freshness, because the heartbeat is the file's mtime.
 6. Handle each
 7. Run `reap-decisions` to close any parked DecisionRecord whose escalation has since resolved
    (see "Filing Parked Decisions to the Cockpit Registry" below) — once per cycle
-8. Go to 2
+8. GET `/api/v2/dashboard/invariants` and digest every root's record (see "Reading the
+   invariants gauge" below) — once per cycle. Each `FINDING` line it prints (a chain gone
+   `overdue` or `broken` among them), and each `paused` line reading `pinned_by=[]`, is a
+   finding: triage it with The Action Set's judgement before re-arming (9)
+9. Go to 2
 ```
 
 **Distinguishing the exits at step 3.** The wrapper emits a machine-readable
@@ -344,9 +321,8 @@ cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh \
 
 **Lease heartbeat (each cycle):** each time you (re)start this watcher subprocess, also touch the
 `recon-watcher-<project>` lease claimed at session startup, so a second session's `lease-claim`
-observes this one as alive and stands down. No other process heartbeats this lease — not even a
-running `recon-watch/loop.sh` (see "Claiming the Recon Watcher Lease" above) — so this call is its
-only keep-alive:
+observes this one as alive and stands down. No other process heartbeats this lease, so this call is
+its only keep-alive:
 
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-heartbeat \
@@ -469,7 +445,7 @@ count) — so hand-listing one `--exclude-id` per record does not scale; use
 `--exclude-file` for it, not `--baseline`. The sibling
 `skills/escalation-watcher/SKILL.md` documents `--baseline` as an available
 flag too, but that is not a counterexample: its Main Loop restarts the
-watcher *first* and drains only after confirming it's up, and its step 7 is
+watcher *first* and drains only after confirming it's up, and its last step is
 `Go to 1`, so **every** restart there is immediately followed by a fresh,
 authoritative drain — that skill says as much at its lines 93-94, that the
 fired escalation "is just the wake ... the drain re-finds it (still
@@ -483,9 +459,43 @@ default path `<queue-dir>/.watcher-rearm-exclude-l2` there,
 `<queue-dir>/.watcher-rearm-exclude` here). `--exclude-file` — not
 `--baseline` — is what is actually consistent across both watcher skills.
 
+**One watcher: the session's own (task 5885).** This skill runs exactly one watcher: the Main
+Loop's step-2 background task. The queue directory is the durable record and the drain is
+authoritative; the watcher is only a wake signal, so a detached re-arm loop whose fire journal no
+session reads adds nothing. The hand-written, never-tracked `~/.claude/recon-watch/loop.sh` was
+retired for that reason — do not recreate one. A watcher the harness reaps needs no second watcher
+to cover it, because step 3 sees the reap: as `KILLED`, or, when only the python child caught a
+SIGTERM, as the exit-0-with-empty-stdout non-fire (both under
+"Distinguishing the exits at step 3"). If a process probe still shows a `scripts/watcher-rearm.sh`
+on this queue under a `loop.sh` ancestor, it is that leftover. Its tree holds no `claude` process and closes nothing. Mention it to
+the human once and leave it running, per the rule below.
+
 **Process safety:** only stop watcher processes you started via background task
-controls. Never `pkill` by pattern. A `recon-watch/loop.sh` tree is not one you
-started, so this rule covers it too.
+controls. Never `pkill` by pattern.
+
+### Reading the invariants gauge
+
+The command, what counts as a finding (the chain rule included), change-only
+triage, the census follow-up, the broken-chain journal probe, the D-4 pointer and
+the filing store and keys live in
+[`skills/_shared/reading-the-invariants-gauge.md`](../_shared/reading-the-invariants-gauge.md).
+Read them there. This skill's deltas:
+
+- **Scope.** Omit the root argument, so every root in the roster is read:
+  fused-memory, like this queue, is fleet-wide. An escalation-watcher reads only
+  its own project.
+- **Handling.** At step 8, before re-arming: this loop already drains and handles
+  with the watcher down (steps 5 and 6). Apply The Action Set's judgement, but
+  there is NO escalation record, so never call `resolve_issue`. Note a
+  verify-fixed or accept-as-known finding in the accepted-as-known list kept in
+  top-level context ("Context Conservation"). file-a-real-task uses the shared
+  file's Case B keys in place of an escalation id. Tell the human about a finding
+  that needs one, and file no cockpit DecisionRecord: `reap-decisions` closes a
+  decision only once its escalation is terminal, so one with no escalation behind
+  it would stay open forever ("Closing parked decisions on resolve"). A `paused`
+  chain's pinning escalation is an orchestrator-queue L2 that the
+  escalation-watcher handles, not this queue's.
+- **A failed read** is reported to the human (Priority Hierarchy 1).
 
 ## The Action Set
 

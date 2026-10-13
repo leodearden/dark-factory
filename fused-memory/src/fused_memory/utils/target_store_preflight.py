@@ -164,8 +164,8 @@ Everything above is a DATED MEASUREMENT (tasks 4319, 5468), not an invariant, an
 not be restated as one: nothing enforces the rule mechanically, so a script
 added tomorrow is unguarded by default.
 
-Pure stdlib, ``sqlite3`` included. No probe write, no mem0 import, no network,
-no backend import.
+Stdlib (``sqlite3`` included) plus ``shared.project_layout``. No probe write, no
+mem0 import, no network, no backend import.
 """
 
 from __future__ import annotations
@@ -175,11 +175,12 @@ from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
 
+from shared.project_layout import tasks_db
+
 __all__ = [
     'TargetStoreMissing',
     'assert_queue_dir_populated',
     'assert_task_store_populated',
-    'task_store_path',
 ]
 
 _TASKS_TABLE = 'tasks'
@@ -215,33 +216,6 @@ class _StoreState(Enum):
     EMPTY = 'empty'
     POPULATED = 'populated'
     UNDETERMINED = 'undetermined'
-
-
-def task_store_path(project_root: Path | str) -> Path:
-    """Return the tasks.db a ``--project-root`` resolves to.
-
-    Lives here, rather than being spelled out at each call site, so the four
-    task-store scripts in ``fused-memory/scripts/`` (``audit_duplicate_tasks``,
-    ``audit_found_on_main_provenance``, ``check_found_on_main_spurious_rate``,
-    ``correct_found_on_main_backlog``) all guard the SAME path -- ``scripts/``
-    is not a package, so a shared module is the only place they can agree.
-
-    Those four call :func:`assert_task_store_populated`, which applies this
-    derivation for them; the function stays public for a caller that needs the
-    path WITHOUT the assertion -- reporting it, or guarding a store it reaches
-    by some other route.
-
-    Mirrors
-    ``fused_memory/backends/sqlite_task_backend.py::SqliteTaskBackend._db_path``
-    by construction, deliberately WITHOUT importing it: that is a private
-    staticmethod, and importing the backend module at guard time would defeat
-    the point of refusing before the backend exists. The duplication is one
-    three-segment join, and a drift between the two shows up as a guard that
-    refuses a project that works (loud), never as one that passes a project
-    that does not (silent). ``_TASKS_TABLE`` mirrors the backend's table name
-    on the same terms.
-    """
-    return Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
 
 
 def _refuse_unless_populated(
@@ -339,10 +313,11 @@ def assert_task_store_populated(project_root: Path | str, *, operation: str) -> 
     The entry point the four task-store scripts in ``fused-memory/scripts/``
     actually call. Only ``operation`` varies between them: the target
     derivation, the ``what`` and the ``remedy`` are constant across the whole
-    family, so they live here once rather than once per script. The same SPOT
-    argument :func:`task_store_path` already makes about the path applies with
-    more force to the prose — a remedy copied per script is a remedy that
-    drifts per script, and it is the sentence an operator actually acts on.
+    family, so they live here once rather than once per script. The path is
+    ``shared.project_layout.tasks_db``, the one the backend opens too, and the
+    same SPOT argument applies with more force to the prose — a remedy copied
+    per script is a remedy that drifts per script, and it is the sentence an
+    operator actually acts on.
 
     Deliberately does NOT log. The refusal carries the operation, the RESOLVED
     target, why it matters and the remedy; a ``logger.error`` restating that
@@ -353,7 +328,7 @@ def assert_task_store_populated(project_root: Path | str, *, operation: str) -> 
     already the better line.
     """
     _refuse_unless_populated(
-        task_store_path(project_root),
+        tasks_db(project_root),
         _classify_task_store,
         operation=operation,
         what=_TASK_STORE_WHAT,

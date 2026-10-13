@@ -701,6 +701,35 @@ class TestMem0BackendScrollCollectionPages:
         assert kwargs['scroll_filter'] == given_filter
 
     @pytest.mark.asyncio
+    async def test_payload_is_read_by_default(self, backend):
+        """Every existing caller reads payloads; the default must keep that."""
+        client = _paging_client([([], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            await _drain(backend.scroll_collection_pages('c', page_size=10))
+
+        assert client.scroll.await_args_list[0].kwargs['with_payload'] is True
+
+    @pytest.mark.asyncio
+    async def test_ids_only_walk_skips_payload_on_every_page(self, backend):
+        """with_payload=False reaches EVERY page request, and points still stream in order.
+
+        The uuid-prefix resolver enumerates ids only; a payload read on any
+        page would widen its data access for nothing.
+        """
+        p1, p2, p3 = (self._make_mock_point(f'id-{i}') for i in range(1, 4))
+        client = _paging_client([([p1, p2], 'off-1'), ([p3], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            got = await _drain(
+                backend.scroll_collection_pages('fused_reify', with_payload=False, page_size=2)
+            )
+
+        assert got == [p1, p2, p3]
+        assert client.scroll.await_count == 2
+        assert [c.kwargs['with_payload'] for c in client.scroll.await_args_list] == [False, False]
+
+    @pytest.mark.asyncio
     async def test_empty_collection_yields_nothing(self, backend):
         client = _paging_client([([], None)])
 
@@ -1510,6 +1539,65 @@ class TestMem0BackendGetPointById:
             'retrieved 2 points for a single id' in rec.getMessage()
             for rec in caplog.records
         ), f'expected a >1-point WARNING, got {[r.getMessage() for r in caplog.records]!r}'
+
+
+class TestMem0BackendGetPointsByIds:
+    """get_points_by_ids reads several points' raw payloads in ONE retrieve (task 5323)."""
+
+    @staticmethod
+    def _point(point_id: str, payload: dict | None):
+        point = MagicMock()
+        point.id = point_id
+        point.payload = payload
+        return point
+
+    @pytest.mark.asyncio
+    async def test_one_retrieve_maps_each_present_id_to_its_raw_payload(self, backend):
+        first, second, absent = (
+            '77a3f6bc-0000-4000-8000-000000000001',
+            '77a3f6bc-0000-4000-8000-000000000002',
+            '77a3f6bc-0000-4000-8000-000000000003',
+        )
+        mock_client = AsyncMock()
+        mock_client.retrieve = AsyncMock(return_value=[
+            self._point(first, {'data': 'one', 'agent_id': 'a'}),
+            self._point(second, None),
+        ])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.get_points_by_ids(
+                [first, second, absent], Scope(project_id='dark_factory'),
+            )
+
+        assert result == {first: {'data': 'one', 'agent_id': 'a'}, second: {}}
+        assert mock_client.retrieve.await_count == 1
+        call_kwargs = mock_client.retrieve.call_args.kwargs
+        assert call_kwargs['collection_name'] == f'{backend.config.mem0.collection_prefix}_dark_factory'
+        assert call_kwargs['ids'] == [first, second, absent]
+        assert call_kwargs['with_payload'] is True
+        assert call_kwargs['with_vectors'] is False
+
+    @pytest.mark.asyncio
+    async def test_no_ids_is_no_read(self, backend):
+        get_client = AsyncMock()
+
+        with patch.object(backend, '_get_async_qdrant', get_client):
+            assert await backend.get_points_by_ids([], Scope(project_id='dark_factory')) == {}
+
+        get_client.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_timeout_propagates_not_swallowed(self, backend):
+        mock_client = AsyncMock()
+        mock_client.retrieve = AsyncMock(side_effect=TimeoutError('too slow'))
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)),
+            pytest.raises(TimeoutError),
+        ):
+            await backend.get_points_by_ids(
+                ['00000000-0000-4000-8000-000000000000'], Scope(project_id='dark_factory'),
+            )
 
 
 class TestMem0BackendAddSystemRecord:

@@ -117,6 +117,14 @@ PROBE="$REPO/scripts/check_write_triage_attach_target.py"
 # cannot drift apart silently.
 PROBE_PASS_MARKER='PASS  the judge path binds a verdict to a determinate candidate'
 
+# Both probes start every NOT-held and every UNVERIFIABLE verdict line with
+# this prefix. An exit 1 whose report carries no such line is no verdict: the
+# probe died before it could report -- a missing or broken
+# scripts/_write_triage_probe_common.py, which both probes import, or a crash
+# in the probe itself -- and Python's own exit 1 there leaves only a traceback
+# on stderr. Pinned from both ends by the hermetic tests, like PROBE_PASS_MARKER.
+PROBE_FAIL_PREFIX='FAIL  '
+
 # The probe's marker for a pass that rests partly on a PARAMETER NAME rather
 # than on behaviour alone (it accepts a target-named parameter that echoes its
 # argument, because a real option (b) naming the target in a header is
@@ -372,7 +380,7 @@ elif [ "$EXTRACTED" -eq 1 ]; then
       note "              the invariant. Failing closed."
       record_fail 1
       show_probe_stderr=1
-    elif [ "$probe_rc" -eq 1 ]; then
+    elif [ "$probe_rc" -eq 1 ] && grep -q "^$PROBE_FAIL_PREFIX" <<<"$probe_out"; then
       # DELIBERATELY TERSE. The harm, BOTH accepted remedies and the
       # candidates[0] warning are all stated by the probe's own report,
       # printed directly below this and carrying the MEASURED slate. Stating
@@ -384,6 +392,11 @@ elif [ "$EXTRACTED" -eq 1 ]; then
       note "              The harm, BOTH accepted remedies and what was measured are in"
       note "              the probe's own report below."
       record_fail 1
+    elif [ "$probe_rc" -eq 1 ]; then
+      note "FAIL  item 1  UNVERIFIABLE: the probe exited 1 without reporting a verdict."
+      note "              It stopped before it could report (see its stderr below). Failing closed."
+      record_fail 1
+      show_probe_stderr=1
     else
       note "FAIL  item 1  UNVERIFIABLE: the probe could not be run (exit $probe_rc)."
       note "              Interpreter: ${PROBE_PY_CMD[*]}. Failing closed."
@@ -506,7 +519,7 @@ elif [ "$EXTRACTED" -eq 1 ]; then
       note "              the invariant. Failing closed."
       record_fail 5
       show_probe5_stderr=1
-    elif [ "$probe5_rc" -eq 1 ]; then
+    elif [ "$probe5_rc" -eq 1 ] && grep -q "^$PROBE_FAIL_PREFIX" <<<"$probe5_out"; then
       # Terse, for item 1's reason: the harm, both accepted remedies and the
       # measured slate are all in the probe's own report printed directly below.
       note "FAIL  item 5  the judge-bound candidate is NOT consumed by the attach"
@@ -514,6 +527,11 @@ elif [ "$EXTRACTED" -eq 1 ]; then
       note "              What was measured, and every branch the probe evaluated, are"
       note "              in its own report below."
       record_fail 5
+    elif [ "$probe5_rc" -eq 1 ]; then
+      note "FAIL  item 5  UNVERIFIABLE: the probe exited 1 without reporting a verdict."
+      note "              It stopped before it could report (see its stderr below). Failing closed."
+      record_fail 5
+      show_probe5_stderr=1
     else
       note "FAIL  item 5  UNVERIFIABLE: the probe could not be run (exit $probe5_rc)."
       note "              Interpreter: ${PROBE5_PY_CMD[*]}. Failing closed."

@@ -27,7 +27,7 @@ Every finding carries these fields, in the instrument's committed artefact:
 |---|---|---|
 | `key` | `fk-<12 hex>` | §2. Stable across runs and instruments. |
 | `area` | one area key | §3. |
-| `anchor` | `path/to/file.py::symbol`, `path/to/file.py`, or `slug:<kebab>` | Repo-relative. `::symbol` is the enclosing top-level or class-level definition. `slug:` only for a non-code subject (a prompt, a contract, an operating practice). |
+| `anchor` | `path/to/file.py::symbol`, `path/to/file.py`, or `slug:<kebab>` | Repo-relative. `::symbol` is the enclosing top-level or class-level definition; a method or associated item is written `::Type.method` (§2 maps Rust's `Type::method` onto it). `slug:` only for a non-code subject (a prompt, a contract, an operating practice). |
 | `tags` | list of `h1`..`h14`, `comments`, `tests`, `inv-<n>`, `kind:<instrument kind>` | At least one. `h<n>` are the fourteen heuristics of `docs/code-quality.md`; `comments`/`tests` its two stances; `inv-<n>` a `docs/legibility/design-invariants.md` id. |
 | `severity` | `high` \| `medium` \| `low` | §4. |
 | `evidence_source` | `present-tree` \| `fix-history` \| `agent-transcripts` \| `metrics` | What the claim rests on. A finding corroborated by two sources lists both. |
@@ -50,7 +50,10 @@ key       = "fk-" + sha256(canonical.encode()).hexdigest()[:12]
 `area` is the plain area key of §3 (never `<area>/<sub>`). `primary_tag`
 is the first entry of `tags`. The anchor is normalised before hashing:
 repo-relative, forward slashes, a trailing line pin removed (`:N`, `:N-M`
-and comma lists of them), surrounding whitespace stripped. Two instruments
+and comma lists of them), surrounding whitespace stripped, and a method or
+associated item written `path::Type.method` — a chain of `::` segments after
+the file (Rust's `path.rs::Type::method`) is mapped onto that form by
+replacing every `::` after the first with `.`. Two instruments
 that locate the same cost at the same anchor under the same heuristic
 therefore mint the same key without talking to each other, and a re-run
 reproduces the key of an unchanged finding.
@@ -117,7 +120,10 @@ instrument-specific ones outside a `extra:` map:
 - `inputs_consumed`: the `run_id` of every other instrument's report this
   run read (§9).
 
-Report homes: `/review` → `review/reports/` (tracked, not gitignored);
+Report homes: `/review` → `review/reports/` (tracked, not gitignored:
+every run record and rendering there is committed; files left there by
+the pre-contract format carry no `as_of_sha`, are not reports, and may
+stay gitignored — `skills/review/SKILL.md` names them);
 `/hotspot-survey` and `/review-all` → the project's plans directory;
 `/census` → the project's plans directory plus
 `docs/legibility/confusion-codebook.yaml`, whose entries carry the

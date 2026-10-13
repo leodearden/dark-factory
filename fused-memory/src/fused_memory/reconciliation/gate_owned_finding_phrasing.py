@@ -53,9 +53,12 @@ Pure throughout: no I/O, no side effects, no task writes.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from fused_memory.reconciliation.curator_gate_resolution_sweep import (
     GATE_RESOLUTION_FLAG_TYPE,
 )
+from fused_memory.reconciliation.task_metadata_selection import select_task_ids_by_metadata
 
 #: Leading marker of :data:`CANONICAL_HUMAN_GATE_ACTION`, and the short
 #: sentinel :func:`normalize_gate_owned_suggested_actions` tests compliance
@@ -163,7 +166,7 @@ def render_gate_owned_action_norm() -> str:
     )
 
 
-def extract_human_gated_task_ids(tasks):
+def extract_human_gated_task_ids(tasks: Iterable[object]) -> list[str]:
     """Return sorted, deduped str ids of human-gate-owned tasks.
 
     A task qualifies when it is a ``dict`` with a ``dict`` ``metadata``
@@ -210,25 +213,19 @@ def extract_human_gated_task_ids(tasks):
     other side — a flag's top-level ``task_id`` channel carries no project, so
     see :func:`_flag_cited_task_ids` for what that costs.
 
+    The traversal — skips, ``str`` coercion, sorted dedup — is
+    ``task_metadata_selection.py::select_task_ids_by_metadata``; this function
+    supplies only the predicate.
+
     Pure: no I/O, no side effects.  Empty input returns ``[]``.
     """
-    seen = set()
-    for task in tasks:
-        if not isinstance(task, dict):
-            continue
-        metadata = task.get('metadata')
-        if not isinstance(metadata, dict):
-            continue
-        if not (
+    return select_task_ids_by_metadata(
+        tasks,
+        lambda metadata: (
             metadata.get('operational_mode') == 'gate'
             or metadata.get('always_escalates') is True
-        ):
-            continue
-        raw_tid = task.get('id')
-        if raw_tid is None:
-            continue
-        seen.add(str(raw_tid))
-    return sorted(seen)
+        ),
+    )
 
 
 def stamp_curator_gate_sweep_provenance(flags):

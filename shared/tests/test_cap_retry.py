@@ -1530,7 +1530,7 @@ class TestCapRetryBudget:
 
 @pytest.mark.asyncio
 class TestCapRetryCostStore:
-    """CostStore integration: invocations and events."""
+    """CostStore integration: invocations."""
 
     async def test_save_invocation_correct_params(self):
         """save_invocation called with all correct parameters on success."""
@@ -1557,33 +1557,6 @@ class TestCapRetryCostStore:
         assert kw['capped'] is False
         assert kw['account_name'] == 'acct-a'
 
-    async def test_save_account_event_on_cap_hit(self):
-        """save_account_event called with cap_hit on cap detection."""
-        gate = _mock_gate(
-            account_count=2,
-            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
-            detect_cap_hit=MagicMock(side_effect=[True, False]),
-            active_account_name='acct-b',
-        )
-        cost_store = MagicMock()
-        cost_store.save_invocation = AsyncMock()
-        cost_store.save_account_event = AsyncMock()
-        result = make_result()
-        with (
-            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
-            patch(_SLEEP_PATCH, new_callable=AsyncMock),
-        ):
-            await invoke_with_cap_retry(
-                gate, 'my-label',
-                cost_store=cost_store, run_id='r1', project_id='p1',
-                prompt='hi',
-            )
-        cost_store.save_account_event.assert_awaited_once()
-        kw = cost_store.save_account_event.call_args.kwargs
-        assert kw['event_type'] == 'cap_hit'
-        assert kw['details'] == 'my-label'
-        assert 'created_at' in kw
-
     async def test_save_invocation_exception_swallowed(self, caplog):
         """save_invocation exception is swallowed (logged as warning)."""
         gate = _mock_gate()
@@ -1599,31 +1572,6 @@ class TestCapRetryCostStore:
             )
         assert got.success is True
         assert 'Failed to save invocation cost' in caplog.text
-
-    async def test_save_account_event_exception_swallowed(self, caplog):
-        """save_account_event exception is swallowed; retry still happens."""
-        gate = _mock_gate(
-            account_count=2,
-            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
-            detect_cap_hit=MagicMock(side_effect=[True, False]),
-            active_account_name='acct-b',
-        )
-        cost_store = MagicMock()
-        cost_store.save_invocation = AsyncMock()
-        cost_store.save_account_event = AsyncMock(side_effect=RuntimeError('db error'))
-        result = make_result()
-        with (
-            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
-            patch(_SLEEP_PATCH, new_callable=AsyncMock),
-            caplog.at_level(logging.WARNING),
-        ):
-            got = await invoke_with_cap_retry(
-                gate, 'lbl', cost_store=cost_store, prompt='hi',
-            )
-        assert got.success is True
-        assert 'Failed to save cap_hit event' in caplog.text
-        # save_invocation still called on the success path
-        cost_store.save_invocation.assert_awaited_once()
 
     async def test_no_error_when_cost_store_none(self):
         """No crash when cost_store is None (default)."""
@@ -1866,7 +1814,7 @@ class TestCapRetryEdgeCases:
 
 @pytest.mark.asyncio
 class TestCapRetryTimingAndSequence:
-    """Verify exact ordering: invoke -> detect -> cost_event -> sleep -> invoke."""
+    """Verify exact ordering: invoke -> detect -> sleep -> invoke."""
 
     async def test_invoke_detect_sleep_invoke_sequence(self):
         """Verify invoke -> detect_cap_hit -> sleep -> invoke on cap-hit retry."""
@@ -1909,50 +1857,6 @@ class TestCapRetryTimingAndSequence:
         ):
             await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
         mock_sleep.assert_not_awaited()
-
-    async def test_sleep_after_cost_event_before_next_invoke(self):
-        """Sleep happens AFTER save_account_event, BEFORE next invoke."""
-        call_order = []
-
-        gate = _mock_gate(
-            account_count=1,
-            before_invoke=AsyncMock(side_effect=['tok', 'tok']),
-            detect_cap_hit=MagicMock(side_effect=[True, False]),
-            active_account_name='acct',
-        )
-
-        cost_store = MagicMock()
-
-        async def save_event(**kwargs):
-            call_order.append('save_event')
-
-        cost_store.save_account_event = AsyncMock(side_effect=save_event)
-        cost_store.save_invocation = AsyncMock()
-
-        r1 = make_result()
-        r2 = make_result()
-        invoke_count = 0
-
-        async def invoke_side_effect(**kwargs):
-            nonlocal invoke_count
-            invoke_count += 1
-            call_order.append(f'invoke_{invoke_count}')
-            return [r1, r2][invoke_count - 1]
-
-        async def sleep_side_effect(duration):
-            call_order.append('sleep')
-
-        with (
-            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=invoke_side_effect),
-            patch(_SLEEP_PATCH, new_callable=AsyncMock, side_effect=sleep_side_effect),
-        ):
-            await invoke_with_cap_retry(
-                gate, 'lbl', cost_store=cost_store, prompt='hi',
-            )
-
-        # Order: invoke_1 -> save_event -> sleep -> invoke_2
-        assert call_order.index('save_event') < call_order.index('sleep')
-        assert call_order.index('sleep') < call_order.index('invoke_2')
 
 
 # ===================================================================
@@ -2513,9 +2417,10 @@ class TestCancelledErrorReleaseProbeSlot:
 class TestCapRetryUnattributedCapHit:
     """Heuristic cap fires but _handle_cap_detected returns False (token unresolvable).
 
-    In this scenario, unattributed_cap is set True (skip_confirm was renamed to
-    unattributed_cap to better reflect its broader semantics). on_agent_complete
-    must NOT be called and cost_store.save_invocation must record capped=True.
+    In this scenario, report() settles the slot with the synthetic CapHit, so the
+    slot's one-verdict rule turns the completion confirm into a no-op.
+    on_agent_complete must NOT be called and cost_store.save_invocation must
+    record capped=True for this returned attempt.
     """
 
     def _make_heuristic_result(self) -> AgentResult:

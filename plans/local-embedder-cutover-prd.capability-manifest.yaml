@@ -1,0 +1,820 @@
+prd: plans/local-embedder-cutover-prd.md
+schema_version: 1
+tasks:
+- label: α1
+  task_id: 6797
+  title: Define the granite embedder compose service and the fused-memory hold drop-in
+  note: >-
+    docker-compose.yml already carries three services (falkordb, qdrant, fused-mcp), so
+    the embedder is a new fourth service, not "a third". α1 adds two NEW `-`-prefixed
+    ExecStartPre lines (compose up for the embedder; a wait on 127.0.0.1:8420 through the
+    host-local /home/leo/bin/wait-for-port.py) and leaves the two existing lines unchanged,
+    so an embedder failure never blocks fused-memory's start and α2 only adds lines. Q2
+    (restart policy, bounded never-blocking wait) is decided here.
+  capabilities:
+  - name: embedder-compose-service-loopback-8420
+    binding: >-
+      capability→producer — α1 adds the service to fused-memory/docker/docker-compose.yml
+      bound to 127.0.0.1:8420 (PRD §4 item 1). Substrate verified: the compose file
+      exists and nothing in fused-memory/, scripts/ or the docs names 127.0.0.1:8420 at main.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 127\.0\.0\.1:8420
+      paths:
+      - fused-memory/docker/docker-compose.yml
+      expect: present
+  - name: embedder-image-digest-pin
+    binding: >-
+      capability→producer — α1 pins vllm/vllm-openai v0.26.0 by digest; substrate:
+      `docker image ls --digests` shows sha256:ffb2d59b1c05… locally (drift D14).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
+      paths:
+      - fused-memory/docker/docker-compose.yml
+      expect: present
+  - name: embedder-gpu-share-0062
+    binding: >-
+      substrate — scripts/local-model-serving/lms_serve.py::_memory_share_for yields 0.062
+      for granite (executed, drift D14); α1 writes that bound into the service command.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 0\.062
+      paths:
+      - fused-memory/docker/docker-compose.yml
+      expect: present
+  - name: service-template-bounded-embedder-wait
+    binding: >-
+      capability→producer — α1 extends scripts/fused-memory.service.template's ExecStartPre
+      (today `up -d falkordb qdrant` plus a wait on 6379/6333) with the embedder and a
+      bounded, never-blocking wait on 8420.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 127\.0\.0\.1:8420
+      paths:
+      - scripts/fused-memory.service.template
+      expect: present
+  - name: hold-drop-in-condition
+    binding: >-
+      capability→producer — α1 adds a new hold drop-in template under scripts/ carrying
+      ConditionPathExists=!<cutover lock>; no unit template in scripts/ uses
+      ConditionPathExists at main.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ConditionPathExists=!
+      paths:
+      - scripts/
+      expect: present
+  - name: compose-config-validates
+    binding: >-
+      substrate — Docker Compose v5.1.2 and the NVIDIA runtime are present (PRD §8);
+      `docker compose -f … config` is run by α1's own verify.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a docker CLI validation, not expressible as a grep over the tree
+- label: β1
+  task_id: 6798
+  title: Config overlay loader, native-width requests, startup endpoint probe, get_status
+    embedder and overlay blocks
+  note: >-
+    Owns B4 for the four existing clients, B5, B19. The engine half of B4 is γ1's.
+  capabilities:
+  - name: config-overlay-env-var
+    binding: >-
+      capability→producer — β1's loader reads FUSED_MEMORY_CONFIG_OVERLAY and deep-merges
+      the allowlisted keys over config.yaml (D14); the name appears nowhere in
+      fused-memory/src at main. Substrate: config/schema.py's loader reads CONFIG_PATH
+      (DEFAULT_CONFIG_PATH = 'config/config.yaml').
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: FUSED_MEMORY_CONFIG_OVERLAY
+      paths:
+      - fused-memory/src/
+      expect: present
+  - name: get-status-config-overlay-block
+    binding: >-
+      capability→producer — β1 adds get_status.config_overlay (path, keys, mtime) on
+      server/tools.py::get_status → services/memory_service.py::MemoryService.get_status
+      (both present, drift D17); `config_overlay` is absent from fused-memory/src at main.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: config_overlay
+      paths:
+      - fused-memory/src/
+      expect: present
+  - name: mem0-stops-emitting-embedding-dims
+    binding: >-
+      removal — backends/mem0_client.py sets embedder_config['embedding_dims'] whenever
+      dimensions differ from _MEM0_DEFAULT_EMBEDDING_DIMS (present at main, drift D5);
+      β1 removes that emission so Mem0 sends no `dimensions` (C3, B4).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: embedder_config\[['"]embedding_dims['"]\]
+      paths:
+      - fused-memory/src/fused_memory/backends/mem0_client.py
+      expect: absent
+  - name: four-clients-send-no-dimensions
+    binding: >-
+      substrate — graphiti_client.py::build_embedder, middleware/task_curator.py::TaskCurator._get_embedder
+      and fused-memory/scripts/calibrate_write_triage.py::build_embed_fn send no
+      `dimensions` today (drift D6); B4 pins all four at the HTTP layer.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behaviour asserted by boundary row B4 against a recording fake endpoint
+  - name: startup-probe-degrades-on-mismatch
+    binding: >-
+      rejection-mechanism — built by β1 (C3 startup probe); B5 observes a 1024-wide or
+      wrong-model fake degrade status with a structured error.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: rejection quality is judged by boundary row B5
+  - name: overlay-loader-refusals
+    binding: >-
+      rejection-mechanism — built by β1; B19 observes a missing file and an
+      off-allowlist key each refuse start with a structured error, and a valid overlay
+      merge.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: rejection quality is judged by boundary row B19
+- label: β2
+  task_id: 6800
+  title: C0 scope enumerator, C2 width guard, chokepoint asserts, loud search_corpus
+  note: >-
+    Decompose rebindings (see the .md twin, F1-F3): C0's registry is built on
+    fused_memory/models/scope.py (build_known_projects_map / resolve_project_id_for_root,
+    canonical yaml only, basename fallback; a phantom root per is_phantom_project_root is
+    the "does not resolve" case), not the dashboard's _discover_escalation_urls. The
+    chokepoint list drops fused-memory/scripts/cgl_eta_auto_apply_impl.py (read-only dump;
+    its cross-graph writes go through maintenance/cross_graph_move.py). β2 defines
+    "vector-bearing" and seeds embedder_scope.excluded so the live container set classifies.
+  capabilities:
+  - name: embedder-width-mismatch-type
+    binding: >-
+      capability→producer — β2 adds EmbedderWidthMismatch (C2); absent from fused-memory/src
+      at main.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class EmbedderWidthMismatch[(:]
+      paths:
+      - fused-memory/src/
+      expect: present
+  - name: embedder-scope-config-section
+    binding: >-
+      capability→producer — β2 adds the embedder_scope config section (extra_projects,
+      excluded with reasons; D13) to the config schema; absent at main.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: embedder_scope
+      paths:
+      - fused-memory/src/fused_memory/config/
+      expect: present
+  - name: c0-registry-from-scope-module
+    binding: >-
+      AS WRITTEN producer-absent: C0 resolves roots "through the same discovery the
+      dashboard uses (canonical, legacy as fallback)", but dashboard/src/dashboard/config.py::_discover_escalation_urls
+      is not importable from fused-memory and maps basename → escalation URL. RESOLVED at
+      decompose: bind to fused_memory/models/scope.py::build_known_projects_map and
+      ::resolve_project_id_for_root (present; server/main.py already builds the map from
+      PROJECT_ROOT + DASHBOARD_KNOWN_PROJECT_ROOTS); unresolvable = ::is_phantom_project_root.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a rebinding of the registry source, asserted by B8a and reviewed in the leaf
+  - name: vector-bearing-definition-and-seeds
+    binding: >-
+      AS WRITTEN producer-extent-short for the live P0/guard signals (α2, ζ, η): D13's seed
+      patterns do not cover live mem0migrations (1 point; mem0 telemetry placeholder,
+      untouched while MEM0_TELEMETRY=false), and "vector-bearing" is undefined, so
+      0-point collections (test, task_dedup_dark_factory, task_dedup_reify) and
+      0-embedding graphs (probe_e1_*, sweep_e4_*, knowlive) classify as unclassified if
+      counted by configuration. RESOLVED by the lead in β2's task text: a graph is
+      vector-bearing iff it holds a non-NULL name_embedding or fact_embedding; in-scope
+      membership is by name; any other Qdrant collection with at least one point must be
+      excluded or unrooted. Seeds: evalmem_*, _probe*, _test_*, task_curator_test_*,
+      task_dedup_*, test, mem0migrations. task_curator_p / _proj / _project are D13
+      unrooted (backed up, dropped at P3). β2 proves it with a read-only live C0 run before
+      merge; ζ's live census and P0 dry-run are the arbiter.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a definition the leaf makes; B8a asserts the classification on fixtures and α2 observes it live
+  - name: qdrant-and-falkor-width-guard
+    binding: >-
+      rejection-mechanism — built by β2 (C2 typed probe; vec.euclideanDistance and vecf32
+      exist and a width mismatch raises, PRD §8); B6 and B7 observe the refusal naming the
+      container.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: rejection quality is judged by boundary rows B6 and B7
+  - name: chokepoint-asserts
+    binding: >-
+      AS WRITTEN producer-absent for one site: C2 names "the recovery-dump re-apply path of
+      scripts/cgl_eta_auto_apply_impl.py", but fused-memory/scripts/cgl_eta_auto_apply_impl.py
+      only reads and dumps fact_embedding and nothing re-applies it (drift D10). RESOLVED:
+      the vecf32 SET sites are graphiti_client.py::GraphitiBackend.update_node_embedding,
+      ::update_edge_embedding (γ2 removes it), maintenance/cross_graph_move.py::_embedding_set_clause
+      / ::format_vecf32_literal (which cgl_eta reaches via fused-memory/scripts/migrate_cross_graph_leak.py),
+      and arm_harness/graph_copy.py::_write_vectors (scratch-name guarded). B18 observes
+      cross_graph_move refuse before the SET.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: rejection quality is judged by boundary row B18
+  - name: chokepoint-scope-for-scratch-and-copy-sites
+    binding: >-
+      Undecided by the PRD: arm_harness/graph_copy.py::_write_vectors writes eval-arm widths
+      onto scratch graphs, so a bare len(v) == config.embedder.dimensions assert there would
+      break the eval harness; graphiti_client.py::GraphitiBackend.reassign_edge and
+      ::redirect_node_edges copy vectors by reference (no vecf32 literal) and carry the
+      source edge's width. RESOLVED by the lead in β2's task text: the shared assert takes
+      the expected width as a parameter (graph_copy passes its arm's width), and the two
+      copy-by-reference sites are width-preserving inside a uniform graph, so they are
+      named as deliberately exempt in the chokepoint test.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a design choice homed in this leaf
+  - name: search-corpus-raises-and-callers-surface
+    binding: >-
+      rejection-mechanism — middleware/task_curator.py::TaskCurator.search_corpus returns []
+      on any exception today (drift D8); β2 makes it raise a structured error (D11) and
+      updates server/tools.py::search_tasks and middleware/curator_zot_duplicate_sweep.py.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the removed fail-soft is a code-shape judgment; asserted by β2's tests
+  - name: guard-binds-at-backend-init
+    binding: >-
+      rejection-mechanism (critic C6) — C2's guard is enforced wherever the Graphiti/Mem0
+      backends or MemoryService initialise, in any process. During the soak tracked
+      config.yaml is still 1536 while the stores are 768, and about 48 scripts plus the two
+      timer jobs build their own backends from config. β2's test builds a backend with
+      config 1536 against a 768 fixture and observes the refusal.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: rejection behaviour asserted by β2's executed fixture test
+- label: α2
+  task_id: 6801
+  title: Install and verify the embedder on the host (attended operator step)
+  note: >-
+    execution_class operational (born-at-L2 gate), files []. Signal (4) is β1/β2's live
+    observation on the unchanged 1536 deployment.
+  capabilities:
+  - name: embedder-serves-768-on-loopback
+    binding: producer α1 (upstream, edge α2→α1) — the compose service on 127.0.0.1:8420.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: an operator's live curl and ss observation
+  - name: phase1-probe-rerun
+    binding: >-
+      AS WRITTEN producer-extent-short: the committed
+      plans/local-memory-models-eval-embedder-residency-2026-10-10/probe.py and run_phase.sh
+      exist, but their inputs audio/jfk.flac and data/mem0_texts.json are deliberately
+      uncommitted, no committed script builds mem0_texts.json, and probe.py defaults to
+      port 8415 (drift D19). RESOLVED at decompose: α2's brief carries both recreation
+      steps (fetch openai/whisper tests/jfk.flac and check its sha256; a read-only Qdrant
+      scroll of 6000 payload.data strings from fused_dark_factory) and passes
+      --embed-url http://127.0.0.1:8420/v1/embeddings. WhisperWriter's venv exists.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: an attended measurement appended to the residency artifact
+  - name: live-get-status-embedder-block-guard-ok
+    binding: >-
+      producers β1 (embedder block, startup probe) and β2 (guard, scope, excluded list),
+      both upstream (α2→β2→β1). Extent depends on β2's vector-bearing definition and seeds
+      (β2 capability vector-bearing-definition-and-seeds).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a live get_status observation by the operator
+- label: γ1
+  task_id: 6802
+  title: 'Reembed engine part 1: derivation module, text cache, census, prepare'
+  note: >-
+    Owns B1, B2, B3, B15a and the engine half of B4. Decides Q1 (cache format) and, with δ,
+    Q3 (textless Mem0 points). mem0migrations is already measured (drift D20): created by
+    mem0 only when MEM0_TELEMETRY is truthy, one placeholder vector, never an embedding;
+    γ1 pins that by test and it is excluded with that reason.
+  capabilities:
+  - name: reembed-module-entry-point
+    binding: >-
+      capability→producer — γ1 creates the fused_memory.maintenance.reembed package with a
+      `python -m` entry point (PRD §1 operator signal, C1); maintenance/ has no reembed at
+      main.
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - fused-memory/src/fused_memory/maintenance/reembed/__main__.py
+      expect: present
+  - name: derivation-parity-with-production
+    binding: >-
+      substrate — mem0.embeddings.openai.OpenAIEmbedding.embed replaces newlines;
+      graphiti_core nodes.py::create_entity_node_embeddings / edges.py::create_entity_edge_embeddings
+      embed raw; middleware/task_curator.py::embedding_text is module-level;
+      arm_harness/graph_copy.py::reembed_graph exists (scratch-guarded, so parity-only)
+      (drift D5, D7, D8, D11). B1–B3 pin it at the HTTP layer.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behaviour asserted by boundary rows B1, B2 and B3
+  - name: paged-falkor-reads
+    binding: >-
+      substrate — graphiti_client.py::_paged_ro_query and ::apply_incompleteness_policy
+      (drift D4); B15a covers a >10,000-edge fixture with incoming edges.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behaviour asserted by boundary row B15a against a real FalkorDB fixture
+  - name: curator-texts-across-all-tags
+    binding: >-
+      substrate — maintenance/backfill_curator_corpus.py::BackfillManager.prune unions
+      get_tasks over list_tags (drift D8); TaskCurator._point_id is uuid5(NAMESPACE_URL,
+      '{project_id}/{task_id}').
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing substrate; a present-check would be vacuous
+  - name: scope-from-c0
+    binding: producer β2 (upstream, γ1→β2) — census and prepare call C0.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: dependency direction, asserted by the wired edge
+- label: γ2
+  task_id: 6803
+  title: 'Reembed engine part 2: record-keyed backup, apply; retire reindex.py and orphaned
+    helpers'
+  note: >-
+    Owns B10a and B15b. File list widened at decompose (drift D15):
+    tests/test_graphiti_group_arg_canonicalization.py (sweep rows and the
+    `len(_ALL_GROUP_ARG_SWEEP_CASES) == 43` assert) and tests/test_timeout_marker_inversion_guard.py
+    (a _GRANDFATHERED entry naming the deleted integration file). Orphans that die with
+    drop_vector_indices are named as "orphaned helpers": GraphitiBackend.drop_vector_index,
+    ._await_index_catalog_settled and falkor_indices.py::IndexCatalogUnsettledError
+    (falkor_indices.py::unsettled_index_statuses, ::vector_index_properties and ::list_indices
+    stay; the first has live callers outside this leaf). update_node_embedding stays; its live callers are now
+    GraphitiBackend._mint_entity_node and ::rename_entity_node (drift D3). The removal signal
+    is a definition/call-site check; prose mentions in docstrings are reworded but not gated.
+  capabilities:
+  - name: stale-reindex-helpers-undefined
+    binding: >-
+      removal — graphiti_client.py defines query_stale_node_embeddings,
+      query_stale_edge_embeddings, _query_stale_embeddings, update_edge_embedding and
+      drop_vector_indices at main (drift D2); γ2 removes them.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def (_query_stale_embeddings|query_stale_node_embeddings|query_stale_edge_embeddings|update_edge_embedding|drop_vector_indices)\(
+      paths:
+      - fused-memory/src/
+      - fused-memory/tests/
+      expect: absent
+  - name: stale-reindex-helpers-uncalled
+    binding: >-
+      removal — the call sites live in maintenance/reindex.py, tests/test_reindex.py and
+      tests/test_drop_vector_indices*.py at main (drift D15).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: \.(_query_stale_embeddings|query_stale_node_embeddings|query_stale_edge_embeddings|update_edge_embedding|drop_vector_indices)\(
+      paths:
+      - fused-memory/src/
+      - fused-memory/tests/
+      expect: absent
+  - name: orphaned-index-helpers-undefined
+    binding: >-
+      removal — AS WRITTEN producer-extent-short (the PRD's removal list omits them, drift
+      D2); RESOLVED by naming them as the "orphaned helpers" of PRD §4 item 3. Defined at
+      main: GraphitiBackend.drop_vector_index, ._await_index_catalog_settled,
+      falkor_indices.py::IndexCatalogUnsettledError (and ::vector_drop_statement, left to
+      γ2's own grep). falkor_indices.py::unsettled_index_statuses is NOT an orphan: it has
+      live callers in fused-memory/scripts/falkordb_index_activation_probe.py and
+      tests/test_bm25_serving_integration.py, so it stays and the check does not name it.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: (def (drop_vector_index|_await_index_catalog_settled)\(|^class IndexCatalogUnsettledError[(:])
+      paths:
+      - fused-memory/src/
+      expect: absent
+  - name: reindex-module-removed
+    binding: removal — fused-memory/src/fused_memory/maintenance/reindex.py exists at main
+      with no production caller (drift D2).
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - fused-memory/src/fused_memory/maintenance/reindex.py
+      expect: absent
+  - name: reindex-module-unimported
+    binding: >-
+      removal — fused_memory.maintenance.reindex is imported or patched only by
+      tests/test_reindex.py and tests/test_local_endpoint_base_url_integration.py at main.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: fused_memory\.maintenance\.reindex
+      paths:
+      - fused-memory/src/
+      - fused-memory/tests/
+      - fused-memory/scripts/
+      expect: absent
+  - name: backup-and-apply-round-trip
+    binding: >-
+      capability→producer — γ2 adds backup and apply over γ1's cache and census (upstream,
+      γ2→γ1); Qdrant 1.17.1 supports recreate, chunked upsert and payload-index creation
+      (PRD §8). B10a and B15b observe the round trip and the paged write.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behaviour asserted by boundary rows B10a and B15b against real store fixtures
+- label: ε
+  task_id: 6804
+  title: search_tasks config key, provenance stamps + guard (C4), quantile mapper (D4)
+  note: >-
+    R7: ε stamps every existing embedder-space group in tracked config.yaml (write_triage
+    bands, write_triage_project_calibrations.dark_factory, the new embedder_thresholds) with
+    text-embedding-3-small/1536; an absent stamp is a refusal, never a match. Calibrate and
+    audit live in fused-memory/scripts/, not scripts/.
+  capabilities:
+  - name: provenance-mismatch-type
+    binding: capability→producer — ε adds CalibrationProvenanceMismatch (C4); absent at main.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class CalibrationProvenanceMismatch[(:]
+      paths:
+      - fused-memory/src/
+      expect: present
+  - name: provenance-guard-function
+    binding: capability→producer — ε adds check_embedder_provenance(stamp, config.embedder)
+      (C4); absent at main.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def check_embedder_provenance\(
+      paths:
+      - fused-memory/src/
+      expect: present
+  - name: embedder-thresholds-group
+    binding: capability→producer — ε adds the embedder_thresholds config group (D5) and, per
+      R7, writes it stamped into tracked fused-memory/config/config.yaml. The check reads
+      the tracked YAML key, because β1's overlay allowlist already spells the group name
+      under fused-memory/src three leaves earlier.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^embedder_thresholds:'
+      paths:
+      - fused-memory/config/config.yaml
+      expect: present
+  - name: tracked-config-stamped
+    binding: >-
+      capability→producer — R7: tracked fused-memory/config/config.yaml carries no
+      embedder_model stamp at main (write_triage bands at t_high 0.8868…, the
+      dark_factory calibration entry); ε adds them.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^[[:space:]]+embedder_model:'
+      paths:
+      - fused-memory/config/config.yaml
+      expect: present
+  - name: consumers-refuse-on-mismatch
+    binding: >-
+      rejection-mechanism — built by ε at server/write_triage.py, server/near_duplicate_guard.py,
+      server/tools.py::search_tasks, middleware/curator_zot_duplicate_sweep.py and
+      fused-memory/scripts/audit_duplicate_memories.py (resolve_ann_threshold /
+      restrict_delete_candidates_for_apply present, drift D9d); B16 observes each refuse and
+      audit --apply exit non-zero deleting nothing.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: rejection quality is judged by boundary row B16
+  - name: calibrate-writes-overlay
+    binding: >-
+      producer β1 (overlay loader, upstream via ε→β2→β1) plus substrate
+      fused-memory/scripts/calibrate_write_triage.py --write-config / --write-project-config
+      (present); B20 observes band keys and stamp land in the overlay with config.yaml
+      unchanged.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behaviour asserted by boundary row B20
+  - name: quantile-mapper-c4b-on-fixture
+    binding: >-
+      capability→producer — ε's new mapper script writes a C4b document on a fixture. Its
+      fixture output must not land under fused-memory/calibration/embedder-threshold-map-*.json,
+      which is ζ's delivered path.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the mapper's name is the leaf's choice; asserted by ε's fixture test
+- label: δ
+  task_id: 6805
+  title: 'reembed cutover: profiles, phases P0–P6, hold, journal, transient unit with dead-owner
+    restore, auto-restore, P5 semantics, smoke'
+  note: >-
+    Owns B8b, B9, B10b, B11, B12a, B12b, B13 (transient-unit fixture), B14, B17. R1: δ
+    replaces the decompose stub scripts/embedder-cutover-cleanup.sh with the real θ action
+    delegating to a reembed cleanup subcommand δ names. Q5 deadline: δ ships it as a
+    profile field defaulting to 15 min past P3 start; ζ reports the measured window against
+    it. The unrooted-curator self-heal runs through
+    middleware/task_interceptor.py::TaskInterceptor._maybe_backfill_corpus (drift D8), not
+    TaskCurator. δ also exposes a scratch-profile-only fault-injection seam for ζ.
+  capabilities:
+  - name: cutover-module
+    binding: capability→producer — δ creates maintenance/reembed/cutover.py (PRD §10 row δ)
+      inside γ1's package.
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - fused-memory/src/fused_memory/maintenance/reembed/cutover.py
+      expect: present
+  - name: dead-owner-guard-timer
+    binding: capability→producer — δ adds fused-memory-cutover-guard.timer, installed at P1
+      and removed at P6 (I3); the unit name appears nowhere at main.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: fused-memory-cutover-guard
+      paths:
+      - fused-memory/
+      - scripts/
+      expect: present
+  - name: resume-if-owner-dead
+    binding: capability→producer — δ adds `cutover --resume --restore-only --if-owner-dead`
+      (I3); absent at main.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: if-owner-dead
+      paths:
+      - fused-memory/src/
+      expect: present
+  - name: cleanup-script-real-not-stub
+    binding: >-
+      capability→producer — R1: the lead commits the fail-loud stub carrying
+      EMBEDDER-CUTOVER-CLEANUP-STUB before filing; δ replaces it. θ's before_done runs it.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: EMBEDDER-CUTOVER-CLEANUP-STUB
+      paths:
+      - scripts/embedder-cutover-cleanup.sh
+      expect: absent
+  - name: engine-and-guard-inputs
+    binding: >-
+      producers γ1 (census, prepare, cache), γ2 (backup, apply), β2 (C0, guard), β1 (overlay
+      loader for P5 validation), ε (C4b format, embedder_thresholds group), α1 (hold drop-in
+      template) — all upstream of δ.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: dependency direction, asserted by the wired edges
+  - name: dead-owner-deadline
+    binding: >-
+      AS WRITTEN producer-downstream: Q5 decides the deadline "in δ against ζ's measured
+      window", and ζ depends on δ. RESOLVED at decompose: δ ships a profile-configurable
+      deadline with the PRD's suggested default (15 min past P3 start); ζ reports its
+      measured window against that deadline and escalates if the margin is short.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a dependency-direction resolution recorded in the .md twin
+  - name: restore-hold-and-p5-behaviour
+    binding: >-
+      rejection-mechanism — built by δ; B8b, B9, B10b, B11, B12a, B12b, B13 (transient
+      unit), B14 and B17 observe it on fixture stores. Quiesce surface verified (drift D12):
+      orchestrator-watchdog.py::fused_memory_liveness_pass skips only a disabled unit,
+      scripts/restart-fused-memory.sh restarts, the staleness backstop, Wants= in eight
+      orchestrator units, the socket template and both timers.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behaviour asserted by the boundary rows δ owns
+  - name: p5-threshold-map-input
+    binding: >-
+      capability→producer (critic C3) — C1 does not say how P5 finds the dated C4b file.
+      δ adds `cutover --threshold-map PATH`, validated at P0 (shape, source/target equal
+      to the cutover's identities, no escalated entry). ζ runs ε's mapper between prepare
+      and the scratch cutover and passes that file; η passes ζ's committed map.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: argument name is δ's to spell; ζ's rehearsal exercises it end to end
+  - name: overlay-drop-in-on-service-and-timer-units
+    binding: >-
+      Leo's ruling 2026-10-11 (extends D14) — the FUSED_MEMORY_CONFIG_OVERLAY drop-in goes
+      on fused-memory.service and on fused-memory-flag-marker-sweep.service and
+      memory-metadata-coverage-census.service, whose jobs build MemoryService/Mem0Backend
+      from config (fused-memory/scripts/sweep_orphan_flag_markers.py,
+      census_memory_metadata.py, retro_stamp_topics.py). The live profile lists all three;
+      P5 writes them, rollback and auto-restore remove them, cleanup removes them.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: host unit state, observed by η's post-P6 check
+  - name: profile-owns-every-unit-name-and-path
+    binding: >-
+      critic C7 — the timers to stop, the guard-timer unit, the cutover unit and the lock,
+      journal, overlay and drop-in paths are profile fields, so a scratch run cannot touch
+      a live unit. B9 asserts a scratch dry-run names no live unit or path. P0 also
+      corroborates that the installed hold drop-in's ConditionPathExists equals the
+      profile's lock path on both held units.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: asserted by boundary row B9 and δ's P0 preflight test
+- label: ζ
+  task_id: 6806
+  title: Dress rehearsal on scratch copies (integration gate)
+  note: >-
+    task_kind normal, full path (precedent task 3722). The report carries the line
+    PRD[-]MARKER:local-embedder-cutover rehearsal[-]report with the brackets removed; it
+    is written bracketed everywhere in plans/ so this manifest never satisfies its own
+    check.
+  capabilities:
+  - name: rehearsal-report-committed
+    binding: >-
+      capability→producer — ζ commits plans/local-embedder-cutover-rehearsal-<date>.md
+      carrying the marker line; nothing under plans/ carries it at main.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: PRD[-]MARKER:local-embedder-cutover rehearsal[-]report
+      paths:
+      - plans/
+      expect: present
+  - name: threshold-map-committed
+    binding: >-
+      capability→producer — ζ commits fused-memory/calibration/embedder-threshold-map-<date>.json
+      (C4b, computed_on.census_sha); no such file exists at main. ε's mapper (upstream)
+      produces the format.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '"census_sha"'
+      paths:
+      - fused-memory/calibration/embedder-threshold-map-*.json
+      expect: present
+  - name: live-census-and-dry-run-p0
+    binding: >-
+      producers γ1 (census) and δ (cutover --dry-run) upstream. Extent of a passing P0 on the
+      live container set depends on β2's vector-bearing definition and seeds (upstream).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a live observation recorded in the rehearsal report
+  - name: injected-fault-auto-restore-on-real-run
+    binding: >-
+      AS WRITTEN producer-extent-short: δ's B11 injects its fault in a fixture test, which
+      ζ cannot reuse on a real scratch run. RESOLVED at decompose: δ exposes a
+      scratch-profile-only fault-injection seam (refused under the live profile).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a rehearsal observation recorded in the report
+  - name: real-systemd-b13-and-round-trip
+    binding: >-
+      producers δ (hold, profiles, B10b path) and α1 (drop-in template) upstream; substrate
+      systemd-run --user transient units (precedent task 3722), Qdrant snapshots, a FalkorDB
+      RDB copy.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a rehearsal observation recorded in the report
+- label: η
+  task_id: 6807
+  title: Live cutover (born-at-L2 attended operator gate)
+  note: >-
+    execution_class operational, files []. Decides Q4 (halt every orchestrator's scheduler
+    for the window) and Q6 (calibration after P6). Depends on κ1 (R3).
+  capabilities:
+  - name: live-cutover-and-status
+    binding: >-
+      producers δ (cutover --profile live), β1 (config_overlay), β2 (guard), γ1 (census), ζ
+      (C4b map, rehearsal predicate) — all upstream.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: an attended live observation
+  - name: recalibration-into-overlay
+    binding: >-
+      producer ε (B20, calibrate writes the overlay) upstream; substrate
+      fused-memory/scripts/calibrate_write_triage.py --write-config / --write-project-config.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: an attended run whose reports the operator commits
+  - name: write-triage-owner-notified
+    binding: producer κ1 (upstream via R3's edge η→κ1).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: dependency direction, asserted by the wired edge
+- label: λ
+  task_id: 6808
+  title: Fold the embedder overlay into tracked config after the soak
+  note: >-
+    R4: task_kind normal, complexity simple, milestone delayed 1209600 s after η. Reads
+    ~/.config/fused-memory/embedder-overlay.yaml read-only; writes tracked config.yaml.
+  capabilities:
+  - name: tracked-config-carries-granite
+    binding: >-
+      capability→producer — λ writes the overlay's embedder block into
+      fused-memory/config/config.yaml, which names text-embedding-3-small at main; the
+      overlay itself is η's (upstream).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^  model:[[:space:]]*["'']?granite-embedding-english-r2'
+      paths:
+      - fused-memory/config/config.yaml
+      expect: present
+  - name: effective-values-unchanged
+    binding: producer η (upstream) — overlay present; β1's config_overlay reports it.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a live get_status comparison
+- label: θ
+  task_id: 6809
+  title: Remove the overlay and the 1536 backups after the fold
+  note: >-
+    R1: task_kind deterministic, before_done {script: scripts/embedder-cutover-cleanup.sh,
+    args: [--profile, live], timeout_secs: 600, kind: deploy}, always_escalates false, no
+    target_unit.
+  capabilities:
+  - name: cleanup-action
+    binding: >-
+      producer δ (the real script and its reembed cleanup subcommand, gated by δ's
+      cleanup-script-real-not-stub check) and λ (the fold) — both upstream.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a deterministic before_done; its own exit code is the gate
+- label: κ1
+  task_id: 6799
+  title: 'Cross-PRD corrections: write-triage evidence stale at η; eval PRD pointer'
+  capabilities:
+  - name: write-triage-prd-amended
+    binding: >-
+      capability→producer — κ1 adds a dated amendment naming this PRD; the write-triage PRD
+      does not mention it at main.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: local-embedder-cutover-prd
+      paths:
+      - plans/write-triage-flip-readiness-prd.md
+      expect: present
+  - name: eval-prd-pointer
+    binding: capability→producer — κ1 adds the pointer; absent from the eval PRD at main.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: local-embedder-cutover-prd
+      paths:
+      - plans/local-memory-models-eval-prd.md
+      expect: present
+- label: κ2
+  task_id: 6810
+  title: Docs and secondary config after cutover
+  note: >-
+    R2: the text-embedding-3-small grep is restricted to κ2's own files (SETUP.md README.md
+    CLAUDE.md DESIGN.md OPERATIONS.md fused-memory/config/config-docker.yaml) and may hit
+    only history, provenance or the rollback runbook. R5: κ2 also documents that the
+    configured api_url beats an ambient OPENAI_BASE_URL / OPENAI_API_BASE
+    (config/env_precedence.py::warn_if_ambient_base_url_is_overridden), absorbing 4877's
+    item 1.
+  capabilities:
+  - name: docs-and-skills-updated
+    binding: >-
+      producer ζ (C4b artifact with the mapped 0.6) and α1 (compose embedder service) —
+      upstream via κ2→η→ζ. Substrate: skills/review/references/phase3-triage.md passes
+      score_threshold=0.6 twice; skills/review-all/SKILL.md says ">= 0.6" in prose.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: no task depends on κ2, so a dispatch gate would gate nothing

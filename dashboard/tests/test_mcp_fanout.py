@@ -785,9 +785,9 @@ class TestFanoutLabel:
     def test_label_is_composed_from_the_single_project_label_definition(self):
         """``fanout_label`` must delegate the basename rule, not re-derive it.
 
-        ``project_label`` is the one definition ``active_tasks._project_label``
-        and ``redux_api._project_label`` are meant to collapse onto; a future
-        edit that inlines the rule here again would silently re-fork it.
+        ``project_label`` is the one definition every dashboard module labels
+        projects with; a future edit that inlines the rule here again would
+        silently re-fork it.
         """
         from pathlib import Path
 
@@ -800,7 +800,7 @@ class TestFanoutLabel:
         """Discrimination is by basename, so same-named roots still collapse.
 
         Documented, inherited behaviour rather than an oversight: scheduler's
-        ``label_to_root`` and redux_api's per-project payload already key on the
+        per-label joins and redux_api's per-project payload already key on the
         same basename, so diverging to full paths here alone would make this one
         log label inconsistent with every other project label the UI renders.
         Pinned so the assumption is executable, not only prose in the docstring.

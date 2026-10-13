@@ -6,12 +6,9 @@ carries all host-invariant safety directives committed in the template
 
 Exit codes
 ----------
-0 — parity (all required directives present, and no drop-in overrides the unit)
-1 — drift, OR a drop-in override applies (the unit FILE was compared, the
-    EFFECTIVE configuration was NOT). Both on 1 because "I could not verify"
-    belongs with "I found a difference", not with the benign 2 below, which
-    setup-host.sh's gate treats as a skip.
-2 — installed unit absent (no installed unit found at the given path)
+The family's codes are defined once, in
+``systemd_unit_parity.py::ParityExit``. Here, drift means a required directive
+is missing from the installed unit.
 
 An exit status alone is not enough to read this script's verdict: 2 is also
 what `python3` returns for a script it cannot open and what argparse returns
@@ -19,7 +16,7 @@ for a rejected flag. So EVERY line this script emits carries the
 ``[fused_memory_unit_parity]`` tag, and setup-host.sh's parity gate believes a
 status only when that tag is present in the captured output. The tag's ABSENCE
 is therefore conclusive rather than heuristic, which only holds because every
-PHYSICAL line carries it — see ``_log``.
+PHYSICAL line carries it — see ``systemd_unit_parity.emit``.
 
 Usage
 -----
@@ -42,12 +39,15 @@ Design notes
 - Required directives are an explicit curated allow-list of host-INVARIANT safety
   switches. They are NOT auto-derived from the template, because some template lines
   are host-specific (e.g. Environment=...PREDONE_HOOK...) and would produce false
-  drift alarms on other machines.
+  drift alarms on other machines. Their Environment= part is
+  ``systemd_unit_parity.py::ENV_POLICY``'s required projection.
 - --fix only APPENDS missing directives; it never removes or reorders existing lines.
   This preserves intentionally host-specific lines (e.g. extra
   DASHBOARD_KNOWN_PROJECT_ROOTS entries) that live only in the installed unit.
-- All output goes through ``_log`` so the report is uniformly tagged; the
-  contract is pinned by test_main_every_emitted_line_carries_the_log_tag in
+- All output goes through the family's one tagger, ``systemd_unit_parity.emit``
+  (via ``_log``, or ``emit_block`` for the ``[override]`` block), so the report
+  is uniformly tagged; the contract is pinned by
+  test_main_every_emitted_line_carries_the_log_tag in
   tests/scripts/test_check_fused_memory_unit_parity.py.
 - DROP-INS are consulted even when the unit file is at parity, via the shared
   ``systemd_unit_parity.find_dropins``. `systemctl --user edit` never modifies
@@ -69,15 +69,22 @@ import subprocess
 import sys
 from collections.abc import Sequence
 
-# find_dropins lives in scripts/systemd_unit_parity.py, and this bare
-# module-name import is the same mechanism the three sibling checkers already
-# use — do not add a path shim. It resolves in BOTH contexts this script runs
-# in: under the CLI python puts the executed script's own directory
-# (``scripts/``) at ``sys.path[0]``, and under pytest
-# ``tests/scripts/conftest.py`` inserts ``scripts/`` explicitly (load-bearing,
-# because pyproject sets ``--import-mode=importlib``, under which pytest
-# deliberately does not perform that sys.path mutation itself).
-from systemd_unit_parity import find_dropins  # pyright: ignore[reportMissingImports]
+# A bare module-name import, the same mechanism the three sibling checkers use
+# — do not add a path shim. It resolves in BOTH contexts this script runs in:
+# under the CLI python puts the executed script's own directory (``scripts/``)
+# at ``sys.path[0]``, and under pytest ``tests/scripts/conftest.py`` inserts
+# ``scripts/`` explicitly (load-bearing, because pyproject sets
+# ``--import-mode=importlib``, under which pytest deliberately does not perform
+# that sys.path mutation itself).
+from systemd_unit_parity import (
+    ENV_POLICY,
+    SERVICE_SECTION,
+    ParityExit,
+    UnitFamily,
+    emit,
+    emit_block,
+    find_dropins,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -96,56 +103,10 @@ _SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 _DEFAULT_TEMPLATE = _SCRIPT_DIR / "fused-memory.service.template"
 
 # Host-invariant safety switches that MUST be present in [Service] as
-# non-comment directives.  Extend this list to guard additional safety flags.
+# non-comment directives. The Environment= entries are ENV_POLICY's required
+# projection; a host-local name cannot be one, because EnvPolicy raises at import
+# (B5, plans/review-all-s25-scripts-instruments-prd.md D5).
 #
-# BUT NEVER ADD A NAME THAT scripts/render_systemd_unit.py PRESERVES.
-# Concretely, today: never add `Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=...`.
-# The two mechanisms are incompatible by construction, and the failure is silent
-# in the worst way — it lands on the unit that governs RECONCILIATION.
-#
-# Since task 4796, setup-host.sh installs this unit through that renderer, which
-# reads the host's DASHBOARD_KNOWN_PROJECT_ROOTS off the installed unit and puts
-# it back into the fresh render. A host that registered nine project roots keeps
-# nine. Now suppose the single-root committed line were added to the list below:
-#
-#   1. find_drift tests EXACT WHOLE-LINE membership, so on that nine-root host
-#      the required single-root line reads as MISSING;
-#   2. --fix appends it after the LAST [Service] line;
-#   3. systemd applies Environment= in file order with LAST-WINS, so the
-#      appended single-root line BEATS the preserved one;
-#   4. the checker then reports parity and exits 0.
-#
-# Eight projects silently stop being known to reconciliation
-# (fused_memory/models/scope.py reads this variable as KNOWN_PROJECT_ROOTS_ENV;
-# reconciliation/harness.py raises UnknownProjectError for a project outside the
-# set), and nothing reports it. The remedy for a host-local value is NOT this
-# list — it is the renderer's preserve set.
-#
-# Held by tests/scripts/test_check_fused_memory_unit_parity.py::
-# test_preserved_names_are_disjoint_from_required_service_directives, with the
-# clobber demonstrated by ::test_a_required_known_project_roots_line_would_reclobber.
-# No code in either module can prevent an edit to a constant in the other, which
-# is why the guard is a cross-module test and this is a comment.
-#
-# PINNED FROM BOTH ENDS, and the second anchor is not redundant. The test above
-# derives its preserved set solely from render_systemd_unit.UNITS[*].
-# host_local_environment, so dropping the name from a UnitSpec while
-# fused_memory/models/scope.py still read it would make that test pass
-# VACUOUSLY — the intersection goes empty for the wrong reason and this hazard
-# is wide open again underneath a green suite. So the same suite also holds
-# ::test_scope_known_project_roots_env_is_disjoint_from_required_service_directives
-# (anchored on scope.py::KNOWN_PROJECT_ROOTS_ENV, the constant whose value is
-# what makes a clobber damaging) and
-# ::test_scope_known_project_roots_env_is_actually_preserved_by_the_renderer,
-# which is the join: it goes red exactly when the renderer stops preserving
-# what scope.py still reads.
-#
-# Those guards read scope.py with `ast` rather than importing it, and that is
-# MEASURED, not stylistic: fused_memory is not installed in the
-# `uv run --project shared` environment tests/scripts/ runs under
-# (scripts/orchestrator.yaml's test_command), so `import fused_memory` raises
-# ModuleNotFoundError. "Simplifying" the source read into an import turns the
-# guard into a collection error that says nothing about the invariant.
 # Restart=on-failure / RestartSec=5 / RestartSteps=4 / TimeoutStartSec=300 /
 # TimeoutStopSec=90 are host-invariant literal strings (already present
 # verbatim in scripts/fused-memory.service.template) — exact membership
@@ -161,8 +122,7 @@ _DEFAULT_TEMPLATE = _SCRIPT_DIR / "fused-memory.service.template"
 # missing this line therefore has no growing backoff at all, silently, and the
 # only way that gets corrected on the host is for this checker to report it.
 REQUIRED_SERVICE_DIRECTIVES: tuple[str, ...] = (
-    "Environment=MEM0_TELEMETRY=false",
-    "Environment=PATH=%h/.local/bin:%h/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    *ENV_POLICY.required_directives(UnitFamily.FUSED_MEMORY),
     "WatchdogSec=120",
     "Restart=on-failure",
     "RestartSec=5",
@@ -182,23 +142,8 @@ REQUIRED_SERVICE_DIRECTIVE_PREFIXES: tuple[str, ...] = ("ExecStartPre=", "ExecSt
 
 
 def _log(message: str, *, stream=None) -> None:
-    """Print *message* with the log tag prefixed onto EVERY physical line.
-
-    Diverges from the three sibling checkers' single-prefix one-liner
-    (check_dashboard_unit_parity._log and friends), and deliberately: those
-    emit one line per call and never interpolate foreign text, so prefixing
-    once is the same thing as prefixing every line. This script does both —
-    the drift report joins a ``  - {directive}`` list into ONE print, and
-    daemon_reload interpolates a captured ``exc.stderr.decode()`` whose shape
-    and line count are not ours to know.
-
-    A single-line prefix would leave those continuations untagged, which
-    matters because setup-host.sh's gate reads tag ABSENCE as "the checker did
-    not run". That inference is only sound if presence is guaranteed per line.
-    """
-    out = stream if stream is not None else sys.stdout
-    for line in message.split("\n"):
-        print(f"[{LOG_TAG}] {line}", file=out)
+    """Tag every physical line of *message*; the contract lives in systemd_unit_parity.py::emit."""
+    emit(LOG_TAG, message, out=stream if stream is not None else sys.stdout)
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +216,7 @@ def find_drift(
         Empty if everything required is present.
     """
     sections = parse_unit_sections(unit_text)
-    service_lines = sections.get("Service", [])
+    service_lines = sections.get(SERVICE_SECTION, [])
     missing = [d for d in required if d not in service_lines]
     missing.extend(
         p for p in required_prefixes if not any(line.startswith(p) for line in service_lines)
@@ -324,7 +269,7 @@ def fix_unit_text(
                 # Hit the section after [Service]
                 next_section_idx = i
                 break
-            if stripped == "[Service]":
+            if stripped == f"[{SERVICE_SECTION}]":
                 in_service = True
 
     # Ensure the line just before the insertion point ends with '\n' so the
@@ -343,44 +288,33 @@ def fix_unit_text(
 # ---------------------------------------------------------------------------
 
 
+_OVERRIDE_TAIL: tuple[str, ...] = (
+    "systemd merges these over the unit at load time, so a directive set here "
+    "silently wins over the committed value. Inspect the merged result with: "
+    "systemctl --user cat fused-memory.service",
+    "Nothing was removed: this checker is read-only about drop-ins BY DESIGN, "
+    "because a drop-in can be load-bearing (task 3750). --fix appends to the "
+    "unit FILE and can neither synthesize nor resolve an override living in a "
+    "different one — remove it by hand, or move the setting into the committed "
+    "template.",
+)
+
+
 def _report_override(
     installed_path: pathlib.Path, dropins: list[pathlib.Path]
 ) -> None:
-    """Emit the ``[override]`` block for the drop-ins layered over the unit.
-
-    Worded APART from ``[drift]`` for the reason check_lms_unit_parity.py's
-    block gives: this is NOT a directive diff to propagate. Every required
-    directive may be present verbatim; what the run could not establish is that
-    the EFFECTIVE configuration matches, because systemd merges these over the
-    unit at load time.
-
-    Every applying drop-in is named by ABSOLUTE PATH, one per line. systemd
-    merges all of them, so naming a count — or only the first — leaves the
-    operator fixing half the problem and re-running into the same red.
-
-    ``_log`` already tags every physical line, so this multi-line block cannot
-    leave an untagged continuation behind. That matters because setup-host.sh's
-    gate reads tag ABSENCE as "the checker did not run", and that inference is
-    sound only if presence is guaranteed per line.
-    """
-    _log(
-        f"[override] {len(dropins)} drop-in(s) apply to {installed_path} — the "
-        "unit file was compared, but the EFFECTIVE configuration was NOT "
-        "verified by that comparison:"
-    )
-    for dropin in dropins:
-        _log(f"  {dropin}")
-    _log(
-        "[override] systemd merges these over the unit at load time, so a "
-        "directive set here silently wins over the committed value. Inspect "
-        "the merged result with: systemctl --user cat fused-memory.service"
-    )
-    _log(
-        "[override] Nothing was removed: this checker is read-only about "
-        "drop-ins BY DESIGN, because a drop-in can be load-bearing (task "
-        "3750). --fix appends to the unit FILE and can neither synthesize nor "
-        "resolve an override living in a different one — remove it by hand, or "
-        "move the setting into the committed template."
+    """Name every drop-in layered over the unit: its EFFECTIVE configuration went unverified."""
+    emit_block(
+        LOG_TAG,
+        "override",
+        header=(
+            f"{len(dropins)} drop-in(s) apply to {installed_path} — the unit file "
+            "was compared, but the EFFECTIVE configuration was NOT verified by "
+            "that comparison:"
+        ),
+        entries=[f"  {dropin}" for dropin in dropins],
+        tail=_OVERRIDE_TAIL,
+        out=sys.stdout,
     )
 
 
@@ -414,18 +348,10 @@ def daemon_reload() -> None:
 
 
 def main(argv: Sequence[str]) -> int:
-    """Parse args and run parity check (and optional fix).
+    """Parse args and run parity check (and optional fix); return a ParityExit.
 
-    Returns (mirroring the module docstring's exit contract — keep the two in
-    step, because a reader reasoning about the ``if dropins: return 1`` branches
-    below from THIS docstring alone would conclude they are dead code):
-        0 — parity (all required directives present, and no drop-in overrides
-            the unit)
-        1 — drift, OR a drop-in override applies (the unit FILE was compared,
-            the EFFECTIVE configuration was NOT). Both on 1 because "I could
-            not verify" belongs with "I found a difference", not with the
-            benign 2 below, which setup-host.sh's gate treats as a skip.
-        2 — installed unit absent
+    systemd_unit_parity.py::ParityExit is the one statement of what each code
+    means — a drop-in alone is FINDING, never PARITY.
     """
     parser = argparse.ArgumentParser(
         description="Verify/fix parity of installed fused-memory systemd unit."
@@ -459,7 +385,7 @@ def main(argv: Sequence[str]) -> int:
             "(unit may not be installed on this host)",
             stream=sys.stderr,
         )
-        return 2
+        return ParityExit.NOT_INSTALLED
 
     unit_text = installed_path.read_text(encoding="utf-8")
     drift = find_drift(unit_text)
@@ -489,9 +415,9 @@ def main(argv: Sequence[str]) -> int:
             # EFFECTIVE configuration matches. Reporting `[ok] ... parity` here
             # would be a green claim covering exactly the configuration that is
             # not running.
-            return 1
+            return ParityExit.FINDING
         _log(f"[ok] {installed_path}: parity — all required directives present.")
-        return 0
+        return ParityExit.PARITY
 
     # rstrip: the joined list ends in a newline, which under a per-line _log
     # would render one final line holding nothing but the tag.
@@ -528,7 +454,7 @@ def main(argv: Sequence[str]) -> int:
                 ).rstrip("\n"),
                 stream=sys.stderr,
             )
-            return 1
+            return ParityExit.FINDING
 
         # An override is neither synthesizable nor removable HERE, so a --fix
         # run that repaired everything it could must still decline to report
@@ -547,15 +473,15 @@ def main(argv: Sequence[str]) -> int:
         # the operator to different places (hand-add a host-specific directive
         # vs. inspect and remove a drop-in).
         if dropins:
-            return 1
-        return 0
+            return ParityExit.FINDING
+        return ParityExit.PARITY
 
     _log(
         "Run with --fix to append missing directives without clobbering "
         "host-specific lines.",
         stream=sys.stderr,
     )
-    return 1
+    return ParityExit.FINDING
 
 
 if __name__ == "__main__":

@@ -77,6 +77,7 @@ const EXPECTED_WINDOW_GLOBALS = {
   'system_health.js': 'DF_SYSTEM_HEALTH',
   'spend_readings.js': 'DF_SPEND_READINGS',
   'persisted_state.js': 'DF_PERSISTED_STATE',
+  'invariant_chip.js': 'DF_INVARIANT_CHIP',
 };
 
 // NOTE — no `document` shim, and that omission is load-bearing rather than an

@@ -1384,11 +1384,12 @@ def shape_scheduler(
     pin_queue: list,
     events_by_task: dict,
     offline_projects: list,
+    degraded_projects: list,
     paused_projects: list,
     recovery_events: dict,
     snapshot_at: str | None,
 ) -> dict:
-    """Return ``{SCHEDULER: {rows, modules, pin_queue, events_by_task, snapshot_at, offline, offline_projects, paused, paused_projects, recovery_events, recovery_event_counts}}``.
+    """Return ``{SCHEDULER: {rows, modules, pin_queue, events_by_task, snapshot_at, offline, offline_projects, degraded, degraded_projects, paused, paused_projects, recovery_events, recovery_event_counts}}``.
 
     Pure, I/O-free — mirrors ``shape_curator`` style.  Shallow-copies top-level
     containers only (``list(rows)``, ``dict(events_by_task)``); inner dicts and
@@ -1409,9 +1410,15 @@ def shape_scheduler(
       the point: zero and unknown must not collapse, or a dead orchestrator
       renders as a quiet one.
 
-    ``recovery_events`` is a required keyword: a new collector element must be
-    threaded through here deliberately, and until it is the mismatch is a loud
-    ``TypeError`` rather than a field that silently never reaches the UI.
+    ``degraded_projects`` is its own ``degraded``/``degraded_projects`` pair,
+    never folded into ``offline_projects``: offline means the read FAILED,
+    degraded means the project's state is UNKNOWN (see the ``scheduler``
+    module docstring).
+
+    ``recovery_events`` and ``degraded_projects`` are required keywords: a new
+    collector element must be threaded through here deliberately, and until it
+    is the mismatch is a loud ``TypeError`` rather than a field that silently
+    never reaches the UI.
     """
     return {
         'SCHEDULER': {
@@ -1422,6 +1429,8 @@ def shape_scheduler(
             'snapshot_at': snapshot_at,
             'offline': bool(offline_projects),
             'offline_projects': list(offline_projects),
+            'degraded': bool(degraded_projects),
+            'degraded_projects': list(degraded_projects),
             'paused': bool(paused_projects),
             'paused_projects': list(paused_projects),
             'recovery_events': [

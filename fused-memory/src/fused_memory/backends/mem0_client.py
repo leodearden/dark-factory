@@ -28,7 +28,7 @@ _MEM0_TEXT_KEYS = (_MEM0_TEXT_KEY, 'memory', 'content')
 _EXCERPT_LEN = 240
 
 
-def _extract_payload_text(payload: dict[str, Any]) -> str | None:
+def extract_payload_text(payload: dict[str, Any]) -> str | None:
     """Return a Qdrant payload's memory text, in canonical key order."""
     for key in _MEM0_TEXT_KEYS:
         value = payload.get(key)
@@ -1175,10 +1175,10 @@ class Mem0Backend:
                 async for point in pages:
                     scanned += 1
                     payload: dict[str, Any] = dict(point.payload) if point.payload else {}
-                    hits = find_toolcall_xml_leak(_extract_payload_text(payload))
+                    hits = find_toolcall_xml_leak(extract_payload_text(payload))
                     if not hits:
                         continue
-                    text = _extract_payload_text(payload) or ''
+                    text = extract_payload_text(payload) or ''
                     matches.append({
                         'id': point.id,
                         'created_at': payload.get('created_at'),
@@ -1223,6 +1223,7 @@ class Mem0Backend:
         max_pages: int = DEFAULT_SCROLL_MAX_PAGES,
         max_points: int | None = None,
         with_vectors: bool = False,
+        with_payload: bool = True,
     ) -> AsyncGenerator[Any, None]:
         """Yield every Qdrant point in *collection_name*, paging on ``next_offset``.
 
@@ -1288,6 +1289,10 @@ class Mem0Backend:
                 only by pulling a point past the cap.
             with_vectors: Fetch each point's stored vector.  Costs bandwidth,
                 so it is opt-in.
+            with_payload: Fetch each point's payload.  ``False`` is an
+                ids-only walk, how id enumeration keeps its data access
+                minimal; it exists for ``services/id_resolver.py`` (PRD C2's
+                single substrate extension).
 
         Yields:
             Raw Qdrant point objects, in page order.  Annotated
@@ -1372,7 +1377,7 @@ class Mem0Backend:
                 client.scroll(
                     collection_name=collection_name,
                     scroll_filter=scroll_filter,
-                    with_payload=True,
+                    with_payload=with_payload,
                     with_vectors=with_vectors,
                     limit=page_limit,
                     offset=offset,
@@ -1558,6 +1563,29 @@ class Mem0Backend:
                 memory_id,
             )
         return dict(records[0].payload or {})
+
+    async def get_points_by_ids(
+        self, memory_ids: Sequence[str], scope: Scope,
+    ) -> dict[str, dict[str, Any]]:
+        """Several points' raw payloads in ONE ``retrieve``: ``{id: payload}``, absent ids omitted.
+
+        The batched sibling of :meth:`get_point_by_id`, with the same payload
+        shape and timeout posture; no ids is no read.
+        """
+        if not memory_ids:
+            return {}
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        client = await self._get_async_qdrant()
+        records = await self._timed_read(
+            client.retrieve(
+                collection_name=collection_name,
+                ids=list(memory_ids),
+                with_payload=True,
+                with_vectors=False,
+            ),
+            'get_points_by_ids',
+        )
+        return {str(record.id): dict(record.payload or {}) for record in records}
 
     async def close(self) -> None:
         """Close all cached AsyncMemory instances and release their connections."""

@@ -24,7 +24,7 @@ from dataclasses import dataclass, field, is_dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, TypeVar
+from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, TypeVar
 
 if TYPE_CHECKING:
     from shared.psi import PsiSample
@@ -1072,37 +1072,69 @@ def _extract_failing_test_ids(test_output: str) -> list[str]:
     return ordered
 
 
-def _extract_failing_test_ids_from_junit(path: Path) -> list[str] | None:
-    """Parse a pytest junitxml report at *path* into failing/errored test ids.
+class _JunitTestIds(NamedTuple):
+    """One junitxml report's test ids, split by what the report says happened.
 
-    Task μ (verify-scope-inversion-prd.md): the STRUCTURED counterpart to
-    :func:`_extract_failing_test_ids` above (which regexes pytest stdout) —
-    this is the baseline-attribution signal, parsed via stdlib
-    ``xml.etree.ElementTree`` rather than a regex. The SAME parser feeds both
-    the per-main-SHA baseline probe and a branch's merge-gate result, so diff
-    consistency — not exact pytest-node-id fidelity — is what matters (see
-    ``diff_new_failures``/``is_wholly_preexisting``).
+    ``failing`` holds testcases with a ``<failure>`` or ``<error>`` child;
+    ``skipped`` holds testcases the run NEVER EXECUTED.  The two are disjoint,
+    and a testcase in neither ran and passed — the only state from which a
+    caller may conclude "main ran it and it was green".
+    """
 
-    A ``<testcase>`` counts as failing iff it has a ``<failure>`` or
-    ``<error>`` child (a ``<skipped>`` child does not count). Its id is
-    ``f'{classname}::{name}'``; when ``classname`` is absent, falls back to
-    ``f'{file}::{name}'`` (the ``file`` attribute some junit writers emit),
-    then to the bare ``name`` when neither is present. ``<testcase>``
-    elements are found via ``root.iter('testcase')`` so both the modern
-    ``<testsuites><testsuite>...`` wrapping and a bare ``<testsuite>`` root
-    are handled uniformly, and multiple ``<testsuite>`` blocks are all
-    covered.
+    failing: list[str]
+    skipped: list[str]
 
-    Returns:
-        - ``None`` when *path* does not exist, or the file is empty/malformed
-          (``ET.ParseError``) — "no junit collected", the B3 degrade signal
-          callers fall back on.
-        - ``[]`` when the report parses but no testcase is failing/errored
-          ("junit collected, zero failing" — main/branch genuinely clean).
-        - Otherwise a sorted, de-duplicated list of failing/errored ids.
 
-    Never raises: any unexpected parse-time exception is treated the same as
-    ``ET.ParseError`` (fail-soft to ``None``).
+# pytest's junitxml records two outcomes of tests that DID run as a
+# ``<skipped>`` child: an xfail (typed ``pytest.xfail``) and a strict XPASS
+# (untyped, with this fixed message) — see
+# ``_pytest/junitxml.py::_NodeReporter.append_skipped`` and ``::append_failure``.
+# Neither belongs in the never-executed population.
+_PYTEST_XFAIL_SKIP_TYPE = 'pytest.xfail'
+_PYTEST_STRICT_XPASS_SKIP_MESSAGE = 'xfail-marked test passes unexpectedly'
+
+
+def _junit_testcase_id(testcase: ET.Element) -> str:
+    """``classname::name``, else ``file::name``, else the bare ``name``.
+
+    The ONE id spelling for every vector parsed from a report.  The vectors are
+    set-differenced against each other and against main's baselines, so two
+    spellings would make every such comparison silently miss.
+    """
+    name = testcase.get('name', '')
+    classname = testcase.get('classname')
+    if classname:
+        return f'{classname}::{name}'
+    file_attr = testcase.get('file')
+    return f'{file_attr}::{name}' if file_attr else name
+
+
+def _junit_testcase_never_ran(testcase: ET.Element) -> bool:
+    skipped = testcase.find('skipped')
+    return (
+        skipped is not None
+        and skipped.get('type') != _PYTEST_XFAIL_SKIP_TYPE
+        and skipped.get('message') != _PYTEST_STRICT_XPASS_SKIP_MESSAGE
+    )
+
+
+def _extract_test_ids_from_junit(path: Path) -> _JunitTestIds | None:
+    """Parse the pytest junitxml report at *path* ONCE into failing and skipped ids.
+
+    Task μ (verify-scope-inversion-prd.md) introduced the failing vector as the
+    STRUCTURED baseline-attribution signal (the stdout-regex counterpart is
+    :func:`_extract_failing_test_ids`); task 3226 added the skipped vector,
+    because the failing vector alone cannot tell "main ran it and it passed"
+    from "main never ran it".  The SAME parser feeds both the per-main-SHA
+    baseline probe and a branch's merge-gate result, so diff consistency — not
+    exact pytest-node-id fidelity — is what matters.  ``root.iter('testcase')``
+    handles a ``<testsuites>`` wrapper, a bare ``<testsuite>`` root, and several
+    ``<testsuite>`` blocks alike; ids are sorted and de-duplicated.
+
+    Returns ``None`` when *path* is missing, empty or malformed — "no junit
+    collected", the B3 degrade signal.  Never ``([], [])`` for that case: an
+    empty pair claims "main ran everything and nothing failed", the very
+    conclusion a missing report must not license.  Never raises.
     """
     try:
         tree = ET.parse(path)
@@ -1112,19 +1144,20 @@ def _extract_failing_test_ids_from_junit(path: Path) -> list[str] | None:
     if root is None:
         return None
 
-    ids: set[str] = set()
+    failing: set[str] = set()
+    skipped: set[str] = set()
     for testcase in root.iter('testcase'):
-        if testcase.find('failure') is None and testcase.find('error') is None:
-            continue
-        name = testcase.get('name', '')
-        classname = testcase.get('classname')
-        if classname:
-            test_id = f'{classname}::{name}'
-        else:
-            file_attr = testcase.get('file')
-            test_id = f'{file_attr}::{name}' if file_attr else name
-        ids.add(test_id)
-    return sorted(ids)
+        if testcase.find('failure') is not None or testcase.find('error') is not None:
+            failing.add(_junit_testcase_id(testcase))
+        elif _junit_testcase_never_ran(testcase):
+            skipped.add(_junit_testcase_id(testcase))
+    return _JunitTestIds(failing=sorted(failing), skipped=sorted(skipped))
+
+
+def _extract_failing_test_ids_from_junit(path: Path) -> list[str] | None:
+    """The failing half of :func:`_extract_test_ids_from_junit`; ``None`` when no report parsed."""
+    ids = _extract_test_ids_from_junit(path)
+    return None if ids is None else ids.failing
 
 
 def _worker_death_cause_hint(output: str, truncation_evidence: str) -> str:
@@ -1475,7 +1508,8 @@ def _remember_main_baseline(main_sha: str, record: _MainShaBaseline) -> None:
     _BASELINE_FAILING_IDS_CACHE[main_sha] = record
     _BASELINE_FAILING_IDS_CACHE.move_to_end(main_sha)
     while len(_BASELINE_FAILING_IDS_CACHE) > _BASELINE_CACHE_MAX_SHAS:
-        _BASELINE_FAILING_IDS_CACHE.popitem(last=False)
+        evicted_sha, _ = _BASELINE_FAILING_IDS_CACHE.popitem(last=False)
+        _BASELINE_SKIPPED_IDS_CACHE.pop(evicted_sha, None)
 
 
 def _recall_main_baseline(main_sha: str, *, touch: bool) -> _MainShaBaseline | None:
@@ -1485,8 +1519,31 @@ def _recall_main_baseline(main_sha: str, *, touch: bool) -> _MainShaBaseline | N
     return record
 
 
-def seed_main_baseline(main_sha: str, ids: Iterable[str]) -> None:
-    """Seed (or refresh) the per-main-SHA failing-id baseline cache for free.
+# Process-wide cache for the per-main-SHA SKIPPED-test-id baseline (task
+# 3226).  Deliberately a PARALLEL dict rather than a field on _MainShaBaseline:
+# narrowed per-module probes rebuild that record (task 5627) with no skip
+# evidence of their own, and a whole-tree skipped vector must survive those
+# rebuilds unchanged.  Written only by seed_main_baseline, so a skipped entry
+# only ever sits beside a whole-tree failing entry seeded by the same call —
+# see that function for the rule — and _remember_main_baseline evicts it with
+# that entry, so both sides share one recency bound.
+#
+# WHY a second baseline at all: the failing baseline can only say "id X was
+# red on main".  Its ABSENCE is ambiguous — it conflates "main RAN X and it
+# passed" (evidence the branch broke it) with "main NEVER RAN X" (evidence of
+# nothing at all).  Only the first licenses the confident task-fault verdict
+# in verify_failure_is_preexisting_on_main's id-diff fast path.  This cache
+# holds the second population so the two can be told apart; see the
+# 2026-07-29 reify-allowlist incident, where a sibling repo's mutable state
+# made a whole guard skip on one side of a comparison and pass-shaped on the
+# other.
+_BASELINE_SKIPPED_IDS_CACHE: dict[str, frozenset[str]] = {}
+
+
+def seed_main_baseline(
+    main_sha: str, ids: Iterable[str], *, skipped: Iterable[str] | None = None,
+) -> None:
+    """Seed (or refresh) the per-main-SHA baselines — failing, and skipped when known.
 
     *ids* is the whole tree's failing set at *main_sha*; ``frozenset()``
     means every module is green there. Called from the PASS path of a
@@ -1494,9 +1551,28 @@ def seed_main_baseline(main_sha: str, ids: Iterable[str]) -> None:
     CAS-advance to become the next main tip — see merge_queue.py's
     ``_run_post_merge_verify``), so in steady state
     ``main_baseline_failing_ids`` below is a cache hit for as long as that
-    SHA is main's tip and never pays for a probe (B2).
+    SHA is main's tip and never pays for a probe (B2); and from that
+    function's own whole-tree cold-start probe.
+
+    THE SKIPPED-SIDE RULE (task 3226), stated here and nowhere else: the
+    skipped entry for *main_sha* describes the same whole-tree run as its
+    failing entry, or is absent.  A *skipped* of ``None`` means that run
+    collected no skip evidence — "unknown", which is NOT "nothing skipped" —
+    so it removes any skipped entry rather than recording an empty set, and
+    :func:`cached_main_baseline_skipped_ids` then reads ``None``.  A run that
+    parsed its junit report always supplies both vectors, so in steady state
+    both sides are warm.  Callers pass *skipped* verbatim: a run genuinely
+    did skip those tests, whereas the pass path overrides *ids* to empty
+    because a passing run has no live failures (task 2590).  A narrowed
+    per-module probe (task 5627) never writes the skipped side: it has skip
+    evidence for part of the tree only, and a partial vector would read as
+    "main skipped nothing else".
     """
     _remember_main_baseline(main_sha, _MainShaBaseline(every_module=frozenset(ids)))
+    if skipped is None:
+        _BASELINE_SKIPPED_IDS_CACHE.pop(main_sha, None)
+    else:
+        _BASELINE_SKIPPED_IDS_CACHE[main_sha] = frozenset(skipped)
 
 
 async def main_baseline_failing_ids(
@@ -1627,7 +1703,7 @@ async def _whole_tree_main_baseline(
         )
         return None
     ids = frozenset(probe_result.failing_test_ids)
-    seed_main_baseline(main_sha, ids)
+    seed_main_baseline(main_sha, ids, skipped=probe_result.skipped_test_ids)
     return ids
 
 
@@ -1739,6 +1815,102 @@ def known_failing_ids_on_main(main_sha: str) -> frozenset[str]:
     """
     _cached = _recall_main_baseline(main_sha, touch=False)
     return _cached.known_failing() if _cached is not None else frozenset()
+
+
+def cached_main_baseline_skipped_ids(main_sha: str) -> 'frozenset[str] | None':
+    """Cache-ONLY peek at the per-main-SHA SKIPPED-id baseline — never probes.
+
+    Mirror of :func:`cached_main_baseline_failing_ids` for the skipped
+    population: pure, synchronous, side-effect-free, and bounded by the same
+    SHA recency as the failing side (see :func:`_remember_main_baseline`).
+
+    Read the return values precisely — the whole point of this cache is that
+    they are NOT interchangeable:
+
+    - ``None``      — no skip evidence for this sha: never probed, evicted,
+                      or seeded by a run that collected none (see
+                      :func:`seed_main_baseline`).  No verdict may be derived
+                      from it.
+    - ``frozenset()`` — main WAS probed and skipped nothing.
+    - non-empty     — main NEVER RAN these tests.  Their absence from the
+                      failing baseline is therefore not evidence that the
+                      branch broke them.
+
+    Used on the critical path by ``verify_failure_is_preexisting_on_main``'s
+    id-diff fast path and by ``merge_queue._run_post_merge_verify``'s
+    branch-block reason enrichment, both of which must NEVER trigger a probe
+    (G4, task 2564) — hence cache-only.
+    """
+    return _BASELINE_SKIPPED_IDS_CACHE.get(main_sha)
+
+
+class NewFailingIds(NamedTuple):
+    """Branch-failing ids absent from main's failing baseline, split by attribution.
+
+    ``unattributable`` ids are in main's SKIPPED baseline: main never ran them,
+    so their absence from its failing baseline is evidence of nothing.
+    ``attributable`` ids are the rest — main ran them green, or (cold skipped
+    baseline) nothing says otherwise — and they blame the branch.
+    """
+
+    attributable: frozenset[str]
+    unattributable: frozenset[str]
+
+
+def partition_new_failing_ids(new_ids: Iterable[str], main_sha: str) -> NewFailingIds:
+    """Split *new_ids* against main *main_sha*'s skipped baseline (task 3226).
+
+    The ONE attribution rule for ids absent from main's failing baseline:
+    ``verify_failure_is_preexisting_on_main`` blames the branch iff any id is
+    attributable, and :func:`describe_new_failing_ids` counts only attributable
+    ids as new failures.  Cache-only (via
+    :func:`cached_main_baseline_skipped_ids`), so it never probes on the
+    critical path (G4, task 2564); a cold skipped baseline makes every id
+    attributable, which is the pre-3226 behaviour exactly.
+    """
+    new = frozenset(new_ids)
+    unattributable = new & (cached_main_baseline_skipped_ids(main_sha) or frozenset())
+    return NewFailingIds(attributable=new - unattributable, unattributable=unattributable)
+
+
+SKIPPED_ON_MAIN_REASON_CLAUSE = (
+    'test(s) SKIPPED on main (main never ran them — not evidence of a branch fault)'
+)
+
+
+def describe_new_failing_ids(new_ids: Iterable[str], main_sha: str) -> str:
+    """Word the failing ids absent from main's failing baseline for a block reason.
+
+    Partitioned by :func:`partition_new_failing_ids`: only attributable ids are
+    counted as new failures; unattributable ones are named under
+    :data:`SKIPPED_ON_MAIN_REASON_CLAUSE`.  With no unattributable id the
+    wording is the pre-3226 one byte for byte.
+    """
+    attributable, unattributable = partition_new_failing_ids(new_ids, main_sha)
+    clauses = []
+    if attributable:
+        clauses.append(
+            f'{len(attributable)} new failing test(s) not present on main: '
+            f"{', '.join(sorted(attributable))}"
+        )
+    if unattributable:
+        clauses.append(
+            f'{len(unattributable)} {SKIPPED_ON_MAIN_REASON_CLAUSE}: '
+            f"{', '.join(sorted(unattributable))}"
+        )
+    return '; plus '.join(clauses)
+
+
+def clear_main_probe_caches() -> None:
+    """Forget every process-wide main-probe verdict and per-main-SHA baseline.
+
+    The single reset for :data:`_PROBE_CACHE`, :data:`_BASELINE_FAILING_IDS_CACHE`
+    and :data:`_BASELINE_SKIPPED_IDS_CACHE`; a cache added beside them belongs
+    here too, so every caller that resets one resets all of them.
+    """
+    _PROBE_CACHE.clear()
+    _BASELINE_FAILING_IDS_CACHE.clear()
+    _BASELINE_SKIPPED_IDS_CACHE.clear()
 
 
 def _worst_category(categories: list[str]) -> str:
@@ -4092,7 +4264,7 @@ class VerifyResult:
     # Machine-readable failing/errored pytest node ids, parsed from a
     # structured merge-role run's junitxml report (task μ,
     # verify-scope-inversion-prd.md — the baseline-attribution signal;
-    # see _extract_failing_test_ids_from_junit and with_junitxml in
+    # see _extract_test_ids_from_junit and with_junitxml in
     # verify_cmd.py). Deliberately a plain JSON-native `list[str] | None`
     # (mirrors `contention`/`plan` immediately above), so it round-trips
     # losslessly through the generic codec (asdict / VerifyResult(**d)).
@@ -4103,6 +4275,27 @@ class VerifyResult:
     # collected, zero failing" (main/branch genuinely clean under this
     # run) and must NOT be conflated with None.
     failing_test_ids: list[str] | None = None
+    # Task 3226: the node ids the same junit report records as NEVER EXECUTED
+    # (an xfail ran, so it is not here), from the same single parse by
+    # _extract_test_ids_from_junit. A plain
+    # JSON-native `list[str] | None` exactly like failing_test_ids above, so it
+    # round-trips through the generic codec (asdict / VerifyResult(**d)) with
+    # no allowlist to touch.
+    #
+    # WHY IT IS CARRIED ALONGSIDE failing_test_ids rather than derived: the
+    # failing vector alone cannot distinguish "this run RAN the test and it
+    # passed" from "this run never ran it". Both look identical — an id absent
+    # from failing_test_ids — yet only the first is evidence about the code.
+    # Consumers that diff a branch's ids against a main baseline need the
+    # second vector to know which of the two they are looking at; without it a
+    # SKIP on main reads as a PASS on main, and a test that main never ran gets
+    # attributed to the branch under test.
+    #
+    # None = "no junit collected" (the same B3 degrade signal as above) — and
+    # deliberately NOT a licence to assume nothing was skipped. `[]` = "junit
+    # collected, zero skipped", which IS such a licence, and the two must never
+    # be conflated.
+    skipped_test_ids: list[str] | None = None
     # Task 5627: module prefix -> the junit-derived failing ids of the module
     # run that produced them. Plain JSON-native, like `failing_test_ids`.
     # None = no module attribution; the ids are then unattributable. When
@@ -6474,8 +6667,8 @@ async def run_verification(
     # (OPAQUE / raw-retained chain / non-pytest tool / cmd is None all leave
     # the flag uninjected), so this never duplicates that check. When
     # nothing ever injects the flag, pytest never writes the report, and
-    # _extract_failing_test_ids_from_junit below degrades to None (file not
-    # found) — the same B3 degrade signal as an unreadable report.
+    # _extract_test_ids_from_junit below degrades to None (file not found)
+    # — the same B3 degrade signal as an unreadable report.
     #
     # The path is worktree-internal (merge worktrees lack `.task/` —
     # git_ops.py scrubs it) and per-module_prefix (mirrors _stream_log_path's
@@ -7294,11 +7487,14 @@ async def run_verification(
     # None when the report does not attribute failures (not a full-breadth
     # merge verify) or is missing/unparseable (nothing ever injected
     # the flag, or the test leg was skipped/crashed before writing it) — the
-    # B3 degrade signal. See _extract_failing_test_ids_from_junit's docstring.
+    # B3 degrade signal. See _extract_test_ids_from_junit's docstring.
     failing_test_ids: list[str] | None = None
+    skipped_test_ids: list[str] | None = None
     if junit.kind == 'attributing':
         assert junit.leg_path is not None  # _JunitReportPlan pairs them
-        failing_test_ids = _extract_failing_test_ids_from_junit(junit.leg_path)
+        junit_ids = _extract_test_ids_from_junit(junit.leg_path)
+        if junit_ids is not None:
+            failing_test_ids, skipped_test_ids = junit_ids
     # The report dies with its worktree; the LOG archival above is gated on
     # `not passed`, this deliberately is not. The gzip runs off the event
     # loop, which also carries the scheduler, the MCP server and the merge
@@ -7328,6 +7524,7 @@ async def run_verification(
         archive_log_paths=archive_log_paths,
         duration_secs=_wall_secs,
         failing_test_ids=failing_test_ids,
+        skipped_test_ids=skipped_test_ids,
         failing_test_ids_by_module=failing_test_ids_by_module,
         failing_leg_categories=failing_leg_categories,
     )
@@ -7461,6 +7658,19 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
     # child — see VerifyResult.failing_test_ids_by_module.
     failing_test_ids_by_module = _aggregate_failing_ids_by_module(results)
 
+    # Task 3226: aggregate skipped_test_ids by the IDENTICAL rule. The
+    # None-contributes-nothing half is what matters here: a module that
+    # collected no junit (OPAQUE command, breadth != full) knows nothing about
+    # skips, and letting it poison the aggregate to None would discard a
+    # SIBLING module's real, collected skip evidence — returning the whole run
+    # to the can't-tell state this field exists to escape. Note this is the
+    # failing_test_ids rule, NOT the deliberately-different fail-closed rule
+    # used by failing_leg_categories just below.
+    _child_skipped_ids = [r.skipped_test_ids for r in results if r.skipped_test_ids is not None]
+    skipped_test_ids = (
+        sorted({sid for ids in _child_skipped_ids for sid in ids}) if _child_skipped_ids else None
+    )
+
     # Task 3173 review amendment: union the per-leg categories across FAILING
     # children only, order-preserved and de-duplicated (same deterministic
     # style as the kill-note fragment merge above).  A PASSING child has no
@@ -7497,6 +7707,7 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         # tasks hit the len==1 fast path above and carry the exact value.
         duration_secs=max((r.duration_secs for r in results), default=0.0),
         failing_test_ids=failing_test_ids,
+        skipped_test_ids=skipped_test_ids,
         failing_test_ids_by_module=failing_test_ids_by_module,
         failing_leg_categories=failing_leg_categories,
     )
@@ -8791,6 +9002,18 @@ async def verify_failure_is_preexisting_on_main(
           - ``git_ops.get_main_sha()`` fails or returns empty.
           - ``git worktree add --detach`` fails after retries.
           - Any unexpected exception during probing.
+          - UNATTRIBUTABLE IDS (task 3226): the task-μ id-diff fast path
+            found branch-failing ids absent from main's failing baseline,
+            and EVERY one of them is in main's SKIPPED baseline — main never
+            RAN them, so the diff is evidence of nothing.  The function then
+            falls through to the (category, cause_hint) signature comparison
+            and returns whatever THAT concludes.  One attributable id (main
+            ran it green) is enough to establish task fault, so a mixed set
+            still returns ``(False, '')`` from the diff — the same partition
+            :func:`partition_new_failing_ids` gives the merge-queue reason.
+            See the 2026-07-29 reify-allowlist incident, whose shape was a
+            guard that skipped on one side of a comparison and looked
+            pass-shaped on the other.
           - CONFIRM GATE (task 3597): the signature matched, but
             ``_main_probe_failure_is_isolated_flake`` positively confirmed
             every named failing test passes in isolation on the main
@@ -8876,9 +9099,27 @@ async def verify_failure_is_preexisting_on_main(
             )
             if baseline is not None:
                 branch_ids = frozenset(failing_result.failing_test_ids)
-                wholly = is_wholly_preexisting(branch_ids, baseline)
-                return wholly, (main_sha if wholly else '')
-            # baseline is None (B3) — fall through to the legacy probe below.
+                if is_wholly_preexisting(branch_ids, baseline):
+                    return True, main_sha
+                # Task 3226: a SKIP is not a PASS.  An attributable id (main
+                # ran it green) blames the branch; a diff made up entirely of
+                # ids main skipped proves nothing and defers to the signature
+                # comparison below.  An empty branch set keeps the task-fault
+                # verdict, exactly as before.
+                attributable, unattributable = partition_new_failing_ids(
+                    diff_new_failures(branch_ids, baseline), main_sha,
+                )
+                if attributable or not unattributable:
+                    return False, ''
+                logger.warning(
+                    'verify_failure_is_preexisting_on_main: all %d new branch-'
+                    'failing id(s) were SKIPPED on main %.8s (%s) — main never '
+                    'ran them, so the id diff supports no verdict; deferring to '
+                    'the signature probe instead of blaming the branch',
+                    len(unattributable), main_sha, ', '.join(sorted(unattributable)),
+                )
+            # baseline is None (B3), or every new id was unattributable — fall
+            # through to the legacy probe below.
 
         # Check the process-wide probe cache before paying the worktree-add cost.
         _norm_hint = _normalize(failing_result.cause_hint)

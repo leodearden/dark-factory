@@ -140,8 +140,10 @@ from orchestrator.merge_lane.speculation_controller import (
     SpeculationController,
 )
 from orchestrator.merge_lane.types import (
+    CHAIN_FAULT_REASONS,
     CapPermit,
     ChainResult,
+    ChainTruncationReason,
     Decided,
     DecidedItem,
     EscalationRecord,
@@ -186,6 +188,7 @@ from orchestrator.verify import (
     VerifyResult,
     _derive_task_files_from_git,
     cached_main_baseline_failing_ids,
+    describe_new_failing_ids,
     diff_new_failures,
     known_failing_ids_on_main,
     red_module_prefixes_of,
@@ -3490,9 +3493,8 @@ async def _run_post_merge_verify(
                 if _cached_baseline is not None:
                     new_ids = diff_new_failures(verify.failing_test_ids, _cached_baseline)
         if new_ids:
-            reason = (
-                f'Post-merge verification failed: {len(new_ids)} new failing '
-                f"test(s) not present on main: {', '.join(sorted(new_ids))}"
+            reason = 'Post-merge verification failed: ' + describe_new_failing_ids(
+                new_ids, _current_main_sha,
             )
         else:
             reason = f'Post-merge verification failed: {verify.summary}'
@@ -3711,7 +3713,7 @@ async def _run_post_merge_verify(
                 req.task_id, len(verify.failing_test_ids),
                 ', '.join(sorted(verify.failing_test_ids)), merge_sha,
             )
-        seed_main_baseline(merge_sha, frozenset())
+        seed_main_baseline(merge_sha, frozenset(), skipped=verify.skipped_test_ids)
 
     return None
 
@@ -6048,7 +6050,7 @@ async def classify_and_merge(
 # Deep merge-ahead chain builder (task 3184, PRD β —
 # ``plans/deep-merge-ahead-prd.md``)
 #
-# TWO INVARIANTS A FUTURE EDITOR MUST NOT BREAK:
+# THREE INVARIANTS A FUTURE EDITOR MUST NOT BREAK:
 #
 # 1. PURITY.  ``build_chain`` is pure w.r.t. queue state: it never calls
 #    ``_pop_next_pickable``, ``_note_transition``, ``_emit_merge_attempt``,
@@ -6062,6 +6064,14 @@ async def classify_and_merge(
 # 2. ONE WORKTREE.  Exactly one ``acquire_chain_build_lane`` per invocation;
 #    the merge loop reuses that lane via ``GitOps.merge_branch_into_worktree``.
 #    (``merge_to_main`` would provision a fresh worktree per item.)
+#
+# 3. BASE.  Nothing is merged until the chain-build lane's HEAD is confirmed
+#    to be ``head_merge_commit``: the tip is what δ's ``_land_chain_prefix``
+#    CAS-advances main onto, so a lane that any acquisition step (worktree
+#    add, ``reset --hard``, the repo's ``seed-warm-lane.sh``) left off-base is
+#    refused, never stacked on.  The check is ``build_chain``'s own: the
+#    other ``acquire_spec_lane`` consumers (the speculative verifies) get no
+#    such guard from it.
 # ---------------------------------------------------------------------------
 
 
@@ -6107,8 +6117,8 @@ async def build_chain(
     :meth:`SpeculativeMergeWorker._run_inflight_verify`'s remaining
     non-adopting arms.
 
-    See the module section comment above for the two invariants (purity and
-    one-worktree) this function exists to uphold.
+    See the module section comment above for the three invariants (purity,
+    one-worktree and base) this function exists to uphold.
 
     **Caller cost — γ must bound this.**  One call blocks on one lane
     acquisition (``acquire_spec_lane``: ``git reset --hard``, ``git clean
@@ -6143,7 +6153,10 @@ async def build_chain(
             :meth:`SpeculativeMergeWorker.chain_snapshot`.
         head_merge_commit: The base to stack on — the frozen prefix tip, from
             :meth:`SpeculativeMergeWorker.frozen_prefix_tip` (which returns
-            ``main_sha`` when nothing is verifying).
+            ``main_sha`` when nothing is verifying).  The acquired lane is
+            confirmed to be checked out there before anything is merged;
+            otherwise the result is empty with
+            ``truncated_reason='lane_base_mismatch'``.
         cap: Hard ceiling from ``MergeDeepConfig.chain_cap``.  ``0`` is the
             kill switch.  Keyword-only, so a call site can never transpose it
             with *target_depth*.
@@ -6183,9 +6196,22 @@ async def build_chain(
     # `tip` starts at the base so a zero-link result still names a verifiable tip.
     tip = head_merge_commit
     truncated_at: str | None = None
-    truncated_reason: str | None = None
+    truncated_reason: ChainTruncationReason | None = None
     try:
-        for req in queue_snapshot[:depth]:
+        chainable = queue_snapshot[:depth]
+        lane_head = await _lane_head(lane)
+        if lane_head != head_merge_commit:
+            # Invariant 3.  No early return: the empty `links` takes the one
+            # release below, after the summary line records the refused build.
+            logger.warning(
+                'build_chain: lane_base_mismatch — lane %s HEAD=%.8s, expected '
+                '%.8s; stacked nothing (depth=%d)',
+                lane.name, lane_head, head_merge_commit, depth,
+            )
+            chainable = ()
+            truncated_at = queue_snapshot[0].task_id
+            truncated_reason = 'lane_base_mismatch'
+        for req in chainable:
             # ── DO NOT EMIT AN OUTCOME FOR `truncated_at` ────────────────
             # PRD decision #4: item j may conflict only with an *unlanded*
             # predecessor, so it takes its normal sequential path later and
@@ -6251,18 +6277,19 @@ async def build_chain(
     # Logged BEFORE the empty-links return so every build that reached the
     # merge loop is observable, not just the ones that produced links: a
     # truncation at position 0 is the single most interesting outcome and was
-    # previously the only one that left no trace at all.  `merge_error` is the
-    # documented fault bucket (missing ref, hook rejection) as opposed to the
-    # benign caps (conflict / already_merged / train_request), and ε's
-    # telemetry reader does not exist yet, so it escalates to WARNING — a
-    # silent fault here is exactly the shape the no-silent-fail-soft design
-    # invariant exists to prevent.
+    # previously the only one that left no trace at all.  The fault reasons
+    # (`CHAIN_FAULT_REASONS`: an item's `merge_error` — missing ref, hook
+    # rejection — and the lane's `lane_base_mismatch`) as opposed to the
+    # benign caps (conflict / already_merged / train_request) escalate to
+    # WARNING, because ε's telemetry reader does not exist yet — a silent
+    # fault here is exactly the shape the no-silent-fail-soft design invariant
+    # exists to prevent.
     #
     # `elapsed_ms` is on the line for the reason in the Caller-cost note of the
     # docstring: the blocking cost of a round is otherwise invisible from the
     # interface, and it must be observable BEFORE the cap is raised above 0.
     logger.log(
-        logging.WARNING if truncated_reason == 'merge_error' else logging.INFO,
+        logging.WARNING if truncated_reason in CHAIN_FAULT_REASONS else logging.INFO,
         'build_chain: depth=%d built=%d tip=%s truncated_at=%s reason=%s '
         'lane=%s elapsed_ms=%d',
         depth, len(links), tip[:8], truncated_at, truncated_reason, lane.name,
@@ -6283,6 +6310,12 @@ async def build_chain(
         truncated_at=truncated_at, truncated_reason=truncated_reason,
         lane=lane, lane_warm=warm,
     )
+
+
+async def _lane_head(lane: Path) -> str | None:
+    """The commit *lane* has checked out, or ``None`` when it cannot be read."""
+    rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane)
+    return out.strip() if rc == 0 else None
 
 
 async def _journal_landed_then_advance(

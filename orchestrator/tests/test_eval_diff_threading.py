@@ -21,7 +21,7 @@ import pytest
 from orchestrator.evals.compare import _assess_task
 from orchestrator.evals.judge import run_judge
 from orchestrator.evals.rereview import Candidate, rereview_one
-from orchestrator.evals.runner import EvalResult
+from orchestrator.evals.results import EvalResult
 
 
 def test_run_judge_threads_pre_task_commit(

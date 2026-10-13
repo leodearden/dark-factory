@@ -66,6 +66,7 @@ const EXPECTED_DF_DATA_KEYS = [
   'PROJECTS', 'AGENTS', 'ORCHESTRATORS', 'ORCHESTRATORS_SPARK',
   'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
   'TASKS_DEGRADED_PROJECTS', 'TASKS_PROJECT_COUNT', 'TASKS_SNAPSHOT',
+  'INVARIANTS',
   'PERFORMANCE', 'PERFORMANCE_LISTING', 'MEMORY_STATUS', 'MEMORY_OPS',
   'RECON_STATE', 'MERGE_QUEUE', 'COSTS', 'BURNDOWN', 'BURNDOWN_BY_PROJECT',
   'CURATOR_STATE', 'ESCALATIONS', 'ESCALATION_ANALYTICS', 'SCHEDULER',
@@ -91,7 +92,7 @@ const EXPECTED_DF_DATA_KEYS = [
 // row; it is deliberately one constant rather than a literal repeated per
 // test, because scattered copies is what went stale when the memory-evals
 // endpoint was added.
-const EXPECTED_ENDPOINT_COUNT = 14;
+const EXPECTED_ENDPOINT_COUNT = 15;
 
 // The two shared registry specs. Declared here as literals rather than read off
 // data.js so the reshape is pinned against a stated expectation instead of
@@ -108,7 +109,7 @@ const DATUM_SPEC = { kind: 'datum' };
 // the thing under test.
 const EXPECTED_ENDPOINT_KEYS = [
   'AGENTS', 'BURNDOWN', 'BURNDOWN_BY_PROJECT', 'COSTS',
-  'CURATOR_STATE', 'ESCALATIONS', 'ESCALATION_ANALYTICS',
+  'CURATOR_STATE', 'ESCALATIONS', 'ESCALATION_ANALYTICS', 'INVARIANTS',
   'MEMORY_EVALS', 'MEMORY_OPS', 'MEMORY_STATUS',
   'MERGE_QUEUE', 'ORCHESTRATORS', 'ORCHESTRATORS_SPARK', 'PERFORMANCE',
   'PERFORMANCE_LISTING', 'PROJECTS', 'RECON_STATE', 'SCHEDULER', 'TASKS_COUNT_UNKNOWN_PROJECTS',
@@ -2870,7 +2871,7 @@ test('scope change: opening a rows tab upgrades the census poll to the full /tas
 
   await load.scope('tasks');
 
-  assert.deepEqual(load.requested, [FULL_TASKS_URL]);
+  assert.deepEqual(load.requested, [FULL_TASKS_URL, `${DASH}/invariants`]);
 });
 
 test('scope change: leaving a rows tab fetches nothing — the full payload already holds the census', async () => {

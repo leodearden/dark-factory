@@ -91,8 +91,9 @@ class TopicClosure:
     members, and conflating them is the overclaim this op exists to end.
 
     ``members`` are the RAW scroll rows, because the tool's topic-guard seed
-    (step 7c) reads their ``content``; the envelope projects them, in
-    ``server/consolidation.py::build_consolidation_result``.
+    (step 7c) reads each row's text through
+    ``services/memory_service.py::metadata_row_text``; the envelope projects
+    them, in ``server/consolidation.py::build_consolidation_result``.
     """
 
     members: list[Any]

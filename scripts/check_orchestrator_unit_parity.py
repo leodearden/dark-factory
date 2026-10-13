@@ -68,30 +68,10 @@ gate.  A gate nobody believes is worse than no gate.
 
 Exit codes
 ----------
-0 — parity (every compared directive agrees, at least one unit was actually
-    compared, and nothing overrides the units that were)
-1 — drift, OR a committed unit VANISHED (no committed copy, so nothing could
-    be verified for it), OR an installed unit carries a drop-in override (so
-    the unit file was compared but the EFFECTIVE configuration was not), OR a
-    unit file exists but is UNREADABLE (permissions / not valid UTF-8)
-2 — installed unit absent (no installed copy found for one or more units)
-
-Everything on the 1 side is "I found a difference, or I could not verify" and
-is worded APART in the report — ``[drift]`` / ``[vanished]`` / ``[override]``
-/ ``[unreadable]`` — because they share an exit code but send the operator to
-four different places.  Only ``[drift]`` is a directive diff to propagate.
-
-PRECEDENCE: drift (1) DOMINATES absence (2).  With sixteen units a single run
-can hit both at once, and returning 2 there would let an unrelated
-uninstalled unit mask an actionable finding — ``setup-host.sh`` treats 2 as a
-benign "not installed on this host, skipping" and only 1 as something to act
-on.  An absent unit is still REPORTED in that case: dominated, not hidden.
-
-A run that compared ZERO units can NEVER report parity.  This vocabulary is
-adopted unchanged from ``check_dashboard_unit_parity.py`` so setup-host.sh's
-existing 0/2/other branch shape carries over verbatim.
-
-A consumer that needs to act per UNIT rather than per run wants the
+The family's codes are defined once, in
+``systemd_unit_parity.py::ParityExit``. Of the report blocks that share
+exit 1, only ``[drift]`` is a directive difference to propagate. A consumer
+that needs to act per UNIT rather than per run wants the
 ``--print-verdicts`` channel described next, not these codes.
 
 Machine-readable verdicts
@@ -113,22 +93,10 @@ emitted before the human summary blocks::
 
     [orchestrator_unit_parity] verdict <unit> <kind>[,<kind>...]
 
-The kind vocabulary is ``VERDICT_KINDS`` below, and that tuple's ORDER is the
-rendering precedence, so a unit that is both directive-drifted and drop-in'd
-always renders ``drift,override`` and never the reverse:
-
-    clean       compared, no directive drift, no drop-in — safe to overwrite
-    absent      no installed copy — nothing to overwrite, safe to install
-    drift       at least one directive differs
-    override    a ``<unit>.d/*.conf`` drop-in is layered over it
-    vanished    no COMMITTED copy — there is no source to install FROM
-    unreadable  the file exists but could not be opened / decoded
-
-``clean`` and ``absent`` are the two install-eligible kinds, and each is
-mutually exclusive with every other kind and with the other.  They are kept
-APART rather than merged because this checker may only claim what it actually
-verified: an absent installed copy was never compared, so reporting it as
-``clean`` would assert a parity measurement that never happened.
+The kinds, what each means, and their rendering order are defined in
+``systemd_unit_parity.py::VERDICT_KINDS``. ``clean`` (safe to overwrite) and
+``absent`` (nothing to overwrite) are the two kinds a unit can be installed
+under.
 
 The sole consumer is ``scripts/setup-host.sh`` section 5, which installs the
 units whose verdict is ``clean`` or ``absent`` and skips the rest, naming each
@@ -289,16 +257,16 @@ import pathlib
 import sys
 from collections.abc import Sequence
 
-# Both names live in scripts/systemd_unit_parity.py and are RE-EXPORTED here.
-# find_dropins was forked, code-identical, between this file and
-# check_dashboard_unit_parity.py until check_lms_unit_parity.py would have made
-# it three copies; this suite's existing find_dropins tests still call
-# mod.find_dropins, so they are what proves the lift was behaviour-preserving.
 from systemd_unit_parity import (
-    _ABSENT,
+    ABSENT,
+    VERDICT_KINDS,
+    BlockText,
     Drift,
-    find_dropins,
+    ParityRun,
+    ReportText,
+    UnitRef,
     parse_unit_directives,
+    run_parity,
 )
 
 # ---------------------------------------------------------------------------
@@ -309,46 +277,14 @@ from systemd_unit_parity import (
 # the same way the dashboard checker's [dashboard_unit_parity] report is.
 LOG_TAG = "orchestrator_unit_parity"
 
-# The complete vocabulary of ``--print-verdicts`` kinds, in RENDERING
-# PRECEDENCE order: a unit carrying several kinds renders them in this
-# sequence, so ``drift,override`` is deterministic and never
-# ``override,drift``.  A consumer comparing verdict strings across two runs
-# (or diffing one host against another) can only do that if the order is a
-# contract rather than an artifact of set iteration.
-#
-# Public because it IS the contract: setup-host.sh must have a case arm for
-# every member, and a cross-artifact test derives this tuple from here and
-# asserts the installer handles each one.  Adding a kind without teaching the
-# installer about it would land a unit in the shell's ``*)`` fallback — a
-# warning naming no actionable cause, which is the silent degradation these
-# gates exist to prevent.
-VERDICT_KINDS: tuple[str, ...] = (
-    "clean",
-    "absent",
-    "drift",
-    "override",
-    "vanished",
-    "unreadable",
-)
-
 _SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parent
 _DEFAULT_INSTALLED_DIR = pathlib.Path.home() / ".config" / "systemd" / "user"
 
 
-def _log(message: str, *, stream=None) -> None:
-    """Print *message* prefixed with the log tag."""
-    print(f"[{LOG_TAG}] {message}", file=stream if stream is not None else sys.stdout)
-
-
 # ---------------------------------------------------------------------------
 # Drift records and comparison
 # ---------------------------------------------------------------------------
-
-# ``Drift`` and ``_ABSENT`` are re-exported from scripts/systemd_unit_parity.py
-# (see the import above). They were code-identical in all three checkers; the
-# lift COLLAPSED that fork rather than pre-empting a hypothetical one.
-
 
 def _render(values: list[str] | None) -> str:
     """Render one side's values for the operator's report.
@@ -368,7 +304,7 @@ def _render(values: list[str] | None) -> str:
     guess at occurrence boundaries has been handed a diff they cannot act on.
     """
     if values is None:
-        return _ABSENT
+        return ABSENT
     if len(values) == 1:
         return values[0]
     return "[" + ", ".join(repr(v) for v in values) + "]"
@@ -443,26 +379,6 @@ def compare_unit(
                 )
             )
     return drifts
-
-
-def _render_kinds(kinds: Sequence[str]) -> str:
-    """Render one unit's verdict kinds in VERDICT_KINDS precedence order.
-
-    Ordering by the published tuple — rather than by insertion or by set
-    iteration — is what makes ``drift,override`` a CONTRACT: the same findings
-    always render the same string, so a consumer can diff one run's verdicts
-    against another's, or one host's against another's.
-
-    A kind outside the vocabulary is APPENDED rather than dropped by the
-    filter.  Dropping it would silently shrink a unit's verdict, and could
-    empty it entirely — which the consumer reads as "no verdict", i.e. a
-    unit skipped with no stated cause.  Surfacing it instead lands it in
-    setup-host.sh's loud ``*)`` arm, which names the kind verbatim.
-    """
-    present = set(kinds)
-    ordered = [kind for kind in VERDICT_KINDS if kind in present]
-    ordered += sorted(present.difference(VERDICT_KINDS))
-    return ",".join(ordered)
 
 
 # ---------------------------------------------------------------------------
@@ -575,253 +491,47 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str]) -> int:
-    """Parse args and run the parity check.
+def _compare(unit: UnitRef, repo_text: str, installed_text: str) -> list[Drift]:
+    return compare_unit(unit.name, repo_text, installed_text)
 
-    Returns:
-        0 — parity (and at least one unit was actually compared)
-        1 — drift, OR a committed unit vanished, OR a drop-in override, OR a
-            unit file that exists but could not be read
-        2 — one or more installed units absent
 
-    Drift DOMINATES absence: a run that hits both returns 1.  An absent unit
-    is still reported in that case — dominated, not hidden.  A run that
-    compared ZERO units never reports parity: see the exit-code table in the
-    module docstring.
-    """
-    args = _build_parser().parse_args(argv)
-
-    installed_dir: pathlib.Path = args.installed_dir
-    repo_root: pathlib.Path = args.repo_root
-    selected = args.unit or sorted(UNITS)
-
-    drifts: list[tuple[Drift, pathlib.Path, pathlib.Path]] = []
-    missing: list[tuple[str, pathlib.Path]] = []
-    vanished: list[tuple[str, pathlib.Path]] = []
-    overridden: list[tuple[str, list[pathlib.Path]]] = []
-    unreadable: list[tuple[str, pathlib.Path, str]] = []
-    # Units that actually reached compare_unit. The success line reports THIS
-    # count, not len(selected): a report may only claim what it verified.
-    compared: list[str] = []
-    # unit -> the VERDICT_KINDS members that apply to it, for --print-verdicts.
-    # Populated ALONGSIDE the buckets above, at the same points in the loop, so
-    # the machine channel and the human report can never describe different
-    # runs. Nothing here feeds the exit code or the report.
-    #
-    # The loop's control flow IS the precedence, and it is preserved exactly as
-    # it already stood: a `vanished` or `absent` unit takes a `continue` before
-    # drop-ins are ever consulted, so neither can be combined with anything —
-    # there is nothing installed to override, or nothing committed to compare.
-    # `unreadable` is reached AFTER the drop-in check, so an unreadable unit
-    # can legitimately also be `override`. `clean` requires both no drift and
-    # no drop-in, so it too is mutually exclusive with every other kind: the
-    # two install-eligible kinds (`clean`, `absent`) never appear alongside a
-    # blocking one, which is what lets the consumer decide per unit on the kind
-    # list alone.
-    verdicts: dict[str, list[str]] = {}
-
-    def _mark(unit: str, kind: str) -> None:
-        """Record *kind* for *unit*; order is imposed at render time."""
-        verdicts.setdefault(unit, []).append(kind)
-
-    for name in selected:
-        repo_path = repo_root / UNITS[name]
-        installed_path = installed_dir / name
-
-        if not repo_path.is_file():
-            # The committed unit is the source of truth; without it there is
-            # nothing to compare against, so this unit was NOT checked.
-            vanished.append((name, repo_path))
-            _mark(name, "vanished")
-            continue
-
-        if not installed_path.is_file():
-            missing.append((name, installed_path))
-            _mark(name, "absent")
-            continue
-
-        # Checked even when the unit itself is at parity: a drop-in is layered
-        # OVER a matching unit file, so it is invisible to the text
-        # comparison below.
-        dropins = find_dropins(installed_dir, name)
-        if dropins:
-            overridden.append((name, dropins))
-            _mark(name, "override")
-
-        # is_file() above establishes the files EXIST, not that they can be
-        # read: either side can be mode 000, or not valid UTF-8. Unguarded,
-        # that raises and the whole run dies with a traceback and exit 1 —
-        # which setup-host.sh reports as "drift or unverifiable state, see the
-        # [orchestrator_unit_parity] report above", sending the operator to
-        # look for a directive diff in a report that is a stack trace. Routed
-        # into its own worded-apart bucket instead, for the same reason
-        # [vanished] and [override] are worded apart from [drift]: it shares
-        # exit 1 ("I could not verify") but points somewhere else entirely.
-        #
-        # Read one side at a time so the report names the file that ACTUALLY
-        # failed; a combined try would leave the operator checking permissions
-        # on the wrong copy.
-        try:
-            repo_text = repo_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            unreadable.append((name, repo_path, str(exc)))
-            _mark(name, "unreadable")
-            continue
-        try:
-            installed_text = installed_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            unreadable.append((name, installed_path, str(exc)))
-            _mark(name, "unreadable")
-            continue
-
-        compared.append(name)
-        unit_drifts = compare_unit(name, repo_text, installed_text)
-        for drift in unit_drifts:
-            drifts.append((drift, repo_path, installed_path))
-
-        if unit_drifts:
-            _mark(name, "drift")
-        elif not dropins:
-            # Neither a directive diff nor a drop-in: this unit was actually
-            # compared and actually matched. `clean` is the only kind that
-            # asserts a positive measurement, so it is the only one gated on
-            # BOTH conditions.
-            _mark(name, "clean")
-
-    if args.print_verdicts:
-        # Emitted BEFORE the human summary blocks so a consumer reading the
-        # stream sees the machine lines first, and in sorted order so two runs
-        # over the same host render identically.
-        #
-        # A unit with no computed kind emits NO line, deliberately: the sole
-        # consumer (setup-host.sh section 5) treats a missing verdict as
-        # "unverified" and declines to install that unit. Skipping is therefore
-        # the SAFE direction — the alternative, a line with an empty kind
-        # field, would be malformed output a consumer might parse as a kind
-        # named "".
-        for name in sorted(selected):
-            kinds = verdicts.get(name)
-            if kinds:
-                _log(f"verdict {name} {_render_kinds(kinds)}")
-
-    for name, path in missing:
-        _log(f"[skip] {name}: installed unit not found: {path} (not installed on this host)")
-
-    if vanished:
-        # Deliberately worded apart from the drift block below. Both exit 1,
-        # but they send the operator to different places: a drift is a
-        # directive diff to propagate, whereas this is "the file I compare
-        # against is gone" — telling them to hunt for a diff would waste the
-        # trip.
-        _log(
-            f"[vanished] {len(vanished)} committed unit(s) not found — "
-            "nothing was verified for them:"
-        )
-        for name, repo_path in vanished:
-            _log(f"  {name}: expected committed copy at {repo_path}")
-        _log(
-            "[vanished] The committed unit is this checker's source of truth. "
-            "Check --repo-root, and whether the unit was renamed or moved "
-            "(the paths live in UNITS in this script)."
-        )
-
-    if unreadable:
-        _log(
-            f"[unreadable] {len(unreadable)} unit file(s) could not be read — "
-            "nothing was verified for them:"
-        )
-        for name, path, error in unreadable:
-            _log(f"  {name}: {path}: {error}")
-        _log(
-            "[unreadable] The file exists but could not be decoded as UTF-8 or "
-            "opened. Check its permissions and encoding — this is not a "
-            "directive diff, so there is nothing to propagate."
-        )
-
-    if overridden:
-        # Worded apart from [drift] for the same reason [vanished] is: this is
-        # not a directive diff to propagate. The unit files may match exactly;
-        # what the run could not establish is that the EFFECTIVE configuration
-        # matches, because systemd merges these over the unit at load time.
-        # It shares exit 1 because "I could not verify" belongs with "I found
-        # a difference", not with the benign "not installed here" that 2
-        # denotes — reporting parity here would overstate what was checked.
-        _log(
-            f"[override] {len(overridden)} unit(s) have drop-in overrides — "
-            "the unit files were compared, but the EFFECTIVE configuration "
-            "was NOT verified:"
-        )
-        for name, dropins in overridden:
-            for dropin in dropins:
-                _log(f"  {name}: {dropin}")
-        _log(
-            "[override] systemd merges these over the unit at load time, so a "
-            "directive set here silently wins over the committed value. "
-            "Inspect with: systemctl --user cat <unit>  (and remove the "
-            "drop-in, or move the setting into the committed unit)."
-        )
-
-    if drifts:
-        _log(
-            f"[drift] {len(drifts)} directive(s) differ between repo and "
-            "installed units:"
-        )
-        for drift, repo_path, installed_path in drifts:
-            _log(f"  {drift.unit} [{drift.section}] {drift.key}")
-            _log(f"      {drift.reason}")
-            _log(f"      repo      {repo_path}: {drift.repo_value}")
-            _log(f"      installed {installed_path}: {drift.installed_value}")
-        _log(
-            "[drift] To propagate the committed units to this host, run: "
+# The second [drift] tail line is deliberately NOT "the installed copy is
+# stale": which side is right has varied per unit on every measurement (see the
+# KNOWN RED section above), so installing blindly can delete a deliberate
+# installed-only setting.
+_REPORT = ReportText(
+    skip="{name}: installed unit not found: {path} (not installed on this host)",
+    drift=BlockText(
+        "drift",
+        "{count} directive(s) differ between repo and installed units:",
+        (
+            "To propagate the committed units to this host, run: "
             "DF_INSTALL_ORCH_UNITS=1 bash scripts/setup-host.sh  (a plain run "
             "runs this same check and DECLINES the unit install on drift, "
             "because the committed side is not always the correct one — see "
             "below. This checker is read-only by design; the module docstring "
-            "says why there is no --fix.)"
-        )
-        # Deliberately NOT phrased as "the installed copy is stale". The
-        # report above shows drift, not direction, and which side is right
-        # has varied per unit on every measurement taken. Measured 2026-08-02
-        # the REPO side was correct for some (RestartSteps) and the INSTALLED
-        # side for others (the ExecStart --config path, where two committed
-        # units named config files that did not exist); both are resolved
-        # (4fcd43eec0, task 3512). Measured 2026-09-05 the one live drift runs
-        # the other way again — orchestrator-watchdog.service carries an
-        # installed-only Environment=ORCH_RESTART_MIN_INTERVAL_SECS the repo
-        # lacks, a deliberate deploy pause owned by task 5020 — so installing
-        # the committed copy would silently delete it. Propagating blindly
-        # would break, or quietly un-throttle, a running orchestrator.
-        _log(
-            "[drift] BUT CHECK DIRECTION FIRST: drift does not mean the "
-            "installed copy is the stale one. Confirm the committed value is "
-            "the one you want on this host before installing — see the KNOWN "
-            "RED section of this script's module docstring."
-        )
+            "says why there is no --fix.)",
+            "BUT CHECK DIRECTION FIRST: drift does not mean the installed copy is "
+            "the stale one. Confirm the committed value is the one you want on "
+            "this host before installing — see the KNOWN RED section of this "
+            "script's module docstring.",
+        ),
+    ),
+)
 
-    if drifts or vanished or overridden or unreadable:
-        return 1
 
-    if missing:
-        return 2
+def main(argv: Sequence[str]) -> int:
+    """Parse args and run the parity check through ``systemd_unit_parity.run_parity``.
 
-    if not compared:
-        # UNREACHABLE BY CONSTRUCTION, kept as defence — not a tested path.
-        # Every unit that was not compared took an earlier `continue` into
-        # `vanished`, `missing` or `unreadable`, and all three return above,
-        # so reaching here
-        # requires `selected` itself to be empty: impossible while UNITS is
-        # non-empty (`args.unit or sorted(UNITS)`) and argparse `choices`
-        # rejects an unknown --unit. (The "compared nothing" TEST reaches
-        # exit 1 through the `vanished` branch, which is the same invariant
-        # enforced one step earlier.) It stays because that invariant — a run
-        # that verified nothing must never report parity — is one a future
-        # early-`continue` could quietly break, and holding it costs three
-        # lines.
-        _log("[error] no units were compared — nothing was verified.")
-        return 1
-
-    _log(f"[ok] parity — {len(compared)} unit(s) match their committed copies.")
-    return 0
+    Exit codes: see ``systemd_unit_parity.ParityExit``.
+    """
+    args = _build_parser().parse_args(argv)
+    units = [
+        UnitRef(name, args.repo_root / UNITS[name], args.installed_dir / name)
+        for name in args.unit or sorted(UNITS)
+    ]
+    run = ParityRun(LOG_TAG, units, _compare, _REPORT, print_verdicts=args.print_verdicts)
+    return run_parity(run, out=sys.stdout)
 
 
 if __name__ == "__main__":

@@ -22,12 +22,12 @@ from fastapi.responses import JSONResponse
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import (
     _all_project_roots,
-    _project_label,
     collect_census_snapshots,
     collect_tasks_with_counts,
     shape_terminal_rows,
 )
 from dashboard.data.datum import Datum, DatumContractError, DatumState, validate_datum
+from dashboard.data.mcp_fanout import project_label
 from dashboard.data.task_snapshot import (
     FRESHNESS_BOUND_SECONDS,
     SnapshotFailure,
@@ -122,7 +122,7 @@ async def _terminal_window(
     terminal tasks", which is a measurement nobody made.
     """
     root = next(
-        (r for r in _all_project_roots(config) if _project_label(r) == label), None
+        (r for r in _all_project_roots(config) if project_label(r) == label), None
     )
     if root is None:
         return Datum(

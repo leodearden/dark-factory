@@ -81,6 +81,7 @@ from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
     ReconciliationEvent,
+    StageAgentOutcome,
 )
 from fused_memory.models.scope import Scope
 from fused_memory.reconciliation.flag_record_contract import (
@@ -159,7 +160,7 @@ if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.reconciliation.event_buffer import EventBuffer
     from fused_memory.reconciliation.journal import ReconciliationJournal
-    from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+    from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
     from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
     from fused_memory.services.write_journal import WriteJournal
 
@@ -266,6 +267,45 @@ def _mem0_content(payload: dict) -> str:
         if isinstance(value, str) and value:
             return value
     return ''
+
+
+def metadata_row_text(row: Mapping[str, Any]) -> str:
+    """The text of one ``get_memories_by_metadata`` row, or ``''``.
+
+    That row is ``{'id', 'created_at', 'metadata'}``
+    (``backends/mem0_client.py::Mem0Backend._normalise_point``) with no
+    top-level text key: the text lives only inside the ``metadata`` payload,
+    where :func:`_mem0_content` owns the key order.
+    """
+    payload = row.get('metadata')
+    return _mem0_content(payload) if isinstance(payload, dict) else ''
+
+
+def _decode_mem0_tombstone(record: ReconLedgerRecord) -> dict | None:
+    """A ``mem0_tombstone`` row's payload plus its own timestamps, or ``None`` (one WARNING).
+
+    The one decode behind ``MemoryService.get_mem0_deletion_tombstone`` and
+    ``MemoryService.find_mem0_deletion_tombstones``; that first method's
+    docstring says why the row's timestamps are added under their own names.
+    """
+    try:
+        payload = json.loads(record.payload_json)
+    except (TypeError, ValueError):
+        payload = None
+    if not isinstance(payload, dict):
+        logger.warning(
+            'mem0 tombstone: unreadable payload for memory_id=%s in project=%s; '
+            'reporting no tombstone',
+            record.task_id,
+            record.project_id,
+            extra={'project_id': record.project_id, 'memory_id': record.task_id},
+        )
+        return None
+    return {
+        **payload,
+        'tombstone_created_at': record.created_at,
+        'tombstone_expires_at': record.expires_at,
+    }
 
 
 def _mem0_category(meta: dict) -> MemoryCategory | None:
@@ -8598,24 +8638,43 @@ class MemoryService:
             return None
         if record is None:
             return None
+        return _decode_mem0_tombstone(record)
+
+    async def find_mem0_deletion_tombstones(
+        self, project_id: str, prefix: str
+    ) -> list[dict] | None:
+        """Every readable tombstone whose memory id starts with *prefix*, or ``None``.
+
+        Feeds the uuid-prefix miss report (PRD C4, task 5323): the tombstone
+        store is keyed by the full id, so a prefix needs a listing, read in
+        one query. Each row decodes exactly as :meth:`get_mem0_deletion_tombstone`
+        decodes it, tagged with its ``memory_id``.
+
+        ``None`` means the tombstone store could not be read: no ledger is
+        wired, or the listing raised (one WARNING). It is never ``[]``, which a
+        reader would take for "nothing with this prefix was reaped" (INV-11).
+        """
+        ledger = getattr(self, 'recon_ledger', None)
+        if ledger is None:
+            return None
         try:
-            payload = json.loads(record.payload_json)
-        except (TypeError, ValueError):
-            payload = None
-        if not isinstance(payload, dict):
+            records = await ledger.mem0_tombstones_with_prefix(project_id, prefix)
+        except Exception:
             logger.warning(
-                'get_mem0_deletion_tombstone: unreadable tombstone payload for '
-                'memory_id=%s in project=%s; reporting no tombstone',
-                memory_id,
+                'find_mem0_deletion_tombstones: tombstone store listing FAILED for '
+                'prefix=%s in project=%s; reporting tombstones unchecked',
+                prefix,
                 project_id,
-                extra={'project_id': project_id, 'memory_id': memory_id},
+                exc_info=True,
+                extra={'project_id': project_id, 'prefix': prefix},
             )
             return None
-        return {
-            **payload,
-            'tombstone_created_at': record.created_at,
-            'tombstone_expires_at': record.expires_at,
-        }
+        found: list[dict] = []
+        for record in records:
+            decoded = _decode_mem0_tombstone(record)
+            if decoded is not None:
+                found.append({'memory_id': record.task_id, **decoded})
+        return found
 
     # ------------------------------------------------------------------
     # Read: cycle_summary ledger presence (task 2436, τ1)
@@ -8654,6 +8713,14 @@ class MemoryService:
         cycle_summary — Stage 1 still runs a focused turn on such a pass and
         may still emit findings; it only skips its own per-cycle summary
         write, by design (task 2652) — from a genuine Stage 1 write failure.
+
+        ``agent_outcome`` (task 5982) is the row's ``StageAgentOutcome`` value
+        as stamped by ``write_cycle_summary``, or ``None`` for an absent,
+        unwired, legacy or corrupt row. A present row whose outcome is not
+        ``'completed'`` records a stage agent that did not run to completion
+        (e.g. ``'zero_output_timeout'``: killed by the startup-wedge watchdog
+        before its first turn) — not a clean zero-work cycle. See
+        plans/recon-stage-startup-wedge-rca-2026-09-27.md.
 
         **Typed absence (task 3731).** ``present=False`` on its own conflates
         four unrelated situations, only ONE of which is a defect:
@@ -8739,6 +8806,7 @@ class MemoryService:
                 'run_id': run_id,
                 'stage': stage,
                 'remediation': None,
+                'agent_outcome': None,
                 'reason': 'ledger_unavailable',
                 'expected': None,
                 'run_lookup_available': journal is not None,
@@ -8760,6 +8828,7 @@ class MemoryService:
             run_id=run_id,
         )
         remediation: bool | None = None
+        agent_outcome: str | None = None
         if record is not None:
             # Guard ONLY this parse — not the get_by_identity read above — so
             # a malformed payload degrades to remediation=None rather than
@@ -8779,6 +8848,11 @@ class MemoryService:
             # be trusted as a suppression signal for Stage 3 (task 2652
             # amendment).
             remediation = raw_remediation if isinstance(raw_remediation, bool) else None
+            raw_outcome = payload.get('agent_outcome') if isinstance(payload, dict) else None
+            try:
+                agent_outcome = StageAgentOutcome(raw_outcome).value
+            except ValueError:
+                agent_outcome = None
 
         reason, expected, run_status = await self._classify_summary_absence(
             journal,
@@ -8795,6 +8869,7 @@ class MemoryService:
             'run_id': run_id,
             'stage': stage,
             'remediation': remediation,
+            'agent_outcome': agent_outcome,
             'reason': reason,
             'expected': expected,
             'run_lookup_available': journal is not None,
@@ -10107,14 +10182,15 @@ class MemoryService:
     ) -> dict:
         """Resolve an Entity node by exact name, MINTING one if none exists.
 
-        Wraps ``graphiti_client.py::GraphitiBackend.ensure_entity_node`` with the
-        two guards an MCP-reachable mint needs and the backend deliberately does
-        not carry.
+        Composes three ``backends/graphiti_client.py::GraphitiBackend``
+        primitives — ``_identity_lock_for``, ``get_nodes_by_exact_name`` and
+        ``_mint_entity_node`` — under the two guards an MCP-reachable mint needs
+        and the backend deliberately does not carry.
 
-        GUARD 1 — BOUNDED IDENTITY-LOCK ACQUIRE. The backend method's docstring
-        states the LOCK CONTRACT: callers MUST hold
-        ``graphiti_client.py::GraphitiBackend._identity_lock_for(group_id)``; it
-        performs no locking of its own. This is the SECOND acquisition site in
+        GUARD 1 — BOUNDED IDENTITY-LOCK ACQUIRE. ``_mint_entity_node``'s
+        docstring states the LOCK CONTRACT: callers MUST hold
+        ``_identity_lock_for(group_id)``; it performs no locking of its own.
+        This is the SECOND acquisition site in
         all of ``fused-memory/src/`` — the first is
         ``memory_service.py::MemoryService._execute_graphiti_write``, which holds
         the same lock across a full LLM extraction plus the entire
@@ -10129,39 +10205,12 @@ class MemoryService:
         INSIDE the lock, which is the other reason the hold time matters.
 
         GUARD 2 — EXACT-NAME PRE-READ under that lock, via the read-only
-        ``get_nodes_by_exact_name``. This is deliberately a WRAPPER-level
-        pre-read rather than an edit to
-        ``graphiti_client.py::GraphitiBackend._resolve_or_create_entity``: that
-        primitive is the shared write-time-identity chokepoint that
-        ``_dedup_episode_nodes`` and the leaf-eta repair path both depend on, and
-        both WANT its >=2-match COLLAPSE arm. Narrowing it would change behaviour
-        for callers this tool never touches and would break its documented
-        post-condition. Refusing here leaves the primitive intact while making
-        the collapse structurally unreachable from the tool: having observed 0
-        matches under the lock we hold, the >=2 branch cannot fire on the mint
-        path; the 1-match case short-circuits to a pure resolve with no backend
-        call at all; and >=2 returns a structured refusal that merges NOTHING.
-
-        THE MINT BRANCH THEREFORE READS THE NAME TWICE, DELIBERATELY. The
-        pre-read above runs, and then ``graphiti.ensure_entity_node`` calls
-        ``_resolve_or_create_entity``, which issues the SAME
-        ``get_nodes_by_exact_name`` query with the same arguments — two
-        identical Cypher round trips inside the very lock guard 1 exists to keep
-        short. This is a known, accepted cost, not an oversight:
-
-        * Only the MINT branch pays it. A resolve (the common case once the
-          graph is populated) short-circuits above with no backend call at all,
-          and both refusals return before the backend is reached.
-        * The mint already makes a far more expensive embedding round trip
-          inside the same lock, so a second read-only exact-name query is not
-          what sets the hold time.
-        * Removing it means a new backend entry point that accepts the
-          already-read node list (a ``_mint_entity_node`` primitive this wrapper
-          could call directly, leaving ``_resolve_or_create_entity`` untouched
-          for its other callers). That is a change to
-          ``backends/graphiti_client.py``, which task 4932 held no lock on, so
-          it was recorded here and filed as an agent-followup ticket against
-          that module rather than done inline.
+        ``get_nodes_by_exact_name``. It is the mint's ONLY identity read: on 0
+        matches the wrapper calls ``_mint_entity_node``, which has no resolve
+        arm, so the irreversible >=2 COLLAPSE is unreachable from this tool by
+        construction. The pre-read is therefore load-bearing — removing it
+        would mint duplicates. 1 match short-circuits to a pure resolve with no
+        backend write, and >=2 returns a structured refusal that merges NOTHING.
 
         Refusals are VALUES, never raises, so an MCP caller gets machine-readable
         data — an ambiguous-name refusal must hand back the conflicting uuids so
@@ -10256,20 +10305,9 @@ class MemoryService:
                     'name': name,
                 }
             else:
-                uuid = await self.graphiti.ensure_entity_node(
+                # 0 matches observed under the lock we hold: the primitive's precondition.
+                uuid = await self.graphiti._mint_entity_node(
                     name, group_id=project_id, summary=summary,
-                    # Redundant BY CONSTRUCTION with the pre-read above — this
-                    # branch is reached only when `existing` was empty, so the
-                    # backend's >=2 arm cannot fire — and that is precisely why
-                    # it is spelled out. Today the collapse is unreachable here
-                    # through an ORDERING property of this method's body, which
-                    # a later refactor dropping the redundant pre-read would
-                    # silently undo. The keyword makes it structurally
-                    # unreachable instead of contingently unreachable, so
-                    # Ratified Decision 1 holds at BOTH non-S1 call sites (the
-                    # other is `_repair_edge_findings`) as an invariant rather
-                    # than as a coincidence of one caller's ordering.
-                    merge_duplicates=False,
                 )
                 result = {
                     'status': 'minted',

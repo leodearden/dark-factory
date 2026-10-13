@@ -70,6 +70,7 @@ from fastmcp.exceptions import ToolError
 from shared.boundary_storm_escape import BoundaryStormEscape
 from shared.mcp_markup_middleware import (
     _ATTRIBUTION_AXIS_MAXLEN,
+    MARKUP_RECURRENCE_ROUTING,
     MarkupGuardMiddleware,
     RepairPolicy,
     _bounded_axis,
@@ -2711,6 +2712,10 @@ class TestB10StormEscape:
         for line in storm_lines:
             assert 'toolcall-markup-containment-prd.md' in line, (
                 f'must name the live owner, not the closed predecessor: {line!r}'
+            )
+            assert MARKUP_RECURRENCE_ROUTING in line, (
+                f'the storm line must carry the ONE shared routing sentence, '
+                f'not a local copy: {line!r}'
             )
 
     # -- the rate limit, and the window ------------------------------------

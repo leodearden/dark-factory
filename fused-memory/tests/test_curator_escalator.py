@@ -22,6 +22,7 @@ from typing import IO, Any, Literal, overload
 import pytest
 from _fm_helpers import LoopFreedomProbe
 from escalation.queue import EscalationQueue
+from shared.project_layout import escalation_queue_dir
 
 from fused_memory.middleware import curator_escalator
 from fused_memory.middleware.curator_escalator import CuratorEscalator
@@ -87,6 +88,24 @@ class TestReportFailure:
             assert '"level": 1' in body
             assert 'max_turns exhausted' in body
             assert 'Add Type::Error arm' in body
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_files_into_the_layout_escalation_queue_when_relocated(
+        self, tmp_path, escalation_queue_relocation,
+    ):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(
+                project_root=str(tmp_path),
+                project_id='proj-x',
+                justification='max_turns exhausted',
+                candidate_title='Add Type::Error arm',
+            )
+
+            assert len(sorted(escalation_queue_dir(tmp_path).glob('esc-*.json'))) == 1
+            assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
         finally:
             handle.close()
 

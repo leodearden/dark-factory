@@ -63,7 +63,7 @@ asyncio_mode = "auto"
 # tests/scripts/test_timeout_method_policy.py.
 # Value provenance: plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 # Rationale for the setting: shared/pyproject.toml. Neither is restated here.
-timeout = 540
+timeout = 420
 timeout_method = "signal"
 
 [dependency-groups]

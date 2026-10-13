@@ -36,9 +36,18 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
-from fused_memory.config.schema import FusedMemoryConfig, WriteTriageConfig
+from fused_memory.config.reload import apply_reload
+from fused_memory.config.schema import (
+    FusedMemoryConfig,
+    LLMConfig,
+    LLMProvidersConfig,
+    OpenAIProviderConfig,
+    RoutingConfig,
+    WriteTriageConfig,
+)
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
+from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.server import write_triage_judge as judge_module
 from fused_memory.server.grouped_read import AMENDMENT_KIND, PARENT_ID_KEY
 from fused_memory.server.write_triage import (
@@ -76,6 +85,7 @@ from fused_memory.server.write_triage_judge import (
     build_judge_prompt,
     judge_write,
     parse_judge_verdict,
+    resolve_judge_api_url,
     resolve_judge_candidate_count,
     resolve_judge_enabled,
     resolve_judge_field_chars,
@@ -86,6 +96,7 @@ from fused_memory.server.write_triage_judge import (
     select_judge_candidates,
 )
 from fused_memory.services.memory_service import RRF_K, SearchResults
+from fused_memory.utils.clip_disclosure import TruncationFact
 
 
 def _payload(word: object, candidate_id: object = None) -> str:
@@ -1287,6 +1298,48 @@ class TestResolveJudgeReasoningEffort:
         assert resolve_judge_reasoning_effort(service) is None
 
 
+class TestResolveJudgeApiUrl:
+    """`judge_api_url` — the judge's OWN endpoint, else None meaning INHERIT.
+
+    None is not a default URL: it hands the choice back to
+    `llm.providers.<provider>.api_url`, the same inheritance `judge_provider`
+    and `judge_model` use.
+    """
+
+    def test_a_configured_url_is_used_verbatim(self) -> None:
+        service = _svc(judge_api_url='http://localhost:8080/v1')
+        assert resolve_judge_api_url(service) == 'http://localhost:8080/v1'
+
+    @pytest.mark.parametrize(
+        ('label', 'service'), _MISSING_HOPS,
+        ids=[label for label, _ in _MISSING_HOPS],
+    )
+    def test_a_missing_hop_inherits(self, label: str, service: object) -> None:
+        assert resolve_judge_api_url(service) is None, label
+
+    @pytest.mark.parametrize('value', ['', '   ', None, 0, b'http://h/v1', True, []])
+    def test_a_blank_or_non_string_url_inherits(self, value: object) -> None:
+        """A blank base_url would fail every call, and read as a judge outage.
+
+        Same reason `_provider_credentials` refuses to forward a blank
+        credential: the operator who cleared the leaf is asking for the
+        provider's own endpoint back.
+        """
+        assert resolve_judge_api_url(_svc(judge_api_url=value)) is None
+
+    def test_the_schema_default_inherits(self) -> None:
+        assert WriteTriageConfig().judge_api_url is None
+
+    @pytest.mark.parametrize('value', ['', '   '])
+    def test_the_schema_stores_a_blank_url_as_inherit(self, value: str) -> None:
+        assert WriteTriageConfig(judge_api_url=value).judge_api_url is None
+
+    def test_the_shipped_config_inherits(self) -> None:
+        """The tracked config.yaml, not just the code default, ships null."""
+        service = types.SimpleNamespace(config=FusedMemoryConfig())
+        assert resolve_judge_api_url(service) is None
+
+
 class TestEveryResolverReadsLive:
     """Nothing is captured at import or construction.
 
@@ -1311,10 +1364,14 @@ class TestEveryResolverReadsLive:
             (resolve_judge_candidate_count, 'judge_candidate_count', 3, 4),
             (resolve_judge_reasoning_effort, 'judge_reasoning_effort', 'low', 'high'),
             (resolve_judge_field_chars, 'judge_field_chars', 1_200, 4_000),
+            (
+                resolve_judge_api_url, 'judge_api_url',
+                'http://a.example/v1', 'http://b.example/v1',
+            ),
         ],
         ids=[
             'enabled', 'provider', 'model', 'timeout', 'candidate_count',
-            'reasoning_effort', 'field_chars',
+            'reasoning_effort', 'field_chars', 'api_url',
         ],
     )
     def test_a_mutation_is_observed_on_the_very_next_call(
@@ -1598,6 +1655,138 @@ class TestProviderCredentials:
             'api_key': 'sk-wire', 'base_url': 'http://h/v1',
         }
 
+    @pytest.mark.parametrize('provider', ['openai', 'anthropic'])
+    def test_the_judge_url_overrides_the_provider_url(self, provider: str) -> None:
+        """The URL is swapped and the provider's key is kept."""
+        service = _creds_svc(**{
+            provider: types.SimpleNamespace(
+                api_key='sk-p', api_url='https://main.example/v1',
+            ),
+        })
+        service.config.write_triage = types.SimpleNamespace(
+            judge_api_url='http://localhost:8080/v1',
+        )
+        assert _provider_credentials(service, provider).client_kwargs == {
+            'api_key': 'sk-p', 'base_url': 'http://localhost:8080/v1',
+        }
+
+    @pytest.mark.parametrize('provider', ['openai', 'anthropic'])
+    def test_the_judge_url_applies_with_no_provider_section(
+        self, provider: str,
+    ) -> None:
+        service = _creds_svc()
+        service.config.write_triage = types.SimpleNamespace(
+            judge_api_url='http://localhost:8080/v1',
+        )
+        assert _provider_credentials(service, provider).client_kwargs == {
+            'base_url': 'http://localhost:8080/v1',
+        }
+
+    @pytest.mark.parametrize('judge_api_url', [None, '', '   ', 0, b'http://x/v1'])
+    def test_an_unset_or_blank_judge_url_inherits_byte_for_byte(
+        self, judge_api_url: object,
+    ) -> None:
+        """Null means today's inheritance, exactly."""
+        service = _creds_svc(
+            openai=types.SimpleNamespace(
+                api_key='sk-p', api_url='https://main.example/v1',
+            ),
+        )
+        service.config.write_triage = types.SimpleNamespace(
+            judge_api_url=judge_api_url,
+        )
+        assert _provider_credentials(service, 'openai').client_kwargs == {
+            'api_key': 'sk-p', 'base_url': 'https://main.example/v1',
+        }
+
+
+_MAIN_URL = 'https://main.example/v1'
+_JUDGE_URL = 'http://localhost:8080/v1'
+
+
+def _real_config(judge_api_url: str | None) -> FusedMemoryConfig:
+    """One REAL config shared by the judge and the main LLM arm.
+
+    Built the way `conftest.py::mock_config` builds its llm section. The
+    write_triage leaves are assigned after construction rather than merged
+    through init kwargs, so the rest of that section stays the shipped one.
+    """
+    cfg = FusedMemoryConfig(
+        llm=LLMConfig(
+            provider='openai',
+            model='gpt-4o-mini',
+            providers=LLMProvidersConfig(
+                openai=OpenAIProviderConfig(api_key='sk-main', api_url=_MAIN_URL),
+            ),
+        ),
+        routing=RoutingConfig(
+            use_heuristics=False, llm_fallback=True, confidence_threshold=0.7,
+        ),
+    )
+    object.__setattr__(cfg.write_triage, 'judge_provider', 'openai')
+    object.__setattr__(cfg.write_triage, 'judge_api_url', judge_api_url)
+    return cfg
+
+
+async def _judge_once(memory_service: object) -> MagicMock:
+    """Run one openai-arm judge_write; return the patched SDK constructor."""
+    client = _openai_client(_payload('distinct'))
+    with patch('openai.AsyncOpenAI', return_value=client) as ctor:
+        await judge_write(
+            memory_service=memory_service,
+            content='c', project_id='p',
+            decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+        )
+    return ctor
+
+
+class TestTheJudgeEndpointOnOneRealConfig:
+    """`judge_api_url` on one real FusedMemoryConfig shared with the classifier.
+
+    The judge's client is built on the judge URL with the provider's key, the
+    add_memory classifier built from the same config is never handed that
+    URL, and a reload reaches the judge's next client.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_judge_client_gets_the_judge_url_and_the_classifier_never_does(
+        self,
+    ) -> None:
+        cfg = _real_config(judge_api_url=_JUDGE_URL)
+
+        judge_ctor = await _judge_once(types.SimpleNamespace(config=cfg))
+        assert judge_ctor.call_args.kwargs['base_url'] == _JUDGE_URL
+        assert judge_ctor.call_args.kwargs['api_key'] == 'sk-main'
+
+        main_client = _chat_client(
+            '{"primary": "procedural_knowledge", "confidence": 0.9}',
+        )
+        with patch(
+            'fused_memory.routing.classifier.AsyncOpenAI', return_value=main_client,
+        ) as main_ctor:
+            result = await WriteClassifier(cfg).classify('some content')
+        assert main_ctor.called
+        assert result.primary is MemoryCategory.procedural_knowledge
+        assert _JUDGE_URL not in main_ctor.call_args.kwargs.values()
+
+        assert cfg.llm.providers.openai is not None
+        assert cfg.llm.providers.openai.api_url == _MAIN_URL
+
+    @pytest.mark.asyncio
+    async def test_a_hot_reloaded_judge_url_reaches_the_next_client(self) -> None:
+        memory_service = types.SimpleNamespace(config=_real_config(judge_api_url=None))
+        before = await _judge_once(memory_service)
+        assert before.call_args.kwargs['base_url'] == _MAIN_URL
+
+        report = apply_reload(
+            memory_service.config, _real_config(judge_api_url=_JUDGE_URL),
+        )
+        assert 'write_triage.judge_api_url' in report['applied']
+
+        # The SAME service object, no reconstruction and no restart.
+        after = await _judge_once(memory_service)
+        assert after.call_args.kwargs['base_url'] == _JUDGE_URL
+
 
 class TestTheVerdictCarriesTheCallsUsage:
     """The provider's per-call usage rides on the verdict, so a write can be priced.
@@ -1678,6 +1867,49 @@ class TestTheVerdictCarriesTheCallsUsage:
             decision=decision, candidates=candidates,
         )
         assert verdict.usage is None
+
+
+class TestJudgeWriteDisclosesTheSlateTrim:
+    """A verdict says how many comparable candidates the judge was NOT shown.
+
+    Structured only: no prompt prose, so JUDGE_PROMPT_CHAR_BUDGET is untouched.
+    """
+
+    @staticmethod
+    async def _verdict(candidates, **write_triage) -> TriageJudgeVerdict:
+        client = _openai_client(_payload('distinct'))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            return await judge_write(
+                memory_service=_judge_svc(**write_triage),
+                content='c', project_id='p',
+                decision=_decision('m0'), candidates=candidates,
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_trimmed_slate_reports_the_comparable_candidates_left_out(self) -> None:
+        candidates = [_result(f'm{i}', 0.90 - i / 100) for i in range(9)]
+
+        verdict = await self._verdict(candidates, judge_candidate_count=3)
+
+        assert verdict.truncation_facts == (TruncationFact(field='judge_candidates', cap=3, elided=6),)
+
+    @pytest.mark.asyncio
+    async def test_uncomparable_candidates_are_not_counted_as_left_out(self) -> None:
+        candidates = [_result(f'm{i}', 0.90 - i / 100) for i in range(4)]
+        candidates += [_result(f'pin{i}', None, omit_store_score=True) for i in range(5)]
+
+        verdict = await self._verdict(candidates, judge_candidate_count=3)
+
+        assert verdict.truncation_facts == (TruncationFact(field='judge_candidates', cap=3, elided=1),)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('comparable', [1, 3])
+    async def test_a_slate_within_the_count_reports_nothing(self, comparable: int) -> None:
+        candidates = [_result(f'm{i}', 0.90 - i / 100) for i in range(comparable)]
+
+        verdict = await self._verdict(candidates, judge_candidate_count=3)
+
+        assert verdict.truncation_facts == ()
 
 
 class TestJudgeWriteDecisionsThatAreNotFailures:
