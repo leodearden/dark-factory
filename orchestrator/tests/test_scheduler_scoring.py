@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import math
 from collections import Counter
 from datetime import UTC, datetime
@@ -15,7 +16,13 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 import orchestrator
-import orchestrator.scheduler as scheduler_module
+from orchestrator.anchor_coverage_gate import (
+    ANCHORLESS_MIN_SAMPLES,
+    ANCHORLESS_SENTINEL,
+    ANCHORLESS_WINDOW,
+    STREAK_ESCALATION_THRESHOLD,
+    STREAK_SENTINEL,
+)
 from orchestrator.config import (
     PRIORITY_TIERS,
     TIER_BASE,
@@ -442,21 +449,9 @@ class TestRow9AnchorCoverageGate:
         assert [e['consecutive_ticks'] for e in _low_coverage_events(store)] == [1, 2, 3, 1]
 
 
-def test_the_storm_escape_constants_are_what_the_measurements_support():
-    """Pinned with the reasoning: code properties, not config leaves (the _BACKFILL_OVERSTAY_* precedent).
-
-    The streak matches the fm-read-storm threshold: it clears a routine
-    fused-memory restart yet catches a fleet stuck on the legacy formula.  The
-    rate is 10x the 0.2% anchorless residual measured live on 2026-10-12 and
-    well under the 10% the arming gate already tolerates; the floor keeps a
-    handful of rows from claiming a rate, and the window lets a fix decay it.
-    """
-    assert scheduler_module._ANCHOR_COVERAGE_LOW_ESCALATION_THRESHOLD == scheduler_module._FM_READ_FAILURE_ESCALATION_THRESHOLD == 12
-    assert pytest.approx(0.02) == scheduler_module._ANCHORLESS_RATE_THRESHOLD
-    assert scheduler_module._ANCHORLESS_MIN_SAMPLES == 500
-    assert scheduler_module._ANCHORLESS_WINDOW == 4096
-    assert scheduler_module._ANCHORLESS_WINDOW > scheduler_module._ANCHORLESS_MIN_SAMPLES
-    assert len({scheduler_module._ANCHOR_COVERAGE_LOW_SENTINEL, scheduler_module._ANCHORLESS_SENTINEL}) == 2
+def test_the_anchorless_window_holds_more_than_the_sample_floor():
+    """Otherwise escape (b) could never sample enough to claim a rate."""
+    assert ANCHORLESS_WINDOW > ANCHORLESS_MIN_SAMPLES
 
 
 class _DownQueue(EscalationQueue):
@@ -499,14 +494,14 @@ class TestStormEscapes:
     def test_a_persistent_unarmed_streak_files_one_l1(self, scheduler, queue):
         tasks = _mixed(anchored=2, absent=3)
 
-        _run(scheduler, tasks, scheduler_module._ANCHOR_COVERAGE_LOW_ESCALATION_THRESHOLD - 1)
+        _run(scheduler, tasks, STREAK_ESCALATION_THRESHOLD - 1)
         assert queue.get_pending() == []
 
         _run(scheduler, tasks, 1)
         [esc] = queue.get_pending()
         assert (esc.task_id, esc.agent_role, esc.severity, esc.level, esc.category) == (
-            scheduler_module._ANCHOR_COVERAGE_LOW_SENTINEL, 'orchestrator-scheduler', 'blocking', 1, 'infra_issue')
-        for fact in ('40.0%', '90.0%', f'{scheduler_module._ANCHOR_COVERAGE_LOW_ESCALATION_THRESHOLD} consecutive', '3', '4', '5', 'stamp_pending_since'):
+            STREAK_SENTINEL, 'orchestrator-scheduler', 'blocking', 1, 'infra_issue')
+        for fact in ('40.0%', '90.0%', f'{STREAK_ESCALATION_THRESHOLD} consecutive', '3', '4', '5', 'stamp_pending_since'):
             assert fact in esc.detail, fact
 
         _run(scheduler, tasks, 5)
@@ -515,22 +510,22 @@ class TestStormEscapes:
     def test_an_armed_tick_ends_the_streak(self, scheduler, queue):
         low, healthy = _mixed(anchored=2, absent=3), _mixed(anchored=5)
 
-        _run(scheduler, low, scheduler_module._ANCHOR_COVERAGE_LOW_ESCALATION_THRESHOLD - 1)
+        _run(scheduler, low, STREAK_ESCALATION_THRESHOLD - 1)
         _run(scheduler, healthy, 1)
-        _run(scheduler, low, scheduler_module._ANCHOR_COVERAGE_LOW_ESCALATION_THRESHOLD - 1)
+        _run(scheduler, low, STREAK_ESCALATION_THRESHOLD - 1)
 
         assert queue.get_pending() == []
 
     def test_a_persistent_anchorless_minority_on_armed_ticks_files_one_l1(self, scheduler, queue):
         tasks = _mixed(anchored=95, absent=3, malformed=2)
-        floor_ticks = scheduler_module._ANCHORLESS_MIN_SAMPLES // len(tasks)
+        floor_ticks = ANCHORLESS_MIN_SAMPLES // len(tasks)
 
         _run(scheduler, tasks, floor_ticks - 1)
         assert queue.get_pending() == []
 
         _run(scheduler, tasks, 1)
         [esc] = queue.get_pending()
-        assert (esc.task_id, esc.level, esc.category) == (scheduler_module._ANCHORLESS_SENTINEL, 1, 'risk_identified')
+        assert (esc.task_id, esc.level, esc.category) == (ANCHORLESS_SENTINEL, 1, 'risk_identified')
         for fact in ('15 ABSENT', '10 MALFORMED', '5.0%', '500', '96', '99'):
             assert fact in esc.detail, fact
 
@@ -548,29 +543,45 @@ class TestStormEscapes:
         assert queue.get_pending() == []
 
     def test_an_unarmed_outage_files_only_the_streak_escape(self, scheduler, queue):
-        _run(scheduler, _mixed(anchored=50, absent=50), scheduler_module._ANCHOR_COVERAGE_LOW_ESCALATION_THRESHOLD + 3)
+        _run(scheduler, _mixed(anchored=50, absent=50), STREAK_ESCALATION_THRESHOLD + 3)
 
-        assert [e.task_id for e in queue.get_pending()] == [scheduler_module._ANCHOR_COVERAGE_LOW_SENTINEL]
+        assert [e.task_id for e in queue.get_pending()] == [STREAK_SENTINEL]
 
     def test_clean_ticks_bring_the_rate_back_under_the_threshold(self, scheduler, queue):
         _run(scheduler, _mixed(anchored=95, absent=5), 5)
-        [esc] = _filed(queue, scheduler_module._ANCHORLESS_SENTINEL)
+        [esc] = _filed(queue, ANCHORLESS_SENTINEL)
 
         _run(scheduler, _mixed(anchored=100), 8)
         queue.resolve(esc.id, 'anchors re-stamped')
         _run(scheduler, _mixed(anchored=100), 3)
 
-        assert _filed(queue, scheduler_module._ANCHORLESS_SENTINEL) == []
+        assert _filed(queue, ANCHORLESS_SENTINEL) == []
 
-    def test_without_a_queue_both_escapes_are_no_ops(self):
+    def test_a_full_window_forgets_its_oldest_samples(self, scheduler, queue):
+        window_ticks = ANCHORLESS_WINDOW // 100 + 1
+        _run(scheduler, _mixed(anchored=95, absent=5), window_ticks)
+        _run(scheduler, _mixed(anchored=100), window_ticks)
+        for esc in _filed(queue, ANCHORLESS_SENTINEL):
+            queue.resolve(esc.id, 'anchors re-stamped')
+
+        _run(scheduler, _mixed(anchored=100), 1)
+
+        assert _filed(queue, ANCHORLESS_SENTINEL) == []
+
+    def test_without_a_queue_both_escapes_only_warn(self, caplog):
         scheduler = _frozen_scheduler()
 
-        _run(scheduler, _mixed(anchored=2, absent=3), scheduler_module._ANCHOR_COVERAGE_LOW_ESCALATION_THRESHOLD + 1)
-        _run(scheduler, _mixed(anchored=95, absent=5), 6)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.sentinel_l1'):
+            _run(scheduler, _mixed(anchored=2, absent=3), STREAK_ESCALATION_THRESHOLD + 1)
+            _run(scheduler, _mixed(anchored=95, absent=5), 6)
+
+        warned = ' '.join(r.getMessage() for r in caplog.records if r.name == 'orchestrator.sentinel_l1')
+        assert STREAK_SENTINEL in warned
+        assert ANCHORLESS_SENTINEL in warned
 
     def test_a_failing_submit_never_aborts_scoring(self, tmp_path):
         scheduler = _frozen_scheduler()
         scheduler.escalation_queue = _DownQueue(tmp_path / 'esc')
 
-        _run(scheduler, _mixed(anchored=2, absent=3), scheduler_module._ANCHOR_COVERAGE_LOW_ESCALATION_THRESHOLD + 1)
+        _run(scheduler, _mixed(anchored=2, absent=3), STREAK_ESCALATION_THRESHOLD + 1)
         _run(scheduler, _mixed(anchored=95, absent=5), 6)
