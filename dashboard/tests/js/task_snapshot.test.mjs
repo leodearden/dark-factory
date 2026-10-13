@@ -41,6 +41,7 @@ const { CENSUS_VIEWS, CENSUS_TILES, censusSegments, censusHistory } = snapshot;
 const { inFlightCount, runningOfInFlight, terminalOfTotal, censusTotal, viewShareText } = snapshot;
 const { projectRows, viewRows, unrequestedTerminalRows } = snapshot;
 const { snapshotRowsOver, EVERY_VIEW, terminalWindowProjects, terminalWindowEntrants } = snapshot;
+const { terminalSelectingProjects } = snapshot;
 const { sameDatum } = snapshot;
 const { isDatum, datumView, displayedAgeMs, EM_DASH } = loadedWindow.DF_DATUM;
 const { MEMBERS, VIEWS, SUB_VIEWS } = loadedWindow.DF_TASK_VOCAB;
@@ -61,6 +62,7 @@ const EXPECTED_FUNCTION_NAMES = [
   'snapshotRowsOver',
   'terminalWindowProjects',
   'terminalWindowEntrants',
+  'terminalSelectingProjects',
   'sameDatum',
 ];
 const EXPECTED_EXPORT_NAMES = [
@@ -721,9 +723,9 @@ test('viewRows: nothing selected lists nothing and leaves the sentence to orch_f
   assert.deepEqual(result.notes, []);
 });
 
-// OrchTab lists terminal rows without requesting the window: that request is
-// another surface's. So an absent window must not read 'not yet fetched', which
-// is data.js::datumFor's answer and promises a fetch that nothing here makes.
+// A surface can list a window it did not request: the Tasks tab, for a project
+// outside its wanted set. So an absent window must not read 'not yet fetched',
+// which is data.js::datumFor's answer and promises a fetch that nothing there makes.
 test('unrequestedTerminalRows: an absent window says it is fetched on request — never "not yet fetched"', () => {
   const absent = unrequestedTerminalRows(undefined);
 
@@ -881,4 +883,58 @@ test('terminalWindowEntrants: its inputs are not mutated', () => {
   terminalWindowEntrants(before, wanted);
   assert.deepEqual(before, ['reify']);
   assert.deepEqual(wanted, ['dark-factory', 'reify']);
+});
+
+// ── terminalSelectingProjects: which projects OrchTab requests ?terminal= for ──
+// OrchTab keeps one view filter per orchestrator, so its wanted set is the
+// projects a listing selects the terminal view for.
+
+const [DARK_FACTORY, REIFY, HIVE] = PROJECT_IDS;
+const listing = (project, filter) => ({ project, filter });
+
+test('terminalSelectingProjects: only a listing whose filter selects the terminal view wants its window, in listing order', () => {
+  const listings = [
+    listing(DARK_FACTORY, { in_flight: true, terminal: true }),
+    listing(REIFY, { in_flight: true }),
+    listing(HIVE, { terminal: true }),
+  ];
+  assert.deepEqual(terminalSelectingProjects(listings), [DARK_FACTORY, HIVE]);
+});
+
+test('terminalSelectingProjects: a project two orchestrators list is wanted once, if either listing selects terminal', () => {
+  const listings = [listing(DARK_FACTORY, { terminal: false }), listing(DARK_FACTORY, { terminal: true }), listing(DARK_FACTORY, { terminal: true })];
+  assert.deepEqual(terminalSelectingProjects(listings), [DARK_FACTORY]);
+  assert.deepEqual(terminalSelectingProjects([listing(DARK_FACTORY, { terminal: false }), listing(DARK_FACTORY, {})]), []);
+});
+
+test('terminalSelectingProjects: no listing selecting terminal wants nothing', () => {
+  assert.deepEqual(terminalSelectingProjects([]), []);
+  const listings = PROJECT_IDS.map(project => listing(project, { in_flight: true, backlog: true }));
+  assert.deepEqual(terminalSelectingProjects(listings), []);
+});
+
+test("terminalSelectingProjects: flipping one listing's terminal view makes its project the only entrant", () => {
+  const withReify = terminal => [
+    listing(DARK_FACTORY, { terminal: true }),
+    listing(REIFY, { terminal }),
+    listing(HIVE, { terminal: false }),
+  ];
+  const off = terminalSelectingProjects(withReify(false));
+  const on = terminalSelectingProjects(withReify(true));
+  assert.deepEqual(terminalWindowEntrants(off, on), [REIFY]);
+  assert.deepEqual(terminalWindowEntrants(on, off), []);
+  assert.deepEqual(terminalWindowEntrants(off, on), [REIFY], 'a re-entry is requested again');
+});
+
+test('terminalSelectingProjects: the persisted filter on mount requests every selecting project', () => {
+  const listings = [listing(HIVE, { terminal: true }), listing(REIFY, {}), listing(DARK_FACTORY, { terminal: true })];
+  const wanted = terminalSelectingProjects(listings);
+  assert.deepEqual(terminalWindowEntrants([], wanted), wanted);
+});
+
+test('terminalSelectingProjects: its inputs are not mutated', () => {
+  const listings = [listing(DARK_FACTORY, { terminal: true }), listing(DARK_FACTORY, { terminal: true }), listing(REIFY, {})];
+  const pristine = structuredClone(listings);
+  terminalSelectingProjects(listings);
+  assert.deepEqual(listings, pristine);
 });
