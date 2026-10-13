@@ -58,7 +58,8 @@ class Env:
 
     @property
     def inbox(self) -> Path:
-        return self.state / 'inbox'
+        """This run's inbox; its sibling ``run-1`` is an earlier night's."""
+        return self.state / 'inbox' / 'run-2'
 
     @property
     def ledger(self) -> Path:
@@ -504,10 +505,9 @@ class TestRecord:
 class TestNightlyConfinement:
     @pytest.fixture
     def confined(self, env, monkeypatch):
-        monkeypatch.setenv(prep_mod.NIGHTLY_CONFINEMENT_ENV, '1')
+        env.inbox.mkdir(parents=True)
+        monkeypatch.setenv(prep_mod.NIGHTLY_CONFINEMENT_ENV, str(env.inbox))
         monkeypatch.setattr(mod, 'DEFAULT_PREPARATION', env.preparation)
-        monkeypatch.setattr(mod, 'DEFAULT_INBOX', env.inbox)
-        env.inbox.mkdir()
         return env
 
     def _batch(self, directory: Path, esc_id: str = 'esc-100-1', *, env: Env) -> Path:
@@ -527,7 +527,7 @@ class TestNightlyConfinement:
         self._batch(confined.inbox, env=confined)
         monkeypatch.chdir(confined.state)
 
-        rc, _, _ = _run(capsys, 'record', '--from', 'inbox/batch-01.json')
+        rc, _, _ = _run(capsys, 'record', '--from', 'inbox/run-2/batch-01.json')
 
         assert rc == 0
 
@@ -538,7 +538,7 @@ class TestNightlyConfinement:
         rc, _, err = _run(capsys, 'record', '--from', '-')
 
         assert rc == 2
-        assert prep_mod.NIGHTLY_CONFINEMENT_ENV in err and str(confined.inbox) in err and 'write the batch as a file' in err
+        assert prep_mod.NIGHTLY_CONFINEMENT_ENV in err and str(confined.inbox) in err and 'write the batch as a .json file' in err
         assert confined.preparation.read_bytes() == before
 
     def test_a_file_outside_the_inbox_is_refused(self, confined, capsys):
@@ -566,6 +566,39 @@ class TestNightlyConfinement:
         before = confined.preparation.read_bytes()
 
         rc, _, err = _run(capsys, 'record', '--from', str(link))
+
+        assert rc == 2 and prep_mod.NIGHTLY_CONFINEMENT_ENV in err
+        assert confined.preparation.read_bytes() == before
+
+    def test_an_earlier_nights_batch_is_refused(self, confined, capsys):
+        earlier = confined.inbox.parent / 'run-1'
+        earlier.mkdir()
+        source = self._batch(earlier, env=confined)
+        before = confined.preparation.read_bytes()
+
+        rc, _, err = _run(capsys, 'record', '--from', str(source))
+
+        assert rc == 2 and str(confined.inbox) in err
+        assert confined.preparation.read_bytes() == before
+
+    @pytest.mark.parametrize('name', ['nested/batch-01.json', 'batch-01.txt'])
+    def test_only_a_json_file_directly_in_the_inbox_is_a_batch(self, confined, capsys, name):
+        source = confined.inbox / name
+        source.parent.mkdir(exist_ok=True)
+        source.write_text(json.dumps([_prep_payload(confined, 'esc-100-1')]))
+        before = confined.preparation.read_bytes()
+
+        rc, _, err = _run(capsys, 'record', '--from', str(source))
+
+        assert rc == 2 and prep_mod.NIGHTLY_CONFINEMENT_ENV in err
+        assert confined.preparation.read_bytes() == before
+
+    def test_a_confining_value_that_is_not_a_directory_admits_no_batch(self, confined, capsys, monkeypatch):
+        source = self._batch(confined.inbox, env=confined)
+        monkeypatch.setenv(prep_mod.NIGHTLY_CONFINEMENT_ENV, '1')
+        before = confined.preparation.read_bytes()
+
+        rc, _, err = _run(capsys, 'record', '--from', str(source))
 
         assert rc == 2 and prep_mod.NIGHTLY_CONFINEMENT_ENV in err
         assert confined.preparation.read_bytes() == before

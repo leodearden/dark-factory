@@ -87,7 +87,6 @@ OWNER_RELEASE_STATUSES: tuple[str, ...] = tuple(sorted(ownership.TERMINAL_TASK_S
 PIN_RELEASE = Manual('a human spends the pin (acknowledge_declared_pins) or withdraws it')
 
 DEFAULT_PREPARATION = _REPO_ROOT / preparations.DEFAULT_PREPARATION_PATH
-DEFAULT_INBOX = _REPO_ROOT / preparations.DEFAULT_INBOX_PATH
 
 
 @dataclass(frozen=True)
@@ -315,8 +314,11 @@ def classification_json(sitting: Sitting) -> dict[str, Any]:
 NIGHTLY_COMMANDS = frozenset({'brief', 'record'})
 
 
-def nightly_confinement_breach(args: argparse.Namespace) -> str | None:
-    """Why *args* would write or close outside what an unattended run may touch, or None."""
+def nightly_confinement_breach(args: argparse.Namespace, inbox: Path) -> str | None:
+    """Why *args* would write or close outside what an unattended run may touch, or None.
+
+    *inbox* is the run's own inbox; one that is not an existing directory admits no batch.
+    """
     if args.command not in NIGHTLY_COMMANDS:
         return f'{args.command!r} is not a nightly subcommand ({", ".join(sorted(NIGHTLY_COMMANDS))})'
     if args.preparation.resolve() != DEFAULT_PREPARATION.resolve():
@@ -325,19 +327,16 @@ def nightly_confinement_breach(args: argparse.Namespace) -> str | None:
         return '--apply-closes is never available to the unattended run'
     if getattr(args, 'ledger', None) is not None:
         return '--ledger is never available to the unattended run'
-    if args.command == 'record' and not _inside_inbox(args.source):
-        return (f'record reads only a file inside {DEFAULT_INBOX}, never stdin or any other path; '
-                f'write the batch as a file in that directory and pass its path to --from')
+    if args.command == 'record' and not (inbox.is_dir() and preparations.is_inbox_batch(inbox, args.source)):
+        return (f'record reads only a .json file directly inside {inbox}, never stdin or any other path; '
+                f'write the batch as a .json file in that directory and pass its path to --from')
     return None
-
-
-def _inside_inbox(source: str) -> bool:
-    return source != '-' and DEFAULT_INBOX.resolve() in Path(source).resolve().parents
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if os.environ.get(preparations.NIGHTLY_CONFINEMENT_ENV) and (breach := nightly_confinement_breach(args)):
+    confined_to = os.environ.get(preparations.NIGHTLY_CONFINEMENT_ENV)
+    if confined_to and (breach := nightly_confinement_breach(args, Path(confined_to))):
         print(f'refused under {preparations.NIGHTLY_CONFINEMENT_ENV}: {breach}', file=sys.stderr)
         return EXIT_CONFIG
     try:

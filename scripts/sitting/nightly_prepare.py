@@ -13,14 +13,17 @@ dontAsk`` with ``nightly_allowed_tools`` as the only tools it may use and
 (``setting_sources=[]``), so no ambient allow rule widens that list. Its one
 write channel is a fresh per-run inbox, ``data/sitting/inbox/<UTC stamp>/``:
 it Writes JSON batches there and runs ``prepare_sitting.py record --from
-<file>``. The child env also carries ``NIGHTLY_CONFINEMENT_ENV``, under which
-``prepare_sitting.py`` itself refuses any other subcommand, ``record`` from
-stdin or from outside the inbox, a non-default ``--preparation``, ``--ledger``
-and ``--apply-closes``: the confinement is enforced in code, not in the allowlist.
+<file>``. The child env also carries ``NIGHTLY_CONFINEMENT_ENV``, set to the
+run's inbox, under which ``prepare_sitting.py`` itself refuses any other subcommand, ``record`` from
+stdin or from outside that inbox, a non-default ``--preparation``, ``--ledger``
+and ``--apply-closes``. Two mechanisms confine the run: the CLI allow rule with no settings files
+limits its file writes to its inbox, and ``prepare_sitting.py`` limits in code what ``record`` reads
+(a ``.json`` file directly in the run's inbox, named by ``NIGHTLY_CONFINEMENT_ENV``) and where it writes
+(the default store).
 
 The outcome is measured from structured data, not from the agent's say-so:
 ``recorded`` counts the item keys whose store entry equals a preparation the
-run's inbox files offer. A run that records nothing exits 1.
+run's inbox files offer and changed during the run. A run that records nothing exits 1.
 
 Its MCP servers are exactly ``NIGHTLY_MCP_SERVERS``, copied from the
 checkout's ``.mcp.json`` and passed with ``--strict-mcp-config``. The
@@ -200,9 +203,9 @@ def run(settings: Settings, *, gate: Any = None) -> int:
     except McpConfigUnusable as exc:
         _log(f'no usable MCP config: {exc}')
         return EXIT_CONFIG
-    env = _child_env(gate if gate is not None else account_pool.build_pool())
     root = settings.root.resolve()
     inbox = _new_inbox(root)
+    env = _child_env(gate if gate is not None else account_pool.build_pool(), inbox)
     argv, temp_files = build_claude_argv(
         model=settings.model,
         max_budget_usd=settings.budget_usd,
@@ -220,6 +223,8 @@ def run(settings: Settings, *, gate: Any = None) -> int:
         setting_sources=[],
     )
     argv[0] = claude
+    store_path = root / preparation.DEFAULT_PREPARATION_PATH
+    held_before = _load_or_empty(store_path)
     try:
         completed = _run_bounded(argv, env, settings.timeout_secs, cwd=root, prompt=nightly_prompt(inbox, root))
     except OSError as exc:
@@ -228,12 +233,12 @@ def run(settings: Settings, *, gate: Any = None) -> int:
     finally:
         for path in temp_files:
             Path(path).unlink(missing_ok=True)
-    return _judge(completed, settings, _measure(inbox, root / preparation.DEFAULT_PREPARATION_PATH))
+    return _judge(completed, settings, _measure(inbox, store_path, held_before))
 
 
 def main(argv: Sequence[str] | None = None, *, gate: Any = None) -> int:
     args = _parser().parse_args(argv)
-    settings = Settings(args.claude_bin, args.model, args.budget_usd, args.timeout_secs, args.max_turns, args.mcp_json, args.root)
+    settings = Settings(args.claude_bin, args.model, args.budget_usd, args.timeout_secs, args.max_turns, args.mcp_json, _REPO_ROOT)
     try:
         return run(settings, gate=gate)
     except Exception as exc:
@@ -261,10 +266,10 @@ def _mcp_config(path: Path) -> dict[str, Any]:
     return {'mcpServers': {name: servers[name] for name in NIGHTLY_MCP_SERVERS}}
 
 
-def _child_env(gate: Any) -> dict[str, str]:
+def _child_env(gate: Any, inbox: Path) -> dict[str, str]:
     env = dict(os.environ)
     env.pop('ANTHROPIC_API_KEY', None)
-    env[preparation.NIGHTLY_CONFINEMENT_ENV] = '1'
+    env[preparation.NIGHTLY_CONFINEMENT_ENV] = str(inbox)
     lease = gate.try_lease(reverse=True)
     if lease is None:
         _log('no pool account available; the run inherits this environment')
@@ -292,38 +297,48 @@ def _run_bounded(argv: list[str], env: dict[str, str], timeout_secs: float, *, c
     return Completed(proc.returncode, stdout, stderr)
 
 
-def _measure(inbox: Path, store_path: Path) -> Outcome:
-    """The preparations *inbox*'s files offer, counted against what the store holds.
+def _load_or_empty(store_path: Path) -> preparation.PreparationStore:
+    try:
+        return preparation.load(store_path)
+    except preparation.PreparationStoreCorrupt:
+        return preparation.PreparationStore()
 
-    Not a before/after diff of the store: a watcher may record into it concurrently.
+
+def _measure(inbox: Path, store_path: Path, held_before: preparation.PreparationStore) -> Outcome:
+    """The item keys whose store entry is now one of the preparations *inbox*'s files offer and was not that entry before the run.
+
+    Not a before/after diff of the whole store: a watcher may record into it concurrently, which
+    can only lower this count, never raise it.
     """
     offered, undecodable = _offered(inbox)
     try:
-        store = preparation.load(store_path)
+        held_now = preparation.load(store_path)
     except preparation.PreparationStoreCorrupt as exc:
         _log(f'the preparation store is unreadable, counting 0 recorded: {exc}')
         return Outcome(len(offered), undecodable, 0)
-    recorded = sum(1 for key, offers in offered.items() if store.entries.get(key) in offers)
+    recorded = sum(
+        1 for key, offers in offered.items()
+        if held_now.entries.get(key) in offers and held_now.entries.get(key) != held_before.entries.get(key)
+    )
     return Outcome(len(offered), undecodable, recorded)
 
 
 def _offered(inbox: Path) -> tuple[dict[str, list[preparation.Preparation]], int]:
-    """Each decodable preparation in ``inbox/*.json`` by item key, and how many files or entries were not.
-
-    The files are agent-written, so a decoder may fail in any way and none of them may end the measurement.
-    """
+    """Each decodable preparation in the batch files of *inbox* by item key, and how many files or entries were not."""
     offered: dict[str, list[preparation.Preparation]] = {}
     undecodable = 0
-    for path in sorted(inbox.glob('*.json')):
+    for path in sorted(inbox.iterdir()):
+        if not preparation.is_inbox_batch(inbox, path):
+            continue
         try:
             data = json.loads(path.read_text(encoding='utf-8'))
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             undecodable += 1
             continue
         for entry in data if isinstance(data, list) else [data]:
             try:
                 prep = preparation.from_json_payload(entry)
-            except Exception:
+            except (TypeError, ValueError):
                 undecodable += 1
                 continue
             offered.setdefault(inventory.key_str(prep.item_key), []).append(prep)
@@ -346,12 +361,11 @@ def _judge(completed: Completed, settings: Settings, outcome: Outcome) -> int:
         _log(f'claude reported an error result (subtype={result.get("subtype")!r}, {run_label}): {_tails(completed)}')
         return EXIT_FAILED
     summary = (f'model={settings.model!r}, turns={result.get("num_turns")}, cost_usd={result.get("total_cost_usd")}, '
-               f'recorded={outcome.recorded} of {outcome.offered_keys}, '
+               f'recorded={outcome.recorded} of {outcome.offered_keys}, undecodable={outcome.undecodable}, '
                f'permission_denials={len(result.get("permission_denials") or [])}')
     verdict = f'{result.get("result", "")!s:.200}'
     if outcome.recorded == 0:
-        _log(f'recorded nothing; {outcome.offered_keys} item key(s) offered, {outcome.undecodable} undecodable '
-             f'inbox file(s) or entries ({summary}): {verdict}')
+        _log(f'recorded nothing; {outcome.offered_keys} item key(s) offered ({summary}): {verdict}')
         return EXIT_FAILED
     print(f'nightly_prepare: done ({summary}): {verdict}')
     return EXIT_OK
@@ -398,8 +412,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument('--max-turns', type=_positive(int), default=DEFAULT_MAX_TURNS)
     parser.add_argument('--mcp-json', type=Path, default=DEFAULT_MCP_JSON,
                         help="the MCP config whose escalation and fused-memory blocks the run uses (default: this checkout's)")
-    parser.add_argument('--root', type=Path, default=_REPO_ROOT,
-                        help='the checkout the run works in (default: this one)')
     return parser
 
 
