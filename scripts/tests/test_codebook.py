@@ -2531,6 +2531,138 @@ def test_live_codebook_withdraws_the_refuted_em_dash_framing():
 
 
 # ---------------------------------------------------------------------------
+# task 5729 (live-file guard) — the ef7f6a5c census-verifier sighting misfiled
+# on entry-cand-20260919-2 is annotated there and re-routed to
+# entry-cand-20260722-18, through the sole writer.
+# ---------------------------------------------------------------------------
+
+_T5729_RECORD_PATH = (
+    _REPO_ROOT / "docs" / "legibility" / "coding-records" / "task-5729-corrections.jsonl"
+)
+_T5729_ANNOTATION_SESSION = "task-5729-ef7f6a5c-reroute"
+_T5729_MISFILED_SESSION = "ef7f6a5c-3ea0-43b3-b0ee-73fe34d67ccf"
+_T5729_MISFILED_DATE = "2026-09-20"
+_T5729_HOME_ENTRY_ID = "entry-cand-20260722-18"
+_T5729_MISFILED_NOTE = (
+    "The periodic-census verifier encountered the em-dash issue itself while "
+    "verifying the cluster. Turns 42, 46, 54, 83, 97 show repeated "
+    "ansi_c_string encoding rejections when constructing heredocs with "
+    "embedded em-dashes. Error neighborhoods confirm SyntaxError with U+2014 "
+    "character and multiple failed Bash commands attempting to work with the "
+    "problematic em-dash pattern."
+)
+
+
+def test_live_codebook_reroutes_the_misfiled_census_verifier_sighting():
+    """The misfiled sighting is annotated where it was filed and re-routed to
+    the entry whose mechanism it shows, both through the sole writer.
+
+    (1) ANNOTATION — a note-only correction on the misfiled entry, absorbed as
+        `_assert_correction_absorbed` defines it, the entry still open.
+    (2) REPLACES NO EXPLANATION — the annotation supplies no title, cause or
+        status.
+    (3) ANNOTATED, NOT RETRACTED — the misfiled sighting keeps its own note.
+    (4) LINK — the annotation names the session it annotates and its new home.
+    (5) ROUTE — one match op, under the real session and date, on the home
+        entry, naming where it was misfiled; carried once, field for field.
+    (6) ROUTE NO-OP — re-applying the route changes nothing.
+    """
+    _, correction, entry = _assert_correction_absorbed(
+        _T5729_RECORD_PATH,
+        _T5729_ANNOTATION_SESSION,
+        _T5687_ENTRY_ID,
+        refuted_tokens=_T5687_REFUTED_TOKENS,
+        expected_status="open",
+        original_sightings={_T5729_MISFILED_SESSION: _T5729_MISFILED_DATE},
+    )
+
+    # (2) REPLACES NO EXPLANATION.
+    rewritten = {"title", "cause", "status"} & correction.keys()
+    assert rewritten == set(), (
+        f"the {_T5729_ANNOTATION_SESSION!r} correction writes {sorted(rewritten)} "
+        f"of {_T5687_ENTRY_ID!r} — that entry's framing is owned by task 5687's "
+        "record; this one only annotates a sighting"
+    )
+
+    # (3) ANNOTATED, NOT RETRACTED.
+    notes = [s.get("note") for s in _sightings_for(entry, _T5729_MISFILED_SESSION)]
+    assert notes == [_T5729_MISFILED_NOTE], (
+        f"the {_T5729_MISFILED_SESSION!r} sighting of {_T5687_ENTRY_ID!r} now "
+        f"carries {notes!r} — a dated observation is immutable: it is corrected "
+        "by the sibling annotation sighting, never rewritten"
+    )
+
+    # (4) LINK.
+    unnamed = [
+        ident
+        for ident in (_T5729_MISFILED_SESSION, _T5729_HOME_ENTRY_ID)
+        if ident not in correction["note"]
+    ]
+    assert unnamed == [], (
+        f"the annotation note does not name {unnamed} — naming them is the only "
+        "link from an annotation to the sighting it annotates and its new home"
+    )
+
+    # (5) ROUTE.
+    records = [
+        json.loads(line)
+        for line in _T5729_RECORD_PATH.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    routes = [r for r in records if r.get("session") == _T5729_MISFILED_SESSION]
+    assert len(routes) == 1, (
+        f"expected exactly one {_T5729_MISFILED_SESSION!r} record in "
+        f"{_T5729_RECORD_PATH}, found {len(routes)}"
+    )
+    route = routes[0]
+    assert mod.validate_coding_record(route) == [], (
+        f"invalid §7.3 coding record for session {_T5729_MISFILED_SESSION!r}"
+    )
+    assert route.get("date") == _T5729_MISFILED_DATE, (
+        f"the route must keep the observation's own date, not {route.get('date')!r}"
+    )
+    assert not route.get("corrections") and not route.get("candidates"), (
+        "the route only adds a sighting; it rewrites no entry and files nothing new"
+    )
+    matches = route.get("matches") or []
+    assert len(matches) == 1, f"expected exactly one match op, got {len(matches)}"
+    match = matches[0]
+    assert match.get("entry_id") == _T5729_HOME_ENTRY_ID
+    assert _T5687_ENTRY_ID in match.get("note", ""), (
+        f"the route note does not name {_T5687_ENTRY_ID!r}, where the sighting "
+        "was misfiled and still stands"
+    )
+
+    codebook = mod.load(_LIVE_CODEBOOK_PATH)
+    homes = [
+        e for e in codebook.get("entries") or [] if e.get("id") == _T5729_HOME_ENTRY_ID
+    ]
+    assert len(homes) == 1, f"expected exactly one {_T5729_HOME_ENTRY_ID!r} entry"
+    carried = _sightings_for(homes[0], _T5729_MISFILED_SESSION)
+    assert [s.get("date") for s in carried] == [_T5729_MISFILED_DATE], (
+        f"expected exactly one {_T5729_MISFILED_SESSION!r} sighting on "
+        f"{_T5729_HOME_ENTRY_ID!r} dated {_T5729_MISFILED_DATE}, found "
+        f"{[s.get('date') for s in carried]}"
+    )
+    drift = {
+        field: (match[field], carried[0].get(field))
+        for field in _SIGHTING_PAYLOAD_FIELDS
+        if match.get(field) and match[field] != carried[0].get(field)
+    }
+    assert drift == {}, (
+        f"the {_T5729_MISFILED_SESSION!r} sighting on {_T5729_HOME_ENTRY_ID!r} no "
+        f"longer matches the committed route {{field: (record, codebook)}}: {drift}"
+    )
+
+    # (6) ROUTE NO-OP.
+    merge = _merge_one(codebook, route)
+    assert _report(merge) == _clean_report(), (
+        f"re-applying the route changed something — the committed codebook has "
+        f"not fully absorbed it: {merge.summary()}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # task 6402 (census PRD leaf L3, C1): finding identity, run history and ticket
 # fields on entries and candidates. Every field is optional; each rejection
 # names the field path and carries the offending value (INV-2).
