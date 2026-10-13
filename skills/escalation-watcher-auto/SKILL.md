@@ -734,17 +734,19 @@ Agent found it depends on work that isn't done yet.
 
 Technical debt or cleanup discovered during development.
 
-1. Resolve with action='resume' (the dispatch agent is parked on the L0 live wait; resume injects the ack and continues):
-   ```
+1. File the cleanup with steps 1–2 of [Convert to tracked work](#convert-to-tracked-work-file-and-resolve): `submit_task`, then `resolve_ticket`, then branch on its `status`.
+2. **On `created` / `combined`:** resolve with `action='resume'` instead of that section's `close_only`. A blocked subject may be parked on this record, and resume re-pends it; on a done or cancelled subject resume is a no-op (`orchestrator/src/orchestrator/harness.py::Harness._cascade_unblock_member` skips terminal statuses).
+   ```python
    mcp__escalation__resolve_issue(
      escalation_id="...",
-     resolution="Cleanup queued. Agent may continue — cleanup tracked in digest for follow-up.",
+     resolution="Cleanup filed as task <task_id> (<created|combined>) — <summary>; agent may continue.",
      action='resume',
      resolved_by="escalation-watcher-auto",
-     resolution_class="actionable"
+     resolution_class="converted"
    )
    ```
-2. Add to digest: `DISPATCHED: cleanup_needed — <task_id> — <summary>`
+   Add to digest: `FILED: cleanup_needed — <task_id> — tracked as task <new_task_id> (<created|combined>) — <summary> [converted]`
+3. **On `refused` / `failed` / a submit error:** follow that section's step 4 (promote). Never resolve with a cleanup claim when no task exists.
 
 #### `stranded_blocked`
 
@@ -1144,10 +1146,10 @@ Exit reason: <"escalation limit reached" | "time limit reached">
 Mode: <"L2-promotion (promote_to_l2 available)" | "LEGACY (promote_to_l2 not available)">
 
 ### Dispatched (autonomous)
-- DISPATCHED: cleanup_needed — task-99 — dead code in scheduler.py flagged for follow-up [actionable]
 - DISPATCHED: dependency_discovered — task-77 → depends on task-55 [actionable]
 
 ### Filed as tracked work
+- FILED: cleanup_needed — task-99 — tracked as task 6121 (created) — dead code in scheduler.py [converted]
 - FILED: infra_issue — task-61 — tracked as task 6120 (created) — residual: scripts/watcher-rearm.sh still reads the pre-6118 queue path [converted]
 
 ### Promoted to L2 (L2-promotion mode only)
