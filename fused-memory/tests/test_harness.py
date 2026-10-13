@@ -6254,6 +6254,48 @@ async def test_run_full_cycle_cancellation_records_traceback_and_sqlite_classifi
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('drive', 'run_type'),
+    [
+        pytest.param(
+            lambda harness: harness.run_full_cycle('test-project', 'buffer_size:1'), 'full',
+            id='full_cycle',
+        ),
+        pytest.param(_remediation_pass_under_test, 'remediation', id='remediation_pass'),
+    ],
+)
+async def test_all_accounts_capped_deferral_records_traceback_and_sqlite_classification(
+    journal, event_buffer, mock_memory_service, drive, run_type,
+):
+    """An AllAccountsCapped deferral, in either driver, records the same
+    classified failure evidence as any other run-ending exception, plus its
+    ``deferred`` marker."""
+    from shared.cli_invoke import AllAccountsCappedException
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    await event_buffer.push(_make_event())
+    harness.stages[0].run = _raising_stage_run(
+        lambda: AllAccountsCappedException(retries=3, elapsed_secs=1.0, label='stage'),
+    )
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    await drive(harness)
+
+    [row] = await journal.get_recent_runs('test-project', limit=1)
+    assert row.run_type == run_type
+    assert row.status == 'failed'
+    err = row.stage_reports['_error']
+    assert err['deferred'] is True
+    _assert_run_failure_record(
+        err,
+        error_type='AllAccountsCappedException', failed_stage='memory_consolidator',
+        message='stage: all accounts capped after 3 retries (1.0s elapsed)',
+        errorname=None, errorcode=None,
+    )
+
+
+@pytest.mark.asyncio
 async def test_remediation_pass_cancellation_cleanup_failure_still_propagates_cancel(
     journal, event_buffer, mock_memory_service, caplog,
 ):
