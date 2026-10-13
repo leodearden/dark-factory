@@ -7956,11 +7956,10 @@ class TestResolveIssueSurfacesLateResolution:
     async def test_already_terminal_path_does_not_resurrect_the_archived_record(
         self, tmp_path: Path,
     ):
-        """(c) The `rec.status == 'pending'` guard still skips the pre-stamp rewrite.
+        """(c) The already-terminal path leaves no queue-root copy.
 
-        `queue._rewrite` targets the queue ROOT, so running it on an archived
-        record would leave a second copy there — the orphan state
-        `TestResolveIdempotent` exists to prevent.
+        A second copy in the queue ROOT beside the archived one is the orphan
+        state `TestResolveIdempotent` exists to prevent.
         """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
@@ -8071,6 +8070,7 @@ class TestResolveIssueDeclaredPinGuard:
         esc_id: str = 'esc-3371-2',
         task_id: str = '3371',
         level: int = 1,
+        pin_declared_reason: str = '',
     ) -> Escalation:
         esc = Escalation(
             id=esc_id,
@@ -8080,6 +8080,7 @@ class TestResolveIssueDeclaredPinGuard:
             category='design_concern',
             summary='a load-bearing pending record',
             level=level,
+            pin_declared_reason=pin_declared_reason,
         )
         queue.submit(esc)
         return esc
@@ -8206,11 +8207,7 @@ class TestResolveIssueDeclaredPinGuard:
         """The declarer list is the marker, not the prose."""
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
-        esc = self._seed(queue)
-        rec = queue.get(esc.id)
-        assert rec is not None
-        rec.pin_declared_reason = 'I feel like this one matters'
-        queue._rewrite(esc.id, rec)
+        esc = self._seed(queue, pin_declared_reason='I feel like this one matters')
 
         result = await _resolve_issue(
             server, escalation_id=esc.id, resolution='closing', action='close_only',

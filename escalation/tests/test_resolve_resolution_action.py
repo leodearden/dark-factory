@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from fastmcp.tools import FunctionTool
 
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue, ResolveOutcome
@@ -66,6 +67,7 @@ def _interleave_after_first_read(
 
 async def _resolve_issue(queue: EscalationQueue, **kwargs: Any) -> dict[str, Any]:
     tool = await create_server(queue).get_tool('resolve_issue')
+    assert isinstance(tool, FunctionTool)
     return tool.fn(**kwargs)
 
 
