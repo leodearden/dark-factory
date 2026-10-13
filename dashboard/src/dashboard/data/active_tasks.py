@@ -219,12 +219,17 @@ _TASKS_PER_PROJECT_BUDGET = 14.0
 # called in-process against the live fused-memory with the production roots,
 # served 30.4 MB: 9 roots, all fresh on both halves, and 3128 active rows.
 # ACTIVE_TASKS was 15.2 MB, and the same rows again under
-# TASKS_SNAPSHOT[p].rows were another 15.2 MB, until γ3 (task 5590) retires
+# TASKS_SNAPSHOT[p].rows were another 15.2 MB, until γ3 (task 5590) retired
 # ACTIVE_TASKS. Main's live endpoint, at the same hour, served 17.4 MB
 # for 3634 rows. 506 of those rows were terminal, at 2.2 MB, so that 2.2 MB is
 # all that leaving terminal rows out of the default render saved on the wire.
 # The PRD baseline's 9.4 MB terminal-window row measures the READ (its caption:
 # the dashboard's own fetch_tasks), not the capped slice of it that shipped.
+#
+# NOTE 2026-10-14 (task 5953): task 5590 has since landed (merged to main
+# 2026-09-30), so the rows now travel once, under TASKS_SNAPSHOT[p].rows, and
+# the duplicate 15.2 MB ACTIVE_TASKS copy is gone. The sizes above were not
+# re-measured.
 _TASKS_TOTAL_BUDGET = 20.0
 
 # How many project roots ``collect_tasks_with_counts`` may have in flight.
