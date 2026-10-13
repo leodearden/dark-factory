@@ -15,7 +15,7 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
-import pytest  # pyright: ignore[reportMissingImports]
+import pytest
 
 from orchestrator import session_registry as sr
 
