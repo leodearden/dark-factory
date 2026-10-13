@@ -405,12 +405,12 @@ verdict.
 
 Instead follow [`merge-queue/SKILL.md`](../merge-queue/SKILL.md)'s "Follow the superseded
 successor" rules 2–3: check the **TIP's** merge marker and this task's own scheduler status, and
-on either landing signal the verdict is **landed** rather than not-landed. **Rule 2b licenses no
-write on this arm** — there is no self-stamp — exactly as rule 2a licenses none on the rc=128 arm
-below; the two arms agree. Rule 2b is the authority for the whole disposition — read which exit
-each scheduler status yields, its **landed-but-not-credited** report, and the `git cherry main
-task/<TASK_ID>` content proof (including why that proof cannot discharge the veto) from there, not
-from here. **rc=1 is NOT not-landed on the `coalesce-*` arm.**
+on either landing signal the verdict is **landed** rather than not-landed. **Rule 2v (the veto, both
+arms) licenses no write on this arm** — there is no self-stamp — exactly as it licenses none on the
+rc=128 arm below; the two arms agree. Rules 2v and 2b are the authority for the whole disposition —
+read which exit each scheduler status yields, its **landed-but-not-credited** report, and why a
+content proof cannot discharge the veto from 2v, and the `git cherry main task/<TASK_ID>` content
+proof itself from 2b, not from here. **rc=1 is NOT not-landed on the `coalesce-*` arm.**
 
 Only outside that arm — no train absorption anywhere in this task's history — is rc=1 a genuine
 not-landed outcome. What to do with it there is the call site's own disposition (`unblock` and
@@ -429,11 +429,11 @@ to prevent, and the one call sites act on hardest, since a not-landed reading he
 On that arm, follow [`merge-queue/SKILL.md`](../merge-queue/SKILL.md)'s "Follow the superseded
 successor" **rule 2a**, which governs precisely rc=128-with-empty-marker: check the **TIP's**
 merge marker on main and this task's own scheduler status, and on either landing signal the
-verdict is **landed** rather than not-landed. **Rule 2a licenses no write on this arm** — there
-is no self-stamp — exactly as rule 2b licenses none on the rc=1 arm; the two arms agree. Rule 2a
-is the authority for the whole disposition — read which exit each scheduler status yields, its
-**landed-but-not-credited** report, and why the `git cherry` content proof is unavailable on
-this arm from there, not from here.
+verdict is **landed** rather than not-landed. **Rule 2v (the veto, both arms) licenses no write on this arm** —
+there is no self-stamp — exactly as it licenses none on the rc=1 arm; the two arms agree. Rules 2v
+and 2a are the authority for the whole disposition — read which exit each scheduler status yields,
+its **landed-but-not-credited** report from 2v, and why the `git cherry` content proof is
+unavailable on this arm from 2a, not from here.
 [`unblock/SKILL.md`](../unblock/SKILL.md) states the same for its own resumed loop: *"Neither an
 empty rc=128 marker search nor rc=1 means 'not landed' here."* **rc=128-with-empty-marker is NOT
 not-landed on the `coalesce-*` arm.**

@@ -440,7 +440,7 @@ eyeballed listing.
   outcome** — a train merges only the tip branch, so an absorbed non-tip member has neither a
   marker of its own nor an ancestor relationship to prove. Follow the ladder's pointer into
   `merge-queue/SKILL.md`: rules 2–3 govern rc=1, rule 2a governs rc=128-with-empty-marker, and
-  **neither arm licenses a write** — never self-stamp on either. Read rule 2 there for the
+  **neither arm licenses a write** — never self-stamp on either. Read rules 2 and 2v there for the
   argument rather than restating it; the disposition here is the **same on both arms**, and it
   turns on re-reading this task's scheduler status **fresh**:
   - **`done`** — `mark_member_done`'s automatic flip already happened, so the work is landed
