@@ -10,9 +10,8 @@ WriteJournal and reads the rows back through that reader.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
@@ -356,11 +355,13 @@ class TestReadRunCreationOutcomesUnavailable:
 # Section 2: TaskInterceptor writes the journal on every creation path
 # ═══════════════════════════════════════════════════════════════════════════
 #
-# Fixtures replicated minimally from tests/test_ticket_worker.py (module-private
-# fixtures are not cross-imported in this repo).
+# Driven through the public seams only: the curator is injected through the
+# constructor, tickets go in through submit_task and come out through
+# resolve_ticket, and rows are read back through read_run_creation_outcomes.
 
 _CREATION_OPERATIONS = {TASK_CREATED_OPERATION, TASK_COMBINED_OPERATION}
 _RUN_METADATA = {'_causation_id': RUN, 'source': 'stage2'}
+_PROJECT_ROOT = '/project'
 
 
 @pytest.fixture
@@ -390,31 +391,6 @@ async def ticket_store(tmp_path):
     await store.close()
 
 
-async def _cancel_workers(interceptor: TaskInterceptor) -> None:
-    workers = list(getattr(interceptor, '_worker_tasks', {}).values())
-    for worker in workers:
-        if not worker.done():
-            worker.cancel()
-    for worker in workers:
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await worker
-
-
-@pytest_asyncio.fixture
-async def journaled_interceptor(taskmaster, event_buffer, ticket_store, write_journal):
-    interceptor = TaskInterceptor(taskmaster, None, event_buffer, ticket_store=ticket_store)
-    interceptor.set_write_journal(write_journal)
-    yield interceptor
-    await _cancel_workers(interceptor)
-
-
-@pytest_asyncio.fixture
-async def unjournaled_interceptor(taskmaster, event_buffer, ticket_store):
-    interceptor = TaskInterceptor(taskmaster, None, event_buffer, ticket_store=ticket_store)
-    yield interceptor
-    await _cancel_workers(interceptor)
-
-
 def _curator_returning(*decisions: CuratorDecision) -> MagicMock:
     """A curator whose single-item ``curate`` returns *decisions* in order."""
     curator = MagicMock()
@@ -423,15 +399,27 @@ def _curator_returning(*decisions: CuratorDecision) -> MagicMock:
     curator.note_created = MagicMock()
     curator.record_task = AsyncMock()
     curator.reembed_task = AsyncMock(return_value=None)
+    curator.close = AsyncMock()
     return curator
 
 
-async def _poll_ticket_resolved(ticket_store, ticket_id: str) -> dict:
-    async def _resolved():
-        row = await ticket_store.get(ticket_id)
-        return row if row is not None and row['status'] != 'pending' else None
+@pytest_asyncio.fixture
+async def build_interceptor(taskmaster, event_buffer, ticket_store, write_journal):
+    """Build TaskInterceptors around an injected curator; each is closed at teardown."""
+    built: list[TaskInterceptor] = []
 
-    return await poll_until(_resolved, message=f'worker did not resolve {ticket_id}')
+    def _build(curator: MagicMock | None = None, *, journaled: bool = True) -> TaskInterceptor:
+        interceptor = TaskInterceptor(
+            taskmaster, None, event_buffer, ticket_store=ticket_store, curator=curator,
+        )
+        if journaled:
+            interceptor.set_write_journal(write_journal)
+        built.append(interceptor)
+        return interceptor
+
+    yield _build
+    for interceptor in built:
+        await interceptor.close()
 
 
 async def _poll_outcomes(journal, run_id: str, predicate) -> CreationOutcomes:
@@ -447,13 +435,9 @@ async def _creation_rows(journal) -> list[dict]:
     return [row for row in rows if row['operation'] in _CREATION_OPERATIONS]
 
 
-def _curated_by(interceptor, curator):
-    """Install *curator* for the whole test: the worker drains after submit returns."""
-    return patch.object(type(interceptor), '_get_curator', new=AsyncMock(return_value=curator))
-
-
-async def _submit(interceptor, *, project_root='/project', metadata=None, **kwargs):
-    return await interceptor.submit_task(
+async def _submit(interceptor, *, project_root=_PROJECT_ROOT, metadata=None, **kwargs) -> str:
+    """Submit a task as Stage 2 does and return its ticket id."""
+    result = await interceptor.submit_task(
         project_root=project_root,
         agent_id=STAGE2_AGENT,
         title=kwargs.pop('title', 'Journal Task'),
@@ -461,15 +445,20 @@ async def _submit(interceptor, *, project_root='/project', metadata=None, **kwar
         metadata=_RUN_METADATA if metadata is None else metadata,
         **kwargs,
     )
+    return result['ticket']
+
+
+async def _resolve(interceptor, ticket: str, project_root: str = _PROJECT_ROOT) -> dict:
+    return await interceptor.resolve_ticket(ticket, project_root, timeout_seconds=10)
 
 
 class TestPlanningModeJournal:
     @pytest.mark.asyncio
     async def test_planning_mode_create_writes_one_task_created_row(
-        self, journaled_interceptor, write_journal,
+        self, build_interceptor, write_journal,
     ):
-        result = await journaled_interceptor.submit_task(
-            project_root='/project', agent_id=STAGE2_AGENT, planning_mode=True,
+        result = await build_interceptor().submit_task(
+            project_root=_PROJECT_ROOT, agent_id=STAGE2_AGENT, planning_mode=True,
             title='Planned', description='d', metadata=_RUN_METADATA,
         )
 
@@ -484,12 +473,12 @@ class TestPlanningModeJournal:
 
     @pytest.mark.asyncio
     async def test_planning_mode_candidate_key_collision_writes_task_combined(
-        self, journaled_interceptor, write_journal, taskmaster,
+        self, build_interceptor, write_journal, taskmaster,
     ):
         taskmaster.add_task = AsyncMock(side_effect=DuplicateCandidateKeyError(existing_id=7))
 
-        result = await journaled_interceptor.submit_task(
-            project_root='/project', agent_id=STAGE2_AGENT, planning_mode=True,
+        result = await build_interceptor().submit_task(
+            project_root=_PROJECT_ROOT, agent_id=STAGE2_AGENT, planning_mode=True,
             title='Planned', description='d', metadata=_RUN_METADATA,
         )
 
@@ -502,14 +491,14 @@ class TestPlanningModeJournal:
 class TestCuratorWorkerJournal:
     @pytest.mark.asyncio
     async def test_create_row_carries_the_submitters_attribution(
-        self, journaled_interceptor, write_journal, ticket_store,
+        self, build_interceptor, write_journal,
     ):
-        curator = _curator_returning(CuratorDecision(action='create'))
-        with _curated_by(journaled_interceptor, curator):
-            result = await _submit(journaled_interceptor)
-            await _poll_ticket_resolved(ticket_store, result['ticket'])
-            outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.created)
+        interceptor = build_interceptor(_curator_returning(CuratorDecision(action='create')))
 
+        resolved = await _resolve(interceptor, await _submit(interceptor))
+        outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.created)
+
+        assert (resolved['status'], resolved['task_id']) == ('created', '42')
         assert outcomes == CreationOutcomes(
             created=frozenset({('project', '42')}), combined=frozenset(),
         )
@@ -518,15 +507,16 @@ class TestCuratorWorkerJournal:
 
     @pytest.mark.asyncio
     async def test_drop_writes_task_combined_for_the_target(
-        self, journaled_interceptor, write_journal, taskmaster,
+        self, build_interceptor, write_journal, taskmaster,
     ):
-        curator = _curator_returning(
+        interceptor = build_interceptor(_curator_returning(
             CuratorDecision(action='drop', target_id='5', justification='dup'),
-        )
-        with _curated_by(journaled_interceptor, curator):
-            await _submit(journaled_interceptor)
-            outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.combined)
+        ))
 
+        resolved = await _resolve(interceptor, await _submit(interceptor))
+        outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.combined)
+
+        assert resolved['status'] == 'combined'
         assert outcomes == CreationOutcomes(
             created=frozenset(), combined=frozenset({('project', '5')}),
         )
@@ -534,36 +524,35 @@ class TestCuratorWorkerJournal:
 
     @pytest.mark.asyncio
     async def test_combine_writes_task_combined_for_the_target(
-        self, journaled_interceptor, write_journal,
+        self, build_interceptor, write_journal, taskmaster, monkeypatch, tmp_path,
     ):
-        curator = _curator_returning(CuratorDecision(
+        monkeypatch.setenv('DARK_FACTORY_DATA_DIR', str(tmp_path / 'data'))
+        taskmaster.get_task = AsyncMock(return_value={
+            'id': '42', 'title': 'Existing Task', 'status': 'pending', 'metadata': {},
+        })
+        interceptor = build_interceptor(_curator_returning(CuratorDecision(
             action='combine',
             target_id='42',
+            target_fingerprint='Existing Task',
             rewritten_task=RewrittenTask(
                 title='Combined', description='d', details='', files_to_modify=[],
                 priority='medium',
             ),
             justification='similar scope',
-        ))
+        )))
 
-        async def fake_execute_combine(project_root, decision, **_kwargs):
-            return {'updated': True, 'target_id': decision.target_id}
+        resolved = await _resolve(interceptor, await _submit(interceptor))
+        outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.combined)
 
-        with (
-            _curated_by(journaled_interceptor, curator),
-            patch.object(
-                journaled_interceptor, '_execute_combine', side_effect=fake_execute_combine,
-            ),
-        ):
-            await _submit(journaled_interceptor)
-            outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.combined)
-
-        assert outcomes.combined == {('project', '42')}
-        assert outcomes.created == frozenset()
+        assert (resolved['status'], resolved['task_id']) == ('combined', '42')
+        assert outcomes == CreationOutcomes(
+            created=frozenset(), combined=frozenset({('project', '42')}),
+        )
+        taskmaster.add_task.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_refused_and_failed_outcomes_write_no_creation_row(
-        self, journaled_interceptor, write_journal, taskmaster, ticket_store,
+        self, build_interceptor, write_journal, taskmaster,
     ):
         """Refuse, then a create whose add_task raises, then a sentinel create:
         tickets drain in order, so once the sentinel's row lands the first two
@@ -572,19 +561,19 @@ class TestCuratorWorkerJournal:
             RuntimeError('backend down'),
             {'id': '43', 'title': 'Sentinel'},
         ])
-        curator = _curator_returning(
+        interceptor = build_interceptor(_curator_returning(
             CuratorDecision(action='refuse', justification='blocked premise'),
             CuratorDecision(action='create'),
             CuratorDecision(action='create'),
-        )
-        with _curated_by(journaled_interceptor, curator):
-            refused = await _submit(journaled_interceptor, title='Refused')
-            failed = await _submit(journaled_interceptor, title='Failed')
-            await _submit(journaled_interceptor, title='Sentinel')
-            outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.created)
+        ))
 
-        assert (await ticket_store.get(refused['ticket']))['status'] == 'refused'
-        assert (await ticket_store.get(failed['ticket']))['status'] == 'failed'
+        refused = await _submit(interceptor, title='Refused')
+        failed = await _submit(interceptor, title='Failed')
+        await _submit(interceptor, title='Sentinel')
+        outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.created)
+
+        assert (await _resolve(interceptor, refused))['status'] == 'refused'
+        assert (await _resolve(interceptor, failed))['status'] == 'failed'
         assert outcomes == CreationOutcomes(
             created=frozenset({('project', '43')}), combined=frozenset(),
         )
@@ -592,24 +581,23 @@ class TestCuratorWorkerJournal:
 
     @pytest.mark.asyncio
     async def test_cross_project_row_names_the_target_project(
-        self, journaled_interceptor, write_journal,
+        self, build_interceptor, write_journal,
     ):
         """The f9e49aef / task 105 shape: Stage 2 of one project files into another."""
-        curator = _curator_returning(CuratorDecision(action='create'))
-        with _curated_by(journaled_interceptor, curator):
-            await _submit(journaled_interceptor, project_root='/home/leo/src/solar_challenge')
-            outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.created)
+        interceptor = build_interceptor(_curator_returning(CuratorDecision(action='create')))
+
+        await _submit(interceptor, project_root='/home/leo/src/solar_challenge')
+        outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.created)
 
         assert outcomes.created == {('solar_challenge', '42')}
 
     @pytest.mark.asyncio
     async def test_add_task_never_sees_attribution_kwargs(
-        self, journaled_interceptor, write_journal, taskmaster,
+        self, build_interceptor, write_journal, taskmaster,
     ):
-        curator = _curator_returning(CuratorDecision(action='create'))
-        with _curated_by(journaled_interceptor, curator):
-            await _submit(journaled_interceptor)
-            await _poll_outcomes(write_journal, RUN, lambda o: o.created)
+        interceptor = build_interceptor(_curator_returning(CuratorDecision(action='create')))
+
+        await _resolve(interceptor, await _submit(interceptor))
 
         forwarded = taskmaster.add_task.call_args.kwargs
         assert 'agent_id' not in forwarded
@@ -617,22 +605,73 @@ class TestCuratorWorkerJournal:
 
     @pytest.mark.asyncio
     async def test_submission_without_causation_still_writes_an_unattributed_row(
-        self, journaled_interceptor, write_journal,
+        self, build_interceptor, write_journal,
     ):
         async def _row():
             rows = await _creation_rows(write_journal)
             return rows or None
 
-        curator = _curator_returning(CuratorDecision(action='create'))
-        with _curated_by(journaled_interceptor, curator):
-            await _submit(journaled_interceptor, metadata={'source': 'no-causation'})
-            [row] = await poll_until(_row, message='no unattributed creation row')
+        interceptor = build_interceptor(_curator_returning(CuratorDecision(action='create')))
+
+        await _submit(interceptor, metadata={'source': 'no-causation'})
+        [row] = await poll_until(_row, message='no unattributed creation row')
 
         assert row['causation_id'] is None
         assert row['agent_id'] == STAGE2_AGENT
         assert await _read(write_journal) == CreationOutcomes(
             created=frozenset(), combined=frozenset(),
         )
+
+
+class TestOrphanRaceJournal:
+    """``cancel_ticket`` wins the ticket row while the worker is mid-decision.
+
+    The worker's own terminal write then finds the row no longer pending, but
+    the backend write still happened, so the outcome's creation row must land
+    with the submitter's attribution regardless.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'decision, expected',
+        [
+            (
+                CuratorDecision(action='create'),
+                CreationOutcomes(created=frozenset({('project', '42')}), combined=frozenset()),
+            ),
+            (
+                CuratorDecision(action='drop', target_id='5', justification='dup'),
+                CreationOutcomes(created=frozenset(), combined=frozenset({('project', '5')})),
+            ),
+        ],
+        ids=['created', 'combined'],
+    )
+    async def test_cancel_winning_the_ticket_row_still_journals_the_outcome(
+        self, build_interceptor, write_journal, decision, expected,
+    ):
+        curating = asyncio.Event()
+        release = asyncio.Event()
+
+        async def gated_curate(*_args, **_kwargs):
+            curating.set()
+            await release.wait()
+            return decision
+
+        curator = _curator_returning()
+        curator.curate = AsyncMock(side_effect=gated_curate)
+        interceptor = build_interceptor(curator)
+
+        ticket = await _submit(interceptor)
+        await asyncio.wait_for(curating.wait(), timeout=10)
+        cancelled = await interceptor.cancel_ticket(ticket)
+        release.set()
+        outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.created or o.combined)
+
+        assert cancelled == {'status': 'cancelled', 'ticket_id': ticket}
+        assert (await _resolve(interceptor, ticket))['status'] == 'cancelled'
+        assert outcomes == expected
+        [row] = await _creation_rows(write_journal)
+        assert (row['agent_id'], row['causation_id']) == (STAGE2_AGENT, RUN)
 
 
 class TestIdempotencyHitJournal:
@@ -645,36 +684,16 @@ class TestIdempotencyHitJournal:
     _METADATA = {**_RUN_METADATA, 'escalation_id': 'e1', 'suggestion_hash': 'h1'}
 
     @pytest.mark.asyncio
-    async def test_single_ticket_path_writes_task_combined(
-        self, journaled_interceptor, write_journal, taskmaster, ticket_store,
+    async def test_idempotency_hit_writes_task_combined(
+        self, build_interceptor, write_journal, taskmaster,
     ):
         taskmaster.get_tasks = AsyncMock(return_value={'tasks': [self._EXISTING]})
-        ticket_id = await ticket_store.submit('project', json.dumps({
-            'project_root': '/project',
-            'kwargs': {'title': 'Escalation Task', 'description': 'd'},
-            'metadata': self._METADATA,
-            'creation_attribution': CreationAttribution(STAGE2_AGENT, RUN).to_blob_value(),
-        }))
+        interceptor = build_interceptor(_curator_returning())
 
-        with _curated_by(journaled_interceptor, _curator_returning()):
-            await journaled_interceptor._process_add_ticket(ticket_id)
+        resolved = await _resolve(interceptor, await _submit(interceptor, metadata=self._METADATA))
+        outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.combined)
 
-        assert (await ticket_store.get(ticket_id))['reason'] == 'idempotency_hit'
-        assert await _read(write_journal) == CreationOutcomes(
-            created=frozenset(), combined=frozenset({('project', '99')}),
-        )
-
-    @pytest.mark.asyncio
-    async def test_batch_path_writes_task_combined(
-        self, journaled_interceptor, write_journal, taskmaster, ticket_store,
-    ):
-        taskmaster.get_tasks = AsyncMock(return_value={'tasks': [self._EXISTING]})
-
-        with _curated_by(journaled_interceptor, _curator_returning()):
-            result = await _submit(journaled_interceptor, metadata=self._METADATA)
-            outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.combined)
-
-        assert (await ticket_store.get(result['ticket']))['reason'] == 'idempotency_hit'
+        assert (resolved['status'], resolved['reason']) == ('combined', 'idempotency_hit')
         assert outcomes == CreationOutcomes(
             created=frozenset(), combined=frozenset({('project', '99')}),
         )
@@ -683,20 +702,19 @@ class TestIdempotencyHitJournal:
 
 class TestNoJournalWired:
     @pytest.mark.asyncio
-    async def test_submit_and_resolve_behave_as_before(
-        self, unjournaled_interceptor, ticket_store,
-    ):
-        curator = _curator_returning(CuratorDecision(action='create'))
-        with _curated_by(unjournaled_interceptor, curator):
-            result = await _submit(unjournaled_interceptor)
-            row = await _poll_ticket_resolved(ticket_store, result['ticket'])
+    async def test_submit_and_resolve_behave_as_before(self, build_interceptor):
+        interceptor = build_interceptor(
+            _curator_returning(CuratorDecision(action='create')), journaled=False,
+        )
 
-        assert (row['status'], row['task_id']) == ('created', '42')
+        resolved = await _resolve(interceptor, await _submit(interceptor))
+
+        assert (resolved['status'], resolved['task_id']) == ('created', '42')
 
     @pytest.mark.asyncio
-    async def test_planning_mode_behaves_as_before(self, unjournaled_interceptor):
-        result = await unjournaled_interceptor.submit_task(
-            project_root='/project', agent_id=STAGE2_AGENT, planning_mode=True,
+    async def test_planning_mode_behaves_as_before(self, build_interceptor):
+        result = await build_interceptor(journaled=False).submit_task(
+            project_root=_PROJECT_ROOT, agent_id=STAGE2_AGENT, planning_mode=True,
             title='Planned', description='d', metadata=_RUN_METADATA,
         )
 

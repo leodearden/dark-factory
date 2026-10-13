@@ -505,6 +505,7 @@ class TaskInterceptor:
         prefix_registry: ProjectPrefixRegistry | None = None,
         scope_violation_escalator: ScopeViolationEscalator | None = None,
         path_scope_adjudicator: 'PathScopeAdjudicator | None' = None,
+        curator: TaskCurator | None = None,
     ):
         self.taskmaster = taskmaster
         self.reconciler = targeted_reconciler
@@ -528,9 +529,10 @@ class TaskInterceptor:
         self._background_tasks: set[asyncio.Task] = set()
 
         # Task curator: LLM-judged drop/combine/create gate. Lazy-initialized in
-        # _get_curator() because it pulls in a Qdrant client + embedder.
+        # _get_curator() because it pulls in a Qdrant client + embedder, unless
+        # *curator* injects a pre-built one. Either way close() closes it.
         self._config = config
-        self._curator: TaskCurator | None = None
+        self._curator: TaskCurator | None = curator
         # exception_summary() of the last failed TaskCurator construction.
         self._curator_construction_error: str | None = None
         self._escalator = escalator
