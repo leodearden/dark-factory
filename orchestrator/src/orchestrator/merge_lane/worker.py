@@ -5496,7 +5496,7 @@ _PRE_STACK_RESTORABLE_STATUSES: frozenset[str] = frozenset({'merge-deferred', 'p
 
 # Restore refusals that leave a member stacked and need a human's hand.
 _TIP_RESTORE_REFUSALS: frozenset[TipRestoreOutcome] = frozenset({
-    TipRestoreOutcome.DIRTY, TipRestoreOutcome.MOVED,
+    TipRestoreOutcome.DIRTY, TipRestoreOutcome.MOVED, TipRestoreOutcome.RESET_FAILED,
 })
 
 

@@ -275,10 +275,13 @@ class UnstackResult:
 
 @dataclass(frozen=True)
 class PreStackTip:
-    """The tip a train member had immediately before a train stacked it."""
+    """A train member's restore point: the tip it had immediately before a
+    train stacked it (``sha``) and the tip stacking gave it (``stacked_sha``),
+    which tells the train's own commits from any added since."""
 
     member_id: str
     sha: str
+    stacked_sha: str
 
 
 class TipRestoreOutcome(StrEnum):
@@ -288,6 +291,7 @@ class TipRestoreOutcome(StrEnum):
     LANDED = 'landed'
     DIRTY = 'dirty'
     MOVED = 'moved'
+    RESET_FAILED = 'reset_failed'
 
 
 @dataclass(frozen=True)
@@ -295,7 +299,8 @@ class TipRestore:
     """Verdict of putting *branch* back on its pre-stack tip.
 
     ``found_sha`` is the tip the branch had when the restore looked (None
-    when the branch is gone); ``worktree`` is the checkout holding it, if any.
+    when the branch is gone); ``worktree`` is the checkout holding it, if any;
+    ``detail`` says why a refused restore moved nothing.
     """
 
     outcome: TipRestoreOutcome

@@ -19,6 +19,9 @@ Base fixture (``repo`` fixture):
 
 from __future__ import annotations
 
+import os
+import shlex
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -106,6 +109,31 @@ async def _git_path(wt: Path, name: str) -> Path:
 async def _assert_clean_and_not_rebasing(wt: Path) -> None:
     assert (await _git(wt, 'status', '--porcelain')).strip() == ''
     assert not (await _git_path(wt, 'rebase-merge')).exists()
+
+
+def _fail_git(
+    monkeypatch: pytest.MonkeyPatch, where: Path, prefix: str, *, after: int = 0,
+) -> None:
+    """Put a ``git`` first on PATH that exits 128 for each call whose arguments
+    start with *prefix*, once *after* such calls have run; every other call
+    reaches the real git.  ``run_git`` copies ``os.environ`` at each spawn, so
+    GitOps sees it (precedent: test_git_fixtures.py::_install_git_spawn_counter)."""
+    real_git = shutil.which('git')
+    assert real_git is not None
+    bin_dir = where / 'bin'
+    bin_dir.mkdir(parents=True)
+    seen = shlex.quote(str(where / 'matched'))
+    shim = bin_dir / 'git'
+    shim.write_text(
+        '#!/bin/sh\n'
+        f'case "$*" in {shlex.quote(prefix)}*)\n'
+        f'  printf x >> {seen}\n'
+        f'  [ $(wc -c < {seen}) -gt {after} ] && exit 128 ;;\n'
+        'esac\n'
+        f'exec {shlex.quote(real_git)} "$@"\n'
+    )
+    shim.chmod(0o755)
+    monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
 
 
 @dataclass(frozen=True)
@@ -350,7 +378,34 @@ class TestStackReportsPreStackTips:
         result = await repo.git_ops.stack_train_branches(['P', 'M'])
 
         assert result.survivors == ['P', 'M']
-        assert result.pre_stack_tips == (PreStackTip(member_id='M', sha=m_before),)
+        assert result.pre_stack_tips == (
+            PreStackTip(member_id='M', sha=m_before, stacked_sha=await repo.sha('task/M')),
+        )
+
+    async def test_member_whose_tip_does_not_resolve_is_ejected_unmoved(
+        self, repo: Repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await _add_p_and_m(repo)
+        m_before = await repo.sha('task/M')
+        _fail_git(monkeypatch, tmp_path / 'shim', 'rev-parse --verify refs/heads/task/M')
+
+        result = await repo.git_ops.stack_train_branches(['P', 'M'])
+
+        assert (result.survivors, result.ejected, result.pre_stack_tips) == (['P'], ['M'], ())
+        assert await repo.sha('task/M') == m_before
+
+    async def test_member_whose_stacked_tip_does_not_resolve_is_ejected_with_its_base(
+        self, repo: Repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await _add_p_and_m(repo)
+        _fail_git(
+            monkeypatch, tmp_path / 'shim', 'rev-parse --verify refs/heads/task/M', after=1,
+        )
+
+        result = await repo.git_ops.stack_train_branches(['P', 'M'])
+
+        assert (result.survivors, result.ejected, result.pre_stack_tips) == (['P'], ['M'], ())
+        assert await repo.ledger.base_of('task/M') == await repo.sha('task/P')
 
     async def test_member_ejected_for_conflict_reports_no_tip(self, repo: Repo) -> None:
         await _add_member(repo.git_ops, 'A', 'main', {'foo.txt': 'alpha\n'})
@@ -401,7 +456,8 @@ class TestRestorePreStackTip:
         self, repo: Repo,
     ) -> None:
         await _add_p_and_m(repo)
-        tip = PreStackTip(member_id='M', sha=await repo.sha('task/M'))
+        m_tip = await repo.sha('task/M')
+        tip = PreStackTip(member_id='M', sha=m_tip, stacked_sha=m_tip)
 
         restore = await repo.git_ops.restore_pre_stack_tip(tip)
 
@@ -450,6 +506,75 @@ class TestRestorePreStackTip:
         assert restore.outcome is TipRestoreOutcome.RESTORED
         assert restore.worktree is None
         assert await repo.sha('task/M') == tip.sha
+
+    async def test_a_stacked_tip_the_lane_rebased_onto_main_is_restored(
+        self, repo: Repo,
+    ) -> None:
+        tip = await _stacked_m(repo)
+        await repo.advance_main({'other.txt': 'main moved\n'})
+        await _git(repo.wt('M'), 'rebase', 'main')
+
+        restore = await repo.git_ops.restore_pre_stack_tip(tip)
+
+        assert restore.outcome is TipRestoreOutcome.RESTORED
+        assert await repo.sha('task/M') == tip.sha
+
+    async def test_a_commit_its_train_did_not_stack_is_never_discarded(
+        self, repo: Repo,
+    ) -> None:
+        tip = await _stacked_m(repo)
+        await repo.advance_main({'other.txt': 'main moved\n'})
+        await _git(repo.wt('M'), 'rebase', 'main')
+        agent_commit = await _commit_files(repo.wt('M'), {'agent.txt': 'agent\n'}, 'agent')
+
+        restore = await repo.git_ops.restore_pre_stack_tip(tip)
+
+        assert restore.outcome is TipRestoreOutcome.MOVED
+        assert agent_commit in restore.detail
+        assert await repo.sha('task/M') == agent_commit
+        assert await repo.ledger.base_of('task/M') == await repo.sha('task/P')
+
+    async def test_a_branch_moved_while_restoring_is_left_where_it_is(
+        self, repo: Repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        tip = await _stacked_m(repo)
+        stacked = await repo.sha('task/M')
+        _fail_git(monkeypatch, tmp_path / 'shim', 'update-ref refs/heads/task/M ')
+
+        restore = await repo.git_ops.restore_pre_stack_tip(tip)
+
+        assert restore.outcome is TipRestoreOutcome.MOVED
+        assert await repo.sha('task/M') == stacked
+        assert await _rev_parse(repo.wt('M'), 'HEAD') == stacked
+        assert await repo.ledger.base_of('task/M') == await repo.sha('task/P')
+
+    async def test_a_worktree_deleted_under_the_restore_leaves_the_branch(
+        self, repo: Repo,
+    ) -> None:
+        tip = await _stacked_m(repo)
+        stacked = await repo.sha('task/M')
+        shutil.rmtree(repo.wt('M'))
+
+        restore = await repo.git_ops.restore_pre_stack_tip(tip)
+
+        assert restore.outcome is TipRestoreOutcome.MOVED
+        assert await repo.sha('task/M') == stacked
+
+    async def test_a_failed_worktree_reset_puts_the_branch_back_on_its_stacked_tip(
+        self, repo: Repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        tip = await _stacked_m(repo)
+        stacked = await repo.sha('task/M')
+        _fail_git(monkeypatch, tmp_path / 'shim', 'reset --hard')
+
+        restore = await repo.git_ops.restore_pre_stack_tip(tip)
+
+        assert restore.outcome is TipRestoreOutcome.RESET_FAILED
+        assert restore.worktree == repo.wt('M')
+        assert await repo.sha('task/M') == stacked
+        assert await _rev_parse(repo.wt('M'), 'HEAD') == stacked
+        assert (await _git(repo.wt('M'), 'status', '--porcelain')).strip() == ''
+        assert await repo.ledger.base_of('task/M') == await repo.sha('task/P')
 
 
 class TestUnstackResultInvariant:
