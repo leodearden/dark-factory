@@ -4,6 +4,7 @@ Tests cover compute_flag_signature, dedup_flags, and error-handling behavior.
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import logging
@@ -2825,6 +2826,298 @@ class TestSafeGetTask:
         assert result == {'error': 'backend down', 'error_type': 'RuntimeError'}
         assert flag_dedup.confirm_task_present(result) is False
         assert flag_dedup.confirm_task_absent(result) is False
+
+
+# ---------------------------------------------------------------------------
+# corroborate_task_lookups — the single corroboration loop (task 4873)
+# ---------------------------------------------------------------------------
+
+
+def _present_task(task_id: object, title: str = 'A real task') -> dict:
+    return {'id': str(task_id), 'title': title, 'status': 'pending'}
+
+
+def _not_found_task(task_id: object = '0') -> dict:
+    return {
+        'error': f'No tasks found for ID(s): {task_id}',
+        'error_type': 'TaskmasterError',
+    }
+
+
+class _PerRootTaskmaster:
+    """Taskmaster double whose ``get_task`` answers per ``(str(task_id), root)``.
+
+    Replicated from ``tests/test_stage2_stats_audit.py::_StubTaskmaster``
+    rather than cross-imported (module-private fixtures are not a shared
+    contract). Unmapped pairs answer not-found; a mapped ``Exception`` is
+    RAISED. ``max_concurrent`` is the peak in-flight lookup count, so one
+    gathered batch (== N) is distinguishable from a sequential loop (== 1).
+    """
+
+    def __init__(self, results: dict[tuple[str, str], Any] | None = None) -> None:
+        self.results: dict[tuple[str, str], Any] = dict(results or {})
+        self.calls: list[tuple[Any, str]] = []
+        self.max_concurrent = 0
+        self._in_flight = 0
+
+    async def get_task(self, task_id: Any, project_root: str) -> Any:
+        self.calls.append((task_id, project_root))
+        self._in_flight += 1
+        self.max_concurrent = max(self.max_concurrent, self._in_flight)
+        try:
+            await asyncio.sleep(0)
+            result = self.results.get((str(task_id), project_root), _not_found_task(task_id))
+            if isinstance(result, Exception):
+                raise result
+            return result
+        finally:
+            self._in_flight -= 1
+
+
+class _ExplodingKnownProjects(dict):
+    """A known_projects mapping that raises while being resolved."""
+
+    def get(self, key, default=None):  # type: ignore[override]
+        raise ValueError(f'project resolution exploded on {key!r}')
+
+
+class TestCorroborateTaskLookups:
+    """``corroborate_task_lookups(taskmaster, known_projects, lookups)``.
+
+    The ONE resolve-root -> single flat gather of ``safe_get_task`` -> classify
+    loop that every cross-project corroboration in reconciliation shares. Each
+    lookup carries its own ``accept`` predicate, so "the task exists",
+    "the task exists with this title" and "the task's hints contain these
+    entries" are call sites rather than copies of the loop.
+
+    One verdict per lookup, in input order. Fail-CLOSED on confirmation (an
+    uncertain answer is never CONFIRMED) and fail-SAFE for the caller (it never
+    raises). UNCONFIRMED means "we asked and it did not confirm"; UNRESOLVABLE
+    means "we could not ask".
+    """
+
+    _KNOWN = {'dark_factory': '/repo/df', 'reify': '/repo/reify'}
+
+    @staticmethod
+    def _lookup(project_id, task_id, accept=None):
+        return flag_dedup.TaskLookup(
+            project_id=project_id,
+            task_id=task_id,
+            accept=accept if accept is not None else flag_dedup.confirm_task_present,
+        )
+
+    @pytest.mark.asyncio
+    async def test_present_task_with_confirm_task_present_is_confirmed(self):
+        stub = _PerRootTaskmaster({('3045', '/repo/df'): _present_task('3045')})
+
+        verdicts = await flag_dedup.corroborate_task_lookups(
+            stub, self._KNOWN, [self._lookup('dark_factory', '3045')],
+        )
+
+        assert verdicts == (flag_dedup.LookupVerdict.CONFIRMED,)
+        assert stub.calls == [('3045', '/repo/df')]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'get_task_result',
+        [
+            _not_found_task('3045'),
+            {'error': 'Connection timeout', 'error_type': 'TimeoutError'},
+            RuntimeError('backend down'),
+            None,
+            {},
+            'a task exists',
+        ],
+        ids=['not-found', 'inconclusive-error', 'raised', 'none', 'empty-dict', 'str'],
+    )
+    async def test_non_present_results_are_unconfirmed_never_raised(self, get_task_result):
+        stub = _PerRootTaskmaster({('3045', '/repo/df'): get_task_result})
+
+        verdicts = await flag_dedup.corroborate_task_lookups(
+            stub, self._KNOWN, [self._lookup('dark_factory', '3045')],
+        )
+
+        assert verdicts == (flag_dedup.LookupVerdict.UNCONFIRMED,)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('project_id', [None, '', '   ', 'unknown_project'])
+    async def test_unresolvable_project_issues_no_lookup(self, project_id):
+        stub = _PerRootTaskmaster()
+
+        verdicts = await flag_dedup.corroborate_task_lookups(
+            stub,
+            self._KNOWN,
+            [self._lookup(project_id, '3045'), self._lookup('dark_factory', '1')],
+        )
+
+        assert verdicts[0] is flag_dedup.LookupVerdict.UNRESOLVABLE
+        assert verdicts[1] is flag_dedup.LookupVerdict.UNCONFIRMED
+        assert stub.calls == [('1', '/repo/df')]
+
+    @pytest.mark.asyncio
+    async def test_each_lookup_goes_to_its_own_project_root(self):
+        """Same id under two projects is two lookups against two roots —
+        Taskmaster ids are per-project."""
+        stub = _PerRootTaskmaster({
+            ('3045', '/repo/df'): _present_task('3045'),
+            ('3045', '/repo/reify'): _not_found_task('3045'),
+        })
+
+        verdicts = await flag_dedup.corroborate_task_lookups(
+            stub,
+            self._KNOWN,
+            [self._lookup('dark_factory', '3045'), self._lookup('reify', '3045')],
+        )
+
+        assert verdicts == (
+            flag_dedup.LookupVerdict.CONFIRMED,
+            flag_dedup.LookupVerdict.UNCONFIRMED,
+        )
+        assert sorted(stub.calls) == [('3045', '/repo/df'), ('3045', '/repo/reify')]
+
+    @pytest.mark.asyncio
+    async def test_resolvable_lookups_go_out_as_one_concurrent_batch(self):
+        stub = _PerRootTaskmaster()
+        lookups = [self._lookup('dark_factory', str(i)) for i in range(5)]
+        lookups.insert(2, self._lookup('nowhere', '99'))
+
+        verdicts = await flag_dedup.corroborate_task_lookups(stub, self._KNOWN, lookups)
+
+        assert len(stub.calls) == 5
+        assert stub.max_concurrent == 5
+        assert verdicts[2] is flag_dedup.LookupVerdict.UNRESOLVABLE
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'taskmaster_arg, known_projects_arg',
+        [
+            (None, {'dark_factory': '/repo/df'}),
+            (False, {'dark_factory': '/repo/df'}),
+            ('STUB', None),
+            ('STUB', {}),
+        ],
+        ids=['taskmaster-none', 'taskmaster-false', 'known-projects-none', 'known-projects-empty'],
+    )
+    async def test_falsy_taskmaster_or_known_projects_is_all_unresolvable(
+        self, taskmaster_arg, known_projects_arg,
+    ):
+        stub = _PerRootTaskmaster()
+        taskmaster = stub if taskmaster_arg == 'STUB' else taskmaster_arg
+
+        verdicts = await flag_dedup.corroborate_task_lookups(
+            taskmaster,
+            known_projects_arg,
+            [self._lookup('dark_factory', '3045'), self._lookup('reify', '9')],
+        )
+
+        assert verdicts == (flag_dedup.LookupVerdict.UNRESOLVABLE,) * 2
+        assert stub.calls == []
+
+    @pytest.mark.asyncio
+    async def test_raising_accept_predicate_is_unconfirmed_and_isolated(self):
+        def exploding_accept(result: object) -> bool:
+            raise ValueError('predicate exploded')
+
+        stub = _PerRootTaskmaster({
+            ('1', '/repo/df'): _present_task('1'),
+            ('2', '/repo/df'): _present_task('2'),
+        })
+
+        verdicts = await flag_dedup.corroborate_task_lookups(
+            stub,
+            self._KNOWN,
+            [
+                self._lookup('dark_factory', '1', accept=exploding_accept),
+                self._lookup('dark_factory', '2'),
+            ],
+        )
+
+        assert verdicts == (
+            flag_dedup.LookupVerdict.UNCONFIRMED,
+            flag_dedup.LookupVerdict.CONFIRMED,
+        )
+
+    @pytest.mark.asyncio
+    async def test_accept_predicate_receives_the_raw_get_task_result(self):
+        seen: list[object] = []
+        record = _present_task('7', title='Exact title')
+
+        def recording_accept(result: object) -> bool:
+            seen.append(result)
+            return False
+
+        stub = _PerRootTaskmaster({('7', '/repo/df'): record})
+
+        verdicts = await flag_dedup.corroborate_task_lookups(
+            stub, self._KNOWN, [self._lookup('dark_factory', '7', accept=recording_accept)],
+        )
+
+        assert seen == [record]
+        assert verdicts == (flag_dedup.LookupVerdict.UNCONFIRMED,)
+
+    @pytest.mark.asyncio
+    async def test_exploding_known_projects_degrades_to_all_unresolvable(self, caplog):
+        caplog.set_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup')
+
+        verdicts = await flag_dedup.corroborate_task_lookups(
+            _PerRootTaskmaster(),
+            _ExplodingKnownProjects(dark_factory='/repo/df'),
+            [self._lookup('dark_factory', '3045'), self._lookup('reify', '9')],
+        )
+
+        assert verdicts == (flag_dedup.LookupVerdict.UNRESOLVABLE,) * 2
+        assert any(
+            'reconciliation.corroborate_task_lookups' in r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_lookups_is_an_empty_tuple_with_no_io(self):
+        stub = _PerRootTaskmaster()
+
+        verdicts = await flag_dedup.corroborate_task_lookups(stub, self._KNOWN, [])
+
+        assert verdicts == ()
+        assert stub.calls == []
+
+    def test_task_lookup_is_frozen(self):
+        lookup = self._lookup('dark_factory', '1')
+
+        with pytest.raises(AttributeError):
+            lookup.task_id = '2'  # type: ignore[misc]
+
+    @pytest.mark.asyncio
+    async def test_phantom_filter_drops_when_any_cite_corroborates_and_keeps_otherwise(self):
+        """The phantom-flag filter rides this loop: one corroborated cite among
+        several drops the flag; a flag with none corroborated is kept."""
+        stub = _PerRootTaskmaster({
+            ('42', '/repo/reify'): _present_task('42', title='Foreign task'),
+        })
+
+        def phantom(*cited: dict) -> dict:
+            return {
+                'task_id': None,
+                'flag_type': 'phantom_tasks_created',
+                'description': 'Stage 2 reported tasks_created=1 with no task found',
+                'cited_tasks': list(cited),
+            }
+
+        corroborated = phantom(
+            {'project_id': 'dark_factory', 'task_id': '41', 'title': 'Ghost'},
+            {'project_id': 'reify', 'task_id': '42', 'title': 'Foreign task'},
+        )
+        uncorroborated = phantom(
+            {'project_id': 'dark_factory', 'task_id': '43', 'title': 'Ghost'},
+            {'project_id': 'reify', 'task_id': '42', 'title': 'Different title'},
+        )
+        benign = {'task_id': '5', 'flag_type': 'other', 'description': 'unrelated'}
+
+        kept = await flag_dedup.filter_false_phantom_task_creation_flags(
+            stub, self._KNOWN, [corroborated, benign, uncorroborated],
+        )
+
+        assert kept == [benign, uncorroborated]
 
 
 # ---------------------------------------------------------------------------
