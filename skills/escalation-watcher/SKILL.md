@@ -1667,7 +1667,8 @@ project root as `uv run --frozen --project shared python scripts/sitting/prepare
 #### When it runs
 
 - **Nightly at 05:30**, from `return-brief.timer`: headless on Fable, recommend-only and read-only.
-  This is the *nightly form*: investigate, then `record` preparations. The render that follows
+  This is the *nightly form*: investigate, then `record` preparations, which it does through
+  batch files in its per-run inbox (`data/sitting/inbox/<run>/`). The render that follows
   writes `data/return-brief.md` (OPERATIONS.md §12, "Cross-project return brief (05:30)"). Its
   autonomous closes are windowed on `closed_at`, and a close with no `closed_at` is listed as
   undated, not dropped.
