@@ -577,6 +577,27 @@ class TestFindMergeSha:
         _git(['merge', '--ff-only', 'integration'], repo)
         assert driver.find_merge_sha(repo, '804') == side_merge
 
+    def test_a_revert_or_a_longer_target_branch_is_not_a_landing_merge(
+        self, tmp_path: Path,
+    ) -> None:
+        # The landing spelling is anchored at both ends: a Revert subject
+        # quoting it and a merge into 'mainline' are decoys. Either one would
+        # also turn the real merge below into a spurious second match.
+        repo = _init_repo(tmp_path)
+        _commit(repo, 'a.txt', 'base\n', 'base')
+        _commit(repo, 'b.txt', 'undo\n', 'Revert "Merge task/805 into main"')
+        _git(['checkout', '-q', '-b', 'task/805-decoy'], repo)
+        _commit(repo, 'c.txt', 'decoy\n', 'decoy')
+        _git(['checkout', '-q', 'main'], repo)
+        _merge(repo, 'task/805-decoy', 'Merge task/805 into mainline')
+        assert driver.find_merge_sha(repo, '805') is None
+
+        _git(['checkout', '-q', '-b', 'task/805'], repo)
+        _commit(repo, 'd.txt', 'work\n', 'work')
+        _git(['checkout', '-q', 'main'], repo)
+        landing = _merge(repo, 'task/805', 'Merge task/805: subject')
+        assert driver.find_merge_sha(repo, '805') == landing
+
 
 # ---------------------------------------------------------------------------
 # _mint_one — a planRate-only fixture must not claim a landed verify outcome
