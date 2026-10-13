@@ -236,6 +236,15 @@ class EmptySelectionError(ValueError):
     """
 
 
+class CensusShapeError(ValueError):
+    """The census parsed, but lacks a table this script reads.
+
+    :func:`load_census_coverage` turns it into ``unavailable_reason``, because a
+    probe run is never fatal on its census. ``--derive-registry`` refuses it
+    with :data:`EXIT_BAD_INPUT`, because there the census IS the input.
+    """
+
+
 class ProbeRunError(RuntimeError):
     """The run could not complete; the message is attributed at the seam that raised it.
 
@@ -753,6 +762,10 @@ class DerivationResult:
     one dropped for ``count <= 1`` is a healthy census with an uninformative
     tail. Folding them into one number reports a schema break as a corpus
     property, which is the reading that stops anyone looking.
+
+    An absent or misshapen topic table is REFUSED (:class:`CensusShapeError`),
+    not counted, because it would read zero in every census counter, the same
+    as an empty corpus.
     """
 
     candidates: tuple[dict[str, Any], ...]
@@ -877,7 +890,31 @@ class _CensusDerivation(NamedTuple):
     malformed_count: int
 
 
-def _derive_census_candidates(census: dict) -> _CensusDerivation:
+_CENSUS_TOPIC_TABLE_PATH = ('grand_total', 'topic', 'entries')
+
+
+def _census_topic_table(census: Any) -> list[Any]:
+    """The census's ``grand_total.topic.entries`` rows, which may be empty.
+
+    An empty list is a healthy census of a corpus with no topic values. An
+    absent or misshapen table raises :class:`CensusShapeError` naming where
+    the walk stopped, because it would otherwise read zero in every census
+    counter, exactly like that empty corpus.
+    """
+    node, location = census, 'the top level'
+    for depth, key in enumerate(_CENSUS_TOPIC_TABLE_PATH):
+        if not isinstance(node, dict):
+            raise CensusShapeError(f'{location} is {type(node).__name__}, not an object')
+        node = node.get(key)
+        location = '.'.join(_CENSUS_TOPIC_TABLE_PATH[:depth + 1])
+        if node is None:
+            raise CensusShapeError(f'{location} is null or absent')
+    if not isinstance(node, list):
+        raise CensusShapeError(f'{location} is {type(node).__name__}, not a list')
+    return node
+
+
+def _derive_census_candidates(census: Any) -> _CensusDerivation:
     """Multi-entry census topics, plus every row the derivation had to drop.
 
     A count-1 topic has exactly one entry, so "is the canonical in the top k"
@@ -887,7 +924,7 @@ def _derive_census_candidates(census: dict) -> _CensusDerivation:
     is the wrong shape are counted separately, for the reason
     :class:`_CensusDerivation` states.
     """
-    table = ((census.get('grand_total') or {}).get('topic') or {}).get('entries') or []
+    table = _census_topic_table(census)
     candidates: list[dict[str, Any]] = []
     skipped = 0
     malformed_value = 0
@@ -943,7 +980,7 @@ def _slugify(value: str) -> str:
 
 def derive_registry_candidates(
     calibration_rows: list[dict],
-    census_report: dict,
+    census_report: Any,
     guard_clusters,
 ) -> DerivationResult:
     """Derive candidate registry entries from the three COMMITTED sources.
@@ -2336,23 +2373,19 @@ class CensusCoverage:
     """The registry topics the census deliberately did not gauge."""
 
 
-class _CensusShapeError(ValueError):
-    """The census parsed, but carries no usable registry gauge."""
-
-
 def _census_count(raw: dict, key: str) -> int:
     value = raw.get(key)
     if isinstance(value, bool) or not isinstance(value, int):
-        raise _CensusShapeError(f'a registry_coverage row has a non-integer {key!r}: {raw!r}')
+        raise CensusShapeError(f'a registry_coverage row has a non-integer {key!r}: {raw!r}')
     return value
 
 
 def _parse_census_row(raw: Any) -> CensusTopicRow:
     if not isinstance(raw, dict):
-        raise _CensusShapeError(f'a registry_coverage row is not an object: {raw!r}')
+        raise CensusShapeError(f'a registry_coverage row is not an object: {raw!r}')
     project_id, topic = raw.get('project_id'), raw.get('topic')
     if not isinstance(project_id, str) or not isinstance(topic, str):
-        raise _CensusShapeError(f'a registry_coverage row lacks a project_id or topic: {raw!r}')
+        raise CensusShapeError(f'a registry_coverage row lacks a project_id or topic: {raw!r}')
     return CensusTopicRow(
         project_id=project_id,
         topic=topic,
@@ -2371,7 +2404,7 @@ def _parse_query_surface_topics(raw: Any) -> tuple[str, ...]:
     if not isinstance(raw, list) or not all(
         isinstance(item, dict) and isinstance(item.get('topic'), str) for item in raw
     ):
-        raise _CensusShapeError(f'query_surface_topics_not_gauged is misshapen: {raw!r}')
+        raise CensusShapeError(f'query_surface_topics_not_gauged is misshapen: {raw!r}')
     return tuple(item['topic'] for item in raw)
 
 
@@ -2379,21 +2412,21 @@ def _parse_registry_gauge(
     payload: Any,
 ) -> tuple[dict[tuple[str, str], CensusTopicRow], tuple[str, ...]]:
     if not isinstance(payload, dict):
-        raise _CensusShapeError('the top level is not an object')
+        raise CensusShapeError('the top level is not an object')
     gauge = payload.get('registry_coverage')
     if gauge is None:
-        raise _CensusShapeError(
+        raise CensusShapeError(
             'registry_coverage is null or absent; the census reported '
             f'registry_error={payload.get("registry_error")!r}',
         )
     if not isinstance(gauge, dict) or not isinstance(gauge.get('topics'), list):
-        raise _CensusShapeError('registry_coverage.topics is not a list')
+        raise CensusShapeError('registry_coverage.topics is not a list')
     rows: dict[tuple[str, str], CensusTopicRow] = {}
     for raw in gauge['topics']:
         row = _parse_census_row(raw)
         key = (row.project_id, row.topic)
         if key in rows:
-            raise _CensusShapeError(f'registry_coverage.topics repeats {key!r}')
+            raise CensusShapeError(f'registry_coverage.topics repeats {key!r}')
         rows[key] = row
     return rows, _parse_query_surface_topics(gauge.get('query_surface_topics_not_gauged'))
 
@@ -2418,7 +2451,7 @@ def load_census_coverage(path: str | Path) -> CensusCoverage:
         return unavailable(f'the census at {source} is not decodable JSON: {exc}')
     try:
         rows, query_surface = _parse_registry_gauge(payload)
-    except _CensusShapeError as exc:
+    except CensusShapeError as exc:
         return unavailable(f'the census at {source} carries no usable registry gauge: {exc}')
     return CensusCoverage(
         source=source,
