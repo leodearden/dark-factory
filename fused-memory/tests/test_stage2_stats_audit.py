@@ -161,11 +161,17 @@ class _StubTaskmaster:
 def _mock_deps(
     known_projects: dict[str, str] | None = None,
     taskmaster: Any = None,
+    journal_rows: list[dict] | None = None,
+    project_id: str = _TEST_PROJECT_ID,
 ) -> dict:
-    """Kwargs for constructing a TaskKnowledgeSync with mocked deps."""
+    """Kwargs for constructing a TaskKnowledgeSync with mocked deps.
+
+    *journal_rows* is what the write journal's ``get_ops_by_causation``
+    returns — rows shaped like ``WriteJournal`` output (see ``_journal_row``).
+    """
     config = ReconciliationConfig(enabled=True, explore_codebase_root=_TEST_PROJECT_ROOT)
     write_journal_mock = MagicMock()
-    write_journal_mock.get_ops_by_causation = AsyncMock(return_value=[])
+    write_journal_mock.get_ops_by_causation = AsyncMock(return_value=list(journal_rows or []))
     journal_mock = MagicMock()
     journal_mock.write_journal = write_journal_mock
     journal_mock.record_run_session = AsyncMock()
@@ -175,7 +181,7 @@ def _mock_deps(
         'taskmaster': AsyncMock() if taskmaster is None else taskmaster,
         'journal': journal_mock,
         'config': config,
-        'scope': ProjectScope(ProjectId(_TEST_PROJECT_ID), ProjectRoot(_TEST_PROJECT_ROOT)),
+        'scope': ProjectScope(ProjectId(project_id), ProjectRoot(_TEST_PROJECT_ROOT)),
         'known_projects': dict(known_projects) if known_projects else {},
     }
 
@@ -183,11 +189,38 @@ def _mock_deps(
 def _make_stage(
     known_projects: dict[str, str] | None = None,
     taskmaster: Any = None,
+    journal_rows: list[dict] | None = None,
+    project_id: str = _TEST_PROJECT_ID,
 ) -> TaskKnowledgeSync:
     return TaskKnowledgeSync(
         StageId.task_knowledge_sync,
-        **_mock_deps(known_projects=known_projects, taskmaster=taskmaster),
+        **_mock_deps(
+            known_projects=known_projects,
+            taskmaster=taskmaster,
+            journal_rows=journal_rows,
+            project_id=project_id,
+        ),
     )
+
+
+def _journal_row(
+    run_id: str,
+    task_id: object,
+    *,
+    project_id: str | None,
+    operation: str = 'task_created',
+    success: int = 1,
+) -> dict:
+    """A creation-journal write_op row as ``WriteJournal.get_ops_by_causation`` returns it."""
+    return {
+        'layer': 'write_op',
+        'operation': operation,
+        'causation_id': run_id,
+        'project_id': project_id,
+        'agent_id': 'recon-stage-task_knowledge_sync',
+        'params': json.dumps({'task_id': task_id}),
+        'success': success,
+    }
 
 
 def _make_report(stats: dict) -> StageReport:
@@ -861,7 +894,7 @@ class TestPostFlightRepairIsCorroborated:
         assert report.stats['tasks_created'] == 1
         assert report.stats['tasks_created_reported'] == 0
         assert report.stats['task_created_records_valid'] == 1
-        assert report.stats['task_created_records_corroborated'] == 1
+        assert report.stats['task_created_records_journaled'] == 0
         assert report.stats['task_created_records_uncorroborated'] == 0
         assert report.stats['task_created_records_unresolvable'] == 0
         assert stub.calls == [('3045', '/repo/df')]
@@ -887,8 +920,7 @@ class TestPostFlightRepairIsCorroborated:
 
         assert report.stats['tasks_created'] == 0
         assert 'tasks_created_reported' not in report.stats
-        assert report.stats['task_created_records_valid'] == 1
-        assert report.stats['task_created_records_corroborated'] == 0
+        assert report.stats['task_created_records_valid'] == 0
         assert report.stats['task_created_records_uncorroborated'] == 1
         assert report.stats['task_created_records_unresolvable'] == 0
         assert _undercount_warnings(caplog) == []
@@ -914,8 +946,7 @@ class TestPostFlightRepairIsCorroborated:
 
         assert report.stats['tasks_created'] == 1
         assert report.stats['tasks_created_reported'] == 0
-        assert report.stats['task_created_records_valid'] == 2
-        assert report.stats['task_created_records_corroborated'] == 1
+        assert report.stats['task_created_records_valid'] == 1
         assert report.stats['task_created_records_uncorroborated'] == 1
 
     @pytest.mark.asyncio
@@ -935,7 +966,7 @@ class TestPostFlightRepairIsCorroborated:
 
         assert report.stats['tasks_created'] == 5
         assert 'tasks_created_reported' not in report.stats
-        assert report.stats['task_created_records_corroborated'] == 1
+        assert report.stats['task_created_records_valid'] == 1
         assert _undercount_warnings(caplog) == []
 
     @pytest.mark.asyncio
@@ -949,16 +980,15 @@ class TestPostFlightRepairIsCorroborated:
 
         assert report.stats['tasks_created'] == 0
         assert report.stats['task_created_records_valid'] == 0
-        assert report.stats['task_created_records_corroborated'] == 0
+        assert report.stats['task_created_records_journaled'] == 0
         assert report.stats['task_created_records_uncorroborated'] == 0
         assert report.stats['task_created_records_unresolvable'] == 0
 
     @pytest.mark.asyncio
-    async def test_records_valid_keeps_its_pre_corroboration_meaning(self):
-        """task_created_records_valid is the STRUCTURALLY-valid record count —
-        task 3045's lesson that a stat name must not imply a stronger
-        guarantee than the code delivers. Corroboration is reported
-        separately, never folded into it."""
+    async def test_records_valid_counts_only_confirmed_creations(self):
+        """task_created_records_valid counts CONFIRMED creations only (task
+        4873): a record get_task cannot confirm is never valid, so the
+        valid=0-despite-a-real-task discrepancy and its inverse cannot recur."""
         stub = _StubTaskmaster()  # every lookup not-found
         stage = _make_stage(known_projects=_KNOWN_PROJECTS, taskmaster=stub)
         report = _make_report({
@@ -973,10 +1003,8 @@ class TestPostFlightRepairIsCorroborated:
         await stage._apply_post_flight_guards(report, [], 'test-run-3051')
 
         # 'failed' never counts and 'combined' is not a tasks_created status;
-        # the one 'created' record is structurally valid and does not
-        # corroborate.
-        assert report.stats['task_created_records_valid'] == 1
-        assert report.stats['task_created_records_corroborated'] == 0
+        # the one 'created' record does not corroborate, so nothing is valid.
+        assert report.stats['task_created_records_valid'] == 0
         assert report.stats['task_created_records_uncorroborated'] == 1
 
     @pytest.mark.asyncio
@@ -1105,8 +1133,8 @@ class TestPostFlightLoudDegradation:
         'which', ['no-taskmaster', 'empty-known-projects', 'every-lookup-raises'],
     )
     async def test_every_valid_record_is_accounted_for(self, which):
-        """The withheld repair is visible: all four record stats are present
-        and the three corroboration buckets partition the valid records."""
+        """The withheld repair is visible: the record stats are present, nothing
+        is valid, and the two shortfall buckets account for every record."""
         stage = self._degraded_stages()[which]
         report = _make_report({
             'tasks_created': 0,
@@ -1115,14 +1143,12 @@ class TestPostFlightLoudDegradation:
 
         await stage._apply_post_flight_guards(report, [], 'test-run-3051')
 
-        valid = report.stats['task_created_records_valid']
-        assert valid == 2
-        assert report.stats['task_created_records_corroborated'] == 0
+        assert report.stats['task_created_records_valid'] == 0
         buckets = (
             report.stats['task_created_records_uncorroborated']
             + report.stats['task_created_records_unresolvable']
         )
-        assert buckets == valid
+        assert buckets == 2
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1192,7 +1218,7 @@ class TestPostFlightLoudDegradation:
         with caplog.at_level(logging.WARNING, logger=_REPAIR_LOGGER):
             await stage._apply_post_flight_guards(report, [], 'test-run-3051')
 
-        assert report.stats['task_created_records_corroborated'] == 2
+        assert report.stats['task_created_records_valid'] == 2
         assert _uncorroborated_warnings(caplog) == []
 
     @pytest.mark.asyncio
@@ -1211,6 +1237,235 @@ class TestPostFlightLoudDegradation:
         assert report.stats['tasks_created'] == 1
         assert len(_undercount_warnings(caplog)) == 1
         assert len(_uncorroborated_warnings(caplog)) == 1
+
+
+# ── task 4873: tasks_created is grounded in the creation journal ─────────────
+
+_JOURNAL_UNAVAILABLE_EVENT = 'reconciliation.stage2_creation_journal_unavailable'
+
+RUN_F9E49AEF = 'f9e49aef-1111-4000-8000-000000000105'
+RUN_90D762D0 = '90d762d0-2222-4000-8000-000000004745'
+RUN_507BC25B = '507bc25b-3333-4000-8000-000000003045'
+
+
+def _warnings_named(caplog, event: str) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and event in r.getMessage()
+    ]
+
+
+class TestPostFlightJournalGrounding:
+    """``tasks_created`` is repaired from the creation journal (task 4873).
+
+    TaskInterceptor writes one row per creation outcome attributed to the
+    submitter's ``_causation_id``; Stage 2's post-flight reads the run's rows.
+    Journal keys are code truth — trusted, never re-looked-up. Records remain a
+    corroborated second channel for creations the journal did not attribute.
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_f9e49aef_journal_confirms_the_self_report(self):
+        """Task 105 filed with no task_created_records entry: the journal row
+        alone makes it a confirmed creation."""
+        stage = _make_stage(
+            project_id='solar_challenge',
+            journal_rows=[_journal_row(RUN_F9E49AEF, '105', project_id='solar_challenge')],
+        )
+        report = _make_report({'tasks_created': 1})
+
+        await stage._apply_post_flight_guards(report, [], RUN_F9E49AEF)
+
+        assert report.stats['task_created_records_valid'] == 1
+        assert report.stats['task_created_records_journaled'] == 1
+        assert report.stats['tasks_created'] == 1
+        assert 'tasks_created_reported' not in report.stats
+
+    @pytest.mark.asyncio
+    async def test_run_90d762d0_journal_repairs_an_omitted_creation(self, caplog):
+        """Task 4745 filed via resolve_ticket, self-report 0, no record."""
+        stage = _make_stage(
+            project_id='dark_factory',
+            journal_rows=[_journal_row(RUN_90D762D0, 4745, project_id='dark_factory')],
+        )
+        report = _make_report({'tasks_created': 0})
+
+        with caplog.at_level(logging.WARNING):
+            await stage._apply_post_flight_guards(report, [], RUN_90D762D0)
+
+        assert report.stats['tasks_created'] == 1
+        assert report.stats['tasks_created_reported'] == 0
+        assert len(_warnings_named(caplog, _UNDERCOUNT_EVENT)) == 1
+
+    @pytest.mark.asyncio
+    async def test_journal_keys_are_trusted_without_a_lookup(self):
+        stub = _StubTaskmaster()
+        stage = _make_stage(
+            taskmaster=stub,
+            known_projects={},
+            journal_rows=[_journal_row(RUN_90D762D0, 4745, project_id='dark_factory')],
+        )
+        report = _make_report({'tasks_created': 0})
+
+        await stage._apply_post_flight_guards(report, [], RUN_90D762D0)
+
+        assert report.stats['tasks_created'] == 1
+        assert report.stats['task_created_records_unresolvable'] == 0
+        assert stub.calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_record_duplicating_a_journal_key_is_neither_counted_twice_nor_looked_up(
+        self,
+    ):
+        stub = _StubTaskmaster()
+        stage = _make_stage(
+            taskmaster=stub,
+            known_projects=_KNOWN_PROJECTS,
+            journal_rows=[_journal_row(RUN_90D762D0, '4745', project_id='dark_factory')],
+        )
+        report = _make_report({
+            'tasks_created': 0,
+            'task_created_records': [
+                {'action': 'task_created', 'task_id': 4745, 'status': 'created',
+                 'project_id': 'dark_factory'},
+            ],
+        })
+
+        await stage._apply_post_flight_guards(report, [], RUN_90D762D0)
+
+        assert report.stats['tasks_created'] == 1
+        assert report.stats['task_created_records_valid'] == 1
+        assert report.stats['task_created_records_journaled'] == 1
+        assert report.stats['task_created_records_uncorroborated'] == 0
+        assert report.stats['task_created_records_unresolvable'] == 0
+        assert stub.calls == []
+
+    @pytest.mark.asyncio
+    async def test_run_507bc25b_record_only_creation_still_repairs_via_get_task(self):
+        stub = _StubTaskmaster(results={('3045', '/repo/df'): _task_record('3045')})
+        stage = _make_stage(known_projects=_KNOWN_PROJECTS, taskmaster=stub)
+        report = _make_report({
+            'tasks_created': 0,
+            'task_created_records': [dict(_RUN_507BC25B_RECORD)],
+        })
+
+        await stage._apply_post_flight_guards(report, [], RUN_507BC25B)
+
+        assert report.stats['tasks_created'] == 1
+        assert report.stats['task_created_records_valid'] == 1
+        assert report.stats['task_created_records_journaled'] == 0
+        assert stub.calls == [('3045', '/repo/df')]
+
+    @pytest.mark.asyncio
+    async def test_stats_partition_journaled_and_record_only_claims(self):
+        stub = _StubTaskmaster(results={
+            ('2', '/repo/df'): _task_record('2'),
+            ('3', '/repo/df'): _not_found('3'),
+        })
+        stage = _make_stage(
+            taskmaster=stub,
+            known_projects=_KNOWN_PROJECTS,
+            journal_rows=[_journal_row(RUN_90D762D0, '1', project_id='dark_factory')],
+        )
+        records = [
+            {'task_id': tid, 'status': 'created', 'project_id': pid}
+            for tid, pid in [('1', 'dark_factory'), ('2', 'dark_factory'),
+                             ('3', 'dark_factory'), ('4', 'nowhere')]
+        ]
+        report = _make_report({'tasks_created': 0, 'task_created_records': records})
+
+        await stage._apply_post_flight_guards(report, [], RUN_90D762D0)
+
+        stats = report.stats
+        record_only_confirmed = stats['task_created_records_valid'] - stats[
+            'task_created_records_journaled'
+        ]
+        assert stats['task_created_records_journaled'] == 1
+        assert record_only_confirmed == 1
+        assert stats['task_created_records_uncorroborated'] == 1
+        assert stats['task_created_records_unresolvable'] == 1
+        assert (
+            record_only_confirmed
+            + stats['task_created_records_uncorroborated']
+            + stats['task_created_records_unresolvable']
+        ) == 3
+        assert stats['tasks_created'] == 2
+
+    @pytest.mark.asyncio
+    async def test_the_corroborated_key_is_no_longer_published(self):
+        stage = _make_stage(
+            known_projects=_KNOWN_PROJECTS,
+            taskmaster=_StubTaskmaster(results={('3045', '/repo/df'): _task_record('3045')}),
+        )
+        report = _make_report({'task_created_records': [dict(_RUN_507BC25B_RECORD)]})
+
+        await stage._apply_post_flight_guards(report, [], RUN_507BC25B)
+
+        assert 'task_created_records_corroborated' not in report.stats
+
+    @staticmethod
+    def _unavailable_stage(which: str) -> TaskKnowledgeSync:
+        stage = _make_stage(
+            known_projects=_KNOWN_PROJECTS,
+            taskmaster=_StubTaskmaster(results={('3045', '/repo/df'): _task_record('3045')}),
+        )
+        journal = stage.journal
+        assert journal is not None
+        if which == 'no-write-journal':
+            journal.write_journal = None
+        elif which == 'read-raises':
+            journal.write_journal.get_ops_by_causation = AsyncMock(
+                side_effect=RuntimeError('db locked'),
+            )
+        else:
+            journal.write_journal.get_ops_by_causation = AsyncMock(return_value=MagicMock())
+        return stage
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('which', ['no-write-journal', 'read-raises', 'non-list'])
+    async def test_unavailable_journal_falls_back_to_records_and_warns_once(
+        self, which, caplog,
+    ):
+        stage = self._unavailable_stage(which)
+        report = _make_report({
+            'tasks_created': 0,
+            'task_created_records': [dict(_RUN_507BC25B_RECORD)],
+        })
+
+        with caplog.at_level(logging.WARNING):
+            await stage._apply_post_flight_guards(report, [], RUN_507BC25B)
+
+        assert report.stats['tasks_created'] == 1
+        assert report.stats['task_created_records_journaled'] == 0
+        warnings = _warnings_named(caplog, _JOURNAL_UNAVAILABLE_EVENT)
+        assert len(warnings) == 1
+        assert RUN_507BC25B in warnings[0]
+        assert _TEST_PROJECT_ID in warnings[0]
+
+    @pytest.mark.asyncio
+    async def test_an_available_journal_does_not_warn(self, caplog):
+        stage = _make_stage(known_projects=_KNOWN_PROJECTS, taskmaster=_StubTaskmaster())
+        report = _make_report({})
+
+        with caplog.at_level(logging.WARNING):
+            await stage._apply_post_flight_guards(report, [], RUN_507BC25B)
+
+        assert _warnings_named(caplog, _JOURNAL_UNAVAILABLE_EVENT) == []
+
+    @pytest.mark.asyncio
+    async def test_a_larger_self_report_is_never_lowered(self, caplog):
+        stage = _make_stage(
+            journal_rows=[_journal_row(RUN_90D762D0, '4745', project_id='dark_factory')],
+        )
+        report = _make_report({'tasks_created': 5})
+
+        with caplog.at_level(logging.WARNING):
+            await stage._apply_post_flight_guards(report, [], RUN_90D762D0)
+
+        assert report.stats['tasks_created'] == 5
+        assert 'tasks_created_reported' not in report.stats
+        assert _warnings_named(caplog, _UNDERCOUNT_EVENT) == []
 
 
 class TestPostFlightFlagCountersAreNeverClamped:
