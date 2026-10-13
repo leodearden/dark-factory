@@ -112,11 +112,42 @@ def configure_triage_config(
             t_low=t_low,
             judge_enabled=judge_enabled,
         ),
-        reconciliation=types.SimpleNamespace(
-            procedural_knowledge_near_dup_guard_enabled=near_dup_guard_enabled,
-            procedural_knowledge_near_dup_threshold=near_dup_threshold,
-            procedural_knowledge_topic_guard_clusters=topic_clusters or [],
+        reconciliation=_reject_guard_section(
+            near_dup_guard_enabled, near_dup_threshold, topic_clusters
         ),
+    )
+
+
+def configure_reject_guard_config(
+    mock_service: AsyncMock,
+    *,
+    near_dup_guard_enabled: bool,
+    near_dup_threshold: float,
+    topic_clusters: list | None = None,
+) -> None:
+    """Stand in for ``memory_service.config`` with the ``reconciliation`` section ONLY.
+
+    ``write_triage`` is left off the namespace, so its resolver reads the
+    production default (off) and the two reject guards are the live path. This
+    is the shape for a suite about the guards themselves; use
+    ``configure_triage_config`` to compare them against triage.
+    """
+    mock_service.config = types.SimpleNamespace(
+        reconciliation=_reject_guard_section(
+            near_dup_guard_enabled, near_dup_threshold, topic_clusters
+        ),
+    )
+
+
+def _reject_guard_section(
+    near_dup_guard_enabled: bool,
+    near_dup_threshold: float,
+    topic_clusters: list | None,
+) -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        procedural_knowledge_near_dup_guard_enabled=near_dup_guard_enabled,
+        procedural_knowledge_near_dup_threshold=near_dup_threshold,
+        procedural_knowledge_topic_guard_clusters=topic_clusters or [],
     )
 
 

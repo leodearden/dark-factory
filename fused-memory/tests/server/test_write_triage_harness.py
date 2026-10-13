@@ -15,6 +15,7 @@ import pytest
 from fused_memory.server.near_duplicate_guard import (
     resolve_near_dup_guard_enabled,
     resolve_near_dup_threshold,
+    resolve_topic_guard_clusters,
 )
 from fused_memory.server.write_triage import (
     OUTCOME_RESTATED,
@@ -26,8 +27,10 @@ from fused_memory.server.write_triage_judge import resolve_judge_enabled
 from server.write_triage_harness import (
     T_HIGH,
     T_LOW,
+    configure_reject_guard_config,
     configure_triage_config,
     search_candidate,
+    topic_cluster,
 )
 
 
@@ -60,6 +63,22 @@ def test_the_disabled_flags_read_as_disabled() -> None:
 
     assert resolve_write_triage_enabled(svc) is False
     assert resolve_near_dup_guard_enabled(svc) is False
+
+
+def test_the_reject_guard_config_reads_as_configured_with_triage_off() -> None:
+    svc = AsyncMock()
+    cluster = topic_cluster()
+    configure_reject_guard_config(
+        svc,
+        near_dup_guard_enabled=False,
+        near_dup_threshold=0.85,
+        topic_clusters=[cluster],
+    )
+
+    assert resolve_write_triage_enabled(svc) is False
+    assert resolve_near_dup_guard_enabled(svc) is False
+    assert resolve_near_dup_threshold(svc) == 0.85
+    assert resolve_topic_guard_clusters(svc) == [cluster]
 
 
 def test_the_default_candidate_lands_in_the_deterministic_band() -> None:
