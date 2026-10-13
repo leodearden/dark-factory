@@ -954,21 +954,12 @@ def _terminal_render(
         monkeypatch.setattr(snapshot_mod, '_TERMINAL_FETCH_WINDOW', window)
 
     roots = [Path('/proj') / label for label in labels]
-    rendered = {str(root) for root in roots}
     calls: list[dict] = []
 
     async def _mcp(http_client, url, tool, args, **kwargs):
-        # Only THIS render's roots are logged. The lifespan's burndown loop
-        # snapshots the real configured roots through this same patched seam
-        # as the app starts, and its reads landed here whenever the two
-        # overlapped (measured: 5 of 10 runs of this class failed on them).
-        # Nothing but the handler can reach a /proj root: the config installed
-        # below is the only place one is named, and the burndown loop bound its
-        # config at lifespan start, so it never sees that one.
-        if args.get('project_root') in rendered:
-            # kwargs is kept: the per-request budget rides as ``timeout=`` and
-            # is assertable at the wire nowhere else.
-            calls.append({'tool': tool, 'args': dict(args), 'kwargs': dict(kwargs)})
+        # kwargs is kept: the per-request budget rides as ``timeout=`` and is
+        # assertable at the wire nowhere else.
+        calls.append({'tool': tool, 'args': dict(args), 'kwargs': dict(kwargs)})
         if tool == 'get_statuses':
             return {'statuses': {}}
         rows = sorted(terminal_rows, key=lambda row: int(row['id']))  # ORDER BY id ASC
