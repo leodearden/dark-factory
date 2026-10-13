@@ -36,9 +36,11 @@ import time
 from collections import Counter
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 from _orch_helpers import mcp_tool_envelope
+from shared.task_submit import SubmitFailed, SubmitOutcome, SubmittedTask, SubmittedTicket
 
 # Column order is pinned, not merely presence: run_store.py:53-58 establishes
 # physical-column-order parity between a freshly-created DB and an ALTER-migrated
@@ -1587,6 +1589,11 @@ class TestBuildDeflakeTaskArguments:
         assert RESPONSIBILITY_FIX_ROOT_DEFECT in description
         assert RESPONSIBILITY_REMOVE_FROM_LEDGER in description
 
+def _task(task_id: str, status: str | None = 'deferred', combined: bool = False) -> SubmittedTask:
+    """A planning-mode ``submit_task`` outcome: the task, created ``deferred``."""
+    return SubmittedTask(task_id, status, combined)
+
+
 class _FakeTaskClient:
     """The full ``FlakeLedgerTaskClient`` seam, recorded.
 
@@ -1618,7 +1625,7 @@ class _FakeTaskClient:
     def __init__(
         self,
         *,
-        submit_returns: object = 'task-901',
+        submit_returns: SubmitOutcome | None = None,
         statuses: dict[str, str] | None = None,
         tasks: dict[str, dict] | None = None,
         submit_raises: BaseException | None = None,
@@ -1634,7 +1641,7 @@ class _FakeTaskClient:
         self.task_calls: list[str] = []
         self.commit_calls: list[list[str]] = []
         self.calls: list[str] = []
-        self._submit_returns = submit_returns
+        self._submit_returns = submit_returns if submit_returns is not None else _task('task-901')
         self._statuses = statuses if statuses is not None else {}
         self._tasks = tasks if tasks is not None else {}
         self._submit_raises = submit_raises
@@ -1645,12 +1652,12 @@ class _FakeTaskClient:
         self._task_hangs = task_hangs
         self._commit_raises = commit_raises
 
-    async def submit_task(self, arguments: dict) -> str:
+    async def submit_task(self, arguments: dict) -> SubmitOutcome:
         self.calls.append('submit_task')
         self.submit_calls.append(arguments)
         if self._submit_raises is not None:
             raise self._submit_raises
-        return self._submit_returns  # type: ignore[return-value]
+        return self._submit_returns
 
     async def get_statuses(self, ids: list[str]) -> tuple[dict[str, str], Exception | None]:
         self.calls.append('get_statuses')
@@ -1718,7 +1725,7 @@ async def _open_owned_debt(db_path: Path, test_id: str, *, now: datetime, owner:
 
     row = await open_debt(
         db_path, 'dark_factory', test_id,
-        task_client=_FakeTaskClient(submit_returns=owner), now=now,
+        task_client=_FakeTaskClient(submit_returns=_task(owner)), now=now,
     )
     assert row is not None and row.owner_task_id == owner, row
     return row
@@ -2019,7 +2026,7 @@ class TestOpenDebtFilesTheDeflakeTask:
         from orchestrator.flake_ledger import build_deflake_task_arguments, open_debt
 
         db_path = tmp_path / 'runs.db'
-        client = _FakeTaskClient(submit_returns='task-901')
+        client = _FakeTaskClient(submit_returns=_task('task-901'))
 
         row = await open_debt(
             db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.NOW
@@ -2044,7 +2051,7 @@ class TestOpenDebtFilesTheDeflakeTask:
         from orchestrator.flake_ledger import open_debt, read_debt
 
         db_path = tmp_path / 'runs.db'
-        client = _FakeTaskClient(submit_returns='task-902')
+        client = _FakeTaskClient(submit_returns=_task('task-902'))
 
         row = await open_debt(
             db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.NOW
@@ -2141,7 +2148,7 @@ class TestOpenDebtRecorroboratesTheOwner:
         """First suppression, which files and stores *owner*."""
         from orchestrator.flake_ledger import open_debt
 
-        seeder = _FakeTaskClient(submit_returns=owner)
+        seeder = _FakeTaskClient(submit_returns=_task(owner))
         await open_debt(db_path, 'dark_factory', self.TEST_ID, task_client=seeder, now=self.NOW)
         assert _owner(db_path, self.TEST_ID) == owner
 
@@ -2177,7 +2184,7 @@ class TestOpenDebtRecorroboratesTheOwner:
 
         db_path = tmp_path / 'runs.db'
         await self._seed(db_path)
-        client = _FakeTaskClient(statuses={'task-901': status}, submit_returns='task-902')
+        client = _FakeTaskClient(statuses={'task-901': status}, submit_returns=_task('task-902'))
 
         row = await open_debt(
             db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.LATER
@@ -2218,7 +2225,7 @@ class TestOpenDebtRecorroboratesTheOwner:
         db_path = tmp_path / 'runs.db'
         await self._seed(db_path)
         client = _FakeTaskClient(
-            statuses=statuses, statuses_error=None, submit_returns='task-903',
+            statuses=statuses, statuses_error=None, submit_returns=_task('task-903'),
             task_error=task_error,
         )
 
@@ -2279,7 +2286,7 @@ class TestOpenDebtRecorroboratesTheOwner:
 
         db_path = tmp_path / 'runs.db'
         await self._seed(db_path)
-        client = _FakeTaskClient(statuses=statuses, submit_returns='task-904')
+        client = _FakeTaskClient(statuses=statuses, submit_returns=_task('task-904'))
 
         await open_debt(db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.LATER)
 
@@ -2323,7 +2330,7 @@ class TestOpenDebtClosesAFinishedCycle:
         db_path = tmp_path / 'runs.db'
         await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
         client = _FakeTaskClient(
-            tasks={'task-901': _done_task('task-901', self.COMMIT)}, submit_returns='task-902'
+            tasks={'task-901': _done_task('task-901', self.COMMIT)}, submit_returns=_task('task-902')
         )
 
         row = await open_debt(
@@ -2346,7 +2353,7 @@ class TestOpenDebtClosesAFinishedCycle:
 
         db_path = tmp_path / 'runs.db'
         await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
-        client = _FakeTaskClient(statuses={'task-901': 'cancelled'}, submit_returns='task-902')
+        client = _FakeTaskClient(statuses={'task-901': 'cancelled'}, submit_returns=_task('task-902'))
 
         await open_debt(db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.LATER)
 
@@ -2419,7 +2426,7 @@ class TestOpenDebtClosesAFinishedCycle:
 
         db_path = tmp_path / 'runs.db'
         await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
-        client = _FakeTaskClient(statuses={'task-901': 'cancelled'}, submit_returns='task-902')
+        client = _FakeTaskClient(statuses={'task-901': 'cancelled'}, submit_returns=_task('task-902'))
 
         await open_debt(db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.LATER)
 
@@ -2434,7 +2441,7 @@ class TestOpenDebtClosesAFinishedCycle:
         db_path = tmp_path / 'runs.db'
         await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
         client = _FakeTaskClient(
-            tasks={'task-901': _done_task('task-901', self.COMMIT)}, submit_returns='task-902'
+            tasks={'task-901': _done_task('task-901', self.COMMIT)}, submit_returns=_task('task-902')
         )
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
@@ -2544,7 +2551,7 @@ class TestOpenDebtNeverReplacesAFinishedOwner:
 
     @staticmethod
     def _done_to_zeta(**kwargs) -> _FakeTaskClient:
-        return _FakeTaskClient(statuses={'task-901': 'done'}, submit_returns='task-902', **kwargs)
+        return _FakeTaskClient(statuses={'task-901': 'done'}, submit_returns=_task('task-902'), **kwargs)
 
     @pytest.mark.parametrize('kwargs', UNLANDED_RESOLUTIONS, ids=UNLANDED_IDS)
     async def test_a_done_owner_on_an_open_cycle_is_kept(
@@ -2611,7 +2618,7 @@ class TestOpenDebtNeverReplacesAFinishedOwner:
             task_client=self._done_to_zeta(task_error=RuntimeError('mcp down')), now=self.LATER,
         )
         healed = _FakeTaskClient(
-            tasks={'task-901': _done_task('task-901', self.COMMIT)}, submit_returns='task-902'
+            tasks={'task-901': _done_task('task-901', self.COMMIT)}, submit_returns=_task('task-902')
         )
         seen: list = []
 
@@ -2639,7 +2646,7 @@ class TestOpenDebtNeverReplacesAFinishedOwner:
         db_path = tmp_path / 'runs.db'
         await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
         client = _FakeTaskClient(
-            statuses=statuses, submit_returns='task-902', task_error=RuntimeError('mcp down')
+            statuses=statuses, submit_returns=_task('task-902'), task_error=RuntimeError('mcp down')
         )
 
         row = await open_debt(
@@ -2718,7 +2725,7 @@ class TestOpenDebtRegressionHook:
         db_path = tmp_path / 'runs.db'
         await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
         client = _FakeTaskClient(
-            tasks={'task-901': _done_task('task-901', self.COMMIT)}, submit_returns='task-902'
+            tasks={'task-901': _done_task('task-901', self.COMMIT)}, submit_returns=_task('task-902')
         )
         seen: list = []
 
@@ -2765,9 +2772,9 @@ class TestOpenDebtRegressionHook:
         never = asyncio.Event()
 
         class _HangingFiling(_FakeTaskClient):
-            async def submit_task(self, arguments: dict) -> str:
+            async def submit_task(self, arguments: dict) -> SubmitOutcome:
                 await never.wait()
-                return 'unreachable'
+                return _task('unreachable')
 
         seen: list = []
         with pytest.raises(TimeoutError):
@@ -2790,7 +2797,7 @@ class TestOpenDebtRegressionHook:
 
         db_path = tmp_path / 'runs.db'
         await self._resolved(db_path)
-        client = _FakeTaskClient(submit_returns='task-902')
+        client = _FakeTaskClient(submit_returns=_task('task-902'))
 
         def _boom(_row) -> None:
             raise RuntimeError('escalation queue unavailable')
@@ -3025,7 +3032,7 @@ class TestResolveDebt:
         assert await _resolve_as_done(db_path, self.TEST_ID, commit='deadbee', now=self.LATER)
         await open_debt(
             db_path, 'dark_factory', self.TEST_ID,
-            task_client=_FakeTaskClient(submit_returns='task-902'), now=self.LATEST,
+            task_client=_FakeTaskClient(submit_returns=_task('task-902')), now=self.LATEST,
         )
         assert await _resolve_as_done(
             db_path, self.TEST_ID, commit='c0ffee', now=datetime(2026, 8, 6, 15, 0, tzinfo=UTC)
@@ -3368,7 +3375,7 @@ class TestDebtReEntry:
         assert await _resolve_as_done(db_path, self.TEST_ID, commit=commit, now=resolved_at)
         return await open_debt(
             db_path, 'dark_factory', self.TEST_ID,
-            task_client=_FakeTaskClient(submit_returns=next_owner), now=reopened_at,
+            task_client=_FakeTaskClient(submit_returns=_task(next_owner)), now=reopened_at,
         )
 
     async def test_second_cycle_updates_the_single_row(self, tmp_path: Path) -> None:
@@ -3544,7 +3551,7 @@ class TestReEntryDischargesTheOwner:
 
         db_path = tmp_path / 'runs.db'
         await self._own_and_resolve(db_path)
-        client = _FakeTaskClient(statuses={'task-901': 'done'}, submit_returns='task-902')
+        client = _FakeTaskClient(statuses={'task-901': 'done'}, submit_returns=_task('task-902'))
 
         row = await open_debt(
             db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.T2
@@ -3885,9 +3892,9 @@ class _PartialTaskClient:
     def __init__(self) -> None:
         self.submit_calls: list[dict] = []
 
-    async def submit_task(self, arguments: dict) -> str:
+    async def submit_task(self, arguments: dict) -> SubmitOutcome:
         self.submit_calls.append(arguments)
-        return 'task-partial'
+        return _task('task-partial')
 
 
 @pytest.mark.asyncio
@@ -3917,7 +3924,7 @@ class TestOpenDebtInvariantDegrades:
     async def _seed(self, db_path: Path, owner: str = 'task-901') -> None:
         from orchestrator.flake_ledger import open_debt
 
-        seeder = _FakeTaskClient(submit_returns=owner)
+        seeder = _FakeTaskClient(submit_returns=_task(owner))
         await open_debt(db_path, 'dark_factory', self.TEST_ID, task_client=seeder, now=self.NOW)
         assert _owner(db_path, self.TEST_ID) == owner
 
@@ -3975,21 +3982,22 @@ class TestOpenDebtInvariantDegrades:
         assert any('task-901' in r.getMessage() for r in caplog.records)
 
     @pytest.mark.parametrize(
-        'kwargs',
+        ('kwargs', 'named'),
         [
-            {'submit_raises': RuntimeError('submit blew up')},
-            {'submit_returns': ''},
-            {'submit_returns': None},
+            ({'submit_raises': RuntimeError('submit blew up')}, 'submit blew up'),
+            (
+                {'submit_returns': SubmitFailed('submit_task response names no task id')},
+                'submit_task response names no task id',
+            ),
         ],
-        ids=['raises', 'empty_id', 'none_id'],
+        ids=['raises', 'submit_failed'],
     )
     async def test_a_failed_filing_leaves_no_owner(
-        self, tmp_path: Path, caplog, kwargs: dict
+        self, tmp_path: Path, caplog, kwargs: dict, named: str
     ) -> None:
-        """A filing that did not produce a usable id must leave the column NULL — which
-        is exactly what ``flake_report`` renders as ``*** NO OWNER (invariant breach)
-        ***`` and counts in ``unowned_tests``.  Storing an empty string instead would
-        hide the breach behind a truthy-looking value."""
+        """A filing that did not produce a task must leave the column NULL — which is
+        exactly what ``flake_report`` renders as ``*** NO OWNER (invariant breach)
+        ***`` and counts in ``unowned_tests`` — and say why in its warning."""
         from orchestrator.flake_ledger import open_debt
 
         db_path = tmp_path / 'runs.db'
@@ -4005,7 +4013,12 @@ class TestOpenDebtInvariantDegrades:
         assert row is not None
         assert row.test_id == self.TEST_ID
         assert row.owner_task_id is None
-        _assert_logged_loudly(caplog)
+        assert any(
+            r.levelno == logging.WARNING
+            for r in caplog.records
+            if r.name == 'orchestrator.flake_ledger'
+        )
+        assert named in caplog.text
 
     async def test_a_failed_commit_still_stores_the_owner(self, tmp_path: Path, caplog) -> None:
         """ORDERING PICKS WHICH FAILURE IS SURVIVABLE.  The task really was created, so
@@ -4017,7 +4030,7 @@ class TestOpenDebtInvariantDegrades:
 
         db_path = tmp_path / 'runs.db'
         client = _FakeTaskClient(
-            submit_returns='task-905', commit_raises=RuntimeError('commit_planning failed')
+            submit_returns=_task('task-905'), commit_raises=RuntimeError('commit_planning failed')
         )
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
@@ -4039,7 +4052,7 @@ class TestOpenDebtInvariantDegrades:
 
         db_path = tmp_path / 'runs.db'
         broken = _FakeTaskClient(
-            submit_returns='task-905', commit_raises=RuntimeError('commit_planning failed')
+            submit_returns=_task('task-905'), commit_raises=RuntimeError('commit_planning failed')
         )
         await open_debt(db_path, 'dark_factory', self.TEST_ID, task_client=broken, now=self.NOW)
 
@@ -4121,30 +4134,20 @@ class TestOpenDebtInvariantDegrades:
         assert client.calls == []
         _assert_logged_loudly(caplog)
 
-    async def test_a_ticket_id_is_a_failed_filing_not_an_owner(
+    async def test_a_ticket_is_a_failed_filing_not_an_owner(
         self, tmp_path: Path, caplog
     ) -> None:
-        """A STRUCTURALLY WRONG id is a failed filing, not a filing with an odd name.
-
-        ``chronic_flake.extract_task_id`` falls back to ``submit_task``'s NON-planning
-        two-phase response key, ``{'ticket': 'tkt_<id>'}``.  If ``planning_mode`` is ever
-        dropped, rejected, or the server falls back to the ticket path, the adapter hands
-        back a TRUTHY ``tkt_…`` string.  The falsy-id guard does not catch it, so it would
-        be stored in ``owner_task_id`` — and a ticket id is not a task id, so the very next
-        suppression's ``get_statuses(['tkt_…'])`` legitimately OMITS it,
-        ``_owner_liveness`` reads that omission as a CORROBORATED ABSENCE, and a
-        replacement is filed.  Every suppression, forever, on a path the module docstring
-        notes has no rate limit: the unbounded orphan-task loop the falsy guard exists to
-        prevent, reached through a truthy value instead.
-
-        A ticket is therefore refused AT THE BOUNDARY and the column left NULL, which is
-        the honest rendering (``flake_report`` shows the breach) rather than a pointer to
-        an id no status read will ever resolve.
-        """
+        """A ``SubmittedTicket`` is a distinct outcome type, not a task: the two-phase
+        path accepted the submission and no task exists yet.  It arrives only if
+        ``planning_mode`` did not take effect, and the ledger stores nothing for it —
+        a ticket id stored as an owner would be OMITTED by every later
+        ``get_statuses``, read as a corroborated absence, and replaced on every
+        suppression.  The column stays NULL, which ``flake_report`` shows as the breach
+        it is."""
         from orchestrator.flake_ledger import open_debt
 
         db_path = tmp_path / 'runs.db'
-        client = _FakeTaskClient(submit_returns='tkt_abc123')
+        client = _FakeTaskClient(submit_returns=SubmittedTicket('tkt_abc123'))
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
             row = await open_debt(
@@ -4152,27 +4155,25 @@ class TestOpenDebtInvariantDegrades:
             )
 
         assert len(client.submit_calls) == 1, 'the filing itself is still attempted once'
-        assert client.commit_calls == [], 'a ticket is not a task id — nothing to release'
+        assert client.commit_calls == [], 'a ticket is not a task — nothing to release'
         assert _owner(db_path, self.TEST_ID) is None, 'a ticket must never become an owner'
         assert row is not None and row.owner_task_id is None
-        _assert_logged_loudly(caplog)
-        assert 'tkt_abc123' in caplog.text, 'the warning must name the id it refused'
+        assert 'tkt_abc123' in caplog.text, 'the warning must name the ticket it got'
 
-    async def test_a_ticket_id_does_not_refile_on_the_next_suppression(
+    async def test_a_ticket_retries_as_a_fresh_filing_on_the_next_suppression(
         self, tmp_path: Path
     ) -> None:
-        """The other end of the loop the guard closes.  With the ticket REFUSED the row is
-        unowned, so the next suppression takes the fresh-filing path and files exactly
-        once more — a retry, which is bounded by the filing eventually succeeding.  Had
-        the ticket been STORED, this pass would instead have been a corroborated-absence
-        REPLACEMENT, and every later pass another one."""
+        """With no owner stored for the ticket, the next suppression takes the
+        fresh-filing path and files exactly once more — a retry, bounded by the filing
+        eventually returning a task — rather than corroborating a pointer no status
+        read could ever resolve."""
         from orchestrator.flake_ledger import open_debt
 
         db_path = tmp_path / 'runs.db'
-        ticketed = _FakeTaskClient(submit_returns='tkt_abc123')
+        ticketed = _FakeTaskClient(submit_returns=SubmittedTicket('tkt_abc123'))
         await open_debt(db_path, 'dark_factory', self.TEST_ID, task_client=ticketed, now=self.NOW)
 
-        recovered = _FakeTaskClient(submit_returns='task-907')
+        recovered = _FakeTaskClient(submit_returns=_task('task-907'))
         await open_debt(
             db_path, 'dark_factory', self.TEST_ID, task_client=recovered, now=self.LATER
         )
@@ -4181,6 +4182,53 @@ class TestOpenDebtInvariantDegrades:
             'an unowned row is a FRESH filing — it must not consult get_statuses'
         )
         assert _owner(db_path, self.TEST_ID) == 'task-907'
+
+    @pytest.mark.parametrize('status', ['done', 'cancelled', None])
+    async def test_a_filing_combined_into_a_closed_or_unknown_task_is_swallowed(
+        self, tmp_path: Path, caplog, status: str | None
+    ) -> None:
+        """The server folded the filing into an existing task that cannot own the debt:
+        a terminal one, or one whose status it did not name.  Nothing open is
+        responsible for the test, so the row stays unowned and the warning names the
+        task that swallowed the filing and its status."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        client = _FakeTaskClient(submit_returns=_task('task-555', status, combined=True))
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            row = await open_debt(
+                db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.NOW
+            )
+
+        assert client.commit_calls == []
+        assert _owner(db_path, self.TEST_ID) is None
+        assert row is not None and row.owner_task_id is None
+        assert 'task-555' in caplog.text
+        assert repr(status) in caplog.text
+
+    @pytest.mark.parametrize(
+        ('status', 'commits'),
+        [('pending', []), ('in-progress', []), ('deferred', [['task-555']])],
+    )
+    async def test_a_filing_combined_into_a_live_task_makes_it_the_owner(
+        self, tmp_path: Path, status: str, commits: list
+    ) -> None:
+        """A live task the filing was folded into owns the debt.  It is released from
+        ``deferred`` only if it is still there: committing an open task would run
+        ``set_task_status`` gates on a row that is not deferred."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        client = _FakeTaskClient(submit_returns=_task('task-555', status, combined=True))
+
+        row = await open_debt(
+            db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.NOW
+        )
+
+        assert _owner(db_path, self.TEST_ID) == 'task-555'
+        assert row is not None and row.owner_task_id == 'task-555'
+        assert client.commit_calls == commits
 
     async def test_a_lost_pointer_write_leaves_the_row_unowned_and_names_the_orphan(
         self, tmp_path: Path, caplog, monkeypatch
@@ -4197,7 +4245,7 @@ class TestOpenDebtInvariantDegrades:
         from orchestrator.flake_ledger import open_debt
 
         db_path = tmp_path / 'runs.db'
-        client = _FakeTaskClient(submit_returns='task-909')
+        client = _FakeTaskClient(submit_returns=_task('task-909'))
 
         def _boom(*_args, **_kwargs):
             raise sqlite3.OperationalError('database is locked')
@@ -4301,7 +4349,7 @@ class _InterleavingTaskClient(_FakeTaskClient):
         self._test_id = test_id
         self._rival_owner = rival_owner
 
-    async def submit_task(self, arguments: dict) -> str:
+    async def submit_task(self, arguments: dict) -> SubmitOutcome:
         conn = sqlite3.connect(str(self._db_path))
         try:
             conn.execute(
@@ -4349,7 +4397,7 @@ class TestOpenDebtOwnerClaimIsConditional:
             db_path=db_path,
             test_id=self.TEST_ID,
             rival_owner='task-winner',
-            submit_returns='task-loser',
+            submit_returns=_task('task-loser'),
         )
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
@@ -4380,7 +4428,7 @@ class TestOpenDebtOwnerClaimIsConditional:
         from orchestrator.flake_ledger import open_debt
 
         db_path = tmp_path / 'runs.db'
-        seeder = _FakeTaskClient(submit_returns='task-stale')
+        seeder = _FakeTaskClient(submit_returns=_task('task-stale'))
         await open_debt(db_path, 'dark_factory', self.TEST_ID, task_client=seeder, now=self.NOW)
         assert _owner(db_path, self.TEST_ID) == 'task-stale'
 
@@ -4388,7 +4436,7 @@ class TestOpenDebtOwnerClaimIsConditional:
             db_path=db_path,
             test_id=self.TEST_ID,
             rival_owner='task-winner',
-            submit_returns='task-loser',
+            submit_returns=_task('task-loser'),
             statuses={'task-stale': 'cancelled'},
         )
         with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
@@ -4415,7 +4463,7 @@ class TestOpenDebtOwnerClaimIsConditional:
             db_path=db_path,
             test_id=self.TEST_ID,
             rival_owner='task-winner',
-            submit_returns='task-loser',
+            submit_returns=_task('task-loser'),
         )
         await open_debt(db_path, 'dark_factory', self.TEST_ID, task_client=loser, now=self.NOW)
 
@@ -4442,7 +4490,7 @@ class TestOpenDebtOwnerClaimIsConditional:
         db_path = tmp_path / 'runs.db'
 
         class _DeletingClient(_FakeTaskClient):
-            async def submit_task(self, arguments: dict) -> str:
+            async def submit_task(self, arguments: dict) -> SubmitOutcome:
                 conn = sqlite3.connect(str(db_path))
                 try:
                     conn.execute('DELETE FROM flake_debt')
@@ -4451,7 +4499,7 @@ class TestOpenDebtOwnerClaimIsConditional:
                     conn.close()
                 return await super().submit_task(arguments)
 
-        client = _DeletingClient(submit_returns='task-909')
+        client = _DeletingClient(submit_returns=_task('task-909'))
         with caplog.at_level(logging.INFO, logger='orchestrator.flake_ledger'):
             row = await open_debt(
                 db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.NOW
@@ -4487,14 +4535,14 @@ class TestOpenDebtOwnerClaimIsConditional:
             mp.setattr(fl, '_write_owner_task_id', _recording)
             await open_debt(
                 db_path, 'dark_factory', self.TEST_ID,
-                task_client=_FakeTaskClient(submit_returns='task-901'), now=self.NOW,
+                task_client=_FakeTaskClient(submit_returns=_task('task-901')), now=self.NOW,
             )
             await open_debt(
                 db_path, 'dark_factory', self.TEST_ID,
                 task_client=_FakeTaskClient(
                     # `cancelled`: the terminal state that still takes the REPLACEMENT
                     # path; a `done` owner is resolved and discharged first (task η).
-                    submit_returns='task-902', statuses={'task-901': 'cancelled'},
+                    submit_returns=_task('task-902'), statuses={'task-901': 'cancelled'},
                 ),
                 now=self.LATER,
             )
@@ -4505,14 +4553,16 @@ class TestOpenDebtOwnerClaimIsConditional:
         assert _owner(db_path, self.TEST_ID) == 'task-902'
 
 
-class _RoutingStubScheduler:
-    """A ``dispatch_tool``-only scheduler double that answers PER TOOL NAME, so one
-    instance can serve a whole ``open_debt`` pass (``get_statuses`` then, if the read
-    corroborated a closure, ``submit_task`` and ``commit_planning``).
+class _RoutingMcpSession:
+    """An MCP session double that answers PER TOOL NAME, so one instance can serve a
+    whole ``open_debt`` pass (``get_statuses`` then, if the read corroborated a
+    closure, ``submit_task`` and ``commit_planning``).
 
-    Duck-typed, exactly like ``test_chronic_flake._StubScheduler``: the real adapter
-    depends on ``dispatch_tool`` alone.  ``raises`` applies to EVERY tool, standing for
-    an MCP that is down rather than one endpoint that is broken.
+    It sits UNDER a real ``Scheduler`` (the ``call_tool`` seam ``Scheduler.dispatch_tool``
+    routes an injected session through), so the adapter's reads and
+    ``scheduler.py::Scheduler.submit_task``'s parse both run as in production.
+    ``raises`` applies to EVERY tool, standing for an MCP that is down rather than one
+    endpoint that is broken.
 
     ``calls`` records ``(name, arguments)`` for every dispatch, which is what lets a
     test assert NO ``submit_task`` ever reached the wire — the strongest available
@@ -4545,7 +4595,7 @@ class _RoutingStubScheduler:
         self.raw = raw
         self.calls: list[tuple[str, dict]] = []
 
-    async def dispatch_tool(self, name, arguments, *, timeout=15):
+    async def call_tool(self, name: str, arguments: dict, timeout: float = 30) -> Any:
         self.calls.append((name, arguments))
         if self.raises is not None:
             raise self.raises
@@ -4567,7 +4617,7 @@ class TestOpenDebtOverTheRealAdapter:
     ``chronic_flake.SchedulerChronicFlakeTaskClient``.  ASYNC-ONLY CLASS.
 
     Every other test here drives ``open_debt`` through :class:`_FakeTaskClient`, and
-    every adapter test drives the adapter through a stub scheduler.  Both sides passed
+    most adapter tests drive the adapter through a stub scheduler.  Both sides passed
     while the composition was broken: the adapter swallowed a failed ``get_statuses``
     into ``{}``, and the ledger read ``{}`` as a corroborated absence and filed a
     replacement de-flake task for a test whose owner was alive and unread.  Neither
@@ -4591,16 +4641,19 @@ class TestOpenDebtOverTheRealAdapter:
         None,
     ]
 
-    def _client(self, scheduler):
+    def _client(self, session: _RoutingMcpSession):
         from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.scheduler import Scheduler
 
+        scheduler = Scheduler(OrchestratorConfig(project_root=Path('/proj')), mcp_session=session)
         return SchedulerChronicFlakeTaskClient(scheduler, '/proj')
 
     async def _seed(self, db_path: Path, owner: str = 'task-901') -> None:
         """First suppression, filed through the REAL adapter over a healthy scheduler."""
         from orchestrator.flake_ledger import open_debt
 
-        scheduler = _RoutingStubScheduler(
+        scheduler = _RoutingMcpSession(
             {'submit_task': {'task_id': owner}, 'commit_planning': {'success': True}}
         )
         await open_debt(
@@ -4619,7 +4672,7 @@ class TestOpenDebtOverTheRealAdapter:
 
         db_path = tmp_path / 'runs.db'
         await self._seed(db_path)
-        scheduler = _RoutingStubScheduler({}, raises=RuntimeError('mcp down'))
+        scheduler = _RoutingMcpSession({}, raises=RuntimeError('mcp down'))
 
         row = await open_debt(
             db_path,
@@ -4645,7 +4698,7 @@ class TestOpenDebtOverTheRealAdapter:
 
         db_path = tmp_path / 'runs.db'
         await self._seed(db_path)
-        scheduler = _RoutingStubScheduler({'get_statuses': envelope}, raw=True)
+        scheduler = _RoutingMcpSession({'get_statuses': envelope}, raw=True)
 
         await open_debt(
             db_path,
@@ -4670,7 +4723,7 @@ class TestOpenDebtOverTheRealAdapter:
 
         db_path = tmp_path / 'runs.db'
         await self._seed(db_path)
-        scheduler = _RoutingStubScheduler(
+        scheduler = _RoutingMcpSession(
             {
                 'get_statuses': {'statuses': {}},
                 'submit_task': {'task_id': 'task-902'},
@@ -4701,7 +4754,7 @@ class TestOpenDebtOverTheRealAdapter:
 
         db_path = tmp_path / 'runs.db'
         await self._seed(db_path)
-        scheduler = _RoutingStubScheduler({}, raises=RuntimeError('mcp down'))
+        scheduler = _RoutingMcpSession({}, raises=RuntimeError('mcp down'))
 
         for hour in range(10):
             await open_debt(
@@ -4729,7 +4782,7 @@ class TestOpenDebtOverTheRealAdapter:
         db_path = tmp_path / 'runs.db'
         await self._seed(db_path)
         commit = 'c0ffee' + '0' * 34
-        scheduler = _RoutingStubScheduler(
+        scheduler = _RoutingMcpSession(
             {
                 'get_task': _done_task('task-901', commit),
                 'submit_task': {'task_id': 'task-902'},
@@ -4761,7 +4814,7 @@ class TestOpenDebtOverTheRealAdapter:
 
         db_path = tmp_path / 'runs.db'
         await self._seed(db_path)
-        scheduler = _RoutingStubScheduler(
+        scheduler = _RoutingMcpSession(
             {
                 'get_task': {'error': 'backend down', 'error_type': 'BackendUnavailable'},
                 'get_statuses': {'statuses': {'task-901': 'done'}},
@@ -4790,7 +4843,7 @@ class TestOpenDebtOverTheRealAdapter:
         unowned row).  One WARNING each, so a further layer joining in shows here."""
         from orchestrator.flake_ledger import open_debt
 
-        scheduler = _RoutingStubScheduler(
+        scheduler = _RoutingMcpSession(
             {'submit_task': {'error': 'backlog full', 'error_type': 'BacklogFullError'}}
         )
 
@@ -4821,7 +4874,7 @@ class TestOpenDebtOverTheRealAdapter:
         db_path = tmp_path / 'runs.db'
         await self._seed(db_path)
         refusal = {'error': 'taskmaster unavailable', 'error_type': 'TaskmasterError'}
-        scheduler = _RoutingStubScheduler({'get_task': refusal, 'get_statuses': refusal})
+        scheduler = _RoutingMcpSession({'get_task': refusal, 'get_statuses': refusal})
         caplog.clear()
 
         with caplog.at_level(logging.WARNING):
@@ -5008,7 +5061,7 @@ class TestOneConnectionPerCall:
         from orchestrator.flake_ledger import open_debt
 
         db_path = tmp_path / 'runs.db'
-        client = _FakeTaskClient(submit_returns='task-901')
+        client = _FakeTaskClient(submit_returns=_task('task-901'))
         opened = _count_connections(monkeypatch)
         row = await open_debt(
             db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.NOW
