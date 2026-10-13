@@ -1569,14 +1569,16 @@ def test_adopted_session_still_resolves_the_spawn_window_marker(
 # ---------------------------------------------------------------------------
 
 
-def test_parent_pid_of_resolves_this_process_parent() -> None:
-    assert sh._parent_pid_of(os.getpid()) == os.getppid()
+def test_default_process_tree_reads_this_process_parent() -> None:
+    tree = sh.ProcessTree()
+    assert tree.hook_parent_pid() == os.getppid()
+    assert tree.parent_pid_of(os.getpid()) == os.getppid()
 
 
-def test_parent_pid_of_returns_none_for_an_unresolvable_pid() -> None:
+def test_default_process_tree_answers_none_for_an_unresolvable_parent() -> None:
     # Never raises: an absent /proc entry (or no /proc at all) is a plain
     # "cannot tell", which every caller treats as a best-effort miss.
-    assert sh._parent_pid_of(-1) is None
+    assert sh.ProcessTree().parent_pid_of(-1) is None
 
 
 def _install_fake_tree(
@@ -1699,13 +1701,13 @@ def test_nested_claude_liveness_pid_falls_back_to_the_durable_pid(
     assert sh._nested_claude_liveness_pid() == sh._hand_launched_liveness_pid()
 
 
-def test_process_comm_returns_none_for_an_unresolvable_pid() -> None:
-    # Never raises -- the same best-effort contract as _parent_pid_of.
-    assert sh._process_comm(-1) is None
+def test_default_process_tree_answers_none_for_an_unresolvable_name() -> None:
+    # Never raises -- the same best-effort contract as its parent read.
+    assert sh.ProcessTree().comm_of(-1) is None
 
 
-def test_process_comm_reads_this_process_name() -> None:
-    assert sh._process_comm(os.getpid()) is not None
+def test_default_process_tree_reads_this_process_name() -> None:
+    assert sh.ProcessTree().comm_of(os.getpid()) is not None
 
 
 def test_forked_inheritor_record_gets_a_pid_that_dies_with_it(
