@@ -5,22 +5,20 @@ Hermetic: the census filter runs against a synthetic sqlite db built inline
 ladder runs against temp git repos built per-test. No live data / no network.
 
 ``scripts/`` is not an importable package, so the driver is loaded by path via
-``importlib.util.spec_from_file_location`` off the module-local ``REPO_ROOT``.
+``_mint_driver_loader.load_mint_driver``.
 """
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import sqlite3
 import subprocess
-import sys
 from collections.abc import Mapping
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 
 import pytest
+from _mint_driver_loader import load_mint_driver
 from shared.project_layout import runs_db, tasks_db
 
 # Matches the parents[2] convention used by conftest.py and the sibling
@@ -30,33 +28,7 @@ from shared.project_layout import runs_db, tasks_db
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _load_driver() -> ModuleType:
-    """Import ``scripts/mint_hard_v2_fixtures.py`` by path (not a package).
-
-    The driver binds this checkout with ``import _checkout``, a sibling it
-    resolves by bare name, so ``scripts/`` is on sys.path while it executes.
-    Both that entry and the binder's own sys.path edits are undone afterwards,
-    so the load changes import resolution for no other test in this process.
-    """
-    scripts = REPO_ROOT / 'scripts'
-    path = scripts / 'mint_hard_v2_fixtures.py'
-    spec = importlib.util.spec_from_file_location('mint_hard_v2_fixtures', path)
-    assert spec is not None and spec.loader is not None, f'no import spec for {path}'
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    saved_path = list(sys.path)
-    binder_was_loaded = '_checkout' in sys.modules
-    sys.path.insert(0, str(scripts))
-    try:
-        spec.loader.exec_module(module)
-    finally:
-        sys.path[:] = saved_path
-        if not binder_was_loaded:
-            sys.modules.pop('_checkout', None)
-    return module
-
-
-driver = _load_driver()
+driver = load_mint_driver()
 
 
 def _git(args: list[str], cwd: Path) -> str:
@@ -1493,7 +1465,7 @@ class TestCeilingsEvidenceGuard:
 # ---------------------------------------------------------------------------
 
 class TestEnrichFromTaskDb:
-    # `Any`, not `object`: the driver is loaded by path (see _load_driver), so
+    # `Any`, not `object`: the driver is loaded by path (see load_mint_driver), so
     # `driver.Candidate` is only ever `Any` to a type checker. Narrowing the
     # return to `object` throws that away and makes every field read below a
     # reportAttributeAccessIssue.

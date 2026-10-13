@@ -76,11 +76,8 @@ Dry run is the DEFAULT; ``--apply`` is required to write anything::
     uv run --project shared python scripts/sweep_toolcall_markup.py
     uv run --project shared python scripts/sweep_toolcall_markup.py --apply
 
-The ``uv run --project shared`` prefix is not optional. ``shared/__init__.py``
-imports the whole package eagerly, so ``import shared.toolcall_markup`` drags
-in shared's third-party dependencies even though ``toolcall_markup`` is itself
-pure and stdlib-only — a dependency-free system python cannot run this script.
-The same cost is recorded at ``scripts/scan_task_toolcall_leaks.py:102-112``.
+``_checkout`` binds this checkout's ``shared``, and ``shared`` serves its
+names lazily, so a plain ``python3`` runs this script too.
 
 ## AUTHORING HAZARD — this file spells NO envelope literal, ever
 
