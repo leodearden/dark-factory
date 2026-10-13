@@ -109,6 +109,7 @@ def _make_single_req(
         config=config,
         result=future,
         lane=lane,
+        awaited_by_workflow=True,
     )
 
 
@@ -318,6 +319,7 @@ def _make_req(
         config=config,
         result=future,
         lane='normal',
+        awaited_by_workflow=True,
     )
 
 

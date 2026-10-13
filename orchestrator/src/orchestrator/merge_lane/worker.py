@@ -63,6 +63,7 @@ from orchestrator.git_ops import (
 )
 from orchestrator.guard_state import PersistentSet, guard_path
 from orchestrator.log_coalesce import ExponentialLogCoalescer
+from orchestrator.merge_lane.coalesce_unwind import restore_pre_stack_tips
 from orchestrator.merge_lane.disposition import (
     MergeFailureDisposition,
     SkewEvidence,
@@ -5485,6 +5486,10 @@ _COALESCE_TRAIN_ID_PREFIX = 'coalesce-'
 # predicate — a waiting single whose branch's most-recent merge_finalized
 # event has one of these states is excluded from train formation.
 _COALESCE_RISKY_TERMINAL_STATES: frozenset[str] = frozenset({'blocked', 'error'})
+
+# Exclusion reason for a waiting single no TaskWorkflow awaits (task 4953):
+# nothing would park it merge-deferred, so a train holding it could never land.
+COALESCE_EXCLUDED_NO_AWAITING_WORKFLOW = 'no_awaiting_workflow'
 
 # How long a one-strike derail marker is remembered (task 5352).  An upper
 # bound on the subject, not a tuning dial: seven days is a generous outer
@@ -15223,6 +15228,26 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             len(member_task_ids), member_task_ids,
         )
 
+    async def _unwind_coalesce_train(self, train: GroupMergeRequest, main_sha: str) -> None:
+        """Hand back every member of a coalesce train that did not land (task 4953).
+
+        Each stacked member first goes back on its pre-stack tip
+        (``orchestrator/src/orchestrator/merge_lane/coalesce_unwind.py::restore_pre_stack_tips``);
+        then the 1867 re-drive sends each still-deferred member to a solo
+        merge.  In that order because the re-drive flips members to pending
+        and the scheduler may re-dispatch them at once.  The one policy for
+        every exit of a coalesce train that does not land: derail, incomplete
+        train and admission-halt dissolution.  Never raises.
+        """
+        await restore_pre_stack_tips(self._git_ops, train)
+        try:
+            await self._redrive_coalesce_members(train, main_sha)
+        except Exception:
+            logger.exception(
+                'Coalesce train %s: _redrive_coalesce_members raised unexpectedly '
+                '— members may remain stranded', train.train_id,
+            )
+
     async def _redrive_coalesce_members(
         self, req: GroupMergeRequest, main_sha: str,
     ) -> None:
@@ -15252,7 +15277,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             merge-deferred→done transition.  The member is first un-stacked
             from any unlanded base (:meth:`_unstack_redriven_member`, task
             5618), so neither the re-dispatched agent nor its reviewer sees
-            another task's commits.
+            another task's commits.  A member :meth:`_unwind_coalesce_train`
+            already put back on its pre-stack tip has no stack record left, so
+            the un-stack leaves it there.
 
         Members not in 'merge-deferred' (e.g. raced to 'in-progress' by a sibling)
         are left alone — the live workflow owns their done-transition.
@@ -15431,12 +15458,38 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             agent_role='orchestrator-merge-worker',
         )
 
+    def _coalesce_exclusion_reason(self, candidate: MergeRequest) -> str | None:
+        """Why the coalescing pass must leave *candidate* solo, or None.
+
+        The capability precondition comes first and outside the injectable
+        merge-ready predicate, so no injected predicate can readmit a single
+        that no workflow would park merge-deferred.
+        """
+        if not candidate.awaited_by_workflow:
+            return COALESCE_EXCLUDED_NO_AWAITING_WORKFLOW
+        predicate = self._merge_ready_predicate or self._default_coalesce_exclusion_reason
+        try:
+            return predicate(candidate)
+        except Exception:  # noqa: BLE001
+            # An injected predicate raised — degrade gracefully: log the
+            # error and treat the candidate as eligible so a buggy closure
+            # does not kill the merger loop.  The default predicate is
+            # fire-safe (latest_merge_finalized swallows its own errors).
+            logger.exception(
+                'Coalesce predicate raised for request_id=%s task_id=%s '
+                'branch=%s; treating as eligible (safe-degrade)',
+                candidate.request_id, candidate.task_id, candidate.branch.bare_id,
+            )
+            return None
+
     def _default_coalesce_exclusion_reason(self, req: MergeRequest) -> str | None:
-        """Built-in merge-ready predicate (δ/1720 confidence gate).
+        """Built-in merge-ready predicate (δ/1720 confidence gate): the RISK signals.
 
         Returns an exclusion REASON string (truthy → exclude from coalescing) or
-        None (eligible).  Signals implemented here use only worker-reachable
-        substrate (no scheduler import):
+        None (eligible).  The capability precondition — a workflow awaits the
+        request — is checked before this, outside the injectable seam
+        (:meth:`_coalesce_exclusion_reason`).  Signals implemented here use only
+        worker-reachable substrate (no scheduler import):
 
           1. One-strike registry (cheapest — check first):
              If req.task_id is in self._coalesce_derailed_task_ids (a prior
@@ -15512,23 +15565,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         the journal, so a restart that drops an unstarted coalesce train
         strands every member merge-deferred (task 4737 owns that in general).
         Under an admission halt such a train can never start before the
-        restart, so it is dissolved first through the 1867 derail-recovery
-        re-drive: each still-deferred member goes done when already on main
-        and back to pending otherwise. Not a derail: no one-strike mark and
-        no derail event.
+        restart, so it is dissolved first through
+        :meth:`_unwind_coalesce_train`: each member goes back on its
+        pre-stack tip, then each still-deferred member goes done when already
+        on main and back to pending otherwise. Not a derail: no one-strike
+        mark and no derail event.
         """
         logger.warning(
             'Coalesce train %s: admission halted before its verify started; '
             'dissolving it and re-driving members %s to solo merges',
             train.train_id, train.member_task_ids,
         )
-        try:
-            await self._redrive_coalesce_members(train, main_sha)
-        except Exception:
-            logger.exception(
-                'Coalesce train %s: _redrive_coalesce_members raised unexpectedly '
-                '— members may remain stranded', train.train_id,
-            )
+        await self._unwind_coalesce_train(train, main_sha)
         if not train.result.done():
             train.result.set_result(MergeOutcome('superseded', reason=_COALESCE_DISSOLVED_REASON))
         self._retire_item(train.request_id)
@@ -15696,29 +15744,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._last_coalesce_signature = sig
 
         # ── δ/1720: merge-ready exclusion filter ──────────────────────────────
-        # Split structural candidates into eligible + exclusions.  The predicate
-        # returns a REASON string (truthy → exclude) or None (eligible).
-        # Run AFTER recording the debounce signature (keyed on the structural
-        # waiting set) so risk signals — which are monotonic within a process —
-        # only re-evaluate when the structural set changes, avoiding per-tick
-        # event-store reads.
-        predicate = self._merge_ready_predicate or self._default_coalesce_exclusion_reason
+        # Split structural candidates into eligible + exclusions.  Each REASON
+        # string (truthy → exclude) or None (eligible) comes from
+        # _coalesce_exclusion_reason.  Run AFTER recording the debounce
+        # signature (keyed on the structural waiting set) so risk signals —
+        # which are monotonic within a process — only re-evaluate when the
+        # structural set changes, avoiding per-tick event-store reads.
         eligible: list[MergeRequest] = []
         exclusions: list[dict[str, str]] = []
         for _c in candidates:
-            try:
-                _reason = predicate(_c)
-            except Exception:  # noqa: BLE001
-                # An injected predicate raised — degrade gracefully: log the
-                # error and treat the candidate as eligible so a buggy closure
-                # does not kill the merger loop.  The default predicate is
-                # fire-safe (latest_merge_finalized swallows its own errors).
-                logger.exception(
-                    'Coalesce predicate raised for request_id=%s task_id=%s '
-                    'branch=%s; treating as eligible (safe-degrade)',
-                    _c.request_id, _c.task_id, _c.branch.bare_id,
-                )
-                _reason = None
+            _reason = self._coalesce_exclusion_reason(_c)
             if _reason:
                 exclusions.append({'request_id': _c.request_id, 'reason': _reason})
                 logger.info(
@@ -15834,6 +15869,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             status_check=callbacks.status_check,
             mark_member_done=callbacks.mark_member_done,
             redrive_member=callbacks.redrive_member,
+            member_pre_stack_tips=stack_result.pre_stack_tips,
         )
         # MQ-reliability kappa (task 2169): group_req is a brand-new
         # request_id (GroupMergeRequest.request_id auto-generated at
@@ -15854,9 +15890,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         new_buffer.append(group_req)
         self._lane_buffers['normal'] = new_buffer
 
-        # RESOLVE absorbed futures: park each absorbed workflow as merge-deferred.
-        # The existing workflow._handle_superseded consumer (α/1717) transitions
-        # the task; mark_member_done flips it done after the train lands.
+        # RESOLVE absorbed futures: every absorbed single is workflow-awaited by
+        # construction (_coalesce_exclusion_reason), so its workflow's
+        # _handle_superseded consumer (α/1717) parks the task merge-deferred;
+        # mark_member_done flips it done after the train lands.
         # Detached/cancelled requests were filtered from candidates in step 1, so
         # no set_result is ever called on a cancelled future here.
         for s_req in survivor_reqs:
@@ -16127,7 +16164,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             if outcome.status in _COALESCE_RISKY_TERMINAL_STATES:
                                 self._mark_coalesce_derailed(req.member_task_ids)
                             # 1867: durable re-drive — re-drive any absorbed members
-                            # that are still merge-deferred to solo merge.  Gated on
+                            # that are still merge-deferred to solo merge, after
+                            # handing each back on its pre-stack tip (task 4953,
+                            # _unwind_coalesce_train).  Gated on
                             # outcome != 'done' (success path owns all member flips).
                             # Broader than _COALESCE_RISKY_TERMINAL_STATES: the
                             # per-member is_ancestor guard makes all non-done outcomes
@@ -16154,14 +16193,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             # TRAIN_PARTIAL_FLIP.  Covering the done-path gap is a
                             # follow-up task.
                             if outcome.status != 'done':
-                                try:
-                                    await self._redrive_coalesce_members(req, actual_main)
-                                except Exception:
-                                    logger.exception(
-                                        'Coalesce train %s: _redrive_coalesce_members '
-                                        'raised unexpectedly — members may remain stranded',
-                                        req.train_id,
-                                    )
+                                await self._unwind_coalesce_train(req, actual_main)
                         _train_decided_item = DecidedItem(
                             request=req,
                             base_sha=actual_main, speculative=False,

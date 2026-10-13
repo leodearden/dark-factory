@@ -11392,6 +11392,7 @@ class TaskWorkflow:
             result=future,
             lane=lane_for_task_metadata(self.task.get('metadata')),
             merge_first_enqueued_at=first_enqueued_at,
+            awaited_by_workflow=True,
         )
 
         attached = False

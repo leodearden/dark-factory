@@ -7,7 +7,9 @@ predecessor's commits below its own, and every later consumer would treat
 ``main..branch`` as the member's own work.  This module keeps the one fact
 that makes those commits separable again — the base the branch was stacked
 onto, recorded at the moment of stacking — and computes the cut between the
-foreign prefix and the branch's own delta.
+foreign prefix and the branch's own delta.  It also names the tip each
+member had immediately before stacking (task 4953), so a train that does not
+land can hand every member back on it.
 
 The record is one git ref per stacked branch under
 :data:`STACK_BASE_REF_NAMESPACE`.  A ref is atomic, survives restarts, is
@@ -269,6 +271,44 @@ class UnstackResult:
                 f'{self.branch} {self.main_branch}'
             )
         return f'Remedy: git rebase --onto {self.main_branch} {self.cut} {self.branch}'
+
+
+@dataclass(frozen=True)
+class PreStackTip:
+    """A train member's restore point: the tip it had immediately before a
+    train stacked it (``sha``) and the tip stacking gave it (``stacked_sha``),
+    which tells the train's own commits from any added since."""
+
+    member_id: str
+    sha: str
+    stacked_sha: str
+
+
+class TipRestoreOutcome(StrEnum):
+    RESTORED = 'restored'
+    UNCHANGED = 'unchanged'
+    MISSING = 'missing'
+    LANDED = 'landed'
+    DIRTY = 'dirty'
+    MOVED = 'moved'
+    RESET_FAILED = 'reset_failed'
+
+
+@dataclass(frozen=True)
+class TipRestore:
+    """Verdict of putting *branch* back on its pre-stack tip.
+
+    ``found_sha`` is the tip the branch had when the restore looked (None
+    when the branch is gone); ``worktree`` is the checkout holding it, if any;
+    ``detail`` says why a refused restore moved nothing.
+    """
+
+    outcome: TipRestoreOutcome
+    branch: str
+    pre_stack_sha: str
+    found_sha: str | None
+    worktree: Path | None = None
+    detail: str = ''
 
 
 class OwnDeltaRebase(NamedTuple):
