@@ -1535,6 +1535,7 @@ class EscalationQueue:
         *, resolved_by: str | None = None, resolution_turns: int | None = None,
         resolution_class: str | None = None,
         granted_files: list[str] | None = None,
+        resolution_action: str | None = None,
         outcome: ResolveOutcome | None = None,
     ) -> Escalation | None:
         """Update an escalation's status to resolved or dismissed.
@@ -1545,6 +1546,14 @@ class EscalationQueue:
         stays free-text human-readable rationale. Not propagated through the
         member cascade below: grants are L0 ``scope_violation`` escalations,
         which carry empty ``members`` lists.
+
+        ``resolution_action`` (task 6617): stamped onto the record when not
+        ``None``, inside the locked critical section, so it lands atomically
+        with the status flip — in the archived JSON and on the
+        ``_resolve_callback`` argument.  Never written on the already-terminal
+        path, and not propagated through the member cascade.  Legality is the
+        caller's job: ``escalation/action_effects.py::effect_for`` is the
+        authority ``escalation/server.py::resolve_issue`` consults first.
 
         ``resolution_class`` (plans/escalation-lifecycle-dashboard-prd.md Seam 1):
         an optional explicit ``'benign' | 'actionable'`` classification stamp,
@@ -1692,6 +1701,8 @@ class EscalationQueue:
             esc.resolution_class = stamped_class
             if granted_files is not None:
                 esc.granted_files = granted_files
+            if resolution_action is not None:
+                esc.resolution_action = resolution_action
 
             self._atomic_write(escalation_id, esc.to_json())
             self._archive_resolved(escalation_id, esc.resolved_at)
