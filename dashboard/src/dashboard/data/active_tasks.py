@@ -962,11 +962,16 @@ async def collect_tasks_with_counts(
     to ``active_rows``. So ``active_rows`` IS the concatenation, in canonical
     root order, of every unit's ``rows.value``, by construction rather than
     by a rule a caller must remember. The external-dep tail's in-place status
-    overwrite therefore shows through both. ``dataclasses.replace`` on the
-    frozen records gives the wire its own unit and leaves the cached one's
-    raw rows for the next render to shape; ``TaskSnapshot.rows`` records why
-    the two cannot be one list. A unit whose rows were never measured keeps
-    ``value is None``, because ``[]`` would claim a measured zero.
+    overwrite therefore shows through both. The units are what ``/tasks``
+    serves: ``dashboard/src/dashboard/api/tasks.py::api_tasks`` reads only the
+    snapshots, as ``TASKS_SNAPSHOT[p].rows``, and discards ``active_rows``,
+    whose only remaining consumer is
+    ``dashboard/src/dashboard/data/scheduler.py::collect_scheduler_state``.
+    ``dataclasses.replace`` on the frozen records gives the wire its own unit
+    and leaves the cached one's raw rows for the next render to shape;
+    ``TaskSnapshot.rows`` records why the two cannot be one list. A unit whose
+    rows were never measured keeps ``value is None``, because ``[]`` would
+    claim a measured zero.
 
     **Bounded as a whole, not merely per call.**  A ``loop.time()`` deadline
     (``_TASKS_TOTAL_BUDGET``) is taken up front and each project is run under
