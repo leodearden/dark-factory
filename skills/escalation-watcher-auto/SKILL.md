@@ -459,12 +459,98 @@ The `<min(3600, remaining)>` clamp sizes the final wait exactly to the remaining
 
 ## Per-Category Routing Table
 
+### Convert to tracked work (file-and-resolve)
+
+An escalation is not durable storage: `escalation/src/escalation/archive.py::prune_archive` hard-deletes archived records after `DEFAULT_RETENTION_DAYS` (30), so a finding closed with a bare `resolve_issue` is gone within a month. When a record carries work but its subject task needs nothing from you now, file the work as a task and close the record citing that task's id.
+
+**Applies to** a pending L1 in `work_batch` that meets BOTH:
+- (a) no immediate state change is needed on its subject task — the task is terminal, or is not waiting on this record;
+- (b) it carries durable, work-shaped content — a concrete file path or symbol, a measured observation, a residual work item, a post-merge check.
+
+Typical sources: `harness-orphan-reaper` L0→L1 promotions of completion-time notes (`orchestrator/src/orchestrator/harness.py::Harness._reap_orphan_l0_escalations`), and carry-overs recorded only in the escalation.
+
+**Does NOT apply — [promote](#promote-to-l2) instead:**
+- **Judgement-shaped content.** `design_concern` / `risk_identified` / `missing_premise` content you cannot resolve at L1 needs a human ruling. Never file a task that amounts to "have an agent resolve this design concern" (operator ruling 2026-08-12). Unsure whether it is work or judgement → promote.
+- **Curator-origin records** — `agent_role` is `fused-memory/task-curator` or `fused-memory/ticket-janitor`. The curator is the failing component, so a re-file feeds a watcher→curator→watcher loop. Handle them under [Promote-to-L2 categories](#promote-to-l2-categories-require-human-judgment); never call `submit_task` for them.
+- **A record that already reports a curator `refused` outcome.** A refusal is a deterministic guard; a re-file re-hits it.
+
+**Clusters.** Several L1s carrying ONE finding become ONE filing (one `suggestion_hash`), with every member id in the description; resolve each member citing the same task id.
+
+**1. File.** The `description` must stand alone WITHOUT this rotation's context: name the escalation id(s), the subject task id, the concrete file paths, and the measured evidence copied VERBATIM from `summary`/`detail`. `escalation_id` and `suggestion_hash` are the R4 idempotency keys, so a re-drain dedupes instead of double-filing.
+
+```python
+ticket = mcp__fused-memory__submit_task(
+    title="<one-line work item>",
+    description="<standalone: escalation id(s), subject task id, file paths, evidence verbatim>",
+    priority="low",
+    metadata={
+        "source": "watcher-l1-convert",
+        "spawn_context": "watcher_l1_convert",
+        "spawned_from": "<subject task id, or 'N/A' for a synthetic anchor>",
+        "files": ["path/to/file-or-dir", ...],
+        "escalation_id": esc["id"],
+        "suggestion_hash": "<stable hash of the finding>",
+    },
+    project_root=<project_root>,
+)
+# {"ticket": "tkt_..."}, or {"error": ..., "error_type": ...} with NO "ticket" key:
+# nothing was filed → step 4.
+```
+
+**2. Wait for the task id.** `submit_task` yields only a ticket, and a close citing a ticket is not tracked work.
+
+```python
+result = mcp__fused-memory__resolve_ticket(ticket=ticket["ticket"], project_root=<project_root>)
+# "created" | "combined" → cite result["task_id"]; combined = folded into an existing task, not lost.
+# "refused"  → terminal and a SUCCESS: NO task exists and there is NO "task_id" key.
+#              Never retry, never cite an id → step 4, carrying result["reason"].
+# "failed" with reason "timeout" → call resolve_ticket ONCE more on the SAME ticket
+#              (a wait, not a re-file); still not created/combined → step 4.
+# "failed" with any other reason → step 4, carrying result["reason"] and the ticket id.
+```
+
+Never call `submit_task` twice for one record in a rotation.
+
+**3. Close.** `close_only`, because nothing waits on this record; `converted`, because a curator-created task now carries the work.
+
+```python
+mcp__escalation__resolve_issue(
+    escalation_id=esc["id"],
+    resolution="Converted to tracked work: task <task_id> (<created|combined>) — <one-line finding>",
+    action="close_only",
+    resolved_by="escalation-watcher-auto",
+    resolution_class="converted",
+)
+```
+
+A `declared_pin_refused` close means the record is load-bearing ([Declared pins](#declared-pins-a-close-can-be-refused-declared_pin_refused)): promote it with the filed task id in `evidence`; never leave it pending.
+
+**4. Promote** every record you could not file or close:
+
+```python
+mcp__escalation__promote_to_l2(
+    task_id=esc["task_id"],
+    agent_role="escalation-watcher-auto",
+    member_ids=[esc["id"]],
+    root_cause="unfiled-finding:<task_id>:<slug>",
+    evidence=(esc["detail"] or esc["summary"]) + " | filing outcome: <status, reason, ticket id, filed task id>",
+    options=["A: file it by hand", "B: the finding is moot — resolve", "C: something else"],
+    summary=esc["summary"],
+    category=esc["category"],
+)
+```
+
+**Over-filing.** No per-rotation cap is enforced (`_WATCHER_ALLOWED_TOOLS` is advisory under `bypassPermissions`); the real safety is the R4 keys and the curator's admission gate. File one task per finding, never one per cluster member.
+
+Add to digest: `FILED: <category> — <subject task_id> — tracked as task <new_task_id> (<created|combined>) — <summary> [converted]`
+
 ### Classify the resolution (`resolution_class`)
 
-Every `resolve_issue` you call — an autonomous-dispatch `resume` **or** a `close_only` — MUST carry a `resolution_class`, so the archived record's provenance is **stamped, not inferred** by the origin analytics panel's benign-rate metric. Classification is triage output, not an afterthought; decide it as you decide the disposition. Two values:
+Every `resolve_issue` you call — an autonomous-dispatch `resume` **or** a `close_only` — MUST carry a `resolution_class`, so the archived record's provenance is **stamped, not inferred** by the origin analytics panel's benign-rate metric. Classification is triage output, not an afterthought; decide it as you decide the disposition. Three values:
 
 - **`actionable`** — a real action or decision accompanied the close: a `resume`/re-pend (scope expanded, dependency added, agent continued, strand re-dispatched), a requeue/restart, a dependency added, or a fix filed. The escalation led to a state change.
 - **`benign`** — a confirmed **no-action** close: the stated condition was stale, superseded, already-cleared, or a duplicate, and nothing real changed beyond closing the record. This covers the [L2 rubber-stamp carve-out](#auto-closing-a-rubber-stamp-l2-narrow-close_only-carve-out) closes and the [`stranded_blocked`](#stranded_blocked) predicate-stale close.
+- **`converted`** — the close cites a task you filed via [Convert to tracked work](#convert-to-tracked-work-file-and-resolve): a curator-created task now carries the work. Stamp it on every close whose resolution cites such a task. It is neither `benign` nor `actionable` (`escalation/src/escalation/models.py::RESOLUTION_CLASSES`).
 
 The class describes the **escalation's usefulness**, not your effort — a `resume` you performed in one call is still `actionable`; a stale record you spent effort verifying is still `benign`. `promote_to_l2` takes **no** `resolution_class` (promotion does not resolve — member L1s stay pending; the class is stamped only when the resulting L2 is finally resolved). When genuinely unsure, prefer `actionable` (it never suppresses a record from the human-review benign-rate metric).
 
@@ -1061,6 +1147,9 @@ Mode: <"L2-promotion (promote_to_l2 available)" | "LEGACY (promote_to_l2 not ava
 - DISPATCHED: cleanup_needed — task-99 — dead code in scheduler.py flagged for follow-up [actionable]
 - DISPATCHED: dependency_discovered — task-77 → depends on task-55 [actionable]
 
+### Filed as tracked work
+- FILED: infra_issue — task-61 — tracked as task 6120 (created) — residual: scripts/watcher-rearm.sh still reads the pre-6118 queue path [converted]
+
 ### Promoted to L2 (L2-promotion mode only)
 - PROMOTED (L2 esc-42-7): task_failure — task-12 — verify exhausted after 3 attempts
     Proposal: fix import in tests/test_foo.py line 42 [risk: low]
@@ -1096,6 +1185,6 @@ Mode: <"L2-promotion (promote_to_l2 available)" | "LEGACY (promote_to_l2 not ava
 - review_suggestions: 3 escalations skipped (curator owned)
 ```
 
-The trailing `[actionable]` / `[benign]` tag on each `DISPATCHED` and `AUTO-CLOSED` line is the `resolution_class` you stamped on that resolve/close — recorded on **every** `resolve_issue` you make (see [Classify the resolution](#classify-the-resolution-resolution_class)). `PROMOTED` lines carry no class (promotion does not resolve).
+The trailing `[actionable]` / `[benign]` / `[converted]` tag on each `DISPATCHED`, `FILED` and `AUTO-CLOSED` line is the `resolution_class` you stamped on that resolve/close — recorded on **every** `resolve_issue` you make (see [Classify the resolution](#classify-the-resolution-resolution_class)). `PROMOTED` lines carry no class (promotion does not resolve).
 
 Maintain a running in-context summary as you handle each escalation. Emit the final digest only once, as your last output before returning.
