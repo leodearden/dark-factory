@@ -76,8 +76,8 @@ attention is the right price.
 
 This module imports only the stdlib and shared's stdlib-only layout leaf, by
 design, mirroring the posture of :mod:`gc_agent_transcripts` (a sweep over this
-very same tree), so it runs standalone in any environment with no config load
-and no PYTHONPATH setup.
+very same tree), so it runs from any checkout of this repo with plain
+``python3``: no config load and no PYTHONPATH setup.
 """
 
 from __future__ import annotations

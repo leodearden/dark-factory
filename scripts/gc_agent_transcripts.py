@@ -86,7 +86,8 @@ carries that signal instead.
 
 This module imports only the stdlib and shared's stdlib-only layout leaf, by
 design: it does NOT import/load ``OrchestratorConfig`` (``load_config`` is
-config-required and side-effectful), so it runs standalone in any environment.
+config-required and side-effectful), so it runs from any checkout of this repo
+with plain ``python3``.
 Its default root is derived from the main checkout and its caps are module
 constants that MIRROR α's config, pinned against silent drift by a drift-guard
 test against ``orchestrator.config.TranscriptArchiveConfig`` / ``RetentionConfig``.
