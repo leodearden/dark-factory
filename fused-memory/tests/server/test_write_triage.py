@@ -48,9 +48,9 @@ from fused_memory.server.write_triage import (
     TRIAGE_OUTCOMES,
     TriageFailOpenCounter,
     TriageJudgeVerdict,
-    _canonical_id_of,
     _stub_judge,
     attach_write_landed,
+    canonical_id_of,
     decide_band,
     declares_attach_keys,
     emit_triage_fail_open_storm_escalation,
@@ -702,7 +702,7 @@ class TestDecideBand:
         """
         result = _result('own-id', 0.97, extra_metadata=extra)
         expected = _parent_id_in_meta(result.metadata) or 'own-id'
-        assert _canonical_id_of(result) == expected
+        assert canonical_id_of(result) == expected
 
 
 # ---------------------------------------------------------------------------
