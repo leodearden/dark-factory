@@ -27,6 +27,7 @@ from sitting.gates import UNKNOWN, Fact
 from sitting.inventory import ESC_ID_RE, ItemKey, key_str, parse_key, parse_stamp
 
 DEFAULT_PREPARATION_PATH = Path('data', 'sitting', 'preparation.json')
+DEFAULT_INBOX_PATH = Path('data', 'sitting', 'inbox')
 NIGHTLY_CONFINEMENT_ENV = 'SITTING_NIGHTLY_CONFINED'
 """Set in the unattended run's env; prepare_sitting.py then runs only ``brief`` and ``record`` against the default store."""
 STANDING_KINDS = frozenset({'pin', 'hold', 'leo_owned', 'owned'})

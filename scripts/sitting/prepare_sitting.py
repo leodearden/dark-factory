@@ -87,6 +87,7 @@ OWNER_RELEASE_STATUSES: tuple[str, ...] = tuple(sorted(ownership.TERMINAL_TASK_S
 PIN_RELEASE = Manual('a human spends the pin (acknowledge_declared_pins) or withdraws it')
 
 DEFAULT_PREPARATION = _REPO_ROOT / preparations.DEFAULT_PREPARATION_PATH
+DEFAULT_INBOX = _REPO_ROOT / preparations.DEFAULT_INBOX_PATH
 
 
 @dataclass(frozen=True)
@@ -324,7 +325,14 @@ def nightly_confinement_breach(args: argparse.Namespace) -> str | None:
         return '--apply-closes is never available to the unattended run'
     if getattr(args, 'ledger', None) is not None:
         return '--ledger is never available to the unattended run'
+    if args.command == 'record' and not _inside_inbox(args.source):
+        return (f'record reads only a file inside {DEFAULT_INBOX}, never stdin or any other path; '
+                f'write the batch as a file in that directory and pass its path to --from')
     return None
+
+
+def _inside_inbox(source: str) -> bool:
+    return source != '-' and DEFAULT_INBOX.resolve() in Path(source).resolve().parents
 
 
 def main(argv: Sequence[str] | None = None) -> int:
