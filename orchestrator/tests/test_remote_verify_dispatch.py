@@ -12,9 +12,15 @@ rather than passing against a hand-typed marker string.
 import asyncio
 import dataclasses
 import json
+import re
 import shlex
+import shutil
+import subprocess
+import sys
+import uuid
 from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
+from typing import get_args
 
 import pytest
 from _xdist_crash_fixtures import XDIST_SESSION_ABORTED_OUTPUT
@@ -28,9 +34,12 @@ from orchestrator.verify import (
     VerifyResult,
 )
 from orchestrator.verify_runner import (
+    _SSH_BASE_OPTS,
+    REMOTE_VERIFY_PROCESS_PATTERN,
     ConcurrentDispatchError,
     MergeVerifySpec,
     RemoteRunner,
+    RemoteVerifySubcommand,
     RunnerUnavailable,
     RunnerUnavailableKind,
     UnscopedTypecheckSpec,
@@ -575,3 +584,56 @@ class TestExclusiveDispatchAcrossPaths:
         assert 'abc123:refs/merge-verify/id-b' not in transport.pushed_refspecs()
         transport.ssh_release.set()
         assert await verifying == _green()
+
+
+def _sleeper(*argv: str) -> subprocess.Popen:
+    return subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)', *argv])
+
+
+class TestRemoteVerifyProcessPattern:
+    def test_pgrep_finds_both_subcommands_and_nothing_else(self):
+        if shutil.which('pgrep') is None:
+            pytest.skip('pgrep is not installed')
+        request_id = f'--request-id={uuid.uuid4().hex}'
+        task = _sleeper('orchestrator', 'verify-task', request_id)
+        merge = _sleeper('orchestrator', 'verify-merge', request_id)
+        other = _sleeper('orchestrator', 'verify-other', request_id)
+        try:
+            listed = subprocess.run(
+                ['pgrep', '-f', REMOTE_VERIFY_PROCESS_PATTERN],
+                capture_output=True, text=True, check=False,
+            ).stdout.split()
+
+            assert str(task.pid) in listed
+            assert str(merge.pid) in listed
+            assert str(other.pid) not in listed
+        finally:
+            for child in (task, merge, other):
+                child.kill()
+                child.wait()
+
+    def test_every_subcommand_is_matched(self):
+        for subcommand in get_args(RemoteVerifySubcommand):
+            assert re.search(REMOTE_VERIFY_PROCESS_PATTERN, f'orchestrator {subcommand} --sha x')
+
+    @pytest.mark.asyncio
+    async def test_probe_issues_one_ssh_running_the_pattern(self):
+        transport = _FakeTransport(ssh_rc=1)
+
+        await _remote_runner(transport).probe_clean()
+
+        [ssh_argv] = transport.ssh_calls()
+        assert ssh_argv[:-1] == ['ssh', *_SSH_BASE_OPTS, 'laptop.local']
+        assert shlex.split(ssh_argv[-1]) == ['pgrep', '-f', REMOTE_VERIFY_PROCESS_PATTERN]
+        assert len(transport.calls) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('ssh_rc', 'clean'), [(1, True), (0, False), (2, False)])
+    async def test_probe_is_clean_only_when_pgrep_finds_nothing(self, ssh_rc: int, clean: bool):
+        assert await _remote_runner(_FakeTransport(ssh_rc=ssh_rc)).probe_clean() is clean
+
+    @pytest.mark.asyncio
+    async def test_probe_transport_failure_is_not_clean(self):
+        transport = _FakeTransport(ssh_error=OSError('no ssh'))
+
+        assert await _remote_runner(transport).probe_clean() is False
