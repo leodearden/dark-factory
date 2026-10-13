@@ -54,8 +54,12 @@ rule keeps the worst run.
 
 The previous 10s kept only 1.8x headroom over 5.46s.
 
-Upper edge: 60 < 300, the `--timeout=300` in `escalation/orchestrator.yaml`'s
-`test_command`. Escalation runs `timeout_method = "signal"`
+Upper edge: 60 < 300, the `--timeout=300` on BOTH verify runs of this suite:
+`escalation/orchestrator.yaml`'s `test_command`, and the escalation segment of
+the fleet chain in `dark-factory-orchestrator.yaml` (found with
+`orchestrator/src/orchestrator/verify_cmd.py::split_and_chain_segments`, since
+`verify_cli_timeout` reads only a chain's first flag). Escalation runs
+`timeout_method = "signal"`
 (`escalation/pyproject.toml`). Because of that ordering, an
 alive-but-never-ready server fails with the structured
 `EscalationServerNotReady`, which names the side of the wire that failed,

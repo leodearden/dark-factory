@@ -25,12 +25,13 @@ repo-root multi-package run is not this one. See
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import errno
 import socket
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -444,11 +445,38 @@ _MEASURED_FIRST_START_WORST_CASE_S = 5.46
 
 # Mirrors orchestrator/tests/_orch_helpers.py::UNDER_LOAD_HEADROOM_FACTOR,
 # which is importable only under orchestrator/tests (CONTRIBUTING.md).
+# test_the_headroom_factor_mirror_matches_its_canonical_home keeps them equal.
 _UNDER_LOAD_HEADROOM_FACTOR = 8
 
 # From __file__, never the cwd: verify runs from escalation/, a repo-root run
 # from the root.
-_ESCALATION_ORCH_YAML = Path(__file__).resolve().parents[1] / 'orchestrator.yaml'
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_ORCH_HELPERS = _REPO_ROOT / 'orchestrator' / 'tests' / '_orch_helpers.py'
+_ESCALATION_ORCH_YAML = _REPO_ROOT / 'escalation' / 'orchestrator.yaml'
+_FLEET_ORCH_YAML = _REPO_ROOT / 'dark-factory-orchestrator.yaml'
+
+
+def test_the_headroom_factor_mirror_matches_its_canonical_home() -> None:
+    """``_UNDER_LOAD_HEADROOM_FACTOR`` must equal the constant it mirrors.
+
+    Read from source, because that module does not import from here.
+    """
+    canonical = [
+        ast.literal_eval(node.value)
+        for node in ast.parse(_ORCH_HELPERS.read_text(encoding='utf-8')).body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == 'UNDER_LOAD_HEADROOM_FACTOR'
+            for target in node.targets
+        )
+    ]
+    assert canonical == [_UNDER_LOAD_HEADROOM_FACTOR], (
+        f'_UNDER_LOAD_HEADROOM_FACTOR ({_UNDER_LOAD_HEADROOM_FACTOR}) must mirror '
+        f'the single literal UNDER_LOAD_HEADROOM_FACTOR assignment in '
+        f'{_ORCH_HELPERS}; found {canonical!r}. If the factor was retuned, update '
+        'the mirror. If it moved to a home importable from here (task 6555), '
+        'import it instead and delete the mirror and this test.'
+    )
 
 
 def test_the_readiness_bound_clears_the_measured_first_start_with_headroom(
@@ -473,28 +501,56 @@ def test_the_readiness_bound_clears_the_measured_first_start_with_headroom(
     )
 
 
+def _whole_command(test_command: str) -> str:
+    return test_command
+
+
+def _escalation_segment(test_command: str) -> str:
+    from orchestrator.verify_cmd import split_and_chain_segments
+
+    commands = [
+        segment.command
+        for segment in split_and_chain_segments(test_command) or []
+        if segment.cwd_rel == 'escalation'
+    ]
+    assert len(commands) == 1, (
+        f'expected exactly one segment run from escalation/, got {commands!r} '
+        f'from {test_command!r}'
+    )
+    return commands[0]
+
+
+@pytest.mark.parametrize(
+    ('config', 'escalation_run_of'),
+    [
+        pytest.param(_ESCALATION_ORCH_YAML, _whole_command, id='module-config'),
+        pytest.param(_FLEET_ORCH_YAML, _escalation_segment, id='fleet-chain'),
+    ],
+)
 def test_the_readiness_bound_expires_before_the_verify_per_test_budget(
     escalation_conftest: Any,
+    config: Path,
+    escalation_run_of: Callable[[str], str],
 ) -> None:
-    """``_READY_TIMEOUT_S`` must expire before verify's per-test ``--timeout``.
+    """``_READY_TIMEOUT_S`` must expire before every verify per-test ``--timeout``
+    this suite runs under: its module config's, and the fleet chain's
+    escalation segment.
 
     Past that budget pytest-timeout (``timeout_method = "signal"`` in
     escalation/pyproject.toml) fails the test first, and the structured
     ``EscalationServerNotReady``, which names the side of the wire that
     failed, is never raised.
     """
-    test_command = yaml.safe_load(
-        _ESCALATION_ORCH_YAML.read_text(encoding='utf-8'),
-    )['test_command']
-    budget = verify_cli_timeout(test_command)
+    test_command = yaml.safe_load(config.read_text(encoding='utf-8'))['test_command']
+    budget = verify_cli_timeout(escalation_run_of(test_command))
     assert budget is not None, (
-        f'no --timeout in the test_command of {_ESCALATION_ORCH_YAML}: '
+        f'no --timeout on the escalation run in the test_command of {config}: '
         f'{test_command!r}'
     )
     bound = escalation_conftest._READY_TIMEOUT_S
     assert bound < budget, (
         f'_READY_TIMEOUT_S ({bound}s) does not expire before the verify '
-        f'per-test budget (--timeout={budget} in {_ESCALATION_ORCH_YAML}), so an '
+        f'per-test budget (--timeout={budget} in {config}), so an '
         'alive-but-never-ready server would die by pytest-timeout instead of '
         'raising EscalationServerNotReady. Keep the bound below the budget.'
     )
