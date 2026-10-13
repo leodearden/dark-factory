@@ -350,13 +350,6 @@ async def lifespan(app: FastAPI):
     burndown_store = _BurndownStore(burndown_path, busy_timeout_ms=5000)
     await burndown_store.open()
     app.state.burndown_store = burndown_store
-    collector_task = asyncio.create_task(
-        _burndown_loop(
-            burndown_store,
-            config,
-            http_client,
-        )
-    )
 
     # Metrics snapshot collector (separate WAL writer with full durability triad).
     metrics_path = config.metrics_db
@@ -364,32 +357,40 @@ async def lifespan(app: FastAPI):
     await metrics_store.open()
     app.state.metrics_store = metrics_store
     app.state.metrics_db_path = metrics_path  # preserved for healthz / other callers
-    metrics_task = asyncio.create_task(
-        _metrics_loop(metrics_store, app, pool=pool, http_client=http_client)
-    )
 
-    # Reclaims pool connections a cancelled request orphaned, which httpcore
-    # itself cannot: dashboard/src/dashboard/http_pool.py states the mechanism.
-    # Takes the LOCAL http_client as an argument — never app.state.http_client —
-    # for the reason _metrics_loop's docstring gives in full (task 3771).
+    # Every background task is created here, LAST, with nothing awaited between
+    # here and the yield. Startup has no try/except, so a task created above an
+    # `await ...store.open()` is stranded — still ticking against a client
+    # nobody will close — if that open raises. One site also makes them read as
+    # the set the teardown below cancels as a set. The two samplers are gated on
+    # the LOCAL config (task 3771), never app.state.config.
     #
-    # LAST, with nothing awaited between here and the yield, though it needs
-    # only http_client and could be started as soon as that exists. Startup has
-    # no try/except, so a task created above `await burndown_store.open()` is
-    # stranded — still ticking against a client nobody will close — if that open
-    # raises. Creating all three background tasks at one site also makes them
-    # read as the set the teardown below cancels as a set.
+    # The reaper reclaims pool connections a cancelled request orphaned, which
+    # httpcore itself cannot: dashboard/src/dashboard/http_pool.py states the
+    # mechanism. It takes the LOCAL http_client — never app.state.http_client —
+    # for the reason _metrics_loop's docstring gives in full (task 3771).
+    samplers = (
+        (
+            asyncio.create_task(_burndown_loop(burndown_store, config, http_client)),
+            asyncio.create_task(
+                _metrics_loop(metrics_store, app, pool=pool, http_client=http_client)
+            ),
+        )
+        if config.samplers_enabled
+        else ()
+    )
     reaper_task = asyncio.create_task(reaper_loop(http_client))
+    background = (*samplers, reaper_task)
 
     yield
 
     try:
-        for task in (collector_task, metrics_task, reaper_task):
+        for task in background:
             task.cancel()
-        for task in (collector_task, metrics_task, reaper_task):
+        for task in background:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
-        # After the loops above, so THIS app's three background tasks cannot
+        # After the loops above, so THIS app's background tasks cannot
         # enqueue a fresh refresh behind this reap; before http_client.aclose()
         # below, so a cancelled refresh unwinds into a pool that still
         # exists. One
