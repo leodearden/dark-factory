@@ -20,8 +20,9 @@ and exit 0.
 """
 from __future__ import annotations
 
+import asyncio
 import sys
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -35,7 +36,11 @@ for _src in (_REPO_ROOT / 'fused-memory' / 'src', _REPO_ROOT / 'shared' / 'src')
         sys.path.insert(0, str(_src))
 
 from shared.uuid_prefix import PrefixToken, find_prefix_tokens, substitute_all  # noqa: E402
-from shared.uuid_prefix_guard import Resolution  # noqa: E402
+from shared.uuid_prefix_guard import (  # noqa: E402
+    PrefixResolver,
+    Resolution,
+    ResolverUnavailable,
+)
 
 # ---------------------------------------------------------------------------
 # The planner: one record, its tokens' resolutions, what to write.
@@ -104,3 +109,45 @@ def plan_record(
         untouched=untouched,
         after=substitute_all(fields, expansions) if expansions else None,
     )
+
+
+# ---------------------------------------------------------------------------
+# Resolution: once per distinct token, a bounded number at a time.
+# ---------------------------------------------------------------------------
+
+#: Resolutions in flight at once. Each one walks the project's whole id space
+#: (D9); the plan's two-phase resolution decision sets this bound. Distinct
+#: from ``uuid_prefix_guard.MAX_CONCURRENT_RESOLUTIONS``, which is a per-call
+#: latency policy for the MCP guard, not a corpus-walk load policy.
+RESOLVE_CONCURRENCY = 4
+
+
+async def resolve_distinct(
+    project_id: str,
+    tokens: Iterable[str],
+    resolve: PrefixResolver,
+    memo: Mapping[str, Resolution],
+    *,
+    concurrency: int = RESOLVE_CONCURRENCY,
+) -> dict[str, Resolution]:
+    """*memo* extended with a resolution for every token it lacks.
+
+    Each distinct token is resolved exactly once. *memo* is never mutated. A
+    store outage on any token raises ``ResolverUnavailable`` itself, after the
+    task group has cancelled every other resolution still in flight.
+    """
+    pending = [token for token in dict.fromkeys(tokens) if token not in memo]
+    resolved: dict[str, Resolution] = {}
+    slots = asyncio.Semaphore(concurrency)
+
+    async def resolve_one(token: str) -> None:
+        async with slots:
+            resolved[token] = await resolve(project_id, token)
+
+    try:
+        async with asyncio.TaskGroup() as group:
+            for token in pending:
+                group.create_task(resolve_one(token))
+    except* ResolverUnavailable as outage:
+        raise outage.exceptions[0] from None
+    return {**memo, **resolved}
