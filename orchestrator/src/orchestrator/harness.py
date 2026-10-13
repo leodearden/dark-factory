@@ -62,6 +62,7 @@ from orchestrator import recovery_pins, recut_ruling
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
+from orchestrator.agents.watcher_rearm_outcome_guidance import WATCHER_REARM_OUTCOME_GUIDANCE
 from orchestrator.already_landed_tick_view import (
     AlreadyLandedTickView,
     branch_absent_and_unmarked,
@@ -14899,6 +14900,7 @@ class Harness:
             f'Project root: {cfg.project_root}\n'
             f'Escalation queue: {queue_dir}\n'
             f'{tooling_root_block}'
+            f'\n{WATCHER_REARM_OUTCOME_GUIDANCE}'
         )
         system_prompt = load_skill_system_prompt('escalation-watcher-auto')
         escalation_url = f'http://{cfg.escalation.host}:{cfg.escalation.port}/mcp'
