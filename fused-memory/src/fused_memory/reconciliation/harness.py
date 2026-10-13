@@ -752,11 +752,9 @@ def _run_failure_record(
     failed_stage: str | None,
     error_message: str | None = None,
 ) -> dict[str, object]:
-    """The ``_error`` record every S1→S2→S3 driver writes for a run ended by
-    an exception (a failure, a cancellation, or, through
-    ``_run_deferral_record``, an AllAccountsCapped deferral), so the failure
-    can be classified from the row alone. Only the stale-run reaper, which has
-    no exception in hand, builds its own record.
+    """The ``_error`` record for a run ended by ``exc``: its type, message,
+    failed stage, traceback and SQLite classification, so the failure can be
+    classified from the row alone.
     """
     return {
         'error_type': type(exc).__name__,

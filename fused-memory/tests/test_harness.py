@@ -6057,14 +6057,19 @@ def _remediation_pass_under_test(harness):
     )
 
 
-def _assert_run_failure_record(err, *, error_type, failed_stage, message, errorname, errorcode):
+def _assert_run_failure_record(
+    err, *, error_type, failed_stage, message, errorname, errorcode, message_in_traceback=True,
+):
     """Every key is read by indexing, so a missing sqlite key fails even when
-    the expected value is None."""
+    the expected value is None. A driver that records its own message instead
+    of the exception's passes message_in_traceback=False."""
     assert err['error_type'] == error_type
+    assert err['error_message'] == message
     assert err['failed_stage'] == failed_stage
     assert err['traceback'], 'the failure record must carry the traceback'
     assert error_type in err['traceback']
-    assert message in err['traceback']
+    if message_in_traceback:
+        assert message in err['traceback']
     assert err['sqlite_errorname'] == errorname
     assert err['sqlite_errorcode'] == errorcode
 
@@ -6209,11 +6214,12 @@ async def test_remediation_pass_cancellation_terminalises_row_as_failed(
 
     row = await _settled_remediation_row(journal)
     assert row.status == 'failed'
-    err = row.stage_reports['_error']
-    assert err['error_type'] == 'CancelledError'
-    assert err['failed_stage'] == 'task_knowledge_sync'
-    assert err['traceback']
-    assert err['sqlite_errorname'] is None
+    _assert_run_failure_record(
+        row.stage_reports['_error'],
+        error_type='CancelledError', failed_stage='task_knowledge_sync',
+        message='Remediation pass cancelled (shutdown, timeout or external cancellation)',
+        message_in_traceback=False, errorname=None, errorcode=None,
+    )
     assert 'memory_consolidator' in row.stage_reports
     assert row.id not in {r.id for r in await journal.get_running_runs()}
     assert row.id not in {r.id for r in await journal.get_interrupted_runs()}
@@ -6242,14 +6248,12 @@ async def test_run_full_cycle_cancellation_records_traceback_and_sqlite_classifi
     [row] = await journal.get_recent_runs('test-project', limit=1)
     assert row.run_type == 'full'
     assert row.status == 'failed'
-    err = row.stage_reports['_error']
-    assert err['error_type'] == 'CancelledError'
-    assert err['error_message'] == 'Run cancelled (timeout or external cancellation)'
-    assert err['failed_stage'] == 'memory_consolidator'
-    assert err['traceback'], 'the failure record must carry the traceback'
-    assert 'CancelledError' in err['traceback']
-    assert err['sqlite_errorname'] is None
-    assert err['sqlite_errorcode'] is None
+    _assert_run_failure_record(
+        row.stage_reports['_error'],
+        error_type='CancelledError', failed_stage='memory_consolidator',
+        message='Run cancelled (timeout or external cancellation)',
+        message_in_traceback=False, errorname=None, errorcode=None,
+    )
 
 
 @pytest.mark.asyncio
