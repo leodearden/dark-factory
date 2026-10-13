@@ -828,10 +828,7 @@ _MIGRATED_FILERS: tuple[_Filer, ...] = (
         'completion_claim_gate',
         'fused_memory.services.completion_claim_gate',
         _unverified_claim,
-        # L0, the Escalation model's default, which this filer has always been
-        # born at. Whether an 'info' record under a synthetic anchor should be
-        # born at L1 like its siblings is a design question, not a refactor's.
-        0,
+        1,
     ),
     _Filer(
         'memory_metadata_census',
@@ -1056,12 +1053,9 @@ class TestEveryFilerPinsItsLevels:
             f.label: f.escalation_level for f in _MIGRATED_FILERS
             if f.escalation_level != 1
         }
-        assert not_l1 == {
-            'markup_tripwire residue': 2, 'completion_claim_gate': 0,
-        }, (
-            'L1 is the house escalation level; residue (L2) and '
-            f'completion_claim_gate (L0) are its exceptions. {not_l1!r} says '
-            'another filer moved'
+        assert not_l1 == {'markup_tripwire residue': 2}, (
+            'L1 is the house escalation level; residue (L2) is its one '
+            f'exception. {not_l1!r} says another filer moved'
         )
 
 

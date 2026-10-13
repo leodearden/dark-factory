@@ -981,6 +981,9 @@ class TestEmitUnverifiedClaimEscalation:
         payload = json.loads(files[0].read_text())
         assert payload['id'] == esc_id
         assert payload['category'] == 'unverified_completion_claim'
+        assert payload['level'] == 1, (
+            'the filed record, not just the forwarded kwarg, must be born at L1'
+        )
 
         # The record must be actionable without opening the code or the corpus:
         # it names WHAT was claimed and WHAT was observed. Asserted as labelled
@@ -1077,7 +1080,10 @@ class TestDelegatesToTheSharedHelper:
             'write-path noise in front of work that cannot proceed'
         )
         assert seen['project_root'] == str(tmp_path)
-        assert seen['level'] == 0
+        assert seen['level'] == 1, (
+            'a synthetic per-ref anchor has no steward; an L0 would only wait '
+            'for the orphan-L0 reaper'
+        )
 
     def test_two_different_refs_get_two_different_anchors(
         self, tmp_path, monkeypatch,
