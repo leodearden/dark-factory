@@ -440,8 +440,8 @@ async def _wait_pid_exited(pid: int, timeout: float = 5.0) -> bool:
     """
     deadline = time.monotonic() + timeout
     while True:
-        fields = read_stat_fields(Path('/proc') / str(pid))
-        if fields is None or fields.state in ('Z', 'X'):
+        fields = read_stat_fields(Path('/proc') / str(pid), skip_malformed=False)
+        if fields is None or fields.terminated:
             return True
         if time.monotonic() >= deadline:
             return False

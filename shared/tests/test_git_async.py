@@ -365,8 +365,8 @@ def _wait_pid_exited(pid: int, timeout: float = 5.0) -> bool:
     """
     deadline = time.monotonic() + timeout
     while True:
-        fields = read_stat_fields(Path('/proc') / str(pid))
-        if fields is None or fields.state in ('Z', 'X'):
+        fields = read_stat_fields(Path('/proc') / str(pid), skip_malformed=False)
+        if fields is None or fields.terminated:
             return True
         if time.monotonic() >= deadline:
             return False
@@ -394,7 +394,7 @@ def _spawned_child(marker: str) -> int | None:
     for entry in Path('/proc').iterdir():
         if not entry.name.isdigit():
             continue
-        fields = read_stat_fields(entry)
+        fields = read_stat_fields(entry, skip_malformed=True)
         if fields is None or fields.ppid != os.getpid():
             continue
         with contextlib.suppress(OSError):

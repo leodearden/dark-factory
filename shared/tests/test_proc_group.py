@@ -1942,7 +1942,7 @@ class TestReapProcessGroups:
         real_read = proc_group_module.read_stat_fields
         monkeypatch.setattr(
             'shared.proc_group.read_stat_fields',
-            lambda entry: stat_reads.append(entry.name) or real_read(entry),
+            lambda entry, **kwargs: stat_reads.append(entry.name) or real_read(entry, **kwargs),
         )
 
         outcomes = reap_process_groups({*zombie_groups, gone_group}, grace_secs=0)

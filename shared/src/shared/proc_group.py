@@ -104,35 +104,63 @@ def _read_proc_text(path: Path) -> str:
     return path.read_bytes().decode('utf-8', 'replace')
 
 
+_TERMINATED_STATES = frozenset({'Z', 'X'})
+
+
 class StatFields(NamedTuple):
     comm: str
     state: str
     ppid: int
     pgrp: int
 
+    @property
+    def terminated(self) -> bool:
+        """Exited; awaits only its (maybe reparented) parent's reap."""
+        return self.state in _TERMINATED_STATES
 
-def read_stat_fields(entry: Path) -> StatFields | None:
-    """Parse ``<entry>/stat`` (entry = /proc/<pid>); None if unreadable or malformed.
 
-    comm is delimited by the LAST ``)``, so a comm containing spaces or parens
-    parses correctly; its bytes are arbitrary, so undecodable ones are replaced
-    rather than costing the pid its entry.
-    """
-    try:
-        text = _read_proc_text(entry / 'stat')
-    except OSError:
-        return None
+class MalformedStatLine(ValueError):
+    """A ``/proc/<pid>/stat`` that was read but does not parse."""
+
+    def __init__(self, path: Path, text: str) -> None:
+        self.path = path
+        self.text = text
+        super().__init__(f"{path}: not a 'pid (comm) state ppid pgrp ...' stat line: {text!r}")
+
+
+def _parse_stat_line(path: Path, text: str) -> StatFields:
+    """Parse *text*, read from *path*; comm runs up to the LAST ``)``, so it may hold parens."""
     rparen = text.rfind(')')
     if rparen < 0:
-        return None
+        raise MalformedStatLine(path, text)
     comm = text[text.find('(') + 1 : rparen]
     fields = text[rparen + 2 :].split()
     try:
         return StatFields(
             comm=comm, state=fields[0], ppid=int(fields[1]), pgrp=int(fields[2])
         )
-    except (IndexError, ValueError):
+    except (IndexError, ValueError) as exc:
+        raise MalformedStatLine(path, text) from exc
+
+
+def read_stat_fields(entry: Path, *, skip_malformed: bool) -> StatFields | None:
+    """Parse ``<entry>/stat`` (entry = /proc/<pid>); None if unreadable (the pid is gone).
+
+    A malformed line raises MalformedStatLine, or is None when *skip_malformed*.
+    Walkers over every host pid skip, so one foreign entry never fails the
+    walk; single-pid probes raise, so a malformed line never reads as gone.
+    """
+    path = entry / 'stat'
+    try:
+        text = _read_proc_text(path)
+    except OSError:
         return None
+    try:
+        return _parse_stat_line(path, text)
+    except MalformedStatLine:
+        if skip_malformed:
+            return None
+        raise
 
 
 def snapshot_process_group(pgid: int) -> str:
@@ -187,7 +215,7 @@ def _snapshot_process_group_unsafe(pgid: int) -> str:
             continue
         pid = int(entry.name)
 
-        fields = read_stat_fields(entry)
+        fields = read_stat_fields(entry, skip_malformed=True)
         if fields is None or fields.pgrp != pgid:
             continue
 
@@ -374,7 +402,7 @@ class ProcessGroupMember(NamedTuple):
     @property
     def terminated(self) -> bool:
         """Exited; awaits only its (maybe reparented) parent's reap, not the signaller's job."""
-        return self.state in ('Z', 'X')
+        return self.state in _TERMINATED_STATES
 
 
 def _group_members_by_pgid(pgids: Iterable[int]) -> dict[int, list[ProcessGroupMember]]:
@@ -394,7 +422,7 @@ def _group_members_by_pgid(pgids: Iterable[int]) -> dict[int, list[ProcessGroupM
     for entry in entries:
         if not entry.name.isdigit():
             continue
-        fields = read_stat_fields(entry)
+        fields = read_stat_fields(entry, skip_malformed=True)
         if fields is None or fields.pgrp not in members:
             continue
         members[fields.pgrp].append(
@@ -522,7 +550,7 @@ def _scan_process_groups_under_path_unsafe(root: str, exclude_pgids: Iterable[in
         if not entry.name.isdigit():
             continue
 
-        fields = read_stat_fields(entry)
+        fields = read_stat_fields(entry, skip_malformed=True)
         if fields is None:
             continue
         pgrp = fields.pgrp
