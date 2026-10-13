@@ -4816,19 +4816,19 @@ def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
     spec (the start_new_session escape) and a LIVE :class:`HeartbeatWriter`
     driving its stdin, so :func:`verify_cancel.run_stdin_watchdog` stays armed
     for the whole test but never times out or self-fires.  Waits for the
-    sleeper subtree to appear, then cancels via ``cancel-verify
-    --request-id`` through :class:`CliRunner` (the same in-process pattern as
-    test_cli.py's ``test_verify_merge_cancel_end_to_end``).
+    build to publish its session pgid (:func:`sleeper_spec`'s
+    *build_pgid_file*), then cancels via ``cancel-verify --request-id``
+    through :class:`CliRunner` (the same in-process pattern as test_cli.py's
+    ``test_verify_merge_cancel_end_to_end``).
 
     Asserts:
 
     * cancel-verify exits 0 and removes the pgid file;
     * the verify-merge subprocess exits promptly;
-    * the FULL descendant subtree (including the start_new_session sleeper
-      escape) AND the pgid leader itself are gone (``collect_descendants``
-      empty; ``os.killpg(pgid, 0)`` raises ``ProcessLookupError``) -- the live
-      watchdog and an explicit cancel coexist harmlessly and no orphan
-      survives.
+    * every pid snapshotted from the leader's tree while it was alive -- the
+      leader and the start_new_session build -- has exited (see
+      :func:`assert_pre_kill_tree_exited`): the live watchdog and an explicit
+      cancel coexist harmlessly and no orphan survives.
     """
     repo, head_sha = _setup_verify_repo(tmp_path)
     config_obj = OrchestratorConfig(project_root=repo)
@@ -4838,14 +4838,19 @@ def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
 
     REQUEST_ID = 'row4-cancel-under-watchdog'
     pgf = pgid_file(worktree_base, REQUEST_ID)
+    build_pgf = tmp_path / 'row4-build.pgid'
 
     child = spawn_verify_merge(
-        sha=head_sha, spec=sleeper_spec(300.0), cfg_file=cfg_file, request_id=REQUEST_ID,
+        sha=head_sha,
+        spec=sleeper_spec(300.0, build_pgid_file=build_pgf),
+        cfg_file=cfg_file,
+        request_id=REQUEST_ID,
     )
     heartbeat = HeartbeatWriter(child, interval=0.2).start()
     try:
-        pgid_val = wait_for_pgid_file(pgf)
-        wait_subtree_live(pgid_val, proc=child)
+        leader = wait_for_pgid_file(pgf, timeout=row_discovery_ceiling_secs())
+        build = wait_for_pgid_file(build_pgf, proc=child, timeout=row_discovery_ceiling_secs())
+        tree = snapshot_pre_kill_tree(leader, build)
 
         monkeypatch.setattr(cli_module, 'load_config', lambda _path: config_obj)
         result = CliRunner().invoke(main, [
@@ -4864,9 +4869,8 @@ def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
                 'verify-merge subprocess did not exit within 20s after cancel-verify'
             )
 
-        assert wait_subtree_gone(pgid_val, timeout=10.0), (
-            f'pgid {pgid_val}: subtree and/or leader still alive after '
-            f'cancel-verify (live-watchdog coexistence left an orphan)'
+        assert_pre_kill_tree_exited(
+            tree, timeout=10.0, after='cancel-verify (live-watchdog coexistence left an orphan)',
         )
     finally:
         heartbeat.stop_heartbeats()
@@ -4981,7 +4985,8 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
 
     Spawns a real ``verify-merge --request-id`` with a live
     :class:`HeartbeatWriter` driving its stdin (real heartbeats flow while
-    connected), waits for the sleeper subtree to appear, then calls
+    connected), waits for the build to publish its session pgid
+    (:func:`sleeper_spec`'s *build_pgid_file*), then calls
     ``heartbeat.close_stdin()`` -- stopping heartbeats AND closing the
     child's stdin write-end -- while this test process (the dispatcher
     stand-in) keeps running.  The child sees the same fd-0 EOF signal as Row
@@ -4996,9 +5001,11 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
     ``grace_secs`` bounds it (~5s, measured ~6.7s end-to-end), NOT the ~15s a
     reader might assume from the pinned heartbeat timeout.
 
-    Asserts within a bounded T: the full descendant subtree AND the pgid
-    leader are gone, and the verify-merge process itself self-exits non-zero
-    (the watchdog's controlled ``os._exit(1)``, not an external kill signal).
+    Asserts within a bounded T that the verify-merge process itself
+    self-exits non-zero (the watchdog's controlled ``os._exit(1)``, not an
+    external kill signal), and that every pid snapshotted from the leader's
+    tree while it was alive -- the leader and the start_new_session build --
+    has exited (see :func:`assert_pre_kill_tree_exited`).
     """
     repo, head_sha = _setup_verify_repo(tmp_path)
     cfg_file = tmp_path / 'config.yaml'
@@ -5007,28 +5014,24 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
 
     REQUEST_ID = 'row2-ssh-dropped'
     pgf = pgid_file(worktree_base, REQUEST_ID)
+    build_pgf = tmp_path / 'row2-build.pgid'
 
     child = spawn_verify_merge(
         sha=head_sha,
-        spec=sleeper_spec(300.0),
+        spec=sleeper_spec(300.0, build_pgid_file=build_pgf),
         cfg_file=cfg_file,
         request_id=REQUEST_ID,
         extra_env=ROW_WATCHDOG_ENV,
     )
     heartbeat = HeartbeatWriter(child, interval=0.2).start()
     try:
-        pgid_val = wait_for_pgid_file(pgf, timeout=row_discovery_ceiling_secs())
-        wait_subtree_live(pgid_val, proc=child, timeout=row_discovery_ceiling_secs())
+        leader = wait_for_pgid_file(pgf, timeout=row_discovery_ceiling_secs())
+        build = wait_for_pgid_file(build_pgf, proc=child, timeout=row_discovery_ceiling_secs())
+        tree = snapshot_pre_kill_tree(leader, build)
 
         heartbeat.close_stdin()
 
-        # Reap the leader (a DIRECT child of this test process, unlike Row
-        # 1's separate-dispatcher indirection or Row 4's cancel-verify path)
-        # BEFORE polling wait_subtree_gone: os.killpg(pgid, 0) succeeds
-        # against an unreaped zombie too, so checking liveness first would
-        # spuriously see the group as "alive" until something calls
-        # child.wait() -- confirmed by a manual repro that hung the full
-        # poll window with this ordering reversed.
+        # The reap feeds the returncode assertion; the exit verdict is zombie-aware.
         try:
             child.wait(timeout=ROW_TREE_KILL_CEILING_SECS)
         except subprocess.TimeoutExpired:
@@ -5040,10 +5043,13 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
             f'expected non-zero exit (watchdog self-kill), got {child.returncode}'
         )
 
-        assert wait_subtree_gone(pgid_val, timeout=ROW_TREE_KILL_CEILING_SECS), (
-            f'pgid {pgid_val}: subtree and/or leader still alive after the '
-            f'ssh channel EOF (dispatcher alive) -- watchdog tree-kill did '
-            f'not fire'
+        assert_pre_kill_tree_exited(
+            tree,
+            timeout=ROW_TREE_KILL_CEILING_SECS,
+            after=(
+                'the ssh channel EOF with the dispatcher alive (the watchdog '
+                'tree-kill did not finish)'
+            ),
         )
     finally:
         heartbeat.stop_heartbeats()
@@ -5064,8 +5070,9 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
     """SS9 Row 3: heartbeat starved, stdin stays OPEN -> select-timeout tree-kill.
 
     Spawns a real ``verify-merge --request-id`` with a live
-    :class:`HeartbeatWriter`, waits for the sleeper subtree to appear, then
-    calls ``heartbeat.stop_heartbeats()`` -- which stops writing WITHOUT
+    :class:`HeartbeatWriter`, waits for the build to publish its session pgid
+    (:func:`sleeper_spec`'s *build_pgid_file*), then calls
+    ``heartbeat.stop_heartbeats()`` -- which stops writing WITHOUT
     closing stdin (contrast :func:`HeartbeatWriter.close_stdin`, Row 2) --
     modeling a hard network partition where the channel is never cleanly
     closed.  ``run_stdin_watchdog``'s ``select()`` call times out (empty
@@ -5078,9 +5085,10 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
     here is ~15s rather than production's ~95s; see ROW_WATCHDOG_ENV's comment
     above for the pin rationale and the honest cliff-moved caveat.
 
-    Asserts the leader self-exits non-zero and, after reaping it (same
-    zombie-avoidance ordering as Row 2 -- ``child`` is again a direct child
-    of this test process), that the full subtree and pgid leader are gone.
+    Asserts the leader self-exits non-zero, and that every pid snapshotted
+    from the leader's tree while it was alive -- the leader and the
+    start_new_session build -- has exited (see
+    :func:`assert_pre_kill_tree_exited`).
     """
     repo, head_sha = _setup_verify_repo(tmp_path)
     cfg_file = tmp_path / 'config.yaml'
@@ -5089,18 +5097,20 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
 
     REQUEST_ID = 'row3-heartbeat-starved'
     pgf = pgid_file(worktree_base, REQUEST_ID)
+    build_pgf = tmp_path / 'row3-build.pgid'
 
     child = spawn_verify_merge(
         sha=head_sha,
-        spec=sleeper_spec(300.0),
+        spec=sleeper_spec(300.0, build_pgid_file=build_pgf),
         cfg_file=cfg_file,
         request_id=REQUEST_ID,
         extra_env=ROW_WATCHDOG_ENV,
     )
     heartbeat = HeartbeatWriter(child, interval=0.2).start()
     try:
-        pgid_val = wait_for_pgid_file(pgf, timeout=row_discovery_ceiling_secs())
-        wait_subtree_live(pgid_val, proc=child, timeout=row_discovery_ceiling_secs())
+        leader = wait_for_pgid_file(pgf, timeout=row_discovery_ceiling_secs())
+        build = wait_for_pgid_file(build_pgf, proc=child, timeout=row_discovery_ceiling_secs())
+        tree = snapshot_pre_kill_tree(leader, build)
 
         heartbeat.stop_heartbeats()
         assert child.stdin is not None and not child.stdin.closed, (
@@ -5120,9 +5130,13 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
             f'expected non-zero exit (watchdog self-kill), got {child.returncode}'
         )
 
-        assert wait_subtree_gone(pgid_val, timeout=ROW_TREE_KILL_CEILING_SECS), (
-            f'pgid {pgid_val}: subtree and/or leader still alive after '
-            f'heartbeat starvation -- watchdog tree-kill did not fire'
+        assert_pre_kill_tree_exited(
+            tree,
+            timeout=ROW_TREE_KILL_CEILING_SECS,
+            after=(
+                'heartbeat starvation (the select-timeout watchdog tree-kill did '
+                'not finish)'
+            ),
         )
     finally:
         heartbeat.stop_heartbeats()
