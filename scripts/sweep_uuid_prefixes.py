@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'shared' / 'src'
 
 import sweep_toolcall_markup as markup_sweep
 from _task_db_scan import UNREADABLE_STORE_ERRORS, connect_ro, decode_metadata, tasks_db_path
+from fused_memory.models.scope import Scope
 from migrate_metadata_modules_to_files import (
     DEFAULT_SERVER,
     FusedMemoryClient,
@@ -284,10 +285,21 @@ class TaskClientSlot:
         return self._client
 
 
+class Mem0Corpus(Protocol):
+    """A project's Mem0 bodies, read and amended in place by memory id."""
+
+    def bodies(self, project_id: str) -> AsyncIterator[tuple[str, str]]: ...
+
+    async def read_body(self, project_id: str, memory_id: str) -> str | None: ...
+
+    async def amend_body(self, project_id: str, memory_id: str, body: str) -> Mapping[str, Any]: ...
+
+
 class LaneContext(NamedTuple):
     """What a lane's population and writer may reach during one run."""
 
     scope: SweepScope
+    mem0: Mem0Corpus | None
     tasks: TaskClientSlot
 
 
@@ -392,7 +404,7 @@ async def run_sweep(
     lanes: Iterable[str],
     apply: bool,
     resolve: PrefixResolver,
-    mem0: object | None = None,
+    mem0: Mem0Corpus | None = None,
     open_task_client: TaskClientOpener | None = None,
     server_url: str | None = None,
     rate: float = DEFAULT_RATE,
@@ -412,7 +424,7 @@ async def run_sweep(
     diffs: list[str] = []
     async with contextlib.AsyncExitStack() as stack:
         context = LaneContext(
-            scope=scope, tasks=TaskClientSlot(open_task_client, server_url, stack)
+            scope=scope, mem0=mem0, tasks=TaskClientSlot(open_task_client, server_url, stack)
         )
         for lane in (lane for name, lane in LANES.items() if name in selected):
             report, lane_diffs, memo = await _sweep_lane(
@@ -732,10 +744,147 @@ async def _write_task(
     return None
 
 
+# ---------------------------------------------------------------------------
+# The mem0 lane: raw point bodies, content-only amends that keep the point id.
+# ---------------------------------------------------------------------------
+
+LANE_MEM0 = 'mem0'
+MEM0_STORE = 'mem0'
+#: Attribution on every amend: the write's agent_id and its _source.
+WRITE_SOURCE = 'sweep_uuid_prefixes'
+WRITE_REASON = 'uuid-prefix corpus sweep (PRD C6, task 5325)'
+_SCROLL_PAGE_SIZE = 1000
+
+
+class MemoryStore(Protocol):
+    """The slice of ``MemoryService`` the adapter uses."""
+
+    config: Any
+    mem0: Any
+
+    async def get_memory_by_id(self, *, project_id: str, memory_id: str) -> dict | None: ...
+
+    async def update_memory(
+        self,
+        *,
+        memory_id: str,
+        project_id: str,
+        content: str,
+        reason: str,
+        agent_id: str,
+        _source: str,
+    ) -> dict: ...
+
+
+class ServiceMem0Corpus:
+    """``Mem0Corpus`` over a live ``MemoryService``."""
+
+    def __init__(self, memory: MemoryStore) -> None:
+        self._memory = memory
+
+    async def bodies(self, project_id: str) -> AsyncIterator[tuple[str, str]]:
+        """Every point whose ``data`` is text, in scroll order.
+
+        A store that cannot be walked is an outage, never an empty corpus.
+        """
+        collection = Scope(project_id=project_id).mem0_collection_name(
+            self._memory.config.mem0.collection_prefix
+        )
+        points = self._memory.mem0.scroll_collection_pages(
+            collection, page_size=_SCROLL_PAGE_SIZE, with_payload=True
+        )
+        try:
+            async with contextlib.aclosing(points):
+                async for point in points:
+                    body = (point.payload or {}).get('data')
+                    if isinstance(body, str):
+                        yield str(point.id), body
+        except Exception as exc:
+            raise StoreUnavailable(MEM0_STORE) from exc
+
+    async def read_body(self, project_id: str, memory_id: str) -> str | None:
+        record = await self._memory.get_memory_by_id(project_id=project_id, memory_id=memory_id)
+        if record is None:
+            return None
+        body = record['metadata'].get('data')
+        return body if isinstance(body, str) else None
+
+    async def amend_body(self, project_id: str, memory_id: str, body: str) -> Mapping[str, Any]:
+        """A content-only amend: same point id, every metadata key left as stored."""
+        return await self._memory.update_memory(
+            memory_id=memory_id,
+            project_id=project_id,
+            content=body,
+            reason=WRITE_REASON,
+            agent_id=WRITE_SOURCE,
+            _source=WRITE_SOURCE,
+        )
+
+
+class Mem0Source(NamedTuple):
+    memory_id: str
+
+
+def _required_corpus(context: LaneContext) -> Mem0Corpus:
+    if context.mem0 is None:
+        raise ValueError('the mem0 lane needs a corpus and none was injected')
+    return context.mem0
+
+
+async def _mem0_population(context: LaneContext) -> AsyncIterator[Record | markup_sweep.Refusal]:
+    corpus = _required_corpus(context)
+    async for memory_id, body in corpus.bodies(context.scope.project_id):
+        yield Record(key=memory_id, fields={'data': body}, source=Mem0Source(memory_id))
+
+
+def _amend_rejection(reply: Mapping[str, Any]) -> str | None:
+    """Why *reply* is not an applied amend, or ``None`` when it is one."""
+    if reply.get('error_type'):
+        return f"{reply['error_type']}: {reply.get('error', '')}"
+    if reply.get('status') != 'updated':
+        return f'the reply carries no positive write signal: {dict(reply)!r}'
+    return None
+
+
+async def _write_mem0(
+    context: LaneContext, record: Record, after: dict[str, Any]
+) -> WriteFailureRecord | None:
+    source = _source_of(record, Mem0Source, LANE_MEM0)
+    corpus = _required_corpus(context)
+    project_id = context.scope.project_id
+    try:
+        current = await corpus.read_body(project_id, source.memory_id)
+        if current != record.fields['data']:
+            return WriteFailureRecord(
+                key=record.key,
+                reason=markup_sweep.REASON_CHANGED_UNDER_US,
+                error='the memory body changed between the scan and the write',
+            )
+        reply = await corpus.amend_body(project_id, source.memory_id, after['data'])
+    except Exception as exc:
+        # One backend hiccup costs one report row, not the run.
+        return WriteFailureRecord(
+            key=record.key,
+            reason=markup_sweep.REASON_WRITE_FAILED,
+            error=f'{type(exc).__name__}: {exc}',
+        )
+    rejection = _amend_rejection(reply)
+    if rejection is not None:
+        return WriteFailureRecord(key=record.key, reason=REASON_WRITE_REJECTED, error=rejection)
+    return None
+
+
 #: The declared lane table. Order is the order ``--lane all`` runs them in.
 LANES: Mapping[str, Lane] = MappingProxyType({
     lane.name: lane
     for lane in (
+        Lane(
+            name=LANE_MEM0,
+            needs_root=False,
+            unwritable_fields=frozenset(),
+            population=_mem0_population,
+            write=_write_mem0,
+        ),
         Lane(
             name=LANE_TASKS,
             needs_root=True,
