@@ -650,13 +650,15 @@ class FakeTaskServer:
     """The ``update_task`` half of fused-memory, applied to the seeded sqlite file.
 
     *replies* answers a task id with a canned reply and writes nothing.
-    *side_effects* runs one extra statement inside a task's write, standing in
-    for a concurrent writer.
+    *errors* raises for a task id, the way the client does on a reply it
+    cannot read. *side_effects* runs one extra statement inside a task's
+    write, standing in for a concurrent writer.
     """
 
-    def __init__(self, db: Path, *, replies=None, side_effects=None):
+    def __init__(self, db: Path, *, replies=None, errors=None, side_effects=None):
         self.db = db
         self.replies = replies or {}
+        self.errors = errors or {}
         self.side_effects = side_effects or {}
         self.calls: list[dict] = []
         self.opened_with: list[str | None] = []
@@ -675,6 +677,8 @@ class FakeTaskServer:
         assert name == 'update_task'
         self.calls.append(dict(arguments))
         task_id = arguments['id']
+        if task_id in self.errors:
+            raise self.errors[task_id]
         if task_id in self.replies:
             return self.replies[task_id]
         conn = sqlite3.connect(self.db)
@@ -789,6 +793,30 @@ class TestTasksLane:
         reports, _ = run_tasks(root, server, apply=True)
 
         assert [(f.key, f.reason) for f in reports[0].failures] == [('master#4', 'write-rejected')]
+
+    def test_a_reply_that_is_not_json_is_a_failure_and_the_lane_continues(self, task_root):
+        root, db = task_root
+        html_page = json.JSONDecodeError('Expecting value', '<html>proxy error</html>', 0)
+        server = FakeTaskServer(db, errors={'4': html_page})
+
+        reports, _ = run_tasks(root, server, apply=True)
+
+        (report,) = reports
+        assert [(f.key, f.reason) for f in report.failures] == [
+            ('master#4', markup_sweep.REASON_WRITE_FAILED)
+        ]
+        assert 'JSONDecodeError' in report.failures[0].error
+        assert stored_task(db, 5)['details'] == f'cites {FULL}'
+        assert report.expanded == 3
+        assert sweep.exit_code(reports) == markup_sweep.EXIT_WRITE_FAILED
+
+    def test_an_apply_with_no_task_client_is_a_programming_error(self, task_root):
+        root, db = task_root
+
+        with pytest.raises(ValueError, match='task client'):
+            run(root, apply=True, lanes=('tasks',))
+
+        assert stored_task(db, 1)['description'] == f'see memory {UNIQUE}'
 
     def test_a_row_changed_since_the_scan_is_not_sent(self, task_root):
         root, db = task_root
@@ -938,13 +966,34 @@ class TestMem0Lane:
         assert sweep.exit_code(reports) == markup_sweep.EXIT_CLEAN
 
 
+class MissingCollection(Exception):
+    """Stands in for Qdrant's 404 for a collection that was never created."""
+
+
+class BackendDown(Exception):
+    """Stands in for a Qdrant or embedding-client failure."""
+
+
+#: The adapter's failure policy in these tests, shaped like the live one:
+#: the missing-collection error is itself one of the backend's failures.
+FAILURES = sweep.Mem0Failures(
+    backend=(BackendDown, MissingCollection, OSError),
+    is_missing_collection=lambda exc: isinstance(exc, MissingCollection),
+)
+
+
+def service_corpus(service):
+    return sweep.ServiceMem0Corpus(service, FAILURES)
+
+
 class FakeMemoryService:
     """The slice of ``MemoryService`` the production adapter touches."""
 
-    def __init__(self, points, *, update_error=None, scroll_error=None):
+    def __init__(self, points, *, update_error=None, scroll_error=None, read_error=None):
         self.points = points
         self.update_error = update_error
         self.scroll_error = scroll_error
+        self.read_error = read_error
         self.config = SimpleNamespace(mem0=SimpleNamespace(collection_prefix='fused'))
         self.mem0 = SimpleNamespace(scroll_collection_pages=self._scroll)
         self.scrolls: list[tuple[str, dict]] = []
@@ -958,6 +1007,8 @@ class FakeMemoryService:
             yield point
 
     async def get_memory_by_id(self, *, project_id, memory_id):
+        if self.read_error is not None:
+            raise self.read_error
         for point in self.points:
             if str(point.id) == memory_id:
                 return {'id': memory_id, 'content': 'c', 'metadata': point.payload}
@@ -981,7 +1032,7 @@ def service_points():
 class TestServiceMem0Corpus:
     def test_bodies_scroll_the_project_collection_and_skip_non_text(self):
         service = FakeMemoryService(service_points())
-        corpus = sweep.ServiceMem0Corpus(service)
+        corpus = service_corpus(service)
 
         async def collect():
             return [item async for item in corpus.bodies(PROJECT)]
@@ -992,7 +1043,7 @@ class TestServiceMem0Corpus:
         assert options['with_payload'] is True
 
     def test_read_body_reads_the_payload_data_or_none(self):
-        corpus = sweep.ServiceMem0Corpus(FakeMemoryService(service_points()))
+        corpus = service_corpus(FakeMemoryService(service_points()))
 
         assert asyncio.run(corpus.read_body(PROJECT, FULL_OTHER)) == f'cites {UNIQUE}'
         assert asyncio.run(corpus.read_body(PROJECT, FULL)) is None
@@ -1000,9 +1051,7 @@ class TestServiceMem0Corpus:
     def test_amend_body_is_a_content_only_same_id_amend(self):
         service = FakeMemoryService(service_points())
 
-        reply = asyncio.run(
-            sweep.ServiceMem0Corpus(service).amend_body(PROJECT, FULL_OTHER, f'cites {FULL}')
-        )
+        reply = asyncio.run(service_corpus(service).amend_body(PROJECT, FULL_OTHER, f'cites {FULL}'))
 
         assert reply == {'status': 'updated', 'id': FULL_OTHER}
         assert service.updates == [
@@ -1016,25 +1065,92 @@ class TestServiceMem0Corpus:
             }
         ]
 
-    def test_a_store_exception_on_amend_is_a_lane_failure_not_a_crash(self):
-        service = FakeMemoryService(service_points(), update_error=ConnectionError('qdrant away'))
+    @pytest.mark.parametrize(
+        'failing',
+        [
+            {'update_error': ConnectionError('qdrant away')},
+            {'read_error': BackendDown('qdrant away')},
+        ],
+        ids=['amend', 're-read'],
+    )
+    def test_a_backend_failure_on_write_is_a_lane_failure_not_a_crash(self, failing):
+        service = FakeMemoryService(service_points(), **failing)
 
-        reports, _ = run_mem0(sweep.ServiceMem0Corpus(service), apply=True)
+        reports, _ = run_mem0(service_corpus(service), apply=True)
 
-        assert [(f.key, f.reason) for f in reports[0].failures] == [
+        (report,) = reports
+        assert [(f.key, f.reason) for f in report.failures] == [
             (FULL_OTHER, markup_sweep.REASON_WRITE_FAILED)
         ]
-        assert 'ConnectionError' in reports[0].failures[0].error
-        assert 'qdrant away' in reports[0].failures[0].error
+        (error,) = failing.values()
+        assert type(error).__name__ in report.failures[0].error
+        assert 'qdrant away' in report.failures[0].error
+
+    @pytest.mark.parametrize(
+        'failing',
+        [
+            {'update_error': TypeError("update_memory() got an unexpected keyword 'x'")},
+            {'read_error': KeyError('metadata')},
+        ],
+        ids=['amend', 're-read'],
+    )
+    def test_a_bug_on_the_write_path_is_a_traceback_not_a_failure_row(self, failing):
+        (error,) = failing.values()
+        service = FakeMemoryService(service_points(), **failing)
+
+        with pytest.raises(type(error)):
+            run_mem0(service_corpus(service), apply=True)
 
     def test_a_scroll_that_cannot_reach_the_store_aborts_the_lane(self):
         service = FakeMemoryService(service_points(), scroll_error=ConnectionError('down'))
 
-        reports, _ = run_mem0(sweep.ServiceMem0Corpus(service), apply=True)
+        reports, _ = run_mem0(service_corpus(service), apply=True)
 
         assert reports[0].aborted == 'mem0'
         assert service.updates == []
         assert sweep.exit_code(reports) == sweep.EXIT_STORE_UNAVAILABLE
+
+    def test_a_missing_collection_is_an_empty_corpus_not_an_outage(self, caplog):
+        service = FakeMemoryService(service_points(), scroll_error=MissingCollection('404'))
+
+        with caplog.at_level('WARNING'):
+            reports, diffs = run_mem0(service_corpus(service), apply=False)
+
+        (report,) = reports
+        assert (report.aborted, report.scanned, report.expandable) == (None, 0, 0)
+        assert diffs == ()
+        assert sweep.exit_code(reports) == markup_sweep.EXIT_CLEAN
+        assert 'fused_proj_a' in caplog.text
+
+    def test_a_scroll_failure_outside_the_backend_is_a_traceback_not_an_outage(self):
+        budget = RuntimeError('scroll page budget exhausted')
+        service = FakeMemoryService(service_points(), scroll_error=budget)
+
+        with pytest.raises(RuntimeError, match='page budget'):
+            run_mem0(service_corpus(service), apply=False)
+
+
+class TestLiveMem0Failures:
+    """The production policy, wherever the backend packages are installed."""
+
+    def test_qdrants_missing_collection_is_recognised_and_bugs_are_not_backend_failures(self):
+        mem0_client = pytest.importorskip('fused_memory.backends.mem0_client')
+        from httpx import Headers
+        from qdrant_client.http.exceptions import UnexpectedResponse
+
+        policy = sweep.live_mem0_failures()
+        missing = UnexpectedResponse(
+            404, 'Not Found', b'{"status":{"error":"Not found: Collection `x` doesn\'t exist!"}}', Headers()
+        )
+        server_error = UnexpectedResponse(500, 'Internal Server Error', b'boom', Headers())
+
+        assert isinstance(missing, policy.backend)
+        assert policy.is_missing_collection(missing)
+        assert isinstance(server_error, policy.backend)
+        assert not policy.is_missing_collection(server_error)
+        assert isinstance(TimeoutError(), policy.backend)
+        assert not isinstance(mem0_client.ScrollPageBudgetExhausted('cap'), policy.backend)
+        assert not isinstance(KeyError('metadata'), policy.backend)
 
 
 # ---------------------------------------------------------------------------

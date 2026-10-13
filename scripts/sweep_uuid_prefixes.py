@@ -27,11 +27,20 @@ import asyncio
 import contextlib
 import difflib
 import json
+import logging
 import os
 import sys
 import time
 from collections import Counter
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, NamedTuple, Protocol, TypeVar
@@ -49,6 +58,8 @@ from migrate_metadata_modules_to_files import (
 from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV
 from shared.uuid_prefix import PrefixToken, find_prefix_tokens, substitute_all
 from shared.uuid_prefix_guard import PrefixResolver, Resolution, ResolverUnavailable
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # The planner: one record, its tokens' resolutions, what to write.
@@ -267,7 +278,7 @@ class TaskClientSlot:
 
     def __init__(
         self,
-        opener: TaskClientOpener | None,
+        opener: TaskClientOpener,
         server_url: str | None,
         stack: contextlib.AsyncExitStack,
     ) -> None:
@@ -278,14 +289,21 @@ class TaskClientSlot:
 
     async def client(self) -> TaskClient:
         if self._client is None:
-            if self._opener is None:
-                raise ValueError('a tasks-lane write needs a task client and none was injected')
             self._client = await self._stack.enter_async_context(self._opener(self._server_url))
         return self._client
 
 
+class Mem0CallFailed(Exception):
+    """One mem0 read or amend failed in the backend, not in this script."""
+
+
 class Mem0Corpus(Protocol):
-    """A project's Mem0 bodies, read and amended in place by memory id."""
+    """A project's Mem0 bodies, read and amended in place by memory id.
+
+    ``bodies`` raises ``StoreUnavailable`` when the store cannot be walked;
+    ``read_body`` and ``amend_body`` raise ``Mem0CallFailed`` when the backend
+    fails. Any other exception is a bug and propagates.
+    """
 
     def bodies(self, project_id: str) -> AsyncIterator[tuple[str, str]]: ...
 
@@ -299,7 +317,7 @@ class LaneContext(NamedTuple):
 
     scope: SweepScope
     mem0: Mem0Corpus | None
-    tasks: TaskClientSlot
+    tasks: TaskClientSlot | None
 
 
 Population = Callable[[LaneContext], AsyncIterator['Record | markup_sweep.Refusal']]
@@ -422,9 +440,8 @@ async def run_sweep(
     reports: list[LaneReport] = []
     diffs: list[str] = []
     async with contextlib.AsyncExitStack() as stack:
-        context = LaneContext(
-            scope=scope, mem0=mem0, tasks=TaskClientSlot(open_task_client, server_url, stack)
-        )
+        tasks = None if open_task_client is None else TaskClientSlot(open_task_client, server_url, stack)
+        context = LaneContext(scope=scope, mem0=mem0, tasks=tasks)
         for lane in (lane for name, lane in LANES.items() if name in selected):
             report, lane_diffs, memo = await _sweep_lane(
                 lane, context, resolve, memo, apply=apply, pacer=pacer
@@ -618,6 +635,9 @@ _TASK_SELECT = f"SELECT tag, id, {', '.join(TASK_FIELDS)} FROM tasks"
 TASKS_STORE = 'tasks.db'
 #: The server answered, and its answer was not an acceptance.
 REASON_WRITE_REJECTED = 'write-rejected'
+#: A task write that never got a readable answer: transport, HTTP status, a
+#: JSON-RPC error, or a body that is not JSON.
+_TASK_CALL_FAILURES = (httpx.HTTPError, OSError, RuntimeError, ValueError)
 
 
 class WriteRejectedError(RuntimeError):
@@ -659,6 +679,12 @@ def _task_fields(row: Sequence[Any]) -> dict[str, Any]:
 def _task_rows(root: Path) -> list[Any]:
     with contextlib.closing(connect_ro(tasks_db_path(str(root)))) as conn:
         return conn.execute(f'{_TASK_SELECT} ORDER BY tag, id').fetchall()
+
+
+def _required_task_client(context: LaneContext) -> TaskClientSlot:
+    if context.tasks is None:
+        raise ValueError('a tasks-lane write needs a task client and none was injected')
+    return context.tasks
 
 
 def _current_task_fields(source: TaskSource) -> dict[str, Any] | None:
@@ -716,6 +742,7 @@ async def _write_task(
     context: LaneContext, record: Record, after: dict[str, Any]
 ) -> WriteFailureRecord | None:
     source = _source_of(record, TaskSource, LANE_TASKS)
+    tasks = _required_task_client(context)
     try:
         current = _current_task_fields(source)
     except UNREADABLE_STORE_ERRORS as exc:
@@ -730,11 +757,11 @@ async def _write_task(
         )
     payload = build_task_update(source.root, source.tag, source.task_id, record.fields, after)
     try:
-        client = await context.tasks.client()
+        client = await tasks.client()
         assert_write_accepted(await client.call_tool('update_task', payload))
     except WriteRejectedError as exc:
         return WriteFailureRecord(key=record.key, reason=REASON_WRITE_REJECTED, error=str(exc))
-    except (httpx.HTTPError, OSError, RuntimeError) as exc:
+    except _TASK_CALL_FAILURES as exc:
         return WriteFailureRecord(
             key=record.key,
             reason=markup_sweep.REASON_WRITE_FAILED,
@@ -775,16 +802,42 @@ class MemoryStore(Protocol):
     ) -> dict: ...
 
 
+class Mem0Failures(NamedTuple):
+    """How the adapter tells a backend failure from a bug in this script."""
+
+    #: What the backend raises when a call cannot complete.
+    backend: tuple[type[BaseException], ...]
+    #: True for the backend's "that collection does not exist" failure.
+    is_missing_collection: Callable[[BaseException], bool]
+
+
+def live_mem0_failures() -> Mem0Failures:
+    """The live backend's failure types.
+
+    The imports are deferred for the reason ``open_live_stores`` gives.
+    """
+    import openai
+    from fused_memory.backends.mem0_client import is_missing_collection_error
+    from qdrant_client.http.exceptions import ApiException
+
+    return Mem0Failures(
+        backend=(ApiException, openai.APIError, httpx.HTTPError, TimeoutError, OSError),
+        is_missing_collection=is_missing_collection_error,
+    )
+
+
 class ServiceMem0Corpus:
     """``Mem0Corpus`` over a live ``MemoryService``."""
 
-    def __init__(self, memory: MemoryStore) -> None:
+    def __init__(self, memory: MemoryStore, failures: Mem0Failures) -> None:
         self._memory = memory
+        self._failures = failures
 
     async def bodies(self, project_id: str) -> AsyncIterator[tuple[str, str]]:
         """Every point whose ``data`` is text, in scroll order.
 
-        A store that cannot be walked is an outage, never an empty corpus.
+        A collection that was never created holds no memories. Any other
+        backend failure is an outage, never an empty corpus.
         """
         collection = Scope(project_id=project_id).mem0_collection_name(
             self._memory.config.mem0.collection_prefix
@@ -798,11 +851,14 @@ class ServiceMem0Corpus:
                     body = (point.payload or {}).get('data')
                     if isinstance(body, str):
                         yield str(point.id), body
-        except Exception as exc:
-            raise StoreUnavailable(MEM0_STORE) from exc
+        except self._failures.backend as exc:
+            if not self._failures.is_missing_collection(exc):
+                raise StoreUnavailable(MEM0_STORE) from exc
+            logger.warning('mem0 collection %s does not exist, so it holds no memories', collection)
 
     async def read_body(self, project_id: str, memory_id: str) -> str | None:
-        record = await self._memory.get_memory_by_id(project_id=project_id, memory_id=memory_id)
+        with self._backend_call():
+            record = await self._memory.get_memory_by_id(project_id=project_id, memory_id=memory_id)
         if record is None:
             return None
         body = record['metadata'].get('data')
@@ -810,14 +866,22 @@ class ServiceMem0Corpus:
 
     async def amend_body(self, project_id: str, memory_id: str, body: str) -> Mapping[str, Any]:
         """A content-only amend: same point id, every metadata key left as stored."""
-        return await self._memory.update_memory(
-            memory_id=memory_id,
-            project_id=project_id,
-            content=body,
-            reason=WRITE_REASON,
-            agent_id=WRITE_SOURCE,
-            _source=WRITE_SOURCE,
-        )
+        with self._backend_call():
+            return await self._memory.update_memory(
+                memory_id=memory_id,
+                project_id=project_id,
+                content=body,
+                reason=WRITE_REASON,
+                agent_id=WRITE_SOURCE,
+                _source=WRITE_SOURCE,
+            )
+
+    @contextlib.contextmanager
+    def _backend_call(self) -> Iterator[None]:
+        try:
+            yield
+        except self._failures.backend as exc:
+            raise Mem0CallFailed(f'{type(exc).__name__}: {exc}') from exc
 
 
 class Mem0Source(NamedTuple):
@@ -860,13 +924,8 @@ async def _write_mem0(
                 error='the memory body changed between the scan and the write',
             )
         reply = await corpus.amend_body(project_id, source.memory_id, after['data'])
-    except Exception as exc:
-        # One backend hiccup costs one report row, not the run.
-        return WriteFailureRecord(
-            key=record.key,
-            reason=markup_sweep.REASON_WRITE_FAILED,
-            error=f'{type(exc).__name__}: {exc}',
-        )
+    except Mem0CallFailed as exc:
+        return WriteFailureRecord(key=record.key, reason=markup_sweep.REASON_WRITE_FAILED, error=str(exc))
     rejection = _amend_rejection(reply)
     if rejection is not None:
         return WriteFailureRecord(key=record.key, reason=REASON_WRITE_REJECTED, error=rejection)
@@ -943,7 +1002,7 @@ async def open_live_stores(config_path: str | None, *, mem0_apply: bool) -> Asyn
         await memory.initialize()
         yield LiveStores(
             resolve=IdResolver.for_memory_service(memory).resolve_prefix,
-            mem0=ServiceMem0Corpus(memory),
+            mem0=ServiceMem0Corpus(memory, live_mem0_failures()),
         )
     finally:
         await memory.close()
