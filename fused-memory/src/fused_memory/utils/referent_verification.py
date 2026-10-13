@@ -270,14 +270,12 @@ class ReferentFinding:
     #: resolves-or-mints and handles them identically); this flag is what stops
     #: the first from being folded in with them.
     #:
-    #: THE CONCRETE STAKE. Task 3672's landed repair path reads
-    #: :attr:`new_endpoint_uuid` at exactly ONE site —
-    #: ``minted=finding.new_endpoint_uuid is None`` in
-    #: :meth:`_repair_episode_referents` — so today a transient FalkorDB error
-    #: books as ``minted=True`` telemetry: a node reported as newly created
-    #: where in fact nobody could look. This flag is the discriminator that
-    #: makes that a one-line fix in eta; zeta produces it and does not act on it
-    #: (that consequence is filed as its own follow-up).
+    #: WHO ACTS ON IT. zeta produces this flag and does not act on it. eta
+    #: (``fused_memory/services/memory_service.py::MemoryService._repair_edge_findings``)
+    #: DEFERS a degraded finding, recording it as ``'failed'`` with nothing
+    #: written, rather than resolving-or-minting off a lookup that could not
+    #: look. Read as "absent", it would book ``minted=True`` for a node nobody
+    #: showed was missing.
     #:
     #: Fail-closed like :attr:`resolvable`: a finding whose lookup never ran —
     #: one with no ``intended_referent`` — is not a finding whose lookup was
