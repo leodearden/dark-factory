@@ -27,8 +27,9 @@ by the helpers here, whose contents the test controls exactly.
 
 The live-corpus tests in this file
 (:func:`test_live_sidecars_carry_the_resynced_descriptors`,
-:func:`test_live_sidecars_still_declare_none_of_the_adjudicated_labels` and
-:func:`test_live_foreign_producer_blocks_declare_their_external_registry`)
+:func:`test_live_sidecars_still_declare_none_of_the_adjudicated_labels`,
+:func:`test_live_foreign_producer_blocks_declare_their_external_registry` and
+:func:`test_identifier_anchor_names_a_definition_inside_its_certified_suite`)
 read only TRACKED GIT FILES and open no database at all — the same legitimacy
 as shared/tests/test_capability_manifest.py::TestCheckedInManifestCorpus and
 scripts/tests/test_lms_marker_contract.py.
@@ -2624,7 +2625,7 @@ _MEASURED_DRIFT_ROWS = (
         # broke silently if anyone reworded the docstring, so this row now
         # anchors on the suite's own class identifier instead — same rule as
         # the γ1/3536 row below. See
-        # test_alpha4_anchor_is_an_identifier_inside_the_certified_suite.
+        # test_identifier_anchor_names_a_definition_inside_its_certified_suite.
         _grep("test_sandbox_enforcement_matrix", ["orchestrator/tests/"]),
         _grep("TestSandboxEnforcementMatrix", ["orchestrator/tests/"]),
     ),
@@ -2644,6 +2645,8 @@ _MEASURED_DRIFT_ROWS = (
         # THE FILENAME-VS-CONTENT MODE. orchestrator/tests/
         # test_workflow_merge_gating_strand.py DOES exist, but kind=grep
         # searches CONTENT and a test module does not mention its own name.
+        # The resynced anchor is identifier-anchored, checked by
+        # test_identifier_anchor_names_a_definition_inside_its_certified_suite.
         _grep("test_workflow_merge_gating_strand", ["orchestrator/tests/"]),
         _grep("TestNoStrandExitProperty", ["orchestrator/tests/"]),
     ),
@@ -2872,27 +2875,7 @@ def test_live_sidecars_carry_the_resynced_descriptors(
     """
     root = checkout_root_or_skip()
 
-    # NON-VACUITY FLOOR: assert the sidecar is TRACKED before reading it, so a
-    # renamed or deleted manifest cannot make this test pass by finding
-    # nothing to check.
-    tracked = subprocess.run(
-        ["git", "-C", root, "ls-files", "--", relpath],
-        capture_output=True, text=True, timeout=30,
-    )
-    assert tracked.stdout.strip(), f"{relpath} is not tracked in {root}"
-
-    doc = load_capability_manifest(Path(root) / relpath)
-    matches = [
-        cap for task in doc.tasks if task.label == label
-        for cap in task.capabilities if cap.name == capability
-    ]
-    assert len(matches) == 1, (
-        f"expected exactly one {capability!r} under label {label!r} "
-        f"in {relpath}, found {len(matches)}"
-    )
-
-    check = matches[0].delivered_check
-    assert check is not None
+    check = _live_delivered_check(root, relpath, label, capability)
     assert check.model_dump() == {
         "kind": resynced["kind"],
         "pattern": resynced["pattern"],
@@ -3112,57 +3095,4 @@ def test_identifier_anchor_names_a_definition_inside_its_certified_suite(key, su
     )
     assert reading.defines_in_suite, (
         f"{where}: no hit inside {suite} is a 'class '/'def ' line"
-    )
-
-
-def test_alpha4_anchor_is_an_identifier_inside_the_certified_suite():
-    """The α4 (task 2906) anchor must name a class/def inside the certified
-    suite, not prose it merely contains — grepped with the argv of
-    orchestrator/src/orchestrator/delivered_checks.py::_run_grep_check, over
-    the working tree instead of a ref."""
-    root = checkout_root_or_skip()
-
-    relpath = "plans/os-sandbox-worktree-containment-prd.capability-manifest.yaml"
-    doc = load_capability_manifest(Path(root) / relpath)
-    matches = [
-        cap for task in doc.tasks if task.label == "α4"
-        for cap in task.capabilities if cap.name == "enforcement-matrix-suite-exists"
-    ]
-    assert len(matches) == 1, (
-        f"expected exactly one enforcement-matrix-suite-exists capability "
-        f"under label α4 in {relpath}, found {len(matches)}"
-    )
-    check = matches[0].delivered_check
-    assert check is not None
-    pattern = check.pattern
-    assert pattern is not None, (
-        f"expected a grep check with a pattern, got kind={check.kind!r}"
-    )
-
-    completed = subprocess.run(
-        ["git", "-C", root, "grep", "-E", "-n", "-e", pattern, "--",
-         *check.paths],
-        capture_output=True, text=True, timeout=30,
-    )
-    assert completed.returncode in (0, 1), (
-        f"git grep errored (rc={completed.returncode}, stderr: "
-        f"{completed.stderr!r}) on pattern {pattern!r} under {check.paths!r} — "
-        f"_run_grep_check would report ERRORED"
-    )
-    assert completed.returncode == 0, (
-        f"pattern {pattern!r} matched nothing under {check.paths!r} — "
-        f"_run_grep_check would report FAILED on main"
-    )
-    parsed = [line.split(":", 2) for line in completed.stdout.splitlines() if line]
-    assert parsed, "grep reported rc=0 but produced no output lines"
-
-    paths_matched = {fields[0] for fields in parsed}
-    assert paths_matched == {"orchestrator/tests/test_sandbox_enforcement_matrix.py"}, (
-        f"anchor {pattern!r} leaked outside the certified suite: "
-        f"{sorted(paths_matched)}"
-    )
-
-    assert any(fields[2].lstrip().startswith(("class ", "def ")) for fields in parsed), (
-        f"anchor {pattern!r} does not name a definition the suite "
-        f"owns — no matched line starts with 'class '/'def ' after lstrip()"
     )
