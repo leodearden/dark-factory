@@ -7,6 +7,11 @@ token comes from ``shared.uuid_prefix`` (C1) and every answer from the
 ``unique`` tokens are expanded; ``ambiguous`` ones are reported by record and
 left byte-identical, ``none`` ones are counted and left alone.
 
+One deliberate departure from §4-C6: the tasks lane sends ``update_task`` a
+``merge`` of only the changed metadata keys, not a ``replace`` of the
+just-read blob. A replace strips stored wait anchors and reverts any
+concurrent write to a sibling key (``build_task_update``).
+
 Run it from the checkout root, one project per sitting, dry run first (the
 default), then one lane at a time::
 
