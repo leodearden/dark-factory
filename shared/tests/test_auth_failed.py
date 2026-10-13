@@ -1023,7 +1023,7 @@ class TestSighupKeepsUnverifiedTokensBlocked:
             pytest.param(AsyncMock(side_effect=_spawn_fault()), id='probe-could-not-spawn'),
         ],
     )
-    async def test_unconfirmed_probe_keeps_the_account_out_of_service(self, probe):
+    async def test_unconfirmed_probe_keeps_the_account_out_of_service(self, probe: AsyncMock):
         gate = _make_gate(_ROSTER)
         try:
             _settle_only(gate, 'acct-2', _ORG_DISABLED)

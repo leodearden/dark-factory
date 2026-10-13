@@ -2161,6 +2161,7 @@ class UsageGate:
           AUTH_FAILED account stays blocked until its probe confirms the token
         - reopen the global gate
         - fire a probe per account in parallel
+        - clear the pause reason once the pool is no longer paused
 
         ``cumulative_cost`` is intentionally NOT reset — it is a budget
         counter, unrelated to token state.
@@ -2184,12 +2185,13 @@ class UsageGate:
             # un-blocks it only on a probe that ran and succeeded (task 5946).
             if acct.phase != AccountPhase.AUTH_FAILED:
                 self._transition(acct, AccountPhase.AVAILABLE, force=True)
-        self._paused_reason = ''
         logger.info(f'SIGHUP: reloaded {len(self._accounts)} account(s); firing probes')
         await asyncio.gather(
             *(self._reprobe_account(a) for a in self._accounts),
             return_exceptions=True,
         )
+        if not self.is_paused:
+            self._paused_reason = ''
 
     def _find_account_by_token(self, token: str) -> AccountState | None:
         for acct in self._accounts:
