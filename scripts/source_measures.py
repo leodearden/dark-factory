@@ -924,13 +924,20 @@ def _declared_members(path: Path, config: dict[str, object]) -> tuple[str, ...]:
     duplicates = sorted({member for member in members if members.count(member) > 1})
     if duplicates:
         raise MetricsError(f'{path}: {_MEMBERS_KEY} lists duplicate member(s) {duplicates!r}')
-    collisions = sorted(set(members) & {pseudo.name for pseudo in PSEUDO_MEMBERS})
+    _require_no_pseudo_collision(path, _MEMBERS_KEY, members, PSEUDO_MEMBERS)
+    return tuple(members)
+
+
+def _require_no_pseudo_collision(
+    path: Path, key: str, names: Sequence[str], pseudo_members: Sequence[MemberRoots]
+) -> None:
+    """Members are keyed by name in evidence and --summary, so no two may share one."""
+    collisions = sorted(set(names) & {pseudo.name for pseudo in pseudo_members})
     if collisions:
         raise MetricsError(
-            f'{path}: {_MEMBERS_KEY} names {collisions!r}, which collide with the '
+            f'{path}: {key} names {collisions!r}, which collide with the '
             'pseudo-member of the same name'
         )
-    return tuple(members)
 
 
 def _project_name(path: Path, config: dict[str, object]) -> str:
@@ -953,6 +960,7 @@ def _single_package_members(
     be evidenced: src/ holds tracked .py.
     """
     name = _project_name(path, config)
+    _require_no_pseudo_collision(path, _PROJECT_NAME_KEY, (name,), _SINGLE_PACKAGE_PSEUDO_MEMBERS)
     package = MemberRoots.single_package(name)
     if not _git_output(root, 'ls-files', '-z', '--', f'{package.src_root}/*.py'):
         raise MetricsError(
@@ -1012,18 +1020,38 @@ def _domain_member(
     return DomainMember(name=member.name, pseudo=member.pseudo, files=files)
 
 
-def _require_declared_members_populated(domain: tuple[DomainMember, ...]) -> None:
+def _require_declared_members_populated(
+    members: Sequence[MemberRoots], domain: tuple[DomainMember, ...]
+) -> None:
     """A DECLARED member with no files would read as measured and clean.
 
     A pseudo-member is a convention, not a declaration, so it may be empty.
     """
-    empty = [member.name for member in domain if not member.pseudo and not member.files]
+    empty = [
+        roots
+        for roots, member in zip(members, domain, strict=True)
+        if not member.pseudo and not member.files
+    ]
     if empty:
         raise MetricsError(
             '; '.join(
-                f'{name} has no tracked .py under {name}/src or {name}/tests'
-                for name in empty
+                f'{roots.name} has no tracked .py under {roots.src_root} or {roots.tests_root}'
+                for roots in empty
             )
+        )
+
+
+def _require_disjoint_members(domain: tuple[DomainMember, ...]) -> None:
+    """A file under two members' roots would be measured twice."""
+    holders: dict[str, list[str]] = {}
+    for member in domain:
+        for domain_file in member.files:
+            holders.setdefault(domain_file.path, []).append(member.name)
+    shared = [(path, names) for path, names in sorted(holders.items()) if len(names) > 1]
+    if shared:
+        raise MetricsError(
+            "tracked file(s) under two members' roots would be measured twice: "
+            + '; '.join(f'{path} is held by members {names!r}' for path, names in shared)
         )
 
 
@@ -1042,7 +1070,8 @@ def workspace_domain(root: Path) -> tuple[DomainMember, ...]:
     members = _domain_members(root)
     entries = _tracked_blobs(root, '*.py')
     domain = tuple(_domain_member(member, entries) for member in members)
-    _require_declared_members_populated(domain)
+    _require_declared_members_populated(members, domain)
+    _require_disjoint_members(domain)
     return domain
 
 
