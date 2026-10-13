@@ -1119,6 +1119,46 @@ class TestWorkspaceDomainFailsHard:
         with pytest.raises(source_measures.MetricsError, match='gamma'):
             source_measures.workspace_domain(root)
 
+    def test_a_declared_members_refusal_names_its_own_roots(self, tmp_path: Path) -> None:
+        root = _domain_repo(
+            tmp_path / 'repo',
+            pyproject=_workspace('alpha', 'gamma'),
+            tracked=('alpha/src/alpha/a.py', 'gamma/pyproject.toml'),
+        )
+        with pytest.raises(source_measures.MetricsError, match='gamma/src') as refused:
+            source_measures.workspace_domain(root)
+        assert 'gamma/tests' in str(refused.value)
+
+    def test_a_single_package_named_like_a_pseudo_member_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        # Two members named 'scripts' would merge in evidence and in --summary,
+        # which are keyed by member name.
+        root = _domain_repo(
+            tmp_path / 'repo',
+            pyproject='[project]\nname = "scripts"\n',
+            tracked=('src/scripts/a.py', 'scripts/tool.py'),
+        )
+        with pytest.raises(source_measures.MetricsError, match=r"'scripts'.*pseudo-member"):
+            source_measures.workspace_domain(root)
+
+    def test_a_path_under_two_members_roots_is_refused_naming_both(
+        self, tmp_path: Path
+    ) -> None:
+        # 'scripts/tool' passes every member-list check, but its src root lies
+        # inside the scripts pseudo-member's, so b.py would be measured twice.
+        root = _domain_repo(
+            tmp_path / 'repo',
+            pyproject=_workspace('alpha', 'scripts/tool'),
+            tracked=('alpha/src/alpha/a.py', 'scripts/tool/src/tool/b.py'),
+        )
+        with pytest.raises(
+            source_measures.MetricsError, match='scripts/tool/src/tool/b.py'
+        ) as refused:
+            source_measures.workspace_domain(root)
+        assert "'scripts/tool'" in str(refused.value)
+        assert "'scripts'" in str(refused.value)
+
     def test_an_empty_pseudo_member_is_returned_empty(self, tmp_path: Path) -> None:
         # Pseudo-members are conventions, not declarations: a tree without
         # scripts/ or tests/ legitimately has none there.
