@@ -79,8 +79,9 @@ from census_tagger_debris import (
     render_markdown,
     write_artifacts,
 )
-from shared import project_layout
 from shared.project_id import project_id_for_root
+
+from shared import project_layout
 
 # ---------------------------------------------------------------------------
 # The classification vocabulary and the pure three-axis classifier.
