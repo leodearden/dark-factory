@@ -707,16 +707,20 @@ def load_topic_registry(path: str | Path) -> TopicRegistry:
 
     entries = [_parse_entry(raw, i) for i, raw in enumerate(raw_entries)]
 
-    seen: dict[str, int] = {}
+    seen: dict[str, tuple[int, str]] = {}
     for i, entry in enumerate(entries):
-        if entry.topic in seen:
+        folded = normalize_topic(entry.topic)
+        if folded in seen:
+            earlier_index, earlier_topic = seen[folded]
             raise _fail(
                 entry.topic,
-                f'duplicate topic slug (also at index {seen[entry.topic]}). The slug is '
-                'the persisted tripwire item key, so a duplicate would make one of the '
-                'two invisible to the grandfather set.',
+                f'duplicate topic: index {earlier_index} already carries '
+                f'{earlier_topic!r}, and both fold to {folded!r} under normalize_topic. '
+                'The slug is the persisted tripwire item key, so a duplicate would make '
+                'one of the two invisible to the grandfather set, and a spelling-variant '
+                'pair would measure one topic twice.',
             )
-        seen[entry.topic] = i
+        seen[folded] = (i, entry.topic)
 
     return TopicRegistry(
         schema_version=schema_version,
