@@ -492,11 +492,64 @@ class HeartbeatWriter:
 # ---------------------------------------------------------------------------
 
 
-def wait_for_pgid_file(path: Path, *, timeout: float | None = None, interval: float = 0.05) -> int:
+def describe_proc_exit(proc: subprocess.Popen, label: str) -> str:
+    """Name *proc*'s exit status -- and, once it has exited, its stderr tail.
+
+    The diagnostic a discovery wait appends on timeout: ``<label>
+    rc=<n|None>``.  *label* names *proc* in the message; pass e.g.
+    ``"dispatcher"`` when *proc* is a stand-in process rather than the leader
+    itself, so a reader doesn't apply the rc taxonomy below to the wrong
+    process.  For the LEADER specifically, that rc distinguishes a watchdog
+    self-kill (rc == 1, no ``Error:`` line), an exception exit (rc == 1 WITH
+    an ``Error:`` line), and a merely slow leader (rc is None) -- three
+    causes that were otherwise indistinguishable in every log this timeout
+    has ever produced; a non-leader *proc* follows its own exit-code
+    conventions, not this taxonomy.  ``stderr`` is read ONLY when
+    ``proc.poll()`` is not None, and even then via a ``select()``-bounded raw
+    read (2s ceiling) rather than a buffered ``.read()`` (which blocks to
+    EOF): ``poll()`` only reports *proc*'s own exit, and a short-lived helper
+    it spawned with inherited fds could still be holding the pipe's write end
+    open, which would hang this helper (and the rest of the suite) rather
+    than raise.  The tail (not head) is kept -- see :func:`stderr_tail` --
+    since the actionable line is at the END.
+    """
+    rc = proc.poll()
+    description = f'{label} rc={rc}'
+    if rc is not None and proc.stderr is not None:
+        try:
+            chunks = []
+            read_deadline = time.monotonic() + 2.0
+            fd = proc.stderr.fileno()
+            while True:
+                remaining = read_deadline - time.monotonic()
+                if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+                    break
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            tail = stderr_tail(b''.join(chunks))
+        except Exception as e:  # noqa: BLE001
+            tail = f'<unreadable: {e!r}>'
+        description += f'; stderr tail:\n{tail}'
+    return description
+
+
+def wait_for_pgid_file(
+    path: Path,
+    *,
+    proc: subprocess.Popen | None = None,
+    proc_label: str = 'leader',
+    timeout: float | None = None,
+    interval: float = 0.05,
+) -> int:
     """Poll for a pgid file and return its int value.
 
     Written by ``verify-merge --request-id`` or by a :func:`sleeper_spec`
     build with *build_pgid_file*.
+
+    *proc*, when given, is the process whose exit a timeout failure reports,
+    under *proc_label* -- see :func:`describe_proc_exit`.
 
     *timeout* defaults to :func:`row_discovery_ceiling_secs`, resolved when
     the wait actually STARTS rather than at import, so a row beginning
@@ -509,7 +562,10 @@ def wait_for_pgid_file(path: Path, *, timeout: float | None = None, interval: fl
             with contextlib.suppress(ValueError):
                 return int(path.read_text().strip())
         time.sleep(interval)
-    raise AssertionError(f'pgid file {path} did not appear within {timeout}s')
+    message = f'pgid file {path} did not appear within {timeout}s'
+    if proc is not None:
+        message += f'; {describe_proc_exit(proc, proc_label)}'
+    raise AssertionError(message)
 
 
 def _read_direct_children(pid: int, *, _proc_root: Path = Path('/proc')) -> set[int] | None:
@@ -621,24 +677,8 @@ def wait_subtree_live(
     SEPARATE dispatcher process, that dispatcher) whose ``stdout``/``stderr``
     were opened with ``subprocess.PIPE`` -- see :func:`spawn_verify_merge`.
     It's optional so no existing call site is forced to change semantics.
-    *proc_label* names *proc* in the failure message (default ``"leader"``);
-    pass e.g. ``proc_label="dispatcher"`` when *proc* is a stand-in process
-    rather than the leader itself, so a reader doesn't apply the rc taxonomy
-    below to the wrong process.  When *proc* is given, a timeout failure
-    names its exit status (``<proc_label> rc=<n|None>``).  For the LEADER
-    specifically, that rc distinguishes a watchdog self-kill (rc == 1, no
-    ``Error:`` line), an exception exit (rc == 1 WITH an ``Error:`` line),
-    and a merely slow leader (rc is None) -- three causes that were
-    otherwise indistinguishable in every log this timeout has ever
-    produced; a non-leader *proc* follows its own exit-code conventions,
-    not this taxonomy.  ``stderr`` is read ONLY when ``proc.poll()`` is not
-    None, and even then via a ``select()``-bounded raw read (2s ceiling)
-    rather than a buffered ``.read()`` (which blocks to EOF): ``poll()``
-    only reports *proc*'s own exit, and a short-lived helper it spawned
-    with inherited fds could still be holding the pipe's write end open,
-    which would hang this helper (and the rest of the suite) rather than
-    raise.  The tail (not head) is kept -- see :func:`stderr_tail` -- since
-    the actionable line is at the END.
+    When given, a timeout failure reports its exit under *proc_label* -- see
+    :func:`describe_proc_exit`.
 
     *timeout* defaults to :func:`row_discovery_ceiling_secs`, resolved when
     the wait actually STARTS rather than at import, so a row beginning
@@ -671,25 +711,7 @@ def wait_subtree_live(
         time.sleep(interval)
     message = f'pgid {pgid}: no descendant appeared within {timeout}s'
     if proc is not None:
-        rc = proc.poll()
-        message += f'; {proc_label} rc={rc}'
-        if rc is not None and proc.stderr is not None:
-            try:
-                chunks = []
-                read_deadline = time.monotonic() + 2.0
-                fd = proc.stderr.fileno()
-                while True:
-                    remaining = read_deadline - time.monotonic()
-                    if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
-                        break
-                    chunk = os.read(fd, 65536)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                tail = stderr_tail(b''.join(chunks))
-            except Exception as e:  # noqa: BLE001
-                tail = f'<unreadable: {e!r}>'
-            message += f'; stderr tail:\n{tail}'
+        message += f'; {describe_proc_exit(proc, proc_label)}'
     raise AssertionError(message)
 
 
@@ -4804,12 +4826,12 @@ def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
     tree: set[int] = set()
     try:
         leader = wait_for_pgid_file(pgf, timeout=row_discovery_ceiling_secs())
-        try:
-            build_pgid = wait_for_pgid_file(build_pgf, timeout=row_discovery_ceiling_secs())
-        except AssertionError as exc:
-            # Row 1 owns the DISPATCHER process, not the leader, so the
-            # dispatcher's rc is the exit status this row can report.
-            pytest.fail(f'{exc}; dispatcher rc={dispatcher.poll()}')
+        build_pgid = wait_for_pgid_file(
+            build_pgf,
+            proc=dispatcher,
+            proc_label='dispatcher',
+            timeout=row_discovery_ceiling_secs(),
+        )
         tree = {leader} | collect_descendants(leader, read_ppid_map())
         assert build_pgid in tree, (
             f'harness failure, not a seam defect: build pgid {build_pgid} is not in '
