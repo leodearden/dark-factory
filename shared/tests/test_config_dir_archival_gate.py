@@ -345,7 +345,7 @@ class TestDispositionsMatchTheCode:
         ARCHIVED direction self-guards — it fails loudly on an empty scan — but
         the UNARCHIVED direction does not, so it needs this.)
         """
-        assert len(archival_ref_sites) >= 5, (
+        assert len(archival_ref_sites) >= 7, (
             f'Only {len(archival_ref_sites)} archival reference site(s) found: '
             f'{sorted(archival_ref_sites)}. Seven are known — '
             f'TaskWorkflow._invoke and run_dry_run_unblock (producer hooks), '
