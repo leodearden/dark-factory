@@ -22,6 +22,7 @@ from typing import NamedTuple
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _usage_gate_test_helpers import make_mock_cost_store
 from _usage_gate_test_helpers import spawn_fault as _spawn_fault
 from silent_fallthrough_scan import ParsedFile
 
@@ -48,6 +49,7 @@ def _make_gate(
     *,
     wait_for_reset: bool = False,
     auth_reprobe_secs: int = 3600,
+    cost_store=None,
 ) -> UsageGate:
     acct_cfgs = []
     env_vars: dict[str, str] = {}
@@ -61,7 +63,7 @@ def _make_gate(
         auth_reprobe_secs=auth_reprobe_secs,
     )
     with patch.dict(os.environ, env_vars):
-        gate = UsageGate(config)
+        gate = UsageGate(config, cost_store=cost_store)
     gate._run_probe = AsyncMock(return_value=True)
     return gate
 
@@ -1005,6 +1007,75 @@ class TestSighupTriggersReprobe:
             await gate._on_sighup_async()
         # New semantics: SIGHUP always probes every account.
         gate._run_probe.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+class TestSighupKeepsUnverifiedTokensBlocked:
+    """Task 5946: SIGHUP used to force-reset an AUTH_FAILED account to
+    AVAILABLE before probing it, so a dead token was re-admitted whatever the
+    probe said. Only a probe that ran and succeeded may un-block it.
+    """
+
+    @pytest.mark.parametrize(
+        'probe',
+        [
+            pytest.param(AsyncMock(return_value=False), id='probe-ran-and-failed'),
+            pytest.param(AsyncMock(side_effect=_spawn_fault()), id='probe-could-not-spawn'),
+        ],
+    )
+    async def test_unconfirmed_probe_keeps_the_account_out_of_service(self, probe):
+        gate = _make_gate(_ROSTER)
+        try:
+            _settle_only(gate, 'acct-2', _ORG_DISABLED)
+            gate._run_probe = probe
+
+            with patch('shared.usage_gate.load_dotenv'):
+                await gate._on_sighup_async()
+
+            assert gate._run_probe.await_count == 3
+            assert gate.auth_failed_account_names == ('acct-2',)
+            assert _leasable_names(gate) == ['acct-1', 'acct-3']
+        finally:
+            await gate.shutdown()
+
+    async def test_confirmed_probe_readmits_the_account_and_records_auth_resumed(self):
+        store = make_mock_cost_store()
+        gate = _make_gate(_ROSTER, cost_store=store)
+        try:
+            gate._run_probe = AsyncMock(return_value=True)
+            _settle_only(gate, 'acct-2', _ORG_DISABLED)
+
+            with patch('shared.usage_gate.load_dotenv'):
+                await gate._on_sighup_async()
+            await asyncio.sleep(0)
+
+            assert gate.auth_failed_account_names == ()
+            assert 'acct-2' in _leasable_names(gate)
+            resumed = [
+                call for call in store.save_account_event.await_args_list
+                if call.kwargs['event_type'] == 'auth_resumed'
+                and call.kwargs['account_name'] == 'acct-2'
+            ]
+            assert len(resumed) == 1
+        finally:
+            await gate.shutdown()
+
+    async def test_a_capped_account_keeps_the_hard_reset(self):
+        """CAPPED deliberately keeps SIGHUP's reset to AVAILABLE so a real
+        dispatch can reclassify an auth failure masked by CAPPED (see the
+        UsageGate "Phase precedence" docstring).
+        """
+        gate = _make_gate(_ROSTER)
+        try:
+            _settle_only(gate, 'acct-1', CapHit(resets_at=None, reason="You've hit your limit"))
+            gate._run_probe = AsyncMock(return_value=False)
+
+            with patch('shared.usage_gate.load_dotenv'):
+                await gate._on_sighup_async()
+
+            assert 'acct-1' in _leasable_names(gate)
+        finally:
+            await gate.shutdown()
 
 
 @pytest.mark.asyncio
