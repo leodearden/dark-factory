@@ -25,7 +25,7 @@ machine-readable contract tokens the Python side actually reads
 ``test_recon_gate_closure_guidance.py`` house rule, prose wording beyond
 those tokens is intentionally NOT pinned here.
 
-It also pins the code-side layer: the pure ``_count_valid_task_created_records``
+It also pins the code-side layer: the pure ``stage2_counter_grounding.coerce_count``
 helper, and the deterministic upward-only repair
 ``TaskKnowledgeSync._apply_post_flight_guards`` performs when the
 self-reported ``tasks_created`` undercounts the ``task_created_records``
@@ -50,11 +50,8 @@ from fused_memory.reconciliation.prompts.stage2 import (
 from fused_memory.reconciliation.recon_self_model import (
     render_task_creation_accounting_section,
 )
-from fused_memory.reconciliation.stages.task_knowledge_sync import (
-    TaskKnowledgeSync,
-    _coerce_tasks_created_count,
-    _count_valid_task_created_records,
-)
+from fused_memory.reconciliation.stage2_counter_grounding import coerce_count
+from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
 
 
 class TestTaskCreationAccountingWiring:
@@ -106,187 +103,13 @@ class TestTaskCreationAccountingWiring:
         assert '"action": "task_created"' in built
 
 
-class TestCountValidTaskCreatedRecords:
-    """Pins _count_valid_task_created_records (task 3046): a defensive,
-    non-raising, deduped counter over stats['task_created_records'] — the
-    code-side complement to the '## Verifying Task Operations' confirmation
-    rule and the '## Task-Creation Accounting' action-record mandate.
-    """
-
-    # -- degenerate input: never raises, always 0 --------------------------
-
-    @pytest.mark.parametrize(
-        'records',
-        [None, {}, 'x', 3, []],
-        ids=['none', 'dict', 'str', 'int', 'empty-list'],
-    )
-    def test_degenerate_input_returns_zero(self, records):
-        assert _count_valid_task_created_records(records) == 0
-
-    # -- confirmation-status predicate ---------------------------------------
-
-    def test_one_created_record_counts_one(self):
-        records = [
-            {
-                'action': 'task_created',
-                'task_id': '3045',
-                'status': 'created',
-                'project_id': 'dark_factory',
-            },
-        ]
-        assert _count_valid_task_created_records(records) == 1
-
-    def test_combined_status_counts_as_success(self):
-        """`combined` is a success per `## Creating Tasks` — a candidate
-        merged into an existing task still returns a task_id."""
-        records = [
-            {
-                'action': 'task_created',
-                'task_id': '3045',
-                'status': 'combined',
-                'project_id': 'dark_factory',
-            },
-        ]
-        assert _count_valid_task_created_records(records) == 1
-
-    def test_failed_status_never_counts_even_with_task_id(self):
-        """`failed` is never counted toward tasks_created regardless of
-        whether a task_id is present — mirrors the '## Verifying Task
-        Operations' rule this helper encodes in Python."""
-        records = [
-            {
-                'action': 'task_created',
-                'task_id': '3045',
-                'status': 'failed',
-                'project_id': 'dark_factory',
-            },
-        ]
-        assert _count_valid_task_created_records(records) == 0
-
-    @pytest.mark.parametrize(
-        'record',
-        [
-            {'status': 'created', 'project_id': 'dark_factory'},
-            {'status': 'created', 'project_id': 'dark_factory', 'task_id': None},
-            {'status': 'created', 'project_id': 'dark_factory', 'task_id': ''},
-        ],
-        ids=['missing-task_id', 'none-task_id', 'empty-task_id'],
-    )
-    def test_missing_or_empty_task_id_does_not_count(self, record):
-        assert _count_valid_task_created_records([record]) == 0
-
-    @pytest.mark.parametrize(
-        'record',
-        [
-            {'task_id': '3045', 'status': 'pending', 'project_id': 'dark_factory'},
-            {'task_id': '3045', 'project_id': 'dark_factory'},
-        ],
-        ids=['unknown-status', 'missing-status'],
-    )
-    def test_unknown_or_missing_status_does_not_count(self, record):
-        """Only created/combined count — the helper does not guess at an
-        absent or unrecognized status."""
-        assert _count_valid_task_created_records([record]) == 0
-
-    # -- malformed entries are skipped, never raise --------------------------
-
-    def test_non_dict_entries_interleaved_with_one_valid_record(self):
-        records = [
-            None,
-            'x',
-            ['a'],
-            {
-                'action': 'task_created',
-                'task_id': '3045',
-                'status': 'created',
-                'project_id': 'dark_factory',
-            },
-        ]
-        assert _count_valid_task_created_records(records) == 1
-
-    # -- dedup: keyed on (project_id, str(task_id)) --------------------------
-
-    def test_dedups_same_project_and_task_id(self):
-        records = [
-            {'task_id': '3045', 'status': 'created', 'project_id': 'dark_factory'},
-            {'task_id': '3045', 'status': 'combined', 'project_id': 'dark_factory'},
-        ]
-        assert _count_valid_task_created_records(records) == 1
-
-    def test_same_task_id_under_different_projects_counts_twice(self):
-        """Cross-project routing files genuinely distinct tasks — Taskmaster
-        ids are per-project, so the same numeric id under two different
-        project_ids is two distinct tasks, not a duplicate."""
-        records = [
-            {'task_id': '3045', 'status': 'created', 'project_id': 'dark_factory'},
-            {'task_id': '3045', 'status': 'created', 'project_id': 'autopilot_video'},
-        ]
-        assert _count_valid_task_created_records(records) == 2
-
-    def test_dedups_int_and_str_task_id_forms(self):
-        """task_id normalises to str before deduping — the repo's existing
-        str(task_id) exact-form convention."""
-        records = [
-            {'task_id': 3045, 'status': 'created', 'project_id': 'dark_factory'},
-            {'task_id': '3045', 'status': 'combined', 'project_id': 'dark_factory'},
-        ]
-        assert _count_valid_task_created_records(records) == 1
-
-    # -- project_id normalisation (task-3046 amendment) -----------------------
-
-    def test_dedups_project_id_with_surrounding_whitespace(self):
-        """project_id is normalised via str(...).strip(), same as task_id —
-        ' dark_factory' and 'dark_factory' must collapse to one key, not
-        inflate the count by masquerading as a second distinct project."""
-        records = [
-            {'task_id': '3045', 'status': 'created', 'project_id': 'dark_factory'},
-            {'task_id': '3045', 'status': 'combined', 'project_id': ' dark_factory '},
-        ]
-        assert _count_valid_task_created_records(records) == 1
-
-    def test_missing_project_id_collapses_onto_default_project_id(self):
-        """A record with no project_id falls back to default_project_id (the
-        caller's own self.project_id) rather than keying as a distinct
-        `None` project — so an omitted field can't masquerade as a second,
-        distinct cross-project filing of the same task."""
-        records = [
-            {'task_id': '3045', 'status': 'created', 'project_id': 'dark_factory'},
-            {'task_id': '3045', 'status': 'combined'},  # project_id omitted
-        ]
-        assert _count_valid_task_created_records(
-            records, default_project_id='dark_factory'
-        ) == 1
-
-    def test_missing_project_id_without_default_keys_as_none(self):
-        """With no default_project_id supplied (the pre-amendment call
-        shape), a record with no project_id still keys as None — same
-        behaviour as before this amendment when the caller opts out of the
-        default-collapse."""
-        records = [
-            {'task_id': '3045', 'status': 'created'},
-            {'task_id': '3045', 'status': 'combined'},
-        ]
-        assert _count_valid_task_created_records(records) == 1
-
-    def test_blank_project_id_after_strip_collapses_onto_default(self):
-        """A whitespace-only project_id is treated as omitted, not as a
-        literal '' project — it also falls back to default_project_id."""
-        records = [
-            {'task_id': '3045', 'status': 'created', 'project_id': 'dark_factory'},
-            {'task_id': '3045', 'status': 'combined', 'project_id': '   '},
-        ]
-        assert _count_valid_task_created_records(
-            records, default_project_id='dark_factory'
-        ) == 1
-
-
-class TestCoerceTasksCreatedCount:
-    """Pins _coerce_tasks_created_count (task-3046 amendment): best-effort int
-    coercion for a self-reported tasks_created value, so a non-int self-report
-    (plausible free-form LLM JSON) doesn't collapse to 0 and look like an
-    undercount relative to a smaller record-derived observed count — which
-    would silently move a legitimately larger self-report DOWN, breaking the
-    upward-only repair contract (task 2230 / W5-mu)."""
+class TestCoerceCount:
+    """Pins coerce_count: best-effort int coercion for a self-reported Stage 2
+    counter, so a non-int self-report (plausible free-form LLM JSON) doesn't
+    collapse to 0 and look like an undercount relative to smaller evidence —
+    which would silently move a legitimately larger self-report DOWN, breaking
+    the upward-only repair contract (task 2230 / W5-mu). Never raises (task
+    4140: NaN / infinity once escaped as ValueError / OverflowError)."""
 
     @pytest.mark.parametrize(
         ('value', 'expected'),
@@ -302,7 +125,7 @@ class TestCoerceTasksCreatedCount:
         ids=['int-0', 'int-3', 'str-0', 'str-3', 'str-3-whitespace', 'float-3', 'str-float-3'],
     )
     def test_coerces_legitimate_numeric_forms(self, value, expected):
-        assert _coerce_tasks_created_count(value) == expected
+        assert coerce_count(value) == expected
 
     @pytest.mark.parametrize(
         'value',
@@ -312,7 +135,15 @@ class TestCoerceTasksCreatedCount:
     def test_uncoercible_or_bool_falls_back_to_zero(self, value):
         """A bool is REJECTED even though isinstance(True, int) holds in
         Python — never trusted as a legitimate self-reported count."""
-        assert _coerce_tasks_created_count(value) == 0
+        assert coerce_count(value) == 0
+
+    @pytest.mark.parametrize(
+        'value',
+        [float('nan'), float('inf'), float('-inf'), 'inf', '-inf', '1e400', 'nan', ' Infinity '],
+        ids=['nan', 'inf', '-inf', 'str-inf', 'str--inf', 'str-1e400', 'str-nan', 'str-Infinity'],
+    )
+    def test_non_finite_values_fall_back_to_zero_without_raising(self, value):
+        assert coerce_count(value) == 0
 
 
 # ── Task-3046 step-5: TaskKnowledgeSync._apply_post_flight_guards repair ────

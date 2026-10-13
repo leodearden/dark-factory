@@ -66,6 +66,7 @@ code behaviour.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import UTC, datetime
 from typing import Any
@@ -76,10 +77,14 @@ import pytest
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import StageId, StageReport
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
+from fused_memory.reconciliation.stage2_counter_grounding import (
+    HintsClaim,
+    action_record_keys,
+    hints_claim_confirmed,
+    hints_update_claims,
+)
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
-    _TASK_CREATED_SUCCESS_STATUSES,
     TaskKnowledgeSync,
-    _action_record_keys,
     _corroborate_record_keys,
 )
 
@@ -249,7 +254,10 @@ class TestAuditHarness:
         assert stub.max_concurrent == 4
 
 
-# ── step-3: _action_record_keys ──────────────────────────────────────────────
+# ── action_record_keys ───────────────────────────────────────────────────────
+
+_CREATED = frozenset({'created'})
+_COMBINED = frozenset({'combined'})
 
 
 class _ExplodingRecord(dict):
@@ -260,37 +268,32 @@ class _ExplodingRecord(dict):
 
 
 class TestActionRecordKeys:
-    """``_action_record_keys(records, default_project_id, valid_statuses)``.
+    """``action_record_keys(records, default_project_id, valid_statuses)``.
 
-    The corroboration pass needs the actual ``(project_id, task_id)`` pairs, not
-    just how many there are, so task 3046's counting logic is factored into a
-    helper that RETURNS the deduped key set. Every rule 3046 established must
-    survive that move — these pins are the guard against silent drift, and
-    ``_count_valid_task_created_records`` becomes ``len()`` of this.
-
-    ``valid_statuses`` is a parameter (not a hardcoded constant read) because
-    task 4018's ``tasks_hints_updated`` records work reuses this helper with
-    its own accepted-status vocabulary.
+    Returns the deduped ``(project_id, task_id)`` keys of an LLM action-record
+    list, so each key can be corroborated against its OWN project. Every rule
+    task 3046 established is pinned here. ``valid_statuses`` is REQUIRED: the
+    created and combined counters read the same list with disjoint vocabularies,
+    so no default can be right for both.
     """
 
-    def test_returns_a_set_of_project_task_pairs(self):
-        keys = _action_record_keys(
+    def test_returns_a_frozenset_of_project_task_pairs(self):
+        keys = action_record_keys(
             [
                 {'action': 'task_created', 'task_id': '3045', 'status': 'created',
                  'project_id': 'dark_factory'},
             ],
+            None,
+            _CREATED,
         )
 
         assert keys == {('dark_factory', '3045')}
-        assert isinstance(keys, set)
+        assert isinstance(keys, frozenset)
 
-    @pytest.mark.parametrize(
-        'status',
-        ['created', 'CREATED', ' Created ', 'combined', 'COMBINED', '\tcombined\n'],
-    )
+    @pytest.mark.parametrize('status', ['created', 'CREATED', ' Created ', '\tcreated\n'])
     def test_status_match_is_case_and_whitespace_insensitive(self, status):
-        keys = _action_record_keys(
-            [{'task_id': '1', 'status': status, 'project_id': 'p'}],
+        keys = action_record_keys(
+            [{'task_id': '1', 'status': status, 'project_id': 'p'}], None, _CREATED,
         )
 
         assert keys == {('p', '1')}
@@ -298,38 +301,88 @@ class TestActionRecordKeys:
     @pytest.mark.parametrize('status', ['failed', 'FAILED', ' failed ', 'pending', '', None, 7])
     def test_non_accepted_status_never_keys_even_with_a_task_id(self, status):
         """`failed` is never counted regardless of a present task_id."""
-        keys = _action_record_keys(
-            [{'task_id': '3045', 'status': status, 'project_id': 'p'}],
+        keys = action_record_keys(
+            [{'task_id': '3045', 'status': status, 'project_id': 'p'}], None, _CREATED,
         )
 
-        assert keys == set()
+        assert keys == frozenset()
+
+    def test_missing_status_key_never_keys(self):
+        keys = action_record_keys(
+            [{'task_id': '3045', 'project_id': 'p'}], None, _CREATED,
+        )
+
+        assert keys == frozenset()
+
+    def test_created_vocabulary_never_keys_a_combined_record(self):
+        records = [{'task_id': '1', 'status': 'combined', 'project_id': 'p'}]
+
+        assert action_record_keys(records, 'p', _CREATED) == frozenset()
+
+    def test_combined_vocabulary_never_keys_a_created_record(self):
+        records = [{'task_id': '1', 'status': 'created', 'project_id': 'p'}]
+
+        assert action_record_keys(records, 'p', _COMBINED) == frozenset()
+
+    def test_the_two_vocabularies_partition_a_mixed_list(self):
+        records = [
+            {'task_id': '1', 'status': 'created', 'project_id': 'p'},
+            {'task_id': '2', 'status': 'combined', 'project_id': 'p'},
+        ]
+
+        assert action_record_keys(records, 'p', _CREATED) == {('p', '1')}
+        assert action_record_keys(records, 'p', _COMBINED) == {('p', '2')}
 
     @pytest.mark.parametrize('task_id', [None, '', '   '])
     def test_missing_or_blank_task_id_is_skipped(self, task_id):
-        keys = _action_record_keys(
-            [{'task_id': task_id, 'status': 'created', 'project_id': 'p'}],
+        keys = action_record_keys(
+            [{'task_id': task_id, 'status': 'created', 'project_id': 'p'}], None, _CREATED,
         )
 
-        assert keys == set()
+        assert keys == frozenset()
+
+    def test_absent_task_id_key_is_skipped(self):
+        keys = action_record_keys(
+            [{'status': 'created', 'project_id': 'p'}], None, _CREATED,
+        )
+
+        assert keys == frozenset()
 
     def test_same_numeric_id_under_two_projects_is_two_keys(self):
         """Taskmaster ids are per-project, so cross-project routing filing id
         3045 into two projects is TWO tasks, not one duplicate report."""
-        keys = _action_record_keys(
+        keys = action_record_keys(
             [
                 {'task_id': 3045, 'status': 'created', 'project_id': 'dark_factory'},
                 {'task_id': '3045', 'status': 'created', 'project_id': 'reify'},
             ],
+            None,
+            _CREATED,
         )
 
         assert keys == {('dark_factory', '3045'), ('reify', '3045')}
 
-    def test_duplicate_records_collapse_to_one_key(self):
-        keys = _action_record_keys(
+    def test_int_and_str_task_id_forms_collapse_to_one_key(self):
+        keys = action_record_keys(
             [
                 {'task_id': 3045, 'status': 'created', 'project_id': 'dark_factory'},
-                {'task_id': ' 3045 ', 'status': 'combined', 'project_id': ' dark_factory'},
+                {'task_id': '3045', 'status': 'created', 'project_id': 'dark_factory'},
+                {'task_id': ' 3045 ', 'status': 'created', 'project_id': 'dark_factory'},
             ],
+            None,
+            _CREATED,
+        )
+
+        assert keys == {('dark_factory', '3045')}
+
+    def test_whitespace_padded_project_id_collapses_to_one_key(self):
+        keys = action_record_keys(
+            [
+                {'task_id': '3045', 'status': 'created', 'project_id': 'dark_factory'},
+                {'task_id': '3045', 'status': 'created', 'project_id': ' dark_factory '},
+            ],
+            None,
+            _CREATED,
         )
 
         assert keys == {('dark_factory', '3045')}
@@ -338,26 +391,26 @@ class TestActionRecordKeys:
     def test_missing_or_blank_project_id_falls_back_to_default(self, project_id):
         """An omitted project_id must not masquerade as a second, distinct
         cross-project filing of the same task."""
-        keys = _action_record_keys(
+        keys = action_record_keys(
             [
                 {'task_id': '3045', 'status': 'created', 'project_id': project_id},
                 {'task_id': '3045', 'status': 'created', 'project_id': 'dark_factory'},
             ],
-            default_project_id='dark_factory',
+            'dark_factory',
+            _CREATED,
         )
 
         assert keys == {('dark_factory', '3045')}
 
     def test_absent_project_id_key_falls_back_to_default(self):
-        keys = _action_record_keys(
-            [{'task_id': '3045', 'status': 'created'}],
-            default_project_id='dark_factory',
+        keys = action_record_keys(
+            [{'task_id': '3045', 'status': 'created'}], 'dark_factory', _CREATED,
         )
 
         assert keys == {('dark_factory', '3045')}
 
-    def test_default_project_id_defaults_to_none(self):
-        keys = _action_record_keys([{'task_id': '3045', 'status': 'created'}])
+    def test_none_default_keys_an_unattributed_record_as_none(self):
+        keys = action_record_keys([{'task_id': '3045', 'status': 'created'}], None, _CREATED)
 
         assert keys == {(None, '3045')}
 
@@ -367,12 +420,12 @@ class TestActionRecordKeys:
         ids=['none', 'str', 'int', 'empty-dict', 'dict', 'empty-list', 'tuple'],
     )
     def test_non_list_or_empty_input_returns_empty_set(self, records):
-        assert _action_record_keys(records) == set()
+        assert action_record_keys(records, None, _CREATED) == frozenset()
 
     def test_non_dict_and_exploding_entries_are_skipped_not_propagated(self):
         """A malformed record degrades to 'not counted', never to an exception
         that would corrupt an otherwise-good stage report."""
-        keys = _action_record_keys(
+        keys = action_record_keys(
             [
                 None,
                 'x',
@@ -380,30 +433,161 @@ class TestActionRecordKeys:
                 _ExplodingRecord(task_id='9', status='created', project_id='p'),
                 {'task_id': '3045', 'status': 'created', 'project_id': 'dark_factory'},
             ],
+            None,
+            _CREATED,
         )
 
         assert keys == {('dark_factory', '3045')}
 
-    def test_valid_statuses_parameter_is_honoured(self):
-        """A custom accepted-status set changes which records key — the seam
-        task 4018's tasks_hints_updated work reuses."""
-        records = [
-            {'task_id': '1', 'status': 'created', 'project_id': 'p'},
-            {'task_id': '2', 'status': 'updated', 'project_id': 'p'},
-        ]
 
-        assert _action_record_keys(records) == {('p', '1')}
-        assert _action_record_keys(records, valid_statuses=frozenset({'updated'})) == {('p', '2')}
+# ── hints_update_claims / hints_claim_confirmed (task 4018) ─────────────────
 
-    def test_default_valid_statuses_is_the_task_created_vocabulary(self):
-        records = [
-            {'task_id': str(i), 'status': status, 'project_id': 'p'}
-            for i, status in enumerate(sorted(_TASK_CREATED_SUCCESS_STATUSES))
-        ]
 
-        assert _action_record_keys(records) == {
-            ('p', str(i)) for i in range(len(_TASK_CREATED_SUCCESS_STATUSES))
+def _hints_record(task_id='7', project_id='dark_factory', entities=None, queries=None, **extra):
+    record = {
+        'action': 'task_hints_updated',
+        'task_id': task_id,
+        'project_id': project_id,
+        'entities': ['EntityA'] if entities is None else entities,
+        'queries': ['how is A wired'] if queries is None else queries,
+    }
+    record.update(extra)
+    return record
+
+
+def _task_with_hints(hints: object, *, as_json_string: bool = False) -> dict:
+    metadata: object = {'memory_hints': hints}
+    if as_json_string:
+        metadata = json.dumps(metadata)
+    return {'id': '7', 'title': 'A real task', 'status': 'pending', 'metadata': metadata}
+
+
+class TestHintsUpdateClaims:
+    """``hints_update_claims`` reads Stage 2's ``task_hints_updated_records``;
+    ``hints_claim_confirmed`` decides whether a re-read task really carries
+    the claimed hints (the SUPERSET rule the Stage 2 prompt already states)."""
+
+    def test_one_record_is_one_claim_keyed_like_action_records(self):
+        claims = hints_update_claims([_hints_record(task_id=' 7 ', project_id=' dark_factory ')], 'x')
+
+        assert claims == {
+            ('dark_factory', '7'): HintsClaim(
+                entities=frozenset({'EntityA'}), queries=frozenset({'how is A wired'}),
+            ),
         }
+
+    @pytest.mark.parametrize('project_id', [None, '', '   '])
+    def test_missing_project_id_falls_back_to_default(self, project_id):
+        claims = hints_update_claims([_hints_record(project_id=project_id)], 'dark_factory')
+
+        assert set(claims) == {('dark_factory', '7')}
+
+    def test_duplicate_records_for_one_key_union_their_entries(self):
+        claims = hints_update_claims(
+            [
+                _hints_record(entities=['A'], queries=['q1']),
+                _hints_record(task_id=7, entities=['B'], queries=[]),
+            ],
+            'dark_factory',
+        )
+
+        assert claims == {
+            ('dark_factory', '7'): HintsClaim(
+                entities=frozenset({'A', 'B'}), queries=frozenset({'q1'}),
+            ),
+        }
+
+    @pytest.mark.parametrize(
+        'record',
+        [
+            _hints_record(entities=[], queries=[]),
+            {'action': 'task_hints_updated', 'task_id': '7', 'project_id': 'p'},
+            _hints_record(action='task_created'),
+            _hints_record(action=None),
+            _hints_record(task_id=None),
+            _hints_record(task_id='  '),
+        ],
+        ids=['both-empty', 'both-absent', 'wrong-action', 'no-action', 'no-task-id', 'blank-task-id'],
+    )
+    def test_non_claims_are_skipped(self, record):
+        assert hints_update_claims([record], 'p') == {}
+
+    def test_non_str_entries_compare_by_canonical_json(self):
+        claims = hints_update_claims(
+            [_hints_record(entities=[{'b': 1, 'a': 2}], queries=['q'])], 'p',
+        )
+
+        claim = claims[('dark_factory', '7')]
+        assert claim.entities == frozenset({json.dumps({'a': 2, 'b': 1}, sort_keys=True)})
+
+    @pytest.mark.parametrize(
+        'records',
+        [None, 'x', 42, {}, [], ()],
+        ids=['none', 'str', 'int', 'dict', 'empty-list', 'tuple'],
+    )
+    def test_non_list_input_is_no_claims(self, records):
+        assert hints_update_claims(records, 'p') == {}
+
+    def test_non_dict_and_exploding_entries_are_skipped_not_raised(self):
+        claims = hints_update_claims(
+            [None, 'x', _ExplodingRecord(task_id='9'), _hints_record()], 'p',
+        )
+
+        assert set(claims) == {('dark_factory', '7')}
+
+    def test_claim_is_frozen(self):
+        claim = HintsClaim(entities=frozenset({'A'}), queries=frozenset())
+
+        with pytest.raises(AttributeError):
+            claim.entities = frozenset()  # type: ignore[misc]
+
+    # -- hints_claim_confirmed ------------------------------------------------
+
+    _CLAIM = HintsClaim(entities=frozenset({'A'}), queries=frozenset({'q1'}))
+
+    @pytest.mark.parametrize('as_json_string', [False, True], ids=['dict', 'json-string'])
+    def test_superset_hints_confirm(self, as_json_string):
+        result = _task_with_hints(
+            {'entities': ['A', 'Other'], 'queries': ['q1', 'q2']}, as_json_string=as_json_string,
+        )
+
+        assert hints_claim_confirmed(self._CLAIM, result) is True
+
+    def test_exactly_equal_hints_confirm(self):
+        result = _task_with_hints({'entities': ['A'], 'queries': ['q1']})
+
+        assert hints_claim_confirmed(self._CLAIM, result) is True
+
+    def test_non_str_entries_confirm_by_canonical_json(self):
+        claim = HintsClaim(
+            entities=frozenset({json.dumps({'a': 2, 'b': 1}, sort_keys=True)}), queries=frozenset(),
+        )
+        result = _task_with_hints({'entities': [{'b': 1, 'a': 2}], 'queries': []})
+
+        assert hints_claim_confirmed(claim, result) is True
+
+    @pytest.mark.parametrize(
+        'result',
+        [
+            _task_with_hints({'entities': ['A'], 'queries': []}),
+            _task_with_hints({'entities': [], 'queries': ['q1']}),
+            _task_with_hints({}),
+            _task_with_hints(None),
+            _task_with_hints(['A', 'q1']),
+            {'id': '7', 'title': 'A real task', 'status': 'pending'},
+            {'id': '7', 'title': 'A real task', 'status': 'pending', 'metadata': 'not json'},
+            {'id': '7', 'title': 'A real task', 'status': 'pending', 'metadata': '[1, 2]'},
+            {'error': 'No tasks found for ID(s): 7', 'error_type': 'TaskmasterError'},
+            None,
+            'a task',
+        ],
+        ids=[
+            'missing-query', 'missing-entity', 'empty-hints', 'none-hints', 'legacy-list-hints',
+            'no-metadata', 'undecodable-metadata', 'non-object-metadata', 'not-found', 'none', 'str',
+        ],
+    )
+    def test_anything_short_of_a_superset_is_unconfirmed(self, result):
+        assert hints_claim_confirmed(self._CLAIM, result) is False
 
 
 # ── step-5: _corroborate_record_keys ─────────────────────────────────────────
