@@ -276,6 +276,13 @@ tasks:
     delivered_check:
       kind: manual
       reason: a declared port, exercised by δ1's own fakes
+  - name: one-reader-of-a-done-tasks-fix-commit
+    binding: δ1 makes flake_ledger.py::_resolving_commit public and puts D10's done-task containment question
+      in one engine function, which ε2 reuses for a done de-flake owner (2026-10-13).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a rename and a shared helper; exercised by D10's table tests and scenario 40
 - label: δ2
   task_id: 6861
   title: 'Offline-lane red path δ2 (HUB carry): the cutover — the engine replaces the fingerprint red
@@ -606,6 +613,15 @@ tasks:
     delivered_check:
       kind: manual
       reason: consumed
+  - name: stale-head-for-a-done-de-flake-owner
+    binding: 'Leo 2026-10-13. ε2 offers no test for debt when its de-flake owner is done and the evidence''s
+      head does not contain the owner''s fix commit. Producers upstream: δ1''s fix-containment function
+      and the public flake_ledger.py::resolving_commit (δ1), δ2''s GitOps.is_ancestor_checked. Scenario
+      40.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behaviour asserted by scenario 40 at engine level (ε2) and against the real worker (ι)
 - label: ι
   task_id: 6866
   title: 'Offline-lane red path ι (integration gate): PRD §6 scenarios 1–23 and 25–38 against the real

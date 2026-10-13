@@ -166,6 +166,7 @@ Rests on all three D6 calls (author's calls, unreviewed). G7 waiver storm-escape
 | Capability | Evidence | Verdict | Check |
 |---|---|---|---|
 | lane-calls-the-shared-recorder | capability→producer — ε2 adds the recorder calls and the debt_due retry to orchestrator/src/orchestrator/offline_lane_episodes.py::LaneEngine.observe and ::tick. Absent on main (the module does not exist). | PASS | grep `record_call_site_observations\(` present in orchestrator/src/orchestrator/offline_lane_episodes.py |
+| stale-head-for-a-done-de-flake-owner | Leo 2026-10-13: no debt is offered when the de-flake owner is done and the evidence's head lacks its fix commit; producers δ1 (containment function, public `resolving_commit`) and δ2 (`is_ancestor_checked`), upstream | PASS | manual — scenario 40 (ε2, ι) |
 | recorder-context-and-evidence | producer:ε1 — upstream. | PASS | manual — consumed |
 | engine-pipeline-and-outage-mark | producer:δ1 (the engine, reproduced_heads, last_green_head, debt_due), producer:δ2 (the worker calls it), producer:π (had_outage_pass) — all upstream. | PASS | manual — consumed |
 | host-pressure-read | substrate — shared/src/shared/psi.py::read_psi_sample exists; orchestrator/src/orchestrator/verify.py::_psi_cpu_some10_or_none wraps it for the discriminator. ε2 gives the mapping one public home there. | PASS | manual — a small helper; pinned by shared/tests/test_psi.py |
