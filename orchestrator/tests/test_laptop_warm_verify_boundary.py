@@ -73,6 +73,7 @@ import time
 import uuid
 import warnings
 from collections.abc import Callable, Mapping
+from collections.abc import Set as AbstractSet
 from pathlib import Path
 from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock
@@ -826,7 +827,7 @@ def read_proc_state(pid: int) -> StatFields | None:
 
 
 def wait_pids_exited(
-    pids: set[int],
+    pids: AbstractSet[int],
     *,
     timeout: float,
     interval: float = 0.05,
@@ -854,6 +855,43 @@ def wait_pids_exited(
         if not running or _clock() >= deadline:
             return running
         time.sleep(interval)
+
+
+class PreKillTree(NamedTuple):
+    """A verify-merge leader's process tree, snapshotted while the leader was alive."""
+
+    leader: int
+    build: int
+    pids: frozenset[int]
+
+
+def snapshot_pre_kill_tree(leader: int, build: int) -> PreKillTree:
+    """Snapshot *leader*'s tree, which must contain the session-escaped *build*.
+
+    Call it only while the leader is provably alive: once the leader dies, the
+    ppid chain to the start_new_session build is severed and a walk from the
+    leader can no longer reach it.
+    """
+    pids = frozenset({leader} | collect_descendants(leader, read_ppid_map()))
+    assert build in pids, (
+        f'harness failure, not a seam defect: build pgid {build} is not in '
+        f'leader {leader}\'s subtree {sorted(pids)}'
+    )
+    return PreKillTree(leader=leader, build=build, pids=pids)
+
+
+def assert_pre_kill_tree_exited(tree: PreKillTree, *, timeout: float, after: str) -> None:
+    """Assert every pid in *tree* exits within *timeout* of the trigger named by *after*.
+
+    A zombie awaiting its subreaper counts as exited, as in :func:`wait_pids_exited`.
+    """
+    survivors = wait_pids_exited(tree.pids, timeout=timeout)
+    rendered = {pid: (s.state, s.ppid) for pid, s in sorted(survivors.items())}
+    assert not survivors, (
+        f'leader={tree.leader} build={tree.build}: {rendered} (pid: (state, ppid)) '
+        f'still running {timeout}s after {after}. S/T means SIGKILL never reached '
+        f'it; R/D means signalled but not yet run to exit'
+    )
 
 
 def _kill_pinned_holder(
@@ -4894,7 +4932,7 @@ def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
         heartbeat_interval=0.2,
         extra_env=ROW_WATCHDOG_ENV,
     )
-    tree: set[int] = set()
+    tree: PreKillTree | None = None
     try:
         leader = wait_for_pgid_file(pgf, timeout=row_discovery_ceiling_secs())
         build_pgid = wait_for_pgid_file(
@@ -4903,30 +4941,27 @@ def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
             proc_label='dispatcher',
             timeout=row_discovery_ceiling_secs(),
         )
-        tree = {leader} | collect_descendants(leader, read_ppid_map())
-        assert build_pgid in tree, (
-            f'harness failure, not a seam defect: build pgid {build_pgid} is not in '
-            f'leader {leader}\'s subtree {sorted(tree)}'
-        )
+        tree = snapshot_pre_kill_tree(leader, build_pgid)
 
         dispatcher.kill()
         dispatcher.wait(timeout=10)
 
-        survivors = wait_pids_exited(tree, timeout=ROW_TREE_KILL_CEILING_SECS)
-        rendered = {pid: (s.state, s.ppid) for pid, s in sorted(survivors.items())}
-        assert not survivors, (
-            f'leader={leader} build={build_pgid}: {rendered} (pid: (state, ppid)) '
-            f'still running {ROW_TREE_KILL_CEILING_SECS}s after the dispatcher was '
-            f'killed (EOF-triggered watchdog tree-kill did not finish). S/T means '
-            f'SIGKILL never reached it; R/D means signalled but not yet run to exit'
+        assert_pre_kill_tree_exited(
+            tree,
+            timeout=ROW_TREE_KILL_CEILING_SECS,
+            after=(
+                'the dispatcher was killed (the EOF-triggered watchdog tree-kill '
+                'did not finish)'
+            ),
         )
     finally:
         if dispatcher.poll() is None:
             dispatcher.kill()
             dispatcher.wait(timeout=5)
-        for pid in wait_pids_exited(tree, timeout=0):
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(pid, signal.SIGKILL)
+        if tree is not None:
+            for pid in wait_pids_exited(tree.pids, timeout=0):
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(pid, signal.SIGKILL)
 
 
 # ---------------------------------------------------------------------------
