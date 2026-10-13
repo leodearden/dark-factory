@@ -36,8 +36,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
+from shared.testing_timeout_markers import verify_cli_timeout
 
 # The injected ``escalation_conftest`` is annotated ``Any`` for one reason:
 # ``@pytest.fixture`` types its result as ``FixtureFunctionDefinition``, which
@@ -429,6 +431,73 @@ def test_a_healthy_server_the_client_cannot_reach_names_the_client_error(
         )
     finally:
         dead_proxy.close()
+
+
+# ---------------------------------------------------------------------------
+# The readiness bound is derived from measured first-start latency.
+# ---------------------------------------------------------------------------
+
+# Task 5060's first start in a fresh process at loadavg 162-335, measured to
+# the uvicorn bind FAILURE: a lower bound on a successful start under that load.
+# Corpus: plans/escalation-mcp-readiness-bound-measurement-2026-10-13.md.
+_MEASURED_FIRST_START_WORST_CASE_S = 5.46
+
+# Mirrors orchestrator/tests/_orch_helpers.py::UNDER_LOAD_HEADROOM_FACTOR,
+# which is importable only under orchestrator/tests (CONTRIBUTING.md).
+_UNDER_LOAD_HEADROOM_FACTOR = 8
+
+# From __file__, never the cwd: verify runs from escalation/, a repo-root run
+# from the root.
+_ESCALATION_ORCH_YAML = Path(__file__).resolve().parents[1] / 'orchestrator.yaml'
+
+
+def test_the_readiness_bound_clears_the_measured_first_start_with_headroom(
+    escalation_conftest: Any,
+) -> None:
+    """``_READY_TIMEOUT_S`` must clear 8x the worst first start on record.
+
+    8x because the CPU starvation that kills runs sits one load step past
+    where anyone has measured. The anchor is a failure-path figure, and it
+    still bounds the happy path: a successful start does every step the failed
+    one did, then lifespan startup and a handshake.
+    """
+    bound = escalation_conftest._READY_TIMEOUT_S
+    required = _MEASURED_FIRST_START_WORST_CASE_S * _UNDER_LOAD_HEADROOM_FACTOR
+    assert bound >= required, (
+        f'_READY_TIMEOUT_S ({bound}s) is below {_UNDER_LOAD_HEADROOM_FACTOR}x '
+        f'the measured first-start worst case '
+        f'({_MEASURED_FIRST_START_WORST_CASE_S}s x {_UNDER_LOAD_HEADROOM_FACTOR} '
+        f'= {required}s). Raise the bound, or re-measure at comparable or higher '
+        'load; never lower the anchor. Corpus: '
+        'plans/escalation-mcp-readiness-bound-measurement-2026-10-13.md.'
+    )
+
+
+def test_the_readiness_bound_expires_before_the_verify_per_test_budget(
+    escalation_conftest: Any,
+) -> None:
+    """``_READY_TIMEOUT_S`` must expire before verify's per-test ``--timeout``.
+
+    Past that budget pytest-timeout (``timeout_method = "signal"`` in
+    escalation/pyproject.toml) fails the test first, and the structured
+    ``EscalationServerNotReady``, which names the side of the wire that
+    failed, is never raised.
+    """
+    test_command = yaml.safe_load(
+        _ESCALATION_ORCH_YAML.read_text(encoding='utf-8'),
+    )['test_command']
+    budget = verify_cli_timeout(test_command)
+    assert budget is not None, (
+        f'no --timeout in the test_command of {_ESCALATION_ORCH_YAML}: '
+        f'{test_command!r}'
+    )
+    bound = escalation_conftest._READY_TIMEOUT_S
+    assert bound < budget, (
+        f'_READY_TIMEOUT_S ({bound}s) does not expire before the verify '
+        f'per-test budget (--timeout={budget} in {_ESCALATION_ORCH_YAML}), so an '
+        'alive-but-never-ready server would die by pytest-timeout instead of '
+        'raising EscalationServerNotReady. Keep the bound below the budget.'
+    )
 
 
 # ---------------------------------------------------------------------------
