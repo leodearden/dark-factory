@@ -1805,8 +1805,9 @@ class TestADegradedTargetLookupDefersTheRepair:
         service.graphiti.ensure_entity_node.assert_awaited_once_with(
             'Task 3128', group_id='dark_factory', merge_duplicates=False,
         )
-        service.graphiti.reassign_edge.assert_awaited_once()
-        assert service.graphiti.reassign_edge.await_args.args[0] == 'e2'
+        service.graphiti.reassign_edge.assert_awaited_once_with(
+            'e2', 'n-3127', which_end='source', group_id='dark_factory',
+        )
         assert [r.outcome for r in stats.repairs] == ['failed', 'repaired']
 
     @pytest.mark.asyncio
