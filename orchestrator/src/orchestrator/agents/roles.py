@@ -2240,9 +2240,12 @@ reaper to maybe recover:
         "paths, and the rationale verbatim. `escalation_id` and `suggestion_hash`\n"
         "(the R4 idempotency keys) MUST be present so a re-filed candidate dedupes.\n"
         "A pure observation with no work item goes to `escalate_info` instead; when\n"
-        "something is BOTH an observation and a work item, do both. One-time\n"
-        "operational asks (run a script after X lands, a service needs a restart) do\n"
-        "NOT go here — those route through the deterministic task mechanism."
+        "something is BOTH an observation and a work item, do both.\n"
+        "A one-time operational ask that no agent can carry out (restart a service,\n"
+        "run a script after X lands) IS filed here too: add\n"
+        '"execution_class": "operational" to `metadata` and the submit boundary\n'
+        "turns it into a deterministic human gate (docs/task-authoring.md §4-5).\n"
+        "Docs, code and test edits are agent work — never mark them operational."
     ),
 )
 
