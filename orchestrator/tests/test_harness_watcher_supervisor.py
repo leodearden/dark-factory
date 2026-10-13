@@ -3535,6 +3535,45 @@ class TestWatcherCleanupNeededFilesWork:
 
 
 # ---------------------------------------------------------------------------
+# task 3726: every L1 in work_batch ends resolved, filed-and-resolved or promoted
+# ---------------------------------------------------------------------------
+
+_TERMINAL_HEADING = '### Terminal dispositions — never park'
+_GRACEFUL_DEGRADATION_HEADING = '## Graceful Degradation'
+
+
+class TestWatcherTerminalDispositions:
+    """The L1 decision tree is total: three named exits, no park.
+
+    A park (e.g. esc-5665-2's invented "hold for a 3rd occurrence") is the
+    hole a missing exit leaves; the section names the three tools that
+    close it.
+    """
+
+    def test_names_the_three_terminal_dispositions(self) -> None:
+        section = _skill_section(_watcher_skill_text(), _TERMINAL_HEADING)
+        missing = [
+            tool
+            for tool in ('resolve_issue', 'submit_task', 'promote_to_l2')
+            if tool not in section
+        ]
+        assert not missing, (
+            'the terminal-dispositions section must name resolve it '
+            '(resolve_issue), file-and-resolve it (submit_task) and promote it '
+            f'(promote_to_l2); missing: {missing}'
+        )
+
+    def test_graceful_degradation_covers_the_filing_pair(self) -> None:
+        section = _skill_section(_watcher_skill_text(), _GRACEFUL_DEGRADATION_HEADING)
+        missing = [tool for tool in _FILING_PAIR if tool not in section]
+        assert not missing, (
+            'Graceful Degradation must feature-detect the filing pair like '
+            'promote_to_l2, so the skill is safe to load before orchestrators '
+            f'restart onto the new allowlist; missing: {missing}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # task 2629 step-3: _watcher_has_actionable_l1 — empty-queue rotation precheck
 # ---------------------------------------------------------------------------
 
