@@ -212,6 +212,31 @@ class TestStageGatedToolAdvertisementMatchesTheDisallowLists:
             'surfaces as a silently missing tool rather than an explanation.'
         )
 
+    @pytest.mark.parametrize('tool_name', sorted(STAGE_GATED_REPORT_TOOLS))
+    def test_every_stage_gated_tool_is_denied_by_some_stage_and_held_by_another(
+        self, tool_name
+    ):
+        """Carries over the retired drift-module
+        test_the_absence_guard_is_scoped_to_actually_denying_stages, over all three
+        stages. A tool that exercises BOTH arms above is what makes a mis-scoped
+        absence arm contradict the naming arm instead of passing silently.
+        """
+        denying = [
+            attr for _label, _text, attr in _STAGE_CASES if _stage_denies(tool_name, attr)
+        ]
+        assert denying, (
+            f'`{tool_name}` is denied by NO stage\'s live STAGE{{1,2,3}}_DISALLOWED '
+            '(cli_stage_runner.py), so it is not stage-gated. Reclassify it as shared '
+            'guidance in server/recon_report.py::STAGE_GATED_REPORT_TOOLS, or fold its '
+            'DISALLOW_RECON_REPORT_* sublist into the stage(s) meant to deny it.'
+        )
+        assert len(denying) < len(_STAGE_CASES), (
+            f'`{tool_name}` is denied by EVERY stage ({denying}), so no stage can call '
+            'it: the naming arm can never exercise it, and it is not "held by some '
+            'stages but denied in others". Un-deny it in the stage meant to hold it, or '
+            'stop registering it.'
+        )
+
     @pytest.mark.parametrize('project_id', _STAGE2_PROJECT_IDS)
     @pytest.mark.parametrize('tool_name', sorted(STAGE_GATED_REPORT_TOOLS))
     def test_stage2_contract_holds_in_both_build_stage2_system_prompt_branches(
