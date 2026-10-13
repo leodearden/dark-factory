@@ -3424,13 +3424,13 @@ def resolve_own_record_slug(
     ``LeaseHolder.record_slug`` and ``DecisionRecord.record_slug``.
 
     None when ``CLAUDE_PID`` is unusable or no vouched-for pointer exists.
+    A shared ``claude agents`` host has no session-scoped pid, so the result
+    is None there too.
     Quiet by contract: this serves enrichment, so an unresolvable slug is a
     blank field in the caller's result, not a log line.
     """
-    pid = _parse_session_pid(os.environ if env is None else env)
-    if pid is None:
-        return None
-    return resolve_session_slug_for_pid(pid, root=root)
+    pid = resolve_session_identity(env).session_scoped_pid
+    return None if pid is None else resolve_session_slug_for_pid(pid, root=root)
 
 
 def default_lease_slug(
