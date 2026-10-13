@@ -755,6 +755,53 @@ class TestDeriveFromCensus:
         folded = {m.normalize_topic(c['topic']) for c in result.candidates}
         assert len(folded) == len(result.candidates)
 
+    @pytest.mark.parametrize(('payload', 'named_location'), [
+        pytest.param({'baseline': True}, 'grand_total', id='the-2026-08-31-stub'),
+        pytest.param({'grand_total': {}}, 'topic', id='no-topic-table'),
+        pytest.param({'grand_total': {'topic': {}}}, 'entries', id='no-entries'),
+        pytest.param({'grand_total': None}, 'grand_total', id='grand-total-null'),
+    ])
+    def test_an_absent_topic_table_is_refused_by_name(
+        self, calibration_rows, guard_clusters, payload, named_location,
+    ):
+        """An absent table reads zero in every census counter, exactly like an
+        empty corpus, so it must not derive as one."""
+        m = _mod()
+        with pytest.raises(m.CensusShapeError) as exc:
+            m.derive_registry_candidates(calibration_rows, payload, guard_clusters)
+        assert named_location in str(exc.value)
+
+    @pytest.mark.parametrize(('payload', 'type_name'), [
+        pytest.param({'grand_total': 'x'}, 'str', id='grand-total-str'),
+        pytest.param({'grand_total': {'topic': 'x'}}, 'str', id='topic-str'),
+        pytest.param({'grand_total': {'topic': {'entries': {}}}}, 'dict', id='entries-dict'),
+        pytest.param({'grand_total': {'topic': {'entries': 5}}}, 'int', id='entries-int'),
+        pytest.param([], 'list', id='top-level-list'),
+    ])
+    def test_a_misshapen_topic_table_is_refused_by_name_not_crashed_on(
+        self, calibration_rows, guard_clusters, payload, type_name,
+    ):
+        m = _mod()
+        with pytest.raises(m.CensusShapeError) as exc:
+            m.derive_registry_candidates(calibration_rows, payload, guard_clusters)
+        assert type_name in str(exc.value)
+
+    def test_an_empty_topic_table_is_a_healthy_census(
+        self, calibration_rows, guard_clusters,
+    ):
+        """The census writer emits an empty list for a corpus with no topic
+        values: that census is healthy and derives zero census candidates."""
+        result = _mod().derive_registry_candidates(
+            calibration_rows, _topic_census(), guard_clusters,
+        )
+
+        assert _of(result, 'census_topic') == []
+        for counter in (
+            'census_topics_emitted', 'census_topics_skipped_singleton',
+            'census_rows_malformed_value', 'census_rows_malformed_count',
+        ):
+            assert result.disclosures[counter] == 0, counter
+
 
 class TestDeriveFromGuardClusters:
     """Guard phrases seed ORDINARY phrasings only — never the held-out one."""
