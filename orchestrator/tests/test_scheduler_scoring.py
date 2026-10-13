@@ -21,7 +21,7 @@ from orchestrator.config import (
     ScoringConfig,
 )
 from orchestrator.pending_age import read_pending_age
-from orchestrator.scheduler import Scheduler
+from orchestrator.scheduler import Scheduler, TickContext
 
 REPO_ROOT = Path(orchestrator.__file__).resolve().parents[3]
 FIXTURE_DIR = REPO_ROOT / 'orchestrator' / 'tests' / 'fixtures' / 'scheduler_candidates'
@@ -53,20 +53,26 @@ def load_baseline_rows() -> list[dict]:
         return list(csv.DictReader(fh))
 
 
+def assert_armed_population_floors(fixture: dict) -> None:
+    """A degenerate fixture fails here, before any score is certified against it."""
+    candidates = fixture['candidates']
+    captured_at = fixture_captured_at(fixture)
+
+    assert len(candidates) >= 250
+    assert len({c['tier'] for c in candidates}) >= 3
+    assert sum(c['transitive_count'] >= 1 for c in candidates) >= 20
+    assert captured_at.utcoffset() is not None
+    covered = sum(read_pending_age(t, captured_at).covered for t in fixture_as_tasks(fixture))
+    assert covered / len(candidates) >= ScoringConfig().new_scoring_min_anchor_coverage
+
+
+def baseline_max_tie() -> tuple[float, int]:
+    return Counter(float(r['score']) for r in load_baseline_rows()).most_common(1)[0]
+
+
 class TestCandidateFixtureFloors:
-    """Gate the fixture before anything is certified against it."""
-
     def test_fixture_is_a_realistic_armed_population(self):
-        fixture = load_candidate_fixture()
-        candidates = fixture['candidates']
-        captured_at = fixture_captured_at(fixture)
-
-        assert len(candidates) >= 250
-        assert len({c['tier'] for c in candidates}) >= 3
-        assert sum(c['transitive_count'] >= 1 for c in candidates) >= 20
-        assert captured_at.utcoffset() is not None
-        covered = sum(read_pending_age(t, captured_at).covered for t in fixture_as_tasks(fixture))
-        assert covered / len(candidates) >= ScoringConfig().new_scoring_min_anchor_coverage
+        assert_armed_population_floors(load_candidate_fixture())
 
 
 class TestBaselineEvidence:
@@ -75,12 +81,11 @@ class TestBaselineEvidence:
     def test_baseline_saturation_is_what_the_csv_records(self):
         rows = load_baseline_rows()
         scores = Counter(float(r['score']) for r in rows)
-        tie_score, tie_size = scores.most_common(1)[0]
 
         assert len(rows) == 294
         assert len(scores) == 47
         assert sum(r['capped'] == 'True' for r in rows) == 251
-        assert (tie_score, tie_size) == (2999.0, 117)
+        assert baseline_max_tie() == (2999.0, 117)
 
 
 HOUR = 3600.0
@@ -179,3 +184,87 @@ class TestLegacyFormula:
 
     def test_legacy_formula_still_caps(self, scheduler):
         assert scheduler._compute_score_legacy('medium', 1_000_000, 0) - TIER_BASE['medium'] == 999.0
+
+
+def _tick(tasks: list[dict], transitive_counts: dict[str, int], max_id: int) -> TickContext:
+    return TickContext(
+        tasks=tasks,
+        status_map={t['id']: 'pending' for t in tasks},
+        tasks_by_id={t['id']: t for t in tasks},
+        max_id=max_id,
+        transitive_counts={t['id']: transitive_counts[t['id']] for t in tasks},
+        candidates=tasks,
+    )
+
+
+def _fixture_tick(fixture: dict) -> TickContext:
+    counts = {c['id']: c['transitive_count'] for c in fixture['candidates']}
+    return _tick(fixture_as_tasks(fixture), counts, max(int(tid) for tid in counts))
+
+
+def _scores_by_id(scheduler: Scheduler, ctx: TickContext) -> dict[str, float]:
+    return {tid: score for score, tid, _task, _tier in scheduler._score_candidates(ctx)}
+
+
+class TestRow4NonSaturation:
+    """Boundary row 4: over the live pending population, the tick's scores are spread, unsaturated and CPM-live."""
+
+    @pytest.fixture
+    def fixture(self) -> dict:
+        return load_candidate_fixture()
+
+    @pytest.fixture
+    def frozen(self, fixture) -> Scheduler:
+        captured_at = fixture_captured_at(fixture)
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1, scoring=ScoringConfig()),
+                              wall_time_source=lambda: captured_at)
+        scheduler.finish_startup()
+        return scheduler
+
+    def test_the_live_population_scores_without_saturation(self, fixture, frozen):
+        assert_armed_population_floors(fixture)
+        baseline_score, baseline_tie = baseline_max_tie()
+        assert baseline_tie == 117
+        tiers = {c['id']: c['tier'] for c in fixture['candidates']}
+
+        scores = _scores_by_id(frozen, _fixture_tick(fixture))
+
+        n = len(fixture['candidates'])
+        assert len(scores) == n
+        distinct = len(set(scores.values()))
+        tie_score, tie_size = Counter(scores.values()).most_common(1)[0]
+        assert distinct >= 0.90 * n, (
+            f'{distinct}/{n} distinct scores ({distinct / n:.3f}); the baseline had 47 of 294')
+        assert tie_size <= 10, (
+            f'{tie_size} candidates tie at {tie_score}; the baseline tied {baseline_tie} at {baseline_score}')
+        saturated = [tid for tid, s in scores.items() if s >= TIER_BASE[tiers[tid]] + TIER_WIDTH - 1]
+        assert not saturated, f'{len(saturated)} saturated candidates (baseline 251 of 294): {saturated[:20]}'
+
+    def test_every_dependent_count_raises_the_score(self, fixture, frozen):
+        tick = _fixture_tick(fixture)
+        scores = _scores_by_id(frozen, tick)
+        counterfactual = _scores_by_id(
+            frozen, _tick(tick.candidates, dict.fromkeys(tick.transitive_counts, 0), tick.max_id))
+
+        dead = [c['id'] for c in fixture['candidates']
+                if c['transitive_count'] >= 1 and not scores[c['id']] > counterfactual[c['id']]]
+        assert not dead, f'CPM term dead for D>=1 candidates: {dead}'
+
+    def test_an_anchored_score_depends_only_on_its_own_task(self, fixture, frozen):
+        captured_at = fixture_captured_at(fixture)
+        tick = _fixture_tick(fixture)
+        scores = _scores_by_id(frozen, tick)
+
+        moved = []
+        for candidate, task in zip(fixture['candidates'], tick.candidates, strict=True):
+            if read_pending_age(task, captured_at).covered:
+                alone = _scores_by_id(frozen, _tick([task], tick.transitive_counts, tick.max_id))[candidate['id']]
+                if alone != scores[candidate['id']]:
+                    moved.append((candidate['id'], alone, scores[candidate['id']]))
+            else:
+                expected = frozen._compute_score(candidate['tier'], age_secs=0.0,
+                                                 transitive_count=candidate['transitive_count'],
+                                                 has_work_product=False)
+                if expected != scores[candidate['id']]:
+                    moved.append((candidate['id'], expected, scores[candidate['id']]))
+        assert not moved, f'(id, expected, full-set score) for scores that depend on the candidate set: {moved[:20]}'
