@@ -302,6 +302,40 @@ class TestHappyPath:
         assert 'mcp__fused-memory__update_task' in disallowed
 
 
+class TestDryRunSkillDenied:
+    @pytest.mark.asyncio
+    async def test_dry_run_invocation_denies_skill_tool(self, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        agent_result = _make_agent_result(structured_output={
+            'proposal_text': 'x', 'risk_label': 'low', 'files_referenced': [],
+        })
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch(
+            'orchestrator.dry_run_unblock.invoke_agent',
+            new=AsyncMock(return_value=agent_result),
+        ) as mock_invoke:
+            await run_dry_run_unblock(
+                task_id='42',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        invoke_kwargs = mock_invoke.call_args.kwargs
+        assert 'Skill' in invoke_kwargs['disallowed_tools']
+        granted = [
+            t for t in invoke_kwargs['allowed_tools']
+            if t == 'Skill' or t.startswith('Skill(')
+        ]
+        assert granted == []
+
+
 # ---------------------------------------------------------------------------
 # step-9: missing risk_label defaults to human-review-required
 # ---------------------------------------------------------------------------
