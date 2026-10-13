@@ -346,10 +346,11 @@ import hashlib
 import json
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from functools import cached_property
+from enum import Enum
+from functools import cached_property, partial
 from typing import Any, Literal, NamedTuple, NotRequired, TypedDict
 
 from shared.task_statuses import TaskStatus
@@ -3512,6 +3513,91 @@ async def safe_get_task(taskmaster: Any, task_id: Any, project_root: str) -> Any
         return {'error': str(exc), 'error_type': type(exc).__name__}
 
 
+class LookupVerdict(Enum):
+    """What one :class:`TaskLookup` established.
+
+    UNCONFIRMED means "we asked and the answer did not confirm"; UNRESOLVABLE
+    means "we could not ask" (no root for the project, or no taskmaster).
+    """
+
+    CONFIRMED = 'confirmed'
+    UNCONFIRMED = 'unconfirmed'
+    UNRESOLVABLE = 'unresolvable'
+
+
+@dataclass(frozen=True)
+class TaskLookup:
+    """One task to corroborate in its OWN project, and what counts as confirmation.
+
+    *accept* classifies the raw (or exception-normalised) ``get_task`` result;
+    :func:`confirm_task_present` is the plain "the task exists" rule.
+    """
+
+    project_id: str | None
+    task_id: str
+    accept: Callable[[object], bool]
+
+
+def _lookup_root(known_projects: Mapping[str, str], project_id: str | None) -> str | None:
+    if not isinstance(project_id, str) or not project_id.strip():
+        return None
+    return known_projects.get(project_id) or None
+
+
+def _classify_lookup(lookup: TaskLookup, result: object) -> LookupVerdict:
+    try:
+        accepted = lookup.accept(result)
+    except Exception:
+        logger.debug(
+            'reconciliation.corroborate_task_lookups: accept predicate raised for '
+            'project_id=%s task_id=%s — treating as unconfirmed',
+            lookup.project_id, lookup.task_id, exc_info=True,
+        )
+        return LookupVerdict.UNCONFIRMED
+    return LookupVerdict.CONFIRMED if accepted else LookupVerdict.UNCONFIRMED
+
+
+async def corroborate_task_lookups(
+    taskmaster: Any,
+    known_projects: Mapping[str, str] | None,
+    lookups: Sequence[TaskLookup],
+) -> tuple[LookupVerdict, ...]:
+    """Corroborate each lookup against its own project's root; one verdict per lookup.
+
+    Every resolvable lookup goes out in ONE plain ``asyncio.gather`` of
+    :func:`safe_get_task` (which already normalises exceptions). Confirmation
+    fails closed — a raising ``accept`` is UNCONFIRMED — and the pass never
+    raises: an unexpected fault logs a WARNING and degrades to all-UNRESOLVABLE.
+    """
+    all_unresolvable = (LookupVerdict.UNRESOLVABLE,) * len(lookups)
+    if not taskmaster or not known_projects or not lookups:
+        return all_unresolvable
+    try:
+        resolvable: list[tuple[int, str]] = []
+        for index, lookup in enumerate(lookups):
+            root = _lookup_root(known_projects, lookup.project_id)
+            if root:
+                resolvable.append((index, root))
+        results: list[Any] = await asyncio.gather(
+            *[
+                safe_get_task(taskmaster, lookups[index].task_id, root)
+                for index, root in resolvable
+            ]
+        )
+        verdicts: list[LookupVerdict] = list(all_unresolvable)
+        for (index, _root), result in zip(resolvable, results, strict=True):
+            verdicts[index] = _classify_lookup(lookups[index], result)
+        return tuple(verdicts)
+    except Exception:
+        logger.warning(
+            'reconciliation.corroborate_task_lookups: corroboration pass failed for '
+            '%d lookup(s) — degrading to unresolvable.',
+            len(lookups),
+            exc_info=True,
+        )
+        return all_unresolvable
+
+
 async def _safe_get_task_or_none(
     taskmaster: Any,
     task_id: Any,
@@ -3897,13 +3983,8 @@ async def filter_false_phantom_task_creation_flags(
     if not taskmaster or not known_projects:
         return list(flags)
 
-    # Collect resolvable cited-task lookups, grouped by owning flag index.
-    # Multiple cited_tasks entries (possibly across different flags) run
-    # concurrently in a single flat asyncio.gather batch.
     lookup_flag_indices: list[int] = []  # flat lookup index -> owning flag index
-    lookup_cited: list[dict[str, Any]] = []  # flat lookup index -> owning cited_tasks entry
-    lookup_coros = []
-
+    lookups: list[TaskLookup] = []
     for i, flag in enumerate(flags):
         if flag.get('flag_type') not in PHANTOM_TASK_CREATION_FLAG_TYPES:
             continue
@@ -3917,29 +3998,24 @@ async def filter_false_phantom_task_creation_flags(
             cited_project_id = cited.get('project_id')
             if cited_task_id is None or cited_project_id is None:
                 continue
-            root = known_projects.get(cited_project_id)
-            if not root:
-                continue  # unresolvable project -> not corroborated -> skip lookup
             lookup_flag_indices.append(i)
-            lookup_cited.append(cited)
-            lookup_coros.append(safe_get_task(taskmaster, cited_task_id, root))
+            lookups.append(TaskLookup(
+                project_id=cited_project_id,
+                task_id=str(cited_task_id),
+                accept=partial(_cited_task_corroborated, cited),
+            ))
 
-    if not lookup_coros:
+    if not lookups:
         return list(flags)
 
-    lookup_results: list[Any] = await asyncio.gather(*lookup_coros)
+    verdicts = await corroborate_task_lookups(taskmaster, known_projects, lookups)
 
-    # Map each corroborated flag index to the specific (project_id, task_id)
-    # cited-task that corroborated it, for structured drop logging below.
-    # First corroborating cite wins if a finding cites more than one task.
+    # First corroborating cite wins if a finding cites more than one task; it
+    # is the pair the drop log names.
     corroborating_cite: dict[int, tuple[Any, Any]] = {}
-    for flag_idx, cited, result in zip(
-        lookup_flag_indices, lookup_cited, lookup_results, strict=True
-    ):
-        if flag_idx in corroborating_cite:
-            continue
-        if _cited_task_corroborated(cited, result):
-            corroborating_cite[flag_idx] = (cited.get('project_id'), cited.get('task_id'))
+    for flag_idx, lookup, verdict in zip(lookup_flag_indices, lookups, verdicts, strict=True):
+        if flag_idx not in corroborating_cite and verdict is LookupVerdict.CONFIRMED:
+            corroborating_cite[flag_idx] = (lookup.project_id, lookup.task_id)
 
     kept: list[dict[str, Any]] = []
     for i, flag in enumerate(flags):
