@@ -4753,7 +4753,7 @@ class MemoryService:
         counters leaf iota samples and differences.
 
         THE PER-GROUP STREAK counts CONSECUTIVE EPISODES that needed a repair,
-        and its update rule is a three-way branch, not a two-way one:
+        and its update rule is a four-way branch, evaluated in this order:
 
         * ``repaired >= 1`` -> ``+1``, by exactly one however many endpoints
           moved. The streak's unit is the EPISODE; the per-episode repair count
@@ -4762,6 +4762,12 @@ class MemoryService:
           proportional would let a single wide episode breach the threshold on
           its own, which is precisely the "one bad write" case this alarm is
           not for.
+        * zero repairs and at least one ``'failed'`` record -> UNCHANGED, and
+          the key is not created. An infrastructure fault (a write the backend
+          refused, or a repair deferred on a degraded target lookup) is no
+          evidence either way: resetting on it would let a FalkorDB blip
+          mid-storm disarm the alarm, and incrementing on it would let an
+          outage page as a scanner regression.
         * zero repairs but ``endpoints_checked > 0`` -> ``0``. THE POSITIVE
           HEALTH SIGNAL: we looked at this episode's edge endpoints and none
           needed moving.
@@ -4791,7 +4797,7 @@ class MemoryService:
         Returns:
             The group's streak AFTER the increment, when this pass incremented
             it — i.e. the reading the storm gate thresholds. ``None`` on the
-            other two arms. Returning the value rather than having the caller
+            other three arms. Returning the value rather than having the caller
             re-read the dict is what keeps the gate from firing on a pass that
             merely LEFT a breached streak in place: an episode that checked
             nothing performs no repair, so it must not re-page an alarm it
@@ -4809,6 +4815,8 @@ class MemoryService:
             streak = self._referent_repair_streaks.get(group_id, 0) + 1
             self._referent_repair_streaks[group_id] = streak
             return streak
+        if repair_stats.failed:
+            return None
         if stats.endpoints_checked:
             self._referent_repair_streaks[group_id] = 0
         return None
@@ -5935,7 +5943,8 @@ class MemoryService:
 
         ``'streaks'`` IS A GAUGE, NOT A COUNTER, and the only entry here that
         can go DOWN: group_id -> consecutive episodes whose repair pass moved
-        something, cleared by a pass that looked and found nothing. It is the
+        something, cleared by a pass that looked and found nothing (a pass
+        whose repairs the backend thwarted clears nothing). It is the
         value the storm gate thresholds, exposed so an operator can see how
         close a project is to the alarm rather than only learning at the breach.
         A group appears only once a pass has produced evidence about it, so an
