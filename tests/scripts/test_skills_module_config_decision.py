@@ -222,6 +222,9 @@ SKILLS_CONSUMING_TESTS = (
     # Reads skills/reflect/SKILL.md to execute its `entities=` examples against
     # the live entities_gate (task 3675).
     "fused-memory/tests/test_referent_declaration_examples.py",
+    # EXECUTES every merge-marker search in skills/**/*.md against a shadowed
+    # fixture history (task 5774).
+    "tests/scripts/test_merge_marker_search_snippets.py",
 )
 
 
