@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import json
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1951,6 +1952,146 @@ class TestIsMissingCollectionError:
     def test_timeout_error_is_false(self):
         """A timeout must keep propagating — it is not evidence of 'no data'."""
         assert is_missing_collection_error(TimeoutError()) is False
+
+
+def _missing_collection_404(collection: str) -> UnexpectedResponse:
+    """Qdrant's 404 for an absent collection, with the body a live scroll/count returns."""
+    body = {'status': {'error': f"Not found: Collection `{collection}` doesn't exist!"}}
+    return UnexpectedResponse(404, 'Not Found', json.dumps(body).encode(), httpx.Headers())
+
+
+_ABSENT_SCOPE = Scope(project_id='solar_challenge')
+_ABSENT_FILTERS = {'kind': 'project_status_correction'}
+
+_SCOPED_METADATA_READS = [
+    pytest.param('scroll_by_metadata', 'scroll', [], id='scroll'),
+    pytest.param('count_by_metadata', 'count', 0, id='count'),
+]
+
+_PROPAGATING_FAILURES = [
+    pytest.param(
+        lambda: UnexpectedResponse(500, 'Internal Server Error', b'boom', httpx.Headers()),
+        UnexpectedResponse,
+        id='500',
+    ),
+    pytest.param(
+        lambda: UnexpectedResponse(
+            404,
+            'Not Found',
+            b'{"status":{"error":"Not found: Point 42 does not exist"}}',
+            httpx.Headers(),
+        ),
+        UnexpectedResponse,
+        id='point-404',
+    ),
+    pytest.param(
+        lambda: UnexpectedResponse(
+            404, 'Not Found', b"Snapshot `daily` doesn't exist!", httpx.Headers(),
+        ),
+        UnexpectedResponse,
+        id='snapshot-404',
+    ),
+    pytest.param(lambda: TimeoutError('too slow'), TimeoutError, id='timeout'),
+    pytest.param(lambda: RuntimeError('qdrant down'), RuntimeError, id='generic'),
+]
+
+
+class TestMem0BackendMetadataReadsOnAbsentCollection:
+    """A never-provisioned collection holds zero memories, so both Scope-addressed
+    metadata reads answer it as empty and say so at INFO, while every other
+    failure keeps propagating (task 4858).
+    """
+
+    @staticmethod
+    async def _read_raising(backend, op: str, client_attr: str, exc: BaseException):
+        mock_client = AsyncMock()
+        setattr(mock_client, client_attr, AsyncMock(side_effect=exc))
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            return await getattr(backend, op)(scope=_ABSENT_SCOPE, filters=_ABSENT_FILTERS)
+
+    @staticmethod
+    def _collection(backend) -> str:
+        return _ABSENT_SCOPE.mem0_collection_name(backend.config.mem0.collection_prefix)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('op', 'client_attr', 'empty'), _SCOPED_METADATA_READS)
+    async def test_missing_collection_reads_as_empty(self, backend, op, client_attr, empty):
+        exc = _missing_collection_404(self._collection(backend))
+
+        result = await self._read_raising(backend, op, client_attr, exc)
+
+        assert result == empty
+        assert type(result) is type(empty)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('op', 'client_attr', 'empty'), _SCOPED_METADATA_READS)
+    async def test_missing_collection_is_disclosed_at_info(
+        self, backend, caplog, op, client_attr, empty,
+    ):
+        collection = self._collection(backend)
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.backends.mem0_client'):
+            await self._read_raising(backend, op, client_attr, _missing_collection_404(collection))
+
+        disclosures = [
+            r for r in caplog.records
+            if r.levelno == logging.INFO
+            and op in r.getMessage()
+            and collection in r.getMessage()
+        ]
+        assert len(disclosures) == 1, [r.getMessage() for r in caplog.records]
+        assert getattr(disclosures[0], 'collection', None) == collection
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('op', 'client_attr', 'empty'), _SCOPED_METADATA_READS)
+    @pytest.mark.parametrize(('make_failure', 'raised'), _PROPAGATING_FAILURES)
+    async def test_other_failures_still_propagate(
+        self, backend, op, client_attr, empty, make_failure, raised,
+    ):
+        with pytest.raises(raised):
+            await self._read_raising(backend, op, client_attr, make_failure())
+
+
+@pytest.fixture
+def _absent_scope(worker_id) -> Scope:
+    return Scope(project_id=f'_test_absent_collection_{worker_id}')
+
+
+@pytest.fixture
+def _absent_collection(_absent_scope, mock_config):
+    """Guarantee the scope's Qdrant collection is absent before AND after the test."""
+    collection = _absent_scope.mem0_collection_name(mock_config.mem0.collection_prefix)
+    client = QdrantClient(url=QDRANT_URL, timeout=10)
+    with contextlib.suppress(ResponseHandlingException, UnexpectedResponse):
+        client.delete_collection(collection)
+    yield collection
+    with contextlib.suppress(Exception):
+        client.delete_collection(collection)
+    client.close()
+
+
+class TestMem0BackendMetadataReadsOnAbsentCollectionIntegration:
+    """The live client's absent-collection 404 matches the predicate for BOTH reads.
+
+    No mem0 instance is built: ``_get_instance`` would provision the very
+    collection this test needs absent.
+    """
+
+    pytestmark = [qdrant_skipif(), pytest.mark.timeout(60), pytest.mark.integration]
+
+    @pytest.mark.asyncio
+    async def test_live_absent_collection_reads_as_empty(
+        self, mock_config, _absent_scope, _absent_collection,
+    ):
+        config = mock_config.model_copy(deep=True)
+        config.mem0.qdrant_url = QDRANT_URL
+        backend = Mem0Backend(config)
+        try:
+            assert await backend.scroll_by_metadata(_absent_scope, {'kind': 'x'}) == []
+            assert await backend.count_by_metadata(_absent_scope, {'kind': 'x'}) == 0
+        finally:
+            await backend.close()
 
 
 # ---------------------------------------------------------------------------
