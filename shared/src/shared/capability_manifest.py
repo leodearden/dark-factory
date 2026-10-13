@@ -312,10 +312,10 @@ class ManifestTask(BaseModel):
 
     - ``task_id`` set — the producer is a LOCAL dark-factory task, stamped
       by ``commit_planning``; never author-supplied for a real batch. The one
-      sanctioned exception (INV-12) is the minimal sidecar that ε1–ε4 of
-      ``plans/dashboard-prd-lanes-prd.md`` write for a legacy, chain-only
-      PRD: it binds an EXISTING task's id by hand (that PRD's §9 ε), is not
-      a real batch, and ``commit_planning`` never stamps it. A local
+      exception, sanctioned by ``plans/dashboard-prd-lanes-prd.md`` §9 ε, is
+      the minimal sidecar that its ε1–ε4 write for a legacy, chain-only PRD:
+      it binds an EXISTING task's id by hand, is not a real batch, and
+      ``commit_planning`` never stamps it. A local
       ``task_id`` is the ordinary case, and the only one whose
       ``delivered_check``\\ s this project's dispatch gate evaluates.
     - ``external_task_id`` set — the producer lives in ANOTHER project's

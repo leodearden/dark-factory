@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import yaml
-from shared.capability_manifest import load_capability_manifest, sidecar_path
+from shared.capability_manifest import load_capability_manifest
 
 from fused_memory.server.manifest_stamping import (
     stamp_capability_manifests,
@@ -399,15 +399,16 @@ async def test_stamp_preserves_sidecar_header_comment(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_stamp_keeps_signal_leaves_and_resolves_the_sidecar_via_sidecar_path(tmp_path):
+async def test_stamp_keeps_signal_leaves_byte_for_byte(tmp_path):
     """Boundary row 5 of plans/dashboard-prd-lanes-prd.md: ``signal_leaves`` survives the stamp."""
     prd_key = 'plans/signal-prd.md'
+    sidecar_relpath = 'plans/signal-prd.capability-manifest.yaml'
     original = _mechanical_sidecar_yaml('signal', ['α', 'ζ']).replace(
         'schema_version: 1\n',
         "schema_version: 1\nsignal_leaves:  # the PRD's integration gate\n- ζ\n",
         1,
     )
-    on_disk = tmp_path / sidecar_path(prd_key)
+    on_disk = tmp_path / sidecar_relpath
     on_disk.parent.mkdir(parents=True)
     on_disk.write_bytes(original.encode('utf-8'))
 
@@ -420,7 +421,7 @@ async def test_stamp_keeps_signal_leaves_and_resolves_the_sidecar_via_sidecar_pa
     )
 
     assert report == {
-        'path': sidecar_path(prd_key),
+        'path': sidecar_relpath,
         'stamped': ['α', 'ζ'],
         'missing_labels': [],
         'errors': [],
