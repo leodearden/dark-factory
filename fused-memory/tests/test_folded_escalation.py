@@ -957,6 +957,9 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     from fused_memory.middleware.candidate_key_escalation import (  # noqa: PLC0415
         _ANCHOR_TASK_ID as CANDIDATE_KEY_ANCHOR,
     )
+    from fused_memory.middleware.curator_escalator import (  # noqa: PLC0415
+        _ANCHOR_TASK_ID as CURATOR_ANCHOR,
+    )
     from fused_memory.middleware.entity_mint_storm_escalator import (  # noqa: PLC0415
         _ANCHOR_TASK_ID as ENTITY_MINT_ANCHOR,
     )
@@ -1051,6 +1054,9 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
         'scope_violation_escalator': SCOPE_VIOLATION_ANCHOR,
         'scope_violation_escalator override': SCOPE_OVERRIDE_ANCHOR,
         'scope_violation_escalator budget-misconfig': SCOPE_BUDGET_ANCHOR,
+        # -- the curator-subsystem filers. Plain `queue.submit`, and a SUBJECT
+        #    anchor (the curator bucket) rather than a dedupe anchor. --------
+        'curator_escalator': CURATOR_ANCHOR,
     }
 
 
@@ -1138,6 +1144,7 @@ class TestNoTwoFilersShareAnAnchor:
             'link_heal misfile-share',
             'link_heal corrects-share',
             'link_heal adjudicator',
+            'curator_escalator',
         ):
             assert required in anchors, (
                 f'{required!r} files into the same queue but is absent from '
