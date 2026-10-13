@@ -532,6 +532,22 @@ def _of(result, source: str) -> list[dict]:
     return [c for c in result.candidates if c['derived_from'] == source]
 
 
+def _topic_census(*rows: dict) -> dict:
+    """A census whose topic table holds exactly *rows*; none gives an EMPTY table."""
+    return {'grand_total': {'topic': {'entries': [dict(row) for row in rows]}}}
+
+
+def _baseline_disclosures(calibration_rows, guard_clusters) -> dict[str, int]:
+    """What the curator and guard sources disclose with no census topic at all.
+
+    Tests assert DELTAS against this, so they do not depend on how many
+    curator/guard slugs the committed sources happen to collide on.
+    """
+    return _mod().derive_registry_candidates(
+        calibration_rows, _topic_census(), guard_clusters,
+    ).disclosures
+
+
 class TestDeriveFromCuratorGates:
     """The curator-gate census — 'each gate is a free labeled cluster'."""
 
@@ -667,6 +683,65 @@ class TestDeriveFromCensus:
         assert result.disclosures['census_rows_malformed_value'] == 3
         assert result.disclosures['census_rows_malformed_count'] == 2
 
+    def test_census_rows_spelling_one_topic_two_ways_derive_the_more_used_row(
+        self, calibration_rows, guard_clusters,
+    ):
+        """The corpus spells one topic with '-' and '_', and the census counts
+        each spelling as its own row. Both rows name ONE topic, so one entry is
+        derived, from the row the census lists first: the more-used spelling."""
+        baseline = _baseline_disclosures(calibration_rows, guard_clusters)
+        census = _topic_census(
+            {'value': 'twice-spelt', 'count': 7},
+            {'value': 'twice_spelt', 'count': 3},
+        )
+        result = _mod().derive_registry_candidates(calibration_rows, census, guard_clusters)
+
+        [kept] = _of(result, 'census_topic')
+        assert kept['topic'] == 'twice-spelt'
+        assert kept['provenance']['census_count'] == 7
+        assert (result.disclosures['census_topics_emitted']
+                == baseline['census_topics_emitted'] + 1)
+        assert (result.disclosures['slug_collisions_dropped']
+                == baseline['slug_collisions_dropped'] + 1)
+
+    def test_every_generated_candidate_is_kept_or_counted_as_a_collision(
+        self, calibration_rows, guard_clusters,
+    ):
+        """No candidate leaves derivation uncounted, and no two kept ones fold
+        together."""
+        m = _mod()
+        rows = [
+            {'value': 'pair-of-spellings', 'count': 5},
+            {'value': guard_clusters[0].topic_id.replace('-', '_'), 'count': 4},
+            {'value': 'plain-multi-one', 'count': 3},
+            {'value': 'pair_of_spellings', 'count': 2},
+            {'value': 'plain-multi-two', 'count': 2},
+            {'value': 'lone-singleton', 'count': 1},
+        ]
+        result = m.derive_registry_candidates(
+            calibration_rows, _topic_census(*rows), guard_clusters,
+        )
+
+        clusters_with_canonical = {
+            r['cluster_id'] for r in calibration_rows if r.get('label') == 'canonical'
+        }
+        census_generating = [
+            r for r in rows
+            if isinstance(r['value'], str) and isinstance(r['count'], int) and r['count'] > 1
+        ]
+        generated = (
+            len(clusters_with_canonical) + len(guard_clusters) + len(census_generating)
+        )
+        d = result.disclosures
+        kept_or_dropped = (
+            d['curator_gate_clusters'] + d['topic_guard_clusters']
+            + d['census_topics_emitted'] + d['slug_collisions_dropped']
+        )
+        assert kept_or_dropped == generated
+        assert kept_or_dropped - d['slug_collisions_dropped'] == len(result.candidates)
+        folded = {m.normalize_topic(c['topic']) for c in result.candidates}
+        assert len(folded) == len(result.candidates)
+
 
 class TestDeriveFromGuardClusters:
     """Guard phrases seed ORDINARY phrasings only — never the held-out one."""
@@ -688,6 +763,32 @@ class TestDeriveFromGuardClusters:
         [winner] = [c for c in result.candidates if c['topic'] == slug]
         assert winner['derived_from'] == 'topic_guard_cluster'
         assert result.disclosures['slug_collisions_dropped'] >= 1
+
+    def test_a_census_spelling_variant_of_a_guard_slug_derives_one_candidate(
+        self, calibration_rows, guard_clusters,
+    ):
+        """A census row spelling a guard slug with '_' names the SAME topic.
+
+        Deriving both would measure one topic twice under two tripwire keys.
+        The guard's exact spelling is kept, because it is the persisted key.
+        """
+        m = _mod()
+        slug = guard_clusters[0].topic_id
+        assert '-' in slug, 'premise: the guard slug must be spellable with "_"'
+        baseline = _baseline_disclosures(calibration_rows, guard_clusters)
+        census = _topic_census({'value': slug.replace('-', '_'), 'count': 9})
+        result = m.derive_registry_candidates(calibration_rows, census, guard_clusters)
+
+        [kept] = [
+            c for c in result.candidates
+            if m.normalize_topic(c['topic']) == m.normalize_topic(slug)
+        ]
+        assert kept['derived_from'] == 'topic_guard_cluster'
+        assert kept['topic'] == slug
+        assert (result.disclosures['census_topics_emitted']
+                == baseline['census_topics_emitted'])
+        assert (result.disclosures['slug_collisions_dropped']
+                == baseline['slug_collisions_dropped'] + 1)
 
     def test_guard_phrases_seed_phrasings(self, derived, guard_clusters):
         by_slug = {c.topic_id: c for c in guard_clusters}
