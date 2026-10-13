@@ -942,7 +942,7 @@ _SPLIT_MAJORITY_CLAIM = 'SPLIT / direct-landed candidates are a MAJORITY'
 _REFERENCED_MAJORITY_CLAIM = 'Candidates that CAN carry a reference are a MAJORITY'
 
 # The two accepted landing-merge spellings, as a reader of CURATION.md sees
-# them (`_merge_subject_patterns` carries the machine form).
+# them (`shared.merge_subject.merge_subject_pattern` carries the machine form).
 _SPELLING_INTO_MAIN = '`Merge task/<id> into main`'
 _SPELLING_COLON = '`Merge task/<id>: <subject>`'
 
