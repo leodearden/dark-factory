@@ -3077,6 +3077,7 @@ def _archive_merge_verify_logs(
     cause_hint: str,
     *,
     module_prefix: 'str | None' = None,
+    role: Literal['merge', 'task'] = 'merge',
 ) -> list[Path]:
     """Write merge-verify run outputs + summary DIRECTLY to the durable archive.
 
@@ -3130,7 +3131,7 @@ def _archive_merge_verify_logs(
             archived.append(path)
 
     summary_path = _archive_attempt_summary(
-        _build_summary_payload(runs, category, cause_hint, role='merge'),
+        _build_summary_payload(runs, category, cause_hint, role=role),
         archive_root, task_id, attempt_id,
         module_prefix=module_prefix, stamp=utc_ts,
     )

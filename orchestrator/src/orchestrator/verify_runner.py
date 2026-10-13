@@ -60,6 +60,7 @@ from typing import (
 
 from orchestrator import flake_ledger, verify
 from orchestrator.config import ModuleConfig, VerifyHostPolicy
+from orchestrator.task_verify_spec import TaskVerifySpec, task_spec_to_json
 from orchestrator.verify import VerifyResult, _archive_merge_verify_logs
 from orchestrator.verify_cancel import (
     HEARTBEAT_INTERVAL_SECS,
@@ -1161,6 +1162,30 @@ def _merge_pass_summary_payload(
     }
 
 
+def _task_pass_summary_payload(
+    runner_name: str,
+    spec: TaskVerifySpec,
+    result: VerifyResult,
+    duration_ms: int,
+) -> dict[str, Any]:
+    """A remote task GREEN's audit record: identity, RESULT, TIMING and the spec's SCOPE."""
+    return {
+        'tip_sha': spec.tip_sha,
+        'task_id': spec.task_id,
+        'attempt_id': spec.attempt_id,
+        'runner': runner_name,
+        'passed': result.passed,
+        'category': result.category,
+        'duration_ms': duration_ms,
+        'scope': {
+            'task_files': list(spec.task_files),
+            'force_workspace': spec.force_workspace,
+            'scope_cargo': spec.scope_cargo,
+            'modules': [vc.prefix for vc in spec.verify_commands],
+        },
+    }
+
+
 class RemoteRunner:
     """Runs a merge-verify bundle on a remote host via git push + ssh.
 
@@ -1556,10 +1581,7 @@ class RemoteRunner:
         result = outcome.result
         if archive_root is not None and task_id is not None:
             if not result.passed:
-                # task-1920 / task-1921: remote stderr, then the captured streams.
-                if outcome.ssh_stderr.strip():
-                    self._archive_failure_stderr(archive_root, task_id, 1, outcome.ssh_stderr)
-                self._archive_failure_streams(archive_root, task_id, 1, result)
+                self._archive_remote_red(archive_root, task_id, 1, outcome, role='merge')
             else:
                 # task-2822 fix (c): a remote GREEN is auditable beside the red archives.
                 self._archive_pass_summary(
@@ -1569,6 +1591,52 @@ class RemoteRunner:
                     ),
                 )
         return result
+
+    async def run_task_verify(
+        self,
+        spec: TaskVerifySpec,
+        *,
+        task_id: str,
+        archive_root: Path | None,
+    ) -> VerifyResult:
+        """Run a task-role verify of ``spec.tip_sha`` on the remote host (PRD §5.2).
+
+        ``_dispatch('verify-task')``, with no main-mirror push.  With
+        *archive_root*, a red archives the remote stderr, the
+        ``attempt-<spec.attempt_id>.remote-<name>.{test,lint,type}-<stamp>.log``
+        streams and their ``.summary-<stamp>.json`` (role 'task'); a green archives
+        one ``.pass-summary-<stamp>.json``.  The result's archive_log_paths name
+        exactly those workstation files and worktree_log_paths is emptied, since
+        laptop paths mean nothing here.  *task_id* must equal ``spec.task_id``.
+        """
+        if task_id != spec.task_id:
+            raise ValueError(
+                f'run_task_verify task_id {task_id!r} disagrees with spec.task_id '
+                f'{spec.task_id!r}'
+            )
+        outcome = await self._dispatch(
+            spec.tip_sha, 'verify-task', task_spec_to_json(spec),
+            request_id=self._id_factory(),
+        )
+        archived: list[Path] = []
+        if archive_root is not None:
+            if not outcome.result.passed:
+                archived = self._archive_remote_red(
+                    archive_root, task_id, spec.attempt_id, outcome, role='task',
+                )
+            else:
+                pass_summary = self._archive_pass_summary(
+                    archive_root, task_id, spec.attempt_id,
+                    _task_pass_summary_payload(
+                        self.name, spec, outcome.result, outcome.duration_ms,
+                    ),
+                )
+                archived = [pass_summary] if pass_summary is not None else []
+        return dataclasses.replace(
+            outcome.result,
+            worktree_log_paths=[],
+            archive_log_paths=[str(path) for path in archived],
+        )
 
     async def _push_main_mirror(self, *, task_id: str | None, event_store: Any) -> None:
         """Step 0 (best-effort): push main FIRST so the remote has a fresh view of it.
@@ -1753,6 +1821,28 @@ class RemoteRunner:
             )
         return result
 
+    def _archive_remote_red(
+        self,
+        archive_root: Path,
+        task_id: str,
+        attempt_id: int,
+        outcome: _DispatchOutcome,
+        *,
+        role: Literal['merge', 'task'],
+    ) -> list[Path]:
+        """Archive a remote red: its ssh stderr (task 1920), then its captured streams (task 1921)."""
+        archived: list[Path] = []
+        if outcome.ssh_stderr.strip():
+            stderr_path = self._archive_failure_stderr(
+                archive_root, task_id, attempt_id, outcome.ssh_stderr,
+            )
+            if stderr_path is not None:
+                archived.append(stderr_path)
+        archived += self._archive_failure_streams(
+            archive_root, task_id, attempt_id, outcome.result, role=role,
+        )
+        return archived
+
     def _archive_failure_stderr(
         self,
         archive_root: Path,
@@ -1827,6 +1917,8 @@ class RemoteRunner:
         task_id: str,
         attempt_id: int,
         result: VerifyResult,
+        *,
+        role: Literal['merge', 'task'],
     ) -> list[Path]:
         """Archive captured test/lint/type output streams to archive_root/task_id/ on failure.
 
@@ -1892,6 +1984,7 @@ class RemoteRunner:
                 result.category,
                 result.cause_hint,
                 module_prefix=f'remote-{self.name}',
+                role=role,
             )
         except Exception as exc:
             _logging.getLogger(__name__).warning(
