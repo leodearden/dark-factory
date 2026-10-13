@@ -1,6 +1,6 @@
 ---
 name: escalation-watcher-auto
-description: "Autonomous level-1 escalation watcher. Acts as the L1 consumer and triage funnel to the human (L2): handles admin-class escalations directly (scope_violation, dependency_discovered, cleanup_needed), performs shallow root-cause analysis to detect causal clusters, and promotes judgement-class items — single or clustered — to L2 via promote_to_l2 so the human receives a pre-formed hypothesis with evidence and concrete options. When promote_to_l2 is unavailable (graceful degradation), falls back to the legacy leave-pending + digest mode. Runs until ROTATION_ESCALATIONS or ROTATION_HOURS is reached, then exits cleanly. This is a fully autonomous, no-terminal skill — do NOT use it for interactive unblocking."
+description: "Autonomous level-1 escalation watcher. Acts as the L1 consumer and triage funnel to the human (L2): handles admin-class escalations directly (scope_violation, dependency_discovered, cleanup_needed), performs shallow root-cause analysis to detect causal clusters, and promotes judgement-class items — single or clustered — to L2 via promote_to_l2 so the human receives a pre-formed hypothesis with evidence and concrete options. Files work-shaped findings as tracked tasks (submit_task → resolve_ticket) and closes them citing the task id; every L1 it assesses ends resolved, filed or promoted, never parked. Runs until ROTATION_ESCALATIONS or ROTATION_HOURS is reached, then exits cleanly. This is a fully autonomous, no-terminal skill — do NOT use it for interactive unblocking."
 ---
 
 # Escalation Watcher (Autonomous)
@@ -22,7 +22,7 @@ You are running an autonomous, fully non-interactive level-1 escalation handler.
 - **No recovery ref-moves.** NEVER perform red-on-main recovery ref-moves — no `git reset`, `git update-ref refs/heads/main`, or any other direct ref mutation. When main is RED and a recovery ref-move is required, PROMOTE to L2 so the human-driven escalation-watcher can execute the enforce-safe recovery procedure (`skills/escalation-watcher/SKILL.md §"Red-on-main recovery"`). This invariant applies even if a recovery SHA is known — the auto-watcher is read-only and has no sanctioned path to move the main ref.
 - **`resolve_issue` on level ≥ 2 is forbidden, with one narrow, evidence-gated exception.** This was always the contract, and the escalation server **enforces** it structurally (`plans/escalation-connection-capability-guard-prd.md`, narrowed by task 2630's carve-out — `escalation.authority.l2_auto_close_class`): this watcher's supervised MCP connection carries `X-Escalation-Levels: 0,1`, so `resume` / `restart` / `park` / `abandon` against a level-2 escalation are **always** rejected server-side with `{'error': ..., 'code': 'level_forbidden'}` and make **no** state change — that part of the contract is unchanged and cannot succeed. The one exception: `resolve_issue(action='close_only')` on an L2 record now **succeeds** when (a) the record matches one of three allowlisted classes AND (b) your `resolution` text quotes that class's required evidence verbatim — see [Auto-closing a rubber-stamp L2](#auto-closing-a-rubber-stamp-l2-narrow-close_only-carve-out) below for the classes, evidence, and the NEVER-allowed set (`design_concern` / `milestone_gate` categories, and any record filed by `orchestrator-deterministic` — the born-at-L2 human-gate sentinel role covering deterministic `always_escalates` / operator / acceptance / milestone-predicate gates — are **never** auto-closable, checked before the allowlist). Every other action at L2, and any L2 record outside the three classes or missing its evidence, still returns `level_forbidden` exactly as before. Resolve L0/L1 admin-class items directly; promote judgement-class and L2-bound items via `promote_to_l2` (which is exempt from the level gate); leave every other L2 pending for the human. The same connection carries `X-Escalation-Identity: orchestrator-escalation-watcher-auto`, which the server stamps onto the archived record's `resolved_by` for every permitted `resolve`/`park`/auto-close — server-attributed and non-spoofable, regardless of the `resolved_by="escalation-watcher-auto"` tool argument used in the call-shape examples throughout this skill.
 
-When in doubt, **promote the escalation to L2** (see [Promote to L2](#promote-to-l2)). Leaving items pending at L1 indefinitely is not acceptable; if the tool is unavailable fall back to the legacy digest (see [Graceful Degradation](#graceful-degradation)).
+When in doubt, **promote the escalation to L2** (see [Promote to L2](#promote-to-l2)). Every L1 you assess ends resolved, filed-and-resolved or promoted — never parked (see [Terminal dispositions](#terminal-dispositions--never-park)).
 
 ## Rotation Limits
 
@@ -98,6 +98,8 @@ The auto-watcher's allowed tools strictly limit what you can access. Use these f
 | `mcp__fused-memory__get_task` | Full task record including metadata and recent history |
 | `mcp__fused-memory__get_tasks` | Task tree — useful for finding sibling tasks of the same parent |
 | `mcp__fused-memory__search` | Semantic search for prior decisions, related tasks, conventions |
+
+The filing pair `mcp__fused-memory__submit_task` / `mcp__fused-memory__resolve_ticket` is not an investigation read: it is a mutating Tier-1 action ([Hard Constraints](#hard-constraints--never-violate)).
 
 **MCP tool names are per-server.** The `mcp__<server>__` prefix names the server that owns a tool.
 
@@ -293,9 +295,11 @@ Every auto-closed L2 **MUST** be enumerated in the rotation digest — see [Dige
 
 ```
 1. Record start time; compute deadline = start + ROTATION_HOURS × 3600 s
-2. Feature-detect: is mcp__escalation__promote_to_l2 in my available toolset?
-   If YES → use L2 promotion paths throughout (steps 4 and 5)
-   If NO  → fall back to LEGACY mode (see Graceful Degradation)
+2. Feature-detect, by inspecting the toolset (never a trial call — see Graceful Degradation):
+   are mcp__escalation__promote_to_l2 AND the filing pair
+   mcp__fused-memory__submit_task / mcp__fused-memory__resolve_ticket available?
+   All present → full mode
+   Any missing → DEGRADED (see Graceful Degradation)
 3. Drain and deduplicate pending L1 escalations (exact call shapes: Draining pending escalations):
    a. get_pending_escalations(level=1) → candidate_l1s
       (FULL shape: the handlers read agent_role and detail)
@@ -309,8 +313,12 @@ Every auto-closed L2 **MUST** be enumerated in the rotation digest — see [Dige
    (Member L1s stay pending at L1 after promotion; without this filter every cycle re-scans
     and re-promotes the same items, inflating the counter and re-spending RCA budget)
 4. Apply shallow RCA across work_batch — detect causal clusters (see Shallow-by-default RCA)
-5. For each escalation in work_batch: autonomous dispatch (path-guard scope_violation closes / dependency / cleanup)
-   OR promote to L2 / legacy-leave-pending (judgement classes — see routing table below)
+5. For each escalation in work_batch, apply exactly one terminal disposition (see Terminal dispositions):
+   resolve it (autonomous dispatch: path-guard scope_violation closes / dependency / stranded),
+   file-and-resolve it (Convert to tracked work, including cleanup_needed), or
+   promote it to L2 (judgement classes and anything you cannot address — see routing table below)
+5b. Check that every work_batch member was resolved, filed-and-resolved or promoted;
+    an item in none of those states is a triage bug — promote it
 6. Increment escalations_handled by len(work_batch) — already-promoted items filtered in step 3
    do NOT count toward the rotation limit
 7. Check rotation limits:
@@ -325,7 +333,7 @@ Every auto-closed L2 **MUST** be enumerated in the rotation digest — see [Dige
       - remaining ≤ 0 → emit digest as final message and exit cleanly
 ```
 
-The digest is emitted on rotation-limit exit regardless of mode (promotion or legacy).
+The digest is emitted on rotation-limit exit in either mode (full or DEGRADED).
 
 ### Draining pending escalations
 
@@ -458,6 +466,22 @@ The `<min(3600, remaining)>` clamp sizes the final wait exactly to the remaining
 **Rationale for foreground blocking:** a single foreground call to `scripts/watcher-rearm.sh` with a bounded `--timeout` is simpler than managing a background subprocess, and the bounded wait guarantees the agent regains control before the supervisor's force-kill grace window. This remains a bounded **foreground** call, never a background subprocess — running it via `run_in_background` would violate this skill's "NO terminal spawning" hard constraint. File-descriptor exhaustion from restart cycles is not expected (historical — no longer expected; see escalation-watcher/SKILL.md §Troubleshooting).
 
 ## Per-Category Routing Table
+
+### Terminal dispositions — never park
+
+Every L1 in `work_batch` leaves the rotation in exactly one of three states:
+
+- **Resolve it** (`resolve_issue`) — you made the state change, or confirmed the record stale or benign.
+- **File-and-resolve it** (`submit_task` → `resolve_ticket` → `resolve_issue`) — see [Convert to tracked work](#convert-to-tracked-work-file-and-resolve).
+- **Promote it** (`promote_to_l2`) — anything you cannot yourself address: anything needing authority above `{0,1}`, a code edit, merge-queue, infra or a ref-move, a human ruling, and anything you are unsure about.
+
+There is NO fourth branch. An assessment that ends without one of the three ends in a promotion.
+
+- **"Hold for an Nth occurrence" is retired.** It cannot release itself: one drain samples one moment, nothing counts occurrences across tasks or rotations, and nothing re-examines the criterion. A recurrence question worth asking is a filed task whose description asks it; one that needs a human is a promotion.
+- **A `stamp_triage` stamp is not a disposition.** It changes neither status nor level, so a stamped-only L1 is still parked.
+- **A parked record costs every later rotation.** `orchestrator/src/orchestrator/harness.py::Harness._watcher_has_actionable_l1` counts every pending L1 outside a pending L2's members, so a parked record re-arms rotations indefinitely.
+- **Pending L2s are the human's queue**, not records you parked; the L2 guards above stand.
+- The one non-terminal state is the `promote_to_l2`-absent defect in [Graceful Degradation](#graceful-degradation). It is not a disposition.
 
 ### Convert to tracked work (file-and-resolve)
 
@@ -1106,22 +1130,25 @@ Skip entirely and move to the next escalation.
 
 ## Graceful Degradation
 
-Feature-detect `mcp__escalation__promote_to_l2` **once at startup** (step 2 in the Main Loop) by checking whether it appears in your available toolset. Do NOT make a trial call — a trial call would mutate the queue.
+Feature-detect **once at startup** (step 2 in the Main Loop) by checking whether each tool appears in your available toolset: `mcp__escalation__promote_to_l2`, and the filing pair `mcp__fused-memory__submit_task` / `mcp__fused-memory__resolve_ticket`. Never make a trial call — it would mutate the queue or file a task.
 
 | Condition | Behaviour |
 |-----------|-----------|
-| Tool **present** | Use L2 promotion paths for all judgement-class items (steps 4 and 5 of the routing table). Emit PROMOTED lines in the digest. |
-| Tool **absent** | Fall back to **legacy mode**: leave judgement-class items pending at L1 and emit PENDING lines in the digest (the pre-tiering behaviour). Autonomous dispatch is unchanged in both modes. Note this now covers **real-task `scope_violation`** as well: leave it pending rather than resuming it, since a resume delivers nothing and re-escalates. |
+| All present | Full mode: every L1 ends resolved, filed-and-resolved or promoted ([Terminal dispositions](#terminal-dispositions--never-park)). |
+| Filing pair **absent** | Promote every item you would have filed, with its content verbatim in `evidence`. The tree stays total. |
+| `promote_to_l2` **absent** | A misconfiguration: a defect state, not a mode to run in. Autonomous dispatch and file-and-resolve continue. Items whose only disposition is promotion — real-task `scope_violation` included, since a resume delivers nothing and re-escalates — cannot be dispositioned: leave them pending and UNSTAMPED, so the first rotation with `promote_to_l2` back reassesses them at once. |
 
-This makes the skill safe to land **before** the orchestrators are restarted onto the new escalation server — the skill degrades gracefully until `promote_to_l2` becomes available at runtime.
+Nothing durable records the items the `promote_to_l2`-absent state leaves pending. The digest is this rotation's final chat message and no component reads it, so it is not a fallback. What an operator sees is the symptom: `orchestrator/src/orchestrator/harness.py::Harness._watcher_has_actionable_l1` keeps re-arming rotations on them.
 
-Log one line at startup so the rotation digest reflects which mode was active:
+This keeps the skill safe to load before the orchestrators restart onto an allowlist that grants these tools.
+
+Log one line at startup naming the state:
 ```
-Mode: L2-promotion (promote_to_l2 available)
+Mode: full (promote_to_l2 + filing pair available)
 ```
 or
 ```
-Mode: LEGACY (promote_to_l2 not available — will leave pending + digest)
+Mode: DEGRADED (missing: <tools>)
 ```
 
 ---
@@ -1143,7 +1170,7 @@ Emit this as your **final message** when the rotation limit is reached:
 ## Escalation Watcher Digest
 Rotation: <escalations_handled> escalations in <elapsed_hours:.1f>h
 Exit reason: <"escalation limit reached" | "time limit reached">
-Mode: <"L2-promotion (promote_to_l2 available)" | "LEGACY (promote_to_l2 not available)">
+Mode: <"full (promote_to_l2 + filing pair available)" | "DEGRADED (missing: <tools>)">
 
 ### Dispatched (autonomous)
 - DISPATCHED: dependency_discovered — task-77 → depends on task-55 [actionable]
@@ -1152,7 +1179,7 @@ Mode: <"L2-promotion (promote_to_l2 available)" | "LEGACY (promote_to_l2 not ava
 - FILED: cleanup_needed — task-99 — tracked as task 6121 (created) — dead code in scheduler.py [converted]
 - FILED: infra_issue — task-61 — tracked as task 6120 (created) — residual: scripts/watcher-rearm.sh still reads the pre-6118 queue path [converted]
 
-### Promoted to L2 (L2-promotion mode only)
+### Promoted to L2
 - PROMOTED (L2 esc-42-7): task_failure — task-12 — verify exhausted after 3 attempts
     Proposal: fix import in tests/test_foo.py line 42 [risk: low]
 - PROMOTED (L2 esc-42-11): scope_violation — task-42 — widening needs a re-plan; requested files [orchestrator/src/orchestrator/harness.py]
@@ -1176,12 +1203,12 @@ Mode: <"L2-promotion (promote_to_l2 available)" | "LEGACY (promote_to_l2 not ava
 - AUTO-CLOSED (L2 esc-main-sweep-abc123def456-1): superseded_main_sweep — main-sweep-abc123def456 — newer sweep esc-main-sweep-9f8e7d6c5b4a; swept SHA abc123def456 is-ancestor of clean tip [benign]
 - AUTO-CLOSED (L2 esc-77-3): self_cleared_infra — task-77 — live probe: curator paused=false [benign]
 
-### Pending (human review required — LEGACY mode only)
-- PENDING (human): task_failure — task-12 — verify exhausted after 3 attempts
+### Left pending (promote_to_l2 unavailable — defect state)
+- PENDING: task_failure — task-12 — verify exhausted after 3 attempts
     Proposal: Blocked because import error in test. To unblock: fix import in tests/test_foo.py line 42. Confidence: high. [risk: low]
-- PENDING (human): design_concern — task-88 — architectural question about X
-- PENDING (human/urgent): infra_issue — N/A — Neo4j connection refused
-- PENDING (human): dependency_discovered — task-33 — no matching task for: "GraphitiV2 migration complete"
+- PENDING: design_concern — task-88 — architectural question about X
+- PENDING (urgent): infra_issue — N/A — Neo4j connection refused
+- PENDING: dependency_discovered — task-33 — no matching task for: "GraphitiV2 migration complete"
 
 ### Skipped
 - review_suggestions: 3 escalations skipped (curator owned)
