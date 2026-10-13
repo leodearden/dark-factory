@@ -24,7 +24,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from shared.proc_group import read_stat_fields
+from shared.proc_group import pid_running
 
 from orchestrator import verify
 from orchestrator.config import OrchestratorConfig
@@ -256,21 +256,6 @@ def _scope_pids(unit: str) -> list[int]:
         return []
 
 
-def _pid_alive(pid: int) -> bool:
-    """True iff *pid* names a live (non-zombie) process.
-
-    A SIGKILL'd sleeper whose parent (this pytest process, via Popen) has not
-    yet ``wait()``ed becomes a ZOMBIE — still in the process table, so a bare
-    ``os.kill(pid, 0)`` probe would wrongly report it alive. Read the proc
-    state and treat a terminated one as dead so the reap assertion reflects
-    real liveness.
-    """
-    if pid <= 0:
-        return False
-    fields = read_stat_fields(Path(f'/proc/{pid}'), skip_malformed=False)
-    return fields is not None and not fields.terminated
-
-
 def _launch_scope(unit: str) -> subprocess.Popen:
     """Launch a live-sleeper transient scope (foreground systemd-run, detached)."""
     return subprocess.Popen(
@@ -332,7 +317,7 @@ class TestVerifyScopeReaperRealSystemd:
             assert _wait_active(sibling_unit), f'{sibling_unit} never became active'
 
             sleeper_pids = _wait_scope_pids(unit)
-            assert sleeper_pids and all(_pid_alive(p) for p in sleeper_pids), (
+            assert sleeper_pids and all(pid_running(p) for p in sleeper_pids), (
                 f'sleeper(s) for {unit} not running (cgroup pids={sleeper_pids})'
             )
 
@@ -345,13 +330,13 @@ class TestVerifyScopeReaperRealSystemd:
             deadline = time.monotonic() + 10.0
             while time.monotonic() < deadline and (
                 _is_active(unit) == 'active'
-                or any(_pid_alive(p) for p in sleeper_pids)
+                or any(pid_running(p) for p in sleeper_pids)
             ):
                 time.sleep(0.2)
             assert _is_active(unit) != 'active', (
                 f'{unit} still active after reap (state={_is_active(unit)!r})'
             )
-            assert not any(_pid_alive(p) for p in sleeper_pids), (
+            assert not any(pid_running(p) for p in sleeper_pids), (
                 f'sleeper(s) {sleeper_pids} still alive after reap'
             )
 

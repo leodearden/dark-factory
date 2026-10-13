@@ -817,7 +817,7 @@ def wait_pids_exited(
     means every pid exited.  A zombie counts as exited: reaping a reparented
     orphan is its subreaper's job (``systemd --user`` on this fleet), not the
     code under test's -- the same criterion as
-    ``orchestrator/tests/test_verify_cancel.py::_is_running`` (task 3955).
+    ``shared/src/shared/proc_group.py::pid_running`` (task 3955).
 
     The verdict is always the probe of the returning iteration, so a caller
     descheduled across the deadline never asserts on a stale observation;

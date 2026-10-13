@@ -23,6 +23,7 @@ from shared.proc_group import (
     MalformedStatLine,
     ProcessGroupMember,
     StatFields,
+    pid_running,
     process_group_members,
     process_group_terminated,
     read_stat_fields,
@@ -1610,8 +1611,8 @@ class TestReadStatFields:
     """The one ``/proc/<pid>/stat`` reader and the malformed-line policy each caller states.
 
     An unreadable entry (the pid is gone) is None under either policy.  A
-    malformed line is skipped (None) by walkers over every host pid, and
-    raised by single-pid probes, which must never read it as gone.
+    malformed line is skipped (None) where that only loses one reading, and
+    raised where a None would be taken for "gone".
     """
 
     @_BOTH_POLICIES
@@ -1703,6 +1704,49 @@ class TestReadStatFields:
                 assert (fields.comm, fields.terminated) == ('��', False)
             finally:
                 p.kill()
+
+
+class TestPidRunning:
+    """The single-pid liveness probe: a zombie is not running, and a malformed stat raises."""
+
+    @pytest.mark.timeout(15)
+    def test_a_live_child_is_running(self):
+        with subprocess.Popen(
+            ['sleep', '30'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        ) as p:
+            try:
+                assert pid_running(p.pid) is True
+            finally:
+                p.kill()
+
+    @pytest.mark.timeout(15)
+    def test_an_unreaped_zombie_and_a_reaped_pid_are_not_running(self):
+        """``waitid(..., WNOWAIT)`` yields the zombie by a condition wait, never a sleep."""
+        p = subprocess.Popen(['sleep', '30'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            p.kill()
+            os.waitid(os.P_PID, p.pid, os.WEXITED | os.WNOWAIT)
+            assert pid_running(p.pid) is False
+        finally:
+            p.wait()
+
+        assert pid_running(p.pid) is False
+
+    @pytest.mark.parametrize('pid', [0, -1])
+    def test_a_non_positive_pid_is_not_running(self, pid):
+        assert pid_running(pid) is False
+
+    @pytest.mark.parametrize('text', _MALFORMED_STAT_LINES)
+    def test_a_malformed_stat_raises_rather_than_reading_as_gone(
+        self, tmp_path, monkeypatch, text
+    ):
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', tmp_path)
+        entry = tmp_path / '810'
+        entry.mkdir()
+        (entry / 'stat').write_text(text)
+
+        with pytest.raises(MalformedStatLine):
+            pid_running(810)
 
 
 class TestProcessGroupTermination:

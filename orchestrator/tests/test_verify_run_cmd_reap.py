@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pytest
-from shared.proc_group import read_stat_fields
+from shared.proc_group import pid_running
 
 from orchestrator.verify import _run_cmd
 
@@ -32,14 +32,9 @@ _LEAKER = (
 )
 
 
-def _running(pid: int) -> bool:
-    fields = read_stat_fields(Path(f'/proc/{pid}'), skip_malformed=False)
-    return fields is not None and not fields.terminated
-
-
 async def _wait_all_dead(pids: list[int], timeout: float = 10.0) -> bool:
     deadline = asyncio.get_running_loop().time() + timeout
-    while any(_running(pid) for pid in pids):
+    while any(pid_running(pid) for pid in pids):
         if asyncio.get_running_loop().time() >= deadline:
             return False
         await asyncio.sleep(0.05)
@@ -53,7 +48,7 @@ def _leaker_pids(cwd: Path) -> tuple[int, int]:
 
 
 def _kill_leftovers(leader: int, child: int) -> None:
-    if _running(leader) or _running(child):
+    if pid_running(leader) or pid_running(child):
         with contextlib.suppress(ProcessLookupError):
             os.killpg(leader, signal.SIGKILL)
 

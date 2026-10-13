@@ -19,7 +19,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
-from shared.proc_group import read_stat_fields
+from shared.proc_group import pid_running
 
 from orchestrator.verify_runner import HEARTBEAT_STOP_JOIN_SECS
 
@@ -1806,8 +1806,7 @@ def _is_running(pid: int) -> bool:
         # Covers ProcessLookupError (no such pid) — a subclass of OSError —
         # alongside PermissionError and friends.
         return False
-    fields = read_stat_fields(Path(f'/proc/{pid}'), skip_malformed=False)
-    return fields is not None and not fields.terminated
+    return pid_running(pid)
 
 
 def _poll_until(predicate, timeout, interval=0.1):

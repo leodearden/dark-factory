@@ -33,7 +33,7 @@ import pytest
 from df_pytest_isolation import PIPE_CLOSING_LEAKER_SRC, read_leaked_pid
 
 from shared.git_async import MAX_CONCURRENT_SPAWNS, GitResult, run_git
-from shared.proc_group import process_group_members, read_stat_fields
+from shared.proc_group import pid_running, process_group_members, read_stat_fields
 
 
 @pytest.fixture
@@ -365,8 +365,7 @@ def _wait_pid_exited(pid: int, timeout: float = 5.0) -> bool:
     """
     deadline = time.monotonic() + timeout
     while True:
-        fields = read_stat_fields(Path('/proc') / str(pid), skip_malformed=False)
-        if fields is None or fields.terminated:
+        if not pid_running(pid):
             return True
         if time.monotonic() >= deadline:
             return False

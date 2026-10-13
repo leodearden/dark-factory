@@ -81,11 +81,11 @@ from typing import NamedTuple
 logger = logging.getLogger(__name__)
 
 
-#: The procfs mount every /proc walk in this module reads: the snapshot, the
-#: at-or-under scan and the group-member walk.
+#: The procfs mount every /proc read in this module goes through: the snapshot,
+#: the at-or-under scan, the group-member walk and the single-pid probe.
 #:
 #: Module-level solely so the synthetic-/proc tests in ``test_proc_group`` can
-#: point those walks at a fabricated tree by monkeypatching it, the same way
+#: point those reads at a fabricated tree by monkeypatching it, the same way
 #: other tests there monkeypatch ``os.readlink`` and ``os.killpg``. It is an
 #: INJECTION SEAM FOR TESTS, not a runtime knob: nothing in production reads a
 #: config value into it, and the whole module already assumes Linux procfs
@@ -147,8 +147,9 @@ def read_stat_fields(entry: Path, *, skip_malformed: bool) -> StatFields | None:
     """Parse ``<entry>/stat`` (entry = /proc/<pid>); None if unreadable (the pid is gone).
 
     A malformed line raises MalformedStatLine, or is None when *skip_malformed*.
-    Walkers over every host pid skip, so one foreign entry never fails the
-    walk; single-pid probes raise, so a malformed line never reads as gone.
+    Skip where a None only loses one reading: a walker over every host pid, or
+    a total diagnostic sampler.  Raise where a None would be taken for "gone":
+    a liveness verdict, such as :func:`pid_running`.
     """
     path = entry / 'stat'
     try:
@@ -161,6 +162,16 @@ def read_stat_fields(entry: Path, *, skip_malformed: bool) -> StatFields | None:
         if skip_malformed:
             return None
         raise
+
+
+def pid_running(pid: int) -> bool:
+    """True iff *pid* has a ``/proc`` entry that has not terminated.
+
+    A zombie is not running, although ``os.kill(pid, 0)`` still reaches it.
+    A malformed stat raises MalformedStatLine rather than reading as gone.
+    """
+    fields = read_stat_fields(_PROC_ROOT / str(pid), skip_malformed=False)
+    return fields is not None and not fields.terminated
 
 
 def snapshot_process_group(pgid: int) -> str:

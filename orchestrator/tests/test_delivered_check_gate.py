@@ -36,7 +36,7 @@ from shared.delivered_check_polarity import (
     build_path_argv,
     interpret_grep_rc,
 )
-from shared.proc_group import read_stat_fields
+from shared.proc_group import pid_running
 
 from orchestrator.config import RELOADABLE_FIELDS, DeliveredChecksConfig, OrchestratorConfig
 from orchestrator.delivered_checks import (
@@ -440,8 +440,7 @@ async def _wait_pid_exited(pid: int, timeout: float = 5.0) -> bool:
     """
     deadline = time.monotonic() + timeout
     while True:
-        fields = read_stat_fields(Path('/proc') / str(pid), skip_malformed=False)
-        if fields is None or fields.terminated:
+        if not pid_running(pid):
             return True
         if time.monotonic() >= deadline:
             return False
