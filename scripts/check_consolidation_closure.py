@@ -84,30 +84,14 @@ from pathlib import Path
 from typing import Any
 
 import _checkout as _checkout
-from shared.project_id import project_id_for_root
-from shared.project_layout import default_project_root
-
-# IMPORT-RESOLUTION CONTRACT (same idiom, and the same precedence argument,
-# as scripts/scan_task_toolcall_leaks.py:92-116): bind `fused_memory` and
-# `shared` to THIS checkout via a __file__-relative path. The fused-memory
-# editable install is an ordinary .pth entry, so sys.path ORDER decides the
-# winner — without these inserts a worktree run would silently check its
-# cluster against the MAIN checkout's copy of the predicate.
-_FM_SRC = Path(__file__).resolve().parent.parent / "fused-memory" / "src"
-if str(_FM_SRC) not in sys.path:
-    sys.path.insert(0, str(_FM_SRC))
-
-_SHARED_SRC = Path(__file__).resolve().parent.parent / "shared" / "src"
-if str(_SHARED_SRC) not in sys.path:
-    sys.path.insert(0, str(_SHARED_SRC))
 
 # `_task_db_scan` is a flat sibling in scripts/ and resolves solely because a
 # DIRECTLY-EXECUTED script puts its own directory at sys.path[0] — so never
 # invoke this via `python -m`. It is the single home for the tasks.db path and
 # its read-only open.
-from _task_db_scan import TaskDbUnreadable, connect_ro, tasks_db_path  # noqa: E402
-from fused_memory.middleware.task_interceptor import TaskInterceptor  # noqa: E402
-from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
+from _task_db_scan import TaskDbUnreadable, connect_ro, tasks_db_path
+from fused_memory.middleware.task_interceptor import TaskInterceptor
+from fused_memory.reconciliation.consolidation_gate import (
     EXIT_CLOSED,
     EXIT_NOT_CLOSED,
     GATE_METADATA_KEY,
@@ -115,6 +99,8 @@ from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
     evaluate_closure,
     resolve_unstamped_live_ids,
 )
+from shared.project_id import project_id_for_root
+from shared.project_layout import default_project_root
 
 #: "I could not run the check." Distinct from EXIT_NOT_CLOSED by design —
 #: see the EXIT-CODE CONTRACT above.
@@ -338,15 +324,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def default_project_root_arg() -> str:
-    return str(default_project_root())
+def _project_root(args: argparse.Namespace) -> str:
+    return args.project_root if args.project_root is not None else str(default_project_root())
 
 
-def resolve_project_args(args: argparse.Namespace) -> argparse.Namespace:
-    """*args* with an unset --project-root as the main checkout and an unset --project-id as its id."""
-    project_root = args.project_root if args.project_root is not None else default_project_root_arg()
-    project_id = args.project_id if args.project_id is not None else project_id_for_root(project_root)
-    return argparse.Namespace(**{**vars(args), "project_root": project_root, "project_id": project_id})
+def _project_id(args: argparse.Namespace) -> str:
+    return args.project_id if args.project_id is not None else project_id_for_root(_project_root(args))
 
 
 def _emit(payload: dict, *, as_json: bool, human: str) -> None:
@@ -357,7 +340,7 @@ async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
     try:
         if args.task_id:
             raw_metadata: Any = load_task_metadata(
-                args.project_root, args.task_id, args.tag
+                _project_root(args), args.task_id, args.tag
             )
         elif args.metadata_file:
             raw_metadata = Path(args.metadata_file).read_text()
@@ -380,13 +363,14 @@ async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
         return EXIT_USAGE
 
     topic = block["topic"]
+    project_id = _project_id(args)
     if memory is None:
         memory = build_memory_service()
 
     store_error: str | None = None
     try:
         scrolled = await scroll_cluster(
-            memory, args.project_id, topic, block=block
+            memory, project_id, topic, block=block
         )
     except Exception as exc:  # noqa: BLE001 — any store failure is "could not check"
         store_error = f"{type(exc).__name__}: {exc}"
@@ -447,8 +431,7 @@ async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = resolve_project_args(build_parser().parse_args(argv))
-    return asyncio.run(run(args))
+    return asyncio.run(run(build_parser().parse_args(argv)))
 
 
 if __name__ == "__main__":

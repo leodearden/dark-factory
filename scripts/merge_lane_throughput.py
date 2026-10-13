@@ -1238,11 +1238,6 @@ _ALWAYS_ON_SECTIONS = (
 )
 
 
-def resolve_runs_db(root: str | Path) -> Path:
-    """``<root>/data/orchestrator/runs.db`` — the orchestrator event store."""
-    return runs_db(root)
-
-
 def resolve_project_roots(values: Sequence[str] | None) -> list[Path]:
     """Resolve the repeated ``--project-root`` values, defaulting to the main checkout.
 
@@ -1306,7 +1301,7 @@ def collect_project(
     window" are different findings and must not render identically.
     """
     root_path = Path(root)
-    db_path = resolve_runs_db(root_path)
+    db_path = runs_db(root_path)
     bundle: dict[str, Any] = {
         'project_root': str(root_path),
         'runs_db': str(db_path),

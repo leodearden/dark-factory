@@ -113,13 +113,8 @@ def sweep_queue(queue_dir: str) -> int:
 
 
 def default_queues() -> list[str]:
-    src = Path(os.path.expanduser('~/src'))
-    projects = src.iterdir() if src.is_dir() else ()
-    queues = sorted(
-        str(escalation_queue_dir(project))
-        for project in projects
-        if escalation_queue_dir(project).is_dir()
-    )
+    every_project = Path(glob.escape(os.path.expanduser('~/src')), '*')
+    queues = sorted(glob.glob(str(escalation_queue_dir(every_project))))
     recon = default_project_root() / 'data' / 'reconciliation' / 'escalations'
     if recon.is_dir():
         queues.append(str(recon))

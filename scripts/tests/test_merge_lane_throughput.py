@@ -17,7 +17,7 @@ from typing import Any
 
 import merge_lane_throughput as mlt
 import pytest
-from shared.project_layout import default_project_root
+from shared.project_layout import default_project_root, runs_db
 
 # ---------------------------------------------------------------------------
 # parse_window — clock-free: ``now`` is always injected, never read inside.
@@ -1937,12 +1937,6 @@ def test_chains_tolerates_a_non_numeric_landed_via_chain():
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_runs_db_is_data_orchestrator_runs_db_under_the_root(tmp_path):
-    assert mlt.resolve_runs_db(tmp_path / 'proj') == (
-        tmp_path / 'proj' / 'data' / 'orchestrator' / 'runs.db'
-    )
-
-
 def test_project_root_flag_is_repeatable(corpus_roots):
     root_a, root_b = corpus_roots
     args = mlt.build_parser().parse_args(
@@ -1998,7 +1992,7 @@ def test_collect_project_labels_its_bundle_with_the_root_it_read(corpus_roots):
     root_a, _ = corpus_roots
     bundle = mlt.collect_project(root_a, CORPUS_LO_DT, CORPUS_HI_DT)
     assert bundle['project_root'] == str(root_a)
-    assert bundle['runs_db'] == str(mlt.resolve_runs_db(root_a))
+    assert bundle['runs_db'] == str(runs_db(root_a))
     assert bundle['error'] is None
     assert bundle['window'] == (CORPUS_LO, CORPUS_HI)
 
@@ -2189,7 +2183,7 @@ def test_collect_project_reports_a_missing_db_as_a_labelled_error(tmp_path):
     assert bundle['error'] is not None
     # Loud: the message names the path that was actually looked for, so the
     # operator can see whether it was the root or the layout that was wrong.
-    assert str(mlt.resolve_runs_db(missing)) in bundle['error']
+    assert str(runs_db(missing)) in bundle['error']
     # And empty — NOT a bundle of zeros. "This DB could not be read" must never
     # render identically to "this project landed nothing in the window".
     assert bundle['sections'] == {}
@@ -2201,7 +2195,7 @@ def test_collect_project_reports_an_unreadable_db_as_a_labelled_error(tmp_path):
     (root / 'data' / 'orchestrator' / 'runs.db').write_text('not a sqlite database')
     bundle = mlt.collect_project(root, CORPUS_LO_DT, CORPUS_HI_DT)
     assert bundle['error'] is not None
-    assert str(mlt.resolve_runs_db(root)) in bundle['error']
+    assert str(runs_db(root)) in bundle['error']
     assert bundle['sections'] == {}
 
 
@@ -2614,7 +2608,7 @@ def test_main_returns_nonzero_when_a_projects_db_is_unreadable(
     )
     assert code != 0
     # Loud on stderr, naming the path actually looked for...
-    assert str(mlt.resolve_runs_db(missing)) in err
+    assert str(runs_db(missing)) in err
     # ...and the healthy project's rows are still printed.
     assert 'median 2.0' in out
     assert str(root_a) in out
@@ -2668,6 +2662,6 @@ def test_main_defaults_to_the_main_checkout_when_no_project_root_is_given(capsys
     # must not fail where the live host passes — the non-hermeticity this
     # module's docstring forbids. Deriving it pins the contract on BOTH:
     # readable store -> 0, unreadable -> 1.
-    has_store = mlt.resolve_runs_db(main_checkout).is_file()
+    has_store = runs_db(main_checkout).is_file()
     assert code == (0 if has_store else 1)
     assert (payload['projects'][str(main_checkout)]['error'] is None) is has_store

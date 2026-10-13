@@ -8,10 +8,10 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType
 
-import _task_db_scan
 import census_tagger_debris
 import merge_lane_throughput
 import suite_census_evidence
@@ -35,11 +35,16 @@ def _load_hyphenated(stem: str) -> ModuleType:
     return module
 
 
-def test_fleet_state_reads_runs_db_through_the_one_tier1_locator(tmp_path):
+def test_fleet_state_measures_landings_and_spend_from_the_layouts_runs_db(tmp_path):
     root = tmp_path / 'proj'
+    root.mkdir()
+    now = datetime(2026, 10, 1, tzinfo=UTC)
 
-    assert fleet_state.runs_db_path(root) == project_layout.runs_db(root)
-    assert fleet_state.runs_db_path is _task_db_scan.runs_db_path
+    states = fleet_state.measure_projects([root], {}, window=fleet_state.Window.trailing(now, days=1), now=now)
+
+    (state,) = states.values()
+    assert state.landed.source == state.spend.source == str(project_layout.runs_db(root))
+    assert (state.landed.status, state.spend.status) == ('source_missing', 'source_missing')
 
 
 def test_task_event_timeline_opens_the_layouts_runs_db_for_a_project_root(tmp_path, capsys):
@@ -63,10 +68,14 @@ def test_census_reads_the_layouts_task_store_and_event_log(tmp_path, make_tasks_
     assert coverage.event_log_path == str(project_layout.runs_db(root))
 
 
-def test_merge_lane_throughput_resolves_the_layouts_runs_db(tmp_path):
+def test_merge_lane_throughput_reads_the_layouts_runs_db(tmp_path):
     root = tmp_path / 'proj'
+    lo = datetime(2026, 10, 1, tzinfo=UTC)
 
-    assert merge_lane_throughput.resolve_runs_db(root) == project_layout.runs_db(root)
+    bundle = merge_lane_throughput.collect_project(root, lo, lo + timedelta(days=1))
+
+    assert bundle['runs_db'] == str(project_layout.runs_db(root))
+    assert str(project_layout.runs_db(root)) in bundle['error']
 
 
 def test_suite_census_finds_flakes_at_the_layouts_runs_db(tmp_path):
@@ -114,6 +123,7 @@ def test_member_chain_sweep_finds_each_projects_layout_queue(tmp_path, monkeypat
     for queue in queues:
         queue.mkdir(parents=True)
     (src / 'c' / 'data').mkdir(parents=True)
+    project_layout.escalation_queue_dir(src / '.hidden').mkdir(parents=True)
     monkeypatch.setenv('HOME', str(tmp_path))
 
     found = _load_hyphenated('member-chain-sweep').default_queues()
