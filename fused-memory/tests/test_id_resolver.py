@@ -80,7 +80,7 @@ class TestMem0Walk:
         resolution = await resolver.resolve_prefix(_PROJECT, 'bff81530')
 
         assert resolution == Resolution('unique', (Candidate('mem0', _FULL, _LONG_TEXT[:80]),))
-        assert mem0.point_reads == [_FULL]
+        assert mem0.point_reads == [(_FULL,)]
 
     @pytest.mark.asyncio
     async def test_a_match_deleted_before_its_preview_read_keeps_its_candidate(self):
@@ -105,6 +105,24 @@ class TestMem0Walk:
 
         assert resolution.outcome == 'ambiguous'
         assert {c.id for c in resolution.candidates} == {_FULL, _SIBLING}
+
+    @pytest.mark.asyncio
+    async def test_every_match_is_previewed_by_one_batched_read(self):
+        mem0 = FakeMem0({_FULL: _memory('a'), _OTHER: _memory('o'), _SIBLING: _memory('b')})
+        resolver = make_resolver(mem0=mem0)
+
+        resolution = await resolver.resolve_prefix(_PROJECT, 'bff81530')
+
+        assert [(c.id, c.preview) for c in resolution.candidates] == [(_SIBLING, 'b'), (_FULL, 'a')]
+        assert mem0.point_reads == [(_FULL, _SIBLING)]
+
+    @pytest.mark.asyncio
+    async def test_no_match_reads_no_point(self):
+        mem0 = FakeMem0({_OTHER: _memory('o')})
+
+        await make_resolver(mem0=mem0).resolve_prefix(_PROJECT, 'bff81530')
+
+        assert mem0.point_reads == []
 
 
 class TestGraphitiNamespaces:
@@ -222,6 +240,17 @@ class TestUnavailableIsNeverAResolution:
             await resolver.resolve_prefix(_PROJECT, 'bff81530')
 
         assert excinfo.value.store == 'graphiti'
+
+    @pytest.mark.asyncio
+    async def test_a_hanging_walk_is_mem0_unavailable_after_the_read_timeout(self):
+        graphiti = FakeGraphiti()
+        resolver = make_resolver(mem0=FakeMem0(hang=True), graphiti=graphiti, read_timeout_seconds=0.05)
+
+        with pytest.raises(ResolverUnavailable) as excinfo:
+            await resolver.resolve_prefix(_PROJECT, 'bff81530')
+
+        assert excinfo.value.store == 'mem0'
+        assert graphiti.calls == []
 
     @pytest.mark.asyncio
     async def test_a_missing_collection_holds_zero_ids_rather_than_being_an_outage(self):

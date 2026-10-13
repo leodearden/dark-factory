@@ -1564,6 +1564,29 @@ class Mem0Backend:
             )
         return dict(records[0].payload or {})
 
+    async def get_points_by_ids(
+        self, memory_ids: Sequence[str], scope: Scope,
+    ) -> dict[str, dict[str, Any]]:
+        """Several points' raw payloads in ONE ``retrieve``: ``{id: payload}``, absent ids omitted.
+
+        The batched sibling of :meth:`get_point_by_id`, with the same payload
+        shape and timeout posture; no ids is no read.
+        """
+        if not memory_ids:
+            return {}
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        client = await self._get_async_qdrant()
+        records = await self._timed_read(
+            client.retrieve(
+                collection_name=collection_name,
+                ids=list(memory_ids),
+                with_payload=True,
+                with_vectors=False,
+            ),
+            'get_points_by_ids',
+        )
+        return {str(record.id): dict(record.payload or {}) for record in records}
+
     async def close(self) -> None:
         """Close all cached AsyncMemory instances and release their connections."""
         import contextlib

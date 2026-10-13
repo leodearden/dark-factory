@@ -1541,6 +1541,65 @@ class TestMem0BackendGetPointById:
         ), f'expected a >1-point WARNING, got {[r.getMessage() for r in caplog.records]!r}'
 
 
+class TestMem0BackendGetPointsByIds:
+    """get_points_by_ids reads several points' raw payloads in ONE retrieve (task 5323)."""
+
+    @staticmethod
+    def _point(point_id: str, payload: dict | None):
+        point = MagicMock()
+        point.id = point_id
+        point.payload = payload
+        return point
+
+    @pytest.mark.asyncio
+    async def test_one_retrieve_maps_each_present_id_to_its_raw_payload(self, backend):
+        first, second, absent = (
+            '77a3f6bc-0000-4000-8000-000000000001',
+            '77a3f6bc-0000-4000-8000-000000000002',
+            '77a3f6bc-0000-4000-8000-000000000003',
+        )
+        mock_client = AsyncMock()
+        mock_client.retrieve = AsyncMock(return_value=[
+            self._point(first, {'data': 'one', 'agent_id': 'a'}),
+            self._point(second, None),
+        ])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.get_points_by_ids(
+                [first, second, absent], Scope(project_id='dark_factory'),
+            )
+
+        assert result == {first: {'data': 'one', 'agent_id': 'a'}, second: {}}
+        assert mock_client.retrieve.await_count == 1
+        call_kwargs = mock_client.retrieve.call_args.kwargs
+        assert call_kwargs['collection_name'] == f'{backend.config.mem0.collection_prefix}_dark_factory'
+        assert call_kwargs['ids'] == [first, second, absent]
+        assert call_kwargs['with_payload'] is True
+        assert call_kwargs['with_vectors'] is False
+
+    @pytest.mark.asyncio
+    async def test_no_ids_is_no_read(self, backend):
+        get_client = AsyncMock()
+
+        with patch.object(backend, '_get_async_qdrant', get_client):
+            assert await backend.get_points_by_ids([], Scope(project_id='dark_factory')) == {}
+
+        get_client.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_timeout_propagates_not_swallowed(self, backend):
+        mock_client = AsyncMock()
+        mock_client.retrieve = AsyncMock(side_effect=TimeoutError('too slow'))
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)),
+            pytest.raises(TimeoutError),
+        ):
+            await backend.get_points_by_ids(
+                ['00000000-0000-4000-8000-000000000000'], Scope(project_id='dark_factory'),
+            )
+
+
 class TestMem0BackendAddSystemRecord:
     """Unit tests for the dedup-exempt system-write path (task 2222 / W5-δ).
 

@@ -11,7 +11,7 @@ real class over these fakes.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from types import SimpleNamespace
 from typing import Any
 
@@ -19,10 +19,13 @@ from fused_memory.services.id_resolver import IdResolver
 
 
 class FakeMem0:
-    """Qdrant-shaped id walk plus point reads over an ``id -> payload`` map.
+    """Qdrant-shaped id walk plus batched point reads over an ``id -> payload`` map.
 
-    ``scroll_error`` is raised after every id has been yielded, i.e. a walk
-    that fails part-way; ``point_error`` is raised by every point read.
+    A ``None`` payload is a point deleted after the walk saw it, so the batch
+    read omits it. ``scroll_error`` is raised after every id has been yielded,
+    i.e. a walk that fails part-way; ``hang`` stalls the walk before its
+    first id; ``point_error`` is raised by every point read. ``point_reads``
+    holds one tuple of ids per batch read.
     """
 
     def __init__(
@@ -31,25 +34,33 @@ class FakeMem0:
         *,
         scroll_error: BaseException | None = None,
         point_error: BaseException | None = None,
+        hang: bool = False,
     ) -> None:
         self.points = dict(points or {})
         self.scroll_error = scroll_error
         self.point_error = point_error
+        self.hang = hang
         self.scroll_calls: list[tuple[str, dict[str, Any]]] = []
-        self.point_reads: list[str] = []
+        self.point_reads: list[tuple[str, ...]] = []
 
     async def scroll_collection_pages(self, collection_name: str, **kwargs: Any) -> AsyncIterator[Any]:
         self.scroll_calls.append((collection_name, kwargs))
+        if self.hang:
+            await asyncio.Event().wait()
         for point_id in self.points:
             yield SimpleNamespace(id=point_id)
         if self.scroll_error is not None:
             raise self.scroll_error
 
-    async def get_point_by_id(self, memory_id: str, scope: Any) -> dict[str, Any] | None:
-        self.point_reads.append(memory_id)
+    async def get_points_by_ids(self, memory_ids: Sequence[str], scope: Any) -> dict[str, dict[str, Any]]:
+        self.point_reads.append(tuple(memory_ids))
         if self.point_error is not None:
             raise self.point_error
-        return self.points.get(memory_id)
+        return {
+            memory_id: payload
+            for memory_id in memory_ids
+            if (payload := self.points.get(memory_id)) is not None
+        }
 
 
 class FakeGraphiti:

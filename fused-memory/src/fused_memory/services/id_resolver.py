@@ -10,6 +10,9 @@ read a store raises ``ResolverUnavailable(store)``; the one exception is a
 Mem0 collection that does not exist, which is the store answering that it
 holds no ids.
 
+Each store's reads run under one ``read_timeout_seconds`` deadline, so a
+resolution is bounded per store, not per Qdrant page.
+
 D9: no cache. Every call walks. A per-collection map would have to be
 invalidated at ``Mem0Backend.add``, ``Mem0Backend.add_system_record`` and
 ``Mem0Backend.delete`` (plus a TTL rebuild for out-of-band writes); add one
@@ -23,7 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from typing import TYPE_CHECKING, Any, Protocol, TypeGuard
 
 from shared.uuid_prefix import find_prefix_tokens
@@ -54,13 +57,15 @@ TombstoneSource = Callable[[str, str], Awaitable[list[dict[str, Any]] | None]]
 
 
 class Mem0Ids(Protocol):
-    """The Mem0 reads the resolver makes: an ids-only walk, then matched points."""
+    """The Mem0 reads the resolver makes: an ids-only walk, then one read of the matches."""
 
     def scroll_collection_pages(
         self, collection_name: str, *, with_payload: bool = ..., page_size: int = ...,
     ) -> AsyncIterator[Any]: ...
 
-    async def get_point_by_id(self, memory_id: str, scope: Scope) -> dict[str, Any] | None: ...
+    async def get_points_by_ids(
+        self, memory_ids: Sequence[str], scope: Scope,
+    ) -> dict[str, dict[str, Any]]: ...
 
 
 class GraphitiIds(Protocol):
@@ -105,6 +110,11 @@ def _outcome(candidate_count: int) -> ResolutionOutcome:
 
 def _candidate_order(candidate: Candidate) -> tuple[int, str]:
     return NAMESPACES.index(candidate.namespace), candidate.id
+
+
+def _mem0_preview(payload: dict[str, Any] | None) -> str:
+    text = extract_payload_text(payload) if payload else None
+    return (text or '')[:PREVIEW_CHARS]
 
 
 class IdResolver:
@@ -180,19 +190,15 @@ class IdResolver:
         scope = Scope(project_id=project_id)
         collection = scope.mem0_collection_name(self._collection_prefix)
         try:
-            matched: list[str] = []
-            async for point in self._mem0.scroll_collection_pages(
-                collection, with_payload=False, page_size=ID_WALK_PAGE_SIZE,
-            ):
-                point_id = str(point.id)
-                if point_id.startswith(prefix):
-                    matched.append(point_id)
-            candidates: list[Candidate] = []
-            for memory_id in matched:
-                payload = await self._mem0.get_point_by_id(memory_id, scope)
-                text = extract_payload_text(payload) if payload else None
-                candidates.append(Candidate('mem0', memory_id, (text or '')[:PREVIEW_CHARS]))
-            return candidates
+            async with asyncio.timeout(self._read_timeout):
+                matched: list[str] = []
+                async for point in self._mem0.scroll_collection_pages(
+                    collection, with_payload=False, page_size=ID_WALK_PAGE_SIZE,
+                ):
+                    point_id = str(point.id)
+                    if point_id.startswith(prefix):
+                        matched.append(point_id)
+                payloads = await self._mem0.get_points_by_ids(matched, scope) if matched else {}
         except Exception as exc:
             if is_missing_collection_error(exc):
                 logger.info(
@@ -201,6 +207,10 @@ class IdResolver:
                 )
                 return []
             raise ResolverUnavailable(MEM0_STORE) from exc
+        return [
+            Candidate('mem0', memory_id, _mem0_preview(payloads.get(memory_id)))
+            for memory_id in matched
+        ]
 
     async def _graphiti_candidates(self, project_id: str, prefix: str) -> list[Candidate]:
         try:
