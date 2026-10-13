@@ -84,9 +84,10 @@ best-effort and always exits 0, a cron/watchdog wrapper will not alarm on
 routine per-dir hiccups — the machine-readable failure list in the JSON report
 carries that signal instead.
 
-This module is STDLIB-ONLY by design: it does NOT import/load
-``OrchestratorConfig`` (``load_config`` is config-required and side-effectful),
-so it runs standalone in any environment. Its default root/caps are module
+This module imports only the stdlib and shared's stdlib-only layout leaf, by
+design: it does NOT import/load ``OrchestratorConfig`` (``load_config`` is
+config-required and side-effectful), so it runs standalone in any environment.
+Its default root is derived from the main checkout and its caps are module
 constants that MIRROR α's config, pinned against silent drift by a drift-guard
 test against ``orchestrator.config.TranscriptArchiveConfig`` / ``RetentionConfig``.
 """
@@ -103,6 +104,9 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import _checkout as _checkout
+from shared.project_layout import default_project_root
+
 logger = logging.getLogger('gc_agent_transcripts')
 
 # Stable greppable prefix on every operator-facing log line.
@@ -114,13 +118,9 @@ SECONDS_PER_DAY = 86_400
 # (orchestrator.config.TranscriptArchiveConfig / RetentionConfig). Pinned
 # against silent drift by test_gc_agent_transcripts.py's drift-guard test —
 # see the module docstring for why the GC does not import OrchestratorConfig.
-# drain_check.py's DEFAULT_FLEET_DIR sets the precedent for the hardcoded
-# absolute project-root default.
-DEFAULT_PROJECT_ROOT = Path('/home/leo/src/dark-factory')
 # Mirrors TranscriptArchiveConfig().root — resolved against project_root, NOT
 # the per-task worktree (the archive is a durable, git-ignored data dir).
 ARCHIVE_ROOT_RELATIVE = 'data/orchestrator/agent-transcripts'
-DEFAULT_ARCHIVE_ROOT = DEFAULT_PROJECT_ROOT / ARCHIVE_ROOT_RELATIVE
 # Mirrors RetentionConfig().max_age_days / .max_task_dirs.
 DEFAULT_MAX_AGE_DAYS = 90
 DEFAULT_MAX_TASK_DIRS = 50000
@@ -157,13 +157,13 @@ MIN_RATE_SAMPLE_DAYS = 7
 
 
 def default_archive_root() -> Path:
-    """Return the default archive root (``project_root / ARCHIVE_ROOT_RELATIVE``).
+    """Return the default archive root (``main checkout / ARCHIVE_ROOT_RELATIVE``).
 
     The single resolution site for the CLI ``--root`` default, mirroring the
     ``resolve_*`` helper shape of :mod:`drain_check`. ``--root`` overrides it;
     there is no env knob (the archive root is a fixed data-dir convention).
     """
-    return DEFAULT_ARCHIVE_ROOT
+    return default_project_root() / ARCHIVE_ROOT_RELATIVE
 
 
 @dataclass
@@ -622,8 +622,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--root',
-        default=str(default_archive_root()),
-        help='Archive root to sweep (default: %(default)s).',
+        default=None,
+        help="Archive root to sweep (default: the main checkout's agent-transcript archive).",
     )
     parser.add_argument(
         '--max-age-days',
@@ -742,7 +742,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO)
     args = build_parser().parse_args(argv)
 
-    root = Path(args.root)
+    root = Path(args.root) if args.root is not None else default_archive_root()
     scanned = scan_task_dirs(root)
     decision = select_prunable(
         scanned, args.now, args.max_age_days, args.max_task_dirs

@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Any
 
 import _checkout as _checkout
-from shared.project_layout import runs_db
+from shared.project_layout import default_project_root, runs_db
 
 # `<N>d`, N a positive integer.  Anchored: '14' and '14x' must both be
 # rejected rather than silently truncated to 14 days.
@@ -1230,12 +1230,6 @@ def compute_chains(
 # Multi-project rim: one runs.db per project root, one labelled bundle each.
 # ---------------------------------------------------------------------------
 
-# This checkout, used when no --project-root is passed. `scripts/` sits
-# directly under the project root, so `parents[1]` is that root (the same
-# spelling `scripts/mint_hard_v2_fixtures.py` and `scripts/query-events.sh`
-# use).
-DEFAULT_PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
 # The always-on sections, in report order. `chains` and `speculation` are
 # behind flags and appended after these.
 _ALWAYS_ON_SECTIONS = (
@@ -1250,15 +1244,17 @@ def resolve_runs_db(root: str | Path) -> Path:
 
 
 def resolve_project_roots(values: Sequence[str] | None) -> list[Path]:
-    """Resolve the repeated ``--project-root`` values, defaulting to this checkout.
+    """Resolve the repeated ``--project-root`` values, defaulting to the main checkout.
 
     argparse's ``append`` action leaves the destination at ``None`` (not
     ``[]``) when the flag never appears, so the default is applied here rather
     than via ``default=[...]`` — an argparse list default is shared mutable
     state that ``append`` extends rather than replaces, which would silently
-    add this checkout to every explicit invocation.
+    add the main checkout to every explicit invocation.  The main checkout,
+    not the checkout this script sits in: runs.db exists only there, since
+    data/ is gitignored and a task worktree has no store of its own.
 
-    EVERY ROOT IS ``.resolve()``d, matching :data:`DEFAULT_PROJECT_ROOT`.  The
+    EVERY ROOT IS ``.resolve()``d, matching the resolved default.  The
     root is not just an input path here, it is the project LABEL — the only
     per-project key the events table gives us (see :func:`collect_project`) —
     so an unnormalised one labels a bundle ``'.'`` and, worse, makes the same
@@ -1269,7 +1265,7 @@ def resolve_project_roots(values: Sequence[str] | None) -> list[Path]:
     renderings would then disagree about how many projects were read.
     """
     if not values:
-        return [DEFAULT_PROJECT_ROOT]
+        return [default_project_root()]
     seen: set[Path] = set()
     roots: list[Path] = []
     for value in values:
@@ -1463,7 +1459,7 @@ def build_parser() -> argparse.ArgumentParser:
             'Project root holding data/orchestrator/runs.db. Repeat to report '
             'several projects side by side (the events table has no project '
             'column, so the root IS the project label). '
-            f'Default: {DEFAULT_PROJECT_ROOT}'
+            'Default: the main checkout.'
         ),
     )
     parser.add_argument(

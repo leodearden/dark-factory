@@ -83,6 +83,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import _checkout as _checkout
+from shared.project_id import project_id_for_root
+from shared.project_layout import default_project_root
+
 # IMPORT-RESOLUTION CONTRACT (same idiom, and the same precedence argument,
 # as scripts/scan_task_toolcall_leaks.py:92-116): bind `fused_memory` and
 # `shared` to THIS checkout via a __file__-relative path. The fused-memory
@@ -120,9 +124,6 @@ EXIT_USAGE = 2
 #: exactly as much of the cluster as the seam does, or the two can disagree
 #: about `scroll_incomplete` on the very cluster the operator is checking.
 SCROLL_LIMIT = TaskInterceptor._CONSOLIDATION_SCROLL_LIMIT
-
-DEFAULT_PROJECT_ROOT = "/home/leo/src/dark-factory"
-DEFAULT_PROJECT_ID = "dark_factory"
 
 
 class UsageError(Exception):
@@ -320,21 +321,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--project-root",
-        default=DEFAULT_PROJECT_ROOT,
-        help="project root owning tasks.db (default: %(default)s)",
+        default=None,
+        help="project root owning tasks.db (default: the main checkout)",
     )
     parser.add_argument(
         "--tag", default="master", help="taskmaster tag (default: %(default)s)"
     )
     parser.add_argument(
         "--project-id",
-        default=DEFAULT_PROJECT_ID,
-        help="memory project_id to scroll (default: %(default)s)",
+        default=None,
+        help="memory project_id to scroll (default: the project id of --project-root)",
     )
     parser.add_argument(
         "--json", action="store_true", dest="as_json", help="emit the verdict as JSON"
     )
     return parser
+
+
+def default_project_root_arg() -> str:
+    return str(default_project_root())
+
+
+def resolve_project_args(args: argparse.Namespace) -> argparse.Namespace:
+    """*args* with an unset --project-root as the main checkout and an unset --project-id as its id."""
+    project_root = args.project_root if args.project_root is not None else default_project_root_arg()
+    project_id = args.project_id if args.project_id is not None else project_id_for_root(project_root)
+    return argparse.Namespace(**{**vars(args), "project_root": project_root, "project_id": project_id})
 
 
 def _emit(payload: dict, *, as_json: bool, human: str) -> None:
@@ -435,7 +447,7 @@ async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    args = resolve_project_args(build_parser().parse_args(argv))
     return asyncio.run(run(args))
 
 

@@ -68,8 +68,8 @@ Usage
   # Deterministic age reference clock (tests / reproducible runs).
   python3 scripts/reclaim_orphaned_worktrees.py --now 1000000000
 
-This module is STDLIB-ONLY by design: it does NOT import/construct
-``OrchestratorConfig`` / ``GitOps`` (both config-required and side-effectful) —
+This module imports only the stdlib and shared's stdlib-only layout leaf, by
+design: it does NOT import/construct ``OrchestratorConfig`` / ``GitOps`` (both config-required and side-effectful) —
 it re-implements the few git operations it needs via ``subprocess``, so it runs
 standalone in any environment (and the wrapper needs no ``uv``/service-env,
 unlike the flag-marker sweep). It reuses only the PRODUCER's naming FACTS.
@@ -90,14 +90,19 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+import _checkout as _checkout
+from shared.project_layout import default_project_root
+
 logger = logging.getLogger('reclaim_orphaned_worktrees')
 
 # Stable greppable prefix on every operator-facing log line.
 _LOG_PREFIX = 'reclaim_orphaned_worktrees:'
 
-# The hardcoded absolute project-root default (drain_check.py / gc_agent_
-# transcripts.py set the precedent). Overridable via --repo.
-DEFAULT_PROJECT_ROOT = '/home/leo/src/dark-factory'
+
+def default_repo() -> Path:
+    """The CLI ``--repo`` default: the main checkout, even when run from a worktree."""
+    return default_project_root()
+
 
 # The quarantine base is a direct sibling of the worktree dir (mirrors
 # GitOps.quarantine_base: ``<worktree_dir>-orphaned``). Derived per-repo in
@@ -248,9 +253,9 @@ def select_reclaimable(
 # where it lands.
 #
 # DUPLICATED, NOT IMPORTED, from ``df_pytest_isolation._GIT_REDIRECT_ENV``:
-# this module is STDLIB-ONLY by design (see the module docstring — the systemd
-# wrapper runs plain ``python3`` with no ``uv``/service env) and that module
-# imports pytest, so importing it would break the nightly unit outright.
+# this module imports nothing beyond the stdlib and shared's stdlib-only layout
+# leaf (see the module docstring — the systemd wrapper runs plain ``python3``
+# with no ``uv``/service env) and that module imports pytest, so importing it would break the nightly unit outright.
 # ``scripts/memory-metadata-coverage-census.sh`` carries a third copy for the
 # same reason. The duplication is pinned against drift by
 # ``test_scrubbed_git_env_matches_shared_redirect_classifier``.
@@ -725,7 +730,7 @@ def reclaim_worktrees(
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI arg parser (unit-testable in isolation).
 
-    ``--repo`` defaults to :data:`DEFAULT_PROJECT_ROOT`; ``--parking-root``
+    ``--repo`` defaults to :func:`default_repo`; ``--parking-root``
     defaults to ``None`` (derived as ``<repo>/.worktrees-orphaned`` in
     :func:`main`); ``--min-age-hours`` is the age floor (non-positive => reclaim
     nothing); ``--check`` is a dry-run flag; ``--now`` overrides the age
@@ -740,8 +745,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--repo',
-        default=DEFAULT_PROJECT_ROOT,
-        help='Repository whose quarantine base is swept (default: %(default)s).',
+        default=None,
+        help='Repository whose quarantine base is swept (default: the main checkout).',
     )
     parser.add_argument(
         '--parking-root',
@@ -852,7 +857,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO)
     args = build_parser().parse_args(argv)
 
-    repo = Path(args.repo)
+    repo = Path(args.repo) if args.repo is not None else default_repo()
     parking_root = (
         Path(args.parking_root)
         if args.parking_root is not None

@@ -28,7 +28,6 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from audit_model_admission import (
-    DEFAULT_RUNS_DB,
     MERGER_ROLE,
     InvocationRecord,
     RoleContainment,
@@ -38,6 +37,7 @@ from audit_model_admission import (
     ServiceRestart,
     SpendInWindow,
     connect_ro,
+    default_runs_db,
     iso,
     load_events,
     markdown_table,
@@ -49,12 +49,12 @@ from audit_model_admission import (
     spend_in_window,
 )
 from escalation_ladder import (
-    DEFAULT_ESCALATIONS_DIR,
     STEWARD_ROLE,
     EscalationCorpus,
     L2TierMetrics,
     StewardDisposition,
     StewardDispositionSummary,
+    default_escalations_dir,
     l2_tier_metrics,
     load_escalation_corpus,
     summarize_steward_dispositions,
@@ -809,12 +809,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                              'means unknown, rendered as "-"')
     parser.add_argument('--steward-min-tier', default=1, type=int,
                         help='dispatch tier the steward arms split at (default: 1)')
-    parser.add_argument('--runs-db', default=DEFAULT_RUNS_DB, type=Path)
-    parser.add_argument('--escalations-dir', default=DEFAULT_ESCALATIONS_DIR, type=Path)
+    parser.add_argument('--runs-db', default=None, type=Path,
+                        help="(default: the main checkout's runs.db)")
+    parser.add_argument('--escalations-dir', default=None, type=Path,
+                        help="(default: the main checkout's escalation queue)")
     args = parser.parse_args(argv)
 
-    corpus = load_escalation_corpus(args.escalations_dir)
-    conn = connect_ro(args.runs_db)
+    corpus = load_escalation_corpus(
+        args.escalations_dir if args.escalations_dir is not None else default_escalations_dir()
+    )
+    conn = connect_ro(args.runs_db if args.runs_db is not None else default_runs_db())
     try:
         result = review(
             conn, corpus,

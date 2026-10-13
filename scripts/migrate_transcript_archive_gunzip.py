@@ -74,9 +74,10 @@ content, and deleting on that basis would be the same unverified destruction
 this module exists to prevent. One residual ``.gz`` and a line of operator
 attention is the right price.
 
-This module is STDLIB-ONLY by design, mirroring the deliberate no-repo-imports
-posture of :mod:`gc_agent_transcripts` (a sweep over this very same tree), so it
-runs standalone in any environment with no config load and no PYTHONPATH setup.
+This module imports only the stdlib and shared's stdlib-only layout leaf, by
+design, mirroring the posture of :mod:`gc_agent_transcripts` (a sweep over this
+very same tree), so it runs standalone in any environment with no config load
+and no PYTHONPATH setup.
 """
 
 from __future__ import annotations
@@ -91,6 +92,9 @@ import sys
 import zlib
 from pathlib import Path
 
+import _checkout as _checkout
+from shared.project_layout import default_project_root
+
 logger = logging.getLogger('migrate_transcript_archive_gunzip')
 
 # Stable greppable prefix on every operator-facing log line.
@@ -99,12 +103,10 @@ _LOG_PREFIX = 'migrate_transcript_archive_gunzip:'
 # Copy chunk size: bounds peak RSS independently of transcript size.
 _CHUNK_BYTES = 1 << 20
 
-# Mirrors gc_agent_transcripts' constants for the same archive tree — the
+# Mirrors gc_agent_transcripts' constant for the same archive tree — the
 # archive root is a durable, git-ignored data dir under project_root, NOT the
 # per-task worktree.
-DEFAULT_PROJECT_ROOT = Path('/home/leo/src/dark-factory')
 ARCHIVE_ROOT_RELATIVE = 'data/orchestrator/agent-transcripts'
-DEFAULT_ARCHIVE_ROOT = DEFAULT_PROJECT_ROOT / ARCHIVE_ROOT_RELATIVE
 
 GZ_SUFFIX = '.gz'
 
@@ -148,13 +150,13 @@ _UNREADABLE_SOURCE_ERRORS = (OSError, EOFError, zlib.error, UnicodeDecodeError)
 
 
 def default_archive_root() -> Path:
-    """Return the default archive root (``project_root / ARCHIVE_ROOT_RELATIVE``).
+    """Return the default archive root (``main checkout / ARCHIVE_ROOT_RELATIVE``).
 
     The single resolution site for the CLI ``--root`` default, mirroring
     :func:`gc_agent_transcripts.default_archive_root`. ``--root`` overrides it;
     there is no env knob (the archive root is a fixed data-dir convention).
     """
-    return DEFAULT_ARCHIVE_ROOT
+    return default_project_root() / ARCHIVE_ROOT_RELATIVE
 
 
 def plain_sibling(gz_path: Path) -> Path:
@@ -525,8 +527,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--root',
-        default=str(default_archive_root()),
-        help='Archive root to migrate (default: %(default)s).',
+        default=None,
+        help="Archive root to migrate (default: the main checkout's agent-transcript archive).",
     )
     parser.add_argument(
         '--apply',
@@ -553,7 +555,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO)
     args = build_parser().parse_args(argv)
 
-    root = Path(args.root)
+    root = Path(args.root) if args.root is not None else default_archive_root()
     summary = migrate_archive(root, apply=args.apply)
     print(json.dumps(summary))
 
