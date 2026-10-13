@@ -25,12 +25,13 @@ That single-source rule holds exactly where it decides anything, and task
 4014 added ONE deliberate, narrow exception on the other side of a
 discovery/assertion split:
 
-* ASSERTIONS -- ``subtree_and_leader_gone``, ``wait_subtree_gone`` -- and the
-  descendant set ``wait_subtree_live`` RETURNS still come only from the
-  production walkers ``collect_descendants``/``read_ppid_map``.  A kill
-  verdict on CAPTURED pids goes through ``wait_pids_exited`` (a zombie-aware
-  ``shared/src/shared/proc_group.py::read_stat_fields`` read), but the pids
-  themselves are still discovered only by those walkers.
+* ASSERTIONS -- every row's kill verdict goes through ``wait_pids_exited``
+  (a zombie-aware ``shared/src/shared/proc_group.py::read_stat_fields``
+  read), applied by ``assert_pre_kill_tree_exited`` to the pids
+  ``snapshot_pre_kill_tree`` captured while the leader was alive.  Those
+  pids, and the descendant set ``wait_subtree_live`` RETURNS, are still
+  discovered only by the production walkers
+  ``collect_descendants``/``read_ppid_map``.
 * the ARRANGE-phase discovery GATE adds a cheap Linux
   ``/proc/<pid>/task/*/children`` pre-filter (:func:`_read_direct_children`)
   that decides nothing except whether to spend a full rescan on a given poll
@@ -794,29 +795,6 @@ def wait_for_marker_stable(
     )
 
 
-def subtree_and_leader_gone(pgid: int) -> bool:
-    """True when *pgid* has no live descendants AND the pgid leader itself is gone."""
-    if collect_descendants(pgid, read_ppid_map()):
-        return False
-    try:
-        os.killpg(pgid, 0)
-        return False  # group still alive
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        return False
-
-
-def wait_subtree_gone(pgid: int, *, timeout: float, interval: float = 0.1) -> bool:
-    """Poll until subtree_and_leader_gone(pgid); return the final boolean (no raise)."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if subtree_and_leader_gone(pgid):
-            return True
-        time.sleep(interval)
-    return subtree_and_leader_gone(pgid)
-
-
 def read_proc_state(pid: int) -> StatFields | None:
     """*pid*'s stat fields, or None once it has no ``/proc`` entry.
 
@@ -1115,7 +1093,7 @@ ROW_WATCHDOG_ENV: dict[str, str] = {
     'ORCH_WATCHDOG_KILL_GRACE_SECS': str(ROW_WATCHDOG_KILL_GRACE_SECS),
 }
 
-#: Ceiling for the rows' child.wait()/wait_subtree_gone()/wait_pids_exited() polls: the full
+#: Ceiling for the rows' child.wait()/wait_pids_exited() polls: the full
 #: window plus load headroom.  A WEDGE-DETECTOR, not a speed assertion (the
 #: rows assert THAT the tree was killed, never how fast), so on the success
 #: path a wider ceiling costs zero wall-clock and is paid only when the test
@@ -1132,9 +1110,10 @@ ROW_TREE_KILL_CEILING_SECS: float = ROW_WATCHDOG_WINDOW_SECS + 15.0  # 30.0
 ROW_MARKER_CEILING_SECS: float = 20.0
 
 #: Base ceiling for the two DISCOVERY waits every row runs BEFORE the
-#: watchdog is even armed -- wait_for_pgid_file, then wait_subtree_live (Row
-#: 1: a second wait_for_pgid_file, on the build's own pgid file).  Rows
-#: 1/2/3 pass the resolved ceiling explicitly at their call sites below
+#: watchdog is even armed.  Rows 1-4 run wait_for_pgid_file twice -- once on
+#: the leader's pgid file, once on the build's own (sleeper_spec
+#: build_pgid_file); Row 5 runs wait_for_pgid_file, then wait_subtree_live.
+#: Rows 1-4 pass the resolved ceiling explicitly at their call sites below
 #: (instead of relying on the bare default) so this value and those defaults
 #: cannot silently drift apart.
 ROW_DISCOVERY_CEILING_BASE_SECS: int = 20
@@ -1285,8 +1264,8 @@ ROW_PER_TEST_TIMEOUT_SECS: int = int(
 )  # 390
 
 #: Row 5's own bounded terms.  It does not share Rows 1-4's shape -- no
-#: watchdog window, no wait_subtree_gone kill confirmation -- so it cannot
-#: share their constant, only their DERIVATION.  Named here (rather than
+#: watchdog window, no kill confirmation -- so it cannot share their
+#: constant, only their DERIVATION.  Named here (rather than
 #: passed as literals at the call sites) so the budget below and the waits it
 #: is supposed to cover move together.
 ROW5_WAITER_COMPLETION_CEILING_SECS: float = 60.0
@@ -1749,9 +1728,8 @@ def _timeout_mark_argument(func_node):
 def test_row5_per_test_timeout_covers_its_own_bounded_work():
     """Row 5's pytest timeout must cover ITS bounded worst case, and be DERIVED.
 
-    Row 5 does not share Rows 1-4's shape -- no watchdog window, no
-    ``wait_subtree_gone`` kill confirmation -- so it cannot share their
-    constant.  Its bounded terms are: two discovery waits (both on the
+    Row 5 does not share Rows 1-4's shape -- no watchdog window, no kill
+    confirmation -- so it cannot share their constant.  Its bounded terms are: two discovery waits (both on the
     load-scaled ceiling), the marker wait, the waiter subprocess's completion
     ceiling, and the ``finally`` block's TWO holder teardowns (waiter then
     holder).
@@ -2398,10 +2376,9 @@ def test_wait_subtree_live_skips_a_vanished_transient_and_returns_the_durable_se
 
     The helper must keep polling rather than hand back that empty set.  Two
     reasons: it makes the return contract "a NON-EMPTY descendant set"
-    total, and it biases what the rows observe toward the durable sleeper --
-    a transient that self-exits could otherwise let the ``wait_subtree_gone``
-    assertion each row makes next pass without the watchdog having killed
-    anything.
+    total, and it biases what a caller observes toward the durable sleeper --
+    a caller would otherwise mistake a transient ``git`` child for the
+    durable build.
     """
     probe_calls = [0]
     ppid_map_calls = [0]
@@ -2999,7 +2976,7 @@ def test_pre_kill_tree_verdict_sees_a_session_escaped_build_after_its_leader_is_
         leader.wait(timeout=5)
 
         build_state = read_proc_state(build)
-        assert build_state is not None and not build_state.exited, (
+        assert build_state is not None and not build_state.terminated, (
             f'harness bug: build pid={build} is not running ({build_state}) after '
             f'its leader was reaped, so the verdict below would prove nothing'
         )
