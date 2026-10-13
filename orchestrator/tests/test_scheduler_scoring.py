@@ -3,14 +3,25 @@
 from __future__ import annotations
 
 import csv
+import inspect
 import json
+import math
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 import orchestrator
-from orchestrator.config import ScoringConfig
+from orchestrator.config import (
+    PRIORITY_TIERS,
+    TIER_BASE,
+    TIER_WIDTH,
+    OrchestratorConfig,
+    ScoringConfig,
+)
 from orchestrator.pending_age import read_pending_age
+from orchestrator.scheduler import Scheduler
 
 REPO_ROOT = Path(orchestrator.__file__).resolve().parents[3]
 FIXTURE_DIR = REPO_ROOT / 'orchestrator' / 'tests' / 'fixtures' / 'scheduler_candidates'
@@ -70,3 +81,101 @@ class TestBaselineEvidence:
         assert len(scores) == 47
         assert sum(r['capped'] == 'True' for r in rows) == 251
         assert (tie_score, tie_size) == (2999.0, 117)
+
+
+HOUR = 3600.0
+
+
+@pytest.fixture
+def scheduler() -> Scheduler:
+    scheduler = Scheduler(OrchestratorConfig(max_per_module=1, scoring=ScoringConfig()))
+    scheduler.finish_startup()
+    return scheduler
+
+
+def _bonus(scheduler: Scheduler, *, age_secs: float = 0.0, transitive_count: int = 0,
+           has_work_product: bool = False, tier: str = 'medium') -> float:
+    score = scheduler._compute_score(
+        tier, age_secs=age_secs, transitive_count=transitive_count, has_work_product=has_work_product,
+    )
+    return score - TIER_BASE[tier]
+
+
+class TestSubBudgetFormula:
+    """C2 at the shipped defaults, as known-answer arithmetic."""
+
+    @pytest.mark.parametrize(('age_secs', 'expected'), [
+        (0.0, 0.0), (24 * HOUR, 125.0), (72 * HOUR, 250.0), (168 * HOUR, 350.0),
+    ])
+    def test_age_term(self, scheduler, age_secs, expected):
+        assert _bonus(scheduler, age_secs=age_secs) == pytest.approx(expected, abs=1e-9)
+
+    def test_age_half_life_gives_exactly_half_the_budget(self, scheduler):
+        cfg = scheduler.config.scoring
+
+        assert _bonus(scheduler, age_secs=cfg.age_half_secs) == cfg.age_budget / 2
+
+    @pytest.mark.parametrize(('d', 'expected'), [
+        (0, 0.0), (1, 59.4723), (4, 138.0896), (32, 300.0), (188, 300.0),
+    ])
+    def test_cpm_term(self, scheduler, d, expected):
+        assert _bonus(scheduler, transitive_count=d) == pytest.approx(expected, abs=1e-4)
+
+    def test_cpm_term_clips_at_the_cap(self, scheduler):
+        cfg = scheduler.config.scoring
+
+        assert _bonus(scheduler, transitive_count=cfg.cpm_d_cap) == cfg.cpm_budget
+        assert _bonus(scheduler, transitive_count=188) == cfg.cpm_budget
+
+    def test_continuity_is_exactly_additive(self, scheduler):
+        inputs = {'age_secs': 30 * HOUR, 'transitive_count': 3, 'tier': 'high'}
+
+        with_work = _bonus(scheduler, has_work_product=True, **inputs)
+        without = _bonus(scheduler, has_work_product=False, **inputs)
+
+        assert with_work - without == pytest.approx(scheduler.config.scoring.continuity_credit, abs=1e-9)
+
+    @pytest.mark.parametrize('tier', PRIORITY_TIERS)
+    def test_tier_base_dominates(self, scheduler, tier):
+        cfg = scheduler.config.scoring
+
+        assert TIER_BASE[tier] + cfg.cpm_budget + cfg.age_budget + cfg.continuity_credit < TIER_BASE[tier] + TIER_WIDTH
+
+    def test_score_never_saturates_in_age(self, scheduler):
+        year = 365 * 24 * HOUR
+        ages = [0.0, 1.0, HOUR, 24 * HOUR, 72 * HOUR, 30 * 24 * HOUR, year, 100 * year]
+
+        scores = [scheduler._compute_score('low', age_secs=a, transitive_count=32, has_work_product=True)
+                  for a in ages]
+
+        assert all(lo < hi for lo, hi in zip(scores, scores[1:], strict=False)), scores
+        assert max(scores) < TIER_BASE['low'] + TIER_WIDTH - 1
+
+    def test_score_strictly_increases_in_d_up_to_the_cap(self, scheduler):
+        cap = scheduler.config.scoring.cpm_d_cap
+
+        bonuses = [_bonus(scheduler, transitive_count=d) for d in range(cap + 1)]
+
+        assert all(lo < hi for lo, hi in zip(bonuses, bonuses[1:], strict=False)), bonuses
+
+    def test_only_the_tier_can_be_passed_positionally(self, scheduler):
+        parameters = inspect.signature(scheduler._compute_score).parameters
+
+        positional = [name for name, p in parameters.items() if p.kind is not inspect.Parameter.KEYWORD_ONLY]
+        assert positional == ['tier']
+
+
+class TestLegacyFormula:
+    """The I-6 fallback: today's clipped formula, still live on an unarmed tick."""
+
+    @pytest.mark.parametrize(('tier', 'age', 'd'), [
+        ('medium', 0, 0), ('high', 5, 2), ('low', 30, 9), ('medium', 1_000_000, 0),
+    ])
+    def test_legacy_formula_is_intact(self, scheduler, tier, age, d):
+        cfg = scheduler.config
+        expected = TIER_BASE[tier] + min(cfg.age_alpha * age + cfg.cpm_beta * math.log1p(d), TIER_WIDTH - 1)
+
+        assert scheduler._compute_score_legacy(tier, age, d) == expected
+
+    def test_legacy_formula_still_caps(self, scheduler):
+        assert scheduler._compute_score_legacy('medium', 1_000_000, 0) - TIER_BASE['medium'] == 999.0
