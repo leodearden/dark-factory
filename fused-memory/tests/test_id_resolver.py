@@ -258,6 +258,16 @@ class TestMissReport:
         assert tombstones.calls == [(_PROJECT, 'bff81530')]
         assert len(mem0.scroll_calls) == 1, 'the report must not walk the collection again'
 
+    @pytest.mark.asyncio
+    async def test_unreadable_tombstones_are_reported_unchecked_never_empty(self):
+        resolver = make_resolver(tombstones=RecordingTombstones(unreadable=True))
+        resolution = await resolver.resolve_prefix(_PROJECT, 'bff81530')
+
+        report = await resolver.miss_report(_PROJECT, 'bff81530', resolution)
+
+        assert report['mem0_tombstone'] is None
+        assert report['mem0'] == report['graphiti_node'] == report['graphiti_edge'] == []
+
 
 class TestForMemoryService:
     @pytest.mark.asyncio

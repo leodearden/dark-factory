@@ -50,7 +50,7 @@ PREVIEW_CHARS = 80
 MEM0_STORE = 'mem0'
 GRAPHITI_STORE = 'graphiti'
 
-TombstoneSource = Callable[[str, str], Awaitable[list[dict[str, Any]]]]
+TombstoneSource = Callable[[str, str], Awaitable[list[dict[str, Any]] | None]]
 
 
 class Mem0Ids(Protocol):
@@ -158,6 +158,8 @@ class IdResolver:
 
         Reads only the tombstone source; the live lists are the resolution's
         own candidates, so nothing the resolution just walked is walked again.
+        ``mem0_tombstone`` is ``None`` when the source could not read its
+        store: unchecked, never an empty list (INV-11).
         """
 
         def live(namespace: Namespace) -> list[dict[str, str]]:

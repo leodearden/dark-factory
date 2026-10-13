@@ -4979,7 +4979,8 @@ def create_mcp_server(
             prefix: the miss report ``{'found': False, 'prefix_checked': True,
             'prefix', 'project_id', 'namespaces', 'hint'}`` listing what each
             namespace (mem0, mem0_tombstone, graphiti_node, graphiti_edge)
-            holds; ``{'error_type': 'ambiguous_uuid_prefix', 'candidates', ...}``
+            holds, with ``mem0_tombstone: None`` when the tombstone store could
+            not be read; ``{'error_type': 'ambiguous_uuid_prefix', 'candidates', ...}``
             when it names several ids; ``{'error_type': 'resolver_unavailable',
             'store', 'prefix_checked': False, ...}`` when a store could not be
             read. Any other non-uuid id is a ``ValidationError`` with a ``hint``.

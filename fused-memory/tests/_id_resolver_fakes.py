@@ -87,15 +87,19 @@ class FakeGraphiti:
 
 
 class RecordingTombstones:
-    """An async ``(project_id, prefix) -> list[dict]`` tombstone source."""
+    """An async ``(project_id, prefix) -> list[dict] | None`` tombstone source.
 
-    def __init__(self, found: list[dict[str, Any]] | None = None) -> None:
+    ``unreadable`` answers ``None``: the tombstone store could not be read.
+    """
+
+    def __init__(self, found: list[dict[str, Any]] | None = None, *, unreadable: bool = False) -> None:
         self.found = list(found or [])
+        self.unreadable = unreadable
         self.calls: list[tuple[str, str]] = []
 
-    async def __call__(self, project_id: str, prefix: str) -> list[dict[str, Any]]:
+    async def __call__(self, project_id: str, prefix: str) -> list[dict[str, Any]] | None:
         self.calls.append((project_id, prefix))
-        return list(self.found)
+        return None if self.unreadable else list(self.found)
 
 
 def make_resolver(

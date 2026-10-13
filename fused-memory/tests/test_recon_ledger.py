@@ -1615,11 +1615,12 @@ async def test_get_mem0_tombstone_absent_returns_none(store):
 
 
 @pytest.mark.asyncio
-async def test_mem0_tombstone_ids_with_prefix_lists_only_this_projects_matching_tombstones(store):
-    """A uuid prefix reaches the tombstones whose memory id starts with it (task 5323).
+async def test_mem0_tombstones_with_prefix_lists_only_this_projects_matching_tombstones(store):
+    """A uuid prefix reaches the tombstone rows whose memory id starts with it (task 5323).
 
     The store is keyed by the FULL memory id, so a prefix needs its own
-    listing. Project, record kind and the prefix itself each scope it.
+    listing. Project, record kind and the prefix itself each scope it, and
+    each row is the same record the exact-id read returns.
     """
     reify_b = 'bff81530-0000-4000-8000-00000000000b'
     reify_a = 'bff81530-0000-4000-8000-00000000000a'
@@ -1648,11 +1649,14 @@ async def test_mem0_tombstone_ids_with_prefix_lists_only_this_projects_matching_
         flag_type='f1',
     ))
 
-    assert await store.mem0_tombstone_ids_with_prefix('reify', 'bff81530') == [reify_a, reify_b]
+    rows = await store.mem0_tombstones_with_prefix('reify', 'bff81530')
+
+    assert [row.task_id for row in rows] == [reify_a, reify_b]
+    assert rows == [await store.get_mem0_tombstone('reify', memory_id) for memory_id in (reify_a, reify_b)]
 
 
 @pytest.mark.asyncio
-async def test_mem0_tombstone_ids_with_prefix_is_a_literal_case_sensitive_match(store):
+async def test_mem0_tombstones_with_prefix_is_a_literal_case_sensitive_match(store):
     """LIKE would fold case and read %/_ as wildcards; the prefix must not."""
     await record_mem0_deletion_tombstone(
         _tombstone_ms(store),
@@ -1664,9 +1668,9 @@ async def test_mem0_tombstone_ids_with_prefix_is_a_literal_case_sensitive_match(
         deleting_run_id='run-deleter',
     )
 
-    assert await store.mem0_tombstone_ids_with_prefix('reify', 'BFF81530') == []
-    assert await store.mem0_tombstone_ids_with_prefix('reify', 'bff8153_') == []
-    assert await store.mem0_tombstone_ids_with_prefix('reify', 'bff%') == []
+    assert await store.mem0_tombstones_with_prefix('reify', 'BFF81530') == []
+    assert await store.mem0_tombstones_with_prefix('reify', 'bff8153_') == []
+    assert await store.mem0_tombstones_with_prefix('reify', 'bff%') == []
 
 
 @pytest.mark.asyncio

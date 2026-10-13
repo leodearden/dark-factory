@@ -785,8 +785,10 @@ class TestFindMem0DeletionTombstones:
     """Tombstones reachable from a uuid PREFIX, over the real ledger (task 5323).
 
     The tombstone store is keyed by the full memory id, so a prefix-shaped
-    get_memory_by_id miss needs a listing. Each hit is decoded by the existing
-    get_mem0_deletion_tombstone, so the two answers cannot drift apart.
+    get_memory_by_id miss needs a listing. Each hit decodes exactly as
+    get_mem0_deletion_tombstone decodes it, so the two answers cannot drift
+    apart. ``None`` is "the tombstone store could not be read": unchecked,
+    never the empty list a reader would take for "none were reaped".
     """
 
     _PROJECT = 'reify'
@@ -795,7 +797,7 @@ class TestFindMem0DeletionTombstones:
 
     @pytest.mark.asyncio
     async def test_each_match_is_the_exact_id_decode_plus_its_memory_id(
-        self, tmp_path, mock_config,
+        self, tmp_path, mock_config, monkeypatch,
     ):
         from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
         from fused_memory.services.memory_service import MemoryService
@@ -817,40 +819,43 @@ class TestFindMem0DeletionTombstones:
             )
             assert written == 3
 
-            found = await service.find_mem0_deletion_tombstones(self._PROJECT, 'bff81530')
             expected = []
             for memory_id in (self._FIRST, self._SECOND):
                 decoded = await service.get_mem0_deletion_tombstone(self._PROJECT, memory_id)
                 assert decoded is not None
                 expected.append({'memory_id': memory_id, **decoded})
+            exact_reads = AsyncMock(side_effect=AssertionError('one listing query, not a read per match'))
+            monkeypatch.setattr(store, 'get_mem0_tombstone', exact_reads)
+            found = await service.find_mem0_deletion_tombstones(self._PROJECT, 'bff81530')
         finally:
             await store.close()
 
         assert found == expected
         assert found[0]['deleter'] == 'stage1_cycle_summary_trim'
+        exact_reads.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_no_ledger_wired_returns_empty(self, mock_config):
+    async def test_no_ledger_wired_is_unchecked(self, mock_config):
         from fused_memory.services.memory_service import MemoryService
 
         service = MemoryService(mock_config)
 
-        assert await service.find_mem0_deletion_tombstones(self._PROJECT, 'bff81530') == []
+        assert await service.find_mem0_deletion_tombstones(self._PROJECT, 'bff81530') is None
 
     @pytest.mark.asyncio
-    async def test_a_raising_listing_returns_empty_and_warns_once(self, mock_config, caplog):
-        """Fail-safe like the exact-id read: a tombstone's absence proves nothing."""
+    async def test_a_raising_listing_is_unchecked_and_warns_once(self, mock_config, caplog):
+        """INV-11: an unreadable tombstone store is never reported as holding none."""
         from fused_memory.services.memory_service import MemoryService
 
         service = MemoryService(mock_config)
         ledger = AsyncMock()
-        ledger.mem0_tombstone_ids_with_prefix = AsyncMock(side_effect=RuntimeError('sqlite locked'))
+        ledger.mem0_tombstones_with_prefix = AsyncMock(side_effect=RuntimeError('sqlite locked'))
         service.set_recon_ledger(ledger)
 
         with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
             found = await service.find_mem0_deletion_tombstones(self._PROJECT, 'bff81530')
 
-        assert found == []
+        assert found is None
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1, f'expected exactly one WARNING, got {warnings!r}'
         assert warnings[0].exc_info is not None
