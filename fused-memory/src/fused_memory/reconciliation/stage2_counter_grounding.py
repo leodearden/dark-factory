@@ -285,15 +285,26 @@ EvidenceBuilder: TypeAlias = Callable[
 ]
 
 
+def _creation_records_evidence(
+    stats: Mapping[str, Any],
+    project_id: str | None,
+    status: str,
+    journaled: frozenset[TaskKey],
+) -> CounterEvidence:
+    records = action_record_keys(stats.get('task_created_records'), project_id, frozenset({status}))
+    return CounterEvidence(journaled=journaled, claims=dict.fromkeys(records, confirm_task_present))
+
+
 def _created_evidence(
     stats: Mapping[str, Any], project_id: str | None, journal: CreationOutcomes,
 ) -> CounterEvidence:
-    records = action_record_keys(
-        stats.get('task_created_records'), project_id, frozenset({'created'}),
-    )
-    return CounterEvidence(
-        journaled=journal.created, claims=dict.fromkeys(records, confirm_task_present),
-    )
+    return _creation_records_evidence(stats, project_id, 'created', journal.created)
+
+
+def _combined_evidence(
+    stats: Mapping[str, Any], project_id: str | None, journal: CreationOutcomes,
+) -> CounterEvidence:
+    return _creation_records_evidence(stats, project_id, 'combined', journal.combined)
 
 
 @dataclass(frozen=True)
@@ -305,6 +316,7 @@ class _GroundedCounter:
 
 _GROUNDED_COUNTERS: tuple[_GroundedCounter, ...] = (
     _GroundedCounter('tasks_created', 'task_created_records', _created_evidence),
+    _GroundedCounter('tasks_combined', 'task_combined_records', _combined_evidence),
 )
 
 _NO_JOURNAL = CreationOutcomes(created=frozenset(), combined=frozenset())
