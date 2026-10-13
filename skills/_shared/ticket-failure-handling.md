@@ -212,6 +212,8 @@ submit_task(
   `f"review-cycle-{review_id}"`).  For `suggestion_hash`, sha256 the finding's
   stable key (file path + line number + title concatenated), truncated to 16 hex
   chars.
+- **Invariants-gauge findings** (`skills/_shared/reading-the-invariants-gauge.md`) —
+  prefix `escalation_id` with `"invariants-"`; the payload is defined there.
 
 Adding idempotency metadata changes retry behaviour from "the curator may or may
 not de-duplicate" to "the R4 gate guarantees exactly-once task creation".

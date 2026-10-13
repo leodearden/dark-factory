@@ -258,7 +258,10 @@ show freshness, because the heartbeat is the file's mtime.
 6. Handle each
 7. Run `reap-decisions` to close any parked DecisionRecord whose escalation has since resolved
    (see "Filing Parked Decisions to the Cockpit Registry" below) — once per cycle
-8. Go to 2
+8. GET `/api/v2/dashboard/invariants` and digest every root's record (see "Reading the
+   invariants gauge" below) — once per cycle. A blind root or a nonzero unledgered terminal
+   tier is a finding: triage it with The Action Set's judgement before re-arming (9)
+9. Go to 2
 ```
 
 **Distinguishing the exits at step 3.** The wrapper emits a machine-readable
@@ -469,7 +472,7 @@ count) — so hand-listing one `--exclude-id` per record does not scale; use
 `--exclude-file` for it, not `--baseline`. The sibling
 `skills/escalation-watcher/SKILL.md` documents `--baseline` as an available
 flag too, but that is not a counterexample: its Main Loop restarts the
-watcher *first* and drains only after confirming it's up, and its step 7 is
+watcher *first* and drains only after confirming it's up, and its last step is
 `Go to 1`, so **every** restart there is immediately followed by a fresh,
 authoritative drain — that skill says as much at its lines 93-94, that the
 fired escalation "is just the wake ... the drain re-finds it (still
@@ -486,6 +489,27 @@ default path `<queue-dir>/.watcher-rearm-exclude-l2` there,
 **Process safety:** only stop watcher processes you started via background task
 controls. Never `pkill` by pattern. A `recon-watch/loop.sh` tree is not one you
 started, so this rule covers it too.
+
+### Reading the invariants gauge
+
+The command, what counts as a finding, change-only triage, the census follow-up,
+the D-4 pointer and the filing keys live in
+[`skills/_shared/reading-the-invariants-gauge.md`](../_shared/reading-the-invariants-gauge.md).
+Read them there. This skill's deltas:
+
+- **Scope.** Omit the root argument, so every root in the roster is read:
+  fused-memory, like this queue, is fleet-wide. An escalation-watcher reads only
+  its own project.
+- **Handling.** At step 8, before re-arming: this loop already drains and handles
+  with the watcher down (steps 5 and 6). Apply The Action Set's judgement, but
+  there is NO escalation record, so never call `resolve_issue`. Note a
+  verify-fixed or accept-as-known finding in the accepted-as-known list kept in
+  top-level context ("Context Conservation"). file-a-real-task uses the shared
+  file's Case B keys in place of an escalation id. Tell the human about a finding
+  that needs one, and file no cockpit DecisionRecord: `reap-decisions` closes a
+  decision only once its escalation is terminal, so one with no escalation behind
+  it would stay open forever ("Closing parked decisions on resolve").
+- **A failed read** is reported to the human (Priority Hierarchy 1).
 
 ## The Action Set
 

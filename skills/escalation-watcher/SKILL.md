@@ -331,7 +331,10 @@ always-ask list ("Bypasses" in "Always ask — keyed on record content").
    step 2 of the next pass is the authoritative source of what to handle
 6. Run `reap-decisions` to close any parked DecisionRecord whose escalation has since resolved
    (see "Filing Parked Decisions to the Cockpit Registry" below) — once per cycle
-7. Go to 1 (restart watcher → confirm up → drain → handle)
+7. GET `/api/v2/dashboard/invariants` and digest this project's record (see "Reading the
+   invariants gauge" below) — once per cycle. A blind root or a nonzero unledgered terminal
+   tier is a finding: handle it in step 3 of the next pass, beside the drained escalations
+8. Go to 1 (restart watcher → confirm up → drain → handle)
 ```
 
 The fired escalation (step 5) is just the wake; you do not handle it inline. Looping back
@@ -475,7 +478,7 @@ watcher.
 **Process safety**: only stop watcher processes you started via background task controls. Never `pkill` by pattern — other orchestrators, the user, or other sessions may have their own watchers.
 
 **Lease heartbeat (each cycle):** each time you (re)start this watcher subprocess (Main Loop steps 1
-and 7), also touch the `watcher-<project>` lease claimed at session startup (see "Claiming the
+and 8), also touch the `watcher-<project>` lease claimed at session startup (see "Claiming the
 Watcher Lease" above):
 
 ```bash
@@ -504,6 +507,21 @@ the whole blob in context. Loop back, re-arm the watcher, and let the next compa
 authoritative list of what to handle. Fetch the full record via
 `mcp__escalation__get_escalation(escalation_id="esc-XX-N")` only for the specific item you're about
 to act on — ideally inside the handling sub-agent rather than at top level.
+
+### Reading the invariants gauge
+
+The command, what counts as a finding, change-only triage, the census follow-up, the D-4 pointer
+and the filing keys live in
+[`skills/_shared/reading-the-invariants-gauge.md`](../_shared/reading-the-invariants-gauge.md).
+Read them there. This skill's deltas:
+
+- **Scope.** Pass this watcher's `<project_root>` to the digest, so only this project's record is
+  read. The recon-escalation-watcher covers the whole roster.
+- **Handling.** Never inline at step 7: the watcher is down from its fire (step 5) until step 1
+  re-arms it, and handling is the step most likely to run long. A finding joins step 3 of the next
+  pass and goes through "Before an item reaches Leo" like any drained item.
+- **Stopping.** A finding still undisposed at stop goes into the handover's "Untriaged — start
+  here" section.
 
 ## Priority Hierarchy
 
