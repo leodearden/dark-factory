@@ -830,6 +830,7 @@ class TestFindMem0DeletionTombstones:
         finally:
             await store.close()
 
+        assert found is not None
         assert found == expected
         assert found[0]['deleter'] == 'stage1_cycle_summary_trim'
         exact_reads.assert_not_awaited()
