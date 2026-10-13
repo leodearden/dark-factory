@@ -2685,8 +2685,9 @@ unit's PATH. Every digest fails with it, so the night is a storm that exits
 
 ### Legibility trickle health probe (04:30)
 
-**What it does.** Runs both trickle probes once a night and files one
-escalation if the pipeline has stopped producing.
+**What it does.** Runs the three trickle probes once a night and files one
+escalation if the pipeline has stopped producing, or if a census the trigger
+fired never advanced census-state.
 
 **Why it exists** — this section is the single home for that argument; the
 code, unit and test sites cite it rather than restating it. Before task 4514
@@ -2708,16 +2709,17 @@ Once the timer below is installed for a project, the "nothing runs the
 probes" claim becomes historical **for that project only** — a second project
 without the timer is back to the pre-4514 state.
 
-**Three artefacts, three different questions.** Do not merge them again:
+**Four artefacts, four different questions.** Do not merge them again:
 
 | Artefact | Answers |
 |---|---|
 | `scripts/legibility/check_trickle_liveness.sh` | Did the UNIT run? (reads `legibility-trickle@<project>.service`'s `Result`) |
 | `scripts/legibility/check_trickle_progress.py` | Did SIGNAL flow? (reads the recorded run state) |
-| `scripts/legibility/check_trickle_health.py` | Runs both on a timer and escalates |
+| `scripts/legibility/check_census_progress.py` | Did a FIRED census advance census-state? (reads the recorded census-fire streak plus the project's `docs/legibility/census-state.json`) |
+| `scripts/legibility/check_trickle_health.py` | Runs the three on a timer and escalates |
 
-`check_trickle_health.py` **executes** the other two as subprocesses rather
-than re-deriving either verdict, so there is no lockstep duplication to keep
+`check_trickle_health.py` **executes** the other three as subprocesses rather
+than re-deriving any verdict, so there is no lockstep duplication to keep
 in sync and `check_trickle_liveness.sh` stays byte-identical as its own
 header comment requires.
 
@@ -2731,6 +2733,7 @@ The full argument lives where the change it forbids would be made, in
 
 ```bash
 uv run --project shared python scripts/legibility/check_trickle_health.py --project-id <project>
+python3 scripts/legibility/check_census_progress.py <project> [N]
 ```
 
 **Deploy it** — once per project, from the MAIN checkout after this change
@@ -2777,6 +2780,16 @@ is how an operator ends up tuning the sampler for a crashed coder:
 - **`missing` / `malformed` / stale** — the recorder itself stopped. The
   nightly is not writing state at all, so neither streak means anything yet.
 - **`quiet`** — a legitimately quiet night. Never alarms, by construction.
+- **census fired without advancing** — the census trigger FIREd on at least N
+  (default 3) consecutive recorded trickle nights while `last_census_at`
+  stayed put, and every such night launches a paid census. A census deferred
+  for usage headroom **counts**, so check the census's own `legibility census
+  deferred` info escalations first. Otherwise read `journalctl --user -u
+  legibility-trickle@<project> --since <since>` for the census child's lines;
+  the verdict names `<since>` and the outcome lines to look for. Nights where
+  the trigger was not evaluated (a failed or capped trickle) neither break nor
+  extend the streak. A census that advances clears the verdict at once,
+  because the probe re-reads census-state live.
 
 **Retried nights** (task 5678). A night that did not finish (a non-zero exit,
 or a usage-cap DEFERRED night) leaves its date in the `retry_backlog` key of
@@ -2815,8 +2828,10 @@ second case, only while that record is still fresh** (within the same
 `max_age_hours` window the progress probe uses). So it never doubles an alarm
 the nightly already raised, and no failure mode can silence it permanently: a
 recorder that stops on a night landing exactly on the barren threshold goes
-stale, and the probe takes over. A non-zero exit is the authoritative signal
-whether or not the POST landed.
+stale, and the probe takes over. Those two silence cases apply to the
+progress and liveness probes only: a census-probe failure **always** posts,
+because nothing else escalates an unadvanced-fire streak. A non-zero exit is
+the authoritative signal whether or not the POST landed.
 
 **Where the state file lives.**
 
