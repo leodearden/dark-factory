@@ -38,6 +38,7 @@ _SWEPT_SCRIPTS = tuple(
         "orchestrator/scripts/warm-lane/thin-warm-lane.sh",
         "orchestrator/scripts/warm-lane/warm-lane-disk-guard.sh",
         "orchestrator/scripts/warm-lane/warm-lane-gc-sweep.sh",
+        "orchestrator/scripts/warm-lane/warm-lane-gc.sh",
     )
 )
 
