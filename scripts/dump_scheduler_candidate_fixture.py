@@ -21,6 +21,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
+import _checkout as _checkout
 from _task_db_scan import TaskDbUnreadable, connect_ro, decode_metadata, tasks_db_path
 from orchestrator.config import coerce_tier
 from orchestrator.scheduler import Scheduler
