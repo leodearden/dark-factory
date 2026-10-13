@@ -2206,8 +2206,11 @@ class TestReferentRepairStreakSemantics:
         assert stats.repaired == 0
         assert service._referent_repair_streaks['dark_factory'] == 0
 
-    async def test_a_failed_only_pass_does_not_increment(self, service):
-        """A broken backend must never masquerade as a repair storm."""
+    async def test_a_failed_only_pass_leaves_the_streak_unchanged(self, service):
+        """A backend fault is no evidence either way. It must not masquerade
+        as a storm, and it must not pass as the positive health signal the
+        reset arm needs: "we looked and none needed moving" is false for an
+        episode whose repair the backend refused."""
         service._referent_repair_streaks['dark_factory'] = 3
         service.graphiti.ensure_entity_node = AsyncMock(
             side_effect=RuntimeError('falkor down'),
@@ -2218,7 +2221,50 @@ class TestReferentRepairStreakSemantics:
         )
 
         assert stats.failed == 1
-        assert service._referent_repair_streaks['dark_factory'] == 0
+        assert service._referent_repair_streaks['dark_factory'] == 3
+
+    async def test_a_degraded_deferral_only_pass_leaves_the_streak_unchanged(
+        self, service,
+    ):
+        service._referent_repair_streaks['dark_factory'] = 3
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding(new_endpoint_uuid=None, uuid_lookup_degraded=True)),
+            group_id='dark_factory',
+        )
+
+        assert stats.failed == 1
+        assert service._referent_repair_streaks['dark_factory'] == 3
+
+    async def test_a_failed_only_pass_does_not_create_the_streak_key(self, service):
+        """No conclusion has been drawn about that group, exactly as on the
+        checked-nothing arm."""
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='reify',
+        )
+
+        assert 'reify' not in service._referent_repair_streaks
+
+    async def test_a_pass_that_repaired_and_failed_still_increments(self, service):
+        """A real repair outranks a co-occurring failure."""
+        service._referent_repair_streaks['dark_factory'] = 3
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=[RuntimeError('falkor down'), 'n-3127'],
+        )
+        service.graphiti.reassign_edge = AsyncMock(return_value=_reassigned(uuid='e2'))
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding(edge_uuid='e1'), _finding(edge_uuid='e2')),
+            group_id='dark_factory',
+        )
+
+        assert stats.repaired == 1
+        assert stats.failed == 1
+        assert service._referent_repair_streaks['dark_factory'] == 4
 
     async def test_a_moved_false_no_op_pass_does_not_increment(self, service):
         """`reassign_edge`'s corroborate-before-acting no-op: the edge was
@@ -2581,6 +2627,36 @@ class TestTheStormGate:
             'the streak restarted at 1, so the next alarm needs a full fresh '
             'run to the threshold'
         )
+
+    async def test_a_backend_blip_mid_storm_neither_pages_nor_disarms_the_alarm(
+        self, service, to_thread_spy, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 3,
+        )
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        for _ in range(2):
+            await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+        assert service._referent_repair_streaks['dark_factory'] == 2
+        assert _escalations(to_thread_spy) == []
+
+        await service._repair_episode_referents(
+            _stats(_finding(new_endpoint_uuid=None, uuid_lookup_degraded=True)),
+            group_id='dark_factory',
+        )
+        assert service._referent_repair_streaks['dark_factory'] == 2
+        assert _escalations(to_thread_spy) == []
+
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+        assert service._referent_repair_streaks['dark_factory'] == 3
+        fired = _escalations(to_thread_spy)
+        assert len(fired) == 1
+        assert fired[0][1]['streak'] == 3
 
     async def test_a_checked_nothing_pass_never_re_pages_an_already_breached_streak(
         self, service, to_thread_spy, monkeypatch,
