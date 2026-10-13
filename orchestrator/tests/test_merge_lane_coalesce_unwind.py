@@ -4,7 +4,8 @@ Forming a coalesce train rebases each successor onto its predecessor. When
 the train does not land, every member goes back on the tip it had before
 stacking. That happens BEFORE the re-drive flips the member to pending, so a
 re-dispatched agent never meets the stacked tree. A branch a live agent may
-own is never reset.
+own is never reset, including one the scheduler claims while another member
+is being handed back.
 
 Driven through the lane's public surface over a real git repo. Every request
 is enqueued before the lane starts, so the pass runs on the merger's first
@@ -42,7 +43,7 @@ _GIT = GitConfig(
     push_after_advance=False,
 )
 _SEED = RepoSeed(files=(('README.md', '# Test\n'),), message='Initial commit')
-_ANCHOR, _TIP = 'uw-anchor', 'uw-tip'
+_ANCHOR, _MID, _TIP = 'uw-anchor', 'uw-mid', 'uw-tip'
 _MEMBERS = (_ANCHOR, _TIP)
 
 
@@ -121,12 +122,12 @@ class _UnwindHooks:
 
     def factory(self, train_id: str) -> TrainCallbacks:
         return TrainCallbacks(
-            status_check=self._status_check,
+            status_check=self.status_check,
             mark_member_done=AsyncMock(),
             redrive_member=self._redrive,
         )
 
-    async def _status_check(self, ids: list[str]) -> dict[str, str]:
+    async def status_check(self, ids: list[str]) -> dict[str, str]:
         return {i: self._statuses[i] for i in ids}
 
     async def _redrive(self, member: str, on_main: bool, sha: str | None) -> None:
@@ -137,6 +138,28 @@ class _UnwindHooks:
 
     async def wait(self) -> None:
         await wait_responsive(self._all_redriven.wait(), label='members re-driven')
+
+
+class _ClaimDuringUnwindHooks(_UnwindHooks):
+    """Reports *claimed* in-progress from the moment *restored* is back on its
+    pre-stack tip: the scheduler claims a pending member while the unwind is
+    still handing back another."""
+
+    def __init__(
+        self, git_ops: GitOps, statuses: dict[str, str], *, redrives: int,
+        claimed: str, restored: str, pre_stack_tip: str,
+    ) -> None:
+        super().__init__(git_ops, statuses, redrives=redrives)
+        self._claimed = claimed
+        self._restored_branch = f'{_GIT.branch_prefix}{restored}'
+        self._pre_stack_tip = pre_stack_tip
+
+    async def status_check(self, ids: list[str]) -> dict[str, str]:
+        statuses = await super().status_check(ids)
+        restored = await self._git_ops.resolve_branch_sha(self._restored_branch)
+        if restored == self._pre_stack_tip and self._claimed in statuses:
+            statuses[self._claimed] = 'in-progress'
+        return statuses
 
 
 async def _coalesce_and_unwind(
@@ -154,7 +177,7 @@ async def _coalesce_and_unwind(
         await hooks.wait()
     assert [e['data']['member_task_ids'] for e in scene.events.fetch_events_by_type(
         EventType.train_coalesced,
-    )] == [list(_MEMBERS)]
+    )] == [[r.task_id for r in requests]]
 
 
 async def test_a_derailed_train_hands_every_member_back_before_its_redrive(
@@ -201,4 +224,25 @@ async def test_a_tip_a_live_agent_may_own_is_left_stacked(scene: _Scene) -> None
     await _coalesce_and_unwind(scene, requests, hooks)
 
     assert [r.member for r in hooks.redriven] == [_ANCHOR]
+    assert await scene.git_ops.is_ancestor(f'task/{_ANCHOR}', f'task/{_TIP}')
+
+
+async def test_a_member_claimed_while_another_is_handed_back_is_left_stacked(
+    scene: _Scene,
+) -> None:
+    members = (_ANCHOR, _MID, _TIP)
+    requests = [await _workflow_request(scene, name) for name in members]
+    scene.commit_on_main('drift.txt', 'main moved\n')
+    before = {name: scene.tip_of(name) for name in members}
+    hooks = _ClaimDuringUnwindHooks(
+        scene.git_ops,
+        {_ANCHOR: 'merge-deferred', _MID: 'merge-deferred', _TIP: 'pending'},
+        redrives=2, claimed=_TIP, restored=_MID, pre_stack_tip=before[_MID],
+    )
+
+    await _coalesce_and_unwind(scene, requests, hooks)
+
+    assert [r.member for r in hooks.redriven] == [_ANCHOR, _MID]
+    assert scene.tip_of(_MID) == before[_MID]
+    assert scene.tip_of(_TIP) != before[_TIP]
     assert await scene.git_ops.is_ancestor(f'task/{_ANCHOR}', f'task/{_TIP}')

@@ -45,7 +45,7 @@ from shared.mcp_post import open_mcp_client, post_mcp_tool_call
 from shared.task_metadata import RetryLedger
 
 from orchestrator import chronic_flake
-from orchestrator.branch_stack import PreStackTip, TipRestore, TipRestoreOutcome, UnstackOutcome
+from orchestrator.branch_stack import UnstackOutcome
 from orchestrator.critical_gate import critical_filing_gate
 from orchestrator.delivered_checks import gate_mark_done_on_delivered_checks
 from orchestrator.dry_run_unblock import run_dry_run_unblock
@@ -63,6 +63,7 @@ from orchestrator.git_ops import (
 )
 from orchestrator.guard_state import PersistentSet, guard_path
 from orchestrator.log_coalesce import ExponentialLogCoalescer
+from orchestrator.merge_lane.coalesce_unwind import restore_pre_stack_tips
 from orchestrator.merge_lane.disposition import (
     MergeFailureDisposition,
     SkewEvidence,
@@ -5489,23 +5490,6 @@ _COALESCE_RISKY_TERMINAL_STATES: frozenset[str] = frozenset({'blocked', 'error'}
 # Exclusion reason for a waiting single no TaskWorkflow awaits (task 4953):
 # nothing would park it merge-deferred, so a train holding it could never land.
 COALESCE_EXCLUDED_NO_AWAITING_WORKFLOW = 'no_awaiting_workflow'
-
-# Task statuses under which no live agent can own a coalesce member's branch,
-# so a train that did not land may put it back on its pre-stack tip (task 4953).
-_PRE_STACK_RESTORABLE_STATUSES: frozenset[str] = frozenset({'merge-deferred', 'pending', 'blocked'})
-
-# Restore refusals that leave a member stacked and need a human's hand.
-_TIP_RESTORE_REFUSALS: frozenset[TipRestoreOutcome] = frozenset({
-    TipRestoreOutcome.DIRTY, TipRestoreOutcome.MOVED, TipRestoreOutcome.RESET_FAILED,
-})
-
-
-def _tip_restore_remedy(restore: TipRestore) -> str:
-    """The command that finishes a refused restore by hand, once a human has
-    confirmed nothing on the branch or in its worktree is worth keeping."""
-    if restore.worktree is None:
-        return f'git update-ref refs/heads/{restore.branch} {restore.pre_stack_sha}'
-    return f'git -C {restore.worktree} reset --hard {restore.pre_stack_sha}'
 
 # How long a one-strike derail marker is remembered (task 5352).  An upper
 # bound on the subject, not a tuning dial: seven days is a generous outer
@@ -15248,83 +15232,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """Hand back every member of a coalesce train that did not land (task 4953).
 
         Each stacked member first goes back on its pre-stack tip
-        (:meth:`_restore_pre_stack_tips`); then the 1867 re-drive sends each
-        still-deferred member to a solo merge.  In that order because the
-        re-drive flips members to pending and the scheduler may re-dispatch
-        them at once.  The one policy for every exit of a coalesce train that
-        does not land: derail, incomplete train and admission-halt
-        dissolution.  Never raises.
+        (``orchestrator/src/orchestrator/merge_lane/coalesce_unwind.py::restore_pre_stack_tips``);
+        then the 1867 re-drive sends each still-deferred member to a solo
+        merge.  In that order because the re-drive flips members to pending
+        and the scheduler may re-dispatch them at once.  The one policy for
+        every exit of a coalesce train that does not land: derail, incomplete
+        train and admission-halt dissolution.  Never raises.
         """
-        await self._restore_pre_stack_tips(train)
+        await restore_pre_stack_tips(self._git_ops, train)
         try:
             await self._redrive_coalesce_members(train, main_sha)
         except Exception:
             logger.exception(
                 'Coalesce train %s: _redrive_coalesce_members raised unexpectedly '
                 '— members may remain stranded', train.train_id,
-            )
-
-    async def _restore_pre_stack_tips(self, train: GroupMergeRequest) -> None:
-        """Put each stacked member of *train* back on its pre-stack tip.  Never raises.
-
-        Leaves every ref alone when the train's tip is already on main: the
-        train landed, and restoring would hide that from the re-drive's
-        double-landing guard.  A member is restored only while its status says
-        no live agent can own its branch (``_PRE_STACK_RESTORABLE_STATUSES``).
-        """
-        tips = train.member_pre_stack_tips
-        if not tips:
-            return
-        try:
-            if await self._git_ops.is_ancestor(
-                train.branch.full_name, self._git_ops.config.main_branch,
-            ):
-                logger.info(
-                    'Coalesce train %s: tip %s is already on main — leaving '
-                    'every member branch as it is',
-                    train.train_id, train.branch.full_name,
-                )
-                return
-            statuses = await train.status_check([tip.member_id for tip in tips])
-        except Exception:
-            logger.exception(
-                'Coalesce train %s: could not decide whether to restore pre-stack '
-                'tips — leaving members stacked', train.train_id,
-            )
-            return
-        for tip in tips:
-            await self._restore_member_tip(train.train_id, tip, statuses.get(tip.member_id))
-
-    async def _restore_member_tip(
-        self, train_id: str, tip: PreStackTip, status: str | None,
-    ) -> None:
-        if status not in _PRE_STACK_RESTORABLE_STATUSES:
-            logger.warning(
-                'Coalesce train %s: member %s is %r, so a live agent may own its '
-                'branch — leaving it stacked (pre-stack tip %s)',
-                train_id, tip.member_id, status, tip.sha,
-            )
-            return
-        try:
-            restore = await self._git_ops.restore_pre_stack_tip(tip)
-        except Exception:
-            logger.exception(
-                'Coalesce train %s: restoring member %s to pre-stack tip %s raised '
-                '— continuing with remaining members', train_id, tip.member_id, tip.sha,
-            )
-            return
-        if restore.outcome in _TIP_RESTORE_REFUSALS:
-            logger.warning(
-                'Coalesce train %s: member %s left stacked (%s: %s); found %s, '
-                'pre-stack %s. Remedy: %s',
-                train_id, tip.member_id, restore.outcome, restore.detail,
-                restore.found_sha, restore.pre_stack_sha, _tip_restore_remedy(restore),
-            )
-        else:
-            logger.info(
-                'Coalesce train %s: member %s pre-stack restore %s (%s -> %s)',
-                train_id, tip.member_id, restore.outcome,
-                restore.found_sha, restore.pre_stack_sha,
             )
 
     async def _redrive_coalesce_members(
