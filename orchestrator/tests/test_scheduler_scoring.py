@@ -116,7 +116,7 @@ class TestSubBudgetFormula:
         assert _bonus(scheduler, age_secs=cfg.age_half_secs) == cfg.age_budget / 2
 
     @pytest.mark.parametrize(('d', 'expected'), [
-        (0, 0.0), (1, 59.4723), (4, 138.0896), (32, 300.0), (188, 300.0),
+        (0, 0.0), (1, 59.47196), (4, 138.08961), (32, 300.0), (188, 300.0),
     ])
     def test_cpm_term(self, scheduler, d, expected):
         assert _bonus(scheduler, transitive_count=d) == pytest.approx(expected, abs=1e-4)

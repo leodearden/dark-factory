@@ -5840,18 +5840,19 @@ class Scheduler:
                 self._pending_anchor[tid] = max_id
         self._was_non_pending |= newly_non_pending
 
-    def _compute_score(
+    def _compute_score_legacy(
         self,
         tier: str,
         age: int,
         transitive_count: int,
     ) -> float:
-        """Compute the total dispatch score for a task.
+        """The pre-C2 dispatch score, still live as the I-6 fallback.
 
-        ``score = TIER_BASE[tier] + min(α*age + β*log1p(trans), TIER_WIDTH - 1)``
-
-        The combined age+CPM bonus is capped below ``TIER_WIDTH`` so bonuses
-        can never bump a task across a tier boundary — priority always wins.
+        ``score = TIER_BASE[tier] + min(α*age + β*log1p(trans), TIER_WIDTH - 1)``,
+        where *age* is a newer-task count (:meth:`_compute_age`), not seconds.
+        A tick whose anchor coverage is below
+        ``scoring.new_scoring_min_anchor_coverage`` scores every candidate
+        with this formula.
         """
         tier = coerce_tier(tier)
         base = TIER_BASE[tier]
@@ -5859,6 +5860,37 @@ class Scheduler:
         cpm_bonus = self.config.cpm_beta * math.log1p(max(0, transitive_count))
         bonus = min(age_bonus + cpm_bonus, float(TIER_WIDTH - 1))
         return float(base) + bonus
+
+    def _compute_score(
+        self,
+        tier: str,
+        *,
+        age_secs: float,
+        transitive_count: int,
+        has_work_product: bool,
+    ) -> float:
+        """The C2 dispatch score: tier base plus three independently budgeted terms.
+
+        No term is clipped against another, and ScoringConfig's validators keep
+        the budgets' sum inside one tier (plans/scheduler-dispatch-scoring-and-
+        lock-layer-prd.md C2, I-1, I-2).  Keyword-only so a caller can never
+        hand a newer-task count where seconds are meant.
+        """
+        cfg = self.config.scoring
+        cpm = cfg.cpm_budget * math.log1p(min(max(0, transitive_count), cfg.cpm_d_cap)) / math.log1p(cfg.cpm_d_cap)
+        a = max(0.0, age_secs)
+        age = cfg.age_budget * a / (a + cfg.age_half_secs)
+        continuity = cfg.continuity_credit if has_work_product else 0.0
+        return float(TIER_BASE[coerce_tier(tier)]) + cpm + age + continuity
+
+    def _has_work_product(self, task: dict) -> bool:
+        """Whether *task* already carries work worth resuming (PRD C3).
+
+        Task γ owns the real predicate.  Until it lands this is False for every
+        task, the fail-safe: no live score gains ``continuity_credit`` before
+        γ's zero-progress gating exists.
+        """
+        return False
 
     def _emit_override_diff_events(
         self,
@@ -7878,7 +7910,7 @@ class Scheduler:
             pri = ctx.effective_priorities.get(tid, coerce_tier(t.get('priority')))
             age = self._compute_age(tid, ctx.max_id)
             transitive = ctx.transitive_counts.get(tid, 0)
-            score = self._compute_score(pri, age, transitive)
+            score = self._compute_score_legacy(pri, age, transitive)
             scored.append((score, tid, t, pri))
 
         scored.sort(key=lambda entry: (-entry[0], entry[1]))
