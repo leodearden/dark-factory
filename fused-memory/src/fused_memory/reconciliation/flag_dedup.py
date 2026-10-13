@@ -349,7 +349,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from functools import cached_property
+from functools import cached_property, partial
 from typing import Any, Literal, NamedTuple, NotRequired, TypedDict
 
 from shared.task_statuses import TaskStatus
@@ -371,6 +371,17 @@ from fused_memory.reconciliation.recon_ledger import (
 from fused_memory.reconciliation.standing_decision_constants import (
     GROUNDS_TOKEN_FAMILIES,
     STATE_ACTIVE,
+)
+from fused_memory.reconciliation.task_corroboration import (
+    LookupVerdict,
+    TaskLookup,
+    confirm_task_present,
+    corroborate_task_lookups,
+    safe_get_task,
+)
+from fused_memory.reconciliation.task_count_snapshot_cadence import (
+    SNAPSHOT_PRUNED_STAT_KEY,
+    SNAPSHOT_WRITTEN_STAT_KEY,
 )
 from fused_memory.utils.async_utils import gather_collect
 
@@ -3226,7 +3237,7 @@ async def filter_false_absence_flags(
     async def _safe_get_task_for_root(task_id: Any) -> Any:
         """Fetch task with normalised exception handling, for THIS filter's root.
 
-        Delegates to the module-level :func:`safe_get_task`, binding the
+        Delegates to ``task_corroboration.py::safe_get_task``, binding the
         single fixed *project_root* this filter was called with (that binding
         is the only reason it remains a closure — task 4381 amendment
         superseded the former "keep the two in sync" NOTE by extracting the
@@ -3321,43 +3332,6 @@ def confirm_task_absent(get_task_result: object) -> bool:
         return False
     error_type = get_task_result.get('error_type', '')
     return error_type in {'TaskmasterError', 'TaskNotFoundError'} and _NOT_FOUND_PHRASE in error.lower()
-
-
-#: Keys whose presence on a get_task result dict identifies it as an actual
-#: task record (as opposed to e.g. an unrelated empty dict).  Mirrors the
-#: shape of both the MCP-wrapper task envelope and the raw sqlite backend row.
-_TASK_IDENTITY_KEYS: frozenset[str] = frozenset({'id', 'task_id', 'title', 'status'})
-
-
-def confirm_task_present(get_task_result: object) -> bool:
-    """Fail-safe classifier: True ONLY when get_task POSITIVELY confirms presence.
-
-    Positive-present inverse of :func:`confirm_task_absent`: returns True iff
-    the result is a plain task-record dict — no ``'error'`` / ``'error_type'``
-    key — that carries at least one task-identity key (``id``, ``task_id``,
-    ``title``, or ``status``) as evidence the record is an actual task rather
-    than an unrelated empty dict.
-
-    All other inputs — a not-found error dict, a generic/inconclusive error
-    dict, ``None``, an empty dict, or a non-dict value — return False
-    (fail-safe: an uncertain or absent result must never be treated as
-    corroboration that a task exists).
-
-    Args:
-        get_task_result: The raw value returned by taskmaster.get_task() (or
-            mcp__fused-memory__get_task).  Expected to be either a task dict
-            (present) or an error dict (absent / inconclusive).
-
-    Returns:
-        True if and only if the result is a dict without ``'error'`` /
-        ``'error_type'`` keys and with at least one task-identity key
-        present. False in all other cases.
-    """
-    if not isinstance(get_task_result, dict):
-        return False
-    if 'error' in get_task_result or 'error_type' in get_task_result:
-        return False
-    return any(key in get_task_result for key in _TASK_IDENTITY_KEYS)
 
 
 def _titles_corroborate(cited_title: object, live_title: object) -> bool:
@@ -3464,52 +3438,6 @@ _ABANDONED_TASK_STATUSES: frozenset[TaskStatus] = frozenset({TaskStatus.CANCELLE
 _ABANDONED_TASK_STATUS_VALUES: frozenset[str] = frozenset(
     s.value for s in _ABANDONED_TASK_STATUSES
 )
-
-
-async def safe_get_task(taskmaster: Any, task_id: Any, project_root: str) -> Any:
-    """Fetch ONE task with normalised exception handling.
-
-    Returns the raw ``taskmaster.get_task`` result on success, or a normalised
-    ``{'error': ..., 'error_type': ...}`` dict on ANY exception, so that
-    :func:`confirm_task_present` / :func:`_cited_task_corroborated` /
-    :func:`_cited_fix_task_live` classify the raised-exception path exactly as
-    they classify the MCP wrapper's own error-dict path.
-
-    That normalisation is also what lets every caller keep using a PLAIN
-    ``asyncio.gather`` (no ``return_exceptions=True``, which
-    ``tests/test_gather_convention_guard.py`` would otherwise require be routed
-    through ``utils/async_utils``).
-
-    Module-level as of the task 4381 amendment pass: the two cross-project call
-    sites — :func:`_resolve_live_cross_project_fix_task` and
-    :func:`filter_false_phantom_task_creation_flags` — previously carried
-    byte-identical private closures with a "keep the two in sync" NOTE.  Both
-    take a PER-CITATION ``project_root``, so neither was actually closing over
-    anything, and the note had already gone stale at three copies.
-
-    The fail-safe-to-``None`` variant is the SEPARATE module-level
-    :func:`_safe_get_task_or_none` (task 3476 amendment pass), extracted for
-    the same reason once it had reached two byte-identical copies, in
-    :func:`filter_terminal_metadata_flags` and
-    :func:`filter_accounted_cluster_growth_flags`.  Exactly ONE private closure
-    now survives — :func:`filter_false_absence_flags`' ``_safe_get_task_for_root``,
-    which binds one fixed ``project_root`` for a whole filter and delegates
-    here so the normalised shape cannot drift.
-
-    PUBLIC (no leading underscore) as of task 3051: the corroboration pass
-    :func:`~fused_memory.reconciliation.stages.task_knowledge_sync._corroborate_record_keys`
-    is a call site OUTSIDE this module, and one more private copy of the
-    normalised-exception shape is exactly what this helper exists to prevent.
-    Callers may rely on the contract pinned by
-    ``tests/test_flag_dedup.py::TestSafeGetTask``: the raw result through
-    untouched on success (task dict AND error dict alike), ANY exception
-    normalised to ``{'error': str(exc), 'error_type': type(exc).__name__}``,
-    and ``(task_id, project_root)`` forwarded positionally in that order.
-    """
-    try:
-        return await taskmaster.get_task(task_id, project_root)
-    except Exception as exc:
-        return {'error': str(exc), 'error_type': type(exc).__name__}
 
 
 async def _safe_get_task_or_none(
@@ -3897,13 +3825,8 @@ async def filter_false_phantom_task_creation_flags(
     if not taskmaster or not known_projects:
         return list(flags)
 
-    # Collect resolvable cited-task lookups, grouped by owning flag index.
-    # Multiple cited_tasks entries (possibly across different flags) run
-    # concurrently in a single flat asyncio.gather batch.
     lookup_flag_indices: list[int] = []  # flat lookup index -> owning flag index
-    lookup_cited: list[dict[str, Any]] = []  # flat lookup index -> owning cited_tasks entry
-    lookup_coros = []
-
+    lookups: list[TaskLookup] = []
     for i, flag in enumerate(flags):
         if flag.get('flag_type') not in PHANTOM_TASK_CREATION_FLAG_TYPES:
             continue
@@ -3917,29 +3840,24 @@ async def filter_false_phantom_task_creation_flags(
             cited_project_id = cited.get('project_id')
             if cited_task_id is None or cited_project_id is None:
                 continue
-            root = known_projects.get(cited_project_id)
-            if not root:
-                continue  # unresolvable project -> not corroborated -> skip lookup
             lookup_flag_indices.append(i)
-            lookup_cited.append(cited)
-            lookup_coros.append(safe_get_task(taskmaster, cited_task_id, root))
+            lookups.append(TaskLookup(
+                project_id=cited_project_id,
+                task_id=str(cited_task_id),
+                accept=partial(_cited_task_corroborated, cited),
+            ))
 
-    if not lookup_coros:
+    if not lookups:
         return list(flags)
 
-    lookup_results: list[Any] = await asyncio.gather(*lookup_coros)
+    verdicts = await corroborate_task_lookups(taskmaster, known_projects, lookups)
 
-    # Map each corroborated flag index to the specific (project_id, task_id)
-    # cited-task that corroborated it, for structured drop logging below.
-    # First corroborating cite wins if a finding cites more than one task.
+    # First corroborating cite wins if a finding cites more than one task; it
+    # is the pair the drop log names.
     corroborating_cite: dict[int, tuple[Any, Any]] = {}
-    for flag_idx, cited, result in zip(
-        lookup_flag_indices, lookup_cited, lookup_results, strict=True
-    ):
-        if flag_idx in corroborating_cite:
-            continue
-        if _cited_task_corroborated(cited, result):
-            corroborating_cite[flag_idx] = (cited.get('project_id'), cited.get('task_id'))
+    for flag_idx, lookup, verdict in zip(lookup_flag_indices, lookups, verdicts, strict=True):
+        if flag_idx not in corroborating_cite and verdict is LookupVerdict.CONFIRMED:
+            corroborating_cite[flag_idx] = (lookup.project_id, lookup.task_id)
 
     kept: list[dict[str, Any]] = []
     for i, flag in enumerate(flags):
@@ -5299,6 +5217,54 @@ def filter_contamination_ceiling_findings(
                 project_id,
             )
             # do NOT append — flag is dropped
+        else:
+            kept.append(flag)
+
+    return kept
+
+
+#: Stage 2's Mem0-only snapshot stats, taken from their defining module so a
+#: stat rename moves this gate with it instead of silently disabling it.
+_MEM0_SNAPSHOT_STAT_KEYS: tuple[str, ...] = (
+    SNAPSHOT_WRITTEN_STAT_KEY,
+    SNAPSHOT_PRUNED_STAT_KEY,
+)
+
+#: Wordings a Stage-3 finding uses for a Graphiti temporal_facts edge.
+_GRAPHITI_TEMPORAL_EDGE_MARKERS: tuple[str, ...] = (
+    'temporal_fact',
+    'temporal fact',
+    'graphiti edge',
+    'graphiti temporal',
+)
+
+
+def filter_snapshot_stat_edge_findings(
+    flags: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop Stage-3 findings that pair a snapshot stat with a Graphiti edge.
+
+    Per Snapshot Discipline a task-count snapshot is never persisted as a
+    Graphiti ``temporal_facts`` edge, for ANY project, so a finding reading a
+    Mem0-only snapshot stat as evidence of a missing or rejected edge is a
+    false positive (task 3487).  A flag is dropped iff its ``description`` +
+    ``suggested_action`` text names one of :data:`_MEM0_SNAPSHOT_STAT_KEYS`
+    AND one of :data:`_GRAPHITI_TEMPORAL_EDGE_MARKERS` (case-insensitive);
+    everything else passes through (fail-open), with a ``logger.debug`` line
+    per drop.
+    """
+    kept: list[dict[str, Any]] = []
+    for flag in flags:
+        text = f"{flag.get('description') or ''} {flag.get('suggested_action') or ''}"
+        if contains_any_casefolded(text, _MEM0_SNAPSHOT_STAT_KEYS) and contains_any_casefolded(
+            text, _GRAPHITI_TEMPORAL_EDGE_MARKERS,
+        ):
+            logger.debug(
+                'filter_snapshot_stat_edge_findings: dropping %s finding for task_id=%s '
+                '(snapshot stats are Mem0-only; no Graphiti edge is ever written)',
+                flag.get('category'),
+                flag.get('task_id'),
+            )
         else:
             kept.append(flag)
 
