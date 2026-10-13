@@ -11500,11 +11500,11 @@ class TestAcquireNextBookkeepingPurgesAbsentTasks:
         assert 'X' not in scheduler._pending_anchor, (
             f"Expected 'X' purged from _pending_anchor but it's still there: {scheduler._pending_anchor}"
         )
-        # _was_non_pending must record X so that if it is resurrected to pending
+        # X must be owed an age reset so that if it is resurrected to pending
         # it gets a fresh max_id anchor (resurrection semantics) instead of
         # re-using its old stale numeric id.
-        assert 'X' in scheduler._was_non_pending, (
-            f"Expected 'X' recorded in _was_non_pending for resurrection semantics: {scheduler._was_non_pending}"
+        assert 'X' in scheduler._age_reset_owed, (
+            f"Expected 'X' owed an age reset for resurrection semantics: {scheduler._age_reset_owed}"
         )
 
 
@@ -13354,7 +13354,7 @@ class TestStreakRegistryMigration:
         NOTE: the spine entry uses ``_skip_count`` rather than
         ``_pending_anchor`` — ``_update_age_anchors`` (called earlier in the
         same tick, before the stale-id sweep) unconditionally pops
-        ``_pending_anchor`` for any tid observed with a non-'pending' status,
+        ``_pending_anchor`` for any tid observed with a terminal status,
         so a task reported as already-'done' in its very first observed tick
         never survives in ``_pending_anchor`` long enough to reach the
         stale-id sweep.  ``_skip_count`` has no such early-pop and is one of

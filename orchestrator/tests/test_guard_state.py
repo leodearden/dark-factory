@@ -477,10 +477,8 @@ class TestGuardStateBatchedWrites:
     ``_GuardStore.flush`` re-reads, re-merges and re-serialises the WHOLE map,
     so a per-element flush costs a batch of N some N+1 writes and O(N^2)
     parse/serialise work.  Measured in this worktree before the fix: N=373
-    performed 374 writes in 3.17s and N=1500 performed 1501 in 19.22s.  N=373
-    is not hypothetical — it is today's count of active non-pending tasks, so
-    it is what the first ``acquire_next`` tick after every fleet redeploy
-    pays, inline on the event loop.
+    performed 374 writes in 3.17s and N=1500 performed 1501 in 19.22s.
+    Removals and map puts batch the same way (task 6659).
 
     ``|=`` is the form that matters: all three production batch call sites use
     it, not ``update`` —

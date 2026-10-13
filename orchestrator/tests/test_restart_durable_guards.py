@@ -853,18 +853,16 @@ class TestResurrectionAnchorSurvivesRedeploy:
     ):
         """The two halves of one property, measured from the same spy.
 
-        The COLD START is the first ``acquire_next`` tick after every fleet
-        redeploy, inline on the event loop: it observes every active
-        non-pending task at once — 373 in the live store today, 345 of them
-        ``deferred``, a status that accumulates monotonically — so a
-        per-element write would make that tick pay N writes of an N-entry
-        file.  The STEADY STATE re-observes the same ids every ~15s, which is
+        The COLD START is a first tick that observes many departures at once,
+        inline on the event loop.  Its departure marks are batched, so it pays
+        one write rather than N writes of an N-entry file.  The STEADY STATE
+        re-observes the same ids every ~15s, which is
         the difference between a quiet guard and a file rewritten ~5,760 times
         a day.  Spying from BEFORE the first call is what makes the cold start
         assertable at all.
         """
         cold_start = [
-            _task(str(tid), status='deferred') for tid in range(1000, 1200)
+            _task(str(tid), status='cancelled') for tid in range(1000, 1200)
         ]
         scheduler = _scheduler()
 
@@ -904,7 +902,7 @@ class TestStaleSweepRecordingSurvivesRedeploy:
         first.get_statuses = AsyncMock(return_value=({}, None))
 
         await first.acquire_next()
-        assert '300' in first._was_non_pending
+        assert '300' in first._age_reset_owed, 'a swept id must be owed an age reset'
 
         redeployed = _scheduler()
         redeployed._update_age_anchors([_task('300')], _MAX_ID)
