@@ -9293,6 +9293,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         provenance_conflict_sink: Any = None,
         verifier: VerifyPort = PRODUCTION_VERIFIER,
         clock: ClockPort = PRODUCTION_CLOCK,
+        remote_runners: Sequence[VerifyRunner] | None = None,
     ):
         self._git_ops = git_ops
         self._queue = queue
@@ -9721,6 +9722,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # None until first _ensure_host_allocator(config) call — lazily built
         # because config arrives per-MergeRequest, not at __init__ time.
         self._host_allocator: HostAllocator | None = None
+        # Tests supply verify hosts here; production builds them from config.
+        self._remote_runners: tuple[VerifyRunner, ...] | None = (
+            None if remote_runners is None else tuple(remote_runners)
+        )
         # γ in-flight deque: ordered list of InflightEntry objects dispatched to hosts.
         # Finalized strictly in submission order (head-first).  Empty when single-host
         # (finalize drains before the next dispatch) → byte-identical serial behaviour.
@@ -10656,13 +10661,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         The allocator shares ``self._runner_quarantine`` by reference so
         HostAllocator-driven (RunnerUnavailable) and DriftDetector-driven
         quarantines share one source of truth.
+
+        The remotes are the constructor's ``remote_runners`` when it was given
+        them, and are built from *config* otherwise.
         """
         if self._host_allocator is not None:
             return self._host_allocator
         project_root = getattr(self._git_ops, 'project_root', None)
         if project_root is not None:
-            remotes = _build_remote_runners(
-                config, project_root, quarantine=self._runner_quarantine
+            remotes = list(self._remote_runners) if self._remote_runners is not None else (
+                _build_remote_runners(config, project_root, quarantine=self._runner_quarantine)
             )
             self._host_allocator = HostAllocator(
                 remotes, quarantine=self._runner_quarantine
