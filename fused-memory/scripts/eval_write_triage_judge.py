@@ -1706,22 +1706,6 @@ def apply_field_chars(config: Any, requested: int | None) -> int:
     return requested
 
 
-def _elision_flags(
-    content: str, slate: Sequence[Any], field_chars: int,
-) -> tuple[bool, dict[str, bool]]:
-    """Which rendered fields the judge's own ``_elide`` cut at *field_chars*.
-
-    Asked of the shipped function rather than re-derived from a length
-    comparison here, so the flags cannot disagree with the prompt.
-    """
-    from fused_memory.server.write_triage_judge import _elide  # noqa: PLC0415
-
-    return (
-        _elide(content, field_chars) != content,
-        {c.id: _elide(c.content, field_chars) != c.content for c in slate},
-    )
-
-
 def _usage_row(usage: JudgeUsage | None) -> dict[str, int] | None:
     """The verdict's usage under the artifact's ESTABLISHED keys, or ``None``.
 
@@ -1763,6 +1747,7 @@ def _ask_judge(
 
     from fused_memory.server.write_triage import BandDecision  # noqa: PLC0415
     from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+        judge_prompt_elisions,
         judge_write,
         resolve_judge_field_chars,
     )
@@ -1770,8 +1755,8 @@ def _ask_judge(
     if outcome != OUTCOME_JUDGE:
         return JudgeAnswer(outcome=outcome)
 
-    entry_elided, candidates_elided = _elision_flags(
-        content, slate, resolve_judge_field_chars(service),
+    elisions = judge_prompt_elisions(
+        content, slate, field_chars=resolve_judge_field_chars(service),
     )
     verdict = asyncio.run(judge_write(
         memory_service=service,
@@ -1789,8 +1774,8 @@ def _ask_judge(
     return JudgeAnswer(
         outcome=verdict.outcome,
         verdict=verdict.outcome,
-        entry_elided=entry_elided,
-        candidates_elided=candidates_elided,
+        entry_elided=elisions.entry,
+        candidates_elided=elisions.candidates,
         usage=_usage_row(verdict.usage),
         candidate_id=verdict.candidate_id,
     )
