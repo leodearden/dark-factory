@@ -713,17 +713,27 @@ _EDGES_IN_VALID_AT_WINDOW_PAGE_TEMPLATE = (
 _EDGES_IN_VALID_AT_WINDOW_CENSUS = _EDGES_IN_VALID_AT_WINDOW_MATCH + 'RETURN count(*)'
 
 # Ids starting with a uuid prefix, for services/id_resolver.py (task 5323).
-# `$prefix` is bound, never interpolated. No invalid_at filter: a superseded
-# edge's uuid is still an id a prefix can cite. The edge pattern is DIRECTED
-# for the one-row-per-edge reason given at _EMBEDDED_EDGES_MATCH.
-_ENTITY_UUID_PREFIX_MATCH = 'MATCH (n:Entity) WHERE n.uuid STARTS WITH $prefix '
+# `$prefix`/`$upper` are bound, never interpolated. STARTS WITH alone is
+# planned as a full scan; the half-open range [$prefix, $upper) is what lets
+# FalkorDB serve it from the uuid RANGE index (measured on reify: ~110ms ->
+# ~2ms for edges), and STARTS WITH stays as the exact predicate. No
+# invalid_at filter: a superseded edge's uuid is still an id a prefix can
+# cite. The edge pattern is DIRECTED for the one-row-per-edge reason given
+# at _EMBEDDED_EDGES_MATCH.
+_ENTITY_UUID_PREFIX_MATCH = (
+    'MATCH (n:Entity) '
+    'WHERE n.uuid >= $prefix AND n.uuid < $upper AND n.uuid STARTS WITH $prefix '
+)
 _ENTITY_UUID_PREFIX_PAGE_TEMPLATE = (
     _ENTITY_UUID_PREFIX_MATCH
     + 'RETURN n.uuid, n.name ORDER BY n.uuid SKIP {skip} LIMIT {limit}'
 )
 _ENTITY_UUID_PREFIX_CENSUS = _ENTITY_UUID_PREFIX_MATCH + 'RETURN count(*)'
 
-_EDGE_UUID_PREFIX_MATCH = 'MATCH ()-[e:RELATES_TO]->() WHERE e.uuid STARTS WITH $prefix '
+_EDGE_UUID_PREFIX_MATCH = (
+    'MATCH ()-[e:RELATES_TO]->() '
+    'WHERE e.uuid >= $prefix AND e.uuid < $upper AND e.uuid STARTS WITH $prefix '
+)
 _EDGE_UUID_PREFIX_PAGE_TEMPLATE = (
     _EDGE_UUID_PREFIX_MATCH
     + 'RETURN e.uuid, e.fact ORDER BY e.uuid SKIP {skip} LIMIT {limit}'
@@ -2602,9 +2612,12 @@ class GraphitiBackend:
         noun: str,
     ) -> list[tuple[str, str]]:
         """Page (uuid, label) rows matching *prefix*; the one body of the two prefix reads."""
+        if not prefix:
+            raise ValueError(f'{method} needs a non-empty prefix')
+        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
         graph = self._graph_for(group_id)
         paged = await _paged_ro_query(
-            graph, page_template, census_cypher, params={'prefix': prefix},
+            graph, page_template, census_cypher, params={'prefix': prefix, 'upper': upper},
         )
         matches = [
             (row[0], row[1] or '')
