@@ -311,9 +311,8 @@ def _env_slug_ownership(
     hook_input: Mapping[str, Any],
     root: Path | str | None,
     *,
-    env: Mapping[str, str],
     allow_remint: bool = False,
-    probes: _EventProbes | None = None,
+    probes: _EventProbes,
 ) -> tuple[bool, bool, _RecordSnapshot | None]:
     """Is the inherited CLAUDE_SPAWN_SESSION_ID *slug* THIS session's own?
 
@@ -385,14 +384,12 @@ def _env_slug_ownership(
     *probes* is this event's ``_EventProbes`` memo, so the ownership walk it
     performs here is the SAME observation ``_withhold_from_launching`` and
     ``_bind_claude_session_id`` later consult -- see that class's docstring.
-    None builds a single-use memo, leaving a direct call unchanged.
 
     The returned snapshot is the probe's own record read. On the adopt path
     it is the event's ONLY read of the record it goes on to write: the
     handlers take it forward through ``_HookSlugResolution.snapshot``
     instead of reading again (task 4662).
     """
-    probes = probes or _EventProbes(env)
     hook_session_id = _hook_session_id(hook_input)
     if not hook_session_id:
         # No discriminator at all, and nothing to bind either: the 'unknown'
@@ -459,9 +456,8 @@ def _env_slug_is_owned(
     hook_input: Mapping[str, Any],
     root: Path | str | None,
     *,
-    env: Mapping[str, str],
     allow_remint: bool = False,
-    probes: _EventProbes | None = None,
+    probes: _EventProbes,
 ) -> bool:
     """Adopt-or-fork half of ``_env_slug_ownership`` -- see its docstring.
 
@@ -469,9 +465,7 @@ def _env_slug_is_owned(
     identity decision; the binding decision travels separately, through
     ``_resolve_hook_slug``.
     """
-    return _env_slug_ownership(
-        slug, hook_input, root, env=env, allow_remint=allow_remint, probes=probes
-    )[0]
+    return _env_slug_ownership(slug, hook_input, root, allow_remint=allow_remint, probes=probes)[0]
 
 
 @dataclass(frozen=True)
@@ -499,7 +493,7 @@ def _resolve_hook_slug(
     root: Path | str | None,
     *,
     allow_remint: bool = False,
-    probes: _EventProbes | None = None,
+    probes: _EventProbes,
 ) -> _HookSlugResolution:
     """Resolve this hook event's registry identity -- see ``_HookSlugResolution``.
 
@@ -555,7 +549,6 @@ def _resolve_hook_slug(
             candidate,
             hook_input,
             root,
-            env=env,
             allow_remint=allow_remint,
             probes=probes,
         )
@@ -607,6 +600,7 @@ def hook_session_slug(
     *,
     root: Path | str | None = None,
     allow_remint: bool = False,
+    process_tree: ProcessTree | None = None,
 ) -> str:
     """Build the record-identity slug for one hook event.
 
@@ -646,6 +640,8 @@ def hook_session_slug(
 
     *allow_remint* (SessionStart only) lets a ``/clear``-style re-mint keep
     the record instead of forking -- see ``_env_slug_is_owned``.
+    *process_tree* is the tree this event's ownership probes read; None reads
+    the live one (see ``ProcessTree``).
 
     Thin wrapper over ``_resolve_hook_slug``, which additionally reports
     WHETHER an inherited env slug was rejected, whether this event may BIND
@@ -655,7 +651,8 @@ def hook_session_slug(
     so calling it re-reads what the probe already read -- the handlers go
     through ``_resolve_hook_slug`` directly for exactly that reason.
     """
-    return _resolve_hook_slug(hook_input, env, root, allow_remint=allow_remint).slug
+    probes = _EventProbes(env, process_tree)
+    return _resolve_hook_slug(hook_input, env, root, allow_remint=allow_remint, probes=probes).slug
 
 
 def _own_identity_env(
@@ -689,7 +686,7 @@ def _bind_claude_session_id(
     hook_input: Mapping[str, Any],
     *,
     allow_rebind: bool = False,
-    probes: _EventProbes | None = None,
+    probes: _EventProbes,
 ) -> bool:
     """Stamp this hook's Claude Code session_id onto an unbound *record*.
 
@@ -726,7 +723,7 @@ def _bind_claude_session_id(
     # told apart from a nested claude presenting a different id. None when
     # it cannot be resolved -- recorded honestly rather than guessed, and
     # read back as "cannot prove ownership".
-    record.claude_owner_pid = (probes or _EventProbes({})).owning_claude_pid()
+    record.claude_owner_pid = probes.owning_claude_pid()
     return True
 
 
@@ -881,12 +878,11 @@ class ProcessTree:
     comm_of: Callable[[int], str | None] = _process_comm
 
 
-def _owning_claude_pid() -> int | None:
+def _owning_claude_pid(tree: ProcessTree) -> int | None:
     """The pid of the ``claude`` process that fired THIS hook event, or None.
 
-    Resolved by IDENTITY, not by a fixed depth: walk up from
-    ``os.getppid()`` and return the first ancestor whose
-    ``/proc/<pid>/comm`` is ``claude``.
+    Resolved by IDENTITY, not by a fixed depth: walk up *tree* from this
+    hook's parent and return the first ancestor whose comm is ``claude``.
 
     A fixed depth is wrong. Claude Code runs a hook command through a
     SHELL, so the real tree is ``claude -> sh -c -> <hook>.sh -> python``
@@ -918,18 +914,19 @@ def _owning_claude_pid() -> int | None:
     mid-read race, a reparented hook). Callers treat None as "cannot prove
     ownership" and take the fail-safe branch.
 
-    Memoized per hook event by ``_EventProbes``, so the adopt/fork decision,
-    the launch-window withhold decision and ``_bind_claude_session_id``'s
-    ``claude_owner_pid`` stamp all read ONE walk of the tree. Call the memo,
-    not this, from anywhere inside an event that already holds one.
+    Memoized per hook event by ``_EventProbes``, which reads ONE
+    ``ProcessTree``, so the adopt/fork decision, the launch-window withhold
+    decision and ``_bind_claude_session_id``'s ``claude_owner_pid`` stamp
+    all read ONE walk of that tree. Call the memo, not this, from anywhere
+    inside an event that already holds one.
     """
-    pid: int | None = os.getppid()
+    pid: int | None = tree.hook_parent_pid()
     for _ in range(_MAX_CLAUDE_ANCESTOR_HOPS):
         if pid is None or pid <= 1:
             return None
-        if _process_comm(pid) == 'claude':
+        if tree.comm_of(pid) == 'claude':
             return pid
-        pid = _parent_pid_of(pid)
+        pid = tree.parent_pid_of(pid)
     return None
 
 
@@ -968,29 +965,35 @@ class _EventProbes:
     process tree is live state, and the memo's whole safety argument is that
     its lifetime is shorter than any interval over which that state can
     meaningfully change.
+
+    Each memo reads ONE ``ProcessTree``: *process_tree*, or the live tree
+    when it is None.
     """
 
-    def __init__(self, env: Mapping[str, str]) -> None:
+    def __init__(self, env: Mapping[str, str], process_tree: ProcessTree | None) -> None:
         self._env = env
+        self._tree = process_tree or ProcessTree()
         self._pid: Any = _UNRESOLVED
         self._verdict: Any = _UNRESOLVED
 
     def owning_claude_pid(self) -> int | None:
-        """``_owning_claude_pid()``, walked at most once per event."""
+        """``_owning_claude_pid`` over this memo's tree, walked at most once per event."""
         if self._pid is _UNRESOLVED:
-            self._pid = _owning_claude_pid()
+            self._pid = _owning_claude_pid(self._tree)
         return self._pid
 
+    def parent_pid_of(self, pid: int) -> int | None:
+        """*pid*'s parent in this memo's tree."""
+        return self._tree.parent_pid_of(pid)
+
     def owner_ppid_verdict(self) -> bool | None:
-        """``_owner_ppid_verdict(env)``, computed at most once per event."""
+        """``_owner_ppid_verdict`` over this memo, computed at most once per event."""
         if self._verdict is _UNRESOLVED:
             self._verdict = _owner_ppid_verdict(self._env, probes=self)
         return self._verdict
 
 
-def _owner_ppid_verdict(
-    env: Mapping[str, str], *, probes: _EventProbes | None = None
-) -> bool | None:
+def _owner_ppid_verdict(env: Mapping[str, str], *, probes: _EventProbes) -> bool | None:
     """Does this event come from the claude spawn-claude.sh actually launched?
 
     Returns True (positively the owner), False (positively an inheritor), or
@@ -1028,11 +1031,9 @@ def _owner_ppid_verdict(
     with no ``/proc`` (macOS -- a first-class lane, cf. task 4058). Callers
     treat None as "adopt", the fail-soft direction this module documents.
 
-    *probes* is this event's ``_EventProbes`` memo when the caller holds one,
-    so the owning-pid walk is shared with the event's other consumers rather
-    than repeated. Omitting it builds a single-use memo, which resolves
-    through the module-level ``_owning_claude_pid`` exactly as before -- so a
-    bare ``_owner_ppid_verdict(env)`` call is semantically unchanged.
+    *probes* is this event's ``_EventProbes`` memo, so the owning-pid walk
+    is shared with the event's other consumers rather than repeated, and the
+    owner's parent is read from the same tree.
 
     Within one hook event this verdict is computed ONCE and reused by the
     adopt/fork decision (``_env_slug_ownership``) and the launch-window
@@ -1051,16 +1052,16 @@ def _owner_ppid_verdict(
         return None
     if expected <= 1:
         return None
-    owner_pid = (probes or _EventProbes(env)).owning_claude_pid()
+    owner_pid = probes.owning_claude_pid()
     if owner_pid is None:
         return None
-    actual = _parent_pid_of(owner_pid)
+    actual = probes.parent_pid_of(owner_pid)
     if actual is None:
         return None
     return actual == expected
 
 
-def _nested_claude_liveness_pid(*, probes: _EventProbes | None = None) -> int:
+def _nested_claude_liveness_pid(*, probes: _EventProbes) -> int:
     """A liveness pid that actually DIES with a forked inheritor's session.
 
     ``_hand_launched_liveness_pid``'s ``os.getsid(0)`` is deliberately the
@@ -1074,7 +1075,7 @@ def _nested_claude_liveness_pid(*, probes: _EventProbes | None = None) -> int:
     Nested invocation is routine agent behaviour, so that is registry growth
     proportional to it (task 4193 review).
 
-    ``_owning_claude_pid()`` resolves the nested ``claude`` itself --
+    ``_owning_claude_pid`` resolves the nested ``claude`` itself --
     exactly the process whose exit should make the record reclaimable. It
     is reused here rather than re-deriving the ancestry inline: the earlier
     inline copy took this process's GRANDPARENT, which the real
@@ -1096,7 +1097,7 @@ def _nested_claude_liveness_pid(*, probes: _EventProbes | None = None) -> int:
     walking ``/proc`` again -- the fork path has already resolved it once to
     reach the ownership verdict that sent it here.
     """
-    return (probes or _EventProbes({})).owning_claude_pid() or _hand_launched_liveness_pid()
+    return probes.owning_claude_pid() or _hand_launched_liveness_pid()
 
 
 def _resolve_parent_session_id(env: Mapping[str, str]) -> str | None:
@@ -1294,6 +1295,8 @@ def run_session_start(
     hook_input: Mapping[str, Any],
     env: Mapping[str, str],
     root: Path | str | None = None,
+    *,
+    process_tree: ProcessTree | None = None,
 ) -> session_registry.SessionRecord:
     """SessionStart hook handler: capture or refresh this session's record.
 
@@ -1371,8 +1374,11 @@ def run_session_start(
     comes from ``_own_identity_env`` (stripped on the fork path, raw on
     every other), so identity resolution falls through to this session's own
     defaults instead of the spawner's.
+
+    *process_tree* is the tree this event's ownership probes read; None reads
+    the live one (see ``ProcessTree``).
     """
-    probes = _EventProbes(env)
+    probes = _EventProbes(env, process_tree)
     resolution = _resolve_hook_slug(
         hook_input, env, root, allow_remint=True, probes=probes
     )
@@ -1552,9 +1558,8 @@ def _in_unbound_launch_window(
 
 def _withhold_from_launching(
     prior: session_registry.SessionRecord,
-    env: Mapping[str, str],
     *,
-    probes: _EventProbes | None = None,
+    probes: _EventProbes,
 ) -> bool:
     """Given a record in the unbound launch window, withhold this event?
 
@@ -1577,7 +1582,7 @@ def _withhold_from_launching(
     adopt/fork decision, so the two can never disagree because the process
     tree changed between two walks.
     """
-    if (probes or _EventProbes(env)).owner_ppid_verdict() is True:
+    if probes.owner_ppid_verdict() is True:
         return False
     return not _launch_window_withholding_expired(prior)
 
@@ -1589,6 +1594,7 @@ def _run_status_refresh_and_retitle(
     status: session_registry.Status,
     *,
     question: session_registry.Question | None = None,
+    process_tree: ProcessTree | None,
 ) -> str:
     """Shared refresh-then-retitle body for run_notification/run_stop.
 
@@ -1662,7 +1668,7 @@ def _run_status_refresh_and_retitle(
     so a session already running when the pointer shipped -- a long-lived
     watcher -- is linked by its next Notification/Stop, not its next restart.
     """
-    probes = _EventProbes(env)
+    probes = _EventProbes(env, process_tree)
     resolution = _resolve_hook_slug(hook_input, env, root, probes=probes)
     slug, may_bind = resolution.slug, resolution.may_bind
     # THE event's only read of the slug it writes: the ownership probe
@@ -1695,7 +1701,7 @@ def _run_status_refresh_and_retitle(
     in_launch_window = (
         prior is not None
         and _in_unbound_launch_window(prior)
-        and _withhold_from_launching(prior, env, probes=probes)
+        and _withhold_from_launching(prior, probes=probes)
     )
     record = session_registry.apply_refresh(
         slug, prior, status=None if in_launch_window else status
@@ -1725,12 +1731,15 @@ def run_notification(
     hook_input: Mapping[str, Any],
     env: Mapping[str, str],
     root: Path | str | None = None,
+    *,
+    process_tree: ProcessTree | None = None,
 ) -> str:
     """Notification hook handler: status -> AWAITING_INPUT, stamp any question, return its OSC retitle.
 
     Resolves the record through the ownership check (task 4193): a nested
     inheritor's question lands on its own record, never on the spawning
-    session's.
+    session's. *process_tree* is the tree this event's ownership probes
+    read; None reads the live one (see ``ProcessTree``).
     """
     return _run_status_refresh_and_retitle(
         hook_input,
@@ -1738,6 +1747,7 @@ def run_notification(
         root,
         session_registry.Status.AWAITING_INPUT,
         question=_extract_question(hook_input),
+        process_tree=process_tree,
     )
 
 
@@ -1745,14 +1755,19 @@ def run_stop(
     hook_input: Mapping[str, Any],
     env: Mapping[str, str],
     root: Path | str | None = None,
+    *,
+    process_tree: ProcessTree | None = None,
 ) -> str:
     """Stop hook handler: status -> IDLE, return its OSC retitle.
 
     Resolves the record through the ownership check (task 4193): a nested
     inheritor finishing its turn can no longer idle the spawning session
-    mid-turn.
+    mid-turn. *process_tree* is the tree this event's ownership probes
+    read; None reads the live one (see ``ProcessTree``).
     """
-    return _run_status_refresh_and_retitle(hook_input, env, root, session_registry.Status.IDLE)
+    return _run_status_refresh_and_retitle(
+        hook_input, env, root, session_registry.Status.IDLE, process_tree=process_tree
+    )
 
 
 # ---------------------------------------------------------------------------
