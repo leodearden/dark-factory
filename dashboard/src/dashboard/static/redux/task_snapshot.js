@@ -272,19 +272,21 @@ function viewReason([view, datum]) {
 }
 
 // ── The terminal window ──
-// Terminal rows come only from the on-demand ?terminal=<project> window.
-// OrchTab lists that window when another surface's request has landed one, but
-// never requests it itself. data.js::datumFor would call an absent window
-// 'not yet fetched', which promises a fetch that is not coming, so the hole
-// states what is actually true instead.
+// Terminal rows come only from the on-demand ?terminal=<project> window. A
+// surface that requests a project's window reads data.js::onDemandDatum. A
+// surface that lists a window it did NOT request — the Tasks tab, for each
+// project outside its wanted set — reads it through unrequestedTerminalRows:
+// data.js::datumFor would call an absent window 'not yet fetched', which
+// promises a fetch that is not coming, so the hole states what is true instead.
 const TERMINAL_NOT_REQUESTED = 'the terminal window is fetched on request only, and this view does not request it';
 
 function unrequestedTerminalRows(served) {
   return isSnapshotDatum(served) ? served : unknownSnapshotDatum(TERMINAL_NOT_REQUESTED);
 }
 
-// PRD decision 5: the projects whose window a surface requests — every one
-// while the terminal view is selected, else each one grouped by PRD.
+// The Tasks tab's wanted set (PRD decision 5): its one filter covers every
+// project, so every one while the terminal view is selected, else each one
+// grouped by PRD.
 function terminalWindowProjects(projectIds, filter, groupedIds) {
   return projectIds.filter(id => filter.terminal || groupedIds.includes(id));
 }
@@ -293,6 +295,15 @@ function terminalWindowProjects(projectIds, filter, groupedIds) {
 // change to the wanted set owes a request, since the rest already had theirs.
 function terminalWindowEntrants(wantedBefore, wanted) {
   return wanted.filter(id => !wantedBefore.includes(id));
+}
+
+// OrchTab's wanted set (PRD decision 5): each project whose view filter, on
+// any listing of it, selects the terminal view — once, in listing order.
+// OrchTab keeps one filter per orchestrator, so two listings of one project
+// owe one request.
+function terminalSelectingProjects(listings) {
+  const selecting = listings.filter(listing => listing.filter.terminal).map(listing => listing.project);
+  return selecting.filter((project, i) => selecting.indexOf(project) === i);
 }
 
 // Module-unique export const, never a bare `API` — the CANONICAL note in
@@ -317,6 +328,7 @@ const TASK_SNAPSHOT_API = {
   unrequestedTerminalRows,
   terminalWindowProjects,
   terminalWindowEntrants,
+  terminalSelectingProjects,
   sameDatum,
 };
 
