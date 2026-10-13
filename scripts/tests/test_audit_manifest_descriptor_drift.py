@@ -37,6 +37,7 @@ scripts/tests/test_lms_marker_contract.py.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -75,7 +76,11 @@ from audit_manifest_descriptor_drift import (
 )
 from git_checkout_root import checkout_root_or_skip
 from shared.capability_manifest import DeliveredCheck, load_capability_manifest
-from shared.delivered_check_polarity import CheckOutcome, interpret_grep_rc
+from shared.delivered_check_polarity import (
+    CheckOutcome,
+    build_grep_argv,
+    interpret_grep_rc,
+)
 from shared.task_statuses import TERMINAL, TaskStatus
 
 # ---------------------------------------------------------------------------
@@ -2997,22 +3002,54 @@ class _AnchorReading:
     stderr: str
 
 
+#: Fills build_grep_argv's mandatory ref slot only to be removed again: with no
+#: tree argument git grep reads the working tree, which is the tree
+#: _live_delivered_check reads the sidecar from.
+_REF_SLOT_PLACEHOLDER = "<working-tree>"
+
+_DEFINED_NAME = re.compile(r"\s*(?:async\s+)?(?:class|def)\s+(\w+)")
+
+
+def _working_tree_grep_argv(root: str, pattern: str,
+                            paths: Sequence[str]) -> list[str]:
+    """build_grep_argv's argv minus its ref, plus the output-only --null and
+    --column, which change neither the match set nor the exit code."""
+    argv = build_grep_argv(pattern, paths, project_root=root,
+                           ref=_REF_SLOT_PLACEHOLDER)
+    removed = argv.pop(argv.index("-e") + 2)
+    assert removed == _REF_SLOT_PLACEHOLDER, (
+        f"build_grep_argv no longer puts its ref right after the pattern: {argv}"
+    )
+    flags_at = argv.index("-E")
+    argv[flags_at:flags_at] = ["--null", "--column"]
+    return argv
+
+
+def _match_starts_in_defined_name(text: str, column: int) -> bool:
+    """Whether git's 1-based byte *column* of a line's first match falls in the
+    name that line's class/def defines, not in a comment or body after it."""
+    defined = _DEFINED_NAME.match(text)
+    if defined is None:
+        return False
+    start, end = (len(text[:offset].encode()) for offset in defined.span(1))
+    return start < column <= end
+
+
 def _read_identifier_anchor(root: str, *, pattern: str, paths: Sequence[str],
                             expect: str | None, suite: str) -> _AnchorReading:
-    """Run the runtime grep argv over the working tree instead of a ref, and
-    judge its exit code with the runtime's own interpret_grep_rc."""
+    """Run the runtime's grep over the working tree instead of a ref, and judge
+    its exit code with the runtime's own interpret_grep_rc."""
     completed = subprocess.run(
-        ["git", "-C", root, "grep", "-E", "--null", "-e", pattern,
-         *(["--", *paths] if paths else [])],
+        _working_tree_grep_argv(root, pattern, paths),
         capture_output=True, text=True, timeout=30,
     )
-    hits = [line.split("\0", 1) for line in completed.stdout.split("\n") if line]
+    hits = [line.split("\0", 2) for line in completed.stdout.split("\n") if line]
     return _AnchorReading(
         outcome=interpret_grep_rc(completed.returncode, expect),
-        paths_hit=frozenset(path for path, _text in hits),
+        paths_hit=frozenset(path for path, _column, _text in hits),
         defines_in_suite=any(
-            path == suite and text.lstrip().startswith(("class ", "def "))
-            for path, text in hits
+            path == suite and _match_starts_in_defined_name(text, int(column))
+            for path, column, text in hits
         ),
         stderr=completed.stderr,
     )
@@ -3025,6 +3062,9 @@ def _read_identifier_anchor(root: str, *, pattern: str, paths: Sequence[str],
     pytest.param({"suite.py": "# TestAnchor is only mentioned here\n"},
                  CheckOutcome.PASS, {"tests/suite.py"}, False,
                  id="prose-only-in-suite"),
+    pytest.param({"suite.py": "def helper():  # TestAnchor\n"},
+                 CheckOutcome.PASS, {"tests/suite.py"}, False,
+                 id="prose-on-a-def-line"),
     pytest.param({"suite.py": "class TestAnchor:\n    pass\n",
                   "other.py": "# see TestAnchor\n"},
                  CheckOutcome.PASS, {"tests/suite.py", "tests/other.py"}, True,
@@ -3094,5 +3134,5 @@ def test_identifier_anchor_names_a_definition_inside_its_certified_suite(key, su
         f"{sorted(reading.paths_hit)}"
     )
     assert reading.defines_in_suite, (
-        f"{where}: no hit inside {suite} is a 'class '/'def ' line"
+        f"{where}: no hit inside {suite} starts in the name a class/def defines"
     )
