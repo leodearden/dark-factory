@@ -257,3 +257,99 @@ def test_a_hosted_claim_without_a_session_id_exits_2_naming_it(
     assert 'CLAUDE_CODE_SESSION_ID' in err
     assert '--slug' in err
     assert not sr.lease_path_for_name(_NAME, root=tmp_path).exists()
+
+
+# --- lease bodies that still carry a running host pid ------------------------
+#
+# Claimed before hosted sessions recorded pid 0, or via an explicit `--pid`.
+
+
+def _seed_lease(tmp_path: Path, pid: int, name: str = _NAME) -> Path:
+    holder = sr.LeaseHolder(
+        session_slug=f'{name}-{pid}', pid=pid, start_ts='2026-10-01T00:00:00+00:00'
+    )
+    sr.claim_lease(name, holder=holder, root=tmp_path)
+    return sr.lease_path_for_name(name, root=tmp_path)
+
+
+def test_lease_status_reports_a_legacy_host_pid_lease_reclaimable_past_ttl_only(
+    shared_host_pid: int, tmp_path: Path
+) -> None:
+    host = shared_host_pid
+    lease = _seed_lease(tmp_path, host)
+    _age(lease, _PAST_TTL_SECS)
+
+    aged = sr.lease_status(_NAME, root=tmp_path)
+
+    assert aged.holder_pid == host
+    assert aged.holder_pid_alive is True
+    assert aged.reclaimable is True
+
+    _age(lease, 60)
+
+    assert sr.lease_status(_NAME, root=tmp_path).reclaimable is False
+
+
+def test_reap_stale_leases_removes_an_aged_legacy_host_pid_lease(
+    shared_host_pid: int, tmp_path: Path
+) -> None:
+    aged_lease = _seed_lease(tmp_path, shared_host_pid)
+    fresh_lease = _seed_lease(tmp_path, shared_host_pid, name='watcher-df')
+    _age(aged_lease, _PAST_TTL_SECS)
+    _age(fresh_lease, 60)
+
+    assert [r.reason for r in sr.reap_stale_leases(root=tmp_path)] == ['stale_pid']
+    assert not aged_lease.exists()
+    assert fresh_lease.is_file()
+
+
+def test_claim_lease_reclaims_an_aged_legacy_host_pid_lease(
+    shared_host_pid: int, tmp_path: Path
+) -> None:
+    host = shared_host_pid
+    lease = _seed_lease(tmp_path, host)
+    held_body = lease.read_text()
+    contender = sr.LeaseHolder(
+        session_slug='contender', pid=os.getpid(), start_ts='2026-10-13T00:00:00+00:00'
+    )
+    _age(lease, 60)
+
+    fresh = sr.claim_lease(_NAME, holder=contender, root=tmp_path)
+
+    assert fresh.decision is sr.LeaseDecision.STAND_DOWN
+    assert f'pid {host} alive' in fresh.message
+    assert lease.read_text() == held_body
+
+    _age(lease, _PAST_TTL_SECS)
+
+    aged = sr.claim_lease(_NAME, holder=contender, root=tmp_path)
+
+    assert aged.decision is sr.LeaseDecision.ACQUIRED
+    assert _body(tmp_path) == contender
+
+
+def test_an_operator_pid_override_naming_a_host_still_ages_out(
+    shared_host_pid: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    host = shared_host_pid
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _cli(capsys, 'lease-claim', '--name', _NAME, '--slug', 'op-token', '--pid', str(host))
+    lease = sr.lease_path_for_name(_NAME, root=tmp_path)
+    assert _body(tmp_path).pid == host
+    _age(lease, _PAST_TTL_SECS)
+
+    _cli(capsys, 'lease-reap')
+
+    assert not lease.exists()
+
+
+def test_a_running_non_host_holder_is_never_stale(tmp_path: Path) -> None:
+    lease = _seed_lease(tmp_path, os.getpid())
+    _age(lease, 10 * sr.LEASE_HEARTBEAT_TTL.total_seconds())
+
+    assert sr.lease_status(_NAME, root=tmp_path).reclaimable is False
+    assert sr.reap_stale_leases(root=tmp_path) == []
+    assert lease.is_file()
