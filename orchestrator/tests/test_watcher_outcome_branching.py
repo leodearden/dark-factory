@@ -34,7 +34,10 @@ _HARNESS_STOP_DIRECTIVE = 'STOP what you are doing'  # Claude Code tool-rejectio
 
 _ARTIFACTS: dict[str, Callable[[], str]] = {
     'auto-skill': lambda: load_skill_system_prompt('escalation-watcher-auto'),
+    'l2-skill': lambda: load_skill_system_prompt('escalation-watcher'),
 }
+_KILLED = 'KILLED'
+_L2_KILLED_RECOVERY = 'run_in_background'  # the interactive lane's sanctioned re-arm
 
 
 @dataclass(frozen=True)
@@ -169,4 +172,19 @@ class TestOutcomeBranchContract:
         assert _HARNESS_STOP_DIRECTIVE in _ARTIFACTS[artifact_id](), (
             f'{artifact_id}: must say how to honour a tool result carrying '
             f'{_HARNESS_STOP_DIRECTIVE!r}'
+        )
+
+
+class TestL2LaneKilledRecovery:
+    def test_killed_row_names_the_background_recovery(
+        self, producer_contract: ProducerContract
+    ) -> None:
+        assert _KILLED in producer_contract.outcomes, (
+            f'the wrapper no longer emits {_KILLED}; outcomes are {sorted(producer_contract.outcomes)}'
+        )
+        rows = _branch_rows(_ARTIFACTS['l2-skill']()).get(_KILLED, [])
+        assert any(_L2_KILLED_RECOVERY in row for row in rows), (
+            f'l2-skill: the {_KILLED} row must name {_L2_KILLED_RECOVERY}, because a '
+            'killed foreground arm moves to the background pattern rather than '
+            'being re-issued in the foreground'
         )
