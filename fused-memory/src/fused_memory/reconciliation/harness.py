@@ -475,8 +475,17 @@ def _finding_has_citation_failures(finding: dict) -> bool:
     return bool(finding.get('citation_failures'))
 
 
+def _finding_is_superseded(finding: dict) -> bool:
+    """True iff a later finding of the same run retired this claim (task 4653,
+    ``server/recon_report.py::ReconReportState.add_finding`` ``supersedes``), so
+    the row is a record of the claim, not a standing one.  Truthiness, so the
+    always-projected ``superseded_by: None`` reads as standing."""
+    return bool(finding.get('superseded_by'))
+
+
 def _finding_is_live_actionable(finding: dict) -> bool:
-    """Return True iff *finding* is actionable and not superseded.
+    """Return True iff *finding* is actionable and not superseded
+    (composes ``_finding_is_superseded``).
 
     Task 4653: ``add_finding(..., supersedes=...)`` lets a later finding of a
     run mark an earlier one historical, stamping the target's
@@ -502,7 +511,7 @@ def _finding_is_live_actionable(finding: dict) -> bool:
     never-cited placeholder, so counting it as either would corrupt the
     drop-cause attribution that split exists to get right.
     """
-    return bool(finding.get('actionable', False)) and not finding.get('superseded_by')
+    return bool(finding.get('actionable', False)) and not _finding_is_superseded(finding)
 
 
 # Module-local sleep binding — allows tests to patch sleep without touching
@@ -4885,8 +4894,8 @@ class ReconciliationHarness:
         The filter runs BEFORE the ``if items:`` fall-through, so a run whose
         every finding was retired behaves exactly like a run that flagged
         nothing: an older completed run still gets its turn, and no empty
-        "Prior Stage 3 Findings" section is rendered.  ``.get`` is fail-open —
-        a finding dict that never carried the key is unaffected.
+        "Prior Stage 3 Findings" section is rendered.  A finding dict that never
+        carried the key is unaffected.
         """
         try:
             recent = await self.journal.get_recent_runs(project_id, limit=3)
@@ -4900,7 +4909,7 @@ class ReconciliationHarness:
                     items = s3_report.get('items_flagged', [])
                 else:
                     items = s3_report.items_flagged
-                items = [f for f in items if not f.get('superseded_by')]
+                items = [f for f in items if not _finding_is_superseded(f)]
                 if items:
                     return items
         except Exception as e:
@@ -4919,6 +4928,11 @@ class ReconciliationHarness:
         for dedup), so findings that differ only in non-identity fields do not inflate the
         count.  Counted per-run — duplicates within one run's items_flagged do not count
         twice.
+
+        A row its own run superseded (``_finding_is_superseded``) is a record of the
+        claim, not an occurrence, so it is skipped before it is fingerprinted.  The skip
+        is per row: a standing copy beside a retired one still counts the run.  Pinned by
+        ``tests/test_harness.py::test_superseded_prior_occurrences_do_not_push_a_finding_to_escalation``.
 
         The default lookback is ``max(5, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD)`` so
         that raising the threshold never silently caps the count below the gate value.
@@ -4962,6 +4976,8 @@ class ReconciliationHarness:
                 # Count this run once if any item matches the target fingerprint
                 for item in items:
                     try:
+                        if _finding_is_superseded(item):
+                            continue
                         fp = _recon_finding_fingerprint(_RECON_INTEGRITY_ISSUE_CATEGORY, item)
                     except Exception:
                         any_item_fp_failed = True
