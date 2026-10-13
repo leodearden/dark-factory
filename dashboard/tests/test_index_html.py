@@ -76,6 +76,16 @@ _CDN_SCRIPT_CASES = [
 ]
 
 
+def _script_attrs(
+    index_html_body: str, src_prefix: str, consumer_note: str = ''
+) -> dict[str, str | None]:
+    result = find_script_position(index_html_body, src_prefix)
+    assert result is not None, (
+        f'No <script src="{src_prefix}..."> tag found in index.html. {consumer_note}'
+    ).rstrip()
+    return result[1]
+
+
 @pytest.mark.parametrize(
     'src_prefix, lib_name, consumer_note',
     _CDN_SCRIPT_CASES,
@@ -90,12 +100,7 @@ def test_cdn_script_has_sri_integrity(
     whose pin the node suite's
     dashboard/tests/js/_served_bundle.mjs::loadVendoredBabel already holds.
     """
-    result = find_script_position(index_html_body, src_prefix)
-    attrs = result[1] if result is not None else None
-    assert attrs is not None, (
-        f'No <script src="{src_prefix}..."> tag found in index.html. '
-        f'{consumer_note}'
-    )
+    attrs = _script_attrs(index_html_body, src_prefix, consumer_note)
     integrity = (attrs.get('integrity') or '').strip()
     assert integrity, (
         f'{lib_name} CDN tag has missing or empty integrity= attribute. '
@@ -130,9 +135,7 @@ def _parse_unpkg_umd_src(src: str) -> UnpkgUmdTag:
 
 
 def _react_umd_tag(index_html_body: str, src_prefix: str) -> UnpkgUmdTag:
-    result = find_script_position(index_html_body, src_prefix)
-    assert result is not None, f'No <script src="{src_prefix}..."> tag found in index.html.'
-    return _parse_unpkg_umd_src(result[1].get('src') or '')
+    return _parse_unpkg_umd_src(_script_attrs(index_html_body, src_prefix).get('src') or '')
 
 
 def test_react_cdn_tags_load_one_version_of_the_production_build(index_html_body: str) -> None:
@@ -141,6 +144,12 @@ def test_react_cdn_tags_load_one_version_of_the_production_build(index_html_body
     The development build re-validates every element on every render; the page
     still works, so a reversion would ship unnoticed while every poll-driven
     re-render pays for it.
+
+    The production build is silent about missing keys and prop or hook misuse,
+    and reports render errors as "Minified React error #N". To get those
+    diagnostics back while debugging a .jsx change locally, point both tags at
+    umd/<package>.development.js and drop or re-derive their integrity= (SRI
+    blocks a mismatched hash). Do not commit that swap; this test fails on it.
     """
     react = _react_umd_tag(index_html_body, _REACT_PREFIX)
     react_dom = _react_umd_tag(index_html_body, _REACT_DOM_PREFIX)
