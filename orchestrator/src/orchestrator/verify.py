@@ -7716,10 +7716,7 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         # stutter the same sentence twice).
         for r in results:
             for fragment in r.summary.removeprefix('Failures: ').split(', '):
-                if (
-                    any(marker in fragment for marker in _NO_VERDICT_SUMMARY_MARKERS)
-                    and fragment not in parts
-                ):
+                if is_no_verdict_summary(fragment) and fragment not in parts:
                     parts.append(fragment)
         summary = 'All checks passed' if passed else f'Failures: {", ".join(parts)}'
 

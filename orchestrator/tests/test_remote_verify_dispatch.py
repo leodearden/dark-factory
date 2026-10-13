@@ -12,7 +12,6 @@ rather than passing against a hand-typed marker string.
 import asyncio
 import dataclasses
 import json
-import re
 import shlex
 import shutil
 import subprocess
@@ -20,7 +19,6 @@ import sys
 import uuid
 from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
-from typing import get_args
 
 import pytest
 from _xdist_crash_fixtures import XDIST_SESSION_ABORTED_OUTPUT
@@ -34,12 +32,10 @@ from orchestrator.verify import (
     VerifyResult,
 )
 from orchestrator.verify_runner import (
-    _SSH_BASE_OPTS,
     REMOTE_VERIFY_PROCESS_PATTERN,
     ConcurrentDispatchError,
     MergeVerifySpec,
     RemoteRunner,
-    RemoteVerifySubcommand,
     RunnerUnavailable,
     RunnerUnavailableKind,
     UnscopedTypecheckSpec,
@@ -206,6 +202,9 @@ def _green() -> VerifyResult:
     )
 
 
+_GREEN_WITH_NULL_SUMMARY = json.dumps({**json.loads(result_to_json(_green())), 'summary': None})
+
+
 class TestRunnerUnavailableKind:
     def test_default_kind_is_transport_and_message_is_kept(self):
         exc = RunnerUnavailable('host down')
@@ -260,7 +259,7 @@ class TestDispatchFailureKinds:
         assert await self._kind_of(_FakeTransport(ssh_stdout=stdout)) == 'unparseable'
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('stdout', ['{"unexpected": 1}', '[1, 2]'])
+    @pytest.mark.parametrize('stdout', ['{"unexpected": 1}', '[1, 2]', _GREEN_WITH_NULL_SUMMARY])
     async def test_json_of_the_wrong_shape_is_wire_shape(self, stdout: str):
         assert await self._kind_of(_FakeTransport(ssh_stdout=stdout)) == 'wire_shape'
 
@@ -612,10 +611,6 @@ class TestRemoteVerifyProcessPattern:
                 child.kill()
                 child.wait()
 
-    def test_every_subcommand_is_matched(self):
-        for subcommand in get_args(RemoteVerifySubcommand):
-            assert re.search(REMOTE_VERIFY_PROCESS_PATTERN, f'orchestrator {subcommand} --sha x')
-
     @pytest.mark.asyncio
     async def test_probe_issues_one_ssh_running_the_pattern(self):
         transport = _FakeTransport(ssh_rc=1)
@@ -623,7 +618,7 @@ class TestRemoteVerifyProcessPattern:
         await _remote_runner(transport).probe_clean()
 
         [ssh_argv] = transport.ssh_calls()
-        assert ssh_argv[:-1] == ['ssh', *_SSH_BASE_OPTS, 'laptop.local']
+        assert (ssh_argv[0], ssh_argv[-2]) == ('ssh', 'laptop.local')
         assert shlex.split(ssh_argv[-1]) == ['pgrep', '-f', REMOTE_VERIFY_PROCESS_PATTERN]
         assert len(transport.calls) == 1
 

@@ -854,6 +854,10 @@ class LocalRunner:
 # the same task; the format is still lexicographically sortable.
 _STDERR_ARCHIVE_TS_FMT = '%Y%m%dT%H%M%S_%fZ'
 
+# A merge verify carries no attempt id; its archives stem with the same
+# fallback the local merge path uses (verify.py::_archive_attempt_id).
+_MERGE_ARCHIVE_ATTEMPT_ID = 1
+
 # Shared base ssh options for all four RemoteRunner ssh argv sites (health,
 # run_merge_verify dispatch, cancel_verify, probe_clean) — kept in one place
 # so the keepalive flags can't drift apart across sites. The two keepalive
@@ -1584,11 +1588,13 @@ class RemoteRunner:
         result = outcome.result
         if archive_root is not None and task_id is not None:
             if not result.passed:
-                self._archive_remote_red(archive_root, task_id, 1, outcome, role='merge')
+                self._archive_remote_red(
+                    archive_root, task_id, _MERGE_ARCHIVE_ATTEMPT_ID, outcome, role='merge',
+                )
             else:
                 # task-2822 fix (c): a remote GREEN is auditable beside the red archives.
                 self._archive_pass_summary(
-                    archive_root, task_id, 1,
+                    archive_root, task_id, _MERGE_ARCHIVE_ATTEMPT_ID,
                     _merge_pass_summary_payload(
                         self.name, spec, result, merge_sha, outcome.duration_ms,
                     ),
@@ -1817,6 +1823,12 @@ class RemoteRunner:
                 f'VerifyResult of the wrong shape from {self._ssh_host!r}: {exc!r}',
                 kind='wire_shape',
             ) from exc
+        if not isinstance(result.summary, str):
+            raise RunnerUnavailable(
+                f'VerifyResult of the wrong shape from {self._ssh_host!r}: '
+                f'summary {result.summary!r} is not a string',
+                kind='wire_shape',
+            )
         if verify.is_no_verdict_summary(result.summary):
             raise RunnerUnavailable(
                 f'{self.name!r} returned no verdict: {result.summary}',
