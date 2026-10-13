@@ -914,9 +914,12 @@ Parse JSON stdout; `verdict` is one of `clean | repaired | blocked`.
   empty for want of a look rather than for want of damage. Check the path you passed before
   reading anything else in the payload.
 
-The preflight moves a suspect `MERGE_RR` aside to a `MERGE_RR.quarantined-<timestamp>` sibling —
-**moved, never deleted**. A *successful* abort deletes that file, and it is the only record of
-which conflict ids the worktree was carrying, so leave any quarantined copy where it is.
+The preflight moves a suspect `MERGE_RR` aside to
+`<git-common-dir>/rerere-specimens/MERGE_RR.<worktree>-<stamp>` — **moved, never deleted**. It
+goes to the common dir, not beside the original, because the worktree lifecycle deletes
+`.git/worktrees/<id>/` on landing. A *successful* abort deletes the original file, and it is the
+only record of which conflict ids the worktree was carrying, so leave any quarantined copy where
+it is.
 
 The state it detects is an id present in `MERGE_RR` with no backing `rr-cache/<id>` directory. How
 those directories come to be missing is **not established** — report only what was observed, never
