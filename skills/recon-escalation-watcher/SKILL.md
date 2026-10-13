@@ -496,7 +496,7 @@ started, so this rule covers it too.
 
 The command, what counts as a finding (the chain rule included), change-only
 triage, the census follow-up, the broken-chain journal probe, the D-4 pointer and
-the filing keys live in
+the filing store and keys live in
 [`skills/_shared/reading-the-invariants-gauge.md`](../_shared/reading-the-invariants-gauge.md).
 Read them there. This skill's deltas:
 

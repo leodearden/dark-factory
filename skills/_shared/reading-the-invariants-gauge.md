@@ -175,8 +175,16 @@ record's shape. Read both there before filing.
 
 ## Filing a task for a finding
 
-Both watchers read this endpoint, so first run `mcp__fused-memory__search_tasks` for an existing
-task naming that root and finding. Then file with the Case B keys of
+Both watchers read this endpoint, so a finding must reach the same task whichever watcher files
+it. The R4 gate
+(`fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._check_escalation_idempotency`)
+dedupes only among the tasks of the `project_root` a submit names. So file every finding into one
+store, `project_root=$DARK_FACTORY_ROOT`, whatever root the finding is on. The gauge, the census
+and the chain mint are factory machinery, and the factory's store stays writable when the finding
+is a root's own store gone blind.
+
+First run `mcp__fused-memory__search_tasks` in that store for an existing task naming the root
+and finding: R4 cannot see a task filed without these keys. Then file with the Case B keys of
 [`ticket-failure-handling.md`](ticket-failure-handling.md), derived here so that both watchers
 mint the same R4 key:
 
@@ -184,8 +192,9 @@ mint the same R4 key:
 import hashlib
 
 # project: the record's `project`; for `absent`, which has no record, os.path.basename(root)
+# after: "" on a first filing; f" after {task_id}" when the finding outlived a done task (below)
 escalation_id = f"invariants-{kind}-{project}"
-suggestion_hash = hashlib.sha256(f"{root} {kind} {identity}".encode()).hexdigest()[:16]
+suggestion_hash = hashlib.sha256(f"{root} {kind} {identity}{after}".encode()).hexdigest()[:16]
 ```
 
 `kind` is the word after `FINDING` in the digest line, or `chain-paused` for an unowned hold:
@@ -193,6 +202,22 @@ suggestion_hash = hashlib.sha256(f"{root} {kind} {identity}".encode()).hexdigest
 | `kind` | `identity` |
 |---|---|
 | `blind` | the record's `error` string |
-| `terminal` | the space-joined, sorted `tag#task_id` list the filing covers |
+| `terminal` | `unledgered`: one standing task per root holds all of that root's rows |
 | `chain-overdue`, `chain-broken`, `chain-paused` | `tag`, `key` and `link_id`, space-joined |
 | `absent` | the normalised root the digest printed |
+
+The terminal key names the root, not a set of rows, so a later filing with more rows meets the
+same task. List the `tag#task_id` rows a filing covers in its `details`.
+
+### Reading an R4 hit
+
+R4 matches every task that is not `cancelled`, `done` included. A hit resolves `combined` with
+reason `idempotency_hit` and the existing `task_id`. Read that task with `get_task` before treating
+the finding as handled:
+
+- Not `done`: the finding is already filed. For `terminal`, append the rows the task does not
+  list yet: `update_task(id=<task_id>, project_root=$DARK_FACTORY_ROOT, details=<rows>,
+  append=True)`.
+- `done`: the finding came back after its fix. That is news, not a duplicate. File again with
+  `after = f" after {task_id}"`, so both watchers still mint one key for the recurrence. Read a hit
+  on that key the same way.
