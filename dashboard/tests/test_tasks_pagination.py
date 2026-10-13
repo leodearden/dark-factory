@@ -154,6 +154,9 @@ class TestPublicReadContracts:
             f'one page read plus one whole-tree read, got {calls!r} — a shared '
             'cache entry would show up here as a missing read'
         )
+        assert calls[0] == {
+            'project_root': '/proj/signal', 'page_size': 10, 'offset': 0,
+        }, f'the page read sends its window; got {calls[0]!r}'
         assert calls[1] == {'project_root': '/proj/signal'}, (
             f'the complete read sends no window; got {calls[1]!r}'
         )
