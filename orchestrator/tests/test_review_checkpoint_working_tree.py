@@ -74,7 +74,9 @@ def _printed_as(rel: str, module_dirs: Iterable[str]) -> str:
     )
 
 
-async def _tree_walking_lint(project_root: Path, config: OrchestratorConfig) -> VerifyResult:
+async def _tree_walking_lint(
+    project_root: Path, config: OrchestratorConfig, **_admission: object,
+) -> VerifyResult:
     offenders = sorted(
         _printed_as(path.relative_to(project_root).as_posix(), config.module_configs_or_empty)
         for path in project_root.rglob('*.py')
