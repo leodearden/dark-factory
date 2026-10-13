@@ -2231,8 +2231,9 @@ class _StubMcpSession:
 
     Handles every tool the eval ``Scheduler`` dispatches via ``dispatch_tool``:
     ``set_task_status``, ``get_task``, ``get_tasks``, ``get_statuses``,
-    ``update_task``, ``set_task_claimant``, ``get_external_statuses`` (plus
-    ``add_dependency``, stubbed defensively though not yet dispatched).  The
+    ``update_task``, ``set_task_claimant``, ``get_external_statuses``,
+    ``submit_task`` (plus ``add_dependency``, stubbed defensively though not
+    yet dispatched).  The
     ``test_scheduler_dispatch_literal_tripwire`` guard asserts every dispatched
     literal has a branch here.  Any other tool name raises ``NotImplementedError``.
     """
@@ -2266,7 +2267,8 @@ class _StubMcpSession:
 
         Supported tools: ``set_task_status``, ``get_task``, ``get_tasks``,
         ``get_statuses``, ``update_task``, ``set_task_claimant``,
-        ``get_external_statuses``, ``add_dependency``.  Unknown tool names raise
+        ``get_external_statuses``, ``submit_task``, ``add_dependency``.  Unknown
+        tool names raise
         ``NotImplementedError``.
 
         .. note::
@@ -2319,6 +2321,14 @@ class _StubMcpSession:
             deps = arguments.get('deps', [])
             mapping = {d: 'done' for d in deps}
             return self._envelope(json.dumps(mapping))
+        if name == 'submit_task':
+            # Scheduler.submit_task files tasks for machine filers (auto-eval,
+            # the flake ledger). An eval run must create none, so the answer is
+            # the server's structured refusal, which parses to SubmitFailed.
+            return self._envelope(json.dumps({
+                'error': 'eval runs file no tasks',
+                'error_type': 'EvalStubRefusal',
+            }))
         if name == 'add_dependency':
             # Not currently dispatched by scheduler.py; added defensively per
             # task spec so a future dispatch site is already stubbed. Echo the id
