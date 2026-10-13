@@ -4591,13 +4591,13 @@ class TestScoreFunction:
 
     def test_tier_base_dominates(self, scheduler: Scheduler):
         """A fresh medium task with no descendants scores = TIER_BASE[medium]."""
-        score = scheduler._compute_score('medium', age=0, transitive_count=0)
+        score = scheduler._compute_score_legacy('medium', age=0, transitive_count=0)
         assert score == float(TIER_BASE['medium'])
 
     def test_age_bonus_bounded_by_tier_width(self, scheduler: Scheduler):
         """age=1e6 + medium tier must never outscore a fresh high tier."""
-        aged_medium = scheduler._compute_score('medium', age=1_000_000, transitive_count=0)
-        fresh_high = scheduler._compute_score('high', age=0, transitive_count=0)
+        aged_medium = scheduler._compute_score_legacy('medium', age=1_000_000, transitive_count=0)
+        fresh_high = scheduler._compute_score_legacy('high', age=0, transitive_count=0)
         assert aged_medium < fresh_high
         # Verify the cap: score - base never exceeds TIER_WIDTH - 1.
         bonus = aged_medium - TIER_BASE['medium']
@@ -4605,15 +4605,15 @@ class TestScoreFunction:
 
     def test_cpm_bonus_positive(self, scheduler: Scheduler):
         """A task with many descendants scores higher than one without."""
-        alone = scheduler._compute_score('medium', age=0, transitive_count=0)
-        unlock_many = scheduler._compute_score('medium', age=0, transitive_count=1000)
+        alone = scheduler._compute_score_legacy('medium', age=0, transitive_count=0)
+        unlock_many = scheduler._compute_score_legacy('medium', age=0, transitive_count=1000)
         assert unlock_many > alone
         # Still bounded below the next tier.
         assert unlock_many < TIER_BASE['high']
 
     def test_combined_bonus_bounded(self, scheduler: Scheduler):
         """Age + CPM together never cross a tier boundary."""
-        huge = scheduler._compute_score('low', age=10_000, transitive_count=10_000)
+        huge = scheduler._compute_score_legacy('low', age=10_000, transitive_count=10_000)
         assert huge < TIER_BASE['medium']
 
 

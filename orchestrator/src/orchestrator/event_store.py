@@ -609,6 +609,13 @@ class EventType(StrEnum):
     # NOT emitted through _emit_lock_event: that chokepoint is contractually
     # the lock-event single writer and raises on any other event type.
     park_backfill_overstay = 'park_backfill_overstay'
+    # Anchor-coverage arming gate (task 3819 / scheduler-scoring PRD D12, I-6).
+    # Producer: scheduler.py::Scheduler._note_anchor_coverage, once per tick whose
+    # share of candidates carrying a parseable metadata.pending_since is below
+    # scoring.new_scoring_min_anchor_coverage — the whole tick then scores on
+    # the legacy formula.  Scheduler-scoped (task_id=None).  Payload:
+    # {coverage, threshold, candidates, with_anchor, consecutive_ticks}.
+    scoring_anchor_coverage_low = 'scoring_anchor_coverage_low'
 
     # Scheduler priority overrides
     #

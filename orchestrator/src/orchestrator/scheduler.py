@@ -12,7 +12,7 @@ import re
 import time
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, MutableSet, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
@@ -33,6 +33,7 @@ from shared.task_metadata import parse_metadata
 from shared.task_metadata_wire import coerce_task_metadata
 
 from orchestrator import git_ops
+from orchestrator.anchor_coverage_gate import AnchorCoverageGate
 from orchestrator.config import (
     DEFAULT_TIER,
     PRIORITY_RANK,
@@ -51,6 +52,7 @@ from orchestrator.mcp_lifecycle import ORCHESTRATOR_MCP_IDENTITY, mcp_call, tool
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
+from orchestrator.pending_age import AnchorReading, read_pending_age
 from orchestrator.pin_reservation import (
     Blocker,
     BlockerKind,
@@ -78,6 +80,7 @@ from orchestrator.recovery_emission import (
     veto_signature,
 )
 from orchestrator.recovery_pins import records_pin_blocked_recovery
+from orchestrator.sentinel_l1 import file_sentinel_l1
 from orchestrator.streaks import StreakCounter, StreakRegistry
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
 
@@ -1071,6 +1074,11 @@ class _BackfillScanCache:
 
     parks: dict[str, dict] | None = None
     delays: dict[str, float] = field(default_factory=dict)
+
+
+def _numeric_id(task_id: str) -> float:
+    """The dispatch tie-break rank of *task_id*: older numeric ids first, any non-numeric id last (PRD I-4)."""
+    return float(int(task_id)) if task_id.isdecimal() else math.inf
 
 
 def _resolve_time_source(ts: Callable[[], float] | None) -> Callable[[], float]:
@@ -2418,6 +2426,8 @@ class Scheduler:
         # reset-on-success cannot leak. Bumped by _note_fm_read_failure,
         # zeroed by _reset_fm_read_failure_streak on any successful read.
         self._fm_read_failure_streak: int = 0
+        # The I-6 arming gate and its storm-escape state (task 3819, PRD D12).
+        self._anchor_gate = AnchorCoverageGate()
         # --- Startup gate (task 2235, W10-α) ---
         # False until finish_startup() is called.  acquire_next() asserts
         # this — a runtime check for the "startup reconcile sweeps run
@@ -5834,24 +5844,25 @@ class Scheduler:
             if tid in self._was_non_pending:
                 # Resurrection — start fresh from now.
                 self._pending_anchor[tid] = max_id
-            elif tid.isdigit():
+            elif tid.isdecimal():
                 self._pending_anchor[tid] = int(tid)
             else:
                 self._pending_anchor[tid] = max_id
         self._was_non_pending |= newly_non_pending
 
-    def _compute_score(
+    def _compute_score_legacy(
         self,
         tier: str,
         age: int,
         transitive_count: int,
     ) -> float:
-        """Compute the total dispatch score for a task.
+        """The pre-C2 dispatch score, still live as the I-6 fallback.
 
-        ``score = TIER_BASE[tier] + min(α*age + β*log1p(trans), TIER_WIDTH - 1)``
-
-        The combined age+CPM bonus is capped below ``TIER_WIDTH`` so bonuses
-        can never bump a task across a tier boundary — priority always wins.
+        ``score = TIER_BASE[tier] + min(α*age + β*log1p(trans), TIER_WIDTH - 1)``,
+        where *age* is a newer-task count (:meth:`_compute_age`), not seconds.
+        A tick whose anchor coverage is below
+        ``scoring.new_scoring_min_anchor_coverage`` scores every candidate
+        with this formula.
         """
         tier = coerce_tier(tier)
         base = TIER_BASE[tier]
@@ -5859,6 +5870,37 @@ class Scheduler:
         cpm_bonus = self.config.cpm_beta * math.log1p(max(0, transitive_count))
         bonus = min(age_bonus + cpm_bonus, float(TIER_WIDTH - 1))
         return float(base) + bonus
+
+    def _compute_score(
+        self,
+        tier: str,
+        *,
+        age_secs: float,
+        transitive_count: int,
+        has_work_product: bool,
+    ) -> float:
+        """The C2 dispatch score: tier base plus three independently budgeted terms.
+
+        No term is clipped against another, and ScoringConfig's validators keep
+        the budgets' sum inside one tier (plans/scheduler-dispatch-scoring-and-
+        lock-layer-prd.md C2, I-1, I-2).  Keyword-only so a caller can never
+        hand a newer-task count where seconds are meant.
+        """
+        cfg = self.config.scoring
+        cpm = cfg.cpm_budget * math.log1p(min(max(0, transitive_count), cfg.cpm_d_cap)) / math.log1p(cfg.cpm_d_cap)
+        a = max(0.0, age_secs)
+        age = cfg.age_budget * a / (a + cfg.age_half_secs)
+        continuity = cfg.continuity_credit if has_work_product else 0.0
+        return float(TIER_BASE[coerce_tier(tier)]) + cpm + age + continuity
+
+    def _has_work_product(self, task: dict) -> bool:
+        """Whether *task* already carries work worth resuming (PRD C3).
+
+        Task γ owns the real predicate.  Until it lands this is False for every
+        task, the fail-safe: no live score gains ``continuity_credit`` before
+        γ's zero-progress gating exists.
+        """
+        return False
 
     def _emit_override_diff_events(
         self,
@@ -7859,6 +7901,54 @@ class Scheduler:
             task_id=pin.task_id, task=pin.task, modules=modules
         ))
 
+    def _note_anchor_coverage(self, task_ids: list[str], readings: list[AnchorReading]) -> bool:
+        """Run the tick's arming gate and deliver its verdict: the event, then any L1."""
+        verdict = self._anchor_gate.observe(
+            task_ids, readings, threshold=self.config.scoring.new_scoring_min_anchor_coverage,
+        )
+        if verdict.coverage_low is not None and self.event_store:
+            self.event_store.emit(
+                EventType.scoring_anchor_coverage_low, task_id=None, data=asdict(verdict.coverage_low),
+            )
+        if verdict.escalation is not None:
+            file_sentinel_l1(self.escalation_queue, verdict.escalation)
+        return verdict.armed
+
+    def _score_candidates(self, ctx: TickContext) -> list[tuple[float, str, dict, str]]:
+        """Score every candidate of the tick, best first, as ``(score, task_id, task, tier)``.
+
+        Precondition: ``ctx.candidates`` is non-empty — an empty tick ends in
+        an earlier phase.
+
+        The I-6 arming gate decides the formula for the WHOLE tick: when the
+        share of candidates with a usable ``pending_since`` anchor reaches
+        ``scoring.new_scoring_min_anchor_coverage``, every candidate scores on
+        C2; otherwise every candidate scores on the legacy formula, so one
+        tick's ordering always comes from one comparable scale.
+        """
+        now = self._wall_now()
+        task_ids = [str(t.get('id', '')) for t in ctx.candidates]
+        readings = [read_pending_age(t, now) for t in ctx.candidates]
+        armed = self._note_anchor_coverage(task_ids, readings)
+
+        scored: list[tuple[float, str, dict, str]] = []
+        for tid, t, reading in zip(task_ids, ctx.candidates, readings, strict=True):
+            pri = ctx.effective_priorities.get(tid, coerce_tier(t.get('priority')))
+            transitive = ctx.transitive_counts.get(tid, 0)
+            if armed:
+                score = self._compute_score(
+                    pri,
+                    age_secs=reading.age_secs,
+                    transitive_count=transitive,
+                    has_work_product=self._has_work_product(t),
+                )
+            else:
+                score = self._compute_score_legacy(pri, self._compute_age(tid, ctx.max_id), transitive)
+            scored.append((score, tid, t, pri))
+
+        scored.sort(key=lambda entry: (-entry[0], _numeric_id(entry[1]), entry[1]))
+        return scored
+
     async def _phase_select_scored(self, ctx: TickContext) -> object:
         """Score each candidate and dispatch the best available.
 
@@ -7869,19 +7959,11 @@ class Scheduler:
         ``TickOutcome(TaskAssignment)`` on a successful dispatch, or
         ``TickOutcome(None)`` once the loop is exhausted with no acquire
         (the top candidate's skip counter is bumped either way it is
-        passed over). Higher score wins; ties broken by task_id string
-        order (stable, FIFO-ish for numeric ids).
+        passed over). Higher score wins; equal scores dispatch the
+        numerically smaller (older) id first, and non-numeric ids after every
+        numeric one, in string order.
         """
-        scored: list[tuple[float, str, dict, str]] = []
-        for t in ctx.candidates:
-            tid = str(t.get('id', ''))
-            pri = ctx.effective_priorities.get(tid, coerce_tier(t.get('priority')))
-            age = self._compute_age(tid, ctx.max_id)
-            transitive = ctx.transitive_counts.get(tid, 0)
-            score = self._compute_score(pri, age, transitive)
-            scored.append((score, tid, t, pri))
-
-        scored.sort(key=lambda entry: (-entry[0], entry[1]))
+        scored = self._score_candidates(ctx)
 
         # DEBUG: log the top 3 so α/β tuning is post-hoc diagnosable.
         if logger.isEnabledFor(logging.DEBUG):
@@ -7991,9 +8073,9 @@ class Scheduler:
     async def acquire_next(self) -> TaskAssignment | None:
         """Find next eligible task under the value/h scoring model.
 
-        Dispatch order is determined by ``_compute_score()``: tier base is
-        dominant, age + CPM bonuses order tasks within a tier, and
-        per-tier slot caps reserve headroom for higher-value work.
+        Dispatch order is determined by ``_score_candidates()``: tier base is
+        dominant, age + CPM (+ continuity) bonuses order tasks within a tier,
+        and per-tier slot caps reserve headroom for higher-value work.
 
         Returns ``None`` immediately when the scheduler is paused (park-stop).
         No MCP round-trips, no GC, no override snapshots are performed while
@@ -8068,7 +8150,7 @@ class Scheduler:
                 continue
             status_map[tid] = t.get('status', 'unknown')
             tasks_by_id[tid] = t
-            if tid.isdigit():
+            if tid.isdecimal():
                 max_id = max(max_id, int(tid))
 
         # Maintain age anchors (resurrected tasks reset their anchor).

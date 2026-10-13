@@ -4,6 +4,7 @@ import fnmatch
 import hashlib
 import importlib.resources
 import logging
+import math
 import os
 import re
 import stat
@@ -80,6 +81,15 @@ TIER_BASE: dict[str, int] = {
     'low': 2000,
     'polish': 1000,
 }
+
+# Defaults of ScoringConfig's sub-budgets (plans/scheduler-dispatch-scoring-and-
+# lock-layer-prd.md C2).  Each bonus term is bounded by its own budget, and the
+# budgets together stay inside one TIER_WIDTH (I-1), so no term masks another.
+CPM_BUDGET: float = 300.0
+CPM_D_CAP: int = 32
+AGE_BUDGET: float = 500.0
+AGE_HALF_SECS: float = 259200.0
+CONTINUITY_CREDIT: float = 120.0
 
 # Per-process warn-once dedup for coerce_tier()'s unrecognized-value WARNING
 # below, keyed by a length-capped repr(value) (safe for unhashable/non-str
@@ -580,6 +590,86 @@ class FairnessConfig(BaseModel):
                 )
             )
         return int(self.skip_threshold)
+
+
+class ScoringConfig(BaseModel):
+    """Dispatch-score sub-budgets (task 3819; plans/scheduler-dispatch-scoring-and-lock-layer-prd.md C2).
+
+    A candidate scores ``TIER_BASE[tier]`` plus three bonus terms, each capped
+    by its own budget, so a saturated term can never mask the others:
+    critical-path weight (``cpm_budget``), pending age (``age_budget``) and
+    work-product continuity (``continuity_credit``).  The scheduler arms this
+    formula only on ticks where at least ``new_scoring_min_anchor_coverage``
+    of the candidates carry a usable ``pending_since`` anchor (PRD I-6).
+
+    Plain BaseModel (no ``validate_assignment``) so ``_set_leaf`` can write a
+    multi-leaf retune one leaf at a time — see :class:`MergeDeepConfig`.  The
+    cross-leaf invariants still bind a reload: ``apply_reload`` re-validates
+    the whole config afterwards and rolls back on failure.  Every leaf is
+    green-tier (PRD D8).
+    """
+
+    cpm_budget: float = Field(
+        default=CPM_BUDGET,
+        gt=0,
+        description='Ceiling of the critical-path term, reached at cpm_d_cap transitive dependents (PRD C2).',
+    )
+    cpm_d_cap: int = Field(
+        default=CPM_D_CAP,
+        ge=1,
+        description='Transitive-dependent count at which the critical-path term saturates (PRD C2).',
+    )
+    age_budget: float = Field(
+        default=AGE_BUDGET,
+        gt=0,
+        description='Ceiling the pending-age term approaches as a task waits (PRD C2).',
+    )
+    age_half_secs: float = Field(
+        default=AGE_HALF_SECS,
+        gt=0,
+        description='Seconds pending at which the age term reaches half of age_budget (PRD C2).',
+    )
+    continuity_credit: float = Field(
+        default=CONTINUITY_CREDIT,
+        ge=0,
+        description='Flat credit for a task that already carries work product (PRD C2).',
+    )
+    new_scoring_min_anchor_coverage: float = Field(
+        default=0.90,
+        ge=0.0,
+        le=1.0,
+        description=(
+            'Share of a tick\'s candidates that must carry a usable pending_since '
+            'anchor for that tick to score on the sub-budget formula; below it the '
+            'whole tick falls back to the legacy formula (PRD D12, I-6).'
+        ),
+    )
+
+    @model_validator(mode='after')
+    def _reject_budget_sum_crossing_tier(self) -> 'ScoringConfig':
+        total = self.cpm_budget + self.age_budget + self.continuity_credit
+        if total > TIER_WIDTH - 1:
+            raise ValueError(
+                'ScoringConfig.cpm_budget + age_budget + continuity_credit '
+                f'({self.cpm_budget} + {self.age_budget} + {self.continuity_credit} '
+                f'= {total}) must be <= TIER_WIDTH - 1 ({TIER_WIDTH - 1}); a larger '
+                'sum lets a bonus lift a task across a priority-tier boundary. '
+                'Lower one of the three budgets.'
+            )
+        return self
+
+    @model_validator(mode='after')
+    def _reject_continuity_above_cpm_d4(self) -> 'ScoringConfig':
+        cpm_at_d4 = self.cpm_budget * math.log1p(4) / math.log1p(self.cpm_d_cap)
+        if self.continuity_credit >= cpm_at_d4:
+            raise ValueError(
+                f'ScoringConfig.continuity_credit ({self.continuity_credit}) must be '
+                f'< the critical-path term at four dependents ({cpm_at_d4:.4f}, from '
+                f'cpm_budget={self.cpm_budget} and cpm_d_cap={self.cpm_d_cap}); '
+                'otherwise resuming a half-done task outranks unblocking four others. '
+                'Lower continuity_credit, or raise cpm_budget.'
+            )
+        return self
 
 
 class StarvationWatchdogConfig(BaseModel):
@@ -4799,6 +4889,11 @@ class OrchestratorConfig(BaseSettings):
     # Scheduler fairness / anti-starvation
     fairness: FairnessConfig = Field(default_factory=FairnessConfig)
 
+    # Dispatch-score sub-budgets (task 3819).  An absent stanza yields the
+    # default instance; age_alpha / cpm_beta below remain the legacy formula's
+    # knobs, which the anchor-coverage gate still falls back to.
+    scoring: ScoringConfig = Field(default_factory=ScoringConfig)
+
     # Scheduler starvation watchdog (task 1880).
     starvation_watchdog: StarvationWatchdogConfig = Field(
         default_factory=StarvationWatchdogConfig,
@@ -5906,6 +6001,12 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # count that drifts reads as a checked claim and is not one — the check is
     # test_config.py::TestSessionResumeConfig::test_leaves_in_reloadable_fields.
     _submodel_leaf_paths('session_resume', SessionResumeConfig),
+    # Dispatch-score sub-budgets (task 3819, PRD D8) — same whole-submodel
+    # idiom.  Green-tier because a scoring retune used to cost a fleet restart,
+    # which is why the old age_alpha / cpm_beta constants were never tuned.
+    # I-1 / I-3 still bind a reload through apply_reload's whole-config
+    # re-validation.
+    _submodel_leaf_paths('scoring', ScoringConfig),
     # Unknown-config-key census escape hatch (task 2989) — same whole-submodel
     # idiom.  Green-tier ON PURPOSE: the born-at-L2 this census files tells the
     # operator to add a path to config_key_census.ignore and hot-reload, and a

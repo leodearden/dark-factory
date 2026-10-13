@@ -952,6 +952,15 @@ takes no arguments: it always re-reads that process's own
 - `unblock_auto.*`
 - `session_resume.*` (whole submodel, including the `restore_from_archive`
   rehydration kill switch — see [§14](#14-transcript-preservation--the-archival-guard))
+- `scoring.*` (whole submodel: the dispatch-score sub-budgets `cpm_budget`,
+  `cpm_d_cap`, `age_budget`, `age_half_secs` and `continuity_credit`, plus
+  the anchor-coverage arming threshold `new_scoring_min_anchor_coverage`), so
+  scoring is retuned without a fleet restart (PRD D8). A retune that breaks
+  the no-tier-crossing or continuity-subordination invariant is rejected and
+  rolled back whole. Normative homes:
+  `orchestrator/src/orchestrator/config.py::ScoringConfig` and
+  `plans/scheduler-dispatch-scoring-and-lock-layer-prd.md` §C2. The legacy
+  formula's `age_alpha` / `cpm_beta` stay restart-only.
 - `verify_env`
 - `verify_cgroup_cpu_weight_merge` / `_task` / `_background` (the per-role
   cgroup `CPUWeight` a verify scope is spawned with when
