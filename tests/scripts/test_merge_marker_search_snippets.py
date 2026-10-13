@@ -24,7 +24,18 @@ Nothing here skips: a missing git, bash or skill file fails.
 """
 from __future__ import annotations
 
+import re
+import textwrap
 from typing import NamedTuple
+
+COUNTEREXAMPLE_MARKER = 'marker-search-guard: counterexample'
+
+_FIXED_STRINGS_FLAG = re.compile(r'--fixed-strings|(?<=\s)-F(?=\s)')
+_FENCE_OPEN = re.compile(r'^\s*(`{3,})[^`]*$')
+_FENCE_CLOSE = re.compile(r'^\s*(`{3,})\s*$')
+_INLINE_SPAN = re.compile(r'(?<!`)`([^`]+)`(?!`)')
+_BLANK_LINE = re.compile(r'\n\s*\n')
+_SOFT_WRAP = re.compile(r'\s*\n\s*')
 
 
 class MarkerSearch(NamedTuple):
@@ -33,8 +44,86 @@ class MarkerSearch(NamedTuple):
     shell: str
 
 
+class _Fence(NamedTuple):
+    opener: int
+    closer: int
+
+
+class _Snippet(NamedTuple):
+    first_line: int
+    last_line: int
+    shell: str
+
+
 def marker_searches(markdown: str, *, source: str) -> list[MarkerSearch]:
-    raise NotImplementedError
+    lines = markdown.split('\n')
+    fences = _fences(lines)
+    snippets = [
+        *(_fenced_snippet(lines, fence) for fence in fences),
+        *_inline_snippets(_blank_fences(lines, fences)),
+    ]
+    return [
+        MarkerSearch(source, snippet.first_line, snippet.shell)
+        for snippet in sorted(snippets, key=lambda snippet: snippet.first_line)
+        if _is_marker_search(snippet.shell) and not _opts_out(lines, snippet)
+    ]
+
+
+def _fences(lines: list[str]) -> list[_Fence]:
+    fences: list[_Fence] = []
+    index = 0
+    while index < len(lines):
+        opener = _FENCE_OPEN.match(lines[index])
+        if opener is None:
+            index += 1
+            continue
+        closer = _closing_fence(lines, index, len(opener.group(1)))
+        fences.append(_Fence(index, closer))
+        index = closer + 1
+    return fences
+
+
+def _closing_fence(lines: list[str], opener: int, run_length: int) -> int:
+    for index in range(opener + 1, len(lines)):
+        closer = _FENCE_CLOSE.match(lines[index])
+        if closer is not None and len(closer.group(1)) >= run_length:
+            return index
+    return len(lines)
+
+
+def _fenced_snippet(lines: list[str], fence: _Fence) -> _Snippet:
+    body = textwrap.dedent('\n'.join(lines[fence.opener + 1 : fence.closer]))
+    return _Snippet(fence.opener + 1, min(fence.closer + 1, len(lines)), body)
+
+
+def _blank_fences(lines: list[str], fences: list[_Fence]) -> str:
+    fenced = {index for fence in fences for index in range(fence.opener, fence.closer + 1)}
+    return '\n'.join('' if index in fenced else line for index, line in enumerate(lines))
+
+
+def _inline_snippets(prose: str) -> list[_Snippet]:
+    return [
+        _Snippet(
+            _line_number(prose, span.start()),
+            _line_number(prose, span.end() - 1),
+            _SOFT_WRAP.sub(' ', span.group(1)),
+        )
+        for span in _INLINE_SPAN.finditer(prose)
+        if _BLANK_LINE.search(span.group(1)) is None
+    ]
+
+
+def _line_number(text: str, offset: int) -> int:
+    return text.count('\n', 0, offset) + 1
+
+
+def _is_marker_search(shell: str) -> bool:
+    return '--grep' in shell and _FIXED_STRINGS_FLAG.search(shell) is not None
+
+
+def _opts_out(lines: list[str], snippet: _Snippet) -> bool:
+    occupied = lines[snippet.first_line - 1 : snippet.last_line]
+    return any(COUNTEREXAMPLE_MARKER in line for line in occupied)
 
 
 _SYNTHETIC_SKILL = r"""# Synthetic skill
