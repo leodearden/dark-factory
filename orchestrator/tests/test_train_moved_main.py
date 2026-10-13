@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, call, patch
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
 from _merge_lane_fakes import lane_scene_config, make_lane, merge_through_lane
+from _merge_lane_verifier_doubles import ScriptedVerifier
 from _orch_helpers import git_env_with_ceiling
 from _recording_event_store import _RecordingEventStore
 from df_pytest_isolation import git_redirect_env
@@ -39,7 +40,6 @@ from orchestrator.verify import VerifyResult
 
 pytestmark = pytest.mark.asyncio
 
-_VERIFY_TARGET = 'orchestrator.merge_lane.worker.run_scoped_verification'
 _CAS_DERAIL_REASON = 'Train merge advance failed: cas_failed'
 
 _MEMBER_A, _MEMBER_B, _TIP = _MEMBERS = ('mm-a', 'mm-b', 'mm-c')
@@ -201,7 +201,8 @@ class _VerifyCall:
 
 
 class _VerifyDouble:
-    """``run_scoped_verification`` stand-in that can move main while it runs.
+    """The train's scoped verify, injected through ``ScriptedVerifier``, that
+    can move main while it runs.
 
     Call *n* (1-based) records what it saw, then commits a drift with
     *mover* when *n* is in *move_on*, then answers red when *n* is in
@@ -246,9 +247,11 @@ async def _run_train(
     scene: _Scene, train: _Train, verify: _VerifyDouble, store: _RecordingEventStore,
 ) -> MergeOutcome:
     queue: asyncio.Queue[Any] = asyncio.Queue()
-    lane = make_lane(scene.git_ops, queue, event_store=store)
-    with patch(_VERIFY_TARGET, side_effect=verify.run_scoped_verification):
-        return await merge_through_lane(lane, queue, train.request)
+    lane = make_lane(
+        scene.git_ops, queue,
+        verifier=ScriptedVerifier(verify.run_scoped_verification), event_store=store,
+    )
+    return await merge_through_lane(lane, queue, train.request)
 
 
 def _events(store: _RecordingEventStore, event_type: str) -> list[dict[str, Any]]:

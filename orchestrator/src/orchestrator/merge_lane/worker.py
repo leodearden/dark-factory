@@ -5504,9 +5504,10 @@ class _TrainMergeHost(Protocol):
     the narrow statement of what the train pipeline touches.
     """
 
-    # ── Git / event dependencies ──────────────────────────────────────────
+    # ── Git / event / verify dependencies ─────────────────────────────────
     _git_ops: GitOps
     _event_store: EventStore | None
+    _verifier: VerifyPort
 
     # ── Per-task counters (mutated by shared helpers) ─────────────────────
     _post_merge_verify_timeouts: dict[str, int]
@@ -7194,11 +7195,11 @@ async def _do_train_merge(
             f'but merge_worktree is None'
         )
 
-    # (e) Workspace-wide post-merge verify via the shared helper.
-    # _run_post_merge_verify runs the pre-verify disk guard, the scoped
-    # verification (with ENOSPC prune-retry), and the timeout loop-breaker
-    # bookkeeping.  Returns None when verify passes; returns a MergeOutcome
-    # (and cleans up merge_wt) when any controlled failure fires.
+    # (e) Workspace-wide post-merge verify via the shared helper, on the
+    # worker's injected VerifyPort. _run_post_merge_verify runs the pre-verify
+    # disk guard, the scoped verification (with ENOSPC prune-retry), and the
+    # timeout loop-breaker bookkeeping.  Returns None when verify passes;
+    # returns a MergeOutcome (and cleans up merge_wt) on a controlled failure.
     # Routing note (λ, task 2589, T1): this ultimately threads role='merge'
     # and force_workspace=req.config.merge_verify_workspace into
     # run_scoped_verification (via LocalRunner._run, verify_runner.py) —
@@ -7218,6 +7219,7 @@ async def _do_train_merge(
         event_store=event_store,
         escalation_queue=getattr(worker, '_escalation_queue', None),
         task_client=getattr(worker, '_flake_task_client', None),
+        verifier=worker._verifier,
     )
 
     async def train_verify(*args: Any, **kwargs: Any) -> MergeOutcome | None:
