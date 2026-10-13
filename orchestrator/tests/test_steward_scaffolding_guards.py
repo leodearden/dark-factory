@@ -54,7 +54,7 @@ from __future__ import annotations
 
 import ast
 import functools
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from pathlib import Path
 from types import MappingProxyType
 from typing import NamedTuple
@@ -435,6 +435,45 @@ def _recurrence_swept_modules() -> tuple[tuple[Path, ast.Module], ...]:
     return tuple(
         (p, t) for p, t in _scan_tests_tree().modules if p.name != _CANONICAL_OWNER
     )
+
+
+class TestCensusTree:
+    """The seam every census below is built on, driven over a real ``tmp_path``
+    tree so no test here triggers a full-tree scan.
+
+    Synthetic sources stay inside string literals: the censuses parse THIS
+    module too, and a real construction or assert block here would self-trip.
+    """
+
+    def test_it_maps_each_module_to_its_own_findings_and_names_what_did_not_parse(
+        self, tmp_path,
+    ) -> None:
+        (tmp_path / 'a.py').write_text('steward = TaskSteward()\n', encoding='utf-8')
+        (tmp_path / 'sub').mkdir()
+        (tmp_path / 'sub' / 'b.py').write_text('x = 1\n', encoding='utf-8')
+        (tmp_path / 'broken.py').write_text('def f(:\n', encoding='utf-8')
+
+        census = _census_tree(tmp_path, _steward_construction_sites)
+
+        assert census.parsed == ('a.py', 'sub/b.py')
+        assert [entry.split(':', 1)[0] for entry in census.unparseable] == ['broken.py']
+        assert dict(census.sites) == {'a.py': ('1 (constructs TaskSteward)',)}
+        assert not isinstance(census.sites, MutableMapping), (
+            'the census is memoised and shared, so its sites must be read-only'
+        )
+
+    def test_it_applies_no_exclusion_of_its_own(self, tmp_path) -> None:
+        """Exclusions belong to the consuming guard: the recurrence guard drops the canonical owner, while the tmp-literal census must keep it."""
+        (tmp_path / '_orch_helpers.py').write_text(
+            'def assert_sandboxed_project_root(project_root, tmp_path):\n'
+            '    assert isinstance(project_root, Path)\n'
+            '    assert project_root.resolve().is_relative_to(tmp_path.resolve())\n',
+            encoding='utf-8',
+        )
+
+        census = _census_tree(tmp_path, _inline_sandbox_asserts)
+
+        assert '_orch_helpers.py' in census.sites
 
 
 class TestNoInlineSandboxedProjectRootAsserts:
