@@ -3574,6 +3574,43 @@ class TestWatcherTerminalDispositions:
 
 
 # ---------------------------------------------------------------------------
+# task 3726: the remaining explicit park sites end in a terminal disposition
+# ---------------------------------------------------------------------------
+
+_DECLARED_PINS_HEADING = '### Declared pins: a close can be REFUSED (`declared_pin_refused`)'
+_CURATOR_RUNG_HEADING = '#### Curator-origin records — promote, never re-file'
+
+
+class TestWatcherNoParkingSites:
+    """Sites that used to park a record, or report it to the unread digest."""
+
+    def test_candidate_pin_is_promoted(self) -> None:
+        section = _skill_section(_watcher_skill_text(), _DECLARED_PINS_HEADING)
+        assert 'promote_to_l2' in section, (
+            'a candidate pin (load-bearing, no pin_declared_by) must be '
+            'promoted: promotion is the only channel by which a human learns '
+            'to run declare_pin, and no component reads the digest'
+        )
+
+    def test_curator_origin_rung_promotes_and_never_refiles(self) -> None:
+        section = _skill_section(_watcher_skill_text(), _CURATOR_RUNG_HEADING)
+        code = '\n'.join(_fenced_code_blocks(section))
+        assert 'mcp__escalation__promote_to_l2(' in code, (
+            'the curator-origin rung must end in a promote_to_l2 call'
+        )
+        assert 'submit_task(' not in code, (
+            'the curator-origin rung must never file through the curator that '
+            'produced the record: that loops watcher -> curator -> watcher'
+        )
+        missing = [role for role in _CURATOR_ORIGIN_ROLES if role not in section]
+        assert not missing, (
+            'the rung discriminates on producer agent_role '
+            '(curator_escalator.py::_curator_escalation, ticket_janitor.py); '
+            f'missing: {missing}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # task 2629 step-3: _watcher_has_actionable_l1 — empty-queue rotation precheck
 # ---------------------------------------------------------------------------
 
