@@ -324,6 +324,10 @@ class TestNumericTieBreak:
         assert await _dispatch_order(tasks) == ['3', '12', 'alpha', 'zeta']
 
     @pytest.mark.asyncio
+    async def test_a_digit_that_int_cannot_parse_is_a_non_numeric_id(self):
+        assert await _dispatch_order([_task('\u00b2'), _task('7')]) == ['7', '\u00b2']
+
+    @pytest.mark.asyncio
     async def test_score_still_dominates_the_tie_break(self):
         tasks = [_task('5', priority='medium'), _task('500', priority='high')]
 

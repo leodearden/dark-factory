@@ -1104,7 +1104,7 @@ def _anchorless_ids(candidates: list[dict], readings: list[AnchorReading]) -> li
 
 def _numeric_id(task_id: str) -> float:
     """The dispatch tie-break rank of *task_id*: older numeric ids first, any non-numeric id last (PRD I-4)."""
-    return float(int(task_id)) if task_id.isdigit() else math.inf
+    return float(int(task_id)) if task_id.isdecimal() else math.inf
 
 
 def _resolve_time_source(ts: Callable[[], float] | None) -> Callable[[], float]:
@@ -5876,7 +5876,7 @@ class Scheduler:
             if tid in self._was_non_pending:
                 # Resurrection — start fresh from now.
                 self._pending_anchor[tid] = max_id
-            elif tid.isdigit():
+            elif tid.isdecimal():
                 self._pending_anchor[tid] = int(tid)
             else:
                 self._pending_anchor[tid] = max_id
@@ -8298,7 +8298,7 @@ class Scheduler:
                 continue
             status_map[tid] = t.get('status', 'unknown')
             tasks_by_id[tid] = t
-            if tid.isdigit():
+            if tid.isdecimal():
                 max_id = max(max_id, int(tid))
 
         # Maintain age anchors (resurrected tasks reset their anchor).

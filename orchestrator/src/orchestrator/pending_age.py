@@ -3,8 +3,8 @@
 fused-memory stamps ``pending_since`` on every landing in ``pending``
 (``sqlite_task_backend.py::stamp_pending_since``).  This module is the one
 reader of that anchor (plans/scheduler-dispatch-scoring-and-lock-layer-prd.md
-INV-5): the scheduler's scorer and the starvation watchdog's eligible age both
-read it here, so they cannot disagree about how long a task has waited.
+INV-5); the scheduler's scorer reads it here.  ``pending_age_secs`` is the
+PRD's C1 reader contract, kept as the entry point for any further consumer.
 """
 
 import enum
