@@ -302,6 +302,7 @@ def _seed_state(project_id, *, outcomes, last_recorded_at=None):
             budget_suppressed=False,
             capped=False,
             scheduled=False,
+            census=None,
             **full,
         )
     return doc
