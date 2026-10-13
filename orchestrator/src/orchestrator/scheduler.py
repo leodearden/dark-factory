@@ -85,7 +85,7 @@ from orchestrator.sentinel_l1 import file_sentinel_l1
 from orchestrator.streaks import StreakCounter, StreakRegistry
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
 
-# How long a task is remembered as having been non-pending (task 5352).  An
+# How long a task is remembered as owed an age reset (task 5352).  An
 # upper bound on the subject, not a tuning dial: thirty days is the horizon
 # over which a resurrected task could still be pending and still be claiming
 # an age bonus it did not earn.  The longest of the four guard TTLs because
@@ -2395,25 +2395,15 @@ class Scheduler:
         # currently-dispatched task so acquire_next can count slots at-or-below
         # a candidate's tier without re-walking the full task graph.
         self._dispatched_priority: dict[str, str] = {}
-        # Age-anchor bookkeeping for score(): first time we see a task as
-        # pending, we record its age baseline.  Cleared on transition to any
-        # non-pending status so a cancelled->pending resurrection starts
-        # fresh (no accumulated age).
+        # Age-anchor bookkeeping for score(): one anchor per task while it is
+        # in the active fetch.  A reset is owed only once the task has left
+        # that fetch; the rule is D3 in
+        # plans/scheduler-dispatch-scoring-and-lock-layer-prd.md.  The owed
+        # mark is restart-durable (task 5352) and is NOT the state snapshot,
+        # which is a write-only observability artifact.
         self._pending_anchor: dict[str, int] = {}
-        # The mark that makes that resurrection reset stick.  Restart-durable
-        # since task 5352: held in memory, it was cleared by the ~8-15h fleet
-        # redeploy, so a resurrected task re-anchored to its own (low) numeric
-        # id and collected its full accumulated age bonus again — once per
-        # redeploy, at the expense of the genuinely-old pending tasks the
-        # starvation watchdog is there to protect.  It decays after
-        # _RESURRECTION_GUARD_TTL, so the mark cannot outlive its subject.
-        #
-        # NOT the state-snapshot path: scheduler_state.json is a throttled,
-        # content-deduped, write-only OBSERVABILITY artifact that is never read
-        # back as authoritative state, and overloading it would make a
-        # dashboard file load-bearing for dispatch fairness.
-        self._was_non_pending: MutableSet[str] = PersistentSet(
-            guard_path(self._project_root, 'scheduler_was_non_pending.json'),
+        self._age_reset_owed: MutableSet[str] = PersistentSet(
+            guard_path(self._project_root, 'scheduler_age_reset_owed.json'),
             ttl=_RESURRECTION_GUARD_TTL,
         )
         # Effective-priority cache: populated at the end of each acquire_next tick
@@ -5827,8 +5817,9 @@ class Scheduler:
         """Return this task's age, in "newer-task-count" units.
 
         Anchors are lazily initialized in :meth:`_update_age_anchors`; they
-        reset to the *current* max_id on resurrection so a cancelled→pending
-        task does not inherit accumulated age.
+        reset to the *current* max_id when a task returns after leaving the
+        active population, so a resurrected task does not inherit accumulated
+        age.
         """
         anchor = self._pending_anchor.get(task_id)
         if anchor is None:
@@ -5836,48 +5827,46 @@ class Scheduler:
         return max(0, max_id - anchor)
 
     def _update_age_anchors(self, tasks: list[dict], max_id: int) -> None:
-        """Maintain per-task age anchors across ticks.
+        """Maintain one age anchor per task while it is in the active fetch.
 
-        - First time we see a task as pending with no prior non-pending
-          history, anchor to its own numeric id (so genuinely-old pending
-          tasks carry accumulated age from the start).
-        - First time we see a task as pending after having seen it
-          non-pending, anchor to *current max_id* (resurrection resets age).
-        - On any non-pending observation, drop the anchor and mark the task
-          as ever-non-pending so the next pending appearance is a fresh start.
+        The rule is D3 in
+        ``plans/scheduler-dispatch-scoring-and-lock-layer-prd.md``: only a
+        task that left the active population and came back has its wait reset.
 
-        That last mark survives a restart (task 5352), so a resurrection resets
-        age ONCE rather than once per fleet redeploy.  The marks are collected
-        here and recorded in a single batch after the loop: this method
-        re-observes every non-pending task on every ~15s tick, and a cold start
-        seeing N of them would otherwise perform N writes of an N-entry file.
-        Batching is safe by construction — a task has exactly one status, so
-        the branch that WRITES a mark (non-pending) and the branch that READS
-        one (pending) are mutually exclusive within a single call, and no id can
-        be both.
+        - A task's first sighting, whatever its active status, anchors it:
+          to *max_id* if a reset is owed, else to its own numeric id (so a
+          genuinely-old task carries its accumulated age), else to *max_id*.
+        - An active status never drops the anchor, so a requeue, an unblock
+          or an undefer keeps the task's wait.
+        - A terminal status drops the anchor and marks a reset as owed, as
+          :meth:`_phase_stale_sweep` does for a task that left the fetch.
+
+        The marks survive a restart (task 5352) and are recorded in one batch
+        after the loop, because a tick observing N departures would otherwise
+        perform N writes of an N-entry file.  Batching is safe by
+        construction: a task has exactly one status, so the branch that
+        WRITES a mark (terminal) and the branch that READS one (active) are
+        mutually exclusive within a single call.
         """
-        newly_non_pending: set[str] = set()
+        departed: set[str] = set()
         for t in tasks:
             tid = str(t.get('id', ''))
             if not tid:
                 continue
             status = t.get('status', '')
-            if status != 'pending':
+            if not status or status in TERMINAL_STATUSES:
                 self._pending_anchor.pop(tid, None)
                 if status:
-                    newly_non_pending.add(tid)
-                continue
-            if tid in self._pending_anchor:
-                continue
-            # First-seen pending for this tid.
-            if tid in self._was_non_pending:
-                # Resurrection — start fresh from now.
-                self._pending_anchor[tid] = max_id
-            elif tid.isdecimal():
-                self._pending_anchor[tid] = int(tid)
-            else:
-                self._pending_anchor[tid] = max_id
-        self._was_non_pending |= newly_non_pending
+                    departed.add(tid)
+            elif tid not in self._pending_anchor:
+                self._pending_anchor[tid] = self._first_sight_anchor(tid, max_id)
+        self._age_reset_owed |= departed
+
+    def _first_sight_anchor(self, tid: str, max_id: int) -> int:
+        """The anchor for a task this process has not anchored yet."""
+        if tid in self._age_reset_owed or not tid.isdecimal():
+            return max_id
+        return int(tid)
 
     def _compute_score_legacy(
         self,
@@ -6706,7 +6695,7 @@ class Scheduler:
         ``_module_cache`` / ``_pending_anchor`` entries for tasks that are
         (a) in a terminal status, or (b) absent from tasks_by_id
         (active-only filter dropped them), recording each dropped id in
-        ``_was_non_pending`` and ``ctx.stale_ids``. Then sweeps every
+        ``_age_reset_owed`` and ``ctx.stale_ids``. Then sweeps every
         registered ``StreakRegistry`` counter (task 2124) via
         ``self._streak_registry.gc`` — CONSUMED here, not re-collapsed
         into a hand loop — unioning in tasks that left the candidate pool
@@ -6730,7 +6719,7 @@ class Scheduler:
         """
         stale_ids: set[str] = set()
         terminal_ids: set[str] = set()
-        newly_non_pending: set[str] = set()
+        departed: set[str] = set()
         all_tracked: set[str] = (
             set(self._last_dispatch_at)
             | set(self._skip_count)
@@ -6746,11 +6735,11 @@ class Scheduler:
                 self._skip_count.pop(tid_str, None)
                 self._module_cache.pop(tid_str, None)
                 self._pending_anchor.pop(tid_str, None)
-                newly_non_pending.add(tid_str)
+                departed.add(tid_str)
                 stale_ids.add(tid_str)
         # Recorded in one batch, for the same reason as _update_age_anchors:
         # this sweep re-observes the same terminal ids on every tick.
-        self._was_non_pending |= newly_non_pending
+        self._age_reset_owed |= departed
         starvation_non_eligible = {
             tid for tid in self._starvation_escalated
             if ctx.status_map.get(tid) in _STARVATION_NON_ELIGIBLE
