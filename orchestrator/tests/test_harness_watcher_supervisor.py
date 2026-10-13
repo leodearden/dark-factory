@@ -3114,6 +3114,9 @@ class TestWatcherSupervisorLoopRecoveryResolvesL2:
 # task 1501: _WATCHER_ALLOWED_TOOLS must include promote_to_l2
 # ---------------------------------------------------------------------------
 
+_FILING_PAIR = ('mcp__fused-memory__submit_task', 'mcp__fused-memory__resolve_ticket')
+
+
 class TestWatcherAllowedTools:
     """_WATCHER_ALLOWED_TOOLS includes the L2-promotion tool (task 1501)."""
 
@@ -3175,6 +3178,31 @@ class TestWatcherAllowedTools:
             'silently blind the drain to archived L2s (task 3999); '
             f'current list: {_WATCHER_DISALLOWED_TOOLS}'
         )
+
+    def test_filing_pair_is_granted(self) -> None:
+        """submit_task and resolve_ticket must be allowed, and not disallowed.
+
+        allowed_tools reaches the CLI as --allowed-tools, an ALLOWLIST
+        (shared/src/shared/cli_invoke.py), and MCP tools are not covered by
+        permission-bypass mode (SKILL.md "Headless-mode permission gotchas"),
+        so an unnamed MCP tool is permission-denied: a silent no-op.
+        Both entries are load-bearing: submit_task returns only a tkt_
+        ticket, and resolve_ticket is the only call that yields the task id
+        the escalation's resolution must cite (task 3726).
+        """
+        for tool in _FILING_PAIR:
+            assert tool in _WATCHER_ALLOWED_TOOLS, (
+                f'{tool} must be in _WATCHER_ALLOWED_TOOLS so the watcher can '
+                'file a finding and close its escalation citing the filed '
+                'task id (submit_task yields only a ticket; resolve_ticket '
+                'yields the task id) (task 3726); '
+                f'current list: {_WATCHER_ALLOWED_TOOLS}'
+            )
+            assert tool not in _WATCHER_DISALLOWED_TOOLS, (
+                f'{tool} must not be in _WATCHER_DISALLOWED_TOOLS — that would '
+                'silently strip the convert-to-tracked-work filing action '
+                f'(task 3726); current list: {_WATCHER_DISALLOWED_TOOLS}'
+            )
 
 
 # ---------------------------------------------------------------------------
