@@ -9,6 +9,7 @@ import logging
 import os
 import time
 import uuid as uuid_mod
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -657,27 +658,40 @@ def _canonicalize_project_id_arg(project_id: str) -> tuple[str, dict[str, str] |
 _AMBIGUOUS_UUID_PREFIX = 'ambiguous_uuid_prefix'
 
 
-async def _answer_prefix_read(
-    id_resolver: IdResolver, project_id: str, prefix: str, *, serves: Namespace,
-) -> str | dict[str, Any]:
-    """Answer a read tool's prefix-shaped id argument (PRD C4).
+@dataclass(frozen=True)
+class _ResolvedId:
+    """The prefix named exactly one live id in the tool's namespace: read *full_id*."""
 
-    Returns the FULL id to read when the prefix names exactly one live id in
-    the *serves* namespace; otherwise the tool's whole response: the outage
-    (``prefix_checked: False``, never a miss — INV-11), the ambiguity refusal
-    with its candidates, or the miss report of what each namespace holds.
+    full_id: str
+
+
+@dataclass(frozen=True)
+class _PrefixResponse:
+    """The prefix named no one readable id: *body* is the tool's whole response."""
+
+    body: dict[str, Any]
+
+
+async def _resolve_or_respond(
+    id_resolver: IdResolver, project_id: str, prefix: str, *, serves: Namespace,
+) -> _ResolvedId | _PrefixResponse:
+    """Resolve a read tool's prefix-shaped id argument, or answer for the tool (PRD C4).
+
+    The response is the outage (``prefix_checked: False``, never a miss —
+    INV-11), the ambiguity refusal with its candidates, or the miss report of
+    what each namespace holds.
     """
     try:
         resolution = await id_resolver.resolve_prefix(project_id, prefix)
     except ResolverUnavailable as exc:
-        return {
+        return _PrefixResponse({
             **resolver_unavailable_body(exc),
             'prefix': prefix,
             'project_id': project_id,
             'prefix_checked': False,
-        }
+        })
     if resolution.outcome == 'ambiguous':
-        return {
+        return _PrefixResponse({
             'error': (
                 f'{prefix!r} is the prefix of {len(resolution.candidates)} ids; '
                 'pass the full uuid of the one you mean'
@@ -687,17 +701,17 @@ async def _answer_prefix_read(
             'project_id': project_id,
             'prefix_checked': True,
             'candidates': [candidate._asdict() for candidate in resolution.candidates],
-        }
+        })
     if resolution.outcome == 'unique' and resolution.candidates[0].namespace == serves:
-        return resolution.candidates[0].id
-    return {
+        return _ResolvedId(resolution.candidates[0].id)
+    return _PrefixResponse({
         'found': False,
         'prefix_checked': True,
         'prefix': prefix,
         'project_id': project_id,
         'namespaces': await id_resolver.miss_report(project_id, prefix, resolution),
         'hint': _prefix_miss_hint(prefix, resolution, serves),
-    }
+    })
 
 
 def _prefix_miss_hint(prefix: str, resolution: Resolution, serves: Namespace) -> str:
@@ -5007,10 +5021,11 @@ def create_mcp_server(
             return err
         resolved_from_prefix: str | None = None
         if is_uuid_prefix(memory_id):
-            answer = await _answer_prefix_read(_resolver(), project_id, memory_id, serves='mem0')
-            if isinstance(answer, dict):
-                return answer
-            resolved_from_prefix, memory_id = memory_id, answer
+            match await _resolve_or_respond(_resolver(), project_id, memory_id, serves='mem0'):
+                case _PrefixResponse(body=response):
+                    return response
+                case _ResolvedId(full_id=full_id):
+                    resolved_from_prefix, memory_id = memory_id, full_id
         elif err := validate_full_uuid(memory_id, field_name='memory_id'):
             return err
         record = await memory_service.get_memory_by_id(
@@ -5199,9 +5214,11 @@ def create_mcp_server(
         can mask duplicate-node pathology.
 
         An 8-31 lowercase-hex PREFIX naming exactly one Entity node is read
-        through to it (the result gains ``resolved_from_prefix``); any other
-        prefix returns get_memory_by_id's miss report, ambiguity refusal or
-        ``resolver_unavailable`` shape instead of a NodeNotFoundError.
+        through to it (the result gains ``resolved_from_prefix``, as does the
+        NodeNotFoundError, with the resolved ``entity_uuid``, if the node is
+        gone by read time); any other prefix returns get_memory_by_id's miss
+        report, ambiguity refusal or ``resolver_unavailable`` shape instead of
+        a NodeNotFoundError.
 
         Args:
             entity_uuid: UUID of the Entity node to look up, or a prefix of one
@@ -5217,23 +5234,24 @@ def create_mcp_server(
             return err
         resolved_from_prefix: str | None = None
         if is_uuid_prefix(entity_uuid):
-            answer = await _answer_prefix_read(
+            match await _resolve_or_respond(
                 _resolver(), project_id, entity_uuid, serves='graphiti_node',
-            )
-            if isinstance(answer, dict):
-                await _log_read(
-                    operation='get_entity_by_uuid',
-                    project_id=project_id,
-                    agent_id=agent_id,
-                    session_id=session_id,
-                    params={'entity_uuid': entity_uuid},
-                    result_summary={
-                        'prefix_checked': answer['prefix_checked'],
-                        'outcome': answer.get('error_type', 'miss_report'),
-                    },
-                )
-                return answer
-            resolved_from_prefix, entity_uuid = entity_uuid, answer
+            ):
+                case _PrefixResponse(body=response):
+                    await _log_read(
+                        operation='get_entity_by_uuid',
+                        project_id=project_id,
+                        agent_id=agent_id,
+                        session_id=session_id,
+                        params={'entity_uuid': entity_uuid},
+                        result_summary={
+                            'prefix_checked': response['prefix_checked'],
+                            'outcome': response.get('error_type', 'miss_report'),
+                        },
+                    )
+                    return response
+                case _ResolvedId(full_id=full_id):
+                    resolved_from_prefix, entity_uuid = entity_uuid, full_id
         try:
             result = await memory_service.get_entity_by_uuid(
                 entity_uuid=entity_uuid, project_id=project_id
@@ -5266,7 +5284,10 @@ def create_mcp_server(
                 params={'entity_uuid': entity_uuid},
                 result_summary={'found': False},
             )
-            return {'error': str(e), 'error_type': type(e).__name__}
+            miss = {'error': str(e), 'error_type': type(e).__name__}
+            if resolved_from_prefix is not None:
+                miss |= {'entity_uuid': entity_uuid, 'resolved_from_prefix': resolved_from_prefix}
+            return miss
         except Exception as e:
             await _log_read(
                 operation='get_entity_by_uuid',

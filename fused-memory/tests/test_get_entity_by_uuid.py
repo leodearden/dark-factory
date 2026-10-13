@@ -189,6 +189,20 @@ class TestGetEntityByUuidPrefixArm:
         svc.get_entity_by_uuid.assert_awaited_once_with(entity_uuid=_NODE, project_id='reify')
 
     @pytest.mark.asyncio
+    async def test_a_node_deleted_between_resolution_and_read_still_says_it_was_resolved(self):
+        svc = self._service(miss=True)
+        resolver = make_resolver(graphiti=FakeGraphiti(nodes={_NODE: 'Resolver'}))
+
+        result = await self._call(svc, resolver, 'bff81530')
+
+        assert result == {
+            'error': 'Entity node not found',
+            'error_type': 'NodeNotFoundError',
+            'entity_uuid': _NODE,
+            'resolved_from_prefix': 'bff81530',
+        }
+
+    @pytest.mark.asyncio
     async def test_a_prefix_with_no_live_match_is_a_miss_report(self):
         svc = self._service()
 
