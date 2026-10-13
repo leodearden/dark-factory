@@ -125,7 +125,7 @@ _WIRING_UNCHECKED = 'which judge add_memory injects'
 
 _BAND_CANONICAL = 'parent-1'
 #: The slate's evidence child: the top-scoring candidate, and the one
-#: `_canonical_id_of` hoists to `_BAND_CANONICAL`. It is on the slate (that is
+#: `canonical_id_of` hoists to `_BAND_CANONICAL`. It is on the slate (that is
 #: what makes the band's canonical an id nobody carries) but it may never be
 #: DESIGNATED, because a correct remedy is obliged to hoist it.
 _EVIDENCE_CHILD = 'child-1'
@@ -282,7 +282,7 @@ class TestConsumptionProbe:
     ):
         """A correct option-(a) fix HOISTS, and must not be told to stop.
 
-        ``_canonical_id_of``'s own contract makes the hoist mandatory:
+        ``canonical_id_of``'s own contract makes the hoist mandatory:
         attaching to a child creates a grandchild that can never fold under the
         true canonical, which reads as content loss. So a remedy that threads
         the designation still has to hoist a designated CHILD to its parent —

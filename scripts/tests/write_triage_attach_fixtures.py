@@ -19,7 +19,7 @@ may import nothing but the stdlib — the same constraint, for the same reason, 
 the judge fixtures in ``test_check_write_triage_flip_preconditions.py``.
 
 WHAT IS MIRRORED FROM MAIN, and why it has to be. ``decide_band`` reproduces
-main's max-cosine selection AND ``_canonical_id_of``'s child hoisting, because
+main's max-cosine selection AND ``canonical_id_of``'s child hoisting, because
 the hoist is what makes the band's canonical an id that belongs to no candidate
 in the slate — which is exactly what separates "the attach followed the judge's
 designation" from "the attach used the band's winner". A fixture that skipped
@@ -36,7 +36,7 @@ TRIAGE_PREAMBLE = r'''"""Standalone stand-in for fused_memory.server.write_triag
 Dependency-free by construction: the probe imports this out of a bare directory
 tree, so it may import nothing but the stdlib.
 
-decide_band mirrors main's EXACTLY, including _canonical_id_of's hoist of a
+decide_band mirrors main's EXACTLY, including canonical_id_of's hoist of a
 CHILD winner to its parent_id — so on the probe's fixture slate the band's
 canonical is an id no candidate carries as its own.
 """
@@ -99,7 +99,7 @@ def _cosine_of(result):
     return None
 
 
-def _canonical_id_of(result):
+def canonical_id_of(result):
     """The id a write attaches to for *result*, HOISTING a child to its parent."""
     meta = getattr(result, 'metadata', None) or {}
     if meta.get('kind') in CHILD_KINDS:
@@ -122,10 +122,10 @@ def decide_band(results, *, t_high, t_low):
         return BandDecision(OUTCOME_STORED, None, None, t_high, t_low)
     if t_high is not None and similarity >= t_high:
         return BandDecision(
-            OUTCOME_RESTATED, _canonical_id_of(best), similarity, t_high, t_low,
+            OUTCOME_RESTATED, canonical_id_of(best), similarity, t_high, t_low,
         )
     return BandDecision(
-        OUTCOME_JUDGE, _canonical_id_of(best), similarity, t_high, t_low,
+        OUTCOME_JUDGE, canonical_id_of(best), similarity, t_high, t_low,
     )
 
 
@@ -383,7 +383,7 @@ triage_write = _make_designating_triage_write(_decode)
 
 
 #: A CORRECT option-(a) remedy — and the one shape a naive "the attach id
-#: equals the designated id" test false-FAILs. ``_canonical_id_of``'s own
+#: equals the designated id" test false-FAILs. ``canonical_id_of``'s own
 #: contract makes the hoist MANDATORY: attaching to a child would create a
 #: grandchild that can never fold under the true canonical, which reads as
 #: content loss. So a remedy that threads the designation must still hoist a
@@ -399,10 +399,10 @@ def _decode(verdict):
 
 
 def _attach_hoisted(candidate_id, candidates, decision):
-    """Honour the designation, then hoist it as _canonical_id_of mandates."""
+    """Honour the designation, then hoist it as canonical_id_of mandates."""
     for candidate in candidates or ():
         if getattr(candidate, 'id', None) == candidate_id:
-            return _canonical_id_of(candidate)
+            return canonical_id_of(candidate)
     return decision.canonical_id
 
 

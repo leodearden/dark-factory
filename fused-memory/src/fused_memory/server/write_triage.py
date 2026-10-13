@@ -417,7 +417,7 @@ def declares_attach_keys(metadata: Any) -> bool:
     return any(key in metadata for key in ATTACH_OWNED_KEYS)
 
 
-def _canonical_id_of(result: MemoryResult) -> str:
+def canonical_id_of(result: MemoryResult) -> str:
     """The id a write should attach to for *result* — hoisting a CHILD.
 
     A sighting or amendment record is itself attached to something, and
@@ -507,7 +507,7 @@ def decide_band(
 
     ``canonical_id`` is a CANONICAL id, not merely "the winning result's id":
     a winner that is itself a sighting or amendment child is HOISTED to its
-    parent by :func:`_canonical_id_of`, so the attach can never produce a
+    parent by :func:`canonical_id_of`, so the attach can never produce a
     grandchild that one-level grouping cannot fold. Only the attach TARGET
     moves — ``similarity`` stays the winner's own measured cosine, because
     that is the evidence actually observed against the submitted text.
@@ -535,11 +535,11 @@ def decide_band(
     # from t_low up. See the docstring: this is measured, not a fallback.
     if t_high is not None and similarity >= t_high:
         return BandDecision(
-            OUTCOME_RESTATED, _canonical_id_of(best), similarity, t_high, t_low,
+            OUTCOME_RESTATED, canonical_id_of(best), similarity, t_high, t_low,
         )
 
     return BandDecision(
-        OUTCOME_JUDGE, _canonical_id_of(best), similarity, t_high, t_low,
+        OUTCOME_JUDGE, canonical_id_of(best), similarity, t_high, t_low,
     )
 
 
@@ -944,7 +944,7 @@ def _apply_judge_verdict(
     *answer* is what the judge returned — a :class:`TriageJudgeVerdict` (its
     ``usage`` is ignored here), any ``(outcome, candidate_id)`` pair, or a bare
     outcome word naming no candidate. A verdict naming a candidate attaches to that retrieved record,
-    hoisted by :func:`_canonical_id_of` exactly as the band's winner is; one
+    hoisted by :func:`canonical_id_of` exactly as the band's winner is; one
     naming none attaches to the band's winner. ``stored`` attaches nothing, so
     it carries no canonical a caller could mistake for an endorsement.
 
@@ -976,7 +976,7 @@ def _apply_judge_verdict(
     return replace(
         decision,
         outcome=verdict.outcome,
-        canonical_id=_canonical_id_of(judged),
+        canonical_id=canonical_id_of(judged),
         judged_candidate_id=verdict.candidate_id,
     )
 

@@ -751,7 +751,7 @@ class TestSelectJudgeCandidates:
         assert len(selected) <= 3
 
     def test_the_winner_is_present_even_when_hoisted(self) -> None:
-        """`_canonical_id_of` HOISTS a child winner to its parent id.
+        """`canonical_id_of` HOISTS a child winner to its parent id.
 
         So `decision.canonical_id` can name a record that is not itself in the
         result set at all. The parent is what the attach targets, so when the

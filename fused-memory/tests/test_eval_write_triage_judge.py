@@ -2664,7 +2664,7 @@ class TestTheAttachTargetIsTheJudgedCandidate:
     """A judged attach lands on the candidate the verdict NAMED, hoisted.
 
     `write_triage.py::_apply_judge_verdict` files a middle-band attach against
-    `_canonical_id_of(named record)`, and against the band winner only when
+    `canonical_id_of(named record)`, and against the band winner only when
     the verdict named nothing. The row's `attach_target_*` describe that
     record, so `score_attachments` scores production's attach.
     """
@@ -2941,7 +2941,7 @@ class TestPlanFromSlates:
         assert (provenance['candidate_count'], provenance['distractor_count']) == (2, None)
 
     def test_a_hoisted_child_counts_as_the_canonical_on_the_slate(self) -> None:
-        """`_canonical_id_of` hoists a sighting to its parent, so a slate
+        """`canonical_id_of` hoists a sighting to its parent, so a slate
         holding only the CHILD still shows the model the match."""
         slates = [
             _slate('c1-dup-1', candidates=[_live('child', canonical_id='c1-canon')],

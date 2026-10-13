@@ -24,7 +24,7 @@ from typing import Any
 
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.write_triage import (
-    _canonical_id_of,
+    canonical_id_of,
     decide_band,
     retrieve_candidates,
 )
@@ -153,14 +153,14 @@ def normalize(result: MemoryResult) -> dict[str, Any]:
 
     The metadata survives whole because it carries ``store_score`` — the
     cosine ``decide_band`` and ``select_judge_candidates`` both read — and the
-    ``kind``/``parent_id`` pair ``_canonical_id_of`` hoists on.
+    ``kind``/``parent_id`` pair ``canonical_id_of`` hoists on.
     """
     metadata = dict(result.metadata or {})
     return {
         'memory_id': result.id,
         'content': result.content,
         'category': metadata.get('category'),
-        'canonical_id': _canonical_id_of(result),
+        'canonical_id': canonical_id_of(result),
         'store_score': metadata.get('store_score'),
         'metadata': metadata,
     }
