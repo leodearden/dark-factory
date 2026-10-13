@@ -237,6 +237,102 @@ deleted past 30 days, then oldest-first until the tree is under 500MB
 (`verify.py::_prune_archive`). `flaky-ledger.jsonl` sits one level up, in
 `data/verify-logs/` itself, and is deliberately outside that sweep.
 
+### Reading a task-verify admission wait
+
+Before a gated verify leg (role `task`, a task's own verify, or role
+`background`, the main-tip sweep and the review checkpoint) takes its
+cross-process flock slot in `shared.verify_admission`, it queues in an
+in-process admission gate (`orchestrator/src/orchestrator/verify_admission_gate.py`).
+The gate decides whose turn it is. The flock stays behind it as the
+cross-process safety net. Merge verifies are ungated and touch neither. Design
+and contract: `plans/verify-admission-fifo-prd.md`.
+
+**The knobs.** All three are green-tier through `reload_config`:
+
+| Knob | Default | Meaning |
+|------|---------|---------|
+| `verify_admission_order` | `unordered` | `unordered`: the turn goes to a random waiter, as the flock's poll race did before the gate. `arrival`: the lowest (role class, plan arrival, leg sequence), so task legs go before background legs. A verify call's legs, retries included, share one arrival stamp. |
+| `verify_admission_background_promote_secs` | `7200` | A background waiter queued this long ranks with the task class but keeps its original arrival: it never overtakes a task that arrived before it, and later tasks stop overtaking it. |
+| `verify_admission_wait_alarm_secs` | `43200` | The waiter age that raises `verify_admission_wait_aged`. |
+
+The order and the slot count (`verify_admission_task_slots`) apply from the
+next grant, the promotion age from the next ranking, and the alarm age from the
+next watch tick.
+
+**The events.** They are written to `<project_root>/data/orchestrator/runs.db`,
+table `events`, keyed by `event_type`, with the payload as JSON in `data`. Each
+payload shape is stated once, in the comment on its `EventType` member in
+`orchestrator/src/orchestrator/event_store.py`, and a plan's legs are
+`orchestrator/src/orchestrator/verify_admission_record.py::AdmissionLeg`:
+
+- `verify_admission_plan`: one row per gated verify call, written when it
+  returns with an admitted leg (`outcome` `returned`), or when it raises while
+  admission is on (`outcome` `raised`). A cancelled call writes none. `legs`
+  holds one entry per admitted test leg, retries and env-recovery re-runs
+  included.
+- `verify_admission_heartbeat`: written by the harness `verify-admission-watch`
+  service every 300s, and only while a waiter is queued.
+- `verify_admission_wait_aged`: written by the same watch when the oldest
+  waiter past the alarm age first appears, and again only when that waiter
+  changes. It only reports the age; nothing times a wait out.
+
+**Reading a task stuck in `phase=verify`.** Start with the latest heartbeats:
+
+```bash
+sqlite3 data/orchestrator/runs.db <<'SQL'
+SELECT timestamp,
+       json_extract(data, '$.depth')                              AS depth,
+       json_extract(data, '$.oldest.task_id')                     AS oldest_task,
+       round(json_extract(data, '$.oldest_wait_secs') / 3600, 1)  AS oldest_h,
+       json_extract(data, '$.holders')                            AS holders,
+       json_extract(data, '$.order')                              AS "order"
+FROM events
+WHERE event_type = 'verify_admission_heartbeat'
+ORDER BY id DESC LIMIT 5;
+SQL
+```
+
+- `depth` is how many legs are queued, `oldest` is the longest waiter, and
+  `holders` shows who has the turns now and for how long. A task listed among
+  the holders is running, not waiting. On a running orchestrator, no heartbeat
+  newer than about 300s means nothing is queued.
+- `verify_admission_wait_aged` names the oldest waiter that has passed the
+  alarm age.
+- After the verify returns, its `verify_admission_plan` legs split each
+  leg's wait in two. `waited_secs` is the time queued in this process's gate.
+  `flock_wait_secs` is the time from the gate's grant until the cross-process
+  flock slot was held, so a slot held by another process shows up there.
+  `held_secs` runs from the grant until the turn was handed back, the flock
+  wait included. `slot_held = false` means the flock failed open, so that leg
+  ran without cross-process gating. `order` records which ordering admitted
+  it:
+
+```bash
+sqlite3 data/orchestrator/runs.db <<'SQL'
+SELECT e.timestamp,
+       json_extract(leg.value, '$.module')           AS module,
+       json_extract(leg.value, '$.waited_secs')      AS waited_secs,
+       json_extract(leg.value, '$.flock_wait_secs')  AS flock_wait_secs,
+       json_extract(leg.value, '$.held_secs')        AS held_secs,
+       json_extract(leg.value, '$.slot_held')        AS slot_held,
+       json_extract(leg.value, '$.order')            AS "order"
+FROM events AS e, json_each(e.data, '$.legs') AS leg
+WHERE e.event_type = 'verify_admission_plan' AND e.task_id = '<task_id>'
+ORDER BY e.id DESC;
+SQL
+```
+
+A call that raised, typically a `VerifyInfraError` that the workflow then
+retries as a new call, writes a row with `outcome` `raised` and no legs. Its
+wait is not measured, and this leg query shows nothing for it.
+
+**Measuring the ordering.** Split the rows by each event's `order` field, never
+by date: a reload can flip the order at any moment, and a plan whose legs ran
+under both orders records `order` as null. Arrival order targets the tail of
+the wait (p90 and max), not the mean wait or the throughput. Leg statistics
+leave out every raised call, so count the `outcome` `raised` rows in the same
+window before treating a p90 or a max as complete.
+
 ### Reading the merge-lane throughput baseline
 
 ```bash
@@ -2658,13 +2754,20 @@ supersedes `data/afk-digest.md`, which was last written 2026-08-19.
 
 1. **Prepare.** A headless `claude --print` run on Fable follows the
    prepare-sitting mode's nightly form and records its judgement (options,
-   ramifications, a recommendation or an explicit no-lean) with
-   `prepare_sitting.py record`. It is read-only by construction: it runs
+   ramifications, a recommendation or an explicit no-lean). Its one write
+   channel is a per-run inbox, `data/sitting/inbox/<run>/`: it writes JSON
+   batch files there and runs `prepare_sitting.py record --from <file>`.
+   It is read-only otherwise, by construction: it runs
    under `--permission-mode dontAsk`, with an allowlist and an explicit
-   denylist of every apply verb, both in `nightly_prepare.py`, and its
-   environment sets `SITTING_NIGHTLY_CONFINED`, under which
-   `prepare_sitting.py` refuses anything but `brief` and `record` into
-   `data/sitting/`, including `--apply-closes` and `--ledger`. Its only MCP
+   denylist of every apply verb, both in `nightly_prepare.py`, reading no
+   settings file (`--setting-sources ''`), and its
+   environment sets `SITTING_NIGHTLY_CONFINED` to the run's inbox. The CLI
+   allow rule plus the absence of settings files confine the agent's own
+   file writes to that inbox. `prepare_sitting.py` confines in code what
+   `record` reads (a `.json` file directly in that inbox, never stdin or
+   another path, so never an earlier night's batch) and where it writes
+   (the default store in `data/sitting/`), and refuses everything but `brief`
+   and `record`, including `--apply-closes` and `--ledger`. Its only MCP
    servers are the `escalation` and `fused-memory` blocks of the checkout's
    `.mcp.json`, passed with `--strict-mcp-config`, so its reads never depend
    on the project config being approved for a headless run, and playwright
@@ -2685,6 +2788,7 @@ is no commit seam, unlike the 05:00 census:
 | `data/return-brief.md` | The page |
 | `data/sitting/ledger-nightly.json` | The night's item numbering, carried over from the night before so an item keeps its number; a watcher seeds its sitting from it |
 | `data/sitting/preparation.json` | The prepared judgement, per open item |
+| `data/sitting/inbox/<run>/` | The night's batch files, kept for forensics |
 
 **The regen commands**, which are the two invocations the wrapper makes, run
 from the repo root:
@@ -2709,11 +2813,15 @@ journalctl --user -u return-brief.service -n 100
 systemctl --user list-timers return-brief.timer
 ```
 
-- `prepare=1` means the Fable run failed, timed out or hit a usage limit;
-  its log line carries both stream tails. That is routine, not an incident:
+- `prepare=1` means the Fable run failed, timed out, hit a usage limit or
+  recorded nothing; its log line carries both stream tails, or, for a run
+  that recorded nothing, the counts of what the inbox offered and could not decode. That is
+  routine, not an incident:
   the page is still written, and items the run did not reach show as
   `awaiting preparation`. The page's header says how fresh the preparation
-  is.
+  is. A run that finished well logs `nightly_prepare: done (... recorded=<n>
+  of <m>, undecodable=<u>, permission_denials=<d>)`; a high `undecodable`
+  means the agent's entries failed validation even though some were recorded.
 - `prepare=2` is a configuration error, such as no `claude` on the unit's
   PATH.
 - `brief=` other than 0 means the page was not written. That is the one

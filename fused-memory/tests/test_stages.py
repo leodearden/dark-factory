@@ -15093,6 +15093,75 @@ class TestIntegrityCheckContaminationCeilingWiring:
         )
 
 
+class TestIntegrityCheckSnapshotStatEdgeWiring:
+    """IntegrityCheck.run() applies filter_snapshot_stat_edge_findings for every
+    project and surfaces report.stats['snapshot_stat_edge_findings_dropped']
+    (task 3487). Mirrors TestIntegrityCheckContaminationCeilingWiring."""
+
+    @pytest.fixture
+    def config(self):
+        return ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+
+    @pytest.fixture
+    def mock_deps(self, config):
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+            'scope': _scope('dark_factory', '/tmp/test'),
+        }
+
+    async def _run(self, mock_deps, flags):
+        stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
+        stage.filtered_task_tree = None
+        base_report = StageReport(
+            stage=StageId.integrity_check,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=flags,
+            stats={},
+        )
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            return await stage.run(
+                events=[],
+                watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[],
+                run_id='run-3487',
+            )
+
+    @pytest.mark.asyncio
+    async def test_stat_edge_finding_dropped_for_a_non_blocked_project(self, mock_deps):
+        stat_edge_flag = {
+            'task_id': None,
+            'flag_type': 'stats_mismatch',
+            'category': 'memory_stale',
+            'description': 'Stage 2 reported task_count_snapshot_mem0_written=1 but no '
+                           'Graphiti temporal_facts edge exists',
+            'suggested_action': 'Investigate the rejected write',
+            'actionable': False,
+        }
+        benign_flag = {
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'category': 'missing_deliverable',
+            'description': 'task 42 has no design doc',
+            'suggested_action': 'Add a design doc',
+            'actionable': True,
+        }
+
+        report = await self._run(mock_deps, [stat_edge_flag, benign_flag])
+
+        assert report.items_flagged == [benign_flag]
+        assert report.stats['snapshot_stat_edge_findings_dropped'] == 1
+
+    @pytest.mark.asyncio
+    async def test_stat_is_zero_with_no_flags(self, mock_deps):
+        report = await self._run(mock_deps, [])
+
+        assert report.stats['snapshot_stat_edge_findings_dropped'] == 0
+
+
 class TestIntegrityCheckPhantomTaskCreationWiring:
     """IntegrityCheck.run() must apply filter_false_phantom_task_creation_flags
     and surface report.stats['phantom_task_creation_findings_dropped'] (task-2525

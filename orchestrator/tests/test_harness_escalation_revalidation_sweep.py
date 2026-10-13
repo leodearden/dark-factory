@@ -710,6 +710,7 @@ def _make_main_tip_harness(*, main_sha: str) -> Harness:
     h._last_swept_main_sha = 'stale-' + main_sha[:6]
     h._run_store = None
     h._main_sweep_cold_control = None
+    h.event_store = None
     return h
 
 

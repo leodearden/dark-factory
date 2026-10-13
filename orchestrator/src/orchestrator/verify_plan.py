@@ -201,7 +201,7 @@ class PlannedRun:
     ScopeKind.FILE_SCOPED``** — FULL_SUITE is deliberately unscoped and
     SKIPPED/TRIVIAL never ran, so empty is the correct and MEANINGFUL value
     there, not an absence of information. (Pinned by tests, deliberately not
-    by a ``__post_init__`` assert: ``verify._safe_derive_verify_plan_dict``
+    by a ``__post_init__`` assert: ``verify._safe_derive_executed_fallback_plan``
     swallows exceptions and returns ``None``, so an assert here would
     degrade an invariant violation into losing the ENTIRE plan record —
     silently destroying the very observability this field exists to supply.)

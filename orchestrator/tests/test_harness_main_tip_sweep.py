@@ -99,6 +99,7 @@ def _make_sweep_harness(
     h._last_swept_main_sha = None
     h._run_store = run_store
     h._main_sweep_cold_control = None
+    h.event_store = None
     return h
 
 

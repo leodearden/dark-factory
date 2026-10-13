@@ -30,9 +30,9 @@ per-item nor the class-level tier can exhaustively enumerate (see
 :func:`per_item_marker_names` and :func:`guaranteed_marker_names`), or a
 module with zero collected items resolves to "no widening" — i.e. precisely
 today's behaviour.  Widening is only ever chosen on positive proof.  Nothing
-here raises: ``verify._safe_derive_verify_plan_dict`` swallows exceptions and
-returns None, so a raise on a mid-edit ``pyproject.toml`` would silently
-destroy the ENTIRE plan record.
+here raises: ``verify.py::_safe_derive_executed_fallback_plan`` swallows
+exceptions and returns None, so a raise on a mid-edit ``pyproject.toml``
+would silently destroy the ENTIRE plan record.
 """
 from __future__ import annotations
 

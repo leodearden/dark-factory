@@ -45,6 +45,7 @@ from fused_memory.reconciliation.recon_self_model import (
     render_investigation_outcome_section,
     render_source_completion_section,
     render_task_creation_accounting_section,
+    render_task_hints_update_accounting_section,
 )
 from fused_memory.reconciliation.stale_gate_citation_guard import (
     render_gate_citation_section,
@@ -87,7 +88,9 @@ missing-summary finding (see ## Carry-Forward Missing-Summary Findings below).
 Task creation is a two-phase operation:
 
 1. Call `mcp__fused-memory__submit_task(project_root=..., title=..., description=..., \
-priority=..., metadata=...)` → returns `{{"ticket": "tkt_..."}}`.
+priority=..., metadata={{..., "_causation_id": <run_id>}})` → returns \
+`{{"ticket": "tkt_..."}}`. The `_causation_id` is what lets the framework journal the \
+curator's outcome against this run (see `## Task-Creation Accounting`).
 2. Call `mcp__fused-memory__resolve_ticket(ticket=..., project_root=...)` → blocks until \
 the curator decides, then returns `{{"status": ..., "task_id"?: ..., "reason"?: ...}}`.
 
@@ -370,7 +373,7 @@ was created — count it as a no-op, not a successful addition. Your stats \
 
 {_STAGE2_GRAPHITI_QUEUED_GUIDANCE}
 
-**Per-Cycle Counter Schema** — include all four of the following fields in your \
+**Per-Cycle Counter Schema** — include all six of the following fields in your \
 structured `stats` output (omitting them causes Stage 3's flag-accounting audit to \
 report ambiguous or missing data):
 - `flag_deleted_records`: list of `{{"action": "flag_deleted", "flag_id": ..., \
@@ -393,12 +396,22 @@ report ambiguous or missing data):
   if Stage 1 emitted no flagged_items.
 - `task_created_records`: list of `{{"action": "task_created", "task_id": ..., \
   "status": "created"|"combined", "project_id": ..., "source_path": ...}}` dicts, \
-  one per confirmed task creation (see `## Task-Creation Accounting` below). The \
-  framework CORROBORATES each record before using it: it looks the `task_id` up \
-  via `get_task` against the root of the record's own `project_id`, and repairs \
-  `tasks_created` upward only to the number of records whose task is confirmed to \
-  exist. A record naming a task that cannot be confirmed will NOT raise the \
-  counter, so record only creations you actually made.
+  one per confirmed `resolve_ticket` outcome (see `## Task-Creation Accounting` \
+  below). The framework repairs `tasks_created` (status `created`) and \
+  `tasks_combined` (status `combined`) upward only, to the union of this run's \
+  journaled curator outcomes and the records whose task it confirms to exist via \
+  `get_task` against the root of the record's own `project_id`. A record naming a \
+  task that cannot be confirmed will NOT raise a counter, so record only outcomes \
+  you actually got.
+- `tasks_combined`: count of `resolve_ticket` outcomes with status `combined` — \
+  candidates the curator folded into an existing task. Never counted under \
+  `tasks_created`. Set to 0 if there were none.
+- `task_hints_updated_records`: list of `{{"action": "task_hints_updated", \
+  "task_id": ..., "project_id": ..., "entities": [...], "queries": [...]}}` dicts, \
+  one per SUPERSET-confirmed `memory_hints` attach (see \
+  `## Task-Hints-Update Accounting` below). The framework re-reads each task and \
+  repairs `tasks_hints_updated` upward only for records whose stored hints contain \
+  every recorded entry.
 
 These two counters are orthogonal: a flag may appear as a Mem0 marker \
 (`stage1_mem0_flags_processed`) or as a structured analytical finding \
@@ -439,7 +452,8 @@ well have run the stage and lost only the ledger write.
 ## Verifying Task Operations
 After `mcp__fused-memory__resolve_ticket` returns `status="created"` or \
 `status="combined"` with a `task_id`, treat as authoritative success — increment \
-`tasks_created` directly. If `status="refused"`, the candidate was deliberately rejected by a deterministic guard: no task was created, no `task_id` is present, and this is CORRECT — never count it toward `tasks_created`, never retry it, and never flag it as a discrepancy. \
+`tasks_created` for `created` and `tasks_combined` for `combined` (never \
+`tasks_created`: a combined candidate mints no new task id). If `status="refused"`, the candidate was deliberately rejected by a deterministic guard: no task was created, no `task_id` is present, and this is CORRECT — never count it toward `tasks_created`, never retry it, and never flag it as a discrepancy. \
 Otherwise, if `task_id` is missing from the `resolve_ticket` response, \
 skip the `tasks_created` increment and flag the discrepancy in your structured report. \
 `status="failed"` is never counted toward `tasks_created` regardless of whether a \
@@ -553,6 +567,8 @@ stat unless the response payload or a follow-up verification confirms the expect
 outcome.
 
 {render_task_creation_accounting_section()}
+
+{render_task_hints_update_accounting_section()}
 
 ## Knowledge-Deletion Absence Pre-Check
 Before deleting ANY knowledge edge or Mem0 entry that is attributed to a task being \

@@ -184,6 +184,7 @@ from orchestrator.task_status import (
     is_infra_held,
 )
 from orchestrator.usage_gate import UsageGate
+from orchestrator.verify_admission_watch import ADMISSION_WATCH_INTERVAL_SECS, AdmissionWatch
 from orchestrator.verify_categories import FailureCategory
 from orchestrator.workflow import (
     ResumeFailure,
@@ -2089,6 +2090,7 @@ class Harness:
         self._last_swept_main_sha: str | None = None
         # Bound on the first sweep tick, once run() has opened runs.db (task 5812).
         self._main_sweep_cold_control: MainSweepColdControl | None = None
+        self._admission_watch = AdmissionWatch()
 
         # Deterministic-strand reconciliation sweep — task 2074.
         # Periodic recovery sweep for deterministic gate/deploy tasks stranded
@@ -2326,14 +2328,16 @@ class Harness:
         escalation-server, merge-worker, offline-lane, orphan-l0-reaper,
         terminal-status-watcher, watcher-supervisor, stranded-reconcile,
         main-tip-sweep, no-landings-breaker, deterministic-recon-sweep,
-        warm-lane-gc, stale-service-restart, merge-heartbeat.
+        warm-lane-gc, stale-service-restart, merge-heartbeat,
+        verify-admission-watch.
         escalation-server and merge-worker start first so the recovery block
         (which runs immediately after ``start_all()`` returns) can depend on
         both being live. The seven sweeps are conditionally registered on
         their own ``config.X_enabled`` gate — ``BackgroundService`` itself has
         no ``enabled`` field (PRD §5.3 shape); a disabled sweep is simply
-        absent from the registry. The last two always run: they must keep
-        their cadence whatever the dispatch loop is doing (task 5344).
+        absent from the registry. The last three always run: they must keep
+        their cadence whatever the dispatch loop is doing (task 5344; the
+        verify-admission watch, task 5628).
         """
         if self._lifecycle is not None:
             return
@@ -2443,7 +2447,29 @@ class Harness:
             stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
             max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
         ))
+        registry.register(BackgroundService(
+            name='verify-admission-watch',
+            pass_fn=self._run_verify_admission_watch_pass,
+            interval_secs=ADMISSION_WATCH_INTERVAL_SECS,
+            backoff=sweep_backoff,
+            stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
+            max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
+        ))
         self._lifecycle = registry
+
+    async def _run_verify_admission_watch_pass(self) -> None:
+        """One tick of the task-verify admission watch on this process's gate.
+
+        Every knob is read per tick, so a reload applies from the next one.
+        """
+        if self.event_store is None:
+            return
+        self._admission_watch.tick(
+            self.event_store,
+            slots_dir=Path(self.config.verify_admission_slots_dir),
+            alarm_secs=self.config.verify_admission_wait_alarm_secs,
+            order=self.config.verify_admission_order,
+        )
 
     async def _run_orphan_l0_reaper_pass(self) -> None:
         """Async ``pass_fn`` wrapper for the orphan-L0 pass.
@@ -15037,6 +15063,7 @@ class Harness:
         # (closes the TOCTOU window — suggestion 2 from the code review).
         outcome = await verify_mod.run_main_tip_sweep(
             self.config, self.git_ops, main_sha=main_sha, seed_mode=seed_mode,
+            event_store=self.event_store,
         )
         if outcome is None:
             # Infra failure in the sweep itself — retry next tick, don't mark swept.

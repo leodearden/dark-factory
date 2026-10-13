@@ -2637,197 +2637,6 @@ class TestConfirmTaskAbsent:
 
 
 # ---------------------------------------------------------------------------
-# task-2525 step-1: confirm_task_present (RED tests)
-# ---------------------------------------------------------------------------
-
-
-class TestConfirmTaskPresent:
-    """RED tests for confirm_task_present(get_task_result) (task-2525 step-1).
-
-    confirm_task_present is the positive-present inverse of confirm_task_absent:
-    returns True ONLY when the result positively confirms the task DOES exist
-    (a plain task-record dict, no error keys, carrying at least one
-    task-identity key). Any not-found, inconclusive, or non-dict result
-    returns False (fail-safe: uncertain presence must never be treated as
-    corroboration).
-
-    RED until step-2 adds confirm_task_present to flag_dedup.py.
-    """
-
-    def test_true_for_valid_task_record(self):
-        """Returns True for a valid task record dict carrying several identity keys."""
-        from fused_memory.reconciliation.flag_dedup import confirm_task_present
-
-        task_record = {
-            'id': '42',
-            'title': 'Some real task',
-            'status': 'in-progress',
-            'dependencies': [],
-        }
-        assert confirm_task_present(task_record) is True, (
-            'confirm_task_present must return True for a valid task record'
-        )
-
-    def test_true_for_dict_with_only_task_id_key(self):
-        """Returns True when the only identity key present is 'task_id'."""
-        from fused_memory.reconciliation.flag_dedup import confirm_task_present
-
-        minimal_record = {'task_id': '42'}
-        assert confirm_task_present(minimal_record) is True, (
-            "confirm_task_present must return True when 'task_id' is the only identity key"
-        )
-
-    def test_false_for_not_found_error_dict(self):
-        """Returns False for the canonical not-found error dict (task is absent, not present)."""
-        from fused_memory.reconciliation.flag_dedup import confirm_task_present
-
-        not_found = {
-            'error': 'TASKMASTER_TOOL_ERROR: No tasks found for ID(s): 42',
-            'error_type': 'TaskmasterError',
-        }
-        assert confirm_task_present(not_found) is False, (
-            'confirm_task_present must return False for a not-found error dict'
-        )
-
-    def test_false_for_generic_inconclusive_error_dict(self):
-        """Returns False for a generic/inconclusive error dict (e.g. timeout)."""
-        from fused_memory.reconciliation.flag_dedup import confirm_task_present
-
-        timeout_error = {
-            'error': 'Connection timeout reaching Taskmaster backend',
-            'error_type': 'TimeoutError',
-        }
-        assert confirm_task_present(timeout_error) is False, (
-            'confirm_task_present must return False for inconclusive errors (fail-safe)'
-        )
-
-    def test_false_for_none(self):
-        """Returns False for None input (fail-safe)."""
-        from fused_memory.reconciliation.flag_dedup import confirm_task_present
-
-        assert confirm_task_present(None) is False, (
-            'confirm_task_present must return False for None (fail-safe)'
-        )
-
-    def test_false_for_empty_dict(self):
-        """Returns False for an empty dict (no identity keys => not confirmed present)."""
-        from fused_memory.reconciliation.flag_dedup import confirm_task_present
-
-        assert confirm_task_present({}) is False, (
-            'confirm_task_present must return False for an empty dict (fail-safe)'
-        )
-
-    def test_false_for_non_dict_inputs(self):
-        """Returns False for non-dict inputs (str, int, list, bool) — fail-safe."""
-        from fused_memory.reconciliation.flag_dedup import confirm_task_present
-
-        for bad in ['a task exists', 42, [], True]:
-            assert confirm_task_present(bad) is False, (
-                f'confirm_task_present must return False for non-dict {bad!r} (fail-safe)'
-            )
-
-
-# ---------------------------------------------------------------------------
-# task-3051 step-1: safe_get_task (RED tests)
-# ---------------------------------------------------------------------------
-
-
-class TestSafeGetTask:
-    """RED tests for the module-level ``safe_get_task`` (task 3051 step-1).
-
-    ``safe_get_task(taskmaster, task_id, project_root)`` is the single shared
-    one-task fetch every cross-project corroboration path routes through: it
-    returns the raw ``taskmaster.get_task`` result untouched on success and
-    normalises ANY exception to ``{'error': str(exc), 'error_type':
-    type(exc).__name__}``, so ``confirm_task_present`` / ``confirm_task_absent``
-    classify the raised-exception path exactly as they classify the MCP
-    wrapper's own error-dict path. That normalisation is also what lets every
-    caller keep using a PLAIN ``asyncio.gather``.
-
-    It is PUBLIC (no leading underscore) because task 3051 adds a call site
-    outside this module — ``task_knowledge_sync._corroborate_record_keys`` —
-    and one more private copy is exactly what this helper exists to prevent.
-    """
-
-    @pytest.mark.asyncio
-    async def test_returns_task_record_unchanged(self):
-        """A successful task-record result passes through byte-identical."""
-        from fused_memory.reconciliation.flag_dedup import safe_get_task
-
-        record = {'id': '3045', 'title': 'A real task', 'status': 'pending'}
-        taskmaster = AsyncMock()
-        taskmaster.get_task = AsyncMock(return_value=record)
-
-        result = await safe_get_task(taskmaster, '3045', '/repo/df')
-
-        assert result is record
-        assert flag_dedup.confirm_task_present(result) is True
-
-    @pytest.mark.asyncio
-    async def test_returns_error_dict_unchanged(self):
-        """A RETURNED error dict is passed through untouched, not re-wrapped."""
-        from fused_memory.reconciliation.flag_dedup import safe_get_task
-
-        error_dict = {
-            'error': 'TASKMASTER_TOOL_ERROR: No tasks found for ID(s): 9999',
-            'error_type': 'TaskmasterError',
-        }
-        taskmaster = AsyncMock()
-        taskmaster.get_task = AsyncMock(return_value=error_dict)
-
-        result = await safe_get_task(taskmaster, '9999', '/repo/df')
-
-        assert result is error_dict
-        assert flag_dedup.confirm_task_absent(result) is True
-
-    @pytest.mark.asyncio
-    async def test_forwards_task_id_and_project_root_positionally(self):
-        """task_id and project_root are forwarded POSITIONALLY, in that order."""
-        from fused_memory.reconciliation.flag_dedup import safe_get_task
-
-        taskmaster = AsyncMock()
-        taskmaster.get_task = AsyncMock(return_value={'id': '7'})
-
-        await safe_get_task(taskmaster, 7, '/repo/other')
-
-        taskmaster.get_task.assert_awaited_once_with(7, '/repo/other')
-
-    @pytest.mark.asyncio
-    async def test_normalises_not_found_exception_to_absent_error_dict(self):
-        """A RAISED TaskmasterError carrying the canonical not-found phrase
-        normalises to a dict that ``confirm_task_absent`` classifies exactly as
-        it classifies the returned error-dict path."""
-        from fused_memory.reconciliation.flag_dedup import safe_get_task
-
-        exc = TaskmasterError('TASKMASTER_TOOL_ERROR', 'No tasks found for ID(s): 9999')
-        taskmaster = AsyncMock()
-        taskmaster.get_task = AsyncMock(side_effect=exc)
-
-        result = await safe_get_task(taskmaster, '9999', '/repo/df')
-
-        assert result == {'error': str(exc), 'error_type': 'TaskmasterError'}
-        assert flag_dedup.confirm_task_absent(result) is True
-        assert flag_dedup.confirm_task_present(result) is False
-
-    @pytest.mark.asyncio
-    async def test_normalises_generic_exception_to_inconclusive_error_dict(self):
-        """A generic exception normalises to the same shape and is INCONCLUSIVE:
-        neither classifier fires, so it can neither corroborate presence nor
-        confirm absence."""
-        from fused_memory.reconciliation.flag_dedup import safe_get_task
-
-        exc = RuntimeError('backend down')
-        taskmaster = AsyncMock()
-        taskmaster.get_task = AsyncMock(side_effect=exc)
-
-        result = await safe_get_task(taskmaster, '3045', '/repo/df')
-
-        assert result == {'error': 'backend down', 'error_type': 'RuntimeError'}
-        assert flag_dedup.confirm_task_present(result) is False
-        assert flag_dedup.confirm_task_absent(result) is False
-
-
-# ---------------------------------------------------------------------------
 # Step 9: filter_false_absence_flags (RED tests)
 # ---------------------------------------------------------------------------
 
@@ -3411,6 +3220,48 @@ class TestFilterFalsePhantomTaskCreationFlags:
             "Drop log must not report the finding's null top-level task_id; got: "
             f'{[r.message for r in caplog.records]}'
         )
+
+    @pytest.mark.asyncio
+    async def test_phantom_filter_drops_when_any_cite_corroborates_and_keeps_otherwise(self):
+        """Across several flags, one corroborated cite among several drops its
+        flag; a flag with none corroborated is kept (task 4873 corroboration fold)."""
+
+        async def get_task(task_id, project_root):
+            if (str(task_id), project_root) == ('42', '/repo/reify'):
+                return {'id': '42', 'title': 'Foreign task', 'status': 'pending'}
+            return {
+                'error': f'No tasks found for ID(s): {task_id}',
+                'error_type': 'TaskmasterError',
+            }
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=get_task)
+
+        def phantom(*cited: dict) -> dict:
+            return {
+                'task_id': None,
+                'flag_type': 'phantom_tasks_created',
+                'description': 'Stage 2 reported tasks_created=1 with no task found',
+                'cited_tasks': list(cited),
+            }
+
+        corroborated = phantom(
+            {'project_id': 'dark_factory', 'task_id': '41', 'title': 'Ghost'},
+            {'project_id': 'reify', 'task_id': '42', 'title': 'Foreign task'},
+        )
+        uncorroborated = phantom(
+            {'project_id': 'dark_factory', 'task_id': '43', 'title': 'Ghost'},
+            {'project_id': 'reify', 'task_id': '42', 'title': 'Different title'},
+        )
+        benign = {'task_id': '5', 'flag_type': 'other', 'description': 'unrelated'}
+
+        kept = await flag_dedup.filter_false_phantom_task_creation_flags(
+            taskmaster,
+            {'dark_factory': '/repo/df', 'reify': '/repo/reify'},
+            [corroborated, benign, uncorroborated],
+        )
+
+        assert kept == [benign, uncorroborated]
 
 
 # ---------------------------------------------------------------------------
@@ -8401,6 +8252,103 @@ class TestFilterContaminationCeilingFindings:
 # which point these classes fold into TestAcknowledgeFlagMarkerDelete/Tag/
 # ResolvedFlags below (replacing their Mem0 search+delete/tag bodies).
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# filter_snapshot_stat_edge_findings — task 3487 code-side backstop
+# ---------------------------------------------------------------------------
+
+
+class TestFilterSnapshotStatEdgeFindings:
+    """Drops a Stage-3 finding that pairs a ``task_count_snapshot*`` stat with
+    a missing Graphiti temporal_facts edge, for EVERY project: snapshot stats
+    are Mem0-only, so no such edge is ever written (Snapshot Discipline)."""
+
+    @staticmethod
+    def _flag(description, suggested_action='Investigate', **extra):
+        flag = {
+            'task_id': None,
+            'flag_type': 'stats_mismatch',
+            'category': 'memory_stale',
+            'description': description,
+            'suggested_action': suggested_action,
+        }
+        flag.update(extra)
+        return flag
+
+    @pytest.mark.parametrize(
+        'description',
+        [
+            'Stage 2 reported task_count_snapshot_mem0_written=1 but no Graphiti '
+            'temporal_facts edge exists',
+            'TASK_COUNT_SNAPSHOT_MEM0_PRUNED=2 yet no temporal fact was found',
+            'task_count_snapshot_mem0_written=1 with no matching Graphiti edge',
+            'task_count_snapshot_mem0_written=1 has no graphiti temporal record',
+        ],
+        ids=['temporal_fact', 'temporal-fact-uppercase-stat', 'graphiti-edge', 'graphiti-temporal'],
+    )
+    def test_drops_a_stat_plus_edge_finding(self, description):
+        assert flag_dedup.filter_snapshot_stat_edge_findings([self._flag(description)]) == []
+
+    def test_signals_may_be_split_across_description_and_suggested_action(self):
+        flag = self._flag(
+            'Stage 2 reported task_count_snapshot_mem0_written=1',
+            suggested_action='Write the missing Graphiti temporal_facts edge',
+        )
+
+        assert flag_dedup.filter_snapshot_stat_edge_findings([flag]) == []
+
+    @pytest.mark.parametrize(
+        'flag',
+        [
+            {'description': 'task_count_snapshot_mem0_written=1 looks low',
+             'suggested_action': 'Check Mem0'},
+            {'description': 'Graphiti temporal_facts edge for task 12 is stale',
+             'suggested_action': 'Refresh it'},
+            {'description': None, 'suggested_action': None},
+            {},
+            {'description': 'task 42 has no design doc', 'suggested_action': 'Add one'},
+        ],
+        ids=['stat-only', 'edge-only', 'none-fields', 'empty', 'unrelated'],
+    )
+    def test_keeps_anything_short_of_both_signals(self, flag):
+        assert flag_dedup.filter_snapshot_stat_edge_findings([flag]) == [flag]
+
+    def test_is_project_agnostic(self):
+        import inspect
+
+        params = inspect.signature(flag_dedup.filter_snapshot_stat_edge_findings).parameters
+        assert list(params) == ['flags']
+
+    def test_preserves_order_and_returns_a_new_list(self):
+        keep_a = self._flag('task 1 has no design doc')
+        drop = self._flag(
+            'task_count_snapshot_mem0_written=1 but no Graphiti temporal_facts edge',
+        )
+        keep_b = self._flag('task 2 has no tests')
+        flags = [keep_a, drop, keep_b]
+
+        kept = flag_dedup.filter_snapshot_stat_edge_findings(flags)
+
+        assert kept == [keep_a, keep_b]
+        assert kept is not flags
+        assert flags == [keep_a, drop, keep_b]
+
+    def test_logs_one_debug_line_per_drop(self, caplog):
+        caplog.set_level(logging.DEBUG, logger='fused_memory.reconciliation.flag_dedup')
+        drops = [
+            self._flag('task_count_snapshot_mem0_written=1 but no temporal fact', task_id=str(i))
+            for i in range(2)
+        ]
+
+        flag_dedup.filter_snapshot_stat_edge_findings([*drops, self._flag('unrelated')])
+
+        lines = [
+            r for r in caplog.records
+            if r.levelno == logging.DEBUG
+            and 'filter_snapshot_stat_edge_findings' in r.getMessage()
+        ]
+        assert len(lines) == 2
 
 
 class TestAcknowledgeFlagMarkerLedger:

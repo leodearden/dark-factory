@@ -19,7 +19,7 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from collections import Counter, OrderedDict
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field, is_dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -46,6 +46,20 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 # flake_ledger depends only on shared.sqlite_sync_base, so there is no cycle.
 from orchestrator.flake_ledger import FlakeCallSite, FlakeSuppression, FlakeVerdict
 from orchestrator.main_tip_sweep_cadence import SweepSeedMode
+from orchestrator.verify_admission_gate import (
+    AdmissionGrant,
+    AdmissionPlan,
+    AdmissionPolicy,
+    AdmissionRequest,
+    gate_for,
+)
+from orchestrator.verify_admission_record import (
+    AdmissionLeg,
+    begin_plan,
+    emit_admission_plan,
+    legs_from_wire,
+    plan_request,
+)
 from orchestrator.verify_categories import (
     ARCHIVE_DENY_LIST as _ARCHIVE_DENY_LIST,  # noqa: F401 — re-exported for external consumers
 )
@@ -4082,6 +4096,10 @@ class CheckRun:
     # off, a lint/type leg, or an ungated role such as merge), never 0.0.
     # LAST field, for the rule ``segments`` and ``load`` state above.
     slot_wait_secs: 'float | None' = None
+    # The admitted leg this check's slot wait ended in (task 5628). ``None``
+    # when it competed for no slot, on the terms ``slot_wait_secs`` states.
+    # LAST field, as above.
+    admission: 'AdmissionLeg | None' = None
 
     @classmethod
     def skipped(cls, label: str) -> 'CheckRun':
@@ -4099,9 +4117,9 @@ class CheckRun:
     def to_dict(self) -> dict:
         """Serialise to the runs-dict schema consumed by ``_persist_attempt_logs``/
         ``_build_summary_payload``/``_verify_duration_secs``/``_archive_merge_verify_logs``
-        (all take ``list[dict]``) — the exact 10-key shape (label/cmd/rc/output/
-        timed_out/started_at/duration_secs/segments/load/slot_wait_secs), 7 of
-        which were previously hand-built inline in ``run_verification``.
+        (all take ``list[dict]``) — the exact 11-key shape (label/cmd/rc/output/
+        timed_out/started_at/duration_secs/segments/load/slot_wait_secs/admission),
+        7 of which were previously hand-built inline in ``run_verification``.
 
         ``started_at`` is normalised via ``or ''``: a skipped check's
         ``None`` serialises as ``''``, matching the pre-refactor
@@ -4120,8 +4138,9 @@ class CheckRun:
         historical ones, and "absent" vs "null" is the distinction that tells
         it whether a run predates load stamping or merely went unstamped.
 
-        ``slot_wait_secs`` (task 5671) is emitted unconditionally too: absent
-        means the run predates it, ``None`` means it queued for no slot.
+        ``slot_wait_secs`` (task 5671) and ``admission`` (task 5628) are
+        emitted unconditionally too: absent means the run predates them,
+        ``None`` means it queued for no slot.
         """
         return {
             'label': self.label,
@@ -4134,6 +4153,7 @@ class CheckRun:
             'segments': self.segments,
             'load': self.load,
             'slot_wait_secs': self.slot_wait_secs,
+            'admission': None if self.admission is None else self.admission.to_dict(),
         }
 
 
@@ -4254,7 +4274,7 @@ class VerifyResult:
     # ran. On the fallback (no-module_configs) path, the same decision is
     # derived once and then reconciled against _build_fallback_config's
     # already-executed ModuleConfig via _executed_fallback_plan (see
-    # _safe_derive_verify_plan_dict and its call site below), so the
+    # _safe_derive_executed_fallback_plan and its call site below), so the
     # attached record reflects the actual subproject/mixed-subproject
     # rescoping and OPAQUE-chain first-clause scoping that ran, not the
     # idealized flat '__fallback__' decision alone — see
@@ -4376,6 +4396,11 @@ class VerifyResult:
     # compare=False a failing CLI verify that produced an `unconfirmable` observation
     # would break test_cli test_verify_merge_cli_wrapper_transparency.
     flake_suppression: FlakeSuppression | None = field(default=None, compare=False)
+    # Task 5628: one record per gated test-leg admission, retries and the
+    # env-recovery rerun included: each test CheckRun's ``admission``. None =
+    # no gated leg ran. compare=False because the stamps are wall clock, as for
+    # ``duration_secs``.
+    admission_legs: tuple[AdmissionLeg, ...] | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         mismatch = _module_attribution_mismatch(
@@ -4386,6 +4411,8 @@ class VerifyResult:
                 'VerifyResult: failing_test_ids_by_module does not cover exactly '
                 'failing_test_ids; ids in only one of them: %s', sorted(mismatch),
             )
+        if self.admission_legs is not None:
+            self.admission_legs = legs_from_wire(self.admission_legs)
 
     def failure_report(self) -> str:
         """Format all failures into a single report for the debugger."""
@@ -6367,12 +6394,52 @@ def _admission_executor() -> concurrent.futures.ThreadPoolExecutor:
     return _admission_executor_singleton
 
 
-@contextlib.asynccontextmanager
-async def _admission_slot(role: str, config: OrchestratorConfig):
-    """Async CM around T1's ``shared.verify_admission.acquire_task_slot``.
+def _admission_policy(config: OrchestratorConfig) -> AdmissionPolicy:
+    """The admission gate's policy as *config* states it now (read at each grant)."""
+    return AdmissionPolicy(
+        slots=config.verify_admission_task_slots,
+        order=config.verify_admission_order,
+        promote_after_secs=config.verify_admission_background_promote_secs,
+    )
 
-    Callers gate only a verify's test leg; WHICH roles that gate actually
-    acquires for is T1's ``is_gated_role`` to decide, never re-derived here.
+
+@contextlib.asynccontextmanager
+async def _admission_slot(
+    role: str, config: OrchestratorConfig, request: AdmissionRequest | None,
+) -> AsyncIterator[AdmissionGrant | None]:
+    """Admit one verify test leg: the in-process gate decides whose turn it is
+    (task 5628, plans/verify-admission-fifo-prd.md), then ``_flock_slot`` takes
+    the cross-process flock slot.
+
+    Yields the gate's grant with the flock's answer stamped on as
+    ``slot_held``. Only an admitted waiter polls the flock, so the admission
+    executor holds at most ``verify_admission_task_slots`` pollers, plus any
+    cancelled leg's thread still finishing its poll. Callers gate only a
+    verify's test leg; WHICH roles are gated is T1's ``is_gated_role`` to
+    decide, never re-derived here. An ungated role yields None and never
+    touches the gate or the executor (task 5424).
+    """
+    if not is_gated_role(role):
+        async with _flock_slot(role, config):
+            yield None
+        return
+    if request is None:
+        raise ValueError(
+            f'a gated verify role reaches the admission gate only with an AdmissionRequest: '
+            f'role={role!r} came without one',
+        )
+    gate = gate_for(Path(config.verify_admission_slots_dir))
+    async with (
+        gate.admit(request, lambda: _admission_policy(config)) as grant,
+        _flock_slot(role, config) as held,
+    ):
+        yield replace(grant, slot_held=held)
+
+
+@contextlib.asynccontextmanager
+async def _flock_slot(role: str, config: OrchestratorConfig) -> AsyncIterator[bool]:
+    """Async CM around T1's ``shared.verify_admission.acquire_task_slot``;
+    yields whether a slot is held.
 
     Gated role — the mkdir (T1 never creates ``slots_dir`` itself, and fails
     open when it is absent) and the blocking, potentially-unbounded
@@ -6406,6 +6473,7 @@ async def _admission_slot(role: str, config: OrchestratorConfig):
     slots_dir = Path(config.verify_admission_slots_dir)
     n = config.verify_admission_task_slots
     cm = None
+    held = False
     try:
         # Constructing the CM runs none of acquire_task_slot's body (it is a
         # @contextlib.contextmanager generator function); only __enter__ does,
@@ -6419,7 +6487,7 @@ async def _admission_slot(role: str, config: OrchestratorConfig):
             )
             enter_future = loop.run_in_executor(executor, cm.__enter__)
             try:
-                await asyncio.shield(enter_future)
+                held = await asyncio.shield(enter_future)
             except asyncio.CancelledError:
                 def _release_if_acquired(fut: 'asyncio.Future[bool]') -> None:
                     if cm is None or fut.cancelled() or fut.exception() is not None:
@@ -6429,11 +6497,12 @@ async def _admission_slot(role: str, config: OrchestratorConfig):
                 enter_future.add_done_callback(_release_if_acquired)
                 raise
         else:
-            cm.__enter__()
+            held = cm.__enter__()
     except OSError:
         cm = None
+        held = False
     try:
-        yield
+        yield held
     finally:
         if cm is not None:
             with contextlib.suppress(OSError):
@@ -6581,8 +6650,14 @@ async def run_verification(
     archive_root: Path | None = None,
     role: Literal['merge', 'task', 'background'] = 'task',
     segment_chained_test: bool = False,
+    admission_request: AdmissionRequest | None = None,
 ) -> VerifyResult:
     """Run test suite, linter, and type checker. Return structured result.
+
+    *admission_request* places the gated test leg in the admission gate's
+    order (task 5628). A caller verifying several modules as one plan passes
+    each module its plan's request; when it is None a gated role gets a plan
+    of its own, stamped once here so every retry keeps its arrival.
 
     *segment_chained_test* (task 3338 / esc-3062-2) opts the TEST leg into
     per-segment execution: when the configured command is an `&&` chain
@@ -6648,6 +6723,13 @@ async def run_verification(
         type_cmd = config.type_check_command
 
     module_prefix = module_config.prefix if module_config is not None else None
+    if admission_request is not None and admission_request.role != role:
+        raise ValueError(
+            f'an admission request must carry its verify role: request role='
+            f'{admission_request.role!r}, verify role={role!r}',
+        )
+    if admission_request is None:
+        admission_request = plan_request(begin_plan(role, task_id=task_id), module_prefix)
 
     # Task μ (verify-scope-inversion-prd.md): under role=='merge' AND
     # merge_verify_breadth=='full', inject --junitxml into the test leg (see
@@ -6871,9 +6953,13 @@ async def run_verification(
             if prefix:
                 cmd = f'{shlex.join(prefix)} /bin/bash -c {shlex.quote(cmd)}'
         slot_requested = time.monotonic()
-        async with (_admission_slot(role, config) if admission else contextlib.nullcontext()):
+        async with (
+            _admission_slot(role, config, admission_request) if admission
+            else contextlib.nullcontext()
+        ) as grant:
             # The queueing half of the leg, which `load_start` below excludes.
-            slot_wait_secs = time.monotonic() - slot_requested if slot_gated else None
+            slot_taken = time.monotonic()
+            slot_wait_secs = slot_taken - slot_requested if slot_gated else None
             started_at = datetime.now(UTC).isoformat()
             t0 = time.monotonic()
             # INSIDE the admission slot, beside the clock it belongs to: the
@@ -7066,6 +7152,7 @@ async def run_verification(
             # to no command's duration.
             elapsed = time.monotonic() - t0
             load_end = _load_sample()
+        slot_released = time.monotonic()
         # Mis-resolved interpreter (task 3367 / esc-3359-1): make the condition
         # LEGIBLE at the point it is observed. Classification alone routes the
         # merge lane correctly (ENV_TRANSIENT -> a loud infra_issue hold) but
@@ -7163,6 +7250,10 @@ async def run_verification(
             # return through this single construction.
             load={'start': load_start, 'end': load_end, 'xdist': xdist},
             slot_wait_secs=slot_wait_secs,
+            admission=None if grant is None else AdmissionLeg.of(
+                grant, slot_taken=slot_taken, released=slot_released,
+                rc=rc, timed_out=timed_out_flag,
+            ),
         )
 
     # Cold-verify shared-venv pre-provision (task 2997, esc-2913-3): populate
@@ -7178,6 +7269,7 @@ async def run_verification(
             worktree, config, verify_env=verify_env, timeout=timeout,
         )
 
+    test_runs: list[CheckRun] = []
     retries = 0
     while True:
         # attempt_id is the persistence ID handed in by the caller (or None for
@@ -7220,6 +7312,7 @@ async def run_verification(
                 await _run_or_skip_timed(type_cmd, label='type', current_attempt=current_attempt_id),
             ])
 
+        test_runs.append(attempt.test)
         if attempt.passed or not attempt.pure_timeout_failure or retries >= max_retries:
             break
 
@@ -7313,6 +7406,7 @@ async def run_verification(
         new_test = await _run_or_skip_timed(
             recovered_test_cmd, label='test', current_attempt=current_attempt_id,
         )
+        test_runs.append(new_test)
 
         # Recompute pure-timeout consistency for the recovery run via a fresh
         # VerifyAttempt: lint/type are unchanged from the first pass (only
@@ -7527,6 +7621,7 @@ async def run_verification(
         skipped_test_ids=skipped_test_ids,
         failing_test_ids_by_module=failing_test_ids_by_module,
         failing_leg_categories=failing_leg_categories,
+        admission_legs=tuple(run.admission for run in test_runs if run.admission is not None) or None,
     )
 
     # Mark the worktree warm whenever the build completed (no pure timeout),
@@ -7710,6 +7805,7 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         skipped_test_ids=skipped_test_ids,
         failing_test_ids_by_module=failing_test_ids_by_module,
         failing_leg_categories=failing_leg_categories,
+        admission_legs=tuple(leg for r in results for leg in (r.admission_legs or ())) or None,
     )
 
 
@@ -7720,6 +7816,7 @@ async def run_full_verification(
     force_rediscover: bool = False,
     role: Literal['merge', 'task', 'background'] = 'task',
     max_retries: int | None = None,
+    event_store: 'EventStore | None' = None,
 ) -> VerifyResult:
     """Run verification for ALL subprojects against the project root.
 
@@ -7743,6 +7840,10 @@ async def run_full_verification(
     *max_retries* overrides ``config.verify_timeout_retries`` for every
     internal :func:`run_verification`; ``None`` keeps the config default, and
     ``run_main_tip_sweep`` passes ``0`` (task 5812).
+
+    A gated *role* verifies its subprojects as ONE admission plan, recorded on
+    *event_store* as a ``verify_admission_plan`` event (task 5628; see
+    :func:`_recorded_admission_plan`).
 
     Discovery reuse: ``config._module_configs`` uses a sentinel of ``None`` to
     mean "discovery never ran".  When it holds any dict (including ``{}``,
@@ -7775,23 +7876,52 @@ async def run_full_verification(
         module_configs = config._module_configs
     else:
         module_configs = _discover_module_configs(project_root)
-    if not module_configs:
-        logger.info('Full verification: no subproject configs — using global')
-        return await run_verification(
-            project_root, config, role=role, max_retries=max_retries,
-        )
+    admission_plan = begin_plan(role, task_id=None)
 
-    logger.info(
-        'Full verification: running %d subprojects in parallel',
-        len(module_configs),
-    )
-    results = await asyncio.gather(
-        *(
-            run_verification(project_root, config, mc, role=role, max_retries=max_retries)
-            for mc in module_configs.values()
+    async def verify_all() -> VerifyResult:
+        if not module_configs:
+            logger.info('Full verification: no subproject configs — using global')
+            return await run_verification(
+                project_root, config, role=role, max_retries=max_retries,
+                admission_request=plan_request(admission_plan, None),
+            )
+        logger.info(
+            'Full verification: running %d subprojects in parallel',
+            len(module_configs),
         )
-    )
-    return _aggregate_results(list(results))
+        results = await asyncio.gather(
+            *(
+                run_verification(
+                    project_root, config, mc, role=role, max_retries=max_retries,
+                    admission_request=plan_request(admission_plan, mc.prefix),
+                )
+                for mc in module_configs.values()
+            )
+        )
+        return _aggregate_results(list(results))
+
+    return await _recorded_admission_plan(config, event_store, admission_plan, verify_all())
+
+
+async def _recorded_admission_plan(
+    config: OrchestratorConfig,
+    event_store: 'EventStore | None',
+    plan: AdmissionPlan | None,
+    verify: Awaitable[VerifyResult],
+) -> VerifyResult:
+    """Await *verify*, which runs *plan*'s legs, then record the plan on *event_store*.
+
+    A plan that raises while admission is on is recorded as raised, without
+    legs. A cancelled plan is not recorded.
+    """
+    try:
+        result = await verify
+    except Exception:
+        if _verify_admission_active(config):
+            emit_admission_plan(event_store, plan, (), outcome='raised')
+        raise
+    emit_admission_plan(event_store, plan, result.admission_legs or (), outcome='returned')
+    return result
 
 
 def _worktree_reader(
@@ -7881,6 +8011,21 @@ def _mc_attr_for_run(run: verify_plan.PlannedRun) -> str:
     if attr is None:
         raise ValueError(f'PlannedRun.reason has no recognised tool prefix: {run.reason!r}')
     return attr
+
+
+def _test_scope_kind(plan: verify_plan.VerifyPlan | None, module_prefix: str) -> str | None:
+    """The scope kind *plan* gave *module_prefix*'s test slot; None when it planned none."""
+    if plan is None:
+        return None
+    return next(
+        (
+            str(run.scope_kind)
+            for run in plan.runs
+            if run.module_prefix == module_prefix
+            and _mc_attr_for_run_or_none(run) == 'test_command'
+        ),
+        None,
+    )
 
 
 def _executed_module_configs_from_plan(
@@ -8071,7 +8216,7 @@ def _executed_fallback_plan(
     return replace(plan, runs=tuple(executed_runs))
 
 
-def _safe_derive_verify_plan_dict(
+def _safe_derive_executed_fallback_plan(
     existing_files: list[str],
     module_configs: list[ModuleConfig],
     config: OrchestratorConfig,
@@ -8080,18 +8225,18 @@ def _safe_derive_verify_plan_dict(
     role: Literal['merge', 'task'],
     executed_fallback: ModuleConfig | None = None,
     fallback_pytest_reason: str | None = None,
-) -> dict | None:
-    """Best-effort executed-plan dict for ``VerifyResult.plan``.
+) -> verify_plan.VerifyPlan | None:
+    """Best-effort executed plan for ``VerifyResult.plan`` and the fallback leg's scope kind.
 
     Used by the fallback (no-``module_configs``) branch of
     :func:`run_scoped_verification` — the module-config branch derives its
     plan directly and executes it (see
     :func:`_executed_module_configs_from_plan`), so this helper's job is
     giving the fallback branch the same ``VerifyResult.plan`` treatment: it
-    best-effort-builds the EXECUTED plan record without re-deriving it
+    best-effort-builds the EXECUTED plan without re-deriving it
     inline. When *executed_fallback* is given (the fallback branch's own
     already-executed ``ModuleConfig``), the derived DECISION plan is folded
-    through :func:`_executed_fallback_plan` first, so the returned dict
+    through :func:`_executed_fallback_plan` first, so the returned plan
     records what actually ran (module_prefix + rendered command) rather than
     the idealized flat ``'__fallback__'`` decision alone.
     *fallback_pytest_reason* rides along on that same path (and only that
@@ -8100,11 +8245,10 @@ def _safe_derive_verify_plan_dict(
     :func:`_executed_fallback_plan` needs in order to record a marker-deselection
     widening the executed config already applied. A bug in the
     decision layer or this reconciliation — an unforeseen ``VerifyCmd``/
-    dataclass edge, or a future change to ``_verify_cmd_to_dict``/``to_dict``
-    — must never fail an otherwise-passing verify attempt just because its
-    plan record couldn't be built. Catches broadly and logs a warning,
-    returning ``None`` (``VerifyResult.plan``'s own default) on any failure
-    instead of propagating and failing the gate.
+    dataclass edge — must never fail an otherwise-passing verify attempt
+    just because its plan couldn't be built. Catches broadly and logs a
+    warning, returning ``None`` (``VerifyResult.plan``'s own default) on any
+    failure instead of propagating and failing the gate.
     """
     try:
         plan = verify_plan.derive_verify_plan(
@@ -8114,7 +8258,7 @@ def _safe_derive_verify_plan_dict(
             plan = _executed_fallback_plan(
                 plan, executed_fallback, pytest_reason=fallback_pytest_reason,
             )
-        return plan.to_dict()
+        return plan
     except Exception as exc:  # noqa: BLE001 — best-effort; must never fail the verify gate
         logger.warning(
             'derive_verify_plan failed — omitting VerifyResult.plan for this attempt: %s',
@@ -8304,6 +8448,11 @@ async def run_scoped_verification(
 ) -> VerifyResult:
     """Run verification scoped to specific subprojects and optionally to task files.
 
+    A gated *role* verifies as ONE admission plan, stamped here so every leg
+    and retry keeps the plan's place in the admission gate's order, and
+    recorded on *event_store* as a ``verify_admission_plan`` event (task 5628;
+    see :func:`_recorded_admission_plan`).
+
     Scoping modes (in priority order):
 
     1. **File-scoped within subprojects** — when *module_configs* is non-empty
@@ -8332,10 +8481,43 @@ async def run_scoped_verification(
     :func:`_is_verify_cold`.  Set this to ``True`` from the merge-queue
     call sites so post-merge verifies get the cold timeout.
     """
+    admission_plan = begin_plan(role, task_id=task_id)
+    scoped_verify = _run_scoped_verification_body(
+        worktree, config, module_configs, task_files,
+        max_retries=max_retries,
+        is_merge_verify=is_merge_verify,
+        attempt_id=attempt_id,
+        task_id=task_id,
+        archive_root=archive_root,
+        force_workspace=force_workspace,
+        role=role,
+        event_store=event_store,
+        admission_plan=admission_plan,
+    )
+    return await _recorded_admission_plan(config, event_store, admission_plan, scoped_verify)
+
+
+async def _run_scoped_verification_body(
+    worktree: Path,
+    config: OrchestratorConfig,
+    module_configs: list[ModuleConfig],
+    task_files: list[str] | None,
+    *,
+    max_retries: int | None,
+    is_merge_verify: bool,
+    attempt_id: int | None,
+    task_id: str | None,
+    archive_root: Path | None,
+    force_workspace: bool,
+    role: Literal['merge', 'task'],
+    event_store: 'EventStore | None',
+    admission_plan: AdmissionPlan | None,
+) -> VerifyResult:
+    """``run_scoped_verification``'s scoping and execution; every leg joins *admission_plan*."""
     scope_cargo_enabled = config.scope_cargo
     _fanout_sem = _module_fanout_semaphore(config, role)
 
-    async def _verify_module(mc: ModuleConfig) -> 'VerifyResult':
+    async def _verify_module(mc: ModuleConfig, scope_kind: str | None = None) -> 'VerifyResult':
         async with _fanout_sem:
             return await run_verification(
                 worktree, config, mc,
@@ -8343,6 +8525,7 @@ async def run_scoped_verification(
                 is_merge_verify=is_merge_verify,
                 attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
                 role=role,
+                admission_request=plan_request(admission_plan, mc.prefix, scope_kind),
             )
 
     # When the plan didn't provide a file list, try to derive one from git —
@@ -8435,7 +8618,9 @@ async def run_scoped_verification(
                             plan_dict, worktree, attempt_id=attempt_id,
                             task_id=task_id, archive_root=archive_root,
                         )
-                        results = await asyncio.gather(*(_verify_module(mc) for mc in scoped))
+                        results = await asyncio.gather(*(
+                            _verify_module(mc, _test_scope_kind(plan, mc.prefix)) for mc in scoped
+                        ))
                         aggregated = _aggregate_results(list(results))
                         aggregated.plan = plan_dict
                         return aggregated
@@ -8460,6 +8645,7 @@ async def run_scoped_verification(
                 task_id=task_id,
                 archive_root=archive_root,
                 role=role,
+                admission_request=plan_request(admission_plan, None),
             )
         if module_configs:
             # λ (task 2589, R1): the broad merge gate. role=='merge' +
@@ -8709,10 +8895,11 @@ async def run_scoped_verification(
                     scoped = scoped + widened
             else:
                 scoped = module_configs
+                plan = None
                 plan_dict = None
                 logger.info('Verification mode: subproject-scoped (%d subprojects)', len(module_configs))
             results = await asyncio.gather(
-                *(_verify_module(mc) for mc in scoped)
+                *(_verify_module(mc, _test_scope_kind(plan, mc.prefix)) for mc in scoped)
             )
             aggregated = _aggregate_results(list(results))
             if plan_dict is not None:
@@ -8853,11 +9040,12 @@ async def run_scoped_verification(
                 # _build_fallback_config's own read above (see the NOTE at
                 # the _build_fallback_config call site) — unchanged from
                 # before this task.
-                plan_dict = _safe_derive_verify_plan_dict(
+                fallback_plan = _safe_derive_executed_fallback_plan(
                     existing_files, module_configs, config, fallback_reader, role=role,
                     executed_fallback=fallback,
                     fallback_pytest_reason=fallback_pytest_reason,
                 )
+                plan_dict = fallback_plan.to_dict() if fallback_plan is not None else None
                 if plan_dict is not None:
                     logger.info('Verify plan: %s', plan_dict)
                 _persist_verify_plan(
@@ -8892,6 +9080,10 @@ async def run_scoped_verification(
                     # test_fallback_verify_config.py::MEASURED_FLEET_SEGMENT_SECS)
                     # is a lower bound, not the whole chain.
                     segment_chained_test=role != 'merge',
+                    admission_request=plan_request(
+                        admission_plan, fallback.prefix,
+                        _test_scope_kind(fallback_plan, fallback.prefix),
+                    ),
                 )
                 fallback_result.plan = plan_dict
                 return fallback_result
@@ -8918,6 +9110,7 @@ async def run_scoped_verification(
                         is_merge_verify=is_merge_verify,
                         attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
                         role=role,
+                        admission_request=plan_request(admission_plan, rewritten.prefix),
                     )
 
         # INV-1 (task 2883) GLOBAL-tail backstop: the merge gate must never
@@ -8946,6 +9139,7 @@ async def run_scoped_verification(
             is_merge_verify=is_merge_verify,
             attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
             role=role,
+            admission_request=plan_request(admission_plan, None),
         )
     finally:
         _maybe_prune_archive(archive_root)
@@ -9246,6 +9440,7 @@ async def run_main_tip_sweep(
     *,
     main_sha: str | None = None,
     seed_mode: SweepSeedMode = SweepSeedMode.COLD,
+    event_store: 'EventStore | None' = None,
 ) -> 'tuple[str, VerifyResult] | None':
     """Run a full unscoped verification sweep against the current main-tip SHA.
 
@@ -9400,8 +9595,8 @@ async def run_main_tip_sweep(
             # background asyncio.Task with no dispatch/merge/deploy path awaiting it, so
             # its fan-out should never contend with real task/merge lane verifies.
             # max_retries=0 (task 5812): no pure-timeout re-runs on either pass.
-            result = await run_full_verification(  # type: ignore[arg-type]
-                tmp_path, config, role='background', max_retries=0,
+            result = await run_full_verification(
+                tmp_path, config, role='background', max_retries=0, event_store=event_store,
             )
 
             # pytest INTERNALERROR means the test infrastructure itself crashed (e.g. an
@@ -9495,8 +9690,8 @@ async def run_main_tip_sweep(
                     )
                     return (main_sha, result)
 
-                retry = await run_full_verification(  # type: ignore[arg-type]
-                    tmp_path, config, role='background', max_retries=0,
+                retry = await run_full_verification(
+                    tmp_path, config, role='background', max_retries=0, event_store=event_store,
                 )
 
                 if retry.category in INFRA_TRANSIENT_CATEGORIES:

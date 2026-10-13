@@ -3864,6 +3864,8 @@ class TaskWorkflow:
                         # re-verify (the implement-phase site is covered
                         # separately by TestTaskLaneVerifyHoldsLease).
                         role='task',
+                        task_id=self.task_id,
+                        event_store=self.event_store,
                     )
                 if not verify.passed:
                     if verify.timed_out:
@@ -4399,6 +4401,15 @@ class TaskWorkflow:
         worktree's source code rather than the main tree's editable installs.
         Local ``[tool.uv.sources]`` dependencies (e.g. ``shared``) are
         pulled in automatically via relative editable paths.
+
+        Never uninstalls, and covers the whole workspace (task 3443): a
+        workspace shares one root ``.venv`` and a bare ``uv sync`` is exact,
+        so it prunes that venv down to one member's closure. ``--inexact``
+        makes it never uninstall, so it cannot undo what
+        ``verify_cold_preprovision_command`` or a steward provisioned, and the
+        parallel per-prefix syncs commute; ``--all-packages`` installs every
+        workspace member, which also heals a venv an earlier exact sync
+        stripped.
         """
         assert self.worktree is not None
 
@@ -4419,6 +4430,7 @@ class TaskWorkflow:
             project_dir = str(worktree / prefix)
             proc = await asyncio.create_subprocess_exec(
                 'uv', 'sync', '--project', project_dir,
+                '--inexact', '--all-packages',
                 cwd=str(self.worktree),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
@@ -9980,6 +9992,7 @@ class TaskWorkflow:
                         archive_root=self.config.project_root / 'data' / 'verify-logs',
                         force_workspace=self._train is not None,
                         role='task',
+                        event_store=self.event_store,
                     )
             except VerifyInfraError as exc:
                 last_infra_exc = exc

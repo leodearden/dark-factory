@@ -155,12 +155,9 @@ Never recommend adding a project to the `ReconSnapshotWriteRejected` guard \
 exception list on this evidence. That contradicts Snapshot Discipline and is the \
 wrong fix.
 
-Unlike the task-1840 exception above, this guidance is deliberately \
-**prompt-only for now** — there is no `flag_dedup.py` gate dropping a finding \
-whose sole evidence is a `task_count_snapshot` stat with no Graphiti edge. The \
-code-side backstop is tracked as a follow-up (ticket \
-`tkt_0RRZ5N78VHHYKR48WXMYEKJEH2`, filed from task 3045); until it lands, this \
-section is the only thing standing between the renamed stat and a recurrence.
+A code-side gate (`filter_snapshot_stat_edge_findings` in `flag_dedup.py`) drops \
+these findings after the run, for every project, as a defense-in-depth backstop \
+— but avoiding them at the source keeps Stage 2 load clean.
 
 ## Contamination-Ceiling Retirement Exception (task 2818/2826)
 
@@ -397,6 +394,13 @@ legitimately created the task in a DIFFERENT known project via documented cross-
 routing (`submit_task` called with another project's `project_root`). An origin-only \
 check cannot see that. Real incident: run 709de018 — the task genuinely existed in \
 another project, and the false phantom conclusion drove a wasteful duplicate re-file.
+
+Two Stage 2 stats settle most of these questions before any lookup. \
+`task_created_records_journaled` counts creations the framework journaled code-side \
+as the curator decided them — cross-project filings included — so it corroborates a \
+`tasks_created` count by itself; never flag a count it covers as phantom. \
+`tasks_combined` counts candidates the curator folded into an EXISTING task: they \
+mint no new task id, so never read a `tasks_combined` count as phantom creations.
 
 Before flagging a self-reported `tasks_created` count phantom:
 1. Look for any signal identifying a candidate OTHER project + task_id for the created \
