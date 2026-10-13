@@ -413,6 +413,9 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 #   tests/scripts/test_shadow_ruling_doc_contract.py — reads
 #       skills/escalation-watcher/SKILL.md to validate its x_shadow_ruling
 #       payload literals against the live parser (task 5374).
+#   scripts/tests/test_design_invariants_consistency.py — reads
+#       skills/prd/references/gates.md live; its enumeration and citation
+#       scans walk the repo with no skills/ prune (task 4941).
 #   fused-memory/tests/test_referent_declaration_examples.py — reads
 #       skills/reflect/SKILL.md to execute its `entities=` examples against
 #       the live entities_gate (task 3675).
