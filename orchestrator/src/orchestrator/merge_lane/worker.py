@@ -6990,10 +6990,15 @@ class _TrainVerifyHost:
     """The host a train's verifies run on: the slot it leased, or unleased local."""
 
     def __init__(
-        self, worker: _TrainMergeHost, allocator: HostAllocator, lease: HostLease | None,
+        self,
+        worker: _TrainMergeHost,
+        allocator: HostAllocator,
+        local_factory: Callable[[], LocalRunner],
+        lease: HostLease | None,
     ) -> None:
         self._worker = worker
         self._allocator = allocator
+        self._local_factory = local_factory
         self._lease = lease
 
     @classmethod
@@ -7011,7 +7016,7 @@ class _TrainVerifyHost:
             lease = allocator.acquire_local(factory)
         else:
             lease = await allocator.acquire(factory, policy=req.config.verify_host_policy)
-        return cls(worker, allocator, lease)
+        return cls(worker, allocator, factory, lease)
 
     @property
     def name(self) -> str:
@@ -7023,6 +7028,19 @@ class _TrainVerifyHost:
         if self._lease is None or self._lease.is_local:
             return None
         return self._lease.runner
+
+    async def fall_back_to_local(self, reason: str) -> None:
+        """Bench the unreachable remote this train leased and move to local.
+
+        The remote is quarantined through the worker's INV-A chokepoint, so the
+        reprobe sweep can re-admit it. Local is leased when free, else unleased.
+        """
+        assert self._lease is not None and not self._lease.is_local, self._lease
+        await self._allocator.quarantine_and_release(self._lease)
+        self._worker._quarantine_unreachable_host(
+            self._lease.name, reason, self._worker._clock.now(),
+        )
+        self._lease = self._allocator.acquire_local(self._local_factory)
 
     async def release(self, *, aborted: bool) -> None:
         """Give the slot back; an *aborted* train's verify may still be running."""
@@ -7041,8 +7059,10 @@ async def _leased_train_verify(
     """Lease a verify host for *req* and yield its verify on that host.
 
     The yielded callable is ``_run_post_merge_verify`` on the worker's
-    injected VerifyPort. The lease is held until the block exits: released
-    plainly on a normal exit, cancelled and released on any exception.
+    injected VerifyPort. A remote that turns out unreachable is benched and
+    the same verify re-runs on local. The lease is held until the block
+    exits: released plainly on a normal exit, cancelled and released on any
+    exception.
     """
     verify_once = functools.partial(
         _run_post_merge_verify,
@@ -7065,7 +7085,19 @@ async def _leased_train_verify(
         # Every train verify, the CAS-retry re-verifies included, restarts
         # the restart drain's deadline clock (task 5371).
         worker._note_verify_started(req.request_id, host=host.name)
-        return await verify_once(*args, runner=host.runner, **kwargs)
+        runner = host.runner
+        try:
+            return await verify_once(*args, runner=runner, **kwargs)
+        except RunnerUnavailable as exc:
+            if runner is None:
+                raise
+            logger.warning(
+                'Train %s: verify host %s unreachable (%s); re-running the verify on local',
+                req.train_id, host.name, exc,
+            )
+            await host.fall_back_to_local(str(exc))
+            worker._note_verify_started(req.request_id, host=host.name)
+            return await verify_once(*args, runner=host.runner, **kwargs)
 
     try:
         yield train_verify
@@ -7173,7 +7205,8 @@ async def _do_train_merge(
         enforces the workspace-wide post-merge green gate (scenario 5).  It
         runs on a host leased from the worker's allocator (a remote only for
         trains of at most ``_TRAIN_REMOTE_VERIFY_MAX_MEMBERS`` members), or
-        unleased on local when no slot is free.
+        unleased on local when no slot is free.  A transport fault on the
+        remote re-runs the verify on local and is never a derail.
     (e) CAS advance — :func:`_advance_train`'s bounded loop atomically
         updates the main ref, re-verifying a tip rebased onto a moved main
         (item 1) and retrying a lost CAS (item 5).
