@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 import types
 from pathlib import Path
 from typing import Any
@@ -85,20 +84,21 @@ def _live_worker(raw_state: str, request_id: str = 'mr-live') -> types.SimpleNam
     )
 
 
-def _ring(raw_state: str, request_id: str = 'mr-ring') -> types.SimpleNamespace:
-    """A duck-typed terminal-retention ring holding one record in *raw_state*.
+def _finalized_store(tmp_path: Path, raw_state: str, request_id: str = 'mr-final') -> Any:
+    """A real current-run event store holding one merge_finalized row in *raw_state*.
 
-    ``finished_at`` must be an epoch FLOAT — ``_durable_terminal_state`` runs it
-    through ``_epoch_to_iso8601``, which would raise on a string.
+    Hand the returned instance to ``create_server`` so the row is the server's
+    own run.
     """
-    rec = types.SimpleNamespace(
-        request_id=request_id, state=raw_state, finished_at=time.time() - 5.0
+    from orchestrator.event_store import EventStore, EventType
+
+    event_store = EventStore(tmp_path / 'runs.db', 'run-wiring')
+    event_store.emit(
+        EventType.merge_finalized,
+        task_id='T-final',
+        data={'request_id': request_id, 'branch': 'b-final', 'state': raw_state},
     )
-    return types.SimpleNamespace(
-        get=lambda rid: rec if rid == request_id else None,
-        get_by_branch=lambda b: None,
-        get_by_task=lambda t: None,
-    )
+    return event_store
 
 
 def _server(tmp_path: Path, harness: Any = None, **kwargs: Any):
@@ -163,12 +163,13 @@ class TestMergeStatusTier1EmitsLiveStates:
 
 
 # ---------------------------------------------------------------------------
-# merge_status — Tiers 2-3 (durable) + Tier 4
+# merge_status — event-store tier + clean miss
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-class TestMergeStatusDurableTiersEmitTerminalStates:
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
+class TestMergeStatusEventStoreTierEmitsTerminalStates:
     @pytest.mark.parametrize(
         ('raw', 'expected'),
         [
@@ -185,10 +186,14 @@ class TestMergeStatusDurableTiersEmitTerminalStates:
     async def test_raw_collapses_to_a_terminal_member(
         self, tmp_path: Path, raw: str, expected: MergeState
     ) -> None:
-        harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=_ring(raw))
-        result = await call_merge_status(_server(tmp_path, harness), request_id='mr-ring')
+        server = _server(
+            tmp_path,
+            types.SimpleNamespace(_merge_worker=None),
+            event_store=_finalized_store(tmp_path, raw),
+        )
+        result = await call_merge_status(server, request_id='mr-final')
 
-        _assert_is_member(result['state'], TERMINAL_STATES, f'durable raw={raw!r}')
+        _assert_is_member(result['state'], TERMINAL_STATES, f'event-store raw={raw!r}')
         # Collapse behaviour is UNCHANGED by the switchover.
         assert result['state'] == expected
         # The raw value survives verbatim on `outcome` — the collapse is lossy
@@ -197,32 +202,30 @@ class TestMergeStatusDurableTiersEmitTerminalStates:
 
 
 @pytest.mark.asyncio
-class TestMergeStatusTier4EmitsUnknown:
-    async def test_no_record_anywhere_returns_unknown_member(self, tmp_path: Path) -> None:
-        """Tier 4's `unknown` is pinned to the POLL partitions, not the cancel one.
+class TestMergeStatusCleanMissEmitsNoRecord:
+    async def test_no_record_anywhere_returns_no_record_member(self, tmp_path: Path) -> None:
+        """A clean miss is pinned to the POLL partitions, not the cancel one.
 
-        ``POLL_STOP_STATES`` and ``CANCEL_STATES`` hold the same members today, so
-        pinning this to ``CANCEL_STATES`` — as it did before this amendment —
-        could not fail.  That equality is incidental: they are the stop sets of two
-        different call sites, and PRD beta widens what ``merge_status`` may return
-        without touching ``merge_cancel``.  In a file whose whole purpose is
-        asserting the right partition per call site, a poll assertion checked
-        against the cancel vocabulary would silently start checking the wrong
-        contract the moment the two diverge.
+        ``POLL_STOP_STATES`` and ``CANCEL_STATES`` are separate contracts, the
+        stop sets of two different call sites, and they now differ:
+        ``CANCEL_STATES`` also holds the live states
+        (``shared/src/shared/merge_state.py::CANCEL_STATES``).  A poll assertion
+        checked against the cancel vocabulary would be checking the wrong
+        contract.
 
         ``EPISTEMIC_STATES`` is the tighter of the two claims and is asserted as
-        well: Tier 4 fires when the server has NO RECORD of the request, so what it
-        reports is a state of knowledge, not an outcome the merge reached.
+        well: every tier missed, so what the server reports is a state of
+        knowledge, not an outcome the merge reached.
         """
         result = await call_merge_status(_server(tmp_path), request_id='mr-nothing')
 
-        _assert_is_member(result['state'], POLL_STOP_STATES, 'Tier-4')
+        _assert_is_member(result['state'], POLL_STOP_STATES, 'clean miss')
         assert result['state'] in EPISTEMIC_STATES, (
-            f"Tier-4 returned {result['state']!r}, an OUTCOME state — a poll that "
+            f"clean miss returned {result['state']!r}, an OUTCOME state — a poll that "
             'found no record anywhere must report what the server knows, not what '
             'the merge did.'
         )
-        assert result['state'] == MergeState.unknown
+        assert result['state'] == MergeState.no_record
 
 
 @pytest.mark.asyncio
@@ -286,23 +289,35 @@ class TestMergeCancelEmitsCancelStates:
             merge_inflight_registry=InFlightMergeRegistry(),
         )
 
-    async def test_no_waiter_miss_returns_unknown_member(self, tmp_path: Path) -> None:
+    async def test_no_waiter_miss_returns_no_record_member(self, tmp_path: Path) -> None:
         result = await call_merge_cancel(_server(tmp_path), request_id='mr-never-seen')
 
         assert result['cancelled'] is False
         _assert_is_member(result['state'], CANCEL_STATES, 'merge_cancel no-waiter miss')
-        assert result['state'] == MergeState.unknown
+        assert result['state'] == MergeState.no_record
 
     async def test_no_waiter_durable_hit_returns_terminal_member(self, tmp_path: Path) -> None:
-        harness = types.SimpleNamespace(
-            _merge_worker=None, _terminal_retention=_ring('superseded', 'mr-gone')
+        server = _server(
+            tmp_path,
+            types.SimpleNamespace(_merge_worker=None),
+            event_store=_finalized_store(tmp_path, 'superseded', 'mr-gone'),
         )
-        result = await call_merge_cancel(_server(tmp_path, harness), request_id='mr-gone')
+        result = await call_merge_cancel(server, request_id='mr-gone')
 
         assert result['cancelled'] is False
         _assert_is_member(result['state'], CANCEL_STATES, 'merge_cancel durable hit')
         # superseded is precisely the member DEFECT 1's docstring omitted.
         assert result['state'] == MergeState.superseded
+
+    async def test_no_waiter_live_hit_returns_live_member(self, tmp_path: Path) -> None:
+        server = _server(
+            tmp_path, types.SimpleNamespace(_merge_worker=_live_worker('verifying'))
+        )
+        result = await call_merge_cancel(server, request_id='mr-live')
+
+        assert result['cancelled'] is False
+        _assert_is_member(result['state'], CANCEL_STATES, 'merge_cancel no-waiter live hit')
+        assert result['state'] == MergeState.verifying
 
     async def test_pending_waiter_returns_abandoned_member(self, tmp_path: Path) -> None:
         server = self._queue_server(tmp_path)
@@ -367,6 +382,7 @@ class TestMergeCancelEmitsCancelStates:
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
 class TestWireCompatibility:
     """A StrEnum member serialises and compares as its plain str value, so no
     existing consumer — in-process or over the MCP wire — can tell the
@@ -374,16 +390,24 @@ class TestWireCompatibility:
     """
 
     async def test_response_json_round_trips_to_a_plain_string(self, tmp_path: Path) -> None:
-        harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=_ring('done'))
-        result = await call_merge_status(_server(tmp_path, harness), request_id='mr-ring')
+        server = _server(
+            tmp_path,
+            types.SimpleNamespace(_merge_worker=None),
+            event_store=_finalized_store(tmp_path, 'done'),
+        )
+        result = await call_merge_status(server, request_id='mr-final')
 
         round_tripped = json.loads(json.dumps(result))
         assert round_tripped['state'] == 'done'
         assert type(round_tripped['state']) is str
 
     async def test_plain_str_comparison_still_holds(self, tmp_path: Path) -> None:
-        harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=_ring('conflict'))
-        result = await call_merge_status(_server(tmp_path, harness), request_id='mr-ring')
+        server = _server(
+            tmp_path,
+            types.SimpleNamespace(_merge_worker=None),
+            event_store=_finalized_store(tmp_path, 'conflict'),
+        )
+        result = await call_merge_status(server, request_id='mr-final')
 
         # The exact shape of every pre-existing assertion in the suite.
         assert result['state'] == 'conflict'

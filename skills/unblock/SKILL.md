@@ -468,9 +468,10 @@ The merge procedure is iterative — don't assume one pass will be enough:
      # merge-state-vocab:end
      # merge-state-vocab:begin partition=POLL_STOP_STATES
      #   Mirrors shared/src/shared/merge_state.py::POLL_STOP_STATES (TERMINAL_STATES
-     #   plus `unknown`). Pinned by the same guard.
+     #   plus every epistemic state). Pinned by the same guard.
      else:
-         terminal = ("done", "conflict", "blocked", "abandoned", "unknown", "superseded")
+         terminal = ("done", "conflict", "blocked", "abandoned", "unknown", "superseded",
+                     "no_record", "stale_record", "journaled")
      # merge-state-vocab:end
      # 20-min hard ceiling on BOTH unscoped arms (branch and task_id): each can reject a
      # terminal `done` (see accept_terminal), and a durable tier re-serves the same stale

@@ -25,8 +25,10 @@ import pytest
 from _filing_tools import call_blocker as _blocker
 from _filing_tools import call_info as _info
 from _merge_tool_calls import call_merge_cancel, call_merge_request, call_merge_status
+from shared.merge_state import EPISTEMIC_STATES, MergeReason
 
 from escalation.dedupe import DedupeConfig
+from escalation.merge_status_answer import hint_for
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -1770,11 +1772,11 @@ class TestMergeCancel:
             f'done={req.result.done()} cancelled={req.result.cancelled()}'
         )
 
-    async def test_cancel_unknown_request_id_returns_unknown(self, tmp_path: Path):
-        """Cancelling a request_id with no live waiter returns cancelled=False, state='unknown'.
+    async def test_cancel_never_submitted_request_id_returns_no_record(self, tmp_path: Path):
+        """Cancelling a never-submitted request_id returns cancelled=False, state='no_record'.
 
         Fresh server with no submissions.  Call merge_cancel with a random id.
-        Must return a dict (no raise) with cancelled=False, state='unknown', and
+        Must return a dict (no raise) with cancelled=False, state='no_record', and
         a non-empty reason string.
 
         RED until step-4 impl: the current minimal body calls rec.future on a None rec,
@@ -1797,8 +1799,8 @@ class TestMergeCancel:
         assert result.get('cancelled') is False, (
             f"Expected cancelled=False for unknown id, got: {result}"
         )
-        assert result.get('state') == 'unknown', (
-            f"Expected state='unknown' for unknown id, got: {result}"
+        assert result.get('state') == 'no_record', (
+            f"Expected state='no_record' for a never-submitted id, got: {result}"
         )
         assert result.get('reason'), (
             f"Expected non-empty reason string for unknown id, got: {result}"
@@ -2002,24 +2004,22 @@ class TestMergeCancel:
     async def test_cancel_finalized_popped_id_resolves_via_durable_tier(self, tmp_path: Path):
         """Cancelling a finalized+popped request_id returns the durable terminal state.
 
-        Injects a tiny fake event_store that returns a finalized row for 'mr-finalized'
-        and None for other ids.  No waiter is registered (simulating finalized+popped).
+        A real event store holds a 'done' merge_finalized row for 'mr-finalized' in
+        the server's own run.  No waiter is registered (simulating finalized+popped).
         merge_cancel('mr-finalized') must return {cancelled: False, state: 'done', reason:
-        <non-empty>} — not 'unknown'.  merge_cancel('mr-never') must still return state='unknown'.
-
-        RED until step-10 impl: the None-rec branch always returns 'unknown' and never
-        consults event_store.
+        <non-empty>} — not an epistemic state.  merge_cancel('mr-never') returns 'no_record'.
         """
+        from orchestrator.event_store import (
+            EventStore,
+            EventType,
+        )
 
-        class FakeEventStore:
-            def latest_merge_finalized(self, request_id=None, branch=None, task_id=None):
-                if request_id == 'mr-finalized':
-                    return {
-                        'request_id': request_id,
-                        'state': 'done',
-                        'finished_at': '2026-01-01T00:00:00+00:00',
-                    }
-                return None
+        event_store = EventStore(db_path=tmp_path / 'events-finalized.db', run_id='cancel')
+        event_store.emit(
+            EventType.merge_finalized,
+            task_id='T-fin',
+            data={'request_id': 'mr-finalized', 'branch': 'T-fin', 'state': 'done'},
+        )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
@@ -2031,7 +2031,7 @@ class TestMergeCancel:
             merge_queue=mq,
             orch_config=orch_config,
             merge_inflight_registry=registry,
-            event_store=FakeEventStore(),
+            event_store=event_store,
         )
 
         # No waiter registered for 'mr-finalized' (simulates finalized+popped)
@@ -2047,101 +2047,58 @@ class TestMergeCancel:
             f"Expected non-empty reason for finalized id, got: {result_finalized}"
         )
 
-        # An id not in the event_store must still return 'unknown'
         result_never = await call_merge_cancel(server, request_id='mr-never')
-        assert result_never.get('state') == 'unknown', (
-            f"Expected state='unknown' for truly unknown id, got: {result_never}"
+        assert result_never.get('state') == 'no_record', (
+            f"Expected state='no_record' for a never-submitted id, got: {result_never}"
         )
 
-    async def test_cancel_finalized_popped_id_resolves_via_retention_ring(
+    async def test_cancel_finalized_popped_id_ignores_the_retention_ring(
         self, tmp_path: Path
     ):
-        """Cancelling a finalized+popped id resolves via the retention ring (Tier 2).
+        """A finalized+popped id resolves from the event store, never the retention ring.
 
-        Injects a fake harness whose ``_terminal_retention`` ring returns a record for
-        'mr-ring-hit' (state='done') and a fake event_store that would return 'conflict'
-        for the same id.  The ring (Tier 2) must take precedence over the event_store
-        (Tier 3).
-
-        Also asserts:
-          - 'mr-store-only' (ring miss, event_store hit) returns state='conflict'.
-          - 'mr-never' (both miss) returns state='unknown'.
-
-        Previously untested: test_cancel_finalized_popped_id_resolves_via_durable_tier
-        covers the event_store-only path but not the retention-ring path.  A regression
-        in the ring branch (e.g. wrong attribute name, wrong precedence) would go
-        undetected without this test.
+        'mr-finalized' has a 'conflict' merge_finalized row in the server's own
+        run and a disagreeing 'done' ring record; 'mr-never' is in neither.
         """
-
-        class FakeRetentionRecord:
-            def __init__(self, request_id: str, state: str) -> None:
-                self.request_id = request_id
-                self.state = state
-                self.finished_at = 1_700_000_000.0  # epoch float — normalised by _epoch_to_iso8601
-                self.superseded_by = None
-
-        class FakeRetentionRing:
-            def get(self, request_id: str):
-                if request_id == 'mr-ring-hit':
-                    return FakeRetentionRecord('mr-ring-hit', 'done')
-                return None
-
-        class FakeHarness:
-            _terminal_retention = FakeRetentionRing()
-
-        class FakeEventStore:
-            def latest_merge_finalized(self, request_id=None, branch=None, task_id=None):
-                if request_id == 'mr-ring-hit':
-                    # Ring takes precedence — this row must NOT be returned
-                    return {
-                        'request_id': request_id,
-                        'state': 'conflict',
-                        'finished_at': '2026-01-01T00:00:00+00:00',
-                    }
-                if request_id == 'mr-store-only':
-                    return {
-                        'request_id': request_id,
-                        'state': 'conflict',
-                        'finished_at': '2026-01-01T00:00:00+00:00',
-                    }
-                return None
-
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        mq: asyncio.Queue = asyncio.Queue()
-        orch_config = _make_orch_config(tmp_path / 'repo')
-        registry = _make_registry()
-
-        server = create_server(
-            esc_queue,
-            merge_queue=mq,
-            orch_config=orch_config,
-            merge_inflight_registry=registry,
-            harness=FakeHarness(),
-            event_store=FakeEventStore(),
+        from orchestrator.event_store import (
+            EventStore,
+            EventType,
+        )
+        from orchestrator.merge_queue import (
+            TerminalOutcomeRecord,
+            TerminalOutcomeRetention,
         )
 
-        # Ring hit: returns state='done' from ring (not 'conflict' from event_store)
-        result_ring = await call_merge_cancel(server, request_id='mr-ring-hit')
-        assert result_ring.get('cancelled') is False, (
-            f"Expected cancelled=False for finalized ring-hit id, got: {result_ring}"
+        event_store = EventStore(db_path=tmp_path / 'events-cancel.db', run_id='cancel')
+        event_store.emit(
+            EventType.merge_finalized,
+            task_id='T-fin',
+            phase='merge',
+            data={'request_id': 'mr-finalized', 'branch': 'b-fin', 'state': 'conflict'},
         )
-        assert result_ring.get('state') == 'done', (
-            f"Expected state='done' from retention ring (Tier 2), got: {result_ring}"
-        )
-        assert result_ring.get('reason'), (
-            f"Expected non-empty reason for finalized ring-hit id, got: {result_ring}"
-        )
-
-        # Event-store only: ring misses, falls through to event_store
-        result_store = await call_merge_cancel(server, request_id='mr-store-only')
-        assert result_store.get('state') == 'conflict', (
-            f"Expected state='conflict' from event_store (Tier 3), got: {result_store}"
+        ring = TerminalOutcomeRetention()
+        ring.record(TerminalOutcomeRecord(
+            request_id='mr-finalized', task_id='T-fin', branch='b-fin', state='done',
+        ))
+        server, _, _, _, _ = _build_merge_server(
+            tmp_path, retention=ring, event_store=event_store,
         )
 
-        # Truly unknown: both tiers miss
+        result_finalized = await call_merge_cancel(server, request_id='mr-finalized')
+        assert result_finalized.get('cancelled') is False, (
+            f"Expected cancelled=False for finalized id, got: {result_finalized}"
+        )
+        assert result_finalized.get('state') == 'conflict', (
+            f"Expected state='conflict' from the event store, not 'done' from the "
+            f"ring, got: {result_finalized}"
+        )
+        assert result_finalized.get('reason'), (
+            f"Expected non-empty reason for finalized id, got: {result_finalized}"
+        )
+
         result_never = await call_merge_cancel(server, request_id='mr-never')
-        assert result_never.get('state') == 'unknown', (
-            f"Expected state='unknown' when both durable tiers miss, got: {result_never}"
+        assert result_never.get('state') == 'no_record', (
+            f"Expected state='no_record' when every durable tier misses, got: {result_never}"
         )
 
 
@@ -2491,22 +2448,20 @@ class TestBoundaryTableMcpSurface:
         """Row 4: merge_status across queued → verifying → done lifecycle.
 
         Drive states strictly at the worker/verify boundary (fake snapshot()).
-        Records a terminal TerminalOutcomeRecord into harness._terminal_retention
-        for the 'done' transition.
+        The 'done' transition resolves the entry's future, whose done-callback
+        writes merge_finalized into the server's own event store.
         """
         import time
 
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            TerminalOutcomeRecord,
-            TerminalOutcomeRetention,
-        )
+        from orchestrator.event_store import EventStore
+        from orchestrator.merge_queue import MergeOutcome
 
         worker = _FakeMergeWorker()
-        retention = TerminalOutcomeRetention()
-        server, mq, _, _, harness = _build_merge_server(
+        event_store = EventStore(db_path=tmp_path / 'events-sc4.db', run_id='sc4')
+        server, mq, _, _, _ = _build_merge_server(
             tmp_path,
             worker=worker,
-            retention=retention,
+            event_store=event_store,
         )
 
         # Submit to get a real request_id
@@ -2553,44 +2508,35 @@ class TestBoundaryTableMcpSurface:
             f"Expected 'verifying' state, got: {status_verifying}"
         )
 
-        # ── State 3: done (from retention ring) ────────────────────────────
+        # ── State 3: done (from the event store) ───────────────────────────
         worker.set_entries([])  # worker no longer tracking it
-        retention.record(TerminalOutcomeRecord(
-            request_id=rid,
-            task_id='sc4',
-            branch='sc4',
-            state='done',
-            merge_sha='abc123sc4',
-        ))
+        mq.get_nowait().result.set_result(MergeOutcome('done', merge_sha='abc123sc4'))
+        await asyncio.sleep(0)  # let the _on_finalized done-callback run
 
         status_done = await call_merge_status(server, request_id=rid)
         assert status_done['state'] == 'done', (
-            f"Expected 'done' from retention ring, got: {status_done}"
+            f"Expected 'done' from the event store, got: {status_done}"
+        )
+        assert status_done.get('source') == 'event_store', (
+            f"Expected source='event_store', got: {status_done}"
         )
         assert 'outcome' in status_done, (
             f"Terminal entry must include outcome: {status_done}"
         )
 
-        # Cleanup
-        req = mq.get_nowait()
-        req.result.cancel()
-
-    async def test_scenario_5_merge_status_restart_and_unknown(
+    async def test_scenario_5_merge_status_restart_and_no_record(
         self, tmp_path: Path,
     ) -> None:
-        """Row 5: merge_status after restart uses event store; unknown returns hint.
+        """Row 5: merge_status after restart uses event store; a clean miss is no_record.
 
         (a) Emit merge_finalized directly to a real EventStore.  Build a fresh
-        server with empty retention ring but same EventStore; assert merge_status
-        returns the terminal state from the event store.
-        (b) merge_status('mr-doesnotexist') → {state:'unknown', hint:'check git log main'}.
+        server on the same EventStore; assert merge_status returns the terminal
+        state from the event store.
+        (b) merge_status('mr-doesnotexist') → no_record with the never_submitted hint.
         """
         from orchestrator.event_store import (  # type: ignore[reportMissingImports]
             EventStore,
             EventType,
-        )
-        from orchestrator.merge_queue import (
-            TerminalOutcomeRetention,  # type: ignore[reportMissingImports]
         )
 
         db_path = tmp_path / 'events-sc5.db'
@@ -2614,16 +2560,14 @@ class TestBoundaryTableMcpSurface:
             },
         )
 
-        # Build a FRESH server with empty retention (simulating restart)
-        # but the same event_store
+        # Build a FRESH server (simulating restart) on the same event_store
         from orchestrator.merge_queue import (
             InFlightMergeRegistry,  # type: ignore[reportMissingImports]
         )
 
         from escalation.queue import EscalationQueue  # type: ignore[reportMissingImports]
 
-        fresh_retention = TerminalOutcomeRetention()
-        fresh_harness = _FakeHarness(retention=fresh_retention)
+        fresh_harness = _FakeHarness()
         fresh_server = create_server(
             EscalationQueue(tmp_path / 'esc-sc5'),
             merge_queue=asyncio.Queue(),
@@ -2643,14 +2587,13 @@ class TestBoundaryTableMcpSurface:
             f"Expected request_id={KNOWN_RID!r}, got: {status_known}"
         )
 
-        # (b) Unknown id → {state:'unknown', hint:...}
-        status_unknown = await call_merge_status(fresh_server, request_id='mr-doesnotexist')
-        assert status_unknown.get('state') == 'unknown', (
-            f"Expected state='unknown' for unknown id, got: {status_unknown}"
+        # (b) Never-submitted id → no_record with the reason-derived hint
+        status_missing = await call_merge_status(fresh_server, request_id='mr-doesnotexist')
+        assert status_missing.get('state') == 'no_record', (
+            f"Expected state='no_record' for a never-submitted id, got: {status_missing}"
         )
-        assert 'hint' in status_unknown, f"Expected 'hint' key: {status_unknown}"
-        assert 'check git log main' in status_unknown['hint'], (
-            f"Expected 'check git log main' in hint, got: {status_unknown['hint']!r}"
+        assert status_missing.get('hint') == hint_for(MergeReason.never_submitted), (
+            f"Expected the never_submitted hint, got: {status_missing}"
         )
 
     async def test_scenario_6_explicit_cancel(
@@ -2727,22 +2670,22 @@ class TestBoundaryTableMcpSurface:
 
         Submit with wait_secs=30, advance loop, drain queue for request_id,
         cancel the merge_request Task (simulates disconnect).  Assert the entry
-        future is NOT cancelled.  Manually record 'done' into retention ring.
-        Build a NEW server with same retention; assert merge_status returns 'done'.
-        Extends test_bounded_wait_disconnect_does_not_cancel_entry with
-        new-session merge_status cross-check.
+        future is NOT cancelled.  Resolve it 'done', which writes merge_finalized
+        into the event store.  Build a NEW server on the same event store; assert
+        merge_status returns 'done'.  Extends
+        test_bounded_wait_disconnect_does_not_cancel_entry with new-session
+        merge_status cross-check.
         """
+        from orchestrator.event_store import EventStore
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             InFlightMergeRegistry,  # type: ignore[reportMissingImports]
             MergeOutcome,
-            TerminalOutcomeRecord,
-            TerminalOutcomeRetention,
         )
 
         from escalation.queue import EscalationQueue  # type: ignore[reportMissingImports]
 
-        retention = TerminalOutcomeRetention()
-        server, mq, _, _, _ = _build_merge_server(tmp_path, retention=retention)
+        event_store = EventStore(db_path=tmp_path / 'events-sc7.db', run_id='sc7')
+        server, mq, _, _, _ = _build_merge_server(tmp_path, event_store=event_store)
 
         merge_task = asyncio.create_task(
             call_merge_request(
@@ -2772,31 +2715,25 @@ class TestBoundaryTableMcpSurface:
             'Entry future must NOT be cancelled after MCP disconnect — shield protects it'
         )
 
-        # Manually record the terminal 'done' outcome into the retention ring
-        retention.record(TerminalOutcomeRecord(
-            request_id=rid,
-            task_id='sc7',
-            branch='sc7',
-            state='done',
-            merge_sha='sha-sc7',
-        ))
         # Resolve the entry future (worker finished)
-        req.result.set_result(MergeOutcome('done', reason='late resolve'))
+        req.result.set_result(MergeOutcome('done', reason='late resolve', merge_sha='sha-sc7'))
+        await asyncio.sleep(0)  # let the _on_finalized done-callback run
 
-        # Build a fresh server sharing the same retention ring (simulating new session)
+        # Build a fresh server on the same event store (simulating new session)
         fresh_server = create_server(
             EscalationQueue(tmp_path / 'esc-sc7-fresh'),
             merge_queue=asyncio.Queue(),
             orch_config=_make_orch_config(tmp_path / 'repo-sc7'),
-            harness=_FakeHarness(retention=retention),
+            event_store=event_store,
+            harness=_FakeHarness(),
             merge_inflight_registry=InFlightMergeRegistry(),
             startup_sweep=False,
         )
 
-        # New session: merge_status must find 'done' from retention ring
+        # New session: merge_status must find 'done' from the event store
         status = await call_merge_status(fresh_server, request_id=rid)
         assert status.get('state') == 'done', (
-            f"Expected 'done' from retention ring in new session, got: {status}"
+            f"Expected 'done' from the event store in new session, got: {status}"
         )
 
     async def test_scenario_8_coalesce_returns_existing_request_id(
@@ -2872,7 +2809,7 @@ class TestBoundaryTableMcpSurface:
             with status=='queued' and a valid 'mr-' request_id R.
         (b) POLL half: set the fake worker snapshot so it echoes the submitted
             entry, then call merge_status(request_id=R) (and merge_status(branch=B));
-            assert both resolve to a coherent non-'unknown' state whose
+            assert both resolve to a coherent outcome (non-epistemic) state whose
             request_id and branch match the submission.
 
         This is the runtime analogue of the §7.3 invariant — exercised end-to-end
@@ -2918,8 +2855,8 @@ class TestBoundaryTableMcpSurface:
             call_merge_status(server, request_id=R),
             timeout=2.0,
         )
-        assert status_by_rid.get('state') != 'unknown', (
-            f"POLL by request_id: expected non-'unknown' state, got: {status_by_rid}"
+        assert status_by_rid.get('state') not in EPISTEMIC_STATES, (
+            f"POLL by request_id: expected an outcome state, got: {status_by_rid}"
         )
         assert status_by_rid.get('request_id') == R, (
             f"POLL by request_id: expected request_id={R!r}, got: {status_by_rid.get('request_id')!r}"
@@ -2930,8 +2867,8 @@ class TestBoundaryTableMcpSurface:
             call_merge_status(server, branch='sc14'),
             timeout=2.0,
         )
-        assert status_by_branch.get('state') != 'unknown', (
-            f"POLL by branch: expected non-'unknown' state, got: {status_by_branch}"
+        assert status_by_branch.get('state') not in EPISTEMIC_STATES, (
+            f"POLL by branch: expected an outcome state, got: {status_by_branch}"
         )
         assert status_by_branch.get('request_id') == R, (
             f"POLL by branch: expected request_id={R!r}, got: {status_by_branch.get('request_id')!r}"
@@ -2940,66 +2877,6 @@ class TestBoundaryTableMcpSurface:
         # Cleanup
         req = mq.get_nowait()
         req.result.cancel()
-
-    async def test_scenario_superseded_ring_tier(
-        self, tmp_path: Path,
-    ) -> None:
-        """Superseded surface via retention ring (Tier 2).
-
-        Record two TerminalOutcomeRecords directly into the ring:
-          1. absorbed request (state='superseded', superseded_by='mr-train')
-          2. train request    (state='done', merge_sha='sha-train')
-
-        Assert:
-          - merge_status(request_id='mr-absorbed') → state='superseded', outcome='superseded',
-            superseded_by='mr-train'
-          - merge_status(request_id='mr-train')    → state='done'
-
-        RED: _map_terminal_state collapses 'superseded' → 'blocked', and the ring meta
-        never threads superseded_by, so neither assertion passes until step-2 impl.
-        """
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            TerminalOutcomeRecord,
-            TerminalOutcomeRetention,
-        )
-
-        retention = TerminalOutcomeRetention()
-        server, _, _, _, _ = _build_merge_server(tmp_path, retention=retention)
-
-        # Record absorbed request into ring
-        retention.record(TerminalOutcomeRecord(
-            request_id='mr-absorbed',
-            task_id='task-absorbed',
-            branch='branch-absorbed',
-            state='superseded',
-            superseded_by='mr-train',
-        ))
-        # Record train request into ring
-        retention.record(TerminalOutcomeRecord(
-            request_id='mr-train',
-            task_id='task-train',
-            branch='branch-train',
-            state='done',
-            merge_sha='sha-train',
-        ))
-
-        # Assert absorbed → state='superseded', outcome='superseded', superseded_by='mr-train'
-        status_absorbed = await call_merge_status(server, request_id='mr-absorbed')
-        assert status_absorbed.get('state') == 'superseded', (
-            f"Expected state='superseded' for absorbed request, got: {status_absorbed}"
-        )
-        assert status_absorbed.get('outcome') == 'superseded', (
-            f"Expected outcome='superseded' for absorbed request, got: {status_absorbed}"
-        )
-        assert status_absorbed.get('superseded_by') == 'mr-train', (
-            f"Expected superseded_by='mr-train', got: {status_absorbed}"
-        )
-
-        # Assert train → state='done'
-        status_train = await call_merge_status(server, request_id='mr-train')
-        assert status_train.get('state') == 'done', (
-            f"Expected state='done' for train request, got: {status_train}"
-        )
 
     async def test_scenario_superseded_event_store_tier(
         self, tmp_path: Path,
@@ -3630,15 +3507,12 @@ class TestMergeRequestRetentionParity:
       - enqueue_merge_request's _on_finalized callback records a
         TerminalOutcomeRecord for an MCP-dispatched merge once it finishes;
       - the coalesce arm calls retention.record_alias for a coalesced
-        submission, so the coalesced request_id later resolves to the
-        primary's outcome;
-      - merge_status's Tier-2 read (_durable_terminal_state) can therefore
-        serve MCP-submitted merges even when every other tier misses.
+        submission.
 
-    All three tests below pin one invariant: there is no partial
-    implementation that satisfies one without the others, since a single
-    retention=... kwarg at the coalesce_or_enqueue_merge_request call site
-    is what makes all three true simultaneously.
+    Both tests below pin one invariant: there is no partial implementation
+    that satisfies one without the other, since a single retention=... kwarg
+    at the coalesce_or_enqueue_merge_request call site is what makes both
+    true simultaneously.  merge_status does not read this ring.
     """
 
     async def test_dispatched_merge_records_terminal_outcome_in_ring(
@@ -3687,7 +3561,6 @@ class TestMergeRequestRetentionParity:
         self, tmp_path: Path,
     ) -> None:
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            MergeOutcome,
             TerminalOutcomeRetention,
         )
 
@@ -3751,77 +3624,13 @@ class TestMergeRequestRetentionParity:
             "requires merge_request's coalesce_or_enqueue_merge_request call "
             'to pass retention=...'
         )
-        coalesced_id, alias_primary = ring.alias_calls[0]
+        _, alias_primary = ring.alias_calls[0]
         assert alias_primary == primary_rid, (
             f'Expected the alias to point at the primary {primary_rid!r}, '
             f'got: {alias_primary!r}'
         )
 
-        # Resolve the PRIMARY's future for real, through the same production
-        # path as test_dispatched_merge_records_terminal_outcome_in_ring, so
-        # enqueue_merge_request's _on_finalized callback writes a genuine
-        # TerminalOutcomeRecord for primary_rid (only the first submission
-        # was ever enqueued — the coalesced one attached to it instead).
-        req = mq.get_nowait()
-        assert req.request_id == primary_rid
-        req.result.set_result(MergeOutcome('done', merge_sha='ret-b-sha'))
-        await asyncio.sleep(0)  # let the _on_finalized done-callback run
-
-        # The user-visible consequence: a caller polling merge_status with
-        # the COALESCED request_id (never itself enqueued) must resolve —
-        # via the record_alias entry asserted above — to the primary's real
-        # terminal outcome.
-        status = await asyncio.wait_for(
-            call_merge_status(server, request_id=coalesced_id), timeout=2.0,
-        )
-        assert status.get('state') == 'done', (
-            f'Expected merge_status(request_id={coalesced_id!r}) to resolve '
-            f"'done' via the alias to primary {primary_rid!r}, got: {status}"
-        )
-
-    async def test_merge_status_resolves_mcp_submitted_merge_from_retention_tier(
-        self, tmp_path: Path,
-    ) -> None:
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            MergeOutcome,
-            TerminalOutcomeRetention,
-        )
-
-        ring = TerminalOutcomeRetention()
-        # worker=None, event_store=None, git_ops=None (_build_merge_server's
-        # defaults) so Tier-1 (live snapshot), Tier-3 (event store), and
-        # Tier-3.5 (git authority) all miss — only Tier-2 (this ring) can
-        # possibly serve merge_status, making this the task's stated
-        # end-to-end consequence.
-        server, mq, _reg, _, _ = _build_merge_server(tmp_path, retention=ring)
-
-        result = await asyncio.wait_for(
-            call_merge_request(
-                server,
-                task_id='ret-c',
-                branch='ret-c',
-                worktree=str(tmp_path / 'wt-ret-c'),
-                wait_secs=0,
-            ),
-            timeout=2.0,
-        )
-        assert result.get('status') == 'queued', f'Expected queued dispatch: {result}'
-        rid = result['request_id']
-
-        req = mq.get_nowait()
-        req.result.set_result(MergeOutcome('done', merge_sha='ret-c-sha'))
-        await asyncio.sleep(0)
-
-        status = await asyncio.wait_for(
-            call_merge_status(server, request_id=rid), timeout=2.0,
-        )
-        assert status.get('state') == 'done', (
-            "Expected merge_status to resolve 'done' from the retention "
-            f'tier (every other tier misses by construction), got: {status}'
-        )
-        assert status.get('outcome') == 'done', (
-            f'Expected outcome=done, got: {status}'
-        )
+        mq.get_nowait().result.cancel()
 
 
 # ---------------------------------------------------------------------------
