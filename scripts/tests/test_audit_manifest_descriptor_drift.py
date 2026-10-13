@@ -38,6 +38,8 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -72,7 +74,7 @@ from audit_manifest_descriptor_drift import (
 )
 from git_checkout_root import checkout_root_or_skip
 from shared.capability_manifest import load_capability_manifest
-from shared.delivered_check_polarity import CheckOutcome
+from shared.delivered_check_polarity import CheckOutcome, interpret_grep_rc
 from shared.task_statuses import TERMINAL, TaskStatus
 
 # ---------------------------------------------------------------------------
@@ -2960,6 +2962,37 @@ def test_live_foreign_producer_blocks_declare_their_external_registry(
     assert block.task_id is None, (
         f"{relpath} label {label} carries a LOCAL task_id ({block.task_id}) "
         f"alongside its reify producer {external_task_id!r}."
+    )
+
+
+@dataclass(frozen=True)
+class _AnchorReading:
+    """One grep check's working-tree hits, read against the suite it certifies."""
+
+    outcome: CheckOutcome
+    paths_hit: frozenset[str]
+    defines_in_suite: bool
+    stderr: str
+
+
+def _read_identifier_anchor(root: str, *, pattern: str, paths: Sequence[str],
+                            expect: str | None, suite: str) -> _AnchorReading:
+    """Run the runtime grep argv over the working tree instead of a ref, and
+    judge its exit code with the runtime's own interpret_grep_rc."""
+    completed = subprocess.run(
+        ["git", "-C", root, "grep", "-E", "--null", "-e", pattern,
+         *(["--", *paths] if paths else [])],
+        capture_output=True, text=True, timeout=30,
+    )
+    hits = [line.split("\0", 1) for line in completed.stdout.split("\n") if line]
+    return _AnchorReading(
+        outcome=interpret_grep_rc(completed.returncode, expect),
+        paths_hit=frozenset(path for path, _text in hits),
+        defines_in_suite=any(
+            path == suite and text.lstrip().startswith(("class ", "def "))
+            for path, text in hits
+        ),
+        stderr=completed.stderr,
     )
 
 
