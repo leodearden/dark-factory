@@ -90,13 +90,14 @@ async def test_run_lifecycle(journal):
 
 
 @pytest.mark.asyncio
-async def test_fresh_schema_holds_only_ledgers_with_live_writers(journal):
+async def test_fresh_schema_creates_exactly_this_table_set(journal):
     """The tables ReconciliationJournal.initialize() creates, read from the DB file.
 
-    The dashboard, a separate process, reads these tables directly.  Per
-    INV-13 each must have a live producer, so adding one means naming its
-    writer here.  recon_ledger shares the file but is created by
-    ReconLedgerStore, not by the journal.
+    A tripwire on schema drift: the dashboard, a separate process, reads
+    these tables directly, so adding or dropping one must show up here.
+    The set cannot show that each table has a live producer (INV-13); whoever
+    adds a table owes that check.  recon_ledger shares the file but is
+    created by ReconLedgerStore, not by the journal.
     """
     db_path = journal.data_dir / 'reconciliation.db'
     conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
