@@ -12197,6 +12197,57 @@ async def test_planning_mode_candidate_key_collision_returns_combined(
     }
 
 
+_SUBMIT_TASK_RESPONSES = json.loads(
+    (
+        Path(__file__).parents[2] / 'shared' / 'tests' / 'fixtures' / 'submit_task_responses.json'
+    ).read_text()
+)['cases']
+_LIVE_SUBMIT_TASK_CASES = [
+    name for name, case in _SUBMIT_TASK_RESPONSES.items() if case.get('live')
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('case_name', _LIVE_SUBMIT_TASK_CASES)
+async def test_submit_task_returns_the_fixture_payload(
+    case_name,
+    interceptor_facade,
+    taskmaster,
+):
+    """The real ``submit_task`` returns each live payload pinned in
+    ``shared/tests/fixtures/submit_task_responses.json`` — the same file the
+    orchestrator's ``Scheduler.submit_task`` tests parse — modulo generated ids
+    and error text.
+    """
+    from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
+
+    expected = _SUBMIT_TASK_RESPONSES[case_name]['payload']
+    submit: dict[str, Any] = {'title': 'T'}
+    if case_name == 'planning_create':
+        submit['planning_mode'] = True
+    elif case_name == 'planning_collision_terminal':
+        submit['planning_mode'] = True
+        taskmaster.add_task.side_effect = DuplicateCandidateKeyError(
+            existing_id=int(expected['task_id']), existing_status=expected['status'],
+        )
+    elif case_name == 'tool_error_structured':
+        await interceptor_facade.close()
+
+    actual = await interceptor_facade.submit_task('/project', **submit)
+
+    assert actual.keys() == expected.keys()
+    generated = {'ticket': lambda v: v.startswith('tkt_')}
+    if case_name == 'planning_create':
+        generated['task_id'] = lambda v: isinstance(v, str) and bool(v)
+    if case_name == 'tool_error_structured':
+        generated['error'] = lambda v: v == expected['error']
+    for key, value in actual.items():
+        if key in generated:
+            assert generated[key](value), (key, value)
+        else:
+            assert value == expected[key], key
+
+
 # ─────────────────────────────────────────────────────────────────────
 # index_committed_tasks — write-time curator indexing for commit_planning
 # (task 2562 item 1: planning_mode tasks bypass the ticket/curator record
