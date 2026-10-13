@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeAlias, assert_never
 
 from shared.branch_names import canonical_queued_branch_name
 
+from orchestrator.branch_stack import PreStackTip
 from orchestrator.git_ops import MergeResult
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
 from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
@@ -984,6 +985,11 @@ class GroupMergeRequest(MergeRequest):
     """Optional async callback: re-drive an absorbed member still merge-deferred
     after a coalesce-train derail.  Signature: (mid, found_on_main, sha) -> None.
     None when not wired (back-compat with existing test constructions)."""
+
+    member_pre_stack_tips: tuple[PreStackTip, ...] = field(default=(), kw_only=True)
+    """The tip each stacked member had before the coalescing pass stacked it,
+    so a train that does not land can hand its members back.  Empty on a
+    declared train, whose tip workflow re-fires it."""
 
 
 @dataclass

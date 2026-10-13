@@ -45,7 +45,7 @@ from shared.mcp_post import open_mcp_client, post_mcp_tool_call
 from shared.task_metadata import RetryLedger
 
 from orchestrator import chronic_flake
-from orchestrator.branch_stack import UnstackOutcome
+from orchestrator.branch_stack import PreStackTip, TipRestore, TipRestoreOutcome, UnstackOutcome
 from orchestrator.critical_gate import critical_filing_gate
 from orchestrator.delivered_checks import gate_mark_done_on_delivered_checks
 from orchestrator.dry_run_unblock import run_dry_run_unblock
@@ -5489,6 +5489,23 @@ _COALESCE_RISKY_TERMINAL_STATES: frozenset[str] = frozenset({'blocked', 'error'}
 # Exclusion reason for a waiting single no TaskWorkflow awaits (task 4953):
 # nothing would park it merge-deferred, so a train holding it could never land.
 COALESCE_EXCLUDED_NO_AWAITING_WORKFLOW = 'no_awaiting_workflow'
+
+# Task statuses under which no live agent can own a coalesce member's branch,
+# so a train that did not land may put it back on its pre-stack tip (task 4953).
+_PRE_STACK_RESTORABLE_STATUSES: frozenset[str] = frozenset({'merge-deferred', 'pending', 'blocked'})
+
+# Restore refusals that leave a member stacked and need a human's hand.
+_TIP_RESTORE_REFUSALS: frozenset[TipRestoreOutcome] = frozenset({
+    TipRestoreOutcome.DIRTY, TipRestoreOutcome.MOVED,
+})
+
+
+def _tip_restore_remedy(restore: TipRestore) -> str:
+    """The command that finishes a refused restore by hand, once a human has
+    confirmed nothing on the branch or in its worktree is worth keeping."""
+    if restore.worktree is None:
+        return f'git update-ref refs/heads/{restore.branch} {restore.pre_stack_sha}'
+    return f'git -C {restore.worktree} reset --hard {restore.pre_stack_sha}'
 
 # How long a one-strike derail marker is remembered (task 5352).  An upper
 # bound on the subject, not a tuning dial: seven days is a generous outer
@@ -15227,6 +15244,89 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             len(member_task_ids), member_task_ids,
         )
 
+    async def _unwind_coalesce_train(self, train: GroupMergeRequest, main_sha: str) -> None:
+        """Hand back every member of a coalesce train that did not land (task 4953).
+
+        Each stacked member first goes back on its pre-stack tip
+        (:meth:`_restore_pre_stack_tips`); then the 1867 re-drive sends each
+        still-deferred member to a solo merge.  In that order because the
+        re-drive flips members to pending and the scheduler may re-dispatch
+        them at once.  The one policy for every exit of a coalesce train that
+        does not land: derail, incomplete train and admission-halt
+        dissolution.  Never raises.
+        """
+        await self._restore_pre_stack_tips(train)
+        try:
+            await self._redrive_coalesce_members(train, main_sha)
+        except Exception:
+            logger.exception(
+                'Coalesce train %s: _redrive_coalesce_members raised unexpectedly '
+                '— members may remain stranded', train.train_id,
+            )
+
+    async def _restore_pre_stack_tips(self, train: GroupMergeRequest) -> None:
+        """Put each stacked member of *train* back on its pre-stack tip.  Never raises.
+
+        Leaves every ref alone when the train's tip is already on main: the
+        train landed, and restoring would hide that from the re-drive's
+        double-landing guard.  A member is restored only while its status says
+        no live agent can own its branch (``_PRE_STACK_RESTORABLE_STATUSES``).
+        """
+        tips = train.member_pre_stack_tips
+        if not tips:
+            return
+        try:
+            if await self._git_ops.is_ancestor(
+                train.branch.full_name, self._git_ops.config.main_branch,
+            ):
+                logger.info(
+                    'Coalesce train %s: tip %s is already on main — leaving '
+                    'every member branch as it is',
+                    train.train_id, train.branch.full_name,
+                )
+                return
+            statuses = await train.status_check([tip.member_id for tip in tips])
+        except Exception:
+            logger.exception(
+                'Coalesce train %s: could not decide whether to restore pre-stack '
+                'tips — leaving members stacked', train.train_id,
+            )
+            return
+        for tip in tips:
+            await self._restore_member_tip(train.train_id, tip, statuses.get(tip.member_id))
+
+    async def _restore_member_tip(
+        self, train_id: str, tip: PreStackTip, status: str | None,
+    ) -> None:
+        if status not in _PRE_STACK_RESTORABLE_STATUSES:
+            logger.warning(
+                'Coalesce train %s: member %s is %r, so a live agent may own its '
+                'branch — leaving it stacked (pre-stack tip %s)',
+                train_id, tip.member_id, status, tip.sha,
+            )
+            return
+        try:
+            restore = await self._git_ops.restore_pre_stack_tip(tip)
+        except Exception:
+            logger.exception(
+                'Coalesce train %s: restoring member %s to pre-stack tip %s raised '
+                '— continuing with remaining members', train_id, tip.member_id, tip.sha,
+            )
+            return
+        if restore.outcome in _TIP_RESTORE_REFUSALS:
+            logger.warning(
+                'Coalesce train %s: member %s left stacked (%s: %s); found %s, '
+                'pre-stack %s. Remedy: %s',
+                train_id, tip.member_id, restore.outcome, restore.detail,
+                restore.found_sha, restore.pre_stack_sha, _tip_restore_remedy(restore),
+            )
+        else:
+            logger.info(
+                'Coalesce train %s: member %s pre-stack restore %s (%s -> %s)',
+                train_id, tip.member_id, restore.outcome,
+                restore.found_sha, restore.pre_stack_sha,
+            )
+
     async def _redrive_coalesce_members(
         self, req: GroupMergeRequest, main_sha: str,
     ) -> None:
@@ -15256,7 +15356,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             merge-deferred→done transition.  The member is first un-stacked
             from any unlanded base (:meth:`_unstack_redriven_member`, task
             5618), so neither the re-dispatched agent nor its reviewer sees
-            another task's commits.
+            another task's commits.  A member :meth:`_unwind_coalesce_train`
+            already put back on its pre-stack tip has no stack record left, so
+            the un-stack leaves it there.
 
         Members not in 'merge-deferred' (e.g. raced to 'in-progress' by a sibling)
         are left alone — the live workflow owns their done-transition.
@@ -15542,23 +15644,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         the journal, so a restart that drops an unstarted coalesce train
         strands every member merge-deferred (task 4737 owns that in general).
         Under an admission halt such a train can never start before the
-        restart, so it is dissolved first through the 1867 derail-recovery
-        re-drive: each still-deferred member goes done when already on main
-        and back to pending otherwise. Not a derail: no one-strike mark and
-        no derail event.
+        restart, so it is dissolved first through
+        :meth:`_unwind_coalesce_train`: each member goes back on its
+        pre-stack tip, then each still-deferred member goes done when already
+        on main and back to pending otherwise. Not a derail: no one-strike
+        mark and no derail event.
         """
         logger.warning(
             'Coalesce train %s: admission halted before its verify started; '
             'dissolving it and re-driving members %s to solo merges',
             train.train_id, train.member_task_ids,
         )
-        try:
-            await self._redrive_coalesce_members(train, main_sha)
-        except Exception:
-            logger.exception(
-                'Coalesce train %s: _redrive_coalesce_members raised unexpectedly '
-                '— members may remain stranded', train.train_id,
-            )
+        await self._unwind_coalesce_train(train, main_sha)
         if not train.result.done():
             train.result.set_result(MergeOutcome('superseded', reason=_COALESCE_DISSOLVED_REASON))
         self._retire_item(train.request_id)
@@ -15851,6 +15948,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             status_check=callbacks.status_check,
             mark_member_done=callbacks.mark_member_done,
             redrive_member=callbacks.redrive_member,
+            member_pre_stack_tips=stack_result.pre_stack_tips,
         )
         # MQ-reliability kappa (task 2169): group_req is a brand-new
         # request_id (GroupMergeRequest.request_id auto-generated at
@@ -16145,7 +16243,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             if outcome.status in _COALESCE_RISKY_TERMINAL_STATES:
                                 self._mark_coalesce_derailed(req.member_task_ids)
                             # 1867: durable re-drive — re-drive any absorbed members
-                            # that are still merge-deferred to solo merge.  Gated on
+                            # that are still merge-deferred to solo merge, after
+                            # handing each back on its pre-stack tip (task 4953,
+                            # _unwind_coalesce_train).  Gated on
                             # outcome != 'done' (success path owns all member flips).
                             # Broader than _COALESCE_RISKY_TERMINAL_STATES: the
                             # per-member is_ancestor guard makes all non-done outcomes
@@ -16172,14 +16272,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             # TRAIN_PARTIAL_FLIP.  Covering the done-path gap is a
                             # follow-up task.
                             if outcome.status != 'done':
-                                try:
-                                    await self._redrive_coalesce_members(req, actual_main)
-                                except Exception:
-                                    logger.exception(
-                                        'Coalesce train %s: _redrive_coalesce_members '
-                                        'raised unexpectedly — members may remain stranded',
-                                        req.train_id,
-                                    )
+                                await self._unwind_coalesce_train(req, actual_main)
                         _train_decided_item = DecidedItem(
                             request=req,
                             base_sha=actual_main, speculative=False,

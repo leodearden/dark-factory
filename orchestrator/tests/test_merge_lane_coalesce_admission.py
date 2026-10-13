@@ -10,8 +10,8 @@ risk predicate says.
 Driven through the lane's public surface over a real git repo. Every request
 is enqueued before the lane starts, so the pass runs on the merger's first
 iteration. Observed through the request futures and the ``train_coalesced``
-events only. The configured verify commands are no-ops, so a train that forms
-lands without any patching.
+events only. A train that forms verifies through the suite's autouse stub
+(``orchestrator/tests/conftest.py::_mock_merge_queue_verification``), so it lands.
 """
 
 from __future__ import annotations
@@ -55,11 +55,7 @@ def scene(tmp_path: Path) -> _Scene:
     return _Scene(
         git_ops=GitOps(_GIT, repo),
         events=EventStore(db_path=tmp_path / 'events.db', run_id='coalesce-admission'),
-        config=lane_scene_config(
-            repo, _GIT,
-            merge_train_coalesce_enabled=True,
-            test_command='true', lint_command='true', type_check_command='true',
-        ),
+        config=lane_scene_config(repo, _GIT, merge_train_coalesce_enabled=True),
     )
 
 

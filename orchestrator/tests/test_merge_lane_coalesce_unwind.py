@@ -78,11 +78,7 @@ def scene(tmp_path: Path) -> _Scene:
         repo=repo,
         git_ops=GitOps(_GIT, repo),
         events=EventStore(db_path=tmp_path / 'events.db', run_id='coalesce-unwind'),
-        config=lane_scene_config(
-            repo, _GIT,
-            merge_train_coalesce_enabled=True,
-            test_command='true', lint_command='true', type_check_command='true',
-        ),
+        config=lane_scene_config(repo, _GIT, merge_train_coalesce_enabled=True),
     )
 
 
