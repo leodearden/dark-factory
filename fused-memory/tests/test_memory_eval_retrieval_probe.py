@@ -696,17 +696,25 @@ class TestDeriveFromCensus:
         assert result.disclosures['census_rows_malformed_value'] == 3
         assert result.disclosures['census_rows_malformed_count'] == 2
 
+    @pytest.mark.parametrize('rows', [
+        pytest.param(
+            ({'value': 'twice-spelt', 'count': 7}, {'value': 'twice_spelt', 'count': 3}),
+            id='more-used-listed-first',
+        ),
+        pytest.param(
+            ({'value': 'twice_spelt', 'count': 3}, {'value': 'twice-spelt', 'count': 7}),
+            id='less-used-listed-first',
+        ),
+    ])
     def test_census_rows_spelling_one_topic_two_ways_derive_the_more_used_row(
-        self, calibration_rows, guard_clusters,
+        self, calibration_rows, guard_clusters, rows,
     ):
         """The corpus spells one topic with '-' and '_', and the census counts
         each spelling as its own row. Both rows name ONE topic, so one entry is
-        derived, from the row the census lists first: the more-used spelling."""
+        derived, from the more-used spelling, whatever order the census file
+        happens to list them in."""
         baseline = _baseline_disclosures(calibration_rows, guard_clusters)
-        census = _topic_census(
-            {'value': 'twice-spelt', 'count': 7},
-            {'value': 'twice_spelt', 'count': 3},
-        )
+        census = _topic_census(*rows)
         result = _mod().derive_registry_candidates(calibration_rows, census, guard_clusters)
 
         [kept] = _of(result, 'census_topic')
@@ -716,6 +724,20 @@ class TestDeriveFromCensus:
                 == baseline['census_topics_emitted'] + 1)
         assert (result.disclosures['slug_collisions_dropped']
                 == baseline['slug_collisions_dropped'] + 1)
+
+    def test_two_equally_used_census_spellings_keep_the_lexically_first(
+        self, calibration_rows, guard_clusters,
+    ):
+        """A tie is broken by the value itself, so the persisted tripwire key
+        never depends on the census file's row order."""
+        census = _topic_census(
+            {'value': 'tied_spelling', 'count': 4},
+            {'value': 'tied-spelling', 'count': 4},
+        )
+        result = _mod().derive_registry_candidates(calibration_rows, census, guard_clusters)
+
+        [kept] = _of(result, 'census_topic')
+        assert kept['topic'] == 'tied-spelling'
 
     def test_every_generated_candidate_is_kept_or_counted_as_a_collision(
         self, calibration_rows, guard_clusters,

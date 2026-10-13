@@ -923,9 +923,14 @@ def _derive_census_candidates(census: Any) -> _CensusDerivation:
     reported rather than silently applied. Rows whose ``value`` or ``count``
     is the wrong shape are counted separately, for the reason
     :class:`_CensusDerivation` states.
+
+    Candidates come out most-used first, ties broken by value, whatever order
+    the census file lists its rows in: that order is what lets the folded
+    dedup in :func:`derive_registry_candidates` keep a topic's more-used
+    spelling.
     """
     table = _census_topic_table(census)
-    candidates: list[dict[str, Any]] = []
+    multi_entry: list[tuple[str, int]] = []
     skipped = 0
     malformed_value = 0
     malformed_count = 0
@@ -943,7 +948,10 @@ def _derive_census_candidates(census: Any) -> _CensusDerivation:
         if count <= 1:
             skipped += 1
             continue
-        candidates.append(_candidate(
+        multi_entry.append((value, count))
+    multi_entry.sort(key=lambda row: (-row[1], row[0]))
+    candidates = [
+        _candidate(
             _slugify(value),
             project_id='dark_factory',
             derived_from='census_topic',
@@ -954,7 +962,9 @@ def _derive_census_candidates(census: Any) -> _CensusDerivation:
             phrasings=[value.replace('_', ' ').replace('-', ' ')],
             members=[],
             provenance={'census_topic_value': value, 'census_count': count},
-        ))
+        )
+        for value, count in multi_entry
+    ]
     return _CensusDerivation(candidates, skipped, malformed_value, malformed_count)
 
 
@@ -1000,8 +1010,8 @@ def derive_registry_candidates(
     topic_guard_cluster > census_topic, since a curator gate knows its
     canonical's hash, a guard cluster carries hand-written match phrases, and
     a census topic has only a phrasing synthesised from its own slug. Between
-    two census rows, the census's own count-descending order keeps the
-    more-used spelling. Every dropped candidate is counted in
+    two census rows, the more-used spelling is kept, and on a tie the
+    lexically first. Every dropped candidate is counted in
     ``slug_collisions_dropped``, so the per-source counts plus collisions
     account for every candidate generated.
     """
