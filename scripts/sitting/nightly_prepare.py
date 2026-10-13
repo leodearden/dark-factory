@@ -67,15 +67,7 @@ if str(_REPO_ROOT / 'scripts' / 'legibility') not in sys.path:
 from legibility import account_pool  # noqa: E402
 from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
 from shared.cli_invoke import build_claude_argv  # noqa: E402
-from sitting import preparation  # noqa: E402
-from sitting.inventory import key_str  # noqa: E402
-from sitting.preparation import (  # noqa: E402
-    DEFAULT_INBOX_PATH,
-    DEFAULT_PREPARATION_PATH,
-    NIGHTLY_CONFINEMENT_ENV,
-    Preparation,
-    PreparationStoreCorrupt,
-)
+from sitting import inventory, preparation  # noqa: E402  # debt: task 6760
 
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG = 0, 1, 2
 
@@ -236,7 +228,7 @@ def run(settings: Settings, *, gate: Any = None) -> int:
     finally:
         for path in temp_files:
             Path(path).unlink(missing_ok=True)
-    return _judge(completed, settings, _measure(inbox, root / DEFAULT_PREPARATION_PATH))
+    return _judge(completed, settings, _measure(inbox, root / preparation.DEFAULT_PREPARATION_PATH))
 
 
 def main(argv: Sequence[str] | None = None, *, gate: Any = None) -> int:
@@ -250,7 +242,7 @@ def main(argv: Sequence[str] | None = None, *, gate: Any = None) -> int:
 
 
 def _new_inbox(root: Path) -> Path:
-    inbox = root / DEFAULT_INBOX_PATH / datetime.now(UTC).strftime(TIMESTAMP_FORMAT)
+    inbox = root / preparation.DEFAULT_INBOX_PATH / datetime.now(UTC).strftime(TIMESTAMP_FORMAT)
     inbox.mkdir(parents=True)
     return inbox
 
@@ -272,7 +264,7 @@ def _mcp_config(path: Path) -> dict[str, Any]:
 def _child_env(gate: Any) -> dict[str, str]:
     env = dict(os.environ)
     env.pop('ANTHROPIC_API_KEY', None)
-    env[NIGHTLY_CONFINEMENT_ENV] = '1'
+    env[preparation.NIGHTLY_CONFINEMENT_ENV] = '1'
     lease = gate.try_lease(reverse=True)
     if lease is None:
         _log('no pool account available; the run inherits this environment')
@@ -308,16 +300,19 @@ def _measure(inbox: Path, store_path: Path) -> Outcome:
     offered, undecodable = _offered(inbox)
     try:
         store = preparation.load(store_path)
-    except PreparationStoreCorrupt as exc:
+    except preparation.PreparationStoreCorrupt as exc:
         _log(f'the preparation store is unreadable, counting 0 recorded: {exc}')
         return Outcome(len(offered), undecodable, 0)
     recorded = sum(1 for key, offers in offered.items() if store.entries.get(key) in offers)
     return Outcome(len(offered), undecodable, recorded)
 
 
-def _offered(inbox: Path) -> tuple[dict[str, list[Preparation]], int]:
-    """Each decodable preparation in ``inbox/*.json`` by item key, and how many files or entries were not."""
-    offered: dict[str, list[Preparation]] = {}
+def _offered(inbox: Path) -> tuple[dict[str, list[preparation.Preparation]], int]:
+    """Each decodable preparation in ``inbox/*.json`` by item key, and how many files or entries were not.
+
+    The files are agent-written, so a decoder may fail in any way and none of them may end the measurement.
+    """
+    offered: dict[str, list[preparation.Preparation]] = {}
     undecodable = 0
     for path in sorted(inbox.glob('*.json')):
         try:
@@ -328,10 +323,10 @@ def _offered(inbox: Path) -> tuple[dict[str, list[Preparation]], int]:
         for entry in data if isinstance(data, list) else [data]:
             try:
                 prep = preparation.from_json_payload(entry)
-            except Exception:  # noqa: BLE001 - agent-written JSON is untrusted; a decoder may fail any way
+            except Exception:
                 undecodable += 1
                 continue
-            offered.setdefault(key_str(prep.item_key), []).append(prep)
+            offered.setdefault(inventory.key_str(prep.item_key), []).append(prep)
     return offered, undecodable
 
 
