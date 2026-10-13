@@ -11,7 +11,9 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any, TypeAlias
 
-from fused_memory.middleware.task_creation_journal import CreationOutcomes
+from shared.task_metadata_wire import coerce_task_metadata
+
+from fused_memory.middleware.task_creation_journal import CreationOutcomes, TaskKey, task_key
 from fused_memory.reconciliation.flag_dedup import (
     LookupVerdict,
     TaskLookup,
@@ -20,10 +22,6 @@ from fused_memory.reconciliation.flag_dedup import (
 )
 
 logger = logging.getLogger(__name__)
-
-#: ``(project_id, task_id)``. Taskmaster ids are per-project, so the same id
-#: under two projects is two tasks.
-TaskKey: TypeAlias = tuple[str | None, str]
 
 HINTS_UPDATED_ACTION = 'task_hints_updated'
 
@@ -35,21 +33,7 @@ def _dict_records(records: object) -> list[dict[Any, Any]]:
 
 
 def _record_key(record: dict[Any, Any], default_project_id: str | None) -> TaskKey | None:
-    """A record's normalised key; a missing or blank project_id falls back to the default.
-
-    The fallback stops an omitted project_id from masquerading as a second,
-    cross-project filing of the same task.
-    """
-    task_id = record.get('task_id')
-    if task_id is None:
-        return None
-    task_id_str = str(task_id).strip()
-    if not task_id_str:
-        return None
-    project_id = record.get('project_id')
-    if project_id is None:
-        return (default_project_id, task_id_str)
-    return (str(project_id).strip() or default_project_id, task_id_str)
+    return task_key(record.get('project_id'), record.get('task_id'), default_project_id)
 
 
 def action_record_keys(
@@ -153,18 +137,6 @@ def hints_update_claims(
     }
 
 
-def _decode_object(value: object) -> dict[Any, Any]:
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        try:
-            decoded = json.loads(value)
-        except ValueError:
-            return {}
-        return decoded if isinstance(decoded, dict) else {}
-    return {}
-
-
 def hints_claim_confirmed(claim: HintsClaim, get_task_result: object) -> bool:
     """True iff the re-read task's memory_hints contain every claimed entry.
 
@@ -174,7 +146,8 @@ def hints_claim_confirmed(claim: HintsClaim, get_task_result: object) -> bool:
     if not isinstance(get_task_result, dict) or not confirm_task_present(get_task_result):
         return False
     try:
-        hints = _decode_object(get_task_result.get('metadata')).get('memory_hints')
+        metadata = coerce_task_metadata(get_task_result.get('metadata')) or {}
+        hints = metadata.get('memory_hints')
         if not isinstance(hints, dict):
             return False
         return (

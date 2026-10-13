@@ -26,6 +26,7 @@ from fused_memory.middleware.task_creation_journal import (
     CreationOutcomes,
     creation_operation_for,
     read_run_creation_outcomes,
+    task_key,
 )
 from fused_memory.middleware.task_curator import CuratorDecision, RewrittenTask
 from fused_memory.middleware.task_interceptor import TaskInterceptor
@@ -35,6 +36,7 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 RUN = 'f9e49aef-0000-4000-8000-000000000001'
 OTHER_RUN = '90d762d0-0000-4000-8000-000000000002'
 STAGE2_AGENT = 'recon-stage-task_knowledge_sync'
+STAGE2_PROJECT = 'dark_factory'
 
 
 # ── Section 1a: CreationAttribution.from_submission ─────────────────────────
@@ -139,7 +141,34 @@ class TestCreationOperationFor:
         assert creation_operation_for(status) is None
 
 
-# ── Section 1d: the per-run reader over a REAL WriteJournal ─────────────────
+# ── Section 1d: task_key — the one key rule for rows and records ────────────
+
+
+class TestTaskKey:
+    @pytest.mark.parametrize(
+        'project_id, task_id, expected',
+        [
+            ('reify', '7', ('reify', '7')),
+            (' reify ', ' 7 ', ('reify', '7')),
+            ('reify', 7, ('reify', '7')),
+            (None, '7', (STAGE2_PROJECT, '7')),
+            ('', '7', (STAGE2_PROJECT, '7')),
+            ('   ', '7', (STAGE2_PROJECT, '7')),
+        ],
+        ids=['plain', 'whitespace', 'int-id', 'no-project', 'empty-project', 'blank-project'],
+    )
+    def test_normalises_both_parts(self, project_id, task_id, expected):
+        assert task_key(project_id, task_id, STAGE2_PROJECT) == expected
+
+    @pytest.mark.parametrize('task_id', [None, '', '   '])
+    def test_missing_task_id_is_no_key(self, task_id):
+        assert task_key('reify', task_id, STAGE2_PROJECT) is None
+
+    def test_default_project_may_itself_be_none(self):
+        assert task_key(None, '7', None) == (None, '7')
+
+
+# ── Section 1e: the per-run reader over a REAL WriteJournal ─────────────────
 
 
 @pytest_asyncio.fixture
@@ -178,6 +207,11 @@ async def _log_row(
     )
 
 
+async def _read(journal, run_id: str = RUN) -> CreationOutcomes | None:
+    """Read *run_id*'s outcomes as Stage 2 of ``STAGE2_PROJECT`` does."""
+    return await read_run_creation_outcomes(journal, run_id, default_project_id=STAGE2_PROJECT)
+
+
 class TestReadRunCreationOutcomes:
     @pytest.mark.asyncio
     async def test_reads_created_and_combined_keys_for_the_run(self, write_journal):
@@ -187,7 +221,7 @@ class TestReadRunCreationOutcomes:
             project_id='dark_factory',
         )
 
-        outcomes = await read_run_creation_outcomes(write_journal, RUN)
+        outcomes = await _read(write_journal)
 
         assert outcomes == CreationOutcomes(
             created=frozenset({('solar_challenge', '105')}),
@@ -211,7 +245,7 @@ class TestReadRunCreationOutcomes:
             payload={'task_id': '204'},
         )
 
-        outcomes = await read_run_creation_outcomes(write_journal, RUN)
+        outcomes = await _read(write_journal)
 
         assert outcomes == CreationOutcomes(
             created=frozenset({('solar_challenge', '105')}), combined=frozenset(),
@@ -226,7 +260,7 @@ class TestReadRunCreationOutcomes:
             project_id=' solar_challenge ',
         )
 
-        outcomes = await read_run_creation_outcomes(write_journal, RUN)
+        outcomes = await _read(write_journal)
 
         assert outcomes is not None
         assert outcomes.created == {('solar_challenge', '105')}
@@ -236,13 +270,13 @@ class TestReadRunCreationOutcomes:
     async def test_row_without_a_task_id_is_skipped(self, write_journal, task_id):
         await _log_row(write_journal, operation=TASK_CREATED_OPERATION, task_id=task_id)
 
-        outcomes = await read_run_creation_outcomes(write_journal, RUN)
+        outcomes = await _read(write_journal)
 
         assert outcomes == CreationOutcomes(created=frozenset(), combined=frozenset())
 
     @pytest.mark.asyncio
     async def test_an_empty_run_is_empty_outcomes_not_unavailable(self, write_journal):
-        assert await read_run_creation_outcomes(write_journal, RUN) == CreationOutcomes(
+        assert await _read(write_journal) == CreationOutcomes(
             created=frozenset(), combined=frozenset(),
         )
 
@@ -259,47 +293,63 @@ class TestReadRunCreationOutcomes:
             'not-a-row',
         ])
 
-        outcomes = await read_run_creation_outcomes(stub, RUN)
+        outcomes = await _read(stub)
 
         assert outcomes == CreationOutcomes(created=frozenset({('p', '9')}), combined=frozenset())
 
     @pytest.mark.asyncio
-    async def test_row_with_no_project_id_keys_as_none(self, write_journal):
+    @pytest.mark.parametrize('project_id', [None, '', '   '])
+    async def test_row_with_no_project_id_keys_under_the_default_project(
+        self, write_journal, project_id,
+    ):
         await _log_row(
-            write_journal, operation=TASK_CREATED_OPERATION, task_id='5', project_id=None,
+            write_journal, operation=TASK_CREATED_OPERATION, task_id='5', project_id=project_id,
         )
 
-        outcomes = await read_run_creation_outcomes(write_journal, RUN)
+        outcomes = await _read(write_journal)
 
         assert outcomes is not None
-        assert outcomes.created == {(None, '5')}
+        assert outcomes.created == {(STAGE2_PROJECT, '5')}
+
+    @pytest.mark.asyncio
+    async def test_rows_and_records_share_one_key_rule(self, write_journal):
+        """A journal row and a Stage 2 record naming the same task normalise to
+        the same key, so grounding never counts one task twice."""
+        await _log_row(
+            write_journal, operation=TASK_CREATED_OPERATION, task_id=' 5 ', project_id=None,
+        )
+
+        outcomes = await _read(write_journal)
+
+        assert outcomes is not None
+        assert outcomes.created == {task_key(None, 5, STAGE2_PROJECT)}
 
 
-# ── Section 1e: journal unavailable ─────────────────────────────────────────
+# ── Section 1f: journal unavailable ─────────────────────────────────────────
 
 
 class TestReadRunCreationOutcomesUnavailable:
     @pytest.mark.asyncio
     async def test_no_journal_is_unavailable(self):
-        assert await read_run_creation_outcomes(None, RUN) is None
+        assert await _read(None) is None
 
     @pytest.mark.asyncio
     async def test_raising_read_is_unavailable(self):
         stub = MagicMock()
         stub.get_ops_by_causation = AsyncMock(side_effect=RuntimeError('db locked'))
 
-        assert await read_run_creation_outcomes(stub, RUN) is None
+        assert await _read(stub) is None
 
     @pytest.mark.asyncio
     async def test_non_list_result_is_unavailable(self):
         """journal=AsyncMock() in tests/test_stages.py yields a MagicMock here."""
         journal = AsyncMock()
 
-        assert await read_run_creation_outcomes(journal.write_journal, RUN) is None
+        assert await _read(journal.write_journal) is None
 
     @pytest.mark.asyncio
     async def test_non_awaitable_read_is_unavailable(self):
-        assert await read_run_creation_outcomes(MagicMock(), RUN) is None
+        assert await _read(MagicMock()) is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -385,11 +435,11 @@ async def _poll_ticket_resolved(ticket_store, ticket_id: str) -> dict:
 
 
 async def _poll_outcomes(journal, run_id: str, predicate) -> CreationOutcomes:
-    async def _read():
-        outcomes = await read_run_creation_outcomes(journal, run_id)
+    async def _matching():
+        outcomes = await _read(journal, run_id)
         return outcomes if outcomes is not None and predicate(outcomes) else None
 
-    return await poll_until(_read, message=f'no matching creation rows for {run_id}')
+    return await poll_until(_matching, message=f'no matching creation rows for {run_id}')
 
 
 async def _creation_rows(journal) -> list[dict]:
@@ -424,7 +474,7 @@ class TestPlanningModeJournal:
         )
 
         assert result['task_id'] == '42'
-        assert await read_run_creation_outcomes(write_journal, RUN) == CreationOutcomes(
+        assert await _read(write_journal) == CreationOutcomes(
             created=frozenset({('project', '42')}), combined=frozenset(),
         )
         [row] = await _creation_rows(write_journal)
@@ -444,7 +494,7 @@ class TestPlanningModeJournal:
         )
 
         assert result['combined'] is True
-        assert await read_run_creation_outcomes(write_journal, RUN) == CreationOutcomes(
+        assert await _read(write_journal) == CreationOutcomes(
             created=frozenset(), combined=frozenset({('project', '7')}),
         )
 
@@ -580,7 +630,7 @@ class TestCuratorWorkerJournal:
 
         assert row['causation_id'] is None
         assert row['agent_id'] == STAGE2_AGENT
-        assert await read_run_creation_outcomes(write_journal, RUN) == CreationOutcomes(
+        assert await _read(write_journal) == CreationOutcomes(
             created=frozenset(), combined=frozenset(),
         )
 
@@ -610,7 +660,7 @@ class TestIdempotencyHitJournal:
             await journaled_interceptor._process_add_ticket(ticket_id)
 
         assert (await ticket_store.get(ticket_id))['reason'] == 'idempotency_hit'
-        assert await read_run_creation_outcomes(write_journal, RUN) == CreationOutcomes(
+        assert await _read(write_journal) == CreationOutcomes(
             created=frozenset(), combined=frozenset({('project', '99')}),
         )
 

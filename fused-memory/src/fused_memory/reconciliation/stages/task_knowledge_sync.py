@@ -3861,6 +3861,7 @@ class TaskKnowledgeSync(BaseStage):
 
         journal = await read_run_creation_outcomes(
             getattr(self.journal, 'write_journal', None), run_id,
+            default_project_id=self.project_id,
         )
         report.stats.update(await ground_stage2_counters(
             report.stats,

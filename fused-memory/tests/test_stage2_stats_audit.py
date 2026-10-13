@@ -1229,6 +1229,28 @@ class TestPostFlightJournalGrounding:
         assert stub.calls == []
 
     @pytest.mark.asyncio
+    async def test_project_less_row_and_record_for_one_task_count_once(self):
+        """Both channels key a missing project under Stage 2's own project."""
+        stub = _StubTaskmaster()
+        stage = _make_stage(
+            taskmaster=stub,
+            known_projects=_KNOWN_PROJECTS,
+            project_id='dark_factory',
+            journal_rows=[_journal_row(RUN_90D762D0, '4745', project_id=None)],
+        )
+        report = _make_report({
+            'tasks_created': 0,
+            'task_created_records': [{'task_id': ' 4745 ', 'status': 'created'}],
+        })
+
+        await stage._apply_post_flight_guards(report, [], RUN_90D762D0)
+
+        assert report.stats['tasks_created'] == 1
+        assert report.stats['task_created_records_valid'] == 1
+        assert report.stats['task_created_records_journaled'] == 1
+        assert stub.calls == []
+
+    @pytest.mark.asyncio
     async def test_run_507bc25b_record_only_creation_still_repairs_via_get_task(self):
         stub = _StubTaskmaster(results={('3045', '/repo/df'): _task_record('3045')})
         stage = _make_stage(known_projects=_KNOWN_PROJECTS, taskmaster=stub)

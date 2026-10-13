@@ -13,6 +13,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeAlias
 
+from shared.task_metadata_wire import coerce_task_metadata
+
 if TYPE_CHECKING:
     from fused_memory.services.write_journal import WriteJournal
 
@@ -26,8 +28,25 @@ _OPERATION_FOR_STATUS: dict[str, str] = {
     'combined': TASK_COMBINED_OPERATION,
 }
 
-#: ``(project_id, task_id)``.
+#: ``(project_id, task_id)``. Taskmaster ids are per-project, so the same id
+#: under two projects is two tasks.
 TaskKey: TypeAlias = tuple[str | None, str]
+
+
+def task_key(project_id: object, task_id: object, default_project_id: str | None) -> TaskKey | None:
+    """The one normalised key for a task named by a journal row or a Stage 2 record.
+
+    None when *task_id* is missing or blank. Both parts are stripped, and a
+    missing or blank *project_id* falls back to *default_project_id*, so an
+    omitted project cannot masquerade as a second, cross-project task.
+    """
+    if task_id is None:
+        return None
+    task_id_str = str(task_id).strip()
+    if not task_id_str:
+        return None
+    project_key = str(project_id).strip() if project_id is not None else ''
+    return (project_key or default_project_id, task_id_str)
 
 
 def creation_operation_for(status: str | None) -> str | None:
@@ -37,16 +56,17 @@ def creation_operation_for(status: str | None) -> str | None:
     return _OPERATION_FOR_STATUS.get(status)
 
 
-def _decode_object(value: object) -> dict[Any, Any] | None:
+def _decode_params(value: object) -> dict[Any, Any] | None:
+    """A row's ``params``: stored as JSON text, a dict when already decoded."""
     if isinstance(value, dict):
         return value
-    if isinstance(value, str):
-        try:
-            decoded = json.loads(value)
-        except ValueError:
-            return None
-        return decoded if isinstance(decoded, dict) else None
-    return None
+    if not isinstance(value, str):
+        return None
+    try:
+        decoded = json.loads(value)
+    except ValueError:
+        return None
+    return decoded if isinstance(decoded, dict) else None
 
 
 def _non_blank_str(value: object) -> str | None:
@@ -64,7 +84,7 @@ class CreationAttribution:
 
     @classmethod
     def from_submission(cls, metadata: object, agent_id: str | None) -> CreationAttribution:
-        decoded = _decode_object(metadata) or {}
+        decoded = coerce_task_metadata(metadata) or {}
         return cls(agent_id=agent_id, causation_id=_non_blank_str(decoded.get('_causation_id')))
 
     @classmethod
@@ -92,26 +112,24 @@ class CreationOutcomes:
     combined: frozenset[TaskKey]
 
 
-def _row_key(row: dict[Any, Any]) -> TaskKey | None:
-    params = _decode_object(row.get('params'))
+def _row_key(row: dict[Any, Any], default_project_id: str | None) -> TaskKey | None:
+    params = _decode_params(row.get('params'))
     if params is None:
         return None
-    task_id = params.get('task_id')
-    if task_id is None:
-        return None
-    task_id_str = str(task_id).strip()
-    if not task_id_str:
-        return None
-    project_id = row.get('project_id')
-    project_key = str(project_id).strip() if project_id is not None else ''
-    return (project_key or None, task_id_str)
+    return task_key(row.get('project_id'), params.get('task_id'), default_project_id)
 
 
 async def read_run_creation_outcomes(
     write_journal: WriteJournal | None,
     run_id: str,
+    *,
+    default_project_id: str | None,
 ) -> CreationOutcomes | None:
-    """The run's journaled creation outcomes; None when the journal cannot be read."""
+    """The run's journaled creation outcomes; None when the journal cannot be read.
+
+    Rows are keyed by :func:`task_key` under *default_project_id*, the same
+    rule a reader of Stage 2's records applies, so one task is one key in both.
+    """
     if write_journal is None:
         return None
     try:
@@ -134,7 +152,7 @@ async def read_run_creation_outcomes(
         operation_keys = keys.get(str(row.get('operation')))
         if operation_keys is None or not row.get('success'):
             continue
-        key = _row_key(row)
+        key = _row_key(row, default_project_id)
         if key is not None:
             operation_keys.add(key)
     return CreationOutcomes(
