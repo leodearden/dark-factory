@@ -21,6 +21,7 @@ from orchestrator.config import (
     OrchestratorConfig,
     ScoringConfig,
 )
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.pending_age import read_pending_age
 from orchestrator.scheduler import Scheduler, TickContext
 
@@ -283,9 +284,9 @@ def _task(task_id: str, *, priority: str = 'medium', pending_since: str | None =
             'dependencies': [], 'metadata': metadata}
 
 
-def _frozen_scheduler(now: datetime = NOW, **config) -> Scheduler:
-    scheduler = Scheduler(OrchestratorConfig(max_per_module=1, max_concurrent_tasks=20, **config),
-                          wall_time_source=lambda: now)
+def _frozen_scheduler(event_store: EventStore | None = None) -> Scheduler:
+    scheduler = Scheduler(OrchestratorConfig(max_per_module=1, max_concurrent_tasks=50, scoring=ScoringConfig()),
+                          event_store=event_store, wall_time_source=lambda: NOW)
     scheduler.finish_startup()
     return scheduler
 
@@ -323,3 +324,111 @@ class TestNumericTieBreak:
         tasks = [_task('5', priority='medium'), _task('500', priority='high')]
 
         assert await _dispatch_order(tasks) == ['500', '5']
+
+
+def _population(first_id: int, *, anchored: int, anchorless: int) -> list[dict]:
+    """Candidates with varied tiers and anchors; the first *anchored* carry pending_since."""
+    tiers = ('high', 'medium', 'low')
+    tasks = []
+    for i in range(anchored + anchorless):
+        anchor = f'2026-10-{1 + i % 10:02d}T0{i % 10}:00:00.000Z' if i < anchored else None
+        tasks.append(_task(str(first_id + i), priority=tiers[i % 3], pending_since=anchor))
+    return tasks
+
+
+def _gate_tick(scheduler: Scheduler, tasks: list[dict]) -> TickContext:
+    """A tick over *tasks* whose legacy ages are non-zero, as acquire_next's preamble leaves them."""
+    max_id = max(int(t['id']) for t in tasks)
+    scheduler._update_age_anchors(tasks, max_id)
+    return _tick(tasks, {t['id']: int(t['id']) % 4 for t in tasks}, max_id)
+
+
+def _legacy_scores(scheduler: Scheduler, ctx: TickContext) -> dict[str, float]:
+    return {t['id']: scheduler._compute_score_legacy(
+        t['priority'], scheduler._compute_age(t['id'], ctx.max_id), ctx.transitive_counts[t['id']])
+        for t in ctx.candidates}
+
+
+def _c2_scores(scheduler: Scheduler, ctx: TickContext) -> dict[str, float]:
+    return {t['id']: scheduler._compute_score(
+        t['priority'], age_secs=read_pending_age(t, NOW).age_secs,
+        transitive_count=ctx.transitive_counts[t['id']], has_work_product=False)
+        for t in ctx.candidates}
+
+
+def _low_coverage_events(store: EventStore) -> list[dict]:
+    return [row['data'] for row in store.fetch_events_by_type(EventType.scoring_anchor_coverage_low)]
+
+
+class TestRow9AnchorCoverageGate:
+    """Boundary row 9 (I-6 / D12): below the coverage threshold the whole tick scores on the legacy formula."""
+
+    @pytest.fixture
+    def store(self, tmp_path) -> EventStore:
+        return EventStore(tmp_path / 'runs.db', run_id='gate')
+
+    def test_half_coverage_scores_every_candidate_on_the_legacy_formula(self, store):
+        scheduler = _frozen_scheduler(store)
+        ctx = _gate_tick(scheduler, _population(100, anchored=5, anchorless=5))
+
+        scores = _scores_by_id(scheduler, ctx)
+
+        assert scores == _legacy_scores(scheduler, ctx)
+        anchorless = [scores[t['id']] - TIER_BASE[t['priority']] for t in ctx.candidates[5:]]
+        assert len(set(anchorless)) > 1, f'the anchorless half collapsed to one bonus: {anchorless}'
+        assert _low_coverage_events(store) == [{
+            'coverage': 0.5, 'threshold': 0.90, 'candidates': 10, 'with_anchor': 5, 'consecutive_ticks': 1,
+        }]
+
+    def test_full_coverage_scores_on_c2_and_emits_nothing(self, store):
+        scheduler = _frozen_scheduler(store)
+        ctx = _gate_tick(scheduler, _population(100, anchored=10, anchorless=0))
+
+        assert _scores_by_id(scheduler, ctx) == _c2_scores(scheduler, ctx)
+        assert _low_coverage_events(store) == []
+
+    def test_coverage_exactly_at_the_threshold_arms(self, store):
+        scheduler = _frozen_scheduler(store)
+        ctx = _gate_tick(scheduler, _population(100, anchored=9, anchorless=1))
+
+        assert _scores_by_id(scheduler, ctx) == _c2_scores(scheduler, ctx)
+        assert _low_coverage_events(store) == []
+
+    def test_coverage_just_below_the_threshold_falls_back(self, store):
+        scheduler = _frozen_scheduler(store)
+        ctx = _gate_tick(scheduler, _population(100, anchored=8, anchorless=1))
+
+        assert _scores_by_id(scheduler, ctx) == _legacy_scores(scheduler, ctx)
+        assert len(_low_coverage_events(store)) == 1
+
+    def test_a_hot_retune_moves_the_gate_on_the_next_tick(self, store):
+        scheduler = _frozen_scheduler(store)
+        half = _gate_tick(scheduler, _population(100, anchored=5, anchorless=5))
+        nine_of_ten = _gate_tick(scheduler, _population(200, anchored=9, anchorless=1))
+
+        scheduler.config.scoring.new_scoring_min_anchor_coverage = 0.5
+        assert _scores_by_id(scheduler, half) == _c2_scores(scheduler, half)
+
+        scheduler.config.scoring.new_scoring_min_anchor_coverage = 1.0
+        assert _scores_by_id(scheduler, nine_of_ten) == _legacy_scores(scheduler, nine_of_ten)
+
+    @pytest.mark.asyncio
+    async def test_the_streak_counts_consecutive_unarmed_ticks(self, store):
+        scheduler = _frozen_scheduler(store)
+        next_id = iter(range(100, 10_000, 10))
+
+        async def tick(tasks: list[dict]) -> None:
+            scheduler.get_tasks = AsyncMock(return_value=tasks)
+            await scheduler.acquire_next()
+
+        async def low_tick() -> None:
+            await tick(_population(next(next_id), anchored=2, anchorless=2))
+
+        await low_tick()
+        await low_tick()
+        await tick([])
+        await low_tick()
+        await tick(_population(next(next_id), anchored=4, anchorless=0))
+        await low_tick()
+
+        assert [e['consecutive_ticks'] for e in _low_coverage_events(store)] == [1, 2, 3, 1]
