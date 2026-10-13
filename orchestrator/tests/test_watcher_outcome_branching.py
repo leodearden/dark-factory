@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
+from orchestrator.agents.watcher_rearm_outcome_guidance import WATCHER_REARM_OUTCOME_GUIDANCE
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _REARM_SCRIPT = _REPO_ROOT / 'scripts' / 'watcher-rearm.sh'
@@ -35,6 +36,7 @@ _HARNESS_STOP_DIRECTIVE = 'STOP what you are doing'  # Claude Code tool-rejectio
 _ARTIFACTS: dict[str, Callable[[], str]] = {
     'auto-skill': lambda: load_skill_system_prompt('escalation-watcher-auto'),
     'l2-skill': lambda: load_skill_system_prompt('escalation-watcher'),
+    'rotation-guidance': lambda: WATCHER_REARM_OUTCOME_GUIDANCE,
 }
 _KILLED = 'KILLED'
 _L2_KILLED_RECOVERY = 'run_in_background'  # the interactive lane's sanctioned re-arm
