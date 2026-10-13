@@ -259,10 +259,9 @@ show freshness, because the heartbeat is the file's mtime.
 7. Run `reap-decisions` to close any parked DecisionRecord whose escalation has since resolved
    (see "Filing Parked Decisions to the Cockpit Registry" below) — once per cycle
 8. GET `/api/v2/dashboard/invariants` and digest every root's record (see "Reading the
-   invariants gauge" below) — once per cycle. A blind root or a nonzero unledgered terminal
-   tier is a finding; so is a chain in state `overdue` or `broken` (a `paused` chain is inspected
-   via its own pinning escalation, not this rule): triage it with The Action Set's judgement
-   before re-arming (9)
+   invariants gauge" below) — once per cycle. Each `FINDING` line it prints (a chain gone
+   `overdue` or `broken` among them), and each `paused` line reading `pinned_by=[]`, is a
+   finding: triage it with The Action Set's judgement before re-arming (9)
 9. Go to 2
 ```
 

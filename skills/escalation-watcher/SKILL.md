@@ -332,10 +332,9 @@ always-ask list ("Bypasses" in "Always ask — keyed on record content").
 6. Run `reap-decisions` to close any parked DecisionRecord whose escalation has since resolved
    (see "Filing Parked Decisions to the Cockpit Registry" below) — once per cycle
 7. GET `/api/v2/dashboard/invariants` and digest this project's record (see "Reading the
-   invariants gauge" below) — once per cycle. A blind root or a nonzero unledgered terminal
-   tier is a finding; so is a chain in state `overdue` or `broken` (a `paused` chain is inspected
-   via its own pinning escalation, not this rule): handle it in step 3 of the next pass, beside
-   the drained escalations
+   invariants gauge" below) — once per cycle. Each `FINDING` line it prints (a chain gone
+   `overdue` or `broken` among them), and each `paused` line reading `pinned_by=[]`, is a
+   finding: handle it in step 3 of the next pass, beside the drained escalations
 8. Go to 1 (restart watcher → confirm up → drain → handle)
 ```
 
