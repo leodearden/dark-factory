@@ -13,10 +13,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fastmcp.tools import FunctionTool
+from _resolve_issue_call import call_resolve_issue
 
 from escalation.models import Escalation
-from escalation.queue import EscalationQueue, ResolveOutcome
+from escalation.queue import EscalationQueue, blank_resolve_outcome
 from escalation.server import create_server
 
 SWEEP_TEXT = 'Auto-dismissed: steward interrupted (attempt cap)'
@@ -65,24 +65,8 @@ def _interleave_after_first_read(
     monkeypatch.setattr(queue, 'get', get_then_race)
 
 
-async def _resolve_issue(queue: EscalationQueue, **kwargs: Any) -> dict[str, Any]:
-    tool = await create_server(queue).get_tool('resolve_issue')
-    assert isinstance(tool, FunctionTool)
-    return tool.fn(**kwargs)
-
-
 def _archive_copies(queue: EscalationQueue, esc_id: str) -> list[Path]:
     return list((queue.queue_dir / 'archive').rglob(f'{esc_id}.json'))
-
-
-def _blank_outcome() -> ResolveOutcome:
-    return {
-        'applied': False,
-        'prior_status': None,
-        'prior_resolved_by': None,
-        'late_resolution_captured': False,
-        'resolution_class_corrected': None,
-    }
 
 
 class TestQueueResolveStampsResolutionAction:
@@ -119,7 +103,7 @@ class TestQueueResolveStampsResolutionAction:
         queue = EscalationQueue(tmp_path / 'esc')
         esc_id = _seed_pending(queue)
         queue.resolve(esc_id, SWEEP_TEXT, dismiss=True, resolved_by='auto-dismissed')
-        outcome = _blank_outcome()
+        outcome = blank_resolve_outcome()
 
         queue.resolve(
             esc_id, LATE_TEXT, resolved_by=STEWARD,
@@ -156,8 +140,8 @@ class TestResolveIssueDoesNotRewriteAStaleSnapshot:
             ),
         )
 
-        result = await _resolve_issue(
-            queue, escalation_id=esc_id, resolution=LATE_TEXT,
+        result = await call_resolve_issue(
+            create_server(queue), escalation_id=esc_id, resolution=LATE_TEXT,
             action='resume', resolved_by=STEWARD,
         )
 
@@ -197,8 +181,8 @@ class TestResolveIssueDoesNotRewriteAStaleSnapshot:
             monkeypatch, queue, l2, lambda: queue.add_members_to_l2(l2, [m2]),
         )
 
-        await _resolve_issue(
-            queue, escalation_id=l2, resolution='closing the cluster',
+        await call_resolve_issue(
+            create_server(queue), escalation_id=l2, resolution='closing the cluster',
             action='close_only',
         )
 
@@ -209,6 +193,8 @@ class TestResolveIssueDoesNotRewriteAStaleSnapshot:
             'the stale snapshot clobbered the concurrent member append'
         )
         assert stored_l2.resolution_action == 'close_only'
+        # m2 joined after the gate snapshot, so the declared-pin gate never saw
+        # it: a known gap, ticket tkt_0RVR9PCSRAM7TK2TA0G2R1YP9K.
         stored_m2 = queue.get(m2)
         assert stored_m2 is not None
         assert stored_m2.status == 'dismissed'

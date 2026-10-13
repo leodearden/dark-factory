@@ -368,6 +368,17 @@ class ResolveOutcome(TypedDict):
     resolution_class_corrected: str | None  # the stamp this call re-derived, or None
 
 
+def blank_resolve_outcome() -> ResolveOutcome:
+    """The outcome of a resolve that did nothing, which ``resolve()`` seeds first."""
+    return {
+        'applied': False,
+        'prior_status': None,
+        'prior_resolved_by': None,
+        'late_resolution_captured': False,
+        'resolution_class_corrected': None,
+    }
+
+
 def _elide(text: str, limit: int, what: str = 'amendment field') -> tuple[str, int]:
     """Return (*text* capped at *limit*, characters dropped).
 
@@ -1650,11 +1661,7 @@ class EscalationQueue:
         # above, so an INV-1 rejection leaves the caller's dict untouched —
         # nothing is persisted and nothing is reported.
         if outcome is not None:
-            outcome['applied'] = False
-            outcome['prior_status'] = None
-            outcome['prior_resolved_by'] = None
-            outcome['late_resolution_captured'] = False
-            outcome['resolution_class_corrected'] = None
+            outcome.update(blank_resolve_outcome())
 
         with escalation_id_lock(self.queue_dir, escalation_id):
             esc = self.get(escalation_id)
