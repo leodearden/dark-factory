@@ -3799,6 +3799,46 @@ class TestTripwireCensusSplit:
         assert str(absent) in capsys.readouterr().err
 
 
+class TestDeriveRegistryRefusesAnUnusableCensus:
+    """For --derive-registry the census IS the input, so an unusable one is bad
+    input: exit 2 naming the census, and no partial candidate set on stdout."""
+
+    def _derive(self, tmp_path, capsys, payload):
+        path = _write_census(tmp_path, payload)
+        code = _mod().main(['--derive-registry', '--census', str(path)])
+        return code, path, capsys.readouterr()
+
+    def test_a_census_without_a_topic_table_is_bad_input(self, tmp_path, capsys):
+        code, path, captured = self._derive(tmp_path, capsys, {'baseline': True})
+
+        assert code == _mod().EXIT_BAD_INPUT == 2
+        assert str(path) in captured.err
+        assert 'grand_total' in captured.err
+        assert captured.out == ''
+
+    def test_a_misshapen_topic_table_is_bad_input_not_a_traceback(self, tmp_path, capsys):
+        code, path, captured = self._derive(tmp_path, capsys, {'grand_total': 'x'})
+
+        assert code == _mod().EXIT_BAD_INPUT
+        assert str(path) in captured.err
+        assert captured.out == ''
+
+    def test_an_undecodable_census_is_bad_input(self, tmp_path, capsys):
+        code, path, captured = self._derive(tmp_path, capsys, '{not json')
+
+        assert code == _mod().EXIT_BAD_INPUT
+        assert str(path) in captured.err
+        assert captured.out == ''
+
+    def test_an_empty_topic_table_still_derives(self, tmp_path, capsys):
+        code, _, captured = self._derive(tmp_path, capsys, _topic_census())
+
+        assert code == 0
+        payload = json.loads(captured.out)
+        assert payload['_disclosures']['census_topics_emitted'] == 0
+        assert payload['entries']
+
+
 class TestCorpusCounting:
     """(b) One count per category, with the category list derived not restated."""
 
