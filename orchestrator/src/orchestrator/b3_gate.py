@@ -14,6 +14,7 @@ import argparse
 import fcntl
 import json
 import logging
+import re
 import sqlite3
 import subprocess
 import sys
@@ -75,6 +76,8 @@ so they cannot silently drift (see TestPostMergeRedMainAbort.test_coherence_*).
 DEFAULT_TAG = 'master'
 DEFAULT_CAP = 6
 _LAUNCH_RETENTION_DAYS = 30  # prune launches older than this many days (bound state-file growth)
+
+_FENCED_BLOCK_RE = re.compile(r'^```[^\n]*\n.*?^```[ \t]*$', re.MULTILINE | re.DOTALL)
 
 # ---------------------------------------------------------------------------
 # State path
@@ -342,6 +345,17 @@ def _age_of(
         return None, AGE_UNPARSEABLE
 
 
+def _strip_fenced_blocks(text: str | None) -> str | None:
+    """Return *text* with every COMPLETE ``` fenced block removed.
+
+    An opening fence with no closing line is left in place, so a truncated
+    text never hides what follows it.
+    """
+    if not text:
+        return text
+    return _FENCED_BLOCK_RE.sub('', text)
+
+
 def check_proposal(
     entry: dict[str, Any] | None,
     *,
@@ -368,10 +382,17 @@ def check_proposal(
           legacy prose/status sniffs (those stay gated on `block_class is
           None`, not on validity).
       1c. EXPLICIT STOP INSTRUCTION (task 2509, reconciliation finding
-          0aac21b4): if entry['proposal_text'], entry['block_reason'], or any
-          string in extra_texts (e.g. the task description — see
-          b3_gate.run_check) contains a phrase from
+          0aac21b4): if any AUTHORED text contains a phrase from
           orchestrator.stop_instruction.STOP_INSTRUCTION_PHRASES -> abort.
+          Authored, scanned whole: entry['proposal_text'] and every string in
+          extra_texts (e.g. the task description — see b3_gate.run_check).
+          Authored, scanned: entry['block_reason'] prose outside fences.
+          Captured, excluded: complete ``` fenced blocks in block_reason —
+          tool output from
+          orchestrator/src/orchestrator/verify.py::VerifyResult.failure_report,
+          not a directive (task 6933).  An unterminated fence excludes
+          nothing.  Pinned by
+          orchestrator/tests/test_b3_gate.py::TestStopScanExcludesCapturedOutput.
           Hard-aborted before risk_label/git checks, same shape as 1b, and
           takes precedence even over an otherwise-fresh low-risk entry — a
           stop instruction is the highest-authority human directive and must
@@ -470,8 +491,11 @@ def check_proposal(
     # single source of truth for the phrase set — also reused by
     # DeterministicRunner's before_done guard and the /unblock +
     # unblock-low-risk runbook prose, so it cannot drift between surfaces.
+    # The authored/captured line is stated in the docstring's item 1c.
     stop_phrase = detect_stop_instruction(
-        entry.get('proposal_text'), entry.get('block_reason'), *(extra_texts or []),
+        entry.get('proposal_text'),
+        _strip_fenced_blocks(entry.get('block_reason')),
+        *(extra_texts or []),
     )
     if stop_phrase:
         return _result(
