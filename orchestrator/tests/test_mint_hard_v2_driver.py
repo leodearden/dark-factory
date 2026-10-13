@@ -33,18 +33,26 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 def _load_driver() -> ModuleType:
     """Import ``scripts/mint_hard_v2_fixtures.py`` by path (not a package).
 
-    ``scripts/`` goes on sys.path first because the driver binds this checkout
-    with ``import _checkout``, a sibling it resolves by bare name.
+    The driver binds this checkout with ``import _checkout``, a sibling it
+    resolves by bare name, so ``scripts/`` is on sys.path while it executes.
+    Both that entry and the binder's own sys.path edits are undone afterwards,
+    so the load changes import resolution for no other test in this process.
     """
     scripts = REPO_ROOT / 'scripts'
-    if str(scripts) not in sys.path:
-        sys.path.insert(0, str(scripts))
     path = scripts / 'mint_hard_v2_fixtures.py'
     spec = importlib.util.spec_from_file_location('mint_hard_v2_fixtures', path)
     assert spec is not None and spec.loader is not None, f'no import spec for {path}'
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    saved_path = list(sys.path)
+    binder_was_loaded = '_checkout' in sys.modules
+    sys.path.insert(0, str(scripts))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path[:] = saved_path
+        if not binder_was_loaded:
+            sys.modules.pop('_checkout', None)
     return module
 
 

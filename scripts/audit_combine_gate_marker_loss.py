@@ -91,23 +91,11 @@ from _task_db_scan import (
     run_audit_cli,
     tasks_db_path,
 )
-from shared.project_id import project_id_for_root
-
-# Bind `shared` to the SAME checkout as this script via a __file__-relative
-# path, never a hardcoded absolute. An editable install puts the MAIN
-# checkout's shared/src on sys.path for a bare `python3`, so without this a
-# copy of this script running from a worktree would validate manifests using
-# the MAIN checkout's schema. Same reasoning and same form as
-# repair_wiped_metadata_files.py:65-75 (tasks 2881/2882/3329). The
-# shared.capability_manifest import below MUST stay after this insert.
-_SHARED_SRC = Path(__file__).resolve().parent.parent / "shared" / "src"
-if str(_SHARED_SRC) not in sys.path:
-    sys.path.insert(0, str(_SHARED_SRC))
-
-from shared.capability_manifest import (  # noqa: E402
+from shared.capability_manifest import (
     MECHANICAL_CHECK_KINDS,
     load_capability_manifest,
 )
+from shared.project_id import project_id_for_root
 
 # The curator verdict this audit is about. The sibling verdict is 'create',
 # which files a NEW task and wipes nothing.

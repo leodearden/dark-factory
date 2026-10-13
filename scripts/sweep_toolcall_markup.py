@@ -80,8 +80,7 @@ The ``uv run --project shared`` prefix is not optional. ``shared/__init__.py``
 imports the whole package eagerly, so ``import shared.toolcall_markup`` drags
 in shared's third-party dependencies even though ``toolcall_markup`` is itself
 pure and stdlib-only — a dependency-free system python cannot run this script.
-The same cost is recorded at ``scripts/scan_task_toolcall_leaks.py:102-112``,
-which carries this identical bootstrap.
+The same cost is recorded at ``scripts/scan_task_toolcall_leaks.py:102-112``.
 
 ## AUTHORING HAZARD — this file spells NO envelope literal, ever
 
@@ -110,21 +109,7 @@ from typing import Any, NamedTuple
 
 import _checkout as _checkout
 from shared.project_layout import escalation_queue_dir
-
-# shared/src bootstrap. Same idiom and same precedence argument as
-# scripts/scan_task_toolcall_leaks.py:113-115 and
-# scripts/repair_wiped_metadata_files.py:67-73: resolve it from __file__ and
-# insert at sys.path[0], so a run inside a task worktree resolves `shared` to
-# THIS checkout's copy of the envelope-literal enumeration rather than to
-# whatever editable install happens to be on the path. The fused-memory/shared
-# editable installs are ordinary .pth entries, so sys.path ORDER decides the
-# winner and a hardcoded or install-provided path would silently test the main
-# checkout's literals.
-_SHARED_SRC = Path(__file__).resolve().parent.parent / 'shared' / 'src'
-if str(_SHARED_SRC) not in sys.path:
-    sys.path.insert(0, str(_SHARED_SRC))
-
-from shared.toolcall_markup import (  # noqa: E402
+from shared.toolcall_markup import (
     CANONICAL_OPENER_PREFIX,
     INVOKE_CLOSER,
     PREFILTER_NEEDLES,

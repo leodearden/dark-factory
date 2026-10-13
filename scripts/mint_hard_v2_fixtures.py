@@ -1662,9 +1662,6 @@ def _refs_pointing_at(repo_root: Path | str, commit: str) -> list[str]:
 
 def _import_sampler():
     """Import ``task_sampler`` from this repo's orchestrator package."""
-    src = REPO_ROOT / 'orchestrator' / 'src'
-    if str(src) not in sys.path:
-        sys.path.insert(0, str(src))
     from orchestrator.evals import task_sampler
     return task_sampler
 
