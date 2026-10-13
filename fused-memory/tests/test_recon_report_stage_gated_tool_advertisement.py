@@ -7,15 +7,9 @@ contract equally invisible failures, and this module asserts BOTH:
 
 - DENIES => the stage's prompt must NOT name the tool. Telling a stage about an
   action it cannot take produces silence, not a refusal the agent could act on.
-  Already asserted, per (tool, stage), by
-  `test_recon_report_guidance_drift.py::test_stage_gated_tools_absent_from_denying_stage_prompts`
-  — restated here so this file reads as the WHOLE contract rather than half of
-  one, which is the discipline that module's own docstring states ("one contract
-  rather than two unrelated guards a future edit can quietly split").
-- HOLDS => the stage's prompt must NAME the tool. This is the converse the drift
-  guard deliberately declines to assert, naming task 4395 as its owner: a tool
-  the agent genuinely holds but that no prompt ever mentions is a tool the agent
-  simply never learns exists (the held-but-unadvertised defect esc-3391-1 /
+- HOLDS => the stage's prompt must NAME the tool: a tool the agent genuinely
+  holds but that no prompt ever mentions is a tool the agent simply never
+  learns exists (the held-but-unadvertised defect esc-3391-1 /
   test_recon_amend_tool_advertisement.py exists to catch, one namespace over).
 
 The stage-agnostic server-level listing (`RECON_REPORT_INSTRUCTIONS`) is NOT a
@@ -158,9 +152,10 @@ def _stage_denies(tool_name: str, disallowed_attr: str) -> bool:
     """Does the stage gated by *disallowed_attr* deny *tool_name*?
 
     Reads the live disallow list and strips the `mcp__recon-report__` prefix
-    exactly as `test_recon_report_guidance_drift.py` does, so both guards answer
-    "may this stage call this tool?" from the same single source of truth — the
-    lists that actually render into `--disallowed-tools`.
+    exactly as
+    `test_recon_report_guidance_drift.py::test_stage_gated_matches_the_real_enforcement_surface`
+    does, so "may this stage call this tool?" is answered from the same single
+    source of truth — the lists that actually render into `--disallowed-tools`.
     """
     denied = {
         name.removeprefix('mcp__recon-report__')

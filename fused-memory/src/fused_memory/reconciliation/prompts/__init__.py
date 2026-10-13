@@ -96,8 +96,7 @@ destroys entities and edges exclusively sourced from that episode.\
 # SHARED between Stage 1 and Stage 2 because every sentence below is true
 # verbatim in both: the holding map, the two-id contract, and the reasons
 # Stage 3 is denied it are all stage-independent facts. Stage 3 must NOT
-# interpolate it — pinned by test_recon_report_stage_gated_tool_advertisement.py
-# and by test_recon_report_guidance_drift.py's absence guard.
+# interpolate it — pinned by test_recon_report_stage_gated_tool_advertisement.py.
 #
 # The block states the TRIGGER, not only the capability, because an
 # advertisement whose trigger is unstated is inert. Measured while writing it:
@@ -194,7 +193,6 @@ REFERENT_DECLARATION_GUIDANCE = render_referent_declaration_guidance()
 # SQLite-ledger write. So this section must be interpolated into stage2.py and
 # NOWHERE else: naming the tool in Stage 1 or Stage 3 licenses a ledger write from a
 # stage that is read-only with respect to the ledger, and is failed by
-# test_recon_report_guidance_drift.py's absence guard as well as
 # test_recon_report_stage_gated_tool_advertisement.py.
 #
 # A RENDERER rather than a plain constant, matching the form of the two sections it
