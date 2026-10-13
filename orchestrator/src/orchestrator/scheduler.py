@@ -1074,6 +1074,11 @@ class _BackfillScanCache:
     delays: dict[str, float] = field(default_factory=dict)
 
 
+def _numeric_id(task_id: str) -> float:
+    """The dispatch tie-break rank of *task_id*: older numeric ids first, any non-numeric id last (PRD I-4)."""
+    return float(int(task_id)) if task_id.isdigit() else math.inf
+
+
 def _resolve_time_source(ts: Callable[[], float] | None) -> Callable[[], float]:
     """Return *ts* if provided, else the stdlib ``time.monotonic`` callable.
 
@@ -7925,7 +7930,7 @@ class Scheduler:
                 score = self._compute_score_legacy(pri, self._compute_age(tid, ctx.max_id), transitive)
             scored.append((score, tid, t, pri))
 
-        scored.sort(key=lambda entry: (-entry[0], entry[1]))
+        scored.sort(key=lambda entry: (-entry[0], _numeric_id(entry[1]), entry[1]))
         return scored
 
     async def _phase_select_scored(self, ctx: TickContext) -> object:
@@ -7938,8 +7943,9 @@ class Scheduler:
         ``TickOutcome(TaskAssignment)`` on a successful dispatch, or
         ``TickOutcome(None)`` once the loop is exhausted with no acquire
         (the top candidate's skip counter is bumped either way it is
-        passed over). Higher score wins; ties broken by task_id string
-        order (stable, FIFO-ish for numeric ids).
+        passed over). Higher score wins; equal scores dispatch the
+        numerically smaller (older) id first, and non-numeric ids after every
+        numeric one, in string order.
         """
         scored = self._score_candidates(ctx)
 
@@ -8051,9 +8057,9 @@ class Scheduler:
     async def acquire_next(self) -> TaskAssignment | None:
         """Find next eligible task under the value/h scoring model.
 
-        Dispatch order is determined by ``_compute_score()``: tier base is
-        dominant, age + CPM bonuses order tasks within a tier, and
-        per-tier slot caps reserve headroom for higher-value work.
+        Dispatch order is determined by ``_score_candidates()``: tier base is
+        dominant, age + CPM (+ continuity) bonuses order tasks within a tier,
+        and per-tier slot caps reserve headroom for higher-value work.
 
         Returns ``None`` immediately when the scheduler is paused (park-stop).
         No MCP round-trips, no GC, no override snapshots are performed while
