@@ -252,7 +252,23 @@ Nothing is mutated on a refusal: the head and every member stay pending and un-a
 - **A compact drain surfaces `pin_declared_by` on every row.** Check it *before* designating a cluster for a bulk close. `pin_declared_reason` is not projected — a non-empty `pin_declared_by` is your signal to re-read the record without `compact`, as **Reading one full escalation record** under [Read-only investigation toolset](#read-only-investigation-toolset) describes. The pending read is sufficient because a declared-pin refusal mutates nothing — the head and every member stay pending.
 - **`acknowledge_declared_pins` is NOT a way to make the error go away.** It requires naming *every* blocked id (a partial acknowledgement still refuses, reporting only the remainder), and there is no un-declare verb. The correct response to this refusal is to go **read what `pin_declared_by` names and consult it** — a deviation notice, an operator gate — not to silence it. Acknowledge only when that thing has told you the pin may be spent.
 - **An UNMARKED record is not proof that nothing relies on it.** The marker is opt-in; its absence means "not declared", not "safe".
-- **You cannot declare a pin yourself — REPORT one.** `mcp__escalation__declare_pin` is not in this rotation's allowed tools (`orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS` grants `stamp_triage`, not this); declaring is operator/steward-only for now. When a record looks load-bearing but carries no `pin_declared_by`, do NOT close it and do NOT invent a marker: leave it pending, `stamp_triage` it with what you found, and say in your report that it is a *candidate pin* naming what appears to rely on it. A human runs `declare_pin` to make it machine-readable.
+- **You cannot declare a pin yourself — PROMOTE a candidate.** `mcp__escalation__declare_pin` is not in this rotation's allowed tools (`orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS` grants `stamp_triage`, not this); declaring is operator/steward-only for now. When a record looks load-bearing but carries no `pin_declared_by`, do NOT close it and do NOT invent a marker: promote it as a 1-member *candidate pin*. A human runs `declare_pin` to make it machine-readable, and this promotion is how the human learns of it.
+  ```python
+  mcp__escalation__promote_to_l2(
+      task_id=esc["task_id"],
+      agent_role="escalation-watcher-auto",
+      member_ids=[esc["id"]],
+      root_cause="candidate-pin:<esc_id>",
+      evidence="<what appears to rely on this record staying open, and why>",
+      options=[
+          "A: declare_pin <esc_id> naming the dependent, then PARK this L2 — resolving or dismissing it cascades to its member and spends the pin (the esc-3371-2 loss below)",
+          "B: confirm nothing relies on it, then resolve",
+          "C: something else",
+      ],
+      summary="Candidate pin: " + esc["summary"],
+      category=esc["category"],
+  )
+  ```
 
 Why this exists: on 2026-08-08 an L2 cascade close of the homogeneous 11-member cluster esc-3237-5 dismissed esc-3371-2 — the only pin preserving mu-gate validation specimen task 3371, which is permanently gone. Every member was indistinguishable by id, level, category, severity, agent_role and summary, and the sole marker lived in prose nothing linked from. The surviving sibling pin is **esc-3105-3** (a 15-member L2 head — exactly the shape a rotation bulk-closes).
 
@@ -495,7 +511,7 @@ Typical sources: `harness-orphan-reaper` L0→L1 promotions of completion-time n
 
 **Does NOT apply — [promote](#promote-to-l2) instead:**
 - **Judgement-shaped content.** `design_concern` / `risk_identified` / `missing_premise` content you cannot resolve at L1 needs a human ruling. Never file a task that amounts to "have an agent resolve this design concern" (operator ruling 2026-08-12). Unsure whether it is work or judgement → promote.
-- **Curator-origin records** — `agent_role` is `fused-memory/task-curator` or `fused-memory/ticket-janitor`. The curator is the failing component, so a re-file feeds a watcher→curator→watcher loop. Handle them under [Promote-to-L2 categories](#promote-to-l2-categories-require-human-judgment); never call `submit_task` for them.
+- **Curator-origin records** — `agent_role` is `fused-memory/task-curator` or `fused-memory/ticket-janitor`. The curator is the failing component, so a re-file feeds a watcher→curator→watcher loop. Handle them under [Curator-origin records](#curator-origin-records--promote-never-re-file); never call `submit_task` for them.
 - **A record that already reports a curator `refused` outcome.** A refusal is a deterministic guard; a re-file re-hits it.
 
 **Clusters.** Several L1s carrying ONE finding become ONE filing (one `suggestion_hash`), with every member id in the description; resolve each member citing the same task id.
@@ -604,7 +620,7 @@ mcp__escalation__resolve_issue(
 
 Close it; do not `stamp_triage` it. A stamp leaves the record pending, and a pending L1 keeps `_watcher_has_actionable_l1` (`orchestrator/src/orchestrator/harness.py::_watcher_has_actionable_l1`) respawning rotations.
 
-**Report, don't just close.** The live queue held no eval-lane records on 2026-10-01, when containment was built, so a pending eval-lane record with a later `timestamp` most likely reached the queue without passing `escalation/src/escalation/server.py::_chokepoint_or_submit`. This rotation holds no escalation-filing tool, so the digest is the report: append `— BYPASS? filed <timestamp>` to that record's digest line.
+**Report, don't just close.** The live queue held no eval-lane records on 2026-10-01, when containment was built, so a pending eval-lane record with a later `timestamp` most likely reached the queue without passing `escalation/src/escalation/server.py::_chokepoint_or_submit`. File the suspected bypass with steps 1–2 of [Convert to tracked work](#convert-to-tracked-work-file-and-resolve): one filing per rotation however many such records it meets, `files=["escalation/src/escalation/server.py"]`, and a description naming each record's id, `timestamp` and `agent_role`. Then close each record `benign` as above, ending its `resolution` with the filed task id — or, if the filing yielded none, its `status` and `reason`. Never promote it instead: `promote_to_l2` refuses eval-lane members. Appending `— BYPASS? filed <timestamp>` to the record's digest line remains a convenience, not the report.
 
 **Digest — one line per record, mandatory:**
 
@@ -1093,11 +1109,34 @@ mcp__escalation__promote_to_l2(
 
 Add to digest: `PROMOTED (L2 <id>): <category> — <task_id> — <summary>`
 
-#### `curator_failure` / `recon_failure` / `recon_backlog_overflow` / `recon_stale_run` / `recon_integrity_issue`
+#### Curator-origin records — promote, never re-file
 
-Fused-memory reconciliation or curator problems — may indicate systematic issues. These often cluster under one infra-level root cause.
+**Discriminator: `agent_role`**, not a category list — curator categories already outnumber any list:
+- `fused-memory/task-curator` — every curator L1, filed by `fused-memory/src/fused_memory/middleware/curator_escalator.py::_curator_escalation` under task_id `task-curator`;
+- `fused-memory/ticket-janitor` — `ticket_failure` L1s from `fused-memory/src/fused_memory/middleware/ticket_janitor.py`.
 
-Root_cause: `"recon-issue:<category-slug>"` (e.g. `"recon-issue:curator_failure"`, `"recon-issue:backlog-overflow"`)
+Never apply [Convert to tracked work](#convert-to-tracked-work-file-and-resolve) to these, and never call `submit_task` while handling them: the curator is the failing component, and a re-file loops watcher→curator→watcher. Promote them; the `root_cause` keeps the `recon-issue:` prefix (e.g. `"recon-issue:curator_failure"`) so pending L2s under that key still fold:
+
+```python
+mcp__escalation__promote_to_l2(
+  task_id=esc["task_id"],
+  agent_role="escalation-watcher-auto",
+  member_ids=[<esc_id>, ...],
+  root_cause="recon-issue:<category-slug>",
+  evidence=esc["summary"] + " | " + esc["detail"],
+  options=["A: restart fused-memory service", "B: investigate and fix the curator root cause", "C: something else"],
+  summary=esc["category"] + ": " + esc["summary"],
+  category=esc["category"],
+)
+```
+
+Add to digest: `PROMOTED (L2 <id>): <category> — <task_id> — <summary>`
+
+#### `recon_failure` / `recon_backlog_overflow` / `recon_stale_run` / `recon_integrity_issue`
+
+Fused-memory reconciliation problems — may indicate systematic issues. These often cluster under one infra-level root cause.
+
+Root_cause: `"recon-issue:<category-slug>"` (e.g. `"recon-issue:backlog-overflow"`)
 
 ```python
 mcp__escalation__promote_to_l2(
