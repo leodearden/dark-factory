@@ -16,6 +16,7 @@ from __future__ import annotations
 import types
 from unittest.mock import AsyncMock
 
+from fused_memory.config.schema import ProceduralTopicCluster
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.services.memory_service import RRF_K
@@ -30,6 +31,9 @@ _CANONICAL_CONTENT = (
 # rounding change would silently reclassify them.
 T_HIGH = 0.90
 T_LOW = 0.70
+
+#: Content matching the phrases of the cluster `topic_cluster` builds.
+TOPIC_MATCH_CONTENT = 'run create_plan against the missing plan-tools MCP server'
 
 
 def search_candidate(
@@ -113,4 +117,18 @@ def configure_triage_config(
             procedural_knowledge_near_dup_threshold=near_dup_threshold,
             procedural_knowledge_topic_guard_clusters=topic_clusters or [],
         ),
+    )
+
+
+def topic_cluster(
+    topic_id: str = 'test-topic',
+    phrases: tuple[str, ...] = ('plan-tools', 'create_plan'),
+    min_phrase_hits: int = 2,
+    hint: str = '',
+) -> ProceduralTopicCluster:
+    return ProceduralTopicCluster(
+        topic_id=topic_id,
+        phrases=list(phrases),
+        min_phrase_hits=min_phrase_hits,
+        hint=hint,
     )

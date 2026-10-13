@@ -30,7 +30,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from fused_memory.config.schema import ProceduralTopicCluster
 from fused_memory.models.enums import MemoryCategory
 from fused_memory.reconciliation.prompts import (
     FLAG_FOR_STAGE2_MARKER_KIND,
@@ -64,8 +63,10 @@ from fused_memory.utils.clip_disclosure import TRUNCATION_FACTS_KEY, TruncationF
 from server.write_triage_harness import (
     T_HIGH,
     T_LOW,
+    TOPIC_MATCH_CONTENT,
     configure_triage_config,
     search_candidate,
+    topic_cluster,
 )
 
 _PROJECT_ID = 'dark_factory'
@@ -389,24 +390,6 @@ class TestRestatementIsRedirectedNotRejected:
         assert result[CANONICAL_ID_KEY] == 'm-other'
 
 
-#: Content matching the injected test cluster's phrases below.
-_TOPIC_MATCH_CONTENT = 'run create_plan against the missing plan-tools MCP server'
-
-
-def _topic_cluster(
-    topic_id: str = 'test-topic',
-    phrases: tuple[str, ...] = ('plan-tools', 'create_plan'),
-    min_phrase_hits: int = 2,
-    hint: str = '',
-) -> ProceduralTopicCluster:
-    return ProceduralTopicCluster(
-        topic_id=topic_id,
-        phrases=list(phrases),
-        min_phrase_hits=min_phrase_hits,
-        hint=hint,
-    )
-
-
 class TestTheFlagOffPathIsUntouched:
     """The shipped default (D10 staged rollout): triage is OFF.
 
@@ -436,13 +419,13 @@ class TestTheFlagOffPathIsUntouched:
     async def test_a_topic_cluster_match_is_still_rejected(self) -> None:
         mock_service = AsyncMock()
         configure_triage_config(
-            mock_service, enabled=False, topic_clusters=[_topic_cluster()],
+            mock_service, enabled=False, topic_clusters=[topic_cluster()],
         )
         _configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = []
         server = create_mcp_server(mock_service)
 
-        result = await _call(server, content=_TOPIC_MATCH_CONTENT)
+        result = await _call(server, content=TOPIC_MATCH_CONTENT)
 
         assert result.get('error_type') == (
             'ProceduralKnowledgeKnownTopicClusterWriteRejected'
@@ -527,20 +510,20 @@ class TestTheFlagOnPathRetiresBothRejectGuards:
         """
         mock_service = AsyncMock()
         configure_triage_config(
-            mock_service, enabled=True, topic_clusters=[_topic_cluster()],
+            mock_service, enabled=True, topic_clusters=[topic_cluster()],
         )
         _configure_pass_through_add_memory(mock_service)
         mock_service.search.return_value = []
         server = create_mcp_server(mock_service)
 
-        result = await _call(server, content=_TOPIC_MATCH_CONTENT)
+        result = await _call(server, content=TOPIC_MATCH_CONTENT)
 
         assert result.get('error_type') != (
             'ProceduralKnowledgeKnownTopicClusterWriteRejected'
         ), f'the topic guard must be retired for a triaged write: {result!r}'
         assert 'error' not in result, f'{result!r}'
         assert result[ROUTED_KEY] == OUTCOME_STORED
-        assert mock_service.add_memory.await_args.kwargs['content'] == _TOPIC_MATCH_CONTENT
+        assert mock_service.add_memory.await_args.kwargs['content'] == TOPIC_MATCH_CONTENT
 
     @pytest.mark.asyncio
     async def test_no_reject_error_type_is_reachable_for_any_triaged_input(
@@ -550,13 +533,13 @@ class TestTheFlagOnPathRetiresBothRejectGuards:
         for score in (0.0, 0.69, T_LOW, 0.80, T_HIGH, 0.97, 1.0):
             mock_service = AsyncMock()
             configure_triage_config(
-                mock_service, enabled=True, topic_clusters=[_topic_cluster()],
+                mock_service, enabled=True, topic_clusters=[topic_cluster()],
             )
             _configure_pass_through_add_memory(mock_service)
             mock_service.search.return_value = [search_candidate('m1', score)]
             server = create_mcp_server(mock_service)
 
-            result = await _call(server, content=_TOPIC_MATCH_CONTENT)
+            result = await _call(server, content=TOPIC_MATCH_CONTENT)
 
             assert 'error_type' not in result, f'score={score}: {result!r}'
             assert result[ROUTED_KEY] in TRIAGE_OUTCOMES, f'score={score}: {result!r}'
