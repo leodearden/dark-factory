@@ -8,6 +8,7 @@ is the one loop that corroborates many tasks, each in its own project.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 from typing import Any
 from unittest.mock import AsyncMock
@@ -452,5 +453,6 @@ class TestCorroborateTaskLookups:
     def test_task_lookup_is_frozen(self):
         lookup = self._lookup('dark_factory', '1')
 
-        with pytest.raises(AttributeError):
-            lookup.task_id = '2'  # type: ignore[misc]
+        for field in dataclasses.fields(lookup):
+            with pytest.raises(dataclasses.FrozenInstanceError):
+                setattr(lookup, field.name, None)

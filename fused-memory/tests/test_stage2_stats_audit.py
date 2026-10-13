@@ -58,6 +58,7 @@ code behaviour.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 from datetime import UTC, datetime
@@ -570,8 +571,9 @@ class TestHintsUpdateClaims:
     def test_claim_is_frozen(self):
         claim = HintsClaim(entities=frozenset({'A'}), queries=frozenset())
 
-        with pytest.raises(AttributeError):
-            claim.entities = frozenset()  # type: ignore[misc]
+        for field in dataclasses.fields(claim):
+            with pytest.raises(dataclasses.FrozenInstanceError):
+                setattr(claim, field.name, None)
 
     # -- hints_claim_confirmed ------------------------------------------------
 
@@ -721,8 +723,9 @@ class TestGroundCounter:
             journaled=0, record_confirmed=0, uncorroborated=0, unresolvable=0,
         )
 
-        with pytest.raises(AttributeError):
-            grounding.journaled = 1  # type: ignore[misc]
+        for field in dataclasses.fields(grounding):
+            with pytest.raises(dataclasses.FrozenInstanceError):
+                setattr(grounding, field.name, None)
 
 
 # ── step-7: the repair is driven by the CORROBORATED count ───────────────────

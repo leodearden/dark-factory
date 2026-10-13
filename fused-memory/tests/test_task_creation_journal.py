@@ -10,6 +10,7 @@ WriteJournal and reads the rows back through that reader.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from unittest.mock import AsyncMock, MagicMock
 
@@ -89,8 +90,9 @@ class TestCreationAttributionFromSubmission:
     def test_instances_are_frozen(self):
         attribution = CreationAttribution(agent_id=STAGE2_AGENT, causation_id=RUN)
 
-        with pytest.raises(AttributeError):
-            attribution.causation_id = OTHER_RUN  # type: ignore[misc]
+        for field in dataclasses.fields(attribution):
+            with pytest.raises(dataclasses.FrozenInstanceError):
+                setattr(attribution, field.name, None)
 
 
 # ── Section 1b: blob round-trip ─────────────────────────────────────────────
