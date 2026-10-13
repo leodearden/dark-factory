@@ -753,11 +753,11 @@ def _run_failure_record(
     error_message: str | None = None,
 ) -> dict[str, object]:
     """The ``_error`` record both S1→S2→S3 drivers' ``except Exception``
-    handlers, and the remediation pass's cancellation handler, write for a
-    run ended by an exception, so the failure can be classified from the row
-    alone. The other ``_error`` records (run_full_cycle's cancellation, both
-    drivers' AllAccountsCapped, the stale-run reaper) are built by hand and
-    carry neither the traceback nor the sqlite keys.
+    handlers, and both drivers' cancellation handlers, write for a run ended
+    by an exception, so the failure can be classified from the row alone. The
+    other ``_error`` records (both drivers' AllAccountsCapped, the stale-run
+    reaper) are built by hand and carry neither the traceback nor the sqlite
+    keys.
     """
     return {
         'error_type': type(exc).__name__,
@@ -3942,8 +3942,8 @@ class ReconciliationHarness:
                 run.completed_at = datetime.now(UTC)
                 run.status = RunStatus.completed
                 await self.journal.complete_run(run_id, 'completed')
-            except asyncio.CancelledError:
-                await self._record_cancelled_run(run, project_id, current_stage_name)
+            except asyncio.CancelledError as e:
+                await self._record_cancelled_run(run, project_id, current_stage_name, e)
                 raise
             except AllAccountsCappedException as e:
                 await self._record_deferred_run(run, project_id, current_stage_name, e)
@@ -3988,7 +3988,11 @@ class ReconciliationHarness:
                 await self._persist_stage_reports_then_gc_config_dir(run)
 
     async def _record_cancelled_run(
-        self, run: ReconciliationRun, project_id: str, current_stage_name: str | None,
+        self,
+        run: ReconciliationRun,
+        project_id: str,
+        current_stage_name: str | None,
+        exc: asyncio.CancelledError,
     ) -> None:
         """Journal a ``run_full_cycle`` cancelled before durable completion; the
         caller re-raises, so asyncio cancellation semantics hold
@@ -4026,12 +4030,10 @@ class ReconciliationHarness:
             )
             return
         run.status = RunStatus.failed
-        run.stage_reports['_error'] = {
-            'error_type': 'CancelledError',
-            'error_message': 'Run cancelled (timeout or external cancellation)',
-            'failed_stage': current_stage_name,
-            'traceback': '',
-        }
+        run.stage_reports['_error'] = _run_failure_record(
+            exc, failed_stage=current_stage_name,
+            error_message='Run cancelled (timeout or external cancellation)',
+        )
         await self._journal_failed_and_restore_drained(run_id, project_id)
         logger.error(
             f'Reconciliation run {run_id} cancelled for {project_id} '
