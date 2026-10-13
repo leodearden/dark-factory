@@ -14,6 +14,7 @@ import json
 import os
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -836,3 +837,199 @@ class TestAssertWriteAccepted:
 
     def test_an_accepted_reply_returns_none(self):
         assert sweep.assert_write_accepted({'id': '1', 'updated': True}) is None
+
+
+# ---------------------------------------------------------------------------
+# The mem0 lane.
+# ---------------------------------------------------------------------------
+
+M1_BODY = f'cluster around {UNIQUE}; see also {UNIQUE}.'
+MEMORY_ERROR = {'error_type': 'MemoryNotFound', 'error': 'gone'}
+
+
+class FakeCorpus:
+    """An in-memory ``Mem0Corpus``: *replies* answers an amend without applying it,
+    and *drift* makes ``read_body`` return a body the scan never saw."""
+
+    def __init__(self, bodies: dict[str, str], *, replies=None, drift=None):
+        self.store = dict(bodies)
+        self.replies = replies or {}
+        self.drift = drift or {}
+        self.amends: list[tuple[str, str, str]] = []
+
+    async def bodies(self, project_id: str):
+        for memory_id in sorted(self.store):
+            yield memory_id, self.store[memory_id]
+
+    async def read_body(self, project_id: str, memory_id: str) -> str | None:
+        return self.drift.get(memory_id, self.store.get(memory_id))
+
+    async def amend_body(self, project_id: str, memory_id: str, body: str) -> dict:
+        self.amends.append((project_id, memory_id, body))
+        if memory_id in self.replies:
+            return self.replies[memory_id]
+        self.store[memory_id] = body
+        return {'status': 'updated', 'id': memory_id}
+
+
+def mem0_corpus(**options) -> FakeCorpus:
+    return FakeCorpus(
+        {
+            'm1': M1_BODY,
+            'm2': f'which of {AMBIG}',
+            'm3': f'{NONE_TOKENS[0]} on {NONE_TOKENS[1]}',
+            'm4': f'lone {UNIQUE}',
+        },
+        **options,
+    )
+
+
+def run_mem0(corpus, *, apply):
+    return run(None, apply=apply, lanes=('mem0',), mem0=corpus)
+
+
+class TestMem0Lane:
+    def test_a_dry_run_amends_nothing_and_needs_no_root(self):
+        corpus = mem0_corpus()
+
+        reports, diffs = run_mem0(corpus, apply=False)
+
+        assert corpus.amends == []
+        (report,) = reports
+        assert (report.scanned, report.expandable, report.untouched) == (4, 3, 2)
+        assert [site.record for site in report.ambiguous] == ['m2']
+        assert [diff.splitlines()[0] for diff in diffs] == ['--- mem0 m1 data', '--- mem0 m4 data']
+
+    def test_apply_amends_in_place_and_a_rejection_does_not_stop_the_lane(self):
+        corpus = mem0_corpus(replies={'m4': MEMORY_ERROR})
+
+        reports, _ = run_mem0(corpus, apply=True)
+
+        assert corpus.amends == [
+            (PROJECT, 'm1', M1_BODY.replace(UNIQUE, FULL)),
+            (PROJECT, 'm4', f'lone {FULL}'),
+        ]
+        assert corpus.store['m1'] == M1_BODY.replace(UNIQUE, FULL)
+        (report,) = reports
+        assert [(f.key, f.reason) for f in report.failures] == [('m4', 'write-rejected')]
+        assert 'MemoryNotFound' in report.failures[0].error
+        assert report.expanded == 2
+        assert sweep.exit_code(reports) == markup_sweep.EXIT_WRITE_FAILED
+
+    def test_a_body_changed_since_the_scan_is_not_amended(self):
+        corpus = mem0_corpus(drift={'m1': 'someone rewrote this'})
+
+        reports, _ = run_mem0(corpus, apply=True)
+
+        assert 'm1' not in {memory_id for _, memory_id, _ in corpus.amends}
+        assert [(f.key, f.reason) for f in reports[0].failures] == [
+            ('m1', markup_sweep.REASON_CHANGED_UNDER_US)
+        ]
+
+    def test_a_second_run_after_a_clean_apply_is_clean(self):
+        corpus = mem0_corpus()
+        run_mem0(corpus, apply=True)
+
+        reports, _ = run_mem0(corpus, apply=True)
+
+        assert reports[0].remaining == 0
+        assert sweep.exit_code(reports) == markup_sweep.EXIT_CLEAN
+
+
+class FakeMemoryService:
+    """The slice of ``MemoryService`` the production adapter touches."""
+
+    def __init__(self, points, *, update_error=None, scroll_error=None):
+        self.points = points
+        self.update_error = update_error
+        self.scroll_error = scroll_error
+        self.config = SimpleNamespace(mem0=SimpleNamespace(collection_prefix='fused'))
+        self.mem0 = SimpleNamespace(scroll_collection_pages=self._scroll)
+        self.scrolls: list[tuple[str, dict]] = []
+        self.updates: list[dict] = []
+
+    async def _scroll(self, collection, **options):
+        self.scrolls.append((collection, options))
+        if self.scroll_error is not None:
+            raise self.scroll_error
+        for point in self.points:
+            yield point
+
+    async def get_memory_by_id(self, *, project_id, memory_id):
+        for point in self.points:
+            if str(point.id) == memory_id:
+                return {'id': memory_id, 'content': 'c', 'metadata': point.payload}
+        return None
+
+    async def update_memory(self, **kwargs):
+        self.updates.append(kwargs)
+        if self.update_error is not None:
+            raise self.update_error
+        return {'status': 'updated', 'id': kwargs['memory_id']}
+
+
+def service_points():
+    return [
+        SimpleNamespace(id=FULL_OTHER, payload={'data': f'cites {UNIQUE}', 'topic': 't'}),
+        SimpleNamespace(id=AMBIG_A, payload={'topic': 'no body'}),
+        SimpleNamespace(id=AMBIG_B, payload={'data': 7}),
+    ]
+
+
+class TestServiceMem0Corpus:
+    def test_bodies_scroll_the_project_collection_and_skip_non_text(self):
+        service = FakeMemoryService(service_points())
+        corpus = sweep.ServiceMem0Corpus(service)
+
+        async def collect():
+            return [item async for item in corpus.bodies(PROJECT)]
+
+        assert asyncio.run(collect()) == [(FULL_OTHER, f'cites {UNIQUE}')]
+        ((collection, options),) = service.scrolls
+        assert collection == 'fused_proj_a'
+        assert options['with_payload'] is True
+
+    def test_read_body_reads_the_payload_data_or_none(self):
+        corpus = sweep.ServiceMem0Corpus(FakeMemoryService(service_points()))
+
+        assert asyncio.run(corpus.read_body(PROJECT, FULL_OTHER)) == f'cites {UNIQUE}'
+        assert asyncio.run(corpus.read_body(PROJECT, FULL)) is None
+
+    def test_amend_body_is_a_content_only_same_id_amend(self):
+        service = FakeMemoryService(service_points())
+
+        reply = asyncio.run(
+            sweep.ServiceMem0Corpus(service).amend_body(PROJECT, FULL_OTHER, f'cites {FULL}')
+        )
+
+        assert reply == {'status': 'updated', 'id': FULL_OTHER}
+        assert service.updates == [
+            {
+                'memory_id': FULL_OTHER,
+                'project_id': PROJECT,
+                'content': f'cites {FULL}',
+                'reason': sweep.WRITE_REASON,
+                'agent_id': sweep.WRITE_SOURCE,
+                '_source': sweep.WRITE_SOURCE,
+            }
+        ]
+
+    def test_a_store_exception_on_amend_is_a_lane_failure_not_a_crash(self):
+        service = FakeMemoryService(service_points(), update_error=ConnectionError('qdrant away'))
+
+        reports, _ = run_mem0(sweep.ServiceMem0Corpus(service), apply=True)
+
+        assert [(f.key, f.reason) for f in reports[0].failures] == [
+            (FULL_OTHER, markup_sweep.REASON_WRITE_FAILED)
+        ]
+        assert 'ConnectionError' in reports[0].failures[0].error
+        assert 'qdrant away' in reports[0].failures[0].error
+
+    def test_a_scroll_that_cannot_reach_the_store_aborts_the_lane(self):
+        service = FakeMemoryService(service_points(), scroll_error=ConnectionError('down'))
+
+        reports, _ = run_mem0(sweep.ServiceMem0Corpus(service), apply=True)
+
+        assert reports[0].aborted == 'mem0'
+        assert service.updates == []
+        assert sweep.exit_code(reports) == sweep.EXIT_STORE_UNAVAILABLE
