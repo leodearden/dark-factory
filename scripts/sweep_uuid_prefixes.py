@@ -43,7 +43,7 @@ from collections.abc import (
 )
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, NamedTuple, Protocol, TypeVar
+from typing import Any, Generic, NamedTuple, Protocol, TypeVar
 
 import _checkout as _checkout
 import httpx
@@ -184,16 +184,17 @@ class SweepScope(NamedTuple):
     project_root: Path | None
 
 
-class Record(NamedTuple):
-    """One sweepable document.
+#: A lane's own locator type for the record it writes back.
+_Source = TypeVar('_Source')
+_Source_co = TypeVar('_Source_co', covariant=True)
 
-    ``source`` is the owning lane's locator for the write; only that lane's
-    writer reads it.
-    """
+
+class Record(NamedTuple, Generic[_Source_co]):
+    """One sweepable document, and where its lane writes it back."""
 
     key: str
     fields: dict[str, Any]
-    source: object
+    source: _Source_co
 
 
 class WriteFailureRecord(NamedTuple):
@@ -320,18 +321,22 @@ class LaneContext(NamedTuple):
     tasks: TaskClientSlot | None
 
 
-Population = Callable[[LaneContext], AsyncIterator['Record | markup_sweep.Refusal']]
-Writer = Callable[[LaneContext, Record, dict[str, Any]], Awaitable['WriteFailureRecord | None']]
+Population = Callable[[LaneContext], AsyncIterator[Record[_Source] | markup_sweep.Refusal]]
+Writer = Callable[
+    [LaneContext, Record[_Source], dict[str, Any]], Awaitable[WriteFailureRecord | None]
+]
 
 
-class Lane(NamedTuple):
+class Lane(NamedTuple, Generic[_Source]):
+    """A store's sweep: its population and the writer for exactly those records."""
+
     name: str
     #: The lane reads a checkout's files, so a run needs a project root.
     needs_root: bool
     #: Top-level fields scanned for the report but never written.
     unwritable_fields: frozenset[str]
-    population: Population
-    write: Writer
+    population: Population[_Source]
+    write: Writer[_Source]
 
 
 #: A lane could not finish because a store it reads was unreachable.
@@ -391,7 +396,7 @@ def _value_at(document: Mapping[str, Any], path: tuple[str | int, ...]) -> Any:
     return node
 
 
-def render_diffs(lane: str, record: Record, plan: RecordPlan) -> list[str]:
+def render_diffs(lane: str, record: Record[object], plan: RecordPlan) -> list[str]:
     """A unified diff of each string *plan* changes, labelled by lane, record and path."""
     if plan.after is None:
         return []
@@ -452,7 +457,7 @@ async def run_sweep(
 
 
 async def _sweep_lane(
-    lane: Lane,
+    lane: Lane[_Source],
     context: LaneContext,
     resolve: PrefixResolver,
     memo: dict[str, Resolution],
@@ -476,8 +481,10 @@ async def _sweep_lane(
     return report, (), memo
 
 
-async def _collect(lane: Lane, context: LaneContext) -> tuple[list[Record], Counter[str]]:
-    records: list[Record] = []
+async def _collect(
+    lane: Lane[_Source], context: LaneContext
+) -> tuple[list[Record[_Source]], Counter[str]]:
+    records: list[Record[_Source]] = []
     refused: Counter[str] = Counter()
     async for item in lane.population(context):
         if isinstance(item, Record):
@@ -488,9 +495,9 @@ async def _collect(lane: Lane, context: LaneContext) -> tuple[list[Record], Coun
 
 
 async def _write_all(
-    lane: Lane,
+    lane: Lane[_Source],
     context: LaneContext,
-    plans: list[tuple[Record, RecordPlan]],
+    plans: list[tuple[Record[_Source], RecordPlan]],
     pacer: WritePacer,
 ) -> tuple[int, tuple[WriteFailureRecord, ...]]:
     """Write every planned record; count expansions only once they are on disk."""
@@ -511,7 +518,7 @@ async def _write_all(
 def _lane_report(
     lane: str,
     project_id: str,
-    plans: list[tuple[Record, RecordPlan]],
+    plans: Sequence[tuple[Record[object], RecordPlan]],
     refused: Mapping[str, int],
     *,
     expanded: int,
@@ -549,19 +556,6 @@ def _aborted_report(lane: str, project_id: str, store: str) -> LaneReport:
 # Lane plumbing shared by the writers.
 # ---------------------------------------------------------------------------
 
-_Source = TypeVar('_Source')
-
-
-def _source_of(record: Record, kind: type[_Source], lane: str) -> _Source:
-    """*record*'s locator, narrowed to the type the *lane* writer owns."""
-    if not isinstance(record.source, kind):
-        raise TypeError(
-            f'the {lane} lane was handed a {type(record.source).__name__} source, '
-            f'not its own {kind.__name__}'
-        )
-    return record.source
-
-
 def _required_root(scope: SweepScope, lane: str) -> Path:
     if scope.project_root is None:
         raise ValueError(f'the {lane} lane needs a project root and the scope has none')
@@ -581,7 +575,7 @@ class EscalationSource(NamedTuple):
 
 async def _escalation_population(
     context: LaneContext,
-) -> AsyncIterator[Record | markup_sweep.Refusal]:
+) -> AsyncIterator[Record[EscalationSource] | markup_sweep.Refusal]:
     root = _required_root(context.scope, markup_sweep.LANE_ESCALATIONS)
     targets = [
         target
@@ -592,7 +586,9 @@ async def _escalation_population(
         yield _escalation_record(target, root)
 
 
-def _escalation_record(target: markup_sweep.Target, root: Path) -> Record | markup_sweep.Refusal:
+def _escalation_record(
+    target: markup_sweep.Target, root: Path
+) -> Record[EscalationSource] | markup_sweep.Refusal:
     loaded = markup_sweep.load_target(target)
     if isinstance(loaded, markup_sweep.Refusal):
         return loaded
@@ -614,10 +610,9 @@ def _escalation_record(target: markup_sweep.Target, root: Path) -> Record | mark
 
 
 async def _write_escalation(
-    context: LaneContext, record: Record, after: dict[str, Any]
+    context: LaneContext, record: Record[EscalationSource], after: dict[str, Any]
 ) -> WriteFailureRecord | None:
-    source = _source_of(record, EscalationSource, markup_sweep.LANE_ESCALATIONS)
-    failure = markup_sweep.write_repaired(source.resolved, source.raw, after)
+    failure = markup_sweep.write_repaired(record.source.resolved, record.source.raw, after)
     if failure is None:
         return None
     return WriteFailureRecord(key=record.key, reason=failure.reason, error=failure.error)
@@ -695,7 +690,9 @@ def _current_task_fields(source: TaskSource) -> dict[str, Any] | None:
     return None if row is None else _task_fields(row)
 
 
-async def _task_population(context: LaneContext) -> AsyncIterator[Record | markup_sweep.Refusal]:
+async def _task_population(
+    context: LaneContext,
+) -> AsyncIterator[Record[TaskSource] | markup_sweep.Refusal]:
     root = _required_root(context.scope, LANE_TASKS)
     try:
         rows = _task_rows(root)
@@ -739,9 +736,9 @@ def build_task_update(
 
 
 async def _write_task(
-    context: LaneContext, record: Record, after: dict[str, Any]
+    context: LaneContext, record: Record[TaskSource], after: dict[str, Any]
 ) -> WriteFailureRecord | None:
-    source = _source_of(record, TaskSource, LANE_TASKS)
+    source = record.source
     tasks = _required_task_client(context)
     try:
         current = _current_task_fields(source)
@@ -894,7 +891,9 @@ def _required_corpus(context: LaneContext) -> Mem0Corpus:
     return context.mem0
 
 
-async def _mem0_population(context: LaneContext) -> AsyncIterator[Record | markup_sweep.Refusal]:
+async def _mem0_population(
+    context: LaneContext,
+) -> AsyncIterator[Record[Mem0Source] | markup_sweep.Refusal]:
     corpus = _required_corpus(context)
     async for memory_id, body in corpus.bodies(context.scope.project_id):
         yield Record(key=memory_id, fields={'data': body}, source=Mem0Source(memory_id))
@@ -910,9 +909,9 @@ def _amend_rejection(reply: Mapping[str, Any]) -> str | None:
 
 
 async def _write_mem0(
-    context: LaneContext, record: Record, after: dict[str, Any]
+    context: LaneContext, record: Record[Mem0Source], after: dict[str, Any]
 ) -> WriteFailureRecord | None:
-    source = _source_of(record, Mem0Source, LANE_MEM0)
+    source = record.source
     corpus = _required_corpus(context)
     project_id = context.scope.project_id
     try:
@@ -933,7 +932,9 @@ async def _write_mem0(
 
 
 #: The declared lane table. Order is the order ``--lane all`` runs them in.
-LANES: Mapping[str, Lane] = MappingProxyType({
+#: Each lane's source type is checked where the lane is built; the table only
+#: holds them side by side.
+LANES: Mapping[str, Lane[Any]] = MappingProxyType({
     lane.name: lane
     for lane in (
         Lane(
