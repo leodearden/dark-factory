@@ -22,14 +22,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from _task_db_scan import TaskDbUnreadable, connect_ro, decode_metadata, tasks_db_path
+from orchestrator.config import coerce_tier
+from orchestrator.scheduler import Scheduler
 from tasks_db_schema import EXIT_OK, EXIT_UNREADABLE, MainCheckoutUnresolved, resolve_live_db_path
-
-# Bind to the orchestrator of THIS checkout, as reviewer_redundancy_diagnostic.py does.
-_ORCH_SRC = Path(__file__).resolve().parent.parent / 'orchestrator' / 'src'
-if str(_ORCH_SRC) not in sys.path:
-    sys.path.insert(0, str(_ORCH_SRC))
-from orchestrator.config import coerce_tier  # noqa: E402
-from orchestrator.scheduler import Scheduler  # noqa: E402
 
 POPULATION_NOTE = 'every pending task of the tag, anchorless rows included'
 

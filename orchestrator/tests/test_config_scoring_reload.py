@@ -83,7 +83,7 @@ class TestBudgetSumInvariant:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         with pytest.raises(ValidationError):
-            OrchestratorConfig(scoring={'age_budget': 900.0})  # type: ignore[arg-type]
+            OrchestratorConfig.model_validate({'scoring': {'age_budget': 900.0}})
 
 
 class TestContinuityBelowCpmInvariant:
