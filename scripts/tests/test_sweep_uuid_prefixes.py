@@ -12,6 +12,7 @@ import copy
 import itertools
 import json
 import os
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -597,3 +598,241 @@ class TestWritePacer:
         spacings = [later - earlier for earlier, later in itertools.pairwise(releases)]
         assert all(spacing >= 0.2 - 1e-9 for spacing in spacings)
         assert fake.sleeps[2] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# The tasks lane.
+# ---------------------------------------------------------------------------
+
+PENDING_SINCE = '2026-10-01T00:00:00Z'
+REJECTION = {'success': False, 'error': 'done_provenance_via_update_task', 'hint': 'h'}
+
+
+def build_tasks(make_tasks_db, root: Path) -> Path:
+    directory = root / '.taskmaster' / 'tasks'
+    directory.mkdir(parents=True, exist_ok=True)
+    return make_tasks_db(
+        [
+            {
+                'id': 1,
+                'description': f'see memory {UNIQUE}',
+                'metadata': {
+                    'cluster_memory_ids': [UNIQUE, FULL_OTHER],
+                    'pending_since': PENDING_SINCE,
+                    'kind': 'x',
+                },
+            },
+            {'id': 2, 'details': f'which one: {AMBIG}'},
+            {'id': 3, 'test_strategy': f'recall {UNIQUE}'},
+            {'id': 4, 'title': f'about {UNIQUE}'},
+            {'id': 5, 'details': f'cites {UNIQUE}'},
+        ],
+        directory=directory,
+    )
+
+
+def stored_task(db: Path, task_id: int) -> dict:
+    conn = sqlite3.connect(db)
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute('SELECT * FROM tasks WHERE id = ?', (task_id,)).fetchone()
+    finally:
+        conn.close()
+    task = dict(row)
+    task['metadata'] = json.loads(task['metadata'] or '{}')
+    return task
+
+
+class FakeTaskServer:
+    """The ``update_task`` half of fused-memory, applied to the seeded sqlite file.
+
+    *replies* answers a task id with a canned reply and writes nothing.
+    *side_effects* runs one extra statement inside a task's write, standing in
+    for a concurrent writer.
+    """
+
+    def __init__(self, db: Path, *, replies=None, side_effects=None):
+        self.db = db
+        self.replies = replies or {}
+        self.side_effects = side_effects or {}
+        self.calls: list[dict] = []
+        self.opened_with: list[str | None] = []
+
+    def opener(self, server_url):
+        self.opened_with.append(server_url)
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return None
+
+    async def call_tool(self, name: str, arguments: dict) -> dict:
+        assert name == 'update_task'
+        self.calls.append(dict(arguments))
+        task_id = arguments['id']
+        if task_id in self.replies:
+            return self.replies[task_id]
+        conn = sqlite3.connect(self.db)
+        try:
+            with conn:
+                self._apply(conn, arguments)
+                if task_id in self.side_effects:
+                    conn.execute(self.side_effects[task_id])
+        finally:
+            conn.close()
+        return {'id': task_id, 'updated': True}
+
+    @staticmethod
+    def _apply(conn: sqlite3.Connection, arguments: dict) -> None:
+        key = (arguments['tag'], int(arguments['id']))
+        for column in ('title', 'description', 'details'):
+            if column in arguments:
+                conn.execute(
+                    f'UPDATE tasks SET {column} = ? WHERE tag = ? AND id = ?',
+                    (arguments[column], *key),
+                )
+        if 'metadata' in arguments:
+            assert arguments['metadata_mode'] == 'merge'
+            (old,) = conn.execute(
+                'SELECT metadata FROM tasks WHERE tag = ? AND id = ?', key
+            ).fetchone()
+            merged = {**json.loads(old or '{}'), **json.loads(arguments['metadata'])}
+            conn.execute(
+                'UPDATE tasks SET metadata = ? WHERE tag = ? AND id = ?',
+                (json.dumps(merged), *key),
+            )
+
+
+@pytest.fixture
+def task_root(tmp_path, make_tasks_db):
+    root = tmp_path / PROJECT
+    db = build_tasks(make_tasks_db, root)
+    return root, db
+
+
+def run_tasks(root, server, *, apply):
+    return run(root, apply=apply, lanes=('tasks',), open_task_client=server.opener)
+
+
+class TestTasksLane:
+    def test_a_dry_run_never_dials_the_server(self, task_root):
+        root, db = task_root
+        server = FakeTaskServer(db)
+        before = [stored_task(db, n) for n in range(1, 6)]
+
+        reports, diffs = run_tasks(root, server, apply=False)
+
+        assert server.opened_with == []
+        assert [stored_task(db, n) for n in range(1, 6)] == before
+        (report,) = reports
+        assert (report.scanned, report.expandable, report.remaining) == (5, 4, 4)
+        assert [site.record for site in report.ambiguous] == ['master#2']
+        assert [(site.record, site.path) for site in report.unwritable] == [
+            ('master#3', ('test_strategy',))
+        ]
+        labels = [diff.splitlines()[0] for diff in diffs]
+        assert labels == [
+            '--- tasks master#1 description',
+            '--- tasks master#1 metadata.cluster_memory_ids[0]',
+            '--- tasks master#4 title',
+            '--- tasks master#5 details',
+        ]
+
+    def test_apply_sends_only_the_changed_column_and_metadata_key(self, task_root):
+        root, db = task_root
+        server = FakeTaskServer(db)
+
+        reports, _ = run_tasks(root, server, apply=True)
+
+        sent = {call['id']: call for call in server.calls}
+        assert sorted(sent) == ['1', '4', '5']
+        assert sent['1'] == {
+            'id': '1',
+            'project_root': str(root),
+            'tag': 'master',
+            'description': f'see memory {FULL}',
+            'metadata': json.dumps({'cluster_memory_ids': [FULL, FULL_OTHER]}),
+            'metadata_mode': 'merge',
+        }
+        assert stored_task(db, 1)['metadata'] == {
+            'cluster_memory_ids': [FULL, FULL_OTHER],
+            'pending_since': PENDING_SINCE,
+            'kind': 'x',
+        }
+        assert stored_task(db, 3)['test_strategy'] == f'recall {UNIQUE}'
+        assert server.opened_with == [None]
+        assert (reports[0].expanded, reports[0].failures) == (4, ())
+
+    def test_a_rejected_write_is_a_failure_and_the_lane_continues(self, task_root):
+        root, db = task_root
+        server = FakeTaskServer(db, replies={'4': REJECTION})
+
+        reports, _ = run_tasks(root, server, apply=True)
+
+        (report,) = reports
+        assert [(f.key, f.reason) for f in report.failures] == [('master#4', 'write-rejected')]
+        assert 'done_provenance_via_update_task' in report.failures[0].error
+        assert stored_task(db, 4)['title'] == f'about {UNIQUE}'
+        assert stored_task(db, 5)['details'] == f'cites {FULL}'
+        assert report.expanded == 3
+        assert sweep.exit_code(reports) == markup_sweep.EXIT_WRITE_FAILED
+
+    def test_an_empty_reply_is_not_an_acceptance(self, task_root):
+        root, db = task_root
+        server = FakeTaskServer(db, replies={'4': {}})
+
+        reports, _ = run_tasks(root, server, apply=True)
+
+        assert [(f.key, f.reason) for f in reports[0].failures] == [('master#4', 'write-rejected')]
+
+    def test_a_row_changed_since_the_scan_is_not_sent(self, task_root):
+        root, db = task_root
+        server = FakeTaskServer(
+            db, side_effects={'1': "UPDATE tasks SET details = 'rewritten elsewhere' WHERE id = 5"}
+        )
+
+        reports, _ = run_tasks(root, server, apply=True)
+
+        assert '5' not in {call['id'] for call in server.calls}
+        assert [(f.key, f.reason) for f in reports[0].failures] == [
+            ('master#5', markup_sweep.REASON_CHANGED_UNDER_US)
+        ]
+        assert stored_task(db, 5)['details'] == 'rewritten elsewhere'
+
+    def test_a_second_run_after_a_clean_apply_is_clean(self, task_root):
+        root, db = task_root
+        run_tasks(root, FakeTaskServer(db), apply=True)
+
+        reports, _ = run_tasks(root, FakeTaskServer(db), apply=True)
+
+        (report,) = reports
+        assert (report.expandable, report.remaining) == (0, 0)
+        assert [(site.record, site.path) for site in report.unwritable] == [
+            ('master#3', ('test_strategy',))
+        ]
+        assert sweep.exit_code(reports) == markup_sweep.EXIT_CLEAN
+
+    def test_an_unreadable_store_aborts_the_lane(self, tmp_path, project_root_with_tasks_db):
+        root = tmp_path / PROJECT
+        db = project_root_with_tasks_db(root)
+        server = FakeTaskServer(db)
+
+        reports, _ = run_tasks(root, server, apply=True)
+
+        assert reports[0].aborted == 'tasks.db'
+        assert server.calls == []
+        assert sweep.exit_code(reports) == sweep.EXIT_STORE_UNAVAILABLE
+
+
+class TestAssertWriteAccepted:
+    @pytest.mark.parametrize(
+        'reply', [{'success': False, 'error': 'e'}, {}, 'not a dict'], ids=['error', 'empty', 'text']
+    )
+    def test_a_reply_without_a_positive_signal_raises(self, reply):
+        with pytest.raises(sweep.WriteRejectedError):
+            sweep.assert_write_accepted(reply)
+
+    def test_an_accepted_reply_returns_none(self):
+        assert sweep.assert_write_accepted({'id': '1', 'updated': True}) is None
