@@ -26,6 +26,7 @@ import time
 import traceback
 import uuid
 from collections.abc import (
+    AsyncIterator,
     Awaitable,
     Callable,
     Collection,
@@ -206,6 +207,7 @@ from orchestrator.verify_plan import effective_merge_module_configs
 from orchestrator.verify_runner import (
     UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY,
     HostAllocator,
+    HostLease,
     LocalRunner,
     RunnerUnavailable,
     VerifyRunner,
@@ -2328,6 +2330,26 @@ def _merge_boundary_module_configs(
     return effective_merge_module_configs(config, module_configs)
 
 
+def _placeholder_local_runner(
+    merge_wt: Path, req: MergeRequest, verifier: VerifyPort,
+) -> LocalRunner:
+    """The LocalRunner a local host slot is acquired with.
+
+    Its modules are the merge boundary's (PRD §8.2), through the SAME wrapper
+    as the runner that actually drives the verify, so the two can never
+    disagree about which modules a merge covers.
+    """
+    return LocalRunner(
+        merge_wt,
+        req.config,
+        _merge_boundary_module_configs(req.config, req.module_configs),
+        None,   # task_files — derived inside _run_post_merge_verify
+        run_scoped=verifier.run_scoped,
+        run_unscoped=verifier.run_unscoped_typechecks,
+        task_id=req.task_id,
+    )
+
+
 async def _record_flake_observation(
     result: VerifyResult,
     req: MergeRequest,
@@ -2490,10 +2512,11 @@ async def _run_post_merge_verify(
             quarantined, but the queue is NOT halted and the escalation is L1
             blocking rather than born-at-L2 (task 2886 amendment — bound the
             halt blast radius; DriftDetector Invariant 5).  Only the
-            production ``SpeculativeMergeWorker._run_inflight_verify`` call
-            site passes ``self.operator_halt``; every other (module-level or
-            test) caller omits it (default ``None`` → no halt), keeping
-            them byte-identical.  With ``verify_cross_check_remote_green`` on
+            production ``SpeculativeMergeWorker._run_inflight_verify`` and
+            ``_leased_train_verify`` call sites pass the worker's
+            ``operator_halt``; every other (module-level or test) caller
+            omits it (default ``None`` → no halt), keeping them
+            byte-identical.  With ``verify_cross_check_remote_green`` on
             (default True) the cross-check is a BLOCKING pre-land local
             re-verify, NOT a trailing detector; the halt is synchronous purely
             so it precedes any further adoption — incident 83336a32 halted +3s
@@ -2706,8 +2729,8 @@ async def _run_post_merge_verify(
     # γ decision 4: additive runner= param selects the verify host.
     # runner=None (default) → LOCAL-ONLY pool, byte-identical to β for every
     # legacy caller (_do_merge, _reverify_rebased_tree, reverify_member_solo,
-    # _do_train_merge, _run_cold_shadow_verify — recovery/train paths stay on
-    # the trust anchor and out of slot accounting).
+    # _run_cold_shadow_verify — recovery paths stay on the trust anchor and
+    # out of slot accounting).
     # runner=<RemoteRunner> → pool=[runner] (no LocalRunner); warm-swap is skipped
     # (per-host persistent worktree — handled by γ's _run_inflight_verify caller).
     # The caller-owned `quarantine` set is the divergence-quarantine sink for
@@ -3226,7 +3249,7 @@ async def _run_post_merge_verify(
                 # on (default True) the cross-check is a BLOCKING pre-land local
                 # re-verify, NOT a trailing detector; the halt is synchronous
                 # purely so it precedes any further adoption.  None-safe: only the
-                # production worker call site threads self.operator_halt.
+                # production worker call sites thread operator_halt.
                 #
                 # task 2886 amendment (reviewer robustness — bound the halt blast
                 # radius): only halt the WHOLE fleet when the local FAIL is a
@@ -5504,10 +5527,12 @@ class _TrainMergeHost(Protocol):
     the narrow statement of what the train pipeline touches.
     """
 
-    # ── Git / event / verify dependencies ─────────────────────────────────
+    # ── Git / event / verify / clock dependencies ─────────────────────────
     _git_ops: GitOps
     _event_store: EventStore | None
     _verifier: VerifyPort
+    _clock: ClockPort
+    _runner_quarantine: set[str]
 
     # ── Per-task counters (mutated by shared helpers) ─────────────────────
     _post_merge_verify_timeouts: dict[str, int]
@@ -5528,10 +5553,16 @@ class _TrainMergeHost(Protocol):
     # ── WIP halt / abandon helpers ────────────────────────────────────────
     def halt_for_wip(self, reason: str) -> None: ...
     def unhalt_wip(self, reason: str | None = None) -> None: ...
+    def operator_halt(self, reason: str) -> None: ...
     def _abandon_outcome(self, task_id: str, count: int) -> MergeOutcome: ...
 
+    # ── verify hosts ──────────────────────────────────────────────────────
+    def _ensure_host_allocator(self, config: OrchestratorConfig) -> HostAllocator: ...
+    def _quarantine_unreachable_host(self, host: str, reason: str, now: float) -> None: ...
+    async def _cancel_and_release_tracked(self, lease: Any | None) -> bool: ...
+
     # ── restart drain (task 5371) ─────────────────────────────────────────
-    def _note_verify_started(self, request_id: str) -> None: ...
+    def _note_verify_started(self, request_id: str, *, host: str | None = None) -> None: ...
 
 
 async def reverify_member_solo(
@@ -6951,6 +6982,99 @@ async def _advance_train(
         )
 
 
+# Until task 6106 lands, a remote MemoryMax kill reads as a red train verdict.
+_TRAIN_REMOTE_VERIFY_MAX_MEMBERS = 2
+
+
+class _TrainVerifyHost:
+    """The host a train's verifies run on: the slot it leased, or unleased local."""
+
+    def __init__(
+        self, worker: _TrainMergeHost, allocator: HostAllocator, lease: HostLease | None,
+    ) -> None:
+        self._worker = worker
+        self._allocator = allocator
+        self._lease = lease
+
+    @classmethod
+    async def acquire(
+        cls, worker: _TrainMergeHost, req: GroupMergeRequest, merge_wt: Path,
+    ) -> _TrainVerifyHost:
+        """Lease a host slot for *req*, never waiting for one.
+
+        A train of more than ``_TRAIN_REMOTE_VERIFY_MAX_MEMBERS`` members takes
+        only the local slot. No free slot leaves the train unleased on local.
+        """
+        allocator = worker._ensure_host_allocator(req.config)
+        factory = functools.partial(_placeholder_local_runner, merge_wt, req, worker._verifier)
+        if len(req.member_task_ids) > _TRAIN_REMOTE_VERIFY_MAX_MEMBERS:
+            lease = allocator.acquire_local(factory)
+        else:
+            lease = await allocator.acquire(factory, policy=req.config.verify_host_policy)
+        return cls(worker, allocator, lease)
+
+    @property
+    def name(self) -> str:
+        return LocalRunner.name if self._lease is None else self._lease.name
+
+    @property
+    def runner(self) -> VerifyRunner | None:
+        """The remote to dispatch the verify to; None verifies on local."""
+        if self._lease is None or self._lease.is_local:
+            return None
+        return self._lease.runner
+
+    async def release(self, *, aborted: bool) -> None:
+        """Give the slot back; an *aborted* train's verify may still be running."""
+        if self._lease is None:
+            return
+        if aborted:
+            await self._worker._cancel_and_release_tracked(self._lease)
+        else:
+            await self._allocator.release(self._lease)
+
+
+@contextlib.asynccontextmanager
+async def _leased_train_verify(
+    worker: _TrainMergeHost, req: GroupMergeRequest, merge_wt: Path,
+) -> AsyncIterator[Callable[..., Awaitable[MergeOutcome | None]]]:
+    """Lease a verify host for *req* and yield its verify on that host.
+
+    The yielded callable is ``_run_post_merge_verify`` on the worker's
+    injected VerifyPort. The lease is held until the block exits: released
+    plainly on a normal exit, cancelled and released on any exception.
+    """
+    verify_once = functools.partial(
+        _run_post_merge_verify,
+        timeouts=worker._post_merge_verify_timeouts,
+        enospc_retries=worker._post_merge_verify_enospc_retries,
+        max_timeouts=worker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
+        max_enospc=worker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
+        max_narrowed=worker.MAX_POST_MERGE_VERIFY_NARROWED_RETRIES,
+        narrowed_retries=worker._post_merge_verify_narrowed_retries,
+        event_store=worker._event_store,
+        quarantine=worker._runner_quarantine,
+        halt_hook=worker.operator_halt,
+        escalation_queue=getattr(worker, '_escalation_queue', None),
+        task_client=getattr(worker, '_flake_task_client', None),
+        verifier=worker._verifier,
+    )
+    host = await _TrainVerifyHost.acquire(worker, req, merge_wt)
+
+    async def train_verify(*args: Any, **kwargs: Any) -> MergeOutcome | None:
+        # Every train verify, the CAS-retry re-verifies included, restarts
+        # the restart drain's deadline clock (task 5371).
+        worker._note_verify_started(req.request_id, host=host.name)
+        return await verify_once(*args, runner=host.runner, **kwargs)
+
+    try:
+        yield train_verify
+    except BaseException:
+        await host.release(aborted=True)
+        raise
+    await host.release(aborted=False)
+
+
 async def _do_train_merge(
     worker: _TrainMergeHost,
     req: GroupMergeRequest,
@@ -7046,7 +7170,10 @@ async def _do_train_merge(
     (c) Merge — ``merge_to_main`` performs the --no-ff merge of the TIP branch
         (which, by stacking, already carries all member commits).
     (d) Workspace verify — ``run_scoped_verification`` with ``is_merge_verify=True``
-        enforces the workspace-wide post-merge green gate (scenario 5).
+        enforces the workspace-wide post-merge green gate (scenario 5).  It
+        runs on a host leased from the worker's allocator (a remote only for
+        trains of at most ``_TRAIN_REMOTE_VERIFY_MAX_MEMBERS`` members), or
+        unleased on local when no slot is free.
     (e) CAS advance — :func:`_advance_train`'s bounded loop atomically
         updates the main ref, re-verifying a tip rebased onto a moved main
         (item 1) and retrying a lost CAS (item 5).
@@ -7196,10 +7323,11 @@ async def _do_train_merge(
         )
 
     # (e) Workspace-wide post-merge verify via the shared helper, on the
-    # worker's injected VerifyPort. _run_post_merge_verify runs the pre-verify
-    # disk guard, the scoped verification (with ENOSPC prune-retry), and the
-    # timeout loop-breaker bookkeeping.  Returns None when verify passes;
-    # returns a MergeOutcome (and cleans up merge_wt) on a controlled failure.
+    # worker's injected VerifyPort and a leased host (_leased_train_verify).
+    # _run_post_merge_verify runs the pre-verify disk guard, the scoped
+    # verification (with ENOSPC prune-retry), and the timeout loop-breaker
+    # bookkeeping.  Returns None when verify passes; returns a MergeOutcome
+    # (and cleans up merge_wt) on a controlled failure.
     # Routing note (λ, task 2589, T1): this ultimately threads role='merge'
     # and force_workspace=req.config.merge_verify_workspace into
     # run_scoped_verification (via LocalRunner._run, verify_runner.py) —
@@ -7208,52 +7336,33 @@ async def _do_train_merge(
     # builds for role='merge': merge_verify_breadth=='full' fans out to
     # every REGISTERED module's full suite per-module; =='scoped' (the
     # shipped default) stays the pre-λ opaque global workspace command.
-    verify_once = functools.partial(
-        _run_post_merge_verify,
-        timeouts=worker._post_merge_verify_timeouts,
-        enospc_retries=worker._post_merge_verify_enospc_retries,
-        max_timeouts=worker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
-        max_enospc=worker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
-        max_narrowed=worker.MAX_POST_MERGE_VERIFY_NARROWED_RETRIES,
-        narrowed_retries=worker._post_merge_verify_narrowed_retries,
-        event_store=event_store,
-        escalation_queue=getattr(worker, '_escalation_queue', None),
-        task_client=getattr(worker, '_flake_task_client', None),
-        verifier=worker._verifier,
-    )
+    async with _leased_train_verify(worker, req, merge_wt) as train_verify:
+        verify_outcome = await train_verify(git_ops, req, merge_wt, merge_sha=merge_commit)
+        if verify_outcome is not None:
+            return _derail_on_train_verify_failure(
+                event_store, req, verify_outcome, started_monotonic=t0,
+            )
 
-    async def train_verify(*args: Any, **kwargs: Any) -> MergeOutcome | None:
-        # Every train verify, the CAS-retry re-verifies included, restarts
-        # the restart drain's deadline clock (task 5371).
-        worker._note_verify_started(req.request_id)
-        return await verify_once(*args, **kwargs)
-
-    verify_outcome = await train_verify(git_ops, req, merge_wt, merge_sha=merge_commit)
-    if verify_outcome is not None:
-        return _derail_on_train_verify_failure(
-            event_store, req, verify_outcome, started_monotonic=t0,
+        # (f) CAS-advance main.
+        # branch_tip_sha is best-effort (resolve_branch_sha returns str | None;
+        # _do_train_merge has no MergedOk.branch_tip like the single-branch path).
+        # Performance (amendment, task 2154): this costs one extra git subprocess
+        # per train CAS-advance. Nothing upstream in this function already holds
+        # a resolved tip SHA to reuse — rebase_onto_main returns bool only, and
+        # the raw MergeResult from merge_to_main has no branch_tip field (that
+        # field lives only on MergedOk, single-branch's classify_and_merge
+        # result; see git_ops.py:368). The resolve is therefore an accepted,
+        # intentional best-effort cost rather than a deferred TODO.
+        _train_branch_tip = await git_ops.resolve_branch_sha(req.branch.full_name)
+        train_advance = await _advance_train(
+            worker, req,
+            merge_commit=merge_commit,
+            merge_wt=merge_wt,
+            main_sha=main_sha,
+            branch_tip_sha=_train_branch_tip,
+            train_verify=train_verify,
+            started_monotonic=t0,
         )
-
-    # (f) CAS-advance main.
-    # branch_tip_sha is best-effort (resolve_branch_sha returns str | None;
-    # _do_train_merge has no MergedOk.branch_tip like the single-branch path).
-    # Performance (amendment, task 2154): this costs one extra git subprocess
-    # per train CAS-advance. Nothing upstream in this function already holds
-    # a resolved tip SHA to reuse — rebase_onto_main returns bool only, and
-    # the raw MergeResult from merge_to_main has no branch_tip field (that
-    # field lives only on MergedOk, single-branch's classify_and_merge
-    # result; see git_ops.py:368). The resolve is therefore an accepted,
-    # intentional best-effort cost rather than a deferred TODO.
-    _train_branch_tip = await git_ops.resolve_branch_sha(req.branch.full_name)
-    train_advance = await _advance_train(
-        worker, req,
-        merge_commit=merge_commit,
-        merge_wt=merge_wt,
-        main_sha=main_sha,
-        branch_tip_sha=_train_branch_tip,
-        train_verify=train_verify,
-        started_monotonic=t0,
-    )
     if train_advance.reverify_failure is not None:
         return _derail_on_train_verify_failure(
             event_store, req, train_advance.reverify_failure, started_monotonic=t0,
@@ -9629,6 +9738,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # each of a train's inline verifies starts: where the restart drain
         # measures a verify's deadline from.
         self._phase_started: dict[str, float] = {}
+        # The host each train's current inline verify runs on, beside its
+        # _phase_started stamp and retired with it.
+        self._train_verify_host: dict[str, str] = {}
         # Cross-workflow auto-heal attempt counter; shared via
         # self.merge_worker on TaskWorkflow instances.
         self.auto_heal_registry: MainHealthAutoHealRegistry = MainHealthAutoHealRegistry()
@@ -10074,6 +10186,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self._note_verify_started(request_id)
         elif from_state in _RESTAMPED_STATES:
             self._phase_started.pop(request_id, None)
+            self._train_verify_host.pop(request_id, None)
         if live_obj is not None:
             self._live_items[request_id] = live_obj
 
@@ -13495,14 +13608,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._admission_halt_reason = None
         self._signal_resume()
 
-    def _note_verify_started(self, request_id: str) -> None:
+    def _note_verify_started(self, request_id: str, *, host: str | None = None) -> None:
         """Stamp now as the start of *request_id*'s current verify (task 5371).
 
         Called on every entry into a ``_RESTAMPED_STATES`` state and before
         each verify a train runs inline, so a deadline is always measured
-        from the verify actually running.
+        from the verify actually running. A train names the *host* that
+        verify runs on.
         """
         self._phase_started[request_id] = self._clock.now()
+        if host is None:
+            self._train_verify_host.pop(request_id, None)
+        else:
+            self._train_verify_host[request_id] = host
 
     def _verifies_in_flight(self, now: float) -> list[VerifyInFlight]:
         """Every merge verify a restart would kill now, on any host (task 5371).
@@ -13534,7 +13652,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             is_train = isinstance(request, GroupMergeRequest)
             found.append(VerifyInFlight.for_request(
                 request,
-                host=LocalRunner.name if is_train else None,
+                host=self._train_verify_host.get(rid, LocalRunner.name) if is_train else None,
                 kind=VerifyInFlightKind.held(state.value, is_train=is_train),
                 started_ts=self._phase_started.get(rid, now),
             ))
@@ -17836,12 +17954,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """THE cancel-release chokepoint: release the lease, RECORD a strand.
 
         Sole caller of ``HostAllocator.cancel_and_release`` — enforced by
-        :class:`TestCancelAndReleaseChokepoint`'s AST ratchet.  Its six call
+        :class:`TestCancelAndReleaseChokepoint`'s AST ratchet.  Its seven call
         sites are the two ``stop()`` drains (finalizing head and ``_inflight``),
         the head-failure cascade's in-body release,
         :meth:`_resolve_and_release` with ``cancel_lease=True``,
-        :meth:`_finalize_inflight`'s ``_cancel_release`` path, and
-        :meth:`_vacate_inflight_entry` (task 4582).
+        :meth:`_finalize_inflight`'s ``_cancel_release`` path,
+        :meth:`_vacate_inflight_entry` (task 4582), and an aborted train's
+        lease (``_TrainVerifyHost.release``, task 6160).
 
         MECHANISM (task 3043, reify 2026-07-25).  Against an unreachable host
         ``cancel_verify()`` returns rc != 0 and all ``max_attempts``
@@ -21683,21 +21802,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         def _local_factory() -> LocalRunner:
             assert _item_for_factory.merge_wt is not None, \
                 'dispatch path: merge_wt must be non-None for a real item'
-            return LocalRunner(
-                _item_for_factory.merge_wt,
-                _req_for_factory.config,
-                # Same γ resolution as the merge boundary (PRD §8.2), through
-                # the SAME wrapper so the zero-module policy matches too: keep
-                # this slot/health placeholder consistent with the runner that
-                # actually drives the verify, so the two can never disagree
-                # about which modules a merge covers.
-                _merge_boundary_module_configs(
-                    _req_for_factory.config, _req_for_factory.module_configs,
-                ),
-                None,   # task_files — derived inside _run_post_merge_verify
-                run_scoped=self._verifier.run_scoped,
-                run_unscoped=self._verifier.run_unscoped_typechecks,
-                task_id=_req_for_factory.task_id,
+            return _placeholder_local_runner(
+                _item_for_factory.merge_wt, _req_for_factory, self._verifier,
             )
 
         lease = await allocator.acquire(_local_factory, policy=req.config.verify_host_policy)

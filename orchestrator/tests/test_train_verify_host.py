@@ -373,3 +373,41 @@ async def test_a_train_whose_hosts_are_all_taken_verifies_unleased_instead_of_wa
     assert verifier.verified == ['pred', train.tip]
     assert pred_outcome.status == 'done', pred_outcome
     assert train_outcome.status == 'done', train_outcome
+
+
+async def test_a_remote_green_the_local_cross_check_contradicts_benches_the_remote(
+    tmp_path: Path,
+) -> None:
+    """With the cross-check on, a train's remote green is re-run on local; a
+    red local verdict withholds the land, quarantines the remote for
+    divergence and halts the lane, exactly as for a single."""
+    repo = seed_repo(tmp_path / 'repo', _SEED)
+    scene = _Scene(
+        repo=repo, git_ops=GitOps(_GIT, repo),
+        config=lane_scene_config(
+            repo, _GIT, verify_host_policy='prefer_remote', verify_cross_check_remote_green=True,
+        ),
+    )
+    train = await _stacked_train(scene, 2)
+    remote = _FakeRemote()
+    verifier = FakeVerifier(default=fails(category='pytest', summary='red on local'))
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    lane = make_lane(
+        scene.git_ops, queue,
+        verifier=verifier, clock=healthy_verify_clock(), remote_runners=[remote],
+    )
+    main_before = await scene.git_ops.get_main_sha()
+
+    async with running_lane(lane) as run:
+        await queue.put(train.request)
+        outcome = await run.outcome(train.request)
+        halted = lane.is_wip_halted
+
+    assert outcome.status == 'blocked', outcome
+    assert outcome.reason.startswith(TRAIN_VERIFY_FAILED_REASON_PREFIX), outcome
+    assert await scene.git_ops.get_main_sha() == main_before
+    assert len(remote.calls) == 1
+    assert verifier.verified == [train.tip]
+    (laptop,) = [host for host in lane.snapshot()['hosts'] if host['name'] == 'laptop']
+    assert (laptop['quarantined'], laptop['quarantine_class']) == (True, 'divergence')
+    assert halted is True
