@@ -27,7 +27,7 @@ from fused_memory.models.reconciliation import (
     RunType,
     StageReport,
 )
-from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
+from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope, Scope
 from fused_memory.reconciliation.cli_stage_runner import recon_config_base_dir
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.harness import BacklogIterator
@@ -19119,6 +19119,35 @@ class TestHarnessIndexHealthStartupSweep:
 # ── Tests for task 1938: harness._reconcile_status_correction ──────────────────
 
 
+def _missing_collection_404(collection: str) -> UnexpectedResponse:
+    """Qdrant's 404 for an absent collection, with the body a live scroll returns."""
+    body = {'status': {'error': f"Not found: Collection `{collection}` doesn't exist!"}}
+    return UnexpectedResponse(404, 'Not Found', json.dumps(body).encode(), httpx.Headers())
+
+
+@contextlib.contextmanager
+def _real_metadata_read_raising(harness, config, scroll_failure: BaseException):
+    """Route ``harness.memory.get_memories_by_metadata`` through a REAL
+    MemoryService and Mem0Backend whose Qdrant scroll raises *scroll_failure*.
+    """
+    from fused_memory.services.memory_service import MemoryService
+
+    real_svc = MemoryService(config)
+    client = AsyncMock()
+    client.scroll = AsyncMock(side_effect=scroll_failure)
+    with patch.object(real_svc.mem0, '_get_async_qdrant', AsyncMock(return_value=client)):
+        harness.memory.get_memories_by_metadata = real_svc.get_memories_by_metadata
+        yield
+
+
+def _absent_collection_disclosures(caplog) -> list[logging.LogRecord]:
+    """The Mem0 backend's INFO records announcing a collection read as empty."""
+    return [
+        r for r in caplog.records
+        if r.name == 'fused_memory.backends.mem0_client' and hasattr(r, 'collection')
+    ]
+
+
 class TestHarnessReconcileStatusCorrection:
     """ReconciliationHarness._reconcile_status_correction diffs the cached Mem0
     project_status_correction memory against the live get_statuses census and
@@ -19429,88 +19458,60 @@ class TestHarnessReconcileStatusCorrection:
         )
 
     @pytest.mark.asyncio
-    async def test_missing_collection_404_treated_as_no_prior_corrections(
-        self, journal, event_buffer, mock_memory_service, caplog
+    async def test_missing_collection_reads_as_no_prior_corrections_via_the_primitive(
+        self, journal, event_buffer, mock_memory_service, mock_config, caplog
     ):
         """A project whose Qdrant collection was never provisioned holds no
-        prior corrections — an empty result, not a reconciliation failure.
+        prior corrections: the plain found=False record, with no write and no
+        WARNING.
 
-        Before task 2949 that 404 fell into the generic handler, so every cycle
-        logged a WARNING and returned an `error` record that Stage 3 then
-        re-flagged as an unresolved integrity issue, forever.
-
-        step-3 (RED): the 404 is still classified as a failure.
+        Task 2949 caught that 404 here; task 4858 moved the degradation into
+        the Mem0 primitive, so the read goes through a REAL MemoryService and
+        Mem0Backend and the absent-vs-empty disclosure is the backend's INFO.
         """
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        harness.memory.get_memories_by_metadata = AsyncMock(
-            side_effect=UnexpectedResponse(
-                404,
-                'Not Found',
-                b"Collection `fused_solar_challenge` doesn't exist!",
-                httpx.Headers(),
-            )
+        collection = Scope(project_id='solar_challenge').mem0_collection_name(
+            mock_config.mem0.collection_prefix,
         )
+        missing = _missing_collection_404(collection)
 
-        with caplog.at_level(logging.INFO):
+        with (
+            _real_metadata_read_raising(harness, mock_config, missing),
+            caplog.at_level(logging.INFO),
+        ):
             result = await harness._reconcile_status_correction(
                 'solar_challenge', {'1': 'done'}
             )
 
-        assert result is not None
         assert result == {
             'available': True,
             'found': False,
             'diverged': False,
             'superseded': False,
-            'collection_missing': True,
         }
-        assert 'error' not in result
-        # Structurally the same no-op as "no cached memory": nothing written.
         harness.memory.add_memory.assert_not_called()  # type: ignore[attr-defined]
         harness.memory.delete_memory.assert_not_called()  # type: ignore[attr-defined]
-        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
-            'a missing collection is an empty result, not a failure — it must '
-            'not emit the per-cycle WARNING the generic handler logs'
-        )
-        # Loud-over-silent: quiet is NOT the contract, INFO is.  The disclosure
-        # is an operator's only way to tell "collection absent" from "collection
-        # genuinely empty" behind found=False, so pin its presence AND its
-        # structured project_id — not merely the absence of a WARNING, which
-        # deleting the logger.info call outright would also satisfy.
-        missing_records = [
-            r
-            for r in caplog.records
-            if 'reconciliation.status_correction_collection_missing' in r.getMessage()
-        ]
-        assert missing_records, (
-            'Expected an INFO reconciliation.status_correction_collection_missing '
-            f'record disclosing WHY found=False; got '
-            f'{[(r.levelno, r.getMessage()) for r in caplog.records]}'
-        )
-        assert missing_records[0].levelno == logging.INFO
-        assert getattr(missing_records[0], 'project_id', None) == 'solar_challenge', (
-            'the disclosure must name the project in a structured extra= field, '
-            f'got {getattr(missing_records[0], "project_id", None)!r}'
-        )
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert [
+            (r.levelno, getattr(r, 'collection', None))
+            for r in _absent_collection_disclosures(caplog)
+        ] == [(logging.INFO, collection)]
 
     @pytest.mark.asyncio
-    async def test_non_missing_collection_response_still_errors(
-        self, journal, event_buffer, mock_memory_service, caplog
+    async def test_non_missing_collection_failure_still_errors_via_the_primitive(
+        self, journal, event_buffer, mock_memory_service, mock_config, caplog
     ):
         """Boundary: ONLY the missing-collection 404 degrades.  A 500 from the
         same client is a real backend failure and must keep surfacing as an
         error record + WARNING (no-silent-fail).
-
-        step-3 (RED): guards the step-4 catch against over-matching.
         """
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        harness.memory.get_memories_by_metadata = AsyncMock(
-            side_effect=UnexpectedResponse(
-                500, 'Internal Server Error', b'boom', httpx.Headers()
-            )
-        )
+        failure = UnexpectedResponse(500, 'Internal Server Error', b'boom', httpx.Headers())
 
-        with caplog.at_level(logging.WARNING):
+        with (
+            _real_metadata_read_raising(harness, mock_config, failure),
+            caplog.at_level(logging.INFO),
+        ):
             result = await harness._reconcile_status_correction(
                 'solar_challenge', {'1': 'done'}
             )
@@ -19518,10 +19519,10 @@ class TestHarnessReconcileStatusCorrection:
         assert result is not None
         assert 'error' in result
         assert result['superseded'] is False
-        assert 'collection_missing' not in result
         assert any(r.levelno >= logging.WARNING for r in caplog.records), (
             'Expected a WARNING log when the query fails with a non-404'
         )
+        assert _absent_collection_disclosures(caplog) == []
 
     # ------------------------------------------------------------------ #
     # task 1938 amendment: pool-capping + delete-loop resilience

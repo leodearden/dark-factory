@@ -7,9 +7,11 @@ import types
 from datetime import UTC, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from _fm_helpers import _make_rate_limit_error
 from _mem0_record_shapes import mem0_record
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import Scope
@@ -10987,6 +10989,60 @@ class TestCountMemoriesByMetadata:
 
         assert filters['task_id'] == 2614
         assert isinstance(filters['task_id'], int)
+
+
+def _missing_collection_404(collection: str) -> UnexpectedResponse:
+    """Qdrant's 404 for an absent collection, with the body a live scroll/count returns."""
+    body = {'status': {'error': f"Not found: Collection `{collection}` doesn't exist!"}}
+    return UnexpectedResponse(404, 'Not Found', json.dumps(body).encode(), httpx.Headers())
+
+
+class TestMetadataReadsOnAbsentCollection:
+    """Both service-level metadata reads inherit the backend's absent-collection
+    degradation through their passthrough, so every caller of either one reads
+    a never-provisioned project as empty while a real failure still raises
+    (task 4858).
+
+    ``svc.mem0`` stays the REAL ``Mem0Backend``; only its Qdrant client is faked.
+    """
+
+    _PROJECT = 'solar_challenge'
+    _FILTERS = {'kind': 'project_status_correction'}
+    _READS = [
+        pytest.param('get_memories_by_metadata', [], id='get'),
+        pytest.param('count_memories_by_metadata', 0, id='count'),
+    ]
+
+    @classmethod
+    async def _read_with_qdrant_raising(cls, mock_config, read: str, exc: BaseException):
+        svc = MemoryService(mock_config)
+        client = AsyncMock()
+        client.scroll = AsyncMock(side_effect=exc)
+        client.count = AsyncMock(side_effect=exc)
+        with patch.object(svc.mem0, '_get_async_qdrant', AsyncMock(return_value=client)):
+            return await getattr(svc, read)(project_id=cls._PROJECT, filters=cls._FILTERS)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('read', 'empty'), _READS)
+    async def test_absent_collection_reads_as_empty(self, mock_config, read, empty):
+        collection = Scope(project_id=self._PROJECT).mem0_collection_name(
+            mock_config.mem0.collection_prefix,
+        )
+
+        result = await self._read_with_qdrant_raising(
+            mock_config, read, _missing_collection_404(collection),
+        )
+
+        assert result == empty
+        assert type(result) is type(empty)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('read', 'empty'), _READS)
+    async def test_backend_failure_still_raises(self, mock_config, read, empty):
+        failure = UnexpectedResponse(500, 'Internal Server Error', b'boom', httpx.Headers())
+
+        with pytest.raises(UnexpectedResponse):
+            await self._read_with_qdrant_raising(mock_config, read, failure)
 
 
 # ---------------------------------------------------------------------------
