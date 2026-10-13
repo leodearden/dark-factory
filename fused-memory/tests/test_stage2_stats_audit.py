@@ -972,11 +972,12 @@ class TestPostFlightRepairIsCorroborated:
 
         await stage._apply_post_flight_guards(report, [], 'test-run-3051')
 
-        # 'failed' is not structurally valid; the other two are, and neither
-        # corroborates.
-        assert report.stats['task_created_records_valid'] == 2
+        # 'failed' never counts and 'combined' is not a tasks_created status;
+        # the one 'created' record is structurally valid and does not
+        # corroborate.
+        assert report.stats['task_created_records_valid'] == 1
         assert report.stats['task_created_records_corroborated'] == 0
-        assert report.stats['task_created_records_uncorroborated'] == 2
+        assert report.stats['task_created_records_uncorroborated'] == 1
 
     @pytest.mark.asyncio
     async def test_repair_warning_names_the_corroborated_count(self, caplog):
