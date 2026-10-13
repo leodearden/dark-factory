@@ -7,6 +7,7 @@ PRD: plans/remote-task-leg-verify-prd.md §4.1, §5.1, §6 row 1.
 
 import dataclasses
 import json
+import operator
 from pathlib import Path
 
 import pytest
@@ -78,14 +79,12 @@ class TestShape:
     def test_is_frozen(self):
         spec = _spec()
 
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            spec.attempt_id = 4  # type: ignore[misc]
+        pytest.raises(dataclasses.FrozenInstanceError, setattr, spec, 'attempt_id', 4)
 
     def test_verify_env_is_immutable(self):
         spec = _spec()
 
-        with pytest.raises(TypeError):
-            spec.verify_env['A'] = 'changed'  # type: ignore[index]
+        pytest.raises(TypeError, operator.setitem, spec.verify_env, 'A', 'changed')
 
     def test_verify_env_is_a_copy(self):
         env = {'A': '1'}

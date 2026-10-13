@@ -39,8 +39,7 @@ class TestVerifyCommand:
     def test_is_frozen(self):
         vc = VerifyCommand(prefix='m', test_command='t')
 
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            vc.prefix = 'other'  # type: ignore[misc]
+        pytest.raises(dataclasses.FrozenInstanceError, setattr, vc, 'prefix', 'other')
 
     def test_dict_round_trip(self):
         vc = VerifyCommand(prefix='m', test_command='t', lint_command='l', type_check_command='y')
@@ -207,6 +206,6 @@ class TestRequireExactKeys:
 
     def test_non_dict_document_is_a_type_error(self):
         with pytest.raises(TypeError) as excinfo:
-            require_exact_keys([1, 2], frozenset({'a'}), 'Thing')  # type: ignore[arg-type]
+            require_exact_keys([1, 2], frozenset({'a'}), 'Thing')
 
         assert 'Thing' in str(excinfo.value)
