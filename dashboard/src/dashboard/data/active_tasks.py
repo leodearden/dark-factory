@@ -4,7 +4,10 @@ Joins three sources — the per-root task snapshot unit
 (``dashboard.data.task_snapshot``, which owns every read of the task tree),
 per-task runtime state (via the orchestrator's escalation MCP,
 ``get_task_runtime_state``), and optional burst state from reconciliation —
-into the ``ACTIVE_TASKS`` shape consumed by the React dashboard's tasks tab.
+into the per-root task rows that ``/api/v2/dashboard/tasks`` serves as
+``TASKS_SNAPSHOT[p].rows`` and that
+``dashboard/src/dashboard/data/scheduler.py::collect_scheduler_state`` joins
+against.
 
 THIS MODULE READS NOTHING ITSELF beyond the runtime fan-out and the batched
 external-status tail. A root's task state arrives as a ``TaskSnapshot``,
@@ -13,9 +16,11 @@ half, whether that measurement succeeded and why not. What lives here is the
 WALK — the budget, the admission width, the rotation, the canonical
 re-assembly — and the SHAPING of one root's rows out of one unit.
 
-Output shape (per task) matches ``data.js`` mock fixtures. A task's
-description/details are NOT on it: the Task Detail pane fetches them for the
-selected task from ``dashboard/src/dashboard/api/task_prose.py::api_task_prose``.
+Output shape (per row); the ``TASKS_SNAPSHOT`` seed comment in
+``dashboard/src/dashboard/static/redux/data.js`` documents the same shape for
+the client. A task's description/details are NOT on it: the Task Detail pane
+fetches them for the selected task from
+``dashboard/src/dashboard/api/task_prose.py::api_task_prose``.
 
     {
         'id': 'dark_factory/T-19',
