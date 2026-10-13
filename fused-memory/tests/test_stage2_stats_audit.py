@@ -469,7 +469,13 @@ class TestActionRecordKeys:
 # ── hints_update_claims / hints_claim_confirmed (task 4018) ─────────────────
 
 
-def _hints_record(task_id='7', project_id='dark_factory', entities=None, queries=None, **extra):
+def _hints_record(
+    task_id: object = '7',
+    project_id: object = 'dark_factory',
+    entities=None,
+    queries=None,
+    **extra,
+):
     record = {
         'action': 'task_hints_updated',
         'task_id': task_id,
@@ -1287,12 +1293,11 @@ class TestPostFlightJournalGrounding:
 
     @staticmethod
     def _unavailable_stage(which: str) -> TaskKnowledgeSync:
-        stage = _make_stage(
+        deps = _mock_deps(
             known_projects=_KNOWN_PROJECTS,
             taskmaster=_StubTaskmaster(results={('3045', '/repo/df'): _task_record('3045')}),
         )
-        journal = stage.journal
-        assert journal is not None
+        journal = deps['journal']
         if which == 'no-write-journal':
             journal.write_journal = None
         elif which == 'read-raises':
@@ -1301,7 +1306,7 @@ class TestPostFlightJournalGrounding:
             )
         else:
             journal.write_journal.get_ops_by_causation = AsyncMock(return_value=MagicMock())
-        return stage
+        return TaskKnowledgeSync(StageId.task_knowledge_sync, **deps)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('which', ['no-write-journal', 'read-raises', 'non-list'])
