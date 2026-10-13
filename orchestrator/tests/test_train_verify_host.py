@@ -12,7 +12,7 @@ import dataclasses
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, ClassVar
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
@@ -27,6 +27,7 @@ from _merge_lane_fakes import (
     running_lane,
 )
 from _orch_helpers import wait_responsive
+from _recording_event_store import _RecordingEventStore
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
@@ -411,3 +412,35 @@ async def test_a_remote_green_the_local_cross_check_contradicts_benches_the_remo
     (laptop,) = [host for host in lane.snapshot()['hosts'] if host['name'] == 'laptop']
     assert (laptop['quarantined'], laptop['quarantine_class']) == (True, 'divergence')
     assert halted is True
+
+
+async def test_an_unreachable_remote_moves_the_train_verify_to_local(
+    remote_scene: _Scene,
+) -> None:
+    """A transport fault on the remote is never a derail: the remote is benched
+    for reprobe and the same verify re-runs on local."""
+    train = await _stacked_train(remote_scene, 2, train_id='coalesce-6160')
+    remote = _FakeRemote(unreachable=True)
+    verifier = FakeVerifier()
+    store = _RecordingEventStore()
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    lane = make_lane(
+        remote_scene.git_ops, queue,
+        verifier=verifier, clock=healthy_verify_clock(), remote_runners=[remote],
+        event_store=store,
+    )
+
+    outcome = await merge_through_lane(lane, queue, train.request)
+
+    assert outcome.status == 'done', outcome
+    assert len(remote.calls) == 1
+    assert verifier.verified == [train.tip]
+    assert train.mark_member_done.await_args_list == [
+        call(member, outcome.merge_sha) for member in train.request.member_task_ids
+    ]
+    train.redrive_member.assert_not_awaited()
+    assert [name for name, _ in store.events if name == 'train_derailed'] == []
+    (laptop,) = [host for host in lane.snapshot()['hosts'] if host['name'] == 'laptop']
+    assert (laptop['quarantined'], laptop['quarantine_class'], laptop['slot_state']) == (
+        True, 'ru', 'free',
+    )
