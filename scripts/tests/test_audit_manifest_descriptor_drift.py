@@ -73,7 +73,7 @@ from audit_manifest_descriptor_drift import (
     load_task_store_scan,
 )
 from git_checkout_root import checkout_root_or_skip
-from shared.capability_manifest import load_capability_manifest
+from shared.capability_manifest import DeliveredCheck, load_capability_manifest
 from shared.delivered_check_polarity import CheckOutcome, interpret_grep_rc
 from shared.task_statuses import TERMINAL, TaskStatus
 
@@ -2690,6 +2690,16 @@ _MEASURED_DRIFT_ROWS = (
     ),
 )
 
+#: The rows whose resynced pattern is an IDENTIFIER ANCHOR: a class/def name
+#: certifying that a test suite exists. (task_id, capability) -> the suite file
+#: every hit must stay inside.
+_CERTIFIED_SUITE_BY_ANCHORED_ROW = {
+    (2906, "enforcement-matrix-suite-exists"):
+        "orchestrator/tests/test_sandbox_enforcement_matrix.py",
+    (3536, "no-steward-less-escalated-exit-at-merge-entry"):
+        "orchestrator/tests/test_workflow_merge_gating_strand.py",
+}
+
 
 def _rows_as_project(tmp_path, make_tasks_db, *, sidecar_index):
     """Rebuild all 8 measured rows as ONE synthetic project.
@@ -2803,6 +2813,35 @@ def test_the_measured_rows_carry_the_two_differing_field_sets(
 # it reads only TRACKED files in this checkout. That is what makes it a
 # legitimate live assertion where a tasks.db one would not be.
 # ---------------------------------------------------------------------------
+
+def _live_delivered_check(root: str, relpath: str, label: str,
+                          capability: str) -> DeliveredCheck:
+    """The delivered_check of the one *capability* under *label* in a TRACKED sidecar."""
+    # NON-VACUITY FLOOR: assert the sidecar is TRACKED before reading it, so a
+    # renamed or deleted manifest cannot make a caller pass by finding nothing
+    # to check.
+    tracked = subprocess.run(
+        ["git", "-C", root, "ls-files", "--", relpath],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert tracked.stdout.strip(), f"{relpath} is not tracked in {root}"
+
+    doc = load_capability_manifest(Path(root) / relpath)
+    matches = [
+        cap for task in doc.tasks if task.label == label
+        for cap in task.capabilities if cap.name == capability
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one {capability!r} under label {label!r} "
+        f"in {relpath}, found {len(matches)}"
+    )
+
+    check = matches[0].delivered_check
+    assert check is not None, (
+        f"{relpath} label {label} capability {capability} carries no delivered_check"
+    )
+    return check
+
 
 @pytest.mark.parametrize(
     "relpath,task_id,label,capability,resynced",
@@ -3029,6 +3068,51 @@ def test_anchor_reading_tells_a_definition_from_prose_a_leak_and_a_miss(
 
     assert (reading.outcome, reading.paths_hit, reading.defines_in_suite) == (
         outcome, paths_hit, defines_in_suite), reading.stderr
+
+
+@pytest.mark.parametrize(
+    "key,suite",
+    list(_CERTIFIED_SUITE_BY_ANCHORED_ROW.items()),
+    ids=[f"{task_id}-{capability}"
+         for task_id, capability in _CERTIFIED_SUITE_BY_ANCHORED_ROW],
+)
+def test_identifier_anchor_names_a_definition_inside_its_certified_suite(key, suite):
+    """A suite-exists row's live anchor matches on main, only inside its suite,
+    and there names a class/def rather than prose the suite merely contains."""
+    root = checkout_root_or_skip()
+
+    rows = [r for r in _MEASURED_DRIFT_ROWS if (r[1], r[3]) == key]
+    assert len(rows) == 1, (
+        f"_CERTIFIED_SUITE_BY_ANCHORED_ROW key {key!r} resolves to {len(rows)} "
+        f"_MEASURED_DRIFT_ROWS rows, expected exactly one"
+    )
+    relpath, task_id, label, capability, _stale, resynced = rows[0]
+    assert resynced["expect"] == "present", (
+        f"{key!r} is expect={resynced['expect']!r}; only a present-polarity row "
+        f"can be an identifier anchor"
+    )
+
+    check = _live_delivered_check(root, relpath, label, capability)
+    assert check.pattern is not None, (
+        f"expected a grep check with a pattern, got kind={check.kind!r}"
+    )
+    reading = _read_identifier_anchor(
+        root, pattern=check.pattern, paths=check.paths, expect=check.expect,
+        suite=suite)
+
+    where = (f"{relpath} label {label} (task {task_id}) anchor "
+             f"{check.pattern!r} under {check.paths!r}")
+    assert reading.outcome is CheckOutcome.PASS, (
+        f"{where}: verdict {reading.outcome.value} (stderr: {reading.stderr!r}) — "
+        f"_run_grep_check would not report DELIVERED"
+    )
+    assert reading.paths_hit == {suite}, (
+        f"{where}: leaked outside the certified suite {suite}: "
+        f"{sorted(reading.paths_hit)}"
+    )
+    assert reading.defines_in_suite, (
+        f"{where}: no hit inside {suite} is a 'class '/'def ' line"
+    )
 
 
 def test_alpha4_anchor_is_an_identifier_inside_the_certified_suite():
