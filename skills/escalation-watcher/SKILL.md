@@ -333,7 +333,9 @@ always-ask list ("Bypasses" in "Always ask — keyed on record content").
    (see "Filing Parked Decisions to the Cockpit Registry" below) — once per cycle
 7. GET `/api/v2/dashboard/invariants` and digest this project's record (see "Reading the
    invariants gauge" below) — once per cycle. A blind root or a nonzero unledgered terminal
-   tier is a finding: handle it in step 3 of the next pass, beside the drained escalations
+   tier is a finding; so is a chain in state `overdue` or `broken` (a `paused` chain is inspected
+   via its own pinning escalation, not this rule): handle it in step 3 of the next pass, beside
+   the drained escalations
 8. Go to 1 (restart watcher → confirm up → drain → handle)
 ```
 
@@ -510,8 +512,8 @@ to act on — ideally inside the handling sub-agent rather than at top level.
 
 ### Reading the invariants gauge
 
-The command, what counts as a finding, change-only triage, the census follow-up, the D-4 pointer
-and the filing keys live in
+The command, what counts as a finding (the chain rule included), change-only triage, the census
+follow-up, the broken-chain journal probe, the D-4 pointer and the filing keys live in
 [`skills/_shared/reading-the-invariants-gauge.md`](../_shared/reading-the-invariants-gauge.md).
 Read them there. This skill's deltas:
 

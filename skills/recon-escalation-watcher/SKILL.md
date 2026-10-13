@@ -260,7 +260,9 @@ show freshness, because the heartbeat is the file's mtime.
    (see "Filing Parked Decisions to the Cockpit Registry" below) — once per cycle
 8. GET `/api/v2/dashboard/invariants` and digest every root's record (see "Reading the
    invariants gauge" below) — once per cycle. A blind root or a nonzero unledgered terminal
-   tier is a finding: triage it with The Action Set's judgement before re-arming (9)
+   tier is a finding; so is a chain in state `overdue` or `broken` (a `paused` chain is inspected
+   via its own pinning escalation, not this rule): triage it with The Action Set's judgement
+   before re-arming (9)
 9. Go to 2
 ```
 
@@ -492,8 +494,9 @@ started, so this rule covers it too.
 
 ### Reading the invariants gauge
 
-The command, what counts as a finding, change-only triage, the census follow-up,
-the D-4 pointer and the filing keys live in
+The command, what counts as a finding (the chain rule included), change-only
+triage, the census follow-up, the broken-chain journal probe, the D-4 pointer and
+the filing keys live in
 [`skills/_shared/reading-the-invariants-gauge.md`](../_shared/reading-the-invariants-gauge.md).
 Read them there. This skill's deltas:
 
@@ -508,7 +511,9 @@ Read them there. This skill's deltas:
   file's Case B keys in place of an escalation id. Tell the human about a finding
   that needs one, and file no cockpit DecisionRecord: `reap-decisions` closes a
   decision only once its escalation is terminal, so one with no escalation behind
-  it would stay open forever ("Closing parked decisions on resolve").
+  it would stay open forever ("Closing parked decisions on resolve"). A `paused`
+  chain's pinning escalation is an orchestrator-queue L2 that the
+  escalation-watcher handles, not this queue's.
 - **A failed read** is reported to the human (Priority Hierarchy 1).
 
 ## The Action Set
