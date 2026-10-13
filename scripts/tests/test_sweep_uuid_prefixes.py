@@ -9,12 +9,17 @@ the MCP task client are injected fakes.
 """
 import asyncio
 import copy
+import itertools
+import json
+import os
+from pathlib import Path
 
 import pytest
 
 # `import sweep_uuid_prefixes` resolves because scripts/tests/conftest.py puts
 # scripts/ on sys.path; the script's own bootstrap then binds `shared` to this
 # checkout.
+import sweep_toolcall_markup as markup_sweep
 import sweep_uuid_prefixes as sweep
 from shared.uuid_prefix import PrefixToken
 from shared.uuid_prefix_guard import Candidate, Resolution, ResolverUnavailable
@@ -292,3 +297,303 @@ class TestResolveDistinct:
         assert resolver.calls == []
         assert result == memo
         assert result is not memo
+
+
+# ---------------------------------------------------------------------------
+# Fixture builders shared by the lane and CLI tests.
+# ---------------------------------------------------------------------------
+
+PROJECT = 'proj_a'
+ESC_DIR = ('data', 'escalations')
+ESC_1_REL = 'data/escalations/archive/2026-09-01/esc-1-1.json'
+ESC_1_KEY = f'esc-1-1 ({ESC_1_REL})'
+ESC_2_KEY = 'esc-2-1 (data/escalations/esc-2-1.json)'
+
+
+def escalation(esc_id: str, status: str, detail: str, **extra) -> dict:
+    record = {
+        'id': esc_id,
+        'task_id': esc_id.split('-')[1],
+        'agent_role': 'implementer',
+        'severity': 'blocking',
+        'category': 'infra_issue',
+        'summary': 'a one-line summary',
+        'detail': detail,
+        'evidence': [],
+        'status': status,
+        'resolution': '',
+        'created_at': '2026-08-08T00:00:00+00:00',
+    }
+    record.update(extra)
+    return record
+
+
+def write_escalation(path: Path, obj: dict, *, indent: int = 2) -> Path:
+    """Write *obj* the way ``Escalation.to_json`` does: indent=2, NO trailing newline."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, indent=indent), encoding='utf-8')
+    return path
+
+
+def build_escalations(root: Path) -> dict[str, Path]:
+    base = root.joinpath(*ESC_DIR)
+    return {
+        'esc-1-1': write_escalation(
+            base / 'archive' / '2026-09-01' / 'esc-1-1.json',
+            escalation(
+                'esc-1-1',
+                'resolved',
+                f'the memory {UNIQUE} was cited\nand nothing else',
+                evidence=[{'observation': f'recall returned {UNIQUE}', 'ref': 'run one'}],
+            ),
+        ),
+        'esc-2-1': write_escalation(
+            base / 'esc-2-1.json', escalation('esc-2-1', 'dismissed', f'which one is {AMBIG}')
+        ),
+        'esc-3-1': write_escalation(
+            base / 'esc-3-1.json',
+            escalation('esc-3-1', 'resolved', f'{NONE_TOKENS[0]} on {NONE_TOKENS[1]}'),
+        ),
+        'esc-4-1': write_escalation(
+            base / 'esc-4-1.json', escalation('esc-4-1', 'pending', f'still open: {UNIQUE}')
+        ),
+        'esc-5-1': write_escalation(
+            base / 'esc-5-1.json',
+            escalation('esc-5-1', 'resolved', f'hand-edited {UNIQUE}'),
+            indent=4,
+        ),
+    }
+
+
+def bytes_under(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob('*'))
+        if path.is_file()
+    }
+
+
+def run(root, *, apply, lanes=('escalations',), resolver=None, mem0=None, open_task_client=None):
+    return asyncio.run(
+        sweep.run_sweep(
+            sweep.SweepScope(project_id=PROJECT, project_root=root),
+            lanes=lanes,
+            apply=apply,
+            resolve=resolver if resolver is not None else FakeResolver(),
+            mem0=mem0,
+            open_task_client=open_task_client,
+            rate=1000.0,
+        )
+    )
+
+
+@pytest.fixture
+def esc_root(tmp_path):
+    root = tmp_path / PROJECT
+    build_escalations(root)
+    return root
+
+
+# ---------------------------------------------------------------------------
+# The run loop over the escalations lane.
+# ---------------------------------------------------------------------------
+
+
+class TestEscalationsLane:
+    def test_a_dry_run_reports_and_diffs_but_writes_nothing(self, esc_root):
+        before = bytes_under(esc_root)
+
+        reports, diffs = run(esc_root, apply=False)
+
+        assert bytes_under(esc_root) == before
+        (report,) = reports
+        assert report.lane == 'escalations'
+        assert report.project_id == PROJECT
+        assert (report.scanned, report.expandable, report.expanded, report.remaining) == (3, 2, 0, 2)
+        assert report.untouched == 2
+        assert [(site.record, site.token, site.candidates) for site in report.ambiguous] == [
+            (ESC_2_KEY, AMBIG, (AMBIG_A, AMBIG_B))
+        ]
+        assert dict(report.refused) == {
+            markup_sweep.REASON_NON_TERMINAL: 1,
+            markup_sweep.REASON_FORMAT_NOT_REPRODUCIBLE: 1,
+        }
+        assert len(diffs) == 2
+        assert all(diff.startswith(f'--- escalations {ESC_1_KEY} ') for diff in diffs)
+        added = [
+            line
+            for diff in diffs
+            for line in diff.splitlines()
+            if line.startswith('+') and not line.startswith('+++')
+        ]
+        assert added == [f'+the memory {FULL} was cited', f'+recall returned {FULL}']
+
+    def test_apply_expands_exactly_the_diffed_occurrences(self, esc_root):
+        raw = (esc_root / ESC_1_REL).read_text(encoding='utf-8')
+        before = bytes_under(esc_root)
+
+        reports, diffs = run(esc_root, apply=True)
+
+        after = bytes_under(esc_root)
+        assert set(after) == set(before)
+        assert {rel for rel in before if before[rel] != after[rel]} == {ESC_1_REL}
+        new_text = (esc_root / ESC_1_REL).read_text(encoding='utf-8')
+        assert new_text == raw.replace(UNIQUE, FULL)
+        assert json.loads(new_text)['evidence'][0]['observation'] == f'recall returned {FULL}'
+        (report,) = reports
+        assert (report.expandable, report.expanded, report.remaining) == (2, 2, 0)
+        assert report.failures == ()
+        assert diffs == ()
+
+    def test_a_second_apply_finds_nothing_and_exits_clean(self, esc_root):
+        run(esc_root, apply=True)
+
+        reports, _ = run(esc_root, apply=True)
+
+        (report,) = reports
+        assert (report.expandable, report.remaining) == (0, 0)
+        assert len(report.ambiguous) == 1
+        assert sweep.exit_code(reports) == markup_sweep.EXIT_CLEAN
+
+    def test_an_interrupted_swap_leaves_the_target_whole_and_a_rerun_converges(
+        self, esc_root, monkeypatch
+    ):
+        target = esc_root / ESC_1_REL
+        raw = target.read_bytes()
+
+        def interrupted(src, dst):
+            raise KeyboardInterrupt
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, 'replace', interrupted)
+            with pytest.raises(KeyboardInterrupt):
+                run(esc_root, apply=True)
+
+        assert target.read_bytes() == raw
+        json.loads(raw)
+        assert list(esc_root.rglob('.sweep.*.tmp')) == []
+
+        (report,), _ = run(esc_root, apply=True)
+        assert report.expanded == 2
+        reports, _ = run(esc_root, apply=True)
+        assert reports[0].remaining == 0
+        assert sweep.exit_code(reports) == markup_sweep.EXIT_CLEAN
+
+    def test_a_dry_run_with_work_left_exits_repairable_remains(self, esc_root):
+        reports, _ = run(esc_root, apply=False)
+
+        assert sweep.exit_code(reports) == markup_sweep.EXIT_REPAIRABLE_REMAINS
+
+    def test_a_failed_swap_is_a_write_failure(self, esc_root, monkeypatch):
+        def refused(src, dst):
+            raise OSError(28, 'No space left on device')
+
+        monkeypatch.setattr(os, 'replace', refused)
+
+        reports, _ = run(esc_root, apply=True)
+
+        (report,) = reports
+        assert [(f.key, f.reason) for f in report.failures] == [
+            (ESC_1_KEY, markup_sweep.REASON_WRITE_FAILED)
+        ]
+        assert 'No space left on device' in report.failures[0].error
+        assert report.expanded == 0
+        assert sweep.exit_code(reports) == markup_sweep.EXIT_WRITE_FAILED
+
+    def test_an_unreachable_store_aborts_the_lane_before_any_write(self, esc_root):
+        before = bytes_under(esc_root)
+
+        reports, _ = run(
+            esc_root, apply=True, resolver=FakeResolver(unavailable={UNIQUE: 'graphiti'})
+        )
+
+        assert bytes_under(esc_root) == before
+        (report,) = reports
+        assert report.aborted == 'graphiti'
+        assert report.expanded == 0
+        assert sweep.exit_code(reports) == sweep.EXIT_STORE_UNAVAILABLE
+
+
+def lane_report(*, expandable=0, expanded=0, ambiguous=(), failures=(), aborted=None):
+    return sweep.LaneReport(
+        lane='escalations',
+        project_id=PROJECT,
+        scanned=1,
+        expandable=expandable,
+        expanded=expanded,
+        untouched=0,
+        ambiguous=ambiguous,
+        unwritable=(),
+        refused={},
+        failures=failures,
+        aborted=aborted,
+    )
+
+
+class TestExitCode:
+    def test_precedence_is_aborted_then_failures_then_remaining(self):
+        failure = sweep.WriteFailureRecord(key='k', reason='write-failed', error='e')
+        remaining = lane_report(expandable=3, expanded=1)
+        failed = lane_report(failures=(failure,))
+        aborted = lane_report(aborted='mem0')
+
+        assert sweep.exit_code((remaining, failed, aborted)) == sweep.EXIT_STORE_UNAVAILABLE
+        assert sweep.exit_code((remaining, failed)) == markup_sweep.EXIT_WRITE_FAILED
+        assert sweep.exit_code((remaining,)) == markup_sweep.EXIT_REPAIRABLE_REMAINS
+        site = sweep.AmbiguousRecordSite(
+            record='k', path=('detail',), token=AMBIG, candidates=(AMBIG_A, AMBIG_B)
+        )
+        assert sweep.exit_code((lane_report(ambiguous=(site,)),)) == markup_sweep.EXIT_CLEAN
+
+
+# ---------------------------------------------------------------------------
+# WritePacer.
+# ---------------------------------------------------------------------------
+
+
+class FakeTime:
+    """A clock plus a sleep; *advance* makes a sleep move the clock."""
+
+    def __init__(self, *, advance: bool):
+        self.now = 100.0
+        self.advance = advance
+        self.sleeps: list[float] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        if self.advance:
+            self.now += seconds
+
+
+class TestWritePacer:
+    def test_a_frozen_clock_sleeps_a_full_interval_between_writes(self):
+        fake = FakeTime(advance=False)
+        pacer = sweep.WritePacer(5.0, clock=fake.clock, sleep=fake.sleep)
+
+        async def three():
+            for _ in range(3):
+                await pacer.wait()
+
+        asyncio.run(three())
+
+        assert fake.sleeps == [0.0, pytest.approx(0.2), pytest.approx(0.2)]
+
+    def test_releases_are_spaced_by_at_least_the_interval(self):
+        fake = FakeTime(advance=True)
+        pacer = sweep.WritePacer(5.0, clock=fake.clock, sleep=fake.sleep)
+        releases: list[float] = []
+
+        async def paced():
+            for gap in (0.0, 0.05, 0.5, 0.0):
+                fake.now += gap
+                await pacer.wait()
+                releases.append(fake.now)
+
+        asyncio.run(paced())
+
+        spacings = [later - earlier for earlier, later in itertools.pairwise(releases)]
+        assert all(spacing >= 0.2 - 1e-9 for spacing in spacings)
+        assert fake.sleeps[2] == 0.0
