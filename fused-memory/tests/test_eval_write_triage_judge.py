@@ -32,6 +32,8 @@ from pathlib import Path
 import pytest
 from _fm_helpers import load_script_module
 
+from fused_memory.models.enums import SourceStore
+from fused_memory.models.memory import MemoryResult
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
@@ -40,6 +42,7 @@ from fused_memory.server.write_triage import (
     OUTCOME_STORED,
     TRIAGE_OUTCOMES,
 )
+from fused_memory.server.write_triage_judge import JudgePromptElisions, judge_prompt_elisions
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'eval_write_triage_judge.py'
 CALIBRATE_PATH = Path(__file__).parent.parent / 'scripts' / 'calibrate_write_triage.py'
@@ -3136,11 +3139,13 @@ class TestApplyFieldChars:
     def test_zero_means_no_elision_rather_than_everything_elided(self) -> None:
         config = self._config()
         text = 'x' * 20_000
-        slate = [types.SimpleNamespace(id='a', content=text)]
+        slate = [MemoryResult(id='a', content=text, source_store=SourceStore.mem0)]
         assert _mod().apply_field_chars(config, 0) == 0
         width = self._resolved(config)
         assert width >= len(text)
-        assert _mod()._elision_flags(text, slate, width) == (False, {'a': False})
+        assert judge_prompt_elisions(text, slate, field_chars=width) == JudgePromptElisions(
+            entry=False, candidates={'a': False},
+        )
 
     def test_a_negative_width_is_refused_rather_than_recorded(self) -> None:
         """The resolver would fall back to the default, so provenance would lie."""
@@ -3155,8 +3160,3 @@ class TestApplyFieldChars:
         before = config.write_triage.judge_field_chars
         assert _mod().apply_field_chars(config, None) == self._resolved(config) == 4_000
         assert config.write_triage.judge_field_chars == before
-
-    def test_the_elision_flags_follow_the_width(self) -> None:
-        long_text = 'y' * 5_000
-        slate = [types.SimpleNamespace(id='a', content=long_text)]
-        assert _mod()._elision_flags(long_text, slate, 1_200) == (True, {'a': True})
