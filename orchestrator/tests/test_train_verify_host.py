@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock
@@ -18,17 +19,21 @@ from _git_fixtures import RepoSeed, seed_repo
 from _merge_lane_fakes import (
     FakeVerifier,
     fails,
+    hangs_until,
     healthy_verify_clock,
     lane_scene_config,
     make_lane,
     merge_through_lane,
+    running_lane,
 )
+from _orch_helpers import wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import (
     TRAIN_VERIFY_FAILED_REASON_PREFIX,
     GroupMergeRequest,
+    MergeLane,
     MergeRequest,
     QueuedBranch,
 )
@@ -181,6 +186,17 @@ class _FakeRemote:
         )
 
 
+def _slot_states(lane: MergeLane) -> dict[str, str]:
+    """Each verify host's slot state, as the lane's public census reports it."""
+    return {host['name']: host['slot_state'] for host in lane.snapshot()['hosts']}
+
+
+def _in_flight(lane: MergeLane, task_id: str) -> list[dict[str, Any]]:
+    """The restart drain's in-flight verify records for *task_id*."""
+    records = lane.snapshot()['restart_drain']['verifies_in_flight']
+    return [record for record in records if record['task_id'] == task_id]
+
+
 # ─── The train verify obeys the lane's injected verifier ────────────────────
 
 
@@ -237,3 +253,123 @@ async def test_a_lane_given_remote_runners_verifies_a_single_on_a_free_remote_un
     assert outcome.status == 'done', outcome
     assert len(remote.calls) == 1
     assert verifier.verified == []
+
+
+# ─── A train verifies on a host it leases from the lane ─────────────────────
+
+
+async def test_a_train_verify_holds_the_local_host_slot_until_it_lands(scene: _Scene) -> None:
+    train = await _stacked_train(scene, 2)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    verifier = FakeVerifier(scripts={train.tip: hangs_until(release, entered=entered)})
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    lane = make_lane(scene.git_ops, queue, verifier=verifier, clock=healthy_verify_clock())
+
+    async with running_lane(lane) as run:
+        await queue.put(train.request)
+        await wait_responsive(entered.wait(), label='train verify under way')
+        while_verifying = _slot_states(lane).get('local')
+        release.set()
+        outcome = await run.outcome(train.request)
+        after_landing = _slot_states(lane).get('local')
+
+    assert while_verifying == 'busy'
+    assert outcome.status == 'done', outcome
+    assert after_landing == 'free'
+
+
+async def test_a_two_member_train_verifies_on_a_free_remote_under_prefer_remote(
+    remote_scene: _Scene,
+) -> None:
+    train = await _stacked_train(remote_scene, 2)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    remote = _FakeRemote(release=release, entered=entered)
+    verifier = FakeVerifier()
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    lane = make_lane(
+        remote_scene.git_ops, queue,
+        verifier=verifier, clock=healthy_verify_clock(), remote_runners=[remote],
+    )
+
+    async with running_lane(lane) as run:
+        await queue.put(train.request)
+        await wait_responsive(entered.wait(), label='train verify under way on the remote')
+        while_verifying = _slot_states(lane).get('laptop')
+        records = _in_flight(lane, train.tip)
+        release.set()
+        outcome = await run.outcome(train.request)
+        after_landing = _slot_states(lane).get('laptop')
+
+    assert while_verifying == 'busy'
+    assert [(r['host'], r['kind']) for r in records] == [('laptop', 'train')]
+    assert outcome.status == 'done', outcome
+    assert after_landing == 'free'
+    assert len(remote.calls) == 1
+    assert verifier.verified == []
+
+
+async def test_a_train_of_more_than_two_members_verifies_on_local_until_task_6106(
+    remote_scene: _Scene,
+) -> None:
+    """Pins the member cap: until task 6106 lands, a remote MemoryMax kill
+    reads as a red verdict, so a train of three stays off a free remote."""
+    train = await _stacked_train(remote_scene, 3)
+    remote = _FakeRemote()
+    verifier = FakeVerifier()
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    lane = make_lane(
+        remote_scene.git_ops, queue,
+        verifier=verifier, clock=healthy_verify_clock(), remote_runners=[remote],
+    )
+
+    outcome = await merge_through_lane(lane, queue, train.request)
+
+    assert outcome.status == 'done', outcome
+    assert remote.calls == []
+    assert verifier.verified == [train.tip]
+
+
+async def _until(predicate: Callable[[], bool]) -> None:
+    while not predicate():
+        await asyncio.sleep(0)
+
+
+async def test_a_train_whose_hosts_are_all_taken_verifies_unleased_instead_of_waiting(
+    scene: _Scene,
+) -> None:
+    """A predecessor's held verify keeps the one host. On the fake clock the
+    train's park behind that predecessor runs out at once, and the train
+    must then verify unleased on local rather than wait for the slot.
+
+    The train lands, flipping its members, while the predecessor is still
+    held; its outcome resolves only after the predecessor's, because the
+    lane resolves outcomes in merge order.
+    """
+    pred = await _single(scene, 'pred')
+    train = await _stacked_train(scene, 2)
+    release_pred = asyncio.Event()
+    verifier = FakeVerifier(scripts={'pred': hangs_until(release_pred)})
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    lane = make_lane(scene.git_ops, queue, verifier=verifier, clock=healthy_verify_clock())
+
+    async with running_lane(lane) as run:
+        await queue.put(pred)
+        await wait_responsive(verifier.await_entry(1), label='predecessor verify under way')
+        await queue.put(train.request)
+        await wait_responsive(
+            _until(lambda: train.mark_member_done.await_count == 2),
+            label='train landed while its predecessor holds the host',
+        )
+        pred_held = not pred.result.done()
+        local_while_held = _slot_states(lane).get('local')
+        release_pred.set()
+        pred_outcome = await run.outcome(pred)
+        train_outcome = await run.outcome(train.request)
+
+    assert pred_held
+    assert local_while_held == 'busy'
+    assert verifier.verified == ['pred', train.tip]
+    assert pred_outcome.status == 'done', pred_outcome
+    assert train_outcome.status == 'done', train_outcome
