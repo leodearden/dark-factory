@@ -327,9 +327,8 @@ cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh \
 
 **Lease heartbeat (each cycle):** each time you (re)start this watcher subprocess, also touch the
 `recon-watcher-<project>` lease claimed at session startup, so a second session's `lease-claim`
-observes this one as alive and stands down. No other process heartbeats this lease — not even a
-running `recon-watch/loop.sh` (see "Claiming the Recon Watcher Lease" above) — so this call is its
-only keep-alive:
+observes this one as alive and stands down. No other process heartbeats this lease, so this call is
+its only keep-alive:
 
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-heartbeat \
@@ -467,8 +466,7 @@ default path `<queue-dir>/.watcher-rearm-exclude-l2` there,
 `--baseline` — is what is actually consistent across both watcher skills.
 
 **Process safety:** only stop watcher processes you started via background task
-controls. Never `pkill` by pattern. A `recon-watch/loop.sh` tree is not one you
-started, so this rule covers it too.
+controls. Never `pkill` by pattern.
 
 ### Reading the invariants gauge
 
