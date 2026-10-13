@@ -867,6 +867,20 @@ def _process_comm(pid: int) -> str | None:
         return None
 
 
+@dataclass(frozen=True)
+class ProcessTree:
+    """The process tree one hook event's ownership probes read.
+
+    ``ProcessTree()`` reads the live tree: this process's parent, then
+    ``/proc``. The hook entry points accept one as ``process_tree=``, so a
+    caller names the tree to be judged rather than patching these readers.
+    """
+
+    hook_parent_pid: Callable[[], int] = os.getppid
+    parent_pid_of: Callable[[int], int | None] = _parent_pid_of
+    comm_of: Callable[[int], str | None] = _process_comm
+
+
 def _owning_claude_pid() -> int | None:
     """The pid of the ``claude`` process that fired THIS hook event, or None.
 
