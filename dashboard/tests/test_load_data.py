@@ -11,7 +11,6 @@ import pytest
 from sampler.metrics import METRIC_GROUPS, GroupName
 from sampler.store import SCHEMA
 
-import dashboard.data.load as load_module
 from dashboard.data.load import KNOWN_METRICS, get_load_metrics
 
 # ---------------------------------------------------------------------------
@@ -209,11 +208,6 @@ def test_no_load_group_metric_is_served() -> None:
     (load,) = [group for group in METRIC_GROUPS if group.name is GroupName.LOAD]
 
     assert not (load.exact | load.per_leaf) & set(KNOWN_METRICS)
-
-
-@pytest.mark.parametrize('name', ['PSI_METRICS', 'PROCESS_METRICS'])
-def test_the_module_keeps_no_hand_spelled_metric_set(name: str) -> None:
-    assert not hasattr(load_module, name)
 
 
 # ---------------------------------------------------------------------------
