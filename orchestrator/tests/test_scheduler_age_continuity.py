@@ -13,12 +13,16 @@ it shares the guards directory and starts with empty memory.
 
 from __future__ import annotations
 
+from datetime import timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+import shared.safe_io as _safe_io
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.event_store import EventStore
+from orchestrator.event_store import EventStore, EventType
+from orchestrator.guard_state import PersistentMap, guard_path
 from orchestrator.scheduler import Scheduler
 
 pytestmark = pytest.mark.asyncio
@@ -72,3 +76,75 @@ class TestAccruedWaitIsKept:
         tasks = [_task('10'), _task('4995'), _task('5000', 'in-progress')]
 
         assert await _tick(scheduler, tasks) == '10'
+
+
+def _guard(name: str) -> Path:
+    path = guard_path(OrchestratorConfig().project_root, name)
+    assert path is not None
+    return path
+
+
+async def _resurrect_100(event_store: EventStore | None = None) -> None:
+    """'100' leaves the active fetch, then returns and is reset at max_id 1000."""
+    scheduler = _scheduler(event_store)
+    await _tick(scheduler, [_task('100'), _task('1000', 'in-progress')])
+    await _tick(scheduler, [_task('1000', 'in-progress')])
+    await _tick(scheduler, [_task('100'), _task('1000', 'in-progress')])
+
+
+_AFTER_RESURRECTION = [_task('100'), _task('1040'), _task('1050', 'in-progress')]
+
+
+class TestAResetIsAppliedOnce:
+    async def test_every_later_start_restores_the_reset_instead_of_re_zeroing(self):
+        """Age 50 since the reset beats '1040''s 10, at each of two restarts."""
+        await _resurrect_100()
+
+        assert await _tick(_scheduler(), _AFTER_RESURRECTION) == '100'
+        assert await _tick(_scheduler(), _AFTER_RESURRECTION) == '100'
+
+    async def test_a_restart_does_not_undo_the_reset(self):
+        """The resurrected task does not regain its own-id age (task 5352):
+        '900''s 150 beats the 50 accrued since the reset."""
+        await _resurrect_100()
+
+        tasks = [_task('100'), _task('900'), _task('1050', 'in-progress')]
+
+        assert await _tick(_scheduler(), tasks) == '900'
+
+    async def test_only_the_applied_reset_is_journaled(self, tmp_path: Path):
+        """INV-11: one row for the reset, none for the restores."""
+        store = EventStore(tmp_path / 'events.db', 'run-6659')
+        await _resurrect_100(store)
+        await _tick(_scheduler(store), _AFTER_RESURRECTION)
+        await _tick(_scheduler(store), _AFTER_RESURRECTION)
+
+        rows = store.fetch_events_by_type(EventType.age_anchor_reset)
+
+        assert [(r['task_id'], r['data']) for r in rows] == [('100', {'anchor': 1000})]
+
+    async def test_a_mass_return_writes_each_age_guard_once(self, monkeypatch):
+        returning = [_task(str(tid)) for tid in range(2000, 2050)]
+        holder = _task('3000', 'in-progress')
+        scheduler = _scheduler()
+        await _tick(scheduler, [*returning, holder])
+        await _tick(scheduler, [holder])
+
+        writes: list[Path] = []
+        real = _safe_io.atomic_write_text
+
+        def recorder(path, text, **kwargs):
+            writes.append(Path(path))
+            return real(path, text, **kwargs)
+
+        monkeypatch.setattr(_safe_io, 'atomic_write_text', recorder)
+        await _tick(scheduler, [*returning, holder])
+
+        assert writes.count(_guard('scheduler_age_reset_owed.json')) == 1
+        assert writes.count(_guard('scheduler_age_reset_anchors.json')) == 1
+
+    async def test_a_non_integer_recorded_anchor_is_ignored(self):
+        anchors = PersistentMap(_guard('scheduler_age_reset_anchors.json'), ttl=timedelta(days=30))
+        anchors['10'] = 'not-an-int'
+
+        assert await _tick(_scheduler(), [_task('10'), _task('4995')]) == '10'
