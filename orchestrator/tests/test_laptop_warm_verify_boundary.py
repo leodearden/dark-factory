@@ -82,6 +82,7 @@ from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 from click.testing import CliRunner
 from df_pytest_isolation import load_scaled_grace
 from escalation.queue import EscalationQueue
+from shared.proc_group import StatFields
 from test_cli import _setup_verify_repo  # noqa: F401 -- reused cross-module
 from test_merge_queue_multihost_wiring import (  # noqa: F401 -- reused cross-module
     _make_config as _mq_make_config,
@@ -2784,8 +2785,8 @@ def test_read_direct_children_tri_state_over_a_fake_task_listing(
     assert result == expected, f'expected {expected!r}, got {result!r} -- {consequence}'
 
 
-def test_read_proc_state_reports_an_unreaped_zombie_as_exited():
-    """A terminated-but-unreaped child reads as EXITED, although signal 0 still answers.
+def test_wait_pids_exited_counts_an_unreaped_zombie_as_exited():
+    """A terminated-but-unreaped child is not a survivor, although signal 0 still answers.
 
     ``os.waitid(..., WNOWAIT)`` blocks until the child has exited without
     reaping it, so the zombie is produced by a condition wait, never a sleep.
@@ -2803,31 +2804,24 @@ def test_read_proc_state_reports_an_unreaped_zombie_as_exited():
                 'as alive'
             )
 
-        state = read_proc_state(child.pid)
-        assert state == ProcState(state='Z', ppid=os.getpid())
-        assert state is not None and state.exited is True
         assert wait_pids_exited({child.pid}, timeout=0) == {}
 
         child.wait()
-        assert read_proc_state(child.pid) is None
+        assert wait_pids_exited({child.pid}, timeout=0) == {}
     finally:
         if child.returncode is None:
             child.kill()
             child.wait()
 
 
-def test_read_proc_state_reports_a_live_child_as_running():
-    """A live child reads as RUNNING, parented to this process, and survives the wait."""
+def test_wait_pids_exited_reports_a_live_child_as_a_survivor():
+    """A live child survives the wait, parented to this process and not terminated."""
     child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])
     try:
-        state = read_proc_state(child.pid)
-        assert state is not None
-        assert state.ppid == os.getpid()
-        assert state.exited is False
-
         survivors = wait_pids_exited({child.pid}, timeout=0)
         assert set(survivors) == {child.pid}
-        assert survivors[child.pid].exited is False
+        assert survivors[child.pid].ppid == os.getpid()
+        assert survivors[child.pid].terminated is False
     finally:
         child.kill()
         child.wait()
@@ -2842,9 +2836,10 @@ def test_wait_pids_exited_decides_on_a_probe_taken_after_its_last_sleep():
     """
     reads: list[int] = []
 
-    def read_state(pid: int) -> ProcState:
+    def read_state(pid: int) -> StatFields:
         reads.append(pid)
-        return ProcState('R', 1) if len(reads) == 1 else ProcState('Z', 1)
+        state = 'R' if len(reads) == 1 else 'Z'
+        return StatFields(comm='sleep', state=state, ppid=1, pgrp=pid)
 
     ticks = iter([0.0, 0.5])
 
@@ -2860,18 +2855,17 @@ def test_wait_pids_exited_decides_on_a_probe_taken_after_its_last_sleep():
 def test_wait_pids_exited_reports_each_survivor_with_its_last_observed_state():
     """timeout=0 is exactly one probe; a pid with no /proc entry is not a survivor."""
     reads: list[int] = []
+    asleep = StatFields(comm='sleep', state='S', ppid=4242, pgrp=4242)
 
-    def sleeping(pid: int) -> ProcState:
+    def sleeping(pid: int) -> StatFields:
         reads.append(pid)
-        return ProcState('S', 4242)
+        return asleep
 
-    assert wait_pids_exited({7}, timeout=0, _read_state=sleeping) == {7: ProcState('S', 4242)}
+    assert wait_pids_exited({7}, timeout=0, _read_state=sleeping) == {7: asleep}
     assert reads == [7]
 
-    states = {7: ProcState('S', 4242), 8: None}
-    assert wait_pids_exited({7, 8}, timeout=0, _read_state=states.__getitem__) == {
-        7: ProcState('S', 4242)
-    }
+    states: dict[int, StatFields | None] = {7: asleep, 8: None}
+    assert wait_pids_exited({7, 8}, timeout=0, _read_state=states.__getitem__) == {7: asleep}
 
 
 def test_sleeper_spec_build_pgid_file_names_the_blocking_session_leader(tmp_path):
