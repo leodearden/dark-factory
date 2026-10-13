@@ -4511,7 +4511,7 @@ def _run_configured_census(
         raise CensusPreconditionFailed(f"cannot resolve as_of_sha -- {exc}") from exc
 
     codebook_path = project_root / "docs" / "legibility" / "confusion-codebook.yaml"
-    census_state_path = project_root / "docs" / "legibility" / "census-state.json"
+    census_state_path = census_trigger.census_state_path(project_root)
     prior = census_identity.prior_census(*census_trigger.load_census_state(census_state_path))
     plans_dir = project_root / "plans"
     identity = census_identity.allocate_run_identity(
