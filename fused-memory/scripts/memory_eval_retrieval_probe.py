@@ -953,12 +953,16 @@ def derive_registry_candidates(
     per-facet claim needles. Those are hand-authored, which is exactly why the
     CLI band prints rather than overwrites (see :func:`run_derive_registry`).
 
-    When two sources derive the same slug, the richer one is kept and the
-    other is counted in ``slug_collisions_dropped``. A curator gate knows its
+    Two candidates collide when their slugs fold together under
+    :func:`normalize_topic`, because the corpus spells one topic with ``-``
+    and ``_``. The richer one is kept, in its own spelling: curator_gate >
+    topic_guard_cluster > census_topic, since a curator gate knows its
     canonical's hash, a guard cluster carries hand-written match phrases, and
-    a census topic has only a phrasing synthesised from its own slug. So a
-    census that grows a topic equal to a guard slug does not change the
-    entry derived for that slug.
+    a census topic has only a phrasing synthesised from its own slug. Between
+    two census rows, the census's own count-descending order keeps the
+    more-used spelling. Every dropped candidate is counted in
+    ``slug_collisions_dropped``, so the per-source counts plus collisions
+    account for every candidate generated.
     """
     curator_candidates, clusters_without_canonical = _derive_curator_gate_candidates(
         calibration_rows,
@@ -974,10 +978,11 @@ def derive_registry_candidates(
     deduped: list[dict[str, Any]] = []
     collisions = 0
     for candidate in candidates:
-        if candidate['topic'] in seen:
+        folded = normalize_topic(candidate['topic'])
+        if folded in seen:
             collisions += 1
             continue
-        seen.add(candidate['topic'])
+        seen.add(folded)
         deduped.append(candidate)
     deduped.sort(key=lambda c: c['topic'])
 
