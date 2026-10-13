@@ -112,6 +112,7 @@ rows on two roots, plus two blind roots. Each finding has an identity:
 - terminal: (root, `tag#task_id`), one per unledgered row
 - chain: (root, `state`, `tag`, `key`, `link_id`). The state is part of it, because one link can
   read `overdue` and then, run but left without a successor, `broken`.
+- absent: (root), the normalised root the digest printed
 
 Triage only identities absent from the previous reading. Keep the identities already triaged, and
 their dispositions, in top-level context. Carry undisposed ones across sessions the way the skill
@@ -123,8 +124,13 @@ carries its other work. The first reading of a session is all new, so check the 
 - Blind: the `error` string, and whether `<root>/.taskmaster/tasks/tasks.db` exists and is
   non-empty.
 - Terminal: the listed rows.
+- Absent: the printed `roots:` list, compared against `realpath <root>` of the watched root. A
+  root missing from the list is a gap in the dashboard's roster, and the knob for it is
+  `DASHBOARD_KNOWN_PROJECT_ROOTS`. A root present under another spelling means the watcher's
+  argument needs fixing. There is no record behind an absent finding, so the census below does
+  not apply to it.
 
-Then run the census (detection PRD Open question 2):
+For a blind or terminal finding, run the census next (detection PRD Open question 2):
 
 ```bash
 cd $DARK_FACTORY_ROOT && uv run --project fused-memory python scripts/clear_leaked_claimants.py --project-root <root> --json
@@ -178,7 +184,8 @@ mint the same R4 key:
 ```python
 import hashlib
 
-escalation_id = f"invariants-{kind}-{project}"   # project: the finding record's `project`
+# project: the record's `project`; for `absent`, which has no record, os.path.basename(root)
+escalation_id = f"invariants-{kind}-{project}"
 suggestion_hash = hashlib.sha256(f"{root} {kind} {identity}".encode()).hexdigest()[:16]
 ```
 
@@ -189,3 +196,4 @@ suggestion_hash = hashlib.sha256(f"{root} {kind} {identity}".encode()).hexdigest
 | `blind` | the record's `error` string |
 | `terminal` | the space-joined, sorted `tag#task_id` list the filing covers |
 | `chain-overdue`, `chain-broken`, `chain-paused` | `tag`, `key` and `link_id`, space-joined |
+| `absent` | the normalised root the digest printed |
