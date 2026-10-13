@@ -413,8 +413,8 @@ _LINKED_WORKTREE_COPY = load_script_module(
 # scrolled under, then the script's own run() for --task-id 1 with the verdict
 # swallowed, so stdout carries only that record.
 _SCOPE_PROBE = """
-import asyncio, contextlib, io, json
-import check_consolidation_closure as m
+import asyncio, contextlib, importlib, io, json
+m = importlib.import_module('check_consolidation_closure')
 
 class Memory:
     def __init__(self):
