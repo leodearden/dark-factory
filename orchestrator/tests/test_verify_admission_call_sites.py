@@ -14,7 +14,7 @@ import shlex
 import sys
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -63,7 +63,7 @@ def _review_checkpoint(event_store: _RecordingEventStore) -> ReviewCheckpoint:
     mcp = MagicMock()
     mcp.mcp_config_json.return_value = {'mcpServers': {}}
     checkpoint = ReviewCheckpoint(config, mcp=mcp, usage_gate=None)
-    checkpoint.event_store = event_store  # type: ignore[assignment]
+    checkpoint.event_store = cast(EventStore, event_store)
     return checkpoint
 
 
@@ -121,10 +121,10 @@ def _workflow_on_real_lane(
         assignment=assignment,
         config=config,
         git_ops=git_ops,
-        scheduler=MagicMock(),  # type: ignore[arg-type]
-        briefing=MagicMock(),  # type: ignore[arg-type]
-        mcp=MagicMock(),  # type: ignore[arg-type]
-        event_store=event_store,  # type: ignore[arg-type]
+        scheduler=MagicMock(),
+        briefing=MagicMock(),
+        mcp=MagicMock(),
+        event_store=cast(EventStore, event_store),
     )
     workflow.worktree = worktree
     artifacts = TaskArtifacts(worktree)
@@ -142,7 +142,7 @@ def _sweep_harness(tmp_path: Path, event_store: _RecordingEventStore) -> Harness
     harness = Harness(OrchestratorConfig(project_root=tmp_path))
     harness.git_ops = MagicMock()
     harness.git_ops.get_main_sha = AsyncMock(return_value='b' * 40)
-    harness.event_store = event_store  # type: ignore[assignment]
+    harness.event_store = cast(EventStore, event_store)
     return harness
 
 
@@ -190,10 +190,10 @@ async def test_implement_phase_verify_records_one_admission_plan_for_its_task(
 async def test_post_rebase_reverify_carries_task_id_and_event_store(tmp_path, monkeypatch):
     store = _RecordingEventStore()
     workflow = _workflow_on_real_lane(_lane_config(tmp_path), store)
-    workflow._maybe_defer_as_train_member = AsyncMock(return_value=None)  # type: ignore[method-assign]
-    workflow._check_scope_invariant = AsyncMock(return_value=None)  # type: ignore[method-assign]
-    workflow.git_ops.get_main_sha = AsyncMock(return_value='mainsha')  # type: ignore[method-assign]
-    workflow.git_ops.rebase_onto_main = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    workflow._maybe_defer_as_train_member = AsyncMock(return_value=None)
+    workflow._check_scope_invariant = AsyncMock(return_value=None)
+    workflow.git_ops.get_main_sha = AsyncMock(return_value='mainsha')
+    workflow.git_ops.rebase_onto_main = AsyncMock(return_value=True)
     verify = AsyncMock(side_effect=_StopMergePhase)
     monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', verify)
     monkeypatch.setattr(

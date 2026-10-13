@@ -122,8 +122,8 @@ class TestCheckRun:
 
     def test_to_dict_serialises_the_admitted_leg(self):
         """Task 5628: the admitted leg the test leg's slot wait ended in."""
-        from orchestrator.verify import CheckRun  # noqa: PLC0415
-        from orchestrator.verify_admission_record import AdmissionLeg  # noqa: PLC0415
+        from orchestrator.verify import CheckRun
+        from orchestrator.verify_admission_record import AdmissionLeg
 
         leg = AdmissionLeg(
             plan_id='p', module='pkg', scope_kind=None, order='arrival',

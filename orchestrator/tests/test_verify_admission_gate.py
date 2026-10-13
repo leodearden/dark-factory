@@ -15,6 +15,7 @@ import logging
 from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from shared.verify_admission import acquire_task_slot, is_gated_role
@@ -173,7 +174,7 @@ class TestAdmissionPolicy:
 
     def test_an_unknown_order_is_rejected(self):
         with pytest.raises(ValueError, match=r'order.*fifo'):
-            AdmissionPolicy(slots=1, order='fifo', promote_after_secs=1.0)  # pyright: ignore[reportArgumentType]
+            AdmissionPolicy(slots=1, order=cast(Any, 'fifo'), promote_after_secs=1.0)
 
     def test_a_negative_promote_age_is_rejected(self):
         with pytest.raises(ValueError, match=r'promote_after_secs.*-1'):
@@ -205,7 +206,7 @@ class TestFreshSnapshot:
         snap = gate_for(tmp_path).snapshot()
 
         with pytest.raises(dataclasses.FrozenInstanceError):
-            snap.waiters = ()  # pyright: ignore[reportAttributeAccessIssue]
+            cast(Any, snap).waiters = ()
 
 
 @pytest.mark.asyncio

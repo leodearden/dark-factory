@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
@@ -162,7 +163,7 @@ class TestVerifyAdmissionOrderingKnobs:
 
     def test_an_unknown_order_is_rejected(self):
         with pytest.raises(ValidationError):
-            OrchestratorConfig(verify_admission_order='fifo')  # type: ignore[arg-type]
+            OrchestratorConfig(verify_admission_order=cast(Any, 'fifo'))
 
     def test_arrival_order_is_accepted(self):
         assert OrchestratorConfig(verify_admission_order='arrival').verify_admission_order == 'arrival'

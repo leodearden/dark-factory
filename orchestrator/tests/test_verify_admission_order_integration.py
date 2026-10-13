@@ -504,7 +504,7 @@ class TestPlanEvent:
             ),
         )
         git_ops = GitOps(config.git, tmp_path)
-        git_ops.get_main_sha = AsyncMock(return_value='a' * 40)  # type: ignore[method-assign]
+        git_ops.get_main_sha = AsyncMock(return_value='a' * 40)
         git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
         store = EventStore(tmp_path / 'runs.db', run_id='t')
         seen: list[dict] = []
