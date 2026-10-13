@@ -2271,9 +2271,10 @@ def test_wait_for_marker_stable_raises_when_never_settles(tmp_path):
 # test_read_direct_children_skips_a_sibling_thread_that_exits_mid_probe
 # below): the two timeout-diagnostic tests spawn a real `proc` because the
 # diagnostic message's CONTENT -- the leader's actual returncode and, where
-# applicable, its stderr tail -- is exactly what is under test.  The poll
-# loop each one drives still runs zero ticks (timeout=0, interval=0), so
-# timing stays zero even there.
+# applicable, its stderr tail -- is exactly what is under test.  Each test
+# covers BOTH discovery waiters (wait_subtree_live and wait_for_pgid_file),
+# since they share one exit diagnostic.  The poll loop each one drives still
+# runs zero ticks (timeout=0), so timing stays zero even there.
 # ---------------------------------------------------------------------------
 
 
@@ -2416,21 +2417,50 @@ def test_wait_subtree_live_falls_back_to_the_full_walk_when_children_unreadable(
     )
 
 
-def test_wait_subtree_live_timeout_reports_leader_returncode_and_stderr_tail():
+def _time_out_subtree_live(proc: subprocess.Popen, tmp_path: Path) -> None:
+    """Drive :func:`wait_subtree_live` straight into its timeout branch for *proc*."""
+    wait_subtree_live(
+        1234,
+        proc=proc,
+        proc_label='leader',
+        timeout=0,
+        interval=0,
+        _probe_children=lambda _pid: set(),
+        _ppid_map=lambda: {},
+    )
+
+
+def _time_out_build_pgid_file(proc: subprocess.Popen, tmp_path: Path) -> None:
+    """Drive :func:`wait_for_pgid_file` straight into its timeout branch for *proc*."""
+    wait_for_pgid_file(
+        tmp_path / 'never-written.pgid', proc=proc, proc_label='leader', timeout=0,
+    )
+
+
+_DISCOVERY_WAIT_TIMEOUTS = pytest.mark.parametrize(
+    'time_out',
+    [_time_out_subtree_live, _time_out_build_pgid_file],
+    ids=['wait_subtree_live', 'wait_for_pgid_file'],
+)
+
+
+@_DISCOVERY_WAIT_TIMEOUTS
+def test_discovery_wait_timeout_reports_leader_returncode_and_stderr_tail(time_out, tmp_path):
     """The timeout diagnostic names the LEADER's real rc and stderr tail (291a75a919).
 
     291a75a919 ("De-flake alpha: make wait_subtree_live's timeout path
-    self-diagnosing") added the ``proc``/``proc_label`` reporting in the
-    timeout branch above (:func:`wait_subtree_live`, ~:582-603) so a
-    watchdog self-kill (rc == 1, no ``Error:`` line), an exception exit
-    (rc == 1 WITH an ``Error:`` line), and a merely slow leader (rc is
-    None) are distinguishable from the failure message alone -- exactly the
-    signal an incident needs. It shipped with no test (task 4312).
+    self-diagnosing") added the ``proc``/``proc_label`` reporting now owned
+    by :func:`describe_proc_exit`, which both discovery waiters append on
+    timeout, so a watchdog self-kill (rc == 1, no ``Error:`` line), an
+    exception exit (rc == 1 WITH an ``Error:`` line), and a merely slow
+    leader (rc is None) are distinguishable from the failure message alone
+    -- exactly the signal an incident needs. It shipped with no test (task
+    4312).
 
-    Deterministic per the task-4014 precedent above: ``_probe_children``
-    always reports no children and ``timeout=0`` so the poll body never
-    executes a single tick -- the timeout branch fires immediately, with
-    zero real timing.  What IS real is *proc*: an actually-spawned,
+    Deterministic per the task-4014 precedent above: each waiter runs with
+    ``timeout=0`` (and :func:`wait_subtree_live` with seams that report no
+    children), so the poll body never executes a single tick -- the timeout
+    branch fires immediately, with zero real timing.  What IS real is *proc*: an actually-spawned,
     already-``wait()``-ed subprocess with a KNOWN returncode (3) and a
     KNOWN stderr payload (``SENTINEL-XYZ``), so this pins the diagnostic's
     CONTENT rather than merely the presence of the words "rc"/"stderr" --
@@ -2447,15 +2477,7 @@ def test_wait_subtree_live_timeout_reports_leader_returncode_and_stderr_tail():
         assert proc.returncode == 3  # sanity: the known rc actually landed
 
         with pytest.raises(AssertionError) as exc_info:
-            wait_subtree_live(
-                1234,
-                proc=proc,
-                proc_label='leader',
-                timeout=0,
-                interval=0,
-                _probe_children=lambda _pid: set(),
-                _ppid_map=lambda: {},
-            )
+            time_out(proc, tmp_path)
 
         message = str(exc_info.value)
         assert 'leader rc=3' in message, (
@@ -2472,18 +2494,21 @@ def test_wait_subtree_live_timeout_reports_leader_returncode_and_stderr_tail():
                 proc.stderr.close()
 
 
-def test_wait_subtree_live_timeout_reports_rc_none_and_omits_stderr_for_a_live_leader():
+@_DISCOVERY_WAIT_TIMEOUTS
+def test_discovery_wait_timeout_reports_rc_none_and_omits_stderr_for_a_live_leader(
+    time_out, tmp_path,
+):
     """The rc=None ("merely slow leader") taxonomy branch and its anti-hang guard (291a75a919).
 
     Sibling of
-    :func:`test_wait_subtree_live_timeout_reports_leader_returncode_and_stderr_tail`
+    :func:`test_discovery_wait_timeout_reports_leader_returncode_and_stderr_tail`
     above, covering the two properties that rc=3 case cannot reach (task 4312
     review):
 
     * the ``rc is None`` taxonomy branch itself -- a leader that is merely
       slow (still running when the poll gives up) is the case an incident is
       most likely to actually hit, and it was entirely unpinned.
-    * the load-bearing guard :func:`wait_subtree_live`'s docstring calls out:
+    * the load-bearing guard :func:`describe_proc_exit`'s docstring calls out:
       stderr is read ONLY when ``proc.poll()`` is not ``None``, precisely
       because a LIVE leader's pipe write end can still be held open by an
       inherited-fd helper it spawned, and a buffered read on that pipe would
@@ -2508,15 +2533,7 @@ def test_wait_subtree_live_timeout_reports_rc_none_and_omits_stderr_for_a_live_l
     )
     try:
         with pytest.raises(AssertionError) as exc_info:
-            wait_subtree_live(
-                1234,
-                proc=proc,
-                proc_label='leader',
-                timeout=0,
-                interval=0,
-                _probe_children=lambda _pid: set(),
-                _ppid_map=lambda: {},
-            )
+            time_out(proc, tmp_path)
 
         message = str(exc_info.value)
         assert 'leader rc=None' in message, (
