@@ -6077,6 +6077,19 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: 'Periodic-census diagnostic commands repeatedly blocked by per-command approval gates: turns 78,79,80,105,121 reject forensic Bash operations (multi-line scripts, Python transcript analysis) with ''requires approval'' despite being read-only investigation.'
+  - date: '2026-09-20'
+    project: dark_factory
+    session: ef7f6a5c-3ea0-43b3-b0ee-73fe34d67ccf
+    origin_phase: ops
+    manifested_phase: verify
+    note: 'Re-routed here by task 5729 from entry-cand-20260919-2, where the 2026-09-20 nightly trickle filed this session under that entry''s since-withdrawn title. The sighting there stays, annotated by the task-5729-ef7f6a5c-reroute sighting.
+
+
+      The session is a periodic-census verifier run (permissionMode `default`) verifying that entry''s founding cluster. Transcript: ~/.claude/projects/-home-leo-src-dark-factory/ef7f6a5c-3ea0-43b3-b0ee-73fe34d67ccf.jsonl, 117 records; turn numbers are 0-indexed records, as the digest prints them.
+
+
+      All seven is_error results are permission refusals, so none of those commands ran: 29 and 42 `This Bash command contains multiple operations` (parts require approval); 46 and 83 `Contains ansi_c_string`; 50 a Write to /tmp not granted; 54 `This command requires approval`; 97 `Contains simple_expansion`. 83 and 97 were read-only forensic greps; 42/46/50/54 were attempts to run a probe script.'
+    evidence_quote: 'Bash({"command": "grep -rlI $''\\xe2\\x80\\x94'' /home/leo/src/dark-factory --include=*.py 2>/dev/null | wc -l"}) -> Contains ansi_c_string'
 - id: entry-cand-20260719-5
   title: Graphiti search returns decontextualized single-sentence fragments — high relevance score, zero actionable content
   severity: medium
@@ -18529,6 +18542,24 @@ entries:
 
 
       Reproduction: archived transcript records 616 (the Bash `tool_use`), 617 (the `is_error` result), and 621/622 (the +27s self-correction and its `ok`), 0-indexed into the 687-record session archive under task 5580. Four controls were run on CPython 3.13.9 at HEAD c800c2e1e7, each feeding the script to `python3 -` against a throwaway copy of the target file so no tracked file was written: REPRO verbatim (rc=1, stderr byte-identical to record 617); A, every U+2014 to ASCII `-` (rc=1, `unterminated string literal (detected at line 22)`); C, the embedded delimiter escaped (rc=0, `ok`); D, the embedded delimiter deleted (rc=0, `ok`). The control target was located by content and its index asserted to be 14 before perturbation.'
+  - date: '2026-10-13'
+    project: dark_factory
+    session: task-5729-ef7f6a5c-reroute
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'ANNOTATES the 2026-09-20 sighting `ef7f6a5c-3ea0-43b3-b0ee-73fe34d67ccf` above. That session is not an occurrence of this entry and is RE-ROUTED to `entry-cand-20260722-18` (task 5729). The sighting stays here exactly as filed, but its note is the nightly coder''s account and is wrong.
+
+
+      Measured against the transcript (~/.claude/projects/-home-leo-src-dark-factory/ef7f6a5c-3ea0-43b3-b0ee-73fe34d67ccf.jsonl, 117 records; turn numbers are 0-indexed records, as the digest prints them): the five turns the note names are harness permission refusals whose commands never ran. 42 `This Bash command contains multiple operations. The following parts require approval: python3 -, echo "exit: $?"`; 46 and 83 `Contains ansi_c_string`; 54 `This command requires approval`; 97 `Contains simple_expansion`. The only Python invocation that ran was `python3 --version`: no Python script or code executed, so no SyntaxError was raised in the session. The `SyntaxError`/U+2014 text the note attributes to error neighborhoods occurs only in the verifier''s own briefing, which quotes this entry''s founding cluster and its evidence_quote and which the digest renders as a `User Corrections` turn, and in the verifier''s own grep and Read of this codebook.
+
+
+      It fails this entry''s discriminator: no docstring was pasted, and no raw closing triple-quote sits beside an escaped one. The session''s only triple-quoted literal is a refused three-line probe written to test this entry''s since-withdrawn framing.
+
+
+      `status` stays `open`; this changes no title or cause.
+
+
+      Hypothesis: the coder matched the session here because its briefing embeds the cluster under verification, a vector owned by pending task 6847.'
   cause: 'A `python3` heredoc edit script pasted a docstring into its `old = """..."""` literal together with the docstring''s OWN closing `"""`, ending that literal early and leaving the script tail as bare top-level code.
 
 
