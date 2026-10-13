@@ -3330,6 +3330,58 @@ class TestWatcherSkillDrainProtocol:
 
 
 # ---------------------------------------------------------------------------
+# task 3726: the Tier-1 mutating-tool bullet and the grant move in lockstep
+# ---------------------------------------------------------------------------
+
+_READ_ONLY_GRANTED_MCP_TOOLS = frozenset({
+    'mcp__escalation__get_pending_escalations',
+    'mcp__escalation__get_task_escalations',
+    'mcp__fused-memory__get_task',
+    'mcp__fused-memory__get_tasks',
+    'mcp__fused-memory__search',
+})
+_TIER1_BULLET = '- **Tier-1 admin actions ONLY.**'
+
+
+def _tier1_mcp_tools(text: str) -> set[str]:
+    bullets = [line for line in text.splitlines() if line.startswith(_TIER1_BULLET)]
+    assert len(bullets) == 1, (
+        f'SKILL.md must carry exactly one {_TIER1_BULLET!r} Hard Constraints '
+        f'line; found {len(bullets)}'
+    )
+    return set(re.findall(r'`(mcp__[a-z-]+__[a-z0-9_]+)`', bullets[0]))
+
+
+class TestWatcherTier1BulletMatchesGrant:
+    """The Tier-1 bullet names exactly the granted mutating MCP tools.
+
+    The bullet ends "Nothing else mutates state", so a granted mutating tool
+    it omits is one the rotation is told never to use, and a tool it names
+    but the grant lacks is permission-denied.
+    """
+
+    def test_tier1_bullet_is_parseable(self) -> None:
+        assert _tier1_mcp_tools(_watcher_skill_text()), (
+            f'the {_TIER1_BULLET!r} line names no backticked mcp__ tools'
+        )
+
+    def test_tier1_bullet_matches_granted_mutating_tools(self) -> None:
+        declared = _tier1_mcp_tools(_watcher_skill_text())
+        granted = {
+            tool for tool in _WATCHER_ALLOWED_TOOLS if tool.startswith('mcp__')
+        } - _READ_ONLY_GRANTED_MCP_TOOLS
+        assert granted == declared, (
+            'harness.py::_WATCHER_ALLOWED_TOOLS and the SKILL.md Hard '
+            'Constraints Tier-1 bullet must change in lockstep. '
+            'Granted but forbidden to the agent by the Tier-1 bullet: '
+            f'{sorted(granted - declared)}. '
+            'Declared in the Tier-1 bullet but not granted: '
+            f'{sorted(declared - granted)}. '
+            'A newly granted READ tool belongs in _READ_ONLY_GRANTED_MCP_TOOLS.'
+        )
+
+
+# ---------------------------------------------------------------------------
 # task 2629 step-3: _watcher_has_actionable_l1 — empty-queue rotation precheck
 # ---------------------------------------------------------------------------
 
