@@ -11095,8 +11095,8 @@ class Harness:
             new_task_id = outcome.task_id
         else:
             logger.warning(
-                'Task %s: auto-eval submit_task created no redo task (%r) — '
-                'aborting redo',
+                'Task %s: auto-eval submit_task produced no redo task this harness may '
+                'flip (%r) — aborting redo',
                 original_id, outcome,
             )
             return

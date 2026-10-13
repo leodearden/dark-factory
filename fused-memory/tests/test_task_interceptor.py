@@ -12216,8 +12216,8 @@ async def test_submit_task_returns_the_fixture_payload(
 ):
     """The real ``submit_task`` returns each live payload pinned in
     ``shared/tests/fixtures/submit_task_responses.json`` — the same file the
-    orchestrator's ``Scheduler.submit_task`` tests parse — modulo generated ids
-    and error text.
+    orchestrator's ``Scheduler.submit_task`` tests parse.  Every value, error text
+    included, is compared exactly; only generated ids are compared by shape.
     """
     from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
 
@@ -12232,6 +12232,9 @@ async def test_submit_task_returns_the_fixture_payload(
         )
     elif case_name == 'tool_error_structured':
         await interceptor_facade.close()
+    elif case_name == 'tool_error_add_task_raised':
+        submit['planning_mode'] = True
+        taskmaster.add_task.side_effect = RuntimeError(expected['error'])
 
     actual = await interceptor_facade.submit_task('/project', **submit)
 
@@ -12239,8 +12242,6 @@ async def test_submit_task_returns_the_fixture_payload(
     generated = {'ticket': lambda v: v.startswith('tkt_')}
     if case_name == 'planning_create':
         generated['task_id'] = lambda v: isinstance(v, str) and bool(v)
-    if case_name == 'tool_error_structured':
-        generated['error'] = lambda v: v == expected['error']
     for key, value in actual.items():
         if key in generated:
             assert generated[key](value), (key, value)

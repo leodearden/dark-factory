@@ -28,7 +28,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import yaml
-from _orch_helpers import mcp_tool_envelope, pydantic_spec
+from _orch_helpers import CannedMcpSession, mcp_tool_envelope, pydantic_spec
 from shared.task_submit import SubmitFailed, SubmitOutcome, SubmittedTask, SubmittedTicket
 
 from orchestrator.config import OrchestratorConfig
@@ -1079,6 +1079,101 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
         assert 'request_id' in str(error)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('envelope', 'server_text'),
+        [(_mcp_is_error_body('get_statuses'), 'boom'), (_JSONRPC_PROTOCOL_ERROR, 'Invalid params')],
+        ids=['mcp_is_error', 'jsonrpc_protocol_error'],
+    )
+    async def test_get_statuses_failure_carries_the_servers_text(self, envelope, server_text):
+        _, client = await self._client(envelope)
+        statuses, error = await client.get_statuses(['42'])
+        assert statuses == {}
+        assert server_text in str(error)
+
+    # ── commit_planning ───────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_commit_planning_dispatches_comma_joined_ids(self):
+        """``commit_planning``'s ``task_ids`` is a COMMA-SEPARATED STRING, not a list
+        (fused-memory server/tools.py::commit_planning) — a list would be rejected."""
+        scheduler, client = await self._client({'success': True})
+        await client.commit_planning(['42', '43'])
+        assert scheduler.calls[0][0] == 'commit_planning'
+        assert scheduler.calls[0][1] == {
+            'project_root': '/proj',
+            'task_ids': '42,43',
+            'target_status': 'pending',
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [{'error': 'no such task'}, {'success': False}, None],
+        ids=['error', 'not_successful', 'non_dict'],
+    )
+    async def test_commit_planning_does_not_raise_on_a_failure_envelope(self, envelope, caplog):
+        _, client = await self._client(envelope)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.chronic_flake'):
+            assert await client.commit_planning(['42']) is None
+        assert [r for r in caplog.records if r.name == 'orchestrator.chronic_flake']
+
+    @pytest.mark.asyncio
+    async def test_commit_planning_does_not_raise_when_dispatch_raises(self):
+        _, client = await self._client(None, raises=RuntimeError('mcp down'))
+        assert await client.commit_planning(['42']) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [mcp_tool_envelope({'success': True}), {'success': True}],
+        ids=['production_jsonrpc_body', 'legacy_bare_payload'],
+    )
+    async def test_commit_planning_is_SILENT_on_success(self, envelope, caplog):
+        """THE NEGATIVE CONTROL, and the only assertion that can catch a warning which
+        fires unconditionally.
+
+        The failure-envelope test above asserts a warning is PRESENT; nothing asserted it
+        is ABSENT on success, so an implementation that warned every time passed the whole
+        suite.  That was not hypothetical: this confirmation reads ``envelope.get(
+        'success')`` off the SHARED unwrapper, and while that unwrapper took one step it
+        landed on the inner MCP result — whose keys are ``content``/``structuredContent``/
+        ``isError`` — so ``get('success')`` was ``None`` and the "did not confirm success
+        … they may still be deferred" WARNING fired on every SUCCESSFUL commit_planning.
+        A permanent false alarm on a line an operator is meant to act on.
+
+        Parametrized over the real JSON-RPC body FIRST, because that is the shape that was
+        broken; the bare payload is the already-unwrapped spelling the fakes produce.
+        """
+        _, client = await self._client(envelope)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.chronic_flake'):
+            assert await client.commit_planning(['42']) is None
+        assert [r for r in caplog.records if r.name == 'orchestrator.chronic_flake'] == [], (
+            'a SUCCESSFUL commit_planning must log nothing: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+
+    # ── submit_task's project_root injection ──────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_submit_task_does_not_clobber_an_explicit_project_root(self):
+        """``setdefault``, not assignment — which is what keeps chronic_flake's OWN
+        path (``build_chronic_flake_fix_task_arguments`` always sets the key) byte-
+        identical to before this change."""
+        scheduler, client = await self._client(None)
+        await client.submit_task({'title': 't', 'project_root': '/elsewhere'})
+        assert scheduler.submit_calls[0][0]['project_root'] == '/elsewhere'
+
+    @pytest.mark.asyncio
+    async def test_submit_task_does_not_mutate_the_callers_dict(self):
+        """The caller's argument block is COPIED before injection.  ``open_debt``
+        compares the emitted block against ``build_deflake_task_arguments``' output, and
+        a shared dict mutated here would make that comparison depend on call order."""
+        scheduler, client = await self._client(None)
+        arguments = {'title': 't'}
+        await client.submit_task(arguments)
+        assert arguments == {'title': 't'}
+
+    @pytest.mark.asyncio
     async def test_a_failed_submit_task_logs_its_reason_once(self, caplog):
         """The refusal behind a ledger row with NO OWNER.  The outcome is returned
         unchanged, so control flow stays the caller's, but its reason — the server's
@@ -1129,20 +1224,6 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
         assert scheduler.submit_calls[0][0] == expected
 
 
-class _CannedMcpSession:
-    """The duck-typed ``call_tool`` seam ``Scheduler.dispatch_tool`` routes an injected
-    session through (the eval runner's ``_StubMcpSession`` pattern), answering every
-    call with one canned JSON-RPC body."""
-
-    def __init__(self, body: dict) -> None:
-        self.body = body
-        self.calls: list[tuple[str, dict]] = []
-
-    async def call_tool(self, name: str, arguments: dict, timeout: float = 30) -> dict:
-        self.calls.append((name, arguments))
-        return self.body
-
-
 class TestGetStatusesHasOneParser:
     """The adapter and ``scheduler.py::Scheduler.get_statuses`` read one tool's answer,
     so they must agree on every JSON-RPC body the transport and the eval stub emit.
@@ -1190,7 +1271,7 @@ class TestGetStatusesHasOneParser:
         from orchestrator.scheduler import Scheduler
 
         config = OrchestratorConfig(project_root=tmp_path)
-        session = _CannedMcpSession(body)
+        session = CannedMcpSession(body)
         scheduler = Scheduler(config, mcp_session=session)
         adapter = SchedulerChronicFlakeTaskClient(scheduler, config.project_root)
 
@@ -1206,9 +1287,11 @@ class TestGetStatusesHasOneParser:
 
 class TestSubmitTaskThroughTheRealScheduler:
     """The adapter over a real ``Scheduler`` answering the production JSON-RPC body —
-    the composition ``merge_lane/worker.py`` and ``workflow.py`` run.  Every other
+    the composition ``orchestrator/src/orchestrator/merge_lane/worker.py`` and
+    ``orchestrator/src/orchestrator/workflow.py`` run.  Every other
     submit test drives :class:`_StubScheduler`'s canned outcome; this one is where the
-    response parse (``scheduler.py::Scheduler.submit_task``) meets the adapter."""
+    response parse (``orchestrator/src/orchestrator/scheduler.py::Scheduler.submit_task``)
+    meets the adapter."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1226,7 +1309,7 @@ class TestSubmitTaskThroughTheRealScheduler:
         from orchestrator.scheduler import Scheduler
 
         config = OrchestratorConfig(project_root=tmp_path)
-        session = _CannedMcpSession(mcp_tool_envelope(payload))
+        session = CannedMcpSession(mcp_tool_envelope(payload))
         adapter = SchedulerChronicFlakeTaskClient(
             Scheduler(config, mcp_session=session), config.project_root,
         )
@@ -1242,7 +1325,7 @@ class TestSubmitTaskThroughTheRealScheduler:
         from orchestrator.scheduler import Scheduler
 
         config = OrchestratorConfig(project_root=tmp_path)
-        session = _CannedMcpSession(
+        session = CannedMcpSession(
             mcp_tool_envelope({'error': 'backlog full', 'error_type': 'BacklogFullError'}),
         )
         adapter = SchedulerChronicFlakeTaskClient(

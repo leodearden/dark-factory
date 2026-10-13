@@ -604,7 +604,8 @@ def _unwrap_dispatch_envelope(result: object) -> dict:
     A one-step unwrapper therefore returns a dict in which every payload key is
     absent, which each parser above reads as a well-formed envelope that simply
     does not carry its key: ``_extract_statuses_map`` returned an error on
-    EVERY successful production call.  Corroborated by ``scheduler.py::SchedulerFacade.get_statuses``, which
+    EVERY successful production call.  Corroborated by
+    ``orchestrator/src/orchestrator/scheduler.py::SchedulerFacade.get_statuses``, which
     parses the very same ``dispatch_tool`` result with
     ``shared.mcp_envelope.parse_tool_result(result, 'statuses', dict)`` — a
     parser that requires exactly ``result['result']['content'][i]['text']``.
@@ -798,7 +799,7 @@ class SchedulerChronicFlakeTaskClient:
         :func:`build_chronic_flake_fix_task_arguments` always sets the key —
         byte-identical on the wire.
 
-        A :class:`~shared.task_submit.SubmitFailed` is logged with its reason,
+        A ``shared/src/shared/task_submit.py::SubmitFailed`` is logged with its reason,
         which carries the server's own text when it gave one.
         """
         arguments = {**arguments}

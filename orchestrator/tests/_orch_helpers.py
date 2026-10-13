@@ -2394,6 +2394,26 @@ def mcp_tool_envelope(payload: object) -> dict:
             'isError': False,
         },
     }
+
+
+class CannedMcpSession:
+    """The duck-typed ``call_tool`` seam ``Scheduler.dispatch_tool`` routes an injected
+    session through (the eval runner's ``_StubMcpSession`` pattern): answers every call
+    with one canned JSON-RPC body, or raises ``error``; ``calls`` records each
+    ``(name, arguments)``."""
+
+    def __init__(self, body: dict | None = None, error: Exception | None = None) -> None:
+        self.body = body or {}
+        self.error = error
+        self.calls: list[tuple[str, dict]] = []
+
+    async def call_tool(self, name: str, arguments: dict, timeout: float = 30) -> dict:
+        self.calls.append((name, arguments))
+        if self.error is not None:
+            raise self.error
+        return self.body
+
+
 def make_prompt_resolution_workflow(
     *, tmp_path: Path, prompt_store: PromptArtifactStore | None = None,
 ) -> TaskWorkflow:

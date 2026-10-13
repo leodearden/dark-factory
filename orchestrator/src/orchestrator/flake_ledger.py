@@ -1106,9 +1106,15 @@ async def _owner_status(
 class _SubmittedOwner:
     task_id: str
     needs_commit_planning: bool
+    combined: bool
 
 
-def _owner_from_submission(outcome: SubmitOutcome) -> _SubmittedOwner | str:
+@dataclass(frozen=True)
+class _FailedFiling:
+    reason: str
+
+
+def _owner_from_submission(outcome: SubmitOutcome) -> _SubmittedOwner | _FailedFiling:
     """The task a ``submit_task`` *outcome* makes the debt row's owner, or the reason
     the filing failed.
 
@@ -1120,21 +1126,27 @@ def _owner_from_submission(outcome: SubmitOutcome) -> _SubmittedOwner | str:
     """
     match outcome:
         case SubmittedTask(task_id=task_id, combined=False):
-            return _SubmittedOwner(task_id, needs_commit_planning=True)
+            return _SubmittedOwner(task_id, needs_commit_planning=True, combined=False)
         case SubmittedTask(task_id=task_id, status=status) if status is None or status in TERMINAL:
-            return (
+            return _FailedFiling(
                 f'submit_task combined the filing into task {task_id} '
                 f'(status={status!r}), which cannot own it — the filing was swallowed'
             )
         case SubmittedTask(task_id=task_id, status=status):
-            return _SubmittedOwner(task_id, needs_commit_planning=status == 'deferred')
+            return _SubmittedOwner(
+                task_id, needs_commit_planning=status == 'deferred', combined=True,
+            )
         case SubmittedTicket(ticket_id=ticket_id):
-            return (
+            return _FailedFiling(
                 f'submit_task returned ticket {ticket_id!r}, not a task — '
                 'planning_mode did not take effect'
             )
         case SubmitFailed(reason=reason):
-            return reason
+            return _FailedFiling(reason)
+        case _:
+            return _FailedFiling(
+                f'submit_task answered a {type(outcome).__name__}, not a SubmitOutcome'
+            )
 
 
 async def _ensure_owner_task(
@@ -1284,14 +1296,14 @@ async def _ensure_owner_task(
         )
         return row
     owner = _owner_from_submission(outcome)
-    if isinstance(owner, str):
+    if isinstance(owner, _FailedFiling):
         logger.warning(
             'flake_ledger: failed to file a de-flake task for test_id=%s (project_id=%s): '
             '%s — the debt row stays UNOWNED and §5.9 is breached for it until the next '
             'suppression retries',
             row.test_id,
             project_id,
-            owner,
+            owner.reason,
         )
         return row
     new_id = owner.task_id
@@ -1352,12 +1364,21 @@ async def _ensure_owner_task(
             row.test_id,
             exc_info=True,
         )
-    logger.info(
-        'flake_ledger: filed de-flake task %s owning debt for test_id=%s (project_id=%s)',
-        new_id,
-        row.test_id,
-        project_id,
-    )
+    if owner.combined:
+        logger.info(
+            'flake_ledger: de-flake filing for test_id=%s was combined into live task %s, '
+            'now its owner (project_id=%s)',
+            row.test_id,
+            new_id,
+            project_id,
+        )
+    else:
+        logger.info(
+            'flake_ledger: filed de-flake task %s owning debt for test_id=%s (project_id=%s)',
+            new_id,
+            row.test_id,
+            project_id,
+        )
     # No re-read.  After a ROWCOUNT-CHECKED conditional UPDATE, `new_id` is exactly what
     # is in that column on disk — so patching the one column this function owns is not a
     # "local copy" of the row, it is the row.

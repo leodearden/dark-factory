@@ -3466,7 +3466,7 @@ class Scheduler:
 
         ``project_root`` defaults to this scheduler's root.  A dispatch
         exception is returned as ``SubmitFailed``, never raised.  The outcome
-        taxonomy lives in ``shared/task_submit.py``.
+        taxonomy lives in ``shared/src/shared/task_submit.py::SubmitOutcome``.
         """
         call_arguments = dict(arguments)
         call_arguments.setdefault('project_root', self._project_root)

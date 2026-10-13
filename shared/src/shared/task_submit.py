@@ -64,7 +64,7 @@ def parse_submit_task_result(result: Any) -> SubmitOutcome:
     """Classify a ``dispatch_tool('submit_task', ...)`` response.  Never raises.
 
     *result* is the JSON-RPC body the transport returns; the payload is read
-    through ``shared.mcp_envelope.parse_tool_result`` in whole-inner-dict mode,
+    through ``shared/src/shared/mcp_envelope.py::parse_tool_result`` in whole-inner-dict mode,
     so a bare, already-unwrapped dict is a failure here, not a payload.
     """
     inner, err = parse_tool_result(result, None, dict)

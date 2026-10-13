@@ -1,5 +1,5 @@
 {
-  "_README": "Return values of the fused-memory submit_task tool and the typed outcome shared/src/shared/task_submit.py::parse_submit_task_result must classify each as. Read by orchestrator/tests/test_scheduler_submit_task.py, which wraps each 'payload' (the tool's own return value) in the production JSON-RPC body via orchestrator/tests/_orch_helpers.py::mcp_tool_envelope (a case with 'jsonrpc_result' instead carries the 'result' member verbatim, for FastMCP's prose isError form that has no dict payload) and asserts Scheduler.submit_task returns 'outcome'; and by fused-memory/tests/test_task_interceptor.py, which asserts the real TaskInterceptor.submit_task returns each case marked \"live\": true. Both readers pin one file, so a drift in either the server's response shape or the parser fails a test.",
+  "_README": "Return values of the fused-memory submit_task tool and the typed outcome shared/src/shared/task_submit.py::parse_submit_task_result must classify each as. Read by orchestrator/tests/test_scheduler_submit_task.py, which wraps each 'payload' (the tool's own return value) in the production JSON-RPC body via orchestrator/tests/_orch_helpers.py::mcp_tool_envelope (a case with 'jsonrpc_result' instead carries the 'result' member verbatim, for FastMCP's prose isError form that has no dict payload) and asserts Scheduler.submit_task returns 'outcome'; and by fused-memory/tests/test_task_interceptor.py, which asserts the real TaskInterceptor.submit_task returns each case marked \"live\": true. Both readers pin one file, so a drift in either the server's response shape or the parser fails a test. Only the \"live\": true cases are asserted against the real server; the others pin parser behaviour on shapes the server can produce.",
   "cases": {
     "ticket": {
       "live": true,
@@ -16,7 +16,12 @@
         "task_id": "2",
         "status": "deferred",
         "planning_mode": true,
-        "routing_intent_warning": "task text names a deterministic gate but metadata.task_kind is unset"
+        "routing_intent_warning": {
+          "markers": ["no_code_label"],
+          "fields": ["description"],
+          "detail": "Declares a \"no-code\" label for this task.",
+          "hint": "This task_kind='normal' submission's text declares a different execution path (see 'markers'). If genuinely operational/decision work, set metadata.execution_class or resubmit with the matching task_kind; otherwise remove the conflicting declaration."
+        }
       },
       "outcome": {"kind": "SubmittedTask", "task_id": "2", "status": "deferred", "combined": false}
     },
@@ -27,7 +32,7 @@
     },
     "planning_collision_null_task_id": {
       "payload": {"task_id": null, "status": null, "combined": true, "planning_mode": true},
-      "outcome": {"kind": "SubmitFailed", "reason_contains": "combined"}
+      "outcome": {"kind": "SubmitFailed", "reason_contains": "did not name"}
     },
     "tool_error_structured": {
       "live": true,
@@ -36,6 +41,11 @@
         "error_type": "ClosedError"
       },
       "outcome": {"kind": "SubmitFailed", "reason_contains": "ClosedError"}
+    },
+    "tool_error_add_task_raised": {
+      "live": true,
+      "payload": {"error": "add_task exploded", "error_type": "RuntimeError"},
+      "outcome": {"kind": "SubmitFailed", "reason_contains": "RuntimeError"}
     },
     "tool_error_prose_is_error": {
       "jsonrpc_result": {
