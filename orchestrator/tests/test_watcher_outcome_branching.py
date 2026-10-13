@@ -2,11 +2,12 @@
 
 The wrapper's exit-code -> `WATCHER_REARM_OUTCOME` mapping has one home: the
 script itself. The vocabulary below is DERIVED by running that script over a
-stub watcher (its `WATCHER_REARM_PYTHON` seam), never restated here, so a new
-outcome fails every consumer at once.
+stub watcher (its `WATCHER_REARM_PYTHON` seam) for every exit code 0-255, never
+restated here, so a new outcome fails every consumer at once.
 
 Every assertion checks a consumer's outcome table against values derived by
-running the producer.
+running the producer. The rotation prompt carries no table of its own: its
+guidance points at the auto skill section that does, and that pointer must resolve.
 """
 
 from __future__ import annotations
@@ -15,25 +16,31 @@ import os
 import re
 import subprocess
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
-from orchestrator.agents.watcher_rearm_outcome_guidance import WATCHER_REARM_OUTCOME_GUIDANCE
+from orchestrator.agents.watcher_rearm_outcome_guidance import (
+    WATCHER_REARM_OUTCOME_GUIDANCE,
+    WATCHER_REARM_OUTCOME_SECTION,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _REARM_SCRIPT = _REPO_ROOT / 'scripts' / 'watcher-rearm.sh'
 _OUTCOME_MARKER = re.compile(r'WATCHER_REARM_OUTCOME: (\w+) exit=(\d+)')
 _OUTCOME_TOKEN = re.compile(r'WATCHER_REARM_OUTCOME: (\w+)')
-_PROBE_RCS = (0, 124, 137, 143, 144, 1, 3)
-_CATCH_ALL_PROBE_RCS = (1, 3)
+_PROBE_RCS = range(256)
+_PROBE_WORKERS = 8
+_EXIT_COLUMN = 'Exit'
+
+pytestmark = pytest.mark.xdist_group('watcher-rearm-producer')
 
 _ARTIFACTS: dict[str, Callable[[], str]] = {
     'auto-skill': lambda: load_skill_system_prompt('escalation-watcher-auto'),
     'l2-skill': lambda: load_skill_system_prompt('escalation-watcher'),
-    'rotation-guidance': lambda: WATCHER_REARM_OUTCOME_GUIDANCE,
 }
 
 
@@ -64,15 +71,20 @@ def producer_contract(tmp_path_factory: pytest.TempPathFactory) -> ProducerContr
     tooling_root.mkdir()
     args = ['--queue-dir', str(work / 'queue'), '--level', '1', '--timeout', '1']
 
-    outcome_by_rc: dict[int, str] = {}
-    for rc in _PROBE_RCS:
+    def probe(rc: int) -> subprocess.CompletedProcess[str]:
         env = {
             'PATH': os.environ.get('PATH', ''),
             'DARK_FACTORY_ROOT': str(tooling_root),
             'WATCHER_REARM_PYTHON': str(stub),
             'STUB_RC': str(rc),
         }
-        result = _run_rearm(args, env)
+        return _run_rearm(args, env)
+
+    with ThreadPoolExecutor(max_workers=_PROBE_WORKERS) as pool:
+        probes = dict(zip(_PROBE_RCS, pool.map(probe, _PROBE_RCS), strict=True))
+
+    outcome_by_rc: dict[int, str] = {}
+    for rc, result in probes.items():
         match = _OUTCOME_MARKER.search(result.stderr)
         assert match is not None, f'probe rc={rc} printed no outcome marker: {result.stderr!r}'
         assert int(match.group(2)) == rc == result.returncode, (
@@ -83,8 +95,7 @@ def producer_contract(tmp_path_factory: pytest.TempPathFactory) -> ProducerContr
     outcomes: dict[str, set[int]] = {}
     for rc, outcome in outcome_by_rc.items():
         outcomes.setdefault(outcome, set()).add(rc)
-    catch_all = outcome_by_rc[_CATCH_ALL_PROBE_RCS[0]]
-    assert {outcome_by_rc[rc] for rc in _CATCH_ALL_PROBE_RCS} == {catch_all}, outcome_by_rc
+    catch_all = max(outcomes, key=lambda outcome: len(outcomes[outcome]))
 
     usage = _run_rearm(['--no-such-flag'], {'PATH': os.environ.get('PATH', '')})
     assert usage.returncode != 0, usage
@@ -99,17 +110,53 @@ def producer_contract(tmp_path_factory: pytest.TempPathFactory) -> ProducerContr
     )
 
 
-def _branch_rows(text: str) -> dict[str, list[str]]:
-    rows: dict[str, list[str]] = {}
-    table_rows = (line for line in text.splitlines() if line.lstrip().startswith('|'))
-    for row in table_rows:
-        for token in _OUTCOME_TOKEN.findall(row):
-            rows.setdefault(token, []).append(row)
-    return rows
+def _cells(row: str) -> list[str]:
+    return [cell.strip() for cell in row.strip().strip('|').split('|')]
 
 
-def _names_code(row: str, rc: int) -> bool:
-    return re.search(rf'(?<!\d){rc}(?!\d)', row) is not None
+def _exit_cells_by_outcome(text: str) -> dict[str, list[str]]:
+    """The Exit cell of every markdown table row carrying each outcome marker."""
+    exit_cells: dict[str, list[str]] = {}
+    header: list[str] | None = None
+    for line in text.splitlines():
+        if not line.lstrip().startswith('|'):
+            header = None
+            continue
+        if header is None:
+            header = _cells(line)
+            continue
+        exit_cell = dict(zip(header, _cells(line), strict=False)).get(_EXIT_COLUMN, '')
+        for token in _OUTCOME_TOKEN.findall(line):
+            exit_cells.setdefault(token, []).append(exit_cell)
+    return exit_cells
+
+
+def _names_code(exit_cell: str, rc: int) -> bool:
+    return re.search(rf'(?<!\d){rc}(?!\d)', exit_cell) is not None
+
+
+def _heading_level(line: str) -> int:
+    hashes = len(line) - len(line.lstrip('#'))
+    return hashes if hashes and line[hashes:].startswith(' ') else 0
+
+
+def _section_under(text: str, title: str) -> str | None:
+    """The body of the markdown section titled `title`; '#' lines inside code fences are not headings."""
+    body: list[str] | None = None
+    level = 0
+    in_fence = False
+    for line in text.splitlines():
+        if line.lstrip().startswith('```'):
+            in_fence = not in_fence
+        heading = 0 if in_fence else _heading_level(line)
+        if body is None:
+            if heading and line[heading:].strip() == title:
+                body, level = [], heading
+        elif 0 < heading <= level:
+            break
+        else:
+            body.append(line)
+    return None if body is None else '\n'.join(body)
 
 
 @pytest.mark.parametrize('artifact_id', sorted(_ARTIFACTS))
@@ -117,11 +164,11 @@ class TestOutcomeBranchContract:
     def test_one_branch_row_per_producer_outcome(
         self, artifact_id: str, producer_contract: ProducerContract
     ) -> None:
-        rows = _branch_rows(_ARTIFACTS[artifact_id]())
+        exit_cells = _exit_cells_by_outcome(_ARTIFACTS[artifact_id]())
         miscounted = {
-            outcome: len(rows.get(outcome, []))
+            outcome: len(exit_cells.get(outcome, []))
             for outcome in producer_contract.outcomes
-            if len(rows.get(outcome, [])) != 1
+            if len(exit_cells.get(outcome, [])) != 1
         }
         assert not miscounted, (
             f'{artifact_id}: each producer outcome needs exactly one table row '
@@ -131,25 +178,49 @@ class TestOutcomeBranchContract:
     def test_row_names_every_exit_code_the_producer_maps_to_it(
         self, artifact_id: str, producer_contract: ProducerContract
     ) -> None:
-        rows = _branch_rows(_ARTIFACTS[artifact_id]())
+        exit_cells = _exit_cells_by_outcome(_ARTIFACTS[artifact_id]())
         unnamed: dict[str, list[int]] = {}
         for outcome, rcs in producer_contract.outcomes.items():
             if outcome == producer_contract.catch_all:
                 continue
             missing = sorted(
-                rc for rc in rcs if not any(_names_code(row, rc) for row in rows.get(outcome, []))
+                rc
+                for rc in rcs
+                if not any(_names_code(cell, rc) for cell in exit_cells.get(outcome, []))
             )
             if missing:
                 unnamed[outcome] = missing
         assert not unnamed, (
-            f'{artifact_id}: outcome rows omit exit codes the wrapper maps to them: {unnamed}'
+            f'{artifact_id}: outcome rows\' {_EXIT_COLUMN} cells omit exit codes the wrapper '
+            f'maps to them: {unnamed}'
         )
 
     def test_catch_all_row_names_the_no_marker_usage_code(
         self, artifact_id: str, producer_contract: ProducerContract
     ) -> None:
-        rows = _branch_rows(_ARTIFACTS[artifact_id]()).get(producer_contract.catch_all, [])
-        assert any(_names_code(row, producer_contract.usage_rc) for row in rows), (
-            f'{artifact_id}: the {producer_contract.catch_all} row must name exit '
-            f'{producer_contract.usage_rc}, the usage error that prints no marker'
+        exit_cells = _exit_cells_by_outcome(_ARTIFACTS[artifact_id]()).get(
+            producer_contract.catch_all, []
+        )
+        assert any(_names_code(cell, producer_contract.usage_rc) for cell in exit_cells), (
+            f'{artifact_id}: the {producer_contract.catch_all} row\'s {_EXIT_COLUMN} cell must '
+            f'name exit {producer_contract.usage_rc}, the usage error that prints no marker'
+        )
+
+
+class TestRotationGuidancePointer:
+    def test_points_at_the_auto_skill_section_holding_every_outcome_row(
+        self, producer_contract: ProducerContract
+    ) -> None:
+        assert WATCHER_REARM_OUTCOME_SECTION in WATCHER_REARM_OUTCOME_GUIDANCE
+        section = _section_under(
+            load_skill_system_prompt('escalation-watcher-auto'), WATCHER_REARM_OUTCOME_SECTION
+        )
+        assert section is not None, (
+            f'the rotation guidance points at a "{WATCHER_REARM_OUTCOME_SECTION}" section '
+            'the auto skill does not have'
+        )
+        missing = sorted(set(producer_contract.outcomes) - set(_exit_cells_by_outcome(section)))
+        assert not missing, (
+            f'the auto skill\'s "{WATCHER_REARM_OUTCOME_SECTION}" section, which the rotation '
+            f'guidance points at, has no table row for outcomes {missing}'
         )
