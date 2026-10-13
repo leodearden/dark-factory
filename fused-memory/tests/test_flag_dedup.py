@@ -8697,6 +8697,103 @@ class TestFilterContaminationCeilingFindings:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# filter_snapshot_stat_edge_findings — task 3487 code-side backstop
+# ---------------------------------------------------------------------------
+
+
+class TestFilterSnapshotStatEdgeFindings:
+    """Drops a Stage-3 finding that pairs a ``task_count_snapshot*`` stat with
+    a missing Graphiti temporal_facts edge, for EVERY project: snapshot stats
+    are Mem0-only, so no such edge is ever written (Snapshot Discipline)."""
+
+    @staticmethod
+    def _flag(description, suggested_action='Investigate', **extra):
+        flag = {
+            'task_id': None,
+            'flag_type': 'stats_mismatch',
+            'category': 'memory_stale',
+            'description': description,
+            'suggested_action': suggested_action,
+        }
+        flag.update(extra)
+        return flag
+
+    @pytest.mark.parametrize(
+        'description',
+        [
+            'Stage 2 reported task_count_snapshot_mem0_written=1 but no Graphiti '
+            'temporal_facts edge exists',
+            'TASK_COUNT_SNAPSHOT_MEM0_PRUNED=2 yet no temporal fact was found',
+            'task_count_snapshot_mem0_written=1 with no matching Graphiti edge',
+            'task_count_snapshot_mem0_written=1 has no graphiti temporal record',
+        ],
+        ids=['temporal_fact', 'temporal-fact-uppercase-stat', 'graphiti-edge', 'graphiti-temporal'],
+    )
+    def test_drops_a_stat_plus_edge_finding(self, description):
+        assert flag_dedup.filter_snapshot_stat_edge_findings([self._flag(description)]) == []
+
+    def test_signals_may_be_split_across_description_and_suggested_action(self):
+        flag = self._flag(
+            'Stage 2 reported task_count_snapshot_mem0_written=1',
+            suggested_action='Write the missing Graphiti temporal_facts edge',
+        )
+
+        assert flag_dedup.filter_snapshot_stat_edge_findings([flag]) == []
+
+    @pytest.mark.parametrize(
+        'flag',
+        [
+            {'description': 'task_count_snapshot_mem0_written=1 looks low',
+             'suggested_action': 'Check Mem0'},
+            {'description': 'Graphiti temporal_facts edge for task 12 is stale',
+             'suggested_action': 'Refresh it'},
+            {'description': None, 'suggested_action': None},
+            {},
+            {'description': 'task 42 has no design doc', 'suggested_action': 'Add one'},
+        ],
+        ids=['stat-only', 'edge-only', 'none-fields', 'empty', 'unrelated'],
+    )
+    def test_keeps_anything_short_of_both_signals(self, flag):
+        assert flag_dedup.filter_snapshot_stat_edge_findings([flag]) == [flag]
+
+    def test_is_project_agnostic(self):
+        import inspect
+
+        params = inspect.signature(flag_dedup.filter_snapshot_stat_edge_findings).parameters
+        assert list(params) == ['flags']
+
+    def test_preserves_order_and_returns_a_new_list(self):
+        keep_a = self._flag('task 1 has no design doc')
+        drop = self._flag(
+            'task_count_snapshot_mem0_written=1 but no Graphiti temporal_facts edge',
+        )
+        keep_b = self._flag('task 2 has no tests')
+        flags = [keep_a, drop, keep_b]
+
+        kept = flag_dedup.filter_snapshot_stat_edge_findings(flags)
+
+        assert kept == [keep_a, keep_b]
+        assert kept is not flags
+        assert flags == [keep_a, drop, keep_b]
+
+    def test_logs_one_debug_line_per_drop(self, caplog):
+        caplog.set_level(logging.DEBUG, logger='fused_memory.reconciliation.flag_dedup')
+        drops = [
+            self._flag('task_count_snapshot_mem0_written=1 but no temporal fact', task_id=str(i))
+            for i in range(2)
+        ]
+
+        flag_dedup.filter_snapshot_stat_edge_findings([*drops, self._flag('unrelated')])
+
+        lines = [
+            r for r in caplog.records
+            if r.levelno == logging.DEBUG
+            and 'filter_snapshot_stat_edge_findings' in r.getMessage()
+        ]
+        assert len(lines) == 2
+
+
 class TestAcknowledgeFlagMarkerLedger:
     """acknowledge_flag_marker(memory_service, ...) maps to
     memory_service.recon_ledger.mark_addressed — no Mem0 find_prior_memories
