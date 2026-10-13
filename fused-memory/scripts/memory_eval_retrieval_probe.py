@@ -1078,8 +1078,20 @@ def run_derive_registry(
         for line in Path(calibration_path).read_text(encoding='utf-8').splitlines()
         if line.strip()
     ]
-    census = json.loads(Path(census_path).read_text(encoding='utf-8'))
-    result = derive_registry_candidates(rows, census, guard_clusters)
+    census_text = Path(census_path).read_text(encoding='utf-8')
+    try:
+        census = json.loads(census_text)
+    except ValueError as exc:
+        raise CensusShapeError(
+            f'the census at {census_path} is not decodable JSON: {exc}'
+        ) from exc
+    try:
+        result = derive_registry_candidates(rows, census, guard_clusters)
+    except CensusShapeError as exc:
+        raise CensusShapeError(
+            f'the census at {census_path} has no usable topic table for '
+            f'--derive-registry: {exc}'
+        ) from exc
     payload = result.as_registry_payload()
     payload['_disclosures'] = result.disclosures
     return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + '\n'
@@ -3170,7 +3182,8 @@ Agrees with ``shared.cli_boundary.EXIT_STDOUT_FAILED``.
 
 EXIT_BAD_INPUT = 2
 """Nothing can be measured until the input is fixed: the registry did not load,
-or ``--project-id`` selected nothing."""
+``--project-id`` selected nothing, or ``--derive-registry``'s census is
+undecodable or carries no usable topic table."""
 
 
 def corpus_categories() -> tuple[str, ...]:
@@ -3486,7 +3499,9 @@ def build_parser() -> LoudArgumentParser:
         help=(
             'Metadata census JSON, read for the tripwire split by canonical '
             'presence and by --derive-registry. An unreadable census is named '
-            f'in the report, never fatal to a probe run (default: {DEFAULT_CENSUS_PATH})'
+            'in the report, never fatal to a probe run; --derive-registry '
+            'refuses a census with no usable topic table (exit 2) '
+            f'(default: {DEFAULT_CENSUS_PATH})'
         ),
     )
     parser.add_argument(
@@ -3569,7 +3584,7 @@ def main(argv: list[str] | None = None) -> int:
             registry = load_topic_registry(args.registry)
             outcome = asyncio.run(_probe(args, registry))
             text = outcome.report
-    except (RegistryError, EmptySelectionError) as exc:
+    except (RegistryError, EmptySelectionError, CensusShapeError) as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_BAD_INPUT
     except ProbeRunError as exc:
