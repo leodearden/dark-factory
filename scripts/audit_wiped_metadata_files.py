@@ -216,10 +216,11 @@ CLEAN_MERGE_SHA = "clean_merge_sha"
 # No merge_finalized at all. UNKNOWN, not clean: found_on_main recovery and
 # eval mode both reach DONE without emitting one.
 NO_MERGE_EVENT = "no_merge_event"
-# The project has no runs.db, so its merge history is unread — UNKNOWN, and
+# The project's runs.db was not read, so its merge history is UNKNOWN —
 # distinct from NO_MERGE_EVENT, which asserts a READ log holds no
-# merge_finalized for the task.
-EVENT_LOG_ABSENT = "event_log_absent"
+# merge_finalized for the task. census_tagger_debris labels its records with
+# the same value when it could not read the log.
+EVENT_LOG_UNREAD = "event_log_unread"
 
 # merge_finalized states that mean the workflow PROCEEDED TO DONE. A null sha
 # on one of these is the wipe; a null sha on any other state (blocked,
@@ -239,8 +240,8 @@ def classify_wipe_signature(merge_finalized_payloads: list) -> str:
     :data:`NO_SUCCESSFUL_MERGE_SHA`, :data:`CONTRADICTED_REAL_MERGE_SHA`,
     :data:`CLEAN_MERGE_SHA`, or :data:`NO_MERGE_EVENT`. See the block comment
     above for the live-DB measurement that justifies the state-aware rule.
-    :data:`EVENT_LOG_ABSENT` is assigned by :func:`audit_project`, never
-    returned here.
+    :data:`EVENT_LOG_UNREAD` is assigned by the readers that could not read
+    the log, never returned here.
 
     Null-sha and real-sha observations are tracked SEPARATELY so a history
     that only ever carried real shas is labelled :data:`CLEAN_MERGE_SHA`
@@ -549,8 +550,8 @@ class AuditCoverage(NamedTuple):
     partition ``total_tasks`` exactly:
     ``file_level + lock_level_only + without_plan_signal == total_tasks``.
 
-    ``event_log_present`` says whether the runs.db was there to read: when it
-    is False no merge history was seen, so no wipe signature was proven.
+    ``event_log_read`` says whether the runs.db was read: when it is False no
+    merge history was seen, so no wipe signature was proven.
     """
 
     project_root: str
@@ -559,7 +560,7 @@ class AuditCoverage(NamedTuple):
     tasks_with_lock_level_signal_only: int
     tasks_without_plan_signal: int
     plan_records_without_task: int
-    event_log_present: bool
+    event_log_read: bool
 
 
 class ProjectAudit(NamedTuple):
@@ -586,7 +587,7 @@ def _candidate_sort_key(candidate: WipeCandidate) -> tuple[str, int, str]:
 def _read_event_log(
     runs_db: Path,
 ) -> tuple[bool, dict[str, PlanFilesRecord], dict[str, list[dict]]]:
-    """Return (present, plan records, merge signatures) read from *runs_db*.
+    """Return (read, plan records, merge signatures) from *runs_db*.
 
     An absent log yields ``(False, {}, {})``: the caller must not read the
     empty maps as "no events", only as "nothing was read".
@@ -610,14 +611,14 @@ def audit_project(project_root: str) -> ProjectAudit:
     population was invisible.
 
     A missing runs.db is tolerated rather than aborting the audit: the
-    coverage records the event log as absent and every signature is
-    :data:`EVENT_LOG_ABSENT`, never a :data:`NO_MERGE_EVENT` claimed of a log
+    coverage records the event log as unread and every signature is
+    :data:`EVENT_LOG_UNREAD`, never a :data:`NO_MERGE_EVENT` claimed of a log
     nobody read.
     """
     task_records = load_task_records(str(tasks_db_path(project_root)))
 
     disk_records = load_plan_files_from_disk(str(worktree_base_path(project_root)))
-    event_log_present, event_records, merge_signatures = _read_event_log(
+    event_log_read, event_records, merge_signatures = _read_event_log(
         runs_db_path(project_root)
     )
     plan_records = merge_plan_file_sources(disk_records, event_records)
@@ -666,8 +667,8 @@ def audit_project(project_root: str) -> ProjectAudit:
                     plan_files_fidelity=plan.fidelity,
                     wipe_signature=(
                         classify_wipe_signature(merge_signatures.get(task_id, []))
-                        if event_log_present
-                        else EVENT_LOG_ABSENT
+                        if event_log_read
+                        else EVENT_LOG_UNREAD
                     ),
                 )
             )
@@ -680,7 +681,7 @@ def audit_project(project_root: str) -> ProjectAudit:
         tasks_with_lock_level_signal_only=lock_level_only,
         tasks_without_plan_signal=len(task_records) - file_level - lock_level_only,
         plan_records_without_task=len(plan_records) - len(matched_plan_ids),
-        event_log_present=event_log_present,
+        event_log_read=event_log_read,
     )
     return ProjectAudit(
         project_root=project_root, candidates=candidates, coverage=coverage
@@ -746,11 +747,11 @@ def _format_coverage(coverage: AuditCoverage) -> list[str]:
 
 
 def _event_log_row(coverage: AuditCoverage) -> str:
-    if coverage.event_log_present:
+    if coverage.event_log_read:
         return "present"
     return (
         f"ABSENT at {runs_db_path(coverage.project_root)} — wipe signatures "
-        f"unknown ({EVENT_LOG_ABSENT})"
+        f"unknown ({EVENT_LOG_UNREAD})"
     )
 
 

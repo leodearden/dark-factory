@@ -96,8 +96,8 @@ from _task_db_scan import (
 # ``from audit_wiped_metadata_files import`` block.
 from audit_wiped_metadata_files import (
     _EVENT_PLAN_SOURCES,
+    EVENT_LOG_UNREAD,
     FIDELITY_LOCK_LEVEL,
-    NO_MERGE_EVENT,
     _coerce_file_list,
     _decode_files,
     classify_wipe_signature,
@@ -312,8 +312,10 @@ class CensusRecord(NamedTuple):
     over this task's ``merge_finalized`` history — a second, independently
     derived piece of evidence in a vocabulary DF 3113 P4a and DF 3427 already
     consume, so they can join this artifact to their existing candidate sets
-    without a translation layer. It is deliberately NOT the same field as
-    ``wipe_signature``, which is this census's own axis-3 label.
+    without a translation layer. When the event log could not be read it is
+    the audit's ``EVENT_LOG_UNREAD``, never a verdict over a log nobody read.
+    It is deliberately NOT the same field as ``wipe_signature``, which is this
+    census's own axis-3 label.
     """
 
     project_id: str
@@ -759,7 +761,7 @@ def census_project(project_root: str) -> ProjectCensus:
 
     A missing or unreadable runs.db is TOLERATED but never hidden: every record
     still appears, degraded to NEVER_RECONCILED / NO_PRIOR_SCOPE /
-    NO_MERGE_EVENT, and ``coverage.event_log_read`` goes False so a consumer
+    EVENT_LOG_UNREAD, and ``coverage.event_log_read`` goes False so a consumer
     can see the axes were unknown rather than measured clean.
 
     A tasks.db error PROPAGATES — any of
@@ -831,9 +833,9 @@ def census_project(project_root: str) -> ProjectCensus:
                 metadata_files=record.metadata_files,
                 metadata_files_match_prior_plan=verdict.metadata_files_match_prior_plan,
                 merge_signature=(
-                    classify_wipe_signature(merge_signatures[str(record.task_id)])
-                    if str(record.task_id) in merge_signatures
-                    else NO_MERGE_EVENT
+                    classify_wipe_signature(merge_signatures.get(str(record.task_id), []))
+                    if event_log_read
+                    else EVENT_LOG_UNREAD
                 ),
             )
         )

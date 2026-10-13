@@ -32,7 +32,7 @@ from audit_wiped_metadata_files import (
     CLEAN_MERGE_SHA,
     CONFIRMED_NULL_SHA_DONE_PATH,
     CONTRADICTED_REAL_MERGE_SHA,
-    EVENT_LOG_ABSENT,
+    EVENT_LOG_UNREAD,
     FIDELITY_FILE_LEVEL,
     FIDELITY_LOCK_LEVEL,
     NO_MERGE_EVENT,
@@ -1063,12 +1063,12 @@ def test_audit_project_coverage_tiers_partition_tasks_even_across_tags(tmp_path,
     ] == [("master", 42)]
 
 
-def test_audit_project_without_a_runs_db_records_the_event_log_absent(tmp_path, make_tasks_db):
+def test_audit_project_without_a_runs_db_records_the_event_log_unread(tmp_path, make_tasks_db):
     """A project with no runs.db still audits, but claims nothing about merges.
 
     NO_MERGE_EVENT asserts a READ log holds no merge_finalized for the task;
     with no log there was nothing to read, so every signature is
-    EVENT_LOG_ABSENT and the coverage says the log was absent (INV-13).
+    EVENT_LOG_UNREAD and the coverage says the log was not read (INV-13).
     """
     root = _make_project(
         tmp_path, make_tasks_db,
@@ -1082,8 +1082,8 @@ def test_audit_project_without_a_runs_db_records_the_event_log_absent(tmp_path, 
 
     audit = audit_project(str(root))
 
-    assert audit.coverage.event_log_present is False
-    assert [c.wipe_signature for c in audit.candidates] == [EVENT_LOG_ABSENT, EVENT_LOG_ABSENT]
+    assert audit.coverage.event_log_read is False
+    assert [c.wipe_signature for c in audit.candidates] == [EVENT_LOG_UNREAD, EVENT_LOG_UNREAD]
 
 
 def test_audit_project_with_a_runs_db_lacking_the_tasks_merge_reports_no_merge_event(
@@ -1097,7 +1097,7 @@ def test_audit_project_with_a_runs_db_lacking_the_tasks_merge_reports_no_merge_e
 
     audit = audit_project(str(root))
 
-    assert audit.coverage.event_log_present is True
+    assert audit.coverage.event_log_read is True
     assert [c.wipe_signature for c in audit.candidates] == [NO_MERGE_EVENT]
 
 
@@ -1141,7 +1141,7 @@ def _coverage(root="/tmp/proj", **overrides):
         "tasks_with_lock_level_signal_only": 400,
         "tasks_without_plan_signal": 2049,
         "plan_records_without_task": 2,
-        "event_log_present": True,
+        "event_log_read": True,
     }
     fields.update(overrides)
     return AuditCoverage(**fields)
@@ -1237,13 +1237,13 @@ def test_format_report_renders_every_coverage_line_verbatim():
 
 
 def test_format_report_renders_an_absent_event_log_row_verbatim():
-    report = format_report([_audit([], event_log_present=False)])
+    report = format_report([_audit([], event_log_read=False)])
     lines = report.splitlines()
 
     start = lines.index("    plan records with no such task:     2")
     assert lines[start + 1] == (
         "    event log (runs.db):                ABSENT at /tmp/proj/data/orchestrator/runs.db"
-        " — wipe signatures unknown (event_log_absent)"
+        " — wipe signatures unknown (event_log_unread)"
     )
 
 
@@ -1574,12 +1574,12 @@ def test_main_audits_a_project_whose_runs_db_is_missing(tmp_path, make_tasks_db)
 
     assert as_json.returncode == 1
     project = json.loads(as_json.stdout)["projects"][0]
-    assert project["coverage"]["event_log_present"] is False
-    assert project["candidates"][0]["wipe_signature"] == "event_log_absent"
+    assert project["coverage"]["event_log_read"] is False
+    assert project["candidates"][0]["wipe_signature"] == "event_log_unread"
     assert as_text.returncode == 1
     assert (
         f"    {'event log (runs.db):':<36}ABSENT at {project_layout.runs_db(root)}"
-        " — wipe signatures unknown (event_log_absent)"
+        " — wipe signatures unknown (event_log_unread)"
     ) in as_text.stdout.splitlines()
     assert "no_merge_event" not in as_text.stdout
 
