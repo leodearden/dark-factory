@@ -27,7 +27,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Literal
@@ -71,39 +71,58 @@ class TaskVerifySpec:
     tip_sha: str
 
     def __post_init__(self) -> None:
-        if not (
-            isinstance(self.verify_commands, tuple)
-            and all(isinstance(vc, VerifyCommand) for vc in self.verify_commands)
-        ):
-            raise TypeError(
-                f'TaskVerifySpec.verify_commands must be a tuple of VerifyCommand, '
-                f'got {self.verify_commands!r}'
-            )
-        if not (
-            self.global_verify_command is None
-            or isinstance(self.global_verify_command, VerifyCommand)
-        ):
-            raise TypeError(
-                f'TaskVerifySpec.global_verify_command must be a VerifyCommand or None, '
-                f'got {self.global_verify_command!r}'
-            )
-        if not (
-            isinstance(self.task_files, tuple)
-            and all(isinstance(path, str) for path in self.task_files)
-        ):
-            raise TypeError(
-                f'TaskVerifySpec.task_files must be a tuple of str, got {self.task_files!r}'
-            )
-        if isinstance(self.attempt_id, bool) or not isinstance(self.attempt_id, int):
-            raise TypeError(
-                f'TaskVerifySpec.attempt_id must be an int, got {self.attempt_id!r}'
-            )
-        if not (isinstance(self.tip_sha, str) and _FULL_SHA.fullmatch(self.tip_sha)):
+        _require('verify_commands', self.verify_commands,
+                 _is_tuple_of(VerifyCommand), 'a tuple of VerifyCommand')
+        _require('global_verify_command', self.global_verify_command,
+                 _is_optional_command, 'a VerifyCommand or None')
+        _require('task_files', self.task_files, _is_tuple_of(str), 'a tuple of str')
+        _require('force_workspace', self.force_workspace, _is_bool, 'a bool')
+        _require('verify_env', self.verify_env, _is_str_mapping, 'a mapping of str to str')
+        _require('scope_cargo', self.scope_cargo, _is_bool, 'a bool')
+        _require('verify_cold_preprovision_command', self.verify_cold_preprovision_command,
+                 _is_str, 'a str')
+        _require('attempt_id', self.attempt_id, _is_int, 'an int')
+        _require('task_id', self.task_id, _is_str, 'a str')
+        _require('tip_sha', self.tip_sha, _is_str, 'a str')
+        if not _FULL_SHA.fullmatch(self.tip_sha):
             raise ValueError(
                 f'TaskVerifySpec.tip_sha must be a full 40-hex lowercase SHA, '
                 f'got {self.tip_sha!r}'
             )
         object.__setattr__(self, 'verify_env', MappingProxyType(dict(self.verify_env)))
+
+
+def _require(field: str, value: object, holds: Callable[[object], bool], expected: str) -> None:
+    if not holds(value):
+        raise TypeError(f'TaskVerifySpec.{field} must be {expected}, got {value!r}')
+
+
+def _is_bool(value: object) -> bool:
+    return isinstance(value, bool)
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_str(value: object) -> bool:
+    return isinstance(value, str)
+
+
+def _is_optional_command(value: object) -> bool:
+    return value is None or isinstance(value, VerifyCommand)
+
+
+def _is_str_mapping(value: object) -> bool:
+    return isinstance(value, Mapping) and all(
+        isinstance(key, str) and isinstance(item, str) for key, item in value.items()
+    )
+
+
+def _is_tuple_of(kind: type) -> Callable[[object], bool]:
+    def holds(value: object) -> bool:
+        return isinstance(value, tuple) and all(isinstance(item, kind) for item in value)
+    return holds
 
 
 @dataclass(frozen=True)
@@ -216,8 +235,9 @@ def _command_from_dict(d: dict) -> VerifyCommand:
 def spec_from_dict(d: dict) -> TaskVerifySpec:
     """Decode strictly: unknown or missing keys, at top level or in any command, are a TypeError.
 
-    Arrays become tuples only when they ARE arrays, so any other wire value
-    reaches ``__post_init__`` unchanged and is rejected there by field name.
+    Arrays become tuples only when they ARE arrays, so every other top-level
+    wire value reaches ``__post_init__`` unchanged and is type-checked there,
+    a mismatch raising a TypeError that names the field.
     """
     require_exact_keys(d, _FIELD_NAMES, 'TaskVerifySpec')
     commands = d['verify_commands']

@@ -62,8 +62,8 @@ def _host_config(tmp_path: Path, **overrides) -> OrchestratorConfig:
 
 
 class TestShape:
-    def test_fields_are_exactly_the_contract(self):
-        assert tuple(f.name for f in dataclasses.fields(TaskVerifySpec)) == (
+    def test_wire_keys_are_exactly_the_contract(self):
+        assert set(spec_to_dict(_spec())) == {
             'verify_commands',
             'global_verify_command',
             'task_files',
@@ -74,7 +74,7 @@ class TestShape:
             'attempt_id',
             'task_id',
             'tip_sha',
-        )
+        }
 
     def test_is_frozen(self):
         spec = _spec()
@@ -156,6 +156,22 @@ class TestCodec:
     def test_json_list_document_is_a_type_error(self):
         with pytest.raises(TypeError):
             task_spec_from_json(json.dumps([1, 2]))
+
+    @pytest.mark.parametrize(('field', 'wire_value'), [
+        ('force_workspace', 1),
+        ('scope_cargo', 'false'),
+        ('verify_env', {'A': 1}),
+        ('verify_env', None),
+        ('verify_cold_preprovision_command', None),
+        ('attempt_id', '3'),
+        ('task_id', 6667),
+        ('tip_sha', None),
+    ])
+    def test_mistyped_field_is_rejected_naming_it(self, field: str, wire_value: object):
+        document = {**spec_to_dict(_spec()), field: wire_value}
+
+        with pytest.raises(TypeError, match=f'TaskVerifySpec.{field} must be'):
+            spec_from_dict(document)
 
 
 class TestBuild:
