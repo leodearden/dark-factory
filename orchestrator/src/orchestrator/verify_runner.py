@@ -94,6 +94,7 @@ __all__ = [
     "LocalRunner",
     "RemoteRunner",
     "RemoteVerifySubcommand",
+    "REMOTE_VERIFY_PROCESS_PATTERN",
     "RunnerUnavailable",
     "RunnerUnavailableKind",
     "ConcurrentDispatchError",
@@ -1130,6 +1131,8 @@ def resolve_local_df_checkout(start: Path | None = None) -> Path | None:
 
 
 RemoteVerifySubcommand = Literal['verify-merge', 'verify-task']
+# The single home of the remote verify process pattern; β's verify_cancel reuses it.
+REMOTE_VERIFY_PROCESS_PATTERN: str = '|'.join(get_args(RemoteVerifySubcommand))
 
 
 @dataclass(frozen=True)
@@ -2024,9 +2027,10 @@ class RemoteRunner:
             return 1  # non-zero → caller treats as cancel failure
 
     async def probe_clean(self) -> bool:
-        """Probe whether any verify-merge is still running on the remote host.
+        """Probe whether any remote verify (any RemoteVerifySubcommand) is still running.
 
-        Issues: ssh <_SSH_BASE_OPTS> <host> pgrep -f verify-merge
+        Issues: ssh <_SSH_BASE_OPTS> <host> pgrep -f 'verify-merge|verify-task'
+        (REMOTE_VERIFY_PROCESS_PATTERN, quoted: '|' is a remote-shell metacharacter)
 
         Returns:
             True  — rc == 1 (pgrep found no match; host is clean)
@@ -2035,7 +2039,10 @@ class RemoteRunner:
         """
         try:
             rc, _, _ = await self._run(
-                ['ssh', *_SSH_BASE_OPTS, self._ssh_host, 'pgrep -f verify-merge']
+                [
+                    'ssh', *_SSH_BASE_OPTS, self._ssh_host,
+                    f'pgrep -f {shlex.quote(REMOTE_VERIFY_PROCESS_PATTERN)}',
+                ]
             )
             return rc == 1
         except Exception:
