@@ -708,7 +708,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
   entirely** and go straight to **step 9** (cleanup). This is a **success** path, not an abort.
 
   **Signal (a) alone must never break the loop.** Signal (a)-landed next to a non-`done` signal (b)
-  is exactly rule 2b's veto: keep polling to `terminal_resumed`'s 20-minute ceiling, and only then
+  is exactly rule 2v's veto (both arms): keep polling to `terminal_resumed`'s 20-minute ceiling, and only then
   take the **landed-but-not-credited** exit stated there — citing the tip merge sha, the
   `git cherry` output and the current status; never "not landed", never resubmit, never self-stamp.
   Breaking out on signal (a) alone would fall through to step 8's
@@ -774,14 +774,14 @@ The merge procedure is iterative — don't assume one pass will be enough:
     for every absorbed member once the train lands
     (`orchestrator/src/orchestrator/harness.py::mark_member_done`).
   - **Under rc=128-with-empty-marker** → [`skills/merge-queue/SKILL.md`](../merge-queue/SKILL.md)'s
-    **rule 2a** governs; follow it there rather than from here.
+    **rule 2a** governs (with the shared **rule 2v** veto); follow it there rather than from here.
   - **Under rc=1 on the `coalesce-*` arm** → [`skills/merge-queue/SKILL.md`](../merge-queue/SKILL.md)'s
-    **rule 2b** governs; follow it there rather than from here. The verdict, so you know which way
+    **rule 2b** governs (with the shared **rule 2v** veto); follow it there rather than from here. The verdict, so you know which way
     the arm points before you go: rc=1 is **not** a not-landed outcome here, signal (b) is a **veto,
-    not a corroborator**, and **there is no self-stamp on this arm**. Read rule 2b there for the
+    not a corroborator**, and **there is no self-stamp on this arm**. Read rule 2v there for the
     argument — which exit each scheduler status yields, its **landed-but-not-credited** report, and
-    the `git cherry main task/<TASK_ID>` content proof including why that proof cannot discharge the
-    veto — rather than restating it.
+    why a content proof cannot discharge the veto — and rule 2b for the
+    `git cherry main task/<TASK_ID>` content proof itself, rather than restating it.
   - **`get_merge_queue()` no longer showing the train is NOT a landing signal.** It means only
     "stop waiting on the train," and is equally consistent with a **derail**: on any non-`done`
     train outcome the orchestrator re-pends the still-unlanded members for solo re-merge
