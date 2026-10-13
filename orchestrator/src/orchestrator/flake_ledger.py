@@ -740,25 +740,16 @@ NEVER_WIDEN_A_TIMEOUT = (
     'and structural asserts (assert on state, not on log/prose output).'
 )
 
-# §5.9's invariant names TWO responsibilities, and both belong to the SAME task.  Split
-# into two constants so each is asserted on its own.  The second is NOT an action the
-# agent performs: the ledger closes the debt cycle itself, by observing this task live
-# 'done' with its merge commit recorded (``resolve_debt`` reads that from the task; it
-# never takes a commit from a caller).  The agent cannot write the ledger -- the
-# implementer sandbox excludes ``data/orchestrator/`` -- and its own task is not 'done'
-# while it runs.  What the agent owes is a fix that leaves the test's pytest node-id
-# byte-identical, because ``flake_debt.test_id`` is the row's primary key: a rename,
-# parametrize or class move orphans the row and hides a recurrence.  When the ledger
-# next observes the test (``open_debt``) or its periodic sweep runs, the row closes.
+# Rationale: plans/flake-ledger-prd.md §5.9 ("Removing the test from the ledger").
 RESPONSIBILITY_FIX_ROOT_DEFECT = (
     'You are responsible for finding and fixing the ROOT DEFECT behind this observation'
 )
 RESPONSIBILITY_REMOVE_FROM_LEDGER = (
     'You do NOT write to the flake ledger, and must not ask anyone to: the ledger '
-    'closes this debt cycle itself once it observes this task done with its merge '
-    'commit recorded. Your part is to keep the test\'s pytest node-id byte-identical '
-    '(no rename, no parametrize, no move into a class), because the ledger keys its '
-    'debt row on that id and a changed id orphans the row and hides a recurrence'
+    'closes this debt cycle itself once it observes this task done. Your part is to '
+    'keep the test\'s pytest node-id byte-identical (no rename, no parametrize, no '
+    'move into a class), because the ledger keys its debt row on that id and a '
+    'changed id orphans the row and hides a recurrence'
 )
 
 
