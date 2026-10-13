@@ -178,6 +178,47 @@ class TestTheSeededLiveEdge:
         assert answer.usage is None
 
 
+class TestTheRecordedElisionFollowsTheWidth:
+    """`--field-chars` reaches each case's recorded flags, and they match the prompt sent."""
+
+    @staticmethod
+    def _first_case() -> tuple[dict, list]:
+        plan = TestTheSeededLiveEdge._plan()
+        return plan.cases[0], _resolved(plan, 0)
+
+    @staticmethod
+    def _ask(case: dict, slate: list, width: int) -> tuple:
+        """The recorded answer at *width*, and the user prompt the provider was sent."""
+        config = _judge_config()
+        _mod().apply_field_chars(config, width)
+        client = _openai('amends')
+        with patch('openai.AsyncOpenAI', return_value=client):
+            answer = _mod().build_judge_fn(config)(case, slate)
+        return answer, client.responses.create.await_args.kwargs['input']
+
+    def test_a_narrow_width_records_every_field_elided(self) -> None:
+        case, slate = self._first_case()
+        answer, _ = self._ask(case, slate, 5)
+        assert answer.entry_elided is True
+        assert answer.candidates_elided == dict.fromkeys(case['candidates'], True)
+
+    def test_zero_records_nothing_elided(self) -> None:
+        case, slate = self._first_case()
+        answer, _ = self._ask(case, slate, 0)
+        assert answer.entry_elided is False
+        assert answer.candidates_elided == dict.fromkeys(case['candidates'], False)
+
+    def test_the_recorded_flags_agree_with_the_prompt_sent(self) -> None:
+        case, slate = self._first_case()
+        width = min(len(record['content']) for record in slate)
+        answer, prompt = self._ask(case, slate, width)
+        assert set(answer.candidates_elided.values()) == {True, False}
+        assert answer.entry_elided == (case['content'] not in prompt)
+        assert answer.candidates_elided == {
+            record['memory_id']: record['content'] not in prompt for record in slate
+        }
+
+
 def _deterministic_answer(system: str, user: str) -> str:
     """One verdict per (system, user) text pair, so any wire difference changes a verdict."""
     digest = hashlib.sha256(f'{system}\x00{user}'.encode()).digest()
