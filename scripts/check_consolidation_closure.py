@@ -38,8 +38,10 @@ alone):
               the seam would refuse the ``done`` transition with.
   - exit 2  — COULD NOT CHECK (usage or infra). Bad arguments, no such
               task, an unreadable ``tasks.db``, a task that is not a
-              consolidation gate, a gate block with no usable ``topic``, or
-              a store that did not answer.
+              consolidation gate, a gate block with no usable ``topic``, a
+              project root that names no directory or no
+              ``--project-root`` outside any checkout, or a store that did
+              not answer.
 
 Exit 2 is a SEPARATE code on purpose. An unreachable Qdrant and a
 genuinely malformed cluster are different facts and must not share an exit
@@ -100,7 +102,7 @@ from fused_memory.reconciliation.consolidation_gate import (
     resolve_unstamped_live_ids,
 )
 from shared.project_id import project_id_for_root
-from shared.project_layout import default_project_root
+from shared.project_layout import CheckoutRootError, default_project_root
 
 #: "I could not run the check." Distinct from EXIT_NOT_CLOSED by design —
 #: see the EXIT-CODE CONTRACT above.
@@ -325,11 +327,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _project_root(args: argparse.Namespace) -> str:
-    return args.project_root if args.project_root is not None else str(default_project_root())
+    if args.project_root is not None:
+        return str(Path(args.project_root).resolve())
+    try:
+        return str(default_project_root())
+    except CheckoutRootError as exc:
+        raise UsageError(f"no --project-root given and {exc}") from exc
 
 
 def _project_id(args: argparse.Namespace) -> str:
-    return args.project_id if args.project_id is not None else project_id_for_root(_project_root(args))
+    if args.project_id is not None:
+        return args.project_id
+    try:
+        return project_id_for_root(_project_root(args))
+    except ValueError as exc:
+        raise UsageError(f"{exc}, or pass --project-id") from exc
 
 
 def _emit(payload: dict, *, as_json: bool, human: str) -> None:
@@ -347,14 +359,8 @@ async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
         else:
             raw_metadata = args.metadata_json
         block = extract_gate_block(raw_metadata)
-    except UsageError as exc:
-        _emit(
-            {"checked": False, "exit_code": EXIT_USAGE, "error": str(exc)},
-            as_json=args.as_json,
-            human=f"COULD NOT CHECK: {exc}",
-        )
-        return EXIT_USAGE
-    except OSError as exc:
+        project_id = _project_id(args)
+    except (UsageError, OSError) as exc:
         _emit(
             {"checked": False, "exit_code": EXIT_USAGE, "error": str(exc)},
             as_json=args.as_json,
@@ -363,7 +369,6 @@ async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
         return EXIT_USAGE
 
     topic = block["topic"]
-    project_id = _project_id(args)
     if memory is None:
         memory = build_memory_service()
 
