@@ -2424,6 +2424,11 @@ class Scheduler:
         # reset-on-success cannot leak. Bumped by _note_fm_read_failure,
         # zeroed by _reset_fm_read_failure_streak on any successful read.
         self._fm_read_failure_streak: int = 0
+        # Consecutive ticks scored on the legacy formula because anchor
+        # coverage was below the arming threshold (task 3819, PRD D12).
+        # Bumped and zeroed only by _note_anchor_coverage; an idle tick never
+        # scores, so it leaves the streak alone.
+        self._anchor_coverage_low_streak: int = 0
         # --- Startup gate (task 2235, W10-α) ---
         # False until finish_startup() is called.  acquire_next() asserts
         # this — a runtime check for the "startup reconcile sweeps run
@@ -7897,6 +7902,33 @@ class Scheduler:
             task_id=pin.task_id, task=pin.task, modules=modules
         ))
 
+    def _note_anchor_coverage(self, covered: int, total: int) -> bool:
+        """Decide whether this tick is armed for C2, and record an unarmed one.
+
+        The coverage only chooses WHICH formula runs; it is never a score term
+        (PRD I-5).  An unarmed tick extends the streak and emits
+        ``scoring_anchor_coverage_low``; an armed tick ends the streak.
+        """
+        coverage = covered / total
+        threshold = self.config.scoring.new_scoring_min_anchor_coverage
+        if coverage >= threshold:
+            self._anchor_coverage_low_streak = 0
+            return True
+        self._anchor_coverage_low_streak += 1
+        if self.event_store:
+            self.event_store.emit(
+                EventType.scoring_anchor_coverage_low,
+                task_id=None,
+                data={
+                    'coverage': coverage,
+                    'threshold': threshold,
+                    'candidates': total,
+                    'with_anchor': covered,
+                    'consecutive_ticks': self._anchor_coverage_low_streak,
+                },
+            )
+        return False
+
     def _score_candidates(self, ctx: TickContext) -> list[tuple[float, str, dict, str]]:
         """Score every candidate of the tick, best first, as ``(score, task_id, task, tier)``.
 
@@ -7911,8 +7943,7 @@ class Scheduler:
         """
         now = self._wall_now()
         readings = [read_pending_age(t, now) for t in ctx.candidates]
-        coverage = sum(r.covered for r in readings) / len(ctx.candidates)
-        armed = coverage >= self.config.scoring.new_scoring_min_anchor_coverage
+        armed = self._note_anchor_coverage(sum(r.covered for r in readings), len(ctx.candidates))
 
         scored: list[tuple[float, str, dict, str]] = []
         for t, reading in zip(ctx.candidates, readings, strict=True):
