@@ -189,16 +189,10 @@ lease held by recon-watcher-df-1348600 (pid 1348600 is not running, but its hear
 A fresh heartbeat means you **stand down** even when the pid reads as not running: staleness needs
 BOTH a dead pid AND a heartbeat past the TTL.
 
-**One watcher: the session's own (task 5885).** This skill runs exactly one watcher: the Main
-Loop's step-2 background task. The queue directory is the durable record and the drain is
-authoritative; the watcher is only a wake signal, so a detached re-arm loop whose fire journal no
-session reads adds nothing. The hand-written, never-tracked `~/.claude/recon-watch/loop.sh` was
-retired for that reason — do not recreate one. A watcher reaped by the harness takes step 3's
-`KILLED` path (see "The Main Loop" below). If a process probe still shows a
-`scripts/watcher-rearm.sh` on this queue under a `loop.sh` ancestor, it is that leftover. Its tree
-holds no `claude` process: it closes nothing, never touches the `recon-watcher-<project>` lease,
-and changes no lease verdict. Mention it to the human once and leave it running ("Process safety",
-under "Starting the watcher").
+**A leftover `loop.sh` never touches this lease (task 5885).** A `scripts/watcher-rearm.sh` tree
+under a `~/.claude/recon-watch/loop.sh` ancestor never claims, heartbeats or releases
+`recon-watcher-<project>`, so it changes no lease verdict; see "One watcher: the session's own"
+under "Starting the watcher".
 
 **Heartbeat + release.** Touch the lease every Main Loop cycle (see "Starting the watcher" below),
 and release it when the session ends. Both verbs act **only for the holder** — a mismatched slug is
@@ -464,6 +458,17 @@ either — it routes through the same wrapper-owned `--exclude-file`
 default path `<queue-dir>/.watcher-rearm-exclude-l2` there,
 `<queue-dir>/.watcher-rearm-exclude` here). `--exclude-file` — not
 `--baseline` — is what is actually consistent across both watcher skills.
+
+**One watcher: the session's own (task 5885).** This skill runs exactly one watcher: the Main
+Loop's step-2 background task. The queue directory is the durable record and the drain is
+authoritative; the watcher is only a wake signal, so a detached re-arm loop whose fire journal no
+session reads adds nothing. The hand-written, never-tracked `~/.claude/recon-watch/loop.sh` was
+retired for that reason — do not recreate one. A watcher the harness reaps needs no second watcher
+to cover it, because step 3 sees the reap: as `KILLED`, or, when only the python child caught a
+SIGTERM, as the exit-0-with-empty-stdout non-fire (both under
+"Distinguishing the exits at step 3"). If a process probe still shows a `scripts/watcher-rearm.sh`
+on this queue under a `loop.sh` ancestor, it is that leftover. Its tree holds no `claude` process and closes nothing. Mention it to
+the human once and leave it running, per the rule below.
 
 **Process safety:** only stop watcher processes you started via background task
 controls. Never `pkill` by pattern.
