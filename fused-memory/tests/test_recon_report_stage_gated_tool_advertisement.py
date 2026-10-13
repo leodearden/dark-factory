@@ -56,6 +56,12 @@ from fused_memory.reconciliation.prompts.stage2 import (
     build_stage2_system_prompt,
 )
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+from fused_memory.reconciliation.recon_self_model import (
+    ENTITY_STANDING_DECISIONS_HEADING,
+    INVESTIGATION_OUTCOME_RECORDS_HEADING,
+    render_entity_standing_decision_schema_section,
+    render_investigation_outcome_section,
+)
 from fused_memory.server.recon_report import (
     STAGE_GATED_REPORT_TOOLS,
     get_recon_report_tool_signatures,
@@ -362,37 +368,43 @@ class TestStageGatedToolBlocksAreWiredNotRePasted:
         )
 
     @pytest.mark.parametrize(
-        'heading',
-        ['## Entity Standing Decisions', '## Investigation Outcome Records'],
+        'heading,owning_renderer',
+        [
+            pytest.param(
+                ENTITY_STANDING_DECISIONS_HEADING,
+                render_entity_standing_decision_schema_section,
+                id='entity_standing_decisions',
+            ),
+            pytest.param(
+                INVESTIGATION_OUTCOME_RECORDS_HEADING,
+                render_investigation_outcome_section,
+                id='investigation_outcome_records',
+            ),
+        ],
     )
     def test_headings_the_standing_decision_section_points_at_precede_it_in_stage2(
-        self, heading
+        self, heading, owning_renderer
     ):
-        """render_entity_standing_decision_write_section() deliberately POINTS AT
-        these two sections instead of re-pasting them — the grounds enum lives in
-        the first (rendered by render_entity_standing_decision_schema_section())
-        and the arm-2 record pool in the second (render_investigation_outcome_section()),
-        and each is single-sourced there.
-
-        Cross-referencing a heading that does not exist in the target prompt is
-        a recorded hazard: STALE_KNOWLEDGE_ANNOTATION_NORM's comment carries two
-        such MUST-NOTs, both for headings that exist in one stage prompt and not
-        another. That block avoids the hazard by naming no heading at all; this
-        one accepts it (it is Stage-2-only, so both headings are reachable) and
-        pays for it with this guard.
-
-        The POSITIONAL half is the part that actually bites. The section says
-        "above" of both headings, so mere membership is not enough: reordering
-        the Stage-2 sections, or moving this section earlier, leaves a
-        membership-only guard green while the prompt sends the agent scrolling
-        the wrong way for the grounds enum. Asserting the order turns that into
-        a test failure at the moment of the reorder.
+        """render_entity_standing_decision_write_section() POINTS AT these two
+        sections by heading and says they are "above". All three legs read the one
+        exported constant: the owning renderer opens with it, the pointer section
+        names it, and in STAGE2_SYSTEM_PROMPT it precedes the pointer section.
         """
         from fused_memory.reconciliation.prompts import (
             render_entity_standing_decision_write_section,
         )
 
+        assert owning_renderer().startswith(heading + '\n'), (
+            f'{owning_renderer.__name__}() no longer opens with {heading!r}, the heading '
+            'constant exported beside it in recon_self_model.py. Emit the constant, do '
+            'not re-type the heading.'
+        )
         block = render_entity_standing_decision_write_section()
+        assert heading in block, (
+            f'render_entity_standing_decision_write_section() no longer names {heading!r}, '
+            'so its "above" pointer aims at a heading no renderer emits. Interpolate the '
+            'recon_self_model.py constant rather than re-typing the heading.'
+        )
         assert heading in STAGE2_SYSTEM_PROMPT, (
             f'render_entity_standing_decision_write_section() points the agent at '
             f'{heading!r}, but no such heading is in STAGE2_SYSTEM_PROMPT. Either the '
