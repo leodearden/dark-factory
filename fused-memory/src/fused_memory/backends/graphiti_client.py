@@ -713,13 +713,11 @@ _EDGES_IN_VALID_AT_WINDOW_PAGE_TEMPLATE = (
 _EDGES_IN_VALID_AT_WINDOW_CENSUS = _EDGES_IN_VALID_AT_WINDOW_MATCH + 'RETURN count(*)'
 
 # Ids starting with a uuid prefix, for services/id_resolver.py (task 5323).
-# `$prefix`/`$upper` are bound, never interpolated. STARTS WITH alone is
-# planned as a full scan; the half-open range [$prefix, $upper) is what lets
-# FalkorDB serve it from the uuid RANGE index (measured on reify: ~110ms ->
-# ~2ms for edges), and STARTS WITH stays as the exact predicate. No
-# invalid_at filter: a superseded edge's uuid is still an id a prefix can
-# cite. The edge pattern is DIRECTED for the one-row-per-edge reason given
-# at _EMBEDDED_EDGES_MATCH.
+# `$prefix`/`$upper` are bound, never interpolated. The half-open range
+# [$prefix, $upper) lets FalkorDB use the uuid RANGE index; STARTS WITH stays
+# as the exact predicate. No invalid_at filter: a superseded edge's uuid is
+# still an id a prefix can cite. The edge pattern is DIRECTED for the
+# one-row-per-edge reason given at _EMBEDDED_EDGES_MATCH.
 _ENTITY_UUID_PREFIX_MATCH = (
     'MATCH (n:Entity) '
     'WHERE n.uuid >= $prefix AND n.uuid < $upper AND n.uuid STARTS WITH $prefix '
