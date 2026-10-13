@@ -747,7 +747,7 @@ class UsageGate:
     ``_account_resume_probe_loop`` has no such deadline and will keep
     re-probing indefinitely at the ``max_probe_interval_secs`` backoff
     ceiling — recovery then requires an operator token refresh + SIGHUP
-    (``_on_sighup_async`` force-resets every account to AVAILABLE). See
+    (``_on_sighup_async`` force-resets every CAPPED account to AVAILABLE). See
     PRD §7.3 (task W4-γ) for the full transition table.
     """
 
@@ -1024,10 +1024,10 @@ class UsageGate:
             acct.probe_count = 0
             acct.resets_at = None
             # Covers the AVAILABLE -> AVAILABLE self-loop the blocked-set
-            # block above cannot see (task 4512 review): SIGHUP discards every
-            # account's cap/auth evidence, so it must discard the spawn-fault
-            # evidence with it rather than stay latched on counts it has just
-            # invalidated.
+            # block above cannot see (task 4512 review): SIGHUP discards the
+            # cap/auth evidence of every account it resets, so it must discard
+            # the spawn-fault evidence with it rather than stay latched on
+            # counts it has just invalidated.
             self._reset_probe_spawn_failures(acct, reason='operator hard reset (SIGHUP)')
 
         # --- Centralized _open recompute (DD-5) ---------------------------
@@ -2157,7 +2157,8 @@ class UsageGate:
         Treats SIGHUP as an operator-driven "refresh everything" signal:
         - reload .env (override existing env vars)
         - refresh each account's token from its env var if it changed
-        - force every account to AVAILABLE so it is probe-worthy
+        - force every account except an AUTH_FAILED one to AVAILABLE; an
+          AUTH_FAILED account stays blocked until its probe confirms the token
         - reopen the global gate
         - fire a probe per account in parallel
 
@@ -2178,7 +2179,11 @@ class UsageGate:
             # centralized _open recompute. force=True is required because
             # CAPPED/AUTH_FAILED -> AVAILABLE is not a legal edge outside
             # this operator-driven hard reset.
-            self._transition(acct, AccountPhase.AVAILABLE, force=True)
+            #
+            # An AUTH_FAILED account is left to _reprobe_account, which
+            # un-blocks it only on a probe that ran and succeeded (task 5946).
+            if acct.phase != AccountPhase.AUTH_FAILED:
+                self._transition(acct, AccountPhase.AVAILABLE, force=True)
         self._paused_reason = ''
         logger.info(f'SIGHUP: reloaded {len(self._accounts)} account(s); firing probes')
         await asyncio.gather(
@@ -2331,9 +2336,10 @@ class UsageGate:
         # cadence (`_account_resume_probe_loop` / `_auth_reprobe_loop`), so
         # only they can ever produce the probe that zeroes the count again.
         #
-        # `_on_sighup_async` is the path that proved it: it force-resets EVERY
-        # account to AVAILABLE (which zeroes the counter via `_transition`)
-        # and only THEN fans out `_reprobe_account` over all of them. On a
+        # `_on_sighup_async` is the path that proved it: it force-resets every
+        # account except an AUTH_FAILED one to AVAILABLE (which zeroes the
+        # counter via `_transition`) and only THEN fans out `_reprobe_account`
+        # over all of them. On a
         # broken host that left every AVAILABLE account holding a count of 1
         # that nothing would ever clear — `_transition`'s reset fires on
         # LEAVING the blocked set, and AVAILABLE -> CAPPED is an ENTRY — so a
