@@ -297,6 +297,13 @@ status before it is trusted (INV-3) rather than assumed still-open from the stor
 filing.* The ledger never marks a task done, never blocks one, never reprioritises one. A de-flake
 task's lifecycle belongs to the orchestrator; the ledger only observes it.
 
+**"Removing the test from the ledger" is the ledger's act, not the agent's.** The de-flake task's
+text (`flake_ledger.py::RESPONSIBILITY_REMOVE_FROM_LEDGER`) tells the agent the ledger closes the cycle
+itself once it observes the task `done` with its merge commit recorded (`resolve_debt`, via
+`open_debt`'s lazy close at the next suppression of the same test, or the periodic sweep). The agent
+never writes to the ledger; its duty is to keep the test's pytest node-id byte-identical, since
+`flake_debt.test_id` is the primary key and a renamed test orphans the row and hides a recurrence.
+
 ### 5.10 Chronic 3-in-20 is retired as a gate, repurposed as severity
 
 The `threshold: 3` / `window: 20` numbers came **verbatim from reify's `run_all.sh`** and were never
