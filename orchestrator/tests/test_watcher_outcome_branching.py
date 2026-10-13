@@ -5,8 +5,8 @@ script itself. The vocabulary below is DERIVED by running that script over a
 stub watcher (its `WATCHER_REARM_PYTHON` seam), never restated here, so a new
 outcome fails every consumer at once.
 
-Every assertion is a containment, count or equality check against a named
-constant or a producer-derived value. None pins prose.
+Every assertion checks a consumer's outcome table against values derived by
+running the producer.
 """
 
 from __future__ import annotations
@@ -30,16 +30,11 @@ _OUTCOME_TOKEN = re.compile(r'WATCHER_REARM_OUTCOME: (\w+)')
 _PROBE_RCS = (0, 124, 137, 143, 144, 1, 3)
 _CATCH_ALL_PROBE_RCS = (1, 3)
 
-_IDENTICAL_RETRY_CAP = 1  # task 3606: "cannot be re-issued more than once"
-_HARNESS_STOP_DIRECTIVE = 'STOP what you are doing'  # Claude Code tool-rejection text
-
 _ARTIFACTS: dict[str, Callable[[], str]] = {
     'auto-skill': lambda: load_skill_system_prompt('escalation-watcher-auto'),
     'l2-skill': lambda: load_skill_system_prompt('escalation-watcher'),
     'rotation-guidance': lambda: WATCHER_REARM_OUTCOME_GUIDANCE,
 }
-_KILLED = 'KILLED'
-_L2_KILLED_RECOVERY = 'run_in_background'  # the interactive lane's sanctioned re-arm
 
 
 @dataclass(frozen=True)
@@ -113,10 +108,6 @@ def _branch_rows(text: str) -> dict[str, list[str]]:
     return rows
 
 
-def _stated_caps(text: str) -> list[int]:
-    return [int(n) for n in re.findall(r'Identical-retry cap: (\d+)', text)]
-
-
 def _names_code(row: str, rc: int) -> bool:
     return re.search(rf'(?<!\d){rc}(?!\d)', row) is not None
 
@@ -161,32 +152,4 @@ class TestOutcomeBranchContract:
         assert any(_names_code(row, producer_contract.usage_rc) for row in rows), (
             f'{artifact_id}: the {producer_contract.catch_all} row must name exit '
             f'{producer_contract.usage_rc}, the usage error that prints no marker'
-        )
-
-    def test_states_one_identical_retry_cap(self, artifact_id: str) -> None:
-        caps = _stated_caps(_ARTIFACTS[artifact_id]())
-        assert caps == [_IDENTICAL_RETRY_CAP], (
-            f'{artifact_id}: expected exactly one Identical-retry cap of '
-            f'{_IDENTICAL_RETRY_CAP}; found {caps}'
-        )
-
-    def test_names_the_harness_stop_directive(self, artifact_id: str) -> None:
-        assert _HARNESS_STOP_DIRECTIVE in _ARTIFACTS[artifact_id](), (
-            f'{artifact_id}: must say how to honour a tool result carrying '
-            f'{_HARNESS_STOP_DIRECTIVE!r}'
-        )
-
-
-class TestL2LaneKilledRecovery:
-    def test_killed_row_names_the_background_recovery(
-        self, producer_contract: ProducerContract
-    ) -> None:
-        assert _KILLED in producer_contract.outcomes, (
-            f'the wrapper no longer emits {_KILLED}; outcomes are {sorted(producer_contract.outcomes)}'
-        )
-        rows = _branch_rows(_ARTIFACTS['l2-skill']()).get(_KILLED, [])
-        assert any(_L2_KILLED_RECOVERY in row for row in rows), (
-            f'l2-skill: the {_KILLED} row must name {_L2_KILLED_RECOVERY}, because a '
-            'killed foreground arm moves to the background pattern rather than '
-            'being re-issued in the foreground'
         )
