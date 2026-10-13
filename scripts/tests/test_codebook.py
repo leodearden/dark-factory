@@ -2039,7 +2039,8 @@ def test_live_codebook_has_no_pending_twin_of_an_adjudicated_candidate():
 
 
 # ---------------------------------------------------------------------------
-# Shared machinery for the live-file guards below (tasks 4892, 5198, 5687).
+# Shared machinery for the live-file guards below (tasks 4892, 5198, 5687,
+# 5729).
 # Each asserts that a committed §7.3 coding record and the merger-owned
 # registry still agree; the comparison itself is single-sourced here, so each
 # guard states only what is distinctive about its own correction and a fix to
@@ -2057,9 +2058,68 @@ _SIGHTING_PAYLOAD_FIELDS = (
     "evidence_quote",
 )
 
+# What apply_coding_records copies from the record's header into every
+# sighting it appends (the session is how a sighting is found, so it is the
+# lookup key rather than a compared field).
+_SIGHTING_HEADER_FIELDS = ("date", "project")
+
 
 def _sightings_for(holder: dict, session: str) -> list[dict]:
     return [s for s in holder.get("sightings") or [] if s.get("session") == session]
+
+
+def _session_record(record_path: Path, session: str) -> dict:
+    """The one §7.3 coding record in JSONL *record_path* that carries
+    *session*, asserted valid."""
+    records = [
+        json.loads(line)
+        for line in record_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    mine = [r for r in records if r.get("session") == session]
+    assert len(mine) == 1, (
+        f"expected exactly one {session!r} record in {record_path}, found "
+        f"{len(mine)}; sessions present: "
+        f"{sorted({r.get('session') for r in records})}"
+    )
+    assert mod.validate_coding_record(mine[0]) == [], (
+        f"invalid §7.3 coding record for session {session!r}"
+    )
+    return mine[0]
+
+
+def _live_entry(codebook: dict, entry_id: str) -> dict:
+    entries = [e for e in codebook.get("entries") or [] if e.get("id") == entry_id]
+    assert len(entries) == 1, (
+        f"expected exactly one {entry_id!r} entry, found {len(entries)}"
+    )
+    return entries[0]
+
+
+def _assert_sighting_carries(record: dict, payload: dict, holder: dict) -> None:
+    """Assert *holder* carries exactly one sighting for *record*'s session,
+    and that it is what the sole writer appends for *payload*: the record's
+    header fields and the payload's fields, verbatim. This is the
+    in-place-rewrite detector for a committed sighting."""
+    session = record["session"]
+    carried = _sightings_for(holder, session)
+    assert len(carried) == 1, (
+        f"expected exactly one {session!r} sighting on {holder.get('id')!r}, "
+        f"found {len(carried)}"
+    )
+    expected = {field: record[field] for field in _SIGHTING_HEADER_FIELDS} | {
+        field: payload[field] for field in _SIGHTING_PAYLOAD_FIELDS if payload.get(field)
+    }
+    drift = {
+        field: (want, carried[0].get(field))
+        for field, want in expected.items()
+        if carried[0].get(field) != want
+    }
+    assert drift == {}, (
+        f"the {session!r} sighting on {holder.get('id')!r} no longer matches the "
+        "committed record — a committed sighting was rewritten in place "
+        f"{{field: (record, codebook)}}: {drift}"
+    )
 
 
 def _assert_correction_absorbed(
@@ -2091,7 +2151,7 @@ def _assert_correction_absorbed(
         session would be counted in `correction_skipped` with its field
         writes lost.
     (1) AGREEMENT — the entry's title/cause/status equal the record's, and one
-        sighting carries the record's payload field for field. This is the
+        sighting carries the record field for field. This is the
         in-place-rewrite detector for the merger-owned YAML, and it is what
         proves the correction's full text is carried verbatim — which is why
         no caller needs to pin cause or note prose.
@@ -2116,21 +2176,7 @@ def _assert_correction_absorbed(
     stays owned by `test_live_codebook_is_v2_and_validates_green`.
     """
     # (0) WELL-FORMED.
-    records = [
-        json.loads(line)
-        for line in record_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    mine = [r for r in records if r.get("session") == session]
-    assert len(mine) == 1, (
-        f"expected exactly one {session!r} record in {record_path}, found "
-        f"{len(mine)}; sessions present: "
-        f"{sorted({r.get('session') for r in records})}"
-    )
-    record = mine[0]
-    assert mod.validate_coding_record(record) == [], (
-        f"invalid §7.3 coding record for session {session!r}"
-    )
+    record = _session_record(record_path, session)
     corrections = record.get("corrections") or []
     assert len(corrections) == 1, (
         f"expected exactly one correction in the {session!r} record, got "
@@ -2142,9 +2188,7 @@ def _assert_correction_absorbed(
     assert correction.get("entry_id") == entry_id
 
     codebook = mod.load(_LIVE_CODEBOOK_PATH)
-    entries = [e for e in codebook.get("entries") or [] if e.get("id") == entry_id]
-    assert len(entries) == 1, f"expected exactly one {entry_id!r} entry"
-    entry = entries[0]
+    entry = _live_entry(codebook, entry_id)
 
     # (1) AGREEMENT — entry fields, then the provenance sighting.
     field_drift = {
@@ -2157,21 +2201,7 @@ def _assert_correction_absorbed(
         f"merger-owned field was rewritten by hand {{field: (record, codebook)}}: "
         f"{field_drift}"
     )
-
-    carried = _sightings_for(entry, session)
-    assert len(carried) == 1, (
-        f"expected exactly one {session!r} sighting on {entry_id!r}, found "
-        f"{len(carried)}"
-    )
-    sighting_drift = {
-        field: (correction[field], carried[0].get(field))
-        for field in _SIGHTING_PAYLOAD_FIELDS
-        if correction.get(field) and correction[field] != carried[0].get(field)
-    }
-    assert sighting_drift == {}, (
-        f"the {session!r} sighting no longer matches the committed record "
-        f"{{field: (record, codebook)}}: {sighting_drift}"
-    )
+    _assert_sighting_carries(record, correction, entry)
 
     # (2) WITHDRAWN — the refuted framing is gone from the one field
     #     build_codebook_index renders unconditionally.
@@ -2604,20 +2634,7 @@ def test_live_codebook_reroutes_the_misfiled_census_verifier_sighting():
     )
 
     # (5) ROUTE.
-    records = [
-        json.loads(line)
-        for line in _T5729_RECORD_PATH.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    routes = [r for r in records if r.get("session") == _T5729_MISFILED_SESSION]
-    assert len(routes) == 1, (
-        f"expected exactly one {_T5729_MISFILED_SESSION!r} record in "
-        f"{_T5729_RECORD_PATH}, found {len(routes)}"
-    )
-    route = routes[0]
-    assert mod.validate_coding_record(route) == [], (
-        f"invalid §7.3 coding record for session {_T5729_MISFILED_SESSION!r}"
-    )
+    route = _session_record(_T5729_RECORD_PATH, _T5729_MISFILED_SESSION)
     assert route.get("date") == _T5729_MISFILED_DATE, (
         f"the route must keep the observation's own date, not {route.get('date')!r}"
     )
@@ -2634,25 +2651,7 @@ def test_live_codebook_reroutes_the_misfiled_census_verifier_sighting():
     )
 
     codebook = mod.load(_LIVE_CODEBOOK_PATH)
-    homes = [
-        e for e in codebook.get("entries") or [] if e.get("id") == _T5729_HOME_ENTRY_ID
-    ]
-    assert len(homes) == 1, f"expected exactly one {_T5729_HOME_ENTRY_ID!r} entry"
-    carried = _sightings_for(homes[0], _T5729_MISFILED_SESSION)
-    assert [s.get("date") for s in carried] == [_T5729_MISFILED_DATE], (
-        f"expected exactly one {_T5729_MISFILED_SESSION!r} sighting on "
-        f"{_T5729_HOME_ENTRY_ID!r} dated {_T5729_MISFILED_DATE}, found "
-        f"{[s.get('date') for s in carried]}"
-    )
-    drift = {
-        field: (match[field], carried[0].get(field))
-        for field in _SIGHTING_PAYLOAD_FIELDS
-        if match.get(field) and match[field] != carried[0].get(field)
-    }
-    assert drift == {}, (
-        f"the {_T5729_MISFILED_SESSION!r} sighting on {_T5729_HOME_ENTRY_ID!r} no "
-        f"longer matches the committed route {{field: (record, codebook)}}: {drift}"
-    )
+    _assert_sighting_carries(route, match, _live_entry(codebook, _T5729_HOME_ENTRY_ID))
 
     # (6) ROUTE NO-OP.
     merge = _merge_one(codebook, route)
