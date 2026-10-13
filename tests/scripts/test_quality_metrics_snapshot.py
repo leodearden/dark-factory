@@ -2,7 +2,8 @@
 
 Every fixture is a small REAL git repository whose root pyproject.toml names
 two workspace members (or, for a single-package project, one package),
-measured through the script's public entry points; no measure is patched. The one real-tree test (cluster agreement) is the PRD's row 12.
+measured through the script's public entry points; no measure is patched.
+The one real-tree test (cluster agreement) is the PRD's row 12.
 """
 from __future__ import annotations
 
