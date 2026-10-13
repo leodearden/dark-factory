@@ -1786,9 +1786,10 @@ class TestStopInstructionAbort:
 
 
 class TestStopScanExcludesCapturedOutput:
-    """check_proposal's step-1c scan skips complete ``` fenced blocks in
-    block_reason (captured tool output) and still scans every authored text:
-    proposal_text, extra_texts, and block_reason prose outside fences (task 6933).
+    """check_proposal's step-1c scan skips the fenced captured output of each
+    verify failure-report section in block_reason, and still scans every
+    authored text: proposal_text, extra_texts, and the rest of block_reason
+    (task 6933).
     """
 
     _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
@@ -1874,6 +1875,35 @@ class TestStopScanExcludesCapturedOutput:
         )
         assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
         assert 'do not run' in result['reason']
+
+    @pytest.mark.parametrize('block_reason', [
+        pytest.param(
+            'Blocked.\n\n```\nhold for human sign-off\n```',
+            id='fence-without-a-failure-report-heading',
+        ),
+        pytest.param(
+            'Post-merge verification failed\n\n```\nE  expected:\n```\nE  got\n```'
+            '\n\nhold for human sign-off'
+            '\n\n## Lint Issues\n\n```\nx.py:1:1: E501 line too long\n```',
+            id='unheaded-fences-around-prose',
+        ),
+        pytest.param(
+            'Post-merge verification failed\n\n## Test Failures\n\n```\nE  expected:\n```\nE  got\n```'
+            '\n\nhold for human sign-off'
+            '\n\n## Lint Issues\n\n```\nx.py:1:1: E501 line too long\n```',
+            id='stray-fence-inside-captured-output',
+        ),
+    ])
+    def test_stray_or_unheaded_fences_never_hide_authored_prose(self, block_reason):
+        from orchestrator.b3_gate import ABORT, check_proposal
+
+        result = check_proposal(
+            self._merge_verify_red_entry(block_reason),
+            worktree='/tmp', category=None,
+            run_git=_fake_git_never_called, now=self._NOW,
+        )
+        assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
+        assert 'hold for human' in result['reason']
 
     @pytest.mark.parametrize('stream', [
         {'test_output': (

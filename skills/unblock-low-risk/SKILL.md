@@ -47,8 +47,9 @@ The watcher pre-gated, but you re-assert defensively (state can change between t
 
    **Mechanical backstop:** precondition 6's `b3_gate check` below now *also* scans the task
    description, the proposal text and the block reason's prose for this same phrase family
-   (captured tool output inside the block reason's ` ``` ` fenced blocks — the verify failure
-   report — is excluded, so pytest/lint output that merely contains a phrase like
+   (captured tool output — the fenced excerpt under each `## Test Failures`, `## Lint Issues`
+   or `## Type Errors` section of the verify failure report — is excluded, so
+   pytest/lint output that merely contains a phrase like
    'do not run' no longer aborts; task 6933) and returns
    `verdict == 'abort'` with an `'explicit stop instruction present'` reason when found — so
    even if this precondition is somehow skipped, the existing "**ONLY** `verdict == 'fresh'`

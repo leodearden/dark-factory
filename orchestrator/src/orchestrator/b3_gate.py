@@ -77,7 +77,12 @@ DEFAULT_TAG = 'master'
 DEFAULT_CAP = 6
 _LAUNCH_RETENTION_DAYS = 30  # prune launches older than this many days (bound state-file growth)
 
-_FENCED_BLOCK_RE = re.compile(r'^```[^\n]*\n.*?^```[ \t]*$', re.MULTILINE | re.DOTALL)
+_FAILURE_REPORT_CAPTURED_HEADINGS = ('Test Failures', 'Lint Issues', 'Type Errors')
+_CAPTURED_OUTPUT_RE = re.compile(
+    r'^(## (?:' + '|'.join(map(re.escape, _FAILURE_REPORT_CAPTURED_HEADINGS)) + r')\n\n)'
+    r'```\n.*?^```[ \t]*$',
+    re.MULTILINE | re.DOTALL,
+)
 
 # ---------------------------------------------------------------------------
 # State path
@@ -345,15 +350,18 @@ def _age_of(
         return None, AGE_UNPARSEABLE
 
 
-def _strip_fenced_blocks(text: str | None) -> str | None:
-    """Return *text* with every COMPLETE ``` fenced block removed.
+def _strip_captured_output(text: str | None) -> str | None:
+    """Return *text* without the fenced output of its failure-report sections.
 
-    An opening fence with no closing line is left in place, so a truncated
-    text never hides what follows it.
+    Only a fence opened directly under a _FAILURE_REPORT_CAPTURED_HEADINGS
+    heading starts captured output, and the first fence line after it ends
+    it.  A stray fence line inside captured output therefore only ends the
+    excerpt early: it cannot pair with a later fence and hide authored text.
+    An opening fence with no closing line excludes nothing.
     """
     if not text:
         return text
-    return _FENCED_BLOCK_RE.sub('', text)
+    return _CAPTURED_OUTPUT_RE.sub(r'\1', text)
 
 
 def check_proposal(
@@ -386,12 +394,14 @@ def check_proposal(
           orchestrator.stop_instruction.STOP_INSTRUCTION_PHRASES -> abort.
           Authored, scanned whole: entry['proposal_text'] and every string in
           extra_texts (e.g. the task description — see b3_gate.run_check).
-          Authored, scanned: entry['block_reason'] prose outside fences.
-          Captured, excluded: complete ``` fenced blocks in block_reason —
-          tool output from
+          Captured, excluded: in entry['block_reason'], the fenced output
+          under each _FAILURE_REPORT_CAPTURED_HEADINGS section — tool output
+          from
           orchestrator/src/orchestrator/verify.py::VerifyResult.failure_report,
-          not a directive (task 6933).  An unterminated fence excludes
-          nothing.  Pinned by
+          not a directive (task 6933).  Authored, scanned: the rest of
+          block_reason, including any other fence, an unterminated one, and
+          whatever follows a stray fence line inside captured output.  Pinned
+          by
           orchestrator/tests/test_b3_gate.py::TestStopScanExcludesCapturedOutput.
           Hard-aborted before risk_label/git checks, same shape as 1b, and
           takes precedence even over an otherwise-fresh low-risk entry — a
@@ -494,7 +504,7 @@ def check_proposal(
     # The authored/captured line is stated in the docstring's item 1c.
     stop_phrase = detect_stop_instruction(
         entry.get('proposal_text'),
-        _strip_fenced_blocks(entry.get('block_reason')),
+        _strip_captured_output(entry.get('block_reason')),
         *(extra_texts or []),
     )
     if stop_phrase:
