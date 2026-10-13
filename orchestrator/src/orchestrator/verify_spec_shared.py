@@ -12,6 +12,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic import TypeAdapter, ValidationError
+
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 
 
@@ -128,7 +130,10 @@ def apply_spec_to_host_config(
       Accepted consequence: ``verify.py::_reverse_dependency_module_configs``
       (task 2607) cannot widen to a dependent outside the spec's set on this
       leg; it logs the unresolvable dependent instead.
-    - *field_overrides*: the spec's verdict-deciding profile fields.
+    - *field_overrides*: the spec's verdict-deciding profile fields, each
+      checked strictly against its declared OrchestratorConfig type first,
+      because ``model_copy(update=...)`` validates nothing: an unknown name
+      or a mistyped value raises TypeError rather than deciding the run.
 
     Two spelling hazards, both because ``model_copy`` carries field and
     private-attribute VALUES over by reference: verify_env is a FRESH dict
@@ -138,7 +143,7 @@ def apply_spec_to_host_config(
     the caller's config — the one cli.py loaded and may still use.
     """
     update: dict[str, Any] = {
-        **field_overrides,
+        **_validated_field_overrides(field_overrides),
         'verify_env': {**config.effective_verify_env, **verify_env},
     }
     if global_verify_command is not None:
@@ -148,6 +153,24 @@ def apply_spec_to_host_config(
     applied = config.model_copy(update=update)
     applied._module_configs = {mc.prefix: mc for mc in module_configs}
     return applied
+
+
+def _validated_field_overrides(field_overrides: Mapping[str, Any]) -> dict[str, Any]:
+    fields = OrchestratorConfig.model_fields
+    unknown = sorted(set(field_overrides) - set(fields))
+    if unknown:
+        raise TypeError(f'field_overrides name no OrchestratorConfig field: {unknown}')
+    validated: dict[str, Any] = {}
+    for name, value in field_overrides.items():
+        adapter = TypeAdapter(fields[name].rebuild_annotation())
+        try:
+            validated[name] = adapter.validate_python(value, strict=True)
+        except ValidationError as exc:
+            raise TypeError(
+                f'field_overrides[{name!r}] = {value!r} is not a valid '
+                f'OrchestratorConfig.{name}'
+            ) from exc
+    return validated
 
 
 def canonical_json(payload: Any) -> str:

@@ -165,6 +165,22 @@ class TestApplySpecToHostConfig:
 
         assert applied.scope_cargo is False
 
+    def test_unknown_field_override_is_rejected_naming_it(self, tmp_path: Path):
+        with pytest.raises(TypeError, match='scope_cargoo'):
+            self._apply(_host_config(tmp_path), field_overrides={'scope_cargoo': False})
+
+    @pytest.mark.parametrize(('field', 'value'), [
+        ('scope_cargo', 'false'),
+        ('merge_verify_workspace', 1),
+        ('merge_verify_breadth', 'everything'),
+        ('verify_cold_preprovision_command', None),
+    ])
+    def test_mistyped_field_override_is_rejected_naming_it(
+        self, tmp_path: Path, field: str, value: object,
+    ):
+        with pytest.raises(TypeError, match=field):
+            self._apply(_host_config(tmp_path), field_overrides={field: value})
+
     def test_caller_config_is_not_mutated(self, tmp_path: Path):
         config = _host_config(tmp_path)
         host_modules = {'host/only': ModuleConfig(prefix='host/only')}
