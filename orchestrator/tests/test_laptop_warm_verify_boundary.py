@@ -2924,6 +2924,77 @@ def test_sleeper_spec_build_pgid_file_names_the_blocking_session_leader(tmp_path
         proc.wait(timeout=5)
 
 
+def test_pre_kill_tree_verdict_sees_a_session_escaped_build_after_its_leader_is_reaped(tmp_path):
+    """A build that outlives its reaped leader fails the verdict; once killed, it passes.
+
+    The stand-in leader reproduces verify.py::_run_cmd's escape: it starts the
+    :func:`sleeper_spec` build in a new session, then is SIGKILLed and reaped
+    while the build runs on.  That severs the ppid chain, so a walk rooted at
+    the leader -- and a signal-0 probe of the leader's group -- both read the
+    tree as gone.  The verdict judges the pids snapshotted while the leader
+    was alive, so it must still name the surviving build.
+    """
+    build_pgf = tmp_path / 'build.pgid'
+    sleep_secs = float(f'274.{os.getpid() % 1000:03d}')
+    cmd = sleeper_spec(sleep_secs, build_pgid_file=build_pgf).verify_commands[0].test_command
+    assert cmd is not None
+    cwd = tmp_path / 'build'
+    cwd.mkdir()
+    leader = subprocess.Popen(
+        [
+            sys.executable, '-c',
+            'import subprocess, sys, time\n'
+            'subprocess.Popen(["/bin/bash", "-c", sys.argv[1]], start_new_session=True, '
+            'stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n'
+            'time.sleep(300)\n',
+            cmd,
+        ],
+        cwd=cwd,
+    )
+    build = None
+    try:
+        build = wait_for_pgid_file(build_pgf, timeout=10.0)
+        tree = snapshot_pre_kill_tree(leader.pid, build)
+        assert {leader.pid, build} <= tree.pids
+
+        leader.kill()
+        leader.wait(timeout=5)
+
+        build_state = read_proc_state(build)
+        assert build_state is not None and not build_state.exited, (
+            f'harness bug: build pid={build} is not running ({build_state}) after '
+            f'its leader was reaped, so the verdict below would prove nothing'
+        )
+        assert build_state.ppid != leader.pid, (
+            f'harness bug: build pid={build} still names the reaped leader '
+            f'pid={leader.pid} as its parent -- it was never reparented'
+        )
+        assert build not in collect_descendants(leader.pid, read_ppid_map()), (
+            f'harness bug: the ppid walk from pid={leader.pid} still reaches build '
+            f'pid={build}, so this test does not isolate the severed-chain case'
+        )
+
+        with pytest.raises(AssertionError) as exc_info:
+            assert_pre_kill_tree_exited(tree, timeout=0, after='its leader was reaped')
+        message = str(exc_info.value)
+        assert f'build={build}' in message, message
+        assert f'{build}: (' in message, (
+            f'the verdict must render the surviving build pid={build}; got {message!r}'
+        )
+        assert 'its leader was reaped' in message, message
+
+        os.kill(build, signal.SIGKILL)
+        assert_pre_kill_tree_exited(tree, timeout=5.0, after='the build was SIGKILLed')
+    finally:
+        if leader.returncode is None:
+            leader.kill()
+            leader.wait(timeout=5)
+        if build is not None:
+            for pid in wait_pids_exited({build}, timeout=0):
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(pid, signal.SIGKILL)
+
+
 # ---------------------------------------------------------------------------
 # Task 4092 -- deterministic-ish unit coverage for kill_holder_tree, the
 # shared teardown helper that reaps a spawn_verify_merge holder AND every
