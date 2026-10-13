@@ -176,6 +176,19 @@ class TestLoadTopicRegistry:
         assert 'dup-slug' in str(exc.value)
         assert 'duplicate' in str(exc.value).lower()
 
+    def test_two_slugs_that_fold_together_are_a_duplicate(self, tmp_path):
+        """'fold-me' and 'fold_me' are one topic to every consumer of the
+        registry, so carrying both would measure that topic twice."""
+        path = _write_registry(tmp_path, _registry_payload(
+            _entry_payload('fold-me'), _entry_payload('fold_me'),
+        ))
+
+        with pytest.raises(_mod().RegistryError) as exc:
+            _mod().load_topic_registry(path)
+        assert 'fold-me' in str(exc.value)
+        assert 'fold_me' in str(exc.value)
+        assert 'duplicate' in str(exc.value).lower()
+
     def test_zero_phrasings_names_the_topic(self, tmp_path):
         path = _write_registry(tmp_path, _registry_payload(
             _entry_payload('empty-phrasings', phrasings=[]),
