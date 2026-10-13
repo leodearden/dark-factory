@@ -72,6 +72,8 @@ from collections.abc import Collection, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
+import _checkout as _checkout
+
 # Tier 1 — the ONE tasks.db and runs.db locators. Tier 3 — the warn-and-continue per-root
 # loop and the shared no-root message. run_audit_cli is deliberately NOT
 # adopted; the exit-ladder block near main() records why.
@@ -109,6 +111,10 @@ from audit_wiped_metadata_files import (
 # must be the same object or the census would be answering a question the
 # repair is not asking.
 from repair_wiped_metadata_files import TERMINAL_STATUSES
+
+# The artifact keys on the id spelling its consumers already use: the one
+# project-id rule, never the directory name.
+from shared.project_id import project_id_for_root
 
 # ---------------------------------------------------------------------------
 # The classification vocabulary.
@@ -725,16 +731,6 @@ class ProjectCensus(NamedTuple):
     coverage: CensusCoverage
 
 
-def project_id_for(project_root: str) -> str:
-    """``/home/leo/src/solar-challenge-platform`` -> ``solar_challenge_platform``.
-
-    The six corpora spell their project ids with underscores where the
-    directory uses hyphens. The artifact must key on the id spelling its
-    consumers already use, not on the directory name.
-    """
-    return Path(project_root).name.replace("-", "_")
-
-
 def _sort_key(record: CensusRecord, lead: str) -> tuple[str, int, str]:
     """Sort by (*lead*, NUMERIC task id) so 100 follows 20 rather than preceding it.
 
@@ -774,7 +770,7 @@ def census_project(project_root: str) -> ProjectCensus:
     equality. Returning a partial census here would silently re-open the false
     green exit 3 closes.
     """
-    project_id = project_id_for(project_root)
+    project_id = project_id_for_root(project_root)
     tasks_db = tasks_db_path(project_root)
 
     conn = connect_ro(tasks_db)

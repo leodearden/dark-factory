@@ -59,6 +59,8 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
+import _checkout as _checkout
+
 # Tier 1 (tasks.db discovery) and Tier 3 (audit-script CLI plumbing: the roots
 # loop, the warn-and-continue skip, the exit-code ladder and the two reporting
 # layout primitives), imported as a flat sibling and shared with
@@ -89,6 +91,7 @@ from _task_db_scan import (
     run_audit_cli,
     tasks_db_path,
 )
+from shared.project_id import project_id_for_root
 
 # Bind `shared` to the SAME checkout as this script via a __file__-relative
 # path, never a hardcoded absolute. An editable install puts the MAIN
@@ -528,13 +531,14 @@ def classify_gap(key: str, expected_value: object) -> tuple[str, str]:
 def resolve_project_id(project_root: str, override: str | None = None) -> str:
     """Derive the tickets.db ``project_id`` for *project_root*.
 
-    ``/home/leo/src/dark-factory`` -> ``dark_factory``: the directory name with
-    ``-`` mapped to ``_``. *override* wins outright when supplied, which is the
-    escape hatch for a project whose directory name does not match its id.
+    ``/home/leo/src/dark-factory`` -> ``dark_factory``: the one project-id rule,
+    ``shared.project_id.project_id_for_root``, over the directory name.
+    *override* wins outright when supplied, which is the escape hatch for a
+    project whose directory name does not match its id.
     """
     if override:
         return override
-    return Path(project_root).name.replace("-", "_")
+    return project_id_for_root(project_root)
 
 
 def _distinct_ticket_project_ids(tickets_db_path: str) -> set[str]:
