@@ -27,6 +27,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import _init_harness_state_for_test
+from escalation.models import RESOLUTION_CLASSES
 from escalation.queue import EscalationQueue
 
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
@@ -3378,6 +3379,114 @@ class TestWatcherTier1BulletMatchesGrant:
             'Declared in the Tier-1 bullet but not granted: '
             f'{sorted(declared - granted)}. '
             'A newly granted READ tool belongs in _READ_ONLY_GRANTED_MCP_TOOLS.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3726: the convert-to-tracked-work (file-and-resolve) disposition
+# ---------------------------------------------------------------------------
+
+_CONVERT_HEADING = '### Convert to tracked work (file-and-resolve)'
+_CURATOR_ORIGIN_ROLES = ('fused-memory/task-curator', 'fused-memory/ticket-janitor')
+_RESOLUTION_CLASS_LITERAL = r'resolution_class\s*=\s*["\']([a-z-]+)["\']'
+
+
+def _convert_section() -> str:
+    return _skill_section(_watcher_skill_text(), _CONVERT_HEADING)
+
+
+class TestWatcherConvertToTrackedWork:
+    """A work-shaped L1 is filed as a task and closed citing that task id.
+
+    Pins only call shapes and structured tokens of the section: tool names,
+    metadata keys, resolve_ticket status values and resolution classes.
+    """
+
+    def test_files_through_the_two_phase_api(self) -> None:
+        code = '\n'.join(_fenced_code_blocks(_convert_section()))
+        missing = [tool for tool in _FILING_PAIR if f'{tool}(' not in code]
+        assert not missing, (
+            'the Convert section must show submit_task (yields a ticket) then '
+            'resolve_ticket (yields the task id the close cites) as calls in a '
+            f'code block; missing: {missing}'
+        )
+
+    def test_submit_call_carries_the_r4_idempotency_keys(self) -> None:
+        submit_blocks = [
+            block
+            for block in _fenced_code_blocks(_convert_section())
+            if 'submit_task(' in block
+        ]
+        assert submit_blocks, 'the Convert section has no submit_task( code block'
+        submit_code = '\n'.join(submit_blocks)
+        missing = [
+            key
+            for key in ('escalation_id', 'suggestion_hash')
+            if not re.search(rf'["\']{key}["\']\s*:', submit_code)
+        ]
+        assert not missing, (
+            'the submit_task metadata must carry the R4 idempotency keys as '
+            'dict keys — they are the interceptor\'s only dedupe handle on a '
+            're-file (orchestrator/src/orchestrator/agents/roles.py::'
+            f'submit_only_instructions); missing: {missing}'
+        )
+
+    def test_branches_on_every_terminal_ticket_status(self) -> None:
+        section = _convert_section()
+        missing = [
+            status
+            for status in ('created', 'combined', 'failed', 'refused')
+            if not re.search(rf'\b{status}\b', section)
+        ]
+        assert not missing, (
+            'the Convert section must branch on every resolve_ticket status '
+            '(fused-memory/src/fused_memory/server/tools.py::resolve_ticket); '
+            '`refused` is terminal, carries no task_id and is never retried; '
+            f'missing: {missing}'
+        )
+
+    def test_close_is_stamped_converted(self) -> None:
+        classes = [
+            cls
+            for block in _fenced_code_blocks(_convert_section())
+            if 'mcp__escalation__resolve_issue(' in block
+            for cls in re.findall(_RESOLUTION_CLASS_LITERAL, block)
+        ]
+        assert classes and set(classes) == {'converted'}, (
+            'a close citing a curator-created task is resolution_class '
+            "'converted' (escalation/src/escalation/models.py::"
+            f'RESOLUTION_CLASSES); found {classes}'
+        )
+        assert 'converted' in RESOLUTION_CLASSES
+
+    def test_unconvertible_outcomes_promote(self) -> None:
+        code = '\n'.join(_fenced_code_blocks(_convert_section()))
+        assert 'mcp__escalation__promote_to_l2(' in code, (
+            'a refused/failed filing, a submit error or a pin-refused close '
+            'must end in a promote_to_l2 call, never a park'
+        )
+
+    def test_curator_origin_records_are_never_refiled(self) -> None:
+        section = _convert_section()
+        missing = [role for role in _CURATOR_ORIGIN_ROLES if role not in section]
+        assert not missing, (
+            'the Convert section must exclude curator-origin records by '
+            'agent_role: re-filing through the curator that produced them '
+            f'loops watcher -> curator -> watcher; missing: {missing}'
+        )
+
+    def test_every_resolution_class_in_the_skill_is_server_vocabulary(self) -> None:
+        classes = {
+            cls
+            for block in _fenced_code_blocks(_watcher_skill_text())
+            for cls in re.findall(_RESOLUTION_CLASS_LITERAL, block)
+        }
+        assert classes, 'found no resolution_class literals in SKILL.md code blocks'
+        unknown = sorted(classes - RESOLUTION_CLASSES)
+        assert not unknown, (
+            'escalation/src/escalation/server.py::resolve_issue rejects a '
+            'resolution_class outside escalation.models.RESOLUTION_CLASSES, '
+            f'so these templates fail at runtime: {unknown}'
         )
 
 
