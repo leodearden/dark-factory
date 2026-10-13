@@ -69,7 +69,6 @@ import pytest
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import StageId, StageReport
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
-from fused_memory.reconciliation.flag_dedup import confirm_task_present
 from fused_memory.reconciliation.stage2_counter_grounding import (
     CounterEvidence,
     CounterGrounding,
@@ -80,6 +79,7 @@ from fused_memory.reconciliation.stage2_counter_grounding import (
     hints_update_claims,
 )
 from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+from fused_memory.reconciliation.task_corroboration import confirm_task_present
 
 # ── Shared harness ───────────────────────────────────────────────────────────
 #

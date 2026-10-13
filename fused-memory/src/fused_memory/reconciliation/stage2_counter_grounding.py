@@ -14,7 +14,7 @@ from typing import Any, TypeAlias
 from shared.task_metadata_wire import coerce_task_metadata
 
 from fused_memory.middleware.task_creation_journal import CreationOutcomes, TaskKey, task_key
-from fused_memory.reconciliation.flag_dedup import (
+from fused_memory.reconciliation.task_corroboration import (
     LookupVerdict,
     TaskLookup,
     confirm_task_present,

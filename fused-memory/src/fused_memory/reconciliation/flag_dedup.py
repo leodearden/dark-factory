@@ -346,10 +346,9 @@ import hashlib
 import json
 import logging
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from enum import Enum
 from functools import cached_property, partial
 from typing import Any, Literal, NamedTuple, NotRequired, TypedDict
 
@@ -372,6 +371,13 @@ from fused_memory.reconciliation.recon_ledger import (
 from fused_memory.reconciliation.standing_decision_constants import (
     GROUNDS_TOKEN_FAMILIES,
     STATE_ACTIVE,
+)
+from fused_memory.reconciliation.task_corroboration import (
+    LookupVerdict,
+    TaskLookup,
+    confirm_task_present,
+    corroborate_task_lookups,
+    safe_get_task,
 )
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
     SNAPSHOT_PRUNED_STAT_KEY,
@@ -3328,43 +3334,6 @@ def confirm_task_absent(get_task_result: object) -> bool:
     return error_type in {'TaskmasterError', 'TaskNotFoundError'} and _NOT_FOUND_PHRASE in error.lower()
 
 
-#: Keys whose presence on a get_task result dict identifies it as an actual
-#: task record (as opposed to e.g. an unrelated empty dict).  Mirrors the
-#: shape of both the MCP-wrapper task envelope and the raw sqlite backend row.
-_TASK_IDENTITY_KEYS: frozenset[str] = frozenset({'id', 'task_id', 'title', 'status'})
-
-
-def confirm_task_present(get_task_result: object) -> bool:
-    """Fail-safe classifier: True ONLY when get_task POSITIVELY confirms presence.
-
-    Positive-present inverse of :func:`confirm_task_absent`: returns True iff
-    the result is a plain task-record dict — no ``'error'`` / ``'error_type'``
-    key — that carries at least one task-identity key (``id``, ``task_id``,
-    ``title``, or ``status``) as evidence the record is an actual task rather
-    than an unrelated empty dict.
-
-    All other inputs — a not-found error dict, a generic/inconclusive error
-    dict, ``None``, an empty dict, or a non-dict value — return False
-    (fail-safe: an uncertain or absent result must never be treated as
-    corroboration that a task exists).
-
-    Args:
-        get_task_result: The raw value returned by taskmaster.get_task() (or
-            mcp__fused-memory__get_task).  Expected to be either a task dict
-            (present) or an error dict (absent / inconclusive).
-
-    Returns:
-        True if and only if the result is a dict without ``'error'`` /
-        ``'error_type'`` keys and with at least one task-identity key
-        present. False in all other cases.
-    """
-    if not isinstance(get_task_result, dict):
-        return False
-    if 'error' in get_task_result or 'error_type' in get_task_result:
-        return False
-    return any(key in get_task_result for key in _TASK_IDENTITY_KEYS)
-
-
 def _titles_corroborate(cited_title: object, live_title: object) -> bool:
     """True iff a cited title and a live task title name the SAME task.
 
@@ -3469,138 +3438,6 @@ _ABANDONED_TASK_STATUSES: frozenset[TaskStatus] = frozenset({TaskStatus.CANCELLE
 _ABANDONED_TASK_STATUS_VALUES: frozenset[str] = frozenset(
     s.value for s in _ABANDONED_TASK_STATUSES
 )
-
-
-async def safe_get_task(taskmaster: Any, task_id: Any, project_root: str) -> Any:
-    """Fetch ONE task with normalised exception handling.
-
-    Returns the raw ``taskmaster.get_task`` result on success, or a normalised
-    ``{'error': ..., 'error_type': ...}`` dict on ANY exception, so that
-    :func:`confirm_task_present` / :func:`_cited_task_corroborated` /
-    :func:`_cited_fix_task_live` classify the raised-exception path exactly as
-    they classify the MCP wrapper's own error-dict path.
-
-    That normalisation is also what lets every caller keep using a PLAIN
-    ``asyncio.gather`` (no ``return_exceptions=True``, which
-    ``tests/test_gather_convention_guard.py`` would otherwise require be routed
-    through ``utils/async_utils``).
-
-    Module-level as of the task 4381 amendment pass: the two cross-project call
-    sites — :func:`_resolve_live_cross_project_fix_task` and
-    :func:`filter_false_phantom_task_creation_flags` — previously carried
-    byte-identical private closures with a "keep the two in sync" NOTE.  Both
-    take a PER-CITATION ``project_root``, so neither was actually closing over
-    anything, and the note had already gone stale at three copies.
-
-    The fail-safe-to-``None`` variant is the SEPARATE module-level
-    :func:`_safe_get_task_or_none` (task 3476 amendment pass), extracted for
-    the same reason once it had reached two byte-identical copies, in
-    :func:`filter_terminal_metadata_flags` and
-    :func:`filter_accounted_cluster_growth_flags`.  Exactly ONE private closure
-    now survives — :func:`filter_false_absence_flags`' ``_safe_get_task_for_root``,
-    which binds one fixed ``project_root`` for a whole filter and delegates
-    here so the normalised shape cannot drift.
-
-    PUBLIC (no leading underscore) since task 3051 gave it a call site
-    outside this module; since task 4873 that corroboration runs through
-    :func:`corroborate_task_lookups` instead, which is built on this helper.
-    One more private copy of the normalised-exception shape is exactly what
-    this helper exists to prevent.
-    Callers may rely on the contract pinned by
-    ``tests/test_flag_dedup.py::TestSafeGetTask``: the raw result through
-    untouched on success (task dict AND error dict alike), ANY exception
-    normalised to ``{'error': str(exc), 'error_type': type(exc).__name__}``,
-    and ``(task_id, project_root)`` forwarded positionally in that order.
-    """
-    try:
-        return await taskmaster.get_task(task_id, project_root)
-    except Exception as exc:
-        return {'error': str(exc), 'error_type': type(exc).__name__}
-
-
-class LookupVerdict(Enum):
-    """What one :class:`TaskLookup` established.
-
-    UNCONFIRMED means "we asked and the answer did not confirm"; UNRESOLVABLE
-    means "we could not ask" (no root for the project, or no taskmaster).
-    """
-
-    CONFIRMED = 'confirmed'
-    UNCONFIRMED = 'unconfirmed'
-    UNRESOLVABLE = 'unresolvable'
-
-
-@dataclass(frozen=True)
-class TaskLookup:
-    """One task to corroborate in its OWN project, and what counts as confirmation.
-
-    *accept* classifies the raw (or exception-normalised) ``get_task`` result;
-    :func:`confirm_task_present` is the plain "the task exists" rule.
-    """
-
-    project_id: str | None
-    task_id: str
-    accept: Callable[[object], bool]
-
-
-def _lookup_root(known_projects: Mapping[str, str], project_id: str | None) -> str | None:
-    if not isinstance(project_id, str) or not project_id.strip():
-        return None
-    return known_projects.get(project_id) or None
-
-
-def _classify_lookup(lookup: TaskLookup, result: object) -> LookupVerdict:
-    try:
-        accepted = lookup.accept(result)
-    except Exception:
-        logger.debug(
-            'reconciliation.corroborate_task_lookups: accept predicate raised for '
-            'project_id=%s task_id=%s — treating as unconfirmed',
-            lookup.project_id, lookup.task_id, exc_info=True,
-        )
-        return LookupVerdict.UNCONFIRMED
-    return LookupVerdict.CONFIRMED if accepted else LookupVerdict.UNCONFIRMED
-
-
-async def corroborate_task_lookups(
-    taskmaster: Any,
-    known_projects: Mapping[str, str] | None,
-    lookups: Sequence[TaskLookup],
-) -> tuple[LookupVerdict, ...]:
-    """Corroborate each lookup against its own project's root; one verdict per lookup.
-
-    Every resolvable lookup goes out in ONE plain ``asyncio.gather`` of
-    :func:`safe_get_task` (which already normalises exceptions). Confirmation
-    fails closed — a raising ``accept`` is UNCONFIRMED — and the pass never
-    raises: an unexpected fault logs a WARNING and degrades to all-UNRESOLVABLE.
-    """
-    all_unresolvable = (LookupVerdict.UNRESOLVABLE,) * len(lookups)
-    if not taskmaster or not known_projects or not lookups:
-        return all_unresolvable
-    try:
-        resolvable: list[tuple[int, str]] = []
-        for index, lookup in enumerate(lookups):
-            root = _lookup_root(known_projects, lookup.project_id)
-            if root:
-                resolvable.append((index, root))
-        results: list[Any] = await asyncio.gather(
-            *[
-                safe_get_task(taskmaster, lookups[index].task_id, root)
-                for index, root in resolvable
-            ]
-        )
-        verdicts: list[LookupVerdict] = list(all_unresolvable)
-        for (index, _root), result in zip(resolvable, results, strict=True):
-            verdicts[index] = _classify_lookup(lookups[index], result)
-        return tuple(verdicts)
-    except Exception:
-        logger.warning(
-            'reconciliation.corroborate_task_lookups: corroboration pass failed for '
-            '%d lookup(s) — degrading to unresolvable.',
-            len(lookups),
-            exc_info=True,
-        )
-        return all_unresolvable
 
 
 async def _safe_get_task_or_none(
