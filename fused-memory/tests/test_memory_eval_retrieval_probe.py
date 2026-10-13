@@ -743,37 +743,32 @@ class TestDeriveFromCensus:
         self, calibration_rows, guard_clusters,
     ):
         """No candidate leaves derivation uncounted, and no two kept ones fold
-        together."""
+        together.
+
+        The curator and guard sources' share is read from the no-census
+        baseline, so every census row that generates a candidate must add
+        exactly one to kept-or-dropped, and the lone singleton none."""
         m = _mod()
-        rows = [
+        multi_entry_rows = [
             {'value': 'pair-of-spellings', 'count': 5},
             {'value': guard_clusters[0].topic_id.replace('-', '_'), 'count': 4},
             {'value': 'plain-multi-one', 'count': 3},
             {'value': 'pair_of_spellings', 'count': 2},
             {'value': 'plain-multi-two', 'count': 2},
-            {'value': 'lone-singleton', 'count': 1},
         ]
-        result = m.derive_registry_candidates(
-            calibration_rows, _topic_census(*rows), guard_clusters,
-        )
+        census = _topic_census(*multi_entry_rows, {'value': 'lone-singleton', 'count': 1})
+        baseline = _baseline_disclosures(calibration_rows, guard_clusters)
+        result = m.derive_registry_candidates(calibration_rows, census, guard_clusters)
 
-        clusters_with_canonical = {
-            r['cluster_id'] for r in calibration_rows if r.get('label') == 'canonical'
-        }
-        census_generating = [
-            r for r in rows
-            if isinstance(r['value'], str) and isinstance(r['count'], int) and r['count'] > 1
-        ]
-        generated = (
-            len(clusters_with_canonical) + len(guard_clusters) + len(census_generating)
-        )
+        def kept_or_dropped(d: dict[str, int]) -> int:
+            return (
+                d['curator_gate_clusters'] + d['topic_guard_clusters']
+                + d['census_topics_emitted'] + d['slug_collisions_dropped']
+            )
+
         d = result.disclosures
-        kept_or_dropped = (
-            d['curator_gate_clusters'] + d['topic_guard_clusters']
-            + d['census_topics_emitted'] + d['slug_collisions_dropped']
-        )
-        assert kept_or_dropped == generated
-        assert kept_or_dropped - d['slug_collisions_dropped'] == len(result.candidates)
+        assert kept_or_dropped(d) == kept_or_dropped(baseline) + len(multi_entry_rows)
+        assert kept_or_dropped(d) - d['slug_collisions_dropped'] == len(result.candidates)
         folded = {m.normalize_topic(c['topic']) for c in result.candidates}
         assert len(folded) == len(result.candidates)
 

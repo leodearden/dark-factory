@@ -572,7 +572,9 @@ narrowing nobody can see reads downstream as "there was nothing there".
 
 `--derive-registry` refuses a census whose `grand_total.topic.entries` table
 is absent or not object/list-shaped, or which is not decodable JSON: it exits
-2 naming the census path and prints nothing. An EMPTY table is a healthy
+2 naming the census path and prints nothing. A census file it cannot read
+at all, such as a wrong path, is a run failure instead (exit 1), like any
+unreadable derivation source. An EMPTY table is a healthy
 census of a corpus with no topic values, and derives zero census candidates.
 The two are told apart because both read zero in every census counter, as the
 2026-08-31 stub `{"baseline": true}` did.

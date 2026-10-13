@@ -3193,7 +3193,10 @@ Agrees with ``shared.cli_boundary.EXIT_STDOUT_FAILED``.
 EXIT_BAD_INPUT = 2
 """Nothing can be measured until the input is fixed: the registry did not load,
 ``--project-id`` selected nothing, or ``--derive-registry``'s census is
-undecodable or carries no usable topic table."""
+undecodable or carries no usable topic table.
+
+A census file that cannot be read at all, such as a wrong path, is
+:data:`EXIT_RUN_FAILED` instead, like any unreadable derivation source."""
 
 
 def corpus_categories() -> tuple[str, ...]:
@@ -3509,9 +3512,10 @@ def build_parser() -> LoudArgumentParser:
         help=(
             'Metadata census JSON, read for the tripwire split by canonical '
             'presence and by --derive-registry. An unreadable census is named '
-            'in the report, never fatal to a probe run; --derive-registry '
-            'refuses a census with no usable topic table (exit 2) '
-            f'(default: {DEFAULT_CENSUS_PATH})'
+            'in the report, never fatal to a probe run. --derive-registry '
+            'refuses a census that is undecodable or has no usable topic '
+            'table (exit 2), and fails on one it cannot read at all, such as '
+            f'a wrong path (exit 1) (default: {DEFAULT_CENSUS_PATH})'
         ),
     )
     parser.add_argument(
