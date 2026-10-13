@@ -81,6 +81,9 @@ class CreationAttribution:
         return {'agent_id': self.agent_id, 'causation_id': self.causation_id}
 
 
+UNATTRIBUTED = CreationAttribution(agent_id=None, causation_id=None)
+
+
 @dataclass(frozen=True)
 class CreationOutcomes:
     """The task keys one run's submissions created, and the ones they folded into."""

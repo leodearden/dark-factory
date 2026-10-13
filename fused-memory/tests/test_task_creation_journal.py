@@ -397,17 +397,20 @@ async def _creation_rows(journal) -> list[dict]:
     return [row for row in rows if row['operation'] in _CREATION_OPERATIONS]
 
 
-async def _submit(interceptor, curator, *, project_root='/project', metadata=None, **kwargs):
-    with patch.object(type(interceptor), '_get_curator', new=AsyncMock(return_value=curator)):
-        result = await interceptor.submit_task(
-            project_root=project_root,
-            agent_id=STAGE2_AGENT,
-            title=kwargs.pop('title', 'Journal Task'),
-            description=kwargs.pop('description', 'A task for the journal'),
-            metadata=_RUN_METADATA if metadata is None else metadata,
-            **kwargs,
-        )
-    return result
+def _curated_by(interceptor, curator):
+    """Install *curator* for the whole test: the worker drains after submit returns."""
+    return patch.object(type(interceptor), '_get_curator', new=AsyncMock(return_value=curator))
+
+
+async def _submit(interceptor, *, project_root='/project', metadata=None, **kwargs):
+    return await interceptor.submit_task(
+        project_root=project_root,
+        agent_id=STAGE2_AGENT,
+        title=kwargs.pop('title', 'Journal Task'),
+        description=kwargs.pop('description', 'A task for the journal'),
+        metadata=_RUN_METADATA if metadata is None else metadata,
+        **kwargs,
+    )
 
 
 class TestPlanningModeJournal:
@@ -451,12 +454,11 @@ class TestCuratorWorkerJournal:
     async def test_create_row_carries_the_submitters_attribution(
         self, journaled_interceptor, write_journal, ticket_store,
     ):
-        result = await _submit(
-            journaled_interceptor, _curator_returning(CuratorDecision(action='create')),
-        )
-        await _poll_ticket_resolved(ticket_store, result['ticket'])
-
-        outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.created)
+        curator = _curator_returning(CuratorDecision(action='create'))
+        with _curated_by(journaled_interceptor, curator):
+            result = await _submit(journaled_interceptor)
+            await _poll_ticket_resolved(ticket_store, result['ticket'])
+            outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.created)
 
         assert outcomes == CreationOutcomes(
             created=frozenset({('project', '42')}), combined=frozenset(),
@@ -471,9 +473,9 @@ class TestCuratorWorkerJournal:
         curator = _curator_returning(
             CuratorDecision(action='drop', target_id='5', justification='dup'),
         )
-
-        await _submit(journaled_interceptor, curator)
-        outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.combined)
+        with _curated_by(journaled_interceptor, curator):
+            await _submit(journaled_interceptor)
+            outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.combined)
 
         assert outcomes == CreationOutcomes(
             created=frozenset(), combined=frozenset({('project', '5')}),
@@ -497,10 +499,13 @@ class TestCuratorWorkerJournal:
         async def fake_execute_combine(project_root, decision, **_kwargs):
             return {'updated': True, 'target_id': decision.target_id}
 
-        with patch.object(
-            journaled_interceptor, '_execute_combine', side_effect=fake_execute_combine,
+        with (
+            _curated_by(journaled_interceptor, curator),
+            patch.object(
+                journaled_interceptor, '_execute_combine', side_effect=fake_execute_combine,
+            ),
         ):
-            await _submit(journaled_interceptor, curator)
+            await _submit(journaled_interceptor)
             outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.combined)
 
         assert outcomes.combined == {('project', '42')}
@@ -522,11 +527,11 @@ class TestCuratorWorkerJournal:
             CuratorDecision(action='create'),
             CuratorDecision(action='create'),
         )
-
-        refused = await _submit(journaled_interceptor, curator, title='Refused')
-        failed = await _submit(journaled_interceptor, curator, title='Failed')
-        await _submit(journaled_interceptor, curator, title='Sentinel')
-        outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.created)
+        with _curated_by(journaled_interceptor, curator):
+            refused = await _submit(journaled_interceptor, title='Refused')
+            failed = await _submit(journaled_interceptor, title='Failed')
+            await _submit(journaled_interceptor, title='Sentinel')
+            outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.created)
 
         assert (await ticket_store.get(refused['ticket']))['status'] == 'refused'
         assert (await ticket_store.get(failed['ticket']))['status'] == 'failed'
@@ -540,12 +545,10 @@ class TestCuratorWorkerJournal:
         self, journaled_interceptor, write_journal,
     ):
         """The f9e49aef / task 105 shape: Stage 2 of one project files into another."""
-        await _submit(
-            journaled_interceptor, _curator_returning(CuratorDecision(action='create')),
-            project_root='/home/leo/src/solar_challenge',
-        )
-
-        outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.created)
+        curator = _curator_returning(CuratorDecision(action='create'))
+        with _curated_by(journaled_interceptor, curator):
+            await _submit(journaled_interceptor, project_root='/home/leo/src/solar_challenge')
+            outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.created)
 
         assert outcomes.created == {('solar_challenge', '42')}
 
@@ -553,10 +556,10 @@ class TestCuratorWorkerJournal:
     async def test_add_task_never_sees_attribution_kwargs(
         self, journaled_interceptor, write_journal, taskmaster,
     ):
-        await _submit(
-            journaled_interceptor, _curator_returning(CuratorDecision(action='create')),
-        )
-        await _poll_outcomes(write_journal, RUN, lambda o: o.created)
+        curator = _curator_returning(CuratorDecision(action='create'))
+        with _curated_by(journaled_interceptor, curator):
+            await _submit(journaled_interceptor)
+            await _poll_outcomes(write_journal, RUN, lambda o: o.created)
 
         forwarded = taskmaster.add_task.call_args.kwargs
         assert 'agent_id' not in forwarded
@@ -566,16 +569,14 @@ class TestCuratorWorkerJournal:
     async def test_submission_without_causation_still_writes_an_unattributed_row(
         self, journaled_interceptor, write_journal,
     ):
-        await _submit(
-            journaled_interceptor, _curator_returning(CuratorDecision(action='create')),
-            metadata={'source': 'no-causation'},
-        )
-
         async def _row():
             rows = await _creation_rows(write_journal)
             return rows or None
 
-        [row] = await poll_until(_row, message='no unattributed creation row')
+        curator = _curator_returning(CuratorDecision(action='create'))
+        with _curated_by(journaled_interceptor, curator):
+            await _submit(journaled_interceptor, metadata={'source': 'no-causation'})
+            [row] = await poll_until(_row, message='no unattributed creation row')
 
         assert row['causation_id'] is None
         assert row['agent_id'] == STAGE2_AGENT
@@ -605,10 +606,7 @@ class TestIdempotencyHitJournal:
             'creation_attribution': CreationAttribution(STAGE2_AGENT, RUN).to_blob_value(),
         }))
 
-        with patch.object(
-            type(journaled_interceptor), '_get_curator',
-            new=AsyncMock(return_value=_curator_returning()),
-        ):
+        with _curated_by(journaled_interceptor, _curator_returning()):
             await journaled_interceptor._process_add_ticket(ticket_id)
 
         assert (await ticket_store.get(ticket_id))['reason'] == 'idempotency_hit'
@@ -622,10 +620,9 @@ class TestIdempotencyHitJournal:
     ):
         taskmaster.get_tasks = AsyncMock(return_value={'tasks': [self._EXISTING]})
 
-        result = await _submit(
-            journaled_interceptor, _curator_returning(), metadata=self._METADATA,
-        )
-        outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.combined)
+        with _curated_by(journaled_interceptor, _curator_returning()):
+            result = await _submit(journaled_interceptor, metadata=self._METADATA)
+            outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.combined)
 
         assert (await ticket_store.get(result['ticket']))['reason'] == 'idempotency_hit'
         assert outcomes == CreationOutcomes(
@@ -639,11 +636,10 @@ class TestNoJournalWired:
     async def test_submit_and_resolve_behave_as_before(
         self, unjournaled_interceptor, ticket_store,
     ):
-        result = await _submit(
-            unjournaled_interceptor, _curator_returning(CuratorDecision(action='create')),
-        )
-
-        row = await _poll_ticket_resolved(ticket_store, result['ticket'])
+        curator = _curator_returning(CuratorDecision(action='create'))
+        with _curated_by(unjournaled_interceptor, curator):
+            result = await _submit(unjournaled_interceptor)
+            row = await _poll_ticket_resolved(ticket_store, result['ticket'])
 
         assert (row['status'], row['task_id']) == ('created', '42')
 
