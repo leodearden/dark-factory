@@ -15327,7 +15327,7 @@ async def _cycle_flagging_after_prior_runs(
 ):
     """Persist THRESHOLD - 2 completed runs carrying *prior_items*, then run one
     cycle whose S3 flags *live*; return the escalation queue it files into."""
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue
 
     from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
 
