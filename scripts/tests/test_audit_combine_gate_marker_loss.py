@@ -69,6 +69,7 @@ from audit_combine_gate_marker_loss import (
     is_actionable,
     load_combine_targets,
     load_ticket_expectations,
+    main,
     resolve_project_id,
     tickets_db_path,
 )
@@ -1434,6 +1435,25 @@ def test_resolve_project_id_folds_case_like_the_shared_rule():
 @pytest.mark.parametrize("root", ["/home/leo/src/dark-factory", "/x/a-b-c", "/x/Dark-Factory"])
 def test_resolve_project_id_is_the_shared_project_id_rule(root):
     assert resolve_project_id(root) == project_id_for_root(root)
+
+
+def test_resolve_project_id_resolves_a_relative_root(tmp_path, monkeypatch):
+    project = tmp_path / "Know-Live"
+    (project / "sub").mkdir(parents=True)
+    monkeypatch.chdir(project)
+    assert resolve_project_id(".") == "know_live"
+    assert resolve_project_id(".", override="reify") == "reify"
+    monkeypatch.chdir(project / "sub")
+    assert resolve_project_id("..") == "know_live"
+
+
+def test_main_audits_a_relative_project_root_under_its_directorys_id(
+        tmp_path, make_tasks_db, monkeypatch, capsys):
+    root = _make_project(tmp_path, make_tasks_db, name="Know-Live")
+    monkeypatch.chdir(root)
+
+    assert main(["--project-root", ".", "--json"]) == EXIT_OK
+    assert json.loads(capsys.readouterr().out)["projects"][0]["project_id"] == "know_live"
 
 
 def test_audit_project_flags_a_project_id_matching_zero_of_many(tmp_path, make_tasks_db):

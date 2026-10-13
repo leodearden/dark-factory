@@ -76,6 +76,7 @@ from census_tagger_debris import (
     classify_record,
     load_scope_events,
     load_stamped_records,
+    main,
     render_markdown,
     write_artifacts,
 )
@@ -1387,6 +1388,21 @@ def test_project_id_is_the_shared_rule_over_the_root_basename(tmp_path):
     project_id = census_project(str(root)).coverage.project_id
 
     assert project_id == "solar_challenge_platform" == project_id_for_root(root)
+
+
+def test_a_relative_root_is_censused_under_its_directorys_id(tmp_path, monkeypatch):
+    root = _make_project(tmp_path, name="Know-Live", tasks=[])
+    monkeypatch.chdir(root)
+
+    assert census_project(".").coverage.project_id == "know_live"
+
+
+def test_main_sweeps_a_relative_project_root(tmp_path, monkeypatch, capsys):
+    root = _make_project(tmp_path, name="Know-Live", tasks=[])
+    monkeypatch.chdir(root)
+
+    assert main(["--project-root", ".", "--json"]) == EXIT_OK
+    assert "know_live" in json.loads(capsys.readouterr().out)["projects"]
 
 
 # ---------------------------------------------------------------------------
