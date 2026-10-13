@@ -113,6 +113,30 @@ class TestValidation:
         assert payload['error']
         assert rig.store_calls() == 0
 
+    @pytest.mark.parametrize('prefix', [
+        'bff81530',
+        'bff81530' + 'a' * 23,
+        _FULL,
+        _FULL.upper(),
+        'bff8153',
+        'BFF81530',
+        'xyz12345',
+        'bff8153070e54ab6939e507299d1bcd2',
+        '-bff81530',
+    ])
+    @pytest.mark.asyncio
+    async def test_the_route_accepts_exactly_what_the_resolver_accepts(self, prefix):
+        rig = _Rig()
+        try:
+            await rig.resolver.resolve_prefix('reify', prefix)
+            resolver_accepts = True
+        except ValueError:
+            resolver_accepts = False
+
+        route_accepts = rig.post({'project_id': 'reify', 'prefix': prefix}).status_code != 400
+
+        assert route_accepts == resolver_accepts
+
     def test_a_non_json_body_is_400_body(self):
         rig = _Rig()
 

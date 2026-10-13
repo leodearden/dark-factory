@@ -21,11 +21,10 @@ from shared.uuid_prefix_guard import PrefixResolver, Resolution, ResolverUnavail
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from fused_memory.services.id_resolver import is_uuid_prefix
+from fused_memory.services.id_resolver import RESOLVABLE_PREFIX_GRAMMAR, is_resolvable_prefix
 from fused_memory.utils.validation import (
     PathShapedProjectIdError,
     canonicalize_project_id,
-    is_full_uuid,
     validate_known_project_id,
     validate_project_id,
 )
@@ -79,11 +78,9 @@ def _known_project_id(raw: object, known_projects: dict[str, str] | None) -> str
 
 
 def _resolvable_prefix(raw: object) -> str:
-    if isinstance(raw, str) and (is_uuid_prefix(raw) or is_full_uuid(raw)):
+    if is_resolvable_prefix(raw):
         return raw
-    raise _InvalidRequest(
-        'prefix', 'prefix must be 8-31 lowercase hex characters, or a full 36-character uuid',
-    )
+    raise _InvalidRequest('prefix', f'prefix must be {RESOLVABLE_PREFIX_GRAMMAR}')
 
 
 def register_resolve_prefix_route(

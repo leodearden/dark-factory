@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, TypeGuard
 
 from shared.uuid_prefix import find_prefix_tokens
 from shared.uuid_prefix_guard import (
@@ -71,6 +71,11 @@ class GraphitiIds(Protocol):
     async def edge_uuids_with_prefix(self, prefix: str, *, group_id: str) -> list[tuple[str, str]]: ...
 
 
+RESOLVABLE_PREFIX_GRAMMAR = (
+    '8-31 lowercase hex characters standing alone, or a full 36-character uuid'
+)
+
+
 def is_uuid_prefix(value: object) -> bool:
     """True iff *value* is, in its entirety, one C1 prefix token (8-31 lowercase hex)."""
     if not isinstance(value, str):
@@ -79,15 +84,15 @@ def is_uuid_prefix(value: object) -> bool:
     return len(tokens) == 1 and tokens[0].start == 0 and tokens[0].end == len(value)
 
 
+def is_resolvable_prefix(value: object) -> TypeGuard[str]:
+    """True iff :meth:`IdResolver.resolve_prefix` accepts *value* (see RESOLVABLE_PREFIX_GRAMMAR)."""
+    return is_uuid_prefix(value) or is_full_uuid(value)
+
+
 def _normalized_prefix(prefix: str) -> str:
-    if is_full_uuid(prefix):
-        return prefix.lower()
-    if is_uuid_prefix(prefix):
-        return prefix
-    raise ValueError(
-        f'{prefix!r} is not a uuid prefix: expected 8-31 lowercase hex characters '
-        'standing alone, or a full 36-character uuid'
-    )
+    if not is_resolvable_prefix(prefix):
+        raise ValueError(f'{prefix!r} is not a uuid prefix: expected {RESOLVABLE_PREFIX_GRAMMAR}')
+    return prefix.lower()
 
 
 def _outcome(candidate_count: int) -> ResolutionOutcome:
