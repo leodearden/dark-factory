@@ -3497,10 +3497,11 @@ async def safe_get_task(taskmaster: Any, task_id: Any, project_root: str) -> Any
     which binds one fixed ``project_root`` for a whole filter and delegates
     here so the normalised shape cannot drift.
 
-    PUBLIC (no leading underscore) as of task 3051: the corroboration pass
-    :func:`~fused_memory.reconciliation.stages.task_knowledge_sync._corroborate_record_keys`
-    is a call site OUTSIDE this module, and one more private copy of the
-    normalised-exception shape is exactly what this helper exists to prevent.
+    PUBLIC (no leading underscore) since task 3051 gave it a call site
+    outside this module; since task 4873 that corroboration runs through
+    :func:`corroborate_task_lookups` instead, which is built on this helper.
+    One more private copy of the normalised-exception shape is exactly what
+    this helper exists to prevent.
     Callers may rely on the contract pinned by
     ``tests/test_flag_dedup.py::TestSafeGetTask``: the raw result through
     untouched on success (task dict AND error dict alike), ANY exception

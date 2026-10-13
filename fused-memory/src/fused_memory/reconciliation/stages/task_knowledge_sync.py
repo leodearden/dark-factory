@@ -22,6 +22,7 @@ from fused_memory.backends.task_backend_errors import (
     DuplicateCandidateKeyError,
     LeakedEnvelopeMarkupError,
 )
+from fused_memory.middleware.task_creation_journal import read_run_creation_outcomes
 from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
@@ -44,11 +45,9 @@ from fused_memory.reconciliation.flag_dedup import (
     _normalize_content_description,
     acknowledge_resolved_flags,
     compute_flag_signature,
-    confirm_task_present,
     filter_blocked_snapshot_findings,
     filter_contamination_ceiling_findings,
     filter_false_phantom_task_creation_flags,
-    safe_get_task,
 )
 from fused_memory.reconciliation.flag_record_contract import STAGE1_FLAG_MARKER_KIND
 from fused_memory.reconciliation.live_workflow_section import (
@@ -70,8 +69,7 @@ from fused_memory.reconciliation.recon_pool_map import (
     STAGE2_CYCLE_SUMMARY_RECON_POOL as _STAGE2_CYCLE_SUMMARY_RECON_POOL,
 )
 from fused_memory.reconciliation.stage2_counter_grounding import (
-    action_record_keys,
-    coerce_count,
+    ground_stage2_counters,
 )
 from fused_memory.reconciliation.stages.base import BaseStage, RequiredSection
 from fused_memory.reconciliation.standing_decision_constants import (
@@ -294,152 +292,6 @@ async def _acknowledge_resolved_stage1_markers(
             exc_info=True,
         )
         return 0
-
-
-class _RecordCorroboration(NamedTuple):
-    """Outcome of corroborating a set of action-record keys (task 3051).
-
-    The three buckets PARTITION the input keys — ``corroborated`` +
-    ``uncorroborated`` + ``unresolvable`` always equals the number of
-    well-formed keys handed in — so no key can be silently dropped and an
-    operator can tell "the agent invented records" (uncorroborated: we asked
-    and the task is not there) from "we could not check" (unresolvable: no
-    project root to ask against, or no taskmaster at all).
-    """
-
-    #: The keys ``taskmaster.get_task`` positively confirmed exist.
-    corroborated_keys: set[tuple[str | None, str]]
-    #: Keys looked up whose result did NOT positively confirm presence.
-    uncorroborated: int
-    #: Keys no lookup could be issued for (unresolvable project, or the
-    #: corroboration pass could not run at all).
-    unresolvable: int
-
-    @property
-    def corroborated(self) -> int:
-        """Number of positively-confirmed keys (derived, cannot drift)."""
-        return len(self.corroborated_keys)
-
-
-def _normalize_record_keys(keys: object) -> list[tuple[Any, Any]]:
-    """Best-effort projection of *keys* to a list of well-formed 2-tuples.
-
-    Non-raising: a non-iterable, or an entry that is not a 2-tuple, degrades
-    to "no such key" rather than to an exception.
-    """
-    if not isinstance(keys, Iterable):
-        return []
-    normalized: list[tuple[Any, Any]] = []
-    try:
-        for key in keys:
-            if isinstance(key, tuple) and len(key) == 2:
-                normalized.append(key)
-    except TypeError:
-        return []
-    return normalized
-
-
-async def _corroborate_record_keys(
-    taskmaster: Any,
-    known_projects: dict[str, str] | None,
-    keys: object,
-) -> _RecordCorroboration:
-    """Confirm each ``(project_id, task_id)`` key against its OWN project (task 3051).
-
-    Structurally mirrors
-    :func:`~fused_memory.reconciliation.flag_dedup.filter_false_phantom_task_creation_flags`:
-    resolve each key's ``project_id`` to a root via *known_projects*, batch
-    every resolvable lookup into ONE flat ``asyncio.gather`` of
-    :func:`~fused_memory.reconciliation.flag_dedup.safe_get_task` coroutines,
-    and classify each result with
-    :func:`~fused_memory.reconciliation.flag_dedup.confirm_task_present`.
-    Resolving per key (rather than against this stage's own root) is what makes
-    a task filed by Cross-Project Routing corroborable at all: Taskmaster ids
-    are per-project sequential integers, so the wrong root routinely lands on
-    an unrelated task that merely shares the id.
-
-    Fail-CLOSED on the increment: a key whose lookup raises, returns not-found,
-    returns an inconclusive error, or cannot be issued at all is NOT
-    corroborated, mirroring ``confirm_task_present``'s documented posture that
-    "an uncertain or absent result must never be treated as corroboration that
-    a task exists".
-
-    What corroboration proves, and what it does not: a corroborated key names
-    a task that EXISTS in that project. It does not prove THIS cycle created
-    it — an id copied from the payload, or the target of a ``combined``
-    ticket, corroborates too — so this closes the fabricated-id hole only.
-    Binding a record to this run's own creation is task 4873's scope.
-
-    Fail-SAFE for the stage: the whole body is wrapped defensively and
-    degrades to "nothing corroborated, everything unresolvable" rather than
-    raising, matching the non-raising contract
-    :func:`_acknowledge_resolved_stage1_markers` and
-    ``stage2_counter_grounding.action_record_keys`` already document. That is safe because the
-    only consumer — the ``tasks_created`` repair in
-    :meth:`TaskKnowledgeSync._apply_post_flight_guards` — is UPWARD-ONLY, so
-    withholding corroboration can only ever leave a self-reported counter
-    untouched; it can never move one down.
-
-    A falsy *taskmaster* or falsy/empty *known_projects* short-circuits with
-    zero I/O and every key counted unresolvable, so the lost repair is
-    reported rather than silently absorbed.
-
-    Args:
-        taskmaster: Object with an async ``get_task(task_id, project_root)``
-            method, typically ``self.taskmaster``.
-        known_projects: Map of ``project_id -> project_root``, typically
-            ``self.known_projects``.
-        keys: The deduped ``(project_id, task_id)`` pairs from
-            ``stage2_counter_grounding.action_record_keys``.
-
-    Returns:
-        A :class:`_RecordCorroboration` partitioning the well-formed keys.
-    """
-    normalized = _normalize_record_keys(keys)
-    total = len(normalized)
-    if not taskmaster or not known_projects or not total:
-        return _RecordCorroboration(set(), 0, total)
-
-    try:
-        resolvable: list[tuple[tuple[Any, Any], str]] = []
-        unresolvable = 0
-        for key in normalized:
-            project_id = key[0]
-            root = known_projects.get(project_id) if project_id else None
-            if not root:
-                # No root to ask against -> we could not CHECK (distinct from
-                # having checked and found nothing).  Issues no lookup.
-                unresolvable += 1
-                continue
-            resolvable.append((key, root))
-
-        if not resolvable:
-            return _RecordCorroboration(set(), 0, unresolvable)
-
-        # PLAIN gather — safe_get_task normalises every exception to an error
-        # dict, so no return_exceptions=True is needed (see
-        # tests/test_gather_convention_guard.py).
-        results: list[Any] = await asyncio.gather(
-            *[safe_get_task(taskmaster, key[1], root) for key, root in resolvable]
-        )
-
-        corroborated_keys: set[tuple[str | None, str]] = set()
-        uncorroborated = 0
-        for (key, _root), result in zip(resolvable, results, strict=True):
-            if confirm_task_present(result):
-                corroborated_keys.add(key)
-            else:
-                uncorroborated += 1
-
-        return _RecordCorroboration(corroborated_keys, uncorroborated, unresolvable)
-    except Exception:
-        logger.warning(
-            'reconciliation._corroborate_record_keys: corroboration pass failed for '
-            '%d record key(s) — degrading to nothing corroborated.',
-            total,
-            exc_info=True,
-        )
-        return _RecordCorroboration(set(), 0, total)
 
 
 def _marker_is_within_run_window(created_at: object, run_window_start: object) -> bool:
@@ -3964,81 +3816,26 @@ class TaskKnowledgeSync(BaseStage):
         prior_reports: list[StageReport],
         run_id: str,
     ) -> None:
-        """Acknowledge resolved Stage 1 flag markers and normalize Stage 2 counters.
+        """Acknowledge resolved Stage 1 flag markers and ground Stage 2's counters.
 
-        ``report.stats['stage1_analytical_findings_processed']`` and
-        ``report.stats['stage1_mem0_flags_processed']`` are Stage 2's
-        self-reported flag-processing counters. The clamps that used to
-        check them against ground truth here were removed by task 2230
-        (W5-mu) and not replaced: neither counter is in
-        ``_COMPUTED_STAT_KEYS`` (stage_stats.py), so ``derive_stage_stats``
-        cannot recompute either from the write journal and
-        ``stats_verifier`` leaves both untouched. They remain purely
-        self-reported with no computed ground truth; this method only
-        normalizes their presence via ``setdefault(..., 0)`` below so
-        Stage 3's audit always sees a deterministic pair.
+        The flag-processing counters ``stage1_analytical_findings_processed``
+        and ``stage1_mem0_flags_processed`` stay purely self-reported (their
+        clamps were removed by task 2230 / W5-mu); they are only normalized to
+        a present value so Stage 3's audit sees a deterministic pair.
 
-        Terminal-state, stall-guard-freshness, post-action-mismatch, and
-        live-workflow writes are also no longer reclassified here: that write
-        class is now rejected pre-write, server-side, by ``ReconWritePolicy``
-        (task 2224), so post-hoc detection is redundant.
-
-        ``report.stats['tasks_created']`` (task 3046) is also normalized here,
-        plus repaired — UPWARD ONLY — from ``report.stats['task_created_records']``,
-        the action-shaped record list the '## Task-Creation Accounting' prompt
-        section mandates Stage 2 append to at the moment each ``resolve_ticket``
-        call confirms a creation. ``submit_task``/``resolve_ticket`` are not
-        journaled, so unlike the flag counters above, ``tasks_created`` has no
-        write-journal-derived ground truth to fall back on; a self-reported
-        undercount (e.g. a task filed mid-cycle via the Proactive Task Sample or
-        Cross-Project Routing, as in run 507bc25b) would otherwise stand
-        uncorrected. The self-reported value is coerced to ``int`` via
-        :func:`~fused_memory.reconciliation.stage2_counter_grounding.coerce_count` (a numeric-``str``/``float`` self-report
-        normalizes in place; a ``bool`` or anything else uncoercible normalizes to
-        ``0``) *before* comparison, so a legitimately larger non-``int`` self-report
-        (e.g. ``"3"``) can never look like an undercount and get overwritten
-        downward — the coerced value is always what ends up in
-        ``report.stats['tasks_created']``, so normalization is real even when no
-        repair fires.
-
-        That record list is NOT trusted as unverified ground truth (task 3051).
-        It is itself pure LLM self-report — nothing journals it — so a mistaken
-        or hallucinated entry would otherwise inflate ``tasks_created`` with no
-        external check, violating the standard that a stat may only increment
-        after the underlying MCP operation is confirmed to have succeeded. Each
-        deduped ``(project_id, task_id)`` key from :func:`~fused_memory.reconciliation.stage2_counter_grounding.action_record_keys`
-        (project-scoped via its ``default_project_id``, so a record with an
-        omitted ``project_id`` collapses onto this stage's own
-        ``self.project_id`` rather than masquerading as a second cross-project
-        filing) is therefore resolved to its OWN project's root via
-        ``self.known_projects`` and confirmed with ``taskmaster.get_task`` by
-        :func:`_corroborate_record_keys` before it may raise the counter.
-
-        The fail direction is CLOSED on the increment and SAFE for the stage: a
-        key whose lookup raises, returns not-found, returns an inconclusive
-        error, or cannot be issued at all does not count, but because the
-        repair is upward-only that can only ever WITHHOLD a repair — it never
-        moves a counter down (task 2230 / W5-mu deliberately removed symmetric
-        clamping of Stage 2's self-reported counters from this method), never
-        raises, and never aborts the stage.
-
-        Four record stats are always published so the outcome is auditable
-        rather than silent: ``task_created_records_valid`` (the deduped
-        STRUCTURALLY-valid record count, unchanged in meaning — pre-
-        corroboration), plus ``task_created_records_corroborated`` /
-        ``_uncorroborated`` / ``_unresolvable``, which partition it and let an
-        operator distinguish "the agent invented records" from "we could not
-        check". When the CORROBORATED count exceeds the coerced self-reported
-        ``tasks_created``, the pre-repair raw value is stashed under
-        ``report.stats['tasks_created_reported']``, ``tasks_created`` is
-        overwritten, and a WARNING is logged.
+        The task counters are grounded in code-side evidence by
+        :mod:`fused_memory.reconciliation.stage2_counter_grounding`, which owns
+        the rules. ``tasks_created`` has ground truth in the creation journal
+        TaskInterceptor writes for every submission that carried this run's
+        ``_causation_id``; the agent's record list remains a second channel,
+        each claim confirmed with ``get_task`` in its own project. Repairs move
+        a counter UPWARD only.
 
         Args:
             report: The ``StageReport`` returned by ``super().run()``.
                 Mutated in place.
             prior_reports: Stage reports for all earlier stages in this cycle.
-                Unused now that the analytical flag-counter clamp has been
-                removed; kept for signature compatibility with the sole call
+                Unused; kept for signature compatibility with the sole call
                 site.
             run_id: Current reconciliation run identifier.
         """
@@ -4058,84 +3855,20 @@ class TaskKnowledgeSync(BaseStage):
             getattr(self, '_stage2_combined_flags', []) or [],
         )
 
-        # Normalize: ensure both Stage 2 counters are always present in stats so
-        # Stage 3's audit sees a deterministic, present pair via recon_report's
-        # free-form stats passthrough.  setdefault preserves any agent-reported
-        # value.
         report.stats.setdefault('stage1_analytical_findings_processed', 0)
         report.stats.setdefault('stage1_mem0_flags_processed', 0)
 
-        # ── tasks_created accounting repair (task 3046) ─────────────────────
-        # tasks_created is a purely SELF-REPORTED counter: submit_task/resolve_ticket
-        # are not journaled (TaskInterceptor._journal_around covers only
-        # set_task_status/update_task/remove_tasks/add_dependency/remove_dependency),
-        # so derive_stage_stats cannot recompute it and stats_verifier leaves it
-        # untouched (not in _COMPUTED_STAT_KEYS).  task_created_records is the
-        # action-shaped record list the prompt now mandates — mirroring
-        # flag_deleted_records — itself an LLM claim, so each key is
-        # corroborated below (task 3051) before it may raise the counter; an increment missed on a mid-cycle
-        # proactive/cross-project filing is recovered here instead of lost
-        # (run 507bc25b reported tasks_created=0 while filing task 3045).
-        report.stats.setdefault('tasks_created', 0)
-        record_keys = action_record_keys(
-            report.stats.get('task_created_records'),
-            self.project_id,
-            frozenset({'created'}),
+        journal = await read_run_creation_outcomes(
+            getattr(self.journal, 'write_journal', None), run_id,
         )
-        observed = len(record_keys)
-        report.stats['task_created_records_valid'] = observed
-        reported = report.stats.get('tasks_created')
-        # Coerce before comparing (task-3046 amendment): a non-int self-report
-        # (e.g. "3" or 3.0) must not collapse to 0 and look like an undercount
-        # relative to the corroborated count — that would silently move a
-        # legitimately larger self-report DOWN, which the upward-only contract
-        # forbids.  The coerced value is written back unconditionally so the
-        # "normalize" half of this block is real even when no repair fires.
-        reported_int = coerce_count(reported)
-        report.stats['tasks_created'] = reported_int
-
-        # Corroborate before repairing (task 3051).  The record list is LLM
-        # self-report, so it may only RAISE the counter for records whose task
-        # get_task confirms actually exists, each checked against its own
-        # project's root.  Fail-closed on the increment, never on the stage.
-        corroboration = await _corroborate_record_keys(
-            self.taskmaster, self.known_projects, record_keys,
-        )
-        report.stats['task_created_records_corroborated'] = corroboration.corroborated
-        report.stats['task_created_records_uncorroborated'] = corroboration.uncorroborated
-        report.stats['task_created_records_unresolvable'] = corroboration.unresolvable
-
-        if corroboration.corroborated > reported_int:
-            report.stats['tasks_created_reported'] = reported
-            report.stats['tasks_created'] = corroboration.corroborated
-            logger.warning(
-                'reconciliation.stage2_tasks_created_undercount: run_id=%s project_id=%s '
-                'self-reported tasks_created=%r but %d task_created_records were confirmed '
-                'to exist via get_task — repairing upward to %d.',
-                run_id, self.project_id, reported,
-                corroboration.corroborated, corroboration.corroborated,
-            )
-
-        # Loud degradation (task 3051): a record that could not be confirmed
-        # never raises the counter, so the repair task 3046 would have made is
-        # WITHHELD.  Withholding it silently would trade one invisible failure
-        # (an inflated counter) for another (a lost repair), so report it —
-        # under an event name distinct from the undercount repair above, and
-        # with the split spelled out, so an operator can tell "the agent
-        # invented records" (uncorroborated) from "we could not check"
-        # (unresolvable: no project root to ask against, or no taskmaster).
-        shortfall = corroboration.uncorroborated + corroboration.unresolvable
-        if shortfall:
-            logger.warning(
-                'reconciliation.stage2_task_created_records_uncorroborated: run_id=%s '
-                'project_id=%s %d of %d structurally-valid task_created_records could not '
-                'be confirmed to exist via get_task '
-                '(uncorroborated=%d unresolvable=%d) — those records did NOT raise '
-                'tasks_created, which stands at %r.',
-                run_id, self.project_id, shortfall, observed,
-                corroboration.uncorroborated, corroboration.unresolvable,
-                report.stats['tasks_created'],
-            )
+        report.stats.update(await ground_stage2_counters(
+            report.stats,
+            taskmaster=self.taskmaster,
+            known_projects=self.known_projects,
+            project_id=self.project_id,
+            run_id=run_id,
+            journal=journal,
+        ))
 
     async def _maybe_queue_briefing_refresh_tasks(self, run_id: str = '') -> None:
         """Best-effort: queue 'Refresh briefing' tasks for each briefing-known-gaps mismatch.

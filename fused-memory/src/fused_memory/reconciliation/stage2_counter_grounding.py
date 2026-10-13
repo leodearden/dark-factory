@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
-from collections.abc import Mapping
+from collections import Counter
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, TypeAlias
 
-from fused_memory.reconciliation.flag_dedup import confirm_task_present
+from fused_memory.middleware.task_creation_journal import CreationOutcomes
+from fused_memory.reconciliation.flag_dedup import (
+    LookupVerdict,
+    TaskLookup,
+    confirm_task_present,
+    corroborate_task_lookups,
+)
+
+logger = logging.getLogger(__name__)
 
 #: ``(project_id, task_id)``. Taskmaster ids are per-project, so the same id
 #: under two projects is two tasks.
@@ -172,3 +182,163 @@ def hints_claim_confirmed(claim: HintsClaim, get_task_result: object) -> bool:
         )
     except Exception:
         return False
+
+
+@dataclass(frozen=True)
+class CounterEvidence:
+    """What can raise one counter: journal keys (code truth) and LLM record claims.
+
+    Each claim carries the predicate a re-read task must satisfy to confirm it.
+    """
+
+    journaled: frozenset[TaskKey]
+    claims: Mapping[TaskKey, Callable[[object], bool]]
+
+
+@dataclass(frozen=True)
+class CounterGrounding:
+    """How much of one counter's evidence was confirmed.
+
+    ``record_confirmed``, ``uncorroborated`` and ``unresolvable`` partition the
+    record claims the journal did not already cover: confirmed, asked but not
+    confirmed, and could not ask.
+    """
+
+    journaled: int
+    record_confirmed: int
+    uncorroborated: int
+    unresolvable: int
+
+    @property
+    def valid(self) -> int:
+        return self.journaled + self.record_confirmed
+
+
+async def ground_counter(
+    taskmaster: Any,
+    known_projects: Mapping[str, str] | None,
+    evidence: CounterEvidence,
+) -> CounterGrounding:
+    """Confirm one counter's evidence. Journal keys are trusted and never looked up."""
+    record_only = [
+        TaskLookup(project_id=key[0], task_id=key[1], accept=accept)
+        for key, accept in evidence.claims.items()
+        if key not in evidence.journaled
+    ]
+    verdicts = Counter(await corroborate_task_lookups(taskmaster, known_projects, record_only))
+    return CounterGrounding(
+        journaled=len(evidence.journaled),
+        record_confirmed=verdicts[LookupVerdict.CONFIRMED],
+        uncorroborated=verdicts[LookupVerdict.UNCONFIRMED],
+        unresolvable=verdicts[LookupVerdict.UNRESOLVABLE],
+    )
+
+
+def publish_counter(
+    counter: str,
+    prefix: str,
+    reported_raw: object,
+    grounding: CounterGrounding,
+    *,
+    run_id: str,
+    project_id: str | None,
+) -> dict[str, Any]:
+    """The stats one grounded counter publishes; repairs UPWARD only.
+
+    The journal is complete only for submissions that carried
+    ``_causation_id``, so it never proves a larger self-report false
+    (task 2230 / W5-mu): a counter is raised to its confirmed evidence and
+    never lowered.
+    """
+    reported = coerce_count(reported_raw)
+    updates: dict[str, Any] = {
+        counter: reported,
+        f'{prefix}_valid': grounding.valid,
+        f'{prefix}_journaled': grounding.journaled,
+        f'{prefix}_uncorroborated': grounding.uncorroborated,
+        f'{prefix}_unresolvable': grounding.unresolvable,
+    }
+    if grounding.valid > reported:
+        updates[counter] = grounding.valid
+        updates[f'{counter}_reported'] = reported_raw
+        logger.warning(
+            'reconciliation.stage2_%s_undercount: run_id=%s project_id=%s self-reported '
+            '%s=%r but %d were confirmed (journaled=%d, corroborated records=%d) — '
+            'repairing upward to %d.',
+            counter, run_id, project_id, counter, reported_raw, grounding.valid,
+            grounding.journaled, grounding.record_confirmed, grounding.valid,
+        )
+    shortfall = grounding.uncorroborated + grounding.unresolvable
+    if shortfall:
+        logger.warning(
+            'reconciliation.stage2_%s_uncorroborated: run_id=%s project_id=%s %d record '
+            'claim(s) could not be confirmed via get_task (uncorroborated=%d '
+            'unresolvable=%d) — they did NOT raise %s, which stands at %r.',
+            prefix, run_id, project_id, shortfall, grounding.uncorroborated,
+            grounding.unresolvable, counter, updates[counter],
+        )
+    return updates
+
+
+EvidenceBuilder: TypeAlias = Callable[
+    [Mapping[str, Any], str | None, CreationOutcomes], CounterEvidence,
+]
+
+
+def _created_evidence(
+    stats: Mapping[str, Any], project_id: str | None, journal: CreationOutcomes,
+) -> CounterEvidence:
+    records = action_record_keys(
+        stats.get('task_created_records'), project_id, frozenset({'created'}),
+    )
+    return CounterEvidence(
+        journaled=journal.created, claims=dict.fromkeys(records, confirm_task_present),
+    )
+
+
+@dataclass(frozen=True)
+class _GroundedCounter:
+    counter: str
+    prefix: str
+    evidence: EvidenceBuilder
+
+
+_GROUNDED_COUNTERS: tuple[_GroundedCounter, ...] = (
+    _GroundedCounter('tasks_created', 'task_created_records', _created_evidence),
+)
+
+_NO_JOURNAL = CreationOutcomes(created=frozenset(), combined=frozenset())
+
+
+async def ground_stage2_counters(
+    stats: Mapping[str, Any],
+    *,
+    taskmaster: Any,
+    known_projects: Mapping[str, str] | None,
+    project_id: str | None,
+    run_id: str,
+    journal: CreationOutcomes | None,
+) -> dict[str, Any]:
+    """The stat updates that ground every Stage 2 task counter; *stats* is not mutated.
+
+    *journal* is the run's creation outcomes, or None when the journal could
+    not be read, in which case grounding falls back to records alone.
+    """
+    if journal is None:
+        logger.warning(
+            'reconciliation.stage2_creation_journal_unavailable: run_id=%s project_id=%s '
+            '— the creation journal could not be read; Stage 2 task counters are '
+            'grounded on corroborated records only.',
+            run_id, project_id,
+        )
+        journal = _NO_JOURNAL
+    updates: dict[str, Any] = {}
+    for spec in _GROUNDED_COUNTERS:
+        grounding = await ground_counter(
+            taskmaster, known_projects, spec.evidence(stats, project_id, journal),
+        )
+        updates.update(publish_counter(
+            spec.counter, spec.prefix, stats.get(spec.counter, 0), grounding,
+            run_id=run_id, project_id=project_id,
+        ))
+    return updates
