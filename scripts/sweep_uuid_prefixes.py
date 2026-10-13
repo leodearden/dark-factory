@@ -21,31 +21,34 @@ and exit 0.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import difflib
+import json
 import sys
 import time
 from collections import Counter
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, NamedTuple, TypeVar
+from typing import Any, NamedTuple, Protocol, TypeVar
 
-# Bind `shared` and `fused_memory` to THIS checkout, the
-# scripts/check_consolidation_closure.py idiom: the editable installs are
+import httpx
+
+# Bind `shared` and `fused_memory` to THIS checkout: the editable installs are
 # ordinary .pth entries, so sys.path order decides which copy a worktree run
-# imports.
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-for _src in (_REPO_ROOT / 'fused-memory' / 'src', _REPO_ROOT / 'shared' / 'src'):
-    if str(_src) not in sys.path:
-        sys.path.insert(0, str(_src))
+# imports. Bare calls, so the imports below need no E402 suppression.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'fused-memory' / 'src'))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'shared' / 'src'))
 
-import sweep_toolcall_markup as markup_sweep  # noqa: E402
-from shared.uuid_prefix import PrefixToken, find_prefix_tokens, substitute_all  # noqa: E402
-from shared.uuid_prefix_guard import (  # noqa: E402
-    PrefixResolver,
-    Resolution,
-    ResolverUnavailable,
+import sweep_toolcall_markup as markup_sweep
+from _task_db_scan import UNREADABLE_STORE_ERRORS, connect_ro, decode_metadata, tasks_db_path
+from migrate_metadata_modules_to_files import (
+    DEFAULT_SERVER,
+    FusedMemoryClient,
+    write_failure_reason,
 )
+from shared.uuid_prefix import PrefixToken, find_prefix_tokens, substitute_all
+from shared.uuid_prefix_guard import PrefixResolver, Resolution, ResolverUnavailable
 
 # ---------------------------------------------------------------------------
 # The planner: one record, its tokens' resolutions, what to write.
@@ -236,10 +239,56 @@ class LaneReport(NamedTuple):
         }
 
 
+class StoreUnavailable(Exception):
+    """A lane's own store could not be read: the population's ``ResolverUnavailable``."""
+
+    def __init__(self, store: str) -> None:
+        super().__init__(f'the {store} store could not be read')
+        self.store = store
+
+
+#: Every outage that stops a lane before it writes. Each carries ``.store``.
+_STORE_OUTAGES = (ResolverUnavailable, StoreUnavailable)
+
+
+class TaskClient(Protocol):
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> object: ...
+
+
+TaskClientOpener = Callable[[str | None], contextlib.AbstractAsyncContextManager[TaskClient]]
+
+
+class TaskClientSlot:
+    """The run's one MCP task client, opened by the first write that asks for it.
+
+    A dry run never asks, so it never dials the server. The client closes with
+    the run's exit stack.
+    """
+
+    def __init__(
+        self,
+        opener: TaskClientOpener | None,
+        server_url: str | None,
+        stack: contextlib.AsyncExitStack,
+    ) -> None:
+        self._opener = opener
+        self._server_url = server_url
+        self._stack = stack
+        self._client: TaskClient | None = None
+
+    async def client(self) -> TaskClient:
+        if self._client is None:
+            if self._opener is None:
+                raise ValueError('a tasks-lane write needs a task client and none was injected')
+            self._client = await self._stack.enter_async_context(self._opener(self._server_url))
+        return self._client
+
+
 class LaneContext(NamedTuple):
     """What a lane's population and writer may reach during one run."""
 
     scope: SweepScope
+    tasks: TaskClientSlot
 
 
 Population = Callable[[LaneContext], AsyncIterator['Record | markup_sweep.Refusal']]
@@ -344,7 +393,8 @@ async def run_sweep(
     apply: bool,
     resolve: PrefixResolver,
     mem0: object | None = None,
-    open_task_client: object | None = None,
+    open_task_client: TaskClientOpener | None = None,
+    server_url: str | None = None,
     rate: float = DEFAULT_RATE,
 ) -> tuple[tuple[LaneReport, ...], tuple[str, ...]]:
     """Sweep the selected *lanes* in declared order; return their reports and dry-run diffs.
@@ -356,17 +406,20 @@ async def run_sweep(
     unknown = selected - LANES.keys()
     if unknown:
         raise ValueError(f'unknown lanes {sorted(unknown)}; known: {list(LANES)}')
-    context = LaneContext(scope=scope)
     pacer = WritePacer(rate)
     memo: dict[str, Resolution] = {}
     reports: list[LaneReport] = []
     diffs: list[str] = []
-    for lane in (lane for name, lane in LANES.items() if name in selected):
-        report, lane_diffs, memo = await _sweep_lane(
-            lane, context, resolve, memo, apply=apply, pacer=pacer
+    async with contextlib.AsyncExitStack() as stack:
+        context = LaneContext(
+            scope=scope, tasks=TaskClientSlot(open_task_client, server_url, stack)
         )
-        reports.append(report)
-        diffs.extend(lane_diffs)
+        for lane in (lane for name, lane in LANES.items() if name in selected):
+            report, lane_diffs, memo = await _sweep_lane(
+                lane, context, resolve, memo, apply=apply, pacer=pacer
+            )
+            reports.append(report)
+            diffs.extend(lane_diffs)
     return tuple(reports), tuple(diffs)
 
 
@@ -384,7 +437,7 @@ async def _sweep_lane(
         records, refused = await _collect(lane, context)
         tokens = [token.token for record in records for token in find_prefix_tokens(record.fields)]
         memo = await resolve_distinct(project_id, tokens, resolve, memo)
-    except ResolverUnavailable as outage:
+    except _STORE_OUTAGES as outage:
         return _aborted_report(lane.name, project_id, outage.store), (), memo
     plans = [(record, plan_record(record.fields, memo, lane.unwritable_fields)) for record in records]
     if not apply:
@@ -542,10 +595,154 @@ async def _write_escalation(
     return WriteFailureRecord(key=record.key, reason=failure.reason, error=failure.error)
 
 
+# ---------------------------------------------------------------------------
+# The tasks lane: read-only sqlite scan, MCP update_task write.
+# ---------------------------------------------------------------------------
+
+LANE_TASKS = 'tasks'
+TASK_FIELDS = ('title', 'description', 'details', 'test_strategy', 'metadata')
+#: update_task has no test_strategy parameter, so that column is scanned only.
+_TASK_TEXT_WRITABLE = ('title', 'description', 'details')
+_TASK_SELECT = f"SELECT tag, id, {', '.join(TASK_FIELDS)} FROM tasks"
+TASKS_STORE = 'tasks.db'
+#: The server answered, and its answer was not an acceptance.
+REASON_WRITE_REJECTED = 'write-rejected'
+
+
+class WriteRejectedError(RuntimeError):
+    pass
+
+
+def assert_write_accepted(reply: object) -> None:
+    """Raise unless *reply* carries a positive write signal. The only judge of a task reply."""
+    reason = write_failure_reason(reply)
+    if reason is not None:
+        raise WriteRejectedError(reason)
+
+
+class SweepFusedMemoryClient(FusedMemoryClient):
+    _client_name = 'sweep-uuid-prefixes'
+
+
+def open_live_task_client(server_url: str | None) -> SweepFusedMemoryClient:
+    return SweepFusedMemoryClient(server_url or DEFAULT_SERVER)
+
+
+class TaskSource(NamedTuple):
+    root: Path
+    tag: str
+    task_id: int
+
+
+def _task_fields(row: Sequence[Any]) -> dict[str, Any]:
+    title, description, details, test_strategy, metadata = row[2:]
+    return {
+        'title': title or '',
+        'description': description or '',
+        'details': details or '',
+        'test_strategy': test_strategy or '',
+        'metadata': decode_metadata(metadata),
+    }
+
+
+def _task_rows(root: Path) -> list[Any]:
+    with contextlib.closing(connect_ro(tasks_db_path(str(root)))) as conn:
+        return conn.execute(f'{_TASK_SELECT} ORDER BY tag, id').fetchall()
+
+
+def _current_task_fields(source: TaskSource) -> dict[str, Any] | None:
+    with contextlib.closing(connect_ro(tasks_db_path(str(source.root)))) as conn:
+        row = conn.execute(
+            f'{_TASK_SELECT} WHERE tag = ? AND id = ?', (source.tag, source.task_id)
+        ).fetchone()
+    return None if row is None else _task_fields(row)
+
+
+async def _task_population(context: LaneContext) -> AsyncIterator[Record | markup_sweep.Refusal]:
+    root = _required_root(context.scope, LANE_TASKS)
+    try:
+        rows = _task_rows(root)
+    except UNREADABLE_STORE_ERRORS as exc:
+        raise StoreUnavailable(TASKS_STORE) from exc
+    for row in rows:
+        tag, task_id = row[0], row[1]
+        yield Record(
+            key=f'{tag}#{task_id}',
+            fields=_task_fields(row),
+            source=TaskSource(root=root, tag=tag, task_id=task_id),
+        )
+
+
+def build_task_update(
+    root: Path,
+    tag: str,
+    task_id: int,
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+) -> dict[str, str]:
+    """The ``update_task`` arguments for exactly what changed between *before* and *after*.
+
+    Metadata goes as a shallow ``merge`` of the changed top-level keys only, so
+    no sibling key a concurrent writer set, and no wait anchor a ``replace``
+    would strip, is ever touched.
+    """
+    payload = {'id': str(task_id), 'project_root': str(root), 'tag': tag}
+    for column in _TASK_TEXT_WRITABLE:
+        if after[column] != before[column]:
+            payload[column] = after[column]
+    changed = {
+        key: value
+        for key, value in after['metadata'].items()
+        if key not in before['metadata'] or before['metadata'][key] != value
+    }
+    if changed:
+        payload['metadata'] = json.dumps(changed)
+        payload['metadata_mode'] = 'merge'
+    return payload
+
+
+async def _write_task(
+    context: LaneContext, record: Record, after: dict[str, Any]
+) -> WriteFailureRecord | None:
+    source = _source_of(record, TaskSource, LANE_TASKS)
+    try:
+        current = _current_task_fields(source)
+    except UNREADABLE_STORE_ERRORS as exc:
+        return WriteFailureRecord(
+            key=record.key, reason=markup_sweep.REASON_CHANGED_UNDER_US, error=f're-read failed: {exc}'
+        )
+    if current != record.fields:
+        return WriteFailureRecord(
+            key=record.key,
+            reason=markup_sweep.REASON_CHANGED_UNDER_US,
+            error='the task changed between the scan and the write',
+        )
+    payload = build_task_update(source.root, source.tag, source.task_id, record.fields, after)
+    try:
+        client = await context.tasks.client()
+        assert_write_accepted(await client.call_tool('update_task', payload))
+    except WriteRejectedError as exc:
+        return WriteFailureRecord(key=record.key, reason=REASON_WRITE_REJECTED, error=str(exc))
+    except (httpx.HTTPError, OSError, RuntimeError) as exc:
+        return WriteFailureRecord(
+            key=record.key,
+            reason=markup_sweep.REASON_WRITE_FAILED,
+            error=f'{type(exc).__name__}: {exc}',
+        )
+    return None
+
+
 #: The declared lane table. Order is the order ``--lane all`` runs them in.
 LANES: Mapping[str, Lane] = MappingProxyType({
     lane.name: lane
     for lane in (
+        Lane(
+            name=LANE_TASKS,
+            needs_root=True,
+            unwritable_fields=frozenset({'test_strategy'}),
+            population=_task_population,
+            write=_write_task,
+        ),
         Lane(
             name=markup_sweep.LANE_ESCALATIONS,
             needs_root=True,
