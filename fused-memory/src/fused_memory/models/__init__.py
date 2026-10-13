@@ -9,6 +9,7 @@ from fused_memory.models.enums import (
     QueryType,
     SourceStore,
     routes_to_graphiti,
+    routes_to_mem0,
 )
 from fused_memory.models.memory import (
     AddEpisodeResponse,
@@ -36,4 +37,5 @@ __all__ = [
     'Scope',
     'SourceStore',
     'routes_to_graphiti',
+    'routes_to_mem0',
 ]

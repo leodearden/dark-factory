@@ -70,6 +70,7 @@ from fused_memory.models.enums import (
     MemoryCategory,
     SourceStore,
     routes_to_graphiti,
+    routes_to_mem0,
 )
 from fused_memory.models.memory import (
     AddEpisodeResponse,
@@ -6841,13 +6842,10 @@ class MemoryService:
         #   what makes this cover Graphiti-primary writes, which never reach
         #   Mem0 at all — V1 covers the seam, not just the Mem0 branch.
         #
-        # `write_mem0` is HOISTED above the call (task 3508) so ONE expression
+        # `write_mem0` is HOISTED above the call (task 3508) so ONE value
         # answers both "does this write go to Mem0" and the seam's
-        # `reaches_mem0`. Never restate it: a copy that forgot `dual_write`
-        # would refuse valid canonical writes that do land in Mem0.
-        write_mem0 = (
-            resolved_category in MEM0_PRIMARY or dual_write
-        )
+        # `reaches_mem0`.
+        write_mem0 = routes_to_mem0(resolved_category, dual_write=dual_write)
 
         await _apply_memory_metadata_validation(
             meta,

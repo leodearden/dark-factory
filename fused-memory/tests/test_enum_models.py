@@ -80,6 +80,22 @@ class TestRoutesToGraphiti:
         assert all(routes_to_graphiti(c, dual_write=True) for c in MemoryCategory)
 
 
+class TestRoutesToMem0:
+    """The one statement of whether an add_memory write reaches Mem0."""
+
+    def test_without_dual_write_exactly_the_mem0_primary_categories_route(self):
+        from fused_memory.models.enums import MEM0_PRIMARY, MemoryCategory, routes_to_mem0
+
+        routed = {c for c in MemoryCategory if routes_to_mem0(c, dual_write=False)}
+
+        assert routed == MEM0_PRIMARY
+
+    def test_dual_write_routes_every_category(self):
+        from fused_memory.models.enums import MemoryCategory, routes_to_mem0
+
+        assert all(routes_to_mem0(c, dual_write=True) for c in MemoryCategory)
+
+
 # ---------------------------------------------------------------------------
 # Step 3: EpisodeStatus StrEnum
 # ---------------------------------------------------------------------------
