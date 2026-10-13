@@ -1747,6 +1747,105 @@ class TestPerFindingFailureContainment:
             )
 
 
+class TestADegradedTargetLookupDefersTheRepair:
+    """"Could not look" is not "not there", so eta acts on neither reading.
+
+    zeta stamps `uuid_lookup_degraded=True` when its lookup of the intended
+    target raised, and always pairs it with `new_endpoint_uuid=None`. Read as
+    "absent", that None would send the finding through resolve-or-MINT and book
+    `minted=True` for a node nobody showed was missing. eta instead DEFERS it:
+    nothing is written, and the record is `'failed'`, the infrastructure bucket,
+    because the backend did not cooperate. It is never a refusal.
+    """
+
+    @staticmethod
+    def _degraded(**overrides) -> ReferentFinding:
+        return _finding(new_endpoint_uuid=None, uuid_lookup_degraded=True, **overrides)
+
+    @pytest.mark.asyncio
+    async def test_a_degraded_finding_writes_nothing_and_books_failed(self, service):
+        stats = await service._repair_episode_referents(
+            _stats(self._degraded()), group_id='dark_factory',
+        )
+
+        assert_never_repaired(service)
+        assert len(stats.repairs) == 1
+        record = stats.repairs[0]
+        assert record.outcome == 'failed'
+        assert record.minted is False
+        assert record.moved is False
+        assert record.new_endpoint_uuid == ''
+        assert record.intended_referent == 'Task 3127'
+        assert 'degraded' in record.reason.lower()
+        assert 'Task 3127' in record.reason
+        assert stats.failed == 1
+        assert stats.nodes_minted == 0
+        assert stats.repaired == 0
+        assert stats.flagged_unrepairable == 0, (
+            'infrastructure, not a refusal: it must stay out of the NEVER-GUESS '
+            'bucket'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_deferral_is_contained_to_that_finding(self, service):
+        service.graphiti.reassign_edge = AsyncMock(return_value=_reassigned(uuid='e2'))
+
+        stats = await service._repair_episode_referents(
+            _stats(
+                self._degraded(edge_uuid='e1'),
+                _finding(
+                    edge_uuid='e2',
+                    intended_referent=Referent(number='3128'),
+                    new_endpoint_uuid='n-3128',
+                ),
+            ),
+            group_id='dark_factory',
+        )
+
+        service.graphiti.ensure_entity_node.assert_awaited_once_with(
+            'Task 3128', group_id='dark_factory', merge_duplicates=False,
+        )
+        service.graphiti.reassign_edge.assert_awaited_once()
+        assert service.graphiti.reassign_edge.await_args.args[0] == 'e2'
+        assert [r.outcome for r in stats.repairs] == ['failed', 'repaired']
+
+    @pytest.mark.asyncio
+    async def test_the_deferral_warns_once_naming_the_edge_and_announces_no_repair(
+        self, service, caplog,
+    ):
+        with caplog.at_level(logging.INFO, logger=_MEMORY_SERVICE_LOGGER):
+            await service._repair_episode_referents(
+                _stats(self._degraded()), group_id='dark_factory',
+            )
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert 'e1' in warnings[0].getMessage()
+        assert TestAnExecutedRepairEmitsOneStructuredSuccessLine._success_lines(
+            caplog,
+        ) == []
+
+    @pytest.mark.asyncio
+    async def test_a_degraded_fallback_target_is_deferred_not_refused_as_implausible(
+        self, service,
+    ):
+        """The plausibility guard reads target existence off the same lookup.
+        Reading a degraded answer as "absent" would refuse with a reason saying
+        no node of that name exists, a claim that lookup never checked."""
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        stats = await service._repair_episode_referents(
+            _stats(TestTheTargetPlausibilityGuard._junk(uuid_lookup_degraded=True)),
+            group_id='dark_factory',
+        )
+
+        record = stats.repairs[0]
+        assert record.outcome == 'failed'
+        assert 'not plausible' not in record.reason
+        assert stats.flagged_unrepairable == 0
+        service.graphiti.ensure_entity_node.assert_not_awaited()
+
+
 class TestAnExecutedRepairEmitsOneStructuredSuccessLine:
     """The thing this pass EXISTS to do was the one thing it never said.
 
@@ -3226,6 +3325,28 @@ class TestTheUserObservableSignalEndToEnd:
         )
         service.graphiti.reassign_edge.assert_awaited_once()
         service.graphiti.merge_entities.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_degraded_zeta_lookup_defers_the_repair_end_to_end(self, service):
+        """The control route with zeta's target lookup failing. zeta still
+        records the finding and flags the lookup degraded; eta branches on
+        that flag as zeta actually populates it, and writes nothing."""
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        found, stats = await self._pipeline(
+            service, referents=(Referent(number='3127'),),
+            endpoint_name='Task 3129', endpoint_uuid='n-3129',
+        )
+
+        assert found.findings[0].uuid_lookup_degraded is True
+        assert found.findings[0].resolvable is True
+        assert stats.repairs[0].outcome == 'failed'
+        assert stats.nodes_minted == 0
+        assert stats.repaired == 0
+        service.graphiti.ensure_entity_node.assert_not_awaited()
+        service.graphiti.reassign_edge.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_duplicate_name_target_refuses_and_merges_nothing(
