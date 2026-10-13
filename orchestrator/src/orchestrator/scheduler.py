@@ -51,6 +51,7 @@ from orchestrator.mcp_lifecycle import ORCHESTRATOR_MCP_IDENTITY, mcp_call, tool
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
+from orchestrator.pending_age import read_pending_age
 from orchestrator.pin_reservation import (
     Blocker,
     BlockerKind,
@@ -7891,6 +7892,42 @@ class Scheduler:
             task_id=pin.task_id, task=pin.task, modules=modules
         ))
 
+    def _score_candidates(self, ctx: TickContext) -> list[tuple[float, str, dict, str]]:
+        """Score every candidate of the tick, best first, as ``(score, task_id, task, tier)``.
+
+        Precondition: ``ctx.candidates`` is non-empty — an empty tick ends in
+        an earlier phase.
+
+        The I-6 arming gate decides the formula for the WHOLE tick: when the
+        share of candidates with a usable ``pending_since`` anchor reaches
+        ``scoring.new_scoring_min_anchor_coverage``, every candidate scores on
+        C2; otherwise every candidate scores on the legacy formula, so one
+        tick's ordering always comes from one comparable scale.
+        """
+        now = self._wall_now()
+        readings = [read_pending_age(t, now) for t in ctx.candidates]
+        coverage = sum(r.covered for r in readings) / len(ctx.candidates)
+        armed = coverage >= self.config.scoring.new_scoring_min_anchor_coverage
+
+        scored: list[tuple[float, str, dict, str]] = []
+        for t, reading in zip(ctx.candidates, readings, strict=True):
+            tid = str(t.get('id', ''))
+            pri = ctx.effective_priorities.get(tid, coerce_tier(t.get('priority')))
+            transitive = ctx.transitive_counts.get(tid, 0)
+            if armed:
+                score = self._compute_score(
+                    pri,
+                    age_secs=reading.age_secs,
+                    transitive_count=transitive,
+                    has_work_product=self._has_work_product(t),
+                )
+            else:
+                score = self._compute_score_legacy(pri, self._compute_age(tid, ctx.max_id), transitive)
+            scored.append((score, tid, t, pri))
+
+        scored.sort(key=lambda entry: (-entry[0], entry[1]))
+        return scored
+
     async def _phase_select_scored(self, ctx: TickContext) -> object:
         """Score each candidate and dispatch the best available.
 
@@ -7904,16 +7941,7 @@ class Scheduler:
         passed over). Higher score wins; ties broken by task_id string
         order (stable, FIFO-ish for numeric ids).
         """
-        scored: list[tuple[float, str, dict, str]] = []
-        for t in ctx.candidates:
-            tid = str(t.get('id', ''))
-            pri = ctx.effective_priorities.get(tid, coerce_tier(t.get('priority')))
-            age = self._compute_age(tid, ctx.max_id)
-            transitive = ctx.transitive_counts.get(tid, 0)
-            score = self._compute_score_legacy(pri, age, transitive)
-            scored.append((score, tid, t, pri))
-
-        scored.sort(key=lambda entry: (-entry[0], entry[1]))
+        scored = self._score_candidates(ctx)
 
         # DEBUG: log the top 3 so α/β tuning is post-hoc diagnosable.
         if logger.isEnabledFor(logging.DEBUG):
