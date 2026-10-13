@@ -6,6 +6,10 @@ import logging
 from collections.abc import Mapping
 
 from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES, FindingSeverity
+from fused_memory.reconciliation.recon_self_model import (
+    ENTITY_STANDING_DECISIONS_HEADING,
+    INVESTIGATION_OUTCOME_RECORDS_HEADING,
+)
 from fused_memory.reconciliation.standing_decision_writer import ARM2_MIN_DISTINCT_RUNS
 from fused_memory.utils.referent_resolution import render_referent_declaration_guidance
 
@@ -237,7 +241,8 @@ REFERENT_DECLARATION_GUIDANCE = render_referent_declaration_guidance()
 # MUST NOT contain the literal '## Available Tools' — build_stage2_system_prompt
 # raises RuntimeError unless that sentinel appears exactly once in
 # STAGE2_SYSTEM_PROMPT. Unlike the two shared blocks above, this one DOES reference
-# sections by heading name, and points at them with "above"; that is safe only because
+# sections by heading name (interpolated from recon_self_model.py's *_HEADING
+# constants), and points at them with "above"; that is safe only because
 # it is single-stage, so both headings are reachable, and both their PRESENCE and their
 # ORDER relative to this section are pinned by
 # test_recon_report_stage_gated_tool_advertisement.py rather than left to trust.
@@ -262,9 +267,10 @@ def render_entity_standing_decision_write_section() -> str:
         '## Writing an Entity Standing Decision\n'
         '`mcp__recon-report__write_entity_standing_decision(project_id=..., '
         'entity_uuid=..., grounds=..., evidence=[...])` is the tool that WRITES the '
-        '`entity_standing_decision` ledger record described under `## Entity Standing '
-        'Decisions` above, and the records you write under `## Investigation Outcome '
-        'Records` are what unlock it. Stage 2 is the ONLY stage that holds it — Stage 1 '
+        '`entity_standing_decision` ledger record described under '
+        f'`{ENTITY_STANDING_DECISIONS_HEADING}` above, and the records you write under '
+        f'`{INVESTIGATION_OUTCOME_RECORDS_HEADING}` are what unlock it. Stage 2 is the '
+        'ONLY stage that holds it — Stage 1 '
         'and Stage 3 are denied it (it is the one recon-report tool with a durable '
         'ledger write, and they are read-only with respect to that ledger). Nothing in '
         'your tool listing distinguishes a tool you lack from one nobody told you about, '
@@ -280,8 +286,8 @@ def render_entity_standing_decision_write_section() -> str:
         'anything you assert). An agent-authored record, or one that does not resolve, '
         'does not count however many you cite.\n'
         '- **Arm 2 — independent investigation outcomes.** Satisfied by the record pool '
-        'described under `## Investigation Outcome Records` above, with no `evidence` '
-        'cited at all: `investigation_outcome` records for this same `entity_uuid`, '
+        f'described under `{INVESTIGATION_OUTCOME_RECORDS_HEADING}` above, with no '
+        '`evidence` cited at all: `investigation_outcome` records for this same `entity_uuid`, '
         'marked `actionable=false`, spanning at least '
         f'{ARM2_MIN_DISTINCT_RUNS} DISTINCT `run_id`s. A record carrying no `run_id` '
         'cannot establish independence and is not counted. Distinct RUNS are the point '
@@ -291,9 +297,9 @@ def render_entity_standing_decision_write_section() -> str:
         'cited: do NOT fabricate an evidence list to reach that path. Refs to other '
         'stores (escalation ids, task ids) are recorded as provenance but never count '
         'toward EITHER arm.\n\n'
-        '`grounds` must be a value from the closed enum named under `## Entity Standing '
-        'Decisions` above — that section is where the enum is stated; do not invent a '
-        'value.\n\n'
+        '`grounds` must be a value from the closed enum named under '
+        f'`{ENTITY_STANDING_DECISIONS_HEADING}` above — that section is where the enum '
+        'is stated; do not invent a value.\n\n'
         "**Responses.** On success: `{status: 'written', entity_uuid, grounds, "
         'edge_count_at_decision, expires_at, decided_at}`. Three structured errors, each '
         'keyed by `error`: `insufficient_evidence` when NEITHER arm holds — it carries '
