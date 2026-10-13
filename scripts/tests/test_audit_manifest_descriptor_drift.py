@@ -72,6 +72,7 @@ from audit_manifest_descriptor_drift import (
 )
 from git_checkout_root import checkout_root_or_skip
 from shared.capability_manifest import load_capability_manifest
+from shared.delivered_check_polarity import CheckOutcome
 from shared.task_statuses import TERMINAL, TaskStatus
 
 # ---------------------------------------------------------------------------
@@ -2960,6 +2961,41 @@ def test_live_foreign_producer_blocks_declare_their_external_registry(
         f"{relpath} label {label} carries a LOCAL task_id ({block.task_id}) "
         f"alongside its reify producer {external_task_id!r}."
     )
+
+
+@pytest.mark.parametrize("files,outcome,paths_hit,defines_in_suite", [
+    pytest.param({"suite.py": "class TestAnchor:\n    pass\n"},
+                 CheckOutcome.PASS, {"tests/suite.py"}, True,
+                 id="definition-in-suite"),
+    pytest.param({"suite.py": "# TestAnchor is only mentioned here\n"},
+                 CheckOutcome.PASS, {"tests/suite.py"}, False,
+                 id="prose-only-in-suite"),
+    pytest.param({"suite.py": "class TestAnchor:\n    pass\n",
+                  "other.py": "# see TestAnchor\n"},
+                 CheckOutcome.PASS, {"tests/suite.py", "tests/other.py"}, True,
+                 id="leaks-outside-suite"),
+    pytest.param({"suite.py": "x = 1\n", "other.py": "class TestAnchor:\n"},
+                 CheckOutcome.PASS, {"tests/other.py"}, False,
+                 id="definition-only-outside-suite"),
+    pytest.param({"suite.py": "x = 1\n"},
+                 CheckOutcome.FAIL, frozenset(), False,
+                 id="matches-nothing"),
+])
+def test_anchor_reading_tells_a_definition_from_prose_a_leak_and_a_miss(
+        tmp_path, files, outcome, paths_hit, defines_in_suite):
+    """Each live identifier-anchor assertion can fail, shown on a synthetic repo."""
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    for name, text in files.items():
+        (tests_dir / name).write_text(text, encoding="utf-8")
+    _git_init(tmp_path)
+
+    reading = _read_identifier_anchor(
+        str(tmp_path), pattern="TestAnchor", paths=["tests/"], expect="present",
+        suite="tests/suite.py")
+
+    assert (reading.outcome, reading.paths_hit, reading.defines_in_suite) == (
+        outcome, paths_hit, defines_in_suite), reading.stderr
 
 
 def test_alpha4_anchor_is_an_identifier_inside_the_certified_suite():
