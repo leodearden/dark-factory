@@ -578,3 +578,51 @@ class TestGuardStateBatchedWrites:
         guard.add('task-c')
 
         assert sorted(PersistentSet(path, ttl=_TTL)) == ['task-a', 'task-b', 'task-c']
+
+    def test_isub_performs_exactly_one_write_and_is_durable(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """``MutableSet.__isub__`` loops calling ``discard``, which writes per
+        element; the override has to keep removal batched too."""
+        path = tmp_path / 'age_reset_owed.json'
+        guard = PersistentSet(path, ttl=_TTL)
+        guard.update(self._keys(0, self._N + 5))
+
+        calls = _spy_on_writes(monkeypatch)
+        guard -= set(self._keys(0, self._N))
+
+        assert len(calls) == 1, f'expected one write for {self._N} removals, got {len(calls)}'
+        assert sorted(PersistentSet(path, ttl=_TTL)) == sorted(self._keys(self._N, self._N + 5))
+
+    def test_a_removal_of_only_absent_keys_performs_no_write(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        guard = PersistentSet(tmp_path / 'age_reset_owed.json', ttl=_TTL)
+        guard.update(self._keys(0, 5))
+
+        calls = _spy_on_writes(monkeypatch)
+        guard.difference_update(self._keys(100, 100 + self._N))
+
+        assert calls == [], 'removing nothing must be silent'
+        assert sorted(guard) == sorted(self._keys(0, 5))
+
+    def test_put_many_performs_exactly_one_write_and_overwrites(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        path = tmp_path / 'age_reset_anchors.json'
+        guard = PersistentMap(path, ttl=_TTL)
+        guard['task-0'] = 'stale'
+
+        calls = _spy_on_writes(monkeypatch)
+        guard.put_many({f'task-{i}': i for i in range(self._N)})
+
+        assert len(calls) == 1, f'expected one write for {self._N} puts, got {len(calls)}'
+        assert dict(PersistentMap(path, ttl=_TTL)) == {f'task-{i}': i for i in range(self._N)}
+
+    def test_put_many_of_nothing_performs_no_write(self, tmp_path: Path, monkeypatch):
+        guard = PersistentMap(tmp_path / 'age_reset_anchors.json', ttl=_TTL)
+
+        calls = _spy_on_writes(monkeypatch)
+        guard.put_many({})
+
+        assert calls == [], 'an empty batch must be silent'
