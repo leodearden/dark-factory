@@ -1485,6 +1485,145 @@ class TestPostFlightTasksCombinedSplit:
         assert report.stats['tasks_combined_reported'] == '0'
 
 
+# ── task 4018 (in 4873's scope): tasks_hints_updated parity ──────────────────
+
+RUN_HINTS = '4018aaaa-5555-4000-8000-000000000007'
+
+
+def _hinted_task(task_id: object, entities: list, queries: list) -> dict:
+    return {
+        'id': str(task_id),
+        'title': 'A hinted task',
+        'status': 'pending',
+        'metadata': {'memory_hints': {'entities': entities, 'queries': queries}},
+    }
+
+
+class TestPostFlightHintsUpdatedGrounding:
+    """``tasks_hints_updated`` is repaired from ``task_hints_updated_records``,
+    each claim confirmed only when the re-read task's memory_hints contain
+    every claimed entry (the SUPERSET rule)."""
+
+    @pytest.mark.asyncio
+    async def test_a_superset_confirmed_claim_repairs_the_counter(self):
+        stub = _StubTaskmaster(results={
+            ('7', '/repo/df'): _hinted_task(7, ['EntityA', 'Other'], ['how is A wired', 'q2']),
+        })
+        stage = _make_stage(known_projects=_KNOWN_PROJECTS, taskmaster=stub)
+        report = _make_report({
+            'tasks_hints_updated': 0,
+            'task_hints_updated_records': [_hints_record()],
+        })
+
+        await stage._apply_post_flight_guards(report, [], RUN_HINTS)
+
+        assert report.stats['tasks_hints_updated'] == 1
+        assert report.stats['tasks_hints_updated_reported'] == 0
+        assert report.stats['task_hints_updated_records_valid'] == 1
+
+    @pytest.mark.asyncio
+    async def test_hints_missing_a_claimed_query_do_not_confirm(self):
+        stub = _StubTaskmaster(results={
+            ('7', '/repo/df'): _hinted_task(7, ['EntityA'], []),
+        })
+        stage = _make_stage(known_projects=_KNOWN_PROJECTS, taskmaster=stub)
+        report = _make_report({'task_hints_updated_records': [_hints_record()]})
+
+        await stage._apply_post_flight_guards(report, [], RUN_HINTS)
+
+        assert report.stats['tasks_hints_updated'] == 0
+        assert report.stats['task_hints_updated_records_uncorroborated'] == 1
+        assert 'tasks_hints_updated_reported' not in report.stats
+
+    @pytest.mark.asyncio
+    async def test_a_missing_task_does_not_confirm(self):
+        stage = _make_stage(known_projects=_KNOWN_PROJECTS, taskmaster=_StubTaskmaster())
+        report = _make_report({'task_hints_updated_records': [_hints_record()]})
+
+        await stage._apply_post_flight_guards(report, [], RUN_HINTS)
+
+        assert report.stats['tasks_hints_updated'] == 0
+        assert report.stats['task_hints_updated_records_uncorroborated'] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_claim_in_an_unknown_project_is_unresolvable_with_no_lookup(self):
+        stub = _StubTaskmaster()
+        stage = _make_stage(known_projects=_KNOWN_PROJECTS, taskmaster=stub)
+        report = _make_report({
+            'task_hints_updated_records': [_hints_record(project_id='nowhere')],
+        })
+
+        await stage._apply_post_flight_guards(report, [], RUN_HINTS)
+
+        assert report.stats['task_hints_updated_records_unresolvable'] == 1
+        assert stub.calls == []
+
+    @pytest.mark.asyncio
+    async def test_the_lookup_goes_to_the_claims_own_project(self):
+        stub = _StubTaskmaster(results={
+            ('7', '/repo/reify'): _hinted_task(7, ['EntityA'], ['how is A wired']),
+        })
+        stage = _make_stage(
+            known_projects={'dark_factory': '/repo/df', 'reify': '/repo/reify'},
+            taskmaster=stub,
+        )
+        report = _make_report({
+            'task_hints_updated_records': [_hints_record(project_id='reify')],
+        })
+
+        await stage._apply_post_flight_guards(report, [], RUN_HINTS)
+
+        assert report.stats['tasks_hints_updated'] == 1
+        assert stub.calls == [('7', '/repo/reify')]
+
+    @pytest.mark.asyncio
+    async def test_hints_have_no_journal_channel_and_the_counter_is_always_present(self):
+        stage = _make_stage(
+            known_projects=_KNOWN_PROJECTS,
+            taskmaster=_StubTaskmaster(),
+            journal_rows=[_journal_row(RUN_HINTS, '7', project_id='dark_factory')],
+        )
+        report = _make_report({})
+
+        await stage._apply_post_flight_guards(report, [], RUN_HINTS)
+
+        assert report.stats['tasks_hints_updated'] == 0
+        assert report.stats['task_hints_updated_records_journaled'] == 0
+        assert report.stats['task_hints_updated_records_valid'] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_larger_self_report_is_never_lowered(self):
+        stub = _StubTaskmaster(results={
+            ('7', '/repo/df'): _hinted_task(7, ['EntityA'], ['how is A wired']),
+        })
+        stage = _make_stage(known_projects=_KNOWN_PROJECTS, taskmaster=stub)
+        report = _make_report({
+            'tasks_hints_updated': 3,
+            'task_hints_updated_records': [_hints_record()],
+        })
+
+        await stage._apply_post_flight_guards(report, [], RUN_HINTS)
+
+        assert report.stats['tasks_hints_updated'] == 3
+        assert 'tasks_hints_updated_reported' not in report.stats
+
+    @pytest.mark.asyncio
+    async def test_a_claim_naming_no_entries_does_not_count(self):
+        stub = _StubTaskmaster(results={
+            ('7', '/repo/df'): _hinted_task(7, ['EntityA'], ['how is A wired']),
+        })
+        stage = _make_stage(known_projects=_KNOWN_PROJECTS, taskmaster=stub)
+        report = _make_report({
+            'task_hints_updated_records': [_hints_record(entities=[], queries=[])],
+        })
+
+        await stage._apply_post_flight_guards(report, [], RUN_HINTS)
+
+        assert report.stats['tasks_hints_updated'] == 0
+        assert report.stats['task_hints_updated_records_uncorroborated'] == 0
+        assert stub.calls == []
+
+
 class TestPostFlightFlagCountersAreNeverClamped:
     """Audit conclusion for the adjacent flag counters, as executable behaviour.
 
