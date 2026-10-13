@@ -20,13 +20,15 @@ is about 23 KB (measured 2026-10-12), so never print it whole. Read this digest 
 out=$(mktemp /tmp/invariants.XXXXXX.json)
 if curl -sS -m 30 --fail -o "$out" http://127.0.0.1:8080/api/v2/dashboard/invariants; then
 python3 - "$out" <ROOT-OR-NOTHING> <<'PY'
-import json, sys
+import json, os, sys
 body = json.load(open(sys.argv[1]))
-only = sys.argv[2] if len(sys.argv) > 2 else None
+only = os.path.realpath(sys.argv[2]) if len(sys.argv) > 2 else None
 print('served_at', body['served_at'])
+matched = 0
 for r in body['INVARIANTS']:
-    if only and r['root'] != only:
+    if only and os.path.realpath(r['root']) != only:
         continue
+    matched += 1
     where = f"{r['project']} ({r['root']})"
     if r['status'] == 'blind':
         print(f"FINDING blind {where}: {r['error']}")
@@ -41,6 +43,9 @@ for r in body['INVARIANTS']:
             print(f"FINDING chain-{c['state']} {where} {link}")
         elif c['state'] == 'paused':
             print(f"paused {where} {link} pinned_by={c['pending_escalation_ids']}")
+if only and not matched:
+    roster = ' '.join(r['root'] for r in body['INVARIANTS'])
+    print(f"FINDING absent {only}: no record in roster (roots: {roster})")
 PY
 else
   echo "GAUGE UNREADABLE: curl rc=$?"
@@ -49,7 +54,9 @@ rm -f "$out"
 ```
 
 Replace `<ROOT-OR-NOTHING>` with the watched `<project_root>` to read only that root's record, or
-delete it to read every root. Each `FINDING` line is one finding, and so is a `paused` line
+delete it to read every root. The digest compares both roots after `os.path.realpath`, so a
+trailing slash or a symlinked spelling of the watched root still matches, and a root that matches
+no record prints `FINDING absent`. Each `FINDING` line is one finding, and so is a `paused` line
 reading `pinned_by=[]` (see "What is a finding"). A `served_at` line with neither under it is a
 clean reading.
 
@@ -73,6 +80,13 @@ the previous reading forward as current. (Detection PRD D-2: blind ≠ clean.)
 3. A recurrence chain whose `state` is `overdue` or `broken`, the alarm-shaped states
    (`docs/prds/recurring-deterministic-tasks.md` C-4; state function
    `dashboard/src/dashboard/data/recurrence_gauge.py::chain_state`).
+4. A root filter that matched no record (`FINDING absent`). The gauge said nothing about that
+   root, so this is not a clean reading (detection PRD D-2: blind ≠ clean). The printed `roots:`
+   list is the dashboard's roster, `dashboard/src/dashboard/project_dbs.py::project_roots`:
+   `DASHBOARD_PROJECT_ROOT` first, then `DASHBOARD_KNOWN_PROJECT_ROOTS`
+   (`dashboard/src/dashboard/config.py::DashboardConfig.from_env`). Either the watched project is
+   missing from that roster, or the root argument names a path that does not resolve to the
+   dashboard's spelling of it.
 
 Not findings: ledgered violations, which are sanctioned C4-E2 mints (detection PRD D-5), and the
 `hygiene_tier`, which is reported but never alarmable (`docs/prds/claimant-invariant-enforcement.md`
