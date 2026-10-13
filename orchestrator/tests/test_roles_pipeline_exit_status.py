@@ -63,7 +63,7 @@ class TestPipelineExitStatusSplice(PreambleTailContractTests):
             ),
         )
 
-    @pytest.mark.parametrize(('name', 'half'), _HALVES)
+    @pytest.mark.parametrize(('name', 'half'), _HALVES, ids=[name for name, _ in _HALVES])
     def test_each_half_is_spliced_exactly_once(self, name: str, half: str) -> None:
         """A 0 count means the composite is missing; a 2 means a stale bare half survives.
 

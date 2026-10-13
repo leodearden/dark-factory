@@ -1,28 +1,57 @@
-"""Role-prompt guidance: under `pipefail`, a pipe reader that quits early turns success into exit 141.
+"""Role-prompt guidance: a pipeline's exit status is not its first command's, with `pipefail` off or on.
 
 `orchestrator/src/orchestrator/agents/roles.py::_BASH_CAPABLE_ROLE_PREAMBLE`
-splices `SIGPIPE_UNDER_PIPEFAIL_GUIDANCE` into every role holding unqualified
+splices `PIPELINE_EXIT_STATUS_GUIDANCE` into every role holding unqualified
 `Bash`. It is a leaf module, imported downward by roles.py, only so that
 already oversized file does not grow further.
 
-With `pipefail` on, `head`, `grep -q` or `grep -m` closing the pipe SIGPIPEs a
-producer that is still writing, and the pipeline's 141 then reads like a
-failure or a "no match". It is guidance rather than a guard because whether a
-141 is benign depends on intent, which command text does not show.
+The block is one section built from two named halves.
+`PIPELINE_LAST_STAGE_STATUS` covers `pipefail` off, where `$?` after
+`cmd | head` is the reader's status. `SIGPIPE_UNDER_PIPEFAIL` covers `pipefail`
+on, where a reader that quits early turns the status into 141. It is guidance
+rather than a guard because whether a pipeline's status matters, or a 141 is
+benign, depends on intent, which command text does not show.
 
-`orchestrator/tests/test_roles_sigpipe_under_pipefail.py` checks the block's
-shape and its splice (carrier roles, count, order after
-`GREP_LOOKAROUND_GUIDANCE`), never its wording.
+`orchestrator/tests/test_roles_pipeline_exit_status.py` checks the block's
+shape, its composition and its splice, never its wording.
 """
 
-SIGPIPE_UNDER_PIPEFAIL_GUIDANCE = """
-## Under `pipefail`, a pipe reader that quits early turns success into exit 141
+PIPELINE_LAST_STAGE_STATUS = """
+## A pipeline's exit status is not your command's
 
-The `Bash` tool's own shell runs with `pipefail` off. It is ON inside any
-script that sets it (a `set -euo pipefail` header is common in repository
-scripts and test helpers) and in any command where you turn it on yourself.
-With it on, a pipeline's status is the last NON-ZERO status of any stage, not
-the last stage's.
+The `Bash` tool's own shell runs with `pipefail` off. So after
+`cmd | head -N` or `cmd | tail -N`, both `$?` and the call's own "Exit code N"
+are the LAST stage's status: `head`'s or `tail`'s, which is almost always 0.
+They are not `cmd`'s. A command that failed outright reads as a success
+(measured 2026-10-13, bash 5.2.21):
+
+    bash -c 'echo "ERROR: unknown argument" >&2; exit 64' 2>&1 | head -4; echo "EXIT=$?"
+
+printed the ERROR line, then `EXIT=0`, for a command that exited 64. That is
+how real sessions have read a verify script's exit 64 as EXIT=0, and taken
+compiler errors printed above "exit=0" for a clean build.
+
+CAPTURE, THEN READ THE STATUS, THEN TRUNCATE. Keep the command out of the pipe:
+
+    cmd > /tmp/<task-id>-out.log 2>&1; echo "rc=$?"
+
+Then `Read` the log, or run `head` or `tail` on the FILE. Measured, the same
+command gave `rc=64`. Make the path unique to your task: /tmp is shared by
+every agent on the host.
+
+`set -o pipefail` is NOT the fix. With it on, a reader that closes early can
+kill the command with SIGPIPE before it finishes, and the status becomes 141,
+which hides the command's own code. Measured: a producer that wrote 200000
+lines and then exited 64, piped to `head -1` under `pipefail`, returned 141.
+The same producer redirected to a file returned 64.
+"""
+
+SIGPIPE_UNDER_PIPEFAIL = """
+UNDER `pipefail`, A READER THAT QUITS EARLY TURNS SUCCESS INTO EXIT 141.
+`pipefail` is ON inside any script that sets it (a `set -euo pipefail` header
+is common in repository scripts and test helpers) and in any command where you
+turn it on yourself. With it on, a pipeline's status is the last NON-ZERO
+status of any stage, not the last stage's.
 
 That makes a reader that stops early dangerous. `head -n1`, `grep -q` and
 `grep -m1` exit as soon as they have their answer and close the pipe. If the
@@ -52,11 +81,12 @@ pipeline. Run alone, the same producer exits 0.
 RECOGNISE IT. A 141, or a "BrokenPipeError" traceback, from a pipeline that
 ends in `head`, `grep -q` or `grep -m` means the producer was cut off after
 the reader already had what it wanted. It is neither a failure nor a "no
-match", and it is not a bug in your lookup logic. Confirm it in one step:
-run the producer alone and read its own status, or run
+match", and it is not a bug in your lookup logic. To confirm it, run
 `declare -p PIPESTATUS` immediately after the pipeline, before any other
-command overwrites it. That prints the whole array, and its first element is
-the producer's status.
+command overwrites it. That prints the whole array, and a 141 in its first
+element confirms the reader closed early. It is not the producer's real
+status and does not tell you what that would have been: to learn it, run the
+producer alone, captured to a file, and read its own status.
 
 GUARD IT whenever you write or edit a script that sets `pipefail`:
 
@@ -74,3 +104,5 @@ GUARD IT whenever you write or edit a script that sets `pipefail`:
   failure: `false | head -n1 || true` returned 0 with empty output. Use it
   only where the producer's own failure does not matter.
 """
+
+PIPELINE_EXIT_STATUS_GUIDANCE = PIPELINE_LAST_STAGE_STATUS + SIGPIPE_UNDER_PIPEFAIL
