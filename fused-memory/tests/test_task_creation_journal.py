@@ -662,7 +662,7 @@ class TestOrphanRaceJournal:
         interceptor = build_interceptor(curator)
 
         ticket = await _submit(interceptor)
-        await asyncio.wait_for(curating.wait(), timeout=10)
+        await poll_until(curating.is_set, message='the curator never started curating')
         cancelled = await interceptor.cancel_ticket(ticket)
         release.set()
         outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.created or o.combined)
