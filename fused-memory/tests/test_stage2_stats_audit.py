@@ -776,7 +776,7 @@ class TestPostFlightRepairIsCorroborated:
         })
 
         with caplog.at_level(logging.WARNING, logger=_REPAIR_LOGGER):
-            await stage._apply_post_flight_guards(report, [], 'test-run-3051')
+            await stage._apply_post_flight_guards(report, 'test-run-3051')
 
         assert report.stats['tasks_created'] == 1
         assert report.stats['tasks_created_reported'] == 0
@@ -803,7 +803,7 @@ class TestPostFlightRepairIsCorroborated:
         })
 
         with caplog.at_level(logging.WARNING, logger=_REPAIR_LOGGER):
-            await stage._apply_post_flight_guards(report, [], 'test-run-3051')
+            await stage._apply_post_flight_guards(report, 'test-run-3051')
 
         assert report.stats['tasks_created'] == 0
         assert 'tasks_created_reported' not in report.stats
@@ -829,7 +829,7 @@ class TestPostFlightRepairIsCorroborated:
             ],
         })
 
-        await stage._apply_post_flight_guards(report, [], 'test-run-3051')
+        await stage._apply_post_flight_guards(report, 'test-run-3051')
 
         assert report.stats['tasks_created'] == 1
         assert report.stats['tasks_created_reported'] == 0
@@ -849,7 +849,7 @@ class TestPostFlightRepairIsCorroborated:
         })
 
         with caplog.at_level(logging.WARNING, logger=_REPAIR_LOGGER):
-            await stage._apply_post_flight_guards(report, [], 'test-run-3051')
+            await stage._apply_post_flight_guards(report, 'test-run-3051')
 
         assert report.stats['tasks_created'] == 5
         assert 'tasks_created_reported' not in report.stats
@@ -863,7 +863,7 @@ class TestPostFlightRepairIsCorroborated:
         stage = _make_stage(known_projects=_KNOWN_PROJECTS, taskmaster=_StubTaskmaster())
         report = _make_report({})
 
-        await stage._apply_post_flight_guards(report, [], 'test-run-3051')
+        await stage._apply_post_flight_guards(report, 'test-run-3051')
 
         assert report.stats['tasks_created'] == 0
         assert report.stats['task_created_records_valid'] == 0
@@ -887,7 +887,7 @@ class TestPostFlightRepairIsCorroborated:
             ],
         })
 
-        await stage._apply_post_flight_guards(report, [], 'test-run-3051')
+        await stage._apply_post_flight_guards(report, 'test-run-3051')
 
         # 'failed' never counts and 'combined' is not a tasks_created status;
         # the one 'created' record does not corroborate, so nothing is valid.
@@ -914,7 +914,7 @@ class TestPostFlightRepairIsCorroborated:
         })
 
         with caplog.at_level(logging.WARNING, logger=_REPAIR_LOGGER):
-            await stage._apply_post_flight_guards(report, [], 'test-run-3051')
+            await stage._apply_post_flight_guards(report, 'test-run-3051')
 
         assert report.stats['tasks_created'] == 2
         warnings = _undercount_warnings(caplog)
@@ -939,7 +939,7 @@ class TestPostFlightRepairIsCorroborated:
             ],
         })
 
-        await stage._apply_post_flight_guards(report, [], 'test-run-3051')
+        await stage._apply_post_flight_guards(report, 'test-run-3051')
 
         assert report.stats['tasks_created'] == 1
         assert stub.calls == [('77', '/repo/reify')]
@@ -1008,7 +1008,7 @@ class TestPostFlightLoudDegradation:
             'task_created_records': _two_records(),
         })
 
-        await stage._apply_post_flight_guards(report, [], 'test-run-3051')
+        await stage._apply_post_flight_guards(report, 'test-run-3051')
 
         # Coerced (str -> int) but never repaired upward from the records.
         assert report.stats['tasks_created'] == 1
@@ -1028,7 +1028,7 @@ class TestPostFlightLoudDegradation:
             'task_created_records': _two_records(),
         })
 
-        await stage._apply_post_flight_guards(report, [], 'test-run-3051')
+        await stage._apply_post_flight_guards(report, 'test-run-3051')
 
         assert report.stats['task_created_records_valid'] == 0
         buckets = (
@@ -1054,7 +1054,7 @@ class TestPostFlightLoudDegradation:
         })
 
         with caplog.at_level(logging.WARNING, logger=_REPAIR_LOGGER):
-            await stage._apply_post_flight_guards(report, [], 'test-run-3051')
+            await stage._apply_post_flight_guards(report, 'test-run-3051')
 
         warnings = _uncorroborated_warnings(caplog)
         assert len(warnings) == 1
@@ -1074,7 +1074,7 @@ class TestPostFlightLoudDegradation:
         stage = self._degraded_stages()[which]
         report = _make_report({'task_created_records': _two_records()})
 
-        await stage._apply_post_flight_guards(report, [], 'test-run-3051')
+        await stage._apply_post_flight_guards(report, 'test-run-3051')
 
         assert report.stats['stage1_analytical_findings_processed'] == 0
         assert report.stats['stage1_mem0_flags_processed'] == 0
@@ -1089,7 +1089,7 @@ class TestPostFlightLoudDegradation:
         report = _make_report({'tasks_created': 0, 'task_created_records': []})
 
         with caplog.at_level(logging.WARNING, logger=_REPAIR_LOGGER):
-            await stage._apply_post_flight_guards(report, [], 'test-run-3051')
+            await stage._apply_post_flight_guards(report, 'test-run-3051')
 
         assert _uncorroborated_warnings(caplog) == []
 
@@ -1103,7 +1103,7 @@ class TestPostFlightLoudDegradation:
         report = _make_report({'tasks_created': 2, 'task_created_records': _two_records()})
 
         with caplog.at_level(logging.WARNING, logger=_REPAIR_LOGGER):
-            await stage._apply_post_flight_guards(report, [], 'test-run-3051')
+            await stage._apply_post_flight_guards(report, 'test-run-3051')
 
         assert report.stats['task_created_records_valid'] == 2
         assert _uncorroborated_warnings(caplog) == []
@@ -1119,7 +1119,7 @@ class TestPostFlightLoudDegradation:
         report = _make_report({'tasks_created': 0, 'task_created_records': _two_records()})
 
         with caplog.at_level(logging.WARNING, logger=_REPAIR_LOGGER):
-            await stage._apply_post_flight_guards(report, [], 'test-run-3051')
+            await stage._apply_post_flight_guards(report, 'test-run-3051')
 
         assert report.stats['tasks_created'] == 1
         assert len(_undercount_warnings(caplog)) == 1
@@ -1162,7 +1162,7 @@ class TestPostFlightJournalGrounding:
         )
         report = _make_report({'tasks_created': 1})
 
-        await stage._apply_post_flight_guards(report, [], RUN_F9E49AEF)
+        await stage._apply_post_flight_guards(report, RUN_F9E49AEF)
 
         assert report.stats['task_created_records_valid'] == 1
         assert report.stats['task_created_records_journaled'] == 1
@@ -1179,7 +1179,7 @@ class TestPostFlightJournalGrounding:
         report = _make_report({'tasks_created': 0})
 
         with caplog.at_level(logging.WARNING):
-            await stage._apply_post_flight_guards(report, [], RUN_90D762D0)
+            await stage._apply_post_flight_guards(report, RUN_90D762D0)
 
         assert report.stats['tasks_created'] == 1
         assert report.stats['tasks_created_reported'] == 0
@@ -1195,7 +1195,7 @@ class TestPostFlightJournalGrounding:
         )
         report = _make_report({'tasks_created': 0})
 
-        await stage._apply_post_flight_guards(report, [], RUN_90D762D0)
+        await stage._apply_post_flight_guards(report, RUN_90D762D0)
 
         assert report.stats['tasks_created'] == 1
         assert report.stats['task_created_records_unresolvable'] == 0
@@ -1219,7 +1219,7 @@ class TestPostFlightJournalGrounding:
             ],
         })
 
-        await stage._apply_post_flight_guards(report, [], RUN_90D762D0)
+        await stage._apply_post_flight_guards(report, RUN_90D762D0)
 
         assert report.stats['tasks_created'] == 1
         assert report.stats['task_created_records_valid'] == 1
@@ -1243,7 +1243,7 @@ class TestPostFlightJournalGrounding:
             'task_created_records': [{'task_id': ' 4745 ', 'status': 'created'}],
         })
 
-        await stage._apply_post_flight_guards(report, [], RUN_90D762D0)
+        await stage._apply_post_flight_guards(report, RUN_90D762D0)
 
         assert report.stats['tasks_created'] == 1
         assert report.stats['task_created_records_valid'] == 1
@@ -1259,7 +1259,7 @@ class TestPostFlightJournalGrounding:
             'task_created_records': [dict(_RUN_507BC25B_RECORD)],
         })
 
-        await stage._apply_post_flight_guards(report, [], RUN_507BC25B)
+        await stage._apply_post_flight_guards(report, RUN_507BC25B)
 
         assert report.stats['tasks_created'] == 1
         assert report.stats['task_created_records_valid'] == 1
@@ -1284,7 +1284,7 @@ class TestPostFlightJournalGrounding:
         ]
         report = _make_report({'tasks_created': 0, 'task_created_records': records})
 
-        await stage._apply_post_flight_guards(report, [], RUN_90D762D0)
+        await stage._apply_post_flight_guards(report, RUN_90D762D0)
 
         stats = report.stats
         record_only_confirmed = stats['task_created_records_valid'] - stats[
@@ -1309,7 +1309,7 @@ class TestPostFlightJournalGrounding:
         )
         report = _make_report({'task_created_records': [dict(_RUN_507BC25B_RECORD)]})
 
-        await stage._apply_post_flight_guards(report, [], RUN_507BC25B)
+        await stage._apply_post_flight_guards(report, RUN_507BC25B)
 
         assert 'task_created_records_corroborated' not in report.stats
 
@@ -1342,7 +1342,7 @@ class TestPostFlightJournalGrounding:
         })
 
         with caplog.at_level(logging.WARNING):
-            await stage._apply_post_flight_guards(report, [], RUN_507BC25B)
+            await stage._apply_post_flight_guards(report, RUN_507BC25B)
 
         assert report.stats['tasks_created'] == 1
         assert report.stats['task_created_records_journaled'] == 0
@@ -1357,7 +1357,7 @@ class TestPostFlightJournalGrounding:
         report = _make_report({})
 
         with caplog.at_level(logging.WARNING):
-            await stage._apply_post_flight_guards(report, [], RUN_507BC25B)
+            await stage._apply_post_flight_guards(report, RUN_507BC25B)
 
         assert _warnings_named(caplog, _JOURNAL_UNAVAILABLE_EVENT) == []
 
@@ -1369,7 +1369,7 @@ class TestPostFlightJournalGrounding:
         report = _make_report({'tasks_created': 5})
 
         with caplog.at_level(logging.WARNING):
-            await stage._apply_post_flight_guards(report, [], RUN_90D762D0)
+            await stage._apply_post_flight_guards(report, RUN_90D762D0)
 
         assert report.stats['tasks_created'] == 5
         assert 'tasks_created_reported' not in report.stats
@@ -1398,7 +1398,7 @@ class TestPostFlightTasksCombinedSplit:
             ],
         })
 
-        await stage._apply_post_flight_guards(report, [], RUN_COMBINED)
+        await stage._apply_post_flight_guards(report, RUN_COMBINED)
 
         assert report.stats['tasks_created'] == 0
         assert report.stats['tasks_combined'] == 1
@@ -1411,7 +1411,7 @@ class TestPostFlightTasksCombinedSplit:
         ])
         report = _make_report({})
 
-        await stage._apply_post_flight_guards(report, [], RUN_COMBINED)
+        await stage._apply_post_flight_guards(report, RUN_COMBINED)
 
         assert report.stats['tasks_created'] == 0
         assert report.stats['tasks_combined'] == 1
@@ -1439,7 +1439,7 @@ class TestPostFlightTasksCombinedSplit:
             ],
         })
 
-        await stage._apply_post_flight_guards(report, [], RUN_COMBINED)
+        await stage._apply_post_flight_guards(report, RUN_COMBINED)
 
         assert report.stats['tasks_created'] == 2
         assert report.stats['tasks_combined'] == 1
@@ -1454,7 +1454,7 @@ class TestPostFlightTasksCombinedSplit:
         stage = _make_stage()
         report = _make_report({'tasks_combined': raw})
 
-        await stage._apply_post_flight_guards(report, [], RUN_COMBINED)
+        await stage._apply_post_flight_guards(report, RUN_COMBINED)
 
         assert report.stats['tasks_combined'] == expected
         assert type(report.stats['tasks_combined']) is int
@@ -1464,7 +1464,7 @@ class TestPostFlightTasksCombinedSplit:
         stage = _make_stage()
         report = _make_report({})
 
-        await stage._apply_post_flight_guards(report, [], RUN_COMBINED)
+        await stage._apply_post_flight_guards(report, RUN_COMBINED)
 
         assert report.stats['tasks_combined'] == 0
         assert 'tasks_combined_reported' not in report.stats
@@ -1476,7 +1476,7 @@ class TestPostFlightTasksCombinedSplit:
         ])
         report = _make_report({'tasks_combined': 4})
 
-        await stage._apply_post_flight_guards(report, [], RUN_COMBINED)
+        await stage._apply_post_flight_guards(report, RUN_COMBINED)
 
         assert report.stats['tasks_combined'] == 4
         assert 'tasks_combined_reported' not in report.stats
@@ -1486,7 +1486,7 @@ class TestPostFlightTasksCombinedSplit:
         stage = _make_stage()
         report = _make_report({})
 
-        await stage._apply_post_flight_guards(report, [], RUN_COMBINED)
+        await stage._apply_post_flight_guards(report, RUN_COMBINED)
 
         for suffix in ('valid', 'journaled', 'uncorroborated', 'unresolvable'):
             assert report.stats[f'tasks_combined_evidence_{suffix}'] == 0
@@ -1501,7 +1501,7 @@ class TestPostFlightTasksCombinedSplit:
         ])
         report = _make_report({'tasks_combined': '0'})
 
-        await stage._apply_post_flight_guards(report, [], RUN_COMBINED)
+        await stage._apply_post_flight_guards(report, RUN_COMBINED)
 
         assert report.stats['tasks_combined'] == 1
         assert report.stats['tasks_combined_reported'] == '0'
@@ -1537,7 +1537,7 @@ class TestPostFlightHintsUpdatedGrounding:
             'task_hints_updated_records': [_hints_record()],
         })
 
-        await stage._apply_post_flight_guards(report, [], RUN_HINTS)
+        await stage._apply_post_flight_guards(report, RUN_HINTS)
 
         assert report.stats['tasks_hints_updated'] == 1
         assert report.stats['tasks_hints_updated_reported'] == 0
@@ -1551,7 +1551,7 @@ class TestPostFlightHintsUpdatedGrounding:
         stage = _make_stage(known_projects=_KNOWN_PROJECTS, taskmaster=stub)
         report = _make_report({'task_hints_updated_records': [_hints_record()]})
 
-        await stage._apply_post_flight_guards(report, [], RUN_HINTS)
+        await stage._apply_post_flight_guards(report, RUN_HINTS)
 
         assert report.stats['tasks_hints_updated'] == 0
         assert report.stats['task_hints_updated_records_uncorroborated'] == 1
@@ -1562,7 +1562,7 @@ class TestPostFlightHintsUpdatedGrounding:
         stage = _make_stage(known_projects=_KNOWN_PROJECTS, taskmaster=_StubTaskmaster())
         report = _make_report({'task_hints_updated_records': [_hints_record()]})
 
-        await stage._apply_post_flight_guards(report, [], RUN_HINTS)
+        await stage._apply_post_flight_guards(report, RUN_HINTS)
 
         assert report.stats['tasks_hints_updated'] == 0
         assert report.stats['task_hints_updated_records_uncorroborated'] == 1
@@ -1575,7 +1575,7 @@ class TestPostFlightHintsUpdatedGrounding:
             'task_hints_updated_records': [_hints_record(project_id='nowhere')],
         })
 
-        await stage._apply_post_flight_guards(report, [], RUN_HINTS)
+        await stage._apply_post_flight_guards(report, RUN_HINTS)
 
         assert report.stats['task_hints_updated_records_unresolvable'] == 1
         assert stub.calls == []
@@ -1593,7 +1593,7 @@ class TestPostFlightHintsUpdatedGrounding:
             'task_hints_updated_records': [_hints_record(project_id='reify')],
         })
 
-        await stage._apply_post_flight_guards(report, [], RUN_HINTS)
+        await stage._apply_post_flight_guards(report, RUN_HINTS)
 
         assert report.stats['tasks_hints_updated'] == 1
         assert stub.calls == [('7', '/repo/reify')]
@@ -1607,7 +1607,7 @@ class TestPostFlightHintsUpdatedGrounding:
         )
         report = _make_report({})
 
-        await stage._apply_post_flight_guards(report, [], RUN_HINTS)
+        await stage._apply_post_flight_guards(report, RUN_HINTS)
 
         assert report.stats['tasks_hints_updated'] == 0
         assert report.stats['task_hints_updated_records_journaled'] == 0
@@ -1624,7 +1624,7 @@ class TestPostFlightHintsUpdatedGrounding:
             'task_hints_updated_records': [_hints_record()],
         })
 
-        await stage._apply_post_flight_guards(report, [], RUN_HINTS)
+        await stage._apply_post_flight_guards(report, RUN_HINTS)
 
         assert report.stats['tasks_hints_updated'] == 3
         assert 'tasks_hints_updated_reported' not in report.stats
@@ -1639,7 +1639,7 @@ class TestPostFlightHintsUpdatedGrounding:
             'task_hints_updated_records': [_hints_record(entities=[], queries=[])],
         })
 
-        await stage._apply_post_flight_guards(report, [], RUN_HINTS)
+        await stage._apply_post_flight_guards(report, RUN_HINTS)
 
         assert report.stats['tasks_hints_updated'] == 0
         assert report.stats['task_hints_updated_records_uncorroborated'] == 0
@@ -1654,7 +1654,8 @@ class TestPostFlightFlagCountersAreNeverClamped:
     against ``len(prior_reports[0].items_flagged)``, and ``prompts/stage2.py``
     never told the agent they were gone. Neither clamp has existed since
     tasks 2229/2230 (W5-mu) — ``_apply_post_flight_guards`` only
-    ``setdefault``-normalizes both keys. These pins keep that true (and are
+    ``setdefault``-normalizes both keys, and since task 4873 it no longer
+    receives the prior reports at all. These pins keep that true (and are
     what makes the step-11 prompt correction verifiable in code rather than
     prose).
     """
@@ -1662,8 +1663,6 @@ class TestPostFlightFlagCountersAreNeverClamped:
     @pytest.mark.asyncio
     async def test_self_reported_flag_counters_survive_untouched(self):
         stage = _make_stage(known_projects=_KNOWN_PROJECTS, taskmaster=_StubTaskmaster())
-        prior = _make_report({})
-        prior.items_flagged = [{'id': str(i)} for i in range(4)]
         report = _make_report({
             'stage1_analytical_findings_processed': 1,
             'stage1_mem0_flags_processed': 5,
@@ -1672,7 +1671,7 @@ class TestPostFlightFlagCountersAreNeverClamped:
             ],
         })
 
-        await stage._apply_post_flight_guards(report, [prior], 'test-run-3051')
+        await stage._apply_post_flight_guards(report, 'test-run-3051')
 
         assert report.stats['stage1_analytical_findings_processed'] == 1
         assert report.stats['stage1_mem0_flags_processed'] == 5
@@ -1682,7 +1681,7 @@ class TestPostFlightFlagCountersAreNeverClamped:
         stage = _make_stage(known_projects=_KNOWN_PROJECTS, taskmaster=_StubTaskmaster())
         report = _make_report({})
 
-        await stage._apply_post_flight_guards(report, [], 'test-run-3051')
+        await stage._apply_post_flight_guards(report, 'test-run-3051')
 
         assert report.stats['stage1_analytical_findings_processed'] == 0
         assert report.stats['stage1_mem0_flags_processed'] == 0

@@ -3521,7 +3521,7 @@ class TaskKnowledgeSync(BaseStage):
                 report.stats['stage2_stage1_dups_suppressed'] = len(suppressed)
 
         # --- post-flight guards (task 1137) ---
-        await self._apply_post_flight_guards(report, prior_reports, run_id)
+        await self._apply_post_flight_guards(report, run_id)
 
         # --- deterministic per-cycle summary write (task 2229 W5-λ) ---
         # Python writes the authoritative cycle_summary ledger row directly
@@ -3811,12 +3811,7 @@ class TaskKnowledgeSync(BaseStage):
                 result['failed'],
             )
 
-    async def _apply_post_flight_guards(
-        self,
-        report: StageReport,
-        prior_reports: list[StageReport],
-        run_id: str,
-    ) -> None:
+    async def _apply_post_flight_guards(self, report: StageReport, run_id: str) -> None:
         """Acknowledge resolved Stage 1 flag markers and ground Stage 2's counters.
 
         The flag-processing counters ``stage1_analytical_findings_processed``
@@ -3835,9 +3830,6 @@ class TaskKnowledgeSync(BaseStage):
         Args:
             report: The ``StageReport`` returned by ``super().run()``.
                 Mutated in place.
-            prior_reports: Stage reports for all earlier stages in this cycle.
-                Unused; kept for signature compatibility with the sole call
-                site.
             run_id: Current reconciliation run identifier.
         """
         # ── Stage-1 flag-marker acknowledgment (task-2029 scenario b) ──────────
@@ -3860,8 +3852,7 @@ class TaskKnowledgeSync(BaseStage):
         report.stats.setdefault('stage1_mem0_flags_processed', 0)
 
         journal = await read_run_creation_outcomes(
-            getattr(self.journal, 'write_journal', None), run_id,
-            default_project_id=self.project_id,
+            self.journal.write_journal, run_id, default_project_id=self.project_id,
         )
         report.stats.update(await ground_stage2_counters(
             report.stats,

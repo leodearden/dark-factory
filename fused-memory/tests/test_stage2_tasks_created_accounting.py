@@ -259,7 +259,7 @@ class TestPostFlightTasksCreatedRepair:
         stage = _make_stage()
         report = _make_report({})
 
-        await stage._apply_post_flight_guards(report, [], 'test-run-3046')
+        await stage._apply_post_flight_guards(report, 'test-run-3046')
 
         assert report.stats['tasks_created'] == 0
         assert report.stats['task_created_records_valid'] == 0
@@ -285,7 +285,7 @@ class TestPostFlightTasksCreatedRepair:
         })
 
         with caplog.at_level(logging.WARNING, logger=_REPAIR_LOGGER):
-            await stage._apply_post_flight_guards(report, [], 'test-run-3046')
+            await stage._apply_post_flight_guards(report, 'test-run-3046')
 
         assert report.stats['tasks_created'] == 1
         assert report.stats['tasks_created_reported'] == 0
@@ -318,7 +318,7 @@ class TestPostFlightTasksCreatedRepair:
             ],
         })
 
-        await stage._apply_post_flight_guards(report, [], 'test-run-3046')
+        await stage._apply_post_flight_guards(report, 'test-run-3046')
 
         assert report.stats['tasks_created'] == 2
         assert report.stats['tasks_created_reported'] == 0
@@ -348,7 +348,7 @@ class TestPostFlightTasksCreatedRepair:
         })
 
         with caplog.at_level(logging.WARNING, logger=_REPAIR_LOGGER):
-            await stage._apply_post_flight_guards(report, [], 'test-run-3046')
+            await stage._apply_post_flight_guards(report, 'test-run-3046')
 
         assert report.stats['tasks_created'] == 2
         assert 'tasks_created_reported' not in report.stats
@@ -375,7 +375,7 @@ class TestPostFlightTasksCreatedRepair:
         })
 
         with caplog.at_level(logging.WARNING, logger=_REPAIR_LOGGER):
-            await stage._apply_post_flight_guards(report, [], 'test-run-3046')
+            await stage._apply_post_flight_guards(report, 'test-run-3046')
 
         assert report.stats['tasks_created'] == 3
         assert report.stats['task_created_records_valid'] == 1
@@ -390,7 +390,7 @@ class TestPostFlightTasksCreatedRepair:
             'task_created_records': 'not-a-list',
         })
 
-        await stage._apply_post_flight_guards(report, [], 'test-run-3046')
+        await stage._apply_post_flight_guards(report, 'test-run-3046')
 
         assert report.stats['tasks_created'] == 0
         assert report.stats['task_created_records_valid'] == 0
@@ -414,7 +414,7 @@ class TestPostFlightTasksCreatedRepair:
             ],
         })
 
-        await stage._apply_post_flight_guards(report, [], 'test-run-3046')
+        await stage._apply_post_flight_guards(report, 'test-run-3046')
 
         assert report.stats['tasks_created'] == 0
         assert report.stats['task_created_records_valid'] == 0
@@ -461,7 +461,7 @@ class TestPostFlightTasksCreatedRepair:
             ],
         })
 
-        await stage._apply_post_flight_guards(report, [], 'test-run-3046')
+        await stage._apply_post_flight_guards(report, 'test-run-3046')
 
         assert report.stats['tasks_created'] == expected
         assert isinstance(report.stats['tasks_created'], int)
