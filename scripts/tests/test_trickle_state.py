@@ -830,13 +830,13 @@ class TestRecordRunFailedStreak:
 _CENSUS_STATE = '/p/docs/legibility/census-state.json'
 
 
-def _fire(anchor='2026-08-02', path=_CENSUS_STATE):
+def _fire(anchor: str | None = '2026-08-02', path=_CENSUS_STATE):
     return trickle_state.CensusObservation(
         fired=True, last_census_at=anchor, census_state_path=path,
     )
 
 
-def _no_fire(anchor='2026-08-02', path=_CENSUS_STATE):
+def _no_fire(anchor: str | None = '2026-08-02', path=_CENSUS_STATE):
     return trickle_state.CensusObservation(
         fired=False, last_census_at=anchor, census_state_path=path,
     )
@@ -995,8 +995,10 @@ class TestReadCensusFireStreak:
             census_state_path=_CENSUS_STATE,
             since='2026-07-01',
         )
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            setattr(streak, 'fires', 9)
+        assert streak is not None
+        for field in dataclasses.fields(streak):
+            with pytest.raises(dataclasses.FrozenInstanceError):
+                setattr(streak, field.name, None)
 
     def test_a_never_censused_anchor_parses(self):
         raw = dict(self._WELL_FORMED, last_census_at=None)
