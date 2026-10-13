@@ -160,7 +160,7 @@ if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.reconciliation.event_buffer import EventBuffer
     from fused_memory.reconciliation.journal import ReconciliationJournal
-    from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+    from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
     from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
     from fused_memory.services.write_journal import WriteJournal
 
@@ -279,6 +279,33 @@ def metadata_row_text(row: Mapping[str, Any]) -> str:
     """
     payload = row.get('metadata')
     return _mem0_content(payload) if isinstance(payload, dict) else ''
+
+
+def _decode_mem0_tombstone(record: ReconLedgerRecord) -> dict | None:
+    """A ``mem0_tombstone`` row's payload plus its own timestamps, or ``None`` (one WARNING).
+
+    The one decode behind ``MemoryService.get_mem0_deletion_tombstone`` and
+    ``MemoryService.find_mem0_deletion_tombstones``; that first method's
+    docstring says why the row's timestamps are added under their own names.
+    """
+    try:
+        payload = json.loads(record.payload_json)
+    except (TypeError, ValueError):
+        payload = None
+    if not isinstance(payload, dict):
+        logger.warning(
+            'mem0 tombstone: unreadable payload for memory_id=%s in project=%s; '
+            'reporting no tombstone',
+            record.task_id,
+            record.project_id,
+            extra={'project_id': record.project_id, 'memory_id': record.task_id},
+        )
+        return None
+    return {
+        **payload,
+        'tombstone_created_at': record.created_at,
+        'tombstone_expires_at': record.expires_at,
+    }
 
 
 def _mem0_category(meta: dict) -> MemoryCategory | None:
@@ -8611,24 +8638,43 @@ class MemoryService:
             return None
         if record is None:
             return None
+        return _decode_mem0_tombstone(record)
+
+    async def find_mem0_deletion_tombstones(
+        self, project_id: str, prefix: str
+    ) -> list[dict] | None:
+        """Every readable tombstone whose memory id starts with *prefix*, or ``None``.
+
+        Feeds the uuid-prefix miss report (PRD C4, task 5323): the tombstone
+        store is keyed by the full id, so a prefix needs a listing, read in
+        one query. Each row decodes exactly as :meth:`get_mem0_deletion_tombstone`
+        decodes it, tagged with its ``memory_id``.
+
+        ``None`` means the tombstone store could not be read: no ledger is
+        wired, or the listing raised (one WARNING). It is never ``[]``, which a
+        reader would take for "nothing with this prefix was reaped" (INV-11).
+        """
+        ledger = getattr(self, 'recon_ledger', None)
+        if ledger is None:
+            return None
         try:
-            payload = json.loads(record.payload_json)
-        except (TypeError, ValueError):
-            payload = None
-        if not isinstance(payload, dict):
+            records = await ledger.mem0_tombstones_with_prefix(project_id, prefix)
+        except Exception:
             logger.warning(
-                'get_mem0_deletion_tombstone: unreadable tombstone payload for '
-                'memory_id=%s in project=%s; reporting no tombstone',
-                memory_id,
+                'find_mem0_deletion_tombstones: tombstone store listing FAILED for '
+                'prefix=%s in project=%s; reporting tombstones unchecked',
+                prefix,
                 project_id,
-                extra={'project_id': project_id, 'memory_id': memory_id},
+                exc_info=True,
+                extra={'project_id': project_id, 'prefix': prefix},
             )
             return None
-        return {
-            **payload,
-            'tombstone_created_at': record.created_at,
-            'tombstone_expires_at': record.expires_at,
-        }
+        found: list[dict] = []
+        for record in records:
+            decoded = _decode_mem0_tombstone(record)
+            if decoded is not None:
+                found.append({'memory_id': record.task_id, **decoded})
+        return found
 
     # ------------------------------------------------------------------
     # Read: cycle_summary ledger presence (task 2436, τ1)
