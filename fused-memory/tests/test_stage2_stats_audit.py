@@ -1402,7 +1402,7 @@ class TestPostFlightTasksCombinedSplit:
 
         assert report.stats['tasks_created'] == 0
         assert report.stats['tasks_combined'] == 1
-        assert report.stats['task_combined_records_valid'] == 1
+        assert report.stats['tasks_combined_evidence_valid'] == 1
 
     @pytest.mark.asyncio
     async def test_a_journal_combined_row_raises_tasks_combined_only(self):
@@ -1415,7 +1415,7 @@ class TestPostFlightTasksCombinedSplit:
 
         assert report.stats['tasks_created'] == 0
         assert report.stats['tasks_combined'] == 1
-        assert report.stats['task_combined_records_journaled'] == 1
+        assert report.stats['tasks_combined_evidence_journaled'] == 1
         assert report.stats['task_created_records_journaled'] == 0
 
     @pytest.mark.asyncio
@@ -1489,7 +1489,10 @@ class TestPostFlightTasksCombinedSplit:
         await stage._apply_post_flight_guards(report, [], RUN_COMBINED)
 
         for suffix in ('valid', 'journaled', 'uncorroborated', 'unresolvable'):
-            assert report.stats[f'task_combined_records_{suffix}'] == 0
+            assert report.stats[f'tasks_combined_evidence_{suffix}'] == 0
+        # Combined outcomes are recorded in task_created_records; no stat may
+        # name a task_combined_records list that Stage 2 never emits.
+        assert not [key for key in report.stats if key.startswith('task_combined_records')]
 
     @pytest.mark.asyncio
     async def test_tasks_combined_reported_carries_the_raw_value_on_repair(self):

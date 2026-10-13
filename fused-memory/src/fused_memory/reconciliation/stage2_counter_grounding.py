@@ -300,7 +300,7 @@ class _GroundedCounter:
 
 _GROUNDED_COUNTERS: tuple[_GroundedCounter, ...] = (
     _GroundedCounter('tasks_created', 'task_created_records', _created_evidence),
-    _GroundedCounter('tasks_combined', 'task_combined_records', _combined_evidence),
+    _GroundedCounter('tasks_combined', 'tasks_combined_evidence', _combined_evidence),
     _GroundedCounter('tasks_hints_updated', 'task_hints_updated_records', _hints_updated_evidence),
 )
 
