@@ -50,7 +50,15 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable, Iterable, Iterator, MutableMapping, MutableSet
+from collections.abc import (
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    MutableMapping,
+    MutableSet,
+)
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -186,11 +194,16 @@ class _GuardStore:
 
     # --- mutations (each flushes through the one chokepoint) ---
 
-    def put(self, key: str, value: Any) -> None:
-        """Store *value* under *key*, always refreshing the timestamp."""
+    def put(self, key: str, value: Any, *, flush: bool = True) -> None:
+        """Store *value* under *key*, always refreshing the timestamp.
+
+        ``flush=False`` defers the write exactly as :meth:`insert_if_absent`'s
+        does.
+        """
         self._entries[key] = _Entry(value=value, updated_at=self._now())
         self._removed.discard(key)
-        self.flush()
+        if flush:
+            self.flush()
 
     def insert_if_absent(self, key: str, value: Any, *, flush: bool = True) -> bool:
         """Store *value* under *key* only if *key* is not already present.
@@ -219,12 +232,17 @@ class _GuardStore:
             self.flush()
         return True
 
-    def remove(self, key: str) -> bool:
-        """Drop *key*.  Returns whether it was there to drop."""
+    def remove(self, key: str, *, flush: bool = True) -> bool:
+        """Drop *key*.  Returns whether it was there to drop.
+
+        ``flush=False`` defers the write as :meth:`insert_if_absent`'s does;
+        the key is still recorded as removed, so ANY later flush applies it.
+        """
         if self._entries.pop(key, None) is None:
             return False
         self._removed.add(key)
-        self.flush()
+        if flush:
+            self.flush()
         return True
 
     # --- disk ---
@@ -346,7 +364,7 @@ class PersistentSet(MutableSet[str]):
 
     Backs the guards whose whole state is "this key happened": a capped
     escalation id, a derailed task id, a fingerprint whose blocker was already
-    promoted, a task id already seen non-pending.
+    promoted, a task id owed an age reset.
 
     ``add`` is idempotent in the strong sense — re-adding a key that is
     already present neither refreshes its TTL nor writes to disk — so a caller
@@ -380,11 +398,13 @@ class PersistentSet(MutableSet[str]):
         the whole map, so a per-element flush costs a batch of N some N+1
         writes and O(N^2) parse/serialise work.  Measured at the per-element
         shape this replaced: N=373 -> 374 writes in 3.17s, N=1500 -> 1501 in
-        19.22s.  The worst case is
-        ``orchestrator/src/orchestrator/scheduler.py::Scheduler._update_age_anchors``,
-        whose cold start observes every active non-pending task at once —
-        N=373 in the live store when this was measured — inline on the event
-        loop of the first ``acquire_next`` tick after a fleet redeploy.
+        19.22s.  The batches that pay it run inline on the scheduler's event
+        loop: the departures
+        ``orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_stale_sweep``
+        records when many tasks leave the active fetch in one tick, and the
+        age resets
+        ``orchestrator/src/orchestrator/scheduler.py::Scheduler._update_age_anchors``
+        consumes when they come back together.
         """
         changed = False
         for value in values:
@@ -408,6 +428,22 @@ class PersistentSet(MutableSet[str]):
         plain ``set``.
         """
         self.update(value)
+        return self
+
+    def difference_update(self, values: Iterable[str]) -> None:
+        """Remove every element of *values*, then write ONCE — the removal
+        twin of :meth:`update`, whose docstring carries the O(N^2) rationale.
+        A batch that removed nothing writes nothing."""
+        changed = False
+        for value in values:
+            changed |= self._store.remove(value, flush=False)
+        if changed:
+            self._store.flush()
+
+    def __isub__(self, it: AbstractSet[Any]) -> Self:
+        """Batch-remove via :meth:`difference_update`; ``MutableSet``'s own
+        ``__isub__`` loops calling ``discard``, which writes per element."""
+        self.difference_update(it)
         return self
 
     def __contains__(self, value: object) -> bool:
@@ -459,6 +495,14 @@ class PersistentMap(MutableMapping[str, Any]):
 
     def __setitem__(self, key: str, value: Any) -> None:
         self._store.put(key, value)
+
+    def put_many(self, items: Mapping[str, Any]) -> None:
+        """Store every item, then write ONCE — see :meth:`PersistentSet.update`
+        for why one write.  An empty mapping writes nothing."""
+        for key, value in items.items():
+            self._store.put(key, value, flush=False)
+        if items:
+            self._store.flush()
 
     def __delitem__(self, key: str) -> None:
         if not self._store.remove(key):
