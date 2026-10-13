@@ -78,6 +78,7 @@ from census_tagger_debris import (
     render_markdown,
     write_artifacts,
 )
+from shared.project_id import project_id_for_root
 
 # ---------------------------------------------------------------------------
 # The classification vocabulary and the pure three-axis classifier.
@@ -1369,13 +1370,16 @@ def test_an_undecided_axis_emits_fidelity_present_and_null(tmp_path):
         assert row[key]["fidelity"] is None
 
 
-def test_project_id_is_the_root_basename_with_underscores(tmp_path):
-    """The six corpora spell their ids with underscores where the directory
-    uses hyphens (solar-challenge-platform -> solar_challenge_platform). The
-    artifact must use the id spelling its consumers already key on."""
-    root = _make_project(tmp_path, name="solar-challenge-platform", tasks=[])
+def test_project_id_is_the_shared_rule_over_the_root_basename(tmp_path):
+    """The six corpora spell their ids lower-case with underscores where the
+    directory uses hyphens (Solar-Challenge-Platform -> solar_challenge_platform).
+    The artifact must use the id spelling its consumers already key on, which
+    is shared.project_id's one rule."""
+    root = _make_project(tmp_path, name="Solar-Challenge-Platform", tasks=[])
 
-    assert census_project(str(root)).coverage.project_id == "solar_challenge_platform"
+    project_id = census_project(str(root)).coverage.project_id
+
+    assert project_id == "solar_challenge_platform" == project_id_for_root(root)
 
 
 # ---------------------------------------------------------------------------

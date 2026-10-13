@@ -31,6 +31,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from _task_db_scan import (
     AUDIT_EXIT_FINDINGS,
     AUDIT_EXIT_NO_ROOT,
@@ -71,6 +72,7 @@ from audit_combine_gate_marker_loss import (
     resolve_project_id,
     tickets_db_path,
 )
+from shared.project_id import project_id_for_root
 
 # ---------------------------------------------------------------------------
 # load_combine_targets — the combine-target population.
@@ -1422,6 +1424,16 @@ def test_resolve_project_id_derives_from_the_directory_name(tmp_path):
 
 def test_resolve_project_id_override_wins(tmp_path):
     assert resolve_project_id("/home/leo/src/dark-factory", override="reify") == "reify"
+    assert resolve_project_id("/x/y/Know-Live", override="reify") == "reify"
+
+
+def test_resolve_project_id_folds_case_like_the_shared_rule():
+    assert resolve_project_id("/x/y/Know-Live") == "know_live" == project_id_for_root("/x/y/Know-Live")
+
+
+@pytest.mark.parametrize("root", ["/home/leo/src/dark-factory", "/x/a-b-c", "/x/Dark-Factory"])
+def test_resolve_project_id_is_the_shared_project_id_rule(root):
+    assert resolve_project_id(root) == project_id_for_root(root)
 
 
 def test_audit_project_flags_a_project_id_matching_zero_of_many(tmp_path, make_tasks_db):
