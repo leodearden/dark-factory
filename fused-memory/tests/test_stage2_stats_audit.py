@@ -1357,6 +1357,134 @@ class TestPostFlightJournalGrounding:
         assert _warnings_named(caplog, _UNDERCOUNT_EVENT) == []
 
 
+# ── task 4873 scope (2): combined outcomes count under tasks_combined ────────
+
+RUN_COMBINED = 'c0mb1ned-4444-4000-8000-000000000010'
+
+
+class TestPostFlightTasksCombinedSplit:
+    """A curator fold (drop / combine / idempotency / candidate-key collision)
+    mints no task id, so it counts under ``tasks_combined``, never
+    ``tasks_created`` — the hole the 3051 review named."""
+
+    @pytest.mark.asyncio
+    async def test_a_combined_record_raises_tasks_combined_not_tasks_created(self):
+        stub = _StubTaskmaster(results={('42', '/repo/df'): _task_record('42')})
+        stage = _make_stage(known_projects=_KNOWN_PROJECTS, taskmaster=stub)
+        report = _make_report({
+            'tasks_created': 0,
+            'task_created_records': [
+                {'action': 'task_created', 'task_id': '42', 'status': 'combined',
+                 'project_id': 'dark_factory'},
+            ],
+        })
+
+        await stage._apply_post_flight_guards(report, [], RUN_COMBINED)
+
+        assert report.stats['tasks_created'] == 0
+        assert report.stats['tasks_combined'] == 1
+        assert report.stats['task_combined_records_valid'] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_journal_combined_row_raises_tasks_combined_only(self):
+        stage = _make_stage(journal_rows=[
+            _journal_row(RUN_COMBINED, '42', project_id='dark_factory', operation='task_combined'),
+        ])
+        report = _make_report({})
+
+        await stage._apply_post_flight_guards(report, [], RUN_COMBINED)
+
+        assert report.stats['tasks_created'] == 0
+        assert report.stats['tasks_combined'] == 1
+        assert report.stats['task_combined_records_journaled'] == 1
+        assert report.stats['task_created_records_journaled'] == 0
+
+    @pytest.mark.asyncio
+    async def test_mixed_batch_splits_created_from_combined(self):
+        """Journal: 10 created, and a within-batch drop folded into that same
+        new task 10; plus a corroborated 'created' record for 11."""
+        stub = _StubTaskmaster(results={('11', '/repo/df'): _task_record('11')})
+        stage = _make_stage(
+            known_projects=_KNOWN_PROJECTS,
+            taskmaster=stub,
+            journal_rows=[
+                _journal_row(RUN_COMBINED, '10', project_id='dark_factory'),
+                _journal_row(
+                    RUN_COMBINED, '10', project_id='dark_factory', operation='task_combined',
+                ),
+            ],
+        )
+        report = _make_report({
+            'task_created_records': [
+                {'task_id': '11', 'status': 'created', 'project_id': 'dark_factory'},
+            ],
+        })
+
+        await stage._apply_post_flight_guards(report, [], RUN_COMBINED)
+
+        assert report.stats['tasks_created'] == 2
+        assert report.stats['tasks_combined'] == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('raw', 'expected'),
+        [('2', 2), (2.0, 2), (True, 0), (float('nan'), 0), (None, 0)],
+        ids=['str', 'float', 'bool', 'nan', 'none'],
+    )
+    async def test_tasks_combined_self_report_is_coerced(self, raw, expected):
+        stage = _make_stage()
+        report = _make_report({'tasks_combined': raw})
+
+        await stage._apply_post_flight_guards(report, [], RUN_COMBINED)
+
+        assert report.stats['tasks_combined'] == expected
+        assert type(report.stats['tasks_combined']) is int
+
+    @pytest.mark.asyncio
+    async def test_tasks_combined_is_always_present(self):
+        stage = _make_stage()
+        report = _make_report({})
+
+        await stage._apply_post_flight_guards(report, [], RUN_COMBINED)
+
+        assert report.stats['tasks_combined'] == 0
+        assert 'tasks_combined_reported' not in report.stats
+
+    @pytest.mark.asyncio
+    async def test_a_larger_tasks_combined_self_report_is_never_lowered(self):
+        stage = _make_stage(journal_rows=[
+            _journal_row(RUN_COMBINED, '42', project_id='dark_factory', operation='task_combined'),
+        ])
+        report = _make_report({'tasks_combined': 4})
+
+        await stage._apply_post_flight_guards(report, [], RUN_COMBINED)
+
+        assert report.stats['tasks_combined'] == 4
+        assert 'tasks_combined_reported' not in report.stats
+
+    @pytest.mark.asyncio
+    async def test_the_combined_stat_family_is_always_published(self):
+        stage = _make_stage()
+        report = _make_report({})
+
+        await stage._apply_post_flight_guards(report, [], RUN_COMBINED)
+
+        for suffix in ('valid', 'journaled', 'uncorroborated', 'unresolvable'):
+            assert report.stats[f'task_combined_records_{suffix}'] == 0
+
+    @pytest.mark.asyncio
+    async def test_tasks_combined_reported_carries_the_raw_value_on_repair(self):
+        stage = _make_stage(journal_rows=[
+            _journal_row(RUN_COMBINED, '42', project_id='dark_factory', operation='task_combined'),
+        ])
+        report = _make_report({'tasks_combined': '0'})
+
+        await stage._apply_post_flight_guards(report, [], RUN_COMBINED)
+
+        assert report.stats['tasks_combined'] == 1
+        assert report.stats['tasks_combined_reported'] == '0'
+
+
 class TestPostFlightFlagCountersAreNeverClamped:
     """Audit conclusion for the adjacent flag counters, as executable behaviour.
 
