@@ -7,7 +7,8 @@ producer exits non-zero after printing the match, or because `grep -q` closes
 the pipe on its first match and the still-writing producer dies of SIGPIPE.
 
 The behavioural suites (test_script_probe_pipelines.py,
-test_setup_host_probe_pipelines.py) pin what each fixed site DOES. This module
+test_setup_host_probe_pipelines.py, and for the warm-lane scripts the bash
+suites in orchestrator/tests/warm-lane/) pin what each fixed site DOES. This module
 pins that the defective CONSTRUCT does not come back, in every script listed in
 `_SWEPT_SCRIPTS`. Its detector is the shared `grep_q_offenders` in
 tests/scripts/shell_sections.py, guarded by

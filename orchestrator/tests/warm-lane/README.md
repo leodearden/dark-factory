@@ -74,6 +74,15 @@ above still describe the ported baseline, not the current file:
   `lib_lane_state.sh`, with `lib_live_refs.sh` deliberately PRESENT in the
   fixture so A9's guard cannot account for the result.
 
+Six ported suites carry further dark-factory-native asserts:
+
+- **Task 5940:** `test_provision_warm_lane_fs.sh` N4, `test_warm_lane_disk_guard.sh` A10,
+  `test_warm_lane_gc_sweep.sh` G6g, `test_warm_lane_gc.sh` A11m/A11n,
+  `test_warm_lane_audit.sh` A3/A4 and `test_warm_lane_degenerate_ref.sh` U8.
+  They pin the script-side change recorded in
+  [`orchestrator/scripts/warm-lane/README.md`](../../scripts/warm-lane/README.md)
+  "Delta 12".
+
 ## Why these eight
 
 The port set was confirmed against **what α actually relocated**, not against a
