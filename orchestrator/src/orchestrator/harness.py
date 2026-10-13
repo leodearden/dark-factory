@@ -585,6 +585,8 @@ _WATCHER_DISALLOWED_TOOLS: list[str] = [
     'Bash(git clean:*)',
     'Bash(git merge:*)',
     'Bash(git rebase:*)',
+    # Unscoped on purpose: removes the tool from the CLI registry, so no skill loads; SKILL.md invokes none.
+    'Skill',
 ]
 
 

@@ -301,6 +301,8 @@ _DISALLOWED_TOOLS: list[str] = [
     # would falsify it.
     'mcp__fused-memory__consolidate_memories',
     'mcp__fused-memory__remove_task',
+    # Unscoped on purpose: removes the tool from the CLI registry, so no skill loads; SKILL.md invokes none.
+    'Skill',
 ]
 
 # ---------------------------------------------------------------------------
