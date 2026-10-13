@@ -29,8 +29,8 @@ discovery/assertion split:
   descendant set ``wait_subtree_live`` RETURNS still come only from the
   production walkers ``collect_descendants``/``read_ppid_map``.  A kill
   verdict on CAPTURED pids goes through ``wait_pids_exited`` (a zombie-aware
-  ``/proc/<pid>/stat`` read, task 5903), but the pids themselves are still
-  discovered only by those walkers.
+  ``shared/src/shared/proc_group.py::read_stat_fields`` read), but the pids
+  themselves are still discovered only by those walkers.
 * the ARRANGE-phase discovery GATE adds a cheap Linux
   ``/proc/<pid>/task/*/children`` pre-filter (:func:`_read_direct_children`)
   that decides nothing except whether to spend a full rescan on a given poll
@@ -82,7 +82,7 @@ from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 from click.testing import CliRunner
 from df_pytest_isolation import load_scaled_grace
 from escalation.queue import EscalationQueue
-from shared.proc_group import StatFields
+from shared.proc_group import StatFields, read_stat_fields
 from test_cli import _setup_verify_repo  # noqa: F401 -- reused cross-module
 from test_merge_queue_multihost_wiring import (  # noqa: F401 -- reused cross-module
     _make_config as _mq_make_config,
@@ -794,31 +794,13 @@ def wait_subtree_gone(pgid: int, *, timeout: float, interval: float = 0.1) -> bo
     return subtree_and_leader_gone(pgid)
 
 
-class ProcState(NamedTuple):
-    """A pid's ``/proc/<pid>/stat`` state letter and parent pid."""
+def read_proc_state(pid: int) -> StatFields | None:
+    """*pid*'s stat fields, or None once it has no ``/proc`` entry.
 
-    state: str
-    ppid: int
-
-    @property
-    def exited(self) -> bool:
-        """A zombie has terminated and is only awaiting its (possibly reparented) parent's reap."""
-        return self.state in ('Z', 'X')
-
-
-def read_proc_state(pid: int) -> ProcState | None:
-    """*pid*'s :class:`ProcState`, or None when it has no ``/proc`` entry.
-
-    Parsed after the LAST ``') '`` exactly as
-    :func:`orchestrator.verify_cancel.read_ppid_map` does, since ``comm`` may
-    hold spaces or parens.  A malformed stat raises rather than reading as gone.
+    A probe of one pid, so a malformed stat raises rather than reading as gone
+    (task 5903).
     """
-    try:
-        raw = Path(f'/proc/{pid}/stat').read_text()
-    except OSError:
-        return None
-    fields = raw.rsplit(') ', 1)[1].split()
-    return ProcState(state=fields[0], ppid=int(fields[1]))
+    return read_stat_fields(Path('/proc') / str(pid), skip_malformed=False)
 
 
 def wait_pids_exited(
@@ -826,12 +808,12 @@ def wait_pids_exited(
     *,
     timeout: float,
     interval: float = 0.05,
-    _read_state: Callable[[int], ProcState | None] = read_proc_state,
+    _read_state: Callable[[int], StatFields | None] = read_proc_state,
     _clock: Callable[[], float] = time.monotonic,
-) -> dict[int, ProcState]:
+) -> dict[int, StatFields]:
     """Poll until every pid in *pids* has exited; return the still-RUNNING ones.
 
-    Each survivor maps to its last observed :class:`ProcState`; an empty dict
+    Each survivor maps to its last observed :class:`StatFields`; an empty dict
     means every pid exited.  A zombie counts as exited: reaping a reparented
     orphan is its subreaper's job (``systemd --user`` on this fleet), not the
     code under test's -- the same criterion as
@@ -845,7 +827,7 @@ def wait_pids_exited(
     while True:
         running = {
             pid: state for pid in pids
-            if (state := _read_state(pid)) is not None and not state.exited
+            if (state := _read_state(pid)) is not None and not state.terminated
         }
         if not running or _clock() >= deadline:
             return running
@@ -3463,7 +3445,7 @@ def test_kill_holder_tree_sweeps_the_session_escaped_orphan_of_an_already_reaped
             'already-reaped short circuit never fires and this test exercises nothing'
         )
         orphan_state = read_proc_state(grandchild)
-        assert orphan_state is not None and not orphan_state.exited, (
+        assert orphan_state is not None and not orphan_state.terminated, (
             f'harness bug: orphan pid={grandchild} is not running ({orphan_state}) '
             f'before teardown, so its exit afterwards would prove nothing'
         )
