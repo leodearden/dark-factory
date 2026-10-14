@@ -610,3 +610,136 @@ async def test_restamp_of_held_row_moves_the_lease(
     record = _valid_record((await stack.read(task_id))['metadata']['deferral'])
     assert isinstance(record, task_deferral.HeldBySessionDeferral), record
     assert record.holder.pid == second_claude_holder
+
+
+# Rows 9, 25 and 10: compare-and-set, the guarded re-stamp, and the legacy shape.
+
+
+def _assert_changed(
+    result: Any, *, expected: str | None, current: str | None, current_status: str,
+) -> None:
+    assert result['success'] is False, result
+    assert result['error'] == 'deferral_changed', result
+    assert result['expected_stamped_at'] == expected
+    if current is None:
+        assert result['current_stamped_at'] is None, result
+    else:
+        assert task_deferral.parse_utc_timestamp(
+            result['current_stamped_at'],
+        ) == task_deferral.parse_utc_timestamp(current)
+    assert result['current_status'] == current_status
+
+
+async def _stamped_at(stack: Stack, task_id: str) -> str:
+    return (await stack.read(task_id))['metadata']['deferral']['stamped_at']
+
+
+@pytest.mark.asyncio
+async def test_cas_refuses_a_moved_record_and_replays_success(stack: Stack) -> None:
+    task_id = await stack.seed('pending', 'row 9 cas')
+    await _enter(stack, task_id, _until_condition('row 9 first'))
+    s1 = await _stamped_at(stack, task_id)
+    await _enter(stack, task_id, _until_condition('row 9 second'))
+    s2 = await _stamped_at(stack, task_id)
+
+    moved = await stack.call(
+        'set_task_status', id=task_id, status='pending', expected_stamped_at=s1,
+    )
+    _assert_changed(moved, expected=s1, current=s2, current_status='deferred')
+    assert await _stamped_at(stack, task_id) == s2
+    stored = (await stack.read(task_id))['metadata']['deferral']
+
+    released = await stack.call(
+        'set_task_status', id=task_id, status='pending', expected_stamped_at=s2,
+        client_op_id='op-6525-cas',
+    )
+    assert 'error' not in released, released
+    assert (await stack.read(task_id))['status'] == 'pending'
+    assert released['deferral_cleared'] == stored
+
+    replayed = await stack.call(
+        'set_task_status', id=task_id, status='pending', expected_stamped_at=s2,
+        client_op_id='op-6525-cas',
+    )
+    assert replayed == released
+
+
+@pytest.mark.asyncio
+async def test_cas_on_a_row_that_left_deferred(stack: Stack) -> None:
+    task_id = await stack.seed('pending', 'row 9 left')
+    expected = '2026-10-14T00:00:00+00:00'
+
+    result = await stack.call(
+        'set_task_status', id=task_id, status='blocked', expected_stamped_at=expected,
+    )
+
+    _assert_changed(result, expected=expected, current=None, current_status='pending')
+    await _assert_untouched(stack, task_id, 'pending')
+
+
+_LEGACY = {'kind': 'legacy_unknown', 'reason': 'migration'}
+
+
+@pytest.mark.asyncio
+async def test_guarded_restamp_on_unrecorded_row(stack: Stack) -> None:
+    task_id = await stack.seed('deferred', 'row 25 unrecorded')
+
+    result = await stack.call(
+        'set_task_status', id=task_id, status='deferred', deferral=_LEGACY, restamp_only=True,
+    )
+
+    assert 'error' not in result, result
+    stored = (await stack.read(task_id))['metadata']['deferral']
+    record = _valid_record(stored)
+    assert isinstance(record, task_deferral.LegacyUnknownDeferral), record
+    assert record.deferred_at is None
+    assert result['deferral'] == stored
+
+
+@pytest.mark.asyncio
+async def test_guarded_restamp_on_repended_row(stack: Stack) -> None:
+    task_id = await stack.seed('deferred', 'row 25 repended')
+    assert (await stack.read(task_id))['status'] == 'deferred'
+    released = await stack.call('set_task_status', id=task_id, status='pending')
+    assert 'error' not in released, released
+
+    result = await stack.call(
+        'set_task_status', id=task_id, status='deferred', deferral=_LEGACY, restamp_only=True,
+    )
+
+    _assert_changed(result, expected=None, current=None, current_status='pending')
+    await _assert_untouched(stack, task_id, 'pending')
+
+
+@pytest.mark.asyncio
+async def test_guarded_restamp_expects_the_current_record(stack: Stack) -> None:
+    task_id = await stack.seed('pending', 'row 25 recorded')
+    await _enter(stack, task_id, _until_condition('row 25 first'))
+    current = await _stamped_at(stack, task_id)
+    replacement = _until_condition('row 25 second')
+
+    unguarded = await stack.call(
+        'set_task_status', id=task_id, status='deferred', deferral=replacement,
+        restamp_only=True,
+    )
+    guarded = await stack.call(
+        'set_task_status', id=task_id, status='deferred', deferral=replacement,
+        restamp_only=True, expected_stamped_at=current,
+    )
+
+    _assert_changed(unguarded, expected=None, current=current, current_status='deferred')
+    assert 'error' not in guarded, guarded
+    stored = (await stack.read(task_id))['metadata']['deferral']
+    assert stored['condition'] == 'row 25 second'
+
+
+@pytest.mark.asyncio
+async def test_legacy_unknown_on_recorded_row_is_server_only(stack: Stack) -> None:
+    task_id = await stack.seed('pending', 'row 10 recorded')
+    await _enter(stack, task_id, _until_condition('row 10'))
+    stored = (await stack.read(task_id))['metadata']['deferral']
+
+    result = await stack.call('set_task_status', id=task_id, status='deferred', deferral=_LEGACY)
+
+    _assert_invalid(result, task_id, 'server_only_kind', 'kind')
+    assert (await stack.read(task_id))['metadata']['deferral'] == stored
