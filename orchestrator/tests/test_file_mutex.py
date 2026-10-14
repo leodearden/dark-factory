@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+
 from orchestrator.file_mutex import FileMutexTimeout, exclusive
 
 _SRC = Path(__file__).resolve().parents[1] / 'src'
