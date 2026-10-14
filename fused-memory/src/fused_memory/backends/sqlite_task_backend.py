@@ -44,6 +44,7 @@ from fused_memory.backends.task_backend_errors import (
     DeferralWriteAuthorityError,
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
+    MetadataNotAnObjectError,
     StatusWriteAuthorityError,
     TaskmasterError,
     TaskNotFoundError,
@@ -3358,10 +3359,14 @@ class SqliteTaskBackend:
         # sanctioned writer for status AND metadata.done_provenance — it
         # enforces the terminal-exit, phantom-done, and done-provenance
         # gates — so update_task may never ADD, CHANGE or REMOVE
-        # metadata.done_provenance. The status floor, and the done_provenance
-        # floor in every mode except 'replace', reject unconditionally before
-        # ensure_connected() and the task SELECT, so a write-authority
-        # rejection takes precedence over any existence or connection error.
+        # metadata.done_provenance. The status floor, the non-object metadata
+        # floor, and the done_provenance floor in every mode except 'replace',
+        # reject unconditionally before ensure_connected() and the task
+        # SELECT, so a write-authority or shape rejection takes precedence
+        # over any existence or connection error. The non-object floor applies
+        # in EVERY mode, replace included: a payload that is not a JSON object
+        # has no keys to merge, and refusing it needs no stored state
+        # (_metadata_object_or_raise, task 6130).
         # Only metadata_mode='replace' defers: a whole-blob replace must
         # carry the STORED done_provenance through verbatim, which can only
         # be judged against the row, so _assert_done_provenance_passthrough
@@ -3374,25 +3379,8 @@ class SqliteTaskBackend:
             raise StatusWriteAuthorityError(task_id, status)
         parsed_metadata: dict | None = None
         if metadata is not None:
-            # Accept an already-parsed dict directly before falling back to
-            # json.loads. A caller that bypasses the documented ``str | None``
-            # signature and passes a dict would otherwise hit
-            # ``json.loads(dict)`` -> TypeError -> parsed_metadata=None,
-            # silently permitting a done_provenance write past this floor.
-            if isinstance(metadata, dict):
-                parsed_metadata = metadata
-            else:
-                try:
-                    loaded_metadata = json.loads(metadata)
-                except (ValueError, TypeError):
-                    loaded_metadata = None
-                if isinstance(loaded_metadata, dict):
-                    parsed_metadata = loaded_metadata
-            if (
-                parsed_metadata is not None
-                and 'done_provenance' in parsed_metadata
-                and metadata_mode != 'replace'
-            ):
+            parsed_metadata = _metadata_object_or_raise(metadata, task_id)
+            if 'done_provenance' in parsed_metadata and metadata_mode != 'replace':
                 raise DoneProvenanceWriteAuthorityError(task_id)
             # Same floor family, different remedy (task 3816 review
             # remediation): the wait-anchor keys are MACHINE-authored, so a
@@ -3482,7 +3470,7 @@ class SqliteTaskBackend:
                     f'No tasks found for ID(s): {task_id}',
                 )
             done_provenance_passed_through = False
-            if metadata_mode == 'replace':
+            if metadata_mode == 'replace' and parsed_metadata is not None:
                 done_provenance_passed_through = _assert_done_provenance_passthrough(
                     row['metadata'], parsed_metadata, task_id,
                 )
@@ -3557,9 +3545,9 @@ class SqliteTaskBackend:
                 # Strip reserved update_task call-flag key names (append,
                 # metadata_mode) from the INCOMING payload before merging —
                 # a caller that conflates the call-flag with a metadata field
-                # (task 2682) must not have the literal key persisted.
-                # Fail-safe passthrough for corrupt/non-dict payloads leaves
-                # _merge_metadata's own guards below as the source of truth.
+                # (task 2682) must not have the literal key persisted. The
+                # payload is already known to be a JSON object: the
+                # non-object floor above refused anything else.
                 metadata = _strip_reserved_control_keys(
                     metadata, project_root=project_root, tag=tag, task_id=tid,
                 )
@@ -3588,13 +3576,12 @@ class SqliteTaskBackend:
                 # An untouched legacy field (e.g. a pre-existing
                 # done_provenance missing the now-required kind) is tolerated
                 # rather than permanently blocking every future patch to the
-                # row. Falls back to None (enforce-all) when the payload
-                # isn't a JSON object — _merge_metadata already treats a
-                # non-dict incoming blob as last-write-wins, so there is no
-                # narrower "responsibility" to scope to here. Under replace, a
-                # done_provenance the passthrough check admitted is not this
-                # write's responsibility either: the caller had to send it
-                # back unchanged. The same holds for an admitted echo of
+                # row. The None (enforce-all) fallback for a payload that is
+                # not a JSON object is unreachable from here: the non-object
+                # floor above refuses such a payload before connect. Under
+                # replace, a done_provenance the passthrough check admitted is
+                # not this write's responsibility either: the caller had to
+                # send it back unchanged. The same holds for an admitted echo of
                 # metadata.deferral, which _assert_deferral_unchanged checks
                 # against the stored row in every mode.
                 deferral_echoed = _assert_deferral_unchanged(
@@ -4445,8 +4432,39 @@ def _merge_values(old: object, new: object) -> object:
     return old
 
 
+_JSON_TYPE_NAMES: dict[type, str] = {
+    list: 'array',
+    str: 'string',
+    bool: 'boolean',
+    int: 'number',
+    float: 'number',
+    type(None): 'null',
+}
+
+
+def _metadata_object_or_raise(metadata: str | dict, task_id: str | None) -> dict:
+    """Parse an update_task metadata payload, refusing anything but a JSON object.
+
+    A dict is returned as-is, so a caller bypassing the documented ``str``
+    signature cannot slip a payload past the floors that read the result.
+    Anything else is ``json.loads``-ed; text that does not parse, or JSON
+    that decodes to a non-object, raises :class:`MetadataNotAnObjectError`.
+    Such a payload has no keys to merge, and treating it as last-write-wins
+    wiped the whole stored blob, done_provenance included (task 6130).
+    """
+    if isinstance(metadata, dict):
+        return metadata
+    try:
+        loaded = json.loads(metadata)
+    except (ValueError, TypeError):
+        raise MetadataNotAnObjectError(task_id, 'invalid_json') from None
+    if not isinstance(loaded, dict):
+        raise MetadataNotAnObjectError(task_id, _JSON_TYPE_NAMES[type(loaded)])
+    return loaded
+
+
 def _assert_done_provenance_passthrough(
-    stored_raw: str | None, incoming: dict | None, task_id: str,
+    stored_raw: str | None, incoming: dict, task_id: str,
 ) -> bool:
     """Refuse a whole-blob replace that would move ``metadata.done_provenance``.
 
@@ -4471,9 +4489,10 @@ def _assert_done_provenance_passthrough(
     get_task -> json.dumps round trip, which is exactly how a
     read-modify-write caller builds its payload.
 
-    * ``incoming`` is None (unparseable or non-dict payload): no check, the
-      same fail-open the pre-connect floor applies. Known residual: such a
-      payload still replaces the blob and can destroy done_provenance.
+    ``incoming`` is always a JSON object: update_task's non-object floor
+    (:func:`_metadata_object_or_raise`) guarantees it, and rewrite_audit_trail
+    takes a dict.
+
     * The stored blob is absent or not a JSON object: identity cannot be
       established, so a payload carrying done_provenance is refused, while
       one omitting it is the corrupt-row repair replace mode exists for.
@@ -4484,8 +4503,6 @@ def _assert_done_provenance_passthrough(
     was admitted as a passthrough — the licence update_task needs to exclude
     that key from enforce-mode responsibility.
     """
-    if incoming is None:
-        return False
     try:
         stored = json.loads(stored_raw) if stored_raw is not None else None
     except (TypeError, ValueError):
