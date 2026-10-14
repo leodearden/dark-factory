@@ -366,6 +366,26 @@ def _stored_record(stored_metadata: object) -> _StoredRecord:
     return _StoredRecord(present=True, raw=raw, parsed=parse_record(raw))
 
 
+def _cas_refusal(
+    *, old_status: str, stored: _StoredRecord, call: DeferralCall, task_id: str,
+) -> DeferralChangedRefusal | None:
+    """Refuse a guarded write unless the row is deferred with the record the caller read.
+
+    An omitted expected_stamped_at expects no record; an invalid record counts as none.
+    """
+    if not call.restamp_only and call.expected_stamped_at is None:
+        return None
+    current = stored.valid.stamped_at if stored.valid is not None else None
+    if old_status == DEFERRED and current == call.expected_stamped_at:
+        return None
+    return DeferralChangedRefusal(
+        task_id,
+        expected_stamped_at=call.expected_stamped_at_text,
+        current_stamped_at=None if current is None else current.isoformat(),
+        current_status=old_status,
+    )
+
+
 def _needs_request(old_status: str, call: DeferralCall) -> bool:
     return (
         old_status != DEFERRED
@@ -402,6 +422,9 @@ def plan(
 ) -> GateRefusal | DeferralWrite:
     """One id's refusal or write plan, decided under the write lock from the stored row."""
     stored = _stored_record(stored_metadata)
+    changed = _cas_refusal(old_status=old_status, stored=stored, call=call, task_id=task_id)
+    if changed is not None:
+        return changed
     request = call.request
     if status == DEFERRED and request is None and _needs_request(old_status, call):
         return DeferralRequiredRefusal(task_id, old_status)
