@@ -2208,27 +2208,20 @@ class TaskWorkflow:
         when the persistence layer refuses.  The DONE phase is entered only
         once the done write has landed, so a refused write reaches
         ``_mark_blocked`` from a working machine and leaves a 'blocked' row
-        plus an L1.  A missing ``_merge_sha`` is the exception: that branch
-        enters DONE first, so its ``_mark_blocked`` is a swallowed late
-        transition and the exit is DONE.
+        plus an L1.  A missing ``_merge_sha`` exits DONE without writing the
+        row (task 3113).
         """
         await self._reconcile_metadata_files_for_done()
         if not self._merge_sha:
-            # Eval mode's DONE depends on entering DONE here, first; task 3113 owns this branch.
-            self._enter_phase(WorkflowState.DONE)
-            # Should never happen on the happy path — _submit_to_merge_queue
-            # always populates _merge_sha on success.  Defensive bail-out
-            # rather than passing done_provenance=None (which the server
-            # gate now rejects with done_provenance_required).
+            # Eval mode and the coalesced already_merged case reach here; task 3113 owns this exit.
             logger.error(
                 'Task %s: SUCCESS path reached without _merge_sha — '
-                'cannot construct done_provenance',
+                'cannot construct done_provenance; exiting DONE without '
+                'writing the done row',
                 self.task_id,
             )
-            return await self._mark_blocked(
-                'Internal: SUCCESS without merge_sha — provenance unconstructable',
-                escalate_to_human=True,
-            )
+            self._enter_phase(WorkflowState.DONE)
+            return WorkflowOutcome.DONE
         # task 3057: this stamp is DELIBERATELY NOT routed through
         # `gate_mark_done_on_delivered_checks`, unlike the eleven
         # attribution-shaped seams in this module, harness.py and
@@ -3037,29 +3030,24 @@ class TaskWorkflow:
                 # Not 'cancelled' (must be 'done' given TERMINAL_STATUSES).
                 # Reuse the bypass-discrimination helper: returns BLOCKED when a
                 # bypass is detected (reopen + bypass_done L1 already filed), or
-                # None when provenance is legitimate (commit reachable from main).
-                bypass_outcome = await self._handle_terminal_exit_on_block(
+                # DONE when provenance is legitimate (commit reachable from main).
+                terminal_outcome = await self._handle_terminal_exit_on_block(
                     exc,
                     reason=(
                         f'terminal at dispatch (old_status={exc.old_status!r})'
                     ),
                     detail='preempt: task terminal at dispatch',
                 )
-                if bypass_outcome is not None:
-                    # Bypass done detected — helper already reopened the row and
-                    # filed an L1 with category='bypass_done'.
-                    return bypass_outcome
-
-                # Legitimate done: provenance commit is reachable from main.
-                # The row is already terminal-done out-of-band (e.g. a human
-                # marked done during the ~3s acquire→dispatch window). Accept it.
-                logger.info(
-                    'Task %s: already legitimately done at dispatch (old_status=%r) '
-                    '— accepting, no reopen, no escalation',
-                    self.task_id, exc.old_status,
-                )
-                self._enter_phase(WorkflowState.DONE)
-                return WorkflowOutcome.DONE
+                if terminal_outcome is WorkflowOutcome.DONE:
+                    # The row is already terminal-done out-of-band (e.g. a human
+                    # marked done during the ~3s acquire→dispatch window).
+                    logger.info(
+                        'Task %s: already legitimately done at dispatch '
+                        '(old_status=%r) — accepting, no reopen, no escalation',
+                        self.task_id, exc.old_status,
+                    )
+                    self._enter_phase(WorkflowState.DONE)
+                return terminal_outcome
 
             # A persistence-layer rejection escaped one of the workflow's
             # set_task_status / mark_done call sites without an explicit
@@ -3474,16 +3462,8 @@ class TaskWorkflow:
         * a hard cancel: ``_enter_phase`` never persists status, so a
           forcibly-torn-down workflow leaves the row as it was — the harness
           R3 grace window and reconcile sweep own it;
-        * an in-flight Table-B action teardown (restart/abandon):
-          ``orchestrator/src/orchestrator/harness.py::Harness._action_teardown_and_set_status``
-          is the cancel choke point.  It writes this row (spec §5
-          cancelled/soft-cancelled row: "the park/teardown target") and
-          absorbs this workflow's own 'blocked' write.  It holds the stamp
-          until the slot clears or it issues a hard cancel, whose exit is
-          unjudged anyway.  Only a literal ``True`` counts, because a
-          MagicMock scheduler's attribute is truthy — the rule
-          ``orchestrator/src/orchestrator/exit_contract.py`` applies to
-          ``workflow_exit_contract_enforce``.
+        * an in-flight Table-B action teardown (restart/abandon), which owns
+          the row: ``orchestrator/src/orchestrator/harness.py::Harness._action_teardown_and_set_status``.
 
         A raising ``get_status`` (its contract is ``str | None``, so only a
         non-conforming double does this) reads as an unknown row.
@@ -7322,6 +7302,7 @@ class TaskWorkflow:
                 'leaving it (%s)',
                 self.task_id, status, exc.old_status, why,
             )
+            self._note_exit_status_write(status, None)
             return self._observed_terminal_outcome(exc.old_status)
         except Exception as exc:
             logger.warning(
@@ -16071,7 +16052,7 @@ class TaskWorkflow:
         exc: TerminalExitRejection,
         reason: str,
         detail: str,
-    ) -> WorkflowOutcome | None:
+    ) -> WorkflowOutcome:
         """Detect ``update_task(status='done')`` bypass after a terminal-exit rejection.
 
         When ``set_task_status('blocked')`` raises ``TerminalExitRejection``
@@ -16083,8 +16064,7 @@ class TaskWorkflow:
            ``WorkflowOutcome.CANCELLED`` immediately (before any ``get_task``
            round-trip or provenance read).
         1. Legitimate done (``old_status == 'done'``, provenance commit reachable
-           from main) — return ``None``; the caller reports the observed done
-           and files nothing.
+           from main) — return ``WorkflowOutcome.DONE``; nothing is filed.
         2. Bypass (``old_status == 'done'``, provenance missing or commit not on
            main) — reopen the row via
            ``set_task_status('blocked', reopen_reason='bypass detected: …')``,
@@ -16115,7 +16095,7 @@ class TaskWorkflow:
                         'commit %s is reachable from main — legitimate done',
                         self.task_id, commit[:12],
                     )
-                    return None
+                    return WorkflowOutcome.DONE
             except Exception:
                 logger.warning(
                     'Task %s: ancestor check failed during bypass detection',
@@ -16366,12 +16346,10 @@ class TaskWorkflow:
             try:
                 await self.scheduler.set_task_status(self.task_id, block_status)
             except TerminalExitRejection as exc:
-                bypass_outcome = await self._handle_terminal_exit_on_block(
+                self._note_exit_status_write(block_status, None)
+                return _record(await self._handle_terminal_exit_on_block(
                     exc, reason, detail or reason,
-                )
-                if bypass_outcome is not None:
-                    return _record(bypass_outcome)
-                return _record(self._observed_terminal_outcome(exc.old_status))
+                ))
             # Best-effort staleness-reference stamp (task 2557): records
             # the confirmed block transition so BriefingAssembler can
             # tell a stale persisted dry_run_proposals entry (from a
