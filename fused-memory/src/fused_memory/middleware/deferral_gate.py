@@ -260,21 +260,20 @@ def read_holder(pid: int, proc_root: Path) -> ProcessIdentity:
     return identity
 
 
-def _request_shape_error(
+def _check_request_shape(
     *,
     task_id: str,
     status: str,
     raw_deferral: object,
     expected_stamped_at: str | None,
     restamp_only: bool,
-) -> DeferralInvalid | None:
+) -> None:
     if ',' in task_id and (restamp_only or expected_stamped_at is not None):
-        return DeferralInvalid(DeferralInvalidReason.CAS_NEEDS_SINGLE_ID, 'id', task_id)
+        raise DeferralInvalid(DeferralInvalidReason.CAS_NEEDS_SINGLE_ID, 'id', task_id)
     if restamp_only and status != DEFERRED:
-        return DeferralInvalid(DeferralInvalidReason.FIELD_NOT_ALLOWED, 'restamp_only', status)
+        raise DeferralInvalid(DeferralInvalidReason.FIELD_NOT_ALLOWED, 'restamp_only', status)
     if raw_deferral is not None and status != DEFERRED:
-        return DeferralInvalid(DeferralInvalidReason.STATUS_NOT_DEFERRED, 'status', status)
-    return None
+        raise DeferralInvalid(DeferralInvalidReason.STATUS_NOT_DEFERRED, 'status', status)
 
 
 def _parse_expected(text: str | None) -> datetime | None:
@@ -324,15 +323,13 @@ async def corroborate(
     carrier row and raises TaskNotFoundError when it does not exist.
     """
     try:
-        shape_error = _request_shape_error(
+        _check_request_shape(
             task_id=task_id,
             status=status,
             raw_deferral=raw_deferral,
             expected_stamped_at=expected_stamped_at,
             restamp_only=restamp_only,
         )
-        if shape_error is not None:
-            raise shape_error
         expected = _parse_expected(expected_stamped_at)
         request = None if raw_deferral is None else parse_request(raw_deferral, now=now)
         holder = await _corroborate_request(request, read_task=read_task, proc_root=proc_root)
