@@ -193,14 +193,16 @@ def test_load_samples_db_property_points_to_canonical_path(tmp_path: Path) -> No
 # ---------------------------------------------------------------------------
 
 
-def test_known_metrics_are_the_exact_names_of_the_served_groups() -> None:
-    """The dashboard decides which groups it serves; the table names their metrics."""
-    served = {GroupName.PSI, GroupName.PROCESS}
-    served_names = sorted(
-        name for group in METRIC_GROUPS if group.name in served for name in group.exact
-    )
+@pytest.mark.asyncio
+async def test_every_psi_and_process_metric_in_the_table_is_served() -> None:
+    """The dashboard serves the PSI and process groups, under the table's names."""
+    groups = {group.name: group for group in METRIC_GROUPS}
 
-    assert tuple(served_names) == KNOWN_METRICS
+    served = set(await get_load_metrics(None))
+
+    assert served == set(KNOWN_METRICS)
+    assert groups[GroupName.PSI].exact <= served
+    assert groups[GroupName.PROCESS].exact <= served
 
 
 def test_no_load_group_metric_is_served() -> None:
