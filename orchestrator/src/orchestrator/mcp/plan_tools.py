@@ -79,6 +79,7 @@ from __future__ import annotations
 import argparse
 import ast
 import copy
+import functools
 import inspect
 import json
 import logging
@@ -89,7 +90,7 @@ from collections.abc import Awaitable, Callable, Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, NamedTuple
+from typing import Any, Concatenate, NamedTuple, ParamSpec, TypeVar
 
 from fastmcp import FastMCP
 from shared.mcp_markup_middleware import (
@@ -981,6 +982,25 @@ def _read_plan_repaired(artifacts: TaskArtifacts) -> tuple[dict, list[dict[str, 
     return repaired, reportable
 
 
+_P = ParamSpec('_P')
+_R = TypeVar('_R')
+
+
+def _plan_mutation(
+    fn: Callable[Concatenate[TaskArtifacts, _P], _R],
+) -> Callable[Concatenate[TaskArtifacts, _P], _R]:
+    """The whole mutator, including the repair write-back in ``_read_plan_repaired``
+    and any nested TaskArtifacts write, is ONE critical section against every
+    other plan.json writer."""
+
+    @functools.wraps(fn)
+    def mutation(artifacts: TaskArtifacts, /, *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        with artifacts.plan_mutex():
+            return fn(artifacts, *args, **kwargs)
+
+    return mutation
+
+
 def _with_markup_repairs(
     response: dict[str, Any], facts: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -1007,6 +1027,7 @@ def _with_markup_repairs(
 # ---------------------------------------------------------------------------
 
 
+@_plan_mutation
 def _create_plan(
     artifacts: TaskArtifacts,
     task_id: str,
@@ -1102,6 +1123,7 @@ def _create_plan(
     return {'status': 'ok', 'task_id': task_id}
 
 
+@_plan_mutation
 def _add_plan_step(
     artifacts: TaskArtifacts,
     step_id: str,
@@ -1139,6 +1161,7 @@ def _add_plan_step(
     )
 
 
+@_plan_mutation
 def _add_prerequisite(
     artifacts: TaskArtifacts,
     prereq_id: str,
@@ -1171,6 +1194,7 @@ def _add_prerequisite(
     return _with_markup_repairs({'status': 'ok', 'prereq_id': prereq_id}, markup_facts)
 
 
+@_plan_mutation
 def _add_design_decision(
     artifacts: TaskArtifacts,
     decision: str,
@@ -1191,6 +1215,7 @@ def _add_design_decision(
     )
 
 
+@_plan_mutation
 def _add_reuse_item(
     artifacts: TaskArtifacts,
     what: str,
@@ -1212,6 +1237,7 @@ def _add_reuse_item(
     )
 
 
+@_plan_mutation
 def _drop_plan_file(
     artifacts: TaskArtifacts,
     path: str,
@@ -1316,6 +1342,7 @@ def _drop_plan_file(
 _REPAIRABLE_PLAN_FIELDS = _build_repairable_plan_fields()
 
 
+@_plan_mutation
 def _mark_step_done(
     artifacts: TaskArtifacts,
     step_id: str,
@@ -1389,6 +1416,7 @@ def _mark_step_done(
 # ---------------------------------------------------------------------------
 
 
+@_plan_mutation
 def _update_plan_metadata(
     artifacts: TaskArtifacts,
     files: list[str] | str | None = None,
@@ -1426,6 +1454,7 @@ def _forget_redeclared_drops(plan: dict) -> None:
     ]
 
 
+@_plan_mutation
 def _remove_plan_step(
     artifacts: TaskArtifacts,
     step_id: str,
@@ -1461,6 +1490,7 @@ def _remove_plan_step(
     )
 
 
+@_plan_mutation
 def _replace_plan_step(
     artifacts: TaskArtifacts,
     step_id: str,
@@ -1497,6 +1527,7 @@ def _replace_plan_step(
     )
 
 
+@_plan_mutation
 def _confirm_plan(
     artifacts: TaskArtifacts,
 ) -> dict[str, Any]:
@@ -1796,6 +1827,7 @@ def _sha_branch_reachability(worktree: Path, sha: str) -> str:
     return 'reachable' if result.returncode == 0 else 'unreachable'
 
 
+@_plan_mutation
 def _mark_step_committed(
     artifacts: TaskArtifacts,
     step_id: str,
