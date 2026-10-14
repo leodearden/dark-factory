@@ -2855,6 +2855,68 @@ class TestRunMergeVerifyOnWorktree:
             'that is unchanged'
         )
 
+    # --- task 6127: the dispatcher's pre-provision command reaches the remote leg
+
+    _PROVISION = 'uv sync --all-packages && npm ci --no-audit --no-fund --prefer-offline'
+
+    @staticmethod
+    def _preprovision_spec(verify_cold_preprovision_command):
+        return MergeVerifySpec(
+            verify_commands=(VerifyCommand('src/a', test_command='true'),),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=('src/a/m.py',),
+            verify_env={},
+            cold_timeout_secs=60.0,
+            verify_cold_preprovision_command=verify_cold_preprovision_command,
+        )
+
+    @staticmethod
+    async def _effective_config(config, spec):
+        from orchestrator.verify_runner import run_merge_verify_on_worktree
+
+        run_scoped = AsyncMock(return_value=_make_pass_result())
+        run_unscoped = AsyncMock(
+            return_value=MagicMock(
+                broken=False, timed_out=False,
+                failing_subprojects=[], timed_out_subprojects=[],
+            )
+        )
+        await run_merge_verify_on_worktree(
+            MagicMock(), config, spec,
+            run_scoped=run_scoped, run_unscoped=run_unscoped,
+        )
+        assert run_scoped.await_args is not None
+        return run_scoped.await_args[0][1]
+
+    async def test_spec_preprovision_command_overrides_empty_host_value(self):
+        """The 6021 shape: the verifying host's own value is ''."""
+        caller_config = self._host_config(verify_cold_preprovision_command='')
+
+        effective_config = await self._effective_config(
+            caller_config, self._preprovision_spec(self._PROVISION),
+        )
+
+        assert effective_config.verify_cold_preprovision_command == self._PROVISION
+        assert caller_config.verify_cold_preprovision_command == ''
+
+    async def test_empty_spec_preprovision_keeps_host_value(self):
+        config = self._host_config(verify_cold_preprovision_command='HOST_PROVISION')
+
+        effective_config = await self._effective_config(config, self._preprovision_spec(''))
+
+        assert effective_config.verify_cold_preprovision_command == 'HOST_PROVISION'
+
+    async def test_legacy_spec_without_preprovision_keeps_host_value(self):
+        config = self._host_config(verify_cold_preprovision_command='HOST_PROVISION')
+        legacy = self._preprovision_spec(self._PROVISION).to_dict()
+        legacy.pop('verify_cold_preprovision_command')
+
+        effective_config = await self._effective_config(
+            config, MergeVerifySpec.from_dict(legacy),
+        )
+
+        assert effective_config.verify_cold_preprovision_command == 'HOST_PROVISION'
+
     async def test_gate_broken_returns_sentinel_result(self):
         """When run_unscoped returns broken=True, result carries UNSCOPED_TYPECHECK_FAILED_CATEGORY."""
         from orchestrator.verify_runner import (
