@@ -519,7 +519,8 @@ class TestLoadState:
 
 
 def _record(project_id='dark_factory', *, day=1, hour=3, exit_code=0,
-            applied=0, commit_made=False, budget_suppressed=False, **counters):
+            applied=0, commit_made=False, budget_suppressed=False,
+            capped=False, **counters):
     """Call record_run with a derived-total counter set and an injected
     clock (the module is deliberately clock-injectable — no time faking)."""
     kw = _counters(**counters)
@@ -532,6 +533,7 @@ def _record(project_id='dark_factory', *, day=1, hour=3, exit_code=0,
         applied=applied,
         commit_made=commit_made,
         budget_suppressed=budget_suppressed,
+        capped=capped,
         **kw,
     )
 
@@ -1098,3 +1100,200 @@ class TestRetryBacklogPolicy:
             trickle_state.RETRY_MAX_AGE_DAYS,
             trickle_state.RETRY_MAX_ATTEMPTS,
         ) == (1, 7, 3)
+
+
+def _warnings_naming(caplog, text):
+    return [
+        r for r in caplog.records
+        if r.levelname == 'WARNING' and text in r.getMessage()
+    ]
+
+
+def _without_backlog(doc):
+    return {k: v for k, v in doc.items() if k != 'retry_backlog'}
+
+
+class TestRecordRunRetryBacklog:
+    """record_run folds each scheduled pass into the document's additive
+    ``retry_backlog`` ({ISO date: unfinished attempts})."""
+
+    @pytest.fixture(autouse=True)
+    def _state_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
+
+    def test_a_failed_run_owes_its_own_date_and_a_repeat_counts_again(self):
+        first = _record(day=1, exit_code=1, selected_count=6)
+        again = _record(day=1, exit_code=1, selected_count=6)
+
+        assert first['retry_backlog'] == {'2026-07-01': 1}
+        assert again['retry_backlog'] == {'2026-07-01': 2}
+
+    def test_a_capped_run_owes_its_date_and_records_capped(self):
+        capped = _record(day=1, capped=True, zero_signal_dropped=2)
+
+        assert capped['exit_code'] == 0
+        assert capped['capped'] is True
+        assert capped['retry_backlog'] == {'2026-07-01': 1}
+
+    def test_a_normal_run_records_capped_false_and_owes_nothing(self):
+        doc = _record(day=1, selected_count=1)
+
+        assert doc['capped'] is False
+        assert doc['retry_backlog'] == {}
+
+    def test_a_run_that_committed_never_owes_its_date(self):
+        doc = _record(day=1, exit_code=1, selected_count=6, commit_made=True)
+
+        assert doc['retry_backlog'] == {}
+
+    def test_a_finished_run_clears_its_own_date_and_carries_the_rest(self):
+        _record(day=1, exit_code=1)
+        _record(day=2, exit_code=1)
+
+        cleared = _record(day=1, selected_count=1)
+        carried = _record(day=3, selected_count=1)
+
+        assert cleared['retry_backlog'] == {'2026-07-02': 1}
+        assert carried['retry_backlog'] == {'2026-07-02': 1}
+
+    def test_an_entry_past_the_window_is_pruned_with_one_warning(self, caplog):
+        _record(day=1, exit_code=1)
+
+        with caplog.at_level('WARNING'):
+            doc = _record(day=2 + trickle_state.RETRY_MAX_AGE_DAYS,
+                          selected_count=1)
+
+        assert doc['retry_backlog'] == {}
+        assert len(_warnings_naming(caplog, '2026-07-01')) == 1
+
+    def test_a_document_without_a_backlog_reads_ok_and_starts_one(
+        self, caplog
+    ):
+        path = trickle_state.trickle_state_path('dark_factory')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            'schema_version': trickle_state.STATE_SCHEMA_VERSION,
+            'project_id': 'dark_factory',
+            'outcome': OUTCOME_PRODUCTIVE,
+            'consecutive_barren_runs': 0,
+            'consecutive_failed_runs': 0,
+        }))
+
+        with caplog.at_level('WARNING'):
+            status, _ = trickle_state.load_state(path)
+            doc = _record(day=2, exit_code=1)
+
+        assert status == 'ok'
+        assert not [r for r in caplog.records if r.levelname == 'WARNING']
+        assert doc['retry_backlog'] == {'2026-07-02': 1}
+
+    @pytest.mark.parametrize('garbage', [
+        pytest.param(['2026-07-01'], id='a-list'),
+        pytest.param({'yesterday': 1, '2026-07-01': 'x'}, id='bad-entries'),
+        pytest.param('2026-07-01', id='a-string'),
+    ])
+    def test_a_garbage_backlog_is_dropped_never_raised(self, garbage):
+        doc = _record(day=1, selected_count=1)
+        path = trickle_state.trickle_state_path('dark_factory')
+        path.write_text(json.dumps({**doc, 'retry_backlog': garbage}))
+
+        after = _record(day=2, exit_code=1)
+
+        assert after['retry_backlog'] == {'2026-07-02': 1}
+
+
+def _retry(project_id='dark_factory', *, day, recorded_day, exit_code=0,
+           capped=False, commit_made=False):
+    return trickle_state.record_retry(
+        project_id,
+        target_date=date(2026, 7, day),
+        recorded_at=datetime(2026, 7, recorded_day, 3, 30, 0, tzinfo=UTC),
+        exit_code=exit_code,
+        capped=capped,
+        commit_made=commit_made,
+    )
+
+
+class TestRecordRetry:
+    """record_retry rewrites ONLY ``retry_backlog``: the rest of the
+    document keeps describing the scheduled night."""
+
+    @pytest.fixture(autouse=True)
+    def _state_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
+
+    def test_a_finished_retry_clears_its_date_and_changes_nothing_else(self):
+        _record(day=1, exit_code=1, selected_count=6)
+        scheduled = _record(day=2, selected_count=1)
+
+        retried = _retry(day=1, recorded_day=2)
+
+        path = trickle_state.trickle_state_path('dark_factory')
+        assert json.loads(path.read_text()) == retried
+        assert scheduled['retry_backlog'] == {'2026-07-01': 1}
+        assert retried['retry_backlog'] == {}
+        assert _without_backlog(retried) == _without_backlog(scheduled)
+
+    def test_an_unfinished_retry_counts_an_attempt(self):
+        _record(day=1, exit_code=1)
+        scheduled = _record(day=2, selected_count=1)
+
+        retried = _retry(day=1, recorded_day=2, exit_code=1)
+
+        assert retried['retry_backlog'] == {'2026-07-01': 2}
+        assert _without_backlog(retried) == _without_backlog(scheduled)
+
+    def test_a_capped_retry_counts_an_attempt(self):
+        _record(day=1, exit_code=1)
+        _record(day=2, selected_count=1)
+
+        retried = _retry(day=1, recorded_day=2, capped=True)
+
+        assert retried['retry_backlog'] == {'2026-07-01': 2}
+
+    def test_the_attempt_bound_abandons_the_date_with_one_warning(
+        self, caplog
+    ):
+        _record(day=1, exit_code=1)
+        _record(day=2, selected_count=1)
+        unfinished = trickle_state.RETRY_MAX_ATTEMPTS - 1
+
+        with caplog.at_level('WARNING'):
+            for night in range(unfinished):
+                doc = _retry(day=1, recorded_day=2 + night, exit_code=1)
+
+        assert doc['retry_backlog'] == {}
+        assert len(_warnings_naming(caplog, '2026-07-01')) == 1
+
+    def test_with_no_predecessor_nothing_is_written(self, caplog):
+        path = trickle_state.trickle_state_path('dark_factory')
+
+        with caplog.at_level('WARNING'):
+            doc = _retry(day=1, recorded_day=2)
+
+        assert doc is None
+        assert not path.exists()
+        assert len(_warnings_naming(caplog, '2026-07-01')) == 1
+
+    def test_with_a_corrupt_predecessor_nothing_is_written(self, caplog):
+        path = trickle_state.trickle_state_path('dark_factory')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'{corrupt')
+
+        with caplog.at_level('WARNING'):
+            doc = _retry(day=1, recorded_day=2)
+
+        assert doc is None
+        assert path.read_bytes() == b'{corrupt'
+        assert len(_warnings_naming(caplog, '2026-07-01')) == 1
+
+    def test_the_write_is_atomic_and_leaves_no_tmp_file(self):
+        _record(day=1, exit_code=1)
+        _record(day=2, selected_count=1)
+
+        _retry(day=1, recorded_day=2)
+
+        state_dir = trickle_state.trickle_state_path('dark_factory').parent
+        assert [p.name for p in state_dir.iterdir()] == [
+            trickle_state.STATE_FILENAME
+        ]
