@@ -11,10 +11,12 @@ from __future__ import annotations
 
 from fused_memory.backends.task_backend_errors import (
     DoneProvenanceWriteAuthorityError,
+    MetadataNotAnObjectError,
     StatusWriteAuthorityError,
     TaskmasterError,
     TaskNotFoundError,
     done_provenance_via_update_task_error,
+    metadata_not_an_object_error,
     status_via_update_task_error,
 )
 
@@ -93,6 +95,43 @@ def test_done_provenance_write_authority_error_is_taskmaster_error():
     assert isinstance(err, TaskmasterError)
     assert err.code == 'TASKMASTER_TOOL_ERROR'
     assert 'set_task_status' in err.message
+
+
+# ── MetadataNotAnObjectError — non-object metadata payload (task 6130) ──
+
+
+def test_metadata_not_an_object_error_shape():
+    error = metadata_not_an_object_error('7', 'array')
+    assert {key: value for key, value in error.items() if key != 'hint'} == {
+        'success': False,
+        'error': 'metadata_not_an_object',
+        'task_id': '7',
+        'received': 'array',
+    }
+    assert isinstance(error['hint'], str)
+    assert 'JSON object' in error['hint']
+
+
+def test_metadata_not_an_object_error_is_taskmaster_error():
+    err = MetadataNotAnObjectError('7', 'null')
+    assert isinstance(err, TaskmasterError)
+    assert err.code == 'TASKMASTER_TOOL_ERROR'
+    assert err.task_id == '7'
+    assert err.received == 'null'
+    assert 'null' in err.message
+
+
+def test_metadata_not_an_object_error_to_error_dict_matches_canonical():
+    err = MetadataNotAnObjectError('7', 'invalid_json')
+    assert err.to_error_dict() == metadata_not_an_object_error('7', 'invalid_json')
+
+
+def test_metadata_not_an_object_error_is_not_a_done_provenance_error():
+    """A distinct refusal with a distinct error code, not a variant of the
+    done_provenance floor: it applies to rows that hold no done_provenance."""
+    assert not isinstance(
+        MetadataNotAnObjectError('7', 'array'), DoneProvenanceWriteAuthorityError,
+    )
 
 
 # ── TaskNotFoundError — definitive zero-row absence (task 2521 RC2) ──────
