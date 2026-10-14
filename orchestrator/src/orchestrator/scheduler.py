@@ -900,6 +900,7 @@ class SchedulerFacade(Protocol):
     def clear_requeue_count(self, task_id: str, /) -> None: ...
     def note_merge_phase_entered(self, tid: str, /) -> None: ...
     def clear_merge_phase(self, tid: str, /) -> None: ...
+    def blocked_writes_suppressed(self, task_id: str, /) -> bool: ...
 
 
 @dataclass
@@ -3093,6 +3094,15 @@ class Scheduler:
             )
         return None if distinguish_failure else []
 
+    def blocked_writes_suppressed(self, task_id: str, /) -> bool:
+        """True while a Table-B action teardown
+        (harness.py::Harness._action_teardown_and_set_status) owns the row and
+        this task's 'blocked' writes are absorbed."""
+        return (
+            self._callbacks.suppress_blocked_write is not None
+            and self._callbacks.suppress_blocked_write(task_id)
+        )
+
     async def set_task_status(
         self,
         task_id: str,
@@ -3169,11 +3179,7 @@ class Scheduler:
         # and _maybe_fire_park_stop_trip are then necessarily skipped for free.
         # (A guard placed at the post-write success branch :1190 would still let the
         # write reach fused-memory, defeating C3.2.)
-        if (
-            status == 'blocked'
-            and self._callbacks.suppress_blocked_write is not None
-            and self._callbacks.suppress_blocked_write(task_id)
-        ):
+        if status == 'blocked' and self.blocked_writes_suppressed(task_id):
             logger.info(
                 'set_task_status(%s, blocked): suppressed by action-teardown — skipping write',
                 task_id,

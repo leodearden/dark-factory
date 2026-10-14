@@ -12,6 +12,8 @@ Covers:
       all-``None`` ``SchedulerCallbacks`` so bare-Scheduler unit tests are
       unaffected).
   (c) Constructor-injected hooks actually FIRE on their triggers.
+  (d) ``_workflow_helpers.FakeScheduler`` models (c)'s blocked-write
+      suppression.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ import time
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from _workflow_helpers import FakeScheduler
 
 from orchestrator.config import OrchestratorConfig, StarvationWatchdogConfig
 from orchestrator.scheduler import Scheduler, SchedulerCallbacks
@@ -127,6 +130,23 @@ class TestConstructorInjectedHooksFire:
             'Suppressed write must not record a blocked transition'
         )
 
+    def test_blocked_writes_suppressed_reports_the_callback(self):
+        """The suppression is observable as a query, not only as a silent no-op."""
+        config = OrchestratorConfig(max_per_module=1)
+        suppress = Mock(return_value=True)
+        suppressing = Scheduler(
+            config, callbacks=SchedulerCallbacks(suppress_blocked_write=suppress),
+        )
+        not_suppressing = Scheduler(
+            config,
+            callbacks=SchedulerCallbacks(suppress_blocked_write=Mock(return_value=False)),
+        )
+
+        assert suppressing.blocked_writes_suppressed('T1') is True
+        suppress.assert_called_once_with('T1')
+        assert not_suppressing.blocked_writes_suppressed('T1') is False
+        assert Scheduler(config).blocked_writes_suppressed('T1') is False
+
     @pytest.mark.asyncio
     async def test_on_starvation_warn_fires(self):
         """A constructor-injected on_starvation_warn fires once both gates cross."""
@@ -177,6 +197,24 @@ class TestConstructorInjectedHooksFire:
         spy.assert_called_once()
         call_args = spy.call_args
         assert call_args.args[0] == 'starved'
+
+
+class TestFakeSchedulerModelsTheBlockedWriteSuppression:
+    """(d) The ``_workflow_helpers.FakeScheduler`` double keeps step with
+    (c)'s suppression, so workflow suites that drive a Table-B teardown
+    through it see what the real Scheduler would do."""
+
+    @pytest.mark.asyncio
+    async def test_absorbs_only_the_suppressed_blocked_write(self):
+        scheduler = FakeScheduler()
+        scheduler.blocked_write_suppressed_ids = {'T1'}
+
+        await scheduler.set_task_status('T1', 'blocked')
+        assert scheduler.statuses.get('T1') is None
+        await scheduler.set_task_status('T1', 'pending')
+        assert scheduler.statuses['T1'] == ['pending']
+        assert scheduler.blocked_writes_suppressed('T1') is True
+        assert scheduler.blocked_writes_suppressed('T2') is False
 
 
 class TestLivenessAccessors:

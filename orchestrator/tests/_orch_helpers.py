@@ -20,7 +20,7 @@ import time
 import types
 import weakref
 from collections import deque
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
@@ -2475,3 +2475,28 @@ class ExitContractViolationCollector(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         if getattr(record, self._verdict_attribute, None) == self._violation:
             self.violations.append(record)
+
+    @classmethod
+    @contextlib.contextmanager
+    def listening(cls) -> Iterator[ExitContractViolationCollector]:
+        """Attach a collector to the recorder's logger, pinned so that neither
+        a raised ancestor level nor a disabled logger can blind it.
+
+        A test that itself raises 'orchestrator.exit_contract' above WARNING
+        after setup still blinds it.
+        """
+        from orchestrator.exit_contract import record_exit_verdict
+
+        contract_logger = logging.getLogger(record_exit_verdict.__module__)
+        saved_level, saved_disabled = contract_logger.level, contract_logger.disabled
+        if saved_level == logging.NOTSET or saved_level > logging.WARNING:
+            contract_logger.setLevel(logging.WARNING)
+        contract_logger.disabled = False
+        collector = cls()
+        contract_logger.addHandler(collector)
+        try:
+            yield collector
+        finally:
+            contract_logger.removeHandler(collector)
+            contract_logger.setLevel(saved_level)
+            contract_logger.disabled = saved_disabled
