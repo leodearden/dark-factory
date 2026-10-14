@@ -37,10 +37,12 @@ this suite what it has to pin too.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import math
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
@@ -60,6 +62,9 @@ PARK_EVENT = 'all_capped_park'
 ONE_SHOT_PARK_MESSAGE = 'All accounts capped'
 
 _LOOP_STALL_SECS = 0.6
+
+# Far under the pytest timeout, and generous against the worst field starvation (~0.7s).
+_PARK_VALVE_SECS = 10.0
 
 
 def _park_records(caplog) -> list[tuple[logging.LogRecord, dict]]:
@@ -86,6 +91,20 @@ def _loop_passes(caplog) -> int:
     )
 
 
+def _heartbeat_span(caplog) -> float:
+    """Seconds between the first and last heartbeat's emission; 0.0 below two."""
+    records = _park_records(caplog)
+    if len(records) < 2:
+        return 0.0
+    return records[-1][0].created - records[0][0].created
+
+
+def _park_clock_has_advanced(caplog) -> bool:
+    """Whether the latest heartbeat reports a park clock above zero."""
+    records = _park_records(caplog)
+    return bool(records) and records[-1][1]['elapsed_s'] > 0
+
+
 def _all_capped_gate(names: tuple[str, ...] = ('a', 'b')):
     """A gate whose every account is capped until well past any test's runtime."""
     gate = make_gate(list(names), wait_for_reset=False)
@@ -96,17 +115,55 @@ def _all_capped_gate(names: tuple[str, ...] = ('a', 'b')):
     return gate
 
 
-async def _park_for(gate, seconds: float) -> None:
-    """Drive ``before_invoke`` into the park and abandon it after *seconds*.
+async def _until(
+    ready: Callable[[], bool],
+    *,
+    at_least_secs: float = 0.0,
+    valve_secs: float = _PARK_VALVE_SECS,
+) -> None:
+    """Wait *at_least_secs*, then poll *ready* every 5ms until it holds.
 
-    The same shape as ``test_usage_gate_exhaustive.py::
-    test_blocks_when_all_capped`` — driving a deliberately-unbounded wait
-    under ``asyncio.wait_for`` inside ``pytest.raises`` is how this repo
-    asserts on a park without hanging the suite. The TimeoutError IS the
-    assertion that the park never returned early.
+    The poll is bounded by *valve_secs*, and the valve RETURNS rather than
+    raising, so an unmet precondition fails on the caller's own assertion as a
+    clean per-test red instead of hanging into the pytest timeout.
     """
-    with pytest.raises(TimeoutError):
-        await asyncio.wait_for(gate.before_invoke(), timeout=seconds)
+    await asyncio.sleep(at_least_secs)
+    valve = time.monotonic() + valve_secs
+    while not ready() and time.monotonic() < valve:
+        await asyncio.sleep(0.005)
+
+
+async def _park_for(
+    gate,
+    seconds: float,
+    *,
+    until: Callable[[], bool] | None = None,
+    valve_secs: float = _PARK_VALVE_SECS,
+) -> None:
+    """Drive ``before_invoke`` into the park, hold it, then abandon it.
+
+    The park is held for at least *seconds*. When *until* is given it is held
+    further, until the caller's precondition has actually been observed rather
+    than for a fixed span, bounded by *valve_secs*. A park that returns early
+    fails. The park is abandoned by cancellation, the routine production path.
+    """
+    park = asyncio.create_task(gate.before_invoke())
+    try:
+        await _until(
+            lambda: park.done() or until is None or until(),
+            at_least_secs=seconds,
+            valve_secs=valve_secs,
+        )
+        if park.done():
+            lease = park.result()
+            raise AssertionError(
+                f'before_invoke returned early ({lease!r}) while every account '
+                'was capped: the park must block until an account reopens'
+            )
+    finally:
+        park.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await park
 
 
 @pytest.fixture(autouse=True)
@@ -243,11 +300,13 @@ class TestAllCappedParkIsVisible:
         interval = fast_heartbeat(0.02)
         gate = _all_capped_gate()
 
-        # Long enough that the clock's growth clears the 0.1s rounding
-        # resolution several times over, so the assertion cannot pass or fail
-        # on a rounding boundary.
+        # Held until the park's own heartbeats span 25 intervals, clearing the
+        # 0.1s rounding several times over; measured on emission time, never
+        # on the elapsed_s payload under test.
         stall_the_loop()
-        await _park_for(gate, interval * 25)
+        await _park_for(
+            gate, interval * 25, until=lambda: _heartbeat_span(caplog) >= interval * 25
+        )
 
         records = _park_records(caplog)
         assert len(records) >= 2, (
@@ -300,23 +359,18 @@ class TestAllCappedParkIsVisible:
         # too slow to clear it skips.
         target_passes = 200
         started = time.monotonic()
-        deadline = started + 30.0
 
         waker = asyncio.create_task(_wake_repeatedly())
-        parked = asyncio.create_task(gate.before_invoke())
         try:
-            while _loop_passes(caplog) < target_passes:
-                if time.monotonic() > deadline:
-                    break
-                await asyncio.sleep(0.005)
-            assert not parked.done(), (
-                f'before_invoke ended while every account was capped ({parked!r}): '
-                'the park must block until an account reopens'
+            await _park_for(
+                gate,
+                0.0,
+                until=lambda: _loop_passes(caplog) >= target_passes,
+                valve_secs=30.0,
             )
         finally:
             waker.cancel()
-            parked.cancel()
-            await asyncio.gather(waker, parked, return_exceptions=True)
+            await asyncio.gather(waker, return_exceptions=True)
         duration = time.monotonic() - started
 
         heartbeats = len(_park_records(caplog))
@@ -390,8 +444,8 @@ class TestAnAbandonedParkIsNotInherited:
 
     ``before_invoke`` clears the heartbeat clock on exactly one path — the
     one where it finally serves a lease. A parked caller is routinely
-    CANCELLED instead: callers wrap it in ``asyncio.wait_for``, which is
-    what ``_park_for`` above does, and what the eval runner's own timeouts
+    CANCELLED instead: that is how ``_park_for`` above abandons its park,
+    and what ``asyncio.wait_for`` callers and the eval runner's own timeouts
     do. Left set, the timestamps make the NEXT park report an ``elapsed_s``
     measured from a park that ended long ago and suppress its first
     heartbeat for up to a full interval — reintroducing, on the
@@ -447,7 +501,9 @@ class TestAnAbandonedParkIsNotInherited:
         stall_the_loop()
         survivor = asyncio.create_task(gate.before_invoke())
         doomed = asyncio.create_task(gate.before_invoke())
-        await asyncio.sleep(interval * 10)
+        await _until(
+            lambda: _park_clock_has_advanced(caplog), at_least_secs=interval * 10
+        )
 
         doomed.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -461,7 +517,9 @@ class TestAnAbandonedParkIsNotInherited:
 
         caplog.clear()
         try:
-            await asyncio.sleep(interval * 10)
+            await _until(
+                lambda: bool(_park_records(caplog)), at_least_secs=interval * 10
+            )
             after = [payload['elapsed_s'] for _, payload in _park_records(caplog)]
         finally:
             survivor.cancel()
