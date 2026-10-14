@@ -2260,71 +2260,76 @@ class TestOverlapSignal:
         )
 
         worker_task = asyncio.create_task(worker.run())
-
-        # Submit both requests; merger will process them while verifier runs
-        await q.put(req_a)
-        await q.put(req_b)
-
-        # N (local) should enter its gated verify quickly
-        await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
-
-        # While N is STILL verifying (gate_a NOT released), N+1 should ALSO
-        # start verifying (remote slot is free → dispatch-fill overlap).
-        # RED: times out — serial loop only dispatches N+1 after N finalizes.
-        # GREEN (step-18): concurrent fill → gate_b_entered fires quickly.
         try:
-            # task 2376: widened from 3.0s (host-oversubscription flake — a
-            # starved worker missed the deadline while the invariant held;
-            # see the 45.0s convention already used at lines ~2251/4185).
-            await asyncio.wait_for(gate_b_entered.wait(), timeout=45.0)
-        except TimeoutError:
-            # Cleanup: release gates so worker can drain cleanly
-            gate_a_release.set()
-            gate_b_release.set()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(req_a.result, timeout=10.0)
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(req_b.result, timeout=10.0)
-            await worker.stop()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(worker_task, timeout=5.0)
-            pytest.fail(
-                'OVERLAP not observed: gate_b timed out while gate_a was set. '
-                'RED: serial blocking-get path finalizes N before fetching N+1 '
-                '— N+1 only dispatched after N fully completes. '
-                'GREEN (step-18): blocking-get path loops back to fill → '
-                'dispatch-fill picks up N+1 to remote slot while N is in-flight.'
+            # Submit both requests; merger will process them while verifier runs
+            await q.put(req_a)
+            await q.put(req_b)
+
+            # N (local) should enter its gated verify quickly
+            await wait_responsive(
+                gate_a_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='ov-a: local verify entered',
             )
 
-        # ── Both verifies entered — overlap confirmed ──────────────────
-        # gate_a is still blocking, gate_b is still blocking → true overlap
-        assert gate_a_entered.is_set(), 'N (local) gate not entered'
-        assert gate_b_entered.is_set(), 'N+1 (remote) gate not entered'
-        assert not gate_a_release.is_set(), 'gate_a already released (test bug)'
-        assert not gate_b_release.is_set(), 'gate_b already released (test bug)'
+            # While N is STILL verifying (gate_a NOT released), N+1 should ALSO
+            # start verifying (remote slot is free → dispatch-fill overlap).
+            # RED: times out — serial loop only dispatches N+1 after N finalizes.
+            # GREEN (step-18): concurrent fill → gate_b_entered fires quickly.
+            try:
+                # task 2376: widened from 3.0s (host-oversubscription flake — a
+                # starved worker missed the deadline while the invariant held;
+                # see the 45.0s convention already used at lines ~2251/4185).
+                await asyncio.wait_for(gate_b_entered.wait(), timeout=45.0)
+            except TimeoutError:
+                # Cleanup: release gates so worker can drain cleanly
+                gate_a_release.set()
+                gate_b_release.set()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(req_a.result, timeout=10.0)
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(req_b.result, timeout=10.0)
+                pytest.fail(
+                    'OVERLAP not observed: gate_b timed out while gate_a was set. '
+                    'RED: serial blocking-get path finalizes N before fetching N+1 '
+                    '— N+1 only dispatched after N fully completes. '
+                    'GREEN (step-18): blocking-get path loops back to fill → '
+                    'dispatch-fill picks up N+1 to remote slot while N is in-flight.'
+                )
 
-        # Peak _inflight == 2: both entries in deque before head was popped
-        # RED: max_len == 1 (N appended, popped, finalized; then N+1 appended)
-        # GREEN: max_len == 2 (N appended, N+1 appended, then head popped)
-        assert tracked.max_len == 2, (
-            f'Expected peak _inflight length 2 (both entries before popleft), '
-            f'got {tracked.max_len}. '
-            'RED: serial dispatch never fills two slots simultaneously. '
-            'GREEN (step-18): fill loop appends N then N+1 before any popleft.'
-        )
+            # ── Both verifies entered — overlap confirmed ──────────────────
+            # gate_a is still blocking, gate_b is still blocking → true overlap
+            assert gate_a_entered.is_set(), 'N (local) gate not entered'
+            assert gate_b_entered.is_set(), 'N+1 (remote) gate not entered'
+            assert not gate_a_release.is_set(), 'gate_a already released (test bug)'
+            assert not gate_b_release.is_set(), 'gate_b already released (test bug)'
 
-        # ── Submission-order finalize: release N+1 FIRST ──────────────
-        # Even though N+1's verify finishes before N's, main must advance N first.
-        gate_b_release.set()   # N+1 (remote) verify completes first
-        gate_a_release.set()   # N (local) verify completes second
+            # Peak _inflight == 2: both entries in deque before head was popped
+            # RED: max_len == 1 (N appended, popped, finalized; then N+1 appended)
+            # GREEN: max_len == 2 (N appended, N+1 appended, then head popped)
+            assert tracked.max_len == 2, (
+                f'Expected peak _inflight length 2 (both entries before popleft), '
+                f'got {tracked.max_len}. '
+                'RED: serial dispatch never fills two slots simultaneously. '
+                'GREEN (step-18): fill loop appends N then N+1 before any popleft.'
+            )
 
-        # Both should resolve 'done'
-        outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
-        outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            # ── Submission-order finalize: release N+1 FIRST ──────────────
+            # Even though N+1's verify finishes before N's, main must advance N first.
+            gate_b_release.set()   # N+1 (remote) verify completes first
+            gate_a_release.set()   # N (local) verify completes second
 
-        await worker.stop()
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=45.0)
+            # Both should resolve 'done'
+            outcome_a = await wait_responsive(
+                req_a.result,
+                label='ov-a: MergeOutcome (submission-order finalize)',
+            )
+            outcome_b = await wait_responsive(
+                req_b.result,
+                label='ov-b: MergeOutcome (submission-order finalize)',
+            )
+        finally:
+            await _stop_worker(worker, worker_task, join_timeout=45.0)
 
         assert outcome_a.status == 'done', f'N: expected done, got {outcome_a}'
         assert outcome_b.status == 'done', f'N+1: expected done, got {outcome_b}'
@@ -2370,8 +2375,6 @@ class TestLastItemOfBurstFinalizes:
         git_config: GitConfig,
         config: OrchestratorConfig,
     ) -> None:
-        import contextlib
-
         # Gated LOCAL verify: enters, then blocks until released — guarantees the
         # fill loop reaches the empty-queue branch while N is still running.
         gate_release = asyncio.Event()
@@ -2399,33 +2402,32 @@ class TestLastItemOfBurstFinalizes:
         )
 
         worker_task = asyncio.create_task(worker.run())
-        # Submit ONLY this one item — the last (and only) item of the burst.
-        await q.put(req)
-
-        # N enters its gated verify; the dispatch-fill loop is now parked
-        # waiting for either a new queue item or N's verify to complete.
-        await asyncio.wait_for(gate_entered.wait(), timeout=15.0)
-
-        # Release N's verify.  With the bug, FINALIZE-HEAD is unreachable
-        # (loop blocked on get()) and this Future never resolves.
-        gate_release.set()
         try:
-            outcome = await asyncio.wait_for(req.result, timeout=10.0)
-        except TimeoutError:
-            with contextlib.suppress(Exception):
-                await worker.stop()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(worker_task, timeout=5.0)
-            pytest.fail(
-                'LAST-ITEM HANG: single-item burst never finalized. '
-                'RED: fill loop blocked on bare _verifier_queue.get() — the '
-                'completing verify did not wake it, so FINALIZE-HEAD never ran. '
-                'GREEN: race persistent getter vs running verify tasks.'
+            # Submit ONLY this one item — the last (and only) item of the burst.
+            await q.put(req)
+
+            # N enters its gated verify; the dispatch-fill loop is now parked
+            # waiting for either a new queue item or N's verify to complete.
+            await wait_responsive(
+                gate_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='burst-n: local verify entered',
             )
 
-        await worker.stop()
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=5.0)
+            # Release N's verify.  With the bug, FINALIZE-HEAD is unreachable
+            # (loop blocked on get()) and this Future never resolves.
+            gate_release.set()
+            try:
+                outcome = await asyncio.wait_for(req.result, timeout=10.0)
+            except TimeoutError:
+                pytest.fail(
+                    'LAST-ITEM HANG: single-item burst never finalized. '
+                    'RED: fill loop blocked on bare _verifier_queue.get() — the '
+                    'completing verify did not wake it, so FINALIZE-HEAD never ran. '
+                    'GREEN: race persistent getter vs running verify tasks.'
+                )
+        finally:
+            await _stop_worker(worker, worker_task)
 
         assert outcome.status == 'done', f'expected done, got {outcome}'
 
@@ -2833,8 +2835,6 @@ class TestHaltAndUnavailable:
         GREEN (step-22): cascade skips REQUEUED entries; _remerge is never
         called; both reqs land on _queue exactly once and are resolved cleanly.
         """
-        import contextlib
-
         gate_a_release = asyncio.Event()
         gate_a_entered = asyncio.Event()
         gate_b_release = asyncio.Event()
@@ -2881,28 +2881,33 @@ class TestHaltAndUnavailable:
         worker._remerge = _spy_remerge  # type: ignore[method-assign]
 
         worker_task = asyncio.create_task(worker.run())
+        try:
+            await q.put(req_a)
+            await q.put(req_b)
 
-        await q.put(req_a)
-        await q.put(req_b)
+            # Wait for both verifies to enter (true concurrent overlap)
+            await wait_responsive(
+                gate_a_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='halt-a: local verify entered',
+            )
+            await wait_responsive(
+                gate_b_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='halt-b: remote verify entered',
+            )
 
-        # Wait for both verifies to enter (true concurrent overlap)
-        await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
-        await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+            # Set operator halt — both abort-polls fire within 0.01s
+            worker._operator_halt.set()
 
-        # Set operator halt — both abort-polls fire within 0.01s
-        worker._operator_halt.set()
+            # Give abort-polls time to fire and requeue
+            await asyncio.sleep(0.15)
 
-        # Give abort-polls time to fire and requeue
-        await asyncio.sleep(0.15)
-
-        # Release gates so the leaked inner tasks can complete (harmlessly)
-        gate_a_release.set()
-        gate_b_release.set()
-
-        await worker.stop()
-
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=5.0)
+            # Release gates so the leaked inner tasks can complete (harmlessly)
+            gate_a_release.set()
+            gate_b_release.set()
+        finally:
+            await _stop_worker(worker, worker_task)
 
         # Both futures should be resolved (by stop()→shutdown, not by double-dispatch)
         assert req_a.result.done(), 'req_a.result should be resolved by stop()'
@@ -3008,12 +3013,10 @@ class TestHaltAndUnavailable:
 
             outcome_a = await wait_responsive(
                 req_a.result,
-                timeout=15.0,
                 label='unav-a: MergeOutcome (local verify passed)',
             )
             outcome_b = await wait_responsive(
                 req_b.result,
-                timeout=15.0,
                 label='unav-b: MergeOutcome (re-dispatched on local after quarantine)',
             )
         finally:
@@ -4358,12 +4361,8 @@ class TestCascadeErrorContainment:
             # N fails → head-failure cascade fires → _killer_remerge raises for N+1
             gate_a_release.set()
 
-            # nominal PRESERVED at 15.0 as a literal -- never measured to
-            # fail (see the design decision on never-widen); this is
-            # deliberate, not an oversight.
             outcome_a = await wait_responsive(
                 req_a.result,
-                timeout=15.0,
                 label='cascade-err-a: MergeOutcome (N head verify fails)',
             )
             assert outcome_a.status not in ('done', 'already_merged'), (
@@ -5560,110 +5559,117 @@ class TestRedispatchSpeculativeConservation:
         req_b = _make_request('rc-b', 'task/rc-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
+        try:
+            await q.put(req_a)
+            await q.put(req_b)
 
-        await q.put(req_a)
-        await q.put(req_b)
-
-        await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
-
-        # Bounded poll (not a flat sleep): the merger's real git worktree
-        # + commit calls have variable latency, so wait until B has
-        # actually landed on _redispatch rather than guessing a delay.
-        deadline = asyncio.get_running_loop().time() + 15.0
-        while not worker._redispatch and asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(0.05)
-
-        parked = list(worker._redispatch)
-        assert len(parked) == 1 and parked[0].speculative, (
-            f'Expected exactly one speculative item parked on _redispatch '
-            f'while A is gated (proves the fix is actually exercised); '
-            f'got {parked!r}.'
-        )
-        inflight_speculative = worker.snapshot()['speculation']['inflight_speculative']
-        assert inflight_speculative == 1, (
-            f'the parked speculative B must stay counted as verifier-owned; '
-            f'snapshot speculation.inflight_speculative={inflight_speculative}'
-        )
-
-        # NOTE(test-determinism): from here on this test calls
-        # worker._maybe_log_queue_heartbeat(...) directly from the test
-        # coroutine while worker_task (the real worker.run() loop) keeps
-        # running concurrently. That manual interleaving is only safe
-        # because _maybe_log_queue_heartbeat — and the
-        # _check_resource_audit / snapshot() calls it makes — are fully
-        # synchronous (no `await` anywhere in that call chain), so each
-        # call is atomic with respect to worker_task's own event-loop
-        # iterations and can never observe state torn mid-dispatch. If
-        # any of those methods ever gains an `await`, this interleaving
-        # could start observing torn state and flake intermittently; a
-        # future async refactor of the heartbeat/audit path must
-        # revisit this test.
-        #
-        # Sample the audit at several heartbeat-observable points while
-        # the speculative item sits parked (the multi-heartbeat window
-        # the original false positive persisted across). Check the
-        # recorded_violations delta AROUND EACH INDIVIDUAL call (rather
-        # than leaning on the blanket non-empty check further below,
-        # which the explicit speculation_accounting_violations() call a
-        # few lines down would satisfy all on its own) so the test
-        # proves _maybe_log_queue_heartbeat itself drives the audit
-        # (via _check_resource_audit and snapshot()'s own
-        # resource_audit key) on every one of these calls while B is
-        # parked — not merely that *some* call somewhere recorded a
-        # sample. Asserts a non-empty delta rather than a hardcoded
-        # multiplier: the exact number of speculation_accounting_
-        # violations() calls per heartbeat (currently 2 — once via
-        # _check_resource_audit, once via snapshot()'s resource_audit
-        # key) is an incidental implementation detail, not the contract
-        # under test.
-        heartbeat_samples: list[list[str]] = []
-        for heartbeat_ts in (1_000_000.0, 1_000_100.0, 1_000_200.0):
-            _pre_count = len(recorded_violations)
-            worker._maybe_log_queue_heartbeat(heartbeat_ts)
-            _new_samples = recorded_violations[_pre_count:]
-            assert _new_samples, (
-                f'expected _maybe_log_queue_heartbeat({heartbeat_ts}) to '
-                f'invoke speculation_accounting_violations at least once '
-                f'via _check_resource_audit — proves the audit genuinely '
-                f'runs on the heartbeat path itself while B is parked, '
-                f'not just via the explicit call below; got no new '
-                f'recorded samples'
+            await wait_responsive(
+                gate_a_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='rc-a: local verify entered',
             )
-            heartbeat_samples.extend(_new_samples)
-        assert all(v == [] for v in heartbeat_samples), (
-            f'speculation-slot identity must hold on every '
-            f'heartbeat-triggered audit call while the speculative item '
-            f'is parked on _redispatch; got {heartbeat_samples!r}'
-        )
 
-        assert worker.speculation_accounting_violations() == [], (
-            'speculation-slot identity must hold while the speculative '
-            'item is parked on _redispatch'
-        )
+            # Bounded poll (not a flat sleep): the merger's real git worktree
+            # + commit calls have variable latency, so wait until B has
+            # actually landed on _redispatch rather than guessing a delay.
+            deadline = asyncio.get_running_loop().time() + 15.0
+            while not worker._redispatch and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.05)
 
-        # A fails -> the existing 'previous_failed' chain-invalidation
-        # path re-merges B against actual main and re-dispatches it.
-        gate_a_release.set()
+            parked = list(worker._redispatch)
+            assert len(parked) == 1 and parked[0].speculative, (
+                f'Expected exactly one speculative item parked on _redispatch '
+                f'while A is gated (proves the fix is actually exercised); '
+                f'got {parked!r}.'
+            )
+            inflight_speculative = worker.snapshot()['speculation']['inflight_speculative']
+            assert inflight_speculative == 1, (
+                f'the parked speculative B must stay counted as verifier-owned; '
+                f'snapshot speculation.inflight_speculative={inflight_speculative}'
+            )
 
-        outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
-        outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            # NOTE(test-determinism): from here on this test calls
+            # worker._maybe_log_queue_heartbeat(...) directly from the test
+            # coroutine while worker_task (the real worker.run() loop) keeps
+            # running concurrently. That manual interleaving is only safe
+            # because _maybe_log_queue_heartbeat — and the
+            # _check_resource_audit / snapshot() calls it makes — are fully
+            # synchronous (no `await` anywhere in that call chain), so each
+            # call is atomic with respect to worker_task's own event-loop
+            # iterations and can never observe state torn mid-dispatch. If
+            # any of those methods ever gains an `await`, this interleaving
+            # could start observing torn state and flake intermittently; a
+            # future async refactor of the heartbeat/audit path must
+            # revisit this test.
+            #
+            # Sample the audit at several heartbeat-observable points while
+            # the speculative item sits parked (the multi-heartbeat window
+            # the original false positive persisted across). Check the
+            # recorded_violations delta AROUND EACH INDIVIDUAL call (rather
+            # than leaning on the blanket non-empty check further below,
+            # which the explicit speculation_accounting_violations() call a
+            # few lines down would satisfy all on its own) so the test
+            # proves _maybe_log_queue_heartbeat itself drives the audit
+            # (via _check_resource_audit and snapshot()'s own
+            # resource_audit key) on every one of these calls while B is
+            # parked — not merely that *some* call somewhere recorded a
+            # sample. Asserts a non-empty delta rather than a hardcoded
+            # multiplier: the exact number of speculation_accounting_
+            # violations() calls per heartbeat (currently 2 — once via
+            # _check_resource_audit, once via snapshot()'s resource_audit
+            # key) is an incidental implementation detail, not the contract
+            # under test.
+            heartbeat_samples: list[list[str]] = []
+            for heartbeat_ts in (1_000_000.0, 1_000_100.0, 1_000_200.0):
+                _pre_count = len(recorded_violations)
+                worker._maybe_log_queue_heartbeat(heartbeat_ts)
+                _new_samples = recorded_violations[_pre_count:]
+                assert _new_samples, (
+                    f'expected _maybe_log_queue_heartbeat({heartbeat_ts}) to '
+                    f'invoke speculation_accounting_violations at least once '
+                    f'via _check_resource_audit — proves the audit genuinely '
+                    f'runs on the heartbeat path itself while B is parked, '
+                    f'not just via the explicit call below; got no new '
+                    f'recorded samples'
+                )
+                heartbeat_samples.extend(_new_samples)
+            assert all(v == [] for v in heartbeat_samples), (
+                f'speculation-slot identity must hold on every '
+                f'heartbeat-triggered audit call while the speculative item '
+                f'is parked on _redispatch; got {heartbeat_samples!r}'
+            )
 
-        # Same source-specific proof for the post-resolution heartbeat.
-        _pre_final_heartbeat_samples = len(recorded_violations)
-        worker._maybe_log_queue_heartbeat(1_000_300.0)
-        final_heartbeat_samples = recorded_violations[_pre_final_heartbeat_samples:]
-        assert final_heartbeat_samples and all(
-            v == [] for v in final_heartbeat_samples
-        ), (
-            f'expected the post-resolution heartbeat call to invoke the '
-            f'audit at least once and find it clean; got '
-            f'{final_heartbeat_samples!r}'
-        )
+            assert worker.speculation_accounting_violations() == [], (
+                'speculation-slot identity must hold while the speculative '
+                'item is parked on _redispatch'
+            )
 
-        await worker.stop()
+            # A fails -> the existing 'previous_failed' chain-invalidation
+            # path re-merges B against actual main and re-dispatches it.
+            gate_a_release.set()
 
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=5.0)
+            outcome_a = await wait_responsive(
+                req_a.result,
+                label='rc-a: MergeOutcome (head verify failed)',
+            )
+            outcome_b = await wait_responsive(
+                req_b.result,
+                label='rc-b: MergeOutcome (re-merged and re-verified after A failed)',
+            )
+
+            # Same source-specific proof for the post-resolution heartbeat.
+            _pre_final_heartbeat_samples = len(recorded_violations)
+            worker._maybe_log_queue_heartbeat(1_000_300.0)
+            final_heartbeat_samples = recorded_violations[_pre_final_heartbeat_samples:]
+            assert final_heartbeat_samples and all(
+                v == [] for v in final_heartbeat_samples
+            ), (
+                f'expected the post-resolution heartbeat call to invoke the '
+                f'audit at least once and find it clean; got '
+                f'{final_heartbeat_samples!r}'
+            )
+        finally:
+            await _stop_worker(worker, worker_task)
 
         assert outcome_a.status != 'done', (
             f'Expected A to fail (gated verify returns passed=False), got {outcome_a!r}'
