@@ -174,10 +174,10 @@ def _sleep_binary() -> str:
     return found
 
 
-@pytest.fixture
-def claude_holder(tmp_path: Path) -> Iterator[int]:
+def _claude_named(directory: Path) -> Iterator[int]:
     """A live process whose /proc/<pid>/comm reads 'claude'."""
-    binary = tmp_path / 'claude'
+    directory.mkdir()
+    binary = directory / 'claude'
     shutil.copy(_sleep_binary(), binary)
     binary.chmod(0o755)
     process = _spawn([str(binary), '600'])
@@ -185,6 +185,16 @@ def claude_holder(tmp_path: Path) -> Iterator[int]:
         yield process.pid
     finally:
         _reap(process)
+
+
+@pytest.fixture
+def claude_holder(tmp_path: Path) -> Iterator[int]:
+    yield from _claude_named(tmp_path / 'first_holder')
+
+
+@pytest.fixture
+def second_claude_holder(tmp_path: Path) -> Iterator[int]:
+    yield from _claude_named(tmp_path / 'second_holder')
 
 
 @pytest.fixture
@@ -530,3 +540,73 @@ async def test_plain_pending_release_is_legal_for_every_kind(
 
     assert 'error' not in result, result
     assert (await stack.read(task_id))['status'] == 'pending'
+
+
+# Rows 6 and 27 (re-stamp): a deferral on a deferred row replaces its record in place.
+
+
+@pytest.mark.asyncio
+async def test_restamp_replaces_record_without_a_status_change(stack: Stack) -> None:
+    task_id = await stack.seed('pending', 'row 6 restamp')
+    carrier = await stack.seed('pending', 'row 6 carrier')
+    await _enter(stack, task_id, _until_condition('row 6 first'))
+    first = _valid_record((await stack.read(task_id))['metadata']['deferral'])
+    first_raw = (await stack.read(task_id))['metadata']['deferral']
+    await stack.interceptor.drain()
+    status_events_before = len(await _status_events(stack, task_id, 'deferred'))
+    reconciles_before = len(stack.reconciler.calls)
+    journal_before = len(await stack.journal_rows('set_task_status'))
+
+    result = await _enter(stack, task_id, {'kind': 'carried_by', 'carrier_task_id': int(carrier)})
+
+    await stack.interceptor.drain()
+    row = await stack.read(task_id)
+    assert row['status'] == 'deferred'
+    stored = row['metadata']['deferral']
+    second = _valid_record(stored)
+    assert isinstance(second, task_deferral.CarriedByDeferral), second
+    assert second.stamped_by == _AGENT
+    assert second.deferred_at == first.deferred_at
+    assert second.stamped_at > first.stamped_at
+    assert result['deferral'] == stored
+    assert 'reconciliation' not in result, result
+    restamps = [
+        event.payload for event in await stack.events('deferral_restamped')
+        if event.payload['task_id'] == task_id
+    ]
+    assert len(restamps) == 1, restamps
+    assert restamps[0]['old'] == first_raw
+    assert restamps[0]['new'] == stored
+    assert len(await _status_events(stack, task_id, 'deferred')) == status_events_before
+    assert len(stack.reconciler.calls) == reconciles_before
+    rows = await stack.journal_rows('set_task_status')
+    assert len(rows) == journal_before + 1
+    assert rows[-1]['success'] == 1
+
+
+@pytest.mark.asyncio
+async def test_deferred_write_without_deferral_on_deferred_row_is_still_a_no_op(
+    stack: Stack,
+) -> None:
+    task_id = await stack.seed('pending', 'row 6 no-op')
+    await _enter(stack, task_id, _until_condition('row 6 no-op'))
+    stored = (await stack.read(task_id))['metadata']['deferral']
+
+    result = await stack.call('set_task_status', id=task_id, status='deferred')
+
+    assert result.get('no_op') is True, result
+    assert (await stack.read(task_id))['metadata']['deferral'] == stored
+
+
+@pytest.mark.asyncio
+async def test_restamp_of_held_row_moves_the_lease(
+    stack: Stack, claude_holder: int, second_claude_holder: int,
+) -> None:
+    task_id = await stack.seed('pending', 'row 6 lease')
+    await _enter(stack, task_id, {'kind': 'held_by_session', 'holder_pid': claude_holder})
+
+    await _enter(stack, task_id, {'kind': 'held_by_session', 'holder_pid': second_claude_holder})
+
+    record = _valid_record((await stack.read(task_id))['metadata']['deferral'])
+    assert isinstance(record, task_deferral.HeldBySessionDeferral), record
+    assert record.holder.pid == second_claude_holder
