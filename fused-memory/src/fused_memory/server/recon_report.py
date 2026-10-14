@@ -305,12 +305,12 @@ _MAX_PURGED_TEXT_CHARS = 2_000
 _MAX_PURGED_FINDINGS = 20
 
 
-def _truncate_field(value: str, cap: int) -> tuple[str, bool]:
+def _truncate_field(value: str, cap: int, *, field: str) -> tuple[str, bool]:
     """``(value cut by clip_text, was_truncated)``, marked with the uncounted ``_TRUNCATION_MARKER``.
 
     The marker stays uncounted because truncated text is persisted and feeds the null-null description dedup hash.
     """
-    clip = clip_text(value, cap, field='finding_text')
+    clip = clip_text(value, cap, field=field)
     if clip.fact is None:
         return clip.text, False
     return clip.text + _TRUNCATION_MARKER, True
@@ -1569,15 +1569,19 @@ class ReconReportState:
         # its ordering relative to the dedup check below is not load-bearing
         # the way description's is.
         warnings: list[str] = []
-        description, description_truncated = _truncate_field(description, _MAX_FINDING_TEXT_CHARS)
+        description, description_truncated = _truncate_field(
+            description, _MAX_FINDING_TEXT_CHARS, field='description'
+        )
         if description_truncated:
             warnings.append(f'description truncated to {_MAX_FINDING_TEXT_CHARS} chars')
         suggested_action, suggested_action_truncated = _truncate_field(
-            suggested_action, _MAX_FINDING_TEXT_CHARS
+            suggested_action, _MAX_FINDING_TEXT_CHARS, field='suggested_action'
         )
         if suggested_action_truncated:
             warnings.append(f'suggested_action truncated to {_MAX_FINDING_TEXT_CHARS} chars')
-        category, category_truncated = _truncate_field(category, _MAX_FINDING_TEXT_CHARS)
+        category, category_truncated = _truncate_field(
+            category, _MAX_FINDING_TEXT_CHARS, field='category'
+        )
         if category_truncated:
             warnings.append(f'category truncated to {_MAX_FINDING_TEXT_CHARS} chars')
 
@@ -2523,7 +2527,9 @@ class ReconReportState:
         snapshot = asdict(finding)
         truncated_fields: list[str] = []
         for name in ('description', 'suggested_action'):
-            snapshot[name], was_truncated = _truncate_field(snapshot[name], _MAX_PURGED_TEXT_CHARS)
+            snapshot[name], was_truncated = _truncate_field(
+                snapshot[name], _MAX_PURGED_TEXT_CHARS, field=name
+            )
             if was_truncated:
                 truncated_fields.append(name)
         record_entry.purged_findings.append({
