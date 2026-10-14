@@ -406,7 +406,7 @@ def plan(
     if status == DEFERRED and request is None and _needs_request(old_status, call):
         return DeferralRequiredRefusal(task_id, old_status)
     if request is None:
-        return NO_WRITE
+        return _exit(stored) if old_status == DEFERRED and status != DEFERRED else NO_WRITE
     refusal = _kind_refusal(request, old_status=old_status, stored=stored, task_id=task_id)
     if refusal is not None:
         return refusal
@@ -414,6 +414,13 @@ def plan(
         record = _stamped(request, call, agent_id=agent_id, deferred_at=call.now)
         return DeferralWrite(audit_fields={'deferral': record}, event_fields={'deferral': record})
     return NO_WRITE
+
+
+def _exit(stored: _StoredRecord) -> DeferralWrite:
+    return DeferralWrite(
+        clear_keys=frozenset({'deferral'}) if stored.present else frozenset(),
+        event_fields={'deferral_cleared': stored.raw},
+    )
 
 
 def _stamped(

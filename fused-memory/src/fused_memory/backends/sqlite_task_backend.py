@@ -2596,11 +2596,16 @@ class SqliteTaskBackend:
         tag: str | None = None,
         *,
         audit_fields: dict,
+        clear_keys: frozenset[str] = frozenset(),
         claimant_run_id: str | None = _UNSET,  # type: ignore[assignment]
         heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
         pending_since_now: str | None = None,
     ) -> SetTaskStatusResult | StatusWriteNotPersistedResult:
         """Atomically update ``status`` AND merge ``audit_fields`` into metadata.
+
+        ``clear_keys`` (a subset of ``_CLEARABLE_AUDIT_KEYS``) are removed from
+        the resulting blob in the same transaction: leaving ``deferred`` drops
+        its record.
 
         The sole atomic status+audit writer (task 2649). Calling
         ``stamp_audit_metadata`` followed by ``set_task_status`` — the
@@ -2642,6 +2647,11 @@ class SqliteTaskBackend:
         :meth:`stamp_audit_metadata`, kept off the 12-method contract so
         other callers do not treat it as sanctioned public surface.
         """
+        if unclearable := clear_keys - _CLEARABLE_AUDIT_KEYS:
+            raise ValueError(
+                f'set_status_and_stamp_audit cannot clear {sorted(unclearable)}; '
+                f'clearable keys are {sorted(_CLEARABLE_AUDIT_KEYS)}'
+            )
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         tid = _parse_task_id(task_id)
@@ -2700,6 +2710,7 @@ class SqliteTaskBackend:
                 )
                 if stamped is not None:
                     new_metadata = stamped
+                new_metadata = _metadata_without_keys(new_metadata, clear_keys)
 
                 set_columns = ['status = ?', 'metadata = ?', 'updated_at = ?']
                 set_values: list[Any] = [status, new_metadata, task_timestamp_now()]
@@ -4331,6 +4342,22 @@ def _assert_done_provenance_passthrough(
     if stored.get('done_provenance', absent) != incoming.get('done_provenance', absent):
         raise DoneProvenanceWriteAuthorityError(task_id)
     return 'done_provenance' in incoming
+
+
+_CLEARABLE_AUDIT_KEYS: frozenset[str] = frozenset({'deferral'})
+
+
+def _metadata_without_keys(blob_json: str, keys: frozenset[str]) -> str:
+    """*blob_json* with *keys* removed; returned unchanged when it is not a JSON object."""
+    if not keys:
+        return blob_json
+    try:
+        blob = json.loads(blob_json)
+    except (TypeError, ValueError):
+        return blob_json
+    if not isinstance(blob, dict) or not keys & blob.keys():
+        return blob_json
+    return json.dumps({k: v for k, v in blob.items() if k not in keys})
 
 
 def _merge_metadata(

@@ -1835,10 +1835,14 @@ class TaskInterceptor:
                 # single atomic set_status_and_stamp_audit call instead of
                 # plain set_task_status, so the status column and the audit
                 # metadata commit together — both or neither.
-                if audit_fields:
+                if audit_fields or deferral_write.clear_keys:
+                    clear_kwargs = (
+                        {'clear_keys': deferral_write.clear_keys}
+                        if deferral_write.clear_keys else {}
+                    )
                     write_body = tm.set_status_and_stamp_audit(  # type: ignore[attr-defined]
                         task_id, status, project_root, tag,
-                        audit_fields=audit_fields, **claimant_kwargs,
+                        audit_fields=audit_fields, **clear_kwargs, **claimant_kwargs,
                     )
                 else:
                     write_body = tm.set_task_status(
