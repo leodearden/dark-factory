@@ -15,11 +15,9 @@ from __future__ import annotations
 import ast
 import dataclasses
 import inspect
-from collections.abc import Collection, Iterable
+from collections.abc import Iterable
 from pathlib import Path
 from typing import TypeGuard
-
-from shared.psi import _ARMS
 
 from sampler.metrics import (
     METRIC_GROUPS,
@@ -35,13 +33,18 @@ from sampler.store import LoadSampleStore
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def scanned_names(groups: Iterable[MetricGroup], arm_names: Collection[str]) -> frozenset[str]:
-    """Every table metric name, less those that are also gate-arm names.
+def scanned_names(groups: Iterable[MetricGroup]) -> frozenset[str]:
+    """Every table metric name, less those that are also one of the table's gate arms.
 
     The exclusion is derived, never hand-listed: a metric named like an arm
-    (``runqueue_ratio``) is legitimately spelled wherever that arm is.
+    (``runqueue_ratio``) is legitimately spelled wherever that arm is. The
+    table's arms are reconciled with shared.psi's by
+    sampler/tests/test_load_metrics.py::TestArmMetricStemParity.
     """
-    return frozenset(spec.name for group in groups for spec in group.metrics) - set(arm_names)
+    groups = tuple(groups)
+    return frozenset(spec.name for group in groups for spec in group.metrics) - set(
+        arm_metrics(groups)
+    )
 
 
 def literal_metric_names(
@@ -152,7 +155,7 @@ _FIXTURE_TABLE = (
         windowed=True,
     ),
 )
-_FIXTURE_NAMES = scanned_names(_FIXTURE_TABLE, {'fixture_shared_with_an_arm'})
+_FIXTURE_NAMES = scanned_names(_FIXTURE_TABLE)
 
 _SEEDED_MODULE = '''\
 """fixture_alpha is described here, which is prose, not a spelling."""
@@ -197,7 +200,7 @@ class TestTheScanOnFixtureModules:
 # Structural backstop, live
 # ---------------------------------------------------------------------------
 
-_LIVE_NAMES = scanned_names(METRIC_GROUPS, {arm.field for arm in _ARMS})
+_LIVE_NAMES = scanned_names(METRIC_GROUPS)
 _SPEC_HOME = Path(inspect.getsourcefile(MetricSpec) or '').resolve()
 
 

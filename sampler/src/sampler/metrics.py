@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections import Counter
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -85,6 +86,11 @@ class GroupName(StrEnum):
     LOAD = 'load'
 
 
+def _repeated(names: Iterable[str]) -> list[str]:
+    """The sorted names that occur more than once in *names*."""
+    return sorted(name for name, count in Counter(names).items() if count > 1)
+
+
 @dataclass(frozen=True)
 class MetricSpec:
     """One recorded metric, and the facts every projection of the table reads.
@@ -131,8 +137,7 @@ class MetricGroup:
     windowed: bool
 
     def __post_init__(self) -> None:
-        names = [spec.name for spec in self.metrics]
-        repeated = sorted({name for name in names if names.count(name) > 1})
+        repeated = _repeated(spec.name for spec in self.metrics)
         if repeated:
             raise ValueError(
                 f'metric names must be unique within a group: {self.name} repeats {repeated}'
@@ -452,11 +457,8 @@ def collect_process_metrics(
 
 
 def _metric_table(*groups: MetricGroup) -> tuple[MetricGroup, ...]:
-    group_names = [group.name for group in groups]
-    metric_names = [spec.name for group in groups for spec in group.metrics]
-    repeated = sorted(
-        {str(name) for name in group_names if group_names.count(name) > 1}
-        | {name for name in metric_names if metric_names.count(name) > 1}
+    repeated = _repeated(str(group.name) for group in groups) + _repeated(
+        spec.name for group in groups for spec in group.metrics
     )
     if repeated:
         raise ValueError(
