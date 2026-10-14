@@ -2205,10 +2205,17 @@ class TaskWorkflow:
         the state machine stays under pyright's complexity threshold.
 
         Returns ``WorkflowOutcome.DONE`` on success; ``BLOCKED`` (with L1)
-        when the persistence layer refuses or ``_merge_sha`` is missing.
+        when the persistence layer refuses.  The DONE phase is entered only
+        once the done write has landed, so a refused write reaches
+        ``_mark_blocked`` from a working machine and leaves a 'blocked' row
+        plus an L1.  A missing ``_merge_sha`` is the exception: that branch
+        enters DONE first, so its ``_mark_blocked`` is a swallowed late
+        transition and the exit is DONE.
         """
         await self._reconcile_metadata_files_for_done()
         if not self._merge_sha:
+            # Eval mode's DONE depends on entering DONE here, first; task 3113 owns this branch.
+            self._enter_phase(WorkflowState.DONE)
             # Should never happen on the happy path — _submit_to_merge_queue
             # always populates _merge_sha on success.  Defensive bail-out
             # rather than passing done_provenance=None (which the server
@@ -2253,6 +2260,7 @@ class TaskWorkflow:
                 f'set_task_status(done) rejected: {exc.error_code} — {exc.raw}',
                 escalate_to_human=True,
             )
+        self._enter_phase(WorkflowState.DONE)
         # task 2681/ζ: consume the write-ahead LandedRow on the happy path so it
         # no longer survives to the next startup (closing the RC-3 stale-row
         # window); only after a SUCCESSFUL mark_done — a rejected done-write
@@ -3563,7 +3571,6 @@ class TaskWorkflow:
         # Wait for steward to finish any pending work (suggestion triage, etc.)
         await self._ensure_steward_started()
         await self._await_steward_completion(skip_if_idle=True)
-        self._enter_phase(WorkflowState.DONE)
         return await self._finalise_merged_done()
 
     async def _resume_merge_retry_if_pending(
@@ -6956,7 +6963,6 @@ class TaskWorkflow:
             'setting status done with provenance',
             self.task_id, commit[:12],
         )
-        self._enter_phase(WorkflowState.DONE)
         await self._reconcile_metadata_files_for_done()
         try:
             await self.scheduler.mark_done(
@@ -6980,6 +6986,7 @@ class TaskWorkflow:
                 f'Architect already_done rejected: {exc.error_code} — {exc.raw}',
                 escalate_to_human=True,
             )
+        self._enter_phase(WorkflowState.DONE)
         return WorkflowOutcome.DONE
 
     async def _hold_unattributed_already_done(
@@ -15134,7 +15141,6 @@ class TaskWorkflow:
         ) is not None:
             return None
         self._merge_recovery_basis = basis
-        self._enter_phase(WorkflowState.DONE)
         await self._reconcile_metadata_files_for_done(override_files=files)
         try:
             await self.scheduler.mark_done(
@@ -15149,6 +15155,7 @@ class TaskWorkflow:
                 f'Recovery-DONE rejected: {exc.error_code} — {exc.raw}',
                 escalate_to_human=True,
             )
+        self._enter_phase(WorkflowState.DONE)
         return WorkflowOutcome.DONE
 
     async def _discovered_landing_sha(
