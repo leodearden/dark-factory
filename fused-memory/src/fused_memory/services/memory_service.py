@@ -2265,7 +2265,12 @@ class ReferentRepairStats:
 
     @property
     def failed(self) -> int:
-        """Findings whose repair was ATTEMPTED and did not complete."""
+        """Findings whose repair the backend thwarted; nothing was written.
+
+        Both populations — attempted and raised, or deferred on a degraded
+        target lookup — are defined by the ``'failed'`` bullet of
+        :data:`REFERENT_REPAIR_OUTCOMES`.
+        """
         return sum(1 for r in self.repairs if r.outcome == 'failed')
 
     @property
@@ -4597,34 +4602,14 @@ class MemoryService:
           statements earlier. zeta's ``new_endpoint_uuid`` is demoted to what
           its own docstring already calls it: an audit convenience.
 
-        THE FOUR PRE-WRITE GUARDS, in the order they are evaluated. Each
-        RECORDS the finding and moves on; none of them drops it, and none is
-        reachable after a write has begun:
+        THE PRE-WRITE GUARDS — which findings are recorded and left alone
+        rather than repaired, in what order, and under which outcome — are
+        listed once, in :meth:`_repair_edge_findings`, where they are
+        evaluated.
 
-        1. ZETA-UNRESOLVABLE — zeta determined no single target. Recorded with
-           zeta's own reason, verbatim: NEVER GUESS.
-        2. DEGRADED-LOOKUP DEFERRAL — zeta determined one, but its lookup of
-           that target's node was degraded
-           (:attr:`ReferentFinding.uuid_lookup_degraded`), so whether the node
-           exists is unknown. Deferred BEFORE ``ensure_entity_node``.
-        3. IMPLAUSIBLE TARGET — zeta determined one, from the whole-set
-           fallback, and it is not plausible
-           (:func:`_implausible_target_reason`). Refused BEFORE
-           ``ensure_entity_node``, so the phantom node is never minted.
-        4. DUPLICATE-NAME REFUSAL — the target name resolves to two or more
-           nodes, and the backend raises rather than collapsing them.
-
-        Guards 1 to 3 are evaluated in :meth:`_repair_edge_findings` before the
-        write block; guard 4 is the backend's, surfaced as
-        ``AmbiguousEntityError`` and caught there. Guards 1, 3 and 4 are
-        refusals and book ``outcome='unrepairable'`` — the edge was left alone
-        — which is what keeps a refusal out of ``failed``, where a FalkorDB
-        outage belongs. Guard 2 is that outage, so it books ``'failed'``, not
-        ``'unrepairable'``.
-
-        WHY GUARD 4 IS A REFUSAL HERE AND A COLLAPSE ELSEWHERE. The >=2-match
-        ``merge_entities`` collapse remains licensed on exactly one path, the
-        episode-write dedup of the PRD's seam S1 (see
+        WHY A DUPLICATE-NAME GROUP IS REFUSED HERE AND COLLAPSED ELSEWHERE.
+        The >=2-match ``merge_entities`` collapse remains licensed on exactly
+        one path, the episode-write dedup of the PRD's seam S1 (see
         ``plans/fm-memory-identity-prd.md``, whose S1 scope amendment names this
         task) — and that path reaches ``_resolve_or_create_entity`` DIRECTLY,
         never ``ensure_entity_node``. A repair is not that path: collapsing two
@@ -5194,24 +5179,31 @@ class MemoryService:
         degenerate predicate reads as a gate on the whole edge rather than as
         another branch inside the per-finding loop.
 
-        FOUR PRE-WRITE DISPOSITIONS, in order, all stopping before anything is
-        written:
+        FOUR PRE-WRITE DISPOSITIONS, in the order they are evaluated. Each
+        RECORDS the finding and moves on — none drops it — and all four stop
+        before anything is written:
 
         1. ZETA-UNRESOLVABLE — no target was determined at all. Carries zeta's
            own ``reason`` verbatim (NEVER GUESS, the structural default).
         2. DEGRADED-LOOKUP DEFERRAL — a target WAS determined, but zeta's
-           lookup of its node was degraded, so neither resolving nor minting is
-           grounded. The one pre-write disposition that records ``'failed'``:
-           it is the backend not answering, not a refusal.
+           lookup of its node was degraded
+           (:attr:`ReferentFinding.uuid_lookup_degraded`), so neither resolving
+           nor minting is grounded. Deferred BEFORE ``ensure_entity_node``.
         3. IMPLAUSIBLE TARGET — a target WAS determined, from the whole-set
-           fallback, and it is not one this pass may mint a node for. See
-           :func:`_implausible_target_reason`.
+           fallback, and it is not one this pass may mint a node for
+           (:func:`_implausible_target_reason`). Refused BEFORE
+           ``ensure_entity_node``, so the phantom node is never minted.
         4. DUPLICATE-NAME REFUSAL — the target name resolves to two or more
-           nodes, and collapsing them is not this path's act to make.
+           nodes, and collapsing them is not this path's act to make. The
+           backend's guard: ``ensure_entity_node`` raises
+           ``AmbiguousEntityError`` and the write block's arm catches it.
 
-        The three refusals (1, 3, 4) record ``outcome='unrepairable'`` and are
-        distinguishable by ``reason``, which is the field that exists to say
-        why; the outcome vocabulary is deliberately not widened.
+        The three refusals (1, 3, 4) record ``outcome='unrepairable'`` — the
+        edge was left alone — and are distinguishable by ``reason``, which is
+        the field that exists to say why; the outcome vocabulary is
+        deliberately not widened. Disposition 2 records ``'failed'``: it is the
+        backend not answering, not a refusal, and keeping refusals out of
+        ``'failed'`` is what leaves that bucket meaning a FalkorDB outage.
 
         TWO GUARDS PER FINDING, NOT ONE, split at the commit point. The first
         wraps ``ensure_entity_node`` + ``reassign_edge`` — everything that can
@@ -5320,9 +5312,9 @@ class MemoryService:
                 # writes. A stale `None` can only ever REFUSE: it covers absent
                 # and duplicate-name group, and in both cases the direction is
                 # fail-closed. (The duplicate-name case is refused twice over —
-                # guard (c) below would refuse it too.) A degraded lookup never
-                # reaches here: it was deferred above, so this guard never reads
-                # an existence answer nobody could check.
+                # the DUPLICATE-NAME REFUSAL below would refuse it too.) A
+                # degraded lookup never reaches here: it was deferred above, so
+                # this guard never reads an existence answer nobody could check.
                 # This is EVIDENCE, not the repair TARGET: the target still
                 # comes from `ensure_entity_node`'s return, so the standing
                 # objection to branching on `new_endpoint_uuid` — "a SECOND site
