@@ -113,6 +113,12 @@ async def _row(ledger, topic=TOPIC, run_id='run-p1', project_id=PROJECT_ID):
     )
 
 
+def _outcome(row) -> ProposalOutcome:
+    outcome = outcome_from_record(row)
+    assert outcome is not None, 'the executor never recorded an outcome on this row'
+    return outcome
+
+
 def _assert_stats_complete(report):
     assert set(auto_consolidation_initial_stats()) <= set(report.stats)
 
@@ -182,7 +188,7 @@ class TestFreshClusterPasses:
         row = await _row(ledger)
         assert row.state == 'addressed'
         assert row.expires_at is None
-        outcome = outcome_from_record(row)
+        outcome = _outcome(row)
         (canonical_id,) = svc.canonical_ids()
         assert outcome.canonical_id == canonical_id
         assert outcome.canonical_minted is True
@@ -208,7 +214,7 @@ class TestFullyConsolidatedReEmission:
         assert svc.write_awaits() == writes_before
         row = await _row(ledger, run_id='run-p2')
         assert row.state == 'addressed'
-        assert outcome_from_record(row).reason_codes == ('already_consolidated',)
+        assert _outcome(row).reason_codes == ('already_consolidated',)
         assert report.stats['auto_consolidations_noop'] == 1
         _assert_stats_complete(report)
 
@@ -353,7 +359,7 @@ class TestRegrowthIsTaggedOnly:
         assert svc.snapshot(canonical) == before
         svc.add_memory.assert_not_awaited()
         svc.delete_memory.assert_not_awaited()
-        outcome = outcome_from_record(await _row(ledger))
+        outcome = _outcome(await _row(ledger))
         assert outcome.tagged_ids == tuple(fresh)
         assert outcome.stripped_ids == (canonical,)
         assert outcome.canonical_id == canonical
@@ -396,7 +402,7 @@ class TestHazardGate:
         assert 'canonical_carries_correction' in call['description']
         row = await _row(ledger)
         assert row.state == 'gated'
-        assert outcome_from_record(row).gate_task_id == '1001'
+        assert _outcome(row).gate_task_id == '1001'
         assert report.stats['auto_consolidation_gates_filed'] == 1
 
     @pytest.mark.asyncio
@@ -418,7 +424,7 @@ class TestHazardGate:
 
         row = await _row(ledger)
         assert row.state == 'gated'
-        assert outcome_from_record(row).gate_task_id == '77'
+        assert _outcome(row).gate_task_id == '77'
 
     @pytest.mark.asyncio
     async def test_a_zero_filing_budget_leaves_the_row_proposed(self, ledger, queue):
@@ -472,7 +478,7 @@ class TestAlreadyGated:
         assert svc.write_awaits() == (0, 0, 0, 0)
         row = await _row(ledger)
         assert row.state == 'addressed'
-        outcome = outcome_from_record(row)
+        outcome = _outcome(row)
         assert outcome.reason_codes == ('already_gated',)
         assert outcome.gate_task_id == str(GATE_TOPIC_TASK_ID)
 
@@ -519,7 +525,7 @@ class TestClosureFailure:
         row = await _row(ledger)
         assert row.state == 'gated'
         assert row.expires_at is None
-        outcome = outcome_from_record(row)
+        outcome = _outcome(row)
         (canonical_id,) = svc.canonical_ids()
         assert outcome.canonical_id == canonical_id
         assert outcome.tagged_ids == (members[0], members[2], members[3])
@@ -542,7 +548,7 @@ class TestExecutionRefusal:
         assert svc.write_awaits() == (0, 0, 0, 0)
         row = await _row(ledger)
         assert row.state == 'refused'
-        assert outcome_from_record(row).reason_codes == ('execution_refused',)
+        assert _outcome(row).reason_codes == ('execution_refused',)
         assert report.stats['auto_consolidation_refusals'] == {'execution_refused': 1}
 
 
@@ -574,7 +580,7 @@ class TestBenignRefusal:
         assert 'member_count_out_of_range' in esc.detail
         row = await _row(ledger)
         assert row.state == 'refused'
-        assert outcome_from_record(row).reason_codes == ('member_count_out_of_range',)
+        assert _outcome(row).reason_codes == ('member_count_out_of_range',)
         assert report.stats['auto_consolidation_refusals'] == {'member_count_out_of_range': 1}
         svc.get_memory_by_id.assert_not_awaited()
 
