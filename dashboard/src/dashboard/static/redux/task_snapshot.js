@@ -273,11 +273,13 @@ function viewReason([view, datum]) {
 
 // ── The terminal window ──
 // Terminal rows come only from the on-demand ?terminal=<project> window. A
-// surface that requests a project's window reads data.js::onDemandDatum. A
-// surface that lists a window it did NOT request — the Tasks tab, for each
-// project outside its wanted set — reads it through unrequestedTerminalRows:
-// data.js::datumFor would call an absent window 'not yet fetched', which
-// promises a fetch that is not coming, so the hole states what is true instead.
+// surface requests the windows of its wanted set through
+// createTerminalWindowHooks, and reads a window it requested as
+// data.js::onDemandDatum shows it. A window it did NOT request — the Tasks tab
+// lists one for each project outside its wanted set — reads through
+// unrequestedTerminalRows: data.js::datumFor would call an absent window 'not
+// yet fetched', which promises a fetch that is not coming, so the hole states
+// what is true instead.
 const TERMINAL_NOT_REQUESTED = 'the terminal window is fetched on request only, and this view does not request it';
 
 function unrequestedTerminalRows(served) {
@@ -306,6 +308,42 @@ function terminalSelectingProjects(listings) {
   return selecting.filter((project, i) => selecting.indexOf(project) === i);
 }
 
+// The hook a requesting surface renders terminal windows through, built over
+// `react` (React itself, or anything carrying its useState, useEffect and
+// useRef) and `loader` (data.js's DF_DATA_LOADER). Both come from the caller,
+// as persisted_state.js::createPersistedHooks takes React, so this module
+// reads neither at load and node drives the hook with stand-ins.
+function createTerminalWindowHooks({ useState, useEffect, useRef }, loader) {
+  // Requests a project's window as it enters `wanted` (PRD decision 5: once per
+  // entry, never per poll) and returns windowOf(project), the Datum to list for
+  // any project: a wanted one's shows what this surface's own request is doing
+  // until the window lands; any other's is unrequestedTerminalRows over `data`.
+  //
+  // No cleanup cancels a pending outcome: a later run does not re-request a
+  // project still in the set, so its outcome arrives only via the run that asked.
+  function useTerminalWindows(data, wanted) {
+    const [outcomes, setOutcomes] = useState({});
+    const wantedBefore = useRef([]);
+    const wantedKey = wanted.join('\n');
+    useEffect(() => {
+      const entrants = terminalWindowEntrants(wantedBefore.current, wanted);
+      wantedBefore.current = wanted;
+      if (entrants.length === 0) return;
+      setOutcomes(held => ({ ...held, ...Object.fromEntries(entrants.map(project => [project, null])) }));
+      for (const project of entrants) {
+        loader.requestOnDemand('terminal', project).then(outcome => {
+          setOutcomes(held => ({ ...held, [project]: outcome }));
+        });
+      }
+    }, [wantedKey]); // eslint-disable-line react-hooks/exhaustive-deps
+    return project => (wanted.includes(project)
+      ? loader.onDemandDatum('terminal', project, outcomes[project] ?? null)
+      : unrequestedTerminalRows(data[loader.ON_DEMAND_KEYS.terminal.key(project)]));
+  }
+
+  return { useTerminalWindows };
+}
+
 // Module-unique export const, never a bare `API` — the CANONICAL note in
 // datum.js's header, enforced by classic_script_scope.test.mjs.
 const TASK_SNAPSHOT_API = {
@@ -329,6 +367,7 @@ const TASK_SNAPSHOT_API = {
   terminalWindowProjects,
   terminalWindowEntrants,
   terminalSelectingProjects,
+  createTerminalWindowHooks,
   sameDatum,
 };
 

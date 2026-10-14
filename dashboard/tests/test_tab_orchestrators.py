@@ -404,27 +404,16 @@ class TestOrchTabReadsTheCensus:
         )
 
 
-def _binding(code: str, name: str) -> str:
-    """The right-hand side of ``const <name> = ...;`` in *code*."""
-    match = re.search(rf'\bconst\s+{re.escape(name)}\s*=\s*([^;]*);', code)
-    assert match, f'`{name}` is not bound by a `const` in OrchTab'
-    return match.group(1)
-
-
-def _terminal_request_effects(code: str) -> list[str]:
-    """Every ``uE(...)`` call in *code* that requests the terminal window."""
-    effects = [walk_balanced(code, match.end() - 1, '(', ')') for match in re.finditer(r'\buE\s*\(', code)]
-    return [e for e in effects if re.search(r"(?:\w+\.)?requestOnDemand\(\s*'terminal'\s*,", e)]
-
-
 class TestOrchTabRequestsTheTerminalWindow:
     """OrchTab requests a project's ``?terminal=`` window while a listing's
     filter selects the terminal view (task 5936; PRD decision 5).
 
-    This pins only the WIRING, on comment-stripped source. The rules execute
-    under node: which projects in task_snapshot.test.mjs
-    (terminalSelectingProjects, terminalWindowEntrants), and what a requesting
-    caller shows in data_poll.test.mjs (onDemandDatum).
+    This pins only the WIRING, on comment-stripped source: OrchTab hands its
+    wanted set to the hook task_snapshot.js::createTerminalWindowHooks builds,
+    and lists the reader that hook returns. The rules execute under node in
+    task_snapshot.test.mjs: which projects are wanted
+    (terminalSelectingProjects), and when each is requested and what it then
+    reads (createTerminalWindowHooks).
     """
 
     @pytest.fixture(scope='class')
@@ -437,6 +426,15 @@ class TestOrchTabRequestsTheTerminalWindow:
         calls = re.findall(r'\bconst\s+(\w+)\s*=\s*terminalSelectingProjects\(', orch_tab_code)
         assert len(calls) == 1, f'OrchTab binds terminalSelectingProjects(...) {len(calls)} times; expected one'
         return calls[0]
+
+    @pytest.fixture(scope='class')
+    def window_of(self, orch_tab_code, wanted):
+        """The name OrchTab binds the hook's reader to; the probes follow it."""
+        readers = re.findall(rf'\bconst\s+(\w+)\s*=\s*useTerminalWindows\(\s*DF\s*,\s*{wanted}\s*\)', orch_tab_code)
+        assert len(readers) == 1, (
+            f'OrchTab binds useTerminalWindows(DF, {wanted}) {len(readers)} times; expected one'
+        )
+        return readers[0]
 
     def test_the_wanted_set_is_each_listed_project_whose_filter_selects_terminal(self, orch_tab_code, wanted):
         assert re.search(
@@ -456,77 +454,33 @@ class TestOrchTabRequestsTheTerminalWindow:
             'wanted set is derived from'
         )
 
-    def test_the_window_is_requested_in_one_effect_keyed_on_the_wanted_set(self, orch_tab_code, wanted):
-        requesting = _terminal_request_effects(orch_tab_code)
-        assert len(requesting) == 1, f'{len(requesting)} effects request the terminal window; expected one'
-        [effect] = requesting
-        deps = re.search(r',\s*\[\s*(\w+)\s*\]\s*\)\Z', effect)
-        assert deps, (
-            'the terminal request must run in an effect keyed on ONE derived key of the wanted '
-            f'set: once per entry into it, never on the 3 s poll and never only on mount. Found: {effect}'
-        )
-        assert re.fullmatch(rf'{wanted}\.join\([^)]*\)', _binding(orch_tab_code, deps.group(1)).strip()), (
-            f'the effect key `{deps.group(1)}` is not derived from `{wanted}`'
-        )
-        assert re.search(r'\.then\(\s*\(?\s*(\w+)\s*\)?\s*=>[^;]*\bset\w+\([^;]*\b\1\b', effect), (
-            'the effect does not record the request outcome into state'
-        )
-
-    def test_a_project_already_wanted_is_not_requested_again(self, orch_tab_code, wanted):
-        """Only the entrants are requested; which ids those are executes in task_snapshot.test.mjs."""
-        [effect] = _terminal_request_effects(orch_tab_code)
-        entrants = re.search(rf'\bconst\s+(\w+)\s*=\s*terminalWindowEntrants\(\s*(\w+)\.current\s*,\s*{wanted}\s*\)', effect)
-        assert entrants, (
-            f'the effect does not compute terminalWindowEntrants(<ref>.current, {wanted}): every key change '
-            're-requests the window of each project already wanted'
-        )
-        arrived, before = entrants.groups()
-        assert re.search(rf'\bconst\s+{before}\s*=\s*uR\(', orch_tab_code), f'`{before}` is not a ref OrchTab holds'
-        assert re.search(rf'\b{before}\.current\s*=\s*{wanted}\s*;', effect), (
-            f'the effect never records {wanted} as `{before}.current`, so the next run cannot tell who entered'
-        )
-        loop = re.search(r'\bfor\s*\(\s*const\s+(\w+)\s+of\s+(\w+)\s*\)', effect)
-        assert loop and loop.group(2) == arrived, f'the request loop does not iterate `{arrived}`: {effect}'
-        assert re.search(rf'\b{arrived}\.map\(\s*(\w+)\s*=>\s*\[\s*\1\s*,\s*null\s*\]', effect), (
-            f'only the entrants\' outcomes are reset to null; resetting `{wanted}` blanks settled ones'
-        )
-        assert not re.search(r'\breturn\s*\(\s*\)\s*=>', effect), (
-            'a cleanup that drops pending outcomes loses a still-wanted project\'s: the next run '
-            'does not request it again'
-        )
-
-    def test_the_request_is_made_only_inside_that_effect(self, orch_tab_code):
-        calls = re.findall(r'\brequestOnDemand\(', orch_tab_code)
-        assert len(calls) == 1, (
-            f'OrchTab calls requestOnDemand {len(calls)} times; the one call belongs in the effect, '
-            'never in the render body, which runs on every poll and clock tick'
-        )
-
-    def test_the_listed_terminal_rows_read_the_request_outcome(self, orch_tab_code):
-        listed = re.search(
-            r'viewRows\(\s*projectRows\(\s*DF\s*,\s*o\.project\s*\)\s*,\s*'
-            r"(?:\w+\.)?onDemandDatum\(\s*'terminal'\s*,\s*o\.project\s*,\s*(\w+)\[\s*o\.project\s*\]\s*\?\?\s*null\s*\)"
+    def test_the_listed_terminal_rows_are_the_hooks_reading(self, orch_tab_code, window_of):
+        assert re.search(
+            rf'viewRows\(\s*projectRows\(\s*DF\s*,\s*o\.project\s*\)\s*,\s*{window_of}\(\s*o\.project\s*\)'
             r'\s*,\s*filter\s*\)',
             orch_tab_code,
+        ), (
+            f'OrchTab rows do not come from viewRows(projectRows(DF, o.project), {window_of}(o.project), '
+            'filter): the listed window must say what OrchTab\'s own request is doing'
         )
-        assert listed, (
-            "OrchTab rows do not come from viewRows(projectRows(DF, o.project), onDemandDatum('terminal', "
-            'o.project, <outcomes>[o.project] ?? null), filter): the listed window must say what '
-            'OrchTab\'s own request is doing'
-        )
-        outcomes = listed.group(1)
-        assert re.search(rf'\bconst\s*\[\s*{outcomes}\s*,\s*\w+\s*\]\s*=\s*uS\(', orch_tab_code), (
-            f'`{outcomes}` is not request-outcome state OrchTab holds'
+
+    def test_the_hook_is_built_over_react_and_the_loader(self, tabs_code):
+        assert re.search(
+            r'\bconst\s*\{\s*useTerminalWindows\s*\}\s*=\s*'
+            r'createTerminalWindowHooks\(\s*React\s*,\s*window\.DF_DATA_LOADER\s*\)\s*;',
+            tabs_code,
+        ), 'tabs.jsx does not build useTerminalWindows from React and window.DF_DATA_LOADER at module scope'
+        destructure = re.search(r'const\s*\{([^}]*)\}\s*=\s*window\.DF_TASK_SNAPSHOT\s*;', tabs_code)
+        assert destructure and re.search(r'\bcreateTerminalWindowHooks\b', destructure.group(1)), (
+            'tabs.jsx does not take createTerminalWindowHooks from window.DF_TASK_SNAPSHOT'
         )
 
     @pytest.mark.parametrize(
         ('scope', 'retired', 'why'),
         [
-            (
-                'tabs_code',
-                'unrequestedTerminalRows',
-                'its hole says this view does not request the window; OrchTab now does',
-            ),
+            ('tabs_code', 'requestOnDemand', 'the request is the shared hook\'s, whose rules execute under node'),
+            ('tabs_code', 'onDemandDatum', 'the shared hook reads what OrchTab\'s request is doing'),
+            ('tabs_code', 'unrequestedTerminalRows', 'the shared hook reads a window OrchTab does not request'),
             (
                 'orch_tab_code',
                 'datumFor(',
@@ -538,9 +492,3 @@ class TestOrchTabRequestsTheTerminalWindow:
     )
     def test_no_reader_that_misstates_the_window_remains(self, request, scope, retired, why):
         assert retired not in request.getfixturevalue(scope), f'`{retired}` remains in {scope}: {why}'
-
-    def test_the_loader_is_bound_at_module_scope_without_fallback(self, tabs_code):
-        assert re.search(r'=\s*window\.DF_DATA_LOADER\s*;', tabs_code), (
-            'tabs.jsx does not bind window.DF_DATA_LOADER at module scope.'
-        )
-        assert not re.search(r'window\.DF_DATA_LOADER\s*(\|\||&&|\?\?)', tabs_code)

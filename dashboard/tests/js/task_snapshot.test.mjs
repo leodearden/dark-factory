@@ -22,6 +22,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
 import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
+import { reactStandIn } from './_react_stand_in.mjs';
 
 const REDUX = '../../src/dashboard/static/redux/';
 const LOAD_CHAIN = ['datum.js', 'task_vocab.js', 'task_snapshot.js'].map(name => REDUX + name);
@@ -41,7 +42,7 @@ const { CENSUS_VIEWS, CENSUS_TILES, censusSegments, censusHistory } = snapshot;
 const { inFlightCount, runningOfInFlight, terminalOfTotal, censusTotal, viewShareText } = snapshot;
 const { projectRows, viewRows, unrequestedTerminalRows } = snapshot;
 const { snapshotRowsOver, EVERY_VIEW, terminalWindowProjects, terminalWindowEntrants } = snapshot;
-const { terminalSelectingProjects } = snapshot;
+const { terminalSelectingProjects, createTerminalWindowHooks } = snapshot;
 const { sameDatum } = snapshot;
 const { isDatum, datumView, displayedAgeMs, EM_DASH } = loadedWindow.DF_DATUM;
 const { MEMBERS, VIEWS, SUB_VIEWS } = loadedWindow.DF_TASK_VOCAB;
@@ -63,6 +64,7 @@ const EXPECTED_FUNCTION_NAMES = [
   'terminalWindowProjects',
   'terminalWindowEntrants',
   'terminalSelectingProjects',
+  'createTerminalWindowHooks',
   'sameDatum',
 ];
 const EXPECTED_EXPORT_NAMES = [
@@ -913,28 +915,147 @@ test('terminalSelectingProjects: no listing selecting terminal wants nothing', (
   assert.deepEqual(terminalSelectingProjects(listings), []);
 });
 
-test("terminalSelectingProjects: flipping one listing's terminal view makes its project the only entrant", () => {
-  const withReify = terminal => [
-    listing(DARK_FACTORY, { terminal: true }),
-    listing(REIFY, { terminal }),
-    listing(HIVE, { terminal: false }),
-  ];
-  const off = terminalSelectingProjects(withReify(false));
-  const on = terminalSelectingProjects(withReify(true));
-  assert.deepEqual(terminalWindowEntrants(off, on), [REIFY]);
-  assert.deepEqual(terminalWindowEntrants(on, off), []);
-  assert.deepEqual(terminalWindowEntrants(off, on), [REIFY], 'a re-entry is requested again');
-});
-
-test('terminalSelectingProjects: the persisted filter on mount requests every selecting project', () => {
-  const listings = [listing(HIVE, { terminal: true }), listing(REIFY, {}), listing(DARK_FACTORY, { terminal: true })];
-  const wanted = terminalSelectingProjects(listings);
-  assert.deepEqual(terminalWindowEntrants([], wanted), wanted);
-});
-
 test('terminalSelectingProjects: its inputs are not mutated', () => {
   const listings = [listing(DARK_FACTORY, { terminal: true }), listing(DARK_FACTORY, { terminal: true }), listing(REIFY, {})];
   const pristine = structuredClone(listings);
   terminalSelectingProjects(listings);
   assert.deepEqual(listings, pristine);
+});
+
+// ── createTerminalWindowHooks: the hook a requesting surface renders through ──
+// Driven through reactStandIn and a loader stand-in that records each request
+// and settles it only when a case says so. What a wanted project reads is what
+// data.js::onDemandDatum makes of the outcome handed to it, which
+// data_poll.test.mjs executes; the stand-in echoes its arguments, so these
+// cases assert which outcome each project is read with.
+
+function loaderStandIn() {
+  const requests = [];
+  return {
+    requests,
+    requestOnDemand: (name, project) => new Promise(settle => { requests.push({ name, project, settle }); }),
+    onDemandDatum: (name, project, outcome) => ({ onDemandDatum: [name, project, outcome] }),
+    ON_DEMAND_KEYS: { terminal: { key: project => `TASKS_TERMINAL:${project}` } },
+  };
+}
+
+// One surface holding the hook over `data`. show(wanted) renders it again and
+// returns its reader; requested() lists every project asked for, in order.
+function terminalWindowsSurface(data = {}) {
+  const react = reactStandIn();
+  const loader = loaderStandIn();
+  const { useTerminalWindows } = createTerminalWindowHooks(react, loader);
+  return {
+    show: wanted => react.render(() => useTerminalWindows(data, wanted)),
+    requested: () => loader.requests.map(({ name, project }) => {
+      assert.equal(name, 'terminal');
+      return project;
+    }),
+    // Settles the latest request for `project`, then lets its .then run.
+    settle: async (project, outcome) => {
+      loader.requests.findLast(request => request.project === project).settle(outcome);
+      await new Promise(resolve => setImmediate(resolve));
+    },
+  };
+}
+
+const awaiting = project => ({ onDemandDatum: ['terminal', project, null] });
+const settledAs = (project, outcome) => ({ onDemandDatum: ['terminal', project, outcome] });
+
+test('createTerminalWindowHooks: a mount requests each wanted project once, in wanted order', () => {
+  const surface = terminalWindowsSurface();
+  const windowOf = surface.show([HIVE, DARK_FACTORY]);
+  assert.deepEqual(surface.requested(), [HIVE, DARK_FACTORY]);
+  assert.deepEqual(windowOf(HIVE), awaiting(HIVE));
+  assert.deepEqual(windowOf(DARK_FACTORY), awaiting(DARK_FACTORY));
+});
+
+test('createTerminalWindowHooks: a re-render over an equal wanted set requests nothing, as each poll rebuilds it', () => {
+  const surface = terminalWindowsSurface();
+  surface.show([DARK_FACTORY, REIFY]);
+  surface.show([DARK_FACTORY, REIFY]);
+  surface.show([DARK_FACTORY, REIFY]);
+  assert.deepEqual(surface.requested(), [DARK_FACTORY, REIFY]);
+});
+
+test('createTerminalWindowHooks: a project entering the set is the only one requested; a settled one keeps its outcome', async () => {
+  const surface = terminalWindowsSurface();
+  surface.show([DARK_FACTORY]);
+  await surface.settle(DARK_FACTORY, 'applied');
+  const windowOf = surface.show([DARK_FACTORY, REIFY]);
+  assert.deepEqual(surface.requested(), [DARK_FACTORY, REIFY]);
+  assert.deepEqual(windowOf(DARK_FACTORY), settledAs(DARK_FACTORY, 'applied'));
+  assert.deepEqual(windowOf(REIFY), awaiting(REIFY));
+});
+
+test("createTerminalWindowHooks: each wanted project reads its own request's outcome", async () => {
+  const surface = terminalWindowsSurface();
+  surface.show([DARK_FACTORY, REIFY]);
+  await surface.settle(REIFY, 'failed');
+  const windowOf = surface.show([DARK_FACTORY, REIFY]);
+  assert.deepEqual(windowOf(REIFY), settledAs(REIFY, 'failed'));
+  assert.deepEqual(windowOf(DARK_FACTORY), awaiting(DARK_FACTORY));
+});
+
+test('createTerminalWindowHooks: a request pending when the set changes keeps its outcome, since nothing re-requests it', async () => {
+  const surface = terminalWindowsSurface();
+  surface.show([DARK_FACTORY]);
+  surface.show([DARK_FACTORY, REIFY]);
+  await surface.settle(DARK_FACTORY, 'applied');
+  const windowOf = surface.show([DARK_FACTORY, REIFY]);
+  assert.deepEqual(surface.requested(), [DARK_FACTORY, REIFY]);
+  assert.deepEqual(windowOf(DARK_FACTORY), settledAs(DARK_FACTORY, 'applied'));
+});
+
+test('createTerminalWindowHooks: a project that leaves and re-enters is requested again, and reads as awaiting that request', async () => {
+  const surface = terminalWindowsSurface();
+  surface.show([DARK_FACTORY]);
+  await surface.settle(DARK_FACTORY, 'failed');
+  surface.show([]);
+  const windowOf = surface.show([DARK_FACTORY]);
+  assert.deepEqual(surface.requested(), [DARK_FACTORY, DARK_FACTORY]);
+  assert.deepEqual(windowOf(DARK_FACTORY), awaiting(DARK_FACTORY));
+
+  await surface.settle(DARK_FACTORY, 'applied');
+  assert.deepEqual(surface.show([DARK_FACTORY])(DARK_FACTORY), settledAs(DARK_FACTORY, 'applied'));
+});
+
+test('createTerminalWindowHooks: a project outside the wanted set is not requested, and reads as unrequestedTerminalRows', () => {
+  const landed = terminalWindow(TERMINAL_ROWS);
+  const surface = terminalWindowsSurface({ [`TASKS_TERMINAL:${HIVE}`]: landed });
+  const windowOf = surface.show([DARK_FACTORY]);
+  assert.deepEqual(surface.requested(), [DARK_FACTORY]);
+  assert.equal(windowOf(HIVE), landed, 'a window another surface landed is read as served');
+  assert.deepEqual(windowOf(REIFY), unrequestedTerminalRows(undefined));
+});
+
+// OrchTab's wanted set is terminalSelectingProjects over its listings, rebuilt
+// on every render; these cases drive the hook with it.
+
+test("createTerminalWindowHooks over OrchTab's listings: flipping one terminal view requests its project on each entry only", () => {
+  const withReify = terminal => terminalSelectingProjects([
+    listing(DARK_FACTORY, { terminal: true }),
+    listing(REIFY, { terminal }),
+    listing(HIVE, { terminal: false }),
+  ]);
+  const surface = terminalWindowsSurface();
+  surface.show(withReify(false));
+  assert.deepEqual(surface.requested(), [DARK_FACTORY]);
+  surface.show(withReify(true));
+  assert.deepEqual(surface.requested(), [DARK_FACTORY, REIFY]);
+  surface.show(withReify(false));
+  assert.deepEqual(surface.requested(), [DARK_FACTORY, REIFY]);
+  surface.show(withReify(true));
+  assert.deepEqual(surface.requested(), [DARK_FACTORY, REIFY, REIFY]);
+});
+
+test("createTerminalWindowHooks over OrchTab's listings: a mount requests each project a persisted filter selects, once", () => {
+  const surface = terminalWindowsSurface();
+  surface.show(terminalSelectingProjects([
+    listing(HIVE, { terminal: true }),
+    listing(REIFY, {}),
+    listing(DARK_FACTORY, { terminal: true }),
+    listing(HIVE, { terminal: true }),
+  ]));
+  assert.deepEqual(surface.requested(), [HIVE, DARK_FACTORY]);
 });
