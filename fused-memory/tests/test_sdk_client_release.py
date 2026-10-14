@@ -32,6 +32,7 @@ from fused_memory.backends.graphiti_client import (
 )
 from fused_memory.backends.llm_clients import TokenRecordingOpenAIGenericClient
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
+from fused_memory.middleware.task_curator import TaskCurator
 
 _LIFECYCLE_LOGGER = 'fused_memory.backends.sdk_client_lifecycle'
 
@@ -191,3 +192,29 @@ class TestGraphitiBackendCloseReleasesSdkClients:
     @pytest.mark.asyncio
     async def test_close_before_initialize_is_a_no_op(self, mock_config):
         await GraphitiBackend(mock_config).close()
+
+
+class TestTaskCuratorCloseReleasesEmbedder:
+    @pytest.mark.asyncio
+    async def test_the_lazily_built_embedder_is_released(self, mock_config):
+        await _start_census()
+        curator = TaskCurator(config=mock_config)
+        await curator._get_embedder()
+
+        built = _leaked_async_httpx_clients()
+        assert len(built) == 1
+
+        await curator.close()
+
+        assert _leaked_async_httpx_clients() == []
+
+    @pytest.mark.asyncio
+    async def test_close_without_an_embedder_and_a_second_close_do_not_raise(
+        self, mock_config,
+    ):
+        await TaskCurator(config=mock_config).close()
+
+        curator = TaskCurator(config=mock_config)
+        await curator._get_embedder()
+        await curator.close()
+        await curator.close()
