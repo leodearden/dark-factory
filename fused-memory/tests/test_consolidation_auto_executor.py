@@ -10,6 +10,8 @@ the escalation queue are real.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 import pytest_asyncio
 from _auto_consolidation_fakes import (
@@ -22,14 +24,17 @@ from _auto_consolidation_fakes import (
     propose,
 )
 from escalation.queue import EscalationQueue
+from shared.task_metadata import HUMAN_CURATOR_GATE_KEY
+
+from fused_memory.config.schema import Mem0UpdateConfig
+from fused_memory.models.reconciliation import StageId, StageReport
+from fused_memory.reconciliation.consolidation_auto import build_auto_canonical
 from fused_memory.reconciliation.consolidation_auto_executor import (
     CANONICAL_SLUG_LIMIT,
     auto_consolidation_initial_stats,
     run_auto_consolidation,
 )
-
-from fused_memory.models.reconciliation import StageId, StageReport
-from fused_memory.reconciliation.consolidation_auto import build_auto_canonical
+from fused_memory.reconciliation.consolidation_gate import GATE_METADATA_KEY
 from fused_memory.reconciliation.consolidation_proposal import (
     RECORD_KIND_CONSOLIDATION_PROPOSAL,
     outcome_from_record,
@@ -297,3 +302,235 @@ class TestUnreadableMember:
         assert svc.write_awaits() == (0, 0, 0, 0)
         assert report.stats['auto_consolidations'] == 0
         _assert_stats_complete(report)
+
+
+GATE_TOPIC_TASK_ID = 55
+
+
+def _open_gate(topic=TOPIC, task_id=GATE_TOPIC_TASK_ID):
+    return {
+        'id': task_id,
+        'status': 'blocked',
+        'metadata': {'operational_mode': 'gate', GATE_METADATA_KEY: {'topic': topic}},
+    }
+
+
+def _seed_consolidated(svc, topic=TOPIC, n=5, **canonical_meta):
+    canonical = svc.seed(topic=topic, canonical=True, **canonical_meta)
+    stamped = svc.seed_many(n, topic=topic)
+    return canonical, stamped
+
+
+class TestRegrowthIsTaggedOnly:
+    """PRD B2."""
+
+    @pytest.mark.asyncio
+    async def test_only_the_new_members_are_stamped(self, svc, ledger, queue):
+        canonical, stamped = _seed_consolidated(svc)
+        fresh = svc.seed_many(3)
+        before = svc.snapshot(canonical)
+        await propose(ledger, topic=TOPIC, member_ids=[*stamped, *fresh, canonical])
+
+        report = await run(svc, queue=queue)
+
+        patched = [c.kwargs['memory_id'] for c in svc.update_memory.await_args_list]
+        assert patched == fresh
+        for call in svc.update_memory.await_args_list:
+            assert call.kwargs['metadata_patch'] == {
+                'topic': TOPIC,
+                'x_auto_consolidated_run': EXEC_RUN,
+            }
+        assert svc.snapshot(canonical) == before
+        svc.add_memory.assert_not_awaited()
+        svc.delete_memory.assert_not_awaited()
+        outcome = outcome_from_record(await _row(ledger))
+        assert outcome.tagged_ids == tuple(fresh)
+        assert outcome.stripped_ids == (canonical,)
+        assert outcome.canonical_id == canonical
+        assert outcome.canonical_minted is False
+        assert report.stats['auto_consolidations_tag_only'] == 1
+        assert report.stats['auto_consolidations'] == 0
+
+
+class TestHazardGate:
+    """PRD B4."""
+
+    async def _seed_hazard(self, svc, ledger):
+        canonical = svc.seed(topic=TOPIC, canonical=True, superseded_by='x')
+        members = svc.seed_many(3)
+        member_ids = [*members, canonical]
+        await propose(ledger, topic=TOPIC, member_ids=member_ids)
+        return member_ids
+
+    @pytest.mark.asyncio
+    async def test_a_corrected_incumbent_files_one_curator_gate(self, svc, ledger, queue):
+        member_ids = await self._seed_hazard(svc, ledger)
+        taskmaster = FakeTaskBackend()
+
+        report = await run(svc, queue=queue, taskmaster=taskmaster, tmp_root='/proj')
+
+        assert svc.write_awaits() == (0, 0, 0, 0)
+        (call,) = taskmaster.calls
+        assert call['project_root'] == '/proj'
+        assert isinstance(call['metadata'], str)
+        meta = json.loads(call['metadata'])
+        assert meta['task_kind'] == 'deterministic'
+        assert meta['always_escalates'] is True
+        assert meta['operational_mode'] == 'gate'
+        assert meta[HUMAN_CURATOR_GATE_KEY] is True
+        block = meta[GATE_METADATA_KEY]
+        assert block['topic'] == TOPIC
+        assert block['provenance']['observed_members'] == member_ids
+        assert block['provenance']['authoritative'] is False
+        assert 'canonical_carries_correction' in block['auto_refusal']['reason_codes']
+        assert 'canonical_carries_correction' in call['description']
+        row = await _row(ledger)
+        assert row.state == 'gated'
+        assert outcome_from_record(row).gate_task_id == '1001'
+        assert report.stats['auto_consolidation_gates_filed'] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_hazard_still_files_in_the_supervised_cycle(self, ledger, queue):
+        svc = FakeMemoryService(ledger, consolidation_auto=enabled_config(enabled=False))
+        await self._seed_hazard(svc, ledger)
+        taskmaster = FakeTaskBackend()
+
+        await run(svc, queue=queue, taskmaster=taskmaster)
+
+        assert len(taskmaster.calls) == 1
+        assert (await _row(ledger)).state == 'gated'
+
+    @pytest.mark.asyncio
+    async def test_a_duplicate_candidate_key_reuses_the_existing_gate(self, svc, ledger, queue):
+        await self._seed_hazard(svc, ledger)
+
+        await run(svc, queue=queue, taskmaster=FakeTaskBackend(duplicate_of=77))
+
+        row = await _row(ledger)
+        assert row.state == 'gated'
+        assert outcome_from_record(row).gate_task_id == '77'
+
+    @pytest.mark.asyncio
+    async def test_a_zero_filing_budget_leaves_the_row_proposed(self, ledger, queue):
+        svc = FakeMemoryService(
+            ledger, consolidation_auto=enabled_config(max_gate_filings_per_cycle=0),
+        )
+        await self._seed_hazard(svc, ledger)
+        taskmaster = FakeTaskBackend()
+
+        report = await run(svc, queue=queue, taskmaster=taskmaster)
+
+        assert taskmaster.calls == []
+        assert (await _row(ledger)).state == 'proposed'
+        assert report.stats['auto_consolidation_unfiled'] == 1
+
+    @pytest.mark.asyncio
+    async def test_no_task_backend_counts_as_unfiled(self, svc, ledger, queue):
+        await self._seed_hazard(svc, ledger)
+        report = _report()
+
+        await run_auto_consolidation(
+            svc,
+            None,
+            queue,
+            project_id=PROJECT_ID,
+            project_root='/proj',
+            run_id=EXEC_RUN,
+            config=svc.config.consolidation_auto,
+            active_tasks=[],
+            report=report,
+            now=NOW,
+        )
+
+        assert (await _row(ledger)).state == 'proposed'
+        assert report.stats['auto_consolidation_unfiled'] == 1
+
+
+class TestAlreadyGated:
+    """PRD B5."""
+
+    @pytest.mark.asyncio
+    async def test_an_open_gate_makes_it_a_noop_naming_the_gate(self, svc, ledger, queue):
+        canonical = svc.seed(topic=TOPIC, canonical=True, superseded_by='x')
+        members = svc.seed_many(3)
+        await propose(ledger, topic=TOPIC, member_ids=[*members, canonical])
+        taskmaster = FakeTaskBackend()
+
+        await run(svc, queue=queue, taskmaster=taskmaster, active_tasks=[_open_gate()])
+
+        assert taskmaster.calls == []
+        assert svc.write_awaits() == (0, 0, 0, 0)
+        row = await _row(ledger)
+        assert row.state == 'addressed'
+        outcome = outcome_from_record(row)
+        assert outcome.reason_codes == ('already_gated',)
+        assert outcome.gate_task_id == str(GATE_TOPIC_TASK_ID)
+
+
+class TestExecutionBudget:
+    @pytest.mark.asyncio
+    async def test_one_execution_per_cycle_leaves_the_second_proposed(self, ledger, queue):
+        svc = FakeMemoryService(ledger, consolidation_auto=enabled_config(max_auto_per_cycle=1))
+        await propose(ledger, topic='auto-topic-one', member_ids=svc.seed_many(5))
+        await propose(ledger, topic='auto-topic-two', member_ids=svc.seed_many(4))
+
+        report = await run(svc, queue=queue)
+
+        states = {
+            topic: (await _row(ledger, topic=topic)).state
+            for topic in ('auto-topic-one', 'auto-topic-two')
+        }
+        assert states == {'auto-topic-one': 'addressed', 'auto-topic-two': 'proposed'}
+        assert report.stats['auto_consolidations'] == 1
+        assert report.stats['auto_consolidation_unexecuted'] == 1
+
+
+class TestClosureFailure:
+    @pytest.mark.asyncio
+    async def test_a_member_that_could_not_be_tagged_files_a_gate_past_the_budget(
+        self, ledger, queue,
+    ):
+        svc = FakeMemoryService(
+            ledger, consolidation_auto=enabled_config(max_gate_filings_per_cycle=0),
+        )
+        members = svc.seed_many(4)
+        svc.update_returns[members[1]] = {'error': 'gone', 'error_type': 'MemoryNotFound'}
+        await propose(ledger, topic=TOPIC, member_ids=members)
+        taskmaster = FakeTaskBackend()
+
+        report = await run(svc, queue=queue, taskmaster=taskmaster)
+
+        (call,) = taskmaster.calls
+        reason_codes = json.loads(call['metadata'])[GATE_METADATA_KEY]['auto_refusal'][
+            'reason_codes'
+        ]
+        assert reason_codes['unstamped_cluster_member'] == [members[1]]
+        assert len(svc.system_records) == 1
+        row = await _row(ledger)
+        assert row.state == 'gated'
+        assert row.expires_at is None
+        outcome = outcome_from_record(row)
+        (canonical_id,) = svc.canonical_ids()
+        assert outcome.canonical_id == canonical_id
+        assert outcome.tagged_ids == (members[0], members[2], members[3])
+        assert outcome.gate_task_id == '1001'
+        assert report.stats['auto_consolidation_closure_failures'] == 1
+        assert report.stats['auto_consolidation_gates_filed'] == 1
+
+
+class TestExecutionRefusal:
+    @pytest.mark.asyncio
+    async def test_an_unauthorized_executor_writes_nothing_and_is_refused(self, ledger, queue):
+        svc = FakeMemoryService(
+            ledger,
+            mem0_update=Mem0UpdateConfig(metadata_patch_allowed_agent_prefixes=['curator-']),
+        )
+        await propose(ledger, topic=TOPIC, member_ids=svc.seed_many(4))
+
+        report = await run(svc, queue=queue)
+
+        assert svc.write_awaits() == (0, 0, 0, 0)
+        row = await _row(ledger)
+        assert row.state == 'refused'
+        assert outcome_from_record(row).reason_codes == ('execution_refused',)
+        assert report.stats['auto_consolidation_refusals'] == {'execution_refused': 1}
