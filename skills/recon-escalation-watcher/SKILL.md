@@ -33,9 +33,10 @@ Verify these before starting. If anything is missing, ask the user — don't gue
    `/home/leo/src/dark-factory`). The `escalation` package (watcher) lives here.
 2. **This session's `escalation` MCP must point at 8103**, and `fused-memory` at
    8002. The stock repo `.mcp.json` points `escalation` at 8102 — wrong queue.
-   Launch via the recon-watch config (see "Launching" below); confirm with
-   `mcp__escalation__get_pending_escalations()` returning recon findings
-   (ids like `esc-recon-<hex>-N`, categories `recon_*`).
+   Launch via the recon-watch config (see "Launching" below); confirm the
+   binding from the store-identity block on `get_pending_escalations` reading
+   `kind=reconciliation`, which holds even on an empty queue (how to read it:
+   the empty-result bullet in "Failure Modes" below).
 3. **The 8103 server is up** — it runs inside `fused-memory.service`. If
    `get_pending_escalations` errors, the service is down → tell the user
    (priority 1, system stability); do not try to start it yourself.
@@ -1181,8 +1182,13 @@ known so you don't re-investigate them each cycle.
 - **"Too many open files"** after many watcher restart cycles → fd pool
   exhaustion from accumulated background tasks; tell the user to start a fresh
   session.
-- **`get_pending_escalations` errors / empty when you expect items** → confirm
-  this session's `escalation` server points at **8103**, not 8102. The stock
-  repo `.mcp.json` is 8102.
+- **`get_pending_escalations` empty when you expect items** → read the
+  `THIS ENDPOINT SERVES:` block ending that tool's own description in your
+  tool listing (rendered by
+  `escalation/src/escalation/server.py::_render_store_identity_block`).
+  `kind=reconciliation` → this queue answered; nothing is pending.
+  `kind=project` (e.g. `project=dark_factory`) → wrong store, an orchestrator
+  queue: relaunch per "Launching" above. No block → the server cannot vouch
+  for its store; tell the human rather than read `[]` as absence.
 - **8103 server unreachable** → fused-memory.service is down. Priority 1: tell
   the human; do not start services yourself.
