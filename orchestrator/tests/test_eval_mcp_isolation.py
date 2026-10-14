@@ -23,19 +23,24 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _workflow_helpers import FakeBriefing, FakeScheduler, fixed_prompt
 from shared.cli_invoke import AgentResult, build_claude_argv
 
 from orchestrator.agents.briefing import BriefingAssembler
-from orchestrator.config import OrchestratorConfig
+from orchestrator.agents.roles import ARCHITECT, AgentRole
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.evals import runner
 from orchestrator.evals.compare import _assess_task, compare_models
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.judge import judge_plan_quality, run_judge
 from orchestrator.evals.profile import EVAL_PROFILE, apply_eval_profile
 from orchestrator.evals.results import EvalResult, ResultStore
+from orchestrator.git_ops import GitOps, _run
+from orchestrator.scheduler import TaskAssignment
+from orchestrator.workflow import TaskWorkflow
 
 _FIXTURE_ID = 'df_task_9001'
 
@@ -259,3 +264,93 @@ def test_build_eval_orch_config_carries_strict_mcp_config(tmp_path: Path) -> Non
     eval_cfg = runner.build_eval_orch_config(cfg, task, OrchestratorConfig(project_root=tmp_path))
 
     assert eval_cfg.strict_mcp_config is True
+
+
+# ---------------------------------------------------------------------------
+# TaskWorkflow._invoke: the leaf is forwarded, and never swallowed by a role
+# whose families compose no config.
+# ---------------------------------------------------------------------------
+
+
+class _FalsyMcpStub:
+    """The worst case the guard must handle: ``runner._EvalMcpStub`` answers a FALSY bare ``{}``."""
+
+    url = 'http://127.0.0.1:1'
+
+    def mcp_config_json(self, escalation_url: str | None = None) -> dict:
+        return {}
+
+
+_ORCH_ONLY = AgentRole(name='probe_orch_only', system_prompt='x', allowed_tools=[],
+                       mcp_families=frozenset({'orchestrator'}))
+_NO_MCP = AgentRole(name='probe_no_mcp', system_prompt='x', allowed_tools=[],
+                    mcp_families=frozenset())
+
+
+async def _invoke_probe(tmp_path: Path, role: AgentRole, *, strict: bool) -> dict:
+    """Drive the REAL ``TaskWorkflow._invoke`` once; return the kwargs ``invoke_with_cap_retry`` received."""
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    for argv in (['git', 'init', '-b', 'main'],
+                 ['git', 'config', 'user.email', 'test@test.com'],
+                 ['git', 'config', 'user.name', 'Test']):
+        await _run(argv, cwd=repo)
+    (repo / 'lib.py').write_text('def greet(name): return name\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+    config = OrchestratorConfig(
+        project_root=repo, max_concurrent_tasks=1, strict_mcp_config=strict,
+        git=GitConfig(main_branch='main', branch_prefix='task/', remote='origin',
+                      worktree_dir='.worktrees'),
+    )
+    git_ops = GitOps(config.git, config.project_root)
+    assignment = TaskAssignment(
+        task_id='42',
+        task={'id': '42', 'title': 'X', 'description': 'Y', 'status': 'pending',
+              'metadata': {'files': ['lib']}, 'dependencies': []},
+        modules=['lib'],
+    )
+    cwd = (await git_ops.create_worktree(assignment.task_id)).path
+    workflow = TaskWorkflow(
+        assignment=assignment, config=config, git_ops=git_ops,
+        scheduler=FakeScheduler(),  # type: ignore[arg-type]
+        briefing=FakeBriefing(),  # type: ignore[arg-type]
+        mcp=_FalsyMcpStub(),  # type: ignore[arg-type]
+    )
+    workflow.artifacts = None
+
+    with patch('orchestrator.workflow.invoke_with_cap_retry', new_callable=AsyncMock,
+               return_value=AgentResult(success=True, output='')) as mock_cap_retry:
+        await workflow._invoke(role, fixed_prompt('P'), cwd)
+
+    assert mock_cap_retry.await_args is not None, '_invoke never reached invoke_with_cap_retry'
+    return mock_cap_retry.await_args.kwargs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('role', 'expected_servers'), [
+    (ARCHITECT, {'plan-tools'}),
+    (_ORCH_ONLY, set()),
+    (_NO_MCP, set()),
+], ids=['plan-tools-composed', 'falsy-orchestrator-config', 'no-families'])
+async def test_invoke_strict_config_scopes_every_role(
+    tmp_path: Path, role: AgentRole, expected_servers: set[str],
+) -> None:
+    kw = await _invoke_probe(tmp_path, role, strict=True)
+
+    assert kw.get('strict_mcp_config') is True
+    assert bool(kw['mcp_config']) is True, 'a falsy config would make --strict-mcp-config a no-op'
+    servers = set(kw['mcp_config']['mcpServers'])
+    assert servers.isdisjoint({'escalation', 'fused-memory'})
+    assert servers == expected_servers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('role', [ARCHITECT, _NO_MCP], ids=['plan-tools-composed', 'no-families'])
+async def test_invoke_production_default_is_unchanged(tmp_path: Path, role: AgentRole) -> None:
+    kw = await _invoke_probe(tmp_path, role, strict=False)
+
+    assert kw.get('strict_mcp_config') is False
+    if role is _NO_MCP:
+        assert kw['mcp_config'] is None
