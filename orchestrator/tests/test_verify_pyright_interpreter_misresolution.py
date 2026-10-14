@@ -68,6 +68,18 @@ GENUINE_MISSING_IMPORT_OUTPUT = (
 )
 
 
+# Task 6127: the measured 6021 shape — seven distinct modules with pytest
+# RESOLVED (a cold venv still being populated), plus a consequential error.
+PARTIALLY_PROVISIONED_TYPE_OUTPUT = (
+    _unresolved_import_lines(
+        'graphiti_core', 'qdrant_client', 'openai', 'falkordb', 'mem0', 'anthropic', 'redis'
+    )
+    + '\n  /repo/src/fused_memory/backends/mem0_client.py:9:18 - error: "AsyncMemory" '
+    'is unknown import symbol (reportAttributeAccessIssue)\n'
+    + '171 errors, 1 warning, 0 informations\n'
+)
+
+
 def _make_config(project_root: Path) -> OrchestratorConfig:
     """A config whose three legs are independently-controllable OPAQUE echoes."""
     return OrchestratorConfig(
@@ -284,3 +296,45 @@ class TestEnvRecoveryRetryGate:
             f'the recovery invocation must carry the serial_pytest markers '
             f'(-p no:xdist, -o addopts=); got {pytest_invocations!r}'
         )
+
+
+class TestPartiallyProvisionedVenvIsEnvTransient:
+    """Task 6127 / esc-6021-3: pyright read a cold venv still being populated.
+
+    pytest resolved, so the 3367 interpreter predicate does not apply; the
+    passing TEST leg is what corroborates that the environment, not the
+    branch, was at fault.  The incident classified ``unknown_test_failure``,
+    which the merge lane then attributed to the branch.
+    """
+
+    @staticmethod
+    async def _run(tmp_path: Path, invoked: list[str]) -> verify.VerifyResult:
+        with patch(
+            'orchestrator.verify._run_cmd',
+            side_effect=_spy(invoked, type_out=PARTIALLY_PROVISIONED_TYPE_OUTPUT),
+        ):
+            return await verify.run_verification(tmp_path, _make_config(tmp_path))
+
+    @pytest.mark.asyncio
+    async def test_category_is_env_transient_end_to_end(self, tmp_path: Path) -> None:
+        result = await self._run(tmp_path, [])
+
+        assert result.passed is False
+        assert result.category == 'env_transient'
+
+    @pytest.mark.asyncio
+    async def test_passing_test_leg_is_not_rerun(self, tmp_path: Path) -> None:
+        invoked: list[str] = []
+
+        await self._run(tmp_path, invoked)
+
+        assert len([c for c in invoked if 'TESTLEG' in c]) == 1, invoked
+
+    @pytest.mark.asyncio
+    async def test_interpreter_misresolution_error_does_not_fire(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.ERROR, logger='orchestrator.verify'):
+            await self._run(tmp_path, [])
+
+        assert _misresolution_records(caplog) == []

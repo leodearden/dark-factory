@@ -27,6 +27,7 @@ Test coverage:
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -3133,6 +3134,79 @@ class TestPartiallyProvisionedVenvTypeFailure:
         assert verify_classify.is_partially_provisioned_venv_type_failure(
             text, test_leg_passed=True,
         ) is False
+
+
+def _partial_venv_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING
+        and 'verify_cold_preprovision_command' in r.getMessage()
+    ]
+
+
+class TestPartiallyProvisionedVenvClassifiesEnvTransient:
+    """``_summarize_checks`` refines an OPAQUE type leg's UNKNOWN_TEST_FAILURE
+    fall-through to ENV_TRANSIENT when the same run's test leg passed — task
+    6127, the branch_bug regression.  ENV_TRANSIENT routes the merge lane
+    (``merge_lane/worker.py::_run_post_merge_verify``) to a bounded retry and
+    then an infra hold, both before any disposition is classified."""
+
+    @staticmethod
+    def _summarize(
+        *, test_rc: int = 0, test_out: str = '', test_cmd: str | None = 'echo TESTLEG',
+        type_rc: int = 1, type_timed_out: bool = False,
+    ) -> tuple[bool, str, str, str, list[str]]:
+        from orchestrator.verify import _summarize_checks  # noqa: PLC0415
+
+        return _summarize_checks(
+            test_rc, test_out, False, test_cmd,
+            0, '', False, 'echo LINTLEG',
+            type_rc, PARTIALLY_PROVISIONED_TYPE_OUTPUT, type_timed_out, 'echo TYPELEG',
+        )
+
+    def test_corroborated_type_failure_is_env_transient(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            _, category, _, _, failing_leg_categories = self._summarize()
+
+        assert category == 'env_transient'
+        assert failing_leg_categories == ['env_transient']
+        assert len(_partial_venv_warnings(caplog)) == 1
+
+    def test_type_leg_timeout_still_wins(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            _, category, _, _, _ = self._summarize(type_timed_out=True)
+
+        assert category == 'infra_timeout'
+        assert _partial_venv_warnings(caplog) == []
+
+    def test_type_leg_external_kill_still_wins(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            _, category, _, _, _ = self._summarize(type_rc=-9)
+
+        assert category == 'infra_kill'
+        assert _partial_venv_warnings(caplog) == []
+
+    def test_failing_test_leg_gives_no_corroboration(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            _, _, _, _, failing_leg_categories = self._summarize(
+                test_rc=1, test_out='FAILED tests/test_x.py::test_y - AssertionError',
+            )
+
+        assert failing_leg_categories[-1] != 'env_transient'
+        assert _partial_venv_warnings(caplog) == []
+
+    def test_skipped_test_leg_gives_no_corroboration(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            _, category, _, _, _ = self._summarize(test_cmd=None)
+
+        assert category != 'env_transient'
+        assert _partial_venv_warnings(caplog) == []
 
 
 # ---------------------------------------------------------------------------
