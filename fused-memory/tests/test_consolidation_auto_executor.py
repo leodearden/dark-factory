@@ -36,7 +36,9 @@ from fused_memory.reconciliation.consolidation_auto_executor import (
     BACKLOG_CATEGORY,
     CANONICAL_SLUG_LIMIT,
     REFUSED_CATEGORY,
+    RevertNotAuthorized,
     auto_consolidation_initial_stats,
+    revert_auto_consolidation,
     run_auto_consolidation,
 )
 from fused_memory.reconciliation.consolidation_gate import GATE_METADATA_KEY
@@ -762,3 +764,105 @@ class TestVocabulary:
         server = pytest.importorskip('escalation.server')
         assert REFUSED_CATEGORY in server.CATEGORIES
         assert BACKLOG_CATEGORY in server.CATEGORIES
+
+
+REVERT_AGENT = 'recon-stage-memory_consolidator'
+
+
+class TestReversal:
+    """PRD B10."""
+
+    @pytest.mark.asyncio
+    async def test_a_minted_run_reverts_to_no_orphan(self, svc, ledger, queue):
+        members = svc.seed_many(5)
+        await propose(ledger, topic=TOPIC, member_ids=members)
+        await run(svc, queue=queue)
+        (canonical_id,) = svc.canonical_ids()
+        row = await _row(ledger)
+
+        result = await revert_auto_consolidation(svc, row, agent_id=REVERT_AGENT)
+
+        assert result.reverted is True
+        assert result.canonical_deleted == canonical_id
+        assert result.untagged == tuple(members)
+        assert result.failures == ()
+        svc.delete_memory.assert_awaited_once()
+        assert svc.delete_memory.await_args.args == (canonical_id, 'mem0')
+        for member in members:
+            assert 'topic' not in svc.metadata_of(member)
+            assert 'x_auto_consolidated_run' not in svc.metadata_of(member)
+        untag_calls = [
+            c for c in svc.update_memory.await_args_list
+            if c.kwargs.get('metadata_delete_keys')
+        ]
+        assert {c.kwargs['memory_id'] for c in untag_calls} == set(members)
+        for call in untag_calls:
+            assert call.kwargs['metadata_delete_keys'] == ['topic', 'x_auto_consolidated_run']
+        assert await svc.get_memories_by_metadata(PROJECT_ID, {'topic': TOPIC}) == []
+        assert (await _row(ledger)).state == 'reverted'
+
+    @pytest.mark.asyncio
+    async def test_a_tag_only_run_untags_only_its_own_members(self, svc, ledger, queue):
+        canonical, stamped = _seed_consolidated(svc)
+        fresh = svc.seed_many(3)
+        await propose(ledger, topic=TOPIC, member_ids=[*stamped, *fresh, canonical])
+        await run(svc, queue=queue)
+        before = svc.snapshot(canonical)
+
+        result = await revert_auto_consolidation(svc, await _row(ledger), agent_id=REVERT_AGENT)
+
+        assert result.reverted is True
+        assert result.canonical_deleted is None
+        assert result.untagged == tuple(fresh)
+        for member in fresh:
+            assert 'topic' not in svc.metadata_of(member)
+        for member in stamped:
+            assert svc.metadata_of(member)['topic'] == TOPIC
+        assert svc.snapshot(canonical) == before
+        svc.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_members_are_untagged_before_a_failing_delete(self, svc, ledger, queue):
+        members = svc.seed_many(3)
+        await propose(ledger, topic=TOPIC, member_ids=members)
+        await run(svc, queue=queue)
+        (canonical_id,) = svc.canonical_ids()
+        svc.delete_errors[canonical_id] = TimeoutError('delete timed out')
+
+        result = await revert_auto_consolidation(svc, await _row(ledger), agent_id=REVERT_AGENT)
+
+        for member in members:
+            assert 'topic' not in svc.metadata_of(member)
+        assert result.reverted is False
+        assert [f['id'] for f in result.failures] == [canonical_id]
+        assert canonical_id in svc.records
+        assert (await _row(ledger)).state == 'addressed'
+
+    @pytest.mark.parametrize('state', ['refused', 'dry_run', 'proposed'])
+    @pytest.mark.asyncio
+    async def test_a_row_with_no_execution_cannot_be_reverted(self, svc, ledger, state):
+        await propose(ledger, topic=TOPIC, member_ids=_new_ids(3))
+        row = await _row(ledger)
+        if state != 'proposed':
+            await record_outcome(
+                ledger,
+                row,
+                ProposalOutcome(
+                    state=ProposalState(state), acted_run_id='x', acted_at=NOW.isoformat(),
+                ),
+            )
+            row = await _row(ledger)
+
+        with pytest.raises(ValueError, match=state):
+            await revert_auto_consolidation(svc, row, agent_id=REVERT_AGENT)
+
+    @pytest.mark.asyncio
+    async def test_an_unauthorized_agent_is_refused_before_any_write(self, svc, ledger, queue):
+        await propose(ledger, topic=TOPIC, member_ids=svc.seed_many(3))
+        await run(svc, queue=queue)
+        writes_before = svc.write_awaits()
+
+        with pytest.raises(RevertNotAuthorized):
+            await revert_auto_consolidation(svc, await _row(ledger), agent_id='someone-else')
+
+        assert svc.write_awaits() == writes_before
