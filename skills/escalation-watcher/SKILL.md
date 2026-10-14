@@ -82,6 +82,12 @@ stand-down, and once its heartbeat is past the TTL the reaper reclaims it. The p
 `lease-heartbeat` is the **only** liveness signal a hosted holder has
 (`orchestrator/src/orchestrator/session_registry.py::resolve_session_identity`).
 
+**One-time rollout note (task 6916).** A lease a hosted session claimed *before* this change carries
+the bare `<--name>-$CLAUDE_PID` slug, so that session's re-derived heartbeat and release get
+`result=refused` (naming the holder's pid `alive`) — nothing is damaged. The lease becomes
+reclaimable once its heartbeat is past the 2h TTL; to skip the wait, release it with its original
+`--slug` (`lease-show` prints it as `holder_slug`) and claim again.
+
 If `$CLAUDE_PID` is unresolvable **and** `--slug` is omitted, the lease verbs **exit 2** with a
 message naming both, rather than silently drifting to a slug your own later heartbeat would fail to
 match. The CLI deliberately will not invent one: a synthesized token would be identical for every

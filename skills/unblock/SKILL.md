@@ -68,6 +68,11 @@ held, and once its heartbeat is past the TTL the reaper reclaims it. Its heartbe
 mtime) is the **only** liveness signal a hosted holder has
 (`orchestrator/src/orchestrator/session_registry.py::resolve_session_identity`).
 
+**One-time rollout note (task 6916).** A lease a hosted `/unblock` session claimed *before* this
+change carries the bare `<--name>-$CLAUDE_PID` slug, so its re-derived release gets
+`result=refused` — nothing is damaged. Pass the original `--slug` on release (`lease-show` prints it
+as `holder_slug`), or let the lease become reclaimable once its heartbeat is past the 2h TTL.
+
 If `$CLAUDE_PID` is unresolvable **and** `--slug` is omitted, the lease verbs **exit 2** naming both,
 rather than silently drifting to a slug your own later release would fail to match; the CLI will not
 invent one, because a synthesized token would be identical for every degraded session and let each
