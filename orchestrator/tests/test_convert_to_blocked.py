@@ -49,7 +49,7 @@ from shared.task_statuses import TaskStatus
 
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
-from orchestrator.recovery_emission import RecoverySweepTally, pin_buckets
+from orchestrator.recovery_emission import RecoverySweepTally
 from orchestrator.task_ground_truth import (
     BranchState,
     BranchStateKind,
@@ -937,9 +937,7 @@ class TestConvertToBlockedRecordsTheConversion:
         rows = _strand_rows(enforce_harness)
         assert len(rows) == 1
         assert rows[0]['task_id'] == _TID
-        expected = sorted(pin_buckets(_TID, refs, store_unavailable=False).buckets['queue_handoff'])
-        assert expected
-        assert rows[0]['data']['pinning_escalation_ids'] == expected
+        assert rows[0]['data']['pinning_escalation_ids'] == ['esc-3539-1']
 
     async def test_the_metadata_stamp_agrees_with_the_row(self, enforce_harness) -> None:
         report = _pinned_in_progress()

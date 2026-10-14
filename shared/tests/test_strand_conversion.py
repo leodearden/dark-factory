@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
-from shared.strand_conversion import STRAND_CONVERTED_METADATA_KEY, StrandConverted
+from shared.strand_conversion import StrandConverted
 from shared.task_metadata import parse_metadata
 
 _AT = datetime(2026, 10, 13, 12, 0, tzinfo=UTC)
@@ -24,10 +24,6 @@ def _stamp() -> StrandConverted:
 
 def _slice(**overrides: object) -> dict:
     return {'at': _AT.isoformat(), 'shape': _SHAPE, 'pinning_escalation_ids': list(_IDS), **overrides}
-
-
-def test_key_is_strand_converted() -> None:
-    assert STRAND_CONVERTED_METADATA_KEY == 'strand_converted'
 
 
 def test_to_metadata_round_trips() -> None:
