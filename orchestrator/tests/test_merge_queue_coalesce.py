@@ -1935,7 +1935,7 @@ class TestRedriveCoalesceMembers:
             patch.object(git_ops, 'is_ancestor', AsyncMock(return_value=True)),
             patch.object(git_ops, 'resolve_branch_sha', AsyncMock(return_value='realtipsha')),
             patch(
-                'orchestrator.merge_queue.validate_landing_evidence',
+                'orchestrator.merge_lane.member_redrive.validate_landing_evidence',
                 AsyncMock(return_value=verdict),
             ) as mock_validate,
         ):
@@ -2001,7 +2001,7 @@ class TestRedriveCoalesceMembers:
             patch.object(git_ops, 'is_ancestor', AsyncMock(return_value=True)),
             patch.object(git_ops, 'resolve_branch_sha', AsyncMock(return_value=None)),
             patch(
-                'orchestrator.merge_queue.validate_landing_evidence',
+                'orchestrator.merge_lane.member_redrive.validate_landing_evidence',
                 AsyncMock(return_value=verdict),
             ),
         ):
@@ -2063,7 +2063,7 @@ class TestRedriveCoalesceMembers:
             patch.object(git_ops, 'is_ancestor', AsyncMock(return_value=True)),
             patch.object(git_ops, 'resolve_branch_sha', AsyncMock(return_value='realtipsha')),
             patch(
-                'orchestrator.merge_queue.validate_landing_evidence',
+                'orchestrator.merge_lane.member_redrive.validate_landing_evidence',
                 AsyncMock(return_value=verdict),
             ),
         ):
@@ -2277,7 +2277,7 @@ class TestRedriveCoalesceMembersStaleEvidence:
             patch.object(git_ops, 'is_ancestor', AsyncMock(return_value=True)),
             patch.object(git_ops, 'resolve_branch_sha', AsyncMock(return_value='shatip')),
             patch(
-                'orchestrator.merge_queue.validate_landing_evidence',
+                'orchestrator.merge_lane.member_redrive.validate_landing_evidence',
                 AsyncMock(return_value=accepted_verdict),
             ),
             patch('orchestrator.merge_queue.logger') as mock_logger,

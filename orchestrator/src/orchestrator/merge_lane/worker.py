@@ -89,12 +89,7 @@ from orchestrator.merge_lane.gates import (
     _run_unscoped_typechecks,
 )
 from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
-from orchestrator.merge_lane.landing_evidence import (
-    LandingEvidenceVerdict,
-    file_unattributed_landing_escalation,
-    patch_content_contained,
-    validate_landing_evidence,
-)
+from orchestrator.merge_lane.landing_evidence import patch_content_contained
 from orchestrator.merge_lane.liveness import (
     _HEARTBEAT_POLL_S,
     _MERGE_AHEAD_BOUND,
@@ -110,6 +105,7 @@ from orchestrator.merge_lane.liveness import (
     newest_content_mtime,
     release_chain_build_lane,
 )
+from orchestrator.merge_lane.member_redrive import MemberRedriver
 from orchestrator.merge_lane.no_progress_abort import NoProgressAbort, emit_no_progress_abort
 from orchestrator.merge_lane.ports import (
     ClockPort,
@@ -15251,63 +15247,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     async def _redrive_coalesce_members(
         self, req: GroupMergeRequest, main_sha: str,
     ) -> None:
-        """Re-drive absorbed members still merge-deferred after a coalesce-train derail.
+        """Re-drive absorbed members still merge-deferred after a coalesce train
+        does not land; see ``orchestrator/src/orchestrator/merge_lane/member_redrive.py::MemberRedriver.redrive``.
 
-        For each member task still in 'merge-deferred' status (per req.status_check):
-          - If the member's branch is already an ancestor of main (double-landing
-            guard: a partner's merge brought it in), delegate to the shared
-            :func:`~orchestrator.landing_evidence.validate_landing_evidence`
-            helper (DISCOVERY mode, task 2678) to discover and attribute the
-            citation commit and confirm its effect is still present at main
-            HEAD. An ACCEPTED verdict marks the member done with
-            found_on_main provenance via
-            ``req.redrive_member(mid, True, verdict.evidence_sha)``. A
-            REJECTED verdict (no citation, a lineage mismatch, or the
-            task-1175 reverted-merge shape) is no longer silently anchored
-            on ``main_sha`` — the retired ``resolve_branch_sha(...) or
-            main_sha`` fallback fabricated provenance whenever
-            ``resolve_branch_sha`` came up empty. It now files a
-            dedup-guarded 'provenance_unattributed' escalation via
-            :meth:`_file_unattributed_landing_escalation` and flips the
-            member to pending (``req.redrive_member(mid, False, None)``) so
-            a fresh solo-merge re-attributes it.
-          - Otherwise (branch not an ancestor of main) flip it to 'pending'
-            via req.redrive_member(mid, False, None) so the scheduler
-            re-dispatches a fresh solo-merge workflow that owns the
-            merge-deferred→done transition.  The member is first un-stacked
-            from any unlanded base (:meth:`_unstack_redriven_member`, task
-            5618), so neither the re-dispatched agent nor its reviewer sees
-            another task's commits.  A member :meth:`_unwind_coalesce_train`
-            already put back on its pre-stack tip has no stack record left, so
-            the un-stack leaves it there.
-
-        Members not in 'merge-deferred' (e.g. raced to 'in-progress' by a sibling)
-        are left alone — the live workflow owns their done-transition.
-
-        Per-member try/except ensures one member failure never aborts the rest or
-        kills the merger loop.  req.redrive_member=None is a back-compat no-op.
-
-        A ``StaleEvidenceRejection`` (task 2677) — the found_on_main
-        provenance-integrity gate refusing this member's done-write because
-        its evidence predates the task's most recent ``reopen_at`` — is
-        routed to ``self._provenance_conflict_sink`` (a dedupe-guarded,
-        born-at-L2 escalation) instead of falling into the generic
-        log-and-continue branch below, which would otherwise silently
-        swallow the rejection and re-attempt it on the next derail. Either
-        way the member is left un-flipped and the remaining members are
-        still processed. A ``should_skip`` pre-check (reviewer_comprehensive
-        amendment) guards the ``on_main`` re-drive attempt itself, so once a
-        member is memoized as a provenance conflict a later derail skips
-        straight past it instead of re-attempting the already-rejected
-        write — only the escalation's ``dedupe_count`` folded on repeat
-        derails before this pre-check existed. Like
-        :func:`reconcile_landed_row`, this call omits ``reopen_at`` (no
-        cheap task-metadata access from this worker) so it self-heals only
-        via the escalation-resolved invalidation arm — same known
-        limitation and same operator runbook (resolve the pending
-        ``provenance_conflict`` escalation; no task re-pend needed), see
-        that function's docstring (reviewer_comprehensive amendment, task
-        2677, robustness_self_heal_gap).
+        A member :meth:`_unwind_coalesce_train` already put back on its
+        pre-stack tip has no stack record left, so the un-stack leaves it
+        there.  req.redrive_member=None is a back-compat no-op.
         """
         if req.redrive_member is None:
             logger.warning(
@@ -15316,145 +15261,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 req.train_id,
             )
             return
+        await self._member_redriver().redrive(
+            req.train_id, req.member_task_ids,
+            status_check=req.status_check,
+            redrive_member=req.redrive_member,
+            strip_unlanded_base=True,
+        )
 
-        statuses = await req.status_check(req.member_task_ids)
-        deferred_mids = [
-            mid for mid in req.member_task_ids
-            if statuses.get(mid) == 'merge-deferred'
-        ]
-
-        for mid in deferred_mids:
-            try:
-                branch = f'{self._git_ops.config.branch_prefix}{mid}'
-                on_main = await self._git_ops.is_ancestor(
-                    branch, self._git_ops.config.main_branch,
-                )
-                if on_main:
-                    # reviewer_comprehensive amendment (task 2677): without
-                    # this pre-check, a member memoized as a provenance
-                    # conflict would have its doomed done-write re-attempted
-                    # on EVERY subsequent derail — only the escalation (via
-                    # dedupe_count) was deduped, not the write itself. Skip
-                    # straight to the next member instead.
-                    if (
-                        self._provenance_conflict_sink is not None
-                        and self._provenance_conflict_sink.should_skip(mid)
-                    ):
-                        logger.info(
-                            'Coalesce train %s: member %s already memoized '
-                            'as a provenance conflict — skipping re-drive '
-                            'attempt this derail',
-                            req.train_id, mid,
-                        )
-                        continue
-                    branch_tip = await self._git_ops.resolve_branch_sha(branch)
-                    verdict = await validate_landing_evidence(
-                        self._git_ops, mid, branch,
-                        branch_tip_sha=branch_tip,
-                        pattern_template=self._git_ops.config.commit_citation_pattern,
-                    )
-                    if verdict.accepted:
-                        await req.redrive_member(mid, True, verdict.evidence_sha)
-                        logger.info(
-                            'Coalesce train %s: member %s already on main — '
-                            'marked done (found_on_main, sha=%s)',
-                            req.train_id, mid, verdict.evidence_sha,
-                        )
-                    else:
-                        self._file_unattributed_landing_escalation(mid, branch, verdict)
-                        await req.redrive_member(mid, False, None)
-                        logger.info(
-                            'Coalesce train %s: member %s on main but landing '
-                            'evidence unattributable (reason=%s) — escalated, '
-                            'flipped to pending for solo-merge re-dispatch',
-                            req.train_id, mid, verdict.reason,
-                        )
-                else:
-                    await self._unstack_redriven_member(req.train_id, mid)
-                    await req.redrive_member(mid, False, None)
-                    logger.info(
-                        'Coalesce train %s: member %s not on main — '
-                        'flipped to pending for solo-merge re-dispatch',
-                        req.train_id, mid,
-                    )
-            except StaleEvidenceRejection as exc:
-                if self._provenance_conflict_sink is not None:
-                    self._provenance_conflict_sink.record_from_rejection(
-                        exc, gate_source='coalesce-redrive',
-                    )
-                logger.warning(
-                    'Coalesce train %s: member %s hit done_evidence_stale — '
-                    'evidence %s (%s) predates reopen_at %s; filed '
-                    'provenance_conflict escalation instead of re-driving',
-                    req.train_id, mid, exc.evidence_commit,
-                    exc.evidence_committed_at, exc.reopen_at,
-                )
-            except Exception:
-                logger.exception(
-                    'Coalesce train %s: re-drive failed for member %s — '
-                    'continuing with remaining members',
-                    req.train_id, mid,
-                )
-
-    async def _unstack_redriven_member(self, train_id: str, mid: str) -> None:
-        """Strip an unlanded stack base from a derailed member before re-drive.
-
-        Never raises, so the re-drive that follows always runs: a member left
-        merge-deferred with no workflow is stranded.  A member that cannot be
-        un-stacked is re-driven anyway; its solo merge admission un-stacks it
-        again, and blocks with the attributed reason if it still cannot.
-        """
-        try:
-            result = await self._git_ops.unstack_from_unlanded_base(
-                f'{self._git_ops.config.branch_prefix}{mid}',
-            )
-        except Exception:
-            logger.exception(
-                'Coalesce train %s: un-stacking member %s raised — re-driving '
-                'it anyway; its solo merge admission un-stacks it again',
-                train_id, mid,
-            )
-            return
-        if result.outcome is UnstackOutcome.UNSTACKED:
-            logger.info(
-                'Coalesce train %s: member %s un-stacked before re-drive',
-                train_id, mid,
-            )
-        elif result.stops_merge:
-            logger.warning(
-                'Coalesce train %s: member %s re-driven still stacked; its solo '
-                'merge admission will block with: %s',
-                train_id, mid, result.merge_block_reason(),
-            )
-
-    def _file_unattributed_landing_escalation(
-        self, task_id: str, branch: str, verdict: LandingEvidenceVerdict,
-    ) -> None:
-        """Best-effort, dedup-guarded L1 escalation for unattributable
-        coalesce re-drive landing evidence (task 2678, INV-5).
-
-        Filed when :meth:`_redrive_coalesce_members` finds a member's
-        branch already an ancestor of main but
-        :func:`validate_landing_evidence` rejects the landing evidence (no
-        citation, a lineage mismatch, or an effect-absent reverted merge).
-        Non-status-blocking: the member is simply flipped to pending by the
-        caller, not held in any blocked state, and re-evaluated by its next
-        solo-merge dispatch.
-
-        Best-effort (a no-op when ``_escalation_queue`` is None, e.g. bare-
-        worker unit tests) and deduped via ``has_open_l1`` so repeated
-        coalesce derails re-observing the same unattributable evidence
-        don't stack duplicate L1s.
-
-        Delegates the actual filing (queue-None guard, dedup, ``Escalation``
-        construction, submit/log/except shape) to the shared
-        :func:`~orchestrator.landing_evidence.file_unattributed_landing_escalation`
-        (task 2678 amendment, INV-5) — this method now only supplies
-        ``agent_role``, the one thing that distinguishes it from
-        ``Harness``'s equivalent method.
-        """
-        file_unattributed_landing_escalation(
-            self._escalation_queue, task_id, branch, verdict,
+    def _member_redriver(self) -> MemberRedriver:
+        """Built per call, so it always sees the worker's current collaborators."""
+        return MemberRedriver(
+            git_ops=self._git_ops,
+            provenance_conflict_sink=self._provenance_conflict_sink,
+            escalation_queue=self._escalation_queue,
             agent_role='orchestrator-merge-worker',
         )
 
@@ -15563,7 +15382,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Nothing journals a train and its absorbed singles have already left
         the journal, so a restart that drops an unstarted coalesce train
-        strands every member merge-deferred (task 4737 owns that in general).
+        strands every member merge-deferred (recovered in general by
+        ``orchestrator/src/orchestrator/merge_deferred_recovery.py::AbandonedMemberSweep``).
         Under an admission halt such a train can never start before the
         restart, so it is dissolved first through
         :meth:`_unwind_coalesce_train`: each member goes back on its

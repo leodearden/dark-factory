@@ -16,7 +16,6 @@ from unittest.mock import AsyncMock, call
 import pytest
 import pytest_asyncio
 from escalation.queue import EscalationQueue
-from orchestrator.merge_lane.member_redrive import MemberRedriveOutcome, MemberRedriver
 from test_git_ops_unstack import (
     _add_member,
     _commit_files,
@@ -27,6 +26,7 @@ from test_git_ops_unstack import (
 )
 
 from orchestrator.git_ops import GitOps
+from orchestrator.merge_lane.member_redrive import MemberRedriveOutcome, MemberRedriver
 from orchestrator.scheduler import StaleEvidenceRejection
 
 _ROLE = 'test-member-redrive'
@@ -243,7 +243,7 @@ class TestUnlandedBase:
 
         assert outcomes == {'B': MemberRedriveOutcome.NOT_ON_MAIN}
         assert not await repo.is_ancestor(a_commit, 'task/B')
-        assert (await _git(repo.root, 'show', 'task/B:b.txt')) == 'b\n'
+        assert (await _git(repo.root, 'show', 'task/B:b.txt')).strip() == 'b'
 
     async def test_no_strip_leaves_the_branch_byte_identical(self, repo: _Repo) -> None:
         await self._stack_pair(repo)
