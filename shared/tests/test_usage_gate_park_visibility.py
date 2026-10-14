@@ -59,6 +59,8 @@ PARK_EVENT = 'all_capped_park'
 # throttle is load-bearing rather than an artifact of the wait period.
 ONE_SHOT_PARK_MESSAGE = 'All accounts capped'
 
+_LOOP_STALL_SECS = 0.6
+
 
 def _park_records(caplog) -> list[tuple[logging.LogRecord, dict]]:
     """Every structured ``all_capped_park`` record, with its decoded payload."""
@@ -131,6 +133,48 @@ def fast_heartbeat(monkeypatch):
     return _set
 
 
+@pytest.fixture(params=[0.0, _LOOP_STALL_SECS], ids=['unstalled', 'loop-stalled'])
+def stall_the_loop(request):
+    """Return a callable that blocks the loop thread once, on its next iteration.
+
+    The stall outlasts every window a stalled test requests (the largest is
+    0.5s), so a harness that ends a park on its own wall clock, rather than on
+    what the park has observably done, goes red on every loop-stalled variant.
+    """
+    secs = request.param
+
+    def _stall() -> None:
+        if secs:
+            asyncio.get_running_loop().call_soon(time.sleep, secs)
+
+    return _stall
+
+
+class TestTheParkHarness:
+    async def test_an_unmet_precondition_releases_the_park_instead_of_hanging(
+        self,
+    ) -> None:
+        """A hang breaches pytest-timeout and degrades into the shifting-victim
+        false red that ``shared/pyproject.toml``'s timeout block describes; the
+        valve is what keeps a regression a clean per-test red.
+        """
+        gate = _all_capped_gate()
+        started = time.monotonic()
+
+        await _park_for(gate, 0.0, until=lambda: False, valve_secs=0.05)
+
+        assert time.monotonic() - started < 30.0, (
+            'an unsatisfiable park precondition must be ended by the valve, '
+            'not by the pytest timeout'
+        )
+
+    async def test_a_park_that_returns_early_fails_the_harness(self) -> None:
+        gate = make_gate(['a', 'b'], wait_for_reset=False)
+
+        with pytest.raises(AssertionError, match='returned early'):
+            await _park_for(gate, 0.1)
+
+
 class TestAllCappedParkIsVisible:
     async def test_the_park_emits_a_structured_heartbeat(
         self, caplog, fast_heartbeat
@@ -180,7 +224,7 @@ class TestAllCappedParkIsVisible:
         )
 
     async def test_the_heartbeat_repeats_rather_than_firing_once(
-        self, caplog, fast_heartbeat
+        self, caplog, fast_heartbeat, stall_the_loop
     ) -> None:
         """One record at the start of a multi-hour park is not visibility.
 
@@ -202,6 +246,7 @@ class TestAllCappedParkIsVisible:
         # Long enough that the clock's growth clears the 0.1s rounding
         # resolution several times over, so the assertion cannot pass or fail
         # on a rounding boundary.
+        stall_the_loop()
         await _park_for(gate, interval * 25)
 
         records = _park_records(caplog)
@@ -385,7 +430,7 @@ class TestAnAbandonedParkIsNotInherited:
         )
 
     async def test_a_cancelled_sibling_does_not_reset_a_live_park(
-        self, caplog, fast_heartbeat
+        self, caplog, fast_heartbeat, stall_the_loop
     ) -> None:
         """Clearing the shared clock is for the LAST waiter out, not any.
 
@@ -399,6 +444,7 @@ class TestAnAbandonedParkIsNotInherited:
         interval = fast_heartbeat(0.02)
         gate = _all_capped_gate()
 
+        stall_the_loop()
         survivor = asyncio.create_task(gate.before_invoke())
         doomed = asyncio.create_task(gate.before_invoke())
         await asyncio.sleep(interval * 10)
