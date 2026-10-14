@@ -1252,6 +1252,17 @@ routing:
 orch_daily_cost_ceiling_usd: 10000.0
 watcher_daily_cost_ceiling_usd: 150.0
 
+# Auto-eval redo filing is OFF until task 5423 lands (Leo, 2026-10-13, at the
+# task-6859 hand carry). Task 6859 made the redo filing work for the first time
+# (orchestrator/src/orchestrator/harness.py::Harness._maybe_auto_eval now reads a
+# typed submit outcome); with it live, 5423's two open defects would act in
+# production: the original's branch and worktree are renamed `-skip-attempt`
+# before a redo exists and never rolled back, and a worktree-conflict abort is
+# attributed to the plan phase and so triggers a redo. Flip to true once 5423
+# is done, and cancel the deferred `[auto-eval redo]` orphans at the same time
+# (a new redo collides with one on candidate key and is swallowed as `combined`).
+auto_eval_enabled: false
+
 # Usage cap / multi-account failover
 usage_cap:
   enabled: true
