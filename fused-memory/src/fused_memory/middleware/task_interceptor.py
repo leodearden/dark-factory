@@ -5783,6 +5783,8 @@ class TaskInterceptor:
            caught below and converted via ``.to_error_dict()`` into the canonical
            ``{'success': False, 'error': 'status_via_update_task' | 'done_provenance_via_update_task',
            'task_id': …, …}`` shape defined in ``task_backend_errors.py`` (task C2).
+           Any add, alter or removal of ``metadata.deferral`` raises
+           ``DeferralWriteAuthorityError``, returned the same way.
         2. ``_reject_directory_locks_in_update_metadata`` — rejects ``metadata.files``
            entries that name a directory; returns ``lock_charter_error(...)``.
         3. ``_backlog_gate`` — rejects when the reconciliation backlog exceeds the
@@ -5945,7 +5947,11 @@ class TaskInterceptor:
                     )
                 else:
                     result = dict(await _do_update_task_write())
-            except (StatusWriteAuthorityError, DoneProvenanceWriteAuthorityError) as e:
+            except (
+                StatusWriteAuthorityError,
+                DoneProvenanceWriteAuthorityError,
+                DeferralWriteAuthorityError,
+            ) as e:
                 # SqliteTaskBackend write-authority floor (task C1): a status
                 # write is always rejected, and so is any add, change or
                 # removal of metadata.done_provenance (under replace, anything

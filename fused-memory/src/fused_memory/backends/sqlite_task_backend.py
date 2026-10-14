@@ -37,6 +37,7 @@ from shared.task_statuses import TERMINAL, TaskStatus
 
 from fused_memory.backends.task_backend_errors import (
     AppendUnsupportedFieldError,
+    DeferralWriteAuthorityError,
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
     StatusWriteAuthorityError,
@@ -3223,6 +3224,8 @@ class SqliteTaskBackend:
         # checks it inside the transaction below. The gate reads the RAW
         # metadata_mode because _resolve_metadata_mode can itself raise, and
         # resolving first would change which error a bad call surfaces.
+        # metadata.deferral has its own floor, _assert_deferral_unchanged,
+        # judged in-transaction against the stored row in every mode.
         if status is not None:
             raise StatusWriteAuthorityError(task_id, status)
         parsed_metadata: dict | None = None
@@ -3447,7 +3450,12 @@ class SqliteTaskBackend:
                 # narrower "responsibility" to scope to here. Under replace, a
                 # done_provenance the passthrough check admitted is not this
                 # write's responsibility either: the caller had to send it
-                # back unchanged.
+                # back unchanged. The same holds for an admitted echo of
+                # metadata.deferral, which _assert_deferral_unchanged checks
+                # against the stored row in every mode.
+                deferral_echoed = _assert_deferral_unchanged(
+                    row['metadata'], parsed_metadata, new_metadata, task_id,
+                )
                 incoming_keys: set[str] | None = None
                 try:
                     _loaded_incoming = json.loads(metadata)
@@ -3458,6 +3466,8 @@ class SqliteTaskBackend:
                         incoming_keys = set(_loaded_incoming.keys())
                 if done_provenance_passed_through and incoming_keys is not None:
                     incoming_keys.discard('done_provenance')
+                if deferral_echoed and incoming_keys is not None:
+                    incoming_keys.discard('deferral')
                 await self._validate_metadata_on_write(
                     new_metadata, project_root=project_root, tag=tag, task_id=tid,
                     incoming_keys=incoming_keys,
@@ -3656,6 +3666,7 @@ class SqliteTaskBackend:
         admits ``done_provenance`` only as a verbatim passthrough (the same
         :func:`_assert_done_provenance_passthrough` rule update_task applies),
         refuses any change to ``files`` (``candidate_key`` derives from them),
+        carries ``deferral`` through unchanged (:func:`_assert_deferral_unchanged`),
         and refuses a corrupt stored blob rather than repairing it.
 
         Deliberately NOT declared on :class:`TaskBackendProtocol`, like
@@ -3705,6 +3716,7 @@ class SqliteTaskBackend:
                 **{key: stored[key] for key in _MACHINE_AUTHORED_METADATA_KEYS if key in stored},
             }
             new_metadata = json.dumps(new_blob)
+            _assert_deferral_unchanged(row['metadata'], incoming, new_metadata, task_id)
             stored_files, new_files = _files_for_key(row['metadata']), _files_for_key(new_metadata)
             if stored_files != new_files:
                 raise ValueError(
@@ -4358,6 +4370,41 @@ def _metadata_without_keys(blob_json: str, keys: frozenset[str]) -> str:
     if not isinstance(blob, dict) or not keys & blob.keys():
         return blob_json
     return json.dumps({k: v for k, v in blob.items() if k not in keys})
+
+
+def _deferral_slice(blob_json: str | None, absent: object) -> object:
+    try:
+        blob = json.loads(blob_json) if blob_json is not None else None
+    except (TypeError, ValueError):
+        blob = None
+    return blob.get('deferral', absent) if isinstance(blob, dict) else absent
+
+
+def _assert_deferral_unchanged(
+    stored_raw: str | None, incoming: dict | None, new_blob_json: str, task_id: str,
+) -> bool:
+    """Refuse a metadata write that would add, alter or remove ``metadata.deferral``.
+
+    The status choke point is the record's only writer
+    (plans/deferral-flip-condition-prd.md decision 3). Judged inside the
+    caller's transaction against the STORED row, in every metadata mode:
+    a ``deferral`` the payload carries must equal the stored value (additive's
+    OLD-wins merge would otherwise drop an alteration silently), and the blob
+    about to be written must carry exactly the stored record (a replace that
+    omits it would otherwise remove it). Identity is JSON value equality, as in
+    :func:`_assert_done_provenance_passthrough`; a corrupt or absent stored
+    blob holds no record.
+
+    Returns True when the payload carried the key as an admitted echo.
+    """
+    absent = object()
+    stored = _deferral_slice(stored_raw, absent)
+    carried = incoming.get('deferral', absent) if incoming is not None else absent
+    if carried is not absent and carried != stored:
+        raise DeferralWriteAuthorityError(task_id)
+    if _deferral_slice(new_blob_json, absent) != stored:
+        raise DeferralWriteAuthorityError(task_id)
+    return carried is not absent
 
 
 def _merge_metadata(
