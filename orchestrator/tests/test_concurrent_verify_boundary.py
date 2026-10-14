@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import asyncio
 import collections
-import contextlib
 import os
 import time
 from pathlib import Path
@@ -47,6 +46,7 @@ from test_merge_queue_concurrent_verify import (
     _make_config_no_runners,
     _make_fake_remote,
     _mock_verify_result,
+    _stop_worker,
     config,  # noqa: F401 — pytest fixture re-exported from γ harness
     git_config,  # noqa: F401 — pytest fixture re-exported from γ harness
     git_ops,  # noqa: F401 — pytest fixture re-exported from γ harness
@@ -189,9 +189,7 @@ class TestHarnessSmokeTest:
                 label='smoke-a: MergeOutcome (single item lands)',
             )
         finally:
-            await worker.stop()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(worker_task, timeout=5.0)
+            await _stop_worker(worker, worker_task)
 
         assert outcome.status == 'done', f'expected done, got {outcome}'
 
@@ -289,9 +287,7 @@ class TestB1OverlapOrderedAdvance:
                 label='b1-b: MergeOutcome (lands second, submission order)',
             )
         finally:
-            await worker.stop()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(worker_task, timeout=5.0)
+            await _stop_worker(worker, worker_task)
 
         # (1) Spans overlap: the two concurrent per-task verifies (N's gated
         #     local verify + N+1's gated remote laptop verify) ran
@@ -411,9 +407,7 @@ class TestB2ChainInvalidationUnderOverlap:
                 label='b2-b: MergeOutcome (re-merged and re-verified)',
             )
         finally:
-            await worker.stop()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(worker_task, timeout=5.0)
+            await _stop_worker(worker, worker_task)
 
         # (1) N failed (not 'done' or 'already_merged')
         assert outcome_a.status not in ('done', 'already_merged'), (
@@ -541,9 +535,7 @@ class TestB3HostDownMidOverlap:
                 label='b3-b: MergeOutcome (re-dispatched local after quarantine)',
             )
         finally:
-            await worker.stop()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(worker_task, timeout=5.0)
+            await _stop_worker(worker, worker_task)
 
         # (1) Remote host quarantined -- read off the public host census
         hosts = {h['name']: h for h in worker.snapshot()['hosts']}
@@ -655,9 +647,7 @@ class TestB4CancelBehavior:
                 label='b4a-b: MergeOutcome (re-dispatched after cancel confirm)',
             )
         finally:
-            await worker.stop()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(worker_task, timeout=5.0)
+            await _stop_worker(worker, worker_task)
 
         # (1) Exactly 2 cancel_verify calls on the clean-cancel (rc=0) path:
         # _abort_remote_verify (pre-cancel, id live) + cancel_and_release
@@ -774,9 +764,7 @@ class TestB4CancelBehavior:
                 label='b4b-b: MergeOutcome (re-dispatched after probe clears)',
             )
         finally:
-            await worker.stop()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(worker_task, timeout=5.0)
+            await _stop_worker(worker, worker_task)
 
         # (1) cancel_verify called → cancel-fail path taken.
         # assert_called_once() was relaxed to assert_called() in task-1762 step-4:
@@ -811,9 +799,9 @@ class TestB4CancelBehavior:
 
 
 @pytest.mark.asyncio
-# Worst-case wait bill: 2 barriers x 30 + 2 results x 90 + 5s join = 245s. The
-# mark predates that bill and is kept (never-narrow); why a stretched wait needs
-# one: orchestrator/tests/_orch_helpers.py::wait_responsive (COUPLED OBLIGATION).
+# The mark predates this class's wait bill and is kept (never-narrow); why a
+# stretched wait needs one: orchestrator/tests/_orch_helpers.py::wait_responsive
+# (COUPLED OBLIGATION).
 @pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)
 class TestB5OperatorHalt:
     """B5: operator_halt aborts both in-flight verifies, requeues both; unhalt drains."""
@@ -916,9 +904,7 @@ class TestB5OperatorHalt:
                 req_b.result, label='b5-b: MergeOutcome after unhalt',
             )
         finally:
-            await worker.stop()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(worker_task, timeout=5.0)
+            await _stop_worker(worker, worker_task)
 
         # Both must resolve done after unhalt + drain
         assert outcome_a.status == 'done', f'N expected done after unhalt, got {outcome_a}'
@@ -1084,9 +1070,7 @@ class TestB7SingleHostNewPath:
                 label='b7-c: MergeOutcome (single-host serial, third)',
             )
         finally:
-            await worker.stop()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(worker_task, timeout=5.0)
+            await _stop_worker(worker, worker_task)
 
         # (1) All three items routed through the new _dispatch_item /
         # _finalize_inflight path. Assert on the SET of distinct task_ids

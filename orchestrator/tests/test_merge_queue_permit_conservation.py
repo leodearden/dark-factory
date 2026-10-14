@@ -22,7 +22,6 @@ not-yet-wired attribute/key never breaks collection during the RED steps.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -36,6 +35,7 @@ from test_merge_queue_concurrent_verify import (
     _inject_two_host_allocator,
     _make_branch_with_file,
     _make_request,
+    _stop_worker,
 )
 
 from orchestrator.config import GitConfig
@@ -361,9 +361,7 @@ class TestPrefetchLookaheadAndAttachConservation:
 
             _assert_conservation(worker, where='post-landing quiescence')
         finally:
-            await worker.stop()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(worker_task, timeout=5.0)
+            await _stop_worker(worker, worker_task)
 
         _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)
 
@@ -430,9 +428,7 @@ class TestFallbackConservation:
 
             _assert_conservation(worker, where='after FALLBACK, B lands')
         finally:
-            await worker.stop()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(worker_task, timeout=5.0)
+            await _stop_worker(worker, worker_task)
 
         _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)
 
@@ -540,9 +536,7 @@ class TestCascadeRemergeConservation:
 
             _assert_conservation(worker, where='after cascade + remerge + B lands')
         finally:
-            await worker.stop()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(worker_task, timeout=5.0)
+            await _stop_worker(worker, worker_task)
 
         _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)
 
@@ -610,9 +604,7 @@ class TestShutdownRetainedPermitConservation:
         finally:
             # Shut down while the merger is blocked in _acquire_next_request()
             # (queue empty) — possibly still holding the retained permit.
-            await worker.stop()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(worker_task, timeout=10.0)
+            await _stop_worker(worker, worker_task, join_timeout=10.0)
 
         _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)
 
@@ -734,9 +726,7 @@ class TestLedgerLiveEmptiesAfterTransferRelease:
             assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
             assert outcome_b.status == 'done', f'B must land; got {outcome_b!r}'
         finally:
-            await worker.stop()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(worker_task, timeout=5.0)
+            await _stop_worker(worker, worker_task)
 
         _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)
 
@@ -883,8 +873,6 @@ class TestEarlyContinueTerminalTransferClearsSpecBase:
 
             _assert_conservation(worker, where='post-landing quiescence')
         finally:
-            await worker.stop()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(worker_task, timeout=5.0)
+            await _stop_worker(worker, worker_task)
 
         _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)

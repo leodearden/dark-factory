@@ -26,7 +26,6 @@ docstring.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -43,6 +42,7 @@ from test_merge_queue_concurrent_verify import (
     _fake_verify_result,
     _gated_runner,
     _inject_two_host_allocator,
+    _stop_worker,
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -861,7 +861,8 @@ class TestFinalizeHeadErrorChokepoint:
 
 
 @pytest.mark.asyncio
-# Worst-case wait bill 335s (2 barriers x 30 + 3 results x 90 + 5s join) reaches verify's 300s.
+# Its wait bill (test_merge_queue_concurrent_verify.py::_worst_per_method_wait_budget)
+# reaches verify's per-test timeout.
 @pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)
 class TestCascadeErrorChokepoint:
     """CASCADE path fault injection + release idempotency (~7326).
@@ -1022,9 +1023,7 @@ class TestCascadeErrorChokepoint:
                 label='rrcas-c: MergeOutcome (loop-survival signal)',
             )
         finally:
-            await worker.stop()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(worker_task, timeout=5.0)
+            await _stop_worker(worker, worker_task)
 
         # ── Loop survives + offending req blocked (pre-existing 1856 guard) ──
         assert outcome_c.status == 'done', (
@@ -1245,9 +1244,7 @@ class TestCascadeErrorChokepoint:
                 label='rrcdc-c: MergeOutcome (loop-survival signal)',
             )
         finally:
-            await worker.stop()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(worker_task, timeout=5.0)
+            await _stop_worker(worker, worker_task)
 
         # ── Loop survives + offending req blocked (pre-existing 1856 guard) ──
         assert outcome_c.status == 'done', (
@@ -1409,9 +1406,7 @@ class TestCascadeErrorChokepoint:
                 f'got {slot_now!r}.'
             )
         finally:
-            await worker.stop()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(worker_task, timeout=5.0)
+            await _stop_worker(worker, worker_task)
 
         assert outcome_c.status == 'done', (
             f'Expected req_c to resolve "done" (loop survived cascade error), '
@@ -1548,9 +1543,7 @@ class TestCascadeErrorChokepoint:
             gate_a_release.set()
             gate_b_release.set()
         finally:
-            await worker.stop()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(worker_task, timeout=5.0)
+            await _stop_worker(worker, worker_task)
 
         assert req_a.result.done(), 'req_a.result should be resolved by stop()'
         assert req_b.result.done(), 'req_b.result should be resolved by stop()'

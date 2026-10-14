@@ -243,8 +243,8 @@ async def _stop_worker(
     join_timeout: float = STOP_WORKER_JOIN_TIMEOUT,
 ) -> None:
     """Shut *worker* down and join its run task -- the ONE teardown shape
-    shared by this module and test_merge_speculation.py, so no site can
-    drift or be forgotten.
+    shared by this module and every sibling merge-worker test module that
+    imports it, so no site can drift or be forgotten.
 
     ALWAYS call this from a ``finally:`` whose ``try:`` encloses every wait in
     the test body (task 3980 amendment, esc-3980-4). ``wait_responsive``
