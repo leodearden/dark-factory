@@ -306,3 +306,54 @@ for (const { arm, pinnedTaskIds, draws } of PINNING_ARMS) {
     }
   });
 }
+
+// ── Decision 4: the pinning StatTile (pins_recovery.js::pinningSummary) ──
+// Each fixture repeats a task id across two escalations, so the escalation
+// count and the distinct pinned-task count differ, and carries one item that
+// pins nothing and one with no annotation, neither of which may count.
+
+const PINNING_TILE_FIXTURES = [
+  { pinned: 'one distinct pinned task', pins: [['42'], ['42']] },
+  { pinned: 'two distinct pinned tasks', pins: [['42'], ['42'], ['43']] },
+];
+
+function pinningItems(pins) {
+  const pinning = pins.map((pinnedTaskIds, i) => openEscalationItem({ id: `esc-pin-${i}`, taskId: pinnedTaskIds[0], pinnedTaskIds }));
+  return [
+    ...pinning,
+    openEscalationItem({ id: 'esc-none', taskId: '50', pinnedTaskIds: [] }),
+    openEscalationItem({ id: 'esc-unknown', taskId: '51' }),
+  ];
+}
+
+function statTile(container, label) {
+  const tiles = [...container.querySelectorAll('.kpi')].filter(
+    tile => tile.querySelector('.lbl')?.firstChild?.textContent === label,
+  );
+  assert.equal(tiles.length, 1, `expected exactly one "${label}" StatTile`);
+  return tiles[0];
+}
+
+for (const { pinned, pins } of PINNING_TILE_FIXTURES) {
+  test(`tab_escalations.jsx::EscalationsTab pinning tile renders pinningSummary's count and ${pinned}`, t => {
+    const harness = openWindow(t);
+    const items = pinningItems(pins);
+    seedDashboardData(harness.window, {
+      ESCALATION_ANALYTICS: escalationAnalytics([{ project: PROJECT, openItems: items }]),
+      __receipt: receiptsFor(harness.window.DF_DATA_LOADER, ['ESCALATION_ANALYTICS', 'ESCALATIONS']),
+    });
+    const { container } = harness.mount(harness.window.DF_TABS.EscalationsTab, { projectFilter: [] });
+
+    const { count, pinnedTaskCount } = harness.window.DF_PINS_RECOVERY.pinningSummary(items);
+    assert.notEqual(count, pinnedTaskCount, 'the fixture must make escalations and distinct pinned tasks differ');
+    const tile = statTile(container, 'pinning');
+    assert.equal(tile.querySelector('.val').textContent, String(count), 'the tile value must be pinningSummary().count');
+
+    const hint = tile.querySelector('.lbl > span')?.textContent ?? '';
+    const noun = pinnedTaskCount === 1 ? 'task' : 'tasks';
+    assert.ok(
+      hint.endsWith(` ${pinnedTaskCount} ${noun}`),
+      `the hint "${hint}" must count pinningSummary().pinnedTaskCount = ${pinnedTaskCount} ${noun}`,
+    );
+  });
+}
