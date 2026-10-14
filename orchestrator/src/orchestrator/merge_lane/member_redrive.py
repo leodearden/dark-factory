@@ -47,6 +47,7 @@ class MemberRedriveOutcome(enum.StrEnum):
     PROVENANCE_CONFLICT_MEMOIZED = 'provenance_conflict_memoized'
     STALE_EVIDENCE = 'stale_evidence'
     ERRORED = 'errored'
+    HELD_BY_LIVE_TRAIN = 'held_by_live_train'
 
 
 class ProvenanceConflictMemo(Protocol):

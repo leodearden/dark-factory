@@ -1493,7 +1493,7 @@ def build_train_callback_factory(
                     mid,
                     kind='found_on_main',
                     sha=sha,
-                    note=f'coalesce-derail re-drive: branch already on main (train {train_id})',
+                    note=f'parked-member re-drive: branch already on main (train {train_id})',
                 )
                 # task 2280 (PRD WA-3): consume the tip's write-ahead LandedRow on
                 # this found_on_main done-write, mirroring mark_member_done above.

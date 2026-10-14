@@ -105,7 +105,7 @@ from orchestrator.merge_lane.liveness import (
     newest_content_mtime,
     release_chain_build_lane,
 )
-from orchestrator.merge_lane.member_redrive import MemberRedriver
+from orchestrator.merge_lane.member_redrive import MemberRedriveOutcome, MemberRedriver
 from orchestrator.merge_lane.no_progress_abort import NoProgressAbort, emit_no_progress_abort
 from orchestrator.merge_lane.ports import (
     ClockPort,
@@ -15276,6 +15276,48 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             escalation_queue=self._escalation_queue,
             agent_role='orchestrator-merge-worker',
         )
+
+    def train_member_ids_in_custody(self) -> frozenset[str]:
+        """Every member of a train this lane still holds.  A held train decides
+        each member's fate on its own exit, so none of them is abandoned."""
+        return frozenset(
+            mid
+            for obj in self._live_items.values()
+            if isinstance(request := _request_of(obj), GroupMergeRequest)
+            for mid in request.member_task_ids
+        )
+
+    async def redrive_abandoned_members(
+        self, label: str, member_ids: Sequence[str], *, strip_unlanded_base: bool,
+    ) -> dict[str, MemberRedriveOutcome]:
+        """Re-drive parked members no train holds, through this worker's own
+        train callbacks (task 4737).  A member a live train holds is refused."""
+        factory = self._train_callback_factory
+        if factory is None:
+            raise RuntimeError(
+                'redrive_abandoned_members needs a train_callback_factory: without one '
+                'the lane has no scheduler to hand a parked member back to'
+            )
+        callbacks = factory(label)
+        if callbacks.redrive_member is None:
+            raise RuntimeError(
+                f'train_callback_factory built no redrive_member for {label}: '
+                'a parked member can only be handed back through it'
+            )
+        custody = self.train_member_ids_in_custody()
+        held = [mid for mid in member_ids if mid in custody]
+        if held:
+            logger.warning(
+                'Train %s: members %s are held by a live train — not re-driving them',
+                label, held,
+            )
+        outcomes = await self._member_redriver().redrive(
+            label, [mid for mid in member_ids if mid not in custody],
+            status_check=callbacks.status_check,
+            redrive_member=callbacks.redrive_member,
+            strip_unlanded_base=strip_unlanded_base,
+        )
+        return dict.fromkeys(held, MemberRedriveOutcome.HELD_BY_LIVE_TRAIN) | outcomes
 
     def _coalesce_exclusion_reason(self, candidate: MergeRequest) -> str | None:
         """Why the coalescing pass must leave *candidate* solo, or None.
