@@ -1114,8 +1114,9 @@ def create_server(
     root this store does not serve is refused; with no identity, nothing is.
 
     *mismatch_streak_threshold* (default 5) — how many refused assertions of
-    one ``project_root`` file (or fold) ONE ``infra_issue`` L1 into this
-    server's own queue (``escalation.mismatch_streak::MismatchStreak``).
+    one ``project_root`` within the streak's window file (or fold) ONE
+    ``infra_issue`` L1 into this server's own queue
+    (``escalation.mismatch_streak::MismatchStreak``).
     """
     mcp = FastMCP('escalation', instructions=ESCALATION_SERVER_INSTRUCTIONS)
     if store_identity is not None:

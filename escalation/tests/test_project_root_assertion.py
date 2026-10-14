@@ -296,7 +296,7 @@ class TestWireShape:
 
 class TestMismatchStormEscape:
     @pytest.mark.asyncio
-    async def test_fifth_mismatch_files_once_and_the_next_streak_folds(
+    async def test_fifth_mismatch_files_once_and_the_rest_of_the_burst_does_not_refile(
         self,
         project_server: FastMCP,
         queue: EscalationQueue,
@@ -326,7 +326,7 @@ class TestMismatchStormEscape:
         await assert_refused(project_server, kwargs_for, str(other), TOOLS[1:])
         records = storm_records(queue)
         assert len(records) == 1
-        assert records[0].dedupe_count == 1
+        assert records[0].dedupe_count == 0
 
     @pytest.mark.asyncio
     async def test_the_storm_lands_in_the_reconciliation_queue(

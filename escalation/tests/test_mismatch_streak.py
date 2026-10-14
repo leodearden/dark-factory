@@ -16,12 +16,25 @@ import _project_root_stores as stores
 import pytest
 from _project_root_stores import storm_records
 
-from escalation.mismatch_streak import DEFAULT_MISMATCH_STREAK_THRESHOLD, MismatchStreak
+from escalation.mismatch_streak import (
+    DEFAULT_MISMATCH_STREAK_THRESHOLD,
+    DEFAULT_MISMATCH_STREAK_WINDOW_SECONDS,
+    MismatchStreak,
+)
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.store_identity import StoreIdentity
 
 REFUSAL = 'project_root mismatch: the refusal text the caller saw'
+WINDOW = 100.0
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
 
 
 @pytest.fixture
@@ -58,9 +71,10 @@ def _record_n(streak: MismatchStreak, identity: StoreIdentity, root: str, n: int
     return [streak.record_mismatch(identity, root, REFUSAL) for _ in range(n)]
 
 
-class TestDefaultThreshold:
-    def test_default_is_five(self) -> None:
+class TestDefaults:
+    def test_five_refusals_within_an_hour(self) -> None:
         assert DEFAULT_MISMATCH_STREAK_THRESHOLD == 5
+        assert DEFAULT_MISMATCH_STREAK_WINDOW_SECONDS == 3600.0
 
     def test_fifth_mismatch_files_one_record(
         self, queue: EscalationQueue, project_identity: StoreIdentity, other: Path,
@@ -74,11 +88,16 @@ class TestDefaultThreshold:
         assert len(storm_records(queue)) == 1
 
 
-class TestThresholdValidation:
+class TestConstructorValidation:
     @pytest.mark.parametrize('bad', [0, -1, True, 2.5])
-    def test_constructor_rejects_non_positive_int(self, queue: EscalationQueue, bad) -> None:
+    def test_threshold_must_be_a_positive_int(self, queue: EscalationQueue, bad) -> None:
         with pytest.raises(ValueError, match=re.escape(repr(bad))):
             MismatchStreak(queue, threshold=bad)
+
+    @pytest.mark.parametrize('bad', [0, -1.0, True, float('inf'), float('nan'), '60'])
+    def test_window_must_be_a_positive_finite_number(self, queue: EscalationQueue, bad) -> None:
+        with pytest.raises(ValueError, match=re.escape(repr(bad))):
+            MismatchStreak(queue, window_seconds=bad)
 
 
 class TestRecordShape:
@@ -101,6 +120,10 @@ class TestRecordShape:
         assert str(queue.queue_dir) in esc.summary
         assert 'proj' in esc.summary
         assert REFUSAL in esc.detail
+        assert 'refusals_in_window: 3' in esc.detail.splitlines()
+        assert f'window_seconds: {DEFAULT_MISMATCH_STREAK_WINDOW_SECONDS:g}' in (
+            esc.detail.splitlines()
+        )
 
     def test_reconciliation_store_record(
         self, recon_queue: EscalationQueue, recon_identity: StoreIdentity, other: Path,
@@ -114,32 +137,77 @@ class TestRecordShape:
         assert str(recon_queue.queue_dir) in records[0].summary
 
 
-class TestReArm:
-    def test_second_streak_folds_into_the_open_record(
+class TestWindow:
+    def test_refusals_spread_wider_than_the_window_never_fire(
         self, queue: EscalationQueue, project_identity: StoreIdentity, other: Path,
     ) -> None:
-        streak = MismatchStreak(queue, threshold=3)
+        clock = _Clock()
+        streak = MismatchStreak(queue, threshold=3, window_seconds=WINDOW, time_provider=clock)
+
+        fired = []
+        for _ in range(6):
+            fired.append(streak.record_mismatch(project_identity, str(other), REFUSAL))
+            clock.now += WINDOW / 2
+
+        assert fired == [False] * 6
+        assert storm_records(queue) == []
+
+    def test_aged_out_refusals_do_not_count_toward_a_later_burst(
+        self, queue: EscalationQueue, project_identity: StoreIdentity, other: Path,
+    ) -> None:
+        clock = _Clock()
+        streak = MismatchStreak(queue, threshold=3, window_seconds=WINDOW, time_provider=clock)
+        assert _record_n(streak, project_identity, str(other), 2) == [False, False]
+
+        clock.now = WINDOW * 30
+        assert _record_n(streak, project_identity, str(other), 2) == [False, False]
+        assert storm_records(queue) == []
+
+        assert streak.record_mismatch(project_identity, str(other), REFUSAL) is True
+
+
+class TestReArm:
+    def test_the_rest_of_a_burst_inside_the_window_does_not_refile(
+        self, queue: EscalationQueue, project_identity: StoreIdentity, other: Path,
+    ) -> None:
+        clock = _Clock()
+        streak = MismatchStreak(queue, threshold=3, window_seconds=WINDOW, time_provider=clock)
         _record_n(streak, project_identity, str(other), 3)
 
-        assert _record_n(streak, project_identity, str(other), 2) == [False, False]
+        clock.now = WINDOW - 1
+        assert _record_n(streak, project_identity, str(other), 10) == [False] * 10
         records = storm_records(queue)
         assert len(records) == 1
         assert records[0].dedupe_count == 0
 
-        assert streak.record_mismatch(project_identity, str(other), REFUSAL) is True
+    def test_a_burst_still_running_a_window_later_folds_into_the_open_record(
+        self, queue: EscalationQueue, project_identity: StoreIdentity, other: Path,
+    ) -> None:
+        clock = _Clock()
+        streak = MismatchStreak(queue, threshold=3, window_seconds=WINDOW, time_provider=clock)
+        _record_n(streak, project_identity, str(other), 3)
+
+        fired = []
+        for instant in (30.0, 60.0, WINDOW + 1, WINDOW + 30):
+            clock.now = instant
+            fired.append(streak.record_mismatch(project_identity, str(other), REFUSAL))
+
+        assert fired == [False, False, True, False]
         records = storm_records(queue)
         assert len(records) == 1
         assert records[0].dedupe_count == 1
 
-    def test_resolved_record_does_not_suppress_the_next_streak(
+    def test_resolved_record_does_not_suppress_the_next_burst(
         self, queue: EscalationQueue, project_identity: StoreIdentity, other: Path,
     ) -> None:
-        streak = MismatchStreak(queue, threshold=3)
+        clock = _Clock()
+        streak = MismatchStreak(queue, threshold=3, window_seconds=WINDOW, time_provider=clock)
         _record_n(streak, project_identity, str(other), 3)
         first_id = storm_records(queue)[0].id
         queue.resolve(first_id, 'fixed')
 
-        _record_n(streak, project_identity, str(other), 3)
+        clock.now = WINDOW * 2
+        assert _record_n(streak, project_identity, str(other), 3)[-1] is True
 
         records = storm_records(queue)
         assert len(records) == 1
@@ -198,7 +266,7 @@ class TestPerRootStreaks:
 
 
 class TestFilingFailure:
-    def test_failed_submit_is_logged_not_raised(
+    def test_failed_submit_is_logged_on_this_logger_not_raised(
         self,
         tmp_path: Path,
         proj: Path,
@@ -216,10 +284,14 @@ class TestFilingFailure:
         with caplog.at_level(logging.WARNING, logger='escalation.mismatch_streak'):
             assert _record_n(streak, identity, str(other), 3)[-1] is True
 
-        assert any(
-            r.name == 'escalation.mismatch_streak' and r.levelno >= logging.WARNING
-            for r in caplog.records
-        )
+        failures = [
+            r for r in caplog.records
+            if r.name == 'escalation.mismatch_streak'
+            and r.levelno >= logging.WARNING
+            and 'project_root mismatch storm escape' in r.getMessage()
+            and 'disk full' in r.getMessage()
+        ]
+        assert len(failures) == 1
         assert storm_records(broken) == []
 
 
