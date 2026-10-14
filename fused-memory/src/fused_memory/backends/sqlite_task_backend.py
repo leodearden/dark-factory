@@ -759,6 +759,8 @@ async def _migrate_v3_to_v4(
                     mode='merge',
                     project_root=project_root, tag=group['tag'], task_id=cancel_id,
                 )
+                # Leaving deferred drops its record (plans/deferral-flip-condition-prd.md decision 4).
+                new_metadata = _metadata_without_keys(new_metadata, _CLEARABLE_AUDIT_KEYS)
                 await conn.execute(
                     "UPDATE tasks SET status = 'cancelled', updated_at = ?, "
                     "metadata = ? WHERE tag = ? AND id = ?",
