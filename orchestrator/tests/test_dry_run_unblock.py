@@ -25,10 +25,12 @@ from _orch_helpers import (
 )
 from shared.cli_invoke import (
     AgentFailureKind,
+    AgentResult,
     AllAccountsCappedException,
     classify_agent_failure,
 )
 from shared.config_dir import TaskConfigDir
+from shared.testing import make_gate_mock
 
 from orchestrator.config import OrchestratorConfig, TranscriptArchiveConfig
 from orchestrator.dry_run_unblock import _TASK_EMPTY_STATE, _TASK_UNAVAILABLE_STATE
@@ -1972,6 +1974,73 @@ class TestDryRunCapExhaustionRealLoop:
         assert entry['risk_label'] == 'human-review-required'
         assert entry['files_referenced'] == []
         assert 'capped' in entry['proposal_text'].lower()
+
+
+class TestCapHitRetriesFresh:
+    """A capped investigation retries FRESH through the real cap-retry loop,
+    even when its transcript records progress the default would resume."""
+
+    @pytest.mark.asyncio
+    async def test_capped_investigation_retries_fresh_not_resumed(self, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        gate = make_gate_mock(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
+        scheduler = MagicMock(
+            update_task=AsyncMock(return_value=True),
+            get_task=AsyncMock(return_value=None),
+        )
+        calls: list[dict] = []
+
+        async def _invoke(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                slug_dir = Path(kwargs['config_dir']) / 'projects' / 'p'
+                slug_dir.mkdir(parents=True, exist_ok=True)
+                records = [
+                    {'type': 'user', 'content': 'hi'},
+                    {'type': 'assistant', 'message': {'role': 'assistant', 'content': [
+                        {'type': 'tool_use', 'name': 'Read', 'input': {'file_path': '/tmp/x.py'}},
+                    ]}},
+                ]
+                (slug_dir / f"{kwargs['session_id']}.jsonl").write_text(
+                    '\n'.join(_json.dumps(r) for r in records) + '\n',
+                )
+                return AgentResult(
+                    success=False, output='usage limit', cost_usd=0.5,
+                    session_id=kwargs['session_id'],
+                )
+            return AgentResult(
+                success=True, output='{}', cost_usd=0.5, turns=3, duration_ms=9000,
+                structured_output={
+                    'proposal_text': 'p', 'risk_label': 'low', 'files_referenced': [],
+                },
+            )
+
+        with (
+            patch('orchestrator.dry_run_unblock.invoke_agent', new=AsyncMock(side_effect=_invoke)),
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            await run_dry_run_unblock(
+                task_id='42',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+                usage_gate=gate,
+            )
+
+        assert len(calls) == 2
+        first, retry = calls
+        assert 'resume_session_id' not in retry
+        assert retry['prompt'] == first['prompt']
+        assert retry['session_id'] != first['session_id']
 
 
 # ---------------------------------------------------------------------------
