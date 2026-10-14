@@ -10,13 +10,14 @@ from __future__ import annotations
 import shutil
 import subprocess
 from collections.abc import AsyncIterator, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from shared import task_deferral
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig
@@ -87,6 +88,15 @@ class Stack:
             resolve_project_id(self.root), _EVENT_PEEK_LIMIT,
         )
         return [event for event in buffered if event.type == event_type]
+
+    def with_proc_root(self, proc_root: Path) -> Stack:
+        """This stack's store behind a second interceptor that reads /proc at *proc_root*."""
+        interceptor = TaskInterceptor(
+            self.backend, self.reconciler, self.event_buffer, proc_root=proc_root,
+        )
+        interceptor.set_write_journal(self.journal)
+        server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
+        return replace(self, interceptor=interceptor, server=server)
 
 
 def _git(root: Path, *args: str) -> None:
@@ -185,3 +195,167 @@ def dead_pid() -> int:
     process = _spawn([true_binary])
     process.wait()
     return process.pid
+
+
+def _until_condition(condition: str) -> dict[str, Any]:
+    return {'kind': 'until_condition', 'condition': condition}
+
+
+async def _assert_untouched(stack: Stack, task_id: str, status: str) -> None:
+    row = await stack.read(task_id)
+    assert row['status'] == status, row
+    assert 'deferral' not in row['metadata'], row
+
+
+def _assert_invalid(result: Any, task_id: str, reason_code: str, field: str) -> None:
+    assert result['success'] is False, result
+    assert result['error'] == 'deferral_invalid', result
+    assert result['task_id'] == task_id, result
+    assert result['reason_code'] == reason_code, result
+    assert result['field'] == field, result
+    assert 'value' in result, result
+    assert isinstance(result['hint'], str) and result['hint'], result
+
+
+# Row 1: entering `deferred` needs a record.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('from_status', ['pending', 'in-progress', 'blocked'])
+async def test_entry_without_record_is_refused_and_journalled(
+    stack: Stack, from_status: str,
+) -> None:
+    task_id = await stack.seed(from_status, f'row 1 from {from_status}')
+
+    result = await stack.call('set_task_status', id=task_id, status='deferred')
+
+    assert result['success'] is False, result
+    assert result['error'] == 'deferral_required', result
+    assert result['task_id'] == task_id
+    assert result['from_status'] == from_status
+    assert result['accepted_kinds'] == sorted(k.value for k in task_deferral.CALLER_KINDS)
+    assert isinstance(result['alternatives'], list) and len(result['alternatives']) == 3
+    assert isinstance(result['hint'], str) and result['hint']
+    await _assert_untouched(stack, task_id, from_status)
+    rows = await stack.journal_rows('set_task_status')
+    assert len(rows) == 1, rows
+    assert rows[0]['success'] == 0
+    assert 'deferral_required' in rows[0]['error']
+
+
+# Rows 3, 4 and 26: the record is validated, and a holder is corroborated in /proc.
+
+
+@pytest.mark.asyncio
+async def test_blank_condition_is_deferral_invalid(stack: Stack) -> None:
+    task_id = await stack.seed('pending', 'row 3')
+
+    result = await stack.call(
+        'set_task_status', id=task_id, status='deferred', deferral=_until_condition('  '),
+    )
+
+    _assert_invalid(result, task_id, 'missing_field', 'condition')
+    await _assert_untouched(stack, task_id, 'pending')
+
+
+@pytest.mark.asyncio
+async def test_holder_must_be_a_live_claude_process(
+    stack: Stack, other_process: int, dead_pid: int,
+) -> None:
+    task_id = await stack.seed('pending', 'row 4')
+
+    not_session = await stack.call(
+        'set_task_status', id=task_id, status='deferred',
+        deferral={'kind': 'held_by_session', 'holder_pid': other_process},
+    )
+    not_live = await stack.call(
+        'set_task_status', id=task_id, status='deferred',
+        deferral={'kind': 'held_by_session', 'holder_pid': dead_pid},
+    )
+
+    _assert_invalid(not_session, task_id, 'holder_not_session', 'holder_pid')
+    _assert_invalid(not_live, task_id, 'holder_not_live', 'holder_pid')
+    await _assert_untouched(stack, task_id, 'pending')
+
+
+@pytest.mark.asyncio
+async def test_unreadable_proc_is_holder_unverifiable(
+    stack: Stack, claude_holder: int, tmp_path: Path,
+) -> None:
+    empty_proc = tmp_path / 'empty_proc'
+    empty_proc.mkdir()
+    blind = stack.with_proc_root(empty_proc)
+    task_id = await stack.seed('pending', 'row 26')
+
+    result = await blind.call(
+        'set_task_status', id=task_id, status='deferred',
+        deferral={'kind': 'held_by_session', 'holder_pid': claude_holder},
+    )
+
+    _assert_invalid(result, task_id, 'holder_unverifiable', 'holder_pid')
+    await _assert_untouched(stack, task_id, 'pending')
+
+
+# Row 25 edges and decision 3: request shapes refused before any row is read.
+
+
+@pytest.mark.asyncio
+async def test_request_shape_refusals(stack: Stack) -> None:
+    first = await stack.seed('pending', 'shape first')
+    second = await stack.seed('pending', 'shape second')
+    unrecorded = await stack.seed('deferred', 'shape unrecorded')
+    both = f'{first},{second}'
+    condition = _until_condition('request shape')
+
+    restamp_to_pending = await stack.call(
+        'set_task_status', id=first, status='pending', restamp_only=True,
+    )
+    restamp_csv = await stack.call(
+        'set_task_status', id=both, status='deferred', deferral=condition, restamp_only=True,
+    )
+    expected_csv = await stack.call(
+        'set_task_status', id=both, status='deferred', deferral=condition,
+        expected_stamped_at='2026-10-14T00:00:00+00:00',
+    )
+    deferral_on_pending = await stack.call(
+        'set_task_status', id=first, status='pending', deferral=condition,
+    )
+    restamp_without_record = await stack.call(
+        'set_task_status', id=unrecorded, status='deferred', restamp_only=True,
+    )
+
+    _assert_invalid(restamp_to_pending, first, 'field_not_allowed', 'restamp_only')
+    _assert_invalid(restamp_csv, both, 'cas_needs_single_id', 'id')
+    _assert_invalid(expected_csv, both, 'cas_needs_single_id', 'id')
+    _assert_invalid(deferral_on_pending, first, 'status_not_deferred', 'status')
+    assert restamp_without_record['success'] is False, restamp_without_record
+    assert restamp_without_record['error'] == 'deferral_required', restamp_without_record
+    await _assert_untouched(stack, first, 'pending')
+    await _assert_untouched(stack, second, 'pending')
+    await _assert_untouched(stack, unrecorded, 'deferred')
+
+
+@pytest.mark.asyncio
+async def test_kind_refusals(stack: Stack) -> None:
+    task_id = await stack.seed('pending', 'kind refusals')
+
+    legacy = await stack.call(
+        'set_task_status', id=task_id, status='deferred', deferral={'kind': 'legacy_unknown'},
+    )
+    planning = await stack.call(
+        'set_task_status', id=task_id, status='deferred', deferral={'kind': 'planning'},
+    )
+    no_carrier = await stack.call(
+        'set_task_status', id=task_id, status='deferred',
+        deferral={'kind': 'carried_by', 'carrier_task_id': 999_999},
+    )
+    self_carrier = await stack.call(
+        'set_task_status', id=task_id, status='deferred',
+        deferral={'kind': 'carried_by', 'carrier_task_id': int(task_id)},
+    )
+
+    _assert_invalid(legacy, task_id, 'server_only_kind', 'kind')
+    _assert_invalid(planning, task_id, 'server_only_kind', 'kind')
+    _assert_invalid(no_carrier, task_id, 'carrier_not_found', 'carrier_task_id')
+    _assert_invalid(self_carrier, task_id, 'carrier_is_self', 'carrier_task_id')
+    await _assert_untouched(stack, task_id, 'pending')
