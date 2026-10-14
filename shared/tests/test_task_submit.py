@@ -1,4 +1,4 @@
-"""Tests for shared.task_submit.parse_submit_task_result — the one classification of a
+"""Tests for shared/src/shared/task_submit.py::parse_submit_task_result — the one classification of a
 fused-memory ``submit_task`` response into SubmittedTicket / SubmittedTask / SubmitFailed.
 
 The JSON-RPC body shape is the production one (payload two layers down, in

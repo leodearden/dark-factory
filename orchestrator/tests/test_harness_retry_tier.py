@@ -169,7 +169,7 @@ class TestAutoEvalRedoCarriesBumpedTier:
     """
 
     def _harness(self, tmp_path: Path) -> Harness:
-        harness = Harness(OrchestratorConfig(project_root=tmp_path))
+        harness = Harness(OrchestratorConfig(project_root=tmp_path, auto_eval_enabled=True))
         # Budget OK + no prior redos → straight through to submit_task.
         harness._auto_eval_budget_used_24h = AsyncMock(return_value=0.0)
         harness._find_prior_auto_eval_redos = AsyncMock(return_value=[])

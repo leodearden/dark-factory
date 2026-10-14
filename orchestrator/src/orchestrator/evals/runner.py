@@ -2233,9 +2233,9 @@ class _StubMcpSession:
     ``set_task_status``, ``get_task``, ``get_tasks``, ``get_statuses``,
     ``update_task``, ``set_task_claimant``, ``get_external_statuses``,
     ``submit_task`` (plus ``add_dependency``, stubbed defensively though not
-    yet dispatched).  The
-    ``test_scheduler_dispatch_literal_tripwire`` guard asserts every dispatched
-    literal has a branch here.  Any other tool name raises ``NotImplementedError``.
+    yet dispatched).  The ``test_scheduler_dispatch_literal_tripwire`` guard
+    asserts every dispatched literal has a branch here.  Any other tool name
+    raises ``NotImplementedError``.
     """
 
     def __init__(self) -> None:
