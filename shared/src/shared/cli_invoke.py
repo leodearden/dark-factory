@@ -124,9 +124,13 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 #                                         stall.
 #
 # orchestrator/harness.py                 14-day default OK for both sites.
-#   (module tagging + watcher rotation)   AllAccountsCappedException handlers
-#                                         log and return / supervisor-driven
-#                                         restart; neither blocks a queue.
+#   (module tagging + watcher rotation)   Module tagging: the handler logs and
+#                                         returns.  Watcher rotation: also
+#                                         max_cap_retries=16, and a cap hit
+#                                         retries FRESH (resume_on_cap_hit=
+#                                         False); AllAccountsCappedException
+#                                         takes the supervisor's unclean path.
+#                                         Neither blocks a queue.
 #
 # fused_memory/middleware/task_curator.py _CURATOR_CAP_WAIT_SANITY_SECS=120s
 #   (LLM triage calls)                    + park_on_frozen_pool=False.  DEFERS,

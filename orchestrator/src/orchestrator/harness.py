@@ -401,6 +401,10 @@ _WATCHER_TIMEOUT_GRACE_SECS: float = 300.0
 # Maximum backoff between unclean watcher exits (seconds).
 _WATCHER_MAX_BACKOFF_SECS: float = 3600.0
 
+# Cap-retry bound for one rotation; past it the supervisor's fresh relaunch and
+# crashloop guard own recovery (mirrors steward.py::_MAX_CAP_RETRIES).
+_WATCHER_MAX_CAP_RETRIES: int = 16
+
 # Fixed quiescent gap after a failed background-loop pass (seconds). Shared by
 # the main-tip sweep and no-landings breaker loops. Guarantees neither loop can
 # tight-spin on a pass that fails immediately, even if the configured interval
@@ -14413,7 +14417,9 @@ class Harness:
         final message.  The supervisor-side timeout is rotation_hours*3600 +
         _WATCHER_TIMEOUT_GRACE_SECS so that a wedged agent that ignores its
         own rotation instructions is force-killed (classified as unclean, feeds
-        the crashloop guard).
+        the crashloop guard).  An exhausted cap-retry bound raises
+        AllAccountsCappedException, which the supervisor treats as an unclean
+        exit.
         """
 
         cfg = self.config
@@ -14527,6 +14533,10 @@ class Harness:
             project_id=cfg.fused_memory.project_id,
             role='escalation-watcher-auto',
             task_id='',
+            # A stateless triage loop over a queue it re-reads every cycle, so a
+            # capped rotation retries fresh.
+            resume_on_cap_hit=False,
+            max_cap_retries=_WATCHER_MAX_CAP_RETRIES,
             prompt=user_prompt,
             system_prompt=system_prompt,
             cwd=cfg.project_root,
