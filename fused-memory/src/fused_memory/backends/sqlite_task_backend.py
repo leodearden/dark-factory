@@ -4590,8 +4590,8 @@ def _merge_metadata(
       :func:`_assert_done_provenance_passthrough`.
     * ``'merge'`` — shallow last-write-wins: ``{**existing, **incoming}``.
       Omitted keys are preserved; every supplied key (scalar **or** list)
-      overwrites wholesale.  Falls back to ``incoming`` when either side is
-      valid JSON but not a dict.
+      overwrites wholesale.  Falls back to ``incoming`` when the existing
+      blob is valid JSON but not a dict.
     * ``'additive'`` — existing recursive ``_merge_values`` semantics: list
       union+dedup, dict-recursive, scalar/type-collision OLD-wins.  Keeps the
       legacy ``memory_hints`` list-shape normalisation before the dict union.
@@ -4603,12 +4603,16 @@ def _merge_metadata(
 
     A ``None`` ``existing_raw`` is treated as empty: ``incoming`` is returned
     for all three modes (nothing to preserve or merge into).
+
+    ``incoming`` must be a JSON object in every mode, otherwise
+    :class:`MetadataNotAnObjectError` — the same rule, through the same
+    helper (:func:`_metadata_object_or_raise`), as update_task's floor.
     """
+    new = _metadata_object_or_raise(incoming, None if task_id is None else str(task_id))
     # replace (or no existing data): return incoming verbatim, no guard.
     if existing_raw is None or mode == 'replace':
         return incoming
-    # merge and additive: parse the existing blob first so a corrupt EXISTING
-    # blob is distinguishable from a corrupt incoming blob.
+    # merge and additive: a corrupt EXISTING blob is refused, not clobbered.
     try:
         old = json.loads(existing_raw)
     except (TypeError, ValueError) as err:
@@ -4625,13 +4629,7 @@ def _merge_metadata(
             f'(original bytes preserved).',
             raw=existing_raw,
         ) from err
-    # Corrupt INCOMING blob: intentionally last-write-wins (pre-existing
-    # Taskmaster fallback behaviour).
-    try:
-        new = json.loads(incoming)
-    except (TypeError, ValueError):
-        return incoming
-    if not isinstance(old, dict) or not isinstance(new, dict):
+    if not isinstance(old, dict):
         return incoming
     if mode == 'merge':
         # Shallow last-write-wins: every supplied key overwrites wholesale.
@@ -4689,9 +4687,9 @@ def _strip_reserved_control_keys(
     """String wrapper around :func:`_drop_reserved_control_keys`.
 
     Fail-safe passthrough: a corrupt/non-JSON ``incoming`` string, or valid
-    JSON that is not an object, is returned UNCHANGED — preserving
-    :func:`_merge_metadata`'s own corrupt-incoming last-write-wins and
-    non-dict-incoming fallback behavior. This wrapper never raises.
+    JSON that is not an object, is returned UNCHANGED. This wrapper still
+    never raises; refusing a non-object payload belongs to
+    :func:`_metadata_object_or_raise`.
     """
     try:
         parsed = json.loads(incoming)

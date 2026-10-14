@@ -2180,8 +2180,8 @@ def test_strip_reserved_control_keys_no_op_returns_equivalent_when_absent():
 
 
 def test_strip_reserved_control_keys_passthrough_on_corrupt_json():
-    """(d) Fail-safe: a corrupt/non-JSON string is returned UNCHANGED (identity-preserving),
-    matching _merge_metadata's corrupt-incoming last-write-wins fallback."""
+    """(d) Fail-safe: a corrupt/non-JSON string is returned UNCHANGED (identity-preserving);
+    this wrapper never raises, refusing it is _metadata_object_or_raise's job."""
     from fused_memory.backends.sqlite_task_backend import _strip_reserved_control_keys
 
     incoming = 'NOT_JSON'
@@ -2190,8 +2190,8 @@ def test_strip_reserved_control_keys_passthrough_on_corrupt_json():
 
 @pytest.mark.parametrize('incoming', ['[1,2]', '"s"'])
 def test_strip_reserved_control_keys_passthrough_on_non_dict_json(incoming):
-    """(d) Fail-safe: valid-but-non-dict JSON is returned UNCHANGED, matching
-    _merge_metadata's non-dict-incoming fallback (returns incoming verbatim)."""
+    """(d) Fail-safe: valid-but-non-dict JSON is returned UNCHANGED; this wrapper
+    never raises, refusing it is _metadata_object_or_raise's job."""
     from fused_memory.backends.sqlite_task_backend import _strip_reserved_control_keys
 
     assert _strip_reserved_control_keys(incoming) is incoming
