@@ -2,13 +2,13 @@
 
 import asyncio
 import contextlib
-import json
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 from _fm_helpers import QDRANT_URL, collection_vector_size, qdrant_skipif
+from _qdrant_responses import missing_collection_404
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
@@ -1954,18 +1954,14 @@ class TestIsMissingCollectionError:
         assert is_missing_collection_error(TimeoutError()) is False
 
 
-def _missing_collection_404(collection: str) -> UnexpectedResponse:
-    """Qdrant's 404 for an absent collection, with the body a live scroll/count returns."""
-    body = {'status': {'error': f"Not found: Collection `{collection}` doesn't exist!"}}
-    return UnexpectedResponse(404, 'Not Found', json.dumps(body).encode(), httpx.Headers())
-
-
 _ABSENT_SCOPE = Scope(project_id='solar_challenge')
 _ABSENT_FILTERS = {'kind': 'project_status_correction'}
 
-_SCOPED_METADATA_READS = [
-    pytest.param('scroll_by_metadata', 'scroll', [], id='scroll'),
-    pytest.param('count_by_metadata', 'count', 0, id='count'),
+_SCOPED_METADATA_READS = ['scroll_by_metadata', 'count_by_metadata']
+
+_EMPTY_READ_RESULTS = [
+    pytest.param('scroll_by_metadata', [], id='scroll'),
+    pytest.param('count_by_metadata', 0, id='count'),
 ]
 
 _PROPAGATING_FAILURES = [
@@ -2003,9 +1999,10 @@ class TestMem0BackendMetadataReadsOnAbsentCollection:
     """
 
     @staticmethod
-    async def _read_raising(backend, op: str, client_attr: str, exc: BaseException):
+    async def _read_raising(backend, op: str, exc: BaseException):
         mock_client = AsyncMock()
-        setattr(mock_client, client_attr, AsyncMock(side_effect=exc))
+        mock_client.scroll = AsyncMock(side_effect=exc)
+        mock_client.count = AsyncMock(side_effect=exc)
         with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
             return await getattr(backend, op)(scope=_ABSENT_SCOPE, filters=_ABSENT_FILTERS)
 
@@ -2014,24 +2011,22 @@ class TestMem0BackendMetadataReadsOnAbsentCollection:
         return _ABSENT_SCOPE.mem0_collection_name(backend.config.mem0.collection_prefix)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(('op', 'client_attr', 'empty'), _SCOPED_METADATA_READS)
-    async def test_missing_collection_reads_as_empty(self, backend, op, client_attr, empty):
-        exc = _missing_collection_404(self._collection(backend))
+    @pytest.mark.parametrize(('op', 'empty'), _EMPTY_READ_RESULTS)
+    async def test_missing_collection_reads_as_empty(self, backend, op, empty):
+        exc = missing_collection_404(self._collection(backend))
 
-        result = await self._read_raising(backend, op, client_attr, exc)
+        result = await self._read_raising(backend, op, exc)
 
         assert result == empty
         assert type(result) is type(empty)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(('op', 'client_attr', 'empty'), _SCOPED_METADATA_READS)
-    async def test_missing_collection_is_disclosed_at_info(
-        self, backend, caplog, op, client_attr, empty,
-    ):
+    @pytest.mark.parametrize('op', _SCOPED_METADATA_READS)
+    async def test_missing_collection_is_disclosed_at_info(self, backend, caplog, op):
         collection = self._collection(backend)
 
         with caplog.at_level(logging.INFO, logger='fused_memory.backends.mem0_client'):
-            await self._read_raising(backend, op, client_attr, _missing_collection_404(collection))
+            await self._read_raising(backend, op, missing_collection_404(collection))
 
         disclosures = [
             r for r in caplog.records
@@ -2044,13 +2039,11 @@ class TestMem0BackendMetadataReadsOnAbsentCollection:
         assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(('op', 'client_attr', 'empty'), _SCOPED_METADATA_READS)
+    @pytest.mark.parametrize('op', _SCOPED_METADATA_READS)
     @pytest.mark.parametrize(('make_failure', 'raised'), _PROPAGATING_FAILURES)
-    async def test_other_failures_still_propagate(
-        self, backend, op, client_attr, empty, make_failure, raised,
-    ):
+    async def test_other_failures_still_propagate(self, backend, op, make_failure, raised):
         with pytest.raises(raised):
-            await self._read_raising(backend, op, client_attr, make_failure())
+            await self._read_raising(backend, op, make_failure())
 
 
 @pytest.fixture

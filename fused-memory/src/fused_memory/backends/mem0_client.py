@@ -395,11 +395,9 @@ class Mem0Backend:
     ) -> _T:
         """:meth:`_timed_read`, reading a provably-absent collection as *if_absent*.
 
-        Only :func:`is_missing_collection_error` degrades; a timeout and every
-        other failure propagate per the class TIMEOUT POSTURE.  The catch is
-        reactive, never a ``collection_exists`` pre-check, so the hot pool-GC
-        loops pay no extra round-trip.  The INFO lets an operator tell
-        "collection absent" from "collection genuinely empty".
+        Only :func:`is_missing_collection_error` degrades: it returns
+        *if_absent* and logs the collection at INFO.  A timeout and every other
+        failure propagate per the class TIMEOUT POSTURE.
         """
         try:
             return await self._timed_read(awaitable, op)

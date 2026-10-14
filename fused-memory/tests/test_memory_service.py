@@ -11,6 +11,7 @@ import httpx
 import pytest
 from _fm_helpers import _make_rate_limit_error
 from _mem0_record_shapes import mem0_record
+from _qdrant_responses import missing_collection_404
 from qdrant_client.http.exceptions import UnexpectedResponse
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
@@ -10991,12 +10992,6 @@ class TestCountMemoriesByMetadata:
         assert isinstance(filters['task_id'], int)
 
 
-def _missing_collection_404(collection: str) -> UnexpectedResponse:
-    """Qdrant's 404 for an absent collection, with the body a live scroll/count returns."""
-    body = {'status': {'error': f"Not found: Collection `{collection}` doesn't exist!"}}
-    return UnexpectedResponse(404, 'Not Found', json.dumps(body).encode(), httpx.Headers())
-
-
 class TestMetadataReadsOnAbsentCollection:
     """Both service-level metadata reads inherit the backend's absent-collection
     degradation through their passthrough, so every caller of either one reads
@@ -11008,7 +11003,8 @@ class TestMetadataReadsOnAbsentCollection:
 
     _PROJECT = 'solar_challenge'
     _FILTERS = {'kind': 'project_status_correction'}
-    _READS = [
+    _READS = ['get_memories_by_metadata', 'count_memories_by_metadata']
+    _EMPTY_READ_RESULTS = [
         pytest.param('get_memories_by_metadata', [], id='get'),
         pytest.param('count_memories_by_metadata', 0, id='count'),
     ]
@@ -11023,22 +11019,22 @@ class TestMetadataReadsOnAbsentCollection:
             return await getattr(svc, read)(project_id=cls._PROJECT, filters=cls._FILTERS)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(('read', 'empty'), _READS)
+    @pytest.mark.parametrize(('read', 'empty'), _EMPTY_READ_RESULTS)
     async def test_absent_collection_reads_as_empty(self, mock_config, read, empty):
         collection = Scope(project_id=self._PROJECT).mem0_collection_name(
             mock_config.mem0.collection_prefix,
         )
 
         result = await self._read_with_qdrant_raising(
-            mock_config, read, _missing_collection_404(collection),
+            mock_config, read, missing_collection_404(collection),
         )
 
         assert result == empty
         assert type(result) is type(empty)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(('read', 'empty'), _READS)
-    async def test_backend_failure_still_raises(self, mock_config, read, empty):
+    @pytest.mark.parametrize('read', _READS)
+    async def test_backend_failure_still_raises(self, mock_config, read):
         failure = UnexpectedResponse(500, 'Internal Server Error', b'boom', httpx.Headers())
 
         with pytest.raises(UnexpectedResponse):

@@ -12,6 +12,7 @@ from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
 import httpx
 import pytest
 import pytest_asyncio
+from _qdrant_responses import missing_collection_404
 from qdrant_client.http.exceptions import UnexpectedResponse
 from shared.config_dir import TaskConfigDir
 from shared.project_layout import escalation_queue_dir
@@ -19119,12 +19120,6 @@ class TestHarnessIndexHealthStartupSweep:
 # ── Tests for task 1938: harness._reconcile_status_correction ──────────────────
 
 
-def _missing_collection_404(collection: str) -> UnexpectedResponse:
-    """Qdrant's 404 for an absent collection, with the body a live scroll returns."""
-    body = {'status': {'error': f"Not found: Collection `{collection}` doesn't exist!"}}
-    return UnexpectedResponse(404, 'Not Found', json.dumps(body).encode(), httpx.Headers())
-
-
 @contextlib.contextmanager
 def _real_metadata_read_raising(harness, config, scroll_failure: BaseException):
     """Route ``harness.memory.get_memories_by_metadata`` through a REAL
@@ -19473,7 +19468,7 @@ class TestHarnessReconcileStatusCorrection:
         collection = Scope(project_id='solar_challenge').mem0_collection_name(
             mock_config.mem0.collection_prefix,
         )
-        missing = _missing_collection_404(collection)
+        missing = missing_collection_404(collection)
 
         with (
             _real_metadata_read_raising(harness, mock_config, missing),
