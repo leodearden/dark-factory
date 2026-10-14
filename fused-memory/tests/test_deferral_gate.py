@@ -11,6 +11,7 @@ import shutil
 import subprocess
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -359,3 +360,93 @@ async def test_kind_refusals(stack: Stack) -> None:
     _assert_invalid(no_carrier, task_id, 'carrier_not_found', 'carrier_task_id')
     _assert_invalid(self_carrier, task_id, 'carrier_is_self', 'carrier_task_id')
     await _assert_untouched(stack, task_id, 'pending')
+
+
+# Rows 2 and 27 (entry): each caller kind enters `deferred`, stored and echoed.
+
+_AGENT = 'claude-test-6525'
+
+
+async def _deferral_of_kind(stack: Stack, kind: str, holder_pid: int) -> dict[str, Any]:
+    if kind == 'carried_by':
+        carrier = await stack.seed('pending', f'carrier for {kind}')
+        return {'kind': 'carried_by', 'carrier_task_id': int(carrier)}
+    if kind == 'until_condition':
+        expires_at = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+        return {'kind': 'until_condition', 'condition': 'row 2', 'expires_at': expires_at}
+    return {'kind': 'held_by_session', 'holder_pid': holder_pid, 'grace_secs': 600}
+
+
+_STORED_VARIANTS = {
+    'carried_by': task_deferral.CarriedByDeferral,
+    'until_condition': task_deferral.UntilConditionDeferral,
+    'held_by_session': task_deferral.HeldBySessionDeferral,
+}
+
+
+async def _enter(stack: Stack, task_id: str, deferral: dict[str, Any]) -> dict:
+    result = await stack.call(
+        'set_task_status', id=task_id, status='deferred', deferral=deferral, agent_id=_AGENT,
+    )
+    assert 'error' not in result, result
+    return result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', sorted(_STORED_VARIANTS))
+@pytest.mark.parametrize('from_status', ['pending', 'in-progress', 'blocked'])
+async def test_each_caller_kind_enters_deferred(
+    stack: Stack, claude_holder: int, from_status: str, kind: str,
+) -> None:
+    task_id = await stack.seed(from_status, f'row 2 {kind} from {from_status}')
+    deferral = await _deferral_of_kind(stack, kind, claude_holder)
+
+    result = await _enter(stack, task_id, deferral)
+
+    row = await stack.read(task_id)
+    assert row['status'] == 'deferred'
+    stored = row['metadata']['deferral']
+    record = task_deferral.parse_record(stored)
+    assert isinstance(record, _STORED_VARIANTS[kind]), record
+    assert record.stamped_by == _AGENT
+    assert record.deferred_at == record.stamped_at
+    if isinstance(record, task_deferral.HeldBySessionDeferral):
+        assert record.holder.pid == claude_holder
+        assert record.holder.boot_id
+    assert isinstance(result['deferral'], dict)
+    assert result['deferral'] == stored
+
+
+@pytest.mark.asyncio
+async def test_entry_event_carries_the_record(stack: Stack) -> None:
+    task_id = await stack.seed('pending', 'entry event')
+
+    await _enter(stack, task_id, _until_condition('entry event'))
+
+    stored = (await stack.read(task_id))['metadata']['deferral']
+    payloads = [
+        event.payload for event in await stack.events('task_status_changed')
+        if event.payload['task_id'] == task_id
+    ]
+    assert len(payloads) == 1, payloads
+    assert payloads[0]['deferral'] == stored
+
+
+@pytest.mark.asyncio
+async def test_csv_entry_applies_one_record_to_every_id(stack: Stack) -> None:
+    first = await stack.seed('pending', 'csv entry first')
+    second = await stack.seed('pending', 'csv entry second')
+
+    result = await stack.call(
+        'set_task_status', id=f'{first},{second}', status='deferred',
+        deferral=_until_condition('csv entry'), agent_id=_AGENT,
+    )
+
+    assert result['success'] is True, result
+    stored = [(await stack.read(task_id))['metadata']['deferral'] for task_id in (first, second)]
+    records = [task_deferral.parse_record(raw) for raw in stored]
+    assert all(isinstance(r, task_deferral.UntilConditionDeferral) for r in records), records
+    assert stored[0]['condition'] == stored[1]['condition'] == 'csv entry'
+    assert stored[0]['stamped_at'] == stored[1]['stamped_at']
+    echoes = [one['result']['deferral'] for one in result['results']]
+    assert echoes == stored
