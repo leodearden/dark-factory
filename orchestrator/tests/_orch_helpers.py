@@ -259,7 +259,7 @@ PYPROJECT_DEFAULT_TIMEOUT = 420
 # never fall below PYPROJECT_DEFAULT_TIMEOUT, or a module-level mark meant as
 # a FLOOR would start narrowing its module below the global default (pinned by
 # test_whole_tree_scan_timeout_guard.py).
-WHOLE_TREE_SCAN_TEST_TIMEOUT = 600
+WHOLE_TREE_SCAN_TEST_TIMEOUT = 1200
 
 # Headroom a per-test ceiling must keep over its family's measured-under-load
 # worst case.  8x rather than 2x: the xdist worker deaths these ceilings exist

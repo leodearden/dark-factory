@@ -120,7 +120,7 @@ _MEASURED_UNDER_LOAD_WORST_CASE = 148.65
 # derivation was dropped when the ini default was raised 60 -> 300 (for
 # host-contention reasons of its own), because carrying the multiple forward
 # would have set the family ceiling to 1500s on no measurement at all.
-_ABSOLUTE_FLOOR_SECONDS = 600
+_ABSOLUTE_FLOOR_SECONDS = 1200
 
 # Resolved from _orch_helpers' shared anchor, which is itself resolved from
 # THAT file and never from the process CWD: merge-verify runs pytest from the
@@ -216,10 +216,11 @@ class TestTimeoutConstants:
           esc-3787-1), i.e. past the 60s default then in force;
         * 51.87s setup for test_merge_lane_ratchet.py under task 5442's full
           suite -- the anchor until task 6556;
-        * 73.47s per-test total for
-          test_timeout_marker_inversion_guard.py::test_no_timeout_marker_sits_in_the_inversion_band
-          under task 5581's verify (2026-10-09, ``-n 8``, loadavg 156 -> 64)
-          -- the current anchor, ``_MEASURED_UNDER_LOAD_WORST_CASE``.
+        * 148.65s per-test total for
+          test_merge_lane_ratchet.py::TestLanePatchTargets::test_real_tree_union_anchor
+          under task 3165's verify (2026-10-08, ``-n 8``, loadavg 64 -> 79),
+          the worst of the verify-log archive across every module marked with
+          this constant -- the current anchor, ``_MEASURED_UNDER_LOAD_WORST_CASE``.
 
         The floor clears 8 x the anchor, and the constant clears both the floor
         and the ini default.  Asserted as ``>=`` rather than ``==`` so raising the

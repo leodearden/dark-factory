@@ -80,8 +80,9 @@ from shared.testing_timeout_markers import (
 # This module is ITSELF a whole-tree AST scanner -- it rglob()s every *.py
 # under this directory and ast.parse()s each one -- so it is a member of the
 # family test_whole_tree_scan_timeout_guard.py polices and carries the mark
-# that guard demands.  WHOLE_TREE_SCAN_TEST_TIMEOUT is 300, at the inversion
-# band's OPEN upper edge, so this module does not flag its own mark.
+# that guard demands.  WHOLE_TREE_SCAN_TEST_TIMEOUT sits at or above the
+# inversion band's OPEN upper edge, VERIFY_CLI_PER_TEST_TIMEOUT, so this module
+# does not flag its own mark.
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 #: The per-module merge-verify config whose ``test_command`` carries the
