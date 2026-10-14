@@ -110,6 +110,7 @@ class TestApplySpecToHostConfig:
             'global_verify_command': None,
             'module_configs': [],
             'field_overrides': {},
+            'verify_cold_preprovision_command': '',
         }
         return apply_spec_to_host_config(config, **{**arguments, **overrides})
 
@@ -181,8 +182,27 @@ class TestApplySpecToHostConfig:
         with pytest.raises(TypeError, match=field):
             self._apply(_host_config(tmp_path), field_overrides={field: value})
 
+    def test_non_empty_preprovision_replaces_the_hosts(self, tmp_path: Path):
+        config = _host_config(tmp_path, verify_cold_preprovision_command='host-prep')
+
+        applied = self._apply(config, verify_cold_preprovision_command='spec-prep')
+
+        assert applied.verify_cold_preprovision_command == 'spec-prep'
+
+    def test_empty_preprovision_keeps_the_hosts(self, tmp_path: Path):
+        config = _host_config(tmp_path, verify_cold_preprovision_command='host-prep')
+
+        applied = self._apply(config, verify_cold_preprovision_command='')
+
+        assert applied.verify_cold_preprovision_command == 'host-prep'
+
+    @pytest.mark.parametrize('value', [1, None])
+    def test_mistyped_preprovision_is_rejected_naming_it(self, tmp_path: Path, value: object):
+        with pytest.raises(TypeError, match=r'OrchestratorConfig\.verify_cold_preprovision_command'):
+            self._apply(_host_config(tmp_path), verify_cold_preprovision_command=value)
+
     def test_caller_config_is_not_mutated(self, tmp_path: Path):
-        config = _host_config(tmp_path)
+        config = _host_config(tmp_path, verify_cold_preprovision_command='host-prep')
         host_modules = {'host/only': ModuleConfig(prefix='host/only')}
         config._module_configs = host_modules
         original_env = dict(config.verify_env)
@@ -192,11 +212,13 @@ class TestApplySpecToHostConfig:
             config,
             verify_env={'SHARED': 'spec'},
             module_configs=[ModuleConfig(prefix='a')],
+            verify_cold_preprovision_command='spec-prep',
         )
 
         assert config.verify_env == original_env
         assert config.module_configs_or_empty is original_registry
         assert original_registry == {'host/only': ModuleConfig(prefix='host/only')}
+        assert config.verify_cold_preprovision_command == 'host-prep'
 
 
 class TestCanonicalJson:

@@ -3634,6 +3634,10 @@ class OrchestratorConfig(BaseSettings):
     # verify_env): read fresh each verify with no in-flight-split risk.
     # Deliberately NOT in _OVERRIDABLE_FIELDS — it is a whole-worktree concern,
     # not a per-module override.
+    # Remote verifies receive this value in their spec (MergeVerifySpec /
+    # TaskVerifySpec, applied by verify_spec_shared.py::apply_spec_to_host_config),
+    # so the deployed value still lives only in dark-factory-orchestrator.yaml,
+    # and a remote host's copy is a fallback.
     verify_cold_preprovision_command: str = Field(default='')
 
     # Per-model USD/1M-token prices for backends without native cost

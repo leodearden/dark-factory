@@ -5,6 +5,7 @@ import concurrent.futures
 import contextlib
 import errno
 import fnmatch
+import functools
 import gzip
 import hashlib
 import json
@@ -76,6 +77,7 @@ from orchestrator.verify_classify import (
     classify_failure,
     is_external_kill_rc,
     is_interpreter_missing_workspace_packages,
+    is_partially_provisioned_venv_type_failure,
     unresolved_top_level_modules,
 )
 from orchestrator.verify_cmd import (
@@ -2300,6 +2302,57 @@ def _worker_death_leg_note(label: str) -> str:
     )
 
 
+def _classify_leg(rc: int, out: str, timed_out: bool, cmd: str | None) -> FailureCategory:
+    return classify_failure(_tool_for_cmd(cmd), rc, out, timed_out)
+
+
+def _type_leg_read_partially_provisioned_venv(
+    rc: int, out: str, timed_out: bool, cmd: str | None, *, test_rc: int, test_cmd: str | None,
+) -> bool:
+    """True when task 6127's cross-leg refinement decides the TYPE leg.
+
+    Only an UNKNOWN_TEST_FAILURE fall-through qualifies, so every
+    ``classify_failure`` guard and every specific per-tool category stays
+    authoritative.  The output must show a partially provisioned venv that the
+    same run's passing pytest leg corroborates
+    (``verify_classify.py::is_partially_provisioned_venv_type_failure``).
+    ``_classify_type_leg`` and ``_warn_if_type_leg_read_partially_provisioned_venv``
+    both ask this one question, so the log never disagrees with the category.
+    """
+    return _classify_leg(rc, out, timed_out, cmd) == FailureCategory.UNKNOWN_TEST_FAILURE and (
+        is_partially_provisioned_venv_type_failure(
+            out, test_tool=_tool_for_cmd(test_cmd), test_leg_passed=test_rc == 0,
+        )
+    )
+
+
+def _classify_type_leg(
+    rc: int, out: str, timed_out: bool, cmd: str | None, *, test_rc: int, test_cmd: str | None,
+) -> FailureCategory:
+    if _type_leg_read_partially_provisioned_venv(
+        rc, out, timed_out, cmd, test_rc=test_rc, test_cmd=test_cmd,
+    ):
+        return FailureCategory.ENV_TRANSIENT
+    return _classify_leg(rc, out, timed_out, cmd)
+
+
+def _warn_if_type_leg_read_partially_provisioned_venv(attempt: 'VerifyAttempt') -> None:
+    type_leg, test_leg = attempt.type, attempt.test
+    if not _type_leg_read_partially_provisioned_venv(
+        type_leg.rc, type_leg.output, type_leg.timed_out, type_leg.cmd,
+        test_rc=test_leg.rc, test_cmd=test_leg.cmd,
+    ):
+        return
+    logger.warning(
+        'Verification type check failed with %d distinct unresolved top-level '
+        'modules while the same run\'s pytest leg passed: pyright read a venv '
+        'that was still being provisioned. This is an ENVIRONMENT fault, NOT a '
+        'branch defect. Likely fix surface: verify_cold_preprovision_command '
+        'is missing or failing on the verifying host. See task 6127.',
+        len(unresolved_top_level_modules(type_leg.output)),
+    )
+
+
 def _summarize_checks(
     test_rc: int, test_out: str, test_timed_out: bool, test_cmd: str | None,
     lint_rc: int, lint_out: str, lint_timed_out: bool, lint_cmd: str | None,
@@ -2384,18 +2437,19 @@ def _summarize_checks(
     if passed:
         return True, 'passed', '', 'All checks passed', []
 
+    classify_type_leg = functools.partial(_classify_type_leg, test_rc=test_rc, test_cmd=test_cmd)
     hint_parts = []
     per_check_categories: list[str] = []
-    for rc, out, to, cmd in (
-        (test_rc, test_out, test_timed_out, test_cmd),
-        (lint_rc, lint_out, lint_timed_out, lint_cmd),
-        (type_rc, type_out, type_timed_out, type_cmd),
+    for rc, out, to, cmd, classify in (
+        (test_rc, test_out, test_timed_out, test_cmd, _classify_leg),
+        (lint_rc, lint_out, lint_timed_out, lint_cmd, _classify_leg),
+        (type_rc, type_out, type_timed_out, type_cmd, classify_type_leg),
     ):
         if rc != 0:
             h = _extract_cause_hint(out)
             if h:
                 hint_parts.append(h)
-            per_check_categories.append(classify_failure(_tool_for_cmd(cmd), rc, out, to))
+            per_check_categories.append(classify(rc, out, to, cmd))
     cause_hint = ' | '.join(hint_parts)
     category = _worst_category(per_check_categories) if per_check_categories else 'unknown_test_failure'
 
@@ -7442,6 +7496,8 @@ async def run_verification(
             # the pure-timeout retry loop, so "after {max_retries} retries"
             # would misdescribe it.
             summary = 'Verification timed out during env-recovery retry'
+
+    _warn_if_type_leg_read_partially_provisioned_venv(attempt)
 
     # Bare pytest-xdist worker-crash retry (task 2365): under host overload a
     # starved xdist worker is os._exit()'d by pytest-timeout's thread method,

@@ -316,6 +316,13 @@ class MergeVerifySpec:
                           config globals — the fidelity fix for INV-1 (task 2883,
                           incident 966f23a6). None when module_configs is
                           non-empty (per-module verify_commands drive the gate).
+    verify_cold_preprovision_command : the project's cold-worktree pre-provision
+                          command, which verify.py::_preprovision_shared_venv
+                          runs before the gather. Applied by
+                          verify_spec_shared.py::apply_spec_to_host_config under
+                          TaskVerifySpec's rule: non-empty replaces the host's
+                          value, '' keeps the host's own. '' is also what a
+                          pre-6127 dispatcher's spec decodes to.
 
     Note
     ----
@@ -342,6 +349,8 @@ class MergeVerifySpec:
     # project, shipped so the remote runs the SAME gate as local. Narrow default
     # None matches every existing spec (module_configs non-empty → not sourced).
     global_verify_command: VerifyCommand | None = None
+    # Task 6127 — the dispatcher's pre-provision command; '' keeps the host's.
+    verify_cold_preprovision_command: str = ''
 
     def to_dict(self) -> dict:
         return {
@@ -358,6 +367,7 @@ class MergeVerifySpec:
                 if self.global_verify_command is not None
                 else None
             ),
+            "verify_cold_preprovision_command": self.verify_cold_preprovision_command,
         }
 
     @classmethod
@@ -380,6 +390,7 @@ class MergeVerifySpec:
             global_verify_command=(
                 VerifyCommand.from_dict(_gvc) if _gvc is not None else None
             ),
+            verify_cold_preprovision_command=d.get("verify_cold_preprovision_command", ""),
         )
 
 
@@ -485,6 +496,7 @@ def build_merge_verify_spec(
         merge_verify_workspace=config.merge_verify_workspace,
         merge_verify_breadth=config.merge_verify_breadth,
         global_verify_command=global_verify_command_for(config, verify_commands),
+        verify_cold_preprovision_command=config.verify_cold_preprovision_command,
     )
 
 
@@ -581,7 +593,8 @@ async def run_merge_verify_on_worktree(
     task_files = tuple(spec.task_files) if spec.task_files is not None else None
 
     # Fix (a), task 2822 — the merge-deciding profile rides the spec, so the
-    # host's own --config can no longer narrow it.
+    # host's own --config can no longer narrow it; task 6127 — nor skip the
+    # dispatcher's cold-venv pre-provision.
     config = apply_spec_to_host_config(
         config,
         verify_env=spec.verify_env,
@@ -591,6 +604,7 @@ async def run_merge_verify_on_worktree(
             'merge_verify_workspace': spec.merge_verify_workspace,
             'merge_verify_breadth': spec.merge_verify_breadth,
         },
+        verify_cold_preprovision_command=spec.verify_cold_preprovision_command,
     )
 
     runner = LocalRunner(

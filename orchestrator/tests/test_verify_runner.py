@@ -284,6 +284,38 @@ class TestMergeVerifySpec:
         assert restored.global_verify_command == spec.global_verify_command
         assert restored == spec
 
+    # --- task 6127: the cold-worktree pre-provision command rides the spec ---
+
+    def test_verify_cold_preprovision_command_round_trips(self):
+        provision = 'uv sync --all-packages && npm ci --no-audit --no-fund --prefer-offline'
+        spec = dataclasses.replace(
+            self._make_spec(), verify_cold_preprovision_command=provision,
+        )
+        restored = MergeVerifySpec.from_dict(spec.to_dict())
+        assert restored == spec
+        assert restored.verify_cold_preprovision_command == provision
+        from_wire = spec_from_json(spec_to_json(spec))
+        assert from_wire == spec
+        assert from_wire.verify_cold_preprovision_command == provision
+
+    def test_verify_cold_preprovision_command_defaults_empty(self):
+        spec = MergeVerifySpec(
+            verify_commands=(VerifyCommand(prefix="src/a"),),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=None,
+            verify_env={},
+            cold_timeout_secs=60.0,
+        )
+        assert spec.verify_cold_preprovision_command == ''
+
+    def test_from_dict_back_compat_missing_verify_cold_preprovision_command(self):
+        """BACK-COMPAT: a pre-6127 dispatcher's dict lacks the key and decodes
+        to '', which leaves the consuming host's own value in force."""
+        legacy = self._make_spec().to_dict()
+        legacy.pop("verify_cold_preprovision_command", None)
+        restored = MergeVerifySpec.from_dict(legacy)
+        assert restored.verify_cold_preprovision_command == ''
+
 
 # ---------------------------------------------------------------------------
 # VerifyResult codec  (result_to_dict / result_from_dict)
@@ -1970,6 +2002,8 @@ class TestBuildMergeVerifySpec:
         config.test_command = test_cmd
         config.lint_command = lint_cmd
         config.type_check_command = type_check_cmd
+        # Task 6127: projected onto the spec, so it needs a real (JSON-native) value.
+        config.verify_cold_preprovision_command = ''
         return config
 
     def test_verify_commands_project_module_fields(self):
@@ -2144,6 +2178,20 @@ class TestBuildMergeVerifySpec:
             'RUSTC_WRAPPER': 'sccache',
             'SCCACHE_REDIS': 'redis://orch:6379',
         }
+
+    # --- task 6127: the pre-provision command is dispatcher-carried ----------
+
+    def test_verify_cold_preprovision_command_projected_from_config(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        config = OrchestratorConfig(verify_cold_preprovision_command='SENTINEL_PROVISION')
+        spec = build_merge_verify_spec(config, [], None)
+        assert spec.verify_cold_preprovision_command == 'SENTINEL_PROVISION'
+
+    @pytest.mark.usefixtures('code_default_config')
+    def test_unconfigured_preprovision_projects_empty(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        spec = build_merge_verify_spec(OrchestratorConfig(), [], None)
+        assert spec.verify_cold_preprovision_command == ''
 
 
 # ---------------------------------------------------------------------------
@@ -2806,6 +2854,68 @@ class TestRunMergeVerifyOnWorktree:
             'uniformity is what the fix buys, and it is the per-module path '
             'that is unchanged'
         )
+
+    # --- task 6127: the dispatcher's pre-provision command reaches the remote leg
+
+    _PROVISION = 'uv sync --all-packages && npm ci --no-audit --no-fund --prefer-offline'
+
+    @staticmethod
+    def _preprovision_spec(verify_cold_preprovision_command):
+        return MergeVerifySpec(
+            verify_commands=(VerifyCommand('src/a', test_command='true'),),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=('src/a/m.py',),
+            verify_env={},
+            cold_timeout_secs=60.0,
+            verify_cold_preprovision_command=verify_cold_preprovision_command,
+        )
+
+    @staticmethod
+    async def _effective_config(config, spec):
+        from orchestrator.verify_runner import run_merge_verify_on_worktree
+
+        run_scoped = AsyncMock(return_value=_make_pass_result())
+        run_unscoped = AsyncMock(
+            return_value=MagicMock(
+                broken=False, timed_out=False,
+                failing_subprojects=[], timed_out_subprojects=[],
+            )
+        )
+        await run_merge_verify_on_worktree(
+            MagicMock(), config, spec,
+            run_scoped=run_scoped, run_unscoped=run_unscoped,
+        )
+        assert run_scoped.await_args is not None
+        return run_scoped.await_args[0][1]
+
+    async def test_spec_preprovision_command_overrides_empty_host_value(self):
+        """The 6021 shape: the verifying host's own value is ''."""
+        caller_config = self._host_config(verify_cold_preprovision_command='')
+
+        effective_config = await self._effective_config(
+            caller_config, self._preprovision_spec(self._PROVISION),
+        )
+
+        assert effective_config.verify_cold_preprovision_command == self._PROVISION
+        assert caller_config.verify_cold_preprovision_command == ''
+
+    async def test_empty_spec_preprovision_keeps_host_value(self):
+        config = self._host_config(verify_cold_preprovision_command='HOST_PROVISION')
+
+        effective_config = await self._effective_config(config, self._preprovision_spec(''))
+
+        assert effective_config.verify_cold_preprovision_command == 'HOST_PROVISION'
+
+    async def test_legacy_spec_without_preprovision_keeps_host_value(self):
+        config = self._host_config(verify_cold_preprovision_command='HOST_PROVISION')
+        legacy = self._preprovision_spec(self._PROVISION).to_dict()
+        legacy.pop('verify_cold_preprovision_command')
+
+        effective_config = await self._effective_config(
+            config, MergeVerifySpec.from_dict(legacy),
+        )
+
+        assert effective_config.verify_cold_preprovision_command == 'HOST_PROVISION'
 
     async def test_gate_broken_returns_sentinel_result(self):
         """When run_unscoped returns broken=True, result carries UNSCOPED_TYPECHECK_FAILED_CATEGORY."""
