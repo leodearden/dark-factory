@@ -23,9 +23,15 @@ import {
 const PROJECT = 'p';
 const TAB_PROPS = { projectFilter: [], search: '' };
 
+// React reports a broken render (a missing key, an update outside act(), a bad
+// prop) on console.error and renders on, so every test also asserts that
+// nothing reached it, through the unmount.
 function openWindow(t) {
   const harness = buildDashboardWindow();
-  t.after(() => harness.close());
+  t.after(() => {
+    harness.close();
+    assert.deepEqual(harness.consoleErrors, [], 'the window wrote to console.error');
+  });
   return harness;
 }
 
@@ -144,10 +150,10 @@ const PROJECT_SAMPLES = 3;
 
 function seedBurndown(window, { alarm }) {
   const vocab = window.DF_TASK_VOCAB;
-  const verdict = { parity_alarm: alarm, parity_cap: 4, parity_peak: 6, parity_breach_count: 3 };
+  const verdict = { alarm, cap: 4, peak: 6, breachCount: 3 };
   seedDashboardData(window, {
     PROJECTS: [projectRow(PROJECT)],
-    BURNDOWN: burndownBlock(vocab, AGGREGATE_SAMPLES, { ...verdict, parity_projects: [PROJECT] }),
+    BURNDOWN: burndownBlock(vocab, AGGREGATE_SAMPLES, { ...verdict, projects: [PROJECT] }),
     BURNDOWN_BY_PROJECT: { [PROJECT]: burndownBlock(vocab, PROJECT_SAMPLES, verdict) },
     __receipt: receiptsFor(window.DF_DATA_LOADER, ['BURNDOWN', 'PROJECTS']),
   });

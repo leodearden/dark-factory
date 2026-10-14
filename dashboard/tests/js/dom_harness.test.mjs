@@ -6,7 +6,6 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { createRequire } from 'node:module';
 import {
   REDUX_DIR,
   REPO_ROOT,
@@ -16,10 +15,10 @@ import {
   readIndexHtml,
   sha384Digest,
 } from './_served_bundle.mjs';
-import { buildDashboardWindow, toolchainPackageDir } from './dom_harness.mjs';
+import { NPM_CI, REACT_BUILDS, buildDashboardWindow, seedDashboardData, toolchainPackageDir } from './dom_harness.mjs';
+import { escalationAnalytics, receiptsFor } from './wire_fixtures.mjs';
 
 const ROOT_PACKAGE_JSON = path.join(REPO_ROOT, 'package.json');
-const REACT_PACKAGES = ['react', 'react-dom'];
 const EXACT_VERSION_RE = /^\d+\.\d+\.\d+$/;
 
 function devDependencies() {
@@ -27,22 +26,11 @@ function devDependencies() {
 }
 
 function reactInstallCommand() {
-  const specs = REACT_PACKAGES.map(pkg => `${pkg}@${cdnScriptTag(pkg).version}`);
+  const specs = REACT_BUILDS.map(pkg => `${pkg}@${cdnScriptTag(pkg).version}`);
   return `npm install --save-dev --save-exact ${specs.join(' ')}`;
 }
 
-function installedCopyOfCdnFile(pkg) {
-  const requireFromRoot = createRequire(ROOT_PACKAGE_JSON);
-  let packageJson;
-  try {
-    packageJson = requireFromRoot.resolve(`${pkg}/package.json`);
-  } catch {
-    assert.fail(`${pkg} is not installed under ${REPO_ROOT}/node_modules — run \`npm ci --no-audit --no-fund\` at the repo root`);
-  }
-  return path.join(path.dirname(packageJson), cdnScriptTag(pkg).pathInPackage);
-}
-
-for (const pkg of REACT_PACKAGES) {
+for (const pkg of REACT_BUILDS) {
   test(`package.json pins ${pkg} to exactly the version index.html loads`, () => {
     assert.equal(
       devDependencies()[pkg],
@@ -53,13 +41,13 @@ for (const pkg of REACT_PACKAGES) {
   });
 
   test(`the installed ${pkg} build is byte-identical to the one index.html loads`, () => {
-    const { url, integrity } = cdnScriptTag(pkg);
-    const installed = installedCopyOfCdnFile(pkg);
+    const { url, integrity, pathInPackage } = cdnScriptTag(pkg);
+    const installed = path.join(toolchainPackageDir(pkg), pathInPackage);
     assert.equal(
       sha384Digest(installed),
       integrity,
       `${installed} is not the build index.html loads (${url}), so the harness would render with a ` +
-        `different React than the browser. Remedy: ${reactInstallCommand()}, then \`npm ci\``,
+        `different React than the browser. Remedy: ${reactInstallCommand()}, then \`${NPM_CI}\``,
     );
   });
 }
@@ -165,6 +153,23 @@ test('close() leaves no live timer behind, though data.js starts polling on load
   assert.equal(liveTimerCount(), before, 'a timer outlived close(); it would hold `node --test` open');
 });
 
+// ── Seeding lands only what a poll could land ─────────────────────────────
+
+test('seeding refuses a key that no endpoint data.js polls serves', t => {
+  const { window } = openWindow(t);
+  assert.throws(() => seedDashboardData(window, { NOT_A_POLLED_KEY: 1 }), /polls no endpoint that serves NOT_A_POLLED_KEY/);
+});
+
+test("seeding refuses a key without its endpoint's receipt, and lands it with one", t => {
+  const { window } = openWindow(t);
+  const patch = { ESCALATION_ANALYTICS: escalationAnalytics([]) };
+  assert.throws(() => seedDashboardData(window, patch), /records a receipt for \/api\/v2\/dashboard\/escalation-analytics/);
+  assert.ok(!window.DF_DATA.__loaded.ESCALATION_ANALYTICS, 'a refused seed must land nothing');
+
+  seedDashboardData(window, { ...patch, __receipt: receiptsFor(window.DF_DATA_LOADER, ['ESCALATION_ANALYTICS']) });
+  assert.equal(window.DF_DATA.__loaded.ESCALATION_ANALYTICS, true);
+});
+
 // ── A missing or stale toolchain fails with its remedy, never a skip ──────
 
 function scratchRoot(t) {
@@ -174,13 +179,14 @@ function scratchRoot(t) {
   return root;
 }
 
-test('a checkout with no node_modules fails with the npm ci remedy', t => {
+test('a checkout with no node_modules fails with the npm ci remedy, and its sandbox-safe form', t => {
   const root = scratchRoot(t);
   assert.throws(
     () => toolchainPackageDir('jsdom', root),
     err =>
       err.message.includes('jsdom') &&
-      err.message.includes(`npm ci --no-audit --no-fund`) &&
+      err.message.includes(NPM_CI) &&
+      err.message.includes(`npm_config_cache="$(mktemp -d)" ${NPM_CI}`) &&
       err.message.includes(root) &&
       !/stale/.test(err.message),
   );
@@ -194,6 +200,6 @@ test('a node_modules installed from an older package-lock.json is named as stale
   const locked = JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8')).packages['node_modules/jsdom'].version;
   assert.throws(
     () => toolchainPackageDir('jsdom', root),
-    err => /stale/.test(err.message) && err.message.includes(locked) && err.message.includes('npm ci --no-audit --no-fund'),
+    err => /stale/.test(err.message) && err.message.includes(locked) && err.message.includes(NPM_CI),
   );
 });

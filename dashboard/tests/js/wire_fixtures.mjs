@@ -3,6 +3,11 @@
 // Pure: no window, no assertions. Where a shape depends on the client's own
 // vocabulary or endpoint table, that is passed in rather than restated here.
 //
+// A builder may leave out a key the route serves, but never emit one it does
+// not: boundary_wire_fixtures.test.mjs checks each builder against the bodies
+// the real routes serve, so a server-side rename fails there instead of
+// leaving the render tests green on a shape nothing serves.
+//
 // A helper module, not a test: the `*.test.mjs` glob skips it.
 
 // The instant every built Datum was measured, and every receipt was served.
@@ -39,20 +44,21 @@ export function tasksSnapshotEntry(rows, census) {
   };
 }
 
-// The __receipt entries a poll records for the endpoints serving `keys`, keyed
-// as data.js's refreshOne keys them, and received now so nothing reads as aged.
-// `loader` is data.js's `window.DF_DATA_LOADER`, whose endpoint table says which
-// endpoint serves each key.
+// The endpoint data.js polls for `key`, as the key its receipt is filed under,
+// and the spec that endpoint's row declares for `key`. `loader` is data.js's
+// `window.DF_DATA_LOADER`, whose endpoint table is the one source of both.
+export function servingEndpoint(loader, key, win = '24h') {
+  const served = Object.entries(loader.endpointsFor(win)).find(([, keySpecs]) => key in keySpecs);
+  if (!served) throw new Error(`data.js polls no endpoint that serves ${key}`);
+  const [url, keySpecs] = served;
+  return { stateKey: loader.pollKey(url), spec: keySpecs[key] };
+}
+
+// The __receipt entries a poll records for the endpoints serving `keys`,
+// received now so nothing reads as aged.
 export function receiptsFor(loader, keys, win = '24h') {
-  const endpoints = Object.entries(loader.endpointsFor(win));
   const receipt = { servedAt: WIRE_AS_OF, receivedAt: Date.now() };
-  return Object.fromEntries(
-    keys.map(key => {
-      const served = endpoints.find(([, keySpecs]) => key in keySpecs);
-      if (!served) throw new Error(`data.js polls no endpoint that serves ${key}`);
-      return [loader.pollKey(served[0]), receipt];
-    }),
-  );
+  return Object.fromEntries(keys.map(key => [servingEndpoint(loader, key, win).stateKey, receipt]));
 }
 
 // `count` hourly sample labels ending at WIRE_AS_OF, oldest first.
@@ -67,8 +73,9 @@ function sampleLabels(count) {
 //   - a non-empty series per census member, so every band draws;
 //   - the rows' in-progress split;
 //   - the `latest` and `forecast` Datums;
-//   - `parity`, the verdict's parity_* fields, passed through as served.
-export function burndownBlock(vocab, sampleCount, parity) {
+//   - the parity verdict's fields. Only the aggregate block names the
+//     breaching `projects`; leave them out for a per-project block.
+export function burndownBlock(vocab, sampleCount, { alarm, cap, peak, breachCount, projects }) {
   const labels = sampleLabels(sampleCount);
   const series = Object.fromEntries(
     Object.values(vocab.SERIES_KEYS).map((key, i) => [key, labels.map(() => i + 1)]),
@@ -86,7 +93,11 @@ export function burndownBlock(vocab, sampleCount, parity) {
     ...columns,
     latest: wireDatum({ counts, completed: 0, velocity: 0, window_days: 1 }),
     forecast: wireDatum({ forecast_low: 1, forecast_high: 2 }),
-    ...parity,
+    parity_alarm: alarm,
+    parity_cap: cap,
+    parity_peak: peak,
+    parity_breach_count: breachCount,
+    ...(projects === undefined ? {} : { parity_projects: projects }),
   };
 }
 
@@ -103,8 +114,8 @@ export function openEscalationItem({ id, taskId, level = 1, ageSecs = 3600, brea
 
 // The ESCALATION_ANALYTICS payload, one per_project entry per
 // `{project, openItems}`. Each lifespan block lists only its open items; the
-// origin, workflow and terminal blocks are empty, so their panels render their
-// empty states.
+// origin and workflow blocks are empty, so their panels render their empty
+// states, and no escalation is terminal.
 export function escalationAnalytics(projects) {
   return {
     generated_at: WIRE_AS_OF,
@@ -120,7 +131,7 @@ export function escalationAnalytics(projects) {
         open_items: openItems,
       },
       workflow: {},
-      terminal: {},
+      terminal: 0,
     })),
   };
 }

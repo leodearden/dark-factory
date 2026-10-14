@@ -20,15 +20,24 @@ import {
   readIndexHtml,
   sha384Digest,
 } from './_served_bundle.mjs';
+import { servingEndpoint } from './wire_fixtures.mjs';
 
-const NPM_CI = 'npm ci --no-audit --no-fund';
+export const NPM_CI = 'npm ci --no-audit --no-fund';
+
+// The CDN builds index.html loads that the harness takes from node_modules.
+export const REACT_BUILDS = ['react', 'react-dom'];
 
 // app.jsx is the page bootstrap: at load it mounts the whole <App/> into
 // #root, which would bring every tab's effects into every window. Render tests
 // mount one tab each instead.
 const EXCLUDED_SCRIPTS = ['app.jsx'];
 
-const REACT_BUILDS = ['react', 'react-dom'];
+function npmCiRemedy(root) {
+  return (
+    `Remedy: run \`${NPM_CI}\` in ${root}. If that fails with EACCES under ~/.npm, as it does in a sandbox ` +
+    `that denies writes outside the worktree, give npm a writable cache: \`npm_config_cache="$(mktemp -d)" ${NPM_CI}\`.`
+  );
+}
 
 function lockfileVersion(lockfile, pkg) {
   if (!fs.existsSync(lockfile)) return null;
@@ -50,7 +59,7 @@ function missingToolchainMessage(pkg, root) {
       );
     }
   }
-  sentences.push(`Remedy: run \`${NPM_CI}\` in ${root}.`);
+  sentences.push(npmCiRemedy(root));
   return sentences.join(' ');
 }
 
@@ -82,7 +91,7 @@ function reactScript(pkg) {
     if (digest !== integrity) {
       throw new Error(
         `${file} (${digest}) is not the build index.html loads (${url}, ${integrity}), so the harness ` +
-          `would render with a different React than the browser. Remedy: run \`${NPM_CI}\` in ${REPO_ROOT}.`,
+          `would render with a different React than the browser. ${npmCiRemedy(REPO_ROOT)}`,
       );
     }
     reactScripts.set(pkg, new vm.Script(fs.readFileSync(file, 'utf8'), { filename: url }));
@@ -221,13 +230,23 @@ export function buildDashboardWindow({ readSource = readServedSource } = {}) {
   return { window, loaded: scripts.map(({ src }) => src), excluded, consoleErrors, mount, close };
 }
 
-// Lands `patch` in the window's DF_DATA as a poll would: each key through
-// data.js's own applyKey, which fills PROJECTS and AGENTS in place (shell.jsx
-// captured those arrays at load) and marks the key __loaded. `__receipt`
-// entries are merged into data.js's map. Call it after the load, because
-// data.js creates DF_DATA itself.
+// Lands `patch` in the window's DF_DATA as a poll would. Its `__receipt`
+// entries are merged into data.js's map first. Every other key then goes
+// through data.js's own applyKey with the spec its endpoint's row declares and
+// that endpoint's receipt, so a datum-kinded key is validated and stamped as a
+// poll's would be. applyKey fills PROJECTS and AGENTS in place (shell.jsx
+// captured those arrays at load) and marks the key __loaded. Call it after the
+// load, because data.js creates DF_DATA itself.
 export function seedDashboardData(window, patch) {
   const { __receipt: receipts = {}, ...keys } = patch;
+  const loader = window.DF_DATA_LOADER;
   Object.assign(window.DF_DATA.__receipt, receipts);
-  for (const [key, value] of Object.entries(keys)) window.DF_DATA_LOADER.applyKey(key, value);
+  for (const [key, value] of Object.entries(keys)) {
+    const { stateKey, spec } = servingEndpoint(loader, key);
+    const receipt = window.DF_DATA.__receipt[stateKey];
+    if (!receipt) {
+      throw new Error(`a poll that lands ${key} records a receipt for ${stateKey}: seed one with wire_fixtures.mjs::receiptsFor`);
+    }
+    loader.applyKey(key, value, spec, receipt);
+  }
 }

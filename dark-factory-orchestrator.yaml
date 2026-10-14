@@ -789,6 +789,11 @@ timeouts:
 # bytes — it just avoids a registry round-trip on every cold worktree.
 # The same install also provisions the dashboard DOM harness's devDependencies
 # (jsdom, react, react-dom; task 4899), which dashboard/tests/js/ needs.
+# It runs only on a COLD verify, so a task worktree that cold-verified before a
+# package-lock.json change keeps its old node_modules. The harness then fails,
+# naming the stale package and `npm ci` as the remedy. Merge verify is always
+# cold, so main is unaffected. Re-provisioning on lockfile drift is ticket
+# tkt_0RVST44N7D57CY4ERSJCVJ3QW2.
 # MEASURED 2026-10-14, with those added, against an empty isolated npm cache
 # (the worst case, and the one a fresh host actually sees): 14.5s. Warm cache:
 # 10.6s. Both were taken at load average ~105 on 32 cores; the pyright-only
