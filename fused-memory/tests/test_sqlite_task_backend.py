@@ -6859,6 +6859,29 @@ def test_merge_metadata_mode_merge_existing_none_returns_incoming():
     assert _merge_metadata(None, incoming, mode='merge') == incoming
 
 
+@pytest.mark.parametrize('mode', ['merge', 'additive', 'replace'])
+@pytest.mark.parametrize(
+    ('payload', 'received'),
+    [('[]', 'array'), ('null', 'null'), ('not json{', 'invalid_json')],
+)
+def test_merge_metadata_refuses_non_object_incoming_in_every_mode(mode, payload, received):
+    """A non-object incoming payload is never returned as the new blob, whether
+    or not there is an existing blob to preserve (task 6130)."""
+    existing = json.dumps({
+        'done_provenance': {'kind': 'merged', 'commit': 'a' * 40}, 'files': ['src'],
+    })
+    with pytest.raises(MetadataNotAnObjectError) as exc:
+        _merge_metadata(
+            existing, payload, mode=mode, project_root='/p', tag='master', task_id=1,
+        )
+    assert exc.value.received == received
+    with pytest.raises(MetadataNotAnObjectError) as exc_no_existing:
+        _merge_metadata(
+            None, payload, mode=mode, project_root='/p', tag='master', task_id=1,
+        )
+    assert exc_no_existing.value.received == received
+
+
 # ── update_task end-to-end: default-merge + metadata_mode (step-5 RED / step-6 GREEN) ──
 
 
