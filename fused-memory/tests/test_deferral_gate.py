@@ -22,6 +22,7 @@ import pytest_asyncio
 from shared import task_deferral
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+from fused_memory.backends.task_backend_errors import DeferralWriteAuthorityError
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_store import TicketStore
@@ -889,3 +890,99 @@ async def test_submit_task_refuses_caller_deferral(stack: Stack, planning_mode: 
     assert result['path'] == 'metadata.deferral'
     assert 'ticket' not in result
     assert len((await stack.interceptor.get_tasks(stack.root))['tasks']) == before
+
+
+# Row 8: no metadata writer but the status choke point may add, alter or remove the record.
+
+_MODES = ['merge', 'additive', 'replace']
+
+
+async def _deferred_with_note(stack: Stack, title: str) -> tuple[str, dict[str, Any]]:
+    task_id = await stack.seed('pending', title, {'x_note': 'kept'})
+    await _enter(stack, task_id, _until_condition(title))
+    return task_id, (await stack.read(task_id))['metadata']
+
+
+def _assert_write_authority(result: Any, task_id: str) -> None:
+    assert result['success'] is False, result
+    assert result['error'] == 'deferral_write_authority', result
+    assert result['path'] == 'metadata.deferral'
+    assert result['task_id'] == task_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', _MODES)
+async def test_update_task_cannot_alter_deferral(stack: Stack, mode: str) -> None:
+    task_id, metadata = await _deferred_with_note(stack, f'row 8 alter {mode}')
+    altered = {**metadata['deferral'], 'condition': 'altered'}
+    payload = {**metadata, 'deferral': altered} if mode == 'replace' else {'deferral': altered}
+
+    result = await stack.call(
+        'update_task', id=task_id, metadata=payload, metadata_mode=mode,
+    )
+
+    _assert_write_authority(result, task_id)
+    assert (await stack.read(task_id))['metadata']['deferral'] == metadata['deferral']
+
+
+@pytest.mark.asyncio
+async def test_update_task_cannot_add_or_remove_deferral(stack: Stack) -> None:
+    pending = await stack.seed('pending', 'row 8 add')
+    task_id, metadata = await _deferred_with_note(stack, 'row 8 remove')
+    without = {k: v for k, v in metadata.items() if k != 'deferral'}
+
+    added = await stack.call(
+        'update_task', id=pending, metadata={'deferral': metadata['deferral']},
+        metadata_mode='merge',
+    )
+    nulled = await stack.call(
+        'update_task', id=task_id, metadata={'deferral': None}, metadata_mode='merge',
+    )
+    dropped = await stack.call(
+        'update_task', id=task_id, metadata=without, metadata_mode='replace',
+    )
+
+    _assert_write_authority(added, pending)
+    assert 'deferral' not in (await stack.read(pending))['metadata']
+    _assert_write_authority(nulled, task_id)
+    _assert_write_authority(dropped, task_id)
+    assert (await stack.read(task_id))['metadata']['deferral'] == metadata['deferral']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', _MODES)
+async def test_update_task_echo_of_stored_record_is_accepted(stack: Stack, mode: str) -> None:
+    task_id, metadata = await _deferred_with_note(stack, f'row 8 echo {mode}')
+    echoed = {**metadata, f'x_echo_{mode}': 'written'}
+
+    result = await stack.call(
+        'update_task', id=task_id, metadata=echoed, metadata_mode=mode,
+    )
+
+    assert result.get('error') is None, result
+    after = (await stack.read(task_id))['metadata']
+    assert json.dumps(after['deferral'], sort_keys=True) == json.dumps(
+        metadata['deferral'], sort_keys=True,
+    )
+    assert after[f'x_echo_{mode}'] == 'written'
+
+
+@pytest.mark.asyncio
+async def test_rewrite_audit_trail_carries_deferral(stack: Stack) -> None:
+    task_id, metadata = await _deferred_with_note(stack, 'row 8 rotation')
+    without = {k: v for k, v in metadata.items() if k != 'deferral'}
+    altered = {**metadata, 'deferral': {**metadata['deferral'], 'condition': 'altered'}}
+
+    await stack.backend.rewrite_audit_trail(
+        task_id, stack.root, description=None, metadata=metadata,
+    )
+    assert (await stack.read(task_id))['metadata']['deferral'] == metadata['deferral']
+    with pytest.raises(DeferralWriteAuthorityError):
+        await stack.backend.rewrite_audit_trail(
+            task_id, stack.root, description=None, metadata=without,
+        )
+    with pytest.raises(DeferralWriteAuthorityError):
+        await stack.backend.rewrite_audit_trail(
+            task_id, stack.root, description=None, metadata=altered,
+        )
+    assert (await stack.read(task_id))['metadata']['deferral'] == metadata['deferral']
