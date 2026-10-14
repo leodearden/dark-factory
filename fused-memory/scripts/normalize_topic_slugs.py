@@ -203,6 +203,7 @@ __all__ = [
 ERROR_OUTCOMES: frozenset[str] = frozenset({
     'slug_collision',
     'canonical_collision',
+    'topic_unfoldable',
     'under_enumerated',
     'scroll_budget_exhausted',
     'memory_not_found',
@@ -324,6 +325,16 @@ def census_categories() -> tuple[str, ...]:
 # The corpus boundary
 # ---------------------------------------------------------------------------
 
+def _is_non_conforming_topic(topic: object) -> bool:
+    """A PRESENT topic the slug rule rejects, whatever its type.
+
+    ``None`` is an absent topic (``retro_stamp_topics.py``'s job), never a
+    non-conforming one.  Both the corpus boundary and the planner ask this, so
+    the two cannot disagree about which records need attention.
+    """
+    return topic is not None and not is_valid_topic_slug(topic)
+
+
 async def enumerate_topic_bearing(
     memory_service: Any,
     project_id: str,
@@ -349,7 +360,8 @@ async def enumerate_topic_bearing(
     corpus.  It is also why ``CategoryCensus`` cannot be reused here — it
     deliberately retains no payloads at all, so it knows WHICH slugs are
     non-conforming but not WHICH RECORDS carry them, and a migration needs
-    the ids.
+    the ids.  A present topic that is not a string, or is empty, is
+    non-conforming too, and is retained so :func:`plan_renames` reports it.
 
     The backend is reached as ``memory_service.mem0`` (the
     ``consolidate_namespace_families.py`` pattern) so one injected service
@@ -404,18 +416,17 @@ async def enumerate_topic_bearing(
                 scrolled += 1
                 metadata = record.get('metadata') or {}
                 topic = metadata.get('topic')
-                if not isinstance(topic, str) or not topic:
-                    continue
-                occupied_topics.add(topic)
-                # ``is True``, not truthiness: metadata off a live store is
-                # not schema-enforced here, and ``canonical: 'false'`` would
-                # otherwise read as a canonical claim and escalate a mild
-                # collision into the severe bucket.
-                if metadata.get('canonical') is True:
-                    memory_id = record.get('id')
-                    if isinstance(memory_id, str) and memory_id:
-                        canonical_ids_by_topic.setdefault(topic, []).append(memory_id)
-                if is_valid_topic_slug(topic):
+                if isinstance(topic, str):
+                    occupied_topics.add(topic)
+                    # ``is True``, not truthiness: metadata off a live store is
+                    # not schema-enforced here, and ``canonical: 'false'`` would
+                    # otherwise read as a canonical claim and escalate a mild
+                    # collision into the severe bucket.
+                    if metadata.get('canonical') is True:
+                        memory_id = record.get('id')
+                        if isinstance(memory_id, str) and memory_id:
+                            canonical_ids_by_topic.setdefault(topic, []).append(memory_id)
+                if not _is_non_conforming_topic(topic):
                     continue
                 # The residue triple: the id to write to, the topic to fold,
                 # and whether this record claims canonical (which decides
@@ -653,22 +664,19 @@ def plan_renames(
     collisions: dict[str, dict] = {}
     for record in records:
         metadata = record.get('metadata') or {}
-        if 'topic' not in metadata:
-            continue
-        topic = metadata['topic']
-        if topic is None:
-            continue
-        if is_valid_topic_slug(topic):
+        topic = metadata.get('topic')
+        if not _is_non_conforming_topic(topic):
             continue
 
         memory_id = record.get('id')
         folded = derive_topic_slug(topic)
-        if folded is None:
+        if not isinstance(topic, str) or folded is None:
             skips.append({
                 'reason': 'topic_unfoldable',
                 'project_id': project_id,
                 'memory_id': memory_id,
                 'topic': topic,
+                'topic_type': type(topic).__name__,
                 'note': (
                     'no honest fold exists for this value (it collapses to '
                     'empty, exceeds TOPIC_SLUG_MAX_LEN once folded, or is not '
@@ -1723,8 +1731,11 @@ async def run(
         coverage[project_id] = enumerated['coverage']
         coverage_complete = coverage_complete and enumerated['complete']
         candidate_count += len(enumerated['records'])
+        # Keyed by ``str(topic)``, as census_memory_metadata.py::CategoryCensus.add
+        # keys topic values: the count stays comparable to the census, and an
+        # unhashable list or dict topic cannot raise.
         measured_by_project[project_id] = len({
-            (r.get('metadata') or {}).get('topic') for r in enumerated['records']
+            str((r.get('metadata') or {}).get('topic')) for r in enumerated['records']
         })
         _record_skips(enumerated['skips'])
 
