@@ -83,6 +83,7 @@ def _plant_guard(
     extensionless: list[str] | None = None,
     rc: int = 0,
     sleep_secs: float | None = None,
+    warning: str | None = None,
 ) -> Path:
     """Write a FAKE reify ``scripts/lock-charter-guard.sh`` under *repo* and return it.
 
@@ -91,7 +92,9 @@ def _plant_guard(
     unrecognised flag prints usage to stderr and exits 2 (measured 2026-08-09 on
     the live script, and recorded on ``_reify_guard_vector`` in the two in-suite
     copies).  *rc* and *sleep_secs* exist to drive the BROKEN-emitter arms: a
-    script that is present and then fails, and one that hangs.
+    script that is present and then fails, and one that hangs.  *warning* is a
+    ``printf`` format written to stderr before answering, so an octal escape in
+    it reaches the stream as a raw byte.
     """
     scripts_dir = repo / 'scripts'
     scripts_dir.mkdir(parents=True, exist_ok=True)
@@ -106,6 +109,8 @@ def _plant_guard(
         return f"printf '%s\\n' {joined}"
 
     body = ['#!/usr/bin/env bash']
+    if warning is not None:
+        body.append(f"printf '{warning}\\n' >&2")
     if sleep_secs is not None:
         body.append(f'sleep {sleep_secs}')
     if rc != 0:
@@ -336,6 +341,20 @@ class TestCheckVectors:
         assert report['exit_code'] not in (drift.EXIT_OK, drift.EXIT_DRIFT)
         assert report['status'] == 'unavailable'
 
+    def test_non_utf8_stderr_beside_a_readable_answer_is_still_an_answer(self, tmp_path):
+        """stdout is the answer and stderr only commentary: a garbled warning must not void a vector it could read."""
+        repo = tmp_path / 'reify'
+        _plant_guard(
+            repo,
+            extensions=DF_EXTENSIONS,
+            extensionless=DF_EXTENSIONLESS,
+            warning='\\351 deprecated flag',  # stderr carries byte 0xE9
+        )
+
+        report = drift.check_vectors(repo)
+
+        assert report['exit_code'] == drift.EXIT_OK, report['detail']
+
 
 class TestGuardVectorHelper:
     """``_guard_vector`` — the bounded, loud-on-broken subprocess wrapper."""
@@ -549,6 +568,20 @@ class TestCheckCorpus:
         assert report['exit_code'] != drift.EXIT_OK
         assert report['status'] == 'unavailable'
         assert report['findings'] == {}
+
+    def test_unavailable_detail_names_the_undecodable_path(self, tmp_path):
+        """One odd filename blinds the sweep until it is renamed, so the report must say WHICH file.
+
+        A byte offset into ``git ls-files`` output is not something an operator
+        can act on; the path is.
+        """
+        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
+        _track_non_utf8_path(repo)
+
+        report = drift.check_corpus(repo)
+
+        assert report['exit_code'] == drift.EXIT_UNAVAILABLE
+        assert r'caf\xe9.py' in report['detail']
 
     def test_first_offending_path_is_recorded_per_extension(self, tmp_path):
         """One representative path per extension, not an unbounded list.

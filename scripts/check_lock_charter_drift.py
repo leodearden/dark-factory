@@ -116,14 +116,18 @@ def _run_or_unavailable(argv: list[str], *, what: str, timeout: float) -> subpro
 
     Owns only "did the process answer at all"; each caller judges its rc.  Every
     could-not-answer escape — a timeout, an ``OSError`` (no binary, permission
-    bits, ENOENT), output that is not UTF-8 — becomes `GuardUnavailable`,
+    bits, ENOENT), a stdout that is not UTF-8 — becomes `GuardUnavailable`,
     because an escaping exception exits 1, which a caller reads as DRIFT: a
     false accusation against reify.  The codec is pinned rather than taken from
     the locale, so whether the same bytes are readable never depends on who ran
     this.
+
+    Only stdout is the answer, so only stdout must decode; stderr is commentary,
+    decoded leniently, and a garbled warning beside a readable answer does not
+    void it.
     """
     try:
-        return subprocess.run(argv, capture_output=True, encoding='utf-8', timeout=timeout)
+        raw = subprocess.run(argv, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         raise GuardUnavailable(
             f'{what} did not finish within {timeout}s — treated as unavailable '
@@ -131,11 +135,28 @@ def _run_or_unavailable(argv: list[str], *, what: str, timeout: float) -> subpro
         ) from exc
     except OSError as exc:
         raise GuardUnavailable(f'could not run {what}: {exc}') from exc
+    try:
+        stdout = raw.stdout.decode('utf-8')
     except UnicodeDecodeError as exc:
         raise GuardUnavailable(
-            f'{what} produced output that is not valid UTF-8 ({exc}) — its '
-            f'answer could not be read'
+            f'{what} answered with output that is not valid UTF-8 ({exc}), in '
+            f'{_record_holding(exc)[:400]!r} — its answer could not be read'
         ) from exc
+    stderr = raw.stderr.decode('utf-8', errors='backslashreplace')
+    return subprocess.CompletedProcess(argv, raw.returncode, stdout, stderr)
+
+
+def _record_holding(exc: UnicodeDecodeError) -> bytes:
+    """The NUL- or newline-delimited record of *exc*'s input that holds the undecodable bytes.
+
+    Both callers' answers are sequences of such records — ``git ls-files -z``
+    entries and guard vector lines — so this names the offending path or entry,
+    where the codec's own message gives only a byte offset.
+    """
+    data = exc.object
+    head = max(data.rfind(b'\0', 0, exc.start), data.rfind(b'\n', 0, exc.start)) + 1
+    tails = [i for i in (data.find(b'\0', exc.end), data.find(b'\n', exc.end)) if i != -1]
+    return data[head:min(tails, default=len(data))]
 
 
 def _guard_vector(script: Path, flag: str, *, timeout: float = SUBPROCESS_TIMEOUT_SECS) -> list[str]:
@@ -152,7 +173,7 @@ def _guard_vector(script: Path, flag: str, *, timeout: float = SUBPROCESS_TIMEOU
     nothing.
 
     Raises `GuardUnavailable` for a missing script and a non-zero rc here, and
-    for a timeout, an ``OSError`` or undecodable output via `_run_or_unavailable`.
+    for a timeout, an ``OSError`` or an undecodable stdout via `_run_or_unavailable`.
     """
     if not script.is_file():
         raise GuardUnavailable(
