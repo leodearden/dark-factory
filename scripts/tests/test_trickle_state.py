@@ -1297,3 +1297,41 @@ class TestRecordRetry:
         assert [p.name for p in state_dir.iterdir()] == [
             trickle_state.STATE_FILENAME
         ]
+
+
+class TestDueRetries:
+    """``due_retries(doc, *, today)`` — the reader the nightly calls, so the
+    backlog's field name and encoding stay inside trickle_state."""
+
+    @pytest.fixture(autouse=True)
+    def _state_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
+
+    def test_a_recorded_failed_night_is_due_after_a_productive_one(self):
+        _record(day=1, exit_code=1, selected_count=6)
+        doc = _record(day=2, selected_count=1)
+
+        assert trickle_state.due_retries(doc, today=_d(3)) == (_d(1),)
+
+    def test_several_owed_dates_give_the_oldest_up_to_the_nightly_limit(self):
+        _record(day=1, exit_code=1)
+        _record(day=2, exit_code=1)
+        doc = _record(day=3, selected_count=1)
+
+        due = trickle_state.due_retries(doc, today=_d(4))
+
+        assert due == (_d(1), _d(2))[:trickle_state.RETRIES_PER_NIGHT]
+
+    @pytest.mark.parametrize('doc', [
+        pytest.param(None, id='None'),
+        pytest.param(['2026-07-01'], id='not-a-dict'),
+        pytest.param({'outcome': OUTCOME_PRODUCTIVE}, id='no-backlog-key'),
+        pytest.param({'retry_backlog': 'garbage'}, id='garbage-backlog'),
+        pytest.param(
+            {'retry_backlog': {'2026-07-01': 1}}, id='outside-the-window'
+        ),
+    ])
+    def test_nothing_is_due_from_what_owes_nothing_today(self, doc):
+        today = _d(1) + timedelta(days=trickle_state.RETRY_MAX_AGE_DAYS + 1)
+
+        assert trickle_state.due_retries(doc, today=today) == ()
