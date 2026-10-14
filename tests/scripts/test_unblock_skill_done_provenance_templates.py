@@ -642,13 +642,11 @@ _TASK_REV_RANGE_RE = re.compile(r"task/<[A-Za-z0-9_]+>\.\.\w+")
 _FORMAT_ANCHOR_RE = re.compile(r"--format=['\"]?%H")
 
 _REQUIRED_SCOPING = (
-    "A provenance SHA source must name THIS task. Use either the exact-subject "
-    'merge-marker search — `git log main --fixed-strings --grep="Merge '
-    "task/<TASK_ID> into main\" --format='%H%x09%s'` with its subject-selecting "
-    '`awk`, where a `$S` bound to that subject nearby counts as the argument — or '
-    "an ancestry-path range — `git rev-list --topo-order --ancestry-path --merges "
-    "task/<TASK_ID>..main | tail -1`. An unscoped `git log --format=%H -1 main` "
-    "takes no task argument: it "
+    "A provenance SHA source must name THIS task. Use one of the task-scoped "
+    "derivations in skills/_shared/deriving-landed-sha.md#the-ladder (the "
+    "exact-subject merge-marker search, where a `$S` bound to that subject nearby "
+    "counts as the argument, or the `task/<TASK_ID>..main` ancestry-path range). "
+    "An unscoped `git log --format=%H -1 main` takes no task argument: it "
     "yields main's CURRENT HEAD, which is this task's merge commit only when "
     "this task's merge is the newest commit on main. The server's only backstop "
     "(`git merge-base --is-ancestor <sha> main`) passes for every recent commit "
