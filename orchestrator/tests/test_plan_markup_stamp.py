@@ -1280,9 +1280,11 @@ class TestTheStampSerialisesWithEveryPlanWriter:
         from orchestrator.mcp import plan_tools
 
         stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
-        refusal = threading.Thread(
-            target=lambda: asyncio.run(stamp(make_fact())), daemon=True,
-        )
+
+        async def refuse() -> None:
+            await stamp(make_fact())
+
+        refusal = threading.Thread(target=lambda: asyncio.run(refuse()), daemon=True)
 
         with artifacts.plan_mutex():
             refusal.start()
