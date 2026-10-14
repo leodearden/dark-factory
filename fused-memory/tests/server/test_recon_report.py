@@ -3420,6 +3420,54 @@ class TestReconReportOverlengthTruncation:
         assert item['description'] == 'd'
         assert item['suggested_action'] == 'a'
 
+    def test_text_exactly_at_the_cap_is_stored_whole_without_warnings(self):
+        from fused_memory.server.recon_report import _MAX_FINDING_TEXT_CHARS
+
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        at_cap = 'x' * _MAX_FINDING_TEXT_CHARS
+        result = state.add_finding(
+            run_id='r1',
+            severity='minor',
+            category=at_cap,
+            description=at_cap,
+            suggested_action=at_cap,
+        )
+        assert 'finding_id' in result, f'add_finding failed: {result}'
+        assert 'warnings' not in result
+
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        item = report['flagged_items'][0]
+        assert item['description'] == at_cap
+        assert item['suggested_action'] == at_cap
+        assert item['category'] == at_cap
+
+    def test_text_one_char_over_the_cap_is_cut_to_the_cap_and_marked(self):
+        from fused_memory.server.recon_report import (
+            _MAX_FINDING_TEXT_CHARS,
+            _TRUNCATION_MARKER,
+        )
+
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        result = state.add_finding(
+            run_id='r1',
+            severity='minor',
+            category='c',
+            description='x' * (_MAX_FINDING_TEXT_CHARS + 1),
+            suggested_action='a',
+        )
+        assert 'finding_id' in result, f'add_finding failed: {result}'
+        assert result['warnings'] == [f'description truncated to {_MAX_FINDING_TEXT_CHARS} chars']
+
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        item = report['flagged_items'][0]
+        assert item['description'] == 'x' * _MAX_FINDING_TEXT_CHARS + _TRUNCATION_MARKER
+
     def test_overlength_null_null_findings_dedup_on_truncated_text(self):
         """Two null-null findings whose descriptions are identical for the
         first _MAX_FINDING_TEXT_CHARS chars but differ only in the
