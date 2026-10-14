@@ -47,6 +47,22 @@ gate block out of each named task store, and ``run`` refuses ``--apply``
 unless the census covers every swept project.  A store the census could not
 read is a gap it names, never a silent "no gates here".
 
+A gated slug moves all-or-nothing; an ungated slug does not
+-----------------------------------------------------------
+When any member write of a GATED slug fails, ``rename_group`` undoes the
+members that moved, because a gate left on a vacated slug is uncloseable.
+
+An UNGATED slug gets no undo.  A partial failure leaves it split: the members
+that moved carry the new slug and the rest keep the legacy value.  The residue
+probe files ``legacy_slug_residue`` for it, and the report lists the group
+under ``ungated_partial_rename``.
+
+A plain re-run does NOT finish the move.  The collision guard sees the moved
+members as incumbents on the new slug and refuses the stragglers as
+``slug_collision``.  The remedy is by hand: once a straggler's failure is
+resolved, patch its ``metadata.topic`` to the new slug with a metadata-only
+``update_memory`` merge, the same patch this script issues.
+
 Dry run is the default — the operator runbook
 --------------------------------------------
 1. **Dry run**, from anywhere, naming the checkout of EACH swept corpus::
@@ -71,7 +87,9 @@ Dry run is the default — the operator runbook
    more than one consolidation gate, where moving one gate would strand the
    others.  Also check ``under_enumerated`` / ``scroll_budget_exhausted``: a
    run with either populated is a LOWER BOUND, and a clean residue probe over
-   it proves nothing.
+   it proves nothing.  After an ``--apply``, ``ungated_partial_rename`` lists
+   any slug left split across both values; it too is resolved by hand, as
+   described above.
 
 3. **Apply**, as an OPERATOR, with the same roots::
 
@@ -161,6 +179,7 @@ __all__ = [
     'WriteRejectedError',
     'assert_write_accepted',
     'census_consolidation_gates',
+    'describe_partial_ungated_group',
     'load_mcp_client_class',
     'load_mcp_client_module',
     'open_live_memory_service',
@@ -213,6 +232,7 @@ ERROR_OUTCOMES: frozenset[str] = frozenset({
     'gate_census_incomplete',
     'gate_ambiguous',
     'gate_lockstep_failed',
+    'ungated_partial_rename',
     'legacy_slug_residue',
 })
 
@@ -240,6 +260,8 @@ SKIP_BUCKETS: tuple[str, ...] = (
     'orphan_gate_topic',
     'gate_ambiguous',
     'gate_lockstep_failed',
+    # from describe_partial_ungated_group
+    'ungated_partial_rename',
     # from verify_old_slugs_drained
     'legacy_slug_residue',
 )
@@ -1287,6 +1309,8 @@ async def rename_group(
 
     An UNGATED group is the common case and short-circuits after step 1: it
     needs no client, so a sweep that touches no gate never opens a socket.
+    It also gets no undo; see the module docstring's "A gated slug moves
+    all-or-nothing; an ungated slug does not".
     A GATED group with no client is the same verdict as a refused gate —
     unable to move it is not permission to leave it behind.
 
@@ -1303,8 +1327,7 @@ async def rename_group(
     if group.gate_task_id is None:
         return results, None
 
-    stood = {'renamed', 'would_rename', 'already_normalized'}
-    failed = [r for r in results if r.get('outcome') not in stood]
+    failed = [r for r in results if r.get('outcome') not in _STOOD_OUTCOMES]
     if failed:
         undo_failures = await _undo_group(memory_service, group, results)
         logger.warning(
@@ -1372,6 +1395,38 @@ async def rename_group(
     )
 
 
+def describe_partial_ungated_group(group: GateGroup, results: list[dict]) -> dict | None:
+    """The report entry for an ungated slug that only partly moved, else ``None``.
+
+    Pure.  A gated group is never described here: its gate row already reports
+    a held pair.  ``failed_outcomes`` has the gate row's key and shape, so the
+    two read the same way.
+    """
+    if group.gate_task_id is not None:
+        return None
+    stood = [r for r in results if r.get('outcome') in _STOOD_OUTCOMES]
+    failed = [r for r in results if r.get('outcome') not in _STOOD_OUTCOMES]
+    if not stood or not failed:
+        return None
+    return {
+        'reason': 'ungated_partial_rename',
+        'project_id': group.project_id,
+        'old_topic': group.old_topic,
+        'new_topic': group.new_topic,
+        'stood_memory_ids': sorted(r['memory_id'] for r in stood),
+        'failed_memory_ids': sorted(r['memory_id'] for r in failed),
+        'failed_outcomes': sorted({str(r.get('outcome')) for r in failed}),
+        'note': (
+            'this slug carries no consolidation gate, so members that move are '
+            'not rolled back when another fails and the slug is split across '
+            'both values; a plain re-run refuses the failed members still on '
+            'the legacy value as slug_collision, because the moved members '
+            'occupy the new slug — finish them by hand once their failure is '
+            'resolved (see the module docstring)'
+        ),
+    }
+
+
 def load_mcp_client_class() -> type:
     """Reuse ``FusedMemoryClient`` from ``strip_leaked_control_keys.py``.
 
@@ -1427,6 +1482,10 @@ _REHEARSED_OUTCOMES = frozenset({'would_rename'})
 #: Outcomes that actually moved (or intended to move) a slug.  Anything else
 #: never touched one, so there is nothing to drain and nothing to probe.
 _MOVED_OUTCOMES = frozenset({'renamed', 'would_rename', 'update_failed', 'rename_error'})
+
+#: Outcomes after which a member sits on the new slug, or would in a dry run.
+#: Every other outcome is a member that did not stand.
+_STOOD_OUTCOMES: frozenset[str] = frozenset({'renamed', 'would_rename', 'already_normalized'})
 
 
 async def verify_old_slugs_drained(memory_service, results, skips) -> None:
@@ -1762,6 +1821,9 @@ async def run(
         results.extend(group_results)
         if gate_row is not None:
             gate_results.append(gate_row)
+        partial = describe_partial_ungated_group(group, group_results)
+        if partial is not None:
+            _record_skips([partial])
 
     # Scope item 3, in the same run that did the writing.
     await verify_old_slugs_drained(memory_service, results, skips)
