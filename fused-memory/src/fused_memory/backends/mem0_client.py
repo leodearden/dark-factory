@@ -875,7 +875,7 @@ class Mem0Backend:
         (would otherwise count every memory in the collection — almost
         certainly a bug at the caller).
         """
-        from qdrant_client.http import models as qmodels  # noqa: PLC0415
+        from qdrant_client.http import models as qmodels
 
         if not filters:
             raise ValueError(
