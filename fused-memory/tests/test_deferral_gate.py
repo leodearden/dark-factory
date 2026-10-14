@@ -743,3 +743,149 @@ async def test_legacy_unknown_on_recorded_row_is_server_only(stack: Stack) -> No
 
     _assert_invalid(result, task_id, 'server_only_kind', 'kind')
     assert (await stack.read(task_id))['metadata']['deferral'] == stored
+
+
+# Row 7, row 6's planning-born precondition, and decision 3's submit refusal.
+
+
+async def _birth(stack: Stack, title: str) -> str:
+    born = await stack.call(
+        'submit_task', title=title, description=f'{title} body', planning_mode=True,
+        agent_id=_AGENT,
+    )
+    assert born.get('status') == 'deferred', born
+    return str(born['task_id'])
+
+
+def _per_id(result: dict) -> dict[str, dict]:
+    return {str(one['task_id']): one['result'] for one in result['results']}
+
+
+@pytest.mark.asyncio
+async def test_planning_birth_is_stamped_planning(stack: Stack) -> None:
+    task_id = await _birth(stack, 'row 7 birth')
+
+    metadata = (await stack.read(task_id))['metadata']
+
+    record = _valid_record(metadata['deferral'])
+    assert isinstance(record, task_deferral.PlanningDeferral), record
+    assert record.stamped_by == _AGENT
+    assert record.deferred_at == record.stamped_at
+    assert metadata['human_decomposed'] is True
+
+
+@pytest.mark.asyncio
+async def test_commit_pending_releases_a_planning_hold(stack: Stack) -> None:
+    births = [await _birth(stack, f'row 7 release {n}') for n in range(2)]
+
+    result = await stack.call('commit_planning', task_ids=','.join(births))
+
+    assert result['success'] is True, result
+    for task_id, one in _per_id(result).items():
+        assert one['deferral_cleared']['kind'] == 'planning', one
+        row = await stack.read(task_id)
+        assert row['status'] == 'pending'
+        assert 'deferral' not in row['metadata']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('target_status', ['pending', 'cancelled'])
+async def test_commit_releases_an_unrecorded_hold(stack: Stack, target_status: str) -> None:
+    task_id = await stack.seed('deferred', f'row 7 unrecorded {target_status}')
+
+    result = await stack.call(
+        'commit_planning', task_ids=task_id, target_status=target_status,
+    )
+
+    assert 'error' not in result, result
+    assert result['deferral_cleared'] is None
+    assert (await stack.read(task_id))['status'] == target_status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('target_status', ['pending', 'cancelled'])
+async def test_commit_refuses_a_non_planning_hold(stack: Stack, target_status: str) -> None:
+    held = await stack.seed('pending', f'row 7 held {target_status}')
+    await _enter(stack, held, _until_condition(f'row 7 held {target_status}'))
+    stored = (await stack.read(held))['metadata']['deferral']
+    birth = await _birth(stack, f'row 7 batch birth {target_status}')
+
+    result = await stack.call(
+        'commit_planning', task_ids=f'{held},{birth}', target_status=target_status,
+    )
+
+    assert result['success'] is False, result
+    _assert_invalid(_per_id(result)[held], held, 'not_planning_hold', 'deferral.kind')
+    held_row = await stack.read(held)
+    assert held_row['status'] == 'deferred'
+    assert held_row['metadata']['deferral'] == stored
+    assert (await stack.read(birth))['status'] == target_status
+    released = await stack.call('set_task_status', id=held, status='pending')
+    assert 'error' not in released, released
+
+
+@pytest.mark.asyncio
+async def test_commit_deferred_needs_a_deferral(stack: Stack) -> None:
+    births = [await _birth(stack, f'row 6 planning-born {n}') for n in range(2)]
+    born_at = {
+        task_id: _valid_record((await stack.read(task_id))['metadata']['deferral']).deferred_at
+        for task_id in births
+    }
+
+    bare = await stack.call(
+        'commit_planning', task_ids=','.join(births), target_status='deferred',
+    )
+    restamped = await stack.call(
+        'commit_planning', task_ids=','.join(births), target_status='deferred',
+        deferral=_until_condition('row 6 planning-born'),
+    )
+
+    assert bare['success'] is False, bare
+    assert {one['error'] for one in _per_id(bare).values()} == {'deferral_required'}
+    assert restamped['success'] is True, restamped
+    restamp_events = {
+        event.payload['task_id'] for event in await stack.events('deferral_restamped')
+    }
+    for task_id, one in _per_id(restamped).items():
+        stored = (await stack.read(task_id))['metadata']['deferral']
+        record = _valid_record(stored)
+        assert isinstance(record, task_deferral.UntilConditionDeferral), record
+        assert record.deferred_at == born_at[task_id]
+        assert one['deferral'] == stored
+        assert task_id in restamp_events
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_attributes_agent_id(stack: Stack) -> None:
+    task_id = await _birth(stack, 'row 7 attribution')
+
+    result = await stack.call(
+        'commit_planning', task_ids=task_id, target_status='deferred',
+        deferral=_until_condition('row 7 attribution'), agent_id='claude-commit-6525',
+    )
+
+    assert 'error' not in result, result
+    record = _valid_record((await stack.read(task_id))['metadata']['deferral'])
+    assert record.stamped_by == 'claude-commit-6525'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('planning_mode', [True, False])
+async def test_submit_task_refuses_caller_deferral(stack: Stack, planning_mode: bool) -> None:
+    now = datetime.now(UTC)
+    forged = task_deferral.record_to_json(
+        task_deferral.UntilConditionDeferral(
+            condition='forged', deferred_at=now, stamped_at=now, stamped_by=_AGENT,
+        )
+    )
+    before = len((await stack.interceptor.get_tasks(stack.root))['tasks'])
+
+    result = await stack.call(
+        'submit_task', title='row 8 forged', description='forged record',
+        planning_mode=planning_mode, metadata={'deferral': forged},
+    )
+
+    assert result.get('error') == 'deferral_write_authority', result
+    assert result['path'] == 'metadata.deferral'
+    assert 'ticket' not in result
+    assert len((await stack.interceptor.get_tasks(stack.root))['tasks']) == before
