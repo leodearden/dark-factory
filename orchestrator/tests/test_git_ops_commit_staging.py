@@ -93,7 +93,7 @@ class TestCommitEmbeddedRepoGitlinks:
         (wt / 'work.py').write_text('x = 1\n')
         _plant_embedded_repo(wt, 'scratch/t0', with_commit=True)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.staged_gitlinks'):
             sha = await git_ops.commit(wt, 'wip')
 
         assert isinstance(sha, str) and len(sha) == 40
