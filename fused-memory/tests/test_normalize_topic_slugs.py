@@ -2712,6 +2712,88 @@ class TestFailedRowsAreListedInTheirBuckets:
         _assert_outcomes_match_buckets(report)
 
 
+class TestPartialUngatedGroup:
+    """An ungated slug that only partly moved is listed, with what stood and what did not.
+
+    An ungated group gets no undo, so a partial failure leaves the slug split
+    across both values, and a plain re-run does not finish the move.
+    """
+
+    @staticmethod
+    def _plain_group(gate_tasks=()) -> object:
+        return _one_group([
+            _mod.Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic'),
+            _mod.Rename('dark_factory', 'm2', 'plain_topic', 'plain-topic'),
+        ], gate_tasks)
+
+    @staticmethod
+    def _plain_results(*outcomes: str) -> list[dict]:
+        return [
+            _result(outcome, memory_id=f'm{n}', old_topic='plain_topic', new_topic='plain-topic')
+            for n, outcome in enumerate(outcomes, start=1)
+        ]
+
+    def test_a_partly_moved_ungated_group_names_both_halves(self):
+        entry = _mod.describe_partial_ungated_group(
+            self._plain_group(), self._plain_results('renamed', 'update_failed'))
+
+        assert {key: value for key, value in entry.items() if key != 'note'} == {
+            'reason': 'ungated_partial_rename',
+            'project_id': 'dark_factory',
+            'old_topic': 'plain_topic',
+            'new_topic': 'plain-topic',
+            'stood_memory_ids': ['m1'],
+            'failed_memory_ids': ['m2'],
+            'failed_outcomes': ['update_failed'],
+        }
+        assert 'slug_collision' in entry['note']
+
+    def test_a_rehearsed_rename_counts_as_stood(self):
+        entry = _mod.describe_partial_ungated_group(
+            self._plain_group(), self._plain_results('would_rename', 'memory_not_found'))
+
+        assert entry['stood_memory_ids'] == ['m1']
+        assert entry['failed_outcomes'] == ['memory_not_found']
+
+    @pytest.mark.parametrize(('gate_tasks', 'outcomes'), [
+        pytest.param([_gate_task('4220', 'plain_topic')], ('renamed', 'update_failed'), id='gated'),
+        pytest.param([], ('renamed', 'already_normalized'), id='all_stood'),
+        pytest.param([], ('update_failed', 'rename_error'), id='none_stood'),
+    ])
+    def test_no_entry_unless_an_ungated_slug_is_split(self, gate_tasks, outcomes):
+        assert _mod.describe_partial_ungated_group(
+            self._plain_group(gate_tasks), self._plain_results(*outcomes)) is None
+
+    @pytest.mark.asyncio
+    async def test_a_split_slug_is_reported_and_a_re_run_refuses_the_straggler(self):
+        service, corpus = _run_service({'dark_factory': [
+            _crec('m1', 'legacy_topic'), _crec('m2', 'legacy_topic'),
+        ]})
+        _refuse_writes_to(service, 'm2')
+
+        report = await run_sweep(service, projects=('dark_factory',), apply=True)
+
+        assert corpus.topic_of('dark_factory', 'm1') == 'legacy-topic'
+        assert corpus.topic_of('dark_factory', 'm2') == 'legacy_topic'
+        assert [
+            (e['stood_memory_ids'], e['failed_memory_ids'], e['failed_outcomes'])
+            for e in report['skips'].get('ungated_partial_rename', [])
+        ] == [(['m1'], ['m2'], ['update_failed'])]
+        assert report['outcomes'].get('ungated_partial_rename') == 1
+        assert resolve_exit(report) == 1
+        section = _bucket_section(_mod.render_markdown(report), 'ungated_partial_rename')
+        assert "stood_memory_ids=['m1']" in section
+        assert "failed_memory_ids=['m2']" in section
+
+        second = await run_sweep(corpus.service(), projects=('dark_factory',), apply=True)
+
+        assert [e['memory_ids'] for e in second['skips']['slug_collision']] == [['m2']]
+
+    def test_ungated_partial_rename_is_a_pre_seeded_error_bucket(self):
+        assert 'ungated_partial_rename' in _mod.SKIP_BUCKETS
+        assert 'ungated_partial_rename' in _mod.ERROR_OUTCOMES
+
+
 class TestReportRenderAndCli:
     """The artifacts, the grade and the argument surface."""
 
