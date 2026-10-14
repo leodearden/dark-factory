@@ -67,21 +67,18 @@ TICK_SECONDS = 0.005
 
 #: How long each stubbed blocking primitive sleeps, in the thread it should be
 #: running in — a margin over scheduler jitter, not a timing the code relies on.
-SCAN_BLOCK_SECONDS = 1.0
-PROBE_BLOCK_SECONDS = 1.0
+SCAN_BLOCK_SECONDS = 2.0
+PROBE_BLOCK_SECONDS = 2.0
 
 
 def _max_gap_ceiling(blocked_seconds: float) -> float:
     """The longest loop stall tolerated while *blocked_seconds* of work runs.
 
     A call held on the loop thread stalls it for at least *blocked_seconds*;
-    offloaded, the worst gap is only scheduler jitter.  The ceiling sits at
-    nine tenths of the block: a regression still lands above it, while an
-    offloaded run keeps most of the block as headroom for jitter, which
-    reached 500-900ms under host load averages of 4-6x the core count (a
-    half-block ceiling flaked there).
+    offloaded, the worst gap is only scheduler jitter.  Three quarters of the
+    block sits between the two.
     """
-    return blocked_seconds * 0.9
+    return blocked_seconds * 0.75
 
 
 # ── Local harness scaffolding (mirrors tests/test_harness.py) ────────────────
@@ -360,7 +357,7 @@ class TestArchiveScanLeavesTheLoop:
     async def test_loop_keeps_ticking_while_the_archive_is_scanned(
         self, journal, event_buffer, memory_service, tmp_path, monkeypatch,
     ):
-        """A second of scan must not cost the loop a second of silence.
+        """Seconds of scan must not cost the loop seconds of silence.
 
         Task 901 reads as live so nothing escalates: `_escalate` still fsyncs
         on the loop (task 5270), and under load that stall would be measured
