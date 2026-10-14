@@ -45,8 +45,10 @@ import logging
 import os
 import pwd
 import tempfile
+from collections.abc import Mapping
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -416,6 +418,126 @@ def recorded_age_hours(doc) -> float | None:
     if stamp.tzinfo is None:
         stamp = stamp.replace(tzinfo=UTC)
     return (datetime.now(UTC) - stamp).total_seconds() / 3600.0
+
+
+# ---------------------------------------------------------------------------
+# Retry backlog — the target dates still owed a run
+# ---------------------------------------------------------------------------
+
+RETRY_MAX_AGE_DAYS = 7
+"""Age in days past which an owed target date is abandoned.
+
+At :data:`RETRIES_PER_NIGHT` retries per finished night, oldest first,
+every date of a k-night outage is retried at age k+1, so an outage of up
+to ``RETRY_MAX_AGE_DAYS - 1`` nights is fully recovered and a longer one
+loses only its oldest dates. A module constant, not a ``legibility.yaml``
+field, for the same bare-``python3`` reason as
+:data:`DEFAULT_MAX_BARREN_RUNS`."""
+
+RETRY_MAX_ATTEMPTS = 3
+"""Unfinished passes of one date (its scheduled pass plus retries) after
+which it is abandoned, so a date that fails deterministically cannot hold
+the head of the oldest-first queue until it ages out."""
+
+RETRIES_PER_NIGHT = 1
+"""Retry passes one invocation runs after its own scheduled pass finished.
+It bounds the extra spend to one night's, and it is the rate the
+:data:`RETRY_MAX_AGE_DAYS` recovery bound is derived from."""
+
+
+class RetryFold(NamedTuple):
+    """The backlog after folding one pass, and what that fold abandoned."""
+
+    backlog: dict[date, int]
+    abandoned: dict[date, int]
+
+
+def finished(*, exit_code: int, capped: bool) -> bool:
+    """Whether a pass completed: a clean exit the usage cap did not defer."""
+    return exit_code == 0 and not capped
+
+
+def owes_retry(*, exit_code: int, capped: bool, commit_made: bool) -> bool:
+    """Whether a pass leaves its target date owed a run: it did not
+    finish, and it landed nothing."""
+    return not commit_made and not finished(exit_code=exit_code, capped=capped)
+
+
+def parse_retry_backlog(raw: object) -> dict[date, int]:
+    """Read a recorded ``retry_backlog`` ({ISO date: unfinished attempts}).
+
+    Never raises. A non-mapping gives an empty backlog, and an entry whose
+    key is not an ISO date or whose count is not a positive int is dropped:
+    a damaged backlog under-reports, like a lost streak."""
+    if not isinstance(raw, dict):
+        return {}
+    backlog: dict[date, int] = {}
+    for key, attempts in raw.items():
+        owed = _parse_iso_date(key)
+        if owed is not None and _is_attempt_count(attempts):
+            backlog[owed] = attempts
+    return backlog
+
+
+def _parse_iso_date(raw: object) -> date | None:
+    if not isinstance(raw, str):
+        return None
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def _is_attempt_count(raw: object) -> bool:
+    return isinstance(raw, int) and not isinstance(raw, bool) and raw > 0
+
+
+def _within_window(owed: date, today: date) -> bool:
+    return (today - owed).days <= RETRY_MAX_AGE_DAYS
+
+
+def fold_retry_backlog(
+    backlog: Mapping[date, int],
+    *,
+    target_date: date,
+    owes_retry: bool,
+    today: date,
+) -> RetryFold:
+    """Fold one pass of *target_date* into a copy of *backlog*.
+
+    An unfinished pass adds its date or counts one more attempt; a
+    finished pass removes it. Every entry then outside the age window, or
+    at :data:`RETRY_MAX_ATTEMPTS`, moves to ``abandoned``."""
+    folded = dict(backlog)
+    if owes_retry:
+        folded[target_date] = folded.get(target_date, 0) + 1
+    else:
+        folded.pop(target_date, None)
+    kept = {
+        owed: attempts
+        for owed, attempts in folded.items()
+        if _within_window(owed, today) and attempts < RETRY_MAX_ATTEMPTS
+    }
+    abandoned = {
+        owed: attempts for owed, attempts in folded.items() if owed not in kept
+    }
+    return RetryFold(backlog=kept, abandoned=abandoned)
+
+
+def select_due_retries(
+    backlog: Mapping[date, int],
+    *,
+    today: date,
+    limit: int = RETRIES_PER_NIGHT,
+) -> tuple[date, ...]:
+    """The owed dates to retry now: in-window only, oldest first, at most
+    *limit*."""
+    due = sorted(owed for owed in backlog if _within_window(owed, today))
+    return tuple(due[:limit])
+
+
+def _serialize_retry_backlog(backlog: Mapping[date, int]) -> dict[str, int]:
+    return {owed.isoformat(): backlog[owed] for owed in sorted(backlog)}
 
 
 # ---------------------------------------------------------------------------
