@@ -3935,7 +3935,10 @@ class OrchestratorConfig(BaseSettings):
         default_factory=lambda: {'plan', 'execute', 'verify', 'review'},
         description=(
             'Block phases that trigger auto-eval. Merge/infra failures are '
-            'excluded — they are unlikely to differ on the full path.'
+            'excluded — they are unlikely to differ on the full path; '
+            'infra-class block categories are excluded by '
+            'orchestrator/src/orchestrator/harness.py::'
+            '_AUTO_EVAL_EXCLUDED_BLOCK_CATEGORIES whatever their phase.'
         ),
     )
 

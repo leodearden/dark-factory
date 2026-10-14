@@ -28,7 +28,7 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness, TaskReport
 from orchestrator.module_charter import derive_modules
-from orchestrator.scheduler import Scheduler, TaskAssignment
+from orchestrator.scheduler import Scheduler, SetTaskStatusRejected, TaskAssignment
 from orchestrator.task_status import ACTIVE_TASK_STATUSES
 from orchestrator.workflow import WorkflowOutcome
 
@@ -172,8 +172,16 @@ def _make(
         submit_calls.append((name, args))
         return {'ok': True}
 
+    # The pending flip (and the cancel of a redo whose flip failed) goes
+    # through Scheduler.set_task_status; the supersede cancels of prior redos
+    # still go through dispatch_tool. Both land in ``submit_calls`` as
+    # ('set_task_status', {'id', 'status'}) so tests read one ordered list.
+    async def _set_task_status(task_id: str, status: str) -> None:
+        submit_calls.append(('set_task_status', {'id': task_id, 'status': status}))
+
     scheduler.submit_task = _submit_task
     scheduler.dispatch_tool = _dispatch_recording
+    scheduler.set_task_status = AsyncMock(side_effect=_set_task_status)
 
     return _Fixture(
         harness=harness,
@@ -465,11 +473,19 @@ async def test_original_is_renamed_only_after_the_redo_is_released(tmp_path: Pat
     ]
 
 
-@pytest.mark.asyncio
-async def test_pending_flip_failure_leaves_the_original_untouched(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture,
-):
-    f = _make(project_root=tmp_path / 'proj')
+def _rejecting_flip(f: _Fixture, *, cancel_raises: Exception | None = None) -> None:
+    """Make the redo's pending flip raise; optionally make its cancel raise too."""
+    async def _set_task_status(task_id: str, status: str) -> None:
+        f.submit_calls.append(('set_task_status', {'id': task_id, 'status': status}))
+        if status == 'pending':
+            raise SetTaskStatusRejected(task_id, 'TimeoutError', 'taskmaster restarting')
+        if cancel_raises is not None:
+            raise cancel_raises
+
+    f.harness.scheduler.set_task_status = AsyncMock(side_effect=_set_task_status)
+
+
+def _seed_prior_redo(f: _Fixture) -> None:
     f.harness.scheduler.get_tasks = AsyncMock(return_value=[
         {
             'id': 'redo-old-1',
@@ -478,20 +494,22 @@ async def test_pending_flip_failure_leaves_the_original_untouched(
         },
     ])
 
-    async def _flip_fails(name: str, arguments: dict, *, timeout: float = 15) -> dict:
-        f.submit_calls.append((name, arguments))
-        if name == 'set_task_status' and arguments.get('status') == 'pending':
-            raise RuntimeError('fused-memory unreachable')
-        return {'ok': True}
 
-    f.harness.scheduler.dispatch_tool = _flip_fails
+@pytest.mark.asyncio
+async def test_pending_flip_failure_leaves_the_original_untouched(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+):
+    f = _make(project_root=tmp_path / 'proj')
+    _seed_prior_redo(f)
+    _rejecting_flip(f)
 
     with caplog.at_level('WARNING', logger='orchestrator.harness'):
         await f.harness._maybe_auto_eval(f.assignment, _make_report())
 
-    assert [(c[0], c[1].get('status')) for c in f.submit_calls] == [
-        ('submit_task', None),
-        ('set_task_status', 'pending'),
+    assert [(c[0], c[1].get('id'), c[1].get('status')) for c in f.submit_calls] == [
+        ('submit_task', None, None),
+        ('set_task_status', 'redo-1', 'pending'),
+        ('set_task_status', 'redo-1', 'cancelled'),
     ]
     f.git_ops_rename.assert_not_awaited()
     f.update_task.assert_not_awaited()
@@ -500,6 +518,50 @@ async def test_pending_flip_failure_leaves_the_original_untouched(
     warnings = [r for r in caplog.records if r.levelname == 'WARNING']
     assert len(warnings) == 1
     assert 'redo-1' in warnings[0].getMessage()
+    assert 'cancelled' in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_pending_flip_failure_and_failed_cancel_leave_the_redo_deferred(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+):
+    f = _make(project_root=tmp_path / 'proj')
+    _rejecting_flip(f, cancel_raises=RuntimeError('fused-memory unreachable'))
+
+    with caplog.at_level('WARNING', logger='orchestrator.harness'):
+        await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    f.git_ops_rename.assert_not_awaited()
+    f.update_task.assert_not_awaited()
+    assert f.harness._auto_eval_redo_task_ids == set()
+    assert _auto_eval_events(f) == []
+    warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert 'redo-1' in message
+    assert 'left deferred' in message
+
+
+@pytest.mark.asyncio
+async def test_pending_flip_structured_error_body_is_not_a_release(
+    tmp_path: Path,
+):
+    """A raw dispatch_tool answers a structured error WITHOUT raising; the flip
+    must go through Scheduler.set_task_status, which turns that into a raise."""
+    f = _make(project_root=tmp_path / 'proj')
+
+    async def _error_body(name: str, args: dict, *, timeout: float = 15) -> dict:
+        f.submit_calls.append((name, args))
+        return {'error': 'TimeoutError(...)', 'error_type': 'TimeoutError'}
+
+    f.harness.scheduler.dispatch_tool = _error_body  # pyright: ignore[reportAttributeAccessIssue]
+    _rejecting_flip(f)
+
+    await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    f.git_ops_rename.assert_not_awaited()
+    f.update_task.assert_not_awaited()
+    assert f.harness._auto_eval_redo_task_ids == set()
 
 
 @pytest.mark.asyncio
@@ -980,7 +1042,7 @@ async def test_supersede_cancel_failure_is_isolated(tmp_path: Path):
     assert cancelled_ids == {'redo-old-1', 'redo-old-2'}
 
     flipped = [
-        c for c in calls
+        c for c in f.submit_calls
         if c[0] == 'set_task_status' and c[1].get('status') == 'pending'
     ]
     assert len(flipped) == 1
