@@ -15,12 +15,13 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
+import _project_root_stores as stores
 import pytest
 from _pending_tool_fixtures import _file
+from _project_root_stores import storm_records
 from fastmcp import Client, FastMCP
 from mcp.types import TextContent
 
-from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
 from escalation.store_identity import StoreIdentity
@@ -45,10 +46,6 @@ async def call(server, name: str, **kw: Any) -> Any:
     return result
 
 
-def storm_records(queue: EscalationQueue) -> list[Escalation]:
-    return [e for e in queue.get_pending() if e.category == 'infra_issue' and e.level == 1]
-
-
 async def assert_refused(
     server, kwargs_for: Callable[[str], dict[str, Any]], root: str, names: Iterable[str],
 ) -> None:
@@ -59,21 +56,17 @@ async def assert_refused(
 
 @pytest.fixture
 def proj(tmp_path: Path) -> Path:
-    path = tmp_path / 'proj'
-    path.mkdir()
-    return path
+    return stores.make_root(tmp_path, 'proj')
 
 
 @pytest.fixture
 def other(tmp_path: Path) -> Path:
-    path = tmp_path / 'other'
-    path.mkdir()
-    return path
+    return stores.make_root(tmp_path, 'other')
 
 
 @pytest.fixture
 def queue(proj: Path) -> EscalationQueue:
-    return EscalationQueue(proj / 'esc')
+    return stores.project_queue(proj)
 
 
 @pytest.fixture
@@ -94,10 +87,8 @@ def kwargs_for(seeded_id: str) -> Callable[[str], dict[str, Any]]:
 
 
 @pytest.fixture
-def project_identity(proj: Path) -> StoreIdentity:
-    return StoreIdentity(
-        kind='project', queue_dir=proj / 'esc', project_id='proj', project_root=proj,
-    )
+def project_identity(queue: EscalationQueue, proj: Path) -> StoreIdentity:
+    return stores.project_identity(queue, proj)
 
 
 @pytest.fixture
@@ -112,15 +103,14 @@ def bare_server(queue: EscalationQueue) -> FastMCP:
 
 @pytest.fixture
 def recon_queue(tmp_path: Path) -> EscalationQueue:
-    return EscalationQueue(tmp_path / 'recon')
+    return stores.recon_queue(tmp_path)
 
 
 @pytest.fixture
 def recon_server(recon_queue: EscalationQueue) -> FastMCP:
-    identity = StoreIdentity(
-        kind='reconciliation', queue_dir=recon_queue.queue_dir, project_id=None, project_root=None,
+    return create_server(
+        recon_queue, startup_sweep=False, store_identity=stores.recon_identity(recon_queue),
     )
-    return create_server(recon_queue, startup_sweep=False, store_identity=identity)
 
 
 @pytest.fixture

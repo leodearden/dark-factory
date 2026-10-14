@@ -12,7 +12,9 @@ import re
 import threading
 from pathlib import Path
 
+import _project_root_stores as stores
 import pytest
+from _project_root_stores import storm_records
 
 from escalation.mismatch_streak import DEFAULT_MISMATCH_STREAK_THRESHOLD, MismatchStreak
 from escalation.models import Escalation
@@ -22,46 +24,34 @@ from escalation.store_identity import StoreIdentity
 REFUSAL = 'project_root mismatch: the refusal text the caller saw'
 
 
-def storm(queue: EscalationQueue) -> list[Escalation]:
-    return [e for e in queue.get_pending() if e.category == 'infra_issue' and e.level == 1]
-
-
 @pytest.fixture
 def proj(tmp_path: Path) -> Path:
-    path = tmp_path / 'proj'
-    path.mkdir()
-    return path
-
-
-@pytest.fixture
-def queue(proj: Path) -> EscalationQueue:
-    return EscalationQueue(proj / 'esc')
-
-
-@pytest.fixture
-def project_identity(queue: EscalationQueue, proj: Path) -> StoreIdentity:
-    return StoreIdentity(
-        kind='project', queue_dir=queue.queue_dir, project_id='proj', project_root=proj,
-    )
-
-
-@pytest.fixture
-def recon_queue(tmp_path: Path) -> EscalationQueue:
-    return EscalationQueue(tmp_path / 'recon')
-
-
-@pytest.fixture
-def recon_identity(recon_queue: EscalationQueue) -> StoreIdentity:
-    return StoreIdentity(
-        kind='reconciliation', queue_dir=recon_queue.queue_dir, project_id=None, project_root=None,
-    )
+    return stores.make_root(tmp_path, 'proj')
 
 
 @pytest.fixture
 def other(tmp_path: Path) -> Path:
-    path = tmp_path / 'other'
-    path.mkdir()
-    return path
+    return stores.make_root(tmp_path, 'other')
+
+
+@pytest.fixture
+def queue(proj: Path) -> EscalationQueue:
+    return stores.project_queue(proj)
+
+
+@pytest.fixture
+def project_identity(queue: EscalationQueue, proj: Path) -> StoreIdentity:
+    return stores.project_identity(queue, proj)
+
+
+@pytest.fixture
+def recon_queue(tmp_path: Path) -> EscalationQueue:
+    return stores.recon_queue(tmp_path)
+
+
+@pytest.fixture
+def recon_identity(recon_queue: EscalationQueue) -> StoreIdentity:
+    return stores.recon_identity(recon_queue)
 
 
 def _record_n(streak: MismatchStreak, identity: StoreIdentity, root: str, n: int) -> list[bool]:
@@ -78,10 +68,10 @@ class TestDefaultThreshold:
         streak = MismatchStreak(queue)
 
         assert _record_n(streak, project_identity, str(other), 4) == [False] * 4
-        assert storm(queue) == []
+        assert storm_records(queue) == []
 
         assert streak.record_mismatch(project_identity, str(other), REFUSAL) is True
-        assert len(storm(queue)) == 1
+        assert len(storm_records(queue)) == 1
 
 
 class TestThresholdValidation:
@@ -98,7 +88,7 @@ class TestRecordShape:
         streak = MismatchStreak(queue, threshold=3)
         _record_n(streak, project_identity, str(other), 3)
 
-        records = storm(queue)
+        records = storm_records(queue)
         assert len(records) == 1
         esc = records[0]
         assert esc.category == 'infra_issue'
@@ -118,7 +108,7 @@ class TestRecordShape:
         streak = MismatchStreak(recon_queue, threshold=3)
         _record_n(streak, recon_identity, str(other), 3)
 
-        records = storm(recon_queue)
+        records = storm_records(recon_queue)
         assert len(records) == 1
         assert 'reconciliation' in records[0].summary
         assert str(recon_queue.queue_dir) in records[0].summary
@@ -132,12 +122,12 @@ class TestReArm:
         _record_n(streak, project_identity, str(other), 3)
 
         assert _record_n(streak, project_identity, str(other), 2) == [False, False]
-        records = storm(queue)
+        records = storm_records(queue)
         assert len(records) == 1
         assert records[0].dedupe_count == 0
 
         assert streak.record_mismatch(project_identity, str(other), REFUSAL) is True
-        records = storm(queue)
+        records = storm_records(queue)
         assert len(records) == 1
         assert records[0].dedupe_count == 1
 
@@ -146,12 +136,12 @@ class TestReArm:
     ) -> None:
         streak = MismatchStreak(queue, threshold=3)
         _record_n(streak, project_identity, str(other), 3)
-        first_id = storm(queue)[0].id
+        first_id = storm_records(queue)[0].id
         queue.resolve(first_id, 'fixed')
 
         _record_n(streak, project_identity, str(other), 3)
 
-        records = storm(queue)
+        records = storm_records(queue)
         assert len(records) == 1
         assert records[0].id != first_id
 
@@ -167,12 +157,12 @@ class TestPerRootStreaks:
         for _ in range(2):
             assert streak.record_mismatch(project_identity, str(root_a), REFUSAL) is False
             assert streak.record_mismatch(project_identity, str(root_b), REFUSAL) is False
-        assert storm(queue) == []
+        assert storm_records(queue) == []
 
         assert streak.record_mismatch(project_identity, str(root_a), REFUSAL) is True
         assert streak.record_mismatch(project_identity, str(root_b), REFUSAL) is True
 
-        records = storm(queue)
+        records = storm_records(queue)
         assert len(records) == 2
         assert records[0].task_id != records[1].task_id
         by_root = {
@@ -192,7 +182,7 @@ class TestPerRootStreaks:
         fired = [streak.record_mismatch(project_identity, s, REFUSAL) for s in spellings]
 
         assert fired == [False, False, True]
-        assert len(storm(queue)) == 1
+        assert len(storm_records(queue)) == 1
 
     def test_awkward_root_still_files(
         self, tmp_path: Path, queue: EscalationQueue, project_identity: StoreIdentity,
@@ -202,7 +192,7 @@ class TestPerRootStreaks:
 
         assert _record_n(streak, project_identity, str(awkward), 3)[-1] is True
 
-        records = storm(queue)
+        records = storm_records(queue)
         assert len(records) == 1
         assert re.fullmatch(r'[A-Za-z0-9._-]+', records[0].task_id)
 
@@ -220,9 +210,7 @@ class TestFilingFailure:
                 raise OSError('disk full')
 
         broken = _BrokenQueue(tmp_path / 'broken')
-        identity = StoreIdentity(
-            kind='project', queue_dir=broken.queue_dir, project_id='proj', project_root=proj,
-        )
+        identity = stores.project_identity(broken, proj)
         streak = MismatchStreak(broken, threshold=3)
 
         with caplog.at_level(logging.WARNING, logger='escalation.mismatch_streak'):
@@ -232,7 +220,7 @@ class TestFilingFailure:
             r.name == 'escalation.mismatch_streak' and r.levelno >= logging.WARNING
             for r in caplog.records
         )
-        assert storm(broken) == []
+        assert storm_records(broken) == []
 
 
 class TestConcurrency:
@@ -259,4 +247,4 @@ class TestConcurrency:
 
         assert len(results) == workers
         assert results.count(True) == 1
-        assert len(storm(queue)) == 1
+        assert len(storm_records(queue)) == 1
