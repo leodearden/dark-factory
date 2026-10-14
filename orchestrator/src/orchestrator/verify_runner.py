@@ -593,7 +593,8 @@ async def run_merge_verify_on_worktree(
     task_files = tuple(spec.task_files) if spec.task_files is not None else None
 
     # Fix (a), task 2822 — the merge-deciding profile rides the spec, so the
-    # host's own --config can no longer narrow it.
+    # host's own --config can no longer narrow it; task 6127 — nor skip the
+    # dispatcher's cold-venv pre-provision.
     config = apply_spec_to_host_config(
         config,
         verify_env=spec.verify_env,
@@ -603,6 +604,7 @@ async def run_merge_verify_on_worktree(
             'merge_verify_workspace': spec.merge_verify_workspace,
             'merge_verify_breadth': spec.merge_verify_breadth,
         },
+        verify_cold_preprovision_command=spec.verify_cold_preprovision_command,
     )
 
     runner = LocalRunner(

@@ -189,17 +189,13 @@ def apply_task_verify_spec(
     env is applied once, at config level.
     """
     module_configs = [module_config_from_command(vc) for vc in spec.verify_commands]
-    field_overrides: dict[str, object] = {'scope_cargo': spec.scope_cargo}
-    if spec.verify_cold_preprovision_command:
-        field_overrides['verify_cold_preprovision_command'] = (
-            spec.verify_cold_preprovision_command
-        )
     applied = apply_spec_to_host_config(
         config,
         verify_env=spec.verify_env,
         global_verify_command=spec.global_verify_command,
         module_configs=module_configs,
-        field_overrides=field_overrides,
+        field_overrides={'scope_cargo': spec.scope_cargo},
+        verify_cold_preprovision_command=spec.verify_cold_preprovision_command,
     )
     return applied, module_configs
 
