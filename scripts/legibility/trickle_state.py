@@ -67,7 +67,8 @@ fallback, so no reader can MIS-READ a document that lacks it. Bumping
 would make every live state file on every project read ``malformed`` on
 the first post-deploy probe — one guaranteed false alarm per project,
 plus a reset streak — which is precisely the degradation this module
-exists to close.
+exists to close. ``capped`` and ``retry_backlog`` (task 5678) are further
+additive fields under the same rule.
 
 THE RULE FOR THE NEXT PERSON: bump only for a change that would make an
 OLD reader MIS-READ a NEW document. Adding a field an old reader ignores
@@ -559,9 +560,14 @@ def record_run(
     applied: int = 0,
     commit_made: bool = False,
     budget_suppressed: bool = False,
+    capped: bool = False,
 ) -> dict:
     """Classify this run, fold it into the running streak, and write the
     state file atomically. Returns the document it wrote.
+
+    The run is also folded into ``retry_backlog`` by
+    :func:`fold_retry_backlog`, so a date whose pass did not finish stays
+    owed a run.
 
     ``recorded_at`` is an INJECTED parameter, not a ``datetime.now()``
     inside this function, so the whole module stays clock-injectable and
@@ -654,6 +660,7 @@ def record_run(
         'applied': applied,
         'commit_made': bool(commit_made),
         'budget_suppressed': bool(budget_suppressed),
+        'capped': bool(capped),
         'consecutive_barren_runs': (
             prev_streak + 1 if outcome == OUTCOME_BARREN
             else prev_streak if outcome == OUTCOME_FAILED
@@ -671,8 +678,100 @@ def record_run(
             'budget_skipped': budget_skipped,
             'selected_count': selected_count,
         },
+        'retry_backlog': _next_retry_backlog(
+            project_id,
+            prev,
+            target_date=target_date,
+            recorded_at=recorded_at,
+            exit_code=exit_code,
+            capped=capped,
+            commit_made=commit_made,
+        ),
     }
 
+    _write_state(path, doc)
+    return doc
+
+
+def record_retry(
+    project_id: str,
+    *,
+    target_date: date,
+    recorded_at: datetime,
+    exit_code: int,
+    capped: bool,
+    commit_made: bool,
+) -> dict | None:
+    """Fold one RETRY pass of *target_date* into the recorded backlog.
+    Returns the document it wrote, or ``None`` when it wrote nothing.
+
+    A retry pass rewrites ONLY ``retry_backlog``, so the health record, and
+    the ``recorded_at`` freshness both probes read, keep describing the
+    scheduled night. With no readable predecessor there is no backlog to
+    fold into: it logs one WARNING and writes nothing."""
+    path = trickle_state_path(project_id)
+    status, prev = load_state(path)
+    if prev is None:
+        logger.warning(
+            'trickle state: cannot record retry of %s for project=%s: no '
+            'readable trickle state (%s)',
+            target_date.isoformat(),
+            project_id,
+            status,
+        )
+        return None
+
+    doc = {
+        **prev,
+        'retry_backlog': _next_retry_backlog(
+            project_id,
+            prev,
+            target_date=target_date,
+            recorded_at=recorded_at,
+            exit_code=exit_code,
+            capped=capped,
+            commit_made=commit_made,
+        ),
+    }
+    _write_state(path, doc)
+    return doc
+
+
+def _next_retry_backlog(
+    project_id: str,
+    prev: dict | None,
+    *,
+    target_date: date,
+    recorded_at: datetime,
+    exit_code: int,
+    capped: bool,
+    commit_made: bool,
+) -> dict[str, int]:
+    today = recorded_at.date()
+    fold = fold_retry_backlog(
+        parse_retry_backlog(None if prev is None else prev.get('retry_backlog')),
+        target_date=target_date,
+        owes_retry=owes_retry(
+            exit_code=exit_code, capped=capped, commit_made=commit_made
+        ),
+        today=today,
+    )
+    for owed, attempts in sorted(fold.abandoned.items()):
+        logger.warning(
+            'trickle retry backlog: abandoning %s for project=%s after %d '
+            'unfinished attempt(s), age %d day(s) (limits: %d attempts, %d '
+            'days) — its sightings are permanently lost to the trickle',
+            owed.isoformat(),
+            project_id,
+            attempts,
+            (today - owed).days,
+            RETRY_MAX_ATTEMPTS,
+            RETRY_MAX_AGE_DAYS,
+        )
+    return _serialize_retry_backlog(fold.backlog)
+
+
+def _write_state(path: Path, doc: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(path.name + '.tmp')
     try:
@@ -684,8 +783,6 @@ def record_run(
         with contextlib.suppress(OSError):
             tmp_path.unlink()
         raise
-
-    return doc
 
 
 DEFAULT_MAX_BARREN_RUNS = 3
