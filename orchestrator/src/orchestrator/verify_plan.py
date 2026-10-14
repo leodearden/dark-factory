@@ -282,10 +282,8 @@ class VerifyPlan:
         }
 
 
-def log_dropped_chain_clauses(
-    log: logging.Logger, raw: str, keyword: str, retained: str,
-) -> None:
-    """Report onto *log* the trailing chain clauses a gate REJECT discarded from *raw*.
+def _log_dropped_chain_clauses(raw: str, keyword: str, retained: str) -> None:
+    """Report the trailing chain clauses a gate REJECT discarded from *raw*.
 
     Shared by BOTH scopers — ``scope_prefix_to_keyword`` below and
     ``verify._scope_to_keyword``, which passes its own module logger — so the
@@ -335,7 +333,7 @@ def log_dropped_chain_clauses(
     keyword rule buried at DEBUG under fan-out prose.
     """
     dropped, fan_out = describe_dropped_clauses(raw, retained, keyword)
-    log.log(
+    logger.log(
         logging.DEBUG if fan_out else logging.INFO,
         'scope-to-keyword %r dropped %d trailing chain clause(s) from %r '
         '(gate rejected tail preservation) — %s',
@@ -349,10 +347,6 @@ def log_dropped_chain_clauses(
         # dropped clauses rather than from the keyword.
         else 'a sibling check chained onto this command will NOT run for this '
         'verify',
-        # Attribute the record to the CALLING scoper, not to this shared
-        # helper — otherwise every record, from either scoper, points at the
-        # same line here and the file/line is useless for telling them apart.
-        stacklevel=2,
     )
 
 
@@ -451,7 +445,7 @@ def scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> VerifyC
     # `retained` is what makes the reported count right: it is the truncation
     # point, so the clauses past it are exactly the ones this call discards.
     if has_unpreserved_chain_clauses(raw, tail):
-        log_dropped_chain_clauses(logger, raw, keyword, retained)
+        _log_dropped_chain_clauses(raw, keyword, retained)
     scoped = strip_cwd(promote_cwd_to_project(scope_to(prefix_parsed, files)))
     if not tail:
         return scoped

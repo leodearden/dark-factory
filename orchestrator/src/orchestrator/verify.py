@@ -89,17 +89,12 @@ from orchestrator.verify_cmd import (
     apply_pytest_numprocesses,
     cargo_scope,
     govern_cpu,
-    has_unpreserved_chain_clauses,
-    keyword_truncation_end,
     parse_config_command,
-    promote_cwd_to_project,
     render,
     reproject,
-    scope_to,
     serial_pytest,
     split_and_chain_segments,
     split_chain_tail,
-    strip_cwd,
     with_junitxml,
     with_pytest_timeout,
 )
@@ -166,117 +161,12 @@ class VerifyInfraError(Exception):
 
 
 def _scope_to_keyword(cmd: str | None, keyword: str, files: list[str]) -> str | None:
-    """Narrow *cmd* to *files* by parsing the prefix through *keyword*, scoping, and rendering.
+    """*cmd* narrowed to *files* and rendered back to a shell string; ``None`` passes through.
 
-    Replaces the historical ``_scope_command`` + ``_strip_directory_flag`` /
-    ``_strip_leading_cd`` pairing: everything in *cmd* up to and including
-    the first occurrence of *keyword* is parsed as one tool invocation
-    (folding in any leading ``cd <dir> &&`` or uv ``--project``/
-    ``--directory`` context), its targets are replaced by *files*, any cwd
-    shift is cleared (the new targets are worktree-root-relative), and the
-    result is rendered back to a shell string. This eliminates the old
-    dash-token-harvesting mangling (verify.py's historical ``_scope_command``
-    regression): ``scope_to`` only ever replaces targets, never re-derives
-    flags from unparsed remainder text.
-
-    Returns *cmd* unchanged (no scoping applied) when: *cmd* is ``None``;
-    *keyword* is not present in *cmd* (nothing recognisable to scope, e.g. a
-    no-op ``'true'`` or a ``mypy``-based command); or the *keyword*-prefix
-    does not parse into a single recognised, structured tool invocation
-    (P1 — an OPAQUE or raw-retained/unparseable prefix is left untouched
-    rather than truncated into a possibly-broken argv).
-
-    Content after the matched *keyword* occurrence is truncated WITHIN the
-    matched segment: a value-taking flag positioned after the target (e.g.
-    ``'ruff check src/ --select E'``) would otherwise have its value misread
-    as an extra target by ``scope_to``, so truncating first is what keeps
-    this safe.
-
-    A trailing ``&&``-chained clause is a separate question, decided by
-    ``verify_cmd.split_chain_tail``: a SIBLING CHECKER (a different tool, no
-    ``cd`` sequencing — every subproject's ``lint_command`` chains a
-    ``python3 .../check_*.py <dir>`` gate after ``ruff check``) is PRESERVED
-    unscoped and verbatim, because it asserts a whole-directory invariant
-    that narrowing would break; a SAME-TOOL FAN-OUT (the root config's ``cd X
-    && npx pyright`` chain) is still dropped, since preserving it would run
-    two more subprojects unscoped AND leave a ``cd ../orchestrator`` that
-    misresolves once ``strip_cwd`` has removed the leading ``cd``.
-
-    The PYTEST slot is excluded from tail preservation outright (task 3218):
-    ``'pytest'`` is off the gate's ``_TAIL_PRESERVING_KEYWORDS``, so a
-    chained ``test_command`` always truncates and the scoped result stays
-    STRUCTURED — which is what keeps ``with_junitxml`` and
-    ``with_pytest_timeout`` live on it. A preserved tail there would have
-    silently cost the junit report that drives
-    ``_extract_failing_test_ids_from_junit``, flake confirmation and the
-    per-test timeout floor. The dropped clauses are not silent: a
-    multi-clause command whose tail the gate rejects is reported by
-    ``verify_plan.log_dropped_chain_clauses`` below, naming the keyword and
-    the dropped-clause count — at DEBUG when a dropped clause re-invokes the
-    tool (an intended same-tool fan-out truncation), at INFO when none does (a
-    sibling check that will now never run), independent of which slot is
-    running. The record is emitted only on the rewriting path: both bail-outs
-    below return *cmd* with its chain intact, so nothing is dropped there and
-    nothing is reported.
-
-    Lockstep with ``verify_plan.scope_prefix_to_keyword`` (the ``VerifyCmd``-
-    layer counterpart) is now STRUCTURAL rather than a convention: both route
-    through that one shared ``split_chain_tail`` gate. When the gate rejects,
-    ``head is cmd`` and ``tail == ''``, so the body below collapses to its
-    pre-gate form byte-for-byte. Both bail-outs return *cmd* — the full
-    original, never ``head`` — so a gate-accepted command can never be
-    silently truncated on the unparseable path.
+    The string form of ``verify_plan.py::scope_prefix_to_keyword``, which owns the scoping
+    rule (keyword truncation, chain-tail preservation, bail-outs, and the dropped-clause record).
     """
-    if cmd is None:
-        return None
-    head, tail = split_chain_tail(cmd, keyword)
-    idx = head.find(keyword)
-    if idx == -1:
-        return cmd
-    # Task 3931 / esc-3805-1: token-aware, not a bare byte-offset slice. The
-    # old `head[: idx + len(keyword)]` cut mid-token at the `@` of a pinned npx
-    # package spec, silently dropping `@1.1.408` before the string was
-    # re-parsed — so the gate advertised a pinned pyright and ran whatever npx
-    # last cached. See `keyword_truncation_end` for the boundary rule and why
-    # it is anchored on `@` rather than "keep the whole token"; the shared
-    # helper is also what keeps this in structural lockstep with
-    # `verify_plan.scope_prefix_to_keyword`.
-    retained = head[: keyword_truncation_end(head, idx + len(keyword))]
-    parsed = parse_config_command(retained)
-    if parsed.tool is ToolKind.OPAQUE or parsed.raw is not None:
-        return cmd
-    # Sited AFTER both bail-outs on purpose: each of them returns *cmd* — the
-    # whole original, chain and all — so a gate REJECT costs nothing there and
-    # a record would name clauses that in fact still run. Only the rewriting
-    # path below actually discards them. A record that does not correspond to
-    # a real drop is the same failure mode this log exists to avoid.
-    #
-    # The LEVEL follows what was actually dropped, not which slot is running.
-    # A dropped clause that re-invokes the tool at an argv head is an intended
-    # same-tool fan-out -> DEBUG, not the WARNING the reverse-dependency
-    # widening's no-op uses further down this module: BOTH root configs are
-    # that case and hit it on every fallback verify, so a louder level would be
-    # steady noise that trains operators to ignore the record. A dropped clause
-    # that does NOT invoke the tool is a sibling check that will now never run
-    # -> INFO, the possible-false-GREEN direction, the same level
-    # `_with_junitxml_str` uses for the missing junit report.
-    #
-    # Keying that on `keyword == 'pytest'` instead — the first spelling of this
-    # record — got it backwards on the live config: this repo's root
-    # `test_command` is a pure pytest fan-out with no sibling checker anywhere,
-    # and was reported at INFO as a dropped sibling check on every fallback
-    # verify that scopes it.
-    #
-    # The record itself is `verify_plan`'s, emitted onto THIS module's logger.
-    # Sharing the one implementation is what makes the two scopers' records
-    # read alike structurally rather than by hand-mirroring — the same
-    # argument that put the tail-preservation policy in one shared gate.
-    # `retained` is the truncation point, so the clauses past it are exactly
-    # the ones this call discards — which is what makes the count right.
-    if has_unpreserved_chain_clauses(cmd, tail):
-        verify_plan.log_dropped_chain_clauses(logger, cmd, keyword, retained)
-    rendered = render(strip_cwd(promote_cwd_to_project(scope_to(parsed, files))))
-    return f'{rendered} {tail}' if tail else rendered
+    return None if cmd is None else render(verify_plan.scope_prefix_to_keyword(cmd, keyword, files))
 
 
 def _reproject_str(cmd: str | None, project: str) -> str | None:
