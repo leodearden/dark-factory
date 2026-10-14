@@ -731,6 +731,42 @@ class TestStateMachineLegalityAndConsistency:
         assert outcome_allows_status(report.outcome, last_status)
         assert report.phase == workflow.machine.state
 
+    async def test_row6_exit_while_an_action_teardown_owns_the_row_is_unjudged(
+        self, config, git_ops, task_assignment, monkeypatch, caplog,
+    ):
+        """A Table-B restart tears the slot down mid-run: the harness writes
+        'pending' and absorbs this workflow's own 'blocked' write.  The row is
+        the teardown's, so the outcome<->status half goes unjudged — the same
+        carve-out as eval mode and a hard cancel."""
+        from shared.cli_invoke import AllAccountsCappedException
+
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        event_store = MagicMock()
+        workflow.event_store = event_store
+        tid = workflow.task_id
+
+        async def raise_cap_exc(*args, **kwargs):
+            scheduler.blocked_write_suppressed_ids.add(tid)
+            await scheduler.set_task_status(tid, 'pending')
+            raise AllAccountsCappedException(
+                retries=3, elapsed_secs=120.0, label='Task 42 [architect]',
+            )
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', raise_cap_exc)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
+        )
+        caplog.set_level(logging.WARNING, logger=_EXIT_CONTRACT_LOGGER)
+
+        report = await workflow.run()
+
+        assert report.outcome == WorkflowOutcome.BLOCKED
+        assert scheduler.statuses[tid][-1] == 'pending'
+        assert _exit_contract_records(caplog, 'violation') == []
+        assert _exit_contract_events(event_store) == []
+
     async def test_row6_warmlane_requeued_run_is_consistent(self, tmp_path: Path):
         """REQUEUED run (reuses test_workflow_warm_lane_requeue setup)."""
         from orchestrator.git_ops import WarmLanePoolHardDown
