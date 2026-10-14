@@ -57,6 +57,9 @@ from fused_memory.reconciliation.cli_stage_runner import (
     _normalize_report,
     run_stage_via_cli,
 )
+from fused_memory.reconciliation.consolidation_auto_executor import (
+    auto_consolidation_initial_stats,
+)
 from fused_memory.reconciliation.live_workflow_section import NO_PER_TASK_SIGNAL_TOKEN
 from fused_memory.reconciliation.prompts import (
     ESCALATION_BOUNDARY_NOTE,
@@ -2420,6 +2423,11 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # human-gate-owned, so the deterministic gate-owned
             # suggested_action normalizer rewrites nothing.
             'gate_owned_suggested_actions_normalized': 0,
+            # The auto-consolidation post-step's keys (task 5240). This bare
+            # AsyncMock memory's enabled_projects contains nothing, so the
+            # post-step stops at its project gate.
+            **auto_consolidation_initial_stats(),
+            'auto_consolidations_skipped_project': 1,
             # THIRTEEN keys from the two stale-edge sweeps, not the four this
             # task added (task 4386).  The count is what needs explaining: the
             # consolidator's per-sweep `else:` branch copies out the WHOLE key
@@ -2629,6 +2637,11 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # human-gate-owned, so the deterministic gate-owned
             # suggested_action normalizer rewrites nothing.
             'gate_owned_suggested_actions_normalized': 0,
+            # The auto-consolidation post-step's keys (task 5240). This bare
+            # AsyncMock memory's enabled_projects contains nothing, so the
+            # post-step stops at its project gate.
+            **auto_consolidation_initial_stats(),
+            'auto_consolidations_skipped_project': 1,
             # THIRTEEN keys from the two stale-edge sweeps, not the four this
             # task added (task 4386).  The count is what needs explaining: the
             # consolidator's per-sweep `else:` branch copies out the WHOLE key
