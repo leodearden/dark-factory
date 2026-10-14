@@ -1023,7 +1023,7 @@ def _node():
 # three scripts load in index.html's order because each destructures the one
 # before it at module scope, and `document` stays undefined on purpose: data.js
 # starts polling only in a real browser document, so without one it loads
-# inert (data_poll.test.mjs::loadDataJs records why).
+# inert (dashboard/tests/js/_data_loader.mjs::loadDataJs records why).
 _ON_DEMAND_CLIENT = r"""
 const fs = require('fs');
 const path = require('path');
