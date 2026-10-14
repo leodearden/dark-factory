@@ -5,8 +5,18 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { createRequire } from 'node:module';
-import { REPO_ROOT, cdnScriptTag, sha384Digest } from './_served_bundle.mjs';
+import {
+  REDUX_DIR,
+  REPO_ROOT,
+  babelScriptSrcs,
+  cdnScriptTag,
+  classicScriptSrcs,
+  readIndexHtml,
+  sha384Digest,
+} from './_served_bundle.mjs';
+import { buildDashboardWindow, toolchainPackageDir } from './dom_harness.mjs';
 
 const ROOT_PACKAGE_JSON = path.join(REPO_ROOT, 'package.json');
 const REACT_PACKAGES = ['react', 'react-dom'];
@@ -60,5 +70,130 @@ test('package.json pins jsdom to a bare exact version', () => {
     EXACT_VERSION_RE,
     `${ROOT_PACKAGE_JSON} must pin devDependencies.jsdom to a bare X.Y.Z. ` +
       'Remedy: npm install --save-dev --save-exact jsdom@<version>',
+  );
+});
+
+// ── The window the render tests mount into ────────────────────────────────
+
+function openWindow(t, options) {
+  const harness = buildDashboardWindow(options);
+  t.after(() => harness.close());
+  return harness;
+}
+
+function everyLocalScriptInExecutionOrder() {
+  const html = readIndexHtml();
+  return [...classicScriptSrcs(html), ...babelScriptSrcs(html)];
+}
+
+test('the harness evaluates every local script in browser execution order: classic tags, then text/babel', t => {
+  const { loaded, excluded } = openWindow(t);
+  assert.deepEqual(
+    loaded,
+    everyLocalScriptInExecutionOrder().filter(src => !excluded.includes(src)),
+    'Babel-standalone runs the text/babel tags after every classic script, each group in document order',
+  );
+});
+
+test('the harness leaves out exactly app.jsx, the page bootstrap', t => {
+  const { loaded, excluded } = openWindow(t);
+  assert.deepEqual(excluded, ['app.jsx']);
+  assert.deepEqual(
+    new Set([...loaded, ...excluded]),
+    new Set(everyLocalScriptInExecutionOrder()),
+    'every local script index.html loads must be either evaluated or deliberately excluded',
+  );
+});
+
+test('a script that fails to evaluate fails the build, naming the file (negative control)', () => {
+  const readSource = src =>
+    src === 'spark_path.js' ? 'throw new Error("boom");' : fs.readFileSync(path.join(REDUX_DIR, src), 'utf8');
+  assert.throws(
+    () => buildDashboardWindow({ readSource }),
+    err => err.message.includes('spark_path.js') && err.message.includes('boom'),
+    'a script that throws on load must fail the build loudly, never return a partially loaded window',
+  );
+});
+
+test('the window exposes the helpers and tabs the render tests mount', t => {
+  const { window } = openWindow(t);
+  for (const name of ['DF_TASK_ROW_CELLS', 'DF_BURNDOWN_BANDS', 'DF_PINS_RECOVERY']) {
+    assert.ok(window[name], `window.${name} is not set after the load`);
+  }
+  for (const tab of ['OrchTab', 'BurnTab', 'EscalationsTab', 'EscalationAnalyticsTab']) {
+    assert.equal(typeof window.DF_TABS?.[tab], 'function', `window.DF_TABS.${tab} is not a component`);
+  }
+  assert.equal(typeof window.DF_TASKS?.TasksTab, 'function', 'window.DF_TASKS.TasksTab is not a component');
+});
+
+test('the window runs React at the version index.html loads', t => {
+  const { window } = openWindow(t);
+  assert.equal(window.React.version, cdnScriptTag('react').version);
+  assert.equal(window.ReactDOM.version, cdnScriptTag('react-dom').version);
+});
+
+test('the load writes nothing to console.error', t => {
+  const { consoleErrors } = openWindow(t);
+  assert.deepEqual(consoleErrors, []);
+});
+
+test('consecutive windows are isolated from each other', t => {
+  const first = openWindow(t);
+  first.window.DF_DATA.PROJECTS.push({ id: 'leaked-from-first-window', name: 'leak' });
+  const second = openWindow(t);
+  assert.ok(
+    !second.window.DF_DATA.PROJECTS.some(p => p.id === 'leaked-from-first-window'),
+    "a mutation to one window's DF_DATA is visible in the next",
+  );
+});
+
+function liveTimerCount() {
+  return process.getActiveResourcesInfo().filter(kind => kind === 'Timeout').length;
+}
+
+test('close() leaves no live timer behind, though data.js starts polling on load', () => {
+  const before = liveTimerCount();
+  const harness = buildDashboardWindow();
+  try {
+    assert.ok(
+      liveTimerCount() > before,
+      'data.js polling armed no timer in the open window, so the check below would prove nothing',
+    );
+  } finally {
+    harness.close();
+  }
+  assert.equal(liveTimerCount(), before, 'a timer outlived close(); it would hold `node --test` open');
+});
+
+// ── A missing or stale toolchain fails with its remedy, never a skip ──────
+
+function scratchRoot(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dom-harness-root-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.copyFileSync(path.join(REPO_ROOT, 'package-lock.json'), path.join(root, 'package-lock.json'));
+  return root;
+}
+
+test('a checkout with no node_modules fails with the npm ci remedy', t => {
+  const root = scratchRoot(t);
+  assert.throws(
+    () => toolchainPackageDir('jsdom', root),
+    err =>
+      err.message.includes('jsdom') &&
+      err.message.includes(`npm ci --no-audit --no-fund`) &&
+      err.message.includes(root) &&
+      !/stale/.test(err.message),
+  );
+});
+
+test('a node_modules installed from an older package-lock.json is named as stale', t => {
+  const root = scratchRoot(t);
+  const pyrightOnly = { name: 'dark-factory', lockfileVersion: 3, packages: { 'node_modules/pyright': { version: '1.1.408' } } };
+  fs.mkdirSync(path.join(root, 'node_modules', 'pyright'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'node_modules', '.package-lock.json'), JSON.stringify(pyrightOnly));
+  const locked = JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8')).packages['node_modules/jsdom'].version;
+  assert.throws(
+    () => toolchainPackageDir('jsdom', root),
+    err => /stale/.test(err.message) && err.message.includes(locked) && err.message.includes('npm ci --no-audit --no-fund'),
   );
 });
