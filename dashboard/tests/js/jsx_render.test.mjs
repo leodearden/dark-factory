@@ -11,6 +11,8 @@ import assert from 'node:assert/strict';
 import { buildDashboardWindow, seedDashboardData } from './dom_harness.mjs';
 import {
   burndownBlock,
+  escalationAnalytics,
+  openEscalationItem,
   orchestratorRow,
   projectRow,
   receiptsFor,
@@ -262,5 +264,45 @@ for (const { view, show, block, bannerProjects } of BURN_VIEWS) {
     assert.equal(harness.window.DF_BURNDOWN_BANDS.parityBannerState(block(harness.window), bannerProjects(harness.window)), null);
     assert.ok(filledPathColors(panel).length > 0, `the ${view} chart drew nothing, so the absent banner proves nothing`);
     assert.deepEqual([...panel.querySelectorAll('.badge.bad')], [], `the ${view} view rendered a parity banner with the alarm down`);
+  });
+}
+
+// ── Decision 3: the PINNING chip (pins_recovery.js::pinningBadgeState) ──
+// pins_recovery is three-state on the wire: true, false, or ABSENT (unknown).
+// Only true draws the chip.
+
+const PINNING_ARMS = [
+  { arm: 'an item that pins recovery', pinnedTaskIds: ['42'], draws: true },
+  { arm: 'an item that pins nothing', pinnedTaskIds: [], draws: false },
+  { arm: 'an item with no pins_recovery annotation', pinnedTaskIds: undefined, draws: false },
+];
+
+function openItemRow(container, item) {
+  return [...container.querySelectorAll('tbody tr')].find(tr => tr.querySelector('td')?.textContent === item.id);
+}
+
+for (const { arm, pinnedTaskIds, draws } of PINNING_ARMS) {
+  test(`tab_escalation_analytics.jsx open items: ${arm} ${draws ? 'renders the chip pinningBadgeState describes' : 'renders no PINNING chip, though its row renders'}`, t => {
+    const harness = openWindow(t);
+    const { pinningBadgeState } = harness.window.DF_PINS_RECOVERY;
+    const item = openEscalationItem({ id: 'esc-42-1', taskId: '42', pinnedTaskIds });
+    assert.equal('pins_recovery' in item, pinnedTaskIds !== undefined, 'the fixture must make absence real, not undefined-valued');
+    seedDashboardData(harness.window, {
+      ESCALATION_ANALYTICS: escalationAnalytics([{ project: PROJECT, openItems: [item] }]),
+      __receipt: receiptsFor(harness.window.DF_DATA_LOADER, ['ESCALATION_ANALYTICS']),
+    });
+    const { container } = harness.mount(harness.window.DF_TABS.EscalationAnalyticsTab, { projectFilter: [] });
+
+    const row = openItemRow(container, item);
+    assert.ok(row, `the open item's row did not render, so the chip assertion would prove nothing`);
+    const chip = pinningBadgeState(item);
+    if (draws) {
+      assert.ok(chip, 'pinningBadgeState describes no chip for an item that pins recovery');
+      assert.equal(spansDescribedBy(row, chip).length, 1, 'the row must render exactly one span carrying the chip descriptor');
+    } else {
+      assert.equal(chip, null);
+      const wouldRender = pinningBadgeState(openEscalationItem({ id: item.id, taskId: '42', pinnedTaskIds: ['42'] }));
+      assert.deepEqual(spansDescribedBy(row, wouldRender), [], 'the row rendered a PINNING chip for an item that pins nothing');
+    }
   });
 }
