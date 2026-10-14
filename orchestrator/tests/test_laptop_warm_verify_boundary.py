@@ -862,6 +862,8 @@ def assert_pre_kill_tree_exited(tree: PreKillTree, *, timeout: float, after: str
     """Assert every pid in *tree* exits within *timeout* of the trigger named by *after*.
 
     A zombie awaiting its subreaper counts as exited, as in :func:`wait_pids_exited`.
+    Only the snapshotted pids are judged: a process forked after the snapshot,
+    even into the leader's own group, is outside this verdict.
     """
     survivors = wait_pids_exited(tree.pids, timeout=timeout)
     rendered = {pid: (s.state, s.ppid) for pid, s in sorted(survivors.items())}
@@ -2942,12 +2944,15 @@ def test_sleeper_spec_build_pgid_file_names_the_blocking_session_leader(tmp_path
 def test_pre_kill_tree_verdict_sees_a_session_escaped_build_after_its_leader_is_reaped(tmp_path):
     """A build that outlives its reaped leader fails the verdict; once killed, it passes.
 
-    The stand-in leader reproduces verify.py::_run_cmd's escape: it starts the
-    :func:`sleeper_spec` build in a new session, then is SIGKILLed and reaped
-    while the build runs on.  That severs the ppid chain, so a walk rooted at
-    the leader -- and a signal-0 probe of the leader's group -- both read the
-    tree as gone.  The verdict judges the pids snapshotted while the leader
-    was alive, so it must still name the surviving build.
+    The stand-in leader leads its own session, as
+    ``orchestrator/src/orchestrator/verify_cancel.py::start_own_process_group``
+    makes the real one, and reproduces verify.py::_run_cmd's escape: it starts
+    the :func:`sleeper_spec` build in another new session, then is SIGKILLed
+    and reaped while the build runs on.  That severs the ppid chain and empties
+    the leader's group, so a walk rooted at the leader and a signal-0 probe of
+    its group both read the tree as gone.  The verdict judges the pids
+    snapshotted while the leader was alive, so it must still name the
+    surviving build.
     """
     build_pgf = tmp_path / 'build.pgid'
     sleep_secs = float(f'274.{os.getpid() % 1000:03d}')
@@ -2965,12 +2970,17 @@ def test_pre_kill_tree_verdict_sees_a_session_escaped_build_after_its_leader_is_
             cmd,
         ],
         cwd=cwd,
+        start_new_session=True,
     )
     build = None
     try:
         build = wait_for_pgid_file(build_pgf, timeout=10.0)
         tree = snapshot_pre_kill_tree(leader.pid, build)
         assert {leader.pid, build} <= tree.pids
+        assert os.getpgid(leader.pid) == leader.pid, (
+            f'harness bug: leader pid={leader.pid} must lead its own group, or the '
+            f'signal-0 group probe below proves nothing'
+        )
 
         leader.kill()
         leader.wait(timeout=5)
@@ -2988,6 +2998,8 @@ def test_pre_kill_tree_verdict_sees_a_session_escaped_build_after_its_leader_is_
             f'harness bug: the ppid walk from pid={leader.pid} still reaches build '
             f'pid={build}, so this test does not isolate the severed-chain case'
         )
+        with pytest.raises(ProcessLookupError):
+            os.killpg(leader.pid, 0)
 
         with pytest.raises(AssertionError) as exc_info:
             assert_pre_kill_tree_exited(tree, timeout=0, after='its leader was reaped')
@@ -4825,7 +4837,7 @@ def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
     )
     heartbeat = HeartbeatWriter(child, interval=0.2).start()
     try:
-        leader = wait_for_pgid_file(pgf, timeout=row_discovery_ceiling_secs())
+        leader = wait_for_pgid_file(pgf, proc=child, timeout=row_discovery_ceiling_secs())
         build = wait_for_pgid_file(build_pgf, proc=child, timeout=row_discovery_ceiling_secs())
         tree = snapshot_pre_kill_tree(leader, build)
 
@@ -4915,7 +4927,12 @@ def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
     )
     tree: PreKillTree | None = None
     try:
-        leader = wait_for_pgid_file(pgf, timeout=row_discovery_ceiling_secs())
+        leader = wait_for_pgid_file(
+            pgf,
+            proc=dispatcher,
+            proc_label='dispatcher',
+            timeout=row_discovery_ceiling_secs(),
+        )
         build_pgid = wait_for_pgid_file(
             build_pgf,
             proc=dispatcher,
@@ -5002,7 +5019,7 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
     )
     heartbeat = HeartbeatWriter(child, interval=0.2).start()
     try:
-        leader = wait_for_pgid_file(pgf, timeout=row_discovery_ceiling_secs())
+        leader = wait_for_pgid_file(pgf, proc=child, timeout=row_discovery_ceiling_secs())
         build = wait_for_pgid_file(build_pgf, proc=child, timeout=row_discovery_ceiling_secs())
         tree = snapshot_pre_kill_tree(leader, build)
 
@@ -5085,7 +5102,7 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
     )
     heartbeat = HeartbeatWriter(child, interval=0.2).start()
     try:
-        leader = wait_for_pgid_file(pgf, timeout=row_discovery_ceiling_secs())
+        leader = wait_for_pgid_file(pgf, proc=child, timeout=row_discovery_ceiling_secs())
         build = wait_for_pgid_file(build_pgf, proc=child, timeout=row_discovery_ceiling_secs())
         tree = snapshot_pre_kill_tree(leader, build)
 
@@ -5194,7 +5211,7 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
     # raises before the waiter is ever spawned.
     waiter = None
     try:
-        holder_pgid_val = wait_for_pgid_file(pgf_holder)
+        holder_pgid_val = wait_for_pgid_file(pgf_holder, proc=holder)
         wait_subtree_live(holder_pgid_val, proc=holder)
 
         persistent_wt = worktree_base / '_merge-verify'
