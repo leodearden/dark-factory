@@ -4759,6 +4759,7 @@ class TaskWorkflow:
         try:
             await self.scheduler.set_task_status(self.task_id, 'pending')
         except TerminalExitRejection as exc:
+            self._note_exit_status_write('pending', None)
             return self._observed_terminal_outcome(exc.old_status)
         except SetTaskStatusRejected as exc:
             logger.error(
