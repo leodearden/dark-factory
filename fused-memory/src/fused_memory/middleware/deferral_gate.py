@@ -413,7 +413,19 @@ def plan(
     if old_status != DEFERRED:
         record = _stamped(request, call, agent_id=agent_id, deferred_at=call.now)
         return DeferralWrite(audit_fields={'deferral': record}, event_fields={'deferral': record})
+    if status == DEFERRED:
+        return _restamp(request, call, stored, agent_id=agent_id)
     return NO_WRITE
+
+
+def _restamp(
+    request: DeferralRequest, call: DeferralCall, stored: _StoredRecord, *, agent_id: str | None,
+) -> DeferralWrite:
+    first_entry = stored.valid.deferred_at if stored.valid is not None else None
+    record = _stamped(request, call, agent_id=agent_id, deferred_at=first_entry)
+    return DeferralWrite(
+        audit_fields={'deferral': record}, restamp_old=stored.raw, restamp_new=record,
+    )
 
 
 def _exit(stored: _StoredRecord) -> DeferralWrite:

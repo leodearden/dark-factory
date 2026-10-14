@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import uuid as uuid_mod
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, get_args
@@ -1531,6 +1531,16 @@ class TaskInterceptor:
                 return await self._journal_deferral_refusal(
                     deferral_write, project_root, _journal_params, agent_id,
                 )
+            if deferral_write.is_restamp:
+                return await self._apply_restamp(
+                    tm,
+                    task_id=task_id,
+                    project_root=project_root,
+                    tag=tag,
+                    deferral_write=deferral_write,
+                    journal_params=_journal_params,
+                    journal_agent_id=_journal_agent_id,
+                )
             audit_fields.update(deferral_write.audit_fields)
 
             if status == old_status:
@@ -1830,29 +1840,16 @@ class TaskInterceptor:
             )
 
             async def _do_set_task_status_write() -> Any:
-                # Task 2649: an audit-carrying transition (reopen_* and/or
-                # done_provenance accumulated above) writes through the
-                # single atomic set_status_and_stamp_audit call instead of
-                # plain set_task_status, so the status column and the audit
-                # metadata commit together — both or neither.
-                if audit_fields or deferral_write.clear_keys:
-                    clear_kwargs = (
-                        {'clear_keys': deferral_write.clear_keys}
-                        if deferral_write.clear_keys else {}
-                    )
-                    write_body = tm.set_status_and_stamp_audit(  # type: ignore[attr-defined]
-                        task_id, status, project_root, tag,
-                        audit_fields=audit_fields, **clear_kwargs, **claimant_kwargs,
-                    )
-                else:
-                    write_body = tm.set_task_status(
-                        task_id, status, project_root, tag, **claimant_kwargs,
-                    )
                 return await self._journal_around(
                     'set_task_status',
                     project_root,
                     _journal_params,
-                    write_body,
+                    _status_write_body(
+                        tm, task_id, status, project_root, tag,
+                        audit_fields=audit_fields,
+                        clear_keys=deferral_write.clear_keys,
+                        claimant_kwargs=claimant_kwargs,
+                    ),
                     agent_id=_journal_agent_id,
                 )
 
@@ -1964,6 +1961,48 @@ class TaskInterceptor:
             result['reconciliation'] = {'status': 'async', 'task_id': task_id}
 
         return result
+
+    async def _apply_restamp(
+        self,
+        tm: TaskBackendProtocol,
+        *,
+        task_id: str,
+        project_root: str,
+        tag: str | None,
+        deferral_write: deferral_gate.DeferralWrite,
+        journal_params: dict[str, Any],
+        journal_agent_id: str | None,
+    ) -> dict:
+        """Replace a deferred row's record: not a status change, so no status event,
+        transition gate or targeted reconciliation (PRD decision 3)."""
+        result = dict(
+            await self._journal_around(
+                'set_task_status',
+                project_root,
+                journal_params,
+                _status_write_body(
+                    tm, task_id, TaskStatus.DEFERRED.value, project_root, tag,
+                    audit_fields=dict(deferral_write.audit_fields),
+                    clear_keys=frozenset(),
+                    claimant_kwargs={},
+                ),
+                agent_id=journal_agent_id,
+            )
+        )
+        if result.get('success') is False:
+            return result
+        await self._journal(
+            self._make_event(
+                EventType.deferral_restamped,
+                project_root,
+                {
+                    'task_id': task_id,
+                    'old': deferral_write.restamp_old,
+                    'new': deferral_write.restamp_new,
+                },
+            )
+        )
+        return {**result, **deferral_write.echo}
 
     async def _mint_recurrence_successor(
         self, *, task_id: str, project_root: str, tag: str | None, project_id: str,
@@ -6332,6 +6371,35 @@ class TaskInterceptor:
             return 'warn'
         recon = getattr(cfg, 'reconciliation', None)
         return getattr(recon, 'reject_stale_done_evidence', 'warn')
+
+
+def _status_write_body(
+    tm: TaskBackendProtocol,
+    task_id: str,
+    status: str,
+    project_root: str,
+    tag: str | None,
+    *,
+    audit_fields: dict[str, Any],
+    clear_keys: frozenset[str],
+    claimant_kwargs: dict[str, Any],
+) -> Awaitable[Any]:
+    """The status write: atomic with its metadata changes when there are any.
+
+    Task 2649: an audit-carrying transition (reopen_*, done_provenance, a
+    deferral record) or one that clears a key writes through the single atomic
+    set_status_and_stamp_audit, so the status column and the metadata commit
+    together, both or neither. Every other write keeps plain set_task_status.
+    """
+    if audit_fields or clear_keys:
+        clear_kwargs = {'clear_keys': clear_keys} if clear_keys else {}
+        write_body = tm.set_status_and_stamp_audit(  # type: ignore[attr-defined]
+            task_id, status, project_root, tag,
+            audit_fields=audit_fields, **clear_kwargs, **claimant_kwargs,
+        )
+    else:
+        write_body = tm.set_task_status(task_id, status, project_root, tag, **claimant_kwargs)
+    return write_body
 
 
 def _extract_status(task_data: dict) -> str:
