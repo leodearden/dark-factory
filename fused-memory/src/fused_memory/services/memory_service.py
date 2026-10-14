@@ -2039,7 +2039,11 @@ _ENTITY_MINT_DEFAULT_LOCK_TIMEOUT_SECONDS: float = 5.0
 #: * ``'failed'``      — we tried and the backend did not cooperate. An
 #:   INFRASTRUCTURE signal, deliberately not folded into the refusal bucket:
 #:   conflating them would let a FalkorDB outage read as a scanner regression
-#:   in leaf iota's rate, and would feed a false repair-storm streak.
+#:   in leaf iota's rate, and would feed a false repair-storm streak. It also
+#:   covers a repair DEFERRED because zeta's lookup of the target was degraded
+#:   (:attr:`ReferentFinding.uuid_lookup_degraded`): nothing was written, since
+#:   "could not look" is neither "absent" (mint) nor "present" (resolve), and
+#:   the backend not answering is the same infrastructure signal.
 REFERENT_REPAIR_OUTCOMES: tuple[str, ...] = (
     'repaired', 'unrepairable', 'degenerate', 'failed',
 )
@@ -2172,7 +2176,8 @@ class ReferentRepair:
     #: * DUPLICATE-NAME REFUSAL — composed from ``AmbiguousEntityError``'s
     #:   STRUCTURED fields, a fact neither pass held until the write attempt.
     #:
-    #: On the ``'failed'`` arm it carries the exception text.
+    #: On the ``'failed'`` arm it carries the exception text, or, for a repair
+    #: deferred on a degraded target lookup, eta's sentence saying so.
     reason: str = ''
 
     def __post_init__(self) -> None:
@@ -2260,7 +2265,12 @@ class ReferentRepairStats:
 
     @property
     def failed(self) -> int:
-        """Findings whose repair was ATTEMPTED and did not complete."""
+        """Findings whose repair the backend thwarted; nothing was written.
+
+        Both populations — attempted and raised, or deferred on a degraded
+        target lookup — are defined by the ``'failed'`` bullet of
+        :data:`REFERENT_REPAIR_OUTCOMES`.
+        """
         return sum(1 for r in self.repairs if r.outcome == 'failed')
 
     @property
@@ -4512,11 +4522,12 @@ class MemoryService:
         THE THIRD OUTCOME IS REPORTED, NOT COLLAPSED. The two paragraphs above
         describe DELIBERATE collapses — absent and duplicate-name-group are one
         answer because eta treats them as one. A backend that would not answer
-        at all is a different thing entirely, and returning a bare ``None`` for
-        it made "could not look" indistinguishable from "not there" at the one
-        site eta reads (``minted=finding.new_endpoint_uuid is None``). Hence the
+        at all is a different thing entirely, and a bare ``None`` for it would
+        make "could not look" indistinguishable from "not there". Hence the
         pair: the uuid, and whether the lookup was DEGRADED. See
-        :attr:`ReferentFinding.uuid_lookup_degraded`.
+        :attr:`ReferentFinding.uuid_lookup_degraded`; eta defers a degraded
+        finding rather than resolving-or-minting off it
+        (:meth:`_repair_edge_findings`).
 
         Returns:
             ``(uuid_or_None, degraded)``. ``degraded`` is ``True`` only for the
@@ -4591,28 +4602,14 @@ class MemoryService:
           statements earlier. zeta's ``new_endpoint_uuid`` is demoted to what
           its own docstring already calls it: an audit convenience.
 
-        THE THREE PRE-WRITE GUARDS, in the order they are evaluated. Each
-        RECORDS the finding and moves on; none of them drops it, and none is
-        reachable after a write has begun:
+        THE PRE-WRITE GUARDS — which findings are recorded and left alone
+        rather than repaired, in what order, and under which outcome — are
+        listed once, in :meth:`_repair_edge_findings`, where they are
+        evaluated.
 
-        1. ZETA-UNRESOLVABLE — zeta determined no single target. Recorded with
-           zeta's own reason, verbatim: NEVER GUESS.
-        2. IMPLAUSIBLE TARGET — zeta determined one, from the whole-set
-           fallback, and it is not plausible
-           (:func:`_implausible_target_reason`). Refused BEFORE
-           ``ensure_entity_node``, so the phantom node is never minted.
-        3. DUPLICATE-NAME REFUSAL — the target name resolves to two or more
-           nodes, and the backend raises rather than collapsing them.
-
-        Guards 1 and 2 are evaluated in :meth:`_repair_edge_findings` before the
-        write block; guard 3 is the backend's, surfaced as
-        ``AmbiguousEntityError`` and caught there. All three book
-        ``outcome='unrepairable'`` — the edge was left alone — which is what
-        keeps a refusal out of ``failed``, where a FalkorDB outage belongs.
-
-        WHY GUARD 3 IS A REFUSAL HERE AND A COLLAPSE ELSEWHERE. The >=2-match
-        ``merge_entities`` collapse remains licensed on exactly one path, the
-        episode-write dedup of the PRD's seam S1 (see
+        WHY A DUPLICATE-NAME GROUP IS REFUSED HERE AND COLLAPSED ELSEWHERE.
+        The >=2-match ``merge_entities`` collapse remains licensed on exactly
+        one path, the episode-write dedup of the PRD's seam S1 (see
         ``plans/fm-memory-identity-prd.md``, whose S1 scope amendment names this
         task) — and that path reaches ``_resolve_or_create_entity`` DIRECTLY,
         never ``ensure_entity_node``. A repair is not that path: collapsing two
@@ -4741,7 +4738,7 @@ class MemoryService:
         counters leaf iota samples and differences.
 
         THE PER-GROUP STREAK counts CONSECUTIVE EPISODES that needed a repair,
-        and its update rule is a three-way branch, not a two-way one:
+        and its update rule is a four-way branch, evaluated in this order:
 
         * ``repaired >= 1`` -> ``+1``, by exactly one however many endpoints
           moved. The streak's unit is the EPISODE; the per-episode repair count
@@ -4750,6 +4747,12 @@ class MemoryService:
           proportional would let a single wide episode breach the threshold on
           its own, which is precisely the "one bad write" case this alarm is
           not for.
+        * zero repairs and at least one ``'failed'`` record -> UNCHANGED, and
+          the key is not created. An infrastructure fault (a write the backend
+          refused, or a repair deferred on a degraded target lookup) is no
+          evidence either way: resetting on it would let a FalkorDB blip
+          mid-storm disarm the alarm, and incrementing on it would let an
+          outage page as a scanner regression.
         * zero repairs but ``endpoints_checked > 0`` -> ``0``. THE POSITIVE
           HEALTH SIGNAL: we looked at this episode's edge endpoints and none
           needed moving.
@@ -4779,7 +4782,7 @@ class MemoryService:
         Returns:
             The group's streak AFTER the increment, when this pass incremented
             it — i.e. the reading the storm gate thresholds. ``None`` on the
-            other two arms. Returning the value rather than having the caller
+            other three arms. Returning the value rather than having the caller
             re-read the dict is what keeps the gate from firing on a pass that
             merely LEFT a breached streak in place: an episode that checked
             nothing performs no repair, so it must not re-page an alarm it
@@ -4797,6 +4800,8 @@ class MemoryService:
             streak = self._referent_repair_streaks.get(group_id, 0) + 1
             self._referent_repair_streaks[group_id] = streak
             return streak
+        if repair_stats.failed:
+            return None
         if stats.endpoints_checked:
             self._referent_repair_streaks[group_id] = 0
         return None
@@ -5174,24 +5179,36 @@ class MemoryService:
         degenerate predicate reads as a gate on the whole edge rather than as
         another branch inside the per-finding loop.
 
-        THREE PRE-WRITE DISPOSITIONS, in order, all recording
-        ``outcome='unrepairable'`` and all refusing before anything is written:
+        FOUR PRE-WRITE DISPOSITIONS, in the order they are evaluated. Each
+        RECORDS the finding and moves on — none drops it — and all four stop
+        before anything is written:
 
         1. ZETA-UNRESOLVABLE — no target was determined at all. Carries zeta's
            own ``reason`` verbatim (NEVER GUESS, the structural default).
-        2. IMPLAUSIBLE TARGET — a target WAS determined, from the whole-set
-           fallback, and it is not one this pass may mint a node for. See
-           :func:`_implausible_target_reason`.
-        3. DUPLICATE-NAME REFUSAL — the target name resolves to two or more
-           nodes, and collapsing them is not this path's act to make.
+        2. DEGRADED-LOOKUP DEFERRAL — a target WAS determined, but zeta's
+           lookup of its node was degraded
+           (:attr:`ReferentFinding.uuid_lookup_degraded`), so neither resolving
+           nor minting is grounded. Deferred BEFORE ``ensure_entity_node``.
+        3. IMPLAUSIBLE TARGET — a target WAS determined, from the whole-set
+           fallback, and it is not one this pass may mint a node for
+           (:func:`_implausible_target_reason`). Refused BEFORE
+           ``ensure_entity_node``, so the phantom node is never minted.
+        4. DUPLICATE-NAME REFUSAL — the target name resolves to two or more
+           nodes, and collapsing them is not this path's act to make. The
+           backend's guard: ``ensure_entity_node`` raises
+           ``AmbiguousEntityError`` and the write block's arm catches it.
 
-        They are distinguishable by ``reason``, which is the field that exists
-        to say why; the outcome vocabulary is deliberately not widened.
+        The three refusals (1, 3, 4) record ``outcome='unrepairable'`` — the
+        edge was left alone — and are distinguishable by ``reason``, which is
+        the field that exists to say why; the outcome vocabulary is
+        deliberately not widened. Disposition 2 records ``'failed'``: it is the
+        backend not answering, not a refusal, and keeping refusals out of
+        ``'failed'`` is what leaves that bucket meaning a FalkorDB outage.
 
         TWO GUARDS PER FINDING, NOT ONE, split at the commit point. The first
         wraps ``ensure_entity_node`` + ``reassign_edge`` — everything that can
         fail with NOTHING written — and its generic ``except`` records
-        ``'failed'``; disposition 3's ``AmbiguousEntityError`` is peeled off
+        ``'failed'``; disposition 4's ``AmbiguousEntityError`` is peeled off
         AHEAD of that one, because a refusal is not a fault (see the arm's own
         comment). The second guard wraps only the post-write summary backstop,
         whose failures cannot un-write the move that already landed and
@@ -5239,6 +5256,33 @@ class MemoryService:
                 ))
                 continue
 
+            if finding.uuid_lookup_degraded:
+                # DEFERRED, not resolved-or-minted off a lookup that could not
+                # look. Why this books 'failed': REFERENT_REPAIR_OUTCOMES'
+                # 'failed' bullet.
+                logger.warning(
+                    'Referent repair DEFERRED for edge %s (%s end): the lookup '
+                    'of target %r was degraded, so the edge is left unrepaired '
+                    'and recorded as failed: %s',
+                    finding.edge_uuid, finding.which_end, intended.node_name,
+                    finding.to_dict(),
+                )
+                repair_stats.repairs.append(ReferentRepair(
+                    edge_uuid=finding.edge_uuid,
+                    which_end=finding.which_end,
+                    outcome='failed',
+                    old_endpoint_uuid=finding.old_endpoint_uuid,
+                    check=finding.check,
+                    intended_referent=intended.node_name,
+                    reason=(
+                        f'the lookup of repair target {intended.node_name!r} '
+                        'was DEGRADED (the backend did not answer), so whether '
+                        'that node exists is unknown; the repair is deferred '
+                        'rather than resolving-or-minting off an incomplete read'
+                    ),
+                ))
+                continue
+
             if not finding.target_cited:
                 # TARGET PLAUSIBILITY, and it must refuse BEFORE the write
                 # below — that ordering is the whole user-observable signal.
@@ -5265,10 +5309,12 @@ class MemoryService:
                 # same site for `minted=` — so this is a second read of an
                 # existing dependency, not a new one, and it costs no round-trip
                 # inside the lock where every query serializes same-group
-                # writes. A stale `None` can only ever REFUSE: it covers absent,
-                # duplicate-name group AND a degraded lookup, and in all three
-                # cases the direction is fail-closed. (The duplicate-name case
-                # is refused twice over — guard (c) below would refuse it too.)
+                # writes. A stale `None` can only ever REFUSE: it covers absent
+                # and duplicate-name group, and in both cases the direction is
+                # fail-closed. (The duplicate-name case is refused twice over —
+                # the DUPLICATE-NAME REFUSAL below would refuse it too.) A
+                # degraded lookup never reaches here: it was deferred above, so
+                # this guard never reads an existence answer nobody could check.
                 # This is EVIDENCE, not the repair TARGET: the target still
                 # comes from `ensure_entity_node`'s return, so the standing
                 # objection to branching on `new_endpoint_uuid` — "a SECOND site
@@ -5449,12 +5495,11 @@ class MemoryService:
                 check=finding.check,
                 new_endpoint_uuid=target_uuid,
                 intended_referent=intended.node_name,
-                # zeta found no single pre-existing node keyed by this name
-                # moments earlier under this same lock, so ensure_entity_node
-                # took its mint-or-collapse path. The two are deliberately not
-                # distinguished here — zeta collapses them to one `None` on
-                # purpose, and telling them apart would cost a second query
-                # inside the identity lock to sharpen a telemetry count.
+                # zeta found no pre-existing node keyed by this name moments
+                # earlier under this same lock, so ensure_entity_node minted.
+                # A degraded lookup was deferred above and never reaches here,
+                # and a duplicate-name group raised AmbiguousEntityError before
+                # this record was built, so `None` here means only "absent".
                 minted=finding.new_endpoint_uuid is None,
                 moved=moved,
                 summaries_refreshed=refreshed,
@@ -5890,7 +5935,8 @@ class MemoryService:
 
         ``'streaks'`` IS A GAUGE, NOT A COUNTER, and the only entry here that
         can go DOWN: group_id -> consecutive episodes whose repair pass moved
-        something, cleared by a pass that looked and found nothing. It is the
+        something, cleared by a pass that looked and found nothing (a pass
+        whose repairs the backend thwarted clears nothing). It is the
         value the storm gate thresholds, exposed so an operator can see how
         close a project is to the alarm rather than only learning at the breach.
         A group appears only once a pass has produced evidence about it, so an

@@ -515,6 +515,25 @@ landed, have since landed under task 3134 (below).
 
 ### Changed
 
+#### Referent repair defers a degraded target lookup instead of minting off it (task 5191)
+
+When zeta's lookup of a repair target fails, the finding carries
+`uuid_lookup_degraded=True` (task 4506). The write-time repair pass (eta) now treats
+"could not look" as neither "absent" nor "present". See
+`fused-memory/src/fused_memory/services/memory_service.py::MemoryService._repair_edge_findings`
+and `::MemoryService._record_referent_repair_pass`.
+
+- **A degraded finding is recorded as `outcome='failed'` and nothing is written.**
+  Previously it went through `ensure_entity_node` -> `reassign_edge` and was booked
+  `minted=True`. So `nodes_minted` no longer counts backend errors as mints, and the
+  whole-set-fallback plausibility guard no longer refuses with a "no node of that name
+  exists" reason it could not check.
+- **A repair pass with zero repairs and at least one `'failed'` record now leaves the
+  per-group storm streak unchanged instead of resetting it.** This changes a rule task
+  3672 pinned: a backend blip can no longer disarm an in-progress storm alarm. A
+  `'failed'` record still never increments the streak, and a pass that both repaired
+  and failed still increments.
+
 #### Task-family census reads each graph once (task 5662)
 
 `maintenance/task_family_census.py` now makes one backend read per graph instead
