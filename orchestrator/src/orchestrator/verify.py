@@ -76,6 +76,7 @@ from orchestrator.verify_classify import (
     classify_failure,
     is_external_kill_rc,
     is_interpreter_missing_workspace_packages,
+    is_partially_provisioned_venv_type_failure,
     unresolved_top_level_modules,
 )
 from orchestrator.verify_cmd import (
@@ -2300,6 +2301,33 @@ def _worker_death_leg_note(label: str) -> str:
     )
 
 
+def _classify_type_leg(
+    rc: int, out: str, timed_out: bool, cmd: str | None, *, test_leg_passed: bool,
+) -> FailureCategory:
+    """``classify_failure`` for the TYPE leg, plus the one cross-leg refinement.
+
+    Only an UNKNOWN_TEST_FAILURE fall-through is refined, so every
+    ``classify_failure`` guard and every specific per-tool category stays
+    authoritative.  It becomes ENV_TRANSIENT when the output shows a partially
+    provisioned venv that the same run's passing TEST leg corroborates
+    (``verify_classify.py::is_partially_provisioned_venv_type_failure``).
+    """
+    base = classify_failure(_tool_for_cmd(cmd), rc, out, timed_out)
+    if base == FailureCategory.UNKNOWN_TEST_FAILURE and (
+        is_partially_provisioned_venv_type_failure(out, test_leg_passed=test_leg_passed)
+    ):
+        logger.warning(
+            'Verification type check failed with %d distinct unresolved top-level '
+            'modules while the same run\'s test leg passed: pyright read a venv '
+            'that was still being provisioned. This is an ENVIRONMENT fault, NOT a '
+            'branch defect. Likely fix surface: verify_cold_preprovision_command '
+            'is missing or failing on the verifying host. See task 6127.',
+            len(unresolved_top_level_modules(out)),
+        )
+        return FailureCategory.ENV_TRANSIENT
+    return base
+
+
 def _summarize_checks(
     test_rc: int, test_out: str, test_timed_out: bool, test_cmd: str | None,
     lint_rc: int, lint_out: str, lint_timed_out: bool, lint_cmd: str | None,
@@ -2384,18 +2412,23 @@ def _summarize_checks(
     if passed:
         return True, 'passed', '', 'All checks passed', []
 
+    test_leg_passed = test_rc == 0 and test_cmd is not None
     hint_parts = []
     per_check_categories: list[str] = []
-    for rc, out, to, cmd in (
-        (test_rc, test_out, test_timed_out, test_cmd),
-        (lint_rc, lint_out, lint_timed_out, lint_cmd),
-        (type_rc, type_out, type_timed_out, type_cmd),
+    for rc, out, to, cmd, is_type_leg in (
+        (test_rc, test_out, test_timed_out, test_cmd, False),
+        (lint_rc, lint_out, lint_timed_out, lint_cmd, False),
+        (type_rc, type_out, type_timed_out, type_cmd, True),
     ):
         if rc != 0:
             h = _extract_cause_hint(out)
             if h:
                 hint_parts.append(h)
-            per_check_categories.append(classify_failure(_tool_for_cmd(cmd), rc, out, to))
+            per_check_categories.append(
+                _classify_type_leg(rc, out, to, cmd, test_leg_passed=test_leg_passed)
+                if is_type_leg
+                else classify_failure(_tool_for_cmd(cmd), rc, out, to)
+            )
     cause_hint = ' | '.join(hint_parts)
     category = _worst_category(per_check_categories) if per_check_categories else 'unknown_test_failure'
 
