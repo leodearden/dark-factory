@@ -36,6 +36,33 @@ from orchestrator.merge_lane import (
 _CUSTODY_WAIT_S = 5.0
 
 
+def held_train_request(
+    git_ops: GitOps, sched: FakeScheduler, train_id: str, member_ids: Sequence[str],
+) -> GroupMergeRequest:
+    """A train over *member_ids* wired to *sched* through the real callback factory."""
+    callbacks = build_train_callback_factory(sched)(train_id)
+    tip = member_ids[-1]
+    prefix = git_ops.config.branch_prefix
+    result: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+    return GroupMergeRequest(
+        task_id=tip,
+        branch=QueuedBranch.parse(f'{prefix}{tip}', prefix),
+        worktree=git_ops.worktree_base / tip,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=OrchestratorConfig(project_root=git_ops.project_root, git=git_ops.config),
+        result=result,
+        train_id=train_id,
+        member_task_ids=list(member_ids),
+        tip_branch=QueuedBranch.parse(f'{prefix}{tip}', prefix),
+        tip_task_id=tip,
+        status_check=callbacks.status_check,
+        mark_member_done=callbacks.mark_member_done,
+        redrive_member=callbacks.redrive_member,
+    )
+
+
 @dataclass(frozen=True)
 class _Lane:
     git_ops: GitOps
@@ -49,27 +76,7 @@ class _Lane:
         )
 
     def declared_train(self, train_id: str, member_ids: Sequence[str]) -> GroupMergeRequest:
-        callbacks = build_train_callback_factory(self.sched)(train_id)
-        tip = member_ids[-1]
-        prefix = self.git_ops.config.branch_prefix
-        result: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
-        return GroupMergeRequest(
-            task_id=tip,
-            branch=QueuedBranch.parse(f'{prefix}{tip}', prefix),
-            worktree=self.git_ops.worktree_base / tip,
-            pre_rebased=False,
-            task_files=None,
-            module_configs=[],
-            config=OrchestratorConfig(project_root=self.git_ops.project_root, git=self.git_ops.config),
-            result=result,
-            train_id=train_id,
-            member_task_ids=list(member_ids),
-            tip_branch=QueuedBranch.parse(f'{prefix}{tip}', prefix),
-            tip_task_id=tip,
-            status_check=callbacks.status_check,
-            mark_member_done=callbacks.mark_member_done,
-            redrive_member=callbacks.redrive_member,
-        )
+        return held_train_request(self.git_ops, self.sched, train_id, member_ids)
 
     async def park(self, *mids: str) -> None:
         for mid in mids:
@@ -85,7 +92,7 @@ async def lane(tmp_path: Path) -> _Lane:
     return _Lane(git_ops=_make_git_ops(root), sched=FakeScheduler(), queue=asyncio.Queue())
 
 
-async def _until_custody(worker: SpeculativeMergeWorker, expected: frozenset[str]) -> None:
+async def until_custody(worker: SpeculativeMergeWorker, expected: frozenset[str]) -> None:
     deadline = time.monotonic() + _CUSTODY_WAIT_S
     while worker.train_member_ids_in_custody() != expected:
         assert time.monotonic() < deadline, (
@@ -103,7 +110,7 @@ class TestCustody:
         await lane.queue.put(lane.declared_train('train-p1-held', ['p1', 'p2']))
 
         async with running_merge_worker(worker):
-            await _until_custody(worker, frozenset({'p1', 'p2'}))
+            await until_custody(worker, frozenset({'p1', 'p2'}))
 
         assert worker.train_member_ids_in_custody() == frozenset()
 
@@ -140,7 +147,7 @@ class TestRedriveAbandonedMembers:
         await lane.queue.put(lane.declared_train('train-p1-held', ['p1', 'p2']))
 
         async with running_merge_worker(worker):
-            await _until_custody(worker, frozenset({'p1', 'p2'}))
+            await until_custody(worker, frozenset({'p1', 'p2'}))
             outcomes = await worker.redrive_abandoned_members(
                 'abandoned-p1', ['p1'], strip_unlanded_base=True,
             )

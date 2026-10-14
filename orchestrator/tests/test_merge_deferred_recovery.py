@@ -4,11 +4,14 @@ Part 1 pins the pure ownership discriminator in
 ``orchestrator/src/orchestrator/merge_deferred_recovery.py``: who, if anyone,
 still owns a parked member, and what recovering an abandoned one targets.
 Part 2 drives ``AbandonedMemberSweep.run_pass`` against a fake lane and task
-store and a real escalation queue.
+store and a real escalation queue.  Part 3 is the regression for members a
+restart left parked: real git, a real merge worker and the real train
+callbacks.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -16,9 +19,17 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import pytest_asyncio
+from _live_merge_worker import running_merge_worker
+from _workflow_helpers import FakeScheduler
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+from test_git_ops_unstack import _commit_files, _init_repo, _make_git_ops, _rev_parse
+from test_merge_lane_member_redrive import add_unlanded, land_attributed
+from test_merge_lane_parked_custody import held_train_request, until_custody
 
+from orchestrator.git_ops import GitOps
+from orchestrator.harness import build_train_callback_factory
 from orchestrator.merge_deferred_recovery import (
     MERGE_DEFERRED_ABANDONED_CATEGORY,
     AbandonedMemberSweep,
@@ -31,7 +42,7 @@ from orchestrator.merge_deferred_recovery import (
     owner_of,
     recovery_targets,
 )
-from orchestrator.merge_lane import MemberRedriveOutcome
+from orchestrator.merge_lane import MemberRedriveOutcome, SpeculativeMergeWorker
 from orchestrator.scheduler import train_order_key
 
 NOW = datetime(2026, 10, 14, 12, 0, tzinfo=UTC)
@@ -487,3 +498,122 @@ class TestOwnership:
         for mid in ('d0', 'd1', 'd2'):
             assert mid in esc.detail
         assert sweep.filed('d0') == sweep.filed('d1') == []
+
+
+# ---------------------------------------------------------------------------
+# Part 3: members a restart left parked, against real collaborators
+# ---------------------------------------------------------------------------
+
+
+class ParkedScheduler(FakeScheduler):
+    """FakeScheduler plus the two reads the abandoned-member sweep makes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.held: set[str] = set()
+
+    async def get_tasks(
+        self, *, statuses: Iterable[str] | None = None, distinguish_failure: bool = False,
+    ) -> list[dict]:
+        wanted = None if statuses is None else set(statuses)
+        return [
+            {
+                'id': tid,
+                'status': history[-1],
+                'metadata': dict((self.task_data.get(tid) or {}).get('metadata') or {}),
+            }
+            for tid, history in self.statuses.items()
+            if history and (wanted is None or history[-1] in wanted)
+        ]
+
+    def is_actively_held(self, tid: str) -> bool:
+        return tid in self.held
+
+    async def park(self, *tids: str, train_id: str | None = None) -> None:
+        for order, tid in enumerate(tids):
+            if train_id is not None:
+                self.task_data[tid] = {
+                    'id': tid, 'metadata': {'train': {'id': train_id, 'order': order}},
+                }
+            await self.set_task_status(tid, 'merge-deferred')
+
+
+@pytest_asyncio.fixture
+async def git_ops(tmp_path: Path) -> GitOps:
+    root = tmp_path / 'repo'
+    root.mkdir()
+    await _init_repo(root)
+    await _commit_files(root, {'shared.txt': 'v0\n'}, 'initial')
+    return _make_git_ops(root)
+
+
+def _abandoned_l1s(queue: EscalationQueue, tid: str) -> list[tuple[int, str]]:
+    return [
+        (esc.level, esc.severity) for esc in queue.get_by_task(tid, status='pending')
+        if esc.category == MERGE_DEFERRED_ABANDONED_CATEGORY
+    ]
+
+
+@pytest.mark.asyncio
+class TestRecoveryAfterARestart:
+    async def test_abandoned_members_recover_and_owned_ones_stay_parked(
+        self, git_ops: GitOps, tmp_path: Path,
+    ) -> None:
+        root = git_ops.project_root
+        await land_attributed(git_ops, 'landed')
+        for mid in ('unlanded', 'stacked', 'd0', 'd1'):
+            await add_unlanded(git_ops, mid)
+        stacked = await git_ops.stack_train_branches(['unlanded', 'stacked'])
+        declared = await git_ops.stack_train_branches(['d0', 'd1'])
+        assert (stacked.survivors, declared.survivors) == (['unlanded', 'stacked'], ['d0', 'd1'])
+        unlanded_commit = await _rev_parse(root, 'task/unlanded')
+        d1_tip = await _rev_parse(root, 'task/d1')
+
+        sched = ParkedScheduler()
+        await sched.park('landed', 'unlanded', 'stacked', 'live1', 'live2')
+        await sched.park('d0', 'd1', train_id='train-d0-4737')
+        queue = EscalationQueue(tmp_path / 'esc')
+        intake: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops, intake, train_callback_factory=build_train_callback_factory(sched),
+        )
+        sweep = AbandonedMemberSweep()
+
+        async def run_pass():
+            return await sweep.run_pass(
+                lane=worker, tasks=sched, escalations=queue, claimant_ttl=TTL,
+            )
+
+        worker.halt_for_wip('test')
+        await intake.put(held_train_request(git_ops, sched, 'train-live-4737', ['live1', 'live2']))
+        parked = {tid: list(history) for tid, history in sched.statuses.items()}
+        async with running_merge_worker(worker):
+            await until_custody(worker, frozenset({'live1', 'live2'}))
+
+            await run_pass()
+            assert sched.statuses == parked
+            assert queue.get_pending() == []
+
+            await run_pass()
+
+            latest = {tid: history[-1] for tid, history in sched.statuses.items()}
+            assert latest == {
+                'landed': 'done', 'unlanded': 'pending', 'stacked': 'pending',
+                'live1': 'merge-deferred', 'live2': 'merge-deferred',
+                'd0': 'merge-deferred', 'd1': 'pending',
+            }
+            assert sched.provenance['landed']['kind'] == 'found_on_main'
+            assert not await git_ops.is_ancestor(unlanded_commit, 'task/stacked')
+            assert await _rev_parse(root, 'task/d1') == d1_tip
+            for tid in ('live1', 'live2', 'd0'):
+                assert sched.statuses[tid] == parked[tid]
+            for tid in ('landed', 'unlanded', 'stacked', 'd1'):
+                assert _abandoned_l1s(queue, tid) == [(1, 'info')]
+            for tid in ('d0', 'live1', 'live2'):
+                assert queue.get_by_task(tid, status='pending') == []
+
+            third = await run_pass()
+
+        assert third.owners[ParkedOwner.TRAIN_PEER_ACTIVE] == 1
+        assert third.outcomes == {}
+        assert sched.statuses['d0'] == parked['d0']
