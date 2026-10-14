@@ -43,33 +43,18 @@
 // decision arm — or adding one nobody asked for — fails a test instead of
 // nothing.
 //
-// ── (2) THE JSX CALL SITES: A DOM HARNESS, BUILT (task 4899) ──────────────
-// A DOM harness was first rejected here on three premises, all false. The
-// repo has a root package.json and package-lock.json (task 4538). That
-// package.json declares no "type", so these files still resolve as CommonJS.
-// And verify_cold_preprovision_command already runs `npm ci` from the
-// lockfile in every cold verify, so the harness needs no gate-time install
-// and no skip guard: a missing node_modules fails loudly instead.
-//
-// dashboard/tests/js/dom_harness.mjs loads index.html's scripts into jsdom on
-// the browser's exact Babel and React bytes, each sha384-checked against
-// index.html's integrity attributes. dashboard/tests/js/jsx_render.test.mjs
-// mounts the real tabs and asserts that each helper's descriptor reaches the
-// DOM at every call site. It was accepted by mutation: deleting each call
-// site fails a test (task 4899's mutation-verification commit).
-//
-// The roles stay split. A render DECISION is extracted into a helper like
-// these and unit-tested; the harness covers only the thin call site that
-// consumes it.
+// ── (2) THE JSX CALL SITES ────────────────────────────────────────────────
+// The roles are split. A render DECISION is extracted into a helper like
+// these and unit-tested; the thin JSX call site that consumes it is
+// render-tested by dashboard/tests/js/jsx_render.test.mjs, on the jsdom page
+// dashboard/tests/js/dom_harness.mjs builds.
 //
 // ── (3) WHAT IS OUT OF SCOPE ──────────────────────────────────────────────
 // Re-hardening the deleted tests with tightened regexes or comment-stripped
 // source fixtures is explicitly out of scope, by the reviewer guidance that
 // motivated 039e55c7ef: hardening the greps deepens the same hole rather than
-// closing it. The residual gap task 4361 measured — deleting a thin JSX call
-// site failed no test (its mutation-verification step) — is closed by the
-// harness in (2), which asserts over rendered DOM, never source text. Do not
-// "restore" the greps.
+// closing it. The call sites are covered by (2), which asserts over rendered
+// DOM, never source text. Do not "restore" the greps.
 //
 // ── (4) NO BROWSER GLOBALS, IN ANY OF THE THREE ───────────────────────────
 // Nothing in these modules reads `window` or `document`: the
