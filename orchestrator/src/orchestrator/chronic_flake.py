@@ -25,8 +25,8 @@ This module never talks to the fused-memory MCP directly (mirrors
 ``offline_lane.OfflineLaneTaskClient``'s cross-project scope boundary) —
 :class:`ChronicFlakeTaskClient` is the pluggable seam, and
 :class:`SchedulerChronicFlakeTaskClient` is the concrete adapter over a
-duck-typed scheduler exposing ``dispatch_tool`` (self-contained here to
-avoid a workflow<->harness import cycle).
+duck-typed scheduler exposing ``dispatch_tool`` and ``submit_task``
+(self-contained here to avoid a workflow<->harness import cycle).
 
 Non-blocking guarantee: :func:`maybe_file_chronic_flake_tasks` is internally
 catch-all-defensive (mirrors ``compute_failing_test_set_fingerprint``'s
@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from shared.mcp_envelope import parse_tool_result
 from shared.safe_io import load_json_or_warn
 from shared.task_statuses import TERMINAL
+from shared.task_submit import SubmitFailed, SubmitOutcome
 
 from orchestrator.mcp_lifecycle import tool_error_text
 
@@ -376,11 +377,11 @@ class ChronicFlakeTaskClient(Protocol):
     so a failed read reported as ``{}`` would be acted on as a deletion. This
     module's own path never calls it; only the ledger's does."""
 
-    async def submit_task(self, arguments: dict) -> str:
+    async def submit_task(self, arguments: dict) -> SubmitOutcome:
         """Submit a new task from a ``submit_task``-shaped argument block
-        (see :func:`build_chronic_flake_fix_task_arguments`) and return a
-        best-effort id (submit is two-phase server-side, so the id is
-        log-only — never relied on for dedup)."""
+        (see :func:`build_chronic_flake_fix_task_arguments`) and return its
+        typed outcome (submit is two-phase server-side, so this module reads
+        it for logging only — never for dedup)."""
         ...
 
     async def search_tasks(self, query: str) -> list[dict]:
@@ -586,11 +587,10 @@ def _unwrap_dispatch_envelope(result: object) -> dict:
     underlying tool's own returned dict, tolerating whichever transport
     shape it happens to hand back.
 
-    Generalises ``Harness._extract_task_id``'s envelope normalisation
-    (``{'task_id': ...}`` direct, ``{'structuredContent': {...}}`` /
+    Tolerates a bare payload dict, ``{'structuredContent': {...}}`` /
     ``{'result': {...}}`` nested, or a ``content`` list of text blocks
-    carrying JSON) so the parsers here — :func:`extract_task_id`,
-    :func:`_extract_results_list`, :func:`_extract_task`, and
+    carrying JSON, so the parsers here — :func:`_extract_results_list`,
+    :func:`_extract_task`, and
     :func:`_extract_statuses_map` for bare shapes — share one seam. Returns
     ``{}`` for a non-dict *result* or when no known shape unwraps.
 
@@ -603,9 +603,9 @@ def _unwrap_dispatch_envelope(result: object) -> dict:
     ``content``/``structuredContent``/``isError`` and never the payload's own.
     A one-step unwrapper therefore returns a dict in which every payload key is
     absent, which each parser above reads as a well-formed envelope that simply
-    does not carry its key: ``extract_task_id`` returned ``''`` and
-    ``_extract_statuses_map`` returned an error, on EVERY successful production
-    call.  Corroborated by ``scheduler.py::SchedulerFacade.get_statuses``, which
+    does not carry its key: ``_extract_statuses_map`` returned an error on
+    EVERY successful production call.  Corroborated by
+    ``orchestrator/src/orchestrator/scheduler.py::SchedulerFacade.get_statuses``, which
     parses the very same ``dispatch_tool`` result with
     ``shared.mcp_envelope.parse_tool_result(result, 'statuses', dict)`` — a
     parser that requires exactly ``result['result']['content'][i]['text']``.
@@ -627,40 +627,6 @@ def _unwrap_dispatch_envelope(result: object) -> dict:
             break
         envelope = inner
     return envelope
-
-
-def extract_task_id(result: object) -> str:
-    """Best-effort extraction of a task/ticket id out of a
-    ``dispatch_tool('submit_task', ...)`` response envelope.
-
-    Self-contained (no ``harness``/``scheduler`` import — avoids a
-    workflow<->harness import cycle) so both
-    :class:`SchedulerChronicFlakeTaskClient` and any future adapter can
-    share it. Handles the direct ``{'task_id': ...}`` shape (e.g.
-    planning-mode submissions) AND ``{'ticket': ...}`` — ``submit_task``'s
-    actual two-phase response, ``{"ticket": "tkt_<id>"}`` — plus the
-    ``structuredContent``/``content``-text-block nested shapes via
-    :func:`_unwrap_dispatch_envelope`. Never raises; an
-    unrecognised/unparseable envelope returns ``''``.
-
-    LOAD-BEARING FOR ONE CONSUMER, log-only for the other, and the difference
-    is why :func:`_unwrap_dispatch_envelope` must handle the production shape.
-    For THIS module's own filing path the id is log-only (see the module
-    docstring's dedup-layer note) — a wrong id there costs a log line, and the
-    ``FilingLedger`` rate limit still bounds duplicates.  For
-    ``flake_ledger::_ensure_owner_task`` it is the ``owner_task_id`` the §5.9
-    invariant is STORED AGAINST, and that path has no rate limit: an empty id
-    is treated there as a failed filing, so a server-side task really was
-    created while the row stays NULL, and the next suppression of the same test
-    files another.  An unbounded orphan-task loop is the failure mode, which is
-    why the ``''`` return must mean "the tool did not name one", never "the
-    parser did not reach the payload".
-    """
-    envelope = _unwrap_dispatch_envelope(result)
-    for key in ('task_id', 'ticket'):
-        if envelope.get(key):
-            return str(envelope[key])
-    return ''
 
 
 def _extract_results_list(result: object) -> list[dict]:
@@ -793,14 +759,15 @@ def _extract_task(result: object) -> tuple[dict | None, Exception | None]:
     return None, _response_error('get_task response carries no task', envelope)
 
 
-# Per-call dispatch_tool timeout for submit_task — matches
+# Per-call timeout for submit_task — matches
 # harness._OfflineLaneTaskClient.submit_fix_task's precedent.
 _SUBMIT_TASK_TIMEOUT_SECS = 30
 
 
 class SchedulerChronicFlakeTaskClient:
     """Concrete :class:`ChronicFlakeTaskClient` adapter over a duck-typed
-    scheduler exposing ``dispatch_tool`` (the ``SchedulerFacade`` surface).
+    scheduler exposing ``dispatch_tool`` (the ``SchedulerFacade`` surface) and
+    ``orchestrator/src/orchestrator/scheduler.py::Scheduler.submit_task``.
 
     Self-contained here (not in ``harness.py``) so this module never talks
     to the fused-memory MCP directly and avoids a workflow<->harness import
@@ -812,16 +779,16 @@ class SchedulerChronicFlakeTaskClient:
         self._scheduler = scheduler
         self._project_root = str(project_root)
 
-    async def submit_task(self, arguments: dict) -> str:
+    async def submit_task(self, arguments: dict) -> SubmitOutcome:
         """Submit *arguments* (see
-        :func:`build_chronic_flake_fix_task_arguments`) via
-        ``dispatch_tool('submit_task', ...)`` and return a best-effort id.
+        :func:`build_chronic_flake_fix_task_arguments`) through
+        ``orchestrator/src/orchestrator/scheduler.py::Scheduler.submit_task``,
+        which owns the response parse, and return its outcome verbatim.
 
-        For this module's own path the id is log-only (submit is two-phase
-        server-side); for ``flake_ledger``'s it is the ``owner_task_id`` the
-        §5.9 invariant is stored against, which is why that path's argument
-        block carries ``planning_mode: True`` — that makes the response a
-        REAL task id, synchronously.
+        For this module's own path the outcome is log-only (submit is two-phase
+        server-side); for ``flake_ledger``'s a ``SubmittedTask`` is the
+        ``owner_task_id`` the §5.9 invariant is stored against, which is why
+        that path's argument block carries ``planning_mode: True``.
 
         ``project_root`` is INJECTED when absent, over a copy of *arguments*
         so a caller's dict is never mutated. ``flake_ledger.open_debt`` holds
@@ -832,22 +799,17 @@ class SchedulerChronicFlakeTaskClient:
         :func:`build_chronic_flake_fix_task_arguments` always sets the key —
         byte-identical on the wire.
 
-        A response naming no id still returns ``''``, but is logged with the
-        server's own text first: this is the only layer holding the raw response,
-        and ``''`` alone would drop why the filing failed.
+        A ``shared/src/shared/task_submit.py::SubmitFailed`` is logged with its reason,
+        which carries the server's own text when it gave one.
         """
         arguments = {**arguments}
         arguments.setdefault('project_root', self._project_root)
-        result = await self._scheduler.dispatch_tool(
-            'submit_task', arguments, timeout=_SUBMIT_TASK_TIMEOUT_SECS,
-        )
-        task_id = extract_task_id(result)
-        if not task_id:
+        outcome = await self._scheduler.submit_task(arguments, timeout=_SUBMIT_TASK_TIMEOUT_SECS)
+        if isinstance(outcome, SubmitFailed):
             logger.warning(
-                'chronic_flake: submit_task filed nothing a caller can own — %s',
-                _response_error('response names no task id', _unwrap_dispatch_envelope(result)),
+                'chronic_flake: submit_task filed nothing a caller can own — %s', outcome.reason,
             )
-        return task_id
+        return outcome
 
     async def get_statuses(self, ids: list[str]) -> tuple[dict[str, str], Exception | None]:
         """Live ``{id: status}`` for *ids* via ``dispatch_tool('get_statuses', ...)``,

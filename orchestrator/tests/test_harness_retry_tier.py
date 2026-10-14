@@ -162,18 +162,19 @@ class TestAutoEvalRedoCarriesBumpedTier:
     history) alongside the existing ``force_full_path=True``. Harness-set at
     submit time = harness-stamped, not author-supplied (invariant 8).
 
-    Uses a real Harness so ``_extract_task_id`` / ``git_ops`` are genuine; the
-    budget + prior-redo lookups are stubbed and ``dispatch_tool`` returns ``{}``
-    so ``_maybe_auto_eval`` returns right after capturing the submit_task call.
+    Uses a real Harness so ``Scheduler.submit_task`` / ``git_ops`` are genuine; the
+    budget + prior-redo lookups are stubbed and ``dispatch_tool`` returns ``{}``,
+    which ``Scheduler.submit_task`` parses as a ``SubmitFailed``, so
+    ``_maybe_auto_eval`` returns right after capturing the submit_task call.
     """
 
     def _harness(self, tmp_path: Path) -> Harness:
-        harness = Harness(OrchestratorConfig(project_root=tmp_path))
+        harness = Harness(OrchestratorConfig(project_root=tmp_path, auto_eval_enabled=True))
         # Budget OK + no prior redos → straight through to submit_task.
         harness._auto_eval_budget_used_24h = AsyncMock(return_value=0.0)
         harness._find_prior_auto_eval_redos = AsyncMock(return_value=[])
-        # submit_task capture; {} → _extract_task_id None → early return before
-        # any further dispatch_tool call, so call_args_list[0] IS submit_task.
+        # submit_task capture; {} → SubmitFailed → _maybe_auto_eval returns before
+        # the flip's dispatch_tool call, so call_args_list[0] IS submit_task.
         harness.scheduler.dispatch_tool = AsyncMock(return_value={})
         return harness
 

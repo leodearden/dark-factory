@@ -31,6 +31,7 @@ from shared.psi import PsiSample, read_psi_sample
 from shared.task_claimant import has_live_claimant, is_stranded_blocked
 from shared.task_metadata import parse_metadata
 from shared.task_metadata_wire import coerce_task_metadata
+from shared.task_submit import SubmitFailed, SubmitOutcome, parse_submit_task_result
 
 from orchestrator import git_ops
 from orchestrator.anchor_coverage_gate import AnchorCoverageGate
@@ -3459,6 +3460,22 @@ class Scheduler:
                     return None
                 return None
         return None
+
+    async def submit_task(self, arguments: dict, *, timeout: float = 30) -> SubmitOutcome:
+        """Submit one task to fused-memory and return its typed outcome.
+
+        ``project_root`` defaults to this scheduler's root.  A dispatch
+        exception is returned as ``SubmitFailed``, never raised.  The outcome
+        taxonomy lives in ``shared/src/shared/task_submit.py::SubmitOutcome``.
+        """
+        call_arguments = dict(arguments)
+        call_arguments.setdefault('project_root', self._project_root)
+        try:
+            result = await self.dispatch_tool('submit_task', call_arguments, timeout=timeout)
+        except Exception as e:
+            logger.exception('Failed to submit task: %s: %s', type(e).__name__, e)
+            return SubmitFailed(f'submit_task dispatch raised {type(e).__name__}: {e}')
+        return parse_submit_task_result(result)
 
     async def get_statuses(
         self, ids: list[str] | None = None

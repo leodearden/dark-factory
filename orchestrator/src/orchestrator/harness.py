@@ -41,6 +41,7 @@ from shared.task_claimant import (
     has_live_claimant,
 )
 from shared.task_metadata import RoutingState
+from shared.task_submit import SubmittedTask
 from shared.timestamps import parse_timestamp_or_warn
 from shared.transcript_archive import (
     archive_task_transcripts,
@@ -11082,33 +11083,21 @@ class Harness:
             f'{new_branch} for forensic comparison.'
         )
 
-        try:
-            submit_result = await self.scheduler.dispatch_tool(
-                'submit_task',
-                {
-                    'project_root': str(self.config.project_root),
-                    'title': title,
-                    'description': description,
-                    'priority': str(
-                        assignment.task.get('priority') or 'medium'
-                    ),
-                    'metadata': redo_metadata,
-                    'planning_mode': True,
-                },
-                timeout=30,
-            )
-        except Exception as exc:  # noqa: BLE001
+        outcome = await self.scheduler.submit_task({
+            'project_root': str(self.config.project_root),
+            'title': title,
+            'description': description,
+            'priority': str(assignment.task.get('priority') or 'medium'),
+            'metadata': redo_metadata,
+            'planning_mode': True,
+        })
+        if isinstance(outcome, SubmittedTask) and not outcome.combined:
+            new_task_id = outcome.task_id
+        else:
             logger.warning(
-                'Task %s: auto-eval submit_task raised (%s) — aborting redo',
-                original_id, exc,
-            )
-            return
-
-        new_task_id = self._extract_task_id(submit_result)
-        if not new_task_id:
-            logger.warning(
-                'Task %s: auto-eval submit_task returned no task_id (%r)',
-                original_id, submit_result,
+                'Task %s: auto-eval submit_task produced no redo task this harness may '
+                'flip (%r) — aborting redo',
+                original_id, outcome,
             )
             return
 

@@ -78,6 +78,7 @@ from typing import Any, Protocol
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 from shared.task_metadata import DoneProvenance, parse_metadata
 from shared.task_statuses import TERMINAL
+from shared.task_submit import SubmitFailed, SubmitOutcome, SubmittedTask, SubmittedTicket
 
 logger = logging.getLogger(__name__)
 
@@ -867,16 +868,6 @@ def read_debt(db_path: Path, test_id: str) -> DebtRow | None:
         return None
 
 
-# `submit_task`'s TWO-PHASE (non-planning) response names a ticket, not a task:
-# `{"ticket": "tkt_<id>"}`, which the curator resolves into a task asynchronously.
-# `chronic_flake::extract_task_id` accepts that key as a fallback, so the prefix is the
-# one machine-checkable signal that `planning_mode: True` did NOT take effect and the id
-# in hand can never be resolved by `get_statuses`.  Kept as a constant, beside the
-# Protocol whose `submit_task` docstring states the "not a ticket id" requirement in
-# prose, so the guard and the contract it enforces are read together.
-_TICKET_ID_PREFIX = 'tkt_'
-
-
 class FlakeLedgerTaskClient(Protocol):
     """The task seam :func:`open_debt` needs to enforce §5.9, and :func:`resolve_debt`
     needs to corroborate a resolution — declared STRUCTURALLY (``typing.Protocol``) so
@@ -899,12 +890,13 @@ class FlakeLedgerTaskClient(Protocol):
     docstrings).
     """
 
-    async def submit_task(self, arguments: dict) -> str:
+    async def submit_task(self, arguments: dict) -> SubmitOutcome:
         """File the task described by *arguments* (see
-        :func:`build_deflake_task_arguments`) and return its id.  The block carries
-        ``planning_mode: True``, so this must return a REAL, synchronously-known task id
-        — not a ticket id — or the invariant it backs is hollow.  A falsy return is
-        treated as a failed filing."""
+        :func:`build_deflake_task_arguments`) and return its typed outcome.  The block
+        carries ``planning_mode: True``, so a ``SubmittedTask`` is required: the
+        invariant is stored against its id.  A ``SubmittedTicket``, a ``SubmitFailed``,
+        and a ``combined`` task whose status is terminal or unknown are failed filings
+        (:func:`_owner_from_submission`)."""
         ...
 
     async def get_statuses(self, ids: list[str]) -> tuple[dict[str, str], Exception | None]:
@@ -1110,6 +1102,53 @@ async def _owner_status(
     return statuses.get(owner_task_id), None
 
 
+@dataclass(frozen=True)
+class _SubmittedOwner:
+    task_id: str
+    needs_commit_planning: bool
+    combined: bool
+
+
+@dataclass(frozen=True)
+class _FailedFiling:
+    reason: str
+
+
+def _owner_from_submission(outcome: SubmitOutcome) -> _SubmittedOwner | _FailedFiling:
+    """The task a ``submit_task`` *outcome* makes the debt row's owner, or the reason
+    the filing failed.
+
+    A ``combined`` outcome means the server folded the filing into an existing task.
+    A live one owns the debt as it stands; it needs ``commit_planning`` only while it is
+    still ``deferred``, since committing an open task would run ``set_task_status``
+    gates on it.  A terminal or unknown one swallowed the filing: nothing open owns the
+    debt.
+    """
+    match outcome:
+        case SubmittedTask(task_id=task_id, combined=False):
+            return _SubmittedOwner(task_id, needs_commit_planning=True, combined=False)
+        case SubmittedTask(task_id=task_id, status=status) if status is None or status in TERMINAL:
+            return _FailedFiling(
+                f'submit_task combined the filing into task {task_id} '
+                f'(status={status!r}), which cannot own it — the filing was swallowed'
+            )
+        case SubmittedTask(task_id=task_id, status=status):
+            return _SubmittedOwner(
+                task_id, needs_commit_planning=status == 'deferred', combined=True,
+            )
+        case SubmittedTicket(ticket_id=ticket_id):
+            return _FailedFiling(
+                f'submit_task returned ticket {ticket_id!r}, not a task — '
+                'planning_mode did not take effect'
+            )
+        case SubmitFailed(reason=reason):
+            return _FailedFiling(reason)
+        case _:
+            return _FailedFiling(
+                f'submit_task answered a {type(outcome).__name__}, not a SubmitOutcome'
+            )
+
+
 async def _ensure_owner_task(
     db_path: Path,
     project_id: str,
@@ -1245,28 +1284,7 @@ async def _ensure_owner_task(
     # the other side-effects — the "independently guarded side-effects" discipline
     # `orchestrator/src/orchestrator/flake_recorder.py::_guarded` established.
     try:
-        new_id = str(await task_client.submit_task(build_deflake_task_arguments(row)) or '')
-        if not new_id:
-            # A falsy id is a FAILED filing, not a filing with an empty name.  Storing
-            # '' would hide the breach behind a truthy-looking column value; leaving the
-            # column NULL is what `flake_report` renders as the invariant breach it is.
-            raise ValueError('submit_task returned no task id')
-        if new_id.startswith(_TICKET_ID_PREFIX):
-            # A STRUCTURALLY WRONG id is also a failed filing, and the falsy guard above
-            # does not catch it because a ticket id is truthy.  `chronic_flake
-            # ::extract_task_id` falls back to submit_task's NON-planning two-phase
-            # response key, `{'ticket': 'tkt_<id>'}`; if `planning_mode` is ever dropped,
-            # rejected, or the server falls back to that path, a `tkt_...` string arrives
-            # here.  Storing it is strictly WORSE than storing nothing: a ticket id is not
-            # a task id, so every later `get_statuses(['tkt_...'])` legitimately OMITS it,
-            # `_owner_liveness` reads the omission as a CORROBORATED ABSENCE, and a
-            # REPLACEMENT is filed -- on every suppression, unbounded, on a path with no
-            # rate limit (see this function's own note).  Refused here, the row simply
-            # stays unowned and the next suppression RETRIES the filing, which terminates.
-            raise ValueError(
-                f'submit_task returned a ticket id ({new_id!r}), not a task id -- '
-                'planning_mode did not take effect'
-            )
+        outcome = await task_client.submit_task(build_deflake_task_arguments(row))
     except Exception:
         logger.warning(
             'flake_ledger: failed to file a de-flake task for test_id=%s (project_id=%s) '
@@ -1277,6 +1295,18 @@ async def _ensure_owner_task(
             exc_info=True,
         )
         return row
+    owner = _owner_from_submission(outcome)
+    if isinstance(owner, _FailedFiling):
+        logger.warning(
+            'flake_ledger: failed to file a de-flake task for test_id=%s (project_id=%s): '
+            '%s — the debt row stays UNOWNED and §5.9 is breached for it until the next '
+            'suppression retries',
+            row.test_id,
+            project_id,
+            owner.reason,
+        )
+        return row
+    new_id = owner.task_id
 
     # The pointer is written BEFORE commit_planning is awaited, and the order picks
     # which failure is survivable.  Written last, a commit_planning failure would orphan
@@ -1323,7 +1353,8 @@ async def _ensure_owner_task(
     # PHASE of the initial filing, not lifecycle management, and without it the task
     # exists but is never dispatched.
     try:
-        await task_client.commit_planning([new_id])
+        if owner.needs_commit_planning:
+            await task_client.commit_planning([new_id])
     except Exception:
         logger.warning(
             'flake_ledger: filed de-flake task %s for test_id=%s but could not release it '
@@ -1333,12 +1364,21 @@ async def _ensure_owner_task(
             row.test_id,
             exc_info=True,
         )
-    logger.info(
-        'flake_ledger: filed de-flake task %s owning debt for test_id=%s (project_id=%s)',
-        new_id,
-        row.test_id,
-        project_id,
-    )
+    if owner.combined:
+        logger.info(
+            'flake_ledger: de-flake filing for test_id=%s was combined into live task %s, '
+            'now its owner (project_id=%s)',
+            row.test_id,
+            new_id,
+            project_id,
+        )
+    else:
+        logger.info(
+            'flake_ledger: filed de-flake task %s owning debt for test_id=%s (project_id=%s)',
+            new_id,
+            row.test_id,
+            project_id,
+        )
     # No re-read.  After a ROWCOUNT-CHECKED conditional UPDATE, `new_id` is exactly what
     # is in that column on disk — so patching the one column this function owns is not a
     # "local copy" of the row, it is the row.

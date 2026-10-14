@@ -14,8 +14,14 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _orch_helpers import _init_harness_state_for_test, assert_update_wire_mode, pydantic_spec
+from _orch_helpers import (
+    _init_harness_state_for_test,
+    assert_update_wire_mode,
+    mcp_tool_envelope,
+    pydantic_spec,
+)
 from _workflow_helpers import FakeMetadataBackend, wire_metadata_backend
+from shared.task_submit import SubmitOutcome, parse_submit_task_result
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
@@ -31,7 +37,6 @@ class _Fixture:
     harness: Harness
     assignment: TaskAssignment
     git_ops_rename: AsyncMock
-    dispatch_tool: AsyncMock
     update_task: AsyncMock
     event_emit: MagicMock
     submit_calls: list[tuple[str, dict]]
@@ -47,7 +52,7 @@ def _make(
     auto_eval_enabled: bool = True,
     auto_eval_phases: set[str] | None = None,
     redo_budget_usd: float = 50.0,
-    submit_returns: dict | None = None,
+    submit_payload: dict | None = None,
     rename_raises: Exception | None = None,
     worktree_exists: bool = True,
     seen_redo_costs: list[float] | None = None,
@@ -85,20 +90,12 @@ def _make(
     if worktree_exists:
         (worktree_base / 'orig-task').mkdir(parents=True, exist_ok=True)
 
-    if submit_returns is None:
-        submit_returns = {'task_id': 'redo-1', 'status': 'deferred'}
-
-    dispatch_tool = AsyncMock()
-
-    # First call submit_task → submit_returns
-    # Second call set_task_status → OK
-    async def _dispatch(name, args, *, timeout=15):
-        return await dispatch_tool(name, args, timeout=timeout)
-
-    dispatch_tool.return_value = submit_returns
+    if submit_payload is None:
+        submit_payload = {
+            'task_id': 'redo-1', 'status': 'deferred', 'planning_mode': True,
+        }
 
     scheduler = MagicMock()
-    scheduler.dispatch_tool = _dispatch
     # Default: no prior auto-eval redo siblings. Tests exercising the
     # dedupe/supersede behaviour override this per-test.
     scheduler.get_tasks = AsyncMock(return_value=[])
@@ -153,22 +150,26 @@ def _make(
         modules=['mod_a'],
     )
 
-    # Multi-call dispatch — distinguish submit_task vs set_task_status.
+    # ``submit_calls`` records every wire call as (tool, arguments).
+    # ``submit_task`` answers with the real parser over the production
+    # JSON-RPC body of ``submit_payload`` (the tool's own return value).
     submit_calls: list[tuple[str, dict]] = []
+
+    async def _submit_task(arguments: dict, *, timeout: float = 30) -> SubmitOutcome:
+        submit_calls.append(('submit_task', arguments))
+        return parse_submit_task_result(mcp_tool_envelope(submit_payload))
 
     async def _dispatch_recording(name, args, *, timeout=15):
         submit_calls.append((name, args))
-        if name == 'submit_task':
-            return submit_returns
         return {'ok': True}
 
+    scheduler.submit_task = _submit_task
     scheduler.dispatch_tool = _dispatch_recording
 
     return _Fixture(
         harness=harness,
         assignment=assignment,
         git_ops_rename=git_ops_rename,
-        dispatch_tool=dispatch_tool,
         update_task=update_task,
         event_emit=harness.event_store.emit,
         submit_calls=submit_calls,
@@ -464,7 +465,7 @@ async def test_no_worktree_no_rename(tmp_path: Path):
 async def test_submit_returns_no_task_id(tmp_path: Path):
     f = _make(
         project_root=tmp_path / 'proj',
-        submit_returns={'error': 'curator full'},
+        submit_payload={'error': 'curator full'},
     )
     await f.harness._maybe_auto_eval(f.assignment, _make_report())
     submitted = [c for c in f.submit_calls if c[0] == 'submit_task']
@@ -475,26 +476,71 @@ async def test_submit_returns_no_task_id(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_extract_task_id_from_structured_content(tmp_path: Path):
-    """submit_task may return MCP envelope shapes."""
+async def test_task_id_is_read_from_the_production_jsonrpc_body(tmp_path: Path):
+    """The id in the tool's own return value, two envelope layers deep, reaches
+    the pending flip, the back-link and the budget set."""
     f = _make(
         project_root=tmp_path / 'proj',
-        submit_returns={
-            'content': [{'type': 'text', 'text': '{"task_id": "redo-99"}'}],
-        },
+        submit_payload={'task_id': 'redo-99', 'status': 'deferred', 'planning_mode': True},
     )
     await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    flipped = [c for c in f.submit_calls if c[0] == 'set_task_status']
+    assert [c[1]['id'] for c in flipped] == ['redo-99']
+    assert flipped[0][1]['status'] == 'pending'
+    assert f.update_task.await_args.kwargs['metadata']['auto_eval_pair'] == 'redo-99'
     assert 'redo-99' in f.harness._auto_eval_redo_task_ids
 
 
 @pytest.mark.asyncio
-async def test_extract_task_id_handles_structured_content_dict(tmp_path: Path):
+async def test_combined_submission_flips_nothing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+):
+    """A submission folded into someone else's task must not flip, supersede or
+    cross-reference that task."""
     f = _make(
         project_root=tmp_path / 'proj',
-        submit_returns={'structuredContent': {'task_id': 'redo-77'}},
+        submit_payload={
+            'task_id': 'other-redo',
+            'status': 'pending',
+            'combined': True,
+            'planning_mode': True,
+        },
     )
-    await f.harness._maybe_auto_eval(f.assignment, _make_report())
-    assert 'redo-77' in f.harness._auto_eval_redo_task_ids
+    f.harness.scheduler.get_tasks = AsyncMock(return_value=[
+        {
+            'id': 'redo-old-1',
+            'status': 'pending',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+    ])
+
+    with caplog.at_level('WARNING', logger='orchestrator.harness'):
+        await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    assert [c[0] for c in f.submit_calls] == ['submit_task']
+    f.update_task.assert_not_awaited()
+    assert f.harness._auto_eval_redo_task_ids == set()
+    assert any(
+        'orig-task' in r.getMessage() and 'other-redo' in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_ticket_submission_flips_nothing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+):
+    """A ``tkt_`` ticket is not a task id: nothing is flipped or recorded."""
+    f = _make(project_root=tmp_path / 'proj', submit_payload={'ticket': 'tkt_x'})
+
+    with caplog.at_level('WARNING', logger='orchestrator.harness'):
+        await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    assert [c[0] for c in f.submit_calls] == ['submit_task']
+    f.update_task.assert_not_awaited()
+    assert f.harness._auto_eval_redo_task_ids == set()
+    assert any('tkt_x' in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -705,7 +751,7 @@ async def test_no_supersede_when_submit_fails(tmp_path: Path):
     """
     f = _make(
         project_root=tmp_path / 'proj',
-        submit_returns={'error': 'curator full'},
+        submit_payload={'error': 'curator full'},
     )
     f.harness.scheduler.get_tasks = AsyncMock(return_value=[
         {
@@ -814,8 +860,6 @@ async def test_supersede_cancel_failure_is_isolated(tmp_path: Path):
             and arguments.get('status') == 'cancelled'
         ):
             raise RuntimeError('transient dispatch failure')
-        if name == 'submit_task':
-            return {'task_id': 'redo-1', 'status': 'deferred'}
         return {'ok': True}
 
     f.harness.scheduler.dispatch_tool = _flaky_dispatch
