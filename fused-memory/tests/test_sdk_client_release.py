@@ -10,7 +10,7 @@ open.
 
 import logging
 import types
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _fm_helpers import (
@@ -34,6 +34,7 @@ from fused_memory.backends.graphiti_client import (
 )
 from fused_memory.backends.llm_clients import TokenRecordingOpenAIGenericClient
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
+from fused_memory.maintenance.reindex import ReindexResult, run_reindex
 from fused_memory.middleware.task_curator import TaskCurator
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
@@ -274,3 +275,48 @@ class TestRoutingClientsClose:
         await WriteClassifier(mock_config, openai_client=client).close()
 
         client.close.assert_awaited_once()
+
+
+@pytest.fixture
+def reindex_manager_cls(mock_config, make_fake_maintenance_service):
+    """``run_reindex`` over a fake service and manager; its OpenAIEmbedder stays real."""
+    service = AsyncMock()
+    service.durable_queue = MagicMock()
+    service.graphiti = MagicMock()
+    with (
+        patch(
+            'fused_memory.maintenance.reindex.maintenance_service',
+            side_effect=make_fake_maintenance_service(mock_config, service),
+        ),
+        patch('fused_memory.maintenance.reindex.ReindexManager') as manager_cls,
+    ):
+        yield manager_cls
+
+
+class TestRunReindexClosesEmbedder:
+    @pytest.mark.asyncio
+    async def test_the_embedder_is_released_after_the_run(self, reindex_manager_cls):
+        reindex_manager_cls.return_value.reindex_and_replay = AsyncMock(
+            return_value={'reindex_result': ReindexResult(), 'replay_count': 0},
+        )
+        await _start_census()
+
+        await run_reindex()
+
+        embedder = reindex_manager_cls.call_args.kwargs['embedder']
+        assert embedder.client.is_closed() is True
+        assert _leaked_async_httpx_clients() == []
+
+    @pytest.mark.asyncio
+    async def test_the_embedder_is_released_when_the_run_fails(self, reindex_manager_cls):
+        reindex_manager_cls.return_value.reindex_and_replay = AsyncMock(
+            side_effect=RuntimeError('boom'),
+        )
+        await _start_census()
+
+        with pytest.raises(RuntimeError, match='boom'):
+            await run_reindex()
+
+        embedder = reindex_manager_cls.call_args.kwargs['embedder']
+        assert embedder.client.is_closed() is True
+        assert _leaked_async_httpx_clients() == []
