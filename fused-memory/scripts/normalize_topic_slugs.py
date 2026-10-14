@@ -1769,8 +1769,11 @@ async def run(
     outcomes: dict[str, int] = {}
     renamed_by_topic: dict[str, int] = {}
     would_rename_by_topic: dict[str, int] = {}
-    for row in results:
+    for row in [*results, *gate_results]:
         outcome = str(row.get('outcome'))
+        if outcome in ERROR_OUTCOMES:
+            skips.setdefault(outcome, []).append(row)
+            continue
         outcomes[outcome] = outcomes.get(outcome, 0) + 1
         if outcome == 'renamed':
             topic = str(row.get('new_topic'))
@@ -1778,14 +1781,12 @@ async def run(
         elif outcome == 'would_rename':
             topic = str(row.get('new_topic'))
             would_rename_by_topic[topic] = would_rename_by_topic.get(topic, 0) + 1
-    for row in gate_results:
-        outcome = str(row.get('outcome'))
-        outcomes[outcome] = outcomes.get(outcome, 0) + 1
 
-    # A skip that grades as an error must reach the exit code even when no
-    # RESULT row carries it: a collision is refused at plan time, so it never
-    # produces a rename row, and grading outcomes alone would exit 0 on a run
-    # that declined to migrate the most dangerous slug it found.
+    # The buckets are the ONLY source of error counts, so each failure is
+    # counted exactly once and every error outcome equals its bucket's length.
+    # That also grades a refusal no result row carries: a collision is refused
+    # at plan time, and grading result rows alone would exit 0 on a run that
+    # declined to migrate the most dangerous slug it found.
     for bucket, entries in skips.items():
         if entries and bucket in ERROR_OUTCOMES:
             outcomes[bucket] = outcomes.get(bucket, 0) + len(entries)
@@ -1862,8 +1863,10 @@ async def run(
 DEFAULT_JSON_OUT = str(_REPO_ROOT / 'plans' / 'topic-slug-normalization-report.json')
 DEFAULT_MD_OUT = str(_REPO_ROOT / 'plans' / 'topic-slug-normalization-report.md')
 
-#: Keys a skip line leaves out.  The bucket heading already names the reason.
-_SKIP_LINE_OMITTED_KEYS: frozenset[str] = frozenset({'reason'})
+#: Keys a skip line leaves out.  The bucket heading already names the reason
+#: or outcome, and ``response`` is :func:`rename_one`'s whole write envelope,
+#: which the JSON keeps.
+_SKIP_LINE_OMITTED_KEYS: frozenset[str] = frozenset({'reason', 'outcome', 'response'})
 
 
 def render_json(report: dict) -> str:
