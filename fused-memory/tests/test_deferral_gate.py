@@ -384,6 +384,12 @@ _STORED_VARIANTS = {
 }
 
 
+def _valid_record(raw: object) -> task_deferral.Deferral:
+    record = task_deferral.parse_record(raw)
+    assert record is not None and not isinstance(record, task_deferral.InvalidRecord), record
+    return record
+
+
 async def _enter(stack: Stack, task_id: str, deferral: dict[str, Any]) -> dict:
     result = await stack.call(
         'set_task_status', id=task_id, status='deferred', deferral=deferral, agent_id=_AGENT,
@@ -406,7 +412,7 @@ async def test_each_caller_kind_enters_deferred(
     row = await stack.read(task_id)
     assert row['status'] == 'deferred'
     stored = row['metadata']['deferral']
-    record = task_deferral.parse_record(stored)
+    record = _valid_record(stored)
     assert isinstance(record, _STORED_VARIANTS[kind]), record
     assert record.stamped_by == _AGENT
     assert record.deferred_at == record.stamped_at

@@ -30,6 +30,8 @@ from shared.task_deferral import (
     parse_record,
     parse_request,
     parse_utc_timestamp,
+    record_to_json,
+    stamp,
 )
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TaskStatus
@@ -403,8 +405,29 @@ def plan(
     request = call.request
     if status == DEFERRED and request is None and _needs_request(old_status, call):
         return DeferralRequiredRefusal(task_id, old_status)
-    if request is not None:
-        refusal = _kind_refusal(request, old_status=old_status, stored=stored, task_id=task_id)
-        if refusal is not None:
-            return refusal
+    if request is None:
+        return NO_WRITE
+    refusal = _kind_refusal(request, old_status=old_status, stored=stored, task_id=task_id)
+    if refusal is not None:
+        return refusal
+    if old_status != DEFERRED:
+        record = _stamped(request, call, agent_id=agent_id, deferred_at=call.now)
+        return DeferralWrite(audit_fields={'deferral': record}, event_fields={'deferral': record})
     return NO_WRITE
+
+
+def _stamped(
+    request: DeferralRequest,
+    call: DeferralCall,
+    *,
+    agent_id: str | None,
+    deferred_at: datetime | None,
+) -> dict[str, Any]:
+    record = stamp(
+        request,
+        stamped_at=call.now,
+        stamped_by=agent_id,
+        deferred_at=deferred_at,
+        holder=call.holder,
+    )
+    return record_to_json(record)

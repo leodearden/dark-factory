@@ -1531,6 +1531,7 @@ class TaskInterceptor:
                 return await self._journal_deferral_refusal(
                     deferral_write, project_root, _journal_params, agent_id,
                 )
+            audit_fields.update(deferral_write.audit_fields)
 
             if status == old_status:
                 if status == 'done' and done_provenance:
@@ -1915,6 +1916,8 @@ class TaskInterceptor:
         if resolved_reopen_reason is not None:
             payload['reopen_reason'] = resolved_reopen_reason
             payload['reopen_from'] = old_status
+        payload.update(deferral_write.event_fields)
+        result.update(deferral_write.echo)
         event = self._make_event(
             EventType.task_status_changed,
             project_root,
