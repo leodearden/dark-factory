@@ -75,10 +75,13 @@ def _max_gap_ceiling(blocked_seconds: float) -> float:
     """The longest loop stall tolerated while *blocked_seconds* of work runs.
 
     A call held on the loop thread stalls it for at least *blocked_seconds*;
-    offloaded, the worst gap is only scheduler jitter.  Half the block splits
-    the two.
+    offloaded, the worst gap is only scheduler jitter.  The ceiling sits at
+    nine tenths of the block: a regression still lands above it, while an
+    offloaded run keeps most of the block as headroom for jitter, which
+    reached 500-900ms under host load averages of 4-6x the core count (a
+    half-block ceiling flaked there).
     """
-    return blocked_seconds / 2
+    return blocked_seconds * 0.9
 
 
 # ── Local harness scaffolding (mirrors tests/test_harness.py) ────────────────
@@ -462,7 +465,9 @@ def _stub_probe(monkeypatch, probed: list, *, live_ids: frozenset[str] = frozens
     Stands in for ``is_workflow_live_for_task``, a coroutine since task 3778
     whose up-to-three git probes per task each take up to 10s.  The stub
     awaits for *block* seconds, so a stall of that size means the pass is
-    holding the loop around the probe rather than awaiting it.
+    holding the loop around the probe rather than awaiting it.  The worktree
+    index the pass hoists ahead of the probes is stubbed too: otherwise it
+    spawns a real ``git worktree list`` inside the measured window.
     """
 
     async def _is_live(tid, _project_root, **_kw):
@@ -470,7 +475,11 @@ def _stub_probe(monkeypatch, probed: list, *, live_ids: frozenset[str] = frozens
         await asyncio.sleep(block)
         return str(tid) in live_ids
 
+    async def _no_worktree_index(_project_root):
+        return {}
+
     monkeypatch.setattr(harness_module, 'is_workflow_live_for_task', _is_live)
+    monkeypatch.setattr(harness_module, 'worktree_index_kwargs', _no_worktree_index)
 
 
 class TestLiveWorkflowProbesLeaveTheLoopAndAreMemoised:
