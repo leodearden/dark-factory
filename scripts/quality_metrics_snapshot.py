@@ -1286,8 +1286,10 @@ def summary_table(snapshot: Mapping[str, Any]) -> str:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            f'Measure every workspace member\'s tracked Python at HEAD as a schema-{SCHEMA_VERSION} '
-            'snapshot (plans/quality-metrics-snapshot-prd.md), diff two snapshots, '
+            "Measure the domain's tracked Python (a uv workspace's members or a single "
+            'src-layout package, plus pseudo-members) at HEAD as a '
+            f'schema-{SCHEMA_VERSION} snapshot (plans/quality-metrics-snapshot-prd.md), '
+            'diff two snapshots, '
             'or print one as a per-member table. A report, never a gate.'
         ),
         epilog=(

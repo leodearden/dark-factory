@@ -1,8 +1,9 @@
 """Tests of ``scripts/quality_metrics_snapshot.py``, the whole-repo metrics report.
 
 Every fixture is a small REAL git repository whose root pyproject.toml names
-two members, measured through the script's public entry points; no measure is
-patched. The one real-tree test (cluster agreement) is the PRD's row 12.
+two workspace members (or, for a single-package project, one package),
+measured through the script's public entry points; no measure is patched.
+The one real-tree test (cluster agreement) is the PRD's row 12.
 """
 from __future__ import annotations
 
@@ -1334,6 +1335,68 @@ class TestTheSummary:
 
 
 # ---------------------------------------------------------------------------
+# A single-package project: no [tool.uv.workspace], one package in the src layout.
+
+_SINGLE_PACKAGE_FILES: dict[str, str] = {
+    'pyproject.toml': '[project]\nname = "solo"\n',
+    'src/solo/__init__.py': '',
+    'src/solo/mod.py': _MOD_BEFORE,
+    'tests/test_mod.py': (
+        'from unittest.mock import patch\n\n\ndef test_it():\n'
+        "    with patch('solo.mod._helper'):\n        assert True\n"
+    ),
+    'scripts/x.py': 'X = 1\n',
+    'hooks/h.py': 'H = 1\n',
+}
+
+
+class TestASinglePackageProject:
+    @pytest.fixture
+    def measured(self, tmp_path: Path) -> Path:
+        path = tmp_path / 'out' / 'snapshot.json'
+        assert _run(_repo(tmp_path, _SINGLE_PACKAGE_FILES), path) == 0
+        return path
+
+    def test_the_package_and_the_scripts_pseudo_member_are_the_domain(
+        self, measured: Path
+    ) -> None:
+        taken = _load(measured)
+        assert {
+            path: (record['member'], record['kind']) for path, record in taken['files'].items()
+        } == {
+            'src/solo/__init__.py': ('solo', 'src'),
+            'src/solo/mod.py': ('solo', 'src'),
+            'tests/test_mod.py': ('solo', 'tests'),
+            'scripts/x.py': ('scripts', 'src'),
+        }
+        assert taken['evidence']['members'] == [
+            {'name': 'solo', 'pseudo': False, 'domain_files': 3},
+            {'name': 'scripts', 'pseudo': True, 'domain_files': 1},
+        ]
+        assert taken['evidence']['complete'] is True
+
+    def test_src_files_are_named_by_their_path_below_src(self, measured: Path) -> None:
+        taken = _load(measured)
+        files = taken['files']
+        package = files['src/solo/__init__.py']
+        assert (package['module'], package['package_init']) == ('solo', True)
+        assert files['src/solo/mod.py']['module'] == 'solo.mod'
+        assert taken['functions']['src/solo/mod.py::f'] == 2
+
+    def test_the_package_import_names_reach_the_patch_target_measure(
+        self, measured: Path
+    ) -> None:
+        record = _load(measured)['files']['tests/test_mod.py']
+        assert record['private_patch_targets'] == ['solo.mod._helper']
+
+    def test_the_summary_has_a_row_for_the_package(
+        self, measured: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        summary = _summary_of(measured, capsys)
+        assert [line for line in summary if line.startswith('| solo | false |')]
+
+
+# ---------------------------------------------------------------------------
 # Refusals: exit 2, the cause named on stderr, nothing written.
 
 
@@ -1421,11 +1484,13 @@ class TestAMovedHeadIsRefused:
 
 
 class TestToolFaultsAreRefused:
-    def test_no_workspace_members(
+    def test_neither_a_workspace_nor_a_project_name(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        root = _repo(tmp_path, {**_BASE, 'pyproject.toml': '[project]\nname = "x"\n'})
-        assert 'tool.uv.workspace' in _refused(root, capsys)
+        root = _repo(tmp_path, {**_BASE, 'pyproject.toml': '[tool.ruff]\nline-length = 100\n'})
+        err = _refused(root, capsys)
+        assert '[project].name' in err
+        assert 'tool.uv.workspace' in err
 
     def test_git_absent(
         self,
