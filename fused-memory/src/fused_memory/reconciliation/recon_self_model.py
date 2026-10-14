@@ -458,10 +458,7 @@ def render_suppression_schema_section() -> str:
     )
 
 
-#: The entity-standing-decision schema section's heading (task 5750), exported so
-#: a rename moves this renderer, the "above" pointer in
-#: ``prompts/__init__.py::render_entity_standing_decision_write_section`` and
-#: ``tests/test_recon_report_stage_gated_tool_advertisement.py`` together.
+#: Heading of the section below; other prompt sections refer to it by this constant.
 ENTITY_STANDING_DECISIONS_HEADING = '## Entity Standing Decisions'
 
 
@@ -510,8 +507,7 @@ def render_entity_standing_decision_schema_section() -> str:
     )
 
 
-#: The investigation-outcome section's heading (task 5750), exported for the same
-#: reason, for the same pointer and test.
+#: Heading of the section below; other prompt sections refer to it by this constant.
 INVESTIGATION_OUTCOME_RECORDS_HEADING = '## Investigation Outcome Records'
 
 

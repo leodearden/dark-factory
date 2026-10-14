@@ -217,10 +217,10 @@ class TestStageGatedToolAdvertisementMatchesTheDisallowLists:
     def test_every_stage_gated_tool_is_denied_by_some_stage_and_held_by_another(
         self, tool_name
     ):
-        """Carries over the retired drift-module
-        test_the_absence_guard_is_scoped_to_actually_denying_stages, over all three
-        stages. A tool that exercises BOTH arms above is what makes a mis-scoped
-        absence arm contradict the naming arm instead of passing silently.
+        """Every stage-gated tool is denied by at least one stage and held by another.
+
+        That keeps BOTH arms above exercised for every tool, so a mis-scoped
+        absence arm contradicts the naming arm instead of passing silently.
         """
         denying = [
             attr for _label, _text, attr in _STAGE_CASES if _stage_denies(tool_name, attr)
