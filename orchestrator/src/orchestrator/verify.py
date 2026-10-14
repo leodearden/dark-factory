@@ -2240,6 +2240,11 @@ WORKER_DEATH_SUMMARY_MARKER = 'session aborted after worker death'
 _NO_VERDICT_SUMMARY_MARKERS = (SIGNAL_KILL_SUMMARY_MARKER, WORKER_DEATH_SUMMARY_MARKER)
 
 
+def is_no_verdict_summary(summary: str) -> bool:
+    """True when *summary* carries a no-verdict note — a signal-killed leg or an xdist-truncated session — so it records no verdict on the code."""
+    return any(marker in summary for marker in _NO_VERDICT_SUMMARY_MARKERS)
+
+
 def _killed_leg_note(label: str, rc: int, duration: float | None) -> str:
     """Describe a leg that was terminated by an external signal.
 
@@ -3072,6 +3077,7 @@ def _archive_merge_verify_logs(
     cause_hint: str,
     *,
     module_prefix: 'str | None' = None,
+    role: Literal['merge', 'task'] = 'merge',
 ) -> list[Path]:
     """Write merge-verify run outputs + summary DIRECTLY to the durable archive.
 
@@ -3125,7 +3131,7 @@ def _archive_merge_verify_logs(
             archived.append(path)
 
     summary_path = _archive_attempt_summary(
-        _build_summary_payload(runs, category, cause_hint, role='merge'),
+        _build_summary_payload(runs, category, cause_hint, role=role),
         archive_root, task_id, attempt_id,
         module_prefix=module_prefix, stamp=utc_ts,
     )
@@ -7710,10 +7716,7 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         # stutter the same sentence twice).
         for r in results:
             for fragment in r.summary.removeprefix('Failures: ').split(', '):
-                if (
-                    any(marker in fragment for marker in _NO_VERDICT_SUMMARY_MARKERS)
-                    and fragment not in parts
-                ):
+                if is_no_verdict_summary(fragment) and fragment not in parts:
                     parts.append(fragment)
         summary = 'All checks passed' if passed else f'Failures: {", ".join(parts)}'
 
