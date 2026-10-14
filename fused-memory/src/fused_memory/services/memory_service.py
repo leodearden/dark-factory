@@ -2697,6 +2697,8 @@ class MemoryService:
             await self._safe_close('durable_queue', self.durable_queue)
         await self._safe_close('graphiti', self.graphiti)
         await self._safe_close('mem0', self.mem0)
+        await self._safe_close('classifier', self.classifier)
+        await self._safe_close('router', self.router)
         if self._write_journal:
             await self._safe_close('write_journal', self._write_journal)
         if self._event_buffer:
