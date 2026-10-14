@@ -91,6 +91,13 @@ MENTIONS_DECIDED_ROWS = [
     ranked('u-700-lower', 'task 700', '2026-02-10', 8),
 ]
 
+#: A backend whose rank rule is not a plain sum — the census must report the
+#: backend's key, whatever rule produced it.
+WEIGHTED_RANK_ROWS = [
+    {**ranked('u-700-canon', 'Task 700', '2026-02-20', 2, 9), 'provenance_rank': 29},
+    ranked('u-700-lower', 'task 700', '2026-02-10', 8),
+]
+
 
 def complete_read(rows_seen: int) -> PagedRead:
     """A PagedRead that reports a whole enumeration."""
@@ -181,10 +188,41 @@ class TestTaskFamilyCensusRun:
         result = await census.run(group_id='home')
 
         (family_700,) = result.families
-        assert [(v.name, v.uuid, v.edge_count) for v in family_700.variants] == [
-            ('Task 700', 'u-700-canon', 2),
-            ('task 700', 'u-700-lower', 8),
+        assert [
+            (v.name, v.uuid, v.edge_count, v.mentions_count, v.provenance_rank)
+            for v in family_700.variants
+        ] == [
+            ('Task 700', 'u-700-canon', 2, 9, 11),
+            ('task 700', 'u-700-lower', 8, 0, 8),
         ], 'the episode-richer variant leads even though it holds FEWER edges'
+
+    @pytest.mark.asyncio
+    async def test_an_exact_name_pair_carries_each_nodes_provenance(self):
+        """Same spelling, different nodes: the per-variant numbers are all that
+        tells the operator which of the pair would survive, without a second
+        trip to the graph."""
+        census = TaskFamilyCensus(backend=make_census_backend())
+
+        result = await census.run(group_id='home')
+
+        _, family_900 = result.families
+        assert [
+            (v.edge_count, v.mentions_count, v.provenance_rank)
+            for v in family_900.variants
+        ] == [(4, 0, 4), (1, 0, 1)]
+
+    @pytest.mark.asyncio
+    async def test_the_rank_is_the_backends_number_not_a_recomputation(self):
+        """The ranking rule has one home (graphiti_client.py::_PROVENANCE_RANK_CLAUSE
+        and the RETURN projection beside it); a census that re-derived the rank
+        would silently disagree with the order it prints the moment that rule
+        changed."""
+        census = TaskFamilyCensus(backend=make_census_backend(rows=WEIGHTED_RANK_ROWS))
+
+        result = await census.run(group_id='home')
+
+        (family_700,) = result.families
+        assert [v.provenance_rank for v in family_700.variants] == [29, 8]
 
     @pytest.mark.asyncio
     async def test_a_multi_spelling_family_is_distinguishable_from_an_exact_name_pair(self):
@@ -261,7 +299,11 @@ class TestAFragmentedFamilyHoldsAtLeastTwoVariants:
     """'Split across more than one node' is enforced by the type, not by prose."""
 
     def test_a_fragmented_family_cannot_be_built_with_fewer_than_two_variants(self):
-        one = (VariantSpelling(name='Task 1', uuid='u-1', edge_count=3),)
+        one = (
+            VariantSpelling(
+                name='Task 1', uuid='u-1', edge_count=3, mentions_count=0, provenance_rank=3,
+            ),
+        )
 
         with pytest.raises(ValueError) as exc_info:
             FragmentedFamily(canonical_name='Task 1', variants=one)
@@ -271,6 +313,52 @@ class TestAFragmentedFamilyHoldsAtLeastTwoVariants:
         assert "'Task 1' has 1" in message
         with pytest.raises(ValueError):
             FragmentedFamily(canonical_name='Task 1', variants=())
+
+
+async def fragmented_family_line(caplog, backend, canonical_name: str) -> str:
+    """The one WARNING a census run logs for *canonical_name*'s family."""
+    with caplog.at_level('WARNING'):
+        await TaskFamilyCensus(backend=backend).run(group_id='home')
+    (line,) = [
+        record.getMessage() for record in caplog.records
+        if record.getMessage().startswith(f'fragmented task family {canonical_name}')
+    ]
+    return line
+
+
+class TestTheFragmentedFamilyLineExplainsTheSurvivor:
+    """The WARNING is the operator-facing report, and after task 4986 an edge
+    count alone cannot explain why variants[0] leads."""
+
+    @pytest.mark.asyncio
+    async def test_an_edge_poorer_survivor_shows_why_it_leads(self, caplog):
+        """'Task 700' holds fewer edges yet leads; the line has to show the
+        rank and the mentions that put it there."""
+        backend = make_census_backend(rows=MENTIONS_DECIDED_ROWS)
+
+        line = await fragmented_family_line(caplog, backend, 'Task 700')
+
+        first = "'Task 700' provenance_rank=11 (2 edge(s), 9 mention(s))"
+        second = "'task 700' provenance_rank=8 (8 edge(s), 0 mention(s))"
+        assert first in line and second in line
+        assert line.index(first) < line.index(second)
+
+    @pytest.mark.asyncio
+    async def test_every_variant_of_a_three_way_split_is_rendered_in_order(self, caplog):
+        """Every spelling appears, survivor first, and the substring noise in
+        the same graph never reaches the report."""
+        line = await fragmented_family_line(caplog, make_census_backend(), 'Task 605')
+
+        fragments = [
+            "'task 605' provenance_rank=14 (13 edge(s), 1 mention(s))",
+            "'Task 605' provenance_rank=3 (2 edge(s), 1 mention(s))",
+            "'tasks 605' provenance_rank=1 (1 edge(s), 0 mention(s))",
+        ]
+        assert all(fragment in line for fragment in fragments)
+        positions = [line.index(fragment) for fragment in fragments]
+        assert positions == sorted(set(positions))
+        assert "'reify:605'" not in line
+        assert "'Task 6051'" not in line
 
 
 class TestTaskFamilyCensusIsReadOnly:
@@ -758,7 +846,10 @@ class TestTheTwoOutputShapes:
         assert [graph['group_id'] for graph in emitted['graphs']] == [
             'home', 'other', 'clean',
         ]
-        assert emitted['graphs'][0]['families'][0]['variants'][0]['edge_count'] == 13
+        survivor = emitted['graphs'][0]['families'][0]['variants'][0]
+        assert {
+            k: survivor[k] for k in ('edge_count', 'mentions_count', 'provenance_rank')
+        } == {'edge_count': 13, 'mentions_count': 1, 'provenance_rank': 14}
 
     def test_without_json_the_summary_names_each_graph_and_its_count(self, capsys):
         """'three families somewhere' is not actionable; the breakdown is what

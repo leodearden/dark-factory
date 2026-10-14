@@ -45,18 +45,17 @@ logger = logging.getLogger(__name__)
 class VariantSpelling:
     """One node in a fragmented family: how it is spelled, and what it holds.
 
-    ``edge_count`` is the number of still-VALID RELATES_TO edges hanging off the
-    node, and ONLY those. It says how many edges a collapse would have to move.
-    It no longer says which node a collapse would KEEP: since task 4986 the
-    backend ranks survivors by ``provenance_rank`` (``edge_count`` plus the
-    node's Episodic MENTIONS), so an edge-poorer node can legitimately outrank
-    an edge-richer one. Read ``variants[0]`` for the would-be survivor, not the
-    largest ``edge_count``.
+    ``edge_count`` counts still-VALID RELATES_TO edges ONLY — what a collapse
+    would have to move. ``mentions_count`` counts the Episodic MENTIONS
+    pointing at the node. ``provenance_rank`` is the backend's survivor key,
+    copied from the enumerated row and never recomputed here.
     """
 
     name: str
     uuid: str
     edge_count: int
+    mentions_count: int
+    provenance_rank: int
 
 
 @dataclass(frozen=True)
@@ -146,6 +145,15 @@ class CensusSweep:
     elapsed_ms: float
 
 
+def _describe_variants(variants: tuple[VariantSpelling, ...]) -> str:
+    """Each variant's survivor key and the two counts beneath it, in the order given."""
+    return '; '.join(
+        f'{v.name!r} provenance_rank={v.provenance_rank} '
+        f'({v.edge_count} edge(s), {v.mentions_count} mention(s))'
+        for v in variants
+    )
+
+
 class TaskFamilyCensus:
     """Counts fragmented task families in a project graph. Never writes.
 
@@ -166,10 +174,10 @@ class TaskFamilyCensus:
         the write-path normalizer renames it the next time an episode touches
         that task.
 
-        Membership and edge counts come from ONE group-scoped read, so they
-        cannot disagree. A node whose group_id property names another project
-        (task 2115's leak) is not a member, matching every group-scoped
-        collapse path. Why that read is a dedicated method rather than a
+        Membership and per-node provenance (edge count, mention count, rank)
+        come from ONE group-scoped read, so they cannot disagree. A node whose
+        group_id property names another project (task 2115's leak) is not a
+        member, matching every group-scoped collapse path. Why that read is a dedicated method rather than a
         widened ``enumerate_entity_nodes``: task 5264, decision 7.
 
         Args:
@@ -187,7 +195,11 @@ class TaskFamilyCensus:
                 continue
             variants = tuple(
                 VariantSpelling(
-                    name=row['name'], uuid=row['uuid'], edge_count=row['edge_count'],
+                    name=row['name'],
+                    uuid=row['uuid'],
+                    edge_count=row['edge_count'],
+                    mentions_count=row['mentions_count'],
+                    provenance_rank=row['provenance_rank'],
                 )
                 for row in members
             )
@@ -196,11 +208,11 @@ class TaskFamilyCensus:
             )
             families.append(family)
             logger.warning(
-                'fragmented task family %s in graph %r: %d node(s) — %s',
+                'fragmented task family %s in graph %r: %d node(s), survivor first — %s',
                 family.canonical_name,
                 group_id,
                 len(variants),
-                ', '.join(f'{v.name!r}={v.edge_count} edge(s)' for v in variants),
+                _describe_variants(variants),
             )
 
         if not paged.complete:
