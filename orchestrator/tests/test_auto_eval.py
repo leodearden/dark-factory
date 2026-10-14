@@ -1,8 +1,9 @@
 """Tests for the harness auto-eval hook (``Harness._maybe_auto_eval``).
 
 When the optimistic path (Lever B revalidation skip or Lever C SIMPLE_TASK)
-blocks at a phase the auto-eval cares about, the hook renames the original
-branch + worktree and submits a sibling task with ``force_full_path=True``.
+blocks at a phase the auto-eval cares about, the hook submits a sibling task
+with ``force_full_path=True``, releases it, and only then renames the original
+branch + worktree.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness, TaskReport
 from orchestrator.module_charter import derive_modules
-from orchestrator.scheduler import Scheduler, TaskAssignment
+from orchestrator.scheduler import Scheduler, SetTaskStatusRejected, TaskAssignment
 from orchestrator.task_status import ACTIVE_TASK_STATUSES
 from orchestrator.workflow import WorkflowOutcome
 
@@ -82,9 +83,20 @@ def _make(
     worktree_base.mkdir(parents=True, exist_ok=True)
     git_ops = MagicMock()
     git_ops.worktree_base = worktree_base
-    git_ops_rename = AsyncMock(side_effect=rename_raises)
+    git_ops_rename = AsyncMock()
     git_ops.rename_worktree = git_ops_rename
     harness.git_ops = git_ops
+
+    # ``submit_calls`` records every wire call as (tool, arguments), and the
+    # rename as ('rename_worktree', kwargs), in the order they happened.
+    submit_calls: list[tuple[str, dict]] = []
+
+    async def _rename(**kwargs) -> None:
+        submit_calls.append(('rename_worktree', kwargs))
+        if rename_raises is not None:
+            raise rename_raises
+
+    git_ops_rename.side_effect = _rename
 
     # Pre-create the worktree directory so the hook actually invokes rename.
     if worktree_exists:
@@ -150,11 +162,8 @@ def _make(
         modules=['mod_a'],
     )
 
-    # ``submit_calls`` records every wire call as (tool, arguments).
     # ``submit_task`` answers with the real parser over the production
     # JSON-RPC body of ``submit_payload`` (the tool's own return value).
-    submit_calls: list[tuple[str, dict]] = []
-
     async def _submit_task(arguments: dict, *, timeout: float = 30) -> SubmitOutcome:
         submit_calls.append(('submit_task', arguments))
         return parse_submit_task_result(mcp_tool_envelope(submit_payload))
@@ -163,8 +172,16 @@ def _make(
         submit_calls.append((name, args))
         return {'ok': True}
 
+    # The pending flip (and the cancel of a redo whose flip failed) goes
+    # through Scheduler.set_task_status; the supersede cancels of prior redos
+    # still go through dispatch_tool. Both land in ``submit_calls`` as
+    # ('set_task_status', {'id', 'status'}) so tests read one ordered list.
+    async def _set_task_status(task_id: str, status: str) -> None:
+        submit_calls.append(('set_task_status', {'id': task_id, 'status': status}))
+
     scheduler.submit_task = _submit_task
     scheduler.dispatch_tool = _dispatch_recording
+    scheduler.set_task_status = AsyncMock(side_effect=_set_task_status)
 
     return _Fixture(
         harness=harness,
@@ -180,14 +197,23 @@ def _make_report(
     *,
     outcome: WorkflowOutcome = WorkflowOutcome.BLOCKED,
     block_phase: str = 'verify',
+    block_category: str = 'task_failure',
 ) -> TaskReport:
     return TaskReport(
         task_id='orig-task',
         title='Document foo',
         outcome=outcome,
         block_phase=block_phase,
+        block_category=block_category,
         cost_usd=0.0,
     )
+
+
+def _auto_eval_events(f: _Fixture) -> list:
+    return [
+        c for c in f.event_emit.call_args_list
+        if c.args and c.args[0] == EventType.auto_eval_dispatched
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +427,146 @@ async def test_skipped_for_excluded_phase(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('block_category', ['wip_conflict', 'infra_issue', 'branch_reset'])
+async def test_skipped_for_excluded_block_category(tmp_path: Path, block_category: str):
+    """A worktree conflict at setup blocks from ``plan`` — an auto-eval phase —
+    yet a full-path redo would meet the same worktree."""
+    f = _make(project_root=tmp_path / 'proj')
+    await f.harness._maybe_auto_eval(
+        f.assignment,
+        _make_report(block_phase='plan', block_category=block_category),
+    )
+    assert f.submit_calls == []
+    f.git_ops_rename.assert_not_awaited()
+    assert _auto_eval_events(f) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('block_category', ['task_failure', 'review_issues', ''])
+async def test_fires_for_non_excluded_block_category(tmp_path: Path, block_category: str):
+    f = _make(project_root=tmp_path / 'proj')
+    await f.harness._maybe_auto_eval(
+        f.assignment, _make_report(block_category=block_category),
+    )
+    assert [c[0] for c in f.submit_calls if c[0] == 'submit_task'] == ['submit_task']
+    assert len(_auto_eval_events(f)) == 1
+
+
+@pytest.mark.asyncio
+async def test_original_is_renamed_only_after_the_redo_is_released(tmp_path: Path):
+    f = _make(project_root=tmp_path / 'proj')
+    f.harness.scheduler.get_tasks = AsyncMock(return_value=[
+        {
+            'id': 'redo-old-1',
+            'status': 'pending',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+    ])
+
+    await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    assert [(c[0], c[1].get('status')) for c in f.submit_calls] == [
+        ('submit_task', None),
+        ('set_task_status', 'pending'),
+        ('rename_worktree', None),
+        ('set_task_status', 'cancelled'),
+    ]
+
+
+def _rejecting_flip(f: _Fixture, *, cancel_raises: Exception | None = None) -> None:
+    """Make the redo's pending flip raise; optionally make its cancel raise too."""
+    async def _set_task_status(task_id: str, status: str) -> None:
+        f.submit_calls.append(('set_task_status', {'id': task_id, 'status': status}))
+        if status == 'pending':
+            raise SetTaskStatusRejected(task_id, 'TimeoutError', 'taskmaster restarting')
+        if cancel_raises is not None:
+            raise cancel_raises
+
+    f.harness.scheduler.set_task_status = AsyncMock(side_effect=_set_task_status)
+
+
+def _seed_prior_redo(f: _Fixture) -> None:
+    f.harness.scheduler.get_tasks = AsyncMock(return_value=[
+        {
+            'id': 'redo-old-1',
+            'status': 'pending',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+    ])
+
+
+@pytest.mark.asyncio
+async def test_pending_flip_failure_leaves_the_original_untouched(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+):
+    f = _make(project_root=tmp_path / 'proj')
+    _seed_prior_redo(f)
+    _rejecting_flip(f)
+
+    with caplog.at_level('WARNING', logger='orchestrator.harness'):
+        await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    assert [(c[0], c[1].get('id'), c[1].get('status')) for c in f.submit_calls] == [
+        ('submit_task', None, None),
+        ('set_task_status', 'redo-1', 'pending'),
+        ('set_task_status', 'redo-1', 'cancelled'),
+    ]
+    f.git_ops_rename.assert_not_awaited()
+    f.update_task.assert_not_awaited()
+    assert f.harness._auto_eval_redo_task_ids == set()
+    assert _auto_eval_events(f) == []
+    warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+    assert len(warnings) == 1
+    assert 'redo-1' in warnings[0].getMessage()
+    assert 'cancelled' in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_pending_flip_failure_and_failed_cancel_leave_the_redo_deferred(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+):
+    f = _make(project_root=tmp_path / 'proj')
+    _rejecting_flip(f, cancel_raises=RuntimeError('fused-memory unreachable'))
+
+    with caplog.at_level('WARNING', logger='orchestrator.harness'):
+        await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    f.git_ops_rename.assert_not_awaited()
+    f.update_task.assert_not_awaited()
+    assert f.harness._auto_eval_redo_task_ids == set()
+    assert _auto_eval_events(f) == []
+    warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert 'redo-1' in message
+    assert 'left deferred' in message
+
+
+@pytest.mark.asyncio
+async def test_pending_flip_structured_error_body_is_not_a_release(
+    tmp_path: Path,
+):
+    """A raw dispatch_tool answers a structured error WITHOUT raising, so a flip
+    read from it would look released. The flip must not read dispatch_tool at
+    all: it goes through Scheduler.set_task_status, mocked here to raise as the
+    real method does for that body, and nothing is renamed or back-linked."""
+    f = _make(project_root=tmp_path / 'proj')
+
+    async def _error_body(name: str, arguments: dict, *, timeout: float = 15) -> dict:
+        f.submit_calls.append((name, arguments))
+        return {'error': 'TimeoutError(...)', 'error_type': 'TimeoutError'}
+
+    f.harness.scheduler.dispatch_tool = _error_body
+    _rejecting_flip(f)
+
+    await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    f.git_ops_rename.assert_not_awaited()
+    f.update_task.assert_not_awaited()
+    assert f.harness._auto_eval_redo_task_ids == set()
+
+
+@pytest.mark.asyncio
 async def test_skipped_for_non_blocked_outcome(tmp_path: Path):
     f = _make(project_root=tmp_path / 'proj')
     await f.harness._maybe_auto_eval(
@@ -472,6 +638,7 @@ async def test_submit_returns_no_task_id(tmp_path: Path):
     flipped = [c for c in f.submit_calls if c[0] == 'set_task_status']
     assert len(submitted) == 1
     assert len(flipped) == 0  # status flip not called
+    f.git_ops_rename.assert_not_awaited()
     assert f.harness._auto_eval_redo_task_ids == set()
 
 
@@ -519,6 +686,7 @@ async def test_combined_submission_flips_nothing(
         await f.harness._maybe_auto_eval(f.assignment, _make_report())
 
     assert [c[0] for c in f.submit_calls] == ['submit_task']
+    f.git_ops_rename.assert_not_awaited()
     f.update_task.assert_not_awaited()
     assert f.harness._auto_eval_redo_task_ids == set()
     assert any(
@@ -538,6 +706,7 @@ async def test_ticket_submission_flips_nothing(
         await f.harness._maybe_auto_eval(f.assignment, _make_report())
 
     assert [c[0] for c in f.submit_calls] == ['submit_task']
+    f.git_ops_rename.assert_not_awaited()
     f.update_task.assert_not_awaited()
     assert f.harness._auto_eval_redo_task_ids == set()
     assert any('tkt_x' in r.getMessage() for r in caplog.records)
@@ -766,6 +935,7 @@ async def test_no_supersede_when_submit_fails(tmp_path: Path):
     status_calls = [c for c in f.submit_calls if c[0] == 'set_task_status']
     cancelled = [c for c in status_calls if c[1].get('status') == 'cancelled']
     assert cancelled == []
+    f.git_ops_rename.assert_not_awaited()
 
     emit_calls = [
         c for c in f.event_emit.call_args_list
@@ -874,7 +1044,7 @@ async def test_supersede_cancel_failure_is_isolated(tmp_path: Path):
     assert cancelled_ids == {'redo-old-1', 'redo-old-2'}
 
     flipped = [
-        c for c in calls
+        c for c in f.submit_calls
         if c[0] == 'set_task_status' and c[1].get('status') == 'pending'
     ]
     assert len(flipped) == 1

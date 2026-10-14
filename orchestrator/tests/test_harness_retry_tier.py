@@ -198,7 +198,9 @@ class TestAutoEvalRedoCarriesBumpedTier:
     @pytest.mark.asyncio
     async def test_redo_carries_parent_tier_plus_one(self, tmp_path: Path):
         harness = self._harness(tmp_path)
-        report = SimpleNamespace(outcome=WorkflowOutcome.BLOCKED, block_phase='verify')
+        report = SimpleNamespace(
+            outcome=WorkflowOutcome.BLOCKED, block_phase='verify', block_category='task_failure',
+        )
 
         await harness._maybe_auto_eval(self._assignment(routing_tier=2), cast(TaskReport, report))
 
@@ -209,7 +211,9 @@ class TestAutoEvalRedoCarriesBumpedTier:
     @pytest.mark.asyncio
     async def test_redo_from_parent_without_routing_starts_at_tier_one(self, tmp_path: Path):
         harness = self._harness(tmp_path)
-        report = SimpleNamespace(outcome=WorkflowOutcome.BLOCKED, block_phase='verify')
+        report = SimpleNamespace(
+            outcome=WorkflowOutcome.BLOCKED, block_phase='verify', block_category='task_failure',
+        )
 
         await harness._maybe_auto_eval(
             self._assignment(routing_tier=None), cast(TaskReport, report)
