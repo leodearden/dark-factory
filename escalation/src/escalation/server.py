@@ -75,6 +75,7 @@ from escalation.models import (
     max_severity,
 )
 from escalation.pins import classify_pins
+from escalation.project_root_guard import ProjectRootGuard
 from escalation.queue import AmendmentOutcome, EscalationQueue, ResolveOutcome
 from escalation.queue import observed_submit_response as _observed_submit_response
 from escalation.related_pending import related_pending
@@ -525,7 +526,10 @@ def _require_matching_project_root(wired_root: Path, project_root: str) -> str |
 
 
 def _project_root_refusal(identity: StoreIdentity, project_root: str) -> str | None:
-    """The PRD §6.3 verdict on an asserted *project_root*: a refusal message, or None to proceed."""
+    """The PRD §6.3 verdict on an asserted *project_root*: a refusal message, or None to proceed.
+
+    ``create_server`` hands it to ``escalation.project_root_guard::ProjectRootGuard``.
+    """
     if identity.kind == 'reconciliation':
         return (
             f'this endpoint serves the reconciliation store ({identity.queue_dir}), '
@@ -1110,7 +1114,8 @@ def create_server(
     call sites.  When given, one transform appends the PRD §6.2 store-identity
     block to every tool's description; None leaves each description exactly
     its docstring.  It is also read by the optional ``project_root`` guard
-    (``plans/escalation-store-ambiguity-prd.md`` §6.3): a tool call asserting a
+    (``escalation.project_root_guard::ProjectRootGuard``,
+    ``plans/escalation-store-ambiguity-prd.md`` §6.3): a tool call asserting a
     root this store does not serve is refused; with no identity, nothing is.
 
     *mismatch_streak_threshold* (default 5) — how many refused assertions of
@@ -1359,26 +1364,13 @@ def create_server(
     cfg = dedupe_config if dedupe_config is not None else DedupeConfig()
 
     # --- Optional project_root assertion (PRD §6.3) ---
-    mismatch_streak = MismatchStreak(queue, threshold=mismatch_streak_threshold)
-
-    # An omitted or '' assertion, or a server with no identity, proceeds.  The
-    # sync tools call the guard directly (FastMCP threadpools them); the async
-    # ones hop only when there is something to resolve.
-    def _refuse_misdirected_call(project_root: str | None) -> dict[str, str] | None:
-        if store_identity is None or not project_root:
-            return None
-        refusal = _project_root_refusal(store_identity, project_root)
-        if refusal is None:
-            return None
-        mismatch_streak.record_mismatch(store_identity, project_root, refusal)
-        return {'error': refusal}
-
-    async def _refuse_misdirected_call_off_loop(
-        project_root: str | None,
-    ) -> dict[str, str] | None:
-        if store_identity is None or not project_root:
-            return None
-        return await asyncio.to_thread(_refuse_misdirected_call, project_root)
+    # Sync tools call check() directly: FastMCP already runs them on a worker
+    # thread.  Async tools await check_off_loop().
+    project_root_guard = ProjectRootGuard(
+        store_identity,
+        MismatchStreak(queue, threshold=mismatch_streak_threshold),
+        _project_root_refusal,
+    )
 
     # --- Startup sweep (pre-serving single-writer window) ---
     if startup_sweep:
@@ -1953,7 +1945,7 @@ def create_server(
           ``action`` key — that is only on the blocker path — so an info filer
           simply carries on, as it already does on every other branch.
         """
-        if (refusal := await _refuse_misdirected_call_off_loop(project_root)) is not None:
+        if (refusal := await project_root_guard.check_off_loop(project_root)) is not None:
             return refusal
         if severity not in KNOWN_SEVERITIES:
             return {
@@ -2104,7 +2096,7 @@ def create_server(
           way — so its state is unknown).  ``action`` is
           ``'terminate_cleanly'`` on every OTHER branch above.
         """
-        if (refusal := await _refuse_misdirected_call_off_loop(project_root)) is not None:
+        if (refusal := await project_root_guard.check_off_loop(project_root)) is not None:
             return refusal
         if severity not in KNOWN_SEVERITIES:
             return {
@@ -2767,7 +2759,7 @@ def create_server(
         prevent, so callers must treat an absent key as UNKNOWN and render
         nothing rather than "not pinning".
         """
-        if (refusal := await _refuse_misdirected_call_off_loop(project_root)) is not None:
+        if (refusal := await project_root_guard.check_off_loop(project_root)) is not None:
             return refusal
         # Read the pending set ONCE, unfiltered, and narrow it in memory.  The
         # `level` filter is applied here rather than pushed into the queue
@@ -2980,7 +2972,7 @@ def create_server(
         unlike the adjacent ``get_escalation``: this is a scan, not an id
         lookup, so zero matches is a valid answer rather than a failure.
         """
-        if (refusal := _refuse_misdirected_call(project_root)) is not None:
+        if (refusal := project_root_guard.check(project_root)) is not None:
             return refusal
         escalations = get_task_escalations(task_id, level=level)
         return {
@@ -2996,7 +2988,7 @@ def create_server(
         project_root: str | None = None,
     ) -> dict[str, Any]:
         """Get a single escalation by ID."""
-        if (refusal := _refuse_misdirected_call(project_root)) is not None:
+        if (refusal := project_root_guard.check(project_root)) is not None:
             return refusal
         esc = queue.get(escalation_id)
         if esc is None:
