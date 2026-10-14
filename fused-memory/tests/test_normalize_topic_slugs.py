@@ -2181,6 +2181,19 @@ def _run_service(records: dict[str, list[dict]] | None = None) -> tuple[MagicMoc
     return corpus.service(), corpus
 
 
+def _refuse_writes_to(service: MagicMock, *memory_ids: str) -> None:
+    """Make *service* refuse every write to *memory_ids*, forwarding the rest."""
+    forward = service.update_memory.side_effect
+    refused = set(memory_ids)
+
+    async def _update(**kwargs):
+        if kwargs['memory_id'] in refused:
+            return {'error_type': 'write_refused', 'error': 'refused by test'}
+        return await forward(**kwargs)
+
+    service.update_memory = AsyncMock(side_effect=_update)
+
+
 class TestRun:
     """``run(memory_service, *, projects, apply, client, gate_tasks)``.
 
@@ -2643,6 +2656,60 @@ class TestNonSlugTopicsReachTheReport:
         assert report['baseline_delta']['measured_by_project'] == {'dark_factory': 4}
         assert report['outcomes']['topic_unfoldable'] == 3
         assert resolve_exit(report) == 1
+
+
+def _assert_outcomes_match_buckets(report: dict) -> None:
+    for bucket in _mod.ERROR_OUTCOMES:
+        assert report['outcomes'].get(bucket, 0) == len(report['skips'].get(bucket, [])), bucket
+
+
+class TestFailedRowsAreListedInTheirBuckets:
+    """A record that did not move is listed under its outcome, with its error.
+
+    The Outcomes count and the bucket under Skips describe the same failures,
+    so they can never disagree.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_refused_write_is_listed_under_update_failed(self):
+        service, _corpus = _run_service({'dark_factory': [_crec('m1', 'legacy_topic')]})
+        _refuse_writes_to(service, 'm1')
+
+        report = await run_sweep(service, projects=('dark_factory',), apply=True)
+
+        assert [(r['memory_id'], r['error_type']) for r in report['skips']['update_failed']] == [
+            ('m1', 'write_refused'),
+        ]
+        assert report['outcomes']['update_failed'] == 1
+        section = _bucket_section(_mod.render_markdown(report), 'update_failed')
+        assert "memory_id='m1'" in section
+        assert "error_type='write_refused'" in section
+        assert 'response=' not in section
+        _assert_outcomes_match_buckets(report)
+
+    @pytest.mark.asyncio
+    async def test_a_held_gate_pair_is_listed_under_gate_lockstep_failed(self):
+        service, _corpus = _run_service({'dark_factory': [
+            _crec('df1', 'gate_slug'), _crec('df2', 'gate_slug'),
+        ]})
+        _refuse_writes_to(service, 'df2')
+
+        report = await run_sweep(
+            service, projects=('dark_factory',), apply=True, client=_client(),
+            gates=_census(covered=('dark_factory',), tasks=[_gate_task('4220', 'gate_slug')]))
+
+        assert [r['memory_id'] for r in report['skips']['update_failed']] == ['df2']
+        lockstep = report['skips']['gate_lockstep_failed']
+        (member,) = [r for r in lockstep if 'gate_task_id' not in r]
+        (gate,) = [r for r in lockstep if 'gate_task_id' in r]
+        assert (member['memory_id'], member['undone']) == ('df1', True)
+        assert (gate['gate_task_id'], gate['half'], gate['failed_outcomes']) == (
+            '4220', 'memory', ['update_failed'])
+        section = _bucket_section(_mod.render_markdown(report), 'gate_lockstep_failed')
+        assert "failed_outcomes=['update_failed']" in section
+        assert "gate_project_root='/repo'" in section
+        assert "half='memory'" in section
+        _assert_outcomes_match_buckets(report)
 
 
 class TestReportRenderAndCli:
