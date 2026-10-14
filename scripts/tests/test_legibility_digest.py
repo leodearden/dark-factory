@@ -33,6 +33,7 @@ from legibility import detectors, reingestion
 from legibility import inventory as inventory_mod
 from legibility_carrier_fixtures import (
     CENSUS_MEMORY_CONTEXT_TURN,
+    CENSUS_QUOTE_OF_THE_ESCALATION_PAYLOAD,
     NON_HUMAN_ORIGIN_IDS,
     NON_HUMAN_ORIGIN_TURNS,
     TASK_NOTIFICATION_TEXT,
@@ -43,6 +44,7 @@ from legibility_carrier_fixtures import (
     json_fenced,
     merger_prompt,
     recon_run_review_text,
+    steward_continuation_prompt,
     with_origin,
 )
 from orchestrator.agents.memory_recall import (
@@ -2004,6 +2006,17 @@ def _resume_and_context_block_records():
     ]
 
 
+def _sdk_prompt(text):
+    """A prompt delivered over the SDK, shaped like the steward continuation
+    records sighted in reify session 77fb6617: promptSource and turnOrigin
+    'sdk', no 'origin', and the 'isMeta' key ABSENT rather than False."""
+    rec = _user_text(text)
+    rec.pop('isMeta')
+    rec['promptSource'] = 'sdk'
+    rec['turnOrigin'] = 'sdk'
+    return rec
+
+
 class TestHarnessInjectedTurnFilter:
     def test_briefing_shaped_turn_is_excluded_by_content(self):
         records = [_user_text(briefing_text())]
@@ -2210,6 +2223,42 @@ class TestHarnessInjectedTurnFilter:
 
         assert [t['text'] for t in turns] == ['please fix the bug']
         assert [t['index'] for t in turns] == [1]
+
+    def test_steward_continuation_prompt_is_excluded_from_iter_user_turns(self, tmp_path):
+        # The 77fb6617 shape: two continuation prompts around real dialogue.
+        continuation = steward_continuation_prompt(tmp_path)
+        records = [
+            _sdk_prompt(continuation),
+            _user_text('please fix the bug'),
+            _sdk_prompt(continuation),
+        ]
+
+        turns = mod.iter_user_turns(records)
+
+        assert [(t['index'], t['text']) for t in turns] == [(1, 'please fix the bug')]
+
+    def test_human_turn_quoting_the_census_sighting_stays_gold(self):
+        turns = mod.iter_user_turns([_user_text(CENSUS_QUOTE_OF_THE_ESCALATION_PAYLOAD)])
+
+        assert [t['text'] for t in turns] == [CENSUS_QUOTE_OF_THE_ESCALATION_PAYLOAD]
+
+    def test_render_digest_steward_continuation_session_has_no_gold_section(self, tmp_path):
+        # The escalation summary's 'BLOCKED:' is a df_guard literal inside a
+        # harness prompt, so it must not count: a continuation prompt in reify
+        # session 8312381d (record 281) fired df_guard this way.
+        prompt = steward_continuation_prompt(
+            tmp_path, summary='BLOCKED: merge gate refused the branch',
+        )
+        records = [_with_session_meta(_sdk_prompt(prompt)) for _ in range(2)]
+
+        digest = mod.render_digest(records, agent_class='orchestrated-task')
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert '## User Corrections' not in digest
+        assert meta['n_user_turns'] == 0
+        assert meta['signal_counts'] == dict.fromkeys(mod.SIGNAL_COUNT_KEYS, 0)
 
     def test_usage_limit_mentioned_in_passing_is_not_excluded(self):
         # Must NOT regress: a genuine human turn that merely MENTIONS a
