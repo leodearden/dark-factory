@@ -49,8 +49,8 @@ outside tests.
 ``middleware/task_interceptor.py`` imports this module, so this module's import
 weight becomes the interceptor's.  Imports are restricted to the standard
 library plus :mod:`fused_memory.memory_metadata`,
-:mod:`fused_memory.utils.validation` and
-``reconciliation.recon_self_model.EXECUTION_CLASSES``.  PRD D4 records a
+:mod:`fused_memory.utils.validation` and the two human-curator keys from
+:mod:`shared.task_metadata`.  PRD D4 records a
 *measured* hard import cycle from a careless import of exactly this kind
 (``config/schema.py`` → ``memory_metadata`` → ``backends.mem0_client`` →
 ``config.schema`` raising ``ImportError: cannot import name
@@ -67,6 +67,8 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
+
+from shared.task_metadata import HUMAN_CURATOR_ADJUDICATED_AT_KEY, HUMAN_CURATOR_GATE_KEY
 
 from fused_memory.memory_metadata import (
     EXPERIMENTAL_KEY_PREFIX,
@@ -965,8 +967,28 @@ class ConsolidationGateSpec:
         }
 
 
+_WORKING_LIST_PARAGRAPH = (
+    'The WORKING LIST is the live `metadata.topic` scroll for that topic — '
+    'never a hand-written member list. Any enumeration carried in this '
+    "task's metadata is inert provenance (`authoritative: false`) and "
+    'cannot make this gate closeable.\n'
+)
+
+_CLOSURE_PARAGRAPH = (
+    'This gate CANNOT be closed while the live same-topic scroll shows the '
+    'cluster is not well-formed: `set_task_status(..., done)` re-runs the '
+    'check and refuses with the offending ids. Run '
+    '`scripts/check_consolidation_closure.py` to see the same verdict by '
+    'hand.\n'
+)
+
+
 def _default_title(topic: str) -> str:
     return f'Consolidation gate: topic {topic}'
+
+
+def _auto_refusal_title(topic: str, report_run: str) -> str:
+    return f'Consolidation gate: topic {topic} (auto-consolidation refused, run {report_run})'
 
 
 def _default_description(topic: str, rationale: str) -> str:
@@ -974,22 +996,72 @@ def _default_description(topic: str, rationale: str) -> str:
         'A memory consolidation reached an irreversible, content-losing '
         'judgment call that must not be resolved silently. This is the human '
         f'gate for topic `{topic}`.\n',
-        'The WORKING LIST is the live `metadata.topic` scroll for that topic — '
-        'never a hand-written member list. Any enumeration carried in this '
-        "task's metadata is inert provenance (`authoritative: false`) and "
-        'cannot make this gate closeable.\n',
+        _WORKING_LIST_PARAGRAPH,
     ]
     if rationale.strip():
         parts.append(f'Judgment call: {rationale.strip()}\n')
-    parts.append(
-        'This gate CANNOT be closed while the live same-topic scroll shows the '
-        'cluster is not well-formed: `set_task_status(..., done)` re-runs the '
-        'check and refuses with the offending ids. Run '
-        '`scripts/check_consolidation_closure.py` to see the same verdict by '
-        'hand.\n'
-    )
+    parts.append(_CLOSURE_PARAGRAPH)
     parts.append(render_end_state_brief())
     return '\n'.join(parts)
+
+
+def _auto_refusal_description(
+    topic: str, reason_codes: Mapping[str, Sequence[str]], rationale: str
+) -> str:
+    reasons = '\n'.join(
+        f'Auto-consolidation refused: `{code}` (ids {", ".join(ids) or "none"}).'
+        for code, ids in reason_codes.items()
+    )
+    parts = [
+        f'Deterministic auto-consolidation refused topic `{topic}`; a human '
+        'decides what happens to this cluster.\n',
+        reasons + '\n',
+    ]
+    if rationale.strip():
+        parts.append(f'Detail: {rationale.strip()}\n')
+    parts.append(
+        'This is a human-curator gate. Before resolve_issue(resume), record the '
+        'review with '
+        "`update_task(id='<this task id>', project_root='<this project root>', "
+        f"metadata={{{HUMAN_CURATOR_ADJUDICATED_AT_KEY!r}: '<ISO-8601 UTC>'}}, "
+        "metadata_mode='merge')`.\n"
+    )
+    parts.append(_WORKING_LIST_PARAGRAPH)
+    parts.append(_CLOSURE_PARAGRAPH)
+    parts.append(render_end_state_brief())
+    return '\n'.join(parts)
+
+
+def _auto_refusal_block(
+    reason_codes: Mapping[str, Sequence[str]] | None,
+    *,
+    report_run: str | None,
+    auto_predicate_version: str | None,
+    category: str | None,
+) -> dict[str, Any] | None:
+    """The ``auto_refusal`` gate sub-block, or ``None`` for a non-auto gate.
+
+    Raises ``ValueError`` for a refusal that names no reason, no predicate
+    version or no run, and for refusal fields passed without ``reason_codes``.
+    """
+    if reason_codes is None:
+        if auto_predicate_version is not None or category is not None:
+            raise ValueError(
+                'auto_predicate_version and category describe an auto-consolidation '
+                'refusal and require reason_codes'
+            )
+        return None
+    if not reason_codes:
+        raise ValueError('reason_codes is empty: a refusal gate must name its reason')
+    if not auto_predicate_version:
+        raise ValueError('reason_codes requires auto_predicate_version')
+    if not report_run:
+        raise ValueError('reason_codes requires report_run, which keeps the gate title unique')
+    return {
+        'reason_codes': {code: [str(i) for i in ids] for code, ids in reason_codes.items()},
+        'predicate_version': auto_predicate_version,
+        'category': category,
+    }
 
 
 def build_consolidation_gate_task(
@@ -1004,6 +1076,9 @@ def build_consolidation_gate_task(
     priority: str = 'medium',
     title: str | None = None,
     description: str | None = None,
+    reason_codes: Mapping[str, Sequence[str]] | None = None,
+    auto_predicate_version: str | None = None,
+    category: str | None = None,
 ) -> ConsolidationGateSpec:
     """Build the ``operational`` + ``operational_mode='gate'`` consolidation gate.
 
@@ -1038,12 +1113,19 @@ def build_consolidation_gate_task(
     invented ``metadata.memory_ids`` key was extended 7 to 8 by a later cycle
     while it still defined "done".
 
+    *reason_codes* (code -> the ids it concerns) selects the AUTO-REFUSAL arm
+    the auto-consolidation executor files (PRD C6): the gate block gains an
+    ``auto_refusal`` sub-block, the metadata gains the human-curator marker,
+    and the default title names *report_run* so each filing has its own
+    candidate key.  Without it the gate is the Stage-2 shape, unchanged.
+
     Raises:
         ValueError: if *topic* is not a well-formed topic slug.  Validated
             through the shared :func:`is_valid_topic_slug` — one namespace,
             shared with ``ProceduralTopicCluster.topic_id`` (PRD D4) — because
             a gate filed against a topic the closure scroll could never match
-            would be permanently uncloseable.
+            would be permanently uncloseable.  Also for an auto-refusal
+            missing its reason, predicate version or run.
     """
     if not is_valid_topic_slug(topic):
         raise ValueError(
@@ -1053,6 +1135,13 @@ def build_consolidation_gate_task(
             'hyphen-separated (see fused_memory.topic_slug.is_valid_topic_slug '
             '— one namespace shared with ProceduralTopicCluster.topic_id).'
         )
+
+    auto_refusal = _auto_refusal_block(
+        reason_codes,
+        report_run=report_run,
+        auto_predicate_version=auto_predicate_version,
+        category=category,
+    )
 
     gate_block: dict[str, Any] = {'topic': topic}
     if considered_and_kept:
@@ -1074,9 +1163,20 @@ def build_consolidation_gate_task(
         GATE_METADATA_KEY: gate_block,
     }
 
+    if auto_refusal is None:
+        default_title = _default_title(topic)
+        default_description = _default_description(topic, rationale)
+    else:
+        gate_block['auto_refusal'] = auto_refusal
+        metadata[HUMAN_CURATOR_GATE_KEY] = True
+        default_title = _auto_refusal_title(topic, str(report_run))
+        default_description = _auto_refusal_description(
+            topic, auto_refusal['reason_codes'], rationale
+        )
+
     return ConsolidationGateSpec(
-        title=title or _default_title(topic),
-        description=description or _default_description(topic, rationale),
+        title=title or default_title,
+        description=description or default_description,
         priority=priority,
         task_kind='deterministic',
         metadata=metadata,
