@@ -31,7 +31,7 @@ from typing import Any
 
 import _checkout as _checkout
 import pytest
-from sampler.metrics import SampleKey
+from sampler.metrics import ARM_METRICS, TICK_CLOCK, MetricSpec, SampleKey
 from sampler.store import SCHEMA, LoadSampleStore
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -244,6 +244,36 @@ def test_a_bare_interpreter_imports_the_checkouts_metrics_and_nothing_heavier(
     assert metrics_file.is_relative_to(REPO_ROOT / 'sampler' / 'src'), metrics_file
     assert probe['loaded'] == [], probe['loaded']
     assert probe['selectors'] == probe['arm_metrics']
+
+
+def load_script_against(monkeypatch, arm_metrics: Mapping[str, MetricSpec]):
+    """The script, loaded while sampler.metrics.ARM_METRICS is *arm_metrics*."""
+    monkeypatch.setattr('sampler.metrics.ARM_METRICS', arm_metrics)
+    return load_script()
+
+
+def test_reordering_the_tables_arms_leaves_the_report_order_unchanged(monkeypatch):
+    shipped = list(load_script().ARM_METRIC_SELECTORS)
+    reversed_table = dict(reversed(list(ARM_METRICS.items())))
+
+    reordered = list(load_script_against(monkeypatch, reversed_table).ARM_METRIC_SELECTORS)
+
+    assert reordered == shipped
+
+
+def test_an_arm_the_table_records_and_the_script_cannot_scale_fails_at_load(monkeypatch):
+    widened = {**ARM_METRICS, 'fixture_unscaled_arm': TICK_CLOCK}
+
+    with pytest.raises(ValueError, match='fixture_unscaled_arm'):
+        load_script_against(monkeypatch, widened)
+
+
+def test_an_arm_the_script_scales_and_the_table_does_not_record_fails_at_load(monkeypatch):
+    dropped = next(iter(ARM_METRICS))
+    narrowed = {arm: spec for arm, spec in ARM_METRICS.items() if arm != dropped}
+
+    with pytest.raises(ValueError, match=dropped):
+        load_script_against(monkeypatch, narrowed)
 
 
 # ── the argument surface ────────────────────────────────────────────────────

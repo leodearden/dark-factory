@@ -118,8 +118,8 @@ _PRESSURE_LADDER = (10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0)
 _PRESSURE_UNIT = '% of wall time stalled (PSI avg10)'
 
 # This script's own fact about each gate arm: the thresholds to evaluate it at,
-# and the unit they are in. The metric recording the arm, and its readability
-# metric, are sampler.metrics.ARM_METRICS's.
+# and the unit they are in. Its order is the report's arm order. The metric
+# recording the arm, and its readability metric, are sampler.metrics.ARM_METRICS's.
 _ARM_SCALES: dict[str, tuple[tuple[float, ...], str]] = {
     'mem_full_avg10': (_PRESSURE_LADDER, _PRESSURE_UNIT),
     'mem_some_avg10': (_PRESSURE_LADDER, _PRESSURE_UNIT),
@@ -138,14 +138,27 @@ _ARM_SCALES: dict[str, tuple[tuple[float, ...], str]] = {
 TICK_METRIC = TICK_CLOCK.name
 
 
-def _arm_spec(arm: str, spec: MetricSpec) -> ArmSpec:
-    """*arm*'s ArmSpec; an arm in the table with no scale here fails at load."""
-    ladder, unit = _ARM_SCALES[arm]
+def _arm_spec(spec: MetricSpec, ladder: tuple[float, ...], unit: str) -> ArmSpec:
     readability = spec.readability.name if spec.readability is not None else None
     return ArmSpec(spec.name, ladder, unit, readability)
 
 
-ARM_METRIC_SELECTORS = {arm: _arm_spec(arm, spec) for arm, spec in ARM_METRICS.items()}
+def _arm_selectors(arm_metrics: Mapping[str, MetricSpec]) -> dict[str, ArmSpec]:
+    """Every arm's ArmSpec, in ``_ARM_SCALES`` order; the two must name the same arms."""
+    unscaled = sorted(arm_metrics.keys() - _ARM_SCALES.keys())
+    unrecorded = sorted(_ARM_SCALES.keys() - arm_metrics.keys())
+    if unscaled or unrecorded:
+        raise ValueError(
+            'the gate arms here and in sampler.metrics.ARM_METRICS differ: '
+            f'no scale here for {unscaled}, no recording metric for {unrecorded}'
+        )
+    return {
+        arm: _arm_spec(arm_metrics[arm], ladder, unit)
+        for arm, (ladder, unit) in _ARM_SCALES.items()
+    }
+
+
+ARM_METRIC_SELECTORS = _arm_selectors(ARM_METRICS)
 
 
 def pct(xs: list[float], p: float) -> float:
