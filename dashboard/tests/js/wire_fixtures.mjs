@@ -55,6 +55,41 @@ export function receiptsFor(loader, keys, win = '24h') {
   );
 }
 
+// `count` hourly sample labels ending at WIRE_AS_OF, oldest first.
+function sampleLabels(count) {
+  const newest = Date.parse(WIRE_AS_OF);
+  return Array.from({ length: count }, (_, i) => new Date(newest - (count - 1 - i) * 3_600_000).toISOString());
+}
+
+// One burndown block, as data/redux_api.py::shape_burndown serves BURNDOWN and
+// each BURNDOWN_BY_PROJECT entry. It holds:
+//   - `sampleCount` labels;
+//   - a non-empty series per census member, so every band draws;
+//   - the rows' in-progress split;
+//   - the `latest` and `forecast` Datums;
+//   - `parity`, the verdict's parity_* fields, passed through as served.
+export function burndownBlock(vocab, sampleCount, parity) {
+  const labels = sampleLabels(sampleCount);
+  const series = Object.fromEntries(
+    Object.values(vocab.SERIES_KEYS).map((key, i) => [key, labels.map(() => i + 1)]),
+  );
+  const inProgress = series[vocab.SERIES_KEYS['in-progress']];
+  const split = {
+    in_progress_live: inProgress.map(n => n - 1),
+    in_progress_stranded: inProgress.map(() => 1),
+    in_progress_rows: inProgress,
+  };
+  const columns = { ...series, ...split };
+  const counts = Object.fromEntries(Object.entries(columns).map(([key, values]) => [key, values.at(-1)]));
+  return {
+    labels,
+    ...columns,
+    latest: wireDatum({ counts, completed: 0, velocity: 0, window_days: 1 }),
+    forecast: wireDatum({ forecast_low: 1, forecast_high: 2 }),
+    ...parity,
+  };
+}
+
 // One ORCHESTRATORS row, as /orchestrators serves it.
 export function orchestratorRow({ pid, project, running }) {
   return { pid, project, running };

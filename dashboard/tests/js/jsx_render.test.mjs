@@ -153,7 +153,7 @@ function seedBurndown(window, { alarm }) {
 
 function statusMixPanel(container) {
   const panels = [...container.querySelectorAll('.panel')].filter(panel =>
-    panel.querySelector('.panel-head .title')?.textContent.startsWith('Status mix'),
+    panel.querySelector(':scope > .panel-head > .title')?.textContent.startsWith('Status mix'),
   );
   assert.equal(panels.length, 1, 'expected exactly one Status mix panel in the rendered view');
   return panels[0];
@@ -186,6 +186,14 @@ function mountBurnView(harness, show) {
   return statusMixPanel(container);
 }
 
+// A colour as the window's CSSOM serialises a style value: oklch(0.80 ...)
+// reads back as oklch(0.8 ...).
+function styledColor(window, color) {
+  const probe = window.document.createElement('span');
+  probe.style.background = color;
+  return probe.style.background;
+}
+
 function filledPathColors(panel) {
   return [...panel.querySelectorAll('svg path')].map(path => path.getAttribute('fill')).filter(Boolean);
 }
@@ -198,8 +206,9 @@ for (const { view, show, block, bannerProjects } of BURN_VIEWS) {
 
     const legend = harness.window.DF_BURNDOWN_BANDS.burndownLegend(harness.window.DF_CHARTS.PALETTE);
     for (const { label, color } of legend) {
+      const swatchColor = styledColor(harness.window, color);
       const entries = [...panel.querySelectorAll('span')].filter(
-        span => span.textContent === label && [...span.children].some(swatch => swatch.style.background === color),
+        span => span.textContent === label && [...span.children].some(swatch => swatch.style.background === swatchColor),
       );
       assert.equal(entries.length, 1, `the ${view} legend has no single "${label}" entry with its ${color} swatch`);
     }
@@ -213,8 +222,19 @@ for (const { view, show, block, bannerProjects } of BURN_VIEWS) {
     const stacks = harness.window.DF_BURNDOWN_BANDS.burndownStacks(block(harness.window), harness.window.DF_CHARTS.PALETTE);
     assert.deepEqual(
       filledPathColors(panel).sort(),
-      stacks.map(stack => stack.color).sort(),
+      // Array.from: a node-realm array, since strict deepEqual compares prototypes.
+      Array.from(stacks, stack => stack.color).sort(),
       `the ${view} chart must draw one filled band per burndownStacks entry, in that entry's colour`,
+    );
+
+    const { fmtDateTime } = harness.window.DF_SHELL;
+    const { BURNDOWN, BURNDOWN_BY_PROJECT } = harness.window.DF_DATA;
+    const anySampleLabel = new Set([...BURNDOWN.labels, ...BURNDOWN_BY_PROJECT[PROJECT].labels].map(fmtDateTime));
+    const ownLabels = Array.from(block(harness.window).labels, fmtDateTime);
+    assert.deepEqual(
+      [...panel.querySelectorAll('svg text')].map(text => text.textContent).filter(text => anySampleLabel.has(text)),
+      ownLabels,
+      `the ${view} chart must lay its bands over its own block's ${ownLabels.length} sample labels`,
     );
   });
 
