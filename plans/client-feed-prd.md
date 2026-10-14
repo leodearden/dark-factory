@@ -1,8 +1,9 @@
 # Client feed: a per-project, client-safe evidence feed for the client portal
 
 **Status:** authored 2026-10-14 (spawned design session; `/team` + `/prd` author mode; the design was
-attacked by an opus critic seat before this PRD was written, see the design note §13). Not yet
-decomposed.
+attacked by an opus critic seat before this PRD was written, see the design note §13).
+**Decomposed 2026-10-14:** α 6966, θ 6967, β1 6968, β2 6969, γ 6970, δ 6971, ε 6972, ζ 6973, η 6974;
+bindings and the G7 walk in `client-feed-prd.capability-manifest.md` and its stamped YAML sidecar.
 **Type:** greenfield. A new workspace member, `client-feed/`, that publishes one project's build
 evidence to the LDE client portal through file contracts, one orchestrator event the factory does not
 record today, and a minimal acceptance-criteria data format.
@@ -60,15 +61,14 @@ package's schema, and this package's fixture feed renders in the portal (two-way
     with `event_type`, `task_id`, `phase`, `data`; `merge_finalized` with `data.state == 'done'` and
     `data.merge_sha` is the landed fact; `train_merged` carries `member_task_ids`; `merge_verify` and
     `workflow_verify` carry `passed` and `duration_ms`; `phase_enter`/`phase_exit` carry the phase in
-    `events.phase`; `scheduler_paused`/`scheduler_resumed`; `escalation_created`/`escalation_resolved`
-    with a level; `task_results.review_cycles`);
+    `events.phase`; `scheduler_paused`/`scheduler_resumed`; `escalation_created`/`escalation_resolved`, whose `data`
+    carries `level` on some rows only (452 of 2,675 on 2026-10-14); `task_results.review_cycles`);
   - the verify archive at `<root>/data/verify-logs/<task_id>/` (`attempt-N[.module].junit-<ts>.xml.gz`
     for task legs on every verify — 2,294 reports under 1,885 task directories on 2026-10-14 — and for
     merge runs only under `merge_verify_breadth: full`; `summary-<ts>.json` with `category` and `rc`;
     pruned past 30 days and oldest-first past 500 MB by `orchestrator/src/orchestrator/verify.py::_prune_archive`);
     task legs archive at `project_root / 'data' / 'verify-logs'` (the `run_scoped_verification` call in
-    `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._execute_verify_review_loop`'s verify
-    path);
+    `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._run_scoped_verification_with_infra_retry`);
   - git: merge commits `Merge task/<id> into main`, branches `task/<id>`.
 - **Not recorded today:** the review outcome. `TaskWorkflow._execute_verify_review_loop` holds a
   `ReviewAggregation` (`orchestrator/src/orchestrator/artifacts.py::ReviewAggregation`:
@@ -154,7 +154,8 @@ own checkout (`shared.project_layout.default_project_root` is banned in `client_
    version; a changed field a major one. The portal ignores unknown types and refuses an unknown major.
 10. **Never hide red, from recorded sources.** A failed verify is `verify_run.passed == false`; a
     blocked task is `task_upserted` with that status and `waiting_on: leo` when an open escalation
-    exists for it, else `factory`; `factory_state` carries `scheduler: running|paused`, `last_event_at`
+    whose recorded `level` is 2 exists for it, else `factory` (an open escalation with no recorded
+    level is the factory's own ladder, not Leo); `factory_state` carries `scheduler: running|paused`, `last_event_at`
     and `idle_seconds` from the project's own `runs.db`. Where a fact is not recorded (no junit, no
     summary) the event says `not_recorded`, never pass.
 11. **The publisher reports its own health.** Every `heartbeat` carries `head`, `as_of`,
