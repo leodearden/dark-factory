@@ -40,6 +40,17 @@ import { fileURLToPath } from 'node:url';
 import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
 
 import { loadDataJs, drain } from './_data_loader.mjs';
+import {
+  COSTS_PATH,
+  CURATOR_PATH,
+  DATUM_SPEC,
+  EXPECTED_ENDPOINT_COUNT,
+  PLAIN_SPEC,
+  STALE_FAILURE_THRESHOLD,
+  TASKS_PATH,
+  TERMINAL_PROJECT,
+  okResponse,
+} from './_data_fixtures.mjs';
 
 const { staleNoticesForTab } = staleness;
 
@@ -85,21 +96,6 @@ const EXPECTED_DF_DATA_KEYS = [
   '__receipt',
 ];
 
-// Number of rows in endpointsFor() (data.js:16-34). Several tests below assert
-// that a cycle touched EVERY endpoint — "all of them" is the actual claim, and
-// a literal is the only way to state it without deriving the expectation from
-// the same map under test. Bump this whenever endpointsFor gains or loses a
-// row; it is deliberately one constant rather than a literal repeated per
-// test, because scattered copies is what went stale when the memory-evals
-// endpoint was added.
-const EXPECTED_ENDPOINT_COUNT = 15;
-
-// The two shared registry specs. Declared here as literals rather than read off
-// data.js so the reshape is pinned against a stated expectation instead of
-// against itself.
-const PLAIN_SPEC = { kind: 'plain' };
-const DATUM_SPEC = { kind: 'datum' };
-
 // Every DF_DATA key any endpoint row names, as one sorted list. The registry
 // reshape (array of key names -> object of key name to spec) is exactly the
 // kind of edit that can silently DROP a key — an object literal with a
@@ -132,12 +128,9 @@ const SERVED_DATUM = Object.freeze({
   freshness_bound_seconds: 60,
 });
 
-// Pure, state-free — reused below so the test fixtures assert against
-// data.js's own key derivation rather than a hand-copied duplicate of the
-// `url.split('?')[0]` rule (see pollKey's doc comment in data.js). Safe to
-// grab once at file scope: loadDataJs()'s window/fetch shim is fully
-// re-installed by every test's own loadDataJs() call, so this throwaway
-// load leaves nothing behind that a later test could observe.
+// Reused below so the test fixtures assert against data.js's own key
+// derivation rather than a hand-copied duplicate of the `url.split('?')[0]`
+// rule (see pollKey's doc comment in data.js).
 const { pollKey } = loadDataJs().api;
 
 // The endpoint the motivating incident hung on (measured 108s response) —
@@ -1047,18 +1040,9 @@ test("preserved behaviour: refreshDFData(win) updates the ?window= param on the 
 // dashboard/tests/js/endpoint_staleness.test.mjs covers it.
 // ---------------------------------------------------------------------------
 
-// The contract constants, stated as literals rather than read back out of the
-// module under test. data.js prefers window.DF_ENDPOINT_STALENESS's threshold
-// when that module has loaded and falls back to its own literal otherwise
-// (data.js is the FIRST classic script in index.html, so it must not gain a
-// hard load-order dependency on a later one); under this node harness the
-// window shim carries no DF_ENDPOINT_STALENESS, so the fallback is what runs.
-// endpoint_staleness.test.mjs asserts the two agree.
-const STALE_FAILURE_THRESHOLD = 3;
+// The reduced per-attempt deadline, stated as a literal rather than read back
+// out of the module under test.
 const STALE_TIMEOUT_MS = 5000;
-
-const CURATOR_PATH = '/api/v2/dashboard/curator';
-const COSTS_PATH = '/api/v2/dashboard/costs';
 
 const DATA_JS_SOURCE = fs.readFileSync(
   path.resolve(
@@ -1624,10 +1608,6 @@ test('datumFor: unknown before the first apply, the stored Datum after', () => {
 // __receipt — published on SUCCESS ONLY
 // ---------------------------------------------------------------------------
 
-function okResponse(body) {
-  return () => Promise.resolve({ ok: true, json: async () => body });
-}
-
 test('receipts: a successful refresh records servedAt from the body and receivedAt from the clock', async () => {
   const { api, window: win } = loadDataJs();
   const deps = { fetchImpl: okResponse({ served_at: '2026-09-20T12:00:00+00:00' }), now: () => 555 };
@@ -1774,8 +1754,6 @@ test('receipts: __stale still advances on failure — the two maps are not one',
 // polled endpoint never had. A user action must not be able to blind a tab.
 // ---------------------------------------------------------------------------
 
-const TASKS_PATH = '/api/v2/dashboard/tasks';
-const TERMINAL_PROJECT = 'dark-factory';
 const TERMINAL_KEY = `TASKS_TERMINAL:${TERMINAL_PROJECT}`;
 // The flow-control/staleness key an on-demand request must use instead of the
 // polled path. Stated as a literal, not built from the row, so the separation
