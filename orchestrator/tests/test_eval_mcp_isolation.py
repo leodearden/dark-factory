@@ -31,8 +31,10 @@ from shared.cli_invoke import AgentResult, build_claude_argv
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.config import OrchestratorConfig
 from orchestrator.evals import runner
+from orchestrator.evals.compare import _assess_task, compare_models
 from orchestrator.evals.configs import EvalConfig
-from orchestrator.evals.results import ResultStore
+from orchestrator.evals.judge import judge_plan_quality, run_judge
+from orchestrator.evals.results import EvalResult, ResultStore
 
 _FIXTURE_ID = 'df_task_9001'
 
@@ -132,3 +134,103 @@ async def test_architect_eval_invoke_is_strictly_scoped_to_plan_tools(
     assert tail[0] == '--mcp-config'
     assert tail[2] == '--strict-mcp-config', f'flag does not follow the pair: {tail!r}'
     assert servers == {'plan-tools'}
+
+
+# ---------------------------------------------------------------------------
+# The /tmp-cwd eval LLM calls: two judges, two compare assessors. None needs
+# any MCP server: each answers through its output schema.
+# ---------------------------------------------------------------------------
+
+_ASSESSMENT = {
+    'winner': 'A', 'confidence': 0.9, 'summary': 's',
+    'strengths_a': [], 'weaknesses_a': [], 'strengths_b': [], 'weaknesses_b': [],
+    'circumstances': '',
+}
+_SYNTHESIS = {
+    'overall_winner': 'A', 'executive_summary': 'e', 'circumstantial_analysis': 'c',
+    'cost_quality_tradeoff': 't', 'workflow_recommendations': 'w',
+}
+_TASK = {
+    'id': _FIXTURE_ID,
+    'name': 'mcp isolation probe',
+    'pre_task_commit': 'a' * 40,
+    'task_definition': {'description': 'd'},
+}
+
+
+def _recording_invoke(structured_output: dict) -> tuple[list[dict], object]:
+    """An ``invoke_agent`` double that records every call's kwargs and answers *structured_output*."""
+    calls: list[dict] = []
+
+    async def fake_invoke_agent(**kwargs: object) -> AgentResult:
+        calls.append(kwargs)
+        return AgentResult(success=True, output=json.dumps(structured_output),
+                           structured_output=structured_output, cost_usd=0.0)
+
+    return calls, fake_invoke_agent
+
+
+def _assert_zero_mcp_strict(kwargs: dict) -> None:
+    # Truthiness is load-bearing: --strict-mcp-config is emitted only inside `if mcp_config:`.
+    assert kwargs.get('mcp_config') == {'mcpServers': {}}
+    assert bool(kwargs['mcp_config']) is True
+    assert kwargs.get('strict_mcp_config') is True
+
+
+def _eval_result(config_name: str, worktree: Path) -> EvalResult:
+    worktree.mkdir()
+    return EvalResult(task_id=_FIXTURE_ID, config_name=config_name, outcome='done',
+                      metrics={}, worktree_path=str(worktree))
+
+
+@pytest.mark.asyncio
+async def test_pairwise_judge_carries_no_mcp_servers(monkeypatch) -> None:
+    calls, fake = _recording_invoke({'winner': 'A', 'confidence': 0.9, 'reasoning': 'r'})
+    monkeypatch.setattr('orchestrator.evals.judge.invoke_agent', fake)
+
+    await run_judge({'diff': '+a', 'config_name': 'A'}, {'diff': '+b', 'config_name': 'B'}, _TASK)
+
+    assert len(calls) == 1
+    _assert_zero_mcp_strict(calls[0])
+
+
+@pytest.mark.asyncio
+async def test_plan_quality_judge_carries_no_mcp_servers(monkeypatch) -> None:
+    calls, fake = _recording_invoke({'plan_quality': 0.5, 'reasoning': 'r'})
+    monkeypatch.setattr('orchestrator.evals.judge.invoke_agent', fake)
+    plan = {'steps': [{'id': 'step-1', 'type': 'test', 'description': 'write the test'}]}
+
+    await judge_plan_quality(plan, '+landed', _TASK)
+
+    assert len(calls) == 1
+    _assert_zero_mcp_strict(calls[0])
+
+
+@pytest.mark.asyncio
+async def test_compare_assessor_carries_no_mcp_servers(monkeypatch, tmp_path: Path) -> None:
+    calls, fake = _recording_invoke(_ASSESSMENT)
+    monkeypatch.setattr('orchestrator.evals.compare.invoke_agent', fake)
+    monkeypatch.setattr('orchestrator.evals.compare.get_diff', AsyncMock(return_value='+x'))
+
+    await _assess_task(_TASK, _eval_result('A', tmp_path / 'wt_a'),
+                       _eval_result('B', tmp_path / 'wt_b'), 'A', 'B')
+
+    assert len(calls) == 1
+    _assert_zero_mcp_strict(calls[0])
+
+
+@pytest.mark.asyncio
+async def test_compare_synthesizer_carries_no_mcp_servers(monkeypatch, tmp_path: Path) -> None:
+    calls, fake = _recording_invoke({**_ASSESSMENT, **_SYNTHESIS})
+    monkeypatch.setattr('orchestrator.evals.compare.invoke_agent', fake)
+    monkeypatch.setattr('orchestrator.evals.compare.get_diff', AsyncMock(return_value='+x'))
+
+    report = await compare_models(
+        [_eval_result('A', tmp_path / 'wt_a'), _eval_result('B', tmp_path / 'wt_b')],
+        ['A'], ['B'], {_FIXTURE_ID: _TASK},
+    )
+
+    assert report.executive_summary == 'e', 'the synthesizer was never reached'
+    assert len(calls) == 2
+    for call in calls:
+        _assert_zero_mcp_strict(call)
