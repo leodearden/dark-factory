@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
-import { REPO_ROOT, cdnScriptTag, sha384Digest } from './redux_page.mjs';
+import { REPO_ROOT, cdnScriptTag, sha384Digest } from './_served_bundle.mjs';
 
 const ROOT_PACKAGE_JSON = path.join(REPO_ROOT, 'package.json');
 const REACT_PACKAGES = ['react', 'react-dom'];
