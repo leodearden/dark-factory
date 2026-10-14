@@ -1334,12 +1334,12 @@ class TestScoperTrailingClausePreservation:
         ids=[test_id for _, _, test_id in _LOCKSTEP_CASES],
     )
     def test_lockstep_between_the_two_scopers(self, raw, keyword):
-        """The string scoper and the VerifyCmd scoper must never disagree.
+        """The string scoper is byte-identical to ``render(scope_prefix_to_keyword(...))``.
 
-        They were historically kept in sync only by a docstring mandate —
-        a convention this very bug shows was load-bearing and unenforced.
-        Both now route through the shared ``split_chain_tail`` gate, so this
-        asserts a property that holds by construction.
+        The two were once separate pipelines kept in sync by a docstring
+        mandate, and drifted. The string scoper now renders the VerifyCmd
+        scoper; this corpus sweep catches a future re-duplication of the
+        pipeline in verify.py.
         """
         assert _scope_to_keyword(raw, keyword, self._FILES) == render(
             scope_prefix_to_keyword(raw, keyword, self._FILES)
@@ -1354,7 +1354,7 @@ class TestScoperTrailingClausePreservation:
 
 
 class TestTailPreservationAllowlist:
-    """Both scopers must return a STRUCTURED command for a chained pytest slot.
+    """A chained pytest slot must scope to a STRUCTURED command, in both forms.
 
     Task 3218 part 1. ``split_chain_tail``'s ACCEPT makes
     ``scope_prefix_to_keyword`` return ``VerifyCmd(tool=PYTEST, raw=...)``
@@ -1366,8 +1366,9 @@ class TestTailPreservationAllowlist:
     per-test timeout floor — is silently never collected.
 
     Excluding ``'pytest'`` from the gate's keyword allowlist closes this at
-    all five pytest-slot consumers at once, because both scopers route
-    through that one shared gate.
+    all five pytest-slot consumers at once: each scopes through
+    ``scope_prefix_to_keyword`` (the string scoper renders it), which consults
+    that one gate.
     """
 
     _FILES = ['a/test_x.py']
@@ -1428,7 +1429,7 @@ class TestTailPreservationAllowlist:
         ids=['sibling-names-the-tool', 'sibling-does-not-name-the-tool'],
     )
     def test_lockstep_holds_on_the_rejected_pytest_chains(self, raw):
-        """The two scopers must agree here too — the gate is shared, so this is structural."""
+        """The string scoper is the rendered plan scoper on these chains too."""
         assert _scope_to_keyword(raw, 'pytest', self._FILES) == render(
             scope_prefix_to_keyword(raw, 'pytest', self._FILES)
         )
@@ -1440,7 +1441,10 @@ class TestTailPreservationAllowlist:
 
 
 class TestDroppedChainClausesAreLogged:
-    """Both scopers log the clauses a gate REJECT silently discards (task 3218 2b).
+    """The scoper logs the clauses a gate REJECT silently discards (task 3218 2b).
+
+    ``verify._scope_to_keyword`` renders ``scope_prefix_to_keyword``, so it
+    emits that one record, on ``orchestrator.verify_plan``.
 
     ``split_chain_tail`` returns ``(raw, '')`` for both "single-segment,
     nothing to preserve" and "multi-segment, rejected", so today a caller
@@ -1657,7 +1661,7 @@ class TestDroppedChainClausesAreLogged:
         ],
     )
     def test_logging_is_the_only_observable_change(self, raw, keyword):
-        """Both scopers' returned commands stay byte-identical, and in lockstep."""
+        """The string scoper's command stays byte-identical to the rendered plan scoper's."""
         string_scoped = _scope_to_keyword(raw, keyword, self._FILES)
         plan_scoped = render(scope_prefix_to_keyword(raw, keyword, self._FILES))
         assert string_scoped == plan_scoped
@@ -2793,18 +2797,14 @@ _ESC_3805_FILE = 'orchestrator/tests/test_run_vllm_eval.py'
 class TestVersionPinSurvivesPrefixScoping:
     """``scope_prefix_to_keyword`` must keep a pinned npx package version.
 
-    Task 3931 / esc-3805-1 — the LOCKSTEP counterpart of
-    ``test_verify.py::TestVersionPinSurvivesScoping``.
+    Task 3931 / esc-3805-1 — the ``VerifyCmd``-layer half of
+    ``test_verify.py::TestVersionPinSurvivesScoping``, which pins the same
+    property on ``verify._scope_to_keyword``, this function's rendering.
 
-    This function is the ``VerifyCmd``-layer twin of
-    ``verify._scope_to_keyword`` and carries the IDENTICAL byte-offset
-    truncation (``retained = head[: idx + len(keyword)]``); its own docstring
-    states that *raw* "is ALWAYS truncated to everything up to and including
-    the first occurrence of *keyword* before being (re-)parsed". So it strips a
-    version pin exactly the same way, and the two layers must be fixed in the
-    SAME commit or they silently diverge — the trap task 3830 fell into, where
-    a plan named only verify.py while verify_plan.py needed the identical
-    change.
+    Its own docstring states that *raw* "is ALWAYS truncated to everything up
+    to and including the first occurrence of *keyword* before being
+    (re-)parsed", and that truncation was the byte-offset slice
+    ``retained = head[: idx + len(keyword)]``, so it stripped a version pin.
 
     MEASURED on this branch before the step-6 change (and after step-4, so this
     is verify_plan.py's own stripping, not the parser's):
@@ -2818,11 +2818,8 @@ class TestVersionPinSurvivesPrefixScoping:
         assert cmd.tool is ToolKind.PYRIGHT
         assert render(cmd) == f'npx pyright@1.1.408 {_ESC_3805_FILE}', (
             f'scope_prefix_to_keyword dropped the version pin, rendering '
-            f'{render(cmd)!r} (task 3931, esc-3805-1). This is the '
-            'VerifyCmd-layer twin of verify._scope_to_keyword and must be '
-            'fixed in lockstep with it — the pair routes through one shared '
-            'split_chain_tail gate and its STRUCTURAL lockstep is a documented '
-            'property'
+            f'{render(cmd)!r} (task 3931, esc-3805-1) — its keyword truncation '
+            'must stay token-aware (verify_cmd.keyword_truncation_end)'
         )
 
     def test_unpinned_chain_scopes_exactly_as_today(self):
@@ -2837,7 +2834,7 @@ class TestVersionPinSurvivesPrefixScoping:
         assert render(cmd) == f'npx pyright {_ESC_3805_FILE}'
 
     def test_a_longer_unrelated_token_is_not_absorbed(self):
-        """Same boundary rule as verify.py's: widen across `@<version>` ONLY.
+        """The `keyword_truncation_end` boundary rule: widen across `@<version>` ONLY.
 
         Passes today; it is the floor that makes the step-6 widening provably
         narrow rather than a general "keep the whole token" change.

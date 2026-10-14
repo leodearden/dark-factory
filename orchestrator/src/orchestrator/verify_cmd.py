@@ -628,8 +628,9 @@ def _segment_invokes_tool(segment: str, keyword: str) -> bool:
 def keyword_truncation_end(head: str, end: int) -> int:
     """Extend a keyword-match end offset across an npx ``@<version>`` suffix.
 
-    Task 3931 / esc-3805-1. Both scopers — ``verify._scope_to_keyword`` and
-    ``verify_plan.scope_prefix_to_keyword`` — truncate their matched segment
+    Task 3931 / esc-3805-1. The scoper —
+    ``verify_plan.py::scope_prefix_to_keyword``, which
+    ``verify._scope_to_keyword`` renders — truncates its matched segment
     to everything up to and including the first occurrence of the keyword,
     historically with the BYTE-OFFSET slice ``head[: idx + len(keyword)]``.
     That slice cuts mid-token at the ``@`` of a pinned npx package spec, so
@@ -638,10 +639,6 @@ def keyword_truncation_end(head: str, end: int) -> int:
     whether the parser could carry it. A gate spelled as pinned therefore ran
     whatever npx last cached — MEASURED byte-identical output for the pinned
     and unpinned fleet chains.
-
-    Both callers route through this one helper for the same reason they route
-    through ``split_chain_tail``: their lockstep is STRUCTURAL, not a
-    convention kept by hand.
 
     THE BOUNDARY RULE, and why it is this narrow. The extension applies ONLY
     when the very next character is ``@`` — the npm package-spec version
@@ -868,13 +865,14 @@ def describe_dropped_clauses(
 
     The companion to ``has_unpreserved_chain_clauses``, and DIAGNOSTIC-ONLY in
     exactly the same sense: between them they supply the count, the text and
-    the classification for one log record (``verify_plan.log_dropped_chain_
-    clauses``) and feed no control-flow decision anywhere. Pure, so this module
-    stays logging-free.
+    the classification for one log record
+    (``verify_plan._log_dropped_chain_clauses``) and feed no control-flow
+    decision anywhere. Pure, so this module stays logging-free.
 
-    *retained* is the CALLER'S truncation point — ``head[: idx + len(keyword)]``
-    — and must be a prefix of *raw*. Passing it in rather than re-deriving it
-    is deliberate: both scopers already compute that exact slice as the
+    *retained* is the CALLER'S truncation point — the
+    ``keyword_truncation_end``-bounded prefix — and must be a prefix of *raw*.
+    Passing it in rather than re-deriving it is deliberate: the scoper
+    already computes that exact slice as the
     argument to ``parse_config_command``, and re-deriving it here would fork
     the truncation rule into a second place free to drift from the first.
 

@@ -285,24 +285,15 @@ class VerifyPlan:
 def _log_dropped_chain_clauses(raw: str, keyword: str, retained: str) -> None:
     """Report the trailing chain clauses a gate REJECT discarded from *raw*.
 
-    Shared by BOTH scopers — ``scope_prefix_to_keyword`` below and
-    ``verify._scope_to_keyword``, which passes its own module logger — so the
-    two records read alike structurally rather than by hand-mirroring. Same
-    argument that put the tail-preservation policy in one shared
-    ``split_chain_tail`` gate: lockstep the pair cannot drift out of. It lives
-    here rather than in ``verify_cmd`` because ``verify`` already imports this
-    module (not the reverse), and because keeping ``verify_cmd`` logging-free
-    is what lets ``has_unpreserved_chain_clauses`` stay a pure predicate.
+    Call it only once ``has_unpreserved_chain_clauses(raw, tail)`` holds, and
+    only on the path that actually rewrites the command: the scoper's
+    bail-outs return the whole original, chain and all, so a record emitted
+    before them would name clauses that in fact still run.
 
-    Callers MUST gate this on ``has_unpreserved_chain_clauses(raw, tail)`` and
-    MUST call it only on the path that actually rewrites the command: both
-    scopers' bail-outs return the whole original, chain and all, so a record
-    emitted before them would name clauses that in fact still run.
-
-    *retained* is the caller's truncation point (``head[: idx + len(keyword)]``
-    — each caller already computes it, as the argument to
-    ``parse_config_command``) and must be a prefix of *raw*. The clause COUNT
-    is the top-level `&&` SEGMENT DELTA across it, NOT
+    *retained* is the scoper's truncation point — the
+    ``keyword_truncation_end``-bounded prefix it already computes as the
+    argument to ``parse_config_command`` — and must be a prefix of *raw*.
+    The clause COUNT is the top-level `&&` SEGMENT DELTA across it, NOT
     ``len(split_top_level_and(raw)) - 1``: that earlier form counted every
     clause in the whole original, which is right only when the keyword sits in
     segment 0, and every ``cd X && <tool>`` config in this repo puts it in
@@ -353,13 +344,9 @@ def _log_dropped_chain_clauses(raw: str, keyword: str, retained: str) -> None:
 def scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> VerifyCmd:
     """Scope *raw* to *files*, first-clause-scoping a raw-retained chain.
 
-    The ``VerifyCmd``-layer counterpart of ``verify._scope_to_keyword`` (which
-    operates on — and returns — a shell string): this returns a ``VerifyCmd``
-    instead, since ``PlannedRun.cmd`` stores structured commands, not strings.
-    Lockstep between the two is now STRUCTURAL rather than a convention kept
-    by hand — both route through the single shared
-    ``verify_cmd.split_chain_tail`` gate, so neither can drift from the
-    other's tail-preservation rule.
+    Returns a ``VerifyCmd`` because ``PlannedRun.cmd`` stores structured
+    commands; ``verify._scope_to_keyword`` is this function rendered to a
+    string.
 
     Within the matched segment, *raw* is ALWAYS truncated to everything up to
     and including the first occurrence of *keyword* before being (re-)parsed,
@@ -389,13 +376,11 @@ def scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> VerifyC
     ``_extract_failing_test_ids_from_junit``, flake confirmation and the
     per-test timeout floor. The dropped clauses are not silent: a
     multi-clause command whose tail the gate rejects is reported by
-    :func:`log_dropped_chain_clauses` below, naming the keyword and the
+    :func:`_log_dropped_chain_clauses`, naming the keyword and the
     dropped-clause count — at DEBUG when a dropped clause re-invokes the tool
     (an intended same-tool fan-out truncation), at INFO when none does (a
     sibling check that will now never run), independent of which slot is
-    running. ``verify._scope_to_keyword`` emits that same record through that
-    same shared helper, since STRUCTURAL lockstep is this pair's documented
-    property. It is emitted only on the rewriting path: both bail-outs below
+    running. It is emitted only on the rewriting path: both bail-outs below
     return *raw* with its chain intact, so nothing is dropped there and
     nothing is reported.
 
@@ -427,11 +412,9 @@ def scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> VerifyC
     idx = head.find(keyword)
     if idx == -1:
         return unscoped
-    # Task 3931 / esc-3805-1: token-aware, in LOCKSTEP with
-    # verify._scope_to_keyword's identical line — the shared
-    # `keyword_truncation_end` helper is what makes that lockstep structural
-    # rather than a convention. The old byte-offset slice cut mid-token at the
-    # `@` of a pinned npx package spec, destroying the pin before the re-parse.
+    # Task 3931 / esc-3805-1: token-aware. The old byte-offset slice cut
+    # mid-token at the `@` of a pinned npx package spec, destroying the pin
+    # before the re-parse.
     retained = head[: keyword_truncation_end(head, idx + len(keyword))]
     prefix_parsed = parse_config_command(retained)
     if prefix_parsed.tool is ToolKind.OPAQUE or prefix_parsed.raw is not None:
@@ -439,8 +422,7 @@ def scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> VerifyC
     # Sited AFTER both bail-outs on purpose — each returns *unscoped*, i.e.
     # *raw* in full with its chain intact, so nothing is dropped there and a
     # record would name clauses that in fact still run. Only the rewriting
-    # path below actually discards them. Same record and same level policy as
-    # verify._scope_to_keyword's, because it is literally the same call.
+    # path below actually discards them.
     #
     # `retained` is what makes the reported count right: it is the truncation
     # point, so the clauses past it are exactly the ones this call discards.
