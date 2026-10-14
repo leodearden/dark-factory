@@ -1181,8 +1181,13 @@ known so you don't re-investigate them each cycle.
 - **"Too many open files"** after many watcher restart cycles → fd pool
   exhaustion from accumulated background tasks; tell the user to start a fresh
   session.
-- **`get_pending_escalations` errors / empty when you expect items** → confirm
-  this session's `escalation` server points at **8103**, not 8102. The stock
-  repo `.mcp.json` is 8102.
+- **`get_pending_escalations` empty when you expect items** → read the
+  `THIS ENDPOINT SERVES:` block ending that tool's own description in your
+  tool listing (rendered by
+  `escalation/src/escalation/server.py::_render_store_identity_block`).
+  `kind=reconciliation` → this queue answered; nothing is pending.
+  `kind=project` (e.g. `project=dark_factory`) → wrong store, an orchestrator
+  queue: relaunch per "Launching" above. No block → the server cannot vouch
+  for its store; tell the human rather than read `[]` as absence.
 - **8103 server unreachable** → fused-memory.service is down. Priority 1: tell
   the human; do not start services yourself.
