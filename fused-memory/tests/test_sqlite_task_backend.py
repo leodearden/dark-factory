@@ -36,10 +36,12 @@ from fused_memory.backends.sqlite_task_backend import (
 from fused_memory.backends.task_backend_errors import (
     AppendUnsupportedFieldError,
     DoneProvenanceWriteAuthorityError,
+    MetadataNotAnObjectError,
     StatusWriteAuthorityError,
     TaskmasterError,
     TaskNotFoundError,
     done_provenance_via_update_task_error,
+    metadata_not_an_object_error,
     status_via_update_task_error,
 )
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -1142,20 +1144,6 @@ async def test_update_task_allows_metadata_without_done_provenance(backend, proj
     assert task['metadata']['files'] == ['src']
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize('bad_metadata', ['not json{', json.dumps(['a', 'list'])])
-async def test_update_task_done_provenance_floor_skips_unparseable_metadata(
-    backend, project_root, bad_metadata,
-):
-    """Parse-safety guard: unparseable or non-dict metadata does not trip the
-    done_provenance floor — mirrors the interceptor's
-    _reject_done_provenance_in_update_metadata, which returns None (no
-    reject) on a JSON error or non-dict payload."""
-    await backend.add_task(project_root=project_root, title='x')
-    # Must not raise DoneProvenanceWriteAuthorityError.
-    await backend.update_task('1', project_root=project_root, metadata=bad_metadata)
-
-
 _STORED_DONE_PROVENANCE = {'kind': 'merged', 'commit': 'a' * 40}
 
 
@@ -1336,6 +1324,131 @@ async def test_update_task_replace_done_provenance_on_missing_task_reports_not_f
         )
     assert not isinstance(exc.value, DoneProvenanceWriteAuthorityError)
     assert 'No tasks found' in exc.value.message
+
+
+# ── update_task: non-object metadata floor (task 6130) ──
+
+_NON_OBJECT_MODES = pytest.mark.parametrize(
+    'mode_kwargs',
+    [
+        {},
+        {'metadata_mode': 'merge'},
+        {'metadata_mode': 'additive'},
+        {'append': True},
+        {'metadata_mode': 'replace'},
+    ],
+    ids=['default', 'merge', 'additive', 'append-shim', 'replace'],
+)
+
+
+@pytest.mark.asyncio
+@_NON_OBJECT_MODES
+@pytest.mark.parametrize(
+    ('payload', 'received'),
+    [
+        ('[]', 'array'),
+        ('null', 'null'),
+        ('not json{', 'invalid_json'),
+        ('["a"]', 'array'),
+    ],
+)
+async def test_update_task_non_object_metadata_never_drops_stored_done_provenance(
+    backend, project_root, mode_kwargs, payload, received,
+):
+    """A payload that is not a JSON object has no keys to merge. Treated as a
+    last-write-wins replacement it wiped the whole stored blob, done_provenance
+    and files included, in every mode; it is refused instead and nothing is
+    written."""
+    await backend.add_task(
+        project_root=project_root, title='x',
+        metadata=json.dumps({'done_provenance': _STORED_DONE_PROVENANCE, 'files': ['src']}),
+    )
+    before = (await backend.get_task('1', project_root=project_root))['metadata']
+    with pytest.raises(MetadataNotAnObjectError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root, metadata=payload, **mode_kwargs,
+        )
+    assert exc.value.to_error_dict() == metadata_not_an_object_error('1', received)
+    after = (await backend.get_task('1', project_root=project_root))['metadata']
+    assert after == before
+    assert after['done_provenance'] == _STORED_DONE_PROVENANCE
+    assert after['files'] == ['src']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('payload', 'received'),
+    [
+        ('not json{', 'invalid_json'),
+        ('[]', 'array'),
+        (json.dumps(['a', 'list']), 'array'),
+        ('null', 'null'),
+        ('"bare"', 'string'),
+        ('7', 'number'),
+        ('true', 'boolean'),
+    ],
+)
+async def test_update_task_rejects_non_object_metadata_on_task_without_done_provenance(
+    backend, project_root, payload, received,
+):
+    """The refusal is about the payload's shape, not about done_provenance: a
+    row that holds none is protected too, and the error is not reported as a
+    done_provenance write."""
+    await backend.add_task(
+        project_root=project_root, title='x', metadata=json.dumps({'files': ['src']}),
+    )
+    before = (await backend.get_task('1', project_root=project_root))['metadata']
+    with pytest.raises(MetadataNotAnObjectError) as exc:
+        await backend.update_task('1', project_root=project_root, metadata=payload)
+    assert not isinstance(exc.value, DoneProvenanceWriteAuthorityError)
+    assert exc.value.received == received
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata'] == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'mode_kwargs', [{}, {'metadata_mode': 'replace'}], ids=['default', 'replace'],
+)
+async def test_update_task_non_object_metadata_rejection_precedes_existence_check(
+    backend, project_root, mode_kwargs,
+):
+    """Refusing a non-object payload needs no stored state, so it runs before
+    the row lookup in every mode, replace included, unlike the done_provenance
+    passthrough, which needs the stored value."""
+    with pytest.raises(MetadataNotAnObjectError) as exc:
+        await backend.update_task(
+            '999', project_root=project_root, metadata='[]', **mode_kwargs,
+        )
+    assert exc.value.to_error_dict() == metadata_not_an_object_error('999', 'array')
+    assert 'No tasks found' not in exc.value.message
+
+
+@pytest.mark.asyncio
+async def test_update_task_non_object_metadata_is_typed_under_enforce_mode(
+    tmp_path, project_root,
+):
+    """Production runs task_metadata.enforce=true, where the post-merge
+    validator used to be the first thing to refuse and raised a raw TypeError.
+    The typed refusal comes first."""
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    backend = SqliteTaskBackend(cfg, task_metadata_enforce=True)
+    await backend.start()
+    try:
+        await backend.add_task(
+            project_root=project_root, title='x',
+            metadata=json.dumps({
+                'done_provenance': _STORED_DONE_PROVENANCE, 'files': ['src'],
+            }),
+        )
+        before = (await backend.get_task('1', project_root=project_root))['metadata']
+        with pytest.raises(MetadataNotAnObjectError) as exc:
+            await backend.update_task('1', project_root=project_root, metadata='[]')
+        assert exc.value.received == 'array'
+        task = await backend.get_task('1', project_root=project_root)
+        assert task['metadata'] == before
+    finally:
+        await backend.close()
 
 
 @pytest.mark.asyncio
