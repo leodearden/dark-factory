@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 from collections.abc import Iterable, Iterator
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -28,6 +29,7 @@ from df_pytest_isolation import git_redirect_env
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.event_store import EventStore
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.verify import VerifyResult
 
@@ -118,7 +120,7 @@ def _make_checkpoint(
     mcp.mcp_config_json.return_value = {'mcpServers': {}}
 
     cp = ReviewCheckpoint(config, mcp=mcp, usage_gate=None)
-    cp.event_store = _RecordingEventStore()  # type: ignore[assignment]
+    cp.event_store = cast(EventStore, _RecordingEventStore())
     return cp
 
 
