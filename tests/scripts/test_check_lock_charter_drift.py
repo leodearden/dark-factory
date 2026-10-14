@@ -18,11 +18,9 @@ a skip is indistinguishable from a pass to anything reading an exit code — the
 precise conflation this task's other half fixes inside verify.  So this script
 has exactly three outcomes, ``EXIT_OK`` / ``EXIT_DRIFT`` / ``EXIT_UNAVAILABLE``,
 and "I could not look" is reported as loudly as "I looked and found drift".
-The assertions below therefore pin ``!= EXIT_OK`` explicitly on every
-could-not-look path, not merely ``== EXIT_UNAVAILABLE``: the failure being
-guarded against is a future refactor quietly folding unavailable into success,
-and an equality assertion against a renamed-but-still-zero constant would not
-catch it.
+Every could-not-look case below asserts ``== EXIT_UNAVAILABLE``; that this can
+never also mean success is pinned once, by `TestExitCodeContract` fixing the
+three codes as the literals 0, 1 and 2, so a renumbering to zero fails there.
 
 HERMETICITY IS A HARD RULE HERE (task 3226 pre-3), not a style preference.
 reify's live vector may legitimately differ from dark-factory's at any instant —
@@ -42,6 +40,7 @@ because ``--import-mode=importlib`` deliberately does not).
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import subprocess
@@ -275,7 +274,6 @@ class TestCheckVectors:
         report = drift.check_vectors(repo)
 
         assert report['exit_code'] == drift.EXIT_UNAVAILABLE
-        assert report['exit_code'] != drift.EXIT_OK
         assert report['status'] == 'unavailable'
 
     def test_nonexistent_repo_dir_is_unavailable(self, tmp_path):
@@ -298,7 +296,6 @@ class TestCheckVectors:
         report = drift.check_vectors(repo)
 
         assert report['exit_code'] == drift.EXIT_UNAVAILABLE
-        assert report['exit_code'] not in (drift.EXIT_OK, drift.EXIT_DRIFT)
         assert report['status'] == 'unavailable'
 
     def test_hanging_guard_is_bounded_and_reports_unavailable(self, tmp_path):
@@ -319,7 +316,6 @@ class TestCheckVectors:
         report = drift.check_vectors(repo, timeout=0.5)
 
         assert report['exit_code'] == drift.EXIT_UNAVAILABLE
-        assert report['exit_code'] not in (drift.EXIT_OK, drift.EXIT_DRIFT)
         assert report['status'] == 'unavailable'
 
     def test_unavailable_detail_names_the_script_it_could_not_run(self, tmp_path):
@@ -338,7 +334,6 @@ class TestCheckVectors:
         report = drift.check_vectors(repo)
 
         assert report['exit_code'] == drift.EXIT_UNAVAILABLE
-        assert report['exit_code'] not in (drift.EXIT_OK, drift.EXIT_DRIFT)
         assert report['status'] == 'unavailable'
 
     def test_non_utf8_stderr_beside_a_readable_answer_is_still_an_answer(self, tmp_path):
@@ -480,11 +475,18 @@ def _track_non_utf8_path(repo: Path) -> None:
     """Track a file in *repo* whose NAME is bytes that are not valid UTF-8.
 
     ``.py`` is an allowlisted extension, so only a decode problem, never a
-    finding, can change the outcome of a sweep over this repo.
+    finding, can change the outcome of a sweep over this repo.  A filesystem
+    that enforces UTF-8 names (APFS, ZFS ``utf8only``) refuses the file with
+    ``EILSEQ``; that skips, and any other ``OSError`` still errors.
     """
     name = b'caf\xe9.py'  # 0xE9 is Latin-1 é; a lone 0xE9 is invalid UTF-8
-    with open(os.fsencode(repo) + b'/' + name, 'wb') as fh:
-        fh.write(b'x\n')
+    try:
+        with open(os.fsencode(repo) + b'/' + name, 'wb') as fh:
+            fh.write(b'x\n')
+    except OSError as exc:
+        if exc.errno != errno.EILSEQ:
+            raise
+        pytest.skip(f'filesystem rejects non-UTF-8 file names: {exc}')
     # `ls-files -z` suppresses git's quoting, so these raw bytes reach the decoder.
     subprocess.run(['git', '-C', str(repo), 'add', '--', name], check=True, capture_output=True)
 
@@ -565,7 +567,6 @@ class TestCheckCorpus:
         report = drift.check_corpus(plain)
 
         assert report['exit_code'] == drift.EXIT_UNAVAILABLE
-        assert report['exit_code'] != drift.EXIT_OK
         assert report['status'] == 'unavailable'
         assert report['findings'] == {}
 
@@ -683,7 +684,6 @@ class TestTrackedPaths:
         )
 
         assert proc.returncode == drift.EXIT_UNAVAILABLE, proc.stderr
-        assert proc.returncode != drift.EXIT_DRIFT
         assert 'Traceback' not in proc.stderr
 
 
@@ -997,7 +997,6 @@ class TestMainCli:
         rc = drift.main([])
 
         assert rc == drift.EXIT_UNAVAILABLE
-        assert rc != drift.EXIT_OK
         err = capsys.readouterr().err
         expected = reify_checkout.reify_skip_reason(
             drift.GUARD_RELPATH, discovered, named_by_env=False
@@ -1023,9 +1022,8 @@ class TestMainCli:
 
         Everything above calls ``main()`` in-process, which cannot observe the
         ``sys.exit(main(...))`` wiring at the bottom of the module.  A scheduled
-        job or CI lane branches on the numeric exit STATUS, so the could-not-look
-        arm is asserted ``!= 0`` as well as ``== EXIT_UNAVAILABLE``: the failure
-        being guarded against is a future refactor that swallows the return value
+        job or CI lane branches on the numeric exit STATUS, and the failure being
+        guarded against is a future refactor that swallows the return value
         (``main(...)`` called bare, or wrapped in a ``try``) and lets an
         unavailable run exit 0 — a skip reported as a pass, which is exactly the
         conflation this script exists to end.
@@ -1045,5 +1043,3 @@ class TestMainCli:
         )
 
         assert proc.returncode == expected, proc.stderr
-        if expected != drift.EXIT_OK:
-            assert proc.returncode != drift.EXIT_OK
