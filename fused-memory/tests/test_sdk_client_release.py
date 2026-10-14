@@ -13,11 +13,23 @@ import types
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fm_helpers import (
+    _leaked_async_httpx_clients,
+    reap_leaked_async_httpx_clients,
+    track_async_httpx_clients,
+)
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
+from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 from graphiti_core.llm_client import LLMConfig, OpenAIClient
 from graphiti_core.llm_client.anthropic_client import AnthropicClient
 
+import fused_memory.backends.graphiti_client as graphiti_client_module
+from fused_memory.backends.graphiti_client import (
+    GraphitiBackend,
+    build_embedder,
+    build_llm_client,
+)
 from fused_memory.backends.llm_clients import TokenRecordingOpenAIGenericClient
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
 
@@ -101,3 +113,81 @@ class TestCloseWrappedSdkClients:
         ]
         assert len(warnings) == 1
         assert type(failing_sdk).__name__ in warnings[0].getMessage()
+
+
+async def _start_census() -> None:
+    track_async_httpx_clients()
+    await reap_leaked_async_httpx_clients()
+
+
+@pytest.fixture
+def offline_falkor(monkeypatch):
+    """A real Graphiti over a spec'd driver double: no FalkorDB, no preflight request."""
+    def driver_factory(**_kwargs):
+        driver = MagicMock(spec=FalkorDriver)
+        driver.clone.return_value = MagicMock(spec=FalkorDriver)
+        return driver
+
+    monkeypatch.setattr(graphiti_client_module, '_MultiTenantFalkorDriver', driver_factory)
+    monkeypatch.setattr(graphiti_client_module, 'check_openai_responses_api', lambda: None)
+
+
+class TestGraphitiBackendCloseReleasesSdkClients:
+    @pytest.mark.asyncio
+    async def test_configured_sub_clients_are_shared_and_released(
+        self, mock_config, offline_falkor,
+    ):
+        await _start_census()
+        backend = GraphitiBackend(mock_config)
+        await backend.initialize(skip_maintenance=True)
+        backend._client_for('g1')
+
+        built = _leaked_async_httpx_clients()
+        assert len(built) == 3
+
+        await backend.close()
+
+        assert _leaked_async_httpx_clients() == []
+
+    @pytest.mark.asyncio
+    async def test_clients_graphiti_mints_for_itself_are_released(
+        self, mock_config, offline_falkor, monkeypatch,
+    ):
+        mock_config.llm.providers.openai.api_key = ''
+        mock_config.embedder.providers.openai.api_key = ''
+        monkeypatch.setenv('OPENAI_API_KEY', 'test-key')
+        await _start_census()
+        backend = GraphitiBackend(mock_config)
+        await backend.initialize(skip_maintenance=True)
+        backend._client_for('g1')
+
+        built = _leaked_async_httpx_clients()
+        assert len(built) == 5
+
+        await backend.close()
+
+        assert _leaked_async_httpx_clients() == []
+
+    @pytest.mark.asyncio
+    async def test_injected_clients_are_owned_and_released(
+        self, mock_config, offline_falkor,
+    ):
+        await _start_census()
+        llm = build_llm_client(mock_config)
+        emb = build_embedder(mock_config)
+        backend = GraphitiBackend(mock_config)
+        await backend.initialize(skip_maintenance=True, llm_client=llm, embedder=emb)
+        backend._client_for('g1')
+
+        built = _leaked_async_httpx_clients()
+        assert len(built) == 3
+
+        await backend.close()
+
+        assert _leaked_async_httpx_clients() == []
+        assert llm.client.is_closed() is True
+        assert emb.client.is_closed() is True
+
+    @pytest.mark.asyncio
+    async def test_close_before_initialize_is_a_no_op(self, mock_config):
+        await GraphitiBackend(mock_config).close()
