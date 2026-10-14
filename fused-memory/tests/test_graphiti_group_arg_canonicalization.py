@@ -279,6 +279,9 @@ class TestGroupIdsFilterAgreement:
 # pair pins that the key and the filter agree, this row pins that a path-shaped
 # id is refused before any DB call, and the two are different claims.
 #
+# `enumerate_ranked_entity_nodes` (task 5662) joined for both reasons too: it
+# resolves a graph key via _graph_for AND filters on $group_id.
+#
 # `enumerate_valid_edges_mentioning` (task 4851) joined for the same reason as
 # enumerate_all_valid_edges, whose narrowed sibling it is.
 _ALL_GROUP_ARG_SWEEP_CASES = [
@@ -309,6 +312,7 @@ _ALL_GROUP_ARG_SWEEP_CASES = [
     ('rename_entity_node', ('n1', 'NewName'), {'group_id': _PATH_SHAPED}),
     ('list_entity_nodes', (), {'group_id': _PATH_SHAPED}),
     ('enumerate_entity_nodes', (), {'group_id': _PATH_SHAPED}),
+    ('enumerate_ranked_entity_nodes', (), {'group_id': _PATH_SHAPED}),
     ('detect_stale_with_edges', (), {'group_id': _PATH_SHAPED}),
     ('detect_stale_dry_run', (), {'group_id': _PATH_SHAPED}),
     ('detect_stale_summaries', (), {'group_id': _PATH_SHAPED}),
@@ -331,8 +335,8 @@ _ALL_GROUP_ARG_SWEEP_CASES = [
     ('retrieve_episodes', (), {'group_ids': [_PATH_SHAPED]}),
 ]
 
-assert len(_ALL_GROUP_ARG_SWEEP_CASES) == 43, (
-    'Sweep must cover exactly the 43 public group-arg GraphitiBackend methods '
+assert len(_ALL_GROUP_ARG_SWEEP_CASES) == 44, (
+    'Sweep must cover exactly the 44 public group-arg GraphitiBackend methods '
     'this table claims: every one not covered by the step-1/3/5 positive-path '
     'tests, plus find_entity_nodes_by_name_substring, which is in both (see the '
     'comment above) — update this table if the decorated surface ever changes.'

@@ -13,23 +13,42 @@ Covers:
 - GraphitiBackend._mint_entity_node (task 5003): the unconditional mint
   primitive — CREATE plus best-effort embedding, with no read, resolve or
   collapse; its 0-match precondition is the caller's to establish.
+- GraphitiBackend.enumerate_ranked_entity_nodes (task 5662): the census-only
+  group-scoped paged read, every row survivor-first by the shared rank rule.
 """
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import functools
+import itertools
+import random
 import uuid
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _fm_helpers import assert_ro_query_only, extract_cypher, extract_params
+import pytest_asyncio
+from _fm_helpers import (
+    FALKOR_HOST,
+    FALKOR_PORT,
+    assert_ro_query_only,
+    extract_cypher,
+    extract_params,
+    falkor_skipif,
+    unique_graph_name,
+)
+from falkordb.asyncio import FalkorDB
 
 from fused_memory.backends.graphiti_client import (
     _PROVENANCE_RANK_CLAUSE,
     _PROVENANCE_RANK_ORDER,
     AmbiguousEntityError,
     GraphitiBackend,
+    SurvivorRankTypeError,
+    _MultiTenantFalkorDriver,
 )
+from fused_memory.utils.task_naming import task_node_referent
 from fused_memory.utils.validation import PathShapedProjectIdError
 
 # ---------------------------------------------------------------------------
@@ -1005,3 +1024,296 @@ class TestFindEntityNodesByNameSubstring:
             '605',
             group_id='home',
         )
+
+
+# ---------------------------------------------------------------------------
+# task 5662: GraphitiBackend.enumerate_ranked_entity_nodes
+# ---------------------------------------------------------------------------
+
+def _ranked_dict(row: list) -> dict:
+    keys = ('uuid', 'name', 'created_at', 'edge_count', 'mentions_count', 'provenance_rank')
+    return dict(zip(keys, row, strict=True))
+
+
+def _null_largest(x, y) -> int:
+    if x == y:
+        return 0
+    if x is None:
+        return 1
+    if y is None:
+        return -1
+    return -1 if x < y else 1
+
+
+def _cypher_order_by(a: dict, b: dict) -> int:
+    """`ORDER BY provenance_rank DESC, n.created_at ASC, n.uuid ASC` as openCypher
+    reads it: one key at a time, NULL comparing larger than any value."""
+    return (
+        -_null_largest(a['provenance_rank'], b['provenance_rank'])
+        or _null_largest(a['created_at'], b['created_at'])
+        or _null_largest(a['uuid'], b['uuid'])
+    )
+
+
+def _page_and_census_cypher(graph: MagicMock) -> tuple[str, str]:
+    cyphers = [extract_cypher(c) for c in graph.ro_query.call_args_list]
+    (census,) = {c for c in cyphers if c.rstrip().endswith('RETURN count(*)')}
+    (page,) = {c for c in cyphers if 'SKIP' in c}
+    return page, census
+
+
+class TestEnumerateRankedEntityNodes:
+    """The task-family census's one read: every same-group Entity node, with the
+    provenance-rank columns of the substring sibling, survivor-first.
+
+    Membership and edge counts come from the SAME rows, so they cannot disagree
+    the way a whole-graph enumeration and a per-family probe could.
+    """
+
+    @pytest.mark.asyncio
+    async def test_is_group_scoped_in_both_the_census_and_the_pages_and_binds_the_canonical_id(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([['u1', 'Task 1', '2026-01-01', 1, 0, 1]])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        await backend.enumerate_ranked_entity_nodes(group_id='know-live')
+
+        assert graph.ro_query.await_count >= 2
+        for call_args in graph.ro_query.call_args_list:
+            assert 'n.group_id = $group_id' in extract_cypher(call_args)
+            assert extract_params(call_args).get('group_id') == 'know_live'
+        backend._driver._get_graph.assert_called_with('know_live')
+
+    @pytest.mark.asyncio
+    async def test_cuts_each_page_by_uuid_before_aggregating_the_shared_rank_clause(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """The paging invariant needs a total order over NON-aggregated rows: a
+        rank computed per page can move between pages on a live store."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([['u1', 'Task 1', '2026-01-01', 1, 0, 1]])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        await backend.enumerate_ranked_entity_nodes(group_id='home')
+
+        page, census = _page_and_census_cypher(graph)
+        assert _PROVENANCE_RANK_CLAUSE in page
+        assert page.index('WITH n ORDER BY n.uuid SKIP') < page.index(_PROVENANCE_RANK_CLAUSE)
+        assert census.partition('RETURN count(*)')[0] == page.partition('WITH n')[0]
+
+    @pytest.mark.asyncio
+    async def test_returns_every_row_survivor_first_across_pages(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """Highest provenance_rank, then oldest (a missing created_at is the
+        largest, as in openCypher), then uuid — the order the destructive
+        rankers' ORDER BY produces, applied to the whole multi-page read."""
+        in_uuid_order = [
+            ['u1', 'Task 1', '2026-03-01', 1, 0, 1],
+            ['u2', 'Task 2', None, 5, 0, 5],
+            ['u3', 'Task 3', '2026-02-01', 3, 2, 5],
+            ['u4', 'Task 4', '2026-01-01', 4, 1, 5],
+            ['u5', 'Task 5', '2026-03-01', 0, 1, 1],
+            ['u6', 'Task 6', '2026-01-15', 7, 2, 9],
+        ]
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(in_uuid_order)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        rows, _ = await backend.enumerate_ranked_entity_nodes(group_id='home', page_size=2)
+
+        by_uuid = {row[0]: row for row in in_uuid_order}
+        assert rows == [
+            _ranked_dict(by_uuid[u]) for u in ('u6', 'u4', 'u3', 'u2', 'u1', 'u5')
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_row_re_emitted_across_a_page_boundary_is_returned_once(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([
+            ['a', 'Task 1', '2026-01-01', 1, 0, 1],
+            ['b', 'Task 2', '2026-01-01', 1, 0, 1],
+            ['b', 'Task 2', '2026-01-01', 1, 0, 1],
+            ['c', 'Task 3', '2026-01-01', 1, 0, 1],
+        ])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        rows, paged = await backend.enumerate_ranked_entity_nodes(group_id='home', page_size=2)
+
+        uuids = [row['uuid'] for row in rows]
+        assert sorted(uuids) == ['a', 'b', 'c']
+        assert paged.complete is True
+        assert paged.rows_seen == 4
+
+    @pytest.mark.asyncio
+    async def test_reports_completeness_as_a_paged_read(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        corpus = [
+            ['a', 'Task 1', '2026-01-01', 1, 0, 1],
+            ['b', 'Alice', '2026-01-01', 0, 2, 2],
+            ['c', 'Task 3', '2026-01-01', 1, 0, 1],
+        ]
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(corpus)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        _, paged = await backend.enumerate_ranked_entity_nodes(group_id='home', page_size=2)
+
+        assert paged.complete is True
+        assert paged.incomplete_kind is None
+        assert paged.expected_rows == len(corpus)
+
+    @pytest.mark.asyncio
+    async def test_never_touches_the_writable_query_channel(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([['a', 'Task 1', '2026-01-01', 1, 0, 1]])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        await backend.enumerate_ranked_entity_nodes(group_id='home')
+
+        graph.query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_survivor_order_is_cyphers_order_by_over_null_and_tied_keys(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """Every combination of tied rank, tied and NULL created_at, twice over,
+        with uuids assigned independently of both — against the comparator
+        spelled straight from the ORDER BY the destructive rankers emit."""
+        combos = list(itertools.product(
+            (0, 3, 5), (None, '2026-01-01T00:00:00Z', '2026-02-01T00:00:00Z'), (1, 2),
+        ))
+        random.Random(5662).shuffle(combos)
+        rows = [
+            {
+                'uuid': f'u{i:02d}', 'name': f'Task {i}', 'created_at': created_at,
+                'edge_count': rank, 'mentions_count': 0, 'provenance_rank': rank,
+            }
+            for i, (rank, created_at, _copy) in enumerate(combos)
+        ]
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([list(row.values()) for row in rows])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        ranked, _ = await backend.enumerate_ranked_entity_nodes(group_id='home', page_size=4)
+
+        assert ranked == sorted(rows, key=functools.cmp_to_key(_cypher_order_by))
+
+    @pytest.mark.asyncio
+    async def test_a_rank_column_mixing_value_types_fails_naming_column_and_types(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([
+            ['a', 'Task 1', '2026-01-01T00:00:00Z', 1, 0, 1],
+            ['b', 'Task 2', 1767225600, 1, 0, 1],
+        ])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        with pytest.raises(SurvivorRankTypeError) as raised:
+            await backend.enumerate_ranked_entity_nodes(group_id='home')
+
+        assert raised.value.column == 'created_at'
+        assert raised.value.value_types == ('int', 'str')
+
+
+@pytest_asyncio.fixture
+async def ranked_census_live_graph():
+    """Provision a throwaway, uniquely-named FalkorDB graph, yield it, then clean up."""
+    graph_name = unique_graph_name('5662_ranked_census')
+    client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
+    with contextlib.suppress(Exception):
+        stale = client.select_graph(graph_name)
+        await stale.delete()
+    graph = client.select_graph(graph_name)
+    try:
+        yield graph_name, graph
+    finally:
+        with contextlib.suppress(Exception):
+            await graph.delete()
+        with contextlib.suppress(Exception):
+            await client.aclose()
+
+
+@falkor_skipif()
+@pytest.mark.timeout(15)
+@pytest.mark.integration
+class TestEnumerateRankedEntityNodesLiveFalkorDB:
+    """On a real server, the Python survivor sort agrees with the shared Cypher
+    ORDER BY — NULL created_at included — and the read stays group-scoped."""
+
+    @staticmethod
+    async def _node(graph, uuid_, name, group_id, created_at=None):
+        props = {'uuid': uuid_, 'name': name, 'gid': group_id, 'created': created_at}
+        if created_at is None:
+            await graph.query(
+                'CREATE (:Entity {uuid: $uuid, name: $name, group_id: $gid})', props,
+            )
+        else:
+            await graph.query(
+                'CREATE (:Entity {uuid: $uuid, name: $name, group_id: $gid, '
+                'created_at: $created})',
+                props,
+            )
+
+    @staticmethod
+    async def _relates(graph, src, edge_uuid, invalid_at=None):
+        await graph.query(
+            "MATCH (a:Entity {uuid: $src}), (b:Entity {uuid: 'nbr'}) "
+            'CREATE (a)-[:RELATES_TO {uuid: $uuid, invalid_at: $invalid_at}]->(b)',
+            {'src': src, 'uuid': edge_uuid, 'invalid_at': invalid_at},
+        )
+
+    @pytest.mark.asyncio
+    async def test_python_survivor_order_matches_the_servers_order_by(
+        self, mock_config, ranked_census_live_graph,
+    ):
+        graph_name, graph = ranked_census_live_graph
+        await self._node(graph, 'nbr', 'Neighbour', graph_name, '2026-01-01T00:00:00Z')
+        await self._node(graph, 'a', 'Task 605', graph_name, '2026-02-01T00:00:00Z')
+        await self._node(graph, 'b', 'task 605', graph_name, '2026-01-01T00:00:00Z')
+        await self._node(graph, 'c', 'tasks 605', graph_name)
+        await self._node(graph, 'd', 'task #605', graph_name, '2026-03-01T00:00:00Z')
+        await self._node(graph, 'e', 'TASK 605', graph_name, '2026-03-01T00:00:00Z')
+        await self._node(graph, 'l', 'task 605', 'other_project', '2026-01-01T00:00:00Z')
+
+        await self._relates(graph, 'a', 'a-e1')
+        for i in range(3):
+            await self._relates(graph, 'b', f'b-e{i}')
+        await self._relates(graph, 'b', 'b-dead', invalid_at='2026-02-02T00:00:00Z')
+        for uuid_ in ('c', 'd', 'e', 'l'):
+            await self._relates(graph, uuid_, f'{uuid_}-e1')
+        for i in range(4):
+            await graph.query('CREATE (:Episodic {uuid: $u})', {'u': f'ep{i}'})
+            await graph.query(
+                "MATCH (ep:Episodic {uuid: $ep}), (n:Entity {uuid: 'a'}) "
+                'CREATE (ep)-[:MENTIONS {uuid: $m}]->(n)',
+                {'ep': f'ep{i}', 'm': f'm-a{i}'},
+            )
+
+        backend = GraphitiBackend(mock_config)
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        try:
+            rows, paged = await backend.enumerate_ranked_entity_nodes(
+                group_id=graph_name, page_size=2,
+            )
+            server_order = await backend.find_entity_nodes_by_name_substring(
+                '605', group_id=graph_name,
+            )
+        finally:
+            await backend.close()
+
+        family = [row['uuid'] for row in rows if task_node_referent(row['name'])]
+        assert family == [row['uuid'] for row in server_order] == ['a', 'b', 'd', 'e', 'c']
+        assert 'l' not in {row['uuid'] for row in rows}
+        assert paged.complete is True
+        by_uuid = {row['uuid']: row for row in rows}
+        assert by_uuid['b']['edge_count'] == 3
+        assert by_uuid['a']['mentions_count'] == 4

@@ -534,6 +534,36 @@ and `::MemoryService._record_referent_repair_pass`.
   `'failed'` record still never increments the streak, and a pass that both repaired
   and failed still increments.
 
+#### Task-family census reads each graph once (task 5662)
+
+`maintenance/task_family_census.py` now makes one backend read per graph instead
+of one per fragmented family, and the structure that existed only to reconcile
+its two reads is gone.
+
+- The per-family `find_entity_nodes_by_name_substring` probe (one un-indexed
+  `CONTAINS` scan per fragmented family, 296 of them on the 2026-09-19 sweep) is
+  replaced by one group-scoped paged read per graph, the new
+  `GraphitiBackend.enumerate_ranked_entity_nodes`. `enumerate_entity_nodes` is
+  unchanged (task 5264, decision 7).
+- Membership and edge counts now come from the same rows, so `UnconfirmedFamily`
+  is unreachable and was deleted, and `FragmentedFamily` now raises `ValueError`
+  below two variants. **Output shape change:** the JSON loses top-level
+  `total_unconfirmed` and per-graph `unconfirmed`, and the summary line loses its
+  `unconfirmed=` token. This supersedes the "two reads disagreeing" paragraph of
+  the task-5264 entry above.
+- `nodes_scanned` now counts same-group nodes only. A node whose `group_id`
+  property names another project (task 2115's leak) is out of the census's
+  scope and is counted nowhere in its output. The deleted `unconfirmed` count
+  was the census's only trace of such a node. A separate read-only leak
+  detector is proposed as follow-up ticket `tkt_0RVQ5JNVSFM3WGVERS1Q2BEHZ0`.
+- The survivor ordering is now one structured spec in `graphiti_client.py`,
+  `_PROVENANCE_RANK_KEYS`, rendered both as the shared Cypher `ORDER BY`
+  (unchanged text) and as the Python sort. A unit test checks the Python sort
+  against openCypher's `ORDER BY` semantics. A live-FalkorDB test, run only
+  with `-m integration`, checks that the two agree on a real server. A rank
+  column whose non-NULL values mix types that Python cannot compare fails that
+  graph with `SurvivorRankTypeError`, which names the column and the types.
+
 #### Store preflight refuses an existing-but-empty target, not just a missing one (task 5468)
 
 The seven fused-memory store scripts that preflight their target now refuse an
