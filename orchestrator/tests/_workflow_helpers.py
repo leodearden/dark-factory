@@ -91,6 +91,10 @@ class FakeScheduler:
         # directly, bypassing handle_blast_radius_expansion) can be asserted.
         # Purely additive — the existing no-op `return True` is preserved.
         self.update_task_calls: list[tuple[str, str | dict]] = []
+        # Tasks a Table-B action teardown owns, modelling
+        # scheduler.py::Scheduler.blocked_writes_suppressed: their 'blocked'
+        # writes are absorbed, every other write lands.
+        self.blocked_write_suppressed_ids: set[str] = set()
 
     async def set_task_status(
         self,
@@ -102,6 +106,8 @@ class FakeScheduler:
         claimant_run_id: str | None = None,
         heartbeat_at: str | None = None,
     ) -> None:
+        if status == 'blocked' and self.blocked_writes_suppressed(task_id):
+            return
         self.statuses.setdefault(task_id, []).append(status)
         if done_provenance is not None:
             self.provenance[task_id] = done_provenance
@@ -202,6 +208,9 @@ class FakeScheduler:
 
     def clear_merge_phase(self, tid: str) -> None:
         pass
+
+    def blocked_writes_suppressed(self, task_id: str, /) -> bool:
+        return task_id in self.blocked_write_suppressed_ids
 
 
 def _merge_values_additive(old: object, new: object) -> object:
