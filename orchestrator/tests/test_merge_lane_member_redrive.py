@@ -46,6 +46,20 @@ class _RecordingSink:
         self.rejections.append((exc, gate_source))
 
 
+async def land_attributed(git_ops: GitOps, mid: str) -> str:
+    """Land *mid* as the merge lane does; returns the merge commit, its citation."""
+    wt = await _add_member(git_ops, mid, 'main', {f'{mid}.py': f'{mid} = 1\n'})
+    await _commit_files(wt, {f'{mid}.py': f'{mid} = 2\n'}, f'impl({mid}): add {mid}')
+    await _git(
+        git_ops.project_root, 'merge', '--no-ff', f'task/{mid}', '-m', f'Merge task/{mid} into main',
+    )
+    return await _rev_parse(git_ops.project_root, 'main')
+
+
+async def add_unlanded(git_ops: GitOps, mid: str) -> None:
+    await _add_member(git_ops, mid, 'main', {f'{mid}.py': f'{mid} = 1\n'})
+
+
 @dataclass(frozen=True)
 class _Repo:
     root: Path
@@ -62,19 +76,14 @@ class _Repo:
         )
 
     async def land_attributed(self, mid: str) -> str:
-        """Land *mid* as the merge lane does; returns the merge commit, its citation."""
-        wt = await _add_member(self.git_ops, mid, 'main', {f'{mid}.py': f'{mid} = 1\n'})
-        await _commit_files(wt, {f'{mid}.py': f'{mid} = 2\n'}, f'impl({mid}): add {mid}')
-        await _git(self.root, 'merge', '--no-ff', f'task/{mid}', '-m', f'Merge task/{mid} into main')
-        return await _rev_parse(self.root, 'main')
+        return await land_attributed(self.git_ops, mid)
 
     async def land_unattributed(self, mid: str) -> None:
-        """Fast-forward main onto *mid*'s branch: on main, but no commit subject cites it."""
         await _add_member(self.git_ops, mid, 'main', {f'{mid}.py': f'{mid} = 1\n'})
         await _git(self.root, 'merge', '--ff-only', f'task/{mid}')
 
     async def add_unlanded(self, mid: str) -> None:
-        await _add_member(self.git_ops, mid, 'main', {f'{mid}.py': f'{mid} = 1\n'})
+        await add_unlanded(self.git_ops, mid)
 
     async def is_ancestor(self, ancestor: str, ref: str) -> bool:
         return await self.git_ops.is_ancestor(ancestor, ref)
