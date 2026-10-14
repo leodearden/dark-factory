@@ -181,6 +181,8 @@ class TestGraphitiBackendCloseReleasesSdkClients:
         await _start_census()
         llm = build_llm_client(mock_config)
         emb = build_embedder(mock_config)
+        assert isinstance(llm, OpenAIClient)
+        assert emb is not None
         backend = GraphitiBackend(mock_config)
         await backend.initialize(skip_maintenance=True, llm_client=llm, embedder=emb)
         backend._client_for('g1')
