@@ -11,16 +11,19 @@ the escalation queue are real.
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 
 import pytest
 import pytest_asyncio
 from _auto_consolidation_fakes import (
     NOW,
     PROJECT_ID,
+    PROPOSED_AT,
     VALID_CLAIM,
     FakeMemoryService,
     FakeTaskBackend,
     enabled_config,
+    new_id,
     propose,
 )
 from escalation.queue import EscalationQueue
@@ -30,16 +33,21 @@ from fused_memory.config.schema import Mem0UpdateConfig
 from fused_memory.models.reconciliation import StageId, StageReport
 from fused_memory.reconciliation.consolidation_auto import build_auto_canonical
 from fused_memory.reconciliation.consolidation_auto_executor import (
+    BACKLOG_CATEGORY,
     CANONICAL_SLUG_LIMIT,
+    REFUSED_CATEGORY,
     auto_consolidation_initial_stats,
     run_auto_consolidation,
 )
 from fused_memory.reconciliation.consolidation_gate import GATE_METADATA_KEY
 from fused_memory.reconciliation.consolidation_proposal import (
     RECORD_KIND_CONSOLIDATION_PROPOSAL,
+    ProposalOutcome,
+    ProposalState,
     outcome_from_record,
+    record_outcome,
 )
-from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 
 TOPIC = 'auto-topic-alpha'
 EXEC_RUN = 'run-exec'
@@ -534,3 +542,223 @@ class TestExecutionRefusal:
         assert row.state == 'refused'
         assert outcome_from_record(row).reason_codes == ('execution_refused',)
         assert report.stats['auto_consolidation_refusals'] == {'execution_refused': 1}
+
+
+def _pending(queue, category=REFUSED_CATEGORY):
+    return [e for e in queue.get_pending() if e.category == category]
+
+
+def _new_ids(n):
+    return [new_id() for _ in range(n)]
+
+
+class TestBenignRefusal:
+    """PRD B7."""
+
+    @pytest.mark.asyncio
+    async def test_an_aged_oversized_row_is_refused_with_one_info_record(
+        self, svc, ledger, queue,
+    ):
+        await propose(ledger, topic=TOPIC, member_ids=_new_ids(21))
+
+        report = await run(svc, queue=queue)
+
+        (esc,) = _pending(queue)
+        assert esc.level == 1
+        assert esc.severity == 'info'
+        assert esc.summary == f'{TOPIC}: member_count_out_of_range'
+        assert esc.project_id == PROJECT_ID
+        assert 'run-p1' in esc.detail
+        assert 'member_count_out_of_range' in esc.detail
+        row = await _row(ledger)
+        assert row.state == 'refused'
+        assert outcome_from_record(row).reason_codes == ('member_count_out_of_range',)
+        assert report.stats['auto_consolidation_refusals'] == {'member_count_out_of_range': 1}
+        svc.get_memory_by_id.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_second_refusal_folds_into_the_pending_record(self, svc, ledger, queue):
+        await propose(ledger, topic=TOPIC, member_ids=_new_ids(21))
+        await run(svc, queue=queue)
+        await propose(ledger, topic=TOPIC, member_ids=_new_ids(21), run_id='run-p2')
+
+        await run(svc, queue=queue, run_id='run-exec-2')
+
+        (esc,) = _pending(queue)
+        assert esc.dedupe_count == 1
+
+    @pytest.mark.asyncio
+    async def test_the_streak_escape_files_a_separate_blocking_record(self, ledger, queue):
+        svc = FakeMemoryService(
+            ledger, consolidation_auto=enabled_config(refusal_streak_threshold=2),
+        )
+        for n in range(3):
+            await propose(ledger, topic=TOPIC, member_ids=_new_ids(21), run_id=f'run-p{n}')
+            await run(svc, queue=queue, run_id=f'run-exec-{n}')
+
+        records = _pending(queue)
+        assert sorted(e.severity for e in records) == ['blocking', 'info']
+
+    @pytest.mark.asyncio
+    async def test_an_addressed_row_between_refusals_resets_the_streak(self, ledger, queue):
+        svc = FakeMemoryService(
+            ledger, consolidation_auto=enabled_config(refusal_streak_threshold=1),
+        )
+        await propose(ledger, topic=TOPIC, member_ids=_new_ids(21), run_id='run-p0')
+        await run(svc, queue=queue, run_id='run-exec-0')
+        await propose(ledger, topic=TOPIC, member_ids=_new_ids(3), run_id='run-p1')
+        addressed = await _row(ledger, run_id='run-p1')
+        await record_outcome(
+            ledger,
+            addressed,
+            ProposalOutcome(
+                state=ProposalState.ADDRESSED, acted_run_id='x', acted_at=NOW.isoformat(),
+            ),
+        )
+        await propose(ledger, topic=TOPIC, member_ids=_new_ids(21), run_id='run-p2')
+
+        await run(svc, queue=queue, run_id='run-exec-2')
+
+        assert [e.severity for e in _pending(queue)] == ['info']
+
+    @pytest.mark.asyncio
+    async def test_an_undecodable_row_is_refused(self, svc, ledger, queue):
+        await ledger.upsert(
+            ReconLedgerRecord(
+                project_id=PROJECT_ID,
+                record_kind=RECORD_KIND_CONSOLIDATION_PROPOSAL,
+                flag_type=TOPIC,
+                run_id='run-p1',
+                payload_json='not json',
+                state='proposed',
+                created_at=NOW.isoformat(),
+                expires_at='2099-01-01T00:00:00+00:00',
+            ),
+        )
+
+        report = await run(svc, queue=queue)
+
+        assert (await _row(ledger)).state == 'refused'
+        assert report.stats['auto_consolidation_refusals'] == {'proposal_undecodable': 1}
+        (esc,) = _pending(queue)
+        assert esc.summary == f'{TOPIC}: proposal_undecodable'
+
+    @pytest.mark.asyncio
+    async def test_a_category_without_flood_weight_is_refused(self, svc, ledger, queue):
+        await propose(
+            ledger, topic=TOPIC, member_ids=svc.seed_many(3), category='temporal_facts',
+        )
+
+        report = await run(svc, queue=queue)
+
+        assert (await _row(ledger)).state == 'refused'
+        assert report.stats['auto_consolidation_refusals'] == {
+            'category_not_consolidatable': 1,
+        }
+        svc.get_memory_by_id.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_execution_refused_files_its_info_record(self, ledger, queue):
+        svc = FakeMemoryService(
+            ledger,
+            mem0_update=Mem0UpdateConfig(metadata_patch_allowed_agent_prefixes=['curator-']),
+        )
+        await propose(ledger, topic=TOPIC, member_ids=svc.seed_many(4))
+
+        await run(svc, queue=queue)
+
+        (esc,) = _pending(queue)
+        assert esc.severity == 'info'
+        assert esc.summary == f'{TOPIC}: execution_refused'
+
+    @pytest.mark.asyncio
+    async def test_no_queue_still_records_the_refusal(self, svc, ledger):
+        await propose(ledger, topic=TOPIC, member_ids=_new_ids(21))
+
+        report = await run(svc, queue=None)
+
+        assert (await _row(ledger)).state == 'refused'
+        assert report.stats['auto_consolidation_refusals'] == {'member_count_out_of_range': 1}
+
+
+class TestBacklog:
+    """PRD B9."""
+
+    def _svc(self, ledger):
+        return FakeMemoryService(
+            ledger,
+            consolidation_auto=enabled_config(
+                max_auto_per_cycle=1, max_gate_filings_per_cycle=0, backlog_multiplier=2,
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_tripped_backlog_executes_nothing_and_escalates_once(self, ledger, queue):
+        svc = self._svc(ledger)
+        topics = ['auto-topic-one', 'auto-topic-two', 'auto-topic-three']
+        for topic in topics:
+            await propose(ledger, topic=topic, member_ids=svc.seed_many(3))
+        taskmaster = FakeTaskBackend()
+
+        report = await run(svc, queue=queue, taskmaster=taskmaster)
+
+        svc.get_memory_by_id.assert_not_awaited()
+        svc.count_memories_by_metadata.assert_not_awaited()
+        assert taskmaster.calls == []
+        for topic in topics:
+            assert (await _row(ledger, topic=topic)).state == 'proposed'
+        (esc,) = _pending(queue, BACKLOG_CATEGORY)
+        assert esc.severity == 'info'
+        assert report.stats['auto_consolidation_backlog_tripped'] is True
+        assert report.stats['auto_consolidation_unexecuted'] == 3
+        assert report.stats['auto_consolidation_applied_cap'] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_second_tripped_cycle_folds(self, ledger, queue):
+        svc = self._svc(ledger)
+        for topic in ['auto-topic-one', 'auto-topic-two', 'auto-topic-three']:
+            await propose(ledger, topic=topic, member_ids=svc.seed_many(3))
+
+        await run(svc, queue=queue)
+        await run(svc, queue=queue, run_id='run-exec-2')
+
+        (esc,) = _pending(queue, BACKLOG_CATEGORY)
+        assert esc.dedupe_count == 1
+
+
+class TestRowSelection:
+    @pytest.mark.asyncio
+    async def test_an_older_row_for_the_same_topic_is_superseded(self, svc, ledger, queue):
+        await propose(
+            ledger,
+            topic=TOPIC,
+            member_ids=svc.seed_many(3),
+            run_id='run-r1',
+            now=PROPOSED_AT - timedelta(hours=1),
+        )
+        await propose(ledger, topic=TOPIC, member_ids=svc.seed_many(3), run_id='run-r2')
+
+        report = await run(svc, queue=queue)
+
+        assert (await _row(ledger, run_id='run-r1')).state == 'superseded'
+        assert (await _row(ledger, run_id='run-r2')).state == 'addressed'
+        assert report.stats['auto_consolidation_proposals_superseded'] == 1
+
+    @pytest.mark.asyncio
+    async def test_an_expired_row_is_neither_evaluated_nor_rewritten(self, svc, ledger, queue):
+        members = svc.seed_many(3)
+        await propose(ledger, topic=TOPIC, member_ids=members, ttl_hours=1)
+        before = await _row(ledger)
+
+        report = await run(svc, queue=queue)
+
+        assert await _row(ledger) == before
+        svc.get_memory_by_id.assert_not_awaited()
+        assert report.stats['auto_consolidation_proposals_expired'] == 1
+
+
+class TestVocabulary:
+    def test_every_filed_category_is_registered(self):
+        server = pytest.importorskip('escalation.server')
+        assert REFUSED_CATEGORY in server.CATEGORIES
+        assert BACKLOG_CATEGORY in server.CATEGORIES
