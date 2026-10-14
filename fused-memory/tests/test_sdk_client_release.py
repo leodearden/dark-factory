@@ -18,6 +18,8 @@ from _fm_helpers import (
     reap_leaked_async_httpx_clients,
     track_async_httpx_clients,
 )
+from _mock_openai_server import mock_openai_server
+from _sdk_client_stubs import completion_client
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
@@ -33,6 +35,8 @@ from fused_memory.backends.graphiti_client import (
 from fused_memory.backends.llm_clients import TokenRecordingOpenAIGenericClient
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
 from fused_memory.middleware.task_curator import TaskCurator
+from fused_memory.routing.classifier import WriteClassifier
+from fused_memory.routing.router import ReadRouter
 
 _LIFECYCLE_LOGGER = 'fused_memory.backends.sdk_client_lifecycle'
 
@@ -218,3 +222,55 @@ class TestTaskCuratorCloseReleasesEmbedder:
         await curator._get_embedder()
         await curator.close()
         await curator.close()
+
+
+_ROUTER_ANSWER = '{"query_type":"broad","stores":["graphiti","mem0"],"primary_store":"graphiti"}'
+_CLASSIFIER_ANSWER = '{"primary":"observations_and_summaries","confidence":0.9,"reasoning":"x"}'
+
+_ROUTING_OWNERS = [
+    pytest.param(ReadRouter, lambda owner: owner.route('anything'), _ROUTER_ANSWER, id='router'),
+    pytest.param(
+        WriteClassifier, lambda owner: owner.classify('anything'), _CLASSIFIER_ANSWER,
+        id='classifier',
+    ),
+]
+
+
+class TestRoutingClientsClose:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('owner_cls', 'ask', 'answer'), _ROUTING_OWNERS)
+    async def test_the_pooled_client_is_released(
+        self, mock_config, monkeypatch, owner_cls, ask, answer,
+    ):
+        mock_config.routing.use_heuristics = False
+        mock_config.routing.llm_fallback = True
+        owner = owner_cls(mock_config)
+        with mock_openai_server() as server:
+            monkeypatch.setenv('OPENAI_BASE_URL', server.base_url)
+            server.chat_content = answer
+            await _start_census()
+            await ask(owner)
+
+            assert len(server.requests_to('/chat/completions')) == 1
+            built = _leaked_async_httpx_clients()
+            assert len(built) == 1
+
+            await owner.close()
+
+        assert _leaked_async_httpx_clients() == []
+        await owner.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('owner_cls', [ReadRouter, WriteClassifier])
+    async def test_close_on_a_never_used_owner_is_a_no_op(self, mock_config, owner_cls):
+        owner = owner_cls(mock_config)
+        await owner.close()
+        await owner.close()
+
+    @pytest.mark.asyncio
+    async def test_an_injected_classifier_client_is_owned_and_released(self, mock_config):
+        client = completion_client('{}')
+
+        await WriteClassifier(mock_config, openai_client=client).close()
+
+        client.close.assert_awaited_once()

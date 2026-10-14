@@ -3181,6 +3181,18 @@ class TestClose:
         mock_journal.close.assert_called_once()
         mock_buffer.close.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_close_closes_router_and_classifier(self, service):
+        service.graphiti.close = AsyncMock()
+        service.mem0.close = AsyncMock()
+        service.router.close = AsyncMock()
+        service.classifier.close = AsyncMock()
+
+        await service.close()
+
+        service.router.close.assert_awaited_once()
+        service.classifier.close.assert_awaited_once()
+
 
 # The logger MemoryService.close() reports sub-close failures on. Single-sourced
 # so the caplog LEVEL scope (`at_level(logger=...)`) and the record FILTER below
