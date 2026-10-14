@@ -127,6 +127,23 @@ class TestConstructorInjectedHooksFire:
             'Suppressed write must not record a blocked transition'
         )
 
+    def test_blocked_writes_suppressed_reports_the_callback(self):
+        """The suppression is observable as a query, not only as a silent no-op."""
+        config = OrchestratorConfig(max_per_module=1)
+        suppress = Mock(return_value=True)
+        suppressing = Scheduler(
+            config, callbacks=SchedulerCallbacks(suppress_blocked_write=suppress),
+        )
+        not_suppressing = Scheduler(
+            config,
+            callbacks=SchedulerCallbacks(suppress_blocked_write=Mock(return_value=False)),
+        )
+
+        assert suppressing.blocked_writes_suppressed('T1') is True
+        suppress.assert_called_once_with('T1')
+        assert not_suppressing.blocked_writes_suppressed('T1') is False
+        assert Scheduler(config).blocked_writes_suppressed('T1') is False
+
     @pytest.mark.asyncio
     async def test_on_starvation_warn_fires(self):
         """A constructor-injected on_starvation_warn fires once both gates cross."""
@@ -452,3 +469,20 @@ class TestSchedulerFacadeProtocol:
         from orchestrator.scheduler import SchedulerFacade
 
         assert isinstance(Scheduler(OrchestratorConfig()), SchedulerFacade)
+
+    @pytest.mark.asyncio
+    async def test_fake_scheduler_absorbs_only_the_suppressed_blocked_write(self):
+        """FakeScheduler models Scheduler.set_task_status's Table-B guard: a
+        suppressed task's 'blocked' write is absorbed, its other writes land,
+        and the query reports the suppression."""
+        from _workflow_helpers import FakeScheduler
+
+        scheduler = FakeScheduler()
+        scheduler.blocked_write_suppressed_ids = {'T1'}
+
+        await scheduler.set_task_status('T1', 'blocked')
+        assert scheduler.statuses.get('T1') is None
+        await scheduler.set_task_status('T1', 'pending')
+        assert scheduler.statuses['T1'] == ['pending']
+        assert scheduler.blocked_writes_suppressed('T1') is True
+        assert scheduler.blocked_writes_suppressed('T2') is False
