@@ -9,6 +9,8 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from shared.cli_invoke import no_mcp_servers_config
+
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.artifacts import TaskArtifacts
 
@@ -566,6 +568,9 @@ async def _assess_task(
         max_budget_usd=5.0,
         max_turns=3,
         output_schema=ASSESSOR_SCHEMA,
+        # No MCP, strictly: see evals/judge.py::run_judge (task 4757).
+        mcp_config=no_mcp_servers_config(),
+        strict_mcp_config=True,
     )
 
     try:
@@ -690,6 +695,8 @@ async def compare_models(
             max_budget_usd=5.0,
             max_turns=3,
             output_schema=SYNTHESIZER_SCHEMA,
+            mcp_config=no_mcp_servers_config(),
+            strict_mcp_config=True,
         )
 
         try:
