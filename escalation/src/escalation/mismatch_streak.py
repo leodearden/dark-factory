@@ -82,6 +82,17 @@ class MismatchStreak:
         self._bursts: KeyedStormCounters[Path] = KeyedStormCounters()
         self._lock = threading.Lock()
 
+    @property
+    def tracked_roots(self) -> frozenset[Path]:
+        """The resolved roots currently counted.
+
+        Public for the reason ``shared.boundary_storm_escape::BoundaryStormEscape.tracked_keys``
+        is: the roots are caller-supplied, so forgetting the dormant ones is
+        this object's memory bound and belongs in its interface.
+        """
+        with self._lock:
+            return self._bursts.tracked_keys
+
     def record_mismatch(self, identity: StoreIdentity, asserted_root: str, refusal: str) -> bool:
         """Count one refusal of *asserted_root*; True iff this call fired."""
         resolved = Path(asserted_root).resolve()

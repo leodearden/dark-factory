@@ -165,6 +165,20 @@ class TestWindow:
 
         assert streak.record_mismatch(project_identity, str(other), REFUSAL) is True
 
+    def test_a_root_with_no_refusal_left_in_the_window_is_forgotten(
+        self, tmp_path: Path, queue: EscalationQueue, project_identity: StoreIdentity,
+    ) -> None:
+        clock = _Clock()
+        streak = MismatchStreak(queue, threshold=3, window_seconds=WINDOW, time_provider=clock)
+        stale, live = tmp_path / 'stale', tmp_path / 'live'
+        streak.record_mismatch(project_identity, str(stale), REFUSAL)
+        assert streak.tracked_roots == {stale.resolve()}
+
+        clock.now = WINDOW * 2
+        streak.record_mismatch(project_identity, str(live), REFUSAL)
+
+        assert streak.tracked_roots == {live.resolve()}
+
 
 class TestReArm:
     def test_the_rest_of_a_burst_inside_the_window_does_not_refile(
