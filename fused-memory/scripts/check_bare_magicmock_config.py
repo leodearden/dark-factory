@@ -618,7 +618,6 @@ def _dataclass_double_violation(
 _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     # orchestrator/tests
     'orchestrator/tests/test_merge_queue_concurrent_verify.py': 85,
-    'orchestrator/tests/test_concurrent_verify_boundary.py': 44,
     'orchestrator/tests/test_merge_queue_lifecycle_registry.py': 30,
     'orchestrator/tests/test_coalesce_integration_gate.py': 12,
     'orchestrator/tests/test_merge_queue_request_liveness.py': 10,
