@@ -139,9 +139,10 @@ async def _wait_until(predicate, *, what: str, timeout: float = 10.0) -> None:
     """Poll *predicate* until true, or fail after *timeout* REAL seconds.
 
     A running worker drives its loops off the injected clock, whose sleep()
-    advances fake time instead of waiting, so the observable being waited for
-    normally lands within a few event-loop iterations. The wall-clock
-    deadline is only a backstop against a wedged loop.
+    charges the full period while waiting at most ``FakeClock.sleep_cap`` of
+    real time, so the observable being waited for normally lands within a
+    few such polls. The
+    wall-clock deadline is only a backstop against a wedged loop.
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -712,8 +713,9 @@ class TestHeartbeatLoopReapWiring:
     ``run()``/``stop()`` pair with a ``FakeClock`` injected, because the
     loop measures BOTH its poll period (``_HEARTBEAT_POLL_S``) and the
     reap's rate limit against ``self._clock``: a clock whose ``sleep()``
-    advances time instead of waiting makes a 30s poll and a 300s reap
-    interval elapse immediately, so neither needs shrinking.
+    charges the full period while waiting at most ``FakeClock.sleep_cap`` of
+    real time makes a 30s poll and a 300s reap interval elapse in a few such
+    waits, so neither needs shrinking.
 
     test_running_worker_reaps_an_aged_orphan: RED until step-6 GREEN wires
     ``await self._maybe_reap_orphaned_merge_worktrees(self._clock.now())``
