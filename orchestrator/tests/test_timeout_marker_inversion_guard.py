@@ -172,7 +172,7 @@ _SPAWN_BUDGET_FIXTURE = '_within_spawn_budget'
 #: definition out of the tree and fails if the two disagree.  This map is a
 #: cache of those definitions, never a claim about them.
 _SANCTIONED_TIMEOUT_NAMES: dict[str, float] = {
-    'WHOLE_TREE_SCAN_TEST_TIMEOUT': 540.0,
+    'WHOLE_TREE_SCAN_TEST_TIMEOUT': 600.0,
     'HEAVY_BARRIER_TEST_TIMEOUT': 540.0,
     'PYTEST_TIMEOUT': 960.0,
     'VERIFY_CLI_PER_TEST_TIMEOUT': float(VERIFY_CLI_PER_TEST_TIMEOUT),

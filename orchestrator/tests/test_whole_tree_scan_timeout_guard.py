@@ -102,13 +102,14 @@ _TESTS_DIR = Path(__file__).resolve().parent
 _MIN_EXPECTED_TEST_FILES = 400
 _MIN_EXPECTED_SCANNERS = 10
 
-# Worst wall clock MEASURED for a member of this family under REAL load: task
-# 5442's full orchestrator suite under `-n auto` (32 workers), loadavg 89.5 ->
-# 67.7 with a mid-run peak of 365, put test_merge_lane_ratchet.py's
-# module-scoped fixture setup at 51.87s.  Task 5572's targeted re-measurement
-# (2026-10-08, worst 37.61s) did not exceed it, and the worst run is kept,
-# never the freshest.  Corpus: plans/pytest-per-test-timeout-measurement-2026-09-17.md.
-_MEASURED_UNDER_LOAD_WORST_CASE = 51.87
+# Worst wall clock MEASURED for a member of this family under REAL load: a
+# per-test TOTAL (setup + call + teardown, what a timeout mark bounds) of 73.47s
+# for test_timeout_marker_inversion_guard.py::
+# test_no_timeout_marker_sits_in_the_inversion_band, from task 5581's
+# orchestrator verify (2026-10-09, `-n 8`, loadavg 156 -> 64).  The worst run is
+# kept, never the freshest; a figure measured on code since replaced retires
+# with that code.  Corpus: plans/pytest-per-test-timeout-measurement-2026-09-17.md.
+_MEASURED_UNDER_LOAD_WORST_CASE = 73.47
 
 # ABSOLUTE floor in seconds: the measured worst case above times
 # UNDER_LOAD_HEADROOM_FACTOR, rounded up to a whole minute.  Deliberately
