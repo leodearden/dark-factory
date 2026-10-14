@@ -2891,6 +2891,27 @@ PHANTOM_MISSING_IMPORTS = _unresolved_import_lines(
     'pytest', 'pydantic', 'aiosqlite', 'openai', 'qdrant_client'
 )
 
+# pyright errors from rules other than reportMissingImports: branch defects.
+OTHER_PYRIGHT_RULES_OUTPUT = (
+    '  /repo/src/a.py:3:9 - error: Argument of type "int" cannot be '
+    'assigned to parameter "x" (reportArgumentType)\n'
+    '  /repo/src/b.py:4:9 - error: Cannot access attribute "foo" for '
+    'class "Bar" (reportAttributeAccessIssue)\n'
+    '  /repo/src/c.py:5:9 - error: "baz" is not a known attribute of '
+    'module "qux" (reportAttributeAccessIssue)\n'
+    '  /repo/src/d.py:6:9 - error: Expression of type "None" is '
+    'incompatible (reportAssignmentType)\n'
+    '  /repo/src/e.py:7:9 - error: No overloads for "get" match '
+    '(reportCallIssue)\n'
+)
+
+NON_PYRIGHT_TEXTS = [
+    'Traceback (most recent call last):\n  File "t.py", line 1\nImportError: x\n',
+    'src/a.py:1:1: F401 [*] `os` imported but unused\nFound 1 error.\n',
+    'error: could not compile `foo` (lib) due to 1 previous error\n',
+    '\x00\x01 not even text — Import " could not be resolved (\n',
+]
+
 
 class TestInterpreterMissingWorkspacePackages:
     """Pins ``is_interpreter_missing_workspace_packages`` — task 3367 / esc-3359-1.
@@ -2962,29 +2983,11 @@ class TestInterpreterMissingWorkspacePackages:
 
     def test_other_pyright_rules_are_not_environmental(self) -> None:
         """Only reportMissingImports counts — other pyright rules are branch defects."""
-        other_rules = (
-            '  /repo/src/a.py:3:9 - error: Argument of type "int" cannot be '
-            'assigned to parameter "x" (reportArgumentType)\n'
-            '  /repo/src/b.py:4:9 - error: Cannot access attribute "foo" for '
-            'class "Bar" (reportAttributeAccessIssue)\n'
-            '  /repo/src/c.py:5:9 - error: "baz" is not a known attribute of '
-            'module "qux" (reportAttributeAccessIssue)\n'
-            '  /repo/src/d.py:6:9 - error: Expression of type "None" is '
-            'incompatible (reportAssignmentType)\n'
-            '  /repo/src/e.py:7:9 - error: No overloads for "get" match '
-            '(reportCallIssue)\n'
+        assert not verify_classify.is_interpreter_missing_workspace_packages(
+            OTHER_PYRIGHT_RULES_OUTPUT
         )
-        assert not verify_classify.is_interpreter_missing_workspace_packages(other_rules)
 
-    @pytest.mark.parametrize(
-        'text',
-        [
-            'Traceback (most recent call last):\n  File "t.py", line 1\nImportError: x\n',
-            'src/a.py:1:1: F401 [*] `os` imported but unused\nFound 1 error.\n',
-            'error: could not compile `foo` (lib) due to 1 previous error\n',
-            '\x00\x01 not even text — Import " could not be resolved (\n',
-        ],
-    )
+    @pytest.mark.parametrize('text', NON_PYRIGHT_TEXTS)
     def test_arbitrary_non_pyright_text_returns_false_without_raising(
         self, text: str
     ) -> None:
@@ -3057,6 +3060,79 @@ class TestInterpreterMisresolutionClassifiesEnvTransient:
         member is introduced; ENV_TRANSIENT already carries precisely this policy.
         """
         assert FailureCategory.ENV_TRANSIENT in INFRA_TRANSIENT_CATEGORIES
+
+
+# ---------------------------------------------------------------------------
+# task 6127: a partially provisioned cold .venv (esc-6021-3)
+# ---------------------------------------------------------------------------
+
+# Mirrors the measured 6021 attempt-1 laptop type log (task 6127; the log was
+# since pruned from data/verify-logs): 164 reportMissingImports over seven
+# top-level modules, pytest NOT among them, plus consequential non-import errors.
+PARTIALLY_PROVISIONED_TYPE_OUTPUT = (
+    _unresolved_import_lines(
+        'graphiti_core.driver.falkordb_driver', 'graphiti_core', 'qdrant_client.models',
+        'openai', 'falkordb.asyncio', 'mem0', 'anthropic', 'redis',
+    )
+    + '\n'
+    + '  /repo/src/fused_memory/backends/mem0_client.py:9:18 - error: "AsyncMemory" '
+    'is unknown import symbol (reportAttributeAccessIssue)\n'
+    + '171 errors, 1 warning, 0 informations\n'
+)
+
+
+class TestPartiallyProvisionedVenvTypeFailure:
+    """Pins ``is_partially_provisioned_venv_type_failure`` — task 6127.
+
+    pyright read a cold ``.venv`` that was still being populated: pytest
+    resolved, member-specific third-party packages did not.  A passing test
+    leg in the same run is the corroboration that the dependency set is fine.
+    """
+
+    def test_measured_shape_with_passing_test_leg_is_partially_provisioned_venv(self) -> None:
+        assert verify_classify.is_partially_provisioned_venv_type_failure(
+            PARTIALLY_PROVISIONED_TYPE_OUTPUT, test_leg_passed=True,
+        )
+
+    def test_same_output_without_test_corroboration_is_not(self) -> None:
+        """A failed test leg gives no runtime proof that the packages import."""
+        assert not verify_classify.is_partially_provisioned_venv_type_failure(
+            PARTIALLY_PROVISIONED_TYPE_OUTPUT, test_leg_passed=False,
+        )
+
+    def test_measured_shape_escapes_the_3367_interpreter_predicate(self) -> None:
+        """Why task 3367 missed it: the pytest sentinel resolved."""
+        assert not verify_classify.is_interpreter_missing_workspace_packages(
+            PARTIALLY_PROVISIONED_TYPE_OUTPUT
+        )
+        assert 'pytest' not in verify_classify.unresolved_top_level_modules(
+            PARTIALLY_PROVISIONED_TYPE_OUTPUT
+        )
+
+    def test_single_genuine_missing_import_with_passing_tests_is_not(self) -> None:
+        assert not verify_classify.is_partially_provisioned_venv_type_failure(
+            _unresolved_import_lines('brand_new_lib'), test_leg_passed=True,
+        )
+
+    def test_floor_is_the_shared_distinct_module_floor(self) -> None:
+        four = ('graphiti_core', 'qdrant_client', 'openai', 'falkordb')
+        assert not verify_classify.is_partially_provisioned_venv_type_failure(
+            _unresolved_import_lines(*four), test_leg_passed=True,
+        )
+        assert verify_classify.is_partially_provisioned_venv_type_failure(
+            _unresolved_import_lines(*four, 'mem0'), test_leg_passed=True,
+        )
+
+    def test_other_pyright_rules_only_is_not(self) -> None:
+        assert not verify_classify.is_partially_provisioned_venv_type_failure(
+            OTHER_PYRIGHT_RULES_OUTPUT, test_leg_passed=True,
+        )
+
+    @pytest.mark.parametrize('text', [*NON_PYRIGHT_TEXTS, ''])
+    def test_arbitrary_non_pyright_text_returns_false_without_raising(self, text: str) -> None:
+        assert verify_classify.is_partially_provisioned_venv_type_failure(
+            text, test_leg_passed=True,
+        ) is False
 
 
 # ---------------------------------------------------------------------------
