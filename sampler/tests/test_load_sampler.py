@@ -558,13 +558,25 @@ class TestMainDegradesEachGroupIndependently:
         )
         assert store.should_vacuum(tick_ts + 86400) is True
 
-    def test_main_runs_the_live_table_by_default(self):
-        """The systemd ExecStart path calls main() with no argument."""
-        import inspect
+    def test_a_bare_main_call_ticks_every_live_group(
+        self, monkeypatch, tmp_path: Path, caplog
+    ):
+        """The systemd ExecStart path calls main() with no argument.
 
+        The live collectors degrade to {} rather than raising, so this runs on
+        any host: what it pins is that the bare call collects the live table
+        and writes a tick to the store under DARK_FACTORY_ROOT.
+        """
         import sampler.__main__ as entry
 
-        assert inspect.signature(entry.main).parameters['groups'].default is METRIC_GROUPS
+        monkeypatch.setenv('DARK_FACTORY_ROOT', str(tmp_path))
+        with caplog.at_level(logging.INFO):
+            entry.main()
+
+        assert (tmp_path / 'data/load-samples.db').exists()
+        (line,) = _tick_lines(caplog)
+        for group in METRIC_GROUPS:
+            assert f'{group.name}=' in line, line
 
 
 class TestTheTickLogLine:
