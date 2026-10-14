@@ -1015,6 +1015,72 @@ class TestStateMachineLegalityAndConsistency:
             esc.category for esc in queue.get_by_task(workflow.task_id, status='pending')
         ] == ['bypass_done']
 
+    @pytest.mark.parametrize('site', ['architect', 'simple'])
+    async def test_row6_plan_phase_exit_meeting_a_cancelled_row_ends_the_run(
+        self, config, git_ops, task_assignment, monkeypatch, caplog, site,
+    ):
+        """The task is cancelled while its planning agent runs, so the agent's
+        unactionable_task exit meets a cancelled row and reports CANCELLED.
+
+        Neither dispatch site may read CANCELLED as "keep going": the plan
+        site must not fall through toward EXECUTE, and the simple-task site
+        must not mistake it for its REQUEUED fall-through sentinel and head
+        for an architect.  Either move leaves the absorbing CANCELLED state,
+        which crashes the run.
+        """
+        from orchestrator.scheduler import TerminalExitRejection
+
+        if site == 'simple':
+            task_assignment = replace(task_assignment, task={
+                **task_assignment.task, 'metadata': {'complexity': 'simple'},
+            })
+        workflow, scheduler = _build_workflow(
+            config, git_ops, task_assignment, AgentStub(),
+        )
+        record_write = scheduler.set_task_status
+
+        async def _cancelled_row_refuses_the_park(
+            task_id: str, status: str, **kwargs,
+        ):
+            if status != 'blocked':
+                await record_write(task_id, status, **kwargs)
+                return
+            await record_write(task_id, 'cancelled')
+            raise TerminalExitRejection(
+                task_id, old_status='cancelled', target_status=status,
+                raw='terminal-exit gate',
+            )
+
+        dispatched: list[Path] = []
+
+        async def _agent_reports_unactionable(*, cwd: Path, **kwargs) -> AgentResult:
+            dispatched.append(cwd)
+            TaskArtifacts(
+                cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name),
+            ).write_unactionable_task(reason='the spec contradicts itself', evidence='ev')
+            return AgentResult(success=True, output='', cost_usd=0.5)
+
+        monkeypatch.setattr(scheduler, 'set_task_status', _cancelled_row_refuses_the_park)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', _agent_reports_unactionable)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
+        )
+        caplog.set_level(logging.WARNING, logger=_EXIT_CONTRACT_LOGGER)
+        caplog.set_level(logging.ERROR, logger='orchestrator.workflow')
+
+        report = await workflow.run()
+
+        assert report.outcome == WorkflowOutcome.CANCELLED
+        assert report.phase == workflow.machine.state == WorkflowState.CANCELLED
+        assert scheduler.statuses[workflow.task_id][-1] == 'cancelled'
+        assert _exit_contract_records(caplog, 'violation') == []
+        assert [
+            r.getMessage() for r in caplog.records
+            if r.name == 'orchestrator.workflow' and r.levelno >= logging.ERROR
+        ] == []
+        assert len(dispatched) == 1, 'only the reporting agent may be paid for'
+
     async def test_row6_none_status_does_not_crash_normal_run(
         self, config, git_ops, task_assignment, monkeypatch,
     ):

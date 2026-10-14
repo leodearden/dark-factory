@@ -1238,7 +1238,7 @@
     "orchestrator/tests/test_workflow_merge_superseded.py": {"patch_targets": [], "private_reads": 2},
     "orchestrator/tests/test_workflow_merge_thrash.py": {"patch_targets": [], "private_reads": 65},
     "orchestrator/tests/test_workflow_preexisting_main_break.py": {"patch_targets": [], "private_reads": 18},
-    "orchestrator/tests/test_workflow_ready_to_merge.py": {"patch_targets": [], "private_reads": 35},
+    "orchestrator/tests/test_workflow_ready_to_merge.py": {"patch_targets": [], "private_reads": 32},
     "orchestrator/tests/test_workflow_sandbox_events.py": {"patch_targets": [], "private_reads": 6},
     "orchestrator/tests/test_workflow_signature_loop_guard.py": {"patch_targets": [], "private_reads": 12},
     "orchestrator/tests/test_workflow_skew_surfacing.py": {"patch_targets": ["enqueue_merge_request"], "private_reads": 17},

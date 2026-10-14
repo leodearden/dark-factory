@@ -1084,50 +1084,6 @@ class TestReadyToMergeDispatch:
         f.wf._execute_iterations.assert_not_called()
         assert f.merge_queue.empty()
 
-    @pytest.mark.parametrize('site', ['architect', 'simple'])
-    async def test_a_cancelled_exit_from_the_handler_ends_the_run(
-        self, tmp_path: Path, site: str,
-    ):
-        """A handler that finds the row cancelled ends ``run()`` CANCELLED.
-
-        Neither dispatch site may read CANCELLED as "keep going": the plan
-        site must not fall through toward EXECUTE, and the simple-task site
-        must not mistake it for its REQUEUED fall-through sentinel and pay
-        for an architect.
-        """
-        from shared.cli_invoke import AgentResult
-
-        f = _make(
-            tmp_path=tmp_path,
-            metadata={'complexity': 'simple'} if site == 'simple' else {},
-        )
-        f.wf.config.simple_task_enabled = True
-
-        async def _observes_a_cancelled_row() -> WorkflowOutcome:
-            return f.wf._observed_terminal_outcome('cancelled')
-
-        ready_to_merge = AsyncMock(side_effect=_observes_a_cancelled_row)
-        f.wf._handle_ready_to_merge_report = ready_to_merge  # type: ignore[method-assign]
-
-        def _invoke_writes_ready_to_merge(*args, **kwargs):
-            # run() re-homes the artifacts, so write where the workflow reads.
-            assert f.wf.artifacts is not None
-            f.wf.artifacts.write_ready_to_merge(commit=_TIP, evidence='ev')
-            return AgentResult(success=True, output='', cost_usd=0.5, turns=3)
-
-        invoke = AsyncMock(side_effect=_invoke_writes_ready_to_merge)
-        f.wf._invoke = invoke  # type: ignore[method-assign]
-        f.wf.briefing.build_architect_prompt = AsyncMock(return_value='P')
-        f.wf.briefing.build_simple_task_prompt = AsyncMock(return_value='P')
-
-        outcome = (await f.wf.run()).outcome
-
-        assert outcome == WorkflowOutcome.CANCELLED
-        ready_to_merge.assert_awaited_once()
-        # The agent that reported is the only one paid for: no architect after
-        # SIMPLE_TASK, and no implementer after the architect.
-        invoke.assert_awaited_once()
-
 
 # ---------------------------------------------------------------------------
 # TestOnArchitectMergeDoneDeliveredChecksGuard (task 3057 — step-9 RED /

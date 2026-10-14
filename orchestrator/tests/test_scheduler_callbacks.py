@@ -12,6 +12,8 @@ Covers:
       all-``None`` ``SchedulerCallbacks`` so bare-Scheduler unit tests are
       unaffected).
   (c) Constructor-injected hooks actually FIRE on their triggers.
+  (d) ``_workflow_helpers.FakeScheduler`` models (c)'s blocked-write
+      suppression.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ import time
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from _workflow_helpers import FakeScheduler
 
 from orchestrator.config import OrchestratorConfig, StarvationWatchdogConfig
 from orchestrator.scheduler import Scheduler, SchedulerCallbacks
@@ -194,6 +197,24 @@ class TestConstructorInjectedHooksFire:
         spy.assert_called_once()
         call_args = spy.call_args
         assert call_args.args[0] == 'starved'
+
+
+class TestFakeSchedulerModelsTheBlockedWriteSuppression:
+    """(d) The ``_workflow_helpers.FakeScheduler`` double keeps step with
+    (c)'s suppression, so workflow suites that drive a Table-B teardown
+    through it see what the real Scheduler would do."""
+
+    @pytest.mark.asyncio
+    async def test_absorbs_only_the_suppressed_blocked_write(self):
+        scheduler = FakeScheduler()
+        scheduler.blocked_write_suppressed_ids = {'T1'}
+
+        await scheduler.set_task_status('T1', 'blocked')
+        assert scheduler.statuses.get('T1') is None
+        await scheduler.set_task_status('T1', 'pending')
+        assert scheduler.statuses['T1'] == ['pending']
+        assert scheduler.blocked_writes_suppressed('T1') is True
+        assert scheduler.blocked_writes_suppressed('T2') is False
 
 
 class TestLivenessAccessors:
@@ -469,20 +490,3 @@ class TestSchedulerFacadeProtocol:
         from orchestrator.scheduler import SchedulerFacade
 
         assert isinstance(Scheduler(OrchestratorConfig()), SchedulerFacade)
-
-    @pytest.mark.asyncio
-    async def test_fake_scheduler_absorbs_only_the_suppressed_blocked_write(self):
-        """FakeScheduler models Scheduler.set_task_status's Table-B guard: a
-        suppressed task's 'blocked' write is absorbed, its other writes land,
-        and the query reports the suppression."""
-        from _workflow_helpers import FakeScheduler
-
-        scheduler = FakeScheduler()
-        scheduler.blocked_write_suppressed_ids = {'T1'}
-
-        await scheduler.set_task_status('T1', 'blocked')
-        assert scheduler.statuses.get('T1') is None
-        await scheduler.set_task_status('T1', 'pending')
-        assert scheduler.statuses['T1'] == ['pending']
-        assert scheduler.blocked_writes_suppressed('T1') is True
-        assert scheduler.blocked_writes_suppressed('T2') is False
