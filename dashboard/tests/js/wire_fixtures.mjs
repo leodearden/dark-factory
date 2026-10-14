@@ -90,6 +90,41 @@ export function burndownBlock(vocab, sampleCount, parity) {
   };
 }
 
+// One open escalation, as data/escalation_analytics.py::_lifespan_block lists
+// it. `pinnedTaskIds` is the escalation server's pins annotation: omit it for a
+// record whose annotation is unknown, and the item carries neither pins key;
+// otherwise pins_recovery is whether it pins any task, derived as the server
+// derives it.
+export function openEscalationItem({ id, taskId, level = 1, ageSecs = 3600, breach6h = false, pinnedTaskIds }) {
+  const item = { id, task_id: taskId, level, age_secs: ageSecs, breach_6h: breach6h };
+  if (pinnedTaskIds === undefined) return item;
+  return { ...item, pins_recovery: pinnedTaskIds.length > 0, pins_recovery_task_ids: pinnedTaskIds };
+}
+
+// The ESCALATION_ANALYTICS payload, one per_project entry per
+// `{project, openItems}`. Each lifespan block lists only its open items; the
+// origin, workflow and terminal blocks are empty, so their panels render their
+// empty states.
+export function escalationAnalytics(projects) {
+  return {
+    generated_at: WIRE_AS_OF,
+    parse_failures: 0,
+    regime_markers: [],
+    per_project: projects.map(({ project, openItems }) => ({
+      project,
+      origin: {},
+      lifespan: {
+        percentiles_by_level: {},
+        l1_to_l2_promotion: { count: 0, p50_secs: null, p90_secs: null },
+        samples: [],
+        open_items: openItems,
+      },
+      workflow: {},
+      terminal: {},
+    })),
+  };
+}
+
 // One ORCHESTRATORS row, as /orchestrators serves it.
 export function orchestratorRow({ pid, project, running }) {
   return { pid, project, running };
