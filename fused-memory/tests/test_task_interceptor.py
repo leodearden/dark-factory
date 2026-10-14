@@ -3291,7 +3291,11 @@ async def test_done_gate_does_not_fire_for_non_done_transitions(
 
     for status in ('blocked', 'cancelled', 'deferred'):
         taskmaster.set_task_status.reset_mock()
-        result = await interceptor.set_task_status('5', status, '/project')
+        deferral = (
+            {'kind': 'until_condition', 'condition': 'done gate non-done transitions'}
+            if status == 'deferred' else None
+        )
+        result = await interceptor.set_task_status('5', status, '/project', deferral=deferral)
         assert 'error' not in result, f'gate should not fire on {status}'
         taskmaster.set_task_status.assert_called_once()
 

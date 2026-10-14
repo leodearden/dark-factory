@@ -31,6 +31,7 @@ except ImportError:
     AllAccountsCappedException = _UnavailableAllAccountsCapped  # type: ignore[assignment,misc]
 
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
+from shared import process_identity
 from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
@@ -46,12 +47,13 @@ from fused_memory.backends.task_backend_errors import (
 )
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.config.schema import CuratorConfig
-from fused_memory.middleware import recon_write_policy
+from fused_memory.middleware import deferral_gate, recon_write_policy
 from fused_memory.middleware.curator_zot_duplicate_sweep import (
     CorpusSearcher,
     build_duplicate_metadata,
     sweep_zot_duplicate,
 )
+from fused_memory.middleware.deferral_gate import StatusWriteScope
 from fused_memory.middleware.done_provenance_authz import (
     DETERMINISTIC_CALLER_ERROR_TYPE,
     DETERMINISTIC_PROVENANCE_KINDS,
@@ -506,8 +508,11 @@ class TaskInterceptor:
         scope_violation_escalator: ScopeViolationEscalator | None = None,
         path_scope_adjudicator: 'PathScopeAdjudicator | None' = None,
         curator: TaskCurator | None = None,
+        proc_root: Path = process_identity.PROC_ROOT,
     ):
         self.taskmaster = taskmaster
+        # Where the deferral gate reads a held_by_session holder's /proc entries.
+        self._proc_root = proc_root
         self.reconciler = targeted_reconciler
         self.buffer = event_buffer
         # WP-B: when an event queue is wired in, journalling is fire-and-forget
@@ -1209,6 +1214,10 @@ class TaskInterceptor:
         heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
         agent_id: str | None = None,
         client_op_id: str | None = None,
+        deferral: dict | None = None,
+        expected_stamped_at: str | None = None,
+        restamp_only: bool = False,
+        scope: StatusWriteScope = StatusWriteScope.STATUS,
     ) -> dict:
         """Proxy to Taskmaster, then fire-and-forget targeted reconciliation if triggered.
 
@@ -1236,12 +1245,35 @@ class TaskInterceptor:
         (whole-call, covering both the CSV and single-id branches) and skips the
         transition. It is NOT threaded into ``_apply_status_transition`` — dedup
         is a public-method concern only. Absent a key behavior is unchanged.
+
+        ``deferral``, ``expected_stamped_at`` and ``restamp_only`` are the
+        metadata.deferral arguments of the MCP tool; ``scope`` is internal,
+        passed only by ``commit_planning``. ``deferral_gate`` decides them:
+        its row-independent checks run once here, before the write lock.
         """
         if (hit := await self._idempotency_replay(client_op_id)) is not None:
             return hit
         if err := await self._backlog_gate(project_root):
             return err
-        await self._ensure_taskmaster()
+        tm = await self._ensure_taskmaster()
+        deferral_call = await deferral_gate.corroborate(
+            task_id=task_id,
+            status=status,
+            raw_deferral=deferral,
+            expected_stamped_at=expected_stamped_at,
+            restamp_only=restamp_only,
+            scope=scope,
+            read_task=lambda carrier_id: tm.get_task(carrier_id, project_root, tag),
+            proc_root=self._proc_root,
+            now=datetime.now(UTC),
+        )
+        if isinstance(deferral_call, deferral_gate.DeferralInvalidRefusal):
+            return await self._journal_deferral_refusal(
+                deferral_call,
+                project_root,
+                {'task_id': task_id, 'status': status, 'tag': tag},
+                agent_id,
+            )
 
         if ',' in task_id:
             ids = [t.strip() for t in task_id.split(',') if t.strip()]
@@ -1272,6 +1304,7 @@ class TaskInterceptor:
                     heartbeat_at=heartbeat_at,
                     agent_id=agent_id,
                     pending_since_now=batch_pending_since,
+                    deferral_call=deferral_call,
                 )
                 results.append({'task_id': tid, 'result': per_result})
             all_ok = all(
@@ -1292,9 +1325,28 @@ class TaskInterceptor:
             claimant_run_id=claimant_run_id,
             heartbeat_at=heartbeat_at,
             agent_id=agent_id,
+            deferral_call=deferral_call,
         )
         await self._idempotency_record(client_op_id, 'set_task_status', result)
         return result
+
+    async def _journal_deferral_refusal(
+        self,
+        refusal: deferral_gate.GateRefusal,
+        project_root: str,
+        params: dict[str, Any],
+        agent_id: str | None,
+    ) -> dict:
+        """Journal a deferral refusal as a ``success=False`` row and return its wire dict."""
+        await self._log_write_op_row(
+            'set_task_status',
+            project_root,
+            params,
+            agent_id=agent_id,
+            success=False,
+            error=refusal.journal_text(),
+        )
+        return refusal.to_error_dict()
 
     async def _apply_status_transition(
         self,
@@ -1309,6 +1361,7 @@ class TaskInterceptor:
         heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
         agent_id: str | None = None,
         pending_since_now: str | None = None,
+        deferral_call: deferral_gate.DeferralCall,
     ) -> dict:
         """Single-id status transition with all gates + event emission.
 
@@ -1465,6 +1518,19 @@ class TaskInterceptor:
             if status == 'done':
                 _journal_params['done_provenance_kind'] = _provenance_kind(done_provenance)
                 _journal_agent_id = agent_id
+
+            deferral_write = deferral_gate.plan(
+                old_status=old_status,
+                stored_metadata=before.get('metadata') if isinstance(before, dict) else None,
+                status=status,
+                call=deferral_call,
+                task_id=task_id,
+                agent_id=agent_id,
+            )
+            if not isinstance(deferral_write, deferral_gate.DeferralWrite):
+                return await self._journal_deferral_refusal(
+                    deferral_write, project_root, _journal_params, agent_id,
+                )
 
             if status == old_status:
                 if status == 'done' and done_provenance:
