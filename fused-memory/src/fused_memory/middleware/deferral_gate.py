@@ -27,6 +27,7 @@ from shared.task_deferral import (
     HeldBySessionRequest,
     InvalidRecord,
     LegacyUnknownRequest,
+    PlanningDeferral,
     parse_record,
     parse_request,
     parse_utc_timestamp,
@@ -52,6 +53,7 @@ __all__ = [
     'StatusWriteScope',
     'corroborate',
     'plan',
+    'planning_birth_record',
     'read_holder',
 ]
 
@@ -386,6 +388,19 @@ def _cas_refusal(
     )
 
 
+def _not_planning_refusal(stored: _StoredRecord, task_id: str) -> DeferralInvalidRefusal | None:
+    """commit_planning releases only a planning hold or an unrecorded one (decision 3)."""
+    if stored.parsed is None or isinstance(stored.parsed, PlanningDeferral):
+        return None
+    held_by = (
+        stored.parsed.detail if isinstance(stored.parsed, InvalidRecord)
+        else stored.parsed.kind.value
+    )
+    return DeferralInvalidRefusal(
+        task_id, DeferralInvalidReason.NOT_PLANNING_HOLD, 'deferral.kind', held_by,
+    )
+
+
 def _needs_request(old_status: str, call: DeferralCall) -> bool:
     return (
         old_status != DEFERRED
@@ -428,8 +443,13 @@ def plan(
     request = call.request
     if status == DEFERRED and request is None and _needs_request(old_status, call):
         return DeferralRequiredRefusal(task_id, old_status)
+    leaving = old_status == DEFERRED and status != DEFERRED
+    if leaving and call.scope is StatusWriteScope.COMMIT_PLANNING:
+        not_planning = _not_planning_refusal(stored, task_id)
+        if not_planning is not None:
+            return not_planning
     if request is None:
-        return _exit(stored) if old_status == DEFERRED and status != DEFERRED else NO_WRITE
+        return _exit(stored) if leaving else NO_WRITE
     refusal = _kind_refusal(request, old_status=old_status, stored=stored, task_id=task_id)
     if refusal is not None:
         return refusal
@@ -455,6 +475,13 @@ def _exit(stored: _StoredRecord) -> DeferralWrite:
     return DeferralWrite(
         clear_keys=frozenset({'deferral'}) if stored.present else frozenset(),
         event_fields={'deferral_cleared': stored.raw},
+    )
+
+
+def planning_birth_record(*, stamped_by: str | None, now: datetime) -> dict[str, Any]:
+    """The record a planning_mode birth carries: the gate writes every server-side record."""
+    return record_to_json(
+        PlanningDeferral(deferred_at=now, stamped_at=now, stamped_by=stamped_by),
     )
 
 

@@ -40,6 +40,7 @@ from shared.task_transitions import derive_actor_class, is_legal_transition
 
 from fused_memory.backends.sqlite_task_backend import task_timestamp_now
 from fused_memory.backends.task_backend_errors import (
+    DeferralWriteAuthorityError,
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
     LeakedEnvelopeMarkupError,
@@ -3939,6 +3940,8 @@ class TaskInterceptor:
             return err
 
         metadata = kwargs.pop('metadata', None)
+        if 'deferral' in (coerce_task_metadata(metadata) or {}):
+            return DeferralWriteAuthorityError(None).to_error_dict()
 
         # Inject the override reason into task metadata (both the normal ticket
         # path and the planning_mode path benefit from this placement).  When no
@@ -4027,7 +4030,8 @@ class TaskInterceptor:
         Skips the ticket store, the per-project curator queue, and the curator
         LLM round-trip entirely.  Persists ``human_decomposed=True`` in task
         metadata as a forensic marker so future curator hooks on status
-        transitions can defensively skip these tasks.
+        transitions can defensively skip these tasks, and the ``planning``
+        deferral record attributed to the submitter.
 
         Returns ``{'task_id', 'status', 'planning_mode'}`` synchronously.
         """
@@ -4056,6 +4060,9 @@ class TaskInterceptor:
                 'error_type': 'ValidationError',
             }
         normalized_metadata['human_decomposed'] = True
+        normalized_metadata['deferral'] = deferral_gate.planning_birth_record(
+            stamped_by=attribution.agent_id, now=datetime.now(UTC),
+        )
         try:
             metadata_json = json.dumps(normalized_metadata)
         except (TypeError, ValueError) as exc:

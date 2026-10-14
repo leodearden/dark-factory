@@ -12035,7 +12035,7 @@ async def test_planning_mode_persists_human_decomposed_metadata(
     interceptor_facade,
     taskmaster,
 ):
-    """planning_mode injects human_decomposed=True into the metadata sent to tm.add_task."""
+    """planning_mode injects human_decomposed=True and the planning deferral record."""
     await interceptor_facade.submit_task(
         '/project',
         title='X',
@@ -12043,7 +12043,9 @@ async def test_planning_mode_persists_human_decomposed_metadata(
     )
     metadata_arg = taskmaster.add_task.call_args.kwargs.get('metadata')
     assert metadata_arg is not None
-    assert json.loads(metadata_arg) == {'human_decomposed': True}
+    decoded = json.loads(metadata_arg)
+    assert decoded.pop('deferral')['kind'] == 'planning'
+    assert decoded == {'human_decomposed': True}
 
 
 @pytest.mark.asyncio
@@ -12059,6 +12061,7 @@ async def test_planning_mode_merges_caller_metadata(
         metadata={'source': 'planning-session', 'files': ['m1', 'm2']},
     )
     decoded = json.loads(taskmaster.add_task.call_args.kwargs['metadata'])
+    assert decoded.pop('deferral')['kind'] == 'planning'
     assert decoded == {
         'source': 'planning-session',
         'files': ['m1', 'm2'],
@@ -12079,6 +12082,7 @@ async def test_planning_mode_accepts_metadata_json_string(
         metadata='{"escalation_id": "esc-1"}',
     )
     decoded = json.loads(taskmaster.add_task.call_args.kwargs['metadata'])
+    assert decoded.pop('deferral')['kind'] == 'planning'
     assert decoded == {'escalation_id': 'esc-1', 'human_decomposed': True}
 
 
