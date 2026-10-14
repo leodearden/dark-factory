@@ -61,6 +61,8 @@ def fit_at_word(text: str, limit: int) -> str:
 
     The cut backs up to the last word boundary unless that would keep half the budget or less.
     """
+    if limit <= 0:
+        raise ValueError(f'fit_at_word limit must be positive, got {limit!r}')
     if len(text) <= limit:
         return text
     budget = limit - 1

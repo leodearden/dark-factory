@@ -142,6 +142,13 @@ def test_fit_at_word_never_exceeds_the_limit_and_marks_exactly_the_cut_text(text
     assert result.endswith('…') == (len(text) > limit)
 
 
+@pytest.mark.parametrize('limit', [0, -1])
+@pytest.mark.parametrize('text', ['', 'N' * 600], ids=['empty', 'over'])
+def test_fit_at_word_rejects_a_non_positive_limit(text, limit):
+    with pytest.raises(ValueError, match='limit'):
+        fit_at_word(text, limit)
+
+
 def test_truncation_fields_serializes_only_the_present_facts_in_order():
     cut_a = clip_text('abcdef', 2, field='a')
     whole = clip_text('ab', 2, field='b')
