@@ -511,6 +511,10 @@ PINNED_SITES: dict[str, tuple[tuple[str, ...], str]] = {
         ("SUBMIT_TERMINAL", "SUBMIT_NON_TERMINAL", "TERMINAL_STATES"),
         "poll terminal set, submit terminal + non-terminal sets",
     ),
+    "skills/_shared/merge-status-reasons.md": (
+        ("EPISTEMIC_STATES",),
+        "the epistemic-state list the shared merge_status reason switch opens with",
+    ),
 }
 
 # Files inside the scan's domain that enumerate a deliberately NARROWED subset of a
