@@ -475,6 +475,52 @@ async def test_update_task_replace_retires_a_key_on_a_done_task_across_surfaces(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('payload', 'received'),
+    [('not json{', 'invalid_json'), ('"bare"', 'string'), ('7', 'number')],
+)
+async def test_update_task_non_object_metadata_rejection_byte_identical_across_surfaces(
+    real_task_stack, tmp_path, payload, received,
+):
+    """A metadata payload that is not a JSON object is refused with the same
+    canonical dict through the MCP tool and the interceptor, and the stored
+    blob, done_provenance included, is left untouched (task 6130).
+
+    The payloads are ones FastMCP's argument pre-parse hands to the tool body
+    as strings: it decodes '[]' to a list, which fails argument validation
+    before the tool runs, and 'null' to an absent metadata argument."""
+    from fused_memory.backends.task_backend_errors import metadata_not_an_object_error
+    from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
+
+    server, interceptor = real_task_stack
+    root = str(tmp_path)
+    await interceptor.taskmaster.add_task(
+        project_root=root, title='T',
+        metadata=json.dumps({
+            'done_provenance': {'kind': 'merged', 'commit': 'a' * 40},
+            'files': ['x.py'],
+        }),
+    )
+    before = (await interceptor.get_task('1', root))['metadata']
+
+    dict_tools = await server._tool_manager.call_tool(
+        'update_task', {'id': '1', 'project_root': root, 'metadata': payload},
+    )
+    dict_interceptor = await interceptor.update_task(
+        '1', root, metadata=payload, metadata_mode='replace',
+    )
+
+    expected = metadata_not_an_object_error('1', received)
+    assert dict_tools == expected, f'tools.py surface diverged from canonical shape: {dict_tools}'
+    assert dict_interceptor == expected, (
+        f'interceptor surface diverged from canonical shape: {dict_interceptor}'
+    )
+    assert interceptor_write_succeeded(dict_tools) is False
+    assert interceptor_write_succeeded(dict_interceptor) is False
+    assert (await interceptor.get_task('1', root))['metadata'] == before
+
+
+@pytest.mark.asyncio
 async def test_update_task_allows_unrelated_metadata(
     mcp_server_with_tasks, task_interceptor,
 ):
