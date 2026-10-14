@@ -2,26 +2,32 @@
 
 Recon Stage 1 emits a proposal through ``server/tools.py::propose_consolidation``
 and the auto-consolidation executor reads it back. Both go through this module,
-so the row's identity, payload keys and states have one home: the executor
-lists rows with ``ReconLedgerStore.list_by_kind(project_id,
-RECORD_KIND_CONSOLIDATION_PROPOSAL, ProposalState.PROPOSED)`` and decodes each
-with :func:`from_ledger_record`, rather than growing a second reader.
+so the row's identity, payload keys, lifecycle states, recorded outcome and the
+pure readers over a topic's rows (:func:`refusal_streak`,
+:func:`newest_per_topic`) have one home: the executor lists rows with
+``ReconLedgerStore.list_by_kind(project_id, RECORD_KIND_CONSOLIDATION_PROPOSAL,
+ProposalState.PROPOSED)``, decodes each with :func:`from_ledger_record`, and
+moves it on with :func:`record_outcome`, rather than growing a second reader.
 
 Clock-injected like :mod:`fused_memory.reconciliation.recon_ledger`: the
-builder takes ``now`` rather than reading a clock. ``rationale`` and
+builder takes ``now`` and an outcome carries a caller-supplied ``acted_at``
+rather than reading a clock. ``rationale`` and
 ``seeded_from`` are reviewer-facing and never reach canonical text (PRD D2);
 only ``claim`` does.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
 from fused_memory.models.reconciliation import StageId
+from fused_memory.reconciliation.consolidation_auto import AutoOutcome
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 
 RECORD_KIND_CONSOLIDATION_PROPOSAL = 'consolidation_proposal'
@@ -33,6 +39,12 @@ PROPOSER_AGENT_ID = f'recon-stage-{StageId.memory_consolidator.value}'
 
 class ProposalState(StrEnum):
     PROPOSED = 'proposed'
+    ADDRESSED = 'addressed'
+    DRY_RUN = 'dry_run'
+    REFUSED = 'refused'
+    GATED = 'gated'
+    SUPERSEDED = 'superseded'
+    REVERTED = 'reverted'
 
 
 _MEMBER_IDS_KEY = 'member_ids'
@@ -40,6 +52,7 @@ _CATEGORY_KEY = 'category'
 _CLAIM_KEY = 'claim'
 _RATIONALE_KEY = 'rationale'
 _SEEDED_FROM_KEY = 'seeded_from'
+_OUTCOME_KEY = 'outcome'
 
 
 @dataclass(frozen=True)
@@ -122,12 +135,7 @@ def from_ledger_record(record: ReconLedgerRecord) -> ConsolidationProposal:
         raise ValueError(
             f'record_kind {record.record_kind!r} is not {RECORD_KIND_CONSOLIDATION_PROPOSAL!r}'
         )
-    try:
-        payload = json.loads(record.payload_json)
-    except ValueError as exc:
-        raise ValueError(f'payload_json is not JSON: {record.payload_json[:200]!r}') from exc
-    if not isinstance(payload, dict):
-        raise ValueError(f'payload_json is not a JSON object: {record.payload_json[:200]!r}')
+    payload = _payload_object(record)
 
     member_ids = payload.get(_MEMBER_IDS_KEY)
     if not isinstance(member_ids, list) or not all(isinstance(m, str) for m in member_ids):
@@ -153,3 +161,170 @@ def _payload_str(payload: dict[str, Any], key: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f'payload {key!r} is not a string: {value!r}')
     return value
+
+
+@dataclass(frozen=True)
+class ProposalOutcome:
+    """What code did with one proposal row, stored on the row itself.
+
+    An outcome that touched the corpus (``executed``) is the authoritative
+    record of the run and the source a reversal reads, so its row never expires.
+    """
+
+    state: ProposalState
+    acted_run_id: str
+    acted_at: str
+    verdict: AutoOutcome | None = None
+    reason_codes: tuple[str, ...] = ()
+    predicate_version: str | None = None
+    canonical_id: str | None = None
+    canonical_minted: bool = False
+    tagged_ids: tuple[str, ...] = ()
+    tag_failure_ids: tuple[str, ...] = ()
+    stripped_ids: tuple[str, ...] = ()
+    gate_task_id: str | None = None
+    closure_codes: tuple[str, ...] = ()
+
+    @property
+    def executed(self) -> bool:
+        return (
+            self.state in (ProposalState.ADDRESSED, ProposalState.GATED)
+            and self.canonical_id is not None
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            'state': self.state.value,
+            'acted_run_id': self.acted_run_id,
+            'acted_at': self.acted_at,
+            'verdict': None if self.verdict is None else self.verdict.value,
+            'reason_codes': list(self.reason_codes),
+            'predicate_version': self.predicate_version,
+            'canonical_id': self.canonical_id,
+            'canonical_minted': self.canonical_minted,
+            'tagged_ids': list(self.tagged_ids),
+            'tag_failure_ids': list(self.tag_failure_ids),
+            'stripped_ids': list(self.stripped_ids),
+            'gate_task_id': self.gate_task_id,
+            'closure_codes': list(self.closure_codes),
+        }
+
+    @classmethod
+    def from_payload(cls, payload: object) -> ProposalOutcome:
+        """Decode :meth:`to_payload`'s shape; ``ValueError`` naming any bad field."""
+        if not isinstance(payload, dict):
+            raise ValueError(f'outcome is not a JSON object: {payload!r}')
+        verdict = _optional_str(payload, 'verdict')
+        canonical_minted = payload.get('canonical_minted')
+        if not isinstance(canonical_minted, bool):
+            raise ValueError(f'outcome canonical_minted is not a bool: {canonical_minted!r}')
+        return cls(
+            state=ProposalState(_payload_str(payload, 'state')),
+            acted_run_id=_payload_str(payload, 'acted_run_id'),
+            acted_at=_payload_str(payload, 'acted_at'),
+            verdict=None if verdict is None else AutoOutcome(verdict),
+            reason_codes=_str_tuple(payload, 'reason_codes'),
+            predicate_version=_optional_str(payload, 'predicate_version'),
+            canonical_id=_optional_str(payload, 'canonical_id'),
+            canonical_minted=canonical_minted,
+            tagged_ids=_str_tuple(payload, 'tagged_ids'),
+            tag_failure_ids=_str_tuple(payload, 'tag_failure_ids'),
+            stripped_ids=_str_tuple(payload, 'stripped_ids'),
+            gate_task_id=_optional_str(payload, 'gate_task_id'),
+            closure_codes=_str_tuple(payload, 'closure_codes'),
+        )
+
+
+async def record_outcome(
+    ledger: ReconLedgerStore,
+    record: ReconLedgerRecord,
+    outcome: ProposalOutcome,
+) -> bool:
+    """Move *record* to ``outcome.state`` with *outcome* on its payload.
+
+    A compare-and-set on the state *record* was read in: ``False`` (and no
+    write) if the stored row has moved since. The proposal's own payload keys
+    are kept, so :func:`from_ledger_record` still decodes the row. An executed
+    outcome drops ``expires_at`` so ``ReconLedgerStore.gc`` never reaps it.
+    """
+    if outcome.state is ProposalState.PROPOSED:
+        raise ValueError('an outcome cannot move a row back to proposed')
+    payload = _payload_object(record)
+    payload[_OUTCOME_KEY] = outcome.to_payload()
+    moved = dataclasses.replace(
+        record,
+        state=outcome.state.value,
+        payload_json=json.dumps(payload),
+        expires_at=None if outcome.executed else record.expires_at,
+    )
+    return await ledger.upsert_if_state(moved, existing_state=record.state)
+
+
+def outcome_from_record(record: ReconLedgerRecord) -> ProposalOutcome | None:
+    """The outcome :func:`record_outcome` stored on *record*, or ``None`` if never acted on."""
+    payload = _payload_object(record)
+    if _OUTCOME_KEY not in payload:
+        return None
+    return ProposalOutcome.from_payload(payload[_OUTCOME_KEY])
+
+
+def refusal_streak(rows: Iterable[ReconLedgerRecord]) -> int:
+    """Count the trailing ``refused`` rows of one topic, in the given order.
+
+    ``proposed`` rows (not yet acted on) and ``superseded`` rows (never
+    evaluated) neither count nor break the streak; any other acted state
+    resets it.
+    """
+    streak = 0
+    for row in rows:
+        state = ProposalState(row.state)
+        if state in (ProposalState.PROPOSED, ProposalState.SUPERSEDED):
+            continue
+        streak = streak + 1 if state is ProposalState.REFUSED else 0
+    return streak
+
+
+def newest_per_topic(
+    records: Sequence[ReconLedgerRecord],
+) -> tuple[tuple[ReconLedgerRecord, ...], tuple[ReconLedgerRecord, ...]]:
+    """Split *records* into the newest row per topic and the rest.
+
+    Newest is the greatest ``(created_at, run_id)``. Both returned tuples keep
+    input order.
+    """
+    newest: dict[str, ReconLedgerRecord] = {}
+    for record in records:
+        incumbent = newest.get(record.flag_type)
+        if incumbent is None or (record.created_at, record.run_id) > (
+            incumbent.created_at,
+            incumbent.run_id,
+        ):
+            newest[record.flag_type] = record
+    kept = set(map(id, newest.values()))
+    keep = tuple(r for r in records if id(r) in kept)
+    superseded = tuple(r for r in records if id(r) not in kept)
+    return keep, superseded
+
+
+def _payload_object(record: ReconLedgerRecord) -> dict[str, Any]:
+    try:
+        payload = json.loads(record.payload_json)
+    except ValueError as exc:
+        raise ValueError(f'payload_json is not JSON: {record.payload_json[:200]!r}') from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f'payload_json is not a JSON object: {record.payload_json[:200]!r}')
+    return payload
+
+
+def _optional_str(payload: dict[str, Any], key: str) -> str | None:
+    value = payload.get(key)
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f'payload {key!r} is not a string or null: {value!r}')
+    return value
+
+
+def _str_tuple(payload: dict[str, Any], key: str) -> tuple[str, ...]:
+    value = payload.get(key)
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise ValueError(f'payload {key!r} is not a list of strings: {value!r}')
+    return tuple(value)
