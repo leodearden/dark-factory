@@ -815,7 +815,9 @@ async def run_architect_eval(
     isolation + token savings). The architect runs with THIS candidate's
     model/backend/effort/env_overrides, not the hardcoded opus-high the
     implementer path pins. Its prompt ends with the replay frame, and the cell
-    is stamped ``replay_frame`` (docs/eval-replay-frame.md).
+    is stamped ``replay_frame`` (docs/eval-replay-frame.md). The architect
+    reaches plan-tools and no other MCP server (:func:`architect_eval_mcp_scope`);
+    ``evals/profile.py::EVAL_PROFILE`` documents the workflow-path counterpart.
 
     The produced plan is scored two ways: :func:`judge_plan_quality` (the LLM
     judge, against the REAL landed reference diff

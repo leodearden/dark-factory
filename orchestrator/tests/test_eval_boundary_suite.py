@@ -1,6 +1,6 @@
-"""Phase-1 eval↔production integration gate — boundary suite B1–B9 (+ capstone).
+"""Phase-1 eval↔production integration gate — boundary suite B1–B10 (+ capstone).
 
-PRD eval-framework-revival §ι, Contract H, Boundary-test sketch B1–B9.
+PRD eval-framework-revival §ι, Contract H, Boundary-test sketch B1–B10.
 
 This is the "C-as-integration-gate" for the eval-framework-revival PRD: the
 two-way eval↔production seam test proving that the mechanisms delivered by the
@@ -16,6 +16,7 @@ REAL composed eval code paths against one refreshed fixture:
   - ``workflow._spawn_dry_run_unblock`` disabled early-return               (D4)
   - ``workflow.build_workflow`` single construction point               (α/P2)
   - ``metrics.compute_composite`` contract-agnostic scoring            (P4/B8)
+  - ``runner.architect_eval_mcp_scope`` / ``TaskWorkflow._invoke`` strict guard (B10)
 
 Each B# faces BOTH sides of its seam: the production default AND the eval-side
 divergence, so the test proves the profile actually flips the behaviour rather
@@ -32,6 +33,7 @@ B# → mechanism map
   B7  no unblock spawn    ``_spawn_dry_run_unblock`` spawns 0 tasks with ``unblock_auto`` off
   B8  contract-agnostic   ``quality_from_review_artifact`` scores legacy == envelope shape
   B9  no claimant spam    a real eval ``Scheduler`` heartbeat logs zero warnings
+  B10 mcp isolation       eval agents run ``--strict-mcp-config``; the architect reaches only plan-tools
 
 Why this suite is deterministic and CI-runnable (design decision)
 -----------------------------------------------------------------
@@ -267,8 +269,8 @@ def test_b1_eval_profile_divergence_parity_and_tripwire(
 
     Exactness holds by construction: ``apply_eval_profile`` is a
     ``model_copy(update=)`` that changes exactly the profile leaves, and β
-    proves all 6 differ from their code defaults, so the divergence is
-    precisely the 6 documented keys — never more (a leak) or fewer (a no-op).
+    proves all 7 differ from their code defaults, so the divergence is
+    precisely the 7 documented keys — never more (a leak) or fewer (a no-op).
     """
     base = _load_default_config(tmp_path)
 
