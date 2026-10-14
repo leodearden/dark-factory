@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 // browser global at load; its window assignment is typeof-guarded).
 import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
 
-import { loadDataJs } from './_data_loader.mjs';
+import { loadDataJs, quietly } from './_data_loader.mjs';
 import {
   COSTS_PATH,
   CURATOR_PATH,
@@ -268,13 +268,7 @@ test('receipts: a FAILED refresh leaves the receipt alone, so the tiles keep age
     await api.refreshOne(CURATOR_PATH, {}, state, { fetchImpl: okResponse({}), now: () => 100 });
     const afterSuccess = win.DF_DATA.__receipt[CURATOR_PATH];
 
-    const originalWarn = console.warn;
-    console.warn = () => {};
-    try {
-      await api.refreshOne(CURATOR_PATH, {}, state, { fetchImpl, now: () => 900 });
-    } finally {
-      console.warn = originalWarn;
-    }
+    await quietly(() => api.refreshOne(CURATOR_PATH, {}, state, { fetchImpl, now: () => 900 }));
 
     assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH], afterSuccess, 'the receipt advanced on a failure');
     assert.equal(win.DF_DATA.__receipt[CURATOR_PATH].receivedAt, 100);
@@ -297,13 +291,7 @@ test('receipts: a FAILED refresh keeps the WINDOW echo describing the values sti
     });
     const before = JSON.stringify(win.DF_DATA.__receipt[COSTS_PATH]);
 
-    const originalWarn = console.warn;
-    console.warn = () => {};
-    try {
-      await api.refreshOne(COSTS_PATH, {}, state, { fetchImpl, now: () => 900 });
-    } finally {
-      console.warn = originalWarn;
-    }
+    await quietly(() => api.refreshOne(COSTS_PATH, {}, state, { fetchImpl, now: () => 900 }));
 
     assert.equal(JSON.stringify(win.DF_DATA.__receipt[COSTS_PATH]), before, 'a failed refresh relabelled the window');
     assert.deepEqual(win.DF_DATA.__receipt[COSTS_PATH].window, echo);
@@ -322,16 +310,10 @@ test('receipts: __stale still advances on failure — the two maps are not one',
   const state = api.createPollState();
   await api.refreshOne(CURATOR_PATH, {}, state, { fetchImpl: okResponse({}), now: () => 100 });
 
-  const originalWarn = console.warn;
-  console.warn = () => {};
-  try {
-    await api.refreshOne(CURATOR_PATH, {}, state, {
-      fetchImpl: () => Promise.reject(new Error('boom')),
-      now: () => 900,
-    });
-  } finally {
-    console.warn = originalWarn;
-  }
+  await quietly(() => api.refreshOne(CURATOR_PATH, {}, state, {
+    fetchImpl: () => Promise.reject(new Error('boom')),
+    now: () => 900,
+  }));
 
   assert.equal(win.DF_DATA.__stale[CURATOR_PATH].failures, 1);
   assert.equal(win.DF_DATA.__receipt[CURATOR_PATH].receivedAt, 100);

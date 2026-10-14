@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { loadDataJs } from './_data_loader.mjs';
+import { loadDataJs, warningsFrom } from './_data_loader.mjs';
 import {
   CURATOR_PATH,
   DATUM_SPEC,
@@ -55,16 +55,11 @@ test('preserved behaviour: a thrown fetch error keeps the prior DF_DATA value an
   const { api, window: win } = loadDataJs();
   win.DF_DATA.CURATOR_STATE = { marker: 'prior-throw' };
 
-  const originalWarn = console.warn;
-  const warnCalls = [];
-  console.warn = (...args) => warnCalls.push(args);
-  try {
-    const state = api.createPollState();
-    const deps = { fetchImpl: () => Promise.reject(new Error('boom')), now: () => 0 };
-    await api.refreshOne(CURATOR_PATH, { CURATOR_STATE: PLAIN_SPEC }, state, deps);
-  } finally {
-    console.warn = originalWarn;
-  }
+  const state = api.createPollState();
+  const deps = { fetchImpl: () => Promise.reject(new Error('boom')), now: () => 0 };
+  const warnCalls = await warningsFrom(() =>
+    api.refreshOne(CURATOR_PATH, { CURATOR_STATE: PLAIN_SPEC }, state, deps),
+  );
 
   assert.deepEqual(
     win.DF_DATA.CURATOR_STATE,
@@ -215,22 +210,11 @@ test('applyKey: a datum-kinded payload is stored as a COPY carrying its receipt'
   assert.equal(win.DF_DATA.__loaded[SYNTHETIC_DATUM_KEY], true);
 });
 
-// Runs *fn* with console.warn captured, and hands back what it said. Every
-// refusal below is EXPECTED to warn, so the capture keeps the suite's output
-// readable — and makes the warning itself assertable rather than mere noise.
-function warningsFrom(fn) {
-  const original = console.warn;
-  const calls = [];
-  console.warn = (...args) => calls.push(args);
-  try {
-    fn();
-  } finally {
-    console.warn = original;
-  }
-  return calls;
-}
+// Every refusal below is EXPECTED to warn, so each one runs inside
+// warningsFrom: the capture keeps the suite's output readable, and makes the
+// warning itself assertable rather than mere noise.
 
-test('applyKey: a datum-kinded payload that is NOT a Datum is refused, prior value kept', () => {
+test('applyKey: a datum-kinded payload that is NOT a Datum is refused, prior value kept', async () => {
   // The half that matters. A server regression that starts sending a bare
   // number where a Datum was declared must leave the last good envelope on
   // screen — with its age badge still growing — rather than replacing it with
@@ -241,19 +225,19 @@ test('applyKey: a datum-kinded payload that is NOT a Datum is refused, prior val
   const good = win.DF_DATA[SYNTHETIC_DATUM_KEY];
 
   for (const bad of [42, 'nine', [SERVED_DATUM], { value: 1, as_of: null, state: 'fresh', reason: null }]) {
-    warningsFrom(() => api.applyKey(SYNTHETIC_DATUM_KEY, bad, DATUM_SPEC, { servedAt: null, receivedAt: 2 }));
+    await warningsFrom(() => api.applyKey(SYNTHETIC_DATUM_KEY, bad, DATUM_SPEC, { servedAt: null, receivedAt: 2 }));
     assert.equal(win.DF_DATA[SYNTHETIC_DATUM_KEY], good, `a non-Datum (${JSON.stringify(bad)}) was applied`);
   }
 });
 
-test('applyKey: a refusal SAYS SO, naming the key', () => {
+test('applyKey: a refusal SAYS SO, naming the key', async () => {
   // Refusing in silence would make a schema break pixel-identical to a wedged
   // endpoint: in both cases the key's tiles simply keep ageing, and an operator
   // would diagnose a network outage for a server that is answering perfectly.
   // The value must still not be applied — only the diagnosis was missing.
   const { api, window: win } = loadDataJs();
 
-  const calls = warningsFrom(() =>
+  const calls = await warningsFrom(() =>
     api.applyKey(SYNTHETIC_DATUM_KEY, 42, DATUM_SPEC, { servedAt: null, receivedAt: 1 }),
   );
 
@@ -266,18 +250,18 @@ test('applyKey: a refusal SAYS SO, naming the key', () => {
   assert.equal(win.DF_DATA[SYNTHETIC_DATUM_KEY], undefined, 'the refused value must still not be applied');
 });
 
-test('applyKey: a plain-kinded key is never second-guessed, and never warns', () => {
+test('applyKey: a plain-kinded key is never second-guessed, and never warns', async () => {
   // The warning is scoped to a DECLARED datum row receiving a non-Datum. Every
   // polled key is plain, so a warn on the plain path would fire on every
   // healthy poll and train an operator to ignore it.
   const { api } = loadDataJs();
-  const calls = warningsFrom(() => api.applyKey('COSTS', 42, PLAIN_SPEC, { servedAt: null, receivedAt: 1 }));
+  const calls = await warningsFrom(() => api.applyKey('COSTS', 42, PLAIN_SPEC, { servedAt: null, receivedAt: 1 }));
   assert.deepEqual(calls, []);
 });
 
-test('applyKey: a refused datum payload does not flip the __loaded marker', () => {
+test('applyKey: a refused datum payload does not flip the __loaded marker', async () => {
   const { api, window: win } = loadDataJs();
-  warningsFrom(() => api.applyKey(SYNTHETIC_DATUM_KEY, 42, DATUM_SPEC, { servedAt: null, receivedAt: 1 }));
+  await warningsFrom(() => api.applyKey(SYNTHETIC_DATUM_KEY, 42, DATUM_SPEC, { servedAt: null, receivedAt: 1 }));
   assert.equal(win.DF_DATA.__loaded[SYNTHETIC_DATUM_KEY], undefined, '__loaded must mean a real value LANDED');
 });
 

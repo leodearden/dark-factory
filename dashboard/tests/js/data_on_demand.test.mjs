@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { loadDataJs, drain } from './_data_loader.mjs';
+import { loadDataJs, drain, quietly } from './_data_loader.mjs';
 import {
   CURATOR_PATH,
   PLAIN_SPEC,
@@ -211,16 +211,10 @@ test('on-demand: a failed request never escalates the polled tasks backoff', asy
   const { api, window: win } = loadDataJs();
   const state = api.createPollState();
 
-  const originalWarn = console.warn;
-  console.warn = () => {};
-  try {
-    await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
-      state,
-      deps: { fetchImpl: () => Promise.reject(new Error('boom')), now: () => 500 },
-    });
-  } finally {
-    console.warn = originalWarn;
-  }
+  await quietly(() => api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+    state,
+    deps: { fetchImpl: () => Promise.reject(new Error('boom')), now: () => 500 },
+  }));
 
   assert.equal(state.get(TERMINAL_STATE_KEY).failures, 1, "the request's own entry should count the failure");
   assert.equal(state.get(TASKS_PATH), undefined, 'a failed user action created backoff for the polled endpoint');
@@ -237,21 +231,15 @@ test('on-demand: a failed request leaves a previously applied terminal Datum unt
   });
   const good = win.DF_DATA[TERMINAL_KEY];
 
-  const originalWarn = console.warn;
-  console.warn = () => {};
-  try {
-    for (const fetchImpl of [
-      () => Promise.reject(new Error('boom')),
-      () => Promise.resolve({ ok: false, status: 503, json: async () => ({}) }),
-    ]) {
-      await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
-        state,
-        deps: { fetchImpl, now: () => 900, ignoreBackoff: true },
-      });
-      assert.equal(win.DF_DATA[TERMINAL_KEY], good, 'a failed retry replaced the last good Datum');
-    }
-  } finally {
-    console.warn = originalWarn;
+  for (const fetchImpl of [
+    () => Promise.reject(new Error('boom')),
+    () => Promise.resolve({ ok: false, status: 503, json: async () => ({}) }),
+  ]) {
+    await quietly(() => api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+      state,
+      deps: { fetchImpl, now: () => 900, ignoreBackoff: true },
+    }));
+    assert.equal(win.DF_DATA[TERMINAL_KEY], good, 'a failed retry replaced the last good Datum');
   }
 
   assert.equal(win.DF_DATA[TERMINAL_KEY]._received_at, 300, 'the stored Datum must keep ageing from its own receipt');
@@ -333,14 +321,9 @@ test('outcomes: a non-ok status and a thrown fetch both report `failed`', async 
     () => Promise.reject(new Error('boom')),
   ]) {
     const { api } = loadDataJs();
-    let outcome;
-    const original = console.warn;
-    console.warn = () => {};
-    try {
-      outcome = await api.refreshOne(CURATOR_PATH, {}, api.createPollState(), { fetchImpl, now: () => 1 });
-    } finally {
-      console.warn = original;
-    }
+    const outcome = await quietly(() =>
+      api.refreshOne(CURATOR_PATH, {}, api.createPollState(), { fetchImpl, now: () => 1 }),
+    );
     assert.equal(outcome, api.REFRESH_OUTCOMES.failed);
   }
 });
@@ -381,17 +364,10 @@ test('outcomes: requestOnDemand propagates refreshOne\'s answer verbatim', async
   });
   assert.equal(applied, api.REFRESH_OUTCOMES.applied);
 
-  const original = console.warn;
-  console.warn = () => {};
-  let failed;
-  try {
-    failed = await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
-      state: api.createPollState(),
-      deps: { fetchImpl: () => Promise.reject(new Error('boom')), now: () => 1 },
-    });
-  } finally {
-    console.warn = original;
-  }
+  const failed = await quietly(() => api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+    state: api.createPollState(),
+    deps: { fetchImpl: () => Promise.reject(new Error('boom')), now: () => 1 },
+  }));
   assert.equal(failed, api.REFRESH_OUTCOMES.failed);
 });
 
@@ -588,17 +564,10 @@ test('onDemandDatum: a failed refresh after a good one still shows the earlier D
   });
   const good = win.DF_DATA[TERMINAL_KEY];
 
-  const originalWarn = console.warn;
-  console.warn = () => {};
-  let outcome;
-  try {
-    outcome = await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
-      state,
-      deps: { fetchImpl: () => Promise.reject(new Error('boom')), now: () => 900, ignoreBackoff: true },
-    });
-  } finally {
-    console.warn = originalWarn;
-  }
+  const outcome = await quietly(() => api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+    state,
+    deps: { fetchImpl: () => Promise.reject(new Error('boom')), now: () => 900, ignoreBackoff: true },
+  }));
 
   assert.equal(outcome, api.REFRESH_OUTCOMES.failed);
   assert.deepEqual(api.onDemandDatum('terminal', TERMINAL_PROJECT, outcome), good);

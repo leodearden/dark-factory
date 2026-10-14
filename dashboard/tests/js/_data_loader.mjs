@@ -1,5 +1,6 @@
 // The data.js loader every data.js node suite shares: a fresh module per
-// call, against a shimmed browser-ish global, and a microtask drain.
+// call, against a shimmed browser-ish global, a microtask drain, and a
+// console.warn capture for the refreshes that warn by design.
 //
 // A helper module, not a test: the `*.test.mjs` glob skips it.
 //
@@ -93,4 +94,32 @@ export function loadDataJs({ fetchStub } = {}) {
 // completion before the next tick fires.
 export function drain() {
   return new Promise(resolve => setImmediate(resolve));
+}
+
+// Awaits *fn* with console.warn redirected to *sink*, and restores it however
+// fn ends. Awaiting is what lets one helper serve an async refresh as well as
+// a sync applyKey.
+async function withConsoleWarn(sink, fn) {
+  const original = console.warn;
+  console.warn = sink;
+  try {
+    return await fn();
+  } finally {
+    console.warn = original;
+  }
+}
+
+// Resolves to every console.warn call *fn* made, each as its argument list,
+// so a test can assert on the warning itself.
+export async function warningsFrom(fn) {
+  const calls = [];
+  await withConsoleWarn((...args) => calls.push(args), fn);
+  return calls;
+}
+
+// Resolves to *fn*'s result with its console.warn output dropped: for a test
+// that provokes a failure on purpose and asserts on something else, so the
+// expected warning does not bury the suite's output.
+export function quietly(fn) {
+  return withConsoleWarn(() => {}, fn);
 }
