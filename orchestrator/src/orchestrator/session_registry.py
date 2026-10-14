@@ -4229,9 +4229,11 @@ class ReapedLease:
     lease_name: the lease's identity, derived from the filename itself
         (the stem of *path*) -- never from the body, so a corrupt/missing
         body is still reapable.
-    reason: why it was reaped -- ``'stale_pid'`` (a parseable body that
-        _lease_is_stale judges stale) or ``'corrupt'`` (body
-        missing/unparseable and older than LEASE_HEARTBEAT_TTL).
+    reason: why it was reaped -- ``'stale_pid'`` (a parseable body whose
+        pid is not running), ``'shared_host'`` (a parseable body whose pid
+        is running but is a shared ``claude agents`` host, which cannot
+        vouch for its session) or ``'corrupt'`` (body missing/unparseable),
+        each once _lease_is_stale judges the lease stale.
     """
 
     path: Path
@@ -4256,7 +4258,8 @@ def reap_stale_leases(
     - lease body unreadable (missing or corrupt) and age >
       LEASE_HEARTBEAT_TTL -> reaped, reason='corrupt'.
     - a parseable body that _lease_is_stale judges stale -> reaped,
-      reason='stale_pid'.
+      reason='shared_host' when its pid is running (only a shared host's
+      running pid fails to vouch), else reason='stale_pid'.
     - otherwise -> kept -- in particular a LIVE holder pid that can vouch
       for its session is never reaped, regardless of heartbeat age (mirrors
       reap_stale_records' non-terminal live-pid rule).
@@ -4285,12 +4288,15 @@ def reap_stale_leases(
             holder = LeaseHolder.from_json(lease_path.read_text(encoding='utf-8'))
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
             holder = None
-        stale = _lease_is_stale(
-            holder,
-            holder_alive=holder is not None and _pid_alive(holder.pid),
-            age_secs=age_secs,
-        )
-        reason = None if not stale else ('corrupt' if holder is None else 'stale_pid')
+        holder_alive = holder is not None and _pid_alive(holder.pid)
+        if not _lease_is_stale(holder, holder_alive=holder_alive, age_secs=age_secs):
+            reason = None
+        elif holder is None:
+            reason = 'corrupt'
+        elif holder_alive:
+            reason = 'shared_host'
+        else:
+            reason = 'stale_pid'
 
         if reason is not None:
             try:

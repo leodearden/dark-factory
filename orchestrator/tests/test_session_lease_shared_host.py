@@ -59,6 +59,14 @@ def _await_host_argv(pid: int) -> None:
         time.sleep(0.01)
 
 
+@pytest.fixture
+def reaped_child_pid() -> int:
+    """The pid of a child that has exited and been reaped, so ``/proc/<pid>`` is gone."""
+    proc = subprocess.Popen([sys.executable, '-c', 'pass'])
+    proc.wait(timeout=10)
+    return proc.pid
+
+
 def _age(path: Path, seconds: float) -> None:
     t = time.time() - seconds
     os.utime(path, (t, t))
@@ -158,6 +166,13 @@ def test_a_non_host_session_is_unchanged(caplog: pytest.LogCaptureFixture) -> No
     assert sr.resolve_session_pid(env) == own
     assert _warnings(caplog) == []
     assert sr.default_lease_slug(_NAME, env) == f'{_NAME}-{own}'
+
+
+def test_a_dead_claude_pid_reads_as_a_plain_session_not_a_host(reaped_child_pid: int) -> None:
+    env = {'CLAUDE_PID': str(reaped_child_pid), 'CLAUDE_CODE_SESSION_ID': 'sess-a'}
+
+    assert sr.resolve_session_pid(env) == reaped_child_pid
+    assert sr.default_lease_slug(_NAME, env) == f'{_NAME}-{reaped_child_pid}'
 
 
 # --- lease verbs through the CLI ---------------------------------------------
@@ -319,9 +334,28 @@ def test_reap_stale_leases_removes_an_aged_legacy_host_pid_lease(
     _age(aged_lease, _PAST_TTL_SECS)
     _age(fresh_lease, 60)
 
-    assert [r.reason for r in sr.reap_stale_leases(root=tmp_path)] == ['stale_pid']
+    assert [r.reason for r in sr.reap_stale_leases(root=tmp_path)] == ['shared_host']
     assert not aged_lease.exists()
     assert fresh_lease.is_file()
+
+
+def test_a_dead_holder_pid_is_reclaimable_past_ttl_only_and_reaped_as_stale_pid(
+    reaped_child_pid: int, tmp_path: Path
+) -> None:
+    lease = _seed_lease(tmp_path, reaped_child_pid)
+    _age(lease, 60)
+
+    fresh = sr.lease_status(_NAME, root=tmp_path)
+
+    assert fresh.holder_pid == reaped_child_pid
+    assert fresh.holder_pid_alive is False
+    assert fresh.reclaimable is False
+
+    _age(lease, _PAST_TTL_SECS)
+
+    assert sr.lease_status(_NAME, root=tmp_path).reclaimable is True
+    assert [r.reason for r in sr.reap_stale_leases(root=tmp_path)] == ['stale_pid']
+    assert not lease.exists()
 
 
 def test_claim_lease_reclaims_an_aged_legacy_host_pid_lease(
