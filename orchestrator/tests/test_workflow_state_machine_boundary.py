@@ -95,7 +95,7 @@ from orchestrator.git_ops import GitOps
 from orchestrator.harness import TaskReport
 from orchestrator.landed_outbox import MergeProvenance
 from orchestrator.module_charter import derive_modules
-from orchestrator.scheduler import BlastRadiusResult, TaskAssignment
+from orchestrator.scheduler import BlastRadiusResult, SetTaskStatusRejected, TaskAssignment
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_categories import FailureCategory
@@ -661,6 +661,48 @@ class TestStateMachineLegalityAndConsistency:
         assert last_status == 'done'
         assert outcome_allows_status(report.outcome, last_status)
         assert report.phase == workflow.machine.state
+
+    async def test_row6_rejected_merged_done_write_exits_blocked_on_a_blocked_row(
+        self, config, git_ops, task_assignment, monkeypatch, caplog, tmp_path,
+    ):
+        """Reify 7286: the merged-done write is refused after a clean merge.
+
+        The run must leave a 'blocked' row behind one L1 and report BLOCKED,
+        never a DONE over the claimed 'in-progress' row.
+        """
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        queue = EscalationQueue(tmp_path / 'esc')
+        workflow.escalation_queue = queue
+        tid = workflow.task_id
+
+        async def _refuse_done(task_id, *, kind, sha, note=None):
+            raise SetTaskStatusRejected(
+                task_id=tid, error_code='pre_done_hook_rejected',
+                raw='pre-done hook exited rc 125',
+            )
+
+        monkeypatch.setattr(scheduler, 'mark_done', _refuse_done)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+        caplog.set_level(logging.WARNING, logger=_EXIT_CONTRACT_LOGGER)
+
+        report = await workflow.run()
+
+        assert report.outcome == WorkflowOutcome.BLOCKED
+        assert scheduler.statuses[tid][-1] == 'blocked'
+        assert outcome_allows_status(report.outcome, 'blocked')
+        assert report.phase == workflow.machine.state == WorkflowState.BLOCKED
+        assert _exit_contract_records(caplog, 'violation') == []
+        l1s = queue.get_by_task(tid, status='pending', level=1)
+        assert len(l1s) == 1, [(e.level, e.category, e.summary) for e in l1s]
+        assert 'set_task_status(done) rejected' in l1s[0].summary
 
     async def test_row6_allaccountscapped_blocked_run_is_consistent(
         self, config, git_ops, task_assignment, monkeypatch,
