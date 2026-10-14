@@ -6,12 +6,19 @@ in ``orchestrator/src/orchestrator/exit_contract.py`` (module docstring).
 from __future__ import annotations
 
 import logging
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-from _orch_helpers import ExitContractViolationCollector
+from _orch_helpers import (
+    ORCH_DIR,
+    ORCH_PYPROJECT,
+    ExitContractViolationCollector,
+    sanitized_probe_env,
+)
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import OrchestratorConfig
@@ -384,6 +391,50 @@ class TestExitContractViolationCollector:
         assert len(guards) == 1
         _record(_violation())
         assert len(guards[0].violations) == 1
+
+    def test_the_suite_wide_guard_hears_the_recorder_when_orchestrator_logs_only_errors(
+        self, caplog,
+    ):
+        """One ordinary ``orchestrator``=ERROR setting must not blind the
+        guard: the would-violate is a WARNING, which a logger inheriting ERROR
+        never creates."""
+        caplog.set_level(logging.ERROR, logger='orchestrator')
+        recorder_logger = logging.getLogger(record_exit_verdict.__module__)
+        guards = [
+            h for h in recorder_logger.handlers
+            if isinstance(h, ExitContractViolationCollector)
+        ]
+        assert len(guards) == 1
+        _record(_violation())
+        assert len(guards[0].violations) == 1
+
+
+_GUARD_PROBE = Path(__file__).with_name('_exit_contract_guard_probe.py')
+#: The probe's leak finishes on its first cancel, so it can only fail by
+#: hanging; the bound is loose.
+_GUARD_PROBE_KILL_SECS = 60
+
+
+def test_a_violation_logged_while_a_leaked_task_is_drained_fails_the_test_that_leaked_it():
+    """A leaked run() whose exit is logged while conftest.py's
+    ``_drain_leaked_tasks`` cancels it must fail the test that leaked it, not
+    be dropped because the guard already tore down, and not be blamed on the
+    next test.  Runs the probe in a REAL nested session under the shipped
+    conftest, mirroring test_leaked_task_drain.py."""
+    run = subprocess.run(
+        [
+            sys.executable, '-m', 'pytest', str(_GUARD_PROBE),
+            '-c', str(ORCH_PYPROJECT), '-o', 'addopts=', '-p', 'no:cacheprovider',
+            f'--timeout={_GUARD_PROBE_KILL_SECS}', '--timeout-method=thread', '-q',
+        ],
+        cwd=ORCH_DIR, env=sanitized_probe_env(), capture_output=True, text=True,
+        timeout=_GUARD_PROBE_KILL_SECS * 4,
+    )
+    output = run.stdout[-4000:] + run.stderr[-2000:]
+    assert run.returncode != 0, output
+    assert 'ERROR at teardown of test_leaks_a_run_that_exits_while_drained' in run.stdout, output
+    assert 'spec §5 exit contract' in run.stdout, output
+    assert '2 passed, 1 error' in run.stdout, output
 
 
 def test_enforce_flag_ships_dark():
