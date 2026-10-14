@@ -47,7 +47,7 @@ from shared.task_statuses import TaskStatus
 from shared.task_transitions import outcome_allows_status
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.scheduler import TaskAssignment
+from orchestrator.scheduler import TaskAssignment, TerminalExitRejection
 from orchestrator.workflow import TaskWorkflow
 from orchestrator.workflow_types import (
     StewardReescalatedL1,
@@ -83,6 +83,7 @@ def _make_config(tmp_path: Path) -> OrchestratorConfig:
 
 def _make_workflow(
     tmp_path: Path, *, with_queue: bool = False,
+    scheduler: FakeScheduler | None = None,
 ) -> TaskWorkflow:
     """A minimal TaskWorkflow whose scheduler RECORDS every status write."""
     assignment = TaskAssignment(
@@ -102,7 +103,7 @@ def _make_workflow(
         assignment=assignment,
         config=_make_config(tmp_path),
         git_ops=MagicMock(),
-        scheduler=FakeScheduler(),  # type: ignore[arg-type]
+        scheduler=scheduler if scheduler is not None else FakeScheduler(),  # type: ignore[arg-type]
         briefing=FakeBriefing(),    # type: ignore[arg-type]
         mcp=FakeMcp(),              # type: ignore[arg-type]
         escalation_queue=queue,
@@ -295,6 +296,85 @@ class TestMergePhaseBlockedWritesParkStatus:
             'the steward owns the human-facing L1 on this branch; the park '
             f'write must not add one — pending levels {levels!r}'
         )
+
+
+class _TerminalRowScheduler(FakeScheduler):
+    """A row a racing writer already made *terminal*.
+
+    A park write (no ``reopen_reason``) meets the server's terminal-exit gate:
+    the row reads *terminal*, and the write raises ``TerminalExitRejection``
+    the way scheduler.py::Scheduler.set_task_status does.
+    """
+
+    def __init__(self, terminal: str) -> None:
+        super().__init__()
+        self.terminal = terminal
+
+    async def set_task_status(
+        self,
+        task_id: str,
+        status: str,
+        *,
+        done_provenance: dict | None = None,
+        reopen_reason: str | None = None,
+        claimant_run_id: str | None = None,
+        heartbeat_at: str | None = None,
+    ) -> None:
+        if status in ('blocked', 'infra-hold') and reopen_reason is None:
+            self.statuses.setdefault(task_id, []).append(self.terminal)
+            raise TerminalExitRejection(
+                task_id=task_id, old_status=self.terminal,
+                target_status=status, raw='terminal_exit_rejected',
+            )
+        await super().set_task_status(
+            task_id, status,
+            done_provenance=done_provenance, reopen_reason=reopen_reason,
+            claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at,
+        )
+
+
+_OBSERVED_OUTCOME = {
+    'done': WorkflowOutcome.DONE,
+    'cancelled': WorkflowOutcome.CANCELLED,
+}
+
+
+class TestMergePhaseParkMeetsATerminalRow:
+    """Spec §5 relaxation 1: a park write that finds the row already terminal
+    reports that terminal.  BLOCKED or ESCALATED over 'done', or ESCALATED
+    over 'cancelled', is an exit-contract violation."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('terminal', ['done', 'cancelled'])
+    @pytest.mark.parametrize(
+        'slot_exit', ['fall_through', 'escalate_to_human', 'steward_reescalated'],
+    )
+    async def test_park_reports_the_observed_terminal(
+        self, tmp_path: Path, terminal: str, slot_exit: str,
+    ) -> None:
+        workflow = _make_workflow(
+            tmp_path,
+            with_queue=slot_exit != 'fall_through',
+            scheduler=_TerminalRowScheduler(terminal),
+        )
+        workflow._enter_phase(WorkflowState.MERGE)
+        if slot_exit == 'steward_reescalated':
+            _wire_steward(workflow, StewardReescalatedL1(esc_id='esc-6052-1'))
+
+        outcome = await workflow._mark_blocked(
+            'merge verification failed',
+            merge_phase=True,
+            skip_escalation=slot_exit == 'fall_through',
+            escalate_to_human=slot_exit == 'escalate_to_human',
+        )
+
+        assert outcome == _OBSERVED_OUTCOME[terminal]
+        assert outcome_allows_status(outcome, terminal) is True
+        report = workflow._terminal_report
+        assert report is not None
+        assert report.outcome == outcome
+        assert report.phase == workflow.machine.state
+        assert workflow.machine.state is not WorkflowState.BLOCKED
 
 
 # ---------------------------------------------------------------------------

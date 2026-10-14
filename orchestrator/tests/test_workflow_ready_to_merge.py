@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
+from shared.task_transitions import outcome_allows_status
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
@@ -288,27 +289,32 @@ class TestReadyToMergeHappyPath:
         f.mark_blocked.assert_not_awaited()  # still no human escalation
         assert f.merge_queue.qsize() == 1
 
+    @pytest.mark.parametrize(('old_status', 'observed'), [
+        ('done', WorkflowOutcome.DONE),
+        ('cancelled', WorkflowOutcome.CANCELLED),
+    ])
     async def test_terminal_exit_rejection_is_accepted_not_forced(
-        self, tmp_path: Path,
+        self, tmp_path: Path, old_status: str, observed: WorkflowOutcome,
     ):
         """The benign already-terminal race: the merge callback or the
-        found_on_main backstop beat us to mark_done.
+        found_on_main backstop beat us to mark_done, or the task was cancelled.
 
-        That row is CORRECT — the work landed.  Dragging it back to 'blocked'
-        would undo a legitimate done, so the rejection must be swallowed, not
-        retried and not re-forced through ``update_task``.
+        That row is CORRECT.  Dragging it back to 'blocked' would undo it, so
+        the rejection must not be retried or re-forced through
+        ``update_task``, and the exit reports the terminal it observed.
         """
         from orchestrator.scheduler import TerminalExitRejection
 
         f = await self._run(
             tmp_path,
             set_task_status_side_effect=TerminalExitRejection(
-                task_id=_TASK_ID, old_status='done',
+                task_id=_TASK_ID, old_status=old_status,
                 target_status='blocked', raw='terminal_exit_rejected',
             ),
         )
 
-        assert f.outcome == WorkflowOutcome.BLOCKED
+        assert f.outcome == observed
+        assert outcome_allows_status(f.outcome, old_status)
         assert f.merge_queue.qsize() == 1  # the merge still went out
         f.scheduler.set_task_status.assert_awaited_once()  # no retry
         assert f.status_forcing_updates() == []  # and no forced re-write
@@ -1077,6 +1083,55 @@ class TestReadyToMergeDispatch:
         assert outcome == WorkflowOutcome.BLOCKED
         f.wf._execute_iterations.assert_not_called()
         assert f.merge_queue.empty()
+
+    @pytest.mark.parametrize('site', ['architect', 'simple'])
+    async def test_a_cancelled_exit_from_the_handler_ends_the_run(
+        self, tmp_path: Path, site: str,
+    ):
+        """A handler that finds the row cancelled ends ``run()`` CANCELLED.
+
+        Neither dispatch site may read CANCELLED as "keep going": the plan
+        site must not fall through toward EXECUTE, and the simple-task site
+        must not mistake it for its REQUEUED fall-through sentinel and pay
+        for an architect.
+        """
+        from shared.cli_invoke import AgentResult
+
+        f = _make(
+            tmp_path=tmp_path,
+            metadata={'complexity': 'simple'} if site == 'simple' else {},
+        )
+        f.wf.config.simple_task_enabled = True
+
+        async def _observes_a_cancelled_row() -> WorkflowOutcome:
+            return f.wf._observed_terminal_outcome('cancelled')
+
+        ready_to_merge = AsyncMock(side_effect=_observes_a_cancelled_row)
+        f.wf._handle_ready_to_merge_report = ready_to_merge  # type: ignore[method-assign]
+
+        def _invoke_writes_ready_to_merge(*args, **kwargs):
+            # run() re-homes the artifacts, so write where the workflow reads.
+            assert f.wf.artifacts is not None
+            f.wf.artifacts.write_ready_to_merge(commit=_TIP, evidence='ev')
+            return AgentResult(success=True, output='', cost_usd=0.5, turns=3)
+
+        f.wf._invoke = AsyncMock(side_effect=_invoke_writes_ready_to_merge)  # type: ignore[method-assign]
+        f.wf.briefing.build_architect_prompt = AsyncMock(return_value='P')
+        f.wf.briefing.build_simple_task_prompt = AsyncMock(return_value='P')
+        f.wf._recover_if_already_merged = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        f.wf._check_branch_on_main = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        execute = AsyncMock(side_effect=AssertionError('EXECUTE must not run'))
+        f.wf._execute_iterations = execute  # type: ignore[method-assign]
+        if site == 'simple':
+            f.wf._plan = AsyncMock(  # type: ignore[method-assign]
+                side_effect=AssertionError('the architect must not run'),
+            )
+
+        outcome = (await f.wf.run()).outcome
+
+        assert outcome == WorkflowOutcome.CANCELLED
+        ready_to_merge.assert_awaited_once()
+        execute.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
