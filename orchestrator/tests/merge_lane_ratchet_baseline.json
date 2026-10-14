@@ -138,7 +138,7 @@
     "orchestrator/src/orchestrator/recover_main.py": {"cognitive": 3, "function_local_imports": 0, "lines": 79, "prose_lines": 26, "reexport_names": 0},
     "orchestrator/src/orchestrator/warm_lane_pool.py": {"cognitive": 55, "function_local_imports": 0, "lines": 747, "prose_lines": 428, "reexport_names": 0},
     "orchestrator/tests/_merge_queue_harness.py": {"cognitive": 5, "function_local_imports": 0, "lines": 106, "prose_lines": 45, "reexport_names": 0},
-    "orchestrator/tests/conftest.py": {"cognitive": 50, "function_local_imports": 6, "lines": 1257, "prose_lines": 778, "reexport_names": 5}
+    "orchestrator/tests/conftest.py": {"cognitive": 50, "function_local_imports": 6, "lines": 1254, "prose_lines": 781, "reexport_names": 5}
   },
   "functions": {
     "orchestrator/src/orchestrator/git_ops.py::BranchResetError::__init__": 2,
@@ -1233,12 +1233,12 @@
     "orchestrator/tests/test_workflow_merge_blocked_surfacing.py": {"patch_targets": [], "private_reads": 7},
     "orchestrator/tests/test_workflow_merge_gating_strand.py": {"patch_targets": [], "private_reads": 43},
     "orchestrator/tests/test_workflow_merge_phase_liveness.py": {"patch_targets": [], "private_reads": 59},
-    "orchestrator/tests/test_workflow_merge_provenance.py": {"patch_targets": [], "private_reads": 89},
+    "orchestrator/tests/test_workflow_merge_provenance.py": {"patch_targets": [], "private_reads": 88},
     "orchestrator/tests/test_workflow_merge_retry_pending.py": {"patch_targets": [], "private_reads": 54},
     "orchestrator/tests/test_workflow_merge_superseded.py": {"patch_targets": [], "private_reads": 2},
     "orchestrator/tests/test_workflow_merge_thrash.py": {"patch_targets": [], "private_reads": 65},
     "orchestrator/tests/test_workflow_preexisting_main_break.py": {"patch_targets": [], "private_reads": 18},
-    "orchestrator/tests/test_workflow_ready_to_merge.py": {"patch_targets": [], "private_reads": 32},
+    "orchestrator/tests/test_workflow_ready_to_merge.py": {"patch_targets": [], "private_reads": 35},
     "orchestrator/tests/test_workflow_sandbox_events.py": {"patch_targets": [], "private_reads": 6},
     "orchestrator/tests/test_workflow_signature_loop_guard.py": {"patch_targets": [], "private_reads": 12},
     "orchestrator/tests/test_workflow_skew_surfacing.py": {"patch_targets": ["enqueue_merge_request"], "private_reads": 17},

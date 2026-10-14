@@ -8,7 +8,6 @@ without conflicting with sibling subprojects' conftests under
 import asyncio
 import itertools
 import json
-import logging
 import os
 import shutil
 import sys
@@ -103,7 +102,7 @@ track_async_mock_coroutines()
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _drain_leaked_tasks():
+async def _drain_leaked_tasks(_no_unexpected_exit_contract_violation):
     """Cancel every task a test left pending, then wait, before its loop closes.
 
     A task cancelled between spawning a subprocess and connecting its pipes
@@ -112,6 +111,9 @@ async def _drain_leaked_tasks():
     delivers exactly one, and hung on it. This cancel is the first of the two
     such a task needs, and the bounded wait lets it land before ``Runner.close``
     throws the second. Pinned end to end by test_leaked_task_drain.py.
+    Requesting ``_no_unexpected_exit_contract_violation`` keeps that guard
+    tearing down AFTER this drain, so a leaked run() that exits while being
+    cancelled is judged against the test that leaked it.
     """
     yield
     own = asyncio.current_task()
@@ -497,13 +499,8 @@ def _no_unexpected_exit_contract_violation(request):
     of ``real_verify_admission`` above: only for a test that DELIBERATELY
     drives a violation.
     """
-    collector = ExitContractViolationCollector()
-    contract_logger = logging.getLogger('orchestrator.exit_contract')
-    contract_logger.addHandler(collector)
-    try:
+    with ExitContractViolationCollector.listening() as collector:
         yield
-    finally:
-        contract_logger.removeHandler(collector)
     if not collector.violations:
         return
     if request.node.get_closest_marker('exit_contract_violation_expected') is not None:

@@ -347,13 +347,8 @@ class TestRecordExitVerdict:
 
 @pytest.fixture
 def collector():
-    collector = ExitContractViolationCollector()
-    logger = logging.getLogger(_LOGGER)
-    logger.addHandler(collector)
-    try:
+    with ExitContractViolationCollector.listening() as collector:
         yield collector
-    finally:
-        logger.removeHandler(collector)
 
 
 class TestExitContractViolationCollector:

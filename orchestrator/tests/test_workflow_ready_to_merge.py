@@ -1115,23 +1115,18 @@ class TestReadyToMergeDispatch:
             f.wf.artifacts.write_ready_to_merge(commit=_TIP, evidence='ev')
             return AgentResult(success=True, output='', cost_usd=0.5, turns=3)
 
-        f.wf._invoke = AsyncMock(side_effect=_invoke_writes_ready_to_merge)  # type: ignore[method-assign]
+        invoke = AsyncMock(side_effect=_invoke_writes_ready_to_merge)
+        f.wf._invoke = invoke  # type: ignore[method-assign]
         f.wf.briefing.build_architect_prompt = AsyncMock(return_value='P')
         f.wf.briefing.build_simple_task_prompt = AsyncMock(return_value='P')
-        f.wf._recover_if_already_merged = AsyncMock(return_value=None)  # type: ignore[method-assign]
-        f.wf._check_branch_on_main = AsyncMock(return_value=None)  # type: ignore[method-assign]
-        execute = AsyncMock(side_effect=AssertionError('EXECUTE must not run'))
-        f.wf._execute_iterations = execute  # type: ignore[method-assign]
-        if site == 'simple':
-            f.wf._plan = AsyncMock(  # type: ignore[method-assign]
-                side_effect=AssertionError('the architect must not run'),
-            )
 
         outcome = (await f.wf.run()).outcome
 
         assert outcome == WorkflowOutcome.CANCELLED
         ready_to_merge.assert_awaited_once()
-        execute.assert_not_called()
+        # The agent that reported is the only one paid for: no architect after
+        # SIMPLE_TASK, and no implementer after the architect.
+        invoke.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
