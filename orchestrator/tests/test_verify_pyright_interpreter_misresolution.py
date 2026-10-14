@@ -28,6 +28,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from _pyright_import_fixtures import PARTIALLY_PROVISIONED_TYPE_OUTPUT, unresolved_import_lines
 
 from orchestrator import verify
 from orchestrator.config import OrchestratorConfig
@@ -37,25 +38,16 @@ LINT_CMD = 'echo LINTLEG'
 TYPE_CMD = 'echo TYPELEG'
 
 
-def _unresolved_import_lines(*modules: str) -> str:
-    """Render *modules* in pyright's REAL unresolved-import line shape."""
-    return '\n'.join(
-        f'  /repo/src/fused_memory/server.py:{i + 8}:8 - error: Import "{mod}" '
-        f'could not be resolved (reportMissingImports)'
-        for i, mod in enumerate(modules)
-    )
-
-
 # The incident's signature: the baseline sentinel `pytest` unresolved alongside
 # many other workspace third-party packages. Deliberately >5 distinct modules
 # and many LINES per module, so the "one log line, not one per match" assertion
 # below has something to collapse.
 PHANTOM_TYPE_OUTPUT = (
-    _unresolved_import_lines(
+    unresolved_import_lines(
         'pytest', 'pydantic', 'aiosqlite', 'openai', 'qdrant_client', 'graphiti_core'
     )
     + '\n'
-    + _unresolved_import_lines(
+    + unresolved_import_lines(
         'pytest', 'pydantic', 'aiosqlite', 'openai', 'qdrant_client', 'graphiti_core'
     )
     + '\n509 errors, 0 warnings, 0 informations\n'
@@ -64,19 +56,7 @@ PHANTOM_DISTINCT_MODULE_COUNT = 6
 
 # Negative control: one genuine undeclared import — a real branch defect.
 GENUINE_MISSING_IMPORT_OUTPUT = (
-    _unresolved_import_lines('brand_new_lib') + '\n1 error, 0 warnings, 0 informations\n'
-)
-
-
-# Task 6127: the measured 6021 shape — seven distinct modules with pytest
-# RESOLVED (a cold venv still being populated), plus a consequential error.
-PARTIALLY_PROVISIONED_TYPE_OUTPUT = (
-    _unresolved_import_lines(
-        'graphiti_core', 'qdrant_client', 'openai', 'falkordb', 'mem0', 'anthropic', 'redis'
-    )
-    + '\n  /repo/src/fused_memory/backends/mem0_client.py:9:18 - error: "AsyncMemory" '
-    'is unknown import symbol (reportAttributeAccessIssue)\n'
-    + '171 errors, 1 warning, 0 informations\n'
+    unresolved_import_lines('brand_new_lib') + '\n1 error, 0 warnings, 0 informations\n'
 )
 
 
@@ -298,29 +278,71 @@ class TestEnvRecoveryRetryGate:
         )
 
 
+def _partial_venv_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """WARNING records naming the partially provisioned venv condition."""
+    return [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and 'verify_cold_preprovision_command' in r.getMessage()
+    ]
+
+
 class TestPartiallyProvisionedVenvIsEnvTransient:
     """Task 6127 / esc-6021-3: pyright read a cold venv still being populated.
 
     pytest resolved, so the 3367 interpreter predicate does not apply; the
-    passing TEST leg is what corroborates that the environment, not the
+    passing PYTEST leg is what corroborates that the environment, not the
     branch, was at fault.  The incident classified ``unknown_test_failure``,
-    which the merge lane then attributed to the branch.
+    which the merge lane then attributed to the branch.  Every ``classify_failure``
+    guard still outranks the refinement, and only a passing pytest leg counts
+    as corroboration.
     """
 
-    @staticmethod
-    async def _run(tmp_path: Path, invoked: list[str]) -> verify.VerifyResult:
-        with patch(
-            'orchestrator.verify._run_cmd',
-            side_effect=_spy(invoked, type_out=PARTIALLY_PROVISIONED_TYPE_OUTPUT),
-        ):
-            return await verify.run_verification(tmp_path, _make_config(tmp_path))
+    PYTEST_TEST_CMD = 'uv run pytest tests/'
+
+    @classmethod
+    async def _run(
+        cls,
+        tmp_path: Path,
+        invoked: list[str] | None = None,
+        *,
+        test_command: str = PYTEST_TEST_CMD,
+        test_rc: int = 0,
+        test_out: str = '',
+        type_rc: int = 1,
+        type_timed_out: bool = False,
+    ) -> verify.VerifyResult:
+        invoked = [] if invoked is None else invoked
+
+        async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            invoked.append(cmd)
+            if 'TYPELEG' in cmd:
+                return type_rc, PARTIALLY_PROVISIONED_TYPE_OUTPUT, type_timed_out
+            if 'LINTLEG' in cmd:
+                return 0, '', False
+            return test_rc, test_out, False
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command=test_command,
+            lint_command=LINT_CMD,
+            type_check_command=TYPE_CMD,
+            concurrent_verify=True,
+        )
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            return await verify.run_verification(tmp_path, config, max_retries=0)
 
     @pytest.mark.asyncio
-    async def test_category_is_env_transient_end_to_end(self, tmp_path: Path) -> None:
-        result = await self._run(tmp_path, [])
+    async def test_category_is_env_transient_end_to_end(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result = await self._run(tmp_path)
 
         assert result.passed is False
         assert result.category == 'env_transient'
+        assert result.failing_leg_categories == ['env_transient']
+        assert len(_partial_venv_warnings(caplog)) == 1
 
     @pytest.mark.asyncio
     async def test_passing_test_leg_is_not_rerun(self, tmp_path: Path) -> None:
@@ -328,13 +350,70 @@ class TestPartiallyProvisionedVenvIsEnvTransient:
 
         await self._run(tmp_path, invoked)
 
-        assert len([c for c in invoked if 'TESTLEG' in c]) == 1, invoked
+        assert len([c for c in invoked if 'pytest' in c]) == 1, invoked
 
     @pytest.mark.asyncio
     async def test_interpreter_misresolution_error_does_not_fire(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         with caplog.at_level(logging.ERROR, logger='orchestrator.verify'):
-            await self._run(tmp_path, [])
+            await self._run(tmp_path)
 
         assert _misresolution_records(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_type_leg_timeout_still_wins(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result = await self._run(tmp_path, type_timed_out=True)
+
+        assert result.category == 'infra_timeout'
+        assert _partial_venv_warnings(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_type_leg_external_kill_still_wins(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result = await self._run(tmp_path, type_rc=-9)
+
+        assert result.category == 'infra_kill'
+        assert _partial_venv_warnings(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_failing_test_leg_gives_no_corroboration(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result = await self._run(
+                tmp_path, test_rc=1, test_out='FAILED tests/test_x.py::test_y - AssertionError\n',
+            )
+
+        assert result.failing_leg_categories is not None
+        assert result.failing_leg_categories[-1] == 'unknown_test_failure'
+        assert _partial_venv_warnings(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_skipped_test_leg_gives_no_corroboration(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        invoked: list[str] = []
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result = await self._run(tmp_path, invoked, test_command='')
+
+        assert not [c for c in invoked if 'pytest' in c], invoked
+        assert result.category == 'unknown_test_failure'
+        assert _partial_venv_warnings(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_passing_non_pytest_test_leg_gives_no_corroboration(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A passing ``true``-like or JS-only test command imported nothing
+        pyright flagged, so it cannot excuse the branch (task 6127 review)."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result = await self._run(tmp_path, test_command=TEST_CMD)
+
+        assert result.category == 'unknown_test_failure'
+        assert _partial_venv_warnings(caplog) == []

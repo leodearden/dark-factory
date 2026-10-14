@@ -27,10 +27,13 @@ Test coverage:
 from __future__ import annotations
 
 import json
-import logging
 from pathlib import Path
 
 import pytest
+from _pyright_import_fixtures import (
+    PARTIALLY_PROVISIONED_TYPE_OUTPUT,
+    unresolved_import_lines,
+)
 
 from orchestrator import verify_classify
 from orchestrator.verify_categories import (
@@ -2870,25 +2873,10 @@ class TestSummarizeChecksThreadsToolIdentity:
 # ---------------------------------------------------------------------------
 
 
-def _unresolved_import_lines(*modules: str, path: str = 'src/fused_memory/server.py') -> str:
-    """Render *modules* in pyright's REAL unresolved-import line shape.
-
-    Captured verbatim during the task-3367 reproduction, e.g.::
-
-        /repo/src/fused_memory/server.py:12:8 - error: Import "pytest" could
-        not be resolved (reportMissingImports)
-    """
-    return '\n'.join(
-        f'  /repo/{path}:{i + 8}:8 - error: Import "{mod}" could not be '
-        f'resolved (reportMissingImports)'
-        for i, mod in enumerate(modules)
-    )
-
-
 # The observed false-red: the baseline sentinel `pytest` is unresolved
 # alongside many other workspace third-party packages, because the resolved
 # interpreter is not this worktree's .venv at all.
-PHANTOM_MISSING_IMPORTS = _unresolved_import_lines(
+PHANTOM_MISSING_IMPORTS = unresolved_import_lines(
     'pytest', 'pydantic', 'aiosqlite', 'openai', 'qdrant_client'
 )
 
@@ -2938,7 +2926,7 @@ class TestInterpreterMissingWorkspacePackages:
         five dotted paths that all belong to two top-level packages and must
         not.
         """
-        five_distinct_tops = _unresolved_import_lines(
+        five_distinct_tops = unresolved_import_lines(
             'pytest',
             'graphiti_core.nodes',
             'qdrant_client.models',
@@ -2949,7 +2937,7 @@ class TestInterpreterMissingWorkspacePackages:
             five_distinct_tops
         )
 
-        two_distinct_tops = _unresolved_import_lines(
+        two_distinct_tops = unresolved_import_lines(
             'pytest',
             'qdrant_client.models',
             'qdrant_client.http',
@@ -2963,7 +2951,7 @@ class TestInterpreterMissingWorkspacePackages:
     def test_single_genuine_missing_dependency_is_not_environmental(self) -> None:
         """A real branch defect must stay RED, never be excused as environmental."""
         assert not verify_classify.is_interpreter_missing_workspace_packages(
-            _unresolved_import_lines('brand_new_lib')
+            unresolved_import_lines('brand_new_lib')
         )
 
     def test_many_distinct_modules_without_the_sentinel_is_not_environmental(self) -> None:
@@ -2974,7 +2962,7 @@ class TestInterpreterMissingWorkspacePackages:
         it as a dev dependency, so a healthy env ALWAYS resolves it.
         """
         assert not verify_classify.is_interpreter_missing_workspace_packages(
-            _unresolved_import_lines(
+            unresolved_import_lines(
                 'pydantic', 'aiosqlite', 'openai', 'qdrant_client', 'graphiti_core'
             )
         )
@@ -3046,7 +3034,7 @@ class TestInterpreterMisresolutionClassifiesEnvTransient:
 
     def test_single_genuine_missing_import_is_not_excused_as_environmental(self) -> None:
         """A real branch defect keeps its pre-existing category, never ENV_TRANSIENT."""
-        genuine = _unresolved_import_lines('brand_new_lib')
+        genuine = unresolved_import_lines('brand_new_lib')
         assert (
             verify_classify.classify_failure(ToolKind.OPAQUE, 1, genuine, False)
             != FailureCategory.ENV_TRANSIENT
@@ -3067,39 +3055,34 @@ class TestInterpreterMisresolutionClassifiesEnvTransient:
 # task 6127: a partially provisioned cold .venv (esc-6021-3)
 # ---------------------------------------------------------------------------
 
-# Mirrors the measured 6021 attempt-1 laptop type log (task 6127; the log was
-# since pruned from data/verify-logs): 164 reportMissingImports over seven
-# top-level modules, pytest NOT among them, plus consequential non-import errors.
-PARTIALLY_PROVISIONED_TYPE_OUTPUT = (
-    _unresolved_import_lines(
-        'graphiti_core.driver.falkordb_driver', 'graphiti_core', 'qdrant_client.models',
-        'openai', 'falkordb.asyncio', 'mem0', 'anthropic', 'redis',
-    )
-    + '\n'
-    + '  /repo/src/fused_memory/backends/mem0_client.py:9:18 - error: "AsyncMemory" '
-    'is unknown import symbol (reportAttributeAccessIssue)\n'
-    + '171 errors, 1 warning, 0 informations\n'
-)
-
-
 class TestPartiallyProvisionedVenvTypeFailure:
     """Pins ``is_partially_provisioned_venv_type_failure`` — task 6127.
 
     pyright read a cold ``.venv`` that was still being populated: pytest
-    resolved, member-specific third-party packages did not.  A passing test
+    resolved, member-specific third-party packages did not.  A passing PYTEST
     leg in the same run is the corroboration that the dependency set is fine.
     """
 
-    def test_measured_shape_with_passing_test_leg_is_partially_provisioned_venv(self) -> None:
-        assert verify_classify.is_partially_provisioned_venv_type_failure(
-            PARTIALLY_PROVISIONED_TYPE_OUTPUT, test_leg_passed=True,
+    @staticmethod
+    def _holds(
+        type_output: str, *, test_tool: ToolKind = ToolKind.PYTEST, test_leg_passed: bool = True,
+    ) -> bool:
+        return verify_classify.is_partially_provisioned_venv_type_failure(
+            type_output, test_tool=test_tool, test_leg_passed=test_leg_passed,
         )
+
+    def test_measured_shape_with_passing_pytest_leg_is_partially_provisioned_venv(self) -> None:
+        assert self._holds(PARTIALLY_PROVISIONED_TYPE_OUTPUT)
 
     def test_same_output_without_test_corroboration_is_not(self) -> None:
         """A failed test leg gives no runtime proof that the packages import."""
-        assert not verify_classify.is_partially_provisioned_venv_type_failure(
-            PARTIALLY_PROVISIONED_TYPE_OUTPUT, test_leg_passed=False,
-        )
+        assert not self._holds(PARTIALLY_PROVISIONED_TYPE_OUTPUT, test_leg_passed=False)
+
+    @pytest.mark.parametrize('test_tool', [t for t in ToolKind if t is not ToolKind.PYTEST])
+    def test_passing_non_pytest_test_leg_gives_no_corroboration(self, test_tool: ToolKind) -> None:
+        """A passing ``true``, JS-only or wrapped test command imported no Python
+        packages that pytest can vouch for, so it cannot excuse the branch."""
+        assert not self._holds(PARTIALLY_PROVISIONED_TYPE_OUTPUT, test_tool=test_tool)
 
     def test_measured_shape_escapes_the_3367_interpreter_predicate(self) -> None:
         """Why task 3367 missed it: the pytest sentinel resolved."""
@@ -3111,102 +3094,19 @@ class TestPartiallyProvisionedVenvTypeFailure:
         )
 
     def test_single_genuine_missing_import_with_passing_tests_is_not(self) -> None:
-        assert not verify_classify.is_partially_provisioned_venv_type_failure(
-            _unresolved_import_lines('brand_new_lib'), test_leg_passed=True,
-        )
+        assert not self._holds(unresolved_import_lines('brand_new_lib'))
 
     def test_floor_is_the_shared_distinct_module_floor(self) -> None:
         four = ('graphiti_core', 'qdrant_client', 'openai', 'falkordb')
-        assert not verify_classify.is_partially_provisioned_venv_type_failure(
-            _unresolved_import_lines(*four), test_leg_passed=True,
-        )
-        assert verify_classify.is_partially_provisioned_venv_type_failure(
-            _unresolved_import_lines(*four, 'mem0'), test_leg_passed=True,
-        )
+        assert not self._holds(unresolved_import_lines(*four))
+        assert self._holds(unresolved_import_lines(*four, 'mem0'))
 
     def test_other_pyright_rules_only_is_not(self) -> None:
-        assert not verify_classify.is_partially_provisioned_venv_type_failure(
-            OTHER_PYRIGHT_RULES_OUTPUT, test_leg_passed=True,
-        )
+        assert not self._holds(OTHER_PYRIGHT_RULES_OUTPUT)
 
     @pytest.mark.parametrize('text', [*NON_PYRIGHT_TEXTS, ''])
     def test_arbitrary_non_pyright_text_returns_false_without_raising(self, text: str) -> None:
-        assert verify_classify.is_partially_provisioned_venv_type_failure(
-            text, test_leg_passed=True,
-        ) is False
-
-
-def _partial_venv_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
-    return [
-        r for r in caplog.records
-        if r.levelno == logging.WARNING
-        and 'verify_cold_preprovision_command' in r.getMessage()
-    ]
-
-
-class TestPartiallyProvisionedVenvClassifiesEnvTransient:
-    """``_summarize_checks`` refines an OPAQUE type leg's UNKNOWN_TEST_FAILURE
-    fall-through to ENV_TRANSIENT when the same run's test leg passed — task
-    6127, the branch_bug regression.  ENV_TRANSIENT routes the merge lane
-    (``merge_lane/worker.py::_run_post_merge_verify``) to a bounded retry and
-    then an infra hold, both before any disposition is classified."""
-
-    @staticmethod
-    def _summarize(
-        *, test_rc: int = 0, test_out: str = '', test_cmd: str | None = 'echo TESTLEG',
-        type_rc: int = 1, type_timed_out: bool = False,
-    ) -> tuple[bool, str, str, str, list[str]]:
-        from orchestrator.verify import _summarize_checks  # noqa: PLC0415
-
-        return _summarize_checks(
-            test_rc, test_out, False, test_cmd,
-            0, '', False, 'echo LINTLEG',
-            type_rc, PARTIALLY_PROVISIONED_TYPE_OUTPUT, type_timed_out, 'echo TYPELEG',
-        )
-
-    def test_corroborated_type_failure_is_env_transient(
-        self, caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
-            _, category, _, _, failing_leg_categories = self._summarize()
-
-        assert category == 'env_transient'
-        assert failing_leg_categories == ['env_transient']
-        assert len(_partial_venv_warnings(caplog)) == 1
-
-    def test_type_leg_timeout_still_wins(self, caplog: pytest.LogCaptureFixture) -> None:
-        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
-            _, category, _, _, _ = self._summarize(type_timed_out=True)
-
-        assert category == 'infra_timeout'
-        assert _partial_venv_warnings(caplog) == []
-
-    def test_type_leg_external_kill_still_wins(self, caplog: pytest.LogCaptureFixture) -> None:
-        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
-            _, category, _, _, _ = self._summarize(type_rc=-9)
-
-        assert category == 'infra_kill'
-        assert _partial_venv_warnings(caplog) == []
-
-    def test_failing_test_leg_gives_no_corroboration(
-        self, caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
-            _, _, _, _, failing_leg_categories = self._summarize(
-                test_rc=1, test_out='FAILED tests/test_x.py::test_y - AssertionError',
-            )
-
-        assert failing_leg_categories[-1] != 'env_transient'
-        assert _partial_venv_warnings(caplog) == []
-
-    def test_skipped_test_leg_gives_no_corroboration(
-        self, caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
-            _, category, _, _, _ = self._summarize(test_cmd=None)
-
-        assert category != 'env_transient'
-        assert _partial_venv_warnings(caplog) == []
+        assert self._holds(text) is False
 
 
 # ---------------------------------------------------------------------------

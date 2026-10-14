@@ -622,10 +622,12 @@ def is_interpreter_missing_workspace_packages(output: str) -> bool:
     )
 
 
-def is_partially_provisioned_venv_type_failure(type_output: str, *, test_leg_passed: bool) -> bool:
+def is_partially_provisioned_venv_type_failure(
+    type_output: str, *, test_tool: ToolKind, test_leg_passed: bool,
+) -> bool:
     """True when a type-check failure shows pyright reading a cold ``.venv``
     that was still being populated, corroborated by the same run's passing
-    TEST leg — an environment fault, not a branch defect.
+    PYTEST leg — an environment fault, not a branch defect.
 
     Task 6127 / esc-6021-3. Measured signature: 164 reportMissingImports over
     seven DISTINCT top-level third-party modules on a docs-only merge, while
@@ -633,12 +635,15 @@ def is_partially_provisioned_venv_type_failure(type_output: str, *, test_leg_pas
     installed it first, so the task-3367 sentinel misses this shape; the
     member-specific packages had not landed yet.
 
-    DISCRIMINATOR CONTRACT — both conditions must hold:
+    DISCRIMINATOR CONTRACT — all three conditions must hold:
 
       1. *test_leg_passed*: the same venv imported those packages at runtime,
          so pyright's view was stale rather than the dependency set wrong.
          This corroboration replaces the 3367 sentinel;
-      2. at least ``_MIN_DISTINCT_UNRESOLVED_IMPORTS`` DISTINCT top-level
+      2. *test_tool* is ``ToolKind.PYTEST``: only a Python test run imports
+         anything, so a passing ``true``, JS-only or wrapped test command
+         corroborates nothing. A skipped leg resolves ``ToolKind.OPAQUE``;
+      3. at least ``_MIN_DISTINCT_UNRESOLVED_IMPORTS`` DISTINCT top-level
          modules are unresolved — the floor shared with 3367, so a branch
          adding one or two undeclared imports still blames the branch.
 
@@ -646,13 +651,16 @@ def is_partially_provisioned_venv_type_failure(type_output: str, *, test_leg_pas
     log carried consequential reportAttributeAccessIssue and
     reportOptionalMemberAccess errors alongside the imports.
 
-    Residual gap: a global type command covering a subproject that the test
-    command does not exercise gets no runtime corroboration from the test leg.
+    Residual gap: a passing pytest leg vouches only for the modules it
+    imported, so a type command covering code no test imports (a whole
+    subproject, or a new untested module) gets no real corroboration.
 
     Pure and total: any input returns a bool rather than raising.
     """
-    return test_leg_passed and _has_broad_unresolved_imports(
-        unresolved_top_level_modules(type_output)
+    return (
+        test_leg_passed
+        and test_tool is ToolKind.PYTEST
+        and _has_broad_unresolved_imports(unresolved_top_level_modules(type_output))
     )
 
 
