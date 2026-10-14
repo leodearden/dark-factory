@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sqlite3
 import subprocess
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, replace
@@ -20,6 +21,7 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 from shared import task_deferral
+from shared.project_layout import tasks_db
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.backends.task_backend_errors import DeferralWriteAuthorityError
@@ -986,3 +988,56 @@ async def test_rewrite_audit_trail_carries_deferral(stack: Stack) -> None:
             task_id, stack.root, description=None, metadata=altered,
         )
     assert (await stack.read(task_id))['metadata']['deferral'] == metadata['deferral']
+
+
+# Row 11: the one raw-SQL exit from `deferred`, the candidate-key self-heal, drops the record.
+
+
+async def _two_tasks(root: Path) -> None:
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=str(root)))
+    await backend.start()
+    try:
+        await backend.add_task(project_root=str(root), title='row 11 canonical')
+        await backend.add_task(project_root=str(root), title='row 11 duplicate')
+    finally:
+        await backend.close()
+
+
+def _forge_v3_residual_duplicate(root: Path, metadata: dict[str, Any]) -> None:
+    with sqlite3.connect(tasks_db(root)) as conn:
+        conn.execute('DROP INDEX ux_tasks_candidate_key')
+        conn.execute('PRAGMA user_version = 3')
+        title, candidate_key = conn.execute(
+            'SELECT title, candidate_key FROM tasks WHERE id = 1',
+        ).fetchone()
+        conn.execute(
+            "UPDATE tasks SET title = ?, candidate_key = ?, status = 'deferred', "
+            'metadata = ? WHERE id = 2',
+            (title, candidate_key, json.dumps(metadata)),
+        )
+
+
+@pytest.mark.asyncio
+async def test_self_heal_cancel_drops_deferral(tmp_path: Path) -> None:
+    root = tmp_path / 'heal'
+    root.mkdir()
+    await _two_tasks(root)
+    now = datetime.now(UTC)
+    record = task_deferral.record_to_json(
+        task_deferral.UntilConditionDeferral(
+            condition='row 11', deferred_at=now, stamped_at=now, stamped_by=_AGENT,
+        )
+    )
+    _forge_v3_residual_duplicate(root, {'deferral': record, 'x_note': 'keep'})
+
+    healed = SqliteTaskBackend(TaskmasterConfig(project_root=str(root)))
+    await healed.start()
+    try:
+        row = await healed.get_task('2', str(root))
+    finally:
+        await healed.close()
+
+    assert row['status'] == 'cancelled', row
+    assert 'deferral' not in row['metadata'], row
+    assert 'auto_cancelled_by_self_heal' in row['metadata']
+    assert row['metadata']['x_note'] == 'keep'
