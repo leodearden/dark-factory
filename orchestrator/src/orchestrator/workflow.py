@@ -3473,12 +3473,24 @@ class TaskWorkflow:
           release and DONE-cleanup gate carry);
         * a hard cancel: ``_enter_phase`` never persists status, so a
           forcibly-torn-down workflow leaves the row as it was — the harness
-          R3 grace window and reconcile sweep own it.
+          R3 grace window and reconcile sweep own it;
+        * an in-flight Table-B action teardown (restart/abandon):
+          ``orchestrator/src/orchestrator/harness.py::Harness._action_teardown_and_set_status``
+          is the cancel choke point.  It writes this row (spec §5
+          cancelled/soft-cancelled row: "the park/teardown target") and
+          absorbs this workflow's own 'blocked' write.  It holds the stamp
+          until the slot clears or it issues a hard cancel, whose exit is
+          unjudged anyway.  Only a literal ``True`` counts, because a
+          MagicMock scheduler's attribute is truthy — the rule
+          ``orchestrator/src/orchestrator/exit_contract.py`` applies to
+          ``workflow_exit_contract_enforce``.
 
         A raising ``get_status`` (its contract is ``str | None``, so only a
         non-conforming double does this) reads as an unknown row.
         """
         if self._worktree_external or cancel_kind == 'hard':
+            return None, None
+        if self.scheduler.blocked_writes_suppressed(self.task_id) is True:
             return None, None
         try:
             status_row = await self.scheduler.get_status(self.task_id)
