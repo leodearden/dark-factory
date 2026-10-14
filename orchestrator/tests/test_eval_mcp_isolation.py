@@ -34,6 +34,7 @@ from orchestrator.evals import runner
 from orchestrator.evals.compare import _assess_task, compare_models
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.judge import judge_plan_quality, run_judge
+from orchestrator.evals.profile import EVAL_PROFILE, apply_eval_profile
 from orchestrator.evals.results import EvalResult, ResultStore
 
 _FIXTURE_ID = 'df_task_9001'
@@ -234,3 +235,27 @@ async def test_compare_synthesizer_carries_no_mcp_servers(monkeypatch, tmp_path:
     assert len(calls) == 2
     for call in calls:
         _assert_zero_mcp_strict(call)
+
+
+# ---------------------------------------------------------------------------
+# The workflow path: OrchestratorConfig.strict_mcp_config, off in production,
+# turned on by EVAL_PROFILE.
+# ---------------------------------------------------------------------------
+
+
+def test_production_default_leaves_strict_mcp_config_off(tmp_path: Path) -> None:
+    assert OrchestratorConfig(project_root=tmp_path).strict_mcp_config is False
+
+
+def test_eval_profile_turns_strict_mcp_config_on(tmp_path: Path) -> None:
+    assert EVAL_PROFILE['strict_mcp_config'] is True
+    assert apply_eval_profile(OrchestratorConfig(project_root=tmp_path)).strict_mcp_config is True
+
+
+def test_build_eval_orch_config_carries_strict_mcp_config(tmp_path: Path) -> None:
+    cfg = EvalConfig(name='t', backend='claude', model='sonnet', effort='high')
+    task = {'id': _FIXTURE_ID, 'project_root': str(tmp_path)}
+
+    eval_cfg = runner.build_eval_orch_config(cfg, task, OrchestratorConfig(project_root=tmp_path))
+
+    assert eval_cfg.strict_mcp_config is True
