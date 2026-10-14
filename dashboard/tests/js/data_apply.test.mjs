@@ -157,7 +157,7 @@ test('registry: the reshape drops no key — the union is exactly today\'s set',
 });
 
 test('registry: ACTIVE_TASKS is retired from the seed and the /tasks row', () => {
-  // data_poll.test.mjs's EXPECTED_DF_DATA_KEYS is a containment check, so it
+  // data_poll.test.mjs::EXPECTED_DF_DATA_KEYS is a containment check, so it
   // cannot see a leftover seed. The rows travel only as TASKS_SNAPSHOT[p].rows
   // now.
   const { api, window: win } = loadDataJs();
