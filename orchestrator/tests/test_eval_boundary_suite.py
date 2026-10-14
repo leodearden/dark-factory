@@ -76,6 +76,7 @@ via ``run_eval`` only when you want to capture the writes. See
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import subprocess
 from collections.abc import Callable, Coroutine
@@ -85,6 +86,7 @@ from typing import Any
 
 import pytest
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from shared.cli_invoke import build_claude_argv
 from test_scheduler_dispatch_literal_tripwire import _dispatch_tool_literals
 from test_workflow_factory import (
     _CONSTRUCT_RE,
@@ -103,6 +105,7 @@ from orchestrator.evals.runner import (
     _build_eval_scheduler,
     _EvalMcpStub,
     _StubMcpSession,
+    architect_eval_mcp_scope,
     build_eval_orch_config,
 )
 from orchestrator.mcp import verdict_tools as _verdict_tools
@@ -766,6 +769,69 @@ async def test_b9_set_task_claimant_heartbeat_no_warning(
         'set_task_claimant heartbeat emitted WARNING(s) (B9/D2 regression):\n'
         + '\n'.join(offenders)
     )
+
+
+# ── B10: eval agent MCP isolation (task 4757) ──────────────────────────────
+
+
+def test_b10_eval_agent_mcp_isolation_two_way(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B10 — an eval agent reaches no live production MCP; production argv is unchanged.
+
+    The CI-runnable stand-in for task 4757's acceptance ("an eval architect
+    cell cannot write to live fused-memory, the live escalation queue or the
+    live task DB, and plan-tools still works"). It asserts the premise (the
+    tracked ``.mcp.json`` an eval worktree carries really does declare the live
+    ``escalation`` and ``fused-memory`` servers), the production default (strict
+    scoping off), the eval-side flip (``build_eval_orch_config`` turns it on for
+    the ``TaskWorkflow._invoke`` path), and the eval architect's real argv: the
+    SAME ``architect_eval_mcp_scope`` the call site uses, through the REAL
+    ``build_claude_argv``, emits ``--strict-mcp-config`` right after an
+    ``--mcp-config`` naming plan-tools and nothing else.
+    """
+    ambient = json.loads(
+        (_orchestrator_src_root().parents[2] / '.mcp.json').read_text(),
+    )['mcpServers']
+    assert {'escalation', 'fused-memory'} <= set(ambient), (
+        f'tracked .mcp.json changed shape ({sorted(ambient)}); re-derive the '
+        'eval MCP isolation guard against the new ambient servers'
+    )
+
+    base = _load_default_config(tmp_path)
+    assert base.strict_mcp_config is False
+
+    cfg = EvalConfig(name='t', backend='claude', model='sonnet', effort='high')
+    task = {'id': 't', 'project_root': str(tmp_path)}
+    assert build_eval_orch_config(cfg, task, base).strict_mcp_config is True
+
+    claude = tmp_path / 'claude'
+    claude.write_text('#!/bin/sh\nexit 0\n')
+    claude.chmod(0o755)
+    monkeypatch.setenv('CLAUDE_BINARY', str(claude))
+
+    cmd, temp_files = build_claude_argv(
+        model='opus',
+        max_budget_usd=1.0,
+        system_prompt='s',
+        max_turns=1,
+        permission_mode='bypassPermissions',
+        allowed_tools=None,
+        disallowed_tools=None,
+        output_schema=None,
+        effort=None,
+        resume_session_id=None,
+        session_id=None,
+        **architect_eval_mcp_scope(tmp_path / 'wt'),
+    )
+    try:
+        at = cmd.index('--mcp-config')
+        assert cmd[at + 2] == '--strict-mcp-config', cmd[at:at + 3]
+        emitted = json.loads(Path(cmd[at + 1]).read_text())['mcpServers']
+        assert set(emitted) == {'plan-tools'}
+    finally:
+        for path in temp_files:
+            Path(path).unlink(missing_ok=True)
 
 
 # ── Capstone: one refreshed fixture through the composed eval framework ─────
