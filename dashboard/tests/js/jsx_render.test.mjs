@@ -9,7 +9,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { buildDashboardWindow, seedDashboardData } from './dom_harness.mjs';
-import { orchestratorRow, projectRow, receiptsFor, taskCensus, tasksSnapshotEntry } from './wire_fixtures.mjs';
+import {
+  burndownBlock,
+  orchestratorRow,
+  projectRow,
+  receiptsFor,
+  taskCensus,
+  tasksSnapshotEntry,
+} from './wire_fixtures.mjs';
 
 const PROJECT = 'p';
 const TAB_PROPS = { projectFilter: [], search: '' };
@@ -121,5 +128,119 @@ for (const { site, options, render } of STRAND_SITES) {
     assert.equal(strandBadgeState(task, options), null);
     const wouldRender = strandBadgeState({ ...task, stranded: true }, options);
     assert.deepEqual(spansDescribedBy(element, wouldRender), [], `${site} rendered a stranded badge for a live task`);
+  });
+}
+
+// ── Decision 2: the burndown bands, legend and parity banner (burndown_bands.js) ──
+
+const BURN_PROPS = { projectFilter: [], displayWindow: '24h' };
+
+// The aggregate and the project are given DIFFERENT sample counts, so a view
+// that pairs one block's labels with the other's series cannot look right.
+const AGGREGATE_SAMPLES = 5;
+const PROJECT_SAMPLES = 3;
+
+function seedBurndown(window, { alarm }) {
+  const vocab = window.DF_TASK_VOCAB;
+  const verdict = { parity_alarm: alarm, parity_cap: 4, parity_peak: 6, parity_breach_count: 3 };
+  seedDashboardData(window, {
+    PROJECTS: [projectRow(PROJECT)],
+    BURNDOWN: burndownBlock(vocab, AGGREGATE_SAMPLES, { ...verdict, parity_projects: [PROJECT] }),
+    BURNDOWN_BY_PROJECT: { [PROJECT]: burndownBlock(vocab, PROJECT_SAMPLES, verdict) },
+    __receipt: receiptsFor(window.DF_DATA_LOADER, ['BURNDOWN', 'PROJECTS']),
+  });
+}
+
+function statusMixPanel(container) {
+  const panels = [...container.querySelectorAll('.panel')].filter(panel =>
+    panel.querySelector('.panel-head .title')?.textContent.startsWith('Status mix'),
+  );
+  assert.equal(panels.length, 1, 'expected exactly one Status mix panel in the rendered view');
+  return panels[0];
+}
+
+// Each view: how to reach it, which block it draws, and the projects its call
+// site hands parityBannerState.
+const BURN_VIEWS = [
+  {
+    view: 'aggregate',
+    show() {},
+    block: window => window.DF_DATA.BURNDOWN,
+    bannerProjects: window => window.DF_DATA.BURNDOWN.parity_projects,
+  },
+  {
+    view: 'per-project',
+    show(window, container) {
+      const button = [...container.querySelectorAll('.seg button')].find(b => b.textContent === 'Per project');
+      assert.ok(button, 'BurnTab rendered no Per project view switch');
+      click(window, button);
+    },
+    block: window => window.DF_DATA.BURNDOWN_BY_PROJECT[PROJECT],
+    bannerProjects: () => null,
+  },
+];
+
+function mountBurnView(harness, show) {
+  const { container } = harness.mount(harness.window.DF_TABS.BurnTab, BURN_PROPS);
+  show(harness.window, container);
+  return statusMixPanel(container);
+}
+
+function filledPathColors(panel) {
+  return [...panel.querySelectorAll('svg path')].map(path => path.getAttribute('fill')).filter(Boolean);
+}
+
+for (const { view, show, block, bannerProjects } of BURN_VIEWS) {
+  test(`tabs.jsx::BurnTab ${view} view renders one legend entry per burndownLegend item`, t => {
+    const harness = openWindow(t);
+    seedBurndown(harness.window, { alarm: false });
+    const panel = mountBurnView(harness, show);
+
+    const legend = harness.window.DF_BURNDOWN_BANDS.burndownLegend(harness.window.DF_CHARTS.PALETTE);
+    for (const { label, color } of legend) {
+      const entries = [...panel.querySelectorAll('span')].filter(
+        span => span.textContent === label && [...span.children].some(swatch => swatch.style.background === color),
+      );
+      assert.equal(entries.length, 1, `the ${view} legend has no single "${label}" entry with its ${color} swatch`);
+    }
+  });
+
+  test(`tabs.jsx::BurnTab ${view} view draws exactly the bands burndownStacks describes for its own block`, t => {
+    const harness = openWindow(t);
+    seedBurndown(harness.window, { alarm: false });
+    const panel = mountBurnView(harness, show);
+
+    const stacks = harness.window.DF_BURNDOWN_BANDS.burndownStacks(block(harness.window), harness.window.DF_CHARTS.PALETTE);
+    assert.deepEqual(
+      filledPathColors(panel).sort(),
+      stacks.map(stack => stack.color).sort(),
+      `the ${view} chart must draw one filled band per burndownStacks entry, in that entry's colour`,
+    );
+  });
+
+  test(`tabs.jsx::BurnTab ${view} view renders the parity banner parityBannerState describes when the alarm is up`, t => {
+    const harness = openWindow(t);
+    seedBurndown(harness.window, { alarm: true });
+    const panel = mountBurnView(harness, show);
+
+    const banner = harness.window.DF_BURNDOWN_BANDS.parityBannerState(block(harness.window), bannerProjects(harness.window));
+    assert.ok(banner, 'parityBannerState describes no banner for a raised alarm');
+    const rendered = [...panel.querySelectorAll('.badge.bad')];
+    assert.equal(rendered.length, 1, `the ${view} view must render exactly one parity banner`);
+    const text = rendered[0].textContent;
+    assert.ok(
+      text.includes(`${banner.peak}`) && text.includes(`${banner.cap}`) && text.endsWith(banner.text),
+      `the ${view} banner "${text}" does not carry parityBannerState's peak, cap and text "${banner.text}"`,
+    );
+  });
+
+  test(`tabs.jsx::BurnTab ${view} view renders no parity banner when the alarm is down, though the chart draws`, t => {
+    const harness = openWindow(t);
+    seedBurndown(harness.window, { alarm: false });
+    const panel = mountBurnView(harness, show);
+
+    assert.equal(harness.window.DF_BURNDOWN_BANDS.parityBannerState(block(harness.window), bannerProjects(harness.window)), null);
+    assert.ok(filledPathColors(panel).length > 0, `the ${view} chart drew nothing, so the absent banner proves nothing`);
+    assert.deepEqual([...panel.querySelectorAll('.badge.bad')], [], `the ${view} view rendered a parity banner with the alarm down`);
   });
 }
