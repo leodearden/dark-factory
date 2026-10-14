@@ -163,7 +163,9 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 #                                         cap storm. AllAccountsCappedException
 #                                         is caught and converted to a
 #                                         retryable 'infra_failure' proposal
-#                                         entry instead of raising.
+#                                         entry instead of raising.  A cap hit
+#                                         retries FRESH (resume_on_cap_hit=
+#                                         False).
 #
 # orchestrator/evals/runner.py            _EVAL_CAP_WAIT_SANITY_SECS = 172800 s (48 h).
 #   (run_architect_eval invocation)       RAISED from 1800 s on 2026-08-25

@@ -501,6 +501,9 @@ async def run_dry_run_unblock(
                 project_id=project_id,
                 role='unblock_auto',
                 cap_wait_sanity_secs=_DRY_RUN_CAP_WAIT_SANITY_SECS,
+                # A fire-and-forget read-only investigation has no mid-work
+                # state worth resuming.
+                resume_on_cap_hit=False,
                 invoke_fn=invoke_agent,
                 backend=ua_cfg.backend,
                 session_id=session_id,
