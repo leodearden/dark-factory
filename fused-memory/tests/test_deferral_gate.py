@@ -7,6 +7,7 @@ processes; nothing private is patched.
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from collections.abc import AsyncIterator, Iterator
@@ -69,9 +70,14 @@ class Stack:
             tool, {'project_root': self.root, **args},
         )
 
-    async def seed(self, status: str, title: str) -> str:
+    async def seed(
+        self, status: str, title: str, metadata: dict[str, Any] | None = None,
+    ) -> str:
         created = await self.backend.add_task(
-            project_root=self.root, title=title, status=status,
+            project_root=self.root,
+            title=title,
+            status=status,
+            metadata=None if metadata is None else json.dumps(metadata),
         )
         return str(created['id'])
 
@@ -100,8 +106,11 @@ class Stack:
         return replace(self, interceptor=interceptor, server=server)
 
 
-def _git(root: Path, *args: str) -> None:
-    subprocess.run(['git', '-C', str(root), *args], check=True, capture_output=True)
+def _git(root: Path, *args: str) -> str:
+    done = subprocess.run(
+        ['git', '-C', str(root), *args], check=True, capture_output=True, text=True,
+    )
+    return done.stdout.strip()
 
 
 def _git_main_checkout(root: Path) -> str:
@@ -456,3 +465,68 @@ async def test_csv_entry_applies_one_record_to_every_id(stack: Stack) -> None:
     assert stored[0]['stamped_at'] == stored[1]['stamped_at']
     echoes = [one['result']['deferral'] for one in result['results']]
     assert echoes == stored
+
+
+# Rows 5 and 27 (exit): leaving `deferred` removes the record and reports it.
+
+
+async def _exit_arguments(stack: Stack, exit_status: str) -> dict[str, Any]:
+    if exit_status != 'done':
+        return {}
+    head = _git(Path(stack.root), 'rev-parse', 'HEAD')
+    return {'done_provenance': {'kind': 'found_on_main', 'commit': head, 'note': 'test'}}
+
+
+async def _status_events(stack: Stack, task_id: str, new_status: str) -> list[dict[str, Any]]:
+    return [
+        event.payload for event in await stack.events('task_status_changed')
+        if event.payload['task_id'] == task_id and event.payload['new_status'] == new_status
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('exit_status', ['pending', 'cancelled', 'blocked', 'done'])
+async def test_exit_clears_the_record(stack: Stack, exit_status: str) -> None:
+    task_id = await stack.seed('pending', f'row 5 exit {exit_status}', {'x_note': 'kept'})
+    await _enter(stack, task_id, _until_condition(f'row 5 exit {exit_status}'))
+    stored = (await stack.read(task_id))['metadata']['deferral']
+
+    result = await stack.call(
+        'set_task_status', id=task_id, status=exit_status,
+        **await _exit_arguments(stack, exit_status),
+    )
+
+    assert 'error' not in result, result
+    row = await stack.read(task_id)
+    assert row['status'] == exit_status
+    assert 'deferral' not in row['metadata'], row
+    assert row['metadata']['x_note'] == 'kept'
+    assert result['deferral_cleared'] == stored
+    payloads = await _status_events(stack, task_id, exit_status)
+    assert len(payloads) == 1, payloads
+    assert payloads[0]['deferral_cleared'] == stored
+
+
+@pytest.mark.asyncio
+async def test_exit_from_unrecorded_row_echoes_none(stack: Stack) -> None:
+    task_id = await stack.seed('deferred', 'unrecorded exit')
+
+    result = await stack.call('set_task_status', id=task_id, status='pending')
+
+    assert 'error' not in result, result
+    assert 'deferral_cleared' in result, result
+    assert result['deferral_cleared'] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', sorted(_STORED_VARIANTS))
+async def test_plain_pending_release_is_legal_for_every_kind(
+    stack: Stack, claude_holder: int, kind: str,
+) -> None:
+    task_id = await stack.seed('pending', f'plain release {kind}')
+    await _enter(stack, task_id, await _deferral_of_kind(stack, kind, claude_holder))
+
+    result = await stack.call('set_task_status', id=task_id, status='pending')
+
+    assert 'error' not in result, result
+    assert (await stack.read(task_id))['status'] == 'pending'
