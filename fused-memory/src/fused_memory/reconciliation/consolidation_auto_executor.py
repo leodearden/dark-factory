@@ -11,6 +11,7 @@ proposal row (``consolidation_proposal.py``). Every stat it reports has one home
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 from collections.abc import Mapping, Sequence
@@ -49,6 +50,7 @@ from fused_memory.reconciliation.consolidation_proposal import (
     ProposalState,
     from_ledger_record,
     newest_per_topic,
+    outcome_from_record,
     record_outcome,
     refusal_streak,
 )
@@ -57,6 +59,7 @@ from fused_memory.reconciliation.curator_gate_resolution_sweep import (
 )
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
 from fused_memory.server.consolidation import ProposalLimits, proposal_shape_codes
+from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
 from fused_memory.services.consolidation_ops import (
     RetainArmApplied,
     RetainArmRefused,
@@ -102,6 +105,7 @@ BACKLOG_CATEGORY = 'recon_auto_consolidation_backlog'
 _ESCALATION_KEY = 'auto-consolidation'
 _ESCALATION_ROLE = 'reconciliation-stage1'
 _STREAK_FINDING = 'refusal_streak'
+_REVERT_SOURCE = 'auto_consolidation_revert'
 
 
 class RefusalCode(StrEnum):
@@ -889,3 +893,110 @@ def _metadata(record: Any) -> dict[str, Any]:
         return {}
     metadata = record.get('metadata')
     return metadata if isinstance(metadata, dict) else {}
+
+
+class RevertNotAuthorized(PermissionError):
+    """*agent_id* may not patch Mem0 metadata, so nothing was reverted."""
+
+    def __init__(self, error_type: str | None, error: str | None) -> None:
+        super().__init__(error or 'not authorized to revert an auto-consolidation')
+        self.error_type = error_type
+
+
+@dataclass(frozen=True)
+class RevertResult:
+    canonical_deleted: str | None
+    untagged: tuple[str, ...]
+    failures: tuple[dict[str, Any], ...]
+    reverted: bool
+
+
+async def revert_auto_consolidation(
+    memory_service: Any,
+    ledger_row: ReconLedgerRecord,
+    *,
+    agent_id: str,
+) -> RevertResult:
+    """Undo one executed auto-consolidation recorded on *ledger_row* (PRD C4, D7).
+
+    Un-stamps exactly the members that run tagged, then deletes the canonical
+    only if that run minted it; an incumbent is never touched. Members go
+    first, so a failed delete leaves a lone canonical rather than stamped
+    members without one. The row moves to ``reverted`` only when every step
+    succeeded. Raises ``ValueError`` for a row that records no execution and
+    :class:`RevertNotAuthorized` before any write.
+    """
+    outcome = outcome_from_record(ledger_row)
+    if outcome is None or not outcome.executed:
+        raise ValueError(
+            f'ledger row in state {ledger_row.state!r} records no executed '
+            'auto-consolidation to revert'
+        )
+    decision = resolve_mem0_update_authorization(
+        memory_service, agent_id=agent_id, content_amend=False, metadata_patch=True,
+    )
+    if not decision.allowed:
+        raise RevertNotAuthorized(decision.error_type, decision.error)
+
+    project_id = ledger_row.project_id
+    untagged: list[str] = []
+    failures: list[dict[str, Any]] = []
+    for member_id in outcome.tagged_ids:
+        failure = await _untag(memory_service, member_id, project_id=project_id, agent_id=agent_id)
+        if failure is None:
+            untagged.append(member_id)
+        else:
+            failures.append({'id': member_id, **failure})
+
+    canonical_deleted: str | None = None
+    if outcome.canonical_minted and outcome.canonical_id is not None:
+        try:
+            await memory_service.delete_memory(
+                outcome.canonical_id,
+                'mem0',
+                project_id=project_id,
+                agent_id=agent_id,
+                _source=_REVERT_SOURCE,
+            )
+            canonical_deleted = outcome.canonical_id
+        except Exception as exc:
+            failures.append(
+                {'id': outcome.canonical_id, 'error': str(exc), 'error_type': type(exc).__name__},
+            )
+
+    reverted = not failures
+    ledger = getattr(memory_service, 'recon_ledger', None)
+    if reverted and ledger is not None:
+        reverted = await record_outcome(
+            ledger, ledger_row, dataclasses.replace(outcome, state=ProposalState.REVERTED),
+        )
+    return RevertResult(
+        canonical_deleted=canonical_deleted,
+        untagged=tuple(untagged),
+        failures=tuple(failures),
+        reverted=reverted,
+    )
+
+
+async def _untag(
+    memory_service: Any, member_id: str, *, project_id: str, agent_id: str,
+) -> dict[str, Any] | None:
+    """Remove this machinery's stamps from one member; ``None`` on success.
+
+    A raise and a returned ``{'error_type'}`` are the same event, as in
+    ``services/consolidation_ops.py::patch_memory_metadata``.
+    """
+    try:
+        result = await memory_service.update_memory(
+            memory_id=member_id,
+            project_id=project_id,
+            content=None,
+            metadata_delete_keys=['topic', _RUN_STAMP_KEY],
+            agent_id=agent_id,
+            _source=_REVERT_SOURCE,
+        )
+    except Exception as exc:
+        return {'error': str(exc), 'error_type': type(exc).__name__}
+    if isinstance(result, dict) and result.get('error_type'):
+        return {'error': result.get('error'), 'error_type': result.get('error_type')}
+    return None
