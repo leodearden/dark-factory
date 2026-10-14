@@ -79,7 +79,7 @@ def _load_script(path: Path, mod_name: str) -> types.ModuleType:
     module = importlib.util.module_from_spec(spec)
     sys.modules[mod_name] = module
     try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
+        spec.loader.exec_module(module)
     except Exception:
         sys.modules.pop(mod_name, None)
         raise
