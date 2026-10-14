@@ -11,11 +11,15 @@ proposal row (``consolidation_proposal.py``). Every stat it reports has one home
 
 from __future__ import annotations
 
+import json
 import logging
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
+from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
 from fused_memory.models.reconciliation import StageId, StageReport
 from fused_memory.reconciliation.consolidation_auto import (
     UNREADABLE,
@@ -74,6 +78,15 @@ _RUN_STAMP_KEY = 'x_auto_consolidated_run'
 _CANONICAL_STAMP_KEY = 'x_auto_consolidated'
 _SYSTEM_RECORD_KIND = 'auto_consolidation'
 _SYSTEM_RECORD_FACTS_KEY = 'x_auto_consolidation'
+_GATE_DETECTOR = 'auto-consolidation'
+
+
+class RefusalCode(StrEnum):
+    """Benign refusals only the executor can name (the validator names the rest)."""
+
+    PROPOSAL_UNDECODABLE = 'proposal_undecodable'
+    CATEGORY_NOT_CONSOLIDATABLE = 'category_not_consolidatable'
+    EXECUTION_REFUSED = 'execution_refused'
 
 
 def auto_consolidation_initial_stats() -> dict[str, Any]:
@@ -116,6 +129,7 @@ class _Cycle:
     open_gates: dict[str, str] = field(default_factory=dict)
     canonical_slugs: tuple[str, ...] = ()
     executions: int = 0
+    filings: int = 0
 
     def outcome(self, state: ProposalState, **fields: Any) -> ProposalOutcome:
         return ProposalOutcome(
@@ -329,7 +343,9 @@ async def _evaluate(
     )
     if verdict.outcome is AutoOutcome.NOOP:
         await _record_noop(cycle, record, verdict)
-    elif verdict.outcome in (AutoOutcome.PASS, AutoOutcome.PASS_TAG_ONLY):
+    elif verdict.outcome is AutoOutcome.FAIL:
+        await _gate_hazard(cycle, record, proposal, verdict)
+    else:
         await _execute(cycle, record, proposal, verdict, facts)
 
 
@@ -403,18 +419,45 @@ async def _execute(
             cycle.stats['auto_consolidations_dry_run'] += 1
         return
 
-    arm = await _apply_arm(cycle, proposal, verdict, facts)
-    if isinstance(arm, RetainArmRefused):
+    try:
+        arm = await _apply_arm(cycle, proposal, verdict, facts)
+    except Exception as exc:
+        # The arm raises only from the canonical write, before any peer patch.
         logger.warning(
-            'auto_consolidation: the retain arm refused topic %r: %s',
+            'auto_consolidation: the retain arm raised for topic %r',
             proposal.topic,
-            arm.response.get('error_type'),
+            exc_info=True,
             extra={'project_id': cycle.project_id, 'run_id': cycle.run_id},
         )
+        await _refuse(
+            cycle, record, (RefusalCode.EXECUTION_REFUSED,), detail=type(exc).__name__,
+        )
         return
+    if isinstance(arm, RetainArmRefused):
+        await _refuse(
+            cycle,
+            record,
+            (RefusalCode.EXECUTION_REFUSED,),
+            detail=str(arm.response.get('error_type')),
+        )
+        return
+    await _record_execution(cycle, record, proposal, verdict, arm)
+
+
+async def _record_execution(
+    cycle: _Cycle,
+    record: ReconLedgerRecord,
+    proposal: ConsolidationProposal,
+    verdict: AutoVerdict,
+    arm: RetainArmApplied,
+) -> None:
+    """Record writes that have landed: addressed, or gated when the topic is not closed.
+
+    The ledger row is written before the system record: it is the authoritative
+    home and the reversal source, so it must not depend on the pointer write.
+    """
     closure = await _closure(cycle, proposal)
     minted = verdict.outcome is AutoOutcome.PASS
-    await _write_system_record(cycle, proposal, arm)
     fields = {
         **_verdict_fields(verdict),
         'canonical_id': arm.canonical_id,
@@ -423,14 +466,143 @@ async def _execute(
         'tag_failure_ids': tuple(str(f.get('id')) for f in arm.retain_failures),
         'closure_codes': tuple(str(r.get('code')) for r in closure.reasons),
     }
-    if not closure.closed:
+    if closure.closed:
+        await record_outcome(cycle.ledger, record, cycle.outcome(ProposalState.ADDRESSED, **fields))
+        cycle.stats['auto_consolidations' if minted else 'auto_consolidations_tag_only'] += 1
+    else:
         cycle.stats['auto_consolidation_closure_failures'] += 1
-        await record_outcome(cycle.ledger, record, cycle.outcome(ProposalState.GATED, **fields))
-        return
-    await record_outcome(cycle.ledger, record, cycle.outcome(ProposalState.ADDRESSED, **fields))
-    cycle.stats['auto_consolidations' if minted else 'auto_consolidations_tag_only'] += 1
+        gate_id = await _file_hazard_gate(
+            cycle,
+            proposal,
+            reason_codes={str(r.get('code')): list(r.get('ids') or []) for r in closure.reasons},
+            predicate_version=verdict.predicate_version,
+            rationale=closure.message,
+            within_budget=False,
+        )
+        await record_outcome(
+            cycle.ledger,
+            record,
+            cycle.outcome(ProposalState.GATED, gate_task_id=gate_id, **fields),
+        )
     cycle.stats['auto_consolidation_pointers'].append(
         {'topic': proposal.topic, 'canonical_id': arm.canonical_id, 'run_id': cycle.run_id},
+    )
+    try:
+        await _write_system_record(cycle, proposal, arm)
+    except Exception:
+        logger.warning(
+            'auto_consolidation: the system record for topic %r failed; the ledger row holds the facts',
+            proposal.topic,
+            exc_info=True,
+            extra={'project_id': cycle.project_id, 'run_id': cycle.run_id},
+        )
+
+
+async def _gate_hazard(
+    cycle: _Cycle,
+    record: ReconLedgerRecord,
+    proposal: ConsolidationProposal,
+    verdict: AutoVerdict,
+) -> None:
+    """A predicate FAIL: file a curator gate under the filing budget, else leave the row."""
+    reason_codes: dict[str, list[str]] = {}
+    for reason in verdict.reasons:
+        ids = reason_codes.setdefault(reason.code.value, [])
+        ids.extend(i for i in reason.ids if i not in ids)
+    gate_id = await _file_hazard_gate(
+        cycle,
+        proposal,
+        reason_codes=reason_codes,
+        predicate_version=verdict.predicate_version,
+        rationale='; '.join(r.detail for r in verdict.reasons if r.detail),
+        within_budget=True,
+    )
+    if gate_id is not None:
+        await record_outcome(
+            cycle.ledger,
+            record,
+            cycle.outcome(ProposalState.GATED, gate_task_id=gate_id, **_verdict_fields(verdict)),
+        )
+
+
+async def _file_hazard_gate(
+    cycle: _Cycle,
+    proposal: ConsolidationProposal,
+    *,
+    reason_codes: Mapping[str, Sequence[str]],
+    predicate_version: str,
+    rationale: str,
+    within_budget: bool,
+) -> str | None:
+    """File the PRD C6 gate through the raw backend; its id, or ``None`` if unfiled.
+
+    The task_kind / always_escalates / gate markers travel inside the metadata
+    JSON: ``SqliteTaskBackend.add_task`` takes no parameters for them.
+    """
+    if within_budget and cycle.filings >= cycle.config.max_gate_filings_per_cycle:
+        cycle.stats['auto_consolidation_unfiled'] += 1
+        return None
+    if cycle.taskmaster is None:
+        cycle.stats['auto_consolidation_unfiled'] += 1
+        return None
+    spec = build_consolidation_gate_task(
+        topic=proposal.topic,
+        observed_members=proposal.member_ids,
+        report_run=proposal.run_id,
+        detector=_GATE_DETECTOR,
+        reason_codes=reason_codes,
+        auto_predicate_version=predicate_version,
+        category=proposal.category,
+        rationale=rationale,
+    )
+    try:
+        added = await cycle.taskmaster.add_task(
+            project_root=cycle.project_root,
+            title=spec.title,
+            description=spec.description,
+            priority=spec.priority,
+            metadata=json.dumps(spec.metadata),
+        )
+    except DuplicateCandidateKeyError as exc:
+        return None if exc.existing_id is None else str(exc.existing_id)
+    except Exception:
+        logger.warning(
+            'auto_consolidation: filing the gate for topic %r failed',
+            proposal.topic,
+            exc_info=True,
+            extra={'project_id': cycle.project_id, 'run_id': cycle.run_id},
+        )
+        cycle.stats['auto_consolidation_unfiled'] += 1
+        return None
+    cycle.filings += 1
+    cycle.stats['auto_consolidation_gates_filed'] += 1
+    return str(added['id'])
+
+
+async def _refuse(
+    cycle: _Cycle,
+    record: ReconLedgerRecord,
+    codes: Sequence[str],
+    *,
+    detail: str,
+) -> None:
+    """Record a benign refusal on the row and count each code."""
+    moved = await record_outcome(
+        cycle.ledger,
+        record,
+        cycle.outcome(ProposalState.REFUSED, reason_codes=tuple(str(c) for c in codes)),
+    )
+    if not moved:
+        return
+    refusals = cycle.stats['auto_consolidation_refusals']
+    for code in codes:
+        refusals[str(code)] = refusals.get(str(code), 0) + 1
+    logger.info(
+        'auto_consolidation: refused topic %r: %s (%s)',
+        record.flag_type,
+        ', '.join(str(c) for c in codes),
+        detail,
+        extra={'project_id': cycle.project_id, 'run_id': cycle.run_id},
     )
 
 
