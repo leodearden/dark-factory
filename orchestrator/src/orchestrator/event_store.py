@@ -927,16 +927,8 @@ class EventType(StrEnum):
     recovery_vetoed = 'recovery_vetoed'
     recovery_left = 'recovery_left'
     # strand_converted — one row per convert-to-blocked the stranded-task sweep
-    # actually applied (task 6476).  The canonical WHY lives in
-    # orchestrator/src/orchestrator/strand_conversion.py (module docstring).
-    # Payload vocabulary:
-    #   {task_id, shape, escalation_ids, pinning_escalation_ids, ages_secs,
-    #    measured_at, metadata_stamped}
-    #   escalation_ids         — bucketed exactly like recovery_vetoed
-    #                            ({dead_l0, queue_handoff, non_pinning}).
-    #   pinning_escalation_ids — the same ids as metadata.strand_converted's.
-    #   measured_at            — the same instant as metadata.strand_converted's at.
-    #   metadata_stamped       — whether that stamp write succeeded.
+    # actually applied (task 6476).  Payload:
+    # orchestrator/src/orchestrator/strand_conversion.py::strand_converted_payload.
     # An ACTION, not a hold, so not signature-gated: one row per conversion.
     # task_id is ALSO a first-class column.
     strand_converted = 'strand_converted'

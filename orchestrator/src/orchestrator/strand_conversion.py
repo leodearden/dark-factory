@@ -12,8 +12,8 @@ sweep that made it.
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
 from datetime import datetime
+from typing import Protocol
 
 from pydantic import ValidationError
 from shared.strand_conversion import StrandConverted
@@ -22,9 +22,17 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.recovery_emission import emit_recovery_event, escalation_ages_secs, pin_buckets
 from orchestrator.task_ground_truth import TruthReport, recovery_shape_str
 
-__all__ = ['record_strand_conversion', 'strand_converted_payload']
+__all__ = ['TaskMetadataWriter', 'record_strand_conversion', 'strand_converted_payload']
 
 logger = logging.getLogger(__name__)
+
+
+class TaskMetadataWriter(Protocol):
+    """The ``update_task`` this module writes the stamp through; the merge mode is always explicit."""
+
+    async def __call__(
+        self, task_id: str, metadata: dict[str, dict], /, *, metadata_mode: str,
+    ) -> bool: ...
 
 
 def strand_converted_payload(
@@ -52,7 +60,7 @@ async def record_strand_conversion(
     report: TruthReport,
     *,
     event_store: EventStore | None,
-    update_task: Callable[..., Awaitable[object]],
+    update_task: TaskMetadataWriter,
     now: datetime,
 ) -> StrandConverted | None:
     """Stamp *task_id* and emit its ``strand_converted`` event; ``None`` when nothing pins it.
@@ -92,7 +100,7 @@ async def record_strand_conversion(
 
 
 async def _write_stamp(
-    task_id: str, stamp: StrandConverted, update_task: Callable[..., Awaitable[object]],
+    task_id: str, stamp: StrandConverted, update_task: TaskMetadataWriter,
 ) -> bool:
     try:
         accepted = await update_task(task_id, stamp.to_metadata(), metadata_mode='merge')
