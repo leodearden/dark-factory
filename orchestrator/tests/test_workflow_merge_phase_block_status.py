@@ -103,7 +103,7 @@ def _make_workflow(
         assignment=assignment,
         config=_make_config(tmp_path),
         git_ops=MagicMock(),
-        scheduler=scheduler if scheduler is not None else FakeScheduler(),  # type: ignore[arg-type]
+        scheduler=scheduler if scheduler is not None else FakeScheduler(),
         briefing=FakeBriefing(),    # type: ignore[arg-type]
         mcp=FakeMcp(),              # type: ignore[arg-type]
         escalation_queue=queue,
