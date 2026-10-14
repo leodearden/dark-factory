@@ -11118,7 +11118,7 @@ class Harness:
             try:
                 await self.scheduler.set_task_status(new_task_id, 'cancelled')
                 disposition = 'redo cancelled'
-            except Exception as cancel_exc:  # noqa: BLE001
+            except Exception as cancel_exc:
                 disposition = (
                     f'cancelling the redo also failed ({cancel_exc}); '
                     'it is left deferred'

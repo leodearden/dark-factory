@@ -546,15 +546,17 @@ async def test_pending_flip_failure_and_failed_cancel_leave_the_redo_deferred(
 async def test_pending_flip_structured_error_body_is_not_a_release(
     tmp_path: Path,
 ):
-    """A raw dispatch_tool answers a structured error WITHOUT raising; the flip
-    must go through Scheduler.set_task_status, which turns that into a raise."""
+    """A raw dispatch_tool answers a structured error WITHOUT raising, so a flip
+    read from it would look released. The flip must not read dispatch_tool at
+    all: it goes through Scheduler.set_task_status, mocked here to raise as the
+    real method does for that body, and nothing is renamed or back-linked."""
     f = _make(project_root=tmp_path / 'proj')
 
-    async def _error_body(name: str, args: dict, *, timeout: float = 15) -> dict:
-        f.submit_calls.append((name, args))
+    async def _error_body(name: str, arguments: dict, *, timeout: float = 15) -> dict:
+        f.submit_calls.append((name, arguments))
         return {'error': 'TimeoutError(...)', 'error_type': 'TimeoutError'}
 
-    f.harness.scheduler.dispatch_tool = _error_body  # pyright: ignore[reportAttributeAccessIssue]
+    f.harness.scheduler.dispatch_tool = _error_body
     _rejecting_flip(f)
 
     await f.harness._maybe_auto_eval(f.assignment, _make_report())
