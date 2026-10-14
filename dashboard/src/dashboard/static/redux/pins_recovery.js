@@ -43,30 +43,33 @@
 // decision arm — or adding one nobody asked for — fails a test instead of
 // nothing.
 //
-// ── (2) WHY NOT A DOM HARNESS (considered and rejected) ───────────────────
-// jsdom or a headless browser would cover the JSX seam this extraction leaves
-// open, and was the first thing considered. It does not fit this repo: there
-// is no package.json, lockfile or tracked node_modules anywhere in git; React
-// 18.3.1 and @babel/standalone 7.29.0 are unpkg CDN tags with SRI hashes,
-// transpiled in-browser with no build step. The ABSENCE of a package.json is
-// load-bearing — it is exactly what makes these static/redux/*.js files
-// resolve as CommonJS for the existing node --test suite, so adding one to
-// host jsdom would break that resolution model. The gate is
-// `cd dashboard && uv run pytest tests/`, so a DOM harness would need an
-// install at gate time or a skip-when-deps-missing guard — and a test that
-// silently skips is the same "passes but does not discriminate" hole these
-// modules exist to close, merely relocated. The settled precedent for this
-// trade is commit bea3edc34f, "GREEN — extract lockChipState helper, rewire
-// chips, drop meta-test" (scheduler_utils.jsx + test_lock_chip_state.py).
+// ── (2) THE JSX CALL SITES: A DOM HARNESS, BUILT (task 4899) ──────────────
+// A DOM harness was first rejected here on three premises, all false. The
+// repo has a root package.json and package-lock.json (task 4538). That
+// package.json declares no "type", so these files still resolve as CommonJS.
+// And verify_cold_preprovision_command already runs `npm ci` from the
+// lockfile in every cold verify, so the harness needs no gate-time install
+// and no skip guard: a missing node_modules fails loudly instead.
+//
+// dashboard/tests/js/dom_harness.mjs loads index.html's scripts into jsdom on
+// the browser's exact Babel and React bytes, each sha384-checked against
+// index.html's integrity attributes. dashboard/tests/js/jsx_render.test.mjs
+// mounts the real tabs and asserts that each helper's descriptor reaches the
+// DOM at every call site. It was accepted by mutation: deleting each call
+// site fails a test (task 4899's mutation-verification commit).
+//
+// The roles stay split. A render DECISION is extracted into a helper like
+// these and unit-tested; the harness covers only the thin call site that
+// consumes it.
 //
 // ── (3) WHAT IS OUT OF SCOPE ──────────────────────────────────────────────
 // Re-hardening the deleted tests with tightened regexes or comment-stripped
 // source fixtures is explicitly out of scope, by the reviewer guidance that
 // motivated 039e55c7ef: hardening the greps deepens the same hole rather than
-// closing it. The residual gap — deleting the thin surviving JSX call site
-// still fails no test, because nothing in this repo renders JSX — is measured
-// rather than assumed (see the mutation-verification step of task 4361) and
-// is filed as a browser-harness follow-up. Do not "restore" the greps.
+// closing it. The residual gap task 4361 measured — deleting a thin JSX call
+// site failed no test (its mutation-verification step) — is closed by the
+// harness in (2), which asserts over rendered DOM, never source text. Do not
+// "restore" the greps.
 //
 // ── (4) NO BROWSER GLOBALS, IN ANY OF THE THREE ───────────────────────────
 // Nothing in these modules reads `window` or `document`: the
