@@ -12,6 +12,7 @@ import logging
 import types
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from _fm_helpers import (
     _leaked_async_httpx_clients,
@@ -20,6 +21,7 @@ from _fm_helpers import (
 )
 from _mock_openai_server import mock_openai_server
 from _sdk_client_stubs import completion_client
+from graphiti_core import Graphiti
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
@@ -127,8 +129,26 @@ async def _start_census() -> None:
 
 
 @pytest.fixture
-def offline_falkor(monkeypatch):
-    """A real Graphiti over a spec'd driver double: no FalkorDB, no preflight request."""
+def async_httpx_clients_built(monkeypatch) -> list:
+    """Every ``httpx.AsyncClient`` constructed during the test, held by strong reference.
+
+    The census above sees only clients still open, so it cannot tell "built
+    nothing" from "built one and closed it"; this list can.
+    """
+    built: list = []
+    original_init = httpx.AsyncClient.__init__
+
+    def recording_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        built.append(self)
+
+    monkeypatch.setattr(httpx.AsyncClient, '__init__', recording_init)
+    return built
+
+
+@pytest.fixture
+def offline_graphiti(monkeypatch):
+    """A real Graphiti over a spec'd driver double: no FalkorDB, no preflight, no extraction."""
     def driver_factory(**_kwargs):
         driver = MagicMock(spec=FalkorDriver)
         driver.clone.return_value = MagicMock(spec=FalkorDriver)
@@ -136,17 +156,24 @@ def offline_falkor(monkeypatch):
 
     monkeypatch.setattr(graphiti_client_module, '_MultiTenantFalkorDriver', driver_factory)
     monkeypatch.setattr(graphiti_client_module, 'check_openai_responses_api', lambda: None)
+    monkeypatch.setattr(Graphiti, 'add_episode', AsyncMock())
+
+
+async def _write_one_episode(backend: GraphitiBackend, group_id: str) -> None:
+    await backend.add_episode(name='e', content='c', group_id=group_id)
+    Graphiti.add_episode.assert_awaited_once()
+    assert Graphiti.add_episode.await_args.kwargs['group_id'] == group_id
 
 
 class TestGraphitiBackendCloseReleasesSdkClients:
     @pytest.mark.asyncio
     async def test_configured_sub_clients_are_shared_and_released(
-        self, mock_config, offline_falkor,
+        self, mock_config, offline_graphiti,
     ):
         await _start_census()
         backend = GraphitiBackend(mock_config)
         await backend.initialize(skip_maintenance=True)
-        backend._client_for('g1')
+        await _write_one_episode(backend, 'g1')
 
         built = _leaked_async_httpx_clients()
         assert len(built) == 3
@@ -157,7 +184,7 @@ class TestGraphitiBackendCloseReleasesSdkClients:
 
     @pytest.mark.asyncio
     async def test_clients_graphiti_mints_for_itself_are_released(
-        self, mock_config, offline_falkor, monkeypatch,
+        self, mock_config, offline_graphiti, monkeypatch,
     ):
         mock_config.llm.providers.openai.api_key = ''
         mock_config.embedder.providers.openai.api_key = ''
@@ -165,7 +192,7 @@ class TestGraphitiBackendCloseReleasesSdkClients:
         await _start_census()
         backend = GraphitiBackend(mock_config)
         await backend.initialize(skip_maintenance=True)
-        backend._client_for('g1')
+        await _write_one_episode(backend, 'g1')
 
         built = _leaked_async_httpx_clients()
         assert len(built) == 5
@@ -176,7 +203,7 @@ class TestGraphitiBackendCloseReleasesSdkClients:
 
     @pytest.mark.asyncio
     async def test_injected_clients_are_owned_and_released(
-        self, mock_config, offline_falkor,
+        self, mock_config, offline_graphiti,
     ):
         await _start_census()
         llm = build_llm_client(mock_config)
@@ -185,7 +212,7 @@ class TestGraphitiBackendCloseReleasesSdkClients:
         assert emb is not None
         backend = GraphitiBackend(mock_config)
         await backend.initialize(skip_maintenance=True, llm_client=llm, embedder=emb)
-        backend._client_for('g1')
+        await _write_one_episode(backend, 'g1')
 
         built = _leaked_async_httpx_clients()
         assert len(built) == 3
@@ -197,8 +224,12 @@ class TestGraphitiBackendCloseReleasesSdkClients:
         assert emb.client.is_closed() is True
 
     @pytest.mark.asyncio
-    async def test_close_before_initialize_is_a_no_op(self, mock_config):
+    async def test_close_before_initialize_builds_nothing(
+        self, mock_config, async_httpx_clients_built,
+    ):
         await GraphitiBackend(mock_config).close()
+
+        assert async_httpx_clients_built == []
 
 
 class TestTaskCuratorCloseReleasesEmbedder:
@@ -216,10 +247,11 @@ class TestTaskCuratorCloseReleasesEmbedder:
         assert _leaked_async_httpx_clients() == []
 
     @pytest.mark.asyncio
-    async def test_close_without_an_embedder_and_a_second_close_do_not_raise(
-        self, mock_config,
+    async def test_close_without_an_embedder_builds_nothing_and_a_second_close_is_safe(
+        self, mock_config, async_httpx_clients_built,
     ):
         await TaskCurator(config=mock_config).close()
+        assert async_httpx_clients_built == []
 
         curator = TaskCurator(config=mock_config)
         await curator._get_embedder()
@@ -265,10 +297,14 @@ class TestRoutingClientsClose:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('owner_cls', [ReadRouter, WriteClassifier])
-    async def test_close_on_a_never_used_owner_is_a_no_op(self, mock_config, owner_cls):
+    async def test_close_on_a_never_used_owner_builds_nothing(
+        self, mock_config, async_httpx_clients_built, owner_cls,
+    ):
         owner = owner_cls(mock_config)
         await owner.close()
         await owner.close()
+
+        assert async_httpx_clients_built == []
 
     @pytest.mark.asyncio
     async def test_an_injected_classifier_client_is_owned_and_released(self, mock_config):
