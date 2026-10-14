@@ -68,6 +68,7 @@ from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import PromptArtifactStore, PromptSpec, default_artifacts_root
 from shared.task_statuses import TaskStatus
 
+from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
 from fused_memory.backends.task_backend_errors import TaskNotFoundError
 from fused_memory.mcp_tools.scheduler_state import effective_lock_depth
 from fused_memory.middleware.candidate_key import compute_candidate_key
@@ -2789,6 +2790,8 @@ class TaskCurator:
             with _ctx.suppress(Exception):
                 await self._qdrant_client.close()
             self._qdrant_client = None
+        embedder, self._embedder = self._embedder, None
+        await close_wrapped_sdk_clients([embedder])
 
     # ------------------------------------------------------------------
     # Idempotency cache
