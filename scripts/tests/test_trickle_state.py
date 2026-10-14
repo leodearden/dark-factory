@@ -850,3 +850,251 @@ class TestRecordedAgeHours:
         verdict while the health probe treats the same input as
         post-worthy."""
         assert trickle_state.recorded_age_hours(doc) is None
+
+
+def _d(day):
+    return date(2026, 7, day)
+
+
+def _fold(backlog, *, target_date, owes_retry, today):
+    return trickle_state.fold_retry_backlog(
+        backlog, target_date=target_date, owes_retry=owes_retry, today=today
+    )
+
+
+def _simulate_outage(outage_nights, *, healthy_nights):
+    """Drive the backlog policy over consecutive nights with no I/O.
+
+    Night ``n`` covers target date ``first + n`` and is recorded the next
+    day. The first ``outage_nights`` scheduled passes are unfinished; each
+    healthy night folds its finished scheduled pass, selects what is due,
+    and folds a finished retry of each selected date. Returns the outage
+    dates, the dates retried in order, every abandoned entry, and the
+    final backlog."""
+    first = _d(1)
+    backlog = {}
+    retried = []
+    abandoned = {}
+    for night in range(outage_nights + healthy_nights):
+        target = first + timedelta(days=night)
+        today = target + timedelta(days=1)
+        healthy = night >= outage_nights
+        fold = _fold(backlog, target_date=target, owes_retry=not healthy,
+                     today=today)
+        backlog = fold.backlog
+        abandoned.update(fold.abandoned)
+        if not healthy:
+            continue
+        for due in trickle_state.select_due_retries(backlog, today=today):
+            fold = _fold(backlog, target_date=due, owes_retry=False,
+                         today=today)
+            backlog = fold.backlog
+            abandoned.update(fold.abandoned)
+            retried.append(due)
+    outage = [first + timedelta(days=n) for n in range(outage_nights)]
+    return outage, retried, abandoned, backlog
+
+
+class TestRetryBacklogPolicy:
+    """The retry-backlog policy as pure functions: no filesystem, no
+    clock. A date is owed a retry when its pass did not finish and
+    committed nothing; the backlog is bounded by age and by attempts."""
+
+    @pytest.mark.parametrize('exit_code, capped, expected', [
+        pytest.param(0, False, True, id='clean'),
+        pytest.param(1, False, False, id='failed'),
+        pytest.param(137, False, False, id='killed'),
+        pytest.param(-1, False, False, id='signalled'),
+        pytest.param(0, True, False, id='capped'),
+        pytest.param(1, True, False, id='failed-and-capped'),
+    ])
+    def test_finished_means_a_clean_exit_that_was_not_capped(
+        self, exit_code, capped, expected
+    ):
+        assert trickle_state.finished(
+            exit_code=exit_code, capped=capped) is expected
+
+    @pytest.mark.parametrize('exit_code, capped, expected', [
+        pytest.param(0, False, False, id='finished'),
+        pytest.param(1, False, True, id='failed'),
+        pytest.param(0, True, True, id='capped'),
+    ])
+    def test_an_unfinished_pass_that_committed_nothing_owes_a_retry(
+        self, exit_code, capped, expected
+    ):
+        assert trickle_state.owes_retry(
+            exit_code=exit_code, capped=capped, commit_made=False
+        ) is expected
+
+    @pytest.mark.parametrize('exit_code, capped', [
+        pytest.param(1, False, id='failed'),
+        pytest.param(0, True, id='capped'),
+        pytest.param(0, False, id='finished'),
+    ])
+    def test_a_pass_that_committed_never_owes_a_retry(self, exit_code, capped):
+        assert trickle_state.owes_retry(
+            exit_code=exit_code, capped=capped, commit_made=True
+        ) is False
+
+    def test_an_unfinished_pass_adds_its_date_with_one_attempt(self):
+        fold = _fold({}, target_date=_d(1), owes_retry=True, today=_d(2))
+
+        assert fold.backlog == {_d(1): 1}
+        assert fold.abandoned == {}
+
+    def test_an_unfinished_pass_on_an_owed_date_increments_it(self):
+        fold = _fold({_d(1): 1}, target_date=_d(1), owes_retry=True,
+                     today=_d(3))
+
+        assert fold.backlog == {_d(1): 2}
+
+    def test_a_finished_pass_removes_its_own_date_and_carries_the_rest(self):
+        backlog = {_d(1): 1, _d(2): 2}
+
+        own = _fold(backlog, target_date=_d(1), owes_retry=False, today=_d(4))
+        other = _fold(backlog, target_date=_d(3), owes_retry=False,
+                      today=_d(4))
+
+        assert own.backlog == {_d(2): 2}
+        assert other.backlog == backlog
+        assert own.abandoned == other.abandoned == {}
+
+    def test_a_fold_never_mutates_its_input(self):
+        backlog = {_d(1): 1, _d(2): 1}
+        snapshot = dict(backlog)
+
+        _fold(backlog, target_date=_d(1), owes_retry=True, today=_d(3))
+        _fold(backlog, target_date=_d(2), owes_retry=False, today=_d(3))
+        _fold(backlog, target_date=_d(1), owes_retry=False, today=_d(30))
+
+        assert backlog == snapshot
+
+    def test_an_entry_older_than_the_window_is_abandoned(self):
+        today = _d(20)
+        max_age = trickle_state.RETRY_MAX_AGE_DAYS
+        too_old = today - timedelta(days=max_age + 1)
+        at_the_edge = today - timedelta(days=max_age)
+
+        backlog, abandoned = _fold(
+            {too_old: 2, at_the_edge: 1},
+            target_date=_d(19), owes_retry=False, today=today,
+        )
+
+        assert backlog == {at_the_edge: 1}
+        assert abandoned == {too_old: 2}
+
+    def test_an_entry_reaching_the_attempt_bound_is_abandoned(self):
+        max_attempts = trickle_state.RETRY_MAX_ATTEMPTS
+
+        fold = _fold({_d(1): max_attempts - 1}, target_date=_d(1),
+                     owes_retry=True, today=_d(3))
+
+        assert fold.backlog == {}
+        assert fold.abandoned == {_d(1): max_attempts}
+
+    def test_due_retries_are_oldest_first_and_at_most_the_limit(self):
+        backlog = {_d(5): 1, _d(3): 2, _d(4): 1}
+        select = trickle_state.select_due_retries
+
+        assert select(backlog, today=_d(6)) == (_d(3),)
+        assert select(backlog, today=_d(6), limit=2) == (_d(3), _d(4))
+        assert select(backlog, today=_d(6), limit=9) == (_d(3), _d(4), _d(5))
+
+    def test_an_entry_outside_the_window_is_never_due(self):
+        today = _d(20)
+        max_age = trickle_state.RETRY_MAX_AGE_DAYS
+        too_old = today - timedelta(days=max_age + 1)
+        at_the_edge = today - timedelta(days=max_age)
+
+        due = trickle_state.select_due_retries(
+            {too_old: 1, at_the_edge: 1}, today=today, limit=5)
+
+        assert due == (at_the_edge,)
+
+    def test_an_empty_backlog_has_nothing_due(self):
+        assert trickle_state.select_due_retries({}, today=_d(2)) == ()
+
+    def test_an_outage_one_night_shorter_than_the_window_is_fully_recovered(
+        self,
+    ):
+        nights = trickle_state.RETRY_MAX_AGE_DAYS - 1
+
+        outage, retried, abandoned, backlog = _simulate_outage(
+            nights, healthy_nights=nights + 2)
+
+        assert retried == outage
+        assert abandoned == {}
+        assert backlog == {}
+
+    def test_a_longer_outage_loses_only_the_dates_the_window_cannot_reach(
+        self,
+    ):
+        nights = trickle_state.RETRY_MAX_AGE_DAYS + 2
+        lost = nights - (trickle_state.RETRY_MAX_AGE_DAYS - 1)
+
+        outage, retried, abandoned, backlog = _simulate_outage(
+            nights, healthy_nights=nights + 2)
+
+        assert abandoned == {d: 1 for d in outage[:lost]}
+        assert retried == outage[lost:]
+        assert backlog == {}
+
+    def test_a_poison_date_is_abandoned_after_the_attempt_bound(self):
+        poison = _d(1)
+        backlog = _fold({}, target_date=poison, owes_retry=True,
+                        today=_d(2)).backlog
+        unfinished_passes = 1
+        abandoned = {}
+        for night in range(2, 12):
+            today = _d(night + 1)
+            backlog = _fold(backlog, target_date=_d(night), owes_retry=False,
+                            today=today).backlog
+            if not trickle_state.select_due_retries(backlog, today=today):
+                break
+            backlog, abandoned = _fold(backlog, target_date=poison,
+                                       owes_retry=True, today=today)
+            unfinished_passes += 1
+
+        assert abandoned == {poison: trickle_state.RETRY_MAX_ATTEMPTS}
+        assert unfinished_passes == trickle_state.RETRY_MAX_ATTEMPTS
+        assert backlog == {}
+
+    @pytest.mark.parametrize('raw', [
+        pytest.param(None, id='None'),
+        pytest.param([['2026-07-01', 1]], id='a-list'),
+        pytest.param('2026-07-01', id='a-string'),
+        pytest.param(3, id='an-int'),
+    ])
+    def test_parsing_a_non_mapping_gives_an_empty_backlog(self, raw):
+        assert trickle_state.parse_retry_backlog(raw) == {}
+
+    def test_parsing_drops_every_invalid_entry_and_keeps_the_rest(self):
+        raw = {
+            '2026-07-01': 2,
+            'not-a-date': 1,
+            '2026-02-30': 1,
+            '2026-07-02': 0,
+            '2026-07-03': -1,
+            '2026-07-04': True,
+            '2026-07-05': '1',
+            '2026-07-06': 1.0,
+        }
+
+        assert trickle_state.parse_retry_backlog(raw) == {_d(1): 2}
+
+    def test_a_serialized_fold_round_trips_through_the_parser(self):
+        fold = _fold({_d(1): 2}, target_date=_d(3), owes_retry=True,
+                     today=_d(4))
+        serialized = {d.isoformat(): n for d, n in fold.backlog.items()}
+
+        parsed = trickle_state.parse_retry_backlog(
+            json.loads(json.dumps(serialized)))
+
+        assert parsed == fold.backlog == {_d(1): 2, _d(3): 1}
+
+    def test_the_recovery_bound_rests_on_these_constants(self):
+        assert (
+            trickle_state.RETRIES_PER_NIGHT,
+            trickle_state.RETRY_MAX_AGE_DAYS,
+            trickle_state.RETRY_MAX_ATTEMPTS,
+        ) == (1, 7, 3)
