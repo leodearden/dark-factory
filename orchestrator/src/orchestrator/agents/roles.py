@@ -887,10 +887,6 @@ this session is one-shot, and abandoned work is recorded as a successful run."""
 # sighting every census cycle, and a number baked into a role prompt goes
 # stale silently.  The evidence sentence instead names the defect's REGION
 # with an open list of sub-shapes, which stays true as new sub-shapes accrue.
-# Task 5954 widened it from the founding empty-slot shape after
-# docs/legibility/confusion-codebook.yaml::cand-20260731-22 and
-# reify docs/legibility/confusion-codebook.yaml::entry-cand-20260725-5 and
-# ::entry-cand-20260813-9 showed other defects in the same region.
 _TOOL_CALL_REJECTION_KNOWN_SHAPES = """
 ## Reading a tool-call rejection before you retry
 
