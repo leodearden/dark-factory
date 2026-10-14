@@ -53,6 +53,7 @@ _CLAIM_KEY = 'claim'
 _RATIONALE_KEY = 'rationale'
 _SEEDED_FROM_KEY = 'seeded_from'
 _OUTCOME_KEY = 'outcome'
+_UNDECODABLE_PAYLOAD_KEY = 'undecodable_payload_json'
 
 
 @dataclass(frozen=True)
@@ -244,12 +245,18 @@ async def record_outcome(
 
     A compare-and-set on the state *record* was read in: ``False`` (and no
     write) if the stored row has moved since. The proposal's own payload keys
-    are kept, so :func:`from_ledger_record` still decodes the row. An executed
-    outcome drops ``expires_at`` so ``ReconLedgerStore.gc`` never reaps it.
+    are kept, so :func:`from_ledger_record` still decodes the row; a payload
+    that was never a JSON object is kept verbatim under one key instead. An
+    executed outcome drops ``expires_at`` so ``ReconLedgerStore.gc`` never
+    reaps it.
     """
     if outcome.state is ProposalState.PROPOSED:
         raise ValueError('an outcome cannot move a row back to proposed')
-    payload = _payload_object(record)
+    payload: dict[str, Any]
+    try:
+        payload = _payload_object(record)
+    except ValueError:
+        payload = {_UNDECODABLE_PAYLOAD_KEY: record.payload_json}
     payload[_OUTCOME_KEY] = outcome.to_payload()
     moved = dataclasses.replace(
         record,

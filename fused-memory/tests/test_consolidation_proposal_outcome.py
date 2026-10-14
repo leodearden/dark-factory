@@ -148,6 +148,33 @@ class TestRecordOutcome:
         assert stored.state == 'refused'
 
     @pytest.mark.asyncio
+    async def test_an_undecodable_row_can_still_be_refused(self, ledger):
+        record = ReconLedgerRecord(
+            project_id=PROJECT_ID,
+            record_kind='consolidation_proposal',
+            flag_type=TOPIC,
+            run_id='run-x',
+            payload_json='not json',
+            state='proposed',
+            created_at=NOW.isoformat(),
+        )
+        await ledger.upsert(record)
+        outcome = _outcome(ProposalState.REFUSED, reason_codes=('proposal_undecodable',))
+
+        assert await record_outcome(ledger, record, outcome) is True
+
+        stored = await ledger.get_by_identity(
+            project_id=PROJECT_ID,
+            record_kind='consolidation_proposal',
+            task_id='',
+            flag_type=TOPIC,
+            run_id='run-x',
+        )
+        assert stored.state == 'refused'
+        assert outcome_from_record(stored) == outcome
+        assert 'not json' in stored.payload_json
+
+    @pytest.mark.asyncio
     async def test_an_outcome_cannot_return_a_row_to_proposed(self, ledger):
         record = await _seed(ledger)
         with pytest.raises(ValueError, match='proposed'):

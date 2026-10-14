@@ -50,17 +50,34 @@ from fused_memory.reconciliation.consolidation_proposal import (
     from_ledger_record,
     newest_per_topic,
     record_outcome,
+    refusal_streak,
 )
 from fused_memory.reconciliation.curator_gate_resolution_sweep import (
     extract_open_gate_task_ids,
 )
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
+from fused_memory.server.consolidation import ProposalLimits, proposal_shape_codes
 from fused_memory.services.consolidation_ops import (
     RetainArmApplied,
     RetainArmRefused,
     apply_retain_arm,
     read_topic_closure,
 )
+
+try:
+    # One combined block, as in stage1_stall_detector.py: the four names bind
+    # or fail together.
+    from escalation.dedupe import (  # type: ignore[import-untyped]
+        DedupeConfig,
+        compute_content_fingerprint,
+        submit_or_dedupe,
+    )
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+except ImportError:
+    Escalation = None  # type: ignore[assignment,misc]
+    DedupeConfig = None  # type: ignore[assignment,misc]
+    compute_content_fingerprint = None  # type: ignore[assignment]
+    submit_or_dedupe = None  # type: ignore[assignment]
 
 if TYPE_CHECKING:
     from fused_memory.config.schema import ConsolidationAutoConfig
@@ -79,6 +96,12 @@ _CANONICAL_STAMP_KEY = 'x_auto_consolidated'
 _SYSTEM_RECORD_KIND = 'auto_consolidation'
 _SYSTEM_RECORD_FACTS_KEY = 'x_auto_consolidation'
 _GATE_DETECTOR = 'auto-consolidation'
+
+REFUSED_CATEGORY = 'recon_auto_consolidation_refused'
+BACKLOG_CATEGORY = 'recon_auto_consolidation_backlog'
+_ESCALATION_KEY = 'auto-consolidation'
+_ESCALATION_ROLE = 'reconciliation-stage1'
+_STREAK_FINDING = 'refusal_streak'
 
 
 class RefusalCode(StrEnum):
@@ -239,10 +262,27 @@ async def _run(
         config=config,
     )
     stats['auto_consolidation_applied_cap'] = plan.cap
+    if plan.backlog_tripped:
+        stats['auto_consolidation_backlog_tripped'] = True
+        stats['auto_consolidation_unexecuted'] = len(plan.deferred) + len(plan.excluded)
+        _escalate_backlog(cycle, listed=len(proposals), threshold=plan.backlog_threshold)
+        return
     stats['auto_consolidation_unexecuted'] += len(plan.deferred)
+    for candidate in plan.excluded:
+        record, _ = proposals[candidate.key]
+        await _refuse(
+            cycle,
+            record,
+            (RefusalCode.CATEGORY_NOT_CONSOLIDATABLE,),
+            detail=f'category {candidate.category!r} carries no flood weight',
+        )
     for candidate in plan.selected:
         record, proposal = proposals[candidate.key]
         try:
+            shape_codes = _shape_codes(proposal, cycle.config)
+            if shape_codes:
+                await _refuse(cycle, record, shape_codes, detail='re-validated aged row')
+                continue
             await _evaluate(cycle, record, proposal)
         except Exception:
             logger.exception(
@@ -306,14 +346,28 @@ async def _live_proposals(
     for row in keep:
         try:
             decoded[row.flag_type] = (row, from_ledger_record(row))
-        except ValueError:
-            logger.warning(
-                'auto_consolidation: undecodable proposal row for topic %r',
-                row.flag_type,
-                exc_info=True,
-                extra={'project_id': cycle.project_id, 'run_id': row.run_id},
-            )
+        except ValueError as exc:
+            await _refuse(cycle, row, (RefusalCode.PROPOSAL_UNDECODABLE,), detail=str(exc))
     return decoded
+
+
+def _shape_codes(
+    proposal: ConsolidationProposal, config: ConsolidationAutoConfig,
+) -> tuple[str, ...]:
+    """The validator's codes for an aged row, re-checked under today's limits."""
+    return tuple(
+        code.value
+        for code in proposal_shape_codes(
+            topic=proposal.topic,
+            member_ids=list(proposal.member_ids),
+            run_id=proposal.run_id,
+            claim=proposal.claim,
+            category=proposal.category,
+            rationale=proposal.rationale,
+            seeded_from=proposal.seeded_from,
+            limits=ProposalLimits.from_config(config),
+        )
+    )
 
 
 def _expired(row: ReconLedgerRecord, now: datetime) -> bool:
@@ -586,24 +640,138 @@ async def _refuse(
     *,
     detail: str,
 ) -> None:
-    """Record a benign refusal on the row and count each code."""
+    """Record a benign refusal on the row, count each code, and escalate it.
+
+    The topic's refusal streak is read from its own rows BEFORE this refusal is
+    recorded; at the threshold the record is a separate ``blocking`` one.
+    """
+    names = tuple(str(c) for c in codes)
+    prior_streak = refusal_streak(
+        await cycle.ledger.list_by_flag_type(
+            cycle.project_id, RECORD_KIND_CONSOLIDATION_PROPOSAL, record.flag_type,
+        ),
+    )
     moved = await record_outcome(
-        cycle.ledger,
-        record,
-        cycle.outcome(ProposalState.REFUSED, reason_codes=tuple(str(c) for c in codes)),
+        cycle.ledger, record, cycle.outcome(ProposalState.REFUSED, reason_codes=names),
     )
     if not moved:
         return
     refusals = cycle.stats['auto_consolidation_refusals']
-    for code in codes:
-        refusals[str(code)] = refusals.get(str(code), 0) + 1
-    logger.info(
-        'auto_consolidation: refused topic %r: %s (%s)',
-        record.flag_type,
-        ', '.join(str(c) for c in codes),
-        detail,
-        extra={'project_id': cycle.project_id, 'run_id': cycle.run_id},
+    for name in names:
+        refusals[name] = refusals.get(name, 0) + 1
+    _escalate_refusal(
+        cycle,
+        topic=record.flag_type,
+        codes=names,
+        blocking=prior_streak >= cycle.config.refusal_streak_threshold,
+        detail='\n'.join([
+            f'project_id: {cycle.project_id}',
+            f'ledger_key: {RECORD_KIND_CONSOLIDATION_PROPOSAL}/{record.flag_type}/{record.run_id}',
+            f'proposal_run_id: {record.run_id}',
+            f'executor_run_id: {cycle.run_id}',
+            f'codes: {", ".join(names)}',
+            f'prior_refusal_streak: {prior_streak}',
+            f'detail: {detail}',
+        ]),
     )
+
+
+def _escalate_refusal(
+    cycle: _Cycle, *, topic: str, codes: Sequence[str], blocking: bool, detail: str,
+) -> None:
+    """File one refusal on the recon queue, folding per (project, topic). Never raises.
+
+    Routine refusals are ``info``. The streak escape is a ``blocking`` record
+    under its own fingerprint, so it never folds into the pending info parent.
+    """
+    if (
+        cycle.escalation_queue is None
+        or Escalation is None
+        or DedupeConfig is None
+        or compute_content_fingerprint is None
+        or submit_or_dedupe is None
+    ):
+        return
+    queue = cycle.escalation_queue
+    summary = f'{topic}: {", ".join(codes)}'
+    affected = [f'{cycle.project_id}:{topic}']
+    try:
+        if blocking:
+            esc = Escalation(
+                id=queue.make_id(_ESCALATION_KEY),
+                task_id=_ESCALATION_KEY,
+                agent_role=_ESCALATION_ROLE,
+                severity='blocking',
+                category=REFUSED_CATEGORY,
+                summary=summary,
+                detail=detail,
+                level=1,
+                dedupe_fingerprint=compute_content_fingerprint(
+                    REFUSED_CATEGORY, _STREAK_FINDING, affected, '',
+                ),
+                project_id=cycle.project_id,
+            )
+        else:
+            esc = Escalation(
+                id=queue.make_id(_ESCALATION_KEY),
+                task_id=_ESCALATION_KEY,
+                agent_role=_ESCALATION_ROLE,
+                severity='info',
+                category=REFUSED_CATEGORY,
+                summary=summary,
+                detail=detail,
+                level=1,
+                dedupe_fingerprint=compute_content_fingerprint(
+                    REFUSED_CATEGORY, '', affected, '',
+                ),
+                project_id=cycle.project_id,
+            )
+        submit_or_dedupe(queue, esc, DedupeConfig.for_content_fingerprint(REFUSED_CATEGORY))
+    except Exception:
+        logger.warning(
+            'auto_consolidation: filing the refusal escalation for topic %r failed',
+            topic,
+            exc_info=True,
+            extra={'project_id': cycle.project_id, 'run_id': cycle.run_id},
+        )
+
+
+def _escalate_backlog(cycle: _Cycle, *, listed: int, threshold: int) -> None:
+    """File the ONE aggregate backlog record, folding per project. Never raises."""
+    if (
+        cycle.escalation_queue is None
+        or Escalation is None
+        or DedupeConfig is None
+        or compute_content_fingerprint is None
+        or submit_or_dedupe is None
+    ):
+        return
+    queue = cycle.escalation_queue
+    try:
+        esc = Escalation(
+            id=queue.make_id(_ESCALATION_KEY),
+            task_id=_ESCALATION_KEY,
+            agent_role=_ESCALATION_ROLE,
+            severity='info',
+            category=BACKLOG_CATEGORY,
+            summary=(
+                f'{cycle.project_id}: {listed} consolidation proposals exceed the '
+                f'backlog threshold {threshold}; nothing was executed or filed'
+            ),
+            detail=f'project_id: {cycle.project_id}\nexecutor_run_id: {cycle.run_id}',
+            level=1,
+            dedupe_fingerprint=compute_content_fingerprint(
+                BACKLOG_CATEGORY, '', [cycle.project_id], '',
+            ),
+            project_id=cycle.project_id,
+        )
+        submit_or_dedupe(queue, esc, DedupeConfig.for_content_fingerprint(BACKLOG_CATEGORY))
+    except Exception:
+        logger.warning(
+            'auto_consolidation: filing the backlog escalation failed',
+            exc_info=True,
+            extra={'project_id': cycle.project_id, 'run_id': cycle.run_id},
+        )
 
 
 async def _apply_arm(

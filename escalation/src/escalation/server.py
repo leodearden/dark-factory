@@ -560,6 +560,9 @@ CATEGORIES = [
     # reaper-submitted branch (stranding-remediation-scheduler-ergonomics-prd.md
     # leaf α).  Inert/unvalidated (action_effects.py:23) — vocabulary parity only.
     'stranded_merge_failed',
+    # Auto-consolidation executor (plans/memory-auto-consolidation-prd.md C4).
+    'recon_auto_consolidation_refused',
+    'recon_auto_consolidation_backlog',
 ]
 
 # OUTPUT keys of a compact row — the triage-relevant subset a long-running L2
