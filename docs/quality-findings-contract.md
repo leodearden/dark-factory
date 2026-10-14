@@ -284,8 +284,10 @@ nor `always_escalates` is rejected at submit, so the chain collapses to
 the human gate alone, carrying `milestone: {mode: delayed, after_secs:
 259200}` (three days of settling) and depending on the run's `critical` and
 `high` tasks (all filed tasks if there are none); it is filed `deferred`
-under `planning_mode`, gains dependencies as `/prd` sessions file them, and
-is committed once the program's FILED table is complete. A run that files
+under `planning_mode`, re-stamped `until_condition` (with the echo check of
+`docs/task-authoring.md` §9 "Deferring a task") if it is held past its filing
+session, gains dependencies as `/prd` sessions file them, and is released to
+`pending` once the program's FILED table is complete. A run that files
 no tasks files no chain and says so in its report. The exact calls for
 both forms, the supersede order and the probe live in
 `skills/_shared/filing-the-trigger-chain.md`; skills cite it.

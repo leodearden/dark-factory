@@ -78,6 +78,8 @@ PRD-decomposition batches are the canonical use case for `planning_mode=True`. *
 
 `planning_mode=True` is **synchronous** and **bypasses the curator**. `submit_task` returns `{task_id, status: "deferred", planning_mode: True}` directly — there is no ticket, no `resolve_ticket` follow-up, no curator `combined` outcome. (The two-phase `submit_task` + `resolve_ticket` pattern applies only to `planning_mode=False`, which decompose mode never uses.)
 
+The server stamps every `planning_mode` birth with a `planning` deferral record (`metadata.deferral.kind == "planning"`); never pass `metadata.deferral` yourself, `submit_task` refuses it.
+
 **Declare every leaf's execution path.** `planning_mode` bypasses the curator-side routing guards (1898/2225/2085) that would otherwise infer `task_kind`/`execution_class` — so the `submit_task` routing-intent lint runs at this boundary instead: a `task_kind="normal"` leaf whose own title/description/details declare a *different* execution path (e.g. "DO NOT IMPLEMENT", "no-code", "deterministic; no worktree", "escalate to a human instead of implementing") gets flagged (or, in enforce mode, rejected) because it carries no matching declaration. Set `task_kind` explicitly on every leaf (`"normal"` for code_tdd work; `"deterministic"` for a deploy/gate leaf — see `CLAUDE.md` "Deterministic task kind").
 
 **The execution-path question is "agent or human?", never "code or not code?"** A docs/comments/rename leaf — any edit an agent can execute mechanically — is `task_kind="normal"` + `metadata.complexity="simple"` (the fast path; its documented scope names docs edits). Set `metadata.execution_class` to `"operational"` or `"decision"` **only when the leaf genuinely requires a human** (a ruling, an operator action no agent can take): that declaration is converted at submit into a deterministic **always-escalates pure gate** whose sole dispatch action is a born-at-L2 escalation to a human, and human attention is the bottleneck. Multiple independent sessions have mis-filed docs leaves as `"operational"` because they "aren't code" (Leo's 2026-08-24 ruling retyped 4626/4671/4675/4680 out of exactly this; semantics reference: `docs/task-authoring.md` §4, "`execution_class` routes to a HUMAN").
@@ -160,6 +162,8 @@ mcp__fused-memory__commit_planning(
 ```
 
 If a single bulk call is rejected (e.g. payload-size cap), split into the smallest number of bulk calls that fit — still never one-at-a-time.
+
+`commit_planning(target_status="pending")` releases only rows holding a `planning` record (or no record); any other hold is refused per id with `not_planning_hold` and stays parked. A task you deliberately hold OUT of the commit needs a real record instead: `commit_planning(project_root=…, task_ids="<id>", target_status="deferred", deferral={"kind": "until_condition", "condition": "<what ends the hold>"})`. Confirm each per-id result echoes `deferral`; no echo means the fused-memory server predates the deferral gate, so the hold is unrecorded: re-stamp it after fused-memory restarts. Recipe: `docs/task-authoring.md` §9 "Deferring a task".
 
 ### Step 5.5 — Stamp + commit the sidecar
 
