@@ -54,11 +54,12 @@ def test_invariant_breach_names_the_field(field: str, overrides: dict) -> None:
     assert field in str(exc_info.value)
 
 
-def test_is_frozen() -> None:
+@pytest.mark.parametrize('field', ['at', 'shape', 'pinning_escalation_ids'])
+def test_is_frozen(field: str) -> None:
     stamp = _stamp()
 
     with pytest.raises(ValidationError):
-        stamp.shape = 'x'  # pyright: ignore[reportAttributeAccessIssue]
+        setattr(stamp, field, 'x')
 
 
 def test_a_valid_stamp_passes_the_write_boundary_without_warnings() -> None:
