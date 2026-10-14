@@ -604,11 +604,12 @@ the module SET is authoritative from the wire spec and a stale remote can
 no longer silently drop modules the spec named or inject ones it did not.
 
 What a stale checkout still does is **run stale verify code**. The remote
-executes its own tree's timeouts, admission logic,
-`verify_cold_preprovision_command` and breadth handling — the gate that
-decides your merge is the one in the remote's checkout, not the one you
-reviewed on the workstation. Verify currency, every time, not just
-reachability.
+executes its own tree's timeouts, admission logic, pre-provision handling
+and breadth handling. The pre-provision *command* now comes from the
+dispatcher's spec (task 6127), but when and how it runs is still the
+remote's code. The gate that decides your merge is the one in the remote's
+checkout, not the one you reviewed on the workstation. Verify currency,
+every time, not just reachability.
 
 ### The per-host YAML
 
@@ -622,21 +623,24 @@ ordinary `load_config` resolution on the remote takes it from there
 `config_path` is left `None`). Name it however you like, or omit it and
 rely on the remote's own `ORCH_CONFIG_PATH`.
 
-**Load-bearing vs. inert.** The dispatcher's wire override
-(`run_merge_verify_on_worktree`'s `config_update`) touches only
+**Load-bearing vs. inert.** The dispatcher's spec is applied onto this
+file by `orchestrator/src/orchestrator/verify_spec_shared.py::apply_spec_to_host_config`,
+the one apply path since task 6667. It sets only
 `merge_verify_workspace`, `merge_verify_breadth`, the three verify
 commands (when the spec carries a `global_verify_command` — see below),
-and the module set (the task-4536 `_module_configs` overwrite). Every
-other verify-behaviour key comes from **this file** and is genuinely
-load-bearing: `project_root`, the `git.*` block, `verify_env`, and the
-full timeout/concurrency/admission/cgroup surface —
-`verify_command_timeout_secs`, `verify_cold_command_timeout_secs`,
+the module set (the task-4536 `_module_configs` overwrite), and
+`verify_cold_preprovision_command`: a non-empty dispatcher value replaces
+this file's, an empty one leaves this file's in force. It also merges
+`verify_env` (see below). Every other verify-behaviour key comes from
+**this file** and is genuinely load-bearing: `project_root`, the `git.*`
+block, `verify_env`, and the full timeout/concurrency/admission/cgroup
+surface — `verify_command_timeout_secs`, `verify_cold_command_timeout_secs`,
 `merge_verify_cold_command_timeout_secs`, `verify_timeout_retries`,
 `concurrent_verify`, `max_concurrent_module_verifies`, the
 `verify_admission_*` and `verify_clock_stop_*` families, `cpu_governance`,
-`scope_cargo`, and `verify_cold_preprovision_command` (the cost recorded
-further down only lands *because* the remote reads that key from this
-file). Scheduler, routing, budget, and escalation sections are the
+and `scope_cargo`. A `verify_cold_preprovision_command` here is a fallback
+only, honoured when the dispatcher ships `''` (an unconfigured or
+pre-6127 dispatcher). Scheduler, routing, budget, and escalation sections are the
 genuinely inert ones for this subcommand and can be left at whatever
 value (or omitted) without effect; don't spend effort keeping those
 sections in sync with the workstation.
@@ -671,17 +675,16 @@ That's divergence from the workstation, not a legitimate fallback;
 "don't restate" holds regardless.
 
 **`verify_env` behaves differently from the three commands above: the
-wire override never touches it, on either branch.** `config_update` has
-no `verify_env` key, so `_resolve_verify_env` always starts from this
-file's `config.verify_env` (plus the authoritative `DF_VERIFY_ROLE`
-stamp) — unconditionally, not just for a zero-module-config project. On
-a project **with** registered module configs, a module's own
-`verify_env` (threaded in by `_module_config_from_command`) is merged on
-top and can add to or override individual keys; on a **zero-module**
-project there is no `ModuleConfig` for that, so this file's top-level
-`verify_env` is the whole answer, unmasked. Either way, setting it here
-has real, non-silent effect — unlike restating a command, it is never
-overridden into a no-op.
+spec merges into it rather than replacing it, on either branch.** Since
+task 5496, `apply_spec_to_host_config` sets `verify_env` to this file's
+effective `verify_env` with the spec's `verify_env` laid over it. The spec
+wins on a conflicting key, because these keys select tests, and a key only
+this file sets survives. `_resolve_verify_env` starts from that merged map
+(plus the authoritative `DF_VERIFY_ROLE` stamp). On a project **with**
+registered module configs, a module's own `verify_env` (threaded in by
+`_module_config_from_command`) is merged on top as well. Either way, a key
+set only here has real, non-silent effect — unlike restating a command, it
+is never overridden into a no-op.
 
 ### Warm vs. ephemeral verify worktrees
 
