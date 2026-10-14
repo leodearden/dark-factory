@@ -1122,7 +1122,7 @@ class TestDeriveVerifyPlanMergeBreadth:
 
 
 # ---------------------------------------------------------------------------
-# The two scopers: &&-chain trailing-clause preservation (task 3061)
+# The scoper: &&-chain trailing-clause preservation (task 3061)
 # ---------------------------------------------------------------------------
 
 # Every real config command, paired with the keyword its slot scopes on. Used
@@ -1153,12 +1153,27 @@ _SHELL_CONSTRUCT_HAZARDS: list[tuple[str, str]] = [
     ('subst-in-double-quotes', 'ruff check "$(ls && echo x)" && python3 y.py'),
 ]
 
+# Chains the tail gate REJECTS, or that bail out before any rewrite: a sibling
+# checker behind the pytest slot (task 3218), and a keyword absent from or
+# OPAQUE in segment 0.
+_REJECTED_CHAINS: list[tuple[str, str]] = [
+    ('pytest-named-sibling', _SIBLING_CHECKER_TEST_COMMAND),
+    ('pytest-unnamed-sibling', _SIBLING_CHECKER_TEST_COMMAND_UNNAMED),
+    ('multi-clause-keyword-absent', 'mypy src/ && python3 x.py'),
+    ('multi-clause-keyword-absent-opaque', 'true && python3 x.py'),
+    ('multi-clause-opaque-prefix', 'echo pytest && python3 x.py'),
+]
+
 _LOCKSTEP_KEYWORDS = ('ruff check', 'pyright', 'pytest')
 
 _LOCKSTEP_CASES = [
-    (raw, keyword, f'{name}::{keyword.replace(" ", "-")}')
-    for name, raw in (*_REAL_CONFIG_COMMANDS, *_SHELL_CONSTRUCT_HAZARDS)
-    for keyword in _LOCKSTEP_KEYWORDS
+    *(
+        (raw, keyword, f'{name}::{keyword.replace(" ", "-")}')
+        for name, raw in (*_REAL_CONFIG_COMMANDS, *_SHELL_CONSTRUCT_HAZARDS, *_REJECTED_CHAINS)
+        for keyword in _LOCKSTEP_KEYWORDS
+    ),
+    # Gate condition 0b: a keyword that is not the tool, over a pytest clause.
+    (_SIBLING_CHECKER_TEST_COMMAND_UNNAMED, 'uv run', 'pytest-unnamed-sibling::uv-run'),
 ]
 
 
@@ -1167,7 +1182,7 @@ class TestScoperTrailingClausePreservation:
 
     Task 3061: every subproject's ``lint_command`` chains a
     ``python3 fused-memory/scripts/check_*.py <dir>`` gate after ``ruff
-    check``. Both scopers truncated at the keyword, so scoped pre-merge
+    check``. Scoping truncated at the keyword, so scoped pre-merge
     verify silently ran only ruff — the bare-MagicMock and asyncmock-
     assertion gates were invisible until post-merge (task 2920's violation
     landed exactly this way).
@@ -1423,17 +1438,6 @@ class TestTailPreservationAllowlist:
             ' fused-memory/tests'
         ) in scoped
 
-    @pytest.mark.parametrize(
-        'raw',
-        [_SIBLING_CHECKER_TEST_COMMAND, _SIBLING_CHECKER_TEST_COMMAND_UNNAMED],
-        ids=['sibling-names-the-tool', 'sibling-does-not-name-the-tool'],
-    )
-    def test_lockstep_holds_on_the_rejected_pytest_chains(self, raw):
-        """The string scoper is the rendered plan scoper on these chains too."""
-        assert _scope_to_keyword(raw, 'pytest', self._FILES) == render(
-            scope_prefix_to_keyword(raw, 'pytest', self._FILES)
-        )
-
 
 # ---------------------------------------------------------------------------
 # A gate-rejected multi-clause command must SAY what it dropped
@@ -1637,35 +1641,6 @@ class TestDroppedChainClausesAreLogged:
             assert string_result == raw
             assert render(plan_result) == raw
 
-    @pytest.mark.parametrize(
-        ('raw', 'keyword'),
-        [
-            (ROOT_TYPE_CHECK_COMMAND, 'pyright'),
-            (ROOT_TEST_COMMAND, 'pytest'),
-            (_SIBLING_CHECKER_TEST_COMMAND, 'pytest'),
-            (_SIBLING_CHECKER_TEST_COMMAND_UNNAMED, 'pytest'),
-            (FM_LINT_COMMAND, 'ruff check'),
-            ('ruff check src/ --select E', 'ruff check'),
-            ('mypy src/', 'ruff check'),
-            ('true', 'pytest'),
-            ('mypy src/ && python3 x.py', 'ruff check'),
-            ('true && python3 x.py', 'pytest'),
-            ('echo pytest && python3 x.py', 'pytest'),
-            ('uv run pytest tests/ && python3 scripts/check_markers.py tests', 'uv run'),
-        ],
-        ids=[
-            'root-type-check', 'root-test', 'pytest-named-sibling',
-            'pytest-unnamed-sibling', 'fm-lint', 'single-clause', 'opaque-mypy', 'no-op-true',
-            'multi-clause-keyword-absent', 'multi-clause-keyword-absent-opaque',
-            'multi-clause-opaque-prefix', 'uv-run-keyword-over-a-pytest-clause',
-        ],
-    )
-    def test_logging_is_the_only_observable_change(self, raw, keyword):
-        """The string scoper's command stays byte-identical to the rendered plan scoper's."""
-        string_scoped = _scope_to_keyword(raw, keyword, self._FILES)
-        plan_scoped = render(scope_prefix_to_keyword(raw, keyword, self._FILES))
-        assert string_scoped == plan_scoped
-
 
 # ---------------------------------------------------------------------------
 
@@ -1682,7 +1657,7 @@ class TestReprojectStrChainTail:
     Once the scoper starts preserving a trailing ``&&`` clause, the string
     handed to ``_reproject_str`` is a chain; re-parsing the whole chain
     classifies it OPAQUE and the injection is SILENTLY dropped. This class
-    guards that regression BEFORE the scopers change, so no intermediate
+    guards that regression BEFORE the scoping change, so no intermediate
     commit is red.
 
     It ALSO guards the converse hazard (task 3061 step-7). ``_reproject_str``

@@ -228,11 +228,12 @@ def _reproject_str(cmd: str | None, project: str) -> str | None:
     ``cwd_rel is not None`` ("an explicit ``--directory`` is already set"),
     so in exactly the bailed case the discarded expression was a pure
     re-render with no ``--project`` injection to lose. Note this asymmetry
-    against the two scopers: they apply ``strip_cwd``, so their ``cwd_rel``
-    is always already ``None`` at render time and neither needs this guard.
-    ``strip_cwd`` is deliberately NOT used here — unlike the scopers, which
-    re-target to worktree-root-relative files, this helper acts on an
-    unscoped/bail-through command whose ``--directory`` is load-bearing (it
+    against the scoper (``verify_plan.py::scope_prefix_to_keyword``, and its
+    string rendering ``_scope_to_keyword``): it applies ``strip_cwd``, so its
+    ``cwd_rel`` is always already ``None`` at render time and it needs no
+    such guard. ``strip_cwd`` is deliberately NOT used here — unlike the
+    scoper, which re-targets to worktree-root-relative files, this helper
+    acts on an unscoped/bail-through command whose ``--directory`` is load-bearing (it
     selects the directory ruff/pyright run in and find their config from).
     Bail, do not rewrite. Guarding on *tail* first keeps the pre-existing
     no-tail ``--directory`` -> ``cd`` renormalisation byte-identical.
@@ -2024,8 +2025,10 @@ def _with_junitxml_str(cmd: str | None, junit_path: str) -> str | None:
     cause of the no-op — a raw-retained ``&&``-chain, an OPAQUE command, a
     non-pytest tool — rather than only the tail-preservation one. As of task
     3218 step-2 the tail-preservation cause is no longer reachable through
-    the two scopers at all (``'pytest'`` is off ``_TAIL_PRESERVING_KEYWORDS``,
-    so a chained pytest slot now comes back structured); this remains as
+    the scoper (``verify_plan.py::scope_prefix_to_keyword``, and its string
+    rendering ``_scope_to_keyword``) at all (``'pytest'`` is off
+    ``_TAIL_PRESERVING_KEYWORDS``, so a chained pytest slot now comes back
+    structured); this remains as
     defence in depth for a hand-written multi-clause ``test_command`` that
     reaches the injection site directly.
 

@@ -787,8 +787,9 @@ def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
     re-emits it as a leading ``cd X &&``. A caller that re-renders a parsed
     head WITHOUT ``strip_cwd`` must therefore additionally refuse to carry a
     tail when ``parsed.cwd_rel is not None`` — see ``verify._reproject_str``,
-    the only such caller. The two scopers apply ``strip_cwd``, so their
-    ``cwd_rel`` is always ``None`` by render time.
+    the only such caller. The scoper (``verify_plan.py::scope_prefix_to_keyword``,
+    and its string rendering ``verify._scope_to_keyword``) applies
+    ``strip_cwd``, so its ``cwd_rel`` is always ``None`` by render time.
     """
     if keyword not in _TAIL_PRESERVING_KEYWORDS:
         return raw, ''
@@ -2061,8 +2062,10 @@ def with_junitxml(cmd: VerifyCmd, junit_path: str) -> VerifyCmd:
     rewritten, rather than risking a mis-scoped injection into an
     unstructured shell string.
 
-    That no-op used to be reachable from the two scopers, which would hand
-    back a raw-retained chain whenever ``split_chain_tail`` preserved a tail
+    That no-op used to be reachable from the scoper
+    (``verify_plan.py::scope_prefix_to_keyword``, and its string rendering
+    ``verify._scope_to_keyword``), which would hand back a raw-retained
+    chain whenever ``split_chain_tail`` preserved a tail
     — so the run simply collected no junit (B3), silently. Task 3218 closed
     that route: ``'pytest'`` is off ``_TAIL_PRESERVING_KEYWORDS``, so a
     chained pytest slot now comes back structured and injectable. The
@@ -2092,7 +2095,7 @@ def with_pytest_timeout(cmd: VerifyCmd, secs: int) -> VerifyCmd:
     regex-rewrite branch here, so a recognised-but-unstructurable
     ``&&``-chained pytest command is left byte-identical rather than
     rewritten. As with ``with_junitxml``, task 3218 made that no-op
-    unreachable via the two scopers — the pytest slot is off the gate's
+    unreachable via the scoper — the pytest slot is off the gate's
     tail-preservation allowlist, so it now yields a structured command.
 
     The α confirm gate injects this AFTER ``serial_pytest``'s
