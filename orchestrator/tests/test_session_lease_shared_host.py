@@ -37,10 +37,26 @@ def shared_host_pid(tmp_path_factory: pytest.TempPathFactory) -> Iterator[int]:
         cwd=host_dir,
     )
     try:
+        _await_host_argv(proc.pid)
         yield proc.pid
     finally:
         proc.kill()
         proc.wait(timeout=10)
+
+
+def _await_host_argv(pid: int) -> None:
+    """Wait for ``/proc/<pid>/cmdline`` to show the host argv.
+
+    Popen returns once the child's exec has closed its CLOEXEC pipe, which the
+    kernel does before it publishes the new argv, so a loaded host can read an
+    empty cmdline for a moment after Popen returns.
+    """
+    cmdline = Path(f'/proc/{pid}/cmdline')
+    deadline = time.monotonic() + 10
+    while cmdline.read_bytes().split(b'\0')[1:2] != [b'agents']:
+        if time.monotonic() > deadline:
+            pytest.fail(f'{cmdline} never showed the `agents` argv')
+        time.sleep(0.01)
 
 
 def _age(path: Path, seconds: float) -> None:
