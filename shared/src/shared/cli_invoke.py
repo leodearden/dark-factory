@@ -2334,6 +2334,7 @@ async def invoke_with_cap_retry(
     max_cap_retries: int | None = None,
     rebuild_prompt: PromptBuilder | None = None,
     resume_delivers_prompt: bool = False,
+    resume_on_cap_hit: bool = True,
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
     park_on_frozen_pool: bool = True,
@@ -2347,7 +2348,8 @@ async def invoke_with_cap_retry(
     cooldown doubles, capped at ``_MAX_CAP_COOLDOWN_SECS`` (300 s).
 
     On cap hit, if the capped invocation produced a ``session_id``, the
-    retry resumes that session via ``--resume`` instead of starting fresh.
+    retry resumes that session via ``--resume`` instead of starting fresh,
+    unless the caller passes ``resume_on_cap_hit=False``.
     This preserves all agent progress (tool calls, reasoning) across
     account switches.  If resume itself fails (non-cap-hit error), falls
     back to a fresh invocation with the original (or rebuilt) prompt.
@@ -2435,6 +2437,12 @@ async def invoke_with_cap_retry(
     ``workflow._invoke``: a crash-recovered session already holds the full
     task context, so the short crash-recovery continuation prompt is sufficient
     and the real prompt is kept only as ``original_prompt`` for fresh-fallback.
+
+    *resume_on_cap_hit*, when ``True`` (the default), applies the two-part
+    resume rule above.  ``False`` makes every cap-hit re-dispatch fresh, for
+    a stateless caller whose retry would preserve nothing worth keeping.  It
+    governs only the loop's own cap-hit re-arm: a caller-preset
+    ``resume_session_id`` (crash recovery) is unaffected.
 
     *label* identifies the caller in log messages (e.g. "Module tagging",
     "Task 7 [implementer]").
@@ -2994,6 +3002,9 @@ async def invoke_with_cap_retry(
                     if not result.session_id:
                         _reset_for_fresh_retry(invoke_kwargs, original_prompt)
                         resume_or_fresh = 'fresh (no session_id)'
+                    elif not resume_on_cap_hit:
+                        _reset_for_fresh_retry(invoke_kwargs, original_prompt)
+                        resume_or_fresh = 'fresh (caller opted out of cap-hit resume)'
                     elif config_dir is not None and not transcript_exists(
                         config_dir.path, result.session_id
                     ):
