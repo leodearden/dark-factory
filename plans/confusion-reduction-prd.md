@@ -179,6 +179,8 @@ Measured 2026-10-11 over the census-finding population (the 400 most recently mo
 
 Measured 2026-10-12, read-only, over all 44,330 transcripts in `~/.claude/projects/*/`: 7,005 sessions open their first non-sidechain, non-meta user turn with the trickle coder's prompt (6,405 under `-home-leo-src-dark-factory`, 600 under `-home-leo-src-reify`). Before this change they classified 6,138 `interactive`, 465 `recon`, 307 `orchestrated-task` and 95 `watcher`; 852 of the 867 non-interactive classes came from a marker inside the coder prompt itself, which quotes the digest it codes. After it, all 7,005 are `legibility-instrument`.
 
+**Known gap, owned by task 6847.** The periodic census sends two more instrument prompts, `census.py::_verify_prompt` ("You are the periodic-census verifier …") and `census.py::_synthesis_prompt` ("You are the periodic-census synthesis writer …"). Neither opener is in `INSTRUMENT_PROMPT_OPENERS`, so their sessions still classify by whatever markers the clusters they embed happen to quote. Measured 2026-10-12 over the same population: 761 verifier sessions, 542 of them with signal, and 20 synthesis sessions, all with signal. With that much signal, whether they join this stratum or are excluded from sampling is a separate decision, so it is left to that task rather than settled by adding the two openers here.
+
 ### 7.3 Coding record (coder output → merger input)
 
 JSONL, one object per digest, strict schema:
