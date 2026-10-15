@@ -63,7 +63,17 @@ from typing import IO, TYPE_CHECKING, Protocol
 
 from shared.verify_admission import nice_prefix
 
+from orchestrator import offline_lane_runs
 from orchestrator.guard_state import PersistentMap, PersistentSet, guard_path
+from orchestrator.offline_lane_records import (
+    LEGACY_INFRA_COMMAND,
+    LEGACY_NUMERIC_COMMAND,
+    Leg,
+    Phase,
+    RunRecordStore,
+    classify_exit,
+)
+from orchestrator.verify import _extract_failing_test_ids, _serial_pytest_str
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
@@ -95,22 +105,6 @@ _OFFLINE_LANE_FAILURE_BACKOFF_SECS: float = 60.0
 # fail-open retry — never a permanent give-up.
 _OFFLINE_LANE_MAX_FAILURE_BACKOFF_SECS: float = 900.0
 
-# Default suite-run seam script (Part A, gated separately at ζ — see module
-# docstring's cross-project scope boundary).
-_RUN_OFFLINE_DEEP_SCRIPT: str = 'scripts/run-offline-deep.sh'
-
-# Default infra sub-run seam script + scope (task 1959, IE1): reify's H9
-# (reify:4929) host-exclusive runner.  IE-D2 — `--scope host-infra`
-# SELF-ACQUIRES the H8 Lane-X flock, so no DF-side flock is needed here.
-_RUN_ALL_INFRA_SCRIPT: str = 'tests/infra/run_all.sh'
-_INFRA_SCOPE: str = 'host-infra'
-
-# Matches reify H9's per-test result lines, e.g. '  RESULT: FAIL (test_x.sh)'
-# or '  RESULT: PASS (test_y.sh)'.  Only FAIL lines are of interest to the
-# infra confirmation runner; the captured group is the test-FILE-name.
-_INFRA_RESULT_FAIL_RE = re.compile(r'^\s*RESULT:\s*FAIL\s*\((?P<name>.+?)\)\s*$')
-
-
 def _parse_infra_failures(text: str) -> list[str]:
     """Extract still-failing test-file-names from reify H9's stdout (IE1).
 
@@ -123,7 +117,7 @@ def _parse_infra_failures(text: str) -> list[str]:
     names = {
         m.group('name')
         for line in text.splitlines()
-        if (m := _INFRA_RESULT_FAIL_RE.match(line))
+        if (m := offline_lane_runs.INFRA_RESULT_FAIL_RE.match(line))
     }
     return sorted(names)
 
@@ -233,9 +227,10 @@ class OfflineLaneWorker:
         lock_path: Path to this worker's dedicated lockfile (keyword-only).
         suite_runner: Optional injectable async seam
             ``(wt_path, head, threads) -> (rc, tail)`` for the heavy suite
-            run.  Defaults to :meth:`_default_run_suite` (a real
-            ``scripts/run-offline-deep.sh`` subprocess invocation) when not
-            supplied.
+            run.  Defaults to
+            ``orchestrator/src/orchestrator/offline_lane_runs.py::suite_runner``
+            (a real ``scripts/run-offline-deep.sh`` subprocess invocation)
+            when not supplied.
         confirmation_runner: Optional injectable async seam (β3)
             ``(wt_path, head) -> confirmed_still_failing_ids`` used by
             :meth:`_handle_red_run` to filter flakes before fingerprinting.
@@ -243,8 +238,9 @@ class OfflineLaneWorker:
         infra_runner: Optional injectable async seam (task 1959, IE1),
             same ``SuiteRunner`` signature as ``suite_runner``, for the
             second (infra) sub-run: reify's ``run_all --scope host-infra``
-            (H9 = reify:4929).  Defaults to :meth:`_default_run_infra` when
-            not supplied.  IE-D2: the infra scope self-acquires the H8
+            (H9 = reify:4929).  Defaults to
+            ``orchestrator/src/orchestrator/offline_lane_runs.py::infra_runner``
+            when not supplied.  IE-D2: the infra scope self-acquires the H8
             Lane-X flock — no DF-side flock is taken here.
         infra_confirmation_runner: Optional injectable async seam (task
             1959, IE1), same ``ConfirmationRunner`` signature as
@@ -256,8 +252,8 @@ class OfflineLaneWorker:
             ``(LaneCommand, wt_path, head) -> (rc, tail)``, for the generic
             per-project command sub-runs iterated from
             ``config.git.offline_lane_commands``.  Defaults to
-            :meth:`_default_run_command` (an idle-niced ``sh -c`` subprocess)
-            when not supplied.
+            ``orchestrator/src/orchestrator/offline_lane_runs.py::command_runner``
+            (an idle-niced ``sh -c`` subprocess) when not supplied.
         command_confirmation_runner: Optional injectable async seam (task
             2789), ``(LaneCommand, wt_path, head) -> confirmed_still_failing_ids``,
             bound per-command by :meth:`_run_once` into :meth:`_handle_red_run`'s
@@ -303,8 +299,11 @@ class OfflineLaneWorker:
         self.git_ops = git_ops
         self.config = config
         self.lock_path = Path(lock_path)
+        self.records = RunRecordStore(config.project_root)
         self.suite_runner: SuiteRunner = (
-            suite_runner if suite_runner is not None else self._default_run_suite
+            suite_runner
+            if suite_runner is not None
+            else offline_lane_runs.suite_runner(self.records)
         )
         self.confirmation_runner: ConfirmationRunner = (
             confirmation_runner
@@ -312,7 +311,9 @@ class OfflineLaneWorker:
             else self._default_confirmation_run
         )
         self.infra_runner: SuiteRunner = (
-            infra_runner if infra_runner is not None else self._default_run_infra
+            infra_runner
+            if infra_runner is not None
+            else offline_lane_runs.infra_runner(self.records)
         )
         self.infra_confirmation_runner: ConfirmationRunner = (
             infra_confirmation_runner
@@ -320,7 +321,9 @@ class OfflineLaneWorker:
             else self._default_infra_confirmation_run
         )
         self.command_runner: CommandRunner = (
-            command_runner if command_runner is not None else self._default_run_command
+            command_runner
+            if command_runner is not None
+            else offline_lane_runs.command_runner(self.records)
         )
         self.command_confirmation_runner: CommandConfirmationRunner = (
             command_confirmation_runner
@@ -533,17 +536,21 @@ class OfflineLaneWorker:
         if not head:
             logger.warning('offline-lane: get_main_sha returned empty head; skipping run')
             return
+        await asyncio.to_thread(self.records.prune, self.records.now())
         wt = await self.git_ops.reset_persistent_offline_deep_worktree(head)
         threads = self.config.git.offline_lane_test_threads
 
         numeric_green = True
         if self.config.git.offline_lane_legacy_numeric_enabled:
+            await asyncio.to_thread(
+                self.records.allocate_pass, LEGACY_NUMERIC_COMMAND, Leg.NUMERIC, head,
+            )
             start = time.monotonic()
             rc, _tail = await self.suite_runner(wt, head, threads)
             duration = time.monotonic() - start
             logger.info(
-                'offline-lane: numeric sub-run head=%s status=%s duration=%.1fs',
-                head[:12], 'PASS' if rc == 0 else 'FAIL', duration,
+                'offline-lane: numeric sub-run head=%s status=%s ended_by=%s duration=%.1fs',
+                head[:12], 'PASS' if rc == 0 else 'FAIL', classify_exit(rc), duration,
             )
             numeric_green = rc == 0
             if not numeric_green:
@@ -551,12 +558,15 @@ class OfflineLaneWorker:
 
         infra_green = True
         if self.config.git.offline_lane_infra_enabled:
+            await asyncio.to_thread(
+                self.records.allocate_pass, LEGACY_INFRA_COMMAND, Leg.INFRA, head,
+            )
             start = time.monotonic()
             rc, _tail = await self.infra_runner(wt, head, threads)
             duration = time.monotonic() - start
             logger.info(
-                'offline-lane: infra sub-run head=%s status=%s duration=%.1fs',
-                head[:12], 'PASS' if rc == 0 else 'FAIL', duration,
+                'offline-lane: infra sub-run head=%s status=%s ended_by=%s duration=%.1fs',
+                head[:12], 'PASS' if rc == 0 else 'FAIL', classify_exit(rc), duration,
             )
             infra_green = rc == 0
             if not infra_green:
@@ -577,12 +587,13 @@ class OfflineLaneWorker:
         for cmd in self.config.git.offline_lane_commands:
             if not cmd.enabled:
                 continue
+            await asyncio.to_thread(self.records.allocate_pass, cmd.name, Leg.GENERIC, head)
             start = time.monotonic()
             rc, _tail = await self.command_runner(cmd, wt, head)
             duration = time.monotonic() - start
             logger.info(
-                'offline-lane: %s sub-run head=%s status=%s duration=%.1fs',
-                cmd.name, head[:12], 'PASS' if rc == 0 else 'FAIL', duration,
+                'offline-lane: %s sub-run head=%s status=%s ended_by=%s duration=%.1fs',
+                cmd.name, head[:12], 'PASS' if rc == 0 else 'FAIL', classify_exit(rc), duration,
             )
             if rc != 0:
                 generic_green = False
@@ -983,40 +994,11 @@ class OfflineLaneWorker:
     # Default injectable seam implementation
     # ------------------------------------------------------------------
 
-    async def _default_run_suite(self, wt_path: Path, head: str, threads: int) -> tuple[int, str]:
-        """Default ``suite_runner`` seam — runs the real offline-deep script.
-
-        Cross-project scope boundary: Part A's ``scripts/run-offline-deep.sh``
-        and its ``DF_VERIFY_ROLE=offline`` role are not yet on reify ``main``
-        (gated at ζ).  This default implementation builds the invocation
-        unconditionally; wiring it to a real, present script is ζ's job.
-
-        Modeled on ``DeterministicRunner._default_run_script``
-        (``deterministic_runner.py:313``): env overlays ``DF_VERIFY_ROLE``
-        onto a full ``os.environ`` copy (never a bespoke subset, so PATH /
-        HOME / XDG_RUNTIME_DIR etc. survive) — the offline role's nice/ionice
-        footprint lives inside the script itself (Part A), not re-implemented
-        here.  ``head`` is accepted for seam-signature/logging symmetry with
-        injected runners; the worktree is already checked out to it by the
-        caller (:meth:`_run_once`) before this is invoked.
-        """
-        argv = [_RUN_OFFLINE_DEEP_SCRIPT, f'--test-threads={threads}']
-        env = {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=str(wt_path),
-            env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        stdout, _ = await proc.communicate()
-        tail = (stdout or b'').decode(errors='replace')[-2000:]
-        return proc.returncode or 0, tail
-
     async def _default_confirmation_run(self, wt: Path, head: str) -> list[str]:
         """Default ``confirmation_runner`` seam — re-runs failures serially, isolated (β3).
 
-        Cross-project scope boundary (same as :meth:`_default_run_suite`):
+        Cross-project scope boundary (same as
+        ``orchestrator/src/orchestrator/offline_lane_runs.py::suite_runner``):
         the real reify-side confirm-failures invocation — discover which
         tests just failed, re-run them isolated/serial once, report those
         still failing — is ζ's job; this default builds the invocation
@@ -1026,10 +1008,9 @@ class OfflineLaneWorker:
         (a flake filter must never share state across parallel test
         workers). ``--confirm-failed`` is the confirm-failures flag
         distinguishing this from a normal suite run. ``env``/``cwd`` mirror
-        :meth:`_default_run_suite` exactly (same ``DF_VERIFY_ROLE=offline``
+        the numeric detect seam exactly (same ``DF_VERIFY_ROLE=offline``
         overlay onto a full ``os.environ`` copy). ``head`` is accepted for
-        seam-signature symmetry with injected runners, same as
-        :meth:`_default_run_suite`.
+        seam-signature symmetry with injected runners.
 
         Parses stdout via the module-level :func:`_parse_confirmed_failures`
         helper: normal output is newline-separated test IDs (blank/whitespace-
@@ -1039,58 +1020,28 @@ class OfflineLaneWorker:
         rejected to ``[]`` rather than turned into bogus confirmed IDs (task
         #5308).
         """
-        argv = [_RUN_OFFLINE_DEEP_SCRIPT, '--test-threads=1', '--confirm-failed']
+        argv = [
+            offline_lane_runs.RUN_OFFLINE_DEEP_SCRIPT, '--test-threads=1', '--confirm-failed',
+        ]
         env = {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=str(wt),
+        launched = await offline_lane_runs.launch(
+            argv,
+            cwd=wt,
             env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+            store=self.records,
+            lane_pass=offline_lane_runs.require_current_pass(self.records, LEGACY_NUMERIC_COMMAND),
+            phase=Phase.CONFIRM,
+            output_format=offline_lane_runs.OutputFormat.OPAQUE,
         )
-        stdout, _ = await proc.communicate()
-        text = (stdout or b'').decode(errors='replace')
-        return _parse_confirmed_failures(text)
-
-    async def _default_run_infra(self, wt_path: Path, head: str, threads: int) -> tuple[int, str]:
-        """Default ``infra_runner`` seam — runs reify's H9 host-infra scope (IE1).
-
-        Cross-project scope boundary (same as :meth:`_default_run_suite`):
-        reify's ``tests/infra/run_all.sh`` (H9 = reify:4929) is not
-        necessarily present/confirmed on every checkout — real wiring is
-        gated separately via ``config.git.offline_lane_infra_enabled``
-        (task 1959, IE1), exactly like ``offline_lane_enabled`` gates
-        :meth:`_default_run_suite`'s ζ script. This default builds the
-        invocation unconditionally.
-
-        NO ``--test-threads``: IE-D2 — ``--scope host-infra`` SELF-ACQUIRES
-        the H8 Lane-X flock and runs the host-exclusive set serially, so a
-        thread count is meaningless and no DF-side flock is taken here.
-        ``env``/``cwd`` mirror :meth:`_default_run_suite` exactly (same
-        ``DF_VERIFY_ROLE=offline`` overlay onto a full ``os.environ``
-        copy). ``head``/``threads`` are accepted only for ``SuiteRunner``
-        seam-signature symmetry with the numeric runner; ``threads`` is
-        unused.
-        """
-        argv = [_RUN_ALL_INFRA_SCRIPT, '--scope', _INFRA_SCOPE]
-        env = {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=str(wt_path),
-            env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        stdout, _ = await proc.communicate()
-        tail = (stdout or b'').decode(errors='replace')[-2000:]
-        return proc.returncode or 0, tail
+        return _parse_confirmed_failures(launched.text)
 
     async def _default_infra_confirmation_run(self, wt: Path, head: str) -> list[str]:
         """Default ``infra_confirmation_runner`` seam — re-runs H9 host-infra (IE1).
 
-        Cross-project scope boundary (same as :meth:`_default_run_infra`).
-        Re-invokes reify's H9 with the SAME argv/env/cwd as
-        :meth:`_default_run_infra` — the whole host-exclusive set is small
+        Cross-project scope boundary (same as
+        ``orchestrator/src/orchestrator/offline_lane_runs.py::infra_runner``).
+        Re-invokes reify's H9 with the SAME argv/env/cwd as that detect
+        seam — the whole host-exclusive set is small
         and self-serializes under its own flock (IE-D2), so re-running the
         full scope is an acceptable flake filter (mirrors
         :meth:`_default_confirmation_run`'s serial re-run, without needing
@@ -1104,50 +1055,18 @@ class OfflineLaneWorker:
         one line per test with an explicit PASS/FAIL verdict rather than
         listing only failures.
         """
-        argv = [_RUN_ALL_INFRA_SCRIPT, '--scope', _INFRA_SCOPE]
+        argv = [offline_lane_runs.RUN_ALL_INFRA_SCRIPT, '--scope', offline_lane_runs.INFRA_SCOPE]
         env = {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=str(wt),
+        launched = await offline_lane_runs.launch(
+            argv,
+            cwd=wt,
             env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+            store=self.records,
+            lane_pass=offline_lane_runs.require_current_pass(self.records, LEGACY_INFRA_COMMAND),
+            phase=Phase.CONFIRM,
+            output_format=offline_lane_runs.OutputFormat.INFRA,
         )
-        stdout, _ = await proc.communicate()
-        text = (stdout or b'').decode(errors='replace')
-        return _parse_infra_failures(text)
-
-    async def _default_run_command(
-        self, cmd: LaneCommand, wt_path: Path, head: str,
-    ) -> tuple[int, str]:
-        """Default ``command_runner`` seam — runs a generic per-project command (task 2789).
-
-        Launches ``cmd.command`` (a shell string) via ``sh -c`` at idle
-        nice/ionice (``nice_prefix('background')`` = ``nice -n 19 ionice -c3``)
-        in ``<wt_path>/<cmd.cwd>``, with ``DF_VERIFY_ROLE=offline`` overlaid
-        onto a full ``os.environ`` copy — mirroring :meth:`_default_run_suite`.
-
-        D4: a bare ``pytest`` does not self-nice (unlike the reify scripts, for
-        which ``nice_prefix('offline')`` returns ``[]``), so the generic runner
-        applies the idle-class prefix itself. ``sh -c`` is needed because
-        ``command`` is a shell string. ``head`` is accepted for seam-signature
-        symmetry with injected runners; the worktree is already checked out to
-        it by :meth:`_run_once`. Returns the return code and the decoded,
-        2000-char output tail (stdout+stderr interleaved).
-        """
-        run_cwd = wt_path / cmd.cwd
-        argv = [*nice_prefix('background'), 'sh', '-c', cmd.command]
-        env = {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=str(run_cwd),
-            env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        stdout, _ = await proc.communicate()
-        tail = (stdout or b'').decode(errors='replace')[-2000:]
-        return proc.returncode or 0, tail
+        return _parse_infra_failures(launched.text)
 
     async def _default_confirm_command(
         self, cmd: LaneCommand, wt_path: Path, head: str,
@@ -1158,7 +1077,8 @@ class OfflineLaneWorker:
         :func:`~orchestrator.verify._serial_pytest_str` rewrites ``cmd.command``
         to run serial (``-p no:xdist``; the run cwd's governing addopts kept minus xdist), falling
         back to the raw command when it is not a pytest invocation; the command is
-        launched exactly like :meth:`_default_run_command` (idle nice/ionice
+        launched exactly like
+        ``orchestrator/src/orchestrator/offline_lane_runs.py::command_runner`` (idle nice/ionice
         ``sh -c`` in ``<wt_path>/<cmd.cwd>``, ``DF_VERIFY_ROLE=offline``); and
         :func:`~orchestrator.verify._extract_failing_test_ids` extracts the
         still-failing pytest node-ids from the FULL captured stdout (not the
@@ -1175,26 +1095,22 @@ class OfflineLaneWorker:
         returned instead of ``[]`` — the red is filed/escalated rather than
         silently swallowed as a flake. A project wanting richer per-failure
         dedup for a non-pytest command injects its own
-        ``command_confirmation_runner``. Both helpers are imported lazily to
-        avoid an ``offline_lane`` <-> ``verify`` import cycle (mirrors the
-        existing lazy ``workflow`` import in :meth:`_handle_red_run`).
+        ``command_confirmation_runner``.
         """
-        from orchestrator.verify import _extract_failing_test_ids, _serial_pytest_str
-
         run_cwd = wt_path / cmd.cwd
         serial_command = _serial_pytest_str(cmd.command, invocation_dir=run_cwd) or cmd.command
         argv = [*nice_prefix('background'), 'sh', '-c', serial_command]
         env = {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=str(run_cwd),
+        launched = await offline_lane_runs.launch(
+            argv,
+            cwd=run_cwd,
             env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+            store=self.records,
+            lane_pass=offline_lane_runs.require_current_pass(self.records, cmd.name),
+            phase=Phase.CONFIRM,
+            output_format=offline_lane_runs.OutputFormat.PYTEST,
         )
-        stdout, _ = await proc.communicate()
-        text = (stdout or b'').decode(errors='replace')
-        ids = _extract_failing_test_ids(text)
+        ids = _extract_failing_test_ids(launched.text)
         if ids:
             return ids
         # No pytest node-ids parsed from the serial re-run. Disambiguate a
@@ -1208,6 +1124,6 @@ class OfflineLaneWorker:
         #     files a dedup'd fix task, and stages to L2. Keyed on cmd.name
         #     alone (not rc or an output hash) so repeated reds of the same
         #     command dedup to one open fix task and stall->L2 cleanly.
-        if (proc.returncode or 0) != 0:
+        if launched.record.returncode != 0:
             return [f'{cmd.name}::nonzero-exit']
         return []

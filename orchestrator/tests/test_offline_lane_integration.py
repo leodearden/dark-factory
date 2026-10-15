@@ -66,6 +66,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
 from orchestrator.offline_lane import OfflineLaneWorker
+from orchestrator.offline_lane_records import LEGACY_NUMERIC_COMMAND, Leg
 
 logger = logging.getLogger(__name__)
 
@@ -1671,6 +1672,18 @@ _VERIFY_USAGE_DUMP = (
 )
 
 
+def _child_writing(output: bytes, *, returncode: int):
+    """A fake ``create_subprocess_exec`` whose child writes *output* into the file it is handed."""
+
+    async def fake_exec(*argv, **kwargs):
+        kwargs['stdout'].write(output)
+        proc = AsyncMock()
+        proc.returncode = returncode
+        return proc
+
+    return fake_exec
+
+
 @pytest.mark.asyncio
 async def test_verify_usage_dump_confirmation_files_no_task_or_escalation(git_ops, tmp_path):
     """Incident reproduction (task 5308; reify:5264) — when the DEFAULT numeric
@@ -1694,13 +1707,11 @@ async def test_verify_usage_dump_confirmation_files_no_task_or_escalation(git_op
     head = await git_ops.get_main_sha()
     wt_path = git_ops.persistent_offline_deep_worktree_path
 
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(return_value=(_VERIFY_USAGE_DUMP.encode(), b''))
-    mock_proc.returncode = 64
+    worker.records.allocate_pass(LEGACY_NUMERIC_COMMAND, Leg.NUMERIC, head)
 
     with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_child_writing(_VERIFY_USAGE_DUMP.encode(), returncode=64),
     ):
         await worker._handle_red_run(wt_path, head)
 

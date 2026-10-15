@@ -940,43 +940,150 @@ _XDIST_NODE_DOWN_PRECEDING_NODEID_RE = re.compile(
 )
 
 
-def _extract_failing_test_ids(test_output: str) -> list[str]:
-    """Extract pytest node-ids of failing/errored/crashed tests from *test_output*.
+class FailureKind(StrEnum):
+    FAILED = 'failed'
+    ERROR = 'error'
 
-    Scans for the three failure surfaces documented above the module-level
-    patterns: ``FAILED <nodeid>`` summary lines, ``ERROR <nodeid>`` /
-    ``ERROR <file.py>`` summary lines (fixture/teardown/collection errors),
-    and xdist worker-crash notices (both the explicit ``crashed while
-    running '<nodeid>'`` phrasing and the in-progress ``<nodeid>`` line
-    immediately preceding a ``node down: Not properly terminated`` marker).
 
-    Returns node-ids in first-seen (leftmost-match) order, de-duplicated.
-    Returns ``[]`` for falsy *test_output* or output with no recoverable
-    node-id (a non-test failure such as a lint/type error block, or a
-    worker-crash notice with no adjacent node-id) — the caller
-    (``confirm_main_tip_failure_is_real``) treats an empty list as
-    "unconfirmable" and fails safe to alarm rather than guessing.
+@dataclass(frozen=True)
+class PytestFailure:
+    node_id: str
+    kind: FailureKind
+    first_line: str
+
+
+@dataclass(frozen=True)
+class _FailureMatch:
+    position: int
+    node_id: str
+    kind: FailureKind
+    summary_reason: str | None  # None: the surface is not a short-summary line
+
+
+_SUMMARY_LINE_SURFACES = (
+    (_FAILED_LINE_NODEID_RE, FailureKind.FAILED),
+    (_ERROR_LINE_NODEID_RE, FailureKind.ERROR),
+    (_ERROR_LINE_FILE_RE, FailureKind.ERROR),
+)
+_XDIST_CRASH_SURFACES = (
+    (_XDIST_CRASH_NODEID_RE, FailureKind.FAILED),
+    (_XDIST_NODE_DOWN_PRECEDING_NODEID_RE, FailureKind.FAILED),
+)
+_SUMMARY_REASON_SEPARATOR = ' - '
+_SECTION_HEADER_RE = re.compile(r'^_+ (.+?) _+$', re.MULTILINE)
+_SECTION_END_RE = re.compile(r'^(?:_+ .+ _+|=+ .+ =+)$', re.MULTILINE)
+_ERROR_SECTION_PREFIX_RE = re.compile(r'^ERROR (?:at (?:setup|teardown) of|collecting) ')
+_TRACEBACK_E_PREFIX = 'E   '
+
+
+def _summary_reason(test_output: str, match: re.Match[str]) -> str:
+    line_end = test_output.find('\n', match.end(1))
+    rest = test_output[match.end(1) : len(test_output) if line_end < 0 else line_end]
+    return rest.partition(_SUMMARY_REASON_SEPARATOR)[2].strip()
+
+
+def _failure_matches(test_output: str) -> list[_FailureMatch]:
+    matches = [
+        _FailureMatch(m.start(1), m.group(1), kind, _summary_reason(test_output, m))
+        for pattern, kind in _SUMMARY_LINE_SURFACES
+        for m in pattern.finditer(test_output)
+    ]
+    matches += [
+        _FailureMatch(m.start(1), m.group(1), kind, None)
+        for pattern, kind in _XDIST_CRASH_SURFACES
+        for m in pattern.finditer(test_output)
+    ]
+    return sorted(matches, key=lambda match: match.position)
+
+
+def _section_title(node_id: str) -> str:
+    return '.'.join(node_id.split('::')[1:]) or node_id
+
+
+_SectionBodies = dict[tuple[str, FailureKind], list[str]]
+
+
+def _section_bodies(test_output: str) -> _SectionBodies:
+    """Every FAILURES/ERRORS section body, keyed by its ``(title, kind)``, in output order."""
+    bodies: _SectionBodies = {}
+    for header in _SECTION_HEADER_RE.finditer(test_output):
+        title = _ERROR_SECTION_PREFIX_RE.sub('', header.group(1))
+        kind = FailureKind.ERROR if title != header.group(1) else FailureKind.FAILED
+        section_end = _SECTION_END_RE.search(test_output, header.end())
+        body = test_output[header.end() : section_end.start() if section_end else len(test_output)]
+        bodies.setdefault((title, kind), []).append(body)
+    return bodies
+
+
+def _section_body_of(sections: _SectionBodies, node_id: str, kind: FailureKind) -> str | None:
+    candidates = sections.get((_section_title(node_id), kind), [])
+    if len(candidates) <= 1:
+        return candidates[0] if candidates else None
+    path_line = re.compile(rf'^{re.escape(node_id.partition("::")[0])}:\d+:', re.MULTILINE)
+    naming_path = [body for body in candidates if path_line.search(body)]
+    return naming_path[0] if len(naming_path) == 1 else None
+
+
+def _section_first_error_line(sections: _SectionBodies, node_id: str, kind: FailureKind) -> str:
+    """First ``E   `` line of the FAILURES/ERRORS section pytest printed for the test."""
+    body = _section_body_of(sections, node_id, kind)
+    traceback_line = _PYTEST_TRACEBACK_E_RE.search(body) if body is not None else None
+    if traceback_line:
+        return traceback_line.group(0).removeprefix(_TRACEBACK_E_PREFIX).strip()
+    return ''
+
+
+def _stated_first_line(matches: list[_FailureMatch]) -> str | None:
+    """The summary-line reason, ``''`` when no surface can carry one, ``None`` when the sections must be read."""
+    stated_reasons = [m.summary_reason for m in matches if m.summary_reason]
+    if stated_reasons:
+        return stated_reasons[0]
+    if any(m.summary_reason is not None for m in matches):
+        return None
+    return ''
+
+
+def parse_pytest_failures(test_output: str) -> tuple[PytestFailure, ...]:
+    """Parse the failing, errored and crashed tests named in pytest *test_output*.
+
+    Reads the five surfaces documented above ``_FAILED_LINE_NODEID_RE``, in
+    first-seen (leftmost-match) order, de-duplicated on ``(node_id, kind)``: a
+    node that is both FAILED and ERROR yields two entries.  ``first_line`` is the
+    reason on the short-summary line, else the first ``E   `` line of the test's
+    own FAILURES/ERRORS section, else ``''``; it is not length-capped.  Sections
+    sharing a title are told apart by the ``path:line:`` lines naming the test's
+    file; if that does not single one out, ``first_line`` is ``''``.  Returns
+    ``()`` for falsy *test_output*.
     """
     if not test_output:
-        return []
-    matches: list[tuple[int, str]] = []
-    for pattern in (
-        _FAILED_LINE_NODEID_RE,
-        _ERROR_LINE_NODEID_RE,
-        _ERROR_LINE_FILE_RE,
-        _XDIST_CRASH_NODEID_RE,
-        _XDIST_NODE_DOWN_PRECEDING_NODEID_RE,
-    ):
-        for m in pattern.finditer(test_output):
-            matches.append((m.start(1), m.group(1)))
-    matches.sort(key=lambda item: item[0])
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for _, node_id in matches:
-        if node_id not in seen:
-            seen.add(node_id)
-            ordered.append(node_id)
-    return ordered
+        return ()
+    by_identity: dict[tuple[str, FailureKind], list[_FailureMatch]] = {}
+    for match in _failure_matches(test_output):
+        by_identity.setdefault((match.node_id, match.kind), []).append(match)
+    stated = {identity: _stated_first_line(matches) for identity, matches in by_identity.items()}
+    sections = _section_bodies(test_output) if None in stated.values() else {}
+    return tuple(
+        PytestFailure(
+            node_id, kind,
+            _section_first_error_line(sections, node_id, kind) if line is None else line,
+        )
+        for (node_id, kind), line in stated.items()
+    )
+
+
+def node_ids_of(failures: Iterable[PytestFailure]) -> list[str]:
+    """Node ids in order, de-duplicated on ``node_id`` alone."""
+    return list(dict.fromkeys(failure.node_id for failure in failures))
+
+
+def _extract_failing_test_ids(test_output: str) -> list[str]:
+    """Node-ids of failing/errored/crashed tests in first-seen order, de-duplicated.
+
+    ``[]`` when *test_output* is falsy or names no recoverable node-id; the
+    caller (``confirm_main_tip_failure_is_real``) treats that as "unconfirmable"
+    and fails safe to alarm.  Byte-identical to the pre-typed-parse scan.
+    """
+    return list(dict.fromkeys(match.node_id for match in _failure_matches(test_output)))
 
 
 class _JunitTestIds(NamedTuple):
