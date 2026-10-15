@@ -50,7 +50,7 @@ _SEGMENT_KEYS = {
 
 
 def _fleet_segments() -> list[ChainSegment]:
-    """The committed fleet chain's 8 runnable segments."""
+    """The committed fleet chain's 9 runnable segments."""
     segments = split_and_chain_segments(_FLEET_TEST_COMMAND)
     assert segments is not None, 'the committed fleet chain must be segmentable'
     return segments
@@ -138,9 +138,9 @@ class TestRunSegmentedRunsEverySegment:
 
         assert rc == 0
         assert timed_out is False
-        assert len(seg_dicts) == len(segments) == 8
-        assert [d['status'] for d in seg_dicts] == ['passed'] * 8
-        assert len(run_one.calls) == 8
+        assert len(seg_dicts) == len(segments) == 9
+        assert [d['status'] for d in seg_dicts] == ['passed'] * 9
+        assert len(run_one.calls) == 9
         # Each segment ran in the cwd the shell's own `cd` folding would have
         # put it in — that is the whole reason `cd` clauses are folded rather
         # than executed.
@@ -204,7 +204,7 @@ class TestRunSegmentedRunsEverySegment:
             now=clock,
         )
 
-        assert len(run_one.calls) == 8, 'segments after the red one were skipped'
+        assert len(run_one.calls) == 9, 'segments after the red one were skipped'
         assert [call[3] for call in run_one.calls] == [s.label for s in segments]
         # The clause esc-3062-2 is about, with its own verdict rather than
         # silence.
@@ -216,7 +216,7 @@ class TestRunSegmentedRunsEverySegment:
         assert rc == 1
         assert timed_out is False
         assert [d['status'] for d in seg_dicts] == (
-            ['passed'] * 2 + ['failed'] + ['passed'] * 5
+            ['passed'] * 2 + ['failed'] + ['passed'] * 6
         )
 
     @pytest.mark.asyncio
@@ -244,7 +244,7 @@ class TestRunSegmentedRunsEverySegment:
         )
 
         assert rc == 3
-        assert len(run_one.calls) == 8
+        assert len(run_one.calls) == 9
         assert seg_dicts[1]['status'] == 'failed'
         assert seg_dicts[1]['rc'] == 3
         assert seg_dicts[4]['status'] == 'failed'
@@ -272,7 +272,7 @@ class TestRunSegmentedRunsEverySegment:
             now=clock,
         )
 
-        assert len(run_one.calls) == 8
+        assert len(run_one.calls) == 9
         assert seg_dicts[0]['status'] == 'timed_out'
         assert seg_dicts[0]['timed_out'] is True
         assert seg_dicts[0]['rc'] == 124
@@ -314,7 +314,7 @@ class TestRunSegmentedSharedDeadline:
 
     @staticmethod
     async def _exhaust_after_two(tmp_path):
-        """8 segments, a 10s budget, and 5s per segment — 2 run, 6 do not."""
+        """9 segments, a 10s budget, and 5s per segment — 2 run, 7 do not."""
         clock = _Clock(cost_per_segment=5.0)
         run_one = _RecordingRunOne(clock)
         segments = _fleet_segments()
@@ -335,7 +335,7 @@ class TestRunSegmentedSharedDeadline:
         run_one, _rc, _output, _timed_out, seg_dicts = await self._exhaust_after_two(tmp_path)
 
         assert len(run_one.calls) == 2
-        assert [d['status'] for d in seg_dicts] == ['passed'] * 2 + ['not_run'] * 6
+        assert [d['status'] for d in seg_dicts] == ['passed'] * 2 + ['not_run'] * 7
 
     @pytest.mark.asyncio
     async def test_not_run_segments_carry_rc_none_and_a_skip_reason(self, tmp_path):
@@ -429,7 +429,7 @@ class TestRunSegmentedSharedDeadline:
         assert rc == 7
         assert timed_out is False
         assert [d['status'] for d in seg_dicts] == (
-            ['passed', 'failed'] + ['not_run'] * 6
+            ['passed', 'failed'] + ['not_run'] * 7
         )
 
     @pytest.mark.asyncio
@@ -458,7 +458,7 @@ class TestRunSegmentedSharedDeadline:
             now=clock,
         )
 
-        assert [d['status'] for d in seg_dicts] == ['passed'] * 2 + ['not_run'] * 6
+        assert [d['status'] for d in seg_dicts] == ['passed'] * 2 + ['not_run'] * 7
         assert rc != 0
         assert timed_out is True
 
@@ -584,13 +584,13 @@ class TestRunSegmentedRoster:
         segments = _fleet_segments()
         from orchestrator.verify import _run_segmented  # noqa: PLC0415
 
-        # 8 segments at 5s each needs 40s; a 35s budget is exhausted exactly as
-        # the 8th is reached, leaving it unrun.
+        # 9 segments at 5s each needs 45s; a 40s budget is exhausted exactly as
+        # the 9th is reached, leaving it unrun.
         return await _run_segmented(
             segments,
             run_one=run_one,
             worktree=tmp_path,
-            budget_secs=35.0,
+            budget_secs=40.0,
             now=clock,
         )
 
@@ -600,11 +600,11 @@ class TestRunSegmentedRoster:
 
         lines = output.splitlines()
         roster = [line for line in lines[: len(seg_dicts)]]
-        assert len(roster) == len(seg_dicts) == 8
+        assert len(roster) == len(seg_dicts) == 9
         for line in roster:
             assert line.startswith('#'), f'roster line is not `#`-prefixed: {line!r}'
         for entry, line in zip(seg_dicts, roster, strict=True):
-            assert f'{entry["index"]}/8' in line
+            assert f'{entry["index"]}/9' in line
             assert entry['label'] in line
         # The roster leads; per-segment output blocks come after it.
         assert lines[len(seg_dicts)].startswith('=====') or lines[len(seg_dicts)] == ''
@@ -614,15 +614,15 @@ class TestRunSegmentedRoster:
         _rc, output, _timed_out, seg_dicts = await self._mixed_run(tmp_path)
 
         assert [d['status'] for d in seg_dicts] == (
-            ['passed'] * 2 + ['failed'] + ['passed'] * 4 + ['not_run']
+            ['passed'] * 2 + ['failed'] + ['passed'] * 5 + ['not_run']
         )
-        roster = output.splitlines()[:8]
-        assert 'NOT RUN' in roster[7]
+        roster = output.splitlines()[:9]
+        assert 'NOT RUN' in roster[8]
         # A reader must be able to tell the red from the greens and from the
         # one that never ran, without decoding rc numbers.
         assert roster[2] != roster[0]
-        assert roster[7] != roster[2]
-        assert len({roster[0], roster[2], roster[7]}) == 3
+        assert roster[8] != roster[2]
+        assert len({roster[0], roster[2], roster[8]}) == 3
 
     @pytest.mark.asyncio
     async def test_roster_is_inert_to_the_cause_hint_and_category_scanners(self, tmp_path):
@@ -779,7 +779,7 @@ class TestRunVerificationSegmentChainedTestWiring:
         segments = _fleet_segments()
 
         test_calls = [c for c in calls if 'pytest' in c['cmd']]
-        assert len(test_calls) == 8
+        assert len(test_calls) == 9
         assert [c['cmd'] for c in test_calls] == [s.command for s in segments]
         assert [c['cwd'] for c in test_calls] == [tmp_path / s.cwd_rel for s in segments]
 
@@ -800,8 +800,8 @@ class TestRunVerificationSegmentChainedTestWiring:
         test_run = _test_run_entry(runs)
         assert test_run['cmd'] == _FLEET_TEST_COMMAND
         assert test_run['segments'] is not None
-        assert len(test_run['segments']) == 8
-        assert [s['status'] for s in test_run['segments']] == ['passed'] * 8
+        assert len(test_run['segments']) == 9
+        assert [s['status'] for s in test_run['segments']] == ['passed'] * 9
 
     @pytest.mark.asyncio
     async def test_each_segment_streams_to_its_own_log_path(self, tmp_path):
@@ -811,9 +811,9 @@ class TestRunVerificationSegmentChainedTestWiring:
         )
 
         test_paths = [c['log_path'] for c in calls if 'pytest' in c['cmd']]
-        assert len(test_paths) == 8
+        assert len(test_paths) == 9
         assert all(p is not None for p in test_paths)
-        assert len(set(test_paths)) == 8
+        assert len(set(test_paths)) == 9
         for path, segment in zip(test_paths, _fleet_segments(), strict=True):
             assert path.name == f'attempt-1.__fallback__.test.{segment.label}.log'
 
@@ -947,7 +947,7 @@ class TestSegmentsAreDashNCapped:
         _result, calls, _runs = await self._run_capped(tmp_path, role=role)
 
         cmds = self._segment_cmds(calls)
-        assert len(cmds) == 8
+        assert len(cmds) == 9
         for cmd in cmds:
             assert '-n 4' in cmd, f'segment was not -n capped under role={role}: {cmd}'
 
@@ -983,9 +983,9 @@ class TestSegmentsAreDashNCapped:
         segments = _fleet_segments()
 
         test_calls = [c for c in calls if 'pytest' in c['cmd']]
-        assert len(test_calls) == 8
+        assert len(test_calls) == 9
         assert [c['cwd'] for c in test_calls] == [tmp_path / s.cwd_rel for s in segments]
-        assert len({c['log_path'] for c in test_calls}) == 8
+        assert len({c['log_path'] for c in test_calls}) == 9
 
     @pytest.mark.real_verify_admission
     @pytest.mark.asyncio
@@ -1232,10 +1232,10 @@ class TestPerSegmentJunitIsDeliberatelyUnwired:
             )
         # Preconditions, so neither guard test can pass vacuously: BOTH sides
         # of the co-occurrence must really be present. `_prepare_junit_report_path`
-        # creates `.df-verify-junit` exactly when it returns a path, and 8
+        # creates `.df-verify-junit` exactly when it returns a path, and 9
         # `_run_cmd` calls mean the chain really did segment.
         assert (tmp_path / '.df-verify-junit').exists(), 'no junit path was computed'
-        assert len([c for c in calls if 'pytest' in c['cmd']]) == 8, 'chain did not segment'
+        assert len([c for c in calls if 'pytest' in c['cmd']]) == 9, 'chain did not segment'
         return result, calls, runs
 
     @pytest.mark.asyncio
@@ -1446,12 +1446,12 @@ class TestRunVerificationSegmentedAcceptance:
         assert test_run['cmd'] == _FLEET_TEST_COMMAND, 'the persisted cmd is still the whole chain'
         segments = test_run['segments']
         assert segments is not None
-        assert len(segments) == 8
+        assert len(segments) == 9
 
         by_label = {s['label']: s for s in segments}
         # The fact the old &&-chain could NEVER produce.
-        assert by_label['root-8']['status'] == 'passed'
-        assert by_label['root-8']['rc'] == 0
+        assert by_label['root-9']['status'] == 'passed'
+        assert by_label['root-9']['rc'] == 0
         # Substring, not a full literal: this segment's command comes from the
         # LIVE committed yaml, whose target LIST grows as the fleet gains
         # script suites (it gained `scripts/tests/` on 2026-08-02). What
@@ -1460,10 +1460,11 @@ class TestRunVerificationSegmentedAcceptance:
         # here just re-breaks this test on every unrelated config edit.
         # `test_verify_cmd.TestSplitAndChainSegmentsLiveConfigDrift` is the
         # single place that guards the exact text.
-        assert 'tests/scripts/' in by_label['root-8']['cmd']
+        assert 'tests/scripts/' in by_label['root-9']['cmd']
         # Nothing after the red was skipped.
         assert [s['status'] for s in segments] == [
             'passed', 'passed', 'failed', 'passed', 'passed', 'passed', 'passed', 'passed',
+            'passed',
         ]
         # ...and the unrelated red is still a red overall. Running the later
         # segments buys information, never leniency.
@@ -1484,7 +1485,7 @@ class TestRunVerificationSegmentedAcceptance:
         not_run = [s for s in segments if s['status'] == 'not_run']
         assert [s['label'] for s in not_run] == [
             'orchestrator-3', 'fused-memory-4', 'dashboard-5',
-            'sampler-6', 'root-7', 'root-8',
+            'sampler-6', 'client-feed-7', 'root-8', 'root-9',
         ]
         # Every segment that actually executed passed...
         assert all(s['status'] == 'passed' for s in segments if s['status'] != 'not_run')
@@ -1526,7 +1527,7 @@ class TestRunVerificationSegmentedAcceptance:
 
         This is the COMMON shape of a red fallback verify, not a corner case:
         removing the `&&` short-circuit — the whole point of task 3338 — makes
-        budget exhaustion strictly MORE likely, because all 8 segments now
+        budget exhaustion strictly MORE likely, because all 9 segments now
         always run where the shell previously stopped at the first red. The
         committed config's own measured table already sums a measured subset of
         the chain's suites into the fleet chain floor (the figure itself lives
@@ -1551,7 +1552,7 @@ class TestRunVerificationSegmentedAcceptance:
 
         segments = _test_run_entry(runs)['segments']
         assert [s['status'] for s in segments] == (
-            ['passed', 'failed', 'passed'] + ['not_run'] * 5
+            ['passed', 'failed', 'passed'] + ['not_run'] * 6
         )
 
         assert result.passed is False
@@ -1683,7 +1684,7 @@ class TestSegmentsReachThePersistedSummaryJson:
         assert by_label['orchestrator-3']['status'] == 'failed'
         # The fact the old &&-chain could never write down: the LAST clause ran
         # anyway, and the persisted artifact says so on its own evidence.
-        assert by_label['root-8']['status'] == 'passed'
+        assert by_label['root-9']['status'] == 'passed'
 
     @pytest.mark.asyncio
     async def test_unrun_segments_are_readable_from_the_file_not_only_the_log_text(
@@ -1693,7 +1694,7 @@ class TestSegmentsReachThePersistedSummaryJson:
         _result, summary = await self._run_persisting(tmp_path, blow_budget_after=3)
 
         segments = self._command_entry(summary, 'test')['segments']
-        assert [s['status'] for s in segments] == ['passed'] * 3 + ['not_run'] * 5
+        assert [s['status'] for s in segments] == ['passed'] * 3 + ['not_run'] * 6
         for entry in segments:
             if entry['status'] == 'not_run':
                 assert entry['rc'] is None, 'a segment that never ran must not read as rc 0'
@@ -1805,7 +1806,7 @@ class TestEachSegmentRecordsItsOwnXdist:
         by_label = {seg['label']: seg['xdist']['n_flag'] for seg in segments}
         # Measured: the cockpit subshell parses raw-retained, and _xdist_workers
         # names no flag for a raw-retained command although its text carries -n 8.
-        assert by_label.pop('root-7') is None
+        assert by_label.pop('root-8') is None
         assert set(by_label.values()) == {'8'}
 
 
@@ -1903,10 +1904,10 @@ class TestSegmentedTaskLegsArchivePerSegmentJunit:
         _result, calls, _archive = await self._run_archiving(tmp_path)
 
         targets = {c['segment']: _segment_junit_target(c['cmd']) for c in calls}
-        assert len(targets) == 8
+        assert len(targets) == 9
         # Measured: the cockpit subshell parses raw-retained, which
         # with_junitxml leaves untouched rather than risk a mis-scoped injection.
-        assert targets.pop('root-7') is None
+        assert targets.pop('root-8') is None
         assert None not in targets.values()
         assert len(set(targets.values())) == len(targets), (
             f'two segments were handed one report path: {targets}'
@@ -1919,21 +1920,21 @@ class TestSegmentedTaskLegsArchivePerSegmentJunit:
         _result, calls, archive_root = await self._run_archiving(tmp_path)
 
         wrote = [c['segment'] for c in calls if _segment_junit_target(c['cmd'])]
-        assert len(wrote) == 7
+        assert len(wrote) == 8
         for label in wrote:
             archived = self._archived(archive_root, label)
             assert len(archived) == 1, (label, archived)
             assert gzip.decompress(archived[0].read_bytes()).decode('utf-8') == (
                 _segment_report(label)
             )
-        assert len(list((archive_root / '3338').glob('*.junit-*.xml.gz'))) == 7
+        assert len(list((archive_root / '3338').glob('*.junit-*.xml.gz'))) == 8
 
     @pytest.mark.asyncio
     async def test_a_segment_that_never_ran_archives_no_stale_report(self, tmp_path):
         from orchestrator.verify import _task_junit_report_path  # noqa: PLC0415
 
         (tmp_path / '.task').mkdir(parents=True, exist_ok=True)
-        stale = _task_junit_report_path(tmp_path, 1, '__fallback__', segment_label='root-8')
+        stale = _task_junit_report_path(tmp_path, 1, '__fallback__', segment_label='root-9')
         assert stale is not None
         stale.write_text(_segment_report('an-earlier-pass'), encoding='utf-8')
 
@@ -1941,10 +1942,10 @@ class TestSegmentedTaskLegsArchivePerSegmentJunit:
             tmp_path, blow_budget_after=3,
         )
 
-        assert 'root-8' not in {c['segment'] for c in calls}, (
+        assert 'root-9' not in {c['segment'] for c in calls}, (
             'precondition: the budget clock left root-8 unrun'
         )
-        assert self._archived(archive_root, 'root-8') == []
+        assert self._archived(archive_root, 'root-9') == []
 
     @pytest.mark.asyncio
     async def test_task_path_attribution_is_unchanged(self, tmp_path):
@@ -1989,7 +1990,7 @@ class TestSegmentedTaskLegsArchivePerSegmentJunit:
             if 'junitxml injection suppressed' in r.getMessage()
         ]
         assert not [m for m in suppressed if 'attempt-1.__fallback__.test.junit.xml' in m]
-        assert [m for m in suppressed if '.test.root-7.junit.xml' in m], (
+        assert [m for m in suppressed if '.test.root-8.junit.xml' in m], (
             'precondition: the cockpit segment, which truly writes no report, '
             'still says so'
         )
