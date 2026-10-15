@@ -52,10 +52,10 @@ A gated slug moves all-or-nothing; an ungated slug does not
 When any member write of a GATED slug fails, ``rename_group`` undoes the
 members that moved, because a gate left on a vacated slug is uncloseable.
 
-An UNGATED slug gets no undo.  A partial failure leaves it split: the members
-that moved carry the new slug and the rest keep the legacy value.  The residue
-probe files ``legacy_slug_residue`` for it, and the report lists the group
-under ``ungated_partial_rename``.
+An UNGATED slug gets no undo.  A failed member write leaves it split: the
+members that moved carry the new slug and each member whose write failed keeps
+the legacy value.  The residue probe files ``legacy_slug_residue`` for it, and
+the report lists the group under ``ungated_partial_rename``.
 
 A plain re-run does NOT finish the move.  The collision guard sees the moved
 members as incumbents on the new slug and refuses the stragglers as
@@ -1405,8 +1405,8 @@ def describe_partial_ungated_group(group: GateGroup, results: list[dict]) -> dic
     if group.gate_task_id is not None:
         return None
     stood = [r for r in results if r.get('outcome') in _STOOD_OUTCOMES]
-    failed = [r for r in results if r.get('outcome') not in _STOOD_OUTCOMES]
-    if not stood or not failed:
+    stragglers = [r for r in results if r.get('outcome') in _LEFT_ON_LEGACY_OUTCOMES]
+    if not stood or not stragglers:
         return None
     return {
         'reason': 'ungated_partial_rename',
@@ -1414,15 +1414,16 @@ def describe_partial_ungated_group(group: GateGroup, results: list[dict]) -> dic
         'old_topic': group.old_topic,
         'new_topic': group.new_topic,
         'stood_memory_ids': sorted(r['memory_id'] for r in stood),
-        'failed_memory_ids': sorted(r['memory_id'] for r in failed),
-        'failed_outcomes': sorted({str(r.get('outcome')) for r in failed}),
+        'failed_memory_ids': sorted(r['memory_id'] for r in stragglers),
+        'failed_outcomes': sorted({str(r.get('outcome')) for r in stragglers}),
         'note': (
             'this slug carries no consolidation gate, so members that move are '
             'not rolled back when another fails and the slug is split across '
-            'both values; a plain re-run refuses the failed members still on '
-            'the legacy value as slug_collision, because the moved members '
-            'occupy the new slug — finish them by hand once their failure is '
-            'resolved (see the module docstring)'
+            'both values (in a dry run the split is predicted, not yet made); '
+            'a plain re-run refuses the failed members still on the legacy '
+            'value as slug_collision, because the moved members occupy the new '
+            'slug — finish them by hand once their failure is resolved (see '
+            'the module docstring)'
         ),
     }
 
@@ -1486,6 +1487,12 @@ _MOVED_OUTCOMES = frozenset({'renamed', 'would_rename', 'update_failed', 'rename
 #: Outcomes after which a member sits on the new slug, or would in a dry run.
 #: Every other outcome is a member that did not stand.
 _STOOD_OUTCOMES: frozenset[str] = frozenset({'renamed', 'would_rename', 'already_normalized'})
+
+#: Outcomes after which a member still carries the LEGACY value: its rename was
+#: attempted and did not land.  A record that is gone (``memory_not_found``) or
+#: that now carries a third value (``topic_moved_since_plan``) did not stand
+#: either, but it is not on the legacy slug, so it splits nothing.
+_LEFT_ON_LEGACY_OUTCOMES: frozenset[str] = _MOVED_OUTCOMES - _STOOD_OUTCOMES
 
 
 async def verify_old_slugs_drained(memory_service, results, skips) -> None:
@@ -1851,7 +1858,7 @@ async def run(
     # declined to migrate the most dangerous slug it found.
     for bucket, entries in skips.items():
         if entries and bucket in ERROR_OUTCOMES:
-            outcomes[bucket] = outcomes.get(bucket, 0) + len(entries)
+            outcomes[bucket] = len(entries)
 
     return {
         'apply': apply,
