@@ -1167,7 +1167,7 @@
     "orchestrator/tests/test_merge_worker_retired.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_worktree_lifecycle_integration_gate.py": {"patch_targets": [], "private_reads": 7},
     "orchestrator/tests/test_multihost_verify_integration.py": {"patch_targets": [], "private_reads": 0},
-    "orchestrator/tests/test_offline_lane.py": {"patch_targets": [], "private_reads": 123},
+    "orchestrator/tests/test_offline_lane.py": {"patch_targets": [], "private_reads": 122},
     "orchestrator/tests/test_offline_lane_infra_integration.py": {"patch_targets": [], "private_reads": 15},
     "orchestrator/tests/test_offline_lane_integration.py": {"patch_targets": [], "private_reads": 18},
     "orchestrator/tests/test_orphan_reaper.py": {"patch_targets": [], "private_reads": 22},
