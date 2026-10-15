@@ -926,6 +926,12 @@ class EventType(StrEnum):
     # these rows for a stranded task is therefore meaningful: nothing held it.
     recovery_vetoed = 'recovery_vetoed'
     recovery_left = 'recovery_left'
+    # strand_converted — one row per convert-to-blocked the stranded-task sweep
+    # actually applied (task 6476).  Payload:
+    # orchestrator/src/orchestrator/strand_conversion.py::strand_converted_payload.
+    # An ACTION, not a hold, so not signature-gated: one row per conversion.
+    # task_id is ALSO a first-class column.
+    strand_converted = 'strand_converted'
 
     # workflow_exit_contract — one row per run() exit whose contract verdict is
     # a violation or store-unavailable (spec docs/task-escalation-state-spec.md

@@ -154,6 +154,7 @@ from orchestrator.service_restart import (
     StaleServiceRestartCoordinator,
     schedule_detached_systemd_restart,
 )
+from orchestrator.strand_conversion import record_strand_conversion
 from orchestrator.stranded_verified_green import (
     DURABLE_MERGE_FAILURE_STATUSES,
     MERGE_REQUEST_RESUBMIT_GRACE_S,
@@ -6556,6 +6557,13 @@ class Harness:
                     tid, exc_info=True,
                 )
                 return None
+            # The stamp + event naming its pins: orchestrator/src/orchestrator/strand_conversion.py.
+            await record_strand_conversion(
+                tid, report,
+                event_store=self.event_store,
+                update_task=self.scheduler.update_task,
+                now=datetime.now(UTC),
+            )
             return 'converted_to_blocked'
 
         if action == RecoveryAction.MARK_DONE_WITH_PROVENANCE:
