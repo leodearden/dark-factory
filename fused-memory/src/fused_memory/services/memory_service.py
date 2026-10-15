@@ -2340,7 +2340,9 @@ class MemoryService:
         # service). An alarm bound to either would vanish in exactly the
         # degraded configuration where an unattended rewrite loop is least
         # likely to be noticed any other way.
-        self._mem0_update_storm_counters: KeyedStormCounters[str] = KeyedStormCounters()
+        self._mem0_update_storm_counters: KeyedStormCounters[tuple[str, str]] = (
+            KeyedStormCounters()
+        )
         self._mem0_update_storm_escalator = Mem0UpdateStormEscalator()
         self.set_known_projects(build_known_projects_map(
             primary_root='', extra_roots=known_project_roots_from_env(),
@@ -2488,13 +2490,13 @@ class MemoryService:
 
     @property
     def mem0_update_storm_tracked_agents(self) -> frozenset[str]:
-        """The ``agent_id`` labels holding an ``update_memory`` storm window.
+        """The ``agent_id`` labels holding an ``update_memory`` storm window in any project.
 
         ``agent_id`` is caller-supplied and unbounded, so evicting dormant
         agents is a real memory bound on a long-lived server and belongs in the
         interface, as ``UnknownKeyStormDetector.tracked_writers`` argues.
         """
-        return self._mem0_update_storm_counters.tracked_keys
+        return frozenset(agent for agent, _ in self._mem0_update_storm_counters.tracked_keys)
 
     @property
     def entity_mint_storm_tracked_agents(self) -> frozenset[str]:
@@ -9512,10 +9514,15 @@ class MemoryService:
         cheap to correct; counting patches would drown the signal that a silent
         content-rewrite loop is running.
 
-        One counter per ``agent_id``, so two independently-busy agents cannot
-        sum into a false alarm. The threshold and window are read LIVE off the
-        shared config and passed into ``record()`` per call — captured once,
-        they would make both green-tier leaves restart-only in disguise.
+        One counter per ``(agent_id, project_id)``. Two independently-busy
+        agents cannot sum into a false alarm, and one agent's amendments in
+        another project cannot inflate the count filed into this project's
+        queue, so the number is reproducible from this project's own journal
+        rows. Recon stage ids (``recon-stage-<stage>``) are project-independent,
+        which is why the project is part of the key. The threshold and window
+        are read LIVE off the shared config and passed into ``record()`` per
+        call — captured once, they would make both green-tier leaves
+        restart-only in disguise.
         """
         label = agent_id or '<unattributed>'
         cfg = getattr(self.config, 'mem0_update', None)
@@ -9527,7 +9534,7 @@ class MemoryService:
         # agent_id is caller-supplied and unbounded; KeyedStormCounters sweeps
         # the dormant ones on every record.
         storm = self._mem0_update_storm_counters.record(
-            label,
+            (label, project_id),
             threshold=threshold,
             window_seconds=float(window_seconds),
             label=label,

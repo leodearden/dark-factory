@@ -5,7 +5,7 @@ record says while preserving its Qdrant point id, so an agent stuck in a rewrite
 loop leaves behind no new records, no id churn and no failed calls — nothing a
 downstream reader could notice. INV-4 (``storm-escape-required``) therefore
 requires an unconditional escape hatch: ``MemoryService`` counts content-amend
-calls per ``agent_id`` in a rolling window
+calls per ``(agent_id, project_id)`` in a rolling window
 (:class:`fused_memory.server.storm_counter.StormCounter`) and, on a burst, calls
 this module to make the condition reach a human.
 
@@ -163,6 +163,9 @@ class Mem0UpdateStormEscalator:
     ) -> str | None:
         """File (or fold into) a storm escalation for *agent_id*.
 
+        *count* is *agent_id*'s amendments in *project_id* alone, so the number
+        filed is reproducible from that project's own journal rows.
+
         Returns the escalation id — freshly minted, or the existing pending
         parent's id when this breach folded into it — or ``None`` when nothing
         was filed (escalation package absent, project_root unresolvable, queue
@@ -214,8 +217,9 @@ class Mem0UpdateStormEscalator:
             f'window_seconds={window_seconds}',
             '',
             f'Agent {agent_id!r} issued {count} in-place update_memory '
-            f'content amendments within {window_seconds}s, at or above the '
-            f'storm threshold of {threshold}.',
+            f'content amendments in project {project_id!r} within '
+            f'{window_seconds}s, at or above the storm threshold of '
+            f'{threshold}.',
             '',
             'In-place amendment preserves the record id, so a runaway rewrite '
             'loop leaves no new records, no id churn and no failed calls — this '
@@ -245,8 +249,8 @@ class Mem0UpdateStormEscalator:
                 category=_CATEGORY,
                 summary=(
                     f'update_memory content-amend storm: agent {agent_id!r} '
-                    f'amended {count} records in {window_seconds}s '
-                    f'(threshold {threshold})'
+                    f'amended {count} records in project {project_id!r} '
+                    f'within {window_seconds}s (threshold {threshold})'
                 ),
                 detail=detail,
                 suggested_action='investigate_runaway_amendment_loop',
