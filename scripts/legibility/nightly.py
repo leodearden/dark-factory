@@ -816,6 +816,11 @@ class NightlyResult:
     is a structured fact and not only a journal line (the next census
     re-mines them)."""
 
+    retry_due: tuple[date, ...] = ()
+    """The backlog dates this invocation should retry next, oldest first.
+    Set only by a scheduled pass that finished and whose state was
+    recorded; otherwise empty."""
+
 
 class _LedgerWrite(NamedTuple):
     written: int
@@ -1065,14 +1070,20 @@ def _record_trickle_progress(
     DISCOVERABILITY, not level-triggering: it makes the probe
     hand-runnable, not bound.
 
-    A FAILED NIGHT'S TARGET DATE IS GONE, NOT RETRIED. See
-    ``scripts/legibility-trickle@.timer``'s ``Persistent=true`` comment
-    for why, and for the decision to leave it that way.
+    An unfinished night's date enters trickle_state's retry backlog
+    (``scripts/legibility/trickle_state.py::fold_retry_backlog``) and is
+    retried by :func:`run_scheduled_night`; operator view in OPERATIONS.md
+    §"Legibility trickle health probe (04:30)".
     """
+    recorded_at = now if now is not None else datetime.now(UTC)
     doc = _record_run_state(
-        cfg.project_id, sample, target_date, result, recorder=recorder, now=now,
+        cfg.project_id, sample, target_date, result, recorder=recorder, now=recorded_at,
     )
     _escalate_barren_streak(cfg, doc, target_date, result, poster=poster)
+    if isinstance(doc, dict) and trickle_state.finished(
+        exit_code=result.exit_code, capped=result.capped,
+    ):
+        result.retry_due = trickle_state.due_retries(doc, today=recorded_at.date())
 
 
 def _record_run_state(
@@ -1111,6 +1122,7 @@ def _record_run_state(
             applied=result.applied,
             commit_made=result.commit_made,
             budget_suppressed=result.budget_suppressed,
+            capped=result.capped,
         )
     except Exception as exc:  # noqa: BLE001 — deliberately total
         logger.warning(
@@ -1519,7 +1531,7 @@ def _run_configured_nightly(
             escalated = post_escalation(
                 cfg, summary, detail, poster=poster, level=logging.WARNING,
             )
-            return NightlyResult(
+            result = NightlyResult(
                 exit_code=0,
                 coder_status=run.status,
                 capped=True,
@@ -1527,6 +1539,7 @@ def _run_configured_nightly(
                 budget_suppressed=budget_suppressed,
                 reason=summary,
             )
+            return result
 
         if run.status == 'failure':
             # >50% of digests failed to code (PRD §5.3/§6.8 storm threshold):
