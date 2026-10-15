@@ -682,7 +682,7 @@ class TestResolveBaseTable:
         with pytest.raises(RuntimeError) as failed:
             resolve_base_table(repo)
 
-        assert blob in str(failed.value) or 'unable to read' in str(failed.value)
+        assert 'fatal:' in str(failed.value), 'the refusal must carry git\'s own stderr'
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
