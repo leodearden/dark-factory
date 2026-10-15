@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from escalation.queue import EscalationQueue
+from shared.repo_paths import DARK_FACTORY_ROOT_ENV
 
 from orchestrator.deterministic_runner import (
     DeterministicRunner,
@@ -335,3 +336,87 @@ class TestScriptTimeoutEscalationNamesTheScriptThatRan:
         [esc] = queue.get_by_task('6471', status='pending')
         assert esc.summary.startswith('Deploy script timed out'), esc.summary
         assert str(project_root.resolve() / RELATIVE_SCRIPT) in esc.detail, esc.detail
+
+
+FACTORY_SCRIPT = 'scripts/report-cwd.sh'
+
+
+def _factory_predicate_task(task_id: str, marker: Path) -> dict:
+    return _task(task_id, {
+        'script': FACTORY_SCRIPT,
+        'script_root': 'factory',
+        'kind': 'predicate',
+        'timeout_secs': 10,
+        'env': {'MARKER': str(marker)},
+    })
+
+
+def _never_consulted() -> Path | None:
+    raise AssertionError('the factory root resolver must not run for a project-rooted script')
+
+
+@pytest.fixture
+def factory_root(tmp_path: Path) -> Path:
+    root = tmp_path / 'factory'
+    (root / 'scripts').mkdir(parents=True)
+    (root / 'scripts' / 'watcher-rearm.sh').touch()
+    script = root / FACTORY_SCRIPT
+    script.write_text(WRITE_CWD_TO_MARKER)
+    script.chmod(0o755)
+    return root
+
+
+@pytest.mark.asyncio
+class TestFactoryRootedPredicate:
+    async def test_factory_predicate_execs_factory_script_with_cwd_at_project_root(
+        self, project_root: Path, factory_root: Path, elsewhere: Path, marker: Path,
+        queue: EscalationQueue, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(DARK_FACTORY_ROOT_ENV, str(factory_root))
+        task = _factory_predicate_task('6386', marker)
+        scheduler = _scheduler(task, project_root)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        outcome = await runner.run(_assignment(task))
+
+        assert outcome == WorkflowOutcome.DONE
+        assert marker.read_text().strip() == str(project_root.resolve())
+        assert _done_provenance_kind(scheduler) == 'deterministic-milestone'
+
+    async def test_unresolvable_factory_root_is_a_no_verdict_leg(
+        self, project_root: Path, elsewhere: Path, marker: Path, queue: EscalationQueue,
+    ) -> None:
+        task = _factory_predicate_task('6387', marker)
+        scheduler = _scheduler(task, project_root)
+        runner = DeterministicRunner(
+            scheduler=scheduler, escalation_queue=queue, factory_root_resolver=lambda: None,
+        )
+
+        outcome = await runner.run(_assignment(task))
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        [esc] = queue.get_by_task('6387', status='pending')
+        assert esc.category == 'infra_issue'
+        assert DARK_FACTORY_ROOT_ENV in esc.detail, esc.detail
+        assert FACTORY_SCRIPT in esc.detail, esc.detail
+        statuses = [c.args[1] for c in scheduler.set_task_status.await_args_list]
+        assert 'done' not in statuses
+
+    async def test_project_rooted_deploy_never_consults_the_factory_resolver(
+        self, project_root: Path, elsewhere: Path, marker: Path, queue: EscalationQueue,
+    ) -> None:
+        task = _task('6388', {
+            'script': RELATIVE_SCRIPT,
+            'timeout_secs': 10,
+            'env': {'MARKER': str(marker)},
+        })
+        runner = DeterministicRunner(
+            scheduler=_scheduler(task, project_root),
+            escalation_queue=queue,
+            factory_root_resolver=_never_consulted,
+        )
+
+        outcome = await runner.run(_assignment(task))
+
+        assert outcome == WorkflowOutcome.DONE
+        assert marker.read_text().strip() == str(project_root.resolve())
