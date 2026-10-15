@@ -11,7 +11,7 @@ import random
 import re
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator, Mapping, MutableSet, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -47,7 +47,7 @@ from orchestrator.config import (
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.fm_retry import fm_retry_backoffs
-from orchestrator.guard_state import PersistentMap, PersistentSet, guard_path
+from orchestrator.guard_state import PersistentMap, guard_path
 from orchestrator.hold_history import HoldHistory
 from orchestrator.mcp_lifecycle import ORCHESTRATOR_MCP_IDENTITY, mcp_call, tool_error_text
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
@@ -85,11 +85,11 @@ from orchestrator.sentinel_l1 import file_sentinel_l1
 from orchestrator.streaks import StreakCounter, StreakRegistry
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
 
-# How long a task is remembered as owed an age reset (task 5352).  An
-# upper bound on the subject, not a tuning dial: thirty days is the horizon
-# over which a resurrected task could still be pending and still be claiming
-# an age bonus it did not earn.  The longest of the four guard TTLs because
-# its subject is the longest-lived.
+# How long a task's age anchor is remembered after it was recorded (task
+# 5352).  An upper bound on the subject, not a tuning dial: thirty days is the
+# horizon over which a resurrected task could still be pending and still be
+# claiming an age bonus it did not earn.  The longest of the four guard TTLs
+# because its subject is the longest-lived.
 _RESURRECTION_GUARD_TTL = timedelta(days=30)
 
 if TYPE_CHECKING:
@@ -1081,6 +1081,43 @@ class _BackfillScanCache:
 def _numeric_id(task_id: str) -> float:
     """The dispatch tie-break rank of *task_id*: older numeric ids first, any non-numeric id last (PRD I-4)."""
     return float(int(task_id)) if task_id.isdecimal() else math.inf
+
+
+def _as_stamp(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _pending_since(task: dict) -> str | None:
+    """The task's D3 ``metadata.pending_since`` stamp; None when absent or
+    malformed, never raising, because every tick reads it."""
+    metadata = task.get('metadata')
+    return _as_stamp(metadata.get('pending_since')) if isinstance(metadata, dict) else None
+
+
+@dataclass(frozen=True)
+class _AgeAnchor:
+    """A task's age anchor and the ``pending_since`` stamp it was taken at.
+
+    A later stamp that differs is D3's cancelled -> pending, which resets the
+    anchor (``Scheduler._update_age_anchors``).
+    """
+
+    anchor: int
+    pending_since: str | None
+
+    def to_record(self) -> dict:
+        return {'anchor': self.anchor, 'pending_since': self.pending_since}
+
+    @classmethod
+    def from_record(cls, raw: object) -> _AgeAnchor | None:
+        """Parse a guard-file record; a malformed one reads as absent, keeping
+        guard_state's fail-open contract."""
+        if not isinstance(raw, dict):
+            return None
+        anchor = raw.get('anchor')
+        if not isinstance(anchor, int) or isinstance(anchor, bool):
+            return None
+        return cls(anchor, _as_stamp(raw.get('pending_since')))
 
 
 def _resolve_time_source(ts: Callable[[], float] | None) -> Callable[[], float]:
@@ -2395,20 +2432,15 @@ class Scheduler:
         # currently-dispatched task so acquire_next can count slots at-or-below
         # a candidate's tier without re-walking the full task graph.
         self._dispatched_priority: dict[str, str] = {}
-        # Age-anchor bookkeeping for score(): one anchor per task while it is
-        # in the active fetch.  A reset is owed only once the task has left
-        # that fetch; the rule is D3 in
-        # plans/scheduler-dispatch-scoring-and-lock-layer-prd.md.  The owed
-        # mark and the applied reset's anchor are restart-durable (task 5352),
-        # and are NOT the state snapshot, which is a write-only observability
-        # artifact.
+        # Age-anchor bookkeeping for score(): one anchor per task in the
+        # active fetch, taken with its pending_since stamp.  It is recorded
+        # durably (task 5352) when the task leaves the fetch or is reset, and
+        # only a changed pending_since resets it: D3 in
+        # plans/scheduler-dispatch-scoring-and-lock-layer-prd.md is the rule.
         self._pending_anchor: dict[str, int] = {}
-        self._age_reset_owed: MutableSet[str] = PersistentSet(
-            guard_path(self._project_root, 'scheduler_age_reset_owed.json'),
-            ttl=_RESURRECTION_GUARD_TTL,
-        )
-        self._age_reset_anchors: PersistentMap = PersistentMap(
-            guard_path(self._project_root, 'scheduler_age_reset_anchors.json'),
+        self._anchor_pending_since: dict[str, str | None] = {}
+        self._age_anchors: PersistentMap = PersistentMap(
+            guard_path(self._project_root, 'scheduler_age_anchors.json'),
             ttl=_RESURRECTION_GUARD_TTL,
         )
         # Effective-priority cache: populated at the end of each acquire_next tick
@@ -5821,10 +5853,10 @@ class Scheduler:
     def _compute_age(self, task_id: str, max_id: int) -> int:
         """Return this task's age, in "newer-task-count" units.
 
-        Anchors are lazily initialized in :meth:`_update_age_anchors`; they
-        reset to the *current* max_id when a task returns after leaving the
-        active population, so a resurrected task does not inherit accumulated
-        age.
+        Anchors are lazily initialized in :meth:`_update_age_anchors`; one
+        is reset to the *current* max_id only when the task's
+        ``pending_since`` changed (D3), so a resurrected task does not inherit
+        accumulated age.
         """
         anchor = self._pending_anchor.get(task_id)
         if anchor is None:
@@ -5832,73 +5864,65 @@ class Scheduler:
         return max(0, max_id - anchor)
 
     def _update_age_anchors(self, tasks: list[dict], max_id: int) -> None:
-        """Maintain one age anchor per task while it is in the active fetch.
+        """Maintain one age anchor per task in the active fetch.
 
         The rule is D3 in
         ``plans/scheduler-dispatch-scoring-and-lock-layer-prd.md``: only a
-        task that left the active population and came back has its wait reset.
+        cancelled -> pending return resets a task's wait, and fused-memory
+        marks exactly that return by overwriting ``metadata.pending_since``.
 
-        - A task's first sighting, whatever its active status, anchors it.
-          If a reset is owed, the anchor is *max_id*: the reset is applied,
-          its mark consumed and its anchor recorded.  Otherwise it is the
-          anchor an earlier reset recorded, else the task's own
+        - A task with an empty or terminal status is skipped: it is not an
+          observation of the active population, and recording its departure
+          is :meth:`_phase_stale_sweep`'s job alone.
+        - Any other task keeps its known anchor: the in-memory one, else the
+          one recorded when it left the fetch or was last reset, else its own
           numeric id (so a genuinely-old task carries its accumulated age),
-          else *max_id*.
-        - An active status never drops the anchor, so a requeue, an unblock
-          or an undefer keeps the task's wait.
-        - A terminal status drops the anchor and marks a reset as owed, as
-          :meth:`_phase_stale_sweep` does for a task that left the fetch.
+          else *max_id*.  So a requeue, an unblock, an undefer, an infra-hold
+          resume, a done reopen and a restart all keep the wait.
+        - If the known anchor was taken at a stamp and the task now carries a
+          different one, the anchor is reset to *max_id*.  A first stamp,
+          where none was known, is not a reset.
 
-        So a resurrection resets age ONCE rather than once per fleet
-        redeploy: every later start restores the recorded anchor.  Marks and
-        anchors are written in one batch per guard file after the loop,
-        because a tick observing N departures or returns would otherwise
-        perform N writes of an N-entry file.  Batching is safe by
-        construction: a task has exactly one status, so the branch that
-        WRITES a mark (terminal) and the branch that READS one (active) are
-        mutually exclusive within a single call.
+        A reset is applied ONCE: its record carries the new stamp, so every
+        later start restores it.  Resets are written in one batch after the
+        loop, because a cold start that finds N stamps changed would
+        otherwise perform N writes of an N-entry file.
         """
-        departed: set[str] = set()
-        resets: dict[str, int] = {}
+        resets: dict[str, _AgeAnchor] = {}
         for t in tasks:
             tid = str(t.get('id', ''))
-            if not tid:
-                continue
             status = t.get('status', '')
-            if not status or status in TERMINAL_STATUSES:
-                self._pending_anchor.pop(tid, None)
-                if status:
-                    departed.add(tid)
+            if not tid or not status or status in TERMINAL_STATUSES:
                 continue
-            if tid in self._pending_anchor:
-                continue
-            if tid in self._age_reset_owed:
-                resets[tid] = max_id
-                self._pending_anchor[tid] = max_id
-            else:
-                self._pending_anchor[tid] = self._restored_or_own_anchor(tid, max_id)
+            stamp = _pending_since(t)
+            known = self._known_age_anchor(tid, stamp, max_id)
+            if known.pending_since and stamp and stamp != known.pending_since:
+                known = _AgeAnchor(max_id, stamp)
+                resets[tid] = known
+            self._pending_anchor[tid] = known.anchor
+            self._anchor_pending_since[tid] = stamp or known.pending_since
         self._apply_age_resets(resets)
-        self._age_reset_owed |= departed
 
-    def _restored_or_own_anchor(self, tid: str, max_id: int) -> int:
-        """The anchor of a task owed no reset: the one an earlier reset
-        recorded, else its own numeric id, else *max_id*.  A recorded
-        value that is not a plain int is ignored (guard_state is fail-open)."""
-        recorded = self._age_reset_anchors.get(tid)
-        if isinstance(recorded, int) and not isinstance(recorded, bool):
+    def _known_age_anchor(self, tid: str, stamp: str | None, max_id: int) -> _AgeAnchor:
+        """The anchor *tid* had before this observation: in memory, else
+        recorded, else its own numeric id, else *max_id*, at *stamp*."""
+        if tid in self._pending_anchor:
+            return _AgeAnchor(self._pending_anchor[tid], self._anchor_pending_since.get(tid))
+        recorded = _AgeAnchor.from_record(self._age_anchors.get(tid))
+        if recorded is not None:
             return recorded
-        return int(tid) if tid.isdecimal() else max_id
+        return _AgeAnchor(int(tid) if tid.isdecimal() else max_id, stamp)
 
-    def _apply_age_resets(self, resets: dict[str, int]) -> None:
-        """Consume each applied reset's mark and record its anchor, one write
-        per guard file, then journal each reset (INV-11)."""
-        self._age_reset_owed -= set(resets)
-        self._age_reset_anchors.put_many(resets)
+    def _apply_age_resets(self, resets: dict[str, _AgeAnchor]) -> None:
+        """Record every reset in one write, then journal each (INV-11)."""
+        self._age_anchors.put_many({tid: a.to_record() for tid, a in resets.items()})
         if not self.event_store:
             return
-        for tid, anchor in resets.items():
+        for tid, a in resets.items():
             self.event_store.emit(
-                EventType.age_anchor_reset, task_id=tid, data={'anchor': anchor},
+                EventType.age_anchor_reset,
+                task_id=tid,
+                data={'anchor': a.anchor, 'pending_since': a.pending_since},
             )
 
     def _compute_score_legacy(
@@ -6728,7 +6752,8 @@ class Scheduler:
         ``_module_cache`` / ``_pending_anchor`` entries for tasks that are
         (a) in a terminal status, or (b) absent from tasks_by_id
         (active-only filter dropped them), recording each dropped id in
-        ``_age_reset_owed`` and ``ctx.stale_ids``. Then sweeps every
+        ``ctx.stale_ids`` and its age anchor in ``_age_anchors``, which a
+        return restores. Then sweeps every
         registered ``StreakRegistry`` counter (task 2124) via
         ``self._streak_registry.gc`` — CONSUMED here, not re-collapsed
         into a hand loop — unioning in tasks that left the candidate pool
@@ -6752,7 +6777,7 @@ class Scheduler:
         """
         stale_ids: set[str] = set()
         terminal_ids: set[str] = set()
-        departed: set[str] = set()
+        departed_anchors: dict[str, dict] = {}
         all_tracked: set[str] = (
             set(self._last_dispatch_at)
             | set(self._skip_count)
@@ -6767,12 +6792,15 @@ class Scheduler:
                 self._last_dispatch_at.pop(tid_str, None)
                 self._skip_count.pop(tid_str, None)
                 self._module_cache.pop(tid_str, None)
-                self._pending_anchor.pop(tid_str, None)
-                departed.add(tid_str)
+                if tid_str in self._pending_anchor:
+                    departed_anchors[tid_str] = _AgeAnchor(
+                        self._pending_anchor.pop(tid_str),
+                        self._anchor_pending_since.pop(tid_str, None),
+                    ).to_record()
                 stale_ids.add(tid_str)
         # Recorded in one batch, for the same reason as _update_age_anchors:
-        # this sweep re-observes the same terminal ids on every tick.
-        self._age_reset_owed |= departed
+        # a mass departure would otherwise rewrite the file once per task.
+        self._age_anchors.put_many(departed_anchors)
         starvation_non_eligible = {
             tid for tid in self._starvation_escalated
             if ctx.status_map.get(tid) in _STARVATION_NON_ELIGIBLE

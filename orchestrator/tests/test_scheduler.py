@@ -13356,11 +13356,10 @@ class TestStreakRegistryMigration:
 
         NOTE: the spine entry uses ``_skip_count`` rather than
         ``_pending_anchor`` — ``_update_age_anchors`` (called earlier in the
-        same tick, before the stale-id sweep) unconditionally pops
-        ``_pending_anchor`` for any tid observed with a terminal status,
-        so a task reported as already-'done' in its very first observed tick
-        never survives in ``_pending_anchor`` long enough to reach the
-        stale-id sweep.  ``_skip_count`` has no such early-pop and is one of
+        same tick, before the stale-id sweep) never anchors a tid observed
+        with a terminal status, so a task reported as already-'done' in its
+        very first observed tick never enters ``_pending_anchor`` and so
+        never reaches the stale-id sweep through it.  ``_skip_count`` has no such early-pop and is one of
         the four ``_all_tracked`` spine dicts, so it reliably lands 'T' in
         ``_stale_ids`` for this single-tick repro.
         """
