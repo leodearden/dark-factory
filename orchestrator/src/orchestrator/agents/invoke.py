@@ -414,6 +414,26 @@ def _codex_inexpressible_tool_specs(
     ]
 
 
+def _codex_mcp_override_args(mcp_config: dict | None) -> list[str]:
+    """MCP servers as per-invocation ``-c mcp_servers."<name>".<key>=<toml>`` argv overrides.
+
+    codex reads each server's ``command`` (the executable alone), an ``args``
+    list and an optional ``env`` inline table. Every name, command, arg and env
+    key/value is JSON-encoded, which is valid TOML for strings, string arrays
+    and quoted keys, so a hyphenated name or a quoted path cannot break it.
+    """
+    overrides: list[str] = []
+    for name, cfg in (mcp_config or {}).get('mcpServers', {}).items():
+        table = f'mcp_servers.{json.dumps(name)}'
+        overrides.append(f'{table}.command={json.dumps(cfg.get("command", ""))}')
+        overrides.append(f'{table}.args={json.dumps([str(a) for a in cfg.get("args", [])])}')
+        env_vars = cfg.get('env', {})
+        if env_vars:
+            inline = ', '.join(f'{json.dumps(str(k))} = {json.dumps(str(v))}' for k, v in env_vars.items())
+            overrides.append(f'{table}.env={{{inline}}}')
+    return [arg for override in overrides for arg in ('-c', override)]
+
+
 async def _invoke_codex(
     prompt: str,
     system_prompt: str,
@@ -443,7 +463,10 @@ async def _invoke_codex(
     strictly stronger than relocating/excluding the file: with no file on
     disk at all, no staging command run against this worktree — including
     the single-implementer-commit path's `git add -A -- . :!.claude`
-    (git_ops.py:5320) — can ever pick it up.
+    (git_ops.py:5320) — can ever pick it up. MCP servers likewise arrive as
+    ``-c`` overrides (see ``_codex_mcp_override_args``), so nothing at all is
+    written into *cwd*. CODEX_HOME is deliberately left alone: a temp home
+    silently drops the ChatGPT login for OPENAI_API_KEY.
 
     *max_turns* and *max_budget_usd* are accepted for dispatcher-signature
     uniformity/observability only: codex-cli (verified 0.143.0, full `codex
@@ -471,41 +494,29 @@ async def _invoke_codex(
             'sandbox axis (no per-tool allowlist): %s',
             ', '.join(dropped_specs),
         )
-    temp_files: list[Path] = []
-    try:
-        # Write MCP config
-        if mcp_config:
-            codex_dir = cwd / '.codex'
-            codex_dir.mkdir(exist_ok=True)
-            config_toml = codex_dir / 'config.toml'
-            _write_codex_mcp_config(config_toml, mcp_config)
-            temp_files.append(config_toml)
+    sandbox_mode = _codex_sandbox_mode(allowed_tools, disallowed_tools)
+    confinement = (
+        ['-s', sandbox_mode] if sandbox_mode
+        else ['--dangerously-bypass-approvals-and-sandbox']
+    )
+    cmd = ['codex', 'exec', '-m', model, '--json', *confinement]
 
-        sandbox_mode = _codex_sandbox_mode(allowed_tools, disallowed_tools)
-        confinement = (
-            ['-s', sandbox_mode] if sandbox_mode
-            else ['--dangerously-bypass-approvals-and-sandbox']
-        )
-        cmd = ['codex', 'exec', '-m', model, '--json', *confinement]
+    if effort:
+        cmd.extend(['-c', f'model_reasoning_effort={effort}'])
 
-        if effort:
-            cmd.extend(['-c', f'model_reasoning_effort={effort}'])
+    cmd.extend(_codex_mcp_override_args(mcp_config))
 
-        # '-' tells codex exec to read the prompt from stdin instead of argv.
-        cmd.append('-')
-        codex_input = f'{system_prompt}\n\n{prompt}'.encode()
+    # '-' tells codex exec to read the prompt from stdin instead of argv.
+    cmd.append('-')
+    codex_input = f'{system_prompt}\n\n{prompt}'.encode()
 
-        cmd, env = _sandbox_spawn(cmd, os.environ, cwd, sandbox_modules, sandbox_extras)
+    cmd, env = _sandbox_spawn(cmd, os.environ, cwd, sandbox_modules, sandbox_extras)
 
-        result = await _run_subprocess_local(
-            cmd, cwd, env, 'codex', model, max_budget_usd, timeout_seconds,
-            stdin_data=codex_input,
-        )
-        return _parse_codex_output(result, model, prices)
-
-    finally:
-        for f in temp_files:
-            f.unlink(missing_ok=True)
+    result = await _run_subprocess_local(
+        cmd, cwd, env, 'codex', model, max_budget_usd, timeout_seconds,
+        stdin_data=codex_input,
+    )
+    return _parse_codex_output(result, model, prices)
 
 
 def _parse_codex_output(
@@ -611,29 +622,6 @@ def _parse_codex_output(
         stderr=result.stderr,
         timed_out=result.timed_out,
     )
-
-
-def _write_codex_mcp_config(config_path: Path, mcp_config: dict) -> None:
-    """Write MCP server config as .codex/config.toml.
-
-    codex reads one ``[mcp_servers.<name>]`` table per server with ``command``
-    (the executable alone) and an ``args`` list, plus an optional
-    ``[mcp_servers.<name>.env]`` subtable. Keys and values are JSON-encoded,
-    which is valid TOML for strings and string arrays, so a server name with a
-    hyphen or a path with a quote cannot break the file.
-    """
-    lines = []
-    for name, cfg in mcp_config.get('mcpServers', {}).items():
-        table = f'mcp_servers.{json.dumps(name)}'
-        lines.append(f'[{table}]')
-        lines.append(f'command = {json.dumps(cfg.get("command", ""))}')
-        lines.append(f'args = {json.dumps([str(a) for a in cfg.get("args", [])])}')
-        env_vars = cfg.get('env', {})
-        if env_vars:
-            lines.append(f'[{table}.env]')
-            lines.extend(f'{json.dumps(str(k))} = {json.dumps(str(v))}' for k, v in env_vars.items())
-        lines.append('')
-    config_path.write_text('\n'.join(lines))
 
 
 # ---------------------------------------------------------------------------
