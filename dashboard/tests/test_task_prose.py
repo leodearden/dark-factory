@@ -23,7 +23,7 @@ from fastapi import FastAPI
 
 from dashboard.api.task_prose import router as task_prose_router
 from dashboard.config import DashboardConfig
-from dashboard.data.active_tasks import project_roots_for_label, task_uid
+from dashboard.data.active_tasks import task_uid
 from dashboard.data.memory import reset_sessions
 from dashboard.data.tasks import (
     DEFAULT_PER_CALL_TIMEOUT,
@@ -99,6 +99,17 @@ def _project(tmp_path: Path, *urls: str, name: str = 'proj') -> tuple[Path, Dash
     return config.project_root, config
 
 
+def _same_basename_config(tmp_path: Path) -> DashboardConfig:
+    """Two configured roots, ``a/proj`` and ``b/proj``, sharing the basename ``proj``."""
+    primary = tmp_path / 'a' / 'proj'
+    other = tmp_path / 'b' / 'proj'
+    for root in (primary, other):
+        root.mkdir(parents=True)
+    return DashboardConfig(
+        project_root=primary, known_project_roots=[other], fused_memory_urls=[_URL_1],
+    )
+
+
 async def _read(fused_memory: _FusedMemory, config: DashboardConfig, root: Path, task_id: int):
     async with httpx.AsyncClient(transport=httpx.MockTransport(fused_memory)) as client:
         return await fetch_task_prose(client, config, root, task_id)
@@ -126,36 +137,17 @@ async def _get_prose(
             return await client.get(path)
 
 
-class TestProjectRootsForLabel:
-    """A row's project label resolves back to the configured root(s) it names."""
+class TestRowIdentity:
+    """A row's project label resolves back to the configured root it names."""
 
-    def test_a_label_matching_one_root_returns_that_root(self, tmp_path):
+    def test_a_label_resolves_to_its_configured_root(self, tmp_path):
         primary = tmp_path / 'alpha'
         other = tmp_path / 'beta'
         for root in (primary, other):
             root.mkdir()
         config = DashboardConfig(project_root=primary, known_project_roots=[other])
 
-        assert project_roots_for_label(config, 'beta') == [other.resolve()]
-
-    def test_an_unknown_label_returns_no_root(self, tmp_path):
-        primary = tmp_path / 'alpha'
-        primary.mkdir()
-        config = DashboardConfig(project_root=primary)
-
-        assert project_roots_for_label(config, 'gamma') == []
-
-    def test_roots_sharing_a_basename_all_come_back_primary_first(self, tmp_path):
-        """The label is a BASENAME, so it can name two roots; neither is dropped."""
-        primary = tmp_path / 'a' / 'proj'
-        other = tmp_path / 'b' / 'proj'
-        for root in (primary, other):
-            root.mkdir(parents=True)
-        config = DashboardConfig(project_root=primary, known_project_roots=[other])
-
-        assert project_roots_for_label(config, 'proj') == [
-            primary.resolve(), other.resolve(),
-        ]
+        assert config.project_labels.root_for('beta') == other.resolve()
 
     def test_task_uid_is_the_rows_identity(self):
         assert task_uid('proj', 19) == 'proj/T-19'
@@ -390,25 +382,30 @@ class TestTaskProseRoute:
         assert response.json() == {'error': 'unknown_project', 'project': 'nope'}
         assert fused_memory.posts == []
 
-    async def test_a_label_naming_two_roots_is_409_and_never_asks_fused_memory(self, tmp_path):
-        """Picking one would show another task's prose under a correct-looking title."""
-        primary = tmp_path / 'a' / 'proj'
-        other = tmp_path / 'b' / 'proj'
-        for root in (primary, other):
-            root.mkdir(parents=True)
-        config = DashboardConfig(
-            project_root=primary, known_project_roots=[other], fused_memory_urls=[_URL_1],
-        )
+    @pytest.mark.parametrize('label', ['a/proj', 'b/proj'])
+    async def test_same_basename_roots_each_resolve_to_their_own_root(self, tmp_path, label):
+        config = _same_basename_config(tmp_path)
+        fused_memory = _FusedMemory({9101: {'id': '19', 'description': 'd', 'details': 't'}})
+        uid = task_uid(label, 19)
+
+        response = await _get_prose(config, fused_memory, _prose_path(uid))
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {f'TASK_PROSE:{uid}': {'description': 'd', 'details': 't'}}
+        [call] = fused_memory.tool_calls()
+        assert call.params is not None
+        assert call.params['arguments'] == {
+            'id': '19', 'project_root': str((tmp_path / label).resolve()),
+        }
+
+    async def test_a_basename_two_roots_share_names_neither_and_is_404(self, tmp_path):
+        config = _same_basename_config(tmp_path)
         fused_memory = _FusedMemory({9101: {'id': '19'}})
 
         response = await _get_prose(config, fused_memory, _prose_path('proj/T-19'))
 
-        assert response.status_code == 409
-        assert response.json() == {
-            'error': 'ambiguous_project',
-            'project': 'proj',
-            'roots': [str(primary.resolve()), str(other.resolve())],
-        }
+        assert response.status_code == 404
+        assert response.json() == {'error': 'unknown_project', 'project': 'proj'}
         assert fused_memory.posts == []
 
     async def test_a_missing_task_is_404_carrying_fused_memorys_message(self, tmp_path):
