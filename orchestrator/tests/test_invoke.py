@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -757,6 +758,39 @@ class TestCodexSandboxArgv:
     async def test_unrestricted_caller_argv_is_unchanged(self, tmp_path) -> None:
         argv = await _codex_argv(tmp_path, None, None)
         assert argv == ['codex', 'exec', '-m', 'gpt-6-astra', '--json', _CODEX_BYPASS_FLAG, '-']
+
+
+@pytest.mark.asyncio
+class TestCodexDroppedToolSpecWarning:
+    """codex has no per-tool allowlist, so every spec finer than "may write"
+    is lost; that loss is logged once, never dropped silently (the
+    `_invoke_pi` precedent)."""
+
+    @staticmethod
+    def _invoke_warnings(caplog) -> list[logging.LogRecord]:
+        return [
+            r for r in caplog.records
+            if r.name == 'orchestrator.agents.invoke' and r.levelno == logging.WARNING
+        ]
+
+    async def test_reviewer_lists_log_one_warning_naming_only_the_lost_specs(self, tmp_path, caplog) -> None:
+        caplog.set_level(logging.WARNING, logger='orchestrator.agents.invoke')
+        await _codex_argv(
+            tmp_path, REVIEWER_COMPREHENSIVE.allowed_tools, REVIEWER_COMPREHENSIVE.disallowed_tools,
+        )
+
+        warnings = self._invoke_warnings(caplog)
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        for lost in ('Bash(git:*)', 'mcp__verdict-tools__*', 'mcp__fused-memory__set_task_status'):
+            assert lost in message
+        for honoured in ('Read', 'Glob', 'Grep', 'Edit', 'Write'):
+            assert not re.search(rf'\b{honoured}\b', message), honoured
+
+    async def test_unrestricted_caller_logs_no_warning(self, tmp_path, caplog) -> None:
+        caplog.set_level(logging.WARNING, logger='orchestrator.agents.invoke')
+        await _codex_argv(tmp_path, None, None)
+        assert self._invoke_warnings(caplog) == []
 
 
 @pytest.mark.asyncio
