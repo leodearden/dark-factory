@@ -168,6 +168,11 @@ class BeforeDone(BaseModel):
     ``deterministic_task_guard._validate_before_done`` (fused-memory); the
     filesystem-level checks (path containment, executable bit) stay at the
     ``submit_task`` guard — this model enforces only the type/shape layer.
+    With ``script_root='factory'`` the script resolves against
+    ``shared.repo_paths.resolve_dark_factory_root()`` while cwd stays
+    project_root; that resolution and its filesystem checks live at
+    ``fused-memory/src/fused_memory/middleware/deterministic_task_guard.py::_validate_before_done``
+    and the orchestrator's deterministic runner.
     """
 
     model_config = ConfigDict(extra='allow')
@@ -179,6 +184,16 @@ class BeforeDone(BaseModel):
     timeout_secs: int = Field(gt=0)
     target_unit: str | None = None
     kind: Literal['deploy', 'predicate'] = 'deploy'
+    script_root: Literal['project', 'factory'] = 'project'
+
+    @model_validator(mode='after')
+    def _factory_script_root_requires_predicate(self) -> BeforeDone:
+        if self.script_root == 'factory' and self.kind != 'predicate':
+            raise ValueError(
+                f"BeforeDone: script_root='factory' requires kind='predicate' "
+                f'(got kind={self.kind!r}); a deploy runs a script from its own project.'
+            )
+        return self
 
 
 class DoneProvenance(BaseModel):

@@ -4,7 +4,9 @@ Contract: ``docs/task-authoring.md`` §5. Lives in ``shared`` so the run-time
 executor (``orchestrator/src/orchestrator/deterministic_runner.py``) and the
 submit-time check
 (``fused-memory/src/fused_memory/middleware/deterministic_task_guard.py::_validate_before_done``,
-which validates ``project_root / script``) can read one definition.
+which validates ``script_base / script``) can read one definition. The caller
+chooses ``script_base`` (project_root, or the dark-factory root) from
+``before_done.script_root``.
 """
 
 from __future__ import annotations
@@ -30,12 +32,14 @@ class BeforeDonePaths:
 
 
 def resolve_before_done_paths(
-    before_done: Mapping[str, Any], project_root: Path,
+    before_done: Mapping[str, Any], project_root: Path, *, script_base: Path | None = None,
 ) -> BeforeDonePaths:
-    """``script`` joins ``project_root`` even when ``cwd`` is set: the file the
-    submit guard validated is the file that runs."""
+    """``script`` joins ``script_base`` (``project_root`` when omitted) even when
+    ``cwd`` is set: the file the submit guard validated is the file that runs.
+    ``cwd`` always joins ``project_root``."""
+    base = script_base if script_base is not None else project_root
     cwd = before_done.get('cwd')
     return BeforeDonePaths(
-        script=project_root / before_done['script'],
+        script=base / before_done['script'],
         cwd=project_root / cwd if cwd else project_root,
     )
