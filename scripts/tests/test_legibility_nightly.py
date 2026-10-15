@@ -3769,15 +3769,15 @@ def test_configure_logging_env_var_still_wins_over_an_unknown_default_level(monk
 # task 3340 step-9/10: run_nightly records trickle run state on EVERY path
 # ---------------------------------------------------------------------------
 
-def _recorder_spy():
-    """A ``recorder=`` seam spy that DELEGATES to the real
-    ``trickle_state.record_run``, so the assertions below run against real
+def _recorder_spy(delegate=trickle_state.record_run):
+    """A ``recorder=`` (or ``retry_recorder=``) seam spy that DELEGATES to
+    the real *delegate*, so the assertions below run against real
     classifier + streak output rather than a mock that could drift from it.
     Returns (fn, calls) where each call is (kwargs, returned_doc)."""
     calls = []
 
     def _record(project_id, **kwargs):
-        doc = trickle_state.record_run(project_id, **kwargs)
+        doc = delegate(project_id, **kwargs)
         calls.append((dict(kwargs, project_id=project_id), doc))
         return doc
 
@@ -4327,11 +4327,13 @@ class _NightRunner:
             return _fake_invoke_capped
         return _fake_invoke_known_cause
 
-    def retry(self, day, *, on_night, invoke=_fake_invoke_known_cause):
+    def retry(self, day, *, on_night, invoke=_fake_invoke_known_cause,
+              recorder=None, retry_recorder=None):
         """Run night *on_night*'s retry pass of *day*'s date, on that night's
         clock, over the config and transcripts already on disk."""
         return nightly.run_nightly(
             **self._pass_kwargs(day, on_night=on_night, invoke=invoke), retry=True,
+            recorder=recorder, retry_recorder=retry_recorder,
         )
 
     def _pass_kwargs(self, day, *, on_night, invoke) -> dict[str, Any]:
@@ -4732,6 +4734,38 @@ class TestRetryPass:
         assert _without_backlog(after) == _without_backlog(before)
         assert after['target_date'] == '2026-07-14'
 
+    def test_a_retry_records_through_the_retry_recorder_seam(self, tmp_path):
+        runner, _before = _owed_after_storm_then_productive(tmp_path)
+        recorder, recorded = _recorder_spy()
+        retry_recorder, retried = _recorder_spy(trickle_state.record_retry)
+
+        runner.retry(13, on_night=14, recorder=recorder, retry_recorder=retry_recorder)
+
+        assert recorded == []
+        assert _one_recorded(retried)['retry_backlog'] == {}
+        assert retried[0][0]['target_date'] == date(2026, 7, 13)
+
+    def test_a_retry_whose_config_does_not_load_records_through_the_retry_recorder_seam(
+        self, tmp_path, monkeypatch,
+    ):
+        _seed_state(day=13, exit_code=1)
+        _seed_state(day=14, exit_code=0)
+        _write_unloadable_config(tmp_path / 'proj', project_id='testproj')
+        monkeypatch.setenv('LEGIBILITY_SEARCH_ROOTS', str(tmp_path))
+        recorder, recorded = _recorder_spy()
+        retry_recorder, retried = _recorder_spy(trickle_state.record_retry)
+
+        with pytest.raises(FileNotFoundError):
+            nightly.run_nightly(
+                project_id='testproj', target_date=date(2026, 7, 13), retry=True,
+                now=datetime(2026, 7, 15, 3, 0, tzinfo=UTC),
+                recorder=recorder, retry_recorder=retry_recorder,
+            )
+
+        assert recorded == []
+        assert _one_recorded(retried)['retry_backlog'] == {'2026-07-13': 2}
+        assert retried[0][0]['exit_code'] == 1
+
     def test_a_retry_never_evaluates_the_census_step(self, tmp_path, monkeypatch):
         census_calls = []
 
@@ -4853,6 +4887,33 @@ class TestRunScheduledNight:
         assert len(results) == 1
         assert results[0].capped is True
         assert runner.recorded()['retry_backlog']['2026-07-13'] == 1
+
+    def test_every_argument_reaches_both_passes(self, monkeypatch):
+        fake, calls = _scripted_run_nightly(
+            nightly.NightlyResult(exit_code=0, retry_due=(date(2026, 7, 13),)),
+            nightly.NightlyResult(exit_code=0),
+        )
+        monkeypatch.setattr(nightly, 'run_nightly', fake)
+        now = datetime(2026, 7, 15, 3, 0, tzinfo=UTC)
+        invoke, status_fetcher, poster = object(), object(), object()
+        committer, recorder, retry_recorder = object(), object(), object()
+
+        nightly.run_scheduled_night(
+            config_path='legibility.yaml', project_id='proj_a', projects_root='projects',
+            target_date=date(2026, 7, 14), now=now, invoke=invoke,
+            status_fetcher=status_fetcher, poster=poster, committer=committer,
+            recorder=recorder, retry_recorder=retry_recorder,
+        )
+
+        shared = dict(
+            config_path='legibility.yaml', project_id='proj_a', projects_root='projects',
+            now=now, invoke=invoke, status_fetcher=status_fetcher, poster=poster,
+            committer=committer, recorder=recorder, retry_recorder=retry_recorder,
+        )
+        assert calls == [
+            {**shared, 'target_date': date(2026, 7, 14), 'retry': False},
+            {**shared, 'target_date': date(2026, 7, 13), 'retry': True},
+        ]
 
     def test_main_retries_the_owed_date_after_an_undated_run(self, monkeypatch):
         fake, calls = _scripted_run_nightly(

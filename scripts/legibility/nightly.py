@@ -31,7 +31,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 # Self-bootstrap for standalone `python scripts/legibility/nightly.py` runs
 # (and the systemd ExecStart, which invokes this file directly) -- must run
@@ -1025,6 +1025,7 @@ def _record_trickle_progress(
     result: NightlyResult,
     *,
     recorder=None,
+    retry_recorder=None,
     poster=None,
     now: datetime | None = None,
     retry: bool,
@@ -1080,7 +1081,7 @@ def _record_trickle_progress(
     recorded_at = now if now is not None else datetime.now(UTC)
     doc = _record_run_state(
         cfg.project_id, sample, target_date, result,
-        recorder=recorder, now=recorded_at, retry=retry,
+        recorder=recorder, retry_recorder=retry_recorder, now=recorded_at, retry=retry,
     )
     if retry:
         return
@@ -1098,13 +1099,14 @@ def _record_run_state(
     result: NightlyResult,
     *,
     recorder,
+    retry_recorder,
     now: datetime | None,
     retry: bool,
 ) -> dict | None:
     """Record one night through *recorder* (default
     :func:`trickle_state.record_run`) and return the document it wrote, or
     ``None`` when the write failed. A *retry* pass is recorded through
-    :func:`trickle_state.record_retry` instead.
+    *retry_recorder* (default :func:`trickle_state.record_retry`) instead.
 
     BEST-EFFORT, ALWAYS: the whole call is wrapped in ``try/except`` ->
     one WARNING, swallowed — mirroring :func:`post_escalation`'s
@@ -1112,11 +1114,14 @@ def _record_run_state(
     the run's own outcome; observability must not become a new failure
     mode.
     """
-    record = recorder if recorder is not None else trickle_state.record_run
     recorded_at = now if now is not None else datetime.now(UTC)
     try:
         if retry:
-            return trickle_state.record_retry(
+            record_retry = (
+                retry_recorder if retry_recorder is not None
+                else trickle_state.record_retry
+            )
+            return record_retry(
                 project_id,
                 target_date=target_date,
                 recorded_at=recorded_at,
@@ -1124,6 +1129,7 @@ def _record_run_state(
                 capped=result.capped,
                 commit_made=result.commit_made,
             )
+        record = recorder if recorder is not None else trickle_state.record_run
         return record(
             project_id,
             target_date=target_date,
@@ -1270,6 +1276,7 @@ def run_nightly(
     poster=None,
     committer=None,
     recorder=None,
+    retry_recorder=None,
     retry: bool = False,
 ) -> NightlyResult:
     """Run one full nightly trickle pass for a single project (PRD §5.5).
@@ -1313,13 +1320,14 @@ def run_nightly(
     nights — and, since task 4514, a FAILED night from a productive one,
     which is the distinction that let a crashed run read as productive
     indefinitely. The seam's contract is all four outcomes. It records the
-    scheduled pass only.
+    scheduled pass only; *retry_recorder* (default
+    :func:`trickle_state.record_retry`, which rewrites only the backlog) is
+    the same seam for a retry pass.
 
     *retry* marks a pass over a date the retry backlog owes, run by
     :func:`run_scheduled_night` after the scheduled pass. It skips sessions
     the session ledger already holds, never evaluates the census trigger,
-    and records through :func:`trickle_state.record_retry`, which rewrites
-    only the backlog.
+    and records through *retry_recorder*.
 
     Happy-path wiring only in this step: inventory+sample -> digest ->
     code -> merge -> docs-only commit (only when the merge actually
@@ -1336,7 +1344,8 @@ def run_nightly(
         cfg = load_config(resolved_config_path)
     elif project_id is not None:
         resolved_config_path, cfg = _load_config_for_project(
-            project_id, target_date, recorder=recorder, now=now, retry=retry,
+            project_id, target_date,
+            recorder=recorder, retry_recorder=retry_recorder, now=now, retry=retry,
         )
     else:
         raise ValueError('run_nightly requires either config_path or project_id')
@@ -1345,14 +1354,21 @@ def run_nightly(
             cfg, resolved_config_path,
             projects_root=projects_root, target_date=target_date, now=now,
             invoke=invoke, status_fetcher=status_fetcher, poster=poster,
-            committer=committer, recorder=recorder, retry=retry,
+            committer=committer, recorder=recorder, retry_recorder=retry_recorder,
+            retry=retry,
         )
     except Exception as exc:
         return _crashed_night(cfg, exc, poster=poster)
 
 
 def _load_config_for_project(
-    project_id: str, target_date: date, *, recorder, now: datetime | None, retry: bool,
+    project_id: str,
+    target_date: date,
+    *,
+    recorder,
+    retry_recorder,
+    now: datetime | None,
+    retry: bool,
 ) -> tuple[Path, LegibilityConfig]:
     """Resolve *project_id*'s config (:func:`resolve_config`), recording a
     failed night for *project_id* before re-raising when none resolves."""
@@ -1361,7 +1377,7 @@ def _load_config_for_project(
     except Exception:
         _record_run_state(
             project_id, _nothing_sampled(), target_date, NightlyResult(exit_code=1),
-            recorder=recorder, now=now, retry=retry,
+            recorder=recorder, retry_recorder=retry_recorder, now=now, retry=retry,
         )
         raise
 
@@ -1398,6 +1414,7 @@ def _run_configured_nightly(
     poster,
     committer,
     recorder,
+    retry_recorder,
     retry: bool,
 ) -> NightlyResult:
     """:func:`run_nightly`'s pass once *cfg* has loaded."""
@@ -1765,7 +1782,8 @@ def _run_configured_nightly(
         finally:
             _record_trickle_progress(
                 cfg, sample, target_date, result,
-                recorder=recorder, poster=poster, now=now, retry=retry,
+                recorder=recorder, retry_recorder=retry_recorder,
+                poster=poster, now=now, retry=retry,
             )
 
 
@@ -1789,17 +1807,40 @@ def _parse_date(value: str) -> date:
     return date.fromisoformat(value)
 
 
-def run_scheduled_night(**run_kwargs: Any) -> tuple[NightlyResult, ...]:
-    """The scheduled :func:`run_nightly` pass, then one ``retry=True`` pass
-    per date its :attr:`NightlyResult.retry_due` names, in order. Each pass
+def run_scheduled_night(
+    *,
+    config_path: Path | str | None = None,
+    project_id: str | None = None,
+    projects_root: Path | str | None = None,
+    target_date: date | None = None,
+    now: datetime | None = None,
+    invoke=None,
+    status_fetcher=None,
+    poster=None,
+    committer=None,
+    recorder=None,
+    retry_recorder=None,
+) -> tuple[NightlyResult, ...]:
+    """The scheduled :func:`run_nightly` pass over *target_date*, then one
+    ``retry=True`` pass per date its :attr:`NightlyResult.retry_due` names,
+    in order. Every other argument reaches every pass unchanged. Each pass
     records itself; a raise from any pass propagates."""
-    scheduled = run_nightly(**run_kwargs)
+
+    def run_pass(pass_date: date | None, *, retry: bool) -> NightlyResult:
+        return run_nightly(
+            config_path=config_path, project_id=project_id, projects_root=projects_root,
+            target_date=pass_date, now=now, invoke=invoke, status_fetcher=status_fetcher,
+            poster=poster, committer=committer, recorder=recorder,
+            retry_recorder=retry_recorder, retry=retry,
+        )
+
+    scheduled = run_pass(target_date, retry=False)
     results = [scheduled]
     for retry_date in scheduled.retry_due:
         logger.info(
             'legibility trickle: retrying %s from the retry backlog', retry_date.isoformat(),
         )
-        results.append(run_nightly(**{**run_kwargs, 'target_date': retry_date, 'retry': True}))
+        results.append(run_pass(retry_date, retry=True))
     return tuple(results)
 
 
