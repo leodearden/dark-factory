@@ -2574,10 +2574,12 @@ is how an operator ends up tuning the sampler for a crashed coder:
 
 **Retried nights** (task 5678). A night that did not finish (a non-zero exit,
 or a usage-cap DEFERRED night) leaves its date in the `retry_backlog` key of
-`trickle-state.json`, as `{date: unfinished attempts}`. The next night whose
-own pass finishes runs one extra pass for the oldest owed date, with its own
-byte budget. That pass skips sessions the session ledger already holds and
-never launches a census. It rewrites only `retry_backlog`, so the rest of the
+`trickle-state.json`, as `{date: unfinished attempts}`. A DEFERRED night
+records `capped: true` and still reads `productive`, since its digests were
+built, but it leaves `last_productive_at` unchanged, since it coded nothing.
+The next night whose own pass finishes runs one extra pass for the oldest
+owed date, with its own byte budget. That pass skips sessions the session
+ledger already holds and never launches a census. It rewrites only `retry_backlog`, so the rest of the
 file, and the progress probe's verdict, still describe the scheduled night. A
 failed retry exits the unit non-zero, exactly like a failed night. In the
 journal, grep `retrying <date> from the retry backlog`, and the WARNING

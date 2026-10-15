@@ -613,9 +613,10 @@ def record_run(
     double-fire it either.
 
     ``last_productive_at`` is stamped with ``recorded_at`` on a productive
-    run and carried forward UNCHANGED across barren and quiet runs. It is
+    run that :func:`finished` and carried forward UNCHANGED otherwise. It is
     the field an operator reads to answer "when did this pipeline last
-    actually do anything".
+    actually do anything", so a *capped* night, which built its digests and
+    coded none of them, still reads ``productive`` but is not stamped.
 
     A ``missing`` or ``malformed`` predecessor simply starts the streak at
     this run (and drops ``last_productive_at``): losing streak history
@@ -656,7 +657,7 @@ def record_run(
     )
 
     recorded_at_iso = recorded_at.isoformat()
-    if outcome == OUTCOME_PRODUCTIVE:
+    if outcome == OUTCOME_PRODUCTIVE and finished(exit_code=exit_code, capped=capped):
         last_productive_at = recorded_at_iso
 
     doc = {

@@ -712,6 +712,17 @@ class TestRecordRunFailedStreak:
         assert _record(day=3, exit_code=1, selected_count=6)[
             'last_productive_at'] == stamp
 
+    def test_a_capped_run_never_restamps_last_productive_at(self):
+        """A usage-cap DEFERRED night built digests and coded none of them,
+        so it reads productive while doing nothing."""
+        prod = _record(day=1, selected_count=2)
+        stamp = prod['last_productive_at']
+
+        capped = _record(day=2, capped=True, selected_count=6)
+
+        assert capped['outcome'] == OUTCOME_PRODUCTIVE
+        assert capped['last_productive_at'] == stamp
+
     def test_last_productive_at_stays_none_when_the_first_run_fails(self):
         doc = _record(day=1, exit_code=1, selected_count=6)
         assert doc['last_productive_at'] is None
