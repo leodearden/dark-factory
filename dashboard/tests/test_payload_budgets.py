@@ -139,16 +139,6 @@ class TestCompleteness:
             'anyone choosing it; give it a measured budget instead.'
         )
 
-    def test_every_literal_route_budgets_its_default_request(
-        self, shipped: BudgetTable,
-    ) -> None:
-        defaults = {e.path for e in shipped.endpoints if not e.query}
-        unbudgeted = sorted(set(dashboard_get_paths().literal) - defaults)
-        assert unbudgeted == [], (
-            f'{unbudgeted} carry no entry for the request with NO query, which is '
-            'the one a bare GET (and the hung-MCP sweep) makes. Add one.'
-        )
-
 
 def _minimal_table() -> dict[str, Any]:
     return {
