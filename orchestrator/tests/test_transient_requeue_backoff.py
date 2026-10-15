@@ -605,12 +605,12 @@ class TestBoundaryRow4ViaGetSchedulerState:
     def test_envelopes_grow_thirty_to_four_eighty_through_the_product_path(self, tmp_path):
         """Row 4: armed cooldowns grow ~30 -> 480s, jittered inside [d/2, d]."""
         _scheduler, _clock, states, _path = self._drive(tmp_path)
-        entries = [s['requeue_cooldowns']['T1'] for s in states]
-        assert [e['envelope_secs'] for e in entries] == [30.0, 60.0, 120.0, 240.0, 480.0]
+        entries = [s.requeue_cooldowns['T1'] for s in states]
+        assert [e.envelope_secs for e in entries] == [30.0, 60.0, 120.0, 240.0, 480.0]
         for entry in entries:
-            envelope = entry['envelope_secs']
-            assert envelope / 2 <= entry['armed_secs'] <= envelope
-            assert entry['transient'] is True
+            envelope = entry.envelope_secs
+            assert envelope / 2 <= entry.armed_secs <= envelope
+            assert entry.transient is True
 
     def test_genuine_requeue_stays_flat_alongside_in_the_same_snapshot(self, tmp_path):
         """Row 4's other half — and the two tasks' entries do not interfere."""
@@ -620,12 +620,12 @@ class TestBoundaryRow4ViaGetSchedulerState:
         _requeue(scheduler, 'G1', reason='verify failed', api_error_status=None)
         scheduler.release('G1', requeued=True)
         scheduler._write_state_snapshot_raw(path)
-        cooldowns = read_scheduler_state(tmp_path)['requeue_cooldowns']
+        cooldowns = read_scheduler_state(tmp_path).requeue_cooldowns
 
-        assert cooldowns['G1']['armed_secs'] == 30.0
-        assert cooldowns['G1']['transient'] is False
-        assert cooldowns['T1']['envelope_secs'] == 480.0
-        assert cooldowns['T1']['transient'] is True
+        assert cooldowns['G1'].armed_secs == 30.0
+        assert cooldowns['G1'].transient is False
+        assert cooldowns['T1'].envelope_secs == 480.0
+        assert cooldowns['T1'].transient is True
 
     def test_wall_clock_fields_are_parseable_and_consistent(self, tmp_path):
         """``armed_at``/``expires_at`` answer "when does this task come back".
@@ -637,11 +637,11 @@ class TestBoundaryRow4ViaGetSchedulerState:
         """
         _scheduler, _clock, states, _path = self._drive(tmp_path)
         for state in states:
-            entry = state['requeue_cooldowns']['T1']
-            armed_at = datetime.fromisoformat(entry['armed_at'])
-            expires_at = datetime.fromisoformat(entry['expires_at'])
+            entry = state.requeue_cooldowns['T1']
+            armed_at = datetime.fromisoformat(entry.armed_at)
+            expires_at = datetime.fromisoformat(entry.expires_at)
             delta = (expires_at - armed_at).total_seconds()
-            assert abs(delta - entry['armed_secs']) < 0.001
+            assert abs(delta - entry.armed_secs) < 0.001
 
     def test_snapshot_is_strictly_json_native(self, tmp_path):
         """No datetime object may leak into the snapshot's wire form.

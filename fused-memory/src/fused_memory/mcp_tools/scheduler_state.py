@@ -5,8 +5,9 @@ standing up the full MCP server.  Mirrors the pattern used by the
 scheduler-override tools registered in 1259.
 
 No orchestrator imports — these helpers read on-disk files written by
-the orchestrator process (a separate process).  The only coupling is the
-on-disk file format (JSON snapshot + SQLite runs.db schema).
+the orchestrator process (a separate process).  The format contract is
+shared.scheduler_state.SchedulerStateSnapshot for the JSON snapshot, plus
+the SQLite runs.db schema.
 """
 
 from __future__ import annotations
@@ -15,6 +16,10 @@ import json
 import logging
 import time
 from pathlib import Path
+
+from pydantic import ValidationError
+from shared.project_layout import runs_db, scheduler_state_json
+from shared.scheduler_state import SchedulerStateSnapshot
 
 _log = logging.getLogger(__name__)
 
@@ -48,43 +53,22 @@ def clear_lock_depth_cache() -> None:
     _lock_depth_fallback_logged.clear()
 
 
-def _empty_skeleton() -> dict:
-    """Build and return a fresh empty skeleton dict.
+def read_scheduler_state(project_root: Path) -> SchedulerStateSnapshot:
+    """Read and parse the scheduler state snapshot the orchestrator wrote.
 
-    Returns a new dict on every call so callers cannot accidentally mutate
-    a shared module-level object and corrupt future calls.
+    Returns ``SchedulerStateSnapshot.empty()`` when the file is absent,
+    unreadable, not JSON, or not shaped like a snapshot.  A missing file is
+    normal before the first orchestrator tick and is handled silently; any
+    other failure is logged as a warning first.
     """
-    return {
-        'skip_counts': {},
-        'parks': {},
-        'park_stacks': {},
-        'effective_priorities': {},
-        'pin_queue': [],
-        'overrides': {},
-        'current_holders': {},
-        'is_paused': False,
-        'pause_reason': None,
-        'snapshot_at': None,
-    }
-
-
-def read_scheduler_state(project_root: Path) -> dict:
-    """Read and return the scheduler state snapshot from disk.
-
-    Reads ``<project_root>/data/orchestrator/scheduler_state.json``.
-    Returns the empty skeleton dict when the file is absent, unreadable,
-    or contains invalid JSON.  A missing file is normal before the first
-    orchestrator tick and is handled silently; any other error is logged
-    as a warning before returning the empty skeleton.
-    """
-    path = project_root / 'data' / 'orchestrator' / 'scheduler_state.json'
+    path = scheduler_state_json(project_root)
     try:
-        return json.loads(path.read_bytes())
+        return SchedulerStateSnapshot.from_json(json.loads(path.read_bytes()))
     except FileNotFoundError:
         pass
-    except (json.JSONDecodeError, OSError) as exc:
-        _log.warning('read_scheduler_state: %s — returning empty skeleton', exc)
-    return _empty_skeleton()
+    except (json.JSONDecodeError, UnicodeDecodeError, ValidationError, OSError) as exc:
+        _log.warning('read_scheduler_state: %s: %s — returning empty snapshot', path, exc)
+    return SchedulerStateSnapshot.empty()
 
 
 def effective_lock_depth(project_root: str | Path | None, default: int) -> int:
@@ -178,31 +162,17 @@ def _read_snapshot_lock_depth(project_root: str | Path) -> int | None:
     """Return the snapshot's usable ``lock_depth``, or ``None`` if there is none.
 
     ``None`` means "no usable value, take the caller's default" and covers an
-    absent snapshot, an unreadable/invalid-JSON file, a missing key, and a
-    value that is not a positive non-bool int. Never raises — depth resolution
-    escaping into ``_build_corpus`` would degrade the curator to an empty pool
-    and file a duplicate task, the exact failure the coarse fallback exists to
-    prevent.
+    absent or unparseable snapshot, a missing key, and a non-positive depth.
+    Never raises — depth resolution escaping into ``_build_corpus`` would
+    degrade the curator to an empty pool and file a duplicate task, the exact
+    failure the coarse fallback exists to prevent.
     """
     try:
-        state = read_scheduler_state(Path(project_root))
-        # read_scheduler_state hands back json.loads() output unchecked, so a
-        # body that is valid JSON but not an object ('null', '[]', '"x"')
-        # arrives here as a non-dict and would make .get raise. Guard before
-        # touching it — the sibling consumer
-        # recon_write_policy._corroboration_verdict defends identically.
-        if not isinstance(state, dict):
-            _log.warning(
-                'effective_lock_depth: snapshot for %s is %s, not an object',
-                project_root, type(state).__name__,
-            )
-            return None
-        depth = state.get('lock_depth')
+        depth = read_scheduler_state(Path(project_root)).lock_depth
     except Exception as exc:  # defensive: never let depth resolution raise
         _log.warning('effective_lock_depth: %s — no usable depth', exc)
         return None
-    # bool is an int subclass; reject it explicitly so True never means depth 1.
-    if isinstance(depth, int) and not isinstance(depth, bool) and depth > 0:
+    if depth is not None and depth > 0:
         return depth
     return None
 
@@ -236,7 +206,7 @@ async def read_scheduler_events(
     """
     import aiosqlite
 
-    db_path = (project_root / 'data' / 'orchestrator' / 'runs.db').resolve()
+    db_path = runs_db(project_root).resolve()
     if not db_path.exists():
         return {'events': [], 'count': 0}
 
