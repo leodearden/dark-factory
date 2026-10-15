@@ -16,7 +16,7 @@ single-owned by a :class:`PermitLedger` (MQ-refactor zeta / task 2159) that
 wraps the underlying ``asyncio.Semaphore``. :class:`SpeculationController`
 holds a REFERENCE to that shared :class:`PermitLedger` (injected — it never
 owns/creates its own) and drives only the MERGER side of its lifecycle,
-storing the :class:`~orchestrator.merge_types.SpecPermit` token it
+storing the :class:`~orchestrator.merge_lane.types.SpecPermit` token it
 currently holds (or ``None``) rather than a bare boolean:
 
 * ``acquire_for_lookahead()`` — acquire one permit before peeking for a
@@ -97,8 +97,8 @@ if TYPE_CHECKING:
 class _Permit(Protocol):
     """Structural bound for :class:`PermitLedger`'s token type (task 2161 /
     theta): any permit token with a mutable ``released`` flag --
-    :class:`~orchestrator.merge_types.SpecPermit`,
-    :class:`~orchestrator.merge_types.CapPermit`, or a future permit type.
+    :class:`~orchestrator.merge_lane.types.SpecPermit`,
+    :class:`~orchestrator.merge_lane.types.CapPermit`, or a future permit type.
     Purely a static-typing seam; no runtime isinstance check uses this.
     """
 
@@ -116,7 +116,7 @@ class PermitLedger(Generic[_PermitT]):
     ``_resolve_and_release``) routes through it. Task theta (2161)
     generalizes the class over its token type (``token_factory``) so a
     second instance can own ``_merge_ahead_cap`` and issue
-    :class:`~orchestrator.merge_types.CapPermit` tokens through the
+    :class:`~orchestrator.merge_lane.types.CapPermit` tokens through the
     identical machinery.
 
     Wraps an externally-owned ``asyncio.Semaphore`` (injected — never owns or

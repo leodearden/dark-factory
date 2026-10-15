@@ -39,7 +39,7 @@ from orchestrator.task_runtime import _derive_phase
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
     from orchestrator.git_ops import GitOps
-    from orchestrator.merge_types import MergeOutcome, MergeRequest, QueuedBranch
+    from orchestrator.merge_lane.types import MergeOutcome, MergeRequest, QueuedBranch
 
 logger = logging.getLogger(__name__)
 
@@ -314,8 +314,8 @@ async def submit_verified_green_merge_request(
 
     Returns the submitted ``MergeRequest`` (callers read ``.request_id``).
     """
-    from orchestrator.merge_queue import enqueue_merge_request  # noqa: PLC0415
-    from orchestrator.merge_types import MergeRequest  # noqa: PLC0415
+    from orchestrator.merge_lane.types import MergeRequest  # noqa: PLC0415
+    from orchestrator.merge_lane.worker import enqueue_merge_request  # noqa: PLC0415
 
     future: asyncio.Future[MergeOutcome] = (
         asyncio.get_running_loop().create_future()

@@ -259,7 +259,7 @@ def _all_entries_foreign(entries: list[str], root: Path) -> bool:
     Imported function-locally (mirroring workflow.py's call site) so this
     module stays import-light at module scope — it runs on every dispatch.
     """
-    from orchestrator.merge_gates import is_cross_repo_task  # noqa: PLC0415
+    from orchestrator.merge_lane.gates import is_cross_repo_task  # noqa: PLC0415
 
     return is_cross_repo_task(entries, root, None)
 

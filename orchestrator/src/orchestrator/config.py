@@ -1199,7 +1199,7 @@ class SpeculationProbeConfig(BaseModel):
     P(pass|depth) curve.
 
     ``probe_fraction=0.0`` (the default) disables the mechanism entirely:
-    :func:`orchestrator.merge_queue.select_probe_depth` always returns
+    :func:`orchestrator.merge_lane.worker.select_probe_depth` always returns
     ``None`` at fraction<=0, so dispatch falls through to the unchanged
     ``_verify_frontier_depth()`` path -- byte-identical to pre-task-2359
     behaviour.

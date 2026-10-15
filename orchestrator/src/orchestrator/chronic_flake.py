@@ -291,7 +291,7 @@ class FilingLedger:
     flake on every verify run.
 
     Loaded eagerly at construction time (mirrors
-    :class:`~orchestrator.landed_outbox.LandedOutbox`'s warm-at-construction
+    :class:`~orchestrator.merge_lane.landed_outbox.LandedOutbox`'s warm-at-construction
     cache) via ``shared.safe_io.load_json_or_warn`` — fail-open: a missing
     file (first run) or a corrupt file (disk/process failure) both yield an
     empty ledger rather than raising, since losing rate-limit history only

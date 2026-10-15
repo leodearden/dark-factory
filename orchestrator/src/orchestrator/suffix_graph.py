@@ -1,15 +1,15 @@
 """Suffix-conflict graph and bounce-state tracker (MQ-refactor task δ=1988).
 
-Extracted verbatim from :mod:`orchestrator.merge_queue`: the two-layer
-suffix-conflict machinery — ``SuffixConflictGraph`` (the immutable
-conflict-graph dataclass) and ``EMPTY_SUFFIX_CONFLICT_GRAPH`` (its sentinel
-empty instance) — plus a NEW :class:`SuffixConflictTracker` class that owns
-the state (``graph`` / ``signature`` / ``last_known_main_sha`` /
+Extracted verbatim from the merge-lane worker (:mod:`orchestrator.merge_lane.worker`):
+the two-layer suffix-conflict machinery — ``SuffixConflictGraph`` (the
+immutable conflict-graph dataclass) and ``EMPTY_SUFFIX_CONFLICT_GRAPH`` (its
+sentinel empty instance) — plus a NEW :class:`SuffixConflictTracker` class
+that owns the state (``graph`` / ``signature`` / ``last_known_main_sha`` /
 ``bounce_registry``) and logic (``recompute()`` /
 ``bounce_conflicting_suffix_items()``) that previously lived directly on
-``SpeculativeMergeWorker``.  ``merge_queue`` re-exports all three names
-through a top-level shim so existing importers
-(``from orchestrator.merge_queue import X``, etc.) keep working unchanged.
+``SpeculativeMergeWorker``.  The worker imports all three names from here at
+module level; the pre-package alias module that also re-exported them is
+gone (task 5037).  This module is a lane component kept outside the package.
 
 ``SpeculativeMergeWorker`` delegates to a ``SuffixConflictTracker`` instance
 (``self._suffix_tracker``) via thin property/method wrappers that preserve
@@ -27,15 +27,15 @@ tracker is unit-testable standalone AND stays correct if the caller later
 reassigns e.g. ``worker._git_ops`` (amend: reviewer
 robustness_stale_reference / consistency, task δ=1988).
 
-A moved method that reads a merge_queue-resident constant (``MERGE_LANES``,
+A moved method that reads a worker-resident constant (``MERGE_LANES``,
 ``MERGE_BOUNCE_CAP``, ``NEEDS_REBASE_REASON_PREFIX``) — these stay in
-``merge_queue.py`` and are NOT moved — resolves it through a function-local
-(deferred) import from :mod:`orchestrator.merge_queue` rather than a
-top-level import.  This mirrors the reach-back convention established by
-:mod:`orchestrator.merge_liveness` / :mod:`orchestrator.merge_drift` and
-keeps this module free of any top-level import of ``merge_queue`` (which
-would deadlock module load, since merge_queue's shim needs this module
-fully defined first).
+``merge_lane/worker.py`` and are NOT moved — resolves it through a
+function-local (deferred) import from :mod:`orchestrator.merge_lane.worker`
+rather than a top-level import.  This mirrors the reach-back convention of
+:mod:`orchestrator.merge_lane.liveness` / :mod:`orchestrator.merge_lane.drift` and
+keeps this module free of any top-level import of the worker (which would
+deadlock module load, since the worker imports this module at module level
+and needs it fully defined first).
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ import secrets
 from collections.abc import Callable
 
 from orchestrator.git_ops import GitOps
-from orchestrator.merge_types import (
+from orchestrator.merge_lane.types import (
     GroupMergeRequest,
     MergeBounceRegistry,
     MergeOutcome,
@@ -147,9 +147,9 @@ EMPTY_SUFFIX_CONFLICT_GRAPH = SuffixConflictGraph(
 def _merge_queue_constants() -> tuple[tuple[str, ...], int, str]:
     """Resolve MERGE_LANES / MERGE_BOUNCE_CAP / NEEDS_REBASE_REASON_PREFIX once.
 
-    These three constants stay in ``merge_queue.py`` (not moved — see module
-    docstring).  The function-local (deferred) import is required to avoid
-    deadlocking merge_queue's re-export shim, but that constraint only binds
+    These three constants stay in ``merge_lane/worker.py`` (not moved — see
+    module docstring).  The function-local (deferred) import is required to
+    avoid deadlocking the worker's own module load, but that constraint only binds
     at *module import time*; by the time :meth:`SuffixConflictTracker.recompute`
     or :meth:`SuffixConflictTracker.bounce_conflicting_suffix_items` actually
     run (the merge-acquire hot path), both modules are already fully loaded.
@@ -157,7 +157,7 @@ def _merge_queue_constants() -> tuple[tuple[str, ...], int, str]:
     sys.modules dict lookup + attribute rebind once, not on every call
     (amend: reviewer performance).
     """
-    from orchestrator.merge_queue import (
+    from orchestrator.merge_lane.worker import (
         MERGE_BOUNCE_CAP,
         MERGE_LANES,
         NEEDS_REBASE_REASON_PREFIX,

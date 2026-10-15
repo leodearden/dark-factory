@@ -4847,7 +4847,7 @@ def _inflight_worktree_is_stale(
     finalization while still in the ledger, the heartbeat pins its mtime fresh
     forever, ``age <= liveness_secs`` is permanently true, and every resubmit
     for that branch coalesces onto a corpse until the process restarts.
-    :func:`orchestrator.merge_liveness.newest_content_mtime` states the same
+    :func:`orchestrator.merge_lane.liveness.newest_content_mtime` states the same
     hazard for the in-flight verify no-progress budget ("the #1728 alpha
     owner-heartbeat ... can never mask a dead/hung verify subprocess"); this
     predicate is that treatment for the coalesce arm.
@@ -6162,9 +6162,9 @@ async def build_chain(
         target_depth: How deep this round actually wants to go.
 
     Returns:
-        A :class:`~orchestrator.merge_types.ChainResult`.  A non-empty result
+        A :class:`~orchestrator.merge_lane.types.ChainResult`.  A non-empty result
         HOLDS its lane and the caller MUST release it via
-        :func:`~orchestrator.merge_liveness.release_chain_build_lane`; an
+        :func:`~orchestrator.merge_lane.liveness.release_chain_build_lane`; an
         empty result never holds one.
     """
     depth = min(len(queue_snapshot), cap, target_depth)
@@ -8404,7 +8404,7 @@ def _alarm_illegal_lifecycle_transition(
     transition (merge-queue-reliability PRD scope-4 kappa / task 2169).
 
     Modeled verbatim on
-    :func:`orchestrator.merge_request_ledger._alarm_merge_request_stuck`.
+    :func:`orchestrator.merge_lane.request_ledger._alarm_merge_request_stuck`.
     Fires at most ONCE per open episode per request_id (dedup'd via
     ``has_open_l1``). Called by :meth:`SpeculativeMergeWorker._note_transition`
     when a wired put/pop call site's belief about an item's lifecycle state
@@ -14031,7 +14031,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ``_queue``/``_inflight``, never halts the pipeline.  See
         ``merge_request_ledger.py``'s module docstring for the ledger
         lifecycle this sweeps, and
-        :func:`orchestrator.merge_request_ledger._alarm_merge_request_stuck`
+        :func:`orchestrator.merge_lane.request_ledger._alarm_merge_request_stuck`
         for the dedup'd-escalation contract.
 
         ``threshold_s`` defaults to ``None``, resolved in-body to 1.5 ×
@@ -14039,7 +14039,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         past the cold-verify ceiling, so anything still unresolved past it is
         definitively stuck).  Read from the module global at call time, so a
         test's string-path monkeypatch of
-        ``orchestrator.merge_queue.INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS``
+        ``orchestrator.merge_lane.worker.INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS``
         stays effective.
 
         The WARNING log line is dedup'd exactly like the escalation: at most
@@ -18228,7 +18228,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             verified tree has a smallest truthful value of 1, so the shim /
             harness / direct-call paths that omit it stay byte-identical in
             meaning as well as in behaviour.
-        chain: A non-empty :class:`~orchestrator.merge_types.ChainResult` from
+        chain: A non-empty :class:`~orchestrator.merge_lane.types.ChainResult` from
             :meth:`_deep_chain_placement` (task 3185, PRD γ) — the DEEP-CHAIN
             REDIRECT, and the capability that separates γ from task 2359's
             probe.  ``probe_base`` directly above is a RELABEL: it changes the
@@ -18248,7 +18248,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                :func:`_acquire_warm_verify_worktree` would take a DIFFERENT
                lane, re-check-out a DIFFERENT commit, and can resolve to the
                serial ``_merge-verify`` lane that
-               :func:`~orchestrator.merge_liveness.acquire_chain_build_lane`
+               :func:`~orchestrator.merge_lane.liveness.acquire_chain_build_lane`
                explicitly refuses (DF-3071).  ``_is_warm_path`` therefore comes
                from ``chain.lane_warm``, and ``_verify_attempt_count`` (staged
                inside that block) is left untouched — an attempt that never
@@ -18416,7 +18416,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             ordinary arm owns an ephemeral (or warm-swapped) merge worktree and
             routes through :meth:`_release_or_cleanup`, while the chain arm is
             sitting in a POOL-OWNED ``_spec-`` lane that must go back through
-            :func:`~orchestrator.merge_liveness.release_chain_build_lane`.
+            :func:`~orchestrator.merge_lane.liveness.release_chain_build_lane`.
             Handing a chain lane to ``_release_or_cleanup`` with
             ``spec_warm=False`` would ``git worktree remove`` a pooled lane —
             a permanently lost slot, and the exact hazard
@@ -21905,7 +21905,7 @@ def _alarm_resource_audit(
     """Submit a dedup'd L1 escalation for persisting resource-conservation violations.
 
     Modeled verbatim on
-    :func:`orchestrator.merge_request_ledger._alarm_merge_request_stuck`.
+    :func:`orchestrator.merge_lane.request_ledger._alarm_merge_request_stuck`.
     Fires at most ONCE while an L1 escalation is open for
     :data:`_RESOURCE_AUDIT_SENTINEL`. Callers (see
     ``SpeculativeMergeWorker._check_resource_audit``) only invoke this after

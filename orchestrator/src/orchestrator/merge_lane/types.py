@@ -881,7 +881,7 @@ class MergeRequest:
     Threaded from ``merge_request(retry_failed_only=...)`` (escalation server)
     onto the ``MergeRequest`` the merge worker dequeues, so it is visible on
     ``req`` inside the worker's post-merge verify retry path
-    (:func:`orchestrator.merge_queue._run_post_merge_verify`).
+    (:func:`orchestrator.merge_lane.worker._run_post_merge_verify`).
 
     When set, DF BUILDS THE SUBSET ITSELF (task 3059): on a classified
     infra-transient attempt-0 red it derives the {did-not-pass} set from that
@@ -1115,7 +1115,7 @@ class CapPermit:
     """Opaque merge-ahead-cap permit token (MQ-refactor theta / task 2161).
 
     The ``_merge_ahead_cap`` analogue of :class:`SpecPermit`: returned by a
-    :class:`~orchestrator.merge_speculation_controller.PermitLedger`
+    :class:`~orchestrator.merge_lane.speculation_controller.PermitLedger`
     constructed with ``token_factory=CapPermit`` and stored on the
     :class:`RealMergeItem` that owns it (``.cap_permit``). Byte-for-byte
     mirror of :class:`SpecPermit` -- same ``eq=False`` IDENTITY (not
@@ -1274,7 +1274,7 @@ class ChainResult:
     """Result of a deep merge-ahead chain build (``plans/deep-merge-ahead-prd.md``
     §Contract, task β).
 
-    Returned by :func:`orchestrator.merge_queue.build_chain`, which
+    Returned by :func:`orchestrator.merge_lane.worker.build_chain`, which
     sequentially merges queued items in submission order onto the frozen
     head's merge commit inside ONE scratch worktree, truncating at the first
     textual conflict.  Sibling of the ``classify_and_merge`` sum type
@@ -1333,7 +1333,7 @@ class ChainResult:
 
     **Lane ownership.**  A NON-EMPTY result HOLDS ``lane``, and the caller
     MUST release it via
-    :func:`orchestrator.merge_liveness.release_chain_build_lane` (passing
+    :func:`orchestrator.merge_lane.liveness.release_chain_build_lane` (passing
     ``warm=lane_warm``) once done with the tip.  An EMPTY result never holds a
     lane (``lane is None``, ``lane_warm is False``), so a caller that skips
     the release on the empty path cannot leak one.
@@ -1384,7 +1384,7 @@ class OutcomeKind(StrEnum):
 
     A single str-compatible Enum (mirrors ``InflightStatus`` above /
     ``event_store.EventType``) enumerating every ``data['outcome']`` value
-    passed to :func:`orchestrator.merge_queue._emit_merge_attempt`. Members
+    passed to :func:`orchestrator.merge_lane.worker._emit_merge_attempt`. Members
     are ``str`` instances, so every existing ``==``/``in``/JSON comparison
     against the raw outcome strings keeps working unchanged, and
     ``EventStore.emit``'s ``json.dumps`` produces byte-identical payloads to
@@ -1505,8 +1505,8 @@ class ItemLifecycleState(StrEnum):
         omission was never a gap.
 
     This is ONLY the state vocabulary — see
-    ``orchestrator.merge_queue.ItemLifecycle`` for the request_id-keyed
-    registry, ``orchestrator.merge_queue._LEGAL_TRANSITIONS`` for the
+    ``orchestrator.merge_lane.worker.ItemLifecycle`` for the request_id-keyed
+    registry, ``orchestrator.merge_lane.worker._LEGAL_TRANSITIONS`` for the
     legal-edge table, and ``ItemLifecycle.transition()`` for the guarded
     mutator. Task iota delivers only this substrate; the sibling task kappa
     wires ``transition()`` at every put/pop call site and repoints

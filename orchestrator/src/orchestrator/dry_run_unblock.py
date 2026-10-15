@@ -31,7 +31,7 @@ from shared.transcript_archive import archive_task_transcripts
 
 from orchestrator.agents.invoke import invoke_agent  # noqa: E402
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
-from orchestrator.merge_completion import merge_completion_eligible
+from orchestrator.merge_lane.completion import merge_completion_eligible
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
 from orchestrator.unblock_types import BlockClass, BlockRecord, classify_block_reason

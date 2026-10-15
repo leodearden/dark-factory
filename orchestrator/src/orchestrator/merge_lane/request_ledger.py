@@ -1,7 +1,7 @@
 """Request-liveness ledger: detects dequeued MergeRequests whose Future is
 never resolved (MQ-invariants eta / task 1992).
 
-A dequeued :class:`~orchestrator.merge_types.MergeRequest` is expected to
+A dequeued :class:`~orchestrator.merge_lane.types.MergeRequest` is expected to
 eventually resolve its ``result`` Future — either via a normal outcome
 (``set_result``) or via abandonment (``cancel``).  If neither ever happens
 (a bug in some future code path, a wedged verify that never finalizes, or a
@@ -275,7 +275,7 @@ def _alarm_merge_request_stuck(
     """Submit a dedup'd L1 escalation for a request stuck past the liveness threshold.
 
     Modeled verbatim on
-    :func:`orchestrator.merge_liveness._alarm_verify_host_unreachable`. Fires at
+    :func:`orchestrator.merge_lane.liveness._alarm_verify_host_unreachable`. Fires at
     most ONCE per open episode per request_id (dedup'd via ``has_open_l1``).
     This is OBSERVATION + ESCALATION only — it never resolves the stuck
     request's Future, mutates queue/inflight state, or halts the pipeline
