@@ -2,9 +2,10 @@
 
 THE RULE, in one line: a marker at ``DELIBERATE_TIGHT_BOUND_CEILING < N <
 VERIFY_CLI_PER_TEST_TIMEOUT`` is too large to read as a deliberate tight bound
-and still sits below the budget verify passes, so the loosening its author
-meant for a slow test silently TIGHTENS the verify run that gates their merge,
-because a pytest-timeout marker is a two-way override and never a floor.
+and still sits below the budget verify passes, so under verify it grants LESS
+than no marker at all -- a slow test's opt-out inverted into a clamp on the
+run that gates the merge, because a pytest-timeout marker is a two-way
+override and never a floor.
 
 The derivation -- the ``pytest_timeout._get_item_settings`` precedence it
 follows from and the three regimes the two budgets carve out -- has ONE home:
@@ -2093,8 +2094,8 @@ def test_no_timeout_marker_sits_in_the_inversion_band() -> None:
 
     A marker at ``DELIBERATE_TIGHT_BOUND_CEILING < N <
     VERIFY_CLI_PER_TEST_TIMEOUT`` is too large to read as a deliberate tight
-    bound, so it was written to give a slow test room -- and it silently
-    becomes a TIGHTENING under verify's CLI budget.  Under
+    bound, yet grants less than verify's budget would with no marker at all.
+    Under
     ``timeout_method = "thread"`` a breach is not a red test: pytest-timeout
     ``os._exit()``s the xdist worker, ``--max-worker-restart=0`` declines to
     replace it, and the session is truncated with the blame landing on
