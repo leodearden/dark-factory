@@ -1072,8 +1072,9 @@ Because no call can block >100 s, top-level submission is safe BY PROTOCOL.
    (`already_merged`, which this list named until task 4829, is a *submit* status the
    server collapses to `done` when observed by polling — see step 1 and
    `escalation/src/escalation/server.py::_map_terminal_state`.)
-   After an orchestrator restart,
-   `{state: 'unknown', hint: 'check git log main'}` → fall back to `git log main` (PRD I3).
+   An epistemic answer describes the server's records, not the merge — switch on its `reason`
+   per [the shared reason switch](../_shared/merge-status-reasons.md#the-switch); never fall
+   back to `git log main`, and never direct-merge on one.
 
 3. **To abandon** a queued entry before it is picked up:
    ```
