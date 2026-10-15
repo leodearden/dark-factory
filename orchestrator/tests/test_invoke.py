@@ -701,6 +701,44 @@ class TestCodexSandboxMode:
         assert _codex_sandbox_mode(allowed, disallowed) is None
 
 
+_CODEX_BYPASS_FLAG = '--dangerously-bypass-approvals-and-sandbox'
+
+
+async def _codex_argv(tmp_path: Path, allowed_tools, disallowed_tools) -> list[str]:
+    """The argv `_invoke_codex` hands its subprocess runner for these tool lists."""
+    empty = _SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=1)
+    with patch('orchestrator.agents.invoke._run_subprocess_local',
+               new_callable=AsyncMock, return_value=empty) as run:
+        await _invoke_codex(
+            prompt='p', system_prompt='s', cwd=tmp_path, model='gpt-6-astra',
+            max_budget_usd=1.0, mcp_config=None, sandbox_modules=None, effort=None,
+            allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
+        )
+    return run.call_args.args[0]
+
+
+@pytest.mark.asyncio
+class TestCodexSandboxArgv:
+    """The sandbox flag on codex's argv follows the role: a role that cannot
+    write runs `-s read-only`; only a writing role keeps the bypass."""
+
+    async def test_reviewer_runs_read_only_without_the_bypass(self, tmp_path) -> None:
+        argv = await _codex_argv(
+            tmp_path, REVIEWER_COMPREHENSIVE.allowed_tools, REVIEWER_COMPREHENSIVE.disallowed_tools,
+        )
+        assert ['-s', 'read-only'] in [argv[i:i + 2] for i in range(len(argv) - 1)]
+        assert _CODEX_BYPASS_FLAG not in argv
+
+    async def test_implementer_keeps_the_bypass(self, tmp_path) -> None:
+        argv = await _codex_argv(tmp_path, IMPLEMENTER.allowed_tools, IMPLEMENTER.disallowed_tools)
+        assert _CODEX_BYPASS_FLAG in argv
+        assert '-s' not in argv
+
+    async def test_unrestricted_caller_argv_is_unchanged(self, tmp_path) -> None:
+        argv = await _codex_argv(tmp_path, None, None)
+        assert argv == ['codex', 'exec', '-m', 'gpt-6-astra', '--json', _CODEX_BYPASS_FLAG, '-']
+
+
 @pytest.mark.asyncio
 class TestGeminiCallerPropagatesTimedOut:
     """_invoke_gemini must propagate timed_out=True from subprocess result."""
