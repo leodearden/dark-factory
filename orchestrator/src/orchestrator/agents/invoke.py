@@ -147,6 +147,8 @@ async def invoke_agent(
     *prices*, when set (codex/gemini backends only — claude reports native
     cost), is forwarded to the parser's cost estimator in place of the
     packaged default price table; see ``_estimate_cost``.
+    The codex backend maps *allowed_tools* / *disallowed_tools* onto its
+    sandbox (see ``_codex_sandbox_mode``).
     """
     if backend == 'claude':
         return await _invoke_claude_with_sandbox(
@@ -176,6 +178,7 @@ async def invoke_agent(
             effort=effort,
             timeout_seconds=timeout_seconds, prices=prices,
             max_turns=max_turns,
+            allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
         )
     elif backend == 'gemini':
         return await _invoke_gemini(
