@@ -350,6 +350,51 @@ class TestParseResetsAt:
         """ZoneInfo raises inside the no-date branch's try → None."""
         assert _parse_resets_at('resets 6pm (Fake/Zone)', now=_MID_JAN) is None
 
+    # --- codex's ChatGPT usage window, "... or try again at H:MM AM". The
+    # text names no zone, so it resolves in the HOST LOCAL zone; every `now`
+    # and expectation is therefore a host-local wall-clock moment (a naive
+    # datetime's .astimezone() reads it as local), so these pass on any host. ---
+
+    CODEX_8_06_AM = (
+        "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), "
+        'visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 8:06 AM.'
+    )
+
+    @staticmethod
+    def _local(hour: int, minute: int = 0, second: int = 0, *, day: int = 11) -> datetime:
+        return datetime(2026, 9, day, hour, minute, second).astimezone()
+
+    def test_codex_try_again_later_today(self):
+        now = self._local(3)  # 03:00 local is before 08:06, so the reset is later today
+        assert _parse_resets_at(self.CODEX_8_06_AM, now=now) == self._local(8, 6)
+
+    def test_codex_try_again_already_past_rolls_to_tomorrow(self):
+        now = self._local(20)  # 20:00 local is ~12h past 08:06, far beyond the grace
+        assert _parse_resets_at(self.CODEX_8_06_AM, now=now) == self._local(8, 6, day=12)
+
+    def test_codex_try_again_pm(self):
+        text = self.CODEX_8_06_AM.replace('8:06 AM', '1:07 PM')
+        now = self._local(3)  # 1:07 PM is 13:07, ahead of 03:00 local
+        assert _parse_resets_at(text, now=now) == self._local(13, 7)
+
+    def test_codex_try_again_just_passed_is_now_not_tomorrow(self):
+        """codex rounds the reset to the minute, so a message naming 8:06
+        can be parsed at 08:06:30. That just-passed instant means "retry
+        now", never a 24-hour sleep."""
+        now = self._local(8, 6, 30)  # 30s after the named minute, inside the grace
+        assert _parse_resets_at(self.CODEX_8_06_AM, now=now) == self._local(8, 6)
+
+    def test_codex_message_without_a_time_returns_none(self):
+        text = "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro)."
+        assert _parse_resets_at(text, now=self._local(3)) is None
+
+    def test_claude_no_date_branch_keeps_its_rollover_without_grace(self):
+        """The grace belongs to the codex branch alone: 30s past a claude
+        'resets 9pm (Europe/London)' still rolls over to tomorrow, as before."""
+        now = datetime(2026, 1, 1, 21, 0, 30, tzinfo=UTC)  # 21:00:30 GMT; London is GMT in Jan
+        result = _parse_resets_at('resets 9pm (Europe/London)', now=now)
+        assert result == datetime(2026, 1, 2, 21, 0, tzinfo=UTC)
+
 
 class TestExtractCapMessage:
     """_extract_cap_message: returns the sentence containing the matched prefix."""
