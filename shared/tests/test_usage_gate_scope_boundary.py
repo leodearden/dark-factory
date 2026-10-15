@@ -72,7 +72,7 @@ from _usage_gate_test_helpers import (
     set_scope_cap,
 )
 
-from shared.cli_invoke import invoke_with_cap_retry
+from shared.cli_invoke import AgentResult, invoke_with_cap_retry
 from shared.usage_gate import AccountPhase
 
 # NOTE: this scaffold (prerequisite P1) imports only what the harness below
@@ -352,16 +352,19 @@ class TestB6KillSwitchByteEquivalence:
 class TestB8NonClaudeBackendBypass:
     """B8: a non-claude backend bypasses scope derivation/state entirely,
     even when the invoked model string is a configured scoped-cap model --
-    the codex CapHit takes the account-level path and no scope_caps entry
-    is ever written anywhere (decision 7). The T1 reconnect contract shapes
+    no scope_caps entry is ever written anywhere (decision 7). A codex cap is
+    the ChatGPT window, not a Claude account's, so the loop waits it out on
+    the same account and never caps it. The T1 reconnect contract shapes
     (backend/prompt/oauth_token forwarded to invoke_fn) are preserved."""
 
-    async def test_b8_codex_backend_bypasses_scope_derivation(self):
+    async def test_b8_codex_cap_waits_on_the_same_account_without_scope(self):
         gate = make_gate(['a', 'b'])
         a, b = gate._accounts
-        invoke_fn = scripted_invoke(cap_result('usage limit reached'), ok_result())
+        invoke_fn = scripted_invoke(
+            AgentResult(success=False, output='Error: usage limit reached'), ok_result(),
+        )
 
-        with patch(_SLEEP_PATCH, new_callable=AsyncMock):
+        with patch(_SLEEP_PATCH, new_callable=AsyncMock) as mock_sleep:
             got = await invoke_with_cap_retry(
                 gate, 'lbl', model='claude-fable-5', backend='codex',
                 invoke_fn=invoke_fn,
@@ -373,9 +376,10 @@ class TestB8NonClaudeBackendBypass:
         assert a.scope_caps == {}
         assert b.scope_caps == {}
         assert gate.scope_status() == {}
-        # The codex CapHit took the account-level path and failed over.
-        assert a.phase == AccountPhase.CAPPED
-        assert got.account_name == 'b'
+        # The codex cap was waited out and retried on A, which stays AVAILABLE.
+        assert mock_sleep.await_count == 1
+        assert a.phase == AccountPhase.AVAILABLE
+        assert got.account_name == 'a'
 
         # T1 reconnect contract shapes preserved (mirrors TestInvokeFnParameter).
         first_call = invoke_fn.calls[0]

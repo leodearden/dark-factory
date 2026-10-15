@@ -2686,7 +2686,8 @@ async def invoke_with_cap_retry(
         # None (the general scope). Scoped ONLY for the claude backend
         # (decision 7 "claude-backend scope only"): a non-claude backend
         # (codex/gemini) never touches the OAuth account pool's model-scoped
-        # caps, satisfying B8. Lazy import mirrors the invocation_outcome
+        # caps, satisfying B8 (account-level caps are scoped separately, by
+        # ACCOUNT_POOL_BACKENDS). Lazy import mirrors the invocation_outcome
         # import below to avoid the usage_gate<->cli_invoke cycle.
         # getattr(...,'_config',None) is None for a spec'd MagicMock gate and
         # scope_for(m, <no config>) is None, so every existing mock-based suite
@@ -2918,8 +2919,10 @@ async def invoke_with_cap_retry(
                     or is_usable_reply is None
                     or not is_usable_reply(result.output)
                 )
-                if offered_to_cap_detector and slot.detect_cap_hit(
-                    result.stderr, result.output, backend=backend,
+                if (
+                    backend in ACCOUNT_POOL_BACKENDS
+                    and offered_to_cap_detector
+                    and slot.detect_cap_hit(result.stderr, result.output, backend=backend)
                 ):
                     consecutive_cap_hits += 1
                     full_cycles = (consecutive_cap_hits - 1) // num_accounts
@@ -3139,7 +3142,8 @@ async def invoke_with_cap_retry(
                 # the retry loop can wait / fail over instead of silently returning a
                 # useless "success" to the caller.
                 if (
-                    not result.success  # is_error=true → success=False after fix 2
+                    backend in ACCOUNT_POOL_BACKENDS
+                    and not result.success  # is_error=true → success=False after fix 2
                     and result.cost_usd == 0
                     and result.turns <= 1
                     and result.duration_ms < 5000
