@@ -18,7 +18,10 @@ Contract (PRD Sec Contract) — derived per-invocation from the worktree path:
      ``plans/os-sandbox-claude-home-writer-audit.md``)
   9-10. ``/tmp/``, ``/dev/``
 
-Everything else is read-only. ``compute_write_set`` is a PURE derivation —
+Everything else is read-only. The common dir's ``rr-cache`` is deliberately
+not granted; sandboxed agents run with rerere off instead
+(``orchestrator/src/orchestrator/agents/sandbox_git_config.py``).
+``compute_write_set`` is a PURE derivation —
 no filesystem side effects (no makedirs); existence/creation remains the
 backend's job.
 """
