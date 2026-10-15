@@ -43,7 +43,7 @@ from orchestrator.merge_lane.ports import escalation_port
 from orchestrator.merge_lane.worker import (
     PRODUCTION_CLOCK,
     SpeculativeMergeWorker,
-    _resolve_dispatch_time_merge_base,
+    resolve_dispatch_time_merge_base,
 )
 
 # ---------------------------------------------------------------------------
@@ -54,8 +54,14 @@ REASON_CONSTANTS = 17
 
 
 def test_merge_lane_is_the_worker() -> None:
-    assert MergeLane is SpeculativeMergeWorker
-    assert merge_lane.resolve_dispatch_time_merge_base is _resolve_dispatch_time_merge_base
+    assert merge_lane.MergeLane is MergeLane is SpeculativeMergeWorker
+    assert merge_lane.resolve_dispatch_time_merge_base is resolve_dispatch_time_merge_base
+
+
+@pytest.mark.parametrize('name', ['_resolve_dispatch_time_merge_base', 'SpeculativeMergeWorker'])
+def test_the_pre_eta_facade_aliases_are_gone(name: str) -> None:
+    assert not hasattr(merge_lane, name)
+    assert name not in merge_lane.__all__
 
 
 def test_every_export_resolves_and_the_reason_constants_are_strings() -> None:
