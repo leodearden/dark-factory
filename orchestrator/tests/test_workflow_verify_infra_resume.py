@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import errno as errno_module
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -813,8 +814,10 @@ class TestExhaustedInfraHoldCarriesExceptionMessage:
 
     @staticmethod
     def _infra_hold_block_call(wf: TaskWorkflow):
-        wf._mark_blocked.assert_awaited_once()  # type: ignore[attr-defined]
-        call = wf._mark_blocked.await_args  # type: ignore[attr-defined]
+        mark_blocked = cast(AsyncMock, wf._mark_blocked)
+        mark_blocked.assert_awaited_once()
+        call = mark_blocked.await_args
+        assert call is not None
         assert call.kwargs['category'] == 'infra_issue'
         assert call.kwargs['escalate_to_human'] is True
         assert call.kwargs['block_status'] == 'infra-hold'
