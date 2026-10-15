@@ -26,6 +26,7 @@ from fused_memory.reconciliation.consolidation_auto import (
     UNREADABLE,
     AutoOutcome,
     AutoProposal,
+    AutoReasonCode,
     AutoVerdict,
     build_auto_canonical,
     evaluate_auto_predicate,
@@ -105,6 +106,7 @@ BACKLOG_CATEGORY = 'recon_auto_consolidation_backlog'
 _ESCALATION_KEY = 'auto-consolidation'
 _ESCALATION_ROLE = 'reconciliation-stage1'
 _STREAK_FINDING = 'refusal_streak'
+_UNGATED_FINDING = 'closure_gate_unfiled'
 _REVERT_SOURCE = 'auto_consolidation_revert'
 
 
@@ -135,6 +137,7 @@ def auto_consolidation_initial_stats() -> dict[str, Any]:
         'auto_consolidation_proposals_expired': 0,
         'auto_consolidation_proposals_superseded': 0,
         'auto_consolidation_closure_failures': 0,
+        'auto_consolidation_unrecorded': 0,
         'auto_consolidation_pointers': [],
     }
 
@@ -269,7 +272,18 @@ async def _run(
     if plan.backlog_tripped:
         stats['auto_consolidation_backlog_tripped'] = True
         stats['auto_consolidation_unexecuted'] = len(plan.deferred) + len(plan.excluded)
-        _escalate_backlog(cycle, listed=len(proposals), threshold=plan.backlog_threshold)
+        _escalate(
+            cycle,
+            category=BACKLOG_CATEGORY,
+            severity='info',
+            finding='',
+            affected=[cycle.project_id],
+            summary=(
+                f'{cycle.project_id}: {len(proposals)} consolidation proposals exceed the '
+                f'backlog threshold {plan.backlog_threshold}; nothing was executed or filed'
+            ),
+            detail=f'project_id: {cycle.project_id}\nexecutor_run_id: {cycle.run_id}',
+        )
         return
     stats['auto_consolidation_unexecuted'] += len(plan.deferred)
     for candidate in plan.excluded:
@@ -439,7 +453,7 @@ async def _record_noop(cycle: _Cycle, record: ReconLedgerRecord, verdict: AutoVe
     gate_ids = [
         reason.ids[0]
         for reason in verdict.reasons
-        if reason.code.value == 'already_gated' and reason.ids
+        if reason.code is AutoReasonCode.already_gated and reason.ids
     ]
     state = ProposalState.ADDRESSED if cycle.config.enabled else ProposalState.DRY_RUN
     moved = await record_outcome(
@@ -513,35 +527,23 @@ async def _record_execution(
 
     The ledger row is written before the system record: it is the authoritative
     home and the reversal source, so it must not depend on the pointer write.
+    A run counts as a consolidation only once its row has moved.
     """
     closure = await _closure(cycle, proposal)
     minted = verdict.outcome is AutoOutcome.PASS
-    fields = {
+    gate_id = None if closure.closed else await _gate_unclosed(cycle, record, proposal, verdict, closure)
+    outcome = cycle.outcome(
+        ProposalState.ADDRESSED if closure.closed else ProposalState.GATED,
         **_verdict_fields(verdict),
-        'canonical_id': arm.canonical_id,
-        'canonical_minted': minted,
-        'tagged_ids': tuple(arm.retained),
-        'tag_failure_ids': tuple(str(f.get('id')) for f in arm.retain_failures),
-        'closure_codes': tuple(str(r.get('code')) for r in closure.reasons),
-    }
-    if closure.closed:
-        await record_outcome(cycle.ledger, record, cycle.outcome(ProposalState.ADDRESSED, **fields))
+        canonical_id=arm.canonical_id,
+        canonical_minted=minted,
+        tagged_ids=tuple(arm.retained),
+        tag_failure_ids=tuple(str(f.get('id')) for f in arm.retain_failures),
+        gate_task_id=gate_id,
+        closure_codes=tuple(str(r.get('code')) for r in closure.reasons),
+    )
+    if await _record_landed(cycle, record, outcome, topic=proposal.topic) and closure.closed:
         cycle.stats['auto_consolidations' if minted else 'auto_consolidations_tag_only'] += 1
-    else:
-        cycle.stats['auto_consolidation_closure_failures'] += 1
-        gate_id = await _file_hazard_gate(
-            cycle,
-            proposal,
-            reason_codes={str(r.get('code')): list(r.get('ids') or []) for r in closure.reasons},
-            predicate_version=verdict.predicate_version,
-            rationale=closure.message,
-            within_budget=False,
-        )
-        await record_outcome(
-            cycle.ledger,
-            record,
-            cycle.outcome(ProposalState.GATED, gate_task_id=gate_id, **fields),
-        )
     cycle.stats['auto_consolidation_pointers'].append(
         {'topic': proposal.topic, 'canonical_id': arm.canonical_id, 'run_id': cycle.run_id},
     )
@@ -554,6 +556,86 @@ async def _record_execution(
             exc_info=True,
             extra={'project_id': cycle.project_id, 'run_id': cycle.run_id},
         )
+
+
+async def _gate_unclosed(
+    cycle: _Cycle,
+    record: ReconLedgerRecord,
+    proposal: ConsolidationProposal,
+    verdict: AutoVerdict,
+    closure: ClosureVerdict,
+) -> str | None:
+    """File the gate a topic this run left unclosed needs, past the filing budget.
+
+    The writes have landed and nothing re-files an unfiled closure gate, so
+    when none can be filed a ``blocking`` record names the closure codes.
+    """
+    cycle.stats['auto_consolidation_closure_failures'] += 1
+    reason_codes = {str(r.get('code')): list(r.get('ids') or []) for r in closure.reasons}
+    gate_id = await _file_hazard_gate(
+        cycle,
+        proposal,
+        reason_codes=reason_codes,
+        predicate_version=verdict.predicate_version,
+        rationale=closure.message,
+        within_budget=False,
+    )
+    if gate_id is None:
+        _escalate(
+            cycle,
+            category=REFUSED_CATEGORY,
+            severity='blocking',
+            finding=_UNGATED_FINDING,
+            affected=[f'{cycle.project_id}:{proposal.topic}'],
+            summary=f'{proposal.topic}: {_UNGATED_FINDING} ({", ".join(reason_codes)})',
+            detail='\n'.join([
+                f'project_id: {cycle.project_id}',
+                f'ledger_key: {_ledger_key(record)}',
+                f'executor_run_id: {cycle.run_id}',
+                'writes: landed; hazard gate: not filed',
+                *(f'{code}: {", ".join(ids)}' for code, ids in reason_codes.items()),
+                f'closure: {closure.message}',
+            ]),
+        )
+    return gate_id
+
+
+async def _record_landed(
+    cycle: _Cycle, record: ReconLedgerRecord, outcome: ProposalOutcome, *, topic: str,
+) -> bool:
+    """Record an executed outcome; ``False`` when the row could not be moved.
+
+    The corpus writes have already landed, so a lost row is counted and logged
+    with the facts a reversal needs; the pointer and system record remain.
+    """
+    try:
+        moved = await record_outcome(cycle.ledger, record, outcome)
+    except Exception:
+        logger.warning(
+            'auto_consolidation: recording the outcome for topic %r raised',
+            topic,
+            exc_info=True,
+            extra={'project_id': cycle.project_id, 'run_id': cycle.run_id},
+        )
+        moved = False
+    if not moved:
+        cycle.stats['auto_consolidation_unrecorded'] += 1
+        logger.warning(
+            'auto_consolidation: the %s outcome for topic %r was not recorded; '
+            'canonical %s, tagged %s',
+            outcome.state.value,
+            topic,
+            outcome.canonical_id,
+            list(outcome.tagged_ids),
+            extra={
+                'project_id': cycle.project_id,
+                'run_id': cycle.run_id,
+                'topic': topic,
+                'canonical_id': outcome.canonical_id,
+                'tagged_ids': list(outcome.tagged_ids),
+            },
+        )
+    return moved
 
 
 async def _gate_hazard(
@@ -622,7 +704,10 @@ async def _file_hazard_gate(
             metadata=json.dumps(spec.metadata),
         )
     except DuplicateCandidateKeyError as exc:
-        return None if exc.existing_id is None else str(exc.existing_id)
+        if exc.existing_id is not None:
+            return str(exc.existing_id)
+        cycle.stats['auto_consolidation_unfiled'] += 1
+        return None
     except Exception:
         logger.warning(
             'auto_consolidation: filing the gate for topic %r failed',
@@ -647,7 +732,9 @@ async def _refuse(
     """Record a benign refusal on the row, count each code, and escalate it.
 
     The topic's refusal streak is read from its own rows BEFORE this refusal is
-    recorded; at the threshold the record is a separate ``blocking`` one.
+    recorded. Routine refusals are ``info`` and fold per (project, topic); at
+    the threshold the record is ``blocking`` under its own fingerprint, so it
+    never folds into the pending info parent.
     """
     names = tuple(str(c) for c in codes)
     prior_streak = refusal_streak(
@@ -663,14 +750,18 @@ async def _refuse(
     refusals = cycle.stats['auto_consolidation_refusals']
     for name in names:
         refusals[name] = refusals.get(name, 0) + 1
-    _escalate_refusal(
+    blocking = prior_streak >= cycle.config.refusal_streak_threshold
+    severity, finding = ('blocking', _STREAK_FINDING) if blocking else ('info', '')
+    _escalate(
         cycle,
-        topic=record.flag_type,
-        codes=names,
-        blocking=prior_streak >= cycle.config.refusal_streak_threshold,
+        category=REFUSED_CATEGORY,
+        severity=severity,
+        finding=finding,
+        affected=[f'{cycle.project_id}:{record.flag_type}'],
+        summary=f'{record.flag_type}: {", ".join(names)}',
         detail='\n'.join([
             f'project_id: {cycle.project_id}',
-            f'ledger_key: {RECORD_KIND_CONSOLIDATION_PROPOSAL}/{record.flag_type}/{record.run_id}',
+            f'ledger_key: {_ledger_key(record)}',
             f'proposal_run_id: {record.run_id}',
             f'executor_run_id: {cycle.run_id}',
             f'codes: {", ".join(names)}',
@@ -680,68 +771,24 @@ async def _refuse(
     )
 
 
-def _escalate_refusal(
-    cycle: _Cycle, *, topic: str, codes: Sequence[str], blocking: bool, detail: str,
+def _ledger_key(record: ReconLedgerRecord) -> str:
+    return f'{RECORD_KIND_CONSOLIDATION_PROPOSAL}/{record.flag_type}/{record.run_id}'
+
+
+def _escalate(
+    cycle: _Cycle,
+    *,
+    category: str,
+    severity: str,
+    finding: str,
+    affected: list[str],
+    summary: str,
+    detail: str,
 ) -> None:
-    """File one refusal on the recon queue, folding per (project, topic). Never raises.
+    """File one level-1 record on the recon queue. Never raises.
 
-    Routine refusals are ``info``. The streak escape is a ``blocking`` record
-    under its own fingerprint, so it never folds into the pending info parent.
+    Records fold on ``(category, finding, affected)``.
     """
-    if (
-        cycle.escalation_queue is None
-        or Escalation is None
-        or DedupeConfig is None
-        or compute_content_fingerprint is None
-        or submit_or_dedupe is None
-    ):
-        return
-    queue = cycle.escalation_queue
-    summary = f'{topic}: {", ".join(codes)}'
-    affected = [f'{cycle.project_id}:{topic}']
-    try:
-        if blocking:
-            esc = Escalation(
-                id=queue.make_id(_ESCALATION_KEY),
-                task_id=_ESCALATION_KEY,
-                agent_role=_ESCALATION_ROLE,
-                severity='blocking',
-                category=REFUSED_CATEGORY,
-                summary=summary,
-                detail=detail,
-                level=1,
-                dedupe_fingerprint=compute_content_fingerprint(
-                    REFUSED_CATEGORY, _STREAK_FINDING, affected, '',
-                ),
-                project_id=cycle.project_id,
-            )
-        else:
-            esc = Escalation(
-                id=queue.make_id(_ESCALATION_KEY),
-                task_id=_ESCALATION_KEY,
-                agent_role=_ESCALATION_ROLE,
-                severity='info',
-                category=REFUSED_CATEGORY,
-                summary=summary,
-                detail=detail,
-                level=1,
-                dedupe_fingerprint=compute_content_fingerprint(
-                    REFUSED_CATEGORY, '', affected, '',
-                ),
-                project_id=cycle.project_id,
-            )
-        submit_or_dedupe(queue, esc, DedupeConfig.for_content_fingerprint(REFUSED_CATEGORY))
-    except Exception:
-        logger.warning(
-            'auto_consolidation: filing the refusal escalation for topic %r failed',
-            topic,
-            exc_info=True,
-            extra={'project_id': cycle.project_id, 'run_id': cycle.run_id},
-        )
-
-
-def _escalate_backlog(cycle: _Cycle, *, listed: int, threshold: int) -> None:
-    """File the ONE aggregate backlog record, folding per project. Never raises."""
     if (
         cycle.escalation_queue is None
         or Escalation is None
@@ -756,23 +803,20 @@ def _escalate_backlog(cycle: _Cycle, *, listed: int, threshold: int) -> None:
             id=queue.make_id(_ESCALATION_KEY),
             task_id=_ESCALATION_KEY,
             agent_role=_ESCALATION_ROLE,
-            severity='info',
-            category=BACKLOG_CATEGORY,
-            summary=(
-                f'{cycle.project_id}: {listed} consolidation proposals exceed the '
-                f'backlog threshold {threshold}; nothing was executed or filed'
-            ),
-            detail=f'project_id: {cycle.project_id}\nexecutor_run_id: {cycle.run_id}',
+            severity=severity,
+            category=category,
+            summary=summary,
+            detail=detail,
             level=1,
-            dedupe_fingerprint=compute_content_fingerprint(
-                BACKLOG_CATEGORY, '', [cycle.project_id], '',
-            ),
+            dedupe_fingerprint=compute_content_fingerprint(category, finding, affected, ''),
             project_id=cycle.project_id,
         )
-        submit_or_dedupe(queue, esc, DedupeConfig.for_content_fingerprint(BACKLOG_CATEGORY))
+        submit_or_dedupe(queue, esc, DedupeConfig.for_content_fingerprint(category))
     except Exception:
         logger.warning(
-            'auto_consolidation: filing the backlog escalation failed',
+            'auto_consolidation: filing the %s escalation %r failed',
+            category,
+            summary,
             exc_info=True,
             extra={'project_id': cycle.project_id, 'run_id': cycle.run_id},
         )

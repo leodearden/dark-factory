@@ -55,7 +55,8 @@ class FakeMemoryService:
     Injection points: ``read_errors`` (id -> exception ``get_memory_by_id``
     raises), ``update_returns`` (id -> the dict ``update_memory`` returns
     instead of landing the patch), ``delete_errors`` (id -> exception
-    ``delete_memory`` raises), ``count_error`` and ``scroll_error``.
+    ``delete_memory`` raises), ``add_error`` (raised by every ``add_memory``),
+    ``count_error`` and ``scroll_error``.
     """
 
     def __init__(
@@ -70,6 +71,7 @@ class FakeMemoryService:
         self.read_errors: dict[str, BaseException] = {}
         self.update_returns: dict[str, dict[str, Any]] = {}
         self.delete_errors: dict[str, BaseException] = {}
+        self.add_error: BaseException | None = None
         self.count_error: BaseException | None = None
         self.scroll_error: BaseException | None = None
         self.config = SimpleNamespace(
@@ -158,6 +160,8 @@ class FakeMemoryService:
         metadata: dict[str, Any] | None = None,
         **_: Any,
     ) -> AddMemoryResponse:
+        if self.add_error is not None:
+            raise self.add_error
         memory_id = new_id()
         self.records[memory_id] = {
             'id': memory_id,

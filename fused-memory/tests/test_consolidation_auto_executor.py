@@ -533,6 +533,101 @@ class TestClosureFailure:
         assert report.stats['auto_consolidation_closure_failures'] == 1
         assert report.stats['auto_consolidation_gates_filed'] == 1
 
+    @pytest.mark.asyncio
+    async def test_an_unfiled_closure_gate_keeps_the_row_and_escalates_blocking(
+        self, svc, ledger, queue,
+    ):
+        members = svc.seed_many(4)
+        svc.update_returns[members[1]] = {'error': 'gone', 'error_type': 'MemoryNotFound'}
+        await propose(ledger, topic=TOPIC, member_ids=members)
+        report = _report()
+
+        await run_auto_consolidation(
+            svc,
+            None,
+            queue,
+            project_id=PROJECT_ID,
+            project_root='/proj',
+            run_id=EXEC_RUN,
+            config=svc.config.consolidation_auto,
+            active_tasks=[],
+            report=report,
+            now=NOW,
+        )
+
+        outcome = _outcome(await _row(ledger))
+        (canonical_id,) = svc.canonical_ids()
+        assert outcome.executed
+        assert outcome.canonical_id == canonical_id
+        assert outcome.gate_task_id is None
+        (esc,) = _pending(queue)
+        assert esc.severity == 'blocking'
+        assert 'unstamped_cluster_member' in esc.summary
+        assert members[1] in esc.detail
+        assert report.stats['auto_consolidation_unfiled'] == 1
+        assert report.stats['auto_consolidation_closure_failures'] == 1
+
+
+class TestLostLedgerRow:
+    @pytest.mark.asyncio
+    async def test_a_row_moved_during_execution_is_counted_not_claimed(
+        self, svc, ledger, queue,
+    ):
+        members = svc.seed_many(4)
+        await propose(ledger, topic=TOPIC, member_ids=members)
+        write_canonical = svc.add_memory.side_effect
+
+        async def move_the_row_then_write(**kwargs):
+            await record_outcome(
+                ledger,
+                await _row(ledger),
+                ProposalOutcome(
+                    state=ProposalState.SUPERSEDED, acted_run_id='other', acted_at=NOW.isoformat(),
+                ),
+            )
+            return await write_canonical(**kwargs)
+
+        svc.add_memory.side_effect = move_the_row_then_write
+
+        report = await run(svc, queue=queue)
+
+        (canonical_id,) = svc.canonical_ids()
+        assert (await _row(ledger)).state == 'superseded'
+        assert report.stats['auto_consolidations'] == 0
+        assert report.stats['auto_consolidation_unrecorded'] == 1
+        assert report.stats['auto_consolidation_pointers'] == [
+            {'topic': TOPIC, 'canonical_id': canonical_id, 'run_id': EXEC_RUN},
+        ]
+        (record,) = svc.system_records
+        assert record['metadata']['x_auto_consolidation']['tagged_ids'] == members
+
+
+class TestCandidateIsolation:
+    @pytest.mark.asyncio
+    async def test_a_failing_proposal_is_left_proposed_and_the_next_still_runs(
+        self, svc, ledger, queue, monkeypatch,
+    ):
+        failing_topic = 'auto-topic-failing'
+        _, stamped = _seed_consolidated(svc, topic=failing_topic, n=8)
+        await propose(ledger, topic=failing_topic, member_ids=stamped)
+        await propose(ledger, topic=TOPIC, member_ids=svc.seed_many(3))
+        upsert = ledger.upsert_if_state
+
+        async def fail_for_one_topic(record, **kwargs):
+            if record.flag_type == failing_topic:
+                raise RuntimeError('ledger write failed')
+            return await upsert(record, **kwargs)
+
+        monkeypatch.setattr(ledger, 'upsert_if_state', fail_for_one_topic)
+
+        report = await run(svc, queue=queue)
+
+        first_read = svc.get_memory_by_id.await_args_list[0].kwargs['memory_id']
+        assert first_read in stamped, 'the failing topic must be evaluated first'
+        assert (await _row(ledger, topic=failing_topic)).state == 'proposed'
+        assert (await _row(ledger)).state == 'addressed'
+        assert report.stats['auto_consolidations'] == 1
+
 
 class TestExecutionRefusal:
     @pytest.mark.asyncio
@@ -550,6 +645,24 @@ class TestExecutionRefusal:
         assert row.state == 'refused'
         assert _outcome(row).reason_codes == ('execution_refused',)
         assert report.stats['auto_consolidation_refusals'] == {'execution_refused': 1}
+
+    @pytest.mark.asyncio
+    async def test_a_raising_canonical_write_is_refused_before_any_peer_patch(
+        self, svc, ledger, queue,
+    ):
+        await propose(ledger, topic=TOPIC, member_ids=svc.seed_many(4))
+        svc.add_error = TimeoutError('qdrant write timed out')
+
+        report = await run(svc, queue=queue)
+
+        svc.update_memory.assert_not_awaited()
+        assert svc.canonical_ids() == []
+        row = await _row(ledger)
+        assert row.state == 'refused'
+        assert _outcome(row).reason_codes == ('execution_refused',)
+        assert report.stats['auto_consolidation_refusals'] == {'execution_refused': 1}
+        (esc,) = _pending(queue)
+        assert 'TimeoutError' in esc.detail
 
 
 def _pending(queue, category=REFUSED_CATEGORY):
