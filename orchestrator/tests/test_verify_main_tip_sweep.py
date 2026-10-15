@@ -1711,20 +1711,24 @@ class TestGroupNodeIdsBySubproject:
 
         return _discover_module_configs(root)
 
+    @staticmethod
+    def _group(root: Path, module_configs, node_ids: list[str], *, log_label: str = 'unit'):
+        from orchestrator import verify as verify_module
+
+        return verify_module._group_node_ids_by_subproject(
+            root, module_configs, node_ids, log_label=log_label,
+        )
+
     def test_subproject_relative_node_id_resolves_to_qualified_id(
         self, tmp_path: Path
     ) -> None:
         """(a) A bare subproject-relative node-id resolves to its owning
         prefix, and the returned id is PREFIX-QUALIFIED (worktree-root
         relative) so the scoped re-run command names a real path."""
-        from orchestrator import verify as verify_module
-
         _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
         mcs = self._discover(tmp_path)
 
-        groups = verify_module._group_node_ids_by_subproject(
-            tmp_path, mcs, ['tests/test_a.py::test_a'], log_label='unit',
-        )
+        groups = self._group(tmp_path, mcs, ['tests/test_a.py::test_a'])
 
         assert groups == {'alpha': ['alpha/tests/test_a.py::test_a']}, groups
 
@@ -1733,14 +1737,10 @@ class TestGroupNodeIdsBySubproject:
     ) -> None:
         """(b) An ALREADY prefix-qualified node-id maps to that prefix and is
         returned verbatim (never double-prefixed)."""
-        from orchestrator import verify as verify_module
-
         _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
         mcs = self._discover(tmp_path)
 
-        groups = verify_module._group_node_ids_by_subproject(
-            tmp_path, mcs, ['beta/tests/test_b.py::test_b'], log_label='unit',
-        )
+        groups = self._group(tmp_path, mcs, ['beta/tests/test_b.py::test_b'])
 
         assert groups == {'beta': ['beta/tests/test_b.py::test_b']}, groups
 
@@ -1749,12 +1749,10 @@ class TestGroupNodeIdsBySubproject:
     ) -> None:
         """(c) Node-ids owned by different subprojects land in separate
         groups, with input order preserved WITHIN each group."""
-        from orchestrator import verify as verify_module
-
         _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
         mcs = self._discover(tmp_path)
 
-        groups = verify_module._group_node_ids_by_subproject(
+        groups = self._group(
             tmp_path,
             mcs,
             [
@@ -1762,7 +1760,6 @@ class TestGroupNodeIdsBySubproject:
                 'tests/test_b.py::test_two',
                 'tests/test_a.py::test_three',
             ],
-            log_label='unit',
         )
 
         assert groups == {
@@ -1777,16 +1774,13 @@ class TestGroupNodeIdsBySubproject:
         """(d) A node-id whose file exists under NO discovered subproject
         returns the None sentinel — the caller's fail-safe signal. One bad
         node-id poisons the whole batch (no partial guessing)."""
-        from orchestrator import verify as verify_module
-
         _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
         mcs = self._discover(tmp_path)
 
-        groups = verify_module._group_node_ids_by_subproject(
+        groups = self._group(
             tmp_path,
             mcs,
             ['tests/test_a.py::test_a', 'tests/test_nonexistent.py::test_ghost'],
-            log_label='unit',
         )
 
         assert groups is None, f'Expected None for an unmapped node-id, got {groups!r}'
@@ -1803,7 +1797,7 @@ class TestGroupNodeIdsBySubproject:
         assert list(mcs) == ['alpha', 'beta'], f'fixture precondition: {list(mcs)}'
 
         with patch.object(verify_module, 'logger') as mock_logger:
-            groups = verify_module._group_node_ids_by_subproject(
+            groups = self._group(
                 tmp_path, mcs, [CONFIRM_AMBIGUOUS_NODE_ID], log_label='my-call-site',
             )
 
@@ -1825,14 +1819,10 @@ class TestGroupNodeIdsBySubproject:
         """(f) An empty node-id list is NOT the unmapped sentinel — it returns
         an empty dict, so callers distinguish "nothing to run" from
         "unmappable" via their own cheap early-out."""
-        from orchestrator import verify as verify_module
-
         _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
         mcs = self._discover(tmp_path)
 
-        groups = verify_module._group_node_ids_by_subproject(
-            tmp_path, mcs, [], log_label='unit',
-        )
+        groups = self._group(tmp_path, mcs, [])
 
         assert groups == {}, f'Expected {{}} for an empty node-id list, got {groups!r}'
 
@@ -1850,12 +1840,9 @@ class TestGroupNodeIdsBySubproject:
         with_empty = {'': mcs['alpha'], **mcs}
 
         with patch.object(verify_module, 'logger') as mock_logger:
-            groups = verify_module._group_node_ids_by_subproject(
-                tmp_path, with_empty, ['tests/test_a.py::test_a'], log_label='unit',
-            )
-            only_empty = verify_module._group_node_ids_by_subproject(
+            groups = self._group(tmp_path, with_empty, ['tests/test_a.py::test_a'])
+            only_empty = self._group(
                 tmp_path, {'': mcs['alpha']}, ['tests/test_a.py::test_a'],
-                log_label='unit',
             )
 
         assert groups == {'alpha': ['alpha/tests/test_a.py::test_a']}, groups
