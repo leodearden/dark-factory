@@ -11,6 +11,8 @@ from typing import Any, Final
 
 import yaml
 
+from dashboard.project_labels import ProjectLabels
+
 logger = logging.getLogger(__name__)
 
 # Port 8002 is the canonical systemd-managed instance (shared across all projects).
@@ -138,7 +140,8 @@ def _discover_root_escalation_url(root: Path) -> str | None:
 def _discover_escalation_urls(roots: Iterable[Path]) -> dict[str, str]:
     """Derive each root's escalation MCP URL from its orchestrator config.
 
-    Keyed by project basename — the same key the Merge UI uses. Prefers the
+    Keyed by each root's project label, unique across *roots* (see
+    ``dashboard/project_labels.py::ProjectLabels``). Prefers the
     canonical ``dark-factory-orchestrator.yaml`` name, falling back to legacy
     spellings (see ``_discover_root_escalation_url``). A root that yields no
     URL at all — no config found under any spelling, or a config found with
@@ -152,6 +155,8 @@ def _discover_escalation_urls(roots: Iterable[Path]) -> dict[str, str]:
     a legitimately non-orchestrator or still-legacy root re-emits its WARNING
     only once per process lifetime — a bounded reminder, not log spam.
     """
+    roots = tuple(roots)
+    labels = ProjectLabels.of_roots(roots)
     out: dict[str, str] = {}
     for root in roots:
         url = _discover_root_escalation_url(root)
@@ -164,7 +169,7 @@ def _discover_escalation_urls(roots: Iterable[Path]) -> dict[str, str]:
                 _LEGACY_CONFIG_NAMES,
             )
             continue
-        out[root.name] = url
+        out[labels.of(root)] = url
     return out
 
 
@@ -221,6 +226,11 @@ class DashboardConfig:
     def all_project_roots(self) -> tuple[Path, ...]:
         """Every configured project root, ``project_root`` first, each named once."""
         return tuple(dict.fromkeys((self.project_root, *self.known_project_roots)))
+
+    @property
+    def project_labels(self) -> ProjectLabels:
+        """Each root in :attr:`all_project_roots` by its label, unique across that roster."""
+        return ProjectLabels.of_roots(self.all_project_roots)
 
     def _runtime_data_dir(self, env_var: str, subdir: str) -> Path:
         """Resolve a managed fused-memory runtime data dir, env-var first.
