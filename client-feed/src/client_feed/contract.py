@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import json
+from collections.abc import Callable, Mapping
 from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Annotated, Final, Literal, Self, get_args
+from typing import Annotated, Any, Final, Literal, Self, TypeAlias, TypeVar, get_args
 
 from pydantic import (
     AfterValidator,
@@ -18,6 +19,7 @@ from pydantic import (
     StrictInt,
     StringConstraints,
     TypeAdapter,
+    ValidationError,
     model_validator,
 )
 
@@ -38,6 +40,33 @@ ENGAGEMENT_FILENAME: Final = 'engagement.json'
 
 NOT_RECORDED: Final = 'not_recorded'
 NotRecorded = Literal['not_recorded']
+
+
+class FeedError(Exception):
+    """A feed, inbox or engagement text a reader must refuse."""
+
+
+class ContractViolation(FeedError):
+    """A text that is not a valid record of the contract."""
+
+    def __init__(self, *, line_no: int | None, detail: str) -> None:
+        self.line_no = line_no
+        self.detail = detail
+        where = 'the whole file' if line_no is None else f'line {line_no}'
+        super().__init__(f'contract violation at {where}: {detail}')
+
+
+class UnsupportedFeedVersion(FeedError):
+    """A feed line whose major version this reader does not implement."""
+
+    def __init__(self, *, line_no: int, found: str, supported_major: int) -> None:
+        self.line_no = line_no
+        self.found = found
+        self.supported_major = supported_major
+        super().__init__(
+            f'unsupported feed version at line {line_no}: found {found!r}, this reader'
+            f' supports major {supported_major} only'
+        )
 
 
 def _require_utc(value: datetime) -> datetime:
@@ -464,6 +493,16 @@ EVENT_MODELS: Final[Mapping[str, type[_Envelope]]] = MappingProxyType(
 )
 
 
+class EventHeader(_Envelope):
+    """A line of a type this reader does not know: its envelope only, payload unread."""
+
+    type: NonEmptyStr
+
+
+FeedLine: TypeAlias = FeedEvent | EventHeader
+_HEADER_KEYS: Final = frozenset(EventHeader.model_fields)
+
+
 class InFlightTask(_Record):
     """A task inside a phase, since the phase's entry."""
 
@@ -517,3 +556,69 @@ class EngagementProjection(_Record):
     project_id: ProjectId
     stage: NonEmptyStr
     delivered_commit: CommitSha | None
+
+
+_Parsed = TypeVar('_Parsed')
+
+
+def _json_object(text: str, *, line_no: int | None) -> dict[str, Any]:
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ContractViolation(
+            line_no=line_no, detail=f'not JSON: {exc.msg} at column {exc.colno}'
+        ) from exc
+    if not isinstance(value, dict):
+        raise ContractViolation(
+            line_no=line_no, detail=f'expected a JSON object, got {type(value).__name__}'
+        )
+    return value
+
+
+def _first_error(exc: ValidationError) -> str:
+    errors = exc.errors()
+    first = errors[0]
+    location = '.'.join(str(part) for part in first['loc']) or '<record>'
+    more = f' (and {len(errors) - 1} more)' if len(errors) > 1 else ''
+    return f'{location}: {first["msg"]}{more}'
+
+
+def _validated(
+    validate: Callable[[Any], _Parsed], value: Any, *, line_no: int | None
+) -> _Parsed:
+    try:
+        return validate(value)
+    except ValidationError as exc:
+        raise ContractViolation(line_no=line_no, detail=_first_error(exc)) from exc
+
+
+def _require_supported_major(header: EventHeader, *, line_no: int) -> None:
+    if feed_major(header.feed_version) != FEED_MAJOR:
+        raise UnsupportedFeedVersion(
+            line_no=line_no, found=header.feed_version, supported_major=FEED_MAJOR
+        )
+
+
+def parse_feed_line(text: str, *, line_no: int) -> FeedLine:
+    """One feed.jsonl line as its event, or as an EventHeader when its type is unknown (PRD §4.9)."""
+    raw = _json_object(text, line_no=line_no)
+    envelope = {key: value for key, value in raw.items() if key in _HEADER_KEYS}
+    header = _validated(EventHeader.model_validate, envelope, line_no=line_no)
+    _require_supported_major(header, line_no=line_no)
+    if header.type not in EVENT_MODELS:
+        return header
+    return _validated(FEED_EVENT_ADAPTER.validate_python, raw, line_no=line_no)
+
+
+def parse_inbox_line(text: str, *, line_no: int) -> RevealRequested:
+    """One inbox.jsonl line."""
+    return _validated(
+        RevealRequested.model_validate, _json_object(text, line_no=line_no), line_no=line_no
+    )
+
+
+def parse_engagement(text: str) -> EngagementProjection:
+    """The whole of engagement.json."""
+    return _validated(
+        EngagementProjection.model_validate, _json_object(text, line_no=None), line_no=None
+    )
