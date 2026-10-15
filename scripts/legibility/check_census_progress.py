@@ -29,7 +29,7 @@ from pathlib import Path
 # package context): see check_trickle_progress.py's identical shim.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import trickle_state  # noqa: E402  (must follow the sys.path shim above)
+import trickle_state
 
 USAGE = 'usage: check_census_progress.py <project_id> [max_unadvanced_fires]'
 
