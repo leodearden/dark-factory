@@ -676,6 +676,26 @@ class TestInvokeAgentForwardsMaxTurnsToCodex:
         assert mock_invoke_codex.call_args.kwargs.get('timeout_seconds') == 99.0
 
 
+@pytest.mark.asyncio
+class TestInvokeAgentForwardsToolListsToCodex:
+    """invoke_agent must hand the role's tool lists to the codex path, or
+    `_codex_sandbox_mode` never sees them and every role runs the bypass."""
+
+    async def test_tool_lists_forwarded(self, tmp_path):
+        dummy_result = AgentResult(success=True, output='')
+        with patch('orchestrator.agents.invoke._invoke_codex',
+                   new_callable=AsyncMock, return_value=dummy_result) as mock_invoke_codex:
+            await invoke_agent(
+                prompt='p', system_prompt='s', cwd=tmp_path,
+                backend='codex', model='gpt-6-astra',
+                allowed_tools=['Read', 'Grep'], disallowed_tools=['Edit', 'Write'],
+            )
+
+        mock_invoke_codex.assert_awaited_once()
+        assert mock_invoke_codex.call_args.kwargs.get('allowed_tools') == ['Read', 'Grep']
+        assert mock_invoke_codex.call_args.kwargs.get('disallowed_tools') == ['Edit', 'Write']
+
+
 class TestCodexSandboxMode:
     """A role's tool lists collapse onto codex's one confinement lever: a
     role that cannot write runs 'read-only'; anything else keeps the bypass
