@@ -21,6 +21,7 @@ from shared.testing_stdin import STDIN_STARVATION_STUB, make_starving_exec
 from shared.usage_gate import AccountLease, InvokeSlot
 
 from orchestrator.agents.invoke import (
+    _codex_sandbox_mode,
     _invoke_claude_with_sandbox,
     _invoke_codex,
     _invoke_gemini,
@@ -32,6 +33,7 @@ from orchestrator.agents.invoke import (
     invoke_agent,
     invoke_with_cap_retry,
 )
+from orchestrator.agents.roles import ARCHITECT, IMPLEMENTER, REVIEWER_COMPREHENSIVE
 
 # Cap-retry path is now the unified shared loop; orchestrator callers
 # pass ``invoke_fn=invoke_agent`` to route through multi-backend dispatch.
@@ -672,6 +674,31 @@ class TestInvokeAgentForwardsMaxTurnsToCodex:
         mock_invoke_codex.assert_awaited_once()
         assert mock_invoke_codex.call_args.kwargs.get('max_turns') == 42
         assert mock_invoke_codex.call_args.kwargs.get('timeout_seconds') == 99.0
+
+
+class TestCodexSandboxMode:
+    """A role's tool lists collapse onto codex's one confinement lever: a
+    role that cannot write runs 'read-only'; anything else keeps the bypass
+    (None). The real role constants are used so a role edit cannot desync."""
+
+    @pytest.mark.parametrize('role', [REVIEWER_COMPREHENSIVE, ARCHITECT], ids=['reviewer', 'architect'])
+    def test_role_denied_edit_and_write_is_read_only(self, role) -> None:
+        assert _codex_sandbox_mode(role.allowed_tools, role.disallowed_tools) == 'read-only'
+
+    def test_implementer_keeps_the_bypass(self) -> None:
+        assert _codex_sandbox_mode(IMPLEMENTER.allowed_tools, IMPLEMENTER.disallowed_tools) is None
+
+    def test_wildcard_disallow_is_read_only(self) -> None:
+        assert _codex_sandbox_mode(None, ['*']) == 'read-only'
+
+    def test_allowlist_naming_neither_edit_nor_write_is_read_only(self) -> None:
+        assert _codex_sandbox_mode(['Read', 'Bash'], []) == 'read-only'
+
+    @pytest.mark.parametrize(
+        ('allowed', 'disallowed'), [(None, None), ([], []), (None, []), ([], None)],
+    )
+    def test_unrestricted_caller_keeps_the_bypass(self, allowed, disallowed) -> None:
+        assert _codex_sandbox_mode(allowed, disallowed) is None
 
 
 @pytest.mark.asyncio
