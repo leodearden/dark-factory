@@ -227,8 +227,9 @@ PYPROJECT_DEFAULT_TIMEOUT = 420
 #   FAMILY defect rather than three accidents, and why the rest are marked
 #   preemptively: a marked-but-fast test costs nothing, while an
 #   unmarked-and-slow one costs a whole session.
-# The current anchor is 51.87s under load (task 5442), which floors the family
-# at 420s: test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS.
+# The current anchor is
+# test_whole_tree_scan_timeout_guard.py::_MEASURED_UNDER_LOAD_WORST_CASE, which
+# floors the family at test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS.
 # Derivation: plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 #
 # WAS `5 * PYPROJECT_DEFAULT_TIMEOUT` until 2026-09-12, when that ini default
@@ -247,10 +248,9 @@ PYPROJECT_DEFAULT_TIMEOUT = 420
 # encodes that independence; it has since been re-anchored, but its role is
 # unchanged.
 #
-# It sits above both the floor and PYPROJECT_DEFAULT_TIMEOUT, and neither binds
-# it: the never-narrow rule below asks only `>=`.  Why it sits above its floor
-# is value history, recorded in
-# plans/pytest-per-test-timeout-measurement-2026-09-17.md.
+# It must clear BOTH the floor and PYPROJECT_DEFAULT_TIMEOUT (pinned by
+# test_whole_tree_scan_timeout_guard.py); which of the two binds is value
+# history, recorded in plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 #
 # Deliberately NOT taken from HEAVY_BARRIER_TEST_TIMEOUT: that one bounds a
 # different hazard, sized by merge-barrier waits, and an AST sweep performs
@@ -259,7 +259,7 @@ PYPROJECT_DEFAULT_TIMEOUT = 420
 # never fall below PYPROJECT_DEFAULT_TIMEOUT, or a module-level mark meant as
 # a FLOOR would start narrowing its module below the global default (pinned by
 # test_whole_tree_scan_timeout_guard.py).
-WHOLE_TREE_SCAN_TEST_TIMEOUT = 540
+WHOLE_TREE_SCAN_TEST_TIMEOUT = 1200
 
 # Headroom a per-test ceiling must keep over its family's measured-under-load
 # worst case.  8x rather than 2x: the xdist worker deaths these ceilings exist
