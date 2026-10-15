@@ -2431,8 +2431,9 @@ async def _run_post_merge_verify(
             (see ``narrowed`` below).  Default ``1`` matches the legacy
             single-retry behaviour, so every existing caller that omits
             this param is byte-identical.  A non-narrowed retry (flag off,
-            or a payload that could not be built or corroborated) always
-            uses ``max_enospc`` instead, regardless of this value.
+            a payload that could not be built or corroborated, or a remote
+            dispatch) always uses ``max_enospc`` instead, regardless of this
+            value.
         narrowed_retries: Per-task counter dict for the narrowed budget
             above, mirroring ``enospc_retries`` but DECOUPLED from it (an
             earlier ENOSPC event never starves a narrowed retry, and vice
@@ -2865,21 +2866,18 @@ async def _run_post_merge_verify(
             # legacy path is byte-identical (D1's strict no-op guarantee).  Every
             # fail-safe route — unreadable/malformed sidecar, a probe that could
             # not produce a plan, a probe whose plan does not COVER attempt-0's
-            # observed failures, a rebased or uncorroborated tree, or a subset
-            # that would not materially narrow (_materially_narrows) — returns
-            # None and leaves `spec` untouched, so the retry runs FULL via the
-            # existing _reverify_rebased_tree (M4) semantics AND stays on the
-            # legacy budget.
+            # observed failures, a rebased or uncorroborated tree, a subset
+            # that would not materially narrow (_materially_narrows), or a
+            # REMOTE dispatch (runner is not None: the filter files are
+            # untracked files in THIS host's merge_wt, which the remote's
+            # git-pushed merge SHA does not carry) — leaves `spec` untouched,
+            # so the retry runs FULL via the existing _reverify_rebased_tree
+            # (M4) semantics AND stays on the legacy budget.
+            # See verify_runner.py::MergeVerifySpec (verify_env).
             #
             # `not narrowed` keeps this a once-per-call operation: the loop below
             # may dispatch several times, but the subset is always attempt-0's.
-            #
-            # NOTE (task 2822): injecting into `spec` means the merged verify_env
-            # flows into BOTH the retry dispatch below AND task 2822's
-            # post-dispatch remote-green cross-check re-verify (which reuses this
-            # same `spec`) — correct and desired: a failed-only retry's local
-            # trust-anchor cross-check should scope to the same subset.
-            if req.retry_failed_only and not narrowed:
+            if req.retry_failed_only and not narrowed and runner is None:
                 # spec.verify_env is attempt-0's OWN build environment (the
                 # shared sccache backend et al).  Threading it makes the
                 # `cargo nextest list` probe model the same build the verify
@@ -2915,12 +2913,12 @@ async def _run_post_merge_verify(
             # above actually merged retry_env — earns its own SEPARATE, larger
             # budget (max_narrowed/narrowed_retries), decoupled from the legacy
             # enospc_retries/max_enospc budget so an unrelated prior ENOSPC event
-            # can never starve it.  A non-narrowed retry (flag off, or a payload
-            # that could not be built/corroborated) keeps sharing the legacy
-            # budget: at most `max_enospc` full re-verifies, which matches the
-            # pre-2835 single retry only at max_enospc == 1.  reverify_member_solo
-            # never sets retry_failed_only, so it always lands here; its budget
-            # is pinned by
+            # can never starve it.  A non-narrowed retry (flag off, a payload
+            # that could not be built/corroborated, or a remote dispatch) keeps
+            # sharing the legacy budget: at most `max_enospc` full re-verifies,
+            # which matches the pre-2835 single retry only at max_enospc == 1.
+            # reverify_member_solo never sets retry_failed_only, so it always
+            # lands here; its budget is pinned by
             # orchestrator/tests/test_merge_queue_train_attribution.py::TestReverifyMemberSoloContract::test_persistent_infra_transient_red_earns_one_full_retry
             retries, budget = (
                 (narrowed_retries, max_narrowed) if narrowed else (enospc_retries, max_enospc)
