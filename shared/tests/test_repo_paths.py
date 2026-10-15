@@ -20,6 +20,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
 from shared.repo_paths import (
     DARK_FACTORY_ROOT_ENV,
     rejected_dark_factory_root_override,

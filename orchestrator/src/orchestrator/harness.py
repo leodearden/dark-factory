@@ -34,6 +34,10 @@ from shared.config_dir import CONFIG_DIR_PREFIX
 from shared.cost_store import CostStore
 from shared.eval_lane import eval_lane_provenance
 from shared.mcp_envelope import resolver_failed
+from shared.repo_paths import (
+    rejected_dark_factory_root_override,
+    resolve_dark_factory_root,
+)
 from shared.storm_counter import StormCounter
 from shared.systemd_listeners import take_systemd_listeners
 from shared.task_claimant import (
@@ -138,10 +142,6 @@ from orchestrator.recovery_emission import (
     veto_signature,
 )
 from orchestrator.recovery_pins import records_pin_recovery
-from orchestrator.repo_paths import (
-    rejected_dark_factory_root_override,
-    resolve_dark_factory_root,
-)
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
