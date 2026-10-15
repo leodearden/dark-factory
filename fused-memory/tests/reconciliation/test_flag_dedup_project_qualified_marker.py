@@ -14,17 +14,20 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
 
 from fused_memory.models.memory import AddMemoryResponse
+from fused_memory.models.reconciliation import StageId, StageReport, Watermark
 from fused_memory.reconciliation.flag_dedup import (
     compute_content_fingerprint_signature,
     dedup_flags,
 )
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
+from fused_memory.reconciliation.stages.base import BaseStage
+from reconciliation.consolidator_fixtures import make_consolidator
 
 RUNNING = 'dark_factory'
 FT = 'some_recurring_gap'
@@ -66,22 +69,29 @@ async def memory_service(tmp_path):
         await ledger.close()
 
 
-async def _seed_legacy_marker(ledger: ReconLedgerStore, task_id: str) -> None:
+async def _seed_marker(
+    ledger: ReconLedgerStore,
+    task_id: str,
+    *,
+    project_id: str = RUNNING,
+    flag_type: str = FT,
+    run_id: str = 'legacy',
+) -> None:
     await ledger.upsert(ReconLedgerRecord(
-        project_id=RUNNING,
+        project_id=project_id,
         record_kind=MARKER,
         payload_json=json.dumps({
             'source': MARKER,
             'kind': MARKER,
             'task_id': task_id,
-            'flag_type': FT,
-            'run_id': 'legacy',
-            'last_seen_run_id': 'legacy',
+            'flag_type': flag_type,
+            'run_id': run_id,
+            'last_seen_run_id': run_id,
         }),
         state='active',
         created_at='2026-01-01T00:00:00+00:00',
         task_id=task_id,
-        flag_type=FT,
+        flag_type=flag_type,
         run_id='',
         expires_at='2099-01-01T00:00:00+00:00',
     ))
@@ -118,7 +128,7 @@ async def test_same_foreign_subject_still_recurs(memory_service):
 
 @pytest.mark.asyncio
 async def test_legacy_all_local_row_is_still_read(memory_service):
-    await _seed_legacy_marker(memory_service.recon_ledger, '650')
+    await _seed_marker(memory_service.recon_ledger, '650')
 
     (flag,) = await dedup_flags(memory_service, RUNNING, 'r1', [LOCAL_CITING_ITSELF])
 
@@ -135,7 +145,7 @@ async def test_legacy_bare_row_for_foreign_subject_misses_once_then_self_heals(m
     change removes.  So the foreign subject misses once, re-keys, and recurs
     from the next cycle on.
     """
-    await _seed_legacy_marker(memory_service.recon_ledger, '650')
+    await _seed_marker(memory_service.recon_ledger, '650')
 
     (first,) = await dedup_flags(memory_service, RUNNING, 'r1', [FOREIGN])
     (second,) = await dedup_flags(memory_service, RUNNING, 'r2', [FOREIGN])
@@ -230,3 +240,70 @@ def test_anchorless_flag_falls_back_to_content_fingerprint():
     assert compute_marker_signature(flag, project_id=RUNNING) == (
         compute_content_fingerprint_signature(flag)
     )
+
+
+class TestConsolidatorAcknowledgesByMarkerIdentity:
+    """MemoryConsolidator.run() tells a moot drop from a suppression by
+    signature diff; that diff must compare marker identities, or a foreign
+    subject's suppression shields a same-numbered local moot flag."""
+
+    PROJECT_ID = 'test_project'
+    PROJECT_ROOT = '/tmp/test_project'
+    FOREIGN_ROOT = '/reify'
+    ST = 'stale_metadata'
+
+    SUPPRESSED = {
+        'task_id': None,
+        'flag_type': ST,
+        'description': 'd1',
+        'cited_tasks': [{'project_id': 'reify', 'task_id': '777', 'title': 'Fix'}],
+    }
+    MOOT = {'task_id': '777', 'flag_type': ST, 'description': 'd2'}
+
+    async def _get_task(self, task_id, project_root):
+        if str(task_id) == '777' and project_root == self.FOREIGN_ROOT:
+            return {'id': 777, 'title': 'Fix', 'status': 'pending'}
+        if str(task_id) == '777' and project_root == self.PROJECT_ROOT:
+            return {'id': 777, 'status': 'done', 'title': 'x'}
+        return {'error': f'No tasks found for ID(s): {task_id}', 'error_type': 'TaskmasterError'}
+
+    @pytest.mark.asyncio
+    async def test_moot_local_drop_is_reclaimed_while_foreign_suppression_is_kept(
+        self, memory_service
+    ):
+        from fused_memory.reconciliation.flag_dedup import compute_marker_signature
+
+        ledger = memory_service.recon_ledger
+        suppressed_sig = compute_marker_signature(self.SUPPRESSED, project_id=self.PROJECT_ID)
+        assert suppressed_sig is not None
+        await _seed_marker(ledger, suppressed_sig[0], project_id=self.PROJECT_ID, flag_type=self.ST)
+        await _seed_marker(ledger, '777', project_id=self.PROJECT_ID, flag_type=self.ST)
+
+        stage = make_consolidator(project_root=self.PROJECT_ROOT)
+        assert stage.memory is not None and stage.taskmaster is not None
+        stage.memory.recon_ledger = ledger
+        stage.known_projects = {'reify': self.FOREIGN_ROOT}
+        stage.taskmaster.get_task = AsyncMock(side_effect=self._get_task)
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[dict(self.SUPPRESSED), dict(self.MOOT)],
+            stats={},
+        )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id=self.PROJECT_ID),
+                prior_reports=[],
+                run_id='r2',
+            )
+
+        assert not [f for f in report.items_flagged if f.get('description') in ('d1', 'd2')]
+        moot_row = await ledger.get_by_identity(self.PROJECT_ID, MARKER, '777', self.ST, '')
+        suppressed_row = await ledger.get_by_identity(
+            self.PROJECT_ID, MARKER, *suppressed_sig, '',
+        )
+        assert moot_row is not None and moot_row.state == 'addressed'
+        assert suppressed_row is not None and suppressed_row.state == 'active'
