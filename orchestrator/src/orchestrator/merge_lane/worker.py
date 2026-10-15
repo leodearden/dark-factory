@@ -5533,6 +5533,8 @@ class _TrainMergeHost(Protocol):
     _verifier: VerifyPort
     _clock: ClockPort
     _runner_quarantine: set[str]
+    _escalation_queue: Any
+    _flake_task_client: Any
 
     # ── Per-task counters (mutated by shared helpers) ─────────────────────
     _post_merge_verify_timeouts: dict[str, int]
@@ -5559,7 +5561,7 @@ class _TrainMergeHost(Protocol):
     # ── verify hosts ──────────────────────────────────────────────────────
     def _ensure_host_allocator(self, config: OrchestratorConfig) -> HostAllocator: ...
     def _quarantine_unreachable_host(self, host: str, reason: str, now: float) -> None: ...
-    async def _cancel_and_release_tracked(self, lease: Any | None) -> bool: ...
+    async def _cancel_and_release_tracked(self, lease: HostLease | None) -> bool: ...
 
     # ── restart drain (task 5371) ─────────────────────────────────────────
     def _note_verify_started(self, request_id: str, *, host: str | None = None) -> None: ...
@@ -7020,7 +7022,7 @@ class _TrainVerifyHost:
 
     @property
     def name(self) -> str:
-        return LocalRunner.name if self._lease is None else self._lease.name
+        return self._allocator.local_name if self._lease is None else self._lease.name
 
     @property
     def runner(self) -> VerifyRunner | None:
@@ -7075,8 +7077,8 @@ async def _leased_train_verify(
         event_store=worker._event_store,
         quarantine=worker._runner_quarantine,
         halt_hook=worker.operator_halt,
-        escalation_queue=getattr(worker, '_escalation_queue', None),
-        task_client=getattr(worker, '_flake_task_client', None),
+        escalation_queue=worker._escalation_queue,
+        task_client=worker._flake_task_client,
         verifier=worker._verifier,
     )
     host = await _TrainVerifyHost.acquire(worker, req, merge_wt)
@@ -9541,8 +9543,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         #
         # Read at TWO sites: `_run_inflight_verify`'s `_run_post_merge_verify`
         # dispatch (the VERIFY HALF of `_verify_and_advance` — grep the former, it
-        # is the name that exists), and `_do_train_merge`'s (via `getattr`, since it takes the narrow
-        # `_TrainMergeHost` Protocol).  Both are covered by
+        # is the name that exists), and `_leased_train_verify`'s (a declared
+        # `_TrainMergeHost` attribute).  Both are covered by
         # `orchestrator/tests/test_merge_queue_flake_recorder.py::TestWorkerBuildsTheFlakeTaskClient`
         # — this construction is the one seam whose failure mode is SILENT (a site that
         # never supplies a client stops enforcing §5.9 with nothing anywhere going red),

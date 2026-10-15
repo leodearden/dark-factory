@@ -2857,6 +2857,24 @@
           "current": 6648
         }
       ]
+    },
+    {
+      "task_id": "6160",
+      "reason": "amend: _TrainMergeHost declares _escalation_queue and _flake_task_client, which _leased_train_verify used to reach by getattr string (review suggestion 4)",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22273,
+          "current": 22275
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57727,
+          "current": 57729
+        }
+      ]
     }
   ]
 }
