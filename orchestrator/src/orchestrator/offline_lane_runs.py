@@ -72,7 +72,7 @@ class OutputFormat(StrEnum):
 class Launched(NamedTuple):
     record: RunRecord
     tail: str
-    text: str | None
+    text: str
 
 
 def _pytest_failures(text: str) -> tuple[FailureRecord, ...]:
@@ -120,13 +120,12 @@ async def launch(
     phase: Phase,
     output_format: OutputFormat,
     junit_path: Path | None = None,
-    keep_text: bool = False,
 ) -> Launched:
     """Run *argv* with its output streamed to *lane_pass*'s *phase* log, then record it.
 
     Nothing of the output is held in memory while the child runs; the read,
     the parse and the record write happen in one hop off the event loop.
-    The whole output comes back as ``text`` only when *keep_text* asks for it.
+    The whole output comes back as ``text``; ``tail`` is its last ``_TAIL_CHARS`` characters.
     """
     output_path = lane_pass.output_path(phase)
     started_at = store.now()
@@ -160,7 +159,7 @@ async def launch(
             probe=None,
         )
         store.write_run(lane_pass, record)
-        return Launched(record, text[-_TAIL_CHARS:], text if keep_text else None)
+        return Launched(record, text[-_TAIL_CHARS:], text)
 
     return await asyncio.to_thread(record_run)
 

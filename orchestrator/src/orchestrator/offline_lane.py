@@ -1032,9 +1032,7 @@ class OfflineLaneWorker:
             lane_pass=offline_lane_runs.require_current_pass(self.records, LEGACY_NUMERIC_COMMAND),
             phase=Phase.CONFIRM,
             output_format=offline_lane_runs.OutputFormat.OPAQUE,
-            keep_text=True,
         )
-        assert launched.text is not None
         return _parse_confirmed_failures(launched.text)
 
     async def _default_infra_confirmation_run(self, wt: Path, head: str) -> list[str]:
@@ -1067,9 +1065,7 @@ class OfflineLaneWorker:
             lane_pass=offline_lane_runs.require_current_pass(self.records, LEGACY_INFRA_COMMAND),
             phase=Phase.CONFIRM,
             output_format=offline_lane_runs.OutputFormat.INFRA,
-            keep_text=True,
         )
-        assert launched.text is not None
         return _parse_infra_failures(launched.text)
 
     async def _default_confirm_command(
@@ -1113,9 +1109,7 @@ class OfflineLaneWorker:
             lane_pass=offline_lane_runs.require_current_pass(self.records, cmd.name),
             phase=Phase.CONFIRM,
             output_format=offline_lane_runs.OutputFormat.PYTEST,
-            keep_text=True,
         )
-        assert launched.text is not None
         ids = _extract_failing_test_ids(launched.text)
         if ids:
             return ids

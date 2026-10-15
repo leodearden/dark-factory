@@ -311,6 +311,14 @@ def _subdirectories(directory: Path) -> list[Path]:
     return sorted(entry for entry in directory.iterdir() if entry.is_dir())
 
 
+def _listed_best_effort(directory: Path) -> list[Path]:
+    try:
+        return _subdirectories(directory)
+    except OSError as exc:
+        logger.warning('offline-lane: could not list run records %s: %s', directory, exc)
+        return []
+
+
 def _removed(pass_dir: Path) -> bool:
     try:
         shutil.rmtree(pass_dir)
@@ -437,7 +445,7 @@ class RunRecordStore:
         cutoff = now - RECORD_RETENTION
         pruned: list[str] = []
         for command_dir in _subdirectories(self.root):
-            for pass_dir in _subdirectories(command_dir):
+            for pass_dir in _listed_best_effort(command_dir):
                 started_at = _pass_started_at(pass_dir.name)
                 if started_at is None or started_at >= cutoff or pass_dir.name in pinned_pass_ids:
                     continue
