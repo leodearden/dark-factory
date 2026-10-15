@@ -384,6 +384,7 @@ from fused_memory.reconciliation.task_count_snapshot_cadence import (
     SNAPSHOT_WRITTEN_STAT_KEY,
 )
 from fused_memory.utils.async_utils import gather_collect
+from fused_memory.utils.validation import validate_project_id
 
 logger = logging.getLogger(__name__)
 
@@ -1627,14 +1628,7 @@ async def dedup_flags(
     # no get_tasks call is issued at all.
     discovery_tracked_terms: dict[str, list[_TrackedTask] | None] = {}
     for flag in flags:
-        sig = compute_flag_signature(flag)
-        # Content-fingerprint fallback (task-1654 Fix 2): for null-task_id flags
-        # that lack cited_tasks, compute_flag_signature returns None.  Route them
-        # through the content-fingerprint path so dedup_flags writes/matches a
-        # marker and the finding stops re-escalating every cycle.
-        # Only appended unchanged (pass-through) when BOTH helpers return None.
-        if sig is None:
-            sig = compute_content_fingerprint_signature(flag)
+        sig = compute_marker_signature(flag, project_id=project_id)
         if sig is None:
             result.append(flag)
             continue
@@ -2413,6 +2407,29 @@ def compute_flag_signature(flag: dict[str, Any]) -> tuple[str, str] | None:
     Returns ``None`` for flags without enough signal to deduplicate — these are
     passed through unchanged by :func:`dedup_flags`.
     """
+    return _task_union_signature(flag, home_project_id=None)
+
+
+def compute_marker_signature(
+    flag: dict[str, Any], *, project_id: str
+) -> tuple[str, str] | None:
+    """Return *flag*'s ``stage1_flag_marker`` ledger identity in *project_id*, or ``None``.
+
+    The task component is :func:`compute_flag_signature`'s union, except that
+    a cited task from a project other than *project_id* contributes
+    ``'<project>:<task_id>'``.  Every bare id names a task of the row's own
+    ``project_id``.  A flag with no task anchor falls back to
+    :func:`compute_content_fingerprint_signature`.
+    """
+    return (
+        _task_union_signature(flag, home_project_id=project_id)
+        or compute_content_fingerprint_signature(flag)
+    )
+
+
+def _task_union_signature(
+    flag: dict[str, Any], *, home_project_id: str | None
+) -> tuple[str, str] | None:
     task_id = flag.get('task_id')
 
     # cited_tasks union (task-2432): whenever cited_tasks is present, the
@@ -2427,7 +2444,7 @@ def compute_flag_signature(flag: dict[str, Any]) -> tuple[str, str] | None:
         if task_id is not None:
             task_id_parts.update(part.strip() for part in str(task_id).split(',') if part.strip())
         task_id_parts.update(
-            str(c['task_id'])
+            _cited_task_component(c, home_project_id)
             for c in cited_tasks
             if isinstance(c, dict) and c.get('task_id') is not None
         )
@@ -2438,6 +2455,19 @@ def compute_flag_signature(flag: dict[str, Any]) -> tuple[str, str] | None:
     if task_id is None or flag_type is None:
         return None
     return (str(task_id), str(flag_type))
+
+
+def _cited_task_component(cited: dict[str, Any], home_project_id: str | None) -> str:
+    cited_project = cited.get('project_id')
+    is_foreign = (
+        home_project_id is not None
+        and isinstance(cited_project, str)
+        and bool(cited_project)
+        and cited_project != home_project_id
+    )
+    if is_foreign:
+        return f'{cited_project}:{cited["task_id"]}'
+    return str(cited['task_id'])
 
 
 # --------------------------------------------------------------------------- #
@@ -2518,9 +2548,14 @@ def _is_valid_marker_task_id(tid: str) -> bool:
     # Canonical content-fingerprint branch: fp: + exactly 32 lowercase hex chars.
     if _CONTENT_FP_RE.fullmatch(tid):
         return True
-    # Numeric / comma-joined branch (existing convention, unchanged).
-    components = tid.split(',')
-    return all(part.strip().isdigit() for part in components)
+    return all(_is_valid_marker_task_component(part.strip()) for part in tid.split(','))
+
+
+def _is_valid_marker_task_component(component: str) -> bool:
+    project, separator, task_id = component.partition(':')
+    if not separator:
+        return component.isdigit()
+    return task_id.isdigit() and validate_project_id(project) is None
 
 
 def is_content_fingerprint_task_id(tid: str) -> bool:
