@@ -433,6 +433,35 @@ class TestMultiRootDiscovery:
         assert str(good_root) not in records[0].getMessage()
 
 
+class TestSameBasenameRoots:
+    """Two configured roots sharing a basename keep distinct labels and URLs."""
+
+    def _roots(self, tmp_path):
+        a = tmp_path / 'a' / 'proj'
+        b = tmp_path / 'b' / 'proj'
+        _write_yaml(a / 'dark-factory-orchestrator.yaml', {'escalation': {'port': 9101}})
+        _write_yaml(b / 'dark-factory-orchestrator.yaml', {'escalation': {'port': 9102}})
+        return a, b
+
+    def test_each_root_is_labelled_by_its_shortest_unique_suffix(self, tmp_path):
+        a, b = self._roots(tmp_path)
+        config = DashboardConfig(project_root=a, known_project_roots=[b])
+
+        assert config.project_labels.of(a.resolve()) == 'a/proj'
+        assert config.project_labels.of(b.resolve()) == 'b/proj'
+        assert config.project_labels.roots == config.all_project_roots
+
+    def test_each_root_keeps_its_own_escalation_url(self, tmp_path):
+        a, b = self._roots(tmp_path)
+        expected = {
+            'a/proj': 'http://127.0.0.1:9101/mcp',
+            'b/proj': 'http://127.0.0.1:9102/mcp',
+        }
+
+        assert _discover_escalation_urls([a, b]) == expected
+        assert DashboardConfig(project_root=a, known_project_roots=[b]).escalation_urls == expected
+
+
 class TestCuratorEventsDbPath:
     """``curator_events_db`` resolves where fused-memory writes the curator's
     invocation ledger: ``<reconciliation.data_dir>/curator_events.db``.

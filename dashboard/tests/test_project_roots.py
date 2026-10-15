@@ -151,6 +151,19 @@ class TestEveryConsumerWalksTheOneEnumerator:
             'active_tasks.project_roots_for_label walks its own roster'
         )
 
+    def test_project_labels(self, tmp_path):
+        primary, x_proj, y_proj = _dirs(tmp_path, 'primary', 'x/proj', 'y/proj')
+        config = _ReversedRoots(project_root=primary, known_project_roots=[x_proj, y_proj])
+        assert config.project_labels.roots == config.all_project_roots, (
+            'DashboardConfig.project_labels walks its own roster'
+        )
+        assert config.project_labels.root_for('x/proj') == x_proj.resolve()
+
+        without_last = _WithoutLastRoot(project_root=primary, known_project_roots=[x_proj, y_proj])
+        assert without_last.project_labels.root_for('y/proj') is None, (
+            'a root the roster omits is not configured'
+        )
+
     async def test_fan_out_list_tickets(self, tmp_path):
         a, b, c = _dirs(tmp_path, 'a', 'b', 'c')
         config = _WithoutLastRoot(
