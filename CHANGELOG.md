@@ -1584,5 +1584,8 @@ Every plan.json read-modify-write now holds `TaskArtifacts.plan_mutex`: the 12 p
 mutators, the TaskArtifacts plan methods, `read_plan`'s normalization write-back, and the
 markup stamp. It is a reentrant `fcntl.flock` on a `plan.json.mutex` sidecar, keyed on the
 resolved plan path and honoured across threads and processes; the wait is bounded at 60s
-and then raises `FileMutexTimeout`. This closes the lost update task 4597 left pinned by
+and then raises `FileMutexTimeout`, a `RuntimeError` rather than an `OSError`. The write that
+ends a read-modify-write, `write_plan(plan, mutex_held=True)`, verifies the calling thread
+holds the mutex and otherwise raises `PlanMutexNotHeld` before writing, so a forgotten lock
+fails loudly instead of losing an update. This closes the lost update task 4597 left pinned by
 `TestTheCrossWriterWindowIsKnown`, now `TestTheStampSerialisesWithEveryPlanWriter`.
