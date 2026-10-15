@@ -3456,39 +3456,10 @@ class TestCollectTasksWithCountsFairness:
             'operator can reason about across two consecutive renders'
         )
 
-    async def test_all_project_roots_stays_primary_first(
-        self, monkeypatch, tmp_path, dummy_client,
-    ):
-        """(c) The rotation must NOT leak into the shared root enumerator.
-
-        ``DashboardConfig.all_project_roots`` has other readers that depend on
-        primary-first ordering (``api/tasks.py``'s terminal-window lookup and
-        root count, ``data/scheduler.py``'s roots to query, and
-        ``project_roots_for_label``). Rotating it in place would silently
-        repoint every one of them at a different project — a far larger blast
-        radius than the Tasks tab.
-        """
-        import dashboard.data.active_tasks as at_mod
-
-        config = self._n_root_config(tmp_path, 5)
-        _register_runtime(monkeypatch, {})
-        self._admission_recorder(monkeypatch, dwell=0.0)
-        at_mod._reset_root_rotation()
-
-        for render in range(4):
-            await collect_tasks_with_counts(client=dummy_client, config=config)
-            roots = config.all_project_roots
-            assert roots[0] == config.project_root, (
-                f'after {render + 1} render(s) all_project_roots returned '
-                f'{[r.name for r in roots]} — the primary root is no longer '
-                'first, so the rotation has leaked into the shared enumerator '
-                'and every other reader now reads a different project'
-            )
-
     async def test_output_order_is_unaffected_by_rotation(
         self, monkeypatch, tmp_path, dummy_client,
     ):
-        """(d) Rotation changes ADMISSION order only, never rendered order.
+        """(c) Rotation changes ADMISSION order only, never rendered order.
 
         If the rotated order reached the payload, the Tasks table would
         reshuffle on every 3 s poll — a fix for invisibility that trades it

@@ -305,15 +305,8 @@ def _rotated_project_roots(config: DashboardConfig) -> tuple[Path, ...]:
     Reproducibility in an incident is worth more here than any property a
     random order would buy.
 
-    SEPARATE HELPER, deliberately. ``DashboardConfig.all_project_roots`` stays
-    primary-first: ``api/tasks.py``, ``data/scheduler.py`` and
-    ``project_roots_for_label`` all depend on that ordering, so rotating in
-    place would silently repoint every one of them at a different project.
-    Only ``collect_tasks_with_counts``' admission loop calls this.
-
-    Rotation changes ADMISSION order only. Output is re-assembled in canonical
-    ``DashboardConfig.all_project_roots`` order by the caller, so the rendered
-    table does not reshuffle on every 3 s poll.
+    Rotation changes ADMISSION order only: the caller re-assembles output in
+    ``DashboardConfig.all_project_roots`` order.
     """
     global _root_rotation_offset
     roots = config.all_project_roots
