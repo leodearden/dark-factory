@@ -3599,6 +3599,17 @@ class TestPriceEntry:
         with pytest.raises(ValidationError):
             PriceEntry(input_per_1m=-1, output_per_1m=1)
 
+    def test_cached_input_rate_validates(self):
+        entry = PriceEntry(input_per_1m=10.0, output_per_1m=50.0, cached_input_per_1m=1.0)
+        assert entry.cached_input_per_1m == 1.0
+
+    def test_cached_input_rate_is_optional(self):
+        assert PriceEntry(input_per_1m=1.10, output_per_1m=4.40).cached_input_per_1m is None
+
+    def test_negative_cached_input_rate_rejected(self):
+        with pytest.raises(ValidationError):
+            PriceEntry(input_per_1m=1, output_per_1m=1, cached_input_per_1m=-0.5)
+
 
 class TestOrchestratorConfigPrices:
     """OrchestratorConfig.prices is seeded from the packaged defaults.yaml

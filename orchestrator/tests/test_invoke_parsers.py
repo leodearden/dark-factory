@@ -11,6 +11,7 @@ import pytest
 from shared.cli_invoke import _SubprocessResult
 
 from orchestrator.agents.invoke import (
+    _estimate_cost,
     _parse_codex_output,
     _parse_gemini_output,
     _parse_pi_output,
@@ -227,6 +228,55 @@ class TestParseCodexOutputUnknownModelFallback:
         )
         # _FALLBACK_PRICE: input=2.0/1M, output=8.0/1M
         assert agent_result.cost_usd == pytest.approx((200 * 2.0 + 100 * 8.0) / 1_000_000)
+
+
+# Measured gpt-6-astra rollout usage (task 5403): codex counts cached tokens
+# INSIDE input_tokens.
+_ASTRA_INPUT_TOKENS = 311881
+_ASTRA_CACHED_INPUT_TOKENS = 277760
+_ASTRA_OUTPUT_TOKENS = 1442
+
+
+class TestEstimateCostCachedInput:
+    """The cached share of input_tokens is priced at cached_input_per_1m and
+    only the remainder at input_per_1m; an entry with no cached rate prices
+    every input token at input_per_1m, exactly as before."""
+
+    @pytest.mark.parametrize('as_price_entry', [True, False])
+    def test_measured_astra_rollout_prices_the_cached_share_at_the_cached_rate(
+        self, as_price_entry: bool,
+    ) -> None:
+        rates = {'input_per_1m': 10.0, 'output_per_1m': 50.0, 'cached_input_per_1m': 1.0}
+        prices = {'gpt-6-astra': PriceEntry(**rates) if as_price_entry else rates}
+
+        cost = _estimate_cost(
+            'gpt-6-astra', _ASTRA_INPUT_TOKENS, _ASTRA_OUTPUT_TOKENS, prices,
+            cached_input_tokens=_ASTRA_CACHED_INPUT_TOKENS,
+        )
+
+        # ((311881 - 277760) * 10 + 277760 * 1 + 1442 * 50) / 1e6 = 0.69107,
+        # against 3.19091 with every input token at the uncached rate.
+        assert cost == pytest.approx(0.69107)
+
+    def test_entry_without_cached_rate_prices_cached_tokens_at_input_rate(self) -> None:
+        prices = {'gpt-6-astra': PriceEntry(input_per_1m=10.0, output_per_1m=50.0)}
+
+        with_cached = _estimate_cost(
+            'gpt-6-astra', _ASTRA_INPUT_TOKENS, _ASTRA_OUTPUT_TOKENS, prices,
+            cached_input_tokens=_ASTRA_CACHED_INPUT_TOKENS,
+        )
+
+        assert with_cached == _estimate_cost(
+            'gpt-6-astra', _ASTRA_INPUT_TOKENS, _ASTRA_OUTPUT_TOKENS, prices,
+        )
+        # (311881 * 10 + 1442 * 50) / 1e6
+        assert with_cached == pytest.approx(3.19091)
+
+    def test_fallback_price_without_cached_key_does_not_raise(self) -> None:
+        cost = _estimate_cost('totally-unknown-model', 300, 100, {}, cached_input_tokens=200)
+
+        # _FALLBACK_PRICE has no cached rate: (300 * 2.0 + 100 * 8.0) / 1e6
+        assert cost == pytest.approx((300 * 2.0 + 100 * 8.0) / 1_000_000)
 
 
 # Measured verbatim from codex-cli 0.154.0 on 2026-09-11, carried by both an
