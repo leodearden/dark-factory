@@ -17,6 +17,7 @@ from client_feed.contract import (
     parse_engagement,
     parse_feed_line,
     parse_inbox_line,
+    parse_state,
 )
 
 SHA = 'b' * 40
@@ -271,3 +272,29 @@ def test_a_bad_engagement_projection_is_a_violation(text: str) -> None:
     with pytest.raises(ContractViolation) as caught:
         parse_engagement(text)
     assert caught.value.line_no is None
+
+
+def test_a_state_parses_and_a_bad_one_is_a_whole_file_violation() -> None:
+    state = {
+        'project_id': 'demo-client',
+        'feed_version': '1.0',
+        'watermark_seq': 0,
+        'as_of': None,
+        'head': None,
+        'engagement_version': None,
+        'degraded': [],
+        'factory': None,
+        'prds': {},
+        'tasks': {},
+        'in_flight': [],
+        'branches': None,
+        'tree': None,
+        'revealed': [],
+        'criteria': {},
+        'recent': [],
+    }
+    assert parse_state(json.dumps(state)).project_id == 'demo-client'
+    with pytest.raises(ContractViolation) as caught:
+        parse_state(json.dumps({**state, 'watermark_seq': -1}))
+    assert caught.value.line_no is None
+    assert 'watermark_seq' in caught.value.detail

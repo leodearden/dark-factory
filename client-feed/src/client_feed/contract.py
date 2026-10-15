@@ -622,3 +622,8 @@ def parse_engagement(text: str) -> EngagementProjection:
     return _validated(
         EngagementProjection.model_validate, _json_object(text, line_no=None), line_no=None
     )
+
+
+def parse_state(text: str) -> FeedState:
+    """The whole of state.json."""
+    return _validated(FeedState.model_validate, _json_object(text, line_no=None), line_no=None)
