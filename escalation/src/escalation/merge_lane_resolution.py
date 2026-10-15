@@ -25,7 +25,7 @@ applies to its carrier census.  Eight copies of an argument drift; one does
 not.
 
 Both halves key on the SAME vocabulary.  ``MERGE_LANES`` and
-``lane_for_task_metadata`` are imported from ``orchestrator.merge_queue``,
+``lane_for_task_metadata`` are imported from ``orchestrator.merge_lane.worker``,
 never copied: ``lane_for_task_metadata`` is the same function the
 orchestrator's own submit path uses (``orchestrator/src/orchestrator/
 workflow.py::TaskWorkflow::_submit_to_merge_queue``), so the two submit paths
@@ -115,7 +115,7 @@ def validate_requested_lane(requested: Any) -> MergeLane | None:
     """
     if requested is None:
         return None
-    from orchestrator.merge_queue import MERGE_LANES  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.worker import MERGE_LANES  # type: ignore[reportMissingImports]
 
     if not isinstance(requested, str) or requested not in MERGE_LANES:
         raise InvalidMergeLane(requested, tuple(MERGE_LANES))
@@ -136,7 +136,7 @@ def resolve_merge_lane(
     is the case that lets an operator hold a task with
     ``metadata.merge_lane='high'`` back to the normal lane.
 
-    The metadata arm delegates to ``orchestrator.merge_queue::
+    The metadata arm delegates to ``orchestrator.merge_lane.worker::
     lane_for_task_metadata`` — see the module docstring for why that, and not
     ``_normalize_lane``, is the right normaliser here.  ``source`` is
     ``'task_metadata'`` iff the ``'merge_lane'`` key is PRESENT — presence,
@@ -147,7 +147,7 @@ def resolve_merge_lane(
     if requested is not None:
         return LaneChoice(lane=requested, source='argument')
 
-    from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
         lane_for_task_metadata,
     )
 

@@ -12,7 +12,7 @@ recommendation: ``orchestrator/pyproject.toml`` already declares ``escalation``
 as a workspace dependency (and not the reverse), so η — which lives in
 ``orchestrator`` — imports this module STATICALLY, with no new runtime
 indirection.  ``shared/`` was rejected because it would place a runtime
-reverse-import of ``orchestrator.landing_evidence`` inside the package every
+reverse-import of ``orchestrator.merge_lane.landing_evidence`` inside the package every
 other package depends on: strictly worse layering than the status quo, since
 the reverse import would then sit in the most widely-imported package rather
 than in the one that already tolerates it.
@@ -20,7 +20,7 @@ than in the one that already tolerates it.
 **Two import rules this module must keep.**  It must never import
 ``escalation.server`` — server.py imports this, and a cycle would turn a
 graceful degradation into a server-construction failure.  And its
-``orchestrator.landing_evidence`` imports are RUNTIME-ONLY, made inside
+``orchestrator.merge_lane.landing_evidence`` imports are RUNTIME-ONLY, made inside
 function bodies reached from the fire-safe wrapper in :func:`probe_landing`:
 ``escalation/pyproject.toml`` declares no orchestrator dependency, and the
 import resolves at runtime only because the escalation server is hosted inside
@@ -55,7 +55,7 @@ class GitAuthorityOutcome(enum.StrEnum):
     A ``StrEnum`` rather than bare strings so a consumer switches on a closed
     set, and for consistency with the two enums this code sits between —
     ``shared.merge_state.MergeState`` above it and
-    ``orchestrator.landing_evidence.LandingReason`` below.
+    ``orchestrator.merge_lane.landing_evidence.LandingReason`` below.
 
     ``landed_unconfirmed``, ``no_signal`` and ``probe_failed`` are DIFFERENT
     PROPOSITIONS and that is the whole reason all three exist: the first
@@ -66,7 +66,7 @@ class GitAuthorityOutcome(enum.StrEnum):
     established either way.
 
     NOT to be confused with the unrelated ``'no_signal'`` that
-    ``orchestrator.landing_evidence`` writes into
+    ``orchestrator.merge_lane.landing_evidence`` writes into
     ``probe['delivered_checks_outcome']``, which means "the task's declared
     delivered-checks produced no confirming signal" — a statement about one
     sub-probe, not about whether a landing was established.  The two never
@@ -300,7 +300,7 @@ class GitAuthorityVerdict:
 
     ``reason`` stays a plain ``str | None`` carrying the landing verdict's
     own spelling rather than
-    ``orchestrator.landing_evidence.LandingReason``, because importing that
+    ``orchestrator.merge_lane.landing_evidence.LandingReason``, because importing that
     enum would force exactly the static reverse import this module exists to
     avoid.  ``LandingReason`` is a genuine ``str`` subclass, so the spelling
     round-trips and JSON-encodes as itself.
@@ -390,10 +390,10 @@ async def _evidence_verdict(
     from :func:`probe_landing` — see the module docstring for why it must
     stay inside a function body.  Resolving it per call is also what lets
     ``escalation/tests/test_merge_status_git_authority.py`` observe the call
-    contract by patching ``orchestrator.landing_evidence``, the DEFINING
+    contract by patching ``orchestrator.merge_lane.landing_evidence``, the DEFINING
     module, rather than this one.
     """
-    from orchestrator.landing_evidence import (  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.landing_evidence import (  # type: ignore[reportMissingImports]
         validate_landing_evidence,
     )
     verdict = await validate_landing_evidence(
@@ -496,7 +496,7 @@ async def probe_landing(
         # at runtime because the escalation server is hosted inside the
         # orchestrator process.  An ImportError is an Exception and therefore
         # already degrades to probe_failed via the wrapper below.
-        from orchestrator.landing_evidence import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.landing_evidence import (  # type: ignore[reportMissingImports]
             branch_is_degenerate,
             is_valid_sha_40,
         )

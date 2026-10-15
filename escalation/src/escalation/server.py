@@ -1329,7 +1329,7 @@ def create_server(
     # process where orchestrator is always importable.
     _registry = merge_inflight_registry
     if merge_queue is not None and _registry is None:
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane import (  # type: ignore[reportMissingImports]
             InFlightMergeRegistry,
         )
         _registry = InFlightMergeRegistry()
@@ -3867,18 +3867,16 @@ def create_server(
         # resolves at runtime because the escalation server is hosted inside the
         # orchestrator process; it is unresolvable in escalation's standalone
         # typecheck env (orchestrator is not on its path), hence the suppression.
-        from orchestrator.landing_evidence import (  # type: ignore[reportMissingImports]
-            branch_is_degenerate,
-        )
         from orchestrator.merge_lane import (  # type: ignore[reportMissingImports]
-            WaiterRecord,
-        )
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             MergeOutcome,
             MergeRequest,
             QueuedBranch,
+            WaiterRecord,
             coalesce_or_enqueue_merge_request,
             patch_content_contained,
+        )
+        from orchestrator.merge_lane.landing_evidence import (  # type: ignore[reportMissingImports]
+            branch_is_degenerate,
         )
 
         # Single git_ops handle reused for both the already_merged fast-path
@@ -4798,7 +4796,7 @@ def create_server(
             return {'error': mismatch}
 
         # Runtime-only reverse import: orchestrator depends on escalation, not
-        # vice versa (mirrors merge_request's lazy orchestrator.merge_queue
+        # vice versa (mirrors merge_request's lazy orchestrator.merge_lane
         # import above) — unresolvable in escalation's standalone typecheck
         # env, hence the suppression.
         from orchestrator.git_ops import (  # type: ignore[reportMissingImports]
@@ -5261,7 +5259,7 @@ def create_server(
         # immediate resubmit gets a FRESH entry.  lookup→cancel above stays
         # await-free (I10); the only awaits are here, after cancel.
         rec.future.cancel()
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane import (  # type: ignore[reportMissingImports]
             retire_cancelled_merge_request,
         )
         await retire_cancelled_merge_request(

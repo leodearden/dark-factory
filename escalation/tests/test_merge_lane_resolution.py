@@ -35,7 +35,7 @@ from escalation.merge_lane_resolution import (
 # Cross-package orchestrator imports — mirrors test_merge_state_wiring.py's guard.
 # ---------------------------------------------------------------------------
 try:
-    from orchestrator.merge_queue import MERGE_LANES  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.worker import MERGE_LANES  # type: ignore[reportMissingImports]
     _ORCHESTRATOR_AVAILABLE = True
 except ImportError:
     _ORCHESTRATOR_AVAILABLE = False
@@ -43,7 +43,7 @@ except ImportError:
 
 
 # MODULE-level, not per-class.  Both public functions do their
-# ``from orchestrator.merge_queue import ...`` INSIDE the function body (see
+# ``from orchestrator.merge_lane.worker import ...`` INSIDE the function body (see
 # that module's docstring for why the imports are runtime-only), so without
 # orchestrator installed EVERY test here raises ImportError rather than
 # skipping — a class-level guard on the one class that names ``MERGE_LANES``

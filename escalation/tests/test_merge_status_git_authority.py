@@ -162,14 +162,14 @@ def _record_validate_landing_evidence(
     additionally observed.
 
     Patch the DEFINING module, not the importer: server.py's
-    ``from orchestrator.landing_evidence import ...`` is lazy and inside the
+    ``from orchestrator.merge_lane.landing_evidence import ...`` is lazy and inside the
     function body, so the module attribute is re-resolved on every call.
 
     Read ``call.kwargs['delivered_checks']`` BY NAME rather than by positional
     index, so the pin survives task 4500 flipping that parameter to
     keyword-only.
     """
-    from orchestrator.landing_evidence import (  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.landing_evidence import (  # type: ignore[reportMissingImports]
         validate_landing_evidence as _real,
     )
 
@@ -180,7 +180,7 @@ def _record_validate_landing_evidence(
         return await _real(*args, **kwargs)
 
     monkeypatch.setattr(
-        'orchestrator.landing_evidence.validate_landing_evidence', _recorder,
+        'orchestrator.merge_lane.landing_evidence.validate_landing_evidence', _recorder,
     )
     return calls
 
@@ -1524,7 +1524,7 @@ async def _run_merge_request_fast_path(
     ancestor arm hits and the tool returns ``already_merged`` before any
     worker or queue interaction — which is why no fake worker is needed here.
     """
-    from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
         InFlightMergeRegistry,
     )
 
