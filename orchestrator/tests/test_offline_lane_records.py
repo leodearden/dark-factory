@@ -2,15 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import os
+import shlex
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
+from test_offline_lane import _child_writing, _make_config, _make_git_ops, _make_worker
 
+from orchestrator.config import LaneCommand
+from orchestrator.offline_lane import OfflineLaneWorker
 from orchestrator.offline_lane_records import (
     FIRST_LINE_MAX_CHARS,
     LEGACY_COMMANDS,
@@ -20,6 +29,7 @@ from orchestrator.offline_lane_records import (
     EndedBy,
     FailureRecord,
     Leg,
+    PassRecord,
     Phase,
     ProbeResult,
     RunRecord,
@@ -513,3 +523,159 @@ class TestRetention:
     def test_a_missing_root_prunes_nothing(self, tmp_path: Path) -> None:
         store = RunRecordStore(tmp_path / 'never-created')
         assert store.prune(T0) == []
+
+
+_LANE_COMMAND = 'unit'
+_PASS_DEADLINE_SECS = 120.0
+
+
+def _lane_worker(tmp_path: Path, command: str) -> OfflineLaneWorker:
+    worktree = tmp_path / 'wt'
+    worktree.mkdir(exist_ok=True)
+    config = _make_config(
+        tmp_path,
+        offline_lane_legacy_numeric_enabled=False,
+        offline_lane_commands=[LaneCommand(name=_LANE_COMMAND, command=command, cwd='.')],
+        offline_lane_poll_interval_secs=3600.0,
+    )
+    return _make_worker(
+        tmp_path, git_ops=_make_git_ops(head=HEAD, worktree_path=worktree), config=config,
+    )
+
+
+async def _until(done: Callable[[], bool]) -> None:
+    deadline = time.monotonic() + _PASS_DEADLINE_SECS
+    while not done():
+        assert time.monotonic() < deadline, 'the lane pass left no record in time'
+        await asyncio.sleep(0.02)
+
+
+async def _run_one_pass(tmp_path: Path, command: str, *, until_phase: Phase) -> OfflineLaneWorker:
+    """Drive one lane pass through ``on_post_merge`` + ``run()`` until *until_phase* is recorded."""
+    worker = _lane_worker(tmp_path, command)
+    task = asyncio.create_task(worker.run())
+    try:
+        await worker.on_post_merge('t', 'base', 'head')
+        await _until(lambda: worker.records.last_record(_LANE_COMMAND, until_phase) is not None)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    return worker
+
+
+def _current_pass_record(worker: OfflineLaneWorker) -> PassRecord:
+    lane_pass = worker.records.current_pass(_LANE_COMMAND)
+    assert lane_pass is not None
+    record = worker.records.load_pass(_LANE_COMMAND, lane_pass.pass_id)
+    assert record is not None
+    return record
+
+
+class TestLanePassRecords:
+    """Scenario 1 and the record half of scenario 2: every lane sub-run leaves a record."""
+
+    @pytest.mark.asyncio
+    async def test_a_green_pass_records_its_detect_run_and_output(self, tmp_path: Path) -> None:
+        worker = await _run_one_pass(
+            tmp_path, "printf 'all green\\n'; exit 0", until_phase=Phase.DETECT,
+        )
+
+        detect = _current_pass_record(worker).detect
+        assert detect is not None
+        assert detect.returncode == 0
+        assert detect.ended_by == EndedBy.EXIT
+        assert detect.phase == Phase.DETECT
+        assert detect.junit_path is None
+        assert Path(detect.output_path).read_text() == 'all green\n'
+
+    @pytest.mark.asyncio
+    async def test_a_red_pass_names_the_failing_test_with_kind_and_first_line(
+        self, tmp_path: Path
+    ) -> None:
+        worker = await _run_one_pass(
+            tmp_path,
+            "printf 'FAILED tests/test_q.py::test_a - AssertionError: boom\\n'; exit 1",
+            until_phase=Phase.CONFIRM,
+        )
+
+        record = _current_pass_record(worker)
+        assert record.detect is not None
+        assert record.detect.returncode == 1
+        assert record.detect.ended_by == EndedBy.EXIT
+        assert record.detect.failures == (
+            FailureRecord('tests/test_q.py::test_a', 'failed', 'AssertionError: boom'),
+        )
+        assert record.detect.ids_available is True
+        assert record.confirm is not None
+        assert record.confirm.phase == Phase.CONFIRM
+        assert worker.records.last_record(_LANE_COMMAND, Phase.DETECT) == record.detect
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('command', 'returncode'),
+        [('kill -9 $$', -9), ('sh -c "kill -9 \\$\\$"', 137)],
+        ids=['negative-returncode', 'sh-c-128-plus-n'],
+    )
+    async def test_a_signal_ended_run_records_ended_by_signal(
+        self, tmp_path: Path, command: str, returncode: int
+    ) -> None:
+        worker = await _run_one_pass(tmp_path, command, until_phase=Phase.CONFIRM)
+
+        detect = _current_pass_record(worker).detect
+        assert detect is not None
+        assert detect.returncode == returncode
+        assert detect.ended_by == EndedBy.SIGNAL
+
+    def test_an_allocated_pass_has_its_header_before_any_sub_run(self, tmp_path: Path) -> None:
+        worker = _lane_worker(tmp_path, 'exit 0')
+        lane_pass = worker.records.allocate_pass(_LANE_COMMAND, Leg.GENERIC, HEAD)
+
+        record = worker.records.load_pass(_LANE_COMMAND, lane_pass.pass_id)
+
+        assert record is not None
+        assert (record.command, record.leg, record.head) == (_LANE_COMMAND, Leg.GENERIC, HEAD)
+        assert record.pass_id == lane_pass.pass_id
+        assert (record.detect, record.confirm, record.outcome, record.effect) == (
+            None, None, None, None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_structured_pytest_command_writes_junit_into_the_pass(
+        self, tmp_path: Path
+    ) -> None:
+        worker = _lane_worker(tmp_path, 'pytest -q tests')
+        cmd = LaneCommand(name=_LANE_COMMAND, command='pytest -q tests', cwd='.')
+        lane_pass = worker.records.allocate_pass(_LANE_COMMAND, Leg.GENERIC, HEAD)
+
+        with patch(
+            'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+            side_effect=_child_writing(b'1 passed in 0.01s\n', returncode=0),
+        ) as child:
+            await worker.command_runner(cmd, tmp_path / 'wt', HEAD)
+
+        junit_path = lane_pass.junit_path(Phase.DETECT)
+        assert child.call_args.args[-3:] == (
+            'sh', '-c', f'pytest -q --junitxml {shlex.quote(str(junit_path))} tests',
+        )
+        detect = worker.records.last_record(_LANE_COMMAND, Phase.DETECT)
+        assert detect is not None
+        assert detect.junit_path == str(junit_path)
+        assert detect.session_complete is True
+
+    @pytest.mark.asyncio
+    async def test_an_opaque_command_runs_unchanged_without_junit(self, tmp_path: Path) -> None:
+        worker = _lane_worker(tmp_path, 'make check')
+        cmd = LaneCommand(name=_LANE_COMMAND, command='make check', cwd='.')
+        worker.records.allocate_pass(_LANE_COMMAND, Leg.GENERIC, HEAD)
+
+        with patch(
+            'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+            side_effect=_child_writing(b'make: Nothing to be done.\n', returncode=0),
+        ) as child:
+            await worker.command_runner(cmd, tmp_path / 'wt', HEAD)
+
+        assert child.call_args.args[-3:] == ('sh', '-c', 'make check')
+        detect = worker.records.last_record(_LANE_COMMAND, Phase.DETECT)
+        assert detect is not None
+        assert detect.junit_path is None
