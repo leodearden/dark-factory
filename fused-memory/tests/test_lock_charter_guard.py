@@ -115,7 +115,7 @@ _CANONICAL_EXTENSIONS = [
     'manifest', 'md', 'mjs', 'mts',
     'npmrc', 'png', 'py', 'python-version',
     'ri', 'rs', 'scss', 'service', 'sh', 'step', 'stl', 'svg',
-    'template', 'timer', 'tombstones', 'toml', 'ts', 'tsx', 'txt', 'typed',
+    'template', 'timer', 'tombstones', 'toml', 'ts', 'tsv', 'tsx', 'txt', 'typed',
     'yaml', 'yml',
 ]
 
@@ -410,6 +410,8 @@ _ACCEPT_PATHS = [
     # reify file with a `tombstones` extension; filename is PRD-normative
     # (reify docs/prds/v0_6/spec-conformance-suite.md D3).
     'docs/reify-language-spec.tombstones',  # reify
+    # reify #9058 (α-first): the first tracked reify `.tsv`, landed by reify #8662.
+    'tests/infra/affected-crates-direct-sets.tsv',  # reify
 ]
 
 
