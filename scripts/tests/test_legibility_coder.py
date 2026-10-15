@@ -1541,13 +1541,14 @@ def test_a_reply_shaped_as_the_prompt_prescribes_reaches_the_merger():
 
     assert result.ok, result.reason
     assert result.record is not None
-    merged, stats = codebook_mod.apply_coding_record(
-        _tiny_codebook(), result.record, invariant_slugs=(),
+    merge = codebook_mod.apply_coding_records(
+        _tiny_codebook(), [result.record], invariant_slugs=(),
     )
-    assert stats["record_invalid"] is False
-    assert stats["matched"] == 1
-    assert stats["candidates_applied"] == 1
-    merged_text = json.dumps(merged)
+    assert merge.invalid_records == ()
+    assert merge.skipped_deletions == ()
+    assert merge.counts.matched == 1
+    assert merge.counts.candidates_applied == 1
+    merged_text = json.dumps(merge.codebook)
     assert populated
     assert [value for value in populated if value not in merged_text] == []
 
