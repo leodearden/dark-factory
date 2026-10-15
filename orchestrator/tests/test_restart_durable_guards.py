@@ -788,15 +788,28 @@ def _scheduler():
     return scheduler
 
 
-def _task(task_id: str, status: str = 'pending') -> dict:
+_FILED = '2026-10-01T00:00:00+00:00'
+_REOPENED = '2026-10-05T00:00:00+00:00'
+
+
+def _task(task_id: str, status: str = 'pending', pending_since: str | None = None) -> dict:
+    metadata: dict = {'files': [f'mod{task_id}']}
+    if pending_since is not None:
+        metadata['pending_since'] = pending_since
     return {
         'id': task_id,
         'title': f'Task {task_id}',
         'status': status,
         'priority': 'medium',
         'dependencies': [],
-        'metadata': {'files': [f'mod{task_id}']},
+        'metadata': metadata,
     }
+
+
+async def _tick(scheduler, tasks: list[dict]) -> None:
+    scheduler.get_tasks = AsyncMock(return_value=tasks)
+    scheduler.get_statuses = AsyncMock(return_value=({}, None))
+    await scheduler.acquire_next()
 
 
 def _spy_on_guard_writes(monkeypatch) -> list:
@@ -821,11 +834,11 @@ class TestResurrectionAnchorSurvivesRedeploy:
         queue over genuinely-old pending tasks once per redeploy, and its
         victims are the starvation watchdog's own."""
         first = _scheduler()
-        first._update_age_anchors([_task('100', status='cancelled')], _MAX_ID)
-        first._update_age_anchors([_task('100')], _MAX_ID)
+        first._update_age_anchors([_task('100', pending_since=_FILED)], _MAX_ID)
+        first._update_age_anchors([_task('100', pending_since=_REOPENED)], _MAX_ID)
 
         redeployed = _scheduler()
-        redeployed._update_age_anchors([_task('100')], _MAX_ID)
+        redeployed._update_age_anchors([_task('100', pending_since=_REOPENED)], _MAX_ID)
 
         assert redeployed._compute_age('100', _MAX_ID) == 0
 
@@ -848,22 +861,26 @@ class TestResurrectionAnchorSurvivesRedeploy:
         assert redeployed._compute_age('epic-a', _MAX_ID) == 0
         assert redeployed._compute_age('epic-b', _MAX_ID) == 0
 
-    def test_a_cold_start_writes_once_and_a_steady_state_tick_not_at_all(
+    @pytest.mark.asyncio
+    async def test_a_cold_start_writes_once_and_a_steady_state_tick_not_at_all(
         self, guard_clock, monkeypatch,
     ):
         """The two halves of one property, measured from the same spy.
 
-        The COLD START is a first tick that observes many departures at once,
-        inline on the event loop.  Its departure marks are batched, so it pays
-        one write rather than N writes of an N-entry file.  The STEADY STATE
-        re-observes the same ids every ~15s, which is
+        The COLD START is a first tick that finds N stamps changed while the
+        process was down, inline on the event loop.  Its N resets are
+        batched, so it pays one write rather than N writes of an N-entry file.
+        The STEADY STATE re-observes the same ids every ~15s, which is
         the difference between a quiet guard and a file rewritten ~5,760 times
         a day.  Spying from BEFORE the first call is what makes the cold start
         assertable at all.
         """
-        cold_start = [
-            _task(str(tid), status='cancelled') for tid in range(1000, 1200)
-        ]
+        ids = range(1000, 1200)
+        first = _scheduler()
+        await _tick(first, [_task(str(tid), 'in-progress', _FILED) for tid in ids])
+        await _tick(first, [_task('99', 'in-progress')])
+
+        cold_start = [_task(str(tid), pending_since=_REOPENED) for tid in ids]
         scheduler = _scheduler()
 
         writes = _spy_on_guard_writes(monkeypatch)
@@ -879,15 +896,19 @@ class TestResurrectionAnchorSurvivesRedeploy:
 
         assert writes == [], 'a re-observation of an unchanged observation must be silent'
 
-    def test_the_guard_expires(self, guard_clock):
-        """The mark cannot outlive the task it was recorded for."""
+    @pytest.mark.asyncio
+    async def test_the_guard_expires(self, guard_clock):
+        """The recorded reset cannot outlive the task it was recorded for."""
         first = _scheduler()
-        first._update_age_anchors([_task('100', status='cancelled')], _MAX_ID)
+        await _tick(first, [
+            _task('100', 'in-progress', _FILED), _task('4000', 'in-progress'),
+        ])
+        await _tick(first, [_task('100', pending_since=_REOPENED), _task('4000', 'in-progress')])
 
         guard_clock[0] = _T0 + timedelta(days=31)
 
         redeployed = _scheduler()
-        redeployed._update_age_anchors([_task('100')], _MAX_ID)
+        redeployed._update_age_anchors([_task('100', pending_since=_REOPENED)], _MAX_ID)
         assert redeployed._compute_age('100', _MAX_ID) == _MAX_ID - 100
 
 
@@ -895,15 +916,13 @@ class TestResurrectionAnchorSurvivesRedeploy:
 class TestStaleSweepRecordingSurvivesRedeploy:
     """``_phase_stale_sweep`` is the other write site and must be covered too."""
 
-    async def test_a_swept_id_is_still_marked_after_a_restart(self, guard_clock):
+    async def test_a_swept_anchor_is_restored_after_a_restart(self, guard_clock):
         first = _scheduler()
         first._pending_anchor['300'] = 5
-        first.get_tasks = AsyncMock(return_value=[_task('99')])
-        first.get_statuses = AsyncMock(return_value=({}, None))
-
-        await first.acquire_next()
-        assert '300' in first._age_reset_owed, 'a swept id must be owed an age reset'
+        await _tick(first, [_task('99')])
 
         redeployed = _scheduler()
         redeployed._update_age_anchors([_task('300')], _MAX_ID)
-        assert redeployed._compute_age('300', _MAX_ID) == 0
+        assert redeployed._compute_age('300', _MAX_ID) == _MAX_ID - 5, (
+            'absence from the fetch is not a cancellation (D3)'
+        )

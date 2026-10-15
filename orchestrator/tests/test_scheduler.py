@@ -4622,21 +4622,27 @@ class TestAgeAnchor:
 
     def test_cancelled_resurrection_no_age_jump(self):
         """A previously-cancelled task re-pended scores no higher than brand-new medium."""
+        filed, reopened = '2026-10-01T00:00:00+00:00', '2026-10-05T00:00:00+00:00'
+
+        def stamped(task_id: str, status: str, pending_since: str) -> dict:
+            task = _pending_task(task_id, status=status)
+            task['metadata']['pending_since'] = pending_since
+            return task
+
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         scheduler.finish_startup()
-        # Tick 1: task 1 is cancelled, task 100 is pending.
-        tasks_tick1 = [
-            _pending_task('1', status='cancelled'),
-            _pending_task('100', status='pending'),
-        ]
-        scheduler._update_age_anchors(tasks_tick1, max_id=100)
+        # Tick 1: task 1 and task 100 are pending.
+        scheduler._update_age_anchors(
+            [stamped('1', 'pending', filed), stamped('100', 'pending', filed)], max_id=100,
+        )
         age_100_t1 = scheduler._compute_age('100', max_id=100)
-        # Tick 2: task 1 is reinstated to pending, task 100 still pending.
-        tasks_tick2 = [
-            _pending_task('1', status='pending'),
-            _pending_task('100', status='pending'),
-        ]
-        scheduler._update_age_anchors(tasks_tick2, max_id=100)
+        # Tick 2: task 1 is cancelled; its stamp is unchanged.
+        scheduler._update_age_anchors(
+            [stamped('1', 'cancelled', filed), stamped('100', 'pending', filed)], max_id=100,
+        )
+        # Tick 3: task 1 is reinstated, which D3 marks with a new stamp.
+        tasks_tick3 = [stamped('1', 'pending', reopened), stamped('100', 'pending', filed)]
+        scheduler._update_age_anchors(tasks_tick3, max_id=100)
         age_1 = scheduler._compute_age('1', max_id=100)
         age_100 = scheduler._compute_age('100', max_id=100)
         # Resurrected 1 must not leapfrog brand-new 100.
@@ -11500,12 +11506,9 @@ class TestAcquireNextBookkeepingPurgesAbsentTasks:
         assert 'X' not in scheduler._pending_anchor, (
             f"Expected 'X' purged from _pending_anchor but it's still there: {scheduler._pending_anchor}"
         )
-        # X must be owed an age reset so that if it is resurrected to pending
-        # it gets a fresh max_id anchor (resurrection semantics) instead of
-        # re-using its old stale numeric id.
-        assert 'X' in scheduler._age_reset_owed, (
-            f"Expected 'X' owed an age reset for resurrection semantics: {scheduler._age_reset_owed}"
-        )
+        # Absence is not a cancellation (D3): X returns with the anchor it left with.
+        scheduler._update_age_anchors([_pending_task('X')], max_id=100)
+        assert scheduler._compute_age('X', 100) == 95
 
 
 class TestOrchestratorStatusSetsMatchShared:
