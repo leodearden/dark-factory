@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from typing import TYPE_CHECKING
 
 # Real (non-TYPE_CHECKING) imports: BOTH predicates are CALLED by tiers below,
@@ -230,6 +230,18 @@ _MONTH_ABBR = {
     'dec': 12,
 }
 
+# The strptime ladder every absolute reset clock time is read through.
+_CLOCK_TIME_FORMATS = ('%I:%M %p', '%I%p', '%I:%M%p', '%I %p')
+
+# ASSUMPTION about how codex renders its usage-window reset ("... try again
+# at 1:07 PM."): in the ChatGPT login's local time, naming no zone. On the
+# factory host that is the host's local zone, which astimezone(None) resolves.
+_CODEX_RESET_ZONE: tzinfo | None = None
+
+# codex rounds that reset to the minute, so it can be parsed just after it
+# passed; within this grace it means "now", not the same time tomorrow.
+_CODEX_RESET_ROLLOVER_GRACE = timedelta(minutes=10)
+
 # ORIGIN — _parse_resets_at and _extract_cap_message below started life in
 # usage_gate.py (their regex/parsing logic originated there) and were for a
 # time forked between the two modules with no drift guard. Task 4357 retired
@@ -261,6 +273,7 @@ def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | No
     - "resets in 3h" / "resets in 45m" / "resets in 2d"
     - "resets [on] Mar 30, 6pm (Europe/London)" (date + time + tz)
     - "resets 9pm (Europe/London)" / "resets 3:00 AM (US/Pacific)"
+    - codex's "try again at 1:07 PM" (no zone: host local, rollover grace)
 
     Returns ``None`` when no pattern matches — PRD 7.1.a: an unknown reset
     time must be reported as explicitly unknown, never fabricated as
@@ -314,7 +327,7 @@ def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | No
             month = _MONTH_ABBR.get(month_str)
             if month is None:
                 raise ValueError(f'Unknown month: {month_str}')
-            for fmt in ('%I:%M %p', '%I%p', '%I:%M%p', '%I %p'):
+            for fmt in _CLOCK_TIME_FORMATS:
                 try:
                     parsed_time = datetime.strptime(time_str, fmt).time()
                     break
@@ -353,7 +366,7 @@ def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | No
             time_str = m.group(1).strip()
             tz_str = m.group(2).strip()
             tz = zoneinfo.ZoneInfo(tz_str)
-            for fmt in ('%I:%M %p', '%I%p', '%I:%M%p', '%I %p'):
+            for fmt in _CLOCK_TIME_FORMATS:
                 try:
                     parsed_time = datetime.strptime(time_str, fmt).time()
                     break
@@ -374,6 +387,34 @@ def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | No
             return target.astimezone(UTC)
         except Exception:
             pass
+
+    # codex: "... or try again at 1:07 PM." with no parenthesised zone.
+    m = re.search(
+        r'try\s+again\s+at\s+(\d{1,2}(?::\d{2})?\s*[ap]m)(?!\s*\()',
+        text,
+        re.IGNORECASE,
+    )
+    if m:
+        time_str = m.group(1).strip()
+        for fmt in _CLOCK_TIME_FORMATS:
+            try:
+                parsed_time = datetime.strptime(time_str, fmt).time()
+                break
+            except ValueError:
+                continue
+        else:
+            return None
+
+        now_local = now.astimezone(_CODEX_RESET_ZONE)
+        target = now_local.replace(
+            hour=parsed_time.hour,
+            minute=parsed_time.minute,
+            second=0,
+            microsecond=0,
+        )
+        if target < now_local - _CODEX_RESET_ROLLOVER_GRACE:
+            target += timedelta(days=1)
+        return target.astimezone(UTC)
 
     # No pattern matched: unknown reset time (PRD 7.1.a) — explicit None,
     # never a fabricated now+1h.
