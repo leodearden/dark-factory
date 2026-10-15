@@ -48,7 +48,7 @@ def test_deviation_kinds_is_a_frozenset():
 
 
 def test_deviation_kinds_contains_exactly_the_legal_values():
-    assert DEVIATION_KINDS == frozenset({
+    assert frozenset({
         'never_checked_fact',
         'wrong_inference',
         'plan_internal_contradiction',
@@ -56,7 +56,7 @@ def test_deviation_kinds_contains_exactly_the_legal_values():
         'narrowing_refuted_by_measurement',
         'prediction_falsified',
         'other',
-    })
+    }) == DEVIATION_KINDS
 
 
 @pytest.mark.parametrize('kind', sorted(DEVIATION_KINDS))
