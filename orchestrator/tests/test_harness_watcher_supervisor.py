@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _orch_helpers import _init_harness_state_for_test
 from escalation.queue import EscalationQueue
+from shared.repo_paths import DARK_FACTORY_ROOT_ENV
 
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
 from orchestrator.config import OrchestratorConfig
@@ -39,7 +40,6 @@ from orchestrator.harness import (
     _WATCHER_TIMEOUT_GRACE_SECS,
     Harness,
 )
-from orchestrator.repo_paths import DARK_FACTORY_ROOT_ENV
 
 # ---------------------------------------------------------------------------
 # step-3: Config field presence and defaults
