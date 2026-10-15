@@ -144,16 +144,30 @@ def resolve_config(
 
 def select_scored_records(
     cfg: LegibilityConfig, projects_root: Path | str, target_date: date,
+    *, skip_sessions: frozenset[str] = frozenset(),
 ) -> list[sampling.ScoredRecord]:
     """Enumerate *target_date*'s sessions for *cfg* and score each one with
     :func:`legibility.sampling.score_session`, the loop ``sampling.main``
-    uses too."""
+    uses too. A session whose first ``sessionId`` is in *skip_sessions* is
+    dropped before scoring, as ``census_window.SessionBatchSource._select``
+    drops a ledgered one."""
     sessions = inventory.enumerate_sessions(
         projects_root, cfg.cwd_prefixes, target_date,
         agent_transcript_roots=inventory.resolve_agent_transcript_roots(
             cfg.project_root, cfg.agent_transcript_roots
         ),
     )
+    if skip_sessions:
+        uncoded = [
+            session for session in sessions
+            if sampling.peek_session_id(session.path) not in skip_sessions
+        ]
+        if len(uncoded) < len(sessions):
+            logger.info(
+                'legibility trickle: project=%s date=%s skipped %d already-coded session(s)',
+                cfg.project_id, target_date.isoformat(), len(sessions) - len(uncoded),
+            )
+        sessions = uncoded
     return [sampling.score_session(session) for session in sessions]
 
 
@@ -182,6 +196,7 @@ drift fails a test instead of silently mis-charging the budget."""
 def select_digest_sessions(
     cfg: LegibilityConfig, projects_root: Path | str, target_date: date,
     *, rendered: dict[tuple, str] | None = None,
+    skip_sessions: frozenset[str] = frozenset(),
 ) -> sampling.SampleResult:
     """The budget-bounded, stratified sample of *target_date*'s sessions to
     digest -- :func:`select_scored_records` narrowed by
@@ -232,8 +247,13 @@ def select_digest_sessions(
     budget entirely: a zero-cost record can still fall inside a reserve
     group that is unaffordable as a whole, or sit behind the greedy fill's
     strict halt.
+
+    *skip_sessions* is forwarded to :func:`select_scored_records`, so a
+    skipped session never enters the returned accounting.
     """
-    scored = select_scored_records(cfg, projects_root, target_date)
+    scored = select_scored_records(
+        cfg, projects_root, target_date, skip_sessions=skip_sessions,
+    )
     return sampling.stratified_sample(
         scored, cfg,
         cost_fn=sampling.digest_byte_cost_fn(
