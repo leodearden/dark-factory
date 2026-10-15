@@ -22,6 +22,7 @@ from shared.testing_stdin import STDIN_STARVATION_STUB, make_starving_exec
 from shared.usage_gate import AccountLease, InvokeSlot
 
 from orchestrator.agents.invoke import (
+    _codex_mcp_override_args,
     _codex_sandbox_mode,
     _invoke_claude_with_sandbox,
     _invoke_codex,
@@ -791,6 +792,81 @@ class TestCodexDroppedToolSpecWarning:
         caplog.set_level(logging.WARNING, logger='orchestrator.agents.invoke')
         await _codex_argv(tmp_path, None, None)
         assert self._invoke_warnings(caplog) == []
+
+
+_CODEX_MCP_CONFIG = {'mcpServers': {
+    'verdict-tools': {
+        'command': '/venv/bin/python',
+        'args': ['-m', 'orchestrator.mcp.verdict_tools', '--meta-root', '/tmp/x "y"'],
+        'env': {'FASTMCP_SHOW_SERVER_BANNER': 'false'},
+    },
+    'plain': {'command': 'srv'},
+}}
+
+
+@pytest.mark.asyncio
+class TestCodexMcpServersNeverWrittenIntoCwd:
+    """MCP servers reach codex as per-invocation `-c mcp_servers."<name>".*`
+    overrides, so nothing is written into the caller's cwd: not a
+    `.codex/config.toml`, and no mkdir that a pre-existing `.codex` FILE
+    (the shape at the dark-factory root) turns into EEXIST."""
+
+    def test_override_args_round_trip_through_toml(self) -> None:
+        import tomllib
+
+        fragment = _codex_mcp_override_args(_CODEX_MCP_CONFIG)
+
+        assert fragment[0::2] == ['-c'] * (len(fragment) // 2)
+        parsed = tomllib.loads('\n'.join(fragment[1::2]))
+        assert parsed == {'mcp_servers': {
+            'verdict-tools': {
+                'command': '/venv/bin/python',
+                'args': ['-m', 'orchestrator.mcp.verdict_tools', '--meta-root', '/tmp/x "y"'],
+                'env': {'FASTMCP_SHOW_SERVER_BANNER': 'false'},
+            },
+            'plain': {'command': 'srv', 'args': []},
+        }}
+
+    async def _invoke_with_mcp(self, cwd: Path) -> dict:
+        captured: dict = {}
+
+        async def fake_run_subprocess_local(cmd, cwd, *args, **kwargs):
+            captured['argv'] = cmd
+            captured['cwd_entries'] = sorted(cwd.iterdir())
+            return _SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=1)
+
+        with patch('orchestrator.agents.invoke._run_subprocess_local',
+                   side_effect=fake_run_subprocess_local):
+            await _invoke_codex(
+                prompt='p', system_prompt='s', cwd=cwd, model='gpt-6-astra',
+                max_budget_usd=1.0, mcp_config=_CODEX_MCP_CONFIG,
+                sandbox_modules=None, effort=None,
+            )
+        return captured
+
+    async def test_cwd_stays_empty_during_and_after_the_run(self, tmp_path) -> None:
+        captured = await self._invoke_with_mcp(tmp_path)
+
+        assert captured['cwd_entries'] == []
+        assert list(tmp_path.iterdir()) == []
+
+    async def test_pre_existing_read_only_codex_file_is_left_untouched(self, tmp_path) -> None:
+        codex_file = tmp_path / '.codex'
+        codex_file.write_bytes(b'')
+        codex_file.chmod(0o444)
+
+        await self._invoke_with_mcp(tmp_path)
+
+        assert codex_file.is_file()
+        assert codex_file.read_bytes() == b''
+        assert codex_file.stat().st_mode & 0o777 == 0o444
+
+    async def test_overrides_sit_just_before_the_stdin_marker(self, tmp_path) -> None:
+        argv = (await self._invoke_with_mcp(tmp_path))['argv']
+        fragment = _codex_mcp_override_args(_CODEX_MCP_CONFIG)
+
+        assert argv[-1] == '-'
+        assert argv[-1 - len(fragment):-1] == fragment
 
 
 @pytest.mark.asyncio
