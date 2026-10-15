@@ -1597,10 +1597,10 @@ _CROSS_CHECK_SENTINEL = '__verify_cross_check__'
 #                                 re-checks it a third time from its side.
 #   REIFY_VERIFY_RETRY_SCOPE      always 'failed_only' — the retry-scope marker.
 #
-# The whole dict is merged into MergeVerifySpec.verify_env (the channel already
-# shipped to reify's remote runner AND threaded into local ModuleConfig.verify_env),
-# so no new transport is introduced.  The filter files are written into merge_wt,
-# the shared persistent merge-verify lane reify's verify.sh reads.
+# The dict is merged into the dispatched MergeVerifySpec.verify_env on a LOCAL
+# dispatch only, and the filter files are written into THIS host's merge_wt, the
+# shared persistent merge-verify lane reify's verify.sh reads.  A remote dispatch
+# never receives the env: see verify_runner.py::MergeVerifySpec (verify_env).
 # ---------------------------------------------------------------------------
 
 # Subdir under merge_wt holding the per-profile nextest filter files.
@@ -1670,7 +1670,8 @@ def _build_retry_verify_env(
         run_all_members: {failed} run_all member ids (pass-through, not transformed).
         gui_specs: {failed} gui spec files (pass-through, not transformed).
         tree_oid: attempt-0-pinned content-tree OID (REIFY_VERIFY_RETRY_TREE_OID).
-        filter_dir: directory the filter files are written under (the merge_wt).
+        filter_dir: directory the filter files are written under (the
+            dispatching host's merge_wt; produced for a local dispatch only).
 
     Returns:
         The REIFY_VERIFY_RETRY_* env dict to merge into MergeVerifySpec.verify_env.
@@ -2868,12 +2869,11 @@ async def _run_post_merge_verify(
             # not produce a plan, a probe whose plan does not COVER attempt-0's
             # observed failures, a rebased or uncorroborated tree, a subset
             # that would not materially narrow (_materially_narrows), or a
-            # REMOTE dispatch (runner is not None: the filter files are
-            # untracked files in THIS host's merge_wt, which the remote's
-            # git-pushed merge SHA does not carry) — leaves `spec` untouched,
-            # so the retry runs FULL via the existing _reverify_rebased_tree
-            # (M4) semantics AND stays on the legacy budget.
-            # See verify_runner.py::MergeVerifySpec (verify_env).
+            # REMOTE dispatch (runner is not None: the filter files are untracked
+            # files in THIS host's merge_wt, which the remote's git-pushed merge SHA
+            # does not carry) — leaves `spec` untouched, so the retry runs FULL via
+            # the existing _reverify_rebased_tree (M4) semantics AND stays on the
+            # legacy budget.  See verify_runner.py::MergeVerifySpec (verify_env).
             #
             # `not narrowed` keeps this a once-per-call operation: the loop below
             # may dispatch several times, but the subset is always attempt-0's.
