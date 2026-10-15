@@ -4,13 +4,15 @@ configured project root.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
 import httpx
 
-from dashboard.app import _performance_resources
 from dashboard.config import DashboardConfig
 from dashboard.data import escalation_corpus
 from dashboard.data.active_tasks import project_roots_for_label
@@ -46,6 +48,23 @@ def _dirs(tmp_path, *names):
     return paths
 
 
+def _record_one_completion(root: Path) -> None:
+    """Give *root* a runs.db holding one completed task of a project named after the root."""
+    runs_db = root / 'data' / 'orchestrator' / 'runs.db'
+    runs_db.parent.mkdir(parents=True)
+    with contextlib.closing(sqlite3.connect(runs_db)) as conn:
+        conn.execute(
+            'CREATE TABLE task_results (task_id TEXT, project_id TEXT, outcome TEXT, '
+            'completed_at TEXT, duration_ms INTEGER, review_cycles INTEGER, '
+            'verify_attempts INTEGER, steward_invocations INTEGER)'
+        )
+        conn.execute(
+            "INSERT INTO task_results VALUES ('1', ?, 'done', ?, 0, 0, 0, 0)",
+            (root.name, datetime.now(UTC).isoformat()),
+        )
+        conn.commit()
+
+
 class TestAllProjectRoots:
     def test_primary_first_then_known_roots_in_configured_order(self, tmp_path):
         a, b, c = _dirs(tmp_path, 'a', 'b', 'c')
@@ -68,11 +87,6 @@ class TestAllProjectRoots:
         (a,) = _dirs(tmp_path, 'a')
         config = DashboardConfig(project_root=a)
         assert config.all_project_roots == (a.resolve(),)
-
-    def test_the_roster_is_a_tuple_so_no_caller_can_mutate_it(self, tmp_path):
-        a, b = _dirs(tmp_path, 'a', 'b')
-        config = DashboardConfig(project_root=a, known_project_roots=[b])
-        assert isinstance(config.all_project_roots, tuple)
 
     def test_escalation_url_discovery_probes_each_distinct_root_once(self, tmp_path, caplog):
         a, b = _dirs(tmp_path, 'a', 'b')
@@ -108,17 +122,17 @@ class TestEveryConsumerWalksTheOneEnumerator:
             'project_dbs._project_scoped_dbs_labeled walks its own roster'
         )
 
-    async def test_performance_resources(self, tmp_path):
-        config = self._reversed(tmp_path)
-        pool = DbPool()
-        try:
-            dbs, esc_dirs = await _performance_resources(config, pool)
-        finally:
-            await pool.close_all()
-        assert esc_dirs == [r / 'data' / 'escalations' for r in config.all_project_roots], (
-            'app._performance_resources walks its own roster'
+    def test_performance_route(self, client, tmp_path):
+        roots = _dirs(tmp_path, 'a', 'b', 'c')
+        for root in roots:
+            _record_one_completion(root)
+        config = _WithoutLastRoot(project_root=roots[0], known_project_roots=roots[1:])
+        client.app.state.config = config
+        resp = client.get('/api/v2/dashboard/performance')
+        assert resp.status_code == 200, resp.text
+        assert sorted(resp.json()['PERFORMANCE']) == [r.name for r in config.all_project_roots], (
+            'GET /api/v2/dashboard/performance walks its own roster'
         )
-        assert len(dbs) == 3
 
     def test_corpus_queues(self, tmp_path):
         config = self._reversed(tmp_path)
