@@ -1,0 +1,515 @@
+"""Run-record schema, store, retention and read side of the offline lane."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from orchestrator.offline_lane_records import (
+    FIRST_LINE_MAX_CHARS,
+    LEGACY_COMMANDS,
+    LEGACY_INFRA_COMMAND,
+    LEGACY_NUMERIC_COMMAND,
+    RECORD_RETENTION,
+    EndedBy,
+    FailureRecord,
+    Leg,
+    Phase,
+    ProbeResult,
+    RunRecord,
+    RunRecordStore,
+    classify_exit,
+    command_key,
+    is_well_formed,
+    pass_id_for,
+    records_root,
+)
+
+T0 = datetime(2026, 10, 1, 12, 30, 5, tzinfo=UTC)
+HEAD = 'abcdef0123456789'
+
+
+def _record(
+    lane_pass_command: str = 'unit',
+    phase: Phase = Phase.DETECT,
+    *,
+    returncode: int = 1,
+    failures: tuple[FailureRecord, ...] | None = None,
+) -> RunRecord:
+    return RunRecord(
+        command=lane_pass_command,
+        leg=Leg.GENERIC.value,
+        head=HEAD,
+        phase=phase.value,
+        started_at=T0,
+        ended_at=T0 + timedelta(seconds=3),
+        returncode=returncode,
+        ended_by=classify_exit(returncode).value,
+        output_path=f'/records/{phase.value}.log',
+        junit_path=None,
+        failures=(
+            (FailureRecord('tests/test_q.py::test_a', 'failed', 'AssertionError: boom'),)
+            if failures is None
+            else failures
+        ),
+        ids_available=True,
+        outcomes=None,
+        session_complete=True,
+        probe=None,
+    )
+
+
+class _Clock:
+    def __init__(self, start: datetime) -> None:
+        self.current = start
+
+    def __call__(self) -> datetime:
+        return self.current
+
+
+@pytest.fixture
+def clock() -> _Clock:
+    return _Clock(T0)
+
+
+@pytest.fixture
+def store(tmp_path: Path, clock: _Clock) -> RunRecordStore:
+    return RunRecordStore(tmp_path, clock=clock)
+
+
+class TestClassifyExit:
+    @pytest.mark.parametrize('returncode', [-9, -15, 137, 143, 129, 130])
+    def test_external_kill_forms_are_signal(self, returncode: int) -> None:
+        assert classify_exit(returncode) is EndedBy.SIGNAL
+
+    @pytest.mark.parametrize('returncode', [0, 1, 2, 139, 255, 128, 193])
+    def test_other_codes_are_exit(self, returncode: int) -> None:
+        assert classify_exit(returncode) is EndedBy.EXIT
+
+    def test_any_negative_code_is_signal(self) -> None:
+        assert classify_exit(-11) is EndedBy.SIGNAL
+
+
+class TestCommandKey:
+    def test_legacy_names_pass_through(self) -> None:
+        assert command_key(LEGACY_NUMERIC_COMMAND) == 'legacy_numeric'
+        assert command_key(LEGACY_INFRA_COMMAND) == 'legacy_infra'
+
+    @pytest.mark.parametrize(
+        ('name', 'key'),
+        [
+            ('Qdrant Integration', 'qdrant-integration'),
+            ('a__b', 'a-b'),
+            ('--x--', 'x'),
+            ('', 'command'),
+            ('___', 'command'),
+            ('Ünïcode λ', 'n-code'),
+        ],
+    )
+    def test_generic_names_are_slugged(self, name: str, key: str) -> None:
+        assert command_key(name) == key
+
+    @pytest.mark.parametrize(
+        'name', ['LEGACY_NUMERIC', 'legacy_numeric ', 'legacy-numeric', 'legacy_infra!', 'Legacy_Infra']
+    )
+    def test_no_generic_name_collides_with_a_legacy_key(self, name: str) -> None:
+        assert command_key(name) not in LEGACY_COMMANDS
+        assert '_' not in command_key(name)
+
+    def test_only_the_exact_legacy_name_keeps_its_underscore(self) -> None:
+        assert command_key('LEGACY_NUMERIC') == 'legacy-numeric'
+
+
+class TestRecordsRoot:
+    def test_real_root_gets_the_data_layout(self, tmp_path: Path) -> None:
+        assert records_root(tmp_path) == tmp_path / 'data' / 'orchestrator' / 'offline-lane'
+
+    @pytest.mark.parametrize('unusable', [None, '', 'None'])
+    def test_unusable_root_falls_back_to_a_temp_directory_with_a_warning(
+        self,
+        unusable: str | None,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        with caplog.at_level(logging.WARNING):
+            root = records_root(unusable)
+        try:
+            assert root.is_dir()
+            assert root.name.startswith('offline-lane-records-')
+            assert any(r.levelno == logging.WARNING for r in caplog.records)
+            assert not (tmp_path / 'None').exists()
+            assert list(tmp_path.iterdir()) == []
+        finally:
+            root.rmdir()
+
+
+class TestRunRecordJson:
+    def test_round_trip_preserves_every_field(self) -> None:
+        probe = ProbeResult('outage', None, 'qdrant', 'connection refused', 1.5)
+        record = RunRecord(**{**_record().__dict__, 'probe': probe, 'outcomes': {'a': 'passed'}})
+        assert RunRecord.from_json(json.loads(json.dumps(record.to_json()))) == record
+
+    def test_missing_key_is_a_value_error(self) -> None:
+        payload = _record().to_json()
+        del payload['returncode']
+        with pytest.raises(ValueError):
+            RunRecord.from_json(payload)
+
+    @pytest.mark.parametrize(
+        ('key', 'value'),
+        [
+            ('phase', 'bogus'),
+            ('leg', 'bogus'),
+            ('ended_by', 'bogus'),
+            ('returncode', 'one'),
+            ('returncode', True),
+            ('started_at', '2026-10-01T12:30:05'),
+            ('started_at', 'yesterday'),
+            ('ids_available', 1),
+            ('failures', 'none'),
+            ('failures', [{'node': 'n', 'kind': 'bogus', 'first_line': ''}]),
+            ('probe', {'result': 'sideways'}),
+        ],
+    )
+    def test_malformed_value_is_a_value_error(self, key: str, value: Any) -> None:
+        payload = _record().to_json()
+        payload[key] = value
+        with pytest.raises(ValueError):
+            RunRecord.from_json(payload)
+
+    def test_first_line_cap_is_the_documented_constant(self) -> None:
+        assert FIRST_LINE_MAX_CHARS == 300
+
+
+class TestAllocatePass:
+    def test_pass_id_is_utc_start_plus_short_head(self) -> None:
+        assert pass_id_for(T0, HEAD) == '20261001T123005-abcdef'
+
+    def test_allocation_writes_the_header_before_any_run(self, store: RunRecordStore) -> None:
+        lane_pass = store.allocate_pass('Qdrant Integration', Leg.GENERIC, HEAD)
+
+        assert lane_pass.directory == store.root / 'qdrant-integration' / '20261001T123005-abcdef'
+        assert lane_pass.output_path(Phase.CONFIRM) == lane_pass.directory / 'confirm.log'
+        assert lane_pass.junit_path('detect') == lane_pass.directory / 'detect.junit.xml'
+        payload = json.loads(lane_pass.record_path.read_text())
+        assert payload == {
+            'command': 'Qdrant Integration',
+            'leg': 'generic',
+            'head': HEAD,
+            'pass_id': '20261001T123005-abcdef',
+            'started_at': T0.isoformat(),
+            'detect': None,
+            'confirm': None,
+            'outcome': None,
+            'effect': None,
+        }
+        assert store.current_pass('Qdrant Integration') == lane_pass
+
+    def test_unknown_leg_is_rejected(self, store: RunRecordStore) -> None:
+        with pytest.raises(ValueError):
+            store.allocate_pass('unit', 'sideways', HEAD)
+
+    def test_second_allocation_replaces_the_pass_and_forgets_last_records(
+        self, store: RunRecordStore, clock: _Clock
+    ) -> None:
+        first = store.allocate_pass('unit', Leg.GENERIC, HEAD)
+        store.write_run(first, _record())
+        other = store.allocate_pass('other', Leg.GENERIC, HEAD)
+        store.write_run(other, _record('other'))
+
+        clock.current = T0 + timedelta(minutes=5)
+        second = store.allocate_pass('unit', Leg.GENERIC, HEAD)
+
+        assert store.current_pass('unit') == second != first
+        assert store.last_record('unit', Phase.DETECT) is None
+        assert store.last_record('other', Phase.DETECT) is not None
+        assert store.current_pass('never-allocated') is None
+
+    def test_header_only_pass_is_well_formed(self, store: RunRecordStore) -> None:
+        lane_pass = store.allocate_pass('unit', Leg.NUMERIC, HEAD)
+        loaded = store.load_pass('unit', lane_pass.pass_id)
+        assert loaded is not None
+        assert (loaded.detect, loaded.confirm, loaded.outcome, loaded.effect) == (None,) * 4
+
+
+class TestWriteRun:
+    def test_detect_record_round_trips_through_disk(self, store: RunRecordStore) -> None:
+        lane_pass = store.allocate_pass('unit', Leg.GENERIC, HEAD)
+        record = _record(failures=(
+            FailureRecord('t::a', 'failed', 'x'),
+            FailureRecord('t::b', 'error', ''),
+        ))
+
+        store.write_run(lane_pass, record)
+
+        loaded = store.load_pass('unit', lane_pass.pass_id)
+        assert loaded is not None
+        assert loaded.detect is not None
+        assert loaded.detect == record
+        assert loaded.detect.junit_path is None
+        assert loaded.detect.outcomes is None
+        assert loaded.detect.probe is None
+        assert loaded.confirm is None
+        assert store.last_record('unit', Phase.DETECT) == record
+        assert store.last_record('unit', 'detect') == record
+        assert store.last_record('unit', Phase.CONFIRM) is None
+
+    def test_phases_are_kept_side_by_side(self, store: RunRecordStore) -> None:
+        lane_pass = store.allocate_pass('unit', Leg.GENERIC, HEAD)
+        detect, confirm = _record(), _record(phase=Phase.CONFIRM, returncode=0, failures=())
+        store.write_run(lane_pass, detect)
+        store.write_run(lane_pass, confirm)
+
+        loaded = store.load_pass('unit', lane_pass.pass_id)
+        assert loaded is not None
+        assert (loaded.detect, loaded.confirm) == (detect, confirm)
+
+    def test_write_leaves_no_temp_residue(self, store: RunRecordStore) -> None:
+        lane_pass = store.allocate_pass('unit', Leg.GENERIC, HEAD)
+        store.write_run(lane_pass, _record())
+        assert [p.name for p in lane_pass.directory.iterdir()] == ['record.json']
+
+    def test_missing_header_is_a_lookup_error_naming_the_path(self, store: RunRecordStore) -> None:
+        lane_pass = store.allocate_pass('unit', Leg.GENERIC, HEAD)
+        lane_pass.record_path.unlink()
+        with pytest.raises(LookupError, match='record.json'):
+            store.write_run(lane_pass, _record())
+
+    def test_unreadable_header_is_a_lookup_error(self, store: RunRecordStore) -> None:
+        lane_pass = store.allocate_pass('unit', Leg.GENERIC, HEAD)
+        lane_pass.record_path.write_text('{not json')
+        with pytest.raises(LookupError):
+            store.write_run(lane_pass, _record())
+
+    def test_a_reader_never_sees_a_partial_file(
+        self, store: RunRecordStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        lane_pass = store.allocate_pass('unit', Leg.GENERIC, HEAD)
+        replaced: list[tuple[str, str]] = []
+        real_replace = os.replace
+
+        def spy(src: Any, dst: Any) -> None:
+            replaced.append((str(src), str(dst)))
+            real_replace(src, dst)
+
+        monkeypatch.setattr(os, 'replace', spy)
+        store.write_run(lane_pass, _record())
+
+        assert replaced == [(replaced[0][0], str(lane_pass.record_path))]
+        assert replaced[0][0] != str(lane_pass.record_path)
+
+
+class TestPassBlocks:
+    def test_only_the_given_block_is_set(self, store: RunRecordStore) -> None:
+        lane_pass = store.allocate_pass('unit', Leg.GENERIC, HEAD)
+
+        store.set_pass_blocks(lane_pass, outcome={'arm': 'intersected'})
+        loaded = store.load_pass('unit', lane_pass.pass_id)
+        assert loaded is not None
+        assert (loaded.outcome, loaded.effect) == ({'arm': 'intersected'}, None)
+
+        store.set_pass_blocks(lane_pass, effect=['filed 7001'])
+        loaded = store.load_pass('unit', lane_pass.pass_id)
+        assert loaded is not None
+        assert (loaded.outcome, loaded.effect) == ({'arm': 'intersected'}, ['filed 7001'])
+
+    def test_an_explicit_none_clears_a_block(self, store: RunRecordStore) -> None:
+        lane_pass = store.allocate_pass('unit', Leg.GENERIC, HEAD)
+        store.set_pass_blocks(lane_pass, outcome='x', effect='y')
+        store.set_pass_blocks(lane_pass, outcome=None)
+        loaded = store.load_pass('unit', lane_pass.pass_id)
+        assert loaded is not None
+        assert (loaded.outcome, loaded.effect) == (None, 'y')
+
+    def test_blocks_survive_a_later_run_write(self, store: RunRecordStore) -> None:
+        lane_pass = store.allocate_pass('unit', Leg.GENERIC, HEAD)
+        store.set_pass_blocks(lane_pass, outcome='kept')
+        store.write_run(lane_pass, _record())
+        loaded = store.load_pass('unit', lane_pass.pass_id)
+        assert loaded is not None
+        assert loaded.outcome == 'kept'
+
+
+class TestSetProbe:
+    def test_probe_is_written_into_the_detect_record(self, store: RunRecordStore) -> None:
+        lane_pass = store.allocate_pass('unit', Leg.GENERIC, HEAD)
+        detect = _record()
+        store.write_run(lane_pass, detect)
+        probe = ProbeResult('outage', 7, 'qdrant', 'connection refused', 2.25)
+
+        store.set_probe(lane_pass, probe)
+
+        loaded = store.load_pass('unit', lane_pass.pass_id)
+        assert loaded is not None
+        assert loaded.detect == RunRecord(**{**detect.__dict__, 'probe': probe})
+        assert store.last_record('unit', Phase.DETECT) == loaded.detect
+
+    def test_probe_before_any_detect_record_is_a_lookup_error(self, store: RunRecordStore) -> None:
+        lane_pass = store.allocate_pass('unit', Leg.GENERIC, HEAD)
+        with pytest.raises(LookupError):
+            store.set_probe(lane_pass, ProbeResult('up', 0, None, '', 0.1))
+
+
+class TestWellFormedness:
+    def _header(self, store: RunRecordStore) -> dict[str, Any]:
+        lane_pass = store.allocate_pass('unit', Leg.GENERIC, HEAD)
+        store.write_run(lane_pass, _record())
+        return json.loads(lane_pass.record_path.read_text())
+
+    def test_a_written_pass_is_well_formed(self, store: RunRecordStore) -> None:
+        assert is_well_formed(self._header(store))
+
+    @pytest.mark.parametrize('payload', [None, [], 'record', 3])
+    def test_a_non_object_is_not_well_formed(self, payload: object) -> None:
+        assert not is_well_formed(payload)
+
+    @pytest.mark.parametrize('key', ['command', 'leg', 'head', 'pass_id', 'started_at', 'detect', 'confirm', 'outcome', 'effect'])
+    def test_a_header_missing_a_key_is_not_well_formed(self, store: RunRecordStore, key: str) -> None:
+        payload = self._header(store)
+        del payload[key]
+        assert not is_well_formed(payload)
+
+    def test_a_detect_block_with_an_unknown_failure_kind_is_not_well_formed(
+        self, store: RunRecordStore
+    ) -> None:
+        payload = self._header(store)
+        payload['detect']['failures'][0]['kind'] = 'exploded'
+        assert not is_well_formed(payload)
+
+    def test_a_detect_block_that_is_not_an_object_is_not_well_formed(self, store: RunRecordStore) -> None:
+        payload = self._header(store)
+        payload['detect'] = 'broken'
+        assert not is_well_formed(payload)
+
+    def test_load_of_a_malformed_file_is_none_with_a_warning(
+        self, store: RunRecordStore, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        lane_pass = store.allocate_pass('unit', Leg.GENERIC, HEAD)
+        lane_pass.record_path.write_text(json.dumps({'command': 'unit'}))
+        with caplog.at_level(logging.WARNING):
+            assert store.load_pass('unit', lane_pass.pass_id) is None
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_load_of_unparseable_json_is_none_with_a_warning(
+        self, store: RunRecordStore, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        lane_pass = store.allocate_pass('unit', Leg.GENERIC, HEAD)
+        lane_pass.record_path.write_text('{truncated')
+        with caplog.at_level(logging.WARNING):
+            assert store.load_pass('unit', lane_pass.pass_id) is None
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_load_of_an_absent_pass_is_none_without_a_warning(
+        self, store: RunRecordStore, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING):
+            assert store.load_pass('unit', '20260101T000000-abcdef') is None
+        assert caplog.records == []
+
+
+class TestPassesSince:
+    def _allocate_at(self, store: RunRecordStore, clock: _Clock, when: datetime, command: str = 'unit') -> str:
+        clock.current = when
+        return store.allocate_pass(command, Leg.GENERIC, HEAD).pass_id
+
+    def test_passes_come_back_ascending_from_the_cut(self, store: RunRecordStore, clock: _Clock) -> None:
+        late = self._allocate_at(store, clock, T0 + timedelta(hours=2))
+        early = self._allocate_at(store, clock, T0)
+        middle = self._allocate_at(store, clock, T0 + timedelta(hours=1))
+        self._allocate_at(store, clock, T0 + timedelta(hours=1), command='other')
+
+        everything = [p.pass_id for p in store.passes_since('unit', T0)]
+        cut = [p.pass_id for p in store.passes_since('unit', T0 + timedelta(hours=1))]
+
+        assert everything == [early, middle, late]
+        assert cut == [middle, late]
+
+    def test_a_stray_directory_is_ignored(self, store: RunRecordStore, clock: _Clock) -> None:
+        real = self._allocate_at(store, clock, T0)
+        (store.root / 'unit' / 'scratch').mkdir()
+        (store.root / 'unit' / 'notes.txt').write_text('x')
+
+        assert [p.pass_id for p in store.passes_since('unit', T0)] == [real]
+
+    def test_a_malformed_pass_is_skipped_with_a_warning(
+        self, store: RunRecordStore, clock: _Clock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        broken = store.allocate_pass('unit', Leg.GENERIC, HEAD)
+        broken.record_path.write_text('{}')
+        good = self._allocate_at(store, clock, T0 + timedelta(hours=1))
+
+        with caplog.at_level(logging.WARNING):
+            passes = [p.pass_id for p in store.passes_since('unit', T0)]
+
+        assert passes == [good]
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_an_unknown_command_has_no_passes(self, store: RunRecordStore) -> None:
+        assert list(store.passes_since('never-ran', T0)) == []
+
+
+class TestRetention:
+    def _allocate_aged(self, store: RunRecordStore, clock: _Clock, now: datetime, days: int) -> str:
+        clock.current = now - timedelta(days=days)
+        lane_pass = store.allocate_pass('unit', Leg.GENERIC, HEAD)
+        store.write_run(lane_pass, _record())
+        return lane_pass.pass_id
+
+    def test_retention_is_fourteen_days(self) -> None:
+        assert timedelta(days=14) == RECORD_RETENTION
+
+    def test_a_pass_older_than_retention_is_removed_and_a_newer_one_kept(
+        self, store: RunRecordStore, clock: _Clock
+    ) -> None:
+        now = T0 + timedelta(days=30)
+        old = self._allocate_aged(store, clock, now, 15)
+        recent = self._allocate_aged(store, clock, now, 13)
+
+        assert store.prune(now) == [old]
+
+        assert not (store.root / 'unit' / old).exists()
+        assert (store.root / 'unit' / recent / 'record.json').is_file()
+
+    def test_a_pinned_pass_survives(self, store: RunRecordStore, clock: _Clock) -> None:
+        now = T0 + timedelta(days=30)
+        old = self._allocate_aged(store, clock, now, 15)
+
+        assert store.prune(now, pinned_pass_ids={old}) == []
+
+        assert (store.root / 'unit' / old / 'record.json').is_file()
+
+    def test_pruning_covers_every_command(self, store: RunRecordStore, clock: _Clock) -> None:
+        now = T0 + timedelta(days=30)
+        clock.current = now - timedelta(days=20)
+        first = store.allocate_pass('one', Leg.GENERIC, HEAD).pass_id
+        second = store.allocate_pass(LEGACY_INFRA_COMMAND, Leg.INFRA, 'fedcba9876').pass_id
+
+        assert sorted(store.prune(now)) == sorted([first, second])
+
+    def test_unparsable_directories_are_left_alone(self, store: RunRecordStore) -> None:
+        stray = store.root / 'unit' / 'not-a-pass'
+        stray.mkdir(parents=True)
+
+        assert store.prune(T0 + timedelta(days=365)) == []
+        assert stray.is_dir()
+
+    def test_age_comes_from_the_pass_id_not_the_file_contents(
+        self, store: RunRecordStore, clock: _Clock
+    ) -> None:
+        now = T0 + timedelta(days=30)
+        old = self._allocate_aged(store, clock, now, 15)
+        (store.root / 'unit' / old / 'record.json').write_text('garbage')
+
+        assert store.prune(now) == [old]
+
+    def test_a_missing_root_prunes_nothing(self, tmp_path: Path) -> None:
+        store = RunRecordStore(tmp_path / 'never-created')
+        assert store.prune(T0) == []
