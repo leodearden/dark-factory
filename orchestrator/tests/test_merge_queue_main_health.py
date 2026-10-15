@@ -724,7 +724,7 @@ class TestClassifyFailSafeBranches:
 class TestMainHealthFingerprintWarning:
     """Step-11 (RED): when compute_preexisting_main_break_fingerprint raises,
     _main_health_fingerprint must return '' AND emit a WARNING at
-    'orchestrator.merge_queue'.
+    'orchestrator.merge_lane'.
 
     Before step-12 impl: the except block is silent (no WARNING) → RED.
     After step-12 impl: WARNING is emitted.
@@ -740,7 +740,7 @@ class TestMainHealthFingerprintWarning:
                 'orchestrator.workflow.compute_preexisting_main_break_fingerprint',
                 side_effect=RuntimeError('fingerprint composition exploded'),
             ),
-            caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
+            caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'),
         ):
             result = _main_health_fingerprint('compile_error', 'some hint', 'abc123')
 

@@ -585,7 +585,7 @@ class TestC3SubmitGateQueued:
 
         req = _make_request('task-new', '913', tmp_path, config, request_id='mr-new', snapshot_tip=tip_new)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = await coalesce_or_enqueue_merge_request(
                 queue, req, event_store, registry,
                 git_ops=spy,

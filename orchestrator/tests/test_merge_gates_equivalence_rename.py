@@ -324,7 +324,7 @@ class TestEquivalenceGateRenameAwareness:
             monkeypatch.setattr('orchestrator.merge_gates._run', spy)
 
             with caplog.at_level(
-                logging.WARNING, logger='orchestrator.merge_queue',
+                logging.WARNING, logger='orchestrator.merge_lane',
             ):
                 failed = await _check_post_merge_equivalence(
                     wt, advanced, git_ops, main_sha,

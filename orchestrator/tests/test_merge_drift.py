@@ -7,9 +7,9 @@ mirroring task β's test_merge_gates.py:
 1. Module-existence — ``orchestrator.merge_drift`` exists and exports the
    full closure of moved symbols (the drift-check runner and its cadence
    gate).
-2. Logger-name — the module logs under the ``orchestrator.merge_queue``
-   logger name (not ``orchestrator.merge_drift``) so existing ``caplog``
-   assertions filtered to the merge_queue logger keep capturing the moved
+2. Logger-name — the module logs under the lane's one logger name,
+   ``orchestrator.merge_lane`` (task 5037), so ``caplog`` assertions
+   filtered to that name keep capturing the moved
    drift-check's WARNING-level fail-open messages.
 3. Verify-pool construction — ``TestDriftCheckFullGateSpecNoDerivation``
    spies on ``build_merge_verify_spec`` where ``_run_drift_check`` looks it
@@ -44,18 +44,16 @@ def test_merge_drift_exports_moved_public_symbols() -> None:
         assert obj is not None, f'{name} must not be None'
 
 
-def test_merge_drift_logger_name_is_merge_queue() -> None:
-    """merge_drift emits under the 'orchestrator.merge_queue' logger name.
+def test_merge_drift_logger_name_is_merge_lane() -> None:
+    """The drift module logs under the lane's one name, 'orchestrator.merge_lane'.
 
-    RED (pre-module): ``orchestrator.merge_drift`` does not exist yet.
-
-    Required so existing ``caplog.at_level(..., logger='orchestrator.merge_queue')``
-    assertions in test_merge_queue_multihost_wiring.py keep capturing the
-    moved drift-check's WARNING-level fail-open messages after relocation.
+    Every merge-lane module shares it (task 5037), so a
+    ``caplog.at_level(..., logger='orchestrator.merge_lane')`` filter
+    captures this module's records too.
     """
     import orchestrator.merge_drift as merge_drift
 
-    assert merge_drift.logger.name == 'orchestrator.merge_queue'
+    assert merge_drift.logger.name == 'orchestrator.merge_lane'
 
 
 class TestDriftCheckStatePersistence:

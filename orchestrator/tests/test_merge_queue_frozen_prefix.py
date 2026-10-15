@@ -767,7 +767,7 @@ class TestWarnIfVerifyBaseNotFrozenTip:
             config=config, git_repo=git_repo,
         )
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = _guard_warn(worker, item_e, 'main0')
 
         # Returns None (log-only, no side effect)
@@ -814,7 +814,7 @@ class TestWarnIfVerifyBaseNotFrozenTip:
             config=config, git_repo=git_repo,
         )
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = _guard_warn(worker, item_e, 'main0')
 
         assert result is None
@@ -841,7 +841,7 @@ class TestWarnIfVerifyBaseNotFrozenTip:
             config=config, git_repo=git_repo,
         )
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = _guard_warn(worker, item_d, 'main0')
 
         assert result is None
@@ -955,7 +955,7 @@ class TestRemergeCarveOutAtDispatchGuard:
         )
         item_r = _mark_recovery(item_r)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = _guard_warn(worker, item_r, 'main0')
 
         assert result is None
@@ -992,7 +992,7 @@ class TestRemergeCarveOutAtDispatchGuard:
             config=config, git_repo=git_repo,
         )
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = _guard_warn(worker, item_e, 'main0')
 
         assert result is None
@@ -1029,7 +1029,7 @@ class TestRemergeCarveOutAtDispatchGuard:
             if marked:
                 item_e = _mark_recovery(item_e)
 
-            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
                 assert _guard_warn(worker, item_e, 'main0') is None
 
             warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -1112,7 +1112,7 @@ class TestGuardWarningCarriesCallTimeContext:
         assert len(worker.frozen_prefix()) == 1
         expected_tip = worker.frozen_prefix_tip('main0')
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             _guard_warn(worker, item_e, 'main0')
 
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -1370,7 +1370,7 @@ class TestDispatchItemGuardWiring:
         with (
             mock.patch.object(git_ops, 'get_main_sha', side_effect=_return_main),
             mock.patch.object(worker, '_run_inflight_verify', _noop_verify),
-            caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
+            caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'),
         ):
             result = await _dispatch(worker, item_e)
 

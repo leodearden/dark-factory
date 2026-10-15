@@ -7,9 +7,9 @@ mirroring task β's test_merge_gates.py:
 1. Module-existence — ``orchestrator.merge_shadow`` exists and exports the
    full closure of moved symbols (state/diff types, per-test parsers,
    sentinels, and the shadow-compare functions).
-2. Logger-name — the module logs under the ``orchestrator.merge_queue``
-   logger name (not ``orchestrator.merge_shadow``) so existing ``caplog``
-   assertions filtered to the merge_queue logger keep capturing the moved
+2. Logger-name — the module logs under the lane's one logger name,
+   ``orchestrator.merge_lane`` (task 5037), so ``caplog`` assertions
+   filtered to that name keep capturing the moved
    shadow-compare's WARNING/INFO lines.
 """
 
@@ -76,18 +76,16 @@ def test_merge_shadow_exports_moved_public_symbols() -> None:
         assert obj is not None, f'{name} must not be None'
 
 
-def test_merge_shadow_logger_name_is_merge_queue() -> None:
-    """merge_shadow emits under the 'orchestrator.merge_queue' logger name.
+def test_merge_shadow_logger_name_is_merge_lane() -> None:
+    """The shadow module logs under the lane's one name, 'orchestrator.merge_lane'.
 
-    RED (pre-module): ``orchestrator.merge_shadow`` does not exist yet.
-
-    Required so existing ``caplog.at_level(..., logger='orchestrator.merge_queue')``
-    assertions in the warm/cold shadow-compare test files keep capturing the
-    moved functions' WARNING/INFO-level messages after relocation.
+    Every merge-lane module shares it (task 5037), so a
+    ``caplog.at_level(..., logger='orchestrator.merge_lane')`` filter
+    captures this module's records too.
     """
     import orchestrator.merge_shadow as merge_shadow
 
-    assert merge_shadow.logger.name == 'orchestrator.merge_queue'
+    assert merge_shadow.logger.name == 'orchestrator.merge_lane'
 
 
 # ---------------------------------------------------------------------------

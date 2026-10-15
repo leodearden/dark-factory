@@ -1159,7 +1159,7 @@ class TestCheckResourceAudit:
             git_ops, asyncio.Queue(), escalation_queue=fake_eq, speculation_depth=2,
         )
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             worker._check_resource_audit(1000.0)
 
         assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 0
@@ -1177,7 +1177,7 @@ class TestCheckResourceAudit:
         )
         worker._speculation_slot._value -= 1  # forced permit leak
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             worker._check_resource_audit(1000.0)
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -1299,7 +1299,7 @@ class TestHeartbeatWiringRunsResourceAuditUnconditionally:
         # before any resource-audit check ran.
         assert worker.snapshot()['depth'] == 0
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = worker._maybe_log_queue_heartbeat(1000.0)
 
         assert result is False, 'heartbeat must stay idle — no depth to report (depth==0)'
@@ -1352,7 +1352,7 @@ class TestHeartbeatWiringRunsResourceAuditUnconditionally:
 
         monkeypatch.setattr(worker, '_check_resource_audit', _boom)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = worker._maybe_log_queue_heartbeat(1000.0)
 
         assert result is True, 'depth heartbeat must still fire despite the resource-audit bug'
@@ -1374,7 +1374,7 @@ class TestHeartbeatWiringRunsResourceAuditUnconditionally:
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
         worker._speculation_slot._value -= 1  # forced permit leak
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             worker._maybe_log_queue_heartbeat(1000.0)
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -1618,7 +1618,7 @@ class TestCheckResourceAuditReclaimBandSuppression:
         )
         calls = worker.RESOURCE_AUDIT_ESCALATION_STREAK + 2
 
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             for i in range(1, calls + 1):
                 worker._check_resource_audit(self._NOW + i)
 
@@ -2135,7 +2135,7 @@ class TestResourceAuditLogCoalescence:
         worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 10_000  # cap must not bind here
         _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
 
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             self._drive(worker, 512)
 
         assert _streaks(caplog) == [1, 2, 4, 8, 16, 32, 64, 128, 256, 512], (
@@ -2162,7 +2162,7 @@ class TestResourceAuditLogCoalescence:
         worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 4
         _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
 
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             self._drive(worker, 40)
 
         assert _streaks(caplog) == [1, 2, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40], (
@@ -2180,7 +2180,7 @@ class TestResourceAuditLogCoalescence:
         worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 10_000
         _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
 
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             self._drive(worker, 512)
 
         assert len(_audit_records(caplog)) == 512, (
@@ -2201,7 +2201,7 @@ class TestResourceAuditLogCoalescence:
         worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 10_000
         wt = _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
 
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             self._drive(worker, 64)
 
         lines = _audit_lines(caplog)
@@ -2243,7 +2243,7 @@ class TestResourceAuditLogCoalescence:
         self._drive(worker, 100)
 
         second = _mkdir_worktree(git_ops, '_merge-two', mtime=self._NOW - self._IN_BAND_AGE)
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             caplog.clear()  # only the polls below are under test
             self._drive(worker, 1, start_poll=100)   # poll 101 — the change
             change_lines = list(_audit_lines(caplog))
@@ -2275,7 +2275,7 @@ class TestResourceAuditLogCoalescence:
 
         gone_path = str(gone.resolve())
         gone.rmdir()
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             caplog.clear()  # only the poll below is under test
             self._drive(worker, 1, start_poll=100)
 
@@ -2388,7 +2388,7 @@ class TestResourceAuditClearLine:
         worker = self._worker(git_ops)
         worker._speculation_slot._value -= 1  # forced, PERSISTING permit leak
 
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             self._drive(worker, self._RUN)
             worker._speculation_slot._value += 1  # the leak is repaired
             caplog.clear()
@@ -2408,7 +2408,7 @@ class TestResourceAuditClearLine:
         worker = self._worker(git_ops)
         worker._speculation_slot._value -= 1
 
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             self._drive(worker, self._RUN)
             worker._speculation_slot._value += 1
             self._drive(worker, 1, start_poll=self._RUN)
@@ -2436,7 +2436,7 @@ class TestResourceAuditClearLine:
         worker._speculation_slot._value -= 1  # persists for the whole episode
         change_at = 40
 
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             self._drive(worker, change_at)
             # The set GROWS at poll 41: a leaked worktree joins the permit
             # leak, restarting the gate's per-fingerprint segment clock while
@@ -2465,7 +2465,7 @@ class TestResourceAuditClearLine:
         fixes."""
         worker = self._worker(git_ops)
 
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             self._drive(worker, 10)
 
         assert _clear_lines(caplog) == []
@@ -2483,7 +2483,7 @@ class TestResourceAuditClearLine:
         self._drive(worker, 1, start_poll=self._RUN)
 
         worker._speculation_slot._value -= 1  # the same leak returns
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             caplog.clear()
             self._drive(worker, 1, start_poll=self._RUN + 1)
 
@@ -2503,7 +2503,7 @@ class TestResourceAuditClearLine:
         self._drive(worker, self._RUN)
 
         wt.rmdir()
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             caplog.clear()
             self._drive(worker, 1, start_poll=self._RUN)
 
@@ -2522,7 +2522,7 @@ class TestResourceAuditClearLine:
         self._drive(worker, self._RUN)
 
         gone.rmdir()
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             caplog.clear()
             self._drive(worker, 1, start_poll=self._RUN)
 
@@ -2581,7 +2581,7 @@ class TestResourceAuditLogLevels:
         worker = self._worker(git_ops)
         wt = _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
 
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             self._drive(worker, 1)
 
         records = _audit_records(caplog)
@@ -2597,7 +2597,7 @@ class TestResourceAuditLogLevels:
         _mkdir_worktree(git_ops, '_merge-one', mtime=self._NOW - self._IN_BAND_AGE)
         self._drive(worker, 100)  # next scheduled report is poll 128
 
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             added = _mkdir_worktree(
                 git_ops, '_merge-two', mtime=self._NOW - self._IN_BAND_AGE,
             )
@@ -2624,7 +2624,7 @@ class TestResourceAuditLogLevels:
         worker = self._worker(git_ops)
         _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
 
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             self._drive(worker, 512)
 
         records = _audit_records(caplog)
@@ -2651,7 +2651,7 @@ class TestResourceAuditLogLevels:
         self._drive(worker, 50)
 
         wt.rmdir()
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             caplog.clear()
             self._drive(worker, 1, start_poll=50)
 
@@ -2666,7 +2666,7 @@ class TestResourceAuditLogLevels:
         worker = self._worker(git_ops)
         _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
 
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             self._drive(worker, 246)
 
         assert len(_at_level(_audit_records(caplog), logging.WARNING)) == 1, (
@@ -2691,7 +2691,7 @@ class TestResourceAuditLogLevels:
         _mkdir_worktree(git_ops, '_merge-crossing', mtime=self._NOW - self._IN_BAND_AGE)
         self._drive(worker, flip_poll - 1)
 
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             caplog.clear()
             self._drive(worker, 1, start_poll=flip_poll - 1)
 
@@ -2747,7 +2747,7 @@ class TestHeartbeatPathCoalescence:
         _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
         assert worker.snapshot()['depth'] == 0, 'the incident shape is an IDLE pipeline'
 
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             for i in range(512):
                 assert worker._maybe_log_queue_heartbeat(self._NOW + i * self._POLL_S) is False
 
@@ -2771,7 +2771,7 @@ class TestHeartbeatPathCoalescence:
 
         interval = worker._heartbeat_interval_s  # 300s == 10 polls
         fired: list[int] = []
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             for i in range(100):
                 if worker._maybe_log_queue_heartbeat(self._NOW + i * self._POLL_S):
                     fired.append(i)

@@ -574,7 +574,7 @@ class TestCheckPlanTargetsInTree:
 
         # ── Sub-case 1: dropped is non-empty → structured WARNING ──────────
         caplog.clear()
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = await _check_plan_targets_in_tree(
                 merge_sha, git_ops, main_sha, task_id='warn-test',
             )
@@ -605,7 +605,7 @@ class TestCheckPlanTargetsInTree:
         assert merge_result2.merge_commit is not None
         try:
             caplog.clear()
-            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
                 result2 = await _check_plan_targets_in_tree(
                     merge_result2.merge_commit, git_ops,
                     await git_ops.get_main_sha(),
@@ -927,7 +927,7 @@ class TestCheckPlanTargetsInTree:
             branch_tip=task_tip, kept_tree_of=task_tip,
         )
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = await _check_plan_targets_in_tree(
                 merge_sha, git_ops, 'definitely-not-a-ref', task_id='failopen-drop',
             )
@@ -944,7 +944,7 @@ class TestCheckPlanTargetsInTree:
         single_parent_tip = await git_ops.commit(worktree, 'Add f.py')
         assert single_parent_tip
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = await _check_plan_targets_in_tree(
                 single_parent_tip, git_ops, await git_ops.get_main_sha(),
                 task_id='no-second-parent',
@@ -7971,7 +7971,7 @@ class TestCheckPlanFilesTouchedInBranch:
         rc, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
         head = head_out.strip()
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = await _check_plan_files_touched_in_branch(
                 ['src/a.py', 'src/never_touched.py'],
                 base, head, git_ops, task_id='miss-test',
@@ -12286,7 +12286,7 @@ class TestSpeculationRaceRetry:
         monkeypatch.setattr(git_ops, 'merge_to_main', fake_merge_to_main)
         actual_main = await git_ops.get_main_sha()
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             item = await worker._remerge(req, None)
 
         # merge_to_main must have been called exactly twice
@@ -19086,7 +19086,7 @@ class TestCheckMergeLivenessMarginShippedDefaults:
         )
         from orchestrator.merge_queue import _HEARTBEAT_POLL_S
         cfg = OrchestratorConfig(project_root=tmp_path)
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = check_merge_liveness_margin(cfg)
 
         expected_floor = _HEARTBEAT_POLL_S * TOUCH_MISS_TOLERANCE
@@ -19098,7 +19098,7 @@ class TestCheckMergeLivenessMarginShippedDefaults:
             f'got safe={result.safe!r}'
         )
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING
-                    and r.name == 'orchestrator.merge_queue']
+                    and r.name == 'orchestrator.merge_lane']
         assert len(warnings) == 0, (
             f'Expected no WARNINGs for shipped defaults; got {len(warnings)}: '
             f'{[r.message for r in warnings]!r}'
@@ -19114,7 +19114,7 @@ class TestCheckMergeLivenessMarginClassificationAndLogging:
         from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
 
         cfg = OrchestratorConfig(project_root=tmp_path)
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = check_merge_liveness_margin(cfg, liveness_secs=600.0)
 
         assert result.safe is False, (
@@ -19122,7 +19122,7 @@ class TestCheckMergeLivenessMarginClassificationAndLogging:
             f'got safe={result.safe!r}'
         )
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING
-                    and r.name == 'orchestrator.merge_queue']
+                    and r.name == 'orchestrator.merge_lane']
         assert len(warnings) == 1, (
             f'Expected exactly 1 WARNING; '
             f'got {len(warnings)}: {[r.message for r in warnings]!r}'
@@ -19135,12 +19135,12 @@ class TestCheckMergeLivenessMarginClassificationAndLogging:
         from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
 
         cfg = OrchestratorConfig(project_root=tmp_path)
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = check_merge_liveness_margin(cfg)
 
         assert result.safe is True
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING
-                    and r.name == 'orchestrator.merge_queue']
+                    and r.name == 'orchestrator.merge_lane']
         assert len(warnings) == 0, (
             f'Expected no WARNINGs for in-budget config; '
             f'got {len(warnings)}: {[r.message for r in warnings]!r}'
@@ -19153,11 +19153,11 @@ class TestCheckMergeLivenessMarginClassificationAndLogging:
         from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
 
         cfg = OrchestratorConfig(project_root=tmp_path)
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             check_merge_liveness_margin(cfg, liveness_secs=600.0)
 
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING
-                    and r.name == 'orchestrator.merge_queue']
+                    and r.name == 'orchestrator.merge_lane']
         assert len(warnings) >= 1
         msg = warnings[0].message
 
@@ -19177,7 +19177,7 @@ class TestCheckMergeLivenessMarginInvariant:
         from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
 
         cfg = OrchestratorConfig(project_root=tmp_path)
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = check_merge_liveness_margin(cfg, safety_factor=0.5, liveness_secs=600.0)
 
         assert result.safe is False, (
@@ -19185,7 +19185,7 @@ class TestCheckMergeLivenessMarginInvariant:
             f'got .safe={result.safe!r}'
         )
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING
-                    and r.name == 'orchestrator.merge_queue']
+                    and r.name == 'orchestrator.merge_lane']
         assert len(warnings) == 1, (
             f'Expected exactly 1 WARNING, got {len(warnings)}: {[r.message for r in warnings]!r}'
         )
@@ -19359,7 +19359,7 @@ class TestMaybeLogQueueHeartbeat:
         t0 = time.time()
 
         # (a) First call — should fire
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             result_a = worker._maybe_log_queue_heartbeat(t0)
 
         assert result_a is True, 'First heartbeat call must return True'
@@ -19593,7 +19593,7 @@ class TestSoftCancelMidVerify:
                 'orchestrator.merge_queue._finalize_advanced_merge',
                 new=_finalize_detach_and_done,
             ),
-            caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
+            caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'),
         ):
             await drive_verify_and_advance(worker, item)
 
@@ -19680,7 +19680,7 @@ class TestSoftCancelMidVerify:
                 'orchestrator.merge_queue.run_scoped_verification',
                 side_effect=_blocking_verify,
             ),
-            caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
+            caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'),
         ):
             task = asyncio.create_task(drive_verify_and_advance(worker, item))
             # Wait until the blocking verify has started.
@@ -19755,7 +19755,7 @@ class TestSoftCancelMidVerify:
         registry = InFlightMergeRegistry()
         retention = TerminalOutcomeRetention()
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             worker_task = asyncio.create_task(worker.run())
             await register_and_enqueue_merge_request(
                 queue, req, None, registry, retention=retention,
@@ -19842,7 +19842,7 @@ class TestSoftCancelMidVerify:
                 'orchestrator.merge_queue._run_post_merge_verify',
                 AsyncMock(return_value=MergeOutcome('blocked', reason='test failed')),
             ),
-            caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
+            caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'),
         ):
             result = await drive_verify_and_advance(worker, item)
 
@@ -19909,7 +19909,7 @@ class TestSoftCancelMidVerify:
                     'blocked', reason='low disk space', verify_skipped=True,
                 )),
             ),
-            caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
+            caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'),
         ):
             result = await drive_verify_and_advance(worker, item)
 
@@ -20680,7 +20680,7 @@ class TestOperatorHalt:
                 'orchestrator.merge_queue.run_scoped_verification',
                 side_effect=_blocking_verify,
             ),
-            caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
+            caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'),
         ):
             task = asyncio.create_task(drive_verify_and_advance(worker, item))
             await wait_responsive(
@@ -21810,7 +21810,7 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
         assert merge_wt.stat().st_mtime == 0, 'pre-condition: mtime should be 0'
 
         # Touch and check
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             n = worker._touch_owned_merge_worktrees()
 
         assert n == 1, f'Expected touched count 1, got {n}'
@@ -21859,7 +21859,7 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
             'removal assertion below passes vacuously'
         )
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             n = worker._touch_owned_merge_worktrees()
 
         assert n == 0, f'Expected 0 (ENOENT path excluded), got {n}'
@@ -21907,7 +21907,7 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
 
         # Inject failure via monkeypatch (guarantees auto-teardown on test exit)
         monkeypatch.setattr(mq_mod.os, 'utime', _raise_permission)
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             n1 = worker._touch_owned_merge_worktrees()
             n2 = worker._touch_owned_merge_worktrees()
 
@@ -21928,7 +21928,7 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
         # --- Recovery: undo monkeypatch → os.utime restored; call once → success ---
         monkeypatch.undo()
         caplog.clear()
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             n3 = worker._touch_owned_merge_worktrees()
         assert n3 == 1, f'Expected count 1 after recovery, got {n3}'
         warn_after_recovery = [
@@ -21942,7 +21942,7 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
         # --- Re-inject failure → a fresh WARNING emitted (warned-state cleared on success) ---
         monkeypatch.setattr(mq_mod.os, 'utime', _raise_permission)
         caplog.clear()
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             n4 = worker._touch_owned_merge_worktrees()
         assert n4 == 0
         fresh_warns = [
@@ -22820,7 +22820,7 @@ class TestHeartbeatOccupancy:
         worker._inflight.append(entry_b)
 
         t0 = time.time()
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             result = worker._maybe_log_queue_heartbeat(t0)
 
         assert result is True, 'Heartbeat must fire when depth > 0'

@@ -2282,7 +2282,7 @@ class TestRedriveCoalesceMembersStaleEvidence:
                 'orchestrator.merge_lane.member_redrive.validate_landing_evidence',
                 AsyncMock(return_value=accepted_verdict),
             ),
-            caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
+            caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'),
         ):
             await worker._redrive_coalesce_members(req, 'mainsha000')
 

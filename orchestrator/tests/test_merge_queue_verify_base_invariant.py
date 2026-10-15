@@ -544,7 +544,7 @@ class TestRemergeCarveOutAtSnapshotSurface:
             # snapshot surface makes for the head entry.
             dispatch_worker = _make_worker(git_ops)
             caplog.clear()
-            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
                 dispatch_worker._warn_if_verify_base_not_frozen_tip(item, main_sha)
             dispatch_fired = any(
                 r.levelno >= logging.WARNING for r in caplog.records
@@ -904,7 +904,7 @@ class TestAdvisoryContractRegressionPins:
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
         )
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             entry = await worker._dispatch_item(item)
 
         guard_warnings = [
@@ -990,7 +990,7 @@ class TestAdvisoryContractRegressionPins:
             return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
         )
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             entry = await worker._dispatch_item(item)
 
         assert entry is not None, 'a healthy dispatch must complete'

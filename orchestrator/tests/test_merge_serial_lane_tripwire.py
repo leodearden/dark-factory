@@ -268,9 +268,9 @@ class TestAlarmSerialLaneBreach:
 
         assessment = check_serial_lane_tripwire(2, merge_ahead_bound=1, num_hosts=1)
         rec = _RecordingEventStore()
-        # merge_liveness.py:58 binds logger = getLogger('orchestrator.merge_queue'),
+        # merge_liveness.py:58 binds logger = getLogger('orchestrator.merge_lane'),
         # NOT __name__ — filter on that name.
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = alarm_serial_lane_breach(
                 assessment,
                 event_store=rec,
@@ -326,7 +326,7 @@ class TestAlarmSerialLaneBreach:
 
         assessment = check_serial_lane_tripwire(1, merge_ahead_bound=1, num_hosts=1)
         rec = _RecordingEventStore()
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = alarm_serial_lane_breach(
                 assessment,
                 event_store=rec,
@@ -350,7 +350,7 @@ class TestAlarmSerialLaneBreach:
         )
 
         assessment = check_serial_lane_tripwire(2, merge_ahead_bound=1, num_hosts=1)
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = alarm_serial_lane_breach(
                 assessment, event_store=None, task_id='5326', branch='task/5326'
             )
@@ -371,7 +371,7 @@ class TestAlarmSerialLaneBreach:
         assessment = check_serial_lane_tripwire(2, merge_ahead_bound=1, num_hosts=1)
         hostile = MagicMock()
         hostile.emit = MagicMock(side_effect=RuntimeError('boom'))
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = alarm_serial_lane_breach(
                 assessment, event_store=hostile, task_id='5326', branch='task/5326'
             )
@@ -562,7 +562,7 @@ class TestSerialLaneTripwireWiredIntoDispatch:
         worker = self._bare_worker(git_ops, rec)
         item_a = await _make_merged_item(git_ops, config, '9001')
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             worker._inflight_append(self._local_entry(worker, item_a))
 
         assert self._tripwire_events(rec) == []
@@ -579,7 +579,7 @@ class TestSerialLaneTripwireWiredIntoDispatch:
         item_a = await _make_merged_item(git_ops, config, '9002')
         item_b = await _make_merged_item(git_ops, config, '9003')
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             worker._inflight_append(self._local_entry(worker, item_a))
             worker._inflight_append(self._local_entry(worker, item_b))
 
@@ -685,7 +685,7 @@ class TestSerialLaneTripwireWiredIntoDispatch:
 
         item_a = await _make_merged_item(git_ops, config, '9013')
         item_b = await _make_merged_item(git_ops, config, '9014')
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             worker._inflight_append(self._local_entry(worker, item_a))
             worker._inflight_append(self._local_entry(worker, item_b))
 

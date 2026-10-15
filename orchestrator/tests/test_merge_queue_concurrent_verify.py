@@ -923,15 +923,13 @@ def _fake_verify_result(*, passed: bool, **overrides: Any) -> MagicMock:
 # Disposition fail-open predicate (task 3980 amendment) — the companion guard
 # to _fake_verify_result above, and deliberately colocated with it.
 #
-# The classifier has TWO fail-open sites, on two different loggers, both
-# emitting the same substring:
-#   1. merge_disposition.py:710-719 — the classifier's own internal fail-open,
-#      logger 'orchestrator.merge_disposition'.
-#   2. merge_queue.py:994-1001 — `_classify_disposition_for_outcome`'s
-#      belt-and-suspenders catch for anything site 1 re-raises past, logger
-#      'orchestrator.merge_queue'.
-# Keying on the shared substring catches both; filtering by a single logger
-# name silently excludes site 2.
+# The classifier has TWO fail-open sites, both emitting the same substring on
+# the lane's one logger, 'orchestrator.merge_lane':
+#   1. merge_lane/disposition.py — the classifier's own internal fail-open.
+#   2. merge_lane/worker.py::_classify_disposition_for_outcome — the
+#      belt-and-suspenders catch for anything site 1 re-raises past.
+# Keying on the shared substring catches both; filtering by any narrower
+# signal than that silently excludes one of them.
 #
 # Lives HERE rather than in test_merge_speculation.py so there is exactly one
 # predicate for one production invariant. Task 3980 first wrote a second copy
@@ -939,7 +937,7 @@ def _fake_verify_result(*, passed: bool, **overrides: Any) -> MagicMock:
 # file's older inline version keyed on a longer substring that matched only
 # site 1. Two copies of a drift-detector is how the drift gets back in.
 _FAIL_OPEN_SUBSTRING = 'degrading to INDETERMINATE (fail-open, I3)'
-_FAIL_OPEN_LOGGERS = ('orchestrator.merge_disposition', 'orchestrator.merge_queue')
+_FAIL_OPEN_LOGGERS = ('orchestrator.merge_lane',)
 
 
 def _fail_open_records(
@@ -6012,7 +6010,7 @@ class TestRedispatchSpeculativeConservation:
         degrade to its fail-open path while processing this test's failing
         VerifyResult double — see the caplog guard at the end of this test.
         """
-        caplog.set_level(logging.WARNING, logger='orchestrator.merge_disposition')
+        caplog.set_level(logging.WARNING, logger='orchestrator.merge_lane')
         gate_a_release = asyncio.Event()
         gate_a_entered = asyncio.Event()
         verifier = _GatedVerifier(
@@ -6202,7 +6200,7 @@ class TestRedispatchSpeculativeConservation:
         # predicate above. The inline version this replaces keyed on a longer
         # substring ('internal error; degrading to ...') that matched only
         # merge_disposition.py:711, so the second fail-open site
-        # (merge_queue.py:1000, logger 'orchestrator.merge_queue') could swallow
+        # (worker.py::_classify_disposition_for_outcome) could swallow
         # the same defect here undetected.
         fail_open_records = _fail_open_records(caplog.records)
         assert fail_open_records == [], (

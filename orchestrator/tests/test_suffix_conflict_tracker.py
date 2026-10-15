@@ -186,14 +186,12 @@ class TestModuleSurface:
 
 
 class TestModuleLogger:
-    """suffix_graph's module logger must share merge_queue's logger name so
-    existing caplog-based log-message assertions keep matching post-extraction.
+    """suffix_graph is the worker's suffix tracker kept outside the package, so
+    it logs under the merge lane's one logger name and caplog filters on
+    'orchestrator.merge_lane' see its records."""
 
-    RED until step-2 GREEN sets logger = logging.getLogger('orchestrator.merge_queue').
-    """
-
-    def test_logger_name_matches_merge_queue(self):
-        assert suffix_graph.logger.name == 'orchestrator.merge_queue'
+    def test_logger_name_is_the_merge_lanes(self):
+        assert suffix_graph.logger.name == 'orchestrator.merge_lane'
 
 
 # ── step-1: tracker construction without a worker ──────────────────────────────

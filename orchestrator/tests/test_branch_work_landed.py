@@ -1641,7 +1641,7 @@ class TestBranchWorkLandedNeverRaises:
             raise RuntimeError('simulated merge_base failure')
 
         monkeypatch.setattr(git_ops, 'merge_base_with_main', _boom)
-        with caplog.at_level('WARNING', logger='orchestrator.landing_evidence'):
+        with caplog.at_level('WARNING', logger='orchestrator.merge_lane'):
             verdict = await branch_work_landed(
                 git_ops, TASK_ID, sc.branch,
                 branch_tip_sha=sc.branch_tip_sha, metadata=None,
@@ -1936,7 +1936,7 @@ class TestTallyIsChargedByEveryVerdict:
         silence layered on the first.
         """
         scenario = build_rebased_landing(repo)
-        with caplog.at_level('INFO', logger='orchestrator.landing_evidence'):
+        with caplog.at_level('INFO', logger='orchestrator.merge_lane'):
             await branch_work_landed(
                 git_ops, TASK_ID, scenario.branch,
                 branch_tip_sha=scenario.branch_tip_sha, metadata=scenario.metadata,

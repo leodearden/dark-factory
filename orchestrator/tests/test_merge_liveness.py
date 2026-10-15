@@ -8,9 +8,9 @@ mirroring task β's test_merge_gates.py:
 1. Module-existence — ``orchestrator.merge_liveness`` exists and exports the
    full closure of moved symbols (liveness-margin types/functions,
    verify-host-unreachable alarm helpers, and persistent-worktree guards).
-2. Logger-name — the module logs under the ``orchestrator.merge_queue``
-   logger name (not ``orchestrator.merge_liveness``) so existing ``caplog``
-   assertions filtered to the merge_queue logger keep capturing the moved
+2. Logger-name — the module logs under the lane's one logger name,
+   ``orchestrator.merge_lane`` (task 5037), so ``caplog`` assertions
+   filtered to that name keep capturing the moved
    guards' WARNING-level messages.
 """
 
@@ -178,18 +178,16 @@ class TestNewestContentMtime:
         assert result == 100.0, f'a broken symlink must be skipped, not raised; got {result!r}'
 
 
-def test_merge_liveness_logger_name_is_merge_queue() -> None:
-    """merge_liveness emits under the 'orchestrator.merge_queue' logger name.
+def test_merge_liveness_logger_name_is_merge_lane() -> None:
+    """The liveness module logs under the lane's one name, 'orchestrator.merge_lane'.
 
-    RED (pre-module): ``orchestrator.merge_liveness`` does not exist yet.
-
-    Required so existing ``caplog.at_level(..., logger='orchestrator.merge_queue')``
-    assertions in test_merge_queue.py keep capturing the moved guards'
-    WARNING-level messages after relocation.
+    Every merge-lane module shares it (task 5037), so a
+    ``caplog.at_level(..., logger='orchestrator.merge_lane')`` filter
+    captures this module's records too.
     """
     import orchestrator.merge_liveness as merge_liveness
 
-    assert merge_liveness.logger.name == 'orchestrator.merge_queue'
+    assert merge_liveness.logger.name == 'orchestrator.merge_lane'
 
 
 

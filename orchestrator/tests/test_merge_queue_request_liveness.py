@@ -217,7 +217,7 @@ class TestCheckRequestLiveness:
         t0 = 1_000_000.0
         worker._request_ledger.on_dequeue(req, now=t0)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             worker._check_request_liveness(t0 + 2000, threshold_s=1000)
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -251,7 +251,7 @@ class TestCheckRequestLiveness:
         t0 = 1_000_000.0
         worker._request_ledger.on_dequeue(req, now=t0)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             worker._check_request_liveness(t0 + 2000, threshold_s=1000)
             assert len(fake_eq.filed) == 1
 
@@ -322,7 +322,7 @@ class TestCheckRequestLiveness:
         worker._request_ledger.on_dequeue(req, now=t0)
         req.result.set_result(MergeOutcome('done'))
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             worker._check_request_liveness(t0 + 2000, threshold_s=1000)
 
         assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 0
@@ -354,7 +354,7 @@ class TestCheckRequestLiveness:
         t0 = 1_000_000.0
         worker._request_ledger.on_dequeue(req, now=t0)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             worker._check_request_liveness(t0 + 2000, threshold_s=1000)
         assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
 
@@ -365,7 +365,7 @@ class TestCheckRequestLiveness:
         worker._request_ledger.on_dequeue(req, now=t2)
 
         caplog.clear()
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             worker._check_request_liveness(t2 + 2000, threshold_s=1000)
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -418,7 +418,7 @@ class TestHeartbeatWiringRunsLivenessCheckFirst:
 
         far_future = t0 + 20_000.0  # past the 16200s (1.5x) default stuck threshold
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = worker._maybe_log_queue_heartbeat(far_future)
 
         assert result is False, 'heartbeat must stay idle — no depth to report (snapshot depth==0)'
@@ -506,7 +506,7 @@ class TestWedgedVerifyIntegration:
             threshold_s = 1.5 * INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
             now = time.time() + threshold_s + 60.0  # comfortably past threshold
 
-            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
                 worker._check_request_liveness(now)
 
             warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -901,7 +901,7 @@ class TestDeadInflightVerifyAborts:
         t0 = 1_000_000.0
         worker._request_ledger.on_dequeue(req, now=t0)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = await asyncio.wait_for(
                 worker._run_inflight_verify(item, lease), timeout=15.0,
             )
@@ -1045,7 +1045,7 @@ class TestDeadInflightVerifyAborts:
         fake_remote.cancel_verify = AsyncMock(return_value=0)
         lease = HostLease(name='remote-host', runner=fake_remote, is_local=False)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = await asyncio.wait_for(
                 worker._run_inflight_verify(item, lease), timeout=15.0,
             )
@@ -1411,7 +1411,7 @@ class TestDeadInflightVerifyAborts:
 
         lease = HostLease(name='remote-host', runner=runner, is_local=False)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = await asyncio.wait_for(
                 worker._run_inflight_verify(item, lease), timeout=15.0,
             )
@@ -2282,7 +2282,7 @@ class TestContendedLeaseDefers:
 
         # ── Attempt 2: crosses the streak threshold — the ERROR must not lie ──
         caplog.clear()
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             _, result2 = await _drive_one('lhd-1')
 
         assert result2.status == InflightStatus.REQUEUED
@@ -3262,7 +3262,7 @@ class TestContendedLeaseDefers:
         # Requeues 1..threshold-1 stay at WARNING (no ERROR yet).
         for i in range(worker.CONTENDED_LEASE_REQUEUE_WARN_STREAK - 1):
             caplog.clear()
-            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
                 result = await _drive_one(f'clc-{i}', lease_contended)
             assert result.status == InflightStatus.REQUEUED
             assert worker._contended_lease_requeues[task_id] == i + 1
@@ -3272,7 +3272,7 @@ class TestContendedLeaseDefers:
 
         # The requeue that REACHES the threshold rises to ERROR naming the streak.
         caplog.clear()
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = await _drive_one('clc-cross', lease_contended)
         assert result.status == InflightStatus.REQUEUED
         streak = worker.CONTENDED_LEASE_REQUEUE_WARN_STREAK
@@ -3340,7 +3340,7 @@ class TestContendedLeaseDefers:
 
         # Four consecutive defers, NOT clearing caplog between them.
         caplog.clear()
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             for i in range(4):
                 assert await _drive_one(f'sld-{i}') == InflightStatus.REQUEUED
 
@@ -3659,7 +3659,7 @@ class TestDeadVerifyAbortRequeuesIntoTheLiveQueue:
         )
         rid = req.request_id
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             worker._drain_queue_into_lanes()
 
         buffered = [it for buf in worker._lane_buffers.values() for it in buf]
@@ -3935,7 +3935,7 @@ class TestDeadVerifyAbortSelfHealsEndToEnd:
 
         req = _make_request(branch, branch, wt, config)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             worker_task = asyncio.create_task(worker.run())
             try:
                 await q.put(req)

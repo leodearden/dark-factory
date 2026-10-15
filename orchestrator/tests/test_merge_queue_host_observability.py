@@ -772,7 +772,7 @@ class TestHeartbeatDegradation:
         await _quarantine_remote(alloc, 'laptop')
         _seed_ru(worker, 'laptop')
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             assert worker._maybe_log_queue_heartbeat(time.time()) is True
 
         msg = _hb_message(caplog)
@@ -790,7 +790,7 @@ class TestHeartbeatDegradation:
         await _quarantine_remote(alloc, 'laptop')
         _seed_ru(worker, 'laptop')
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             assert worker._maybe_log_queue_heartbeat(time.time()) is True
 
         msg = _hb_message(caplog)
@@ -809,7 +809,7 @@ class TestHeartbeatDegradation:
         self._add_local_inflight(worker, config, git_repo)
         await _quarantine_remote(alloc, 'laptop')
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             assert worker._maybe_log_queue_heartbeat(time.time()) is True
 
         msg = _hb_message(caplog)
@@ -826,7 +826,7 @@ class TestHeartbeatDegradation:
             'nothing quarantined yet, on ANY managed host'
         )
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             assert worker._maybe_log_queue_heartbeat(time.time()) is True
 
         msg = _hb_message(caplog)
@@ -856,7 +856,7 @@ class TestHeartbeatDegradation:
         assert snap['depth'] > 0
         assert snap['occupancy']['by_host'] == {}, 'precondition: occupancy is silent here'
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             assert worker._maybe_log_queue_heartbeat(time.time()) is True
 
         msg = _hb_message(caplog)
@@ -901,7 +901,7 @@ class TestHeartbeatDegradation:
         await alloc.quarantine_and_release(lease)
         _seed_ru(worker, 'laptop', first_unavailable_at=now - 60.0)
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             assert worker._maybe_log_queue_heartbeat(time.time()) is True
         assert 'DEGRADED' in _hb_message(caplog)
 
@@ -911,7 +911,7 @@ class TestHeartbeatDegradation:
         caplog.clear()
         # The rate limit is `now - _last_heartbeat_at < _heartbeat_interval_s`,
         # so a `now` past the interval reopens the gate.
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             later = time.time() + 2 * _HEARTBEAT_INTERVAL_S
             assert worker._maybe_log_queue_heartbeat(later) is True
 

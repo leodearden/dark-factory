@@ -374,7 +374,7 @@ class TestRenamedOnMainResolvesViaDeletingCommit:
         await git_ops.commit(wt, 'step-2')
         head = await _head_of(wt)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = await _check_plan_files_touched_in_branch(
                 [old], base, head, git_ops, task_id='rename-5196',
             )
@@ -459,7 +459,7 @@ class TestRenamedOnMainResolvesViaDeletingCommit:
         await git_ops.commit(wt, 'step-2')
         head = await _head_of(wt)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = await _check_plan_files_touched_in_branch(
                 [first], base, head, git_ops, task_id='multi-hop',
             )
@@ -539,7 +539,7 @@ class TestUniqueBasenameFallback:
         await git_ops.commit(wt, 'step-2')
         head = await _head_of(wt)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = await _check_plan_files_touched_in_branch(
                 [old], base, head, git_ops, task_id='basename-5196',
             )
@@ -683,7 +683,7 @@ class TestBasenameFallbackUsesLastResolvedHop:
         await git_ops.commit(wt, 'step-2')
         head = await _head_of(wt)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = await _check_plan_files_touched_in_branch(
                 [declared], base, head, git_ops, task_id='hop-basename',
             )
@@ -803,7 +803,7 @@ class TestDeclaredBasenameFallbackWhenHopHasNoMatch:
         await git_ops.commit(wt, 'step-2')
         head = await _head_of(wt)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = await _check_plan_files_touched_in_branch(
                 [declared], base, head, git_ops, task_id='hop-no-match',
             )
@@ -978,7 +978,7 @@ class TestTouchedSetBreaksTheCrossKeyTie:
         await git_ops.commit(wt, 'step-2')
         head = await _head_of(wt)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = await _check_plan_files_touched_in_branch(
                 [declared], base, head, git_ops, task_id='untouched-hop-no-shadow',
             )
@@ -1115,7 +1115,7 @@ class TestHopBasenameAcceptedTradeoff:
         await git_ops.commit(wt, 'step-2')
         head = await _head_of(wt)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = await _check_plan_files_touched_in_branch(
                 [declared], base, head, git_ops, task_id='hop-deleted-outright',
             )
@@ -1368,7 +1368,7 @@ class TestGitErrorArmsFailClosed:
 
         spy = _RunSpy(fail_when=_is_existence_probe)
         monkeypatch.setattr('orchestrator.merge_gates._run', spy)
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = await _check_plan_files_touched_in_branch(
                 [declared], base, head, git_ops, task_id='probe-error',
             )
@@ -1425,7 +1425,7 @@ class TestGitErrorArmsFailClosed:
 
         spy = _RunSpy(fail_when=_is_tree_listing)
         monkeypatch.setattr('orchestrator.merge_gates._run', spy)
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = await _check_plan_files_touched_in_branch(
                 [old_a, old_b], base, head, git_ops, task_id='tree-listing-error',
             )
@@ -1483,7 +1483,7 @@ class TestGitErrorArmsFailClosed:
 
         spy = _RunSpy(fail_when=_is_rename_delete_probe)
         monkeypatch.setattr('orchestrator.merge_gates._run', spy)
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = await _check_plan_files_touched_in_branch(
                 [old], base, head, git_ops, task_id='rename-delete-error',
             )
@@ -1544,7 +1544,7 @@ class TestGitErrorArmsFailClosed:
 
         spy = _RunSpy(fail_when=_is_rename_show_probe)
         monkeypatch.setattr('orchestrator.merge_gates._run', spy)
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = await _check_plan_files_touched_in_branch(
                 [old], base, head, git_ops, task_id='rename-show-error',
             )
@@ -1620,7 +1620,7 @@ class TestGitErrorArmsFailClosed:
 
         spy = _RunSpy(fail_when=_is_hop1_delete_probe)
         monkeypatch.setattr('orchestrator.merge_gates._run', spy)
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = await _check_plan_files_touched_in_branch(
                 [declared], base, head, git_ops, task_id='rename-delete-error-hop2',
             )

@@ -19,6 +19,11 @@ nothing is draining. ``main_health_probe_spawned`` reads off a red
 ``lane_scene_config`` builds a scene's ``OrchestratorConfig`` with that probe
 off.
 
+Since task 5037 every merge-lane module, and ``suffix_graph``, logs under
+exactly ``'orchestrator.merge_lane'``; filter caplog by that name. A
+NEGATIVE assertion over records filtered by a logger name nothing emits
+under passes vacuously, so pair it with a positive capture.
+
 Imported by bare module name (``from _merge_lane_fakes import ...``), like
 ``_orch_helpers`` -- ``orchestrator/tests/`` has no ``__init__.py``.
 """

@@ -1070,7 +1070,7 @@ class TestDeepChainPlacementBuild:
 
         monkeypatch.setattr('orchestrator.merge_queue.build_chain', _exploding)
 
-        with caplog.at_level(logging.ERROR, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.ERROR, logger='orchestrator.merge_lane'):
             assert await worker._deep_chain_placement(item) is None
 
         assert _lane_states(git_ops) == [LaneState.FREE], 'no lane stranded'
@@ -1168,7 +1168,7 @@ class TestDeepChainPlacementBuild:
             await never.wait()
 
         monkeypatch.setattr(git_ops, 'merge_branch_into_worktree', _stalled_merge)
-        caplog.set_level(logging.WARNING, logger='orchestrator.merge_queue')
+        caplog.set_level(logging.WARNING, logger='orchestrator.merge_lane')
 
         task = asyncio.ensure_future(worker._deep_chain_placement(item))
         # Wait on the stub's own signal, never a sleep: the cancel has to land

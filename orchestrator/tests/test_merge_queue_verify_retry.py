@@ -185,7 +185,7 @@ async def test_assemble_retry_verify_env_rebased_returns_none(
 
     git_ops = _git_ops_returning('different-oid')
     req = cast('MergeRequest', SimpleNamespace(task_id='t-2', retry_failed_only=True))
-    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
         env = await _assemble_retry_verify_env(
             git_ops, req, tmp_path, _attempt0('abc123')
         )
@@ -209,7 +209,7 @@ async def test_assemble_retry_verify_env_unknown_tree_returns_none(
 
     git_ops = _git_ops_returning(None)
     req = cast('MergeRequest', SimpleNamespace(task_id='t-3', retry_failed_only=True))
-    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
         env = await _assemble_retry_verify_env(
             git_ops, req, tmp_path, _attempt0('abc123')
         )
@@ -279,7 +279,7 @@ async def test_assemble_refuses_a_subset_that_narrows_nothing(
 
     git_ops = _git_ops_returning('abc123')
     req = cast('MergeRequest', SimpleNamespace(task_id='t-mn', retry_failed_only=True))
-    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
         env = await _assemble_retry_verify_env(
             git_ops, req, tmp_path,
             _payload(debug_planned=planned, debug_verdicts=verdicts),
@@ -340,7 +340,7 @@ async def test_assemble_logs_per_suite_subset_sizes_when_it_narrows(
 
     git_ops = _git_ops_returning('abc123')
     req = cast('MergeRequest', SimpleNamespace(task_id='t-mn3', retry_failed_only=True))
-    with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+    with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
         env = await _assemble_retry_verify_env(
             git_ops, req, tmp_path, _attempt0('abc123')
         )
@@ -348,7 +348,7 @@ async def test_assemble_logs_per_suite_subset_sizes_when_it_narrows(
     assert env is not None
     msgs = [
         r.getMessage() for r in caplog.records
-        if r.name == 'orchestrator.merge_queue'
+        if r.name == 'orchestrator.merge_lane'
     ]
     # _attempt0(): 4 planned debug tests, 1 passed -> a 3/4 subset.
     assert any('debug 3/4' in m for m in msgs), msgs
@@ -597,7 +597,7 @@ def _mq_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [
         r.getMessage()
         for r in caplog.records
-        if r.name == 'orchestrator.merge_queue' and r.levelno >= logging.WARNING
+        if r.name == 'orchestrator.merge_lane' and r.levelno >= logging.WARNING
     ]
 
 
@@ -700,7 +700,7 @@ async def test_probe_nextest_planned_failure_modes_return_none(
         return result
 
     with (
-        caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
+        caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'),
         patch.object(mq, '_run_probe_cmd', _fake),
     ):
         planned = await mq._probe_nextest_planned(tmp_path, 'release', timeout_secs=5.0)
@@ -731,7 +731,7 @@ async def test_probe_nextest_planned_nonzero_exit_warning_carries_stderr(
         return 101, '', stderr
 
     with (
-        caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
+        caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'),
         patch.object(mq, '_run_probe_cmd', _fake),
     ):
         planned = await mq._probe_nextest_planned(
@@ -1199,7 +1199,7 @@ async def test_build_attempt0_payload_none_when_the_plan_misses_a_real_failure(
         return list(partial_plan)
 
     with (
-        caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
+        caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'),
         patch.object(mq, '_probe_nextest_planned', _fake_probe),
     ):
         payload = await mq._build_attempt0_payload(

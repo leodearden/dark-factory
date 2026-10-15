@@ -7,9 +7,9 @@ mirroring task α's test_merge_types.py:
 1. Module-existence — ``orchestrator.merge_gates`` exists and exports the
    full closure of moved symbols (reason prefixes, types, sentinel,
    functions).
-2. Logger-name — the module logs under the ``orchestrator.merge_queue``
-   logger name (not ``orchestrator.merge_gates``) so existing ``caplog``
-   assertions filtered to the merge_queue logger keep capturing the moved
+2. Logger-name — the module logs under the lane's one logger name,
+   ``orchestrator.merge_lane`` (task 5037), so ``caplog`` assertions
+   filtered to that name keep capturing the moved
    gates' fail-open/fail-closed warnings.
 """
 
@@ -70,19 +70,16 @@ def test_merge_gates_exports_moved_public_symbols() -> None:
         assert obj is not None, f'{name} must not be None'
 
 
-def test_merge_gates_logger_name_is_merge_queue() -> None:
-    """merge_gates emits under the 'orchestrator.merge_queue' logger name.
+def test_merge_gates_logger_name_is_merge_lane() -> None:
+    """The gates module logs under the lane's one name, 'orchestrator.merge_lane'.
 
-    RED (pre-module): ``orchestrator.merge_gates`` does not exist yet.
-
-    Required so existing ``caplog.at_level(..., logger='orchestrator.merge_queue')``
-    assertions in test_merge_queue_equivalence.py / test_merge_queue.py keep
-    capturing the moved gates' WARNING-level fail-open/fail-closed messages
-    after the functions relocate to this module.
+    Every merge-lane module shares it (task 5037), so a
+    ``caplog.at_level(..., logger='orchestrator.merge_lane')`` filter
+    captures this module's records too.
     """
     import orchestrator.merge_gates as merge_gates
 
-    assert merge_gates.logger.name == 'orchestrator.merge_queue'
+    assert merge_gates.logger.name == 'orchestrator.merge_lane'
 
 
 @pytest.mark.asyncio
@@ -537,7 +534,7 @@ class TestFinalizeDrivesRegistry:
                 'orchestrator.merge_lane.gates._check_post_merge_pyright',
                 AsyncMock(return_value=clean_pyright),
             ),
-            caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
+            caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'),
         ):
             await _finalize_advanced_merge(**args)
 
@@ -564,7 +561,7 @@ class TestFinalizeDrivesRegistry:
                 'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=['f.py']),
             ),
-            caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
+            caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'),
         ):
             outcome = await _finalize_advanced_merge(**args)
 
@@ -608,7 +605,7 @@ class TestFinalizeDrivesRegistry:
                 'orchestrator.merge_lane.gates._check_post_merge_pyright',
                 AsyncMock(return_value=broken_pyright),
             ),
-            caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
+            caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'),
         ):
             outcome = await _finalize_advanced_merge(**args)
 

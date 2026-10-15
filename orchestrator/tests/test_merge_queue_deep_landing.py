@@ -3106,7 +3106,7 @@ class TestChainWalkConsumesNoPermits:
             lambda p: (cap_released.append(p), _real_cap_release(p))[1],
         )
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             await worker._finalize_inflight(entry)
             await asyncio.sleep(0)
 

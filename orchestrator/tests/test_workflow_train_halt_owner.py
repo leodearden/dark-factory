@@ -776,7 +776,7 @@ async def test_escalate_train_halt_releases_orphan_halt_on_submit_failure(
     workflow.escalation_queue.submit = _raise_on_submit  # type: ignore[method-assign]
 
     try:
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'), \
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'), \
                 pytest.raises(RuntimeError, match='disk full'):
             await workflow._escalate_train_halt(  # type: ignore[attr-defined]
                 MergeOutcome(status='wip_halted', overlap_files=['a.py']),

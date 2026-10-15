@@ -1475,7 +1475,7 @@ class TestShellGuardNameWithGenuineLandingIsIndeterminate:
 
         guard_failure = _guard_failure(cause_hint)
         with caplog.at_level(
-            logging.WARNING, logger='orchestrator.merge_disposition',
+            logging.WARNING, logger='orchestrator.merge_lane',
         ):
             disposition, evidence, observed = asyncio.run(
                 classify_merge_failure_disposition(
@@ -1570,7 +1570,7 @@ class TestShellGuardNameWithGenuineLandingIsIndeterminate:
             'FAILED tests/test_foo.py::test_bar - AssertionError',
         )
         with caplog.at_level(
-            logging.WARNING, logger='orchestrator.merge_disposition',
+            logging.WARNING, logger='orchestrator.merge_lane',
         ):
             disposition, evidence, observed = asyncio.run(
                 classify_merge_failure_disposition(

@@ -452,7 +452,7 @@ class TestClassifyDispositionForOutcome:
         async def _run() -> tuple[
             MergeFailureDisposition, dict[str, str] | None, str, SkewEvidence | None,
         ]:
-            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
                 return await _classify_disposition_for_outcome(
                     _XPY_FAILURE, req=req, merge_base_sha=merge_base_sha,
                     main_sha=landing_sha, event_store=None,

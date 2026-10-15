@@ -183,7 +183,7 @@ class TestNoteTransitionBestEffort:
         fake_eq = RecordingEscalations()
         worker = make_lane(git_ops, escalation_queue=fake_eq)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             worker._note_transition(
                 'mr-unregistered0', ItemLifecycleState.QUEUED, ItemLifecycleState.MERGING,
             )
@@ -205,7 +205,7 @@ class TestNoteTransitionBestEffort:
         rid = 'mr-aaaaaaaa'
         worker._lifecycle.register(rid)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             # Skip-stage move (mirrors test_item_lifecycle.py's
             # test_skip_stage_move_raises) — an illegal EDGE, not an
             # unregistered rid.
@@ -234,7 +234,7 @@ class TestNoteTransitionBestEffort:
 
         worker = make_lane(git_ops, escalation_queue=None)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             worker._note_transition(
                 'mr-unregistered1', ItemLifecycleState.QUEUED, ItemLifecycleState.MERGING,
             )
@@ -2184,7 +2184,7 @@ class TestSentinelExitLeavesNoLiveItemsResidue:
         )
         rid = req.request_id
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             advanced = await worker._finalize_inflight(entry)
             head = lane_finalizing(worker)
 
@@ -2225,7 +2225,7 @@ class TestSentinelExitLeavesNoLiveItemsResidue:
         )
         rid = req.request_id
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             advanced = await worker._finalize_inflight(entry)
             head = lane_finalizing(worker)
 
@@ -2288,7 +2288,7 @@ class TestSentinelExitLeavesNoLiveItemsResidue:
             f'{worker._lifecycle.current(rid)!r}'
         )
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             advanced = await worker._finalize_inflight(entry)
 
         assert advanced is False, f'a REQUEUED sentinel must not advance main: {advanced!r}'
@@ -3432,7 +3432,7 @@ class TestSnapshotRendersEachRequestIdOnce:
     ) -> None:
         async with _duplicate_scene(git_ops, config, tmp_path) as scene:
             a_req, b_req = scene.a_req, scene.b_req
-            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
                 snap = scene.worker.snapshot()
 
             assert _rendered_ids(snap) == [a_req.request_id, b_req.request_id], (
@@ -3456,7 +3456,7 @@ class TestSnapshotRendersEachRequestIdOnce:
     ) -> None:
         async with _duplicate_scene(git_ops, config, tmp_path) as scene:
             rid = scene.a_req.request_id
-            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
                 for _ in range(3):
                     scene.worker.snapshot()
                 assert len(_warnings_naming(caplog, rid)) == 1, (

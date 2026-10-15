@@ -245,7 +245,7 @@ class TestAdvanceIfAt:
         rid = entry.request_id
         worker._register_item(entry, initial=ItemLifecycleState.FINALIZING)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = worker._advance_if_at(
                 rid, ItemLifecycleState.VERIFYING, ItemLifecycleState.FINALIZING,
                 live_obj=entry,
@@ -360,7 +360,7 @@ class TestAdvanceIfAtToleratesOnlyNamedStates:
         rid = entry.request_id
         worker._register_item(entry, initial=ItemLifecycleState.MERGING)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = worker._advance_if_at(
                 rid, ItemLifecycleState.VERIFYING, ItemLifecycleState.FINALIZING,
                 live_obj=entry,

@@ -331,7 +331,7 @@ class TestDropGuardRenameAwareness:
             monkeypatch.setattr('orchestrator.merge_gates._run', spy)
 
             with caplog.at_level(
-                logging.WARNING, logger='orchestrator.merge_queue',
+                logging.WARNING, logger='orchestrator.merge_lane',
             ):
                 result = await _check_plan_targets_in_tree(
                     merge_result.merge_commit, git_ops, main_sha,
@@ -484,7 +484,7 @@ class TestDropGuardSuppressionIsContentVerified:
         monkeypatch.setattr('orchestrator.merge_gates._run', spy)
 
         with caplog.at_level(
-            logging.WARNING, logger='orchestrator.merge_queue',
+            logging.WARNING, logger='orchestrator.merge_lane',
         ):
             result = await _check_plan_targets_in_tree(
                 merge_sha, git_ops, main_sha, task_id='drop-probe-error',

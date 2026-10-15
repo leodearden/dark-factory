@@ -726,15 +726,14 @@ class TestChainBuildLane:
 
         monkeypatch.setattr(git_ops, 'acquire_spec_lane', _fake_acquire)
 
-        # NOTE — the logger name is 'orchestrator.merge_queue' even though the
-        # emitting code lives in orchestrator/merge_liveness.py: that module is
-        # a split-out of merge_queue and deliberately keeps the parent's logger
-        # name (`merge_liveness.py`: `logger = getLogger('orchestrator.merge_queue')`),
-        # so the whole merge subsystem stays one configurable channel.  Do NOT
-        # "correct" this to 'orchestrator.merge_liveness' — no logger by that
+        # NOTE — the emitting code lives in orchestrator/merge_lane/liveness.py,
+        # which logs under the lane's one logger name, 'orchestrator.merge_lane'
+        # (every merge-lane module does), so the whole merge subsystem stays
+        # one configurable channel.  Do NOT "correct" this to a per-module
+        # name such as 'orchestrator.merge_lane.liveness' — no logger by that
         # name is ever used, so the level would be raised on the wrong object
         # and the emitter assertion below would fail.
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             lane, warm = await acquire_chain_build_lane(git_ops, config, head_sha)
 
         assert lane is None
@@ -743,7 +742,7 @@ class TestChainBuildLane:
         # start passing on some unrelated WARNING that happens to name the lane.
         assert any(
             PERSISTENT_MERGE_WORKTREE_NAME in r.getMessage()
-            and r.name == 'orchestrator.merge_queue'
+            and r.name == 'orchestrator.merge_lane'
             for r in caplog.records
             if r.levelno >= logging.WARNING
         )
@@ -2037,7 +2036,7 @@ class TestBuildChainLaneBase:
         self, git_repo: Path, monkeypatch, caplog,
     ):
         off = await _rev_parse(git_repo)
-        caplog.set_level(logging.WARNING, logger='orchestrator.merge_queue')
+        caplog.set_level(logging.WARNING, logger='orchestrator.merge_lane')
 
         git_ops, snap, head, res, acquires, merges = await self._build_on_a_seeded_lane(
             git_repo, monkeypatch,
@@ -2067,7 +2066,7 @@ class TestBuildChainLaneBase:
     async def test_unreadable_lane_head_is_a_base_mismatch_not_an_item_merge_error(
         self, git_repo: Path, monkeypatch, caplog,
     ):
-        caplog.set_level(logging.WARNING, logger='orchestrator.merge_queue')
+        caplog.set_level(logging.WARNING, logger='orchestrator.merge_lane')
 
         git_ops, snap, head, res, _, merges = await self._build_on_a_seeded_lane(
             git_repo, monkeypatch,

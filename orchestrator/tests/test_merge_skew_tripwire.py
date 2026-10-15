@@ -391,7 +391,7 @@ class TestAbandonedOracleRegistry:
             asyncio.ensure_future(asyncio.Event().wait()) for _ in range(threshold + 1)
         ]
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_skew_tripwire'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             for task in tasks:
                 merge_skew_tripwire._abandon_oracle(task)
 

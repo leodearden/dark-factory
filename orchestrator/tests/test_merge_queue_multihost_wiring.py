@@ -1550,7 +1550,7 @@ async def _drive_runner_unavailable(tmp_path, caplog, reason):
     )
     lease = HostLease(name=_RU_HOST, runner=fake_runner, is_local=False)
 
-    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
         result = await worker._run_inflight_verify(item, lease)
 
     records = [
@@ -3675,13 +3675,12 @@ class TestReprobeIsTrackerDriven:
 def _mq_records_naming(caplog, host: str) -> list:
     """merge_queue records whose rendered message names *host*.
 
-    Filtered to the ``orchestrator.merge_queue`` logger so records emitted by
-    the recovery helpers (``orchestrator.merge_liveness``) cannot inflate the
-    per-host decision count.
+    Filtered to the lane's ``orchestrator.merge_lane`` logger so records
+    emitted by other subsystems cannot inflate the per-host decision count.
     """
     return [
         r for r in caplog.records
-        if r.name == 'orchestrator.merge_queue' and host in r.getMessage()
+        if r.name == 'orchestrator.merge_lane' and host in r.getMessage()
     ]
 
 
@@ -3724,7 +3723,7 @@ class TestReprobeObservability:
         now = 1000.0
         seed_ru_tracker(worker, 'up-host', first_unavailable_at=now - 300.0)
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             await worker._reprobe_quarantined_hosts(now)
 
         recs = _mq_records_naming(caplog, 'up-host')
@@ -3746,7 +3745,7 @@ class TestReprobeObservability:
         now = 1000.0
         seed_ru_tracker(worker, 'down-host', first_unavailable_at=now - 450.0)
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             await worker._reprobe_quarantined_hosts(now)
 
         recs = _mq_records_naming(caplog, 'down-host')
@@ -3771,7 +3770,7 @@ class TestReprobeObservability:
         seed_ru_tracker(worker, 'up-host', first_unavailable_at=now - 10.0)
         seed_ru_tracker(worker, 'down-host', first_unavailable_at=now - 10.0)
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             await worker._reprobe_quarantined_hosts(now)
 
         assert len(_mq_records_naming(caplog, 'up-host')) == 1
@@ -3797,7 +3796,7 @@ class TestReprobeObservability:
         seed_ru_tracker(worker, 'ghost-host', first_unavailable_at=now - 60.0)
         seed_ru_tracker(worker, 'ok-host', first_unavailable_at=now - 60.0)
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             await worker._reprobe_quarantined_hosts(now)
 
         ghost_warnings = [
@@ -3822,12 +3821,12 @@ class TestReprobeObservability:
         seed_ru_tracker(worker, 'host-a', first_unavailable_at=900.0)
         seed_ru_tracker(worker, 'host-b', first_unavailable_at=900.0)
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             await worker._reprobe_quarantined_hosts(1000.0)  # must not raise
 
         warns = [
             r for r in caplog.records
-            if r.name == 'orchestrator.merge_queue' and r.levelno >= logging.WARNING
+            if r.name == 'orchestrator.merge_lane' and r.levelno >= logging.WARNING
         ]
         assert len(warns) == 1, (
             f'expected one WARNING for an absent allocator with tracked hosts; got {warns}'
@@ -3845,10 +3844,10 @@ class TestReprobeObservability:
         worker, eq = make_reprobe_worker()
         worker._host_allocator = None
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             await worker._reprobe_quarantined_hosts(1000.0)
 
-        assert [r for r in caplog.records if r.name == 'orchestrator.merge_queue'] == []
+        assert [r for r in caplog.records if r.name == 'orchestrator.merge_lane'] == []
 
     # ── (d) healthy steady state is silent ──────────────────────────────────
 
@@ -3861,10 +3860,10 @@ class TestReprobeObservability:
         alloc = _FakeAllocatorForReprobe({}, unquarantined={'idle-host': runner})
         worker._host_allocator = alloc  # type: ignore[assignment]
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             await worker._reprobe_quarantined_hosts(1000.0)
 
-        assert [r for r in caplog.records if r.name == 'orchestrator.merge_queue'] == [], (
+        assert [r for r in caplog.records if r.name == 'orchestrator.merge_lane'] == [], (
             'the sweep runs every verify_host_reprobe_interval_s (120 s) — the '
             'healthy steady state must be completely silent'
         )
@@ -3886,7 +3885,7 @@ class TestReprobeObservability:
         now = 1000.0
         seed_ru_tracker(worker, 'parked-host', first_unavailable_at=now - 60.0)
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             await worker._reprobe_quarantined_hosts(now)
 
         recs = _mq_records_naming(caplog, 'parked-host')
@@ -4073,7 +4072,7 @@ class TestReprobeCompatAndErrorPaths:
         now = 1000.0
         seed_ru_tracker(worker, 'flaky-host', first_unavailable_at=now - 60.0)
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             await worker._reprobe_quarantined_hosts(now)  # must not raise
 
         assert 'flaky-host' in worker._runner_unavailable, (
@@ -4098,7 +4097,7 @@ class TestReprobeCompatAndErrorPaths:
         seed_ru_tracker(worker, 'bad-host', first_unavailable_at=now - 60.0)
         seed_ru_tracker(worker, 'good-host', first_unavailable_at=now - 60.0)
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             await worker._reprobe_quarantined_hosts(now)
 
         assert alloc.readmitted == ['good-host']
@@ -4118,7 +4117,7 @@ class TestReprobeCompatAndErrorPaths:
         now = 1000.0
         seed_ru_tracker(worker, 'bad-host', first_unavailable_at=now - 60.0)
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             await worker._reprobe_quarantined_hosts(now)
 
         recs = _mq_records_naming(caplog, 'bad-host')
@@ -4150,7 +4149,7 @@ class TestReprobeCompatAndErrorPaths:
         now = 1000.0
         seed_ru_tracker(worker, 'simple-host', first_unavailable_at=now - 60.0)
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             await worker._reprobe_quarantined_hosts(now)
 
         assert alloc.readmitted == ['simple-host'], 'must stay recoverable'
@@ -4182,7 +4181,7 @@ class TestReprobeCompatAndErrorPaths:
 
         seed_ru_tracker(worker, 'gone-host', first_unavailable_at=0.0)
 
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             for sweep in range(10):          # 10 sweeps x 120 s = 20 min
                 await worker._reprobe_quarantined_hosts(120.0 * (sweep + 1))
 
@@ -4207,7 +4206,7 @@ class TestReprobeCompatAndErrorPaths:
 
         seed_ru_tracker(worker, 'gone-host', first_unavailable_at=0.0, streak=1)
 
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             await worker._reprobe_quarantined_hosts(120.0)     # INFO (first sweep)
             await worker._reprobe_quarantined_hosts(240.0)     # DEBUG (throttled)
             worker._runner_unavailable['gone-host'].streak = 2  # a new failure
@@ -4227,7 +4226,7 @@ class TestReprobeCompatAndErrorPaths:
         worker._host_allocator = alloc  # type: ignore[assignment]
 
         seed_ru_tracker(worker, 'flappy-host', first_unavailable_at=0.0)
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             await worker._reprobe_quarantined_hosts(120.0)   # INFO
             await worker._reprobe_quarantined_hosts(240.0)   # DEBUG
 
@@ -4238,7 +4237,7 @@ class TestReprobeCompatAndErrorPaths:
 
         caplog.clear()
         seed_ru_tracker(worker, 'flappy-host', first_unavailable_at=600.0)
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             await worker._reprobe_quarantined_hosts(720.0)
 
         recs = _mq_records_naming(caplog, 'flappy-host')
@@ -4265,7 +4264,7 @@ class TestLocalQuarantineIsLoud:
         """The never-quarantine-local rule is unchanged."""
         worker, _eq = make_reprobe_worker()
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             worker._quarantine_unreachable_host('local', 'boom', 1000.0)
 
         assert worker._runner_quarantine == set()
@@ -4275,12 +4274,12 @@ class TestLocalQuarantineIsLoud:
         """…but the event is greppable instead of vanishing."""
         worker, _eq = make_reprobe_worker()
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             worker._quarantine_unreachable_host('local', 'ssh: connect refused', 1000.0)
 
         warns = [
             r for r in caplog.records
-            if r.name == 'orchestrator.merge_queue' and r.levelno >= logging.WARNING
+            if r.name == 'orchestrator.merge_lane' and r.levelno >= logging.WARNING
         ]
         assert len(warns) == 1, (
             f'a local RU-class quarantine must be audible; got {caplog.records}'
@@ -4297,14 +4296,14 @@ class TestLocalQuarantineIsLoud:
             [], quarantine=worker._runner_quarantine, local_name='anchor-01',
         )
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             worker._quarantine_unreachable_host('anchor-01', 'boom', 1000.0)
 
         assert worker._runner_quarantine == set()
         assert worker._runner_unavailable == {}
         assert [
             r for r in caplog.records
-            if r.name == 'orchestrator.merge_queue' and r.levelno >= logging.WARNING
+            if r.name == 'orchestrator.merge_lane' and r.levelno >= logging.WARNING
         ]
 
 
@@ -5072,7 +5071,7 @@ class TestOrphanGuardPreservesCancellation:
         started = lease.runner.entered
 
         try:
-            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
                 outer = asyncio.ensure_future(
                     worker._run_inflight_verify(item, lease)
                 )
@@ -5088,7 +5087,7 @@ class TestOrphanGuardPreservesCancellation:
 
             warns = [
                 r for r in caplog.records
-                if r.name == 'orchestrator.merge_queue'
+                if r.name == 'orchestrator.merge_lane'
                 and r.levelno >= logging.WARNING
                 and 'leo-laptop' in r.getMessage()
             ]
@@ -5145,7 +5144,7 @@ class TestOrphanGuardPreservesCancellation:
                     raise RuntimeError('wedged log handler')
                 return True
 
-        mq_logger = logging.getLogger('orchestrator.merge_queue')
+        mq_logger = logging.getLogger('orchestrator.merge_lane')
         wedge = _WedgedFilter()
         mq_logger.addFilter(wedge)
         try:

@@ -1438,7 +1438,7 @@ class TestLateArrivalAttaches:
           - ``speculative_merge`` event for B carries the same ``base_sha``
         """
         # Capture DEBUG-level logs so we can assert the ATTACH code path fired.
-        caplog.set_level(logging.DEBUG, logger='orchestrator.merge_queue')
+        caplog.set_level(logging.DEBUG, logger='orchestrator.merge_lane')
 
         git_config = _make_late_arrival_git_config()
         git_ops = GitOps(git_config, spec_git_repo)
@@ -1648,7 +1648,7 @@ class TestLateArrivalCleanCAS:
         GREEN (step-2): B.base_sha == A's merge commit == main-after-A → 'advanced'.
         """
         # Capture DEBUG-level logs so we can assert the ATTACH code path fired.
-        caplog.set_level(logging.DEBUG, logger='orchestrator.merge_queue')
+        caplog.set_level(logging.DEBUG, logger='orchestrator.merge_lane')
 
         git_config = _make_late_arrival_git_config()
         git_ops = GitOps(git_config, spec_git_repo)
@@ -2603,7 +2603,7 @@ class TestLateArrivalSubmissionOrderCAS:
           (c) Both A and B resolve 'done' (clean CAS, no rebase).
         """
         # Capture DEBUG-level logs so we can assert the ATTACH code path fired.
-        caplog.set_level(logging.DEBUG, logger='orchestrator.merge_queue')
+        caplog.set_level(logging.DEBUG, logger='orchestrator.merge_lane')
 
         git_config = _make_late_arrival_git_config()
         git_ops = GitOps(git_config, spec_git_repo)
