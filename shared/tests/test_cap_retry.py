@@ -2909,8 +2909,21 @@ class TestInvokeFnParameter:
         assert kw['oauth_token'] == 'fake-token-a'
         assert kw['model'] == 'sonnet'
 
-    async def test_backend_forwarded_to_detect_cap_hit(self):
-        """backend parameter is forwarded to slot.detect_cap_hit."""
+    @pytest.mark.parametrize(
+        ('backend', 'expected_detect_calls'),
+        [
+            ('claude', ['claude']),
+            ('pi', ['pi']),
+            ('codex', []),
+            ('gemini', []),
+        ],
+    )
+    async def test_only_pool_backends_reach_detect_cap_hit(
+        self, backend, expected_detect_calls,
+    ):
+        """A backend that spends the leased Claude token forwards itself to
+        slot.detect_cap_hit; codex and gemini never ask the Claude pool's
+        detector, because their caps are not that account's."""
         gate = make_gate(['a'])
         detect_calls: list[str] = []
         orig_detect = gate.detect_cap_hit
@@ -2928,9 +2941,9 @@ class TestInvokeFnParameter:
         )
         with patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result):
             await invoke_with_cap_retry(
-                gate, 'lbl', backend='codex', prompt='hi',
+                gate, 'lbl', backend=backend, prompt='hi',
             )
-        assert detect_calls == ['codex']
+        assert detect_calls == expected_detect_calls
 
     async def test_default_invoke_fn_is_claude(self):
         """When invoke_fn is omitted, invoke_claude_agent is used."""
@@ -3064,6 +3077,47 @@ class TestNonPoolBackendCapWait:
         assert [c['oauth_token'] for c in cli.calls] == ['fake-token-a', 'fake-token-b']
         assert gate.active_account_name == 'b'
         assert gate.soonest_resets_at is not None
+
+
+@pytest.mark.asyncio
+class TestNonPoolBackendFailureSkipsHeuristicNet:
+    """The zero-cost instant-exit heuristic net guesses at an unrecognised
+    Claude cap. A non-pool backend's failure is never a Claude account's cap,
+    so the net is backend-scoped, not disabled."""
+
+    @staticmethod
+    def _instant_generic_failure() -> AgentResult:
+        return make_result(
+            success=False, output='codex: unexpected failure',
+            cost_usd=0.0, turns=0, duration_ms=800,
+        )
+
+    async def test_codex_failure_is_returned_without_touching_the_pool(self):
+        gate = make_gate(['a', 'b'], wait_for_reset=False)
+        cli = scripted_invoke(self._instant_generic_failure(), make_result(output='complete'))
+        with patch(_SLEEP_PATCH, new_callable=AsyncMock) as mock_sleep:
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', invoke_fn=cli, backend='codex', prompt='hi',
+            )
+
+        assert got.success is False
+        assert got.output == 'codex: unexpected failure'
+        assert len(cli.calls) == 1
+        assert gate.active_account_name == 'a'
+        assert gate.is_paused is False
+        mock_sleep.assert_not_awaited()
+
+    async def test_claude_failure_still_trips_the_net_and_fails_over(self):
+        gate = make_gate(['a', 'b'], wait_for_reset=False)
+        cli = scripted_invoke(self._instant_generic_failure(), make_result(output='complete'))
+        with patch(_SLEEP_PATCH, new_callable=AsyncMock):
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', invoke_fn=cli, backend='claude', prompt='hi',
+            )
+
+        assert got.success is True
+        assert [c['oauth_token'] for c in cli.calls] == ['fake-token-a', 'fake-token-b']
+        assert gate.active_account_name == 'b'
 
 
 # ===================================================================
