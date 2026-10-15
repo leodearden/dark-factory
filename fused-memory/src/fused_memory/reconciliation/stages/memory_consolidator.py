@@ -34,8 +34,7 @@ from fused_memory.reconciliation.degenerate_task_node_sweep import (
 from fused_memory.reconciliation.flag_dedup import (
     EntityStandingSuppressionResult,
     acknowledge_resolved_flags,
-    compute_content_fingerprint_signature,
-    compute_flag_signature,
+    compute_marker_signature,
     dedup_flags,
     filter_accounted_cluster_growth_flags,
     filter_already_recorded_caveat_flags,
@@ -913,12 +912,12 @@ class MemoryConsolidator(BaseStage):
             )
             _esd_kept_signatures = {
                 sig for f in report.items_flagged
-                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
+                if (sig := compute_marker_signature(f, project_id=self.project_id))
                 is not None
             }
             esd_suppressed_signatures = {
                 sig for f in _pre_esd_flags
-                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
+                if (sig := compute_marker_signature(f, project_id=self.project_id))
                 is not None and sig not in _esd_kept_signatures
             }
             # Per-cycle "storm escape": one active decision suppressing more than the
@@ -995,12 +994,12 @@ class MemoryConsolidator(BaseStage):
             # INFO log that names the specific fix task behind each drop.
             _post_dedup_signatures = {
                 sig for f in report.items_flagged
-                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
+                if (sig := compute_marker_signature(f, project_id=self.project_id))
                 is not None
             }
             suppressed_signatures = {
                 sig for f in _pre_dedup_flags
-                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
+                if (sig := compute_marker_signature(f, project_id=self.project_id))
                 is not None and sig not in _post_dedup_signatures
             }
             # Fold in the entity-standing-decision drops (task 2896 γ): they are a
@@ -1030,12 +1029,12 @@ class MemoryConsolidator(BaseStage):
             # suppression is not the same as resolved; see the snapshot comment above.
             surviving_signatures = {
                 sig for f in report.items_flagged
-                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
+                if (sig := compute_marker_signature(f, project_id=self.project_id))
                 is not None
             }
             dropped_flags = [
                 f for f in _pre_filter_flags
-                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
+                if (sig := compute_marker_signature(f, project_id=self.project_id))
                 is not None
                 and sig not in surviving_signatures
                 and sig not in suppressed_signatures
