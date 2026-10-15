@@ -5100,9 +5100,7 @@ async def acknowledge_resolved_flags(
     """
     sigs: list[tuple[str, str]] = []
     for flag in resolved_flags:
-        sig = compute_flag_signature(flag)
-        if sig is None:
-            sig = compute_content_fingerprint_signature(flag)
+        sig = compute_marker_signature(flag, project_id=project_id)
         if sig is None:
             continue
         sigs.append(sig)
