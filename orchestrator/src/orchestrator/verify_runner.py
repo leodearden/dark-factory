@@ -283,9 +283,9 @@ class MergeVerifySpec:
                           project's own dark-factory-orchestrator.yaml — its single
                           home (INV-9), and the file to read before assuming what a
                           key here means.
-                          The one producer whose path-valued keys cannot resolve
-                          remotely is the failed-only retry env from
-                          orchestrator/src/orchestrator/merge_lane/worker.py::_build_retry_verify_env:
+                          The failed-only retry env from
+                          orchestrator/src/orchestrator/merge_lane/worker.py::_build_retry_verify_env
+                          has path-valued keys that cannot resolve remotely:
                           its nextest filter files are UNTRACKED files in the
                           dispatching host's merge_wt, which the git-pushed merge
                           SHA does not carry. That env is therefore never shipped:

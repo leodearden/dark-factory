@@ -1597,10 +1597,10 @@ _CROSS_CHECK_SENTINEL = '__verify_cross_check__'
 #                                 re-checks it a third time from its side.
 #   REIFY_VERIFY_RETRY_SCOPE      always 'failed_only' — the retry-scope marker.
 #
-# The dict is merged into the dispatched MergeVerifySpec.verify_env on a LOCAL
-# dispatch only, and the filter files are written into THIS host's merge_wt, the
-# shared persistent merge-verify lane reify's verify.sh reads.  A remote dispatch
-# never receives the env: see verify_runner.py::MergeVerifySpec (verify_env).
+# The dict is merged into the dispatched MergeVerifySpec.verify_env, and the
+# filter files are written into THIS host's merge_wt, the shared persistent
+# merge-verify lane reify's verify.sh reads: LOCAL dispatch only (see
+# verify_runner.py::MergeVerifySpec).
 # ---------------------------------------------------------------------------
 
 # Subdir under merge_wt holding the per-profile nextest filter files.
@@ -2867,13 +2867,13 @@ async def _run_post_merge_verify(
             # legacy path is byte-identical (D1's strict no-op guarantee).  Every
             # fail-safe route — unreadable/malformed sidecar, a probe that could
             # not produce a plan, a probe whose plan does not COVER attempt-0's
-            # observed failures, a rebased or uncorroborated tree, a subset
-            # that would not materially narrow (_materially_narrows), or a
-            # REMOTE dispatch (runner is not None: the filter files are untracked
-            # files in THIS host's merge_wt, which the remote's git-pushed merge SHA
-            # does not carry) — leaves `spec` untouched, so the retry runs FULL via
-            # the existing _reverify_rebased_tree (M4) semantics AND stays on the
-            # legacy budget.  See verify_runner.py::MergeVerifySpec (verify_env).
+            # observed failures, a rebased or uncorroborated tree, or a subset
+            # that would not materially narrow (_materially_narrows) — returns
+            # None and leaves `spec` untouched, so the retry runs FULL via the
+            # existing _reverify_rebased_tree (M4) semantics AND stays on the
+            # legacy budget.  A REMOTE dispatch (runner is not None) skips the
+            # producer altogether, with the same outcome: see
+            # verify_runner.py::MergeVerifySpec.
             #
             # `not narrowed` keeps this a once-per-call operation: the loop below
             # may dispatch several times, but the subset is always attempt-0's.
