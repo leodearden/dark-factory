@@ -11,7 +11,7 @@ import random
 import re
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator, MutableSet, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, MutableSet, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -2052,6 +2052,20 @@ def _task_external_deps(task: dict) -> list[str]:
     return metadata.external_deps
 
 
+def train_order_key(task: Mapping[str, Any]) -> tuple[int, int]:
+    """A declared-train member's place in its train, root to tip: ascending
+    ``metadata.train.order``, with a missing or non-integer order last.  A
+    train's tip is the last member in this order."""
+    train = (task.get('metadata') or {}).get('train') or {}
+    order = train.get('order') if isinstance(train, dict) else None
+    if order is None:
+        return (1, 0)
+    try:
+        return (0, int(order))
+    except (TypeError, ValueError):
+        return (1, 0)
+
+
 def _reject_contradictory_metadata_mode(
     metadata_mode: str | None, append: bool
 ) -> None:
@@ -3017,21 +3031,13 @@ class Scheduler:
 
         tasks = await self.get_tasks(statuses=ACTIVE_TASK_STATUSES)
 
-        def _order_key(t: dict) -> tuple[int, int]:
-            train = (t.get('metadata') or {}).get('train') or {}
-            order = train.get('order') if isinstance(train, dict) else None
-            try:
-                return (0, int(order))  # type: ignore[arg-type]
-            except (TypeError, ValueError):
-                return (1, 0)  # missing/non-int → sort last
-
         return sorted(
             [
                 t for t in tasks
                 if isinstance((t.get('metadata') or {}).get('train'), dict)
                 and (t.get('metadata') or {}).get('train', {}).get('id') == train_id
             ],
-            key=_order_key,
+            key=train_order_key,
         )
 
     @overload

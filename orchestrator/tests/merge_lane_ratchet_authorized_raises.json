@@ -2905,6 +2905,36 @@
           "current": 32113
         }
       ]
+    },
+    {
+      "task_id": "4737",
+      "reason": "net-additive: abandoned merge-deferred recovery (custody query, abandoned re-drive); per-member re-drive extracted from worker.py into merge_lane/member_redrive.py",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/__init__.py",
+          "baseline": 93,
+          "current": 95
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4866,
+          "current": 4867
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57857,
+          "current": 57911
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6652,
+          "current": 6655
+        }
+      ]
     }
   ]
 }

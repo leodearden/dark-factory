@@ -164,6 +164,11 @@ occupant when two entries share a host.
 | `_run_no_landings_breaker_pass()` | harness.py | Harness pass that acts on `BreakerTrip`: calls `force_halt_scheduler` + files L2-INFO escalation |
 | `classify_and_merge()` | merge_lane/worker.py | Shared pre-merge guard + merge + drop-guard pipeline (branch-presence → already-merged → merge → conflict/non-conflict-failure → drop-guard), returning `MergedOk \| Decided`; `SpeculativeMergeWorker._merger_loop` and `SpeculativeMergeWorker._remerge` both delegate to it instead of each running its own duplicated inline copy (MQ-refactor task κ, task 1995) |
 | `patch_content_contained()` | merge_lane/landing_evidence.py | Patch-id containment check: True iff every commit in `head` is already present in `upstream` (moved out of the worker, task 5036) |
+| `MemberRedriver` | merge_lane/member_redrive.py | Per-member re-drive of parked train members: on-main fork, landing-evidence attribution, un-stack off an unlanded train base. Serves both the coalesce derail/unwind path and abandoned-member recovery (extracted from the worker, task 4737) |
+| `MemberRedriveOutcome` | merge_lane/member_redrive.py | What the redriver decided for each member (`NOT_PARKED`, `NOT_ON_MAIN`, `ON_MAIN_ATTRIBUTED`, `ON_MAIN_UNATTRIBUTED`, `PROVENANCE_CONFLICT_MEMOIZED`, `STALE_EVIDENCE`, `ERRORED`, `HELD_BY_LIVE_TRAIN`); exported by the façade (task 4737) |
+| `train_member_ids_in_custody()` | merge_lane/worker.py | Members of every train the worker still holds, i.e. every live (non-retired) registry entry (task 4737) |
+| `redrive_abandoned_members()` | merge_lane/worker.py | Re-drives members no train holds through `MemberRedriver`, using the worker's own train callbacks; a member still in custody is refused as `HELD_BY_LIVE_TRAIN` (task 4737) |
+| `AbandonedMemberSweep` | merge_deferred_recovery.py (outside the package) | Finds merge-deferred members with no owner on two consecutive passes, re-drives them through the lane and files one `merge_deferred_abandoned` record per target: an `info` L0 receipt when recovered, a pinning `blocking` L1 when not. Last step of `harness.py::Harness._run_stranded_reconcile_pass` (task 4737; runbook: OPERATIONS.md § "Abandoned merge-deferred members") |
 
 ### 7.1 merge_lane/types.py — request/outcome/item/entry types + registries (MQ-refactor task α)
 
