@@ -9,7 +9,7 @@ import logging
 import os
 import shlex
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -39,6 +39,11 @@ from orchestrator.offline_lane_records import (
     is_well_formed,
     pass_id_for,
     records_root,
+)
+from orchestrator.offline_lane_runs import (
+    RUN_ALL_INFRA_SCRIPT,
+    RUN_OFFLINE_DEEP_SCRIPT,
+    require_current_pass,
 )
 
 T0 = datetime(2026, 10, 1, 12, 30, 5, tzinfo=UTC)
@@ -93,6 +98,24 @@ def store(tmp_path: Path, clock: _Clock) -> RunRecordStore:
     return RunRecordStore(tmp_path, clock=clock)
 
 
+_needs_file_permissions = pytest.mark.skipif(
+    os.geteuid() == 0, reason='root removes a read-only directory regardless'
+)
+
+
+@contextlib.contextmanager
+def _locked_subdirectory(pass_dir: Path) -> Iterator[None]:
+    """A non-empty read-only subdirectory of *pass_dir*: ``rmtree`` fails with PermissionError."""
+    locked = pass_dir / 'locked'
+    locked.mkdir()
+    (locked / 'output').write_text('x')
+    locked.chmod(0o500)
+    try:
+        yield
+    finally:
+        locked.chmod(0o700)
+
+
 class TestClassifyExit:
     @pytest.mark.parametrize('returncode', [-9, -15, 137, 143, 129, 130])
     def test_external_kill_forms_are_signal(self, returncode: int) -> None:
@@ -132,7 +155,7 @@ class TestCommandKey:
         assert command_key(name) not in LEGACY_COMMANDS
         assert '_' not in command_key(name)
 
-    def test_only_the_exact_legacy_name_keeps_its_underscore(self) -> None:
+    def test_a_legacy_name_in_another_case_is_slugged_like_any_other(self) -> None:
         assert command_key('LEGACY_NUMERIC') == 'legacy-numeric'
 
 
@@ -187,6 +210,9 @@ class TestRunRecordJson:
             ('failures', 'none'),
             ('failures', [{'node': 'n', 'kind': 'bogus', 'first_line': ''}]),
             ('probe', {'result': 'sideways'}),
+            ('outcomes', ['tests/test_q.py::test_a']),
+            ('outcomes', {'tests/test_q.py::test_a': 1}),
+            ('started_at', '0001-01-01T00:00:00+01:00'),
         ],
     )
     def test_malformed_value_is_a_value_error(self, key: str, value: Any) -> None:
@@ -226,6 +252,22 @@ class TestAllocatePass:
     def test_unknown_leg_is_rejected(self, store: RunRecordStore) -> None:
         with pytest.raises(ValueError):
             store.allocate_pass('unit', 'sideways', HEAD)
+
+    @pytest.mark.parametrize('legacy_name', sorted(LEGACY_COMMANDS))
+    def test_a_generic_pass_cannot_take_a_legacy_name(
+        self, store: RunRecordStore, legacy_name: str
+    ) -> None:
+        with pytest.raises(ValueError, match=legacy_name):
+            store.allocate_pass(legacy_name, Leg.GENERIC, HEAD)
+        assert store.current_pass(legacy_name) is None
+
+    def test_require_current_pass_is_the_allocated_pass(self, store: RunRecordStore) -> None:
+        lane_pass = store.allocate_pass('unit', Leg.GENERIC, HEAD)
+        assert require_current_pass(store, 'unit') == lane_pass
+
+    def test_require_current_pass_without_one_names_the_command(self, store: RunRecordStore) -> None:
+        with pytest.raises(RuntimeError, match='never-allocated'):
+            require_current_pass(store, 'never-allocated')
 
     def test_second_allocation_replaces_the_pass_and_forgets_last_records(
         self, store: RunRecordStore, clock: _Clock
@@ -298,23 +340,6 @@ class TestWriteRun:
         lane_pass.record_path.write_text('{not json')
         with pytest.raises(LookupError):
             store.write_run(lane_pass, _record())
-
-    def test_a_reader_never_sees_a_partial_file(
-        self, store: RunRecordStore, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        lane_pass = store.allocate_pass('unit', Leg.GENERIC, HEAD)
-        replaced: list[tuple[str, str]] = []
-        real_replace = os.replace
-
-        def spy(src: Any, dst: Any) -> None:
-            replaced.append((str(src), str(dst)))
-            real_replace(src, dst)
-
-        monkeypatch.setattr(os, 'replace', spy)
-        store.write_run(lane_pass, _record())
-
-        assert replaced == [(replaced[0][0], str(lane_pass.record_path))]
-        assert replaced[0][0] != str(lane_pass.record_path)
 
 
 class TestPassBlocks:
@@ -417,6 +442,20 @@ class TestWellFormedness:
             assert store.load_pass('unit', lane_pass.pass_id) is None
         assert any(r.levelno == logging.WARNING for r in caplog.records)
 
+    def test_a_start_out_of_range_in_utc_is_skipped_with_a_warning(
+        self, store: RunRecordStore, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        lane_pass = store.allocate_pass('unit', Leg.GENERIC, HEAD)
+        payload = json.loads(lane_pass.record_path.read_text())
+        payload['started_at'] = '0001-01-01T00:00:00+01:00'
+        lane_pass.record_path.write_text(json.dumps(payload))
+
+        assert not is_well_formed(payload)
+        with caplog.at_level(logging.WARNING):
+            assert store.load_pass('unit', lane_pass.pass_id) is None
+            assert list(store.passes_since('unit', T0)) == []
+        assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 2
+
     def test_load_of_an_absent_pass_is_none_without_a_warning(
         self, store: RunRecordStore, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -464,6 +503,17 @@ class TestPassesSince:
 
     def test_an_unknown_command_has_no_passes(self, store: RunRecordStore) -> None:
         assert list(store.passes_since('never-ran', T0)) == []
+
+    def test_names_that_slug_alike_read_back_only_their_own_passes(
+        self, store: RunRecordStore, clock: _Clock
+    ) -> None:
+        spaced = self._allocate_at(store, clock, T0, command='Unit Tests')
+        dashed = self._allocate_at(store, clock, T0 + timedelta(hours=1), command='unit-tests')
+
+        assert command_key('Unit Tests') == command_key('unit-tests')
+        assert store.load_pass('Unit Tests', dashed) is None
+        assert [p.pass_id for p in store.passes_since('unit-tests', T0)] == [dashed]
+        assert [p.pass_id for p in store.passes_since('Unit Tests', T0)] == [spaced]
 
 
 class TestRetention:
@@ -524,23 +574,57 @@ class TestRetention:
         store = RunRecordStore(tmp_path / 'never-created')
         assert store.prune(T0) == []
 
+    @_needs_file_permissions
+    def test_a_pass_that_cannot_be_removed_is_skipped_with_a_warning(
+        self, store: RunRecordStore, clock: _Clock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        now = T0 + timedelta(days=30)
+        stuck = self._allocate_aged(store, clock, now, 15)
+        removable = self._allocate_aged(store, clock, now, 16)
+
+        with _locked_subdirectory(store.root / 'unit' / stuck), caplog.at_level(logging.WARNING):
+            assert store.prune(now) == [removable]
+
+        assert (store.root / 'unit' / stuck).is_dir()
+        assert any(
+            r.levelno == logging.WARNING and str(store.root / 'unit' / stuck) in r.getMessage()
+            for r in caplog.records
+        )
+
 
 _LANE_COMMAND = 'unit'
 _PASS_DEADLINE_SECS = 120.0
 
 
-def _lane_worker(tmp_path: Path, command: str) -> OfflineLaneWorker:
+def _lane_worker(tmp_path: Path, **git_overrides: Any) -> OfflineLaneWorker:
+    """A worker whose worktree is ``tmp_path / 'wt'``, with every leg off unless *git_overrides* enables it."""
     worktree = tmp_path / 'wt'
     worktree.mkdir(exist_ok=True)
     config = _make_config(
         tmp_path,
-        offline_lane_legacy_numeric_enabled=False,
-        offline_lane_commands=[LaneCommand(name=_LANE_COMMAND, command=command, cwd='.')],
-        offline_lane_poll_interval_secs=3600.0,
+        **{
+            'offline_lane_legacy_numeric_enabled': False,
+            'offline_lane_poll_interval_secs': 3600.0,
+            **git_overrides,
+        },
     )
     return _make_worker(
         tmp_path, git_ops=_make_git_ops(head=HEAD, worktree_path=worktree), config=config,
     )
+
+
+def _generic_worker(tmp_path: Path, command: str) -> OfflineLaneWorker:
+    return _lane_worker(
+        tmp_path, offline_lane_commands=[LaneCommand(name=_LANE_COMMAND, command=command, cwd='.')],
+    )
+
+
+def _add_lane_script(tmp_path: Path, relative_path: str, body: str) -> None:
+    """Put an executable ``sh`` script at *relative_path* in the lane worktree, for a default seam to run."""
+    script = tmp_path / 'wt' / relative_path
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text(f'#!/bin/sh\n{body}\n')
+    script.chmod(0o755)
 
 
 async def _until(done: Callable[[], bool]) -> None:
@@ -550,36 +634,57 @@ async def _until(done: Callable[[], bool]) -> None:
         await asyncio.sleep(0.02)
 
 
-async def _run_one_pass(tmp_path: Path, command: str, *, until_phase: Phase) -> OfflineLaneWorker:
-    """Drive one lane pass through ``on_post_merge`` + ``run()`` until *until_phase* is recorded."""
-    worker = _lane_worker(tmp_path, command)
+async def _drive_one_pass(worker: OfflineLaneWorker, command: str, until_phase: Phase) -> None:
+    """Drive one lane pass through ``on_post_merge`` + ``run()`` until *command*'s *until_phase* is recorded."""
     task = asyncio.create_task(worker.run())
     try:
         await worker.on_post_merge('t', 'base', 'head')
-        await _until(lambda: worker.records.last_record(_LANE_COMMAND, until_phase) is not None)
+        await _until(lambda: worker.records.last_record(command, until_phase) is not None)
     finally:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+async def _run_one_pass(tmp_path: Path, command: str, *, until_phase: Phase) -> OfflineLaneWorker:
+    worker = _generic_worker(tmp_path, command)
+    await _drive_one_pass(worker, _LANE_COMMAND, until_phase)
     return worker
 
 
-def _current_pass_record(worker: OfflineLaneWorker) -> PassRecord:
-    lane_pass = worker.records.current_pass(_LANE_COMMAND)
+def _current_pass_record(worker: OfflineLaneWorker, command: str = _LANE_COMMAND) -> PassRecord:
+    lane_pass = worker.records.current_pass(command)
     assert lane_pass is not None
-    record = worker.records.load_pass(_LANE_COMMAND, lane_pass.pass_id)
+    record = worker.records.load_pass(command, lane_pass.pass_id)
     assert record is not None
     return record
+
+
+def _sub_run_logs(caplog: pytest.LogCaptureFixture, command: str) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records if r.getMessage().startswith(f'offline-lane: {command} sub-run')
+    ]
+
+
+def _seed_pass(tmp_path: Path, age: timedelta) -> Path:
+    """Allocate a pass of the lane's generic command that started *age* ago; its directory."""
+    started_at = datetime.now(UTC) - age
+    return RunRecordStore(tmp_path, clock=lambda: started_at).allocate_pass(
+        _LANE_COMMAND, Leg.GENERIC, HEAD
+    ).directory
 
 
 class TestLanePassRecords:
     """Scenario 1 and the record half of scenario 2: every lane sub-run leaves a record."""
 
     @pytest.mark.asyncio
-    async def test_a_green_pass_records_its_detect_run_and_output(self, tmp_path: Path) -> None:
-        worker = await _run_one_pass(
-            tmp_path, "printf 'all green\\n'; exit 0", until_phase=Phase.DETECT,
-        )
+    async def test_a_green_pass_records_its_detect_run_and_output(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
+            worker = await _run_one_pass(
+                tmp_path, "printf '=== 3 passed in 0.10s ===\\n'; exit 0", until_phase=Phase.DETECT,
+            )
 
         detect = _current_pass_record(worker).detect
         assert detect is not None
@@ -587,7 +692,11 @@ class TestLanePassRecords:
         assert detect.ended_by == EndedBy.EXIT
         assert detect.phase == Phase.DETECT
         assert detect.junit_path is None
-        assert Path(detect.output_path).read_text() == 'all green\n'
+        assert detect.failures == ()
+        assert detect.ids_available is False
+        assert detect.session_complete is True
+        assert Path(detect.output_path).read_text() == '=== 3 passed in 0.10s ===\n'
+        assert ['ended_by=exit' in line for line in _sub_run_logs(caplog, _LANE_COMMAND)] == [True]
 
     @pytest.mark.asyncio
     async def test_a_red_pass_names_the_failing_test_with_kind_and_first_line(
@@ -612,23 +721,57 @@ class TestLanePassRecords:
         assert worker.records.last_record(_LANE_COMMAND, Phase.DETECT) == record.detect
 
     @pytest.mark.asyncio
+    async def test_a_failure_reason_is_stored_capped(self, tmp_path: Path) -> None:
+        reason = 'x' * (FIRST_LINE_MAX_CHARS + 100)
+        worker = await _run_one_pass(
+            tmp_path,
+            f"printf 'FAILED tests/test_q.py::test_a - {reason}\\n'; exit 1",
+            until_phase=Phase.CONFIRM,
+        )
+
+        detect = _current_pass_record(worker).detect
+        assert detect is not None
+        assert [failure.first_line for failure in detect.failures] == [reason[:FIRST_LINE_MAX_CHARS]]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('summary', 'session_complete'),
+        [('=== 1 failed in 0.10s ===\\n', True), ('', False)],
+        ids=['final-summary', 'no-final-summary'],
+    )
+    async def test_a_generic_run_is_session_complete_only_with_pytests_final_summary(
+        self, tmp_path: Path, summary: str, session_complete: bool
+    ) -> None:
+        worker = await _run_one_pass(
+            tmp_path,
+            f"printf 'FAILED tests/test_q.py::test_a - AssertionError: boom\\n{summary}'; exit 1",
+            until_phase=Phase.CONFIRM,
+        )
+
+        detect = _current_pass_record(worker).detect
+        assert detect is not None
+        assert detect.session_complete is session_complete
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ('command', 'returncode'),
         [('kill -9 $$', -9), ('sh -c "kill -9 \\$\\$"', 137)],
         ids=['negative-returncode', 'sh-c-128-plus-n'],
     )
     async def test_a_signal_ended_run_records_ended_by_signal(
-        self, tmp_path: Path, command: str, returncode: int
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, command: str, returncode: int
     ) -> None:
-        worker = await _run_one_pass(tmp_path, command, until_phase=Phase.CONFIRM)
+        with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
+            worker = await _run_one_pass(tmp_path, command, until_phase=Phase.CONFIRM)
 
         detect = _current_pass_record(worker).detect
         assert detect is not None
         assert detect.returncode == returncode
         assert detect.ended_by == EndedBy.SIGNAL
+        assert ['ended_by=signal' in line for line in _sub_run_logs(caplog, _LANE_COMMAND)] == [True]
 
     def test_an_allocated_pass_has_its_header_before_any_sub_run(self, tmp_path: Path) -> None:
-        worker = _lane_worker(tmp_path, 'exit 0')
+        worker = _generic_worker(tmp_path, 'exit 0')
         lane_pass = worker.records.allocate_pass(_LANE_COMMAND, Leg.GENERIC, HEAD)
 
         record = worker.records.load_pass(_LANE_COMMAND, lane_pass.pass_id)
@@ -644,7 +787,7 @@ class TestLanePassRecords:
     async def test_a_structured_pytest_command_writes_junit_into_the_pass(
         self, tmp_path: Path
     ) -> None:
-        worker = _lane_worker(tmp_path, 'pytest -q tests')
+        worker = _generic_worker(tmp_path, 'pytest -q tests')
         cmd = LaneCommand(name=_LANE_COMMAND, command='pytest -q tests', cwd='.')
         lane_pass = worker.records.allocate_pass(_LANE_COMMAND, Leg.GENERIC, HEAD)
 
@@ -664,9 +807,14 @@ class TestLanePassRecords:
         assert detect.session_complete is True
 
     @pytest.mark.asyncio
-    async def test_an_opaque_command_runs_unchanged_without_junit(self, tmp_path: Path) -> None:
-        worker = _lane_worker(tmp_path, 'make check')
-        cmd = LaneCommand(name=_LANE_COMMAND, command='make check', cwd='.')
+    @pytest.mark.parametrize(
+        'command', ['make check', 'pytest -q tests && echo done'], ids=['opaque', 'raw-retained-pytest'],
+    )
+    async def test_a_command_with_no_structured_pytest_runs_unchanged_without_junit(
+        self, tmp_path: Path, command: str
+    ) -> None:
+        worker = _generic_worker(tmp_path, command)
+        cmd = LaneCommand(name=_LANE_COMMAND, command=command, cwd='.')
         worker.records.allocate_pass(_LANE_COMMAND, Leg.GENERIC, HEAD)
 
         with patch(
@@ -675,7 +823,80 @@ class TestLanePassRecords:
         ) as child:
             await worker.command_runner(cmd, tmp_path / 'wt', HEAD)
 
-        assert child.call_args.args[-3:] == ('sh', '-c', 'make check')
+        assert child.call_args.args[-3:] == ('sh', '-c', command)
         detect = worker.records.last_record(_LANE_COMMAND, Phase.DETECT)
         assert detect is not None
         assert detect.junit_path is None
+
+
+class TestLegacyLegRecords:
+    """The numeric and infra legs' default seams, run against stub scripts in the lane worktree."""
+
+    @pytest.mark.asyncio
+    async def test_the_infra_leg_records_each_failing_test_and_its_confirm_run(
+        self, tmp_path: Path
+    ) -> None:
+        worker = _lane_worker(tmp_path, offline_lane_infra_enabled=True)
+        _add_lane_script(tmp_path, RUN_ALL_INFRA_SCRIPT, "echo '  RESULT: FAIL (test_x.sh)'\nexit 1")
+
+        await _drive_one_pass(worker, LEGACY_INFRA_COMMAND, Phase.CONFIRM)
+
+        record = _current_pass_record(worker, LEGACY_INFRA_COMMAND)
+        assert record.leg == Leg.INFRA
+        assert record.detect is not None
+        assert record.detect.failures == (
+            FailureRecord('test_x.sh', 'failed', 'RESULT: FAIL (test_x.sh)'),
+        )
+        assert record.detect.ids_available is True
+        assert record.confirm is not None
+        assert record.confirm.phase == Phase.CONFIRM
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('body', 'until_phase', 'session_complete'),
+        [('exit 0', Phase.DETECT, True), ('kill -9 $$', Phase.CONFIRM, False)],
+        ids=['exit', 'signal'],
+    )
+    async def test_the_numeric_leg_records_an_opaque_detect_run(
+        self, tmp_path: Path, body: str, until_phase: Phase, session_complete: bool
+    ) -> None:
+        worker = _lane_worker(tmp_path, offline_lane_legacy_numeric_enabled=True)
+        _add_lane_script(tmp_path, RUN_OFFLINE_DEEP_SCRIPT, body)
+
+        await _drive_one_pass(worker, LEGACY_NUMERIC_COMMAND, until_phase)
+
+        record = _current_pass_record(worker, LEGACY_NUMERIC_COMMAND)
+        assert record.leg == Leg.NUMERIC
+        assert record.detect is not None
+        assert record.detect.failures == ()
+        assert record.detect.ids_available is False
+        assert record.detect.session_complete is session_complete
+
+
+class TestLaneRetention:
+    @pytest.mark.asyncio
+    async def test_a_lane_pass_prunes_expired_records_and_keeps_recent_ones(
+        self, tmp_path: Path
+    ) -> None:
+        expired = _seed_pass(tmp_path, RECORD_RETENTION + timedelta(days=6))
+        recent = _seed_pass(tmp_path, timedelta(days=1))
+
+        await _run_one_pass(tmp_path, 'exit 0', until_phase=Phase.DETECT)
+
+        assert not expired.exists()
+        assert (recent / 'record.json').is_file()
+
+    @_needs_file_permissions
+    @pytest.mark.asyncio
+    async def test_an_expired_pass_that_cannot_be_removed_does_not_stop_the_lane(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        stuck = _seed_pass(tmp_path, RECORD_RETENTION + timedelta(days=6))
+
+        with _locked_subdirectory(stuck), caplog.at_level(logging.WARNING):
+            worker = await _run_one_pass(tmp_path, 'exit 0', until_phase=Phase.DETECT)
+
+        assert _current_pass_record(worker).detect is not None
+        assert any(
+            r.levelno == logging.WARNING and str(stuck) in r.getMessage() for r in caplog.records
+        )

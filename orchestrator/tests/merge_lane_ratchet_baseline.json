@@ -136,7 +136,7 @@
     "orchestrator/src/orchestrator/merge_skew_tripwire.py": {"cognitive": 0, "external_importers": 2, "function_local_imports": 0, "lines": 12, "prose_lines": 2, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_speculation_controller.py": {"cognitive": 0, "external_importers": 2, "function_local_imports": 0, "lines": 7, "prose_lines": 2, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_types.py": {"cognitive": 0, "external_importers": 72, "function_local_imports": 0, "lines": 12, "prose_lines": 2, "reexport_names": 0},
-    "orchestrator/src/orchestrator/offline_lane.py": {"cognitive": 78, "function_local_imports": 5, "lines": 1135, "prose_lines": 605, "reexport_names": 0},
+    "orchestrator/src/orchestrator/offline_lane.py": {"cognitive": 78, "function_local_imports": 4, "lines": 1135, "prose_lines": 603, "reexport_names": 0},
     "orchestrator/src/orchestrator/recover_main.py": {"cognitive": 3, "function_local_imports": 0, "lines": 79, "prose_lines": 26, "reexport_names": 0},
     "orchestrator/src/orchestrator/warm_lane_pool.py": {"cognitive": 55, "function_local_imports": 0, "lines": 747, "prose_lines": 428, "reexport_names": 0},
     "orchestrator/tests/_merge_queue_harness.py": {"cognitive": 5, "function_local_imports": 0, "lines": 106, "prose_lines": 45, "reexport_names": 0},
