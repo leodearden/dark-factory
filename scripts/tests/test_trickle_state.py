@@ -519,7 +519,8 @@ class TestLoadState:
 
 
 def _record(project_id='dark_factory', *, day=1, hour=3, exit_code=0,
-            applied=0, commit_made=False, budget_suppressed=False, **counters):
+            applied=0, commit_made=False, budget_suppressed=False,
+            capped=False, **counters):
     """Call record_run with a derived-total counter set and an injected
     clock (the module is deliberately clock-injectable — no time faking)."""
     kw = _counters(**counters)
@@ -532,6 +533,7 @@ def _record(project_id='dark_factory', *, day=1, hour=3, exit_code=0,
         applied=applied,
         commit_made=commit_made,
         budget_suppressed=budget_suppressed,
+        capped=capped,
         **kw,
     )
 
@@ -710,6 +712,17 @@ class TestRecordRunFailedStreak:
         assert _record(day=3, exit_code=1, selected_count=6)[
             'last_productive_at'] == stamp
 
+    def test_a_capped_run_never_restamps_last_productive_at(self):
+        """A usage-cap DEFERRED night built digests and coded none of them,
+        so it reads productive while doing nothing."""
+        prod = _record(day=1, selected_count=2)
+        stamp = prod['last_productive_at']
+
+        capped = _record(day=2, capped=True, selected_count=6)
+
+        assert capped['outcome'] == OUTCOME_PRODUCTIVE
+        assert capped['last_productive_at'] == stamp
+
     def test_last_productive_at_stays_none_when_the_first_run_fails(self):
         doc = _record(day=1, exit_code=1, selected_count=6)
         assert doc['last_productive_at'] is None
@@ -850,3 +863,486 @@ class TestRecordedAgeHours:
         verdict while the health probe treats the same input as
         post-worthy."""
         assert trickle_state.recorded_age_hours(doc) is None
+
+
+def _d(day):
+    return date(2026, 7, day)
+
+
+def _fold(backlog, *, target_date, owes_retry, today):
+    return trickle_state.fold_retry_backlog(
+        backlog, target_date=target_date, owes_retry=owes_retry, today=today
+    )
+
+
+def _simulate_outage(outage_nights, *, healthy_nights):
+    """Drive the backlog policy over consecutive nights with no I/O.
+
+    Night ``n`` covers target date ``first + n`` and is recorded the next
+    day. The first ``outage_nights`` scheduled passes are unfinished; each
+    healthy night folds its finished scheduled pass, selects what is due,
+    and folds a finished retry of each selected date. Returns the outage
+    dates, the dates retried in order, every abandoned entry, and the
+    final backlog."""
+    first = _d(1)
+    backlog = {}
+    retried = []
+    abandoned = {}
+    for night in range(outage_nights + healthy_nights):
+        target = first + timedelta(days=night)
+        today = target + timedelta(days=1)
+        healthy = night >= outage_nights
+        fold = _fold(backlog, target_date=target, owes_retry=not healthy,
+                     today=today)
+        backlog = fold.backlog
+        abandoned.update(fold.abandoned)
+        if not healthy:
+            continue
+        for due in trickle_state.select_due_retries(backlog, today=today):
+            fold = _fold(backlog, target_date=due, owes_retry=False,
+                         today=today)
+            backlog = fold.backlog
+            abandoned.update(fold.abandoned)
+            retried.append(due)
+    outage = [first + timedelta(days=n) for n in range(outage_nights)]
+    return outage, retried, abandoned, backlog
+
+
+class TestRetryBacklogPolicy:
+    """The retry-backlog policy as pure functions: no filesystem, no
+    clock. A date is owed a retry when its pass did not finish and
+    committed nothing; the backlog is bounded by age and by attempts."""
+
+    @pytest.mark.parametrize('exit_code, capped, expected', [
+        pytest.param(0, False, True, id='clean'),
+        pytest.param(1, False, False, id='failed'),
+        pytest.param(137, False, False, id='killed'),
+        pytest.param(-1, False, False, id='signalled'),
+        pytest.param(0, True, False, id='capped'),
+        pytest.param(1, True, False, id='failed-and-capped'),
+    ])
+    def test_finished_means_a_clean_exit_that_was_not_capped(
+        self, exit_code, capped, expected
+    ):
+        assert trickle_state.finished(
+            exit_code=exit_code, capped=capped) is expected
+
+    @pytest.mark.parametrize('exit_code, capped, expected', [
+        pytest.param(0, False, False, id='finished'),
+        pytest.param(1, False, True, id='failed'),
+        pytest.param(0, True, True, id='capped'),
+    ])
+    def test_an_unfinished_pass_that_committed_nothing_owes_a_retry(
+        self, exit_code, capped, expected
+    ):
+        assert trickle_state.owes_retry(
+            exit_code=exit_code, capped=capped, commit_made=False
+        ) is expected
+
+    @pytest.mark.parametrize('exit_code, capped', [
+        pytest.param(1, False, id='failed'),
+        pytest.param(0, True, id='capped'),
+        pytest.param(0, False, id='finished'),
+    ])
+    def test_a_pass_that_committed_never_owes_a_retry(self, exit_code, capped):
+        assert trickle_state.owes_retry(
+            exit_code=exit_code, capped=capped, commit_made=True
+        ) is False
+
+    def test_an_unfinished_pass_adds_its_date_with_one_attempt(self):
+        fold = _fold({}, target_date=_d(1), owes_retry=True, today=_d(2))
+
+        assert fold.backlog == {_d(1): 1}
+        assert fold.abandoned == {}
+
+    def test_an_unfinished_pass_on_an_owed_date_increments_it(self):
+        fold = _fold({_d(1): 1}, target_date=_d(1), owes_retry=True,
+                     today=_d(3))
+
+        assert fold.backlog == {_d(1): 2}
+
+    def test_a_finished_pass_removes_its_own_date_and_carries_the_rest(self):
+        backlog = {_d(1): 1, _d(2): 2}
+
+        own = _fold(backlog, target_date=_d(1), owes_retry=False, today=_d(4))
+        other = _fold(backlog, target_date=_d(3), owes_retry=False,
+                      today=_d(4))
+
+        assert own.backlog == {_d(2): 2}
+        assert other.backlog == backlog
+        assert own.abandoned == other.abandoned == {}
+
+    def test_a_fold_never_mutates_its_input(self):
+        backlog = {_d(1): 1, _d(2): 1}
+        snapshot = dict(backlog)
+
+        _fold(backlog, target_date=_d(1), owes_retry=True, today=_d(3))
+        _fold(backlog, target_date=_d(2), owes_retry=False, today=_d(3))
+        _fold(backlog, target_date=_d(1), owes_retry=False, today=_d(30))
+
+        assert backlog == snapshot
+
+    def test_an_entry_older_than_the_window_is_abandoned(self):
+        today = _d(20)
+        max_age = trickle_state.RETRY_MAX_AGE_DAYS
+        too_old = today - timedelta(days=max_age + 1)
+        at_the_edge = today - timedelta(days=max_age)
+
+        backlog, abandoned = _fold(
+            {too_old: 2, at_the_edge: 1},
+            target_date=_d(19), owes_retry=False, today=today,
+        )
+
+        assert backlog == {at_the_edge: 1}
+        assert abandoned == {too_old: 2}
+
+    def test_an_entry_reaching_the_attempt_bound_is_abandoned(self):
+        max_attempts = trickle_state.RETRY_MAX_ATTEMPTS
+
+        fold = _fold({_d(1): max_attempts - 1}, target_date=_d(1),
+                     owes_retry=True, today=_d(3))
+
+        assert fold.backlog == {}
+        assert fold.abandoned == {_d(1): max_attempts}
+
+    def test_due_retries_are_oldest_first_and_at_most_the_limit(self):
+        backlog = {_d(5): 1, _d(3): 2, _d(4): 1}
+        select = trickle_state.select_due_retries
+
+        assert select(backlog, today=_d(6)) == (_d(3),)
+        assert select(backlog, today=_d(6), limit=2) == (_d(3), _d(4))
+        assert select(backlog, today=_d(6), limit=9) == (_d(3), _d(4), _d(5))
+
+    def test_an_entry_outside_the_window_is_never_due(self):
+        today = _d(20)
+        max_age = trickle_state.RETRY_MAX_AGE_DAYS
+        too_old = today - timedelta(days=max_age + 1)
+        at_the_edge = today - timedelta(days=max_age)
+
+        due = trickle_state.select_due_retries(
+            {too_old: 1, at_the_edge: 1}, today=today, limit=5)
+
+        assert due == (at_the_edge,)
+
+    def test_an_empty_backlog_has_nothing_due(self):
+        assert trickle_state.select_due_retries({}, today=_d(2)) == ()
+
+    def test_an_outage_one_night_shorter_than_the_window_is_fully_recovered(
+        self,
+    ):
+        nights = trickle_state.RETRY_MAX_AGE_DAYS - 1
+
+        outage, retried, abandoned, backlog = _simulate_outage(
+            nights, healthy_nights=nights + 2)
+
+        assert retried == outage
+        assert abandoned == {}
+        assert backlog == {}
+
+    def test_a_longer_outage_loses_only_the_dates_the_window_cannot_reach(
+        self,
+    ):
+        nights = trickle_state.RETRY_MAX_AGE_DAYS + 2
+        lost = nights - (trickle_state.RETRY_MAX_AGE_DAYS - 1)
+
+        outage, retried, abandoned, backlog = _simulate_outage(
+            nights, healthy_nights=nights + 2)
+
+        assert abandoned == {d: 1 for d in outage[:lost]}
+        assert retried == outage[lost:]
+        assert backlog == {}
+
+    def test_a_poison_date_is_abandoned_after_the_attempt_bound(self):
+        poison = _d(1)
+        backlog = _fold({}, target_date=poison, owes_retry=True,
+                        today=_d(2)).backlog
+        unfinished_passes = 1
+        abandoned = {}
+        for night in range(2, 12):
+            today = _d(night + 1)
+            backlog = _fold(backlog, target_date=_d(night), owes_retry=False,
+                            today=today).backlog
+            if not trickle_state.select_due_retries(backlog, today=today):
+                break
+            backlog, abandoned = _fold(backlog, target_date=poison,
+                                       owes_retry=True, today=today)
+            unfinished_passes += 1
+
+        assert abandoned == {poison: trickle_state.RETRY_MAX_ATTEMPTS}
+        assert unfinished_passes == trickle_state.RETRY_MAX_ATTEMPTS
+        assert backlog == {}
+
+    @pytest.mark.parametrize('raw', [
+        pytest.param(None, id='None'),
+        pytest.param([['2026-07-01', 1]], id='a-list'),
+        pytest.param('2026-07-01', id='a-string'),
+        pytest.param(3, id='an-int'),
+    ])
+    def test_parsing_a_non_mapping_gives_an_empty_backlog(self, raw):
+        assert trickle_state.parse_retry_backlog(raw) == {}
+
+    def test_parsing_drops_every_invalid_entry_and_keeps_the_rest(self):
+        raw = {
+            '2026-07-01': 2,
+            'not-a-date': 1,
+            '2026-02-30': 1,
+            '2026-07-02': 0,
+            '2026-07-03': -1,
+            '2026-07-04': True,
+            '2026-07-05': '1',
+            '2026-07-06': 1.0,
+        }
+
+        assert trickle_state.parse_retry_backlog(raw) == {_d(1): 2}
+
+    def test_a_serialized_fold_round_trips_through_the_parser(self):
+        fold = _fold({_d(1): 2}, target_date=_d(3), owes_retry=True,
+                     today=_d(4))
+        serialized = {d.isoformat(): n for d, n in fold.backlog.items()}
+
+        parsed = trickle_state.parse_retry_backlog(
+            json.loads(json.dumps(serialized)))
+
+        assert parsed == fold.backlog == {_d(1): 2, _d(3): 1}
+
+
+def _warnings_naming(caplog, text):
+    return [
+        r for r in caplog.records
+        if r.levelname == 'WARNING' and text in r.getMessage()
+    ]
+
+
+def _without_backlog(doc):
+    return {k: v for k, v in doc.items() if k != 'retry_backlog'}
+
+
+class TestRecordRunRetryBacklog:
+    """record_run folds each scheduled pass into the document's additive
+    ``retry_backlog`` ({ISO date: unfinished attempts})."""
+
+    @pytest.fixture(autouse=True)
+    def _state_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
+
+    def test_a_failed_run_owes_its_own_date_and_a_repeat_counts_again(self):
+        first = _record(day=1, exit_code=1, selected_count=6)
+        again = _record(day=1, exit_code=1, selected_count=6)
+
+        assert first['retry_backlog'] == {'2026-07-01': 1}
+        assert again['retry_backlog'] == {'2026-07-01': 2}
+
+    def test_a_capped_run_owes_its_date_and_records_capped(self):
+        capped = _record(day=1, capped=True, zero_signal_dropped=2)
+
+        assert capped['exit_code'] == 0
+        assert capped['capped'] is True
+        assert capped['retry_backlog'] == {'2026-07-01': 1}
+
+    def test_a_normal_run_records_capped_false_and_owes_nothing(self):
+        doc = _record(day=1, selected_count=1)
+
+        assert doc['capped'] is False
+        assert doc['retry_backlog'] == {}
+
+    def test_a_run_that_committed_never_owes_its_date(self):
+        doc = _record(day=1, exit_code=1, selected_count=6, commit_made=True)
+
+        assert doc['retry_backlog'] == {}
+
+    def test_a_finished_run_clears_its_own_date_and_carries_the_rest(self):
+        _record(day=1, exit_code=1)
+        _record(day=2, exit_code=1)
+
+        cleared = _record(day=1, selected_count=1)
+        carried = _record(day=3, selected_count=1)
+
+        assert cleared['retry_backlog'] == {'2026-07-02': 1}
+        assert carried['retry_backlog'] == {'2026-07-02': 1}
+
+    def test_an_entry_past_the_window_is_pruned_with_one_warning(self, caplog):
+        _record(day=1, exit_code=1)
+
+        with caplog.at_level('WARNING'):
+            doc = _record(day=2 + trickle_state.RETRY_MAX_AGE_DAYS,
+                          selected_count=1)
+
+        assert doc['retry_backlog'] == {}
+        assert len(_warnings_naming(caplog, '2026-07-01')) == 1
+
+    def test_a_document_without_a_backlog_reads_ok_and_starts_one(
+        self, caplog
+    ):
+        path = trickle_state.trickle_state_path('dark_factory')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            'schema_version': trickle_state.STATE_SCHEMA_VERSION,
+            'project_id': 'dark_factory',
+            'outcome': OUTCOME_PRODUCTIVE,
+            'consecutive_barren_runs': 0,
+            'consecutive_failed_runs': 0,
+        }))
+
+        with caplog.at_level('WARNING'):
+            status, _ = trickle_state.load_state(path)
+            doc = _record(day=2, exit_code=1)
+
+        assert status == 'ok'
+        assert not [r for r in caplog.records if r.levelname == 'WARNING']
+        assert doc['retry_backlog'] == {'2026-07-02': 1}
+
+    @pytest.mark.parametrize('garbage', [
+        pytest.param(['2026-07-01'], id='a-list'),
+        pytest.param({'yesterday': 1, '2026-07-01': 'x'}, id='bad-entries'),
+        pytest.param('2026-07-01', id='a-string'),
+    ])
+    def test_a_garbage_backlog_is_dropped_never_raised(self, garbage):
+        doc = _record(day=1, selected_count=1)
+        path = trickle_state.trickle_state_path('dark_factory')
+        path.write_text(json.dumps({**doc, 'retry_backlog': garbage}))
+
+        after = _record(day=2, exit_code=1)
+
+        assert after['retry_backlog'] == {'2026-07-02': 1}
+
+
+def _retry(project_id='dark_factory', *, day, recorded_day, exit_code=0,
+           capped=False, commit_made=False):
+    return trickle_state.record_retry(
+        project_id,
+        target_date=date(2026, 7, day),
+        recorded_at=datetime(2026, 7, recorded_day, 3, 30, 0, tzinfo=UTC),
+        exit_code=exit_code,
+        capped=capped,
+        commit_made=commit_made,
+    )
+
+
+def _retried(**kwargs) -> dict:
+    """:func:`_retry` over a readable predecessor, so a document is written."""
+    doc = _retry(**kwargs)
+    assert doc is not None, 'record_retry wrote nothing'
+    return doc
+
+
+class TestRecordRetry:
+    """record_retry rewrites ONLY ``retry_backlog``: the rest of the
+    document keeps describing the scheduled night."""
+
+    @pytest.fixture(autouse=True)
+    def _state_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
+
+    def test_a_finished_retry_clears_its_date_and_changes_nothing_else(self):
+        _record(day=1, exit_code=1, selected_count=6)
+        scheduled = _record(day=2, selected_count=1)
+
+        retried = _retried(day=1, recorded_day=2)
+
+        path = trickle_state.trickle_state_path('dark_factory')
+        assert json.loads(path.read_text()) == retried
+        assert scheduled['retry_backlog'] == {'2026-07-01': 1}
+        assert retried['retry_backlog'] == {}
+        assert _without_backlog(retried) == _without_backlog(scheduled)
+
+    def test_an_unfinished_retry_counts_an_attempt(self):
+        _record(day=1, exit_code=1)
+        scheduled = _record(day=2, selected_count=1)
+
+        retried = _retried(day=1, recorded_day=2, exit_code=1)
+
+        assert retried['retry_backlog'] == {'2026-07-01': 2}
+        assert _without_backlog(retried) == _without_backlog(scheduled)
+
+    def test_a_capped_retry_counts_an_attempt(self):
+        _record(day=1, exit_code=1)
+        _record(day=2, selected_count=1)
+
+        retried = _retried(day=1, recorded_day=2, capped=True)
+
+        assert retried['retry_backlog'] == {'2026-07-01': 2}
+
+    def test_the_attempt_bound_abandons_the_date_with_one_warning(
+        self, caplog
+    ):
+        _record(day=1, exit_code=1)
+        _record(day=2, selected_count=1)
+        unfinished = trickle_state.RETRY_MAX_ATTEMPTS - 1
+
+        with caplog.at_level('WARNING'):
+            for night in range(unfinished):
+                doc = _retried(day=1, recorded_day=2 + night, exit_code=1)
+
+        assert doc['retry_backlog'] == {}
+        assert len(_warnings_naming(caplog, '2026-07-01')) == 1
+
+    def test_with_no_predecessor_nothing_is_written(self, caplog):
+        path = trickle_state.trickle_state_path('dark_factory')
+
+        with caplog.at_level('WARNING'):
+            doc = _retry(day=1, recorded_day=2)
+
+        assert doc is None
+        assert not path.exists()
+        assert len(_warnings_naming(caplog, '2026-07-01')) == 1
+
+    def test_with_a_corrupt_predecessor_nothing_is_written(self, caplog):
+        path = trickle_state.trickle_state_path('dark_factory')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'{corrupt')
+
+        with caplog.at_level('WARNING'):
+            doc = _retry(day=1, recorded_day=2)
+
+        assert doc is None
+        assert path.read_bytes() == b'{corrupt'
+        assert len(_warnings_naming(caplog, '2026-07-01')) == 1
+
+    def test_the_write_is_atomic_and_leaves_no_tmp_file(self):
+        _record(day=1, exit_code=1)
+        _record(day=2, selected_count=1)
+
+        _retry(day=1, recorded_day=2)
+
+        state_dir = trickle_state.trickle_state_path('dark_factory').parent
+        assert [p.name for p in state_dir.iterdir()] == [
+            trickle_state.STATE_FILENAME
+        ]
+
+
+class TestDueRetries:
+    """``due_retries(doc, *, today)`` — the reader the nightly calls, so the
+    backlog's field name and encoding stay inside trickle_state."""
+
+    @pytest.fixture(autouse=True)
+    def _state_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
+
+    def test_a_recorded_failed_night_is_due_after_a_productive_one(self):
+        _record(day=1, exit_code=1, selected_count=6)
+        doc = _record(day=2, selected_count=1)
+
+        assert trickle_state.due_retries(doc, today=_d(3)) == (_d(1),)
+
+    def test_several_owed_dates_give_the_oldest_up_to_the_nightly_limit(self):
+        _record(day=1, exit_code=1)
+        _record(day=2, exit_code=1)
+        doc = _record(day=3, selected_count=1)
+
+        due = trickle_state.due_retries(doc, today=_d(4))
+
+        assert due == (_d(1), _d(2))[:trickle_state.RETRIES_PER_NIGHT]
+
+    @pytest.mark.parametrize('doc', [
+        pytest.param(None, id='None'),
+        pytest.param(['2026-07-01'], id='not-a-dict'),
+        pytest.param({'outcome': OUTCOME_PRODUCTIVE}, id='no-backlog-key'),
+        pytest.param({'retry_backlog': 'garbage'}, id='garbage-backlog'),
+        pytest.param(
+            {'retry_backlog': {'2026-07-01': 1}}, id='outside-the-window'
+        ),
+    ])
+    def test_nothing_is_due_from_what_owes_nothing_today(self, doc):
+        today = _d(1) + timedelta(days=trickle_state.RETRY_MAX_AGE_DAYS + 1)
+
+        assert trickle_state.due_retries(doc, today=today) == ()

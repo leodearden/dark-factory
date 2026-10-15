@@ -2436,7 +2436,9 @@ exhaustions, each prefixed with the label:
   headroom`, where each per-digest reason reads `<label>: all 7 pool accounts
   capped`. The run exits **0**: a deferral rather than an incident (task
   4736), with a WARNING-level escalation. It self-clears at the weekly reset,
-  so there is nothing to do.
+  and the deferred date is retried automatically once a night finishes (see
+  "Retried nights" under "Legibility trickle health probe (04:30)"), so there
+  is nothing to do.
 - `<label>: no pool accounts resolved — check that the unit's EnvironmentFile
   supplies the CLAUDE_OAUTH_TOKEN_* vars named in config/usage-accounts.yaml`.
   This is a config fault and will never clear on its own. It is paired with a
@@ -2569,6 +2571,21 @@ is how an operator ends up tuning the sampler for a crashed coder:
 - **`missing` / `malformed` / stale** — the recorder itself stopped. The
   nightly is not writing state at all, so neither streak means anything yet.
 - **`quiet`** — a legitimately quiet night. Never alarms, by construction.
+
+**Retried nights** (task 5678). A night that did not finish (a non-zero exit,
+or a usage-cap DEFERRED night) leaves its date in the `retry_backlog` key of
+`trickle-state.json`, as `{date: unfinished attempts}`. A DEFERRED night
+records `capped: true` and still reads `productive`, since its digests were
+built, but it leaves `last_productive_at` unchanged, since it coded nothing.
+The next night whose own pass finishes runs one extra pass for the oldest
+owed date, with its own byte budget. That pass skips sessions the session
+ledger already holds and never launches a census. It rewrites only `retry_backlog`, so the rest of the
+file, and the progress probe's verdict, still describe the scheduled night. A
+failed retry exits the unit non-zero, exactly like a failed night. In the
+journal, grep `retrying <date> from the retry backlog`, and the WARNING
+`abandoning <date>`: a date past `RETRY_MAX_AGE_DAYS` or `RETRY_MAX_ATTEMPTS`
+(`scripts/legibility/trickle_state.py`) is dropped from the backlog. Its
+sessions stay minable by the census within `census.ledger_retention_days`.
 
 **The escalation it files.** `task_id=legibility-trickle-health-<project_id>`
 (deliberately distinct from the nightly's own
