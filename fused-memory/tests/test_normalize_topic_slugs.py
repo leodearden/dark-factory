@@ -2713,10 +2713,10 @@ class TestPartialUngatedGroup:
     """
 
     @staticmethod
-    def _plain_group(gate_tasks=()) -> object:
+    def _plain_group(gate_tasks=(), *, members: int = 2) -> object:
         return _one_group([
-            _mod.Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic'),
-            _mod.Rename('dark_factory', 'm2', 'plain_topic', 'plain-topic'),
+            _mod.Rename('dark_factory', f'm{n}', 'plain_topic', 'plain-topic')
+            for n in range(1, members + 1)
         ], gate_tasks)
 
     @staticmethod
@@ -2746,6 +2746,7 @@ class TestPartialUngatedGroup:
             self._plain_group(), self._plain_results('would_rename', 'rename_error'))
 
         assert entry['stood_memory_ids'] == ['m1']
+        assert entry['failed_memory_ids'] == ['m2']
         assert entry['failed_outcomes'] == ['rename_error']
         assert 'predicted' in entry['note']
 
@@ -2753,12 +2754,45 @@ class TestPartialUngatedGroup:
         pytest.param([_gate_task('4220', 'plain_topic')], ('renamed', 'update_failed'), id='gated'),
         pytest.param([], ('renamed', 'already_normalized'), id='all_stood'),
         pytest.param([], ('update_failed', 'rename_error'), id='none_stood'),
-        pytest.param([], ('renamed', 'memory_not_found'), id='straggler_gone'),
-        pytest.param([], ('renamed', 'topic_moved_since_plan'), id='straggler_on_a_third_value'),
+        pytest.param([], ('renamed', 'memory_not_found'), id='straggler_vanished'),
+        pytest.param([], ('renamed', 'topic_moved_since_plan'), id='straggler_moved_elsewhere'),
     ])
     def test_no_entry_unless_an_ungated_slug_is_split(self, gate_tasks, outcomes):
         assert _mod.describe_partial_ungated_group(
             self._plain_group(gate_tasks), self._plain_results(*outcomes)) is None
+
+    def test_only_the_members_left_on_the_legacy_value_are_listed_as_failed(self):
+        entry = _mod.describe_partial_ungated_group(
+            self._plain_group(members=3),
+            self._plain_results('renamed', 'update_failed', 'memory_not_found'))
+
+        assert entry['stood_memory_ids'] == ['m1']
+        assert entry['failed_memory_ids'] == ['m2']
+        assert entry['failed_outcomes'] == ['update_failed']
+
+    @pytest.mark.asyncio
+    async def test_a_straggler_that_moved_elsewhere_is_reported_only_in_its_own_bucket(self):
+        service, corpus = _run_service({'dark_factory': [
+            _crec('m1', 'legacy_topic'), _crec('m2', 'legacy_topic'),
+        ]})
+        forward = service.get_memory_by_id.side_effect
+
+        async def _read(**kwargs):
+            record = await forward(**kwargs)
+            if kwargs['memory_id'] == 'm2':
+                record['metadata']['topic'] = 'someone-else-set-this'
+            return record
+
+        service.get_memory_by_id = AsyncMock(side_effect=_read)
+
+        report = await run_sweep(service, projects=('dark_factory',), apply=True)
+
+        assert report['skips']['ungated_partial_rename'] == []
+        assert 'ungated_partial_rename' not in report['outcomes']
+        assert [e['memory_id'] for e in report['skips']['topic_moved_since_plan']] == ['m2']
+        assert corpus.topic_of('dark_factory', 'm1') == 'legacy-topic'
+        section = _bucket_section(_mod.render_markdown(report), 'ungated_partial_rename')
+        assert "'m2'" not in section
 
     @pytest.mark.asyncio
     async def test_a_split_slug_is_reported_and_a_re_run_refuses_the_straggler(self):
