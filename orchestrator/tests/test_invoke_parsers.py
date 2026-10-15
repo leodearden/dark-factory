@@ -229,6 +229,70 @@ class TestParseCodexOutputUnknownModelFallback:
         assert agent_result.cost_usd == pytest.approx((200 * 2.0 + 100 * 8.0) / 1_000_000)
 
 
+# Measured verbatim from codex-cli 0.154.0 on 2026-09-11, carried by both an
+# `error` and a `turn.failed` event while `codex exec` exited 0.
+_CODEX_USAGE_LIMIT_MESSAGE = (
+    "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), "
+    'visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 1:07 PM.'
+)
+# A codex-cli 0.154.0 binary string: an item-level `error` is a warning the
+# run continues past ("Defaulting to fallback metadata"), not a failure.
+_CODEX_MODEL_METADATA_WARNING = (
+    'Model metadata for `gpt-6-astra` not found. Defaulting to fallback metadata; '
+    'this can degrade performance and cause issues.'
+)
+
+
+def _codex_stream(*events: dict[str, Any]) -> _SubprocessResult:
+    return _make_subprocess_result(stdout='\n'.join(json.dumps(e) for e in events), returncode=0)
+
+
+class TestParseCodexErrorCarriers:
+    """codex exits 0 on a failed turn, so the failure lives only in the JSONL
+    stream: `turn.failed` and item-level `error` events must not be dropped."""
+
+    def test_lone_turn_failed_is_a_failure_carrying_its_message(self) -> None:
+        agent_result = _parse_codex_output(_codex_stream(
+            {'type': 'thread.started', 'thread_id': 'tid-tf-1'},
+            {'type': 'turn.started'},
+            {'type': 'turn.failed', 'error': {'message': _CODEX_USAGE_LIMIT_MESSAGE}},
+        ), 'gpt-6-astra')
+
+        assert agent_result.success is False
+        assert _CODEX_USAGE_LIMIT_MESSAGE in agent_result.output
+
+    def test_item_level_error_text_is_surfaced(self) -> None:
+        agent_result = _parse_codex_output(_codex_stream(
+            {'type': 'thread.started', 'thread_id': 'tid-ie-1'},
+            {'type': 'item.completed', 'item': {'type': 'error', 'message': _CODEX_MODEL_METADATA_WARNING}},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'done'}},
+            {'type': 'turn.completed', 'usage': {'input_tokens': 10, 'output_tokens': 5}},
+        ), 'gpt-6-astra')
+
+        assert _CODEX_MODEL_METADATA_WARNING in agent_result.output
+
+    def test_item_level_error_alone_does_not_fail_a_completed_turn(self) -> None:
+        agent_result = _parse_codex_output(_codex_stream(
+            {'type': 'thread.started', 'thread_id': 'tid-ie-2'},
+            {'type': 'item.completed', 'item': {'type': 'error', 'message': _CODEX_MODEL_METADATA_WARNING}},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'done'}},
+            {'type': 'turn.completed', 'usage': {'input_tokens': 10, 'output_tokens': 5}},
+        ), 'gpt-6-astra')
+
+        assert agent_result.success is True
+
+    def test_measured_error_and_turn_failed_pair_reports_the_message_once(self) -> None:
+        agent_result = _parse_codex_output(_codex_stream(
+            {'type': 'thread.started', 'thread_id': 'tid-pair-1'},
+            {'type': 'turn.started'},
+            {'type': 'error', 'message': _CODEX_USAGE_LIMIT_MESSAGE},
+            {'type': 'turn.failed', 'error': {'message': _CODEX_USAGE_LIMIT_MESSAGE}},
+        ), 'gpt-6-astra')
+
+        assert agent_result.success is False
+        assert agent_result.output.count(_CODEX_USAGE_LIMIT_MESSAGE) == 1
+
+
 class TestPiToolName:
     """`_pi_tool_name` maps a Claude-style tool spec to pi's direct-tool
     name (spike Q3, live-confirmed against pi-mcp-adapter's
