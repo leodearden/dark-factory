@@ -2,7 +2,8 @@
 
 Spawned per-agent invocation by the orchestrator.  The architect agent
 builds plans via ``create_plan`` / ``add_plan_step`` / etc., and the
-implementer marks steps done via ``mark_step_done``.  On revalidation
+implementer marks steps done via ``mark_step_done`` and records where a
+step's text proved wrong via ``record_step_deviation``.  On revalidation
 (blast-radius requeue), the architect uses ``update_plan_metadata``,
 ``remove_plan_step``, ``replace_plan_step``, and ``confirm_plan`` to
 update an existing plan without recreating it from scratch.  All writes
@@ -97,6 +98,7 @@ from shared.mcp_markup_middleware import (
     RepairPolicy,
     accepts_markup_override,
 )
+from shared.plan_deviation import DeviationRecord, UnknownDeviationKind
 from shared.toolcall_markup import detect_for, repair
 
 from orchestrator.artifacts import TaskArtifacts
@@ -1384,6 +1386,64 @@ def _mark_step_done(
     )
 
 
+def _deviation_recorder(artifacts: TaskArtifacts, plan: dict) -> str | None:
+    """The plan-tools session identity in hand: the agent sidecar's, else the plan's."""
+    session = artifacts.read_agent_session()
+    if session is not None and session.session_id:
+        return session.session_id
+    plan_session = plan.get('_session_id')
+    if isinstance(plan_session, str) and plan_session:
+        return plan_session
+    return None
+
+
+def _record_step_deviation(
+    artifacts: TaskArtifacts,
+    step_id: str,
+    kind: str,
+    observed: str,
+    expected: str,
+    action_taken: str,
+    prose_only: bool = False,
+    note: str = '',
+) -> dict[str, Any]:
+    plan, markup_facts = _read_plan_repaired(artifacts)
+    if not plan:
+        return {'status': 'error', 'message': 'No plan exists.'}
+
+    try:
+        record = DeviationRecord(
+            kind=kind,
+            observed=observed,
+            expected=expected,
+            action_taken=action_taken,
+            prose_only=prose_only,
+            note=note,
+            recorded_at=datetime.now(UTC).isoformat(),
+            recorded_by=_deviation_recorder(artifacts, plan),
+        )
+    except UnknownDeviationKind as exc:
+        return _with_markup_repairs(
+            {
+                'status': 'error',
+                'message': str(exc),
+                'kind': exc.kind,
+                'allowed_kinds': list(exc.allowed),
+            },
+            markup_facts,
+        )
+
+    count = artifacts.append_step_deviation(step_id, record)
+    if count is None:
+        return _with_markup_repairs(
+            {'status': 'error', 'message': f'Step {step_id!r} not found in plan.'},
+            markup_facts,
+        )
+    return _with_markup_repairs(
+        {'status': 'ok', 'step_id': step_id, 'deviations': count}, markup_facts
+    )
+
+
 # ---------------------------------------------------------------------------
 # Revalidation helpers
 # ---------------------------------------------------------------------------
@@ -2345,6 +2405,43 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
                 reachable from HEAD on the current branch.
         """
         return _mark_step_done(artifacts, step_id, commit_sha)
+
+    @mcp.tool()
+    @accepts_markup_override
+    def record_step_deviation(
+        step_id: str,
+        kind: str,
+        observed: str,
+        expected: str,
+        action_taken: str,
+        prose_only: bool = False,
+        note: str = '',
+    ) -> dict[str, Any]:
+        """Record that a plan step's text proved wrong at execution time.
+
+        State what you observed, what the step expected, and what you did.
+        Allowed on a step or prerequisite in any status, including after
+        ``mark_step_done``. Never changes the step's status, commit or
+        description.
+
+        Args:
+            step_id: The step or prerequisite ID (e.g. "step-1", "pre-1").
+            kind: One of the closed vocabulary
+                ``shared.plan_deviation.DEVIATION_KINDS``. An unknown kind is
+                refused, and the refusal lists every valid kind.
+            observed: What you actually found.
+            expected: What the step's text said or assumed.
+            action_taken: What you did about it.
+            prose_only: True when the claim is destined for a docstring,
+                CHANGELOG or SKILL.md.
+            note: Anything else a later reader needs.
+        """
+        # Flat str/bool parameters DELIBERATELY, as drop_plan_file: only flat
+        # strings get MarkupGuardMiddleware's inbound coverage.
+        return _record_step_deviation(
+            artifacts, step_id, kind, observed, expected, action_taken,
+            prose_only, note,
+        )
 
     @mcp.tool()
     @accepts_markup_override
