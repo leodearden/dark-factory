@@ -2941,6 +2941,38 @@ class TestUpdateMemoryStormFilesIntoTheProjectQueue:
             for record in caplog.records
         ), [record.getMessage() for record in caplog.records]
 
+    @pytest.mark.asyncio
+    async def test_one_agent_amending_in_two_projects_files_a_per_project_count(
+        self, mock_config, tmp_path,
+    ):
+        """A recon stage id carries no project, so one agent amends in many.
+
+        The count filed into a project's queue must be reproducible from that
+        project's own journal rows, never pooled across projects.
+        """
+        root_a = tmp_path / 'a'
+        root_b = tmp_path / 'b'
+        root_a.mkdir()
+        root_b.mkdir()
+        service = _mocked_service(mock_config)
+        service.config.mem0_update.storm_threshold = 3
+        service.set_known_projects({'proj_a': str(root_a), 'proj_b': str(root_b)})
+
+        await self._amend(service, 'proj_a', times=2)
+        await self._amend(service, 'proj_b', times=2)
+
+        assert self._filed(root_a) == []
+        assert self._filed(root_b) == []
+
+        await self._amend(service, 'proj_b', times=1)
+
+        filed = self._filed(root_b)
+        assert len(filed) == 1, filed
+        assert 'count=3' in filed[0]['detail'].splitlines()
+        assert 'proj_b' in filed[0]['summary']
+        assert self._filed(root_a) == []
+        assert service.mem0_update_storm_tracked_agents == frozenset({self.AGENT})
+
 
 class TestUpdateEdgeVerification:
     """Tests for the post-write persistence verification in update_edge (Guard 2)."""
