@@ -138,7 +138,7 @@ def test_the_timeout_names_the_lock_and_the_wait(lock_path: Path) -> None:
         pass
 
     error = caught.value
-    assert isinstance(error, TimeoutError)
+    assert not isinstance(error, OSError), 'an `except OSError` would read a lock timeout as an IO failure'
     assert error.lock_path == lock_path
     assert error.timeout == _SHORT_SECS
     assert str(lock_path) in str(error)

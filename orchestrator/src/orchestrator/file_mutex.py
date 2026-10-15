@@ -24,7 +24,10 @@ from pathlib import Path
 _POLL_INTERVAL_SECS = 0.01
 
 
-class FileMutexTimeout(TimeoutError):
+class FileMutexTimeout(RuntimeError):
+    """Not a ``TimeoutError``: that is an ``OSError``, and every ``except OSError``
+    around plan I/O would then report a deadlock-class signal as a disk failure."""
+
     def __init__(self, lock_path: Path, timeout: float) -> None:
         self.lock_path = lock_path
         self.timeout = timeout
