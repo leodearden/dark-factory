@@ -8,17 +8,21 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import yaml
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
 import dashboard.data.active_tasks as active_tasks
 import dashboard.data.task_snapshot as task_snapshot
 from dashboard.config import DashboardConfig
+from dashboard.data import escalation_corpus
 from dashboard.data.active_tasks import (
     collect_census_snapshots,
     collect_tasks_with_counts,
     shape_terminal_rows,
 )
 from dashboard.data.datum import Datum, DatumState
+from dashboard.data.escalation_corpus import QueueKind, corpus_queues
+from dashboard.data.root_invariants import RootInvariants, ScanStatus
 from dashboard.data.scheduler import collect_scheduler_state
 from dashboard.data.task_snapshot import (
     FRESHNESS_BOUND_SECONDS,
@@ -310,3 +314,53 @@ class TestSchedulerCollector:
         )
 
         assert [(row['project'], row['task_id']) for row in rows] == [('m/T-x/proj', '5')]
+
+
+def _write_orchestrator_config(root: Path, escalation_port: int) -> None:
+    (root / 'dark-factory-orchestrator.yaml').write_text(
+        yaml.safe_dump({'escalation': {'port': escalation_port}}),
+    )
+
+
+def test_each_orchestrator_queue_is_labelled_by_its_escalation_url_key(roots):
+    a, b = roots
+    _write_orchestrator_config(a, 9101)
+    _write_orchestrator_config(b, 9102)
+    config = DashboardConfig(project_root=a, known_project_roots=[b])
+
+    queue_labels = {
+        queue.label for queue in corpus_queues(config) if queue.kind is QueueKind.ORCHESTRATOR
+    }
+
+    assert queue_labels == {A_LABEL, B_LABEL} == set(config.escalation_urls)
+
+
+def test_each_roots_invariants_record_names_its_own_project(config, roots):
+    records = [
+        RootInvariants(
+            root=root, status=ScanStatus.BLIND, measured_at=_NOW, rows_scanned=None,
+            error='x', terminal_tier=None, hygiene_tier=None, chains=None,
+        )
+        for root in roots
+    ]
+
+    assert [record.to_wire(config.project_labels)['project'] for record in records] == [
+        A_LABEL, B_LABEL,
+    ]
+
+
+def test_the_invariants_route_names_each_root_by_its_own_label(client, roots):
+    a, b = roots
+    escalation_corpus._corpus_cache_clear()
+    try:
+        client.app.state.config = dataclasses.replace(
+            client.app.state.config, project_root=a, known_project_roots=[b],
+        )
+        resp = client.get('/api/v2/dashboard/invariants')
+    finally:
+        escalation_corpus._corpus_cache_clear()
+
+    assert resp.status_code == 200, resp.text
+    assert [(record['root'], record['project']) for record in resp.json()['INVARIANTS']] == [
+        (str(a), A_LABEL), (str(b), B_LABEL),
+    ]
