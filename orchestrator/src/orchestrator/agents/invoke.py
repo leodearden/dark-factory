@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -430,23 +431,33 @@ def _codex_inexpressible_tool_specs(
     ]
 
 
-def _codex_mcp_override_args(mcp_config: dict | None) -> list[str]:
-    """MCP servers as per-invocation ``-c mcp_servers."<name>".<key>=<toml>`` argv overrides.
+_TOML_BARE_KEY = re.compile(r'[A-Za-z0-9_-]+')
 
+
+def _codex_mcp_override_args(mcp_config: dict | None) -> list[str]:
+    """MCP servers as per-invocation ``-c mcp_servers.<name>.<key>=<toml>`` argv overrides.
+
+    codex's ``-c`` splitter keeps a quoted segment's quotes in the server name,
+    so each name must be a bare TOML key; any other name raises ValueError.
     codex reads each server's ``command`` (the executable alone), an ``args``
-    list and an optional ``env`` inline table. Every name, command, arg and env
-    key/value is JSON-encoded, which is valid TOML for strings, string arrays
-    and quoted keys, so a hyphenated name or a quoted path cannot break it.
+    list and an optional ``env`` inline table, all JSON-encoded, which is valid
+    TOML for strings, string arrays and quoted inline-table keys. Each server's
+    tools are pre-approved: ``-s read-only`` runs with approval policy
+    ``never``, which fails every unapproved MCP call, and the bypass flag
+    ignores the setting.
     """
     overrides: list[str] = []
     for name, cfg in (mcp_config or {}).get('mcpServers', {}).items():
-        table = f'mcp_servers.{json.dumps(name)}'
+        if not _TOML_BARE_KEY.fullmatch(name):
+            raise ValueError(f'codex MCP server name {name!r} is not a bare TOML key')
+        table = f'mcp_servers.{name}'
         overrides.append(f'{table}.command={json.dumps(cfg.get("command", ""))}')
         overrides.append(f'{table}.args={json.dumps([str(a) for a in cfg.get("args", [])])}')
         env_vars = cfg.get('env', {})
         if env_vars:
             inline = ', '.join(f'{json.dumps(str(k))} = {json.dumps(str(v))}' for k, v in env_vars.items())
             overrides.append(f'{table}.env={{{inline}}}')
+        overrides.append(f'{table}.default_tools_approval_mode="approve"')
     return [arg for override in overrides for arg in ('-c', override)]
 
 
