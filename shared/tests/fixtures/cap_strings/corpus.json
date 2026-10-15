@@ -414,5 +414,14 @@
     "expected": "CapHit",
     "resets_at": "set",
     "provenance": "task 3314 (plans/server-side-api-error-handling-prd.md task alpha, contract C1); 2026-07-29 provider-outage incident \u2014 the ServerError tier sits BELOW cap detection: a 5xx carrying a real cap body still caps the account. Also rides TestB3CapHitDrivesAccountCapped, pinning that cap accounting is untouched by the new tier"
+  },
+  {
+    "id": "codex_chatgpt_usage_window",
+    "backend": "codex",
+    "output": "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 1:07 PM.",
+    "strict_confirm": true,
+    "expected": "CapHit",
+    "resets_at": "set",
+    "provenance": "task 5403; codex-cli 0.154.0 ChatGPT usage window, carried by an `error` + `turn.failed` pair while `codex exec` exits 0: 47 pairs in plans/fable-evidence-package-2026-09-10/campaign/run-trial1-xfam.log (untracked, main checkout) and the live reproduction on 2026-09-11"
   }
 ]

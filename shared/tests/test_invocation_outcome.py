@@ -1020,6 +1020,18 @@ class TestClassifyInvocationBackends:
         outcome = classify_invocation(result, strict_confirm=True, backend='codex')
         assert isinstance(outcome, CapHit)
 
+    def test_codex_chatgpt_usage_window_is_a_codex_cap_with_its_reset(self):
+        """The measured ChatGPT usage-window message is a codex cap, not a
+        fall-through to the claude prefix ladder, and carries its reset."""
+        result = AgentResult(success=False, output=(
+            "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), "
+            'visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 1:07 PM.'
+        ))
+        outcome = classify_invocation(result, strict_confirm=True, backend='codex')
+        assert isinstance(outcome, CapHit)
+        assert outcome.reason.startswith('Codex cap hit')
+        assert outcome.resets_at is not None
+
 
 class TestClassifyInvocationWedgeOkFailure:
     """ZeroOutputWedge + OK + Failure tail, and the full precedence chain."""
