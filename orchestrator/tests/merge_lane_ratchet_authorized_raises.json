@@ -3253,6 +3253,42 @@
           "current": 32054
         }
       ]
+    },
+    {
+      "task_id": "4757",
+      "reason": "Net-additive: the new OrchestratorConfig.strict_mcp_config leaf (on in EVAL_PROFILE) is read by TaskWorkflow._invoke, so the shared mock_orch_config fixture pins its production default False -- unassigned, the spec_set MagicMock reads truthy and would run every mock-config workflow test strictly scoped (conftest.py lines/prose); and test_eval_mcp_isolation.py drives the real TaskWorkflow._invoke once to prove a strict config is never swallowed by a role whose MCP families compose no config, the same private seam nine other test files drive (one private read)",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 1254,
+          "current": 1257
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 781,
+          "current": 783
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57842,
+          "current": 57845
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6653,
+          "current": 6654
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31941,
+          "current": 31943
+        }
+      ]
     }
   ]
 }

@@ -26,6 +26,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
 from _workflow_helpers import FakeBriefing, FakeScheduler, fixed_prompt
 from shared.cli_invoke import AgentResult, build_claude_argv
 
@@ -38,7 +39,7 @@ from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.judge import judge_plan_quality, run_judge
 from orchestrator.evals.profile import EVAL_PROFILE, apply_eval_profile
 from orchestrator.evals.results import EvalResult, ResultStore
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow
 
@@ -122,7 +123,7 @@ async def _drive_architect_eval(monkeypatch, tmp_path: Path) -> dict:
         store=MagicMock(spec=ResultStore),
     )
     assert mock_invoke.await_args is not None, 'the architect was never invoked'
-    return mock_invoke.await_args.kwargs
+    return dict(mock_invoke.await_args.kwargs)
 
 
 @pytest.mark.asyncio
@@ -289,15 +290,7 @@ _NO_MCP = AgentRole(name='probe_no_mcp', system_prompt='x', allowed_tools=[],
 
 async def _invoke_probe(tmp_path: Path, role: AgentRole, *, strict: bool) -> dict:
     """Drive the REAL ``TaskWorkflow._invoke`` once; return the kwargs ``invoke_with_cap_retry`` received."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    for argv in (['git', 'init', '-b', 'main'],
-                 ['git', 'config', 'user.email', 'test@test.com'],
-                 ['git', 'config', 'user.name', 'Test']):
-        await _run(argv, cwd=repo)
-    (repo / 'lib.py').write_text('def greet(name): return name\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+    repo = seed_repo(tmp_path / 'repo')
 
     config = OrchestratorConfig(
         project_root=repo, max_concurrent_tasks=1, strict_mcp_config=strict,
@@ -325,7 +318,7 @@ async def _invoke_probe(tmp_path: Path, role: AgentRole, *, strict: bool) -> dic
         await workflow._invoke(role, fixed_prompt('P'), cwd)
 
     assert mock_cap_retry.await_args is not None, '_invoke never reached invoke_with_cap_retry'
-    return mock_cap_retry.await_args.kwargs
+    return dict(mock_cap_retry.await_args.kwargs)
 
 
 @pytest.mark.asyncio
