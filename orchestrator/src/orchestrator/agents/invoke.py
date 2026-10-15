@@ -61,11 +61,19 @@ def _rate(entry: Any, key: str) -> float:
     return getattr(entry, key) if hasattr(entry, key) else entry[key]
 
 
+def _optional_rate(entry: Any, key: str) -> float | None:
+    """Read an optional *key* off a price *entry* as _rate does, answering
+    None when it is absent or unset rather than raising."""
+    return getattr(entry, key) if hasattr(entry, key) else entry.get(key)
+
+
 def _estimate_cost(
     model: str,
     input_tokens: int,
     output_tokens: int,
     prices: dict[str, Any] | None = None,
+    *,
+    cached_input_tokens: int = 0,
 ) -> float:
     """Estimate USD cost for *model* from token counts (backends without
     native cost reporting: codex, gemini).
@@ -75,6 +83,9 @@ def _estimate_cost(
     packaged ``default_price_table()`` (lazy import — this low-level module
     does not depend on orchestrator.config at module-load time). A model
     absent from the resolved table falls back to _FALLBACK_PRICE.
+
+    *input_tokens* INCLUDES *cached_input_tokens*; that cached share is priced
+    at cached_input_per_1m, or at input_per_1m when the entry has none.
     """
     if prices is None:
         from orchestrator.config import default_price_table
@@ -87,8 +98,13 @@ def _estimate_cost(
             model, _FALLBACK_PRICE['input_per_1m'], _FALLBACK_PRICE['output_per_1m'],
         )
         entry = _FALLBACK_PRICE
+    input_rate = _rate(entry, 'input_per_1m')
+    cached_rate = _optional_rate(entry, 'cached_input_per_1m')
+    if cached_rate is None:
+        cached_rate = input_rate
     return (
-        input_tokens * _rate(entry, 'input_per_1m')
+        (input_tokens - cached_input_tokens) * input_rate
+        + cached_input_tokens * cached_rate
         + output_tokens * _rate(entry, 'output_per_1m')
     ) / 1_000_000
 
