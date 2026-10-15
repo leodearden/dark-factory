@@ -3459,13 +3459,14 @@ class TestCollectTasksWithCountsFairness:
     async def test_all_project_roots_stays_primary_first(
         self, monkeypatch, tmp_path, dummy_client,
     ):
-        """(c) The rotation must NOT leak into the shared root helper.
+        """(c) The rotation must NOT leak into the shared root enumerator.
 
-        ``_all_project_roots`` has other callers that depend on primary-first
-        ordering (``app.py``, ``scheduler.py``, ``api/tasks.py``'s root count,
-        and ``test_app.py``'s patch
-        point). Rotating it in place would silently repoint every one of them
-        at a different project — a far larger blast radius than the Tasks tab.
+        ``DashboardConfig.all_project_roots`` has other readers that depend on
+        primary-first ordering (``api/tasks.py``'s terminal-window lookup and
+        root count, ``data/scheduler.py``'s roots to query, and
+        ``project_roots_for_label``). Rotating it in place would silently
+        repoint every one of them at a different project — a far larger blast
+        radius than the Tasks tab.
         """
         import dashboard.data.active_tasks as at_mod
 
@@ -3476,12 +3477,12 @@ class TestCollectTasksWithCountsFairness:
 
         for render in range(4):
             await collect_tasks_with_counts(client=dummy_client, config=config)
-            roots = at_mod._all_project_roots(config)
+            roots = config.all_project_roots
             assert roots[0] == config.project_root, (
-                f'after {render + 1} render(s) _all_project_roots returned '
+                f'after {render + 1} render(s) all_project_roots returned '
                 f'{[r.name for r in roots]} — the primary root is no longer '
-                'first, so the rotation has leaked into the shared helper and '
-                'every other caller now reads a different project'
+                'first, so the rotation has leaked into the shared enumerator '
+                'and every other reader now reads a different project'
             )
 
     async def test_output_order_is_unaffected_by_rotation(
