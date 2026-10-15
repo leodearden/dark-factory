@@ -627,20 +627,40 @@ def _add_lane_script(tmp_path: Path, relative_path: str, body: str) -> None:
     script.chmod(0o755)
 
 
-async def _until(done: Callable[[], bool]) -> None:
+class _PassFailureWatch(logging.Handler):
+    """Remembers the first ``run() pass failed`` line the lane worker logs."""
+
+    MARKER = 'offline-lane: run() pass failed'
+
+    def __init__(self) -> None:
+        super().__init__(logging.ERROR)
+        self.line: str | None = None
+
+    def emit(self, record: logging.LogRecord) -> None:
+        message = record.getMessage()
+        if self.line is None and message.startswith(self.MARKER):
+            self.line = message
+
+
+async def _until(done: Callable[[], bool], watch: _PassFailureWatch) -> None:
     deadline = time.monotonic() + _PASS_DEADLINE_SECS
     while not done():
+        assert watch.line is None, f'the lane worker logged: {watch.line}'
         assert time.monotonic() < deadline, 'the lane pass left no record in time'
         await asyncio.sleep(0.02)
 
 
 async def _drive_one_pass(worker: OfflineLaneWorker, command: str, until_phase: Phase) -> None:
     """Drive one lane pass through ``on_post_merge`` + ``run()`` until *command*'s *until_phase* is recorded."""
+    watch = _PassFailureWatch()
+    lane_logger = logging.getLogger('orchestrator.offline_lane')
+    lane_logger.addHandler(watch)
     task = asyncio.create_task(worker.run())
     try:
         await worker.on_post_merge('t', 'base', 'head')
-        await _until(lambda: worker.records.last_record(command, until_phase) is not None)
+        await _until(lambda: worker.records.last_record(command, until_phase) is not None, watch)
     finally:
+        lane_logger.removeHandler(watch)
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
@@ -734,10 +754,29 @@ class TestLanePassRecords:
         assert [failure.first_line for failure in detect.failures] == [reason[:FIRST_LINE_MAX_CHARS]]
 
     @pytest.mark.asyncio
+    async def test_output_that_is_not_utf8_still_yields_a_record_naming_the_failure(
+        self, tmp_path: Path
+    ) -> None:
+        worker = await _run_one_pass(
+            tmp_path,
+            "printf '\\377\\nFAILED tests/t.py::test_a - x\\n'; exit 1",
+            until_phase=Phase.CONFIRM,
+        )
+
+        detect = _current_pass_record(worker).detect
+        assert detect is not None
+        assert [failure.node for failure in detect.failures] == ['tests/t.py::test_a']
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ('summary', 'session_complete'),
-        [('=== 1 failed in 0.10s ===\\n', True), ('', False)],
-        ids=['final-summary', 'no-final-summary'],
+        [
+            ('=== 1 failed in 0.10s ===\\n', True),
+            ('=== 1 failed in 65.00s (0:01:05) ===\\n', True),
+            ('no tests ran in 0.01s\\n', True),
+            ('', False),
+        ],
+        ids=['final-summary', 'final-summary-with-clock-time', 'no-tests-ran', 'no-final-summary'],
     )
     async def test_a_generic_run_is_session_complete_only_with_pytests_final_summary(
         self, tmp_path: Path, summary: str, session_complete: bool
@@ -834,12 +873,13 @@ class TestLegacyLegRecords:
 
     @pytest.mark.asyncio
     async def test_the_infra_leg_records_each_failing_test_and_its_confirm_run(
-        self, tmp_path: Path
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         worker = _lane_worker(tmp_path, offline_lane_infra_enabled=True)
         _add_lane_script(tmp_path, RUN_ALL_INFRA_SCRIPT, "echo '  RESULT: FAIL (test_x.sh)'\nexit 1")
 
-        await _drive_one_pass(worker, LEGACY_INFRA_COMMAND, Phase.CONFIRM)
+        with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
+            await _drive_one_pass(worker, LEGACY_INFRA_COMMAND, Phase.CONFIRM)
 
         record = _current_pass_record(worker, LEGACY_INFRA_COMMAND)
         assert record.leg == Leg.INFRA
@@ -850,20 +890,43 @@ class TestLegacyLegRecords:
         assert record.detect.ids_available is True
         assert record.confirm is not None
         assert record.confirm.phase == Phase.CONFIRM
+        assert ['ended_by=exit' in line for line in _sub_run_logs(caplog, 'infra')] == [True]
+
+    @pytest.mark.asyncio
+    async def test_a_signal_ended_infra_run_logs_ended_by_signal(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        worker = _lane_worker(tmp_path, offline_lane_infra_enabled=True)
+        _add_lane_script(tmp_path, RUN_ALL_INFRA_SCRIPT, 'kill -9 $$')
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
+            await _drive_one_pass(worker, LEGACY_INFRA_COMMAND, Phase.CONFIRM)
+
+        assert ['ended_by=signal' in line for line in _sub_run_logs(caplog, 'infra')] == [True]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ('body', 'until_phase', 'session_complete'),
-        [('exit 0', Phase.DETECT, True), ('kill -9 $$', Phase.CONFIRM, False)],
+        ('body', 'until_phase', 'session_complete', 'ended_by'),
+        [
+            ('exit 0', Phase.DETECT, True, EndedBy.EXIT),
+            ('kill -9 $$', Phase.CONFIRM, False, EndedBy.SIGNAL),
+        ],
         ids=['exit', 'signal'],
     )
     async def test_the_numeric_leg_records_an_opaque_detect_run(
-        self, tmp_path: Path, body: str, until_phase: Phase, session_complete: bool
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        body: str,
+        until_phase: Phase,
+        session_complete: bool,
+        ended_by: EndedBy,
     ) -> None:
         worker = _lane_worker(tmp_path, offline_lane_legacy_numeric_enabled=True)
         _add_lane_script(tmp_path, RUN_OFFLINE_DEEP_SCRIPT, body)
 
-        await _drive_one_pass(worker, LEGACY_NUMERIC_COMMAND, until_phase)
+        with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
+            await _drive_one_pass(worker, LEGACY_NUMERIC_COMMAND, until_phase)
 
         record = _current_pass_record(worker, LEGACY_NUMERIC_COMMAND)
         assert record.leg == Leg.NUMERIC
@@ -871,6 +934,7 @@ class TestLegacyLegRecords:
         assert record.detect.failures == ()
         assert record.detect.ids_available is False
         assert record.detect.session_complete is session_complete
+        assert [f'ended_by={ended_by}' in line for line in _sub_run_logs(caplog, 'numeric')] == [True]
 
 
 class TestLaneRetention:
@@ -899,4 +963,24 @@ class TestLaneRetention:
         assert _current_pass_record(worker).detect is not None
         assert any(
             r.levelno == logging.WARNING and str(stuck) in r.getMessage() for r in caplog.records
+        )
+
+    @_needs_file_permissions
+    @pytest.mark.asyncio
+    async def test_an_unreadable_command_directory_does_not_stop_the_lane(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        sibling = tmp_path / 'data' / 'orchestrator' / 'offline-lane' / 'sibling'
+        sibling.mkdir(parents=True)
+        sibling.chmod(0o000)
+
+        try:
+            with caplog.at_level(logging.WARNING):
+                worker = await _run_one_pass(tmp_path, 'exit 0', until_phase=Phase.DETECT)
+        finally:
+            sibling.chmod(0o700)
+
+        assert _current_pass_record(worker).detect is not None
+        assert any(
+            r.levelno == logging.WARNING and str(sibling) in r.getMessage() for r in caplog.records
         )

@@ -1592,6 +1592,25 @@ async def test_default_confirm_command_no_failures_is_flake(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_default_confirm_command_parses_the_whole_output_not_its_tail(tmp_path: Path):
+    """A failure line more than the 2000-char tail from the end is still extracted."""
+    from orchestrator.config import LaneCommand
+
+    worker = _make_worker(tmp_path)
+    cmd = LaneCommand(name='q', command='pytest -m integration')
+    worker.records.allocate_pass(cmd.name, Leg.GENERIC, 'HEAD1')
+    stdout = b'FAILED tests/t.py::test_a\n' + b'x' * 3000 + b'\n'
+
+    with patch(
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_child_writing(stdout, returncode=1),
+    ):
+        ids = await worker.command_confirmation_runner(cmd, tmp_path / '_offline-deep', 'HEAD1')
+
+    assert ids == ['tests/t.py::test_a']
+
+
+@pytest.mark.asyncio
 async def test_default_confirm_command_nonzero_exit_without_node_ids_files_sentinel(
     tmp_path: Path,
 ):

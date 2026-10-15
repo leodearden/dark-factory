@@ -1889,6 +1889,10 @@ class TestParsePytestFailures:
         output = 'tests/a.py::test_x\n[gw0] node down: Not properly terminated\n'
         assert self._parse(output) == [('tests/a.py::test_x', 'failed', '')]
 
+    def test_summary_reason_is_stripped_of_line_ending_and_trailing_spaces(self):
+        output = 'FAILED tests/a.py::test_x - AssertionError: boom  \r\n'
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', 'AssertionError: boom')]
+
     def test_first_line_keeps_everything_after_first_separator(self):
         output = 'FAILED tests/a.py::test_x - ValueError: a - b\n'
         assert self._parse(output) == [('tests/a.py::test_x', 'failed', 'ValueError: a - b')]
