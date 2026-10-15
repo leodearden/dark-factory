@@ -391,10 +391,6 @@ class _Census(NamedTuple):
     sites: Mapping[str, tuple[str, ...]]
 
 
-def _detect(path: Path, detector: _Detector) -> list[str]:
-    return detector(ast.parse(path.read_text(encoding='utf-8')))
-
-
 def _census_tree(root: Path, detector: _Detector) -> _Census:
     """Stream every ``*.py`` under *root* through *detector*, one tree at a time.
 
@@ -408,7 +404,7 @@ def _census_tree(root: Path, detector: _Detector) -> _Census:
     for path in sorted(root.rglob('*.py')):
         module = path.relative_to(root).as_posix()
         try:
-            findings = _detect(path, detector)
+            findings = detector(ast.parse(path.read_text(encoding='utf-8')))
         except SyntaxError as exc:
             unparseable.append(f'{module}: {exc}')
             continue
@@ -482,6 +478,17 @@ class TestCensusTree:
         census = _census_tree(tmp_path, _inline_sandbox_asserts)
 
         assert '_orch_helpers.py' in census.sites
+
+    def test_an_undecodable_module_raises_rather_than_dropping_out(
+        self, tmp_path,
+    ) -> None:
+        """Only a ``SyntaxError`` lands in ``unparseable``; a module the pass
+        cannot even decode must fail the census loudly, not shrink its swept set."""
+        (tmp_path / 'a.py').write_text('x = 1\n', encoding='utf-8')
+        (tmp_path / 'undecodable.py').write_bytes(b'x = "\xff\xfe"\n')
+
+        with pytest.raises(UnicodeDecodeError):
+            _census_tree(tmp_path, _steward_construction_sites)
 
 
 class TestNoInlineSandboxedProjectRootAsserts:
