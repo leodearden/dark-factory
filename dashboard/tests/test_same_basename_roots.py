@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -19,7 +19,12 @@ from dashboard.data.active_tasks import (
     shape_terminal_rows,
 )
 from dashboard.data.datum import Datum, DatumState
-from dashboard.data.task_snapshot import FRESHNESS_BOUND_SECONDS
+from dashboard.data.scheduler import collect_scheduler_state
+from dashboard.data.task_snapshot import (
+    FRESHNESS_BOUND_SECONDS,
+    SnapshotFailure,
+    unmeasured_snapshot,
+)
 
 A_LABEL = 'a/proj'
 B_LABEL = 'b/proj'
@@ -148,3 +153,160 @@ def test_the_terminal_window_reads_the_root_its_label_names(client, roots):
     assert f'TASKS_TERMINAL:{B_LABEL}' in resp.json()
     (acquisition,) = window.await_args_list
     assert acquisition.args[2] == b
+
+
+_NOW = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
+_FIVE_MINUTES_AGO = (_NOW - timedelta(minutes=5)).isoformat()
+
+
+def _active_row(label: str, task_id: int) -> dict:
+    """An active row as ``collect_tasks_with_counts`` emits it, locking ``src/utils.py``."""
+    return {
+        'id': f'{label}/T-{task_id}', 'project': label, 'title': f'task {task_id}',
+        'priority': 'medium', 'status': 'in-progress', 'started': 5,
+        'meta_files': ['src/utils.py'],
+    }
+
+
+@dataclasses.dataclass
+class _SchedulerSubstrate:
+    """A fused-memory stand-in answering the scheduler's three reads per root."""
+
+    skips: dict[Path, int]
+    recovery_type: dict[Path, str]
+    state_reads: list[Path] = dataclasses.field(default_factory=list)
+
+    async def __call__(self, client, url, tool, args, **_kw):
+        root = Path(args['project_root'])
+        if tool == 'get_scheduler_state':
+            self.state_reads.append(root)
+            return {
+                'skip_counts': {}, 'parks': {}, 'effective_priorities': {},
+                'pin_queue': [], 'overrides': {}, 'current_holders': {},
+            }
+        if args['event_types'] == ['task_skipped']:
+            return [
+                {'event_type': 'task_skipped', 'task_id': '7', 'timestamp': _FIVE_MINUTES_AGO}
+                for _ in range(self.skips.get(root, 0))
+            ]
+        return [{
+            'event_type': self.recovery_type[root], 'task_id': '7',
+            'timestamp': _FIVE_MINUTES_AGO,
+        }]
+
+
+class TestSchedulerCollector:
+    @pytest.fixture
+    def scheduler_roots(self, tmp_path) -> tuple[Path, Path]:
+        x = tmp_path / 'x' / 'proj'
+        y = tmp_path / 'y' / 'proj'
+        for root in (x, y):
+            root.mkdir(parents=True)
+        return x.resolve(), y.resolve()
+
+    @pytest.fixture
+    def substrate(self, scheduler_roots) -> _SchedulerSubstrate:
+        x, y = scheduler_roots
+        return _SchedulerSubstrate(
+            skips={x: 2, y: 3},
+            recovery_type={x: 'recovery_vetoed', y: 'strand_converted'},
+        )
+
+    @staticmethod
+    async def _collect(client, roots, substrate, active, snapshots=None):
+        config = DashboardConfig(project_root=roots[0], known_project_roots=list(roots[1:]))
+        with patch('dashboard.data.scheduler.mcp_tool_call', new=substrate), patch(
+            'dashboard.data.scheduler.collect_tasks_with_counts',
+            new=AsyncMock(return_value=(active, snapshots or {})),
+        ):
+            return await collect_scheduler_state(client, config, now=_NOW)
+
+    async def _both_online(self, dummy_client, scheduler_roots, substrate):
+        return await self._collect(
+            dummy_client, scheduler_roots, substrate,
+            [_active_row('x/proj', 7), _active_row('y/proj', 7)],
+        )
+
+    async def test_each_task_row_is_composed_once_with_its_own_root(
+        self, dummy_client, scheduler_roots, substrate,
+    ):
+        x, y = scheduler_roots
+        rows, *_rest = await self._both_online(dummy_client, scheduler_roots, substrate)
+
+        assert len(rows) == 2, rows
+        assert {(row['project'], row['task_id'], row['project_root']) for row in rows} == {
+            ('x/proj', '7', str(x)), ('y/proj', '7', str(y)),
+        }
+
+    async def test_each_roots_skip_sparkline_keeps_its_own_key(
+        self, dummy_client, scheduler_roots, substrate,
+    ):
+        _rows, _modules, _pins, events_by_task, *_rest = await self._both_online(
+            dummy_client, scheduler_roots, substrate,
+        )
+
+        assert {key: sum(spark['values']) for key, spark in events_by_task.items()} == {
+            'x/proj/7': 2, 'y/proj/7': 3,
+        }
+
+    async def test_each_roots_recovery_events_keep_their_own_key(
+        self, dummy_client, scheduler_roots, substrate,
+    ):
+        *_head, recovery_events, _degraded = await self._both_online(
+            dummy_client, scheduler_roots, substrate,
+        )
+
+        assert {
+            label: [(row['event_type'], row['project']) for row in events]
+            for label, events in recovery_events.items()
+        } == {
+            'x/proj': [('recovery_vetoed', 'x/proj')],
+            'y/proj': [('strand_converted', 'y/proj')],
+        }
+
+    async def test_each_roots_module_contention_is_counted_apart(
+        self, dummy_client, scheduler_roots, substrate,
+    ):
+        _rows, modules, *_rest = await self._both_online(dummy_client, scheduler_roots, substrate)
+
+        assert sorted(
+            (module['project'], module['contention'])
+            for module in modules if module['path'] == 'src/utils.py'
+        ) == [('x/proj', 1), ('y/proj', 1)]
+
+    async def test_an_offline_root_skips_only_itself(
+        self, dummy_client, scheduler_roots, substrate,
+    ):
+        x, y = scheduler_roots
+        offline_x = unmeasured_snapshot(
+            x, now=_NOW, reason='test', failure=SnapshotFailure.UNREACHABLE,
+        )
+        rows, _modules, _pins, _events, offline_projects, _paused, recovery_events, _degraded = (
+            await self._collect(
+                dummy_client, scheduler_roots, substrate,
+                [_active_row('y/proj', 7)], {'x/proj': offline_x},
+            )
+        )
+
+        assert offline_projects == ['x/proj']
+        assert substrate.state_reads == [y]
+        assert [row['project'] for row in rows] == ['y/proj']
+        assert set(recovery_events) == {'y/proj'}
+
+    async def test_a_label_containing_the_uid_separator_keeps_its_task_id(
+        self, dummy_client, tmp_path,
+    ):
+        m = tmp_path / 'm' / 'T-x' / 'proj'
+        n = tmp_path / 'n' / 'T-x' / 'proj'
+        for root in (m, n):
+            root.mkdir(parents=True)
+        roots = (m.resolve(), n.resolve())
+        substrate = _SchedulerSubstrate(
+            skips={}, recovery_type=dict.fromkeys(roots, 'recovery_left'),
+        )
+
+        rows, *_rest = await self._collect(
+            dummy_client, roots, substrate, [_active_row('m/T-x/proj', 5)],
+        )
+
+        assert [(row['project'], row['task_id']) for row in rows] == [('m/T-x/proj', '5')]
