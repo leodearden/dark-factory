@@ -376,6 +376,27 @@ async def _invoke_claude_with_sandbox(
 # Codex backend
 # ---------------------------------------------------------------------------
 
+_CODEX_WRITE_TOOLS = frozenset({'Edit', 'Write'})
+
+
+def _codex_sandbox_mode(
+    allowed_tools: list[str] | None,
+    disallowed_tools: list[str] | None,
+) -> str | None:
+    """`codex exec` offers no per-tool lever, only its sandbox axis, so a role's tool lists collapse onto it.
+
+    A role that cannot write runs 'read-only'; every other caller keeps the existing bypass (None).
+    """
+    allowed = set(allowed_tools or ())
+    disallowed = set(disallowed_tools or ())
+    cannot_write = (
+        '*' in disallowed
+        or bool(_CODEX_WRITE_TOOLS & disallowed)
+        or (bool(allowed) and not _CODEX_WRITE_TOOLS & allowed)
+    )
+    return 'read-only' if cannot_write else None
+
+
 async def _invoke_codex(
     prompt: str,
     system_prompt: str,
