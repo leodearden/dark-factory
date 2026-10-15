@@ -560,6 +560,12 @@ entries:
     origin_phase: verify
     manifested_phase: verify
     note: The block report states the test_failure is 'preexisting on main' and charges it to task 5602. The digest does not show that main was actually checked, so the causal claim is unverified. This is the pre-existing-failure misattribution pattern the entry describes, but the evidence is limited to the block text.
+  - date: '2026-10-14'
+    project: dark_factory
+    session: 95deb067-dba3-45dc-9034-40442f390bee
+    origin_phase: unknown
+    manifested_phase: verify
+    note: Post-merge verification blocked task 4858 on a live-tree ratchet test that flags pre-existing noqa markers in fused-memory/ files, with the baseline not yet seeded. That charges a pre-existing failure to the task. The digest is thin (one user turn, no visible agent reasoning), so the match is partial.
 - id: unverified-task-premises
   title: 'Tasks filed and dispatched on unverified premises: recon-invented code models, dep ''done'' ≠ capability delivered, phantom found_on_main dones'
   severity: high
@@ -3701,6 +3707,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: 'In turn 23 a resume-style Bash command ran `cat .task/metadata.json | head -50` and `tail -c 3000 .task/iterations.jsonl` without checking existence. Both files were absent, producing the ''No such file or directory'' errors in Error Neighborhoods and Not Found. Weak match: the digest does not show the boilerplate itself, so phases are left unknown.'
+  - date: '2026-10-14'
+    project: dark_factory
+    session: 3a8cf508-3861-4b98-9112-d3c73642107c
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: After the merge-thrash block, the agent ran Bash `cat .task/metadata.json | head -50; tail -c 3000 .task/iterations.jsonl; ... ls .task .task/reviews`. Both .task/metadata.json and .task/iterations.jsonl returned No such file or directory (turn 22, exit 2), matching the entry's claim that resume-after-escalation boilerplate assumes .task/iterations.jsonl exists. The digest does not establish which phase the agent was in when it ran these commands, so both phases are recorded as unknown.
 - id: entry-cand-20260718-1
   title: Reconciliation stage cost telemetry (tokens_used) always zero despite nonzero llm_calls
   severity: medium
@@ -8071,6 +8083,13 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Two ModuleNotFoundError hits (turns 160 and 305) occur inside a task worktree. The digest does not show that this was the architect explore phase, so the phase cannot be supported and is recorded as unknown. Weaker match than entry-cand-20260728-3.
+  - date: '2026-10-14'
+    project: dark_factory
+    session: 1e37a10e-9359-4f59-b5ae-751d5c32408e
+    origin_phase: unknown
+    manifested_phase: verify
+    invariant_violated: readers-prove-their-producer
+    note: Test module imports orchestrator.merge_lane.member_redrive, which does not exist in the worktree; the pytest run fails at collection with ModuleNotFoundError (turn 278, plus turn 714 in not_found). Origin cannot be determined from the digest, so it is marked unknown.
 - id: entry-cand-20260720-10
   title: Architect overrides explicit in-task dependency-coordination branching instructions instead of following them
   severity: medium
@@ -8692,6 +8711,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: The digest's 'User Corrections' bucket holds the dispatched task's injected step-list prompt (turn 2), not a corrective user message, so the signal is mislabeled. The same session also shows the agent retrying a SITTING_NIGHTLY_CONFINED refusal through alternate paths (nested dir, stdin) despite the 'do nothing else' instruction. That retry behaviour is not captured by this entry.
+  - date: '2026-10-14'
+    project: dark_factory
+    session: 672225ab-c56e-4340-b683-03ef739c7ff0
+    origin_phase: unknown
+    manifested_phase: ops
+    note: The digest's 'User Corrections' section is the supervisor-injected watcher rotation prompt (ROTATION_ESCALATIONS, DARK_FACTORY_ROOT, re-arm instructions), mislabeled as user feedback. The session itself is an autonomous watcher, not a user correction.
 - id: entry-cand-20260723-5
   title: Recon terminal-task write guard's corrective_path covers only done_provenance, leaving other terminal-task string fields permanently unrepairable and silently re-diagnosed each recurrence
   severity: medium
@@ -9805,6 +9830,24 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Guard Trips list two entries (turns 170 and 244) that render as bare 'blocked:' with no matched reason text, so the digest drops the substring that would explain the trip.
+  - date: '2026-10-14'
+    project: dark_factory
+    session: e77bb8d4-80c4-4fb9-8f07-c3be678a647f
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The digest renders not_found signals as bare lowercased templates (e.g. 'modulenotfounderror', 'does not exist') with no matched path or substring, which is the rendering gap this entry describes.
+  - date: '2026-10-14'
+    project: dark_factory
+    session: 75169738-1eea-4b27-a2da-92744ad60df9
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Four df_guard trips are rendered with an empty ''blocked:'' reason at turns 42, 106, 183, and 266, which matches the family where the digest drops the matched substring from guard signals. Not conclusive: the digest is 517 bytes with truncated_items 0, so the blank could be the session''s own output rather than the generator.'
+  - date: '2026-10-14'
+    project: dark_factory
+    session: b0159851-edd6-46f0-8fa1-caa1c9111d51
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Guard Trips entries for turns 111 and 191 read only 'blocked:' with no matched substring or reason, so the digest renders a guard signal without its evidence.
 - id: entry-cand-20260722-34
   title: Census-verifier agent doesn't know the transcript storage path convention, so it blind-searches the filesystem and repeatedly hits approval gates
   severity: medium
@@ -11076,6 +11119,12 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: The digest's 'User Corrections' section (turn 3) holds the verify-block report and a pasted gate-failure dump, not user feedback. signal_counts show self_correct 0 and n_user_turns 1, so the bucket is filled by non-corrective report text.
+  - date: '2026-10-14'
+    project: dark_factory
+    session: b0159851-edd6-46f0-8fa1-caa1c9111d51
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The User Corrections bucket captures a slash-command invocation block (<command-message>/<command-name> escalation-watcher) as a user correction. The turn is a command invocation, not corrective feedback.
 - id: entry-cand-20260728-1
   title: Digest pipeline mislabels an ordinary task's injected '# Context' project-briefing block as a 'User Correction'
   severity: medium
@@ -17573,6 +17622,25 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Orchestrated worktree session shows repeated 'no such file or directory' not-found signals (turns 41, 49) with no other diagnostic signal in the digest.
+  - date: '2026-10-14'
+    project: dark_factory
+    session: af531d39-8413-4a21-949c-057531b3b241
+    origin_phase: unknown
+    manifested_phase: unknown
+    invariant_violated: structured-facts-at-failure
+    note: Orchestrated-task session in a .worktrees path shows repeated 'no such file or directory' not_found signals (turns 32, 93) with tool_error 0 and no other diagnostic signal. The digest does not establish the phase, so both phases are unknown.
+  - date: '2026-10-14'
+    project: dark_factory
+    session: 4ef416ca-4e5c-4f28-9c84-318d2fecdc82
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Weak match. Orchestrated-task session in a worktree shows 7 not_found signals, mostly 'does not exist' and 'no such file or directory' (turns 38-240), with no other diagnostic content in the digest. The digest carries no user turns and empty guard-trip bodies, so the phase cannot be supported from the evidence.
+  - date: '2026-10-14'
+    project: dark_factory
+    session: e77bb8d4-80c4-4fb9-8f07-c3be678a647f
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated-task session in a .worktrees/ directory fires not_found signals (no such file or directory, does not exist x2, modulenotfounderror) with no tool_error or other diagnostic signal. The digest does not show the paths or the phase, so phase is unknown.
 - id: entry-cand-20260809-16
   title: Agent falls back to a whole-filesystem `find /` to locate an installed package's source, timing out the Bash call
   severity: medium
@@ -17678,6 +17746,12 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: get_task_escalations was called with malformed JSON containing an empty value after 'status'. It is a similar self-generated JSON syntax error, here on an MCP tool rather than Read. Only one occurrence is seen, with no retry shown.
+  - date: '2026-10-14'
+    project: dark_factory
+    session: 672225ab-c56e-4340-b683-03ef739c7ff0
+    origin_phase: unknown
+    manifested_phase: ops
+    note: 'Partial match on the malformed-tool-JSON family. An MCP get_task_escalations call was emitted with an empty-valued field ("status": ,) and failed InputValidationError. The original candidate concerns the Read tool and identical retries, and this digest shows a different tool and no identical retry, so the match is only in kind.'
 - id: entry-cand-20260811-6
   title: Sub-agent resumed after weekly usage-limit hit has no persisted partial progress to resume from
   severity: medium
@@ -18034,6 +18108,12 @@ entries:
     manifested_phase: ops
     invariant_violated: readers-prove-their-producer
     note: 'The digest''s Retry Loops bucket flags six Bash calls to scripts/watcher-rearm.sh as a retry loop, though the watcher''s re-arm is designed to run once per rotation. The bucket includes the designed CEILING outcome (exit 124, WATCHER_REARM_OUTCOME: CEILING).'
+  - date: '2026-10-14'
+    project: dark_factory
+    session: b0159851-edd6-46f0-8fa1-caa1c9111d51
+    origin_phase: ops
+    manifested_phase: ops
+    note: Retry Loops bucket flags the watcher's designed re-arm calls (13x watcher-rearm.sh with run_in_background) and repeated get_pending_escalations polls as retry loops. This is the designed once-per-rotation watcher behaviour, not a retry defect.
 - id: entry-cand-20260827-23
   title: Edit's multi-match error hint gets invoked as a nonexistent standalone 'replace_all' tool
   severity: medium
@@ -34041,3 +34121,18 @@ candidates:
     origin_phase: unknown
     manifested_phase: recon
     evidence_quote: Probe whether a heredoc payload after the allowlisted record ...
+- id: cand-20261014-1
+  title: Designed bounded-wait re-arm killed with exit 137 (SIGKILL) and no diagnostic, indistinguishable from the designed exit-124 ceiling
+  cause: watcher-rearm.sh printed its header and was terminated with exit 137 on a Bash call whose timeout was set to 3660000 ms, so the 2-minute kill theory does not apply. The transcript gives no reason for the kill. The watcher had to re-arm again, and the agent cannot tell a harness/OS kill from a designed ceiling. A silent loss of the escalation watch is a risk to the next rotation.
+  area: watcher-loop
+  first_seen: '2026-10-14'
+  disposition: pending
+  sightings:
+  - date: '2026-10-14'
+    project: dark_factory
+    session: 672225ab-c56e-4340-b683-03ef739c7ff0
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: '[exit 137] Exit code 137
+
+      watcher-rearm.sh: level=1 exclude-file=/home/leo/src/dark-factory/data/escalations/.watcher-rearm-exclude-l1 (append a deliberately-pending esc-id here to suppress it)'
