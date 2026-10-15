@@ -1214,6 +1214,13 @@ def _retry(project_id='dark_factory', *, day, recorded_day, exit_code=0,
     )
 
 
+def _retried(**kwargs) -> dict:
+    """:func:`_retry` over a readable predecessor, so a document is written."""
+    doc = _retry(**kwargs)
+    assert doc is not None, 'record_retry wrote nothing'
+    return doc
+
+
 class TestRecordRetry:
     """record_retry rewrites ONLY ``retry_backlog``: the rest of the
     document keeps describing the scheduled night."""
@@ -1226,7 +1233,7 @@ class TestRecordRetry:
         _record(day=1, exit_code=1, selected_count=6)
         scheduled = _record(day=2, selected_count=1)
 
-        retried = _retry(day=1, recorded_day=2)
+        retried = _retried(day=1, recorded_day=2)
 
         path = trickle_state.trickle_state_path('dark_factory')
         assert json.loads(path.read_text()) == retried
@@ -1238,7 +1245,7 @@ class TestRecordRetry:
         _record(day=1, exit_code=1)
         scheduled = _record(day=2, selected_count=1)
 
-        retried = _retry(day=1, recorded_day=2, exit_code=1)
+        retried = _retried(day=1, recorded_day=2, exit_code=1)
 
         assert retried['retry_backlog'] == {'2026-07-01': 2}
         assert _without_backlog(retried) == _without_backlog(scheduled)
@@ -1247,7 +1254,7 @@ class TestRecordRetry:
         _record(day=1, exit_code=1)
         _record(day=2, selected_count=1)
 
-        retried = _retry(day=1, recorded_day=2, capped=True)
+        retried = _retried(day=1, recorded_day=2, capped=True)
 
         assert retried['retry_backlog'] == {'2026-07-01': 2}
 
@@ -1260,7 +1267,7 @@ class TestRecordRetry:
 
         with caplog.at_level('WARNING'):
             for night in range(unfinished):
-                doc = _retry(day=1, recorded_day=2 + night, exit_code=1)
+                doc = _retried(day=1, recorded_day=2 + night, exit_code=1)
 
         assert doc['retry_backlog'] == {}
         assert len(_warnings_naming(caplog, '2026-07-01')) == 1

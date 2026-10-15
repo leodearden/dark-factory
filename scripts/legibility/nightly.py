@@ -31,7 +31,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 # Self-bootstrap for standalone `python scripts/legibility/nightly.py` runs
 # (and the systemd ExecStart, which invokes this file directly) -- must run
@@ -1789,6 +1789,20 @@ def _parse_date(value: str) -> date:
     return date.fromisoformat(value)
 
 
+def run_scheduled_night(**run_kwargs: Any) -> tuple[NightlyResult, ...]:
+    """The scheduled :func:`run_nightly` pass, then one ``retry=True`` pass
+    per date its :attr:`NightlyResult.retry_due` names, in order. Each pass
+    records itself; a raise from any pass propagates."""
+    scheduled = run_nightly(**run_kwargs)
+    results = [scheduled]
+    for retry_date in scheduled.retry_due:
+        logger.info(
+            'legibility trickle: retrying %s from the retry backlog', retry_date.isoformat(),
+        )
+        results.append(run_nightly(**{**run_kwargs, 'target_date': retry_date, 'retry': True}))
+    return tuple(results)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entrypoint -- what the systemd ``legibility-trickle@.service``
     ``ExecStart`` and an operator both invoke.
@@ -1799,11 +1813,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     project; both are simply forwarded to :func:`run_nightly`, which
     already prefers ``config_path`` over ``project_id`` when both are
     given -- so ``--config`` takes precedence for free, no extra logic
-    here. ``--projects-root``/``--date`` default to ``None``, letting
-    :func:`run_nightly`'s own defaults (``~/.claude/projects`` / yesterday
-    UTC) apply. ``--dry-run`` is accepted for forward operator visibility
-    but not yet wired to any behavior change. Returns
-    :attr:`NightlyResult.exit_code`.
+    here. ``--projects-root`` defaults to ``None``, letting
+    :func:`run_nightly`'s own default (``~/.claude/projects``) apply. An
+    undated run is the scheduled night (yesterday UTC) plus any retry the
+    backlog owes (:func:`run_scheduled_night`); a ``--date`` run is a single
+    pass. ``--dry-run`` is accepted for forward operator visibility but not
+    yet wired to any behavior change. Returns the first non-zero
+    :attr:`NightlyResult.exit_code` among the passes, else 0.
 
     ``resolve-config <project_id>`` -- print the resolved
     ``legibility.yaml`` path (via :func:`resolve_config_path`) and return
@@ -1835,7 +1851,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     run_parser.add_argument(
         '--date', default=None, type=_parse_date,
-        help='Target date YYYY-MM-DD (default: yesterday UTC).',
+        help=(
+            'Target date YYYY-MM-DD, run as a single pass (default: yesterday '
+            'UTC, then any date the retry backlog owes).'
+        ),
     )
     run_parser.add_argument(
         '--dry-run', action='store_true',
@@ -1862,13 +1881,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.config and not args.project_id:
         parser.error('run requires --config or --project-id')
 
-    result = run_nightly(
-        config_path=args.config,
-        project_id=args.project_id,
-        projects_root=args.projects_root,
-        target_date=args.date,
-    )
-    return result.exit_code
+    if args.date is None:
+        results = run_scheduled_night(
+            config_path=args.config,
+            project_id=args.project_id,
+            projects_root=args.projects_root,
+        )
+    else:
+        results = (run_nightly(
+            config_path=args.config,
+            project_id=args.project_id,
+            projects_root=args.projects_root,
+            target_date=args.date,
+        ),)
+    return next((result.exit_code for result in results if result.exit_code != 0), 0)
 
 
 if __name__ == '__main__':
