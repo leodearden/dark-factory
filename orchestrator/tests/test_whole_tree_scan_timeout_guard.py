@@ -103,7 +103,9 @@ _MIN_EXPECTED_SCANNERS = 10
 # every module marked with WHOLE_TREE_SCAN_TEST_TIMEOUT, not only the ones the
 # detector below finds.  The worst run is kept, never the freshest; a figure
 # measured on code since replaced retires with that code.  Corpus:
-# plans/pytest-per-test-timeout-measurement-2026-09-17.md.
+# plans/pytest-per-test-timeout-measurement-2026-09-17.md.  That fixture is a
+# whole-repo complexity measurement rather than an AST sweep of this tree, so
+# one member's cost sets the ceiling for all 21; task 6986 owns separating it.
 _MEASURED_UNDER_LOAD_WORST_CASE = 148.65
 
 # ABSOLUTE floor in seconds: the measured worst case above times
@@ -204,23 +206,8 @@ class TestTimeoutConstants:
     def test_whole_tree_scan_timeout_clears_default_with_margin(self) -> None:
         """``WHOLE_TREE_SCAN_TEST_TIMEOUT`` must clear the default several times over.
 
-        Measured basis, all first-hand except where the task record is cited:
-
-        * 8.25s / 6.70s / 6.46s per call unloaded and serial (``-n0``) on a
-          32-core box for test_merge_queue_reachback_patch_guard,
-          test_event_loop_antipattern_guard and the serial-worker import
-          guard (deleted by task 5034) respectively;
-        * 17.85 / 21.32 / 30.75s per call for that serial-worker guard
-          at loadavg 120-176 (task 4215's record) -- ~4.8x its unloaded figure;
-        * xdist worker deaths observed at loadavg 250-423 (esc-3980-1,
-          esc-3787-1), i.e. past the 60s default then in force;
-        * 51.87s setup for test_merge_lane_ratchet.py under task 5442's full
-          suite -- the anchor until task 6556;
-        * 148.65s per-test total for
-          test_merge_lane_ratchet.py::TestLanePatchTargets::test_real_tree_union_anchor
-          under task 3165's verify (2026-10-08, ``-n 8``, loadavg 64 -> 79),
-          the worst of the verify-log archive across every module marked with
-          this constant -- the current anchor, ``_MEASURED_UNDER_LOAD_WORST_CASE``.
+        Measured basis: ``_MEASURED_UNDER_LOAD_WORST_CASE``, whose corpus is the
+        task 6556 addendum of plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 
         The floor clears 8 x the anchor, and the constant clears both the floor
         and the ini default.  Asserted as ``>=`` rather than ``==`` so raising the

@@ -836,6 +836,14 @@ The cost, stated plainly: a genuinely hung family item now burns up to 20
 minutes before the kill. Its stacks still reach the verify log at
 `faulthandler_timeout`.
 
+That cost is one member's. The anchor is the ratchet's `live_measurement`
+fixture, a whole-repo complexity measurement and not an AST sweep of the tests
+tree, yet it sets the ceiling for all 21 modules. Without it the family's worst
+is `test_merge_lane_alias_names.py` at 83.96, which derives 720. Giving the
+ratchet its own constant needs an edit to `test_merge_lane_ratchet.py`, which is
+outside this task's scope. Task 6986 owns that split, or cutting the fixture
+instead.
+
 ### What did NOT move
 
 - The ini default stays **420**, in all eight configs.
