@@ -11,7 +11,9 @@ enforcement points read it: the pre-merge fleet sweep
   new endpoint cannot ship unbudgeted and a deleted one cannot leave a stale
   entry behind;
 * a malformed table is REFUSED loudly, naming the field, and never read as an
-  empty or partial table, which would compare clean against everything.
+  empty or partial table, which would compare clean against everything;
+* the pure accounting both enforcement points report with: wire bytes, the
+  leaf-field breakdown, the overage message and the slack rule.
 """
 
 from __future__ import annotations
@@ -24,15 +26,23 @@ from typing import Any
 
 import pytest
 from _dashboard_routes import dashboard_get_paths
+from starlette.responses import JSONResponse
 
 from dashboard.payload_budgets import (
+    MAX_SLACK_RATIO,
+    SLACK_FLOOR_BYTES,
     BudgetChange,
     BudgetTable,
     EndpointBudget,
     Exemption,
+    FieldBytes,
     PayloadBudgetTableError,
+    field_breakdown,
     load_budget_table,
     parse_budget_table,
+    payload_bytes,
+    render_overage,
+    slack_violation,
 )
 
 _PREFIX = '/api/v2/dashboard/'
@@ -281,3 +291,169 @@ class TestRefusals:
         message = str(refused.value)
         assert 'budget-table-under-test' in message
         assert field in message
+
+
+def _compact(value: object) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode('utf-8'))
+
+
+def _leaf(key: str, value: object) -> int:
+    return _compact(key) + 1 + _compact(value)
+
+
+def _as_dict(breakdown: tuple[FieldBytes, ...]) -> dict[str, int]:
+    return {field.path: field.bytes for field in breakdown}
+
+
+class TestFieldBreakdown:
+    """Bytes are attributed to LEAF fields, with data-keyed maps collapsed."""
+
+    def test_list_indices_collapse_and_rows_sum_into_one_leaf(self) -> None:
+        payload = {'SCHEDULER': {'rows': [{'title': 'a'}, {'title': 'bcd'}]}}
+        assert _as_dict(field_breakdown(payload)) == {
+            'SCHEDULER.rows[].title': _leaf('title', 'a') + _leaf('title', 'bcd'),
+        }
+
+    def test_lists_of_dicts_recurse(self) -> None:
+        payload = {'A': {'rows': [{'deps': [{'title': 'x'}, {'title': 'yz'}]}]}}
+        assert _as_dict(field_breakdown(payload)) == {
+            'A.rows[].deps[].title': _leaf('title', 'x') + _leaf('title', 'yz'),
+        }
+
+    def test_a_list_of_scalars_is_one_leaf_on_its_key(self) -> None:
+        lock_set = ['a/b.py', 'c/d.py']
+        payload = {'SCHEDULER': {'rows': [{'lock_set': lock_set}]}}
+        assert _as_dict(field_breakdown(payload)) == {
+            'SCHEDULER.rows[].lock_set': _leaf('lock_set', lock_set),
+        }
+
+    def test_nested_dicts_recurse_and_top_level_scalars_are_leaves(self) -> None:
+        payload = {'TASKS_OFFLINE': False, 'WINDOW': {'days': 90, 'served': '90d'}}
+        assert _as_dict(field_breakdown(payload)) == {
+            'TASKS_OFFLINE': _leaf('TASKS_OFFLINE', False),
+            'WINDOW.days': _leaf('days', 90),
+            'WINDOW.served': _leaf('served', '90d'),
+        }
+
+    def test_empty_containers_are_leaves(self) -> None:
+        payload = {'A': {'rows': [], 'meta': {}}}
+        assert _as_dict(field_breakdown(payload)) == {
+            'A.rows': _leaf('rows', []),
+            'A.meta': _leaf('meta', {}),
+        }
+
+    def test_a_declared_data_keyed_map_collapses_its_keys(self) -> None:
+        payload = {
+            'TASKS_SNAPSHOT': {
+                'dark-factory': {'rows': {'value': [{'title': 'one'}]}},
+                'reify': {'rows': {'value': [{'title': 'two'}, {'title': 'three'}]}},
+            },
+        }
+        collapsed = _as_dict(field_breakdown(payload, (('TASKS_SNAPSHOT',),)))
+        assert collapsed == {
+            'TASKS_SNAPSHOT.{}.rows.value[].title': (
+                _leaf('title', 'one') + _leaf('title', 'two') + _leaf('title', 'three')
+            ),
+        }
+
+    def test_an_undeclared_data_keyed_map_stays_split(self) -> None:
+        payload = {
+            'TASKS_SNAPSHOT': {
+                'dark-factory': {'rows': {'value': [{'title': 'one'}]}},
+                'reify': {'rows': {'value': [{'title': 'two'}]}},
+            },
+        }
+        assert set(_as_dict(field_breakdown(payload))) == {
+            'TASKS_SNAPSHOT.dark-factory.rows.value[].title',
+            'TASKS_SNAPSHOT.reify.rows.value[].title',
+        }
+
+    def test_a_map_under_a_list_collapses_when_declared_with_list_descent(self) -> None:
+        payload = {'A': {'per_project': [{'daily': {'2026-10-01': 1, '2026-10-02': 22}}]}}
+        declared = (('A', 'per_project', '[]', 'daily'),)
+        assert _as_dict(field_breakdown(payload, declared)) == {
+            'A.per_project[].daily.{}': _leaf('2026-10-01', 1) + _leaf('2026-10-02', 22),
+        }
+
+    def test_dicts_sharing_a_key_set_are_not_inferred_as_data_keyed(self) -> None:
+        """ESCALATIONS.views holds two NAMED Datum fields with identical keys."""
+        payload = {'views': {'a': {'value': 1, 'state': 'x'}, 'b': {'value': 2, 'state': 'y'}}}
+        assert set(_as_dict(field_breakdown(payload))) == {
+            'views.a.value', 'views.a.state', 'views.b.value', 'views.b.state',
+        }
+
+    def test_non_ascii_is_counted_in_encoded_bytes(self) -> None:
+        payload = {'rows': [{'title': 'déjà vu — ✓'}]}
+        assert _as_dict(field_breakdown(payload)) == {
+            'rows[].title': _leaf('title', 'déjà vu — ✓'),
+        }
+        assert _leaf('title', 'déjà vu — ✓') > len('"title":"déjà vu — ✓"')
+
+    def test_sorted_by_bytes_descending_then_path(self) -> None:
+        payload = {'b': 'xx', 'a': 'xx', 'c': 'xxxxxxxx'}
+        assert [field.path for field in field_breakdown(payload)] == ['c', 'a', 'b']
+
+    def test_returns_frozen_field_bytes(self) -> None:
+        breakdown = field_breakdown({'a': 1})
+        assert isinstance(breakdown, tuple)
+        assert breakdown == (FieldBytes(path='a', bytes=_leaf('a', 1)),)
+
+
+class TestPayloadBytes:
+    def test_matches_the_starlette_json_response_body(self) -> None:
+        sample = {
+            'title': 'déjà vu — ✓ 日本',
+            'n': [1, 2.5, None, True],
+            'nested': {'empty': {}, 'list': []},
+        }
+        assert payload_bytes(sample) == len(JSONResponse(sample).body)
+
+
+def _entry_for_overage() -> EndpointBudget:
+    raw = _minimal_table()
+    raw['endpoints'][0]['query'] = {'terminal': 'dark-factory'}
+    raw['endpoints'][0]['history'].append(
+        {'budget_bytes': 1200, 'task': '9999', 'reason': 'raised after the 2026-10 growth'},
+    )
+    return parse_budget_table(json.dumps(raw)).endpoints[0]
+
+
+class TestRenderOverage:
+    def test_names_request_numbers_fields_history_and_remedy(self) -> None:
+        breakdown = tuple(
+            FieldBytes(path=f'TASKS_SNAPSHOT.{{}}.rows.value[].f{i}', bytes=200 - i)
+            for i in range(10)
+        )
+        message = render_overage(_entry_for_overage(), 1500, breakdown, top_n=8)
+
+        assert '/api/v2/dashboard/tasks?terminal=dark-factory' in message
+        assert '1,200' in message and '1,500' in message and '1.25' in message
+        for field in breakdown[:8]:
+            assert field.path in message
+            assert f'{field.bytes:,}' in message
+            assert f'{100 * field.bytes / 1500:.1f}%' in message
+        assert breakdown[8].path not in message and breakdown[9].path not in message
+        assert '9999' in message and 'raised after the 2026-10 growth' in message
+        assert 'shrink' in message
+        assert 'APPEND' in message
+        assert 'dashboard/src/dashboard/payload_budgets.json' in message
+
+
+class TestSlackViolation:
+    def test_the_constants_are_the_documented_ones(self) -> None:
+        assert MAX_SLACK_RATIO == 2.0
+        assert SLACK_FLOOR_BYTES == 32_768
+
+    @pytest.mark.parametrize(
+        ('budget', 'measured', 'violates'),
+        [
+            pytest.param(5_500_000, 2_000_000, True, id='a-large-shrink'),
+            pytest.param(5_500_000, 4_374_910, False, id='calibrated'),
+            pytest.param(19_000, 1_749, False, id='under-the-floor'),
+            pytest.param(5_500_000, 2, True, id='an-empty-payload'),
+        ],
+    )
+    def test_slack_is_budget_beyond_ratio_and_floor(
+        self, budget: int, measured: int, violates: bool,
+    ) -> None:
+        assert slack_violation(budget, measured) is violates
