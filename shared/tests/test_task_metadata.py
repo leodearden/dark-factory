@@ -169,6 +169,32 @@ class TestBeforeDone:
         with pytest.raises(ValidationError):
             BeforeDone(script='scripts/x.sh', timeout_secs=60, kind='bogus')  # type: ignore[arg-type]
 
+    def test_script_root_defaults_to_project(self):
+        bd = BeforeDone(script='scripts/x.sh', timeout_secs=60)
+        assert bd.script_root == 'project'
+
+    def test_factory_script_root_accepted_on_predicate(self):
+        bd = BeforeDone(
+            script='scripts/x.sh', timeout_secs=60, kind='predicate', script_root='factory',
+        )
+        assert bd.script_root == 'factory'
+
+    @pytest.mark.parametrize('kind_fields', [{'kind': 'deploy'}, {}], ids=['explicit', 'default'])
+    def test_factory_script_root_rejected_on_deploy(self, kind_fields):
+        with pytest.raises(ValidationError) as excinfo:
+            BeforeDone(script='scripts/x.sh', timeout_secs=60, script_root='factory', **kind_fields)
+        assert 'script_root' in str(excinfo.value)
+        assert 'predicate' in str(excinfo.value)
+
+    @pytest.mark.parametrize('kind', ['deploy', 'predicate'])
+    def test_project_script_root_accepted_on_both_kinds(self, kind):
+        bd = BeforeDone(script='scripts/x.sh', timeout_secs=60, kind=kind, script_root='project')
+        assert bd.script_root == 'project'
+
+    def test_script_root_bogus_rejected(self):
+        with pytest.raises(ValidationError):
+            BeforeDone(script='scripts/x.sh', timeout_secs=60, script_root='elsewhere')  # type: ignore[arg-type]
+
 
 class TestDoneProvenance:
     def test_merged_with_commit_constructs(self):

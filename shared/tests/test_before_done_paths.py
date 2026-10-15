@@ -14,6 +14,7 @@ import pytest
 from shared.before_done_paths import BeforeDonePaths, resolve_before_done_paths
 
 ROOT = Path('/srv/project')
+FACTORY = Path('/srv/factory')
 RELATIVE_SCRIPT = 'data/ops/deploy.sh'
 
 
@@ -57,6 +58,28 @@ class TestResolveBeforeDonePaths:
     def test_relative_project_root_is_rejected(self) -> None:
         with pytest.raises(ValueError, match='rel/root'):
             resolve_before_done_paths({'script': RELATIVE_SCRIPT}, Path('rel/root'))
+
+    def test_script_base_replaces_project_root_for_the_script_only(self) -> None:
+        paths = resolve_before_done_paths(
+            {'script': RELATIVE_SCRIPT}, ROOT, script_base=FACTORY,
+        )
+
+        assert paths == BeforeDonePaths(script=FACTORY / RELATIVE_SCRIPT, cwd=ROOT)
+
+    def test_script_base_does_not_move_a_relative_cwd(self) -> None:
+        paths = resolve_before_done_paths(
+            {'script': RELATIVE_SCRIPT, 'cwd': 'sub/dir'}, ROOT, script_base=FACTORY,
+        )
+
+        assert paths == BeforeDonePaths(
+            script=FACTORY / RELATIVE_SCRIPT, cwd=ROOT / 'sub/dir',
+        )
+
+    def test_relative_script_base_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match='rel/factory'):
+            resolve_before_done_paths(
+                {'script': RELATIVE_SCRIPT}, ROOT, script_base=Path('rel/factory'),
+            )
 
 
 class TestBeforeDonePathsInvariant:
