@@ -69,10 +69,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import httpx
+from pydantic import ValidationError
 from shared.locking import files_to_modules, modules_conflict
+from shared.scheduler_state import OverrideRecord, SchedulerStateSnapshot
 
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import collect_tasks_with_counts
@@ -82,6 +86,13 @@ from dashboard.data.task_snapshot import SnapshotHealth, classify
 from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
+
+# Lock depth for a snapshot that does not publish one (an older producer).
+_DEFAULT_LOCK_DEPTH = 2
+
+_NO_OVERRIDE = OverrideRecord()
+
+_ParkStacks = Mapping[str, Sequence[Mapping[str, Any]]]
 
 # ---------------------------------------------------------------------------
 # Short-TTL cache for get_scheduler_snapshot
@@ -207,10 +218,10 @@ async def get_scheduler_snapshot(
 
 def _module_contention_counts(
     rows: list[dict],
-    current_holders: dict[str, str],
+    current_holders: Mapping[str, str],
     *,
     project: str | None = None,
-    park_stacks: dict | None = None,
+    park_stacks: _ParkStacks | None = None,
     live_task_ids: set[str] | None = None,
 ) -> list[dict]:
     """Build a sorted module-contention list from task rows and current holders.
@@ -241,7 +252,7 @@ def _module_contention_counts(
                          ``current_holders`` map only contains task_ids from
                          the same project root.
         park_stacks:     Optional ``{module_key: [entry, ...]}`` from
-                         ``snapshot['park_stacks']``.  Each stack is in
+                         ``snapshot.park_stacks``.  Each stack is in
                          bottom→top order (``stack[-1]`` is the active top).
                          When provided, every path in *park_stacks* is included
                          even if it has no live waiters (contention: 0), so a
@@ -386,7 +397,7 @@ def _park_age_seconds(installed_at, *, now: datetime | None = None) -> int:
 
 
 def _stranded_park_rows(
-    park_stacks: dict,
+    park_stacks: _ParkStacks,
     live_task_ids: set[str],
     *,
     project: str | None = None,
@@ -474,8 +485,8 @@ def _stranded_park_rows(
 
 def _compose_rows(
     active_tasks: list[dict],
-    snapshot: dict,
-    depth: int = 2,
+    snapshot: SchedulerStateSnapshot,
+    depth: int = _DEFAULT_LOCK_DEPTH,
     *,
     now: datetime | None = None,
 ) -> list[dict]:
@@ -493,7 +504,7 @@ def _compose_rows(
     ``meta_files`` produce an empty ``lock_set`` and are correctly invisible to
     the contention view — they hold no scheduler locks.
 
-    Snapshot keys consumed: ``skip_counts``, ``parks``, ``effective_priorities``,
+    Snapshot fields consumed: ``skip_counts``, ``parks``, ``effective_priorities``,
     ``overrides``.
 
     *now* is the reference timestamp for park-age computation, resolved via
@@ -503,27 +514,20 @@ def _compose_rows(
 
     Returns one dict per task with all fields needed by the React scheduler tab.
     """
-    skip_counts: dict[str, int] = snapshot.get('skip_counts') or {}
-    parks: dict[str, dict] = snapshot.get('parks') or {}
-    effective_priorities: dict[str, str] = snapshot.get('effective_priorities') or {}
-    overrides: dict[str, dict] = snapshot.get('overrides') or {}
-
     result: list[dict] = []
     for task in active_tasks:
         tid = task.get('task_id') or ''
         declared = task.get('priority')
-        effective = effective_priorities.get(tid)
+        effective = snapshot.effective_priorities.get(tid)
         priority_differs = (effective is not None and effective != declared)
 
-        park_state = parks.get(tid)
-        if park_state:
-            # Age from when parks were installed.  Coerce to str up front
-            # — `or ''` handles None, but a number/dict would raise
-            # AttributeError on `.replace(...)` and was not previously caught.
-            installed_at_str = str(park_state.get('installed_at') or '')
+        park_state = snapshot.parks.get(tid)
+        if park_state is not None:
+            # Age from when parks were installed.  A naive stamp cannot be
+            # subtracted from the aware now (TypeError).
             try:
                 installed_at = datetime.fromisoformat(
-                    installed_at_str.replace('Z', '+00:00')
+                    park_state.installed_at.replace('Z', '+00:00')
                 )
                 age_seconds = int(
                     (resolve_now(now) - installed_at).total_seconds()
@@ -531,28 +535,28 @@ def _compose_rows(
                 age_seconds = max(age_seconds, 0)
             except (ValueError, TypeError):
                 logger.warning(
-                    'park_state.installed_at unparseable for %s: %r', tid, installed_at_str
+                    'park_state.installed_at unparseable for %s: %r', tid, park_state.installed_at
                 )
                 age_seconds = 0
         else:
             # Age from task started (minutes → seconds)
             age_seconds = int(task.get('started') or 0) * 60
 
-        ov: dict = overrides.get(tid) or {}
+        ov = snapshot.overrides.get(tid, _NO_OVERRIDE)
         result.append({
             'task_id': tid,
             'title': task.get('title') or '',
             'declared_priority': declared,
             'effective_priority': effective,
             'priority_differs': priority_differs,
-            'skip_count': skip_counts.get(tid, 0),
-            'park_state': park_state,
+            'skip_count': snapshot.skip_counts.get(tid, 0),
+            'park_state': park_state.model_dump(mode='json') if park_state is not None else None,
             'age_seconds': age_seconds,
             'lock_set': files_to_modules(task.get('meta_files') or [], depth),
-            'pinned': bool(ov.get('pinned')),
-            'reserve_now': bool(ov.get('reserve_now')),
-            'boost_tier': ov.get('boost_tier'),
-            'ttl_until': ov.get('ttl_until'),
+            'pinned': ov.pinned,
+            'reserve_now': ov.reserve_now,
+            'boost_tier': ov.boost_tier,
+            'ttl_until': ov.ttl_until,
             # project/project_root are copied verbatim so the React drawer's
             # ActionsPanel.submit and ActivePinsStrip unpin handlers can supply
             # the correct project_root in override/clear-override POSTs.
@@ -700,7 +704,7 @@ async def collect_scheduler_state(
         if project_label(root) not in offline_projects
     ]
 
-    async def _one_project(root) -> tuple[dict | None, list[dict], list[dict]]:
+    async def _one_project(root) -> tuple[SchedulerStateSnapshot | None, list[dict], list[dict]]:
         """Fetch snapshot + skip events + recovery events for one project root.
 
         Delegates the per-URL failover to ``mcp_fanout.first_success``: URLs
@@ -722,10 +726,11 @@ async def collect_scheduler_state(
         rows, which the projection would then report as a confident zero.
 
         Returns ``(snapshot, skip_events, recovery_events)`` on success —
-        ``snapshot`` may be ``{}`` for a project with no scheduler state yet
-        (online but empty), and is normalised to ``{}`` if the MCP server
-        returns a non-dict (defensive — older/buggy servers should never crash
-        the aggregator).  Returns ``(None, [], [])`` when every URL fails;
+        ``snapshot`` may be empty for a project with no scheduler state yet
+        (online but empty), and a reply that does not parse as a
+        ``SchedulerStateSnapshot`` is logged and read as
+        ``SchedulerStateSnapshot.empty()`` (a malformed reply is not a
+        transport failure).  Returns ``(None, [], [])`` when every URL fails;
         the ``None`` sentinel lets the caller distinguish *offline* from
         *online-but-empty* so a legitimately quiescent project is never
         misclassified as offline.
@@ -768,18 +773,22 @@ async def collect_scheduler_state(
                 )
             return events
 
-        async def _call(url: str) -> tuple[dict, list[dict], list[dict]]:
-            snapshot = await mcp_tool_call(
+        async def _call(url: str) -> tuple[SchedulerStateSnapshot, list[dict], list[dict]]:
+            reply = await mcp_tool_call(
                 client,
                 url,
                 'get_scheduler_state',
                 {'project_root': str(root)},
             )
-            # Normalise: a buggy/older MCP server returning a list or
-            # None must not propagate as AttributeError on downstream
-            # `.get(...)` calls.  Treat as online-but-empty.
-            if not isinstance(snapshot, dict):
-                snapshot = {}
+            try:
+                snapshot = SchedulerStateSnapshot.from_json(reply)
+            except ValidationError as exc:
+                logger.warning(
+                    'get_scheduler_state[%s] reply is not a scheduler snapshot; '
+                    'showing the project as online but empty: %s',
+                    label, exc,
+                )
+                snapshot = SchedulerStateSnapshot.empty()
             skip_events = await _fetch_events(
                 url, _SKIP_EVENT_TYPES, _SCHEDULER_EVENTS_LIMIT, 'skip',
             )
@@ -831,17 +840,16 @@ async def collect_scheduler_state(
         snapshot, skip_events, recovery_events = result
         label = project_label(root)
 
-        # None snapshot means every URL failed (offline); {} means online-but-empty.
+        # None snapshot means every URL failed (offline); an empty one means
+        # online-but-empty.
         if snapshot is None:
             offline_projects.append(label)
             continue
 
-        # Aggregate pause state — reads defensively so pre-upgrade snapshots
-        # (missing is_paused key) degrade to "not paused" without error.
-        if snapshot.get('is_paused'):
+        if snapshot.is_paused:
             all_paused_projects.append({
                 'project': label,
-                'reason': snapshot.get('pause_reason'),
+                'reason': snapshot.pause_reason,
             })
 
         # Build task lookup from active_tasks for this project
@@ -870,7 +878,7 @@ async def collect_scheduler_state(
         # Compose rows — normalize footprints to the scheduler's lock_depth so
         # row lock_set values match the snapshot's current_holders keys.  Older
         # snapshots without lock_depth degrade to the default depth of 2.
-        depth = snapshot.get('lock_depth', 2)
+        depth = snapshot.lock_depth if snapshot.lock_depth is not None else _DEFAULT_LOCK_DEPTH
         rows = _compose_rows(enriched, snapshot, depth, now=effective_now)
         all_rows.extend(rows)
 
@@ -878,14 +886,10 @@ async def collect_scheduler_state(
         # for the liveness oracle (PRD §3).  A park owner absent from this set
         # is stranded and gets a synthetic row in the orphan pass below.
         live_task_ids: set[str] = {r['task_id'] for r in rows}
-        # park_stacks: dict[module → list[entry]] from the snapshot (β pass-through).
-        # None-safe: pre-upgrade snapshots lacking the key degrade to empty dict.
+        # park_stacks: module → stack of entries from the snapshot (β pass-through).
         # A degraded project's live set is empty because its task read never
         # finished, so every park verdict drawn from it would be a guess.
-        park_stacks: dict = (
-            {} if label in degraded_projects
-            else snapshot.get('park_stacks') or {}
-        )
+        park_stacks: _ParkStacks = {} if label in degraded_projects else snapshot.park_stacks
 
         # Module contention from composed rows + snapshot holders.
         # Tag each module with the owning `project` so _merge_module_lists can
@@ -894,9 +898,8 @@ async def collect_scheduler_state(
         # park_stacks/live_task_ids flow through so fully-stranded modules still
         # get an entry (contention: 0) and every module entry carries
         # parked_by/park_stack (PRD §5 read-seam contract, task γ B1/B2).
-        current_holders: dict[str, str] = snapshot.get('current_holders') or {}
         modules = _module_contention_counts(
-            rows, current_holders,
+            rows, snapshot.current_holders,
             project=label,
             park_stacks=park_stacks,
             live_task_ids=live_task_ids,
@@ -918,12 +921,9 @@ async def collect_scheduler_state(
         # numeric id can appear in two projects' pin queues; without these
         # fields the React strip would collapse rows under a duplicate key
         # and the per-project reorder call would be ambiguous.
-        pin_queue_raw = snapshot.get('pin_queue') or []
-        for pin in pin_queue_raw:
-            if not isinstance(pin, dict):
-                continue
+        for pin in snapshot.pin_queue:
             all_pin_queue.append({
-                **pin,
+                **pin.model_dump(mode='json'),
                 'project': label,
                 'project_root': str(root),
             })
