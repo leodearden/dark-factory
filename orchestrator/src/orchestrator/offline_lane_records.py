@@ -23,8 +23,10 @@ logger = logging.getLogger(__name__)
 RECORD_RETENTION = timedelta(days=14)
 FIRST_LINE_MAX_CHARS = 300
 
-# Underscored because command_key's alphabet cannot produce '_': no configured
-# command name can ever map onto a legacy leg's directory.
+# Underscored because command_key's alphabet cannot produce '_', so no slug is a
+# legacy key; a generic pass named exactly a legacy name is refused by
+# RunRecordStore.allocate_pass. Distinct names that slug alike share a directory
+# until task 4078's name validator lands, and reads filter on the header command.
 LEGACY_NUMERIC_COMMAND = 'legacy_numeric'
 LEGACY_INFRA_COMMAND = 'legacy_infra'
 LEGACY_COMMANDS: frozenset[str] = frozenset({LEGACY_NUMERIC_COMMAND, LEGACY_INFRA_COMMAND})
@@ -122,7 +124,10 @@ def _get_instant(payload: Mapping[str, Any], key: str) -> datetime:
     instant = datetime.fromisoformat(_get(payload, key, str))
     if instant.tzinfo is None:
         raise ValueError(f'{key!r} must carry a UTC offset')
-    return instant.astimezone(UTC)
+    try:
+        return instant.astimezone(UTC)
+    except OverflowError as exc:
+        raise ValueError(f'{key!r} is out of range in UTC: {exc}') from exc
 
 
 def _get_member(payload: Mapping[str, Any], key: str, allowed: Collection[str]) -> str:
@@ -306,6 +311,15 @@ def _subdirectories(directory: Path) -> list[Path]:
     return sorted(entry for entry in directory.iterdir() if entry.is_dir())
 
 
+def _removed(pass_dir: Path) -> bool:
+    try:
+        shutil.rmtree(pass_dir)
+    except OSError as exc:
+        logger.warning('offline-lane: could not prune run records %s: %s', pass_dir, exc)
+        return False
+    return True
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -340,6 +354,8 @@ class RunRecordStore:
         return self._clock()
 
     def allocate_pass(self, command: str, leg: Leg | str, head: str) -> LanePass:
+        if Leg(leg) is Leg.GENERIC and command in LEGACY_COMMANDS:
+            raise ValueError(f'{command!r} names a legacy leg, not a generic command')
         started_at = self.now()
         pass_id = pass_id_for(started_at, head)
         lane_pass = LanePass(
@@ -402,10 +418,11 @@ class RunRecordStore:
         if not path.is_file():
             return None
         try:
-            return _pass_from_json(_read_payload(path))
+            record = _pass_from_json(_read_payload(path))
         except (LookupError, ValueError) as exc:
             logger.warning('offline-lane: skipping malformed run record %s: %s', path, exc)
             return None
+        return record if record.command == command else None
 
     def passes_since(self, command: str, since: datetime) -> Iterator[PassRecord]:
         for pass_dir in _subdirectories(self.root / command_key(command)):
@@ -424,6 +441,6 @@ class RunRecordStore:
                 started_at = _pass_started_at(pass_dir.name)
                 if started_at is None or started_at >= cutoff or pass_dir.name in pinned_pass_ids:
                     continue
-                shutil.rmtree(pass_dir)
-                pruned.append(pass_dir.name)
+                if _removed(pass_dir):
+                    pruned.append(pass_dir.name)
         return pruned
