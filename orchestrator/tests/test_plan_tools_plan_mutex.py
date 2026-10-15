@@ -37,6 +37,7 @@ from orchestrator.mcp.plan_tools import (
 
 _SEED = RepoSeed(files=(('.gitignore', '.task/\n'), ('m.py', 'x = 1\n')), message='Initial')
 _REJECTIONS = plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY
+_UNBLOCKED_WRITER_BOUND_SECS = 10.0
 
 
 @pytest.fixture(autouse=True)
@@ -205,3 +206,22 @@ def test_a_mutator_without_its_mutex_refuses_to_write(lane: _Lane) -> None:
         undecorated(lane.artifacts, 'step-3', 'impl', 'third')
 
     assert plan_path.read_bytes() == before
+
+
+def test_mark_step_committed_refuses_an_off_branch_sha_without_waiting_for_the_mutex(
+    lane: _Lane,
+) -> None:
+    """The reachability probe reads no plan, so no plan writer waits on its git subprocess."""
+    envelopes: list[dict[str, Any]] = []
+
+    outcome = race_writer_against_held_mutex(
+        lane.artifacts,
+        lambda: envelopes.append(_mark_step_committed(lane.artifacts, 'step-1', 'f' * 40)),
+        probe_secs=_UNBLOCKED_WRITER_BOUND_SECS,
+    )
+
+    assert not outcome.blocked, 'the off-branch refusal waited for the held plan mutex'
+    assert outcome.writer_error is None
+    assert envelopes[0]['ok'] is False, envelopes[0]
+    assert _holder_marked(outcome.plan)
+    assert _step(outcome.plan, 'step-1')['status'] != 'done'

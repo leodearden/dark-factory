@@ -423,6 +423,12 @@ class TaskArtifacts:
         the ownership lock ``lock_plan`` (plan.lock). A vanished root takes no
         lock: it holds no plan to lose an update of, and must not be
         re-materialized by locking.
+
+        A WAIT BLOCKS THE CALLING THREAD, for up to PLAN_MUTEX_TIMEOUT_SECS. The
+        orchestrator calls its plan methods synchronously on its event-loop
+        thread, so while a plan-tools process holds the mutex, every task
+        workflow in the orchestrator stalls. Keep critical sections short, and
+        never hold one across a subprocess the plan does not depend on.
         """
         lock_path = self._plan_mutex_path()
         if lock_path is None:
