@@ -1000,29 +1000,46 @@ def _section_title(node_id: str) -> str:
     return '.'.join(node_id.split('::')[1:]) or node_id
 
 
-def _section_first_error_line(test_output: str, node_id: str, kind: FailureKind) -> str:
-    """First ``E   `` line of the FAILURES/ERRORS section pytest printed for the test."""
+_SectionBodies = dict[tuple[str, FailureKind], list[str]]
+
+
+def _section_bodies(test_output: str) -> _SectionBodies:
+    """Every FAILURES/ERRORS section body, keyed by its ``(title, kind)``, in output order."""
+    bodies: _SectionBodies = {}
     for header in _SECTION_HEADER_RE.finditer(test_output):
         title = _ERROR_SECTION_PREFIX_RE.sub('', header.group(1))
-        header_kind = FailureKind.ERROR if title != header.group(1) else FailureKind.FAILED
-        if (title, header_kind) != (_section_title(node_id), kind):
-            continue
+        kind = FailureKind.ERROR if title != header.group(1) else FailureKind.FAILED
         section_end = _SECTION_END_RE.search(test_output, header.end())
         body = test_output[header.end() : section_end.start() if section_end else len(test_output)]
-        traceback_line = _PYTEST_TRACEBACK_E_RE.search(body)
-        if traceback_line:
-            return traceback_line.group(0).removeprefix(_TRACEBACK_E_PREFIX).strip()
+        bodies.setdefault((title, kind), []).append(body)
+    return bodies
+
+
+def _section_body_of(sections: _SectionBodies, node_id: str, kind: FailureKind) -> str | None:
+    candidates = sections.get((_section_title(node_id), kind), [])
+    if len(candidates) <= 1:
+        return candidates[0] if candidates else None
+    path_line = re.compile(rf'^{re.escape(node_id.partition("::")[0])}:\d+:', re.MULTILINE)
+    naming_path = [body for body in candidates if path_line.search(body)]
+    return naming_path[0] if len(naming_path) == 1 else None
+
+
+def _section_first_error_line(sections: _SectionBodies, node_id: str, kind: FailureKind) -> str:
+    """First ``E   `` line of the FAILURES/ERRORS section pytest printed for the test."""
+    body = _section_body_of(sections, node_id, kind)
+    traceback_line = _PYTEST_TRACEBACK_E_RE.search(body) if body is not None else None
+    if traceback_line:
+        return traceback_line.group(0).removeprefix(_TRACEBACK_E_PREFIX).strip()
     return ''
 
 
-def _first_line(
-    test_output: str, node_id: str, kind: FailureKind, matches: list[_FailureMatch],
-) -> str:
+def _stated_first_line(matches: list[_FailureMatch]) -> str | None:
+    """The summary-line reason, ``''`` when no surface can carry one, ``None`` when the sections must be read."""
     stated_reasons = [m.summary_reason for m in matches if m.summary_reason]
     if stated_reasons:
         return stated_reasons[0]
     if any(m.summary_reason is not None for m in matches):
-        return _section_first_error_line(test_output, node_id, kind)
+        return None
     return ''
 
 
@@ -1033,7 +1050,9 @@ def parse_pytest_failures(test_output: str) -> tuple[PytestFailure, ...]:
     first-seen (leftmost-match) order, de-duplicated on ``(node_id, kind)``: a
     node that is both FAILED and ERROR yields two entries.  ``first_line`` is the
     reason on the short-summary line, else the first ``E   `` line of the test's
-    own FAILURES/ERRORS section, else ``''``; it is not length-capped.  Returns
+    own FAILURES/ERRORS section, else ``''``; it is not length-capped.  Sections
+    sharing a title are told apart by the ``path:line:`` lines naming the test's
+    file; if that does not single one out, ``first_line`` is ``''``.  Returns
     ``()`` for falsy *test_output*.
     """
     if not test_output:
@@ -1041,9 +1060,14 @@ def parse_pytest_failures(test_output: str) -> tuple[PytestFailure, ...]:
     by_identity: dict[tuple[str, FailureKind], list[_FailureMatch]] = {}
     for match in _failure_matches(test_output):
         by_identity.setdefault((match.node_id, match.kind), []).append(match)
+    stated = {identity: _stated_first_line(matches) for identity, matches in by_identity.items()}
+    sections = _section_bodies(test_output) if None in stated.values() else {}
     return tuple(
-        PytestFailure(node_id, kind, _first_line(test_output, node_id, kind, matches))
-        for (node_id, kind), matches in by_identity.items()
+        PytestFailure(
+            node_id, kind,
+            _section_first_error_line(sections, node_id, kind) if line is None else line,
+        )
+        for (node_id, kind), line in stated.items()
     )
 
 
@@ -1059,7 +1083,7 @@ def _extract_failing_test_ids(test_output: str) -> list[str]:
     caller (``confirm_main_tip_failure_is_real``) treats that as "unconfirmable"
     and fails safe to alarm.  Byte-identical to the pre-typed-parse scan.
     """
-    return node_ids_of(parse_pytest_failures(test_output))
+    return list(dict.fromkeys(match.node_id for match in _failure_matches(test_output)))
 
 
 class _JunitTestIds(NamedTuple):

@@ -1984,6 +1984,48 @@ class TestParsePytestFailures:
         )
         assert self._parse(output) == [('tests/a.py::test_x', 'failed', '')]
 
+    def test_same_named_tests_in_two_files_each_take_their_own_section(self):
+        output = (
+            '=== FAILURES ===\n'
+            '___ test_x ___\n'
+            'tests/a.py:3: in test_x\n'
+            'E   KeyError: from a\n'
+            '___ test_x ___\n'
+            'tests/b.py:9: in test_x\n'
+            'E   ValueError: from b\n'
+            '=== short test summary info ===\n'
+            'FAILED tests/b.py::test_x\n'
+            'FAILED tests/a.py::test_x\n'
+        )
+        assert self._parse(output) == [
+            ('tests/b.py::test_x', 'failed', 'ValueError: from b'),
+            ('tests/a.py::test_x', 'failed', 'KeyError: from a'),
+        ]
+
+    def test_same_named_tests_whose_sections_name_no_path_leave_first_line_empty(self):
+        output = (
+            '___ test_x ___\n'
+            'E   KeyError: from a\n'
+            '___ test_x ___\n'
+            'E   ValueError: from b\n'
+            'FAILED tests/a.py::test_x\n'
+            'FAILED tests/b.py::test_x\n'
+        )
+        assert self._parse(output) == [
+            ('tests/a.py::test_x', 'failed', ''),
+            ('tests/b.py::test_x', 'failed', ''),
+        ]
+
+    def test_extract_failing_test_ids_returns_every_reasonless_failure(self):
+        count = 500
+        output = (
+            ''.join(f'___ test_{i} ___\nE   Boom: {i}\n' for i in range(count))
+            + ''.join(f'FAILED tests/a.py::test_{i}\n' for i in range(count))
+        )
+        assert verify._extract_failing_test_ids(output) == [
+            f'tests/a.py::test_{i}' for i in range(count)
+        ]
+
     def test_xdist_crash_has_no_section_first_line(self):
         output = (
             '___ test_x ___\n'
