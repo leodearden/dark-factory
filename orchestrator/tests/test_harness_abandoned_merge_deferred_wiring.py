@@ -14,12 +14,10 @@ from pathlib import Path
 from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
-from escalation.queue import EscalationQueue
-from test_merge_deferred_recovery import ParkedScheduler
+from test_merge_deferred_recovery import ParkedScheduler, _abandoned_records
 from test_reconcile_stranded import _bind_queue
 
 from orchestrator.harness import Harness
-from orchestrator.merge_deferred_recovery import MERGE_DEFERRED_ABANDONED_CATEGORY
 from orchestrator.merge_lane import MemberRedriveOutcome, SpeculativeMergeWorker
 
 
@@ -61,13 +59,6 @@ async def _stranded_reconcile_pass(harness: Harness) -> None:
     await harness._run_stranded_reconcile_pass()
 
 
-def _abandoned_l1s(queue: EscalationQueue, tid: str) -> list[tuple[int, str]]:
-    return [
-        (esc.level, esc.severity) for esc in queue.get_by_task(tid, status='pending')
-        if esc.category == MERGE_DEFERRED_ABANDONED_CATEGORY
-    ]
-
-
 @pytest.mark.asyncio
 class TestRecoverAbandonedMergeDeferred:
     async def test_the_second_consecutive_sighting_redrives_and_escalates(
@@ -86,7 +77,7 @@ class TestRecoverAbandonedMergeDeferred:
         assert lane.redrive_abandoned_members.await_args_list == [
             call(ANY, ['x'], strip_unlanded_base=True),
         ]
-        assert _abandoned_l1s(queue, 'x') == [(1, 'info')]
+        assert _abandoned_records(queue, 'x') == [(0, 'info')]
 
     async def test_no_merge_worker_is_a_noop(
         self, harness: Harness, sched: ParkedScheduler, tmp_path: Path,
@@ -138,5 +129,5 @@ class TestStrandedReconcilePassWiring:
         assert lane.redrive_abandoned_members.await_args_list == [
             call(ANY, ['x'], strip_unlanded_base=True),
         ]
-        assert _abandoned_l1s(queue, 'x') == [(1, 'info')]
+        assert _abandoned_records(queue, 'x') == [(0, 'info')]
         assert sched.statuses == {'x': ['merge-deferred']}

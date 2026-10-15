@@ -2526,8 +2526,6 @@ class Harness:
         is that status's owner.  A fault is logged and swallowed so it never
         fails the pass and starves the next stranded reconcile.
         """
-        if self._merge_worker is None:
-            return
         try:
             await self._abandoned_member_sweep.run_pass(
                 lane=self._merge_worker,

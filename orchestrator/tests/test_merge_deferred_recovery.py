@@ -261,7 +261,10 @@ class _FakeTasks:
         assert distinguish_failure
         assert 'merge-deferred' in set(statuses)
         self.listings += 1
-        return None if self.rows is None else [dict(row) for row in self.rows]
+        wanted = set(statuses)
+        if self.rows is None:
+            return None
+        return [dict(row) for row in self.rows if row['status'] in wanted]
 
     def is_actively_held(self, tid: str) -> bool:
         return tid in self.held
@@ -308,10 +311,12 @@ def sweep(tmp_path: Path) -> _Sweep:
     )
 
 
-def _file(queue: EscalationQueue, tid: str, *, category: str, severity: str) -> None:
+def _file(
+    queue: EscalationQueue, tid: str, *, category: str, severity: str, level: int = 1,
+) -> None:
     queue.submit(Escalation(
         id=queue.make_id(tid), task_id=tid, agent_role='test', severity=severity,
-        category=category, summary='pre-existing', level=1,
+        category=category, summary='pre-existing', level=level,
     ))
 
 
@@ -368,17 +373,27 @@ class TestDebounce:
         assert sweep.redriven() == []
         assert sweep.filed('a') == []
 
+    async def test_a_pass_without_a_lane_restarts_the_count(self, sweep: _Sweep) -> None:
+        await sweep.run()
+        await sweep.run(lane=None)
+        await sweep.run()
+        assert sweep.redriven() == []
+
+        await sweep.run()
+
+        assert sweep.redriven() == [(['a'], True)]
+
 
 @pytest.mark.asyncio
 class TestEscalation:
-    async def test_a_recovery_files_one_info_l1_naming_the_absent_owners(
+    async def test_a_recovery_files_one_info_l0_receipt_naming_the_absent_owners(
         self, sweep: _Sweep,
     ) -> None:
         await sweep.run()
         await sweep.run()
 
         (esc,) = sweep.filed('a')
-        assert (esc.level, esc.severity, esc.suggested_action) == (1, 'info', 'close_only')
+        assert (esc.level, esc.severity, esc.suggested_action) == (0, 'info', 'close_only')
         assert MemberRedriveOutcome.NOT_ON_MAIN in esc.summary
         for signal in ('custody', 'workflow', 'claimant', 'escalation', 'peer'):
             assert signal in esc.detail
@@ -396,8 +411,8 @@ class TestEscalation:
         await sweep.run()
 
         (esc,) = sweep.filed('a')
-        assert (esc.severity, esc.suggested_action) == (
-            'blocking', 'investigate_stranded_merge_deferred',
+        assert (esc.level, esc.severity, esc.suggested_action) == (
+            1, 'blocking', 'investigate_stranded_merge_deferred',
         )
 
         report = await sweep.run()
@@ -419,16 +434,42 @@ class TestEscalation:
         assert sweep.redriven() == [(['a'], True)]
         assert sweep.filed('a') == []
 
-    async def test_an_open_l1_of_the_category_suppresses_a_second_filing(
+    async def test_an_open_record_of_the_same_severity_suppresses_a_second_filing(
         self, sweep: _Sweep,
     ) -> None:
         assert sweep.queue is not None
-        _file(sweep.queue, 'a', category=MERGE_DEFERRED_ABANDONED_CATEGORY, severity='info')
+        _file(
+            sweep.queue, 'a', category=MERGE_DEFERRED_ABANDONED_CATEGORY,
+            severity='info', level=0,
+        )
         await sweep.run()
         await sweep.run()
 
         assert sweep.redriven() == [(['a'], True)]
         assert [esc.summary for esc in sweep.filed('a')] == ['pre-existing']
+
+    @pytest.mark.parametrize('receipt_level', [0, 1])
+    async def test_an_open_receipt_never_suppresses_a_failure_which_then_pins(
+        self, sweep: _Sweep, receipt_level: int,
+    ) -> None:
+        assert sweep.queue is not None
+        _file(
+            sweep.queue, 'a', category=MERGE_DEFERRED_ABANDONED_CATEGORY,
+            severity='info', level=receipt_level,
+        )
+        sweep.lane.outcomes['a'] = MemberRedriveOutcome.ERRORED
+        await sweep.run()
+        await sweep.run()
+
+        assert {(esc.level, esc.severity) for esc in sweep.filed('a')} == {
+            (1, 'blocking'), (receipt_level, 'info'),
+        }
+
+        report = await sweep.run()
+        await sweep.run()
+
+        assert report.owners[ParkedOwner.EXTERNAL_HOLD] == 1
+        assert sweep.redriven() == [(['a'], True)]
 
     async def test_a_lane_failure_on_one_target_does_not_stop_the_next(
         self, sweep: _Sweep,
@@ -440,7 +481,6 @@ class TestEscalation:
 
         assert sorted(ids for ids, _ in sweep.redriven()) == [['a'], ['b'], ['c']]
         assert report.outcomes['b'] is MemberRedriveOutcome.ERRORED
-        assert report.errored == frozenset({'b'})
         assert [esc.severity for esc in sweep.filed('b')] == ['blocking']
         assert [esc.severity for esc in sweep.filed('c')] == ['info']
 
@@ -499,6 +539,56 @@ class TestOwnership:
             assert mid in esc.detail
         assert sweep.filed('d0') == sweep.filed('d1') == []
 
+    @pytest.mark.parametrize('landed', [
+        MemberRedriveOutcome.ON_MAIN_ATTRIBUTED, MemberRedriveOutcome.ON_MAIN_UNATTRIBUTED,
+    ])
+    async def test_a_tip_found_on_main_carries_the_rest_of_its_train_in_one_pass(
+        self, sweep: _Sweep, landed: MemberRedriveOutcome,
+    ) -> None:
+        sweep.tasks.rows = [
+            _row(f'd{order}', train={'id': 'T', 'order': order}) for order in (0, 1, 2)
+        ]
+        sweep.lane.outcomes.update(d0=landed, d1=landed, d2=landed)
+        await sweep.run()
+        report = await sweep.run()
+
+        assert sweep.redriven() == [(['d2'], False), (['d0', 'd1'], False)]
+        assert report.outcomes == {'d0': landed, 'd1': landed, 'd2': landed}
+        (esc,) = sweep.filed('d2')
+        assert (esc.level, esc.severity) == (0, 'info')
+        for mid in ('d0', 'd1', 'd2'):
+            assert f'{mid} {landed}' in esc.detail
+        assert sweep.filed('d0') == sweep.filed('d1') == []
+
+    async def test_a_landed_tip_whose_peer_fails_files_one_blocking_record(
+        self, sweep: _Sweep,
+    ) -> None:
+        sweep.tasks.rows = [
+            _row(f'd{order}', train={'id': 'T', 'order': order}) for order in (0, 1)
+        ]
+        sweep.lane.outcomes.update(
+            d0=MemberRedriveOutcome.ERRORED, d1=MemberRedriveOutcome.ON_MAIN_ATTRIBUTED,
+        )
+        await sweep.run()
+        await sweep.run()
+
+        assert sweep.redriven() == [(['d1'], False), (['d0'], False)]
+        (esc,) = sweep.filed('d1')
+        assert (esc.level, esc.severity) == (1, 'blocking')
+        assert 'd0 errored' in esc.detail
+
+    async def test_an_infra_held_peer_keeps_its_train_active(self, sweep: _Sweep) -> None:
+        sweep.tasks.rows = [
+            _row('d0', train={'id': 'T', 'order': 0}),
+            _row('d1', train={'id': 'T', 'order': 1}),
+            _row('d2', status='infra-hold', train={'id': 'T', 'order': 2}),
+        ]
+        await sweep.run()
+        report = await sweep.run()
+
+        assert report.owners[ParkedOwner.TRAIN_PEER_ACTIVE] == 2
+        assert sweep.redriven() == []
+
 
 # ---------------------------------------------------------------------------
 # Part 3: members a restart left parked, against real collaborators
@@ -547,7 +637,7 @@ async def git_ops(tmp_path: Path) -> GitOps:
     return _make_git_ops(root)
 
 
-def _abandoned_l1s(queue: EscalationQueue, tid: str) -> list[tuple[int, str]]:
+def _abandoned_records(queue: EscalationQueue, tid: str) -> list[tuple[int, str]]:
     return [
         (esc.level, esc.severity) for esc in queue.get_by_task(tid, status='pending')
         if esc.category == MERGE_DEFERRED_ABANDONED_CATEGORY
@@ -608,7 +698,7 @@ class TestRecoveryAfterARestart:
             for tid in ('live1', 'live2', 'd0'):
                 assert sched.statuses[tid] == parked[tid]
             for tid in ('landed', 'unlanded', 'stacked', 'd1'):
-                assert _abandoned_l1s(queue, tid) == [(1, 'info')]
+                assert _abandoned_records(queue, tid) == [(0, 'info')]
             for tid in ('d0', 'live1', 'live2'):
                 assert queue.get_by_task(tid, status='pending') == []
 

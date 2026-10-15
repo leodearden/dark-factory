@@ -20,11 +20,12 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from escalation.models import Escalation
 from shared.task_claimant import is_stranded_any_status
+from shared.task_statuses import ACTIVE
 
 from orchestrator.merge_lane import MemberRedriveOutcome
 from orchestrator.recovery_pins import records_pin_recovery
 from orchestrator.scheduler import train_order_key
-from orchestrator.task_status import ACTIVE_TASK_STATUSES, TaskStatus
+from orchestrator.task_status import TaskStatus
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
@@ -39,11 +40,11 @@ _ABSENT_OWNERS = (
     'no train in merge-lane custody, no live workflow, no live claimant, '
     'no pinning escalation and no active declared-train peer'
 )
-_RECOVERED: frozenset[MemberRedriveOutcome] = frozenset({
-    MemberRedriveOutcome.NOT_ON_MAIN,
+_LANDED: frozenset[MemberRedriveOutcome] = frozenset({
     MemberRedriveOutcome.ON_MAIN_ATTRIBUTED,
     MemberRedriveOutcome.ON_MAIN_UNATTRIBUTED,
 })
+_RECOVERED: frozenset[MemberRedriveOutcome] = _LANDED | {MemberRedriveOutcome.NOT_ON_MAIN}
 _NOT_ACTED_ON: frozenset[MemberRedriveOutcome] = frozenset({
     MemberRedriveOutcome.NOT_PARKED,
     MemberRedriveOutcome.HELD_BY_LIVE_TRAIN,
@@ -136,6 +137,11 @@ class RecoveryTarget:
     strip_unlanded_base: bool
     declared_train_id: str | None
 
+    @property
+    def landed_with_tip(self) -> tuple[str, ...]:
+        """The members whose commits a landed tip carried onto main."""
+        return tuple(mid for mid in self.members if mid != self.redrive_id)
+
 
 def owner_of(member: ParkedMember, view: OwnershipView) -> ParkedOwner:
     if member.task_id in view.custody:
@@ -163,8 +169,8 @@ def recovery_targets(
     abandoned: Iterable[ParkedMember], view: OwnershipView,
 ) -> tuple[RecoveryTarget, ...]:
     """A member of no declared train is re-driven alone, un-stacked.  An abandoned
-    declared train is re-driven through its tip alone, never un-stacked: only
-    the tip's branch carries every member's commits.  A train is a target only
+    declared train is re-driven through its tip, never un-stacked: only the
+    tip's branch carries every member's commits.  A train is a target only
     when every peer the view lists is among *abandoned*."""
     solos: list[RecoveryTarget] = []
     trains: dict[str, list[tuple[tuple[int, int], str]]] = {}
@@ -222,13 +228,6 @@ class SweepReport:
     suspects: frozenset[str]
     outcomes: Mapping[str, MemberRedriveOutcome]
 
-    @property
-    def errored(self) -> frozenset[str]:
-        return frozenset(
-            tid for tid, outcome in self.outcomes.items()
-            if outcome not in _RECOVERED and outcome not in _NOT_ACTED_ON
-        )
-
 
 _NOTHING_SWEPT = SweepReport(owners={}, suspects=frozenset(), outcomes={})
 
@@ -241,7 +240,7 @@ class _Snapshot:
 
 class AbandonedMemberSweep:
     """Re-drives each merge-deferred member found abandoned on two consecutive
-    passes, and files one L1 per member it acted on."""
+    passes, and files one escalation per target it acted on."""
 
     def __init__(self) -> None:
         self._suspects: frozenset[str] = frozenset()
@@ -267,8 +266,9 @@ class AbandonedMemberSweep:
         outcomes: dict[str, MemberRedriveOutcome] = {}
         for target in recovery_targets(abandoned, view):
             if target.redrive_id in previous:
-                outcomes[target.redrive_id] = await _redrive(lane, target)
-                _file_escalation(escalations, target, outcomes[target.redrive_id])
+                target_outcomes = await _recover(lane, target)
+                outcomes.update(target_outcomes)
+                _file_escalation(escalations, target, target_outcomes)
         counts = Counter(owners.values())
         report = SweepReport(
             owners={owner: counts[owner] for owner in ParkedOwner},
@@ -284,7 +284,9 @@ class AbandonedMemberSweep:
 
 
 async def _snapshot(tasks: ParkedTaskStore, claimant_ttl: timedelta) -> _Snapshot | None:
-    rows = await tasks.get_tasks(statuses=ACTIVE_TASK_STATUSES, distinguish_failure=True)
+    """Every non-terminal row, infra-hold included: an infra-held peer keeps
+    its declared train active."""
+    rows = await tasks.get_tasks(statuses=ACTIVE, distinguish_failure=True)
     if rows is None:
         logger.warning(
             'Abandoned merge-deferred sweep: the task listing failed — skipping this '
@@ -344,36 +346,75 @@ def _pending_records(
         return None
 
 
-async def _redrive(lane: ParkedMemberLane, target: RecoveryTarget) -> MemberRedriveOutcome:
+async def _recover(
+    lane: ParkedMemberLane, target: RecoveryTarget,
+) -> dict[str, MemberRedriveOutcome]:
+    """Re-drive *target*'s tip.  A tip found on main carried the rest of its
+    declared train onto main, so they are re-driven in the same pass."""
+    outcomes = await _redrive(
+        lane, target.label, (target.redrive_id,),
+        strip_unlanded_base=target.strip_unlanded_base,
+    )
+    if outcomes[target.redrive_id] in _LANDED and target.landed_with_tip:
+        outcomes |= await _redrive(
+            lane, target.label, target.landed_with_tip, strip_unlanded_base=False,
+        )
+    return outcomes
+
+
+async def _redrive(
+    lane: ParkedMemberLane, label: str, member_ids: Sequence[str], *, strip_unlanded_base: bool,
+) -> dict[str, MemberRedriveOutcome]:
     try:
         outcomes = await lane.redrive_abandoned_members(
-            target.label, [target.redrive_id], strip_unlanded_base=target.strip_unlanded_base,
+            label, list(member_ids), strip_unlanded_base=strip_unlanded_base,
         )
-        return outcomes[target.redrive_id]
+        return {mid: outcomes[mid] for mid in member_ids}
     except Exception:
         logger.exception(
             'Abandoned merge-deferred sweep: re-driving %s (%s) raised — '
-            'continuing with the remaining targets', target.redrive_id, target.label,
+            'continuing with the remaining targets', ', '.join(member_ids), label,
         )
-        return MemberRedriveOutcome.ERRORED
+        return dict.fromkeys(member_ids, MemberRedriveOutcome.ERRORED)
+
+
+@dataclass(frozen=True)
+class _Filing:
+    level: int
+    severity: str
+    suggested_action: str
+    verdict: str
+
+
+_RECEIPT = _Filing(
+    level=0, severity='info', suggested_action='close_only', verdict='recovered',
+)
+_STRANDED = _Filing(
+    level=1, severity='blocking', suggested_action='investigate_stranded_merge_deferred',
+    verdict='NOT recovered',
+)
 
 
 def _file_escalation(
-    escalations: EscalationQueue | None, target: RecoveryTarget, outcome: MemberRedriveOutcome,
+    escalations: EscalationQueue | None,
+    target: RecoveryTarget,
+    outcomes: Mapping[str, MemberRedriveOutcome],
 ) -> None:
-    if outcome in _NOT_ACTED_ON:
+    acted = {mid: outcome for mid, outcome in outcomes.items() if outcome not in _NOT_ACTED_ON}
+    if not acted:
         return
+    filing = _RECEIPT if all(o in _RECOVERED for o in acted.values()) else _STRANDED
     task_id = target.redrive_id
     if escalations is None:
         logger.warning(
-            'Abandoned merge-deferred sweep: no escalation queue — %s re-driven '
-            '(%s) with nothing filed', task_id, outcome,
+            'Abandoned merge-deferred sweep: no escalation queue — %s %s (%s) '
+            'with nothing filed', task_id, filing.verdict, _render(acted),
         )
         return
     try:
-        if escalations.has_open_l1(task_id, category=MERGE_DEFERRED_ABANDONED_CATEGORY):
+        if _already_filed(escalations, task_id, filing):
             return
-        escalations.submit(_escalation(escalations.make_id(task_id), target, outcome))
+        escalations.submit(_escalation(escalations.make_id(task_id), target, acted, filing))
     except Exception:
         logger.warning(
             'Abandoned merge-deferred sweep: filing the escalation for %s failed',
@@ -381,10 +422,24 @@ def _file_escalation(
         )
 
 
+def _already_filed(escalations: EscalationQueue, task_id: str, filing: _Filing) -> bool:
+    """An open record of the same severity, so a receipt never hides a failure."""
+    return any(
+        esc.category == MERGE_DEFERRED_ABANDONED_CATEGORY and esc.severity == filing.severity
+        for esc in escalations.get_by_task(task_id, status='pending')
+    )
+
+
+def _render(outcomes: Mapping[str, MemberRedriveOutcome]) -> str:
+    return ', '.join(f'{mid} {outcome}' for mid, outcome in outcomes.items())
+
+
 def _escalation(
-    escalation_id: str, target: RecoveryTarget, outcome: MemberRedriveOutcome,
+    escalation_id: str,
+    target: RecoveryTarget,
+    outcomes: Mapping[str, MemberRedriveOutcome],
+    filing: _Filing,
 ) -> Escalation:
-    recovered = outcome in _RECOVERED
     train = (
         f' (declared train {target.declared_train_id}: re-driven through its tip '
         f'{target.redrive_id}, not un-stacked)'
@@ -395,16 +450,16 @@ def _escalation(
         task_id=target.redrive_id,
         agent_role=_AGENT_ROLE,
         category=MERGE_DEFERRED_ABANDONED_CATEGORY,
-        level=1,
-        severity='info' if recovered else 'blocking',
-        suggested_action='close_only' if recovered else 'investigate_stranded_merge_deferred',
+        level=filing.level,
+        severity=filing.severity,
+        suggested_action=filing.suggested_action,
         summary=(
-            f'Abandoned merge-deferred {target.redrive_id} '
-            f'{"recovered" if recovered else "NOT recovered"}: {outcome}'
+            f'Abandoned merge-deferred {target.redrive_id} {filing.verdict}: '
+            f'{", ".join(sorted(set(outcomes.values())))}'
         ),
         detail='\n'.join((
             f'Members: {", ".join(target.members)}{train}',
-            f'Outcome: {outcome}',
+            f'Outcomes: {_render(outcomes)}',
             f'Found merge-deferred on two consecutive passes with {_ABSENT_OWNERS}.',
             f'Runbook: {_RUNBOOK}.',
         )),

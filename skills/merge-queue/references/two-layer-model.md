@@ -168,7 +168,7 @@ occupant when two entries share a host.
 | `MemberRedriveOutcome` | merge_lane/member_redrive.py | What the redriver decided for each member (`NOT_PARKED`, `NOT_ON_MAIN`, `ON_MAIN_ATTRIBUTED`, `ON_MAIN_UNATTRIBUTED`, `PROVENANCE_CONFLICT_MEMOIZED`, `STALE_EVIDENCE`, `ERRORED`, `HELD_BY_LIVE_TRAIN`); exported by the façade (task 4737) |
 | `train_member_ids_in_custody()` | merge_lane/worker.py | Members of every train the worker still holds, i.e. every live (non-retired) registry entry (task 4737) |
 | `redrive_abandoned_members()` | merge_lane/worker.py | Re-drives members no train holds through `MemberRedriver`, using the worker's own train callbacks; a member still in custody is refused as `HELD_BY_LIVE_TRAIN` (task 4737) |
-| `AbandonedMemberSweep` | merge_deferred_recovery.py (outside the package) | Finds merge-deferred members with no owner on two consecutive passes, re-drives them through the lane and files `merge_deferred_abandoned` L1s. Last step of `harness.py::Harness._run_stranded_reconcile_pass` (task 4737; runbook: OPERATIONS.md § "Abandoned merge-deferred members") |
+| `AbandonedMemberSweep` | merge_deferred_recovery.py (outside the package) | Finds merge-deferred members with no owner on two consecutive passes, re-drives them through the lane and files one `merge_deferred_abandoned` record per target: an `info` L0 receipt when recovered, a pinning `blocking` L1 when not. Last step of `harness.py::Harness._run_stranded_reconcile_pass` (task 4737; runbook: OPERATIONS.md § "Abandoned merge-deferred members") |
 
 ### 7.1 merge_lane/types.py — request/outcome/item/entry types + registries (MQ-refactor task α)
 
