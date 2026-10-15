@@ -1,10 +1,12 @@
 """MemoryConsolidator.run calls the auto-consolidation post-step (task 5240, PRD C4).
 
 Harness per ``tests/reconciliation/test_stage1.py::TestMemoryConsolidatorGateBacklogWiring``:
-``BaseStage.run`` and ``dedup_flags`` are patched out, the escalation queue is a
-real ``EscalationQueue`` on ``tmp_path``, and the memory service is the
+``BaseStage.run`` is patched out (it would spawn the LLM turn), the escalation
+queue is a real ``EscalationQueue`` on ``tmp_path`` attached the way
+``reconciliation/harness.py`` attaches it, and the memory service is the
 fixture's bare AsyncMock with a real ``ConsolidationAutoConfig`` and a real
-ledger set on it.
+ledger set on it. The base report flags nothing, so the real ``dedup_flags``
+has no flag to read or write.
 """
 
 from __future__ import annotations
@@ -67,13 +69,7 @@ def stage(tmp_path, ledger):
 
 
 async def _run(stage, run_id='run-wiring') -> StageReport:
-    with (
-        patch.object(BaseStage, 'run', new=AsyncMock(return_value=_base_report())),
-        patch(
-            'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
-            new=AsyncMock(return_value=[]),
-        ),
-    ):
+    with patch.object(BaseStage, 'run', new=AsyncMock(return_value=_base_report())):
         return await stage.run(
             events=[],
             watermark=Watermark(project_id='test_project'),
