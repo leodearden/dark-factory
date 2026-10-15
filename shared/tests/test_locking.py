@@ -1155,8 +1155,8 @@ class TestIsFilePath:
     def test_accept_corpus_paths_are_files(self, path: str):
         """Every canonical extension is run through the α copy of the predicate.
 
-        One representative path per canonical extension (all 59, not just the 22
-        added by the 2026-07-28 sweep).  Before this amendment only the 22 new
+        One representative path per canonical extension (every one, not just the
+        22 added by the 2026-07-28 sweep).  Before this amendment only the 22 new
         extensions had behavioural coverage here while the original 36 had nothing
         but four spot-checks in ``test_file_extensions_is_frozenset`` — leaving
         the copy the orchestrator scheduler actually imports pinned strictly
@@ -1172,7 +1172,7 @@ class TestIsFilePath:
         """
         assert is_file_path(path) is True, (
             f'{path!r} must classify as a file — its extension is on the '
-            f'canonical allowlist (59 entries as of dark_factory #3715 hotfix)'
+            'canonical allowlist'
         )
 
     @pytest.mark.parametrize('path', _REJECT_PATHS)
