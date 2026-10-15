@@ -558,6 +558,12 @@ class EventType(StrEnum):
 
     # Scheduler fairness
     task_skipped = 'task_skipped'
+    # Producer: scheduler.py::Scheduler._update_age_anchors.  Payload
+    # {anchor: int, pending_since: str}: the max_id the task's age now counts
+    # from, and the stamp whose change signalled the reset.  Emitted once per
+    # applied reset; restoring that anchor at a later process start emits
+    # nothing.
+    age_anchor_reset = 'age_anchor_reset'
     # Producer of both: scheduler.py::Scheduler._complete_parks (semantics there).
     # Every emitted reservation_* event carries data.source in {pin, fairness}
     # (task 6040): an operator pin's reservation, or the automatic machinery's.
