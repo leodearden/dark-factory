@@ -3266,10 +3266,10 @@ _DEFAULT_PRICES: dict[str, dict[str, float]] = {
     # config is threaded in. Kept in lockstep with defaults.yaml's `prices:`
     # block by test_config.py's test_default_price_table_matches_defaults_yaml.
     'gpt-5.4': {'input_per_1m': 2.50, 'output_per_1m': 10.00},
-    # Codex sticker rates; codex reports no cached-input split, so these price
-    # every input token at the uncached rate (an upper bound on the true
-    # spend). gpt-5.6-sol's rate is promotional through at least 2026-11-21.
-    'gpt-6-astra': {'input_per_1m': 10.00, 'output_per_1m': 50.00},
+    # Codex sticker rates. codex reports cached_input_tokens inside input_tokens and astra prices
+    # that split; sol and terra have no cached rate yet, so theirs is an uncached upper bound.
+    # gpt-5.6-sol's rate is promotional through at least 2026-11-21.
+    'gpt-6-astra': {'input_per_1m': 10.00, 'output_per_1m': 50.00, 'cached_input_per_1m': 1.00},
     'gpt-5.6-sol': {'input_per_1m': 4.00, 'output_per_1m': 20.00},
     'gpt-5.6-terra': {'input_per_1m': 2.00, 'output_per_1m': 12.00},
     'o4-mini': {'input_per_1m': 1.10, 'output_per_1m': 4.40},
