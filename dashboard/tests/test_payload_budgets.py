@@ -13,24 +13,35 @@ enforcement points read it: the pre-merge fleet sweep
 * a malformed table is REFUSED loudly, naming the field, and never read as an
   empty or partial table, which would compare clean against everything;
 * the pure accounting both enforcement points report with: wire bytes, the
-  leaf-field breakdown, the overage message and the slack rule.
+  leaf-field breakdown, the overage message and the slack rule;
+* history is APPEND-ONLY against ``merge-base(main, HEAD)``, so every raise or
+  lowering is a new entry naming a task and a reason.
 """
 
 from __future__ import annotations
 
 import copy
 import json
+import subprocess
 from collections.abc import Callable
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
 import pytest
 from _dashboard_routes import dashboard_get_paths
+from _payload_budget_history import (
+    BaseTable,
+    FirstWrite,
+    history_violations,
+    resolve_base_table,
+)
 from starlette.responses import JSONResponse
 
 from dashboard.payload_budgets import (
     MAX_SLACK_RATIO,
     SLACK_FLOOR_BYTES,
+    TABLE_REPO_PATH,
     BudgetChange,
     BudgetTable,
     EndpointBudget,
@@ -457,3 +468,247 @@ class TestSlackViolation:
         self, budget: int, measured: int, violates: bool,
     ) -> None:
         assert slack_violation(budget, measured) is violates
+
+
+_TASKS = '/api/v2/dashboard/tasks'
+_SCHEDULER = '/api/v2/dashboard/scheduler'
+_PROSE = '/api/v2/dashboard/task/{project}/T-{task_id}'
+
+_Change = tuple[int, str, str]
+
+
+def _history_table(
+    histories: dict[tuple[str, tuple[tuple[str, str], ...]], list[_Change]],
+    exempt: tuple[str, ...] = (),
+) -> BudgetTable:
+    """A parsed table holding exactly *histories*, keyed by (path, query pairs)."""
+    raw = {
+        'schema_version': 1,
+        'endpoints': [
+            {
+                'path': path,
+                'query': dict(query),
+                'data_keyed_maps': [],
+                'history': [
+                    {'budget_bytes': size, 'task': task, 'reason': reason}
+                    for size, task, reason in changes
+                ],
+            }
+            for (path, query), changes in histories.items()
+        ],
+        'exempt': [{'path': path, 'reason': 'one task'} for path in exempt],
+    }
+    return parse_budget_table(json.dumps(raw))
+
+
+_SEED: _Change = (5_500_000, '5824', 'measured 4,351,859 on 2026-10-15')
+_RAISE: _Change = (6_400_000, '6001', 'rows grew to 5,800; shrinking meta_files is task 6002')
+_LOWER: _Change = (3_000_000, '6003', 'meta_files moved to the prose route')
+
+_BARE_TASKS = (_TASKS, ())
+_CENSUS = (_TASKS, (('projection', 'census'),))
+
+
+class TestHistoryViolations:
+    """The DECISION layer: head's history must extend base's, request by request."""
+
+    def test_identical_tables_are_clean(self) -> None:
+        table = _history_table({_BARE_TASKS: [_SEED]})
+        assert history_violations(table, table) == []
+
+    def test_an_appended_raise_is_clean(self) -> None:
+        base = _history_table({_BARE_TASKS: [_SEED]})
+        head = _history_table({_BARE_TASKS: [_SEED, _RAISE]})
+        assert history_violations(base, head) == []
+
+    def test_an_appended_lowering_is_clean(self) -> None:
+        base = _history_table({_BARE_TASKS: [_SEED]})
+        head = _history_table({_BARE_TASKS: [_SEED, _LOWER]})
+        assert history_violations(base, head) == []
+
+    @pytest.mark.parametrize(
+        ('edited', 'old', 'new'),
+        [
+            pytest.param((9_000_000, '5824', _SEED[2]), '5500000', '9000000', id='budget'),
+            pytest.param((_SEED[0], '6001', _SEED[2]), "'5824'", "'6001'", id='task'),
+            pytest.param((_SEED[0], '5824', 'rewritten'), _SEED[2], 'rewritten', id='reason'),
+        ],
+    )
+    def test_an_in_place_edit_is_one_violation_naming_the_change(
+        self, edited: _Change, old: str, new: str,
+    ) -> None:
+        base = _history_table({_BARE_TASKS: [_SEED, _RAISE]})
+        head = _history_table({_BARE_TASKS: [edited, _RAISE]})
+
+        violations = history_violations(base, head)
+
+        assert len(violations) == 1, violations
+        assert _TASKS in violations[0]
+        assert 'history[0]' in violations[0]
+        assert old in violations[0] and new in violations[0]
+
+    def test_a_deleted_entry_is_a_violation(self) -> None:
+        base = _history_table({_BARE_TASKS: [_SEED, _RAISE]})
+        head = _history_table({_BARE_TASKS: [_SEED]})
+        violations = history_violations(base, head)
+        assert len(violations) == 1 and 'history[1]' in violations[0], violations
+
+    def test_a_reordered_history_is_a_violation(self) -> None:
+        base = _history_table({_BARE_TASKS: [_SEED, _RAISE]})
+        head = _history_table({_BARE_TASKS: [_RAISE, _SEED]})
+        assert len(history_violations(base, head)) == 1
+
+    def test_a_request_added_at_head_is_clean(self) -> None:
+        base = _history_table({_BARE_TASKS: [_SEED]})
+        head = _history_table({_BARE_TASKS: [_SEED], (_SCHEDULER, ()): [_SEED]})
+        assert history_violations(base, head) == []
+
+    def test_a_request_removed_at_head_is_left_to_completeness(self) -> None:
+        base = _history_table({_BARE_TASKS: [_SEED], (_SCHEDULER, ()): [_SEED]})
+        head = _history_table({_BARE_TASKS: [_SEED]})
+        assert history_violations(base, head) == []
+
+    def test_exemptions_added_or_removed_are_clean(self) -> None:
+        with_exemption = _history_table({_BARE_TASKS: [_SEED]}, exempt=(_PROSE,))
+        without = _history_table({_BARE_TASKS: [_SEED]})
+        assert history_violations(with_exemption, without) == []
+        assert history_violations(without, with_exemption) == []
+
+    def test_the_same_path_with_another_query_is_another_request(self) -> None:
+        base = _history_table({_BARE_TASKS: [_SEED]})
+        head = _history_table({_CENSUS: [_LOWER]})
+        assert history_violations(base, head) == []
+
+
+def _init_repo(path: Path) -> Path:
+    """``git init`` a fresh repo at *path* with one commit on ``main``.
+
+    Copied from test_cache_buster_freshness.py::_init_repo rather than
+    imported, for the reason that module states: a test module's helpers are
+    not imported across test modules. The suite-wide git ceiling keeps it
+    inside the pytest basetemp.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    _git(path, 'init', '-b', 'main')
+    _git(path, 'config', 'user.email', 'test@test.com')
+    _git(path, 'config', 'user.name', 'Test')
+    (path / 'README.md').write_text('# sentinel\n')
+    _git(path, 'add', '-A')
+    _git(path, 'commit', '-m', 'initial')
+    return path
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ['git', *args], cwd=repo, capture_output=True, text=True, check=True, timeout=60,
+    ).stdout
+
+
+def _commit_table(repo: Path, histories: list[_Change], message: str) -> None:
+    raw = {
+        'schema_version': 1,
+        'endpoints': [{
+            'path': _TASKS,
+            'query': {},
+            'data_keyed_maps': [],
+            'history': [
+                {'budget_bytes': size, 'task': task, 'reason': reason}
+                for size, task, reason in histories
+            ],
+        }],
+        'exempt': [],
+    }
+    table = repo / TABLE_REPO_PATH
+    table.parent.mkdir(parents=True, exist_ok=True)
+    table.write_text(json.dumps(raw))
+    _git(repo, 'add', '-A')
+    _git(repo, 'commit', '-m', message)
+
+
+class TestResolveBaseTable:
+    """The GIT layer, against throwaway repos built to exhibit each answer."""
+
+    def test_no_main_ref_is_unmeasurable(self, tmp_path: Path) -> None:
+        repo = _init_repo(tmp_path / 'repo')
+        _git(repo, 'branch', '-m', 'main', 'trunk')
+        assert resolve_base_table(repo) is None
+
+    def test_a_table_absent_at_the_base_is_a_first_write(self, tmp_path: Path) -> None:
+        repo = _init_repo(tmp_path / 'repo')
+        _git(repo, 'checkout', '-b', 'work')
+        _commit_table(repo, [_SEED], 'first write of the table')
+
+        base = resolve_base_table(repo)
+
+        assert isinstance(base, FirstWrite), base
+        assert base.base_ref == 'main'
+        assert base.base_commit == _git(repo, 'rev-parse', 'main').strip()
+
+    def test_the_table_is_read_at_the_merge_base_not_at_mains_tip(
+        self, tmp_path: Path,
+    ) -> None:
+        repo = _init_repo(tmp_path / 'repo')
+        _commit_table(repo, [_SEED], 'seed the table')
+        branch_point = _git(repo, 'rev-parse', 'HEAD').strip()
+        _git(repo, 'checkout', '-b', 'work')
+        _git(repo, 'checkout', 'main')
+        _commit_table(repo, [_SEED, _RAISE], 'main raises after the branch point')
+        _git(repo, 'checkout', 'work')
+
+        base = resolve_base_table(repo)
+
+        assert isinstance(base, BaseTable), base
+        assert base.base_commit == branch_point
+        assert [c.budget_bytes for c in base.table.endpoints[0].history] == [_SEED[0]]
+
+    def test_the_second_candidate_ref_is_tried(self, tmp_path: Path) -> None:
+        repo = _init_repo(tmp_path / 'repo')
+        _commit_table(repo, [_SEED], 'seed the table')
+        _git(repo, 'checkout', '-b', 'work')
+        _git(repo, 'update-ref', 'refs/remotes/origin/main', 'main')
+        _git(repo, 'branch', '-D', 'main')
+
+        base = resolve_base_table(repo)
+
+        assert isinstance(base, BaseTable) and base.base_ref == 'origin/main', base
+
+    def test_a_git_failure_after_merge_base_raises_with_stderr(self, tmp_path: Path) -> None:
+        repo = _init_repo(tmp_path / 'repo')
+        _commit_table(repo, [_SEED], 'seed the table')
+        _git(repo, 'checkout', '-b', 'work')
+        blob = _git(repo, 'rev-parse', f'main:{TABLE_REPO_PATH}').strip()
+        (repo / '.git' / 'objects' / blob[:2] / blob[2:]).unlink()
+
+        with pytest.raises(RuntimeError) as failed:
+            resolve_base_table(repo)
+
+        assert blob in str(failed.value) or 'unable to read' in str(failed.value)
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_the_shipped_history_only_appends_to_the_merge_base() -> None:
+    """THE GUARD: no recorded budget entry was edited, reordered or deleted."""
+    base = resolve_base_table(_REPO_ROOT)
+    if base is None:
+        pytest.skip(
+            f'neither main nor origin/main resolves in {_REPO_ROOT}, so there is '
+            'no merge base to compare the budget history against'
+        )
+    if isinstance(base, FirstWrite):
+        pytest.skip(
+            f'{TABLE_REPO_PATH} does not exist at merge base {base.base_commit[:12]} '
+            f'({base.base_ref}); this branch is its first write, so there is no '
+            'recorded history to protect yet'
+        )
+
+    violations = history_violations(base.table, load_budget_table())
+
+    assert violations == [], (
+        f'{TABLE_REPO_PATH} rewrites budget history recorded at merge base '
+        f'{base.base_commit[:12]} ({base.base_ref}):\n  ' + '\n  '.join(violations)
+        + '\nHistory is APPEND-ONLY: a budget is the last entry, so every raise or '
+        'lowering is a NEW entry naming its task and reason. Restore the recorded '
+        'entries exactly and append a new one instead.'
+    )
