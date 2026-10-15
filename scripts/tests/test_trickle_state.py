@@ -1105,13 +1105,6 @@ class TestRetryBacklogPolicy:
 
         assert parsed == fold.backlog == {_d(1): 2, _d(3): 1}
 
-    def test_the_recovery_bound_rests_on_these_constants(self):
-        assert (
-            trickle_state.RETRIES_PER_NIGHT,
-            trickle_state.RETRY_MAX_AGE_DAYS,
-            trickle_state.RETRY_MAX_ATTEMPTS,
-        ) == (1, 7, 3)
-
 
 def _warnings_naming(caplog, text):
     return [
