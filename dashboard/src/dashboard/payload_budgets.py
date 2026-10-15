@@ -13,15 +13,27 @@ import of the app.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections import Counter
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
+from typing import TypeGuard
 from urllib.parse import urlencode
 
 TABLE_PATH = Path(__file__).with_name('payload_budgets.json')
+TABLE_REPO_PATH = 'dashboard/src/dashboard/payload_budgets.json'
+"""The table's repo-relative path: the form a remedy names and ``git show`` reads."""
 SCHEMA_VERSION = 1
 API_PREFIX = '/api/v2/dashboard/'
+
+MAX_SLACK_RATIO = 2.0
+"""Headroom is at most 1.25x live and the fleet is calibrated to at least 0.625x live."""
+SLACK_FLOOR_BYTES = 32_768
+"""Twice the 16 KiB headroom floor, so a small endpoint's headroom never reads as slack."""
+
+_LIST_DESCENT = '[]'
+_COLLAPSED_KEY = '{}'
 
 _TABLE_KEYS = frozenset({'_README', 'schema_version', 'endpoints', 'exempt'})
 _ENDPOINT_KEYS = frozenset({'path', 'query', 'data_keyed_maps', 'history'})
@@ -257,3 +269,124 @@ def _shown(value: object) -> str:
         return 'missing'
     rendered = json.dumps(value)
     return rendered if len(rendered) <= 60 else f'{rendered[:57]}...'
+
+
+@dataclass(frozen=True)
+class FieldBytes:
+    """The wire bytes one LEAF field carries, summed over every occurrence."""
+
+    path: str
+    bytes: int
+
+
+def payload_bytes(obj: object) -> int:
+    """The wire size of *obj*, serialized exactly as Starlette's JSONResponse does."""
+    return len(_encoded(obj))
+
+
+def field_breakdown(
+    payload: object, data_keyed_maps: Iterable[Sequence[str]] = (),
+) -> tuple[FieldBytes, ...]:
+    """Attribute *payload*'s bytes to its leaf fields, largest first.
+
+    A leaf is a dict key whose value is a scalar, an empty container, or a list
+    holding no dict. It is charged its JSON-encoded key, the colon, and its
+    compact value. List descent renders as ``[]``. A dict whose key path is in
+    *data_keyed_maps* has its keys collapsed to ``{}``, so a field spread
+    across project labels or dates sums into one leaf. Nothing is inferred:
+    two NAMED fields that happen to share a shape stay apart.
+    """
+    totals: Counter[tuple[str, ...]] = Counter()
+    keyed = frozenset(tuple(key_path) for key_path in data_keyed_maps)
+    if _holds_a_dict(payload):
+        _account_list(payload, (_LIST_DESCENT,), keyed, totals)
+    else:
+        _account_list([payload], (), keyed, totals)
+    ranked = sorted(
+        ((_rendered(path), size) for path, size in totals.items()),
+        key=lambda item: (-item[1], item[0]),
+    )
+    return tuple(FieldBytes(path=path, bytes=size) for path, size in ranked)
+
+
+def render_overage(
+    entry: EndpointBudget,
+    measured_bytes: int,
+    breakdown: tuple[FieldBytes, ...],
+    top_n: int = 8,
+) -> str:
+    last = entry.history[-1]
+    ratio = measured_bytes / entry.budget_bytes
+    return '\n'.join([
+        f'{entry.url_suffix()} served {measured_bytes:,} bytes against a budget of '
+        f'{entry.budget_bytes:,} ({ratio:.2f}x the budget).',
+        f'Largest leaf fields ({min(top_n, len(breakdown))} of {len(breakdown)}):',
+        *(
+            f'  {field.bytes:>12,}  {100 * field.bytes / measured_bytes:5.1f}%  {field.path}'
+            for field in breakdown[:top_n]
+        ),
+        f'The budget was last set by task {last.task}: {last.reason}',
+        'Remedy: shrink the payload, OR APPEND a history entry {budget_bytes, task, '
+        f'reason}} to this request in {TABLE_REPO_PATH} naming your task and why the '
+        'larger size is right. Never edit a recorded entry.',
+    ])
+
+
+def slack_violation(budget_bytes: int, measured_bytes: int) -> bool:
+    """True when the budget sits further above the measurement than headroom explains.
+
+    That is either a fixture that stopped reaching its data, or a real shrink
+    nobody recorded; both are failures of the budget, not of the payload.
+    """
+    allowance = max(MAX_SLACK_RATIO * measured_bytes, measured_bytes + SLACK_FLOOR_BYTES)
+    return budget_bytes > allowance
+
+
+def _encoded(value: object) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, allow_nan=False, indent=None, separators=(',', ':'),
+    ).encode('utf-8')
+
+
+def _holds_a_dict(value: object) -> TypeGuard[list[object]]:
+    return isinstance(value, list) and any(isinstance(item, dict) for item in value)
+
+
+def _account_list(
+    items: list[object],
+    path: tuple[str, ...],
+    keyed: frozenset[tuple[str, ...]],
+    totals: Counter[tuple[str, ...]],
+) -> None:
+    for item in items:
+        if isinstance(item, dict):
+            _account_dict(item, path, keyed, totals)
+        else:
+            totals[path] += len(_encoded(item))
+
+
+def _account_dict(
+    node: dict[str, object],
+    path: tuple[str, ...],
+    keyed: frozenset[tuple[str, ...]],
+    totals: Counter[tuple[str, ...]],
+) -> None:
+    collapse = path in keyed
+    for key, value in node.items():
+        member = (*path, _COLLAPSED_KEY if collapse else key)
+        if isinstance(value, dict) and value:
+            _account_dict(value, member, keyed, totals)
+        elif _holds_a_dict(value):
+            _account_list(value, (*member, _LIST_DESCENT), keyed, totals)
+        else:
+            totals[member] += len(_encoded(key)) + 1 + len(_encoded(value))
+
+
+def _rendered(path: tuple[str, ...]) -> str:
+    text = ''
+    for segment in path:
+        if segment == _LIST_DESCENT or not text:
+            text += segment
+        else:
+            text += f'.{segment}'
+    return text or '(the whole payload)'
