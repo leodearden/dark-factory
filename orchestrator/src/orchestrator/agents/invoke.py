@@ -400,6 +400,20 @@ def _codex_sandbox_mode(
     return 'read-only' if cannot_write else None
 
 
+_CODEX_HONOURED_TOOLS = _CODEX_WRITE_TOOLS | {'Read', 'Glob', 'Grep'}
+
+
+def _codex_inexpressible_tool_specs(
+    allowed_tools: list[str] | None,
+    disallowed_tools: list[str] | None,
+) -> list[str]:
+    """The specs codex's sandbox axis cannot honour: all but Edit/Write (which pick the mode) and Read/Glob/Grep (which read-only permits)."""
+    return [
+        spec for spec in [*(allowed_tools or ()), *(disallowed_tools or ())]
+        if spec not in _CODEX_HONOURED_TOOLS
+    ]
+
+
 async def _invoke_codex(
     prompt: str,
     system_prompt: str,
@@ -450,6 +464,13 @@ async def _invoke_codex(
         'the wall-clock watchdog (timeout_seconds=%r) is enforced',
         max_turns, max_budget_usd, timeout_seconds,
     )
+    dropped_specs = _codex_inexpressible_tool_specs(allowed_tools, disallowed_tools)
+    if dropped_specs:
+        logger.warning(
+            'codex backend: dropped tool spec(s) not expressible on codex\'s '
+            'sandbox axis (no per-tool allowlist): %s',
+            ', '.join(dropped_specs),
+        )
     temp_files: list[Path] = []
     try:
         # Write MCP config
