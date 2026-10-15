@@ -13,34 +13,14 @@ from __future__ import annotations
 
 import re
 
-from _dashboard_helpers import (
-    destructure_bindings,
-    extract_function_body,
-    strip_js_comments,
-    walk_balanced,
-)
+from _app_jsx_source import app_body, app_code, assert_app_destructures_without_fallback
+from _dashboard_helpers import walk_balanced
 
 _KEYED_BODY_TAG = '<div className="body" key={tab}>'
 
-_MODULE_DESTRUCTURE = re.compile(r'const\s*\{([^{}]*)\}\s*=\s*window\.(DF_\w+)\s*;')
-
-
-def _app_code(app_jsx_body: str) -> str:
-    return strip_js_comments(app_jsx_body)
-
-
-def _app_body(app_jsx_body: str) -> str:
-    body = extract_function_body(_app_code(app_jsx_body), 'App')
-    assert body, "could not extract App()'s body from app.jsx"
-    return body
-
-
-def _module_scope(app_jsx_body: str) -> str:
-    return _app_code(app_jsx_body).replace(_app_body(app_jsx_body), '')
-
 
 def _boundary_class_body(app_jsx_body: str) -> str:
-    code = _app_code(app_jsx_body)
+    code = app_code(app_jsx_body)
     match = re.search(r'class\s+TabErrorBoundary\s+extends\s+React\.Component\s*\{', code)
     assert match, (
         'app.jsx declares no `class TabErrorBoundary extends React.Component`. React '
@@ -53,7 +33,7 @@ def _boundary_class_body(app_jsx_body: str) -> str:
 
 
 def test_the_active_tab_renders_inside_the_error_boundary(app_jsx_body: str) -> None:
-    body = _app_body(app_jsx_body)
+    body = app_body(app_jsx_body)
 
     calls = re.findall(r'(?<!function )\brenderTab\s*\(', body)
     assert len(calls) == 1, f'App() must call renderTab() exactly once; found {len(calls)}'
@@ -68,7 +48,7 @@ def test_the_active_tab_renders_inside_the_error_boundary(app_jsx_body: str) -> 
 
 
 def test_the_notices_and_the_tab_retry_sit_outside_the_boundary(app_jsx_body: str) -> None:
-    body = _app_body(app_jsx_body)
+    body = app_body(app_jsx_body)
     keyed_body = body.find(_KEYED_BODY_TAG)
     assert keyed_body >= 0, f'App() no longer renders {_KEYED_BODY_TAG}'
     boundary = body.find('<TabErrorBoundary')
@@ -110,17 +90,7 @@ def test_tab_error_boundary_is_a_react_error_boundary_rendering_through_the_deci
 
 
 def test_app_destructures_the_failure_notice_without_fallback(app_jsx_body: str) -> None:
-    scope = _module_scope(app_jsx_body)
-    destructures = [
-        bindings for bindings, global_name in _MODULE_DESTRUCTURE.findall(scope)
-        if global_name == 'DF_TAB_RENDER_FAILURE'
-    ]
-    assert destructures, 'app.jsx must destructure window.DF_TAB_RENDER_FAILURE at module scope'
-    assert any(
-        ('tabRenderFailureNotice', 'tabRenderFailureNotice') in destructure_bindings(bindings)
-        for bindings in destructures
-    ), f'app.jsx does not bind tabRenderFailureNotice from window.DF_TAB_RENDER_FAILURE: {destructures}'
-    assert not re.search(r'window\.DF_TAB_RENDER_FAILURE\s*(\|\||&&|\?\?)', _app_code(app_jsx_body)), (
-        'a fallback on window.DF_TAB_RENDER_FAILURE turns a load-order regression '
-        'into a silently uncontained page'
+    assert_app_destructures_without_fallback(
+        app_jsx_body, 'DF_TAB_RENDER_FAILURE', 'tabRenderFailureNotice',
+        fallback_consequence='a silently uncontained page',
     )
