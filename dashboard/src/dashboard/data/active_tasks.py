@@ -81,7 +81,6 @@ from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 from shared.timestamps import parse_timestamp_or_warn
 
 from dashboard.config import DashboardConfig
-from dashboard.data.mcp_fanout import project_label
 from dashboard.data.task_runtime import fetch_task_runtime
 from dashboard.data.task_snapshot import (
     SnapshotFailure,
@@ -247,17 +246,6 @@ _TASKS_TOTAL_BUDGET = 20.0
 # 5128 tasks, reify 7279) and seven that finish in under 0.1 s — in
 # ``ceil(9/4) = 3`` waves. ``test_tasks_budget.py`` (f) holds it in (1, 8].
 _TASKS_ROOT_CONCURRENCY = 4
-
-def project_roots_for_label(config: DashboardConfig, label: str) -> list[Path]:
-    """Every configured root whose display label is *label*, primary first.
-
-    A LIST, because the label is the directory basename and two configured
-    roots can share one — the collision ``collect_tasks_with_counts`` keys by
-    root to survive. A caller that needs one root must refuse rather than guess
-    when the list is not exactly one long.
-    """
-    return [root for root in config.all_project_roots if project_label(root) == label]
-
 
 # Admission-order rotation offset for `collect_tasks_with_counts`, advanced by
 # one slot per render. Module state, like the `_*_cache` objects elsewhere in
