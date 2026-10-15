@@ -58,7 +58,7 @@ from types import ModuleType
 
 import pytest
 from _git_fixtures import RepoSeed, build_repo
-from _merge_lane_ratchet_fixtures import synthetic_report
+from _merge_lane_ratchet_fixtures import blank_file_entry, synthetic_report
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # This module AST-parses the Appendix A cluster (8 CLUSTER_PATHS entries, one
@@ -1552,7 +1552,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
     ) -> None:
         target = self._seeded(tmp_path)
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][self._NEW_PATH] = _blank_file_entry(
+        current['files'][self._NEW_PATH] = blank_file_entry(
             lines=metrics.FILE_LINE_CEILING + 1
         )
 
@@ -1596,7 +1596,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         # zero would only hide which arm fired.
         target = self._seeded(tmp_path)
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][self._NEW_PATH] = _blank_file_entry(
+        current['files'][self._NEW_PATH] = blank_file_entry(
             lines=metrics.FILE_LINE_CEILING
         )
 
@@ -1633,7 +1633,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         target = self._seeded(tmp_path)
         ledger = tmp_path / 'ledger.json'
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][self._NEW_PATH] = _blank_file_entry(
+        current['files'][self._NEW_PATH] = blank_file_entry(
             lines=metrics.FILE_LINE_CEILING + 1
         )
 
@@ -1750,7 +1750,7 @@ class TestCompareBaselineFiles:
         previous, current = self._pair(
             tmp_path,
             lambda report: report['files'].__setitem__(
-                'new_big.py', _blank_file_entry(lines=oversized)
+                'new_big.py', blank_file_entry(lines=oversized)
             ),
         )
 
@@ -2688,18 +2688,6 @@ def _ratchet_baseline() -> dict:
     }
 
 
-def _blank_file_entry(**overrides: int) -> dict:
-    entry = {
-        'lines': 0,
-        'prose_lines': 0,
-        'cognitive': 0,
-        'function_local_imports': 0,
-        'reexport_names': 0,
-    }
-    entry.update(overrides)
-    return entry
-
-
 def _bump_file(measure: str):
     def mutate(current: dict) -> None:
         current['files'][_MQ][measure] += 1
@@ -2713,7 +2701,7 @@ def _add_file(measure: str):
         # the baseline, so no per-path comparison fires -- only the derived
         # cluster total can catch it, which is precisely the rename-gaming shape.
         current['files']['orchestrator/src/orchestrator/merge_new.py'] = (
-            _blank_file_entry(**{measure: 1})
+            blank_file_entry(**{measure: 1})
         )
 
     return mutate
@@ -2854,7 +2842,7 @@ class TestCeilingsApplyOnlyToNewKeys:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
         new_path = 'orchestrator/src/orchestrator/merge_new.py'
-        current['files'][new_path] = _blank_file_entry(lines=1501)
+        current['files'][new_path] = blank_file_entry(lines=1501)
         ceilings = [
             v
             for v in metrics.check_against_baseline(current, baseline)
@@ -2867,7 +2855,7 @@ class TestCeilingsApplyOnlyToNewKeys:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
         current['files']['orchestrator/src/orchestrator/merge_new.py'] = (
-            _blank_file_entry(lines=1500)
+            blank_file_entry(lines=1500)
         )
         assert not [
             v
@@ -2892,7 +2880,7 @@ class TestCeilingsApplyOnlyToNewKeys:
         baseline = _ratchet_baseline()
         del baseline['files'][_GIT_OPS]
         current = copy.deepcopy(baseline)
-        current['files'][_GIT_OPS] = _blank_file_entry(lines=14721)
+        current['files'][_GIT_OPS] = blank_file_entry(lines=14721)
         assert not [
             v
             for v in metrics.check_against_baseline(current, baseline)
@@ -2906,7 +2894,7 @@ class TestCeilingsApplyOnlyToNewKeys:
         del baseline['files'][_GIT_OPS]
         current = copy.deepcopy(baseline)
         current['files']['orchestrator/src/orchestrator/merge_new.py'] = (
-            _blank_file_entry(lines=14721)
+            blank_file_entry(lines=14721)
         )
         assert [
             v
