@@ -20,7 +20,9 @@ Its git plumbing is why these tests live in their own module rather than in
 a module under ``orchestrator/tests`` can import ``_orch_helpers``'s
 ``assert_isolated_git_repo`` / ``git_env_with_ceiling`` -- the two per-call
 layers of the esc-3072-3 defence that every git-in-tmp_path test here must use.
-The instrument's own pure helpers stay unit-tested next to the instrument.
+The pure faces this gate calls are unit-tested in
+``test_merge_lane_ratchet_commit_delta.py``, the rest of the instrument in
+``test_merge_lane_ratchet.py``.
 
 EVERY REFUSAL PINS THE EXIT CODE rather than merely non-zero. The ladder -- 0
 clean, 1 a policy refusal this commit must fix, 2 the gate could not do its job
