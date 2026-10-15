@@ -29,8 +29,8 @@ from orchestrator.offline_lane_records import (
     RunRecordStore,
     classify_exit,
 )
-from orchestrator.verify import _with_junitxml_str, parse_pytest_failures
-from orchestrator.verify_cmd import ToolKind, parse_config_command
+from orchestrator.verify import parse_pytest_failures
+from orchestrator.verify_cmd import parse_config_command, render, with_junitxml
 
 if TYPE_CHECKING:
     from orchestrator.config import LaneCommand
@@ -59,8 +59,9 @@ _PYTEST_FINAL_SUMMARY_RE = re.compile(
 class OutputFormat(StrEnum):
     """How a sub-run's output is parsed into failures and ``session_complete``.
 
-    ``session_complete`` is: PYTEST, pytest's final summary line is present (so False for
-    a non-pytest generic command); INFRA and OPAQUE, the run ended by exit, not by signal.
+    PYTEST: ``session_complete`` is pytest's final summary line being present. Every generic
+    command is PYTEST whatever its parse, so a non-pytest one records ``session_complete=False``.
+    INFRA and OPAQUE: ``session_complete`` is the run having ended by exit, not by signal.
     """
 
     PYTEST = 'pytest'
@@ -71,6 +72,7 @@ class OutputFormat(StrEnum):
 class Launched(NamedTuple):
     record: RunRecord
     tail: str
+    text: str | None
 
 
 def _pytest_failures(text: str) -> tuple[FailureRecord, ...]:
@@ -108,11 +110,6 @@ def _read_text(path: Path) -> str:
     return path.read_bytes().decode(errors='replace')
 
 
-def read_output(record: RunRecord) -> str:
-    """The whole streamed output of *record*'s sub-run (blocking file I/O)."""
-    return _read_text(Path(record.output_path))
-
-
 async def launch(
     argv: Sequence[str],
     *,
@@ -123,11 +120,13 @@ async def launch(
     phase: Phase,
     output_format: OutputFormat,
     junit_path: Path | None = None,
+    keep_text: bool = False,
 ) -> Launched:
     """Run *argv* with its output streamed to *lane_pass*'s *phase* log, then record it.
 
     Nothing of the output is held in memory while the child runs; the read,
     the parse and the record write happen in one hop off the event loop.
+    The whole output comes back as ``text`` only when *keep_text* asks for it.
     """
     output_path = lane_pass.output_path(phase)
     started_at = store.now()
@@ -161,7 +160,7 @@ async def launch(
             probe=None,
         )
         store.write_run(lane_pass, record)
-        return Launched(record, text[-_TAIL_CHARS:])
+        return Launched(record, text[-_TAIL_CHARS:], text if keep_text else None)
 
     return await asyncio.to_thread(record_run)
 
@@ -170,11 +169,19 @@ def _lane_env() -> dict[str, str]:
     return {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
 
 
-def open_pass(store: RunRecordStore, command: str) -> LanePass:
+def require_current_pass(store: RunRecordStore, command: str) -> LanePass:
     lane_pass = store.current_pass(command)
     if lane_pass is None:
         raise RuntimeError(f'offline-lane: no open pass for {command}')
     return lane_pass
+
+
+def _with_junit(command: str, junit_path: Path) -> tuple[str, Path | None]:
+    parsed = parse_config_command(command)
+    rewritten = with_junitxml(parsed, str(junit_path))
+    if rewritten is parsed:
+        return command, None
+    return render(rewritten), junit_path
 
 
 def suite_runner(store: RunRecordStore) -> SuiteRunner:
@@ -186,7 +193,7 @@ def suite_runner(store: RunRecordStore) -> SuiteRunner:
             cwd=wt_path,
             env=_lane_env(),
             store=store,
-            lane_pass=open_pass(store, LEGACY_NUMERIC_COMMAND),
+            lane_pass=require_current_pass(store, LEGACY_NUMERIC_COMMAND),
             phase=Phase.DETECT,
             output_format=OutputFormat.OPAQUE,
         )
@@ -204,7 +211,7 @@ def infra_runner(store: RunRecordStore) -> SuiteRunner:
             cwd=wt_path,
             env=_lane_env(),
             store=store,
-            lane_pass=open_pass(store, LEGACY_INFRA_COMMAND),
+            lane_pass=require_current_pass(store, LEGACY_INFRA_COMMAND),
             phase=Phase.DETECT,
             output_format=OutputFormat.INFRA,
         )
@@ -220,18 +227,8 @@ def command_runner(store: RunRecordStore) -> CommandRunner:
     """
 
     async def run_command(cmd: LaneCommand, wt_path: Path, head: str) -> tuple[int, str]:
-        lane_pass = open_pass(store, cmd.name)
-        parsed = parse_config_command(cmd.command)
-        junit_path = (
-            lane_pass.junit_path(Phase.DETECT)
-            if parsed.tool is ToolKind.PYTEST and parsed.raw is None
-            else None
-        )
-        command = (
-            cmd.command
-            if junit_path is None
-            else _with_junitxml_str(cmd.command, str(junit_path)) or cmd.command
-        )
+        lane_pass = require_current_pass(store, cmd.name)
+        command, junit_path = _with_junit(cmd.command, lane_pass.junit_path(Phase.DETECT))
         launched = await launch(
             [*nice_prefix('background'), 'sh', '-c', command],
             cwd=wt_path / cmd.cwd,

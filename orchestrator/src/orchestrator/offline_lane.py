@@ -73,6 +73,7 @@ from orchestrator.offline_lane_records import (
     RunRecordStore,
     classify_exit,
 )
+from orchestrator.verify import _extract_failing_test_ids, _serial_pytest_str
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
@@ -1028,12 +1029,13 @@ class OfflineLaneWorker:
             cwd=wt,
             env=env,
             store=self.records,
-            lane_pass=offline_lane_runs.open_pass(self.records, LEGACY_NUMERIC_COMMAND),
+            lane_pass=offline_lane_runs.require_current_pass(self.records, LEGACY_NUMERIC_COMMAND),
             phase=Phase.CONFIRM,
             output_format=offline_lane_runs.OutputFormat.OPAQUE,
+            keep_text=True,
         )
-        text = await asyncio.to_thread(offline_lane_runs.read_output, launched.record)
-        return _parse_confirmed_failures(text)
+        assert launched.text is not None
+        return _parse_confirmed_failures(launched.text)
 
     async def _default_infra_confirmation_run(self, wt: Path, head: str) -> list[str]:
         """Default ``infra_confirmation_runner`` seam — re-runs H9 host-infra (IE1).
@@ -1062,12 +1064,13 @@ class OfflineLaneWorker:
             cwd=wt,
             env=env,
             store=self.records,
-            lane_pass=offline_lane_runs.open_pass(self.records, LEGACY_INFRA_COMMAND),
+            lane_pass=offline_lane_runs.require_current_pass(self.records, LEGACY_INFRA_COMMAND),
             phase=Phase.CONFIRM,
             output_format=offline_lane_runs.OutputFormat.INFRA,
+            keep_text=True,
         )
-        text = await asyncio.to_thread(offline_lane_runs.read_output, launched.record)
-        return _parse_infra_failures(text)
+        assert launched.text is not None
+        return _parse_infra_failures(launched.text)
 
     async def _default_confirm_command(
         self, cmd: LaneCommand, wt_path: Path, head: str,
@@ -1096,12 +1099,8 @@ class OfflineLaneWorker:
         returned instead of ``[]`` — the red is filed/escalated rather than
         silently swallowed as a flake. A project wanting richer per-failure
         dedup for a non-pytest command injects its own
-        ``command_confirmation_runner``. Both helpers are imported lazily to
-        avoid an ``offline_lane`` <-> ``verify`` import cycle (mirrors the
-        existing lazy ``workflow`` import in :meth:`_handle_red_run`).
+        ``command_confirmation_runner``.
         """
-        from orchestrator.verify import _extract_failing_test_ids, _serial_pytest_str
-
         run_cwd = wt_path / cmd.cwd
         serial_command = _serial_pytest_str(cmd.command, invocation_dir=run_cwd) or cmd.command
         argv = [*nice_prefix('background'), 'sh', '-c', serial_command]
@@ -1111,12 +1110,13 @@ class OfflineLaneWorker:
             cwd=run_cwd,
             env=env,
             store=self.records,
-            lane_pass=offline_lane_runs.open_pass(self.records, cmd.name),
+            lane_pass=offline_lane_runs.require_current_pass(self.records, cmd.name),
             phase=Phase.CONFIRM,
             output_format=offline_lane_runs.OutputFormat.PYTEST,
+            keep_text=True,
         )
-        text = await asyncio.to_thread(offline_lane_runs.read_output, launched.record)
-        ids = _extract_failing_test_ids(text)
+        assert launched.text is not None
+        ids = _extract_failing_test_ids(launched.text)
         if ids:
             return ids
         # No pytest node-ids parsed from the serial re-run. Disambiguate a
