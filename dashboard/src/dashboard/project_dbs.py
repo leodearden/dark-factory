@@ -1,13 +1,10 @@
 """Resolve the per-project SQLite connections a consumer needs.
 
 The dashboard reads the same relative DB path out of every project it knows
-about: ``config.project_root`` first, then each of
-``config.known_project_roots``, de-duplicated so a root named twice is
-opened once. These helpers are that walk, plus the concrete per-root paths
-consumers ask for — ``runs.db``, ``burndown.db`` and the task store's
-``tasks.db`` — and ``_cost_sources``: the cost view's runs.db list plus the
-fused-memory curator's own invocation ledger, which lives outside any project
-tree.
+about. These helpers map ``DashboardConfig.all_project_roots`` to per-root
+paths — ``runs.db``, ``burndown.db`` and the task store's ``tasks.db`` — and
+``_cost_sources`` adds the fused-memory curator's own invocation ledger, which
+lives outside any project tree, to the cost view's runs.db list.
 
 This is its own module rather than part of ``app.py`` because its callers
 land on both sides of the route/loop boundary:
@@ -21,22 +18,11 @@ A missing DB file is not an error here: ``DbPool.get`` yields ``None`` for
 it, so a consumer fans out over whatever exists and a project that has not
 produced a given DB yet simply contributes nothing.
 
-These seven names are this module's entire interface: ``project_roots``
-(the walk itself, for a consumer that needs each root's ``Path``),
-``TASKS_DB_REL_PATH`` (read by ``api/invariants.py``), and five connection
-helpers. The helpers carry a leading underscore from when they were private
-to ``app.py``. Read their underscore as vestigial, not as a private-use
-signal — the move that created this module was a pure extraction, with
-renaming outside its scope.
-
-This is the canonical home for that primary-root-first, de-duplicated walk
-but not yet its only copy: ``app.py::_performance_resources``,
-``app.py::_analytics_project_dirs``,
-``dashboard/data/escalations.py::build_escalation_queues`` and
-``dashboard/data/active_tasks.py::_all_project_roots`` each still hand-roll
-the same iteration, differing only in what they derive per root. Rebuilding
-them on one shared root iterator is a logic change the extraction
-deliberately did not make; it is filed as a follow-up rather than dropped.
+These six names are this module's entire interface: ``TASKS_DB_REL_PATH``
+(read by ``api/invariants.py``) and five connection helpers. The helpers
+carry a leading underscore from when they were private to ``app.py``. Read
+their underscore as vestigial, not as a private-use signal — the move that
+created this module was a pure extraction, with renaming outside its scope.
 """
 
 from __future__ import annotations
@@ -53,18 +39,13 @@ from dashboard.data.db import DbPool
 TASKS_DB_REL_PATH: Final = Path('.taskmaster/tasks/tasks.db')
 
 
-def project_roots(config: DashboardConfig) -> list[Path]:
-    """Every known project root, ``config.project_root`` first, each named once."""
-    return list(dict.fromkeys([config.project_root, *config.known_project_roots]))
-
-
 async def _project_scoped_dbs(
     config: DashboardConfig,
     pool: DbPool,
     rel_path: Path,
 ) -> list[aiosqlite.Connection | None]:
     """Return DB connections for a project-scoped file across all known roots."""
-    return [await pool.get(root / rel_path) for root in project_roots(config)]
+    return [await pool.get(root / rel_path) for root in config.all_project_roots]
 
 
 async def _project_scoped_dbs_labeled(
@@ -73,7 +54,7 @@ async def _project_scoped_dbs_labeled(
     rel_path: Path,
 ) -> list[tuple[str, aiosqlite.Connection | None]]:
     """Return labeled (str(root), connection|None) pairs across all known project roots."""
-    return [(str(root), await pool.get(root / rel_path)) for root in project_roots(config)]
+    return [(str(root), await pool.get(root / rel_path)) for root in config.all_project_roots]
 
 
 async def _cost_dbs(

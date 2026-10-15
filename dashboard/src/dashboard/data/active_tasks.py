@@ -248,17 +248,6 @@ _TASKS_TOTAL_BUDGET = 20.0
 # ``ceil(9/4) = 3`` waves. ``test_tasks_budget.py`` (f) holds it in (1, 8].
 _TASKS_ROOT_CONCURRENCY = 4
 
-def _all_project_roots(config: DashboardConfig) -> list[Path]:
-    """All known project roots, deduped, primary first."""
-    seen: set[Path] = {config.project_root}
-    roots: list[Path] = [config.project_root]
-    for r in config.known_project_roots:
-        if r not in seen:
-            seen.add(r)
-            roots.append(r)
-    return roots
-
-
 def project_roots_for_label(config: DashboardConfig, label: str) -> list[Path]:
     """Every configured root whose display label is *label*, primary first.
 
@@ -267,7 +256,7 @@ def project_roots_for_label(config: DashboardConfig, label: str) -> list[Path]:
     root to survive. A caller that needs one root must refuse rather than guess
     when the list is not exactly one long.
     """
-    return [root for root in _all_project_roots(config) if project_label(root) == label]
+    return [root for root in config.all_project_roots if project_label(root) == label]
 
 
 # Admission-order rotation offset for `collect_tasks_with_counts`, advanced by
@@ -287,8 +276,8 @@ def _reset_root_rotation() -> None:
     _root_rotation_offset = 0
 
 
-def _rotated_project_roots(config: DashboardConfig) -> list[Path]:
-    """``_all_project_roots`` rotated left by one more slot on each call.
+def _rotated_project_roots(config: DashboardConfig) -> tuple[Path, ...]:
+    """``DashboardConfig.all_project_roots`` rotated left by one more slot on each call.
 
     WHAT THIS CLOSES. `collect_tasks_with_counts` cannot always serve every
     root inside `_TASKS_TOTAL_BUDGET`, and with a FIXED walk order the roots
@@ -316,18 +305,18 @@ def _rotated_project_roots(config: DashboardConfig) -> list[Path]:
     Reproducibility in an incident is worth more here than any property a
     random order would buy.
 
-    SEPARATE HELPER, deliberately. ``_all_project_roots`` stays byte-identical
-    and primary-first: ``app.py``, ``scheduler.py``, ``collect_done_counts``
-    and ``test_app.py``'s patch point all depend on that ordering, so rotating
-    in place would silently repoint every one of them at a different project.
+    SEPARATE HELPER, deliberately. ``DashboardConfig.all_project_roots`` stays
+    primary-first: ``api/tasks.py``, ``data/scheduler.py`` and
+    ``project_roots_for_label`` all depend on that ordering, so rotating in
+    place would silently repoint every one of them at a different project.
     Only ``collect_tasks_with_counts``' admission loop calls this.
 
     Rotation changes ADMISSION order only. Output is re-assembled in canonical
-    ``_all_project_roots`` order by the caller, so the rendered table does not
-    reshuffle on every 3 s poll.
+    ``DashboardConfig.all_project_roots`` order by the caller, so the rendered
+    table does not reshuffle on every 3 s poll.
     """
     global _root_rotation_offset
-    roots = _all_project_roots(config)
+    roots = config.all_project_roots
     if not roots:
         return roots
     offset = _root_rotation_offset % len(roots)
@@ -817,7 +806,7 @@ async def _serve_roots_within_budget(
     # the same trailing roots being starved on every render; see
     # _rotated_project_roots. `roots` below is the canonical order the results
     # are re-assembled in.
-    roots = _all_project_roots(config)
+    roots = config.all_project_roots
     admission_order = _rotated_project_roots(config)
     # Admission control, not a work queue: the coroutines are all created up
     # front and the semaphore decides how many shares are running at once.
@@ -939,8 +928,8 @@ async def _serve_roots_within_budget(
     # ``/b/proj``) — and a label-keyed dict collapses them, which would emit
     # the survivor's rows TWICE (duplicate `task_uid`s, the React tab's map
     # key) and drop the other root's rows entirely. Roots are deduped by
-    # `_all_project_roots`, so this pairing is total and 1:1; `strict=True`
-    # says so rather than trusting it. (The callers' snapshot dicts are
+    # `DashboardConfig.all_project_roots`, so this pairing is total and 1:1;
+    # `strict=True` says so rather than trusting it. (The callers' snapshot dicts are
     # label-keyed because the wire addresses projects by label; the collision
     # costs an ENTRY there, never a row.)
     by_root = dict(zip(admission_order, results, strict=True))
