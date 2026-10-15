@@ -458,6 +458,10 @@ def render_suppression_schema_section() -> str:
     )
 
 
+#: Heading of the section below; other prompt sections refer to it by this constant.
+ENTITY_STANDING_DECISIONS_HEADING = '## Entity Standing Decisions'
+
+
 def render_entity_standing_decision_schema_section() -> str:
     """Render the SHARED entity-standing-decision schema section (task 2898 ε,
     PRD plans/stage1-entity-standing-decision-prd.md §ε).
@@ -480,7 +484,7 @@ def render_entity_standing_decision_schema_section() -> str:
       deterministic filter (γ) and reads never consult mem0 for authority.
     """
     return (
-        '## Entity Standing Decisions\n'
+        f'{ENTITY_STANDING_DECISIONS_HEADING}\n'
         f'The `{RECORD_KIND_ENTITY_STANDING_DECISION}` ledger record is the SOLE '
         'machine-consulted standing-decision form — the durable record that a prior '
         'investigation adjudicated a recurring class of complaint about an entity and '
@@ -503,6 +507,10 @@ def render_entity_standing_decision_schema_section() -> str:
     )
 
 
+#: Heading of the section below; other prompt sections refer to it by this constant.
+INVESTIGATION_OUTCOME_RECORDS_HEADING = '## Investigation Outcome Records'
+
+
 def render_investigation_outcome_section() -> str:
     """Render the STAGE-2-ONLY investigation_outcome section (task 2898 ε,
     PRD plans/stage1-entity-standing-decision-prd.md §ε).
@@ -519,7 +527,7 @@ def render_investigation_outcome_section() -> str:
     design (PRD decision 8).
     """
     return (
-        '## Investigation Outcome Records\n'
+        f'{INVESTIGATION_OUTCOME_RECORDS_HEADING}\n'
         'When you (Stage 2) conclude an investigation of a flagged entity and '
         'determine it is not actionable, write an '
         f'`{MEM0_KIND_INVESTIGATION_OUTCOME}` mem0 record so the conclusion is durable '
