@@ -2,17 +2,12 @@
 // threw: which tab failed, that the rest of the dashboard is still live, how to
 // retry, and what was thrown. app.jsx's TabErrorBoundary only renders it.
 //
-// LOAD CONTRACT. It reads no window.DF_* global. index.html loads it before the
-// Babel JSX tags, so window.DF_TAB_RENDER_FAILURE exists before app.jsx
-// destructures it at module scope (test_index_html.py pins the order; datum.js's
-// CANONICAL block says why there is no fallback). node requires the same file as
-// CommonJS. Coverage is behavioural, in dashboard/tests/js/tab_render_failure.test.mjs.
-//
 // IT MUST NEVER THROW, whatever was thrown. It runs while React recovers from
 // the tab's throw, and a second throw there escapes the boundary and unmounts
 // the whole page.
 
 const UNDESCRIBABLE_THROW = 'an undescribable value was thrown';
+const LISTED_KEY_LIMIT = 10;
 
 function nameOfFailedTab(tabLabel) {
   return typeof tabLabel === 'string' && tabLabel !== '' ? tabLabel : 'current';
@@ -24,6 +19,12 @@ function describeError(error) {
   return message === '' ? name : name + ': ' + message;
 }
 
+function listedKeys(keys) {
+  const listed = keys.slice(0, LISTED_KEY_LIMIT).join(', ');
+  const unlisted = keys.length - LISTED_KEY_LIMIT;
+  return unlisted > 0 ? listed + ', …and ' + unlisted + ' more' : listed;
+}
+
 // Every read of the thrown value sits inside the one try: a getter, a revoked
 // proxy or a value String() cannot convert all land on the constant.
 function describeThrownValue(thrown) {
@@ -32,7 +33,7 @@ function describeThrownValue(thrown) {
     if (typeof thrown === 'function') return 'function thrown';
     if (typeof thrown !== 'object') return typeof thrown + ' thrown: ' + String(thrown);
     if (thrown instanceof Error) return describeError(thrown);
-    return 'object thrown, with keys [' + Object.keys(thrown).join(', ') + ']';
+    return 'object thrown, with keys [' + listedKeys(Object.keys(thrown)) + ']';
   } catch (_undescribable) {
     return UNDESCRIBABLE_THROW;
   }

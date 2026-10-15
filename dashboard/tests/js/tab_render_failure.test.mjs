@@ -130,6 +130,26 @@ for (const [label, thrown, mentioned] of NON_ERROR_THROWABLES) {
   });
 }
 
+function objectWithKeys(count) {
+  return Object.fromEntries(Array.from({ length: count }, (_, i) => ['k' + i, i]));
+}
+
+test('(d) a thrown object with many keys lists the first ten and counts the rest', () => {
+  const notice = tabRenderFailureNotice('Costs', objectWithKeys(300));
+
+  assertNoticeShape(notice);
+  for (let i = 0; i < 10; i += 1) assert.ok(notice.detail.includes('k' + i + ','), notice.detail);
+  assert.ok(!notice.detail.includes('k10'), notice.detail);
+  assert.ok(notice.detail.includes('…and 290 more'), notice.detail);
+});
+
+test('(d) a thrown object with exactly ten keys lists them all, with no remainder', () => {
+  const notice = tabRenderFailureNotice('Costs', objectWithKeys(10));
+
+  assert.ok(notice.detail.includes('k9'), notice.detail);
+  assert.ok(!notice.detail.includes('more'), notice.detail);
+});
+
 // ── (e) totality: the load-bearing invariant ────────────────────────────────
 
 function throwing(what) {
