@@ -343,6 +343,88 @@ class TestParseCodexErrorCarriers:
         assert agent_result.output.count(_CODEX_USAGE_LIMIT_MESSAGE) == 1
 
 
+_ASTRA_PRICES = {
+    'gpt-6-astra': PriceEntry(input_per_1m=10.0, output_per_1m=50.0, cached_input_per_1m=1.0),
+}
+
+
+def _codex_turns(*usages: dict[str, int]) -> _SubprocessResult:
+    return _codex_stream(
+        {'type': 'thread.started', 'thread_id': 'tid-usage'},
+        {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'done'}},
+        *({'type': 'turn.completed', 'usage': usage} for usage in usages),
+    )
+
+
+class TestParseCodexCachedUsage:
+    """turn.completed usage carries cached_input_tokens INSIDE input_tokens;
+    the parser prices that split and reports every token count it read."""
+
+    _MEASURED_USAGE = {
+        'input_tokens': _ASTRA_INPUT_TOKENS,
+        'cached_input_tokens': _ASTRA_CACHED_INPUT_TOKENS,
+        'cache_write_input_tokens': 0,
+        'output_tokens': _ASTRA_OUTPUT_TOKENS,
+    }
+
+    def test_measured_usage_prices_the_cached_split(self) -> None:
+        agent_result = _parse_codex_output(
+            _codex_turns(self._MEASURED_USAGE), 'gpt-6-astra', _ASTRA_PRICES,
+        )
+
+        # ((311881 - 277760) * 10 + 277760 * 1 + 1442 * 50) / 1e6
+        assert agent_result.cost_usd == pytest.approx(0.69107)
+
+    def test_measured_usage_populates_the_token_fields(self) -> None:
+        agent_result = _parse_codex_output(
+            _codex_turns(self._MEASURED_USAGE), 'gpt-6-astra', _ASTRA_PRICES,
+        )
+
+        assert agent_result.input_tokens == _ASTRA_INPUT_TOKENS
+        assert agent_result.output_tokens == _ASTRA_OUTPUT_TOKENS
+        assert agent_result.cache_read_tokens == _ASTRA_CACHED_INPUT_TOKENS
+        assert agent_result.cache_create_tokens == 0
+
+    def test_usage_across_two_turns_adds_field_wise(self) -> None:
+        second = {
+            'input_tokens': 1000, 'cached_input_tokens': 400,
+            'cache_write_input_tokens': 50, 'output_tokens': 20,
+        }
+
+        agent_result = _parse_codex_output(
+            _codex_turns(self._MEASURED_USAGE, second), 'gpt-6-astra', _ASTRA_PRICES,
+        )
+
+        assert agent_result.turns == 2
+        assert agent_result.input_tokens == 312881
+        assert agent_result.output_tokens == 1462
+        assert agent_result.cache_read_tokens == 278160
+        assert agent_result.cache_create_tokens == 50
+        # ((312881 - 278160) * 10 + 278160 * 1 + 1462 * 50) / 1e6
+        assert agent_result.cost_usd == pytest.approx(0.69847)
+
+    def test_cached_above_input_clamps_and_warns_once(self, caplog) -> None:
+        usage = {'input_tokens': 1200, 'cached_input_tokens': 1500, 'output_tokens': 10}
+
+        with caplog.at_level(logging.WARNING):
+            agent_result = _parse_codex_output(_codex_turns(usage), 'gpt-6-astra', _ASTRA_PRICES)
+
+        # Non-cached count clamped at 0: (0 * 10 + 1500 * 1 + 10 * 50) / 1e6
+        assert agent_result.cost_usd == pytest.approx(0.002)
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        assert '1500' in warnings[0]
+        assert '1200' in warnings[0]
+
+    def test_usage_without_cached_keys_prices_as_before(self) -> None:
+        agent_result = _parse_codex_output(
+            _codex_turns({'input_tokens': 200, 'output_tokens': 100}),
+            'gpt-6-astra', _ASTRA_PRICES,
+        )
+
+        assert agent_result.cost_usd == (200 * 10.0 + 100 * 50.0) / 1_000_000
+
+
 class TestPiToolName:
     """`_pi_tool_name` maps a Claude-style tool spec to pi's direct-tool
     name (spike Q3, live-confirmed against pi-mcp-adapter's
