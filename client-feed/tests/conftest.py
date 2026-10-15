@@ -19,10 +19,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
-from df_pytest_isolation import (  # noqa: E402
-    _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
-    _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
-    _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
+from df_pytest_isolation import (  # noqa: E402  # debt: ticket tkt_0RVTJHQ45EAGTZT7SGTA7E9AQT
+    _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring  # debt: ticket tkt_0RVTJHQ45EAGTZT7SGTA7E9AQT
+    _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring  # debt: ticket tkt_0RVTJHQ45EAGTZT7SGTA7E9AQT
+    _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring  # debt: ticket tkt_0RVTJHQ45EAGTZT7SGTA7E9AQT
     reject_unsafe_basetemp,
 )
 

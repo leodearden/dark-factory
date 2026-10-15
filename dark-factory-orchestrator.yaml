@@ -176,7 +176,7 @@ lock_depth: 12
 # Do NOT re-close it here: this segment still never runs for a
 # scripts/** diff, so a change made here to fix a scripts/ coverage
 # question would be inert, and would read as a gate that is not one.
-test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalation && uv run pytest tests/ --timeout=300 && cd ../orchestrator && uv run pytest tests/ --timeout=300 && cd ../fused-memory && uv run pytest tests/ --timeout=300 && cd ../dashboard && uv run pytest tests/ --timeout=300 && cd ../sampler && uv run pytest tests/ --timeout=300 && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 ) && uv run --project shared pytest tests/scripts/ scripts/tests/ --timeout=300"
+test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalation && uv run pytest tests/ --timeout=300 && cd ../orchestrator && uv run pytest tests/ --timeout=300 && cd ../fused-memory && uv run pytest tests/ --timeout=300 && cd ../dashboard && uv run pytest tests/ --timeout=300 && cd ../sampler && uv run pytest tests/ --timeout=300 && cd ../client-feed && uv run pytest tests/ --timeout=300 && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 ) && uv run --project shared pytest tests/scripts/ scripts/tests/ --timeout=300"
 # ``uv run`` prefix is load-bearing: ruff is not on PATH at the worktree root
 # (only inside each member venv). Without it the fallback scoper (which narrows
 # this to a single touched file for root-level changes) emits a bare ``ruff
@@ -322,7 +322,7 @@ test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalati
 # The doc mirrors the ruff leg ONLY, never the check_bare_magicmock_config.py
 # tail: disjoint target list, and gate-internal rather than something a
 # contributor runs.
-lint_command: "uv run ruff check shared escalation fused-memory orchestrator dashboard sampler cockpit conftest.py df_pytest_isolation.py skills && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests sampler/tests cockpit/tests"
+lint_command: "uv run ruff check shared escalation fused-memory orchestrator dashboard sampler cockpit client-feed conftest.py df_pytest_isolation.py skills && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests sampler/tests cockpit/tests client-feed/tests"
 #
 # DECIDED — skills/orchestrator.yaml (task 3554, deciding what task 3485
 # deferred). Supersedes 3485's "WHY NOT" block, which stood here as a
@@ -631,7 +631,7 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 # pyright` (wheel lane, uv.lock) against this chain's `npx pyright` (Node
 # lane, package.json), a divergence the guard pins from both ends and
 # tests/scripts/test_pyright_version_pin.py holds to one version.
-type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx pyright && cd ../dashboard && npx pyright && cd ../shared && npx pyright && cd ../escalation && npx pyright && cd ../sampler && npx pyright && cd ../cockpit && npx pyright"
+type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx pyright && cd ../dashboard && npx pyright && cd ../shared && npx pyright && cd ../escalation && npx pyright && cd ../sampler && npx pyright && cd ../cockpit && npx pyright && cd ../client-feed && npx pyright"
 
 # Verification timeouts: the budget of the FALLBACK fleet chain above.
 #
