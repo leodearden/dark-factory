@@ -822,7 +822,7 @@ _CODEX_MCP_CONFIG = {'mcpServers': {
 
 
 class TestCodexMcpServersNeverWrittenIntoCwd:
-    """MCP servers reach codex as per-invocation `-c mcp_servers."<name>".*`
+    """MCP servers reach codex as per-invocation `-c mcp_servers.<name>.*`
     overrides, so nothing is written into the caller's cwd: not a
     `.codex/config.toml`, and no mkdir that a pre-existing `.codex` FILE
     (the shape at the dark-factory root) turns into EEXIST."""
@@ -839,9 +839,31 @@ class TestCodexMcpServersNeverWrittenIntoCwd:
                 'command': '/venv/bin/python',
                 'args': ['-m', 'orchestrator.mcp.verdict_tools', '--meta-root', '/tmp/x "y"'],
                 'env': {'FASTMCP_SHOW_SERVER_BANNER': 'false'},
+                'default_tools_approval_mode': 'approve',
             },
-            'plain': {'command': 'srv', 'args': []},
+            'plain': {'command': 'srv', 'args': [], 'default_tools_approval_mode': 'approve'},
         }}
+
+    def test_server_names_are_bare_key_segments(self) -> None:
+        """tomllib reads a quoted and a bare segment as one key, but codex's
+        `-c` splitter keeps the quotes in the server name (esc-5403-4)."""
+        fragment = _codex_mcp_override_args(_CODEX_MCP_CONFIG)
+
+        key_paths = {override.split('=', 1)[0] for override in fragment[1::2]}
+        assert key_paths == {
+            'mcp_servers.verdict-tools.command',
+            'mcp_servers.verdict-tools.args',
+            'mcp_servers.verdict-tools.env',
+            'mcp_servers.verdict-tools.default_tools_approval_mode',
+            'mcp_servers.plain.command',
+            'mcp_servers.plain.args',
+            'mcp_servers.plain.default_tools_approval_mode',
+        }
+
+    @pytest.mark.parametrize('name', ['has space', 'dotted.name', 'quo"te', ''])
+    def test_a_name_no_bare_key_can_spell_is_rejected(self, name: str) -> None:
+        with pytest.raises(ValueError):
+            _codex_mcp_override_args({'mcpServers': {name: {'command': 'srv'}}})
 
     async def _invoke_with_mcp(self, cwd: Path) -> dict:
         captured: dict = {}
