@@ -57,6 +57,12 @@ _PYTEST_FINAL_SUMMARY_RE = re.compile(
 
 
 class OutputFormat(StrEnum):
+    """How a sub-run's output is parsed into failures and ``session_complete``.
+
+    ``session_complete`` is: PYTEST, pytest's final summary line is present (so False for
+    a non-pytest generic command); INFRA and OPAQUE, the run ended by exit, not by signal.
+    """
+
     PYTEST = 'pytest'
     INFRA = 'infra'
     OPAQUE = 'opaque'

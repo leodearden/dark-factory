@@ -83,6 +83,17 @@ def _make_worker(
     )
 
 
+async def _inline(fn, *args, **kwargs):
+    return fn(*args, **kwargs)
+
+
+@contextlib.contextmanager
+def _inline_record_io():
+    """Run the worker's record-I/O thread hops on the loop: the virtual clock rejects executor work."""
+    with patch('orchestrator.offline_lane.asyncio.to_thread', new=_inline):
+        yield
+
+
 # A faithful reproduction of reify scripts/verify.sh's error+usage() dump
 # (reify:5308 incident, verified against task 5264's corrupted fields): an
 # em-dash ``verify.sh: ERROR — <msg>`` banner on stderr followed by the full
@@ -381,6 +392,7 @@ async def test_run_once_snapshots_head_at_run_start_and_invokes_seam(tmp_path: P
 
 
 @pytest.mark.timeout(10)
+@_inline_record_io()
 @virtual_clock_test
 async def test_loop_coalesces_to_exactly_one_rerun(tmp_path: Path):
     """Multiple dirty-sets during one run collapse into exactly one re-run.
@@ -447,6 +459,7 @@ async def test_loop_coalesces_to_exactly_one_rerun(tmp_path: Path):
 
 
 @pytest.mark.timeout(10)
+@_inline_record_io()
 @virtual_clock_test
 async def test_poll_backstop_runs_on_missed_trigger(tmp_path: Path):
     """A missed trigger is caught by a periodic get_main_sha poll.
@@ -525,6 +538,7 @@ async def test_poll_backstop_runs_on_missed_trigger(tmp_path: Path):
 
 
 @pytest.mark.timeout(10)
+@_inline_record_io()
 @virtual_clock_test
 async def test_loop_is_fail_open_and_cancellation_clean(tmp_path: Path):
     """A broken lane run can never wedge the process (worker leg of C7).
@@ -593,6 +607,7 @@ async def test_loop_is_fail_open_and_cancellation_clean(tmp_path: Path):
 
 
 @pytest.mark.timeout(10)
+@_inline_record_io()
 @virtual_clock_test
 async def test_loop_backoff_grows_and_caps_on_consecutive_failures(tmp_path: Path):
     """Consecutive run() failures back off exponentially, capped (task 2016 amendment).
@@ -2050,6 +2065,7 @@ async def test_run_once_infra_leg_exception_does_not_advance_last_run_head(
 
 
 @pytest.mark.timeout(10)
+@_inline_record_io()
 @virtual_clock_test
 async def test_loop_retries_after_red_handling_exception(tmp_path: Path):
     """run()'s poll backstop retries a red-handling exception (Bug #2, end-to-end).
