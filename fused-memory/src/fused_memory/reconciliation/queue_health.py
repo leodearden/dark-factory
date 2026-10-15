@@ -24,25 +24,43 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def _optional_mapping(stats: dict, key: str) -> tuple[dict, bool]:
-    """Read an optional mapping field of *stats* as ``(mapping, malformed)``.
+def _optional_counts(stats: dict, key: str) -> tuple[dict[str, int], bool]:
+    """Read an optional ``{name: count}`` field of *stats* as ``(counts, malformed)``.
 
     Absent (or None) is benign: ``({}, False)``, silently.  Present but not a
-    dict is a malformed producer output: a WARNING and ``({}, True)``.
+    dict, or holding a count that is not int-convertible, is a malformed
+    producer output: a WARNING and ``malformed`` True.  The returned dict is a
+    fresh copy of the int-convertible entries only, so one bad count never
+    costs the rest of the record.
     """
     raw = stats.get(key)
     if raw is None:
         return {}, False
-    if isinstance(raw, dict):
-        return raw, False
-    logger.warning(
-        "summarize_graphiti_queue_health: stats[%r] is present but not a dict"
-        " (type=%s, repr=%s); forcing healthy=False",
-        key,
-        type(raw).__name__,
-        repr(raw)[:200],
-    )
-    return {}, True
+    if not isinstance(raw, dict):
+        logger.warning(
+            "summarize_graphiti_queue_health: stats[%r] is present but not a dict"
+            " (type=%s, repr=%s); forcing healthy=False",
+            key,
+            type(raw).__name__,
+            repr(raw)[:200],
+        )
+        return {}, True
+
+    counts: dict[str, int] = {}
+    unconvertible: dict = {}
+    for name, count in raw.items():
+        try:
+            counts[name] = int(count)
+        except (TypeError, ValueError, OverflowError):
+            unconvertible[name] = count
+    if unconvertible:
+        logger.warning(
+            "summarize_graphiti_queue_health: stats[%r] holds non-integer counts"
+            " (repr=%s); dropping them and forcing healthy=False",
+            key,
+            repr(unconvertible)[:200],
+        )
+    return counts, bool(unconvertible)
 
 
 def summarize_graphiti_queue_health(stats: dict) -> dict:
@@ -68,9 +86,10 @@ def summarize_graphiti_queue_health(stats: dict) -> dict:
             healthy (bool): True when dead_count == 0.
 
     Emits a WARNING log when *stats* is malformed (not a dict, or a 'counts' or
-    'dead_by_operation' key present but not a dict) and forces *healthy* to
-    False in those cases.  A benign-absent 'counts' or 'dead_by_operation' key
-    remains silent and healthy.
+    'dead_by_operation' key present but not a dict or holding a non-integer
+    count) and forces *healthy* to False in those cases.  A non-integer count
+    is dropped; the remaining counts still report.  A benign-absent 'counts' or
+    'dead_by_operation' key remains silent and healthy.
     """
     stats_malformed = not isinstance(stats, dict)
     if stats_malformed:
@@ -82,17 +101,17 @@ def summarize_graphiti_queue_health(stats: dict) -> dict:
         )
         stats = {}
 
-    counts, counts_malformed = _optional_mapping(stats, 'counts')
-    dead_by_operation, breakdown_malformed = _optional_mapping(stats, 'dead_by_operation')
+    counts, counts_malformed = _optional_counts(stats, 'counts')
+    dead_by_operation, breakdown_malformed = _optional_counts(stats, 'dead_by_operation')
     malformed = stats_malformed or counts_malformed or breakdown_malformed
 
-    dead_count = int(counts.get('dead', 0))
+    dead_count = counts.get('dead', 0)
 
     return {
         'dead_count': dead_count,
-        'pending_count': int(counts.get('pending', 0)),
-        'retry_count': int(counts.get('retry', 0)),
+        'pending_count': counts.get('pending', 0),
+        'retry_count': counts.get('retry', 0),
         'oldest_pending_age_seconds': stats.get('oldest_pending_age_seconds'),
-        'dead_by_operation': {op: int(n) for op, n in dead_by_operation.items()},
+        'dead_by_operation': dead_by_operation,
         'healthy': (dead_count == 0) and not malformed,
     }

@@ -241,3 +241,37 @@ class TestSummarizeGraphitiQueueHealth:
     def test_non_dict_stats_yields_empty_breakdown(self, bad_stats):
         """The 'dead_by_operation' key is always present, whatever the input."""
         assert summarize_graphiti_queue_health(bad_stats)['dead_by_operation'] == {}
+
+    @pytest.mark.parametrize(
+        "stats",
+        [
+            {'counts': {'completed': 5, 'pending': 'corrupt'}},
+            {'counts': {'completed': 5}, 'dead_by_operation': {'add_episode': None}},
+        ],
+    )
+    def test_non_integer_count_yields_unhealthy_and_warning(self, stats, caplog):
+        """A count that is not int-convertible, in either mapping => healthy=False + WARNING."""
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            result = summarize_graphiti_queue_health(stats)
+
+        assert result['healthy'] is False, (
+            f"a non-integer count in {stats!r} must yield healthy=False"
+        )
+        warns = [
+            r for r in caplog.records
+            if r.name == _LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, f"expected a WARNING on {_LOGGER!r} for a non-integer count"
+
+    def test_non_integer_breakdown_entry_is_dropped_and_dead_count_survives(self):
+        """Only the malformed entry is dropped: the rest of the record still reports."""
+        stats = {
+            'counts': {'dead': 3, 'pending': 'corrupt'},
+            'dead_by_operation': {'add_episode': 2, 'add_memory_graphiti': 'corrupt'},
+        }
+        result = summarize_graphiti_queue_health(stats)
+
+        assert result['dead_count'] == 3
+        assert result['pending_count'] == 0
+        assert result['dead_by_operation'] == {'add_episode': 2}
+        assert result['healthy'] is False
