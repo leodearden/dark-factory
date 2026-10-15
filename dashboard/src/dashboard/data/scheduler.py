@@ -792,11 +792,7 @@ async def collect_scheduler_state(
         snapshot, skip_events, recovery_events = await first_success(
             config.fused_memory_urls,
             _call,
-            # String-identical to the former f'get_scheduler_state[{label}]' —
-            # fanout_label's basename form IS project_label's. Routed through
-            # the helper so all four fan-out sites share one definition of the
-            # per-project-root throttle-key convention (see its docstring).
-            log_label=fanout_label('get_scheduler_state', root),
+            log_label=fanout_label('get_scheduler_state', root, labels),
             offline_result=lambda errs: (None, [], []),
         )
         return snapshot, skip_events, recovery_events

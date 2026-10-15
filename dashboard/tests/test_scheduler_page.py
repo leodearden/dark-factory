@@ -404,7 +404,7 @@ async def test_collect_scheduler_state_happy_path(dummy_client, dummy_config):
 
     from dashboard.data.scheduler import collect_scheduler_state
 
-    project = dummy_config.project_root.name  # _project_label result
+    project = dummy_config.project_root.name  # a lone root's label is its basename
 
     snapshot = _scheduler_snapshot(
         skip_counts={'1': 2},

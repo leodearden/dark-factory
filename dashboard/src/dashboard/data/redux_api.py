@@ -35,14 +35,13 @@ from dashboard.data.datum import (
     validate_datum,
 )
 from dashboard.data.escalation_corpus import EscalationView
-from dashboard.data.mcp_fanout import project_label
 from dashboard.data.outcome_colors import assign_outcome_colors
 from dashboard.data.performance import PerformanceListing
 from dashboard.data.reconciliation import AgentActivity
 from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import resolve_now
 from dashboard.data.write_journal import MemoryOps
-from dashboard.project_labels import ProjectLabels
+from dashboard.project_labels import ProjectLabels, basename_label
 
 # ---------------------------------------------------------------------------
 # ORCHESTRATORS + PROJECTS
@@ -656,7 +655,7 @@ def shape_costs(
         models_list = list(models)
         sums = _sum_models(models_list)
         by_project_list.append({
-            'project': project_label(pid),
+            'project': basename_label(pid),
             'total': round(sum(sums.values()), 4),
             **{k: round(v, 4) for k, v in sums.items()},
         })
@@ -890,7 +889,7 @@ def shape_performance(
 ) -> dict[str, Any]:
     """Each project's cards Datum beside its hour-bucketed histories, as served at *served_at*.
 
-    Output: ``{PERFORMANCE: {project_label: {cards, time_centiles_history,
+    Output: ``{PERFORMANCE: {project_basename: {cards, time_centiles_history,
     one_pass_history, escalation_history}}, PERFORMANCE_LISTING, served_at}``,
     where ``cards`` is the project's wire Datum from
     :func:`dashboard.data.performance.aggregate_performance_cards` and
@@ -914,7 +913,7 @@ def shape_performance(
     for pid, datum in listing.cards.items():
         validate_datum(datum, served_at)
         h = history.get(pid) or {}
-        out[project_label(pid)] = {
+        out[basename_label(pid)] = {
             'cards': datum.to_wire(),
             'time_centiles_history': dict(h.get('time_centiles_history') or empty_centiles),
             'one_pass_history': dict(h.get('one_pass_history') or empty_pair),

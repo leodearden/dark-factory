@@ -649,7 +649,7 @@ async def _fanout_read(
     return await first_success(
         config.fused_memory_urls,
         strategy,
-        log_label=fanout_label(label, read.project_root),
+        log_label=fanout_label(label, read.project_root, config.project_labels),
         offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
     )
 
@@ -1006,7 +1006,7 @@ async def fetch_statuses(
     return await first_success(
         config.fused_memory_urls,
         _call,
-        log_label=fanout_label('fetch_statuses', project_root_str),
+        log_label=fanout_label('fetch_statuses', project_root_str, config.project_labels),
         offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
     )
 
@@ -1084,7 +1084,7 @@ async def _read_task(
     return await first_success(
         config.fused_memory_urls,
         _call,
-        log_label=fanout_label(log_name, root),
+        log_label=fanout_label(log_name, root, config.project_labels),
         offline_result=lambda errs: TaskReadOffline('; '.join(errs)),
     )
 
