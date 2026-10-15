@@ -2402,7 +2402,9 @@ class TestReadSideSeesMeasuredRowsOnly:
         """Wire compatibility with ``redux_api.shape_burndown`` (task 5592 owns it):
         a gap row contributes nothing — not zeros — to either block."""
         from dashboard.data.redux_api import shape_burndown
+        from dashboard.project_labels import ProjectLabels
 
+        no_configured_roots = ProjectLabels.of_roots(())
         with_gap, without_gap = tmp_path / 'with_gap.db', tmp_path / 'without_gap.db'
         for path in (with_gap, without_gap):
             _migrated_pre_delta1_db(path)
@@ -2415,8 +2417,8 @@ class TestReadSideSeesMeasuredRowsOnly:
             conn.commit()
             conn.close()
 
-        shaped = shape_burndown({'/p/proj': await _series_of(with_gap)})
-        expected = shape_burndown({'/p/proj': await _series_of(without_gap)})
+        shaped = shape_burndown({'/p/proj': await _series_of(with_gap)}, labels=no_configured_roots)
+        expected = shape_burndown({'/p/proj': await _series_of(without_gap)}, labels=no_configured_roots)
 
         assert shaped['BURNDOWN_BY_PROJECT'] == expected['BURNDOWN_BY_PROJECT']
         assert shaped['BURNDOWN'] == expected['BURNDOWN']
