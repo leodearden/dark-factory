@@ -4287,15 +4287,30 @@ class _NightRunner:
     def night(self, day, kind, *, invoke=None):
         """Run one night. *kind* is 'barren' (real signal, squeezed budget),
         'productive' (real signal, stock budget), 'quiet' (no sessions at
-        all for this date) or 'storm' (real signal, every digest's coding
-        output unparseable, so the night exits 1 and records ``failed``).
-        *invoke* replaces the kind's coder."""
+        all for this date), 'storm' (real signal, every digest's coding
+        output unparseable, so the night exits 1 and records ``failed``) or
+        'capped' (real signal, every digest hits a usage cap, so the night
+        is deferred at exit 0). *invoke* replaces the kind's coder."""
+        self._prepare(day, kind)
+        return nightly.run_nightly(
+            **self._pass_kwargs(day, on_night=day, invoke=invoke or self._coder(kind)),
+        )
+
+    def scheduled_night(self, day, kind):
+        """Run night *day* as main() does for an undated run: through
+        run_scheduled_night, so any retry the backlog owes runs too."""
+        self._prepare(day, kind)
+        return nightly.run_scheduled_night(
+            **self._pass_kwargs(day, on_night=day, invoke=self._coder(kind)),
+        )
+
+    def _prepare(self, day, kind):
         _write_config(
             self.repo, project_id='testproj', escalation_port=8199,
             cwd_prefixes=[self.work_cwd],
             max_daily_digest_bytes=10 if kind == 'barren' else None,
         )
-        if kind in ('barren', 'productive', 'storm'):
+        if kind in ('barren', 'productive', 'storm', 'capped'):
             _write_transcript(
                 self.projects_root / _encode_cwd(self.work_cwd)
                 / f'session-{day}.jsonl',
@@ -4303,9 +4318,14 @@ class _NightRunner:
                 timestamp=f'2026-07-{day:02d}T10:00:00Z',
                 session_id=f'session-{day}',
             )
-        if invoke is None:
-            invoke = _fake_invoke_unparseable if kind == 'storm' else _fake_invoke_known_cause
-        return nightly.run_nightly(**self._pass_kwargs(day, on_night=day, invoke=invoke))
+
+    @staticmethod
+    def _coder(kind):
+        if kind == 'storm':
+            return _fake_invoke_unparseable
+        if kind == 'capped':
+            return _fake_invoke_capped
+        return _fake_invoke_known_cause
 
     def retry(self, day, *, on_night, invoke=_fake_invoke_known_cause):
         """Run night *on_night*'s retry pass of *day*'s date, on that night's
@@ -4778,6 +4798,111 @@ class TestRetryPass:
         assert result.exit_code == 0
         assert result.retry_due == ()
         assert runner.recorded()['retry_backlog'] == {'2026-07-14': 1}
+
+
+def _scripted_run_nightly(*outcomes):
+    """A ``run_nightly`` fake recording each call's kwargs. Call N gets
+    outcome N (the last repeats); an exception outcome is raised."""
+    calls: list[dict[str, Any]] = []
+
+    def _fake(**kwargs):
+        calls.append(kwargs)
+        outcome = outcomes[min(len(calls), len(outcomes)) - 1]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    return _fake, calls
+
+
+class TestRunScheduledNight:
+    """An undated run is the scheduled night plus, once that night finished,
+    the retry the backlog owes; a dated run stays a single pass."""
+
+    def test_a_failed_night_is_recovered_by_the_next_healthy_night(self, tmp_path):
+        """The 2026-08-17 scenario: a lost night is now retried, not dropped."""
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'storm')
+
+        results = runner.scheduled_night(14, 'productive')
+
+        assert [result.exit_code for result in results] == [0, 0]
+        assert _commit_subjects(runner.repo)[:2] == [
+            'legibility: nightly trickle sightings for 2026-07-13',
+            'legibility: nightly trickle sightings for 2026-07-14',
+        ]
+        doc = runner.recorded()
+        assert doc['retry_backlog'] == {}
+        assert doc['target_date'] == '2026-07-14'
+
+    def test_an_unfinished_night_runs_no_retry_and_burns_no_attempt(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'storm')
+
+        results = runner.scheduled_night(14, 'storm')
+
+        assert len(results) == 1
+        assert runner.recorded()['retry_backlog']['2026-07-13'] == 1
+
+    def test_a_capped_night_runs_no_retry(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'storm')
+
+        results = runner.scheduled_night(14, 'capped')
+
+        assert len(results) == 1
+        assert results[0].capped is True
+        assert runner.recorded()['retry_backlog']['2026-07-13'] == 1
+
+    def test_main_retries_the_owed_date_after_an_undated_run(self, monkeypatch):
+        fake, calls = _scripted_run_nightly(
+            nightly.NightlyResult(exit_code=0, retry_due=(date(2026, 7, 13),)),
+            nightly.NightlyResult(exit_code=0),
+        )
+        monkeypatch.setattr(nightly, 'run_nightly', fake)
+
+        exit_code = nightly.main(['run', '--project-id', 'proj_a'])
+
+        assert exit_code == 0
+        assert len(calls) == 2
+        scheduled, retried = calls
+        assert retried['target_date'] == date(2026, 7, 13)
+        assert retried['retry'] is True
+        for key in ('project_id', 'config_path', 'projects_root'):
+            assert retried[key] == scheduled[key]
+
+    def test_main_fails_when_the_retry_fails(self, monkeypatch):
+        fake, calls = _scripted_run_nightly(
+            nightly.NightlyResult(exit_code=0, retry_due=(date(2026, 7, 13),)),
+            nightly.NightlyResult(exit_code=1),
+        )
+        monkeypatch.setattr(nightly, 'run_nightly', fake)
+
+        exit_code = nightly.main(['run', '--project-id', 'proj_a'])
+
+        assert exit_code == 1
+        assert len(calls) == 2
+
+    def test_a_dated_run_is_a_single_pass(self, monkeypatch):
+        fake, calls = _scripted_run_nightly(
+            nightly.NightlyResult(exit_code=0, retry_due=(date(2026, 7, 10),)),
+        )
+        monkeypatch.setattr(nightly, 'run_nightly', fake)
+
+        exit_code = nightly.main(['run', '--project-id', 'proj_a', '--date', '2026-07-13'])
+
+        assert exit_code == 0
+        assert len(calls) == 1
+        assert calls[0]['target_date'] == date(2026, 7, 13)
+
+    def test_a_scheduled_pass_that_raises_propagates_and_runs_no_retry(self, monkeypatch):
+        fake, calls = _scripted_run_nightly(FileNotFoundError('no legibility.yaml'))
+        monkeypatch.setattr(nightly, 'run_nightly', fake)
+
+        with pytest.raises(FileNotFoundError):
+            nightly.main(['run', '--project-id', 'proj_a'])
+
+        assert len(calls) == 1
 
 
 # ---------------------------------------------------------------------------
