@@ -4,10 +4,11 @@
 BODY quotes a merge subject shadows the genuine merge. The selecting form in
 ``skills/_shared/deriving-landed-sha.md`` step 1 scans past such a body match;
 a ``--max-count=1`` stops at it. This guard extracts every marker search in
-``skills/**/*.md`` (any fenced block or inline code span carrying ``--grep``
-plus a fixed-strings flag), RUNS it against a fixture history where a body
-match shadows the genuine marker, and requires it to print the genuine marker
-and nothing else.
+``skills/**/*.md`` (any fenced block or inline code span in which a
+``git log`` or ``git rev-list`` greps for ``$S`` or a ``Merge task/…`` /
+``Merge branch 'task/…'`` subject, whatever its other flags), RUNS it against a
+fixture history where a body match shadows the genuine marker, and requires it
+to print the genuine marker and nothing else.
 
 It executes rather than greps for a flag because INV-10
 ``guards-exercise-behaviour`` (``docs/legibility/design-invariants.md``) asks a
@@ -15,8 +16,9 @@ guard to exercise the behaviour it protects: any newest-hit shortcut fails the
 same way, and the prose around a snippet stays free to change.
 
 A snippet that quotes a non-selecting form on purpose, to show what not to do,
-carries ``<!-- marker-search-guard: counterexample -->`` on one of its lines
-and is not executed.
+is not executed when it carries ``<!-- marker-search-guard: counterexample -->``:
+an inline span right after its closing backtick, a fenced block on one of its
+lines.
 
 This module reads real ``skills/`` paths, so it is registered in
 ``tests/scripts/test_skills_module_config_decision.py::SKILLS_CONSUMING_TESTS``.
@@ -40,7 +42,9 @@ REPO_ROOT = Path(__file__).parents[2]
 
 COUNTEREXAMPLE_MARKER = 'marker-search-guard: counterexample'
 
-_FIXED_STRINGS_FLAG = re.compile(r'--fixed-strings|(?<=\s)-F(?=\s)')
+_COUNTEREXAMPLE_TAG = re.compile(rf'[ \t]*<!--[ \t]*{re.escape(COUNTEREXAMPLE_MARKER)}[ \t]*-->')
+_HISTORY_SEARCH_COMMAND = re.compile(r'\bgit\s+(?:log|rev-list)\b')
+_MARKER_GREP_OPTION = re.compile(r'''--grep[= ]['"]?\^?(?:\$\{?S\b|Merge (?:branch ')?task/[<\d])''')
 _FENCE_OPEN = re.compile(r'^\s*(`{3,})[^`]*$')
 _FENCE_CLOSE = re.compile(r'^\s*(`{3,})\s*$')
 _INLINE_SPAN = re.compile(r'(?<!`)`([^`]+)`(?!`)')
@@ -61,8 +65,8 @@ class _Fence(NamedTuple):
 
 class _Snippet(NamedTuple):
     first_line: int
-    last_line: int
     shell: str
+    counterexample: bool
 
 
 def marker_searches(markdown: str, *, source: str) -> list[MarkerSearch]:
@@ -75,7 +79,7 @@ def marker_searches(markdown: str, *, source: str) -> list[MarkerSearch]:
     return [
         MarkerSearch(source, snippet.first_line, snippet.shell)
         for snippet in sorted(snippets, key=lambda snippet: snippet.first_line)
-        if _is_marker_search(snippet.shell) and not _opts_out(lines, snippet)
+        if _is_marker_search(snippet.shell) and not snippet.counterexample
     ]
 
 
@@ -103,7 +107,10 @@ def _closing_fence(lines: list[str], opener: int, run_length: int) -> int:
 
 def _fenced_snippet(lines: list[str], fence: _Fence) -> _Snippet:
     body = textwrap.dedent('\n'.join(lines[fence.opener + 1 : fence.closer]))
-    return _Snippet(fence.opener + 1, min(fence.closer + 1, len(lines)), body)
+    occupied = lines[fence.opener : fence.closer + 1]
+    return _Snippet(
+        fence.opener + 1, body, any(COUNTEREXAMPLE_MARKER in line for line in occupied),
+    )
 
 
 def _blank_fences(lines: list[str], fences: list[_Fence]) -> str:
@@ -115,8 +122,8 @@ def _inline_snippets(prose: str) -> list[_Snippet]:
     return [
         _Snippet(
             _line_number(prose, span.start()),
-            _line_number(prose, span.end() - 1),
             _SOFT_WRAP.sub(' ', span.group(1)),
+            _COUNTEREXAMPLE_TAG.match(prose, span.end()) is not None,
         )
         for span in _INLINE_SPAN.finditer(prose)
         if _BLANK_LINE.search(span.group(1)) is None
@@ -128,12 +135,10 @@ def _line_number(text: str, offset: int) -> int:
 
 
 def _is_marker_search(shell: str) -> bool:
-    return '--grep' in shell and _FIXED_STRINGS_FLAG.search(shell) is not None
-
-
-def _opts_out(lines: list[str], snippet: _Snippet) -> bool:
-    occupied = lines[snippet.first_line - 1 : snippet.last_line]
-    return any(COUNTEREXAMPLE_MARKER in line for line in occupied)
+    return (
+        _HISTORY_SEARCH_COMMAND.search(shell) is not None
+        and _MARKER_GREP_OPTION.search(shell) is not None
+    )
 
 
 _SYNTHETIC_SKILL = r"""# Synthetic skill
@@ -151,11 +156,15 @@ _SYNTHETIC_SKILL = r"""# Synthetic skill
 
 Never `git log main --fixed-strings --grep="Merge task/1 into main" --max-count=1 --format=%H` <!-- marker-search-guard: counterexample -->
 
+Prefer `git log main --fixed-strings --grep="$S" --format='%H%x09%s' | awk -F'\t' -v s="$S" '$2==s && !seen {print $1; seen=1}'` to `git log main --fixed-strings --grep="$S" --max-count=1 --format=%H` <!-- marker-search-guard: counterexample -->.
+
+A careless rewrite: `git log main --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H`, `git log -1 --format=%H --grep "${S}"` or `git rev-list -1 main --grep="^Merge branch 'task/42'"`.
+
 ```bash
-git log main --extended-regexp --format='%H %s' --grep='^Merge task/[0-9]+ into main$'
+git log main --extended-regexp --format='%H%x09%s' --grep='^Merge task/[0-9]+ into main$' | awk -F '\t' '{print $1}'
 ```
 
-Split with `awk -F'\t' '{print $1}'`, and never use the bare `--grep ... --max-count=1`.
+Split with `awk -F'\t' '{print $1}'`, never use the bare `--grep ... --max-count=1`, and note that `--grep="Merge task/<task-id> into main"` alone is no command.
 """
 
 _SYNTHETIC_FENCED_SHELL = r"""S="Merge task/<TASK_ID> into main"
@@ -174,6 +183,15 @@ def test_marker_search_extractor_reads_every_snippet_shape() -> None:
     assert found == [
         MarkerSearch('skills/synthetic.md', 5, _SYNTHETIC_FENCED_SHELL),
         MarkerSearch('skills/synthetic.md', 11, _SYNTHETIC_INLINE_SHELL),
+        MarkerSearch('skills/synthetic.md', 16, _SYNTHETIC_INLINE_SHELL),
+        MarkerSearch(
+            'skills/synthetic.md', 18,
+            'git log main --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H',
+        ),
+        MarkerSearch('skills/synthetic.md', 18, 'git log -1 --format=%H --grep "${S}"'),
+        MarkerSearch(
+            'skills/synthetic.md', 18, '''git rev-list -1 main --grep="^Merge branch 'task/42'"''',
+        ),
     ]
 
 
@@ -266,7 +284,8 @@ def shadowed_history(tmp_path_factory: pytest.TempPathFactory) -> ShadowedHistor
         root, 'docs',
         'docs: explain the marker search',
         f'A marker search for "{_MARKER_SUBJECT}" or "{_HAND_MERGE_SUBJECT}" '
-        'also matches this body.',
+        'also matches this body, even one anchored to a whole line:',
+        f'{_MARKER_SUBJECT}\n{_HAND_MERGE_SUBJECT}',
     )
     return ShadowedHistory(root, frozenset({orchestrator_marker, hand_merge}), shadow)
 
@@ -316,16 +335,16 @@ def _selection_defect(history: ShadowedHistory, search: MarkerSearch) -> str | N
 
 
 def _with_max_count(search: MarkerSearch) -> MarkerSearch:
-    mutant = _FIXED_STRINGS_FLAG.sub(
-        lambda flag: f'{flag.group(0)} --max-count=1', search.shell, count=1,
+    mutant = _MARKER_GREP_OPTION.sub(
+        lambda grep: f'--max-count=1 {grep.group(0)}', search.shell, count=1,
     )
     return search._replace(shell=mutant)
 
 
 def test_skills_present_marker_searches() -> None:
     assert _LIVE_MARKER_SEARCHES, (
-        'no merge-marker search (a code snippet with --grep and a fixed-strings flag) '
-        'was found in skills/**/*.md, so the parametrised guards below collected '
+        'no merge-marker search (a code snippet whose git log or git rev-list greps for '
+        '$S or a merge subject) was found in skills/**/*.md, so the parametrised guards below collected '
         'nothing and would pass without running a single snippet'
     )
 
