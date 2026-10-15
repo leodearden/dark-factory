@@ -4284,12 +4284,12 @@ class _NightRunner:
         self.projects_root.mkdir(parents=True, exist_ok=True)
         self.escalations = []
 
-    def night(self, day, kind):
+    def night(self, day, kind, *, invoke=None):
         """Run one night. *kind* is 'barren' (real signal, squeezed budget),
         'productive' (real signal, stock budget), 'quiet' (no sessions at
         all for this date) or 'storm' (real signal, every digest's coding
-        output unparseable, so the night exits 1 and records ``failed``)."""
-        target = date(2026, 7, day)
+        output unparseable, so the night exits 1 and records ``failed``).
+        *invoke* replaces the kind's coder."""
         _write_config(
             self.repo, project_id='testproj', escalation_port=8199,
             cwd_prefixes=[self.work_cwd],
@@ -4303,15 +4303,24 @@ class _NightRunner:
                 timestamp=f'2026-07-{day:02d}T10:00:00Z',
                 session_id=f'session-{day}',
             )
+        if invoke is None:
+            invoke = _fake_invoke_unparseable if kind == 'storm' else _fake_invoke_known_cause
+        return nightly.run_nightly(**self._pass_kwargs(day, on_night=day, invoke=invoke))
+
+    def retry(self, day, *, on_night, invoke=_fake_invoke_known_cause):
+        """Run night *on_night*'s retry pass of *day*'s date, on that night's
+        clock, over the config and transcripts already on disk."""
         return nightly.run_nightly(
+            **self._pass_kwargs(day, on_night=on_night, invoke=invoke), retry=True,
+        )
+
+    def _pass_kwargs(self, day, *, on_night, invoke) -> dict[str, Any]:
+        return dict(
             config_path=self.config_path,
             projects_root=self.projects_root,
-            target_date=target,
-            now=datetime(2026, 7, day + 1, 3, 0, 0, tzinfo=UTC),
-            invoke=(
-                _fake_invoke_unparseable if kind == 'storm'
-                else _fake_invoke_known_cause
-            ),
+            target_date=date(2026, 7, day),
+            now=datetime(2026, 7, on_night + 1, 3, 0, 0, tzinfo=UTC),
+            invoke=invoke,
             status_fetcher=None,
             poster=lambda url, env: self.escalations.append((url, env)),
         )
@@ -4596,6 +4605,179 @@ class TestScheduledPassRetryBacklog:
         _run_e2e_nightly(tmp_path, branch='capped', recorder=recorder)
 
         assert calls[0][0]['capped'] is True
+
+
+def _without_backlog(doc: dict) -> dict:
+    return {key: value for key, value in doc.items() if key != 'retry_backlog'}
+
+
+def _commit_subjects(repo: Path) -> list[str]:
+    return subprocess.run(
+        ['git', 'log', '--format=%s'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+
+
+def _counting_invoke(calls: list[str]):
+    def _invoke(prompt: str, model: str) -> str:
+        calls.append(prompt)
+        return _fake_invoke_known_cause(prompt, model)
+
+    return _invoke
+
+
+def _seed_state(*, day: int, exit_code: int) -> None:
+    trickle_state.record_run(
+        'testproj', target_date=date(2026, 7, day),
+        recorded_at=datetime(2026, 7, day + 1, 3, 0, tzinfo=UTC), exit_code=exit_code,
+        total_records=0, zero_signal_dropped=0, dedupe_collapsed=0,
+        below_sampling_cut=0, budget_skipped=0, selected_count=0,
+    )
+
+
+def _owed_after_storm_then_productive(tmp_path) -> tuple[_NightRunner, dict]:
+    """Night 13 storms and night 14 is productive, so date 13 is owed with
+    one attempt. Returns the runner and the state document night 14 wrote."""
+    runner = _NightRunner(tmp_path)
+    runner.night(13, 'storm')
+    runner.night(14, 'productive')
+    before = runner.recorded()
+    assert before['retry_backlog'] == {'2026-07-13': 1}
+    return runner, before
+
+
+class TestRetryPass:
+    """``run_nightly(retry=True)`` re-runs an owed date and touches ONLY the
+    backlog: the recorded health keeps describing the scheduled night."""
+
+    def test_a_recovered_date_lands_its_sightings_and_leaves_the_backlog(self, tmp_path):
+        runner, before = _owed_after_storm_then_productive(tmp_path)
+
+        result = runner.retry(13, on_night=14)
+
+        assert result.exit_code == 0
+        assert _commit_subjects(runner.repo)[0] == (
+            'legibility: nightly trickle sightings for 2026-07-13'
+        )
+        after = runner.recorded()
+        assert after['retry_backlog'] == {}
+        assert _without_backlog(after) == _without_backlog(before)
+        assert after['target_date'] == '2026-07-14'
+
+    def test_a_failed_retry_counts_an_attempt_and_exits_non_zero(self, tmp_path):
+        runner, before = _owed_after_storm_then_productive(tmp_path)
+
+        result = runner.retry(13, on_night=14, invoke=_fake_invoke_unparseable)
+
+        assert result.exit_code == 1
+        after = runner.recorded()
+        assert after['retry_backlog'] == {'2026-07-13': 2}
+        assert _without_backlog(after) == _without_backlog(before)
+        assert after['outcome'] == trickle_state.OUTCOME_PRODUCTIVE
+        assert after['consecutive_failed_runs'] == 0
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason='root ignores permission bits')
+    def test_a_retry_that_raises_counts_an_attempt_and_keeps_the_health_record(
+        self, tmp_path,
+    ):
+        runner, before = _owed_after_storm_then_productive(tmp_path)
+
+        runner.projects_root.chmod(0)
+        try:
+            result = runner.retry(13, on_night=14)
+        finally:
+            runner.projects_root.chmod(0o755)
+
+        assert result.exit_code == 1
+        after = runner.recorded()
+        assert after['retry_backlog'] == {'2026-07-13': 2}
+        assert _without_backlog(after) == _without_backlog(before)
+
+    def test_a_retry_whose_config_does_not_load_counts_an_attempt_then_raises(
+        self, tmp_path, monkeypatch,
+    ):
+        _seed_state(day=13, exit_code=1)
+        _seed_state(day=14, exit_code=0)
+        before = _testproj_state()
+        _write_unloadable_config(tmp_path / 'proj', project_id='testproj')
+        monkeypatch.setenv('LEGIBILITY_SEARCH_ROOTS', str(tmp_path))
+
+        with pytest.raises(FileNotFoundError):
+            nightly.run_nightly(
+                project_id='testproj', target_date=date(2026, 7, 13), retry=True,
+                now=datetime(2026, 7, 15, 3, 0, tzinfo=UTC),
+            )
+
+        after = _testproj_state()
+        assert after['retry_backlog'] == {'2026-07-13': 2}
+        assert _without_backlog(after) == _without_backlog(before)
+        assert after['target_date'] == '2026-07-14'
+
+    def test_a_retry_never_evaluates_the_census_step(self, tmp_path, monkeypatch):
+        census_calls = []
+
+        def _spy(cfg, **kwargs):
+            census_calls.append(cfg.project_id)
+            return 'census: spy', False
+
+        monkeypatch.setattr(nightly, 'evaluate_census_step', _spy)
+        runner, _before = _owed_after_storm_then_productive(tmp_path)
+        assert census_calls == ['testproj'], 'the scheduled night 14 evaluates it once'
+
+        result = runner.retry(13, on_night=14)
+
+        assert census_calls == ['testproj']
+        assert result.census_line is None
+        assert result.census_fire is False
+
+    def test_a_retry_skips_sessions_the_ledger_already_holds(self, tmp_path):
+        runner, _before = _owed_after_storm_then_productive(tmp_path)
+        session_ledger.record_codings(session_ledger.ledger_path('testproj'), [
+            session_ledger.LedgerRow(
+                session='session-13', instrument_version=1,
+                coded_by=session_ledger.CodedBy.CENSUS, run_ref='census-run',
+                outcome=session_ledger.Outcome.MATCHED,
+                coded_at=datetime(2026, 7, 14, 12, 0, tzinfo=UTC),
+            ),
+        ])
+        retry_prompts: list[str] = []
+
+        result = runner.retry(13, on_night=14, invoke=_counting_invoke(retry_prompts))
+
+        assert retry_prompts == []
+        assert result.exit_code == 0
+        assert runner.recorded()['retry_backlog'] == {}
+
+        scheduled_prompts: list[str] = []
+        runner.night(13, 'productive', invoke=_counting_invoke(scheduled_prompts))
+        assert len(scheduled_prompts) == 1, 'a scheduled pass does not skip ledgered sessions'
+
+    def test_a_retry_never_refires_the_barren_streak_escalation(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'storm')
+        for day in (14, 15, 16):
+            runner.night(day, 'barren')
+        streak = runner.recorded()
+        assert streak['outcome'] == trickle_state.OUTCOME_BARREN
+        assert streak['consecutive_barren_runs'] == trickle_state.DEFAULT_MAX_BARREN_RUNS
+        assert streak['retry_backlog'] == {'2026-07-13': 1}
+        posted_before = len(_streak_escalations(runner.escalations))
+
+        result = runner.retry(13, on_night=16)
+
+        assert len(_streak_escalations(runner.escalations)) == posted_before
+        assert result.barren_escalated is False
+
+    def test_a_retry_never_schedules_another_retry(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'storm')
+        runner.night(14, 'storm')
+        assert runner.night(15, 'productive').retry_due == (date(2026, 7, 13),)
+
+        result = runner.retry(13, on_night=15)
+
+        assert result.exit_code == 0
+        assert result.retry_due == ()
+        assert runner.recorded()['retry_backlog'] == {'2026-07-14': 1}
 
 
 # ---------------------------------------------------------------------------
