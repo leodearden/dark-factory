@@ -81,4 +81,5 @@ async def test_the_registered_tool_refuses_an_unknown_type(artifacts):
     result = await tool.run({'step_id': 'step-1', 'step_type': 'red', 'description': 'X'})
 
     assert result.structured_content is not None
-    assert result.structured_content['status'] == 'error'
+    _assert_refused(result.structured_content, 'red')
+    assert artifacts.read_plan()['steps'] == []
