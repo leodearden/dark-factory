@@ -83,7 +83,11 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     StageAgentOutcome,
 )
-from fused_memory.models.scope import Scope
+from fused_memory.models.scope import (
+    Scope,
+    build_known_projects_map,
+    known_project_roots_from_env,
+)
 from fused_memory.reconciliation.flag_record_contract import (
     enforce_flag_record_write_contract,
 )
@@ -2325,11 +2329,9 @@ class MemoryService:
         self.planned_episode_registry: PlannedEpisodeRegistry | None = None
         self.recon_ledger: ReconLedgerStore | None = None
         self.recon_journal: ReconciliationJournal | None = None
-        # {project_id: project_root} registry snapshot (task 3088). Injected by
-        # set_known_projects at server startup — MemoryService is constructed
-        # before build_known_projects_map runs, so it cannot arrive by
-        # constructor. Used to resolve an escalation queue's filesystem root
-        # from the project_id update_memory carries.
+        # {project_id: project_root}, seeded below from DASHBOARD_KNOWN_PROJECT_ROOTS
+        # alone, never config.taskmaster.project_root (see the module docstring of
+        # middleware/mem0_update_storm_escalator.py); startup replaces it.
         self._known_projects: dict[str, str] = {}
         # INV-4 storm escape for update_memory's silent-rewrite primitive (task
         # 3088). Both are constructed UNCONDITIONALLY — never obtained from
@@ -2340,6 +2342,9 @@ class MemoryService:
         # likely to be noticed any other way.
         self._mem0_update_storm_counters: KeyedStormCounters[str] = KeyedStormCounters()
         self._mem0_update_storm_escalator = Mem0UpdateStormEscalator()
+        self.set_known_projects(build_known_projects_map(
+            primary_root='', extra_roots=known_project_roots_from_env(),
+        ))
         # INV-4 storm escape for the ensure_entity_node MCP tool (task 4932),
         # keyed per `agent_id` for the same attribution reason as the registry
         # above.
@@ -2529,13 +2534,15 @@ class MemoryService:
     def set_known_projects(self, known_projects: Mapping[str, str] | None) -> None:
         """Wire the ``{project_id: project_root}`` registry snapshot (task 3088).
 
-        The same snapshot ``server/main.py`` builds with
-        ``build_known_projects_map`` and already hands to ``ReconciliationHarness``
-        and ``TicketJanitor``. Injected rather than derived so this stays pure
-        data with no lifetime coupling to any conditionally-constructed
-        component — the ``update_memory`` storm alarm must keep working with
-        reconciliation disabled, which is exactly the degraded configuration
-        where an unattended rewrite loop is least likely to be noticed.
+        The ONE injection point for the registry. ``__init__`` seeds it with
+        the ``DASHBOARD_KNOWN_PROJECT_ROOTS`` roots, and ``server/main.py``
+        replaces that seed with the full startup snapshot it builds with
+        ``build_known_projects_map`` and also hands to ``ReconciliationHarness``
+        and ``TicketJanitor``. Pure data with no lifetime coupling to any
+        conditionally-constructed component — the ``update_memory`` storm alarm
+        must keep working with reconciliation disabled, which is exactly the
+        degraded configuration where an unattended rewrite loop is least likely
+        to be noticed.
 
         Copied on entry so a later mutation of the caller's map cannot change
         resolution out from under an in-flight escalation.
@@ -2545,9 +2552,9 @@ class MemoryService:
         # project_root resolution actually happens.
         self._mem0_update_storm_escalator.set_known_projects(self._known_projects)
         # The PERMISSIVE arm is logged too, not only the populated one. An
-        # empty registry is a real window rather than a hypothetical: this
-        # service is constructed before `build_known_projects_map` runs (see
-        # `__init__`), and while it lasts every producer referent scan stays
+        # empty registry is a real window rather than a hypothetical: with
+        # DASHBOARD_KNOWN_PROJECT_ROOTS unset, the `__init__` seed is empty until
+        # startup wiring, and while it lasts every producer referent scan stays
         # permissive — junk qualifiers like 'localhost:6379' keep minting
         # referents — with nothing else in the log to say so. The remedy is the
         # same one the three existing `_known_projects`-miss messages already

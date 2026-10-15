@@ -38,8 +38,8 @@ class TestStormEscalationEnabled:
     def test_constructs_zero_arg(self):
         """Constructed unconditionally inside MemoryService.__init__ — no deps to hand it.
 
-        The map is delivered later by a setter, exactly because MemoryService is
-        built before ``build_known_projects_map`` runs at server startup.
+        The map is delivered by a setter: MemoryService hands it the env seed at
+        construction, and server startup replaces that with the full snapshot.
         """
         esc = Mem0UpdateStormEscalator()
         assert esc._queues == {}

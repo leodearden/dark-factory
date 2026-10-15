@@ -14893,13 +14893,14 @@ class TestSetKnownProjectsLogsTheWireUp:
     """One INFO line per wire-up, naming whether referent narrowing is ACTIVE.
 
     `set_known_projects` is the single injection point every caller goes
-    through (`server/main.py` plus tests), so a future second caller cannot
-    bypass the report by wiring the registry somewhere else.
+    through (the constructor's env seed, `server/main.py` and tests), so a
+    future second caller cannot bypass the report by wiring the registry
+    somewhere else.
 
     The PERMISSIVE arm is logged too, and is the one an operator most needs:
-    `MemoryService` is constructed before `build_known_projects_map` runs, so
-    an empty registry is a real and easily-missed window — and while it lasts,
-    every producer scan silently stays permissive.
+    with DASHBOARD_KNOWN_PROJECT_ROOTS unset the constructor's seed is empty
+    until startup wiring, so an empty registry is a real and easily-missed
+    window — and while it lasts, every producer scan silently stays permissive.
     """
 
     @staticmethod

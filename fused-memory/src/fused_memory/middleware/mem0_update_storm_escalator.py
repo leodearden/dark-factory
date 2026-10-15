@@ -34,23 +34,26 @@ content fingerprint answers that while still folding the repeat breaches, so thi
 keeps decision doc §4's ratified class shape and its state (the queue cache).
 
 RESOLVING ``project_id`` → ``project_root``. ``update_memory`` carries only a
-``project_id`` and ``MemoryService`` holds no filesystem root, so the
-``{project_id: project_root}`` snapshot that ``server/main.py`` already builds
-with ``build_known_projects_map`` (and already hands to ``ReconciliationHarness``
-and ``TicketJanitor``) is INJECTED here via :meth:`set_known_projects`. That is
-pure data with no lifetime coupling to any conditionally-constructed component,
-which is what lets this escalator be built unconditionally in
-``MemoryService.__init__`` — the alarm must not vanish when
+``project_id``, so this escalator resolves the root from a
+``{project_id: project_root}`` registry INJECTED via :meth:`set_known_projects`.
+``MemoryService`` constructs it and immediately hands it the service's own
+registry, seeded from ``DASHBOARD_KNOWN_PROJECT_ROOTS`` alone;
+``server/main.py`` later replaces that with the full startup snapshot it builds
+with ``build_known_projects_map`` (and also hands to ``ReconciliationHarness``
+and ``TicketJanitor``). That is pure data with no lifetime coupling to any
+conditionally-constructed component, which is what lets this escalator be built
+unconditionally in ``MemoryService.__init__`` — the alarm must not vanish when
 ``config.reconciliation.enabled`` is false, since that is exactly the degraded
 configuration where an unattended rewrite loop is least likely to be noticed any
 other way.
 
-When the root cannot be resolved (setter never called, or the id is absent from
-the map) this logs a structured WARN carrying the agent, the count and the
-window — so the signal stays recoverable from logs — and submits nothing.
-Falling back to ``config.taskmaster.project_root`` is explicitly FORBIDDEN: it
-defaults to ``'.'``, so the fallback would file into the server's cwd, where no
-operator is watching, and report success while doing it.
+When the root cannot be resolved (the project is neither in the env registry nor
+wired at startup) this logs a structured WARN carrying the agent, the count and
+the window — so the signal stays recoverable from logs — and submits nothing.
+Falling back to ``config.taskmaster.project_root`` is explicitly FORBIDDEN, both
+here and as a source for the seed: it defaults to ``'.'``, so the fallback would
+file into the server's cwd, where no operator is watching, and report success
+while doing it.
 """
 
 from __future__ import annotations
@@ -109,9 +112,10 @@ class Mem0UpdateStormEscalator:
     """File ``mem0_in_place_update_storm`` escalations for update_memory bursts.
 
     Constructed zero-arg (``Mem0UpdateStormEscalator()``) inside
-    ``MemoryService.__init__``; the ``{project_id: project_root}`` map arrives
-    afterwards via :meth:`set_known_projects` because the map is built later in
-    server startup than the service is.
+    ``MemoryService.__init__``, which immediately hands it the service's
+    env-seeded ``{project_id: project_root}`` registry via
+    :meth:`set_known_projects`; server startup replaces that registry with the
+    full snapshot.
 
     Holds one cached :class:`escalation.queue.EscalationQueue` per
     ``project_root``. State is process-local and per-instance, so nothing bleeds
@@ -182,8 +186,9 @@ class Mem0UpdateStormEscalator:
                 'project_id=%r (%d known project(s)); NOT escalating the '
                 'update_memory content-amend storm from agent_id=%r '
                 '(count=%d, threshold=%d, window_seconds=%s). '
-                'Wire MemoryService.set_known_projects(build_known_projects_map(...)) '
-                'at server startup to restore this alarm.',
+                'Register the project in DASHBOARD_KNOWN_PROJECT_ROOTS, or wire '
+                'MemoryService.set_known_projects(build_known_projects_map(...)) '
+                'at server startup, to restore this alarm.',
                 project_id, len(self._known_projects), agent_id,
                 count, threshold, window_seconds,
             )
