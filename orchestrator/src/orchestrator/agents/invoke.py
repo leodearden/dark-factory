@@ -531,7 +531,8 @@ def _parse_codex_output(
 
     timed_out is propagated directly from result.timed_out on every return path.
     *prices*, when provided, is forwarded to _estimate_cost (see there for the
-    resolution order when None).
+    resolution order when None). codex exits 0 on ``turn.failed``, so
+    returncode alone is not a failure signal.
     """
     if not result.stdout.strip():
         return AgentResult(
@@ -566,13 +567,13 @@ def _parse_codex_output(
                 timed_out=result.timed_out,
             )
 
-    # Find completion events and collect text
-    # Codex JSONL format:
+    # Codex JSONL events handled below (others, e.g. turn.started, are ignored):
     #   {"type":"thread.started","thread_id":"..."}
-    #   {"type":"turn.started"}
     #   {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
-    #   {"type":"item.completed","item":{"type":"command_execution","command":"...","exit_code":0}}
+    #   {"type":"item.completed","item":{"type":"error","message":"..."}}  non-fatal warning
     #   {"type":"turn.completed","usage":{"input_tokens":N,"output_tokens":N}}
+    #   {"type":"error","message":"..."}                  fatal; paired with turn.failed
+    #   {"type":"turn.failed","error":{"message":"..."}}  fatal
     output_parts = []
     total_input_tokens = 0
     total_output_tokens = 0
@@ -582,6 +583,7 @@ def _parse_codex_output(
 
     for event in events:
         event_type = event.get('type', '')
+        error_text: str | None = None
 
         if event_type == 'thread.started':
             session_id = event.get('thread_id', session_id)
@@ -595,6 +597,8 @@ def _parse_codex_output(
             elif item.get('type') == 'command_execution':
                 # Track command executions for debugging
                 pass
+            elif item.get('type') == 'error':
+                error_text = item.get('message', 'Unknown error')
 
         elif event_type == 'turn.completed':
             num_turns += 1
@@ -604,7 +608,15 @@ def _parse_codex_output(
 
         elif event_type == 'error':
             is_error = True
-            output_parts.append(event.get('message', 'Unknown error'))
+            error_text = event.get('message', 'Unknown error')
+
+        elif event_type == 'turn.failed':
+            is_error = True
+            error_text = (event.get('error') or {}).get('message', 'Unknown error')
+
+        # The measured cap arrives as an `error` AND a `turn.failed` with one text.
+        if error_text is not None and error_text not in output_parts:
+            output_parts.append(error_text)
 
     output_text = '\n'.join(output_parts) if output_parts else result.stdout[:2000]
 
