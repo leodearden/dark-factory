@@ -201,6 +201,27 @@ async def test_mixed_union_key_round_trips_through_the_ledger(memory_service):
     assert await memory_service.recon_ledger.get_by_identity(RUNNING, MARKER, *sig, '') is not None
 
 
+@pytest.mark.asyncio
+async def test_acknowledging_the_foreign_subject_addresses_only_its_row(memory_service):
+    from fused_memory.reconciliation.flag_dedup import (
+        acknowledge_resolved_flags,
+        compute_marker_signature,
+    )
+
+    ledger = memory_service.recon_ledger
+    await dedup_flags(memory_service, RUNNING, 'r1', [LOCAL, FOREIGN])
+    foreign_sig = compute_marker_signature(FOREIGN, project_id=RUNNING)
+    assert foreign_sig is not None
+
+    acknowledged = await acknowledge_resolved_flags(memory_service, RUNNING, 'r2', [FOREIGN])
+
+    assert acknowledged == 1
+    foreign_row = await ledger.get_by_identity(RUNNING, MARKER, *foreign_sig, '')
+    local_row = await ledger.get_by_identity(RUNNING, MARKER, '650', FT, '')
+    assert foreign_row is not None and foreign_row.state == 'addressed'
+    assert local_row is not None and local_row.state == 'active'
+
+
 def test_anchorless_flag_falls_back_to_content_fingerprint():
     from fused_memory.reconciliation.flag_dedup import compute_marker_signature
 
