@@ -648,7 +648,7 @@ def make_plan_stamp(
             plan[PLAN_MARKUP_REJECTIONS_KEY] = merge_block(
                 plan.get(PLAN_MARKUP_REJECTIONS_KEY), block_of(event)
             )
-            artifacts.write_plan(plan)
+            artifacts.write_plan(plan, mutex_held=True)
         return str(plan_path)
 
     async def plan_stamp(record: dict[str, Any]) -> str | None:

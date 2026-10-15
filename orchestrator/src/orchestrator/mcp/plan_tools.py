@@ -1119,7 +1119,7 @@ def _create_plan(
             'markup stamp: could not carry the rejection counter into the new '
             'plan for %s; the plan itself is unaffected', task_id,
         )
-    artifacts.write_plan(plan)
+    artifacts.write_plan(plan, mutex_held=True)
     return {'status': 'ok', 'task_id': task_id}
 
 
@@ -1154,7 +1154,7 @@ def _add_plan_step(
         'status': 'pending',
         'commit': None,
     })
-    artifacts.write_plan(plan)
+    artifacts.write_plan(plan, mutex_held=True)
     return _with_markup_repairs(
         {'status': 'ok', 'step_id': step_id, 'total_steps': len(plan['steps'])},
         markup_facts,
@@ -1190,7 +1190,7 @@ def _add_prerequisite(
         'commit': None,
         'tests': [],
     })
-    artifacts.write_plan(plan)
+    artifacts.write_plan(plan, mutex_held=True)
     return _with_markup_repairs({'status': 'ok', 'prereq_id': prereq_id}, markup_facts)
 
 
@@ -1208,7 +1208,7 @@ def _add_design_decision(
         'decision': decision,
         'rationale': rationale,
     })
-    artifacts.write_plan(plan)
+    artifacts.write_plan(plan, mutex_held=True)
     return _with_markup_repairs(
         {'status': 'ok', 'total_decisions': len(plan['design_decisions'])},
         markup_facts,
@@ -1231,7 +1231,7 @@ def _add_reuse_item(
         'where': where,
         'how': how,
     })
-    artifacts.write_plan(plan)
+    artifacts.write_plan(plan, mutex_held=True)
     return _with_markup_repairs(
         {'status': 'ok', 'total_reuse': len(plan['reuse'])}, markup_facts
     )
@@ -1324,7 +1324,7 @@ def _drop_plan_file(
         'path': path,
         'reason': reason,
     })
-    artifacts.write_plan(plan)
+    artifacts.write_plan(plan, mutex_held=True)
     return _with_markup_repairs(
         {
             'status': 'ok',
@@ -1431,7 +1431,7 @@ def _update_plan_metadata(
         _forget_redeclared_drops(plan)
     if analysis is not None:
         plan['analysis'] = analysis
-    artifacts.write_plan(plan)
+    artifacts.write_plan(plan, mutex_held=True)
     return _with_markup_repairs(
         {
             'status': 'ok',
@@ -1478,7 +1478,7 @@ def _remove_plan_step(
                         markup_facts,
                     )
                 items.pop(i)
-                artifacts.write_plan(plan)
+                artifacts.write_plan(plan, mutex_held=True)
                 return _with_markup_repairs(
                     {'status': 'ok', 'removed': step_id, 'collection': collection},
                     markup_facts,
@@ -1516,7 +1516,7 @@ def _replace_plan_step(
                     )
                 item['type'] = step_type
                 item['description'] = description
-                artifacts.write_plan(plan)
+                artifacts.write_plan(plan, mutex_held=True)
                 return _with_markup_repairs(
                     {'status': 'ok', 'replaced': step_id}, markup_facts
                 )
@@ -1603,7 +1603,7 @@ def _confirm_plan(
     # checks (see workflow._can_skip_revalidation).
     plan['_finalized_at'] = now
     plan['_revalidated_at'] = now
-    artifacts.write_plan(plan)
+    artifacts.write_plan(plan, mutex_held=True)
     return _respond({
         'status': 'ok',
         'finalized': True,

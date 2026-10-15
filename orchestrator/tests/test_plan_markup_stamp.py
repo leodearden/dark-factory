@@ -1027,7 +1027,7 @@ class TestThePlanStampNeverRaises:
         seed_plan(artifacts)
         before = (artifacts.root / 'plan.json').read_bytes()
 
-        def boom(plan):
+        def boom(plan, **_kwargs):
             raise OSError('the plan is unwritable')
 
         monkeypatch.setattr(artifacts, 'write_plan', boom)

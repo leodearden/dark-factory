@@ -7,6 +7,7 @@ the mutex (``_plan_mutex_race``); both writes surviving is the property.
 """
 from __future__ import annotations
 
+import inspect
 import subprocess
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -17,7 +18,7 @@ import pytest
 from _git_fixtures import RepoSeed, seed_repo
 from _plan_mutex_race import HOLDER_MARKER_KEY, mark_holder, race_writer_against_held_mutex
 
-from orchestrator.artifacts import TaskArtifacts
+from orchestrator.artifacts import PlanMutexNotHeld, TaskArtifacts
 from orchestrator.mcp import plan_markup_stamp
 from orchestrator.mcp.plan_tools import (
     _add_design_decision,
@@ -192,3 +193,15 @@ def test_mark_step_done_validates_against_the_plan_it_writes(lane: _Lane) -> Non
     assert outcome.writer_error is None
     assert envelopes[0]['status'] == 'error', envelopes[0]
     assert _ids(outcome.plan) == ['step-2']
+
+
+def test_a_mutator_without_its_mutex_refuses_to_write(lane: _Lane) -> None:
+    """A forgotten ``_plan_mutation`` fails loudly at the write, not as a lost update."""
+    plan_path = lane.artifacts.root / 'plan.json'
+    before = plan_path.read_bytes()
+    undecorated = inspect.unwrap(_add_plan_step)
+
+    with pytest.raises(PlanMutexNotHeld):
+        undecorated(lane.artifacts, 'step-3', 'impl', 'third')
+
+    assert plan_path.read_bytes() == before

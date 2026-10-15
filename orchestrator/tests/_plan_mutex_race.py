@@ -63,7 +63,7 @@ def race_writer_against_held_mutex(
         thread.join(probe_secs)
         blocked = thread.is_alive()
         holder_edit(plan)
-        artifacts.write_plan(plan)
+        artifacts.write_plan(plan, mutex_held=True)
     thread.join(_WRITER_FINISH_SECS)
     assert not thread.is_alive(), (
         f'writer still running {_WRITER_FINISH_SECS}s after the holder released'

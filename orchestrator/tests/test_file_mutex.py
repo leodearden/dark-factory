@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from orchestrator.file_mutex import FileMutexTimeout, exclusive
+from orchestrator.file_mutex import FileMutexTimeout, exclusive, held
 
 _SRC = Path(__file__).resolve().parents[1] / 'src'
 _BOUND_SECS = 10.0
@@ -78,6 +78,15 @@ def _attempt_on_another_thread(lock_path: Path) -> BaseException | None:
 
 def _is_excluded_elsewhere(lock_path: Path) -> bool:
     return isinstance(_attempt_on_another_thread(lock_path), FileMutexTimeout)
+
+
+def _held_on_a_fresh_thread(lock_path: Path) -> bool:
+    answers: list[bool] = []
+    thread = threading.Thread(target=lambda: answers.append(held(lock_path)), daemon=True)
+    thread.start()
+    thread.join(_BOUND_SECS)
+    assert answers, 'the fresh thread never answered'
+    return answers[0]
 
 
 def _child_attempt(lock_path: Path) -> subprocess.CompletedProcess[str]:
@@ -152,3 +161,20 @@ def test_a_missing_directory_is_not_created(tmp_path: Path) -> None:
         pass
 
     assert not absent.exists()
+
+
+def test_held_answers_for_the_calling_thread_at_every_depth(lock_path: Path) -> None:
+    assert not held(lock_path)
+    with exclusive(lock_path, timeout=5):
+        assert held(lock_path)
+        with exclusive(lock_path, timeout=5):
+            assert held(lock_path)
+        assert held(lock_path), 'the inner exit cleared the outer hold'
+        assert not _held_on_a_fresh_thread(lock_path), 'another thread inherited this hold'
+
+    assert not held(lock_path)
+
+
+def test_a_lock_held_by_another_thread_is_not_held_by_this_one(lock_path: Path) -> None:
+    with _held_on_another_thread(lock_path):
+        assert not held(lock_path)

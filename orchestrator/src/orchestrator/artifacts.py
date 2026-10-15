@@ -47,6 +47,13 @@ class ArtifactWriteError(OSError):
     """
 
 
+class PlanMutexNotHeld(RuntimeError):
+    """A plan.json read-modify-write reached its write without holding ``plan_mutex()``.
+
+    Raised before anything is written: the alternative is a silently lost update.
+    """
+
+
 # Matches one-or-more leading ``[COMMITTED <hex>]`` provenance tags (with any
 # trailing whitespace) at the START of a step description.  Used by
 # :meth:`TaskArtifacts.mark_step_committed` to strip a stale tag before
@@ -417,18 +424,40 @@ class TaskArtifacts:
         lock: it holds no plan to lose an update of, and must not be
         re-materialized by locking.
         """
-        lock_path = Path(os.path.realpath(self.root / 'plan.json')).with_name('plan.json.mutex')
-        if not lock_path.parent.is_dir():
+        lock_path = self._plan_mutex_path()
+        if lock_path is None:
             yield
             return
         with file_mutex.exclusive(lock_path, timeout=PLAN_MUTEX_TIMEOUT_SECS):
             yield
 
-    def write_plan(self, plan: dict) -> None:
-        """Write .task/plan.json — the structured plan."""
+    def _plan_mutex_path(self) -> Path | None:
+        lock_path = Path(os.path.realpath(self.root / 'plan.json')).with_name('plan.json.mutex')
+        return lock_path if lock_path.parent.is_dir() else None
+
+    def write_plan(self, plan: dict, *, mutex_held: bool = False) -> None:
+        """Write .task/plan.json — the structured plan.
+
+        A bare overwrite holds ``plan_mutex()`` for the write alone. The write
+        that ends a read-modify-write passes ``mutex_held=True``, a claim that
+        is VERIFIED: if the calling thread does not hold the mutex it raises
+        :class:`PlanMutexNotHeld` and writes nothing.
+        """
+        plan['_schema_version'] = PLAN_SCHEMA_VERSION
+        if mutex_held:
+            self._write_held_plan(plan)
+            return
         with self.plan_mutex():
-            plan['_schema_version'] = PLAN_SCHEMA_VERSION
-            self._write_json(self.root / 'plan.json', plan)
+            self._write_held_plan(plan)
+
+    def _write_held_plan(self, plan: dict) -> None:
+        lock_path = self._plan_mutex_path()
+        if lock_path is not None and not file_mutex.held(lock_path):
+            raise PlanMutexNotHeld(
+                f'{self.root / "plan.json"} reached its write without {lock_path} held: '
+                'run the whole read-modify-write inside plan_mutex()'
+            )
+        self._write_json(self.root / 'plan.json', plan)
 
     def ensure_lane_plan_symlink(self) -> None:
         """Single-source plan.json onto the durable meta-root copy.
@@ -812,7 +841,7 @@ class TaskArtifacts:
                     'Plan normalization applied — writing corrected plan to %s',
                     self.root / 'plan.json',
                 )
-                self._write_json(self.root / 'plan.json', plan)
+                self._write_held_plan(plan)
         return plan
 
     def _read_normalized_plan(self) -> tuple[dict, bool]:
@@ -836,7 +865,7 @@ class TaskArtifacts:
                         item['status'] = status
                         if commit is not None:
                             item['commit'] = commit
-                        self._write_json(self.root / 'plan.json', plan)
+                        self._write_held_plan(plan)
                         return
 
         logger.warning(f'Step {step_id} not found in plan')
@@ -879,7 +908,7 @@ class TaskArtifacts:
                         # with a different sha.
                         description = _COMMITTED_TAG_RE.sub('', item.get('description') or '')
                         item['description'] = f'{tag} {description}'
-                        self.write_plan(plan)
+                        self.write_plan(plan, mutex_held=True)
                         return True
 
         logger.warning(f'Step {step_id} not found in plan')
@@ -1071,7 +1100,7 @@ class TaskArtifacts:
                 )
             plan['_revalidated_at'] = datetime.now(UTC).isoformat()
             plan['_revalidated_by_session'] = session_id
-            self._write_json(self.root / 'plan.json', plan)
+            self._write_held_plan(plan)
         if base_commit is not None:
             self.update_base_commit(base_commit)
 
@@ -1101,7 +1130,7 @@ class TaskArtifacts:
             # ready-made plan (eval initial_plan, SIMPLE_TASK) rely on this so the
             # plan is not mistaken for an interrupted partial on a later requeue.
             plan.setdefault('_finalized_at', plan['_created_at'])
-            self._write_json(self.root / 'plan.json', plan)
+            self._write_held_plan(plan)
 
     def validate_plan_owner(self, session_id: str) -> bool:
         """Return True if *session_id* owns plan.json.
@@ -1158,7 +1187,7 @@ class TaskArtifacts:
             if not already_owner:
                 plan['_session_id'] = session_id
                 plan.setdefault('_created_at', datetime.now(UTC).isoformat())
-            self._write_json(self.root / 'plan.json', plan)
+            self._write_held_plan(plan)
 
     # ──────────────────────────────────────────────────────────────────
     # Agent-session sidecar — marker for "an agent subprocess is in flight".

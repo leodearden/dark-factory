@@ -21,7 +21,7 @@ from _plan_mutex_race import (
     race_writer_against_held_mutex,
 )
 
-from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
+from orchestrator.artifacts import PLAN_SCHEMA_VERSION, PlanMutexNotHeld, TaskArtifacts
 
 _JOIN_SECS = 10.0
 
@@ -112,6 +112,47 @@ def test_a_bare_overwrite_is_ordered_after_an_in_flight_rmw(artifacts: TaskArtif
     assert outcome.blocked
     assert outcome.writer_error is None
     assert outcome.plan == {**replacement, '_schema_version': PLAN_SCHEMA_VERSION}
+
+
+def test_an_rmw_write_without_the_mutex_is_refused_and_lands_nothing(
+    artifacts: TaskArtifacts,
+) -> None:
+    plan_path = artifacts.root / 'plan.json'
+    before = plan_path.read_bytes()
+    plan = artifacts.read_plan()
+    plan['title'] = 'written outside the mutex'
+
+    with pytest.raises(PlanMutexNotHeld, match='plan_mutex'):
+        artifacts.write_plan(plan, mutex_held=True)
+
+    assert plan_path.read_bytes() == before
+
+
+def test_an_rmw_write_inside_the_mutex_lands(artifacts: TaskArtifacts) -> None:
+    with artifacts.plan_mutex():
+        plan = artifacts.read_plan()
+        plan['title'] = 'written inside the mutex'
+        artifacts.write_plan(plan, mutex_held=True)
+
+    assert artifacts.read_plan()['title'] == 'written inside the mutex'
+
+
+def test_another_threads_hold_does_not_license_an_rmw_write(artifacts: TaskArtifacts) -> None:
+    errors: list[BaseException] = []
+
+    def write_while_the_holder_holds() -> None:
+        try:
+            artifacts.write_plan(artifacts.read_plan(), mutex_held=True)
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=write_while_the_holder_holds, daemon=True)
+    with artifacts.plan_mutex():
+        thread.start()
+        thread.join(_JOIN_SECS)
+
+    assert not thread.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], PlanMutexNotHeld), errors
 
 
 def test_a_normalizing_read_rereads_under_the_mutex(artifacts: TaskArtifacts) -> None:

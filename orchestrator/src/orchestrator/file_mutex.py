@@ -67,6 +67,11 @@ def exclusive(lock_path: Path, *, timeout: float) -> Iterator[None]:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def held(lock_path: Path) -> bool:
+    """Whether the CALLING THREAD holds *lock_path* through :func:`exclusive`."""
+    return os.fspath(lock_path) in _depths.by_path
+
+
 def _acquire(fd: int, lock_path: Path, timeout: float) -> None:
     deadline = time.monotonic() + timeout
     while True:
