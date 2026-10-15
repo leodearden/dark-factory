@@ -217,7 +217,7 @@ from orchestrator.workflow import _select_train_members
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
 
-logger = logging.getLogger('orchestrator.merge_queue')
+logger = logging.getLogger('orchestrator.merge_lane')
 
 
 NEEDS_REBASE_REASON_PREFIX = 'Suffix item needs rebase onto frozen-prefix tip'

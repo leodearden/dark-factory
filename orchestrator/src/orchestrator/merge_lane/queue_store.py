@@ -65,7 +65,7 @@ if TYPE_CHECKING:
 
     from orchestrator.config import ModuleConfig, OrchestratorConfig
 
-logger = logging.getLogger('orchestrator.merge_queue_store')
+logger = logging.getLogger('orchestrator.merge_lane')
 
 
 # ---------------------------------------------------------------------------

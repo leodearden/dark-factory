@@ -56,7 +56,7 @@ from orchestrator.merge_types import (
 )
 from orchestrator.overlap_footprint import Footprint, get_overlap_detector
 
-logger = logging.getLogger('orchestrator.merge_queue')
+logger = logging.getLogger('orchestrator.merge_lane')
 
 
 @dataclasses.dataclass(frozen=True)

@@ -31,7 +31,7 @@ from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('orchestrator.merge_lane')
 
 
 class MainHealthAutoHealRegistry:

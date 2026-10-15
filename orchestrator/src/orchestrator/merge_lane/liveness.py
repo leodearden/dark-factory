@@ -39,7 +39,7 @@ from orchestrator.merge_lane.types import MergeRequest
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
 
-logger = logging.getLogger('orchestrator.merge_queue')
+logger = logging.getLogger('orchestrator.merge_lane')
 
 
 _MERGE_AHEAD_BOUND = 1
@@ -308,7 +308,7 @@ def check_merge_liveness_margin(
         safety_factor: Fraction of *liveness_secs* that constitutes the
             "comfortably below" threshold.  Default 0.75.
         logger: Logger to use for the WARNING (default: module logger, captured
-            by ``pytest caplog`` as ``orchestrator.merge_queue``).
+            by ``pytest caplog`` as ``orchestrator.merge_lane``).
 
     Returns:
         :class:`MergeLivenessAssessment` with all computed values and the

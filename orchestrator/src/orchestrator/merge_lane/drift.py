@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from orchestrator.merge_lane.ports import VerifyPort
     from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
-logger = logging.getLogger('orchestrator.merge_queue')
+logger = logging.getLogger('orchestrator.merge_lane')
 
 
 def _build_remote_runners(

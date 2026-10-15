@@ -216,7 +216,7 @@ if TYPE_CHECKING:
 
     from orchestrator.git_ops import GitOps
 
-logger = logging.getLogger('orchestrator.landing_evidence')
+logger = logging.getLogger('orchestrator.merge_lane')
 
 
 async def patch_content_contained(

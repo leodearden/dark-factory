@@ -61,7 +61,7 @@ if TYPE_CHECKING:
 # merge_gates, merge_shadow, merge_drift, suffix_graph) so every merge-queue
 # log line — regardless of which physical module emits it — appears under
 # one logger namespace for caplog / journalctl filtering.
-logger = logging.getLogger('orchestrator.merge_queue')
+logger = logging.getLogger('orchestrator.merge_lane')
 
 
 @dataclass(frozen=True)
