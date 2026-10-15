@@ -410,8 +410,13 @@ async def _invoke_codex(
     timeout_seconds: float | None = None,
     prices: dict[str, Any] | None = None,
     max_turns: int | None = None,
+    allowed_tools: list[str] | None = None,
+    disallowed_tools: list[str] | None = None,
 ) -> AgentResult:
     """Invoke OpenAI Codex CLI.
+
+    The sandbox-bypass flag survives only for roles that legitimately write;
+    a role that cannot runs ``-s read-only`` (see ``_codex_sandbox_mode``).
 
     No instruction file (AGENTS.md) is ever written into the worktree —
     system_prompt and prompt are folded together and delivered entirely via
@@ -452,8 +457,12 @@ async def _invoke_codex(
             _write_codex_mcp_config(config_toml, mcp_config)
             temp_files.append(config_toml)
 
-        cmd = ['codex', 'exec', '-m', model, '--json',
-               '--dangerously-bypass-approvals-and-sandbox']
+        sandbox_mode = _codex_sandbox_mode(allowed_tools, disallowed_tools)
+        confinement = (
+            ['-s', sandbox_mode] if sandbox_mode
+            else ['--dangerously-bypass-approvals-and-sandbox']
+        )
+        cmd = ['codex', 'exec', '-m', model, '--json', *confinement]
 
         if effort:
             cmd.extend(['-c', f'model_reasoning_effort={effort}'])
