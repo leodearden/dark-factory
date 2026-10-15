@@ -85,11 +85,11 @@ from orchestrator.sentinel_l1 import file_sentinel_l1
 from orchestrator.streaks import StreakCounter, StreakRegistry
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
 
-# How long a task's age anchor is remembered after it was recorded (task
-# 5352).  An upper bound on the subject, not a tuning dial: thirty days is the
-# horizon over which a resurrected task could still be pending and still be
-# claiming an age bonus it did not earn.  The longest of the four guard TTLs
-# because its subject is the longest-lived.
+# How long a task's age-anchor record outlives the last write that recorded
+# it (task 5352).  Every age-guard write re-records every anchor in the active
+# fetch, so only a departed task's record expires, or a live one through a
+# whole TTL with no write; a restart then re-anchors that task to its own id.
+# The longest of the four guard TTLs because its subject is the longest-lived.
 _RESURRECTION_GUARD_TTL = timedelta(days=30)
 
 if TYPE_CHECKING:
@@ -1104,6 +1104,11 @@ class _AgeAnchor:
 
     anchor: int
     pending_since: str | None
+
+    def is_reset_by(self, stamp: str | None) -> bool:
+        """Whether *stamp* differs from a known stamp.  A first stamp, where
+        none was known, is not a reset, and neither is a missing one."""
+        return bool(self.pending_since and stamp and stamp != self.pending_since)
 
     def to_record(self) -> dict:
         return {'anchor': self.anchor, 'pending_since': self.pending_since}
@@ -2433,9 +2438,10 @@ class Scheduler:
         # a candidate's tier without re-walking the full task graph.
         self._dispatched_priority: dict[str, str] = {}
         # Age-anchor bookkeeping for score(): one anchor per task in the
-        # active fetch, taken with its pending_since stamp.  It is recorded
-        # durably (task 5352) when the task leaves the fetch or is reset, and
-        # only a changed pending_since resets it: D3 in
+        # active fetch, taken with its pending_since stamp and read and
+        # written through _held_age_anchor / _hold_age_anchor /
+        # _release_age_anchor.  Each is recorded durably (task 5352) whenever
+        # it changes, and only a changed pending_since resets it: D3 in
         # plans/scheduler-dispatch-scoring-and-lock-layer-prd.md is the rule.
         self._pending_anchor: dict[str, int] = {}
         self._anchor_pending_since: dict[str, str | None] = {}
@@ -5874,20 +5880,21 @@ class Scheduler:
         - A task with an empty or terminal status is skipped: it is not an
           observation of the active population, and recording its departure
           is :meth:`_phase_stale_sweep`'s job alone.
-        - Any other task keeps its known anchor: the in-memory one, else the
-          one recorded when it left the fetch or was last reset, else its own
-          numeric id (so a genuinely-old task carries its accumulated age),
-          else *max_id*.  So a requeue, an unblock, an undefer, an infra-hold
-          resume, a done reopen and a restart all keep the wait.
-        - If the known anchor was taken at a stamp and the task now carries a
-          different one, the anchor is reset to *max_id*.  A first stamp,
-          where none was known, is not a reset.
+        - Any other task keeps its known anchor: the held one, else the
+          recorded one, else its own numeric id (so a genuinely-old task
+          carries its accumulated age), else *max_id*.  So a requeue, an
+          unblock, an undefer, an infra-hold resume, a done reopen and a
+          restart all keep the wait.
+        - If the task's stamp resets the known anchor
+          (:meth:`_AgeAnchor.is_reset_by`), the anchor moves to *max_id*.
 
-        A reset is applied ONCE: its record carries the new stamp, so every
-        later start restores it.  Resets are written in one batch after the
-        loop, because a cold start that finds N stamps changed would
-        otherwise perform N writes of an N-entry file.
+        An anchor is recorded as soon as it differs from its record, so the
+        stamp it was taken at survives a restart.  A cancel and reopen while
+        no process runs is therefore still reset at the next start, and a
+        reset is applied ONCE, because its record carries the new stamp.  A
+        tick that changes no anchor writes nothing.
         """
+        changed: dict[str, _AgeAnchor] = {}
         resets: dict[str, _AgeAnchor] = {}
         for t in tasks:
             tid = str(t.get('id', ''))
@@ -5895,27 +5902,54 @@ class Scheduler:
             if not tid or not status or status in TERMINAL_STATUSES:
                 continue
             stamp = _pending_since(t)
-            known = self._known_age_anchor(tid, stamp, max_id)
-            if known.pending_since and stamp and stamp != known.pending_since:
-                known = _AgeAnchor(max_id, stamp)
-                resets[tid] = known
-            self._pending_anchor[tid] = known.anchor
-            self._anchor_pending_since[tid] = stamp or known.pending_since
-        self._apply_age_resets(resets)
+            stored = self._held_age_anchor(tid) or _AgeAnchor.from_record(self._age_anchors.get(tid))
+            known = stored or _AgeAnchor(int(tid) if tid.isdecimal() else max_id, stamp)
+            if known.is_reset_by(stamp):
+                current = _AgeAnchor(max_id, stamp)
+                resets[tid] = current
+            else:
+                current = _AgeAnchor(known.anchor, stamp or known.pending_since)
+            if current != stored:
+                changed[tid] = current
+            self._hold_age_anchor(tid, current)
+        self._record_age_anchors(changed)
+        self._journal_age_resets(resets)
 
-    def _known_age_anchor(self, tid: str, stamp: str | None, max_id: int) -> _AgeAnchor:
-        """The anchor *tid* had before this observation: in memory, else
-        recorded, else its own numeric id, else *max_id*, at *stamp*."""
-        if tid in self._pending_anchor:
-            return _AgeAnchor(self._pending_anchor[tid], self._anchor_pending_since.get(tid))
-        recorded = _AgeAnchor.from_record(self._age_anchors.get(tid))
-        if recorded is not None:
-            return recorded
-        return _AgeAnchor(int(tid) if tid.isdecimal() else max_id, stamp)
+    def _held_age_anchor(self, tid: str) -> _AgeAnchor | None:
+        if tid not in self._pending_anchor:
+            return None
+        return _AgeAnchor(self._pending_anchor[tid], self._anchor_pending_since.get(tid))
 
-    def _apply_age_resets(self, resets: dict[str, _AgeAnchor]) -> None:
-        """Record every reset in one write, then journal each (INV-11)."""
-        self._age_anchors.put_many({tid: a.to_record() for tid, a in resets.items()})
+    def _hold_age_anchor(self, tid: str, anchor: _AgeAnchor) -> None:
+        self._pending_anchor[tid] = anchor.anchor
+        self._anchor_pending_since[tid] = anchor.pending_since
+
+    def _release_age_anchor(self, tid: str) -> _AgeAnchor | None:
+        held = self._held_age_anchor(tid)
+        self._pending_anchor.pop(tid, None)
+        self._anchor_pending_since.pop(tid, None)
+        return held
+
+    def _record_age_anchors(self, records: dict[str, _AgeAnchor]) -> None:
+        """Write *records*, and every held anchor with them, in ONE write.
+
+        One write, because each write rewrites the whole file: a cold start
+        or a mass departure of N tasks would otherwise perform N writes of an
+        N-entry file.  Re-recording the held anchors adds no write and
+        refreshes their TTL, so a task that stays in the fetch keeps its
+        record while any write lands within ``_RESURRECTION_GUARD_TTL``.  No
+        records, no write.
+        """
+        if not records:
+            return
+        held = {
+            tid: _AgeAnchor(anchor, self._anchor_pending_since.get(tid))
+            for tid, anchor in self._pending_anchor.items()
+        }
+        self._age_anchors.put_many({tid: a.to_record() for tid, a in {**held, **records}.items()})
+
+    def _journal_age_resets(self, resets: dict[str, _AgeAnchor]) -> None:
+        """Journal each applied reset (INV-11)."""
         if not self.event_store:
             return
         for tid, a in resets.items():
@@ -6777,7 +6811,7 @@ class Scheduler:
         """
         stale_ids: set[str] = set()
         terminal_ids: set[str] = set()
-        departed_anchors: dict[str, dict] = {}
+        departed_anchors: dict[str, _AgeAnchor] = {}
         all_tracked: set[str] = (
             set(self._last_dispatch_at)
             | set(self._skip_count)
@@ -6792,15 +6826,11 @@ class Scheduler:
                 self._last_dispatch_at.pop(tid_str, None)
                 self._skip_count.pop(tid_str, None)
                 self._module_cache.pop(tid_str, None)
-                if tid_str in self._pending_anchor:
-                    departed_anchors[tid_str] = _AgeAnchor(
-                        self._pending_anchor.pop(tid_str),
-                        self._anchor_pending_since.pop(tid_str, None),
-                    ).to_record()
+                departed = self._release_age_anchor(tid_str)
+                if departed is not None:
+                    departed_anchors[tid_str] = departed
                 stale_ids.add(tid_str)
-        # Recorded in one batch, for the same reason as _update_age_anchors:
-        # a mass departure would otherwise rewrite the file once per task.
-        self._age_anchors.put_many(departed_anchors)
+        self._record_age_anchors(departed_anchors)
         starvation_non_eligible = {
             tid for tid in self._starvation_escalated
             if ctx.status_map.get(tid) in _STARVATION_NON_ELIGIBLE

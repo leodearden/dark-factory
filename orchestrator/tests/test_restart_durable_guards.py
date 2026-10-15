@@ -806,10 +806,11 @@ def _task(task_id: str, status: str = 'pending', pending_since: str | None = Non
     }
 
 
-async def _tick(scheduler, tasks: list[dict]) -> None:
+async def _tick(scheduler, tasks: list[dict]) -> str | None:
     scheduler.get_tasks = AsyncMock(return_value=tasks)
     scheduler.get_statuses = AsyncMock(return_value=({}, None))
-    await scheduler.acquire_next()
+    assignment = await scheduler.acquire_next()
+    return assignment.task_id if assignment is not None else None
 
 
 def _spy_on_guard_writes(monkeypatch) -> list:
@@ -898,7 +899,9 @@ class TestResurrectionAnchorSurvivesRedeploy:
 
     @pytest.mark.asyncio
     async def test_the_guard_expires(self, guard_clock):
-        """The recorded reset cannot outlive the task it was recorded for."""
+        """A record that no write refreshed within the TTL expires, and the
+        restart re-anchors the task to its own id.  That is the trade-off
+        which bounds the file, and it takes a TTL with no age-guard write."""
         first = _scheduler()
         await _tick(first, [
             _task('100', 'in-progress', _FILED), _task('4000', 'in-progress'),
@@ -910,6 +913,21 @@ class TestResurrectionAnchorSurvivesRedeploy:
         redeployed = _scheduler()
         redeployed._update_age_anchors([_task('100', pending_since=_REOPENED)], _MAX_ID)
         assert redeployed._compute_age('100', _MAX_ID) == _MAX_ID - 100
+
+    @pytest.mark.asyncio
+    async def test_any_write_within_the_ttl_keeps_an_in_fetch_record_alive(self, guard_clock):
+        """'1000''s departure on day 20 re-records '100''s reset, so on day 40
+        the restart restores it: '900''s 150 beats the 50 accrued since."""
+        first = _scheduler()
+        await _tick(first, [_task('100', 'in-progress', _FILED), _task('1000', 'in-progress')])
+        await _tick(first, [_task('100', 'in-progress', _REOPENED), _task('1000', 'in-progress')])
+        guard_clock[0] = _T0 + timedelta(days=20)
+        await _tick(first, [_task('100', 'in-progress', _REOPENED)])
+        guard_clock[0] = _T0 + timedelta(days=40)
+
+        tasks = [_task('100', pending_since=_REOPENED), _task('900'), _task('1050', 'in-progress')]
+
+        assert await _tick(_scheduler(), tasks) == '900'
 
 
 @pytest.mark.asyncio
