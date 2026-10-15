@@ -58,7 +58,6 @@ from collections.abc import (
     MutableMapping,
     MutableSet,
 )
-from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -232,17 +231,12 @@ class _GuardStore:
             self.flush()
         return True
 
-    def remove(self, key: str, *, flush: bool = True) -> bool:
-        """Drop *key*.  Returns whether it was there to drop.
-
-        ``flush=False`` defers the write as :meth:`insert_if_absent`'s does;
-        the key is still recorded as removed, so ANY later flush applies it.
-        """
+    def remove(self, key: str) -> bool:
+        """Drop *key*.  Returns whether it was there to drop."""
         if self._entries.pop(key, None) is None:
             return False
         self._removed.add(key)
-        if flush:
-            self.flush()
+        self.flush()
         return True
 
     # --- disk ---
@@ -364,7 +358,7 @@ class PersistentSet(MutableSet[str]):
 
     Backs the guards whose whole state is "this key happened": a capped
     escalation id, a derailed task id, a fingerprint whose blocker was already
-    promoted, a task id owed an age reset.
+    promoted.
 
     ``add`` is idempotent in the strong sense — re-adding a key that is
     already present neither refreshes its TTL nor writes to disk — so a caller
@@ -398,13 +392,7 @@ class PersistentSet(MutableSet[str]):
         the whole map, so a per-element flush costs a batch of N some N+1
         writes and O(N^2) parse/serialise work.  Measured at the per-element
         shape this replaced: N=373 -> 374 writes in 3.17s, N=1500 -> 1501 in
-        19.22s.  The batches that pay it run inline on the scheduler's event
-        loop: the departures
-        ``orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_stale_sweep``
-        records when many tasks leave the active fetch in one tick, and the
-        age resets
-        ``orchestrator/src/orchestrator/scheduler.py::Scheduler._update_age_anchors``
-        consumes when they come back together.
+        19.22s.
         """
         changed = False
         for value in values:
@@ -416,34 +404,15 @@ class PersistentSet(MutableSet[str]):
         """Batch-insert via :meth:`update`, so this too is one write.
 
         ``MutableSet`` supplies a ``__ior__`` that loops calling ``add``,
-        which would write per element.  Overriding it is what the three
-        production batch call sites actually depend on, since all three use
-        ``|=`` rather than ``update``:
-        ``orchestrator/src/orchestrator/scheduler.py::Scheduler._update_age_anchors``,
-        ``orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_stale_sweep``
-        and
-        ``orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker._mark_coalesce_derailed``.
+        which would write per element.  Overriding it is what the production
+        batch call site actually depends on, since it uses ``|=`` rather than
+        ``update``:
+        ``orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._mark_coalesce_derailed``.
         It also keeps the batched write for a caller whose attribute is
         declared as the ABC — the narrow type that lets a test substitute a
         plain ``set``.
         """
         self.update(value)
-        return self
-
-    def difference_update(self, values: Iterable[str]) -> None:
-        """Remove every element of *values*, then write ONCE — the removal
-        twin of :meth:`update`, whose docstring carries the O(N^2) rationale.
-        A batch that removed nothing writes nothing."""
-        changed = False
-        for value in values:
-            changed |= self._store.remove(value, flush=False)
-        if changed:
-            self._store.flush()
-
-    def __isub__(self, it: AbstractSet[Any]) -> Self:
-        """Batch-remove via :meth:`difference_update`; ``MutableSet``'s own
-        ``__isub__`` loops calling ``discard``, which writes per element."""
-        self.difference_update(it)
         return self
 
     def __contains__(self, value: object) -> bool:

@@ -472,20 +472,17 @@ class TestGuardStateTtl:
 # ---------------------------------------------------------------------------
 
 class TestGuardStateBatchedWrites:
-    """Both batch entry points coalesce their writes into one.
+    """Every batch entry point, ``update``/``|=`` and ``put_many``, coalesces
+    its writes into one.
 
     ``_GuardStore.flush`` re-reads, re-merges and re-serialises the WHOLE map,
     so a per-element flush costs a batch of N some N+1 writes and O(N^2)
     parse/serialise work.  Measured in this worktree before the fix: N=373
     performed 374 writes in 3.17s and N=1500 performed 1501 in 19.22s.
-    Removals and map puts batch the same way (task 6659).
 
-    ``|=`` is the form that matters: all three production batch call sites use
-    it, not ``update`` —
-    ``orchestrator/src/orchestrator/scheduler.py::Scheduler._update_age_anchors``,
-    ``orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_stale_sweep``
-    and
-    ``orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker._mark_coalesce_derailed``.
+    ``|=`` is the set form that matters, not ``update``: the production set
+    batch call site uses it,
+    ``orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._mark_coalesce_derailed``.
     """
 
     _N = 50
@@ -577,37 +574,10 @@ class TestGuardStateBatchedWrites:
 
         assert sorted(PersistentSet(path, ttl=_TTL)) == ['task-a', 'task-b', 'task-c']
 
-    def test_isub_performs_exactly_one_write_and_is_durable(
-        self, tmp_path: Path, monkeypatch,
-    ):
-        """``MutableSet.__isub__`` loops calling ``discard``, which writes per
-        element; the override has to keep removal batched too."""
-        path = tmp_path / 'age_reset_owed.json'
-        guard = PersistentSet(path, ttl=_TTL)
-        guard.update(self._keys(0, self._N + 5))
-
-        calls = _spy_on_writes(monkeypatch)
-        guard -= set(self._keys(0, self._N))
-
-        assert len(calls) == 1, f'expected one write for {self._N} removals, got {len(calls)}'
-        assert sorted(PersistentSet(path, ttl=_TTL)) == sorted(self._keys(self._N, self._N + 5))
-
-    def test_a_removal_of_only_absent_keys_performs_no_write(
-        self, tmp_path: Path, monkeypatch,
-    ):
-        guard = PersistentSet(tmp_path / 'age_reset_owed.json', ttl=_TTL)
-        guard.update(self._keys(0, 5))
-
-        calls = _spy_on_writes(monkeypatch)
-        guard.difference_update(self._keys(100, 100 + self._N))
-
-        assert calls == [], 'removing nothing must be silent'
-        assert sorted(guard) == sorted(self._keys(0, 5))
-
     def test_put_many_performs_exactly_one_write_and_overwrites(
         self, tmp_path: Path, monkeypatch,
     ):
-        path = tmp_path / 'age_reset_anchors.json'
+        path = tmp_path / 'age_anchors.json'
         guard = PersistentMap(path, ttl=_TTL)
         guard['task-0'] = 'stale'
 
@@ -618,7 +588,7 @@ class TestGuardStateBatchedWrites:
         assert dict(PersistentMap(path, ttl=_TTL)) == {f'task-{i}': i for i in range(self._N)}
 
     def test_put_many_of_nothing_performs_no_write(self, tmp_path: Path, monkeypatch):
-        guard = PersistentMap(tmp_path / 'age_reset_anchors.json', ttl=_TTL)
+        guard = PersistentMap(tmp_path / 'age_anchors.json', ttl=_TTL)
 
         calls = _spy_on_writes(monkeypatch)
         guard.put_many({})
