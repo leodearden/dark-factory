@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.scheduler import Scheduler, transient_requeue_cooldown
@@ -470,7 +471,7 @@ class TestReleaseArmsJitteredBackoff:
 
 
 class TestSnapshotExposesRequeueCooldowns:
-    """``get_state_snapshot()['requeue_cooldowns']`` — the operator-visible read.
+    """``get_state_snapshot().requeue_cooldowns`` — the operator-visible read.
 
     Sourced from a meta dict stamped ONCE AT ARMING, never recomputed from
     "now": ``_build_snapshot_payload`` content-dedups the snapshot, so a
@@ -482,37 +483,37 @@ class TestSnapshotExposesRequeueCooldowns:
         clock = [1000.0]
         scheduler = _clocked_scheduler(clock, jitter_source=lambda lo, hi: hi)
         _arm_transient(scheduler, clock, 'T1')
-        entry = scheduler.get_state_snapshot()['requeue_cooldowns']['T1']
-        assert entry['armed_secs'] == 30.0
-        assert entry['envelope_secs'] == 30.0
-        assert entry['transient'] is True
-        assert entry['transient_count'] == 1
+        entry = scheduler.get_state_snapshot().requeue_cooldowns['T1']
+        assert entry.armed_secs == 30.0
+        assert entry.envelope_secs == 30.0
+        assert entry.transient is True
+        assert entry.transient_count == 1
 
         for _ in range(2):
             _arm_transient(scheduler, clock, 'T1')
-        entry = scheduler.get_state_snapshot()['requeue_cooldowns']['T1']
-        assert entry['armed_secs'] == entry['envelope_secs'] == 120.0
-        assert entry['transient_count'] == 3
+        entry = scheduler.get_state_snapshot().requeue_cooldowns['T1']
+        assert entry.armed_secs == entry.envelope_secs == 120.0
+        assert entry.transient_count == 3
 
     def test_real_rng_armed_value_sits_inside_the_recorded_envelope(self):
         clock = [1000.0]
         scheduler = _clocked_scheduler(clock)
         for _ in range(4):
             _arm_transient(scheduler, clock, 'T1')
-        entry = scheduler.get_state_snapshot()['requeue_cooldowns']['T1']
-        assert entry['envelope_secs'] == 240.0
-        assert entry['envelope_secs'] / 2 <= entry['armed_secs'] <= entry['envelope_secs']
+        entry = scheduler.get_state_snapshot().requeue_cooldowns['T1']
+        assert entry.envelope_secs == 240.0
+        assert entry.envelope_secs / 2 <= entry.armed_secs <= entry.envelope_secs
 
     def test_genuine_requeue_records_a_flat_non_transient_entry(self):
         clock = [1000.0]
         scheduler = _clocked_scheduler(clock, jitter_source=lambda lo, hi: hi)
         _requeue(scheduler, 'G1', reason='verify failed', api_error_status=None)
         scheduler.release('G1', requeued=True)
-        entry = scheduler.get_state_snapshot()['requeue_cooldowns']['G1']
-        assert entry['armed_secs'] == 30.0
-        assert entry['envelope_secs'] == 30.0
-        assert entry['transient'] is False
-        assert entry['transient_count'] == 0
+        entry = scheduler.get_state_snapshot().requeue_cooldowns['G1']
+        assert entry.armed_secs == 30.0
+        assert entry.envelope_secs == 30.0
+        assert entry.transient is False
+        assert entry.transient_count == 0
 
     def test_armed_secs_grow_across_successive_transient_requeues(self):
         """Boundary row 4's product-visible signal: the deltas GROW."""
@@ -521,9 +522,7 @@ class TestSnapshotExposesRequeueCooldowns:
         seen = []
         for _ in range(5):
             _arm_transient(scheduler, clock, 'T1')
-            seen.append(
-                scheduler.get_state_snapshot()['requeue_cooldowns']['T1']['armed_secs']
-            )
+            seen.append(scheduler.get_state_snapshot().requeue_cooldowns['T1'].armed_secs)
         assert seen == [30.0, 60.0, 120.0, 240.0, 480.0]
 
     def test_gc_drops_the_meta_in_lockstep_with_the_deadline(self):
@@ -531,12 +530,12 @@ class TestSnapshotExposesRequeueCooldowns:
         clock = [1000.0]
         scheduler = _clocked_scheduler(clock, jitter_source=lambda lo, hi: hi)
         _arm_transient(scheduler, clock, 'T1')
-        assert 'T1' in scheduler.get_state_snapshot()['requeue_cooldowns']
+        assert 'T1' in scheduler.get_state_snapshot().requeue_cooldowns
 
         clock[0] += 31.0
         scheduler._gc_expired_cooldowns()
         assert 'T1' not in scheduler._requeue_until
-        assert 'T1' not in scheduler.get_state_snapshot()['requeue_cooldowns']
+        assert 'T1' not in scheduler.get_state_snapshot().requeue_cooldowns
 
     def test_gc_tolerates_a_directly_injected_deadline_with_no_meta(self):
         """Tests inject ``_requeue_until`` directly (test_scheduler_tick_phases.py).
@@ -563,17 +562,14 @@ class TestSnapshotExposesRequeueCooldowns:
         clock[0] += 5.0
         assert scheduler._build_snapshot_payload() == first
 
-    def test_returned_cooldowns_are_deep_copied(self):
-        """Mutating the returned dict must not corrupt scheduler state."""
+    def test_returned_cooldowns_cannot_be_mutated(self):
         clock = [1000.0]
         scheduler = _clocked_scheduler(clock, jitter_source=lambda lo, hi: hi)
         _arm_transient(scheduler, clock, 'T1')
-        snap = scheduler.get_state_snapshot()
-        snap['requeue_cooldowns']['T1']['armed_secs'] = 9999.0
-        snap['requeue_cooldowns']['INJECTED'] = {}
-        fresh = scheduler.get_state_snapshot()['requeue_cooldowns']
-        assert fresh['T1']['armed_secs'] == 30.0
-        assert 'INJECTED' not in fresh
+        entry = scheduler.get_state_snapshot().requeue_cooldowns['T1']
+        with pytest.raises(ValidationError):
+            entry.armed_secs = 9999.0
+        assert scheduler.get_state_snapshot().requeue_cooldowns['T1'].armed_secs == 30.0
 
 
 class TestBoundaryRow4ViaGetSchedulerState:
@@ -648,16 +644,14 @@ class TestBoundaryRow4ViaGetSchedulerState:
             assert abs(delta - entry['armed_secs']) < 0.001
 
     def test_snapshot_is_strictly_json_native(self, tmp_path):
-        """No datetime object may leak into the snapshot.
+        """No datetime object may leak into the snapshot's wire form.
 
-        The production writer serialises with ``json.dumps(state, default=str)``,
-        which would silently stringify a datetime into a shape
-        ``read_scheduler_state`` cannot round-trip into a comparable value.
-        Serialising with NO ``default=`` fallback is what proves it.
+        Serialising ``to_json()`` with NO ``default=`` fallback is what proves it.
         """
         scheduler, _clock, _states, _path = self._drive(tmp_path)
-        json.dumps(scheduler.get_state_snapshot())  # no default= — must not raise
-        for entry in scheduler.get_state_snapshot()['requeue_cooldowns'].values():
+        wire = scheduler.get_state_snapshot().to_json()
+        json.dumps(wire)  # no default= — must not raise
+        for entry in wire['requeue_cooldowns'].values():
             for key, value in entry.items():
                 assert isinstance(value, (str, int, float, bool)), (
                     f'{key}={value!r} ({type(value).__name__}) is not JSON-native'
