@@ -524,6 +524,7 @@ CODEX_CAP_PATTERNS = [
     'quota exceeded',
     'insufficient_quota',
     'rate_limit_exceeded',
+    'hit your usage limit',  # ChatGPT usage window, measured on codex-cli 0.154.0 (task 5403)
 ]
 
 # Gemini (Google) cap-hit patterns. Copied from usage_gate.py:90 (GEMINI_CAP_PATTERNS).
@@ -646,13 +647,14 @@ def classify_invocation(
             return CliLocalError(marker=marker)
 
     # Backend-specific cap patterns checked first, ahead of the claude prefix
-    # logic below (mirrors usage_gate.py:386-397). Codex/Gemini error bodies
-    # don't carry a parseable reset time, so resets_at is always None here.
+    # logic below (mirrors usage_gate.py:386-397). codex's ChatGPT usage
+    # window names its reset ("try again at 1:07 PM"), read by _parse_resets_at.
     if backend == 'codex':
         for pattern in CODEX_CAP_PATTERNS:
             if pattern.lower() in combined_lower:
-                return CapHit(resets_at=None, reason=f'Codex cap hit: {pattern}')
+                return CapHit(resets_at=_parse_resets_at(combined), reason=f'Codex cap hit: {pattern}')
     elif backend == 'gemini':
+        # No measured gemini cap text names a reset time, so none is parsed.
         for pattern in GEMINI_CAP_PATTERNS:
             if pattern.lower() in combined_lower:
                 return CapHit(resets_at=None, reason=f'Gemini cap hit: {pattern}')
