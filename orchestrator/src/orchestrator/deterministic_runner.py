@@ -362,6 +362,7 @@ import logging
 import os
 import re
 import signal
+from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -369,6 +370,7 @@ from typing import TYPE_CHECKING
 
 from shared.before_done_paths import BeforeDonePaths, resolve_before_done_paths
 from shared.proc_group import unsafe_pgid_reason
+from shared.repo_paths import DARK_FACTORY_ROOT_ENV, resolve_dark_factory_root
 from shared.task_metadata import (
     HUMAN_CURATOR_ADJUDICATED_AT_KEY,
     HUMAN_CURATOR_GATE_KEY,
@@ -871,6 +873,22 @@ def _configured_project_root(scheduler) -> Path | None:
     return None
 
 
+class FactoryRootUnresolved(RuntimeError):
+    """before_done.script_root='factory' but ``resolve_dark_factory_root()``
+    found no dark-factory checkout.
+
+    ``_run_predicate`` files it through its no-verdict arm, never as a verdict.
+    """
+
+    def __init__(self, script: str) -> None:
+        super().__init__(
+            f"before_done.script_root='factory' but the dark-factory tooling root is "
+            f'unresolvable, so script {script!r} cannot be located; set '
+            f'{DARK_FACTORY_ROOT_ENV} for the orchestrator process to the '
+            f'dark-factory checkout'
+        )
+
+
 def _snippet_project_root(scheduler) -> str:
     """The configured project_root for the runbook snippet, else a visible placeholder."""
     root = _configured_project_root(scheduler)
@@ -1346,6 +1364,11 @@ class DeterministicRunner:
             ``systemctl --user show`` ``communicate()`` call (task 2091).
             Defaults to ``_INSPECT_TIMEOUT_SECS``.  Injected in tests so a
             wedged-inspect test doesn't actually wait.
+        factory_root_resolver: Optional callable ``() -> Path | None`` locating
+            the dark-factory root a ``before_done.script_root='factory'``
+            script resolves under.  Defaults to
+            ``shared.repo_paths.resolve_dark_factory_root``; consulted only for
+            such scripts.  ``None`` raises ``FactoryRootUnresolved``.
     """
 
     def __init__(
@@ -1361,6 +1384,7 @@ class DeterministicRunner:
         reap_grace_secs=_REAP_GRACE_SECS,
         run_timeout_grace_secs=_RUN_TIMEOUT_GRACE_SECS,
         inspect_timeout_secs=_INSPECT_TIMEOUT_SECS,
+        factory_root_resolver: Callable[[], Path | None] | None = None,
     ):
         self.scheduler = scheduler
         self.escalation_queue = escalation_queue
@@ -1376,6 +1400,7 @@ class DeterministicRunner:
         self._reap_grace_secs = reap_grace_secs
         self._run_timeout_grace_secs = run_timeout_grace_secs
         self._inspect_timeout_secs = inspect_timeout_secs
+        self._factory_root_resolver = factory_root_resolver or resolve_dark_factory_root
 
     # ------------------------------------------------------------------
     # Default injectable seam implementations
@@ -1399,7 +1424,20 @@ class DeterministicRunner:
                 'resolving before_done paths against the process cwd %s',
                 root,
             )
-        return resolve_before_done_paths(before_done, root.resolve())
+        project_root = root.resolve()
+        return resolve_before_done_paths(
+            before_done,
+            project_root,
+            script_base=self._script_base(before_done, project_root),
+        )
+
+    def _script_base(self, before_done: dict, project_root: Path) -> Path:
+        if before_done.get('script_root') != 'factory':
+            return project_root
+        factory_root = self._factory_root_resolver()
+        if factory_root is None:
+            raise FactoryRootUnresolved(before_done['script'])
+        return factory_root
 
     async def _default_schedule_detached_restart(
         self,
