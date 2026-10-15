@@ -1009,6 +1009,25 @@ def _with_markup_repairs(
 # ---------------------------------------------------------------------------
 
 
+STEP_TYPES: frozenset[str] = frozenset({'test', 'impl'})
+
+
+def _step_type_refusal(step_type: str) -> dict[str, Any] | None:
+    """The one enforcement of :data:`STEP_TYPES`: ``None`` for a member, else the refusal."""
+    if step_type in STEP_TYPES:
+        return None
+    allowed = sorted(STEP_TYPES)
+    return {
+        'status': 'error',
+        'message': (
+            f'step_type must be one of {allowed}; got {step_type!r}. '
+            "The plan stores this value under the key 'type'."
+        ),
+        'step_type': step_type,
+        'allowed_step_types': allowed,
+    }
+
+
 def _create_plan(
     artifacts: TaskArtifacts,
     task_id: str,
@@ -1113,6 +1132,10 @@ def _add_plan_step(
     plan, markup_facts = _read_plan_repaired(artifacts)
     if not plan:
         return {'status': 'error', 'message': 'No plan exists. Call create_plan first.'}
+
+    refusal = _step_type_refusal(step_type)
+    if refusal is not None:
+        return _with_markup_repairs(refusal, markup_facts)
 
     # Reject duplicate step IDs
     existing_ids = {
@@ -1530,6 +1553,10 @@ def _replace_plan_step(
     plan, markup_facts = _read_plan_repaired(artifacts)
     if not plan:
         return {'status': 'error', 'message': 'No plan exists.'}
+
+    refusal = _step_type_refusal(step_type)
+    if refusal is not None:
+        return _with_markup_repairs(refusal, markup_facts)
 
     for collection in ('prerequisites', 'steps'):
         for item in plan.get(collection, []):
@@ -2288,8 +2315,11 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
 
         Args:
             step_id: Unique step ID (e.g. "step-1", "step-2").
-            step_type: Either "test" or "impl".
-            description: What this step does.
+            step_type: One of ``STEP_TYPES``: "test" or "impl". Anything else
+                is refused. The plan stores this value under the key ``type``.
+            description: What the step changes and which test it greens. Not
+                suite-state forecasts such as exact counts, error types or
+                "must stay green".
         """
         return _add_plan_step(artifacts, step_id, step_type, description)
 
@@ -2527,7 +2557,8 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
 
         Args:
             step_id: The step ID to replace (e.g. "step-2").
-            step_type: New step type — either "test" or "impl".
+            step_type: New step type — either "test" or "impl". An
+                out-of-vocabulary value is refused.
             description: New description of what this step does.
         """
         return _replace_plan_step(artifacts, step_id, step_type, description)
