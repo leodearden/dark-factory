@@ -59,9 +59,13 @@ class RequeueCooldown(BaseModel):
     """The requeue cooldown gating a task's re-dispatch, as armed.
 
     Every value is fixed at arming, never derived from now, because the
-    producer content-dedups snapshot writes. ``armed_at`` and ``expires_at``
-    are ISO-8601 wall-clock strings; compare ``expires_at`` against now rather
-    than treating presence as proof the task is still cooling.
+    producer content-dedups snapshot writes. ``envelope_secs`` is the
+    un-jittered ceiling ``armed_secs`` was drawn from (armed lies in
+    [envelope/2, envelope]); both grow across successive transient requeues
+    and stay flat for a genuine one. ``armed_at`` and ``expires_at`` are
+    ISO-8601 wall-clock strings. An expired entry can linger until the
+    producer's next tick, so compare ``expires_at`` against now rather than
+    treating presence as proof the task is still cooling.
     """
 
     model_config = _RECORD_CONFIG
@@ -75,6 +79,11 @@ class RequeueCooldown(BaseModel):
 
 
 class SchedulerStateSnapshot(BaseModel):
+    """``parks`` maps each owner to the modules it tops; ``park_stacks`` maps each
+    module to its whole stack, bottom to top, as open entry records; ``lock_depth``
+    is the depth the producer normalises lock keys to.
+    """
+
     model_config = _RECORD_CONFIG
 
     skip_counts: Mapping[str, int] = Field(default_factory=dict)
