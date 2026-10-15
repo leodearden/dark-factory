@@ -14,7 +14,7 @@ from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 import dashboard.data.active_tasks as active_tasks
 import dashboard.data.task_snapshot as task_snapshot
 from dashboard.config import DashboardConfig
-from dashboard.data import escalation_corpus
+from dashboard.data import escalation_corpus, redux_api
 from dashboard.data.active_tasks import (
     collect_census_snapshots,
     collect_tasks_with_counts,
@@ -29,6 +29,7 @@ from dashboard.data.task_snapshot import (
     SnapshotFailure,
     unmeasured_snapshot,
 )
+from dashboard.project_labels import ProjectLabels
 
 A_LABEL = 'a/proj'
 B_LABEL = 'b/proj'
@@ -364,3 +365,104 @@ def test_the_invariants_route_names_each_root_by_its_own_label(client, roots):
     assert [(record['root'], record['project']) for record in resp.json()['INVARIANTS']] == [
         (str(a), A_LABEL), (str(b), B_LABEL),
     ]
+
+
+_TEAM_A = '/srv/team-a/app'
+_TEAM_B = '/srv/team-b/app'
+_TEAM_LABELS = ProjectLabels.of_roots([_TEAM_A, _TEAM_B])
+
+
+def _measured_merge_queue(depth: int) -> dict:
+    """One project's merge-queue aggregate, with the fields the route always resolves."""
+    return {
+        'depth_timeseries': {'labels': [0], 'values': [depth]},
+        'outcomes': {'labels': [], 'values': []},
+        'latency': {},
+        'recent': [],
+        'active': [],
+        'in_queue': Datum(0, _NOW, DatumState.FRESH, None, 30),
+        'live_probe_configured': True,
+        'speculative': Datum(
+            {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': None},
+            _NOW, DatumState.FRESH, None, 30,
+        ),
+        'recent_total': Datum(0, _NOW, DatumState.FRESH, None, 30),
+    }
+
+
+class TestReduxShapers:
+    def test_orchestrators_and_projects_name_each_root_by_its_own_label(self):
+        raw = [
+            {'pids': [pid], 'project_root': root, 'running': True, 'started': ''}
+            for pid, root in ((1, _TEAM_A), (2, _TEAM_B))
+        ]
+
+        body = redux_api.shape_orchestrators(raw, labels=_TEAM_LABELS, running_spark=None)
+
+        assert {orch['project'] for orch in body['ORCHESTRATORS']} == {'team-a/app', 'team-b/app'}
+        assert sorted((p['id'], p['name'], p['active']) for p in body['PROJECTS']) == [
+            ('team-a/app', 'team-a/app', True), ('team-b/app', 'team-b/app', True),
+        ]
+
+    def test_merge_queue_keeps_each_roots_depth_and_halt(self):
+        halt_status = {
+            'team-a/app': {'wired': True, 'halted': True, 'owner_esc_id': 'esc-a', 'offline': False},
+            'team-b/app': {'wired': True, 'halted': False, 'owner_esc_id': None, 'offline': False},
+        }
+
+        mq = redux_api.shape_merge_queue(
+            {_TEAM_A: _measured_merge_queue(3), _TEAM_B: _measured_merge_queue(5)},
+            labels=_TEAM_LABELS, halt_status=halt_status, served_at=_NOW,
+        )['MERGE_QUEUE']
+
+        assert {
+            label: (block['depth']['values'], block['halt']['halted'])
+            for label, block in mq.items()
+        } == {'team-a/app': ([3], True), 'team-b/app': ([5], False)}
+
+    def test_burndown_keeps_and_sums_each_root(self):
+        sampled_at = (_NOW - timedelta(minutes=1)).isoformat()
+        series = {
+            _TEAM_A: {'labels': [sampled_at], 'done': [10], 'pending': [1]},
+            _TEAM_B: {'labels': [sampled_at], 'done': [32], 'pending': [2]},
+        }
+
+        body = redux_api.shape_burndown(series, labels=_TEAM_LABELS, served_at=_NOW)
+
+        assert set(body['BURNDOWN_BY_PROJECT']) == {'team-a/app', 'team-b/app'}
+        assert body['BURNDOWN']['latest']['value']['counts']['done'] == 42
+
+
+def test_the_merge_queue_route_reads_each_roots_own_live_probe(client, roots):
+    a, b = roots
+    client.app.state.config = dataclasses.replace(
+        client.app.state.config, project_root=a, known_project_roots=[b],
+    )
+    entry = {
+        'task_id': '7', 'branch': 'task/7', 'state': 'queued',
+        'age_secs': 60.0, 'position': 1, 'waiter_alive': True,
+    }
+    live_map = {
+        A_LABEL: {'reachable': True, 'entries': [entry], 'metrics': {'probe': 'a'}},
+        B_LABEL: {'reachable': True, 'entries': [entry, entry], 'metrics': {'probe': 'b'}},
+    }
+    per_root = {str(root): _measured_merge_queue(0) for root in roots}
+    with (
+        patch('dashboard.api.merge_queue.build_per_project_merge_queue',
+              new=AsyncMock(return_value=per_root)),
+        patch('dashboard.api.merge_queue.get_merge_halt_status', new=AsyncMock(return_value={})),
+        patch('dashboard.api.merge_queue.fetch_live_merge_queues',
+              new=AsyncMock(return_value=live_map)),
+        patch('dashboard.api.merge_queue.lookup_tasks', new=AsyncMock(return_value={})),
+    ):
+        resp = client.get('/api/v2/dashboard/merge-queue')
+
+    assert resp.status_code == 200, resp.text
+    mq = resp.json()['MERGE_QUEUE']
+    assert {
+        label: (len(block['active']), block['in_queue']['value'], block['metrics'])
+        for label, block in mq.items()
+    } == {
+        A_LABEL: (1, 1, {'probe': 'a'}),
+        B_LABEL: (2, 2, {'probe': 'b'}),
+    }
