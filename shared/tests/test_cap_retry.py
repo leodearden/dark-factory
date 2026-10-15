@@ -12,12 +12,13 @@ import json
 import logging
 import re
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
 
 import pytest
 from _usage_gate_test_helpers import make_gate as _shared_make_gate
+from _usage_gate_test_helpers import scripted_invoke
 
 import shared.cli_invoke as cli_invoke_module
 from shared.cli_invoke import (
@@ -2940,6 +2941,129 @@ class TestInvokeFnParameter:
         with patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result) as mock_inv:
             await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
         mock_inv.assert_awaited_once()
+
+
+# ===================================================================
+# TestNonPoolBackendCapWait
+# ===================================================================
+
+
+def _codex_usage_window_text(reset_at: datetime) -> str:
+    """codex-cli 0.154.0's ChatGPT usage-window message, naming *reset_at*'s
+    local wall-clock minute in the same zone-less 12-hour form codex prints."""
+    meridiem = 'AM' if reset_at.hour < 12 else 'PM'
+    return (
+        "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), "
+        'visit https://chatgpt.com/codex/settings/usage to purchase more credits or try '
+        f'again at {reset_at.hour % 12 or 12}:{reset_at.minute:02d} {meridiem}.'
+    )
+
+
+def _backend_cap(output: str) -> AgentResult:
+    """A failed, zero-cost, instant backend cap: the shape codex exec reports."""
+    return make_result(success=False, output=output, cost_usd=0.0, duration_ms=900)
+
+
+@pytest.mark.asyncio
+class TestNonPoolBackendCapWait:
+    """A codex or gemini cap is the backend's own window, never a Claude
+    account's: the loop waits it out on the SAME account instead of capping
+    one and failing over. pi spends the leased Claude token, so its caps
+    still cap that account.
+
+    ``wait_for_reset=False`` keeps a wrongly capped account from being
+    reopened by a background probe mid-test, and ``park_on_frozen_pool=False``
+    turns a wrongly frozen pool into a loud PoolFrozen instead of a park.
+    """
+
+    @staticmethod
+    def _gate() -> UsageGate:
+        return make_gate(['a', 'b'], wait_for_reset=False)
+
+    @staticmethod
+    def _assert_pool_untouched(gate: UsageGate) -> None:
+        assert gate.active_account_name == 'a'
+        assert gate.is_paused is False
+        assert gate.soonest_resets_at is None
+
+    async def test_known_reset_sleeps_until_it_on_the_same_account(self):
+        gate = self._gate()
+        now_local = datetime.now().astimezone()
+        reset_at = (now_local + timedelta(hours=2)).replace(second=0, microsecond=0)
+        cli = scripted_invoke(
+            _backend_cap(_codex_usage_window_text(reset_at)),
+            make_result(output='complete', cost_usd=0.3),
+        )
+        with patch(_SLEEP_PATCH, new_callable=AsyncMock) as mock_sleep:
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', invoke_fn=cli, backend='codex',
+                park_on_frozen_pool=False, prompt='review this',
+            )
+
+        assert got.success is True
+        assert mock_sleep.await_count == 1
+        real_delta = (reset_at - now_local).total_seconds()
+        assert abs(mock_sleep.await_args.args[0] - real_delta) <= 120
+        assert [c['oauth_token'] for c in cli.calls] == ['fake-token-a', 'fake-token-a']
+        assert cli.calls[1]['prompt'] == 'review this'
+        assert not cli.calls[1].get('resume_session_id')
+        self._assert_pool_untouched(gate)
+
+    @pytest.mark.parametrize(
+        ('backend', 'cap_text'),
+        [('codex', 'Error: rate limit'), ('gemini', 'Error: quota exceeded')],
+    )
+    async def test_unknown_reset_backs_off_without_capping(self, backend, cap_text):
+        gate = self._gate()
+        cli = scripted_invoke(
+            _backend_cap(cap_text), _backend_cap(cap_text), make_result(output='complete'),
+        )
+        with patch(_SLEEP_PATCH, new_callable=AsyncMock) as mock_sleep:
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', invoke_fn=cli, backend=backend,
+                park_on_frozen_pool=False, prompt='hi',
+            )
+
+        assert got.success is True
+        assert [c.args[0] for c in mock_sleep.await_args_list] == [
+            _CAP_HIT_COOLDOWN_SECS, 2 * _CAP_HIT_COOLDOWN_SECS,
+        ]
+        assert {c['oauth_token'] for c in cli.calls} == {'fake-token-a'}
+        self._assert_pool_untouched(gate)
+
+    async def test_max_cap_retries_bounds_the_wait_without_capping(self):
+        gate = self._gate()
+        cli = scripted_invoke(_backend_cap('Error: usage limit reached'))
+        with (
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            pytest.raises(AllAccountsCappedException),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl', invoke_fn=cli, backend='codex', max_cap_retries=1,
+                park_on_frozen_pool=False, prompt='hi',
+            )
+
+        assert len(cli.calls) == 1
+        self._assert_pool_untouched(gate)
+
+    async def test_pi_cap_still_caps_the_leased_account(self):
+        gate = self._gate()
+        cli = scripted_invoke(
+            make_result(
+                success=False,
+                output="You've hit your usage limit for Claude Pro. Your plan resets in 3 hours.",
+            ),
+            make_result(output='complete'),
+        )
+        with patch(_SLEEP_PATCH, new_callable=AsyncMock):
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', invoke_fn=cli, backend='pi', prompt='hi',
+            )
+
+        assert got.success is True
+        assert [c['oauth_token'] for c in cli.calls] == ['fake-token-a', 'fake-token-b']
+        assert gate.active_account_name == 'b'
+        assert gate.soonest_resets_at is not None
 
 
 # ===================================================================

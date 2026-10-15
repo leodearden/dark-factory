@@ -18,6 +18,7 @@ import pytest
 from _orch_helpers import make_gate_yielding as _make_gate_yielding  # centralized (task 1458)
 from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
 from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, AgentResult
+from shared.invocation_outcome import CapHit
 from shared.testing_stdin import STDIN_STARVATION_STUB, make_starving_exec
 from shared.usage_gate import AccountLease, InvokeSlot
 
@@ -203,17 +204,29 @@ class TestCapHitResume:
             assert second_call.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
 
     async def test_no_resume_on_cap_hit_codex_backend(self):
-        """Codex backend cap hit → no resume_session_id (not supported).
+        """Codex backend cap hit → fresh retry, and the Claude pool never hears of it.
 
-        The unified loop resumes by session_id when the result has one, regardless
-        of backend.  Codex backends produce no session_id, so no resume happens.
+        Codex produces no session_id, so there is nothing to resume.  Its cap is
+        the ChatGPT window, not the leased Claude account's, so the loop waits
+        it out without asking the slot's cap detector or reporting a CapHit —
+        even though the capped slot's detector here would answer True.
         """
-        gate = _make_gate_yielding([
+        slots = [
             _make_slot(token='token-a', account_name='acct-a', cap_hit=True),
             _make_slot(token='token-b', account_name='acct-b', cap_hit=False),
-        ])
+        ]
+        gate = _make_gate_yielding(slots)
 
-        capped_result = _make_result(session_id='')  # codex: no session
+        capped_result = _make_result(
+            success=False,
+            output=(
+                "You've hit your usage limit. Upgrade to Pro "
+                '(https://chatgpt.com/explore/pro), visit '
+                'https://chatgpt.com/codex/settings/usage to purchase more credits '
+                'or try again at 1:07 PM.'
+            ),
+            session_id='',  # codex: no session
+        )
         ok_result = _make_result()
         ok_result.duration_ms = 6000
         ok_result.turns = 2
@@ -229,6 +242,10 @@ class TestCapHitResume:
             second_call = fake_invoke.call_args_list[1]
             assert 'resume_session_id' not in second_call.kwargs
             assert second_call.kwargs.get('prompt') == 'hi'
+
+        slots[0].detect_cap_hit.assert_not_called()
+        reported = [arg for slot in slots for c in slot.report.call_args_list for arg in c.args]
+        assert not any(isinstance(arg, CapHit) for arg in reported)
 
     async def test_resume_failure_falls_back_to_fresh(self):
         """Resume returns success=False → retry with original prompt."""
