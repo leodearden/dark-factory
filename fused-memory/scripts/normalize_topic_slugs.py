@@ -52,10 +52,10 @@ A gated slug moves all-or-nothing; an ungated slug does not
 When any member write of a GATED slug fails, ``rename_group`` undoes the
 members that moved, because a gate left on a vacated slug is uncloseable.
 
-An UNGATED slug gets no undo.  A failed member write leaves it split: the
-members that moved carry the new slug and each member whose write failed keeps
-the legacy value.  The residue probe files ``legacy_slug_residue`` for it, and
-the report lists the group under ``ungated_partial_rename``.
+An UNGATED slug gets no undo.  A partial failure leaves it split: the members
+that moved carry the new slug and those whose write did not land keep the
+legacy value.  The residue probe files ``legacy_slug_residue`` for it, and the
+report lists the group under ``ungated_partial_rename``.
 
 A plain re-run does NOT finish the move.  The collision guard sees the moved
 members as incumbents on the new slug and refuses the stragglers as
@@ -1400,13 +1400,15 @@ def describe_partial_ungated_group(group: GateGroup, results: list[dict]) -> dic
 
     Pure.  A gated group is never described here: its gate row already reports
     a held pair.  ``failed_outcomes`` has the gate row's key and shape, so the
-    two read the same way.
+    two read the same way.  "Failed" means a member whose rename did not land
+    and so still carries the legacy value; a vanished or concurrently moved
+    member splits nothing and is reported only in its own bucket.
     """
     if group.gate_task_id is not None:
         return None
     stood = [r for r in results if r.get('outcome') in _STOOD_OUTCOMES]
-    stragglers = [r for r in results if r.get('outcome') in _LEFT_ON_LEGACY_OUTCOMES]
-    if not stood or not stragglers:
+    failed = [r for r in results if r.get('outcome') in _LEFT_ON_LEGACY_OUTCOMES]
+    if not stood or not failed:
         return None
     return {
         'reason': 'ungated_partial_rename',
@@ -1414,8 +1416,8 @@ def describe_partial_ungated_group(group: GateGroup, results: list[dict]) -> dic
         'old_topic': group.old_topic,
         'new_topic': group.new_topic,
         'stood_memory_ids': sorted(r['memory_id'] for r in stood),
-        'failed_memory_ids': sorted(r['memory_id'] for r in stragglers),
-        'failed_outcomes': sorted({str(r.get('outcome')) for r in stragglers}),
+        'failed_memory_ids': sorted(r['memory_id'] for r in failed),
+        'failed_outcomes': sorted({str(r.get('outcome')) for r in failed}),
         'note': (
             'this slug carries no consolidation gate, so members that move are '
             'not rolled back when another fails and the slug is split across '
