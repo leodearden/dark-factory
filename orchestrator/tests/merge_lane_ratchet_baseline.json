@@ -1110,7 +1110,7 @@
     "orchestrator/tests/test_merge_queue_build_chain.py": {"patch_targets": ["_emit_merge_attempt"], "private_reads": 20},
     "orchestrator/tests/test_merge_queue_c3_submit_identity.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_queue_chain_intact.py": {"patch_targets": [], "private_reads": 75},
-    "orchestrator/tests/test_merge_queue_coalesce.py": {"patch_targets": ["_do_train_merge", "logger", "member_redrive.validate_landing_evidence", "run_scoped_verification"], "private_reads": 85},
+    "orchestrator/tests/test_merge_queue_coalesce.py": {"patch_targets": ["_do_train_merge", "member_redrive.validate_landing_evidence", "run_scoped_verification"], "private_reads": 85},
     "orchestrator/tests/test_merge_queue_concurrent_verify.py": {"patch_targets": ["_alarm_illegal_lifecycle_transition", "_maybe_schedule_shadow_compare"], "private_reads": 174},
     "orchestrator/tests/test_merge_queue_conflict_graph.py": {"patch_targets": [], "private_reads": 26},
     "orchestrator/tests/test_merge_queue_deep_dispatch.py": {"patch_targets": ["CHAIN_BUILD_TIMEOUT_SECS", "_run_post_merge_verify", "build_chain", "release_chain_build_lane"], "private_reads": 138},
