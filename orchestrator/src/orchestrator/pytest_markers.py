@@ -180,7 +180,7 @@ def _cli_marker_expr(test_command: str | None) -> str | None:
       expression and silently suppress a legitimate widening.
 
     FIRST-occurrence-then-truncate-at-the-chain-delimiter is deliberately the
-    same semantics ``verify_plan._scope_prefix_to_keyword`` applies when it
+    same semantics ``verify_plan.scope_prefix_to_keyword`` applies when it
     scopes the very same string (``split_chain_tail`` + ``head.find(keyword)``),
     so the marker probe and the scoper can never describe DIFFERENT pytest
     invocations of one chained command.  ``split_chain_tail`` itself is not
