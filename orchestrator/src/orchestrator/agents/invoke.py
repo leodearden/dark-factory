@@ -587,11 +587,14 @@ def _parse_codex_output(
     #   {"type":"thread.started","thread_id":"..."}
     #   {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
     #   {"type":"item.completed","item":{"type":"error","message":"..."}}  non-fatal warning
-    #   {"type":"turn.completed","usage":{"input_tokens":N,"output_tokens":N}}
+    #   {"type":"turn.completed","usage":{"input_tokens":N,"cached_input_tokens":N,
+    #       "cache_write_input_tokens":N,"output_tokens":N}}  cached is INSIDE input
     #   {"type":"error","message":"..."}                  fatal; paired with turn.failed
     #   {"type":"turn.failed","error":{"message":"..."}}  fatal
     output_parts = []
     total_input_tokens = 0
+    total_cached_input_tokens = 0
+    total_cache_write_tokens = 0
     total_output_tokens = 0
     session_id = ''
     is_error = False
@@ -620,6 +623,8 @@ def _parse_codex_output(
             num_turns += 1
             usage = event.get('usage') or {}
             total_input_tokens += usage.get('input_tokens') or 0
+            total_cached_input_tokens += usage.get('cached_input_tokens') or 0
+            total_cache_write_tokens += usage.get('cache_write_input_tokens') or 0
             total_output_tokens += usage.get('output_tokens') or 0
 
         elif event_type == 'error':
@@ -636,8 +641,18 @@ def _parse_codex_output(
 
     output_text = '\n'.join(output_parts) if output_parts else result.stdout[:2000]
 
-    # Estimate cost from token counts
-    cost = _estimate_cost(model, total_input_tokens, total_output_tokens, prices)
+    priced_input_tokens = total_input_tokens
+    if total_cached_input_tokens > total_input_tokens:
+        logger.warning(
+            'codex reported cached_input_tokens=%d above input_tokens=%d, which should '
+            'include them; pricing the non-cached input count as 0',
+            total_cached_input_tokens, total_input_tokens,
+        )
+        priced_input_tokens = total_cached_input_tokens
+    cost = _estimate_cost(
+        model, priced_input_tokens, total_output_tokens, prices,
+        cached_input_tokens=total_cached_input_tokens,
+    )
 
     return AgentResult(
         success=result.returncode == 0 and not is_error,
@@ -649,6 +664,10 @@ def _parse_codex_output(
         subtype='success' if result.returncode == 0 and not is_error else 'error',
         stderr=result.stderr,
         timed_out=result.timed_out,
+        input_tokens=total_input_tokens,
+        output_tokens=total_output_tokens,
+        cache_read_tokens=total_cached_input_tokens,
+        cache_create_tokens=total_cache_write_tokens,
     )
 
 
