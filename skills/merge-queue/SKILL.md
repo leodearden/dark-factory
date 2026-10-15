@@ -237,8 +237,15 @@ Four rules make this fallback loop terminate correctly. **On the `coalesce-*` ar
 
 **Whichever shape `superseded_by` takes, never direct-merge and never resubmit while a successor is unresolved.**
 
-**`state: "unknown"`** — for the `request_id`/`task_id` poll arms, this means the orchestrator restarted and the retention ring no longer holds this request (a record that *was* enqueued). `merge_status` now self-resolves a landed merge via its git-authority tier: if the branch is provably on `main` it returns `state: "done"` with `kind: "found_on_main"` and `merge_sha` directly. **`unknown` does not mean "not landed"** — the tier is deliberately silent whenever it cannot *attribute* a landing, which now includes a branch that never advanced past its creation point and a landing that no commit on main cites. If `merge_status` still returns `unknown`, confirm deterministically:
-<a id="canonical-ancestry-check"></a>**The canonical ancestry check — three outcomes, not two.** Every "is it on main?" confirmation in this skill means this check. **Never use the two-way idiom `git merge-base --is-ancestor ... && echo "on main" || echo "not on main"`**: a deleted branch ref exits **128**, which that idiom silently reports as "not on main" — inverting the truth for the normal post-merge state, since the merge lane deletes task branches on cleanup (`_delete_branch_if_on_main`, `orchestrator/src/orchestrator/git_ops.py`), and on the `branch` arm a *foreign* merger's cleanup deletes it out from under you.
+**Epistemic answers** — a state that describes the server's records rather than the merge, always carrying a `reason`. Switch on `reason` per [the shared reason switch](../_shared/merge-status-reasons.md#the-switch), including its [request_id re-poll rule](../_shared/merge-status-reasons.md#request-id-polls); never reconstruct the answer from ancestry exit codes. This skill's dispositions:
+
+- **`never_submitted`** on the `request_id`/`task_id` arms, confirmed by a task_id-keyed answer, with `get_merge_queue()` showing no entry for the branch → **resubmit (go back to step 3).** On the `branch` arm it is the live state (above).
+- **`prior_run_terminal`** → report `last_outcome` to the human and stop; resubmitting is their call.
+- **`landing_unattributable`** → verify per the shared switch; a verified sha → step 4's `done`, stamped `found_on_main` with `commit` **and** `note`.
+- **`coalesce_train_id`** → the [Escape](#follow-the-superseded-successor).
+- **Wait-state reasons** → keep polling, under the shared [wait bound](../_shared/merge-status-reasons.md#wait-bound).
+
+<a id="canonical-ancestry-check"></a>**The canonical ancestry check — three outcomes, not two.** Every "is it on main?" confirmation in this skill means this check: the unscoped arms' `done` gate, the `already_merged` condition, and the Escape's rules. **Never use the two-way idiom `git merge-base --is-ancestor ... && echo "on main" || echo "not on main"`**: a deleted branch ref exits **128**, which that idiom silently reports as "not on main" — inverting the truth for the normal post-merge state, since the merge lane deletes task branches on cleanup (`_delete_branch_if_on_main`, `orchestrator/src/orchestrator/git_ops.py`), and on the `branch` arm a *foreign* merger's cleanup deletes it out from under you.
 ```bash
 git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 # The trailing `echo` is REQUIRED, not decoration. `--is-ancestor` prints
@@ -254,12 +261,12 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 **This skill's dispositions on the ladder's verdicts:**
 
 - **A verified sha (on rc=0, or on rc=128 with a non-empty marker)** → treat as done/`found_on_main` and stamp exactly what that arm specifies — `commit` **and** `note`, both required.
-- **rc=1** → not an ancestor of main. Outside the coalesce arm and with the queue healthy: **resubmit (go back to step 3).**
+- **rc=1** → not an ancestor of main. On an unscoped arm's `done` gate the `done` is stale, so keep polling; on the Escape, rules 2/2v/2b/3 govern. **rc=1 never licenses a resubmit in this skill.**
 - **rc=128 with an empty marker on the `coalesce-*` arm** → **not** one of the ladder's genuine not-landed outcomes below; [Follow the superseded successor](#follow-the-superseded-successor)'s **rule 2a** governs it (tip's merge marker + this task's scheduler status; either landing signal means it **landed**, and **there is no self-stamp on this arm** — a `done` status means the automatic flip already happened and nothing is left to write, any other status means never write, and the exit at the ceiling is **landed-but-not-credited**). The shared ladder carries this carve-out explicitly, so running it "in full" no longer contradicts rule 2a.
-- **rc=1 on the `coalesce-*` arm** → that resubmit line does **not** apply; [Follow the superseded successor](#follow-the-superseded-successor)'s rules 2/2v/2b/3 govern instead. Rule 2b's `git cherry main task/<TASK_ID>` content proof is correct **there** — the branch is not an ancestor of main, so the test actually discriminates — and is unaffected by the shared doc's ban on substituting it on the rc=0 arm. Honour rule 2v's **veto (both arms)**: **there is no self-stamp on this arm** either, so the scheduler status decides only which exit applies — `done` means the flip already happened and nothing is left to write; any other status means keep polling, and at the ceiling take its **landed-but-not-credited** exit (citing the tip merge sha, the `git cherry` output and the current status) rather than reporting not-landed.
+- **rc=1 on the `coalesce-*` arm** → **not** a not-landed verdict either; [Follow the superseded successor](#follow-the-superseded-successor)'s rules 2/2v/2b/3 govern. Rule 2b's `git cherry main task/<TASK_ID>` content proof is correct **there** — the branch is not an ancestor of main, so the test actually discriminates — and is unaffected by the shared doc's ban on substituting it on the rc=0 arm. Honour rule 2v's **veto (both arms)**: **there is no self-stamp on this arm** either, so the scheduler status decides only which exit applies — `done` means the flip already happened and nothing is left to write; any other status means keep polling, and at the ceiling take its **landed-but-not-credited** exit (citing the tip merge sha, the `git cherry` output and the current status) rather than reporting not-landed.
 - **The ladder's genuine not-landed outcomes**, and a citation gate that is **un-evaluable** (`git.commit_citation_pattern: ""`) → stamp nothing. Un-evaluable proves neither verdict, so never read it as not-landed.
 
-**Never fall back to a direct merge in response to `unknown`** — `unknown` means the server lost its record, NOT that the merge failed. The direct-merge fallback (step 6) is ONLY for orchestrator down/congested. **This block's `resubmit` line does not apply to the `poll_by == "branch"` arm** — there nothing was ever enqueued, so `unknown` is that arm's expected live state, not a lost record; see its 20-minute ceiling above for the bounded exit instead. **Nor does it apply when this check is reached from [Follow the superseded successor](#follow-the-superseded-successor)'s Escape** — that subsection's rule 3 governs rc=1 there instead; do not resubmit.
+**Never fall back to a direct merge in response to an epistemic answer** — it describes the server's records, NOT a failed merge. The direct-merge fallback (step 6) is ONLY for orchestrator down/congested.
 
 ### 4. Handle the outcome
 
@@ -271,10 +278,9 @@ The outcome arrives from either the submit call (terminal at submit time) or the
   - **Where the SHA comes from depends on which call produced the `done`, and not every source is
     safe to record as `kind: "merged"`.** A terminal-at-submit-time `merge_request` response carries
     the true merge SHA in `commit` — safe to use directly. A *polled* `done` does not, unless the
-    response carries `merge_sha` (the git-authority tier's `kind: "found_on_main"` shape) — the
-    durable retention-ring/event-store tiers return only
-    `state`/`request_id`/`generation`/`outcome`/`finished_at` (`escalation/server.py:2404-2420`),
-    and `outcome` is the raw state string `"done"`, not a commit hash.
+    response carries `merge_sha` (the git-authority tier's `kind: "found_on_main"` shape) — a
+    `done` from the live or event-store tier carries no sha (the event-store tier's `outcome` is
+    the raw state string `"done"`, not a commit hash).
 
     - **A `merge_sha` is always a commit ON main, on both of the tier's resolution paths** — the
       citing commit discovered on main on the live-branch path, the merge commit itself on the
@@ -319,7 +325,7 @@ The outcome arrives from either the submit call (terminal at submit time) or the
         main and would not catch it.
 
     - **If the response has neither `commit` nor `merge_sha`** — including on the `poll_by ==
-      "branch"` arm, where a durable record can resolve `done` with no `merge_sha` — re-derive the
+      "branch"` arm, where a live or event-store `done` carries no `merge_sha` — re-derive the
       merge commit the same way. Never fabricate a SHA; and an empty search is **not** a not-landed
       verdict — resolve it with
       [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#step-3) and stamp
@@ -378,20 +384,20 @@ mcp__escalation__merge_cancel(request_id="<request_id from submit>")
 The response is `{ cancelled, state, reason }`:
 
 - **`cancelled: true`** with `state: "abandoned"` — a pending waiter was dropped. The merge will not proceed.
-- **`cancelled: false`** — the request was already finalized (terminal), unknown, or already cancelled. The `state` and `reason` fields explain why.
+- **`cancelled: false`** — the request was already finalized (terminal), answered an epistemic state, or already cancelled. The `state` and `reason` fields explain why.
 
 **Important:** `merge_cancel` is the **only** explicit-cancellation path. An MCP client disconnect no longer cancels the merge (durable intent), so an abandoned submission must be cancelled deliberately.
 
 If your submit returned `status: "attached"`, whether the returned `request_id` cancels the shared in-flight entry depends on that response's `poll_by`:
 
 - `poll_by == "request_id"` — the returned `request_id` IS the in-flight entry's id; cancel it as shown above.
-- `poll_by == "task_id"` or `poll_by == "branch"` — the returned `request_id` names your own coalesced submission, not the in-flight entry. Treat the cancel as best-effort: `cancelled: false` / `state: "unknown"` is the expected outcome here, not evidence of a problem. On `"branch"` specifically, a foreign or pre-restart merger owns the worktree — reaching the real entry isn't this caller's cancel to make. Re-check the actual state first (`merge_status(task_id=...)` / `merge_status(branch="task/<TASK_ID>")`, which self-resolves a landed merge via the git-authority tier), then the `git merge-base --is-ancestor` confirmation described under `state: "unknown"` above, before deciding anything further.
+- `poll_by == "task_id"` or `poll_by == "branch"` — the returned `request_id` names your own coalesced submission, not the in-flight entry. Treat the cancel as best-effort: `cancelled: false` / `state: "no_record"` (your own id was never enqueued) is the expected outcome here, not evidence of a problem. On `"branch"` specifically, a foreign or pre-restart merger owns the worktree — reaching the real entry isn't this caller's cancel to make. Re-check the actual state first (`merge_status(task_id=...)` / `merge_status(branch="task/<TASK_ID>")`, which self-resolves a landed merge via the git-authority tier); if that answer is epistemic, switch on its `reason` per [the shared reason switch](../_shared/merge-status-reasons.md#the-switch) before deciding anything further.
 
-Separately — if you're holding a `coalesce-*` train id from a `superseded` response's `superseded_by` (not from an `attached` submit's `poll_by`), it is **not** cancellable via `merge_cancel` either: `merge_cancel` looks the id up in `_waiters`, which is keyed on `MergeRequest.request_id` (`escalation/server.py:2716`), but a coalesce train is registered only through `_register_item` (`orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._register_item`) and never as a waiter — so the call resolves to `cancelled: false` / `state: "unknown"` for the same reason it can't be polled by `request_id`. (The nearby docstring at `escalation/server.py:2679-2681` describes a different mechanism — door/attach-coalesced *submissions* — not trains; its "use the in-flight request_id" remediation does not apply here.) There is no cancel path for an in-flight train — see [Follow the superseded successor](#follow-the-superseded-successor) instead.
+Separately — if you're holding a `coalesce-*` train id from a `superseded` response's `superseded_by` (not from an `attached` submit's `poll_by`), it is **not** cancellable via `merge_cancel` either: `merge_cancel` looks the id up in `_waiters`, which is keyed on `MergeRequest.request_id` (`escalation/src/escalation/server.py::merge_cancel`), but a coalesce train is registered only through `_register_item` (`orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._register_item`) and never as a waiter — so the call answers `cancelled: false` with the same epistemic state a `request_id` poll of the train id gives (`stale_record`, reason `coalesce_train_id`, once a member row exists). (The same docstring, `escalation/src/escalation/server.py::merge_cancel`, also describes a different mechanism — door/attach-coalesced *submissions* — not trains; its "use the in-flight request_id" remediation does not apply here.) There is no cancel path for an in-flight train — see [Follow the superseded successor](#follow-the-superseded-successor) instead.
 
 ### 6. Fallback: direct merge
 
-**This fallback is ONLY for orchestrator down/congested — NEVER a response to `state: "unknown"`.**
+**This fallback is ONLY for orchestrator down/congested — NEVER a response to an epistemic `merge_status` answer.**
 
 If the escalation MCP is down (orchestrator not running), merge directly. There's no queue to race with.
 
@@ -416,7 +422,7 @@ After a successful direct merge:
 | Orchestrator running | Submit via `merge_request(wait_secs=100, verified_green=...)` — `True` only when verification actually passed, `False` otherwise — then poll `merge_status` |
 | Orchestrator not running | Direct `git merge --no-ff` |
 | Submit returns `queued` or `attached` | Durable intent confirmed; poll the handle `poll_by` names (`request_id` for `queued` and the `poll_by=="request_id"` arm; `task_id`/`branch` when `attached` discloses them) with 15 s→60 s backoff (realise each wait per [Waiting between polls](#waiting-between-polls)) |
-| `merge_status` returns `state: "unknown"` | `request_id`/`task_id` arms: run the [canonical ancestry check](#canonical-ancestry-check), then derive the sha with [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#the-ladder) — run it in full rather than shortcutting it from this row. rc=0 → landed, but the sha comes from the ladder's group-merge / citation arms, never from HEAD; rc=128 → branch ref gone, decided by the ladder's exact-subject marker search (never an unfiltered `--merges` listing) — and **an empty marker search is not by itself a not-landed verdict** ([step 3](../_shared/deriving-landed-sha.md#step-3)), so on the `coalesce-*` arm apply [Follow the superseded successor](#follow-the-superseded-successor) rule 2 before concluding anything; rc=1 + healthy queue, outside the coalesce arm → resubmit. `poll_by == "branch"` arm: `unknown` is that arm's live state — keep polling to the 20-min ceiling, then stop and report, never resubmit. Never direct-merge in response to `unknown`. |
+| `merge_status` returns an epistemic state | Switch on `reason` per [the shared reason switch](../_shared/merge-status-reasons.md#the-switch), never on ancestry exit codes. `prior_run_terminal` → report `last_outcome` and stop; resubmit only on a task_id-confirmed `never_submitted` with nothing queued for the branch. `poll_by == "branch"` arm: it is that arm's live state — keep polling to the 20-min ceiling. Never direct-merge in response to one. |
 | Terminal state arrived on an unscoped arm (`poll_by` `"branch"` or `"task_id"`) | Unconfirmed — a branch- or task-keyed poll can match a *prior* round's record on the same reused branch/task_id. A `done` with `kind: "found_on_main"` is git-authoritative — accept directly. Otherwise accept `done` only when the canonical ancestry check says landed (rc=0, or rc=128 with a merge-marker hit); re-check `get_merge_queue()` before acting on a `conflict`/`blocked`/`abandoned`. |
 | Outcome `conflict` | Fix in worktree, resubmit |
 | Outcome `blocked` | Read reason, fix, resubmit |
