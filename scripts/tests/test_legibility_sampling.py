@@ -30,6 +30,19 @@ from legibility_carrier_fixtures import (
 MAIN_CWD = '/home/leo/src/dark-factory'
 
 
+def _sampling_config(
+    max_daily_digest_bytes: int = 405_000, *, top_fraction: float = 0.12, per_stratum_min: int = 2,
+) -> config_mod.LegibilityConfig:
+    return config_mod.LegibilityConfig(
+        project_id='dark_factory',
+        project_root=MAIN_CWD,
+        escalation_port=8103,
+        cwd_prefixes=[MAIN_CWD],
+        budgets=config_mod.Budgets(max_daily_digest_bytes=max_daily_digest_bytes),
+        sampling=config_mod.Sampling(top_fraction=top_fraction, per_stratum_min=per_stratum_min),
+    )
+
+
 def _write_transcript(path: Path, records: list[dict]) -> Path:
     path.write_text('\n'.join(json.dumps(r) for r in records) + '\n')
     return path
@@ -249,14 +262,7 @@ class TestSamplerDesignedOutcomeParity:
             _scored('ceilings-only', 'watcher', mod.SignalCounts.of(designed_outcome=13), 'poll'),
             _scored('real-signal', 'watcher', mod.SignalCounts.of(tool_error=1), 'boom'),
         ]
-        config = config_mod.LegibilityConfig(
-            project_id='dark_factory',
-            project_root='/home/leo/src/dark-factory',
-            escalation_port=8103,
-            cwd_prefixes=['/home/leo/src/dark-factory'],
-            budgets=config_mod.Budgets(max_daily_digest_bytes=405_000),
-            sampling=config_mod.Sampling(top_fraction=0.12, per_stratum_min=2),
-        )
+        config = _sampling_config()
 
         result = mod.stratified_sample(records, config)
 
@@ -605,14 +611,7 @@ class TestReingestedContentIsNotScored:
             ]),
             _session_on_disk(encoded, 'real-signal', [_clean_record(0), _not_found_record()]),
         ]
-        config = config_mod.LegibilityConfig(
-            project_id='dark_factory',
-            project_root='/home/leo/src/dark-factory',
-            escalation_port=8103,
-            cwd_prefixes=['/home/leo/src/dark-factory'],
-            budgets=config_mod.Budgets(max_daily_digest_bytes=405_000),
-            sampling=config_mod.Sampling(top_fraction=0.12, per_stratum_min=2),
-        )
+        config = _sampling_config()
 
         scored = [mod.score_session(session) for session in sessions]
         result = mod.stratified_sample(scored, config)
@@ -710,14 +709,7 @@ class TestLegibilityInstrumentStratum:
             _session_on_disk(encoded, 'coder-run', [_user_turn(coder_prompt), _tool_error_record()]),
             _session_on_disk(encoded, 'interactive-run', [_clean_record(0), _not_found_record()]),
         ]
-        config = config_mod.LegibilityConfig(
-            project_id='dark_factory',
-            project_root='/home/leo/src/dark-factory',
-            escalation_port=8103,
-            cwd_prefixes=['/home/leo/src/dark-factory'],
-            budgets=config_mod.Budgets(max_daily_digest_bytes=405_000),
-            sampling=config_mod.Sampling(top_fraction=0.12, per_stratum_min=2),
-        )
+        config = _sampling_config()
 
         scored = [mod.score_session(session) for session in sessions]
         result = mod.stratified_sample(scored, config)
@@ -840,16 +832,6 @@ class TestSampleResultAccounting:
 
     _COST = staticmethod(lambda r: r.size_bytes)
 
-    def _config(self, max_bytes):
-        return config_mod.LegibilityConfig(
-            project_id='dark_factory',
-            project_root='/home/leo/src/dark-factory',
-            escalation_port=8103,
-            cwd_prefixes=['/home/leo/src/dark-factory'],
-            budgets=config_mod.Budgets(max_daily_digest_bytes=max_bytes),
-            sampling=config_mod.Sampling(top_fraction=0.12, per_stratum_min=2),
-        )
-
     def _build_records(self):
         """7 records; every stratum's survivors all reach the candidate stage.
 
@@ -914,12 +896,12 @@ class TestSampleResultAccounting:
 
     def test_total_records_counts_every_record_handed_to_the_sampler(self):
         records = self._build_records()
-        result = mod.stratified_sample(records, self._config(3_000), cost_fn=self._COST)
+        result = mod.stratified_sample(records, _sampling_config(3_000), cost_fn=self._COST)
         assert result.total_records == len(records) == 7
 
     def test_every_candidate_is_either_selected_or_budget_skipped(self):
         records = self._build_records()
-        result = mod.stratified_sample(records, self._config(3_000), cost_fn=self._COST)
+        result = mod.stratified_sample(records, _sampling_config(3_000), cost_fn=self._COST)
 
         # The squeeze really did bite (otherwise the conservation law below
         # would hold trivially with budget_skipped == 0).
@@ -947,7 +929,7 @@ class TestSampleResultAccounting:
         # thing excluding records here is the stratum sampling cut, so a
         # non-zero budget_skipped would mean the fixture is not isolating
         # what it claims to.
-        result = mod.stratified_sample(records, self._config(300_000), cost_fn=self._COST)
+        result = mod.stratified_sample(records, _sampling_config(300_000), cost_fn=self._COST)
 
         assert result.total_records == 17
         assert result.zero_signal_dropped == 0
@@ -973,7 +955,7 @@ class TestSampleResultAccounting:
             (self._build_records(), 3_000),             # dedupe + zero-signal + budget
             (self._build_records(), 10),                # total suppression
         ):
-            result = mod.stratified_sample(records, self._config(max_bytes), cost_fn=self._COST)
+            result = mod.stratified_sample(records, _sampling_config(max_bytes), cost_fn=self._COST)
             accounted = (
                 result.zero_signal_dropped
                 + result.dedupe_collapsed
@@ -1006,7 +988,7 @@ class TestSampleResultAccounting:
         for size in range(len(base) + 1):
             for max_bytes in (0, 1, 999, 1_000, 1_001, 2_000, 3_000, 300_000):
                 result = mod.stratified_sample(
-                    base[:size], self._config(max_bytes), cost_fn=self._COST,
+                    base[:size], _sampling_config(max_bytes), cost_fn=self._COST,
                 )
                 looks_like_nothing_to_sample = (
                     not result.selected and result.budget_skipped == 0
@@ -1025,7 +1007,7 @@ class TestSampleResultAccounting:
     def test_the_operator_line_reports_the_sampling_cut(self):
         """The counter is worthless if it never reaches the operator."""
         result = mod.stratified_sample(
-            self._build_narrowed_records(), self._config(300_000), cost_fn=self._COST,
+            self._build_narrowed_records(), _sampling_config(300_000), cost_fn=self._COST,
         )
         line = mod.format_sample_summary_line(result, max_bytes=300_000)
         assert 'below_sampling_cut=14' in line
@@ -1036,7 +1018,7 @@ class TestSampleResultAccounting:
 
         # Budget squeezed below even the cheap group: real candidates existed
         # and every one was discarded on budget.
-        suppressed = mod.stratified_sample(records, self._config(10), cost_fn=self._COST)
+        suppressed = mod.stratified_sample(records, _sampling_config(10), cost_fn=self._COST)
         assert suppressed.selected == []
         assert suppressed.budget_skipped == 4
         assert (not suppressed.selected and suppressed.budget_skipped > 0) is True
@@ -1045,7 +1027,7 @@ class TestSampleResultAccounting:
         # budget phase, so the SAME empty selection must NOT read as
         # suppression.
         quiet = [r for r in records if r.score == 0]
-        quiet_result = mod.stratified_sample(quiet, self._config(300_000), cost_fn=self._COST)
+        quiet_result = mod.stratified_sample(quiet, _sampling_config(300_000), cost_fn=self._COST)
         assert quiet_result.selected == []
         assert quiet_result.budget_skipped == 0
         assert quiet_result.total_records == 2
@@ -1114,40 +1096,30 @@ class TestStratifiedSampleBoundary:
         records.append(_scored('interactive-2', 'interactive', mod.SignalCounts.of(tool_error=4), 'human turn B', 900))
         return records
 
-    def _config(self):
-        return config_mod.LegibilityConfig(
-            project_id='dark_factory',
-            project_root='/home/leo/src/dark-factory',
-            escalation_port=8103,
-            cwd_prefixes=['/home/leo/src/dark-factory'],
-            budgets=config_mod.Budgets(max_daily_digest_bytes=405_000),
-            sampling=config_mod.Sampling(top_fraction=0.12, per_stratum_min=2),
-        )
-
     def _selected_ids(self, result):
         return {r.path.stem for r in result.selected}
 
     def test_zero_signal_dropped(self):
-        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
+        result = mod.stratified_sample(self._build_records(), _sampling_config(), cost_fn=self._COST)
         assert not any(sid.startswith('recon-zero-') for sid in self._selected_ids(result))
 
     def test_zero_signal_drop_count(self):
-        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
+        result = mod.stratified_sample(self._build_records(), _sampling_config(), cost_fn=self._COST)
         assert result.zero_signal_dropped == 12
 
     def test_clones_deduped_to_single_highest_scorer(self):
-        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
+        result = mod.stratified_sample(self._build_records(), _sampling_config(), cost_fn=self._COST)
         watcher_selected = [r for r in result.selected if r.stratum == 'watcher']
         assert len(watcher_selected) == 1
         assert watcher_selected[0].path.stem == 'watcher-clone-3'
 
     def test_no_duplicate_fingerprints_in_selection(self):
-        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
+        result = mod.stratified_sample(self._build_records(), _sampling_config(), cost_fn=self._COST)
         fingerprints = [mod.shape_fingerprint(r) for r in result.selected]
         assert len(fingerprints) == len(set(fingerprints))
 
     def test_each_nonempty_stratum_retains_per_stratum_min_or_all_survivors(self):
-        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
+        result = mod.stratified_sample(self._build_records(), _sampling_config(), cost_fn=self._COST)
         per_stratum = {}
         for r in result.selected:
             per_stratum.setdefault(r.stratum, []).append(r)
@@ -1156,12 +1128,12 @@ class TestStratifiedSampleBoundary:
         assert len(per_stratum['interactive']) >= 2
 
     def test_total_bytes_within_budget(self):
-        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
+        result = mod.stratified_sample(self._build_records(), _sampling_config(), cost_fn=self._COST)
         assert sum(r.size_bytes for r in result.selected) <= 405_000
         assert result.bytes_used == sum(r.size_bytes for r in result.selected)
 
     def test_tiny_stratum_survives_despite_huge_high_score_sessions_elsewhere(self):
-        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
+        result = mod.stratified_sample(self._build_records(), _sampling_config(), cost_fn=self._COST)
         selected_ids = self._selected_ids(result)
         assert 'interactive-1' in selected_ids
         assert 'interactive-2' in selected_ids
@@ -1175,16 +1147,16 @@ class TestStratifiedSampleBoundary:
         # Without per-stratum reserve, recon's mid-tier candidate (score 29)
         # would consume the leftover budget ahead of lower-scoring strata;
         # the tight budget here must exclude it.
-        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
+        result = mod.stratified_sample(self._build_records(), _sampling_config(), cost_fn=self._COST)
         assert 'recon-mid-3' not in self._selected_ids(result)
 
     def test_selected_ordered_by_score_desc(self):
-        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
+        result = mod.stratified_sample(self._build_records(), _sampling_config(), cost_fn=self._COST)
         scores = [r.score for r in result.selected]
         assert scores == sorted(scores, reverse=True)
 
     def test_per_stratum_counts_accounting(self):
-        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
+        result = mod.stratified_sample(self._build_records(), _sampling_config(), cost_fn=self._COST)
         assert result.per_stratum_counts == {'recon': 2, 'watcher': 1, 'interactive': 2}
 
 
@@ -1204,16 +1176,6 @@ class TestStratifiedSampleReserveExceedsBudget:
 
     _COST = staticmethod(lambda r: r.size_bytes)
 
-    def _config(self, max_bytes):
-        return config_mod.LegibilityConfig(
-            project_id='dark_factory',
-            project_root='/home/leo/src/dark-factory',
-            escalation_port=8103,
-            cwd_prefixes=['/home/leo/src/dark-factory'],
-            budgets=config_mod.Budgets(max_daily_digest_bytes=max_bytes),
-            sampling=config_mod.Sampling(top_fraction=0.12, per_stratum_min=2),
-        )
-
     def _build_records(self):
         return [
             # "recon" floor: expensive (200_000 bytes each -> 400_000 total).
@@ -1226,12 +1188,12 @@ class TestStratifiedSampleReserveExceedsBudget:
 
     def test_total_never_exceeds_budget_even_when_floors_alone_would(self):
         # Both floors together (402_000) exceed a 3_000-byte budget.
-        result = mod.stratified_sample(self._build_records(), self._config(3_000), cost_fn=self._COST)
+        result = mod.stratified_sample(self._build_records(), _sampling_config(3_000), cost_fn=self._COST)
         assert sum(r.size_bytes for r in result.selected) <= 3_000
         assert result.bytes_used <= 3_000
 
     def test_cheap_stratum_preferred_when_budget_cannot_fit_both(self):
-        result = mod.stratified_sample(self._build_records(), self._config(3_000), cost_fn=self._COST)
+        result = mod.stratified_sample(self._build_records(), _sampling_config(3_000), cost_fn=self._COST)
         selected_ids = {r.path.stem for r in result.selected}
         assert {'interactive-1', 'interactive-2'} <= selected_ids
         assert 'recon-1' not in selected_ids
@@ -1262,14 +1224,7 @@ class TestStratifiedSampleRealWorldSizes:
     def _stock_config(self):
         """The shipped budget/sampling numbers, verbatim — the point of these
         tests is that the STOCK configuration works on real session sizes."""
-        return config_mod.LegibilityConfig(
-            project_id='dark_factory',
-            project_root='/home/leo/src/dark-factory',
-            escalation_port=8103,
-            cwd_prefixes=['/home/leo/src/dark-factory'],
-            budgets=config_mod.Budgets(max_daily_digest_bytes=300_000),
-            sampling=config_mod.Sampling(top_fraction=0.12, per_stratum_min=2),
-        )
+        return _sampling_config(300_000)
 
     def _single_stratum(self):
         # Distinct WORD stems, never digits: _normalize_first_turn collapses
@@ -1347,16 +1302,6 @@ class TestStratifiedSampleCostSeam:
         'interactive-b': 4_000,
     }
 
-    def _config(self, max_bytes=100_000):
-        return config_mod.LegibilityConfig(
-            project_id='dark_factory',
-            project_root='/home/leo/src/dark-factory',
-            escalation_port=8103,
-            cwd_prefixes=['/home/leo/src/dark-factory'],
-            budgets=config_mod.Budgets(max_daily_digest_bytes=max_bytes),
-            sampling=config_mod.Sampling(top_fraction=0.12, per_stratum_min=2),
-        )
-
     def _build_records(self):
         """Four candidates across two strata, each 6MB of raw transcript."""
         return [
@@ -1394,7 +1339,7 @@ class TestStratifiedSampleCostSeam:
         # Each record's size_bytes (6MB) alone blows the 100_000 budget, so a
         # non-empty selection is only reachable via the injected cost.
         result = mod.stratified_sample(
-            self._build_records(), self._config(), cost_fn=self._cost,
+            self._build_records(), _sampling_config(100_000), cost_fn=self._cost,
         )
         assert result.selected != []
         assert {r.path.stem for r in result.selected} == set(self._COSTS)
@@ -1402,7 +1347,7 @@ class TestStratifiedSampleCostSeam:
 
     def test_bytes_used_sums_the_injected_cost(self):
         result = mod.stratified_sample(
-            self._build_records(), self._config(), cost_fn=self._cost,
+            self._build_records(), _sampling_config(100_000), cost_fn=self._cost,
         )
         assert result.bytes_used == sum(self._cost(r) for r in result.selected)
         assert result.bytes_used == sum(self._COSTS.values())
@@ -1414,7 +1359,7 @@ class TestStratifiedSampleCostSeam:
         # By raw size_bytes both floors are identical (12MB), so this
         # ordering can only come from the injected cost.
         result = mod.stratified_sample(
-            self._build_records(), self._config(5_000), cost_fn=self._cost,
+            self._build_records(), _sampling_config(5_000), cost_fn=self._cost,
         )
         assert {r.path.stem for r in result.selected} == {'recon-a', 'recon-b'}
         assert result.bytes_used == 3_000
@@ -1430,7 +1375,7 @@ class TestStratifiedSampleCostSeam:
             calls[record.path.stem] = calls.get(record.path.stem, 0) + 1
             return self._cost(record)
 
-        mod.stratified_sample(self._build_records(), self._config(), cost_fn=counting_cost)
+        mod.stratified_sample(self._build_records(), _sampling_config(100_000), cost_fn=counting_cost)
 
         assert calls, 'cost_fn was never invoked'
         assert max(calls.values()) == 1
@@ -1445,7 +1390,7 @@ class TestStratifiedSampleCostSeam:
             return self._COSTS.get(record.path.stem, 1_000)
 
         mod.stratified_sample(
-            self._build_records_with_noise(), self._config(), cost_fn=recording_cost,
+            self._build_records_with_noise(), _sampling_config(100_000), cost_fn=recording_cost,
         )
 
         assert 'recon-zero' not in costed
@@ -1618,14 +1563,7 @@ class TestDigestByteCostFn:
             _scored('boom', 'interactive', mod.SignalCounts.of(tool_error=8),
                     'failing session beta', 900),
         ]
-        cfg = config_mod.LegibilityConfig(
-            project_id='dark_factory',
-            project_root='/home/leo/src/dark-factory',
-            escalation_port=8103,
-            cwd_prefixes=['/home/leo/src/dark-factory'],
-            budgets=config_mod.Budgets(max_daily_digest_bytes=40_000),
-            sampling=config_mod.Sampling(top_fraction=1.0, per_stratum_min=1),
-        )
+        cfg = _sampling_config(40_000, top_fraction=1.0, per_stratum_min=1)
 
         result = mod.stratified_sample(
             records, cfg, cost_fn=mod.digest_byte_cost_fn(max_bytes=15360, build=build),
