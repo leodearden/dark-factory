@@ -610,7 +610,7 @@ def _resolve_deps(
 
 
 def _shape_one_project(
-    project_root: Path,
+    project: str,
     snapshot: TaskSnapshot,
     *,
     now: datetime,
@@ -662,7 +662,6 @@ def _shape_one_project(
     degrade to an honest ``None`` via :func:`_runtime_fields`, which is a
     DIFFERENT fault domain from the task-tree read the snapshot reports on.
     """
-    project = project_label(project_root)
     tasks = snapshot.rows.value or []
     if not tasks:
         return []
@@ -694,7 +693,7 @@ def _shape_one_project(
 
 
 def shape_terminal_rows(
-    project_root: Path,
+    project: str,
     rows: list[dict],
     *,
     now: datetime,
@@ -727,7 +726,6 @@ def shape_terminal_rows(
     ``lower_bound`` state is what tells it the list is a window rather than a
     population.
     """
-    project = project_label(project_root)
     runtime_status = _probe_status(None)
     shaped: list[dict] = []
     for task in rows:
@@ -761,7 +759,9 @@ async def _acquire_and_shape(
     have no provenance, and a snapshot with no rows renders nothing.
     """
     snapshot = await acquire_snapshot(client, config, project_root, now=now)
-    rows = _shape_one_project(project_root, snapshot, now=now, runtime=runtime)
+    rows = _shape_one_project(
+        config.project_labels.of(project_root), snapshot, now=now, runtime=runtime,
+    )
     return rows, snapshot
 
 
@@ -800,6 +800,7 @@ async def _serve_roots_within_budget(
     # _rotated_project_roots. `roots` below is the canonical order the results
     # are re-assembled in.
     roots = config.all_project_roots
+    labels = config.project_labels
     admission_order = _rotated_project_roots(config)
     # Admission control, not a work queue: the coroutines are all created up
     # front and the semaphore decides how many shares are running at once.
@@ -832,7 +833,7 @@ async def _serve_roots_within_budget(
         and how much of it remained, and is then carried verbatim by both the
         WARNING and the unit — one sentence, one place, two readers.
         """
-        label = project_label(root)
+        label = labels.of(root)
         async with slots:
             # AFTER admission, deliberately: a root that queued for a slot has
             # already spent part of the whole-handler budget, and handing it a
@@ -916,15 +917,10 @@ async def _serve_roots_within_budget(
     # assembly code, a CancelledError) must still propagate rather than be
     # silently converted into a result object.
     results = await asyncio.gather(*(_one(root) for root in admission_order))
-    # Keyed by ROOT, never by label. `project_label` is the directory
-    # BASENAME, so two configured roots can share one (``/a/proj`` and
-    # ``/b/proj``) — and a label-keyed dict collapses them, which would emit
-    # the survivor's rows TWICE (duplicate `task_uid`s, the React tab's map
-    # key) and drop the other root's rows entirely. Roots are deduped by
-    # `DashboardConfig.all_project_roots`, so this pairing is total and 1:1;
-    # `strict=True` says so rather than trusting it. (The callers' snapshot dicts are
-    # label-keyed because the wire addresses projects by label; the collision
-    # costs an ENTRY there, never a row.)
+    # Keyed by ROOT, never by label: the root is the identity each result was
+    # produced for, so the pairing holds however the roots are labelled. Roots
+    # are deduped by `DashboardConfig.all_project_roots`, so this pairing is
+    # total and 1:1; `strict=True` says so rather than trusting it.
     by_root = dict(zip(admission_order, results, strict=True))
     return [(root, *by_root[root]) for root in roots]
 
@@ -950,11 +946,8 @@ async def collect_tasks_with_counts(
     A project therefore cannot be named offline while its census says it was
     measured, because there is only one thing to read.
 
-    The entries are keyed by project LABEL, which is the directory basename,
-    so two configured roots sharing one collapse to a single entry. That is
-    pre-existing and deliberate: the label is what the wire and the front end
-    address a project by, and the ROW assembly below is still keyed by root,
-    so no root's rows are lost to the collision.
+    The entries are keyed by project label, unique across the configured roots
+    (see ``dashboard/project_labels.py::ProjectLabels``).
 
     **The units it returns carry the SHAPED rows**, not the raw rows
     ``acquire_snapshot`` cached. Each measured unit comes back with
@@ -1046,13 +1039,14 @@ async def collect_tasks_with_counts(
     # for. Same shape as app.healthz's whole-handler deadline.
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _TASKS_TOTAL_BUDGET
+    labels = config.project_labels
     runtime_by_label = await fetch_task_runtime(client, config.escalation_urls)
 
     async def _share(root: Path) -> tuple[list[dict], TaskSnapshot]:
         return await _acquire_and_shape(
             client, config, root,
             now=effective_now,
-            runtime=runtime_by_label.get(project_label(root)),
+            runtime=runtime_by_label.get(labels.of(root)),
         )
 
     all_active: list[dict] = []
@@ -1065,7 +1059,7 @@ async def collect_tasks_with_counts(
     for root, rows, snapshot in served:
         if snapshot.rows.value is not None:
             snapshot = replace(snapshot, rows=replace(snapshot.rows, value=rows))
-        snapshots[project_label(root)] = snapshot
+        snapshots[labels.of(root)] = snapshot
         all_active.extend(rows)
 
     if resolve_external:
@@ -1163,4 +1157,5 @@ async def collect_census_snapshots(
     served = await _serve_roots_within_budget(
         config, _share, now=effective_now, deadline=deadline,
     )
-    return {project_label(root): snapshot for root, _rows, snapshot in served}
+    labels = config.project_labels
+    return {labels.of(root): snapshot for root, _rows, snapshot in served}

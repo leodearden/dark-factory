@@ -619,7 +619,7 @@ async def test_no_task_row_carries_description_or_details(tmp_path, monkeypatch,
 
     active, snapshots = await collect_tasks_with_counts(client=dummy_client, config=cfg)
     terminal = shape_terminal_rows(
-        root,
+        'prose',
         [task for task in shaped if task['status'] in ('done', 'cancelled')],
         now=datetime.now(UTC),
     )
