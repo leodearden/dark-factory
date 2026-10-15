@@ -75,7 +75,7 @@ import httpx
 from shared.locking import files_to_modules, modules_conflict
 
 from dashboard.config import DashboardConfig
-from dashboard.data.active_tasks import _all_project_roots, collect_tasks_with_counts
+from dashboard.data.active_tasks import collect_tasks_with_counts
 from dashboard.data.mcp_fanout import TTLCache, fanout_label, first_success, project_label
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.task_snapshot import SnapshotHealth, classify
@@ -696,7 +696,7 @@ async def collect_scheduler_state(
 
     # Determine which project roots still need querying
     roots_to_query = [
-        root for root in _all_project_roots(config)
+        root for root in config.all_project_roots
         if project_label(root) not in offline_projects
     ]
 
