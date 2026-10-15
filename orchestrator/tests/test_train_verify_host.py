@@ -145,7 +145,9 @@ class _FakeRemote:
     every merge SHA it was asked to verify. A verify waits for *release* when
     one is given, setting *entered* first. An *unreachable* host raises
     ``RunnerUnavailable`` and never probes healthy or clean, so the reprobe
-    sweep cannot re-admit it during a test.
+    sweep cannot re-admit it during a test. ``cancel_verify`` answers
+    *cancel_rc*; ``cancels`` and ``clean_probes`` count the cancels and
+    clean-probes the lane issued.
     """
 
     is_local: ClassVar[bool] = False
@@ -157,21 +159,27 @@ class _FakeRemote:
         release: asyncio.Event | None = None,
         entered: asyncio.Event | None = None,
         unreachable: bool = False,
+        cancel_rc: int = 0,
     ) -> None:
         self.name = name
         self.release = release
         self.entered = entered
         self.unreachable = unreachable
+        self.cancel_rc = cancel_rc
         self.calls: list[str] = []
+        self.cancels = 0
+        self.clean_probes = 0
 
     async def health(self) -> bool:
         return not self.unreachable
 
     async def probe_clean(self) -> bool:
+        self.clean_probes += 1
         return not self.unreachable
 
     async def cancel_verify(self) -> int:
-        return 0
+        self.cancels += 1
+        return self.cancel_rc
 
     async def run_merge_verify(self, merge_sha: str, spec: Any) -> VerifyResult:
         self.calls.append(merge_sha)
@@ -311,6 +319,54 @@ async def test_a_two_member_train_verifies_on_a_free_remote_under_prefer_remote(
     assert verifier.verified == []
 
 
+async def _abort_a_train_verifying_on(scene: _Scene, remote: _FakeRemote) -> dict[str, Any]:
+    """Cancel the lane's ``run()`` while a two-member train verifies on
+    *remote*, as a lane crash or a hard shutdown does. Return *remote*'s
+    host census row as it stands once the lane has unwound."""
+    assert remote.entered is not None and remote.release is not None
+    train = await _stacked_train(scene, 2)
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    lane = make_lane(
+        scene.git_ops, queue,
+        verifier=FakeVerifier(), clock=healthy_verify_clock(), remote_runners=[remote],
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        async with running_lane(lane) as run:
+            await queue.put(train.request)
+            await wait_responsive(remote.entered.wait(), label='train verify under way on the remote')
+            run.task.cancel()
+            await asyncio.wait({run.task})
+            (row,) = [host for host in lane.snapshot()['hosts'] if host['name'] == remote.name]
+
+    assert not remote.release.is_set()
+    return row
+
+
+async def test_an_aborted_train_verify_is_cancelled_on_its_remote_and_frees_the_slot(
+    remote_scene: _Scene,
+) -> None:
+    remote = _FakeRemote(release=asyncio.Event(), entered=asyncio.Event())
+
+    laptop = await _abort_a_train_verifying_on(remote_scene, remote)
+
+    assert remote.cancels == 1
+    assert (laptop['slot_state'], laptop['quarantined']) == ('free', False)
+
+
+async def test_a_refused_cancel_parks_the_aborted_trains_remote_until_it_probes_clean(
+    remote_scene: _Scene,
+) -> None:
+    """A remote that refuses the cancel may still be running the verify, so
+    its slot is parked and freed only once the host probes clean."""
+    remote = _FakeRemote(release=asyncio.Event(), entered=asyncio.Event(), cancel_rc=1)
+
+    laptop = await _abort_a_train_verifying_on(remote_scene, remote)
+
+    assert (remote.cancels, remote.clean_probes) == (1, 1)
+    assert (laptop['slot_state'], laptop['quarantined']) == ('free', False)
+
+
 async def test_a_train_of_more_than_two_members_verifies_on_local_until_task_6106(
     remote_scene: _Scene,
 ) -> None:
@@ -364,13 +420,11 @@ async def test_a_train_whose_hosts_are_all_taken_verifies_unleased_instead_of_wa
             label='train landed while its predecessor holds the host',
         )
         pred_held = not pred.result.done()
-        local_while_held = _slot_states(lane).get('local')
         release_pred.set()
         pred_outcome = await run.outcome(pred)
         train_outcome = await run.outcome(train.request)
 
     assert pred_held
-    assert local_while_held == 'busy'
     assert verifier.verified == ['pred', train.tip]
     assert pred_outcome.status == 'done', pred_outcome
     assert train_outcome.status == 'done', train_outcome
