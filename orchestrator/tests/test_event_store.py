@@ -1038,6 +1038,27 @@ class TestMergeFinalizedAbsorbing:
         assert store.merge_finalized_absorbing('mr-legacy', cross_run=True) is None
         assert store.merge_finalized_absorbing('mr-l1', cross_run=True) is None
 
+    def test_only_a_list_of_ids_aliases_a_loser_never_a_scalar(self, tmp_path: Path) -> None:
+        store = EventStore(tmp_path / 'runs.db', 'run-A')
+        _emit_finalized(
+            store, request_id='mr-listed', task_id='T', branch='b', state='done',
+            absorbed_request_ids=['mr-l1'],
+        )
+        _emit_finalized(
+            store, request_id='mr-scalar', task_id='T', branch='b', state='done',
+            absorbed_request_ids='mr-l1',
+        )
+        _emit_finalized(
+            store, request_id='mr-scalar-only', task_id='T', branch='b', state='done',
+            absorbed_request_ids='mr-l2',
+        )
+
+        for cross_run in (True, False):
+            row = store.merge_finalized_absorbing('mr-l1', cross_run=cross_run)
+            assert row is not None
+            assert row['request_id'] == 'mr-listed'
+            assert store.merge_finalized_absorbing('mr-l2', cross_run=cross_run) is None
+
     def test_empty_id_returns_none(self, tmp_path: Path) -> None:
         store = EventStore(tmp_path / 'runs.db', 'run-A')
         _emit_finalized(
@@ -1072,7 +1093,10 @@ def _index_names(db_path: Path) -> set[str]:
 
 
 class TestMergeFinalizedIndexes:
-    """Every merge_finalized read seeks a partial index instead of filtering every such row."""
+    """Every merge_finalized read seeks a partial index instead of filtering every such row.
+
+    Plans are read with no sqlite_stat1, as on production's runs.db.
+    """
 
     @pytest.mark.parametrize(
         ('key', 'index', 'latest_only'),
