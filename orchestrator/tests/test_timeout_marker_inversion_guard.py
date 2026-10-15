@@ -521,12 +521,29 @@ def _sanctioned_bindings_in(tree: ast.Module, module: str) -> list[_Binding]:
 class TestVerifyCliBudgetConstant:
     """``VERIFY_CLI_PER_TEST_TIMEOUT`` -- the budget the whole guard is built on.
 
-    Pinned here for the same reason ``PYPROJECT_DEFAULT_TIMEOUT`` is pinned by
-    test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants: a shared
-    timeout constant that merely *claims* in a comment to mirror a config file
-    is drift-prone, and the executable link is what makes the claim true.  This
-    class is that shape one anchor over -- it reads the REAL
-    orchestrator/orchestrator.yaml at runtime instead of citing a line number.
+    A MIRROR PIN, deliberately loud on a retune.  It resembles the live-yaml
+    pins e9d1055ed8 and 5b51fa970b removed, but those read an operational value
+    INCIDENTALLY, through the autouse ``_isolate_orch_config`` layer over
+    dark-factory-orchestrator.yaml, while their subject was a code default or
+    an unrelated premise.  This class's subject IS the constant-to-config
+    relationship: the shape
+    test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants gives
+    ``PYPROJECT_DEFAULT_TIMEOUT``.
+
+    The relationship-only alternative is already asserted from the yaml by
+    :func:`test_the_verify_budget_is_configured`.  The sweep derives its band
+    from the yaml, never from this constant, which is why fused-memory and
+    shared run the same band with no constant and no pin.  What the equality
+    adds is the CONSTANT's honesty, which other checks rest on: the
+    ``faulthandler_timeout`` bound in TestTimeoutConstants, the deep-scene
+    ``test_the_timeout_never_inverts_the_verify_budget`` floors, and every
+    marker that spells the name.  On an upward retune the sweep goes red anyway,
+    over every site spelling this name, and its remedy names the spelling those
+    sites already use; this is the one red test whose message names the fix.
+
+    Skip or xfail on disagreement was rejected as silent degradation.  The
+    ``--timeout`` lives in a tracked merge-verify config whose own verify runs
+    this test, so a retune moves the constant in the same commit.
     """
 
     def test_the_inversion_band_is_non_empty(self) -> None:
@@ -539,14 +556,9 @@ class TestVerifyCliBudgetConstant:
         not because nothing does.  Asserted rather than assumed: the upper edge
         mirrors a config file that moves independently.
 
-        THIS EXACT COLLAPSE HAPPENED ONCE (2026-09-12, commit 64e24b547f), back
-        when the lower edge mirrored the ini default and that default was
-        raised 60 -> 300 fleet-wide.  That default has since moved AGAIN, to 540
-        (2026-09-17, task 5442, this time derived from measurement rather than
-        picked) -- so had the edge stayed a mirror it would now sit ABOVE the
-        upper one and invert the band rather than merely emptying it.  See
-        shared/src/shared/testing_timeout_markers.py::DELIBERATE_TIGHT_BOUND_CEILING
-        for why the edge is a literal.
+        The lower edge once mirrored the ini default and collapsed with it
+        (64e24b547f); why it is now a literal:
+        shared/src/shared/testing_timeout_markers.py::DELIBERATE_TIGHT_BOUND_CEILING.
         """
         assert DELIBERATE_TIGHT_BOUND_CEILING < VERIFY_CLI_PER_TEST_TIMEOUT, (
             f'the inversion band ({DELIBERATE_TIGHT_BOUND_CEILING}, '
@@ -559,15 +571,14 @@ class TestVerifyCliBudgetConstant:
     def test_constant_mirrors_the_real_verify_test_command(self) -> None:
         """``VERIFY_CLI_PER_TEST_TIMEOUT`` must equal the ``--timeout`` verify really passes.
 
-        THE DRIFT PIN.  The constant is deliberately a literal ``300`` rather
-        than an expression over ``PYPROJECT_DEFAULT_TIMEOUT`` (see its comment
-        in _orch_helpers.py), which means nothing about the Python source keeps
-        it honest.  THIS test is what does: it re-reads
-        ``orchestrator/orchestrator.yaml``'s ``test_command`` and extracts the
-        ``--timeout`` token that pytest-timeout will actually see as
-        ``config._env_timeout``.  If an operator retunes that flag, the band's
-        upper edge moves with it and this fails loudly instead of leaving the
-        guard silently policing a budget nobody passes any more.
+        THE DRIFT PIN.  The constant is deliberately a literal, which means
+        nothing about the Python source keeps it honest.  THIS test is what
+        does: it re-reads ``orchestrator/orchestrator.yaml``'s ``test_command``
+        and extracts the ``--timeout`` token that pytest-timeout will actually
+        see as ``config._env_timeout``.  If an operator retunes that flag, the
+        sweep's band moves with it, because the sweep reads the yaml; what goes
+        stale is the CONSTANT, and every marker and assertion built on it.
+        This fails loudly so the constant moves too.
         """
         test_command = _verify_test_command()
 
@@ -584,11 +595,12 @@ class TestVerifyCliBudgetConstant:
         assert configured == VERIFY_CLI_PER_TEST_TIMEOUT, (
             f'VERIFY_CLI_PER_TEST_TIMEOUT ({VERIFY_CLI_PER_TEST_TIMEOUT}) no '
             f'longer mirrors --timeout={configured} in {_ORCH_YAML}. Update the '
-            'constant in orchestrator/tests/_orch_helpers.py -- the inversion '
-            'band this module polices is (DELIBERATE_TIGHT_BOUND_CEILING, '
-            'VERIFY_CLI_PER_TEST_TIMEOUT), so a stale upper edge either lets a '
-            'genuinely-inverting marker through or manufactures false '
-            'offenders.'
+            'constant in orchestrator/tests/_orch_helpers.py. Until then every '
+            'marker spelled VERIFY_CLI_PER_TEST_TIMEOUT is judged at the stale '
+            "value against the yaml's budget, so a raise reports them all as "
+            'offenders, and the assertions built on the constant check a '
+            'budget verify no longer passes. Why this red is deliberate: '
+            "TestVerifyCliBudgetConstant's docstring."
         )
 
 
