@@ -13,9 +13,12 @@ from _fm_helpers import _make_rate_limit_error
 from _mem0_record_shapes import mem0_record
 from _qdrant_responses import missing_collection_404
 from qdrant_client.http.exceptions import UnexpectedResponse
+from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, escalation_queue_dir
 
+from fused_memory.config.schema import TaskmasterConfig
+from fused_memory.middleware import mem0_update_storm_escalator as storm_mod
 from fused_memory.models.enums import MemoryCategory, SourceStore
-from fused_memory.models.scope import Scope
+from fused_memory.models.scope import Scope, resolve_project_id_for_root
 from fused_memory.services import memory_service
 from fused_memory.services.memory_service import (
     MemoryService,
@@ -51,9 +54,18 @@ DEFAULT_POINT_PAYLOAD = {
 @pytest.fixture
 def service(mock_config):
     """MemoryService with mocked backends (no real DB needed)."""
+    return _mocked_service(mock_config)
+
+
+def _mocked_service(config) -> MemoryService:
+    """Build a MemoryService over *config* with mocked backends.
+
+    The ``service`` fixture's body, callable from a test body so a test can
+    set the environment BEFORE the service is constructed.
+    """
     from _fm_helpers import install_identity_mocks
 
-    svc = MemoryService(mock_config)
+    svc = MemoryService(config)
     # Mock backends
     svc.graphiti = MagicMock()
     svc.graphiti.search = AsyncMock(return_value=[])
@@ -2836,12 +2848,98 @@ class TestUpdateMemoryStormCounter:
 
         assert isinstance(service._mem0_update_storm_escalator, Mem0UpdateStormEscalator)
 
-    def test_set_known_projects_reaches_the_escalator(self, service):
-        """The registry snapshot must arrive where project_root resolution happens."""
-        service.set_known_projects({'dark_factory': '/home/leo/src/dark-factory'})
-        assert service._mem0_update_storm_escalator._known_projects == {
-            'dark_factory': '/home/leo/src/dark-factory',
-        }
+
+@pytest.mark.skipif(
+    not storm_mod.HAS_ESCALATION,
+    reason='escalation package not installed in this environment',
+)
+class TestUpdateMemoryStormFilesIntoTheProjectQueue:
+    """An update_memory burst lands as a record in the right project's queue.
+
+    Drives the REAL escalator into real queue files under tmp_path through the
+    public surface, so it fails whichever link breaks: the registry seed, its
+    forwarding to the escalator, or the project_id -> root resolution.
+    """
+
+    AGENT = 'recon-stage-memory_consolidator'
+
+    @staticmethod
+    def _filed(root):
+        queue_files = sorted(escalation_queue_dir(root).glob('esc-*.json'))
+        return [json.loads(path.read_text()) for path in queue_files]
+
+    async def _amend(self, service, project_id, times):
+        for _ in range(times):
+            await service.update_memory(
+                memory_id='point-1', project_id=project_id,
+                content='amended text', reason='consolidation',
+                agent_id=self.AGENT,
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_never_wired_service_files_into_an_env_registered_root(
+        self, mock_config, monkeypatch, tmp_path,
+    ):
+        """The alarm defends itself: startup wiring is not its only registry source."""
+        root = tmp_path / 'storm_proj'
+        root.mkdir()
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, str(root))
+        service = _mocked_service(mock_config)
+        service.config.mem0_update.storm_threshold = 3
+
+        await self._amend(service, resolve_project_id_for_root(root), times=3)
+
+        filed = self._filed(root)
+        assert len(filed) == 1, filed
+        assert filed[0]['category'] == 'mem0_in_place_update_storm'
+        assert self.AGENT in filed[0]['summary']
+
+    @pytest.mark.asyncio
+    async def test_startup_wiring_replaces_the_env_seed(
+        self, mock_config, monkeypatch, tmp_path,
+    ):
+        """The startup snapshot wins over the seed, and the setter reaches the escalator."""
+        root_env = tmp_path / 'seeded' / 'storm_proj'
+        root_env.mkdir(parents=True)
+        root_wired = tmp_path / 'wired'
+        root_wired.mkdir()
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, str(root_env))
+        service = _mocked_service(mock_config)
+        service.config.mem0_update.storm_threshold = 3
+        project_id = resolve_project_id_for_root(root_env)
+
+        service.set_known_projects({project_id: str(root_wired)})
+        await self._amend(service, project_id, times=3)
+
+        assert len(self._filed(root_wired)) == 1
+        assert self._filed(root_env) == []
+
+    @pytest.mark.asyncio
+    async def test_the_seed_never_consults_taskmaster_project_root(
+        self, mock_config, tmp_path, caplog,
+    ):
+        """taskmaster.project_root defaults to '.', so seeding from it would misfile.
+
+        With no env registry the burst must be logged and filed nowhere, even
+        into a real directory the config names.
+        """
+        primary = tmp_path / 'primary_proj'
+        primary.mkdir()
+        mock_config.taskmaster = TaskmasterConfig(project_root=str(primary))
+        service = _mocked_service(mock_config)
+        service.config.mem0_update.storm_threshold = 3
+        project_id = resolve_project_id_for_root(primary)
+
+        with caplog.at_level(logging.WARNING, logger=storm_mod.__name__):
+            await self._amend(service, project_id, times=3)
+
+        assert self._filed(primary) == []
+        assert any(
+            record.name == storm_mod.__name__
+            and record.levelno == logging.WARNING
+            and project_id in record.getMessage()
+            for record in caplog.records
+        ), [record.getMessage() for record in caplog.records]
 
 
 class TestUpdateEdgeVerification:
