@@ -794,7 +794,13 @@ class TaskArtifacts:
     def update_step_status(
         self, step_id: str, status: str, commit: str | None = None
     ) -> None:
-        """Update ONLY status and commit fields in plan.json. Structure is immutable."""
+        """Update ONLY the status and commit fields of one step in plan.json.
+
+        Plan structure changes only through the architect-role revalidation
+        tools (``orchestrator/mcp/plan_tools.py::_remove_plan_step`` /
+        ``::_replace_plan_step``), and only on steps that are not done.
+        Per-step deviation records go through :meth:`append_step_deviation`.
+        """
         plan = self.read_plan()
 
         for collection in ('prerequisites', 'steps'):

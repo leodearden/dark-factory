@@ -1657,6 +1657,12 @@ def _confirm_plan(
     # mid-build — the workflow routes that partial to a completion pass instead
     # of discarding it.  ``_revalidated_at`` is retained for revalidation-age
     # checks (see workflow._can_skip_revalidation).
+    #
+    # ``_finalized_at`` dates the LAST confirm: every re-confirm, revalidation
+    # and amendment re-confirms included, overwrites it.  ``_created_at``,
+    # stamped by ``orchestrator/artifacts.py::TaskArtifacts.stamp_plan_provenance``,
+    # is a post-hoc provenance stamp and is always later.  Neither dates the
+    # moment the plan was first frozen.
     plan['_finalized_at'] = now
     plan['_revalidated_at'] = now
     artifacts.write_plan(plan)
@@ -2578,7 +2584,8 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         Stamps a durable completeness marker on the plan. A plan WITHOUT this
         marker is treated as incomplete: it will not advance to execution, and
         a later session may resume and finish it. Requires a non-empty steps
-        and files list.
+        and files list. The stamp records the time of the most recent confirm,
+        overwritten by every re-confirm, not when the plan was first frozen.
         """
         return _confirm_plan(artifacts)
 
