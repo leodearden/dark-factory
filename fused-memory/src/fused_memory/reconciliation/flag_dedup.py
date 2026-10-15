@@ -31,8 +31,8 @@ agreement with this module rather than allowed to go stale.
 Ledger-backed marker UPSERT (task 2227)
 ----------------------------------------
 ``dedup_flags`` is the entry point.  For each flag with a computable
-signature — ``(task_id, flag_type)`` via ``compute_flag_signature``,
-falling back to ``compute_content_fingerprint_signature`` for null-task_id
+signature — ``(task_id, flag_type)`` via ``compute_marker_signature``, which
+falls back to ``compute_content_fingerprint_signature`` for null-task_id
 flags lacking ``cited_tasks`` — the corresponding ``stage1_flag_marker``
 row is looked up via ``get_by_identity(project_id, 'stage1_flag_marker',
 task_id, flag_type, run_id='')``.  Note ``run_id=''`` in the identity: the
@@ -57,14 +57,15 @@ that cycle (task 4864).  Neither is persisted.  The sanitizing now serves
 the gate's input validation alone — an unserialisable or malformed
 LLM-authored citation must never reach the resolver — not a payload write.
 
-**Invariant (task 4712):** no INPUT to :func:`compute_flag_signature` may be
+**Invariant (task 4712):** no INPUT to :func:`compute_marker_signature` may be
 persisted in the marker payload as durable cross-cycle state.
-:func:`compute_flag_signature` folds every ``cited_tasks`` entry's
-``task_id`` into the row's own key (see its "cited_tasks union" section
-below), so a value derived from citations is unconditionally stored in a row
-keyed by itself — reachable only when a LATER cycle happens to present the
-IDENTICAL citation set, in which case that cycle's own citation already
-resolves the gate and the anchor adds nothing.  A prior version of this
+:func:`compute_marker_signature` folds every ``cited_tasks`` entry's
+``task_id`` into the row's own key (see :func:`compute_flag_signature`'s
+"cited_tasks union" section below), so a value derived from citations is
+unconditionally stored in a row keyed by itself — reachable only when a
+LATER cycle happens to present the IDENTICAL citation set, in which case
+that cycle's own citation already resolves the gate and the anchor adds
+nothing.  A prior version of this
 module persisted the UNION of the prior row's anchor and the current cycle's
 citations (``_union_cited_tasks``, now deleted) specifically to survive
 citation-less cycles; measured evidence disproved it —
@@ -307,6 +308,8 @@ because the ledger is absent.
 Public API
 ----------
 - ``compute_flag_signature(flag)`` — cheap, sync, no I/O.
+- ``compute_marker_signature(flag, *, project_id)`` — cheap, sync, no I/O;
+  the ``stage1_flag_marker`` ledger identity of *flag* in *project_id*.
 - ``compute_content_fingerprint_signature(flag)`` — cheap, sync, no I/O;
   fallback signature for null-task_id flags lacking ``cited_tasks``.
 - ``canonical_flag_type_family(flag_type)`` — cheap, sync, no I/O;
@@ -1443,17 +1446,17 @@ async def dedup_flags(
 
     For each flag in *flags*:
 
-    - Signature is computed first via ``compute_flag_signature(flag)``
-      (keyed on top-level task_id or cited_tasks fallback).  When that returns
-      None, ``compute_content_fingerprint_signature(flag)`` is tried as a
-      fallback (task-1654 Fix 2) for null-task_id flags lacking cited_tasks.
-      Only when BOTH helpers return None is the flag returned unchanged — no
-      I/O performed.
+    - Signature is ``compute_marker_signature(flag, project_id=project_id)``:
+      the top-level task_id / cited_tasks union, a foreign cited id qualified
+      as ``'<project>:<id>'``, with the content-fingerprint fallback
+      (task-1654 Fix 2) for null-task_id flags lacking cited_tasks.  When it
+      returns None the flag is returned unchanged — no I/O performed.
     - If a signature is computable, the resulting ``task_id`` (``tid``) is
       validated by ``_is_valid_marker_task_id``.  This guard accepts numeric
-      keys, comma-joined integer lists, and canonical ``fp:+32-hex`` content-
-      fingerprint keys (task-1670 Option A); it rejects only genuinely-invalid
-      tids (empty string, malformed ``fp:`` variants, non-numeric strings, etc.).
+      keys, comma-joined lists of integers or ``'<project>:<digits>'``
+      components, and canonical ``fp:+32-hex`` content-fingerprint keys
+      (task-1670 Option A); it rejects only genuinely-invalid tids (empty
+      string, malformed ``fp:`` variants, non-numeric strings, etc.).
       When rejected the flag is returned unchanged and no ledger I/O is performed.
     - A flag explicitly marked ``flag_for_stage2=False`` (per
       :func:`_is_completion_flag`) is a ONE-TIME completion marker: see
@@ -1530,7 +1533,7 @@ async def dedup_flags(
       ``get_tasks`` calls, and every foreign project's backlog is fetched at
       most once per ``dedup_flags`` call.
     * **The discovered citation NEVER touches the flag or the payload.**
-      ``compute_flag_signature`` read ``cited_tasks`` at the top of the loop
+      ``compute_marker_signature`` read ``cited_tasks`` at the top of the loop
       and folds them into the marker row's KEY, so writing a discovered
       citation back would RELOCATE the row instead of annotating it; under a
       HIT-only gate the relocated cycle is a MISS, and because discovery
@@ -2341,6 +2344,9 @@ async def write_suppression_record(
 def compute_flag_signature(flag: dict[str, Any]) -> tuple[str, str] | None:
     """Return a (task_id_str, flag_type_str) signature for *flag*, or ``None``.
 
+    This is the project-agnostic in-run signature; a flag's ledger identity is
+    :func:`compute_marker_signature`.
+
     Both ``task_id`` and ``flag_type`` must be present (i.e. not ``None``) for
     a signature to be computed.  Values are coerced to ``str`` so that an
     integer task_id (common in LLM output) and a string task_id compare equal.
@@ -2526,12 +2532,16 @@ def _is_valid_marker_task_id(tid: str) -> bool:
     - A comma-joined list of non-negative integers (e.g. ``'12,15'``), which is
       the shape produced by :func:`compute_flag_signature`'s ``cited_tasks``
       fallback for multi-task findings.
+    - Any of those components written ``'<project>:<digits>'`` (e.g.
+      ``'12,reify:650'``), the foreign cited id :func:`compute_marker_signature`
+      emits; the project half must pass ``validate_project_id``.
 
     Rejects:
     - Falsy / empty input.
     - Malformed fp: forms: ``'fp:'`` (no hex), too-short or too-long hex bodies,
       uppercase hex, non-hex characters in the body.
-    - Any component that is not a non-negative integer after strip (numeric path).
+    - Any component that is neither a non-negative integer nor
+      ``'<project>:<digits>'`` after strip.
     - Trailing/leading commas that yield empty components (e.g. ``'12,'``).
 
     Mirrors the codebase's canonical isdigit-based, dot-rejecting task-id
@@ -5062,10 +5072,9 @@ async def acknowledge_resolved_flags(
     """Best-effort batch acknowledgment entry point for a list of resolved flags.
 
     For each flag in *resolved_flags*, computes its signature exactly as
-    ``dedup_flags`` does — :func:`compute_flag_signature` first, falling back to
-    :func:`compute_content_fingerprint_signature` — and delegates to
-    :func:`acknowledge_flag_marker` for the ``(task_id, flag_type)`` pair.
-    Flags for which both signature helpers return ``None`` are skipped (no I/O).
+    ``dedup_flags`` does — :func:`compute_marker_signature` in *project_id* —
+    and delegates to :func:`acknowledge_flag_marker` for the ``(task_id,
+    flag_type)`` pair.  Flags with no signature are skipped (no I/O).
 
     Signatures are de-duplicated (order-preserving) BEFORE dispatch: two flags
     reducing to the same ``(task_id, flag_type)`` — e.g. two ``stale_metadata``
