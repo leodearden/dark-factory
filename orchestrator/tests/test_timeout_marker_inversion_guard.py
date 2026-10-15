@@ -2068,6 +2068,14 @@ def _verdict() -> InversionVerdict:
     )
 
 
+def test_the_verify_budget_is_configured() -> None:
+    """The yaml's own ``--timeout`` must leave the band non-empty, read from the
+    yaml and never from ``VERIFY_CLI_PER_TEST_TIMEOUT``.
+    """
+    failure = _verdict().budget_failure
+    assert failure is None, failure
+
+
 def test_no_timeout_marker_sits_in_the_inversion_band() -> None:
     """No marker anywhere under this directory may sit in the inversion band.
 
