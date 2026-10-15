@@ -537,6 +537,15 @@ def select_due_retries(
     return tuple(due[:limit])
 
 
+def due_retries(doc, *, today: date) -> tuple[date, ...]:
+    """The owed dates a recorded document makes due now, per :func:`select_due_retries`."""
+    if not isinstance(doc, dict):
+        return ()
+    return select_due_retries(
+        parse_retry_backlog(doc.get('retry_backlog')), today=today
+    )
+
+
 def _serialize_retry_backlog(backlog: Mapping[date, int]) -> dict[str, int]:
     return {owed.isoformat(): backlog[owed] for owed in sorted(backlog)}
 
