@@ -150,7 +150,7 @@ own checkout (`shared.project_layout.default_project_root` is banned in `client_
    carry it; the portal refuses a feed whose `project_id` is not the one it expected (B4).
 9. **Event types (FEED_VERSION "1.0"):** `heartbeat`, `factory_state`, `prd_upserted`,
    `task_upserted`, `task_phase`, `verify_run`, `test_results`, `merge_landed`, `branch_snapshot`,
-   `tree_snapshot`, `file_revealed`, `reveal_refused`, `criteria_results`. A new type is a minor
+   `tree_snapshot`, `file_revealed`, `reveal_refused`, `criteria_results`, `criteria_declared`. A new type is a minor
    version; a changed field a major one. The portal ignores unknown types and refuses an unknown major.
 10. **Never hide red, from recorded sources.** A failed verify is `verify_run.passed == false`; a
     blocked task is `task_upserted` with that status and `waiting_on: leo` when an open escalation
@@ -241,6 +241,7 @@ corrupt feed. Events with a natural key (`task_upserted.task_id`, `prd_upserted.
 | `file_revealed` | `path`, `commit`, `lines`, `content`, `deleted: bool`, `renamed_from` | `git cat-file blob` | on grant, and on an advance that changes the blob |
 | `reveal_refused` | `path`, `reason` (§4.13) | budget | per refused request |
 | `criteria_results` | `run_kind: verify\|staging`, `commit`, `run_at`, `results: [{id, outcome: passed\|failed\|not_run, tests: [id]}]` | the junit join for `verify`; the CLI's file in `out/` for `staging` | when the newest result of a run kind changes |
+| `criteria_declared` | `criteria: [{id, prd, capability, statement, kind}]` | `acceptance/criteria.yaml` | on start and whenever the file's content hash changes (added 2026-10-15 at the portal PRD's ask: results carry ids only) |
 
 `kind` for a tree file: `test` if the path matches `test_globs` (default `**/tests/**`, `**/test_*.py`,
 `**/*_test.py`, `**/conftest.py`), `docs` if `**/*.md`, `docs/**`, else `production`; files matching
@@ -260,7 +261,7 @@ phase, since}], branches, tree, revealed: [{path, commit, lines}], criteria: {ru
 
 ### 7.5 `in/engagement.json` (portal → publisher)
 
-`{engagement_version: int, project_id, stage, delivered_commit: str|null}`. Missing or unparsable: the
+`{engagement_version: int, project_id, stage: str, delivered_commit: str|null}` (`stage` is a plain string here; its enum's home is the portal). Missing or unparsable: the
 publisher runs with reveals disabled and names it in `heartbeat.degraded`.
 
 ### 7.6 Publisher policy (`~/.config/client-feed/<name>.yaml`, factory-side)
@@ -365,7 +366,11 @@ Review issue text (counts only, θ). Test evidence for non-pytest projects. Cost
 escalation text (never shown). A second feed transport. Per-person links. Failing-test message text
 (open in the design note; exception type only here).
 
-## 12. Open questions (tactical)
+## 12. Amendments
+
+- 2026-10-15, from the portal PRD session (`~/src/scoping-intake/docs/prds/client-portal.md`, tasks 45–56, with 54 → `dark_factory:6966` and 56 → `dark_factory:6973`): `criteria_declared` event (α, ε); `stage` as `str` (α); out/ files group-readable 0640 (γ, task 6970); the portal's `in-v1` fixture vendored by δ (6971); a committed B22 snapshot fixture for the portal's κ (ζ, 6973). Task details amended accordingly.
+
+## 13. Open questions (tactical)
 
 1. **Tree-snapshot cost on large repos.** Suggested: snapshot only on head change; blob line counts
    cached by sha in `cursor.json`; last-change dates from the commits walked since the previous
