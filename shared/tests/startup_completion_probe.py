@@ -81,30 +81,27 @@ from typing import IO, Any, Literal, NamedTuple
 
 # Allow execution as a bare script (``python tests/startup_completion_probe.py``)
 # as well as import from a pytest run, mirroring shared/tests/conftest.py.
-_TESTS_DIR = Path(__file__).resolve().parent
-_SRC_DIR = _TESTS_DIR.parent / 'src'
-for _p in (str(_TESTS_DIR), str(_SRC_DIR)):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
-import startup_completion_fixtures as _scf  # noqa: E402  (isort: after src bootstrap)
-from _oauth_accounts import (  # noqa: E402  (isort: after tests-dir bootstrap)
+import startup_completion_fixtures as _scf
+from _oauth_accounts import (
     ALL_TOKEN_LETTERS,
     first_available_token,
 )
 
-from shared.cli_invoke import (  # noqa: E402
+from shared.cli_invoke import (
     _resolve_transcript_path,
     count_transcript_turns,
     read_transcript_records,
 )
-from shared.config_dir import (  # noqa: E402
+from shared.config_dir import (
     CONFIG_DIR_PREFIX,
     TaskConfigDir,
     sweep_stale_pid_dirs,
     sweep_stale_pid_dirs_once,
 )
-from shared.proc_group import read_stat_fields  # noqa: E402
+from shared.proc_group import read_stat_fields
 
 MODES = ('healthy', 'build_wedge', 'uv_wedge', 'mcp_wedge', 'replay')
 
