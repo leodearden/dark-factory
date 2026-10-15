@@ -146,8 +146,9 @@ class _FakeRemote:
     one is given, setting *entered* first. An *unreachable* host raises
     ``RunnerUnavailable`` and never probes healthy or clean, so the reprobe
     sweep cannot re-admit it during a test. ``cancel_verify`` answers
-    *cancel_rc*; ``cancels`` and ``clean_probes`` count the cancels and
-    clean-probes the lane issued.
+    *cancel_rc*. ``live`` is set while a verify runs, as ``RemoteRunner``'s
+    in-flight id is; ``cancels`` records whether each remote cancel found a
+    verify still live to abort, and ``clean_probes`` counts clean-probes.
     """
 
     is_local: ClassVar[bool] = False
@@ -167,7 +168,8 @@ class _FakeRemote:
         self.unreachable = unreachable
         self.cancel_rc = cancel_rc
         self.calls: list[str] = []
-        self.cancels = 0
+        self.live = False
+        self.cancels: list[bool] = []
         self.clean_probes = 0
 
     async def health(self) -> bool:
@@ -178,21 +180,25 @@ class _FakeRemote:
         return not self.unreachable
 
     async def cancel_verify(self) -> int:
-        self.cancels += 1
+        self.cancels.append(self.live)
         return self.cancel_rc
 
     async def run_merge_verify(self, merge_sha: str, spec: Any) -> VerifyResult:
         self.calls.append(merge_sha)
         if self.unreachable:
             raise RunnerUnavailable(f'{self.name} is unreachable')
-        if self.entered is not None:
-            self.entered.set()
-        if self.release is not None:
-            await self.release.wait()
-        return VerifyResult(
-            passed=True, test_output='', lint_output='', type_output='',
-            summary=f'green on {self.name}',
-        )
+        self.live = True
+        try:
+            if self.entered is not None:
+                self.entered.set()
+            if self.release is not None:
+                await self.release.wait()
+            return VerifyResult(
+                passed=True, test_output='', lint_output='', type_output='',
+                summary=f'green on {self.name}',
+            )
+        finally:
+            self.live = False
 
 
 def _slot_states(lane: MergeLane) -> dict[str, str]:
@@ -319,10 +325,18 @@ async def test_a_two_member_train_verifies_on_a_free_remote_under_prefer_remote(
     assert verifier.verified == []
 
 
-async def _abort_a_train_verifying_on(scene: _Scene, remote: _FakeRemote) -> dict[str, Any]:
+@dataclasses.dataclass(frozen=True)
+class _Unwound:
+    """A remote's host census row, and whether its verify was still live,
+    read the moment a cancelled lane's ``run()`` finished."""
+
+    host: dict[str, Any]
+    verify_live: bool
+
+
+async def _abort_a_train_verifying_on(scene: _Scene, remote: _FakeRemote) -> _Unwound:
     """Cancel the lane's ``run()`` while a two-member train verifies on
-    *remote*, as a lane crash or a hard shutdown does. Return *remote*'s
-    host census row as it stands once the lane has unwound."""
+    *remote*, as a lane crash or a hard shutdown does."""
     assert remote.entered is not None and remote.release is not None
     train = await _stacked_train(scene, 2)
     queue: asyncio.Queue[Any] = asyncio.Queue()
@@ -336,22 +350,30 @@ async def _abort_a_train_verifying_on(scene: _Scene, remote: _FakeRemote) -> dic
             await queue.put(train.request)
             await wait_responsive(remote.entered.wait(), label='train verify under way on the remote')
             run.task.cancel()
-            await asyncio.wait({run.task})
+            await wait_responsive(asyncio.wait({run.task}), label='lane run() unwound')
             (row,) = [host for host in lane.snapshot()['hosts'] if host['name'] == remote.name]
+            unwound = _Unwound(host=row, verify_live=remote.live)
 
     assert not remote.release.is_set()
-    return row
+    return unwound
 
 
-async def test_an_aborted_train_verify_is_cancelled_on_its_remote_and_frees_the_slot(
+async def test_cancelling_a_train_mid_verify_aborts_its_remote_verify_while_it_is_live(
     remote_scene: _Scene,
 ) -> None:
+    """A train's verify runs inline in the merger, so cancelling the lane must
+    abort the remote verify through the worker's teardown chokepoint before
+    the local verify unwinds, and then free the slot."""
     remote = _FakeRemote(release=asyncio.Event(), entered=asyncio.Event())
 
-    laptop = await _abort_a_train_verifying_on(remote_scene, remote)
+    unwound = await _abort_a_train_verifying_on(remote_scene, remote)
 
-    assert remote.cancels == 1
-    assert (laptop['slot_state'], laptop['quarantined']) == ('free', False)
+    assert remote.cancels[:1] == [True], (
+        'the abort must precede the local cancel, or the remote verify-merge '
+        f'process is orphaned (task 1757); cancels found live: {remote.cancels}'
+    )
+    assert unwound.verify_live is False
+    assert (unwound.host['slot_state'], unwound.host['quarantined']) == ('free', False)
 
 
 async def test_a_refused_cancel_parks_the_aborted_trains_remote_until_it_probes_clean(
@@ -361,10 +383,10 @@ async def test_a_refused_cancel_parks_the_aborted_trains_remote_until_it_probes_
     its slot is parked and freed only once the host probes clean."""
     remote = _FakeRemote(release=asyncio.Event(), entered=asyncio.Event(), cancel_rc=1)
 
-    laptop = await _abort_a_train_verifying_on(remote_scene, remote)
+    unwound = await _abort_a_train_verifying_on(remote_scene, remote)
 
-    assert (remote.cancels, remote.clean_probes) == (1, 1)
-    assert (laptop['slot_state'], laptop['quarantined']) == ('free', False)
+    assert remote.clean_probes == 1
+    assert (unwound.host['slot_state'], unwound.host['quarantined']) == ('free', False)
 
 
 async def test_a_train_of_more_than_two_members_verifies_on_local_until_task_6106(
