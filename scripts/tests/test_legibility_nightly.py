@@ -4262,6 +4262,13 @@ def _streak_escalations(calls):
     ]
 
 
+def _testproj_state() -> dict:
+    """The state document the real recorder last wrote for 'testproj'."""
+    status, doc = trickle_state.load_state(trickle_state.trickle_state_path('testproj'))
+    assert status == 'ok' and doc is not None, f'no readable state: {status!r}'
+    return doc
+
+
 class _NightRunner:
     """Drive REAL consecutive run_nightly calls against one repo, so the
     streak is built by the actual pipeline + recorder rather than a
@@ -4311,12 +4318,7 @@ class _NightRunner:
 
     def recorded(self):
         """The state document the REAL recorder just wrote for this run."""
-        status, doc = trickle_state.load_state(
-            trickle_state.trickle_state_path('testproj')
-        )
-        assert (status, doc) != ('missing', None), 'no run recorded yet'
-        assert doc is not None
-        return doc
+        return _testproj_state()
 
 
 class TestBarrenStreakEscalation:
@@ -4515,6 +4517,85 @@ class TestBarrenStreakEscalation:
             f'a quiet project must post NOTHING however long it stays quiet; '
             f'got {runner.escalations!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 5678: an unfinished night's date enters the retry backlog
+# ---------------------------------------------------------------------------
+
+class TestScheduledPassRetryBacklog:
+    """A scheduled pass that did not finish leaves its date owed; one that
+    finished reports which owed dates to retry next."""
+
+    def test_a_storming_night_enters_the_backlog(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+
+        runner.night(13, 'storm')
+
+        assert runner.recorded()['retry_backlog'] == {'2026-07-13': 1}
+
+    def test_a_capped_night_exits_clean_and_still_enters_the_backlog(self, tmp_path):
+        result, _repo = _run_e2e_nightly(tmp_path, branch='capped')
+
+        assert result.exit_code == 0
+        doc = _testproj_state()
+        assert doc['capped'] is True
+        assert doc['retry_backlog'] == {'2026-07-13': 1}
+
+    def test_a_finished_night_reports_the_owed_date(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'storm')
+
+        productive = runner.night(14, 'productive')
+
+        assert productive.exit_code == 0
+        assert productive.retry_due == (date(2026, 7, 13),)
+
+    def test_an_unfinished_night_schedules_no_retry(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'storm')
+
+        stormed = runner.night(14, 'storm')
+
+        assert stormed.retry_due == ()
+        assert runner.recorded()['retry_backlog'] == {'2026-07-13': 1, '2026-07-14': 1}
+
+    def test_a_finished_night_with_nothing_owed_schedules_no_retry(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+
+        productive = runner.night(13, 'productive')
+
+        assert productive.exit_code == 0
+        assert productive.retry_due == ()
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason='root ignores permission bits')
+    def test_a_night_that_raises_enters_the_backlog(self, tmp_path):
+        result, _repo = _run_e2e_nightly(tmp_path, unreadable_transcripts=True)
+
+        assert result.exit_code == 1
+        assert result.retry_due == ()
+        assert _testproj_state()['retry_backlog'] == {'2026-07-13': 1}
+
+    def test_a_project_id_whose_config_does_not_load_enters_the_backlog(
+        self, tmp_path, monkeypatch,
+    ):
+        _write_unloadable_config(tmp_path / 'proj', project_id='testproj')
+        monkeypatch.setenv('LEGIBILITY_SEARCH_ROOTS', str(tmp_path))
+
+        with pytest.raises(FileNotFoundError):
+            nightly.run_nightly(
+                project_id='testproj', target_date=date(2026, 7, 13),
+                now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC),
+            )
+
+        assert _testproj_state()['retry_backlog'] == {'2026-07-13': 1}
+
+    def test_the_recorder_seam_receives_capped(self, tmp_path):
+        recorder, calls = _recorder_spy()
+
+        _run_e2e_nightly(tmp_path, branch='capped', recorder=recorder)
+
+        assert calls[0][0]['capped'] is True
 
 
 # ---------------------------------------------------------------------------
