@@ -829,14 +829,7 @@ class TaskArtifacts:
         ``commit``, ``type`` and ``description`` are never touched, so
         :meth:`update_step_status` stays "status and commit only".
 
-        Known limit, accepted per ``plans/plan-deviation-recording-prd.md``
-        D4: the record's prose fields sit two levels deep
-        (``steps[i].deviations[j].observed``), while
-        ``orchestrator/mcp/plan_tools.py::_REPAIRABLE_PLAN_FIELDS`` and
-        ``::_walk_repairable`` address one level. The fields get inbound
-        ``MarkupGuardMiddleware`` coverage but no stored-damage repair.
-        ``_normalize_plan`` and ``plan_tools.py::_read_plan_repaired`` keep
-        unknown step keys, so the list survives both read-write-back paths.
+        Markup-repair limits: ``plans/plan-deviation-recording-prd.md`` D4.
         """
         plan = self.read_plan()
 

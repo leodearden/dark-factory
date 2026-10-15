@@ -35,6 +35,12 @@ class UnknownDeviationKind(ValueError):
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class DeviationRecord:
+    """One per-step deviation entry.
+
+    ``recorded_by`` is best-effort: the session identity the writer had in
+    hand, which may be the planning session's rather than the recorder's.
+    """
+
     kind: str
     observed: str
     expected: str

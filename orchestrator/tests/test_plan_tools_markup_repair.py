@@ -203,8 +203,8 @@ def _registered_plan_tool_names() -> frozenset[str]:
     """The tool names plan-tools' server actually REGISTERS, read from the server.
 
     Derived, never restated: builds a real server over a throwaway artifacts
-    root and asks it what it registered. Measured against the live tree — 17
-    names, the 12 plan writers plus the 5 ``report_*``.
+    root and asks it what it registered: the plan writers plus the
+    ``report_*`` family.
 
     Cached because several callers ask for the registered surface, which
     cannot change within a process; without it each would pay its own server
@@ -942,10 +942,10 @@ class TestRepairableFieldTable:
         TWO HALVES, both derived:
 
         (a) Every REGISTERED tool that is not a ``report_*`` separate-artifact
-            writer. Measured, production's own claims alone (half (b)) floor
-            only 8 of the 12 — ``confirm_plan``, ``mark_step_done``,
-            ``record_step_deviation`` and ``remove_plan_step`` are declared as
-            no row's alternate, so all four could vanish from the sweep and every test here would still
+            writer. Production's own claims alone (half (b)) do not floor
+            every plan writer — a writer such as ``confirm_plan`` or
+            ``mark_step_done`` that is declared as no row's alternate could
+            vanish from the sweep and every test here would still
             report green, which is exactly what this test's name claims to
             rule out. The ``report_*`` exclusion is not a prefix guess: the
             behaviour it stands for is pinned against the live module by
@@ -1049,8 +1049,7 @@ class TestRepairableFieldTable:
         # registered OUTSIDE that convention (written inline inside
         # `create_server`, or delegating to a differently-named helper) would
         # not fail — it would silently be no candidate at all, which is the
-        # under-reporting this whole surface exists to end. Measured: all 17
-        # registered tools follow it today.
+        # under-reporting this whole surface exists to end.
         for name in sorted(registered):
             impl = getattr(plan_tools, '_' + name, None)
             assert inspect.isfunction(impl) and impl.__module__ == plan_tools.__name__, (

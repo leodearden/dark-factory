@@ -1409,8 +1409,8 @@ def _mark_step_done(
     )
 
 
-def _deviation_recorder(artifacts: TaskArtifacts, plan: dict) -> str | None:
-    """The plan-tools session identity in hand: the agent sidecar's, else the plan's."""
+def _session_identity_in_hand(artifacts: TaskArtifacts, plan: dict) -> str | None:
+    """The agent sidecar's session id, else the planner's ``_session_id``, else None."""
     session = artifacts.read_agent_session()
     if session is not None and session.session_id:
         return session.session_id
@@ -1443,7 +1443,7 @@ def _record_step_deviation(
             prose_only=prose_only,
             note=note,
             recorded_at=datetime.now(UTC).isoformat(),
-            recorded_by=_deviation_recorder(artifacts, plan),
+            recorded_by=_session_identity_in_hand(artifacts, plan),
         )
     except UnknownDeviationKind as exc:
         return _with_markup_repairs(
