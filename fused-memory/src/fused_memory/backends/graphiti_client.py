@@ -1431,7 +1431,12 @@ _UUID_MEANS_LOAD = (
 # mode 3 (``expired_at`` added to one SET list and not its twin), and that task
 # 5264 reproduced when it cloned the then-current MENTIONS-blind ranking into a
 # second method. A test importing these constants can enforce the invariant; two
-# docstrings promising each other cannot.
+# docstrings promising each other cannot. The ordering itself is defined once, by
+# _PROVENANCE_RANK_KEYS below: the Cypher ORDER BY and the Python _survivor_first
+# are both renderings of it. The default test run checks the Python sort against
+# openCypher's ORDER BY semantics; only `-m integration` runs
+# tests/test_write_time_identity.py::TestEnumerateRankedEntityNodesLiveFalkorDB,
+# which checks the two agree on a real server.
 _PROVENANCE_RANK_CLAUSE = (
     'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL '
     'WITH n, count(DISTINCT e) AS edge_count '
@@ -1439,9 +1444,88 @@ _PROVENANCE_RANK_CLAUSE = (
     'WITH n, edge_count, count(DISTINCT m) AS mentions_count '
 )
 
+
+@dataclass(frozen=True)
+class _RankKey:
+    """One survivor-ordering key: the expression ORDER BY sorts on, and the
+    row-dict key the same value comes back under."""
+
+    cypher: str
+    column: str
+    descending: bool
+
+
 # The ordering the clause above exists to make possible. Kept adjacent to it so
 # the projection and the sort key cannot be updated apart.
-_PROVENANCE_RANK_ORDER = 'ORDER BY provenance_rank DESC, n.created_at ASC, n.uuid ASC'
+_PROVENANCE_RANK_KEYS = (
+    _RankKey('provenance_rank', 'provenance_rank', descending=True),
+    _RankKey('n.created_at', 'created_at', descending=False),
+    _RankKey('n.uuid', 'uuid', descending=False),
+)
+_PROVENANCE_RANK_ORDER = 'ORDER BY ' + ', '.join(
+    f'{key.cypher} {"DESC" if key.descending else "ASC"}' for key in _PROVENANCE_RANK_KEYS
+)
+
+
+class SurvivorRankTypeError(TypeError):
+    """A survivor-rank column whose non-NULL values mix types Python cannot
+    order against each other, although Cypher's ORDER BY would.
+
+    ``column`` and ``value_types`` (sorted type names) are required keyword
+    arguments, carried as fields for the reason ``AmbiguousEntityError``
+    carries its own.
+    """
+
+    def __init__(self, *, column: str, value_types: Iterable[str]) -> None:
+        self.column = column
+        self.value_types = tuple(sorted(value_types))
+        super().__init__(
+            f'cannot rank rows survivor-first by {column!r}: its non-NULL values '
+            f'mix the types {list(self.value_types)}'
+        )
+
+
+def _survivor_first(rows: list[dict]) -> list[dict]:
+    """Return *rows* in ``_PROVENANCE_RANK_ORDER``'s order, survivor first.
+
+    One stable pass per key, least significant first. NULL sorts as the
+    largest value, openCypher's rule and FalkorDB's (measured 2026-10-12): last
+    under ASC, first under DESC.
+
+    Raises:
+        SurvivorRankTypeError: a key column mixes non-NULL value types.
+    """
+    ordered = list(rows)
+    for key in reversed(_PROVENANCE_RANK_KEYS):
+        try:
+            ordered.sort(
+                key=lambda row, column=key.column: (row[column] is None, row[column]),
+                reverse=key.descending,
+            )
+        except TypeError as exc:
+            raise SurvivorRankTypeError(
+                column=key.column,
+                value_types={
+                    type(row[key.column]).__name__
+                    for row in ordered
+                    if row[key.column] is not None
+                },
+            ) from exc
+    return ordered
+
+
+# Same-group entity nodes with their provenance rank, for the task-family census
+# (task 5662). The page is cut over non-aggregated `n` in total uuid order, and
+# only then is the rank aggregated, per page.
+_RANKED_ENTITY_NODES_MATCH = 'MATCH (n:Entity) WHERE n.group_id = $group_id '
+_RANKED_ENTITY_NODES_PAGE_TEMPLATE = (
+    _RANKED_ENTITY_NODES_MATCH
+    + 'WITH n ORDER BY n.uuid SKIP {skip} LIMIT {limit} '
+    + _PROVENANCE_RANK_CLAUSE
+    + 'RETURN n.uuid, n.name, n.created_at, edge_count, mentions_count, '
+    'edge_count + mentions_count AS provenance_rank'
+)
+_RANKED_ENTITY_NODES_CENSUS = _RANKED_ENTITY_NODES_MATCH + 'RETURN count(*)'
 
 
 def _derive_registered_graph_ids(config: FusedMemoryConfig) -> frozenset[str]:
@@ -4827,6 +4911,45 @@ class GraphitiBackend:
             for row in _first_row_per_uuid(paged.rows, reader='enumerate_entity_nodes')
         ]
         return nodes, paged
+
+    @_canonicalize_group_args
+    async def enumerate_ranked_entity_nodes(
+        self, *, group_id: str, page_size: int = _DEFAULT_READ_PAGE_SIZE
+    ) -> tuple[list[dict], PagedRead]:
+        """Every same-group Entity node with its provenance rank, survivor-first.
+
+        Rows carry find_entity_nodes_by_name_substring's six keys (edge_count
+        counts valid RELATES_TO only) and are ordered exactly as that method and
+        find_duplicate_entity_nodes order theirs, so any partition of the rows
+        keeps survivor order. Scoped by the `n.group_id` property for the
+        task-2115 reason find_duplicate_entity_nodes gives. A separate method
+        rather than a widened enumerate_entity_nodes: task 5264, decision 7.
+
+        Returns:
+            (rows, paged), *paged* being the read's PagedRead.
+        """
+        graph = self._graph_for(group_id)
+        paged = await _paged_ro_query(
+            graph,
+            _RANKED_ENTITY_NODES_PAGE_TEMPLATE,
+            _RANKED_ENTITY_NODES_CENSUS,
+            params={'group_id': group_id},
+            page_size=page_size,
+        )
+        rows = [
+            {
+                'uuid': row[0],
+                'name': row[1],
+                'created_at': row[2],
+                'edge_count': row[3],
+                'mentions_count': row[4],
+                'provenance_rank': row[5],
+            }
+            for row in _first_row_per_uuid(
+                paged.rows, reader='enumerate_ranked_entity_nodes'
+            )
+        ]
+        return _survivor_first(rows), paged
 
     @_canonicalize_group_args
     async def list_entity_nodes(self, *, group_id: str) -> list[dict]:

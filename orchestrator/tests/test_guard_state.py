@@ -472,22 +472,17 @@ class TestGuardStateTtl:
 # ---------------------------------------------------------------------------
 
 class TestGuardStateBatchedWrites:
-    """Both batch entry points coalesce their writes into one.
+    """Every batch entry point, ``update``/``|=`` and ``put_many``, coalesces
+    its writes into one.
 
     ``_GuardStore.flush`` re-reads, re-merges and re-serialises the WHOLE map,
     so a per-element flush costs a batch of N some N+1 writes and O(N^2)
     parse/serialise work.  Measured in this worktree before the fix: N=373
-    performed 374 writes in 3.17s and N=1500 performed 1501 in 19.22s.  N=373
-    is not hypothetical — it is today's count of active non-pending tasks, so
-    it is what the first ``acquire_next`` tick after every fleet redeploy
-    pays, inline on the event loop.
+    performed 374 writes in 3.17s and N=1500 performed 1501 in 19.22s.
 
-    ``|=`` is the form that matters: all three production batch call sites use
-    it, not ``update`` —
-    ``orchestrator/src/orchestrator/scheduler.py::Scheduler._update_age_anchors``,
-    ``orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_stale_sweep``
-    and
-    ``orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker._mark_coalesce_derailed``.
+    ``|=`` is the set form that matters, not ``update``: the production set
+    batch call site uses it,
+    ``orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._mark_coalesce_derailed``.
     """
 
     _N = 50
@@ -578,3 +573,24 @@ class TestGuardStateBatchedWrites:
         guard.add('task-c')
 
         assert sorted(PersistentSet(path, ttl=_TTL)) == ['task-a', 'task-b', 'task-c']
+
+    def test_put_many_performs_exactly_one_write_and_overwrites(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        path = tmp_path / 'age_anchors.json'
+        guard = PersistentMap(path, ttl=_TTL)
+        guard['task-0'] = 'stale'
+
+        calls = _spy_on_writes(monkeypatch)
+        guard.put_many({f'task-{i}': i for i in range(self._N)})
+
+        assert len(calls) == 1, f'expected one write for {self._N} puts, got {len(calls)}'
+        assert dict(PersistentMap(path, ttl=_TTL)) == {f'task-{i}': i for i in range(self._N)}
+
+    def test_put_many_of_nothing_performs_no_write(self, tmp_path: Path, monkeypatch):
+        guard = PersistentMap(tmp_path / 'age_anchors.json', ttl=_TTL)
+
+        calls = _spy_on_writes(monkeypatch)
+        guard.put_many({})
+
+        assert calls == [], 'an empty batch must be silent'

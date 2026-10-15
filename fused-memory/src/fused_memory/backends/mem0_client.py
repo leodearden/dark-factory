@@ -104,9 +104,9 @@ def is_missing_collection_error(exc: BaseException) -> bool:
     construction (404 AND the message), so a 404 raised about some other
     Qdrant resource can never be read as an empty collection.
 
-    Callers that degrade on this predicate should still say so out loud (log
-    the missing collection), so an operator can tell "collection absent" from
-    "collection genuinely empty".
+    :meth:`Mem0Backend._timed_collection_read` is the degrade-and-disclose
+    home for the Scope-addressed metadata reads; any other caller that
+    degrades on this predicate should likewise log the missing collection.
     """
     from qdrant_client.http.exceptions import UnexpectedResponse  # noqa: PLC0415
 
@@ -389,6 +389,28 @@ class Mem0Backend:
     async def _timed_write(self, awaitable: Awaitable[_T], op: str) -> _T:
         """:meth:`_timed` under this backend's WRITE budget."""
         return await self._timed(awaitable, op, self._write_timeout)
+
+    async def _timed_collection_read(
+        self, awaitable: Awaitable[_T], op: str, collection_name: str, *, if_absent: _T,
+    ) -> _T:
+        """:meth:`_timed_read`, reading a provably-absent collection as *if_absent*.
+
+        Only :func:`is_missing_collection_error` degrades: it returns
+        *if_absent* and logs the collection at INFO.  A timeout and every other
+        failure propagate per the class TIMEOUT POSTURE.
+        """
+        try:
+            return await self._timed_read(awaitable, op)
+        except Exception as exc:
+            if not is_missing_collection_error(exc):
+                raise
+            logger.info(
+                'Mem0 %s: collection %s does not exist; reading it as empty',
+                op,
+                collection_name,
+                extra={'collection': collection_name},
+            )
+            return if_absent
 
     async def add(
         self,
@@ -848,10 +870,13 @@ class Mem0Backend:
         Qdrant payload, so ``filters={'source': 'X', 'flag_id': 'Y'}`` matches
         against ``payload.source == 'X' AND payload.flag_id == 'Y'``.
 
-        Returns the exact match count.  Empty ``filters`` is rejected (would
-        otherwise count every memory in the collection — almost certainly a
-        bug at the caller).
+        Returns the exact match count; an unprovisioned collection reads as 0
+        (see :meth:`_timed_collection_read`).  Empty ``filters`` is rejected
+        (would otherwise count every memory in the collection — almost
+        certainly a bug at the caller).
         """
+        from qdrant_client.http import models as qmodels
+
         if not filters:
             raise ValueError(
                 'count_by_metadata requires at least one filter; '
@@ -860,13 +885,15 @@ class Mem0Backend:
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         client = await self._get_async_qdrant()
         qdrant_filter = self._build_payload_filter(filters)
-        result = await self._timed_read(
+        result = await self._timed_collection_read(
             client.count(
                 collection_name=collection_name,
                 count_filter=qdrant_filter,
                 exact=True,
             ),
             'count_by_metadata',
+            collection_name,
+            if_absent=qmodels.CountResult(count=0),
         )
         return result.count
 
@@ -918,7 +945,8 @@ class Mem0Backend:
             returned that point without one.  A vector-less point is still
             returned (degraded, not dropped) so the caller can count and
             report it rather than losing it silently; the ``'vector'`` key is
-            absent entirely when *with_vectors* is False.
+            absent entirely when *with_vectors* is False.  An unprovisioned
+            collection reads as ``[]`` (see :meth:`_timed_collection_read`).
 
         Raises:
             ValueError: If *filters* is empty.
@@ -935,7 +963,7 @@ class Mem0Backend:
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         client = await self._get_async_qdrant()
         qdrant_filter = self._build_payload_filter(filters)
-        points, _next_offset = await self._timed_read(
+        points, _next_offset = await self._timed_collection_read(
             client.scroll(
                 collection_name=collection_name,
                 scroll_filter=qdrant_filter,
@@ -944,6 +972,8 @@ class Mem0Backend:
                 limit=limit,
             ),
             'scroll_by_metadata',
+            collection_name,
+            if_absent=([], None),
         )
 
         result = [self._normalise_point(point, with_vectors=with_vectors) for point in points]

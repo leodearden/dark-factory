@@ -808,6 +808,11 @@ class MemberRoots:
     def declared(cls, name: str) -> MemberRoots:
         return cls(name=name, pseudo=False, src_root=f'{name}/src', tests_root=f'{name}/tests')
 
+    @classmethod
+    def single_package(cls, name: str) -> MemberRoots:
+        """The one package of a non-workspace project, in the PyPA src layout."""
+        return cls(name=name, pseudo=False, src_root='src', tests_root='tests')
+
     def kind_of(self, path: str) -> FileKind | None:
         if path.startswith(self.tests_root + '/'):
             return FileKind.TESTS
@@ -851,15 +856,23 @@ class DomainMember:
     files: tuple[DomainFile, ...]
 
 
-#: The repo's two Python roots that are not workspace members, described by the
-#: same rule as a member: plans/quality-metrics-snapshot-prd.md decision 3.
-PSEUDO_MEMBERS: tuple[MemberRoots, ...] = (
-    MemberRoots(name='scripts', pseudo=True, src_root='scripts', tests_root='scripts/tests'),
-    MemberRoots(name='tests', pseudo=True, src_root=None, tests_root='tests'),
+_SCRIPTS_PSEUDO_MEMBER = MemberRoots(
+    name='scripts', pseudo=True, src_root='scripts', tests_root='scripts/tests'
 )
+_TESTS_PSEUDO_MEMBER = MemberRoots(name='tests', pseudo=True, src_root=None, tests_root='tests')
+
+#: The Python roots that follow a workspace's members without being members,
+#: described by the same rule as a member: plans/quality-metrics-snapshot-prd.md
+#: decision 3.
+PSEUDO_MEMBERS: tuple[MemberRoots, ...] = (_SCRIPTS_PSEUDO_MEMBER, _TESTS_PSEUDO_MEMBER)
+
+#: The pseudo-members that follow a single package: top-level tests/ is the
+#: package's own tests root, so it is no pseudo-member here.
+_SINGLE_PACKAGE_PSEUDO_MEMBERS: tuple[MemberRoots, ...] = (_SCRIPTS_PSEUDO_MEMBER,)
 
 
 _MEMBERS_KEY = '[tool.uv.workspace].members'
+_PROJECT_NAME_KEY = '[project].name'
 
 
 def _load_toml(path: Path) -> dict[str, object]:
@@ -873,10 +886,16 @@ def _load_toml(path: Path) -> dict[str, object]:
         raise MetricsError(f'{path}: is not valid TOML -- {exc}') from exc
 
 
-def _member_list(path: Path, config: dict[str, object]) -> list[str]:
-    found: object = config
-    for key in ('tool', 'uv', 'workspace', 'members'):
+def _lookup(config: object, *keys: str) -> object:
+    """The value at the nested table path *keys*; None where any table is absent."""
+    found = config
+    for key in keys:
         found = found.get(key) if isinstance(found, dict) else None
+    return found
+
+
+def _member_list(path: Path, config: dict[str, object]) -> list[str]:
+    found = _lookup(config, 'tool', 'uv', 'workspace', 'members')
     if (
         not isinstance(found, list)
         or not found
@@ -889,14 +908,13 @@ def _member_list(path: Path, config: dict[str, object]) -> list[str]:
     return found
 
 
-def _declared_members(root: Path) -> tuple[str, ...]:
-    """``[tool.uv.workspace].members`` of *root*'s pyproject.toml.
+def _declared_members(path: Path, config: dict[str, object]) -> tuple[str, ...]:
+    """``[tool.uv.workspace].members`` of the pyproject.toml at *path*, read as *config*.
 
     Each must be a plain directory name (uv's glob expansion cannot be
     reproduced from the index), listed once, and not a pseudo-member's name.
     """
-    path = root / 'pyproject.toml'
-    members = _member_list(path, _load_toml(path))
+    members = _member_list(path, config)
     globbed = [member for member in members if any(char in member for char in '*?[')]
     if globbed:
         raise MetricsError(
@@ -906,13 +924,65 @@ def _declared_members(root: Path) -> tuple[str, ...]:
     duplicates = sorted({member for member in members if members.count(member) > 1})
     if duplicates:
         raise MetricsError(f'{path}: {_MEMBERS_KEY} lists duplicate member(s) {duplicates!r}')
-    collisions = sorted(set(members) & {pseudo.name for pseudo in PSEUDO_MEMBERS})
+    _require_no_pseudo_collision(path, _MEMBERS_KEY, members, PSEUDO_MEMBERS)
+    return tuple(members)
+
+
+def _require_no_pseudo_collision(
+    path: Path, key: str, names: Sequence[str], pseudo_members: Sequence[MemberRoots]
+) -> None:
+    """Members are keyed by name in evidence and --summary, so no two may share one."""
+    collisions = sorted(set(names) & {pseudo.name for pseudo in pseudo_members})
     if collisions:
         raise MetricsError(
-            f'{path}: {_MEMBERS_KEY} names {collisions!r}, which collide with the '
+            f'{path}: {key} names {collisions!r}, which collide with the '
             'pseudo-member of the same name'
         )
-    return tuple(members)
+
+
+def _project_name(path: Path, config: dict[str, object]) -> str:
+    name = _lookup(config, 'project', 'name')
+    if not isinstance(name, str) or not name:
+        raise MetricsError(
+            f'{path}: has neither {_MEMBERS_KEY} nor a {_PROJECT_NAME_KEY}; a uv workspace '
+            f'declares its members, and a single-package project is named by its '
+            f'[project] table -- found {_PROJECT_NAME_KEY} = {name!r}'
+        )
+    return name
+
+
+def _single_package_members(
+    root: Path, path: Path, config: dict[str, object]
+) -> tuple[MemberRoots, ...]:
+    """The single package [project].name names, then ``_SINGLE_PACKAGE_PSEUDO_MEMBERS``.
+
+    The src layout is inferred from the absence of a workspace table, so it must
+    be evidenced: src/ holds tracked .py.
+    """
+    name = _project_name(path, config)
+    _require_no_pseudo_collision(path, _PROJECT_NAME_KEY, (name,), _SINGLE_PACKAGE_PSEUDO_MEMBERS)
+    package = MemberRoots.single_package(name)
+    if not _git_output(root, 'ls-files', '-z', '--', f'{package.src_root}/*.py'):
+        raise MetricsError(
+            f'{path}: declares no {_MEMBERS_KEY}, so it is read as the single-package '
+            f'project {name!r} in the src layout ({package.src_root}/ and '
+            f'{package.tests_root}/), but {package.src_root}/ holds no tracked .py; '
+            "declare the workspace's members or keep the package under "
+            f'{package.src_root}/'
+        )
+    return (package, *_SINGLE_PACKAGE_PSEUDO_MEMBERS)
+
+
+def _domain_members(root: Path) -> tuple[MemberRoots, ...]:
+    """The members *root*'s pyproject.toml defines, in the layout its tables choose."""
+    path = root / 'pyproject.toml'
+    config = _load_toml(path)
+    if _lookup(config, 'tool', 'uv', 'workspace') is None:
+        return _single_package_members(root, path, config)
+    return (
+        *(MemberRoots.declared(name) for name in _declared_members(path, config)),
+        *PSEUDO_MEMBERS,
+    )
 
 
 def _tracked_blobs(root: Path, *pathspecs: str) -> tuple[tuple[str, str], ...]:
@@ -950,42 +1020,58 @@ def _domain_member(
     return DomainMember(name=member.name, pseudo=member.pseudo, files=files)
 
 
-def _require_declared_members_populated(domain: tuple[DomainMember, ...]) -> None:
+def _require_declared_members_populated(
+    members: Sequence[MemberRoots], domain: tuple[DomainMember, ...]
+) -> None:
     """A DECLARED member with no files would read as measured and clean.
 
     A pseudo-member is a convention, not a declaration, so it may be empty.
     """
-    empty = [member.name for member in domain if not member.pseudo and not member.files]
+    empty = [
+        roots
+        for roots, member in zip(members, domain, strict=True)
+        if not member.pseudo and not member.files
+    ]
     if empty:
         raise MetricsError(
             '; '.join(
-                f'{name} has no tracked .py under {name}/src or {name}/tests'
-                for name in empty
+                f'{roots.name} has no tracked .py under {roots.src_root} or {roots.tests_root}'
+                for roots in empty
             )
         )
 
 
-def _workspace_members(root: Path) -> tuple[MemberRoots, ...]:
-    """The declared members of *root*'s pyproject.toml, then ``PSEUDO_MEMBERS``."""
-    return (
-        *(MemberRoots.declared(name) for name in _declared_members(root)),
-        *PSEUDO_MEMBERS,
-    )
+def _require_disjoint_members(domain: tuple[DomainMember, ...]) -> None:
+    """A file under two members' roots would be measured twice."""
+    holders: dict[str, list[str]] = {}
+    for member in domain:
+        for domain_file in member.files:
+            holders.setdefault(domain_file.path, []).append(member.name)
+    shared = [(path, names) for path, names in sorted(holders.items()) if len(names) > 1]
+    if shared:
+        raise MetricsError(
+            "tracked file(s) under two members' roots would be measured twice: "
+            + '; '.join(f'{path} is held by members {names!r}' for path, names in shared)
+        )
 
 
 def workspace_domain(root: Path) -> tuple[DomainMember, ...]:
-    """Every workspace member's tracked ``.py`` files, classified src or tests.
+    """Every member's tracked ``.py`` files, classified src or tests.
 
-    The member list's one home is the root pyproject.toml's
-    ``[tool.uv.workspace].members``, followed by ``PSEUDO_MEMBERS``. Files come
-    from the index, not the disk, so an untracked file is outside the domain, as
-    is every file under no member's src or tests root (``hooks/`` included).
+    The member list's one home is the root pyproject.toml: a uv workspace's
+    ``[tool.uv.workspace].members`` followed by ``PSEUDO_MEMBERS``, or, with no
+    workspace table, the single src-layout package ``[project].name`` names
+    followed by the scripts pseudo-member (plans/quality-metrics-snapshot-prd.md
+    decision 3). Files come from the index, not the disk, so an untracked file
+    is outside the domain, as is every file under no member's src or tests root
+    (``hooks/`` included).
     """
     _require_work_tree_top(root)
-    members = _workspace_members(root)
+    members = _domain_members(root)
     entries = _tracked_blobs(root, '*.py')
     domain = tuple(_domain_member(member, entries) for member in members)
-    _require_declared_members_populated(domain)
+    _require_declared_members_populated(members, domain)
+    _require_disjoint_members(domain)
     return domain
 
 
@@ -1006,7 +1092,7 @@ def uncommitted_domain_paths(root: Path) -> tuple[str, ...]:
     Untracked files are not listed: they are outside the domain.
     """
     _require_work_tree_top(root)
-    members = _workspace_members(root)
+    members = _domain_members(root)
     listing = _git_output(
         root, 'status', '--porcelain=v1', '-z', '--untracked-files=no', '--no-renames',
         '--', '*.py',

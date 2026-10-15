@@ -41,9 +41,10 @@ from orchestrator.session_registry import (
     normalize_escalations_dir,
     normalize_project_token,
 )
+from shared.project_layout import ESCALATION_QUEUE_RELPATH
 
 QUEUE_TAGS: Mapping[Path, str] = MappingProxyType({
-    Path('data', 'escalations'): '',
+    Path(ESCALATION_QUEUE_RELPATH): '',
     Path('data', 'reconciliation', 'escalations'): 'recon',
 })
 QUEUE_SUBDIRS: tuple[Path, ...] = tuple(QUEUE_TAGS)

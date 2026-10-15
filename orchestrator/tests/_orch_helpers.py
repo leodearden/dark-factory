@@ -20,7 +20,7 @@ import time
 import types
 import weakref
 from collections import deque
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
@@ -227,8 +227,9 @@ PYPROJECT_DEFAULT_TIMEOUT = 420
 #   FAMILY defect rather than three accidents, and why the rest are marked
 #   preemptively: a marked-but-fast test costs nothing, while an
 #   unmarked-and-slow one costs a whole session.
-# The current anchor is 51.87s under load (task 5442), which floors the family
-# at 420s: test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS.
+# The current anchor is
+# test_whole_tree_scan_timeout_guard.py::_MEASURED_UNDER_LOAD_WORST_CASE, which
+# floors the family at test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS.
 # Derivation: plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 #
 # WAS `5 * PYPROJECT_DEFAULT_TIMEOUT` until 2026-09-12, when that ini default
@@ -247,10 +248,9 @@ PYPROJECT_DEFAULT_TIMEOUT = 420
 # encodes that independence; it has since been re-anchored, but its role is
 # unchanged.
 #
-# It sits above both the floor and PYPROJECT_DEFAULT_TIMEOUT, and neither binds
-# it: the never-narrow rule below asks only `>=`.  Why it sits above its floor
-# is value history, recorded in
-# plans/pytest-per-test-timeout-measurement-2026-09-17.md.
+# It must clear BOTH the floor and PYPROJECT_DEFAULT_TIMEOUT (pinned by
+# test_whole_tree_scan_timeout_guard.py); which of the two binds is value
+# history, recorded in plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 #
 # Deliberately NOT taken from HEAVY_BARRIER_TEST_TIMEOUT: that one bounds a
 # different hazard, sized by merge-barrier waits, and an AST sweep performs
@@ -259,7 +259,7 @@ PYPROJECT_DEFAULT_TIMEOUT = 420
 # never fall below PYPROJECT_DEFAULT_TIMEOUT, or a module-level mark meant as
 # a FLOOR would start narrowing its module below the global default (pinned by
 # test_whole_tree_scan_timeout_guard.py).
-WHOLE_TREE_SCAN_TEST_TIMEOUT = 540
+WHOLE_TREE_SCAN_TEST_TIMEOUT = 1200
 
 # Headroom a per-test ceiling must keep over its family's measured-under-load
 # worst case.  8x rather than 2x: the xdist worker deaths these ceilings exist
@@ -2394,6 +2394,26 @@ def mcp_tool_envelope(payload: object) -> dict:
             'isError': False,
         },
     }
+
+
+class CannedMcpSession:
+    """The duck-typed ``call_tool`` seam ``Scheduler.dispatch_tool`` routes an injected
+    session through (the eval runner's ``_StubMcpSession`` pattern): answers every call
+    with one canned JSON-RPC body, or raises ``error``; ``calls`` records each
+    ``(name, arguments)``."""
+
+    def __init__(self, body: dict | None = None, error: Exception | None = None) -> None:
+        self.body = body or {}
+        self.error = error
+        self.calls: list[tuple[str, dict]] = []
+
+    async def call_tool(self, name: str, arguments: dict, timeout: float = 30) -> dict:
+        self.calls.append((name, arguments))
+        if self.error is not None:
+            raise self.error
+        return self.body
+
+
 def make_prompt_resolution_workflow(
     *, tmp_path: Path, prompt_store: PromptArtifactStore | None = None,
 ) -> TaskWorkflow:
@@ -2455,3 +2475,28 @@ class ExitContractViolationCollector(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         if getattr(record, self._verdict_attribute, None) == self._violation:
             self.violations.append(record)
+
+    @classmethod
+    @contextlib.contextmanager
+    def listening(cls) -> Iterator[ExitContractViolationCollector]:
+        """Attach a collector to the recorder's logger, pinned so that neither
+        a raised ancestor level nor a disabled logger can blind it.
+
+        A test that itself raises 'orchestrator.exit_contract' above WARNING
+        after setup still blinds it.
+        """
+        from orchestrator.exit_contract import record_exit_verdict
+
+        contract_logger = logging.getLogger(record_exit_verdict.__module__)
+        saved_level, saved_disabled = contract_logger.level, contract_logger.disabled
+        if saved_level == logging.NOTSET or saved_level > logging.WARNING:
+            contract_logger.setLevel(logging.WARNING)
+        contract_logger.disabled = False
+        collector = cls()
+        contract_logger.addHandler(collector)
+        try:
+            yield collector
+        finally:
+            contract_logger.removeHandler(collector)
+            contract_logger.setLevel(saved_level)
+            contract_logger.disabled = saved_disabled

@@ -910,14 +910,9 @@ async def _performance_resources(
     pool: DbPool,
 ) -> tuple[list[aiosqlite.Connection | None], list[Path]]:
     """Return ``(dbs, esc_dirs)`` for the performance API."""
-    seen: set[Path] = {config.project_root}
-    run_paths: list[Path] = [config.runs_db]
-    esc_dirs: list[Path] = [config.escalations_dir]
-    for root in config.known_project_roots:
-        if root not in seen:
-            seen.add(root)
-            run_paths.append(root / 'data' / 'orchestrator' / 'runs.db')
-            esc_dirs.append(root / 'data' / 'escalations')
+    roots = config.all_project_roots
+    run_paths = [root / 'data' / 'orchestrator' / 'runs.db' for root in roots]
+    esc_dirs = [root / 'data' / 'escalations' for root in roots]
     dbs = [await pool.get(p) for p in run_paths]
     return dbs, esc_dirs
 

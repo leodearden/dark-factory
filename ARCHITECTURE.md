@@ -642,8 +642,12 @@ and are not restated here.
   `CONVERT_TO_BLOCKED` in all four branch states, landed-but-pinned rows
   included; the normative rule is spec §7.2. The applier,
   `Harness._reconcile_one_stranded` (`harness.py`), writes `blocked`, files
-  nothing and writes no `done_provenance`. Conversion is a legibility action,
-  not a recovery: the row keeps its pin and does not self-heal. Its exit is
+  nothing and writes no `done_provenance`. It stamps `metadata.strand_converted`
+  (`shared/src/shared/strand_conversion.py::StrandConverted`: `at`, `shape`,
+  `pinning_escalation_ids`) and emits one `strand_converted` event naming the
+  same records (`orchestrator/src/orchestrator/strand_conversion.py`).
+  Conversion is a legibility action, not a recovery: the row keeps its pin
+  and does not self-heal. Its exit is
   its record's resolution — by a human, or, for a dead-filer L0, by the
   supervised consumer that takes it once the orphan-L0 reaper has promoted it
   to L1 ("Orphaned L0 records" below) — where a `resume` re-pends it (§6).

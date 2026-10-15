@@ -57,6 +57,22 @@ inert (every holder reads as dead). `$PPID` is not stable across tool calls eith
 match what your own release presents. The long-lived `claude` process is `$CLAUDE_PID` — verify with
 `ps -o comm= -p "$CLAUDE_PID"`, which prints `claude`.
 
+**Under `claude agents`, `$CLAUDE_PID` is not yours alone.** `ps -o comm=` prints `claude` for a
+`claude agents` host too, so it cannot tell you: every session one `claude agents` process hosts
+shares that host's pid, which outlives each of them. The CLI detects a host (its argv is
+`claude agents ...`), records **pid 0** (heartbeat-only staleness, logged as DEGRADED) and derives
+the slug as `<--name>-$CLAUDE_PID-$CLAUDE_CODE_SESSION_ID`; without a usable
+`$CLAUDE_CODE_SESSION_ID` the lease verbs exit 2 (pass `--slug`). So a hosted holder reads
+`holder_liveness=orphaned` / `holder_pid=0` even while alive: its fresh heartbeat still counts as
+held, and once its heartbeat is past the TTL the reaper reclaims it. Its heartbeat (the lease file's
+mtime) is the **only** liveness signal a hosted holder has
+(`orchestrator/src/orchestrator/session_registry.py::resolve_session_identity`).
+
+**One-time rollout note (task 6916).** A lease a hosted `/unblock` session claimed *before* this
+change carries the bare `<--name>-$CLAUDE_PID` slug, so its re-derived release gets
+`result=refused` — nothing is damaged. Pass the original `--slug` on release (`lease-show` prints it
+as `holder_slug`), or let the lease become reclaimable once its heartbeat is past the 2h TTL.
+
 If `$CLAUDE_PID` is unresolvable **and** `--slug` is omitted, the lease verbs **exit 2** naming both,
 rather than silently drifting to a slug your own later release would fail to match; the CLI will not
 invent one, because a synthesized token would be identical for every degraded session and let each

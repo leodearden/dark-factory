@@ -78,6 +78,7 @@ from escalation.queue import observed_submit_response as _observed_submit_respon
 from escalation.related_pending import related_pending
 from escalation.server_instructions import ESCALATION_SERVER_INSTRUCTIONS
 from escalation.store_identity import StoreIdentity
+from escalation.tool_description_block import AppendToEveryToolDescription
 
 if TYPE_CHECKING:
     from orchestrator.merge_lane.queue_store import (
@@ -987,6 +988,19 @@ async def _annotate_pins_recovery(
         d['pins_recovery'] = [tid] if pins else []
 
 
+def _render_store_identity_block(identity: StoreIdentity) -> str:
+    """The store-identity block of ``plans/escalation-store-ambiguity-prd.md`` §6.2."""
+    project = 'n/a' if identity.project_id is None else identity.project_id
+    return (
+        f'THIS ENDPOINT SERVES: {identity.queue_dir} '
+        f'(kind={identity.kind}, project={project}).\n'
+        'It contains ONLY escalations for that store. A task id belonging to any other\n'
+        'project returns an empty result because the record is not HERE — not because it\n'
+        'does not exist. To ask whether an escalation was EVER filed for a task\n'
+        '(including resolved/archived), use get_task_escalation_history.'
+    )
+
+
 def create_server(
     queue: EscalationQueue,
     merge_queue: asyncio.Queue | None = None,
@@ -1057,10 +1071,16 @@ def create_server(
 
     *store_identity* (default None) — which store this server serves
     (``escalation.store_identity::StoreIdentity``), passed by both production
-    call sites.  Accepted but not yet read: its consumers are specified in
-    ``plans/escalation-store-ambiguity-prd.md`` §6.2–6.3.
+    call sites.  When given, one transform appends the PRD §6.2 store-identity
+    block to every tool's description; None leaves each description exactly
+    its docstring.  ``plans/escalation-store-ambiguity-prd.md`` §6.3 specifies
+    its other consumer.
     """
     mcp = FastMCP('escalation', instructions=ESCALATION_SERVER_INSTRUCTIONS)
+    if store_identity is not None:
+        mcp.add_transform(
+            AppendToEveryToolDescription(_render_store_identity_block(store_identity))
+        )
 
     # --- Leaked tool-call envelope markup (task 3690, PRD section 4 C2) ---
     #

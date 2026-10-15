@@ -77,6 +77,7 @@ async def _request(scene: _Scene, name: str, *, lane: str = 'normal') -> MergeRe
         config=scene.config,
         result=asyncio.get_running_loop().create_future(),
         lane='high' if lane == 'high' else 'normal',
+        awaited_by_workflow=True,
     )
 
 
@@ -566,6 +567,38 @@ async def test_a_halt_dissolves_a_coalesce_train_waiting_in_its_buffer(
         assert _entries(lane) == []
 
     assert sorted(hooks.redriven) == [(name, False, None) for name in _SINGLES]
+
+
+async def test_a_dissolved_coalesce_train_hands_members_back_on_their_pre_stack_tips(
+    coalesce_scene: _Scene,
+) -> None:
+    """Task 4953: main moves after the branches exist, so re-driving a member
+    from its stacked tip could not land it back where it was."""
+    hooks = _CoalesceHooks()
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    lane = make_lane(coalesce_scene.git_ops, queue, train_callback_factory=hooks.factory)
+    singles = [await _request(coalesce_scene, name) for name in _SINGLES]
+    before = [_git(coalesce_scene.repo, 'rev-parse', f'task/{name}') for name in _SINGLES]
+    (coalesce_scene.repo / 'drift.txt').write_text('main moved\n')
+    _git(coalesce_scene.repo, 'add', '--', 'drift.txt')
+    _git(coalesce_scene.repo, 'commit', '-m', 'drift: direct commit')
+    lane.halt_lane('normal', 'hold the formed train in its buffer')
+    for single in singles:
+        await queue.put(single)
+
+    async with running_lane(lane):
+        await wait_responsive(
+            _until(lambda: all(single.result.done() for single in singles)),
+            label='singles coalesced into a buffered train',
+        )
+        lane.halt_admission('restart drain test')
+        await wait_responsive(
+            _until(lambda: len(hooks.redriven) == len(_SINGLES)),
+            label='train dissolved and its members re-driven',
+        )
+
+    after = [_git(coalesce_scene.repo, 'rev-parse', f'task/{name}') for name in _SINGLES]
+    assert after == before
 
 
 class _WaitWatchingQueue(asyncio.Queue[Any]):

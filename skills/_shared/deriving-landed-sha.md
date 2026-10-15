@@ -283,14 +283,22 @@ fi
 `--ancestry-path task/<TASK_ID>..main` lists every merge that *descends from* this branch, so
 once the branch is on main it also lists every unrelated merge landed afterwards, and `tail -1`
 returns the **oldest** of them. That oldest descendant is the merge that brought this branch in
-when one exists, and an unrelated later merge only when the branch was already in main before it
+only when no other merge descends from the branch first. A merge made on a branch **stacked** on
+this one — dark-factory makes these, e.g. a carry branch that merged main in to resolve
+conflicts before landing — sorts older, so `tail -1` returns that sync merge; its `^1` already
+contains this branch, so the containment check exits 0 and the arm falls through to the citation
+gate instead of stamping it (safe: never a wrong stamp, at worst the citing commit instead of the
+landing merge). It is an unrelated later merge only when the branch was already in main before it
 — which is exactly the distinction the containment check below is there to make.
 
 **`--topo-order` is REQUIRED, not decoration.** `git rev-list` orders by **commit date** by
 default, *not* topologically, so the "oldest" claim above holds only while dates happen to agree
-with topology. A merge whose committer date is skewed or was rewritten — a rebase, a replayed
-patch, a clock-skewed machine — can sort out of position, and `tail -1` then returns a *later*
-merge instead of the one that brought this branch in. Dropping `--topo-order` fails **silently**:
+with topology. Two things break that: commits that share one committer-date second (the
+realistic single-machine case — scripted commits and a busy merge lane land several per second;
+no skew involved), and a committer clock skewed across machines, which can date a commit older
+than the commit it descends from. Either can sort a merge out of position, and `tail -1` then
+returns a *later* merge instead of the one that brought this branch in.
+Dropping `--topo-order` fails **silently**:
 `$c^1` is then that later merge's parent, which already contains the branch, so the check reports
 `contained-before rc=0`, the arm reads "unrelated later merge, do not stamp", and the real group
 merge is skipped — the procedure degrades to the citation gate below and stamps a citing commit
@@ -301,23 +309,24 @@ The containment check on `$c`'s **first parent** decides — but read the caveat
 
 **`$c^1` is main-just-before-the-merge only when `$c` was created ON main.**
 `orchestrator/src/orchestrator/git_ops.py::GitOps.merge_to_main` merges with `git merge --no-ff`
-*from* main, so that holds for every dark-factory landing. It is **not** guaranteed for a target
-project reached via [`orchestrate/SKILL.md`](../orchestrate/SKILL.md)'s call site, where the
-project's own merge convention decides parent order: a merge built on the branch side (e.g. an
-integration branch cut from the task branch, then fast-forwarded onto main) has the **task tip**
-at `$c^1`, the containment check exits 0 trivially, and this arm falsely concludes "unrelated
-later merge, do not stamp" — discarding a merge sha you were already holding. On a project whose
-merge direction you do not know, confirm the parent order before trusting the rc:
-`git rev-list --parents -n 1 "$c"` (or `git log --format=%P -n 1 "$c"`) — the first parent listed
-must itself be on main *before* `$c`; if it is the branch side, read `$c^2` instead.
+*from* main, so that holds for every dark-factory landing. On a target project reached via
+[`orchestrate/SKILL.md`](../orchestrate/SKILL.md)'s call site whose merge direction you do not
+know, parent order is **not recoverable**: git records no merge direction. A merge built on the
+branch side and fast-forwarded onto main is the same commit graph, sha for sha, as a
+fast-forward landing followed by an unrelated merge made on main, so no parent-order,
+first-parent or containment check can tell them apart. On such a project read
+`contained-before rc=0` as **undecided** rather than as "unrelated later merge", and take the
+same exit: do not stamp `$c`, continue to the citation gate.
+(`orchestrator/tests/test_group_merge_candidate_ordering.py` pins the identity against real git.)
 
 - **contained-before rc=1** → the branch was not in main before `$c`, so `$c` **is** the merge
   that brought it in. Stamp `{"kind": "<merged|found_on_main>", "commit": "$c", "note": "absorbed
   into group merge; sha verified by ancestry containment"}` — `$c` is a merge commit that brought
   this branch in, so the same `kind` rule as [step 2](#step-2) applies. Carry the note here too.
-- **contained-before rc=0** (or `$c` empty) → the branch was already in main before `$c`, so
-  `$c` is an unrelated later merge. No merge commit exists for this branch. **Do not stamp
-  yet** — continue to the citation gate below, whose only stampable sha is the citing commit.
+- **contained-before rc=0** (or `$c` empty) → **do not stamp `$c`**. Where `$c` was created on
+  main, the branch was already in main before it and `$c` is an unrelated later merge; where
+  merge direction is unknown, rc=0 is undecided. Either way, continue to the citation gate
+  below, whose only stampable sha is the citing commit.
 
 **The citation gate (phantom-branch check).** rc=0 does not by itself prove this branch carries
 any work: a branch that never advanced past its creation point has main's own old base commit as
