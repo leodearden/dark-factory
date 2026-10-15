@@ -2875,6 +2875,48 @@
           "current": 57729
         }
       ]
+    },
+    {
+      "task_id": "6160",
+      "reason": "an interrupted train verify tears down through _teardown_verify_task (review fix, step-10)",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2215,
+          "current": 2216
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22275,
+          "current": 22313
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12574,
+          "current": 12588
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4862,
+          "current": 4863
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57729,
+          "current": 57767
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 32070,
+          "current": 32084
+        }
+      ]
     }
   ]
 }

@@ -30,6 +30,7 @@ from collections.abc import (
     Awaitable,
     Callable,
     Collection,
+    Coroutine,
     Iterator,
     Mapping,
     MutableSet,
@@ -5562,6 +5563,14 @@ class _TrainMergeHost(Protocol):
     def _ensure_host_allocator(self, config: OrchestratorConfig) -> HostAllocator: ...
     def _quarantine_unreachable_host(self, host: str, reason: str, now: float) -> None: ...
     async def _cancel_and_release_tracked(self, lease: HostLease | None) -> bool: ...
+    async def _teardown_verify_task(
+        self,
+        lease: Any | None,
+        verify_task: asyncio.Task[Any] | None,
+        task_id: str,
+        *,
+        shutdown_defensive: bool = False,
+    ) -> None: ...
 
     # ── restart drain (task 5371) ─────────────────────────────────────────
     def _note_verify_started(self, request_id: str, *, host: str | None = None) -> None: ...
@@ -6997,11 +7006,13 @@ class _TrainVerifyHost:
         allocator: HostAllocator,
         local_factory: Callable[[], LocalRunner],
         lease: HostLease | None,
+        task_id: str,
     ) -> None:
         self._worker = worker
         self._allocator = allocator
         self._local_factory = local_factory
         self._lease = lease
+        self._task_id = task_id
 
     @classmethod
     async def acquire(
@@ -7018,7 +7029,7 @@ class _TrainVerifyHost:
             lease = allocator.acquire_local(factory)
         else:
             lease = await allocator.acquire(factory, policy=req.config.verify_host_policy)
-        return cls(worker, allocator, factory, lease)
+        return cls(worker, allocator, factory, lease, req.task_id)
 
     @property
     def name(self) -> str:
@@ -7044,8 +7055,32 @@ class _TrainVerifyHost:
         )
         self._lease = self._allocator.acquire_local(self._local_factory)
 
+    async def run_verify(
+        self, verify: Coroutine[Any, Any, MergeOutcome | None],
+    ) -> MergeOutcome | None:
+        """Run *verify* on this host as its own task.
+
+        Interrupted, the verify is aborted on its host and reaped through the
+        worker's teardown chokepoint while it is still live.
+        """
+        verify_task = asyncio.create_task(verify)
+        try:
+            await asyncio.wait({verify_task})
+        except BaseException:
+            await self._worker._teardown_verify_task(
+                self._lease, verify_task, self._task_id, shutdown_defensive=True,
+            )
+            raise
+        return verify_task.result()
+
     async def release(self, *, aborted: bool) -> None:
-        """Give the slot back; an *aborted* train's verify may still be running."""
+        """Give the slot back.
+
+        An *aborted* train's slot goes back through the worker's tracked
+        cancel-release: a refused cancel parks the slot until the host probes
+        clean, and a host that never does is quarantined. Any verify it held
+        was already aborted and reaped by :meth:`run_verify`.
+        """
         if self._lease is None:
             return
         if aborted:
@@ -7062,7 +7097,9 @@ async def _leased_train_verify(
 
     The yielded callable is ``_run_post_merge_verify`` on the worker's
     injected VerifyPort. A remote that turns out unreachable is benched and
-    the same verify re-runs on local. The lease is held until the block
+    the same verify re-runs on local. A verify interrupted mid-run is aborted
+    on its host and reaped through the worker's teardown chokepoint before
+    the slot is cancelled and released. The lease is held until the block
     exits: released plainly on a normal exit, cancelled and released on any
     exception.
     """
@@ -7089,7 +7126,7 @@ async def _leased_train_verify(
         worker._note_verify_started(req.request_id, host=host.name)
         runner = host.runner
         try:
-            return await verify_once(*args, runner=runner, **kwargs)
+            return await host.run_verify(verify_once(*args, runner=runner, **kwargs))
         except RunnerUnavailable as exc:
             if runner is None:
                 raise
@@ -7099,7 +7136,7 @@ async def _leased_train_verify(
             )
             await host.fall_back_to_local(str(exc))
             worker._note_verify_started(req.request_id, host=host.name)
-            return await verify_once(*args, runner=host.runner, **kwargs)
+            return await host.run_verify(verify_once(*args, runner=host.runner, **kwargs))
 
     try:
         yield train_verify
@@ -18078,13 +18115,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         The sole caller of BOTH steps — :meth:`_abort_remote_verify` and
         ``verify_task.cancel()`` — enforced by
         test_merge_queue_concurrent_verify.py's
-        ``TestVerifyTeardownChokepoint``. Its SEVEN callers are the two
+        ``TestVerifyTeardownChokepoint``. Its EIGHT callers are the two
         ``stop()`` drain paths (finalizing head and ``_inflight``), the
         head-failure cascade, the three ``_run_inflight_verify`` abort triggers
-        (sole-waiter abandon, operator halt, dead-verify no-progress), and —
-        added by task 3043 — ``_run_inflight_verify``'s ``finally`` orphan
-        guard, which reaps the inner verify task on any exit route the three
-        abort triggers do not cover (in practice: external cancellation).
+        (sole-waiter abandon, operator halt, dead-verify no-progress),
+        ``_run_inflight_verify``'s ``finally`` orphan guard (task 3043), which
+        reaps the inner verify task on any exit route the three abort triggers
+        do not cover (in practice: external cancellation), and a train's
+        verify interrupted mid-run (``_TrainVerifyHost.run_verify``, task 6160).
 
         ORDER IS LOAD-BEARING, and sole-callership is what now guarantees it.
         The remote cancel must fire while ``_inflight_request_id`` is still
