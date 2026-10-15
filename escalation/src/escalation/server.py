@@ -4184,16 +4184,16 @@ def create_server(
         # classifier ignores it).  event_store is None for a standalone
         # server (no orchestrator wired) — guarded so this degrades to no
         # attribution instead of raising (fail-open, mirrors the git-error
-        # None-degrade inside _resolve_dispatch_time_merge_base).
+        # None-degrade inside resolve_dispatch_time_merge_base).
         if verified_green and event_store is not None:
             from orchestrator.event_store import (  # type: ignore[reportMissingImports]
                 EventType,
             )
-            from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-                _resolve_dispatch_time_merge_base,
+            from orchestrator.merge_lane import (  # type: ignore[reportMissingImports]
+                resolve_dispatch_time_merge_base,
             )
             base_sha = (
-                await _resolve_dispatch_time_merge_base(
+                await resolve_dispatch_time_merge_base(
                     orch_config.project_root, orch_config.git.main_branch, resolved_tip,
                 )
                 if resolved_tip is not None

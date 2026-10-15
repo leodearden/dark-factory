@@ -43,8 +43,8 @@ from orchestrator.merge_queue import (
     MergeOutcome,
     MergeRequest,
     _classify_main_health_red,
-    _resolve_dispatch_time_merge_base,
     _run_post_merge_verify,
+    resolve_dispatch_time_merge_base,
 )
 from orchestrator.merge_types import OutcomeKind, QueuedBranch
 from orchestrator.verify import VerifyResult
@@ -664,7 +664,7 @@ class TestRunPostMergeVerifyDispositionWiring:
 
 
 class TestDispatchTimeMergeBaseResolution:
-    """_resolve_dispatch_time_merge_base is what turns an item's two FROZEN
+    """resolve_dispatch_time_merge_base is what turns an item's two FROZEN
     dispatch-time facts — base_sha and merged_branch_tip — into the
     merge_base_sha threaded into _run_post_merge_verify (task 2383 beta, 2357).
 
@@ -690,7 +690,7 @@ class TestDispatchTimeMergeBaseResolution:
         base_sha = _commit_file(repo, 'src/x.py', 'v2', 'edit x on main (landing)')
 
         resolved = asyncio.run(
-            _resolve_dispatch_time_merge_base(repo, base_sha, branch_tip)
+            resolve_dispatch_time_merge_base(repo, base_sha, branch_tip)
         )
 
         assert resolved == fork_point, (
@@ -711,7 +711,7 @@ class TestDispatchTimeMergeBaseResolution:
         base_sha = _commit_file(repo, 'src/x.py', 'v1', 'init x')
 
         assert asyncio.run(
-            _resolve_dispatch_time_merge_base(repo, base_sha, None)
+            resolve_dispatch_time_merge_base(repo, base_sha, None)
         ) is None
 
 

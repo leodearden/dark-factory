@@ -917,7 +917,7 @@ async def _classify_disposition_for_outcome(
         return MergeFailureDisposition.INDETERMINATE, None, '', None
 
 
-async def _resolve_dispatch_time_merge_base(
+async def resolve_dispatch_time_merge_base(
     repo_root: Path,
     main_sha: str,
     branch_tip: str | None,
@@ -944,7 +944,7 @@ async def _resolve_dispatch_time_merge_base(
         )
         if rc != 0:
             logger.warning(
-                '_resolve_dispatch_time_merge_base: git merge-base failed '
+                'resolve_dispatch_time_merge_base: git merge-base failed '
                 '(rc=%d) for main_sha=%s branch_tip=%s: %s; degrading to '
                 'None (fail-safe, I3)',
                 rc, main_sha, branch_tip, err.strip(),
@@ -953,7 +953,7 @@ async def _resolve_dispatch_time_merge_base(
         return out.strip() or None
     except Exception:
         logger.warning(
-            '_resolve_dispatch_time_merge_base: git merge-base raised for '
+            'resolve_dispatch_time_merge_base: git merge-base raised for '
             'main_sha=%s branch_tip=%s; degrading to None (fail-safe, I3)',
             main_sha, branch_tip,
             exc_info=True,
@@ -18509,7 +18509,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             main_sha = item.base_sha if probe_base is None else probe_base
             verify_base = VerifyBaseFacts(
                 main_sha=main_sha,
-                merge_base_sha=await _resolve_dispatch_time_merge_base(
+                merge_base_sha=await resolve_dispatch_time_merge_base(
                     req.config.project_root, main_sha, item.merged_branch_tip,
                 ),
             )

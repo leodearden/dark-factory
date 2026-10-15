@@ -4354,7 +4354,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         sentinel_base_sha = 's' * 40
         monkeypatch.setattr(
             orchestrator_merge_queue,
-            '_resolve_dispatch_time_merge_base',
+            'resolve_dispatch_time_merge_base',
             AsyncMock(return_value=sentinel_base_sha),
         )
         # is_ancestor is stubbed False to reach the fresh-dispatch path; the
@@ -4441,7 +4441,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         tip = 't' * 40
         monkeypatch.setattr(
             orchestrator_merge_queue,
-            '_resolve_dispatch_time_merge_base',
+            'resolve_dispatch_time_merge_base',
             AsyncMock(return_value='s' * 40),
         )
         # is_ancestor False → reach the dispatch path; the task-2945 patch-id
@@ -4506,7 +4506,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         tip = 't' * 40
         monkeypatch.setattr(
             orchestrator_merge_queue,
-            '_resolve_dispatch_time_merge_base',
+            'resolve_dispatch_time_merge_base',
             AsyncMock(return_value='s' * 40),
         )
         # is_ancestor False → reach the dispatch path; the task-2945 patch-id
@@ -4633,7 +4633,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         # is None — avoids relying on a real git subprocess pre-step-4.
         monkeypatch.setattr(
             orchestrator_merge_queue,
-            '_resolve_dispatch_time_merge_base',
+            'resolve_dispatch_time_merge_base',
             AsyncMock(return_value='s' * 40),
         )
         # is_ancestor False → reach the gate path; the task-2945 patch-id
