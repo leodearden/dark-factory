@@ -1150,9 +1150,12 @@ def ample_disk_usage(path: str | os.PathLike[str]) -> HostDiskUsage:
     Far above every free-space floor a test can reach, starting with the
     merge-lane pre-verify guard's 10 GiB default
     (``OrchestratorConfig.merge_verify_min_free_disk_bytes``), so the guards
-    take their healthy-host path whatever disk the host has. Installed as
-    ``shutil.disk_usage`` by conftest's autouse ``_hermetic_disk_usage``.
+    take their healthy-host path whatever disk the host has. It still stats
+    *path*, so a missing path raises ``OSError`` as the real call does.
+    Installed as ``shutil.disk_usage`` by conftest's autouse
+    ``_hermetic_disk_usage``.
     """
+    os.stat(path)
     return HostDiskUsage(total=2 * _AMPLE_FREE_BYTES, used=_AMPLE_FREE_BYTES, free=_AMPLE_FREE_BYTES)
 
 

@@ -49,6 +49,7 @@ from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
 from _worktree_add_fakes import make_fake_run
 
 import orchestrator.git_ops as git_ops_mod
+import orchestrator.merge_lane.worker as worker_mod
 import orchestrator.verify_classify as verify_classify_mod
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps
@@ -153,8 +154,9 @@ class TestWorktreeAddRetryPredicate:
     def test_disk_full_predicate_is_imported_not_recopied(self) -> None:
         """ONE disk-full predicate (task 7032). Object IDENTITY is asserted
         so an "inline it" refactor turns this red rather than forking a copy
-        that can drift; worker.py::_verify_hit_enospc asks the same one."""
+        that can drift."""
         assert git_ops_mod.reports_disk_full is verify_classify_mod.reports_disk_full
+        assert worker_mod.reports_disk_full is verify_classify_mod.reports_disk_full
 
 
 # ---------------------------------------------------------------------------

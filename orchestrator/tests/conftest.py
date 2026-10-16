@@ -645,8 +645,8 @@ def _hermetic_disk_usage(monkeypatch):
 
     The free-space guards read the host's disk, so a verify host under the 10 GiB
     floor of ``orchestrator/src/orchestrator/merge_lane/worker.py::_ensure_verify_disk_space``
-    failed 163 lane tests on every branch (esc-5509-2). A test of a guard patches
-    ``shutil.disk_usage`` over this one with its own numbers.
+    failed lane and workflow tests on every branch (esc-5509-2). A test of a guard
+    patches ``shutil.disk_usage`` over this one with its own numbers.
     """
     monkeypatch.setattr(shutil, 'disk_usage', ample_disk_usage)
 
