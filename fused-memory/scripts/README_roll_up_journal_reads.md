@@ -124,22 +124,45 @@ shrink until a VACUUM. Run it only after `status` reports
 
 ```bash
 $RJ reclaim       # dry run: page figures, reclaimable bytes, blockers
+
+# Hold: make both units unstartable for the window. The lock lives in
+# $XDG_RUNTIME_DIR, so a reboot or logout mid-window releases it.
+HOLD="$XDG_RUNTIME_DIR/task5405-reclaim.lock"
+for unit in fused-memory.service fused-memory.socket; do
+  mkdir -p ~/.config/systemd/user/$unit.d
+  printf '[Unit]\nConditionPathExists=!%s\n' "$HOLD" \
+    > ~/.config/systemd/user/$unit.d/task5405-hold.conf
+done
+touch "$HOLD" && systemctl --user daemon-reload
 systemctl --user stop fused-memory.socket
 systemctl --user disable --now fused-memory.service
+
 $RJ reclaim --apply --temp-dir /home/leo/src/dark-factory/data/reconciliation
+
+rm "$HOLD" ~/.config/systemd/user/fused-memory.{service,socket}.d/task5405-hold.conf
+systemctl --user daemon-reload
 systemctl --user start fused-memory.socket
 systemctl --user enable --now fused-memory.service
 ```
 
-- **Stop the socket.** `fused-memory.socket` holds the listening port across
-  service restarts and starts the service on the next connection, whether or
-  not the service is enabled. Start it again BEFORE the service, so the
-  service inherits the socket's file descriptor.
-- **DISABLE the service, not just stop it.** The watchdog's
-  `fused_memory_liveness_pass` skips a DISABLED unit, but revives a merely
-  stopped one after ~3 port-down ticks (~180 s).
-- `reclaim` refuses while `systemctl --user is-active` reports either unit
-  active, or when their state cannot be confirmed.
+- **Why the hold.** Stopping the service is not enough, because several
+  things start it again:
+  - `fused-memory.socket` starts it on the next connection, enabled or not;
+  - the watchdog's `fused_memory_liveness_pass` revives a stopped, enabled
+    unit after ~3 port-down ticks (~180 s);
+  - the post-merge coordinator runs `scripts/restart-fused-memory.sh`;
+  - the watchdog's staleness backstop;
+  - `Wants=fused-memory.service` in the orchestrator units.
+
+  A start whose `ConditionPathExists` fails is skipped, whoever asks. This is
+  the same mechanism `plans/local-embedder-cutover-prd.md` designs a permanent
+  hold around. Task 5405 did not run this recipe against the live units, and
+  whether a restarter alarms on a skipped start is unverified. Check
+  `journalctl --user -u fused-memory.service --since -10min` after the window.
+- **Start the socket BEFORE the service**, so the service inherits the
+  socket's file descriptor.
+- `reclaim` itself refuses while `systemctl --user is-active` reports either
+  unit active, or when their state cannot be confirmed.
 - **Downtime:** the VACUUM measured 103 s on a scratch of the post-migration
   keep-set (2.33 GB), so budget ~2-5 min with the stop/start around it.
   fused-memory is down for the whole window.
