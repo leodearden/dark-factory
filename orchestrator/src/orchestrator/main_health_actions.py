@@ -1,18 +1,6 @@
-"""The next action a ``preexisting_main_break`` escalation carries (task 3774).
+"""The closed vocabulary of next actions a merge-lane ``preexisting_main_break`` escalation carries.
 
-``MainHealthNextAction`` is the closed vocabulary of those actions.
-Invariant: no member asks the reader to wait. The retired
-``'await_preexisting_main_hotfix'`` did exactly that on paths where nobody
-was producing a fix.
-
-The values are human-facing labels, rendered as "Suggested action" in
-briefings and the dashboard; they are not a parsed protocol.
-escalation-watcher-auto matches on category and summary, never on
-``suggested_action``.
-
-This is a leaf module so that both ``merge_lane/worker.py`` and
-``workflow.py`` can import it at module level: worker imports workflow, so
-the vocabulary cannot live in either.
+Invariant: no member asks the reader to wait.
 """
 
 from __future__ import annotations

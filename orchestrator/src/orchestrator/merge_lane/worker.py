@@ -1441,10 +1441,10 @@ def _file_main_health_escalation(
     Folds via ``submit_or_dedupe`` using the SAME inf-window
     content-fingerprint :class:`~escalation.dedupe.DedupeConfig`
     ``workflow.py``'s ``_auto_heal_main_health`` uses (categories=
-    ``('preexisting_main_break',)``), so a worker-filed and a (legacy)
-    workflow-filed main-red escalation for the same
-    ``(category, cause_hint, probe_sha)`` signature collapse into one
-    parent — race-free against sibling probes/tasks. Falls back to a plain
+    ``('preexisting_main_break',)``), so worker- and workflow-filed L1s for
+    one ``(category, cause_hint, probe_sha)`` signature collapse into one
+    parent, race-free; the task-verify L0 for that break stays separate
+    (dedupe never folds across ladder levels). Falls back to a plain
     ``queue.submit`` when *outcome* carries no fingerprint (the fail-safe
     ``''`` path of :func:`_main_health_fingerprint`).
     """

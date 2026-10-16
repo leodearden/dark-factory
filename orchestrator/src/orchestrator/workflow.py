@@ -726,9 +726,11 @@ def compute_preexisting_main_break_fingerprint(
 ) -> str:
     """Shared fingerprint for preexisting-main-break escalations.
 
-    Composes the same triple used by _verify_debugfix_loop inline so that
-    task-verify escalations and merge-queue escalations for the SAME broken
-    main fold into ONE parent via submit_or_dedupe.
+    Composes the same triple used by _verify_debugfix_loop inline, so every
+    escalation for the SAME broken main shares one fingerprint.
+    submit_or_dedupe folds only within a ladder level
+    (escalation/dedupe.py::find_dedupe_parent): the task-verify L0s fold into
+    one parent, and the merge-lane L1s into another.
 
     Returns '' on any exception (fail-safe — an empty fingerprint triggers
     the raw-submit path, not a crash).
