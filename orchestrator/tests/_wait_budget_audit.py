@@ -312,10 +312,19 @@ def _item_bills(
     return bills
 
 
+_ITEM_SEPARATOR = '::'
+
+
 def _item_id(owner: str | None, function_name: str) -> str:
     """The item's id within its module: ``'Class::method'``, or a
     module-level function's bare name."""
-    return function_name if owner is None else f'{owner}::{function_name}'
+    return function_name if owner is None else f'{owner}{_ITEM_SEPARATOR}{function_name}'
+
+
+def is_module_level_item(item: str) -> bool:
+    """Whether *item*, an id this module built, names a module-level test
+    function rather than a class's test method."""
+    return _ITEM_SEPARATOR not in item
 
 
 def item_wait_budgets(

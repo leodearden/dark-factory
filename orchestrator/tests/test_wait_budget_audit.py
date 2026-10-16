@@ -16,6 +16,7 @@ from _wait_budget_audit import (
     AMBIENT_TEST_TIMEOUT,
     LimitSource,
     WaitBudgetOffender,
+    is_module_level_item,
     item_limit_sources,
     item_wait_budgets,
     suppressed_result_wait_methods,
@@ -668,6 +669,16 @@ if x:
             f'Expected unparseable source to return {{}} without raising, '
             f'got {budgets!r}.'
         )
+
+    def test_item_ids_tell_module_level_functions_from_methods(self) -> None:
+        source = (
+            'async def test_x():\n    await asyncio.wait_for(a, timeout=1)\n'
+            'class TestY:\n    async def test_z(self):\n'
+            '        await asyncio.wait_for(a, timeout=1)\n'
+        )
+        kinds = {item: is_module_level_item(item) for item in item_wait_budgets(source)}
+
+        assert kinds == {'test_x': True, 'TestY::test_z': False}, kinds
 
     def test_module_level_test_function_is_keyed_by_its_bare_name(self) -> None:
         """pytest collects a module-level `test*` function as an item of
