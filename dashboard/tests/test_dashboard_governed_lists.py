@@ -9,7 +9,7 @@ with no disposition fails this suite before any test runs.
 
 from __future__ import annotations
 
-from shared.governed_exceptions import governed_exceptions
+from shared.governed_exceptions import Debt, TaskRef, governed_exceptions
 
 from dashboard.config import _LEGACY_CONFIG_NAMES
 
@@ -19,4 +19,6 @@ LEGACY_CONFIG_NAMES = governed_exceptions(
     'fallback after the canonical dark-factory-orchestrator.yaml, for a project not yet '
     'migrated to the canonical name.',
     list(_LEGACY_CONFIG_NAMES),
+    default=Debt(TaskRef(5603)),
+    default_covers=3,
 )
