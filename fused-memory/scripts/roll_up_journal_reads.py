@@ -13,11 +13,12 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import subprocess
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import closing
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ DEFAULT_DEPLOY_GRACE_MINUTES = 15.0
 DEFAULT_WINDOW_HOURS = (1, 24, 168)
 BUSY_TIMEOUT_MS = 30000
 ROLLUP_TABLE = 'read_op_counts'
+FUSED_MEMORY_UNIT = 'fused-memory.service'
 
 _ROLLUP_KEY_COLUMNS = ('hour_start', 'project_id', 'agent_id', 'operation')
 
@@ -116,6 +118,25 @@ class MigrationReport:
     rows_per_second: float
     remaining: RowidSpan | None
     preview: tuple[tuple[Any, ...], ...]
+
+
+@dataclass(frozen=True)
+class PageFigures:
+    page_size: int
+    page_count: int
+    freelist_count: int
+
+
+@dataclass(frozen=True)
+class ReclaimReport:
+    applied: bool
+    blockers: tuple[str, ...]
+    before: PageFigures
+    reclaimable_bytes: int
+    before_bytes: int
+    after: PageFigures | None = None
+    after_bytes: int | None = None
+    seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -356,6 +377,105 @@ def migrate(conn: sqlite3.Connection, limits: MigrationLimits) -> MigrationRepor
     )
 
 
+def fused_memory_unit_active() -> bool:
+    """True unless systemd confirms the unit is NOT active; fails closed."""
+    try:
+        probe = subprocess.run(
+            ['systemctl', '--user', 'is-active', FUSED_MEMORY_UNIT],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    return probe.stdout.strip() in ('active', 'activating', 'reloading', 'deactivating')
+
+
+def page_figures(conn: sqlite3.Connection) -> PageFigures:
+    return PageFigures(
+        page_size=_scalar(conn, 'PRAGMA page_size'),
+        page_count=_scalar(conn, 'PRAGMA page_count'),
+        freelist_count=_scalar(conn, 'PRAGMA freelist_count'),
+    )
+
+
+def on_disk_bytes(journal: Path) -> int:
+    """``.db`` + ``-wal`` + ``-shm``, as WriteJournal.growth_sample counts them."""
+    total = 0
+    for suffix in ('', '-wal', '-shm'):
+        sidecar = journal.with_name(journal.name + suffix)
+        if sidecar.exists():
+            total += sidecar.stat().st_size
+    return total
+
+
+def reclaim_blockers(conn: sqlite3.Connection, *, unit_active: Callable[[], bool]) -> list[str]:
+    blockers = []
+    span = count_only_span(conn)
+    if span is not None:
+        blockers.append(
+            f'count-only raw reads remain in rowids first_rowid={span.first_rowid} '
+            f'max_rowid={span.max_rowid}: finish migrate --apply first'
+        )
+    if unit_active():
+        blockers.append(
+            f'{FUSED_MEMORY_UNIT} is active (or its state could not be confirmed): '
+            f'systemctl --user disable --now {FUSED_MEMORY_UNIT} first'
+        )
+    return blockers
+
+
+def use_temp_dir(conn: sqlite3.Connection, temp_dir: Path) -> None:
+    """Point VACUUM's temporary copy at *temp_dir* (process-wide, as SQLite defines it)."""
+    conn.execute(f"PRAGMA temp_store_directory = '{temp_dir.resolve()}'")
+    if _scalar(conn, 'PRAGMA temp_store_directory') != str(temp_dir.resolve()):
+        raise PreflightError(
+            'this sqlite build ignores PRAGMA temp_store_directory: '
+            'set SQLITE_TMPDIR in the environment instead of --temp-dir'
+        )
+
+
+def vacuum_in_place(conn: sqlite3.Connection) -> None:
+    """VACUUM keeps the file's inode, so a long-lived reader's handle stays valid."""
+    conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    conn.execute('VACUUM')
+    conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+
+
+def reclaim(
+    journal: Path,
+    *,
+    apply: bool,
+    unit_active: Callable[[], bool],
+    temp_dir: Path | None = None,
+) -> ReclaimReport:
+    with closing(connect_read_only(journal)) as conn:
+        blockers = tuple(reclaim_blockers(conn, unit_active=unit_active))
+        before = page_figures(conn)
+    report = ReclaimReport(
+        applied=False,
+        blockers=blockers,
+        before=before,
+        reclaimable_bytes=before.freelist_count * before.page_size,
+        before_bytes=on_disk_bytes(journal),
+    )
+    if not apply:
+        return report
+    if blockers:
+        raise PreflightError('; '.join(blockers))
+    started = time.monotonic()
+    with closing(connect_for_migration(journal)) as conn:
+        if temp_dir is not None:
+            use_temp_dir(conn, temp_dir)
+        vacuum_in_place(conn)
+        after = page_figures(conn)
+    return replace(
+        report,
+        applied=True,
+        after=after,
+        after_bytes=on_disk_bytes(journal),
+        seconds=round(time.monotonic() - started, 3),
+    )
+
+
 def _common_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument('--journal', type=Path, default=DEFAULT_JOURNAL)
@@ -389,6 +509,16 @@ def build_parser() -> argparse.ArgumentParser:
     move.add_argument('--max-chunks', type=int, default=None)
     move.add_argument(
         '--deploy-grace-minutes', type=float, default=DEFAULT_DEPLOY_GRACE_MINUTES
+    )
+
+    vacuum = commands.add_parser(
+        'reclaim', parents=[common], help='VACUUM in place; fused-memory must be disabled'
+    )
+    vacuum.add_argument('--apply', action='store_true')
+    vacuum.add_argument(
+        '--temp-dir', type=Path, default=None,
+        help="VACUUM's temporary copy (default: SQLite's own: $SQLITE_TMPDIR, $TMPDIR, "
+        '/var/tmp, /usr/tmp, /tmp)',
     )
     return parser
 
@@ -441,7 +571,15 @@ def _run_migrate(args: argparse.Namespace) -> int:
     return 0
 
 
-_COMMANDS = {
+def _run_reclaim(args: argparse.Namespace, unit_active: Callable[[], bool]) -> int:
+    report = reclaim(
+        args.journal, apply=args.apply, unit_active=unit_active, temp_dir=args.temp_dir
+    )
+    _print_json(asdict(report))
+    return 0
+
+
+_COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {
     'status': _run_status,
     'snapshot': _run_snapshot,
     'verify': _run_verify,
@@ -449,9 +587,15 @@ _COMMANDS = {
 }
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    unit_active: Callable[[], bool] = fused_memory_unit_active,
+) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.command == 'reclaim':
+            return _run_reclaim(args, unit_active)
         return _COMMANDS[args.command](args)
     except (PreflightError, RollupVerificationError, sqlite3.Error, OSError) as exc:
         print(f'{args.command} refused or failed: {type(exc).__name__}: {exc}', file=sys.stderr)
