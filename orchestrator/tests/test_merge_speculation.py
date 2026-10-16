@@ -65,6 +65,7 @@ from _orch_helpers import (  # noqa: F401
     pydantic_spec,
     wait_responsive,
 )
+from _wait_budget_audit import timeout_mark_offenders, worst_per_method_wait_budget
 from test_merge_queue_concurrent_verify import (  # noqa: F401
     _FAIL_OPEN_LOGGERS,
     HEAVY_BARRIER_TEST_TIMEOUT,
@@ -77,8 +78,6 @@ from test_merge_queue_concurrent_verify import (  # noqa: F401
     _make_branch_with_file,
     _make_request,
     _stop_worker,
-    _timeout_mark_offenders,
-    _worst_per_method_wait_budget,
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig  # noqa: F401
@@ -1406,7 +1405,7 @@ def _make_late_arrival_lane(
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against worst_per_method_wait_budget
 class TestLateArrivalAttaches:
     """Step-1 RED — late arrival B attaches to in-flight predecessor A's merge commit.
 
@@ -1621,7 +1620,7 @@ class TestLateArrivalAttaches:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against worst_per_method_wait_budget
 class TestLateArrivalCleanCAS:
     """Step-3 RED→GREEN — after A lands, B advances via clean CAS (DONE-WHEN 3).
 
@@ -1800,7 +1799,7 @@ class TestLateArrivalCleanCAS:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against worst_per_method_wait_budget
 class TestLateArrivalFailCascade:
     """Step-5 RED→GREEN — predecessor failing invalidates the late arrival (DONE-WHEN 4).
 
@@ -2038,7 +2037,7 @@ class TestLateArrivalFailCascade:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against worst_per_method_wait_budget
 class TestLateArrivalGuards:
     """Step-7 guards — fallback + permit accounting + depth-K + skip_verify + K=1 sanity.
 
@@ -2562,7 +2561,7 @@ class TestLateArrivalGuards:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against worst_per_method_wait_budget
 class TestLateArrivalSubmissionOrderCAS:
     """Step-8 guard — main advances in strict submission order on the late-arrival path.
 
@@ -2874,7 +2873,7 @@ class TestJournalLandedThenAdvanceHelper:
 # `wall-clock-deadline` and `bare-dataclass-double`. Two independent reasons,
 # both hard:
 #
-#   1. It is not an AST-only guard. `_timeout_mark_offenders` resolves each
+#   1. It is not an AST-only guard. `timeout_mark_offenders` resolves each
 #      class through a RUNTIME resolver (`globals().get` below) and reads the
 #      live `cls.pytestmark` marks, and the mark's argument is a Name
 #      (`@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)`), not a literal a
@@ -2902,7 +2901,7 @@ class TestTimeoutMarkCoverage:
     """Enforced invariant: every class in THIS module must have its computed
     worst-case per-method wait budget cleared by the timeout it actually
     runs under -- its own ``@pytest.mark.timeout`` mark if it has one, else
-    the ambient budget (see ``_timeout_mark_offenders``).
+    the ambient budget (see ``timeout_mark_offenders``).
 
     Task 3492 built this guard and applied it to
     test_merge_queue_concurrent_verify.py, but hard-scoped it to that file's
@@ -2916,7 +2915,7 @@ class TestTimeoutMarkCoverage:
     can be driven with foreign input, and a second copy would be free to
     drift from the marks it audits.
 
-    ``_call_wait_budget`` bills a ``wait_responsive(...)`` site its stretched
+    ``_wait_budget_audit.py::_call_wait_budget`` bills a ``wait_responsive(...)`` site its stretched
     worst case, ``min(RESPONSIVE_WAIT_STRETCH * timeout,
     RESPONSIVE_WAIT_WALL_CAP)``.  The helper computes its own default cap from
     that SAME formula, which is what makes the bill an EXACT upper bound on
@@ -2935,8 +2934,8 @@ class TestTimeoutMarkCoverage:
         single source of those figures, so none is restated beside a mark.
         """
         source = Path(__file__).read_text()
-        budgets = _worst_per_method_wait_budget(source, module_constants=globals())
-        offenders = _timeout_mark_offenders(budgets, globals().get)
+        budgets = worst_per_method_wait_budget(source, module_constants=globals())
+        offenders = timeout_mark_offenders(budgets, globals().get)
 
         assert not offenders, (
             'The following classes have a computed worst-case per-method '

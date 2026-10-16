@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import contextlib
 import dataclasses
@@ -45,12 +44,10 @@ from _orch_helpers import (
     wait_responsive,
 )
 from _resolution_merges import resolution_merge
+from _wait_budget_audit import item_wait_budgets, timeout_mark_offenders
 from test_merge_queue_concurrent_verify import (
     HEAVY_BARRIER_TEST_TIMEOUT,
     _fake_verify_result,
-    _iter_test_methods,
-    _method_wait_budget,
-    _timeout_mark_offenders,
 )
 
 from orchestrator.artifacts import TaskArtifacts
@@ -23579,8 +23576,8 @@ class TestTimeoutMarkCoverage:
     Checked per test, not per class as in the sibling guards: this module
     carries method-level ``@pytest.mark.timeout`` marks, and pytest applies
     the closest mark, so a method's own mark REPLACES its class's. The audit
-    engine is imported from test_merge_queue_concurrent_verify unchanged;
-    only the lookup of which object holds the effective mark is local.
+    engine is imported from _wait_budget_audit unchanged; only the lookup of
+    which object holds the effective mark is local.
 
     The bill bounds what the source SPELLS, not what runs: each wait call
     site is billed once, so a wait inside a loop, or inside a nested helper
@@ -23597,7 +23594,7 @@ class TestTimeoutMarkCoverage:
             def test_inherits(self) -> None: ...
 
         resolve = _effective_timeout_mark_resolver({'_Marked': _Marked})
-        offenders = _timeout_mark_offenders(
+        offenders = timeout_mark_offenders(
             {'_Marked::test_tight': 360.0, '_Marked::test_inherits': 360.0}, resolve,
         )
 
@@ -23607,7 +23604,7 @@ class TestTimeoutMarkCoverage:
             f'test_tight is short of its 360s bill; got {offenders!r}'
         )
 
-        unresolved = _timeout_mark_offenders({'_Missing::test_x': 360.0}, resolve)
+        unresolved = timeout_mark_offenders({'_Missing::test_x': 360.0}, resolve)
         assert len(unresolved) == 1 and 'could not be resolved' in unresolved[0], (
             f'an unknown class must be a loud offender, not a silent skip; got {unresolved!r}'
         )
@@ -23621,7 +23618,7 @@ class TestTimeoutMarkCoverage:
         resolve = _effective_timeout_mark_resolver(
             {'test_marked': test_marked, 'test_unmarked': test_unmarked},
         )
-        offenders = _timeout_mark_offenders(
+        offenders = timeout_mark_offenders(
             {'test_marked': 360.0, 'test_unmarked': 360.0}, resolve,
         )
 
@@ -23631,17 +23628,8 @@ class TestTimeoutMarkCoverage:
         )
 
     def test_every_test_runs_under_a_timeout_clearing_its_wait_budget(self) -> None:
-        source = Path(__file__).read_text()
-        budgets = {
-            f'{class_name}::{method.name}': _method_wait_budget(method, module_constants=globals())
-            for class_name, method in _iter_test_methods(source)
-        } | {
-            function.name: _method_wait_budget(function, module_constants=globals())
-            for function in ast.parse(source).body
-            if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and function.name.startswith('test_')
-        }
-        offenders = _timeout_mark_offenders(
+        budgets = item_wait_budgets(Path(__file__).read_text(), module_constants=globals())
+        offenders = timeout_mark_offenders(
             budgets, _effective_timeout_mark_resolver(globals()),
         )
 

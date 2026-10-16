@@ -72,11 +72,10 @@ from _merge_lane_fakes import (
     passes,
 )
 from _orch_helpers import PYPROJECT_DEFAULT_TIMEOUT, wait_responsive
+from _wait_budget_audit import timeout_mark_offenders, worst_per_method_wait_budget
 from test_merge_queue_concurrent_verify import (
     _inject_two_host_allocator,
     _make_branch_with_file,
-    _timeout_mark_offenders,
-    _worst_per_method_wait_budget,
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -2981,7 +2980,7 @@ class TestTimeoutMarkCoverage:
     """Enforced invariant: every class in THIS module must have its computed
     worst-case per-method wait budget cleared by the timeout it actually
     runs under -- its own ``@pytest.mark.timeout`` mark if it has one, else
-    the ambient budget (see ``_timeout_mark_offenders``).
+    the ambient budget (see ``timeout_mark_offenders``).
 
     Task 3492 built this guard, and task 5030 gave test_merge_speculation.py
     its own copy -- but both resolve ``Path(__file__)`` against their own
@@ -3015,8 +3014,8 @@ class TestTimeoutMarkCoverage:
         single source of those figures, so none is restated beside a mark.
         """
         source = Path(__file__).read_text()
-        budgets = _worst_per_method_wait_budget(source, module_constants=globals())
-        offenders = _timeout_mark_offenders(budgets, globals().get)
+        budgets = worst_per_method_wait_budget(source, module_constants=globals())
+        offenders = timeout_mark_offenders(budgets, globals().get)
 
         assert not offenders, (
             'The following classes have a computed worst-case per-method '
