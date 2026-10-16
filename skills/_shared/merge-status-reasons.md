@@ -33,7 +33,11 @@ Sources of truth, named once: the reason vocabulary is
 
 1. **Switch on `reason`.** Never on `hint`, which is prose rendered from `reason` for a human
    reader, and never on a git ancestry exit code: the server's git tier has already run the
-   landing probe, and its verdict arrives as a field.
+   landing probe, and its verdict arrives as a field. Where a hint and the action column
+   below disagree, the action column governs. The `never_submitted` and
+   `prior_run_terminal` hints both invite a resubmit, but the server writes a hint without
+   knowing which handle you polled or whether anyone is watching. A resubmit is licensed
+   only on the terms stated in the [switch](#the-switch).
 2. **`last_outcome` is history unless it says otherwise.** It accompanies any state whenever a
    durable finalize row exists for the key, labelled with `run_id`, `finished_at` and
    `is_current_run`. `is_current_run: false` means another orchestrator run wrote it — never
@@ -42,8 +46,10 @@ Sources of truth, named once: the reason vocabulary is
    branch-keyed poll reaches the git tier (`escalation/src/escalation/server.py::_PollKey.landing_key`).
    Before acting on `stale_record` or `no_record` from a request_id poll, re-poll once with
    `merge_status(task_id="<TASK_ID>")` and switch on that answer instead. A landing shows up
-   there as an ordinary `done` with `kind: "found_on_main"` and a `merge_sha`. If the re-poll
-   is also `stale_record`, report the request_id answer's `last_outcome`: it names your request.
+   there as an ordinary `done` with `kind: "found_on_main"` and a `merge_sha`, and only that
+   shape counts as one. A re-poll `done` without them may be an earlier round's current-run
+   row, so it is unconfirmed. If the re-poll is also `stale_record`, report the request_id
+   answer's `last_outcome`: it names your request.
 
 <a id="the-switch"></a>
 ## The switch
@@ -55,7 +61,7 @@ Sources of truth, named once: the reason vocabulary is
 | `prior_run_terminal` | `stale_record` | only another orchestrator run's finalize row exists | **REPORT** `last_outcome` (`state`, `run_id`, `finished_at`, `reason`) as history, and stop. Never resubmit on it and never stamp `done_provenance` from it: resubmitting after a prior-run record is a human's decision, and an unattended caller aborts |
 | `never_submitted` | `no_record` | no tier holds a record and git shows no landing: never enqueued (expected for the own `request_id` of an `attached` submit whose `poll_by` is `task_id` or `branch`), or its record was lost | **NOT IN FLIGHT HERE**: the consumer's disposition decides. A resubmit is licensed only by a task_id- or branch-keyed `never_submitted` with `get_merge_queue()` showing no entry for the branch |
 | `coalesce_train_id` | `stale_record` | the id names a coalesce train with no outcome row of its own; `last_outcome` is a member's absorption record, never your outcome | **FOLLOW THE MEMBERS**: for your own branch, take merge-queue's [Follow the superseded successor](../merge-queue/SKILL.md#follow-the-superseded-successor) Escape |
-| `landing_unattributable` | any epistemic state but `unknown`, replacing that state's own reason | git shows the branch's work on main but could not confirm attribution or effect | **VERIFY**, never resubmit. Run [the ladder](deriving-landed-sha.md#the-ladder) in full: a stampable sha is a landing (`done_provenance` kind `found_on_main`, with `commit` and the ladder's `note`); no stampable sha means stop and report |
+| `landing_unattributable` | any epistemic state but `unknown`, replacing that state's own reason | git shows the branch's work on main but could not confirm attribution or effect | **VERIFY** at once, never resubmit. It is not transient, so it exits every poll loop, including an arm that otherwise treats epistemic answers as its live state. Run [the ladder](deriving-landed-sha.md#the-ladder) in full: a stampable sha is a landing (`done_provenance` kind `found_on_main`, with `commit` and the ladder's `note`); no stampable sha means stop and report |
 | any reason not listed here | — | the vocabulary grew past this table | **FAIL CLOSED**: stop and report `state`, `reason` and `hint` verbatim |
 
 <a id="wait-bound"></a>

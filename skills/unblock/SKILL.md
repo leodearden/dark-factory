@@ -466,8 +466,9 @@ The merge procedure is iterative — don't assume one pass will be enough:
                 # arm's live state until git proves the landing
              poll_kwargs = {"branch": "task/<TASK_ID>"}
 
-     # epistemic states stop the scoped arms' loop so *Polled epistemic answers* below can
-     # switch on reason; on the branch arm they are the live state, so its set excludes them.
+     # epistemic states stop the request_id and task_id arms' loop so *Polled epistemic
+     # answers* below can switch on reason; on the branch arm they are the live state, so its
+     # set excludes them — all but landing_unattributable, which the loop exits on first.
      # superseded means this request was superseded by another one — either absorbed into a
      # coalesced train, or replaced by a generation-advance resubmission (see *Polled terminal
      # failures* below; the two need different remediation). It stays terminal on every arm
@@ -490,8 +491,8 @@ The merge procedure is iterative — don't assume one pass will be enough:
      # merge-state-vocab:end
      # 20-min hard ceiling on BOTH unscoped arms (branch and task_id): each can reject a
      # terminal `done` (see accept_terminal), the event-store tier re-serves the same
-     # current-run row every tick, and on the branch arm epistemic answers never stop the
-     # loop — so without a floor the loop would spin forever. request_id is
+     # current-run row every tick, and on the branch arm epistemic answers other than
+     # landing_unattributable never stop the loop — so without a floor it would spin forever. request_id is
      # submission-scoped, never rejects, and keeps its unbounded wait.
      deadline = None if poll_by == "request_id" else now() + 1200
      timed_out = False
@@ -538,6 +539,8 @@ The merge procedure is iterative — don't assume one pass will be enough:
      loop:
          sleep(poll_interval)  # realise per skills/merge-queue/SKILL.md#waiting-between-polls -- a bare sleep 60 is blocked by the harness
          poll = mcp__escalation__merge_status(**poll_kwargs)
+         if poll_by == "branch" and poll.get("reason") == "landing_unattributable":
+             break                # git already sees the work on main: verify now, not at the ceiling
          if poll["state"] in terminal and accept_terminal(poll):
              break
          if deadline is not None and now() >= deadline:
@@ -572,10 +575,10 @@ The merge procedure is iterative — don't assume one pass will be enough:
      **On rc=1 `branch_on_main()` is False and `accept_terminal` keeps polling — rc=1 never licenses a resubmit in this skill.** It does not abort either (contrast `skills/unblock-low-risk/SKILL.md`, which aborts and cancels on a genuine not-landed outcome). And remember the ladder's carve-out: on the `coalesce-*` arm rc=1 is the normal, permanent post-landing state for a non-tip train member, resolved by `skills/merge-queue/SKILL.md` rules 2–3, not by waiting it out here.
 
      After the loop exits:
-     - `timed_out` (either unscoped arm's 20-minute deadline reached without an accepted terminal state) → do NOT resubmit and do NOT direct-merge. If the last answer was epistemic, switch on its `reason` per [the shared reason switch](../_shared/merge-status-reasons.md#the-switch) (`landing_unattributable` → verify; a stampable sha → step 8 with `found_on_main`). If it was a `done` that `accept_terminal` rejected, run the [canonical ancestry check](#branch-on-main) once more and follow it into [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#the-ladder) in full — **including [step 1](../_shared/deriving-landed-sha.md#step-1)'s exact-subject marker search on the rc=128 arm**, since a branch deleted by a successful merge is the likeliest reason you got here — and go to step 8 only on a verified sha. Otherwise stop and report to the human.
+     - `timed_out` (either unscoped arm's 20-minute deadline reached without an accepted terminal state) → do NOT resubmit and do NOT direct-merge. If the last answer was epistemic, it came from the `branch` arm and was not `landing_unattributable` (that reason leaves the loop at once). Report its `state`, `reason` and `last_outcome` to the human; no reason in [the shared reason switch](../_shared/merge-status-reasons.md#the-switch) licenses more here. If it was a `done` that `accept_terminal` rejected, run the [canonical ancestry check](#branch-on-main) once more and follow it into [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#the-ladder) in full — **including [step 1](../_shared/deriving-landed-sha.md#step-1)'s exact-subject marker search on the rc=128 arm**, since a branch deleted by a successful merge is the likeliest reason you got here — and go to step 8 only on a verified sha. Otherwise stop and report to the human.
      - `poll["state"] == "done"` → **if the response carries `merge_sha`** (the git-authority tier's `kind: "found_on_main"` shape), thread it as `done_provenance={"kind": "found_on_main", "commit": "<merge_sha>", "note": "<explanation>"}` — **not** a bare `commit`. `merge_sha` is always a commit ON main on both of the tier's resolution paths — the citing commit discovered on main on the live-branch path, the merge commit itself on the deleted-branch path — and on both it is checked to still be present at main HEAD before being returned (`escalation/src/escalation/git_authority.py::found_on_main_response`), so stamp it **exactly as returned**; never substitute the branch tip or a `git merge-base` result for it. **First exception:** on a project that sets `git.commit_citation_pattern: ""` (an explicit per-project opt-out) the live-branch path skips the citation gate and `merge_sha` is the raw branch tip — neither a commit on main nor effect-present-checked — so confirm it with the exact-subject re-derivation below instead of stamping it. **Second exception:** if the task declares a non-empty `metadata.delivered_checks` and the delivered-checks differential confirmed the capability, the tier accepts even though the commit's effect is ABSENT at main HEAD — `merge_sha` is still a commit on main, but it may name a landing that was later reverted, and the `merge_status` response does not say which case you are in — so for such a task confirm it the same way before stamping it. **Otherwise** — including on either unscoped arm (`poll_by` `"branch"` or `"task_id"`), where the live or event-store tier resolves `done` with no `merge_sha` — `merge_status` gives you no commit hash (`poll["outcome"]` is the raw state string `"done"`), so re-derive the true merge commit from git with [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#the-ladder) — start at [step 1](../_shared/deriving-landed-sha.md#step-1)'s exact-subject marker search, and if it comes back empty continue into the rest of the ladder rather than concluding anything. Take the command from there, not from memory: that copy carries the `--fixed-strings` substring-safety rationale and the `git.branch_prefix` / `git.main_branch` override caveat, and on a project that overrides either, a hardcoded subject builds the *wrong* search. **Never substitute main's HEAD or an eyeballed `git log main --oneline | head -5`** — [Never derive the sha from main's HEAD](../_shared/deriving-landed-sha.md#never-from-head) has the reason the server's only backstop would not catch it. **This call site's dispositions:** thread the sha into `done_provenance={"kind": "merged", "commit": "<sha>"}` — `kind` is **required** (the server rejects a kind-less blob with `done_provenance.kind is required`), and this branch supplied the merge, so `merged` is the right kind here; an empty marker search is **not** a not-landed verdict and is never an excuse for a
        note-only `{"note": "<explanation>"}` <!-- provenance-guard: negative --> payload, which the server rejects too. Then proceed to step 8.
-     - an epistemic state on a scoped arm → see *Polled epistemic answers* below.
+     - an epistemic state on the `request_id` or `task_id` arm (the arms whose terminal set includes the epistemic states), or `landing_unattributable` on the `branch` arm → see *Polled epistemic answers* below.
      - `poll["state"] in ("conflict", "blocked", "abandoned")` → see *Polled terminal failures* below. **On the unscoped arms (`poll_by` `"branch"` or `"task_id"`) these are UNCONFIRMED** — per the staleness guard above they may be a prior round's record for this same reused branch/task_id rather than this submission's outcome. Before acting on one, re-check `mcp__escalation__get_merge_queue()` and who owns the worktree; if this branch is still in flight, keep polling to the 20-minute ceiling instead of resubmitting on a stale failure.
      - `poll["state"] == "superseded"` → **on the `request_id` arm** (always submission-scoped) follow the train/successor directly. **On the unscoped arms (`poll_by` `"branch"` or `"task_id"`) this is UNCONFIRMED** per the staleness guard above — with a further wrinkle for a coalesce-absorbed member, where that arm's `superseded` can be permanent rather than merely stale. See *Polled terminal failures* below for the full follow-the-train procedure and why ancestry plus the two landing signals there, not re-polling this same handle, is the real resolution.
 
@@ -610,14 +613,14 @@ The merge procedure is iterative — don't assume one pass will be enough:
 *Polled terminal failures (from `merge_status`):*
 
 - `poll["state"] == "conflict"`, `poll["state"] == "blocked"`, or `poll["state"] == "abandoned"` → same fix-and-resubmit loop: fix in worktree, rebase on main, loop back to step 7 (backing out of that rebase goes through [Recovering a wedged rebase or merge](#recovering-a-wedged-rebase-or-merge)). (For `abandoned`, also verify the cancellation was not intentional before resubmitting.)
-- **Polled epistemic answers** — a scoped arm stopped on a state that describes the server's records rather than the merge. Switch on its `reason` per [the shared reason switch](../_shared/merge-status-reasons.md#the-switch), including its [request_id re-poll rule](../_shared/merge-status-reasons.md#request-id-polls); never reconstruct the answer from ancestry exit codes. **This site's dispositions:**
+- **Polled epistemic answers** — the `request_id` or `task_id` arm (the arms whose terminal set includes the epistemic states) stopped on a state that describes the server's records rather than the merge, or the `branch` arm stopped on `landing_unattributable`. Switch on its `reason` per [the shared reason switch](../_shared/merge-status-reasons.md#the-switch), including its [request_id re-poll rule](../_shared/merge-status-reasons.md#request-id-polls); never reconstruct the answer from ancestry exit codes. **This site's dispositions:**
   - **Wait-state reasons** → resume the step-7 loop on the same handle, under the shared [wait bound](../_shared/merge-status-reasons.md#wait-bound) (on the `request_id` arm that is the only bound).
   - **`never_submitted`**, confirmed by a task_id-keyed answer, with no entry for the branch in `mcp__escalation__get_merge_queue()` → loop back to **step 7** (resubmit).
   - **`prior_run_terminal`** → report `last_outcome` to the user and stop; resubmit only on their say-so.
   - **`landing_unattributable`** → verify per the shared switch; a stampable sha → **step 8** with `done_provenance={"kind": "found_on_main", "commit": "<that sha>", "note": "<the note the ladder specifies for that arm>"}`; both fields are required.
   - **`coalesce_train_id`** → the `superseded` bullet's branch-handle fallback below.
 
-  **Never fall back to direct merge in response to an epistemic answer.** The `poll_by == "branch"` arm never stops here (its terminal set excludes epistemic states); its exit is `timed_out` above.
+  **Never fall back to direct merge in response to an epistemic answer.** The `poll_by == "branch"` arm stops here only on `landing_unattributable`; its other epistemic answers are its live state (its terminal set excludes them), and its exit is `timed_out` above.
 
 - `poll["state"] == "superseded"` → this request was superseded by another one. Two distinct
   mechanisms produce that state, and they need different remediation — check `superseded_by`'s

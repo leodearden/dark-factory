@@ -221,34 +221,33 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
 
      ```
      deadline = now() + 1200 s          # 20-minute hard ceiling
+     # WAIT_REASONS = the reasons whose action is WAIT in
+     #   skills/_shared/merge-status-reasons.md#the-switch
      # merge-state-vocab:begin partition=LIVE_STATES
      #   Mirrors shared/src/shared/merge_state.py::LIVE_STATES. Pinned by
      #   scripts/tests/test_merge_state_vocabulary_consistency.py — extend the enum
      #   and this set goes red until it matches.
-     while state ∈ {queued, verifying, gate, finalizing} and now() < deadline:
+     while (state ∈ {queued, verifying, gate, finalizing} or reason ∈ WAIT_REASONS) and now() < deadline:
      # merge-state-vocab:end
          wait = clamp(eta_seconds if eta_seconds else 30, min=15, max=60)
          sleep(wait)   # unattended: realise per skills/merge-queue/SKILL.md#waiting-between-polls, its FOREGROUND form only -- a bare sleep 60 is blocked by the harness
          result = mcp__escalation__merge_status(request_id)
      # merge-state-vocab:begin partition=LIVE_STATES
      #   Mirrors shared/src/shared/merge_state.py::LIVE_STATES (second copy).
-     if state ∈ {queued, verifying, gate, finalizing}:   # deadline exceeded, entry still live
+     if state ∈ {queued, verifying, gate, finalizing} or reason ∈ WAIT_REASONS:   # deadline exceeded, entry still live or still waiting
      # merge-state-vocab:end
          mcp__escalation__merge_cancel(request_id)
          ABORT   # leave escalation pending; 'one attempt, abort on doubt'
      ```
 
      Use `eta_seconds` from each `merge_status` response as the cadence hint; clamp to [15 s,
-     60 s]. Cap total polling at 20 minutes: if the entry is still live at the deadline, call
-     `merge_cancel(request_id)` and ABORT — leaving the escalation pending for a human,
-     consistent with the skill's bounded-operation ethos and 'one attempt, abort on doubt'
-     principle. Proceed to step 9 with the final `result.state` if the deadline is not reached.
-
-     An epistemic answer also ends the loop, since it is not a live state. If its `reason` is a
-     wait state per [the shared reason switch](../_shared/merge-status-reasons.md#the-switch),
-     keep polling under the **same** step-8 deadline (it replaces the shared doc's own wait
-     bound); if the answer is still a wait state when that deadline passes,
-     `merge_cancel(request_id)` and ABORT as above. Every other epistemic answer goes to step 9.
+     60 s]. Cap total polling at 20 minutes: if the entry is still live, or still answering a
+     wait-state reason, at the deadline, call `merge_cancel(request_id)` and ABORT — leaving the
+     escalation pending for a human, consistent with the skill's bounded-operation ethos and
+     'one attempt, abort on doubt' principle. This deadline replaces the shared doc's own
+     [wait bound](../_shared/merge-status-reasons.md#wait-bound). Proceed to step 9 with the
+     final `result` if the deadline is not reached; any epistemic answer that reaches step 9 is
+     therefore not a wait state.
 
 9. **Handle the outcome.** The `merge_request` (in-window) and `merge_status` (polled) vocabularies
    overlap but differ: `failed`/`unknown_branch` appear only as `merge_request` statuses (the server
@@ -367,7 +366,16 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      `request_id`, so before acting on `stale_record` or `no_record` re-poll once with
      `merge_status(task_id=task_id)` and switch on that answer instead. Unattended, so every
      answer ends in ABORT except two:
-     - A re-poll answer of `done` → handle exactly as the polled `done` arm above.
+     - A re-poll `done` carrying `kind: "found_on_main"` and a `merge_sha` (the only re-poll
+       shape the shared rule counts as a landing) → success; proceed with sub-steps a–d using
+       `done_provenance={"kind": "found_on_main", "commit": "<merge_sha>", "note": "landed
+       per the task_id-keyed merge_status git-authority tier, after an epistemic request_id
+       answer"}`. **Two exceptions**, where `merge_sha` is not safe to stamp as returned: a
+       project that sets `git.commit_citation_pattern: ""` (there `merge_sha` is the raw
+       branch tip, not a commit on main), and a task that declares a non-empty
+       `metadata.delivered_checks` (there `merge_sha` may name a landing since reverted). In
+       either case, run [Deriving the landed sha](#deriving-the-landed-sha) and stamp only
+       the sha it yields.
      - `landing_unattributable` → run [Deriving the landed sha](#deriving-the-landed-sha). A
        stampable sha → success; proceed with sub-steps a–d using
        `done_provenance={"kind": "found_on_main", "commit": "<sha from the ladder>",
@@ -376,8 +384,9 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
 
      Every other answer — `prior_run_terminal` (copy `last_outcome`'s `state`, `run_id`,
      `finished_at` and `reason` into the return value's `reason`), `never_submitted`,
-     `coalesce_train_id`, a wait state at the step-8 deadline, a reason the shared doc does not
-     list, or any other re-poll answer → `mcp__escalation__merge_cancel(request_id)` then
+     `coalesce_train_id`, a reason the shared doc does not list, or any other re-poll answer
+     (a `done` without `kind: "found_on_main"` and a `merge_sha` included: it may be an earlier
+     round's row) → `mcp__escalation__merge_cancel(request_id)` then
      **ABORT**. Never resubmit, never direct-merge.
 
 ### Rebase recovery preflight

@@ -500,8 +500,8 @@ PINNED_SITES: dict[str, tuple[tuple[str, ...], str]] = {
     ),
     "skills/unblock/SKILL.md": (
         ("TERMINAL_STATES", "POLL_STOP_STATES"),
-        "the two poll tuples — branch arm (TERMINAL_STATES) and scoped arms "
-        "(POLL_STOP_STATES)",
+        "the two poll tuples — branch arm (TERMINAL_STATES) and request_id/task_id "
+        "arms (POLL_STOP_STATES)",
     ),
     "skills/unblock-low-risk/SKILL.md": (
         ("SUBMIT_TERMINAL", "SUBMIT_NON_TERMINAL", "LIVE_STATES", "LIVE_STATES"),
