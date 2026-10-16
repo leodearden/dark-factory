@@ -823,12 +823,13 @@ class TestLanePassRecords:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture, command: str, returncode: int
     ) -> None:
         with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
-            worker = await _run_one_pass(tmp_path, command, until_phase=Phase.CONFIRM)
+            worker = await _run_one_pass(tmp_path, command, until_phase=Phase.DETECT)
 
-        detect = _current_pass_record(worker).detect
-        assert detect is not None
-        assert detect.returncode == returncode
-        assert detect.ended_by == EndedBy.SIGNAL
+        record = _current_pass_record(worker)
+        assert record.detect is not None
+        assert record.detect.returncode == returncode
+        assert record.detect.ended_by == EndedBy.SIGNAL
+        assert record.confirm is None
         assert ['ended_by=signal' in line for line in _sub_run_logs(caplog, _LANE_COMMAND)] == [True]
 
     def test_an_allocated_pass_has_its_header_before_any_sub_run(self, tmp_path: Path) -> None:
@@ -950,16 +951,17 @@ class TestLegacyLegRecords:
         _add_lane_script(tmp_path, RUN_ALL_INFRA_SCRIPT, 'kill -9 $$')
 
         with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
-            await _drive_one_pass(worker, LEGACY_INFRA_COMMAND, Phase.CONFIRM)
+            await _drive_one_pass(worker, LEGACY_INFRA_COMMAND, Phase.DETECT)
 
         assert ['ended_by=signal' in line for line in _sub_run_logs(caplog, 'infra')] == [True]
+        assert _current_pass_record(worker, LEGACY_INFRA_COMMAND).confirm is None
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ('body', 'until_phase', 'session_complete', 'ended_by'),
+        ('body', 'session_complete', 'ended_by'),
         [
-            ('exit 0', Phase.DETECT, True, EndedBy.EXIT),
-            ('kill -9 $$', Phase.CONFIRM, False, EndedBy.SIGNAL),
+            ('exit 0', True, EndedBy.EXIT),
+            ('kill -9 $$', False, EndedBy.SIGNAL),
         ],
         ids=['exit', 'signal'],
     )
@@ -968,7 +970,6 @@ class TestLegacyLegRecords:
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
         body: str,
-        until_phase: Phase,
         session_complete: bool,
         ended_by: EndedBy,
     ) -> None:
@@ -976,7 +977,7 @@ class TestLegacyLegRecords:
         _add_lane_script(tmp_path, RUN_OFFLINE_DEEP_SCRIPT, body)
 
         with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
-            await _drive_one_pass(worker, LEGACY_NUMERIC_COMMAND, until_phase)
+            await _drive_one_pass(worker, LEGACY_NUMERIC_COMMAND, Phase.DETECT)
 
         record = _current_pass_record(worker, LEGACY_NUMERIC_COMMAND)
         assert record.leg == Leg.NUMERIC
@@ -984,6 +985,7 @@ class TestLegacyLegRecords:
         assert record.detect.failures == ()
         assert record.detect.ids_available is False
         assert record.detect.session_complete is session_complete
+        assert record.confirm is None
         assert [f'ended_by={ended_by}' in line for line in _sub_run_logs(caplog, 'numeric')] == [True]
 
 
