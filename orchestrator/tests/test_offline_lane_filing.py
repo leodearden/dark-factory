@@ -105,6 +105,15 @@ def test_a_phase_with_no_failure_line_renders_no_line():
     assert 'pass p-bare confirm' not in details
 
 
+def test_a_counted_pass_with_no_failure_line_in_either_phase_still_renders():
+    silent = _counted('p-silent', T0, detect_first_line=None, confirm_first_line=None)
+
+    details = _build([_test(passes=(silent,))])['details']
+
+    assert '  pass p-silent detect : (no failure line)' in details
+    assert '  pass p-silent confirm: (no failure line)' in details
+
+
 def test_the_title_counts_tests_and_distinct_passes_and_names_the_first_test():
     other = _test(node='tests/test_other.py::test_two')
 
@@ -138,10 +147,22 @@ def test_the_description_names_command_leg_tests_range_and_reproduce_line():
     assert f'Reproduce: cd /repo && pytest {NODE}' in description
 
 
-def test_the_whole_command_stands_in_for_a_reproduce_line_that_cannot_be_narrowed():
-    description = _build(reproduce=None)['description']
+def test_the_reproduce_line_is_printed_as_given_and_never_replaced_by_the_command_name():
+    whole = 'cd integration && make check'
 
-    assert f'Reproduce: run the whole command: {COMMAND}' in description
+    description = _build(reproduce=whole)['description']
+
+    assert f'Reproduce: {whole}' in description
+    assert f'Reproduce: {COMMAND}' not in description
+
+
+def test_a_reproduce_line_is_required():
+    arguments = {
+        'command': COMMAND, 'leg': 'generic', 'priority': 'medium', 'tests': [_test()],
+    }
+
+    with pytest.raises(TypeError):
+        build_lane_fix_task_arguments(**arguments)
 
 
 def test_a_range_with_no_green_head_says_so():
@@ -277,6 +298,7 @@ def _command_level(**overrides):
         'head': FIRST_RED,
         'passes': [SECOND_PASS, FIRST_PASS, FIRST_PASS],
         'reason': 'no_detect_record',
+        'reproduce': 'cd integration && make check',
     }
     arguments.update(overrides)
     return build_lane_command_task_arguments(**arguments)
@@ -296,7 +318,7 @@ def test_the_command_level_description_names_command_leg_head_and_reason():
     assert 'generic' in description
     assert FIRST_RED in description
     assert 'no_detect_record' in description
-    assert f'Reproduce: run the whole command: {COMMAND}' in description
+    assert 'Reproduce: cd integration && make check' in description
 
 
 def test_the_command_level_details_list_each_pass_once_in_start_order():

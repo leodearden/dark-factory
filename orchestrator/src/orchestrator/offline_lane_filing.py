@@ -13,6 +13,7 @@ HEAD_PREFIX_CHARS = 12
 SPAWN_CONTEXT = 'offline_lane_red'
 MERGE_LANE = 'normal'
 UNKNOWN_HEAD = 'unknown'
+NO_FAILURE_LINE = '(no failure line)'
 
 
 @dataclass(frozen=True)
@@ -61,13 +62,15 @@ def _distinct_in_order(items: Sequence[str]) -> list[str]:
     return list(dict.fromkeys(items))
 
 
+def _pass_line(counted: CountedPassEvidence, phase: str, line: str) -> str:
+    return f'  pass {counted.pass_id} {phase:<7}: {line[:FAILURE_LINE_MAX_CHARS]}'
+
+
 def _pass_lines(counted: CountedPassEvidence) -> list[str]:
     phases = (('detect', counted.detect_first_line), ('confirm', counted.confirm_first_line))
-    return [
-        f'  pass {counted.pass_id} {phase:<7}: {line[:FAILURE_LINE_MAX_CHARS]}'
-        for phase, line in phases
-        if line is not None
-    ]
+    if all(line is None for _phase, line in phases):
+        return [_pass_line(counted, phase, NO_FAILURE_LINE) for phase, _line in phases]
+    return [_pass_line(counted, phase, line) for phase, line in phases if line is not None]
 
 
 def _test_block(test: TestEvidence) -> str:
@@ -129,10 +132,6 @@ def _suspect_range(test: TestEvidence) -> str:
     return f'{test.last_green_head or UNKNOWN_HEAD}..{test.first_red_head}'
 
 
-def _reproduce_text(command: str, reproduce: str | None) -> str:
-    return reproduce if reproduce is not None else f'run the whole command: {command}'
-
-
 def _lane_metadata(
     *,
     command: str,
@@ -169,14 +168,16 @@ def build_lane_fix_task_arguments(
     leg: str,
     priority: str,
     tests: Sequence[TestEvidence],
-    reproduce: str | None,
+    reproduce: str,
     deflake_owners: Mapping[str, str] = {},
 ) -> dict[str, Any]:
     """The test-level fix task of PRD 5.5.
 
     Tests render in the order given. The suspect range and the title's head come from
-    the test whose first counted pass started earliest. No ``project_root`` and no
-    ``metadata.files``, as ``flake_ledger.py::build_deflake_task_arguments`` explains.
+    the test whose first counted pass started earliest. *reproduce* is a runnable line:
+    the narrowed command, or the whole command line with its working directory. No
+    ``project_root`` and no ``metadata.files``, as
+    ``flake_ledger.py::build_deflake_task_arguments`` explains.
     """
     _require_evidence(tests)
     passes = _distinct_passes([p for test in tests for p in test.passes])
@@ -192,7 +193,7 @@ def build_lane_fix_task_arguments(
         f'The offline lane reproduced a red run of `{command}` (leg: {leg}).',
         'Tests:\n' + _bulleted(shown_nodes + ([f'and {hidden} more'] if hidden > 0 else [])),
         f'Suspect range (last all-green head..first red head): {_suspect_range(earliest)}',
-        f'Reproduce: {_reproduce_text(command, reproduce)}',
+        f'Reproduce: {reproduce}',
     ])
     details = _join_sections([
         _tests_section(tests),
@@ -232,14 +233,18 @@ def build_lane_command_task_arguments(
     head: str,
     passes: Sequence[CountedPassEvidence],
     reason: str,
+    reproduce: str,
 ) -> dict[str, Any]:
-    """The command-level fix task: the command exits non-zero and no test reproduces."""
+    """The command-level fix task: the command exits non-zero and no test reproduces.
+
+    *reproduce* is the whole command line with its working directory.
+    """
     counted = _distinct_passes(passes)
     description = _join_sections([
         f'The offline lane saw `{command}` (leg: {leg}) exit non-zero with no reproducible '
         f'failing test since {head}.',
         f'Why no test could be confirmed: {reason}',
-        f'Reproduce: {_reproduce_text(command, None)}',
+        f'Reproduce: {reproduce}',
     ])
     details = _join_sections([
         '\n\n'.join(_command_pass_block(c) for c in counted),
