@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+from collections.abc import MutableMapping
 from pathlib import Path
 
 import _task_db_scan
@@ -69,11 +70,18 @@ def test_read_tasks_returns_only_the_requested_master_rows(make_tasks_db, store_
 def test_a_task_row_is_frozen_and_its_metadata_read_only(make_tasks_db, store_dir):
     db = make_tasks_db([{'id': 1, 'metadata': {'a': 1}}], directory=store_dir)
     row = read_tasks(db, [1])[1]
+    field = 'status'
     with pytest.raises(dataclasses.FrozenInstanceError):
-        setattr(row, 'status', 'done')
-    with pytest.raises(TypeError):
-        row.metadata['a'] = 2
+        setattr(row, field, 'done')
+    assert not isinstance(row.metadata, MutableMapping)
     assert isinstance(row.id, int)
+
+
+def test_a_task_row_does_not_share_the_callers_metadata():
+    metadata: dict[str, object] = {'a': 1}
+    row = TaskRow(id=1, status='pending', title='t', metadata=metadata)
+    metadata['a'] = 2
+    assert row.metadata['a'] == 1
 
 
 def test_malformed_metadata_reads_as_empty(make_tasks_db, store_dir):
@@ -253,5 +261,6 @@ def test_ticket_outcome_refuses_what_it_cannot_read(result):
 
 def test_a_ticket_outcome_is_frozen():
     outcome = ticket_outcome({'status': 'pending'})
+    field = 'status'
     with pytest.raises(dataclasses.FrozenInstanceError):
-        setattr(outcome, 'status', 'created')
+        setattr(outcome, field, 'created')
