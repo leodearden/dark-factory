@@ -57,6 +57,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from escalation.categories import EscalationCategory
+
 # Must equal orchestrator.harness._WATCHER_ESCALATION_HEADERS['X-Escalation-Identity'].
 # Duplicated (not imported) to preserve the escalation -> orchestrator layer
 # direction; pinned in lockstep by tests/test_authority.py.
@@ -118,24 +120,19 @@ L2_AUTO_CLOSE_ACTION: str = 'close_only'
 # (it files under agent_role='orchestrator-deterministic'), and is listed here
 # for that same defense-in-depth reason.
 #
-# CROSS-LAYER PIN (reviewer amendment). The three RUNNER-FILED members below —
-# 'milestone_gate', 'milestone_check_failed', 'curator_adjudication_missing' —
-# are each duplicated from a named constant in
-# ``orchestrator.deterministic_runner`` (MILESTONE_GATE_CATEGORY /
-# MILESTONE_CHECK_FAILED_CATEGORY / CURATOR_ADJUDICATION_MISSING_CATEGORY) and
-# held in lockstep by the function-local orchestrator imports in
-# ``tests/test_authority.py``, per the layer-direction rule in this module's
-# docstring. 'design_concern' is NOT pinned that way, deliberately: it has no
-# single owning constant to import. It is filed as a bare literal from several
-# orchestrator call sites (twice in ``orchestrator.workflow``, once in
-# ``orchestrator.harness``) AND is a registered EscalationCategory with no
-# single owning filer constant — a SHARED term, not one module's duplicate,
-# so there is no upstream definition a lockstep test could bind to.
+# Every member is spelled through the registry, so a misspelling fails at
+# import instead of silently ending the denial. The three RUNNER-FILED members
+# are additionally held in lockstep with their named constants in
+# ``orchestrator.deterministic_runner`` by the function-local orchestrator
+# imports in ``tests/test_authority.py``, per the layer-direction rule in this
+# module's docstring.
 # Checked BEFORE the allowlist (denylist-first).
-L2_AUTO_CLOSE_DENY_CATEGORIES: frozenset[str] = frozenset(
-    {'design_concern', 'milestone_gate', 'milestone_check_failed',
-     'curator_adjudication_missing'}
-)
+L2_AUTO_CLOSE_DENY_CATEGORIES: frozenset[str] = frozenset({
+    EscalationCategory.DESIGN_CONCERN,
+    EscalationCategory.MILESTONE_GATE,
+    EscalationCategory.MILESTONE_CHECK_FAILED,
+    EscalationCategory.CURATOR_ADJUDICATION_MISSING,
+})
 
 # Agent roles that are NEVER auto-closable regardless of category/evidence —
 # the born-at-L2 human-gate sentinel role (deterministic always_escalates /
