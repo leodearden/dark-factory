@@ -342,8 +342,8 @@ class LimitSource(enum.Enum):
     CLASS_MARK = "its class's @pytest.mark.timeout"
     MODULE_MARK = "its module's pytestmark timeout"
     AMBIENT = (
-        f'no timeout mark: the ambient budget, the tighter of the '
-        f"{PYPROJECT_DEFAULT_TIMEOUT}s ini default and verify's "
+        f'the ambient budget, since no timeout mark sets seconds: the tighter '
+        f"of the {PYPROJECT_DEFAULT_TIMEOUT}s ini default and verify's "
         f'--timeout={VERIFY_CLI_PER_TEST_TIMEOUT}'
     )
     UNRESOLVED = 'unreadable: the test is not in its module namespace'
@@ -357,7 +357,8 @@ class LimitSource(enum.Enum):
 @dataclasses.dataclass(frozen=True)
 class WaitBudgetOffender:
     """A pytest item whose wait bill the timeout it runs under does not
-    clear. *limit* is None when no number could be read for it."""
+    clear. *limit* is None when no number could be read for it, and
+    ``math.inf`` when its mark disables the timeout."""
 
     item: str
     budget: float
@@ -370,55 +371,83 @@ class WaitBudgetOffender:
             if math.isinf(self.budget)
             else f'{self.budget}s'
         )
-        limit = 'none' if self.limit is None else f'{self.limit}s'
+        if self.limit is None:
+            limit = 'none'
+        elif math.isinf(self.limit):
+            limit = 'disabled'
+        else:
+            limit = f'{self.limit}s'
         return (
             f'{self.item}: waits bill {bill}; limit {limit}, from '
             f'{self.limit_source.value}'
         )
 
 
-def _timeout_marks(carrier: object) -> list[object]:
-    """The ``timeout`` marks in a ``pytestmark`` value: one MarkDecorator or
-    Mark, or a list of them, in the order pytest reads them."""
-    marks = carrier if isinstance(carrier, (list, tuple)) else [carrier]
+def _mark_list(carrier: object) -> list[object]:
+    """A ``pytestmark`` value as a list: one MarkDecorator or Mark, or a
+    list of them; absent is empty."""
+    if carrier is None:
+        return []
+    return list(carrier) if isinstance(carrier, (list, tuple)) else [carrier]
+
+
+def _class_marks(owner_cls: object) -> list[object]:
+    """The marks pytest reads for a class: every class in its MRO
+    contributes the marks it was itself decorated with, base classes FIRST,
+    as ``_pytest.mark.structures.get_unpacked_marks`` collects them. A plain
+    ``getattr`` would see only the nearest decorated class's list."""
+    if not isinstance(owner_cls, type):
+        return _mark_list(getattr(owner_cls, 'pytestmark', None))
     return [
-        getattr(mark, 'mark', mark)
-        for mark in marks
-        if getattr(mark, 'name', None) == 'timeout'
+        mark
+        for klass in reversed(owner_cls.__mro__)
+        for mark in _mark_list(klass.__dict__.get('pytestmark'))
     ]
-
-
-def _mark_seconds(mark: object) -> float | None:
-    """A timeout mark's seconds, from its first argument else its
-    ``timeout=`` keyword; None when that is not a plain number."""
-    args = getattr(mark, 'args', ())
-    value = args[0] if args else getattr(mark, 'kwargs', {}).get('timeout')
-    return _as_seconds(value)
 
 
 def _closest_timeout_mark(
     function_obj: object,
     owner_cls: object | None,
     module_namespace: Mapping[str, object],
-) -> tuple[float | None, LimitSource] | None:
-    """The seconds of the timeout mark pytest applies to an item, and the
-    level it sits at: the test's own marks, then its class's (MRO-inclusive),
-    then the module's ``pytestmark``. None when no level carries one.
+) -> tuple[object, LimitSource] | None:
+    """The timeout mark pytest-timeout applies to an item, and the level it
+    sits at: the first one in the test's own marks, then its class's
+    (``_class_marks``), then the module's ``pytestmark``. None when no level
+    carries one.
 
     The closest level wins, as in ``_pytest.nodes.Node.get_closest_marker``;
     why a mark then wins over the CLI/ini budget outright is recorded in
     shared/src/shared/testing_timeout_markers.py.
     """
     levels = (
-        (getattr(function_obj, 'pytestmark', None), LimitSource.FUNCTION_MARK),
-        (getattr(owner_cls, 'pytestmark', None), LimitSource.CLASS_MARK),
-        (module_namespace.get('pytestmark'), LimitSource.MODULE_MARK),
+        (_mark_list(getattr(function_obj, 'pytestmark', None)), LimitSource.FUNCTION_MARK),
+        (_class_marks(owner_cls), LimitSource.CLASS_MARK),
+        (_mark_list(module_namespace.get('pytestmark')), LimitSource.MODULE_MARK),
     )
-    for carrier, source in levels:
-        marks = _timeout_marks(carrier)
-        if marks:
-            return _mark_seconds(marks[0]), source
+    for marks, source in levels:
+        for mark in marks:
+            if getattr(mark, 'name', None) == 'timeout':
+                return getattr(mark, 'mark', mark), source
     return None
+
+
+def _mark_limit(mark: object, source: LimitSource) -> tuple[float | None, LimitSource]:
+    """The limit a timeout mark sets, read as pytest-timeout reads it: its
+    first argument, else its ``timeout=`` keyword.
+
+    A mark that sets no seconds (``method=`` alone, or ``timeout=None``)
+    leaves the ini/CLI timeout in force, so the ambient budget -- a farther
+    mark does not step in. Seconds <= 0 disable the timeout, so
+    ``math.inf``. Seconds that are not a plain number are unreadable: None.
+    """
+    args = getattr(mark, 'args', ())
+    value = args[0] if args else getattr(mark, 'kwargs', {}).get('timeout')
+    if value is None:
+        return float(AMBIENT_TEST_TIMEOUT), LimitSource.AMBIENT
+    seconds = _as_seconds(value)
+    if seconds is None:
+        return None, source
+    return (math.inf if seconds == 0 else seconds), source
 
 
 def _item_limit(
@@ -437,14 +466,15 @@ def _item_limit(
     closest = _closest_timeout_mark(function_obj, owner_cls, namespace)
     if closest is None:
         return float(AMBIENT_TEST_TIMEOUT), LimitSource.AMBIENT
-    return closest
+    return _mark_limit(*closest)
 
 
 def _offends(budget: float, limit: float | None, limit_source: LimitSource) -> bool:
-    """Whether *budget* breaches the limit: an unmarked item offends once its
-    bill REACHES the ambient budget; a marked one when the mark is below the
-    bill (a mark replaces the ambient budget, at any bill); an item with no
-    readable limit -- unresolved, or an unreadable mark -- always."""
+    """Whether *budget* breaches the limit: under the ambient budget an item
+    offends once its bill REACHES it; under a mark, when the mark is below
+    the bill (a mark replaces the ambient budget, at any bill), so never
+    when the mark disables the timeout; with no readable limit -- unresolved,
+    or an unreadable mark -- always."""
     if limit is None:
         return True
     if limit_source is LimitSource.AMBIENT:

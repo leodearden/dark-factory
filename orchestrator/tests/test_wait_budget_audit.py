@@ -910,13 +910,109 @@ class TestWaitBudgetOffenders:
 
     def test_a_mark_with_unreadable_seconds_offends(self) -> None:
         source = (
-            '@pytest.mark.timeout(timeout=None)\n'
+            "@pytest.mark.timeout('soon')\n"
             'class TestUnreadable:\n    async def test_it(self):\n' + _LIGHT_BODY
         )
         offenders = _offenders(source)
 
         assert [(o.item, o.limit) for o in offenders] == [
             ('TestUnreadable::test_it', None)
+        ], f'got {offenders!r}'
+
+    @pytest.mark.parametrize(
+        'mark',
+        [
+            pytest.param("@pytest.mark.timeout(method='thread')", id='method-only'),
+            pytest.param('@pytest.mark.timeout(timeout=None)', id='timeout-none'),
+        ],
+    )
+    def test_a_closest_mark_without_seconds_leaves_the_ambient_budget(
+        self, mark: str
+    ) -> None:
+        """pytest-timeout reads only the closest timeout mark, and one that
+        sets no seconds falls back to the ini/CLI timeout -- not to a
+        farther mark's seconds, so the generous class mark does not apply.
+        """
+        source = (
+            f'@pytest.mark.timeout({_GENEROUS_MARK})\n'
+            'class TestMixed:\n'
+            f'    {mark}\n'
+            '    async def test_heavy(self):\n' + _HEAVY_BODY
+            + f'    {mark}\n'
+            '    async def test_light(self):\n' + _LIGHT_BODY
+        )
+        offenders = _offenders(source)
+
+        assert [(o.item, o.limit, o.limit_source) for o in offenders] == [
+            ('TestMixed::test_heavy', AMBIENT_TEST_TIMEOUT, LimitSource.AMBIENT)
+        ], f'got {offenders!r}'
+
+    @pytest.mark.parametrize('seconds', [0, -1])
+    @pytest.mark.parametrize(
+        'template',
+        [
+            pytest.param(
+                'class TestOff:\n    @pytest.mark.timeout({seconds})\n'
+                '    async def test_it(self):\n',
+                id='function-mark',
+            ),
+            pytest.param(
+                '@pytest.mark.timeout({seconds})\nclass TestOff:\n'
+                '    async def test_it(self):\n',
+                id='class-mark',
+            ),
+            pytest.param(
+                'pytestmark = pytest.mark.timeout({seconds})\nclass TestOff:\n'
+                '    async def test_it(self):\n',
+                id='module-mark',
+            ),
+        ],
+    )
+    def test_a_mark_at_or_below_zero_disables_the_timeout(
+        self, template: str, seconds: int
+    ) -> None:
+        """pytest-timeout arms no timer for seconds <= 0, so nothing can kill
+        the item, whatever its bill -- even an unbounded one."""
+        source = template.format(seconds=seconds) + (
+            '        await asyncio.wait_for(a, timeout=unknown_name)\n'
+        )
+
+        assert _offenders(source) == []
+
+    def test_a_base_class_mark_reaches_a_subclass_decorated_with_other_marks(
+        self,
+    ) -> None:
+        """Decorating the subclass gives it a ``pytestmark`` of its own that
+        hides the base class's from a plain ``getattr``; pytest still
+        applies the base class's timeout mark."""
+        source = (
+            f'@pytest.mark.timeout({_GENEROUS_MARK})\n'
+            'class _Base:\n    pass\n'
+            '@pytest.mark.asyncio\n'
+            'class TestSub(_Base):\n    async def test_it(self):\n' + _HEAVY_BODY
+        )
+        namespace = _exec_module(source)
+
+        assert wait_budget_offenders(source, namespace) == []
+        assert item_limit_sources(source, namespace) == {
+            'TestSub::test_it': LimitSource.CLASS_MARK
+        }
+
+    def test_a_base_class_timeout_mark_wins_over_the_subclass_own_one(self) -> None:
+        """pytest collects class marks base class first and takes the first
+        timeout mark, so a base class's mark beats the subclass's own --
+        measured on pytest 9.0.3. The scan mirrors that order rather than
+        the intuitive one."""
+        source = (
+            f'@pytest.mark.timeout({_TIGHT_MARK})\n'
+            'class _Base:\n    pass\n'
+            f'@pytest.mark.timeout({_GENEROUS_MARK})\n'
+            'class TestSub(_Base):\n    async def test_it(self):\n' + _LIGHT_BODY
+        )
+        offenders = _offenders(source)
+
+        assert [(o.item, o.limit, o.limit_source) for o in offenders] == [
+            ('TestSub::test_it', _TIGHT_MARK, LimitSource.CLASS_MARK)
         ], f'got {offenders!r}'
 
     def test_only_the_three_mark_levels_count_as_a_mark(self) -> None:
