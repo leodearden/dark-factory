@@ -19,7 +19,7 @@ import logging
 import sqlite3
 from collections import Counter
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -37,8 +37,8 @@ logger = logging.getLogger(__name__)
 # before). `INDEXED BY` makes the index a hard constraint: SQLite raises
 # `no such index: idx_wo_created` rather than silently falling back to a scan
 # if it is ever absent. `get_memory_ops` catches exactly that error and
-# retries against `MEMORY_OPS_SQL_UNHINTED`, so the observable of a missing
-# index is a correct-but-slow chart plus an ERROR log naming
+# retries without the hint (see `_MemoryOpsQuery`), so the observable of a
+# missing index is a correct-but-slow chart plus an ERROR log naming
 # `idx_wo_created` (pinned by TestMemoryOpsMissingIndexFallback) — never a
 # 500 and never a silently empty chart. The index cannot go missing in normal
 # operation: fused-memory's initialize() re-runs the `IF NOT EXISTS` DDL on
@@ -48,17 +48,22 @@ logger = logging.getLogger(__name__)
 # fallback guards against is narrower than "nothing else catches it": a
 # schema edit that lands without that suite running, or a journal DB produced
 # by an older fused-memory build.
-_RAW_OPS_ARM = (
-    "SELECT strftime('%Y-%m-%dT%H:00', created_at) AS hour, kind, operation, COUNT(*)"
-    ' FROM write_ops INDEXED BY idx_wo_created'
-    ' WHERE created_at >= :start AND created_at < :end'
-    ' GROUP BY hour, kind, operation'
-)
+_INDEX_HINT = ' INDEXED BY idx_wo_created'
+_MISSING_INDEX_ERROR = 'no such index: idx_wo_created'
+
+
+def _raw_ops_arm(*, hinted: bool) -> str:
+    return (
+        "SELECT strftime('%Y-%m-%dT%H:00', created_at) AS hour, kind, operation, COUNT(*)"
+        f" FROM write_ops{_INDEX_HINT if hinted else ''}"
+        ' WHERE created_at >= :start AND created_at < :end'
+        ' GROUP BY hour, kind, operation'
+    )
+
 
 # Second schema dependency (task 5405): read_op_counts, owned by
 # fused-memory/src/fused_memory/services/read_rollup.py::READ_OP_COUNTS_SCHEMA_SQL.
-# A journal without it falls back to RAW_ONLY_MEMORY_OPS_SQL (see
-# `_memory_ops_rows`).
+# A journal without it is read without this arm (see `_MemoryOpsQuery`).
 _COUNTED_READS_ARM = (
     "SELECT strftime('%Y-%m-%dT%H:00', hour_start) AS hour, 'read' AS kind, operation,"
     ' SUM(count)'
@@ -66,21 +71,64 @@ _COUNTED_READS_ARM = (
     ' WHERE hour_start >= :start AND hour_start < :end'
     ' GROUP BY hour, operation'
 )
-
-# ONE statement, so ONE read snapshot: a migration chunk committing between
-# two separate statements would count its rows twice or not at all.
-MEMORY_OPS_SQL = _RAW_OPS_ARM + ' UNION ALL ' + _COUNTED_READS_ARM
-
-# Fallback used by `get_memory_ops` when idx_wo_created is unexpectedly
-# absent (see the coupling comment above). Derived from MEMORY_OPS_SQL by
-# construction, rather than retyped, so the two strings cannot diverge.
-MEMORY_OPS_SQL_UNHINTED = MEMORY_OPS_SQL.replace(' INDEXED BY idx_wo_created', '')
-
-# Fallback for a journal without read_op_counts: a fused-memory build that
-# predates it journals every read per row, so the raw arm alone is exact.
-RAW_ONLY_MEMORY_OPS_SQL = _RAW_OPS_ARM
-
 _MISSING_ROLLUP_TABLE_ERROR = 'no such table: read_op_counts'
+
+# Per process: a journal without read_op_counts is an expected deploy
+# transient that lasts until fused-memory restarts, so only the first
+# sighting is INFO-worthy.
+_missing_rollup_table_noted = False
+
+
+def _note_missing_rollup_table() -> None:
+    global _missing_rollup_table_noted
+    logger.log(
+        logging.DEBUG if _missing_rollup_table_noted else logging.INFO,
+        'write journal has no read_op_counts yet (older fused-memory build) '
+        '— memory ops reading raw write_ops rows only, which is exact there',
+    )
+    _missing_rollup_table_noted = True
+
+
+@dataclass(frozen=True, slots=True)
+class _MemoryOpsQuery:
+    """The memory-ops statement over the optional schema objects it uses.
+
+    ``hinted`` needs idx_wo_created and ``counted_reads`` needs
+    read_op_counts. Each is dropped on its own when the journal lacks it, so
+    a journal lacking both still gets an exact, unhinted raw scan.
+    """
+
+    hinted: bool = True
+    counted_reads: bool = True
+
+    @property
+    def sql(self) -> str:
+        raw_arm = _raw_ops_arm(hinted=self.hinted)
+        # ONE statement, so ONE read snapshot: a migration chunk committing
+        # between two separate statements would count its rows twice or not
+        # at all. A journal without the table predates the rollup and
+        # journals every read per row, so the raw arm alone is exact there.
+        return f'{raw_arm} UNION ALL {_COUNTED_READS_ARM}' if self.counted_reads else raw_arm
+
+    def without_missing_object(self, exc: sqlite3.OperationalError) -> _MemoryOpsQuery:
+        """This query minus the schema object *exc* reports missing, logged;
+        re-raises *exc* when it names nothing this query can drop."""
+        if self.hinted and str(exc) == _MISSING_INDEX_ERROR:
+            # See the coupling comment at _INDEX_HINT: the chart stays correct
+            # (just slow), and the log names the index without the traceback.
+            logger.error(
+                'write_ops index idx_wo_created missing — memory ops '
+                'falling back to unhinted scan',
+                exc_info=True,
+            )
+            return replace(self, hinted=False)
+        if self.counted_reads and str(exc) == _MISSING_ROLLUP_TABLE_ERROR:
+            _note_missing_rollup_table()
+            return replace(self, counted_reads=False)
+        raise exc
+
+
+MEMORY_OPS_SQL = _MemoryOpsQuery().sql
 
 _HOUR_KEY_FORMAT = '%Y-%m-%dT%H:00'
 
@@ -243,35 +291,13 @@ async def get_memory_ops(
 async def _memory_ops_rows(
     db: aiosqlite.Connection, window: dict[str, str],
 ) -> Iterable[Sequence[Any]]:
-    """The ``(hour, kind, operation, count)`` rows of *window*, hinted when it can be."""
-    try:
-        async with db.execute(MEMORY_OPS_SQL, window) as cursor:
-            return await cursor.fetchall()
-    except sqlite3.OperationalError as exc:
-        fallback_sql = _memory_ops_fallback(exc)
-        async with db.execute(fallback_sql, window) as cursor:
-            return await cursor.fetchall()
-
-
-def _memory_ops_fallback(exc: sqlite3.OperationalError) -> str:
-    """The query to retry after *exc*, logged; re-raises an unexpected error."""
-    if 'no such index' in str(exc):
-        # idx_wo_created is missing — see the coupling comment at
-        # MEMORY_OPS_SQL. Fall back to the unhinted query so the chart
-        # stays correct (just slow), and log loudly enough to name the
-        # index without needing the traceback.
-        logger.error(
-            'write_ops index idx_wo_created missing — memory ops '
-            'falling back to unhinted scan',
-            exc_info=True,
-        )
-        return MEMORY_OPS_SQL_UNHINTED
-    if str(exc) == _MISSING_ROLLUP_TABLE_ERROR:
-        # An expected deploy transient: the dashboard restarts on merge,
-        # fused-memory up to ~8 h later via its staleness backstop.
-        logger.info(
-            'write journal has no read_op_counts yet (older fused-memory build) '
-            '— memory ops reading raw write_ops rows only, which is exact there'
-        )
-        return RAW_ONLY_MEMORY_OPS_SQL
-    raise exc
+    """The ``(hour, kind, operation, count)`` rows of *window*, from the fullest
+    statement the journal's schema supports. Each retry drops one more missing
+    object, so there are at most three attempts."""
+    query = _MemoryOpsQuery()
+    while True:
+        try:
+            async with db.execute(query.sql, window) as cursor:
+                return await cursor.fetchall()
+        except sqlite3.OperationalError as exc:
+            query = query.without_missing_object(exc)

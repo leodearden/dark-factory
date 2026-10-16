@@ -507,12 +507,19 @@ class TestMemoryOpsQueryPlan:
         )
 
 
-async def _memory_ops_with_sql(conn, sql, monkeypatch, **kwargs):
-    """get_memory_ops with its query swapped for *sql* (hinted vs unhinted)."""
-    from dashboard.data import write_journal
+def _drop_created_index(db_path):
+    conn = sqlite3.connect(str(db_path))
+    conn.execute('DROP INDEX idx_wo_created')
+    conn.commit()
+    conn.close()
 
-    monkeypatch.setattr(write_journal, 'MEMORY_OPS_SQL', sql)
-    return await _ops_value(conn, **kwargs)
+
+async def _hinted_and_unhinted_values(db_path, **kwargs):
+    """get_memory_ops on *db_path*, then again once idx_wo_created is dropped,
+    which is the only journal the unhinted statement is ever run against."""
+    hinted = await _ops_value_at(db_path, **kwargs)
+    _drop_created_index(db_path)
+    return hinted, await _ops_value_at(db_path, **kwargs)
 
 
 class TestMemoryOpsResultEquivalence:
@@ -520,36 +527,28 @@ class TestMemoryOpsResultEquivalence:
 
     Passes by construction today, because "the results are unchanged" IS the
     property under test; it goes red if a future edit makes the hinted and
-    unhinted SQL disagree. Compares whole MemoryOps values, so the series,
-    the labels and the by_operation ORDER (count desc, ties by label) all
-    have to agree — including on tied counts, where SQL's own row order is
+    unhinted statements disagree. Compares whole MemoryOps values, so the
+    series, the labels and the by_operation ORDER (count desc, ties by label)
+    all have to agree — including on tied counts, where SQL's own row order is
     unspecified and the two plans walk different indexes.
     """
 
     @pytest.mark.asyncio
-    async def test_hinted_and_unhinted_agree(self, tmp_path, monkeypatch):
-        from dashboard.data.write_journal import MEMORY_OPS_SQL, MEMORY_OPS_SQL_UNHINTED
-
+    async def test_hinted_and_unhinted_agree(self, tmp_path):
         db_path = tmp_path / 'ops_equivalence.db'
         _seed_ops_breakdown_plan_fixture(db_path)
-        window = {'hours': _PLAN_FIXTURE_HOURS, 'now': _PLAN_FIXTURE_NOW}
 
-        async with aiosqlite.connect(str(db_path)) as conn:
-            conn.row_factory = aiosqlite.Row
-            hinted = await _memory_ops_with_sql(conn, MEMORY_OPS_SQL, monkeypatch, **window)
-            unhinted = await _memory_ops_with_sql(
-                conn, MEMORY_OPS_SQL_UNHINTED, monkeypatch, **window,
-            )
+        hinted, unhinted = await _hinted_and_unhinted_values(
+            db_path, hours=_PLAN_FIXTURE_HOURS, now=_PLAN_FIXTURE_NOW,
+        )
 
         assert hinted == unhinted
         assert hinted.by_operation == tuple(_OPS_BREAKDOWN_WEIGHTS.items())
         assert sum(hinted.reads) + sum(hinted.writes) == 500
 
     @pytest.mark.asyncio
-    async def test_hinted_and_unhinted_agree_on_ties(self, tmp_path, monkeypatch):
+    async def test_hinted_and_unhinted_agree_on_ties(self, tmp_path):
         """Tied counts come back in label order from both plans."""
-        from dashboard.data.write_journal import MEMORY_OPS_SQL, MEMORY_OPS_SQL_UNHINTED
-
         db_path = tmp_path / 'ops_equivalence_ties.db'
         rows = [
             (
@@ -563,14 +562,10 @@ class TestMemoryOpsResultEquivalence:
             for i in range(250)
         ]
         _seed_write_ops(db_path, rows)
-        window = {'hours': _PLAN_FIXTURE_HOURS, 'now': _PLAN_FIXTURE_NOW}
 
-        async with aiosqlite.connect(str(db_path)) as conn:
-            conn.row_factory = aiosqlite.Row
-            hinted = await _memory_ops_with_sql(conn, MEMORY_OPS_SQL, monkeypatch, **window)
-            unhinted = await _memory_ops_with_sql(
-                conn, MEMORY_OPS_SQL_UNHINTED, monkeypatch, **window,
-            )
+        hinted, unhinted = await _hinted_and_unhinted_values(
+            db_path, hours=_PLAN_FIXTURE_HOURS, now=_PLAN_FIXTURE_NOW,
+        )
 
         assert hinted == unhinted
         assert hinted.by_operation == tuple((f'operation-{i}', 50) for i in range(5))
@@ -605,10 +600,7 @@ class TestMemoryOpsMissingIndexFallback:
             indexed = await _ops_value(conn, now=now)
 
         # WRITE_OPS_SCHEMA minus idx_wo_created — the coupling breaks here.
-        setup_conn = sqlite3.connect(str(db_path))
-        setup_conn.execute('DROP INDEX idx_wo_created')
-        setup_conn.commit()
-        setup_conn.close()
+        _drop_created_index(db_path)
 
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
@@ -646,11 +638,11 @@ async def _ops_value_at(db_path, **kwargs):
         return await _ops_value(conn, **kwargs)
 
 
-def _seed_ops_rows(db_path):
+def _seed_ops_rows(db_path, *, schema=WRITE_OPS_SCHEMA):
     _seed_write_ops(db_path, [
         (op_id, operation, project, agent, kind, at.isoformat())
         for op_id, operation, project, agent, kind, at in _OPS_ROWS
-    ])
+    ], schema=schema)
 
 
 class TestMemoryOpsReadRollup:
@@ -794,43 +786,94 @@ class TestMemoryOpsRollupEquivalence:
         assert sum(before.reads) == 96
 
 
+async def _memory_ops_logged(db_path, caplog, level):
+    """get_memory_ops on *db_path* and this module's log records at *level* and up."""
+    from dashboard.data import write_journal
+
+    caplog.clear()
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        with caplog.at_level(level, logger='dashboard.data.write_journal'):
+            result = await write_journal.get_memory_ops(conn, hours=24, now=_OPS_NOW)
+    return result, [
+        record for record in caplog.records if record.name == 'dashboard.data.write_journal'
+    ]
+
+
+def _naming_rollup_table(records):
+    return [record for record in records if 'read_op_counts' in record.getMessage()]
+
+
 class TestMemoryOpsMissingRollupTableFallback:
     """The deploy window (task 5405): the dashboard restarts on merge, while
     fused-memory may run an older build for hours. Its journal has no
     read_op_counts and journals every read per row, so the raw arm alone is
     EXACT — a fresh reading, never an unknown one."""
 
+    @pytest.fixture(autouse=True)
+    def _first_sighting_in_this_process(self, monkeypatch):
+        from dashboard.data import write_journal
+
+        monkeypatch.setattr(write_journal, '_missing_rollup_table_noted', False)
+
+    @pytest.fixture()
+    async def expected(self, tmp_path):
+        with_table = tmp_path / 'with_rollup.db'
+        _seed_ops_rows(with_table)
+        return await _ops_value_at(with_table, hours=24, now=_OPS_NOW)
+
+    @pytest.fixture()
+    def pre_rollup_journal(self, tmp_path):
+        without_table = tmp_path / 'pre_rollup.db'
+        _seed_ops_rows(without_table, schema=PRE_ROLLUP_WRITE_OPS_SCHEMA)
+        return without_table
+
     @pytest.mark.asyncio
     async def test_journal_without_rollup_table_reads_raw_rows_fresh(
-        self, tmp_path, caplog,
+        self, pre_rollup_journal, expected, caplog,
     ):
-        from dashboard.data import write_journal
         from dashboard.data.datum import DatumState, validate_datum
 
-        raw_rows = [
-            (op_id, operation, project, agent, kind, at.isoformat())
-            for op_id, operation, project, agent, kind, at in _OPS_ROWS
-        ]
-        with_table = tmp_path / 'with_rollup.db'
-        _seed_write_ops(with_table, raw_rows)
-        without_table = tmp_path / 'pre_rollup.db'
-        _seed_write_ops(without_table, raw_rows, schema=PRE_ROLLUP_WRITE_OPS_SCHEMA)
-        expected = await _ops_value_at(with_table, hours=24, now=_OPS_NOW)
-
-        async with aiosqlite.connect(str(without_table)) as conn:
-            conn.row_factory = aiosqlite.Row
-            with caplog.at_level(logging.INFO, logger='dashboard.data.write_journal'):
-                result = await write_journal.get_memory_ops(conn, hours=24, now=_OPS_NOW)
+        result, records = await _memory_ops_logged(pre_rollup_journal, caplog, logging.INFO)
 
         assert result.state is DatumState.FRESH
         assert result.value == expected
         validate_datum(result, served_at=_OPS_NOW)
-        journal_records = [
-            record for record in caplog.records
-            if record.name == 'dashboard.data.write_journal'
-        ]
+        assert [record.levelno for record in _naming_rollup_table(records)] == [logging.INFO], (
+            f'expected one INFO naming read_op_counts, got: {caplog.record_tuples}'
+        )
+        assert all(record.levelno < logging.WARNING for record in records)
+
+    @pytest.mark.asyncio
+    async def test_later_polls_note_the_missing_table_at_debug_only(
+        self, pre_rollup_journal, caplog,
+    ):
+        """The table appears only when fused-memory restarts, up to ~8 h of
+        polls later, so only the first sighting is INFO-worthy news."""
+        await _memory_ops_logged(pre_rollup_journal, caplog, logging.DEBUG)
+
+        for _ in range(2):
+            _, records = await _memory_ops_logged(pre_rollup_journal, caplog, logging.DEBUG)
+            assert [record.levelno for record in _naming_rollup_table(records)] == [
+                logging.DEBUG
+            ], caplog.record_tuples
+
+    @pytest.mark.asyncio
+    async def test_journal_missing_both_rollup_table_and_index_reads_raw_rows_fresh(
+        self, pre_rollup_journal, expected, caplog,
+    ):
+        """SQLite names the missing table before the missing index, so the
+        two fallbacks must compose rather than the first one's retry failing."""
+        from dashboard.data.datum import DatumState
+
+        _drop_created_index(pre_rollup_journal)
+
+        result, records = await _memory_ops_logged(pre_rollup_journal, caplog, logging.INFO)
+
+        assert result.state is DatumState.FRESH, result.reason
+        assert result.value == expected
+        assert _naming_rollup_table(records)
         assert any(
-            record.levelno == logging.INFO and 'read_op_counts' in record.getMessage()
-            for record in journal_records
-        ), f'expected an INFO naming read_op_counts, got: {caplog.record_tuples}'
-        assert all(record.levelno < logging.WARNING for record in journal_records)
+            record.levelno == logging.ERROR and 'idx_wo_created' in record.getMessage()
+            for record in records
+        ), caplog.record_tuples
