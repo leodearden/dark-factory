@@ -2417,7 +2417,14 @@ async def test_collect_scheduler_state_ignores_an_unknown_key_from_a_newer_produ
         ):
             return await collect_scheduler_state(dummy_client, dummy_config, now=fixed)
 
-    assert await collect({**reply, 'added_by_a_newer_producer': {'x': 1}}) == await collect(reply)
+    baseline = await collect(reply)
+    _rows, modules, pin_queue, _events, _offline, paused, _recovery, _degraded = baseline
+    project = dummy_config.project_root.name
+    assert paused == [{'project': project, 'reason': 'park-stop: test'}]
+    assert [pin['task_id'] for pin in pin_queue] == ['1']
+    assert [(m['path'], m['parked_by']) for m in modules] == [('src/a', '9')]
+
+    assert await collect({**reply, 'added_by_a_newer_producer': {'x': 1}}) == baseline
 
 
 async def test_collect_scheduler_state_without_lock_depth_uses_depth_two(
