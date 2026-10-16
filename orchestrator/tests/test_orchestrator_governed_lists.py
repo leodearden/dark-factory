@@ -9,7 +9,7 @@ with no disposition fails this suite before any test runs.
 
 from pathlib import Path
 
-from shared.governed_exceptions import governed_exceptions
+from shared.governed_exceptions import Debt, TaskRef, governed_exceptions
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -19,6 +19,8 @@ MERGE_LANE_RATCHET_BASELINE = governed_exceptions(
     'none may rise without an authorized raise, and a path or function absent from '
     'the baseline must meet the file-size and new-function complexity ceilings.',
     ['orchestrator/tests/merge_lane_ratchet_baseline.json'],
+    default=Debt(TaskRef(5603)),
+    default_covers=1,
 )
 
 
