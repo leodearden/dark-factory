@@ -4249,8 +4249,8 @@ class TestWriteJournalGrowthAlarmConfig:
             'RED: write_journal_growth_alarm must be a BARE (non-Optional) '
             'submodel — reload.py descends only into required submodels'
         )
-        assert section.max_file_bytes == 19_327_352_832
-        assert section.max_rows_inserted_per_day == 1_500_000
+        assert section.max_file_bytes == 6_442_450_944
+        assert section.max_rows_inserted_per_day == 75_000
         assert section.check_interval_seconds == 3600.0
 
     def test_values_load_from_yaml(self, tmp_path, monkeypatch):
@@ -4268,7 +4268,23 @@ class TestWriteJournalGrowthAlarmConfig:
 
         assert section.max_file_bytes == 1024, 'RED: the section must be tunable'
         assert section.check_interval_seconds == 60.0
-        assert section.max_rows_inserted_per_day == 1_500_000
+        assert section.max_rows_inserted_per_day == 75_000
+
+    def test_shipped_config_yaml_carries_exactly_the_schema_defaults(self, monkeypatch):
+        """The schema default and the config.yaml literal are two copies of one
+        number; the yaml's measured-basis comment is where it is justified."""
+        from fused_memory.config.schema import WriteJournalGrowthAlarmConfig
+
+        for name in (
+            'WRITE_JOURNAL_GROWTH_ALARM_MAX_FILE_BYTES',
+            'WRITE_JOURNAL_GROWTH_ALARM_MAX_ROWS_PER_DAY',
+            'WRITE_JOURNAL_GROWTH_ALARM_CHECK_INTERVAL_SECONDS',
+        ):
+            monkeypatch.delenv(name, raising=False)
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+
+        assert FusedMemoryConfig().write_journal_growth_alarm == WriteJournalGrowthAlarmConfig()
 
     @pytest.mark.parametrize(
         'field',
