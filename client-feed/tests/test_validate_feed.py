@@ -3,7 +3,7 @@
 The fixtures are what the portal repo vendors. feed-v1/state.json is the fold of feed-v1/feed.jsonl at
 seq 26; feed-v1-foreign-project/state.json is the fold of that feed's lines 1 and 3. Regenerate feed-v1's
 only after a deliberate feed change, from client-feed/:
-uv run python -c "from pathlib import Path; from client_feed.contract import parse_feed_line as p; from client_feed.fold import fold; d = Path('tests/fixtures/feed-v1'); d.joinpath('state.json').write_text(fold([p(t, line_no=i) for i, t in enumerate(d.joinpath('feed.jsonl').read_text().splitlines(), 1)], project_id='demo-client', upto_seq=26).model_dump_json(indent=2) + '\\n')"
+uv run python -c "from pathlib import Path; from client_feed.contract import parse_feed_line as p, split_jsonl; from client_feed.fold import fold; d = Path('tests/fixtures/feed-v1'); d.joinpath('state.json').write_text(fold([p(t, line_no=i) for i, t in enumerate(split_jsonl(d.joinpath('feed.jsonl').read_text()), 1)], project_id='demo-client', upto_seq=26).model_dump_json(indent=2) + '\\n')"
 """
 
 import json
@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,9 +26,11 @@ from client_feed.contract import (
     EventHeader,
     FeedLine,
     FeedState,
+    FileRevealed,
     Heartbeat,
     WaitingOn,
     parse_feed_line,
+    split_jsonl,
 )
 from client_feed.fold import fold
 from client_feed.validate import Problem, ProblemKind, ValidationReport, validate_out_dir
@@ -37,8 +40,8 @@ FEED_V1 = FIXTURES / 'feed-v1'
 FOREIGN = FIXTURES / 'feed-v1-foreign-project'
 
 
-def feed_texts(out_dir: Path) -> list[str]:
-    return (out_dir / FEED_FILENAME).read_text(encoding='utf-8').splitlines()
+def feed_texts(out_dir: Path) -> tuple[str, ...]:
+    return tuple(split_jsonl((out_dir / FEED_FILENAME).read_text(encoding='utf-8')))
 
 
 def feed_lines(out_dir: Path) -> list[FeedLine]:
@@ -119,6 +122,28 @@ def test_a_foreign_project_line_is_the_one_problem(capsys: pytest.CaptureFixture
     assert 'demo-client' in problem.detail
     assert main(['validate-feed', '--out-dir', str(FOREIGN)]) == 1
     assert 'canary-b' in capsys.readouterr().out
+
+
+def test_a_line_separator_inside_a_string_is_not_a_line_break(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out_dir = altered_copy(tmp_path)
+    revealed = next(ln for ln in feed_lines(out_dir) if isinstance(ln, FileRevealed))
+    assert revealed.seq == 22
+    line = revealed.model_copy(
+        update={
+            'seq': 29,
+            'at': datetime(2026, 10, 14, 9, 29, tzinfo=UTC),
+            'content': 'first\u2028second\x85third\u2029',
+        }
+    ).model_dump_json()
+    assert '\u2028' in line and '\x85' in line
+    with (out_dir / FEED_FILENAME).open('a', encoding='utf-8') as feed:
+        feed.write(line + '\n')
+    report = validate_out_dir(out_dir)
+    assert report.ok, report.problems
+    assert report.lines_checked == 29
+    assert main(['validate-feed', '--out-dir', str(out_dir)]) == 0
 
 
 def test_an_expected_project_other_than_the_state_is_refused() -> None:

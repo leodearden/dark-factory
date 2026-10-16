@@ -18,6 +18,7 @@ from client_feed.contract import (
     parse_feed_line,
     parse_inbox_line,
     parse_state,
+    split_jsonl,
 )
 
 SHA = 'b' * 40
@@ -218,6 +219,27 @@ def test_the_header_is_validated_even_for_an_unknown_type(override: dict[str, An
     with pytest.raises(ContractViolation) as caught:
         parse_feed_line(json.dumps(line), line_no=3)
     assert caught.value.line_no == 3
+
+
+def test_a_line_separator_inside_a_record_does_not_split_it() -> None:
+    a = json.dumps({'content': 'first second'}, ensure_ascii=False)
+    b = json.dumps({'content': 'third\x85fourth '}, ensure_ascii=False)
+    assert ' ' in a and '\x85' in b and ' ' in b
+    assert tuple(split_jsonl(a + '\n' + b + '\n')) == (a, b)
+
+
+@pytest.mark.parametrize(
+    ('text', 'expected'),
+    [
+        ('', ()),
+        ('{}', ('{}',)),
+        ('{}\n', ('{}',)),
+        ('{}\n\n{}\n', ('{}', '', '{}')),
+        ('{}\n\n', ('{}', '')),
+    ],
+)
+def test_only_the_final_newline_is_dropped(text: str, expected: tuple[str, ...]) -> None:
+    assert tuple(split_jsonl(text)) == expected
 
 
 def test_both_refusals_are_feed_errors() -> None:
