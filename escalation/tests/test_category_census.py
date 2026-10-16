@@ -190,6 +190,29 @@ class TestWrapperDiscovery:
         assert _values(result) == {'eta'}
         assert '_escalate' in result.wrappers
 
+    def test_same_named_wrappers_with_different_category_positions(self, tmp_path: Path):
+        _write(tmp_path, 'pkg/src/pkg/a.py', """
+            class A:
+                def _escalate(self, category, run_id):
+                    Escalation(category=category)
+
+                def tick(self, rid):
+                    self._escalate('eta', rid)
+        """)
+        _write(tmp_path, 'pkg/src/pkg/b.py', """
+            class B:
+                def _escalate(self, run_id, category):
+                    Escalation(category=category)
+
+                def tick(self, rid):
+                    self._escalate(rid, 'theta')
+        """)
+
+        assert _pairs(run_census([tmp_path]), tmp_path) == {
+            ('pkg/src/pkg/a.py', 'eta'),
+            ('pkg/src/pkg/b.py', 'theta'),
+        }
+
     def test_transitive_wrapper(self, tmp_path: Path):
         _write(tmp_path, 'pkg/src/pkg/w.py', """
             def _mark(reason, *, category='epsilon'):

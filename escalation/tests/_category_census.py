@@ -12,7 +12,7 @@ the submit-time check in ``escalation.categories`` catches those.
 from __future__ import annotations
 
 import ast
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence, Set
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +29,7 @@ _REGISTRY_CLASS = 'escalation.categories.EscalationCategory'
 _MAX_DEPTH = 16
 
 _Function = ast.FunctionDef | ast.AsyncFunctionDef
+_Positions = Mapping[str, Set[int | None]]
 
 
 @dataclass(frozen=True)
@@ -264,11 +265,10 @@ def _category_argument(call: ast.Call, position: int | None) -> ast.expr | None:
     return call.args[position]
 
 
-def _known_call_category(call: ast.Call, known: Mapping[str, int | None]) -> ast.expr | None:
-    name = _callee_name(call)
-    if name is None or name not in known:
-        return None
-    return _category_argument(call, known[name])
+def _known_call_categories(call: ast.Call, known: _Positions) -> tuple[ast.expr, ...]:
+    positions = known.get(_callee_name(call) or '', frozenset())
+    found = (_category_argument(call, position) for position in positions)
+    return tuple(dict.fromkeys(argument for argument in found if argument is not None))
 
 
 def _category_param(function: _Function) -> _CategoryParam | None:
@@ -286,23 +286,24 @@ def _category_param(function: _Function) -> _CategoryParam | None:
     return None
 
 
-def _forwards_category(function: _Function, known: Mapping[str, int | None]) -> bool:
-    for node in ast.walk(function):
-        if isinstance(node, ast.Call):
-            argument = _known_call_category(node, known)
-            if isinstance(argument, ast.Name) and argument.id == 'category':
-                return True
-    return False
+def _forwards_category(function: _Function, known: _Positions) -> bool:
+    return any(
+        isinstance(argument, ast.Name) and argument.id == 'category'
+        for node in ast.walk(function) if isinstance(node, ast.Call)
+        for argument in _known_call_categories(node, known)
+    )
 
 
-def _discover_wrappers(indexes: Sequence[_ModuleIndex]) -> tuple[dict[str, int | None], list[_Wrapper]]:
-    """Fixed point from the seeds. Wrappers are keyed by bare function name, so a
-    same-named def anywhere in the tree is treated as the wrapper: an
-    over-approximation that can only add sites, never hide one."""
-    known: dict[str, int | None] = dict(_SEEDS)
+def _discover_wrappers(indexes: Sequence[_ModuleIndex]) -> tuple[_Positions, list[_Wrapper]]:
+    """Fixed point from the seeds. Wrappers are keyed by bare function name, and a
+    name collects the category position of every same-named wrapper, so a call
+    to that name is read at each of them: an over-approximation that can only
+    add sites, never hide one."""
+    known: dict[str, set[int | None]] = {name: {position} for name, position in _SEEDS.items()}
     for index in indexes:
-        known.update({alias: _SEEDS['Escalation'] for alias, target in index.imports.items()
-                      if target == _ESCALATION_CLASS})
+        for alias, target in index.imports.items():
+            if target == _ESCALATION_CLASS:
+                known.setdefault(alias, set()).add(_SEEDS['Escalation'])
     pending = [_Wrapper(index, fn, param) for index in indexes for fn in index.functions
                if (param := _category_param(fn)) is not None]
     wrappers: list[_Wrapper] = []
@@ -312,16 +313,15 @@ def _discover_wrappers(indexes: Sequence[_ModuleIndex]) -> tuple[dict[str, int |
         for candidate in [c for c in pending if _forwards_category(c.function, known)]:
             pending.remove(candidate)
             wrappers.append(candidate)
-            known.setdefault(candidate.function.name, candidate.param.index)
+            known.setdefault(candidate.function.name, set()).add(candidate.param.index)
             progressed = True
     return known, wrappers
 
 
-def _call_sites(index: _ModuleIndex, known: Mapping[str, int | None],
+def _call_sites(index: _ModuleIndex, known: _Positions,
                 modules: Mapping[str, _ModuleIndex]) -> Iterator[CensusSite]:
     for function, call in index.calls:
-        argument = _known_call_category(call, known)
-        if argument is not None:
+        for argument in _known_call_categories(call, known):
             for value in _resolve(argument, index, function, modules):
                 yield CensusSite(index.path, call.lineno, value)
 
