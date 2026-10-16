@@ -15,7 +15,7 @@ import logging
 import sqlite3
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any, cast, overload
 
 import aiosqlite
 from shared.async_sqlite_base import (
@@ -1243,6 +1243,24 @@ def stamp_pending_since(
 _MACHINE_AUTHORED_METADATA_KEYS = frozenset({'pending_since', 'pending_since_backfilled'})
 
 
+@overload
+def strip_machine_authored_metadata(
+    metadata: dict,
+    *,
+    project_root: str | None = ...,
+    tag: str | None = ...,
+    task_id: int | None = ...,
+    task_ref: str | int | None = ...,
+) -> dict: ...
+@overload
+def strip_machine_authored_metadata(
+    metadata: str | dict | None,
+    *,
+    project_root: str | None = ...,
+    tag: str | None = ...,
+    task_id: int | None = ...,
+    task_ref: str | int | None = ...,
+) -> str | dict | None: ...
 def strip_machine_authored_metadata(
     metadata: str | dict | None,
     *,
@@ -3403,8 +3421,11 @@ class SqliteTaskBackend:
             # separate identity axis, so declining the dedup does not also
             # cost the message the task it names: only the PARSED int needs
             # _parse_task_id, and the raw id is in hand right here.
-            metadata = strip_machine_authored_metadata(  # type: ignore[assignment]
-                metadata, project_root=project_root, task_ref=task_id,
+            #
+            # From here on the parsed dict IS the payload: below, the raw
+            # ``metadata`` text is consulted only for whether it was supplied.
+            parsed_metadata = strip_machine_authored_metadata(
+                parsed_metadata, project_root=project_root, task_ref=task_id,
             )
         # Third pre-connection floor, and the last one: reject an append=True
         # write aimed at a REPLACE-ONLY column. Placed here deliberately —
@@ -3541,15 +3562,13 @@ class SqliteTaskBackend:
             )
 
             new_metadata: str | None = None
-            if metadata is not None:
+            if parsed_metadata is not None:
                 # Strip reserved update_task call-flag key names (append,
                 # metadata_mode) from the INCOMING payload before merging —
                 # a caller that conflates the call-flag with a metadata field
-                # (task 2682) must not have the literal key persisted. The
-                # payload is already known to be a JSON object: the
-                # non-object floor above refused anything else.
-                metadata = _strip_reserved_control_keys(
-                    metadata, project_root=project_root, tag=tag, task_id=tid,
+                # (task 2682) must not have the literal key persisted.
+                incoming_metadata = _strip_reserved_control_keys(
+                    parsed_metadata, project_root=project_root, tag=tag, task_id=tid,
                 )
                 # Behavior note: on merge/additive, _merge_metadata RAISES
                 # TaskmasterError if the stored blob is corrupt — preventing a
@@ -3560,7 +3579,7 @@ class SqliteTaskBackend:
                 # passthrough identity cannot be established against a blob
                 # that does not parse (_assert_done_provenance_passthrough).
                 new_metadata = _merge_metadata(
-                    row['metadata'], metadata,
+                    row['metadata'], json.dumps(incoming_metadata),
                     mode=resolved_mode,
                     project_root=project_root, tag=tag, task_id=tid,
                 )
@@ -3576,28 +3595,19 @@ class SqliteTaskBackend:
                 # An untouched legacy field (e.g. a pre-existing
                 # done_provenance missing the now-required kind) is tolerated
                 # rather than permanently blocking every future patch to the
-                # row. The None (enforce-all) fallback for a payload that is
-                # not a JSON object is unreachable from here: the non-object
-                # floor above refuses such a payload before connect. Under
-                # replace, a done_provenance the passthrough check admitted is
-                # not this write's responsibility either: the caller had to
-                # send it back unchanged. The same holds for an admitted echo of
-                # metadata.deferral, which _assert_deferral_unchanged checks
-                # against the stored row in every mode.
+                # row. Under replace, a done_provenance the passthrough check
+                # admitted is not this write's responsibility either: the
+                # caller had to send it back unchanged. The same holds for an
+                # admitted echo of metadata.deferral, which
+                # _assert_deferral_unchanged checks against the stored row in
+                # every mode.
                 deferral_echoed = _assert_deferral_unchanged(
                     row['metadata'], parsed_metadata, new_metadata, task_id,
                 )
-                incoming_keys: set[str] | None = None
-                try:
-                    _loaded_incoming = json.loads(metadata)
-                except (TypeError, ValueError):
-                    pass
-                else:
-                    if isinstance(_loaded_incoming, dict):
-                        incoming_keys = set(_loaded_incoming.keys())
-                if done_provenance_passed_through and incoming_keys is not None:
+                incoming_keys = set(incoming_metadata)
+                if done_provenance_passed_through:
                     incoming_keys.discard('done_provenance')
-                if deferral_echoed and incoming_keys is not None:
+                if deferral_echoed:
                     incoming_keys.discard('deferral')
                 await self._validate_metadata_on_write(
                     new_metadata, project_root=project_root, tag=tag, task_id=tid,
@@ -4678,32 +4688,22 @@ def _drop_reserved_control_keys(meta: dict) -> tuple[dict, set[str]]:
 
 
 def _strip_reserved_control_keys(
-    incoming: str,
+    incoming: dict,
     *,
     project_root: str | None = None,
     tag: str | None = None,
     task_id: int | None = None,
-) -> str:
-    """String wrapper around :func:`_drop_reserved_control_keys`.
+) -> dict:
+    """:func:`_drop_reserved_control_keys`, logging a WARNING naming any key dropped.
 
-    Fail-safe passthrough: a corrupt/non-JSON ``incoming`` string, or valid
-    JSON that is not an object, is returned UNCHANGED. This wrapper still
-    never raises; refusing a non-object payload belongs to
-    :func:`_metadata_object_or_raise`.
+    Returns ``incoming`` itself when it carries no reserved key.
     """
-    try:
-        parsed = json.loads(incoming)
-    except (TypeError, ValueError):
-        return incoming
-    if not isinstance(parsed, dict):
-        return incoming
-    cleaned, dropped = _drop_reserved_control_keys(parsed)
-    if not dropped:
-        return incoming
-    logger.warning(
-        'update_task: stripped reserved control-flag key(s) %s from metadata '
-        'payload for task %s (tag=%s project_root=%s) — call-flags are not '
-        'metadata keys',
-        sorted(dropped), task_id, tag, project_root,
-    )
-    return json.dumps(cleaned)
+    cleaned, dropped = _drop_reserved_control_keys(incoming)
+    if dropped:
+        logger.warning(
+            'update_task: stripped reserved control-flag key(s) %s from metadata '
+            'payload for task %s (tag=%s project_root=%s) — call-flags are not '
+            'metadata keys',
+            sorted(dropped), task_id, tag, project_root,
+        )
+    return cleaned

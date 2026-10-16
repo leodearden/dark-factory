@@ -2161,40 +2161,25 @@ def test_drop_reserved_control_keys_no_op_when_absent():
     assert dropped == set()
 
 
-def test_strip_reserved_control_keys_strips_from_json_object_string():
-    """(c) String wrapper strips reserved keys from a JSON-object string and re-serializes."""
+def test_strip_reserved_control_keys_drops_reserved_keys_and_warns(caplog):
+    """(c) The logging wrapper drops reserved keys and names them in a WARNING."""
     from fused_memory.backends.sqlite_task_backend import _strip_reserved_control_keys
 
-    incoming = json.dumps({'append': True, 'metadata_mode': 'merge', 'source': 'x'})
-    result = _strip_reserved_control_keys(incoming)
-    assert json.loads(result) == {'source': 'x'}
+    incoming = {'append': True, 'metadata_mode': 'merge', 'source': 'x'}
+    with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+        result = _strip_reserved_control_keys(incoming)
+    assert result == {'source': 'x'}
+    assert "['append', 'metadata_mode']" in caplog.text
 
 
-def test_strip_reserved_control_keys_no_op_returns_equivalent_when_absent():
-    """(c) No reserved keys present: the (re-serialized) payload is unchanged in content."""
+def test_strip_reserved_control_keys_no_op_returns_same_dict_when_absent(caplog):
+    """(c) No reserved keys present: the same dict comes back and nothing is logged."""
     from fused_memory.backends.sqlite_task_backend import _strip_reserved_control_keys
 
-    incoming = json.dumps({'source': 'x'})
-    result = _strip_reserved_control_keys(incoming)
-    assert json.loads(result) == {'source': 'x'}
-
-
-def test_strip_reserved_control_keys_passthrough_on_corrupt_json():
-    """(d) Fail-safe: a corrupt/non-JSON string is returned UNCHANGED (identity-preserving);
-    this wrapper never raises, refusing it is _metadata_object_or_raise's job."""
-    from fused_memory.backends.sqlite_task_backend import _strip_reserved_control_keys
-
-    incoming = 'NOT_JSON'
-    assert _strip_reserved_control_keys(incoming) is incoming
-
-
-@pytest.mark.parametrize('incoming', ['[1,2]', '"s"'])
-def test_strip_reserved_control_keys_passthrough_on_non_dict_json(incoming):
-    """(d) Fail-safe: valid-but-non-dict JSON is returned UNCHANGED; this wrapper
-    never raises, refusing it is _metadata_object_or_raise's job."""
-    from fused_memory.backends.sqlite_task_backend import _strip_reserved_control_keys
-
-    assert _strip_reserved_control_keys(incoming) is incoming
+    incoming = {'source': 'x'}
+    with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+        assert _strip_reserved_control_keys(incoming) is incoming
+    assert 'reserved control-flag' not in caplog.text
 
 
 @pytest.mark.asyncio
