@@ -17,9 +17,8 @@ import logging
 import time
 from pathlib import Path
 
-from pydantic import ValidationError
 from shared.project_layout import runs_db, scheduler_state_json
-from shared.scheduler_state import SchedulerStateSnapshot
+from shared.scheduler_state import MalformedSnapshotError, SchedulerStateSnapshot
 
 _log = logging.getLogger(__name__)
 
@@ -66,7 +65,7 @@ def read_scheduler_state(project_root: Path) -> SchedulerStateSnapshot:
         return SchedulerStateSnapshot.from_json(json.loads(path.read_bytes()))
     except FileNotFoundError:
         pass
-    except (json.JSONDecodeError, UnicodeDecodeError, ValidationError, OSError) as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError, MalformedSnapshotError, OSError) as exc:
         _log.warning('read_scheduler_state: %s: %s — returning empty snapshot', path, exc)
     return SchedulerStateSnapshot.empty()
 

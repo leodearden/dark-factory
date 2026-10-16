@@ -15,6 +15,7 @@ import pytest
 from pydantic import ValidationError
 
 from shared.scheduler_state import (
+    MalformedSnapshotError,
     OverrideRecord,
     ParkRecord,
     PinQueueEntry,
@@ -212,26 +213,26 @@ class TestRollingRestart:
 class TestMalformedInput:
     @pytest.mark.parametrize('body', [[], 'x', None, 3])
     def test_non_mapping_body(self, body: Any) -> None:
-        with pytest.raises(ValidationError):
+        with pytest.raises(MalformedSnapshotError):
             SchedulerStateSnapshot.from_json(body)
 
     def test_naive_snapshot_at(self) -> None:
-        with pytest.raises(ValidationError):
+        with pytest.raises(MalformedSnapshotError):
             SchedulerStateSnapshot.from_json({'snapshot_at': '2026-01-01T00:00:00'})
 
     @pytest.mark.parametrize('depth', [True, '4', 4.0])
     def test_lock_depth_is_a_strict_int(self, depth: object) -> None:
-        with pytest.raises(ValidationError):
+        with pytest.raises(MalformedSnapshotError):
             SchedulerStateSnapshot.from_json({'lock_depth': depth})
 
     def test_park_installed_at_must_be_a_string(self) -> None:
-        with pytest.raises(ValidationError):
+        with pytest.raises(MalformedSnapshotError):
             SchedulerStateSnapshot.from_json(
                 {'parks': {'P': {'modules': ['m'], 'installed_at': 12345}}},
             )
 
     def test_current_holder_must_be_a_string(self) -> None:
-        with pytest.raises(ValidationError):
+        with pytest.raises(MalformedSnapshotError):
             SchedulerStateSnapshot.from_json({'current_holders': {'m': 7}})
 
 

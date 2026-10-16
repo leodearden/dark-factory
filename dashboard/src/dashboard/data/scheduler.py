@@ -74,9 +74,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
-from pydantic import ValidationError
 from shared.locking import files_to_modules, modules_conflict
-from shared.scheduler_state import OverrideRecord, SchedulerStateSnapshot
+from shared.scheduler_state import (
+    MalformedSnapshotError,
+    OverrideRecord,
+    SchedulerStateSnapshot,
+)
 
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import collect_tasks_with_counts
@@ -782,7 +785,7 @@ async def collect_scheduler_state(
             )
             try:
                 snapshot = SchedulerStateSnapshot.from_json(reply)
-            except ValidationError as exc:
+            except MalformedSnapshotError as exc:
                 logger.warning(
                     'get_scheduler_state[%s] reply is not a scheduler snapshot; '
                     'showing the project as online but empty: %s',

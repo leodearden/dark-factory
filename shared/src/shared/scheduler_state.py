@@ -4,9 +4,13 @@ The orchestrator scheduler builds a ``SchedulerStateSnapshot`` and writes its
 ``to_json()`` form to ``scheduler_state.json``; fused-memory and the dashboard
 parse that form back with ``from_json``. Unknown keys from a newer producer are
 ignored and keys an older producer lacks take their defaults, so a field is
-added in one place: here. ``snapshot_at is None`` means no producer has written
-a snapshot. Contract: plans/review-all-s14-shared-leaves-prd.md (decision 12,
-invariant I4, INV-13).
+added in one place: here. Each process re-serialises through its own deployed
+copy of this model, so fused-memory's ``get_scheduler_state`` forwards only the
+fields that copy defines: a new field reaches the dashboard only once the
+orchestrator, fused-memory and the dashboard all run code that defines it.
+``snapshot_at is None`` means no producer has written a snapshot.
+Contract: plans/review-all-s14-shared-leaves-prd.md (decision 12, invariant I4,
+INV-13).
 """
 
 from __future__ import annotations
@@ -15,9 +19,18 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StrictInt, field_serializer
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    ValidationError,
+    field_serializer,
+)
 
 __all__ = [
+    'MalformedSnapshotError',
     'OverrideRecord',
     'ParkRecord',
     'PinQueueEntry',
@@ -26,6 +39,10 @@ __all__ = [
 ]
 
 _RECORD_CONFIG = ConfigDict(frozen=True, extra='ignore')
+
+
+class MalformedSnapshotError(ValueError):
+    """The input to ``SchedulerStateSnapshot.from_json`` is not a snapshot's wire form."""
 
 
 class ParkRecord(BaseModel):
@@ -82,6 +99,10 @@ class SchedulerStateSnapshot(BaseModel):
     """``parks`` maps each owner to the modules it tops; ``park_stacks`` maps each
     module to its whole stack, bottom to top, as open entry records; ``lock_depth``
     is the depth the producer normalises lock keys to.
+
+    Frozen means no field can be reassigned. The mappings are plain dicts that
+    validation copies from its input, so a snapshot never aliases its producer's
+    state, but nothing stops a reader mutating one in place.
     """
 
     model_config = _RECORD_CONFIG
@@ -112,9 +133,12 @@ class SchedulerStateSnapshot(BaseModel):
     def from_json(cls, data: Mapping[str, Any]) -> SchedulerStateSnapshot:
         """Parse a snapshot's wire form; unknown keys are ignored.
 
-        Raises pydantic.ValidationError when *data* does not have the snapshot's shape.
+        Raises MalformedSnapshotError when *data* does not have the snapshot's shape.
         """
-        return cls.model_validate(data)
+        try:
+            return cls.model_validate(data)
+        except ValidationError as exc:
+            raise MalformedSnapshotError(str(exc)) from exc
 
     def to_json(self) -> dict[str, Any]:
         return self.model_dump(mode='json')

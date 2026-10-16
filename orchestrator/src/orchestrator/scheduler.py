@@ -8372,7 +8372,7 @@ class Scheduler:
             logger.warning('scheduler_tick telemetry emit failed', exc_info=True)
 
     def get_state_snapshot(self) -> SchedulerStateSnapshot:
-        """Return the scheduler's current state as an immutable value.
+        """Return a frozen copy of the scheduler's current state.
 
         Field shapes live in shared/src/shared/scheduler_state.py::SchedulerStateSnapshot.
         ``parks`` reports every active top, pin reservations included;
