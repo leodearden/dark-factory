@@ -68,6 +68,7 @@ from orchestrator.git_ops import (
 )
 from orchestrator.guard_state import PersistentSet, guard_path
 from orchestrator.log_coalesce import ExponentialLogCoalescer
+from orchestrator.main_health_actions import MainHealthNextAction
 from orchestrator.merge_lane.coalesce_unwind import restore_pre_stack_tips
 from orchestrator.merge_lane.disposition import (
     MergeFailureDisposition,
@@ -1407,7 +1408,10 @@ async def _run_deferred_main_health_probe(
     if auto_heal is not None:
         await auto_heal(outcome, req)
     else:
-        _file_main_health_escalation(escalation_queue, req, outcome)
+        _file_main_health_escalation(
+            escalation_queue, req, outcome,
+            suggested_action=MainHealthNextAction.NO_FIX_OWNER,
+        )
 
 
 def _file_main_health_escalation(
@@ -1415,7 +1419,7 @@ def _file_main_health_escalation(
     req: MergeRequest,
     outcome: MergeOutcome,
     *,
-    suggested_action: str = 'await_preexisting_main_hotfix',
+    suggested_action: MainHealthNextAction,
 ) -> str | None:
     """File (or fold) a dedup'd ``preexisting_main_break`` escalation for a
     confirmed pre-existing main-red *outcome* (task 2564).
@@ -1428,14 +1432,11 @@ def _file_main_health_escalation(
     must reference the parent, not the folded child.  Existing callers that
     ignore the return value are unaffected (backward-compatible addition).
 
-    *suggested_action* defaults to ``'await_preexisting_main_hotfix'`` —
-    byte-identical to every call site predating this parameter — so an
-    escalation-only caller (the bare/test fallback in
-    :func:`_run_deferred_main_health_probe`) files the same operator
-    instruction as before.  A caller performing the full auto-heal
-    (:func:`SpeculativeMergeWorker._auto_heal_main_health_deferred`) passes
-    ``'main_health_auto_heal_in_flight'`` instead, mirroring
-    ``TaskWorkflow._auto_heal_main_health``'s halt-owner escalation.
+    Every caller names its bounded next action from
+    :class:`~orchestrator.main_health_actions.MainHealthNextAction`.  The
+    record is filed at L1 because its consumer is escalation-watcher-auto,
+    never a steward: a steward cannot fix main, and L0s are dismissed by
+    the blocking task's own cleanup and at restart.
 
     Folds via ``submit_or_dedupe`` using the SAME inf-window
     content-fingerprint :class:`~escalation.dedupe.DedupeConfig`
@@ -1461,6 +1462,7 @@ def _file_main_health_escalation(
         detail=outcome.reason,
         suggested_action=suggested_action,
         dedupe_fingerprint=fp,
+        level=1,
     )
     if fp:
         submit_result = submit_or_dedupe(
@@ -18539,7 +18541,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # lane would stay halted permanently → livelock).  Escalate-only, no
         # halt/spawn.
         if not is_auto_heal_eligible(category, cause_hint) or self._escalation_queue is None:
-            _file_main_health_escalation(self._escalation_queue, req, outcome)
+            _file_main_health_escalation(
+                self._escalation_queue, req, outcome,
+                suggested_action=MainHealthNextAction.NO_FIX_OWNER,
+            )
             return
 
         sig = RetryLedger.compute_merge_outcome_signature(
@@ -18554,14 +18559,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self.auto_heal_registry.attempts(sig) >= MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS
             and not self.is_lane_halted('normal')
         ):
-            _file_main_health_escalation(self._escalation_queue, req, outcome)
+            _file_main_health_escalation(
+                self._escalation_queue, req, outcome,
+                suggested_action=MainHealthNextAction.AUTO_HEAL_EXHAUSTED,
+            )
             return
 
         # Build and submit/fold the dedup'd halt-owner escalation — shared by
         # both the idempotency branch and the happy path below.
         esc_id = _file_main_health_escalation(
             self._escalation_queue, req, outcome,
-            suggested_action='main_health_auto_heal_in_flight',
+            suggested_action=MainHealthNextAction.AUTO_HEAL_IN_FLIGHT,
         )
 
         # Branch (idempotency): lane already halted → an auto-heal is already
