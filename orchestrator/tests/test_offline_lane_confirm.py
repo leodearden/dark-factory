@@ -294,6 +294,16 @@ class TestPartition:
         rerun = _rerun(outcomes={'tests/t.py::test_a': 'skipped'}, session_complete=True)
         assert partition(detect, rerun) == ((), (), ('tests/t.py::test_a',))
 
+    def test_per_test_evidence_without_the_node_is_inconclusive_even_in_a_complete_session(self) -> None:
+        detect = _run(('tests/t.py::test_steady', 'failed'), ('tests/t.py::test_flaky', 'failed'))
+        rerun = _rerun(
+            ('tests/t.py::test_steady', 'failed'),
+            returncode=2,
+            outcomes={'tests/t.py::test_other': 'passed'},
+            session_complete=True,
+        )
+        assert partition(detect, rerun) == (('tests/t.py::test_steady',), (), ('tests/t.py::test_flaky',))
+
     def test_a_complete_session_that_did_not_name_it_clears(self) -> None:
         detect = _run(('tests/t.py::test_a', 'failed'))
         assert partition(detect, _rerun(session_complete=True)) == ((), ('tests/t.py::test_a',), ())

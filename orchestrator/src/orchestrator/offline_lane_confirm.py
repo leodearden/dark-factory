@@ -247,17 +247,13 @@ class _Verdict(StrEnum):
     INCONCLUSIVE = 'inconclusive'
 
 
-_EVIDENCE_VERDICTS = {'passed': _Verdict.CLEARED, 'skipped': _Verdict.INCONCLUSIVE}
-
-
 def _verdict(node: str, reproduced: set[str], rerun: RunRecord) -> _Verdict:
     if node in reproduced:
         return _Verdict.REPRODUCED
     if any(failure.node == node for failure in rerun.failures):
         return _Verdict.INCONCLUSIVE
-    evidence = (rerun.outcomes or {}).get(node)
-    if evidence in _EVIDENCE_VERDICTS:
-        return _EVIDENCE_VERDICTS[evidence]
+    if rerun.outcomes is not None:
+        return _Verdict.CLEARED if rerun.outcomes.get(node) == 'passed' else _Verdict.INCONCLUSIVE
     return _Verdict.CLEARED if rerun.session_complete else _Verdict.INCONCLUSIVE
 
 
@@ -272,9 +268,11 @@ def partition(
 
     Reproduced: *rerun* fails the node with a compatible kind
     (``orchestrator/src/orchestrator/verify.py::reproduced_failures``).
-    Inconclusive: *rerun* names it with an incompatible kind, or its per-test
-    evidence is a skip, or *rerun* neither completed its session nor named it.
-    Cleared: its per-test evidence is a pass, or *rerun* completed without naming it.
+    Otherwise, where *rerun* has per-test evidence, the node is cleared only when
+    that evidence says it passed: a skip, or no entry at all (pytest stopped the
+    session before running it), is inconclusive.  Without per-test evidence it is
+    cleared when *rerun* completed its session, else inconclusive.  A node *rerun*
+    names with an incompatible kind is inconclusive.
     """
     original = _as_pytest_failures(detect)
     reproduced = {f.node_id for f in reproduced_failures(original, _as_pytest_failures(rerun))}
