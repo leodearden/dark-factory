@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from pathlib import Path
 from typing import Final
@@ -19,6 +19,7 @@ from client_feed.contract import (
     UnsupportedFeedVersion,
     parse_feed_line,
     parse_state,
+    split_jsonl,
 )
 from client_feed.fold import CorruptFeed, ProjectMismatch, fold
 
@@ -117,7 +118,7 @@ def _expected_project(state: FeedState, expected_project_id: str | None) -> str:
     )
 
 
-def _parse_lines(texts: list[str]) -> list[FeedLine]:
+def _parse_lines(texts: Sequence[str]) -> list[FeedLine]:
     lines: list[FeedLine] = []
     problems: list[Problem] = []
     for line_no, text in enumerate(texts, 1):
@@ -170,7 +171,7 @@ def validate_out_dir(out_dir: Path, *, expected_project_id: str | None = None) -
         state = _read_state(out_dir)
         watermark_seq = state.watermark_seq
         project_id = _expected_project(state, expected_project_id)
-        texts = _read_text(out_dir / FEED_FILENAME).splitlines()
+        texts = split_jsonl(_read_text(out_dir / FEED_FILENAME))
         lines_checked = len(texts)
         lines = _parse_lines(texts)
         _compare_with_state(_fold_at_watermark(lines, project_id, state.watermark_seq), state)

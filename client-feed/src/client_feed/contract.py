@@ -618,6 +618,14 @@ def parse_inbox_line(text: str, *, line_no: int) -> RevealRequested:
     )
 
 
+def split_jsonl(text: str) -> tuple[str, ...]:
+    """The record texts of a JSONL file, split on '\\n' alone (JSONL's only record separator), so a U+2028, U+2029 or U+0085 held raw inside a JSON string never splits a record."""
+    texts = text.split('\n')
+    if texts[-1] == '':
+        texts.pop()
+    return tuple(texts)
+
+
 def parse_engagement(text: str) -> EngagementProjection:
     """The whole of engagement.json."""
     return _validated(
