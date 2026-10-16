@@ -4,14 +4,19 @@ Everything runs on real sqlite3 connections built from the module's own
 public SQL constants; nothing is mocked.
 """
 
+import itertools
 import sqlite3
+import uuid
 
 import pytest
 
 from fused_memory.services.read_rollup import (
+    COUNT_ONLY_READ_PREDICATE,
     COUNT_READ_SQL,
     READ_OP_COUNTS_SCHEMA_SQL,
+    keeps_read_row,
 )
+from fused_memory.services.write_journal import SCHEMA_SQL as WRITE_OPS_SCHEMA_SQL
 
 
 def _rollup_db() -> sqlite3.Connection:
@@ -112,3 +117,57 @@ class TestCountReadUpsert:
         _count(conn, '2026-10-11T21:06:00+00:00', project_id='', agent_id='', operation='')
         _count(conn, '2026-10-11T21:07:00+00:00', project_id=None, agent_id=None, operation=None)
         assert _rows(conn) == [('2026-10-11T21:00:00+00:00', '', '', '', 3)]
+
+
+class TestKeepsReadRow:
+    @pytest.mark.parametrize(
+        ('operation', 'success', 'expected'),
+        [
+            ('search', True, True),
+            ('search', False, True),
+            ('get_task', True, False),
+            ('get_task', False, True),
+            ('get_entity', False, True),
+            (None, True, False),
+        ],
+    )
+    def test_truth_table(self, operation, success, expected):
+        assert keeps_read_row(operation=operation, success=success) is expected
+
+
+def _insert_write_op(
+    conn: sqlite3.Connection,
+    *,
+    kind: str,
+    operation: str | None,
+    success: int | None,
+) -> str:
+    row_id = str(uuid.uuid4())
+    conn.execute(
+        'INSERT INTO write_ops (id, operation, kind, success, created_at) '
+        "VALUES (?, ?, ?, ?, '2026-10-11T21:00:00+00:00')",
+        (row_id, operation, kind, success),
+    )
+    return row_id
+
+
+class TestCountOnlyPredicateAgreesWithKeepsReadRow:
+    def test_sql_predicate_selects_exactly_the_reads_python_would_count(self):
+        conn = sqlite3.connect(':memory:')
+        conn.executescript(WRITE_OPS_SCHEMA_SQL)
+        operations = ['search', 'get_task', 'get_statuses', 'get_entity', None]
+        expected_count_only: set[str] = set()
+        for operation, success in itertools.product(operations, (1, 0)):
+            read_id = _insert_write_op(conn, kind='read', operation=operation, success=success)
+            if not keeps_read_row(operation=operation, success=bool(success)):
+                expected_count_only.add(read_id)
+            _insert_write_op(conn, kind='write', operation=operation, success=success)
+        _insert_write_op(conn, kind='read', operation='get_task', success=None)
+
+        selected = {
+            row[0]
+            for row in conn.execute(f'SELECT id FROM write_ops WHERE {COUNT_ONLY_READ_PREDICATE}')
+        }
+
+        assert selected == expected_count_only
+        assert expected_count_only
