@@ -707,9 +707,7 @@ class TestMarkerDeletionPremise:
     @pytest.mark.parametrize(
         ('near_miss', 'length'),
         [
-            # measured pre-fix: ~9.3s; cubic, so a 40K clause would run for hours
             ('stage 3 deletes ', 4_800),
-            # measured pre-fix: ~11.9s
             ('stage 3 ', 40_000),
         ],
         ids=['subject-verb-pairs', 'subjects'],

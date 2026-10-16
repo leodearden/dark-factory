@@ -950,8 +950,7 @@ _MARKER_NOUN = re.compile(
 
 
 # One pass per pattern, then a gap [a, b) is clean iff a and b fall in the
-# same clause, numbered by the stops before them. One pattern spanning both
-# gaps re-scanned the clause per subject and per verb: cubic in its length.
+# same clause, numbered by the stops before them.
 def _asserts_non_gc_marker_deletion(text: str) -> bool:
     stops = [stop.start() for stop in _GAP_STOP.finditer(text)]
 
