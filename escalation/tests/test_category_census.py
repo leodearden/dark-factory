@@ -113,6 +113,38 @@ class TestResolution:
 
         assert _values(run_census([tmp_path])) == {'review_due'}
 
+    def test_same_module_return_value(self, tmp_path: Path):
+        _write(tmp_path, 'pkg/src/pkg/p.py', """
+            class P:
+                def _pick(self):
+                    return 'omicron'
+
+                def file(self):
+                    Escalation(category=self._pick())
+        """)
+
+        assert _values(run_census([tmp_path])) == {'omicron'}
+
+    def test_tuple_unpacked_from_a_same_module_return(self, tmp_path: Path):
+        _write(tmp_path, 'pkg/src/pkg/w.py', """
+            class W:
+                def _text(self, status):
+                    if status == 'a':
+                        category = 'nu'
+                    else:
+                        category = 'xi'
+                    return category, 'summary', 'detail'
+
+                def _file(self, category, summary, detail):
+                    Escalation(category=category)
+
+                def handle(self, status):
+                    category, summary, detail = self._text(status)
+                    self._file(category, summary, detail)
+        """)
+
+        assert _values(run_census([tmp_path])) == {'nu', 'xi'}
+
     def test_function_local_assignments(self, tmp_path: Path):
         _write(tmp_path, 'pkg/src/pkg/w.py', """
             def _mark(reason, *, category):

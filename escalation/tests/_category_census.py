@@ -2,9 +2,11 @@
 
 Walks every non-test ``.py`` under the given roots and resolves the category
 passed to ``Escalation``, ``has_open_l1``, ``find_terminal_by_citation`` and
-every function that forwards its own ``category`` parameter to one of them.
-It cannot see fully dynamic values (subscripts, call results); only the
-submit-time check in ``escalation.categories`` catches those.
+every function that forwards its own ``category`` parameter to one of them,
+following values through constants, imports, local and tuple-unpacked
+assignments, and the returns of functions defined in the same module. It
+cannot see fully dynamic values (subscripts, calls into other modules); only
+the submit-time check in ``escalation.categories`` catches those.
 """
 
 from __future__ import annotations
@@ -64,6 +66,14 @@ class _ModuleIndex:
 class _CategoryParam:
     index: int | None
     default: ast.expr | None
+
+
+@dataclass(frozen=True)
+class _Bound:
+    """What a local name is bound to: *value* itself, or its *element*-th item."""
+
+    value: ast.expr
+    element: int | None = None
 
 
 @dataclass(frozen=True)
@@ -164,19 +174,52 @@ def _resolve(expr: ast.expr, index: _ModuleIndex, function: _Function | None,
         return _resolve_name(expr.id, index, function, modules, depth + 1)
     if isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name):
         return _resolve_attribute(expr.value.id, expr.attr, index, modules, depth + 1)
+    if isinstance(expr, ast.Call):
+        return _resolve_returns(expr, None, index, modules, depth + 1)
     return frozenset()
 
 
-def _local_assignments(function: _Function, name: str) -> list[ast.expr]:
-    return [value for node in ast.walk(function) if isinstance(node, ast.stmt)
-            for bound, value in _assigned(node) if bound == name]
+def _local_bindings(function: _Function, name: str) -> list[_Bound]:
+    bindings: list[_Bound] = []
+    for node in ast.walk(function):
+        if isinstance(node, ast.stmt):
+            bindings.extend(_Bound(value) for bound, value in _assigned(node) if bound == name)
+        if isinstance(node, ast.Assign):
+            bindings.extend(
+                _Bound(node.value, i)
+                for target in node.targets if isinstance(target, ast.Tuple)
+                for i, item in enumerate(target.elts)
+                if isinstance(item, ast.Name) and item.id == name
+            )
+    return bindings
+
+
+def _resolve_bound(bound: _Bound, index: _ModuleIndex, function: _Function | None,
+                   modules: Mapping[str, _ModuleIndex], depth: int) -> frozenset[str]:
+    if bound.element is None:
+        return _resolve(bound.value, index, function, modules, depth)
+    if isinstance(bound.value, ast.Tuple) and bound.element < len(bound.value.elts):
+        return _resolve(bound.value.elts[bound.element], index, function, modules, depth)
+    if isinstance(bound.value, ast.Call):
+        return _resolve_returns(bound.value, bound.element, index, modules, depth + 1)
+    return frozenset()
+
+
+def _resolve_returns(call: ast.Call, element: int | None, index: _ModuleIndex,
+                     modules: Mapping[str, _ModuleIndex], depth: int) -> frozenset[str]:
+    name = _callee_name(call)
+    returned = [(fn, node.value) for fn in index.functions if fn.name == name
+                for node in ast.walk(fn) if isinstance(node, ast.Return) and node.value is not None]
+    return frozenset().union(*(
+        _resolve_bound(_Bound(value, element), index, fn, modules, depth) for fn, value in returned
+    ))
 
 
 def _resolve_name(name: str, index: _ModuleIndex, function: _Function | None,
                   modules: Mapping[str, _ModuleIndex], depth: int) -> frozenset[str]:
-    local = _local_assignments(function, name) if function is not None else []
+    local = _local_bindings(function, name) if function is not None else []
     if local:
-        return frozenset().union(*(_resolve(v, index, function, modules, depth) for v in local))
+        return frozenset().union(*(_resolve_bound(b, index, function, modules, depth) for b in local))
     if name in index.constants:
         return _resolve(index.constants[name], index, None, modules, depth)
     owner, _, attr = index.imports.get(name, '').rpartition('.')

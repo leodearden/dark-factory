@@ -1924,6 +1924,20 @@ attached to it. To retire a task instead of correcting it, cancel it
 (`status="cancelled"`) rather than removing it, so the record and its id
 remain resolvable by anything that referenced it.
 
+**Adding an escalation category.** Every filed category must be a member of
+`escalation/src/escalation/categories.py::EscalationCategory`; its module
+docstring states when a category is registered. `EscalationQueue.submit`,
+`submit_resolved` and the category-filtered readers raise
+`UnregisteredEscalationCategory` for anything else, and `escalate_blocker`,
+`escalate_info` and `promote_to_l2` return `{'error': ...}`. So a task that
+introduces a category adds the member IN THE SAME CHANGE, prefers passing the
+member over a bare string, and lists `escalation/src/escalation/categories.py`
+in its `files`, because that list is the lock.
+`escalation/tests/test_category_census.py` fails verify on an unregistered
+filer reached through literals, constants, imports or forwarding wrappers. It
+cannot see fully dynamic values (subscripts, values read from payload dicts);
+only the submit-time check catches those.
+
 ## 10. Rotating a long-running audit-trail task
 
 A task that stays open across many reconciliation cycles accretes. Each
