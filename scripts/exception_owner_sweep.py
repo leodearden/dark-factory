@@ -8,17 +8,23 @@ that the next night does not repeat it.
 
 from __future__ import annotations
 
+import collections
+import datetime
 import enum
+import functools
 import json
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import TypeVar
 
 try:
     import _checkout as _checkout
+    import exception_owner_liveness as liveness
+    from _task_db_scan import UNREADABLE_STORE_ERRORS
     from shared.governed_exceptions import (
         MalformedDisposition,
         TaskRef,
@@ -26,6 +32,7 @@ try:
         owner_from_record,
         owner_record,
     )
+    from shared.task_statuses import OwnerLiveness
 except ImportError as exc:
     print(
         f'exception_owner_sweep.py: {exc} -- run it as '
@@ -80,11 +87,18 @@ Owner = TaskRef | TicketRef
 
 @dataclass(frozen=True)
 class Citation:
-    """One owner cited in one scope, with every site that cites it."""
+    """One owner cited in one scope, with every site that cites it.
+
+    Attributes:
+        sites: ``path:line`` for an inline marker; ``default`` or the override
+            key for a governed list's entry.
+        files: The repository files those sites live in.
+    """
 
     scope: str
     owner: Owner
     sites: tuple[str, ...]
+    files: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -134,20 +148,30 @@ def _debt_owner(record: object, where: str) -> Owner | None:
     raise SweepFailure(FailureStage.REGISTER, f'register `{where}` is not a disposition: {record!r}')
 
 
-def _declaration_cites(declaration: Mapping[str, object], where: str) -> list[tuple[str, Owner, str]]:
+@dataclass(frozen=True)
+class _Cite:
+    """One citing site: its sort key renders as the site, ``:``-joined."""
+
+    scope: str
+    owner: Owner
+    site: tuple[str] | tuple[str, int]
+    file: str
+
+
+def _declaration_cites(declaration: Mapping[str, object], where: str) -> list[_Cite]:
     list_id = _field(declaration, 'list_id', str, where)
-    cites = [(list_id, _debt_owner(declaration.get('default'), f'{where}default'), 'default')]
+    path = _field(declaration, 'path', str, where)
+    owned = [('default', _debt_owner(declaration.get('default'), f'{where}default'))]
     for index, override in enumerate(_entries(declaration, 'overrides', where)):
         key = _field(override, 'key', str, f'{where}overrides[{index}].')
-        owner = _debt_owner(override.get('disposition'), f'{where}overrides[{index}].disposition')
-        cites.append((list_id, owner, key))
-    return [(scope, owner, site) for scope, owner, site in cites if owner is not None]
+        owned.append((key, _debt_owner(override.get('disposition'), f'{where}overrides[{index}].disposition')))
+    return [_Cite(list_id, owner, (key,), path) for key, owner in owned if owner is not None]
 
 
-def _inline_cites(debt: Mapping[str, object], where: str) -> tuple[str, Owner, tuple[str, int]]:
+def _inline_cite(debt: Mapping[str, object], where: str) -> _Cite:
     path = _field(debt, 'path', str, where)
     line = _field(debt, 'line', int, where)
-    return INLINE_SCOPE, _owner(debt.get('owner'), f'{where}owner'), (path, line)
+    return _Cite(INLINE_SCOPE, _owner(debt.get('owner'), f'{where}owner'), (path, line), path)
 
 
 def _citation_order(cited: tuple[str, Owner]) -> tuple[str, int, int, str]:
@@ -167,22 +191,37 @@ def parse_register(document: object) -> RegisterView:
             f'register published schema_version {version!r}, but this sweep reads '
             f'{REGISTER_SCHEMA_VERSION_READ}; the two change together',
         )
-    sites: dict[tuple[str, Owner], set[tuple[str, int] | tuple[str]]] = {}
-    for index, declaration in enumerate(_entries(document, 'declarations', '')):
-        for scope, owner, key in _declaration_cites(declaration, f'declarations[{index}].'):
-            sites.setdefault((scope, owner), set()).add((key,))
+    cites = [
+        cite
+        for index, declaration in enumerate(_entries(document, 'declarations', ''))
+        for cite in _declaration_cites(declaration, f'declarations[{index}].')
+    ]
     inline = _field(document, 'inline', dict, '')
-    for index, debt in enumerate(_entries(inline, 'debt', 'inline.')):
-        scope, owner, site = _inline_cites(debt, f'inline.debt[{index}].')
-        sites.setdefault((scope, owner), set()).add(site)
+    cites += [
+        _inline_cite(debt, f'inline.debt[{index}].')
+        for index, debt in enumerate(_entries(inline, 'debt', 'inline.'))
+    ]
     baseline = _field(document, 'baseline', dict, '')
     slack = baseline.get('slack_total')
     return RegisterView(
-        citations=tuple(
-            Citation(scope, owner, tuple(':'.join(map(str, site)) for site in sorted(sites[scope, owner])))
-            for scope, owner in sorted(sites, key=_citation_order)
-        ),
+        citations=_citations(cites),
         slack_total=0 if slack is None else _field(baseline, 'slack_total', int, 'baseline.'),
+    )
+
+
+def _citations(cites: list[_Cite]) -> tuple[Citation, ...]:
+    """One citation per (scope, owner), every list sorted."""
+    grouped: dict[tuple[str, Owner], list[_Cite]] = {}
+    for cite in cites:
+        grouped.setdefault((cite.scope, cite.owner), []).append(cite)
+    return tuple(
+        Citation(
+            scope,
+            owner,
+            sites=tuple(':'.join(map(str, site)) for site in sorted({c.site for c in grouped[scope, owner]})),
+            files=tuple(sorted({c.file for c in grouped[scope, owner]})),
+        )
+        for scope, owner in sorted(grouped, key=_citation_order)
     )
 
 
@@ -295,3 +334,288 @@ class FindingKey:
 
 TIGHTEN_KEY = FindingKey(FindingKind.TIGHTEN)
 OVERFLOW_KEY = FindingKey(FindingKind.OVERFLOW)
+
+# ---------------------------------------------------------------------------
+# Ports: every store and MCP interaction is one call carrying what it needs.
+
+ToolCall = Callable[[str, dict[str, object]], Mapping[str, object]]
+"""One MCP tool call: tool name and arguments in, the unwrapped result out."""
+
+AGENT_ROLE = 'exception-owner-sweep'
+
+REPORT_COMMAND = 'uv run --project shared python scripts/exception_register.py --report'
+
+SUBMIT_RESOLVE_WAIT_SECS = 115
+"""How long a filing waits for the curator: under the server's 120 s MCP call limit."""
+
+
+@dataclass(frozen=True)
+class Ports:
+    """Where the sweep reads and writes: the main checkout's store and both MCP servers."""
+
+    project_root: Path
+    db: Path
+    fused_memory: ToolCall
+    escalation: ToolCall
+
+
+def _call(port: ToolCall, stage: FailureStage, tool: str, args: dict[str, object]) -> Mapping[str, object]:
+    """The one MCP boundary: a transport fault or an error answer is a :class:`SweepFailure`."""
+    try:
+        result = port(tool, args)
+    except Exception as exc:
+        raise SweepFailure(stage, f'{tool} failed: {type(exc).__name__}: {exc}') from exc
+    if not isinstance(result, Mapping) or 'error' in result:
+        raise SweepFailure(stage, f'{tool} answered {result!r}')
+    return result
+
+
+def _from_store(db: Path, read: Callable[[], _T]) -> _T:
+    try:
+        return read()
+    except UNREADABLE_STORE_ERRORS as exc:
+        raise SweepFailure(FailureStage.STORE, f'{db}: {exc}') from exc
+
+
+def _resolve_ticket(ports: Ports, ticket: str, wait_secs: float) -> liveness.TicketOutcome:
+    args: dict[str, object] = {
+        'ticket': ticket,
+        'project_root': str(ports.project_root),
+        'timeout_seconds': wait_secs,
+    }
+    result = _call(ports.fused_memory, FailureStage.FUSED_MEMORY, 'resolve_ticket', args)
+    try:
+        return liveness.ticket_outcome(result)
+    except liveness.TicketUnreadable as exc:
+        raise SweepFailure(FailureStage.FUSED_MEMORY, f'resolve_ticket {ticket}: {exc}') from exc
+
+
+def owner_resolver(ports: Ports) -> Callable[[Owner], liveness.OwnerVerdict]:
+    """``resolve_owner`` bound to this store and to a never-waiting ``resolve_ticket``.
+
+    Zero wait: a ticket still being curated answers the unpersisted ``timeout``,
+    which reads as pending, so the owner is live.
+    """
+    read_tasks = functools.partial(liveness.read_tasks, ports.db)
+
+    def resolve_ticket(ticket: TicketRef) -> liveness.TicketOutcome:
+        return _resolve_ticket(ports, ticket.id, wait_secs=0)
+
+    def resolve(owner: Owner) -> liveness.OwnerVerdict:
+        return _from_store(
+            ports.db,
+            lambda: liveness.resolve_owner(owner, read_tasks=read_tasks, resolve_ticket=resolve_ticket),
+        )
+
+    return resolve
+
+
+def _carriers(ports: Ports, field: str) -> tuple[liveness.TaskRow, ...]:
+    return _from_store(ports.db, lambda: liveness.read_tasks_carrying(ports.db, field))
+
+
+def pending_escalation_ids(ports: Ports) -> frozenset[str]:
+    """The ``task_id`` of every pending escalation: one ``get_pending_escalations`` call."""
+    answer = _call(
+        ports.escalation, FailureStage.ESCALATION, 'get_pending_escalations', {'compact': True}
+    )
+    records = answer.get('result')
+    if not isinstance(records, list):
+        raise SweepFailure(
+            FailureStage.ESCALATION, f'get_pending_escalations answered {answer!r}, not a result list'
+        )
+    return frozenset(
+        record['task_id']
+        for record in records
+        if isinstance(record, dict) and isinstance(record.get('task_id'), str)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scan (read-only), decide (pure), act (re-read, then write).
+
+
+@dataclass(frozen=True)
+class Scan:
+    """Every cited owner's verdict and the pending escalations, as measured at one moment."""
+
+    register: RegisterView
+    verdicts: Mapping[tuple[str, Owner], liveness.OwnerVerdict]
+    pending: frozenset[str]
+    measured_at: datetime.datetime
+
+
+def scan(register: RegisterView, ports: Ports, *, now: datetime.datetime) -> Scan:
+    """Resolve every cited owner once; reads only."""
+    pending = pending_escalation_ids(ports)
+    resolve = owner_resolver(ports)
+    by_owner = {owner: resolve(owner) for owner in dict.fromkeys(c.owner for c in register.citations)}
+    verdicts = {(c.scope, c.owner): by_owner[c.owner] for c in register.citations}
+    return Scan(register, MappingProxyType(verdicts), pending, now)
+
+
+class Action(enum.Enum):
+    SKIP_LIVE_TASK = 'skip_live_task'
+    SKIP_PENDING_ESCALATION = 'skip_pending_escalation'
+    ESCALATE_CLOSED_FINDING = 'escalate_closed_finding'
+    FILE_TASK = 'file_task'
+    FILE_ESCALATION = 'file_escalation'
+
+
+def decide(
+    key: FindingKey, *, carriers: Sequence[liveness.TaskRow], pending: frozenset[str]
+) -> Action:
+    """What to do about *key*, given the tasks carrying a finding key and the pending escalations."""
+    mine = [row for row in carriers if FindingKey.from_record(row.metadata.get(FINDING_KEY_FIELD)) == key]
+    if any(row.liveness() is OwnerLiveness.OPEN for row in mine):
+        return Action.SKIP_LIVE_TASK
+    if key.escalation_task_id() in pending:
+        return Action.SKIP_PENDING_ESCALATION
+    if mine and key.kind.escalates_when_closed:
+        return Action.ESCALATE_CLOSED_FINDING
+    if key.scope in (None, INLINE_SCOPE):
+        return Action.FILE_TASK
+    return Action.FILE_ESCALATION
+
+
+@dataclass(frozen=True)
+class ActOutcome:
+    checked: int = 0
+    findings: int = 0
+    filed: int = 0
+    escalated: int = 0
+    skipped_existing: int = 0
+    overflow: int = 0
+    via_successor: int = 0
+
+
+@dataclass(frozen=True)
+class _Body:
+    """A finding as both outputs render it: task title/description or escalation summary/detail."""
+
+    summary: str
+    detail: str
+    remedy: str
+    observation: str
+    files: tuple[str, ...] = ()
+
+
+SITES_SHOWN = 10
+
+_DEAD_OWNER_REMEDY = (
+    'Re-own every listed site with a live task or ticket; or, if this owner\'s own work '
+    'introduced the suppression, fix the suppression rather than re-citing it. '
+    'Never cite your own task.'
+)
+
+
+def _owner_label(owner: Owner) -> str:
+    return f'task {owner.id}' if isinstance(owner, TaskRef) else f'ticket {owner.id}'
+
+
+def _death_facts(verdict: liveness.OwnerVerdict) -> str:
+    facts = [f'cause {verdict.cause}']
+    if verdict.closed_status is not None:
+        facts.append(f'status {verdict.closed_status!r}')
+    if len(verdict.path) > 1:
+        facts.append('successors followed ' + ' -> '.join(map(str, verdict.path)))
+    if verdict.ticket is not None:
+        facts.append(f'ticket {verdict.ticket.status} ({verdict.ticket.reason})')
+    return ', '.join(facts)
+
+
+def _bounded(items: Sequence[str]) -> str:
+    rest = len(items) - SITES_SHOWN
+    shown = ', '.join(items[:SITES_SHOWN])
+    return shown if rest <= 0 else f'{shown} and {rest} more'
+
+
+def _dead_owner_body(citation: Citation, verdict: liveness.OwnerVerdict) -> _Body:
+    owner = _owner_label(citation.owner)
+    facts = _death_facts(verdict)
+    return _Body(
+        summary=f'INV-12: dead debt owner {owner} still cited by {len(citation.sites)} site(s) in {citation.scope}',
+        detail='\n'.join(
+            [
+                f'{owner} no longer owns the debt it is cited for ({facts}).',
+                f'Scope: {citation.scope}. Sites: {_bounded(citation.sites)}.',
+                f'Remedy: {_DEAD_OWNER_REMEDY}',
+                f'Report: {REPORT_COMMAND}',
+            ]
+        ),
+        remedy=_DEAD_OWNER_REMEDY,
+        observation=f'{owner} cited in {citation.scope} is dead: {facts}',
+        files=citation.files,
+    )
+
+
+def _file_task(key: FindingKey, body: _Body, ports: Ports) -> bool:
+    """Submit *key*'s task and wait for the curator; True when it yielded a task."""
+    args: dict[str, object] = {
+        'project_root': str(ports.project_root),
+        'title': body.summary,
+        'description': body.detail,
+        'priority': 'medium',
+        'agent_id': AGENT_ROLE,
+        'metadata': {FINDING_KEY_FIELD: key.record(), 'source': AGENT_ROLE, 'files': list(body.files)},
+    }
+    submitted = _call(ports.fused_memory, FailureStage.FUSED_MEMORY, 'submit_task', args)
+    ticket = submitted.get('ticket')
+    if not isinstance(ticket, str):
+        raise SweepFailure(FailureStage.FUSED_MEMORY, f'submit_task answered {submitted!r}, no ticket')
+    outcome = _resolve_ticket(ports, ticket, wait_secs=SUBMIT_RESOLVE_WAIT_SECS)
+    return outcome.state is liveness.TicketState.RESOLVED_TO_TASK
+
+
+def _escalate(key: FindingKey, body: _Body, ports: Ports, now: datetime.datetime) -> None:
+    args: dict[str, object] = {
+        'task_id': key.escalation_task_id(),
+        'agent_role': AGENT_ROLE,
+        'category': 'design_concern',
+        'summary': body.summary,
+        'detail': body.detail,
+        'suggested_action': body.remedy,
+        'evidence': [
+            {'observation': body.observation, 'measured_at': now.isoformat(), 'ref': key.escalation_task_id()}
+        ],
+    }
+    _call(ports.escalation, FailureStage.ESCALATION, 'escalate_info', args)
+
+
+class _Outputs:
+    """One act() run's outputs: what it has filed, escalated and skipped so far."""
+
+    def __init__(self, ports: Ports, pending: frozenset[str], now: datetime.datetime) -> None:
+        self.ports = ports
+        self.pending = set(pending)
+        self.now = now
+        self.counts: collections.Counter[str] = collections.Counter()
+
+    def raise_finding(self, key: FindingKey, body: _Body) -> None:
+        """Re-read the carriers, decide, and perform at most one output for *key*."""
+        action = decide(
+            key, carriers=_carriers(self.ports, FINDING_KEY_FIELD), pending=frozenset(self.pending)
+        )
+        if action in (Action.SKIP_LIVE_TASK, Action.SKIP_PENDING_ESCALATION):
+            self.counts['skipped_existing'] += 1
+        elif action is Action.FILE_TASK:
+            self.counts['filed'] += _file_task(key, body, self.ports)
+        else:
+            _escalate(key, body, self.ports, self.now)
+            self.pending.add(key.escalation_task_id())
+            self.counts['escalated'] += 1
+
+
+def act(scan: Scan, ports: Ports, *, now: datetime.datetime) -> ActOutcome:
+    """Re-resolve each cited owner immediately before acting on it, then act (INV-3)."""
+    resolve = owner_resolver(ports)
+    outputs = _Outputs(ports, scan.pending, now)
+    for citation in scan.register.citations:
+        verdict = resolve(citation.owner)
+        outputs.counts['checked'] += 1
+        outputs.counts['via_successor'] += verdict.liveness is liveness.Liveness.LIVE_VIA_SUCCESSOR
+        if verdict.liveness is liveness.Liveness.DEAD:
+            outputs.counts['findings'] += 1
+            key = FindingKey(FindingKind.DEAD_OWNER, citation.scope, citation.owner)
+            outputs.raise_finding(key, _dead_owner_body(citation, verdict))
+    return ActOutcome(**outputs.counts)

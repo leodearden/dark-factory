@@ -115,11 +115,12 @@ def test_one_citation_per_scope_and_owner_listing_every_site():
             _site('c.py', 1, TICKET),
         ),
     )
+    declared = ('tests/test_decl.py',)
     assert parse_register(document).citations == (
-        Citation(INLINE_SCOPE, TaskRef(6760), ('a.py:9', 'a.py:10', 'b.py:12')),
-        Citation(INLINE_SCOPE, TICKET, ('c.py:1',)),
-        Citation('pkg.mod.LIST', TaskRef(5149), ('k3',)),
-        Citation('pkg.mod.LIST', TaskRef(6760), ('default', 'k1')),
+        Citation(INLINE_SCOPE, TaskRef(6760), ('a.py:9', 'a.py:10', 'b.py:12'), ('a.py', 'b.py')),
+        Citation(INLINE_SCOPE, TICKET, ('c.py:1',), ('c.py',)),
+        Citation('pkg.mod.LIST', TaskRef(5149), ('k3',), declared),
+        Citation('pkg.mod.LIST', TaskRef(6760), ('default', 'k1'), declared),
     )
 
 
@@ -275,7 +276,9 @@ def register_tree(root: Path, files: dict[str, str]) -> Path:
 def test_the_real_register_feeds_the_sweep_its_citations(tmp_path: Path):
     root = register_tree(tmp_path / 'tree', {'m.py': OWNED_MODULE})
     view = parse_register(read_register(root, tmp_path / 'absent.json'))
-    assert view == RegisterView(citations=(Citation(INLINE_SCOPE, TaskRef(77), ('m.py:1',)),), slack_total=0)
+    assert view == RegisterView(
+        citations=(Citation(INLINE_SCOPE, TaskRef(77), ('m.py:1',), ('m.py',)),), slack_total=0
+    )
 
 
 def test_a_failing_register_is_a_register_failure(tmp_path: Path):
